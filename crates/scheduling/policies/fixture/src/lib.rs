@@ -1,6 +1,6 @@
 //! A fixture policy package: the arrival-order body, for the generation layer's
 //! delivery test. It is not a deployment policy; `fcfs` is.
 
-type Fixture = scheduling_guest::Arrival<scheduling_guest::ArrivalOrder>;
+type Fixture = scheduling::Arrival<scheduling::ArrivalOrder>;
 
-scheduling_guest::export_policy!(Fixture);
+scheduling::export_policy!(Fixture);

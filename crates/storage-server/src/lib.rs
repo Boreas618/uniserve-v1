@@ -65,12 +65,12 @@ use ::storage::protocol::{
     Scope, ScopeBytes, ServerMessage, StorageRecord, TensorListing, TensorRecord, Tensors, Usage,
     VERSION, Welcome,
 };
-use ::storage::transport::Connection;
 pub use child::Launch;
 pub use error::Error;
 use kv_storage::{KvStorage, Task};
 pub use restart::{PREDECESSOR_DESCRIPTOR, Pending as RestartPending, relaunch_arguments};
 pub use serve::{ServeOptions, list, retire, run_connector, run_transfer_server, serve};
+use service::Connection;
 use shoot::ShootDowns;
 
 /// How often a shoot-down that waits for a GPU to drop its victim polls
@@ -360,7 +360,7 @@ impl Server {
             if client.connection.wants_write() {
                 flags |= PollFlags::OUT;
             }
-            fds.push(PollFd::new(client.connection.stream(), flags));
+            fds.push(PollFd::new(&client.connection, flags));
         }
         for pidfd in &pidfds {
             fds.push(PollFd::new(pidfd.as_ref(), PollFlags::IN));
@@ -457,19 +457,19 @@ impl Server {
                     return;
                 }
             };
-            let admitted = stream
-                .set_nonblocking(true)
-                .and_then(|()| stream.set_nodelay(true));
-            if let Err(error) = admitted {
-                tracing::warn!(%error, "a remote storage client could not be admitted");
-                continue;
-            }
+            let connection = match Connection::new(stream) {
+                Ok(connection) => connection,
+                Err(error) => {
+                    tracing::warn!(%error, "a remote storage client could not be admitted");
+                    continue;
+                }
+            };
             let id = self.next_client;
             self.next_client += 1;
             self.clients.insert(
                 id,
                 Client {
-                    connection: Connection::new(stream),
+                    connection,
                     pid: 0,
                     pidfd: None,
                     role: None,
@@ -483,12 +483,11 @@ impl Server {
     /// A connection's peer process, held by a pidfd so that its identity
     /// cannot be reused while the server refers to it.
     fn admit(&self, stream: UnixStream) -> io::Result<Client> {
-        stream.set_nonblocking(true)?;
         let credentials = rustix::net::sockopt::socket_peercred(&stream)?;
         let pid = credentials.pid;
         let pidfd = rustix::process::pidfd_open(pid, rustix::process::PidfdFlags::empty())?;
         Ok(Client {
-            connection: Connection::new(stream),
+            connection: Connection::new(stream)?,
             pid: pid.as_raw_nonzero().get(),
             pidfd: Some(Arc::new(pidfd)),
             role: None,
@@ -505,23 +504,21 @@ impl Server {
         let mut frames = Vec::new();
         if let Some(client) = self.clients.get_mut(&id) {
             loop {
-                match client.connection.receive() {
-                    Ok(true) => {}
-                    Ok(false) => break,
+                match client.connection.try_recv_with::<ClientMessage>() {
+                    Ok(Some(frame)) => frames.push(frame),
+                    Ok(None) => break,
+                    // The client closed its end: the requests it sent before get their
+                    // responses below.
+                    Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => break,
+                    Err(error) if error.kind() == io::ErrorKind::InvalidData => {
+                        tracing::warn!(pid = client.pid, %error, "a storage client sent an unreadable message");
+                        failed = true;
+                        break;
+                    }
                     Err(error) => {
                         tracing::warn!(pid = client.pid, %error, "a storage client failed");
                         failed = true;
                         break;
-                    }
-                }
-            }
-            while !failed {
-                match client.connection.next_frame::<ClientMessage>() {
-                    Ok(Some(frame)) => frames.push(frame),
-                    Ok(None) => break,
-                    Err(error) => {
-                        tracing::warn!(pid = client.pid, %error, "a storage client sent an unreadable message");
-                        failed = true;
                     }
                 }
             }
@@ -531,9 +528,7 @@ impl Server {
                 ClientMessage::Hello(hello) => {
                     let welcome = self.welcome(id, hello);
                     if let Some(client) = self.clients.get_mut(&id) {
-                        let _ = client
-                            .connection
-                            .send(&ServerMessage::Welcome(welcome), &[]);
+                        let _ = client.connection.send(&ServerMessage::Welcome(welcome));
                     }
                     if self.kv_storage.client == Some(id) {
                         self.offer_parts();
@@ -2080,7 +2075,7 @@ impl Server {
     fn flush_and_reap(&mut self) {
         let mut gone = Vec::new();
         for (id, client) in &mut self.clients {
-            if client.connection.flush().is_err() {
+            if client.connection.try_flush().is_err() {
                 gone.push(*id);
             }
         }
@@ -2255,7 +2250,7 @@ impl Server {
             };
             if let Err(error) = client
                 .connection
-                .send(&ServerMessage::Event(event), &descriptors)
+                .send_with(&ServerMessage::Event(event), &descriptors)
             {
                 tracing::warn!(pid = client.pid, %error, "an event to a storage client failed");
             }
@@ -2344,7 +2339,7 @@ fn send_reply(
         id: request,
         response: reply,
     };
-    if let Err(error) = client.connection.send(&message, descriptors) {
+    if let Err(error) = client.connection.send_with(&message, descriptors) {
         tracing::warn!(pid = client.pid, %error, "a reply to a storage client failed");
     }
 }

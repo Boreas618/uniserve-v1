@@ -114,7 +114,8 @@ use crate::runtime::{Open, Opened};
 
 /// The protocol version a Storage Server and its clients speak; a server
 /// refuses a client of any other. The engine interface carries it
-/// (`proto::ENGINE_INTERFACE_VERSION`), so an engine built for another
+/// (`proto::ENGINE_INTERFACE_VERSION`, through `proto::STORAGE_PROTOCOL`, which
+/// a change of this version changes with it), so an engine built for another
 /// storage protocol is refused at its hello to the daemon as well.
 pub const VERSION: u32 = 24;
 
@@ -1675,4 +1676,51 @@ pub enum ServerMessage {
     Welcome(Welcome),
     Response { id: u64, response: Response },
     Event(Event),
+}
+
+/// The payload of a frame of the Storage Server's protocol: `message` in MessagePack with named
+/// fields, so a reader of another version skips a field it does not know and its own fields
+/// default when absent. Each such frame is a descriptor frame (`service::frame`): the messages
+/// carry the descriptors of the storage they name.
+///
+/// # Errors
+///
+/// Fails with `InvalidInput` when the message does not encode.
+pub fn encode<T: Serialize>(message: &T) -> std::io::Result<Vec<u8>> {
+    rmp_serde::to_vec_named(message)
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidInput, error))
+}
+
+/// The message a frame's payload of the Storage Server's protocol holds ([`encode`]).
+///
+/// # Errors
+///
+/// Fails with `InvalidData` when the payload is no encoding of a `T`.
+pub fn decode<T: serde::de::DeserializeOwned>(payload: &[u8]) -> std::io::Result<T> {
+    rmp_serde::from_slice(payload)
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))
+}
+
+impl service::Message for ClientMessage {
+    const FRAMING: service::Framing = service::Framing::Descriptors;
+
+    fn encode(&self) -> std::io::Result<Vec<u8>> {
+        encode(self)
+    }
+
+    fn decode(payload: &[u8]) -> std::io::Result<Self> {
+        decode(payload)
+    }
+}
+
+impl service::Message for ServerMessage {
+    const FRAMING: service::Framing = service::Framing::Descriptors;
+
+    fn encode(&self) -> std::io::Result<Vec<u8>> {
+        encode(self)
+    }
+
+    fn decode(payload: &[u8]) -> std::io::Result<Self> {
+        decode(payload)
+    }
 }

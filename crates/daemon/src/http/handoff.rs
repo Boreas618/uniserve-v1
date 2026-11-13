@@ -162,7 +162,7 @@ impl Handoff {
             report: Mutex::new(Some(report)),
             frozen: tokio::sync::Mutex::new(Some(frozen)),
         });
-        crate::leader::locked(&self.inner.streaming).insert(id, Arc::downgrade(&registration));
+        service::lock(&self.inner.streaming).insert(id, Arc::downgrade(&registration));
         // A response that starts while a round runs is asked to pause by the
         // round itself, which claims its report before asking: a response that
         // asks for itself here would report into a round that has not claimed
@@ -198,7 +198,7 @@ impl Handoff {
         let mut frozen = Vec::new();
         loop {
             let fresh: Vec<Arc<Registration>> = {
-                let streaming = crate::leader::locked(&self.inner.streaming);
+                let streaming = service::lock(&self.inner.streaming);
                 streaming
                     .values()
                     .filter_map(std::sync::Weak::upgrade)
@@ -255,7 +255,7 @@ impl Handoff {
     /// either seen here, and the round goes on to ask it, or it arrives after
     /// the round is over and is written by this daemon (§7.5.1 step 4).
     fn conclude(&self, asked: &BTreeSet<u64>) -> bool {
-        let streaming = crate::leader::locked(&self.inner.streaming);
+        let streaming = service::lock(&self.inner.streaming);
         let unsettled = streaming
             .values()
             .filter_map(std::sync::Weak::upgrade)
@@ -274,7 +274,7 @@ impl Handoff {
     /// a response that starts from here on is written here.
     fn end_pause(&self) {
         self.inner.pausing.store(false, Ordering::Release);
-        for registration in crate::leader::locked(&self.inner.streaming)
+        for registration in service::lock(&self.inner.streaming)
             .values()
             .filter_map(std::sync::Weak::upgrade)
         {
@@ -341,7 +341,7 @@ impl Registration {
     /// it here, [`Decision::Adopt`] ends it.
     pub(crate) async fn report(&self, frozen: Option<FrozenStream>) -> Decision {
         let reported = {
-            let mut slot = crate::leader::locked(&self.report);
+            let mut slot = service::lock(&self.report);
             slot.take()
         };
         let Some(reported) = reported else {
@@ -381,11 +381,11 @@ impl Registration {
 impl Drop for Registration {
     fn drop(&mut self) {
         if let Some(inner) = self.registrations.upgrade() {
-            crate::leader::locked(&inner.streaming).remove(&self.id);
+            service::lock(&inner.streaming).remove(&self.id);
             // Wake a restart waiting for this response's frozen state: it
             // ended before it could be frozen.
             let slot = {
-                let mut slot = crate::leader::locked(&self.report);
+                let mut slot = service::lock(&self.report);
                 slot.take()
             };
             if let Some(reported) = slot {

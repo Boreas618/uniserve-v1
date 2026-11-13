@@ -4,19 +4,14 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 publish = false
-description = "The host side of the scheduling interface: the wasmtime engine a policy module is compiled for and loaded with."
+description = "The scheduling policy's interface: its phases, views, events, decisions and ABI, compiled into the engine and into every policy."
 
 [dependencies]
-thiserror.workspace = true
-# The engine a policy module is compiled for and precompiled with: the
-# workspace's one pin, which the engine instantiates modules with.
-wasmtime.workspace = true
-
-# The Build Server's precompiler: a policy package's raw wasm32 module, in
-# the precompiled form the engine loads.
-[[bin]]
-name = "scheduling-precompile"
-path = "src/bin/scheduling_precompile.rs"
+# The wire format between the mechanism and a policy module. JSON is
+# self-describing, so a policy skips event kinds and struct fields it does not
+# know; that is what makes the views and events append-only lists (design §4.4).
+serde.workspace = true
+serde_json.workspace = true
 
 [lints]
 workspace = true

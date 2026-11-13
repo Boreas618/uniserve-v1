@@ -35,9 +35,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
+use ::service::{Connection, Listener};
 use anyhow::Context as _;
 use proto::process::{Hello, Join, Welcome, hello};
-use proto::{Connection, Listener};
 
 use claims::ClaimHolder;
 use service::{Local, Stop};
@@ -283,7 +283,7 @@ impl Daemon {
             )
         } else {
             let leader = join_leader(&options)?;
-            let address = leader.local_ip();
+            let address = leader.local_addr().map(|address| address.ip());
             let local = local(&options, address, true)?;
             let thread = std::thread::Builder::new()
                 .name("daemon".into())
@@ -588,7 +588,8 @@ fn leader_address(options: &DaemonOptions, members: &[service::Membership]) -> O
 
     members
         .first()
-        .and_then(|member| member.connection.local_ip())
+        .and_then(|member| member.connection.local_addr())
+        .map(|address| address.ip())
         .or_else(|| {
             options
                 .dist_init_addr
@@ -620,7 +621,7 @@ fn join_leader(options: &DaemonOptions) -> anyhow::Result<Connection> {
             }
         }
     };
-    connection.send(&Hello {
+    connection.deliver(&Hello {
         major: proto::ENGINE_INTERFACE_VERSION,
         build: proto::BUILD.to_owned(),
         peer: Some(hello::Peer::Join(Join {
@@ -665,7 +666,7 @@ mod tests {
 
     fn send(connection: &mut Connection, id: u64, kind: request::Kind) {
         connection
-            .send(&Upstream {
+            .deliver(&Upstream {
                 kind: Some(upstream::Kind::Request(Request {
                     id,
                     kind: Some(kind),
@@ -703,7 +704,7 @@ mod tests {
         let address = daemon.address().unwrap().to_owned();
         let mut engine = Connection::connect(&address).unwrap();
         engine
-            .send(&Hello {
+            .deliver(&Hello {
                 major: proto::ENGINE_INTERFACE_VERSION,
                 build: proto::BUILD.to_owned(),
                 peer: Some(hello::Peer::Engine(Engine {

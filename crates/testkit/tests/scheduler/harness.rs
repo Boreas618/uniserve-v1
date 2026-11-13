@@ -28,11 +28,11 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::num::{NonZeroU32, NonZeroUsize};
 use std::ops::Range;
 use std::sync::atomic::AtomicU64;
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use crossbeam_channel::{Receiver, unbounded};
-use engine::scheduler::{Capacity, Message, Output, Scheduler};
+use engine::scheduler::{Capacity, Message, Output, Scheduler, policy};
 use ipc::CacheGroupKind;
 use ipc::batch::{
     Batch, BatchOutput, CallOutput, CallStatus, ErrorCode, Extent, MediaRow, Phase, Shape, Variant,
@@ -47,7 +47,8 @@ use proto::request::{
     GenerationLimits, GenerationRequest, ImageEncoder, ImageEncoderInput, ImageInput,
     MigrationCause, RequestId, Trajectory,
 };
-use scheduling_guest::limits::Parameters;
+use scheduling::limits::Parameters;
+use service::lock;
 use storage::protocol::BlockState;
 use storage::runtime::{self, Class, Completion, GroupId, OwnerId, Region, Tier};
 use storage::{Key, QueuePair};
@@ -354,8 +355,7 @@ impl Deployment {
             .collect();
         // The scheduler instantiates the policy on its own snapshot, which states the phases its
         // groups serve.
-        let engine = scheduling::Engine::new().unwrap();
-        let module = Arc::new(engine.load(&testkit::packaged_module()).unwrap());
+        let module = Arc::new(policy::load(&testkit::packaged_module()).unwrap());
         let (output, outputs) = unbounded();
         let scheduler = Scheduler::new(
             self.scheduler_config(),
@@ -710,10 +710,6 @@ struct Rule {
     failing: HashMap<RequestId, (ErrorCode, Option<String>)>,
     /// The drafts the drafter proposes with every token a call samples.
     proposals: u32,
-}
-
-fn lock(rule: &Mutex<Rule>) -> MutexGuard<'_, Rule> {
-    rule.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
 /// A batch's output: the fake's rule, with each call of a failing request failed, a

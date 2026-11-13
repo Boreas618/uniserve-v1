@@ -15,7 +15,7 @@ version = "50.0.1"
 [module]
 form = "wasm"
 
-# The policy's arguments and their defaults, as `scheduling_guest::limits::Parameters`
+# The policy's arguments and their defaults, as `scheduling::limits::Parameters`
 # reads them (design §7.7): a deployment that states none gets these, which are
 # the current scheduler's defaults. `max_queued_requests` is absent because
 # absent means unbounded, and `timeout` is absent because the guest's default is
@@ -26,7 +26,7 @@ max_batch = 128
 max_num_batched_tokens = 8192
 prefetch_min_tokens = 256
 
-# The package is this crate: the Build Server snapshots it with the guest crate
+# The package is this crate: the Build Server snapshots it with the `scheduling` crate
 # it depends on when it is installed, builds it for wasm32 from that snapshot
 # and precompiles the module for the host's CPU. The crate's files are the ones
 # cargo resolves from `Cargo.toml`, so none is listed here.

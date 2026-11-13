@@ -195,11 +195,10 @@ The [architecture guide](docs/architecture.md) describes how the daemons, the en
 src/                    The root package, `uniserve`: the command line, logging, the `serve` and `keys` commands, and `main.rs`, which dispatches every command; the base executable holds the daemon, the Storage Server and the Build Server, and links no engine or model
 crates/engine/          The main process of a node and epoch: its control thread, schedulers, executors and blocking pool, and the catalogue that resolves a checkpoint to its model family
 crates/proto/           The interfaces across builds: the request interface and the process interface (Protobuf), and the video condition vocabulary
-crates/ipc/             The batch the scheduler submits and the worker serves, scheduler-to-main-process messages, rank channels and the launch descriptor
+crates/ipc/             The batch the scheduler submits and the worker serves, the peer link's messages and listener, and the launch descriptor
 crates/scheduling/      The scheduling interface between the scheduler's mechanism and its policy
 crates/storage/         The Storage Server's protocol and client
-crates/storage-server/  The Storage Server, its Mooncake connector and its Transfer Server
-crates/nixl/            NIXL agents with the UCX backend, loaded at runtime
+crates/storage-server/  The Storage Server, its Mooncake connector and its Transfer Server (with NIXL, loaded at runtime)
 crates/platform/        The CUDA boundary: driver, virtual memory, device memory and allocator, streams, events, graphs, kernels and NCCL
 crates/ops/             The interface between Rust and kernel packages: operators, their descriptors and descriptor keys, launch code and every kernel, one package per operator and backend under `kernels/`
 crates/nn/              The shared computation library: tensor views, the borrowed forward, numerical layers and blocks, diffusion, tiling and vocoder computation, weight loading, the capability traits models implement and the model family contract execution loads models through
@@ -208,9 +207,8 @@ crates/models/          The concrete models, each a crate that implements both c
   qwen3/                The Qwen3 family: configurations, the decoder layer and stack, `Qwen3MoeForCausalLM`, the Qwen3-VL model, vision tower and processor, and the Qwen3 chat profile
   minimax-h3/           MiniMax-H3 and FastH3: checkpoint configuration, mathematical partition, components and request processing (`src/processing/`)
 crates/worker/          The executors: the one thread per device that issues its work, with the runners, graphs and memory owners
-crates/daemon/          The node's daemon: process supervision and the Storage Server claim; on the leader, serving options, the HTTP server and its connections, metrics, the served model's facade and the engine's client
-crates/frontend/        The application layer: the OpenAI-compatible API, input processing (templates, tokenization, media) and output processing (detokenization, parsers, response bodies), over the served checkpoint's tokenizer, files and family profile
-crates/service/         Host services: the per-user socket, its owner lock, a detached start and the start of an absent service
+crates/daemon/          The node's daemon: process supervision and the Storage Server claim; on the leader, serving options, the HTTP server and its connections, metrics, the served model, the engine's client, and the API server: the OpenAI-compatible API, input processing (templates, tokenization, media) and output processing (detokenization, parsers, response bodies)
+crates/service/         Host services: the per-user socket, its owner lock, a detached start and the start of an absent service; the one connection every process interface runs on
 crates/media/           H.264/AAC output encoding and MP4 muxing, conditional media reading and host resamplers
 crates/build-server/  The Build Server: builds packages into modules, keeps them and hands them out; one host service per host and user
 crates/manager/         `uniserve-manager`: an optional multi-node manager, a client of each node's `/admin`

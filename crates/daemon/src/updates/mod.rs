@@ -116,8 +116,7 @@ impl State {
             report["trial"] = trial.report(crate::leader::request_counts());
         }
         if let Some(steps) = &self.transfers {
-            report["transfers"] =
-                serde_json::to_value(*crate::leader::locked(steps)).unwrap_or_default();
+            report["transfers"] = serde_json::to_value(*service::lock(steps)).unwrap_or_default();
         }
         report
     }
@@ -161,7 +160,7 @@ impl Updater {
     /// The phases updates enter, for the one reader that logs them; `None`
     /// once taken.
     pub(crate) fn transitions(&self) -> Option<tokio::sync::mpsc::UnboundedReceiver<Transition>> {
-        crate::leader::locked(&self.entered).take()
+        service::lock(&self.entered).take()
     }
 
     /// The number and phase of the update in flight, as they change.

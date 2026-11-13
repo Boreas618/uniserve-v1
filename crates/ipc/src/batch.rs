@@ -21,7 +21,7 @@ use std::fmt;
 use std::sync::Arc;
 
 use proto::video::Layout;
-pub use scheduling_guest::Phase;
+pub use scheduling::Phase;
 use serde::{Deserialize, Serialize};
 use storage::runtime::GroupId;
 

@@ -970,14 +970,15 @@ impl Source for WasmSource {
         // scheduler's wasmtime as a serialized module (design section 5.3).
         let precompiler = toolchain.executable().ok_or_else(|| Error::Toolchain {
             kind: ToolchainKind::Wasm,
-            message: "no wasm precompiler on this host: crates/scheduling's \
-                      scheduling-precompile builds it"
+            message: "no wasm precompiler on this host: name a uniserve-engine executable, \
+                      whose `precompile` command builds it"
                 .into(),
         })?;
         let output = dir.path().join(MODULE_WASM);
         let mut command = Command::new(precompiler);
         command
             .current_dir(&workspace)
+            .arg(crate::toolchain::PRECOMPILE)
             .arg("--wasm")
             .arg(&raw)
             .arg("--out")

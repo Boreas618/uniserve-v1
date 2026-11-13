@@ -13,11 +13,11 @@
 use std::ops::Range;
 use std::sync::Arc;
 
-use engine::scheduler::Message;
+use engine::scheduler::{Message, policy};
 use ipc::batch::{Batch, Phase};
 use ipc::philox::DrawAddress;
 use proto::request::RequestId;
-use scheduling_guest::limits::Parameters;
+use scheduling::limits::Parameters;
 use storage::runtime::Request;
 use testkit::executor::output_of;
 use testkit::text::scored;
@@ -320,8 +320,7 @@ fn a_draft_cache_with_a_gap_is_refilled_from_its_valid_end_when_the_policy_names
 fn a_refill_that_does_not_pay_is_never_run() {
     let mut harness = refilling().build();
     // A verification saves nothing over a decode: no refill is worth a token.
-    let engine = scheduling::Engine::new().unwrap();
-    let module = Arc::new(engine.load(&testkit::packaged_module()).unwrap());
+    let module = Arc::new(policy::load(&testkit::packaged_module()).unwrap());
     let parameters = Parameters {
         chunked_prefill_size: Some(8),
         max_batch: Some(8),

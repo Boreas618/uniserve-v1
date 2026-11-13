@@ -8,8 +8,8 @@
 //! its session, resolves its policy and serves; it takes a request, states its metrics, and
 //! exits with status 0 once shut down, its session closed.
 //!
-//! No GPU is touched. The Build Server builds the `fcfs` module from its installed snapshot, so
-//! the test builds the policy precompiler first, into a target directory of its own.
+//! No GPU is touched. The Build Server builds the `fcfs` module from its installed snapshot and
+//! precompiles it with the engine executable under test (`uniserve-engine precompile`).
 #![cfg(test)]
 
 mod support;
@@ -19,10 +19,10 @@ use std::process::{Child, Command, ExitStatus};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use proto::Connection;
 use proto::config::EngineArgs;
 use proto::process::{downstream, report, upstream};
 use proto::request::wire::{self, from_engine};
+use service::{Connection, Listener};
 use support::{DEPLOYMENT, StorageServer, workspace};
 
 /// A bound on a read only a defect reaches.
@@ -31,36 +31,6 @@ const READ: Duration = Duration::from_secs(60);
 /// A bound on the engine's start: the Build Server builds the policy module from its snapshot on
 /// the first resolve.
 const START: Duration = Duration::from_secs(900);
-
-/// The policy precompiler a Build Server builds a policy package with, built by the cargo that
-/// runs the tests into a target directory of its own, so the build does not contend for the lock
-/// of the tree the tests were built in.
-fn precompiler() -> PathBuf {
-    let target = std::env::var_os("CARGO_TARGET_DIR")
-        .map_or_else(|| workspace().join("target"), PathBuf::from)
-        .join("it-policy");
-    let cargo = std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
-    let output = Command::new(&cargo)
-        .current_dir(workspace())
-        .args([
-            "build",
-            "-q",
-            "-p",
-            "scheduling",
-            "--bin",
-            "scheduling-precompile",
-        ])
-        .arg("--target-dir")
-        .arg(&target)
-        .output()
-        .unwrap();
-    assert!(
-        output.status.success(),
-        "building the policy precompiler: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    target.join("debug/scheduling-precompile")
-}
 
 /// A Build Server on a thread of the test process at `directory`'s socket, holding the tree's
 /// `fcfs` policy package as revision 1. Returns its socket.
@@ -78,7 +48,7 @@ fn build_server(directory: &Path) -> PathBuf {
         toolchains: build_server::toolchain::ToolchainConfig {
             nvcc: None,
             python: None,
-            wasm: Some(precompiler()),
+            wasm: Some(PathBuf::from(env!("CARGO_BIN_EXE_uniserve-engine"))),
             cargo: std::env::var_os("CARGO").map(PathBuf::from),
             max_jobs: 4,
         },
@@ -155,7 +125,7 @@ impl Drop for Engine {
 }
 
 /// The first connection to `listener` within `bound`.
-fn accept(listener: &proto::Listener, engine: &mut Engine, bound: Duration) -> Connection {
+fn accept(listener: &Listener, engine: &mut Engine, bound: Duration) -> Connection {
     let deadline = Instant::now() + bound;
     loop {
         if let Some(connection) = listener.try_accept().unwrap() {
@@ -208,8 +178,8 @@ fn an_engine_started_on_the_meta_device_serves_and_shuts_down() {
     let build_server = build_server(directory.path());
     let launch = launch(directory.path(), &build_server);
 
-    let requests_socket = proto::Listener::bind(&launch.requests).unwrap();
-    let processes_socket = proto::Listener::bind(&launch.processes).unwrap();
+    let requests_socket = Listener::bind(&launch.requests).unwrap();
+    let processes_socket = Listener::bind(&launch.processes).unwrap();
     let launch_file = directory.path().join("launch.json");
     std::fs::write(&launch_file, serde_json::to_vec(&launch).unwrap()).unwrap();
     let mut engine = Engine(
@@ -226,7 +196,7 @@ fn an_engine_started_on_the_meta_device_serves_and_shuts_down() {
     assert_eq!(hello.engine, launch.engine);
     assert_eq!(hello.interface, proto::process::Interface::Requests as i32);
     requests
-        .send(&wire::Welcome {
+        .deliver(&wire::Welcome {
             major: proto::ENGINE_INTERFACE_VERSION,
             build: proto::BUILD.to_owned(),
             refusal: String::new(),
@@ -247,7 +217,7 @@ fn an_engine_started_on_the_meta_device_serves_and_shuts_down() {
         ))
     ));
     processes
-        .send(&proto::process::Welcome {
+        .deliver(&proto::process::Welcome {
             major: proto::ENGINE_INTERFACE_VERSION,
             build: proto::BUILD.to_owned(),
             refusal: String::new(),
@@ -267,7 +237,7 @@ fn an_engine_started_on_the_meta_device_serves_and_shuts_down() {
         Some(proto::process::request::Kind::Claim(_))
     ));
     processes
-        .send(&proto::process::Downstream {
+        .deliver(&proto::process::Downstream {
             kind: Some(downstream::Kind::Reply(proto::process::Reply {
                 id: request.id,
                 error: String::new(),
@@ -319,7 +289,7 @@ fn an_engine_started_on_the_meta_device_serves_and_shuts_down() {
             adapter: 0,
         }));
     requests
-        .send(&wire::ToEngine {
+        .deliver(&wire::ToEngine {
             kind: Some(wire::to_engine::Kind::Submit(wire::Submit {
                 requests: vec![request.to_wire()],
             })),
@@ -345,7 +315,7 @@ fn an_engine_started_on_the_meta_device_serves_and_shuts_down() {
 
     // A shutdown ends the process in order: it exits with status 0, its session closed.
     requests
-        .send(&wire::ToEngine {
+        .deliver(&wire::ToEngine {
             kind: Some(wire::to_engine::Kind::Engine(wire::EngineCommand {
                 kind: Some(wire::engine_command::Kind::Shutdown(wire::Shutdown {})),
             })),

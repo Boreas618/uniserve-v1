@@ -23,12 +23,13 @@ use std::sync::{Arc, Mutex};
 use serde::{Deserialize, Serialize};
 use tokio::sync::oneshot;
 
-use super::{Channel, Message, send};
+use super::{Message, send};
 use crate::engine::client::{EngineClient, SubmitError};
 use crate::engine::control::EngineControl;
 use crate::engine::hold::Kept;
+use service::Connection;
 
-pub(super) type Writer = Arc<Mutex<Channel>>;
+pub(super) type Writer = Arc<Mutex<Connection>>;
 
 /// The engine a successor resolved for a predecessor's continuation.
 #[derive(Debug, Serialize, Deserialize)]
@@ -59,13 +60,13 @@ impl Requests {
     }
 
     pub(super) fn respond(&self, id: u64, response: Response) {
-        if let Some(pending) = crate::leader::locked(&self.pending).remove(&id) {
+        if let Some(pending) = service::lock(&self.pending).remove(&id) {
             let _ = pending.send(response);
         }
     }
 
     pub(super) fn close(&self, reason: String) {
-        for (_, pending) in crate::leader::locked(&self.pending).drain() {
+        for (_, pending) in service::lock(&self.pending).drain() {
             let _ = pending.send(Err(reason.clone()));
         }
     }
@@ -79,9 +80,9 @@ impl Requests {
     ) -> Result<Attachment, SubmitError> {
         let id = self.next.fetch_add(1, Ordering::Relaxed);
         let (sender, response) = oneshot::channel();
-        crate::leader::locked(&self.pending).insert(id, sender);
+        service::lock(&self.pending).insert(id, sender);
         if let Err(error) = send(
-            &mut crate::leader::locked(&self.writer),
+            &mut service::lock(&self.writer),
             &Message::Resume {
                 id,
                 replica,
@@ -91,7 +92,7 @@ impl Requests {
             },
             &[],
         ) {
-            crate::leader::locked(&self.pending).remove(&id);
+            service::lock(&self.pending).remove(&id);
             return Err(SubmitError::Unavailable(format!(
                 "the successor daemon is unavailable: {error}"
             )));
@@ -171,10 +172,6 @@ impl RemoteHold {
     }
 }
 
-pub(super) fn writer(channel: &Channel) -> anyhow::Result<Writer> {
-    let stream = match channel.stream() {
-        storage::transport::Socket::Unix(stream) => stream.try_clone()?,
-        storage::transport::Socket::Tcp(_) => anyhow::bail!("daemon handoff uses a Unix socket"),
-    };
-    Ok(Arc::new(Mutex::new(Channel::new(stream))))
+pub(super) fn writer(channel: &Connection) -> anyhow::Result<Writer> {
+    Ok(Arc::new(Mutex::new(channel.writer()?)))
 }

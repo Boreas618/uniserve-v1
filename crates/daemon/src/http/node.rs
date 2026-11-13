@@ -12,7 +12,7 @@
 //! single-node deployment at a time.
 
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use anyhow::{Context as _, Result};
@@ -31,11 +31,11 @@ use tracing::{info, warn};
 use super::admin::Admin;
 use super::listener::Listener;
 use super::{middleware, retire_deployment, router, video_body_limit};
+use crate::api::openai::ApiError;
+use crate::api::openai::video_jobs::VideoJobs;
 use crate::leader::Leader;
 use crate::options::{AdminConfig, ServerArgs, ServerConfig, resolve_text};
 use crate::supervision::Daemon;
-use frontend::openai::ApiError;
-use frontend::openai::video_jobs::VideoJobs;
 
 /// How often a deployment that is brought down checks for requests in
 /// flight.
@@ -74,10 +74,6 @@ struct Node {
     families: processing::Registry,
     /// Reads this host's idle devices, for each deployment's daemon.
     devices: crate::supervision::DeviceProbe,
-}
-
-fn locked<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
-    mutex.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
 /// Serves the client API on `admin`'s address and the admin API on its two
@@ -164,10 +160,10 @@ pub async fn node(
     .await
     .context("the node's HTTP server failed");
     // The deployment serving now comes down with the node.
-    let current = locked(&node.current).take();
+    let current = service::lock(&node.current).take();
     if let Some(token) = current {
         token.cancel();
-        while !matches!(*locked(&node.serving), Serving::Idle) {
+        while !matches!(*service::lock(&node.serving), Serving::Idle) {
             tokio::time::sleep(DRAIN_POLL).await;
         }
     }
@@ -192,7 +188,7 @@ struct DeployBody {
 /// `GET /admin/config` of a node that serves no deployment: no
 /// configuration and empty slots.
 async fn idle_config(State(node): State<Arc<Node>>) -> Response {
-    let routes = match &*locked(&node.serving) {
+    let routes = match &*service::lock(&node.serving) {
         Serving::Epoch { admin, .. } => Some(admin.clone()),
         _ => None,
     };
@@ -222,7 +218,7 @@ async fn idle_config(State(node): State<Arc<Node>>) -> Response {
 /// starts (`202`), with its name. A node that serves a deployment hands
 /// the request to the deployment's own admin API.
 async fn deploy(State(node): State<Arc<Node>>, request: Request) -> Response {
-    let routes = match &*locked(&node.serving) {
+    let routes = match &*service::lock(&node.serving) {
         Serving::Epoch { admin, .. } => Some(admin.clone()),
         _ => None,
     };
@@ -274,7 +270,7 @@ async fn deploy(State(node): State<Arc<Node>>, request: Request) -> Response {
         .into_response();
     }
     {
-        let mut serving = locked(&node.serving);
+        let mut serving = service::lock(&node.serving);
         if !matches!(*serving, Serving::Idle) {
             return ApiError::conflict("the node serves a deployment; shut it down first")
                 .into_response();
@@ -282,8 +278,8 @@ async fn deploy(State(node): State<Arc<Node>>, request: Request) -> Response {
         *serving = Serving::Starting(name.clone());
     }
     let token = CancellationToken::new();
-    *locked(&node.current) = Some(token.clone());
-    *locked(&node.last_error) = None;
+    *service::lock(&node.current) = Some(token.clone());
+    *service::lock(&node.last_error) = None;
     tokio::spawn(run(Arc::clone(&node), config, stated, token));
     (StatusCode::ACCEPTED, Json(json!({ "deployment": name }))).into_response()
 }
@@ -301,10 +297,10 @@ async fn run(
     let served = serve_deployment(&node, &config, &stated, &token).await;
     if let Err(error) = &served {
         warn!(deployment = name, "the deployment ended: {error:#}");
-        *locked(&node.last_error) = Some(format!("{error:#}"));
+        *service::lock(&node.last_error) = Some(format!("{error:#}"));
     }
-    *locked(&node.current) = None;
-    *locked(&node.serving) = Serving::Idle;
+    *service::lock(&node.current) = None;
+    *service::lock(&node.serving) = Serving::Idle;
     info!(deployment = name, "the node serves no deployment");
 }
 
@@ -363,7 +359,7 @@ async fn serve_deployment(
             jobs: Arc::clone(&jobs),
             restarter: None,
         };
-        *locked(&node.serving) = Serving::Epoch {
+        *service::lock(&node.serving) = Serving::Epoch {
             name: name.clone(),
             client,
             admin: super::admin::router(state.clone()),
@@ -374,7 +370,7 @@ async fn serve_deployment(
 
         // New connections find no deployment; requests in flight finish
         // within the shutdown budget.
-        *locked(&node.serving) = Serving::Stopping(name.clone());
+        *service::lock(&node.serving) = Serving::Stopping(name.clone());
         let drained = tokio::time::timeout(node.server.shutdown_timeout, async {
             while engine.status().in_flight > 0 {
                 tokio::time::sleep(DRAIN_POLL).await;
@@ -411,7 +407,7 @@ async fn serve_deployment(
 
 /// `GET /admin/node`: what the node serves.
 async fn node_status(State(node): State<Arc<Node>>) -> Json<serde_json::Value> {
-    let (state, deployment) = match &*locked(&node.serving) {
+    let (state, deployment) = match &*service::lock(&node.serving) {
         Serving::Idle => ("idle", None),
         Serving::Starting(name) => ("starting", Some(name.clone())),
         Serving::Epoch { name, .. } => ("serving", Some(name.clone())),
@@ -420,14 +416,14 @@ async fn node_status(State(node): State<Arc<Node>>) -> Json<serde_json::Value> {
     Json(json!({
         "state": state,
         "deployment": deployment,
-        "last_error": locked(&node.last_error).clone(),
+        "last_error": service::lock(&node.last_error).clone(),
     }))
 }
 
 /// The client API: the serving deployment's routes, or `503` while none
 /// serves.
 async fn dispatch(State(node): State<Arc<Node>>, request: Request) -> Response {
-    let routes = match &*locked(&node.serving) {
+    let routes = match &*service::lock(&node.serving) {
         Serving::Epoch { client, .. } => Some(client.clone()),
         _ => None,
     };
@@ -437,7 +433,7 @@ async fn dispatch(State(node): State<Arc<Node>>, request: Request) -> Response {
 /// Every other admin path on the operator's socket: the serving deployment's
 /// admin routes.
 async fn dispatch_admin(State(node): State<Arc<Node>>, request: Request) -> Response {
-    let routes = match &*locked(&node.serving) {
+    let routes = match &*service::lock(&node.serving) {
         Serving::Epoch { admin, .. } => Some(admin.clone()),
         _ => None,
     };
@@ -446,7 +442,7 @@ async fn dispatch_admin(State(node): State<Arc<Node>>, request: Request) -> Resp
 
 /// The harness's socket: the serving deployment's harness routes.
 async fn dispatch_harness(State(node): State<Arc<Node>>, request: Request) -> Response {
-    let routes = match &*locked(&node.serving) {
+    let routes = match &*service::lock(&node.serving) {
         Serving::Epoch { harness, .. } => Some(harness.clone()),
         _ => None,
     };

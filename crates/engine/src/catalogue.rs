@@ -1,78 +1,53 @@
 //! The family a checkpoint resolves to.
 //!
 //! The executable registers each family once ([`nn::family::Registry`]); a main process resolves
-//! its checkpoint by the class the checkpoint declares ([`resolve`]) and from then on dispatches by
-//! the family's model and the capabilities it implements. Nothing else in this crate names a model.
+//! its checkpoint by what the checkpoint's root files declare, under request processing's one rule
+//! ([`processing::Registry::resolve`]), and from then on dispatches by the family's model and the
+//! capabilities it implements. Nothing else in this crate names a model.
 
 use std::path::Path;
 
-use anyhow::{Context as _, Result, bail};
+use anyhow::{Context as _, Result};
 use nn::family::{Family, Registry};
 
-/// The family of the checkpoint at `checkpoint`, by the class it declares.
+/// The family of the checkpoint at `checkpoint`, by what its root `config.json` or pipeline index
+/// declares ([`processing::Registry::resolve`]).
 ///
 /// # Errors
 ///
-/// Fails when the checkpoint declares no class, or one no family of `registry` claims; the
-/// refusal names the classes the build serves.
+/// Fails when a root file cannot be read, or the checkpoint declares nothing a family of
+/// `registry` claims; the refusal names what the build serves.
 pub fn resolve(registry: &Registry, checkpoint: &Path) -> Result<Family> {
-    let declared = architectural_class(checkpoint)?;
-    registry.by_class(&declared).with_context(|| {
-        format!(
-            "{} declares model class {declared}, which this build cannot serve: it serves {}",
-            checkpoint.display(),
-            registry
-                .families()
-                .iter()
-                .flat_map(|family| family.request.classes.iter().copied())
-                .collect::<Vec<_>>()
-                .join(", ")
-        )
-    })
+    let config = root_file(checkpoint, processing::CONFIG_FILE)?;
+    let mut index = None;
+    for file in processing::PIPELINE_INDEX_FILES {
+        index = root_file(checkpoint, file)?;
+        if index.is_some() {
+            break;
+        }
+    }
+
+    let claims =
+        processing::Registry::new(registry.families().iter().map(|family| family.request))?;
+    let declared = claims
+        .resolve(config.as_deref(), index.as_deref())
+        .with_context(|| format!("resolving the model family of {}", checkpoint.display()))?;
+    registry
+        .families()
+        .iter()
+        .copied()
+        .find(|family| family.request == declared)
+        .with_context(|| format!("no family of this build is {}", declared.id))
 }
 
-/// The model class a checkpoint declares, as the checkpoint itself states it.
-///
-/// A transformers checkpoint states it in `config.json`'s `architectures`; a diffusers modular
-/// pipeline states it in `modular_model_index.json`'s `_class_name` and has no `config.json` at
-/// its root at all. Both are read here, so a family is resolved by the declared class rather than
-/// by which file a checkpoint happens to carry.
-fn architectural_class(checkpoint: &Path) -> Result<String> {
-    let config_path = checkpoint.join("config.json");
-    if config_path.is_file() {
-        let text = std::fs::read_to_string(&config_path)
-            .with_context(|| format!("reading {}", config_path.display()))?;
-        let config: serde_json::Value = serde_json::from_str(&text)
-            .with_context(|| format!("parsing {}", config_path.display()))?;
-        let class = config
-            .get("architectures")
-            .and_then(|architectures| architectures.as_array())
-            .and_then(|architectures| architectures.first())
-            .and_then(|class| class.as_str())
-            .ok_or_else(|| anyhow::anyhow!("{} declares no model class", config_path.display()))?;
-        return Ok(class.to_owned());
+/// The text of the file `name` at the checkpoint's root; `None` when the checkpoint has none.
+fn root_file(checkpoint: &Path, name: &str) -> Result<Option<String>> {
+    let path = checkpoint.join(name);
+    match std::fs::read_to_string(&path) {
+        Ok(text) => Ok(Some(text)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error).with_context(|| format!("reading {}", path.display())),
     }
-
-    let index_path = checkpoint.join("modular_model_index.json");
-    if index_path.is_file() {
-        let text = std::fs::read_to_string(&index_path)
-            .with_context(|| format!("reading {}", index_path.display()))?;
-        let index: serde_json::Value = serde_json::from_str(&text)
-            .with_context(|| format!("parsing {}", index_path.display()))?;
-        let class = index
-            .get("_class_name")
-            .and_then(|class| class.as_str())
-            .ok_or_else(|| anyhow::anyhow!("{} declares no `_class_name`", index_path.display()))?;
-        return Ok(class.to_owned());
-    }
-
-    bail!(
-        "{} declares no model class: it has neither {} (a transformers checkpoint's \
-         `architectures`) nor {} (a modular pipeline's `_class_name`)",
-        checkpoint.display(),
-        config_path.display(),
-        index_path.display()
-    )
 }
 
 #[cfg(test)]
@@ -128,9 +103,9 @@ mod tests {
         .unwrap()
     }
 
-    /// A checkpoint resolves by the class it declares, read from whichever file its format states
-    /// it in: a transformers checkpoint's `config.json`, a diffusers modular pipeline's
-    /// `modular_model_index.json`.
+    /// A checkpoint resolves by the root file its format declares it in: a diffusers modular
+    /// pipeline's `modular_model_index.json`, and a transformers checkpoint's `config.json`, which
+    /// decides when both are present.
     #[test]
     fn a_checkpoint_resolves_by_the_class_it_declares() {
         let registry = registry();
@@ -149,30 +124,5 @@ mod tests {
         )
         .unwrap();
         assert_eq!(resolve(&registry, root.path()).unwrap().id(), "text");
-    }
-
-    /// A class no family claims is refused naming the classes the build serves, and a checkpoint
-    /// that declares none is refused naming both files a class is read from.
-    #[test]
-    fn an_unknown_or_missing_class_is_refused_by_name() {
-        let registry = registry();
-        let root = tempfile::tempdir().unwrap();
-
-        std::fs::write(
-            root.path().join("config.json"),
-            r#"{"architectures": ["OtherForCausalLM"]}"#,
-        )
-        .unwrap();
-        let error = format!("{:#}", resolve(&registry, root.path()).unwrap_err());
-        assert!(error.contains("OtherForCausalLM"), "{error}");
-        assert!(
-            error.contains("TextForCausalLM, VideoModularPipeline"),
-            "{error}"
-        );
-
-        std::fs::remove_file(root.path().join("config.json")).unwrap();
-        let error = format!("{:#}", resolve(&registry, root.path()).unwrap_err());
-        assert!(error.contains("declares no model class"), "{error}");
-        assert!(error.contains("modular_model_index.json"), "{error}");
     }
 }

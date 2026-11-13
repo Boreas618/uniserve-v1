@@ -24,7 +24,7 @@ use http_body::{Frame, SizeHint};
 use tokio::sync::Semaphore;
 use uuid::Uuid;
 
-use frontend::openai::{ApiError, RequestId};
+use crate::api::openai::{ApiError, RequestId};
 
 const X_REQUEST_ID: HeaderName = HeaderName::from_static("x-request-id");
 

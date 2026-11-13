@@ -7,7 +7,7 @@ use proto::request::wire;
 use serde::{Deserialize, Serialize};
 
 use crate::engine::client::EngineClient;
-use crate::leader::{Leader, Replica, UpdateError, locked};
+use crate::leader::{Leader, Replica, UpdateError};
 
 /// Global physical-slot order of logical expert IDs, by model module path.
 #[derive(Debug, Clone, Deserialize)]
@@ -85,7 +85,7 @@ async fn rebalance(
         }
     };
 
-    let mut decided = locked(&replica.served)
+    let mut decided = service::lock(&replica.served)
         .clone()
         .ok_or(UpdateError::NoEngine)?;
     decided
@@ -101,7 +101,7 @@ async fn rebalance(
     // Once a rank starts remapping, recovery must load this distribution.
     // Daemon handoff and engine replacement share the locks held above.
     let committed = decided.expert_order.clone();
-    *locked(&replica.served) = Some(decided);
+    *service::lock(&replica.served) = Some(decided);
     client
         .commit_experts(committed.into_iter().collect())
         .await

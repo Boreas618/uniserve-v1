@@ -16,7 +16,7 @@ The numerical checks of the kernel packages under `crates/ops/kernels` live in `
 
 The HTTP tests under `tests/python/e2e` start real servers on the host's GPUs. `just test-python-gpu` runs every test marked `e2e and gpu`; `just test-python-sanitizer` runs those marked `missing_state` with every main process under compute-sanitizer's memcheck. Both call `tools/gpu_e2e.sh`, which the nightly workflows call as well:
 
-- it builds the release `uniserve` executable, the scheduling policy precompiler and `uniserve-manager` once, and every process of every test deployment runs that one build;
+- it builds the release `uniserve` executable, the `uniserve-engine` executable (which precompiles the scheduling policy) and `uniserve-manager` once, and every process of every test deployment runs that one build;
 - it puts the NCCL the project pins on the loader's path (`tools/check_nccl.sh`) and states the Python environment (`VIRTUAL_ENV`) a main process takes CUPTI from;
 - it runs pytest with one worker per GPU (pytest-xdist), and each case leases the GPUs it serves on, so independent cases run beside one another on different GPUs while a case that observes host-wide state runs alone; the cases of a module that serves one deployment for all of them stay on one worker;
 - it writes pytest's temporary directory, which holds every server's log, and a JUnit report to `artifacts/e2e/<UTC time>/`.
@@ -68,7 +68,7 @@ The eight-rank layouts of `test_h3_parallel_http.py` run on this host and a seco
 
 ### A build shared by several hosts
 
-Hosts that mount the same checkout can run different modules at once from one build: build on one host (`tools/gpu_e2e.sh` builds when it runs there, or `cargo build --release -p uniserve --bin uniserve -p scheduling --bin scheduling-precompile -p manager --bin uniserve-manager`), and on the others name the executables with `UNISERVE_BINARY` and `UNISERVE_SCHEDULING_PRECOMPILE`, which makes `tools/gpu_e2e.sh` build nothing. The executable records the FFmpeg prefix it was linked against as its run path, so that prefix must lie on the shared filesystem too. Each host still needs the Rust toolchain with its dependencies fetched (`cargo fetch --locked`), because a module's Build Server builds the scheduling policy for `wasm32-unknown-unknown` offline, and the Build Server's environment.
+Hosts that mount the same checkout can run different modules at once from one build: build on one host (`tools/gpu_e2e.sh` builds when it runs there, or `cargo build --release -p uniserve --bin uniserve -p engine --bin uniserve-engine -p manager --bin uniserve-manager`), and on the others name the executables with `UNISERVE_BINARY` and `UNISERVE_SCHEDULING_PRECOMPILE` (the `uniserve-engine` executable, whose `precompile` command precompiles the policy), which makes `tools/gpu_e2e.sh` build nothing. The executable records the FFmpeg prefix it was linked against as its run path, so that prefix must lie on the shared filesystem too. Each host still needs the Rust toolchain with its dependencies fetched (`cargo fetch --locked`), because a module's Build Server builds the scheduling policy for `wasm32-unknown-unknown` offline, and the Build Server's environment.
 
 ### Example
 

@@ -121,7 +121,7 @@ impl Migrator {
 
 /// What one step of a request's events resolved to; an event's tokens are
 /// already kept as the request's facts.
-pub(crate) use frontend::events::Next as Step;
+pub(crate) use crate::api::events::Next as Step;
 
 /// A request a migration submits again, as last submitted.
 #[derive(Clone)]
@@ -604,7 +604,7 @@ impl Drop for RequestEvents {
     }
 }
 
-impl frontend::events::Events for RequestEvents {
+impl crate::api::events::Events for RequestEvents {
     fn poll_step(&mut self, cx: &mut Context<'_>) -> Poll<Step> {
         RequestEvents::poll_step(self, cx)
     }

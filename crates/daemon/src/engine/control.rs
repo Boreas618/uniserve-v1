@@ -24,7 +24,7 @@ use std::time::{Duration, Instant};
 use anyhow::Context as _;
 use proto::process::{self, downstream, event, hello, reply, request, upstream};
 use proto::request::wire;
-use proto::{Connection, Listener};
+use service::{Connection, Listener};
 
 use crate::engine::client::{EngineClient, EngineInfo, EngineState, StatsSink};
 
@@ -329,7 +329,7 @@ impl EngineControl {
     fn reserve_world(&self, host: &str) -> anyhow::Result<(process::Reserved, process::Reserved)> {
         let (mut control, _) = self.connect()?;
         let mut reserve = |id| -> anyhow::Result<process::Reserved> {
-            control.send(&process::Upstream {
+            control.deliver(&process::Upstream {
                 kind: Some(upstream::Kind::Request(process::Request {
                     id,
                     kind: Some(request::Kind::Reserve(process::Reserve {
@@ -502,7 +502,7 @@ impl EngineControl {
     fn connect(&self) -> anyhow::Result<(Connection, Vec<process::Node>)> {
         let mut control = Connection::connect(&self.processes)
             .with_context(|| format!("connecting to the daemon at {}", self.processes))?;
-        control.send(&process::Hello {
+        control.deliver(&process::Hello {
             major: proto::ENGINE_INTERFACE_VERSION,
             build: proto::BUILD.to_owned(),
             peer: Some(hello::Peer::Engine(process::Engine {
@@ -534,7 +534,7 @@ impl EngineControl {
         let mut reports = Vec::with_capacity(nodes.len());
         for (index, node) in nodes.iter().enumerate() {
             let host = node.host.clone();
-            connection.send(&process::Upstream {
+            connection.deliver(&process::Upstream {
                 kind: Some(upstream::Kind::Request(process::Request {
                     id: index as u64 + 1,
                     kind: Some(request::Kind::Usage(process::UsageQuery {
@@ -576,7 +576,7 @@ impl EngineControl {
         let pending =
             pending.get_or_insert_with(|| nodes.into_iter().map(|node| node.host).collect());
         while let Some(host) = pending.first().cloned() {
-            connection.send(&process::Upstream {
+            connection.deliver(&process::Upstream {
                 kind: Some(upstream::Kind::Request(process::Request {
                     id: 1,
                     kind: Some(request::Kind::PublishEpochs(process::PublishEpochs {
@@ -618,7 +618,7 @@ impl EngineControl {
         let (mut connection, nodes) = self.connect()?;
         let mut hosts = Vec::with_capacity(nodes.len());
         for node in nodes {
-            connection.send(&process::Upstream {
+            connection.deliver(&process::Upstream {
                 kind: Some(upstream::Kind::Request(process::Request {
                     id: 1,
                     kind: Some(request::Kind::ThrottleTransfers(
@@ -679,7 +679,7 @@ impl EngineControl {
             "a remote engine needs the deployment's network control address"
         );
 
-        control.send(&process::Upstream {
+        control.deliver(&process::Upstream {
             kind: Some(upstream::Kind::Request(process::Request {
                 id: 1,
                 kind: Some(request::Kind::Spawn(process::Spawn {
@@ -826,7 +826,7 @@ pub(crate) fn welcome(
     } else {
         String::new()
     };
-    writer.send(&wire::Welcome {
+    writer.deliver(&wire::Welcome {
         major: proto::ENGINE_INTERFACE_VERSION,
         build: proto::BUILD.to_owned(),
         refusal: refusal.clone(),
@@ -952,8 +952,8 @@ const FAILED_EXIT: Duration = Duration::from_secs(120);
 fn still_serving(control: &mut Connection) -> anyhow::Result<bool> {
     match exited(control) {
         Ok(()) => Ok(true),
-        Err(error) => match error.downcast_ref::<proto::Error>() {
-            Some(proto::Error::Closed) => Ok(false),
+        Err(error) => match error.downcast_ref::<std::io::Error>() {
+            Some(closed) if closed.kind() == std::io::ErrorKind::UnexpectedEof => Ok(false),
             _ => Err(error),
         },
     }
@@ -1695,9 +1695,9 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("processes.sock");
         let address = format!("unix:{}", path.display());
-        let listener = proto::Listener::bind(&address).unwrap();
+        let listener = Listener::bind(&address).unwrap();
         // The predecessor's client end, whose accepted side closed with its service.
-        let control = proto::Connection::connect(&address).unwrap();
+        let control = Connection::connect(&address).unwrap();
         drop(listener.try_accept().expect("the accepted connection"));
         drop(listener);
 

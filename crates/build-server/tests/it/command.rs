@@ -97,7 +97,7 @@ fn settings_survive_the_command_line() {
         host_reserve: Some(1 << 30),
         nvcc: Some(PathBuf::from("/usr/local/cuda/bin/nvcc")),
         python: Some(PathBuf::from("/srv/build-server/bin/python")),
-        wasm: Some(PathBuf::from("/srv/bin/scheduling-precompile")),
+        wasm: Some(PathBuf::from("/srv/bin/uniserve-engine")),
         cargo: Some(PathBuf::from("/srv/bin/cargo")),
     };
     let arguments = settings.arguments();

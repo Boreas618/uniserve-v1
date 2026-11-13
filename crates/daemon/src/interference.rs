@@ -235,7 +235,7 @@ pub(crate) async fn control(
     steps: Arc<std::sync::Mutex<StepTime>>,
 ) -> Throttled {
     let mut throttled = Throttled::default();
-    crate::leader::locked(&steps).slowdown = observed
+    service::lock(&steps).slowdown = observed
         .iter()
         .map(|(_, throttling)| throttling.slowdown)
         .fold(0.0, f64::max);
@@ -290,7 +290,7 @@ pub(crate) async fn control(
                 Err(error) => warn!(?decision, %error, "the transfers' budgets did not change"),
             }
         }
-        let mut read = crate::leader::locked(&steps);
+        let mut read = service::lock(&steps);
         if let Some(ratio) = observed
             .iter()
             .filter_map(|(_, throttling)| throttling.ratio)
@@ -309,7 +309,7 @@ pub(crate) async fn control(
             }
         }
     }
-    let mut read = crate::leader::locked(&steps);
+    let mut read = service::lock(&steps);
     read.halved = false;
     read.throttled = throttled;
     drop(read);
@@ -370,7 +370,7 @@ mod tests {
 
     impl Throttle for Recorded {
         fn throttle(&self, halve: bool) -> Result<Vec<String>, String> {
-            crate::leader::locked(&self.0)
+            service::lock(&self.0)
                 .send(halve)
                 .map_err(|error| error.to_string())?;
             Ok(vec!["rank-0".to_owned()])
@@ -417,7 +417,7 @@ mod tests {
         observer.record(1, 0, &report(15_000, 25, 32));
         assert_eq!(next(Duration::from_secs(10)), Some(true));
         tokio::time::sleep(interval * 2).await;
-        let read = *crate::leader::locked(&steps);
+        let read = *service::lock(&steps);
         assert!(
             read.ratio.is_some_and(|ratio| (ratio - 1.5).abs() < 1e-9),
             "{read:?}"

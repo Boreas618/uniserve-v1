@@ -59,6 +59,7 @@ use platform::{
 
 use super::contexts::{Contexts, Hold};
 use super::network::{Network, Source};
+use super::nixl;
 use super::storage::{Fabric, Mapping};
 
 /// How often a running task reports its progress, at most.

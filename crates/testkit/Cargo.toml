@@ -17,12 +17,13 @@ engine.workspace = true
 ipc.workspace = true
 # The host's monotonic clock, which the buffer pool's task deadlines are stated in.
 libc.workspace = true
+# The connections of a fake engine's request and process interfaces.
+service.workspace = true
 storage.workspace = true
 storage-server.workspace = true
-# The policy engine a test engine's policy module is loaded with, and the policy's parameters
-# and limits.
+# The policy's parameters and limits; a test engine's policy module is loaded with the
+# engine's own policy host (`engine::scheduler::policy`).
 scheduling.workspace = true
-scheduling-guest.workspace = true
 uuid.workspace = true
 proto.workspace = true
 tempfile.workspace = true

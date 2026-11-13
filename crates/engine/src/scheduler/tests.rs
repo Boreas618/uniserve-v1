@@ -17,8 +17,8 @@ use proto::config::{
 };
 use proto::request::wire::WeightsInFlight;
 use proto::request::{GenerationLimits, GenerationRequest};
-use scheduling_guest::limits::{Limits, Parameters};
-use scheduling_guest::view::Snapshot;
+use scheduling::limits::{Limits, Parameters};
+use scheduling::view::Snapshot;
 use storage::runtime::{self, Class, Completion, GroupId, OwnerId, Region, Tier};
 use storage::{Key, QueuePair};
 
@@ -824,7 +824,7 @@ fn a_marked_request_is_told_at_the_next_dispatch() {
         .policy
         .dispatch(&room, &mut scheduler.requests, &scheduler.groups)
         .unwrap();
-    assert_eq!(output.admit, [scheduling_guest::ids::RequestId(1)]);
+    assert_eq!(output.admit, [scheduling::ids::RequestId(1)]);
     assert!(!scheduler.requests[&id].dirty);
 
     scheduler.mark(id);

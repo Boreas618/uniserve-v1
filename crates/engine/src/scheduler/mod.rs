@@ -48,7 +48,7 @@ mod cache;
 mod drain;
 mod group;
 mod memory;
-mod policy;
+pub mod policy;
 mod request;
 mod rows;
 mod schedule;
@@ -73,7 +73,7 @@ use proto::config::{SchedulerConfig, WorkerGroupConfig};
 use proto::report::SchedulerStats;
 use proto::request::wire::WeightsInFlight;
 use proto::request::{Event, FinishReason, GenerationLimits, MigrationCause, RequestId};
-use scheduling_guest::Parameters;
+use scheduling::Parameters;
 use storage::runtime::{self, Cause, Completion, GroupId, OwnerId, Tier};
 use storage::{Key, QueuePair};
 
@@ -82,7 +82,7 @@ pub use group::{Capacity, WorkerGroup};
 /// The packaged policies this tree builds, for the tests of the engine that serves them.
 #[cfg(test)]
 pub(crate) use policy::tests::packaged;
-pub use policy::{Policy, PolicyError, ceilings};
+use policy::{Policy, PolicyError, ceilings};
 pub use request::{Blocks, Request, RequestStatus};
 pub use view::view_of;
 

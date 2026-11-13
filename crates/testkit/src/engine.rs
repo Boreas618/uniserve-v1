@@ -35,8 +35,8 @@ use ::engine::scheduler::{self, Message};
 use ::engine::{Engine, Start};
 use anyhow::{Context as _, Result, anyhow, bail};
 use crossbeam_channel::{Receiver, Sender};
-use proto::Connection;
 use proto::config::EngineArgs;
+use service::Connection;
 use storage::QueuePair;
 use storage::protocol::Segment;
 use storage::runtime::{Open, Opened, Region, Tier};
@@ -107,8 +107,8 @@ pub fn spawn(
 ) -> Result<(Connection, Connection, JoinHandle<Result<()>>)> {
     let (requests, engine_requests) = UnixStream::pair().context("a request socket pair")?;
     let (process, engine_process) = UnixStream::pair().context("a process socket pair")?;
-    let mut engine_requests = Connection::from_unix(engine_requests)?;
-    let engine_process = Connection::from_unix(engine_process)?;
+    let mut engine_requests = Connection::new(engine_requests)?;
+    let engine_process = Connection::new(engine_process)?;
 
     let thread = std::thread::Builder::new()
         .name("engine".to_owned())
@@ -122,8 +122,8 @@ pub fn spawn(
         })
         .context("starting the engine's thread")?;
     Ok((
-        Connection::from_unix(requests)?,
-        Connection::from_unix(process)?,
+        Connection::new(requests)?,
+        Connection::new(process)?,
         thread,
     ))
 }
@@ -160,7 +160,7 @@ fn start(launch: &EngineArgs, fixture: Fixture) -> Result<Engine> {
         .iter()
         .map(|group| (group.id, capacity.clone()))
         .collect();
-    let ceilings = scheduler::ceilings(capacities.iter().map(|(_, capacity)| capacity));
+    let ceilings = scheduler::policy::ceilings(capacities.iter().map(|(_, capacity)| capacity));
     let policy = crate::packaged_policy(&ceilings)?;
 
     let mut inboxes = Vec::with_capacity(open.schedulers.len());

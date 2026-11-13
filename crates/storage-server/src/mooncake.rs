@@ -33,6 +33,7 @@ use std::sync::{Arc, Mutex};
 
 use mooncake_store::MooncakeStore;
 use rustix::event::{PollFd, PollFlags, poll};
+use service::lock;
 
 use ::storage::client::Client;
 use ::storage::connector::Settings;
@@ -236,14 +237,6 @@ fn worker(shared: &Arc<Shared>, name: &str) -> io::Result<mpsc::Sender<Job>> {
             }
         })?;
     Ok(sender)
-}
-
-/// The value behind `mutex`. A thread that panicked while holding it left
-/// it whole: every holder only inserts or takes whole entries.
-fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
-    mutex
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 impl Shared {

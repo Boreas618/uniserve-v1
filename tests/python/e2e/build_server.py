@@ -15,7 +15,8 @@ of those, so a build run with it stops at its first import.
 
 ``UNISERVE_BUILD_SERVER_PYTHON`` names that environment's interpreter (the
 tree's ``crates/build-server/python/.venv`` when unset),
-``UNISERVE_SCHEDULING_PRECOMPILE`` the wasm precompiler, and ``UNISERVE_BINARY``
+``UNISERVE_SCHEDULING_PRECOMPILE`` the wasm precompiler (a ``uniserve-engine``
+executable), and ``UNISERVE_BINARY``
 the ``uniserve`` binary.
 """
 
@@ -92,14 +93,16 @@ def precompiler() -> Path:
     """The wasm precompiler the Build Server turns a policy module into.
 
     A policy is built for wasm32 and precompiled for this host's CPU, so the
-    server needs the precompiler before it can install a policy (design 5.3).
-    ``UNISERVE_SCHEDULING_PRECOMPILE`` names it.
+    server needs the precompiler before it can install a policy (design 5.3):
+    a ``uniserve-engine`` executable, whose ``precompile`` command the server
+    runs. ``UNISERVE_SCHEDULING_PRECOMPILE`` names it.
     """
     named = os.environ.get("UNISERVE_SCHEDULING_PRECOMPILE")
     if not named:
         pytest.fail(
-            "UNISERVE_SCHEDULING_PRECOMPILE must name the precompiler: "
-            "`cargo build -p scheduling --bin scheduling-precompile` builds it"
+            "UNISERVE_SCHEDULING_PRECOMPILE must name the precompiler, a "
+            "uniserve-engine executable: `cargo build -p engine --bin uniserve-engine` "
+            "builds it"
         )
     return Path(named)
 

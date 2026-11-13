@@ -12,8 +12,8 @@
 //!   ([`ToolchainKind::Triton`]).
 //! - CuTe DSL, from the same Python environment
 //!   ([`ToolchainKind::CuteDsl`]).
-//! - wasmtime, which precompiles a scheduling policy for this host's CPU
-//!   ([`ToolchainKind::Wasm`]).
+//! - wasmtime, which precompiles a scheduling policy for this host's CPU through
+//!   the engine executable's `precompile` command ([`ToolchainKind::Wasm`]).
 //!
 //! A source that compiles nothing — a vendor cubin, an executable — needs no
 //! toolchain and asks for [`ToolchainKind::None`], which always reports the
@@ -54,6 +54,11 @@ const NVCC_PEAK_HOST_BYTES: u64 = 4 * 1024 * 1024 * 1024;
 /// covers both.
 const WASM_PEAK_HOST_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 
+/// The command of the engine executable that precompiles a policy module (`uniserve-engine
+/// precompile --wasm <raw> --out <module>`) and reports its wasmtime version (`uniserve-engine
+/// precompile --version`).
+pub(crate) const PRECOMPILE: &str = "precompile";
+
 /// The peak host memory of one compiler process of a cargo build, in bytes:
 /// one rustc over a crate of the engine's workspace in release. A cargo build
 /// runs as many of them at once as its job count.
@@ -89,8 +94,9 @@ pub trait Toolchain: Send + Sync {
     /// queue's `limits.max_jobs`.
     fn max_jobs(&self) -> usize;
 
-    /// The toolchain's principal executable: nvcc, or the wasm precompiler.
-    /// `None` for a toolchain that compiles nothing.
+    /// The toolchain's principal executable: nvcc, or the engine executable
+    /// whose `precompile` command precompiles a policy module. `None` for a
+    /// toolchain that compiles nothing.
     fn executable(&self) -> Option<&Path> {
         None
     }
@@ -132,8 +138,9 @@ pub struct ToolchainConfig {
     /// environment's two toolchains; `None` refuses their packages and runs no
     /// package's Python compile script.
     pub python: Option<PathBuf>,
-    /// The wasm precompiler, `scheduling-precompile`, which builds a policy module with
-    /// the schedule crate's own engine. `None` refuses a policy package.
+    /// The wasm precompiler: a `uniserve-engine` executable, whose `precompile` command builds
+    /// a policy module under the wasmtime configuration the engine loads it with. `None` refuses
+    /// a policy package.
     pub wasm: Option<PathBuf>,
     /// cargo, which builds a cargo package (the engine) and a policy's crate from their
     /// snapshots. `None` takes the `cargo` on this process's `PATH`, and refuses such a
@@ -484,8 +491,9 @@ impl Toolchain for CuteDsl {
 }
 
 /// The WebAssembly toolchain of a scheduling policy: cargo, which builds the
-/// policy's crate for wasm32, and the scheduling crate's precompiler, which
-/// serializes the module for this host's CPU (design section 5.3).
+/// policy's crate for wasm32, and the engine executable's `precompile`
+/// command, which serializes the module for this host's CPU (design section
+/// 5.3).
 #[derive(Debug)]
 struct Wasm {
     precompiler: PathBuf,
@@ -499,9 +507,10 @@ struct Wasm {
 
 impl Wasm {
     fn discover(config: &ToolchainConfig) -> Discovered<Wasm> {
-        let precompiler = config.wasm.clone().ok_or_else(|| {
-            "no wasm precompiler named: pass --wasm <scheduling-precompile>".to_owned()
-        })?;
+        let precompiler = config
+            .wasm
+            .clone()
+            .ok_or_else(|| "no wasm precompiler named: pass --wasm <uniserve-engine>".to_owned())?;
         let precompiler = resolve(&precompiler);
         let version = wasmtime_version(&precompiler)?;
         Ok(Wasm {
@@ -819,11 +828,14 @@ fn python_version(interpreter: &Path, module: &str) -> Discovered<String> {
     Ok(text)
 }
 
-/// The wasmtime version a precompiler reports, either itself or through the
-/// `wasmtime` executable beside it. A precompiled module is only loadable by the
-/// wasmtime that wrote it, so this string is what a policy package declares.
+/// The wasmtime version the engine executable `precompiler` precompiles with:
+/// the last word `precompile --version` prints. A precompiled module is only
+/// loadable by the wasmtime that wrote it, so this string is what a policy
+/// package declares.
 fn wasmtime_version(precompiler: &Path) -> Discovered<String> {
-    if let Ok(reported) = Command::new(precompiler).arg("--version").output()
+    if let Ok(reported) = Command::new(precompiler)
+        .args([PRECOMPILE, "--version"])
+        .output()
         && reported.status.success()
     {
         let text = String::from_utf8_lossy(&reported.stdout);
@@ -832,7 +844,7 @@ fn wasmtime_version(precompiler: &Path) -> Discovered<String> {
         }
     }
     Err(format!(
-        "{} does not report a wasmtime version; it must print one for `--version`",
+        "{} does not report a wasmtime version; it must print one for `precompile --version`",
         precompiler.display()
     ))
 }

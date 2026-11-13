@@ -43,7 +43,7 @@ use axum::response::Response;
 use bytes::Bytes;
 use tokio::sync::{mpsc, oneshot};
 
-pub(crate) use frontend::body::{Session, Step};
+pub(crate) use crate::api::body::{Session, Step};
 pub(crate) use proto::handoff::stream::Application;
 
 use crate::http::handoff::Registration;
@@ -102,7 +102,7 @@ enum Produced {
     /// The response failed before its head was written: the connection states
     /// the failure in the head it has not sent yet.
     Failed {
-        error: frontend::openai::error::ApiError,
+        error: crate::api::openai::error::ApiError,
         frames: Vec<Bytes>,
     },
 }
@@ -113,7 +113,7 @@ pub(crate) enum Opened {
     /// The body's first frame.
     Frame(Bytes),
     /// The body failed before producing anything: the head states the outcome.
-    Failed(frontend::openai::error::ApiError, Vec<Bytes>),
+    Failed(crate::api::openai::error::ApiError, Vec<Bytes>),
     /// The body ended without producing anything.
     Ended,
 }
@@ -317,7 +317,7 @@ impl HandedBody {
 
     /// Takes the body out; the connection owns it from then on.
     pub(crate) fn take(&self) -> Option<Handed> {
-        crate::leader::locked(&self.0).take()
+        service::lock(&self.0).take()
     }
 }
 

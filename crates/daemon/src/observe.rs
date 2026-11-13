@@ -9,8 +9,6 @@ use std::time::{Duration, Instant};
 use proto::report::SchedulerStats;
 use serde::{Deserialize, Serialize};
 
-use crate::leader::locked;
-
 /// Average step time and throughput of one epoch over a span.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct Rates {
@@ -49,13 +47,13 @@ impl Observer {
     /// Records the report of scheduler `scheduler` of `epoch`.
     pub(crate) fn record(&self, epoch: u64, scheduler: u32, stats: &SchedulerStats) {
         if let Some(forward) = &stats.worker_forward_stats {
-            let mut profile = locked(&self.profile);
+            let mut profile = service::lock(&self.profile);
             for (key, value) in &forward.profile {
                 *profile.entry(key.clone()).or_default() += value;
             }
         }
         let now = Instant::now();
-        let mut samples = locked(&self.samples);
+        let mut samples = service::lock(&self.samples);
         samples.push_back(Sample {
             at: now,
             epoch,
@@ -83,7 +81,7 @@ impl Observer {
     /// `epoch`'s rates over the reports it made in `[from, until)`; `None`
     /// without a batch among them.
     pub(crate) fn rates_between(&self, epoch: u64, from: Instant, until: Instant) -> Option<Rates> {
-        let samples = locked(&self.samples);
+        let samples = service::lock(&self.samples);
         let (mut batch_us, mut batches, mut tokens) = (0_u64, 0_u64, 0_u64);
         let mut first: Option<Instant> = None;
         for sample in samples
@@ -116,7 +114,7 @@ impl Observer {
         until: Instant,
         mut visit: impl FnMut(&Sample),
     ) {
-        for sample in locked(&self.samples)
+        for sample in service::lock(&self.samples)
             .iter()
             .filter(|sample| sample.epoch == epoch && sample.at >= from && sample.at < until)
         {
@@ -128,7 +126,7 @@ impl Observer {
     /// steps their windows took, the bytes of their files, and the workers
     /// whose window ended.
     pub(crate) fn profile(&self, session: u64) -> (u64, u64, u64) {
-        let profile = locked(&self.profile);
+        let profile = service::lock(&self.profile);
         let counter = |name: &str| {
             profile
                 .get(&format!("{session}/{name}"))

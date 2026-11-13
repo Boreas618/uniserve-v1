@@ -35,7 +35,7 @@ use proto::process::{
     UsageReport, Welcome, downstream, event, from_member, hello, reply, request, to_member,
     upstream,
 };
-use proto::{Connection, Handed, Listener};
+use service::{Connection, Handed, Listener};
 
 use crate::supervision::claims::{self, ClaimHolder};
 use crate::supervision::processes::Greeting;
@@ -127,7 +127,7 @@ impl Local {
         );
         Ok(Self {
             supervisor: Supervisor::adopt(host, handoff.processes, processes)?,
-            claims: ClaimHolder::adopt(handoff.address, handoff.claims, claims),
+            claims: ClaimHolder::adopt(handoff.address, handoff.claims, claims)?,
             address: handoff.address,
             devices,
         })
@@ -291,7 +291,7 @@ impl Joins {
                 refusal: refusal.clone().unwrap_or_default(),
                 nodes: Vec::new(),
             };
-            let sent = connection.send(&welcome).is_ok();
+            let sent = connection.deliver(&welcome).is_ok();
             if let (None, Some(member), true) = (refusal, member, sent) {
                 tracing::info!(node_rank = member.node_rank, host = %member.host, "a node joined");
                 joined.push(Membership {
@@ -306,8 +306,8 @@ impl Joins {
 
     /// The descriptors a wait for joins polls.
     fn descriptors(&self) -> impl Iterator<Item = std::os::fd::RawFd> + '_ {
-        std::iter::once(self.listener.descriptor())
-            .chain(self.connecting.iter().map(Connection::descriptor))
+        std::iter::once(self.listener.as_raw_fd())
+            .chain(self.connecting.iter().map(Connection::as_raw_fd))
     }
 }
 
@@ -318,8 +318,8 @@ fn member_node(member: &Membership) -> Node {
         host: member.host.clone(),
         address: member
             .connection
-            .peer_ip()
-            .map(|address| address.to_string())
+            .peer_addr()
+            .map(|address| address.ip().to_string())
             .unwrap_or_default(),
     }
 }
@@ -381,7 +381,7 @@ fn report_exit(
     let _ = exits.send(exit.clone());
     let _ = wake.send(());
     if let Some(peer) = connection_of(reporter, engines, clients) {
-        let _ = peer.connection.send(&downstream_exit(exit));
+        let _ = peer.connection.deliver(&downstream_exit(exit));
     }
 }
 
@@ -654,7 +654,7 @@ pub(crate) fn run_leader(
             };
             if peer
                 .connection
-                .send(&Downstream {
+                .deliver(&Downstream {
                     kind: Some(downstream::Kind::Event(process::Event {
                         kind: Some(event::Kind::Command(command)),
                     })),
@@ -760,7 +760,7 @@ pub(crate) fn run_leader(
                                 refusal: refusal.clone().unwrap_or_default(),
                                 nodes: nodes.clone(),
                             };
-                            if peer.connection.send(&welcome).is_err() || refusal.is_some() {
+                            if peer.connection.deliver(&welcome).is_err() || refusal.is_some() {
                                 closed.push((engine, peer.owner));
                                 break;
                             }
@@ -857,7 +857,7 @@ pub(crate) fn run_leader(
                             &mut members,
                             &nodes,
                             &mut stops,
-                        ) && peer.connection.send(&downstream_reply(reply)).is_err()
+                        ) && peer.connection.deliver(&downstream_reply(reply)).is_err()
                         {
                             closed.push((engine, peer.owner));
                             break;
@@ -902,7 +902,7 @@ pub(crate) fn run_leader(
                             &mut members,
                             &nodes,
                             &mut stops,
-                        ) && peer.connection.send(&downstream_reply(reply)).is_err()
+                        ) && peer.connection.deliver(&downstream_reply(reply)).is_err()
                         {
                             gone.push(client);
                             break;
@@ -924,7 +924,7 @@ pub(crate) fn run_leader(
             stops.retain(|&(asker, _), _| asker != client);
             local.supervisor.release(client);
             for member in &mut members {
-                let _ = member.connection.send(&ToMember {
+                let _ = member.connection.deliver(&ToMember {
                     kind: Some(to_member::Kind::Released(client)),
                 });
             }
@@ -947,7 +947,7 @@ pub(crate) fn run_leader(
             tracing::info!(engine, "an engine disconnected; ending its processes");
             local.supervisor.release(engine);
             for member in &mut members {
-                let _ = member.connection.send(&ToMember {
+                let _ = member.connection.deliver(&ToMember {
                     kind: Some(to_member::Kind::Released(engine)),
                 });
             }
@@ -1110,11 +1110,11 @@ pub(crate) fn run_leader(
             report_exit(reporter, exit, &exits, &wake, &mut engines, &mut clients);
         }
 
-        let mut descriptors = vec![listener.descriptor(), stop.wake.as_raw_fd()];
+        let mut descriptors = vec![listener.as_raw_fd(), stop.wake.as_raw_fd()];
         descriptors.extend(joins.iter().flat_map(Joins::descriptors));
-        descriptors.extend(engines.values().map(|peer| peer.connection.descriptor()));
-        descriptors.extend(clients.values().map(|peer| peer.connection.descriptor()));
-        descriptors.extend(members.iter().map(|member| member.connection.descriptor()));
+        descriptors.extend(engines.values().map(|peer| peer.connection.as_raw_fd()));
+        descriptors.extend(clients.values().map(|peer| peer.connection.as_raw_fd()));
+        descriptors.extend(members.iter().map(|member| member.connection.as_raw_fd()));
         wait(&descriptors, EXIT_POLL_INTERVAL);
         stop.drain();
     }
@@ -1142,7 +1142,7 @@ fn deliver(
             let _ = waiter.send(reply);
         }
     } else if let Some(peer) = connection_of(engine, engines, clients) {
-        let _ = peer.connection.send(&downstream_reply(reply));
+        let _ = peer.connection.deliver(&downstream_reply(reply));
     }
 }
 
@@ -1193,7 +1193,7 @@ fn route(
     let forward = |member: &mut Membership| {
         member
             .connection
-            .send(&ToMember {
+            .deliver(&ToMember {
                 kind: Some(to_member::Kind::Forwarded(Forwarded {
                     engine,
                     owner,
@@ -1249,7 +1249,7 @@ pub(crate) fn serve_member(
         if stop.handoff() {
             let mut descriptors = Vec::new();
             let local = local.hand_over(&mut descriptors)?;
-            let leader = leader.hand_over();
+            let leader = leader.hand_over()?;
             let handoff = ServiceHandoff::Member {
                 local,
                 leader: ConnectionHandoff::of(&leader),
@@ -1273,7 +1273,7 @@ pub(crate) fn serve_member(
                         })),
                 })) => {
                     let reply = local.reply(owner, engine, &request);
-                    leader.send(&FromMember {
+                    leader.deliver(&FromMember {
                         kind: Some(from_member::Kind::Replied(Replied {
                             engine,
                             reply: Some(reply),
@@ -1293,7 +1293,7 @@ pub(crate) fn serve_member(
             }
         }
         for (engine, exit) in local.supervisor.exits() {
-            leader.send(&FromMember {
+            leader.deliver(&FromMember {
                 kind: Some(from_member::Kind::Exited(Exited {
                     engine,
                     exit: Some(exit),
@@ -1301,7 +1301,7 @@ pub(crate) fn serve_member(
             })?;
         }
         wait(
-            &[leader.descriptor(), stop.wake.as_raw_fd()],
+            &[leader.as_raw_fd(), stop.wake.as_raw_fd()],
             EXIT_POLL_INTERVAL,
         );
         stop.drain();
@@ -1439,13 +1439,13 @@ impl LeaderService {
         });
         let mut engine_handoffs = Vec::with_capacity(engines.len());
         for (id, engine) in engines {
-            let connection = engine.connection.hand_over();
+            let connection = engine.connection.hand_over()?;
             engine_handoffs.push((id, engine.welcomed, ConnectionHandoff::of(&connection)));
             descriptors.push(connection.descriptor);
         }
         let mut client_handoffs = Vec::with_capacity(clients.len());
         for (id, client) in clients {
-            let connection = client.connection.hand_over();
+            let connection = client.connection.hand_over()?;
             client_handoffs.push(ClientHandoff {
                 id,
                 owner: client.owner,
@@ -1456,7 +1456,7 @@ impl LeaderService {
         }
         let mut member_handoffs = Vec::with_capacity(members.len());
         for member in members {
-            let connection = member.connection.hand_over();
+            let connection = member.connection.hand_over()?;
             member_handoffs.push((
                 member.node_rank,
                 member.host,

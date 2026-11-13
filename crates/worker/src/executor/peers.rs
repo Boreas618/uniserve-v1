@@ -35,8 +35,8 @@ use std::time::{Duration, Instant};
 
 use crossbeam_channel::{Receiver, Sender};
 use ipc::{
-    Channel, Listener, MainProcessRequest, MainProcessResponse, MainProcessResponseError,
-    PeerAccepted, PeerRegistration,
+    Connection as Channel, Listener, MainProcessRequest, MainProcessResponse,
+    MainProcessResponseError, PeerAccepted, PeerRegistration,
 };
 use storage::runtime::{Completion, GroupId, Request};
 

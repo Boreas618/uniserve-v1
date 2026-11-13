@@ -34,7 +34,7 @@ use serde::Serialize;
 use tracing::{info, warn};
 
 use crate::engine::client::{EngineClient, EngineState};
-use crate::leader::{Leader, Replica, UpdateError, locked};
+use crate::leader::{Leader, Replica, UpdateError};
 use crate::observe::Rates;
 
 /// The span before a session's start its baseline step time averages.
@@ -192,14 +192,14 @@ impl Replica {
         request.validate().map_err(UpdateError::Refused)?;
         // Ranks that keep PC sampling enabled for their graphs refuse the
         // collectors CUPTI cannot run beside it.
-        let graph_pc_sampling = locked(&self.served)
+        let graph_pc_sampling = service::lock(&self.served)
             .as_ref()
             .is_some_and(|args| args.engine_config.profiling.graph_pc_sampling);
         if graph_pc_sampling && let Some(reason) = request.refused_beside_graph_pc_sampling() {
             return Err(UpdateError::Refused(reason));
         }
         let profiles = &self.profiles;
-        if let Some(running) = locked(&profiles.session)
+        if let Some(running) = service::lock(&profiles.session)
             .as_ref()
             .filter(|session| session.state == "running")
         {
@@ -293,8 +293,8 @@ impl Replica {
             device_storage,
         };
         let answer = serde_json::to_value(&session).unwrap_or_default();
-        *locked(&profiles.session) = Some(session);
-        *locked(&profiles.acted) = None;
+        *service::lock(&profiles.session) = Some(session);
+        *service::lock(&profiles.acted) = None;
         info!(session = id, epoch, "a profiling session started");
         tokio::spawn(watch(Arc::clone(self), id, started_at));
         Ok(answer)
@@ -302,7 +302,7 @@ impl Replica {
 
     /// The running session, or the last that ended; `None` before any.
     pub(crate) fn profile_status(&self) -> Option<Session> {
-        let mut session = locked(&self.profiles.session).clone()?;
+        let mut session = service::lock(&self.profiles.session).clone()?;
         if session.state == "running" {
             self.profiles.progress(&mut session, &self.observer);
         }
@@ -318,7 +318,7 @@ impl Replica {
         &self,
         reason: &str,
     ) -> Result<serde_json::Value, UpdateError> {
-        let id = locked(&self.profiles.session)
+        let id = service::lock(&self.profiles.session)
             .as_ref()
             .filter(|session| session.state == "running")
             .map(|session| session.id)
@@ -399,7 +399,7 @@ pub(crate) async fn end(
     grow: bool,
 ) {
     let (epoch, device_storage) = {
-        let mut session = locked(&replica.profiles.session);
+        let mut session = service::lock(&replica.profiles.session);
         let Some(running) = session
             .as_mut()
             .filter(|session| session.id == id && session.state == "running")
@@ -434,7 +434,7 @@ pub(crate) async fn end(
             grow_back(client, id).await;
         }
     }
-    let mut session = locked(&replica.profiles.session);
+    let mut session = service::lock(&replica.profiles.session);
     if let Some(ended) = session.as_mut().filter(|session| session.id == id) {
         ended.state = "ended".to_owned();
         ended.ended = Some(now());
@@ -458,7 +458,7 @@ pub(crate) async fn end_for_epoch(
     client: Option<&EngineClient>,
     reason: &str,
 ) {
-    let running = locked(&replica.profiles.session)
+    let running = service::lock(&replica.profiles.session)
         .as_ref()
         .filter(|session| session.state == "running")
         .map(|session| session.id);
@@ -473,7 +473,7 @@ async fn watch(replica: Arc<Replica>, id: u64, started: Instant) {
     loop {
         tokio::time::sleep(POLL).await;
         let (request, collectors, overhead) = {
-            let mut session = locked(&replica.profiles.session);
+            let mut session = service::lock(&replica.profiles.session);
             let Some(running) = session
                 .as_mut()
                 .filter(|session| session.id == id && session.state == "running")
@@ -515,13 +515,13 @@ async fn watch(replica: Arc<Replica>, id: u64, started: Instant) {
         if overhead.slowdown <= max {
             continue;
         }
-        let due = locked(&replica.profiles.acted)
+        let due = service::lock(&replica.profiles.acted)
             .is_none_or(|acted| acted.elapsed() >= GUARD_WINDOW)
             && started.elapsed() >= GUARD_WINDOW;
         if !due {
             continue;
         }
-        *locked(&replica.profiles.acted) = Some(Instant::now());
+        *service::lock(&replica.profiles.acted) = Some(Instant::now());
         let costliest = Collector::COSTLIEST_FIRST
             .into_iter()
             .find(|collector| collectors.contains(collector));
@@ -560,7 +560,7 @@ fn record(
     collector: Option<Collector>,
     slowdown: f64,
 ) {
-    let mut session = locked(&replica.profiles.session);
+    let mut session = service::lock(&replica.profiles.session);
     if let Some(running) = session.as_mut().filter(|session| session.id == id) {
         warn!(
             session = id,

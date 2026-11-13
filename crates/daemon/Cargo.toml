@@ -7,19 +7,35 @@ publish = false
 
 # The persistent process of one node: process supervision, the node's
 # Storage Server claim and the process interface between nodes and engines;
-# on the leader, the HTTP server and its connections, the served model's
-# facade over the engine processes, and the client of their request
-# interface. The API and every request's input and output processing are the
-# frontend's (`frontend::openai::Server` is what the daemon supplies).
+# on the leader, the HTTP server and its connections, the API server (`api`:
+# the OpenAI-compatible routes, input processing, output processing,
+# tokenizers and the wire protocol), the served model over the engine
+# processes, and the client of their request interface. The API server runs
+# no numerical code: of a model family it reads only what request processing
+# serves (`processing::Family`).
 [dependencies]
 anyhow.workspace = true
+asynk-strim-attr.workspace = true
 axum.workspace = true
+base64.workspace = true
 bytes.workspace = true
 clap.workspace = true
-frontend.workspace = true
+# The tokenizer's decoder chain, which the served tokenizer loads.
+fastokens.workspace = true
+fnv.workspace = true
 futures.workspace = true
+# The checkpoint's own files and the Hub's cache layout.
+hf-hub.workspace = true
 http-body.workspace = true
+image.workspace = true
+indexmap.workspace = true
+itertools.workspace = true
 libc.workspace = true
+llm-multimodal.workspace = true
+# The media decoders condition media is probed with, the ones that read it.
+media.workspace = true
+minijinja.workspace = true
+minijinja-contrib.workspace = true
 # The Build Server's client, which an epoch's modules are selected with
 # (`epoch`, the generation layer of a change).
 build-server.workspace = true
@@ -29,10 +45,16 @@ processing.workspace = true
 proto.workspace = true
 service.workspace = true
 reqwest = { workspace = true, features = ["http2", "rustls-tls"] }
+# The header of a checkpoint's safetensors file, read without its tensors.
+safetensors.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+serde-json-fmt.workspace = true
 serde_path_to_error.workspace = true
+serde_with.workspace = true
 sha2.workspace = true
+# The Storage Server's claim and protocol; content digests of media, in the key chain the cache
+# stores pages under.
 storage.workspace = true
 tempfile.workspace = true
 thiserror.workspace = true
@@ -43,11 +65,17 @@ toml.workspace = true
 tower.workspace = true
 tower-http.workspace = true
 tracing.workspace = true
+tracing-futures.workspace = true
+url.workspace = true
 uuid.workspace = true
+validator.workspace = true
+winnow.workspace = true
 
 [dev-dependencies]
-# The application crate's test fixtures, such as the byte tokenizer.
-frontend = { workspace = true, features = ["testing"] }
+criterion.workspace = true
+expect-test.workspace = true
+# Builds the deterministic serving tokenizers of the test fixtures (`api::test_support`).
+tokenizers.workspace = true
 # The test engine: the engine's own control thread over a fake executor and
 # an in-process buffer pool; and the fake engine and node daemon at the
 # process interface an update's tests drive.
@@ -55,6 +83,14 @@ testkit.workspace = true
 # The supervisor's stand-in rank process creates an interprocess event on a
 # device, as a rank does.
 platform.workspace = true
+
+[[bench]]
+name = "tokenizer_hf"
+harness = false
+
+[[bench]]
+name = "tool_parsers"
+harness = false
 
 [lints]
 workspace = true

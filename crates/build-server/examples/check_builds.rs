@@ -8,7 +8,7 @@
 //!     cargo run -p build-server --example check_builds -- \
 //!         --kernels <kernel package root> \
 //!         --python <the Build Server's interpreter> --nvcc <nvcc> \
-//!         --precompile <scheduling-precompile> --cargo <cargo> [--keys <key file>]
+//!         --precompile <uniserve-engine> --cargo <cargo> [--keys <key file>]
 //!
 //! `--keys` names a key file: a build of a source kind then takes the package of the first operator
 //! the file lists. The exit status is 1 when any build fails.
@@ -89,7 +89,7 @@ fn arguments() -> Result<Args, String> {
         kernels: kernels.ok_or("--kernels names the kernel package root")?,
         python: python.ok_or("--python names the Build Server's interpreter")?,
         nvcc: nvcc.ok_or("--nvcc names the CUDA compiler")?,
-        precompile: precompile.ok_or("--precompile names scheduling-precompile")?,
+        precompile: precompile.ok_or("--precompile names a uniserve-engine executable")?,
         cargo: cargo.ok_or("--cargo names the cargo that builds the policy fixture")?,
         keys,
     })

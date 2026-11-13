@@ -20,9 +20,9 @@ use std::time::{Duration, Instant};
 
 use ipc::batch::{Batch, BatchId, Columns, Extent, Phase, Shape};
 use proto::request::{Event, FinishReason, MigrationCause, RejectionKind, RequestId};
-use scheduling_guest::decision::{Shortage, Storage, Victim};
-use scheduling_guest::ids::{EncodingId, PageId, PhaseId};
-use scheduling_guest::{Duration as Span, Event as PolicyEvent};
+use scheduling::decision::{Shortage, Storage, Victim};
+use scheduling::ids::{EncodingId, PageId, PhaseId};
+use scheduling::{Duration as Span, Event as PolicyEvent};
 use storage::Key;
 use storage::runtime::{self, GroupId, OwnerId, Tier};
 
@@ -1387,10 +1387,10 @@ mod tests {
     use ipc::batch::Phase;
     use proto::config::{KvCacheConfig, WorkerGroupRole};
     use proto::request::{GenerationFeatures, GenerationLimits, GenerationRequest, RequestId};
-    use scheduling_guest::Event as PolicyEvent;
-    use scheduling_guest::ids::PageId;
-    use scheduling_guest::limits::{Limits, Parameters};
-    use scheduling_guest::view::Snapshot;
+    use scheduling::Event as PolicyEvent;
+    use scheduling::ids::PageId;
+    use scheduling::limits::{Limits, Parameters};
+    use scheduling::view::Snapshot;
     use storage::runtime::{self, Completion, OwnerId, Tier};
 
     use super::super::policy::tests::packaged;

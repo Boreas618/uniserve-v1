@@ -31,8 +31,8 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use ::storage::protocol::{Access, Claim, Key, Location, Role, Scope, StorageRecord};
-use ::storage::transport::{Connection, Socket};
 use serde::{Deserialize, Serialize};
+use service::{Connection, Handed};
 
 use crate::kv_storage::KvStorage;
 use crate::quota::Quotas;
@@ -64,6 +64,20 @@ enum Message {
     Serving,
     /// The successor gives up, and why.
     Failed { reason: String },
+}
+
+/// The handoff socket's messages are the Storage Server protocol's: MessagePack with named fields
+/// in descriptor frames, so a server hands over to a successor of another build.
+impl service::Message for Message {
+    const FRAMING: service::Framing = service::Framing::Descriptors;
+
+    fn encode(&self) -> io::Result<Vec<u8>> {
+        ::storage::protocol::encode(self)
+    }
+
+    fn decode(payload: &[u8]) -> io::Result<Self> {
+        ::storage::protocol::decode(payload)
+    }
 }
 
 /// A server's state, its descriptors travelling apart: first the listener
@@ -259,11 +273,11 @@ impl Server {
         let mut client_descriptors = Vec::with_capacity(self.clients.len());
         for (id, client) in std::mem::take(&mut self.clients) {
             let pidfd = client.pidfd.as_ref().map(|pidfd| pidfds.index(pidfd));
-            let (socket, received) = client.connection.handoff()?;
-            let (descriptor, unix) = match socket {
-                Socket::Unix(stream) => (OwnedFd::from(stream), true),
-                Socket::Tcp(stream) => (OwnedFd::from(stream), false),
-            };
+            let Handed {
+                descriptor,
+                unix,
+                received,
+            } = client.connection.hand_over()?;
             client_descriptors.push(descriptor);
             clients.push(ClientHandoff {
                 id,
@@ -362,39 +376,44 @@ impl Server {
             channel,
         } = pending;
         let pid = successor.id();
-        let mut connection = Connection::new(channel);
+        let mut connection = Connection::new(channel)?;
         let borrowed: Vec<BorrowedFd<'_>> = descriptors.iter().map(|fd| fd.as_fd()).collect();
-        connection.send(&Message::Takeover(Box::new(handoff)), &borrowed)?;
-        while !connection.flush()? {
-            std::thread::sleep(Duration::from_millis(5));
-        }
+        connection.send_with(&Message::Takeover(Box::new(handoff)), &borrowed)?;
+        connection.flush()?;
         drop(descriptors);
         let deadline = Instant::now() + STEP_TIMEOUT;
         loop {
-            if let Some((message, _)) = connection.next_frame::<Message>()? {
-                return match message {
-                    Message::Serving => {
-                        tracing::info!(pid, "the successor server serves");
-                        Ok(pid)
-                    }
-                    Message::Failed { reason } => Err(io::Error::other(format!(
-                        "the successor server gave up: {reason}"
-                    ))),
-                    Message::Takeover(_) => Err(io::Error::other(
-                        "the successor server responded out of protocol",
-                    )),
-                };
+            let mut closed = false;
+            match connection.try_recv::<Message>() {
+                Ok(Some(message)) => {
+                    return match message {
+                        Message::Serving => {
+                            tracing::info!(pid, "the successor server serves");
+                            Ok(pid)
+                        }
+                        Message::Failed { reason } => Err(io::Error::other(format!(
+                            "the successor server gave up: {reason}"
+                        ))),
+                        Message::Takeover(_) => Err(io::Error::other(
+                            "the successor server responded out of protocol",
+                        )),
+                    };
+                }
+                Ok(None) => {}
+                Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => closed = true,
+                Err(error) => return Err(error),
             }
             if let Some(status) = successor.try_wait()? {
                 return Err(io::Error::other(format!(
                     "the successor server exited: {status}"
                 )));
             }
-            if Instant::now() >= deadline || connection.is_closed() {
+            if closed || Instant::now() >= deadline {
                 return Err(io::Error::other("the successor server did not respond"));
             }
-            std::thread::sleep(Duration::from_millis(5));
-            connection.receive()?;
+            // Ended by the successor's answer, or after 5 ms to look at the successor again; a
+            // close is read by the next receive.
+            let _ = connection.wait(Duration::from_millis(5));
         }
     }
 
@@ -415,37 +434,27 @@ impl Server {
         // SAFETY: the predecessor placed the handoff socket at this
         // descriptor, which nothing else in this process owns.
         let channel = UnixStream::from(unsafe { OwnedFd::from_raw_fd(descriptor) });
-        let mut connection = Connection::new(channel);
-        let (message, descriptors) = loop {
-            if let Some(frame) = connection.next_frame::<Message>()? {
-                break frame;
-            }
-            if connection.is_closed() {
-                return Err(io::Error::other(
-                    "the predecessor closed the handoff socket",
-                ));
-            }
-            connection.receive()?;
-            std::thread::sleep(Duration::from_millis(5));
+        let mut connection = Connection::new(channel)?;
+        let closed = || io::Error::other("the predecessor closed the handoff socket");
+        let (message, descriptors) = match connection.recv_with::<Message>(Duration::MAX) {
+            Ok(Some(frame)) => frame,
+            Ok(None) => return Err(closed()),
+            Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => return Err(closed()),
+            Err(error) => return Err(error),
         };
         let Message::Takeover(handoff) = message else {
             return Err(io::Error::other("the predecessor sent no takeover"));
         };
         match Self::rebuild(*handoff, descriptors, connector, transfer) {
             Ok(resumed) => {
-                connection.send(&Message::Serving, &[])?;
-                while !connection.flush()? {
-                    std::thread::sleep(Duration::from_millis(5));
-                }
+                connection.send(&Message::Serving)?;
+                connection.flush()?;
                 Ok(resumed)
             }
             Err(error) => {
-                let _ = connection.send(
-                    &Message::Failed {
-                        reason: error.to_string(),
-                    },
-                    &[],
-                );
+                let _ = connection.send(&Message::Failed {
+                    reason: error.to_string(),
+                });
                 let _ = connection.flush();
                 Err(error)
             }
@@ -488,20 +497,15 @@ impl Server {
         };
         let mut clients = BTreeMap::new();
         for client in handoff.clients {
-            let descriptor = next()?;
-            let socket = if client.unix {
-                let stream = UnixStream::from(descriptor);
-                stream.set_nonblocking(true)?;
-                Socket::Unix(stream)
-            } else {
-                let stream = std::net::TcpStream::from(descriptor);
-                stream.set_nonblocking(true)?;
-                Socket::Tcp(stream)
-            };
+            let connection = Connection::resume(Handed {
+                descriptor: next()?,
+                unix: client.unix,
+                received: client.received,
+            })?;
             clients.insert(
                 client.id,
                 crate::Client {
-                    connection: Connection::resume(socket, client.received),
+                    connection,
                     pid: client.pid,
                     pidfd: client.pidfd.map(pidfd).transpose()?,
                     role: client.role,

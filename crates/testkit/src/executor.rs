@@ -38,7 +38,7 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::io::Write as _;
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::sync::{Arc, Mutex, MutexGuard};
 
 use crossbeam_channel::Sender;
 use engine::Error;
@@ -48,6 +48,7 @@ use ipc::batch::{
     TimingCounters,
 };
 use proto::request::RequestId;
+use service::lock;
 use storage::runtime::{self, Completion, GroupId, OwnerId, Request, Run, Stamps};
 
 use crate::text::{EOS, EndOfText, SAMPLED, draw_token, scored};
@@ -139,10 +140,6 @@ struct State {
     requests: HashMap<u64, Request>,
     answers: HashMap<u64, Completion>,
     violations: Vec<String>,
-}
-
-fn lock(state: &Mutex<State>) -> MutexGuard<'_, State> {
-    state.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
 impl FakeExecutor {

@@ -34,6 +34,7 @@ use platform::{DeviceId, PeerMapping, ShareableHandle};
 
 use super::contexts::Contexts;
 use super::devices::Gpus;
+use super::nixl;
 
 /// A mapping made once, or why it could not be made.
 type Once<T> = OnceLock<Result<T, String>>;

@@ -330,14 +330,14 @@ impl ClaimHolder {
         address: Option<std::net::IpAddr>,
         handoff: Handoff,
         descriptors: Vec<OwnedFd>,
-    ) -> Self {
+    ) -> storage::Result<Self> {
         let mut holder = Self::new(handoff.executable, handoff.remote_pages, address);
         for ((claim, tcp), descriptor) in handoff.claims.into_iter().zip(descriptors) {
             let deployment = claim.deployment.clone();
-            let client = storage::ClaimClient::resume(claim, descriptor);
+            let client = storage::ClaimClient::resume(claim, descriptor)?;
             holder.claims.insert(deployment, (client, tcp));
         }
-        holder
+        Ok(holder)
     }
 }
 

@@ -17,7 +17,8 @@ use std::time::Duration;
 use proto::report::SchedulerStats;
 use proto::request::wire::{self, from_engine, to_engine};
 use proto::request::{EVENT_WINDOW, Event, GenerationLimits, Request, RequestId};
-use proto::{Connection, MappedMedia, MediaReceiver};
+use proto::{MappedMedia, MediaReceiver};
+use service::{Connection, lock};
 use tokio::sync::{mpsc, oneshot, watch};
 
 /// How long a read of the engine's frames waits before it rechecks whether
@@ -77,14 +78,6 @@ impl From<wire::EngineInfo> for EngineInfo {
     }
 }
 
-/// Locks `mutex`, keeping the state a panicking holder left: every build
-/// profile aborts on panic, so only test builds reach the recovery.
-fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
-    mutex
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-}
-
 /// Where an engine is in its life, as its client knows it: the lifecycle
 /// the engine announces on its request link, and `Stopped` once its
 /// connection closed.
@@ -107,7 +100,13 @@ pub enum EngineState {
     Failed(String),
 }
 
-pub use frontend::input::SubmitError;
+/// Why a request could not be submitted to an engine.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum SubmitError {
+    /// The engine serves no requests.
+    #[error("the engine is unavailable: {0}")]
+    Unavailable(String),
+}
 
 /// Receives each scheduler's statistics: the scheduler's index and its
 /// snapshot of the last interval.
@@ -160,12 +159,15 @@ enum Response {
 }
 
 impl Shared {
-    /// Sends one frame to the engine and says whether it was taken; a closed
-    /// connection is ordinarily the reader's to report, so a caller that has
-    /// nowhere else to learn of it reads the result instead.
-    fn write(&self, kind: to_engine::Kind) -> proto::Result<()> {
+    /// Sends one frame to the engine, waiting until the socket took all of it,
+    /// and says whether it was taken; a closed connection is ordinarily the
+    /// reader's to report, so a caller that has nowhere else to learn of it
+    /// reads the result instead.
+    fn write(&self, kind: to_engine::Kind) -> std::io::Result<()> {
         let message = wire::ToEngine { kind: Some(kind) };
-        lock(&self.writer).send(&message)
+        let mut writer = lock(&self.writer);
+        writer.send(&message)?;
+        writer.flush()
     }
 
     /// Sends one frame to the engine; a closed connection is the reader's to
@@ -767,7 +769,7 @@ impl EngineClient {
     /// on serving its other daemons. Waits until the reader ended.
     pub fn detach(&self) {
         self.detached.store(true, Ordering::Release);
-        lock(&self.shared.writer).close();
+        lock(&self.shared.writer).shutdown();
         let reader = lock(&self.reader).take();
         if let Some(reader) = reader
             && reader.join().is_err()
@@ -837,7 +839,7 @@ fn read_frames(mut reader: Connection, shared: &Shared, stats: &StatsSink) {
                 }
                 continue;
             }
-            Err(proto::Error::Closed) => break,
+            Err(error) if error.kind() == std::io::ErrorKind::UnexpectedEof => break,
             Err(error) => {
                 tracing::error!(%error, "the engine's connection failed");
                 break;

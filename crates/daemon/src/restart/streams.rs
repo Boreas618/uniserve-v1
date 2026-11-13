@@ -55,10 +55,10 @@ use proto::handoff;
 use serde::{Deserialize, Serialize};
 use tracing::{info, warn};
 
+use crate::api::openai::video_jobs::VideoJobs;
 use crate::http::handoff::{Decision, FrozenStream};
 use crate::http::stream::ResponseStream;
 use crate::leader::Leader;
-use frontend::openai::video_jobs::VideoJobs;
 
 /// One response the predecessor froze, as it travels to the successor.
 ///
@@ -278,13 +278,13 @@ static ADOPTED: Mutex<Vec<Adopted>> = Mutex::new(Vec::new());
 
 /// Queues the responses this process took over for its HTTP server.
 pub(crate) fn queue(adopted: Vec<Adopted>) {
-    let mut queue = crate::leader::locked(&ADOPTED);
+    let mut queue = service::lock(&ADOPTED);
     queue.extend(adopted);
 }
 
 /// Takes the responses this process took over.
 pub(crate) fn take_adopted() -> Vec<Adopted> {
-    std::mem::take(&mut crate::leader::locked(&ADOPTED))
+    std::mem::take(&mut service::lock(&ADOPTED))
 }
 
 /// One response a successor took over, as it reports it to the predecessor.
@@ -366,13 +366,13 @@ fn take_over(
                 &chat.engine_request_id,
                 chat.consumed_events,
             )?;
-            let started = frontend::output::started_instant(
+            let started = crate::api::output::started_instant(
                 chat.lowering
                     .as_ref()
                     .map_or(0, |lowering| lowering.started_unix_us),
             );
             let stats = leader.stat_logger(&state.request_id, chat.engine_replica, started);
-            let run = frontend::openai::run::GenerationRun::resume_stream(
+            let run = crate::api::openai::run::GenerationRun::resume_stream(
                 &chat,
                 leader.tokenizer(),
                 Box::new(events),
@@ -388,13 +388,13 @@ fn take_over(
                 &chat.engine_request_id,
                 chat.consumed_events,
             )?;
-            let started = frontend::output::started_instant(
+            let started = crate::api::output::started_instant(
                 chat.lowering
                     .as_ref()
                     .map_or(0, |lowering| lowering.started_unix_us),
             );
             let stats = leader.stat_logger(&state.request_id, chat.engine_replica, started);
-            let run = frontend::openai::run::GenerationRun::resume_collection(
+            let run = crate::api::openai::run::GenerationRun::resume_collection(
                 &chat,
                 leader.tokenizer(),
                 Box::new(events),
@@ -413,7 +413,7 @@ fn take_over(
                     content.job_id
                 )
             })?;
-            let run = frontend::openai::run::VideoContentRun::new(
+            let run = crate::api::openai::run::VideoContentRun::new(
                 content.job_id.clone(),
                 content.content_type.clone(),
                 media,

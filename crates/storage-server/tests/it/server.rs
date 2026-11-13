@@ -1005,22 +1005,22 @@ fn a_server_serves_its_own_protocol_only() {
     Client::connect(&server.socket, Role::Operator).unwrap();
 
     let welcome = |version: u32| {
-        let mut connection = ::storage::transport::Connection::new(
+        let mut connection = service::Connection::new(
             std::os::unix::net::UnixStream::connect(&server.socket).unwrap(),
-        );
+        )
+        .unwrap();
         connection
-            .send(
-                &::storage::protocol::ClientMessage::Hello(::storage::protocol::Hello {
+            .send(&::storage::protocol::ClientMessage::Hello(
+                ::storage::protocol::Hello {
                     version,
                     role: Role::Operator,
-                }),
-                &[],
-            )
+                },
+            ))
             .unwrap();
         connection
-            .recv::<::storage::protocol::ServerMessage>()
+            .recv::<::storage::protocol::ServerMessage>(std::time::Duration::from_secs(30))
             .unwrap()
-            .0
+            .unwrap()
     };
     assert!(matches!(
         welcome(VERSION),

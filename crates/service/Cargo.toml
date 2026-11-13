@@ -8,7 +8,9 @@ publish = false
 # A host service: one server per host and serving user on a Unix socket in
 # the user's runtime directory, owned by a lock, started detached from its
 # starter when absent. The Storage Server and the Build Server are both
-# host services; this crate depends on no workspace crate and links no CUDA.
+# host services. The framing and the one connection every process interface
+# runs on are here too. This crate depends on no workspace crate and links no
+# CUDA.
 [dependencies]
 libc.workspace = true
 rustix = { workspace = true, features = ["net"] }

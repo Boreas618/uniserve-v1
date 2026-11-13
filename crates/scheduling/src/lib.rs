@@ -1,62 +1,73 @@
-//! The host side of the scheduling policy: the wasmtime engine a policy module is compiled for
-//! and loaded with, and the wasmtime version a policy package declares.
+//! The interface between the scheduling mechanism and a scheduling policy.
 //!
-//! A policy is a `wasm32` module of `crates/scheduling/policies`, built against the interface of
-//! `crates/scheduling/guest`. The Build Server precompiles it with the `scheduling-precompile`
-//! binary of this crate, and the engine's schedulers load it with the same [`Engine`] and run it
-//! under fuel (`engine::scheduler::policy`).
+//! This crate is compiled into every policy module (wasm32) and into the
+//! mechanism (native), so both sides are built from the same types and the same
+//! wire format. It holds, as design §4.4 gives them, the policy interface, the
+//! events the mechanism hands to the policy, the decisions the policy returns,
+//! and the snapshot and views a policy reads.
+//!
+//! # Append-only views and events
+//!
+//! Views and events are append-only lists (design §4.4): the mechanism is the
+//! epoch layer and a policy is the generation layer, so a newer mechanism may run
+//! an older policy module. The wire format is therefore self-describing JSON:
+//! a reader ignores struct fields it does not know and skips an event kind it
+//! does not know ([`event::Event::Unknown`]), and every field a policy writes
+//! has a default so a reader tolerates a field an older policy did not write.
+//! Adding a field, an event kind, a view or a decision entry needs no ABI
+//! change; changing what an existing field means does.
+//!
+//! # The ABI
+//!
+//! A policy module exports the functions named in [`wire`]: `sched_alloc` and
+//! `sched_free` for the linear-memory buffers, and one function per decision
+//! with its input as `(ptr, len)` and its reply packed into a `u64`
+//! (`ptr << 32 | len`, `0` for an empty reply) or, for [`Call::Route`] and
+//! [`Call::Place`], the chosen index directly. The mechanism resets the fuel
+//! budget before every call and treats a trap or an exhausted budget as a
+//! policy failure (design §4.4).
+//!
+//! A policy implements [`policy::Policy`]; the `export_policy!` macro (in the
+//! guest helpers) generates the exports for it.
 
-mod engine;
-mod error;
-
-pub use engine::Engine;
-pub use error::PolicyError;
-
-/// The wasmtime version this crate is built against, which a policy package
-/// declares in its `[toolchain]` and which the Build Server's
-/// `scheduling-precompile` reports (§5.2, §5.3).
+/// The version of the scheduling policy interface: the calls of [`wire`] and
+/// what their messages mean.
 ///
-/// A precompiled module carries wasmtime's own artifact format and the
-/// configuration it was compiled with, so a module precompiled by another
-/// wasmtime version, or with another `Config`, is rejected at load. This
-/// constant and the `wasmtime` version the workspace's `Cargo.toml` pins are
-/// therefore one fact, and a test below fails if they drift.
-pub const WASMTIME_VERSION: &str = "50.0.1";
+/// A policy package's manifest states the version it implements
+/// (`interface_version`), and the mechanism refuses to instantiate a module
+/// built for another. An addition a reader tolerates, as described above,
+/// leaves the version; a change of what an existing call or field means
+/// raises it.
+pub const INTERFACE_VERSION: u32 = 1;
 
-#[cfg(test)]
-mod tests {
-    use super::WASMTIME_VERSION;
+pub mod abi;
+pub mod arrival;
+pub mod budget;
+pub mod decision;
+pub mod event;
+pub mod ids;
+pub mod limits;
+pub mod lru;
+pub mod phases;
+pub mod policy;
+pub mod time;
+pub mod view;
+pub mod waiting;
+pub mod wire;
 
-    /// The declared wasmtime version is the one the workspace's `Cargo.toml`
-    /// pins for this crate and the engine: a package's `[toolchain]` names it,
-    /// and a module precompiled against another version would not load.
-    #[test]
-    fn the_declared_wasmtime_version_is_the_one_cargo_pins() {
-        let manifest = include_str!("../../../Cargo.toml");
-        let pin = format!("version = \"{WASMTIME_VERSION}\"");
-        assert!(
-            manifest.contains(&pin),
-            "Cargo.toml does not pin {pin}: the declared wasmtime version and the dependency drifted"
-        );
-    }
-
-    /// The default policies' packages declare the same wasmtime version: the
-    /// Build Server precompiles a package with the toolchain its manifest
-    /// names, and a module precompiled by another version does not load.
-    #[test]
-    fn the_default_policies_declare_the_same_wasmtime_version() {
-        let decl = format!("version = \"{WASMTIME_VERSION}\"");
-        for (backend, manifest) in [
-            ("fcfs", include_str!("../policies/fcfs/package.toml")),
-            (
-                "priority",
-                include_str!("../policies/priority/package.toml"),
-            ),
-        ] {
-            assert!(
-                manifest.contains(&decl),
-                "the {backend} package does not declare {decl}"
-            );
-        }
-    }
-}
+pub use abi::*;
+pub use arrival::Arrival;
+pub use budget::{Shares, Step, prefill_chunk, work_tokens};
+pub use decision::{DispatchOutput, Inflight, Room, Shortage, Storage, Victim, Work};
+pub use event::{End, Event};
+pub use ids::{EncodingId, PageId, PhaseId, RequestId, StageId};
+pub use limits::{Limits, Parameters};
+pub use lru::Lru;
+pub use phases::Phases;
+pub use policy::{Instantiation, Policy};
+pub use time::{Duration, Nanos};
+pub use view::{
+    CallView, EncodingView, PageView, Phase, PhaseClass, PhaseView, RankView, ReplicaView,
+    RequestClass, RequestStatus, RequestView, Snapshot,
+};
+pub use waiting::{ArrivalOrder, Order, PriorityOrder, Waiting};

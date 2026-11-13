@@ -11,19 +11,16 @@ members = [
     "crates/daemon",
     "crates/engine",
     "crates/worker",
-    "crates/frontend",
     "crates/ipc",
     "crates/manager",
     "crates/media",
     "crates/models",
-    "crates/nixl",
     "crates/nn",
     "crates/ops",
     "crates/processing",
     "crates/build-server",
     "crates/proto",
     "crates/scheduling",
-    "crates/scheduling/guest",
     "crates/scheduling/policies/fcfs",
     "crates/scheduling/policies/fixture",
     "crates/scheduling/policies/priority",
@@ -80,19 +77,16 @@ tensor = { path = "crates/tensor" }
 daemon = { path = "crates/daemon" }
 engine = { path = "crates/engine" }
 worker = { path = "crates/worker" }
-frontend = { path = "crates/frontend" }
 ipc = { path = "crates/ipc" }
 media = { path = "crates/media" }
 nn = { path = "crates/nn" }
 ops = { path = "crates/ops" }
 models = { path = "crates/models" }
-nixl = { path = "crates/nixl" }
 processing = { path = "crates/processing" }
 build-server = { path = "crates/build-server" }
 proto = { path = "crates/proto" }
 scheduling = { path = "crates/scheduling" }
 testkit = { path = "crates/testkit" }
-scheduling-guest = { path = "crates/scheduling/guest" }
 scheduling-policy-fcfs = { path = "crates/scheduling/policies/fcfs" }
 scheduling-policy-priority = { path = "crates/scheduling/policies/priority" }
 service = { path = "crates/service" }
@@ -154,6 +148,8 @@ rmp-serde = "1.3.1"
 # A profiling session's file: SQLite, built from its amalgamation so the
 # worker library depends on no system SQLite.
 rusqlite = { version = "0.41.0", features = ["bundled"] }
+# The safetensors format: the header a checkpoint file starts with, and its tensors.
+safetensors = "0.8.0"
 rustix = { version = "1.1.4", features = ["event", "net"] }
 serde = { version = "1.0.228", features = ["derive"] }
 serde_bytes = "0.11"
@@ -185,10 +181,11 @@ tracing-subscriber = { version = "0.3.20", features = ["env-filter", "fmt"] }
 url = "2.5.8"
 uuid = { version = "1.22.0", features = ["v4"] }
 validator = { version = "0.20.0", features = ["derive"] }
-# The runtime of the scheduling policy modules: the engine instantiates and calls them, and the
-# policy host (`crates/scheduling`) configures the engine they are compiled for and precompiles
-# them. One pin, since a module precompiled by another wasmtime version does not load
-# (`scheduling::WASMTIME_VERSION`). Only the JIT, the runtime and `std`: no WASI, no async.
+# The runtime of the scheduling policy modules: the engine's policy host
+# (`engine::scheduler::policy`) configures it, precompiles the modules (`uniserve-engine
+# precompile`), instantiates them and calls them. One pin, since a module precompiled by another
+# wasmtime version does not load (`engine::scheduler::policy::WASMTIME_VERSION`). Only the JIT,
+# the runtime and `std`: no WASI, no async.
 wasmtime = { version = "50.0.1", default-features = false, features = [
     "cranelift",
     "runtime",

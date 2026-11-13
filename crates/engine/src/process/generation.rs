@@ -29,8 +29,8 @@ use anyhow::{Context as _, Result, anyhow};
 use build_server::{Client, Target};
 use crossbeam_channel::{RecvTimeoutError, Sender};
 use proto::module::{ModuleSlot, PackageRevision, Packages, PhaseKind};
-use scheduling_guest::limits::{Limits, Parameters};
-use scheduling_guest::view::Snapshot;
+use scheduling::limits::{Limits, Parameters};
+use scheduling::view::Snapshot;
 use worker::completion::{Outcome, Submission};
 use worker::{Executor, lock};
 
@@ -39,7 +39,8 @@ use crate::data_plane::DataPlane;
 use crate::executor::Shadow;
 use crate::modules::load::{self, install, select};
 use crate::modules::select::{Routes, replaced_operators};
-use crate::scheduler::{Message, Policy};
+use crate::scheduler::Message;
+use crate::scheduler::policy::Policy;
 
 /// The packages the daemon's `Prepare` names: each operator's package under its slot, and the
 /// scheduling policy's package. The Protobuf carries a package's arguments as the TOML text of

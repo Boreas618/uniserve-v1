@@ -2488,7 +2488,7 @@ mod tests {
             engine,
             vec![(groups[0].clone(), stated)],
             idle_policy(),
-            scheduling_guest::Parameters::default(),
+            scheduling::Parameters::default(),
             Box::new(Stamps(Arc::clone(&stamped))),
             output,
             Arc::new(std::sync::atomic::AtomicU64::new(0)),

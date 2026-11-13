@@ -1,7 +1,7 @@
 //! Worker request and response envelopes.
 //!
 //! One [`MainProcessRequest`] or [`MainProcessResponse`] is the message of one
-//! [`Frame`]. Each envelope's optional `message_id` is the
+//! frame of the peer link ([`crate::link`]). Each envelope's optional `message_id` is the
 //! request-response correlation identity: a rank responds to a request under the
 //! identity it carried, and a transport that matches a response to its request
 //! reads the identity from the decoded envelope, taking `None` as zero. The one

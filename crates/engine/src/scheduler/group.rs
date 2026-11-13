@@ -443,7 +443,7 @@ mod tests {
             QueuePair::create(4096, 1).unwrap(),
             groups,
             crate::scheduler::tests::idle_policy(),
-            scheduling_guest::Parameters::default(),
+            scheduling::Parameters::default(),
             Box::new(Idle),
             output,
             Arc::new(AtomicU64::new(0)),

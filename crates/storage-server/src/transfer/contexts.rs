@@ -46,6 +46,7 @@ use std::time::Instant;
 
 use platform::{DeviceId, HostRegistration, PeerMapping, PrimaryContext, Protection};
 
+use super::nixl;
 use super::storage::{HostMap, Mapping};
 
 /// A value made once, or why it could not be made.

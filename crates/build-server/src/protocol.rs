@@ -1,7 +1,8 @@
 //! The Build Server's protocol and its client (design section 6.3).
 //!
-//! A connection to the Build Server speaks length-delimited Protobuf
-//! frames: the client sends one [`wire::Request`], the server responds with
+//! A connection to the Build Server is the workspace's one connection
+//! (`service::Connection`) carrying Protobuf messages in descriptor frames:
+//! the client sends one [`wire::Request`], the server responds with
 //! [`wire::ServerMessage`] frames until the one that responds to the request.
 //! AOT builds report themselves as [`Progress`] frames while `prepare` runs;
 //! `resolve` reports JIT builds the same way. A `resolve` response's module
@@ -19,14 +20,14 @@
 //! package revision changes, and [`Client::cover`] to learn which installed package
 //! builds each descriptor key of an operator the deployment does not name.
 
-use std::collections::VecDeque;
 use std::io;
-use std::os::fd::{AsFd, OwnedFd};
+use std::os::fd::OwnedFd;
 use std::os::unix::net::UnixStream;
 use std::path::Path;
+use std::time::Duration;
 
 use prost::Message;
-use service::frame;
+use service::Connection;
 
 use crate::builder::BuildState;
 use crate::manifest::ModuleForm;
@@ -39,9 +40,6 @@ use proto::module::{ModuleSlot, PackageRevision, PhaseKind};
 pub mod wire {
     include!(concat!(env!("OUT_DIR"), "/uniserve.build_server.rs"));
 }
-
-/// Bytes one receive reads at most.
-const READ_CHUNK: usize = 64 * 1024;
 
 /// An installed package.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -375,15 +373,6 @@ fn prepare_message(request: &PrepareRequest) -> Result<wire::Prepare> {
     })
 }
 
-/// A connection to the Build Server: framed messages, and the descriptors
-/// that travel with them.
-#[derive(Debug)]
-pub struct Connection {
-    stream: UnixStream,
-    inbox: Vec<u8>,
-    descriptors: VecDeque<OwnedFd>,
-}
-
 /// How long a `prepare` or a `resolve` waits through a restart, and how often
 /// it looks for the server again (design section 7.5 bounds the wait).
 ///
@@ -404,80 +393,58 @@ fn pause_until(deadline: std::time::Instant) -> bool {
     true
 }
 
-/// Reads one response frame on `connection`.
-fn response_on(connection: &mut Connection) -> Result<wire::server_message::Message> {
-    let (message, descriptors) = connection.receive::<wire::ServerMessage>()?;
+/// Reads one response frame on `connection`, with the descriptors that rode on it: a `resolve`
+/// response's files, which the client pairs with the names the response lists.
+fn response_on(
+    connection: &mut Connection,
+) -> Result<(wire::server_message::Message, Vec<OwnedFd>)> {
+    let (message, descriptors) = connection
+        .recv_with::<wire::ServerMessage>(Duration::MAX)?
+        .ok_or_else(|| unexpected(None))?;
     let response = message.message.ok_or_else(|| unexpected(None))?;
-    connection.hold(descriptors);
-    Ok(response)
+    Ok((response, descriptors))
 }
 
-impl Connection {
-    /// Opens a blocking connection to a Build Server's socket.
-    pub fn connect(socket: &Path) -> Result<Connection> {
-        Ok(Connection::new(UnixStream::connect(socket)?))
-    }
-
-    /// Wraps a stream, as the server does for an accepted connection.
-    pub fn new(stream: UnixStream) -> Connection {
-        Connection {
-            stream,
-            inbox: Vec::new(),
-            descriptors: VecDeque::new(),
-        }
-    }
-
-    /// Sends one frame with the descriptors that belong to it, as a descriptor frame of the
-    /// workspace's framing module (`service::frame`): they ride on the frame's first byte, so a
-    /// receiver that reads a frame exactly never gets another frame's descriptors.
-    pub fn send<M: Message>(&mut self, message: &M, descriptors: &[OwnedFd]) -> Result<()> {
-        let owned = descriptors
-            .iter()
-            .map(OwnedFd::try_clone)
-            .collect::<io::Result<Vec<_>>>()?;
-        for mut segment in frame::descriptor_frame(&message.encode_to_vec(), owned)? {
-            while !segment.sent() {
-                segment.send(self.stream.as_fd())?;
-            }
-        }
-        Ok(())
-    }
-
-    /// Receives one frame and the descriptors that came with it.
-    pub fn receive<M: Message + Default>(&mut self) -> Result<(M, Vec<OwnedFd>)> {
-        loop {
-            if let Some((payload, descriptors)) =
-                frame::take_descriptor_frame(&mut self.inbox, &mut self.descriptors)
-            {
-                let message = M::decode(payload.as_slice())
-                    .map_err(|error| Error::Protocol(format!("undecodable frame: {error}")))?;
-                return Ok((message, descriptors));
-            }
-            self.fill()?;
-        }
-    }
-
-    /// Reads the bytes the current frame still needs, and the descriptors that ride on them.
-    fn fill(&mut self) -> Result<()> {
-        let frame_bytes = frame::descriptor_frame_bytes(&self.inbox).unwrap_or(frame::HEADER_BYTES);
-        let needed = frame_bytes.saturating_sub(self.inbox.len()).max(1);
-        let mut buffer = vec![0_u8; needed.min(READ_CHUNK)];
-        let received = frame::receive_with_descriptors(
-            self.stream.as_fd(),
-            &mut buffer,
-            &mut self.descriptors,
-        )?;
-        if received == 0 {
-            return Err(Error::Io(io::Error::from(io::ErrorKind::UnexpectedEof)));
-        }
-        self.inbox.extend_from_slice(&buffer[..received]);
-        Ok(())
-    }
+/// Connects to the Build Server listening at `socket`.
+///
+/// # Errors
+///
+/// Fails when nothing listens there, which [`Error::away`] reads as a server that is away.
+pub fn connect(socket: &Path) -> Result<Connection> {
+    Ok(Connection::new(UnixStream::connect(socket)?)?)
 }
+
+/// The messages of the protocol on the workspace's one connection: each a descriptor frame
+/// (`service::frame`) whose payload is the message's Protobuf encoding, with the descriptors the
+/// message names riding on it, so a receiver that reads a frame never gets another frame's
+/// descriptors.
+macro_rules! messages {
+    ($($message:ty),* $(,)?) => {
+        $(
+            impl service::Message for $message {
+                const FRAMING: service::Framing = service::Framing::Descriptors;
+
+                fn encode(&self) -> io::Result<Vec<u8>> {
+                    Ok(Message::encode_to_vec(self))
+                }
+
+                fn decode(payload: &[u8]) -> io::Result<Self> {
+                    <Self as Message>::decode(payload).map_err(|error| {
+                        io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            format!("undecodable frame: {error}"),
+                        )
+                    })
+                }
+            }
+        )*
+    };
+}
+
+messages!(wire::Request, wire::ServerMessage);
 
 /// A connection to a Build Server, as its clients speak it: the daemon
 /// prepares package revisions with it, and the main process resolves them.
-#[derive(Debug)]
 pub struct Client {
     connection: Connection,
     /// The socket this client was opened on, when it was opened by its path.
@@ -490,7 +457,7 @@ impl Client {
     /// Opens a connection to the Build Server at `socket`.
     pub fn connect(socket: &Path) -> Result<Client> {
         Ok(Client {
-            connection: Connection::connect(socket)?,
+            connection: connect(socket)?,
             socket: Some(socket.to_path_buf()),
         })
     }
@@ -517,12 +484,9 @@ impl Client {
                 ))
             })?
             .to_owned();
-        self.connection.send(
-            &wire::Request {
-                request: Some(wire::request::Request::Install(wire::Install { package })),
-            },
-            &[],
-        )?;
+        self.connection.deliver(&wire::Request {
+            request: Some(wire::request::Request::Install(wire::Install { package })),
+        })?;
         match self.response()? {
             wire::server_message::Message::Installed(installed) => installed
                 .package
@@ -557,14 +521,11 @@ impl Client {
         request: &PrepareRequest,
         progress: &mut dyn FnMut(Progress),
     ) -> Result<Vec<(ModuleSlot, PackageRevision)>> {
-        connection.send(
-            &wire::Request {
-                request: Some(wire::request::Request::Prepare(prepare_message(request)?)),
-            },
-            &[],
-        )?;
+        connection.deliver(&wire::Request {
+            request: Some(wire::request::Request::Prepare(prepare_message(request)?)),
+        })?;
         loop {
-            match response_on(connection)? {
+            match response_on(connection)?.0 {
                 wire::server_message::Message::Progress(step) => progress(step.into()),
                 wire::server_message::Message::Prepared(prepared) => {
                     let mut chosen = Vec::with_capacity(prepared.packages.len());
@@ -609,25 +570,22 @@ impl Client {
         descriptor: &str,
         progress: &mut dyn FnMut(Progress),
     ) -> Result<Module> {
-        connection.send(
-            &wire::Request {
-                request: Some(wire::request::Request::Resolve(wire::Resolve {
-                    op: op.to_owned(),
-                    package: Some(revision.into()),
-                    target: target.to_string(),
-                    descriptor: descriptor.to_owned(),
-                })),
-            },
-            &[],
-        )?;
+        connection.deliver(&wire::Request {
+            request: Some(wire::request::Request::Resolve(wire::Resolve {
+                op: op.to_owned(),
+                package: Some(revision.into()),
+                target: target.to_string(),
+                descriptor: descriptor.to_owned(),
+            })),
+        })?;
         loop {
-            match response_on(connection)? {
+            let (response, descriptors) = response_on(connection)?;
+            match response {
                 wire::server_message::Message::Progress(step) => progress(step.into()),
                 wire::server_message::Message::Resolved(resolved) => {
                     let form = wire::ModuleForm::try_from(resolved.form)
                         .map_err(|_| Error::Protocol("unknown module form".into()))?
                         .try_into()?;
-                    let descriptors = connection.take_descriptors();
                     if descriptors.len() != resolved.files.len() {
                         return Err(Error::Protocol(format!(
                             "a module names {} files and came with {}",
@@ -666,12 +624,9 @@ impl Client {
 
     /// Lists every installed package revision with its modules.
     pub fn list(&mut self) -> Result<Vec<(Package, Vec<ModuleEntry>)>> {
-        self.connection.send(
-            &wire::Request {
-                request: Some(wire::request::Request::List(wire::List {})),
-            },
-            &[],
-        )?;
+        self.connection.deliver(&wire::Request {
+            request: Some(wire::request::Request::List(wire::List {})),
+        })?;
         match self.response()? {
             wire::server_message::Message::Listing(listing) => {
                 let mut packages = Vec::with_capacity(listing.packages.len());
@@ -712,33 +667,30 @@ impl Client {
     /// Returns which installed package covers each of an operator's
     /// descriptor keys for `request.targets`; nothing is built.
     pub fn cover(&mut self, request: &CoverRequest) -> Result<Coverage> {
-        self.connection.send(
-            &wire::Request {
-                request: Some(wire::request::Request::Cover(wire::Cover {
-                    op: request.op.clone(),
-                    targets: request.targets.iter().map(Target::to_string).collect(),
-                    keys: request.keys.clone(),
-                    preferred: request
-                        .preferred
-                        .iter()
-                        .map(|preference| wire::Preference {
-                            phase: phase_to_wire(preference.phase),
-                            backend: preference.backend.clone(),
-                            revision: preference.revision.unwrap_or(0),
-                        })
-                        .collect(),
-                    fixed: request
-                        .fixed
-                        .iter()
-                        .map(|(backend, revision)| wire::FixedRevision {
-                            backend: backend.clone(),
-                            revision: *revision,
-                        })
-                        .collect(),
-                })),
-            },
-            &[],
-        )?;
+        self.connection.deliver(&wire::Request {
+            request: Some(wire::request::Request::Cover(wire::Cover {
+                op: request.op.clone(),
+                targets: request.targets.iter().map(Target::to_string).collect(),
+                keys: request.keys.clone(),
+                preferred: request
+                    .preferred
+                    .iter()
+                    .map(|preference| wire::Preference {
+                        phase: phase_to_wire(preference.phase),
+                        backend: preference.backend.clone(),
+                        revision: preference.revision.unwrap_or(0),
+                    })
+                    .collect(),
+                fixed: request
+                    .fixed
+                    .iter()
+                    .map(|(backend, revision)| wire::FixedRevision {
+                        backend: backend.clone(),
+                        revision: *revision,
+                    })
+                    .collect(),
+            })),
+        })?;
         match self.response()? {
             wire::server_message::Message::Coverage(coverage) => {
                 let mut covered = Vec::with_capacity(coverage.covered.len());
@@ -820,7 +772,7 @@ impl Client {
                 Err(error) => return Err(error),
             }
             loop {
-                match Connection::connect(&socket) {
+                match connect(&socket) {
                     Ok(connection) => {
                         self.connection = connection;
                         break;
@@ -837,23 +789,7 @@ impl Client {
     }
 
     fn response(&mut self) -> Result<wire::server_message::Message> {
-        response_on(&mut self.connection)
-    }
-}
-
-impl Connection {
-    /// Holds the descriptors of a frame just read, for the response that names
-    /// them.
-    fn hold(&mut self, descriptors: Vec<OwnedFd>) {
-        self.descriptors.extend(descriptors);
-    }
-
-    /// The descriptors the response just read came with.
-    ///
-    /// A `resolve` response's files ride on its frame, so they are taken after
-    /// the frame is read; the client pairs them with the names in the response.
-    pub fn take_descriptors(&mut self) -> Vec<OwnedFd> {
-        std::mem::take(&mut self.descriptors).into()
+        response_on(&mut self.connection).map(|(response, _)| response)
     }
 }
 

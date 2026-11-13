@@ -4,9 +4,8 @@
 //! Two frame layouts cross sockets, both little-endian:
 //!
 //! - a **length-prefixed frame** is a `u32` payload length followed by the payload. The daemon's
-//!   process interface (`proto::Connection`, Protobuf) and the epoch's peer channel
-//!   (`ipc::Channel`, MessagePack) carry these; a descriptor they pass rides on a frame's first
-//!   byte;
+//!   process interface (Protobuf) and the engines' peer link (MessagePack) carry these; a
+//!   descriptor they pass rides on a frame's first byte;
 //! - a **descriptor frame** is an 8-byte header, the payload's length and the number of
 //!   descriptors that travel with it (two `u32`), the payload, and one carrier byte for every
 //!   further [`MAX_DESCRIPTORS`] descriptors. The host services' connections (the Storage Server,
@@ -19,7 +18,8 @@
 //! frame's bytes, and therefore all of its descriptors, have arrived ([`take_descriptor_frame`]).
 //! Received descriptors are close-on-exec.
 //!
-//! The codec is the caller's: this module moves bytes and descriptors only.
+//! The codec is the caller's: this module moves bytes and descriptors only. The one connection
+//! over these frames is [`crate::Connection`].
 
 use std::collections::VecDeque;
 use std::io::{self, IoSlice, IoSliceMut};
@@ -52,6 +52,29 @@ pub fn length_prefixed(payload: &[u8]) -> io::Result<Vec<u8>> {
     frame.extend_from_slice(&length.to_le_bytes());
     frame.extend_from_slice(payload);
     Ok(frame)
+}
+
+/// `payload` as one length-prefixed frame to send, with `descriptors` riding on its first byte.
+///
+/// # Errors
+///
+/// Fails with `InvalidInput` when the payload is longer than the length field states, or the
+/// descriptors are more than one send carries.
+pub fn length_segment(payload: &[u8], descriptors: Vec<OwnedFd>) -> io::Result<Segment> {
+    if descriptors.len() > MAX_DESCRIPTORS {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "a length-prefixed frame carries at most {MAX_DESCRIPTORS} descriptors, not {}",
+                descriptors.len()
+            ),
+        ));
+    }
+    Ok(Segment {
+        bytes: length_prefixed(payload)?,
+        sent: 0,
+        descriptors,
+    })
 }
 
 /// The payload length a length field states.

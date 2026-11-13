@@ -31,11 +31,14 @@ use crate::protocol::{
     Usage, VERSION, Welcome,
 };
 use crate::runtime::{Open, Opened};
-use crate::transport::Connection;
+use service::Connection;
 
 /// A connection to a Storage Server.
 pub struct Client {
     connection: Connection,
+    /// How long a blocking call waits for its response: unbounded on this host, the timeout
+    /// given for another host's server ([`Client::connect_remote`]).
+    timeout: Duration,
     next: u64,
     /// Responses received and not yet taken, by request, each with the
     /// descriptors that came with it.
@@ -47,7 +50,11 @@ pub struct Client {
 impl Client {
     /// Connect to the server at `socket` as `role`.
     pub fn connect(socket: &Path, role: Role) -> Result<Self> {
-        Self::open(Connection::new(UnixStream::connect(socket)?), role)
+        Self::open(
+            Connection::new(UnixStream::connect(socket)?)?,
+            role,
+            Duration::MAX,
+        )
     }
 
     /// Connect to the server of another host at `address` (`host:port`,
@@ -71,12 +78,7 @@ impl Client {
         let mut refused = None;
         for candidate in address.to_socket_addrs()? {
             match std::net::TcpStream::connect_timeout(&candidate, timeout) {
-                Ok(stream) => {
-                    stream.set_nodelay(true)?;
-                    stream.set_read_timeout(Some(timeout))?;
-                    stream.set_write_timeout(Some(timeout))?;
-                    return Self::open(Connection::new(stream), role);
-                }
+                Ok(stream) => return Self::open(Connection::new(stream)?, role, timeout),
                 Err(error) => refused = Some(error),
             }
         }
@@ -88,17 +90,15 @@ impl Client {
         })))
     }
 
-    fn open(mut connection: Connection, role: Role) -> Result<Self> {
-        connection.send(
-            &ClientMessage::Hello(Hello {
-                version: VERSION,
-                role,
-            }),
-            &[],
-        )?;
-        match connection.recv::<ServerMessage>()?.0 {
+    fn open(mut connection: Connection, role: Role, timeout: Duration) -> Result<Self> {
+        connection.send(&ClientMessage::Hello(Hello {
+            version: VERSION,
+            role,
+        }))?;
+        match receive(&mut connection, timeout)?.0 {
             ServerMessage::Welcome(Welcome::Accepted { .. }) => Ok(Self {
                 connection,
+                timeout,
                 next: 1,
                 responses: HashMap::new(),
                 events: VecDeque::new(),
@@ -117,27 +117,31 @@ impl Client {
                 "a connection with responses or events not taken cannot be passed on".into(),
             ));
         }
-        let socket = match self.connection.into_socket()? {
-            crate::transport::Socket::Unix(stream) => OwnedFd::from(stream),
-            crate::transport::Socket::Tcp(stream) => OwnedFd::from(stream),
-        };
-        Ok((socket, self.next))
+        let handed = self.connection.hand_over()?;
+        // Only the socket crosses: bytes received and not yet taken would be lost.
+        if !handed.received.is_empty() {
+            return Err(Error::Protocol(
+                "a connection with part of a message received cannot be passed on".into(),
+            ));
+        }
+        Ok((handed.descriptor, self.next))
     }
 
-    /// Goes on with a Unix connection another process passed on.
-    fn resume(descriptor: OwnedFd, next: u64) -> Self {
-        Self {
-            connection: Connection::new(UnixStream::from(descriptor)),
+    /// Goes on with a Unix connection on this host another process passed on.
+    fn resume(descriptor: OwnedFd, next: u64) -> Result<Self> {
+        Ok(Self {
+            connection: Connection::new(UnixStream::from(descriptor))?,
+            timeout: Duration::MAX,
             next,
             responses: HashMap::new(),
             events: VecDeque::new(),
-        }
+        })
     }
 
     /// The connection's descriptor, readable when responses or events
     /// arrive.
     pub fn as_fd(&self) -> BorrowedFd<'_> {
-        self.connection.stream().as_fd()
+        self.connection.as_fd()
     }
 
     /// Send `request` with `descriptors` and return its identity. The
@@ -145,7 +149,7 @@ impl Client {
     pub fn submit(&mut self, request: &Request, descriptors: &[BorrowedFd<'_>]) -> Result<u64> {
         let id = self.next;
         self.next += 1;
-        self.connection.send(
+        self.connection.send_with(
             &ClientMessage::Request {
                 id,
                 request: request.clone(),
@@ -155,15 +159,9 @@ impl Client {
         Ok(id)
     }
 
-    /// Read what the server sent without blocking.
+    /// Read what the server sent without blocking, and write what waits to be sent.
     pub fn pump(&mut self) -> Result<()> {
-        self.connection.stream().set_nonblocking(true)?;
-        let read = (|| -> Result<()> {
-            while self.connection.receive()? {}
-            self.route()
-        })();
-        self.connection.stream().set_nonblocking(false)?;
-        read
+        self.route()
     }
 
     /// The response to request `id`, with the descriptors that came with
@@ -205,7 +203,7 @@ impl Client {
             if let Some(response) = self.responses.remove(&id) {
                 return Ok(response);
             }
-            let (message, descriptors) = self.connection.recv::<ServerMessage>()?;
+            let (message, descriptors) = receive(&mut self.connection, self.timeout)?;
             self.deliver(message, descriptors)?;
         }
     }
@@ -221,16 +219,11 @@ impl Client {
         self.wait(id)
     }
 
-    /// Route every complete message received.
+    /// Route every complete message received; the server's close, once every message before it
+    /// was routed, is an error.
     fn route(&mut self) -> Result<()> {
-        while let Some((message, descriptors)) = self.connection.next_frame::<ServerMessage>()? {
+        while let Some((message, descriptors)) = self.connection.try_recv_with::<ServerMessage>()? {
             self.deliver(message, descriptors)?;
-        }
-        if self.connection.is_closed() {
-            return Err(Error::Io(io::Error::new(
-                io::ErrorKind::UnexpectedEof,
-                "the storage server closed the connection",
-            )));
         }
         Ok(())
     }
@@ -863,12 +856,36 @@ impl ClaimClient {
 
     /// Goes on with a claim another process passed on, over its
     /// connection's descriptor.
-    pub fn resume(handoff: ClaimHandoff, descriptor: OwnedFd) -> Self {
-        Self {
-            client: Client::resume(descriptor, handoff.next),
+    ///
+    /// # Errors
+    ///
+    /// Fails when the connection cannot be configured.
+    pub fn resume(handoff: ClaimHandoff, descriptor: OwnedFd) -> Result<Self> {
+        Ok(Self {
+            client: Client::resume(descriptor, handoff.next)?,
             deployment: handoff.deployment,
             claim: handoff.claim,
             epochs: handoff.epochs,
-        }
+        })
     }
+}
+
+/// The next message from the server, waiting up to `timeout`.
+///
+/// # Errors
+///
+/// `TimedOut` when none arrives in time, and the connection's failure, `UnexpectedEof` once the
+/// server closed it.
+fn receive(
+    connection: &mut Connection,
+    timeout: Duration,
+) -> Result<(ServerMessage, Vec<OwnedFd>)> {
+    connection
+        .recv_with::<ServerMessage>(timeout)?
+        .ok_or_else(|| {
+            Error::Io(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "the storage server did not respond within the connection's timeout",
+            ))
+        })
 }

@@ -5,7 +5,7 @@ use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
 use ops::Generation;
-use scheduling_guest::limits::Parameters;
+use scheduling::limits::Parameters;
 use worker::completion::Outcome;
 
 use super::{commit, named, rollback, switch};

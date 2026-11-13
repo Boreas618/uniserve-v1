@@ -7,8 +7,9 @@ publish = false
 
 # The interfaces that cross builds: the process interface between daemons and
 # engine processes and the request interface between the leader daemon and an
-# engine process, as Protobuf schemas compiled at build time, their framing,
-# and the request vocabulary both ends work with.
+# engine process, as Protobuf schemas compiled at build time, their codec on
+# the workspace's one connection, and the request vocabulary both ends work
+# with.
 [dependencies]
 anyhow.workspace = true
 bitflags.workspace = true
@@ -19,11 +20,9 @@ serde = { workspace = true, features = ["rc"] }
 serde_bytes.workspace = true
 serde_json.workspace = true
 serde_with.workspace = true
-# The framing of every socket transport, and descriptor passing.
+# The workspace's one connection, whose codec the interfaces' envelopes implement.
 service.workspace = true
 sha2.workspace = true
-# The storage protocol, whose version the engine interface's version carries.
-storage.workspace = true
 thiserror.workspace = true
 toml.workspace = true
 

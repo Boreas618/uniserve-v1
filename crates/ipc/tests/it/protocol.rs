@@ -1,16 +1,16 @@
-//! Round trips of the peer link's messages through a [`Frame`], as a channel carries them.
+//! Round trips of the peer link's messages through their encoding, as the peer link carries them.
 
 use std::io::Write as _;
 use std::net::TcpListener;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use ipc::*;
 use ipc::{CacheGroupKind, RequestId};
-use serde::Serialize;
+use service::Message;
 
-/// Returns `message` as a receiver decodes it from the frame a sender made.
-fn round_trip<M: Serialize + serde::de::DeserializeOwned>(message: &M) -> M {
-    Frame::encode(message).unwrap().decode().unwrap()
+/// Returns `message` as a receiver decodes it from the payload a sender encoded.
+fn round_trip<M: Message>(message: &M) -> M {
+    M::decode(&message.encode().unwrap()).unwrap()
 }
 
 /// A token group's capacity: prefill and decode on eight slots, over a full-attention and a
@@ -259,48 +259,28 @@ fn the_buffer_pool_s_requests_read_back_from_the_frames_that_carry_them() {
 }
 
 #[test]
-fn a_frame_states_the_length_of_the_message_it_carries() {
-    let frame = Frame::encode(&MainProcessRequest::info()).unwrap();
-    let (field, message) = frame.as_bytes().split_at(Frame::LENGTH_BYTES);
+fn a_message_decodes_only_as_the_message_it_is() {
+    let request = MainProcessRequest::info().encode().unwrap();
+    let refused = MainProcessResponse::decode(&request).unwrap_err();
+    assert_eq!(refused.kind(), std::io::ErrorKind::InvalidData);
 
-    assert_eq!(Frame::message_len(field.try_into().unwrap()), message.len());
-}
-
-#[test]
-fn a_frame_decodes_only_as_the_message_it_carries() {
-    let request = Frame::encode(&MainProcessRequest::info()).unwrap();
-    assert!(matches!(
-        request.decode::<MainProcessResponse>(),
-        Err(IpcError::Encoding(_))
-    ));
-
-    // A message cut short, as a frame of another build may be, is refused:
-    // the frame's length field counts the shortened message, so a channel
-    // receives it whole and its decoding fails.
-    let mut cut = Frame::encode(&MainProcessResponse::ok())
-        .unwrap()
-        .into_bytes();
+    // A message cut short, as a frame of another build may be, is refused: the frame's length
+    // field counts the shortened message, so the connection receives it whole and its decoding
+    // fails.
+    let mut cut = MainProcessResponse::ok().encode().unwrap();
     cut.pop();
-    let length = u32::try_from(cut.len() - Frame::LENGTH_BYTES).unwrap();
-    cut[..Frame::LENGTH_BYTES].copy_from_slice(&length.to_le_bytes());
+    let frame = service::frame::length_prefixed(&cut).unwrap();
 
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-    let mut channel = Channel::connect(&listener.local_addr().unwrap().to_string()).unwrap();
+    let mut connection = Connection::connect(&listener.local_addr().unwrap().to_string()).unwrap();
     let (mut peer, _) = listener.accept().unwrap();
-    peer.write_all(&cut).unwrap();
+    peer.write_all(&frame).unwrap();
 
-    let deadline = Instant::now() + Duration::from_secs(5);
-    let received = loop {
-        match channel.try_recv::<MainProcessResponse>() {
-            Ok(None) => {
-                assert!(Instant::now() < deadline, "the cut frame did not arrive");
-                channel.wait(Duration::from_millis(50)).unwrap();
-            }
-            received => break received,
-        }
-    };
+    let received = connection.recv::<MainProcessResponse>(Duration::from_secs(5));
     assert!(
-        matches!(received, Err(IpcError::Encoding(_))),
+        received
+            .as_ref()
+            .is_err_and(|error| error.kind() == std::io::ErrorKind::InvalidData),
         "{received:?}"
     );
 }

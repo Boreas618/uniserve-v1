@@ -23,8 +23,8 @@
 //! Dropping a request's `RequestEvents` cancels the request in the engine
 //! that serves it; that is the only cancellation path.
 //!
-//! [`RequestOutput`]: frontend::output::RequestOutput
-//! [`output::media_output`]: frontend::output::media_output
+//! [`RequestOutput`]: crate::api::output::RequestOutput
+//! [`output::media_output`]: crate::api::output::media_output
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -41,6 +41,15 @@ use proto::request::wire;
 use tokio::sync::watch;
 use tracing::{info, warn};
 
+use crate::api::input::media::MediaConnector;
+use crate::api::input::video::{ProcessedVideo, VideoService};
+use crate::api::input::{
+    AdapterSelection, LoadedModel, LoadedRenderer, Processor, RequestRenderer, ServeError,
+    TokenizeError,
+};
+use crate::api::model::ModelConfig;
+use crate::api::output::RequestOutputStream;
+use crate::api::protocol::VideoGenerationRequest;
 use crate::engine::client::{EngineClient, EngineState, StatsSink, SubmitError};
 use crate::engine::control::EngineControl;
 use crate::engine::hold::{HoldState, RequestHold};
@@ -48,15 +57,6 @@ use crate::metrics::log_stats::StatsLogger;
 use crate::metrics::stats::{self as metrics, RequestStats};
 use crate::migration::{Migrator, RequestEvents};
 use crate::options::{ReasoningParser, ServerArgs, Stated};
-use frontend::input::media::MediaConnector;
-use frontend::input::video::{ProcessedVideo, VideoService};
-use frontend::input::{
-    AdapterSelection, LoadedModel, LoadedRenderer, Processor, RequestRenderer, ServeError,
-    TokenizeError,
-};
-use frontend::model::ModelConfig;
-use frontend::output::RequestOutputStream;
-use frontend::protocol::VideoGenerationRequest;
 
 /// One model served over its engine process.
 ///
@@ -299,7 +299,7 @@ pub(crate) fn replica_configs(
 pub(crate) struct Prepared {
     families: processing::Registry,
     pub(crate) model_config: ModelConfig,
-    tokenizer: frontend::tokenizer::DynTokenizer,
+    tokenizer: crate::api::tokenizer::DynTokenizer,
     renderer: LoadedRenderer,
     /// The deployment's engine configuration, with the facts the model's files determine.
     pub(crate) engine: proto::config::EngineConfig,
@@ -465,10 +465,10 @@ impl Leader {
 
     /// The LoRA adapter named `name` the workers hold, which a request
     /// naming it as its model computes with.
-    pub fn adapter(&self, name: &str) -> Option<frontend::input::AdapterSelection> {
-        locked(&self.replicas.adapters)
+    pub fn adapter(&self, name: &str) -> Option<crate::api::input::AdapterSelection> {
+        service::lock(&self.replicas.adapters)
             .get(name)
-            .map(|adapter| frontend::input::AdapterSelection {
+            .map(|adapter| crate::api::input::AdapterSelection {
                 slot: adapter.slot,
                 identity: adapter.identity.clone(),
             })
@@ -476,7 +476,10 @@ impl Leader {
 
     /// The names of the LoRA adapters the workers hold.
     pub fn adapter_names(&self) -> Vec<String> {
-        locked(&self.replicas.adapters).keys().cloned().collect()
+        service::lock(&self.replicas.adapters)
+            .keys()
+            .cloned()
+            .collect()
     }
 
     /// Loads the LoRA adapter `body` names (`lora_name`, and its `lora_path`)
@@ -514,7 +517,7 @@ impl Leader {
             clients.push(replica.hold.client().ok_or(UpdateError::NoEngine)?);
         }
         let slot = {
-            let adapters = locked(&self.replicas.adapters);
+            let adapters = service::lock(&self.replicas.adapters);
             if adapters.contains_key(&name) {
                 return Err(UpdateError::Refused(format!(
                     "the adapter {name} is loaded already"
@@ -545,7 +548,7 @@ impl Leader {
             }
         }
         let identity = format!("{name}#{}", uuid::Uuid::new_v4().simple());
-        locked(&self.replicas.adapters).insert(
+        service::lock(&self.replicas.adapters).insert(
             name.clone(),
             Adapter {
                 slot,
@@ -577,7 +580,7 @@ impl Leader {
             owners.push(Arc::clone(&replica.replacing).lock_owned().await);
             clients.push(replica.hold.client().ok_or(UpdateError::NoEngine)?);
         }
-        let adapter = locked(&self.replicas.adapters)
+        let adapter = service::lock(&self.replicas.adapters)
             .remove(&name)
             .ok_or_else(|| UpdateError::Refused(format!("no adapter {name:?} is loaded")))?;
         body["adapter"] = adapter.slot.into();
@@ -726,7 +729,7 @@ impl Leader {
                 Arc::clone(&leader.replicas.adapters),
             );
             let _ = replica.control.set(Arc::clone(&control));
-            *locked(&replica.served) = Some(served);
+            *service::lock(&replica.served) = Some(served);
             replica.monitor();
             leader
                 .replicas
@@ -928,7 +931,7 @@ impl Leader {
         );
         let replica = Arc::clone(&engine.replicas.serving.borrow()[0]);
         let _ = replica.control.set(control);
-        *locked(&replica.served) = Some(served);
+        *service::lock(&replica.served) = Some(served);
         Ok(engine)
     }
 
@@ -1092,14 +1095,14 @@ impl Leader {
     pub(crate) async fn generate(
         &self,
         request_id: String,
-        request: frontend::protocol::ChatCompletionRequest,
+        request: crate::api::protocol::ChatCompletionRequest,
         adapter: Option<AdapterSelection>,
     ) -> Result<
         (
-            Box<dyn frontend::events::Events>,
-            frontend::output::OutputProcessor,
+            Box<dyn crate::api::events::Events>,
+            crate::api::output::OutputProcessor,
         ),
-        frontend::openai::ApiError,
+        crate::api::openai::ApiError,
     > {
         let started = Instant::now();
         let image_urls = if self.processor.supports_image_input() {
@@ -1135,7 +1138,7 @@ impl Leader {
         let log = self.log_requests.then_some(request_id);
         let stats = crate::metrics::stats::StatLogger::new(labels, started, log);
         // Dropping the events on a failure cancels the request in its engine.
-        let output = frontend::output::OutputProcessor::new(
+        let output = crate::api::output::OutputProcessor::new(
             self.processor.tokenizer(),
             lowering,
             Box::new(stats),
@@ -1146,7 +1149,7 @@ impl Leader {
 
     /// The model's tokenizer, which a successor builds the decoder of a
     /// handoff's body from.
-    pub(crate) fn tokenizer(&self) -> frontend::tokenizer::DynTokenizer {
+    pub(crate) fn tokenizer(&self) -> crate::api::tokenizer::DynTokenizer {
         self.processor.tokenizer()
     }
 
@@ -1228,7 +1231,7 @@ impl Leader {
             .await?;
         let prompt_tokens = request.prompt_token_ids.len();
         let (events, core) = self.submit(Request::Diffusion(request)).await?;
-        let output = frontend::output::media_output(
+        let output = crate::api::output::media_output(
             request_id.clone(),
             started,
             elapsed_us(started),
@@ -1499,10 +1502,13 @@ pub(crate) fn configurable(
 /// it does for the served model at `served`: the same tokenizer, tokenizer
 /// settings, generation defaults and chat template, byte for byte.
 pub(crate) async fn same_processing(served: &str, path: &str) -> Result<(), String> {
-    use frontend::model::assets::model_files::ResolvedModelFiles;
+    use crate::api::model::assets::model_files::ResolvedModelFiles;
     // A diffusers checkpoint keeps what processes a request in directories of its own, and states
     // no tokenizer at its root for the model's files to resolve.
-    if std::path::Path::new(served).join(MODULAR_INDEX).is_file() {
+    let pipeline = processing::PIPELINE_INDEX_FILES
+        .iter()
+        .any(|index| std::path::Path::new(served).join(index).is_file());
+    if pipeline {
         return same_pipeline(std::path::Path::new(served), std::path::Path::new(path));
     }
     let resolve = |model: &str| {
@@ -1550,9 +1556,6 @@ pub(crate) async fn same_processing(served: &str, path: &str) -> Result<(), Stri
     Ok(())
 }
 
-/// The index a diffusers checkpoint states its parts in.
-const MODULAR_INDEX: &str = "modular_model_index.json";
-
 /// The parts of a diffusers checkpoint that decide how a request is processed.
 const PROCESSING_PARTS: [&str; 4] = ["tokenizer", "processor", "scheduler", "audio_scheduler"];
 
@@ -1562,11 +1565,20 @@ fn same_pipeline(served: &std::path::Path, path: &std::path::Path) -> Result<(),
     let read = |file: &std::path::Path| {
         std::fs::read(file).map_err(|error| format!("{}: {error}", file.display()))
     };
-    if read(&served.join(MODULAR_INDEX))? != read(&path.join(MODULAR_INDEX))? {
-        return Err(format!(
-            "the checkpoint at {} states other parts than the served model: deploy it instead",
-            path.display()
-        ));
+    // The index files either checkpoint publishes, each the same in both.
+    let published = |root: &std::path::Path, index: &str| root.join(index).is_file();
+    for index in processing::PIPELINE_INDEX_FILES {
+        let same = match (published(served, index), published(path, index)) {
+            (false, false) => true,
+            (true, true) => read(&served.join(index))? == read(&path.join(index))?,
+            _ => false,
+        };
+        if !same {
+            return Err(format!(
+                "the checkpoint at {} states other parts than the served model: deploy it instead",
+                path.display()
+            ));
+        }
     }
     for part in PROCESSING_PARTS {
         let directory = served.join(part);
@@ -1589,13 +1601,6 @@ fn same_pipeline(served: &std::path::Path, path: &std::path::Path) -> Result<(),
         }
     }
     Ok(())
-}
-
-/// The value behind `mutex`; every holder replaces whole values.
-pub(crate) fn locked<T>(mutex: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, T> {
-    mutex
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 /// One independent replica: the engine its requests go to, the arguments
@@ -1857,8 +1862,8 @@ impl Replica {
                     // The configuration and the module set are what the next
                     // apply compares with, what a relaunch and a standby
                     // start from and what a successor daemon takes over.
-                    *locked(&self.config) = config;
-                    if let Some(args) = locked(&self.served).as_mut() {
+                    *service::lock(&self.config) = config;
+                    if let Some(args) = service::lock(&self.served).as_mut() {
                         args.modules = modules;
                     }
                     // The parked standby holds the generation the commit
@@ -2013,9 +2018,14 @@ impl Replica {
         // again on a rollback.
         let before: Vec<_> = previous
             .iter()
-            .map(|replica| (replica.hold.client(), locked(&replica.served).clone()))
+            .map(|replica| {
+                (
+                    replica.hold.client(),
+                    service::lock(&replica.served).clone(),
+                )
+            })
             .collect();
-        let config_before = locked(&self.config).clone();
+        let config_before = service::lock(&self.config).clone();
         let mut routed = Vec::with_capacity(clients.len());
         for (index, (client, (args, _))) in clients.iter().zip(&targets).enumerate() {
             let replica = match previous.get(index) {
@@ -2034,8 +2044,8 @@ impl Replica {
                     replica
                 }
             };
-            *locked(&replica.served) = Some(args.clone());
-            *locked(&replica.config) = config.clone();
+            *service::lock(&replica.served) = Some(args.clone());
+            *service::lock(&replica.config) = config.clone();
             routed.push(replica);
         }
         // Requests go to `serving`; each of `replicas` (`serving` first) has its
@@ -2159,8 +2169,8 @@ impl Replica {
             if !returned && *served.borrow_and_update() < epoch {
                 returned = true;
                 for (replica, (_, args)) in previous.iter().zip(&before) {
-                    *locked(&replica.served) = args.clone();
-                    *locked(&replica.config) = config_before.clone();
+                    *service::lock(&replica.served) = args.clone();
+                    *service::lock(&replica.config) = config_before.clone();
                 }
                 let mut everyone = previous.clone();
                 everyone.extend(routed.iter().skip(previous.len()).cloned());
@@ -2221,8 +2231,8 @@ impl Replica {
             }
         } else if !returned {
             for (replica, (_, args)) in previous.iter().zip(&before) {
-                *locked(&replica.served) = args.clone();
-                *locked(&replica.config) = config_before.clone();
+                *service::lock(&replica.served) = args.clone();
+                *service::lock(&replica.config) = config_before.clone();
             }
             let mut everyone = previous.clone();
             everyone.extend(routed.iter().skip(previous.len()).cloned());
@@ -2299,7 +2309,7 @@ impl Replica {
                 .get()
                 .context("the replica has no engine control")?,
         );
-        let args = locked(&self.served)
+        let args = service::lock(&self.served)
             .clone()
             .context("the replica has no served arguments")?;
         self.hold.hold();
@@ -2415,7 +2425,7 @@ impl Replica {
         let Some((epoch, _)) = updater.epochs().serving() else {
             return true;
         };
-        let Some(served) = locked(&self.served).as_ref().map(|args| args.epoch) else {
+        let Some(served) = service::lock(&self.served).as_ref().map(|args| args.epoch) else {
             return true;
         };
         epoch == served
@@ -2428,8 +2438,8 @@ impl Replica {
         &self,
         serving: &EngineClient,
     ) -> std::sync::MutexGuard<'_, Option<crate::standby::Standbys>> {
-        let config = locked(&self.config).engine_config().ok();
-        let mut domain = locked(&self.domain);
+        let config = service::lock(&self.config).engine_config().ok();
+        let mut domain = service::lock(&self.domain);
         let current = domain.as_ref().is_some_and(|standbys| {
             let members: Vec<u64> = standbys
                 .domains()
@@ -2461,7 +2471,7 @@ impl Replica {
                 crate::standby::Action::Terminate { .. } | crate::standby::Action::Stop { .. }
             )
         });
-        if ends && let Some(standby) = locked(&self.standby).take() {
+        if ends && let Some(standby) = service::lock(&self.standby).take() {
             info!(
                 generation = standby.generation(),
                 "the failure domain's standby epoch is ended"
@@ -2474,7 +2484,7 @@ impl Replica {
     /// claims they hold on their epoch's storage.
     pub(crate) fn drop_standby(&self) {
         let retired: Vec<crate::standby::Action> = {
-            let mut domain = locked(&self.domain);
+            let mut domain = service::lock(&self.domain);
             let hosts: Vec<String> = domain
                 .as_ref()
                 .map(|standbys| {
@@ -2497,7 +2507,7 @@ impl Replica {
                 .unwrap_or_default()
         };
         self.end_standby_world(&retired);
-        let dropped = { locked(&self.standby).take() };
+        let dropped = { service::lock(&self.standby).take() };
         if let Some(standby) = dropped {
             info!(
                 generation = standby.generation(),
@@ -2513,7 +2523,7 @@ impl Replica {
     /// names, so the parked processes are dropped and others started.
     pub(crate) fn restart_standby(self: &Arc<Self>) {
         let lost: Vec<crate::standby::Action> = {
-            let mut domain = locked(&self.domain);
+            let mut domain = service::lock(&self.domain);
             let host = domain.as_ref().and_then(|standbys| {
                 standbys
                     .domains()
@@ -2528,7 +2538,7 @@ impl Replica {
         self.end_standby_world(&lost);
         // Dropping the parked client closes its control connections, which ends
         // its processes.
-        let replaced = { locked(&self.standby).take() };
+        let replaced = { service::lock(&self.standby).take() };
         drop(replaced);
         self.start_standby();
     }
@@ -2577,7 +2587,7 @@ impl Replica {
         // workspaces of its own, and a deployment that has not reserved them
         // cannot hold a second engine of the same scope.
         let (wanted, storage) = {
-            let config = locked(&self.config);
+            let config = service::lock(&self.config);
             (
                 config.worker_config.standby,
                 config.worker_config.standby_storage,
@@ -2597,7 +2607,7 @@ impl Replica {
             return Ok(());
         }
         {
-            let mut slot = locked(&self.standby);
+            let mut slot = service::lock(&self.standby);
             match slot.as_ref().map(|standby| standby.client.state()) {
                 // A parked standby is the one this replica wants.
                 Some(EngineState::Parked) => return Ok(()),
@@ -2607,7 +2617,7 @@ impl Replica {
                 None => {}
             }
         }
-        let Some(mut args) = locked(&self.served).clone() else {
+        let Some(mut args) = service::lock(&self.served).clone() else {
             return Ok(());
         };
         let Some(updater) = self
@@ -2719,7 +2729,7 @@ impl Replica {
                 return Err(error);
             }
         };
-        if let Some(standbys) = locked(&self.domain).as_mut() {
+        if let Some(standbys) = service::lock(&self.domain).as_mut() {
             for (host, generation) in &generations {
                 standbys.parked(host, *generation);
             }
@@ -2729,7 +2739,7 @@ impl Replica {
             storage = ?storage,
             "the standby epoch of the failure domain is parked"
         );
-        *locked(&self.standby) = Some(Standby {
+        *service::lock(&self.standby) = Some(Standby {
             client,
             generations,
         });
@@ -2739,7 +2749,7 @@ impl Replica {
     /// The standby of the hosts `generations` names did not start: the domain keeps none, and a
     /// loss relaunches it.
     fn lose_standby(&self, generations: &[(String, u64)]) {
-        let actions: Vec<crate::standby::Action> = match locked(&self.domain).as_mut() {
+        let actions: Vec<crate::standby::Action> = match service::lock(&self.domain).as_mut() {
             Some(standbys) => generations
                 .iter()
                 .flat_map(|(host, _)| standbys.standby_lost(host))
@@ -2767,7 +2777,7 @@ impl Replica {
             device: None,
         };
         let promotions: Vec<(String, u64)> = {
-            let mut domain = locked(&self.domain);
+            let mut domain = service::lock(&self.domain);
             let standbys = domain.as_mut()?;
             let host = standbys
                 .domains()
@@ -2786,12 +2796,12 @@ impl Replica {
         };
         if promotions.is_empty() {
             // A member has no parked standby: the domain is relaunched.
-            let dropped = locked(&self.standby).take();
+            let dropped = service::lock(&self.standby).take();
             drop(dropped);
-            *locked(&self.domain) = None;
+            *service::lock(&self.domain) = None;
             return None;
         }
-        let standby = locked(&self.standby).take()?;
+        let standby = service::lock(&self.standby).take()?;
         self.hold.hold();
         drop(starting);
         // The promotion travels on each engine's process link, as an epoch
@@ -2802,7 +2812,7 @@ impl Replica {
             .registry
             .upgrade()
             .and_then(|registry| registry.updates.upgrade())?;
-        let ranks = locked(&self.config)
+        let ranks = service::lock(&self.config)
             .engine_config()
             .ok()
             .and_then(|config| crate::engine::control::world_hosts(&config).ok())
@@ -2821,13 +2831,13 @@ impl Replica {
         }
         match standby.client.await_serving().await {
             Ok(()) => {
-                if let Some(standbys) = locked(&self.domain).as_mut() {
+                if let Some(standbys) = service::lock(&self.domain).as_mut() {
                     for (host, generation) in &promotions {
                         standbys.promoted(host, *generation);
                     }
                 }
                 // The promoted world is the engine that serves; the rules over it start anew.
-                *locked(&self.domain) = None;
+                *service::lock(&self.domain) = None;
                 self.hold.serve(Arc::clone(&standby.client));
                 info!(
                     generations = ?standby.generations,
@@ -2837,12 +2847,12 @@ impl Replica {
                 Some(standby.client)
             }
             Err(error) => {
-                if let Some(standbys) = locked(&self.domain).as_mut() {
+                if let Some(standbys) = service::lock(&self.domain).as_mut() {
                     for (host, _) in &promotions {
                         standbys.promote_failed(host);
                     }
                 }
-                *locked(&self.domain) = None;
+                *service::lock(&self.domain) = None;
                 warn!(
                     generation = standby.generation(),
                     "the standby could not be promoted: {error}; the engine is relaunched"
@@ -2868,8 +2878,8 @@ impl Replica {
     /// Dropping the client closes the control connection, which the standby's
     /// engine treats as the end of the process.
     pub(crate) async fn end_standby(&self) {
-        *locked(&self.domain) = None;
-        let standby = { locked(&self.standby).take() };
+        *service::lock(&self.domain) = None;
+        let standby = { service::lock(&self.standby).take() };
         if let Some(standby) = standby
             && let Err(error) = tokio::task::spawn_blocking(move || standby.client.shutdown()).await
         {
@@ -2930,7 +2940,7 @@ impl Replica {
             .control
             .get()
             .context("this leader starts no engine of its own")?;
-        let served = locked(&self.served)
+        let served = service::lock(&self.served)
             .clone()
             .context("this leader starts no engine of its own")?;
         Ok(EngineHandoff {
@@ -2938,7 +2948,7 @@ impl Replica {
             client,
             engine,
             served,
-            config: locked(&self.config).clone(),
+            config: service::lock(&self.config).clone(),
             paused: self.hold().is_paused(),
             asleep: self.asleep.load(Ordering::Acquire),
             sleep_paused: self.sleep_paused.load(Ordering::Acquire),
@@ -2989,7 +2999,7 @@ impl Replica {
             // The leader's status counts the deployment's held requests.
             held: 0,
             generation: hold.client().and_then(|client| client.engine()),
-            standby: locked(&self.standby)
+            standby: service::lock(&self.standby)
                 .as_ref()
                 .map(|standby| {
                     standby
@@ -3118,7 +3128,7 @@ impl Replica {
         let _replacing = self.replacing.lock().await;
         let hold = self.hold();
         let client = hold.client().ok_or(UpdateError::NoEngine)?;
-        let mut config = locked(&self.config).clone();
+        let mut config = service::lock(&self.config).clone();
         // A plugin's weight source streams the tensors of the served
         // checkpoint, whose configuration and tokenizer stay; a directory
         // is another checkpoint of the model, checked to process requests
@@ -3136,7 +3146,7 @@ impl Replica {
                 Leader::prepare(&self.families, &config, &Stated::from_paths(Vec::new()))
                     .await
                     .map_err(|error| UpdateError::Refused(format!("{error:#}")))?;
-            let served = locked(&self.served)
+            let served = service::lock(&self.served)
                 .as_ref()
                 .map(|args| args.engine_config.model.clone());
             if served.is_some_and(|served| !served.processes_as(&prepared.engine.model)) {
@@ -3156,7 +3166,7 @@ impl Replica {
         let results = results.map_err(|error| {
             UpdateError::Failed(anyhow::anyhow!("the weights were not updated: {error}"))
         })?;
-        if let Some(args) = locked(&self.served).as_mut() {
+        if let Some(args) = service::lock(&self.served).as_mut() {
             if !streamed {
                 args.engine_config.model.model = model_path.to_owned();
                 args.engine_config.model.base =
@@ -3167,7 +3177,7 @@ impl Replica {
                 .weights
                 .clone_from(&config.load_config.weights);
         }
-        *locked(&self.config) = config;
+        *service::lock(&self.config) = config;
         // A parked standby mapped the weights this update replaced, and a promotion would serve
         // them: it starts again on the new ones.
         self.restart_standby();
@@ -3213,7 +3223,7 @@ pub(crate) struct Adapter {
 /// leaves the registry, so that requests naming it are refused instead of
 /// computing without it.
 pub(crate) async fn reload_adapters(replica: &Replica, client: &EngineClient) {
-    let adapters: Vec<(String, Adapter)> = locked(&replica.adapters)
+    let adapters: Vec<(String, Adapter)> = service::lock(&replica.adapters)
         .iter()
         .map(|(name, adapter)| (name.clone(), adapter.clone()))
         .collect();
@@ -3225,7 +3235,7 @@ pub(crate) async fn reload_adapters(replica: &Replica, client: &EngineClient) {
                 "loaded the adapter again"
             ),
             Err(error) => {
-                locked(&replica.adapters).remove(&name);
+                service::lock(&replica.adapters).remove(&name);
                 warn!(
                     adapter = name,
                     "the adapter did not load into the new engine, and requests naming it are \
@@ -3366,11 +3376,12 @@ struct SpecialTokenIds {
 }
 
 /// The local snapshot of the base release the checkpoint at `model` continues, when it pins one
-/// (`frontend::model::assets::pipeline::pinned_snapshot`): an engine opens the checkpoint and its
+/// (`crate::api::model::assets::pipeline::pinned_snapshot`): an engine opens the checkpoint and its
 /// base as one checkpoint, and reads where the weights already are.
 fn base_release(model: &str) -> anyhow::Result<Option<String>> {
-    let snapshot = frontend::model::assets::pipeline::pinned_snapshot(std::path::Path::new(model))
-        .with_context(|| format!("reading the base release {model} pins"))?;
+    let snapshot =
+        crate::api::model::assets::pipeline::pinned_snapshot(std::path::Path::new(model))
+            .with_context(|| format!("reading the base release {model} pins"))?;
     Ok(snapshot.map(|path| path.to_string_lossy().into_owned()))
 }
 

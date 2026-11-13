@@ -57,7 +57,7 @@ fn a_claim_crosses_to_a_successor_with_its_connection() {
     // The state crosses a process boundary as bytes.
     let bytes = serde_json::to_vec(&handoff).unwrap();
     let handoff: ClaimHandoff = serde_json::from_slice(&bytes).unwrap();
-    let mut successor = ClaimClient::resume(handoff, descriptor);
+    let mut successor = ClaimClient::resume(handoff, descriptor).unwrap();
     assert_eq!(successor.deployment(), "model");
 
     // The epoch the predecessor claimed is held, and a new one claims under

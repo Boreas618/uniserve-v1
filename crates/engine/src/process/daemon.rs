@@ -19,11 +19,11 @@ use std::time::Duration;
 
 use anyhow::{Context as _, Result, bail};
 use crossbeam_channel::Sender;
-use proto::Connection;
 use proto::config::EngineArgs;
 use proto::process::{downstream, request, upstream};
 use proto::request::ArtifactMedia;
 use proto::request::wire;
+use service::Connection;
 
 use super::Input;
 
@@ -95,7 +95,7 @@ pub(crate) fn claim(
              addresses its commands by this number"
         );
     }
-    process.send(&proto::process::Hello {
+    process.deliver(&proto::process::Hello {
         major: proto::ENGINE_INTERFACE_VERSION,
         build: proto::BUILD.to_owned(),
         peer: Some(proto::process::hello::Peer::Engine(
@@ -124,7 +124,7 @@ pub(crate) fn claim(
     // The scopes are this process's ranks of its group: consecutive from its first, one per
     // device.
     let ranks = (0..launch.devices.len()).map(|index| launch.rank + index as u32);
-    process.send(&proto::process::Upstream {
+    process.deliver(&proto::process::Upstream {
         kind: Some(upstream::Kind::Request(proto::process::Request {
             id: CLAIM,
             kind: Some(request::Kind::Claim(proto::process::Claim {
@@ -214,7 +214,7 @@ pub(crate) fn attach(address: &str, engine: u64) -> Result<Connection> {
 
 /// The hello of the request interface and the daemon's welcome.
 fn hello(connection: &mut Connection, engine: u64, timeout: Duration) -> Result<()> {
-    connection.send(&wire::Hello {
+    connection.deliver(&wire::Hello {
         major: proto::ENGINE_INTERFACE_VERSION,
         build: proto::BUILD.to_owned(),
         engine,
@@ -262,13 +262,16 @@ pub(crate) fn read_requests(
                             return;
                         }
                     }
-                    Ok(None) => {
-                        if let Err(error) = connection.wait(READ_WAIT) {
+                    Ok(None) => match connection.wait(READ_WAIT) {
+                        Ok(()) => {}
+                        // The daemon closed the front.
+                        Err(error) if error.kind() == std::io::ErrorKind::UnexpectedEof => break,
+                        Err(error) => {
                             tracing::warn!(%error, front, "waiting on a daemon front failed");
                             break;
                         }
-                    }
-                    Err(proto::Error::Closed) => break,
+                    },
+                    Err(error) if error.kind() == std::io::ErrorKind::UnexpectedEof => break,
                     Err(error) => {
                         tracing::warn!(%error, front, "reading a daemon front failed");
                         break;
@@ -311,13 +314,15 @@ pub(crate) fn read_commands(
                         }
                         None => {}
                     },
-                    Ok(None) => {
-                        if let Err(error) = connection.wait(READ_WAIT) {
+                    Ok(None) => match connection.wait(READ_WAIT) {
+                        Ok(()) => {}
+                        Err(error) if error.kind() == std::io::ErrorKind::UnexpectedEof => break,
+                        Err(error) => {
                             tracing::warn!(%error, "waiting on the process interface failed");
                             break;
                         }
-                    }
-                    Err(proto::Error::Closed) => break,
+                    },
+                    Err(error) if error.kind() == std::io::ErrorKind::UnexpectedEof => break,
                     Err(error) => {
                         tracing::warn!(%error, "reading the process interface failed");
                         break;
@@ -344,28 +349,29 @@ pub(crate) fn send(
     connection: &mut Connection,
     kind: wire::from_engine::Kind,
     media: Option<&Arc<dyn ArtifactMedia>>,
-) -> proto::Result<()> {
+) -> std::io::Result<()> {
     let frame = wire::FromEngine { kind: Some(kind) };
     let Some(media) = media else {
-        return connection.send(&frame);
+        return connection.deliver(&frame);
     };
 
     let descriptor = media
         .descriptor()
-        .filter(|_| connection.peer_ip().is_none());
+        .filter(|_| connection.peer_addr().is_none());
     if let Some(descriptor) = descriptor {
-        return connection.send_with_descriptor(&frame, descriptor);
+        connection.send_with(&frame, &[descriptor])?;
+        return connection.flush();
     }
     let bytes = media.bytes();
     for data in bytes.chunks(ARTIFACT_PART) {
-        connection.send(&wire::FromEngine {
+        connection.deliver(&wire::FromEngine {
             kind: Some(wire::from_engine::Kind::ArtifactPart(wire::ArtifactPart {
                 size: bytes.len() as u64,
                 data: data.to_vec(),
             })),
         })?;
     }
-    connection.send(&frame)
+    connection.deliver(&frame)
 }
 
 /// Sends one report on the process interface, which the daemon answers with nothing.
@@ -376,8 +382,20 @@ pub(crate) fn send(
 pub(crate) fn report(
     process: &mut Connection,
     report: proto::process::Report,
-) -> proto::Result<()> {
-    process.send(&proto::process::Upstream {
+) -> std::io::Result<()> {
+    process.deliver(&proto::process::Upstream {
         kind: Some(upstream::Kind::Report(report)),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    /// The engine interface carries the Storage Server protocol's version, which the interfaces
+    /// state without linking the storage crate: the two are one fact, and an engine whose
+    /// interface version did not move with the storage protocol would be admitted by a daemon
+    /// whose Storage Server it cannot speak to.
+    #[test]
+    fn the_engine_interface_carries_the_storage_protocol_version() {
+        assert_eq!(proto::STORAGE_PROTOCOL, storage::protocol::VERSION);
+    }
 }

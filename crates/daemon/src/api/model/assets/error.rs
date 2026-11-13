@@ -1,0 +1,72 @@
+//! Errors raised while locating and reading model assets.
+
+use thiserror::Error;
+
+#[derive(Debug, Error)]
+/// Model-asset discovery and deserialization failure.
+pub enum Error {
+    #[error("failed to read model asset `{path}`")]
+    /// A local model asset could not be read.
+    Io {
+        /// Path of the unreadable asset.
+        path: std::path::PathBuf,
+        /// Underlying filesystem error.
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("failed to parse model asset `{path}` as JSON")]
+    /// A model asset contains invalid JSON.
+    Json {
+        /// Path of the malformed asset.
+        path: std::path::PathBuf,
+        /// Underlying JSON parser error.
+        #[source]
+        source: serde_json::Error,
+    },
+    #[error("model `{model}` is missing required asset `{file}`")]
+    /// A required model file is absent from a local model directory or from a
+    /// remote repository's file listing.
+    MissingFile {
+        /// Model identifier or local directory.
+        model: String,
+        /// Required checkpoint-relative file path.
+        file: String,
+    },
+    #[error("unsupported diffusers pipeline {class_name}")]
+    /// A pipeline index declares a pipeline class UniServe does not serve, or
+    /// a family that has no pipeline form is resolved as a pipeline.
+    UnsupportedPipeline {
+        /// Pipeline class declared by the checkpoint's root index, or the
+        /// family id when `ModelConfig::from_pipeline` rejects the family.
+        class_name: String,
+    },
+    #[error(
+        "a media deployment states its `max_model_len`, the longest prompt it admits: the \
+         pipeline keeps no key/value cache, so no checkpoint figure implies one"
+    )]
+    /// A media pipeline is served without the prompt length its deployment
+    /// must state.
+    MissingPromptLength,
+    #[error("failed to resolve remote model `{model}`: {message}")]
+    /// Building the Hub client, fetching repository metadata, or downloading a
+    /// file failed.
+    Remote {
+        /// Remote model identifier.
+        model: String,
+        /// Human-readable remote resolution failure.
+        message: String,
+    },
+    #[error("invalid model asset: {0}")]
+    /// Model asset content violates a profile invariant.
+    Invalid(String),
+}
+
+/// Result type returned by model-asset calls.
+pub type Result<T> = std::result::Result<T, Error>;
+
+impl Error {
+    /// Constructs an invalid-asset error with contextual text.
+    pub fn invalid(message: impl Into<String>) -> Self {
+        Self::Invalid(message.into())
+    }
+}

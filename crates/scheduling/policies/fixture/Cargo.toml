@@ -15,7 +15,7 @@ crate-type = ["cdylib", "rlib"]
 
 [dependencies]
 # The types, the events, the decisions and the helpers every policy shares.
-scheduling-guest.workspace = true
+scheduling.workspace = true
 
 [lints]
 workspace = true

@@ -22,7 +22,7 @@
 
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use axum::extract::{Query, State};
@@ -35,10 +35,10 @@ use serde_json::json;
 use tokio::sync::Notify;
 use tokio_util::sync::CancellationToken;
 
+use crate::api::openai::ApiError;
 use crate::leader::{Leader, LeaderStatus, UpdateError};
 use crate::updates::change::{Applied, ApplyRequest, InFlight};
 use crate::updates::update::Phase;
-use frontend::openai::ApiError;
 
 /// Events the log keeps; older ones leave it.
 const EVENT_CAPACITY: usize = 1024;
@@ -118,10 +118,6 @@ pub(crate) struct Admin {
     epochs: Arc<crate::epoch::Epochs>,
 }
 
-fn locked<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
-    mutex.lock().unwrap_or_else(PoisonError::into_inner)
-}
-
 fn now() -> f64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -170,9 +166,9 @@ impl Admin {
     pub(crate) fn hand_over(&self) -> AdminHandoff {
         self.handoff_sent.store(true, Ordering::Release);
         AdminHandoff {
-            events: locked(&self.events).iter().cloned().collect(),
+            events: service::lock(&self.events).iter().cloned().collect(),
             next_event: self.next_event.load(Ordering::Relaxed),
-            last: locked(&self.last).clone(),
+            last: service::lock(&self.last).clone(),
             next_operation: self.next_operation.load(Ordering::Relaxed),
         }
     }
@@ -185,11 +181,11 @@ impl Admin {
         handoff: AdminHandoff,
     ) -> Arc<Self> {
         let admin = Self::new(shutdown, retire);
-        *locked(&admin.events) = handoff.events.into_iter().collect();
+        *service::lock(&admin.events) = handoff.events.into_iter().collect();
         admin
             .next_event
             .store(handoff.next_event, Ordering::Relaxed);
-        *locked(&admin.last) = handoff.last;
+        *service::lock(&admin.last) = handoff.last;
         admin
             .next_operation
             .store(handoff.next_operation, Ordering::Relaxed);
@@ -198,7 +194,7 @@ impl Admin {
 
     /// Appends an event.
     pub(crate) fn record(&self, kind: &'static str, message: impl Into<String>) {
-        let mut events = locked(&self.events);
+        let mut events = service::lock(&self.events);
         if events.len() == EVENT_CAPACITY {
             events.pop_front();
         }
@@ -222,7 +218,7 @@ impl Admin {
             serde_json::Value::Object(data) => data,
             _ => serde_json::Map::new(),
         };
-        let mut events = locked(&self.events);
+        let mut events = service::lock(&self.events);
         if events.len() == EVENT_CAPACITY {
             events.pop_front();
         }
@@ -245,7 +241,7 @@ impl Admin {
         loop {
             let notified = self.appended.notified();
             {
-                let events = locked(&self.events);
+                let events = service::lock(&self.events);
                 let gap = events.front().is_some_and(|first| first.seq > after + 1);
                 let found: Vec<AdminEvent> = events
                     .iter()
@@ -266,7 +262,7 @@ impl Admin {
     /// Starts operation `kind`; refused, with the running one, while
     /// another runs.
     fn begin(&self, kind: &'static str) -> Result<Operation, Box<Operation>> {
-        let mut running = locked(&self.running);
+        let mut running = service::lock(&self.running);
         if let Some(other) = running.as_ref() {
             return Err(Box::new(other.clone()));
         }
@@ -302,7 +298,7 @@ impl Admin {
         mut operation: Operation,
         result: Result<serde_json::Value, String>,
     ) -> Operation {
-        *locked(&self.running) = None;
+        *service::lock(&self.running) = None;
         operation.ended = Some(now());
         match result {
             Ok(result) => {
@@ -322,7 +318,7 @@ impl Admin {
                 operation.error = Some(error);
             }
         }
-        *locked(&self.last) = Some(operation.clone());
+        *service::lock(&self.last) = Some(operation.clone());
         operation
     }
 
@@ -386,7 +382,7 @@ impl Admin {
 pub(crate) struct AdminState {
     pub leader: Arc<Leader>,
     pub admin: Arc<Admin>,
-    pub jobs: Arc<frontend::openai::video_jobs::VideoJobs>,
+    pub jobs: Arc<crate::api::openai::video_jobs::VideoJobs>,
     /// What restarts the daemon in place; `None` where it cannot.
     pub restarter: Option<Arc<crate::restart::Restarter>>,
 }
@@ -487,8 +483,8 @@ async fn status(State(state): State<AdminState>) -> Json<serde_json::Value> {
     Json(json!({
         "version": env!("CARGO_PKG_VERSION"),
         "deployment": state.leader.status(),
-        "operation": locked(&admin.running).clone(),
-        "last_operation": locked(&admin.last).clone(),
+        "operation": service::lock(&admin.running).clone(),
+        "last_operation": service::lock(&admin.last).clone(),
         "next_event": admin.next_event.load(Ordering::Relaxed),
     }))
 }
@@ -724,7 +720,7 @@ async fn apply(state: &AdminState, body: ConfigBody, operator: bool) -> Response
         }
     });
     if !wait {
-        let running = locked(&admin.running).clone();
+        let running = service::lock(&admin.running).clone();
         return (StatusCode::ACCEPTED, Json(running)).into_response();
     }
     let (status, mut operation) = match ended.await {

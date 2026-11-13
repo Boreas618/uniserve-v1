@@ -16,14 +16,14 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use engine::scheduler::{Message, Output};
+use engine::scheduler::{Message, Output, policy};
 use ipc::batch::{Batch, Phase};
 use proto::report::SchedulerStats;
 use proto::request::{Event, FinishReason, MigrationCause, RequestId};
-use scheduling_guest::decision::{DispatchOutput, Work};
-use scheduling_guest::ids::{PageId, RequestId as PolicyRequest};
-use scheduling_guest::limits::{Limits, Parameters};
-use scheduling_guest::wire;
+use scheduling::decision::{DispatchOutput, Work};
+use scheduling::ids::{PageId, RequestId as PolicyRequest};
+use scheduling::limits::{Limits, Parameters};
+use scheduling::wire;
 use storage::Key;
 use storage::runtime::{Completion, GroupId, Request, Tier};
 use wasmtime::Module;
@@ -41,7 +41,7 @@ const MESSAGES_AT: u32 = 65536;
 /// The pages of a script module's memory: room for a message of several hundred KiB.
 const PAGES: u32 = 8;
 
-/// How an `Updated` event of the policy's wire begins (`scheduling_guest::event::Event`).
+/// How an `Updated` event of the policy's wire begins (`scheduling::event::Event`).
 const UPDATED: &str = r#""kind":"updated""#;
 
 /// What a script's `init` does.
@@ -246,8 +246,7 @@ fn driving(requests: &[u64], tokens: u32) -> DispatchOutput {
 
 /// A policy module of WebAssembly text or binary, compiled by the engine policies run under.
 fn load(bytes: &[u8]) -> Arc<Module> {
-    let engine = scheduling::Engine::new().unwrap();
-    Arc::new(engine.load(bytes).unwrap())
+    Arc::new(policy::load(bytes).unwrap())
 }
 
 /// The `fcfs` policy the harness serves.

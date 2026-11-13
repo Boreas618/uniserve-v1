@@ -15,10 +15,10 @@ use std::collections::BTreeSet;
 use ipc::batch::Phase;
 use proto::config::WorkerGroupRole;
 use proto::request::RequestId;
-use scheduling_guest::decision::{Inflight, Room};
-use scheduling_guest::ids::{RequestId as PolicyRequestId, StageId};
-use scheduling_guest::time::Nanos;
-use scheduling_guest::view::{
+use scheduling::decision::{Inflight, Room};
+use scheduling::ids::{RequestId as PolicyRequestId, StageId};
+use scheduling::time::Nanos;
+use scheduling::view::{
     CallView, PhaseView, ReplicaView, RequestClass, RequestStatus as Standing, RequestView,
     Snapshot,
 };

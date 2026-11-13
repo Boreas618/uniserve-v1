@@ -21,7 +21,7 @@ use std::time::{Duration, Instant};
 use ipc::batch::{Batch, BatchOutput, CallOutput, CallStatus, ErrorCode, Phase};
 use proto::report::{DomainSchedulerStats, ForwardStats, SchedulerStats};
 use proto::request::RequestId;
-use scheduling_guest::PhaseClass;
+use scheduling::PhaseClass;
 
 use super::{Output, Scheduler};
 

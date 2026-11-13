@@ -4,15 +4,16 @@
 //! scheduler with no policy decides nothing (no output, no admission, no batch), so an engine that
 //! serves a request must be given a module. [`packaged_policy`] is that module: the real `fcfs`
 //! package this tree builds, with the arguments that make its declared limits fit the ceilings of
-//! the groups the engine's schedulers serve (`engine::scheduler::ceilings`). Every scheduler
+//! the groups the engine's schedulers serve (`engine::scheduler::policy::ceilings`). Every scheduler
 //! instantiates it as it instantiates a deployment's, so a caller's fixtures exercise the
 //! mechanism rather than a stand-in for it, and there is no second policy in the tree to keep
 //! honest.
 
 use std::sync::Arc;
 
+use ::engine::scheduler::policy;
 use anyhow::Result;
-use scheduling_guest::{Limits, Parameters};
+use scheduling::{Limits, Parameters};
 
 /// The arguments that state `limits` as the policy's parameters: every limit a deployment can
 /// state.
@@ -29,7 +30,7 @@ fn parameters_of(limits: &Limits) -> Parameters {
 }
 
 /// The arguments `fcfs` runs under in an engine whose groups' captured buckets bound it by
-/// `ceilings` (`engine::scheduler::ceilings`): they state the ceilings themselves, so the limits
+/// `ceilings` (`engine::scheduler::policy::ceilings`): they state the ceilings themselves, so the limits
 /// the module declares are the ones a scheduler checks a policy against and cannot be refused.
 pub fn packaged_arguments(ceilings: &Limits) -> Parameters {
     parameters_of(ceilings)
@@ -47,9 +48,7 @@ pub fn packaged_arguments(ceilings: &Limits) -> Parameters {
 ///
 /// As [`packaged_module`].
 pub fn packaged_policy(ceilings: &Limits) -> Result<(Arc<wasmtime::Module>, Parameters)> {
-    let engine = scheduling::Engine::new().map_err(|error| anyhow::anyhow!("{error}"))?;
-    let module = engine
-        .load(&packaged_module())
+    let module = policy::load(&packaged_module())
         .map_err(|error| anyhow::anyhow!("loading the fcfs policy module: {error}"))?;
     Ok((Arc::new(module), packaged_arguments(ceilings)))
 }
@@ -78,8 +77,7 @@ pub fn packaged_module() -> Vec<u8> {
             };
             // Served precompiled for this host, as a deployment's store serves a policy: a
             // preparation then loads the artifact instead of compiling the module again.
-            scheduling::Engine::new()
-                .and_then(|engine| engine.precompile(&wasm))
+            policy::precompile(&wasm)
                 .unwrap_or_else(|error| panic!("precompiling the fcfs policy module: {error}"))
         })
         .clone()

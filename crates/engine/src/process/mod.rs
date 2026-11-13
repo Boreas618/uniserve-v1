@@ -54,14 +54,14 @@ use std::time::{Duration, Instant};
 use anyhow::{Context as _, Result, bail};
 use crossbeam_channel::{Receiver, Select, Sender};
 use ipc::memory::WeightsUpdated;
-use proto::Connection;
 use proto::config::{EngineArgs, EngineConfig, SchedulerConfig};
 use proto::module::{ModuleSlot, Packages};
 use proto::process::command;
 use proto::request::wire::{self, engine_command, from_engine};
 use proto::request::{ArtifactMedia, RequestId};
-use scheduling_guest::Parameters;
-use scheduling_guest::view::Snapshot;
+use scheduling::Parameters;
+use scheduling::view::Snapshot;
+use service::Connection;
 use worker::executor::peers::{LOST_EXIT, Liveness};
 use worker::executor::watchdog::Watchdog;
 
@@ -424,7 +424,7 @@ impl MainProcess {
                 if let Some(slot) = self.fronts.get_mut(front)
                     && let Some(connection) = slot.take()
                 {
-                    connection.close();
+                    connection.shutdown();
                 }
                 self.end_when_unserved();
             }
@@ -561,10 +561,10 @@ impl MainProcess {
         closed?;
 
         for connection in self.fronts.iter().flatten() {
-            connection.close();
+            connection.shutdown();
         }
         if let Some(process) = &self.process {
-            process.close();
+            process.shutdown();
         }
         Ok(())
     }

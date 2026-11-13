@@ -5,8 +5,9 @@
 //!
 //! The policy witness runs a Python build script and the wasm precompiler, which a host provisions:
 //! `UNISERVE_BUILD_SERVER_PYTHON` names the interpreter and `UNISERVE_SCHEDULING_PRECOMPILE` the
-//! precompiler, and the witness says what is missing when either is not named. The builds of the
-//! repository's own packages are `cargo run -p build-server --example check_builds`.
+//! precompiler (a `uniserve-engine` executable), and the witness says what is missing when either
+//! is not named. The builds of the repository's own packages are
+//! `cargo run -p build-server --example check_builds`.
 
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -370,10 +371,10 @@ fn a_policy_is_built_from_its_installed_snapshot() {
     let precompiler = std::env::var_os("UNISERVE_SCHEDULING_PRECOMPILE")
         .map(PathBuf::from)
         .expect(
-            "UNISERVE_SCHEDULING_PRECOMPILE must name the precompiler: \
-             `cargo build -p scheduling --bin scheduling-precompile` builds it",
+            "UNISERVE_SCHEDULING_PRECOMPILE must name the precompiler, a uniserve-engine \
+             executable: `cargo build -p engine --bin uniserve-engine` builds it",
         );
-    // The tree's default policy: a crate that depends on the guest crate through its workspace.
+    // The tree's default policy: a crate that depends on the `scheduling` crate through its workspace.
     let package =
         std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../scheduling/policies/fcfs");
     let temporary = tempfile::tempdir().unwrap();
@@ -421,12 +422,12 @@ fn a_policy_is_built_from_its_installed_snapshot() {
     let (_server, stop, thread) = start(&with_toolchain);
     let mut client = Client::connect(&with_toolchain.socket).unwrap();
     client.install(&package).unwrap();
-    // The revision holds the policy's crate and the guest crate it depends on, and no module:
+    // The revision holds the policy's crate and the `scheduling` crate it depends on, and no module:
     // installing built nothing.
     let revision = root.join("scheduling").join("fcfs").join("1");
     assert!(
         revision
-            .join("workspace/crates/scheduling/guest/Cargo.toml")
+            .join("workspace/crates/scheduling/Cargo.toml")
             .is_file()
     );
     assert!(!revision.join("module.wasm").exists());
@@ -489,7 +490,7 @@ fn the_command_makes_every_path_absolute_before_the_server_sees_it() {
         "--python",
         "relative/python",
         "--wasm",
-        "target/debug/scheduling-precompile",
+        "target/debug/uniserve-engine",
     ])
     .expect("the command's own flags parse");
     let Command::Serve(serve) = args.command else {

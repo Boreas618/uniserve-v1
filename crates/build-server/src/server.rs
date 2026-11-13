@@ -35,8 +35,10 @@ use std::time::Duration;
 use crate::builder::{Build, BuildState, Builder, Limits, Urgency};
 use crate::inputs::Inputs;
 use crate::manifest::Manifest;
+use service::Connection;
+
 use crate::protocol::{
-    self, Connection, Descriptors, Module, ModuleFile, PrepareRequest, Progress, Selector, wire,
+    self, Descriptors, Module, ModuleFile, PrepareRequest, Progress, Selector, wire,
 };
 use crate::source::Source;
 use crate::store::{ModulePath, Root, Store};
@@ -256,9 +258,11 @@ impl BuildServer {
 
     /// Serves one client's connection until it closes.
     fn serve_connection(&self, stream: std::os::unix::net::UnixStream) -> Result<()> {
-        let mut connection = Connection::new(stream);
+        let mut connection = Connection::new(stream)?;
         loop {
-            let (request, _) = connection.receive::<wire::Request>()?;
+            let request = connection
+                .recv::<wire::Request>(std::time::Duration::MAX)?
+                .ok_or_else(|| Error::Protocol("the client sent no request".into()))?;
             let Some(request) = request.request else {
                 return Err(Error::Protocol("a request carries no request".into()));
             };
@@ -267,12 +271,9 @@ impl BuildServer {
                 // The client's request failed; it is told why in the frame
                 // that would have returned it.
                 let refused = refusal(&error);
-                connection.send(
-                    &wire::ServerMessage {
-                        message: Some(wire::server_message::Message::Refused(refused)),
-                    },
-                    &[],
-                )?;
+                connection.deliver(&wire::ServerMessage {
+                    message: Some(wire::server_message::Message::Refused(refused)),
+                })?;
             }
         }
     }
@@ -282,20 +283,17 @@ impl BuildServer {
         match request {
             wire::request::Request::Install(install) => {
                 let installed = self.install(Path::new(&install.package))?;
-                connection.send(
-                    &wire::ServerMessage {
-                        message: Some(wire::server_message::Message::Installed(
-                            wire::InstallResponse {
-                                package: Some(wire::Package {
-                                    op: installed.op,
-                                    backend: installed.backend,
-                                    revision: installed.revision,
-                                }),
-                            },
-                        )),
-                    },
-                    &[],
-                )
+                Ok(connection.deliver(&wire::ServerMessage {
+                    message: Some(wire::server_message::Message::Installed(
+                        wire::InstallResponse {
+                            package: Some(wire::Package {
+                                op: installed.op,
+                                backend: installed.backend,
+                                revision: installed.revision,
+                            }),
+                        },
+                    )),
+                })?)
             }
             wire::request::Request::Prepare(prepare) => {
                 let request = prepare_request(prepare)?;
@@ -315,12 +313,9 @@ impl BuildServer {
                         })
                         .collect(),
                 };
-                connection.send(
-                    &wire::ServerMessage {
-                        message: Some(wire::server_message::Message::Prepared(prepared)),
-                    },
-                    &[],
-                )
+                Ok(connection.deliver(&wire::ServerMessage {
+                    message: Some(wire::server_message::Message::Prepared(prepared)),
+                })?)
             }
             wire::request::Request::Resolve(resolve) => {
                 let revision = PackageRevision::try_from(
@@ -350,22 +345,24 @@ impl BuildServer {
                 for file in module.files {
                     descriptors.push(std::os::fd::OwnedFd::from(file.file));
                 }
-                connection.send(
-                    &wire::ServerMessage {
-                        message: Some(wire::server_message::Message::Resolved(
-                            wire::ResolveResponse {
-                                form: wire::ModuleForm::from(module.form) as i32,
-                                files,
-                                // Field 3 is superseded by `entries` and left empty.
-                                entry: String::new(),
-                                entries: module.entries.into_iter().collect(),
-                                metadata: module.metadata.unwrap_or_default(),
-                                interface_version: module.interface_version,
-                            },
-                        )),
-                    },
-                    &descriptors,
-                )
+                let response = wire::ServerMessage {
+                    message: Some(wire::server_message::Message::Resolved(
+                        wire::ResolveResponse {
+                            form: wire::ModuleForm::from(module.form) as i32,
+                            files,
+                            // Field 3 is superseded by `entries` and left empty.
+                            entry: String::new(),
+                            entries: module.entries.into_iter().collect(),
+                            metadata: module.metadata.unwrap_or_default(),
+                            interface_version: module.interface_version,
+                        },
+                    )),
+                };
+                // The module's files ride on the frame that names them, in its order.
+                let borrowed: Vec<std::os::fd::BorrowedFd<'_>> =
+                    descriptors.iter().map(std::os::fd::AsFd::as_fd).collect();
+                connection.send_with(&response, &borrowed)?;
+                Ok(connection.flush()?)
             }
             wire::request::Request::Cover(cover) => {
                 let mut preferred = Vec::with_capacity(cover.preferred.len());
@@ -413,12 +410,9 @@ impl BuildServer {
                         })
                         .collect(),
                 };
-                connection.send(
-                    &wire::ServerMessage {
-                        message: Some(wire::server_message::Message::Coverage(coverage)),
-                    },
-                    &[],
-                )
+                Ok(connection.deliver(&wire::ServerMessage {
+                    message: Some(wire::server_message::Message::Coverage(coverage)),
+                })?)
             }
             wire::request::Request::List(_) => {
                 let listing = wire::ListResponse {
@@ -441,12 +435,9 @@ impl BuildServer {
                         })
                         .collect(),
                 };
-                connection.send(
-                    &wire::ServerMessage {
-                        message: Some(wire::server_message::Message::Listing(listing)),
-                    },
-                    &[],
-                )
+                Ok(connection.deliver(&wire::ServerMessage {
+                    message: Some(wire::server_message::Message::Listing(listing)),
+                })?)
             }
         }
     }
@@ -1492,8 +1483,8 @@ impl<'a> ProgressSender<'a> {
                 detail: progress.detail.clone(),
             })),
         };
-        if let Err(error) = self.connection.send(&message, &[]) {
-            self.failure = Some(error);
+        if let Err(error) = self.connection.deliver(&message) {
+            self.failure = Some(error.into());
         }
     }
 

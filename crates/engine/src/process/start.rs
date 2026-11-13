@@ -36,8 +36,8 @@ use ops::Generation;
 use platform::DeviceId;
 use proto::config::{EngineArgs, SchedulerConfig, WorkerGroupConfig};
 use proto::request::{GenerationFeatures, GenerationLimits};
-use scheduling_guest::limits::{Limits, Parameters};
-use scheduling_guest::view::{RankView, Snapshot};
+use scheduling::limits::{Limits, Parameters};
+use scheduling::view::{RankView, Snapshot};
 use storage::QueuePair;
 use storage::runtime::{GroupId, Open, Opened};
 use worker::Executor;
@@ -55,7 +55,8 @@ use crate::executor::{Groups, Shadow};
 use crate::modules::load;
 use crate::rank::ModelRunner;
 use crate::rank::text::Keys;
-use crate::scheduler::{self, Message, Output, Policy, Scheduler};
+use crate::scheduler::policy::{self, Policy};
+use crate::scheduler::{self, Message, Output, Scheduler};
 use crate::storage_client::StorageClient;
 
 /// The device a launch names when its ranks are backed by nothing outside the process
@@ -194,7 +195,7 @@ impl Engine {
             max_logprobs: config.max_logprobs,
             ..config.model.generation_limits.clone()
         };
-        let ceilings = scheduler::ceilings(capacities.iter().map(|(_, capacity)| capacity));
+        let ceilings = policy::ceilings(capacities.iter().map(|(_, capacity)| capacity));
         let served = Arc::new(AtomicU64::new(FIRST_GENERATION));
 
         // The schedulers' limits as the deployment states them, which each scheduler lowers to
@@ -687,9 +688,9 @@ enum Links {
     /// This process holds every rank of its group.
     Alone,
     /// The scheduler node's: every peer's registered channel, by the first rank it serves.
-    Accepted(Vec<(u32, ipc::Channel)>),
+    Accepted(Vec<(u32, service::Connection)>),
     /// A peer's: its channel to the scheduler node.
-    Registered(ipc::Channel),
+    Registered(service::Connection),
 }
 
 /// Meets the epoch's other main processes the launch names: the scheduler node accepts every

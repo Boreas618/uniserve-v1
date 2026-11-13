@@ -53,6 +53,7 @@ use ::storage::protocol::{FabricExport, Link, LinkEnd, Region, Registration};
 use platform::DeviceId;
 
 use super::contexts::Hold;
+use super::nixl;
 use super::storage::{Fabric, Mapping};
 use super::threads::{End, Piece, Runner, ThreadKey};
 

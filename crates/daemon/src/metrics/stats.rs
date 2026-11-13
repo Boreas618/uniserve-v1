@@ -24,7 +24,7 @@ use crate::metrics::{
 use futures::{Stream, StreamExt as _};
 use tracing::info;
 
-use frontend::output::{RequestOutput, RequestOutputStream, RequestUsage};
+use crate::api::output::{RequestOutput, RequestOutputStream, RequestUsage};
 use proto::report::SchedulerStats;
 
 /// Records the scheduler-stats-backed metrics for one engine at one point in
@@ -493,7 +493,7 @@ impl StatLogger {
                 self.queue_us = Some(((scheduled_at - queued_at).max(0.0) * 1e6) as u64);
             }
             RequestOutput::Finished { reason, usage, .. } => {
-                self.record(frontend::output::finish_reason_name(reason), Some(usage));
+                self.record(crate::api::output::finish_reason_name(reason), Some(usage));
             }
             RequestOutput::Failed { .. } => self.record("error", None),
             RequestOutput::Rejected { .. } => self.recorded = true,
@@ -562,7 +562,7 @@ impl StatLogger {
 }
 
 impl Stream for RequestStats {
-    type Item = Result<RequestOutput, frontend::output::OutputError>;
+    type Item = Result<RequestOutput, crate::api::output::OutputError>;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         let next = ready!(self.inner.poll_next_unpin(cx));
@@ -640,7 +640,7 @@ fn seconds(microseconds: u64) -> f64 {
     microseconds as f64 / 1_000_000.0
 }
 
-impl frontend::events::Stats for StatLogger {
+impl crate::api::events::Stats for StatLogger {
     fn started(&self) -> Instant {
         StatLogger::started(self)
     }

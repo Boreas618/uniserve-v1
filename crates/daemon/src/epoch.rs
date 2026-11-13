@@ -286,7 +286,7 @@ impl Epochs {
     /// Records `record` as epoch `epoch`'s, replacing what was recorded of
     /// that epoch before.
     pub fn record(&self, epoch: u64, record: EpochRecord) {
-        locked(&self.records).insert(epoch, record);
+        service::lock(&self.records).insert(epoch, record);
     }
 
     /// The launch generation to start `group`'s rank `rank` in: one more than
@@ -308,7 +308,7 @@ impl Epochs {
     /// engines of a deployment over several hosts as it starts them, and processes of another node
     /// are not in this node's process table. Later numbers of `group`'s rank `rank` are above it.
     pub fn launched_up_to(&self, group: &str, rank: u64, generation: u64) {
-        let mut allocated = locked(&self.generations);
+        let mut allocated = service::lock(&self.generations);
         let last = allocated.entry((group.to_owned(), rank)).or_insert(0);
         *last = (*last).max(generation);
     }
@@ -320,7 +320,7 @@ impl Epochs {
             .map(|process| process.generation)
             .max()
             .unwrap_or(0);
-        let mut allocated = locked(&self.generations);
+        let mut allocated = service::lock(&self.generations);
         let key = (group.to_owned(), rank);
         let last = allocated.get(&key).copied().unwrap_or(0).max(runnning);
         let next = last + 1;
@@ -331,7 +331,7 @@ impl Epochs {
     /// Records that epoch `epoch` switched to `modules` on trial, keeping
     /// what it executed before as the previous generation.
     pub fn switched(&self, epoch: u64, modules: ModuleSet) {
-        let mut records = locked(&self.records);
+        let mut records = service::lock(&self.records);
         let Some(record) = records.get_mut(&epoch) else {
             // The modules already execute, so an epoch with no record serves
             // them under a record that says nothing about them.
@@ -352,7 +352,7 @@ impl Epochs {
     /// Records that epoch `epoch`'s new modules are what serves and the
     /// previous generation is no longer kept.
     pub fn committed(&self, epoch: u64) {
-        let mut records = locked(&self.records);
+        let mut records = service::lock(&self.records);
         let Some(record) = records.get_mut(&epoch) else {
             tracing::error!(
                 epoch,
@@ -369,7 +369,7 @@ impl Epochs {
     /// Ends a generation's trial by putting the previous generation back:
     /// what the epoch executed before the update is what it executes again.
     pub fn rolled_back(&self, epoch: u64) {
-        let mut records = locked(&self.records);
+        let mut records = service::lock(&self.records);
         let Some(record) = records.get_mut(&epoch) else {
             tracing::error!(
                 epoch,
@@ -418,18 +418,18 @@ impl Epochs {
 
     /// Epoch `epoch`'s record, if the daemon keeps one.
     pub fn get(&self, epoch: u64) -> Option<EpochRecord> {
-        locked(&self.records).get(&epoch).cloned()
+        service::lock(&self.records).get(&epoch).cloned()
     }
 
     /// Every epoch the daemon keeps, by number.
     pub fn records(&self) -> BTreeMap<u64, EpochRecord> {
-        locked(&self.records).clone()
+        service::lock(&self.records).clone()
     }
 
     /// The epoch that serves requests: the highest numbered one that is
     /// serving or on trial.
     pub fn serving(&self) -> Option<(u64, EpochRecord)> {
-        locked(&self.records)
+        service::lock(&self.records)
             .iter()
             .rev()
             .find(|(_, record)| matches!(record.status, Status::Serving | Status::Trial))
@@ -439,16 +439,16 @@ impl Epochs {
     /// Replaces the node's process table with `processes`.
     pub fn set_processes(&self, processes: Vec<ManagedProcess>) {
         match self.supervised.get() {
-            Some(table) => *locked(table) = processes,
-            None => *locked(&self.processes) = processes,
+            Some(table) => *service::lock(table) = processes,
+            None => *service::lock(&self.processes) = processes,
         }
     }
 
     /// The node's process table.
     pub fn processes(&self) -> Vec<ManagedProcess> {
         match self.supervised.get() {
-            Some(table) => locked(table).clone(),
-            None => locked(&self.processes).clone(),
+            Some(table) => service::lock(table).clone(),
+            None => service::lock(&self.processes).clone(),
         }
     }
 
@@ -465,7 +465,7 @@ impl Epochs {
     /// modules in the form the daemon records, and one entry per process
     /// the daemon manages.
     pub fn report(&self) -> Value {
-        let epochs = locked(&self.records)
+        let epochs = service::lock(&self.records)
             .iter()
             .map(|(epoch, record)| record_report(*epoch, record))
             .collect::<Vec<_>>();
@@ -546,12 +546,6 @@ fn process_report(process: &ManagedProcess) -> Value {
             ProcessState::Failed(reason) => format!("failed: {reason}"),
         },
     })
-}
-
-fn locked<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
-    mutex
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 /// The operator names the epoch record keys its kernel packages by, of the
@@ -922,7 +916,7 @@ mod tests {
         // reports no process, and the record's own rows are not reported
         // beside it.
         assert!(epochs.processes().is_empty());
-        *locked(&table) = vec![ManagedProcess {
+        *service::lock(&table) = vec![ManagedProcess {
             group: "engine".to_owned(),
             rank: 0,
             pid: Some(42),

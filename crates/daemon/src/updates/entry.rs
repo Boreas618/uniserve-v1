@@ -30,7 +30,7 @@ use tracing::info;
 use crate::engine::client::EngineState;
 use crate::engine::hold::HoldState;
 use crate::epoch::{Change, Epoch, Failure};
-use crate::leader::{Leader, Replica, UpdateError, locked};
+use crate::leader::{Leader, Replica, UpdateError};
 use crate::options::ServerArgs;
 use crate::updates::change::{Applied, ApplyRequest, InFlight, resolve};
 use crate::updates::update::{EpochSwitch, Node, Update};
@@ -197,7 +197,7 @@ impl Leader {
         if !request.dry_run && self.updates.in_flight().is_some() {
             return Err(UpdateError::InProgress);
         }
-        let current = locked(&replicas[0].config).clone();
+        let current = service::lock(&replicas[0].config).clone();
         let (target, _stated, options) = resolve(&current, &request)?;
 
         let named_previous = crate::leader::deployment(&current)?;
@@ -275,7 +275,7 @@ impl Leader {
         if request.replica.is_some() {
             return Err("a harness applies to the deployment, not to one replica".to_owned());
         }
-        let allowed = locked(&self.replicas()[0].config)
+        let allowed = service::lock(&self.replicas()[0].config)
             .admin_config
             .harness_options
             .clone();
@@ -412,7 +412,7 @@ impl Leader {
             let Some(client) = replica.hold().client() else {
                 continue;
             };
-            let ranks = locked(&replica.config)
+            let ranks = service::lock(&replica.config)
                 .engine_config()
                 .ok()
                 .and_then(|config| crate::engine::control::world_hosts(&config).ok())
@@ -490,7 +490,7 @@ impl Leader {
             crate::leader::same_processing(current.model(), target.model())
                 .await
                 .map_err(UpdateError::Refused)?;
-            let served = locked(&replicas[0].served).clone();
+            let served = service::lock(&replicas[0].served).clone();
             if served.is_some_and(|served| !served.engine_config.model.processes_as(&engine.model))
             {
                 return Err(UpdateError::Refused(format!(
@@ -522,7 +522,7 @@ impl Leader {
         let serving_configs: Vec<_> = replicas
             .iter()
             .filter_map(|replica| {
-                locked(&replica.served)
+                service::lock(&replica.served)
                     .as_ref()
                     .map(|args| args.engine_config.clone())
             })
@@ -735,7 +735,7 @@ impl Replica {
     /// engine that takes requests with its state, and the digest of the
     /// configuration.
     pub(crate) fn config_status(&self) -> serde_json::Value {
-        let config = locked(&self.config).clone();
+        let config = service::lock(&self.config).clone();
         let printed = crate::options::printed(&config).unwrap_or_default();
         let digest = digest(&config).unwrap_or_default();
         let hold = self.hold();
@@ -743,7 +743,9 @@ impl Replica {
         let unavailable = |epoch: u64, reason: &str| serde_json::json!({ "epoch": epoch, "state": "unavailable", "reason": reason });
         // The epoch a replica without an engine last executed is the one its
         // served arguments name.
-        let served_epoch = locked(&self.served).as_ref().map_or(0, |args| args.epoch);
+        let served_epoch = service::lock(&self.served)
+            .as_ref()
+            .map_or(0, |args| args.epoch);
         let executing = match hold.client() {
             Some(client) => {
                 let epoch = client.epoch();
@@ -793,12 +795,14 @@ impl Replica {
                 "the engine sleeps: wake it (/admin/wake_up) before updating it".to_owned(),
             ));
         }
-        let current = locked(&self.config).clone();
+        let current = service::lock(&self.config).clone();
         let (target, stated, _) = resolve(&current, &request)?;
         if target == current && target.worker_groups.is_none() {
             return Ok(Applied::Unchanged);
         }
-        let served = locked(&self.served).clone().ok_or(UpdateError::NoEngine)?;
+        let served = service::lock(&self.served)
+            .clone()
+            .ok_or(UpdateError::NoEngine)?;
         // The target's engine configuration is resolved as a deployment's
         // start resolves it: from the options, completed by what the model's
         // files determine, and divided into the deployment's replicas.
@@ -886,8 +890,8 @@ impl Replica {
             );
             let mut args = served;
             args.engine_config = target_engine;
-            *locked(&self.served) = Some(args);
-            *locked(&self.config) = target;
+            *service::lock(&self.served) = Some(args);
+            *service::lock(&self.config) = target;
             return Ok(Applied::InPlace(
                 serde_json::json!({ "in_place": ["the fence probes"] }),
             ));
@@ -898,8 +902,8 @@ impl Replica {
         if in_place {
             let mut args = served;
             args.engine_config = target_engine;
-            *locked(&self.served) = Some(args);
-            *locked(&self.config) = target;
+            *service::lock(&self.served) = Some(args);
+            *service::lock(&self.config) = target;
             return Ok(Applied::InPlace(
                 serde_json::json!({ "in_place": ["the scheduling limits"] }),
             ));

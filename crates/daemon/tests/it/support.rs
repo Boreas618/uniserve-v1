@@ -6,11 +6,11 @@ use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use daemon::DaemonOptions;
-use proto::Connection;
 use proto::process::{
     Downstream, Engine as EnginePeer, Exit, Hello, Reply, Request, Reserve, Reserved, Spawn, Stop,
     Upstream, Welcome, downstream, event, hello, reply, request, upstream,
 };
+use service::Connection;
 
 /// The bound for a daemon or a process it supervises to react.
 pub(crate) const TIMEOUT: Duration = Duration::from_secs(30);
@@ -64,7 +64,7 @@ impl Engine {
             }
         };
         connection
-            .send(&Hello {
+            .deliver(&Hello {
                 major,
                 build: proto::BUILD.to_owned(),
                 peer: Some(hello::Peer::Engine(EnginePeer {
@@ -94,7 +94,7 @@ impl Engine {
         let id = self.next;
         self.next += 1;
         self.connection
-            .send(&Upstream {
+            .deliver(&Upstream {
                 kind: Some(upstream::Kind::Request(Request {
                     id,
                     kind: Some(kind),

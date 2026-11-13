@@ -12,6 +12,13 @@
 //! every device's runners, prints the kernel keys they recorded as the key
 //! list `uniserve build-server build --keys` reads, and serves nothing.
 //!
+//! `uniserve-engine precompile --wasm <raw> --out <module>` turns a scheduling
+//! policy package's wasm32 module into the precompiled artifact the Build
+//! Server stores, under the wasmtime configuration the engine loads it with
+//! (`engine::scheduler::policy`), and `uniserve-engine precompile --version`
+//! prints the wasmtime version a policy package must declare as its last
+//! word. The Build Server runs both (`--wasm` names this executable).
+//!
 //! This is the one place the engine names a concrete model: the families it
 //! loads are registered in [`FAMILIES`], and the library dispatches by
 //! capability.
@@ -21,7 +28,8 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 
 use anyhow::{Context as _, Result};
-use clap::Parser;
+use clap::{Parser, Subcommand};
+use engine::scheduler::policy;
 use service::logging;
 
 // mimalloc is built with `no_thp` (workspace `Cargo.toml`): its arenas carry
@@ -40,17 +48,22 @@ const FAMILIES: [nn::family::Family; 4] = [
     models::minimax_h3::family::FAMILY,
 ];
 
-/// The engine's command line.
+/// The engine's command line: a main process with `--launch`, or one of its
+/// commands.
 #[derive(Debug, Parser)]
 #[command(
     name = "uniserve-engine",
-    about = "A node's main process for one epoch of a UniServe deployment."
+    about = "A node's main process for one epoch of a UniServe deployment.",
+    subcommand_negates_reqs = true,
+    args_conflicts_with_subcommands = true
 )]
 struct Cli {
+    #[command(subcommand)]
+    command: Option<Command>,
     /// The launch file the daemon wrote for this process
     /// (`proto::config::EngineArgs`).
-    #[arg(long, value_name = "FILE")]
-    launch: PathBuf,
+    #[arg(long, value_name = "FILE", required = true)]
+    launch: Option<PathBuf>,
     /// Print the kernel keys this launch's profile runs record
     /// (`operator<TAB>key` lines, sorted, each once) and exit, serving
     /// nothing.
@@ -62,6 +75,29 @@ struct Cli {
     /// Log level of the HTTP client libraries.
     #[arg(long)]
     log_level_http: Option<String>,
+}
+
+/// What the executable does besides serving an epoch.
+#[derive(Debug, Subcommand)]
+enum Command {
+    /// Precompile a scheduling policy package's wasm32 module for this host's
+    /// architecture, as the Build Server stores it.
+    Precompile(Precompile),
+}
+
+/// The arguments of `precompile`.
+#[derive(Debug, clap::Args)]
+struct Precompile {
+    /// Print the wasmtime version modules are precompiled with, the one a
+    /// policy package declares, and exit.
+    #[arg(long, exclusive = true)]
+    version: bool,
+    /// The raw wasm32 module the policy crate compiled to.
+    #[arg(long, value_name = "FILE", required_unless_present = "version")]
+    wasm: Option<PathBuf>,
+    /// Where the precompiled module is written; its directory is created.
+    #[arg(long, value_name = "FILE", required_unless_present = "version")]
+    out: Option<PathBuf>,
 }
 
 fn main() -> Result<ExitCode> {
@@ -78,6 +114,10 @@ fn main() -> Result<ExitCode> {
     }));
     let lifeline = take_lifeline();
     let cli = Cli::parse();
+    if let Some(Command::Precompile(arguments)) = cli.command {
+        return precompile(&arguments).map(|()| ExitCode::SUCCESS);
+    }
+    let launch_file = cli.launch.context("--launch names the launch file")?;
     let registry = nn::family::Registry::new(FAMILIES)?;
 
     if cli.keys {
@@ -89,10 +129,10 @@ fn main() -> Result<ExitCode> {
             cli.log_level_http.as_deref(),
             logging::Output::Stderr,
         );
-        let launch: proto::config::EngineArgs = std::fs::read(&cli.launch)
+        let launch: proto::config::EngineArgs = std::fs::read(&launch_file)
             .map_err(anyhow::Error::new)
             .and_then(|text| serde_json::from_slice(&text).map_err(anyhow::Error::new))
-            .with_context(|| format!("reading the launch file {}", cli.launch.display()))?;
+            .with_context(|| format!("reading the launch file {}", launch_file.display()))?;
         let recorded = engine::record(&launch, &registry)?;
         let list = build_server::build::key_list(&recorded)?;
         let mut stdout = std::io::stdout().lock();
@@ -110,7 +150,31 @@ fn main() -> Result<ExitCode> {
         cli.log_level_http.as_deref(),
         logging::Output::Stdout,
     );
-    engine::run(&cli.launch, &registry).map(|()| ExitCode::SUCCESS)
+    engine::run(&launch_file, &registry).map(|()| ExitCode::SUCCESS)
+}
+
+/// `precompile`: prints the wasmtime version, or precompiles `--wasm` into
+/// `--out`. A failure names the file it concerns; the process then exits 1,
+/// and with 2 for a command line clap refused.
+fn precompile(arguments: &Precompile) -> Result<()> {
+    if arguments.version {
+        println!("wasmtime {}", policy::WASMTIME_VERSION);
+        return Ok(());
+    }
+    let (Some(wasm), Some(out)) = (&arguments.wasm, &arguments.out) else {
+        anyhow::bail!("precompile needs --wasm and --out");
+    };
+
+    let bytes = std::fs::read(wasm).with_context(|| format!("cannot read {}", wasm.display()))?;
+    let module = policy::precompile(&bytes)
+        .with_context(|| format!("cannot precompile {}", wasm.display()))?;
+
+    let parent = out.parent().filter(|parent| !parent.as_os_str().is_empty());
+    if let Some(parent) = parent {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("cannot create {}", parent.display()))?;
+    }
+    std::fs::write(out, &module).with_context(|| format!("cannot write {}", out.display()))
 }
 
 /// The lifeline this process inherited from the daemon that supervises it

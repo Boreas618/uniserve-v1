@@ -28,7 +28,7 @@ use proto::request::{
     ArtifactMedia, CachePolicy, Event, FinishReason, GenerationRequest, MigrationCause,
     RejectionKind, RequestId, SamplingParams,
 };
-use scheduling_guest::view::{RankView, Snapshot};
+use scheduling::view::{RankView, Snapshot};
 
 use super::MainProcess;
 use super::lifecycle::Lifecycle;

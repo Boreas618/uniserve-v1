@@ -3,7 +3,7 @@
 //! [`serve`] starts this node's daemon and, on the leader, the [`Leader`],
 //! binds the configured TCP or Unix-domain listener, and serves the router
 //! of the tasks the engine serves until shutdown. Each API module builds its own routes over the engine
-//! (`frontend::openai`); this module registers them by task, as vLLM registers
+//! (`crate::api::openai`); this module registers them by task, as vLLM registers
 //! its routers by `supported_tasks`, and wraps them in the middleware of
 //! `middleware`.
 
@@ -13,7 +13,7 @@ pub(crate) mod handoff;
 pub(crate) mod listener;
 mod middleware;
 mod node;
-mod served;
+pub(crate) mod served;
 pub(crate) mod stream;
 
 pub use node::node;
@@ -38,12 +38,12 @@ use tokio_util::sync::CancellationToken;
 use tower_http::trace::TraceLayer;
 use tracing::{info, warn};
 
+use crate::api::openai::video_jobs::VideoJobs;
+use crate::api::openai::{self, ApiError, chat_completions, videos};
 use crate::http::listener::Listener;
 use crate::http::middleware::ConcurrencyLimit;
 use crate::leader::{Leader, Task};
 use crate::options::{MediaConfig, ServerArgs, ServerConfig, Stated};
-use frontend::openai::video_jobs::VideoJobs;
-use frontend::openai::{self, ApiError, chat_completions, videos};
 
 /// HTTP body limit of every route but the video submission routes, in bytes.
 pub(crate) const BODY_LIMIT: usize = 64 << 20;
@@ -1437,7 +1437,7 @@ mod tests {
         );
         assert_eq!(
             body["video"]["request_fields"],
-            serde_json::json!(frontend::protocol::request_field_names())
+            serde_json::json!(crate::api::protocol::request_field_names())
         );
     }
 }

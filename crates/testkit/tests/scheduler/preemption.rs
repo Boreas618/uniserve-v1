@@ -20,10 +20,10 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use engine::scheduler::Message;
+use engine::scheduler::{Message, policy};
 use ipc::batch::Phase;
 use proto::request::{Event, FinishReason, MigrationCause, RequestId};
-use scheduling_guest::{Nanos, Parameters};
+use scheduling::{Nanos, Parameters};
 use storage::runtime::Request;
 
 use crate::harness::{A, BLOCK, Deployment, Harness, prompt, token};
@@ -402,8 +402,7 @@ fn a_mutual_shortage_preempts_the_last_admitted_of_the_lowest_priority() {
 /// Serves the `fcfs` policy again with a starvation bound of `timeout`, the deployment's other
 /// limits as `Deployment::tokens` states them (chunks and steps of 64 tokens, 8 calls a step).
 fn starve_after(harness: &mut Harness, timeout: Duration) {
-    let engine = scheduling::Engine::new().unwrap();
-    let module = Arc::new(engine.load(&testkit::packaged_module()).unwrap());
+    let module = Arc::new(policy::load(&testkit::packaged_module()).unwrap());
     let parameters = Parameters {
         chunked_prefill_size: Some(64),
         max_batch: Some(8),

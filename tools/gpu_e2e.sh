@@ -47,11 +47,12 @@ fi
 # nothing; otherwise the tree is built here.
 if [ -z "${UNISERVE_BINARY:-}" ] || [ -z "${UNISERVE_SCHEDULING_PRECOMPILE:-}" ]; then
     # The manager runs beside the executable: the admin API's tests attach it to a deployment.
-    "$cargo" build --release -p uniserve --bin uniserve -p scheduling --bin scheduling-precompile \
+    # The engine executable precompiles the scheduling policy (`uniserve-engine precompile`).
+    "$cargo" build --release -p uniserve --bin uniserve -p engine --bin uniserve-engine \
         -p manager --bin uniserve-manager
     release=${CARGO_TARGET_DIR:-$root/target}/release
     export UNISERVE_BINARY=$release/uniserve
-    export UNISERVE_SCHEDULING_PRECOMPILE=$release/scheduling-precompile
+    export UNISERVE_SCHEDULING_PRECOMPILE=$release/uniserve-engine
 fi
 export UNISERVE_RUN_GPU_E2E=1
 export MAX_JOBS=${MAX_JOBS:-16}

@@ -19,7 +19,7 @@ use build_server::{
 use ops::KernelEntry;
 use platform::DeviceId;
 use proto::module::{PackageRevision, Packages};
-use scheduling_guest::limits::Parameters;
+use scheduling::limits::Parameters;
 
 use crate::modules::select::{
     Routes, fixed_revisions, interface_agrees, named_backends, selected_slots,
@@ -226,8 +226,8 @@ pub(crate) fn install(
 
 /// The scheduling policy of `package` (`specs/scheduler-design.md` §5.3): its module, which the
 /// Build Server resolves for the store's wasm target under the operator's single descriptor and
-/// builds first when its store does not hold it, compiled by the engine
-/// `scheduling::Engine` configures (fuel metered), and the package's arguments as the policy's
+/// builds first when its store does not hold it, loaded by `scheduler::policy::load` (fuel
+/// metered), and the package's arguments as the policy's
 /// [`Parameters`]. The module is loaded once here, and every scheduler and the routing policy
 /// instantiate it.
 ///
@@ -275,12 +275,12 @@ pub(crate) fn policy(
 
     // A module built for another version of the policy interface would be asked decisions
     // through calls whose messages mean something else to it.
-    if module.interface_version != scheduling_guest::INTERFACE_VERSION {
+    if module.interface_version != scheduling::INTERFACE_VERSION {
         bail!(
             "{named} implements version {} of the scheduling policy interface and this engine \
              instantiates version {}",
             module.interface_version,
-            scheduling_guest::INTERFACE_VERSION
+            scheduling::INTERFACE_VERSION
         );
     }
     let file = module
@@ -297,9 +297,7 @@ pub(crate) fn policy(
     std::io::Read::read_to_end(&mut &file.file, &mut bytes)
         .with_context(|| format!("reading {named}'s module"))?;
 
-    let engine = scheduling::Engine::new().map_err(|error| anyhow::anyhow!("{error}"))?;
-    let module = engine
-        .load(&bytes)
+    let module = crate::scheduler::policy::load(&bytes)
         .map_err(|error| anyhow::anyhow!("loading {named}'s module: {error}"))?;
     Ok((Arc::new(module), parameters))
 }
@@ -734,7 +732,7 @@ mod tests {
         ))
         .unwrap();
         assert_eq!(stated.max_batch, Some(8));
-        assert_eq!(stated.timeout, Some(scheduling_guest::time::Nanos(1000)));
+        assert_eq!(stated.timeout, Some(scheduling::time::Nanos(1000)));
         assert_eq!(stated.expected_speedup, Some(1.5));
         assert_eq!(stated.chunked_prefill_size, None);
 

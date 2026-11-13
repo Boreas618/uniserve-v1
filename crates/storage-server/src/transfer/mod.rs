@@ -63,6 +63,7 @@
 mod contexts;
 mod devices;
 mod network;
+mod nixl;
 mod storage;
 mod threads;
 

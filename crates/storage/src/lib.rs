@@ -8,9 +8,9 @@
 //! so that a restarted worker maps the retained storage instead of loading it
 //! again.
 //!
-//! - [`protocol`]: the messages, versioned independently of the build.
-//! - [`transport`]: framed messages with file descriptors over a Unix
-//!   socket.
+//! - [`protocol`]: the messages, versioned independently of the build, each a
+//!   descriptor frame with its file descriptors on the workspace's one
+//!   connection (`service::Connection`).
 //! - [`queue`]: the queue pair in shared memory between a scheduler and the
 //!   buffer pool.
 //! - [`runtime`]: the requests and completions that travel on a queue pair.
@@ -36,7 +36,6 @@ pub mod manifest;
 pub mod protocol;
 pub mod queue;
 pub mod runtime;
-pub mod transport;
 
 pub use client::{ClaimClient, ClaimHandoff, Client};
 pub use error::{Error, Result};

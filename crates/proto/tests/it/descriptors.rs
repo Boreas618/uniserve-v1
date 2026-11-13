@@ -7,7 +7,8 @@ use std::os::unix::net::UnixStream;
 use std::time::Duration;
 
 use proto::request::{ArtifactMedia as _, wire};
-use proto::{Connection, Listener, MappedMedia, MediaReceiver};
+use proto::{MappedMedia, MediaReceiver};
+use service::{Connection, Listener};
 
 /// An anonymous shared-memory file holding `bytes`.
 fn storage(bytes: &[u8]) -> OwnedFd {
@@ -26,8 +27,8 @@ fn storage(bytes: &[u8]) -> OwnedFd {
 #[test]
 fn a_frame_carries_its_descriptor_and_the_receiver_maps_the_bytes() {
     let (left, right) = UnixStream::pair().unwrap();
-    let mut sender = Connection::from_unix(left).unwrap();
-    let mut receiver = Connection::from_unix(right).unwrap();
+    let mut sender = Connection::new(left).unwrap();
+    let mut receiver = Connection::new(right).unwrap();
 
     // Two frames, the first with a descriptor and the second without: each
     // descriptor comes with its own frame, in order.
@@ -39,7 +40,7 @@ fn a_frame_carries_its_descriptor_and_the_receiver_maps_the_bytes() {
         bytes: bytes.len() as u64,
     };
     sender
-        .send_with_descriptor(&announce("video/mp4"), shared.as_fd())
+        .send_with(&announce("video/mp4"), &[shared.as_fd()])
         .unwrap();
     drop(shared);
     sender.send(&announce("none")).unwrap();

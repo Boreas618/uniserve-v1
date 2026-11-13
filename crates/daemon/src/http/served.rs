@@ -1,74 +1,39 @@
-//! The served model as the API's routes reach it (`frontend::openai::Server`):
-//! the leader's request facade, and this daemon's connections, which write
-//! every response body and hand it to a successor on a hot restart.
+//! The state of the API's routes: the served model, and this daemon's
+//! connections, which write every response body and hand it to a successor
+//! on a hot restart.
 
 use std::sync::Arc;
 
 use axum::response::Response;
-use futures::FutureExt as _;
-use futures::future::BoxFuture;
 
-use frontend::body::{Opening, Session};
-use frontend::events::Events;
-use frontend::input::video::ProcessedVideo;
-use frontend::input::{AdapterSelection, Processor, ServeError};
-use frontend::openai::{ApiError, Server};
-use frontend::output::{OutputProcessor, RequestOutputStream};
-use frontend::protocol::{ChatCompletionRequest, VideoGenerationRequest};
-
+use crate::api::body::{Opening, Session};
+use crate::api::openai::ApiError;
 use crate::http::handoff::Handoff;
 use crate::http::stream::{HandedBody, ResponseStream, attach};
 use crate::leader::Leader;
 
 /// The leader, with the registry a hot restart pauses its responses through.
 pub(crate) struct Served {
-    leader: Arc<Leader>,
+    /// The served model, which the routes submit requests to.
+    pub(crate) leader: Arc<Leader>,
     handoff: Arc<Handoff>,
 }
 
 impl Served {
-    /// The routes' server over `leader`, whose response bodies register with
+    /// The routes' state over `leader`, whose response bodies register with
     /// `handoff`.
-    pub(crate) fn shared(leader: Arc<Leader>, handoff: Arc<Handoff>) -> Arc<dyn Server> {
+    pub(crate) fn shared(leader: Arc<Leader>, handoff: Arc<Handoff>) -> Arc<Self> {
         Arc::new(Self { leader, handoff })
     }
-}
 
-impl Server for Served {
-    fn served_model_name(&self) -> &str {
-        self.leader.served_model_name()
-    }
-
-    fn adapter_names(&self) -> Vec<String> {
-        self.leader.adapter_names()
-    }
-
-    fn adapter(&self, name: &str) -> Option<AdapterSelection> {
-        self.leader.adapter(name)
-    }
-
-    fn processor(&self) -> &Processor {
-        self.leader.processor()
-    }
-
-    fn generate(
-        &self,
-        request_id: String,
-        request: ChatCompletionRequest,
-        adapter: Option<AdapterSelection>,
-    ) -> BoxFuture<'_, Result<(Box<dyn Events>, OutputProcessor), ApiError>> {
-        self.leader.generate(request_id, request, adapter).boxed()
-    }
-
-    fn generate_video(
-        &self,
-        request_id: String,
-        request: VideoGenerationRequest,
-    ) -> BoxFuture<'_, Result<(ProcessedVideo, RequestOutputStream), ServeError>> {
-        self.leader.generate_video(request_id, request).boxed()
-    }
-
-    fn attach(
+    /// Makes `session` the body of `response`, opened as `opening`: this
+    /// daemon's connection writes its frames, and a hot restart can hand it
+    /// to a successor, which names the response `request_id`.
+    ///
+    /// # Errors
+    ///
+    /// Fails when the body cannot be registered for a handoff.
+    pub(crate) fn attach(
         &self,
         response: &mut Response,
         session: Box<dyn Session>,

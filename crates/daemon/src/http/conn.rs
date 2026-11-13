@@ -58,9 +58,6 @@ type Io = Either<TcpStream, UnixStream>;
 /// The largest request head (request line and headers) the server reads.
 const MAX_HEAD: usize = 64 << 10;
 
-/// How much is read from the socket at a time.
-const READ_CHUNK: usize = 64 << 10;
-
 /// How many de-framed body bytes one pump hands the request's reader before
 /// the reader must poll again.
 const BODY_CHUNK: usize = 64 << 10;
@@ -174,7 +171,7 @@ pub(crate) async fn adopt(
             // One document, so a body that ends before producing one is a
             // failure rather than an empty success.
             Opened::Ended => {
-                let error = frontend::openai::error::ApiError::server_error(
+                let error = crate::api::openai::error::ApiError::server_error(
                     "the response ended before it wrote its document".to_owned(),
                 );
                 let document = Connection::failure_document(&error);
@@ -462,7 +459,8 @@ impl Connection {
         if self.peer_closed {
             return Ok(false);
         }
-        let mut chunk = [0_u8; READ_CHUNK];
+        // As much as a connection of the workspace reads from its socket at a time.
+        let mut chunk = [0_u8; service::READ_CHUNK];
         loop {
             match self.io.read(&mut chunk).await {
                 Ok(0) => {
@@ -614,7 +612,7 @@ impl Connection {
                         request = %handed.request_id,
                         "a response's document opened with an empty frame, which a client reads as an empty success"
                     );
-                    let error = frontend::openai::error::ApiError::server_error(
+                    let error = crate::api::openai::error::ApiError::server_error(
                         "the response's document was empty".to_owned(),
                     );
                     let document = Self::failure_document(&error);
@@ -627,7 +625,7 @@ impl Connection {
                 // One document, so a body that ends before producing one is a
                 // failure rather than an empty response.
                 Some(Opened::Ended) => {
-                    let error = frontend::openai::error::ApiError::server_error(
+                    let error = crate::api::openai::error::ApiError::server_error(
                         "the response ended before it wrote its document".to_owned(),
                     );
                     let document = Self::failure_document(&error);
@@ -696,7 +694,7 @@ impl Connection {
 
     /// The document a failure answers with when the body produced none: the
     /// error's own JSON, which is what a sink's `failed` writes for it.
-    fn failure_document(error: &frontend::openai::error::ApiError) -> Bytes {
+    fn failure_document(error: &crate::api::openai::error::ApiError) -> Bytes {
         serde_json::to_vec(&error.to_error_response())
             .map(Bytes::from)
             .unwrap_or_default()
@@ -706,7 +704,7 @@ impl Connection {
     /// is the failure's, and the body is the sink's document for it.
     async fn write_failure(
         &mut self,
-        error: frontend::openai::error::ApiError,
+        error: crate::api::openai::error::ApiError,
         frames: Vec<Bytes>,
         closing: bool,
     ) -> anyhow::Result<Outcome> {
@@ -1372,18 +1370,18 @@ impl RequestBody {
 
     /// How many times the handler has asked for bytes it did not have.
     fn asks(&self) -> u64 {
-        crate::leader::locked(&self.shared).asks
+        service::lock(&self.shared).asks
     }
 
     /// Whether the handler holds de-framed bytes it has not polled yet.
     fn unpolled(&self) -> bool {
-        !crate::leader::locked(&self.shared).ready.is_empty()
+        !service::lock(&self.shared).ready.is_empty()
     }
 
     /// Marks the body unreadable because the client stopped inside it.
     fn abandon(&mut self) {
         self.ended = true;
-        let mut shared = crate::leader::locked(&self.shared);
+        let mut shared = service::lock(&self.shared);
         shared.ended = true;
         wake(&mut shared);
     }
@@ -1409,7 +1407,7 @@ impl RequestBody {
             if self.ended {
                 break;
             }
-            let mut shared = crate::leader::locked(&self.shared);
+            let mut shared = service::lock(&self.shared);
             let room = BODY_CHUNK.saturating_sub(shared.ready.len());
             if room == 0 {
                 wake(&mut shared);
@@ -1462,7 +1460,7 @@ impl RequestBody {
                 }
             }
         }
-        let mut shared = crate::leader::locked(&self.shared);
+        let mut shared = service::lock(&self.shared);
         wake(&mut shared);
         Ok(fed)
     }
@@ -1584,7 +1582,7 @@ impl http_body::Body for BodySource {
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,
     ) -> Poll<Option<Result<http_body::Frame<Bytes>, io::Error>>> {
-        let mut shared = crate::leader::locked(&self.shared);
+        let mut shared = service::lock(&self.shared);
         if !shared.ready.is_empty() {
             let bytes = shared.ready.split().freeze();
             return Poll::Ready(Some(Ok(http_body::Frame::data(bytes))));
@@ -2648,7 +2646,9 @@ mod tests {
             br#"{"error":{"message":"the engine failed","type":"server_error"}}"#,
         );
         let mut client = serve_document(Some(Step::Failed {
-            error: frontend::openai::error::ApiError::server_error("the engine failed".to_owned()),
+            error: crate::api::openai::error::ApiError::server_error(
+                "the engine failed".to_owned(),
+            ),
             frames: vec![Bytes::clone(&document)],
         }));
         client
@@ -2747,7 +2747,7 @@ mod tests {
         let body = ResponseStream::start_held(
             Box::new(DocumentSession {
                 step: Some(Step::Failed {
-                    error: frontend::openai::error::ApiError::server_error(
+                    error: crate::api::openai::error::ApiError::server_error(
                         "the engine failed".to_owned(),
                     ),
                     frames: vec![Bytes::clone(&document)],

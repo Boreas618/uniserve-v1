@@ -18,10 +18,20 @@
 //! [`shm`] removes the shared memory a process of the host's libraries leaves
 //! behind when it ends without closing them, which the process that reaps it
 //! clears.
+//!
+//! Every process interface runs on one [`Connection`] over a Unix or TCP
+//! socket, framed by [`frame`], whose messages each protocol encodes
+//! ([`Message`]). [`lock`] is the one way a thread takes a mutex.
 
+mod connection;
 pub mod frame;
 pub mod logging;
 pub mod shm;
+
+pub use connection::{
+    Connection, DEAD_PEER_SECS, Framing, Handed, Hangup, Listener, Message, READ_CHUNK, Socket,
+    Wake, Waker,
+};
 
 use std::fs::{File, OpenOptions};
 use std::io::{self, Read as _, Write as _};
@@ -33,6 +43,19 @@ use std::process::Command;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
+
+/// Locks `mutex`, keeping the state a panicking holder left.
+///
+/// Every build profile sets `panic = "abort"`, so a holder's panic ends the
+/// process before another thread observes the poisoned lock. Only test
+/// builds, which ignore that setting and unwind, reach the recovery; it
+/// returns the guard rather than raising a second panic in the thread that
+/// locks next.
+pub fn lock<T>(mutex: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    mutex
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
 
 /// The directory of the calling user's host services:
 /// `$XDG_RUNTIME_DIR/uniserve`, or `/tmp/uniserve-<uid>` without a runtime

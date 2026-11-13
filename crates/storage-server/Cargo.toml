@@ -9,14 +9,15 @@ publish = false
 # Server. It links no CUDA runtime: the server holds device storage only
 # through descriptors and asks NVML (`platform`) which processes a GPU still
 # lists, and the Transfer Server loads the CUDA driver, and NIXL for copies
-# between hosts (`nixl`), at run time.
+# between hosts (`transfer::nixl`), at run time.
 [dependencies]
 anyhow.workspace = true
 clap.workspace = true
 platform.workspace = true
 libc.workspace = true
 mooncake_store.workspace = true
-nixl.workspace = true
+# NIXL's C API library, which the Transfer Server opens at run time (`transfer::nixl`).
+libloading.workspace = true
 rmp-serde.workspace = true
 serde_bytes.workspace = true
 rustix = { workspace = true, features = ["event", "fs", "mm", "net", "pipe", "process", "time"] }

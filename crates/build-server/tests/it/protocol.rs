@@ -3,17 +3,16 @@
 //! calls.
 
 use std::io::{Read as _, Seek as _, SeekFrom, Write as _};
-use std::os::fd::OwnedFd;
+use std::os::fd::{AsFd, OwnedFd};
 use std::os::unix::net::UnixStream;
 
 use build_server::Error;
 use build_server::manifest::ModuleForm;
-use build_server::protocol::{
-    Client, Connection, Descriptors, PackageRequest, PrepareRequest, Selector, wire,
-};
+use build_server::protocol::{Client, Descriptors, PackageRequest, PrepareRequest, Selector, wire};
 use build_server::store::ModulePath;
 use build_server::target::Target;
 use proto::module::{ModuleSlot, PackageRevision, PhaseKind};
+use service::Connection;
 
 /// A package revision of the Triton `rms_norm` package.
 fn revision() -> PackageRevision {
@@ -24,28 +23,57 @@ fn revision() -> PackageRevision {
     }
 }
 
+/// The test server's end of a connection, as the Build Server reads and writes it: one frame and
+/// the descriptors it carries at a time, each written whole before the next.
+trait Frames {
+    fn post(
+        &mut self,
+        message: &impl service::Message,
+        descriptors: &[OwnedFd],
+    ) -> std::io::Result<()>;
+
+    fn receive<M: service::Message>(&mut self) -> std::io::Result<(M, Vec<OwnedFd>)>;
+}
+
+impl Frames for Connection {
+    fn post(
+        &mut self,
+        message: &impl service::Message,
+        descriptors: &[OwnedFd],
+    ) -> std::io::Result<()> {
+        let borrowed: Vec<_> = descriptors.iter().map(AsFd::as_fd).collect();
+        self.send_with(message, &borrowed)?;
+        self.flush()
+    }
+
+    fn receive<M: service::Message>(&mut self) -> std::io::Result<(M, Vec<OwnedFd>)> {
+        self.recv_with(std::time::Duration::from_secs(60))?
+            .ok_or_else(|| std::io::Error::from(std::io::ErrorKind::TimedOut))
+    }
+}
+
 /// Runs `serve` on one end of a socket pair and returns the client of the
 /// other.
 fn server_on(serve: impl FnOnce(&mut Connection) + Send + 'static) -> Client {
     let (client, server) = UnixStream::pair().unwrap();
     std::thread::spawn(move || {
-        let mut connection = Connection::new(server);
+        let mut connection = Connection::new(server).unwrap();
         serve(&mut connection);
     });
-    Client::new(Connection::new(client))
+    Client::new(Connection::new(client).unwrap())
 }
 
 #[test]
 fn a_request_crosses_the_connection_with_the_descriptor_of_its_frame() {
     let (left, right) = UnixStream::pair().unwrap();
-    let mut sender = Connection::new(left);
-    let mut receiver = Connection::new(right);
+    let mut sender = Connection::new(left).unwrap();
+    let mut receiver = Connection::new(right).unwrap();
 
     let mut file = tempfile::tempfile().unwrap();
     file.write_all(b"a cubin").unwrap();
     let descriptor = OwnedFd::from(file);
     sender
-        .send(
+        .post(
             &wire::Request {
                 request: Some(wire::request::Request::Install(wire::Install {
                     package: "/packages/rms_norm/triton".into(),
@@ -75,7 +103,7 @@ fn install_returns_the_revision_the_upstream_gave_the_package() {
     let mut client = server_on(|connection| {
         let _ = connection.receive::<wire::Request>().unwrap();
         connection
-            .send(
+            .post(
                 &wire::ServerMessage {
                     message: Some(wire::server_message::Message::Installed(
                         wire::InstallResponse {
@@ -103,7 +131,7 @@ fn an_install_another_server_refuses_names_the_upstream() {
     let mut client = server_on(|connection| {
         let _ = connection.receive::<wire::Request>().unwrap();
         connection
-            .send(
+            .post(
                 &wire::ServerMessage {
                     message: Some(wire::server_message::Message::Refused(wire::Refusal {
                         reason: "only the upstream Build Server installs packages".into(),
@@ -142,12 +170,12 @@ fn prepare_reports_each_build_and_returns_the_selected_packages() {
             })),
         };
         connection
-            .send(&progress(wire::BuildState::Queued, ""), &[])
+            .post(&progress(wire::BuildState::Queued, ""), &[])
             .unwrap();
         let mut file = tempfile::tempfile().unwrap();
         file.write_all(b"cubin").unwrap();
         connection
-            .send(
+            .post(
                 &wire::ServerMessage {
                     message: Some(wire::server_message::Message::Prepared(
                         wire::PrepareResponse {
@@ -213,7 +241,7 @@ fn a_module_comes_back_with_its_files_over_their_descriptors() {
         let mut file = tempfile::tempfile().unwrap();
         file.write_all(b"the cubin bytes").unwrap();
         connection
-            .send(
+            .post(
                 &wire::ServerMessage {
                     message: Some(wire::server_message::Message::Resolved(
                         wire::ResolveResponse {
@@ -263,7 +291,7 @@ fn a_listing_names_the_packages_revisions_and_modules() {
     let mut client = server_on(|connection| {
         let _ = connection.receive::<wire::Request>().unwrap();
         connection
-            .send(
+            .post(
                 &wire::ServerMessage {
                     message: Some(wire::server_message::Message::Listing(wire::ListResponse {
                         packages: vec![wire::PackageEntry {
@@ -302,7 +330,7 @@ fn the_four_phases_of_a_revision_slot_travel_whole() {
         };
         // The server echoes what it selected, phase and all.
         connection
-            .send(
+            .post(
                 &wire::ServerMessage {
                     message: Some(wire::server_message::Message::Prepared(
                         wire::PrepareResponse {
@@ -372,7 +400,7 @@ fn a_native_module_comes_back_with_its_entries_by_role() {
         let mut file = tempfile::tempfile().unwrap();
         file.write_all(b"the shared object").unwrap();
         connection
-            .send(
+            .post(
                 &wire::ServerMessage {
                     message: Some(wire::server_message::Message::Resolved(
                         wire::ResolveResponse {
@@ -422,7 +450,7 @@ fn a_listing_names_a_policy_module_as_a_wasm_module() {
     let mut client = server_on(|connection| {
         let _ = connection.receive::<wire::Request>().unwrap();
         connection
-            .send(
+            .post(
                 &wire::ServerMessage {
                     message: Some(wire::server_message::Message::Listing(wire::ListResponse {
                         packages: vec![wire::PackageEntry {
@@ -452,7 +480,7 @@ fn a_listed_module_of_an_unknown_form_is_refused_rather_than_guessed() {
     let mut client = server_on(|connection| {
         let _ = connection.receive::<wire::Request>().unwrap();
         connection
-            .send(
+            .post(
                 &wire::ServerMessage {
                     message: Some(wire::server_message::Message::Listing(wire::ListResponse {
                         packages: vec![wire::PackageEntry {

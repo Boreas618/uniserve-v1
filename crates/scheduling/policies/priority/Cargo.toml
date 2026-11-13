@@ -11,7 +11,7 @@ description = "The scheduling policy that admits and batches by the request's ow
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
-scheduling-guest.workspace = true
+scheduling.workspace = true
 
 [lints]
 workspace = true

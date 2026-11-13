@@ -37,6 +37,6 @@ chunked_prefill_size = 512
 max_batch = 8
 max_num_batched_tokens = 512
 prefetch_min_tokens = 256
-# Nanoseconds, as `scheduling_guest::limits::Parameters` reads a duration: the
+# Nanoseconds, as `scheduling::limits::Parameters` reads a duration: the
 # fixture states its cap rather than taking the guest's default of the same 30 s.
 timeout = 30000000000

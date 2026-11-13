@@ -47,7 +47,7 @@ use proto::request::{
     ArtifactEvent, EVENT_WINDOW, Event, FinishReason, MediaKind, MigrationCause, PositionLogprobs,
     RejectionKind, RequestId, StopReason, TokenLogprob,
 };
-use scheduling_guest::{End, Event as Change, Nanos, RequestId as PolicyRequestId};
+use scheduling::{End, Event as Change, Nanos, RequestId as PolicyRequestId};
 use storage::Key;
 use storage::runtime::{self, Cause, Completion, GroupId, OwnerId};
 

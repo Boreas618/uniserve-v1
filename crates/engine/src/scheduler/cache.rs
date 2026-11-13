@@ -19,7 +19,7 @@ use std::num::NonZeroU32;
 use std::time::Instant;
 
 use proto::request::RequestId;
-use scheduling_guest::{EncodingId, EncodingView, Event, Nanos, PageId, PageView};
+use scheduling::{EncodingId, EncodingView, Event, Nanos, PageId, PageView};
 use storage::Key;
 use storage::runtime::{self, Cause, Completion, GroupId, Tier};
 
@@ -840,7 +840,7 @@ mod tests {
 
     use ipc::CacheGroupKind;
     use proto::config::KvCacheConfig;
-    use scheduling_guest::{Event, PageId};
+    use scheduling::{Event, PageId};
     use storage::Key;
     use storage::runtime::{self, Cause, Completion, OwnerId, Source, Tier};
 

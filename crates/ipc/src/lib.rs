@@ -8,13 +8,14 @@
 //! are ready.
 //!
 //! [`MainProcessRequest`] and [`MainProcessResponse`] are the envelopes exchanged per
-//! rank, each as the one message of a [`Frame`]: a length followed by the
+//! rank, each the message of one frame on the workspace's one connection
+//! (`service::Connection`; the codec is [`link`]): a length followed by the
 //! message in the binary encoding its `serde` derive describes. These message
 //! types are the only definition of the protocol, so the main processes of an
-//! epoch must be built from the same sources. A [`Channel`] carries the
-//! frames over a stream connection: a Unix socket to a rank on the scheduler's
-//! node, TCP to a rank on another node. A rank's main process connects to the
-//! scheduler's and sends its [`PeerRegistration`].
+//! epoch must be built from the same sources. The connection is a Unix socket
+//! to a rank on the scheduler's node, TCP to a rank on another node. A rank's
+//! main process connects to the scheduler's [`Listener`] and sends its
+//! [`PeerRegistration`].
 
 use serde::{Deserialize, Serialize};
 
@@ -65,22 +66,19 @@ macro_rules! ensure_valid {
 pub mod batch;
 /// What a worker group's executors serve, as they state it once they are ready.
 pub mod capacity;
-pub mod channel;
-/// Failures at the channel boundary.
-pub mod error;
-/// The unit a channel carries: a length and one encoded message.
-pub mod frame;
 pub mod launch;
+pub mod link;
 pub mod memory;
 
 /// Counter-based random draws of the rank's token sampler.
 pub mod philox;
 
 pub use capacity::Capacity;
-pub use channel::{Channel, Listener, Wake, Waker};
-pub use error::{EncodingError, IpcError, IpcResult, TransportError};
-pub use frame::Frame;
 pub use launch::StorageLaunch;
+pub use link::Listener;
+/// The peer link's connection and its local wake, which the worker's link threads name through
+/// this crate.
+pub use service::{Connection, Wake};
 
 // Message types are split by concern and re-exported flat at the crate root;
 // each module takes the shared imports through `use super::*` and the

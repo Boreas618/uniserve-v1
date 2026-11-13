@@ -934,23 +934,39 @@ name = "daemon"
 version = "2.0.0"
 dependencies = [
  "anyhow",
+ "asynk-strim-attr",
  "axum",
+ "base64 0.22.1",
  "build-server",
  "bytes",
  "clap",
- "frontend",
+ "criterion",
+ "expect-test",
+ "fastokens",
+ "fnv",
  "futures",
+ "hf-hub 0.5.0",
  "http-body",
+ "image",
+ "indexmap 2.14.0",
+ "itertools 0.14.0",
  "libc",
+ "llm-multimodal",
+ "media",
+ "minijinja",
+ "minijinja-contrib",
  "platform",
  "processing",
  "prometheus-client",
  "prost",
  "proto",
  "reqwest",
+ "safetensors",
  "serde",
+ "serde-json-fmt",
  "serde_json",
  "serde_path_to_error",
+ "serde_with",
  "service",
  "sha2",
  "storage",
@@ -958,13 +974,18 @@ dependencies = [
  "testkit",
  "thiserror 2.0.18",
  "thiserror-ext",
+ "tokenizers",
  "tokio",
  "tokio-util",
  "toml",
  "tower",
  "tower-http",
  "tracing",
+ "tracing-futures",
+ "url",
  "uuid",
+ "validator",
+ "winnow",
 ]
 
 [[package]]
@@ -1223,7 +1244,6 @@ dependencies = [
  "processing",
  "proto",
  "scheduling",
- "scheduling-guest",
  "serde_json",
  "service",
  "storage",
@@ -1421,52 +1441,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cb4cb245038516f5f85277875cdaa4f7d2c9a0fa0468de06ed190163b1581fcf"
 dependencies = [
  "percent-encoding",
-]
-
-[[package]]
-name = "frontend"
-version = "2.0.0"
-dependencies = [
- "anyhow",
- "asynk-strim-attr",
- "axum",
- "base64 0.22.1",
- "bytes",
- "criterion",
- "expect-test",
- "fastokens",
- "fnv",
- "frontend",
- "futures",
- "hf-hub 0.5.0",
- "image",
- "indexmap 2.14.0",
- "itertools 0.14.0",
- "libc",
- "llm-multimodal",
- "media",
- "minijinja",
- "minijinja-contrib",
- "processing",
- "proto",
- "reqwest",
- "serde",
- "serde-json-fmt",
- "serde_json",
- "serde_with",
- "storage",
- "tempfile",
- "thiserror 2.0.18",
- "thiserror-ext",
- "tokenizers",
- "tokio",
- "tokio-util",
- "tracing",
- "tracing-futures",
- "url",
- "uuid",
- "validator",
- "winnow",
 ]
 
 [[package]]
@@ -2236,7 +2210,7 @@ dependencies = [
  "libc",
  "proto",
  "rmp-serde",
- "scheduling-guest",
+ "scheduling",
  "serde",
  "service",
  "storage",
@@ -2781,15 +2755,6 @@ dependencies = [
  "portable-atomic",
  "portable-atomic-util",
  "rawpointer",
-]
-
-[[package]]
-name = "nixl"
-version = "2.0.0"
-dependencies = [
- "libloading",
- "platform",
- "thiserror 2.0.18",
 ]
 
 [[package]]
@@ -3348,7 +3313,6 @@ dependencies = [
  "serde_with",
  "service",
  "sha2",
- "storage",
  "thiserror 2.0.18",
  "toml",
 ]
@@ -3889,14 +3853,6 @@ dependencies = [
 name = "scheduling"
 version = "2.0.0"
 dependencies = [
- "thiserror 2.0.18",
- "wasmtime",
-]
-
-[[package]]
-name = "scheduling-guest"
-version = "2.0.0"
-dependencies = [
  "serde",
  "serde_json",
 ]
@@ -3905,21 +3861,21 @@ dependencies = [
 name = "scheduling-policy-fcfs"
 version = "2.0.0"
 dependencies = [
- "scheduling-guest",
+ "scheduling",
 ]
 
 [[package]]
 name = "scheduling-policy-fixture"
 version = "2.0.0"
 dependencies = [
- "scheduling-guest",
+ "scheduling",
 ]
 
 [[package]]
 name = "scheduling-policy-priority"
 version = "2.0.0"
 dependencies = [
- "scheduling-guest",
+ "scheduling",
 ]
 
 [[package]]
@@ -4279,8 +4235,8 @@ dependencies = [
  "anyhow",
  "clap",
  "libc",
+ "libloading",
  "mooncake_store",
- "nixl",
  "platform",
  "rmp-serde",
  "rustix",
@@ -4462,7 +4418,7 @@ dependencies = [
  "libc",
  "proto",
  "scheduling",
- "scheduling-guest",
+ "service",
  "storage",
  "storage-server",
  "tempfile",

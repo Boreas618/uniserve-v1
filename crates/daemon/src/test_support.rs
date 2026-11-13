@@ -27,23 +27,23 @@ use testkit::{FakeExecutor, Fixture};
 use tokio_util::sync::CancellationToken;
 use tower::ServiceExt as _;
 
+use crate::api::input::chat::HfChatRenderer;
+use crate::api::input::media::MediaConnector;
+use crate::api::input::{Processor, RequestRenderer};
+use crate::api::model::{ModelConfig, SamplingDefaults};
+use crate::api::openai::video_jobs::VideoJobs;
+use crate::api::tokenizer::DynTokenizer;
 use crate::engine::client::EngineClient;
 use crate::leader::Leader;
 use crate::options::ChatTemplateContentFormat;
 use crate::options::{ImageFetchConfig, LoggingConfig, ServerArgs, ServerConfig, VideoJobConfig};
-use frontend::input::chat::HfChatRenderer;
-use frontend::input::media::MediaConnector;
-use frontend::input::{Processor, RequestRenderer};
-use frontend::model::{ModelConfig, SamplingDefaults};
-use frontend::openai::video_jobs::VideoJobs;
-use frontend::tokenizer::DynTokenizer;
 
 /// Served model name the test engines serve under.
 pub(crate) const SERVED_MODEL: &str = "sim-model";
 
 /// The application crate's byte tokenizer, which the serving tests decode
-/// with (see `frontend::test_support::configured_tokenizer`).
-pub(crate) use frontend::test_support::{CHAT, VIDEO, configured_tokenizer, test_video_service};
+/// with (see `crate::api::test_support::configured_tokenizer`).
+pub(crate) use crate::api::test_support::{CHAT, VIDEO, configured_tokenizer, test_video_service};
 
 /// The server's router over `engine` under the default server options.
 pub(crate) fn router(engine: impl Into<Arc<Leader>>) -> Router {
@@ -247,7 +247,7 @@ pub(crate) fn fake_engine(
 /// daemon's `Command` event, and each report the engine writes is received on
 /// the returned receiver. The interface closes once the sender is dropped.
 fn process_link(
-    connection: proto::Connection,
+    connection: service::Connection,
 ) -> (
     std::sync::mpsc::Sender<proto::process::Command>,
     std::sync::mpsc::Receiver<proto::process::Report>,
@@ -263,7 +263,7 @@ fn process_link(
         .name("process-commands".into())
         .spawn(move || {
             for command in commanded {
-                let sent = writer.send(&Downstream {
+                let sent = writer.deliver(&Downstream {
                     kind: Some(downstream::Kind::Event(Event {
                         kind: Some(event::Kind::Command(command)),
                     })),
@@ -274,7 +274,7 @@ fn process_link(
             }
             // The daemon closes the interface both ways, which ends the reader
             // below as well as the engine's.
-            writer.close();
+            writer.shutdown();
         })
         .expect("start the process interface's writer");
 
