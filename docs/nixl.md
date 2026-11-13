@@ -2,7 +2,7 @@
 
 UniServe loads NIXL's C API at runtime for RDMA transfers between Storage Servers. The bindings target NIXL 1.5.1 with the UCX backend. Read-only host storage requires both patches in `crates/nixl/patches/`: NIXL passes the requested read access to UCX, and UCX registers the mapping for remote reads without requesting write access. The patches apply to the revisions below.
 
-The build requires Git, a C/C++ compiler, a CUDA toolkit, Autoconf, Automake, Libtool, pkg-config, Meson, Ninja, patchelf, and the development headers and libraries for verbs, RDMA CM and GDRCopy. UCX's configure links against the unversioned names of the verbs and RDMA CM libraries (`libibverbs.so`, `librdmacm.so`, `libmlx5.so`); a host that ships only their versioned runtime libraries builds UCX without its InfiniBand transports, which `ucx_info -d` then omits. Link names in a directory of their own, passed as `LDFLAGS=-L<directory>` to `configure-release`, provide them. Put the CUDA toolkit's `bin` directory on `PATH`. Run these commands from the repository root; sources, build outputs and installed libraries stay under `artifacts/native`.
+The build requires Git, a C/C++ compiler, a CUDA toolkit, Autoconf, Automake, Libtool, pkg-config, Meson, Ninja, patchelf, and the development headers and libraries for verbs, RDMA CM and GDRCopy. UCX's configure links against the unversioned names of the verbs and RDMA CM libraries (`libibverbs.so`, `librdmacm.so`, `libmlx5.so`); a host that ships only their versioned runtime libraries builds UCX without its InfiniBand transports, which `ucx_info -d` then omits. Link names in a directory of their own, passed as `LDFLAGS=-L<directory>` to `configure-release`, provide them. Put the CUDA toolkit's `bin` directory on `PATH` and name its prefix to UCX's configure (`--with-cuda="$CUDA_HOME"`): without it configure finds no `cuda.h` on a host whose toolkit is outside the default paths. The Rust bindings that load NIXL are generated with libclang (`LIBCLANG_PATH`), which a host that runs the binaries without building them does not need. Run these commands from the repository root; sources, build outputs and installed libraries stay under `artifacts/native`.
 
 ```bash
 export MAX_JOBS=8
@@ -21,7 +21,7 @@ git -C "$native_root/src/ucx" apply "$patch_root/ucx-read-only.patch"
     ../contrib/configure-release --prefix="$native_root/ucx" \
         --enable-mt --enable-shared --disable-static --disable-doxygen-doc \
         --enable-optimizations --without-avx --enable-cma --enable-devel-headers \
-        --with-cuda --with-verbs --with-dm --with-gdrcopy=/usr
+        --with-cuda="$CUDA_HOME" --with-verbs --with-dm --with-gdrcopy=/usr
     make -j "$MAX_JOBS"
     make install
 )
