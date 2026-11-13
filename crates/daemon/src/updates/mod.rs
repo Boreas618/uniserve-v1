@@ -14,14 +14,12 @@
 //! at a time.
 //!
 //! [`change`] holds a configuration change's request and what applying it did;
-//! [`trial`] the thresholds of `update_config.rollback`; [`warming`] the
-//! warming of the host KV tier before an epoch switch.
+//! [`trial`] the thresholds of `update_config.rollback`.
 
 pub(crate) mod change;
 pub(crate) mod entry;
 pub(crate) mod trial;
 pub(crate) mod update;
-pub(crate) mod warming;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -96,8 +94,6 @@ struct State {
     /// The serving epoch's steps against their baseline while an epoch
     /// update's target prepares.
     transfers: Option<Arc<Mutex<StepTime>>>,
-    /// What the update's warming read.
-    warming: Option<Value>,
     /// What the last update that ended reported, which the status keeps.
     last: Option<Value>,
     /// The targets a rollback marked unavailable, by their digest.
@@ -114,7 +110,7 @@ struct State {
 const ENDED_KEPT: usize = 16;
 
 impl State {
-    /// `report` with what the update's trial, transfers and warming read.
+    /// `report` with what the update's trial and transfers read.
     fn completed(&self, mut report: Value) -> Value {
         if let Some(trial) = &self.trial {
             report["trial"] = trial.report(crate::leader::request_counts());
@@ -122,9 +118,6 @@ impl State {
         if let Some(steps) = &self.transfers {
             report["transfers"] =
                 serde_json::to_value(*crate::leader::locked(steps)).unwrap_or_default();
-        }
-        if let Some(warming) = &self.warming {
-            report["warming"] = warming.clone();
         }
         report
     }
@@ -149,7 +142,6 @@ impl Updater {
                 update: None,
                 trial: None,
                 transfers: None,
-                warming: None,
                 last: None,
                 unavailable: BTreeMap::new(),
                 retire: Vec::new(),
@@ -218,7 +210,6 @@ impl Updater {
         }
         state.trial = None;
         state.transfers = None;
-        state.warming = None;
         update.start(&mut state.processes);
         let report = update.report();
         state.update = Some(update);
@@ -295,7 +286,6 @@ impl Updater {
         state.last = Some(report);
         state.trial = None;
         state.transfers = None;
-        state.warming = None;
         self.phase.send_replace(None);
     }
 
@@ -361,31 +351,6 @@ impl Updater {
         self.settle(&mut state);
     }
 
-    /// The warming of `host`'s target ended as `warming` states, which the
-    /// update reports, and the switch may begin.
-    pub(crate) fn warmed(&self, host: &str, warming: Option<Value>) {
-        let mut state = self.lock();
-        if warming.is_some() {
-            state.warming = warming;
-        }
-        let State {
-            processes, update, ..
-        } = &mut *state;
-        if let Some(update) = update.as_mut() {
-            update.warmed(processes, host);
-        }
-        self.settle(&mut state);
-    }
-
-    /// Whether the update in flight waits only for what the daemon gives its
-    /// target: every node's engine acknowledged `Preparing`. `None` when no
-    /// update prepares any more, which ends such a wait.
-    pub(crate) fn prepared(&self) -> Option<bool> {
-        let state = self.lock();
-        let update = state.update.as_ref()?;
-        (update.phase() == Phase::Preparing).then(|| update.prepared())
-    }
-
     /// `trial` decides the update in flight from now on, and the status
     /// reports it.
     pub(crate) fn begin_trial(&self, trial: Arc<Trial>) {
@@ -403,9 +368,9 @@ impl Updater {
         self.lock().update.as_ref()?.switch_began()
     }
 
-    /// The hosts where the previous epoch's engines have to start again for
-    /// the rollback in flight.
-    pub(crate) fn relaunch_due(&self) -> BTreeSet<String> {
+    /// The launch generations of the previous epoch's engines that have to
+    /// start again for the rollback in flight.
+    pub(crate) fn relaunch_due(&self) -> BTreeSet<u64> {
         self.lock()
             .update
             .as_ref()
@@ -413,33 +378,34 @@ impl Updater {
             .unwrap_or_default()
     }
 
-    /// The previous epoch's engine on `host` ended for the trial.
-    pub(crate) fn previous_ended(&self, host: &str) {
+    /// The previous epoch's engine of launch generation `launch` ended for
+    /// the trial.
+    pub(crate) fn previous_ended(&self, launch: u64) {
         let mut state = self.lock();
         let State {
             processes, update, ..
         } = &mut *state;
         if let Some(update) = update.as_mut() {
-            update.previous_ended(processes, host);
+            update.previous_ended(processes, launch);
         }
     }
 
-    /// The previous epoch serves again on `host`, at the launch generation
-    /// its owner started it at.
-    pub(crate) fn relaunched(&self, host: &str, generation: u64) {
+    /// The previous epoch's engine of launch generation `previous` serves
+    /// again at launch generation `launch`, which its owner started it at.
+    pub(crate) fn relaunched(&self, previous: u64, launch: u64) {
         let mut state = self.lock();
         let State {
             processes, update, ..
         } = &mut *state;
         if let Some(update) = update.as_mut() {
-            update.relaunched(processes, host, generation);
+            update.relaunched(processes, previous, launch);
         }
         self.settle(&mut state);
     }
 
     /// Promotes the parked engine of launch generation `generation` on
-    /// `host`, a standby whose failure domain was lost: no state is handed to
-    /// it, and its `Serving` arrives on its own links.
+    /// `host`, a standby whose failure domain was lost: no engine drains
+    /// beside it, and its `Serving` arrives on its own links.
     pub(crate) fn promote(&self, host: &str, group: &str, rank: u32, generation: u64) {
         let mut state = self.lock();
         state.processes.adopt(host, group, rank, generation);
@@ -448,7 +414,7 @@ impl Updater {
             generation,
             proto::process::Command {
                 kind: Some(proto::process::command::Kind::Promote(
-                    proto::process::Promote { handoff: None },
+                    proto::process::Promote::default(),
                 )),
             },
         );

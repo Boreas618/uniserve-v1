@@ -727,7 +727,7 @@ def test_a_serving_deployment_answers_its_admin_api(
         assert committed.status_code == 200, committed.text
         before_update = len(read)
         report = _change_epoch(base_url, CHANGE)
-        print(f"epoch switch pause: {report['pause_ms']} ms")
+        print(f"epoch switch: {report['switch_ms']} ms")
         streaming.join(timeout=1800)
         assert done.is_set(), "the count did not end"
         text = "".join(read)
@@ -2186,139 +2186,6 @@ def test_a_package_update_past_a_threshold_reverts_in_its_epoch(
         update = _update(base_url)
         print("reverted:", json.dumps(update))
         assert update["failure"]["kind"] == "throughput_regression", update
-
-
-def test_the_requests_in_flight_warm_the_target_through_the_host_cache(
-    tmp_path: Path, runtime: Path
-):
-    """The switchover waits for the tail ``cache_tail_tokens`` states.
-
-    A request's pages reach the host KV cache as they complete, so the target's
-    admission finds all but its tail there: it computes that tail and not the
-    request. The prefix counters of the target say how much it read.
-    """
-    name = "qwen3-live-warming"
-    log = tmp_path / "server.log"
-    with _serve(runtime, log, name) as base_url:
-        streaming, streamed = _start_count(base_url, name)
-        wait_until(
-            lambda: len(_numbers(streamed["read"])) >= 400,
-            300,
-            "the count did not grow",
-        )
-        hits = metric(base_url, "uniserve:prefix_cache_host_hits")
-        result = _apply(
-            base_url,
-            engine_revision(),
-            "update_config.cache_tail_tokens=64",
-            "update_config.cache_prefill_tokens=128",
-        )
-        assert result["change"] == "epoch", result
-        trial = _on_trial(base_url)
-        warming = trial["warming"]
-        print("warming:", json.dumps(warming))
-        assert warming["warmed_requests"] == 1, warming
-        assert warming["limit_tokens"] == 64, warming
-        assert warming["tail_tokens"] <= 64, warming
-        assert warming["warmed_tokens"] > 0, warming
-        time.sleep(3)
-        read = metric(base_url, "uniserve:prefix_cache_host_hits") - hits
-        print("host hits since the switch:", read)
-        assert read >= warming["warmed_tokens"] - 64, (read, warming)
-        committed = admin(base_url, "config/commit")
-        assert committed.status_code == 200, committed.text
-        _assert_whole(streaming, streamed)
-
-
-def test_warming_waits_for_the_stated_tail_and_limits_the_prefill(
-    tmp_path: Path, runtime: Path
-):
-    """The two warming options change what a switch does.
-
-    A tail of two tokens is reached only at a page boundary, so it takes rounds
-    a page's tail does not. Prompts in their prefill run past a tail of one
-    token, so a round limits the source's prefill, and the wait still ends: a
-    tail that stays past the limit costs the requests a recomputation and no
-    failure.
-    """
-    name = "qwen3-live-warming-options"
-    log = tmp_path / "server.log"
-    with _serve(runtime, log, name) as base_url:
-        first = engine_revision()
-        later = [engine_revision() for _ in range(4)]
-
-        streaming, streamed = _start_count(base_url, name)
-        wait_until(
-            lambda: len(_numbers(streamed["read"])) >= 200,
-            300,
-            "the count did not grow",
-        )
-        _apply(
-            base_url,
-            first,
-            "update_config.cache_tail_tokens=2",
-        )
-        tight = _on_trial(base_url)["warming"]
-        print("a tail of two tokens:", json.dumps(tight))
-        assert tight["limit_tokens"] == 2, tight
-        assert tight["tail_tokens"] <= 2, tight
-        assert tight["rounds"] > 1, tight
-        committed = admin(base_url, "config/commit")
-        assert committed.status_code == 200, committed.text
-        _assert_whole(streaming, streamed)
-        wait_until(
-            lambda: _update(base_url).get("phase") == "purged",
-            120,
-            "the update did not end",
-        )
-
-        # Prompts that never repeat keep a prefill running under the switch, and
-        # what they generate leaves a tail past a page. A round that happens on
-        # no tail ends the wait as it should and limits nothing, so the switch
-        # is tried again.
-        prompts = threading.Event()
-
-        def prefills() -> None:
-            turn = 0
-            while not prompts.is_set():
-                turn += 1
-                words = " ".join(f"{turn}-{word}" for word in range(2500))
-                try:
-                    _chat(base_url, name, words, tokens=48, timeout_s=120)
-                except httpx.HTTPError:
-                    time.sleep(0.2)
-
-        running = [threading.Thread(target=prefills) for _ in range(4)]
-        for thread in running:
-            thread.start()
-        try:
-            for revision in later:
-                _apply_settled(
-                    base_url,
-                    revision,
-                    "update_config.cache_tail_tokens=1",
-                    "update_config.cache_prefill_tokens=128",
-                )
-                limited = _on_trial(base_url)["warming"]
-                if limited["prefill_limited"]:
-                    break
-                print("no tail under prefills:", json.dumps(limited))
-                committed = admin(base_url, "config/commit")
-                assert committed.status_code == 200, committed.text
-                _purged(base_url)
-        finally:
-            prompts.set()
-            for thread in running:
-                thread.join(timeout=300)
-        print("under prefills:", json.dumps(limited))
-        assert limited["prefill_limited"], limited
-        admin(base_url, "config/commit")
-        answer = _chat(base_url, name, RECOVERY_PROMPT, tokens=32)
-        assert _numbers([answer["choices"][0]["message"]["content"]])[:3] == [
-            1,
-            2,
-            3,
-        ]
 
 
 def test_a_request_that_ends_at_once_leaves_its_pages_in_the_host_cache(

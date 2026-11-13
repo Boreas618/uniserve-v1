@@ -359,7 +359,7 @@ def _epoch_change(
     result = response.json()["result"]
     assert result["change"] == "epoch", result
     update = _phase(base_url, "probation", "the update did not reach its trial")
-    print(f"promotion pause: {update['pause_ms']} ms")
+    print(f"switch: {update['switch_ms']} ms")
     return update, _executing(base_url)
 
 

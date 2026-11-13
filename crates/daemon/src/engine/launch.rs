@@ -84,26 +84,13 @@ mod tests {
     /// The launch of a standby (engine 7) of epoch 12 beside the process of epoch 11 it succeeds,
     /// with a rebalanced expert order.
     fn launch() -> EngineArgs {
-        use proto::request::wire::{CacheSegment, CacheSegments, ExpertOrder, Predecessor};
+        use proto::request::wire::{ExpertOrder, Predecessor};
         EngineArgs {
             engine_config: ServerArgs::default()
                 .engine_config()
                 .expect("the configuration resolves"),
             epoch: 12,
-            predecessor: Some(Predecessor {
-                epoch: 11,
-                segments: vec![CacheSegments {
-                    worker_group: "engine".to_owned(),
-                    segments: vec![CacheSegment {
-                        epoch: 11,
-                        ordinal: 0,
-                        units: 64,
-                    }],
-                    held: 1,
-                    units: 64,
-                    scratch: 0,
-                }],
-            }),
+            predecessor: Some(Predecessor { epoch: 11 }),
             expert_order: [(
                 "model.layers.0.mlp".to_owned(),
                 ExpertOrder {

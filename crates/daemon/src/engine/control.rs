@@ -60,7 +60,7 @@ const RUNTIME_DEFAULTS: [(&str, &str); 2] = [
 
 /// The environment an engine is started under: stated on its command, so it precedes any CUDA
 /// or NCCL initialization.
-fn main_process_environment() -> std::collections::HashMap<String, String> {
+pub(crate) fn main_process_environment() -> std::collections::HashMap<String, String> {
     RUNTIME_DEFAULTS
         .into_iter()
         .map(|(name, value)| {
@@ -216,6 +216,56 @@ impl EngineControl {
         numbers: &[u64],
         stats: StatsSink,
     ) -> anyhow::Result<EngineClient> {
+        let (launches, inherit) = self.world(args, numbers)?;
+        let epoch = launches[0].epoch;
+        let parked = launches[0].parked();
+
+        // Every process starts before any is awaited: the scheduler node's waits for its peers.
+        let mut controls = Vec::with_capacity(launches.len());
+        for (launch, inherit) in launches.iter().zip(inherit) {
+            controls.push(self.spawn(launch, inherit)?);
+        }
+        let mut links = Vec::with_capacity(launches.len());
+        for (launch, control) in launches.iter().zip(controls.iter_mut()) {
+            links.push(self.welcome(launch.engine, control)?);
+        }
+        let started = await_started(&mut links, &mut controls, &launches, parked)?;
+
+        let mut clients = Vec::with_capacity(launches.len());
+        let mut sinks = std::iter::once(stats);
+        for (((reader, writer), control), (launch, (info, state))) in links
+            .into_iter()
+            .zip(controls)
+            .zip(launches.iter().zip(started))
+        {
+            // A peer holds no scheduler, so it reports no statistics.
+            let sink = sinks.next().unwrap_or_else(|| Box::new(|_, _, _| {}));
+            clients.push(
+                EngineClient::new(reader, writer, info, state, sink, Some(control))?
+                    .numbered(launch.engine)
+                    .in_epoch(epoch)
+                    .on_host(&launch.host),
+            );
+        }
+        let mut clients = clients.into_iter();
+        let scheduler = clients.next().context("a deployment of no engine")?;
+        Ok(scheduler.with_peers(clients.collect()))
+    }
+
+    /// The launch files of the world of `args`, one engine per host of its worker groups numbered
+    /// `numbers` in [`world_hosts`]'s order (the scheduler node's first), and the reservations
+    /// each process inherits. A world of several hosts meets at two sockets reserved on the
+    /// scheduler node, which that node's process inherits and every launch names.
+    ///
+    /// # Errors
+    ///
+    /// Fails when `numbers` does not number every host, as [`world_hosts`] and [`place_on`] fail,
+    /// and when the scheduler node does not reserve the sockets.
+    fn world(
+        &self,
+        args: EngineArgs,
+        numbers: &[u64],
+    ) -> anyhow::Result<(Vec<EngineArgs>, Vec<Vec<u64>>)> {
         let hosts = world_hosts(&args.engine_config)?;
         anyhow::ensure!(
             numbers.len() == hosts.len(),
@@ -268,41 +318,10 @@ impl EngineControl {
                 engines = ?numbers,
                 channel = %world.channel,
                 store = %world.store,
-                "starting an engine whose worker group spans hosts"
+                "a world whose worker group spans hosts"
             );
         }
-        let parked = launches[0].parked();
-
-        // Every process starts before any is awaited: the scheduler node's waits for its peers.
-        let mut controls = Vec::with_capacity(launches.len());
-        for (launch, inherit) in launches.iter().zip(inherit) {
-            controls.push(self.spawn(launch, inherit)?);
-        }
-        let mut links = Vec::with_capacity(launches.len());
-        for (launch, control) in launches.iter().zip(controls.iter_mut()) {
-            links.push(self.welcome(launch.engine, control)?);
-        }
-        let started = await_started(&mut links, &mut controls, &launches, parked)?;
-
-        let mut clients = Vec::with_capacity(launches.len());
-        let mut sinks = std::iter::once(stats);
-        for (((reader, writer), control), (launch, (info, state))) in links
-            .into_iter()
-            .zip(controls)
-            .zip(launches.iter().zip(started))
-        {
-            // A peer holds no scheduler, so it reports no statistics.
-            let sink = sinks.next().unwrap_or_else(|| Box::new(|_, _, _| {}));
-            clients.push(
-                EngineClient::new(reader, writer, info, state, sink, Some(control))?
-                    .numbered(launch.engine)
-                    .in_epoch(epoch)
-                    .on_host(&launch.host),
-            );
-        }
-        let mut clients = clients.into_iter();
-        let scheduler = clients.next().context("a deployment of no engine")?;
-        Ok(scheduler.with_peers(clients.collect()))
+        Ok((launches, inherit))
     }
 
     /// Reserves on `host` the world's two sockets, which the scheduler node's process inherits:
@@ -387,21 +406,37 @@ impl EngineControl {
         self.next_engine.load(Ordering::Relaxed)
     }
 
-    /// Joins an epoch update's target, which executes `epoch`: the engine the update started
-    /// dials this daemon's request socket, is welcomed, and states that it parked. The update
-    /// commands it on the process link, so this connection carries only its requests once it
-    /// serves.
+    /// Joins an epoch update's target world, which executes `epoch`: every engine of `processes`
+    /// (by host and launch generation, the scheduler node's first) the update started dials this
+    /// daemon's request socket, is welcomed, and states that it parked. The update commands them
+    /// on their process links, so these connections carry only requests once they serve; the
+    /// scheduler node's client holds its peers'. `stats` receives its schedulers' statistics.
     ///
     /// # Errors
     ///
-    /// Fails when the engine does not connect in time, speaks another major version, fails to
+    /// Fails when an engine does not connect in time, speaks another major version, fails to
     /// start, or exits before it stated that it parked.
     pub fn join_target(
         &self,
-        engine: u64,
+        processes: &[(String, u64)],
         epoch: u64,
         stats: StatsSink,
     ) -> anyhow::Result<EngineClient> {
+        let mut clients = Vec::with_capacity(processes.len());
+        let mut sinks = std::iter::once(stats);
+        for (host, engine) in processes {
+            self.next_engine.fetch_max(engine + 1, Ordering::Relaxed);
+            // A peer holds no scheduler, so it reports no statistics.
+            let sink = sinks.next().unwrap_or_else(|| Box::new(|_, _, _| {}));
+            clients.push(self.join(*engine, epoch, sink)?.on_host(host));
+        }
+        let mut clients = clients.into_iter();
+        let scheduler = clients.next().context("a target of no engine")?;
+        Ok(scheduler.with_peers(clients.collect()))
+    }
+
+    /// Joins the one target engine `engine` of [`Self::join_target`].
+    fn join(&self, engine: u64, epoch: u64, stats: StatsSink) -> anyhow::Result<EngineClient> {
         let (mut reader, mut writer, hello) = self.accept(engine, None)?;
         let refusal = if hello.major != proto::ENGINE_INTERFACE_VERSION {
             format!(
@@ -668,46 +703,21 @@ impl EngineControl {
         Ok(hosts)
     }
 
-    /// The launch file's contents for the scheduler node's process `engine`: `args`, with this
-    /// control's statement of the process's place and interfaces ([`place`]).
+    /// What an epoch update starts the world of one target replica with: the launch file of each of
+    /// its engines, numbered `numbers` (the launch generations, the scheduler node's first), with
+    /// the reservations it inherits ([`Self::world`]). The engines are started with
+    /// [`main_process_environment`] set over the daemon's environment.
     ///
     /// # Errors
     ///
-    /// As [`place`].
-    fn launch(&self, args: EngineArgs, engine: u64) -> anyhow::Result<EngineArgs> {
-        place(
-            args,
-            engine,
-            &Interfaces {
-                requests: &self.request_address,
-                processes: &self.processes,
-                build_server: &self.build_server,
-            },
-        )
-    }
-
-    /// What an epoch update starts its target engine with: the launch file's contents for the
-    /// engine of launch generation `engine`, and the variables set over the daemon's environment.
-    ///
-    /// # Errors
-    ///
-    /// Fails for a worker group with ranks on several hosts, which needs one launch per host,
-    /// and as [`place`] does.
-    pub(crate) fn target_launch(
+    /// As [`Self::world`].
+    pub(crate) fn target_world(
         &self,
         args: &EngineArgs,
-        engine: u64,
-    ) -> anyhow::Result<(EngineArgs, std::collections::HashMap<String, String>)> {
-        anyhow::ensure!(
-            world_hosts(&args.engine_config)?.len() == 1,
-            "an epoch update starts its target engines from one launch, and a worker group with \
-             ranks on several hosts starts one per host: such a deployment changes epochs by a \
-             relaunch"
-        );
-        Ok((
-            self.launch(args.clone(), engine)?,
-            main_process_environment(),
-        ))
+        numbers: &[u64],
+    ) -> anyhow::Result<Vec<(EngineArgs, Vec<u64>)>> {
+        let (launches, inherit) = self.world(args.clone(), numbers)?;
+        Ok(launches.into_iter().zip(inherit).collect())
     }
 
     /// Has the daemon of `launch`'s host start the engine `launch` describes, inheriting the
@@ -1656,7 +1666,10 @@ mod tests {
         );
         args.epoch = 3;
 
-        let (launch, _) = control.target_launch(&args, 9).unwrap();
+        let world = control.target_world(&args, &[9]).unwrap();
+        let (launch, inherit) = &world[0];
+        assert_eq!(world.len(), 1);
+        assert!(inherit.is_empty(), "a world of one host reserves nothing");
         assert_eq!(launch.engine, 9);
         assert_eq!(launch.epoch, 3);
         assert_eq!(launch.processes, "unix:/run/processes.sock");
@@ -1666,13 +1679,14 @@ mod tests {
         assert_eq!(launch.modules, modules());
         assert!(!launch.parked());
 
-        args.predecessor = Some(wire::Predecessor {
-            epoch: 3,
-            segments: Vec::new(),
-        });
-        let (parked, _) = control.target_launch(&args, 10).unwrap();
-        assert!(parked.parked());
-        assert_eq!(parked.epoch, 3);
+        args.predecessor = Some(wire::Predecessor { epoch: 3 });
+        let parked = control.target_world(&args, &[10]).unwrap();
+        assert!(parked[0].0.parked());
+        assert_eq!(parked[0].0.epoch, 3);
+        assert!(
+            control.target_world(&args, &[11, 12]).is_err(),
+            "one number for each host of the world"
+        );
     }
 
     /// A handoff's control connection whose accepted side is gone closed with the

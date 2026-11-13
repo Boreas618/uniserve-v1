@@ -479,9 +479,10 @@ pub fn daemon_options_differ(current: &ServerArgs, target: &ServerArgs) -> bool 
 
 /// How the deployment moves to a new configuration in another epoch
 /// (`update_config`, `PUT /admin/config`): what of the previous epoch its
-/// trial keeps for a rollback, when the trial rolls back by itself, and how
-/// the transfers and the warming yield to the serving epoch. A value an
-/// update states in its own assignments governs that update alone.
+/// trial keeps for a rollback, when the trial rolls back by itself, how the
+/// transfers yield to the serving epoch, and how long the switch lets the
+/// requests in flight run on. A value an update states in its own assignments
+/// governs that update alone.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct UpdateConfig {
@@ -498,14 +499,15 @@ pub struct UpdateConfig {
     /// within it. Steps are compared within their batch-size range. The
     /// default is the value measured on GB200 (`docs/configuration.md`).
     pub transfer_slowdown: f64,
-    /// The most tokens a request in flight may have computed past the pages
-    /// the host KV cache holds of it at the switch; unset uses the largest
-    /// source or target cache page.
-    pub cache_tail_tokens: Option<std::num::NonZeroU32>,
-    /// Source prefill tokens per scheduling step after the first warming
-    /// round; unset uses the largest source or target cache page.
-    pub cache_prefill_tokens: Option<std::num::NonZeroU32>,
+    /// Seconds a draining engine steps its running requests beside the
+    /// engine promoted before it, after which it ends the ones still running
+    /// as migratable: it bounds the time two epochs share each GPU.
+    pub drain_s: f64,
 }
+
+/// The default `update_config.drain_s`: the seconds a switch lets the
+/// requests in flight end by themselves.
+pub const DRAIN_S: f64 = 5.0;
 
 /// The default `update_config.transfer_slowdown`: on GB200, above the
 /// serving steps' second-to-second variation without transfers and below
@@ -519,8 +521,7 @@ impl Default for UpdateConfig {
             previous_epoch: PreviousEpoch::Parked,
             rollback: RollbackConfig::default(),
             transfer_slowdown: TRANSFER_SLOWDOWN,
-            cache_tail_tokens: None,
-            cache_prefill_tokens: None,
+            drain_s: DRAIN_S,
         }
     }
 }
@@ -759,6 +760,11 @@ impl ServerArgs {
         anyhow::ensure!(
             slowdown.is_finite() && slowdown > 0.0,
             "invalid `update_config.transfer_slowdown`: {slowdown} must be positive"
+        );
+        let drain = self.update_config.drain_s;
+        anyhow::ensure!(
+            drain.is_finite() && drain >= 0.0,
+            "invalid `update_config.drain_s`: {drain} must be a number of seconds, zero or more"
         );
         let rollback = &self.update_config.rollback;
         if let Some(rate) = rollback.failure_rate {

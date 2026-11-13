@@ -405,7 +405,10 @@ mod tests {
 
         for kind in [
             Kind::Promote(proto::process::Promote::default()),
-            Kind::Drain(proto::process::Drain { epoch: 2 }),
+            Kind::Drain(proto::process::Drain {
+                epoch: 2,
+                ..Default::default()
+            }),
             Kind::Pause(proto::process::Pause { paused: true }),
         ] {
             let command =

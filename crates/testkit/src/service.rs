@@ -626,9 +626,6 @@ fn read_requests(
                     let _ = control.send(Control::Shutdown);
                     return Ok(());
                 }
-                Some(wire::engine_command::Kind::DescribeCache(describe)) => {
-                    describe_caches(describe.id, front, routing);
-                }
                 Some(wire::engine_command::Kind::DescribeRequests(describe)) => {
                     describe_requests(describe.id, front, routing);
                 }
@@ -1183,7 +1180,7 @@ fn serve_process(
     reports: &std::sync::mpsc::Sender<proto::process::Report>,
     routing: &Arc<Routing>,
 ) {
-    use proto::process::{command, report};
+    use proto::process::command;
 
     let mut engine = if routing.state.load(Ordering::Acquire) == wire::EngineState::Parked as i32 {
         crate::process::Engine::parked(0)
@@ -1192,29 +1189,12 @@ fn serve_process(
     };
     for command in commands {
         let effect = match &command.kind {
-            Some(command::Kind::Drain(_)) => drain_schedulers(routing).map(Some),
-            Some(command::Kind::Promote(promote)) => {
-                promote_schedulers(promote.handoff.as_ref(), routing).map(|()| None)
-            }
-            _ => Ok(None),
+            Some(command::Kind::Drain(_)) => drain_schedulers(routing),
+            Some(command::Kind::Promote(promote)) => promote_schedulers(promote, routing),
+            _ => Ok(()),
         };
         let acknowledged = match effect {
-            Ok(index) => engine
-                .command(command)
-                .into_iter()
-                .map(|mut acknowledged| {
-                    // The drain hands over what the schedulers parked with.
-                    if let (Some(report::Kind::Drained(drained)), Some(index)) =
-                        (acknowledged.kind.as_mut(), index.as_ref())
-                    {
-                        drained.handoff = Some(proto::process::Handoff {
-                            index: index.clone(),
-                            ..Default::default()
-                        });
-                    }
-                    acknowledged
-                })
-                .collect(),
+            Ok(()) => engine.command(command),
             Err(reason) => vec![engine.fault(&reason)],
         };
         for report in acknowledged {
@@ -1237,11 +1217,11 @@ fn announce(routing: &Routing, state: wire::EngineState, error: &str) {
     });
 }
 
-/// A parked engine serves: one that never served adopts the index handed to
-/// it through the ordinary scheduler owners, and one that drained resumes its
-/// schedulers; request admission then opens.
+/// A parked engine serves: one that never served promotes its schedulers,
+/// which inherit nothing of the engine it succeeds, and one that drained
+/// resumes them; request admission then opens.
 fn promote_schedulers(
-    handoff: Option<&proto::process::Handoff>,
+    promote: &proto::process::Promote,
     routing: &Arc<Routing>,
 ) -> Result<(), String> {
     let drained = routing.drained.swap(false, Ordering::AcqRel);
@@ -1258,29 +1238,16 @@ fn promote_schedulers(
                 Err(_) => Err("a scheduler stopped".to_owned()),
             })
     } else {
-        let index = handoff
-            .map(|handoff| handoff.index.as_slice())
-            .unwrap_or_default();
-        let (recompute, grows) =
-            handoff.map_or((false, true), |handoff| (handoff.recompute, handoff.grows));
+        let (recompute, grow) = (promote.recompute, promote.grow);
         std::thread::scope(|scope| {
             let promoting: Vec<_> = routing
                 .slots
                 .iter()
-                .enumerate()
-                .map(|(slot_index, slot)| {
-                    let parked = slot
-                        .handle
-                        .cache_group()
-                        .and_then(|group| {
-                            index.iter().find(|indexed| indexed.worker_group == group)
-                        })
-                        .map(scheduler::ParkedCache::from_index)
-                        .unwrap_or_default();
-                    for resume in parked.pages.iter().filter_map(|page| page.resume) {
-                        lock(&routing.cache_routes).insert(resume, slot_index);
-                    }
-                    scope.spawn(move || slot.handle.promote(parked, recompute, grows))
+                .map(|slot| {
+                    scope.spawn(move || {
+                        slot.handle
+                            .promote(scheduler::ParkedCache::default(), recompute, grow)
+                    })
                 })
                 .collect();
             let mut result = Ok(());
@@ -1306,10 +1273,8 @@ fn promote_schedulers(
 }
 
 /// Drains the engine: every scheduler parks, ending its requests in flight
-/// as migratable, and the engine is parked. Returns every scheduler's prefix
-/// cache index, each by the worker group whose cache it indexes, which is
-/// what the engine hands the one that serves after it.
-fn drain_schedulers(routing: &Arc<Routing>) -> Result<Vec<wire::GroupIndex>, String> {
+/// as migratable, and the engine is parked.
+fn drain_schedulers(routing: &Arc<Routing>) -> Result<(), String> {
     announce(routing, wire::EngineState::Draining, "");
     // A scheduler that stopped on a fatal failure responds to no park: it gave
     // its requests back, or ended them, as it stopped.
@@ -1319,11 +1284,10 @@ fn drain_schedulers(routing: &Arc<Routing>) -> Result<Vec<wire::GroupIndex>, Str
         .enumerate()
         .map(|(index, slot)| {
             let response = (!slot.handle.is_dead()).then(|| slot.handle.park(false));
-            (index, slot.handle.cache_workers(), response)
+            (index, response)
         })
         .collect();
-    let mut index = Vec::new();
-    for (slot_index, group, response) in responses {
+    for (slot_index, response) in responses {
         let parked = response
             .ok_or_else(|| "a scheduler stopped".to_owned())?
             .recv()
@@ -1331,55 +1295,11 @@ fn drain_schedulers(routing: &Arc<Routing>) -> Result<Vec<wire::GroupIndex>, Str
         for resume in parked.pages.iter().filter_map(|page| page.resume) {
             lock(&routing.cache_routes).insert(resume, slot_index);
         }
-        index.extend(parked.into_indexes(&group));
     }
     routing.drained.store(true, Ordering::Release);
     announce(routing, wire::EngineState::Parked, "");
     tracing::info!("the engine drained and is parked");
-    Ok(index)
-}
-
-/// Reports every worker group's KV cache as it holds it now, on a thread of
-/// its own, and responds to the daemon `front` with `CacheDescribed`.
-fn describe_caches(id: u64, front: usize, routing: &Arc<Routing>) {
-    let responses: Vec<_> = routing
-        .slots
-        .iter()
-        .map(|slot| slot.handle.describe_cache())
-        .collect();
-    let routing = Arc::clone(routing);
-    let spawned = std::thread::Builder::new()
-        .name("describe-cache".to_owned())
-        .spawn(move || {
-            let mut segments = Vec::new();
-            let mut error = String::new();
-            for response in responses {
-                match response.recv() {
-                    Ok(Ok(groups)) => segments.extend(groups.into_iter().map(wire_cache)),
-                    Ok(Err(failed)) if error.is_empty() => error = failed,
-                    Ok(Err(_)) => {}
-                    Err(_) if error.is_empty() => error = "a scheduler stopped".to_owned(),
-                    Err(_) => {}
-                }
-            }
-            routing.send(
-                front,
-                Frame::plain(from_engine::Kind::CacheDescribed(wire::CacheDescribed {
-                    id,
-                    error,
-                    storage_epoch: segments
-                        .iter()
-                        .flat_map(|cache| &cache.segments)
-                        .map(|segment| segment.epoch)
-                        .min()
-                        .unwrap_or(0),
-                    segments,
-                })),
-            );
-        });
-    if let Err(error) = spawned {
-        tracing::error!(%error, "the cache description thread did not start");
-    }
+    Ok(())
 }
 
 /// Collect each scheduler's accepted request inventory without stopping it.
@@ -1414,25 +1334,6 @@ fn describe_requests(id: u64, front: usize, routing: &Arc<Routing>) {
         });
     if let Err(error) = spawned {
         tracing::error!(%error, "the request inventory thread did not start");
-    }
-}
-
-/// One worker group's KV cache on the wire.
-fn wire_cache(group: scheduler::GroupCache) -> wire::CacheSegments {
-    wire::CacheSegments {
-        worker_group: group.worker_group,
-        segments: group
-            .segments
-            .into_iter()
-            .map(|segment| wire::CacheSegment {
-                epoch: segment.epoch,
-                ordinal: segment.ordinal,
-                units: segment.units,
-            })
-            .collect(),
-        held: group.held,
-        units: group.units,
-        scratch: group.scratch,
     }
 }
 

@@ -42,6 +42,7 @@ message Welcome {
 
 // What travels from the engine process after the welcome.
 message FromEngine {
+  reserved 8;
   oneof kind {
     State state = 1;
     Accepted accepted = 2;
@@ -49,7 +50,6 @@ message FromEngine {
     Stats stats = 4;
     Hooked hooked = 5;
     Configured configured = 6;
-    CacheDescribed cache_described = 8;
     RequestsDescribed requests_described = 9;
     // TCP artifact bytes, sent contiguously before their Artifact event.
     ArtifactPart artifact_part = 10;
@@ -284,6 +284,7 @@ message Takeover {
 
 // A command for the whole engine.
 message EngineCommand {
+  reserved 13;
   oneof kind {
     // Finish every request as aborted, close the workers and exit.
     Shutdown shutdown = 1;
@@ -305,9 +306,6 @@ message EngineCommand {
     // Rewrite the weights in place from another checkpoint of the same
     // model, once no request runs; answered with `Hooked`.
     UpdateWeights update_weights = 9;
-    // Report the KV cache segments every worker group holds now; answered
-    // with `CacheDescribed`.
-    DescribeCache describe_cache = 13;
     // Read the quotas every node's Storage Server keeps for the
     // deployment, each node's daemon over its claim, without asking a
     // worker; answered with `Hooked`, one JSON result per node.
@@ -480,24 +478,6 @@ message Attach {
 
 message Shutdown {}
 message FlushCache {}
-
-// A request for the engine's KV cache segments.
-message DescribeCache {
-  // Matches the `CacheDescribed` answer.
-  uint64 id = 1;
-}
-
-// The answer to a `DescribeCache`.
-message CacheDescribed {
-  uint64 id = 1;
-  // Empty when every worker group reported.
-  string error = 2;
-  repeated CacheSegments segments = 3;
-  // The epoch that created the storage the engine executes on, whose name keys
-  // it: its own, or the one its predecessor took it from. Only the process that
-  // maps the storage knows, since a relaunch of an epoch creates it afresh.
-  uint64 storage_epoch = 4;
-}
 
 // The published pages of one worker group's prefix cache.
 message GroupIndex {
@@ -874,12 +854,12 @@ message ExpertOrder {
   repeated uint32 experts = 1;
 }
 
-// What an engine that succeeds another maps of it.
+// The engine an engine started beside it succeeds: a switch's target or a
+// standby, which parks once it is ready and serves when it is promoted. It
+// maps nothing of its predecessor: both open sessions with the host's buffer
+// pool, which keeps them from writing one block.
 message Predecessor {
-  // The epoch that created the storage the predecessor executes on, whose name
-  // keys it (`CacheDescribed.storage_epoch`).
+  // The epoch the predecessor executes.
   uint64 epoch = 1;
-  // Each worker group's KV cache segments the predecessor holds, which the
-  // successor's ranks map read-only behind segments of their own.
-  repeated CacheSegments segments = 2;
+  reserved 2;
 }

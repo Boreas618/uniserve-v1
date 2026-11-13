@@ -17,8 +17,6 @@ syntax = "proto3";
 
 package uniserve.process;
 
-import "request.proto";
-
 // The first message on a connection, from the connecting side.
 message Hello {
   // `ENGINE_INTERFACE_VERSION` of the sender's build, which carries the storage protocol's
@@ -407,14 +405,13 @@ message Command {
     // prepared one that never executed; the generation left is released once
     // no batch uses it. Acknowledged with `RolledBack`.
     Rollback rollback = 4;
-    // Stop admitting, end the requests in flight as migratable at their step
-    // boundary, and execute nothing more. The engine keeps its storage and is
-    // parked afterwards. Acknowledged with `Drained`, which carries the state
-    // it hands over.
+    // Stop admitting and step the requests in flight until each ends by
+    // itself or the deadline ends it as migratable, beside another epoch that
+    // steps too. The engine keeps its storage and is parked afterwards.
+    // Acknowledged with `Drained`.
     Drain drain = 5;
-    // A parked engine serves: it maps the storage it mapped read-only
-    // writable, takes the handoff of the engine that drained when one is
-    // stated, and admits. Acknowledged with `Serving`.
+    // A parked engine opens admission and serves. Acknowledged with
+    // `Serving`.
     Promote promote = 6;
     // Hold or release admissions, the `/admin/pause_generation` gate, without
     // ending any request.
@@ -445,29 +442,30 @@ message Rollback {
 }
 
 message Drain {
+  // The epoch the engine executes.
   uint64 epoch = 1;
+  // The drain's deadline, in milliseconds after the engine receives the
+  // command: a token request still running then ends as migratable with its
+  // blocks committed under their keys, the partial last one too, and a video
+  // request at its next denoising step boundary with its trajectory saved.
+  uint64 deadline_ms = 2;
+  // The epoch that serves next has another layout: the engine gives its
+  // device regions back to the quota by `Resize` as its requests end, and
+  // answers `Drained` once its regions answered the last one.
+  bool shrink = 3;
 }
 
 message Promote {
-  // What the engine that drained hands over; absent when no state follows: a
-  // standby promoted after its failure domain was lost, or a parked epoch
-  // that serves again.
-  optional Handoff handoff = 1;
-}
-
-// The carried state one engine hands the engine that serves after it.
-message Handoff {
-  // The prefix cache index of the engine that drained, by worker group: its
-  // pages lie in the cache segments the promoted engine maps.
-  repeated uniserve.request.GroupIndex index = 1;
-  // Whether the requests that migrate compute their state again from their
-  // tokens: the promoted engine computes other numerics
-  // (`in_flight = recompute`).
+  reserved 1;
+  // The requests that migrate onto this engine compute their state again
+  // from their tokens and read no block their previous engine committed
+  // (`in_flight = recompute`); otherwise they are admitted by their keys as
+  // any request is.
   bool recompute = 2;
-  // Whether the storage of the engine that drained frees once this one
-  // serves (its processes exit), so the cache grows into it at once rather
-  // than at the commit.
-  bool grows = 3;
+  // The engine that drains beside this one has another layout and gives its
+  // device memory back as it drains: the engine grows its regions from the
+  // quota as that memory frees.
+  bool grow = 3;
 }
 
 message Pause {
@@ -507,8 +505,9 @@ message Report {
     Parked parked = 7;
     // The engine serves: its start completed, or `Promote` took effect.
     Serving serving = 8;
-    // `Drain` took effect: the engine stopped stepping, every request in
-    // flight ended as migratable, and it is parked.
+    // `Drain` took effect: the engine holds no request (each ended by itself
+    // or as migratable), with `shrink` its regions answered their last
+    // `Resize`, and it is parked.
     Drained drained = 9;
     // A job ran past half the watchdog timeout.
     Stalled stalled = 10;
@@ -573,8 +572,7 @@ message Serving {
 
 message Drained {
   uint64 epoch = 1;
-  // What the engine hands the one that serves after it.
-  Handoff handoff = 2;
+  reserved 2;
 }
 
 // The scheduling policy failed: the engine instantiated the previous policy

@@ -7,7 +7,9 @@
 //! and the generation an engine keeps, acknowledges each command the way the
 //! interface states, and records what it was sent. A test states a failure by
 //! arming it ([`Engine::refuse_prepare`], [`Engine::fault_at_switch`]) or by
-//! sending the report itself ([`Engine::fault`], [`Engine::rolled_back`]).
+//! sending the report itself ([`Engine::fault`], [`Engine::rolled_back`]),
+//! and an engine slower than the others by withholding its acknowledgements
+//! ([`Engine::withhold`]).
 //!
 //! [`node_reply`] replies to the requests a leader makes of a node's daemon
 //! (`Spawn`, `Claim`, `Stop`, `KeepWeights`) the way a node does, with what
@@ -34,6 +36,9 @@ pub struct Engine {
     prepare_refusal: Option<String>,
     /// Why its next `Switch` rolls back by itself, when armed.
     switch_fault: Option<String>,
+    /// The acknowledgements of `Promote` and `Drain` it took effect for and
+    /// has not sent yet, while it withholds them.
+    withheld: Option<Vec<Report>>,
 }
 
 impl Engine {
@@ -59,6 +64,7 @@ impl Engine {
             received: Vec::new(),
             prepare_refusal: None,
             switch_fault: None,
+            withheld: None,
         }
     }
 
@@ -91,6 +97,19 @@ impl Engine {
     /// kept generation by itself.
     pub fn fault_at_switch(&mut self, reason: &str) {
         self.switch_fault = Some(reason.to_owned());
+    }
+
+    /// The engine's acknowledgements of `Promote` and `Drain` wait until
+    /// [`Engine::release`]: the commands take effect, and the reports are
+    /// late.
+    pub fn withhold(&mut self) {
+        self.withheld.get_or_insert_with(Vec::new);
+    }
+
+    /// The acknowledgements the engine withheld, oldest first; it withholds
+    /// nothing more.
+    pub fn release(&mut self) -> Vec<Report> {
+        self.withheld.take().unwrap_or_default()
     }
 
     /// What the engine reports once its start completed: that it parked, or
@@ -172,16 +191,27 @@ impl Engine {
             command::Kind::Drain(drain) => {
                 self.lifecycle = EngineState::Parked;
                 self.prepared = None;
-                vec![report(report::Kind::Drained(process::Drained {
+                self.acknowledge(report(report::Kind::Drained(process::Drained {
                     epoch: drain.epoch,
-                    handoff: Some(process::Handoff::default()),
-                }))]
+                })))
             }
             command::Kind::Promote(_) => {
                 self.lifecycle = EngineState::Serving;
-                vec![self.serving_report()]
+                let serving = self.serving_report();
+                self.acknowledge(serving)
             }
             command::Kind::Pause(_) | command::Kind::Serve(_) => Vec::new(),
+        }
+    }
+
+    /// Sends `acknowledgement` now, or keeps it while the engine withholds.
+    fn acknowledge(&mut self, acknowledgement: Report) -> Vec<Report> {
+        match self.withheld.as_mut() {
+            Some(withheld) => {
+                withheld.push(acknowledgement);
+                Vec::new()
+            }
+            None => vec![acknowledgement],
         }
     }
 
@@ -345,11 +375,14 @@ mod tests {
     #[test]
     fn a_drain_parks_and_a_promotion_serves() {
         let mut engine = Engine::serving(7);
-        let drained = engine.command(kind(command::Kind::Drain(process::Drain { epoch: 3 })));
-        assert!(matches!(
+        let drained = engine.command(kind(command::Kind::Drain(process::Drain {
+            epoch: 3,
+            ..Default::default()
+        })));
+        assert_eq!(
             drained[0].kind,
-            Some(report::Kind::Drained(process::Drained { epoch: 3, .. }))
-        ));
+            Some(report::Kind::Drained(process::Drained { epoch: 3 }))
+        );
         assert_eq!(engine.lifecycle(), EngineState::Parked);
 
         let serving = engine.command(kind(command::Kind::Promote(process::Promote::default())));

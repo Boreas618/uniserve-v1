@@ -39,8 +39,7 @@ pub struct EngineInfo {
     /// The engine's schedulers, one per DP rank.
     pub schedulers: u32,
     /// Each worker group's KV cache segments as the engine started with
-    /// them; an epoch succeeding this one maps those its engine describes
-    /// then ([`EngineClient::describe_cache`]).
+    /// them.
     pub segments: Vec<wire::CacheSegments>,
     /// The batch the workers were started for, within which the schedulers
     /// take scheduling limits in place; `None` from an engine that does not
@@ -156,8 +155,6 @@ type Responder = oneshot::Sender<Result<Response, String>>;
 enum Response {
     /// Each worker's JSON result (`Hooked`), or nothing (`Configured`).
     Results(Vec<String>),
-    /// What a successor maps of the engine (`CacheDescribed`).
-    Cache(wire::Predecessor),
     /// The engine described the requests it was asked about (`RequestsDescribed`).
     Prefixes,
 }
@@ -549,38 +546,6 @@ impl EngineClient {
             .unwrap_or_else(|_| Err("the engine ended before it responded".to_owned()))
     }
 
-    /// Each worker group's KV cache segments as the engine holds them now,
-    /// which an epoch succeeding it maps.
-    ///
-    /// # Errors
-    ///
-    /// Fails with the reason a scheduler did not describe its cache, or
-    /// when the engine ends first.
-    pub async fn describe_cache(&self) -> Result<wire::Predecessor, String> {
-        match self
-            .ask(|id| wire::engine_command::Kind::DescribeCache(wire::DescribeCache { id }))
-            .await?
-        {
-            Response::Cache(predecessor) => Ok(predecessor),
-            _ => Err("the engine responded to a cache description with something else".to_owned()),
-        }
-    }
-
-    /// Pin source pages, reserve target pages, or publish a completed cache
-    /// transfer. A snapshot retains its pages until a matching release.
-    pub async fn cache_warm(
-        &self,
-        operation: storage::manifest::cache::Operation,
-    ) -> Result<Vec<storage::manifest::cache::Snapshot>, String> {
-        let operation = serde_json::to_vec(&operation).map_err(|error| error.to_string())?;
-        self.ask(|id| wire::engine_command::Kind::CacheWarm(wire::CacheWarm { id, operation }))
-            .await?
-            .results()
-            .into_iter()
-            .map(|snapshot| serde_json::from_str(&snapshot).map_err(|error| error.to_string()))
-            .collect()
-    }
-
     /// The quotas every node's Storage Server keeps for the
     /// deployment, one JSON result per node: `{"host": ..., "quotas":
     /// [...], "host_storage": {...}}`. No worker is asked: each node's daemon
@@ -854,7 +819,7 @@ impl Response {
     fn results(self) -> Vec<String> {
         match self {
             Self::Results(results) => results,
-            Self::Cache(_) | Self::Prefixes => Vec::new(),
+            Self::Prefixes => Vec::new(),
         }
     }
 }
@@ -1000,18 +965,6 @@ fn read_frames(mut reader: Connection, shared: &Shared, stats: &StatsSink) {
                         Ok(Response::Results(Vec::new()))
                     } else {
                         Err(configured.error)
-                    });
-                }
-            }
-            Some(from_engine::Kind::CacheDescribed(described)) => {
-                if let Some(responder) = lock(&shared.responses).remove(&described.id) {
-                    let _ = responder.send(if described.error.is_empty() {
-                        Ok(Response::Cache(wire::Predecessor {
-                            epoch: described.storage_epoch,
-                            segments: described.segments,
-                        }))
-                    } else {
-                        Err(described.error)
                     });
                 }
             }

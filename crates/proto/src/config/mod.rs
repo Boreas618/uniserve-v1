@@ -1007,12 +1007,10 @@ pub struct EngineArgs {
     /// The epoch's number, which keys the storage the epoch creates. It is zero until the first
     /// process of a new epoch starts, and that process's engine number becomes the epoch's.
     pub epoch: u64,
-    /// The process this one succeeds on the same devices, whose KV cache it maps read-only.
-    ///
-    /// It is present for the serving process's standby (§2.5), which claims its scope's storage
-    /// read-only, parks once it is prepared, and is promoted in place when the serving process of
-    /// its failure domain fails. A standby that claimed writable storage would give the scope two
-    /// writers, so the role is stated here, before the process claims anything.
+    /// The engine this one succeeds: present for an epoch switch's target and for the serving
+    /// process's standby (§2.5), each of which parks once it is prepared and serves when it is
+    /// promoted. It maps nothing of its predecessor: both open sessions with the host's buffer
+    /// pool, which keeps two epochs from writing one block.
     pub predecessor: Option<Predecessor>,
     /// The expert order each MoE module loads, keyed by module, once the daemon has rebalanced the
     /// experts; empty for the checkpoint's own order.

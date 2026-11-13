@@ -735,6 +735,7 @@ mod tests {
                 kind: Some(proto::process::command::Kind::Drain(
                     proto::process::Drain {
                         epoch: first.epoch(),
+                        ..Default::default()
                     },
                 )),
             })

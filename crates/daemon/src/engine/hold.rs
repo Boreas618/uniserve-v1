@@ -5,7 +5,10 @@
 //! submission waits until one is, instead of being refused; once the hold
 //! closes, because no engine will serve again, held and new submissions fail.
 //! While the hold is paused (`/admin/pause_generation`), submissions wait
-//! as well, and the requests the engine already serves go on.
+//! as well, and the requests the engine already serves go on; while a
+//! successor daemon takes the deployment over, they go to it. An epoch switch
+//! holds nothing: new requests go to its target from the target's first
+//! `Serving`, and the serving epoch goes on with what it holds.
 //! A held submission is bounded only by its HTTP request's own timeout and by
 //! its client, whose disconnect drops it.
 

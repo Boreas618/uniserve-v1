@@ -10,7 +10,7 @@ use proto::process::{self, command};
 use testkit::process::Refusals;
 
 use crate::epoch::{Epoch, EpochRecord, Epochs, Failure, PackageRevision, Status};
-use crate::options::{PreviousEpoch, ServerArgs};
+use crate::options::{PreviousEpoch, ServerArgs, UpdateConfig};
 use crate::supervision::processes::Processes;
 use crate::test_support::Engines;
 use crate::updates::update::{EpochSwitch, Node, Phase, Update};
@@ -21,15 +21,17 @@ const SERVING: u64 = 1;
 const TARGET: u64 = 2;
 
 /// The launch generations of the serving engine, of a second serving engine
-/// and of the epoch form's target.
+/// and of the epoch form's targets.
 const PREVIOUS: u64 = 4;
 const SECOND: u64 = 5;
 const SPAWNED: u64 = 9;
+const SPAWNED_PEER: u64 = 10;
 
 /// The build the fake engines greet with.
 const BUILD: &str = "2.0.0+target";
 
 const HOST: &str = "rank-0";
+const OTHER: &str = "rank-1";
 
 /// A deployment whose engines and nodes are fakes: the updater under test,
 /// its epoch records and the fakes it commands.
@@ -113,39 +115,71 @@ impl Deployment {
         )
     }
 
-    /// An epoch update numbered `number` whose previous epoch keeps `keeps`.
+    /// An epoch update numbered `number` from the one serving engine to one
+    /// target engine on the same node, whose previous epoch keeps `keeps`.
     fn epoch(&self, number: u64, keeps: PreviousEpoch, deadline: Option<Instant>) -> Update {
+        let mut switch = self.switch(vec![(target_launch(HOST, 0, SPAWNED), Vec::new())]);
+        switch.keeps = keeps;
+        let nodes = vec![Node::new(HOST.to_owned(), 0, PREVIOUS)];
+        self.epoch_over(number, nodes, switch, deadline)
+    }
+
+    /// The epoch form's target: epoch [`TARGET`], started from `launches`,
+    /// with the previous epoch parked, the default drain and the layout
+    /// unchanged.
+    fn switch(&self, launches: Vec<(proto::config::EngineArgs, Vec<u64>)>) -> EpochSwitch {
         let mut record = self.epochs.get(SERVING).expect("the serving record");
         record.generation = None;
-        let mut launch =
-            proto::config::EngineArgs::new(self.target.engine.clone(), self.target.modules.clone());
-        launch.epoch = TARGET;
-        launch.host = HOST.to_owned();
-        // The target starts parked: it names the engine it succeeds.
-        launch.predecessor = Some(proto::request::wire::Predecessor {
-            epoch: SERVING,
-            segments: Vec::new(),
-        });
+        let launches = launches
+            .into_iter()
+            .map(|(mut launch, inherit)| {
+                launch.engine_config = self.target.engine.clone();
+                launch.modules = self.target.modules.clone();
+                (launch, inherit)
+            })
+            .collect();
+        EpochSwitch {
+            epoch: TARGET,
+            record,
+            launches,
+            environment: Default::default(),
+            requests: "unix:/run/requests.sock".to_owned(),
+            keeps: PreviousEpoch::Parked,
+            recompute: false,
+            drain: Duration::from_secs_f64(UpdateConfig::default().drain_s),
+            shrink: false,
+            retire: Vec::new(),
+        }
+    }
+
+    /// An epoch update numbered `number` from the serving engines `nodes` to
+    /// `switch`'s targets.
+    fn epoch_over(
+        &self,
+        number: u64,
+        nodes: Vec<Node>,
+        switch: EpochSwitch,
+        deadline: Option<Instant>,
+    ) -> Update {
         Update::epoch(
             number,
             self.target.clone(),
             Arc::clone(&self.epochs),
             SERVING,
             "engine".to_owned(),
-            vec![Node::new(HOST.to_owned(), 0, PREVIOUS)],
-            EpochSwitch {
-                epoch: TARGET,
-                record,
-                launch,
-                environment: Default::default(),
-                spawn_generation: SPAWNED,
-                requests: "unix:/run/requests.sock".to_owned(),
-                keeps,
-                recompute: false,
-                retire: Vec::new(),
-            },
+            nodes,
+            switch,
             deadline,
         )
+    }
+
+    /// Sends what the engine of launch generation `launch` withheld, and runs
+    /// the update on.
+    fn release(&mut self, launch: u64) {
+        for report in self.engines.engine(launch).release() {
+            self.engines.report(launch, report);
+        }
+        self.run();
     }
 
     /// Applies `update` and runs it as far as the fakes take it.
@@ -178,6 +212,22 @@ impl Deployment {
     fn record(&self, epoch: u64) -> EpochRecord {
         self.epochs.get(epoch).expect("the epoch's record")
     }
+}
+
+/// The launch file of the target engine `launch` on `host`, whose first rank
+/// is group rank `rank`: it starts parked, succeeding the serving epoch.
+fn target_launch(host: &str, rank: u32, launch: u64) -> proto::config::EngineArgs {
+    let options = ServerArgs::default();
+    let mut args = proto::config::EngineArgs::new(
+        options.engine_config().expect("the configuration resolves"),
+        crate::epoch::modules_of(&options),
+    );
+    args.epoch = TARGET;
+    args.host = host.to_owned();
+    args.rank = rank;
+    args.engine = launch;
+    args.predecessor = Some(proto::request::wire::Predecessor { epoch: SERVING });
+    args
 }
 
 /// The kinds of `commands`, by name, for an order a test states.
@@ -541,46 +591,67 @@ fn an_engine_lost_on_trial_rolls_the_record_back() {
 // --- the epoch form -----------------------------------------------------------------------------
 
 /// An epoch update starts the target from a launch file that states the
-/// epoch's module set and the engine it succeeds, switches once it parked
-/// (drain, then the promotion with what the drain handed over), serves on
-/// trial with the previous epoch parked, and a commit stops the previous
-/// epoch and retires its storage.
+/// epoch's module set and the engine it succeeds, and switches once it
+/// parked: the target is promoted first, and new requests go to it from its
+/// `Serving`; then the serving engine drains beside it, with the deadline
+/// `update_config.drain_s` states. The trial keeps the previous epoch parked,
+/// and a commit stops it and retires its storage.
 #[test]
-fn an_epoch_update_serves_the_target_and_a_commit_retires_the_previous_epoch() {
+fn an_epoch_update_promotes_the_target_and_then_drains_the_serving_engine() {
     let mut deployment = Deployment::new(Refusals::default());
     let update = deployment.epoch(1, PreviousEpoch::Parked, None);
-    let report = deployment.apply(update);
-    assert_eq!(report["change"], "epoch");
-    assert_eq!(report["phase"], "preparing");
+    deployment
+        .updater
+        .apply(update)
+        .expect("no update is in flight");
+    assert_eq!(deployment.status()["change"], "epoch");
 
     // Preparing: one spawn, whose launch states the modules, and the claim.
     let spawns = deployment.engines.spawns();
     assert_eq!(spawns.len(), 1);
-    assert_eq!(spawns[0].host, HOST);
-    assert_eq!(spawns[0].generation, SPAWNED);
+    assert_eq!(
+        (spawns[0].host.as_str(), spawns[0].generation),
+        (HOST, SPAWNED)
+    );
     let launch: proto::config::EngineArgs =
         serde_json::from_slice(&spawns[0].launch).expect("a launch file");
-    assert_eq!(launch.engine, SPAWNED);
-    assert_eq!(launch.epoch, TARGET);
+    assert_eq!((launch.engine, launch.epoch), (SPAWNED, TARGET));
     assert_eq!(launch.modules, deployment.target.modules);
     assert!(launch.parked());
     assert_eq!(deployment.engines.claims()[0].epoch, TARGET);
 
-    // Switching: the serving engine drained before the target was promoted,
-    // and the promotion carried the handoff.
-    assert_eq!(deployment.entered(), ["preparing", "switching", "trial"]);
-    assert_eq!(names(&deployment.engines.received(PREVIOUS)), ["drain"]);
-    let promoted = deployment.engines.received(SPAWNED);
-    assert_eq!(names(&promoted), ["promote"]);
-    assert!(matches!(
-        &promoted[0],
-        command::Kind::Promote(process::Promote {
-            handoff: Some(handoff)
-        }) if !handoff.grows && !handoff.recompute
-    ));
+    // The target is slow to acknowledge its promotion: until it serves,
+    // requests stay with the serving epoch, which is not drained.
+    deployment.engines.start_spawned(BUILD);
+    deployment.engines.engine(SPAWNED).withhold();
+    deployment.run();
+    assert_eq!(deployment.updater.in_flight(), Some((1, Phase::Switching)));
+    assert_eq!(names(&deployment.engines.received(SPAWNED)), ["promote"]);
+    assert!(deployment.engines.received(PREVIOUS).is_empty());
+    assert_eq!(*deployment.epochs.served().borrow(), 0);
 
-    // Trial: requests go to the target, and the previous epoch is kept parked.
+    // Its `Serving` routes new requests to it, and the serving engine
+    // drains: both epochs step until it drained.
+    deployment.release(SPAWNED);
     assert_eq!(*deployment.epochs.served().borrow(), TARGET);
+    assert_eq!(
+        deployment.engines.received(SPAWNED),
+        [command::Kind::Promote(process::Promote {
+            recompute: false,
+            grow: false,
+        })]
+    );
+    assert_eq!(
+        deployment.engines.received(PREVIOUS),
+        [command::Kind::Drain(process::Drain {
+            epoch: SERVING,
+            deadline_ms: 5_000,
+            shrink: false,
+        })]
+    );
+
+    // Trial: the previous epoch is kept parked.
+    assert_eq!(deployment.entered(), ["preparing", "switching", "trial"]);
     assert_eq!(deployment.record(TARGET).status, Status::Trial);
     assert_eq!(deployment.record(TARGET).generation, Some(1));
     assert_eq!(deployment.record(TARGET).config.executable, BUILD);
@@ -588,7 +659,7 @@ fn an_epoch_update_serves_the_target_and_a_commit_retires_the_previous_epoch() {
     let status = deployment.status();
     assert_eq!(status["phase"], "trial");
     assert_eq!(status["previous_epoch_kept"], "parked");
-    assert!(status["pause_ms"].is_number());
+    assert!(status["switch_ms"].is_number());
 
     assert!(deployment.updater.commit().is_some());
     deployment.run();
@@ -600,31 +671,174 @@ fn an_epoch_update_serves_the_target_and_a_commit_retires_the_previous_epoch() {
         .claims()
         .pop()
         .expect("the commit's claim");
-    assert_eq!(retiring.epoch, TARGET);
-    assert_eq!(retiring.retire, vec![SERVING]);
+    assert_eq!((retiring.epoch, retiring.retire), (TARGET, vec![SERVING]));
     assert_eq!(
         deployment.epochs.serving().map(|(epoch, _)| epoch),
         Some(TARGET)
     );
 }
 
-/// The switch waits for the daemon's own warming as well as for the engines.
+/// The drain states the deadline `update_config.drain_s` sets, and when the
+/// target's layout differs the serving engines give their device memory
+/// back as they drain while the targets grow into it. The option's default
+/// is five seconds.
 #[test]
-fn the_switch_waits_for_the_warming() {
-    let mut deployment = Deployment::new(Refusals::default());
-    let mut update = deployment.epoch(1, PreviousEpoch::Parked, None);
-    update.await_warming(HOST);
-    deployment.apply(update);
-    assert_eq!(deployment.updater.prepared(), Some(true));
-    assert_eq!(deployment.updater.in_flight(), Some((1, Phase::Preparing)));
-    assert!(deployment.engines.received(PREVIOUS).is_empty());
+fn the_drain_states_its_deadline_and_shrinks_across_layouts() {
+    assert_eq!(UpdateConfig::default().drain_s, 5.0);
 
+    let mut deployment = Deployment::new(Refusals::default());
+    let mut switch = deployment.switch(vec![(target_launch(HOST, 0, SPAWNED), Vec::new())]);
+    switch.drain = Duration::from_millis(2_500);
+    switch.shrink = true;
+    let nodes = deployment.nodes(1);
+    let update = deployment.epoch_over(1, nodes, switch, None);
+    deployment.apply(update);
+
+    assert_eq!(
+        deployment.engines.received(PREVIOUS),
+        [command::Kind::Drain(process::Drain {
+            epoch: SERVING,
+            deadline_ms: 2_500,
+            shrink: true,
+        })]
+    );
+    assert_eq!(
+        deployment.engines.received(SPAWNED),
+        [command::Kind::Promote(process::Promote {
+            recompute: false,
+            grow: true,
+        })]
+    );
+    let status = deployment.status();
+    assert_eq!(
+        (status["drain_s"].as_f64(), status["shrink"].as_bool()),
+        (Some(2.5), Some(true))
+    );
+}
+
+/// The epoch form covers every node of both epochs: a target whose world
+/// spans two hosts starts one engine on each, its scheduler node inheriting
+/// the world's sockets, every node claims the target's storage, every target
+/// is promoted and every serving engine on every node drained.
+#[test]
+fn an_epoch_update_covers_every_node_of_both_epochs() {
+    let mut deployment = Deployment::new(Refusals::default());
+    deployment.engines.serve(SECOND);
+    let nodes = vec![
+        Node::new(HOST.to_owned(), 0, PREVIOUS),
+        Node::new(OTHER.to_owned(), 2, SECOND),
+    ];
+    let switch = deployment.switch(vec![
+        (target_launch(HOST, 0, SPAWNED), vec![1, 2]),
+        (target_launch(OTHER, 2, SPAWNED_PEER), Vec::new()),
+    ]);
+    let update = deployment.epoch_over(1, nodes, switch, None);
+    deployment.apply(update);
+
+    let spawns = deployment.engines.spawns();
+    let spawned: Vec<_> = spawns
+        .iter()
+        .map(|spawn| {
+            (
+                spawn.host.as_str(),
+                spawn.rank,
+                spawn.generation,
+                spawn.inherit.clone(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        spawned,
+        [
+            (HOST, 0, SPAWNED, vec![1, 2]),
+            (OTHER, 2, SPAWNED_PEER, Vec::new())
+        ]
+    );
+    let claimed: Vec<_> = deployment
+        .engines
+        .claims()
+        .iter()
+        .map(|claim| (claim.host.clone(), claim.epoch, claim.scopes[0].rank))
+        .collect();
+    assert_eq!(
+        claimed,
+        [(HOST.to_owned(), TARGET, 0), (OTHER.to_owned(), TARGET, 2)]
+    );
+    for target in [SPAWNED, SPAWNED_PEER] {
+        assert_eq!(names(&deployment.engines.received(target)), ["promote"]);
+    }
+    for serving in [PREVIOUS, SECOND] {
+        assert_eq!(names(&deployment.engines.received(serving)), ["drain"]);
+    }
+    assert_eq!(deployment.status()["phase"], "trial");
+
+    assert!(deployment.updater.commit().is_some());
+    deployment.run();
+    assert_eq!(
+        deployment.engines.stops(),
+        vec![Some(PREVIOUS), Some(SECOND)]
+    );
+    let retired: Vec<_> = deployment
+        .engines
+        .claims()
+        .iter()
+        .filter(|claim| claim.retire == [SERVING])
+        .map(|claim| claim.host.clone())
+        .collect();
+    assert_eq!(retired, [HOST, OTHER]);
+}
+
+/// The two epochs need not have as many replicas: two serving replicas move
+/// to one target engine, both drained once it serves.
+#[test]
+fn an_epoch_update_moves_two_replicas_to_one() {
+    let mut deployment = Deployment::new(Refusals::default());
+    let nodes = deployment.nodes(2);
+    let mut switch = deployment.switch(vec![(target_launch(HOST, 0, SPAWNED), Vec::new())]);
+    switch.shrink = true;
+    let update = deployment.epoch_over(1, nodes, switch, None);
+    deployment.apply(update);
+
+    assert_eq!(deployment.engines.spawns().len(), 1);
+    assert_eq!(names(&deployment.engines.received(SPAWNED)), ["promote"]);
+    for serving in [PREVIOUS, SECOND] {
+        assert_eq!(names(&deployment.engines.received(serving)), ["drain"]);
+    }
+    assert_eq!(
+        deployment.status()["engines"],
+        serde_json::json!({ "serving": 2, "target": 1 })
+    );
+    assert_eq!(deployment.status()["phase"], "trial");
+    assert_eq!(*deployment.epochs.served().borrow(), TARGET);
+}
+
+/// The switch waits for every target before it drains: a second target that
+/// is slow to serve keeps the serving engines stepping, while new requests
+/// already go to the target from the first one's `Serving`.
+#[test]
+fn requests_go_to_the_target_from_its_first_serving() {
+    let mut deployment = Deployment::new(Refusals::default());
+    let switch = deployment.switch(vec![
+        (target_launch(HOST, 0, SPAWNED), Vec::new()),
+        (target_launch(HOST, 0, SPAWNED_PEER), Vec::new()),
+    ]);
+    let nodes = deployment.nodes(1);
+    let update = deployment.epoch_over(1, nodes, switch, None);
     deployment
         .updater
-        .warmed(HOST, Some(serde_json::json!({ "rounds": 2 })));
+        .apply(update)
+        .expect("no update is in flight");
+    deployment.engines.start_spawned(BUILD);
+    deployment.engines.engine(SPAWNED_PEER).withhold();
     deployment.run();
+
+    assert_eq!(*deployment.epochs.served().borrow(), TARGET);
+    assert!(deployment.engines.received(PREVIOUS).is_empty());
+    assert_eq!(deployment.updater.in_flight(), Some((1, Phase::Switching)));
+
+    deployment.release(SPAWNED_PEER);
+    assert_eq!(names(&deployment.engines.received(PREVIOUS)), ["drain"]);
     assert_eq!(deployment.updater.in_flight(), Some((1, Phase::Trial)));
-    assert_eq!(deployment.status()["warming"]["rounds"], 2);
 }
 
 /// A node that refuses the spawn or the claim abandons the update: the
@@ -691,34 +905,44 @@ fn a_rollback_before_the_switch_abandons_an_epoch_update() {
     assert_eq!(deployment.updater.unavailable(&deployment.target), None);
 }
 
-/// A rollback by decision on trial drains the target, promotes the parked
-/// previous epoch again with no state handed to it, and requests return to
-/// it once it serves.
+/// A rollback on trial is the switch the other way: the parked previous
+/// epoch is promoted again first, new requests return to it from its
+/// `Serving`, and the target drains beside it; once drained it stops and its
+/// storage is retired.
 #[test]
-fn a_rollback_on_trial_returns_to_the_parked_previous_epoch() {
+fn a_rollback_on_trial_promotes_the_previous_epoch_before_the_target_drains() {
     let mut deployment = Deployment::new(Refusals::default());
     let update = deployment.epoch(1, PreviousEpoch::Parked, None);
     deployment.apply(update);
     deployment.entered();
 
+    deployment.engines.engine(PREVIOUS).withhold();
     deployment
         .updater
         .rollback(decision("the model no longer responds usefully"))
         .expect("an update is on trial");
     deployment.run();
+    assert_eq!(
+        deployment.engines.received(PREVIOUS)[1],
+        command::Kind::Promote(process::Promote {
+            recompute: false,
+            grow: false,
+        })
+    );
+    assert_eq!(names(&deployment.engines.received(SPAWNED)), ["promote"]);
+    assert_eq!(*deployment.epochs.served().borrow(), TARGET);
 
-    assert_eq!(deployment.entered(), ["switching", "rolled_back"]);
-    assert_eq!(
-        names(&deployment.engines.received(SPAWNED)),
-        ["promote", "drain"]
-    );
-    let previous = deployment.engines.received(PREVIOUS);
-    assert_eq!(names(&previous), ["drain", "promote"]);
-    assert_eq!(
-        previous[1],
-        command::Kind::Promote(process::Promote { handoff: None })
-    );
+    deployment.release(PREVIOUS);
     assert_eq!(*deployment.epochs.served().borrow(), SERVING);
+    assert_eq!(
+        deployment.engines.received(SPAWNED)[1],
+        command::Kind::Drain(process::Drain {
+            epoch: TARGET,
+            deadline_ms: 5_000,
+            shrink: false,
+        })
+    );
+    assert_eq!(deployment.entered(), ["switching", "rolled_back"]);
     assert_eq!(deployment.engines.stops(), vec![Some(SPAWNED)]);
     assert_eq!(deployment.record(TARGET).status, Status::Released);
     // The target's storage is retired on the node that keeps the previous epoch.
@@ -727,15 +951,14 @@ fn a_rollback_on_trial_returns_to_the_parked_previous_epoch() {
         .claims()
         .pop()
         .expect("the rollback's claim");
-    assert_eq!(retiring.epoch, SERVING);
-    assert_eq!(retiring.retire, vec![TARGET]);
+    assert_eq!((retiring.epoch, retiring.retire), (SERVING, vec![TARGET]));
     assert!(deployment.updater.unavailable(&deployment.target).is_some());
 }
 
 /// A target that faults on trial is stopped, not drained, and the previous
 /// epoch serves again.
 #[test]
-fn a_fault_on_trial_rolls_an_epoch_update_back() {
+fn a_target_that_faults_on_trial_is_stopped_instead_of_drained() {
     let mut deployment = Deployment::new(Refusals::default());
     let update = deployment.epoch(1, PreviousEpoch::Parked, None);
     deployment.apply(update);
@@ -754,10 +977,7 @@ fn a_fault_on_trial_rolls_an_epoch_update_back() {
         ["promote"],
         "a failed target is not commanded again"
     );
-    assert_eq!(
-        deployment.engines.stops(),
-        vec![Some(SPAWNED), Some(SPAWNED)]
-    );
+    assert!(deployment.engines.stops().contains(&Some(SPAWNED)));
     assert_eq!(
         names(&deployment.engines.received(PREVIOUS)),
         ["drain", "promote"]
@@ -779,6 +999,33 @@ fn a_target_that_exits_on_trial_rolls_the_update_back() {
     assert_eq!(*deployment.epochs.served().borrow(), SERVING);
 }
 
+/// A target that fails while the switch runs, before the serving engine was
+/// drained, rolls back at once: the serving engine still serves, and the
+/// target is stopped.
+#[test]
+fn a_target_that_fails_while_switching_leaves_the_serving_engine_serving() {
+    let mut deployment = Deployment::new(Refusals::default());
+    let update = deployment.epoch(1, PreviousEpoch::Parked, None);
+    deployment
+        .updater
+        .apply(update)
+        .expect("no update is in flight");
+    deployment.engines.start_spawned(BUILD);
+    deployment.engines.engine(SPAWNED).withhold();
+    deployment.run();
+
+    let fault = deployment
+        .engines
+        .engine(SPAWNED)
+        .fault("an illegal address");
+    deployment.engines.report(SPAWNED, fault);
+    deployment.run();
+    assert_eq!(deployment.status()["phase"], "rolled_back");
+    assert!(deployment.engines.received(PREVIOUS).is_empty());
+    assert!(deployment.engines.stops().contains(&Some(SPAWNED)));
+    assert_eq!(*deployment.epochs.served().borrow(), SERVING);
+}
+
 /// A deadline rolls an epoch update on trial back as a decision does.
 #[test]
 fn a_deadline_rolls_an_epoch_update_back() {
@@ -793,21 +1040,14 @@ fn a_deadline_rolls_an_epoch_update_back() {
 }
 
 /// A previous epoch that keeps its weights alone is stopped when the trial
-/// begins; a rollback then needs it started again, and ends once its owner
-/// says it serves.
+/// begins; a rollback then needs it started again, and the target drains
+/// once its owner says it serves.
 #[test]
 fn a_previous_epoch_kept_as_weights_is_relaunched_for_a_rollback() {
     let mut deployment = Deployment::new(Refusals::default());
     let update = deployment.epoch(1, PreviousEpoch::Weights, None);
     deployment.apply(update);
     assert_eq!(deployment.engines.stops(), vec![Some(PREVIOUS)]);
-    // The promotion said the target's cache grows into the storage that frees.
-    assert!(matches!(
-        &deployment.engines.received(SPAWNED)[0],
-        command::Kind::Promote(process::Promote {
-            handoff: Some(handoff)
-        }) if handoff.grows
-    ));
 
     // Its exit lets the node keep the weights alone.
     deployment.engines.exit(HOST, PREVIOUS, "exit status: 0");
@@ -830,14 +1070,21 @@ fn a_previous_epoch_kept_as_weights_is_relaunched_for_a_rollback() {
             .relaunch_due()
             .into_iter()
             .collect::<Vec<_>>(),
-        vec![HOST.to_owned()]
+        vec![PREVIOUS]
     );
     assert_eq!(*deployment.epochs.served().borrow(), TARGET);
+    assert_eq!(names(&deployment.engines.received(SPAWNED)), ["promote"]);
 
-    // Its owner started it again at a new launch generation.
-    deployment.updater.relaunched(HOST, 12);
-    assert_eq!(deployment.status()["phase"], "rolled_back");
+    // Its owner started it again at a new launch generation: requests return
+    // to it, and the target drains.
+    deployment.updater.relaunched(PREVIOUS, 12);
     assert_eq!(*deployment.epochs.served().borrow(), SERVING);
+    deployment.run();
+    assert_eq!(
+        names(&deployment.engines.received(SPAWNED)),
+        ["promote", "drain"]
+    );
+    assert_eq!(deployment.status()["phase"], "rolled_back");
     assert!(deployment.updater.relaunch_due().is_empty());
 }
 
@@ -851,7 +1098,7 @@ fn a_node_that_refuses_host_storage_keeps_the_weights_on_its_gpus() {
     });
     let update = deployment.epoch(1, PreviousEpoch::Host, None);
     deployment.apply(update);
-    deployment.updater.previous_ended(HOST);
+    deployment.updater.previous_ended(PREVIOUS);
 
     let retentions = deployment.engines.retentions();
     assert!(retentions[0].to_host);
@@ -866,21 +1113,25 @@ fn a_node_that_refuses_host_storage_keeps_the_weights_on_its_gpus() {
     assert_eq!(deployment.engines.retentions().len(), 1);
 }
 
-/// A serving engine lost during the switch has nothing to hand over: the
-/// target is promoted without its state, and the loss is the failure
-/// domain's to replace.
+/// A serving engine lost during the switch has nothing left to drain: the
+/// switch goes on without it, and the loss is the failure domain's to
+/// replace.
 #[test]
-fn a_serving_engine_lost_during_the_switch_hands_nothing_over() {
+fn a_serving_engine_lost_during_the_switch_is_not_drained() {
     let mut deployment = Deployment::new(Refusals::default());
-    let mut update = deployment.epoch(1, PreviousEpoch::Parked, None);
-    update.await_warming(HOST);
-    deployment.apply(update);
+    let update = deployment.epoch(1, PreviousEpoch::Parked, None);
+    deployment
+        .updater
+        .apply(update)
+        .expect("no update is in flight");
+    deployment.engines.start_spawned(BUILD);
+    deployment.engines.engine(SPAWNED).withhold();
+    deployment.run();
 
     deployment.engines.exit(HOST, PREVIOUS, "signal: 9");
-    deployment.updater.warmed(HOST, None);
-    deployment.run();
+    deployment.release(SPAWNED);
     assert_eq!(deployment.updater.in_flight(), Some((1, Phase::Trial)));
-    assert_eq!(names(&deployment.engines.received(SPAWNED)), ["promote"]);
+    assert!(deployment.engines.received(PREVIOUS).is_empty());
 }
 
 // --- the updater --------------------------------------------------------------------------------
@@ -895,7 +1146,7 @@ fn a_standby_is_promoted_on_its_process_link() {
     deployment.run();
     assert_eq!(
         deployment.engines.received(6),
-        vec![command::Kind::Promote(process::Promote { handoff: None })]
+        vec![command::Kind::Promote(process::Promote::default())]
     );
     assert_eq!(
         deployment.engines.engine(6).lifecycle(),

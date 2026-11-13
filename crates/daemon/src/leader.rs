@@ -144,18 +144,17 @@ pub(crate) enum Following {
         config: Box<ServerArgs>,
         modules: crate::epoch::ModuleSet,
     },
-    /// A target engine of another epoch serves this replica once the update
-    /// switched.
+    /// The target engines of another epoch serve the deployment from the
+    /// first one's `Serving`.
     Epoch {
-        /// What starts and joins the replica's engines.
+        /// What starts and joins the replicas' engines.
         control: Arc<EngineControl>,
-        /// The arguments the target serves with, once it is no longer the
-        /// engine that succeeds another.
-        args: Box<proto::config::EngineArgs>,
+        /// Each target replica: the arguments it serves with, once it is no
+        /// longer an engine that succeeds another, and its world's engines
+        /// by host and launch generation, the scheduler node's first.
+        targets: Vec<(proto::config::EngineArgs, Vec<(String, u64)>)>,
         /// The configuration the target serves.
         config: Box<ServerArgs>,
-        /// The target's launch generation, the number its links state.
-        launch_generation: u64,
         /// The epoch the target serves.
         epoch: u64,
     },
@@ -1723,10 +1722,11 @@ impl Replica {
     /// For both forms it reads the trial's thresholds (`options.rollback`)
     /// and rolls the update back at its `deadline`. For the generation form
     /// it keeps the committed configuration and module set, and replaces the
-    /// standby with one of them. For the epoch form it joins the
-    /// target engine, warms the host KV tier before the switch, moves this
-    /// replica's requests onto the target once it serves, and returns them to
-    /// the previous epoch when the update rolls back.
+    /// standby with one of them. For the epoch form, which the first replica
+    /// follows for the whole deployment, it joins every target replica's
+    /// engines, routes new requests to the target from its first `Serving`,
+    /// and back to the previous epoch from its first `Serving` again when the
+    /// update rolls back.
     ///
     /// The task wakes on the update's own progress
     /// ([`crate::updates::Updater::watch`]), on the deadline and, during the
@@ -1749,23 +1749,14 @@ impl Replica {
                 }
                 Following::Epoch {
                     control,
-                    args,
+                    targets,
                     config,
-                    launch_generation,
                     epoch,
                 } => {
                     // The epoch form's follower holds both epochs' launch
                     // arguments and configurations across its whole wait.
                     Box::pin(replica.follow_epoch(
-                        &updater,
-                        number,
-                        &options,
-                        deadline,
-                        control,
-                        *args,
-                        *config,
-                        launch_generation,
-                        epoch,
+                        &updater, number, &options, deadline, control, targets, *config, epoch,
                     ))
                     .await;
                 }
@@ -1891,7 +1882,16 @@ impl Replica {
         }
     }
 
-    /// [`Self::follow`] for the epoch form.
+    /// [`Self::follow`] for the epoch form, for the deployment's every
+    /// replica.
+    ///
+    /// The two epochs need not have as many replicas: target replica `j` is
+    /// served under the deployment's replica `j`, made when the serving epoch
+    /// has fewer, and a serving replica past the target's last hands the
+    /// requests it migrates to a target replica as its own route; a rollback
+    /// does the same the other way. Each replica's hold serves its new engine
+    /// at once, and requests go to the replicas whose engine serves, so none
+    /// waits for a target that is not yet ready.
     #[allow(clippy::too_many_arguments)]
     async fn follow_epoch(
         self: &Arc<Self>,
@@ -1900,114 +1900,91 @@ impl Replica {
         options: &crate::options::UpdateConfig,
         mut deadline: Option<Instant>,
         control: Arc<EngineControl>,
-        args: proto::config::EngineArgs,
+        targets: Vec<(proto::config::EngineArgs, Vec<(String, u64)>)>,
         config: ServerArgs,
-        launch_generation: u64,
         epoch: u64,
     ) {
-        let host = config.host_identity.clone();
+        let Some(registry) = self.registry.upgrade() else {
+            return;
+        };
+        let previous: Vec<Arc<Replica>> = registry.serving.borrow().clone();
         let mut phases = updater.watch();
 
-        // While the target prepares, its transfers yield to the serving
+        // While the targets prepare, their transfers yield to the serving
         // epoch's steps (`update_config.transfer_slowdown`); the guard ends
         // that however the preparation ends.
         let preparing = tokio_util::sync::CancellationToken::new();
         let preparation = preparing.clone().drop_guard();
-        if let Some(serving) = self.hold.client() {
-            let steps = Arc::new(std::sync::Mutex::new(
-                crate::interference::StepTime::default(),
-            ));
-            updater.watch_transfers(Arc::clone(&steps));
-            let throttling = crate::interference::Throttling::new(
-                &self.observer,
-                serving.epoch(),
-                options.transfer_slowdown,
-                Instant::now(),
-            );
-            tokio::spawn(crate::interference::control(
-                Arc::clone(&control) as Arc<dyn crate::interference::Throttle>,
-                vec![(Arc::clone(&self.observer), throttling)],
-                crate::interference::INTERVAL,
-                preparing,
-                steps,
-            ));
+        let throttled: Vec<_> = previous
+            .iter()
+            .filter_map(|replica| {
+                let serving = replica.hold.client()?;
+                let throttling = crate::interference::Throttling::new(
+                    &replica.observer,
+                    serving.epoch(),
+                    options.transfer_slowdown,
+                    Instant::now(),
+                );
+                Some((Arc::clone(&replica.observer), throttling))
+            })
+            .collect();
+        let steps = Arc::new(std::sync::Mutex::new(
+            crate::interference::StepTime::default(),
+        ));
+        updater.watch_transfers(Arc::clone(&steps));
+        tokio::spawn(crate::interference::control(
+            Arc::clone(&control) as Arc<dyn crate::interference::Throttle>,
+            throttled,
+            crate::interference::INTERVAL,
+            preparing,
+            steps,
+        ));
+
+        // Every target replica's engines dial this daemon's request socket as
+        // they start, and state that they parked once they resolved their
+        // modules and captured their graphs.
+        let observers: Vec<Arc<crate::observe::Observer>> = (0..targets.len())
+            .map(|index| {
+                previous
+                    .get(index)
+                    .map_or_else(Default::default, |replica| Arc::clone(&replica.observer))
+            })
+            .collect();
+        let joining =
+            targets
+                .iter()
+                .zip(&observers)
+                .enumerate()
+                .map(|(index, (target, observer))| {
+                    let sink = stats_sink(self.model_name.clone(), Arc::clone(observer), index);
+                    let (control, processes) = (Arc::clone(&control), target.1.clone());
+                    tokio::task::spawn_blocking(move || {
+                        control.join_target(&processes, epoch, sink)
+                    })
+                });
+        let mut clients = Vec::with_capacity(targets.len());
+        for joined in futures::future::join_all(joining).await {
+            let reason = match joined {
+                Ok(Ok(client)) => {
+                    clients.push(Arc::new(client));
+                    continue;
+                }
+                Ok(Err(error)) => format!("the update's target did not join: {error:#}"),
+                Err(error) => format!("joining the update's target ended: {error}"),
+            };
+            warn!(epoch, "{reason}");
+            // Before the switch a rollback abandons the update; nothing that
+            // serves changed.
+            updater.rollback(crate::epoch::Failure {
+                kind: "prepare_failed".to_owned(),
+                reason,
+                device: None,
+            });
+            return;
         }
 
-        // The target dials this daemon's request socket as it starts, and
-        // states that it parked once it resolved its modules and captured its
-        // graphs.
-        let sink = stats_sink(
-            self.model_name.clone(),
-            Arc::clone(&self.observer),
-            self.ordinal,
-        );
-        let joining = Arc::clone(&control);
-        let joined = tokio::task::spawn_blocking(move || {
-            joining.join_target(launch_generation, epoch, sink)
-        })
-        .await;
-        let client = match joined {
-            Ok(Ok(client)) => Arc::new(client),
-            failed => {
-                let reason = match failed {
-                    Ok(Err(error)) => format!("the update's target did not join: {error:#}"),
-                    Err(error) => format!("joining the update's target ended: {error}"),
-                    Ok(Ok(_)) => String::new(),
-                };
-                warn!(launch_generation, "{reason}");
-                // Before the switch a rollback abandons the update; nothing
-                // that serves changed.
-                updater.rollback(crate::epoch::Failure {
-                    kind: "prepare_failed".to_owned(),
-                    reason,
-                    device: None,
-                });
-                updater.warmed(&host, None);
-                return;
-            }
-        };
-
-        // The requests in flight warm the host KV tier, so the target finds
-        // their pages; the switch begins once this ended. A warming that
-        // fails costs those requests the tail they compute on the target and
-        // nothing else, so it neither fails the update nor delays it further.
-        let target_page = args
-            .engine_config
-            .kv_cache
-            .block_size
-            .map_or(0, std::num::NonZeroU32::get);
-        let mut source = self.hold.client();
-        let warming = match &source {
-            Some(source) => {
-                let reading = Arc::clone(source);
-                let warmed = crate::updates::warming::warm(
-                    |operation| {
-                        let reading = Arc::clone(&reading);
-                        async move { reading.cache_warm(operation).await }
-                    },
-                    options.cache_tail_tokens.map(std::num::NonZeroU32::get),
-                    options.cache_prefill_tokens.map(std::num::NonZeroU32::get),
-                    target_page,
-                    crate::updates::warming::LIMIT,
-                )
-                .await;
-                Some(match warmed {
-                    Ok(warming) => {
-                        info!(?warming, "the requests in flight warmed the target's cache");
-                        serde_json::to_value(&warming).unwrap_or_default()
-                    }
-                    Err(error) => {
-                        warn!(%error, "the warming ended: the requests compute their tails on the target");
-                        serde_json::json!({ "error": error })
-                    }
-                })
-            }
-            None => None,
-        };
-        updater.warmed(&host, warming);
-
-        // Until the target serves, this replica's requests are the previous
-        // epoch's: they end as migratable at its drain and wait in the hold.
+        // Until a target serves, the deployment's requests are the previous
+        // epoch's.
         let mut served = updater.epochs().served();
         let mut phase = updater.phase_of(number);
         loop {
@@ -2015,12 +1992,6 @@ impl Replica {
                 break;
             }
             if phase.is_none_or(Phase::ended) {
-                // The update ended before any request moved: the serving
-                // epoch serves on, at the prefill budget it was configured
-                // with.
-                if let Some(source) = source.take() {
-                    restore_prefill(source).await;
-                }
                 return;
             }
             tokio::select! {
@@ -2035,77 +2006,196 @@ impl Replica {
             }
         }
         drop(preparation);
+
         // From here the update owns both epochs' engines: an engine lost is
-        // the update's to judge, not the watcher's to relaunch.
-        self.following.store(true, Ordering::SeqCst);
-        if let Some(source) = source.take() {
-            restore_prefill(source).await;
+        // the update's to judge, not the watcher's to relaunch. What the
+        // previous epoch served with stays until the update ends: it serves
+        // again on a rollback.
+        let before: Vec<_> = previous
+            .iter()
+            .map(|replica| (replica.hold.client(), locked(&replica.served).clone()))
+            .collect();
+        let config_before = locked(&self.config).clone();
+        let mut routed = Vec::with_capacity(clients.len());
+        for (index, (client, (args, _))) in clients.iter().zip(&targets).enumerate() {
+            let replica = match previous.get(index) {
+                Some(replica) => Arc::clone(replica),
+                None => {
+                    let replica = Replica::new(
+                        self.families.clone(),
+                        &config,
+                        Arc::clone(client),
+                        Arc::clone(&observers[index]),
+                        index,
+                        Arc::downgrade(&registry),
+                        Arc::clone(&self.adapters),
+                    );
+                    let _ = replica.control.set(Arc::clone(&control));
+                    replica
+                }
+            };
+            *locked(&replica.served) = Some(args.clone());
+            *locked(&replica.config) = config.clone();
+            routed.push(replica);
         }
-        let before = locked(&self.served).replace(args);
-        // The configuration is the one the target serves from here, as its
-        // arguments are, and a rollback puts both back.
-        let config_before = std::mem::replace(&mut *locked(&self.config), config);
-        // The previous client stays until the update ends: it is what keeps
-        // the previous epoch's engine, which serves again on a rollback.
-        let previous = self.hold.client();
-        self.hold.serve(Arc::clone(&client));
-        tokio::spawn(watch_engine(Arc::clone(self), Arc::downgrade(&client)));
+        // Requests go to `serving`; each of `replicas` (`serving` first) has its
+        // hold serve its own engine of `clients`, and one past the last a
+        // client of another, to which it migrates what it holds.
+        let route = |replicas: &[Arc<Replica>],
+                     serving: &[Arc<Replica>],
+                     clients: &[Option<Arc<EngineClient>>]| {
+            for (index, replica) in replicas.iter().enumerate() {
+                replica.following.store(true, Ordering::SeqCst);
+                let client = clients
+                    .get(index)
+                    .or_else(|| clients.get(index % clients.len().max(1)));
+                if let Some(client) = client.cloned().flatten() {
+                    replica.hold.serve(client);
+                }
+            }
+            registry.serving.send_replace(serving.to_vec());
+        };
+        let target_clients: Vec<_> = clients.iter().cloned().map(Some).collect();
+        let mut everyone = routed.clone();
+        everyone.extend(previous.iter().skip(routed.len()).cloned());
+        route(&everyone, &routed, &target_clients);
+        for (replica, client) in routed.iter().zip(&clients) {
+            tokio::spawn(watch_engine(Arc::clone(replica), Arc::downgrade(client)));
+        }
         info!(
-            launch_generation,
-            epoch, "the update's target serves this replica"
+            epoch,
+            replicas = routed.len(),
+            "the update's target serves the deployment"
         );
 
         // The trial: the steps the previous epoch served before the switch
-        // are what the target's are read against.
+        // are what the target's are read against, replica by replica.
         let began = updater.switch_began().unwrap_or_else(Instant::now);
-        let previous_epoch = previous.as_ref().map_or(0, |client| client.epoch());
+        let previous_epoch = before
+            .iter()
+            .find_map(|(client, _)| client.as_ref())
+            .map_or(0, |client| client.epoch());
+        let baselines = routed
+            .iter()
+            .take(previous.len())
+            .map(|replica| {
+                crate::updates::trial::Baseline::new(
+                    Arc::clone(&replica.observer),
+                    epoch,
+                    previous_epoch,
+                    options.rollback.window,
+                    began,
+                )
+            })
+            .collect();
         let trial = Arc::new(crate::updates::trial::Trial::begin(
             options.rollback.clone(),
-            vec![crate::updates::trial::Baseline::new(
-                Arc::clone(&self.observer),
-                epoch,
-                previous_epoch,
-                options.rollback.window,
-                began,
-            )],
+            baselines,
             request_counts(),
         ));
         updater.begin_trial(Arc::clone(&trial));
 
-        // The previous engine's end, when the trial stops it: its node then
-        // keeps the weights alone.
-        let mut previous_states = (options.previous_epoch != crate::options::PreviousEpoch::Parked)
-            .then(|| previous.as_ref().map(|client| client.states()))
-            .flatten();
-        let mut relaunched = None;
+        // The previous engines' ends, when the trial stops them: their nodes
+        // then keep the weights alone.
+        let mut ending: Vec<(Vec<u64>, watch::Receiver<EngineState>)> =
+            if options.previous_epoch == crate::options::PreviousEpoch::Parked {
+                Vec::new()
+            } else {
+                before
+                    .iter()
+                    .filter_map(|(client, _)| client.as_ref())
+                    .map(|client| (launches(client), client.states()))
+                    .collect()
+            };
+        let mut serving_again: Vec<Option<Arc<EngineClient>>> =
+            before.iter().map(|(client, _)| client.clone()).collect();
+        let mut relaunched = vec![false; previous.len()];
+        let mut returned = false;
         let mut phase = updater.phase_of(number);
         while phase.is_some_and(|phase| !phase.ended()) {
-            // A rollback of an epoch whose engines the trial stopped starts
-            // them again on the weights they kept, once the target stopped.
-            if relaunched.is_none() && !updater.relaunch_due().is_empty() {
-                relaunched = Some(
-                    self.relaunch_previous(&control, updater, before.clone(), &config_before)
-                        .await,
-                );
+            // A rollback of an epoch whose engines the trial stopped, or that
+            // exited, starts them again on the weights they kept, a replica's
+            // world at a time.
+            let due = updater.relaunch_due();
+            let starting: Vec<usize> = (0..previous.len())
+                .filter(|index| {
+                    !relaunched[*index]
+                        && before[*index].0.as_ref().is_some_and(|client| {
+                            launches(client).iter().any(|launch| due.contains(launch))
+                        })
+                })
+                .collect();
+            if !starting.is_empty() {
+                for index in starting {
+                    relaunched[index] = true;
+                    let replica = &previous[index];
+                    let stopped = before[index].0.as_deref().map(launches).unwrap_or_default();
+                    let started = replica
+                        .relaunch_previous(&control, updater, before[index].1.clone(), &stopped)
+                        .await;
+                    match started {
+                        Ok(started) => {
+                            tokio::spawn(watch_engine(
+                                Arc::clone(replica),
+                                Arc::downgrade(&started),
+                            ));
+                            serving_again[index] = Some(started);
+                        }
+                        Err(error) => {
+                            let reason =
+                                format!("the previous epoch did not start again: {error:#}");
+                            tracing::error!(%reason, "no engine serves the replica's requests");
+                            serving_again[index] = None;
+                            replica.hold.close(reason);
+                        }
+                    }
+                }
+                returned = false;
                 phase = updater.phase_of(number);
                 continue;
             }
+            // From the previous epoch's first `Serving` of a rollback, new
+            // requests return to it.
+            if !returned && *served.borrow_and_update() < epoch {
+                returned = true;
+                for (replica, (_, args)) in previous.iter().zip(&before) {
+                    *locked(&replica.served) = args.clone();
+                    *locked(&replica.config) = config_before.clone();
+                }
+                let mut everyone = previous.clone();
+                everyone.extend(routed.iter().skip(previous.len()).cloned());
+                route(&everyone, &previous, &serving_again);
+                warn!(
+                    epoch,
+                    "the update returns the deployment to the previous epoch"
+                );
+            }
             let ended = async {
-                match previous_states.as_mut() {
-                    Some(states) => {
+                if ending.is_empty() {
+                    return std::future::pending().await;
+                }
+                let waits = ending.iter_mut().map(|(_, states)| {
+                    Box::pin(async move {
                         while *states.borrow_and_update() != EngineState::Stopped {
                             if states.changed().await.is_err() {
                                 break;
                             }
                         }
-                    }
-                    None => std::future::pending().await,
-                }
+                    })
+                });
+                futures::future::select_all(waits).await.1
             };
             tokio::select! {
-                () = ended => {
-                    previous_states = None;
-                    updater.previous_ended(&host);
+                index = ended => {
+                    let (stopped, _) = ending.swap_remove(index);
+                    for launch in stopped {
+                        updater.previous_ended(launch);
+                    }
+                }
+                changed = served.changed() => {
+                    if changed.is_err() {
+                        break;
+                    }
                 }
                 next = Self::next_phase(
                     updater,
@@ -2129,40 +2219,30 @@ impl Replica {
                     "publishing the committed epoch failed: {published:?}"
                 );
             }
-        } else {
-            *locked(&self.served) = before;
-            *locked(&self.config) = config_before;
-            match relaunched {
-                Some(Ok(started)) => {
-                    self.hold.serve(Arc::clone(&started));
-                    tokio::spawn(watch_engine(Arc::clone(self), Arc::downgrade(&started)));
-                }
-                Some(Err(error)) => {
-                    let reason = format!("the previous epoch did not start again: {error:#}");
-                    tracing::error!(%reason, "no engine serves requests");
-                    self.hold.close(reason);
-                }
-                None => {
-                    if let Some(previous) = previous {
-                        self.hold.serve(previous);
-                    }
-                }
+        } else if !returned {
+            for (replica, (_, args)) in previous.iter().zip(&before) {
+                *locked(&replica.served) = args.clone();
+                *locked(&replica.config) = config_before.clone();
             }
-            warn!(
-                launch_generation,
-                epoch, "the update returned this replica to the previous epoch"
-            );
+            let mut everyone = previous.clone();
+            everyone.extend(routed.iter().skip(previous.len()).cloned());
+            route(&everyone, &previous, &serving_again);
         }
-        self.following.store(false, Ordering::SeqCst);
+        for replica in previous.iter().chain(&routed) {
+            replica.following.store(false, Ordering::SeqCst);
+        }
         // The standby of the epoch that no longer serves ended with it
         // (`worker_config.standby`).
-        self.start_standby();
+        for replica in registry.serving.borrow().iter() {
+            replica.start_standby();
+        }
     }
 
-    /// Starts the previous epoch again for a rollback: its engines exited for
-    /// the trial (`update_config.previous_epoch`), the target stopped, and
-    /// the engine binds the weights its node kept. The update waits for this
-    /// engine exactly as it waits for one that was promoted again.
+    /// Starts the previous epoch's world of this replica again for a
+    /// rollback: its engines `stopped` (their launch generations, in world
+    /// order) exited for the trial (`update_config.previous_epoch`), and the
+    /// engines bind the weights their nodes kept. The update waits for these
+    /// engines exactly as it waits for ones that were promoted again.
     ///
     /// A start that fails leaves no engine: the update ends all the same,
     /// since nothing it commands can serve the epoch, and the caller closes
@@ -2172,7 +2252,7 @@ impl Replica {
         control: &Arc<EngineControl>,
         updater: &Arc<crate::updates::Updater>,
         args: Option<proto::config::EngineArgs>,
-        config: &ServerArgs,
+        stopped: &[u64],
     ) -> anyhow::Result<Arc<EngineClient>> {
         let generation = updater
             .epochs()
@@ -2197,8 +2277,16 @@ impl Replica {
             anyhow::Ok(client)
         }
         .await;
-        // Whether or not it serves, the update has nothing left to wait for.
-        updater.relaunched(&config.host_identity, generation);
+        // Whether or not it serves, the update has nothing left to wait for
+        // of these engines.
+        let launched = started
+            .as_ref()
+            .map(|client| launches(client))
+            .unwrap_or_default();
+        for (index, previous) in stopped.iter().enumerate() {
+            let launch = launched.get(index).copied().unwrap_or(*previous);
+            updater.relaunched(*previous, launch);
+        }
         started
     }
 
@@ -2230,14 +2318,13 @@ impl Replica {
     }
 }
 
-/// Gives `source` back the prefill budget a warming limited.
-async fn restore_prefill(source: Arc<EngineClient>) {
-    let restored = source
-        .cache_warm(storage::manifest::cache::Operation::Prefill { tokens: None })
-        .await;
-    if let Err(error) = restored {
-        warn!(%error, "the warming's prefill limit stays until this engine ends");
-    }
+/// The launch generations of `client`'s world, the scheduler node's first.
+fn launches(client: &EngineClient) -> Vec<u64> {
+    client
+        .processes()
+        .into_iter()
+        .map(|process| process.engine)
+        .collect()
 }
 
 /// Whether a replica keeps a standby: the deployment reserved room for one
@@ -2604,28 +2691,12 @@ impl Replica {
             .collect();
         let storage = spawns[0].2;
 
-        // The standby executes the serving engine's epoch: it maps that epoch's
-        // weights and its KV cache read-only, ready to be promoted into the same
-        // scope. What a successor maps is the cache the serving engine
-        // holds **now**, not the segments it started with: a cache that grew or
-        // was resized since the launch would hand the standby units that are
-        // shorter than the ones it will be promoted into, and the failure would
-        // surface at promotion rather than here. `DescribeCache` is the same
-        // account the epoch switch's target is built from.
-        let predecessor = match serving.describe_cache().await {
-            Ok(predecessor) => predecessor,
-            Err(reason) => {
-                // No standby is better than one that maps the wrong units: the
-                // loss path relaunches the engine instead (`Replica::recover`).
-                warn!(
-                    model = %self.model_name,
-                    "the standby was not started: the serving engine did not describe its cache: {reason}"
-                );
-                self.lose_standby(&generations);
-                return Ok(());
-            }
-        };
-        args.predecessor = Some(predecessor);
+        // The standby executes the serving engine's epoch and parks: its
+        // launch names the engine it succeeds, and as an epoch switch's target
+        // it opens a session of its own with the buffer pool while it prepares.
+        args.predecessor = Some(wire::Predecessor {
+            epoch: serving.epoch(),
+        });
         args.standby_storage = match storage {
             crate::standby::Storage::Resident => crate::options::StandbyStorage::Resident,
             crate::standby::Storage::Suspended => crate::options::StandbyStorage::Suspended,

@@ -527,10 +527,7 @@ mod tests {
             options.engine_config().expect("the configuration resolves"),
             crate::epoch::modules_of(&options),
         );
-        launch.predecessor = Some(proto::request::wire::Predecessor {
-            epoch: 1,
-            segments: Vec::new(),
-        });
+        launch.predecessor = Some(proto::request::wire::Predecessor { epoch: 1 });
         launch
     }
 

@@ -148,6 +148,31 @@ fn differing(served: &EngineConfig, target: &EngineConfig) -> Vec<&'static str> 
     parts
 }
 
+/// Whether the replicas `target` places lay their device regions out
+/// otherwise than the replicas `serving` runs: another parallel configuration
+/// (degrees, forms, worker groups, devices, hosts) or another number of
+/// replicas, another slot count, KV layout (block size, cache precision) or
+/// set of graph buckets. Two epochs of one layout name the same regions; two
+/// of different layouts have regions of their own over the same device
+/// memory, so the drain gives the serving epoch's back (`shrink`) and the
+/// target grows into it. The cache's size and its tiers are no layout.
+fn layouts_differ(serving: &[EngineConfig], target: &[EngineConfig]) -> bool {
+    let layout = |config: &EngineConfig| {
+        (
+            config.parallel.clone(),
+            config.max_running_requests,
+            config.kv_cache.block_size,
+            config.kv_cache.dtype,
+            config.cuda_graph.clone(),
+        )
+    };
+    serving.len() != target.len()
+        || serving
+            .iter()
+            .zip(target)
+            .any(|(serving, target)| layout(serving) != layout(target))
+}
+
 impl Leader {
     /// Applies a configuration change as operation `number`, as the module
     /// describes: the least the change needs.
@@ -404,13 +429,14 @@ impl Leader {
     }
 
     /// Starts an update in its epoch form: `next`'s engines start beside the
-    /// serving ones as parked engines of the target epoch, and service moves
+    /// serving ones as parked engines of the target epoch, on every node and
+    /// for every replica the target's configuration places, and service moves
     /// to them.
     ///
-    /// The launch file every target starts from states the epoch's whole
-    /// module set, the storage the serving engine holds now (which the target
-    /// maps read-only until it is promoted) and one launch generation for the
-    /// deployment, above every rank's standby.
+    /// Every target engine starts from a launch file of its own, which states
+    /// the epoch's whole module set, the engine it succeeds, its own launch
+    /// generation (above every rank's standby) and, for a world of several
+    /// hosts, the sockets its scheduler node reserved.
     #[allow(clippy::too_many_arguments)]
     async fn epoch_update(
         &self,
@@ -423,48 +449,19 @@ impl Leader {
         request: &ApplyRequest,
         deadline: Option<Instant>,
     ) -> Result<Applied, UpdateError> {
-        // One engine per node and one launch file per engine: the file names
-        // its peers' request addresses, which this daemon does not know for
-        // a node it does not run on, so it states a world of one only.
-        let engines = if target.moe_config.expert_parallel {
-            1
-        } else {
-            target.data_parallel_size.get()
-        };
-        if engines != 1 {
-            return Err(UpdateError::Refused(format!(
-                "the target epoch runs {engines} data-parallel replicas, and an epoch update \
-                 starts one engine per node from one launch file"
-            )));
-        }
-        if target.nnodes.get() != 1 {
-            return Err(UpdateError::Refused(format!(
-                "the target epoch runs {} nodes, and a launch file written here names no peer: \
-                 every node's daemon has to state its own engine's launch",
-                target.nnodes.get()
-            )));
-        }
+        let refused = |error: anyhow::Error| UpdateError::Refused(format!("{error:#}"));
         let replicas = self.replicas();
         let control = replicas[0].control.get().ok_or(UpdateError::NoEngine)?;
-        let serving_client = replicas[0].hold().client().ok_or(UpdateError::NoEngine)?;
+        // Every engine process that serves, of every replica and on every
+        // node: each is drained by its launch generation.
+        let nodes = self.serving_nodes();
+        if nodes.is_empty() {
+            return Err(UpdateError::Refused(format!(
+                "no engine serving epoch {serving} has a launch generation: this daemon neither \
+                 started nor adopted one"
+            )));
+        }
         let epochs = self.updates.epochs();
-        // The serving engine is addressed by its launch generation, which is
-        // the number the client states: the engine this daemon started or
-        // adopted.
-        let serving_generation = serving_client.engine().ok_or_else(|| {
-            UpdateError::Refused(format!(
-                "the engine serving epoch {serving} has no launch generation: this daemon \
-                 neither started nor adopted it"
-            ))
-        })?;
-        // One number for the whole deployment: every rank's counter is
-        // advanced, and the highest is the generation each target is started
-        // at, so none collides with a rank's standby.
-        let group = crate::engine::control::ENGINE_GROUP;
-        let spawn_generation = (0..u64::from(target.nnodes.get()))
-            .map(|rank| epochs.next_generation(group, rank))
-            .max()
-            .unwrap_or(0);
         // The target's number is above every epoch the daemon knows: an epoch
         // a rollback retired keeps its number.
         let target_epoch = epochs
@@ -475,19 +472,6 @@ impl Leader {
             .unwrap_or(serving)
             .max(serving)
             + 1;
-        if request.dry_run {
-            return Ok(Applied::DryRun(serde_json::json!({
-                "change": "epoch",
-                "epoch": target_epoch,
-                "engine": {
-                    "backend": next.modules.engine.backend,
-                    "revision": next.modules.engine.revision,
-                },
-                "launch_generation": spawn_generation,
-                "nodes": [target.host_identity],
-                "pause": "from the previous epoch's Drain to the target's Serving",
-            })));
-        }
 
         // The target's engine configuration is resolved as a deployment's
         // start resolves it: the options state the scheduler and the rank
@@ -498,7 +482,7 @@ impl Leader {
             &crate::options::Stated::from_paths(Vec::new()),
         )
         .await
-        .map_err(|error| UpdateError::Refused(format!("{error:#}")))?
+        .map_err(refused)?
         .engine;
         // Other model files serve the deployment's requests only when they
         // are processed as the serving ones are.
@@ -518,20 +502,71 @@ impl Leader {
             }
         }
 
-        let mut args = proto::config::EngineArgs::new(engine, next.modules.clone());
-        args.epoch = target_epoch;
-        // The target starts parked: it maps the cache segments the serving
-        // engine holds now read-only, so the storage has one writer while
-        // both run. Only the serving engine can state them, and the epoch
-        // that created them, which is what they are keyed by.
-        args.predecessor = Some(serving_client.describe_cache().await.map_err(|reason| {
-            UpdateError::Refused(format!(
-                "the serving epoch named no cache segments for its successor: {reason}"
-            ))
-        })?);
-        let (launch, environment) = control
-            .target_launch(&args, spawn_generation)
-            .map_err(UpdateError::Failed)?;
+        // One launch generation per engine of every target replica's world,
+        // from the deployment's one counter: none collides with a standby's
+        // or with an engine the engine control numbered.
+        let group = crate::engine::control::ENGINE_GROUP;
+        epochs.launched_up_to(group, 0, control.next_engine().saturating_sub(1));
+        let configs = crate::leader::replica_configs(&engine).map_err(refused)?;
+        let mut worlds = Vec::with_capacity(configs.len());
+        for config in &configs {
+            let hosts = crate::engine::control::world_hosts(config).map_err(refused)?;
+            let numbers: Vec<u64> = hosts
+                .iter()
+                .map(|_| epochs.next_generation(group, 0))
+                .collect();
+            let mut args = proto::config::EngineArgs::new(config.clone(), next.modules.clone());
+            args.epoch = target_epoch;
+            worlds.push((args, hosts, numbers));
+        }
+        let serving_configs: Vec<_> = replicas
+            .iter()
+            .filter_map(|replica| {
+                locked(&replica.served)
+                    .as_ref()
+                    .map(|args| args.engine_config.clone())
+            })
+            .collect();
+        let shrink = layouts_differ(&serving_configs, &configs);
+        if request.dry_run {
+            return Ok(Applied::DryRun(serde_json::json!({
+                "change": "epoch",
+                "epoch": target_epoch,
+                "engine": {
+                    "backend": next.modules.engine.backend,
+                    "revision": next.modules.engine.revision,
+                },
+                "replicas": worlds.len(),
+                "engines": worlds.iter().map(|(_, hosts, numbers)| {
+                    hosts.iter().zip(numbers).map(|(host, number)| serde_json::json!({
+                        "host": host.host,
+                        "launch_generation": number,
+                    })).collect::<Vec<_>>()
+                }).collect::<Vec<_>>(),
+                "shrink": shrink,
+            })));
+        }
+
+        // Each target world's launch files. A target starts parked: its launch
+        // names the epoch it succeeds.
+        let mut launches = Vec::new();
+        let mut targets = Vec::with_capacity(worlds.len());
+        for (args, _, numbers) in worlds {
+            let mut parked = args.clone();
+            parked.predecessor = Some(proto::request::wire::Predecessor { epoch: serving });
+            let (placing, numbering) = (Arc::clone(control), numbers.clone());
+            let world =
+                tokio::task::spawn_blocking(move || placing.target_world(&parked, &numbering))
+                    .await
+                    .map_err(|error| UpdateError::Failed(anyhow::anyhow!("{error}")))?
+                    .map_err(UpdateError::Failed)?;
+            let processes = world
+                .iter()
+                .map(|(launch, _)| (launch.host.clone(), launch.engine))
+                .collect();
+            launches.extend(world);
+            targets.push((args, processes));
+        }
 
         let serving_record = epochs.get(serving).ok_or_else(|| {
             UpdateError::Refused(format!(
@@ -546,15 +581,10 @@ impl Leader {
         record.policy = next.modules.policy.clone();
         record.previous_kernels.clear();
         record.previous_policy = None;
-        // The target's generation is set only by its own engine's report.
+        // The target's generation is set only by its own engines' reports.
         record.generation = None;
 
-        let nodes = vec![Node::new(
-            target.host_identity.clone(),
-            0,
-            serving_generation,
-        )];
-        let mut update = Update::epoch(
+        let update = Update::epoch(
             number,
             next.clone(),
             Arc::clone(epochs),
@@ -564,12 +594,13 @@ impl Leader {
             EpochSwitch {
                 epoch: target_epoch,
                 record,
-                launch,
-                environment,
-                spawn_generation,
+                launches,
+                environment: crate::engine::control::main_process_environment(),
                 requests: target.request_socket().to_string_lossy().into_owned(),
                 keeps: options.previous_epoch,
                 recompute: request.in_flight == InFlight::Recompute,
+                drain: Duration::from_secs_f64(options.drain_s),
+                shrink,
                 retire: self.updates.take_retire(),
             },
             deadline,
@@ -577,11 +608,7 @@ impl Leader {
         // A profiling session does not cross epochs: its ranks write their
         // files while the epoch still executes, before the switch drains it.
         self.end_profiles("epoch change").await;
-        // The requests in flight warm the host KV tier once the target
-        // parked, before the switch.
-        update.await_warming(&target.host_identity);
         let report = self.updates.apply(update)?;
-        args.predecessor = None;
         replicas[0].follow(
             Arc::clone(&self.updates),
             number,
@@ -589,9 +616,8 @@ impl Leader {
             deadline,
             crate::leader::Following::Epoch {
                 control: Arc::clone(control),
-                args: Box::new(args),
+                targets,
                 config: Box::new(target.clone()),
-                launch_generation: spawn_generation,
                 epoch: target_epoch,
             },
         );
@@ -998,6 +1024,41 @@ mod tests {
             assert_eq!(ranks[0].device, "cuda:0");
             assert_eq!(ranks[1].device, "cuda:1");
         }
+    }
+
+    /// The target's layout differs from the serving one's in its parallel
+    /// configuration, its devices, its slot count, its KV layout, its graph
+    /// buckets and its number of replicas, and not in the cache's size or its
+    /// tiers.
+    #[test]
+    fn a_layout_is_the_parallel_configuration_slots_kv_layout_and_graph_buckets() {
+        let served = config();
+        let same = |change: &dyn Fn(&mut EngineConfig)| {
+            let mut target = served.clone();
+            change(&mut target);
+            !layouts_differ(std::slice::from_ref(&served), &[target])
+        };
+        assert!(same(&|_| {}));
+        assert!(same(
+            &|target| target.kv_cache.max_tokens = std::num::NonZeroU64::new(4096)
+        ));
+        assert!(same(
+            &|target| target.kv_cache.host_tier = !target.kv_cache.host_tier
+        ));
+        assert!(!same(
+            &|target| target.parallel.worker_groups[0].ranks[0].device = "cuda:3".to_owned()
+        ));
+        assert!(!same(
+            &|target| target.max_running_requests = std::num::NonZeroUsize::new(3).unwrap()
+        ));
+        assert!(!same(
+            &|target| target.kv_cache.block_size = std::num::NonZeroU32::new(32)
+        ));
+        assert!(!same(&|target| {
+            target.cuda_graph.decode_batch_sizes =
+                Some(vec![std::num::NonZeroU32::new(2).unwrap()]);
+        }));
+        assert!(layouts_differ(&[served.clone(), served.clone()], &[served]));
     }
 
     /// A node's storage report as its daemon states it, with what the
