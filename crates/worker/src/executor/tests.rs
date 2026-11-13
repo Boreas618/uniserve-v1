@@ -43,10 +43,22 @@ const INPUTS: u64 = 256;
 const REFUSED: u64 = 13;
 
 /// The worker group of the tests' executors, and the regions its ranks map: the KV units on the
-/// device and the host pool of their copies.
+/// device and the host pool of their copies, and each of two ranks' product buffer.
 const GROUP: GroupId = GroupId(3);
 const DEVICE: u8 = 0;
 const HOST: u8 = 1;
+const PRODUCTS: [u8; 2] = [2, 3];
+
+/// The bytes of a unit of every region, summed over the ranks, and the copy budget of the tests'
+/// executors: three units.
+const UNIT: u64 = 1024;
+const UNIT_BYTES: [(u8, u64); 4] = [
+    (DEVICE, UNIT),
+    (HOST, UNIT),
+    (PRODUCTS[0], UNIT),
+    (PRODUCTS[1], UNIT),
+];
+const BUDGET: u64 = 3 * UNIT;
 
 /// The phase the `index`-th runner of a test executor serves, and one no runner serves.
 const PHASES: [Phase; 2] = [Phase::Decode, Phase::Prefill];
@@ -272,14 +284,16 @@ fn replacing(serving: &Generation, number: u64, operator: &'static str) -> Arc<G
     )
 }
 
-/// The executor with no device of rank `rank` of `sequences`' group over `runners`.
+/// The executor with no device of rank `rank` of `sequences`' group over `runners`, mapping
+/// `regions`, with the tests' copy budget.
 fn spawn(
     runners: Vec<Box<dyn Runner>>,
     kernels: &Arc<Generation>,
     sequences: &Arc<Sequences>,
     rank: usize,
+    regions: &[u8],
 ) -> Executor {
-    let tables = BlockTables::new(sequences.group(), &[DEVICE, HOST]);
+    let tables = BlockTables::new(sequences.group(), regions, &UNIT_BYTES);
     Executor::spawn(
         None,
         runners,
@@ -287,6 +301,7 @@ fn spawn(
         tables,
         Arc::clone(sequences),
         rank,
+        BUDGET,
     )
     .unwrap()
 }
@@ -304,7 +319,7 @@ fn executor(names: &[&'static str], log: &Log) -> (Executor, Arc<Generation>) {
         .collect();
 
     let sequences = Sequences::new(GROUP, 1, Vec::new());
-    let executor = spawn(runners, &kernels, &sequences, 0);
+    let executor = spawn(runners, &kernels, &sequences, 0, &[DEVICE, HOST]);
     (executor, kernels)
 }
 
@@ -725,7 +740,13 @@ fn the_watchdog_reads_the_job_in_flight_longest_with_its_batch() {
     let mut runner = LoggingRunner::new("a", Phase::Decode, Arc::clone(&kernels), &log);
     runner.held = Some((vec![5], entered, released));
     let sequences = Sequences::new(GROUP, 1, Vec::new());
-    let first = spawn(vec![Box::new(runner)], &kernels, &sequences, 0);
+    let first = spawn(
+        vec![Box::new(runner)],
+        &kernels,
+        &sequences,
+        0,
+        &[DEVICE, HOST],
+    );
     let (second, _) = executor(&["b"], &log);
 
     assert_eq!(first.in_flight(), None);
@@ -893,17 +914,37 @@ fn ranks(ranks: usize, log: &Log) -> (Vec<LoggingRunner>, Arc<Generation>) {
     (runners, kernels)
 }
 
-/// A group of this node's executors of `GROUP`, one per runner given, whose `completed` word
-/// is held by `registers`. Returns the route, the executors and the group's sequences.
+/// A group of this node's executors of `GROUP`, one per runner given, each mapping the device
+/// and host regions, whose `completed` word is held by `registers`. Returns the route, the
+/// executors and the group's sequences.
 fn group(
+    ranks: (Vec<LoggingRunner>, Arc<Generation>),
+    registers: Vec<(QueuePair, usize)>,
+) -> (Executors, Vec<Arc<Executor>>, Arc<Sequences>) {
+    let regions = vec![vec![DEVICE, HOST]; ranks.0.len()];
+    mapping(ranks, registers, &regions)
+}
+
+/// As [`group`], with rank `i` mapping `regions[i]`.
+fn mapping(
     (runners, kernels): (Vec<LoggingRunner>, Arc<Generation>),
     registers: Vec<(QueuePair, usize)>,
+    regions: &[Vec<u8>],
 ) -> (Executors, Vec<Arc<Executor>>, Arc<Sequences>) {
     let sequences = Sequences::new(GROUP, runners.len(), registers);
     let executors: Vec<Arc<Executor>> = runners
         .into_iter()
+        .zip(regions)
         .enumerate()
-        .map(|(rank, runner)| Arc::new(spawn(vec![Box::new(runner)], &kernels, &sequences, rank)))
+        .map(|(rank, (runner, regions))| {
+            Arc::new(spawn(
+                vec![Box::new(runner)],
+                &kernels,
+                &sequences,
+                rank,
+                regions,
+            ))
+        })
         .collect();
 
     let route =
@@ -1191,6 +1232,114 @@ fn a_copy_given_up_before_a_batch_started_it_never_runs_and_returns_no_finish() 
     );
 }
 
+/// Maps, on every rank of `route`'s group, the `Copy` that answers request `id`: a store to the
+/// host of one block of `units` units in region `from`.
+fn store(route: &Executors, id: u64, from: u8, units: u32) {
+    let key = storage::Key([id as u8; 32]);
+    let first = 16 * id as u32;
+
+    let store = Request::Store {
+        group: GROUP,
+        keys: vec![key],
+        tier: Tier::Host,
+    };
+    let copy = Completion::Copy {
+        group: GROUP,
+        keys: vec![key],
+        from: vec![(from, first, units)],
+        to: vec![(HOST, first, units)],
+        evicted: Vec::new(),
+    };
+    map(route, 0, id, store, copy);
+}
+
+/// The `Finish` that reports each of `copies` run, stamped with the batch numbered `sequence`.
+fn finished(copies: &[u64], sequence: u64) -> Vec<Request> {
+    copies
+        .iter()
+        .map(|&copy| Request::Finish {
+            copy: runtime::RequestId(copy),
+            ok: true,
+            after: vec![(GROUP, sequence)],
+        })
+        .collect()
+}
+
+/// The copies `rank` was handed, call by call, with the runs it ran of each.
+fn copied(log: &Log, rank: &str) -> Vec<String> {
+    entries(log)
+        .into_iter()
+        .filter_map(|line| {
+            line.strip_prefix(&format!("{rank}: copy "))
+                .map(str::to_owned)
+        })
+        .collect()
+}
+
+#[test]
+fn a_batch_starts_queued_copies_in_their_order_within_the_copy_budget() {
+    let log = Log::default();
+    let (route, _, _) = group(ranks(1, &log), Vec::new());
+
+    // Copies of 2, 2, 1, 5 and 1 units under a budget of 3 units.
+    for (id, units) in [(10, 2), (11, 2), (12, 1), (13, 5), (14, 1)] {
+        store(&route, id, DEVICE, units);
+    }
+
+    // The second copy would pass the budget, and the third, which would fit, does not pass it
+    // in the queue; the copy larger than the budget runs, as the only copy of its batch.
+    let started: [&[u64]; 5] = [&[10], &[11, 12], &[13], &[14], &[]];
+    for (sequence, copies) in (1..).zip(started) {
+        let (_, requests) = returned_by(&route.submit(reading(sequence, 2)).unwrap());
+        assert_eq!(requests, finished(copies, sequence), "batch {sequence}");
+    }
+
+    assert_eq!(
+        copied(&log, "rank-0"),
+        [
+            "[(10, [((0, 160, 2), (1, 160, 2))])]",
+            "[(11, [((0, 176, 2), (1, 176, 2))]), (12, [((0, 192, 1), (1, 192, 1))])]",
+            "[(13, [((0, 208, 5), (1, 208, 5))])]",
+            "[(14, [((0, 224, 1), (1, 224, 1))])]",
+        ]
+    );
+}
+
+#[test]
+fn every_rank_starts_the_same_copies_with_a_batch_whatever_runs_it_maps() {
+    let log = Log::default();
+    let regions = [
+        vec![DEVICE, HOST, PRODUCTS[0]],
+        vec![DEVICE, HOST, PRODUCTS[1]],
+    ];
+    let (route, _, _) = mapping(ranks(2, &log), Vec::new(), &regions);
+
+    // A store of two units from rank 0's product buffer, which rank 1 has no part in, then a
+    // store of two units every rank runs: together they pass the budget of three units on the
+    // group, whatever each rank's own part of them.
+    store(&route, 10, PRODUCTS[0], 2);
+    store(&route, 11, DEVICE, 2);
+
+    // Each batch's `Finish`es are joined over the ranks, which fails unless both started the
+    // same copies with it.
+    for (sequence, copies) in [(1, [10]), (2, [11])] {
+        let (_, requests) = returned_by(&route.submit(reading(sequence, 2)).unwrap());
+        assert_eq!(requests, finished(&copies, sequence), "batch {sequence}");
+    }
+
+    assert_eq!(
+        copied(&log, "rank-0"),
+        [
+            "[(10, [((2, 160, 2), (1, 160, 2))])]",
+            "[(11, [((0, 176, 2), (1, 176, 2))])]",
+        ]
+    );
+    assert_eq!(
+        copied(&log, "rank-1"),
+        ["[(10, [])]", "[(11, [((0, 176, 2), (1, 176, 2))])]"]
+    );
+}
+
 #[test]
 fn a_batch_a_rank_runs_alone_is_passed_by_the_others_and_ends_on_every_rank() {
     let log = Log::default();
@@ -1374,7 +1523,7 @@ fn an_executor_of_a_device_waits_for_events_recorded_on_its_streams() {
     let device = platform::DeviceId(0);
     let runner = LoggingRunner::new("a", Phase::Decode, Arc::clone(&kernels), &log);
     let sequences = Sequences::new(GROUP, 1, Vec::new());
-    let tables = BlockTables::new(GROUP, &[DEVICE, HOST]);
+    let tables = BlockTables::new(GROUP, &[DEVICE, HOST], &UNIT_BYTES);
     let executor = Executor::spawn(
         Some(device),
         vec![Box::new(runner)],
@@ -1382,6 +1531,7 @@ fn an_executor_of_a_device_waits_for_events_recorded_on_its_streams() {
         tables,
         sequences,
         0,
+        super::COPY_BUDGET,
     )
     .unwrap();
 

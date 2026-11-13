@@ -304,7 +304,7 @@ fn batch(ids: &[u32], bound: u32) -> Batch {
 
 /// The device block table of a rank whose requests hold nothing.
 fn tables() -> BlockTables {
-    BlockTables::new(GroupId(0), &[])
+    BlockTables::new(GroupId(0), &[], &[])
 }
 
 /// A runner on the device with both buckets captured, the Build Server its kernels come from

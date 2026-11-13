@@ -632,7 +632,7 @@ fn commit_entry(tables: &mut BlockTables, slot: u32, class: u8, at: u32) {
 /// The device block table of a rank on which each of `slots` is attached and holds a
 /// writable attention block at every position of a row, in [`unit`].
 fn held(slots: &[u32]) -> BlockTables {
-    let mut tables = BlockTables::new(GroupId(0), &[UNITS]);
+    let mut tables = BlockTables::new(GroupId(0), &[UNITS], &[]);
     for &slot in slots {
         attach(&mut tables, slot);
         let runs: Vec<Run> = (0..TABLE_WIDTH as u32)

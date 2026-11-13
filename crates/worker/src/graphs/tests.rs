@@ -213,7 +213,7 @@ fn batch(ids: &[i32], bound: u32) -> Batch {
 
 /// The device block table of a rank whose requests hold nothing.
 fn tables() -> BlockTables {
-    BlockTables::new(GroupId(0), &[])
+    BlockTables::new(GroupId(0), &[], &[])
 }
 
 /// A kernel no test launches: an entry of the C library stands in for a package's.

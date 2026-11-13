@@ -388,7 +388,7 @@ fn new_slot(slot: u32, history: Vec<u32>) -> NewSlot {
 
 /// The device block table of a rank whose requests hold no block: the model keeps no cache.
 fn tables() -> BlockTables {
-    BlockTables::new(GroupId(0), &[])
+    BlockTables::new(GroupId(0), &[], &[])
 }
 
 /// The one-row commit table of `slot` in `mode`, whose row samples task zero.

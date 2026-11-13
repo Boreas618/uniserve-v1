@@ -42,9 +42,21 @@
 //! The executor thread owns the rank's [`BlockTables`]. A completion the scheduler maps and a
 //! request it has stamped are jobs, so a batch sees exactly the entries of the jobs before it:
 //! "before the group's next batch launches" is the queue's order. Before each batch the executor
-//! hands every runner the table's changes and starts the copies queued since the last batch;
+//! hands every runner the table's changes and starts the queued copies the copy budget admits;
 //! when the batch has ended it applies the `Finish` of each copy it ran and returns it, stamped,
 //! with the batch's output.
+//!
+//! ## Copies
+//!
+//! A copy the buffer pool's `Copy` queues starts with a later numbered batch that every rank of
+//! the group runs, on the device's copy stream, and the batch's end covers it. The copy budget
+//! bounds the bytes the copies started with one batch move together ([`COPY_BUDGET`]): a batch
+//! starts the oldest queued copies, in the order they were queued, while their bytes stay within
+//! the budget, and the first copy that would pass it waits, with every copy behind it, for a
+//! later batch. A copy larger than the budget starts alone, as the only copy of its batch. The
+//! bytes are those [`BlockTables::queued_copies`] counts over the group's ranks, and every rank
+//! of a group has the same budget, so all start the same copies with the same batch and return
+//! the same `Finish`es.
 //!
 //! The rank counts the numbered jobs it has *launched* (the stamp a request gets when the rank
 //! applies it) and the ones it has *ended*: the last number whose job, and every earlier one,
@@ -108,11 +120,22 @@ pub use self::queue::Queue;
 pub use self::sequences::Sequences;
 use crate::buckets::Bucket;
 use crate::completion::{Outcome, Submission, add_stamp};
-use crate::memory::tables::BlockTables;
+use crate::memory::tables::{BlockCopy, BlockTables};
 use crate::profiling;
 use crate::profiling::session::{Change, Session};
 use crate::runner::Runner;
 use crate::{Error, Result, lock};
+
+/// The copy budget per batch the engine gives its executors: the bytes, summed over a group's
+/// ranks, that the copies started with one batch may move together, 512 MiB.
+///
+/// The copies run on the device's copy stream beside the batch's forward, and the batch ends with
+/// them. Host storage feeds a GB200 GPU at 209 GB/s (the Transfer Server's interference
+/// measurement, `docs/configuration.md` under `transfer_slowdown`), so the budget is at most
+/// 2.6 ms of copying on one device, an eighth of the 20.5 ms decode step of that measurement, in
+/// which copies from host storage at a quarter of the link's bandwidth slowed the steps by 2% and
+/// at a sixteenth by none.
+pub const COPY_BUDGET: u64 = 512 << 20;
 
 /// A control operation: what the executor calls with its runners at a batch boundary, with
 /// nothing in flight on the device. The runners are in the order the executor was given them,
@@ -264,6 +287,26 @@ pub(crate) fn alone(batch: &Batch) -> Result<Option<u32>> {
     }
 }
 
+/// How many of the oldest queued copies, which move `sizes` bytes each in the order they were
+/// queued, one batch starts under `budget`: as many as fit in it together, and at least one, so
+/// a copy larger than the budget starts alone. The first copy that does not fit waits with every
+/// copy behind it, smaller ones included, so copies start in the order they were queued.
+fn admitted(sizes: impl IntoIterator<Item = u64>, budget: u64) -> usize {
+    let mut moved: u64 = 0;
+    let mut count = 0;
+
+    for bytes in sizes {
+        let total = moved.saturating_add(bytes);
+        if count > 0 && total > budget {
+            break;
+        }
+
+        moved = total;
+        count += 1;
+    }
+    count
+}
+
 /// What an executor has done since it started; monotonic sums the control thread reads while
 /// the executor adds to them.
 #[derive(Default)]
@@ -293,6 +336,11 @@ impl Executor {
     /// `rank` of the worker group whose device block tables `tables` holds for this rank, and
     /// which states its ended sequence to `sequences`.
     ///
+    /// `copy_budget` is the bytes, summed over the group's ranks, that the copies started with
+    /// one batch may move together ([`COPY_BUDGET`]). Every executor of a group is given the
+    /// same budget and tables given the same unit sizes, or the ranks would start different
+    /// copies with one batch and the group's submission would fail.
+    ///
     /// `device` is the CUDA device the runners issue on: the executor keeps its context current
     /// on the thread and checks it for a sticky error. `None` is an executor of runners that
     /// hold no device (host work, or graphs made by [`Graphs::meta`](crate::Graphs::meta)),
@@ -311,6 +359,7 @@ impl Executor {
         tables: BlockTables,
         sequences: Arc<Sequences>,
         rank: usize,
+        copy_budget: u64,
     ) -> Result<Self> {
         let group = tables.group();
         if sequences.group() != group || rank >= sequences.ranks() {
@@ -344,6 +393,7 @@ impl Executor {
             blocking: Calls::default(),
             renewals: profiling::graph_renewals(),
             tables,
+            copy_budget,
             sequences,
             rank,
             launched: 0,
@@ -731,6 +781,9 @@ struct Thread {
     renewals: u64,
     /// The rank's device block tables.
     tables: BlockTables,
+    /// The bytes, summed over the group's ranks, that the copies started with one batch may
+    /// move together.
+    copy_budget: u64,
     /// Where the rank states its ended sequence, as rank `rank`.
     sequences: Arc<Sequences>,
     rank: usize,
@@ -981,9 +1034,9 @@ impl Thread {
     }
 
     /// Executes `batch`, numbered `sequence` unless it is an expert join, through the runner that
-    /// serves its phase: the tables' changes go to every runner first, and the copies queued
-    /// since the last batch start with a numbered batch every rank of the group runs. Returns
-    /// the output and the stamped `Finish` of each copy that ran.
+    /// serves its phase: the tables' changes go to every runner first, and the queued copies the
+    /// copy budget admits start with a numbered batch every rank of the group runs. Returns the
+    /// output and the stamped `Finish` of each copy that ran.
     fn execute(
         &mut self,
         batch: &Batch,
@@ -1077,14 +1130,20 @@ impl Thread {
         Ok(())
     }
 
-    /// Starts every copy no batch has started on the runner `index`, for the batch it runs next.
-    /// Returns the requests the copies are for, and whether the runner issued them: a copy the
-    /// runner cannot issue is reported failed, and the batch still runs.
+    /// Starts on the runner `index`, for the batch it runs next, the oldest copies no batch has
+    /// started that the copy budget admits. Returns the requests the copies are for, and whether
+    /// the runner issued them: a copy the runner cannot issue is reported failed, and the batch
+    /// still runs.
     fn start_copies(&mut self, index: usize) -> (Vec<RequestId>, bool) {
-        let mut copies = Vec::new();
-        while let Some(copy) = self.tables.start_copy() {
-            copies.push(copy);
-        }
+        // The queue's order and each copy's bytes over the group are the same on every rank, so
+        // every rank starts the same copies with this batch.
+        let admitted = admitted(
+            self.tables.queued_copies().map(|(_, bytes)| bytes),
+            self.copy_budget,
+        );
+        let copies: Vec<BlockCopy> = std::iter::from_fn(|| self.tables.start_copy())
+            .take(admitted)
+            .collect();
         if copies.is_empty() {
             return (Vec::new(), true);
         }

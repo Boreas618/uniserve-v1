@@ -60,6 +60,10 @@
 //! block with no run there is another rank's and gives this rank no entry. A copy is the rank's
 //! to run when it maps both the run read and the run written: an encoder output in another
 //! rank's product buffer is stored to the host by that rank alone.
+//!
+//! What a copy moves is counted from every run its completion states, whichever rank maps them,
+//! in the unit sizes the table is given for the session's regions: the same figure on every rank
+//! of the group, so the group's executors agree on which queued copies start with a batch.
 
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::ops::{Range, RangeInclusive};
@@ -104,6 +108,9 @@ pub struct BlockTables {
     group: GroupId,
     /// The regions whose memory the rank maps.
     regions: Vec<u8>,
+    /// By region number, the bytes of a unit summed over the ranks that hold a part of it, for
+    /// every region a copy of the group may name.
+    unit_bytes: HashMap<u8, u64>,
     /// The slot under which each owner's entries are kept, and whether the owner is attached to
     /// the group there; an owner of another group, whose class this group reads, is not.
     slots: HashMap<OwnerId, (u32, bool)>,
@@ -114,8 +121,9 @@ pub struct BlockTables {
     /// entry's units were given by `Allocated` since then. The latest change of a position
     /// replaces the earlier ones.
     changed: BTreeMap<(u32, u8, u32), bool>,
-    /// The copies no batch has started, oldest first.
-    queued: VecDeque<BlockCopy>,
+    /// The copies no batch has started, oldest first, each with the bytes it moves summed over
+    /// the group's ranks.
+    queued: VecDeque<(BlockCopy, u64)>,
     /// By the request that started the copies of a `Load` or a `Clone`: its owner, whether the
     /// `Finish` that reports the copies run was applied, and the entries (class, position,
     /// run, writable) the owner gets when that `Finish` is answered, one per destination in
@@ -156,10 +164,16 @@ impl BlockTables {
     /// The empty table of a rank of `group` that maps the memory of `regions`, by the numbers
     /// the answer to `Open` gave them: the group's slot rows, the device and host regions of
     /// the group's classes that the rank addresses, and its own product buffer.
-    pub fn new(group: GroupId, regions: &[u8]) -> Self {
+    ///
+    /// `unit_bytes` states, by the same numbers, the bytes of a unit of every region a copy of
+    /// the group may name, mapped by this rank or not, summed over the ranks that hold a part of
+    /// it (`storage::runtime::Region::unit_bytes`). Every rank of the group is given the same,
+    /// so each counts what a copy moves alike.
+    pub fn new(group: GroupId, regions: &[u8], unit_bytes: &[(u8, u64)]) -> Self {
         Self {
             group,
             regions: regions.to_vec(),
+            unit_bytes: unit_bytes.iter().copied().collect(),
             slots: HashMap::new(),
             entries: BTreeMap::new(),
             changed: BTreeMap::new(),
@@ -234,15 +248,18 @@ impl BlockTables {
             .collect()
     }
 
-    /// The copies no batch has started, oldest first.
-    pub fn queued_copies(&self) -> impl Iterator<Item = &BlockCopy> + '_ {
-        self.queued.iter()
+    /// The copies no batch has started, oldest first, each with the bytes it moves summed over
+    /// the group's ranks: every key at the larger of what it reads and what it writes, counted
+    /// from the runs its completion states, also those in other ranks' memory. The figure is the
+    /// same on every rank of the group.
+    pub fn queued_copies(&self) -> impl Iterator<Item = (&BlockCopy, u64)> + '_ {
+        self.queued.iter().map(|(copy, bytes)| (copy, *bytes))
     }
 
     /// Takes the oldest copy that no batch has started, for the batch about to launch: the
     /// copy is started and is not offered again. `None` when nothing is queued.
     pub fn start_copy(&mut self) -> Option<BlockCopy> {
-        self.queued.pop_front()
+        self.queued.pop_front().map(|(copy, _)| copy)
     }
 
     /// Takes the completion of `request`, whose number is `id`, and changes the table by what
@@ -267,7 +284,8 @@ impl BlockTables {
     /// owner's entries are kept under; an owner attached twice; a slot another owner attached
     /// to the group holds; a position that holds an entry already; runs that do not divide into
     /// the request's blocks, or a block with two runs in the rank's regions; a load or a clone
-    /// whose destination the rank maps and whose source it does not.
+    /// whose destination the rank maps and whose source it does not; a copy that names a region
+    /// whose unit size the table was not given.
     pub fn map(
         &mut self,
         slot: u32,
@@ -520,7 +538,11 @@ impl BlockTables {
             }
 
             Request::Finish { copy, ok: true, .. } => {
-                if self.queued.iter().any(|queued| queued.request == *copy) {
+                if self
+                    .queued
+                    .iter()
+                    .any(|(queued, _)| queued.request == *copy)
+                {
                     return Err(Error::Invalid(format!(
                         "a `Finish` reports copy {} as run, and no batch has started it",
                         copy.0
@@ -536,7 +558,7 @@ impl BlockTables {
             Request::Finish {
                 copy, ok: false, ..
             } => {
-                self.queued.retain(|queued| queued.request != *copy);
+                self.queued.retain(|(queued, _)| queued.request != *copy);
 
                 let open = self
                     .destinations
@@ -569,6 +591,22 @@ impl BlockTables {
         }
 
         Ok(self.regions.contains(&region))
+    }
+
+    /// The bytes of `run`, summed over the ranks that hold a part of its units.
+    ///
+    /// # Errors
+    ///
+    /// A region the table was given no unit size of.
+    fn bytes(&self, run: Run) -> Result<u64> {
+        let (region, _, count) = run;
+
+        match self.unit_bytes.get(&region) {
+            Some(unit) => Ok(unit.saturating_mul(u64::from(count))),
+            None => Err(Error::Invalid(format!(
+                "`Copy` names region {region}, whose unit size the block table was not given"
+            ))),
+        }
     }
 
     /// Of the runs of one block, the one in the rank's regions; `None` for a block that lies
@@ -691,7 +729,7 @@ impl BlockTables {
     }
 
     /// Queues the copies of request `id`: for each of `keys` keys, from the run of `from` to
-    /// the run of `to`. `destination` is the owner, the slot its entries are kept under, the
+    /// the run of `to`, with the bytes they move over the group. `destination` is the owner, the slot its entries are kept under, the
     /// class, the first position and whether the request is a clone, for a request whose copies
     /// fill positions.
     fn queue(
@@ -717,8 +755,12 @@ impl BlockTables {
 
         let mut runs = Vec::new();
         let mut entries = Vec::new();
+        // The bytes the copy moves over the group: each key at the larger of what it reads and
+        // what it writes, whichever ranks hold the runs.
+        let mut bytes: u64 = 0;
         for (index, (&source, &target)) in from.iter().zip(to).enumerate() {
             let (reads, writes) = (self.maps(source)?, self.maps(target)?);
+            bytes = bytes.saturating_add(self.bytes(source)?.max(self.bytes(target)?));
 
             // A position whose block lies in the rank's memory gets an entry, so the rank must
             // be able to fill it.
@@ -741,7 +783,8 @@ impl BlockTables {
             }
         }
 
-        self.queued.push_back(BlockCopy { request: id, runs });
+        self.queued
+            .push_back((BlockCopy { request: id, runs }, bytes));
         if let Some((owner, slot, ..)) = destination {
             self.slots.entry(owner).or_insert((slot, false));
             self.destinations.insert(id, (owner, false, entries));
@@ -786,8 +829,17 @@ mod tests {
     const PRODUCTS: u8 = 2;
     const OTHER_PRODUCTS: u8 = 3;
 
+    /// The bytes of a unit of each region, summed over the ranks: a product unit is smaller than
+    /// a host unit.
+    const UNIT_BYTES: [(u8, u64); 4] = [
+        (DEVICE, 1024),
+        (HOST, 1024),
+        (PRODUCTS, 256),
+        (OTHER_PRODUCTS, 256),
+    ];
+
     fn tables() -> BlockTables {
-        BlockTables::new(GROUP, &[DEVICE, HOST, PRODUCTS])
+        BlockTables::new(GROUP, &[DEVICE, HOST, PRODUCTS], &UNIT_BYTES)
     }
 
     fn keys(count: u8) -> Vec<Key> {
@@ -1216,8 +1268,21 @@ mod tests {
         tables.map(0, RequestId(10), &store, &copy).unwrap();
         load(&mut tables, 11, 1, 0, &[(HOST, 2, 1)], &[(DEVICE, 7, 1)]).unwrap();
 
-        let queued: Vec<u64> = tables.queued_copies().map(|copy| copy.request.0).collect();
-        assert_eq!(queued, [10, 11]);
+        // A copy that names a region of no stated unit size is refused, and queues nothing.
+        let unstated = Completion::Copy {
+            group: GROUP,
+            keys: keys(1),
+            from: vec![(9, 0, 1)],
+            to: vec![(HOST, 5, 1)],
+            evicted: vec![],
+        };
+        assert!(tables.map(0, RequestId(12), &store, &unstated).is_err());
+
+        let queued: Vec<(u64, u64)> = tables
+            .queued_copies()
+            .map(|(copy, bytes)| (copy.request.0, bytes))
+            .collect();
+        assert_eq!(queued, [(10, 2048), (11, 1024)]);
 
         // A copy that no batch has started cannot have run, and stays queued.
         assert!(tables.apply(&finish(11, true)).is_err());
@@ -1432,6 +1497,10 @@ mod tests {
             evicted: vec![],
         };
         tables.map(0, RequestId(4), &store, &stored).unwrap();
+
+        // Each still counts what it moves over the group, at its larger side: three host units.
+        let bytes: Vec<u64> = tables.queued_copies().map(|(_, bytes)| bytes).collect();
+        assert_eq!(bytes, [3 * 1024, 3 * 1024]);
 
         for request in [3, 4] {
             assert_eq!(
