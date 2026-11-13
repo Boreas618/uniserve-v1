@@ -1065,8 +1065,10 @@ pub struct EngineArgs {
     pub devices: Vec<u32>,
     /// This rank's worker group, which keys its storage claims.
     pub group: String,
-    /// The ordinal inside its group of the first rank this process serves; its other devices'
-    /// ranks follow it.
+    /// The deployment rank of the first rank this process serves, in the numbering of every worker
+    /// group's ranks in the order the groups are stated. A text process's other devices' ranks
+    /// follow it; a media process serves every rank the deployment places on its host, which
+    /// need not be consecutive.
     pub rank: u32,
     /// Whether this node holds the epoch's schedulers.
     pub scheduler_node: bool,
@@ -1082,8 +1084,8 @@ pub struct EngineArgs {
     pub watchdog_timeout_s: Option<u64>,
     /// The rank layout's queue depth for this rank's worker groups.
     pub queue_depth: u32,
-    /// The number of ranks in the epoch's worker group, on every host: this process's ranks and
-    /// those of its peers.
+    /// The number of the deployment's ranks, every worker group's on every host: this process's
+    /// ranks and those of its peers, the members of the host group they meet in.
     pub world_size: u32,
 }
 

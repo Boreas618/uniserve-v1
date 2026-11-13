@@ -72,13 +72,13 @@ A deployment file passed to `--worker-groups` places FastH3's components on devi
 | --- | --- | --- |
 | `ulysses4.toml` | Four on one host | Ulysses4 denoiser, TP4 text encoder |
 | `ulysses8.toml` | Eight on one host | Ulysses8 denoiser, TP8 text encoder |
-| `ulysses8-two-host.toml` | Four on each of two hosts | Ulysses8 denoiser, TP8 text encoder |
+| `ulysses8-two-host.toml` | Four on each of two hosts; refused at startup, since its products would pass between hosts | Ulysses8 denoiser, TP8 text encoder |
 | `fasth3-ulysses4x2.toml` | Eight on one host | Two Ulysses4 replicas |
 | `fasth3-ulysses4x2-two-host.toml` | Four on each of two hosts | One Ulysses4 replica per host |
 | `fasth3-dp8-text-tp8.toml` | Eight on one host | Eight one-GPU replicas, shared TP8 text encoder |
 | `gather8.toml` | Eight on one host | All-gather sequence-parallel denoiser, TP8 text encoder |
 
-One replica spanning every GPU gives the lowest latency; replicas serve more requests at once. The [FastH3 guide](docs/minimax_h3/minimax_h3.md#deployments) lists the recommended deployment and options for each GPU type and goal, and describes two-host startup.
+One replica spanning every GPU of a host gives the lowest latency; replicas serve more requests at once, and across two hosts each replica lies on one host. The [FastH3 guide](docs/minimax_h3/minimax_h3.md#deployments) lists the recommended deployment and options for each GPU type and goal, and describes two-host startup.
 
 ## HTTP API
 

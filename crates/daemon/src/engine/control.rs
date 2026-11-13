@@ -8,7 +8,7 @@
 //! engine's specification and waits until the engine reports that it serves;
 //! the engine's process lives for as long as its control connection does.
 //!
-//! A deployment whose worker group has ranks on several hosts has one engine
+//! A deployment whose worker groups have ranks on several hosts has one engine
 //! per host ([`world_hosts`]): the scheduler node's, on the deployment's engine
 //! host, and a peer on each other host. They are started together, the daemon
 //! having reserved on the scheduler node the two sockets the peers dial (the
@@ -252,50 +252,32 @@ impl EngineControl {
         Ok(scheduler.with_peers(clients.collect()))
     }
 
-    /// The launch files of the world of `args`, one engine per host of its worker groups numbered
-    /// `numbers` in [`world_hosts`]'s order (the scheduler node's first), and the reservations
-    /// each process inherits. A world of several hosts meets at two sockets reserved on the
-    /// scheduler node, which that node's process inherits and every launch names.
+    /// The launch files of the world of `args` ([`place_world`]), numbered `numbers` (the
+    /// scheduler node's first), and the reservations each process inherits. A world of several
+    /// hosts meets at two sockets reserved on the scheduler node, which that node's process
+    /// inherits and every launch names.
     ///
     /// # Errors
     ///
-    /// Fails when `numbers` does not number every host, as [`world_hosts`] and [`place_on`] fail,
-    /// and when the scheduler node does not reserve the sockets.
+    /// Fails as [`place_world`] fails, and when the scheduler node does not reserve the sockets.
     fn world(
         &self,
         args: EngineArgs,
         numbers: &[u64],
     ) -> anyhow::Result<(Vec<EngineArgs>, Vec<Vec<u64>>)> {
-        let hosts = world_hosts(&args.engine_config)?;
-        anyhow::ensure!(
-            numbers.len() == hosts.len(),
-            "{} engine numbers for the engines of {} hosts",
-            numbers.len(),
-            hosts.len()
-        );
-        for number in numbers {
-            self.next_engine.fetch_max(number + 1, Ordering::Relaxed);
-        }
-        let world_size = hosts.iter().map(|host| host.devices.len()).sum::<usize>();
-        let world_size = u32::try_from(world_size).context("a world wider than u32 ranks")?;
         let interfaces = Interfaces {
             requests: &self.request_address,
             processes: &self.processes,
             build_server: &self.build_server,
         };
-        let mut launches = hosts
-            .iter()
-            .zip(numbers)
-            .map(|(host, number)| place_on(args.clone(), *number, &interfaces, host, world_size))
-            .collect::<anyhow::Result<Vec<_>>>()?;
-        // A new epoch takes its first engine's number, on every host.
-        let epoch = launches[0].epoch;
-        for launch in &mut launches {
-            launch.epoch = epoch;
+        let mut launches = place_world(args, numbers, &interfaces)?;
+        for number in numbers {
+            self.next_engine.fetch_max(number + 1, Ordering::Relaxed);
         }
+
         let mut inherit = vec![Vec::new(); launches.len()];
         if launches.len() > 1 {
-            let (channel, store) = self.reserve_world(&hosts[0].host)?;
+            let (channel, store) = self.reserve_world(&launches[0].host)?;
             let world = proto::config::World {
                 scheduler: numbers[0],
                 channel: channel.address.clone(),
@@ -314,7 +296,7 @@ impl EngineControl {
             }
             inherit[0] = vec![channel.reservation, store.reservation];
             tracing::info!(
-                hosts = ?hosts.iter().map(|host| host.host.as_str()).collect::<Vec<_>>(),
+                hosts = ?launches.iter().map(|launch| launch.host.as_str()).collect::<Vec<_>>(),
                 engines = ?numbers,
                 channel = %world.channel,
                 store = %world.store,
@@ -1404,14 +1386,43 @@ pub(crate) fn place(
     interfaces: &Interfaces<'_>,
 ) -> anyhow::Result<EngineArgs> {
     let hosts = world_hosts(&args.engine_config)?;
-    let world_size = hosts.iter().map(|host| host.devices.len()).sum::<usize>();
-    place_on(
-        args,
-        engine,
-        interfaces,
-        &hosts[0],
-        u32::try_from(world_size).context("a world wider than u32 ranks")?,
-    )
+    let world_size = world_size(&args.engine_config)?;
+    place_on(args, engine, interfaces, &hosts[0], world_size)
+}
+
+/// The launch files of the world of `args`, one engine per host of its worker groups in
+/// [`world_hosts`]'s order (the scheduler node's first), numbered `numbers`: each process with its
+/// host's place in a world of every rank of the deployment ([`world_size`]), all in the epoch of
+/// the first. Where the processes meet is stated by the start that reserves the world's sockets.
+///
+/// # Errors
+///
+/// Fails when `numbers` does not number every host, and as [`world_hosts`] and [`place_on`] fail.
+fn place_world(
+    args: EngineArgs,
+    numbers: &[u64],
+    interfaces: &Interfaces<'_>,
+) -> anyhow::Result<Vec<EngineArgs>> {
+    let hosts = world_hosts(&args.engine_config)?;
+    anyhow::ensure!(
+        numbers.len() == hosts.len(),
+        "{} engine numbers for the engines of {} hosts",
+        numbers.len(),
+        hosts.len()
+    );
+    let world_size = world_size(&args.engine_config)?;
+    let mut launches = hosts
+        .iter()
+        .zip(numbers)
+        .map(|(host, number)| place_on(args.clone(), *number, interfaces, host, world_size))
+        .collect::<anyhow::Result<Vec<_>>>()?;
+
+    // A new epoch takes its first engine's number, on every host.
+    let epoch = launches[0].epoch;
+    for launch in &mut launches {
+        launch.epoch = epoch;
+    }
+    Ok(launches)
 }
 
 /// The ranks of the deployment's worker groups one host holds: an engine's place.
@@ -1419,60 +1430,77 @@ pub(crate) fn place(
 pub(crate) struct HostRanks {
     /// The host, by host identity.
     pub(crate) host: String,
-    /// The group rank of its first rank; its others follow it.
+    /// The deployment rank of the first rank it holds, in the numbering of every worker group's
+    /// ranks in the order the groups are stated: the rank its launch states and its process is
+    /// supervised under. The host's other ranks need not follow it, since each group of a
+    /// deployment may place ranks on several hosts.
     pub(crate) first: u32,
-    /// The CUDA ordinals of its ranks, in rank order.
+    /// The CUDA ordinals of its ranks, in rank order, each once: a device may hold ranks of
+    /// several groups.
     pub(crate) devices: Vec<u32>,
 }
 
-/// The hosts of the deployment's worker groups, the engine host first, each with the consecutive
-/// ranks it holds: one engine per host serves an epoch (`docs/architecture.md`, The
-/// channel), the engine host's holding rank 0 and the schedulers.
+/// The hosts of the deployment's worker groups, in the order of the first rank each holds, each
+/// with that rank and the devices of its ranks: one engine per host serves an epoch
+/// (`docs/architecture.md`, The channel), the engine host's first, holding rank 0 and the
+/// schedulers.
+///
+/// A host's ranks may lie anywhere in the deployment's numbering: a deployment that places one
+/// replica of each of two groups on each of two hosts numbers the first group's ranks of both
+/// hosts before the second group's.
 ///
 /// # Errors
 ///
-/// Fails when the engine host holds no rank or not rank 0, when a host's ranks are not
-/// consecutive, or as [`local_devices`] fails.
+/// Fails when the engine host does not hold rank 0, or as [`local_devices`] fails.
 pub(crate) fn world_hosts(config: &proto::config::EngineConfig) -> anyhow::Result<Vec<HostRanks>> {
-    let engine_host = &config.parallel.engine_host;
-    let mut order: Vec<String> = Vec::new();
-    let mut previous: Option<&str> = None;
-    for rank in config
+    let engine_host = config.parallel.engine_host.as_str();
+    let ranks = config
         .parallel
         .worker_groups
         .iter()
-        .flat_map(|group| group.ranks.iter())
-    {
-        if previous != Some(rank.host.as_str()) {
-            anyhow::ensure!(
-                !order.contains(&rank.host),
-                "the ranks of host {} are not consecutive: a host's engine serves one run \
-                 of its group's ranks",
-                rank.host
-            );
-            order.push(rank.host.clone());
-            previous = Some(rank.host.as_str());
+        .flat_map(|group| group.ranks.iter());
+    // Each host with the deployment rank of the first rank it holds.
+    let mut firsts: Vec<(&str, usize)> = Vec::new();
+    for (rank, placed) in ranks.enumerate() {
+        if !firsts.iter().any(|(host, _)| *host == placed.host) {
+            firsts.push((placed.host.as_str(), rank));
         }
     }
+    let first_host = firsts.first().map(|(host, _)| *host);
     anyhow::ensure!(
-        order.first() == Some(engine_host),
-        "the deployment's first rank runs on {:?} and its engine host is {engine_host}: the engine \
-         host's engine holds rank 0 and the schedulers",
-        order.first()
+        first_host == Some(engine_host),
+        "the deployment's first rank runs on {first_host:?} and its engine host is {engine_host}: \
+         the engine host's engine holds rank 0 and the schedulers"
     );
-    let mut first = 0_u32;
-    let mut hosts = Vec::with_capacity(order.len());
-    for host in order {
-        let devices = local_devices(&host, config)?;
-        let count = u32::try_from(devices.len()).context("a host of more than u32 ranks")?;
-        hosts.push(HostRanks {
-            host,
-            first,
-            devices,
-        });
-        first += count;
-    }
-    Ok(hosts)
+
+    firsts
+        .into_iter()
+        .map(|(host, first)| {
+            Ok(HostRanks {
+                host: host.to_owned(),
+                first: u32::try_from(first)
+                    .context("a deployment of more ranks than u32 numbers")?,
+                devices: local_devices(host, config)?,
+            })
+        })
+        .collect()
+}
+
+/// The number of the deployment's ranks, every worker group's on every host: the members of the
+/// host group its engines' ranks meet in, each under its deployment rank. A device that holds
+/// ranks of several groups counts once for each.
+///
+/// # Errors
+///
+/// Fails for a deployment of more ranks than u32 numbers.
+fn world_size(config: &proto::config::EngineConfig) -> anyhow::Result<u32> {
+    let ranks: usize = config
+        .parallel
+        .worker_groups
+        .iter()
+        .map(|group| group.ranks.len())
+        .sum();
+    u32::try_from(ranks).context("a deployment of more ranks than u32 numbers")
 }
 
 /// The launch file's contents for the process `engine` on `host`, in a world of `world_size`
@@ -1637,6 +1665,70 @@ mod tests {
     /// The epoch's module set every launch file states.
     fn modules() -> proto::module::ModuleSet {
         crate::epoch::modules_of(&ServerArgs::default())
+    }
+
+    /// The launches of the deployment file `file` of the repository's `configs/`, whose hosts are
+    /// `rank-0`, the engine host, and `rank-1`: one engine per host, numbered 1 and 2, with each
+    /// launch's host, first rank, devices, world size, whether it is the scheduler node, and epoch.
+    fn two_host_launches(file: &str) -> Vec<(String, u32, Vec<u32>, u32, bool, u64)> {
+        let configs = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../configs");
+        let options = ServerArgs {
+            model: Some("/models/checkpoint".to_owned()),
+            host_identity: "rank-0".to_owned(),
+            worker_groups: Some(configs.join(file)),
+            ..Default::default()
+        };
+        let args = EngineArgs::new(
+            options.engine_config().expect("the deployment file places"),
+            modules(),
+        );
+        let interfaces = Interfaces {
+            requests: "",
+            processes: "",
+            build_server: Path::new(""),
+        };
+
+        place_world(args, &[1, 2], &interfaces)
+            .expect("the world places")
+            .into_iter()
+            .map(|launch| {
+                (
+                    launch.host,
+                    launch.rank,
+                    launch.devices,
+                    launch.world_size,
+                    launch.scheduler_node,
+                    launch.epoch,
+                )
+            })
+            .collect()
+    }
+
+    /// Each host of a two-host deployment runs one engine from the first deployment rank it holds,
+    /// on the devices of its ranks, in a world of every rank of the deployment; the engine host's
+    /// is the scheduler node, and every engine is in the epoch of the first. A host's ranks may lie
+    /// on either side of another host's.
+    #[test]
+    fn each_host_of_a_two_host_deployment_starts_from_its_first_rank_in_a_world_of_every_rank() {
+        // One text replica and one flow replica on each host's four devices: the text replicas
+        // are ranks 0-3 (`rank-0`) and 4-7 (`rank-1`), the flow replicas ranks 8-11 and 12-15.
+        assert_eq!(
+            two_host_launches("minimax_h3/fasth3-ulysses4x2-two-host.toml"),
+            vec![
+                ("rank-0".to_owned(), 0, vec![0, 1, 2, 3], 16, true, 1),
+                ("rank-1".to_owned(), 4, vec![0, 1, 2, 3], 16, false, 1),
+            ]
+        );
+
+        // A tensor-parallel attention group on `rank-0` (ranks 0 and 1) and its expert group on
+        // `rank-1` (ranks 2 and 3).
+        assert_eq!(
+            two_host_launches("afd/qwen3_moe.toml"),
+            vec![
+                ("rank-0".to_owned(), 0, vec![0, 1], 4, true, 1),
+                ("rank-1".to_owned(), 2, vec![0, 1], 4, false, 1),
+            ]
+        );
     }
 
     /// An epoch update's target starts from a launch that states its own launch generation, the

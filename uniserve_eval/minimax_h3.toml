@@ -60,7 +60,11 @@
 # A server is ready when its /health answers 200, which is when SGLang has
 # also finished its startup warmup; startup time is measured to that point.
 #
-# The gb200-8 deployment spans two four-GPU hosts, rank-0 and rank-1.
+# The gb200-8 deployments span two four-GPU hosts, rank-0 and rank-1, each
+# as one Ulysses8 replica across both (ulysses8-two-host.toml and
+# ulysses8-reference-two-host.toml); such a replica is refused at startup,
+# because its products would pass between the hosts
+# (docs/minimax_h3/minimax_h3.md, Two hosts).
 # The evaluator starts the leader on rank-0, which waits for rank-1's daemon
 # at UNISERVE_DIST_INIT_ADDR (rank-0's address and a free port, HOST:PORT);
 # start `$UNISERVE_EXECUTABLE serve --nnodes 2 --node-rank 1 --dist-init-addr
@@ -312,7 +316,9 @@ videos_per_second = "higher"
 # sequence rows. The media reader publishes decoded references from a GPU
 # rank, the text encoder runs on rank-0's four GPUs and the latent encoder
 # deals condition units to the ranks the prompt leaves free, rank-1's GPUs
-# first, so both hosts encode a request's conditions together.
+# first, so both hosts encode a request's conditions together. The
+# deployment is refused at startup, since its products would pass between
+# the hosts (docs/minimax_h3/minimax_h3.md, Two hosts).
 [servers.gb200-8-omniref-refs]
 host = "127.0.0.1"
 port = 18083
@@ -1053,7 +1059,8 @@ videos_per_second = "higher"
 # SGLang baseline below size them; these points are the ones compared with
 # that baseline. The deployment is the one above with the capacities the
 # enlarged references need: prompts of 3,410 to 47,160 tokens, 79,104
-# condition rows and 236,294 sequence rows for the largest request.
+# condition rows and 236,294 sequence rows for the largest request. Like
+# the one above, it is refused at startup.
 [servers.gb200-8-omniref-refs-enlarged]
 host = "127.0.0.1"
 port = 18083
@@ -1789,7 +1796,9 @@ videos_per_second = "higher"
 "video_latency_ms.p50" = "lower"
 "video_latency_ms.p95" = "lower"
 
-# Base FL2VA for t2va on two hosts.
+# Base FL2VA for t2va on two hosts, as one Ulysses8 replica across both:
+# refused at startup, since its products would pass between the hosts
+# (docs/minimax_h3/minimax_h3.md, Two hosts).
 [servers.gb200-8]
 host = "127.0.0.1"
 port = 18083
@@ -2378,7 +2387,8 @@ videos_per_second = "higher"
 "video_latency_ms.p50" = "lower"
 "video_latency_ms.p95" = "lower"
 
-# The two-host keyframe deployment: W3's options on ulysses8-two-host.toml.
+# The two-host keyframe deployment: W3's options on ulysses8-two-host.toml,
+# refused at startup as gb200-8 is.
 # Start rank-1's daemon for its server as for gb200-8.
 [servers.gb200-8-keyframe]
 host = "127.0.0.1"
