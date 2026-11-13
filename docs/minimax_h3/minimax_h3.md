@@ -111,7 +111,7 @@ uniserve serve "$OMNIREF_EXPORT" \
   --set media_config.directory=/srv/media
 ```
 
-The options can also be kept in a TOML file passed with `--config` ([Configuration](../configuration.md#configuration-file)). A deployment file places each component on devices. These four-GPU files run four-way Ulysses denoising, TP4 text encoding, the latent encoder and one video and audio decoding unit per rank in a `model` worker, and the H.264 encoders, the muxer and the media reader, which decodes condition media. The media components run on the host inside the main process, which serves CUDA devices only, so a deployment places them on CUDA ranks; a rank on `cpu` is refused when the node is launched. The media reader runs on a GPU rank of the leader's host: its decoded pixels lie in that GPU's storage, which condition encoders on every host read through the device transport. Check a running server with:
+The options can also be kept in a TOML file passed with `--config` ([Configuration](../configuration.md#configuration-file)). A deployment file places each component on devices. These four-GPU files run four-way Ulysses denoising, TP4 text encoding, the latent encoder and one video and audio decoding unit per rank in a `model` worker, and the H.264 encoders, the muxer and the media reader, which decodes condition media. The media components run on the host inside the main process, which serves CUDA devices only, so a deployment places them on CUDA ranks; a rank on `cpu` is refused when the node is launched. The media reader runs on a GPU rank: its decoded pixels lie in that GPU's storage, which the condition encoders of the same host read. Check a running server with:
 
 ```bash
 curl --fail-with-body http://127.0.0.1:8000/health
@@ -128,7 +128,7 @@ The deployment files are in `configs/minimax_h3/`, in the TOML format [Configura
 | --- | --- | --- | --- |
 | `ulysses4.toml` | Four on one host | Ulysses4 | TP4 |
 | `ulysses8.toml` | Eight on one host | Ulysses8 | TP8 |
-| `ulysses8-two-host.toml` | Four on each of two hosts | Ulysses8 | TP8 |
+| `ulysses8-two-host.toml` | Four on each of two hosts; refused at startup ([Two hosts](#two-hosts)) | Ulysses8 | TP8 |
 | `fasth3-ulysses4x2.toml` | Eight on one host | Two Ulysses4 replicas | TP4 per replica |
 | `fasth3-ulysses4x2-two-host.toml` | Four on each of two hosts | One Ulysses4 replica per host | TP4 per replica |
 | `fasth3-dp8-text-tp8.toml` | Eight on one host | Eight one-GPU replicas | One shared TP8 |
@@ -137,7 +137,7 @@ The deployment files are in `configs/minimax_h3/`, in the TOML format [Configura
 | `gather8.toml` | Eight on one host | Eight-way all-gather | TP8 |
 | `ulysses4-reference.toml` | Four on one host | Ulysses4 `transformer_ref` | TP4 |
 | `ulysses8-reference.toml` | Eight on one host | Ulysses8 `transformer_ref` | TP8 |
-| `ulysses8-reference-two-host.toml` | Four on each of two hosts | Ulysses8 `transformer_ref` | TP4 on `rank-0` |
+| `ulysses8-reference-two-host.toml` | Four on each of two hosts; refused at startup ([Two hosts](#two-hosts)) | Ulysses8 `transformer_ref` | TP4 on `rank-0` |
 
 A component placed with `weights = "host"` keeps the dense projection weights of its repeated layer stack in page-locked host storage. Each rank holds a few layer-sized device slots, the fewest of at least four that divide the layer count (five for FastH3's 50 layers), and copies each layer into its slot on its own stream up to that count less two layers ahead of its use, while the layers before it compute. Biases and every other weight stay on the device, and the released device storage becomes capacity. `fasth3-dp8-text-tp8-host-weights.toml` places every replica's denoiser this way, and each replica holds its own host copy. On eight RTX PRO 6000 it serves the BF16 checkpoint for throughput with `--max-running-requests 8 --max-model-len 10240 --set video_config.text_capacities=1024 --set video_config.sizes=1344x768 --mem-fraction-static 0.92`, the options of the `rtx-pro-6000-8-dp8-bf16` evaluation server.
 
@@ -148,12 +148,11 @@ A Ulysses denoiser's `sequence_parallel` table also selects how each layer's Q/K
 sequence_parallel = { kind = "ulysses", ulysses_degree = 8, projection = "exchange", projection_rows = 4096 }
 ```
 
-One replica across every GPU gives the lowest latency; replicas serve more requests at once when the offered concurrency keeps them busy. The two-host reference file spreads a request's condition encoding over both hosts: its media reader runs in a one-GPU `reader` worker on `rank-0`, so the latent encoder's ranks on both hosts read the decoded references from that GPU's storage, and while the text encoder encodes the prompt on `rank-0`'s four GPUs, the latent encoder, whose ranks list `rank-1`'s GPUs first, deals the request's condition units to the ranks the prompt leaves free. One eight-way reference replica serves both latency and throughput across two hosts. The validated FastH3 settings:
+One replica across every GPU of a host gives the lowest latency; replicas serve more requests at once when the offered concurrency keeps them busy. Across two hosts, each replica lies on one host ([Two hosts](#two-hosts)). The validated FastH3 settings:
 
 | Hardware | Goal | Deployment | Options |
 | --- | --- | --- | --- |
 | 4 x GB200 | Latency and throughput | `ulysses4.toml` | `--max-running-requests 2` |
-| 8 x GB200, two hosts | Latency | `ulysses8-two-host.toml` | `--max-running-requests 2` |
 | 8 x GB200, two hosts | Throughput | `fasth3-ulysses4x2-two-host.toml` | `--max-running-requests 4` |
 | 8 x RTX PRO 6000 | Latency | `ulysses8.toml` | `--max-running-requests 2 --mem-fraction-static 0.92 --max-model-len 10240 --set video_config.text_capacities=1024` |
 | 8 x RTX PRO 6000 | Throughput | `fasth3-ulysses4x2.toml` | `--max-running-requests 4 --mem-fraction-static 0.92 --max-model-len 10240 --set video_config.text_capacities=1024` |
@@ -177,6 +176,8 @@ The two-host files name their hosts `rank-0` and `rank-1` (a rank entry without 
 ```bash
 uniserve serve --nnodes 2 --node-rank 1 --dist-init-addr <rank-0 address>:<port> --host-identity rank-1
 ```
+
+Each host's main process holds the products of a request on its own ranks: the condition media, the conditioning, the latents, the decoded and encoded video units with their splice tails, and the track. A product passes from the ranks that write it to the ranks that read it within one host, never between hosts. `fasth3-ulysses4x2-two-host.toml` places each replica's text encoder, denoiser, decoders, codecs, muxer and media reader on one host, and the server places each request's stages on the replicas of one host. A deployment in which a product would pass between hosts is refused when its ranks start, with an error that names each such product, the worker group that writes it and the worker group that reads it. `ulysses8-two-host.toml` and `ulysses8-reference-two-host.toml` place one worker group across both hosts, so its latents, decoded units, splice tails and encoded units, its track and the condition media of the `reader` worker on `rank-0` would pass between hosts, and both files are refused.
 
 ## Startup and capacity
 

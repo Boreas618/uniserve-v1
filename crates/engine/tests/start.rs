@@ -6,7 +6,10 @@
 //! with a launch of the Qwen3-MoE fixture on one rank of one group, `device = "meta"`: the
 //! engine says hello and `Starting`, claims the node's Storage Server, starts its rank, opens
 //! its session, resolves its policy and serves; it takes a request, states its metrics, and
-//! exits with status 0 once shut down, its session closed.
+//! exits with status 0 once shut down, its session closed. Two more start an epoch of two
+//! processes of this host standing for two hosts, each with a Storage Server of its own: a text
+//! group with a rank on each, and a released FastH3 checkpoint (which the repository does not
+//! hold, so that case is ignored by default) with a replica on each.
 //!
 //! No GPU is touched. The Build Server builds the `fcfs` module from its installed snapshot and
 //! precompiles it with the engine executable under test (`uniserve-engine precompile`).
@@ -443,6 +446,137 @@ fn two_host_launch(directory: &Path, build_server: &Path, host: &str, world: Wor
     launch
 }
 
+/// The released FastH3 checkpoint a media launch serves, loaded from its shard headers alone.
+const FAST_H3: &str = "/workspace/models/FastVideo-FastH3-8-Step-V2";
+
+/// The launch of the main process of host `host` in an epoch that serves [`FAST_H3`] as
+/// `configs/minimax_h3/fasth3-ulysses4x2-two-host.toml` places it: on each of hosts `rank-0` and
+/// `rank-1`, four devices that hold a text encoder replica and a denoising replica. The meta
+/// device, one scheduler, square videos of the shortest timeline and prompts of up to 256 tokens;
+/// engine 1 (the scheduler node, `rank-0`) or 2 (its peer, `rank-1`), each serving from the first
+/// rank its host holds. Both hosts are this one, each process with sockets of its own in
+/// `directory` and a Storage Server of its own.
+fn media_two_host_launch(
+    directory: &Path,
+    build_server: &Path,
+    host: &str,
+    world: World,
+) -> EngineArgs {
+    let mut launch = launch(directory, build_server);
+    let file = workspace().join("configs/minimax_h3/fasth3-ulysses4x2-two-host.toml");
+    let text = std::fs::read_to_string(file).unwrap();
+    let groups = WorkerGroupConfig::parse_file(&text, "rank-0").unwrap();
+    let hosts: Vec<&str> = groups
+        .iter()
+        .flat_map(|group| &group.ranks)
+        .map(|rank| rank.host.as_str())
+        .collect();
+    launch.world_size = u32::try_from(hosts.len()).unwrap();
+    launch.rank = u32::try_from(hosts.iter().position(|held| *held == host).unwrap()).unwrap();
+
+    let config = &mut launch.engine_config;
+    config.model.model = FAST_H3.to_owned();
+    config.model.max_model_len = 256;
+    config.parallel.engine_host = "rank-0".to_owned();
+    config.parallel.worker_groups = groups;
+    config.video = proto::config::VideoConfig {
+        max_seconds: 4.0,
+        sizes: vec!["768x768".to_owned()],
+        text_capacities: None,
+        max_condition_rows: None,
+    };
+
+    let scheduler_node = host == "rank-0";
+    launch.engine = if scheduler_node { 1 } else { 2 };
+    launch.scheduler_node = scheduler_node;
+    launch.host = host.to_owned();
+    launch.devices = vec![0, 1, 2, 3];
+    launch.world = Some(world);
+    launch
+}
+
+/// The two sockets the daemon reserves on the scheduler node for an epoch of two hosts: the peer
+/// link's listener and the rendezvous of the ranks' host group. The scheduler node inherits both;
+/// its peer dials them.
+struct Reserved {
+    channel: TcpListener,
+    store: TcpListener,
+}
+
+impl Reserved {
+    fn new() -> Self {
+        Self {
+            channel: TcpListener::bind("127.0.0.1:0").unwrap(),
+            store: TcpListener::bind("127.0.0.1:0").unwrap(),
+        }
+    }
+
+    /// The descriptors the scheduler node inherits.
+    fn inherited(&self) -> Inherited {
+        Inherited {
+            channel: self.channel.as_raw_fd(),
+            store: self.store.as_raw_fd(),
+        }
+    }
+
+    /// Where the epoch's two processes meet: with the inherited descriptors for the scheduler
+    /// node, without for its peer.
+    fn world(&self, inherited: Option<Inherited>) -> World {
+        World {
+            scheduler: 1,
+            channel: self.channel.local_addr().unwrap().to_string(),
+            store: self.store.local_addr().unwrap().to_string(),
+            peers: 1,
+            inherited,
+        }
+    }
+}
+
+/// Reads the start of an epoch of two processes to its end: the scheduler node `a` states
+/// `Serving` with its one scheduler, and both report their first generation to their daemons.
+fn both_serve(a: &mut Daemon, b: &mut Daemon) {
+    let info = until(&mut a.requests, START, |kind| match kind {
+        from_engine::Kind::State(state) if state.state == wire::EngineState::Serving as i32 => {
+            Some(state.info.expect("a serving engine states what it serves"))
+        }
+        _ => None,
+    });
+    assert_eq!(info.schedulers, 1);
+    for daemon in [a, b] {
+        let serving: proto::process::Upstream = daemon.processes.recv(START).unwrap().unwrap();
+        assert!(matches!(
+            serving.kind,
+            Some(upstream::Kind::Report(proto::process::Report {
+                kind: Some(report::Kind::Serving(proto::process::Serving {
+                    generation: 1,
+                    ..
+                })),
+            }))
+        ));
+    }
+}
+
+/// Shuts the scheduler node `a` down, which ends the epoch in order: its peer `b` reads the close
+/// of its link and ends too, both with status 0, and neither host's Storage Server (`storage`, the
+/// scheduler node's and the peer's, each with the launch generation of its host's engine) holds
+/// that engine's session of `epoch`.
+fn both_shut_down(a: &mut Daemon, b: &mut Daemon, storage: [(&StorageServer, u64); 2], epoch: u64) {
+    a.requests
+        .deliver(&wire::ToEngine {
+            kind: Some(wire::to_engine::Kind::Engine(wire::EngineCommand {
+                kind: Some(wire::engine_command::Kind::Shutdown(wire::Shutdown {})),
+            })),
+        })
+        .unwrap();
+    let status = a.engine.exited(READ);
+    assert!(status.success(), "the scheduler node exited with {status}");
+    let status = b.engine.exited(READ);
+    assert!(status.success(), "the peer exited with {status}");
+    for (storage, engine) in storage {
+        assert!(!holds_session(storage, epoch, engine));
+    }
+}
+
 #[test]
 fn an_epoch_of_two_processes_of_one_host_standing_for_two_hosts_serves_and_shuts_down() {
     let directory = tempfile::tempdir().unwrap();
@@ -453,24 +587,10 @@ fn an_epoch_of_two_processes_of_one_host_standing_for_two_hosts_serves_and_shuts
     let (storage_a, storage_b) = (StorageServer::start(), StorageServer::start());
     let build_server = build_server(directory.path());
 
-    // The two sockets the daemon reserves on the scheduler node for the epoch: the peer link's
-    // listener and the rendezvous of the ranks' host group. The scheduler node inherits both; its
-    // peer dials them.
-    let channel = TcpListener::bind("127.0.0.1:0").unwrap();
-    let store = TcpListener::bind("127.0.0.1:0").unwrap();
-    let world = |inherited| World {
-        scheduler: 1,
-        channel: channel.local_addr().unwrap().to_string(),
-        store: store.local_addr().unwrap().to_string(),
-        peers: 1,
-        inherited,
-    };
-    let inherited = Inherited {
-        channel: channel.as_raw_fd(),
-        store: store.as_raw_fd(),
-    };
-    let head = two_host_launch(&here, &build_server, "a", world(Some(inherited)));
-    let peer = two_host_launch(&there, &build_server, "b", world(None));
+    let reserved = Reserved::new();
+    let inherited = reserved.inherited();
+    let head = two_host_launch(&here, &build_server, "a", reserved.world(Some(inherited)));
+    let peer = two_host_launch(&there, &build_server, "b", reserved.world(None));
 
     // The scheduler node accepts its peer before its rank loads; the peer registers once its
     // daemon answered its claim.
@@ -484,25 +604,7 @@ fn an_epoch_of_two_processes_of_one_host_standing_for_two_hosts_serves_and_shuts
 
     // Both serve: the scheduler node with its one scheduler, its peer with none, each having
     // started its first generation.
-    let info = until(&mut a.requests, START, |kind| match kind {
-        from_engine::Kind::State(state) if state.state == wire::EngineState::Serving as i32 => {
-            Some(state.info.expect("a serving engine states what it serves"))
-        }
-        _ => None,
-    });
-    assert_eq!(info.schedulers, 1);
-    for daemon in [&mut a, &mut b] {
-        let serving: proto::process::Upstream = daemon.processes.recv(START).unwrap().unwrap();
-        assert!(matches!(
-            serving.kind,
-            Some(upstream::Kind::Report(proto::process::Report {
-                kind: Some(report::Kind::Serving(proto::process::Serving {
-                    generation: 1,
-                    ..
-                })),
-            }))
-        ));
-    }
+    both_serve(&mut a, &mut b);
 
     // The scheduler node holds the epoch's session; the peer's host holds the session of its
     // host regions, where the peer's ranks take their parts.
@@ -551,19 +653,48 @@ fn an_epoch_of_two_processes_of_one_host_standing_for_two_hosts_serves_and_shuts
     let woken = hooked(&mut a.requests, 22, resize(22, wire::CacheChange::Wake));
     assert_eq!(woken, "");
 
-    // A shutdown of the scheduler node ends the epoch in order: its peer reads the close of its
-    // link and ends too, both with status 0, and neither host holds a session of the epoch.
-    a.requests
-        .deliver(&wire::ToEngine {
-            kind: Some(wire::to_engine::Kind::Engine(wire::EngineCommand {
-                kind: Some(wire::engine_command::Kind::Shutdown(wire::Shutdown {})),
-            })),
-        })
-        .unwrap();
-    let status = a.engine.exited(READ);
-    assert!(status.success(), "the scheduler node exited with {status}");
-    let status = b.engine.exited(READ);
-    assert!(status.success(), "the peer exited with {status}");
-    assert!(!holds_session(&storage_a, head.epoch, head.engine));
-    assert!(!holds_session(&storage_b, peer.epoch, peer.engine));
+    // A shutdown of the scheduler node ends the epoch in order.
+    let storage = [(&storage_a, head.engine), (&storage_b, peer.engine)];
+    both_shut_down(&mut a, &mut b, storage, head.epoch);
+}
+
+/// A media epoch whose two replicas each lie on one of two hosts, as
+/// `configs/minimax_h3/fasth3-ulysses4x2-two-host.toml` places them, passes no product between
+/// its two processes: the scheduler node and its peer each start their own host's ranks, and
+/// both serve.
+#[test]
+#[ignore = "reads the headers of a released FastH3 checkpoint, which the repository does not hold"]
+fn a_media_epoch_whose_replicas_lie_on_two_hosts_serves_and_shuts_down() {
+    assert!(Path::new(FAST_H3).is_dir(), "{FAST_H3} is missing");
+    let directory = tempfile::tempdir().unwrap();
+    let (here, there) = (directory.path().join("a"), directory.path().join("b"));
+    std::fs::create_dir_all(&here).unwrap();
+    std::fs::create_dir_all(&there).unwrap();
+    let (storage_a, storage_b) = (StorageServer::start(), StorageServer::start());
+    let build_server = build_server(directory.path());
+
+    let reserved = Reserved::new();
+    let inherited = reserved.inherited();
+    let head = media_two_host_launch(
+        &here,
+        &build_server,
+        "rank-0",
+        reserved.world(Some(inherited)),
+    );
+    let peer = media_two_host_launch(&there, &build_server, "rank-1", reserved.world(None));
+    assert_eq!((head.rank, peer.rank), (0, 4));
+
+    let mut a = started(
+        &here,
+        &head,
+        &storage_a,
+        &[inherited.channel, inherited.store],
+    );
+    let mut b = started(&there, &peer, &storage_b, &[]);
+    both_serve(&mut a, &mut b);
+    assert!(holds_session(&storage_a, head.epoch, head.engine));
+    assert!(holds_session(&storage_b, peer.epoch, peer.engine));
+
+    let storage = [(&storage_a, head.engine), (&storage_b, peer.engine)];
+    both_shut_down(&mut a, &mut b, storage, head.epoch);
 }

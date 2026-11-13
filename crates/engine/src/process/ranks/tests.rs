@@ -621,8 +621,10 @@ fn a_media_group_holds_as_many_request_slots_as_its_ranks_shares_hold() {
     let request = products.units / SLOTS;
     let slot = u64::from(request) * UNIT_BYTES + rows.part_bytes;
 
-    // A share that holds two slots and half a third holds two.
-    super::fit_media_slots(&mut ranks, |_| Ok(Some(2 * slot + slot / 2))).unwrap();
+    // A share that holds two slots and half a third holds two. The process holds every rank of
+    // the group, whose fewest are those its ranks decide.
+    let alone = |fewest: &[u32]| -> anyhow::Result<Vec<u32>> { Ok(fewest.to_vec()) };
+    super::fit_media_slots(&mut ranks, |_| Ok(Some(2 * slot + slot / 2)), alone).unwrap();
     let open = layout(&launch, &ranks).unwrap();
     assert_eq!(region(&open, "slots 1 0").units, 2);
     assert_eq!(region(&open, "products 1 0").units, 2 * request);
@@ -645,7 +647,7 @@ fn a_media_group_holds_as_many_request_slots_as_its_ranks_shares_hold() {
 
     // A share one byte short of a slot refuses the start.
     let mut ranks = load();
-    let refusal = super::fit_media_slots(&mut ranks, |_| Ok(Some(slot - 1))).unwrap_err();
+    let refusal = super::fit_media_slots(&mut ranks, |_| Ok(Some(slot - 1)), alone).unwrap_err();
     let message = format!("{refusal:#}");
     assert!(
         message.contains(&format!("one slot needs {slot} bytes")),
@@ -992,6 +994,137 @@ fn a_device_holds_a_rank_of_the_text_group_and_one_of_a_flow_replica() {
     drop(workers);
     drop(spawned);
     client.close().unwrap();
+}
+
+/// The launch of `checkpoint` for the main process of host `host` of the two-host deployment
+/// `file` of `configs/minimax_h3/`, whose hosts are `rank-0`, the scheduler node's, and `rank-1`,
+/// four devices each: the process serves from the first rank its host holds, in a world of every
+/// rank of the deployment.
+fn two_host_launch(file: &str, host: &str, checkpoint: &str) -> EngineArgs {
+    let mut launch = video_launch();
+    let path = crate::support::workspace()
+        .join("configs/minimax_h3")
+        .join(file);
+    let text = std::fs::read_to_string(path).unwrap();
+    let groups = WorkerGroupConfig::parse_file(&text, "rank-0").unwrap();
+    let ranks: Vec<&WorkerRank> = groups.iter().flat_map(|group| &group.ranks).collect();
+    launch.world_size = u32::try_from(ranks.len()).unwrap();
+    launch.rank = u32::try_from(ranks.iter().position(|rank| rank.host == host).unwrap()).unwrap();
+
+    launch.engine_config.model.model = checkpoint.to_owned();
+    launch.engine_config.parallel.engine_host = "rank-0".to_owned();
+    launch.engine_config.parallel.worker_groups = groups;
+    launch.host = host.to_owned();
+    launch.devices = vec![0, 1, 2, 3];
+    launch
+}
+
+/// The launch and the ranks of the scheduler node's process (host `rank-0`) of the two-host
+/// deployment `file` of `checkpoint`, loaded onto the meta device while the process of host
+/// `rank-1` loads its own: the two meet at one rendezvous as the deployment's host group, and
+/// agree their groups' request slots over it.
+fn two_host_ranks(file: &str, checkpoint: &str) -> (EngineArgs, Vec<LoadedRank>) {
+    assert!(Path::new(checkpoint).is_dir(), "{checkpoint} is missing");
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap().to_string();
+    let load = |host: &str, listener: Option<std::net::TcpListener>| {
+        let launch = two_host_launch(file, host, checkpoint);
+        let registry = nn::family::Registry::new([models::minimax_h3::family::FAMILY]).unwrap();
+        let family = crate::process::catalogue::resolve(&registry, Path::new(checkpoint)).unwrap();
+        let model_runner = ModelRunner::of(&launch, family).unwrap();
+        let meeting = Meeting::World {
+            address: address.clone(),
+            listener,
+        };
+        let ranks = load_ranks(
+            model_runner.ranks().unwrap(),
+            Backing::Meta,
+            &launch,
+            meeting,
+        );
+        (launch, ranks.unwrap())
+    };
+
+    std::thread::scope(|scope| {
+        let peer = scope.spawn(|| load("rank-1", None));
+        let head = load("rank-0", Some(listener));
+        peer.join().unwrap();
+        head
+    })
+}
+
+/// `configs/minimax_h3/fasth3-ulysses4x2-two-host.toml` places each replica's text encoder and
+/// denoiser on one host. The scheduler node's process holds the ranks of its own host alone, and
+/// its session states every group of both hosts: every rank's product buffer and every group's
+/// slot rows, each denoising replica reading the conditioning of the text encoder on its own
+/// host and each text encoder the vision pixels of the media reader on its own, and the groups
+/// of each host that host's memory. No product passes between the two processes.
+#[test]
+#[ignore = "reads the headers of a released FastH3 checkpoint, which the repository does not hold"]
+fn a_two_host_media_session_states_both_hosts_replicas_when_none_passes_a_product_across() {
+    let (launch, ranks) = two_host_ranks("fasth3-ulysses4x2-two-host.toml", FAST_H3);
+
+    // Text replica 0 is ranks 0-3 and flow replica 0 ranks 8-11, on `rank-0`; replicas 1 are
+    // ranks 4-7 and 12-15, on `rank-1`.
+    let held: Vec<u32> = ranks.iter().map(|rank| rank.model_runner.rank()).collect();
+    assert_eq!(held, [0, 1, 2, 3, 8, 9, 10, 11]);
+    for rank in &ranks {
+        assert_eq!(rank.video().unwrap().group_slots, vec![SLOTS; 4]);
+    }
+
+    let open = layout(&launch, &ranks).unwrap();
+    assert_eq!(
+        open.schedulers,
+        vec![(0..4).map(GroupId).collect::<Vec<_>>()]
+    );
+    let region = |name: &str| {
+        let index = open.regions.iter().position(|region| region.name == name);
+        u8::try_from(index.unwrap_or_else(|| panic!("no region {name}"))).unwrap()
+    };
+    let buffers = |ranks: std::ops::Range<usize>| -> Vec<u8> {
+        ranks
+            .map(|rank| region(&format!("products 1 {rank}")))
+            .collect()
+    };
+    for group in 0..4 {
+        let slots = &open.regions[usize::from(region(&format!("slots 1 {group}")))];
+        assert_eq!(slots.units, SLOTS, "group {group}");
+    }
+
+    // Groups text-0, text-1, flow-0 and flow-1, in that order.
+    let conditioning = crate::batch::product::kind(crate::batch::product::CONDITIONING).unwrap();
+    let vision = crate::batch::product::kind(crate::batch::product::VISION_PIXELS).unwrap();
+    let groups = &open.groups;
+    assert_eq!(groups[2].regions[conditioning], buffers(0..1));
+    assert_eq!(groups[3].regions[conditioning], buffers(4..5));
+    assert_eq!(groups[0].regions[vision], buffers(8..12));
+    assert_eq!(groups[1].regions[vision], buffers(12..16));
+    assert_eq!(groups[0].memory, groups[2].memory);
+    assert_eq!(groups[1].memory, groups[3].memory);
+    assert_ne!(groups[0].memory, groups[1].memory);
+}
+
+/// The base MiniMax-H3 release, whose dense denoiser any Ulysses degree splits: the sparse
+/// attention of the FastH3 exports composes rows in blocks that an eight-way split of the test's
+/// one timeline does not leave whole, and refuses it in the profile run.
+const MINIMAX_H3: &str = "/workspace/models/MiniMax-H3";
+
+/// `configs/minimax_h3/ulysses8-two-host.toml` places one group over both hosts, beside a muxer
+/// and a media reader on `rank-0`: its products would pass between the two processes, and the
+/// session is refused at the scheduler node's rank start, naming them.
+#[test]
+#[ignore = "reads the headers of the released MiniMax-H3 checkpoint, which the repository does not hold"]
+fn a_two_host_media_session_is_refused_by_the_products_that_would_pass_across() {
+    let (launch, ranks) = two_host_ranks("ulysses8-two-host.toml", MINIMAX_H3);
+
+    let refusal = format!("{:#}", layout(&launch, &ranks).unwrap_err());
+    for product in [
+        crate::batch::product::AUDIO_SAMPLES,
+        crate::batch::product::ENCODED_UNITS,
+        crate::batch::product::VIDEO_TAIL,
+    ] {
+        assert!(refusal.contains(product), "{product}: {refusal}");
+    }
 }
 
 /// The released checkpoint deliverable E1 serves (`artifacts/buffer-pool/e1/protocol.md`).
