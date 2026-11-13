@@ -10,7 +10,17 @@
 //! shared memory, and never waits for one (SD §3.1, §4.1; BP §9, §11).
 //!
 //! This file holds the scheduler's state (SD §2.1, §2.5), the messages in and out (§2.4, §2.5),
-//! the executor interface (§2.1) and the scheduler's end of the queue pair (§3.1, §3.5):
+//! the executor interface (§2.1), the constructor with the startup checks (§7.1), the step loop
+//! (§3.1) and the scheduler's end of the queue pair (§3.1, §3.5).
+//!
+//! The loop, [`Scheduler::run`], is vLLM's `EngineCore.run_busy_loop`: each pass applies every
+//! message that arrived ([`Scheduler::apply`]) and takes one [`Scheduler::step`], which reads the
+//! completion queue and the capacity words once, schedules, hands the batches to the executor and
+//! writes the step's requests into the submission queue. The loop's one blocking call is the
+//! wait on its inbox, taken only after a step that formed no batch, until the next message, the
+//! next starvation or drain deadline, the next statistics second, or, while the buffer pool owes
+//! answers or a request waits for units, one polling period (`SchedulerConfig::poll_period`): the
+//! queue pair runs in poll mode, and no wake-up crosses from the buffer pool.
 //!
 //! - `submit` takes a request for the buffer pool. A request the executors first apply to their
 //!   device block tables (`Release`, `Detach`, `Commit`, `Transfer`, and the `Finish` that gives a
@@ -24,44 +34,44 @@
 //!   requests, which it requires (BP §7, R1).
 //! - `next_completion` reads the completion queue, matches each completion to its request by
 //!   number, applies what it states of the cache (`cache.rs`), drops what belongs to a forgotten
-//!   owner or to entries a later stamped request names
-//!   (BP §9, obligation 1), and hands every completion that gives entries to the executors
-//!   (`Executor::map`) before the scheduler applies it.
+//!   owner (but a `Committed`, which outlives its owner's `Detach`) or to entries a later stamped
+//!   request names (BP §9, obligation 1), and hands every completion that gives entries to the
+//!   executors (`Executor::map`) before the scheduler applies it. A `Copy` it hands over is
+//!   recorded in `copies` until the executor returns its `Finish`, or the step gives it up at its
+//!   bound (SD §4.4).
 //! - `read_capacity` reads the capacity words of every region.
 //!
 //! The scheduling, admission, update, drain, policy, cache and statistics rules are `impl
 //! Scheduler` blocks of the sibling files (SD §6).
 
 mod cache;
+mod drain;
 mod group;
+mod memory;
 mod policy;
 mod request;
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "the step's assembly, `schedule`, which appends the rows and seals the batches, \
-                  is not in the crate yet"
-    )
-)]
 mod rows;
+mod schedule;
 mod stats;
 #[cfg(test)]
 mod tests;
+mod update;
 mod video;
 mod view;
 
 use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::fmt;
+use std::num::NonZeroUsize;
 use std::ops::Range;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Instant;
+use std::sync::{Arc, OnceLock};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use crossbeam_channel::Sender;
-use ipc::batch::{Batch, BatchId, BatchOutput};
+use crossbeam_channel::{Receiver, RecvTimeoutError, Sender, TryRecvError};
+use ipc::batch::{Batch, BatchId, BatchOutput, Phase};
 use proto::config::{SchedulerConfig, WorkerGroupConfig};
 use proto::report::SchedulerStats;
+use proto::request::wire::WeightsInFlight;
 use proto::request::{Event, FinishReason, GenerationLimits, MigrationCause, RequestId};
 use scheduling_guest::Parameters;
 use storage::runtime::{self, Cause, Completion, GroupId, OwnerId, Tier};
@@ -80,6 +90,19 @@ pub const WARMUP_REQUEST_IDS: u64 = 1 << 63;
 /// The bytes of a record's length word in a ring of a queue pair (`storage::queue`): a ring of
 /// `max_record()` bytes of record holds that many more.
 const LENGTH_WORD: usize = 8;
+
+/// The bytes of an `Evict` record besides its keys (`storage::runtime`): the request's number,
+/// its variant and the length of its key list.
+const EVICT_RECORD: usize = 13;
+
+/// The least time the loop sleeps for a starvation deadline: a step that could not judge a
+/// starved request (every group's queue full, a paused scheduler) does not spin on it
+/// (`S/run.rs:1064-1075`).
+const STARVATION_WAKE: Duration = Duration::from_millis(1);
+
+/// The phases whose calls hold a sequence of tokens in a group's KV cache, which the group's
+/// longest sequence bounds.
+const SEQUENCE_PHASES: [Phase; 4] = [Phase::Prefill, Phase::Decode, Phase::Verify, Phase::Refill];
 
 /// The engine's error: what ends a scheduler, fails a batch or refuses an operation.
 #[derive(Debug)]
@@ -134,6 +157,9 @@ pub enum Message {
     /// From an executor: the requests it applied to its group's device block tables, each with
     /// its group's stamp, and the stamped `Finish` of each copy it ran.
     Submit(Vec<runtime::Request>),
+    /// From an executor: a job of a worker group outside a batch, a `map` or a `stamp`, failed.
+    /// The group's device block tables lack what the scheduler counts on, so it fails at once.
+    Failed(Error),
     /// Form no batch; the reply is sent once nothing is in flight.
     Pause(Sender<()>),
     Resume,
@@ -147,14 +173,21 @@ pub enum Message {
     RollbackPolicy(Sender<Result<(), Error>>),
     /// Drop the policy kept for rollback.
     CommitPolicy,
-    /// Evict every cached block the scheduler knows of; with seeds, the cache groups' seeds from
-    /// here on.
-    Flush(Option<Vec<Key>>, Sender<Result<(), Error>>),
+    /// Evict every cached block the scheduler knows of, the requests it holds continuing as the
+    /// [`WeightsInFlight`] says (`Keep`, `Recompute`, `Abort`). With a weight update's seeds,
+    /// the page seed of each cache group and the latent seed of stored trajectories from here on.
+    Flush(
+        Option<(Vec<Key>, u64)>,
+        WeightsInFlight,
+        Sender<Result<(), Error>>,
+    ),
     /// `Resize { region, units }` at the buffer pool, the region by its number; the reply is sent
     /// at its `Resized`.
     Resize(u8, u32, Sender<()>),
-    /// The scheduler's limits, applied in place.
-    Configure(SchedulerConfig),
+    /// The scheduler's limits, applied in place; the reply refuses a limit above what the
+    /// executors hold, which leaves the limits as they were.
+    Configure(SchedulerConfig, Sender<Result<(), Error>>),
+    /// End every request the scheduler holds, aborted, and stop.
     Shutdown,
 }
 
@@ -234,11 +267,6 @@ pub trait Executor: Send {
 /// A region is named in completions and requests by its number at the buffer pool, and indexed
 /// here, in every per-region field, by its place in the session's regions (`Open::regions`),
 /// which is how the layout of a group and a class names it too.
-#[expect(
-    dead_code,
-    reason = "the step loop, admission, update, drain and policy that read these fields are not \
-              in the crate yet"
-)]
 pub struct Scheduler {
     config: SchedulerConfig,
     /// The generation limits requests are checked against at their arrival: the model's sizing
@@ -304,6 +332,31 @@ pub struct Scheduler {
     owners: HashMap<OwnerId, RequestId>,
     /// The counter owners are drawn from: the scheduler's data-parallel rank in the top 16 bits.
     next_owner: u64,
+    /// Per cache group, in class order, the seed the key chains of its blocks are rooted at (SD
+    /// §4.3); a request's `CachePolicy::state_seeds` override it. Empty until stated, which roots
+    /// every chain at the zero key, the seed of an empty identity. A weight update's `Flush`
+    /// replaces it, so that no key reaches a block the previous weights computed.
+    seeds: Vec<Key>,
+    /// The seed of the keys of stored trajectories (`latent_content`, SD §4.3), replaced with
+    /// `seeds`; 0 until stated.
+    latent_seed: u64,
+    /// Running requests whose next call waits for units of a region since their last shortage:
+    /// per request, the region (by index) and the units its `available` must show before the
+    /// request asks again (SD §3.6). A request listed here takes no further victims.
+    short: HashMap<RequestId, (usize, u32)>,
+    /// The copies the groups' executors hold, by the number of the request answered `Copy` (a
+    /// `Load`, a `Clone`, a `Store` to the host, a `Save` or a `Restore`): the group whose
+    /// executor runs it, and the moment the scheduler gives it up (SD §4.4 "The bound of a
+    /// copy"). A copy enters when its `Copy` is handed to the executor and leaves when the
+    /// executor returns its `Finish` or the scheduler gives it up: a group with an entry is sent
+    /// an empty batch when the step forms none for it (SD §2.1).
+    copies: HashMap<u64, (GroupId, Instant)>,
+    /// Per region, whether a `Detach` was answered since the region's last `Resize` was
+    /// submitted. The buffer pool writes a completion before the capacity words its request
+    /// changed, so the words read with a `Detach`'s answer may not show its units yet; a drain
+    /// that gives memory back owes such a region one more `Resize`, whose answer is read with
+    /// words that do (SD §3.8).
+    detached: Vec<bool>,
 
     policy: Policy,
     executor: Box<dyn Executor>,
@@ -314,7 +367,8 @@ pub struct Scheduler {
     /// The kernel and policy generation batches are assembled for.
     generation: Arc<AtomicU64>,
     paused: bool,
-    /// Whether the scheduler stopped on a fault (`fail`): its loop ends at the next pass.
+    /// Whether the scheduler stopped, on a fault (`fail`) or at `Shutdown`: it takes no message
+    /// and no step from then on, and its loop ends.
     stopped: bool,
     /// The replies owed to `Pause` once nothing is in flight.
     boundary: Vec<Sender<()>>,
@@ -327,20 +381,6 @@ pub struct Scheduler {
 }
 
 impl Scheduler {
-    /// Stops the scheduler on a fault it cannot recover from: `Output::Failed` tells the engine,
-    /// which ends the epoch's requests in flight as migratable with the cause `Loss`, as for a
-    /// lost process, and the loop ends at its next pass. Called once; later faults are dropped.
-    pub(super) fn fail(&mut self, error: Error) {
-        if self.stopped {
-            return;
-        }
-        self.stopped = true;
-        // An engine that no longer listens has stopped this scheduler's epoch already.
-        let _ = self.output.send(Output::Failed(error));
-    }
-}
-
-impl Scheduler {
     /// A scheduler of the session the engine opened with `layout` and that `opened` answered:
     /// the `scheduler`-th of `layout.schedulers`, which is its data-parallel rank, on its end of
     /// its queue pair. `groups` are its worker groups' configurations and the capacities their
@@ -348,10 +388,17 @@ impl Scheduler {
     /// generation limits the engine resolved for the deployment; their features are the ones the
     /// groups' phases serve.
     ///
+    /// The scheduler's limits are `config`'s, lowered to what the executors hold (SD §7.1): the
+    /// running requests to the slots the groups hold for them, a step's tokens to the widest
+    /// prefill bucket the executors captured and its calls to their largest bucket's rows. Its
+    /// first request to the buffer pool is `List`, which teaches it the cached blocks its session
+    /// can reach (SD §4.5).
+    ///
     /// # Errors
     ///
     /// [`Error::Storage`] when the layout and its answer do not state this scheduler: no such
     /// scheduler, other groups than `groups`, or regions and registers that do not match.
+    /// [`Error::InvalidRequest`] for a deployment the startup checks refuse ([`resolved`]).
     #[expect(
         clippy::too_many_arguments,
         reason = "the scheduler's parts come from four owners: the configuration, the session \
@@ -403,6 +450,22 @@ impl Scheduler {
                 .ok_or_else(|| Error::Storage(format!("the session states no group {}", id.0)))?;
             workers.push(WorkerGroup::new(config, capacity, group.clone()));
         }
+        let config = resolved(config, &workers)?;
+
+        // The page seeds every group of the scheduler states for its cache groups, one per class
+        // in class order: one key chain serves all of them, so groups that state seeds must state
+        // the same. A group without a KV cache states none.
+        let mut stated = workers
+            .iter()
+            .map(|worker| &worker.capacity.seeds)
+            .filter(|seeds| !seeds.is_empty());
+        let seeds = stated.next().cloned().unwrap_or_default();
+        if stated.any(|other| *other != seeds) {
+            return Err(Error::InvalidRequest(
+                "the scheduler's groups state different page seeds for their cache groups"
+                    .to_owned(),
+            ));
+        }
 
         let regions: Vec<(u8, runtime::Region)> = opened
             .regions
@@ -421,7 +484,7 @@ impl Scheduler {
             features: request::served_features(&workers),
             ..limits
         };
-        Ok(Self {
+        let mut scheduler = Self {
             config,
             limits,
             epoch: layout.epoch,
@@ -447,6 +510,11 @@ impl Scheduler {
             installed: vec![Vec::new(); count],
             owners: HashMap::new(),
             next_owner: (rank << 48) + 1,
+            seeds,
+            latent_seed: 0,
+            short: HashMap::new(),
+            copies: HashMap::new(),
+            detached: vec![false; count],
             policy,
             executor,
             output,
@@ -460,15 +528,557 @@ impl Scheduler {
             resizing: Vec::new(),
             next_batch: 0,
             step: 0,
+        };
+
+        // Written at the first step; nothing is scheduled before its `Listing` but what the
+        // scheduler commits itself, which `cache` holds exactly.
+        scheduler.submit(runtime::Request::List);
+        Ok(scheduler)
+    }
+}
+
+/// `config` with its limits lowered to what `groups`' executors hold, once the deployment passes
+/// the startup checks (SD §7.1; `S/core.rs:185-236`, `S/submission.rs:93-105`,
+/// `S/run.rs:108-162`, `S/worker/codecs.rs`).
+///
+/// The checks: at least one group; every group that runs calls of a token sequence states its
+/// longest sequence; a deployment whose groups hold a KV cache holds a slot for every running
+/// request, since its requests' cache lives in their slots; and, when a group encodes video, every
+/// group that decodes video has one that encodes its units on the hosts that decoded them
+/// ([`group::encodes_on_host`]). The limits: `max_running_requests` within `1..=` the slots
+/// ([`slots`]), `max_num_batched_tokens` within `1..=` the widest prefill bucket's tokens, and
+/// `max_batch` at most the largest bucket's rows ([`ceilings`]); a bound no group states binds
+/// nothing.
+///
+/// # Errors
+///
+/// [`Error::InvalidRequest`] naming the first check the deployment fails.
+fn resolved(mut config: SchedulerConfig, groups: &[WorkerGroup]) -> Result<SchedulerConfig, Error> {
+    if groups.is_empty() {
+        return Err(Error::InvalidRequest(
+            "the executors state no worker group to schedule on".into(),
+        ));
+    }
+
+    let sequences = |group: &&WorkerGroup| SEQUENCE_PHASES.iter().any(|&phase| group.serves(phase));
+    if let Some(group) = groups
+        .iter()
+        .filter(sequences)
+        .find(|group| group.capacity.max_model_len == 0)
+    {
+        return Err(Error::InvalidRequest(format!(
+            "worker group {} runs token sequences and states no longest sequence",
+            group.config.id.0
+        )));
+    }
+
+    // A decoded video unit is a host product its encoder reads in place, so a decoder whose units
+    // no encoder can read on their hosts could never finish a request.
+    let encoders: Vec<&WorkerGroup> = groups
+        .iter()
+        .filter(|group| group.serves(Phase::VideoEncode))
+        .collect();
+    let stranded = groups
+        .iter()
+        .filter(|group| group.serves(Phase::VideoDecode))
+        .find(|decoder| {
+            !encoders.is_empty()
+                && !encoders
+                    .iter()
+                    .any(|encoder| group::encodes_on_host(&decoder.config, &encoder.config))
+        });
+    if let Some(decoder) = stranded {
+        return Err(Error::InvalidRequest(format!(
+            "worker group {} decodes video units that no video encoding group encodes on the \
+             hosts that decoded them",
+            decoder.config.id.0
+        )));
+    }
+
+    if let Some(slots) = slots(groups) {
+        let slots = usize::try_from(slots).unwrap_or(usize::MAX);
+        let caches = groups.iter().any(|group| {
+            group.capacity.kv_cache.is_some() || !group.capacity.cache_groups.is_empty()
+        });
+        if caches && slots < config.max_running_requests {
+            return Err(Error::InvalidRequest(format!(
+                "the worker groups hold {slots} request slots, but {} running requests need one \
+                 each",
+                config.max_running_requests
+            )));
+        }
+        config.max_running_requests = config.max_running_requests.min(slots).max(1);
+    }
+
+    let ceilings = ceilings(groups.iter().map(|group| &group.capacity));
+    let tokens = usize::try_from(ceilings.max_num_batched_tokens).unwrap_or(usize::MAX);
+    config.max_num_batched_tokens = config.max_num_batched_tokens.clamp(1, tokens.max(1));
+    if let Some(rows) = NonZeroUsize::new(ceilings.max_batch) {
+        config.max_batch = config.max_batch.min(rows);
+    }
+    Ok(config)
+}
+
+/// The requests `groups` hold slots for at once: per phase some group serves, the slots of the
+/// groups that serve it together (replicas of a stage each hold their own), and the least of
+/// those over the phases, since a request holds a slot in a group of every phase it runs. `None`
+/// when no group serves a phase.
+fn slots(groups: &[WorkerGroup]) -> Option<u32> {
+    Phase::ALL
+        .into_iter()
+        .filter_map(|phase| {
+            groups
+                .iter()
+                .filter(|group| group.serves(phase))
+                .map(|group| group.capacity.slots)
+                .reduce(u32::saturating_add)
         })
+        .min()
+}
+
+/// The step loop and the messages it applies (SD §3.1, §2.4): vLLM's `EngineCore.run_busy_loop`,
+/// `_handle_client_request` and `step_with_batch_queue`.
+impl Scheduler {
+    /// Runs the scheduler on the calling thread until it stops: at `Shutdown`, at a fault, which
+    /// it reports as `Output::Failed`, or once no sender of `inbox` is left, which is a shutdown.
+    ///
+    /// Each pass applies every message that arrived ([`Scheduler::apply`]) and takes one
+    /// [`Scheduler::step`]. It blocks on `inbox` only after a step that formed no batch: a formed
+    /// batch may have left room for another (a pipelined decode), which the next pass finds
+    /// without waiting. It then waits until the next message or the next deadline of
+    /// [`Scheduler::next_deadline`].
+    pub fn run(mut self, inbox: Receiver<Message>) {
+        let mut formed = false;
+        while !self.stopped {
+            let first = if formed {
+                match inbox.try_recv() {
+                    Ok(message) => Some(message),
+                    Err(TryRecvError::Empty) => None,
+                    Err(TryRecvError::Disconnected) => return self.shutdown(),
+                }
+            } else {
+                match inbox.recv_deadline(self.next_deadline()) {
+                    Ok(message) => Some(message),
+                    Err(RecvTimeoutError::Timeout) => None,
+                    Err(RecvTimeoutError::Disconnected) => return self.shutdown(),
+                }
+            };
+
+            for message in first.into_iter().chain(inbox.try_iter()) {
+                self.apply(message);
+                if self.stopped {
+                    return;
+                }
+            }
+            formed = self.step();
+        }
+    }
+
+    /// Applies one message of the inbox, as [`Scheduler::run`] does with each. A stopped scheduler
+    /// takes none.
+    ///
+    /// A reply whose receiver has gone is dropped: its sender stopped waiting for it.
+    pub fn apply(&mut self, message: Message) {
+        if self.stopped {
+            return;
+        }
+
+        match message {
+            Message::AddRequest(input) => self.add_request(input),
+            Message::Cancel(id, reason) => self.cancel(id, reason),
+            Message::Acknowledge(id, tokens) => self.acknowledge(id, tokens),
+            Message::Consumed(id, events) => self.consumed(id, events),
+            // The requests of each completed batch advance.
+            Message::Output(batch, output) => self.update(batch, output),
+            // The executor's stamped requests join the step's requests, behind those held.
+            Message::Submit(requests) => self.stamped(requests),
+            Message::Failed(error) => self.fail(error),
+            Message::Pause(reply) => {
+                self.paused = true;
+                self.boundary.push(reply);
+            }
+            Message::Resume => {
+                self.paused = false;
+                self.draining = None;
+            }
+            Message::Drain(cause, deadline, shrink, reply) => {
+                self.drain(cause, deadline, shrink, reply);
+            }
+            Message::SetPolicy(module, parameters, reply) => {
+                let _ = reply.send(self.set_policy(module, parameters));
+            }
+            Message::RollbackPolicy(reply) => {
+                let snapshot = self.snapshot();
+                let _ = reply.send(self.policy.rollback(snapshot));
+            }
+            Message::CommitPolicy => self.policy.previous = None,
+            Message::Flush(seeds, in_flight, reply) => {
+                self.flush(seeds, in_flight);
+                let _ = reply.send(Ok(()));
+            }
+            Message::Resize(region, units, reply) => {
+                self.submit(runtime::Request::Resize { region, units });
+                self.resizing.push((region, reply));
+            }
+            Message::Configure(config, reply) => {
+                let _ = reply.send(self.configure(config));
+            }
+            Message::Shutdown => self.shutdown(),
+        }
+    }
+
+    /// One step after the messages, which waits for nothing:
+    ///
+    /// 1. every completion the buffer pool wrote is applied as it is read, the capacity words of
+    ///    every region are read (SD §4.1), and every copy past its bound is given up (§4.4);
+    /// 2. unless the scheduler is paused, `schedule` assembles the batches that fit now, and each
+    ///    is handed to its group's executor;
+    /// 3. the eviction order of each region whose head changed is installed, and the step's
+    ///    requests are written into the submission queue as far as it and the completion queue
+    ///    have room;
+    /// 4. a drain's deadline ends what it ends, `Pause` and `Drain` are answered once due
+    ///    ([`Scheduler::reply_at_boundary`]), and the statistics leave once a second has passed.
+    ///
+    /// True when it formed a batch. A stopped scheduler takes no step.
+    pub fn step(&mut self) -> bool {
+        if self.stopped {
+            return false;
+        }
+
+        loop {
+            let (id, owner, request, completion) = match self.next_completion() {
+                Ok(Some(entry)) => entry,
+                Ok(None) => break,
+                Err(error) => {
+                    self.fail(error);
+                    return false;
+                }
+            };
+            self.answered(id, owner, request, completion);
+            if self.stopped {
+                return false;
+            }
+        }
+        self.read_capacity();
+        let now = Instant::now();
+        self.give_up_late_copies(now);
+        // A prefill whose decode groups were all full when it finished transfers once one has
+        // room.
+        self.start_transfers();
+
+        let batches = if self.paused {
+            Vec::new()
+        } else {
+            self.step += 1;
+            self.schedule()
+        };
+        if self.stopped {
+            return false;
+        }
+        let formed = !batches.is_empty();
+        for batch in batches {
+            if let Some(group) = self.group_index(batch.group) {
+                self.groups[group].in_flight += 1;
+            }
+            self.count_submitted(&batch, now);
+            self.executor.submit(batch);
+        }
+
+        self.install_victims();
+        if let Err(error) = self.post() {
+            self.fail(error);
+            return false;
+        }
+        self.drain_due(now);
+        self.reply_at_boundary();
+        self.publish_stats(now);
+        formed
+    }
+
+    /// Until when the loop may block on its inbox after a step that formed no batch: the next
+    /// statistics second; the moment the first running request passes its starvation bound (the
+    /// policy's `timeout` from its last progress), at least [`STARVATION_WAKE`] away; a drain's
+    /// deadline still ahead; and one polling period from now while [`Scheduler::polls`].
+    fn next_deadline(&self) -> Instant {
+        let now = Instant::now();
+        let mut deadline = self.stats_due();
+
+        // A request waiting for the buffer pool's transfer is exempt from the bound.
+        let timeout = Duration::from_nanos(self.policy.limits.timeout.0);
+        let starves = self
+            .running
+            .iter()
+            .filter_map(|id| self.requests.get(id))
+            .filter(|request| request.status == RequestStatus::Running)
+            .filter_map(|request| request.last_progress.checked_add(timeout))
+            .min();
+        if let Some(starves) = starves {
+            deadline = deadline.min(starves.max(now + STARVATION_WAKE));
+        }
+
+        // A deadline already passed was met by the step that just ran.
+        if let Some((_, _, due, _)) = &self.draining
+            && *due > now
+        {
+            deadline = deadline.min(*due);
+        }
+
+        if self.polls() {
+            deadline = deadline.min(now + self.config.poll_period);
+        }
+        deadline
+    }
+
+    /// Whether the loop polls the queue pair (BP §9, poll mode): something changes there without
+    /// a message to wake the loop. That is the case while the buffer pool owes answers to
+    /// requests written, while requests wait for room in the submission queue, and, unless the
+    /// scheduler is paused, while a request may wait for units of a region: one in the waiting
+    /// queue, whose admission waits for `available`, or a running request with no call in flight,
+    /// which may wait for the units its next call needs.
+    fn polls(&self) -> bool {
+        let units = !self.paused
+            && (!self.waiting.is_empty()
+                || self
+                    .running
+                    .iter()
+                    .filter_map(|id| self.requests.get(id))
+                    .any(Request::idle));
+        !self.outstanding.is_empty() || !self.held.is_empty() || units
+    }
+
+    /// Answers `Pause` once the scheduler is paused and no group has a batch in flight, and a
+    /// drain once no request remains (SD §3.8): with `shrink`, also once no `Detach` and no
+    /// `Resize` of the scheduler is held, being stamped or outstanding, and every device region
+    /// answered a `Resize` submitted after the last `Detach` was answered, so that the capacity
+    /// words read with that answer show what the `Detach` gave back (the shrink submits one
+    /// whenever a region has none outstanding and something to give, `drain.rs`).
+    ///
+    /// A drained scheduler then forms no batch until `Resume`, as if paused: it admits nothing,
+    /// as the drain stated, and has nothing else to run.
+    fn reply_at_boundary(&mut self) {
+        let idle = self.groups.iter().all(|group| group.in_flight == 0);
+        if self.paused && idle {
+            for reply in self.boundary.drain(..) {
+                let _ = reply.send(());
+            }
+        }
+
+        let Some((_, _, _, shrink)) = &self.draining else {
+            return;
+        };
+        let given_back = !*shrink || (!self.giving_back() && !self.detached.contains(&true));
+        if self.requests.is_empty()
+            && given_back
+            && let Some((reply, ..)) = self.draining.take()
+        {
+            self.paused = true;
+            let _ = reply.send(());
+        }
+    }
+
+    /// Whether a `Detach` or a `Resize` of this scheduler is still to be taken or answered: held,
+    /// being stamped, waiting behind a request being stamped, or outstanding.
+    fn giving_back(&self) -> bool {
+        let pending = |request: &runtime::Request| {
+            matches!(
+                request,
+                runtime::Request::Detach { .. } | runtime::Request::Resize { .. }
+            )
+        };
+        let stamping = self
+            .stamping
+            .values()
+            .any(|(request, _, following)| pending(request) || following.iter().any(pending));
+        stamping
+            || self.held.iter().any(pending)
+            || self
+                .outstanding
+                .values()
+                .any(|(_, request)| pending(request))
+    }
+
+    /// `Flush` (SD §2.4, gap G13 of the work breakdown): the requests the scheduler holds continue
+    /// as `in_flight` says, then every cached block the scheduler knows of is evicted, and with a
+    /// weight update's `seeds` the cache groups' page seeds and the latent seed are replaced.
+    ///
+    /// The requests are dealt with first, under the seeds their state was computed with:
+    ///
+    /// - `Keep`: every request continues with what it holds. Under a weight update its state
+    ///   follows neither the old weights nor the new ones, so a token request commits nothing
+    ///   from here on, and keeps the seeds its keys were rooted at unless it states its own.
+    /// - `Recompute`: every request that holds blocks, admitted or being admitted, ends as
+    ///   `Migratable { Drain }`, and the daemon resubmits it to be computed again; a video request
+    ///   whose denoising is fully scheduled runs to its end. A request still queued waits.
+    /// - `Abort`: every request ends, aborted.
+    ///
+    /// `Evict` names every key of `cache`, as many per request as a record holds; the buffer pool
+    /// evicts those that no request pins, and `cache` keeps the keys its `Evicted` does not list.
+    fn flush(&mut self, seeds: Option<(Vec<Key>, u64)>, in_flight: WeightsInFlight) {
+        let ids: Vec<RequestId> = self.requests.keys().copied().collect();
+        match in_flight {
+            WeightsInFlight::Keep => {
+                if seeds.is_some() {
+                    self.keep_lineage();
+                }
+            }
+            WeightsInFlight::Recompute => {
+                for id in ids {
+                    let Some(request) = self.requests.get(&id) else {
+                        continue;
+                    };
+                    let holds = matches!(
+                        request.status,
+                        RequestStatus::Running | RequestStatus::WaitingForRemoteKvs
+                    );
+                    if holds && !request.runs_to_end(&self.groups) {
+                        self.finish(id, update::migratable(MigrationCause::Drain));
+                    }
+                }
+            }
+            WeightsInFlight::Abort => {
+                for id in ids {
+                    self.cancel(id, FinishReason::Aborted);
+                }
+            }
+        }
+
+        let fits = self.queue.max_record().saturating_sub(EVICT_RECORD) / size_of::<Key>();
+        let keys: Vec<Key> = self.cache.values().map(|row| row.key).collect();
+        for keys in keys.chunks(fits.max(1)) {
+            self.submit(runtime::Request::Evict {
+                keys: keys.to_vec(),
+            });
+        }
+
+        if let Some((pages, latent)) = seeds {
+            self.seeds = pages;
+            self.latent_seed = latent;
+        }
+    }
+
+    /// Under a weight update that keeps the requests in flight: each token request commits no
+    /// block from here on, and its keys stay rooted at the seeds before the update when it states
+    /// none of its own (`S/cache_storage.rs:288-326`).
+    fn keep_lineage(&mut self) {
+        let groups = self
+            .groups
+            .iter()
+            .map(|group| group.capacity.cache_groups.len())
+            .max()
+            .unwrap_or(0);
+        let seeds: Vec<[u8; 32]> = if self.seeds.is_empty() {
+            vec![[0; 32]; groups]
+        } else {
+            self.seeds.iter().map(|seed| seed.0).collect()
+        };
+
+        for request in self.requests.values_mut() {
+            if let proto::request::Request::Generation(input) = &mut request.input {
+                if input.cache.state_seeds.is_empty() {
+                    input.cache.state_seeds.clone_from(&seeds);
+                }
+                input.cache.write = false;
+            }
+        }
+    }
+
+    /// `Configure` (SD §2.4): `config`'s limits serve from the next step on, but the epoch's own,
+    /// which the executors were started for: its drafts per verification and the graph sizes they
+    /// captured. The policy's limits, which budget a step, change with the policy (`SetPolicy`).
+    ///
+    /// # Errors
+    ///
+    /// [`Error::InvalidRequest`] naming the first limit above what the executors hold: running
+    /// requests beyond their slots, a step's tokens beyond the widest prefill bucket, its calls
+    /// beyond the largest bucket's rows (`S/run.rs:287-347`). The limits are then unchanged.
+    fn configure(&mut self, config: SchedulerConfig) -> Result<(), Error> {
+        let ceilings = ceilings(self.groups.iter().map(|group| &group.capacity));
+        let held = |value: Option<u32>| value.map_or(usize::MAX, |value| value as usize);
+        let limits = [
+            (
+                "max_running_requests",
+                config.max_running_requests,
+                held(slots(&self.groups)),
+            ),
+            (
+                "max_num_batched_tokens",
+                config.max_num_batched_tokens,
+                held(Some(ceilings.max_num_batched_tokens)),
+            ),
+            ("max_batch", config.max_batch.get(), ceilings.max_batch),
+        ];
+        if let Some((name, value, held)) = limits.into_iter().find(|&(_, value, held)| value > held)
+        {
+            return Err(Error::InvalidRequest(format!(
+                "scheduler_config.{name} = {value} exceeds the {held} the executors were started \
+                 for; an epoch change starts executors for it"
+            )));
+        }
+
+        self.config = SchedulerConfig {
+            max_num_batched_tokens: config.max_num_batched_tokens.max(1),
+            max_running_requests: config.max_running_requests.max(1),
+            draft_tokens: self.config.draft_tokens,
+            graph_tiers: std::mem::take(&mut self.config.graph_tiers),
+            ..config
+        };
+        Ok(())
+    }
+
+    /// Stops the scheduler on a fault it cannot recover from (SD §3.7). Every request whose
+    /// terminal has not been sent leaves as `Migratable { Loss }`, which the daemon resubmits; a
+    /// `Finished` held for the daemon's decoder is sent as it is, since that generation ended.
+    /// Each request gives up what it holds as far as the executors still take it.
+    /// `Output::Failed` tells the engine, and the loop ends. A failed executor cannot stamp its
+    /// group's `Detach`: the buffer pool detaches the epoch's owners when its session closes
+    /// (BP §12.4). Called once; later faults are dropped.
+    pub(super) fn fail(&mut self, error: Error) {
+        if self.stopped {
+            return;
+        }
+        self.stopped = true;
+
+        let ids: Vec<RequestId> = self.requests.keys().copied().collect();
+        for id in ids {
+            let Some(request) = self.requests.get_mut(&id) else {
+                continue;
+            };
+            let held = request.terminal.take();
+            let sent = request.status == RequestStatus::Finished && held.is_none();
+            request.status = RequestStatus::Finished;
+
+            match held {
+                Some(finished @ Event::Finished { .. }) => self.send(id, finished),
+                _ if !sent => self.send(id, update::migratable(MigrationCause::Loss)),
+                _ => {}
+            }
+            self.free(id);
+        }
+
+        // An engine that no longer listens has stopped this scheduler's epoch already.
+        let _ = self.output.send(Output::Failed(error));
+    }
+
+    /// `Shutdown`: every request the scheduler holds ends, aborted, at once, and the scheduler
+    /// stops (`S/control.rs:73-102`). A terminal still held, behind calls in flight or the
+    /// daemon's decoder, is sent now: nothing more runs.
+    fn shutdown(&mut self) {
+        let ids: Vec<RequestId> = self.requests.keys().copied().collect();
+        for id in ids {
+            self.cancel(id, FinishReason::Aborted);
+            if let Some(terminal) = self
+                .requests
+                .get_mut(&id)
+                .and_then(|request| request.terminal.take())
+            {
+                self.send(id, terminal);
+            }
+        }
+        self.stopped = true;
     }
 }
 
 /// The scheduler's end of its queue pair (SD §3.1, §3.5 `answered`, §4.1).
-#[expect(
-    dead_code,
-    reason = "the step loop, admission and update that call these are not in the crate yet"
-)]
 impl Scheduler {
     /// Takes a request for the buffer pool; a later [`Scheduler::post`] writes it into the
     /// submission queue. Nothing here touches the queue pair or waits.
@@ -617,7 +1227,8 @@ impl Scheduler {
     /// Takes the requests an executor returns ([`Message::Submit`]). A request handed for stamps
     /// gathers the stamp each returned copy carries, and once every group has returned it, it is
     /// held, followed by the requests that waited behind it. A request no executor was handed
-    /// for stamps (the `Finish` of a copy an executor ran) is held as it is.
+    /// for stamps (the `Finish` of a copy an executor ran) is held as it is, and its copy leaves
+    /// `copies`.
     fn stamped(&mut self, requests: Vec<runtime::Request>) {
         for mut request in requests {
             let stamps = stamps_of(&mut request)
@@ -641,7 +1252,11 @@ impl Scheduler {
                 .map(|(key, _)| *key)
                 .min();
 
+            // The `Finish` of a copy the executor ran: the executor holds the copy no more.
             let Some(key) = key else {
+                if let runtime::Request::Finish { copy, .. } = &request {
+                    self.copies.remove(&copy.0);
+                }
                 if let Some(after) = stamps_of(&mut request) {
                     *after = stamps;
                 }
@@ -717,11 +1332,13 @@ impl Scheduler {
     /// `Copy`), which leaves `outstanding` with it.
     ///
     /// A completion is dropped, and the next one read, when the owner its request acts for has
-    /// left `owners` (what it gave goes with that owner's `Detach`), and a completion that gives
-    /// entries when a `Release`, a `Commit` or a `Transfer` naming them was handed to the
-    /// executors after its request was submitted (BP §9, obligation 1). A dropped `Copy` is given
-    /// up at once with `Finish { ok: false }` through its group's executor. A `Refused` with the
-    /// cause `copy` answers a `Finish` for a copy another `Finish` ended, and is dropped.
+    /// left `owners` (what it gave goes with that owner's `Detach`), but a `Committed`, whose
+    /// block a `Detach` does not take back (BP §9, R6) and which the write policy may store; and
+    /// a completion that gives entries when a `Release`, a `Commit` or a `Transfer` naming them
+    /// was handed to the executors after its request was submitted (BP §9, obligation 1). A
+    /// dropped `Copy` is given up at once with `Finish { ok: false }` through its group's
+    /// executor; any other enters `copies` until it ends. A `Refused` with the cause `copy`
+    /// answers a `Finish` for a copy another `Finish` ended, and is dropped.
     ///
     /// Before it is returned, a completion that gives entries is handed to `Executor::map`: to the
     /// group an `Attach` or a `Transfer` names, to a copy's group, and otherwise to the owner's
@@ -763,6 +1380,12 @@ impl Scheduler {
             })?;
             // What it states of the cache holds whether or not the completion is dropped.
             self.learn(&mut request, &completion);
+            // The capacity words read with a `Detach`'s answer may not show what it gave back.
+            if let runtime::Request::Detach { .. } = request {
+                for (region, _) in self.device_regions() {
+                    self.detached[region] = true;
+                }
+            }
 
             if let runtime::Request::Finish { copy, .. } = request {
                 if let Some((owner, copied)) = self.matched_finish(id, copy, request, &completion) {
@@ -797,14 +1420,13 @@ impl Scheduler {
                 | Completion::Transferred { .. }
                 | Completion::Copy { .. }
         );
-        if self.forgotten(owner) || (gives && self.superseded(id.0, owner, request)) {
+        // A commit outlives its owner's `Detach` (BP §9, R6): its block is shared under its key
+        // all the same, and the write policy may store it.
+        let outlives = matches!(completion, Completion::Committed);
+        if (self.forgotten(owner) && !outlives) || (gives && self.superseded(id.0, owner, request))
+        {
             if let Completion::Copy { group, .. } = completion {
-                let give_up = runtime::Request::Finish {
-                    copy: id,
-                    ok: false,
-                    after: Vec::new(),
-                };
-                self.hand(give_up, vec![*group]);
+                self.give_up_copy(id, *group);
             }
             return false;
         }
@@ -813,7 +1435,61 @@ impl Scheduler {
             self.executor
                 .map(group, slot, id, request.clone(), completion.clone());
         }
+        if let Completion::Copy { group, keys, .. } = completion {
+            let tokens = self.copy_tokens(request, keys, *group);
+            let bound = Instant::now() + memory::prefetch_wait(tokens);
+            self.copies.insert(id.0, (*group, bound));
+        }
         true
+    }
+
+    /// Gives up the copy that answered request `copy` with `Finish { copy, ok: false }`, stamped
+    /// by its group's executor, which drops it if it has not started (SD §3.1, §4.4). The
+    /// destination is released only once the copy has ended; the answer to the `Finish` is the
+    /// copy's result.
+    fn give_up_copy(&mut self, copy: runtime::RequestId, group: GroupId) {
+        self.copies.remove(&copy.0);
+        let give_up = runtime::Request::Finish {
+            copy,
+            ok: false,
+            after: Vec::new(),
+        };
+        self.hand(give_up, vec![group]);
+    }
+
+    /// Gives up every copy that has not finished by its bound (SD §4.4 "The bound of a copy"):
+    /// the request then computes those tokens, starts from noise, or leaves with no stored step.
+    fn give_up_late_copies(&mut self, now: Instant) {
+        let late: Vec<(u64, GroupId)> = self
+            .copies
+            .iter()
+            .filter(|(_, (_, bound))| *bound <= now)
+            .map(|(&copy, &(group, _))| (copy, group))
+            .collect();
+        for (copy, group) in late {
+            self.give_up_copy(runtime::RequestId(copy), group);
+        }
+    }
+
+    /// The tokens a copy of `request` that covers `keys` moves, by which its bound is set (SD
+    /// §4.4): a block's tokens for each key of a cache group's class, as `group` states the class
+    /// (class `c` is cache group `c`); none for a trajectory, a product or an encoder output.
+    fn copy_tokens(&self, request: &runtime::Request, keys: &[Key], group: GroupId) -> u32 {
+        let Some(shapes) = self.group(group).map(|group| &group.capacity.cache_groups) else {
+            return 0;
+        };
+        let class_of = |key: &Key| match request {
+            runtime::Request::Load { class, .. } | runtime::Request::Clone { class, .. } => {
+                Some(*class)
+            }
+            runtime::Request::Store { .. } => self.cache.get(&Cached::id(key)).map(|row| row.class),
+            _ => None,
+        };
+        keys.iter()
+            .filter_map(class_of)
+            .filter_map(|class| shapes.get(usize::from(class)))
+            .map(|&(_, block)| block)
+            .fold(0, u32::saturating_add)
     }
 
     /// Matches the answer to the `Finish` numbered `id` of the copy `copy`, as
@@ -1083,20 +1759,23 @@ impl Scheduler {
         else {
             return Vec::new();
         };
-        let Some(group) = self
-            .request_of(owner)
-            .and_then(|row| row.attachment(owner))
-            .and_then(|(group, _)| self.group(group))
-        else {
+        let Some(regions) = self.class_regions(owner, class) else {
             return Vec::new();
         };
 
         let each = self.block_units(class, units).unwrap_or(0);
-        group
-            .regions(class)
-            .iter()
-            .map(|&region| (usize::from(region), count.saturating_mul(each)))
+        regions
+            .into_iter()
+            .map(|region| (region, count.saturating_mul(each)))
             .collect()
+    }
+
+    /// The regions, as indices, owner `owner`'s blocks of `class` are taken from: those of the
+    /// class in the group of the owner's attachment. `None` when the owner is unknown.
+    fn class_regions(&self, owner: OwnerId, class: u8) -> Option<Vec<usize>> {
+        let (group, _) = self.request_of(owner)?.attachment(owner)?;
+        let regions = self.group(group)?.regions(class);
+        Some(regions.iter().map(|&region| usize::from(region)).collect())
     }
 
     /// The units of one block of `class`: the class's block size, or `units` for a sized class.
@@ -1107,11 +1786,7 @@ impl Scheduler {
 
     /// The runs one block of `class` has in the group of `owner`, and its units.
     fn block_shape(&self, owner: OwnerId, class: u8, units: u32) -> Option<(usize, usize)> {
-        let group = self
-            .request_of(owner)
-            .and_then(|row| row.attachment(owner))
-            .and_then(|(group, _)| self.group(group))?;
-        let runs = group.regions(class).len().max(1);
+        let runs = self.class_regions(owner, class)?.len().max(1);
         let units = usize::try_from(self.block_units(class, units)?).ok()?;
         Some((runs, units.max(1)))
     }
@@ -1246,6 +1921,56 @@ impl Scheduler {
             entries = entries.saturating_add(runs.saturating_mul(blocks.asked as usize));
         }
         Some(entries)
+    }
+}
+
+/// The scheduler's one reading of the host's clocks, taken once per process, from which every
+/// instant is placed: an `Instant`, the host's monotonic clock in nanoseconds at that instant,
+/// and the wall clock in seconds since the Unix epoch. An instant maps to the same value however
+/// the wall clock moves after.
+fn clocks() -> (Instant, u64, f64) {
+    static ORIGIN: OnceLock<(Instant, u64, f64)> = OnceLock::new();
+    *ORIGIN.get_or_init(|| {
+        let mut now = libc::timespec {
+            tv_sec: 0,
+            tv_nsec: 0,
+        };
+        // SAFETY: `now` is a valid, writable `timespec` for the duration of the call, and
+        // `CLOCK_MONOTONIC` is a clock every Linux host has.
+        unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut now) };
+        let seconds = u64::try_from(now.tv_sec).unwrap_or(0);
+        let nanos = u64::try_from(now.tv_nsec).unwrap_or(0);
+        let wall = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs_f64();
+        let monotonic = seconds.saturating_mul(1_000_000_000).saturating_add(nanos);
+        (Instant::now(), monotonic, wall)
+    })
+}
+
+/// Nanoseconds of the host's monotonic clock at `at`: the clock of `Cached::last_used`, of every
+/// instant the policy is told (the guest's `Nanos`), and of a `Prefetch`'s deadline, which the
+/// buffer pool compares with its own reading of the clock in its own process
+/// (`storage::runtime::Request::Prefetch`).
+pub(super) fn monotonic_nanos(at: Instant) -> u64 {
+    let (origin, monotonic, _) = clocks();
+    let nanos = |span: Duration| u64::try_from(span.as_nanos()).unwrap_or(u64::MAX);
+    if at >= origin {
+        monotonic.saturating_add(nanos(at - origin))
+    } else {
+        monotonic.saturating_sub(nanos(origin - at))
+    }
+}
+
+/// The wall-clock time, in seconds since the Unix epoch, of the instant `at` (SD §7.2 "Timestamps
+/// of `Scheduled`", `S/clock.rs:39`).
+pub(super) fn unix_secs(at: Instant) -> f64 {
+    let (origin, _, wall) = clocks();
+    if at >= origin {
+        wall + (at - origin).as_secs_f64()
+    } else {
+        wall - (origin - at).as_secs_f64()
     }
 }
 

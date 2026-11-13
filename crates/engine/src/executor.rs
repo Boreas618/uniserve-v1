@@ -9,13 +9,16 @@
 //!
 //! - a batch's output arrives exactly once, as `Message::Output`: the runner's output, or the
 //!   error of a batch the executors refused or failed;
-//! - the `Finish` of each copy that ran with a batch arrives after the batch's output, as one
-//!   `Message::Submit`, each `Finish` stamped by the group with that batch;
+//! - the `Finish` of each copy that ran with a batch arrives just before the batch's output, as
+//!   one `Message::Submit`, each `Finish` stamped by the group with that batch. A batch that
+//!   failed after copies had started with it carries a `Finish { ok: false }` for each
+//!   (`worker::Error::finished`), sent the same way, so the scheduler learns that those copies
+//!   ended instead of giving them up at its bound;
 //! - the requests of a stamp arrive as one `Message::Submit` once every rank of the group has
 //!   applied them to its device block tables, each with the group's stamp;
 //! - a map sends nothing. A map or a stamp that fails leaves the group's device block tables
-//!   without what the scheduler counts on, which is the scheduler's defect: every batch of the
-//!   group handed after it arrives as that failure, and the scheduler fails (SD §3.7).
+//!   without what the scheduler counts on: its failure arrives as `Message::Failed`, in its place
+//!   among the group's messages, and the scheduler fails at once (SD §3.7).
 //!
 //! ## Threads and state
 //!
@@ -25,8 +28,7 @@
 //! until it completes. The executors complete a group's jobs in that order, so a waiter never
 //! waits behind a job that ended after a later one, and since it is the only thread that sends
 //! its group's messages, they arrive in the order the group's jobs were done. Nothing runs on an
-//! executor's thread: a waker would run there, and may only signal. A waiter owns the failure of
-//! its group's first failed map or stamp.
+//! executor's thread: a waker would run there, and may only signal.
 //!
 //! [`Groups`] owns the waiters: dropping it closes their channels and joins them once the
 //! submissions they hold have completed. The node's executors are shared with the control thread
@@ -76,8 +78,8 @@ pub struct Groups {
     reason = "a batch travels by value once per batch, to its `Message::Output`"
 )]
 enum Wait {
-    /// A batch: its output goes to the scheduler as `Message::Output`, and the `Finish` of each
-    /// copy that ran with it as `Message::Submit`.
+    /// A batch: the `Finish` of each copy that ran with it goes to the scheduler as
+    /// `Message::Submit`, then its output as `Message::Output`.
     Batch(Batch, worker::Result<Submission>),
     /// A shadow batch of the pass numbered here: its outcome goes to the pass.
     Shadow(u64, worker::Result<Submission>),
@@ -240,49 +242,41 @@ impl Drop for Groups {
 
 /// The waiter of worker group `group`: waits for each of the group's submissions in the order
 /// they were handed and sends the scheduler what each returns ([`Wait`]), until its channel is
-/// closed and empty.
+/// closed and empty. A map or a stamp that failed is sent as `Message::Failed`, and the
+/// scheduler stops on it.
 fn wait(group: GroupId, waits: &Receiver<Wait>, inbox: &Sender<Message>, shadow: &Mutex<Shadow>) {
-    // The failure of the group's first map or stamp that failed: from then on its device block
-    // tables lack what the scheduler counts on, and every later batch's output is this failure.
-    let mut broken: Option<String> = None;
-
     // A scheduler that stopped reads nothing more: what it is sent then is dropped.
     for wait in waits {
         match wait {
             Wait::Batch(batch, submission) => {
+                // A failed batch's `Finish`es are those of the copies that had started with it.
                 let (output, finished) = match returned(submission) {
                     Ok((output, finished)) => (Ok(output), finished),
-                    Err(failure) => (Err(failure), Vec::new()),
-                };
-                let output = match &broken {
-                    Some(failure) => Err(failure.clone()),
-                    None => output,
+                    Err((failure, finished)) => (Err(failure), finished),
                 };
 
-                let _ = inbox.send(Message::Output(batch, output.map_err(Error::Executor)));
                 if !finished.is_empty() {
                     let _ = inbox.send(Message::Submit(finished));
                 }
+                let _ = inbox.send(Message::Output(batch, output.map_err(Error::Executor)));
             }
 
             Wait::Shadow(pass, submission) => {
-                let outcome = returned(submission).map(|_| ());
+                let outcome = returned(submission)
+                    .map(|_| ())
+                    .map_err(|(failure, _)| failure);
                 lock(shadow).ended(pass, outcome);
             }
 
             Wait::Map(id, submission) => {
-                if let Err(failure) = returned(submission) {
+                if let Err((failure, _)) = returned(submission) {
                     let failure = format!(
                         "the completion of request {} was not mapped into worker group {}'s \
                          device block tables: {failure}",
                         id.0, group.0
                     );
-                    tracing::error!(
-                        group = group.0,
-                        %failure,
-                        "a map failed; the group's next batch fails the scheduler"
-                    );
-                    broken.get_or_insert(failure);
+                    tracing::error!(group = group.0, %failure, "a map failed");
+                    let _ = inbox.send(Message::Failed(Error::Executor(failure)));
                 }
             }
 
@@ -290,17 +284,13 @@ fn wait(group: GroupId, waits: &Receiver<Wait>, inbox: &Sender<Message>, shadow:
                 Ok((_, stamped)) => {
                     let _ = inbox.send(Message::Submit(stamped));
                 }
-                Err(failure) => {
+                Err((failure, _)) => {
                     let failure = format!(
                         "worker group {} did not apply and stamp requests: {failure}",
                         group.0
                     );
-                    tracing::error!(
-                        group = group.0,
-                        %failure,
-                        "a stamp failed; the group's next batch fails the scheduler"
-                    );
-                    broken.get_or_insert(failure);
+                    tracing::error!(group = group.0, %failure, "a stamp failed");
+                    let _ = inbox.send(Message::Failed(Error::Executor(failure)));
                 }
             },
         }
@@ -308,16 +298,26 @@ fn wait(group: GroupId, waits: &Receiver<Wait>, inbox: &Sender<Message>, shadow:
 }
 
 /// What a submission returned once it completed: a batch's output and the requests the group's
-/// executors hand back for the submission queue, or the failure in words, the refusal of a job
-/// the executors did not take included.
+/// executors hand back for the submission queue; or the failure in words, the refusal of a job
+/// the executors did not take included, with the `Finish { ok: false }` of each copy that had
+/// started with a failed batch, which the group's executors applied and stamped
+/// (`worker::Error::finished`; none for any other failure).
 fn returned(
     submission: worker::Result<Submission>,
-) -> Result<(BatchOutput, Vec<runtime::Request>), String> {
+) -> Result<(BatchOutput, Vec<runtime::Request>), (String, Vec<runtime::Request>)> {
     match submission.map(|submission| submission.wait()) {
         Ok(Outcome::Success(returned)) => Ok(returned),
-        Ok(Outcome::Failed(fault)) => Err(fault.to_string()),
-        Ok(Outcome::Cancelled) => Err("the executors closed before they ran the job".to_owned()),
-        Err(refused) => Err(refused.to_string()),
+        Ok(Outcome::Failed(fault)) => {
+            let finished = fault
+                .downcast_ref::<worker::Error>()
+                .map_or_else(Vec::new, |error| error.finished().to_vec());
+            Err((fault.to_string(), finished))
+        }
+        Ok(Outcome::Cancelled) => Err((
+            "the executors closed before they ran the job".to_owned(),
+            Vec::new(),
+        )),
+        Err(refused) => Err((refused.to_string(), refused.finished().to_vec())),
     }
 }
 

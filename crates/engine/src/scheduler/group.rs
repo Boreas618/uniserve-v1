@@ -232,14 +232,6 @@ pub(super) fn encodes_on_host(decoder: &WorkerGroupConfig, encoder: &WorkerGroup
 /// muxer), so that the stages that follow the denoiser land beside it and the video encoder
 /// beside the decoder; it records each choice in `placement` and calls
 /// [`WorkerGroup::join`] once per group the request is newly placed on.
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "admission and the transfer to a decode group, which place requests, are not in \
-                  the crate yet"
-    )
-)]
 impl Scheduler {
     /// The groups that can run `phase` of `request`, in the order they are configured: those that
     /// serve it ([`WorkerGroup::serves`]) and that the request is placed on already or whose slot
@@ -255,7 +247,9 @@ impl Scheduler {
         self.groups
             .iter()
             .filter(|group| group.serves(phase))
-            .filter(|group| request.placement.contains(&Some(group.id())) || self.free(group) > 0)
+            .filter(|group| {
+                request.placement.contains(&Some(group.id())) || self.free_slots(group) > 0
+            })
             .filter(|group| {
                 decoder.is_none_or(|decoder| encodes_on_host(&decoder.config, &group.config))
             })
@@ -287,13 +281,13 @@ impl Scheduler {
         // `min_by_key` keeps the first of equal keys: the first configured.
         candidates.iter().copied().min_by_key(|id| {
             self.group(*id).map_or((u32::MAX, Reverse(0)), |group| {
-                (group.num_requests, Reverse(self.free(group)))
+                (group.num_requests, Reverse(self.free_slots(group)))
             })
         })
     }
 
     /// The free slots of `group`: the units its slot region has available, one per slot row.
-    fn free(&self, group: &WorkerGroup) -> u32 {
+    fn free_slots(&self, group: &WorkerGroup) -> u32 {
         self.available
             .get(usize::from(group.layout.slots))
             .copied()
@@ -498,6 +492,7 @@ mod tests {
             num_draft_tokens: 0,
             num_encoded_inputs: 0,
             encodings: Vec::new(),
+            unpinned: Vec::new(),
             num_acknowledged_tokens: 0,
             artifact: None,
             terminal: None,

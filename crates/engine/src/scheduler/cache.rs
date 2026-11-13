@@ -16,14 +16,14 @@
 
 use std::collections::HashSet;
 use std::num::NonZeroU32;
-use std::sync::OnceLock;
 use std::time::Instant;
 
+use proto::request::RequestId;
 use scheduling_guest::{EncodingId, EncodingView, Event, Nanos, PageId, PageView};
 use storage::Key;
 use storage::runtime::{self, Cause, Completion, GroupId, Tier};
 
-use super::Scheduler;
+use super::{Scheduler, monotonic_nanos};
 
 /// The tier bits of [`Cached::tiers`], as a `Listing` states them.
 pub(super) const DEVICE: u8 = 1;
@@ -58,7 +58,8 @@ pub struct Cached {
     pub groups: u8,
     /// Requests of this scheduler holding it.
     pub pins: u32,
-    /// Its last use on [`now_nanos`]'s clock: its rank in the eviction order.
+    /// Its last use, in nanoseconds of the host's monotonic clock (`monotonic_nanos`): its rank
+    /// in the eviction order.
     pub last_used: u64,
 }
 
@@ -93,28 +94,13 @@ impl Cached {
     }
 }
 
-/// Nanoseconds on the scheduler's monotonic clock since its first reading in the process: the
-/// clock of [`Cached::last_used`] and of every instant the policy is told (the guest's `Nanos`).
-pub(super) fn now_nanos() -> u64 {
-    static ORIGIN: OnceLock<Instant> = OnceLock::new();
-    let elapsed = ORIGIN.get_or_init(Instant::now).elapsed();
-    u64::try_from(elapsed.as_nanos()).unwrap_or(u64::MAX)
-}
-
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "the loop, admission, update and policy that call these are not in the crate yet"
-    )
-)]
 impl Scheduler {
     /// Applies what a completion of `request` states of the cache (SD §4.5). A request answered
     /// `Copy` is narrowed to the keys the copy covers, for which the answer to its `Finish`
     /// speaks: the leading keys of a `Load`, the copied keys of a `Store`.
     pub(super) fn learn(&mut self, request: &mut runtime::Request, completion: &Completion) {
         use runtime::Request as R;
-        let now = now_nanos();
+        let now = monotonic_nanos(Instant::now());
 
         // The keys a completion lists as evicted left the regions its request took blocks from.
         let (taken, evicted) = match (&*request, completion) {
@@ -231,7 +217,7 @@ impl Scheduler {
                     self.invalidate(key, bit(group));
                     let tiers = if at < host { HOST } else { 0 };
                     if at <= host {
-                        self.update(key, Some((*class, 0)), |row| {
+                        self.change_row(key, Some((*class, 0)), |row| {
                             row.tiers = row.tiers & !HOST | tiers
                         });
                     }
@@ -247,7 +233,7 @@ impl Scheduler {
                 Some(_),
             ) => {
                 for key in keys {
-                    self.update(key, None, |row| row.tiers |= HOST);
+                    self.change_row(key, None, |row| row.tiers |= HOST);
                 }
             }
             (
@@ -258,7 +244,7 @@ impl Scheduler {
                 None,
             ) => {
                 for key in keys {
-                    self.update(key, None, |row| row.tiers |= REMOTE);
+                    self.change_row(key, None, |row| row.tiers |= REMOTE);
                 }
             }
             (R::Prefetch { class, keys, .. }, Completion::Prefetched { found }, None) => {
@@ -266,7 +252,7 @@ impl Scheduler {
                     .iter()
                     .take(usize::try_from(*found).unwrap_or(usize::MAX))
                 {
-                    self.update(key, Some((*class, 0)), |row| row.tiers |= HOST);
+                    self.change_row(key, Some((*class, 0)), |row| row.tiers |= HOST);
                 }
             }
             (R::Evict { .. }, Completion::Evicted { keys }, None) => {
@@ -291,7 +277,7 @@ impl Scheduler {
                 },
                 None,
             ) => {
-                self.update(key, None, |row| row.tiers &= !HOST);
+                self.change_row(key, None, |row| row.tiers &= !HOST);
             }
             (
                 R::Load { keys, .. },
@@ -301,7 +287,7 @@ impl Scheduler {
                 None,
             ) => {
                 if let Some(key) = keys.first() {
-                    self.update(key, None, |row| row.tiers &= !HOST);
+                    self.change_row(key, None, |row| row.tiers &= !HOST);
                 }
             }
             _ => {}
@@ -310,7 +296,7 @@ impl Scheduler {
 
     /// `key`'s block is on the device in `groups`, held by `pins` more requests and used now.
     fn hold(&mut self, key: &Key, fresh: (u8, u16), groups: u8, pins: u32, now: u64) {
-        self.update(key, Some(fresh), |row| {
+        self.change_row(key, Some(fresh), |row| {
             row.tiers |= DEVICE;
             row.groups |= groups;
             row.pins = row.pins.saturating_add(pins);
@@ -330,10 +316,10 @@ impl Scheduler {
             .filter(|key| !listed.contains(&Cached::id(key)))
             .collect();
         for key in &gone {
-            self.update(key, None, |row| row.tiers = 0);
+            self.change_row(key, None, |row| row.tiers = 0);
         }
         for &(key, class, tokens, tiers, groups) in keys {
-            self.update(&key, Some((class, tokens)), |row| {
+            self.change_row(&key, Some((class, tokens)), |row| {
                 if row.tiers == 0 {
                     row.last_used = 0;
                 }
@@ -359,7 +345,7 @@ impl Scheduler {
             .get(region)
             .is_some_and(|(_, stated)| stated.tier == Tier::Host)
         {
-            self.update(key, None, |row| row.tiers &= !HOST);
+            self.change_row(key, None, |row| row.tiers &= !HOST);
             return;
         }
         let there = |group: &&super::WorkerGroup| {
@@ -378,7 +364,7 @@ impl Scheduler {
 
     /// `key`'s device copy is not valid in `groups`; it leaves the device once no group holds it.
     fn invalidate(&mut self, key: &Key, groups: u8) {
-        self.update(key, None, |row| {
+        self.change_row(key, None, |row| {
             row.groups &= !groups;
             if row.groups == 0 {
                 row.tiers &= !DEVICE;
@@ -386,15 +372,30 @@ impl Scheduler {
         });
     }
 
-    /// A request gave up the shared blocks of `keys`, in position order, by a `Release` or a
-    /// `Detach` handed to the executors: those it holds by `Pinned`, `Loaded` or a held
-    /// `Committed`, not those answered `Duplicate`. A block no request holds joins its orders as
-    /// just used, the deepest key first in line, so that the prefix before it stays cached
-    /// longest (vLLM's `free` frees a request's tail first).
-    pub(super) fn unpin(&mut self, keys: &[Key]) {
-        let now = now_nanos();
+    /// Request `id` gave up the read-only blocks of `keys`, in position order, by a `Release` or
+    /// a `Detach` handed to the executors: one fewer request holds each, but a key among its
+    /// `Request::unpinned`, whose block `cache` never counted it a holder of (answered
+    /// `Duplicate`, or an encoder output it computed and did not commit), which leaves that record
+    /// instead. A block no request holds joins its orders as just used, the deepest key first in
+    /// line, so that the prefix before it stays cached longest (vLLM's `free` frees a request's
+    /// tail first).
+    pub(super) fn unpin(&mut self, id: RequestId, keys: &[Key]) {
+        let mut keys = keys.to_vec();
+        if let Some(request) = self.requests.get_mut(&id) {
+            keys.retain(
+                |key| match request.unpinned.iter().position(|held| held == key) {
+                    Some(at) => {
+                        request.unpinned.swap_remove(at);
+                        false
+                    }
+                    None => true,
+                },
+            );
+        }
+
+        let now = monotonic_nanos(Instant::now());
         for (offset, key) in (0u64..).zip(keys.iter().rev()) {
-            self.update(key, None, |row| {
+            self.change_row(key, None, |row| {
                 row.pins = row.pins.saturating_sub(1);
                 row.last_used = now.saturating_add(offset);
             });
@@ -405,13 +406,18 @@ impl Scheduler {
     /// row left on no tier leaves `cache`. The orders follow the row, and the policy is told. A
     /// key unknown without `fresh`, or a second key under a known key's number (SD §4.5), is
     /// left alone.
-    fn update(&mut self, key: &Key, fresh: Option<(u8, u16)>, change: impl FnOnce(&mut Cached)) {
+    fn change_row(
+        &mut self,
+        key: &Key,
+        fresh: Option<(u8, u16)>,
+        change: impl FnOnce(&mut Cached),
+    ) {
         let id = Cached::id(key);
         let before = self.cache.get(&id).copied();
         let mut row = match (before, fresh) {
             (Some(row), _) if row.key == *key => row,
             (None, Some((class, tokens))) => {
-                let last_used = now_nanos();
+                let last_used = monotonic_nanos(Instant::now());
                 Cached {
                     key: *key,
                     class,
@@ -567,6 +573,19 @@ impl Scheduler {
         self.cache
             .get(&id)
             .is_some_and(|row| row.pins == 0 && row.tiers & DEVICE != 0)
+    }
+
+    /// A group whose memory holds `row`'s device copy, the first of the scheduler's groups that
+    /// does: the group a `Store` of the block to the host names, whose executor copies it (SD
+    /// §3.4, §4.4). `None` for a block with no device copy.
+    pub(super) fn holder(&self, row: &Cached) -> Option<GroupId> {
+        if row.tiers & DEVICE == 0 {
+            return None;
+        }
+        self.groups
+            .iter()
+            .map(super::WorkerGroup::id)
+            .find(|group| row.groups & bit(*group) != 0)
     }
 
     /// Every block of `cache` as a policy's snapshot states it (SD §5.2): a `PageView` per KV
@@ -766,8 +785,13 @@ mod tests {
     use storage::Key;
     use storage::runtime::{self, Cause, Completion, OwnerId, Source, Tier};
 
+    use proto::request::RequestId;
+
     use super::{Cached, DEVICE, HOST, REMOTE};
     use crate::scheduler::tests::{A, B, Bench, KV, OWNER_A, bench, key};
+
+    /// The request `Bench::attach` adds.
+    const ID: RequestId = RequestId(1);
 
     type Answer = (
         runtime::RequestId,
@@ -872,7 +896,7 @@ mod tests {
         assert!(written(&mut bench).is_empty());
 
         // Given up, it joins the order, whose head is installed once.
-        bench.scheduler.unpin(&[key(1)]);
+        bench.scheduler.unpin(ID, &[key(1)]);
         bench.scheduler.install_victims();
         assert_eq!(written(&mut bench), [victims(&[key(1)])]);
         bench.scheduler.install_victims();
@@ -894,7 +918,10 @@ mod tests {
         bench.scheduler.post().unwrap();
         let taken = bench.take();
         bench.complete(taken[0].0, &Completion::Committed);
-        assert!(bench.answers().is_empty(), "its owner is forgotten");
+        // Its owner is forgotten, but a commit outlives its owner's `Detach` (BP §9, R6): the
+        // answer is applied, for the write policy to store the block.
+        let answers = bench.answers();
+        assert!(matches!(answers[..], [(_, _, _, Completion::Committed)]));
         bench.scheduler.install_victims();
         assert_eq!(written(&mut bench), [victims(&[key(1), key(2)])]);
 
@@ -942,7 +969,7 @@ mod tests {
             host: 0,
         };
         exchange(&mut bench, pin, &pinned);
-        bench.scheduler.unpin(&[key(1)]);
+        bench.scheduler.unpin(ID, &[key(1)]);
         bench.scheduler.install_victims();
         assert_eq!(written(&mut bench), [victims(&[key(2), key(3)])]);
         bench.scheduler.read_capacity();
@@ -1122,7 +1149,7 @@ mod tests {
             !bench.scheduler.cache_unpinned(Cached::id(&key(1))),
             "loaded for the request"
         );
-        bench.scheduler.unpin(&lookup(2));
+        bench.scheduler.unpin(ID, &lookup(2));
         assert!(bench.scheduler.cache_unpinned(Cached::id(&key(1))));
 
         // The remote store's answer names the keys it stored; a prefetch brings the leading keys

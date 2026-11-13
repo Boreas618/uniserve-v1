@@ -305,7 +305,7 @@ fn a_stamped_request_returns_as_submit_with_the_last_batch_its_group_launched() 
 }
 
 #[test]
-fn a_copy_s_finish_arrives_after_the_output_of_the_batch_that_ran_it() {
+fn a_copy_s_finish_arrives_just_before_the_output_of_the_batch_that_ran_it() {
     let (groups, messages) = served(2);
 
     // A store of a device block to the host, which every rank runs.
@@ -328,12 +328,12 @@ fn a_copy_s_finish_arrives_after_the_output_of_the_batch_that_ran_it() {
 
     let sent = sent(groups, &messages);
     let [
-        Message::Output(first, Ok(_)),
         Message::Submit(finished),
+        Message::Output(first, Ok(_)),
         Message::Output(second, Ok(_)),
     ] = sent.as_slice()
     else {
-        panic!("the first batch's output, its copy's `Finish`, the second's output: {sent:?}");
+        panic!("the copy's `Finish`, the first batch's output, the second's output: {sent:?}");
     };
     assert_eq!((first.id, second.id), (BatchId(1), BatchId(2)));
 
@@ -347,7 +347,7 @@ fn a_copy_s_finish_arrives_after_the_output_of_the_batch_that_ran_it() {
 }
 
 #[test]
-fn a_failed_map_fails_every_later_batch_of_its_group() {
+fn a_failed_map_reaches_the_scheduler_as_failed_in_its_place_among_the_groups_jobs() {
     let (groups, messages) = served(2);
 
     // An `Attached` mapped under another slot than the one it states, which the tables refuse.
@@ -364,28 +364,23 @@ fn a_failed_map_fails_every_later_batch_of_its_group() {
         Completion::Attached { slot: 5 },
     );
     groups.submit(decode(2, 1));
-    groups.submit(decode(3, 1));
 
     let sent = sent(groups, &messages);
     let [
         Message::Output(before, Ok(_)),
-        Message::Output(after, Err(failure)),
-        Message::Output(later, Err(again)),
+        Message::Failed(failure),
+        Message::Output(after, _),
     ] = sent.as_slice()
     else {
-        panic!("the output of the batch before the map, then the map's failure twice: {sent:?}");
+        panic!("the batch before the map, the map's failure, the batch after it: {sent:?}");
     };
-    assert_eq!(
-        (before.id, after.id, later.id),
-        (BatchId(1), BatchId(2), BatchId(3))
-    );
+    assert_eq!((before.id, after.id), (BatchId(1), BatchId(2)));
 
     let failure = failure.to_string();
     assert!(
         failure.contains("request 7") && failure.contains("slot 5"),
         "{failure}"
     );
-    assert_eq!(again.to_string(), failure);
 }
 
 #[test]

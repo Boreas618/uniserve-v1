@@ -16,15 +16,6 @@
 //! once per batch in its one domain: the wait in the executor's queue, the device time, and the
 //! copy and host time.
 
-// The step loop and `update`, which call these, are not in the crate yet.
-#![cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "the step loop and update that count and publish are not in the crate yet"
-    )
-)]
-
 use std::time::{Duration, Instant};
 
 use ipc::batch::{Batch, BatchOutput, CallOutput, CallStatus, ErrorCode, Phase};

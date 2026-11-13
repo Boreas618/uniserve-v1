@@ -3,20 +3,30 @@
 //! The executors are a recording double of the [`Executor`] interface.
 
 use std::collections::BTreeMap;
+use std::num::NonZeroUsize;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
-use ipc::batch::Phase;
-use proto::config::{SchedulerConfig, WorkerGroupConfig};
+use crossbeam_channel::{Receiver, Sender};
+use ipc::CacheGroupKind;
+use ipc::batch::{Phase, Shape, Variant};
+use proto::config::{
+    BlockConfig, SchedulerConfig, VIDEO_CODEC_BLOCK, VIDEO_DECODER_BLOCK, WorkerGroupConfig,
+    WorkerRank,
+};
+use proto::request::wire::WeightsInFlight;
 use proto::request::{GenerationLimits, GenerationRequest};
 use scheduling_guest::limits::{Limits, Parameters};
 use scheduling_guest::view::Snapshot;
 use storage::runtime::{self, Class, Completion, GroupId, OwnerId, Region, Tier};
 use storage::{Key, QueuePair};
 
+use super::cache::DEVICE;
 use super::policy::tests::{packaged, toy};
-use super::{Blocks, Cached, Capacity, Executor, Policy, Request, RequestStatus, Scheduler};
+use super::{
+    Blocks, Cached, Capacity, Executor, Message, Output, Policy, Request, RequestStatus, Scheduler,
+};
 
 pub(super) const A: GroupId = GroupId(0);
 pub(super) const B: GroupId = GroupId(1);
@@ -76,9 +86,41 @@ pub(super) struct Bench {
     executors: Arc<Mutex<Recorded>>,
 }
 
+/// The bench of [`built`] over groups A and B, both as [`capacity`] states them, once the
+/// scheduler's startup `List` was answered with an empty `Listing`: each case starts with an
+/// empty cache and nothing outstanding.
+pub(super) fn bench(ring_bytes: usize) -> Bench {
+    let groups = configs().into_iter().map(|config| (config, capacity()));
+    let Ok(mut bench) = built(ring_bytes, SchedulerConfig::default(), groups.collect()) else {
+        panic!("the startup checks pass the bench's groups");
+    };
+
+    bench.scheduler.post().unwrap();
+    let taken = bench.take();
+    let [(list, runtime::Request::List)] = taken[..] else {
+        panic!("the scheduler starts with a `List`: {taken:?}");
+    };
+    bench.complete(list, &Completion::Listing { keys: Vec::new() });
+    assert_eq!(bench.answers().len(), 1);
+    bench
+}
+
+/// The configurations of groups A and B: one rank each, on one host.
+fn configs() -> Vec<WorkerGroupConfig> {
+    WorkerGroupConfig::data_parallel(&["localhost".to_owned()], "cpu", 2, 1, 2, BTreeMap::new())
+}
+
+/// A scheduler of `config` over the first `groups.len()` of groups A and B, each with its
+/// configuration and capacity, on its queue pair with rings of `ring_bytes`, and the buffer
+/// pool's end of that queue pair; or the constructor's refusal.
+///
 /// The session: regions numbered 4 to 7 (the KV regions of groups A and B, the product region
 /// both state, the slot rows), and the capacity words of region `n` at register `2 + 3 * (n - 4)`.
-pub(super) fn bench(ring_bytes: usize) -> Bench {
+fn built(
+    ring_bytes: usize,
+    config: SchedulerConfig,
+    groups: Vec<(WorkerGroupConfig, Capacity)>,
+) -> Result<Bench, super::Error> {
     let region = |name: &str, units| Region {
         name: name.to_owned(),
         tier: Tier::Device,
@@ -117,7 +159,7 @@ pub(super) fn bench(ring_bytes: usize) -> Bench {
         trajectory: PRODUCT,
         peers: Vec::new(),
         groups: vec![group(A, 0), group(B, 1)],
-        schedulers: vec![vec![A, B]],
+        schedulers: vec![[A, B][..groups.len()].to_vec()],
     };
     let opened = runtime::Opened {
         regions: vec![(4, 64), (5, 64), (6, 64), (7, 16)],
@@ -131,23 +173,10 @@ pub(super) fn bench(ring_bytes: usize) -> Bench {
     let pool = QueuePair::create(ring_bytes, 14).unwrap();
     let engine = QueuePair::open(pool.descriptor().try_clone_to_owned().unwrap(), true).unwrap();
 
-    let configs = WorkerGroupConfig::data_parallel(
-        &["localhost".to_owned()],
-        "cpu",
-        2,
-        1,
-        2,
-        BTreeMap::new(),
-    );
-    let groups = configs
-        .into_iter()
-        .map(|config| (config, capacity()))
-        .collect();
-
     let executors = Arc::new(Mutex::new(Recorded::default()));
     let (output, _) = crossbeam_channel::unbounded();
     let scheduler = Scheduler::new(
-        SchedulerConfig::default(),
+        config,
         GenerationLimits::default(),
         &layout,
         &opened,
@@ -158,14 +187,13 @@ pub(super) fn bench(ring_bytes: usize) -> Bench {
         Box::new(Recording(Arc::clone(&executors))),
         output,
         Arc::new(AtomicU64::new(0)),
-    )
-    .unwrap();
+    )?;
 
-    Bench {
+    Ok(Bench {
         scheduler,
         pool,
         executors,
-    }
+    })
 }
 
 pub(super) fn capacity() -> Capacity {
@@ -233,6 +261,7 @@ impl Bench {
             num_draft_tokens: 0,
             num_encoded_inputs: 0,
             encodings: Vec::new(),
+            unpinned: Vec::new(),
             num_acknowledged_tokens: 0,
             artifact: None,
             terminal: None,
@@ -813,6 +842,267 @@ fn the_snapshot_states_the_requests_the_cache_and_the_serving_groups() {
         .map(|phase| (phase.id.0, phase.kind))
         .collect();
     assert_eq!(phases, [(3, Phase::Prefill), (4, Phase::Decode)]);
+}
+
+/// The scheduler's first request is `List` (SD §4.5): what the `Listing` states it knows, and its
+/// next step installs those blocks, which no request holds, as the eviction order of their region.
+#[test]
+fn a_scheduler_starts_by_listing_its_sessions_cached_blocks_and_orders_them() {
+    let groups = configs().into_iter().map(|config| (config, capacity()));
+    let Ok(mut bench) = built(1024, SchedulerConfig::default(), groups.collect()) else {
+        panic!("the startup checks pass the bench's groups");
+    };
+
+    bench.scheduler.step();
+    let taken = bench.take();
+    let [(list, runtime::Request::List)] = taken[..] else {
+        panic!("the first request written is a `List`: {taken:?}");
+    };
+
+    // Two blocks of the KV class whose device copies lie in group A's memory (region 4).
+    let block = |byte| (key(byte), KV, 16, DEVICE, 1 << A.0);
+    let keys = vec![block(1), block(2)];
+    bench.complete(list, &Completion::Listing { keys });
+    bench.scheduler.step();
+
+    let requests: Vec<_> = bench
+        .take()
+        .into_iter()
+        .map(|(_, request)| request)
+        .collect();
+    let victims = runtime::Request::Victims {
+        region: 4,
+        keys: vec![key(1), key(2)],
+    };
+    assert_eq!(requests, [victims]);
+}
+
+/// The constructor refuses a deployment its executors cannot serve (SD §7.1): no group, a group
+/// of token sequences without a longest sequence, a KV cache with fewer slots than running
+/// requests, and a video decoder whose units no video encoder reads on the hosts that decoded
+/// them.
+#[test]
+fn the_startup_checks_refuse_a_deployment_its_executors_cannot_serve() {
+    let refusal = |groups| match built(1024, SchedulerConfig::default(), groups) {
+        Err(super::Error::InvalidRequest(message)) => message,
+        Err(other) => panic!("refused for another cause: {other}"),
+        Ok(_) => panic!("the deployment passed the startup checks"),
+    };
+    let serving = |phase: Phase| Capacity {
+        phases: 1 << phase.index(),
+        ..capacity()
+    };
+    let [a, b] = <[WorkerGroupConfig; 2]>::try_from(configs()).unwrap();
+
+    assert!(refusal(Vec::new()).contains("no worker group"));
+
+    let unbounded = Capacity {
+        max_model_len: 0,
+        ..serving(Phase::Prefill)
+    };
+    assert!(refusal(vec![(a.clone(), unbounded)]).contains("longest sequence"));
+
+    // Two groups of 16 slots for the 128 running requests of the default limits.
+    let cached = Capacity {
+        cache_groups: vec![(CacheGroupKind::Full, 16)],
+        ..serving(Phase::Prefill)
+    };
+    let groups = vec![(a.clone(), cached.clone()), (b.clone(), cached)];
+    assert!(refusal(groups).contains("hold 32 request slots"));
+
+    // Group A decodes one unit per round on its one rank, which lies on `localhost`; group B's
+    // codec encodes it on its one rank, on `elsewhere` and then on `localhost`.
+    let with = |mut config: WorkerGroupConfig, block: &str, host: &str| {
+        config
+            .blocks
+            .insert(block.to_owned(), BlockConfig::parallel(vec![0]));
+        config.ranks = vec![WorkerRank {
+            host: host.to_owned(),
+            device: "cpu".to_owned(),
+        }];
+        config
+    };
+    let decoder = (
+        with(a, VIDEO_DECODER_BLOCK, "localhost"),
+        serving(Phase::VideoDecode),
+    );
+    let encoder = |host| {
+        (
+            with(b.clone(), VIDEO_CODEC_BLOCK, host),
+            serving(Phase::VideoEncode),
+        )
+    };
+    let crossing = vec![decoder.clone(), encoder("elsewhere")];
+    assert!(refusal(crossing).contains("decodes video units"));
+    let beside = vec![decoder, encoder("localhost")];
+    assert!(built(1024, SchedulerConfig::default(), beside).is_ok());
+}
+
+/// `Configure` refuses a limit above what the executors hold, naming it: running requests beyond
+/// the slots of the groups that serve a phase together, a step's tokens beyond the widest prefill
+/// bucket, its calls beyond the largest bucket's rows (SD §7.1). Limits within them are taken.
+#[test]
+fn configure_refuses_a_limit_above_what_the_executors_hold() {
+    // Both groups prefill over 16 slots each and captured one bucket of 8 rows and 512 tokens.
+    let prefills = Capacity {
+        phases: 1 << Phase::Prefill.index(),
+        buckets: vec![Shape::prefill(8, 512, Variant::PrefillWrite)],
+        ..capacity()
+    };
+    let groups = configs()
+        .into_iter()
+        .map(|config| (config, prefills.clone()));
+    let Ok(mut bench) = built(1024, SchedulerConfig::default(), groups.collect()) else {
+        panic!("the startup checks pass both groups");
+    };
+    let mut configure = |config| {
+        let (reply, replied) = crossbeam_channel::bounded(1);
+        bench.scheduler.apply(Message::Configure(config, reply));
+        replied.try_recv().unwrap()
+    };
+
+    let within = SchedulerConfig {
+        max_running_requests: 32,
+        max_num_batched_tokens: 512,
+        max_batch: NonZeroUsize::new(8).unwrap(),
+        ..SchedulerConfig::default()
+    };
+    let beyond = [
+        (
+            "max_running_requests",
+            SchedulerConfig {
+                max_running_requests: 33,
+                ..within.clone()
+            },
+        ),
+        (
+            "max_num_batched_tokens",
+            SchedulerConfig {
+                max_num_batched_tokens: 513,
+                ..within.clone()
+            },
+        ),
+        (
+            "max_batch",
+            SchedulerConfig {
+                max_batch: NonZeroUsize::new(9).unwrap(),
+                ..within.clone()
+            },
+        ),
+    ];
+    for (name, config) in beyond {
+        let Err(super::Error::InvalidRequest(message)) = configure(config) else {
+            panic!("{name} beyond the executors is refused");
+        };
+        assert!(message.contains(name), "{message}");
+    }
+    assert!(configure(within).is_ok());
+}
+
+/// A flush evicts every cached block the scheduler knows of by `Evict`, as many keys per record
+/// as the submission queue takes (SD §2.4), whatever the requests in flight do.
+#[test]
+fn a_flush_evicts_every_cached_block_the_scheduler_knows_of() {
+    // Rings of 2048 bytes: an `Evict` record holds at most (2040 - 13) / 32 = 63 keys. The
+    // scheduler knows of 80 blocks on the host, more than one record, or one `Listing`, holds.
+    let mut bench = bench(2048);
+    let known: Vec<Key> = (0..80).map(key).collect();
+    for &key in &known {
+        let block = Cached {
+            key,
+            class: KV,
+            tokens: 16,
+            tiers: 0b010,
+            groups: 0,
+            pins: 0,
+            last_used: 1,
+        };
+        bench.scheduler.cache.insert(Cached::id(&key), block);
+    }
+
+    let (reply, replied) = crossbeam_channel::bounded(1);
+    bench
+        .scheduler
+        .apply(Message::Flush(None, WeightsInFlight::Keep, reply));
+    assert!(matches!(replied.try_recv(), Ok(Ok(()))));
+
+    // Each step writes what the queues have room for; the buffer pool evicts what it is named.
+    let mut evicted = Vec::new();
+    for _ in 0..4 {
+        bench.scheduler.step();
+        for (id, request) in bench.take() {
+            let completion = match request {
+                runtime::Request::Evict { keys } => {
+                    assert!(keys.len() <= 63, "{} keys in one record", keys.len());
+                    evicted.extend(keys.iter().copied());
+                    Completion::Evicted { keys }
+                }
+                _ => Completion::Done,
+            };
+            bench.complete(id, &completion);
+        }
+    }
+    evicted.sort_unstable();
+    assert_eq!(evicted, known);
+}
+
+/// Runs the bench's scheduler on a thread of its own over `inbox`, its outputs sent to `output`;
+/// the receiver returned answers once `run` has returned.
+fn running(inbox: Receiver<Message>, output: Sender<Output>) -> Receiver<()> {
+    let (ended, end) = crossbeam_channel::bounded(1);
+    std::thread::spawn(move || {
+        let mut bench = bench(1024);
+        bench.scheduler.output = output;
+        bench.scheduler.run(inbox);
+        ended.send(()).unwrap();
+    });
+    end
+}
+
+/// The loop ends at `Shutdown`, and once no sender of its inbox is left, without a failure.
+#[test]
+fn the_loop_ends_at_shutdown_and_once_its_inbox_has_no_sender() {
+    for shutdown in [true, false] {
+        let (inbox, messages) = crossbeam_channel::unbounded();
+        let (output, outputs) = crossbeam_channel::unbounded();
+        let end = running(messages, output);
+
+        if shutdown {
+            inbox.send(Message::Shutdown).unwrap();
+        } else {
+            drop(inbox);
+        }
+        end.recv_timeout(Duration::from_secs(10)).unwrap();
+        assert!(
+            !outputs
+                .try_iter()
+                .any(|output| matches!(output, Output::Failed(_)))
+        );
+    }
+}
+
+/// An executor's failed job outside a batch stops the scheduler at once: `run` returns, and the
+/// engine is told with `Output::Failed`, which carries the executor's error.
+#[test]
+fn a_failed_executor_job_stops_the_loop_and_reaches_the_engine() {
+    let (inbox, messages) = crossbeam_channel::unbounded();
+    let (output, outputs) = crossbeam_channel::unbounded();
+    let end = running(messages, output);
+
+    let failure = "worker group 1 did not apply and stamp requests";
+    inbox
+        .send(Message::Failed(super::Error::Executor(failure.to_owned())))
+        .unwrap();
+    end.recv_timeout(Duration::from_secs(10)).unwrap();
+
+    let failed: Vec<String> = outputs
+        .try_iter()
+        .filter_map(|output| match output {
+            Output::Failed(error) => Some(error.to_string()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(failed, [format!("an executor failed: {failure}")]);
 }
 
 /// A policy that admits nothing: tests that drive the queue pair, the views or the placement,

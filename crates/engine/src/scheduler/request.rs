@@ -115,6 +115,10 @@ pub struct Request {
     /// The key of each encoder output, and the position the scheduler named for it in the
     /// request's encoder-output table, once held.
     pub encodings: Vec<(Key, Option<u32>)>,
+    /// The keys of blocks the request holds that `Cached::pins` does not count it among the
+    /// holders of: a block answered `Duplicate`, which stays private to it (BP §9, R4), and an
+    /// encoder output it computed and did not commit. Giving up its pins passes over them.
+    pub unpinned: Vec<Key>,
     /// Output tokens the daemon's decoder has passed.
     pub num_acknowledged_tokens: u32,
 
@@ -243,6 +247,7 @@ impl Request {
             num_draft_tokens: 0,
             num_encoded_inputs: 0,
             encodings: Vec::new(),
+            unpinned: Vec::new(),
             num_acknowledged_tokens: 0,
             artifact: None,
             terminal: None,
@@ -747,13 +752,6 @@ impl Request {
 }
 
 /// A request's checks at its arrival (SD §3.2, §7.2).
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "admission, which validates arrivals, is not in the crate yet"
-    )
-)]
 impl Scheduler {
     /// Checks a request against the deployment before it is queued (SD §3.2); the message
     /// rejects it as `Invalid`. A video request is `validate_video`'s. A token request is refused,

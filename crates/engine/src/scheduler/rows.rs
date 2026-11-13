@@ -43,6 +43,7 @@ use proto::request::{
 };
 
 use super::group::variants;
+use super::memory::{kept, restored};
 use super::{Capacity, Request, Scheduler};
 
 /// The decoded tokens between two recurrent-state checkpoints when the deployment states none
@@ -241,17 +242,9 @@ impl Scheduler {
         let (mut restore, mut keep) = (None, None);
         if let Some(block) = state_block(capacity) {
             if !seen && start > 0 {
-                if !start.is_multiple_of(block) {
-                    return None;
-                }
-                restore = Some(start / block - 1);
+                restore = Some(restored(start, block)?);
             }
-            let boundary = end / block * block;
-            let kept = matches!(phase, Phase::Prefill | Phase::Refill)
-                || boundary.is_multiple_of(state_interval(capacity));
-            if boundary > start && kept {
-                keep = Some(boundary);
-            }
+            keep = kept(phase, start, end, block, state_interval(capacity));
         }
 
         // Each row draws at the rotary position of the token it samples, in its request's
@@ -444,8 +437,7 @@ impl Scheduler {
     /// request's encoder-output table, and carries the image.
     ///
     /// Returns false and appends nothing when the request's state does not state the row: a
-    /// phase the request has no call of, no slot on the batch's group, or an image whose encoder
-    /// output has no position.
+    /// phase the request has no call of, or no slot on the batch's group.
     #[must_use]
     pub(super) fn push_media_row(&self, batch: &mut Batch, id: RequestId, phase: Phase) -> bool {
         let Some(request) = self.requests.get(&id) else {
@@ -784,7 +776,10 @@ fn lookahead(request: &Request, end: u32, bos: u32) -> Option<u32> {
 }
 
 /// The row of a token request's image encoding on slot `slot`: the image of its next encoder
-/// block to compute, written to that block's encoder output.
+/// block to compute, written to that block's encoder output. Encoder input `i`'s output lies at
+/// position `i` of the request's encoder-output table, where its admission allocated it when no
+/// `Pin` found it (`memory.rs`); `Request::encodings` states the position once the output is
+/// held, which is what a prefill reading it waits for, not the encode that computes it.
 fn image_row(
     request: &Request,
     input: &GenerationRequest,
@@ -805,7 +800,7 @@ fn image_row(
     if phase != encodes {
         return None;
     }
-    let output = request.encodings.get(block)?.1?;
+    let output = u32::try_from(block).ok()?;
 
     Some(MediaRow {
         request: request.id,
@@ -913,7 +908,7 @@ fn state_block(capacity: &Capacity) -> Option<u32> {
 }
 
 /// The decoded tokens between two recurrent-state checkpoints: the deployment's, at least one.
-fn state_interval(capacity: &Capacity) -> u32 {
+pub(super) fn state_interval(capacity: &Capacity) -> u32 {
     capacity
         .kv_cache
         .as_ref()
@@ -1064,6 +1059,7 @@ mod tests {
             num_draft_tokens: 0,
             num_encoded_inputs: 0,
             encodings: Vec::new(),
+            unpinned: Vec::new(),
             num_acknowledged_tokens: 0,
             artifact: None,
             terminal: None,
@@ -1973,7 +1969,8 @@ mod tests {
     }
 
     /// A token request's image encoding carries its image and writes the encoder output of its
-    /// next encoder block, by its position in the request's encoder-output table.
+    /// next encoder block, which the request does not hold yet, by its position in the request's
+    /// encoder-output table: encoder input `i`'s at position `i` (SD §4.2).
     #[test]
     fn a_chat_images_encoding_writes_its_encoder_output() {
         let mut scheduler = scheduler(&[]);
@@ -1982,7 +1979,7 @@ mod tests {
             image(0, ImageEncoder::Vision, 4),
             image(2, ImageEncoder::Latent, 4),
         ];
-        chat.encodings = vec![(Key([1; 32]), Some(3)), (Key([2; 32]), Some(7))];
+        chat.encodings = vec![(Key([1; 32]), None), (Key([2; 32]), None)];
         scheduler.requests.insert(RequestId(1), chat);
 
         let mut batch = batch(Phase::VisionEncode);
@@ -1990,7 +1987,7 @@ mod tests {
         assert!(scheduler.push_media_row(&mut batch, RequestId(1), Phase::VisionEncode));
         let row = &batch.media[0];
         assert_eq!(row.image.as_deref(), Some("aW1hZ2U="));
-        assert_eq!((row.slot, row.results.clone(), row.reads), (1, vec![3], 0));
+        assert_eq!((row.slot, row.results.clone(), row.reads), (1, vec![0], 0));
         scheduler.seal(&mut batch).unwrap();
         assert_eq!(batch.shape.variant, Variant::ConditionEncode);
         assert_eq!(batch.shape.extent, Extent::None);
@@ -2002,7 +1999,7 @@ mod tests {
             .num_encoded_inputs = 1;
         let mut latent = self::batch(Phase::LatentEncode);
         assert!(scheduler.push_media_row(&mut latent, RequestId(1), Phase::LatentEncode));
-        assert_eq!(latent.media[0].results, vec![7]);
+        assert_eq!(latent.media[0].results, vec![1]);
     }
 
     /// A bad word bans its last token exactly where the history ends with its prefix, the history

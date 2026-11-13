@@ -642,11 +642,6 @@ pub fn ceilings<'a>(capacities: impl IntoIterator<Item = &'a Capacity>) -> Limit
 }
 
 /// The policy generation (SD §3.9).
-#[expect(
-    dead_code,
-    reason = "the step loop that answers `SetPolicy` and the schedule and preemption that meet a \
-              policy's fault are not in the crate yet"
-)]
 impl Scheduler {
     /// A new generation's policy serves from this step on, instantiated on the scheduler's state
     /// now; the one it replaces is kept for rollback. On failure the serving policy is untouched
@@ -731,11 +726,11 @@ pub(super) mod tests {
     }
 
     /// A module that speaks the interface's exports, whose `sched_init` runs `body` (a `wat`
-    /// expression of type `i64`), whose `sched_limits` replies `{}` (every limit at its default)
-    /// and whose other exports reply nothing.
+    /// expression of type `i64`), whose `sched_limits` and `sched_dispatch` reply `{}` (every limit
+    /// at its default; a decision that names nothing) and whose other exports reply nothing.
     pub(in super::super) fn toy(body: &str) -> Arc<Module> {
-        // The limits reply lies at 2048: `ptr << 32 | len`.
-        let limits = (2048_u64 << 32) | 2;
+        // The `{}` reply lies at 2048: `ptr << 32 | len`.
+        let empty = (2048_u64 << 32) | 2;
         let text = format!(
             r#"(module
                 (memory (export "memory") 1)
@@ -744,11 +739,11 @@ pub(super) mod tests {
                 (func (export "sched_free") (param i32 i32))
                 (func (export "sched_init") (param i32 i32) (result i64) {body})
                 (func (export "sched_observe") (param i32 i32) (result i64) (i64.const 0))
-                (func (export "sched_dispatch") (param i32 i32) (result i64) (i64.const 0))
+                (func (export "sched_dispatch") (param i32 i32) (result i64) (i64.const {empty}))
                 (func (export "sched_preempt") (param i32 i32) (result i64) (i64.const 0))
                 (func (export "sched_route") (param i32 i32) (result i32) (i32.const 0))
                 (func (export "sched_place") (param i32 i32) (result i32) (i32.const 0))
-                (func (export "sched_limits") (result i64) (i64.const {limits})))"#
+                (func (export "sched_limits") (result i64) (i64.const {empty})))"#
         );
         let engine = scheduling::Engine::new().unwrap();
         Arc::new(engine.load(text.as_bytes()).unwrap())

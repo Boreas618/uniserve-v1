@@ -7,29 +7,23 @@
 //! after a change no other event carries (`Scheduler::mark`, `Updated`), and in a snapshot. A
 //! snapshot is built only when a policy is instantiated, from the scheduler's own state.
 //!
-//! Time on the policy's wire is nanoseconds of one monotonic clock ([`nanos`]); a policy only
-//! compares instants.
+//! Time on the policy's wire is nanoseconds of the host's monotonic clock
+//! ([`super::monotonic_nanos`]); a policy only compares instants.
 
 use std::collections::BTreeSet;
-use std::sync::OnceLock;
-use std::time::Instant;
 
 use ipc::batch::Phase;
 use proto::config::WorkerGroupRole;
 use proto::request::RequestId;
 use scheduling_guest::decision::{Inflight, Room};
-use scheduling_guest::ids::{EncodingId, PageId, RequestId as PolicyRequestId, StageId};
+use scheduling_guest::ids::{RequestId as PolicyRequestId, StageId};
 use scheduling_guest::time::Nanos;
 use scheduling_guest::view::{
-    CallView, EncodingView, PageView, PhaseView, ReplicaView, RequestClass,
-    RequestStatus as Standing, RequestView, Snapshot,
+    CallView, PhaseView, ReplicaView, RequestClass, RequestStatus as Standing, RequestView,
+    Snapshot,
 };
 
-use super::{Cached, Request, RequestStatus, Scheduler, WorkerGroup};
-
-/// The tier bits of [`Cached::tiers`].
-const ON_DEVICE: u8 = 1;
-const ON_HOST: u8 = 1 << 1;
+use super::{Request, RequestStatus, Scheduler, WorkerGroup, monotonic_nanos};
 
 /// The view of `request` the policy reads, computed from the request's fields and the
 /// capacities of `groups` (the scheduler's), the 22 features of `S/views.rs:456-760`:
@@ -110,8 +104,8 @@ pub fn view_of(request: &Request, groups: &[WorkerGroup]) -> RequestView {
         state,
         phase: phase.map(Phase::id),
         priority: request.input.priority(),
-        arrived_at: nanos(request.arrival),
-        admitted_at: (state == Standing::Running).then(|| nanos(request.arrival)),
+        arrived_at: Nanos(monotonic_nanos(request.arrival)),
+        admitted_at: (state == Standing::Running).then(|| Nanos(monotonic_nanos(request.arrival))),
         prompt_tokens: prompt,
         prefill_tokens: if token {
             request.num_prompt_tokens
@@ -139,42 +133,7 @@ pub fn view_of(request: &Request, groups: &[WorkerGroup]) -> RequestView {
     }
 }
 
-/// The instant `at` on the policy's monotonic clock: nanoseconds since the clock was first read in
-/// this process, 0 for an instant before that. The first reading is made when the first request
-/// arrives (its `Arrived` view), so the instants a policy is told of keep their order.
-pub(super) fn nanos(at: Instant) -> Nanos {
-    static ORIGIN: OnceLock<Instant> = OnceLock::new();
-    let origin = *ORIGIN.get_or_init(Instant::now);
-    Nanos(u64::try_from(at.saturating_duration_since(origin).as_nanos()).unwrap_or(u64::MAX))
-}
-
-/// The policy's view of a cached block of a cache group, `id` its number in `Scheduler::cache`
-/// (its `PageId`): on the host when only a lower tier holds it, evictable when no request of the
-/// scheduler holds it.
-pub(super) fn page_view(id: u64, cached: &Cached) -> PageView {
-    PageView {
-        id: PageId(id),
-        tokens: u32::from(cached.tokens),
-        last_used: Nanos(cached.last_used),
-        on_host: cached.tiers & ON_DEVICE == 0 && cached.tiers & ON_HOST != 0,
-        evictable: cached.pins == 0,
-    }
-}
-
-/// The policy's view of a cached encoder output, `id` its number in `Scheduler::cache` (its
-/// `EncodingId`).
-pub(super) fn encoding_view(id: u64, cached: &Cached) -> EncodingView {
-    EncodingView {
-        id: EncodingId(id),
-        last_used: Nanos(cached.last_used),
-    }
-}
-
 /// The call a `place` decision is about: `request`'s first call of `phase` on a group.
-#[expect(
-    dead_code,
-    reason = "the placement that asks the policy's `place` is not in the crate yet"
-)]
 pub(super) fn call_view(request: RequestId, phase: Phase) -> CallView {
     CallView {
         request: PolicyRequestId(request.0),
@@ -185,10 +144,6 @@ pub(super) fn call_view(request: RequestId, phase: Phase) -> CallView {
 
 /// The views of the groups `candidates` a `place` decision chooses among for `request`, in the
 /// order of `candidates`, which the decision's index names.
-#[expect(
-    dead_code,
-    reason = "the placement that asks the policy's `place` is not in the crate yet"
-)]
 pub(super) fn replica_views<'a>(
     request: &Request,
     candidates: impl IntoIterator<Item = &'a WorkerGroup>,
@@ -236,14 +191,6 @@ fn count(value: usize) -> u32 {
 }
 
 /// The policy's views of the scheduler's state.
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "the schedule, update and policy generation that read these are not in the crate \
-                  yet"
-    )
-)]
 impl Scheduler {
     /// Notes that `request`'s view changed in a way no other event tells (SD §5.2): the next
     /// `dispatch` tells it once as `Updated`, however often it is marked before.
@@ -341,19 +288,7 @@ impl Scheduler {
             .map(|request| view_of(request, &self.groups))
             .collect();
 
-        let mut pages = Vec::new();
-        let mut encodings = Vec::new();
-        for (&id, cached) in &self.cache {
-            let sized = self
-                .classes
-                .get(usize::from(cached.class))
-                .is_none_or(|class| class.units == 0);
-            if sized {
-                encodings.push(encoding_view(id, cached));
-            } else {
-                pages.push(page_view(id, cached));
-            }
-        }
+        let (pages, encodings) = self.cache_views();
 
         let serving: Vec<&WorkerGroup> = self
             .groups
@@ -459,6 +394,7 @@ pub(super) mod tests {
             num_draft_tokens: 0,
             num_encoded_inputs: 0,
             encodings: Vec::new(),
+            unpinned: Vec::new(),
             num_acknowledged_tokens: 0,
             artifact: None,
             terminal: None,

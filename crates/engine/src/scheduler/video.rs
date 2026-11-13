@@ -19,14 +19,6 @@
 //! and a result's position in the request's product table is its index in that list; a media row
 //! names the results its call reads and writes by these positions ([`Request::results`]).
 
-#![cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "admission, the rows, update and release that call these are not in the crate yet"
-    )
-)]
-
 use std::iter;
 use std::ops::Range;
 
@@ -68,7 +60,7 @@ pub(super) const VIDEO_PHASES: [Phase; 11] = [
 /// it. The class of kind `k` is the `k`-th of the `PRODUCTS.len()` classes just before the class
 /// of stored trajectories, and `Capacity::media_bytes` states the bytes of a block of each kind in
 /// this order.
-const PRODUCTS: [(&str, Phase); 13] = [
+pub(super) const PRODUCTS: [(&str, Phase); 13] = [
     (product::CONDITION_PIXELS, Phase::MediaRead),
     (product::CONDITION_SAMPLES, Phase::MediaRead),
     (product::VISION_PIXELS, Phase::MediaRead),
@@ -904,6 +896,7 @@ mod tests {
             num_draft_tokens: 0,
             num_encoded_inputs: 0,
             encodings: Vec::new(),
+            unpinned: Vec::new(),
             num_acknowledged_tokens: 0,
             artifact: None,
             terminal: None,
