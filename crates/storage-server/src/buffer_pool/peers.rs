@@ -20,7 +20,7 @@ impl BufferPool {
         let mut held = Vec::new();
         for key in keys {
             let Some(Entry {
-                host: Some((block, None)),
+                host: Some((block, None, _)),
                 tokens,
                 ..
             }) = self.cache.get(key)

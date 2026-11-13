@@ -6,10 +6,18 @@
 //! The region is the deployment's on the rank's host: the Storage Server creates one part per
 //! rank index (`storage::protocol::Request::HostPart`), which every epoch of the deployment that
 //! names the region maps, so an output one epoch stored is found by another that computes the
-//! same, and a resumed request's encoders read their outputs instead of computing them again. A
-//! stored output takes the consecutive units its bytes fill, [`PAGE_BYTES`] each on the rank's
-//! part, rows in order. The scheduler decides what is stored and loaded and keys it; the rank only
-//! copies, between its product buffer and its part ([`BufferMemory::copy`]).
+//! same, and a resumed request's encoders read their outputs instead of computing them again. The
+//! scheduler decides what is stored and loaded and keys it; the rank only copies, between its
+//! product buffer and its part ([`BufferMemory::copy`]).
+//!
+//! An output lies whole in one rank's product buffer, and its host copy on that rank's part
+//! alone: the copy takes the consecutive units whose part holds the output's bytes, [`PAGE_BYTES`]
+//! each, rows in order, since the buffer pool sizes it by the bytes of one part's unit
+//! (`storage::runtime::Region::part_bytes`), and those units of the other ranks' parts hold
+//! nothing of it. Those bytes are the output's rows in order under every parallel configuration,
+//! so the class of encoder outputs states one encoding everywhere
+//! (`storage::runtime::Class::encoding`), and a `Load` copies the bytes as they are: unlike a
+//! trajectory's, an output's restore needs no copy manifest.
 
 use crate::Result;
 use crate::memory::buffers::BufferMemory;
@@ -32,6 +40,11 @@ pub const PAGE_BYTES: u64 = 256 << 10;
 /// slots' outputs. An image request reads and generates images mostly smaller than the largest,
 /// whose features take fewer units. An output evicted beyond that is a miss, and its encoder
 /// computes it again.
+///
+/// These are the units one worker group's outputs take, `request_slots` its slots. An output
+/// takes its units in every rank's part and fills those of its own rank alone, so the outputs of
+/// two groups, which lie in two ranks' product buffers, take units apart: the region's numbering
+/// is the sum of this over the groups that store outputs there.
 pub fn pool_pages(largest: &[u64], request_slots: usize) -> u64 {
     let request: u64 = largest.iter().map(|bytes| bytes.div_ceil(PAGE_BYTES)).sum();
     crate::memory::host_pages::resuming_pages(request_slots as u64 * request)

@@ -148,11 +148,15 @@ impl Driver {
                 units: 1,
                 host: Some((host, 1)),
                 state_in_slot: false,
+                tensors: [0; 32],
+                encoding: [0; 32],
             },
             Class {
                 units: 0,
                 host: Some((host, 0)),
                 state_in_slot: false,
+                tensors: [1; 32],
+                encoding: [0; 32],
             },
         ];
         let mut pool = BufferPool::new((1_000, 1_000));
@@ -163,7 +167,7 @@ impl Driver {
             "units",
             Tier::Device,
             0,
-            64,
+            (64, 64),
             1,
             shape.units,
             shape.units + 1,
@@ -174,7 +178,7 @@ impl Driver {
                 &rows,
                 Tier::Device,
                 group + 1,
-                8,
+                (8, 8),
                 1,
                 shape.rows,
                 shape.rows + 1,
@@ -184,7 +188,7 @@ impl Driver {
             "host",
             Tier::Host,
             host,
-            64,
+            (64, 64),
             0,
             shape.host_units,
             shape.host_units,
@@ -534,7 +538,7 @@ impl Driver {
             let host = entry
                 .host
                 .as_ref()
-                .map_or("-".to_owned(), |(block, _)| unit(block));
+                .map_or("-".to_owned(), |(block, ..)| unit(block));
             lines.push(format!(
                 "key {:02x} d={device} h={host} remote={}",
                 key.0[0],

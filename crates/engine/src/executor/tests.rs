@@ -320,6 +320,7 @@ fn a_copy_s_finish_arrives_after_the_output_of_the_batch_that_ran_it() {
         from: vec![(DEVICE, 7, 1)],
         to: vec![(HOST, 3, 1)],
         evicted: Vec::new(),
+        encodings: None,
     };
     groups.map(GROUP, 0, runtime::RequestId(10), store, copy);
     groups.submit(decode(1, 1));

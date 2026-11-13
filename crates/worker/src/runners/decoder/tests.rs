@@ -177,7 +177,7 @@ fn runner(buckets: Vec<Bucket>, video: bool) -> DecoderRunner {
         },
         Graphs::meta(Arc::new(Generation::new(0, [])), 0),
         None,
-        Arc::new(BufferMemory::meta((PRODUCTS, 32), (SLOTS, 4), 0, &[]).unwrap()),
+        Arc::new(BufferMemory::meta(0, (PRODUCTS, 32), (SLOTS, 4), 0, &[]).unwrap()),
     )
     .unwrap()
 }

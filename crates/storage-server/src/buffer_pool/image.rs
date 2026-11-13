@@ -291,7 +291,7 @@ impl<B> Entry<B> {
             device.push((name(block)?, *maker));
         }
         let host = match &self.host {
-            Some((block, maker)) => Some((name(block)?, *maker)),
+            Some((block, maker, encoding)) => Some((name(block)?, *maker, *encoding)),
             None => None,
         };
         Ok(Entry {

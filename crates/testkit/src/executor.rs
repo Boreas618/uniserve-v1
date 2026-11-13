@@ -1205,6 +1205,7 @@ mod tests {
             from: vec![(3, 0, 1), (3, 1, 1)],
             to: vec![(0, 8, 1), (0, 9, 1)],
             evicted: Vec::new(),
+            encodings: None,
         };
         mapped(&fake, 10, load, copy);
         assert!(
@@ -1245,6 +1246,7 @@ mod tests {
             from: vec![(0, 2, 1)],
             to: vec![(0, 8, 1)],
             evicted: Vec::new(),
+            encodings: None,
         };
         mapped(&fake, 10, clone, copy);
 
@@ -1380,6 +1382,7 @@ mod tests {
                 from: vec![(3, 0, 1)],
                 to: vec![(0, 8, 1)],
                 evicted: Vec::new(),
+                encodings: None,
             };
             mapped(&fake, id, request, copy);
         };

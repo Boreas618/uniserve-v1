@@ -1548,6 +1548,7 @@ fn a_runner_with_no_hook_refuses_the_page_work_it_is_handed() {
     let copy = BlockCopy {
         request: storage::runtime::RequestId(3),
         runs: vec![((UNITS, 1, 1), (UNITS, 2, 1))],
+        encodings: None,
     };
     assert!(matches!(runner.copy(&[copy]), Err(Error::Unsupported(_))));
 }
@@ -2369,6 +2370,7 @@ fn a_copy_between_two_runs_is_issued_on_the_cache_and_ends_with_the_batch() {
     let clone = |runs: Vec<(Run, Run)>| BlockCopy {
         request: storage::runtime::RequestId(5),
         runs,
+        encodings: None,
     };
 
     // A copy names its runs by the regions the buffer pool numbered: before they are stated,
@@ -2463,6 +2465,7 @@ fn a_batch_with_no_rows_writes_the_tables_and_runs_the_copies_without_a_forward(
         from: vec![(UNITS, 3, 1)],
         to: vec![(UNITS, 9, 1)],
         evicted: vec![],
+        encodings: None,
     };
     map(3, clone, copy);
 

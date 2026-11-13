@@ -6,16 +6,21 @@
 //! a video model's float32 values, or an image model's latent rows, each of the row's width and
 //! element type, in the order the row holds them. A `Save` copies the row into a block of the
 //! trajectory class, cached under the trajectory's key (`storage::key::latent_content`), and a
-//! `Restore` copies the block back into a slot's row ([`BufferMemory::copy`]).
+//! `Restore` copies the block back into a slot's row ([`BufferMemory::copy`], or
+//! [`BufferMemory::restore`] for a block saved in another encoding).
 //!
 //! The region is one unit space with one part per rank index, which the Storage Server creates on
 //! the NUMA node closest to the rank's device (`storage::protocol::Request::HostPart`). A unit of
 //! a rank's part is one page of its trajectory row ([`BankPages`]), so a block of `n` units holds
-//! the first `n` pages of the row on every rank. The same rank of every epoch of the deployment
-//! that names the region maps the same part, whatever its parallel configuration, so an epoch
-//! that succeeds another finds the trajectories its predecessor saved; the region is sized for the
-//! trajectories that rank can have saved at once ([`pool_pages`]). The scheduler decides what is
-//! saved and restored and keys it; the rank only copies, on a stream of its device.
+//! the first `n` pages of the row on every rank: each rank of a denoising group holds its share
+//! of the request's samples in its own row and copies it to its own part, and the scheduler sizes
+//! the block by the most pages a rank's share takes. The same rank of every epoch of the
+//! deployment that names the region maps the same part, whatever its parallel configuration, so
+//! an epoch that succeeds another finds the trajectories its predecessor saved; one that lays
+//! them out otherwise restores them through the copy manifest of the two layouts, reading every
+//! saving rank's part it reaches ([`super::restore`]). The region is sized for the trajectories
+//! the ranks can have saved at once ([`pool_pages`]). The scheduler decides what is saved and
+//! restored and keys it; the rank only copies, on a stream of its device.
 
 use uniserve_tensor::DType;
 
@@ -42,6 +47,10 @@ const PAGE_ENCODING: u32 = 1;
 ///
 /// A trajectory the region evicted beyond that, as when requests reach the engine in another
 /// order, is a miss: its request starts from noise.
+///
+/// These are the units one denoising group's trajectories take, `pages` a rank's of it: every
+/// rank of the group fills its own part of the same units. Two groups save into units apart, so
+/// the region's numbering is the sum of this over the groups that save there.
 pub fn pool_pages(pages: BankPages) -> u64 {
     host_pages::resuming_pages(pages.pages)
 }

@@ -84,6 +84,7 @@ pub(super) fn bench(ring_bytes: usize) -> Bench {
         tier: Tier::Device,
         space: name.to_owned(),
         unit_bytes: 1 << 20,
+        part_bytes: 1 << 20,
         reserved: 1,
         units,
         limit: units,
@@ -99,6 +100,8 @@ pub(super) fn bench(ring_bytes: usize) -> Bench {
         units,
         host: None,
         state_in_slot: false,
+        tensors: [0; 32],
+        encoding: [0; 32],
     };
     let layout = runtime::Open {
         version: runtime::VERSION,
@@ -594,6 +597,7 @@ fn a_completion_for_a_forgotten_owner_is_dropped_and_its_copy_given_up() {
         from: vec![(9, 0, 1)],
         to: vec![(4, 2, 1)],
         evicted: Vec::new(),
+        encodings: None,
     };
     bench.complete(taken[1].0, &copy);
 
@@ -637,6 +641,7 @@ fn the_answer_to_a_copys_finish_is_mapped_and_applied_as_the_copys_result() {
         from: vec![(9, 0, 1)],
         to: vec![(4, 2, 1)],
         evicted: Vec::new(),
+        encodings: None,
     };
     bench.complete(id, &copy);
     assert_eq!(

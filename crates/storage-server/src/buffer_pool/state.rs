@@ -95,7 +95,7 @@ impl BufferPool {
     fn holders(&self) -> (CachedBy, Owning) {
         let mut cached = HashMap::new();
         for (key, entry) in &self.cache {
-            for (block, _) in entry.device.iter().chain(&entry.host) {
+            for (block, _) in entry.copies() {
                 cached.insert(Rc::as_ptr(block), *key);
             }
         }
@@ -171,7 +171,7 @@ impl BufferPool {
         };
 
         for entry in self.cache.values() {
-            for (block, _) in entry.device.iter().chain(&entry.host) {
+            for (block, _) in entry.copies() {
                 hold(block, BlockState::Shared);
             }
         }

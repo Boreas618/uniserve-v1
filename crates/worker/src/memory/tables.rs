@@ -3,10 +3,10 @@
 //! The buffer pool in the Storage Server is the authority for every block a request holds; the
 //! device block table is a copy of what the buffer pool's owner tables say, and the kernels'
 //! addresses come only from it. [`BlockTables`] is that copy on the host side: for every class,
-//! by slot and position, the run of the block in the rank's memory and whether a batch may write
-//! it. The runner writes its changes into the pooled tables in device memory and derives every
-//! address of a batch from it; a batch from the scheduler carries slots and positions, never
-//! units.
+//! by slot and position, the runs of the block in the memory the rank's process maps and whether
+//! a batch may write it. The runner writes its changes into the pooled tables in device memory
+//! and derives every address of a batch from it; a batch from the scheduler carries slots and
+//! positions, never units.
 //!
 //! A value is the table of one rank and is owned by that rank's executor thread: every method
 //! takes `&self` or `&mut self`, nothing is shared and nothing locks. The ranks of a group are
@@ -44,7 +44,7 @@
 //! | --- | --- |
 //! | [`BlockTables::map`] | 1: an entry exists only as a run a completion gave, at the position its request named. 4: an entry is writable only when it came from `Allocated`, from a `Clone` answered `Cloned` or as a private block of `Transferred`; the destination of a load or a clone is no entry until the `Finish` of its copy is answered, so only the copy writes it |
 //! | [`BlockTables::apply`] | 2, the part before the stamp: the entries of a `Release`, a `Detach` or a `Transfer` leave, the entry of a `Commit` becomes read-only, a given-up copy that no batch has started is dropped and its destinations are no longer awaited. The stamp itself, the sequence of the last batch launched, is the executor's |
-//! | [`BlockTables::run`], [`BlockTables::units`], [`BlockTables::entries`] | 1: the only source of a kernel's addresses |
+//! | [`BlockTables::run`], [`BlockTables::runs`], [`BlockTables::units`], [`BlockTables::entries`] | 1: the only source of a kernel's addresses and of a media copy's |
 //! | [`BlockTables::writable`] | 4: whether a batch may write a position |
 //! | [`BlockTables::take_changes`] | 1: what the runner writes into the device block table, each change once. A run is stated for reset only while its entry is in the table, so the units of a block that left are never touched. 4: and only while a batch may write it, so a block a `Commit` marked before the next batch is never reset |
 //! | [`BlockTables::queued_copies`], [`BlockTables::start_copy`] | 2 and 4: a copy is started once, by the batch that takes it, and only that copy writes its destination; a copy given up before a batch takes it never runs |
@@ -56,10 +56,16 @@
 //! A run is `(region, first unit, count)`, the region by the number the buffer pool's answer to
 //! `Open` gave it. A block of a KV class, an encoder output or a trajectory has one run; a media
 //! product has one run per backing rank, each in that rank's product buffer. The table is told
-//! the regions its rank maps and keeps, of each block, the run that lies in one of them; a
-//! block with no run there is another rank's and gives this rank no entry. A copy is the rank's
-//! to run when it maps both the run read and the run written: an encoder output in another
-//! rank's product buffer is stored to the host by that rank alone.
+//! the regions its rank maps (its own memory: the KV units, the slot rows, its parts of the host
+//! regions, its product buffer) and the product buffers of the other ranks of its process, which
+//! its device reaches by peer access ([`BlockTables::with_peers`]). It keeps, of each block,
+//! every run that lies in one of them: [`BlockTables::run`] is the one in the rank's own memory,
+//! which the device block table and the kernels address, and [`BlockTables::runs`] every one, so
+//! the rank that runs a call reaches the runs of the backing ranks of its process that do not,
+//! and a decode reaches the run its successor reads. A block with no run there gives this rank no
+//! entry. A copy is the rank's to run when its own memory holds both the run read and the run
+//! written: an encoder output in another rank's product buffer is stored to the host by that rank
+//! alone, onto that rank's part of the host block.
 //!
 //! What a copy moves is counted from every run its completion states, whichever rank maps them,
 //! in the unit sizes the table is given for the session's regions: the same figure on every rank
@@ -82,8 +88,9 @@ pub struct Change {
     pub class: u8,
     /// The position in the slot's table of the class.
     pub position: u32,
-    /// The run the entry names in the rank's memory; `None` when the position holds no entry,
-    /// so the device block table addresses nothing there.
+    /// The run the entry names in the rank's own memory; `None` when the position holds no
+    /// entry, or one whose block lies in other ranks' memory alone, so the device block table
+    /// addresses nothing there.
     pub run: Option<Run>,
     /// Whether the run's units were given by `Allocated` since the changes were last taken:
     /// the runner resets their per-unit state before a batch addresses them. Never set for a
@@ -101,6 +108,10 @@ pub struct BlockCopy {
     /// every copy of the request lies in other ranks' memory; the request still counts as run
     /// by this rank once it is started.
     pub runs: Vec<(Run, Run)>,
+    /// The encoding the runs read were written in and the encoding of the class they write,
+    /// when they differ (`storage::runtime::Completion::Copy`): the copies then lay the bytes
+    /// out through the copy manifest of the two, which a copy of bytes as they are does not.
+    pub encodings: Option<([u8; 32], [u8; 32])>,
 }
 
 /// The device block table of one rank of a worker group on the host: see the module
@@ -109,15 +120,20 @@ pub struct BlockTables {
     group: GroupId,
     /// The regions whose memory the rank maps.
     regions: Vec<u8>,
+    /// The product buffers of the process's other ranks, which the rank's device reaches by
+    /// peer access.
+    peers: Vec<u8>,
     /// By region number, the bytes of a unit summed over the ranks that hold a part of it, for
     /// every region a copy of the group may name.
     unit_bytes: HashMap<u8, u64>,
     /// The slot under which each owner's entries are kept, and whether the owner is attached to
     /// the group there; an owner of another group, whose class this group reads, is not.
     slots: HashMap<OwnerId, (u32, bool)>,
-    /// By slot, class and position: the run, whether a batch may write it, and the owner whose
-    /// request gave it. Every owner named here is in `slots` under that slot.
-    entries: BTreeMap<(u32, u8, u32), (Run, bool, OwnerId)>,
+    /// By slot, class and position: the runs of the block the process maps, in the order the
+    /// completion stated them, at most one in the rank's own memory; whether a batch may write
+    /// it; and the owner whose request gave it. Every owner named here is in `slots` under that
+    /// slot.
+    entries: BTreeMap<(u32, u8, u32), Kept>,
     /// The positions that changed since the changes were last taken, each with whether its
     /// entry's units were given by `Allocated` since then. The latest change of a position
     /// replaces the earlier ones.
@@ -134,9 +150,15 @@ pub struct BlockTables {
     destinations: HashMap<RequestId, (OwnerId, bool, Vec<Entry>)>,
 }
 
-/// An entry of one slot's tables as a completion gives it: the class, the position, the run,
-/// and whether a batch may write it.
-type Entry = (u8, u32, Run, bool);
+/// An entry of one slot's tables as a completion gives it: the class, the position, the runs the
+/// process maps, and whether a batch may write it.
+type Entry = (u8, u32, Vec<Run>, bool);
+
+/// An entry as the table keeps it: the runs, whether a batch may write it, and its owner.
+type Kept = (Vec<Run>, bool, OwnerId);
+
+/// The encoding a copy reads and the encoding of the class it writes.
+type Encodings = ([u8; 32], [u8; 32]);
 
 /// The position `index` places after `at`.
 fn position(at: u32, index: usize) -> Result<u32> {
@@ -148,6 +170,18 @@ fn position(at: u32, index: usize) -> Result<u32> {
                 "a completion states {index} runs after position {at}, past the last position"
             ))
         })
+}
+
+/// Whether `run` is a run of units: it has some, and its last is on the unit axis.
+fn check_run((region, first, count): Run) -> Result<()> {
+    if count == 0 || first.checked_add(count).is_none() {
+        return Err(Error::Invalid(format!(
+            "a completion states the run of {count} units from unit {first} of region {region}, \
+             which is no run of units"
+        )));
+    }
+
+    Ok(())
 }
 
 /// Whether `slot`, under which a completion is mapped, is the slot the completion states.
@@ -174,6 +208,7 @@ impl BlockTables {
         Self {
             group,
             regions: regions.to_vec(),
+            peers: Vec::new(),
             unit_bytes: unit_bytes.iter().copied().collect(),
             slots: HashMap::new(),
             entries: BTreeMap::new(),
@@ -181,6 +216,19 @@ impl BlockTables {
             queued: VecDeque::new(),
             destinations: HashMap::new(),
         }
+    }
+
+    /// The table of a rank whose process holds other ranks too, `peers` their product buffers by
+    /// the numbers the answer to `Open` gave them: the rank's device reaches them by peer access
+    /// (`crate::memory::buffers::BufferMemory::connect`), so the table keeps the runs a block has
+    /// there beside the one in the rank's own memory. Called before the table is fed.
+    pub fn with_peers(mut self, peers: &[u8]) -> Self {
+        self.peers = peers
+            .iter()
+            .copied()
+            .filter(|region| !self.regions.contains(region))
+            .collect();
+        self
     }
 
     /// The worker group whose rank the table belongs to.
@@ -195,19 +243,30 @@ impl BlockTables {
         self.slots.get(&owner).map(|(slot, _)| *slot)
     }
 
-    /// The run of the block that `slot` holds at `position` of `class`, in the rank's memory;
-    /// `None` where the slot holds no entry.
+    /// The run of the block that `slot` holds at `position` of `class` in the rank's own
+    /// memory; `None` where the slot holds no entry, or one whose block lies in other ranks'
+    /// memory alone.
     pub fn run(&self, slot: u32, class: u8, position: u32) -> Option<Run> {
+        self.runs(slot, class, position)
+            .iter()
+            .copied()
+            .find(|run| self.regions.contains(&run.0))
+    }
+
+    /// Every run of the block that `slot` holds at `position` of `class` in the memory the
+    /// process maps, the rank's own and its other ranks' product buffers, in the order the
+    /// completion stated them; empty where the slot holds no entry.
+    pub fn runs(&self, slot: u32, class: u8, position: u32) -> &[Run] {
         self.entries
             .get(&(slot, class, position))
-            .map(|(run, ..)| *run)
+            .map_or(&[], |(runs, ..)| runs.as_slice())
     }
 
     /// The units of the block that `slot` holds at `position` of `class`: `first..first +
     /// count` of its run, one unit for a block of one unit and the block's whole size
     /// otherwise. `None` where the slot holds no entry.
     pub fn units(&self, slot: u32, class: u8, position: u32) -> Option<Range<u32>> {
-        // A run enters the table only when `first + count` does not overflow (`Self::maps`).
+        // A run enters the table only when `first + count` does not overflow (`check_run`).
         self.run(slot, class, position)
             .map(|(_, first, count)| first..first + count)
     }
@@ -221,11 +280,15 @@ impl BlockTables {
             .is_some_and(|(_, writable, _)| *writable)
     }
 
-    /// The entries of `slot` in `class`, in position order: each position with its run.
+    /// The entries of `slot` in `class` whose block has a run in the rank's own memory, in
+    /// position order: each position with that run.
     pub fn entries(&self, slot: u32, class: u8) -> impl Iterator<Item = (u32, Run)> + '_ {
         self.entries
             .range((slot, class, 0)..=(slot, class, u32::MAX))
-            .map(|(&(_, _, position), &(run, ..))| (position, run))
+            .filter_map(|(&(_, _, position), (runs, ..))| {
+                let own = runs.iter().find(|run| self.regions.contains(&run.0));
+                own.map(|run| (position, *run))
+            })
     }
 
     /// Takes the changes since the last call, in slot, class and position order, one per
@@ -240,14 +303,18 @@ impl BlockTables {
         changed
             .into_iter()
             .map(|((slot, class, position), allocated)| {
-                let entry = self.entries.get(&(slot, class, position));
+                let run = self.run(slot, class, position);
+                let writable = self
+                    .entries
+                    .get(&(slot, class, position))
+                    .is_some_and(|(_, writable, _)| *writable);
 
                 Change {
                     slot,
                     class,
                     position,
-                    run: entry.map(|(run, ..)| *run),
-                    reset: allocated && entry.is_some_and(|(_, writable, _)| *writable),
+                    run,
+                    reset: allocated && run.is_some() && writable,
                 }
             })
             .collect()
@@ -332,8 +399,9 @@ impl BlockTables {
 
                 let mut entries = Vec::new();
                 for (index, block) in runs.chunks(runs.len() / blocks).enumerate() {
-                    if let Some(run) = self.own_run(block)? {
-                        entries.push((*class, position(*at, index)?, run, true));
+                    let reached = self.reached(block)?;
+                    if !reached.is_empty() {
+                        entries.push((*class, position(*at, index)?, reached, true));
                     }
                 }
 
@@ -363,8 +431,9 @@ impl BlockTables {
 
                 let mut entries = Vec::new();
                 for (index, run) in runs.iter().enumerate() {
-                    if let Some(run) = self.own_run(std::slice::from_ref(run))? {
-                        entries.push((*class, position(*at, index)?, run, false));
+                    let reached = self.reached(std::slice::from_ref(run))?;
+                    if !reached.is_empty() {
+                        entries.push((*class, position(*at, index)?, reached, false));
                     }
                 }
 
@@ -382,13 +451,25 @@ impl BlockTables {
                 check_stated(slot, *stated)?;
 
                 // A block of several runs states one item per run under one class and
-                // position; the rank keeps the one in its regions.
-                let mut kept: BTreeMap<(u8, u32), (Run, bool)> = BTreeMap::new();
+                // position; the rank keeps those the process maps, one at most in its own
+                // memory.
+                let mut kept: BTreeMap<(u8, u32), (Vec<Run>, bool)> = BTreeMap::new();
                 for &(class, position, run, private) in runs {
-                    if !self.maps(run)? {
+                    check_run(run)?;
+                    if !self.reaches(run.0) {
                         continue;
                     }
-                    if kept.insert((class, position), (run, private)).is_some() {
+
+                    let (held, _) = kept
+                        .entry((class, position))
+                        .or_insert((Vec::new(), private));
+                    held.push(run);
+                    if held
+                        .iter()
+                        .filter(|run| self.regions.contains(&run.0))
+                        .count()
+                        > 1
+                    {
                         return Err(Error::Invalid(format!(
                             "`Transferred` states two runs in the rank's regions at position \
                              {position} of class {class}"
@@ -397,7 +478,7 @@ impl BlockTables {
                 }
                 let entries: Vec<_> = kept
                     .into_iter()
-                    .map(|((class, position), (run, private))| (class, position, run, private))
+                    .map(|((class, position), (runs, private))| (class, position, runs, private))
                     .collect();
 
                 self.check_attach(*owner, slot)?;
@@ -419,14 +500,13 @@ impl BlockTables {
                     keys,
                     from,
                     to,
+                    encodings,
                     ..
                 },
             ) => self.queue(
                 id,
-                *group,
-                keys.len(),
-                from,
-                to,
+                (*group, keys.len()),
+                (from, to, *encodings),
                 Some((*owner, slot, *class, *at, false)),
             ),
 
@@ -439,14 +519,13 @@ impl BlockTables {
                     keys,
                     from,
                     to,
+                    encodings,
                     ..
                 },
             ) => self.queue(
                 id,
-                *group,
-                keys.len(),
-                from,
-                to,
+                (*group, keys.len()),
+                (from, to, *encodings),
                 Some((*owner, slot, *class, *at, true)),
             ),
 
@@ -457,9 +536,10 @@ impl BlockTables {
                     keys,
                     from,
                     to,
+                    encodings,
                     ..
                 },
-            ) => self.queue(id, *group, keys.len(), from, to, None),
+            ) => self.queue(id, (*group, keys.len()), (from, to, *encodings), None),
 
             (
                 Request::Finish { copy, ok: true, .. },
@@ -583,21 +663,20 @@ impl BlockTables {
         }
     }
 
-    /// Whether the rank maps the region of `run`.
+    /// Whether the rank's own memory holds `run`.
     ///
     /// # Errors
     ///
-    /// A run without units, or one whose last unit is past the unit axis.
-    fn maps(&self, run: Run) -> Result<bool> {
-        let (region, first, count) = run;
-        if count == 0 || first.checked_add(count).is_none() {
-            return Err(Error::Invalid(format!(
-                "a completion states the run of {count} units from unit {first} of region \
-                 {region}, which is no run of units"
-            )));
-        }
+    /// As [`check_run`].
+    fn own(&self, run: Run) -> Result<bool> {
+        check_run(run)?;
+        Ok(self.regions.contains(&run.0))
+    }
 
-        Ok(self.regions.contains(&region))
+    /// Whether the process maps `region`: the rank's own memory, or another rank's product
+    /// buffer that the rank's device reaches.
+    fn reaches(&self, region: u8) -> bool {
+        self.regions.contains(&region) || self.peers.contains(&region)
     }
 
     /// The bytes of `run`, summed over the ranks that hold a part of its units.
@@ -616,16 +695,28 @@ impl BlockTables {
         }
     }
 
-    /// Of the runs of one block, the one in the rank's regions; `None` for a block that lies
-    /// in other ranks' memory alone.
-    fn own_run(&self, block: &[Run]) -> Result<Option<Run>> {
-        let mut kept = None;
+    /// Of the runs of one block, those the process maps, in their order; empty for a block that
+    /// lies in memory the process does not map.
+    ///
+    /// # Errors
+    ///
+    /// A run that is no run of units ([`check_run`]), or a block with two runs in the rank's own
+    /// memory.
+    fn reached(&self, block: &[Run]) -> Result<Vec<Run>> {
+        let mut kept = Vec::new();
+        let mut own = false;
         for &run in block {
-            if self.maps(run)? && kept.replace(run).is_some() {
-                return Err(Error::Invalid(format!(
-                    "a block has two runs in the rank's regions, the second in region {}",
-                    run.0
-                )));
+            if self.own(run)? {
+                if own {
+                    return Err(Error::Invalid(format!(
+                        "a block has two runs in the rank's regions, the second in region {}",
+                        run.0
+                    )));
+                }
+                own = true;
+            }
+            if self.reaches(run.0) {
+                kept.push(run);
             }
         }
 
@@ -713,9 +804,9 @@ impl BlockTables {
     fn put(&mut self, owner: OwnerId, slot: u32, entries: Vec<Entry>, allocated: bool) {
         self.slots.entry(owner).or_insert((slot, false));
 
-        for (class, position, run, writable) in entries {
+        for (class, position, runs, writable) in entries {
             self.entries
-                .insert((slot, class, position), (run, writable, owner));
+                .insert((slot, class, position), (runs, writable, owner));
             self.changed.insert((slot, class, position), allocated);
         }
     }
@@ -735,10 +826,11 @@ impl BlockTables {
         }
     }
 
-    /// Queues the copies of request `id`: for each of `keys` keys, from the run of `from` to
-    /// the run of `to`, with the bytes they move over the group. `destination` is the owner,
-    /// the slot its entries are kept under, the class, the first position and whether the
-    /// request is a clone, for a request whose copies fill positions.
+    /// Queues the copies of request `id`, which its completion states for `keys` keys of
+    /// `group`: for each key, from the run of `from` to the run of `to`, in `encodings` when the
+    /// source's is not the destination's, with the bytes they move over the group.
+    /// `destination` is the owner, the slot its entries are kept under, the class, the first
+    /// position and whether the request is a clone, for a request whose copies fill positions.
     ///
     /// The copy of an owner the table no longer holds, whose `Detach` or `Transfer` was applied
     /// before its `Copy` arrived, is queued all the same, since it must run and end with its
@@ -746,10 +838,8 @@ impl BlockTables {
     fn queue(
         &mut self,
         id: RequestId,
-        group: GroupId,
-        keys: usize,
-        from: &[Run],
-        to: &[Run],
+        (group, keys): (GroupId, usize),
+        (from, to, encodings): (&[Run], &[Run], Option<Encodings>),
         destination: Option<(OwnerId, u32, u8, u32, bool)>,
     ) -> Result<()> {
         self.check_group(group)?;
@@ -774,7 +864,7 @@ impl BlockTables {
         // what it writes, whichever ranks hold the runs.
         let mut bytes: u64 = 0;
         for (index, (&source, &target)) in from.iter().zip(to).enumerate() {
-            let (reads, writes) = (self.maps(source)?, self.maps(target)?);
+            let (reads, writes) = (self.own(source)?, self.own(target)?);
             bytes = bytes.saturating_add(self.bytes(source)?.max(self.bytes(target)?));
 
             // A position whose block lies in the rank's memory gets an entry, so the rank must
@@ -786,20 +876,27 @@ impl BlockTables {
                     target.0, source.0
                 )));
             }
-
             if reads && writes {
                 runs.push((source, target));
+            }
 
-                // Only a clone's block is its owner's to write; a loaded one is read-only
-                // whatever answers the `Finish`.
-                if let Some((_, _, class, at, cloned)) = destination {
-                    entries.push((class, position(at, index)?, target, cloned));
-                }
+            // A destination the process maps becomes an entry: in the rank's own memory the
+            // rank fills it, in another rank's product buffer that rank does. Only a clone's
+            // block is its owner's to write; a loaded one is read-only whatever answers the
+            // `Finish`.
+            if let Some((_, _, class, at, cloned)) = destination
+                && self.reaches(target.0)
+            {
+                entries.push((class, position(at, index)?, vec![target], cloned));
             }
         }
 
-        self.queued
-            .push_back((BlockCopy { request: id, runs }, bytes));
+        let copy = BlockCopy {
+            request: id,
+            runs,
+            encodings,
+        };
+        self.queued.push_back((copy, bytes));
         if let Some((owner, ..)) = destination {
             self.destinations.insert(id, (owner, false, entries));
         }
@@ -929,6 +1026,7 @@ mod tests {
             from: from.to_vec(),
             to: to.to_vec(),
             evicted: vec![],
+            encodings: None,
         };
 
         let slot = slot_of(tables, owner);
@@ -1242,6 +1340,7 @@ mod tests {
             from: vec![(DEVICE, 30, 1)],
             to: vec![(DEVICE, 31, 1)],
             evicted: vec![],
+            encodings: None,
         };
         tables.map(1, RequestId(5), &clone, &copy).unwrap();
 
@@ -1278,6 +1377,7 @@ mod tests {
             from: vec![(DEVICE, 5, 1), (DEVICE, 6, 1)],
             to: vec![(HOST, 0, 1), (HOST, 1, 1)],
             evicted: vec![],
+            encodings: None,
         };
         tables.map(0, RequestId(10), &store, &copy).unwrap();
         load(&mut tables, 11, 1, 0, &[(HOST, 2, 1)], &[(DEVICE, 7, 1)]).unwrap();
@@ -1289,6 +1389,7 @@ mod tests {
             from: vec![(9, 0, 1)],
             to: vec![(HOST, 5, 1)],
             evicted: vec![],
+            encodings: None,
         };
         assert!(tables.map(0, RequestId(12), &store, &unstated).is_err());
 
@@ -1466,6 +1567,7 @@ mod tests {
             from: vec![(HOST, 0, 1)],
             to: vec![(DEVICE, 7, 1)],
             evicted: vec![],
+            encodings: None,
         };
         tables.map(1, RequestId(5), &request, &completion).unwrap();
         assert_eq!(tables.slot(OwnerId(1)), None);
@@ -1477,7 +1579,8 @@ mod tests {
             tables.start_copy(),
             Some(BlockCopy {
                 request: RequestId(5),
-                runs: vec![((HOST, 0, 1), (DEVICE, 7, 1))]
+                runs: vec![((HOST, 0, 1), (DEVICE, 7, 1))],
+                encodings: None,
             })
         );
         tables.apply(&finish(5, true)).unwrap();
@@ -1571,6 +1674,7 @@ mod tests {
             from: vec![(HOST, 0, 3)],
             to: vec![(OTHER_PRODUCTS, 20, 3)],
             evicted: vec![],
+            encodings: None,
         };
         tables.map(1, RequestId(3), &encoded, &loaded).unwrap();
         let store = Request::Store {
@@ -1584,6 +1688,7 @@ mod tests {
             from: vec![(OTHER_PRODUCTS, 23, 3)],
             to: vec![(HOST, 3, 3)],
             evicted: vec![],
+            encodings: None,
         };
         tables.map(0, RequestId(4), &store, &stored).unwrap();
 
@@ -1596,7 +1701,8 @@ mod tests {
                 tables.start_copy(),
                 Some(BlockCopy {
                     request: RequestId(request),
-                    runs: vec![]
+                    runs: vec![],
+                    encodings: None,
                 })
             );
         }
@@ -1606,5 +1712,122 @@ mod tests {
             .map(1, RequestId(5), &finish(3, true), &Completion::Loaded)
             .unwrap();
         assert_eq!(entries(&tables, 1, 6), []);
+    }
+
+    #[test]
+    fn a_rank_keeps_every_run_its_process_maps_and_runs_the_copies_of_its_own_memory() {
+        // This rank's product buffer and the one of the other rank of its process.
+        let mut tables = tables().with_peers(&[OTHER_PRODUCTS]);
+        attach(&mut tables, 1, 1);
+
+        // A product backed by both ranks: the entry keeps both runs, and the device table and
+        // the kernels address the rank's own.
+        let products = Request::Allocate {
+            owner: OwnerId(1),
+            class: 5,
+            at: 0,
+            count: 1,
+            units: 3,
+        };
+        let allocated = Completion::Allocated {
+            runs: vec![(PRODUCTS, 0, 3), (OTHER_PRODUCTS, 8, 3)],
+            evicted: vec![],
+        };
+        tables.map(1, RequestId(1), &products, &allocated).unwrap();
+        assert_eq!(
+            tables.runs(1, 5, 0),
+            [(PRODUCTS, 0, 3), (OTHER_PRODUCTS, 8, 3)]
+        );
+        assert_eq!(tables.run(1, 5, 0), Some((PRODUCTS, 0, 3)));
+        assert!(tables.writable(1, 5, 0));
+
+        // A block the other rank alone holds is an entry this rank reaches, with nothing for
+        // its own device table to address.
+        tables.take_changes();
+        let pin = Request::Pin {
+            owner: OwnerId(1),
+            class: 6,
+            at: 0,
+            keys: keys(1),
+        };
+        let pinned = Completion::Pinned {
+            runs: vec![(OTHER_PRODUCTS, 12, 2)],
+            host: 0,
+        };
+        tables.map(1, RequestId(2), &pin, &pinned).unwrap();
+        assert_eq!(tables.runs(1, 6, 0), [(OTHER_PRODUCTS, 12, 2)]);
+        assert_eq!(tables.run(1, 6, 0), None);
+        assert_eq!(entries(&tables, 1, 6), []);
+        assert_eq!(
+            tables.take_changes(),
+            [Change {
+                slot: 1,
+                class: 6,
+                position: 0,
+                run: None,
+                reset: false
+            }]
+        );
+
+        // A load into the other rank's buffer is that rank's copy, which this rank starts with
+        // its batch and does not run; its destination is an entry here once it is answered. The
+        // copy carries the encodings its completion names.
+        let load = Request::Load {
+            owner: OwnerId(1),
+            class: 6,
+            at: 1,
+            keys: keys(1),
+        };
+        let copy = Completion::Copy {
+            group: GROUP,
+            keys: keys(1),
+            from: vec![(HOST, 4, 3)],
+            to: vec![(OTHER_PRODUCTS, 0, 3)],
+            evicted: vec![],
+            encodings: Some(([1; 32], [2; 32])),
+        };
+        tables.map(1, RequestId(3), &load, &copy).unwrap();
+        assert_eq!(
+            tables.start_copy(),
+            Some(BlockCopy {
+                request: RequestId(3),
+                runs: vec![],
+                encodings: Some(([1; 32], [2; 32])),
+            })
+        );
+        tables.apply(&finish(3, true)).unwrap();
+        tables
+            .map(1, RequestId(4), &finish(3, true), &Completion::Loaded)
+            .unwrap();
+        assert_eq!(tables.runs(1, 6, 1), [(OTHER_PRODUCTS, 0, 3)]);
+        assert!(!tables.writable(1, 6, 1));
+
+        // An owner that moves in keeps the runs its process maps of each block, one at most in
+        // the rank's own memory.
+        let transfer = Request::Transfer {
+            owner: OwnerId(2),
+            group: GROUP,
+            after: vec![],
+        };
+        let transferred = Completion::Transferred {
+            slot: 4,
+            runs: vec![
+                (5, 0, (OTHER_PRODUCTS, 14, 2), true),
+                (5, 0, (PRODUCTS, 6, 2), true),
+                (5, 0, (9, 0, 2), true),
+            ],
+        };
+        tables
+            .map(4, RequestId(5), &transfer, &transferred)
+            .unwrap();
+        assert_eq!(
+            tables.runs(4, 5, 0),
+            [(OTHER_PRODUCTS, 14, 2), (PRODUCTS, 6, 2)]
+        );
+        assert_eq!(tables.run(4, 5, 0), Some((PRODUCTS, 6, 2)));
+
+        // A detach takes the owner's entries, every run of each with them.
+        tables.apply(&detach(2)).unwrap();
+        assert_eq!(tables.runs(4, 5, 0), []);
     }
 }

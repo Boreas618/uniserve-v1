@@ -409,6 +409,7 @@ mod tests {
                     tier: Tier::Device,
                     space: format!("slots-{}", id.0),
                     unit_bytes: 256,
+                    part_bytes: 256,
                     reserved: 1,
                     units: 9,
                     limit: 9,

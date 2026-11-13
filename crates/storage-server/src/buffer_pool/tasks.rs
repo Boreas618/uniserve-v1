@@ -283,7 +283,7 @@ impl BufferPool {
             match self.cache.get(key) {
                 Some(entry) if entry.class != class => break,
                 Some(Entry {
-                    host: Some((_, maker)),
+                    host: Some((_, maker, _)),
                     ..
                 }) => {
                     if !copies.is_empty() || !self.visible(*maker, queue.0) {
@@ -336,7 +336,7 @@ impl BufferPool {
         let mut copies: Vec<Copy> = Vec::new();
         for key in keys {
             let Some(Entry {
-                host: Some((host, None)),
+                host: Some((host, None, _)),
                 remote: false,
                 ..
             }) = self.cache.get(key)
@@ -399,30 +399,38 @@ impl BufferPool {
         // A task answered at its deadline caches nothing more.
         if self.answers.contains_key(&task) {
             let class = copy.write.class;
+            // A prefetched copy is taken as written in the encoding of the class the prefetch
+            // names; a session that no longer states the class caches nothing of it.
+            let written = self.class(task.0.0, class).ok();
+            let written = written.map(|found| (found.tensors, found.encoding));
             let done = match self.cache.get_mut(&key) {
                 // The remote store holds the content of the key's host copy.
                 Some(entry) if remote => {
                     let same = entry
                         .host
                         .as_ref()
-                        .is_some_and(|(host, _)| Rc::ptr_eq(host, &copy.write));
+                        .is_some_and(|(host, ..)| Rc::ptr_eq(host, &copy.write));
                     entry.remote |= same;
                     same
                 }
                 None if remote => false,
                 // What the remote store and the peers hold is what every epoch may use.
-                Some(entry) if entry.host.is_none() && entry.class == class => {
-                    entry.host = Some((Rc::clone(&copy.write), None));
-                    copy.write.cached.set(Some(key));
-                    true
-                }
+                Some(entry) if entry.host.is_none() && entry.class == class => match written {
+                    Some(encoding) => {
+                        entry.host = Some((Rc::clone(&copy.write), None, encoding));
+                        copy.write.cached.set(Some(key));
+                        true
+                    }
+                    None => false,
+                },
                 // R4: the key gained a host copy meanwhile and keeps it.
                 Some(entry) => {
-                    let maker = entry.host.as_ref().and_then(|(_, maker)| *maker);
+                    let maker = entry.host.as_ref().and_then(|(_, maker, _)| *maker);
                     entry.class == class && self.visible(maker, task.0.0)
                 }
+                None if written.is_none() => false,
                 None => {
-                    let host = Some((Rc::clone(&copy.write), None));
+                    let host = written.map(|encoding| (Rc::clone(&copy.write), None, encoding));
                     copy.write.cached.set(Some(key));
                     self.cache.insert(
                         key,

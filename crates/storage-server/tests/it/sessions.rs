@@ -37,13 +37,20 @@ pub(crate) const KV: u8 = 0;
 pub(crate) const UNITS: usize = 0;
 pub(crate) const HOST: usize = 3;
 
-/// A region of a layout.
-fn region(name: &str, tier: Tier, unit_bytes: u64, reserved: u32, units: u32) -> Region {
+/// A region of a layout, its units of `unit_bytes` in parts of `part_bytes`.
+fn region(
+    name: &str,
+    tier: Tier,
+    (unit_bytes, part_bytes): (u64, u64),
+    reserved: u32,
+    units: u32,
+) -> Region {
     Region {
         name: name.into(),
         tier,
         space: name.into(),
         unit_bytes,
+        part_bytes,
         reserved,
         units,
         limit: reserved + units,
@@ -61,15 +68,17 @@ pub(crate) fn layout(epoch: u64) -> Open {
         epoch,
         trial: false,
         regions: vec![
-            region("units", Tier::Device, 64, 1, 8),
-            region(&format!("prefill rows {epoch}"), Tier::Device, 8, 1, 2),
-            region(&format!("decode rows {epoch}"), Tier::Device, 8, 1, 2),
-            region("host", Tier::Host, 32, 0, 4),
+            region("units", Tier::Device, (64, 32), 1, 8),
+            region(&format!("prefill rows {epoch}"), Tier::Device, (8, 8), 1, 2),
+            region(&format!("decode rows {epoch}"), Tier::Device, (8, 8), 1, 2),
+            region("host", Tier::Host, (32, 16), 0, 4),
         ],
         classes: vec![Class {
             units: 1,
             host: Some((HOST as u8, 1)),
             state_in_slot: false,
+            tensors: [0; 32],
+            encoding: [0; 32],
         }],
         trajectory: KV,
         groups: vec![

@@ -1102,6 +1102,7 @@ mod tests {
             from: vec![(9, 0, 1), (9, 1, 1)],
             to: vec![(4, 2, 1), (4, 3, 1)],
             evicted: Vec::new(),
+            encodings: None,
         };
         let answers = exchange(&mut bench, load(3), &copy);
         assert_eq!(answers[0].2, load(2));

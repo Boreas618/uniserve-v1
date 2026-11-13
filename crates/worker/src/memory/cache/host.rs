@@ -173,6 +173,31 @@ pub fn page_shape(layout: &CacheLayout, group: usize) -> Result<PageShape> {
     })
 }
 
+/// The digests the buffer pool's class of `group` states for a cache of `layout` split over
+/// `ranks` tensor ranks (`storage::runtime::Class::{tensors, encoding}`): the logical content of
+/// its pages ([`content_digest`]), and its byte layout on every rank ([`layout_digest`]) with the
+/// number of ranks a block's units are split over. A host copy of another layout is answered with
+/// both encodings and is not converted, so it counts as a miss.
+///
+/// # Errors
+///
+/// For a group the layout does not hold.
+pub fn class_digests(
+    layout: &CacheLayout,
+    group: usize,
+    ranks: u32,
+) -> Result<([u8; 32], [u8; 32])> {
+    let entry = layout
+        .groups
+        .get(group)
+        .ok_or_else(|| Error::Invalid(format!("the cache holds no group {group}")))?;
+
+    let mut encoding = ::storage::key::Digest::new(b"uniserve-page-class-encoding");
+    encoding.bytes(&layout_digest(layout, entry));
+    encoding.number(u64::from(ranks));
+    Ok((content_digest(layout, entry), encoding.finish()))
+}
+
 /// The page identity of each of `layout`'s groups for a model whose weights are `fingerprint`
 /// (`PrefixCacheInfo::identities`): the weights and the group's logical page content, as
 /// `|`-separated parts. The scheduler seeds the group's page keys at every tier from it

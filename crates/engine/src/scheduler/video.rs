@@ -619,11 +619,12 @@ impl Scheduler {
         u8::try_from(first.checked_add(kind)?).ok()
     }
 
-    /// The units of the session's region `region` (an index into its regions) that hold `bytes`:
-    /// at least one, since a block has a size.
+    /// The units of the session's region `region` (an index into its regions) that hold `bytes`
+    /// on one rank, a part of each unit (`Region::part_bytes`): at least one, since a block has a
+    /// size.
     fn units_in(&self, region: u8, bytes: u64) -> Option<u32> {
         let (_, stated) = self.regions.get(usize::from(region))?;
-        let units = bytes.div_ceil(stated.unit_bytes.max(1)).max(1);
+        let units = bytes.div_ceil(stated.part_bytes.max(1)).max(1);
         u32::try_from(units).ok()
     }
 }
@@ -959,6 +960,7 @@ mod tests {
             tier,
             space: name.to_owned(),
             unit_bytes,
+            part_bytes: unit_bytes,
             reserved: 0,
             units: 1 << 20,
             limit: 1 << 20,
@@ -968,11 +970,15 @@ mod tests {
             units: 0,
             host,
             state_in_slot: false,
+            tensors: [0; 32],
+            encoding: [0; 32],
         };
         let mut classes = vec![Class {
             units: 1,
             host: None,
             state_in_slot: false,
+            tensors: [0; 32],
+            encoding: [0; 32],
         }];
         classes.extend(PRODUCTS.iter().map(|_| sized(None)));
         classes.push(sized(Some((LATENTS, 0))));

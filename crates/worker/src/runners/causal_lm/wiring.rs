@@ -183,6 +183,15 @@ pub fn page_work(
         match work {
             PageWork::Tables(changes) => cache.apply(changes, stream.as_ref())?,
             PageWork::Copies(copies) => {
+                // The cache copies a unit's bytes as its own layout holds them: a copy from a
+                // host copy of another encoding is refused, and the executor reports it failed.
+                if let Some(copy) = copies.iter().find(|copy| copy.encodings.is_some()) {
+                    return Err(Error::Unsupported(format!(
+                        "the copies of request {} read a block of another encoding, which the \
+                         cache does not convert",
+                        copy.request.0
+                    )));
+                }
                 let runs: Vec<(Run, Run)> = copies
                     .iter()
                     .flat_map(|copy| copy.runs.iter().copied())

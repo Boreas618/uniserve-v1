@@ -204,16 +204,17 @@ impl BufferPool {
     }
 
     /// Opens a region named `name` of `limit` units over a memory space, of
-    /// which the first `reserved` are never allocated. R10: its units enter
-    /// it from the quota, up to `units` of them; the region states how many
-    /// did.
+    /// which the first `reserved` are never allocated, each unit of
+    /// `unit_bytes` over its ranks and `part_bytes` on one of them. R10: its
+    /// units enter it from the quota, up to `units` of them; the region
+    /// states how many did.
     #[allow(clippy::too_many_arguments)]
     pub fn open_region(
         &mut self,
         name: &str,
         tier: Tier,
         space: u8,
-        unit_bytes: u64,
+        (unit_bytes, part_bytes): (u64, u64),
         reserved: u32,
         units: u32,
         limit: u32,
@@ -229,7 +230,8 @@ impl BufferPool {
             })
             .flatten();
         let id = reused.unwrap_or(self.regions.len()) as u8;
-        let mut region = Region::new(id, name, tier, space, unit_bytes, reserved, 0, limit);
+        let bytes = (unit_bytes, part_bytes);
+        let mut region = Region::new(id, name, tier, space, bytes, reserved, 0, limit);
         if let Some(quota) = self.quota.get_mut(usize::from(space)) {
             region.grow(units, |offset, bytes| remove_range(quota, offset, bytes));
         }
@@ -329,7 +331,7 @@ impl BufferPool {
                 &stated.name,
                 stated.tier,
                 space,
-                stated.unit_bytes,
+                (stated.unit_bytes, stated.part_bytes),
                 stated.reserved,
                 stated.units,
                 stated.limit,
@@ -338,9 +340,8 @@ impl BufferPool {
 
         let number = |index: u8| numbers[usize::from(index)];
         let classes = open.classes.iter().map(|class| Class {
-            units: class.units,
             host: class.host.map(|(region, units)| (number(region), units)),
-            state_in_slot: class.state_in_slot,
+            ..class.clone()
         });
         let groups = open.groups.iter().map(|group| {
             let memory = self
@@ -463,16 +464,21 @@ impl BufferPool {
                 return Err(format!("region {} is stated twice", region.name));
             }
             let end = region.reserved.checked_add(region.units);
+            // A unit is a whole number of parts, one on each rank that holds one.
+            let parts = region.part_bytes > 0 && region.unit_bytes % region.part_bytes == 0;
             if region.unit_bytes == 0
+                || !parts
                 || region.tier == Tier::Remote
                 || end.is_none_or(|end| end > region.limit)
             {
                 return Err(format!(
-                    "region {} states {} reserved and {} units of {} bytes in {}, on {:?}",
+                    "region {} states {} reserved and {} units of {} bytes, parts of {}, in {}, \
+                     on {:?}",
                     region.name,
                     region.reserved,
                     region.units,
                     region.unit_bytes,
+                    region.part_bytes,
                     region.limit,
                     region.tier
                 ));
@@ -482,6 +488,7 @@ impl BufferPool {
                 let same = found.tier == region.tier
                     && space == Some(&region.space)
                     && found.unit_bytes == region.unit_bytes
+                    && found.part_bytes == region.part_bytes
                     && found.span() == (region.reserved, region.limit);
                 if !same {
                     return Err(format!(
@@ -754,7 +761,7 @@ impl BufferPool {
                 .device
                 .iter_mut()
                 .map(|(_, maker)| maker)
-                .chain(entry.host.iter_mut().map(|(_, maker)| maker));
+                .chain(entry.host.iter_mut().map(|(_, maker, _)| maker));
             for maker in makers {
                 if *maker == Some(epoch) {
                     *maker = None;
@@ -780,9 +787,9 @@ impl BufferPool {
             |maker: &Option<u64>| maker.is_some_and(|epoch| !self.trial.contains_key(&epoch));
         let mut copies = Vec::new();
         for (key, entry) in &self.cache {
-            let blocks = entry.device.iter().chain(&entry.host);
             copies.extend(
-                blocks
+                entry
+                    .copies()
                     .filter(|(_, maker)| rolled(maker))
                     .map(|(block, _)| (*key, block.region())),
             );

@@ -13,8 +13,8 @@ use storage::protocol::Key;
 use storage::runtime::{Cause, Completion, GroupId, OwnerId, RequestId, Stamps, Tier};
 
 use super::{
-    Block, BufferPool, ClientId, Copy, Deferred, EVERYWHERE, Entry, Held, QueueId, SLOT, Taken,
-    Target,
+    Block, BufferPool, ClientId, Copy, Deferred, EVERYWHERE, Encoding, Entry, Held, QueueId, SLOT,
+    Taken, Target,
 };
 
 impl BufferPool {
@@ -67,15 +67,42 @@ impl BufferPool {
     }
 
     /// The units of a host copy of a block of a class: the configured size,
-    /// or the units that hold the block's bytes.
+    /// or the units whose part on one rank holds what the block holds on one
+    /// rank. Each rank copies its own part of the block to its own part of
+    /// the host block: a share of every unit of a block whose units exist on
+    /// every rank of its region, the whole of a block that lies in one
+    /// rank's memory (`storage::runtime::Region::part_bytes`).
     fn host_units(&self, client: ClientId, class: u8, block: &Block) -> Result<(u8, u32), Cause> {
         let (region, units) = self.class(client, class)?.host.ok_or(Cause::Class)?;
         if units > 0 {
             return Ok((region, units));
         }
-        let bytes = u64::from(block.units()) * self.regions[usize::from(block.region())].unit_bytes;
-        let size = bytes.div_ceil(self.regions[usize::from(region)].unit_bytes);
+        let part = self.regions[usize::from(block.region())].part_bytes;
+        let bytes = u64::from(block.units()) * part;
+        let size = bytes.div_ceil(self.regions[usize::from(region)].part_bytes);
         Ok((region, u32::try_from(size).map_err(|_| Cause::Size)?))
+    }
+
+    /// Whether the owners of a class may be given a host copy written in
+    /// `written`, and the encodings its copy names: `None` when the copy is
+    /// in the class's own encoding and its bytes are copied as they are.
+    /// R1: a copy of other tensors is not loaded or restored for the class,
+    /// nor one outside the class's host region, which its ranks do not map
+    /// (`specs/buffer-pool.md` §13).
+    fn convertible(
+        &self,
+        client: ClientId,
+        class: u8,
+        host: &Block,
+        written: Encoding,
+    ) -> Result<Option<Encoding>, Cause> {
+        let found = self.class(client, class)?;
+        let region = found.host.map(|(region, _)| region);
+        if written.0 != found.tensors || region != Some(host.region()) {
+            return Err(Cause::Class);
+        }
+
+        Ok((written.1 != found.encoding).then_some((written.1, found.encoding)))
     }
 
     /// R5: a clone is a new private block that the executor fills from the
@@ -126,12 +153,14 @@ impl BufferPool {
             deadline: None,
         };
         self.hold_copies((queue, id), vec![copy]);
+        // A clone reads and writes one region, which is memory of one layout.
         Ok(Some(Completion::Copy {
             group,
             keys: vec![key],
             from,
             to,
             evicted,
+            encodings: None,
         }))
     }
 
@@ -159,18 +188,20 @@ impl BufferPool {
         let memory = self.memory(client, group);
 
         // The leading keys that have a host copy the epoch may use and that
-        // the owner cannot pin instead. For each, the host block, and the
-        // device block to fill where the key has one that is valid in other
-        // memories only and that a copy of this epoch may join (R8).
+        // the owner cannot pin instead, all in the encoding of the first,
+        // whose copy names one pair of encodings. For each, the host block,
+        // and the device block to fill where the key has one that is valid
+        // in other memories only and that a copy of this epoch may join (R8).
         let mut sources = Vec::new();
+        let mut encoded: Option<(Encoding, Option<Encoding>)> = None;
         for key in keys {
             let Some(entry) = self.cache.get(key).filter(|entry| entry.class == class) else {
                 break;
             };
-            let Some((host, _)) = entry
+            let Some((host, _, written)) = entry
                 .host
                 .as_ref()
-                .filter(|(_, maker)| self.visible(*maker, client))
+                .filter(|(_, maker, _)| self.visible(*maker, client))
             else {
                 break;
             };
@@ -195,11 +226,24 @@ impl BufferPool {
                 }
                 _ => None,
             };
+            // R1: a first key whose host copy the class cannot be given
+            // refuses the request; a later one ends the leading keys.
+            let converted = match self.convertible(client, class, host, *written) {
+                Ok(converted) => converted,
+                Err(cause) if sources.is_empty() => return Err(cause),
+                Err(_) => break,
+            };
+            match encoded {
+                Some((first, _)) if first != *written => break,
+                Some(_) => {}
+                None => encoded = Some((*written, converted)),
+            }
             sources.push((*key, Rc::clone(host), fills));
         }
         if sources.is_empty() {
             return Ok(Some(Completion::Loaded));
         }
+        let encodings = encoded.and_then(|(_, converted)| converted);
         if !self.free_positions(client, owner, class, at, sources.len() as u32) {
             return Err(Cause::Position);
         }
@@ -213,11 +257,12 @@ impl BufferPool {
         let size = if size > 0 {
             size
         } else {
-            // A sized class: the device block holds the host block's bytes.
+            // A sized class: the device block holds on each rank what one
+            // part of the host block holds (`Self::host_units`).
             let host = &sources[0].1;
             let bytes =
-                u64::from(host.units()) * self.regions[usize::from(host.region())].unit_bytes;
-            u32::try_from(bytes.div_ceil(self.regions[usize::from(region)].unit_bytes))
+                u64::from(host.units()) * self.regions[usize::from(host.region())].part_bytes;
+            u32::try_from(bytes.div_ceil(self.regions[usize::from(region)].part_bytes))
                 .map_err(|_| Cause::Size)?
         };
         let Some(evicted) = self.room(queue, region, new, size) else {
@@ -258,6 +303,7 @@ impl BufferPool {
             from,
             to,
             evicted,
+            encodings,
         }))
     }
 
@@ -337,6 +383,7 @@ impl BufferPool {
             from,
             to,
             evicted,
+            encodings: None,
         }))
     }
 
@@ -391,6 +438,7 @@ impl BufferPool {
             from,
             to,
             evicted,
+            encodings: None,
         }))
     }
 
@@ -407,16 +455,20 @@ impl BufferPool {
         if self.copied(client, owner) {
             return Err(Cause::Copy);
         }
+        let trajectory = self.trajectory(client)?;
         let entry = self
             .cache
             .get(&key)
-            .filter(|entry| Ok(entry.class) == self.trajectory(client))
+            .filter(|entry| entry.class == trajectory)
             .ok_or(Cause::Key)?;
-        let (host, _) = entry
+        let (host, _, written) = entry
             .host
             .as_ref()
-            .filter(|(_, maker)| self.visible(*maker, client))
+            .filter(|(_, maker, _)| self.visible(*maker, client))
             .ok_or(Cause::Key)?;
+        // A trajectory found by its key under any layout: in another
+        // encoding of its tensors it is restored through the manifest.
+        let encodings = self.convertible(client, trajectory, host, *written)?;
         let host = Rc::clone(host);
 
         let (from, to) = (host.stated().collect(), slot.stated().collect());
@@ -436,6 +488,7 @@ impl BufferPool {
             from,
             to,
             evicted: Vec::new(),
+            encodings,
         }))
     }
 
@@ -571,8 +624,9 @@ impl BufferPool {
     }
 
     /// A store's or a save's copy ended well: the host block is the key's
-    /// host copy, unless the key gained one meanwhile (R4), in which case
-    /// the block just written is released.
+    /// host copy, in the encoding of the class of the session that wrote
+    /// it, unless the key gained one meanwhile (R4), in which case the block
+    /// just written is released.
     fn stored(&mut self, client: ClientId, copy: &Copy, key: Key) -> Completion {
         let class = copy.write.class;
         // A save reads its owner's slot.
@@ -581,6 +635,11 @@ impl BufferPool {
         } else {
             Completion::Stored { keys: Vec::new() }
         };
+        // A copy ends while its session is open, which states its class.
+        let Ok(found) = self.class(client, class) else {
+            return Completion::Done;
+        };
+        let written = (found.tensors, found.encoding);
         let maker = self.made_by(client);
         let entry = self.cache.entry(key).or_insert(Entry {
             class,
@@ -590,7 +649,7 @@ impl BufferPool {
             remote: false,
         });
         if entry.host.is_none() {
-            entry.host = Some((Rc::clone(&copy.write), maker));
+            entry.host = Some((Rc::clone(&copy.write), maker, written));
             copy.write.cached.set(Some(key));
         }
         answer

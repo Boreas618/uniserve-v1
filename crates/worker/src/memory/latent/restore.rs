@@ -14,24 +14,44 @@
 //!
 //! A rank that restores a trajectory saved by ranks of another parallel
 //! configuration (another Ulysses degree, other ranks) holds other rows at
-//! other offsets than any saving rank did. Its copies are the manifest from
-//! the saving ranks' pages it reads (the source epoch) to its own row's pages
-//! (a target world of one rank): a page the rank lays out as a saving rank
-//! did has that page's key and is copied whole (a mapping, which host pages
+//! other offsets than any saving rank did. The buffer pool tells it so: the
+//! saved block records the encoding of the class that saved it, and the
+//! `Restore`'s copy names that encoding beside the restoring class's
+//! (`storage::runtime::Completion::Copy`); the runner that restores the
+//! request computes both layouts of the request's samples from them. Its
+//! copies are the manifest from the saving ranks' pages it reads (the source
+//! epoch, each rank's part of the saved block) to its own row's pages (a
+//! target world of one rank): a page the rank lays out as a saving rank did
+//! has that page's key and is copied whole (a mapping, which host pages
 //! cannot be for device pages); every other region of the rank's samples is
 //! copied from the saved page that holds it, as byte runs split at the saved
-//! pages' bounds. Both epochs lie on the rank's GPU, which reads the host
-//! pages directly, so the manifest's one link is the GPU's to itself. The
-//! copies of a rank depend on the sources and its own pages alone, so ranks
-//! compute their own without agreeing on anything.
+//! pages' bounds ([`crate::memory::buffers::BufferMemory::restored`]). Both
+//! epochs lie on the rank's GPU, which reads the host pages directly, so the
+//! manifest's one link is the GPU's to itself. The copies of a rank depend on
+//! the sources and its own pages alone, so ranks compute their own without
+//! agreeing on anything.
+//!
+//! The class of stored trajectories states its tensors and its encoding by
+//! `storage::runtime::encoding` over the [`Stored`] layouts of the ranks of
+//! its layout, for the largest trajectory its rows hold.
 
 use ::storage::manifest::{self, Gpu, Manifest, StorageLayout};
 use ::storage::protocol::{Link, LinkBandwidth, LinkEnd};
 
 use crate::{Error, Result};
 
+/// The GPU that both epochs of a restore's manifest lie on: the restoring
+/// rank's, which names the manifest's one link and nothing else.
+const GPU: Gpu = [0; 16];
+
+/// The content every page of a restore's manifest holds: the one trajectory
+/// both epochs lay out, so the chunk keys tell layouts apart and nothing
+/// more is needed of them.
+const CONTENT: [u8; 32] = [0; 32];
+
 /// A rank's pages of one request's trajectory: how they hold its samples
 /// and the bytes of one page.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Stored {
     /// How the pages, back to back, hold the rank's part of the samples.
     pub layout: StorageLayout,
@@ -57,20 +77,15 @@ pub struct PageCopy {
 }
 
 /// The copies that fill `target`, the restoring rank's row, from `sources`,
-/// the saving ranks' pages it reads, whose values are `content` (the
-/// trajectory's key, `storage::key::latent_content`), on GPU `gpu`.
+/// the saving ranks' pages it reads, all of one trajectory.
 ///
 /// Fails when a description is malformed, when the sources do not hold
 /// every element the target holds, or when the target holds padding or an
 /// encoding that a copy of bytes does not reproduce.
-pub fn copies(
-    sources: &[Stored],
-    target: &Stored,
-    content: [u8; 32],
-    gpu: Gpu,
-) -> Result<Vec<PageCopy>> {
+pub fn copies(sources: &[Stored], target: &Stored) -> Result<Vec<PageCopy>> {
     let invalid = |error: ::storage::Error| Error::Invalid(format!("a latent restore: {error}"));
-    let fingerprint = |_: &str| Some(content);
+    let gpu = GPU;
+    let fingerprint = |_: &str| Some(CONTENT);
     let paged = |stored: &Stored| {
         manifest::Storage::paged(stored.layout.clone(), stored.page_bytes, &fingerprint)
             .map_err(invalid)
@@ -154,15 +169,17 @@ pub fn copies(
     Ok(copies)
 }
 
+/// The layouts and bytes of sequence-parallel shares of a trajectory, which the tests of the
+/// rank's media memory restore too.
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use ::storage::manifest::{Encoding, Field, Logical, Segment, Span};
 
     use super::*;
 
     impl Stored {
         /// The pages that hold the samples: the pages up to the last one a value lies in.
-        fn pages(&self) -> u64 {
+        pub(crate) fn pages(&self) -> u64 {
             self.layout.bytes.div_ceil(self.page_bytes.max(1))
         }
     }
@@ -177,13 +194,11 @@ mod tests {
     /// Values of an element offset's alignment in the slot's pages.
     const ALIGNMENT: u64 = 16;
 
-    const GPU: Gpu = [9; 16];
-
     /// A rank's slot pages holding rows `video` of the video sample and
     /// rows `audio` of the audio sample, each modality's values row-major
     /// at the next aligned element offset, as the worker lays a
     /// sequence-parallel rank's share out.
-    fn share(video: (u64, u64), audio: (u64, u64)) -> Stored {
+    pub(crate) fn share(video: (u64, u64), audio: (u64, u64)) -> Stored {
         let mut fields = Vec::new();
         let mut cursor = 0;
         for (name, (rows, width), (start, count)) in
@@ -234,7 +249,7 @@ mod tests {
     }
 
     /// The bytes of a rank's slot pages, garbage where no field lies.
-    fn pages(stored: &Stored) -> Vec<u8> {
+    pub(crate) fn pages(stored: &Stored) -> Vec<u8> {
         let mut bytes = vec![0xee; (stored.page_bytes * stored.pages()) as usize];
         for (tensor, field) in stored.layout.fields.iter().enumerate() {
             let rows = &field.logical.segments[0][0].span;
@@ -264,7 +279,7 @@ mod tests {
 
     /// Whether the restored pages hold every value the target lays out
     /// where it lays it out.
-    fn holds_its_samples(target: &Stored, bytes: &[u8]) -> bool {
+    pub(crate) fn holds_its_samples(target: &Stored, bytes: &[u8]) -> bool {
         let expected = pages(target);
         target.layout.fields.iter().all(|field| {
             (0..field.shape[0]).all(|local| {
@@ -282,7 +297,7 @@ mod tests {
     fn two_sequence_parallel_ranks_become_one() {
         let sources = [share((0, 22), (0, 5)), share((22, 18), (5, 7))];
         let target = share((0, 40), (0, 12));
-        let copies = copies(&sources, &target, [1; 32], GPU).unwrap();
+        let copies = copies(&sources, &target).unwrap();
         assert!(holds_its_samples(
             &target,
             &restored(&sources, &target, &copies)
@@ -304,7 +319,7 @@ mod tests {
     fn one_rank_becomes_two_sequence_parallel_ranks() {
         let sources = [share((0, 40), (0, 12))];
         for target in [share((0, 22), (0, 5)), share((22, 18), (5, 7))] {
-            let copies = copies(&sources, &target, [1; 32], GPU).unwrap();
+            let copies = copies(&sources, &target).unwrap();
             assert!(holds_its_samples(
                 &target,
                 &restored(&sources, &target, &copies)
@@ -318,7 +333,7 @@ mod tests {
     fn the_stored_layout_copies_every_page_whole() {
         let sources = [share((0, 22), (0, 5)), share((22, 18), (5, 7))];
         let target = share((22, 18), (5, 7));
-        let mut copies = copies(&sources, &target, [1; 32], GPU).unwrap();
+        let mut copies = copies(&sources, &target).unwrap();
         copies.sort_by_key(|copy| copy.target);
         let pages: Vec<(usize, u64, u64)> = copies
             .iter()
@@ -336,6 +351,6 @@ mod tests {
     #[test]
     fn rows_no_source_holds_are_refused() {
         let sources = [share((0, 22), (0, 5))];
-        assert!(copies(&sources, &share((0, 40), (0, 12)), [1; 32], GPU).is_err());
+        assert!(copies(&sources, &share((0, 40), (0, 12))).is_err());
     }
 }

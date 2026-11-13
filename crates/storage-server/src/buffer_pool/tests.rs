@@ -13,12 +13,18 @@ const KV: u8 = 0;
 const TRAJECTORY: u8 = 1;
 /// A media product: sized, one run on each of two ranks.
 const PRODUCT: u8 = 2;
+/// An encoder output: sized, in the first rank's product buffer, with host
+/// copies in the host encoder pool.
+const ENCODER: u8 = 3;
 
 /// The regions: the KV units, the slot rows of the two groups, the host KV
 /// pool, the host latent pool, and the product buffers of two ranks.
 const UNITS: u8 = 0;
 const HOST: u8 = 3;
 const LATENTS: u8 = 4;
+/// The host encoder pool: units of 256 bytes, a part of 128 on each of two
+/// ranks.
+const ENCODERS: u8 = 7;
 
 const PREFILL: GroupId = GroupId(0);
 const DECODE: GroupId = GroupId(1);
@@ -31,24 +37,28 @@ fn key(byte: u8) -> Key {
     Key([byte; 32])
 }
 
-/// The classes of a session: KV blocks, stored trajectories, media products.
+/// The classes of a session: KV blocks, stored trajectories, media
+/// products, encoder outputs. Each states tensors of its own and the
+/// serving layout's encoding.
 fn classes() -> (Vec<Class>, u8) {
+    laid_out([0; 32])
+}
+
+/// The classes of [`classes`], each in `encoding`: a session of another
+/// parallel configuration of the same computation.
+fn laid_out(encoding: [u8; 32]) -> (Vec<Class>, u8) {
+    let class = |index: u8, units, host| Class {
+        units,
+        host,
+        state_in_slot: false,
+        tensors: [index + 1; 32],
+        encoding,
+    };
     let classes = vec![
-        Class {
-            units: 1,
-            host: Some((HOST, 1)),
-            state_in_slot: false,
-        },
-        Class {
-            units: 0,
-            host: Some((LATENTS, 0)),
-            state_in_slot: false,
-        },
-        Class {
-            units: 0,
-            host: None,
-            state_in_slot: false,
-        },
+        class(KV, 1, Some((HOST, 1))),
+        class(TRAJECTORY, 0, Some((LATENTS, 0))),
+        class(PRODUCT, 0, None),
+        class(ENCODER, 0, Some((ENCODERS, 0))),
     ];
     (classes, TRAJECTORY)
 }
@@ -60,28 +70,36 @@ struct Fixture {
 
 impl Fixture {
     /// A pool with four KV units (1 to 4), two slot rows per group, two host
-    /// KV units and eight host latent units, and one session of two groups
-    /// over two memories.
+    /// KV units, eight host latent units, the product buffers of two ranks
+    /// and sixteen host encoder units, and one session of two groups over
+    /// two memories.
     fn new() -> Self {
         let mut pool = BufferPool::new((1_000, 1_000));
-        for space in 0..7 {
+        for space in 0..8 {
             pool.grant(space, 0, 1 << 20);
         }
         assert_eq!(
-            pool.open_region("units", Tier::Device, 0, 64, 1, 4, 5),
+            pool.open_region("units", Tier::Device, 0, (64, 64), 1, 4, 5),
             UNITS
         );
-        pool.open_region("prefill rows", Tier::Device, 1, 8, 1, 2, 3);
-        pool.open_region("decode rows", Tier::Device, 2, 8, 1, 2, 3);
-        assert_eq!(pool.open_region("host", Tier::Host, 3, 64, 0, 2, 2), HOST);
+        pool.open_region("prefill rows", Tier::Device, 1, (8, 8), 1, 2, 3);
+        pool.open_region("decode rows", Tier::Device, 2, (8, 8), 1, 2, 3);
         assert_eq!(
-            pool.open_region("latents", Tier::Host, 4, 16, 0, 8, 8),
+            pool.open_region("host", Tier::Host, 3, (64, 64), 0, 2, 2),
+            HOST
+        );
+        assert_eq!(
+            pool.open_region("latents", Tier::Host, 4, (16, 16), 0, 8, 8),
             LATENTS
         );
-        pool.open_region("products 0", Tier::Device, 5, 256, 0, 4, 4);
-        pool.open_region("products 1", Tier::Device, 6, 256, 0, 4, 4);
+        pool.open_region("products 0", Tier::Device, 5, (256, 256), 0, 4, 4);
+        pool.open_region("products 1", Tier::Device, 6, (256, 256), 0, 4, 4);
+        assert_eq!(
+            pool.open_region("encoders", Tier::Host, 7, (256, 128), 0, 16, 16),
+            ENCODERS
+        );
 
-        let regions = || vec![vec![UNITS], Vec::new(), vec![5, 6]];
+        let regions = || vec![vec![UNITS], Vec::new(), vec![5, 6], vec![5]];
         pool.open(
             SERVING,
             1,
@@ -602,13 +620,20 @@ fn a_clone_is_a_new_private_block_filled_by_the_executor() {
         from,
         to,
         evicted,
+        encodings,
     }) = fixture.answer(id)
     else {
         panic!("no copy")
     };
     assert_eq!(
-        (group, keys, from, evicted),
-        (PREFILL, vec![key(7)], vec![(UNITS, cached, 1)], Vec::new())
+        (group, keys, from, evicted, encodings),
+        (
+            PREFILL,
+            vec![key(7)],
+            vec![(UNITS, cached, 1)],
+            Vec::new(),
+            None
+        )
     );
     // R5: the destination is another block than the cached one.
     assert_ne!(to, [(UNITS, cached, 1)]);
@@ -904,6 +929,260 @@ fn a_product_is_one_run_on_every_backing_rank() {
     assert_eq!((fixture.free(5), fixture.free(6)), (1, 1));
     assert_eq!(fixture.detach(1, Vec::new()), Some(Completion::Done));
     assert_eq!((fixture.free(5), fixture.free(6)), (4, 4));
+}
+
+#[test]
+fn an_encoder_output_is_stored_whole_onto_one_rank_s_part() {
+    let mut fixture = Fixture::new();
+    fixture.attach(1, PREFILL);
+
+    // An output of three units of the first rank's product buffer: 768 bytes, committed.
+    let allocate = Request::Allocate {
+        owner: OwnerId(1),
+        class: ENCODER,
+        at: 0,
+        count: 1,
+        units: 3,
+    };
+    assert!(matches!(
+        fixture.ask(allocate),
+        Some(Completion::Allocated { runs, .. }) if runs == [(5, 0, 3)]
+    ));
+    let commit = Request::Commit {
+        owner: OwnerId(1),
+        class: ENCODER,
+        at: 0,
+        key: key(8),
+        tokens: 0,
+        after: Vec::new(),
+    };
+    assert_eq!(fixture.ask(commit), Some(Completion::Committed));
+
+    // Its host copy takes the six host units whose part on the rank holds 768 bytes, not the
+    // three whose bytes over both ranks do.
+    let store = fixture.submit(
+        QUEUE,
+        Request::Store {
+            group: PREFILL,
+            keys: vec![key(8)],
+            tier: Tier::Host,
+        },
+    );
+    let Some(Completion::Copy { from, to, .. }) = fixture.answer(store) else {
+        panic!("no copy")
+    };
+    assert_eq!((from, to), (vec![(5, 0, 3)], vec![(ENCODERS, 0, 6)]));
+    assert_eq!(
+        fixture.finish(store, true),
+        Some(Completion::Stored { keys: Vec::new() })
+    );
+
+    // Loaded back, the device block holds what the rank's part holds: three product units.
+    assert_eq!(fixture.detach(1, Vec::new()), Some(Completion::Done));
+    assert_eq!(
+        fixture.ask(Request::Evict { keys: vec![key(8)] }),
+        Some(Completion::Evicted { keys: vec![key(8)] })
+    );
+    fixture.attach(2, PREFILL);
+    let load = Request::Load {
+        owner: OwnerId(2),
+        class: ENCODER,
+        at: 0,
+        keys: vec![key(8)],
+    };
+    let Some(Completion::Copy { from, to, .. }) = fixture.ask(load) else {
+        panic!("no copy")
+    };
+    assert_eq!((from, to), (vec![(ENCODERS, 0, 6)], vec![(5, 0, 3)]));
+}
+
+#[test]
+fn a_trajectory_saved_under_one_layout_is_restored_under_another_through_the_manifest() {
+    let mut fixture = Fixture::new();
+    fixture.attach(1, PREFILL);
+    let save = fixture.submit(
+        QUEUE,
+        Request::Save {
+            owner: OwnerId(1),
+            key: key(5),
+            units: 3,
+        },
+    );
+    assert_eq!(fixture.finish(save, true), Some(Completion::Saved));
+
+    // A session of another parallel configuration, the same tensors in another encoding, and
+    // one whose trajectories are other tensors; each group's slot rows are the decode group's.
+    let group = || {
+        (
+            GroupId(0),
+            0,
+            2,
+            vec![vec![UNITS], Vec::new(), vec![5, 6], vec![5]],
+        )
+    };
+    let (other, unlike) = ((2, 0), (3, 0));
+    fixture
+        .pool
+        .open(2, 2, false, laid_out([9; 32]), vec![group()]);
+    let (mut classes, trajectory) = laid_out([9; 32]);
+    classes[usize::from(TRAJECTORY)].tensors = [7; 32];
+    fixture
+        .pool
+        .open(3, 3, false, (classes, trajectory), vec![group()]);
+
+    let restore = |owner| Request::Restore {
+        owner: OwnerId(owner),
+        key: key(5),
+    };
+    for queue in [QUEUE, other, unlike] {
+        fixture.submit(
+            queue,
+            Request::Attach {
+                owner: OwnerId(4),
+                group: GroupId(0),
+            },
+        );
+    }
+
+    // The layout that saved it copies its bytes as they are; the other names both encodings.
+    let same = fixture.submit(QUEUE, restore(4));
+    assert!(matches!(
+        fixture.answer(same),
+        Some(Completion::Copy {
+            encodings: None,
+            ..
+        })
+    ));
+    let across = fixture.submit(other, restore(4));
+    let Some(Completion::Copy {
+        from, encodings, ..
+    }) = fixture.answer(across)
+    else {
+        panic!("no copy")
+    };
+    assert_eq!(
+        (from, encodings),
+        (vec![(LATENTS, 0, 3)], Some(([0; 32], [9; 32])))
+    );
+    let id = fixture.submit(
+        other,
+        Request::Finish {
+            copy: across,
+            ok: true,
+            after: Vec::new(),
+        },
+    );
+    assert_eq!(fixture.answer(id), Some(Completion::Restored));
+
+    // R1: other tensors are refused, and the scheduler takes the refusal as a miss.
+    let refused = fixture.submit(unlike, restore(4));
+    assert_eq!(
+        fixture.answer(refused),
+        Some(Completion::Refused {
+            cause: Cause::Class
+        })
+    );
+}
+
+#[test]
+fn a_load_names_the_encoding_of_the_host_copies_it_reads() {
+    let mut fixture = Fixture::new();
+    let regions = vec![vec![UNITS], Vec::new(), vec![5, 6], vec![5]];
+    fixture.pool.open(
+        2,
+        2,
+        false,
+        laid_out([9; 32]),
+        vec![(GroupId(0), 0, 1, regions)],
+    );
+    let other = (2, 0);
+
+    // Key 7 stored by the serving layout, key 8 by the other one, each from a block it committed.
+    fixture.cached(1, 7);
+    for request in [
+        Request::Attach {
+            owner: OwnerId(1),
+            group: GroupId(0),
+        },
+        Request::Allocate {
+            owner: OwnerId(1),
+            class: KV,
+            at: 0,
+            count: 1,
+            units: 0,
+        },
+        Request::Commit {
+            owner: OwnerId(1),
+            class: KV,
+            at: 0,
+            key: key(8),
+            tokens: 64,
+            after: Vec::new(),
+        },
+        Request::Detach {
+            owner: OwnerId(1),
+            after: Vec::new(),
+        },
+    ] {
+        fixture.submit(other, request);
+    }
+    for (queue, name, group) in [(QUEUE, 7, PREFILL), (other, 8, GroupId(0))] {
+        let store = fixture.submit(
+            queue,
+            Request::Store {
+                group,
+                keys: vec![key(name)],
+                tier: Tier::Host,
+            },
+        );
+        fixture.answer(store);
+        let id = fixture.submit(
+            queue,
+            Request::Finish {
+                copy: store,
+                ok: true,
+                after: Vec::new(),
+            },
+        );
+        fixture.answer(id);
+    }
+    assert_eq!(
+        fixture.ask(Request::Evict {
+            keys: vec![key(7), key(8)]
+        }),
+        Some(Completion::Evicted {
+            keys: vec![key(7), key(8)]
+        })
+    );
+
+    // One copy names one pair of encodings: the leading keys written in the first one's.
+    fixture.attach(2, PREFILL);
+    let load = |keys: Vec<Key>| Request::Load {
+        owner: OwnerId(2),
+        class: KV,
+        at: 0,
+        keys,
+    };
+    let Some(Completion::Copy {
+        keys, encodings, ..
+    }) = fixture.ask(load(vec![key(7), key(8)]))
+    else {
+        panic!("no copy")
+    };
+    assert_eq!((keys, encodings), (vec![key(7)], None));
+
+    let Some(Completion::Copy {
+        keys, encodings, ..
+    }) = fixture.ask(Request::Load {
+        owner: OwnerId(2),
+        class: KV,
+        at: 1,
+        keys: vec![key(8)],
+    })
+    else {
+        panic!("no copy")
+    };
+    assert_eq!((keys, encodings), (vec![key(8)], Some(([9; 32], [0; 32]))));
 }
 
 #[test]
@@ -1347,7 +1626,7 @@ fn a_resize_moves_free_units_between_a_region_and_the_quota() {
     // bytes that left this one.
     let other = fixture
         .pool
-        .open_region("other layout", Tier::Device, 0, 128, 0, 0, 2);
+        .open_region("other layout", Tier::Device, 0, (128, 128), 0, 0, 2);
     let grow = Request::Resize {
         region: other,
         units: 2,

@@ -119,6 +119,14 @@ pub struct Region {
     pub space: String,
     /// The bytes of a unit, summed over the ranks that hold a part of it.
     pub unit_bytes: u64,
+    /// The bytes of one rank's part of a unit: every rank that holds a part
+    /// of the region's units holds this many of each, so `unit_bytes` is a
+    /// whole number of parts; `unit_bytes` itself for memory of one rank
+    /// (slot rows, a product buffer). A block whose bytes lie in one rank's
+    /// memory is copied to that rank's part of a host block alone, so its
+    /// host copy takes the units whose part on one rank holds the block's
+    /// bytes, and a block loaded from it the units that hold a part's.
+    pub part_bytes: u64,
     /// The units before this one are never allocated: unit 0 and the
     /// executor's scratch units of a cache, row 0 of the slot rows.
     pub reserved: u32,
@@ -147,6 +155,65 @@ pub struct Class {
     pub host: Option<(u8, u32)>,
     /// Whether the class's live state is in the slot, which a clone cannot copy.
     pub state_in_slot: bool,
+    /// The digest of the logical tensors a block of the class holds, whatever
+    /// their layout ([`encoding`]): a host copy written for a class of other
+    /// tensors is never loaded or restored for this one.
+    pub tensors: [u8; 32],
+    /// The digest of the layout the class's blocks are written in: which
+    /// part of each logical tensor each rank holds and where its bytes lie
+    /// ([`encoding`]). A host copy records the encoding of the class that
+    /// wrote it; a `Load` or a `Restore` of a copy of the same tensors in
+    /// another encoding is answered with a [`Completion::Copy`] that names
+    /// both, and the executor runs it through the copy manifest of the two.
+    pub encoding: [u8; 32],
+}
+
+/// The digests a class states of the layout its blocks are written in, from
+/// the storage layout of a block on each rank of the layout, in rank order
+/// (`manifest::StorageLayout`; for a sized class, the largest block its
+/// memory is sized for): `(tensors, encoding)`.
+///
+/// `tensors` names the logical tensors the fields hold (their names, element
+/// types and dimensions), so every parallel configuration of one computation
+/// states the same one. `encoding` names the whole layout, every rank's
+/// fields with the parts they hold and where their bytes lie, so two
+/// configurations that lay a block out alike state the same one, and a copy
+/// between two that do not needs the copy manifest of the two.
+///
+/// # Errors
+///
+/// A layout the manifest's encoding cannot write.
+pub fn encoding(ranks: &[crate::manifest::StorageLayout]) -> Result<([u8; 32], [u8; 32])> {
+    // A sized class's blocks hold tensors of the shapes their requests give them, so a
+    // tensor is named without its shape.
+    let mut tensors: Vec<(&str, &str, u64, &[String])> = ranks
+        .iter()
+        .flat_map(|rank| &rank.fields)
+        .map(|field| {
+            let (tensor, dtype) = (field.tensor.as_str(), field.dtype.as_str());
+            (tensor, dtype, field.element, &field.logical.dims[..])
+        })
+        .collect();
+    tensors.sort_unstable();
+    tensors.dedup();
+
+    let mut named = crate::key::Digest::new(b"uniserve-class-tensors");
+    for (tensor, dtype, element, dims) in tensors {
+        named.text(tensor);
+        named.text(dtype);
+        named.number(element);
+        named.number(dims.len() as u64);
+        for dim in dims {
+            named.text(dim);
+        }
+    }
+
+    let encoded = rmp_serde::to_vec(ranks)
+        .map_err(|error| Error::Protocol(format!("encoding a class's layout: {error}")))?;
+    let mut laid = crate::key::Digest::new(b"uniserve-class-encoding");
+    laid.bytes(&encoded);
+
+    Ok((named.finish(), laid.finish()))
 }
 
 /// One worker group of the epoch.
@@ -334,12 +401,19 @@ pub enum Completion {
     Duplicate,
     /// Copies for the group's executor to run: for each of `keys`, from the
     /// run of `from` to the run of `to`; and the keys evicted for the destinations.
+    /// `encodings` is `None` when what the copies read is in the encoding of
+    /// the class they write ([`Class::encoding`]), whose bytes they copy as
+    /// they are; otherwise it is the encoding the source was written in and
+    /// the class's, and the copies go through the copy manifest of the two.
+    /// A host run states the same units in every rank's part, so each rank
+    /// reaches every part of the source the manifest has it read.
     Copy {
         group: GroupId,
         keys: Vec<Key>,
         from: Vec<Run>,
         to: Vec<Run>,
         evicted: Vec<Key>,
+        encodings: Option<([u8; 32], [u8; 32])>,
     },
     Cloned,
     Loaded,
@@ -399,6 +473,10 @@ impl Writer<'_> {
 
     fn key(&mut self, key: &Key) {
         self.0.extend_from_slice(&key.0);
+    }
+
+    fn digest(&mut self, digest: &[u8; 32]) {
+        self.0.extend_from_slice(digest);
     }
 
     fn keys(&mut self, keys: &[Key]) {
@@ -464,9 +542,13 @@ impl Reader<'_> {
     }
 
     fn key(&mut self) -> Result<Key> {
-        let mut key = [0; 32];
-        key.copy_from_slice(self.take(32)?);
-        Ok(Key(key))
+        Ok(Key(self.digest()?))
+    }
+
+    fn digest(&mut self) -> Result<[u8; 32]> {
+        let mut digest = [0; 32];
+        digest.copy_from_slice(self.take(32)?);
+        Ok(digest)
     }
 
     /// A list's length, refused when the record cannot hold that many
@@ -867,6 +949,7 @@ impl Completion {
                 from,
                 to,
                 evicted,
+                encodings,
             } => {
                 writer.byte(8);
                 writer.byte(group.0);
@@ -874,6 +957,12 @@ impl Completion {
                 writer.runs(from);
                 writer.runs(to);
                 writer.keys(evicted);
+                // A flag, then the source's encoding and the destination's.
+                writer.byte(u8::from(encodings.is_some()));
+                if let Some((source, destination)) = encodings {
+                    writer.digest(source);
+                    writer.digest(destination);
+                }
             }
             Self::Cloned => writer.byte(9),
             Self::Loaded => writer.byte(10),
@@ -969,6 +1058,11 @@ impl Completion {
                 from: reader.runs()?,
                 to: reader.runs()?,
                 evicted: reader.keys()?,
+                encodings: if reader.flag()? {
+                    Some((reader.digest()?, reader.digest()?))
+                } else {
+                    None
+                },
             },
             9 => Self::Cloned,
             10 => Self::Loaded,
@@ -1163,6 +1257,15 @@ mod tests {
                 from: vec![(4, 0, 1)],
                 to: vec![(0, 3, 1)],
                 evicted: vec![],
+                encodings: None,
+            },
+            Completion::Copy {
+                group: GroupId(0),
+                keys: vec![key(3)],
+                from: vec![(4, 5, 3)],
+                to: vec![(1, 2, 1)],
+                evicted: vec![key(4)],
+                encodings: Some(([5; 32], [6; 32])),
             },
             Completion::Cloned,
             Completion::Loaded,
@@ -1219,5 +1322,58 @@ mod tests {
         // The number of a record is readable whatever follows it.
         assert_eq!(number(&unknown), Some(RequestId(1)));
         assert_eq!(number(&record[..4]), None);
+    }
+
+    /// A rank's layout holding rows `start..start + count` of a `[rows, 4]`
+    /// float32 tensor `name`, row-major from byte 0.
+    fn rows(name: &str, rows: u64, (start, count): (u64, u64)) -> crate::manifest::StorageLayout {
+        use crate::manifest::{Encoding, Field, Logical, Segment, Span};
+
+        let field = Field {
+            tensor: name.to_owned(),
+            source: String::new(),
+            dtype: "float32".into(),
+            element: 4,
+            offset: 0,
+            shape: vec![count, 4],
+            strides: vec![4, 1],
+            logical: Logical {
+                shape: vec![rows, 4],
+                dims: vec!["row".into(), "channel".into()],
+                units: vec![1, 0],
+                segments: vec![
+                    vec![Segment {
+                        span: Span::range(start, count),
+                        local: 0,
+                    }],
+                    vec![Segment {
+                        span: Span::range(0, 4),
+                        local: 0,
+                    }],
+                ],
+            },
+            encoding: Encoding::Affine,
+        };
+        crate::manifest::StorageLayout {
+            bytes: count * 16,
+            fields: vec![field],
+        }
+    }
+
+    #[test]
+    fn two_layouts_of_one_tensor_state_its_tensors_alike_and_their_encodings_apart() {
+        let whole = encoding(&[rows("latents", 8, (0, 8))]).unwrap();
+        let halves = encoding(&[rows("latents", 8, (0, 4)), rows("latents", 8, (4, 4))]).unwrap();
+        let again = encoding(&[rows("latents", 8, (0, 4)), rows("latents", 8, (4, 4))]).unwrap();
+        let other = encoding(&[rows("features", 8, (0, 8))]).unwrap();
+
+        // One computation under two parallel configurations: the same tensors, laid out apart.
+        assert_eq!(whole.0, halves.0);
+        assert_ne!(whole.1, halves.1);
+        assert_eq!(halves, again);
+
+        // Another tensor is other tensors, whatever its layout.
+        assert_ne!(other.0, whole.0);
+        assert_ne!(other.1, whole.1);
     }
 }

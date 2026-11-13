@@ -777,6 +777,8 @@ pub(crate) fn layout(ranks: &[LoadedRank], launch: &EngineArgs) -> Result<Open> 
                 name,
                 tier: Tier::Host,
                 unit_bytes: shape.page_bytes * tensor,
+                // Each rank's share of a page lies in the part of its own rank index.
+                part_bytes: shape.page_bytes,
                 reserved: 0,
                 units: pages,
                 limit: pages,
@@ -823,6 +825,7 @@ pub(crate) fn layout(ranks: &[LoadedRank], launch: &EngineArgs) -> Result<Open> 
             name,
             tier: Tier::Device,
             unit_bytes: cache.layout().unit_bytes * tensor,
+            part_bytes: cache.layout().unit_bytes,
             // Unit 0 is the padding unit a pooled table names where a row holds no page.
             reserved: 1,
             units: units.saturating_sub(1),
@@ -847,6 +850,7 @@ pub(crate) fn layout(ranks: &[LoadedRank], launch: &EngineArgs) -> Result<Open> 
                 tier: Tier::Device,
                 // An accounting figure: the rows are memory of the ranks' own processes.
                 unit_bytes: slot_bytes.max(1) * tensor,
+                part_bytes: slot_bytes.max(1),
                 reserved: 1,
                 units: slots,
                 limit: slots + 1,
@@ -865,20 +869,26 @@ pub(crate) fn layout(ranks: &[LoadedRank], launch: &EngineArgs) -> Result<Open> 
 
     // Class `g` is cache group `g`; then the product kinds and the stored trajectories, which a
     // text deployment sizes per request and holds none of.
-    let mut classes: Vec<Class> = layout
-        .groups
-        .iter()
-        .zip(&host_regions)
-        .map(|(group, host)| Class {
+    let ranks_per_unit = u32::try_from(tensor).unwrap_or(u32::MAX);
+    let mut classes: Vec<Class> = Vec::with_capacity(layout.groups.len() + PRODUCTS + 1);
+    for (index, (group, host)) in layout.groups.iter().zip(&host_regions).enumerate() {
+        let (tensors, encoding) = host::class_digests(&layout, index, ranks_per_unit)?;
+        classes.push(Class {
             units: group.units_per_page,
             host: host.map(|region| (region, 1)),
             state_in_slot: group.state(),
-        })
-        .collect();
+            tensors,
+            encoding,
+        });
+    }
+    // A text deployment keeps no product on the host, so no host copy of these classes is
+    // written or compared: they state no tensors and no encoding.
     classes.extend((0..=PRODUCTS).map(|_| Class {
         units: 0,
         host: None,
         state_in_slot: false,
+        tensors: [0; 32],
+        encoding: [0; 32],
     }));
     let trajectory =
         u8::try_from(classes.len() - 1).context("more classes than a session numbers")?;

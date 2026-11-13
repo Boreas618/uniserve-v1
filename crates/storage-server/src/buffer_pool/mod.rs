@@ -201,6 +201,11 @@ struct Owner<B = Rc<Block>> {
     moving: bool,
 }
 
+/// The encoding a host copy is written in: the digests of the tensors and of
+/// the layout of the class that wrote it (`Class::tensors`,
+/// `Class::encoding`).
+type Encoding = ([u8; 32], [u8; 32]);
+
 /// A key's content, per tier.
 #[derive(Serialize, Deserialize)]
 struct Entry<B = Rc<Block>> {
@@ -209,20 +214,30 @@ struct Entry<B = Rc<Block>> {
     /// trial that made it, to which alone it is visible until its update
     /// is committed.
     device: Vec<(B, Option<u64>)>,
-    /// The host copy, with the epoch on trial that made it.
-    host: Option<(B, Option<u64>)>,
+    /// The host copy, with the epoch on trial that made it and the encoding
+    /// it is written in. A device copy needs none: a region is memory of
+    /// one layout, which every session that names it shares.
+    host: Option<(B, Option<u64>, Encoding)>,
     /// 64, or fewer for a request's last block.
     tokens: u16,
     /// The remote store acknowledged a copy.
     remote: bool,
 }
 
+impl<B> Entry<B> {
+    /// Every copy of the key, on the device and then on the host, with the
+    /// epoch on trial that made it.
+    fn copies(&self) -> impl Iterator<Item = (&B, &Option<u64>)> {
+        let device = self.device.iter().map(|(block, maker)| (block, maker));
+        device.chain(self.host.iter().map(|(block, maker, _)| (block, maker)))
+    }
+}
+
 impl Entry {
     /// The key's copy in a region, on the device or on the host.
     fn copy_in(&self, region: u8) -> Option<&Rc<Block>> {
-        let device = self.device.iter().map(|(block, _)| block);
-        device
-            .chain(self.host.iter().map(|(block, _)| block))
+        self.copies()
+            .map(|(block, _)| block)
             .find(|block| block.region() == region)
     }
 }
@@ -793,9 +808,9 @@ impl BufferPool {
         let unheld = |block: &Rc<Block>| block.region() == region && Rc::strong_count(block) == 1;
         let left = if let Some(at) = entry.device.iter().position(|(block, _)| unheld(block)) {
             entry.device.swap_remove(at).0
-        } else if entry.host.as_ref().is_some_and(|(block, _)| unheld(block)) {
+        } else if entry.host.as_ref().is_some_and(|(block, ..)| unheld(block)) {
             match entry.host.take() {
-                Some((block, _)) => block,
+                Some((block, ..)) => block,
                 None => return false,
             }
         } else {
@@ -937,7 +952,7 @@ impl BufferPool {
         // The further leading keys that have a host copy the epoch may use.
         let on_host = |key: &&Key| {
             let host = self.cache.get(*key).and_then(|entry| entry.host.as_ref());
-            host.is_some_and(|(_, maker)| self.visible(*maker, client))
+            host.is_some_and(|(_, maker, _)| self.visible(*maker, client))
         };
         let host = keys[blocks.len()..].iter().take_while(on_host).count() as u32;
 
@@ -1276,7 +1291,7 @@ impl BufferPool {
             let host = entry
                 .host
                 .as_ref()
-                .is_some_and(|(_, maker)| self.visible(*maker, client));
+                .is_some_and(|(_, maker, _)| self.visible(*maker, client));
             let tiers = u8::from(held != 0) | u8::from(host) << 1 | u8::from(entry.remote) << 2;
             if tiers != 0 {
                 keys.push((*key, entry.class, entry.tokens, tiers, held));

@@ -71,6 +71,9 @@ pub(crate) struct Region {
     /// two layouts over the same memory state the same space.
     pub(crate) space: u8,
     pub(crate) unit_bytes: u64,
+    /// The bytes of one rank's part of a unit (`storage::runtime::Region::part_bytes`):
+    /// what a block that lies in one rank's memory holds of each of its units.
+    pub(crate) part_bytes: u64,
     /// The free runs by their first unit; neighbours are joined.
     free: BTreeMap<u32, Run>,
     /// The runs outside the region by their first unit.
@@ -108,14 +111,15 @@ pub(crate) struct Region {
 impl Region {
     /// A region of `limit` units numbered from 0, of which those from
     /// `reserved` to `reserved + units` are in the region and free; the units
-    /// before `reserved` are never allocated, and the rest are outside.
+    /// before `reserved` are never allocated, and the rest are outside. A
+    /// unit is `unit_bytes` over every rank and `part_bytes` on one.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         id: u8,
         name: &str,
         tier: Tier,
         space: u8,
-        unit_bytes: u64,
+        (unit_bytes, part_bytes): (u64, u64),
         reserved: u32,
         units: u32,
         limit: u32,
@@ -125,6 +129,7 @@ impl Region {
             tier,
             space,
             unit_bytes,
+            part_bytes,
             free: BTreeMap::new(),
             outside: BTreeMap::new(),
             units,
@@ -443,7 +448,7 @@ mod tests {
     use super::*;
 
     fn region(units: u32, limit: u32) -> Region {
-        Region::new(0, "units", Tier::Device, 0, 64, 1, units, limit)
+        Region::new(0, "units", Tier::Device, 0, (64, 64), 1, units, limit)
     }
 
     #[test]
