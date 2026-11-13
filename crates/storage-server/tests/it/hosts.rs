@@ -1,7 +1,8 @@
 //! Buffer pools that reach other hosts: a prefetch that reads the host
 //! copies another host's Storage Server holds (a peer), a worker group with
 //! a rank on another host, which a transfer reaches through that host's
-//! Transfer Server, and the deadline of a transfer.
+//! Transfer Server, a product that crosses to a main process of another
+//! host, and the deadline of a transfer.
 //!
 //! Two Storage Servers of this host stand for two hosts, each on a thread
 //! of the test process with a socket and a TCP endpoint of its own; they
@@ -22,9 +23,12 @@ use std::time::{Duration, Instant};
 
 use ::storage::protocol::{
     Allocation, Event, Link, LinkBandwidth, LinkEnd, Move, Region, Request as Message, TaskStatus,
+    UnitRun,
 };
-use ::storage::runtime::{Completion, OwnerId, Request, Source};
-use ::storage::{Access, Client, Location, Role};
+use ::storage::runtime::{
+    Class, Completion, Group, GroupId, Open, OwnerId, Request, Source, Tier, VERSION,
+};
+use ::storage::{Access, Client, Key, Location, Role};
 use storage_server::Launch;
 
 use crate::server::{FORKING, Running, engine_head, head, host, key, memfd, scope, tensor};
@@ -510,6 +514,191 @@ fn a_transfer_reaches_a_rank_of_another_host_through_that_host_s_transfer_server
         (id, Completion::Transferred { .. }) if id == moved
     ));
     assert_eq!(read(&prefill_planes, 16, 32), rewritten);
+}
+
+/// The group that writes products in the main process of the session's
+/// host, and the group that reads them in the main process of another host.
+const WRITER: GroupId = GroupId(0);
+const READER: GroupId = GroupId(1);
+
+/// The class of products, sized, in units of 256 bytes.
+const PRODUCT: u8 = 0;
+
+/// The indices of [`processes`]' product buffers.
+const WRITTEN: usize = 2;
+const RECEIVING: usize = 3;
+
+/// The layout of an epoch whose main processes lie on two hosts: the
+/// writer's rank backs products in the product buffer of process `a`, and
+/// the reader's ranks, in process `b`, read them there, receiving them in
+/// the product buffer of the reader's rank there. Each group is a scheduler
+/// of its own.
+fn processes() -> Open {
+    let region =
+        |name: &str, unit_bytes, reserved, units, memory: &str| ::storage::runtime::Region {
+            name: name.into(),
+            tier: Tier::Device,
+            space: name.into(),
+            unit_bytes,
+            part_bytes: unit_bytes,
+            reserved,
+            units,
+            limit: reserved + units,
+            segments: Vec::new(),
+            memory: memory.into(),
+        };
+    let group = |id, memory: &str, slots, regions, receives| Group {
+        id,
+        memory: memory.into(),
+        slots,
+        regions,
+        receives,
+        parts: Vec::new(),
+    };
+    Open {
+        version: VERSION,
+        epoch: 0,
+        trial: false,
+        regions: vec![
+            region("rows a", 8, 1, 2, ""),
+            region("rows b", 8, 1, 2, ""),
+            region("products a", 256, 0, 4, "process a"),
+            region("products b", 256, 0, 4, "process b"),
+        ],
+        classes: vec![Class {
+            units: 0,
+            host: None,
+            state_in_slot: false,
+            tensors: [1; 32],
+            encoding: [0; 32],
+        }],
+        trajectory: PRODUCT,
+        groups: vec![
+            group(
+                WRITER,
+                "process a",
+                0,
+                vec![vec![WRITTEN as u8]],
+                Vec::new(),
+            ),
+            group(
+                READER,
+                "process b",
+                1,
+                vec![Vec::new()],
+                vec![vec![RECEIVING as u8]],
+            ),
+        ],
+        schedulers: vec![vec![WRITER], vec![READER]],
+        peers: Vec::new(),
+    }
+}
+
+/// Where a rank's product buffer of four units of 256 bytes lies: in the
+/// host tensor `key`.
+fn products(key: Key) -> Vec<UnitRun> {
+    vec![UnitRun {
+        field: "products".into(),
+        key,
+        location: Location::Host { numa_node: None },
+        first: 0,
+        count: 4,
+        offset: 0,
+        bytes: 256,
+    }]
+}
+
+#[test]
+fn a_crossing_copies_a_product_into_a_main_process_of_another_host_through_that_host_s_transfer_server()
+ {
+    let network = tempfile::tempdir().unwrap();
+    let here = network_server(network.path(), None, None);
+    let there = network_server(network.path(), None, None);
+    let location = Some(Location::Host { numa_node: None });
+
+    // The writer's rank, on the session's host, and the reader's, on the
+    // other, each hold a product buffer in storage of its own, retained by
+    // its host's Storage Server; the head states where the reader's lies.
+    let buffers = [memfd(&[0; 1024]), memfd(&[0; 1024])];
+    let mut ranks = Vec::new();
+    for ((server, group, name), buffer) in [(&here, "writer", 10), (&there, "reader", 11)]
+        .into_iter()
+        .zip(&buffers)
+    {
+        let claim = head(&server.socket)
+            .claim(0, vec![scope(group, 0)], Vec::new())
+            .unwrap();
+        let mut worker = rank(&server.socket, group, 0, claim);
+        let buffer_tensor = tensor(key(name), "products", 0, 0, Access::Exclusive);
+        worker
+            .put(vec![buffer_tensor], &[(host(1024), buffer.as_fd())])
+            .unwrap();
+        let region = Region::Tensor {
+            key: key(name),
+            at: location,
+        };
+        link(network.path(), &server.tcp, &region, buffer);
+        ranks.push(worker);
+    }
+    ranks[0]
+        .place(
+            "products a".into(),
+            "process a".into(),
+            0,
+            products(key(10)),
+        )
+        .unwrap();
+    let mut engine = engine_head(&here.socket, 0);
+    let (opened, descriptors) = engine.open_pool(processes()).unwrap();
+    engine
+        .place_remote(
+            "products b".into(),
+            "process b".into(),
+            0,
+            there.tcp.clone(),
+            products(key(11)),
+        )
+        .unwrap();
+    let (written, receiving) = (opened.regions[WRITTEN].0, opened.regions[RECEIVING].0);
+    let mut schedulers = Scheduler::all(&opened, descriptors);
+    let writer = &mut schedulers[0];
+
+    // The writer's batch wrote a product of two units in its rank's buffer.
+    writer.ask(Request::Attach {
+        owner: OwnerId(1),
+        group: WRITER,
+    });
+    let allocate = Request::Allocate {
+        owner: OwnerId(1),
+        class: PRODUCT,
+        at: 0,
+        count: 1,
+        units: 2,
+    };
+    let allocated = Completion::Allocated {
+        runs: vec![(written, 0, 2)],
+        evicted: Vec::new(),
+    };
+    assert_eq!(writer.ask(allocate), allocated);
+    let product = pattern(512, 7);
+    buffers[0].write_all_at(&product, 0).unwrap();
+
+    // The crossing takes a run in the reader's buffer, which the other
+    // host's Transfer Server fills from this host's.
+    let crossing = Request::Replicate {
+        owner: OwnerId(1),
+        class: PRODUCT,
+        at: 0,
+        from: written,
+        group: READER,
+        after: Vec::new(),
+    };
+    let replicated = Completion::Replicated {
+        runs: vec![(receiving, 0, 2)],
+    };
+    assert_eq!(writer.ask(crossing), replicated);
+    assert_eq!(read(&buffers[1], 0, 512), product);
+    assert_eq!(read(&buffers[1], 512, 512), [0; 512], "only the run moves");
 }
 
 #[test]

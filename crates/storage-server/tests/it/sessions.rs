@@ -1056,6 +1056,144 @@ fn a_put_and_a_prefetch_move_each_part_through_the_connector_of_its_host() {
     assert_eq!(prefill.next(), (put, stored));
 }
 
+/// Two groups whose ranks of one index lie on two hosts, each copying with
+/// the parts of its own host: a prefetch fills the host parts of the group
+/// it is for and a put reads those that hold the copy, each through the
+/// connector of their host, and a peer reads a copy only from parts that
+/// hold it.
+#[test]
+fn host_parts_of_one_index_on_two_hosts_are_kept_apart() {
+    let here = Running::with_transfer(|_| None);
+    let there = Running::with_transfer(|_| None);
+    // The test plays each server's connector.
+    let mut connectors =
+        [&here, &there].map(|server| Client::connect(&server.socket, Role::Connector).unwrap());
+
+    // The prefill group's ranks copy with the parts of host a, the
+    // session's, and the decode group's with those of host b, where the
+    // engine's peer opened the host regions alone. Each rank takes its part
+    // at its host's server and states its host there; the head states where
+    // the decode ranks' parts lie.
+    let mut open = layout(0);
+    open.groups[0].parts = vec![vec![("a".into(), 0), ("a".into(), 1)]];
+    open.groups[1].parts = vec![vec![("b".into(), 0), ("b".into(), 1)]];
+    let scopes = |group| vec![scope(group, 0), scope(group, 1)];
+    let claim = head(&here.socket)
+        .claim(0, scopes("prefill"), Vec::new())
+        .unwrap();
+    let mut engine = engine_head(&here.socket, 0);
+    let (opened, descriptors) = engine.open_pool(open.clone()).unwrap();
+    let mut hosts = open;
+    hosts.regions.retain(|region| region.tier == Tier::Host);
+    hosts.classes.clear();
+    hosts.groups.clear();
+    hosts.schedulers.clear();
+    let there_claim = head(&there.socket)
+        .claim(0, scopes("decode"), Vec::new())
+        .unwrap();
+    let mut peer = engine_head(&there.socket, 0);
+    peer.open_pool(hosts).unwrap();
+    let mut ranks = Vec::new();
+    for index in 0..2 {
+        for (server, group, claimed, host) in [
+            (&here, "prefill", claim, "a"),
+            (&there, "decode", there_claim, "b"),
+        ] {
+            let mut part = rank(&server.socket, group, index, claimed);
+            part.host_part("host".into(), index, 16, None).unwrap();
+            part.place("host".into(), host.into(), index, Vec::new())
+                .unwrap();
+            ranks.push(part);
+        }
+        engine
+            .place_remote(
+                "host".into(),
+                "b".into(),
+                index,
+                there.tcp.clone(),
+                Vec::new(),
+            )
+            .unwrap();
+    }
+    for connector in &mut connectors {
+        for _ in 0..2 {
+            assert!(matches!(
+                connector_event(connector),
+                Event::Pool { slots: 4, .. }
+            ));
+        }
+    }
+    let mut schedulers = Scheduler::all(&opened, descriptors);
+
+    // Each group's prefetch fills the parts of its own host, through that
+    // host's connector, part by part.
+    for (scheduler, group, byte, unit) in [(1, DECODE, 8, 0), (0, PREFILL, 9, 1)] {
+        let prefetch = schedulers[scheduler].submit(Request::Prefetch {
+            group,
+            class: KV,
+            units: 0,
+            keys: vec![key(byte)],
+            source: Source::Remote,
+            deadline: u64::MAX / 2,
+        });
+        for _ in 0..2 {
+            run_pages(
+                &mut connectors[scheduler],
+                false,
+                &[(key(byte), unit)],
+                vec![true],
+            );
+        }
+        let found = Completion::Prefetched { found: 1 };
+        assert_eq!(schedulers[scheduler].next(), (prefetch, found));
+    }
+    let listed = Completion::Listing {
+        keys: vec![
+            (key(8), KV, 64, 0b010, 0, 0b10),
+            (key(9), KV, 64, 0b010, 0, 0b01),
+        ],
+    };
+    assert_eq!(schedulers[0].ask(Request::List), listed);
+
+    // A put reads each copy from the parts that hold it, on their host.
+    for (connector, byte, unit) in [(1, 8, 0), (0, 9, 1)] {
+        let put = schedulers[0].submit(Request::Store {
+            group: PREFILL,
+            keys: vec![key(byte)],
+            tier: Tier::Remote,
+        });
+        for _ in 0..2 {
+            run_pages(
+                &mut connectors[connector],
+                true,
+                &[(key(byte), unit)],
+                vec![true],
+            );
+        }
+        let stored = Completion::Stored {
+            keys: vec![key(byte)],
+        };
+        assert_eq!(schedulers[0].next(), (put, stored));
+    }
+
+    // A peer reads a region's copies from the parts its first copy lies in;
+    // the second, which other parts hold, is left out.
+    let mut reader = Client::connect_peer(&here.tcp, Duration::from_secs(30)).unwrap();
+    let (copies, mut parts) = reader
+        .peer_hold("model".into(), vec![key(8), key(9)])
+        .unwrap();
+    let held: Vec<Key> = copies.iter().map(|copy| copy.key).collect();
+    assert_eq!(held, [key(8)]);
+    parts.sort_by_key(|part| part.rank);
+    let part = |rank| RegionPart {
+        region: "host".into(),
+        rank,
+        bytes: 16,
+        endpoint: Some(there.tcp.clone()),
+    };
+    assert_eq!(parts, [part(0), part(1)]);
+}
+
 #[test]
 fn a_peer_holds_the_host_copies_it_reads_until_it_releases_them() {
     let server = Running::with_transfer(|_| None);

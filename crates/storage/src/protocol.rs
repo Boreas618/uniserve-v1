@@ -1181,8 +1181,11 @@ pub enum Request {
     /// group, which holds the same share of every unit in every group of
     /// the layout. It replaces what was stated before for the region, memory
     /// and part. The server turns a task's runs into copies with it,
-    /// matching the ranks of two memories by their part. Responded with
-    /// [`Response::Placed`].
+    /// matching the ranks of two memories by their part. For a host region,
+    /// `memory` names the host the part the rank took ([`Request::HostPart`])
+    /// lies on, as the layout's host parts name it
+    /// (`runtime::Group::parts`), with no run: a task reaches a host part
+    /// only where a place states it. Responded with [`Response::Placed`].
     Place {
         region: String,
         memory: String,
@@ -1197,7 +1200,9 @@ pub enum Request {
     /// that host's Storage Server, listening at `endpoint`, whose Transfer
     /// Server reaches them: a task writing them runs there, and one reading
     /// them here READs them from there. It replaces what was stated before
-    /// for the region, memory and part. Responded with [`Response::Placed`].
+    /// for the region, memory and part. For a host region, `memory` names
+    /// the host, as the rank's [`Request::Place`] there does, with no run.
+    /// Responded with [`Response::Placed`].
     PlaceRemote {
         region: String,
         memory: String,
@@ -1398,7 +1403,9 @@ pub enum Response {
     },
     /// The host copies a [`Request::PeerHold`] holds, and every part of
     /// the host regions they lie in that this server knows: its own host's,
-    /// and those of the ranks of other hosts its sessions' heads stated.
+    /// and those of the ranks of other hosts its sessions' heads stated. A
+    /// region's copies are read from the same parts, one of each index; a
+    /// held copy that does not lie in all of them is left out.
     PeerHeld {
         copies: Vec<HostCopy>,
         parts: Vec<RegionPart>,

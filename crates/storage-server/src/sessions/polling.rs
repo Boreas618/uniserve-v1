@@ -95,16 +95,24 @@ pub(crate) type Notice = Box<dyn FnOnce(&mut Server) + Send>;
 /// its count.
 pub(crate) type NamedRun = (String, u32, u32);
 
+/// A host part as a task names it: the host, as the session's layout names
+/// it (`storage::runtime::Group::parts`), and the part index.
+pub(crate) type HostPart = (String, u32);
+
+/// Memories as a task names them: device memories and main processes'
+/// memories by name, and host parts.
+pub(crate) type Memories = (Vec<String>, Vec<HostPart>);
+
 /// One copy of a task, as the main loop runs it: the key it is for if any,
-/// the runs it reads and writes, the device memories that hold the content
-/// it reads, and the device memory it writes into when it writes one
-/// ([`BufferPool::work`]).
+/// the runs it reads and writes, the memories that hold the content it
+/// reads and those it writes into ([`BufferPool::work`]). A copy of a slot
+/// row, whose units exist once, names no memory.
 pub(crate) type Copied = (
     Option<Key>,
     Vec<NamedRun>,
     Vec<NamedRun>,
-    Vec<String>,
-    Option<String>,
+    Memories,
+    Memories,
 );
 
 /// The three capacity words of a region for a queue pair: `available`,
@@ -611,22 +619,31 @@ impl Hosted {
                 })
                 .collect()
         };
-        // The memories of a validity; none for a slot row, whose units exist once.
-        let memories = |bits: u64| -> Vec<String> {
+        // The memories and the host parts of a validity; none for a slot row,
+        // whose units exist once.
+        let memories = |bits: u64| -> Memories {
             if bits == u64::MAX {
-                return Vec::new();
+                return (Vec::new(), Vec::new());
             }
-            (0..64)
-                .filter(|bit| bits & (1 << bit) != 0)
-                .filter_map(|bit| pool.memory_name(bit).map(str::to_owned))
-                .collect()
+            let set = (0..64).filter(|bit| bits & (1 << bit) != 0);
+            let names = set.clone().filter_map(|bit| pool.memory_name(bit));
+            let parts = set.filter_map(|bit| pool.host_part(bit));
+            (
+                names.map(str::to_owned).collect(),
+                parts.map(|(host, part)| (host.to_owned(), part)).collect(),
+            )
         };
         let copies: Vec<Copied> = pool
             .work(task)
             .into_iter()
             .map(|(key, reads, writes, from, to)| {
-                let to = memories(to).into_iter().next();
-                (key, named(reads), named(writes), memories(from), to)
+                (
+                    key,
+                    named(reads),
+                    named(writes),
+                    memories(from),
+                    memories(to),
+                )
             })
             .collect();
         let deployment = deployment.to_owned();
@@ -990,8 +1007,15 @@ impl Pools {
     }
 
     /// Holds the host copies of `keys` for `peer` ([`BufferPool::hold`]).
-    /// Returns the copies held, by the name of their region.
-    pub(crate) fn hold(&mut self, deployment: &str, peer: u64, keys: &[Key]) -> Vec<HostCopy> {
+    /// Returns the copies held, by the name of their region, each with the
+    /// host parts that hold it: none for a copy of groups that state no host
+    /// parts, which every part of its region holds.
+    pub(crate) fn hold(
+        &mut self,
+        deployment: &str,
+        peer: u64,
+        keys: &[Key],
+    ) -> Vec<(HostCopy, Vec<HostPart>)> {
         let Some(hosted) = self.deployments.get_mut(deployment) else {
             return Vec::new();
         };
@@ -999,17 +1023,26 @@ impl Pools {
         let held = hosted.pool.hold(peer, keys);
         let input = || Input::Hold(peer, keys.to_vec());
         hosted.watch.acted(deployment, &hosted.pool, input);
+
+        let pool = &hosted.pool;
+        let parts = |key: &Key| -> Vec<HostPart> {
+            let bits = pool.held_on(key);
+            (0..64)
+                .filter(|bit| bits & (1 << bit) != 0)
+                .filter_map(|bit| pool.host_part(bit))
+                .map(|(host, part)| (host.to_owned(), part))
+                .collect()
+        };
         held.into_iter()
-            .map(|(key, (region, first, count), tokens)| HostCopy {
-                key,
-                tokens,
-                region: hosted
-                    .pool
-                    .region_name(region)
-                    .unwrap_or_default()
-                    .to_owned(),
-                first,
-                count,
+            .map(|(key, (region, first, count), tokens)| {
+                let copy = HostCopy {
+                    key,
+                    tokens,
+                    region: pool.region_name(region).unwrap_or_default().to_owned(),
+                    first,
+                    count,
+                };
+                (copy, parts(&key))
             })
             .collect()
     }

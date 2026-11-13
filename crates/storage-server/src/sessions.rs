@@ -27,8 +27,12 @@
 //!   several hosts holds on each host only that host's parts, so `Open`
 //!   admits nothing of it. A rank of another host has its part on its own
 //!   host, which the head's [`Request::PlaceRemote`] for that rank names
-//!   (`specs/buffer-pool.md` §15). With them a task's runs turn into the
-//!   Transfer Server's spans and the connector's pages.
+//!   (`specs/buffer-pool.md` §15). The part of one index on each host is a
+//!   host part of its own, which holds the host copies written there: a
+//!   rank states the host its part lies on as it would a memory, and the
+//!   head states it for a rank of another host, and a task reaches a host
+//!   part only where such a place states it. With them a task's runs turn
+//!   into the Transfer Server's spans and the connector's pages.
 //! - **Segments.** The head grants a device region's memory space each
 //!   segment the engine's ranks created ([`Request::Grant`]), and withdraws
 //!   one before they release it ([`Request::Withdraw`]); `Open`'s answer
@@ -38,13 +42,17 @@
 //!   rank of the memory the content is in to the rank of the same index of
 //!   the target memory; a region no rank placed (slot rows, product
 //!   buffers) is memory of the ranks' own processes, whose copies move no
-//!   bytes. The spans into a rank of another host run on that host's
-//!   Transfer Server, and a source on another host is read from there
-//!   ([`hosts`]). A prefetch from the remote store and a put to it go to the
-//!   connector as the pages of each part of the host region, a block of `n`
-//!   units being `n` pages under keys derived from its key ([`unit_key`]);
-//!   the pages of a part on another host go to that host's connector
-//!   ([`Request::Pages`]). A prefetch from the peers holds the keys at the
+//!   bytes. A crossing (`Replicate`) is such a task too, from the run its
+//!   block's writer wrote in one main process's product buffer to the
+//!   block's run in another's. The spans into a rank of another host run on
+//!   that host's Transfer Server, and a source on another host is read from
+//!   there ([`hosts`]). A prefetch from the remote store and a put to it go
+//!   to the connector as the pages of each part of the host region, a block
+//!   of `n` units being `n` pages under keys derived from its key
+//!   ([`unit_key`]): a prefetch's into the host parts it fills, a put's from
+//!   a host part of each index that holds the copy; the pages of a part on
+//!   another host go to that host's connector ([`Request::Pages`]). A
+//!   prefetch from the peers holds the keys at the
 //!   peers the session names, has the Transfer Server of each part's host
 //!   read each held copy from the peer's part of the same index, wherever
 //!   that lies, and keeps what was read only from a peer whose holds stood
@@ -79,7 +87,7 @@ use crate::{
     Attachment, Client, ClientId, Handling, Holder, Server, StorageEntry, StorageId, invalid,
     resource,
 };
-use polling::{Copied, NamedRun};
+use polling::{Copied, HostPart, NamedRun};
 
 #[cfg(doc)]
 use storage::protocol::Request;
@@ -124,10 +132,13 @@ type Pages = (Vec<(Key, u32)>, Vec<usize>);
 /// a unit, summed over the parts, and the bytes of one part.
 type HostRegion = (u32, u64, u64);
 
+/// Where a part of a host region lies: its index, the endpoint of its host's
+/// Storage Server (none for this host) and its bytes of a unit.
+type PartHost = (u32, Option<String>, u64);
+
 /// Where the parts of a host region lie ([`Server::part_hosts`]): how many
-/// parts a unit has, and each part known, by its index, with the endpoint of
-/// its host's Storage Server (none for this host) and its bytes of a unit.
-type PartHosts = (u32, Vec<(u32, Option<String>, u64)>);
+/// parts a unit has, and each part known.
+type PartHosts = (u32, Vec<PartHost>);
 
 /// The server's sessions and what it keeps for the buffer pools.
 pub(crate) struct Sessions {
@@ -212,8 +223,9 @@ struct Running {
     /// tokens its block holds, for the leading copies being read.
     release: Option<mpsc::Sender<()>>,
     reads: Vec<(usize, u16)>,
-    /// For a read from the peers, the block each copy writes.
-    writes: Vec<NamedRun>,
+    /// For a read from the peers, the block each copy writes, with the host
+    /// parts it fills (none for a copy of groups that state no host parts).
+    writes: Vec<(NamedRun, Vec<HostPart>)>,
 }
 
 impl Running {
@@ -408,11 +420,18 @@ fn part_shape(region: &str, rank: u32, bytes: u64) -> PageShape {
     }
 }
 
-/// The spans that copy units `first..first + count` from the runs of one
-/// rank (`from`) into the runs of another (`to`): per field the destination
-/// holds, one span per stretch of units one run of each holds.
-fn spans(from: &[UnitRun], to: &[UnitRun], first: u32, count: u32) -> Result<Vec<Span>, String> {
-    let end = first + count;
+/// The spans that copy `count` units from the runs of one rank (`from`),
+/// from unit `firsts.0` on, into the runs of another (`to`), from unit
+/// `firsts.1` on: per field the destination holds, one span per stretch of
+/// units one run of each holds. A transfer reads and writes the same units
+/// in two memories; a crossing into another region writes units of their
+/// own.
+fn spans(
+    from: &[UnitRun],
+    to: &[UnitRun],
+    (source_first, first): (u32, u32),
+    count: u32,
+) -> Result<Vec<Span>, String> {
     let fields: BTreeSet<&str> = to.iter().map(|run| run.field.as_str()).collect();
     let holding = |runs: &'_ [UnitRun], field: &str, unit: u32| {
         runs.iter()
@@ -421,13 +440,14 @@ fn spans(from: &[UnitRun], to: &[UnitRun], first: u32, count: u32) -> Result<Vec
     };
     let mut spans = Vec::new();
     for field in fields {
-        let mut unit = first;
-        while unit < end {
+        let mut done = 0;
+        while done < count {
+            let (read, unit) = (source_first + done, first + done);
             let (Some(source), Some(destination)) =
-                (holding(from, field, unit), holding(to, field, unit))
+                (holding(from, field, read), holding(to, field, unit))
             else {
                 return Err(format!(
-                    "unit {unit}'s {field} lies in no run of both ranks"
+                    "unit {read}'s {field}, or unit {unit}'s it fills, lies in no run of its rank"
                 ));
             };
             if source.bytes != destination.bytes {
@@ -436,16 +456,15 @@ fn spans(from: &[UnitRun], to: &[UnitRun], first: u32, count: u32) -> Result<Vec
                     source.bytes, destination.bytes
                 ));
             }
-            let stretch = end
-                .min(source.first + source.count)
-                .min(destination.first + destination.count)
-                - unit;
+            let stretch = (count - done)
+                .min(source.first + source.count - read)
+                .min(destination.first + destination.count - unit);
             spans.push(Span {
                 source: Region::Tensor {
                     key: source.key,
                     at: Some(source.location),
                 },
-                source_offset: source.offset + u64::from(unit - source.first) * source.bytes,
+                source_offset: source.offset + u64::from(read - source.first) * source.bytes,
                 destination: Region::Tensor {
                     key: destination.key,
                     at: Some(destination.location),
@@ -457,10 +476,17 @@ fn spans(from: &[UnitRun], to: &[UnitRun], first: u32, count: u32) -> Result<Vec
                 source_pitch: 0,
                 destination_pitch: 0,
             });
-            unit += stretch;
+            done += stretch;
         }
     }
     Ok(spans)
+}
+
+/// Keeps of the parts `hosts` states one of each part index, this host's
+/// where it holds one: the parts a read of a copy all of them hold takes.
+fn one_of_each(hosts: &mut Vec<PartHost>) {
+    hosts.sort_by_key(|(part, at, _)| (*part, at.is_some()));
+    hosts.dedup_by_key(|(part, ..)| *part);
 }
 
 /// The spans that read a host copy a peer holds (`copy`, held at the peer
@@ -742,7 +768,11 @@ impl Server {
         Ok(Handling::Response(Response::Closed, Vec::new()))
     }
 
-    /// See [`Request::Place`], from the worker `holder`.
+    /// See [`Request::Place`], from the worker `holder`. For a host region
+    /// the rank states the host its part lies on, as the layout's host parts
+    /// name it (`storage::runtime::Group::parts`), in place of a memory and
+    /// with no run: the part it took at this server ([`Self::host_part`]),
+    /// which a task reaches as that host's part of its index.
     pub(crate) fn place(
         &mut self,
         holder: &Holder,
@@ -758,12 +788,20 @@ impl Server {
                 run.field
             )));
         }
-        let place = (
-            holder.scope.deployment.clone(),
-            region.to_owned(),
-            memory.to_owned(),
-            part,
-        );
+        let deployment = holder.scope.deployment.clone();
+        let hosted = self
+            .sessions
+            .hosts
+            .contains_key(&(deployment.clone(), region.to_owned()));
+        let taken = (deployment.clone(), region.to_owned(), part);
+        let held = self.sessions.parts.contains_key(&taken);
+        if hosted && (memory.is_empty() || !runs.is_empty() || !held) {
+            return Err(invalid(&format!(
+                "a place of the host region {region} names the host of a part this host holds, \
+                 and no run"
+            )));
+        }
+        let place = (deployment, region.to_owned(), memory.to_owned(), part);
         self.sessions.places.insert(place, (None, runs.to_vec()));
         Ok(Handling::Response(Response::Placed, Vec::new()))
     }
@@ -771,7 +809,9 @@ impl Server {
     /// See [`Request::PlaceRemote`], from the head `id` of `epoch` of
     /// `deployment`: part `part` of `memory` lies on the host whose Storage
     /// Server listens at `endpoint`, and so does that rank's part of every
-    /// host region, which its host's server created for it.
+    /// host region, which its host's server created for it. For a host
+    /// region `memory` names that host, as a rank there stated it
+    /// ([`Self::place`]), with no run.
     pub(crate) fn place_remote(
         &mut self,
         id: ClientId,
@@ -790,6 +830,15 @@ impl Server {
             return Err(invalid(&format!(
                 "a run of {} holds no unit or no byte",
                 run.field
+            )));
+        }
+        let hosted = self
+            .sessions
+            .hosts
+            .contains_key(&(deployment.to_owned(), region.to_owned()));
+        if hosted && (memory.is_empty() || !runs.is_empty()) {
+            return Err(invalid(&format!(
+                "a place of the host region {region} names the host of its part, and no run"
             )));
         }
         let place = (
@@ -1005,6 +1054,60 @@ impl Server {
         (count, hosts)
     }
 
+    /// Where the host parts `named` of the host region `region` of
+    /// `deployment` lie, stated as [`Self::part_hosts`] states parts: how
+    /// many parts a unit has, and each named part a place states, by its
+    /// index, with the endpoint of its host's Storage Server (none for this
+    /// host) and its bytes of a unit. A host part lies on this host when a
+    /// rank of it took the part and stated its host ([`Self::place`]), and on
+    /// another when the head stated it for a rank there
+    /// ([`Self::place_remote`]); a part no place states is left out. Without
+    /// named parts (groups that state none), the parts of the region where
+    /// the ranks of the engine whose session is `session` lie.
+    fn parts_at(
+        &self,
+        deployment: &str,
+        session: Option<PoolSession>,
+        region: &str,
+        named: &[HostPart],
+    ) -> PartHosts {
+        if named.is_empty() {
+            return self.part_hosts(deployment, session, region);
+        }
+        let Some(&(_, unit_bytes, part_bytes)) = self
+            .sessions
+            .hosts
+            .get(&(deployment.to_owned(), region.to_owned()))
+        else {
+            return (0, Vec::new());
+        };
+        let count = u32::try_from(unit_bytes / part_bytes.max(1)).unwrap_or(u32::MAX);
+
+        let placed = |(host, part): &HostPart| {
+            let place = (
+                deployment.to_owned(),
+                region.to_owned(),
+                host.clone(),
+                *part,
+            );
+            let (at, _) = self.sessions.places.get(&place)?;
+            let bytes = match at {
+                None => {
+                    let held = (deployment.to_owned(), region.to_owned(), *part);
+                    self.sessions.parts.get(&held)?.bytes
+                }
+                Some(_) => part_bytes,
+            };
+            Some((*part, at.clone(), bytes))
+        };
+        let parts = named
+            .iter()
+            .filter(|(_, part)| *part < count)
+            .filter_map(placed)
+            .collect();
+        (count, parts)
+    }
+
     /// See [`Request::Pages`], from the head `id` of `deployment`, which
     /// runs a task of its buffer pool on another host.
     pub(crate) fn pages_for(
@@ -1051,7 +1154,13 @@ impl Server {
         Ok(Handling::Response(Response::Submitted { task }, Vec::new()))
     }
 
-    /// See [`Request::PeerHold`], from the peer `id`.
+    /// See [`Request::PeerHold`], from the peer `id`. The peer reads every
+    /// copy of a region from the same parts, one of each part index: those
+    /// the region's first held copy lies in, this host's where it holds one,
+    /// or for a copy of groups that state no host parts every part of the
+    /// region this server knows. A later copy that does not lie in all of
+    /// them is left out of the answer, as a key without a copy is: the peer
+    /// reads a host copy only from host parts that hold it.
     pub(crate) fn peer_hold(
         &mut self,
         id: ClientId,
@@ -1059,22 +1168,43 @@ impl Server {
         keys: &[Key],
     ) -> Result<Handling, (ErrorKind, String)> {
         let (named, held) = (deployment.to_owned(), keys.to_vec());
-        let copies = self
+        let held = self
             .sessions
             .thread
             .call(move |pools| pools.hold(&named, id, &held))
             .unwrap_or_default();
-        let regions: BTreeSet<&str> = copies.iter().map(|copy| copy.region.as_str()).collect();
-        let mut parts = Vec::new();
-        for region in regions {
-            let (_, hosts) = self.part_hosts(deployment, None, region);
-            parts.extend(hosts.into_iter().map(|(rank, endpoint, bytes)| RegionPart {
-                region: region.to_owned(),
-                rank,
-                bytes,
-                endpoint,
-            }));
+
+        // Per region, whether its copies lie in named host parts, and the
+        // parts the peer reads them from.
+        let mut read: BTreeMap<String, (bool, Vec<PartHost>)> = BTreeMap::new();
+        let mut copies = Vec::new();
+        for (copy, holding) in held {
+            let (_, lies) = self.parts_at(deployment, None, &copy.region, &holding);
+            let named = !holding.is_empty();
+            let (stated, parts) = read.entry(copy.region.clone()).or_insert_with(|| {
+                let mut parts = lies.clone();
+                if named {
+                    one_of_each(&mut parts);
+                }
+                (named, parts)
+            });
+            if *stated == named && parts.iter().all(|part| lies.contains(part)) {
+                copies.push(copy);
+            }
         }
+        let parts = read
+            .into_iter()
+            .flat_map(|(region, (_, parts))| {
+                parts
+                    .into_iter()
+                    .map(move |(rank, endpoint, bytes)| RegionPart {
+                        region: region.clone(),
+                        rank,
+                        bytes,
+                        endpoint,
+                    })
+            })
+            .collect();
         Ok(Handling::Response(
             Response::PeerHeld { copies, parts },
             Vec::new(),
@@ -1324,9 +1454,15 @@ impl Server {
             .collect()
     }
 
-    /// A transfer's spans as one task of the Transfer Server of each host
-    /// a destination lies on: this host's, or another's through its
-    /// Storage Server ([`hosts::transfer_at`]). A source on another host
+    /// A transfer's or a crossing's spans as one task of the Transfer Server
+    /// of each host a destination lies on: this host's, or another's through
+    /// its Storage Server ([`hosts::transfer_at`]). A run a copy writes is
+    /// filled from the same run in a memory that holds it (a transfer, and a
+    /// crossing of a region whose units exist in every memory that maps it),
+    /// and otherwise from the copy's one read run: a crossing reads the run
+    /// its writer wrote in one main process's product buffer and writes the
+    /// block's run in another's, which lie in different regions. The ranks of
+    /// the two memories are matched by their part. A source on another host
     /// than its destination's is read from there. Returns whether the task
     /// moves bytes.
     fn transfer_blocks(
@@ -1340,25 +1476,41 @@ impl Server {
         // each with whether its source is storage of this host that
         // another host reads.
         let mut tasks: BTreeMap<Option<String>, Vec<(Span, bool)>> = BTreeMap::new();
-        for (_, reads, writes, from, to) in copies {
-            let Some(to) = to else {
+        for (_, reads, writes, (from, _), (to, _)) in copies {
+            let Some(to) = to.first() else {
                 // The slot row: memory of the ranks' own processes.
                 continue;
             };
-            for ((region, first, count), _) in reads.iter().zip(writes) {
+            for write in writes {
+                let (region, first, count) = write;
+                let read = match (reads.iter().find(|read| *read == write), reads.as_slice()) {
+                    (Some(read), _) | (None, [read]) => read,
+                    _ => return Err(format!("no run the copy reads fills {region}'s")),
+                };
+                let (source_region, source_first, source_count) = read;
+                if source_count != count {
+                    return Err(format!(
+                        "{count} units of {region} would hold {source_count} of {source_region}"
+                    ));
+                }
+
                 // The content is read from a memory that holds it and whose
                 // ranks placed the region's units.
                 let destinations = self.ranks(deployment, region, to);
                 let source = from
                     .iter()
-                    .map(|memory| (memory, self.ranks(deployment, region, memory)))
+                    .map(|memory| (memory, self.ranks(deployment, source_region, memory)))
                     .find(|(_, sources)| !sources.is_empty());
                 let Some((from, sources)) = source else {
-                    if destinations.is_empty() {
+                    // A run of the ranks' own processes that no rank placed
+                    // in either memory moves no bytes; a run filled from
+                    // another region's (a crossing into a product buffer)
+                    // moves its bytes, so both are placed.
+                    if destinations.is_empty() && read == write {
                         continue;
                     }
                     return Err(format!(
-                        "no rank of a memory that holds {region}'s units placed them"
+                        "no rank of a memory that holds {source_region}'s units placed them"
                     ));
                 };
                 if destinations.is_empty() {
@@ -1366,9 +1518,10 @@ impl Server {
                 }
                 for (rank, (at, destination)) in destinations {
                     let (source_at, source) = sources.get(&rank).ok_or_else(|| {
-                        format!("rank {rank} of {from} placed no unit of {region}")
+                        format!("rank {rank} of {from} placed no unit of {source_region}")
                     })?;
-                    for mut span in spans(source, destination, *first, *count)? {
+                    let firsts = (*source_first, *first);
+                    for mut span in spans(source, destination, firsts, *count)? {
                         let here = match (source_at, at) {
                             (source_at, at) if source_at == at => false,
                             (Some(endpoint), _) => {
@@ -1493,7 +1646,10 @@ impl Server {
             running.release = Some(release);
             running.writes = copies
                 .iter()
-                .map(|(_, _, writes, ..)| writes.first().cloned().unwrap_or_default())
+                .map(|(_, _, writes, _, (_, parts))| {
+                    let write = writes.first().cloned().unwrap_or_default();
+                    (write, parts.clone())
+                })
                 .collect();
         }
         Ok(true)
@@ -1501,10 +1657,12 @@ impl Server {
 
     /// The peers hold what they hold of a read's keys: the Transfer Server
     /// of each part's host reads the leading copies held into the blocks the
-    /// buffer pool allocated for them, every part of the region, this
-    /// host's and those of the session's ranks of other hosts, from the
+    /// buffer pool allocated for them, in each host part the copy fills (in
+    /// every part of the region, this host's and those of the session's
+    /// ranks of other hosts, for groups that state no host parts), from the
     /// peer's part of the same index, wherever that lies, which must hold the
     /// same bytes of a unit, and the copy the same units ([`read_spans`]).
+    /// A copy with a host part to fill that no place states is not read.
     /// With nothing to read, the holds are released at once.
     pub(crate) fn peers_held(&mut self, number: u64, (sources, peers): hosts::Held) {
         let Some(running) = self.sessions.running.get(&number) else {
@@ -1524,14 +1682,17 @@ impl Server {
         // each with whether its source is storage of this host.
         let mut tasks: BTreeMap<Option<String>, Vec<(Span, bool)>> = BTreeMap::new();
         let mut reads = Vec::new();
-        for (index, write) in writes.iter().enumerate() {
+        for (index, (write, named)) in writes.iter().enumerate() {
             let Some(Some((connection, copy))) = sources.get(index) else {
                 break;
             };
             let Some((peer, held)) = peers.get(*connection) else {
                 break;
             };
-            let destinations = self.part_hosts(&session.0, Some(pool), &write.0);
+            let destinations = self.parts_at(&session.0, Some(pool), &write.0, named);
+            if destinations.1.len() < named.len() {
+                break;
+            }
             let Some(spans) = read_spans(copy, (peer, held), write, &destinations, here) else {
                 break;
             };
@@ -1593,13 +1754,18 @@ impl Server {
     /// A prefetch's or a put's pages as one connector task per part of the
     /// host region: this host's connector moves the pages of its own parts,
     /// and the connector of the host of each part of a rank of another host
-    /// those of that part, asked there by a helper ([`hosts::pages_at`]).
+    /// those of that part, asked there by a helper ([`hosts::pages_at`]). A
+    /// prefetch fills the host parts its copy names, a put reads each part
+    /// index from one host part that holds the copy, this host's where it
+    /// can ([`Self::parts_at`]); a copy of groups that state no host parts
+    /// moves every part of the region where the session's ranks lie.
     /// Returns whether there is a page to move.
     ///
     /// # Errors
     ///
-    /// No connector here, or a part of a copy's region that lies on no host
-    /// this server knows: no copy would move whole.
+    /// No connector here, a host part a prefetch fills that no place
+    /// states, or a part index of a copy's region that lies on no host this
+    /// server knows: no copy would move whole.
     fn move_pages(
         &mut self,
         session: &Session,
@@ -1621,13 +1787,22 @@ impl Server {
         // of; per other host, the same per region and part.
         let mut pages: BTreeMap<u64, Pages> = BTreeMap::new();
         let mut elsewhere: BTreeMap<String, BTreeMap<(String, u32), Pages>> = BTreeMap::new();
-        for (index, (key, _, writes, ..)) in copies.iter().enumerate() {
+        for (index, (key, _, writes, (_, holding), (_, filled))) in copies.iter().enumerate() {
             let (Some(key), Some((region, first, count))) = (key, writes.first()) else {
                 continue;
             };
-            let (parts, hosts) = self.part_hosts(deployment, engine, region);
+            let named = if upload { holding } else { filled };
+            let (parts, mut hosts) = self.parts_at(deployment, engine, region, named);
             if parts == 0 {
                 return Err(format!("{region} is no host region of {deployment}"));
+            }
+            if !upload && hosts.len() < named.len() {
+                return Err(format!(
+                    "a part of {region} the copy fills is placed nowhere"
+                ));
+            }
+            if upload && !named.is_empty() {
+                one_of_each(&mut hosts);
             }
             if let Some(part) = (0..parts).find(|part| hosts.iter().all(|(at, ..)| at != part)) {
                 return Err(format!(

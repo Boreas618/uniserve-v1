@@ -1,6 +1,6 @@
 //! The buffer pools' conversations with other hosts' Storage Servers: the
 //! peers a prefetch reads host copies from, and the hosts of the ranks of
-//! another host that a transfer writes into.
+//! another host that a transfer or a crossing writes into.
 //!
 //! Every call to another host blocks until it answers, so each conversation
 //! runs on a helper thread of its own, never on the server's main loop, and
@@ -15,8 +15,9 @@
 //!   ([`Request::PeerRelease`]): a peer that answers `Gone`, or that cannot
 //!   be reached any more, held nothing throughout, and what was read from
 //!   it is not cached (hazard H2 of `specs/buffer-pool.md`).
-//! - **Ranks of another host.** A transfer into a rank of another host
-//!   runs on that host's Transfer Server: the helper submits it there as a
+//! - **Ranks of another host.** A transfer into a rank of another host, or
+//!   a crossing into a main process there, runs on that host's Transfer
+//!   Server: the helper submits it there as a
 //!   head of the deployment, its sources on this host named as regions of
 //!   another host ([`Region::Remote`]) at the address the connection leaves
 //!   this host from, and waits for its end, which it reports. The main

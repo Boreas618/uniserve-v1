@@ -42,6 +42,14 @@ impl BufferPool {
         held
     }
 
+    /// The host parts, as bits of a block's validity, that hold the host
+    /// copy of `key`: none for a key without one, and for a copy of groups
+    /// that state no host parts.
+    pub fn held_on(&self, key: &Key) -> u64 {
+        let host = self.cache.get(key).and_then(|entry| entry.host.as_ref());
+        host.map_or(0, |(block, ..)| block.valid.get())
+    }
+
     /// Ends every hold of `peer`; a block whose last holder this was is
     /// reclaimed. Returns whether the peer held anything.
     pub fn release_peer(&mut self, peer: u64) -> bool {
