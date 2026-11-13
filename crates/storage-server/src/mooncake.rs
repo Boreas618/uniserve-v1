@@ -1,23 +1,21 @@
-//! The Mooncake connector: the distributed host KV cache (L3) behind a host's
-//! page pools.
+//! The Mooncake connector: the distributed host KV cache (L3) behind the
+//! buffer pools' host regions.
 //!
 //! The Storage Server runs the connector as a child process
 //! (`uniserve storage-server connector`), so that a fault in Mooncake ends
 //! the connector and never the server; the server starts it again. The
-//! connector connects to the server as [`Role::Connector`], maps every page
-//! pool the server sends it, registers each with Mooncake
-//! (`register_buffer`), and runs the server's tasks:
+//! connector connects to the server as [`Role::Connector`], maps every pool
+//! of pages the server sends it (a rank's part of a host region), registers
+//! each with Mooncake (`register_buffer`), and runs the server's tasks:
 //!
-//! - [`Event::Exists`]: which pages Mooncake holds (`batch_is_exist`);
-//! - [`Event::Upload`]: committed pages from their slots into Mooncake
+//! - [`Event::Upload`]: pages from their slots into Mooncake
 //!   (`batch_put_from`);
-//! - [`Event::Download`]: pages from Mooncake into slots the server
-//!   reserved for them (`batch_get_into`).
+//! - [`Event::Download`]: pages from Mooncake into their slots
+//!   (`batch_get_into`).
 //!
 //! Each task runs in calls of at most [`BATCH_PAGES`] pages, and a page
-//! counts only when its call succeeded. Existence queries run on a thread of
-//! their own, so a long transfer never delays an admission's lookup. The
-//! connector never removes objects: Mooncake's master evicts them.
+//! counts only when its call succeeded. The connector never removes
+//! objects: Mooncake's master evicts them.
 //!
 //! A page's object key is `uniserve_{hex(page key)}_{hex(pool
 //! layout)}_{kv head offset}-{kv head count}`, one object per page per rank
@@ -50,7 +48,7 @@ use crate::Error;
 /// Mooncake, so this only needs to exist.
 const LOCAL_BUFFER_BYTES: u64 = 16 << 20;
 
-/// One page pool, mapped into the connector and registered with Mooncake.
+/// One pool of pages, mapped into the connector and registered with Mooncake.
 #[derive(Clone, Copy)]
 struct Mapping {
     /// The address of slot 0.
@@ -78,13 +76,8 @@ impl Mapping {
     }
 }
 
-/// A task for a worker thread.
+/// A task for the worker thread.
 enum Job {
-    Exists {
-        task: u64,
-        pool: u64,
-        keys: Vec<Key>,
-    },
     Upload {
         task: u64,
         pool: u64,
@@ -142,7 +135,6 @@ pub fn run(socket: &Path, settings: &Settings) -> Result<(), Error> {
         finished: Mutex::new(Vec::new()),
         wake: wake_writer,
     });
-    let lookups = worker(&shared, "uniserve-l3-lookups")?;
     let transfers = worker(&shared, "uniserve-l3-transfers")?;
 
     let mut reports: Vec<u64> = Vec::new();
@@ -173,7 +165,7 @@ pub fn run(socket: &Path, settings: &Settings) -> Result<(), Error> {
             match event {
                 Event::Pool { pool, shape, slots } => {
                     let descriptor = descriptors.into_iter().next().ok_or_else(|| {
-                        Error::Settings(format!("page pool {pool} came without its storage"))
+                        Error::Settings(format!("pool {pool} came without its storage"))
                     })?;
                     let mapped = map(&shared.store, descriptor, shape, slots)?;
                     lock(&shared.pools).insert(pool, mapped);
@@ -181,7 +173,7 @@ pub fn run(socket: &Path, settings: &Settings) -> Result<(), Error> {
                         pool,
                         slots,
                         page_bytes = shape.page_bytes,
-                        "registered a page pool"
+                        "registered a pool of pages"
                     );
                 }
                 Event::PoolReleased { pool } => {
@@ -189,11 +181,8 @@ pub fn run(socket: &Path, settings: &Settings) -> Result<(), Error> {
                     // task on it, so no worker thread touches its storage.
                     if let Some(mapped) = lock(&shared.pools).remove(&pool) {
                         unmap(&shared.store, mapped);
-                        tracing::info!(pool, "unmapped a released page pool");
+                        tracing::info!(pool, "unmapped a released pool of pages");
                     }
-                }
-                Event::Exists { task, pool, keys } => {
-                    let _ = lookups.send(Job::Exists { task, pool, keys });
                 }
                 Event::Upload { task, pool, pages } => {
                     let _ = transfers.send(Job::Upload { task, pool, pages });
@@ -202,8 +191,7 @@ pub fn run(socket: &Path, settings: &Settings) -> Result<(), Error> {
                     let _ = transfers.send(Job::Download { task, pool, pages });
                 }
                 // The events of heads, workers and the Transfer Server.
-                Event::Prefetched { .. }
-                | Event::TaskProgress { .. }
+                Event::TaskProgress { .. }
                 | Event::TaskEnded { .. }
                 | Event::Allocation { .. }
                 | Event::AllocationReleased { .. }
@@ -262,28 +250,6 @@ impl Shared {
     /// Run one job; returns its task and one result per page.
     fn execute(&self, job: Job) -> (u64, Vec<bool>) {
         match job {
-            Job::Exists { task, pool, keys } => {
-                let Some(mapped) = self.pool(pool) else {
-                    return (task, vec![false; keys.len()]);
-                };
-                let mut present = Vec::with_capacity(keys.len());
-                for chunk in keys.chunks(BATCH_PAGES) {
-                    let objects: Vec<String> = chunk.iter().map(|key| mapped.object(key)).collect();
-                    let names: Vec<&str> = objects.iter().map(String::as_str).collect();
-                    let found = self.store.batch_is_exist(&names).unwrap_or_else(|error| {
-                        tracing::warn!(%error, "a Mooncake lookup failed");
-                        vec![false; chunk.len()]
-                    });
-                    let ended = found.contains(&false);
-                    present.extend(found);
-                    // Only the leading run of present pages is used.
-                    if ended {
-                        break;
-                    }
-                }
-                present.resize(keys.len(), false);
-                (task, present)
-            }
             Job::Upload { task, pool, pages } => (task, self.transfer(pool, &pages, true)),
             Job::Download { task, pool, pages } => (task, self.transfer(pool, &pages, false)),
         }
@@ -318,10 +284,10 @@ impl Shared {
             let names: Vec<&str> = objects.iter().map(String::as_str).collect();
             let sizes = vec![page_bytes; names.len()];
             // Every buffer is a whole slot of a registered pool mapping,
-            // which lives for the process, and the server holds each slot
-            // for this task: an upload's slots are committed and not
-            // evicted until the task finishes, a download's are reserved for
-            // it and read by nobody else.
+            // which the server releases only once the connector has no task
+            // on it (`Event::PoolReleased`), and the buffer pool's task that
+            // names a slot holds its block until the connector reports the
+            // task.
             let results: Vec<bool> = if upload {
                 // SAFETY: see above; Mooncake only reads the slots.
                 match unsafe { self.store.batch_put_from(&names, &buffers, &sizes, None) } {
@@ -356,7 +322,7 @@ impl Shared {
     }
 }
 
-/// Map a page pool's memfd and register the mapping with Mooncake. The
+/// Map a pool's memfd and register the mapping with Mooncake. The
 /// mapping lives until the server releases the pool ([`unmap`]).
 fn map(
     store: &MooncakeStore,
@@ -380,7 +346,9 @@ fn map(
     // SAFETY: the mapping above, which `unmap` unregisters before it unmaps
     // it.
     unsafe { store.register_buffer(base, bytes) }.map_err(|error| {
-        io::Error::other(format!("registering a page pool with Mooncake: {error}"))
+        io::Error::other(format!(
+            "registering a pool of pages with Mooncake: {error}"
+        ))
     })?;
     Ok(Mapping {
         base: base as usize,
@@ -394,13 +362,13 @@ fn unmap(store: &MooncakeStore, mapped: Mapping) {
     let base = mapped.base as *mut c_void;
     // SAFETY: a mapping `map` registered; no task reads or writes it.
     if let Err(error) = unsafe { store.unregister_buffer(base) } {
-        tracing::warn!(%error, "unregistering a released page pool from Mooncake failed");
+        tracing::warn!(%error, "unregistering a released pool from Mooncake failed");
     }
     let bytes = (mapped.slots * mapped.shape.page_bytes) as usize;
     // SAFETY: the mapping `map` made of the whole pool, which nothing uses.
     let unmapped = unsafe { rustix::mm::munmap(base, bytes) };
     if let Err(error) = unmapped {
-        tracing::warn!(%error, "unmapping a released page pool failed");
+        tracing::warn!(%error, "unmapping a released pool failed");
     }
 }
 

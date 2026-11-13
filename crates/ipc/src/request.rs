@@ -255,16 +255,7 @@ pub enum ResponseKind {
     Hooked,
 }
 
-/// Request and call identity attached to a worker error.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ErrorCallIdentity {
-    /// Request owning the failed call.
-    pub request_key: RequestKey,
-    /// Failed call identity.
-    pub call_id: CallId,
-}
-
-/// Structured worker failure with optional call identities.
+/// Structured worker failure.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct MainProcessResponseError {
     /// Human-readable failure description.
@@ -280,8 +271,6 @@ pub struct MainProcessResponseError {
     /// belongs to no batch with calls, such as an undecodable request, a
     /// submission refused at admission, or a lifecycle-only batch.
     pub route: Option<String>,
-    /// Calls affected by the failure.
-    pub calls: Vec<ErrorCallIdentity>,
 }
 
 /// A job the rank's builder thread has performed for at least the rank's
@@ -298,8 +287,6 @@ pub struct Stall {
     /// Import path of the library method the job calls; `None` for a job
     /// that calls none, such as a copy or a wait.
     pub method: Option<String>,
-    /// The calls of that batch.
-    pub calls: Vec<ErrorCallIdentity>,
     /// How long the job has run, in milliseconds: since its submission, or
     /// since the builder thread completed the job before it, whichever is
     /// later.

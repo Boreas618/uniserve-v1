@@ -173,7 +173,7 @@ impl StorageServer {
         let stop = Arc::new(AtomicBool::new(false));
         let stopped = Arc::clone(&stop);
         let thread = std::thread::spawn(move || {
-            let mut server = Server::new(listener, 1 << 20, 0, None, None).unwrap();
+            let mut server = Server::new(listener, 0, None, None).unwrap();
             server
                 .run(reader.as_fd(), &|| stopped.load(Ordering::Acquire))
                 .unwrap();
@@ -227,7 +227,6 @@ fn launch(server: &StorageServer, claim: Claim, epoch: u64, standby: bool) -> ip
         socket: server.socket.to_string_lossy().into_owned(),
         deployment: DEPLOYMENT.into(),
         claim: claim.0,
-        host_kv_cache: false,
         tcp: None,
         peers: Vec::new(),
         epoch,

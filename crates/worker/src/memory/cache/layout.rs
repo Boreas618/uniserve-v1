@@ -578,7 +578,7 @@ impl CacheLayout {
     }
 
     /// The cache as the rank reports it to the engine, for a pool of `num_units` units. The
-    /// rank fills in what it learns later: its page pools, segments, identities and endpoint.
+    /// rank fills in what it learns later: its segments, identities and endpoint.
     pub fn info(&self, num_units: u32) -> PrefixCacheInfo {
         PrefixCacheInfo {
             num_units,
@@ -597,7 +597,6 @@ impl CacheLayout {
                     head_dim: group.head_dim,
                 })
                 .collect(),
-            page_pools: Vec::new(),
             plane_runs: Vec::new(),
             scratch_units: 0,
             segments: Vec::new(),

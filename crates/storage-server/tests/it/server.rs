@@ -95,8 +95,7 @@ impl Running {
         let address = tcp.local_addr().unwrap().to_string();
         let thread = std::thread::spawn(move || {
             let _lock = lock;
-            // Pools of four 16-byte pages.
-            let mut server = Server::new(listener, 64, host_reserve, None, transfer).unwrap();
+            let mut server = Server::new(listener, host_reserve, None, transfer).unwrap();
             configure(&mut server);
             server.listen_tcp(tcp).unwrap();
             server
@@ -586,297 +585,6 @@ fn retry<T>(mut attempt: impl FnMut() -> Result<T, Error>) -> T {
     panic!("the server did not notice the disconnect");
 }
 
-#[test]
-fn a_head_on_another_host_moves_pages_through_a_workers_pool() {
-    use ::storage::protocol::{PageLevel, PageShape, PageSlot, Request, Response};
-
-    let server = Running::start();
-    let claim = head(&server.socket)
-        .claim(0, vec![scope("text", 0)], Vec::new())
-        .unwrap();
-
-    // The worker maps its pool on the host.
-    let mut worker = worker(&server.socket, scope("text", 0), 1, claim);
-    let shape = PageShape {
-        layout: key(3),
-        kv_head_offset: 0,
-        kv_head_count: 2,
-        page_bytes: 16,
-    };
-    let (response, descriptors) = worker
-        .call(
-            &Request::Pool {
-                shape,
-                numa_node: None,
-                bytes: None,
-            },
-            &[],
-        )
-        .unwrap();
-    let Response::Pool { pool, slots, .. } = response else {
-        panic!("a page pool request responded {response:?}");
-    };
-    assert_eq!((slots, descriptors.len()), (4, 1));
-
-    // The head reaches the pool from another host.
-    let mut remote = Client::connect_tcp(
-        &server.tcp,
-        Role::Head {
-            deployment: "model".into(),
-            epoch: 0,
-        },
-    )
-    .unwrap();
-    let mut ask = |request: Request| remote.call(&request, &[]).unwrap().0;
-    let Response::Reserved { slots } = ask(Request::Reserve {
-        pool,
-        writer: Some(scope("text", 0)),
-        keys: vec![key(1), key(2)],
-        window: None,
-    }) else {
-        panic!("a reservation was refused");
-    };
-    assert!(matches!(
-        slots[..],
-        [PageSlot::Reserved { .. }, PageSlot::Reserved { .. }]
-    ));
-    ask(Request::Commit {
-        pool,
-        keys: vec![key(1)],
-    });
-    assert_eq!(
-        ask(Request::Lookup {
-            pool,
-            keys: vec![key(1), key(2)],
-        }),
-        Response::Lookup {
-            levels: vec![PageLevel::Host, PageLevel::Absent]
-        }
-    );
-    // A connection from another host claims nothing.
-    assert!(matches!(
-        ask(Request::Claim {
-            scopes: Vec::new(),
-            epoch: 0,
-            retire: Vec::new(),
-        }),
-        Response::Error {
-            kind: ErrorKind::Invalid,
-            ..
-        }
-    ));
-
-    // A worker connects on its host only.
-    assert!(matches!(
-        Client::connect_tcp(
-            &server.tcp,
-            Role::Worker {
-                scope: scope("text", 0),
-                generation: 1,
-                claim,
-                epoch: 0,
-            },
-        ),
-        Err(Error::Refused(_))
-    ));
-}
-
-/// The next event `client` receives, waiting up to ten seconds.
-pub(crate) fn next_event(client: &mut Client) -> (::storage::protocol::Event, Vec<OwnedFd>) {
-    for _ in 0..1000 {
-        client.pump().unwrap();
-        if let Some(event) = client.next_event() {
-            return event;
-        }
-        let mut descriptor = libc::pollfd {
-            fd: client.as_fd().as_raw_fd(),
-            events: libc::POLLIN,
-            revents: 0,
-        };
-        // SAFETY: polls one descriptor this test holds.
-        unsafe { libc::poll(&mut descriptor, 1, 10) };
-    }
-    panic!("no event arrived");
-}
-
-#[test]
-fn the_connector_extends_lookups_fills_prefetches_and_uploads_committed_pages() {
-    use ::storage::protocol::{Event, PageLevel, PageShape, PageSlot, Request, Response};
-
-    let server = Running::start();
-    let mut head = head(&server.socket);
-    let claim = head.claim(0, vec![scope("text", 0)], Vec::new()).unwrap();
-    head.publish(vec![0]).unwrap();
-    let mut worker = worker(&server.socket, scope("text", 0), 1, claim);
-    let shape = PageShape {
-        layout: key(3),
-        kv_head_offset: 0,
-        kv_head_count: 2,
-        page_bytes: 16,
-    };
-    let Response::Pool { pool, .. } = worker
-        .call(
-            &Request::Pool {
-                shape,
-                numa_node: None,
-                bytes: None,
-            },
-            &[],
-        )
-        .unwrap()
-        .0
-    else {
-        panic!("the page pool was refused");
-    };
-
-    // The connector is given the pool with its storage.
-    let mut connector = Client::connect(&server.socket, Role::Connector).unwrap();
-    let (event, descriptors) = next_event(&mut connector);
-    assert_eq!(
-        event,
-        Event::Pool {
-            pool,
-            shape,
-            slots: 4
-        }
-    );
-    assert_eq!(descriptors.len(), 1);
-    // A second connector is refused.
-    assert!(matches!(
-        Client::connect(&server.socket, Role::Connector),
-        Err(Error::Refused(_))
-    ));
-
-    // A committed page is uploaded from its slot.
-    let Response::Reserved { slots } = head
-        .call(
-            &Request::Reserve {
-                pool,
-                writer: Some(scope("text", 0)),
-                keys: vec![key(1)],
-                window: None,
-            },
-            &[],
-        )
-        .unwrap()
-        .0
-    else {
-        panic!("the reservation was refused");
-    };
-    let [PageSlot::Reserved { slot }] = slots[..] else {
-        panic!("the reservation responded {slots:?}");
-    };
-    head.call(
-        &Request::Commit {
-            pool,
-            keys: vec![key(1)],
-        },
-        &[],
-    )
-    .unwrap();
-    let (
-        Event::Upload {
-            task,
-            pool: uploaded,
-            pages,
-        },
-        _,
-    ) = next_event(&mut connector)
-    else {
-        panic!("the committed page was not uploaded");
-    };
-    assert_eq!((uploaded, pages), (pool, vec![(key(1), slot)]));
-    let finished = Request::Finished {
-        task,
-        results: vec![true],
-    };
-    assert_eq!(
-        connector.call(&finished, &[]).unwrap().0,
-        Response::Finished
-    );
-
-    // A lookup asks the connector for the pages the pool does not hold.
-    let lookup = head
-        .submit(
-            &Request::Lookup {
-                pool,
-                keys: vec![key(1), key(2), key(3)],
-            },
-            &[],
-        )
-        .unwrap();
-    let (Event::Exists { task, keys, .. }, _) = next_event(&mut connector) else {
-        panic!("the lookup did not reach the connector");
-    };
-    assert_eq!(keys, vec![key(2), key(3)]);
-    connector
-        .call(
-            &Request::Finished {
-                task,
-                results: vec![true, false],
-            },
-            &[],
-        )
-        .unwrap();
-    assert_eq!(
-        head.wait(lookup).unwrap().0,
-        Response::Lookup {
-            levels: vec![PageLevel::Host, PageLevel::Storage, PageLevel::Absent]
-        }
-    );
-
-    // A prefetch reads the pages the pool lacks into reserved slots, and its
-    // event reports which pages the pool holds after.
-    let prefetch = Request::Prefetch {
-        pool,
-        keys: vec![key(1), key(2), key(3)],
-        tag: 7,
-    };
-    assert_eq!(head.call(&prefetch, &[]).unwrap().0, Response::Prefetching);
-    let (Event::Download { task, pages, .. }, _) = next_event(&mut connector) else {
-        panic!("the prefetch did not reach the connector");
-    };
-    assert_eq!(
-        pages.iter().map(|(key, _)| *key).collect::<Vec<_>>(),
-        vec![key(2), key(3)]
-    );
-    connector
-        .call(
-            &Request::Finished {
-                task,
-                results: vec![true, false],
-            },
-            &[],
-        )
-        .unwrap();
-    assert_eq!(
-        next_event(&mut head).0,
-        Event::Prefetched {
-            tag: 7,
-            results: vec![true, true, false]
-        }
-    );
-
-    // A connector that leaves fails its lookups: L3 holds nothing beyond L2.
-    let lookup = head
-        .submit(
-            &Request::Lookup {
-                pool,
-                keys: vec![key(1), key(2), key(3)],
-            },
-            &[],
-        )
-        .unwrap();
-    next_event(&mut connector);
-    drop(connector);
-    assert_eq!(
-        head.wait(lookup).unwrap().0,
-        Response::Lookup {
-            levels: vec![PageLevel::Host, PageLevel::Host, PageLevel::Absent]
-        }
-    );
-}
-
 /// A head of `deployment`.
 fn head_of(socket: &Path, deployment: &str) -> Client {
     Client::connect(
@@ -898,106 +606,10 @@ fn scope_of(deployment: &str) -> Scope {
     }
 }
 
-/// The page pool `worker` maps for pages of 16 bytes, asking for `bytes`:
-/// its id and slots.
-fn page_pool(worker: &mut Client, bytes: Option<u64>) -> Result<(u64, u64), Error> {
-    use ::storage::protocol::{PageShape, Request, Response};
-
-    let shape = PageShape {
-        layout: key(3),
-        kv_head_offset: 0,
-        kv_head_count: 2,
-        page_bytes: 16,
-    };
-    let (response, _) = worker.call(
-        &Request::Pool {
-            shape,
-            numa_node: None,
-            bytes,
-        },
-        &[],
-    )?;
-    match response {
-        Response::Pool { pool, slots, .. } => Ok((pool, slots)),
-        reply => panic!("a page pool request responded {reply:?}"),
-    }
-}
-
-#[test]
-fn page_pools_belong_to_their_deployment_and_leave_with_it() {
-    use ::storage::protocol::{Request, Response};
-
-    let server = Running::start();
-    // The head stays connected, so another deployment's claim keeps this
-    // one.
-    let mut model_head = head_of(&server.socket, "model");
-    let claim = model_head
-        .claim(0, vec![scope_of("model")], Vec::new())
-        .unwrap();
-    let mut first = worker(&server.socket, scope_of("model"), 1, claim);
-    // A worker sizes its pool: two pages of 16 bytes.
-    let (pool, slots) = page_pool(&mut first, Some(32)).unwrap();
-    assert_eq!(slots, 2);
-    // The deployment's other workers of the same pages share it.
-    assert_eq!(page_pool(&mut first, None).unwrap(), (pool, 2));
-
-    // Another deployment's workers of the same pages have a pool of their
-    // own, which its head alone reaches.
-    let mut other_head = head_of(&server.socket, "other");
-    let other_claim = other_head
-        .claim(0, vec![scope_of("other")], Vec::new())
-        .unwrap();
-    let mut second = worker(&server.socket, scope_of("other"), 1, other_claim);
-    let (other_pool, other_slots) = page_pool(&mut second, None).unwrap();
-    assert_ne!(other_pool, pool);
-    assert_eq!(other_slots, 4);
-    let (lookup, _) = other_head
-        .call(
-            &Request::Lookup {
-                pool,
-                keys: vec![key(1)],
-            },
-            &[],
-        )
-        .unwrap();
-    assert!(matches!(
-        lookup,
-        Response::Error {
-            kind: ErrorKind::Invalid,
-            ..
-        }
-    ));
-    let owners: Vec<(u64, String)> = other_head
-        .list()
-        .unwrap()
-        .page_pools
-        .into_iter()
-        .map(|listed| (listed.pool, listed.deployment))
-        .collect();
-    assert_eq!(
-        owners,
-        vec![(pool, "model".to_owned()), (other_pool, "other".to_owned())]
-    );
-
-    // Retiring the other deployment releases its pool.
-    drop(second);
-    drop(other_head);
-    let mut operator = Client::connect(&server.socket, Role::Operator).unwrap();
-    retry(|| operator.retire("other".into()));
-    let pools: Vec<u64> = operator
-        .list()
-        .unwrap()
-        .page_pools
-        .into_iter()
-        .map(|listed| listed.pool)
-        .collect();
-    assert_eq!(pools, vec![pool]);
-}
-
 #[test]
 fn a_claim_retires_every_deployment_whose_head_is_gone() {
     let server = Running::start();
-    // A deployment whose head leaves keeps a tensor and a page pool.
+    // A deployment whose head leaves keeps a tensor.
     let mut gone = head_of(&server.socket, "gone");
     let claim = gone.claim(0, vec![scope_of("gone")], Vec::new()).unwrap();
     let mut gone_worker = worker(&server.socket, scope_of("gone"), 1, claim);
@@ -1008,14 +620,19 @@ fn a_claim_retires_every_deployment_whose_head_is_gone() {
             &[(host(4), storage.as_fd())],
         )
         .unwrap();
-    page_pool(&mut gone_worker, None).unwrap();
     drop(gone_worker);
     drop(gone);
-    // A deployment whose head stays keeps its pool.
+    // A deployment whose head stays keeps its tensor.
     let mut kept = head_of(&server.socket, "kept");
     let kept_claim = kept.claim(0, vec![scope_of("kept")], Vec::new()).unwrap();
     let mut kept_worker = worker(&server.socket, scope_of("kept"), 1, kept_claim);
-    let (kept_pool, _) = page_pool(&mut kept_worker, None).unwrap();
+    let kept_storage = memfd(&[2; 4]);
+    kept_worker
+        .put(
+            vec![tensor(key(2), "kept", 0, 0, Access::ReadOnly)],
+            &[(host(4), kept_storage.as_fd())],
+        )
+        .unwrap();
 
     // A new deployment's claim retires the one whose head left, once the
     // server has noticed it leave.
@@ -1035,7 +652,12 @@ fn a_claim_retires_every_deployment_whose_head_is_gone() {
         .claim(0, vec![scope_of("new")], Vec::new())
         .unwrap();
     let listing = operator.list().unwrap();
-    assert!(listing.tensors.is_empty());
+    let tensors: Vec<&str> = listing
+        .tensors
+        .iter()
+        .map(|listed| listed.name.as_str())
+        .collect();
+    assert_eq!(tensors, ["kept"]);
     let deployments: Vec<String> = listing
         .deployments
         .into_iter()
@@ -1043,49 +665,6 @@ fn a_claim_retires_every_deployment_whose_head_is_gone() {
         .collect();
     assert!(!deployments.contains(&"gone".to_owned()));
     assert!(deployments.contains(&"kept".to_owned()));
-    let pools: Vec<u64> = listing
-        .page_pools
-        .into_iter()
-        .map(|listed| listed.pool)
-        .collect();
-    assert_eq!(pools, vec![kept_pool]);
-}
-
-#[test]
-fn a_page_pool_the_hosts_storage_cannot_hold_is_refused() {
-    use ::storage::protocol::{PageShape, Request};
-
-    let server = Running::start();
-    let claim = head(&server.socket)
-        .claim(0, vec![scope("text", 0)], Vec::new())
-        .unwrap();
-    let mut worker = worker(&server.socket, scope("text", 0), 1, claim);
-    // A million pages of a GiB: a pebibyte, beyond any host's storage.
-    let shape = PageShape {
-        layout: key(3),
-        kv_head_offset: 0,
-        kv_head_count: 2,
-        page_bytes: 1 << 30,
-    };
-    let (refused, _) = worker
-        .call(
-            &Request::Pool {
-                shape,
-                numa_node: None,
-                bytes: Some(1 << 50),
-            },
-            &[],
-        )
-        .unwrap();
-    assert!(matches!(
-        refused,
-        ::storage::protocol::Response::Error {
-            kind: ErrorKind::Resource,
-            ..
-        }
-    ));
-    let listing = worker.list().unwrap();
-    assert!(listing.page_pools.is_empty());
 }
 
 /// A worker of `scope` in `epoch`.
@@ -1209,7 +788,7 @@ fn epochs_retain_their_own_storage_and_a_claim_retires_one() {
     );
 }
 
-/// The engine of `epoch` of the deployment, which sends its page requests.
+/// The engine of `epoch` of the deployment: a head of that epoch.
 pub(crate) fn engine_head(socket: &Path, epoch: u64) -> Client {
     Client::connect(
         socket,
@@ -1221,271 +800,89 @@ pub(crate) fn engine_head(socket: &Path, epoch: u64) -> Client {
     .unwrap()
 }
 
-/// A page pool of four 16-byte pages that `worker` maps.
-pub(crate) fn trial_pool(worker: &mut Client) -> u64 {
-    use ::storage::protocol::{PageShape, Request, Response};
-
-    let shape = PageShape {
-        layout: key(3),
-        kv_head_offset: 0,
-        kv_head_count: 2,
-        page_bytes: 16,
-    };
-    let (response, _) = worker
-        .call(
-            &Request::Pool {
-                shape,
-                numa_node: None,
-                bytes: None,
-            },
-            &[],
-        )
-        .unwrap();
-    let Response::Pool { pool, .. } = response else {
-        panic!("the page pool was refused: {response:?}");
-    };
-    pool
+/// The read-only tensors `worker` puts, each of four bytes in host storage of its own, under
+/// `keys`.
+fn put_read_only(worker: &mut Client, keys: &[Key]) {
+    let storages: Vec<std::fs::File> = keys.iter().map(|key| memfd(&[key.0[0]; 4])).collect();
+    let tensors = keys
+        .iter()
+        .enumerate()
+        .map(|(index, key)| {
+            let name = format!("tensor-{}", key.0[0]);
+            tensor(*key, &name, index as u32, 0, Access::ReadOnly)
+        })
+        .collect();
+    let storages: Vec<_> = storages
+        .iter()
+        .map(|storage| (host(4), storage.as_fd()))
+        .collect();
+    worker.put(tensors, &storages).unwrap();
 }
 
-/// `head` writes and commits the pages of `keys` in `pool`.
-pub(crate) fn publish(head: &mut Client, pool: u64, keys: &[Key]) {
-    use ::storage::protocol::{PageSlot, Request, Response};
-
-    let Response::Reserved { slots } = head
-        .call(
-            &Request::Reserve {
-                pool,
-                writer: Some(scope("text", 0)),
-                keys: keys.to_vec(),
-                window: None,
-            },
-            &[],
-        )
-        .unwrap()
-        .0
-    else {
-        panic!("the reservation was refused");
-    };
-    assert!(
-        slots
-            .iter()
-            .all(|slot| matches!(slot, PageSlot::Reserved { .. })),
-        "{slots:?}"
-    );
-    head.call(
-        &Request::Commit {
-            pool,
-            keys: keys.to_vec(),
-        },
-        &[],
-    )
-    .unwrap();
+/// The keys of `keys` whose read-only tensors `worker` reads, in key order.
+fn readable(worker: &mut Client, keys: &[Key]) -> Vec<Key> {
+    let (found, _) = worker.get(keys.to_vec(), Mode::Read, Vec::new()).unwrap();
+    let mut readable: Vec<Key> = found.tensors.iter().map(|tensor| tensor.key).collect();
+    readable.sort();
+    readable
 }
 
-/// The levels `head` finds the pages of `keys` at in `pool`, without a
-/// connector.
-fn levels(head: &mut Client, pool: u64, keys: &[Key]) -> Vec<::storage::protocol::PageLevel> {
-    use ::storage::protocol::{Request, Response};
-
-    let Response::Lookup { levels } = head
-        .call(
-            &Request::Lookup {
-                pool,
-                keys: keys.to_vec(),
-            },
-            &[],
-        )
-        .unwrap()
-        .0
-    else {
-        panic!("the lookup was refused");
-    };
-    levels
-}
-
-/// An epoch on trial beside the epoch it succeeds keeps the pages it commits
-/// to itself: the serving epoch neither reads them nor finds them in the KV
-/// storage, which takes them only once the epoch is explicitly committed. The epoch on trial reads the serving epoch's pages.
-#[test]
-fn a_epoch_on_trial_publishes_its_pages_to_itself_until_its_commit() {
-    use ::storage::protocol::{Event, PageLevel, Request};
-
-    let server = Running::start();
-    let mut daemon = head(&server.socket);
-    let claim = daemon.claim(1, vec![scope("text", 0)], Vec::new()).unwrap();
-    daemon.publish(vec![1]).unwrap();
-    let mut worker = epoch_worker(&server.socket, scope("text", 0), 1, claim);
-    let pool = trial_pool(&mut worker);
-    let mut connector = Client::connect(&server.socket, Role::Connector).unwrap();
-    assert!(matches!(next_event(&mut connector).0, Event::Pool { .. }));
-    let finish = |connector: &mut Client, task: u64, results: Vec<bool>| {
-        connector
-            .call(&Request::Finished { task, results }, &[])
-            .unwrap();
-    };
-
-    // The serving epoch's pages are every epoch's, and the KV storage
-    // takes them at once.
-    let mut serving = engine_head(&server.socket, 1);
-    publish(&mut serving, pool, &[key(1)]);
-    let (Event::Upload { task, pages, .. }, _) = next_event(&mut connector) else {
-        panic!("the serving epoch's page was not uploaded");
-    };
-    assert_eq!(pages.len(), 1);
-    assert_eq!(pages[0].0, key(1));
-    finish(&mut connector, task, vec![true]);
-
-    // Epoch 2 starts on trial and commits a page of its own.
-    daemon.claim(2, vec![scope("text", 0)], Vec::new()).unwrap();
-    let mut trial = engine_head(&server.socket, 2);
-    publish(&mut trial, pool, &[key(2)]);
-    assert_eq!(
-        levels(&mut trial, pool, &[key(1), key(2)]),
-        vec![PageLevel::Host, PageLevel::Host]
-    );
-
-    // The serving epoch asks the KV storage for the page it does not read:
-    // the connector's next task is that lookup, so no upload preceded it.
-    let lookup = serving
-        .submit(
-            &Request::Lookup {
-                pool,
-                keys: vec![key(1), key(2)],
-            },
-            &[],
-        )
-        .unwrap();
-    let (Event::Exists { task, keys, .. }, _) = next_event(&mut connector) else {
-        panic!("a page of the epoch on trial was uploaded before its commit");
-    };
-    assert_eq!(keys, vec![key(2)]);
-    finish(&mut connector, task, vec![false]);
-    assert_eq!(
-        serving.wait(lookup).unwrap().0,
-        ::storage::protocol::Response::Lookup {
-            levels: vec![PageLevel::Host, PageLevel::Absent]
-        }
-    );
-    // Nor does it pin it.
-    let ::storage::protocol::Response::Pinned { slots } = serving
-        .call(
-            &Request::Pin {
-                pool,
-                reader: scope("text", 0),
-                keys: vec![key(2)],
-            },
-            &[],
-        )
-        .unwrap()
-        .0
-    else {
-        panic!("the pin was refused");
-    };
-    assert_eq!(slots, vec![None]);
-
-    // The commit publishes epoch 2 before retiring epoch 1, and
-    // the KV storage takes them.
-    daemon.publish(vec![2]).unwrap();
-    daemon.claim(2, vec![scope("text", 0)], vec![1]).unwrap();
-    let (Event::Upload { task, pages, .. }, _) = next_event(&mut connector) else {
-        panic!("the committed epoch's pages were not uploaded");
-    };
-    assert_eq!(
-        pages.iter().map(|(key, _)| *key).collect::<Vec<_>>(),
-        vec![key(2)]
-    );
-    finish(&mut connector, task, vec![true]);
-    let mut next = engine_head(&server.socket, 3);
-    assert_eq!(
-        levels(&mut next, pool, &[key(1), key(2)]),
-        vec![PageLevel::Host, PageLevel::Host]
-    );
-}
-
-/// Independent replicas share committed pages while each candidate stays
-/// private. A group commit publishes all successors together, regardless
-/// of the numerical order of the epoch identifiers.
+/// Independent replicas read each other's committed tensors while each candidate's stay
+/// private. A group commit publishes all successors together, regardless of the numerical order
+/// of the epoch identifiers; only the claiming head publishes, and a set naming an epoch it did
+/// not claim publishes none.
 #[test]
 fn independent_replicas_publish_successors_as_a_group() {
-    use ::storage::protocol::PageLevel::{Absent, Host};
-
     let server = Running::start();
     let mut daemon = head(&server.socket);
     let claim = daemon.claim(9, vec![scope("text", 0)], Vec::new()).unwrap();
     daemon.claim(3, vec![scope("text", 0)], Vec::new()).unwrap();
     daemon.publish(vec![9, 3]).unwrap();
-    let mut worker = epoch_worker(&server.socket, scope("text", 0), 9, claim);
-    let pool = trial_pool(&mut worker);
-    let mut first = engine_head(&server.socket, 9);
-    let mut second = engine_head(&server.socket, 3);
-    publish(&mut first, pool, &[key(1)]);
-    publish(&mut second, pool, &[key(2)]);
-    assert_eq!(
-        levels(&mut first, pool, &[key(1), key(2)]),
-        vec![Host, Host]
-    );
-    assert_eq!(
-        levels(&mut second, pool, &[key(1), key(2)]),
-        vec![Host, Host]
-    );
+    let mut first = epoch_worker(&server.socket, scope("text", 0), 9, claim);
+    let mut second = epoch_worker(&server.socket, scope("text", 0), 3, claim);
+    put_read_only(&mut first, &[key(1)]);
+    put_read_only(&mut second, &[key(2)]);
+    assert_eq!(readable(&mut first, &[key(1), key(2)]), [key(1), key(2)]);
+    assert_eq!(readable(&mut second, &[key(1), key(2)]), [key(1), key(2)]);
 
     daemon.claim(4, vec![scope("text", 0)], Vec::new()).unwrap();
     daemon.claim(8, vec![scope("text", 0)], Vec::new()).unwrap();
-    let mut candidate = engine_head(&server.socket, 4);
-    let mut peer = engine_head(&server.socket, 8);
-    publish(&mut candidate, pool, &[key(3)]);
-    publish(&mut peer, pool, &[key(4)]);
-    assert_eq!(server_error(candidate.publish(vec![4])), ErrorKind::Invalid);
+    let mut candidate = epoch_worker(&server.socket, scope("text", 0), 4, claim);
+    let mut peer = epoch_worker(&server.socket, scope("text", 0), 8, claim);
+    put_read_only(&mut candidate, &[key(3)]);
+    put_read_only(&mut peer, &[key(4)]);
+    let mut candidate_head = engine_head(&server.socket, 4);
     assert_eq!(
-        levels(&mut first, pool, &[key(3), key(4)]),
-        vec![Absent, Absent]
+        server_error(candidate_head.publish(vec![4])),
+        ErrorKind::Invalid
     );
-    assert_eq!(
-        levels(&mut candidate, pool, &[key(3), key(4)]),
-        vec![Host, Absent]
-    );
+    assert!(readable(&mut first, &[key(3), key(4)]).is_empty());
+    assert_eq!(readable(&mut candidate, &[key(3), key(4)]), [key(3)]);
 
     // A rejected set publishes none of its otherwise valid members.
     assert_eq!(
         server_error(daemon.publish(vec![4, 99])),
         ErrorKind::Invalid
     );
-    assert_eq!(
-        levels(&mut first, pool, &[key(3), key(4)]),
-        vec![Absent, Absent]
-    );
+    assert!(readable(&mut first, &[key(3), key(4)]).is_empty());
     daemon.publish(vec![4, 8]).unwrap();
-    assert_eq!(
-        levels(&mut first, pool, &[key(3), key(4)]),
-        vec![Host, Host]
-    );
-    daemon.claim(4, vec![scope("text", 0)], vec![9, 3]).unwrap();
-    assert_eq!(
-        levels(&mut candidate, pool, &[key(1), key(2), key(3), key(4)]),
-        vec![Host; 4]
-    );
+    assert_eq!(readable(&mut first, &[key(3), key(4)]), [key(3), key(4)]);
 }
 
-/// A rollback discards what the epoch on trial published: its pages leave
-/// the pool, and the read-only tensors it alone put leave the server. Until
-/// then the serving epoch reads none of them, and a tensor of the same key
-/// that the serving epoch puts carries the serving epoch's bytes.
+/// A rollback discards what the epoch on trial published: the read-only tensors it alone put
+/// leave the server. Until then the serving epoch reads none of them, and a tensor of the same
+/// key that the serving epoch puts carries the serving epoch's bytes.
 #[test]
 fn a_rollback_discards_what_the_epoch_on_trial_published() {
-    use ::storage::protocol::PageLevel;
-
     let server = Running::start();
     let mut daemon = head(&server.socket);
     let claim = daemon.claim(1, vec![scope("text", 0)], Vec::new()).unwrap();
     daemon.publish(vec![1]).unwrap();
     let mut serving_worker = epoch_worker(&server.socket, scope("text", 0), 1, claim);
-    let pool = trial_pool(&mut serving_worker);
     daemon.claim(2, vec![scope("text", 0)], Vec::new()).unwrap();
     let mut trial_worker = epoch_worker(&server.socket, scope("text", 0), 2, claim);
 
-    // Epoch 2 publishes a page and two read-only tensors.
-    let mut trial = engine_head(&server.socket, 2);
-    publish(&mut trial, pool, &[key(5)]);
+    // Epoch 2 publishes two read-only tensors.
     let trial_bytes = [memfd(b"bad!"), memfd(b"new!")];
     trial_worker
         .put(
@@ -1501,11 +898,6 @@ fn a_rollback_discards_what_the_epoch_on_trial_published() {
         .unwrap();
 
     // The serving epoch reads none of them and retains none.
-    let mut serving = engine_head(&server.socket, 1);
-    assert_eq!(
-        levels(&mut serving, pool, &[key(5)]),
-        vec![PageLevel::Absent]
-    );
     let (got, _) = serving_worker
         .get(vec![key(6), key(7)], Mode::Read, Vec::new())
         .unwrap();
@@ -1525,49 +917,8 @@ fn a_rollback_discards_what_the_epoch_on_trial_published() {
         .unwrap();
     assert_eq!(contents(descriptors.remove(0)), b"good");
 
-    // Epoch 2 reserves a page it commits only after the rollback.
-    let ::storage::protocol::Response::Reserved { .. } = trial
-        .call(
-            &::storage::protocol::Request::Reserve {
-                pool,
-                writer: Some(scope("text", 0)),
-                keys: vec![key(8)],
-                window: None,
-            },
-            &[],
-        )
-        .unwrap()
-        .0
-    else {
-        panic!("the reservation was refused");
-    };
-
-    // The rollback retires epoch 2. Neither its committed page nor the one
-    // it commits as it leaves is read by any epoch, nor what it reserves
-    // after.
+    // The rollback retires epoch 2: what it alone put leaves the server.
     daemon.claim(1, vec![scope("text", 0)], vec![2]).unwrap();
-    trial
-        .call(
-            &::storage::protocol::Request::Commit {
-                pool,
-                keys: vec![key(8)],
-            },
-            &[],
-        )
-        .unwrap();
-    publish(&mut trial, pool, &[key(9)]);
-    assert_eq!(
-        levels(&mut serving, pool, &[key(5), key(8), key(9)]),
-        vec![PageLevel::Absent; 3]
-    );
-    let mut next = engine_head(&server.socket, 3);
-    assert_eq!(
-        levels(&mut next, pool, &[key(5), key(8), key(9)]),
-        vec![PageLevel::Absent; 3]
-    );
-    // The page committed before the rollback left the pool.
-    let listing = daemon.list().unwrap();
-    assert_eq!(listing.page_pools[0].ready, 2, "{listing:?}");
     assert_eq!(retained_names(&mut daemon), vec!["weights"]);
     let (_, mut descriptors) = serving_worker
         .get(vec![key(6)], Mode::Read, Vec::new())
@@ -1603,42 +954,6 @@ fn a_epoch_reads_what_it_published_that_only_a_epoch_on_trial_retains() {
         .get(vec![key(10)], Mode::Standby, Vec::new())
         .unwrap();
     assert_eq!(got.tensors.len(), 1, "{:?}", got.missing);
-}
-
-/// An epoch's ranks on a host hold one token count in its host KV cache:
-/// what the epoch asks for, unless the host's budget over the bytes a token
-/// takes on all of them holds fewer.
-#[test]
-fn a_host_sizes_the_host_kv_cache_of_a_epoch_in_tokens() {
-    use ::storage::protocol::{Request, Response};
-
-    let server = Running::start();
-    let mut daemon = head(&server.socket);
-    daemon.claim(1, vec![scope("text", 0)], Vec::new()).unwrap();
-    daemon.publish(vec![1]).unwrap();
-    let mut engine = engine_head(&server.socket, 1);
-    let mut ask = |tokens: u64, host_bytes: Option<u64>| {
-        let (response, _) = engine
-            .call(
-                &Request::HostCache {
-                    tokens,
-                    token_bytes: vec![1024, 3072],
-                    host_bytes,
-                },
-                &[],
-            )
-            .unwrap();
-        let Response::HostCache { tokens } = response else {
-            panic!("the host KV cache was not sized: {response:?}");
-        };
-        tokens
-    };
-
-    // A stated budget of 64 MiB holds 16384 tokens of 4 KiB over both ranks.
-    assert_eq!(ask(1 << 20, Some(64 << 20)), 16384);
-    assert_eq!(ask(4096, Some(64 << 20)), 4096);
-    // The host's available storage holds a few thousand tokens.
-    assert_eq!(ask(4096, None), 4096);
 }
 
 #[test]
@@ -1679,74 +994,6 @@ fn host_storage_is_admitted_before_allocation_and_retires_with_its_owner() {
         assert_eq!(head.keep_weights(vec![1], Vec::new()).unwrap(), 1);
         assert!(head.list().unwrap().tensors.is_empty());
     }
-}
-
-/// A host that admits no page pool, its whole storage reserved, holds no
-/// token of an epoch's host KV cache and refuses its pools. Once a KV
-/// storage keeps what the pools commit (a connector connected), it holds
-/// what a staging pool of `STAGING_POOL_BYTES` holds on each rank, and
-/// admits such a pool from its reserve, though no larger one: pages pass
-/// through it into the KV storage.
-#[test]
-fn a_host_that_admits_no_pool_stages_pages_for_the_kv_storage() {
-    use ::storage::protocol::{PageShape, Request, Response};
-    use storage_server::STAGING_POOL_BYTES;
-
-    let server = Running::reserving(u64::MAX);
-    let mut daemon = head(&server.socket);
-    let claim = daemon.claim(1, vec![scope("text", 0)], Vec::new()).unwrap();
-    daemon.publish(vec![1]).unwrap();
-    let mut engine = engine_head(&server.socket, 1);
-    let mut ask = |tokens: u64, host_bytes: Option<u64>| {
-        let (response, _) = engine
-            .call(
-                &Request::HostCache {
-                    tokens,
-                    token_bytes: vec![1024, 3072],
-                    host_bytes,
-                },
-                &[],
-            )
-            .unwrap();
-        let Response::HostCache { tokens } = response else {
-            panic!("the host KV cache was not sized: {response:?}");
-        };
-        tokens
-    };
-    let mut worker = epoch_worker(&server.socket, scope("text", 0), 1, claim);
-    // The slots of a pool of pages of 16 bytes the worker asks for of
-    // `bytes`, or `None` when the host refuses it.
-    let mut pool = |bytes: u64| {
-        let shape = PageShape {
-            layout: key(3),
-            kv_head_offset: 0,
-            kv_head_count: 2,
-            page_bytes: 16,
-        };
-        let request = Request::Pool {
-            shape,
-            numa_node: None,
-            bytes: Some(bytes),
-        };
-        match worker.call(&request, &[]).unwrap().0 {
-            Response::Pool { slots, .. } => Some(slots),
-            Response::Error { .. } => None,
-            reply => panic!("a page pool request responded {reply:?}"),
-        }
-    };
-
-    assert_eq!(ask(1 << 20, None), 0);
-    assert_eq!(pool(32), None);
-
-    let _connector = Client::connect(&server.socket, Role::Connector).unwrap();
-    // The larger rank takes 3072 bytes a token; a stated budget the host
-    // cannot admit stages as well.
-    let staging = STAGING_POOL_BYTES / 3072;
-    assert_eq!(ask(1 << 20, None), staging);
-    assert_eq!(ask(1 << 20, Some(64 << 30)), staging);
-    assert_eq!(ask(64, None), 64);
-    assert_eq!(pool(STAGING_POOL_BYTES + 16), None);
-    assert_eq!(pool(STAGING_POOL_BYTES), Some(STAGING_POOL_BYTES / 16));
 }
 
 /// A server serves clients of its own protocol only and refuses any other version.
@@ -2339,99 +1586,4 @@ fn a_standby_of_the_scope_adopts_its_storage_by_promotion() {
         server_error(other.get(vec![key(9)], Mode::Write, Vec::new())),
         ErrorKind::Held
     );
-}
-
-/// A pool's slots through a head's requests: a reserved slot is committed
-/// or aborted, an aborted slot is free again, a committed page is found and
-/// evicted for a later reservation unless it is pinned, and an unpinned
-/// page is evictable again.
-#[test]
-fn a_reservation_is_committed_or_aborted_and_a_pin_keeps_its_page() {
-    use ::storage::protocol::{PageLevel, PageSlot, Request, Response};
-
-    let server = Running::start();
-    let mut head = head(&server.socket);
-    let claim = head.claim(0, vec![scope("text", 0)], Vec::new()).unwrap();
-    let mut rank = worker(&server.socket, scope("text", 0), 1, claim);
-    let pool = trial_pool(&mut rank);
-
-    let reserve = |head: &mut Client, keys: Vec<Key>| {
-        let request = Request::Reserve {
-            pool,
-            writer: Some(scope("text", 0)),
-            keys,
-            window: None,
-        };
-        match head.call(&request, &[]).unwrap().0 {
-            Response::Reserved { slots } => slots,
-            other => panic!("a reservation responded {other:?}"),
-        }
-    };
-    let reserved = |slots: &[PageSlot]| {
-        slots
-            .iter()
-            .filter(|slot| matches!(slot, PageSlot::Reserved { .. }))
-            .count()
-    };
-
-    // The pool's four slots are reserved; a fifth page finds none.
-    let first: Vec<Key> = (1..=4).map(key).collect();
-    assert_eq!(reserved(&reserve(&mut head, first.clone())), 4);
-    assert_eq!(reserve(&mut head, vec![key(5)]), vec![PageSlot::Full]);
-
-    // Two pages are written and committed, two are not and are aborted.
-    let commit = Request::Commit {
-        pool,
-        keys: vec![key(1), key(2)],
-    };
-    assert_eq!(head.call(&commit, &[]).unwrap().0, Response::Committed);
-    let abort = Request::Abort {
-        pool,
-        keys: vec![key(3), key(4)],
-    };
-    assert_eq!(head.call(&abort, &[]).unwrap().0, Response::Aborted);
-    assert_eq!(
-        levels(&mut head, pool, &first),
-        vec![
-            PageLevel::Host,
-            PageLevel::Host,
-            PageLevel::Absent,
-            PageLevel::Absent
-        ]
-    );
-    assert_eq!(reserve(&mut head, vec![key(1)]), vec![PageSlot::Present]);
-
-    // A pinned page keeps its slot: four further pages take the two free
-    // slots and the unpinned page's, and one finds none.
-    let pin = Request::Pin {
-        pool,
-        reader: scope("text", 0),
-        keys: vec![key(1), key(3)],
-    };
-    let Response::Pinned { slots } = head.call(&pin, &[]).unwrap().0 else {
-        panic!("a pin was refused");
-    };
-    assert!(matches!(slots[..], [Some(_), None]), "{slots:?}");
-
-    let second: Vec<Key> = (5..=8).map(key).collect();
-    let slots = reserve(&mut head, second.clone());
-    assert_eq!(reserved(&slots), 3, "{slots:?}");
-    assert_eq!(
-        levels(&mut head, pool, &[key(1), key(2)]),
-        vec![PageLevel::Host, PageLevel::Absent]
-    );
-
-    // Once unpinned and nothing is reserved, every slot is evictable.
-    let abort = Request::Abort { pool, keys: second };
-    assert_eq!(head.call(&abort, &[]).unwrap().0, Response::Aborted);
-    let unpin = Request::Unpin {
-        pool,
-        reader: scope("text", 0),
-        keys: vec![key(1)],
-    };
-    assert_eq!(head.call(&unpin, &[]).unwrap().0, Response::Unpinned);
-
-    let third: Vec<Key> = (9..=12).map(key).collect();
-    assert_eq!(reserved(&reserve(&mut head, third)), 4);
-    assert_eq!(levels(&mut head, pool, &[key(1)]), vec![PageLevel::Absent]);
 }

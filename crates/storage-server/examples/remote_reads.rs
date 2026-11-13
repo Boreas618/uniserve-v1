@@ -414,8 +414,8 @@ fn host_storage(bytes: u64, node: Option<u32>, seed: Option<u64>) -> anyhow::Res
         )
     }?;
     if let Some(node) = node {
-        // A node mask of 1024 bits, as the Storage Server's page pools bind
-        // theirs; MPOL_PREFERRED falls back to other nodes when the node is
+        // A node mask of 1024 bits, as the Storage Server's host memory binds
+        // its own; MPOL_PREFERRED falls back to other nodes when the node is
         // full.
         const MASK_BITS: u32 = 1024;
         ensure!(node < MASK_BITS, "NUMA node {node} is beyond the mask");
@@ -504,7 +504,7 @@ fn hold(options: &Options) -> anyhow::Result<()> {
     }
     // Read-only host storage (as weights kept on the host are), which the
     // source's Transfer Server maps read-only and registers for reads
-    // alone, or writable host storage (as host page pools are).
+    // alone, or writable host storage (as a host region's parts are).
     tensors.push(tensor(
         HOST_TENSOR,
         storages.len() as u32,

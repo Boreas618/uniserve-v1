@@ -97,8 +97,8 @@ const fn encoder_feature(encoder: ImageEncoder) -> GenerationFeatures {
 bitflags::bitflags! {
     /// Generation branches present in a runtime or required by one request.
     ///
-    /// Bit 3 is unassigned: it named a branch no runtime serves, and a set
-    /// carried between processes keeps every other bit's meaning.
+    /// Bits 3 and 4 are unassigned: they named branches no runtime serves, and
+    /// a set carried between processes keeps every other bit's meaning.
     #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
     pub struct GenerationFeatures: u8 {
         /// Autoregressive understanding execution.
@@ -107,9 +107,6 @@ bitflags::bitflags! {
         const VISION_ENCODE = 1 << 1;
         /// Variational-autoencoder latent encoding.
         const LATENT_ENCODE = 1 << 2;
-        /// Denoising passes of token blocks that read a prompt's prefix cache
-        /// without writing it.
-        const TOKEN_DENOISING = 1 << 4;
     }
 }
 
@@ -117,8 +114,7 @@ impl GenerationFeatures {
     /// Returns the admission diagnostic name of one represented feature.
     ///
     /// Features are checked in the order understanding, latent encode, vision
-    /// encode, token denoising; an empty set yields
-    /// `runtime_generation_features`.
+    /// encode; an empty set yields `runtime_generation_features`.
     pub fn name(self) -> &'static str {
         if self.contains(Self::UNDERSTANDING) {
             "runtime_und_execution"
@@ -126,8 +122,6 @@ impl GenerationFeatures {
             "runtime_vae_encode"
         } else if self.contains(Self::VISION_ENCODE) {
             "runtime_vit_encode"
-        } else if self.contains(Self::TOKEN_DENOISING) {
-            "runtime_token_denoise"
         } else {
             "runtime_generation_features"
         }
@@ -483,21 +477,10 @@ impl GenerationRequest {
     }
 
     /// Returns the runtime features the request's computation reaches:
-    /// understanding and the encoders of its context images. A request a
-    /// block-diffusion runtime generates in blocks needs
-    /// [`GenerationRequest::block_features`] instead.
+    /// understanding and the encoders of its context images.
     pub fn required_features(&self) -> GenerationFeatures {
         self.context_encoders()
             .fold(GenerationFeatures::UNDERSTANDING, |needs, step| {
-                needs | encoder_feature(step)
-            })
-    }
-
-    /// Returns the features of denoising blocks over the request's context:
-    /// token denoising and the encoders of the context images.
-    pub fn block_features(&self) -> GenerationFeatures {
-        self.context_encoders()
-            .fold(GenerationFeatures::TOKEN_DENOISING, |needs, step| {
                 needs | encoder_feature(step)
             })
     }
@@ -669,10 +652,6 @@ pub enum GenerationRequestError {
         /// The request's token limit.
         max_und_tokens: usize,
     },
-    /// A request a block-diffusion runtime generates in blocks names no
-    /// seed for its draws.
-    #[error("a block-generating request requires a sampling seed")]
-    UnseededBlock,
     /// Text sampling parameters are invalid.
     #[error("invalid sampling parameters: {0}")]
     InvalidSampling(#[source] SamplingParamsError),
@@ -764,12 +743,6 @@ mod tests {
         assert_eq!(
             request.required_features(),
             GenerationFeatures::UNDERSTANDING
-                | GenerationFeatures::LATENT_ENCODE
-                | GenerationFeatures::VISION_ENCODE
-        );
-        assert_eq!(
-            request.block_features(),
-            GenerationFeatures::TOKEN_DENOISING
                 | GenerationFeatures::LATENT_ENCODE
                 | GenerationFeatures::VISION_ENCODE
         );

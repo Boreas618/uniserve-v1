@@ -477,7 +477,6 @@ impl RequestEvents {
         match event {
             Event::Scheduled { .. } => self.scheduled = true,
             Event::TextToken { id, .. } => self.keep(&[*id]),
-            Event::TextTokens { ids } => self.keep(ids),
             event if event.is_terminal() => self.finish(),
             _ => {}
         }

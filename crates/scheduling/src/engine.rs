@@ -4,7 +4,7 @@
 //! (§3, §4.4). The Build Server compiles it with `WasmSource` (§5.2),
 //! precompiles it for the host's CPU with [`Engine::precompile`] and stores the
 //! artifact in its module store (§5.3); the scheduler threads of the main
-//! process load that artifact with [`Engine::module`].
+//! process load that artifact with [`Engine::load`].
 //!
 //! One engine serves a process: a module precompiled by one engine is rejected
 //! by another whose configuration differs, so the process that precompiles and
@@ -62,7 +62,7 @@ impl Engine {
         config.consume_fuel(true);
         config.cranelift_opt_level(OptLevel::Speed);
         // A failure is reported as its trap code alone, so no backtrace is
-        // collected (`None`): the mechanism reverts the policy rather than
+        // collected (`None`): the scheduler reverts the policy rather than
         // debugging it in the scheduler thread.
         config.wasm_backtrace_max_frames(None);
         config.target(target).map_err(|error| PolicyError::Load {
@@ -84,13 +84,6 @@ impl Engine {
             .map_err(|error| PolicyError::Load {
                 message: format!("cannot precompile the policy module: {error}"),
             })
-    }
-
-    /// Loads a policy module from the bytes the Build Server serves: the
-    /// precompiled artifact when the bytes are one, the wasm32 binary
-    /// otherwise.
-    pub fn module(&self, bytes: &[u8]) -> Result<crate::PolicyModule, PolicyError> {
-        crate::PolicyModule::load(self, bytes)
     }
 
     /// Compiles the bytes the Build Server serves for a policy package into
@@ -122,11 +115,5 @@ impl Engine {
                 message: format!("cannot compile the policy module: {error}"),
             }),
         }
-    }
-
-    /// The wasmtime engine itself, for the module and instance code of this
-    /// crate.
-    pub(crate) const fn inner(&self) -> &wasmtime::Engine {
-        &self.inner
     }
 }

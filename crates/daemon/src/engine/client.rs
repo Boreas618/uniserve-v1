@@ -1135,7 +1135,6 @@ impl EventStream {
     fn observe(&mut self, event: &Event) {
         match event {
             Event::TextToken { .. } => self.text_tokens += 1,
-            Event::TextTokens { ids } => self.text_tokens += ids.len(),
             event if event.is_terminal() => {
                 // The terminal event is one the consumer took, and the engine
                 // counts it in the position a takeover replays from: a stream

@@ -15,11 +15,6 @@ pub struct StorageLaunch {
     /// worker states so that the server knows it belongs to the current
     /// head.
     pub claim: [u8; 16],
-    /// Whether the engine copies the worker's cache pages through the host
-    /// KV cache: the worker then maps a page pool per cache group, holding
-    /// the tokens the engine sizes the epoch's host KV cache at
-    /// (`uniserve.host_cache`).
-    pub host_kv_cache: bool,
     /// Where an engine on another host reaches the server (`host:port`), for
     /// page requests; `None` on the engine's host, or when the server accepts
     /// no other host.

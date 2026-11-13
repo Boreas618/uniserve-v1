@@ -710,22 +710,16 @@ impl MainProcess {
             Ok(generation) => generation,
             Err(report) => return self.report(report),
         };
-        let command = proto::process::Command {
-            kind: Some(command::Kind::Prepare(prepare)),
-        };
-        let parts = match ipc::GenerationCommand::from_command(command, self.generation) {
-            Ok(Some(ipc::GenerationCommand::Prepare {
-                packages, policy, ..
-            })) => self
+        let parts = match generation::named(prepare) {
+            Ok((packages, policy)) => self
                 .engine
                 .as_ref()
                 .and_then(|engine| Some((engine, engine.build.clone()?)))
-                .map(|(engine, build)| (engine, build, *packages, policy))
+                .map(|(engine, build)| (engine, build, packages, policy))
                 .ok_or_else(|| {
                     "this engine holds no Build Server to resolve modules at".to_owned()
                 }),
-            Ok(_) => Err("the command did not read as a preparation".to_owned()),
-            Err(error) => Err(error.to_string()),
+            Err(error) => Err(format!("{error:#}")),
         };
         let (engine, build, named, policy) = match parts {
             Ok(parts) => parts,

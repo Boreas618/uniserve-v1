@@ -16,8 +16,7 @@ use std::path::Path;
 use std::time::{Duration, Instant};
 
 use ::storage::protocol::{
-    ErrorKind, Event, Link, LinkEnd, PageShape, Priority, Region, Request, Response, Span,
-    TaskStatus, TaskTotal, Throttle,
+    ErrorKind, Event, Link, LinkEnd, Priority, Region, Span, TaskStatus, TaskTotal, Throttle,
 };
 use ::storage::{Access, Client, Role};
 use storage_server::Launch;
@@ -213,11 +212,12 @@ fn a_transfer_copies_host_regions_and_ends_complete() {
     let claim = head.claim(0, vec![scope("text", 0)], Vec::new()).unwrap();
     let mut worker = worker(&server.socket, scope("text", 0), 1, claim);
 
-    // A read-only source and an exclusive destination, packed in storages
-    // of their own, and a page pool of four 16-byte slots.
+    // A read-only source, an exclusive destination and an exclusive scratch
+    // tensor, packed in storages of their own.
     let source_bytes = pattern(64, 7);
     let source = memfd(&source_bytes);
     let destination = memfd(&[0; 64]);
+    let scratch = memfd(&[0; 64]);
     worker
         .put(
             vec![tensor(key(1), "weights", 0, 0, Access::ReadOnly)],
@@ -230,49 +230,38 @@ fn a_transfer_copies_host_regions_and_ends_complete() {
             &[(host(64), destination.as_fd())],
         )
         .unwrap();
-    let shape = PageShape {
-        layout: key(3),
-        kv_head_offset: 0,
-        kv_head_count: 1,
-        page_bytes: 16,
-    };
-    let Response::Pool { pool, .. } = worker
-        .call(
-            &Request::Pool {
-                shape,
-                numa_node: None,
-                bytes: None,
-            },
-            &[],
+    worker
+        .put(
+            vec![tensor(key(3), "scratch", 0, 0, Access::Exclusive)],
+            &[(host(64), scratch.as_fd())],
         )
-        .unwrap()
-        .0
-    else {
-        panic!("the page pool was refused");
-    };
+        .unwrap();
 
     // Offsets count from the tensor's first byte: the destination tensor
-    // starts at byte 16 of its storage. The pool's slot 2 then goes back
-    // into the destination's last bytes.
+    // starts at byte 16 of its storage. The scratch's bytes 32..48 then go
+    // back into the destination's last bytes.
     let task = worker
         .copy(
             vec![
                 span(tensor_region(1), 8, tensor_region(2), 0, 24),
-                span(tensor_region(1), 0, Region::Pool { pool }, 32, 16),
+                span(tensor_region(1), 0, tensor_region(3), 32, 16),
             ],
             Priority::Warming,
             1,
         )
         .unwrap();
     assert_eq!(end_of(&mut worker, task), (40, TaskStatus::Complete));
-    let pool_task = worker
+    let scratch_task = worker
         .copy(
-            vec![span(Region::Pool { pool }, 32, tensor_region(2), 32, 16)],
+            vec![span(tensor_region(3), 32, tensor_region(2), 32, 16)],
             Priority::Background,
             1,
         )
         .unwrap();
-    assert_eq!(end_of(&mut worker, pool_task), (16, TaskStatus::Complete));
+    assert_eq!(
+        end_of(&mut worker, scratch_task),
+        (16, TaskStatus::Complete)
+    );
 
     let copied = read(&destination, 0, 64);
     assert_eq!(&copied[..16], &[0; 16]);
@@ -317,6 +306,52 @@ fn a_transfer_copies_host_regions_and_ends_complete() {
             },
         ]
     );
+}
+
+/// A request's load overtakes a promotion's copies on their link.
+#[test]
+fn a_request_transfer_overtakes_a_promotion_on_its_link() {
+    let server = serving(Gpus::Hidden);
+    let Slow {
+        mut worker,
+        destination,
+        bytes,
+        ..
+    } = slow(&server, 256 << 20);
+
+    let promotion = worker
+        .copy(
+            vec![span(tensor_region(1), 0, tensor_region(2), 0, bytes - 4096)],
+            Priority::Promotion,
+            1,
+        )
+        .unwrap();
+    let request = worker
+        .copy(
+            vec![span(
+                tensor_region(1),
+                0,
+                tensor_region(2),
+                bytes - 4096,
+                4096,
+            )],
+            Priority::Request,
+            1,
+        )
+        .unwrap();
+
+    let mut ended = Vec::new();
+    while ended.len() < 2 {
+        if let Event::TaskEnded {
+            task, status: end, ..
+        } = transfer_event(&mut worker)
+        {
+            assert_eq!(end, TaskStatus::Complete);
+            ended.push(task);
+        }
+    }
+    assert_eq!(ended, [request, promotion]);
+    assert_eq!(read(&destination, bytes - 4096, 4096), pattern(4096, 3));
 }
 
 #[test]
@@ -472,7 +507,7 @@ fn a_transfer_is_refused_whole_unless_every_span_fits_storage_of_its_deployment(
             0,
             8,
         )],
-        // Another host's region is one of its tensors or page pools.
+        // Another host's region is one of its tensors or host regions' parts.
         vec![span(
             remote_region(
                 "10.0.0.2:7000",

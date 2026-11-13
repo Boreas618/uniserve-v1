@@ -172,8 +172,8 @@ impl KvCacheConfig {
 pub struct CacheRegions {
     /// The region of the pool's units on the device: unit `u` of it is the pool's unit `u`.
     pub units: u8,
-    /// Per cache group, the host region of the group's pages: unit `u` of it is page `u` of the
-    /// group's host page pool. `None` for a group whose pages have no host copy.
+    /// Per cache group, the host region of the group's pages: unit `u` of it is the group's host
+    /// page `u`. `None` for a group whose pages have no host copy.
     pub host: Vec<Option<u8>>,
     /// Per cache group, the region of the group's converted-load source buffer: unit `u` of it
     /// is slot `u` of the buffer. `None` for a group that converts none.

@@ -14,8 +14,8 @@
 //! | latents | what computes the trajectory (the latent seed), the trajectory and its step count | [`latent_seed`], [`latent_content`] |
 //!
 //! A KV page has one key at every level of the cache: the device prefix
-//! cache (L1) indexes it by the key the chain gives it, the host page pools
-//! (L2) hold it under the same key, and the KV storage (L3) keeps it under
+//! cache (L1) indexes it by the key the chain gives it, the buffer pool's
+//! host regions (L2) hold it under the same key, and the KV storage (L3) keeps it under
 //! that key with the rank's KV-head range. A key carries no package's
 //! backend name or revision: replacing a kernel package keeps the
 //! mathematical content, so derived state keeps hitting. A change of
@@ -172,7 +172,7 @@ pub fn encoder_page(content: &[u8; 32], page: u32) -> Key {
 }
 
 /// The latent seed of what a deployment's denoising computes, from the
-/// identities its denoising ranks report (`LatentPoolInfo::identity`): the
+/// identities its denoising ranks report of the weights they compute with: the
 /// first eight bytes of the digest of the distinct identities in order, so
 /// that a parallel configuration of other ranks computing the same derives
 /// the same seed. Zero when no rank reports one.

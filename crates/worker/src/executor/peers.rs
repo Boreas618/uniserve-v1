@@ -882,7 +882,6 @@ fn refusal(id: u64, message: String) -> MainProcessResponse {
             fatal: false,
             phase: None,
             route: None,
-            calls: Vec::new(),
         },
     }
 }

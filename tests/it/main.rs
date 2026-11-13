@@ -3,5 +3,4 @@
 
 #![cfg(test)]
 
-mod mooncake;
 mod nodes;

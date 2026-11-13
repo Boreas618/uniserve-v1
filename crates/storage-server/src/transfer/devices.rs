@@ -5,7 +5,7 @@
 //! A link's bandwidth is measured on the path its copies take, with storage
 //! of the kinds they copy: CUDA VMM allocations that every GPU able to
 //! address them is granted access to, and memfds registered with CUDA,
-//! bound to the GPU's closest host NUMA node as page pools are. Each link
+//! bound to the GPU's closest host NUMA node as host regions' parts are. Each link
 //! runs one untimed copy of [`SAMPLE_BYTES`], then [`SAMPLES`] timed ones
 //! back to back on the stream of the GPU that runs its copies (the
 //! destination's when it is a GPU), timed by CUDA events; the host-to-host
@@ -318,7 +318,7 @@ fn host_buffer(numa_node: Option<u32>) -> Result<OwnedFd, Error> {
     .map_err(std::io::Error::from)?;
     rustix::fs::ftruncate(&descriptor, SAMPLE_BYTES as u64).map_err(std::io::Error::from)?;
     if let Some(node) = numa_node {
-        crate::pages::prefer_node(&descriptor, SAMPLE_BYTES as u64, node)?;
+        crate::memory::prefer_node(&descriptor, SAMPLE_BYTES as u64, node)?;
     }
     Ok(descriptor)
 }

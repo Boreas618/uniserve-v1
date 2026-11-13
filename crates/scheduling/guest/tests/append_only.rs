@@ -13,8 +13,8 @@
 
 #![cfg(test)]
 
-use scheduling::guest::wire;
-use scheduling::guest::{
+use scheduling_guest::wire;
+use scheduling_guest::{
     DispatchOutput, End, Event, Limits, RequestId, RequestStatus, RequestView, Room, Shortage,
     Snapshot, Storage, Victim, Work,
 };
@@ -69,7 +69,7 @@ fn an_output_that_omits_a_later_field_means_its_default() {
 
     let victims: Vec<Victim> = decode(r#"[{"page":1},{"request":2},{"encoding":3}]"#);
     assert_eq!(victims.len(), 3);
-    assert_eq!(victims[0].page(), Some(scheduling::guest::PageId(1)));
+    assert_eq!(victims[0].page(), Some(scheduling_guest::PageId(1)));
 
     let limits: Limits = decode(r#"{"chunked_prefill_size":2048,"max_batch":8}"#);
     assert_eq!(limits.chunked_prefill_size, 2048);

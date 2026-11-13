@@ -7,11 +7,11 @@
 //!
 //! | Allocation | Mapping | For | Lives |
 //! | --- | --- | --- | --- |
-//! | host storage, page pool | the memfd mapped into the process | the CPU's copies | until the server takes it back and no copy holds it |
+//! | host storage, a host region's part | the memfd mapped into the process | the CPU's copies | until the server takes it back and no copy holds it |
 //! | the same | that mapping registered with this process's NIXL agent | READs from another host into it, and another host's READs of it | the same |
 //! | device storage | its CUDA VMM allocation imported on its GPU, every GPU that can address it granted access | copy engines | while the GPU's context is held ([`super::contexts`]) |
 //! | the same | that mapping registered with the NIXL agent | READs, as above | the same |
-//! | host storage, page pool | a mapping of the GPU's own, registered in its context (for reads alone where the device supports it) | the GPU's copy engines | the same |
+//! | host storage, a host region's part | a mapping of the GPU's own, registered in its context (for reads alone where the device supports it) | the GPU's copy engines | the same |
 //! | another host's device allocation | its fabric handle imported on the GPU that runs the copy | copy engines | the task |
 //!
 //! What lives in a GPU's context belongs to that GPU's session, so that the
@@ -257,7 +257,7 @@ impl HostMap {
     /// Map the memfd `descriptor`, which holds at least `bytes`, for
     /// reading, and for writing when `writable`.
     ///
-    /// The whole memfd is mapped: a page pool's memfd may hold huge pages,
+    /// The whole memfd is mapped: a host region's memfd may hold huge pages,
     /// whose size it is rounded up to, and a huge-page mapping is unmapped
     /// only whole.
     pub(super) fn new(descriptor: &OwnedFd, bytes: usize, writable: bool) -> io::Result<Self> {

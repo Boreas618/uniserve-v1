@@ -7,23 +7,19 @@ publish = false
 
 [dependencies]
 libc.workspace = true
-prost.workspace = true
 proto.workspace = true
 rmp-serde.workspace = true
 # The phase a batch computes: the one closed set the policy interface states.
 scheduling-guest.workspace = true
 serde = { workspace = true, features = ["rc"] }
-serde_json.workspace = true
 # The framing of every socket transport.
 service.workspace = true
-# The cache manifest's pages, which a storage operation names.
+# The buffer pool's records the peer link carries, and the keys a cache report names.
 storage.workspace = true
 thiserror.workspace = true
-toml.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
-toml.workspace = true
 
 [lints]
 workspace = true

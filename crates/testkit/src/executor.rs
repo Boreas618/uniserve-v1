@@ -17,9 +17,8 @@
 //!   group's tables, stamps it with the sequence of the group's last batch, and returns it in a
 //!   [`Message::Submit`].
 //!
-//! A batch's output follows the rule of [`crate::FakeBatches`]: a call samples
-//! [`crate::draw_token`] of its last row's draw, and nothing when that row's logits are not
-//! wanted ([`output_of`]). A case varies where text ends, the one token every call samples, the
+//! A batch's output follows one rule: a call samples [`crate::draw_token`] of its last row's
+//! draw, and nothing when that row's logits are not wanted ([`output_of`]). A case varies where text ends, the one token every call samples, the
 //! whole output, which calls fail, which batches are held, and whether copies fail.
 //!
 //! What the fake records answers the scheduler's side of A1 to A4 (`specs/buffer-pool.md` §9,
@@ -38,6 +37,7 @@
 //!   slot holds writable.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
+use std::io::Write as _;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use crossbeam_channel::Sender;
@@ -50,8 +50,7 @@ use ipc::batch::{
 use proto::request::RequestId;
 use storage::runtime::{self, Completion, GroupId, OwnerId, Request, Run, Stamps};
 
-use crate::batches::{SAMPLED, draw_token};
-use crate::text::{EOS, EndOfText, scored};
+use crate::text::{EOS, EndOfText, SAMPLED, draw_token, scored};
 
 /// A case's own response to a batch, in place of the fake's rule. It runs under the fake's lock
 /// and must not call the fake.
@@ -862,7 +861,7 @@ fn media(batch: &Batch, index: usize) -> CallOutput {
         Phase::LatentPrepare => output.step_index = row.step,
         Phase::Mux if row.rounds == 0 => {
             let payload = format!("uniserve-fake-video request={}", row.request.0);
-            match crate::media::publish(payload.as_bytes(), 0) {
+            match publish(payload.as_bytes()) {
                 Ok(media) => output.media_output = Some(media),
                 Err(_) => return failed(ErrorCode::ResourceError, None),
             }
@@ -887,6 +886,28 @@ fn completed(tokens: Vec<u32>, seen: u32) -> CallOutput {
         media_output: None,
         draft_token_ids: Vec::new(),
     }
+}
+
+/// Publishes `bytes` as a POSIX shared-memory object, as a worker's media host relinquishes an
+/// artifact for the scheduler to take.
+fn publish(bytes: &[u8]) -> Result<ipc::MediaOutput, String> {
+    let storage = || -> std::io::Result<String> {
+        let mut storage = tempfile::Builder::new()
+            .prefix("uniserve-fake-video-")
+            .tempfile_in("/dev/shm")?;
+        storage.write_all(bytes)?;
+        let (_file, path) = storage.keep().map_err(|error| error.error)?;
+        path.file_name()
+            .and_then(|name| name.to_str())
+            .map(str::to_owned)
+            .ok_or_else(|| std::io::Error::other("the shared-memory object has no printable name"))
+    };
+    let name = storage().map_err(|error| format!("publishing the artifact: {error}"))?;
+
+    Ok(ipc::MediaOutput {
+        handle: ipc::ArtifactHandle::PosixShm { name },
+        bytes: bytes.len() as u64,
+    })
 }
 
 /// A call that failed with `code`; only an input error states its reason.

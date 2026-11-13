@@ -4,15 +4,12 @@
 //! them; [`cache`] is the cache a fake engine's ranks hold and [`capacity`] what each of its
 //! worker groups serves, from which the engine's schedulers build their whole view of the groups
 //! (`engine::scheduler::Capacity`), as they do from a rank start's.
-//!
-//! [`rank`] and [`pool`] state the inventory of the batch-interface fake ([`crate::FakeBatches`]).
 
 use std::num::NonZeroUsize;
 
+use ipc::Capacity;
 use ipc::batch::{Phase, Shape, Variant};
-use ipc::execution::{Inventory, PoolLayout};
-use ipc::{Capacity, MainProcessEndpoint, MainProcessInfo};
-use proto::config::{BlockConfig, EngineArgs, WorkerGroupConfig};
+use proto::config::{EngineArgs, WorkerGroupConfig};
 use proto::request::{ModelDtype, PrefixCacheDtype};
 use worker::memory::cache::CacheLayout;
 
@@ -26,59 +23,6 @@ const BATCH_TOKENS: u32 = 512;
 
 /// The longest sequence a fake engine's groups serve, in tokens.
 const MAX_MODEL_LEN: u32 = 4096;
-
-/// One rank of a text pool on `host`: prefill and decode, eight request rows, the batch bounds a
-/// launch states, and the paged KV pool every token-serving rank advertises.
-pub fn rank(host: &str) -> MainProcessInfo {
-    MainProcessInfo {
-        endpoint: MainProcessEndpoint {
-            host: host.to_owned(),
-            address_space: format!("{host}-space"),
-            incarnation: format!("{host}-rank"),
-        },
-        supported_calls: vec![
-            ipc::CallKind::Forward(ipc::ForwardMode::Prefill),
-            ipc::CallKind::Forward(ipc::ForwardMode::Decode),
-        ],
-        request_slots: 8,
-        max_batch_calls: 16,
-        max_batch_tokens: 512,
-        // The prefix cache is `MainProcessInfo::default`'s: a rank without one is refused every
-        // token request at admission, which is the rule for a media-only rank and not this one.
-        buffer_pool_bytes: 1 << 20,
-        // A rank that samples states how many candidates it computes for a position, which
-        // bounds what a request may ask (`GenerationLimits::max_logprobs`): the fake reports
-        // every sampled token's log-probability, as a launch with `max_logprobs = 20` does.
-        max_logprobs: 20,
-        ..MainProcessInfo::default()
-    }
-}
-
-/// A text pool named `group` of one [`rank`], one batch in flight per device, serving the default
-/// block on that rank.
-pub fn pool(group: &str) -> Inventory {
-    Inventory {
-        group: group.to_owned(),
-        ranks: vec![rank("gpu-a")],
-        layout: PoolLayout {
-            queue_depth: 1,
-            ranks: 1,
-            stages: std::collections::BTreeMap::from([(
-                proto::config::DEFAULT_BLOCK.to_owned(),
-                BlockConfig {
-                    ranks: vec![0],
-                    tensor_parallel_size: 1,
-                    pipeline_parallel_size: 1,
-                    sequence_parallel: Default::default(),
-                    units_per_rank: 1,
-                    weights: Default::default(),
-                    distribution: None,
-                },
-            )]),
-        },
-        max_model_len: MAX_MODEL_LEN,
-    }
-}
 
 /// [`launch`] of one scheduler.
 pub fn args(name: &str) -> EngineArgs {

@@ -4,7 +4,6 @@
 
 mod claim;
 mod hosts;
-mod peer;
 mod remote;
 mod server;
 mod sessions;

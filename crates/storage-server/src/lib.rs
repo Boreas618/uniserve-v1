@@ -9,11 +9,9 @@
 //! The physical storage of a storage lives while the server holds its
 //! descriptor or any process maps it.
 //!
-//! The server also keeps the host's page pools ([`pages`]): the slots of
-//! the host KV cache and which page each holds. Its Mooncake connector
-//! ([`mooncake`], run as a child process [`kv_storage`] supervises) keeps
-//! committed pages in the KV storage and reads them back for
-//! prefetches. Its Transfer Server ([`transfer`], another child process,
+//! Its Mooncake connector ([`mooncake`], run as a child process
+//! [`kv_storage`] supervises) writes the pages of the buffer pools' host
+//! regions to the KV storage and reads them back. Its Transfer Server ([`transfer`], another child process,
 //! which [`transfers`] supervises) copies bytes between the storage the
 //! server holds, for the tasks heads and workers submit; that process, not
 //! the server, holds the CUDA contexts the copies need.
@@ -31,7 +29,7 @@
 //!
 //! One thread serves every client with `poll(2)`. Requests get their responses in
 //! order on their connection. A request that must wait for a previous
-//! writer to be shot down ([`shoot`]), or for the connector's lookup, holds
+//! writer to be shot down ([`shoot`]), or for the Transfer Server, holds
 //! its connection's queue until then, while every other connection is
 //! served on.
 
@@ -40,9 +38,9 @@ mod child;
 pub mod command;
 mod error;
 mod kv_storage;
+mod memory;
 pub mod mooncake;
 mod moves;
-mod pages;
 mod quota;
 mod restart;
 mod serve;
@@ -61,18 +59,16 @@ use std::time::Duration;
 
 use rustix::event::{PollFd, PollFlags, poll};
 
-use crate::mooncake::BATCH_PAGES;
 use ::storage::protocol::{
     Access, Allocation, Claim, ClientMessage, DeploymentListing, ErrorKind, Event, Hello,
-    HostStorage, Item, Key, Listing, Location, Mode, PageLevel, Quota, Request, Response, Retainer,
-    Role, Scope, ScopeBytes, ServerMessage, StorageRecord, TensorListing, TensorRecord, Tensors,
-    Usage, VERSION, Welcome,
+    HostStorage, Item, Key, Listing, Location, Mode, Quota, Request, Response, Retainer, Role,
+    Scope, ScopeBytes, ServerMessage, StorageRecord, TensorListing, TensorRecord, Tensors, Usage,
+    VERSION, Welcome,
 };
 use ::storage::transport::Connection;
 pub use child::Launch;
 pub use error::Error;
 use kv_storage::{KvStorage, Task};
-pub use pages::{DEFAULT_POOL_BYTES, STAGING_POOL_BYTES};
 pub use restart::{PREDECESSOR_DESCRIPTOR, Pending as RestartPending, relaunch_arguments};
 pub use serve::{ServeOptions, list, retire, run_connector, run_transfer_server, serve};
 use shoot::ShootDowns;
@@ -121,14 +117,13 @@ struct Client {
     pid: i32,
     /// The peer process, held so that its identity cannot be reused; `None`
     /// for a connection from another host, which may only make a head's
-    /// page and transfer requests or another host's Transfer Server's
-    /// exposures.
+    /// transfer requests or a peer's requests.
     pidfd: Option<Arc<OwnedFd>>,
     role: Option<Role>,
     /// Requests received and not yet responded, in arrival order.
     queue: VecDeque<(u64, Request, Vec<OwnedFd>)>,
-    /// Whether a request taken from the queue waits for the connector or
-    /// the Transfer Server, which holds the queue until it gets its response.
+    /// Whether a request taken from the queue waits for the Transfer
+    /// Server, which holds the queue until it gets its response.
     held: bool,
 }
 
@@ -177,7 +172,7 @@ struct Deployment {
     head: Option<ClientId>,
     /// The epochs claimed and not retired.
     epochs: BTreeSet<u64>,
-    /// Committed epochs whose tensors and pages every replica may read.
+    /// Committed epochs whose tensors every replica may read.
     published: BTreeSet<u64>,
     /// The epochs a rollback retired while on trial: what they publish
     /// while their processes leave stays theirs.
@@ -197,8 +192,6 @@ enum Handling {
     Response(Response, Vec<Attachment>),
     /// The request waits for these processes to be shot down.
     Wait(Vec<Holder>),
-    /// The request gets its response when the connector finishes this task.
-    KvStorage(Task),
     /// A peer's exposure, checked and resolved, responded once the Transfer
     /// Server registered its regions: the allocations it registers, each
     /// once; for each region the index of its allocation among them and the
@@ -221,18 +214,17 @@ enum Handling {
     },
 }
 
-/// A descriptor that travels with a reply.
+/// A descriptor that travels with a reply or an event.
 #[derive(Clone, Copy)]
 enum Attachment {
     Storage(StorageId),
-    Pool(u64),
 }
 
 /// The server's state and its listening socket.
 pub struct Server {
     listener: UnixListener,
-    /// The TCP listener other hosts' heads reach the page pools through,
-    /// with the address it is bound to.
+    /// The TCP listener other hosts reach the server through (heads, peers
+    /// and other hosts' Transfer Servers), with the address it is bound to.
     tcp: Option<(TcpListener, String)>,
     clients: BTreeMap<ClientId, Client>,
     next_client: ClientId,
@@ -246,8 +238,7 @@ pub struct Server {
     copies: HashMap<Key, Vec<Location>>,
     deployments: HashMap<String, Deployment>,
     shootdowns: ShootDowns,
-    pages: pages::Pools,
-    /// Host storage a new page pool leaves available to the host's other
+    /// Host storage new host storage leaves available to the host's other
     /// processes.
     host_reserve: u64,
     /// The GPUs' quotas: what the processes reserve and the quotas
@@ -270,14 +261,12 @@ pub struct Server {
 }
 
 impl Server {
-    /// Serve on `listener`, which the caller bound with mode 0600, with
-    /// page pools of `page_pool_bytes` each unless a worker asks for another
-    /// size, leaving `host_reserve` bytes of the host's available storage to
-    /// other processes, and run the Mooncake connector `connector` and the
+    /// Serve on `listener`, which the caller bound with mode 0600, leaving
+    /// `host_reserve` bytes of the host's available storage to other
+    /// processes, and run the Mooncake connector `connector` and the
     /// Transfer Server `transfer` when given.
     pub fn new(
         listener: UnixListener,
-        page_pool_bytes: u64,
         host_reserve: u64,
         connector: Option<Launch>,
         transfer: Option<Launch>,
@@ -294,7 +283,6 @@ impl Server {
             copies: HashMap::new(),
             deployments: HashMap::new(),
             shootdowns: ShootDowns::default(),
-            pages: pages::Pools::new(page_pool_bytes),
             host_reserve,
             quotas: quota::Quotas::default(),
             kv_storage: KvStorage::new(connector),
@@ -323,8 +311,8 @@ impl Server {
         self.sessions.watch_pools(trace, check);
     }
 
-    /// Also accept connections from other hosts on `listener`: a head's
-    /// page requests, without descriptors. Returns the bound address.
+    /// Also accept connections from other hosts on `listener`, which carry
+    /// no descriptors. Returns the bound address.
     pub fn listen_tcp(&mut self, listener: TcpListener) -> io::Result<String> {
         listener.set_nonblocking(true)?;
         let address = listener.local_addr()?.to_string();
@@ -548,7 +536,6 @@ impl Server {
                             .send(&ServerMessage::Welcome(welcome), &[]);
                     }
                     if self.kv_storage.client == Some(id) {
-                        self.offer_pools();
                         self.offer_parts();
                         self.send_events();
                     }
@@ -668,17 +655,6 @@ impl Server {
                     self.respond_with(id, request_id, reply, &borrowed);
                     self.send_events();
                 }
-                Ok(Handling::KvStorage(mut task)) => {
-                    if let Task::Lookup { request, .. } = &mut task {
-                        *request = request_id;
-                    }
-                    if let Some(client) = self.clients.get_mut(&id) {
-                        client.held = true;
-                    }
-                    self.assign(task);
-                    self.send_events();
-                    return;
-                }
                 Ok(Handling::Exposing {
                     allocations,
                     regions,
@@ -727,7 +703,6 @@ impl Server {
                     .storages
                     .get(storage)
                     .map(|entry| entry._descriptor.as_fd()),
-                Attachment::Pool(pool) => self.pages.get(*pool).map(|pool| pool.descriptor.as_fd()),
             })
             .collect();
         send_reply(&mut self.clients, id, request, reply, &descriptors);
@@ -789,24 +764,6 @@ impl Server {
                 "a deployment is claimed at its host's server, not from another host",
             )),
             (
-                Request::Pool { .. }
-                | Request::Lookup { .. }
-                | Request::Reserve { .. }
-                | Request::Commit { .. }
-                | Request::Abort { .. }
-                | Request::Pin { .. }
-                | Request::Unpin { .. }
-                | Request::Prefetch { .. }
-                | Request::HostCache { .. },
-                role,
-            ) => {
-                let result = self.pages(id, request, &role);
-                // A reservation or a prefetch may have evicted pages, and an
-                // abort freed some: the windows that followed them end.
-                self.pages.settle();
-                result
-            }
-            (
                 Request::Submit { .. }
                 | Request::OpenSession { .. }
                 | Request::CloseSession { .. }
@@ -826,34 +783,8 @@ impl Server {
                 Role::Peer,
             ) => self.expose(deployment, regions),
             (Request::Unexpose { exposure }, Role::Peer) => Ok(self.unexpose(id, *exposure)),
-            (
-                Request::PeerPin {
-                    deployment,
-                    layouts,
-                    keys,
-                },
-                Role::Peer,
-            ) => {
-                // A peer reads what every epoch of the deployment shares:
-                // the visibility of no epoch of its own.
-                let visibility = self.visibility(deployment, pages::DISCARDED);
-                let pools = self
-                    .pages
-                    .peer_pin(id, deployment, layouts, keys, &visibility);
-                Ok(Handling::Response(
-                    Response::PeerPinned { pools },
-                    Vec::new(),
-                ))
-            }
-            (Request::PeerUnpin { pool, keys }, Role::Peer) => {
-                pool_of(&mut self.pages, *pool)?.peer_unpin(id, keys);
-                self.pages.settle();
-                Ok(Handling::Response(Response::PeerUnpinned, Vec::new()))
-            }
             (Request::Finished { task, results }, Role::Connector) => {
                 self.finished(*task, results);
-                // A download that failed freed the slots it had reserved.
-                self.pages.settle();
                 Ok(Handling::Response(Response::Finished, Vec::new()))
             }
             (Request::Open(open), Role::Head { deployment, epoch }) => {
@@ -1124,8 +1055,8 @@ impl Server {
         // The head that holds the claim adds and retires epochs. A new head
         // starts from its own epoch: the epochs a previous head kept on
         // trial are discarded with that head, never committed, and the
-        // pages of every epoch discarded before are relabelled as such, so
-        // that the new head's epochs may take their numbers.
+        // epochs discarded before are forgotten, so that the new head's
+        // epochs may take their numbers.
         let (trial, mut discarded, mut epochs, mut published) =
             match self.deployments.get(deployment) {
                 Some(entry) => (
@@ -1150,19 +1081,14 @@ impl Server {
         epochs.insert(epoch);
         epochs.retain(|epoch| !retired.contains(epoch));
         published.retain(|epoch| epochs.contains(epoch));
-        // Retiring an uncommitted epoch discards its private pages. A
-        // committed epoch's immutable pages remain reusable after retirement.
+        // Retiring an uncommitted epoch rolls its update back.
         for &old in &trial {
             if retired.contains(&old) {
-                self.pages.discard_epoch(deployment, old);
                 self.update_rolled_back(deployment, old);
                 discarded.insert(old);
             }
         }
         if held.is_none() {
-            for &old in &discarded {
-                self.pages.discard_epoch(deployment, old);
-            }
             discarded.clear();
         }
         self.deployments.insert(
@@ -1175,8 +1101,6 @@ impl Server {
                 discarded,
             },
         );
-        // The retired epochs map no page pool any more.
-        self.pages.retire_users(deployment, &retired);
         // The epoch's retention of the scopes it no longer places ends, and
         // every retired epoch's retention ends.
         let listed: BTreeSet<&Scope> = scopes.iter().collect();
@@ -1236,16 +1160,13 @@ impl Server {
             .collect();
         entry.published.extend(epochs);
         for epoch in newly {
-            for (pool, pages) in self.pages.published_by(deployment, epoch) {
-                self.upload(pool, pages);
-            }
             self.update_committed(deployment, epoch);
         }
         Ok(Handling::Response(Response::Published, Vec::new()))
     }
 
-    /// The deployments other than `except` that hold a claim, a tensor or a
-    /// page pool and whose head is not connected.
+    /// The deployments other than `except` that hold a claim or a tensor and
+    /// whose head is not connected.
     fn idle_deployments(&self, except: &str) -> Vec<String> {
         let mut named: BTreeSet<String> = self.deployments.keys().cloned().collect();
         named.extend(self.tensors.values().flat_map(|tensor| {
@@ -1254,7 +1175,6 @@ impl Server {
                 .iter()
                 .map(|retainer| retainer.scope.deployment.clone())
         }));
-        named.extend(self.pages.deployments());
         named
             .into_iter()
             .filter(|deployment| deployment != except)
@@ -1268,8 +1188,8 @@ impl Server {
             .collect()
     }
 
-    /// Release every tensor and page pool of `deployment` and forget its
-    /// claim. Returns the tensors released.
+    /// Release every tensor and the buffer pool of `deployment` and forget
+    /// its claim. Returns the tensors released.
     fn release_deployment(&mut self, deployment: &str) -> u64 {
         self.deployments.remove(deployment);
         let released: Vec<TensorId> = self
@@ -1286,31 +1206,10 @@ impl Server {
         for id in released {
             self.remove_tensor(&id);
         }
-        let pools = self.pages.release(deployment);
-        self.pools_released(&pools);
         self.release_pools(deployment);
         self.quotas.release(deployment);
-        tracing::info!(
-            deployment,
-            released = count,
-            pools = pools.len(),
-            "retired a deployment"
-        );
+        tracing::info!(deployment, released = count, "retired a deployment");
         count
-    }
-
-    /// Tell the connector and the Transfer Server that they no longer map
-    /// `pools`.
-    fn pools_released(&mut self, pools: &[u64]) {
-        for &pool in pools {
-            self.allocation_released(Allocation::Pool { pool });
-            if self.kv_storage.offered.remove(&pool)
-                && let Some(connector) = self.kv_storage.client
-            {
-                self.events
-                    .push((connector, Event::PoolReleased { pool }, Vec::new()));
-            }
-        }
     }
 
     /// Refuse `bytes` of new host storage that the host cannot hold: its
@@ -1333,28 +1232,12 @@ impl Server {
         Ok(())
     }
 
-    /// Admit a staging pool of `bytes` the host's room cannot hold
-    /// ([`STAGING_POOL_BYTES`]): one a KV storage stands behind, no larger
-    /// than the bound, which the host's available storage less what the
-    /// pools have yet to allocate holds, from the server's reserve.
-    fn admit_staging(&self, bytes: u64) -> Result<(), ()> {
-        if !self.kv_storage.present() || bytes > STAGING_POOL_BYTES {
-            return Err(());
-        }
-        let host = self.host_storage().map_err(|_| ())?;
-        if bytes > host.available.saturating_sub(host.unallocated) {
-            return Err(());
-        }
-        Ok(())
-    }
-
     /// What the host admits of new host storage now ([`Self::admit_host`]).
     fn host_storage(&self) -> io::Result<HostStorage> {
         Ok(HostStorage {
             available: available_storage()?,
             reserve: self.host_reserve,
-            unallocated: self.pages.unallocated()
-                + self.sessions.unallocated()
+            unallocated: self.sessions.unallocated()
                 + self
                     .storages
                     .values()
@@ -1518,31 +1401,6 @@ impl Server {
             Response::Retired { released: count },
             Vec::new(),
         ))
-    }
-
-    /// What a head of `epoch` of `deployment` reads.
-    fn visibility(&self, deployment: &str, epoch: u64) -> pages::Visibility {
-        pages::Visibility {
-            epoch,
-            private: self
-                .deployments
-                .get(deployment)
-                .map(Deployment::private)
-                .unwrap_or_default(),
-        }
-    }
-
-    /// What the head connected as `client` reads; nothing of an epoch on
-    /// trial once it is gone.
-    fn head_visibility(&self, client: ClientId) -> pages::Visibility {
-        match self
-            .clients
-            .get(&client)
-            .and_then(|client| client.role.as_ref())
-        {
-            Some(Role::Head { deployment, epoch }) => self.visibility(deployment, *epoch),
-            _ => self.visibility("", 0),
-        }
     }
 
     /// Whether a worker of `holder`'s epoch reads `tensor`: its own epoch
@@ -1772,7 +1630,8 @@ impl Server {
     ) -> Result<Handling, (ErrorKind, String)> {
         self.admit_host(bytes)?;
         let at = Location::Host { numa_node: None };
-        let descriptor = pages::shared_memory("uniserve-storage", bytes, None).map_err(resource)?;
+        let descriptor =
+            memory::shared_memory("uniserve-storage", bytes, None).map_err(resource)?;
         self.put(
             holder,
             &[TensorRecord {
@@ -2188,19 +2047,6 @@ impl Server {
         // own, which the driver frees as the process ends.
         self.quotas.disconnect(id);
         match &client.role {
-            Some(Role::Head { .. }) => {
-                // The head's tasks are cancelled below, but each may still
-                // write its destinations until the Transfer Server reports
-                // its end, so the slots they write wait for that.
-                let tasks_running = self.transfers.submitted_by(id);
-                let clients = &self.clients;
-                self.pages
-                    .head_gone(id, &|scope| connected_worker(clients, scope), tasks_running);
-            }
-            Some(Role::Peer) => self.pages.peer_gone(id),
-            Some(Role::Worker { scope, .. }) if !connected_worker(&self.clients, scope) => {
-                self.pages.worker_gone(scope);
-            }
             Some(Role::Connector) if self.kv_storage.client == Some(id) => self.connector_gone(),
             Some(Role::Transfer) if self.transfers.client == Some(id) => {
                 self.transfer_server_gone();
@@ -2381,7 +2227,6 @@ impl Server {
                         .is_some_and(|head| self.clients.contains_key(&head)),
                 })
                 .collect(),
-            page_pools: self.pages.listing(),
             connector: self.kv_storage.client.is_some(),
             transfer: self.listed_transfer(),
             quotas: self.quotas_of(&[], None),
@@ -2399,9 +2244,6 @@ impl Server {
             let descriptors: Vec<BorrowedFd<'_>> = attachments
                 .iter()
                 .filter_map(|attachment| match attachment {
-                    Attachment::Pool(pool) => {
-                        self.pages.get(*pool).map(|pool| pool.descriptor.as_fd())
-                    }
                     Attachment::Storage(storage) => self
                         .storages
                         .get(storage)
@@ -2420,26 +2262,6 @@ impl Server {
         }
     }
 
-    /// Give the connector every page pool it does not map yet.
-    fn offer_pools(&mut self) {
-        let Some(connector) = self.kv_storage.client else {
-            return;
-        };
-        for listed in self.pages.listing() {
-            if !self.pages.released(listed.pool) && self.kv_storage.offered.insert(listed.pool) {
-                self.events.push((
-                    connector,
-                    Event::Pool {
-                        pool: listed.pool,
-                        shape: listed.shape,
-                        slots: listed.slots,
-                    },
-                    vec![Attachment::Pool(listed.pool)],
-                ));
-            }
-        }
-    }
-
     /// Hand `task` to the connector; without one, the task fails at once.
     fn assign(&mut self, task: Task) {
         let Some(connector) = self.kv_storage.client else {
@@ -2447,102 +2269,22 @@ impl Server {
             return;
         };
         let id = self.kv_storage.next_task();
-        let event = match &task {
-            Task::Lookup { pool, keys, .. } => Event::Exists {
+        let (pool, pages) = (task.pool, wide(&task.pages));
+        let event = if task.upload {
+            Event::Upload {
                 task: id,
-                pool: *pool,
-                keys: keys.clone(),
-            },
-            Task::Upload { pool, pages } => Event::Upload {
-                task: id,
-                pool: *pool,
-                pages: wide(pages),
-            },
-            Task::Download { pool, pages, .. }
-            | Task::Blocks {
                 pool,
                 pages,
-                upload: false,
-                ..
-            } => Event::Download {
+            }
+        } else {
+            Event::Download {
                 task: id,
-                pool: *pool,
-                pages: wide(pages),
-            },
-            Task::Blocks {
                 pool,
                 pages,
-                upload: true,
-                ..
-            } => Event::Upload {
-                task: id,
-                pool: *pool,
-                pages: wide(pages),
-            },
+            }
         };
         self.kv_storage.tasks.insert(id, task);
         self.events.push((connector, event, Vec::new()));
-    }
-
-    /// Write pages committed in `pool` to the KV storage, in tasks of
-    /// at most [`BATCH_PAGES`] pages, holding their slots until each task
-    /// ends.
-    fn upload(&mut self, pool: u64, pages: Vec<(Key, u32)>) {
-        if self.kv_storage.client.is_none() || pages.is_empty() {
-            return;
-        }
-        let Some(entry) = self.pages.get_mut(pool) else {
-            return;
-        };
-        entry.upload(&pages);
-        for chunk in pages.chunks(BATCH_PAGES) {
-            self.assign(Task::Upload {
-                pool,
-                pages: chunk.to_vec(),
-            });
-        }
-    }
-
-    /// `prefetch`: see [`Request::Prefetch`].
-    fn prefetch(
-        &mut self,
-        head: ClientId,
-        pool: u64,
-        keys: &[Key],
-        tag: u64,
-        visibility: &pages::Visibility,
-    ) -> Result<(), (ErrorKind, String)> {
-        let entry = pool_of(&mut self.pages, pool)?;
-        let fetches = if self.kv_storage.client.is_some() {
-            entry.prefetch(keys, visibility)
-        } else {
-            vec![pages::Fetch::Full; keys.len()]
-        };
-        let pages: Vec<(Key, u32)> = keys
-            .iter()
-            .zip(&fetches)
-            .filter_map(|(key, fetch)| match fetch {
-                pages::Fetch::Reserved(slot) => Some((*key, *slot)),
-                _ => None,
-            })
-            .collect();
-        if pages.is_empty() {
-            let results = keys
-                .iter()
-                .map(|key| entry.holds(key, visibility))
-                .collect();
-            self.events
-                .push((head, Event::Prefetched { tag, results }, Vec::new()));
-            return Ok(());
-        }
-        self.assign(Task::Download {
-            head,
-            tag,
-            pool,
-            pages,
-            keys: keys.to_vec(),
-        });
-        Ok(())
     }
 
     /// The connector reported the results of `task`.
@@ -2551,100 +2293,23 @@ impl Server {
             return;
         };
         self.complete(task, results);
-        let reaped = self.pages.reap();
-        self.pools_released(&reaped);
     }
 
     /// End `task` as if the connector reported every page failed.
     fn fail(&mut self, task: Task) {
         self.complete(task, &[]);
-        self.pages.settle();
-        let reaped = self.pages.reap();
-        self.pools_released(&reaped);
     }
 
     /// End `task` with the connector's `results`, one per page of the task;
     /// a page without a result failed.
     fn complete(&mut self, task: Task, results: &[bool]) {
-        let succeeded = |index: usize| results.get(index).copied().unwrap_or(false);
-        match task {
-            Task::Lookup {
-                client,
-                request,
-                pool,
-                keys,
-                held,
-            } => {
-                // A page the pool did not hold is in L2 when the pool holds
-                // it by now, and in L3 when the connector found it.
-                let visibility = self.head_visibility(client);
-                let mut missing = keys.iter().enumerate();
-                let levels = held
-                    .iter()
-                    .map(|&held| {
-                        if held {
-                            return PageLevel::Host;
-                        }
-                        let Some((index, key)) = missing.next() else {
-                            return PageLevel::Absent;
-                        };
-                        if self
-                            .pages
-                            .get(pool)
-                            .is_some_and(|entry| entry.holds(key, &visibility))
-                        {
-                            PageLevel::Host
-                        } else if succeeded(index) {
-                            PageLevel::Storage
-                        } else {
-                            PageLevel::Absent
-                        }
-                    })
-                    .collect();
-                self.respond(client, request, Response::Lookup { levels }, &[]);
-                if let Some(entry) = self.clients.get_mut(&client) {
-                    entry.held = false;
-                }
-                self.serve_queue(client);
-            }
-            Task::Upload { pool, pages } => {
-                let failed = (0..pages.len()).filter(|index| !succeeded(*index)).count();
-                if failed > 0 {
-                    tracing::warn!(pool, failed, "pages were not written to the KV storage");
-                }
-                if let Some(entry) = self.pages.get_mut(pool) {
-                    entry.uploaded(&pages);
-                }
-            }
-            Task::Download {
-                head,
-                tag,
-                pool,
-                pages,
-                keys,
-            } => {
-                let visibility = self.head_visibility(head);
-                let Some(entry) = self.pages.get_mut(pool) else {
-                    return;
-                };
-                let arrived: Vec<bool> = (0..pages.len()).map(succeeded).collect();
-                entry.fetched(&pages, &arrived);
-                let results = keys
-                    .iter()
-                    .map(|key| entry.holds(key, &visibility))
-                    .collect();
-                self.events
-                    .push((head, Event::Prefetched { tag, results }, Vec::new()));
-                self.send_events();
-            }
-            Task::Blocks { number, keys, .. } => {
-                let results: Vec<bool> = (0..keys.len()).map(succeeded).collect();
-                self.pool_pages_moved(number, &keys, &results);
-            }
-        }
+        let moved: Vec<bool> = (0..task.keys.len())
+            .map(|index| results.get(index).copied().unwrap_or(false))
+            .collect();
+        self.pool_pages_moved(task.number, &task.keys, &moved);
     }
 
-    /// The connector's connection closed: its tasks fail, and the next
+    /// The connector's connection closed: its tasks are lost, and the next
     /// connector maps every pool again.
     fn connector_gone(&mut self) {
         tracing::warn!("the Mooncake connector disconnected");
@@ -2658,239 +2323,8 @@ impl Server {
             .collect();
         let pid = self.kv_storage.process.pid();
         for task in tasks {
-            match task {
-                // The connector may still move pages until its process has exited.
-                Task::Blocks { number, .. } => self.pool_task_lost(number, pid),
-                task => self.fail(task),
-            }
-        }
-        self.pages.connector_gone();
-        // The connector maps no pool any more: released pools leave.
-        self.pages.reap();
-    }
-
-    /// A page pool request: `page_pool` from a worker, the others from a
-    /// head, for scopes of its deployment.
-    fn pages(
-        &mut self,
-        id: ClientId,
-        request: &Request,
-        role: &Role,
-    ) -> Result<Handling, (ErrorKind, String)> {
-        let reply = |reply| Ok(Handling::Response(reply, Vec::new()));
-        if let (
-            Request::Pool {
-                shape,
-                numa_node,
-                bytes,
-            },
-            Role::Worker { scope, .. },
-        ) = (request, role)
-        {
-            let pool = match self.pages.find(&scope.deployment, *shape, *numa_node) {
-                Some(pool) => pool,
-                None => {
-                    let slots = self
-                        .pages
-                        .slots_of(shape.page_bytes, *bytes)
-                        .map_err(resource)?;
-                    // A pool the host cannot hold first takes the place of
-                    // the deployment's pools no epoch maps any more, whose
-                    // pages a previous epoch left; a staging pool a KV
-                    // storage stands behind is admitted from the reserve.
-                    let bytes = slots * shape.page_bytes;
-                    if self.admit_host(bytes).is_err() {
-                        let unreferenced: Vec<u64> = self
-                            .pages
-                            .unreferenced(&scope.deployment)
-                            .into_iter()
-                            .map(|(pool, _)| pool)
-                            .collect();
-                        let released = self.pages.release_pools(&unreferenced);
-                        self.pools_released(&released);
-                        if let Err(refused) = self.admit_host(bytes) {
-                            self.admit_staging(bytes).map_err(|()| refused)?;
-                            tracing::info!(
-                                deployment = %scope.deployment,
-                                bytes,
-                                "admitted a staging page pool from the host's reserve: its \
-                                 pages pass through it into the KV storage"
-                            );
-                        }
-                    }
-                    self.pages
-                        .create(&scope.deployment, *shape, *numa_node, slots)
-                        .map_err(resource)?
-                }
-            };
-            if let Role::Worker { scope, epoch, .. } = role {
-                self.pages.add_user(pool, scope, *epoch);
-            }
-            let slots = self.pages.get(pool).map_or(0, pages::Pool::slots);
-            self.offer_pools();
-            return Ok(Handling::Response(
-                Response::Pool { pool, slots },
-                vec![Attachment::Pool(pool)],
-            ));
-        }
-        let Role::Head { deployment, epoch } = role else {
-            return Err(invalid(&format!(
-                "{} is a request of a head",
-                request_name(request)
-            )));
-        };
-        let visibility = self.visibility(deployment, *epoch);
-        let of_deployment = |scope: &Scope| {
-            if &scope.deployment == deployment {
-                Ok(())
-            } else {
-                Err(invalid(&format!("{scope} is not a scope of {deployment}")))
-            }
-        };
-        if let Some(pool) = request_pool(request)
-            && let Some(entry) = self.pages.get(pool)
-            && (&entry.deployment != deployment || self.pages.released(pool))
-        {
-            return Err(invalid(&format!(
-                "page pool {pool} is not a live pool of {deployment}"
-            )));
-        }
-        match request {
-            Request::Lookup { pool, keys } => {
-                let held = pool_of(&mut self.pages, *pool)?.lookup(keys, &visibility);
-                let missing: Vec<Key> = keys
-                    .iter()
-                    .zip(&held)
-                    .filter(|(_, held)| !**held)
-                    .map(|(key, _)| *key)
-                    .collect();
-                if self.kv_storage.client.is_none() || missing.is_empty() {
-                    // Without a connector, L3 holds nothing beyond L2.
-                    let levels = held
-                        .iter()
-                        .map(|&held| {
-                            if held {
-                                PageLevel::Host
-                            } else {
-                                PageLevel::Absent
-                            }
-                        })
-                        .collect();
-                    return reply(Response::Lookup { levels });
-                }
-                // The connector looks up the pages the pool does not hold;
-                // the request waits for it.
-                Ok(Handling::KvStorage(Task::Lookup {
-                    client: id,
-                    request: 0,
-                    pool: *pool,
-                    keys: missing,
-                    held,
-                }))
-            }
-            Request::Reserve {
-                pool,
-                writer,
-                keys,
-                window,
-            } => {
-                if let Some(writer) = writer {
-                    of_deployment(writer)?;
-                }
-                let slots = self
-                    .pages
-                    .reserve(*pool, writer.as_ref(), id, keys, *window, &visibility)
-                    .ok_or_else(|| invalid(&format!("page pool {pool} does not exist")))?;
-                reply(Response::Reserved { slots })
-            }
-            Request::Commit { pool, keys } => {
-                let entry = pool_of(&mut self.pages, *pool)?;
-                let mut committed = entry.commit(keys);
-                // The KV storage takes the pages every epoch reads; those of
-                // an epoch on trial wait for its commit.
-                committed.retain(|(_, slot)| {
-                    entry
-                        .publisher(*slot)
-                        .is_some_and(|published| visibility.shared(published))
-                });
-                self.upload(*pool, committed);
-                reply(Response::Committed)
-            }
-            Request::Abort { pool, keys } => {
-                pool_of(&mut self.pages, *pool)?.abort(keys);
-                reply(Response::Aborted)
-            }
-            Request::Pin { pool, reader, keys } => {
-                of_deployment(reader)?;
-                let slots = pool_of(&mut self.pages, *pool)?.pin(reader, id, keys, &visibility);
-                reply(Response::Pinned { slots })
-            }
-            Request::Unpin { pool, reader, keys } => {
-                of_deployment(reader)?;
-                pool_of(&mut self.pages, *pool)?.unpin(reader, keys);
-                reply(Response::Unpinned)
-            }
-            Request::HostCache {
-                tokens,
-                token_bytes,
-                host_bytes,
-            } => {
-                let per_token: u64 = token_bytes.iter().sum();
-                // What the host admits of new pools, counting the
-                // deployment's pools no epoch maps, which a new one
-                // replaces.
-                let room = || -> Result<u64, (ErrorKind, String)> {
-                    let releasable: u64 = self
-                        .pages
-                        .unreferenced(deployment)
-                        .iter()
-                        .map(|(_, bytes)| bytes)
-                        .sum();
-                    Ok((available_storage().map_err(resource)? + releasable)
-                        .saturating_sub(self.pages.unallocated())
-                        .saturating_sub(self.host_reserve))
-                };
-                let budget = match host_bytes {
-                    Some(bytes) => *bytes,
-                    None => room()? / 5 * 4,
-                };
-                let mut held = match budget.checked_div(per_token) {
-                    Some(fits) => fits.min(*tokens),
-                    None => *tokens,
-                };
-                // With a KV storage, an epoch the host holds fewer tokens
-                // for, or whose stated bytes it cannot admit, still stages
-                // its pages through pools of at most `STAGING_POOL_BYTES`
-                // on each rank, which pass them into the KV storage.
-                let staging = token_bytes
-                    .iter()
-                    .max()
-                    .and_then(|rank| STAGING_POOL_BYTES.checked_div(*rank))
-                    .unwrap_or(0);
-                if self.kv_storage.present()
-                    && (held < staging || held.saturating_mul(per_token) > room()?)
-                {
-                    held = staging.min(*tokens);
-                }
-                tracing::info!(
-                    deployment,
-                    epoch,
-                    tokens,
-                    per_token,
-                    budget,
-                    held,
-                    "sized the host KV cache of an epoch"
-                );
-                reply(Response::HostCache { tokens: held })
-            }
-            Request::Prefetch { pool, keys, tag } => {
-                self.prefetch(id, *pool, keys, *tag, &visibility)?;
-                reply(Response::Prefetching)
-            }
-            _ => Err(invalid(&format!(
-                "{} is not a page request of a head",
-                request_name(request)
-            ))),
+            // The connector may still move pages until its process has exited.
+            self.pool_task_lost(task.number, pid);
         }
     }
 }
@@ -2953,20 +2387,6 @@ fn dedup(holders: &mut Vec<Holder>) {
         }
         new
     });
-}
-
-/// The page pool a head's page request names.
-fn request_pool(request: &Request) -> Option<u64> {
-    match request {
-        Request::Lookup { pool, .. }
-        | Request::Reserve { pool, .. }
-        | Request::Commit { pool, .. }
-        | Request::Abort { pool, .. }
-        | Request::Pin { pool, .. }
-        | Request::Unpin { pool, .. }
-        | Request::Prefetch { pool, .. } => Some(*pool),
-        _ => None,
-    }
 }
 
 /// The host's available storage (`MemAvailable` of `/proc/meminfo`), in
@@ -3039,18 +2459,7 @@ fn request_name(request: &Request) -> &'static str {
         Request::Read { .. } => "read",
         Request::Retire { .. } => "retire",
         Request::Restart { .. } => "restart",
-        Request::Pool { .. } => "page_pool",
-        Request::Lookup { .. } => "lookup",
-        Request::Reserve { .. } => "reserve",
-        Request::Commit { .. } => "commit",
-        Request::Abort { .. } => "abort",
-        Request::Pin { .. } => "pin",
-        Request::Unpin { .. } => "unpin",
-        Request::PeerPin { .. } => "peer pin",
-        Request::PeerUnpin { .. } => "peer unpin",
         Request::Endpoint => "endpoint",
-        Request::Prefetch { .. } => "prefetch",
-        Request::HostCache { .. } => "host_cache",
         Request::Finished { .. } => "finished",
         Request::Quota { .. } => "reserve",
         Request::Usage { .. } => "quota",
@@ -3077,20 +2486,6 @@ fn request_name(request: &Request) -> &'static str {
         Request::PeerHold { .. } => "peer hold",
         Request::PeerRelease { .. } => "peer release",
     }
-}
-
-/// Page pool `pool`, which a head request names.
-fn pool_of(pages: &mut pages::Pools, pool: u64) -> Result<&mut pages::Pool, (ErrorKind, String)> {
-    pages
-        .get_mut(pool)
-        .ok_or_else(|| invalid(&format!("page pool {pool} does not exist")))
-}
-
-/// Whether a worker of `scope` is connected.
-fn connected_worker(clients: &BTreeMap<ClientId, Client>, scope: &Scope) -> bool {
-    clients.values().any(
-        |client| matches!(&client.role, Some(Role::Worker { scope: other, .. }) if other == scope),
-    )
 }
 
 /// A fresh claim token.

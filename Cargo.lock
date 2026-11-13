@@ -2246,17 +2246,14 @@ name = "ipc"
 version = "2.0.0"
 dependencies = [
  "libc",
- "prost",
  "proto",
  "rmp-serde",
  "scheduling-guest",
  "serde",
- "serde_json",
  "service",
  "storage",
  "tempfile",
  "thiserror 2.0.18",
- "toml",
 ]
 
 [[package]]
@@ -3925,40 +3922,9 @@ dependencies = [
 ]
 
 [[package]]
-name = "scheduler"
-version = "2.0.0"
-dependencies = [
- "anyhow",
- "base64 0.22.1",
- "build-server",
- "crossbeam-channel",
- "ipc",
- "libc",
- "png",
- "proto",
- "rustix",
- "scheduling",
- "serde",
- "serde_json",
- "service",
- "storage",
- "storage-server",
- "tempfile",
- "testkit",
- "thiserror 2.0.18",
- "tokio",
- "toml",
- "tracing",
- "uuid",
- "wat",
-]
-
-[[package]]
 name = "scheduling"
 version = "2.0.0"
 dependencies = [
- "scheduling-guest",
- "serde",
  "thiserror 2.0.18",
  "wasmtime",
 ]
@@ -5001,11 +4967,9 @@ dependencies = [
  "mimalloc",
  "platform",
  "processing",
- "rustix",
  "serde",
  "serde_json",
  "service",
- "storage",
  "storage-server",
  "tempfile",
  "tokio",

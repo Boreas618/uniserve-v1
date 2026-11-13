@@ -771,43 +771,6 @@ mod tests {
         assert_eq!(error.status_code(), axum::http::StatusCode::BAD_REQUEST);
     }
 
-    /// Tokens committed together are decoded as one block, and a stop string
-    /// inside a block ends the output at the match with the tokens through
-    /// the one that completed it.
-    #[tokio::test]
-    async fn a_stop_string_inside_a_committed_block_ends_the_output() {
-        let block = |text: &str| Event::TextTokens {
-            ids: text.bytes().map(u32::from).collect(),
-        };
-        let decode = handoff::TextDecode {
-            stop_strings: vec!["END".to_string()],
-            ..decode()
-        };
-        let parser = handoff::Parser {
-            kind: handoff::parser::Kind::ParserKindJson as i32,
-            parse_reasoning: true,
-            ..Default::default()
-        };
-        let document = document(
-            parser,
-            decode,
-            false,
-            engine_events([
-                block("first block, "),
-                block("second one. END and more"),
-                block("never decoded"),
-            ]),
-        )
-        .await
-        .unwrap();
-
-        assert_eq!(content(&document), "first block, second one. ");
-        assert_eq!(document["choices"][0]["finish_reason"], "stop");
-        assert_eq!(document["choices"][0]["stop_reason"], "END");
-        // The first block and the second through the `D` that completes `END`.
-        assert_eq!(document["usage"]["completion_tokens"], 28);
-    }
-
     /// The parsers of a request that may call the tool `lookup`, written as
     /// function and parameter tags.
     fn lookup_parser() -> handoff::Parser {

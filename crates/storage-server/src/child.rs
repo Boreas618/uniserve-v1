@@ -49,11 +49,6 @@ impl Process {
         }
     }
 
-    /// Whether the server runs this child.
-    pub(super) fn configured(&self) -> bool {
-        self.launch.is_some()
-    }
-
     /// The running process's id.
     pub(super) fn pid(&self) -> Option<u32> {
         self.child.as_ref().map(|(child, _)| child.id())

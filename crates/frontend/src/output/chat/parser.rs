@@ -154,9 +154,8 @@ impl ChatParser {
 
     /// Parses one decoded text delta into assistant events.
     ///
-    /// One delta may span several delimiters, as when a block-diffusion model
-    /// commits a whole block of tokens at once; its reasoning text precedes
-    /// its visible text.
+    /// One delta may span several delimiters, as when several tokens decode
+    /// into one update; its reasoning text precedes its visible text.
     ///
     /// # Errors
     ///

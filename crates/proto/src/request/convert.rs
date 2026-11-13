@@ -446,7 +446,6 @@ impl Event {
                 id: *id,
                 logprob: *logprob,
             }),
-            Self::TextTokens { ids } => Kind::TextTokens(wire::TextTokens { ids: ids.clone() }),
             Self::TokenLogprobs { id, candidates } => Kind::TokenLogprobs(wire::TokenLogprobs {
                 id: *id,
                 candidates: candidates.iter().map(Into::into).collect(),
@@ -554,7 +553,6 @@ impl Event {
                 id: token.id,
                 logprob: token.logprob,
             },
-            Kind::TextTokens(tokens) => Self::TextTokens { ids: tokens.ids },
             Kind::TokenLogprobs(logprobs) => Self::TokenLogprobs {
                 id: logprobs.id,
                 candidates: logprobs.candidates.into_iter().map(Into::into).collect(),
@@ -684,7 +682,6 @@ impl From<&GenerationLimits> for wire::GenerationLimits {
             understanding: features.contains(GenerationFeatures::UNDERSTANDING),
             vision_encode: features.contains(GenerationFeatures::VISION_ENCODE),
             latent_encode: features.contains(GenerationFeatures::LATENT_ENCODE),
-            token_denoising: features.contains(GenerationFeatures::TOKEN_DENOISING),
             max_vae_grid_tokens: limits.max_vae_grid_tokens,
             max_vit_grid_tokens: limits.max_vit_grid_tokens,
             max_latent_feature_bytes: limits.max_latent_feature_bytes,
@@ -702,7 +699,6 @@ impl From<wire::GenerationLimits> for GenerationLimits {
             (limits.understanding, GenerationFeatures::UNDERSTANDING),
             (limits.vision_encode, GenerationFeatures::VISION_ENCODE),
             (limits.latent_encode, GenerationFeatures::LATENT_ENCODE),
-            (limits.token_denoising, GenerationFeatures::TOKEN_DENOISING),
         ] {
             features.set(feature, present);
         }

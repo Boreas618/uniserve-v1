@@ -267,30 +267,6 @@ impl DecodeStream {
                     return Ok(events);
                 }
             }
-            // Tokens committed together, such as a block-diffusion canvas,
-            // carry no logprobs and decode as one update.
-            Event::TextTokens { ids } => {
-                if let Some(start) = self.start_event(&prompt_token_ids)? {
-                    events.push(start);
-                }
-                self.ensure_output_ready_from(&events, "a block of committed tokens")?;
-                if self.generated_logprobs_requested {
-                    return Err(Error::MalformedOutput {
-                        request_id: self.request_id.clone(),
-                        message: "engine emitted committed tokens without their requested logprobs"
-                            .to_string(),
-                    });
-                }
-                if self.consume_tokens(
-                    &prompt_token_ids,
-                    &ids,
-                    Vec::new(),
-                    raw_stream,
-                    &mut events,
-                )? {
-                    return Ok(events);
-                }
-            }
             Event::TokenLogprobs { id, candidates } => {
                 let pending = self
                     .pending_token

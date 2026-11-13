@@ -49,6 +49,9 @@ scheduling-guest.workspace = true
 serde_json.workspace = true
 storage.workspace = true
 tokio = { workspace = true, features = ["sync"] }
+# A package's arguments, which the daemon's `Prepare` carries as the TOML text of each value
+# (`proto::module::PackageRevision::arguments`).
+toml.workspace = true
 tracing.workspace = true
 # The runtime a scheduler instantiates its policy module in; the modules are compiled by the
 # engine `scheduling::Engine` configures, at the workspace's one pin.
@@ -63,9 +66,6 @@ storage-server.workspace = true
 # A toy policy module in a test is written as `wat`.
 wasmtime = { workspace = true, features = ["wat"] }
 tempfile.workspace = true
-# A test states the arguments a deployment pinned on a package, which are a TOML table
-# (`proto::module::Package`).
-toml.workspace = true
 
 [lints]
 workspace = true

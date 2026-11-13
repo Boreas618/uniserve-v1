@@ -70,13 +70,6 @@ pub enum Event {
         /// Token log probability when requested.
         logprob: Option<f32>,
     },
-    /// Publishes generated text tokens committed together, in order, such as
-    /// a stopped block-diffusion block; they carry no log probabilities.
-    /// Consumers treat them as consecutive `TextToken`s.
-    TextTokens {
-        /// Vocabulary token identities.
-        ids: Vec<u32>,
-    },
     /// Publishes ranked candidates associated with a text token.
     TokenLogprobs {
         /// Generated token identity this payload scores.
@@ -433,8 +426,8 @@ pub enum DiffusionRequestError {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Request {
-    /// Token generation: autoregressive text or block-diffusion blocks. Boxed, as it is several times
-    /// the size of a diffusion request.
+    /// Token generation: autoregressive text. Boxed, as it is several times the size of a diffusion
+    /// request.
     Generation(Box<super::GenerationRequest>),
     /// Video diffusion.
     Diffusion(DiffusionRequest),

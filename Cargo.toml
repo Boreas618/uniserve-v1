@@ -11,7 +11,6 @@ members = [
     "crates/backend",
     "crates/daemon",
     "crates/engine",
-    "crates/scheduler",
     "crates/worker",
     "crates/frontend",
     "crates/ipc",
@@ -67,9 +66,6 @@ tracing.workspace = true
 workspace = true
 
 [dev-dependencies]
-rustix = { workspace = true, features = ["mm"] }
-service.workspace = true
-storage.workspace = true
 tempfile.workspace = true
 tokio = { workspace = true, features = ["rt-multi-thread", "time", "macros"] }
 
@@ -88,7 +84,6 @@ backend = { path = "crates/backend" }
 uniserve-tensor = { path = "/workspace/dev/uniserve-tensor-work" }
 daemon = { path = "crates/daemon" }
 engine = { path = "crates/engine" }
-scheduler = { path = "crates/scheduler" }
 worker = { path = "crates/worker" }
 frontend = { path = "crates/frontend" }
 ipc = { path = "crates/ipc" }

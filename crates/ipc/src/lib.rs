@@ -1,14 +1,11 @@
-//! Scheduler-to-main-process protocol and its rank transports.
+//! The batch a scheduler hands its executor, and the peer link between the engine processes of
+//! an epoch.
 //!
 //! [`batch::Batch`] is the batch the scheduler hands to its executor and
 //! [`batch::BatchOutput`] what the batch produced: plain data that names a
 //! request's memory by positions in its tables, never by an address.
-//! [`NewRequest`] admits static state, [`execution::Batch`] is the batch the
-//! scheduler submits and the worker serves, and [`execution::BatchOutput`]
-//! returns its completions. [`MainProcessInfo`]
-//! describes a peer main process's ranks before execution begins. Numeric
-//! request, call, point, and generation identities remain stable across
-//! serialization.
+//! [`Capacity`] is what a worker group's executors serve, stated once they
+//! are ready.
 //!
 //! [`MainProcessRequest`] and [`MainProcessResponse`] are the envelopes exchanged per
 //! rank, each as the one message of a [`Frame`]: a length followed by the
@@ -19,9 +16,6 @@
 //! node, TCP to a rank on another node. A rank's main process connects to the
 //! scheduler's and sends its [`PeerRegistration`].
 
-use std::collections::HashSet;
-
-use proto::tensor::DType;
 use serde::{Deserialize, Serialize};
 
 /// Result type for semantic worker-message validation.
@@ -41,13 +35,6 @@ impl ValidationError {
     /// What the message violates, without the protocol's prefix.
     pub fn reason(&self) -> &str {
         &self.0
-    }
-}
-
-impl From<SamplingParamsError> for ValidationError {
-    /// Converts sampling validation failures into worker-protocol failures.
-    fn from(error: SamplingParamsError) -> Self {
-        Self::message(error.to_string())
     }
 }
 
@@ -81,8 +68,6 @@ pub mod capacity;
 pub mod channel;
 /// Failures at the channel boundary.
 pub mod error;
-/// The batch the scheduler submits and the worker serves, and what it produces (§2.4, §4.4).
-pub mod execution;
 /// The unit a channel carries: a length and one encoded message.
 pub mod frame;
 pub mod launch;
@@ -101,48 +86,20 @@ pub use launch::StorageLaunch;
 // each module takes the shared imports through `use super::*` and the
 // validation macros through textual scope.
 mod cache;
-mod call;
-mod command;
-pub mod generation;
-mod identity;
 mod info;
 mod media;
-mod output;
 /// The first frame between main processes of one epoch (§2.3).
 pub mod peer;
-/// The scheduler's name for one phase (§4.5).
-pub mod phase;
 pub mod product;
 mod request;
-mod tensor;
-/// The vocabulary of a generation update.
-pub mod update;
 
-// The parts of a call's completion both batches state, and the records of a call's memory that
-// only `execution::Batch` carries.
+// The parts of a call's completion the batch's output states.
 pub use batch::{ArtifactHandle, DraftWork, ErrorCode, MediaOutput, TimingCounters};
 pub use cache::*;
-pub use call::*;
-pub use command::*;
-pub use execution::{
-    BlockTable, BufferAllocation, CacheUnitAllocation, DecodeRange, LatentOffload, LatentPageCopy,
-    LatentPoolRef, LatentRestore, LatentSource, PageCopy,
-};
-pub use identity::*;
 pub use info::*;
 pub use media::{SharedMedia, SharedMediaError};
-pub use proto::{MediaLocator, MediaSource, SharedMemory};
-// The request values the engine carries on to its ranks are the request
-// vocabulary's own.
-pub use generation::GenerationCommand;
-pub use output::*;
 pub use peer::{PeerAccepted, PeerRegistration, VERSION};
-pub use phase::PhaseId;
-pub use proto::report::{FENCE_BUCKETS_US, FenceHistogram, ForwardStats};
-pub use proto::request::{
-    BlockSampling, DiffusionSamplingParams, PrefixCacheDtype, PrefixCacheDtypeParseError,
-    RequestId, SamplingParams, SamplingParamsError, StandbyStorage, TokenLogprob,
-};
+pub use proto::report::{FenceHistogram, ForwardStats};
+pub use proto::request::{PrefixCacheDtype, RequestId, StandbyStorage, TokenLogprob};
+pub use proto::{MediaSource, SharedMemory};
 pub use request::*;
-pub use tensor::*;
-pub use update::UpdateFailure;

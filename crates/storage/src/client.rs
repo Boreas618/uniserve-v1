@@ -26,9 +26,9 @@ use serde::{Deserialize, Serialize};
 use crate::error::{Error, Result};
 use crate::protocol::{
     Claim, ClientMessage, Event, Hello, HostCopy, Item, Key, Link, Listing, Location, Mode,
-    PeerPool, Priority, Quota, Region, RegionPart, Registration, Request, Response, Role, Scope,
-    Segment, ServerMessage, Span, StorageRecord, TaskStatus, TensorRecord, Tensors, Throttle,
-    UnitRun, Usage, VERSION, Welcome,
+    Priority, Quota, Region, RegionPart, Registration, Request, Response, Role, Scope, Segment,
+    ServerMessage, Span, StorageRecord, TaskStatus, TensorRecord, Tensors, Throttle, UnitRun,
+    Usage, VERSION, Welcome,
 };
 use crate::runtime::{Open, Opened};
 use crate::transport::Connection;
@@ -51,18 +51,8 @@ impl Client {
     }
 
     /// Connect to the server of another host at `address` (`host:port`,
-    /// its `Endpoint`) as `role`. The connection carries page requests of
-    /// a head only, and no descriptors.
-    pub fn connect_tcp(address: &str, role: Role) -> Result<Self> {
-        let stream = std::net::TcpStream::connect(address)?;
-        stream.set_nodelay(true)?;
-        Self::open(Connection::new(stream), role)
-    }
-
-    /// Connect to the server of another host at `address` (`host:port`,
     /// its `Endpoint`) as [`Role::Peer`]: the Transfer Server of this host
-    /// that READs storage there, or a scheduler that pins the pages it
-    /// reads there ([`Client::peer_pin`]). Connecting, and every blocking
+    /// that READs storage there. Connecting, and every blocking
     /// call after it ([`Client::call`]), fails once `timeout` passes without
     /// a response, so a host that stopped responding fails the caller's task
     /// instead of holding it.
@@ -286,7 +276,7 @@ impl Client {
     }
 
     /// See [`Request::Publish`]: make the claimed, committed epochs' tensors
-    /// and pages shared together.
+    /// shared together.
     pub fn publish(&mut self, epochs: Vec<u64>) -> Result<()> {
         match self.request(&Request::Publish { epochs }, &[])?.0 {
             Response::Published => Ok(()),
@@ -521,36 +511,6 @@ impl Client {
         match self.request(&Request::Unexpose { exposure }, &[])?.0 {
             Response::Unexposed => Ok(()),
             other => Err(unexpected("unexpose", &other)),
-        }
-    }
-
-    /// See [`Request::PeerPin`]: pin the published pages of `keys` in the
-    /// pools of `deployment` whose layout `layouts` lists, for this
-    /// connection, a [`Role::Peer`]. Returns the pools that hold at least
-    /// one of them, each with one slot per key.
-    pub fn peer_pin(
-        &mut self,
-        deployment: String,
-        layouts: Vec<Key>,
-        keys: Vec<Key>,
-    ) -> Result<Vec<PeerPool>> {
-        let request = Request::PeerPin {
-            deployment,
-            layouts,
-            keys,
-        };
-        match self.request(&request, &[])?.0 {
-            Response::PeerPinned { pools } => Ok(pools),
-            other => Err(unexpected("peer pin", &other)),
-        }
-    }
-
-    /// See [`Request::PeerUnpin`]: end this connection's pins of the pages
-    /// of `keys` in `pool`.
-    pub fn peer_unpin(&mut self, pool: u64, keys: Vec<Key>) -> Result<()> {
-        match self.request(&Request::PeerUnpin { pool, keys }, &[])?.0 {
-            Response::PeerUnpinned => Ok(()),
-            other => Err(unexpected("peer unpin", &other)),
         }
     }
 
@@ -791,7 +751,7 @@ pub struct ClaimHandoff {
 impl ClaimClient {
     /// Connect to the server at `socket` as the head of `deployment`. The
     /// connection holds every epoch of the claim, and reads and publishes
-    /// no page of its own.
+    /// nothing of its own.
     pub fn connect(socket: &Path, deployment: &str) -> Result<Self> {
         let role = Role::Head {
             deployment: deployment.to_owned(),

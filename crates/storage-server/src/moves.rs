@@ -183,7 +183,7 @@ impl Server {
             if to_host {
                 let bytes = self.moves.active[&number].items[index].bytes;
                 let gpu = self.moves.active[&number].items[index].gpu;
-                match crate::pages::shared_memory("uniserve-weights", bytes, None) {
+                match crate::memory::shared_memory("uniserve-weights", bytes, None) {
                     Ok(descriptor) => {
                         let target = self.add_storage(
                             StorageRecord {

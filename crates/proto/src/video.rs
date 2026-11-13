@@ -360,7 +360,7 @@ impl Conditions {
 /// The latent layout a denoiser prepares for one request.
 ///
 /// Ordered and hashed as a plain value of numbers: it is a bucket's extent
-/// (`ipc::execution::Extent`), and a captured graph is keyed by the bucket it holds. The model
+/// (`ipc::batch::Extent`), and a captured graph is keyed by the bucket it holds. The model
 /// states it (`nn::capability::Denoiser::layout`), the worker captures a graph for it and the
 /// scheduler names it back in the batch it submits, so it is stated here, below all three.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug, Serialize, Deserialize)]

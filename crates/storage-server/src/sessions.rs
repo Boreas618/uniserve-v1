@@ -18,8 +18,8 @@
 //!   units lies ([`Request::Place`]); the head states it for a rank of
 //!   another host, whose tensors that host's Storage Server retains
 //!   ([`Request::PlaceRemote`]). A host region is one memfd per rank index,
-//!   which the server creates as it creates a page pool, admitted with the
-//!   host's storage when a session first states the region
+//!   which the server creates on the host's huge pages when it has them,
+//!   admitted with the host's storage when a session first states the region
 //!   ([`Request::HostPart`]). With them a task's runs turn into the Transfer
 //!   Server's spans and the connector's pages.
 //! - **Segments.** The head grants a device region's memory space each
@@ -121,6 +121,10 @@ pub(crate) struct Sessions {
     hosts: BTreeMap<(String, String), (u32, u64)>,
     /// The parts of the host regions, by deployment, region and rank index.
     parts: BTreeMap<(String, String, u32), Part>,
+    /// The pool number the connector maps the next part under. It passes
+    /// every part's: a successor numbers its parts above those it takes
+    /// over, and its connector, which starts afresh, maps them anew.
+    next_pool: u64,
     /// Where the units of the device regions lie, by deployment, region,
     /// device memory and rank index, as each rank stated it.
     places: BTreeMap<Place, Placed>,
@@ -143,7 +147,7 @@ pub(crate) struct Sessions {
 }
 
 /// One rank's part of a host region: the storage that holds it, its bytes
-/// of a unit, and the page pool number the connector maps it under.
+/// of a unit, and the pool number the connector maps it under.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 struct Part {
     storage: StorageId,
@@ -248,6 +252,7 @@ impl Sessions {
             gone: BTreeMap::new(),
             hosts: BTreeMap::new(),
             parts: BTreeMap::new(),
+            next_pool: 1,
             places: BTreeMap::new(),
             peers: BTreeMap::new(),
             running: BTreeMap::new(),
@@ -338,6 +343,12 @@ impl Sessions {
         }
         sessions.hosts = handoff.hosts.into_iter().collect();
         sessions.parts = handoff.parts.into_iter().collect();
+        sessions.next_pool = sessions
+            .parts
+            .values()
+            .map(|part| part.pool + 1)
+            .max()
+            .unwrap_or(1);
         sessions.places = handoff.places.into_iter().collect();
         sessions.peers = handoff.peers.into_iter().collect();
         sessions.next = handoff.next;
@@ -359,8 +370,8 @@ fn unit_key(key: &Key, unit: u32) -> Key {
     digest.key()
 }
 
-/// What a part of a host region is to the connector: a page pool of one
-/// unit's bytes of the part a page, whose layout is the region's name, so
+/// What a part of a host region is to the connector: a pool of pages of one
+/// unit's bytes of the part each, whose layout is the region's name, so
 /// that a region of one name on every host stores its blocks under the same
 /// objects.
 fn part_shape(region: &str, rank: u32, bytes: u64) -> PageShape {
@@ -734,7 +745,7 @@ impl Server {
         }
 
         let total = u64::from(limit) * bytes;
-        let descriptor = crate::pages::shared_memory("uniserve-host-region", total, numa_node)
+        let descriptor = crate::memory::shared_memory("uniserve-host-region", total, numa_node)
             .map_err(resource)?;
         let storage = self.next_storage;
         self.next_storage += 1;
@@ -754,7 +765,8 @@ impl Server {
                 part: true,
             },
         );
-        let pool = self.pages.number();
+        let pool = self.sessions.next_pool;
+        self.sessions.next_pool += 1;
         self.sessions.parts.insert(
             key,
             Part {
@@ -1384,7 +1396,7 @@ impl Server {
             running.waiting = pages.len();
         }
         for (pool, (pages, keys)) in pages {
-            self.assign(Task::Blocks {
+            self.assign(Task {
                 number,
                 pool,
                 pages,

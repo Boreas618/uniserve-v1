@@ -185,10 +185,6 @@ pub(crate) fn claim(
         socket: claimed.socket,
         deployment: launch.engine_config.deployment.clone(),
         claim: token,
-        // The host tier is the build configuration's, and it needs prefix caching to have pages
-        // to keep.
-        host_kv_cache: launch.engine_config.kv_cache.host_tier
-            && launch.engine_config.kv_cache.prefix_caching,
         tcp: (!claimed.tcp.is_empty()).then_some(claimed.tcp),
         // The reply names this node's server alone: another node's servers are not stated to
         // this process.

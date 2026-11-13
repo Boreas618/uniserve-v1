@@ -8,7 +8,7 @@
 //! stated here as the engine's package states them for its executable.
 //!
 //! `crates/media/build_support/ffmpeg_prefix.rs` holds which installation this is, once, for
-//! this script, the root package's, the engine's, `scheduler`'s and `crates/media`'s.
+//! this script, the root package's, the engine's and `crates/media`'s.
 
 include!("../media/build_support/ffmpeg_prefix.rs");
 

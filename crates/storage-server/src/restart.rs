@@ -13,8 +13,8 @@
 //! in its queue pairs meanwhile. The server then stops both children, and
 //! passes the successor its state with every descriptor it holds: the
 //! listening sockets and their lock, each client's connection and pidfd,
-//! each storage's storage, each queue pair's memfd and each page pool's
-//! memfd ([`Server::handoff`]). The buffer pools travel as images, with
+//! each storage's storage and each queue pair's memfd
+//! ([`Server::handoff`]). The buffer pools travel as images, with
 //! the sessions, the parts of the host regions and where the units lie,
 //! and the queue pairs keep their indices.
 //! The successor goes on from there ([`Server::resume`]), starts its own
@@ -35,7 +35,6 @@ use ::storage::transport::{Connection, Socket};
 use serde::{Deserialize, Serialize};
 
 use crate::kv_storage::KvStorage;
-use crate::pages::{Pools, PoolsHandoff};
 use crate::quota::Quotas;
 use crate::sessions::{Sessions, SessionsHandoff};
 use crate::transfers::Transfers;
@@ -70,7 +69,7 @@ enum Message {
 /// A server's state, its descriptors travelling apart: first the listener
 /// and its lock, then the TCP listener when there is one, then every pidfd
 /// of [`Handoff::pidfds`], every client's connection, every storage's
-/// storage, every queue pair's memfd and every page pool's memfd.
+/// storage and every queue pair's memfd.
 #[derive(Debug, Serialize, Deserialize)]
 struct Handoff {
     tcp: Option<String>,
@@ -91,7 +90,6 @@ struct Handoff {
     /// those that did not leave one in time.
     shot_finished: Vec<usize>,
     shot_failed: Vec<usize>,
-    pages: PoolsHandoff,
     host_reserve: u64,
     relaunch: Vec<String>,
     /// The GPUs' totals, the epochs' limits and the reservations of the
@@ -320,7 +318,6 @@ impl Server {
             moved.extend(storage.moved_from.map(|gpu| (id, gpu)));
             storage_descriptors.push(storage._descriptor);
         }
-        let (pages, pool_descriptors) = self.pages.handoff();
         let followed = self
             .shootdowns
             .followed()
@@ -340,7 +337,6 @@ impl Server {
         descriptors.extend(client_descriptors);
         descriptors.extend(storage_descriptors);
         descriptors.extend(queue_descriptors);
-        descriptors.extend(pool_descriptors);
         let handoff = Handoff {
             tcp: tcp.map(|(_, address)| address),
             pidfds: pidfds.descriptors.len(),
@@ -353,7 +349,6 @@ impl Server {
             deployments: self.deployments.drain().collect(),
             shot_finished,
             shot_failed,
-            pages,
             host_reserve: self.host_reserve,
             relaunch: std::mem::take(&mut self.relaunch),
             quotas: std::mem::take(&mut self.quotas),
@@ -582,8 +577,6 @@ impl Server {
             .map(|_| next())
             .collect::<io::Result<Vec<_>>>()?;
         let sessions = Sessions::resume(handoff.sessions, queues, pidfd)?;
-        let pool_descriptors: Vec<OwnedFd> = descriptors.collect();
-        let pages = Pools::resume(handoff.pages, pool_descriptors)?;
         let mut shootdowns = crate::shoot::ShootDowns::default();
         for index in handoff.shot_finished {
             shootdowns.note_finished(pidfd(index)?);
@@ -605,7 +598,6 @@ impl Server {
             copies,
             deployments: handoff.deployments.into_iter().collect(),
             shootdowns,
-            pages,
             host_reserve: handoff.host_reserve,
             quotas: handoff.quotas,
             kv_storage: KvStorage::new(connector),
@@ -623,7 +615,6 @@ impl Server {
         tracing::info!(
             clients = server.clients.len(),
             tensors = server.tensors.len(),
-            pools = server.pages.listing().len(),
             "the server goes on from its predecessor"
         );
         Ok((server, lock))
@@ -688,7 +679,7 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("storage.sock");
         let (listener, lock) = service::bind(&path).unwrap().unwrap();
-        let server = Server::new(listener, 64, 0, None, None).unwrap();
+        let server = Server::new(listener, 0, None, None).unwrap();
         let stop = Arc::new(AtomicBool::new(false));
         let (thread, waker) = running(server, Arc::clone(&stop));
 
@@ -891,7 +882,7 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("storage.sock");
         let (listener, lock) = service::bind(&path).unwrap().unwrap();
-        let server = Server::new(listener, 64, 0, None, None).unwrap();
+        let server = Server::new(listener, 0, None, None).unwrap();
         let stop = Arc::new(AtomicBool::new(false));
         let (thread, waker) = running(server, Arc::clone(&stop));
 
@@ -1042,7 +1033,7 @@ mod tests {
             "--daemon",
             "--predecessor",
             "3",
-            "--page-pool-gib",
+            "--host-reserve-gib",
             "8",
         ]
         .map(OsString::from)
@@ -1054,7 +1045,7 @@ mod tests {
                 "serve",
                 "--socket",
                 "/tmp/s.sock",
-                "--page-pool-gib",
+                "--host-reserve-gib",
                 "8"
             ]
         );

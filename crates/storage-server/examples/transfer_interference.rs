@@ -280,8 +280,8 @@ fn host_memfd(bytes: u64, node: Option<u32>) -> anyhow::Result<OwnedFd> {
         )
     }?;
     if let Some(node) = node {
-        // A node mask of 1024 bits, as the Storage Server's page pools bind
-        // theirs; MPOL_PREFERRED falls back to other nodes when the node is
+        // A node mask of 1024 bits, as the Storage Server's host memory binds
+        // its own; MPOL_PREFERRED falls back to other nodes when the node is
         // full.
         const MASK_BITS: u32 = 1024;
         ensure!(node < MASK_BITS, "NUMA node {node} is beyond the mask");

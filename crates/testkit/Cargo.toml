@@ -8,9 +8,8 @@ publish = false
 # Test support for the engine's scheduler and control thread and their callers: the fake
 # executor of the scheduler's worker groups and the Storage Server's buffer pool served in the
 # test's process, the fake engine that runs the engine's own control thread over them for the
-# daemon's tests, the policy module a test engine instantiates, the fake engine at the process
-# interface, and the batch-interface fake (`ipc::execution::Batches`) with the inventory it
-# states. Never a dependency of a serving build.
+# daemon's tests, the policy module a test engine instantiates, and the fake engine at the process
+# interface. Never a dependency of a serving build.
 [dependencies]
 anyhow.workspace = true
 crossbeam-channel.workspace = true

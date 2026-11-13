@@ -522,10 +522,8 @@ impl TransferServer {
             }
             Event::TaskProgress { .. }
             | Event::TaskEnded { .. }
-            | Event::Prefetched { .. }
             | Event::Pool { .. }
             | Event::PoolReleased { .. }
-            | Event::Exists { .. }
             | Event::Upload { .. }
             | Event::Download { .. } => {}
         }
@@ -616,7 +614,7 @@ impl TransferServer {
 
     /// Register `allocations` with the NIXL agent for another host's READs,
     /// on a helper: registering device storage retains its GPU's context and
-    /// pins the storage, which takes a while for a large page pool.
+    /// pins the storage, which takes a while for a large host region's part.
     fn register(&mut self, request: u64, allocations: &[Allocation]) {
         let mut holds = TaskHolds::new();
         let exposed: Result<Vec<Exposed>, String> = allocations
@@ -846,7 +844,7 @@ impl TransferServer {
 
     fn side(&self, allocation: &Allocation) -> Result<Side, String> {
         match allocation {
-            Allocation::Storage { .. } | Allocation::Pool { .. } => self
+            Allocation::Storage { .. } => self
                 .allocations
                 .get(allocation)
                 .map(|mapped| Side::Given(Arc::clone(mapped)))

@@ -74,8 +74,7 @@ impl Cached {
     }
 
     /// The block as the policy's page: one with a device copy is a device page, one on the host
-    /// alone an offloaded page, as the system as built states them
-    /// (`crates/scheduler/src/views.rs:793-803`).
+    /// alone an offloaded page.
     fn page(&self) -> PageView {
         PageView {
             id: PageId(Self::id(&self.key)),

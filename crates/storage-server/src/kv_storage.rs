@@ -1,15 +1,15 @@
 //! The server's side of the KV storage (L3), which its Mooncake connector
 //! serves.
 //!
-//! The server runs the connector ([`crate::connector`]) as a child process
+//! The server runs the connector ([`crate::mooncake`]) as a child process
 //! and starts it again when it ends. The connector connects as
-//! [`Role::Connector`](crate::protocol::Role::Connector); the server sends it
-//! every page pool and its tasks as events, and the connector reports each
-//! task's results with [`Request::Finished`](crate::protocol::Request).
+//! [`Role::Connector`](::storage::protocol::Role::Connector); the server
+//! sends it every part of a buffer pool's host region as a pool of pages
+//! and its tasks as events, and the connector reports each task's results
+//! with [`Request::Finished`](::storage::protocol::Request::Finished).
 //!
-//! While no connector is connected, L3 holds nothing: a lookup counts L2
-//! only, a prefetch fetches nothing, and committed pages are not uploaded.
-//! A connector that ends fails its tasks in flight.
+//! While no connector is connected, L3 holds nothing: a task fails at once.
+//! A connector that ends loses its tasks in flight.
 
 use std::collections::{BTreeSet, HashMap};
 
@@ -17,41 +17,17 @@ use ::storage::protocol::Key;
 
 use crate::child::{Launch, Process};
 
-/// A task the connector runs for the server.
-pub(super) enum Task {
-    /// The L3 part of a lookup: `keys` are the lookup's keys the pool did
-    /// not hold, and `held` says for each key of the lookup whether the pool
-    /// held it. The lookup's client waits for it.
-    Lookup {
-        client: u64,
-        request: u64,
-        pool: u64,
-        keys: Vec<Key>,
-        held: Vec<bool>,
-    },
-    /// Committed pages being written to Mooncake from their slots, which
-    /// stay out of eviction until the task finishes.
-    Upload { pool: u64, pages: Vec<(Key, u32)> },
-    /// Pages being read from Mooncake into slots reserved for them, for the
-    /// prefetch `tag` of `head`, which named `keys`.
-    Download {
-        head: u64,
-        tag: u64,
-        pool: u64,
-        pages: Vec<(Key, u32)>,
-        keys: Vec<Key>,
-    },
-    /// The pages of a buffer pool task (the server's number `number`) in
-    /// one part of a host region, the connector's pool `pool`: written to
-    /// the KV storage when `upload`, read from it otherwise. `keys` names,
-    /// for each page, the copy of the task it is part of.
-    Blocks {
-        number: u64,
-        pool: u64,
-        pages: Vec<(Key, u32)>,
-        keys: Vec<usize>,
-        upload: bool,
-    },
+/// A task the connector runs for the server: the pages of a buffer pool
+/// task (the server's number `number`) in one part of a host region, the
+/// connector's pool `pool`, written to the KV storage when `upload` and read
+/// from it otherwise. `keys` names, for each page, the copy of the task it
+/// is part of.
+pub(super) struct Task {
+    pub(super) number: u64,
+    pub(super) pool: u64,
+    pub(super) pages: Vec<(Key, u32)>,
+    pub(super) keys: Vec<usize>,
+    pub(super) upload: bool,
 }
 
 /// The connector process and its connection.
@@ -74,12 +50,6 @@ impl KvStorage {
             next: 1,
             offered: BTreeSet::new(),
         }
-    }
-
-    /// Whether a KV storage keeps the pages the pools commit: the server
-    /// runs a connector, or one is connected.
-    pub(super) fn present(&self) -> bool {
-        self.process.configured() || self.client.is_some()
     }
 
     /// The identity of a new task.

@@ -172,7 +172,6 @@ fn events_come_back_from_their_messages_unchanged() {
             id: 3,
             logprob: Some(-0.25),
         },
-        Event::TextTokens { ids: vec![1, 2] },
         Event::TokenLogprobs {
             id: 3,
             candidates: vec![candidate.clone()],

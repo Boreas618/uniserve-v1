@@ -117,11 +117,10 @@ impl Watchdog {
                 rank,
                 Stall {
                     batch_id: batch.map(|batch| batch.0),
-                    // The job belongs to this batch; its call kind, the runner method and the
-                    // batch's calls are the scheduler's to add from the batch it submitted.
+                    // The job belongs to this batch; its call kind and the runner method are the
+                    // scheduler's to add from the batch it submitted.
                     route: None,
                     method: None,
-                    calls: Vec::new(),
                     running_ms: u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX),
                 },
             ));

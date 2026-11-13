@@ -2,7 +2,7 @@
 //!
 //! A [`Storage`] is one allocation: device storage this process created, page-locked or pageable
 //! host storage, or a mapping of storage the host's Storage Server retains (a weight's
-//! allocation, a cache plane, a page pool). Dropping the last reference releases the allocation
+//! allocation, a cache plane, a rank's part of a host region). Dropping the last reference releases the allocation
 //! or the mapping without waiting for device work, so an owner retires every device access to a
 //! storage before it drops it.
 //!
@@ -298,8 +298,8 @@ impl Storage {
     }
 
     /// Maps host storage the Storage Server keeps, `bytes` long, through its `descriptor`,
-    /// writable or read-only, registered in `device`'s context: a page pool, which the rank's
-    /// copies write and read.
+    /// writable or read-only, registered in `device`'s context: a rank's part of a host region,
+    /// which the rank's copies write and read.
     pub fn map_host(
         descriptor: OwnedFd,
         bytes: usize,

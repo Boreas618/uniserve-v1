@@ -8,7 +8,7 @@ use ops::Generation;
 use scheduling_guest::limits::Parameters;
 use worker::completion::Outcome;
 
-use super::{commit, rollback, switch};
+use super::{commit, named, rollback, switch};
 use crate::process::operations::ask;
 use crate::process::operations::tests::{LONG, Node};
 use crate::scheduler::Message;
@@ -142,4 +142,65 @@ fn a_policy_a_scheduler_refuses_rolls_the_switch_back() {
     assert_eq!(serving(&node), [1]);
     assert!(holds_one(&node));
     assert!(!keeps_a_policy(&node));
+}
+
+/// A preparation's packages read back as the daemon named them: each kernel under its operator
+/// and phase (none for every phase), its arguments as the TOML values whose text the Protobuf
+/// carries, and the policy beside them; a kernel without a package is refused by its operator.
+#[test]
+fn a_preparation_names_its_packages_with_their_arguments() {
+    use proto::module::{ModuleSlot, PhaseKind};
+    use proto::process::{KernelPackage, PackageRevision, Prepare};
+
+    let package = |backend: &str, arguments: &[(&str, &str)]| PackageRevision {
+        backend: backend.to_owned(),
+        revision: 2,
+        arguments: arguments
+            .iter()
+            .map(|(name, value)| ((*name).to_owned(), (*value).to_owned()))
+            .collect(),
+    };
+    let kernel = |op: &str, phase: Option<proto::process::PhaseKind>, package| KernelPackage {
+        op: op.to_owned(),
+        phase: phase.map(i32::from),
+        package,
+        part: None,
+    };
+    let prepare = Prepare {
+        kernels: vec![
+            kernel(
+                "decode_attention",
+                None,
+                Some(package("trtllm", &[("block", "16")])),
+            ),
+            kernel(
+                "rms_norm",
+                Some(proto::process::PhaseKind::Prefill),
+                Some(package("triton", &[])),
+            ),
+        ],
+        policy: Some(package("fcfs", &[("chunked_prefill_size", "4096")])),
+    };
+
+    let (packages, policy) = named(prepare.clone()).unwrap();
+    let every_phase = &packages[&ModuleSlot::all("decode_attention")];
+    assert_eq!(
+        (every_phase.backend.as_str(), every_phase.revision),
+        ("trtllm", 2)
+    );
+    assert_eq!(every_phase.arguments["block"], toml::Value::Integer(16));
+    assert_eq!(
+        packages[&ModuleSlot::phase("rms_norm", PhaseKind::Prefill)].backend,
+        "triton"
+    );
+    assert_eq!(policy.backend, "fcfs");
+    assert_eq!(
+        policy.arguments["chunked_prefill_size"],
+        toml::Value::Integer(4096)
+    );
+
+    let mut unnamed = prepare;
+    unnamed.kernels[1].package = None;
+    let refused = named(unnamed).unwrap_err().to_string();
+    assert!(refused.contains("rms_norm"), "{refused}");
 }

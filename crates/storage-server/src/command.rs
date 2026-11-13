@@ -6,7 +6,8 @@
 //! leaves its starter's session first (`service::detach`), which is how a
 //! daemon starts the Storage Server of a host that has none
 //! (`service::ensure`). With `--mooncake-master`, the server also runs the
-//! Mooncake connector, which keeps committed pages in Mooncake (L3): this
+//! Mooncake connector, which keeps the pages of the buffer pools' host
+//! regions in Mooncake (L3): this
 //! executable's `storage-server connector` command, as a child process the
 //! server starts again when it ends. It always runs its Transfer Server,
 //! which copies between the storage it holds, the same way
@@ -41,19 +42,15 @@ pub enum Command {
         /// the starter once listening.
         #[arg(long)]
         daemon: bool,
-        /// The size of a host page pool whose worker states none, in GiB.
-        /// The workers that copy through a pool pin it, so it is allocated
-        /// whole when the first one maps it.
-        #[arg(long, default_value_t = crate::DEFAULT_POOL_BYTES >> 30)]
-        page_pool_gib: u64,
-        /// Host storage, in GiB, that a new page pool leaves available to the
-        /// host's other processes: a pool the host's available storage less
-        /// this reserve cannot hold is refused (SGLang's host KV cache keeps
+        /// Host storage, in GiB, that new host storage (a host region, the
+        /// host copy of an epoch's weights) leaves available to the host's
+        /// other processes: storage the host's available storage less this
+        /// reserve cannot hold is refused (SGLang's host KV cache keeps
         /// 10 GiB the same way).
         #[arg(long, default_value_t = 10)]
         host_reserve_gib: u64,
-        /// Also accept other hosts' heads, for page requests, on this TCP
-        /// address (`host:port`; port 0 picks one, which `Endpoint` names).
+        /// Also accept other hosts' heads and peers on this TCP address
+        /// (`host:port`; port 0 picks one, which `Endpoint` names).
         #[arg(long)]
         tcp: Option<String>,
         #[command(flatten)]
@@ -135,7 +132,7 @@ pub enum Command {
     },
     /// Hand the running server to a successor, of this build or the one
     /// `--executable` names, which goes on with every connection, tensor and
-    /// page pool once nothing is in flight (a restart in place).
+    /// buffer pool once nothing is in flight (a restart in place).
     Restart {
         #[arg(long)]
         socket: Option<PathBuf>,
@@ -150,8 +147,9 @@ pub enum Command {
 /// client's `setup` (`storage::connector::Settings`).
 #[derive(clap::Args, Debug, Clone)]
 pub struct Mooncake {
-    /// Run the Mooncake connector, which keeps committed pages in Mooncake
-    /// (L3), with Mooncake's master at this `host:port`.
+    /// Run the Mooncake connector, which keeps the pages of the buffer pools'
+    /// host regions in Mooncake (L3), with Mooncake's master at this
+    /// `host:port`.
     #[arg(long = "mooncake-master")]
     master: Option<String>,
     /// The transfer engine's metadata server: `P2PHANDSHAKE`, or an
@@ -211,7 +209,6 @@ pub fn run(args: Args) -> anyhow::Result<()> {
         Command::Serve {
             socket,
             daemon,
-            page_pool_gib,
             host_reserve_gib,
             tcp,
             mooncake,
@@ -227,7 +224,6 @@ pub fn run(args: Args) -> anyhow::Result<()> {
             crate::serve(crate::ServeOptions {
                 socket: socket.unwrap_or_else(storage::default_socket),
                 daemon,
-                page_pool_bytes: page_pool_gib << 30,
                 host_reserve_bytes: host_reserve_gib << 30,
                 tcp,
                 connector,

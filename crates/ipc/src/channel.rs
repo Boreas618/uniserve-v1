@@ -893,7 +893,6 @@ mod tests {
             fatal: false,
             phase: None,
             route: None,
-            calls: Vec::new(),
         });
         response.set_message_id(Some(message_id));
         response

@@ -59,7 +59,6 @@
 //! forwards allocate more than the region holds is refused at its capture by the context's
 //! allocator; no room is kept for it.
 
-use ipc::Call;
 use platform::{DeviceId, Nvml};
 use storage::{Item, Quota, Scope};
 
@@ -288,7 +287,7 @@ pub fn cache_units(
 
 /// The calls of one request a rank holds unresolved at once: `depth` submitted batches of up
 /// to `calls` calls each, and never fewer than a producer and its consumer when one batch can
-/// hold both. What a rank reports as `ipc::MainProcessInfo::max_unresolved_calls`.
+/// hold both. What a rank reports as `ipc::Capacity::call_window`.
 ///
 /// # Errors
 ///
@@ -308,10 +307,14 @@ pub fn call_window(depth: usize, calls: usize) -> Result<usize> {
 ///
 /// A slot holds one entry per unresolved call and the one before them, whose completion the
 /// oldest still reads on the device; the padding slot holds as many. An entry is one element
-/// of every scalar a call relays (`ipc::Call::RELAY_DTYPES`).
+/// of every scalar a call relays (`RELAY_ENTRY_BYTES`).
 pub fn relay_bytes(slots: usize, window: usize) -> u64 {
-    ((slots + 1) * (window + 1)) as u64 * Call::relay_row_bytes()
+    ((slots + 1) * (window + 1)) as u64 * RELAY_ENTRY_BYTES
 }
+
+/// Bytes of one relay entry: the scalars a call relays to the call after it, its sampled token
+/// (`i64`) and its completion flag (`u8`).
+const RELAY_ENTRY_BYTES: u64 = (size_of::<i64>() + size_of::<u8>()) as u64;
 
 /// Bytes of the reader-acknowledgment header of an export pool chunk: one `u32` word per
 /// consumer slot.
@@ -672,7 +675,7 @@ mod tests {
         // Eight slots and the padding slot, each with the window's two entries and the one
         // before them.
         let relay = relay_bytes(8, 2);
-        assert_eq!(relay, 9 * 3 * Call::relay_row_bytes());
+        assert_eq!(relay, 9 * 3 * RELAY_ENTRY_BYTES);
 
         // One chunk per live scalar: the 256-byte header and an eight-byte scalar round up to
         // one 512-byte chunk.

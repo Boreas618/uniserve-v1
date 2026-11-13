@@ -44,7 +44,7 @@ impl StorageServer {
         let stopped = Arc::clone(&stop);
         let thread = std::thread::spawn(move || {
             let _lock = lock;
-            let mut server = storage_server::Server::new(listener, 64, 0, None, None).unwrap();
+            let mut server = storage_server::Server::new(listener, 0, None, None).unwrap();
             server
                 .run(reader.as_fd(), &|| stopped.load(Ordering::Acquire))
                 .unwrap();

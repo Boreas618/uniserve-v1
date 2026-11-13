@@ -796,9 +796,8 @@ mod tests {
     /// and an invented one would execute a call the mechanism never named.
     ///
     /// The absence is therefore **the mechanism's defect, not the policy's
-    /// response**: `crates/scheduler`'s `views::next_phase` returns `None` when
-    /// `peek_next_call_variant(id)` names no call, and a running request with
-    /// prompt left always has one to name. Every helper in this module admitted
+    /// response**: a running request with prompt left always has a next call,
+    /// and its view names that call's phase. Every helper in this module admitted
     /// a request with `phase: Some(..)` already, which is why no case could
     /// fail while the mechanism stated `None` and every text test went silent.
     /// This case pins both halves: no phase, no work; the same request stated

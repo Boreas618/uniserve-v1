@@ -4,21 +4,13 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 publish = false
-description = "The host side of the scheduling interface: a policy module run in the scheduler thread under wasmtime."
+description = "The host side of the scheduling interface: the wasmtime engine a policy module is compiled for and loaded with."
 
 [dependencies]
-# The interface, its wire format and the guest side of the call convention.
-scheduling-guest = { path = "guest" }
-serde.workspace = true
 thiserror.workspace = true
 # The engine a policy module is compiled for and precompiled with: the
 # workspace's one pin, which the engine instantiates modules with.
 wasmtime.workspace = true
-
-[dev-dependencies]
-# Toy policies in the tests are written as inline `wat`, so the text parser is
-# needed where they are compiled and nowhere else.
-wasmtime = { workspace = true, features = ["wat"] }
 
 # The Build Server's precompiler: a policy package's raw wasm32 module, in
 # the precompiled form the engine loads.

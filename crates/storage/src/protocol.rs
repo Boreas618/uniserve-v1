@@ -16,7 +16,7 @@
 //!
 //! The server stores bytes with DLPack metadata and never interprets them:
 //! clients compute every [`Key`] and define what the bytes mean. The
-//! protocol holds seven objects, and each request acts on one of them.
+//! protocol holds six objects, and each request acts on one of them.
 //!
 //! **Claim.** A daemon's hold on a deployment's storage on its host
 //! ([`Claim`], [`Request::Claim`]). The claiming connection is the
@@ -26,8 +26,7 @@
 //! configuration of a deployment, and a deployment runs at most two at once
 //! while it updates. A claim names the scopes its epoch places on the host
 //! and the epochs it retires; what an epoch publishes stays private to it
-//! until the head publishes the epoch ([`Request::Publish`]), and pages
-//! committed under a published epoch outlive its retirement. The head also
+//! until the head publishes the epoch ([`Request::Publish`]). The head also
 //! keeps a previous epoch as its weights alone ([`Request::KeepWeights`]) and
 //! moves them to host storage and back ([`Request::Offload`],
 //! [`Request::Restore`]).
@@ -51,18 +50,6 @@
 //! writer is out) or maps it in standby and is promoted
 //! ([`Mode::Standby`], [`Request::Promote`]); a writer gives it up with
 //! [`Request::Release`].
-//!
-//! **Pool.** Host pages addressed by key ([`Request::Pool`]): one memfd of
-//! equal slots per deployment, NUMA node and [`PageShape`], shared by the
-//! deployment's workers whose pages have that shape. A head looks pages up,
-//! reserves slots, commits or aborts them, and pins and unpins what a rank
-//! reads ([`Request::Lookup`], [`Request::Reserve`], [`Request::Commit`],
-//! [`Request::Abort`], [`Request::Pin`], [`Request::Unpin`]); workers copy
-//! pages in and out of the slots on their own streams. Behind the pools, the
-//! server's Mooncake connector ([`Role::Connector`]) keeps committed pages
-//! in the remote store and reads them back ([`Request::Prefetch`]). Another
-//! host's scheduler pins the published pages it reads as a [`Role::Peer`]
-//! ([`Request::PeerPin`], [`Request::PeerUnpin`]).
 //!
 //! **Quota.** A GPU's limit for the deployment and the reservations against
 //! it ([`Quota`]): the limit is `⌊total × fraction⌋` of the whole GPU for the
@@ -119,7 +106,7 @@
 //! and with them the GPU contexts they held. A peer connection states no
 //! credential: the TCP endpoint is unauthenticated, and a host relies on the
 //! isolation of the network it listens on to keep other processes from
-//! reading or pinning the pages and host tensors it serves.
+//! reading the host tensors and host copies it serves.
 
 use serde::{Deserialize, Serialize};
 
@@ -129,7 +116,7 @@ use crate::runtime::{Open, Opened};
 /// refuses a client of any other. The engine interface carries it
 /// (`proto::ENGINE_INTERFACE_VERSION`), so an engine built for another
 /// storage protocol is refused at its hello to the daemon as well.
-pub const VERSION: u32 = 23;
+pub const VERSION: u32 = 24;
 
 /// The most bytes a [`Request::Read`] responds with: a weight manifest of the
 /// largest models the library serves fits many times over, and a reply of
@@ -218,10 +205,9 @@ pub enum Role {
     /// A process of another host, connected to the server's TCP endpoint:
     /// that host's Transfer Server, which READs storage of this host through
     /// NIXL for the tasks of its own host and asks the server to expose
-    /// regions ([`Request::Expose`]), that host's scheduler, which pins
-    /// the published pages it reads ([`Request::PeerPin`]), or that host's
-    /// Storage Server, which holds the host copies of a buffer pool it
-    /// reads ([`Request::PeerHold`]). A peer states no credential: the
+    /// regions ([`Request::Expose`]), or that host's Storage Server, which
+    /// holds the host copies of a buffer pool it reads
+    /// ([`Request::PeerHold`]). A peer states no credential: the
     /// endpoint is unauthenticated and relies on network isolation.
     Peer,
     /// An operator's client, which lists what the server holds and retires
@@ -498,7 +484,7 @@ pub fn gpu_name(gpu: &[u8; 16]) -> String {
     )
 }
 
-/// What a host's Storage Server admits of new host storage (page pools,
+/// What a host's Storage Server admits of new host storage (host regions,
 /// staging, weights moved to the host): the host's available storage less
 /// the server's reserve and what its retained storage has yet to allocate.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -507,7 +493,7 @@ pub struct HostStorage {
     pub available: u64,
     /// What the server leaves to the host's other processes.
     pub reserve: u64,
-    /// Unallocated bytes of page pools and retained host storages.
+    /// Unallocated bytes of host regions and retained host storages.
     pub unallocated: u64,
 }
 
@@ -548,10 +534,10 @@ pub struct TensorRecord {
     pub access: Access,
 }
 
-/// What the pages of one page pool are: every worker of a deployment on a
-/// host's NUMA node whose pages have this shape shares the pool, whatever
-/// its worker group, scheduler or engine, so an identical page is stored
-/// once.
+/// What the pages of a pool the connector maps are (a rank's part of a
+/// buffer pool's host region, [`Event::Pool`]), and what the source pages of
+/// a converted load are: their byte layout, the kv heads a page holds and
+/// its bytes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct PageShape {
     /// The digest of a page's byte layout, computed by the worker: the page
@@ -568,51 +554,6 @@ pub struct PageShape {
     pub kv_head_count: u32,
     /// The bytes of one page.
     pub page_bytes: u64,
-}
-
-/// Where a `lookup` found one page key.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum PageLevel {
-    /// Committed in the pool, the host KV cache (L2).
-    Host,
-    /// Not in the pool, but in the KV storage (L3), which a prefetch reads
-    /// it from.
-    Storage,
-    /// Neither.
-    Absent,
-}
-
-/// The pages of one sliding window of attention, which a `reserve` names:
-/// a window missing one page is useless, so the pool evicts the window
-/// whole. Its pages are the reservation's keys, those the pool reserves and
-/// those it holds already.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub struct PageWindow {
-    /// The page the window follows in another pool of the server: the last
-    /// full-attention page before the window's boundary. A reuse at the
-    /// boundary needs it, so the window is evicted with it.
-    pub anchor: Option<PageAnchor>,
-}
-
-/// A page of a pool: the anchor of a [`PageWindow`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub struct PageAnchor {
-    pub pool: u64,
-    pub key: Key,
-}
-
-/// What a `reserve` made of one page key.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum PageSlot {
-    /// The slot reserved for the page, which its writer writes and the
-    /// head then commits or aborts.
-    Reserved { slot: u64 },
-    /// The page is committed already, or another writer has it reserved.
-    Present,
-    /// Every slot is reserved or pinned; the page is not stored.
-    Full,
 }
 
 /// How a `get` takes the tensors it finds.
@@ -646,9 +587,6 @@ pub enum Region {
     /// several locations names the copy at `at`; `None` names the key's
     /// only copy.
     Tensor { key: Key, at: Option<Location> },
-    /// A live page pool of the caller's deployment; offsets count from slot
-    /// 0, at `slot × page_bytes`.
-    Pool { pool: u64 },
     /// Rank `rank`'s part of the host region `region` of the caller's
     /// deployment's buffer pool ([`Request::HostPart`]); offsets count from
     /// unit 0, at `unit × bytes` for the part's bytes of a unit.
@@ -670,8 +608,8 @@ pub enum Region {
         offset: u64,
     },
     /// Storage of another host that this host's Transfer Server READs
-    /// through NIXL: `region`, a retained tensor or a page pool of the
-    /// caller's deployment, as a client of that host names it, at the
+    /// through NIXL: `region`, a retained tensor or a host region's part of
+    /// the caller's deployment, as a client of that host names it, at the
     /// Storage Server listening at `endpoint` (that server's
     /// [`Request::Endpoint`]). Offsets count as they do in `region`. Only a
     /// span's source lies on another host, since the destination's host
@@ -818,8 +756,6 @@ pub enum TaskStatus {
 pub enum Allocation {
     /// The storage the server numbers `storage`.
     Storage { storage: u64 },
-    /// The page pool `pool`.
-    Pool { pool: u64 },
     /// A device allocation of another host of the NVLink fabric, `bytes`
     /// long, on the GPU `gpu`, by its fabric handle.
     Fabric {
@@ -1054,110 +990,22 @@ pub enum Request {
     /// [`Response::Read`]; refused when the deployment retains no such tensor,
     /// or a longer one.
     Read { deployment: String, key: Key },
-    /// Release every tensor and page pool of `deployment` and forget its
+    /// Release every tensor and buffer pool of `deployment` and forget its
     /// claim: the deployment is no longer served. Refused while its head is
     /// connected.
     Retire { deployment: String },
     /// Pass the server to a successor server of `executable` (this
     /// server's own when `None`), which goes on with every connection, the
-    /// listening sockets, the tensors' storage and the page pools once no
+    /// listening sockets, the tensors' storage and the buffer pools once no
     /// request, shoot-down, connector task or transfer is in flight (a hot
     /// restart);
     /// the server then exits. Responded with the successor's process id
     /// once it started.
     Restart { executable: Option<String> },
-    /// A worker's page pool for pages of `shape` on `numa_node`: the pool
-    /// of the worker's deployment of that shape, whose memfd travels with
-    /// the reply. When absent it is created with `bytes` (the server's
-    /// default when `None`), refused when the host's available storage,
-    /// less the server's reserve and what its pools have yet to allocate,
-    /// cannot hold it.
-    Pool {
-        shape: PageShape,
-        numa_node: Option<u32>,
-        bytes: Option<u64>,
-    },
-    /// Where each page of `keys` is: committed in the pool (L2), in the KV
-    /// storage (L3), or absent. The pages the pool holds become its most
-    /// recently used.
-    Lookup { pool: u64, keys: Vec<Key> },
-    /// A slot for each key the pool holds no page of, to be written by the
-    /// worker of `writer`, or, with no writer, by the head's own transfer
-    /// tasks ([`Request::Submit`] into the pool), as the pages a head
-    /// reads from another host's pool. With `window`, the keys are the
-    /// pages of one sliding window, which the pool evicts whole. When the
-    /// head's connection closes first, its reservations end once no worker
-    /// of their writer is connected, and those without a writer once every
-    /// task the head submitted ended, so no slot is reused while a copy may
-    /// still write it.
-    Reserve {
-        pool: u64,
-        writer: Option<Scope>,
-        keys: Vec<Key>,
-        window: Option<PageWindow>,
-    },
-    /// The reserved pages are written: they become readable.
-    Commit { pool: u64, keys: Vec<Key> },
-    /// The reserved pages were not written: their slots become free.
-    Abort { pool: u64, keys: Vec<Key> },
-    /// The slots of the committed pages of `keys`, which stay readable and
-    /// are not evicted until the head unpins them, for the worker of
-    /// `reader` to read; `None` for a key the pool holds no page of.
-    Pin {
-        pool: u64,
-        reader: Scope,
-        keys: Vec<Key>,
-    },
-    /// The worker of `reader` read the pinned pages.
-    Unpin {
-        pool: u64,
-        reader: Scope,
-        keys: Vec<Key>,
-    },
-    /// From another host's scheduler ([`Role::Peer`]): pin the committed
-    /// pages of `keys` in every live pool of `deployment` whose
-    /// [`PageShape::layout`] `layouts` lists, for that host's Transfer
-    /// Server to READ ([`Region::Remote`] of a [`Region::Pool`]). Only pages
-    /// of epochs every epoch of the deployment shares are found: a page an
-    /// epoch on trial or a rolled-back epoch published is not. A pinned
-    /// page stays readable and is not evicted until the peer unpins it
-    /// ([`Request::PeerUnpin`]) or its connection closes. Responded with
-    /// [`Response::PeerPinned`]. The request carries no credential (see
-    /// [`Role::Peer`]).
-    PeerPin {
-        deployment: String,
-        layouts: Vec<Key>,
-        keys: Vec<Key>,
-    },
-    /// From another host's scheduler: the reads of the pages of `keys` it
-    /// pinned in `pool` ended; one of its pins of each ends. A key it holds
-    /// no pin of is skipped.
-    PeerUnpin { pool: u64, keys: Vec<Key> },
     /// Where the server accepts connections from other hosts.
     Endpoint,
-    /// Read the pages of `keys` the pool does not hold from the KV storage
-    /// into slots reserved for them. Responded at once; the event
-    /// [`Event::Prefetched`] with the same `tag` follows when the reads
-    /// end.
-    Prefetch { pool: u64, keys: Vec<Key>, tag: u64 },
-    /// The token count each rank of an epoch holds in the host KV cache of
-    /// this host, beside the epoch's other ranks here: the least of
-    /// `tokens`, the count the epoch asks for, and the host's budget over
-    /// the bytes one token takes on all of those ranks (`token_bytes`, one
-    /// entry per rank). The budget is `host_bytes`, the deployment's host KV
-    /// cache on each host, when stated; otherwise four fifths of the host's
-    /// available storage (bounded by the server's storage cgroup limit, and
-    /// counting the deployment's page pools no epoch maps, which the server
-    /// releases for a new pool) less what the page pools have yet to
-    /// allocate and the server's reserve. Responded with [`Response::HostCache`].
-    HostCache {
-        tokens: u64,
-        token_bytes: Vec<u64>,
-        host_bytes: Option<u64>,
-    },
-    /// The connector ran task `task` of an [`Event::Exists`],
-    /// [`Event::Upload`] or [`Event::Download`]: one result per page of the
-    /// task.
+    /// The connector ran task `task` of an [`Event::Upload`] or an
+    /// [`Event::Download`]: one result per page of the task.
     Finished { task: u64, results: Vec<bool> },
     /// Reserve the caller's own items on GPU `gpu` (of total storage `total`):
     /// each item of `reservations` takes its bytes, 0 releasing it; an item
@@ -1443,40 +1291,10 @@ pub enum Response {
     Restarting {
         pid: u32,
     },
-    /// The page pool, whose memfd travels with the response: `slots` slots
-    /// of the shape's `page_bytes`, slot `i` at byte `i * page_bytes`.
-    Pool {
-        pool: u64,
-        slots: u64,
-    },
-    /// One level per key of the lookup.
-    Lookup {
-        levels: Vec<PageLevel>,
-    },
-    Reserved {
-        slots: Vec<PageSlot>,
-    },
-    Committed,
-    Aborted,
-    Pinned {
-        slots: Vec<Option<u64>>,
-    },
-    Unpinned,
-    /// The pools a [`Request::PeerPin`] pinned pages in: only those that
-    /// hold at least one of its keys, in pool order.
-    PeerPinned {
-        pools: Vec<PeerPool>,
-    },
-    PeerUnpinned,
     /// The `host:port` other hosts connect to; `None` when the server
     /// accepts local connections only.
     Endpoint {
         tcp: Option<String>,
-    },
-    Prefetching,
-    /// The token count of a [`Request::HostCache`].
-    HostCache {
-        tokens: u64,
     },
     Finished,
     /// What a [`Request::Quota`] or a [`Request::Usage`] names.
@@ -1563,17 +1381,6 @@ pub struct Usage {
     pub tasks: Vec<TaskTotal>,
 }
 
-/// The pages a [`Request::PeerPin`] pinned in one pool: the pool, the shape
-/// of its pages (whose kv head range says which heads a page holds), and
-/// one slot per key of the request, `None` for a key the pool holds no
-/// published page of. Slot `s` lies at byte `s × page_bytes` of the pool.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct PeerPool {
-    pub pool: u64,
-    pub shape: PageShape,
-    pub slots: Vec<Option<u64>>,
-}
-
 /// What a server holds.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Listing {
@@ -1585,8 +1392,6 @@ pub struct Listing {
     pub host_bytes: Vec<ScopeBytes>,
     /// The deployments claimed, and whether their head is connected.
     pub deployments: Vec<DeploymentListing>,
-    /// The page pools.
-    pub page_pools: Vec<PoolListing>,
     /// Whether the Mooncake connector is connected.
     pub connector: bool,
     /// The Transfer Server, while it is connected.
@@ -1716,25 +1521,6 @@ pub struct TaskTotal {
     pub copied: u64,
 }
 
-/// One page pool in a [`Listing`].
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct PoolListing {
-    pub pool: u64,
-    /// The deployment the pool belongs to.
-    pub deployment: String,
-    pub shape: PageShape,
-    pub numa_node: Option<u32>,
-    pub slots: u64,
-    /// Slots holding committed pages, pinned ones included.
-    pub ready: u64,
-    pub reserved: u64,
-    pub pinned: u64,
-    /// Slots the connector is reading pages into.
-    pub fetching: u64,
-    /// Committed pages the connector is writing to the KV storage.
-    pub uploading: u64,
-}
-
 /// One retained tensor in a [`Listing`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TensorListing {
@@ -1780,8 +1566,7 @@ pub struct DeploymentListing {
 }
 
 /// A message the server sends outside the responses to requests: the
-/// completion of a head's prefetch and of a transfer, the connector's work
-/// and the Transfer Server's.
+/// completion of a transfer, the connector's work and the Transfer Server's.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Event {
@@ -1799,8 +1584,8 @@ pub enum Event {
     /// To the Transfer Server: an allocation of `bytes` in `storage`, whose
     /// descriptor travels with the event (a CUDA VMM allocation's POSIX
     /// handle, or a memfd), before the first task that copies it. It maps
-    /// the allocation for writing when `writable`: a page pool, or a
-    /// storage that holds an exclusive tensor.
+    /// the allocation for writing when `writable`: a storage that holds an
+    /// exclusive tensor, or a rank's part of a host region.
     Allocation {
         allocation: Allocation,
         end: LinkEnd,
@@ -1850,33 +1635,24 @@ pub enum Event {
     /// To the Transfer Server: the exposure its registrations of `request`
     /// served ended; they go once no other exposure holds them.
     Deregister { request: u64 },
-    /// To a head: the prefetch `tag` ended. `results[i]` is whether the pool
-    /// holds the page of the prefetch's key `i`.
-    Prefetched { tag: u64, results: Vec<bool> },
-    /// To the connector: a page pool, whose memfd travels with the event.
+    /// To the connector: a pool of pages, a rank's part of a buffer pool's
+    /// host region, whose memfd travels with the event.
     Pool {
         pool: u64,
         shape: PageShape,
         slots: u64,
     },
-    /// To the connector: the page pool is released; the connector has no
-    /// task on it, and unmaps it.
+    /// To the connector: the pool is released; the connector has no task on
+    /// it, and unmaps it.
     PoolReleased { pool: u64 },
-    /// To the connector: which pages of `keys` the KV storage holds.
-    Exists {
-        task: u64,
-        pool: u64,
-        keys: Vec<Key>,
-    },
-    /// To the connector: write the committed pages in these slots to the
-    /// KV storage.
+    /// To the connector: write the pages in these slots to the KV storage.
     Upload {
         task: u64,
         pool: u64,
         pages: Vec<(Key, u64)>,
     },
-    /// To the connector: read these pages from the KV storage into
-    /// their slots.
+    /// To the connector: read these pages from the KV storage into their
+    /// slots.
     Download {
         task: u64,
         pool: u64,

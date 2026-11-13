@@ -58,7 +58,7 @@ use super::threads::{End, Piece, Runner, ThreadKey};
 
 /// How long another host's Storage Server may take to accept the connection
 /// and to respond to an exposure: far longer than registering the largest
-/// region takes there (pinning a host page pool of tens of GiB takes
+/// region takes there (pinning a host region's part of tens of GiB takes
 /// seconds), so that only a host that stopped responding to reaches it.
 const PEER_TIMEOUT: Duration = Duration::from_secs(120);
 

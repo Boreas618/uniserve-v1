@@ -32,12 +32,10 @@ pub struct ServeOptions {
     /// Leave the starter's session, log beside the socket, and return to the
     /// starter once listening.
     pub daemon: bool,
-    /// The size of each host page pool whose worker states none, in bytes.
-    pub page_pool_bytes: u64,
-    /// Host storage a new page pool leaves available to the host's other
+    /// Host storage new host storage leaves available to the host's other
     /// processes, in bytes.
     pub host_reserve_bytes: u64,
-    /// Also accept other hosts' page requests on this TCP address
+    /// Also accept other hosts' heads and peers on this TCP address
     /// (`host:port`; port 0 picks one).
     pub tcp: Option<String>,
     /// The Mooncake connector's settings, when the server runs one.
@@ -178,23 +176,6 @@ pub fn list(socket: &Path) -> ::storage::Result<()> {
             }
         );
     }
-    for pool in &listing.page_pools {
-        println!(
-            "page pool {} of {} kv heads {}+{} {} slots of {} bytes: {} ready, {} reserved, \
-             {} pinned, {} fetching, {} uploading",
-            pool.pool,
-            pool.deployment,
-            pool.shape.kv_head_offset,
-            pool.shape.kv_head_count,
-            pool.slots,
-            pool.shape.page_bytes,
-            pool.ready,
-            pool.reserved,
-            pool.pinned,
-            pool.fetching,
-            pool.uploading
-        );
-    }
     if listing.connector {
         println!("mooncake connector connected");
     }
@@ -268,7 +249,6 @@ fn serve_on(options: &ServeOptions, ready: Option<service::Ready>) -> anyhow::Re
     let (wake, stop) = service::stop_signals().context("installing the stop signals")?;
     let mut server = Server::new(
         listener,
-        options.page_pool_bytes,
         options.host_reserve_bytes,
         connector_launch(options),
         Some(transfer_launch(options)),
@@ -277,7 +257,7 @@ fn serve_on(options: &ServeOptions, ready: Option<service::Ready>) -> anyhow::Re
         let listener = std::net::TcpListener::bind(address)
             .with_context(|| format!("binding {address} for other hosts"))?;
         let bound = server.listen_tcp(listener)?;
-        tracing::info!(address = %bound, "accepting other hosts' page requests");
+        tracing::info!(address = %bound, "accepting other hosts' connections");
     }
     server.set_relaunch(crate::relaunch_arguments(std::env::args_os().collect()));
     server.set_deadlines(options.transfer_deadline, options.put_deadline);

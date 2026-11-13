@@ -677,14 +677,13 @@ message DiffusionSamplingParams {
 // ------------------------------------------------------------------ events
 
 message Event {
-  reserved 7, 8, 9, 10, 11, 19;
-  reserved "readout", "image_begin", "image_step", "image_commit", "image_done",
-      "control_token";
+  reserved 4, 7, 8, 9, 10, 11, 19;
+  reserved "text_tokens", "readout", "image_begin", "image_step", "image_commit",
+      "image_done", "control_token";
   uint64 request = 1;
   oneof kind {
     Scheduled scheduled = 2;
     TextToken text_token = 3;
-    TextTokens text_tokens = 4;
     TokenLogprobs token_logprobs = 5;
     PromptLogprobs prompt_logprobs = 6;
     MediaProgress media_progress = 12;
@@ -727,10 +726,6 @@ message Scheduled {
 message TextToken {
   uint32 id = 1;
   optional float logprob = 2;
-}
-
-message TextTokens {
-  repeated uint32 ids = 1;
 }
 
 message TokenLogprob {
@@ -829,13 +824,12 @@ message Failed {
 // ------------------------------------------------------------ limits
 
 message GenerationLimits {
-  reserved 4, 6, 7, 10, 13, 14;
-  reserved "image_generation", "max_latent_units", "latent_downsample",
+  reserved 4, 5, 6, 7, 10, 13, 14;
+  reserved "image_generation", "token_denoising", "max_latent_units", "latent_downsample",
       "latent_bytes_per_unit", "commit_marker_tokens", "max_cfg_branches";
   bool understanding = 1;
   bool vision_encode = 2;
   bool latent_encode = 3;
-  bool token_denoising = 5;
   uint32 max_vae_grid_tokens = 8;
   uint32 max_vit_grid_tokens = 9;
   uint64 max_latent_feature_bytes = 11;

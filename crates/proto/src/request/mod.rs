@@ -32,7 +32,7 @@ pub use spec::{
     ExpertExchange, FlashInferBackend, FlashInferBackendParseError, LoadFormat, PrefixCacheDtype,
     PrefixCacheDtypeParseError, SchedulingPolicy, StandbyStorage,
 };
-pub use values::{BlockSampling, DiffusionSamplingParams, ImageEncoder, RequestId, TokenLogprob};
+pub use values::{DiffusionSamplingParams, ImageEncoder, RequestId, TokenLogprob};
 
 /// The most events the engine sends a request beyond those its consumer took
 /// (`Consumed`).

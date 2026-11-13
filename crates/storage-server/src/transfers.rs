@@ -181,14 +181,6 @@ impl Transfers {
         }
     }
 
-    /// Whether a task `client` submitted has not ended yet: the Transfer
-    /// Server may still write its destinations.
-    pub(super) fn submitted_by(&self, client: ClientId) -> bool {
-        self.tasks
-            .values()
-            .any(|task| task.owner == Owner::Client(client))
-    }
-
     /// Records task `task` and counts its bytes in its deployment's total.
     fn insert(&mut self, task: u64, entry: Task) {
         self.totals.entry(entry.deployment.clone()).or_default()[entry.priority.rank()].bytes +=
@@ -397,8 +389,8 @@ impl Server {
     }
 
     /// A peer's [`Request::Expose`](::storage::protocol::Request::Expose) of
-    /// `regions` of `deployment`: each is a retained tensor or a page pool
-    /// of the deployment, checked as a task's source is, and the Transfer
+    /// `regions` of `deployment`: each is a retained tensor or a host
+    /// region's part of the deployment, checked as a task's source is, and the Transfer
     /// Server is given each allocation it does not hold yet. The request
     /// then waits for the registrations ([`Server::begin_exposure`]).
     pub(super) fn expose(
@@ -417,12 +409,9 @@ impl Server {
         let mut placed = Vec::with_capacity(regions.len());
         let mut needed = BTreeMap::new();
         for region in regions {
-            if !matches!(
-                region,
-                Region::Tensor { .. } | Region::Pool { .. } | Region::Part { .. }
-            ) {
+            if !matches!(region, Region::Tensor { .. } | Region::Part { .. }) {
                 return Err(invalid(
-                    "a host exposes its own retained tensors, page pools and host regions' parts",
+                    "a host exposes its own retained tensors and host regions' parts",
                 ));
             }
             let resolved = self.resolve(deployment, region, false)?;
@@ -887,25 +876,6 @@ impl Server {
                     writable: self.writable(tensor.storage),
                 })
             }
-            Region::Pool { pool } => {
-                let entry = self
-                    .pages
-                    .get(*pool)
-                    .filter(|entry| entry.deployment == deployment && !self.pages.released(*pool))
-                    .ok_or_else(|| {
-                        invalid(&format!(
-                            "page pool {pool} is not a live pool of {deployment}"
-                        ))
-                    })?;
-                Ok(Resolved {
-                    allocation: Allocation::Pool { pool: *pool },
-                    end: LinkEnd::Host,
-                    base: 0,
-                    bytes: entry.slots() * entry.shape.page_bytes,
-                    attachment: Some(Attachment::Pool(*pool)),
-                    writable: true,
-                })
-            }
             Region::Part { region, rank } => {
                 let (storage, bytes) = self.part_storage(deployment, region, *rank).ok_or_else(
                     || {
@@ -949,7 +919,7 @@ impl Server {
                 "a span writes storage of this host: another host's region is a source, which \
                  this host READs"
             } else {
-                "another host exposes its own retained tensors and page pools"
+                "another host exposes its own retained tensors and host regions' parts"
             })),
         }
     }
@@ -1035,9 +1005,6 @@ impl Server {
         }
         if end.is_some() {
             self.transfers.tasks.remove(&task);
-            if let Owner::Client(client) = owner {
-                self.submitter_task_ended(client);
-            }
         }
         match (owner, end) {
             (Owner::Client(client), Some(status)) => {
@@ -1057,15 +1024,6 @@ impl Server {
                 self.end_pool_task(number, end == TaskStatus::Complete);
             }
             (Owner::Move { .. } | Owner::Pool { .. }, None) => {}
-        }
-    }
-
-    /// A task of `client` ended: once the last task of a client whose
-    /// connection closed ended, the page slots it reserved for its tasks
-    /// to write end ([`crate::pages::Pools::head_tasks_ended`]).
-    fn submitter_task_ended(&mut self, client: ClientId) {
-        if !self.clients.contains_key(&client) && !self.transfers.submitted_by(client) {
-            self.pages.head_tasks_ended(client);
         }
     }
 
@@ -1145,7 +1103,6 @@ impl Server {
                         },
                         Vec::new(),
                     ));
-                    self.submitter_task_ended(client);
                 }
                 Owner::Move { number, index } => self.moved(number, index, &failed),
                 // The Transfer Server may still copy until its process has exited.
@@ -1266,21 +1223,17 @@ fn need(needed: &mut BTreeMap<Allocation, Resolved>, resolved: Resolved) {
 }
 
 /// The allocation of `region`, of `deployment`, at the Storage Server of
-/// another host listening at `endpoint`: a retained tensor or a page pool
-/// there, which that host checks once the Transfer Server asks it to expose
+/// another host listening at `endpoint`: a retained tensor or a host
+/// region's part there, which that host checks once the Transfer Server asks it to expose
 /// the region.
 fn remote(
     deployment: &str,
     endpoint: &str,
     region: &Region,
 ) -> Result<Allocation, (ErrorKind, String)> {
-    if !matches!(
-        region,
-        Region::Tensor { .. } | Region::Pool { .. } | Region::Part { .. }
-    ) {
+    if !matches!(region, Region::Tensor { .. } | Region::Part { .. }) {
         return Err(invalid(
-            "another host's region is one of its retained tensors, page pools or host regions' \
-             parts",
+            "another host's region is one of its retained tensors or host regions' parts",
         ));
     }
     if endpoint.is_empty() {
