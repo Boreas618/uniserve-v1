@@ -462,6 +462,7 @@ impl Scheduler {
         // A scheduler that holds no request and knows no cached block yet is told its groups.
         let bounds = ceilings(workers.iter().map(|worker| &worker.capacity));
         let snapshot = view::snapshot_of(&workers);
+        let parameters = policy::budgeted(parameters, &config);
         let policy = Policy::new(module, parameters, snapshot, &bounds).map_err(Error::Policy)?;
 
         // The page seeds every group of the scheduler states for its cache groups, one per class
@@ -788,6 +789,9 @@ impl Scheduler {
             return false;
         }
 
+        // The running requests before the completions, of which the step's trace states the
+        // admissions they end (`schedule::STEPS`).
+        let running = self.running.len();
         loop {
             let (id, owner, request, completion) = match self.next_completion() {
                 Ok(Some(entry)) => entry,
@@ -809,6 +813,7 @@ impl Scheduler {
         // room.
         self.start_transfers();
 
+        let admitted = self.running.len().saturating_sub(running);
         let batches = if self.paused {
             Vec::new()
         } else {
@@ -818,6 +823,7 @@ impl Scheduler {
         if self.stopped {
             return false;
         }
+        self.trace_step(now, admitted, &batches);
         // The eviction order goes ahead of the step's requests: `available` counts the units of
         // the order beyond the installed head, which the step's requests may take only once the
         // buffer pool has taken a `Victims` that names them (SD §4.5).

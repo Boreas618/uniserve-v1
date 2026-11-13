@@ -26,6 +26,7 @@ use std::fmt;
 use std::sync::Arc;
 
 use crate::batch::Shape;
+use proto::config::SchedulerConfig;
 use proto::request::RequestId;
 use scheduling::decision::{DispatchOutput, Room, Shortage, Victim};
 use scheduling::event::Event;
@@ -901,6 +902,18 @@ fn check(limits: &Limits, ceilings: &Limits) -> Result<(), PolicyError> {
     Ok(())
 }
 
+/// The parameters a scheduler instantiates its policy with (SD §5.2, §7.1): the package's
+/// arguments, with a step's token budget, where they state none, the scheduler's own `config`
+/// resolved (`SchedulerConfig::max_num_batched_tokens`: the deployment's, else the widest prefill
+/// bucket its workers captured). The policy's declared limits budget every step, so a package
+/// that leaves the budget to the deployment is given the deployment's, not the guest's default.
+pub(super) fn budgeted(mut parameters: Parameters, config: &SchedulerConfig) -> Parameters {
+    if parameters.max_num_batched_tokens.is_none() {
+        parameters.max_num_batched_tokens = u32::try_from(config.max_num_batched_tokens).ok();
+    }
+    parameters
+}
+
 /// The ceilings a scheduler's policy declares its limits within (SD §5.2), from what the
 /// workers of its groups captured: the step's tokens and a prefill chunk at most the widest
 /// prefill bucket's tokens, its calls at most the largest bucket's rows, a prefetch threshold of
@@ -938,8 +951,8 @@ pub fn ceilings<'a>(capacities: impl IntoIterator<Item = &'a Capacity>) -> Limit
 /// The policy generation (SD §3.9).
 impl Scheduler {
     /// A new generation's policy serves from this step on, instantiated on the scheduler's state
-    /// now; the one it replaces is kept for rollback. On failure the serving policy is untouched
-    /// and the error is the reply to `SetPolicy`.
+    /// now with its package's parameters ([`budgeted`]); the one it replaces is kept for rollback.
+    /// On failure the serving policy is untouched and the error is the reply to `SetPolicy`.
     pub(super) fn set_policy(
         &mut self,
         module: Arc<Module>,
@@ -947,6 +960,7 @@ impl Scheduler {
     ) -> Result<(), Error> {
         let snapshot = self.snapshot();
         let ceilings = ceilings(self.groups.iter().map(|group| &group.capacity));
+        let parameters = budgeted(parameters, &self.config);
         self.policy.switch(module, parameters, snapshot, &ceilings)
     }
 

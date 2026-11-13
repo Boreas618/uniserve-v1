@@ -65,7 +65,7 @@ use build_server::Target;
 use crossbeam_channel::{Receiver, Sender};
 use ops::KernelEntry;
 use platform::DeviceId;
-use proto::config::{EngineArgs, SchedulerConfig, WorkerGroupConfig};
+use proto::config::{EngineArgs, EngineConfig, SchedulerConfig, WorkerGroupConfig};
 use proto::request::{GenerationFeatures, GenerationLimits};
 use scheduling::limits::{Limits, Parameters};
 use scheduling::view::{RankView, Snapshot};
@@ -259,9 +259,7 @@ impl Engine {
         let scheduling = SchedulerConfig::of(
             config,
             config.scheduler.max_batch.get(),
-            config
-                .max_num_batched_tokens
-                .map_or(config.scheduler.max_num_batched_tokens, NonZeroUsize::get),
+            step_budget(config, &ceilings),
             tiers,
         );
 
@@ -920,6 +918,22 @@ fn start_peer(
         liveness: Some(liveness),
         counters,
     })
+}
+
+/// The tokens one scheduling step holds (`SchedulerConfig::max_num_batched_tokens`, SD §7.1): the
+/// deployment's `max_num_batched_tokens`; when it states none, what the workers' captured catalog
+/// bounds a step to, the widest prefill bucket of `ceilings`; and the configuration's default
+/// only when no group captured a prefill bucket. A scheduler budgets each step by its policy's
+/// declared limit, which is this figure when the policy's package states none
+/// (`scheduler::policy::budgeted`).
+pub(crate) fn step_budget(config: &EngineConfig, ceilings: &Limits) -> usize {
+    let captured = match ceilings.max_num_batched_tokens {
+        u32::MAX => config.scheduler.max_num_batched_tokens,
+        tokens => usize::try_from(tokens).unwrap_or(usize::MAX),
+    };
+    config
+        .max_num_batched_tokens
+        .map_or(captured, NonZeroUsize::get)
 }
 
 /// `configured`, the generation limits a launch states, lowered to what the worker groups of

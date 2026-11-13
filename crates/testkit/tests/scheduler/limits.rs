@@ -222,6 +222,49 @@ fn a_step_charges_at_most_max_num_batched_tokens() {
     assert_eq!(harness.tokens(second).len(), 3);
 }
 
+/// A policy whose package states no step token budget is given the scheduler's (SD §5.2, §7.1
+/// "Limits resolved at construction"): with buckets of 16384 prefill tokens, three prompts of
+/// 3000 tokens admitted together are prefilled whole in one step of 9000 tokens, above the 8192
+/// tokens a policy declares by default.
+#[test]
+fn a_policy_that_states_no_token_budget_is_budgeted_by_the_scheduler() {
+    const PROMPT: u32 = 3000;
+    let mut harness = Deployment::tokens()
+        .batch(8, 16384)
+        .chunk(8192)
+        .unstated_budget()
+        // Room for the three prompts' blocks of 4 tokens, and for their admissions' answers.
+        .kv_units(4096)
+        .ring_bytes(1 << 20)
+        .build();
+    let ids: Vec<RequestId> = (1..=3)
+        .map(|id| harness.submit(token(id, PROMPT, 2)))
+        .collect();
+
+    let mut prefills = Vec::new();
+    for _ in 0..20 {
+        let formed = stepped(&mut harness);
+        prefills.extend(
+            formed
+                .into_iter()
+                .filter(|batch| batch.phase == Phase::Prefill),
+        );
+        if !prefills.is_empty() {
+            break;
+        }
+    }
+    let [prefill] = &prefills[..] else {
+        panic!("one step forms the first prefill: {}", harness.summary());
+    };
+    assert_eq!(prefill.requests, ids, "every prompt joins the step");
+    assert_eq!(prefill.columns.tokens(), 3 * PROMPT as usize, "each whole");
+
+    harness.settle(100);
+    for id in ids {
+        assert_eq!(harness.tokens(id).len(), 2);
+    }
+}
+
 /// A request is admitted only onto a group with a free slot: with one slot on each of two
 /// groups, a third request waits until a request ends, and runs on the group whose slot that
 /// request gave back, while the other still runs (SD §3.5 `place`: the candidates of a phase are

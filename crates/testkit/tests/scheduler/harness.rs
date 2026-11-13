@@ -135,6 +135,9 @@ pub(crate) struct Deployment {
     tokens: u32,
     /// The prefill chunk the policy declares.
     chunk: u32,
+    /// Whether the policy's package states the step's token budget (the widest prefill bucket's
+    /// tokens); otherwise the scheduler gives its policy the budget of its configuration.
+    states_budget: bool,
     /// The bound of the waiting queue the policy declares.
     queued: Option<usize>,
     queue_depth: usize,
@@ -168,6 +171,7 @@ impl Deployment {
             rows: 8,
             tokens: 64,
             chunk: 64,
+            states_budget: true,
             queued: None,
             queue_depth: 2,
             ring_bytes: 1 << 16,
@@ -322,6 +326,13 @@ impl Deployment {
     /// The prefill chunk the policy declares.
     pub(crate) fn chunk(mut self, tokens: u32) -> Self {
         self.chunk = tokens;
+        self
+    }
+
+    /// A policy package that states no step token budget: the scheduler budgets each step by its
+    /// configuration's, the widest prefill bucket's tokens (SD §7.1).
+    pub(crate) fn unstated_budget(mut self) -> Self {
+        self.states_budget = false;
         self
     }
 
@@ -693,14 +704,14 @@ impl Deployment {
         }
     }
 
-    /// The arguments of the `fcfs` policy: the deployment's chunk, step tokens and calls, and its
-    /// queue bound.
+    /// The arguments of the `fcfs` policy: the deployment's chunk, step tokens (unless the
+    /// package leaves them to the scheduler) and calls, and its queue bound.
     fn parameters(&self) -> Parameters {
         Parameters {
             chunked_prefill_size: Some(self.chunk),
             max_queued_requests: self.queued,
             max_batch: Some(self.rows as usize),
-            max_num_batched_tokens: Some(self.tokens),
+            max_num_batched_tokens: self.states_budget.then_some(self.tokens),
             ..Parameters::default()
         }
     }

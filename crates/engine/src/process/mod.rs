@@ -64,6 +64,7 @@ use proto::process::command;
 use proto::request::wire::{self, engine_command, from_engine};
 use proto::request::{ArtifactMedia, RequestId};
 use scheduling::Parameters;
+use scheduling::limits::Limits;
 use scheduling::view::Snapshot;
 use service::Connection;
 
@@ -1238,7 +1239,8 @@ impl MainProcess {
                     return self.configured(front, id, Err(anyhow::anyhow!(error)));
                 };
                 let schedulers = engine.inboxes();
-                let limits = scheduling_limits(&self.launch.engine_config, &scheduling);
+                let limits =
+                    scheduling_limits(&self.launch.engine_config, &engine.ceilings, &scheduling);
                 self.work(Box::new(move || {
                     let configured = operations::configure(&schedulers, &limits);
                     done(move |main| main.configured(front, id, configured))
@@ -1476,20 +1478,21 @@ fn device_bytes(devices: &[wire::DeviceBytes]) -> Result<BTreeMap<[u8; 16], u64>
 }
 
 /// The scheduling limits a `Configure` states (`Scheduling`), each one it leaves out the epoch's
-/// configuration `config` resolves: the batch, the running requests, the token budget and the
-/// prefill chunk the configuration states, and an unbounded waiting queue. A reconfigure carries
-/// no graph catalog.
-fn scheduling_limits(config: &EngineConfig, scheduling: &wire::Scheduling) -> SchedulerConfig {
+/// configuration `config` resolves: the batch, the running requests and the prefill chunk the
+/// configuration states, the token budget it states or else the one the workers' captures under
+/// `ceilings` bound a step to (`start::step_budget`), and an unbounded waiting queue. A
+/// reconfigure carries no graph catalog.
+fn scheduling_limits(
+    config: &EngineConfig,
+    ceilings: &Limits,
+    scheduling: &wire::Scheduling,
+) -> SchedulerConfig {
     let max_batch = match scheduling.max_batch {
         0 => config.scheduler.max_batch.get(),
         batch => batch as usize,
     };
     let tokens = scheduling.max_num_batched_tokens.map_or_else(
-        || {
-            config
-                .max_num_batched_tokens
-                .map_or(config.scheduler.max_num_batched_tokens, NonZeroUsize::get)
-        },
+        || start::step_budget(config, ceilings),
         |tokens| tokens as usize,
     );
 

@@ -49,6 +49,12 @@ const COPY_PHASES: [Phase; 4] = [Phase::Prefill, Phase::Decode, Phase::Verify, P
 /// A step's budgets: the tokens and the calls still to be charged.
 type Budget = (u32, usize);
 
+/// The tracing target of the scheduler's step trace, at debug level: one line per step that asked
+/// the policy or ended an admission ([`Scheduler::trace_step`]), one per admission round started
+/// and per admission ended, and one where the waiting queue stops. Its lines are formed only
+/// while the target is enabled, and nothing the scheduler decides reads them.
+pub(super) const STEPS: &str = "engine::scheduler::steps";
+
 /// A request's arrival and the step (SD §3.2, §3.4).
 impl Scheduler {
     /// Whether request `id` takes calls this step: admitted and in no queue, running or waiting
@@ -198,6 +204,14 @@ impl Scheduler {
             for id in admitted {
                 // The first that does not fit stops the queue.
                 if !self.admit(id) {
+                    tracing::debug!(
+                        target: STEPS,
+                        step = self.step,
+                        request = id.0,
+                        running = self.running.len(),
+                        admitting = self.admitting(),
+                        "the waiting queue stops at a request it cannot admit now"
+                    );
                     break;
                 }
             }
@@ -812,6 +826,89 @@ impl Scheduler {
             )));
         }
     }
+
+    /// Traces the step that ran at `now` ([`STEPS`]), when it asked the policy, ended an
+    /// admission or formed a batch: the batches in flight before it, the admissions its
+    /// completions ended (`admitted`), where each waiting request stands, the running requests
+    /// with prompt left that no batch carries, and each batch `batches` formed with the requests
+    /// of its prefill and how long they had waited since they arrived.
+    ///
+    /// A waiting request is `queued` while no round of its admission was submitted (the step
+    /// asked no policy, the queue stopped ahead of it, or the policy did not name it),
+    /// `answering` while its round's answers are outstanding, and `next_round` when every answer
+    /// arrived and it waits for one more round. Called before the step's batches are counted in
+    /// flight; reads only.
+    pub(super) fn trace_step(&self, now: Instant, admitted: usize, batches: &[Batch]) {
+        if !tracing::enabled!(target: STEPS, tracing::Level::DEBUG) {
+            return;
+        }
+        let in_flight: u32 = self.groups.iter().map(|group| group.in_flight).sum();
+        let asked = !self.paused && self.groups.iter().any(queue_open);
+        if !asked && admitted == 0 && batches.is_empty() {
+            return;
+        }
+
+        let (mut queued, mut answering, mut next_round) = (0usize, 0usize, 0usize);
+        let mut oldest = Duration::ZERO;
+        for request in self.waiting.iter().filter_map(|id| self.requests.get(id)) {
+            match request.status {
+                RequestStatus::Waiting => queued += 1,
+                RequestStatus::WaitingForRemoteKvs if request.pending > 0 => answering += 1,
+                RequestStatus::WaitingForRemoteKvs => next_round += 1,
+                _ => {}
+            }
+            oldest = oldest.max(now.saturating_duration_since(request.arrival));
+        }
+        // Running requests whose prompt is not computed and of which no prefill is in flight:
+        // left out of every batch of this step.
+        let left_out = self
+            .running
+            .iter()
+            .filter_map(|id| self.requests.get(id))
+            .filter(|request| request.status == RequestStatus::Running)
+            .filter(|request| request.num_computed_tokens < request.num_prompt_tokens)
+            .filter(|request| request.in_flight(Phase::Prefill) == 0)
+            .count();
+
+        // Each batch as `phase rows/tokens`; a prefill's requests with their waits in ms.
+        let mut formed = Vec::with_capacity(batches.len());
+        let mut prefills = Vec::new();
+        for batch in batches {
+            formed.push(format!(
+                "{:?} {}/{}",
+                batch.phase, batch.shape.rows, batch.shape.tokens
+            ));
+            if batch.phase != Phase::Prefill {
+                continue;
+            }
+            for id in &batch.requests {
+                if let Some(request) = self.requests.get(id) {
+                    let waited = now.saturating_duration_since(request.arrival);
+                    prefills.push(format!("{}@{:.1}", id.0, waited.as_secs_f64() * 1e3));
+                }
+            }
+        }
+
+        tracing::debug!(
+            target: STEPS,
+            step = self.step,
+            at_us = super::monotonic_nanos(now) / 1_000,
+            asked,
+            in_flight,
+            admitted,
+            queued,
+            answering,
+            next_round,
+            oldest_ms = oldest.as_secs_f64() * 1e3,
+            running = self.running.len(),
+            left_out,
+            outstanding = self.outstanding.len(),
+            held = self.held.len(),
+            batches = formed.join(","),
+            prefill = prefills.join(" "),
+            "a scheduler step"
+        );
+    }
 }
 
 /// Admission and placement (SD §3.5).
@@ -917,6 +1014,14 @@ impl Scheduler {
         // Other requests are scheduled meanwhile.
         if let Some(request) = self.requests.get_mut(&id) {
             request.status = RequestStatus::WaitingForRemoteKvs;
+            tracing::debug!(
+                target: STEPS,
+                step = self.step,
+                request = id.0,
+                pending = request.pending,
+                waited_us = request.arrival.elapsed().as_micros(),
+                "an admission's first round is submitted"
+            );
         }
         self.mark(id);
         true

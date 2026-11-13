@@ -167,6 +167,12 @@ pub(crate) fn record_scheduler_stats(
         .get_or_create(&labels)
         .inc_by(stats.transferred_blocks);
 
+    // Calls the scheduler left out of a step for blocks the buffer pool had not given yet.
+    metrics
+        .scheduler_calls_without_blocks
+        .get_or_create(&labels)
+        .inc_by(stats.calls_without_blocks);
+
     // Worker-local forward/kernel counters. The reporter sends `None` when no
     // worker counter changed in the interval, and then none of these families
     // is touched.
@@ -730,15 +736,16 @@ mod tests {
         }));
     }
 
-    // A scheduler's transfers between worker groups reach the exposition as counters that add
-    // each interval's answers and blocks.
+    // A scheduler's transfers between worker groups, and the calls its steps left out for blocks
+    // not yet given, reach the exposition as counters that add each interval's counts.
     #[test]
-    fn transfers_reach_openmetrics_and_add_up_over_intervals() {
+    fn transfers_and_late_blocks_reach_openmetrics_and_add_up_over_intervals() {
         let metrics = Metrics::new();
         let stats = SchedulerStats {
             transfers: 2,
             failed_transfers: 1,
             transferred_blocks: 9,
+            calls_without_blocks: 3,
             ..Default::default()
         };
 
@@ -750,6 +757,7 @@ mod tests {
             ("uniserve:request_transfers_total", 4),
             ("uniserve:request_transfers_failed_total", 2),
             ("uniserve:request_transfer_blocks_total", 18),
+            ("uniserve:scheduler_calls_without_blocks_total", 6),
         ] {
             let sample = format!("{name}{{model_name=\"model\",engine=\"0\"}} {value}");
             assert!(

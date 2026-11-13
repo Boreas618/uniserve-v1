@@ -18,12 +18,13 @@ form = "wasm"
 # The policy's arguments and their defaults, as `scheduling::limits::Parameters`
 # reads them (design §7.7): a deployment that states none gets these, which are
 # the current scheduler's defaults. `max_queued_requests` is absent because
-# absent means unbounded, and `timeout` is absent because the guest's default is
-# the mechanism's own 30 s starvation cap.
+# absent means unbounded, `timeout` is absent because the guest's default is
+# the mechanism's own 30 s starvation cap, and `max_num_batched_tokens` is
+# absent because absent means the scheduler's own step budget: the deployment's
+# `max_num_batched_tokens`, else the widest prefill batch its workers captured.
 [parameters]
 chunked_prefill_size = 8192
 max_batch = 128
-max_num_batched_tokens = 8192
 prefetch_min_tokens = 256
 
 # The package is this crate: the Build Server snapshots it with the `scheduling` crate

@@ -1000,6 +1000,13 @@ impl Scheduler {
         request.status = RequestStatus::Running;
         request.queued = false;
         request.last_progress = now;
+        tracing::debug!(
+            target: super::schedule::STEPS,
+            step = self.step,
+            request = id.0,
+            waited_us = now.saturating_duration_since(request.arrival).as_micros(),
+            "an admission ended: the request runs"
+        );
         let queued_at = unix_secs(request.arrival);
         self.waiting.retain(|waiting| *waiting != id);
         self.running.push(id);

@@ -188,6 +188,8 @@ pub struct SchedulerMetrics {
     pub request_transfers_failed: Family<EngineLabels, U64Counter>,
     /// The blocks the transfers' target groups received, one per entry a `Transferred` states.
     pub request_transfer_blocks: Family<EngineLabels, U64Counter>,
+    /// Calls a step left out because blocks they write had not arrived from the buffer pool.
+    pub scheduler_calls_without_blocks: Family<EngineLabels, U64Counter>,
 
     // Worker-local forward/kernel counters.
     /// Attention kernel launches.
@@ -405,6 +407,13 @@ impl SchedulerMetrics {
             "Blocks the decode groups received by transfer: every entry of the transferred \
              requests' tables, by class and position.",
             request_transfer_blocks.clone(),
+        );
+        let scheduler_calls_without_blocks: Family<EngineLabels, U64Counter> = Default::default();
+        registry.register(
+            "uniserve:scheduler_calls_without_blocks",
+            "Calls a scheduler step left out because blocks they write had not arrived from the \
+             buffer pool: the request's allocation was still outstanding when the call was due.",
+            scheduler_calls_without_blocks.clone(),
         );
         let worker_attention_launches: Family<EngineLabels, U64Counter> = Default::default();
         registry.register(
@@ -682,6 +691,7 @@ impl SchedulerMetrics {
             request_transfers,
             request_transfers_failed,
             request_transfer_blocks,
+            scheduler_calls_without_blocks,
             worker_attention_launches,
             worker_attention_us,
             worker_attention_backend_counts,
