@@ -3,16 +3,18 @@
 //! The cache is one pool of units. A *unit* is the pool's allocation quantum (unit 0 is the
 //! padding unit no page holds); a *column* is a layer's position inside a unit; a *plane* is the
 //! bytes of one field (keys or values) of one column of one unit; a group's page of
-//! `block_size` tokens occupies the group's `units_per_page` units.
+//! `block_size` tokens occupies the group's `units_per_page` units. A cache whose model's
+//! attention reads the tokens an indexer selects keeps a third field beside them, the *index
+//! keys*: one plane per column of every unit, one key per `ratio` tokens of the column's page.
 //!
 //! The model owns the shape of its cache layers, so the layout is derived from it
-//! ([`CacheLayout::dense`], [`CacheLayout::hybrid`], [`CacheLayout::with_draft`]) and checked
-//! once ([`CacheLayout::validated`]). How many units and request slots a rank's cache holds is
-//! not part of it: those are the capacity a rank resolves
-//! ([`KvCacheConfig`](super::KvCacheConfig)).
+//! ([`CacheLayout::dense`], [`CacheLayout::hybrid`], [`CacheLayout::with_index_keys`],
+//! [`CacheLayout::with_draft`]) and checked once ([`CacheLayout::validated`]). How many units
+//! and request slots a rank's cache holds is not part of it: those are the capacity a rank
+//! resolves ([`KvCacheConfig`](super::KvCacheConfig)).
 
 use ipc::{CacheGroup, CacheGroupKind, PrefixCacheDtype, PrefixCacheInfo};
-use nn::family::{StateField, StateShape};
+use nn::family::{IndexKeys, StateField, StateShape};
 use uniserve_tensor::DType;
 
 use crate::{Error, Result};
@@ -62,6 +64,10 @@ pub struct GroupLayout {
     pub dtype: DType,
     /// The element type the group's layers compute in, through which a converted value rounds.
     pub compute_dtype: DType,
+    /// The index keys each layer keeps beside its keys and values, in `compute_dtype`, as the
+    /// model states them ([`nn::family::CacheShape::index_keys`]); `None` for layers that
+    /// attend every key.
+    pub index_keys: Option<IndexKeys>,
 }
 
 impl GroupLayout {
@@ -76,6 +82,16 @@ impl GroupLayout {
             * u64::from(self.block_size)
             * u64::from(self.num_kv_heads)
             * u64::from(self.head_dim)
+    }
+
+    /// Bytes the index keys of one layer's `tokens` tokens occupy: one key of the layers'
+    /// compute type per `ratio` tokens. Zero for a group that keeps none.
+    pub(crate) fn index_bytes(&self, tokens: u32) -> u64 {
+        self.index_keys.map_or(0, |keys| {
+            let groups = tokens.checked_div(keys.ratio).unwrap_or(0);
+
+            u64::from(groups) * u64::from(keys.width) * element_bytes(self.compute_dtype)
+        })
     }
 
     /// Whether the group's pages hold state checkpoints.
@@ -101,6 +117,15 @@ fn element_bytes(dtype: DType) -> u64 {
     ops::abi::bytes(dtype).unwrap_or(0)
 }
 
+/// Device bytes one cell, a column of one unit, takes of the fields a forward reads: a key
+/// plane, a value plane and the flag of each, one F32 scale per plane when `quantized`, and
+/// `index_bytes` of index keys.
+fn cell_bytes(plane_bytes: u64, quantized: bool, index_bytes: u64) -> u64 {
+    let scale_bytes = if quantized { 2 * 4 } else { 0 };
+
+    2 * plane_bytes + 2 + scale_bytes + index_bytes
+}
+
 /// The element type the cache stores for the engine's `dtype`.
 fn stored(dtype: PrefixCacheDtype) -> DType {
     match dtype {
@@ -120,8 +145,8 @@ pub struct CacheLayout {
     pub plane_bytes: u64,
     /// Whether the planes store FP8 with one scale per plane.
     pub quantized: bool,
-    /// Device bytes one unit takes over every column: its planes, flags, scales and state
-    /// planes.
+    /// Device bytes one unit takes over every column: its planes, flags, scales, index keys
+    /// and state planes.
     pub unit_bytes: u64,
     /// The stored element type as the engine names it (`PrefixCacheInfo::dtype`).
     pub dtype: PrefixCacheDtype,
@@ -153,14 +178,12 @@ impl CacheLayout {
         // plane and the two flags of each, and for FP8 one F32 scale per plane.
         let columns = layers.max(1);
         let quantized = matches!(dtype, PrefixCacheDtype::Float8E4m3Fn);
-        let scale_bytes = if quantized { 2 * 4 } else { 0 };
-        let per_column = 2 * plane_bytes + 2 + scale_bytes;
 
         Self {
             columns,
             plane_bytes,
             quantized,
-            unit_bytes: u64::from(columns) * per_column,
+            unit_bytes: u64::from(columns) * cell_bytes(plane_bytes, quantized, 0),
             dtype,
             groups: vec![GroupLayout {
                 kind: CacheGroupKind::Full,
@@ -176,10 +199,95 @@ impl CacheLayout {
                 head_dim,
                 dtype: element,
                 compute_dtype: DType::BF16,
+                index_keys: None,
             }],
             checkpoints: Vec::new(),
             converts_from: None,
         }
+    }
+
+    /// The layout whose attention layers keep the index keys `keys` the model states
+    /// ([`nn::family::CacheShape::index_keys`]): every cell gains one index-key plane beside
+    /// its key and value planes, `block_size / ratio` keys of `width` elements of the layers'
+    /// compute type, whatever the cache stores its keys and values in. The plane has no flag
+    /// and no scale: a reader reads the keys of completed groups alone, which their writer
+    /// stored.
+    ///
+    /// The draft group stores what the first group's planes hold, so a drafter's layers keep
+    /// the same index keys, whether the draft cache is added before or after.
+    ///
+    /// # Errors
+    ///
+    /// A layout that keeps index keys already or admits converted loads, which convert keys
+    /// and values alone, or index keys the pages do not hold in whole ([`Self::validated`]).
+    pub fn with_index_keys(mut self, keys: IndexKeys) -> Result<Self> {
+        if self.groups.iter().any(|group| group.index_keys.is_some()) {
+            return Err(Error::Invalid(
+                "a cache layout states its index keys once".into(),
+            ));
+        }
+        if self.converts_from.is_some() {
+            return Err(Error::Invalid(
+                "a cache that loads converted pages keeps no index keys".into(),
+            ));
+        }
+
+        for group in &mut self.groups {
+            if !group.state() {
+                group.index_keys = Some(keys);
+            }
+        }
+        self.unit_bytes += u64::from(self.columns) * self.index_bytes();
+
+        self.validated()
+    }
+
+    /// Bytes of one index-key plane: one layer's index keys of one page of the first group.
+    /// Zero for a cache whose layers keep none.
+    pub fn index_bytes(&self) -> u64 {
+        self.groups
+            .first()
+            .map_or(0, |group| group.index_bytes(group.block_size))
+    }
+
+    /// Device bytes one cell takes of the fields a forward reads: its key and value planes,
+    /// their flags and scales, and its index keys. A unit holds one per column, beside its
+    /// state planes.
+    pub(crate) fn cell_bytes(&self) -> u64 {
+        cell_bytes(self.plane_bytes, self.quantized, self.index_bytes())
+    }
+
+    /// The shape of the index keys that `pages` pages of `tokens` tokens of one of `group`'s
+    /// layers lend, `[pages, tokens / ratio, width]` in the group's compute type
+    /// ([`nn::KvPlanes::index_keys`]); `None` for a group that keeps none.
+    ///
+    /// # Errors
+    ///
+    /// When a page's keys do not fill an index-key plane, so the pages would not be the
+    /// planes of consecutive cells.
+    pub(crate) fn index_shape(
+        &self,
+        group: &GroupLayout,
+        pages: usize,
+        tokens: u32,
+    ) -> Result<Option<[usize; 3]>> {
+        let Some(keys) = group.index_keys else {
+            return Ok(None);
+        };
+
+        let bytes = group.index_bytes(tokens);
+        if bytes == 0 || bytes != self.index_bytes() {
+            return Err(Error::Invariant(format!(
+                "the index keys of a page of {tokens} tokens take {bytes} bytes and an \
+                 index-key plane {}",
+                self.index_bytes()
+            )));
+        }
+        Ok(Some([
+            pages,
+            (tokens / keys.ratio) as usize,
+            keys.width as usize,
+        ]))
     }
 
     /// The layout with converted loads admitted: pages another host computed in the groups'
@@ -188,12 +296,13 @@ impl CacheLayout {
     ///
     /// Only the direction that does not lower the destination's precision is admitted: a dense
     /// source into an FP8 cache. A cache with a state or draft group admits none, because those
-    /// pages have no conversion and a hit needs every group.
+    /// pages have no conversion and a hit needs every group; neither does a cache that keeps
+    /// index keys, which a conversion does not carry.
     ///
     /// # Errors
     ///
-    /// A cache that is not FP8, holds a state or draft group, or whose groups do not compute in
-    /// one dense element type.
+    /// A cache that is not FP8, holds a state or draft group, keeps index keys, or whose groups
+    /// do not compute in one dense element type.
     pub fn with_conversion(mut self) -> Result<Self> {
         if !self.quantized {
             return Err(Error::Invalid(
@@ -207,6 +316,11 @@ impl CacheLayout {
         {
             return Err(Error::Invalid(
                 "a cache with a state or draft group loads no converted page".into(),
+            ));
+        }
+        if self.groups.iter().any(|group| group.index_keys.is_some()) {
+            return Err(Error::Invalid(
+                "a cache that keeps index keys loads no converted page".into(),
             ));
         }
 
@@ -257,7 +371,7 @@ impl CacheLayout {
             columns: self.columns,
             plane_bytes,
             quantized: false,
-            unit_bytes: u64::from(self.columns) * (2 * plane_bytes + 2),
+            unit_bytes: u64::from(self.columns) * cell_bytes(plane_bytes, false, 0),
             dtype: source,
             groups: self
                 .groups
@@ -279,7 +393,8 @@ impl CacheLayout {
     /// When a group has no layers, a page of a group takes no unit or holds no token, a group
     /// stores an element narrower than a byte, the groups' layer counts do not make the stated
     /// columns, the state group is not the last group, the draft group does not lie over one
-    /// unit, or a unit is smaller than its planes.
+    /// unit, a group's index keys are not whole groups of a cell's tokens that fill the
+    /// cache's index-key plane, or a unit is smaller than its planes.
     pub fn validated(self) -> Result<Self> {
         if self.groups.is_empty() {
             return Err(Error::Invalid(
@@ -319,6 +434,7 @@ impl CacheLayout {
                     group.layers
                 )));
             }
+            self.check_index_keys(group)?;
         }
 
         if let Some((last, rest)) = self.groups.split_last()
@@ -355,12 +471,52 @@ impl CacheLayout {
             )));
         }
 
-        if self.plane_bytes == 0 || self.unit_bytes < u64::from(self.columns) * self.plane_bytes {
+        let column_bytes = self.plane_bytes + self.index_bytes();
+        if self.plane_bytes == 0 || self.unit_bytes < u64::from(self.columns) * column_bytes {
             return Err(Error::Invalid(
-                "a cache unit holds at least one plane of every column".into(),
+                "a cache unit holds at least one plane and the index keys of every column".into(),
             ));
         }
         Ok(self)
+    }
+
+    /// Checks the index keys `group` keeps, when it keeps any: one key per `ratio` tokens of
+    /// the tokens a cell holds of one of its layers, in bytes the index-key plane of every cell
+    /// of the cache.
+    fn check_index_keys(&self, group: &GroupLayout) -> Result<()> {
+        let Some(keys) = group.index_keys else {
+            return Ok(());
+        };
+        if group.state() {
+            return Err(Error::Invalid(
+                "the state group's pages hold checkpoints and no index keys".into(),
+            ));
+        }
+
+        // A draft layer's page lies over its span of columns, another layer's over one.
+        let tokens = if group.draft() {
+            group.block_size / span_of(self.columns, group.layers.len() as u32)
+        } else {
+            group.block_size
+        };
+        if keys.width == 0 || keys.ratio == 0 || !tokens.is_multiple_of(keys.ratio) {
+            return Err(Error::Invalid(format!(
+                "cache group {:?} keeps index keys of {} elements per {} tokens, and a cell \
+                 holds {tokens} tokens",
+                group.layers, keys.width, keys.ratio
+            )));
+        }
+
+        let bytes = group.index_bytes(tokens);
+        if bytes == 0 || bytes != self.index_bytes() {
+            return Err(Error::Invalid(format!(
+                "cache group {:?} keeps {bytes} bytes of index keys a cell, and the cache's \
+                 index-key plane is {} bytes",
+                group.layers,
+                self.index_bytes()
+            )));
+        }
+        Ok(())
     }
 
     /// The field runs a state page's checkpoints need; zero without a state group.
@@ -554,6 +710,7 @@ impl CacheLayout {
             head_dim: 1,
             dtype: DType::BF16,
             compute_dtype: DType::BF16,
+            index_keys: None,
         });
 
         // A unit holds its key and value planes and flags per column, and one state plane per
@@ -565,6 +722,8 @@ impl CacheLayout {
 
     /// The layout with the draft cache added: the keys and values of a drafter's `layers`
     /// attention layers, which store `kv_heads` heads of `head_dim` as the first group does.
+    ///
+    /// The draft's layers keep the index keys the first group's keep, in the same cells.
     ///
     /// A drafter has fewer layers than a unit has columns, so a draft page does not take a cell
     /// per layer. It takes **one unit**, and each of its layers lies over
@@ -806,6 +965,89 @@ mod tests {
         .validated()?;
         assert_eq!(fp8.plane_bytes, plane / 2);
         assert_eq!(fp8.unit_bytes, u64::from(layers) * (plane + 2 + 8));
+        Ok(())
+    }
+
+    /// Index keys of 128 elements per four tokens, as a model's cache shape states them.
+    const KEYS: IndexKeys = IndexKeys {
+        width: 128,
+        ratio: 4,
+    };
+
+    /// A cache whose layers keep index keys holds one more plane per cell: sixteen keys of 128
+    /// BF16 elements for a page of 64 tokens, whatever the cache stores its keys and values in,
+    /// and nothing else of the layout moves.
+    #[test]
+    fn index_keys_add_one_plane_to_every_cell() -> Result<()> {
+        let dense = |dtype| CacheLayout::dense(64, 10, 2, 256, dtype);
+        let index_plane = 16 * 128 * 2;
+
+        for dtype in [PrefixCacheDtype::BFloat16, PrefixCacheDtype::Float8E4m3Fn] {
+            let without = dense(dtype).validated()?;
+            assert_eq!(without.index_bytes(), 0);
+            assert_eq!(without.groups[0].index_keys, None);
+
+            let keyed = dense(dtype).with_index_keys(KEYS)?;
+            assert_eq!(keyed.index_bytes(), index_plane);
+            assert_eq!(keyed.groups[0].index_keys, Some(KEYS));
+            assert_eq!(keyed.unit_bytes, without.unit_bytes + 10 * index_plane);
+            assert_eq!(
+                (keyed.columns, keyed.plane_bytes, keyed.quantized),
+                (without.columns, without.plane_bytes, without.quantized)
+            );
+        }
+
+        // The state group's pages hold checkpoints alone, in the planes they had.
+        let state = state();
+        let hybrid = CacheLayout::hybrid(64, 10, 2, 256, PrefixCacheDtype::BFloat16, &state)?;
+        let keyed = hybrid.clone().with_index_keys(KEYS)?;
+        assert_eq!(keyed.unit_bytes, hybrid.unit_bytes + 10 * index_plane);
+        assert_eq!(keyed.groups[1].index_keys, None);
+        assert_eq!(
+            keyed.state_planes(2, &state.fields),
+            hybrid.state_planes(2, &state.fields)
+        );
+        assert_eq!(keyed.token_units(640, 4), hybrid.token_units(640, 4));
+        Ok(())
+    }
+
+    /// A drafter's layers keep the index keys of the cache's cells, whichever of the draft
+    /// cache and the index keys the layout gains first.
+    #[test]
+    fn a_draft_group_keeps_the_index_keys_of_its_cells() -> Result<()> {
+        let hybrid = || CacheLayout::hybrid(64, 10, 2, 256, PrefixCacheDtype::BFloat16, &state());
+
+        let keyed_first = hybrid()?.with_index_keys(KEYS)?.with_draft(1, 2, 256)?;
+        let draft_first = hybrid()?.with_draft(1, 2, 256)?.with_index_keys(KEYS)?;
+        assert_eq!(keyed_first, draft_first);
+
+        let draft = &keyed_first.groups[1];
+        assert!(draft.draft());
+        assert_eq!(draft.index_keys, Some(KEYS));
+        assert_eq!(
+            keyed_first.unit_bytes,
+            hybrid()?.with_index_keys(KEYS)?.unit_bytes
+        );
+        Ok(())
+    }
+
+    /// Index keys are whole groups of a page's tokens, stated once, and a cache that keeps
+    /// them loads no converted page.
+    #[test]
+    fn index_keys_a_page_does_not_hold_are_refused() -> Result<()> {
+        let dense = |dtype| CacheLayout::dense(64, 4, 2, 128, dtype);
+        let bf16 = || dense(PrefixCacheDtype::BFloat16);
+        let keys = |width, ratio| IndexKeys { width, ratio };
+
+        // Five tokens a key do not divide a page of 64, and a key has elements.
+        assert!(bf16().with_index_keys(keys(128, 5)).is_err());
+        assert!(bf16().with_index_keys(keys(128, 0)).is_err());
+        assert!(bf16().with_index_keys(keys(0, 4)).is_err());
+        assert!(bf16().with_index_keys(KEYS)?.with_index_keys(KEYS).is_err());
+
+        let fp8 = || dense(PrefixCacheDtype::Float8E4m3Fn);
+        assert!(fp8().with_index_keys(KEYS)?.with_conversion().is_err());
+        assert!(fp8().with_conversion()?.with_index_keys(KEYS).is_err());
         Ok(())
     }
 

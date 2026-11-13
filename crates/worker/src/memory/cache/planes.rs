@@ -8,6 +8,7 @@
 //! | `prefix_cache.{key,value}.values` | bytes | `[columns, units, plane_bytes]` |
 //! | `prefix_cache.{key,value}.scale` (FP8 only) | F32 | `[columns, units]` |
 //! | `prefix_cache.{key,value}.initialized` | U8 | `[columns, units]` |
+//! | `prefix_cache.index_key.values` (index keys only) | bytes | `[columns, units, index_bytes]` |
 //! | `prefix_cache.state.{run}.values` (state group only) | bytes | `[columns, units, plane_bytes]` |
 //!
 //! The names key the storages at the Storage Server, where a successor epoch and a restarted
@@ -16,12 +17,16 @@
 //! An attention group's page is one unit and each of its layers one column, so a layer's keys
 //! are the contiguous `[units, block_size, kv_heads, head_dim]` of its column and a page id is
 //! a unit id. A draft layer lies over `span` columns, so its pages are the `span · units`
-//! planes of those columns.
+//! planes of those columns. A layer's index keys are its column's cells of the index-key
+//! storage in the same way, `[units, block_size / ratio, width]`, so a page's keys, values and
+//! index keys are addressed by one page id.
 //!
 //! On a device whose cache splits ([`super::segments`]), each value storage is segmented: the
 //! last segments are given back ([`Planes::release_segments`]) and created again at their
 //! addresses ([`Planes::restore_segments`]), and the segments a predecessor epoch writes are
-//! mapped read-only.
+//! mapped read-only. The index keys are not segmented: like the flags, the scales and the
+//! state planes they are one storage that stays mapped, and a successor epoch copies the cells
+//! of the pages it adopts.
 
 use std::sync::Arc;
 
@@ -47,6 +52,9 @@ pub(crate) const FLAGS: [&str; 2] = [
 
 /// The FP8 scale storages' names, keys then values.
 pub(crate) const SCALES: [&str; 2] = ["prefix_cache.key.scale", "prefix_cache.value.scale"];
+
+/// The index-key storage's name.
+pub(crate) const INDEX_KEYS: &str = "prefix_cache.index_key.values";
 
 /// The bit pattern of `1.0f32`, the neutral FP8 scale.
 const UNIT_SCALE: u32 = 0x3F80_0000;
@@ -133,6 +141,8 @@ struct DevicePlanes {
     initialized: [Arc<Storage>; 2],
     /// The per-plane scales of an FP8 cache.
     scales: Option<[Arc<Storage>; 2]>,
+    /// The index-key planes of a cache whose layers keep index keys.
+    index_keys: Option<Arc<Storage>>,
     /// The state group's checkpoint planes, one storage per field run of a state page.
     state: Vec<Arc<Storage>>,
     /// The value planes' segments, when the cache splits into them.
@@ -163,8 +173,8 @@ impl Planes {
 
     /// Takes the planes of `units` units (the padding unit included) on `device` from `owner`,
     /// the value planes in `parts` segments when the cache splits, and resets what was created
-    /// for this rank on `stream`, which is synchronized before returning: values and flags
-    /// zero, scales one.
+    /// for this rank on `stream`, which is synchronized before returning: values, flags and
+    /// index keys zero, scales one.
     ///
     /// Planes a predecessor left keep their contents, which are finite whatever they hold: a
     /// standby's predecessor serves from them, a successor engine reads the pages its
@@ -192,6 +202,7 @@ impl Planes {
         let peers = Storage::peers(device)?;
         let cells = layout.columns as usize * units as usize;
         let plane_bytes = cells * layout.plane_bytes as usize;
+        let index_bytes = cells * layout.index_bytes() as usize;
         let config = |name, bytes| ExclusiveConfig {
             name,
             device,
@@ -200,7 +211,7 @@ impl Planes {
         };
 
         // The exclusive storages, in the order they are taken apart below: the value planes of
-        // a cache that does not split, the flags, the scales, the state runs.
+        // a cache that does not split, the flags, the scales, the index keys, the state runs.
         let state_names: Vec<String> = (0..layout.state_fields())
             .map(|run| format!("prefix_cache.state.{run}.values"))
             .collect();
@@ -211,6 +222,9 @@ impl Planes {
         configs.extend(FLAGS.map(|name| config(name, cells)));
         if layout.quantized {
             configs.extend(SCALES.map(|name| config(name, cells * 4)));
+        }
+        if index_bytes > 0 {
+            configs.push(config(INDEX_KEYS, index_bytes));
         }
         configs.extend(state_names.iter().map(|name| config(name, plane_bytes)));
 
@@ -260,6 +274,14 @@ impl Planes {
         } else {
             (None, false)
         };
+        let (index_keys, index_keys_created) = if index_bytes > 0 {
+            let (storage, created) = taken
+                .next()
+                .ok_or_else(|| Error::Invariant("the index-key storage is missing".into()))?;
+            (Some(storage), created)
+        } else {
+            (None, false)
+        };
 
         let mut state = Vec::with_capacity(state_names.len());
         let mut state_created = false;
@@ -282,6 +304,7 @@ impl Planes {
                 values,
                 initialized,
                 scales,
+                index_keys,
                 state,
                 segments: segmented,
                 runs,
@@ -305,6 +328,12 @@ impl Planes {
                     fill(stream, scales[field].address(), UNIT_SCALE, 4, cells)?;
                 }
             }
+        }
+        if let Some(storage) = &held.index_keys
+            && index_keys_created
+        {
+            // SAFETY: the fill spans exactly the storage, which this value owns.
+            unsafe { fill(stream, storage.address(), 0, 1, index_bytes) }?;
         }
         if state_created {
             for storage in &held.state {
@@ -367,13 +396,16 @@ impl Planes {
             .map_or(0..0, Segments::inherited_units)
     }
 
-    /// The device bytes one unit of both value planes holds over every column.
+    /// The device bytes one unit of both value planes holds over every column: what a segment
+    /// gives back per unit, which the flags, scales, index keys and state planes are no part
+    /// of.
     pub(crate) fn unit_bytes(&self) -> u64 {
         2 * u64::from(self.layout.columns) * self.layout.plane_bytes
     }
 
     /// The bytes the planes map on the device: the value planes' mapped segments, the flags,
-    /// the scales and the state planes. A sleeping rank's segments are not in it.
+    /// the scales, the index keys and the state planes. A sleeping rank's segments are not in
+    /// it.
     pub(crate) fn mapped_bytes(&self) -> u64 {
         let Some(device) = &self.device else {
             return 0;
@@ -396,6 +428,7 @@ impl Planes {
         bytes(&device.values).saturating_sub(released)
             + bytes(&device.initialized)
             + device.scales.as_ref().map_or(0, |scales| bytes(scales))
+            + bytes(device.index_keys.as_slice())
             + bytes(&device.state)
     }
 
@@ -455,9 +488,44 @@ impl Planes {
         Ok(Some(scales))
     }
 
+    /// The index keys of `group`'s layers from cell `cell` on, as `pages` pages of `tokens`
+    /// tokens: `[pages, tokens / ratio, width]` in the group's compute type; `None` for a
+    /// group whose layers keep none.
+    fn index_keys(
+        &self,
+        group: &GroupLayout,
+        cell: u64,
+        pages: usize,
+        tokens: u32,
+    ) -> Result<Option<Tensor>> {
+        let Some(shape) = self.layout.index_shape(group, pages, tokens)? else {
+            return Ok(None);
+        };
+        let dtype = group.compute_dtype;
+
+        let keys = match &self.device {
+            Some(device) => {
+                let storage = device.index_keys.as_ref().ok_or_else(|| {
+                    Error::Invariant(
+                        "a cache that keeps index keys holds no storage of them".into(),
+                    )
+                })?;
+                let offset = cell * self.layout.index_bytes();
+
+                // SAFETY: as in `Self::tensor`: the planes own the storage, and a page's keys
+                // fill one index-key plane, so the window is the storage's cells from `cell`.
+                unsafe { storage.external(offset as usize, &shape, dtype) }?
+            }
+            // SAFETY: a meta tensor has no data and its address is never read.
+            None => unsafe { lend(0, &shape, dtype, None) }?,
+        };
+        Ok(Some(keys))
+    }
+
     /// Layer `layer` of the attention group `group`: its column's keys and values as
-    /// `[units, block_size, kv_heads, head_dim]`, and the flags and scales of the same cells as
-    /// `[units, 1, 1, 1]`. A page id of the group is a unit id.
+    /// `[units, block_size, kv_heads, head_dim]`, the flags and scales of the same cells as
+    /// `[units, 1, 1, 1]`, and the index keys of a group that keeps them as
+    /// `[units, block_size / ratio, width]`. A page id of the group is a unit id.
     pub(crate) fn layer(&self, group: &GroupLayout, layer: usize) -> Result<KvPlanes> {
         if layer >= group.layers.len() {
             return Err(Error::Invalid(format!(
@@ -473,7 +541,7 @@ impl Planes {
     /// Layer `layer` of the draft group `group`, lying over `span` columns: pages of
     /// `block_size / span` tokens, `[span · units, block_size / span, kv_heads, head_dim]`,
     /// page `c · units + u` holding the `c`-th run of the draft page in unit `u`, with the
-    /// flags and scales of the same cells.
+    /// flags, scales and index keys of the same cells.
     pub(crate) fn draft_layer(
         &self,
         group: &GroupLayout,
@@ -531,13 +599,13 @@ impl Planes {
         let scale = |field: usize| self.scales(field, cell, &cells);
 
         Ok(KvPlanes {
-            index_keys: None,
             key: value(0)?,
             value: value(1)?,
             key_initialized: flags(0)?,
             value_initialized: flags(1)?,
             key_scale: scale(0)?,
             value_scale: scale(1)?,
+            index_keys: self.index_keys(group, cell, pages, tokens)?,
         })
     }
 
@@ -614,6 +682,17 @@ impl Planes {
         Ok(scales[field].address() + self.cell(column, unit) * 4)
     }
 
+    /// The address of the index-key plane in `column` of `unit`.
+    pub(crate) fn index_address(&self, column: u32, unit: u32) -> Result<u64> {
+        self.require_unit(unit)?;
+        let storage = self
+            .device()?
+            .index_keys
+            .as_ref()
+            .ok_or_else(|| Error::Invalid("the cache's planes carry no index keys".into()))?;
+        Ok(storage.address() + self.cell(column, unit) * self.layout.index_bytes())
+    }
+
     /// The address of the initialization flag of `field` in `column` of `unit`.
     pub(crate) fn flag_address(&self, field: usize, column: u32, unit: u32) -> Result<u64> {
         self.require_unit(unit)?;
@@ -621,9 +700,10 @@ impl Planes {
     }
 
     /// Resets units `[first, first + count)` of every column with fills issued on `stream`:
-    /// flags zero, scales one, and the values zero when `values`. The values of segmented
-    /// planes fill column by column: a fill's rows may not span a segment given back, which
-    /// the driver refuses although no row touches it.
+    /// flags zero, scales one, and the values zero when `values`. The index keys stay as they
+    /// are: they have no flag, and a unit's next owner reads no key before it stored it. The
+    /// values of segmented planes fill column by column: a fill's rows may not span a segment
+    /// given back, which the driver refuses although no row touches it.
     pub(crate) fn reset_units(
         &self,
         first: u32,
@@ -731,8 +811,9 @@ impl Planes {
         Ok(())
     }
 
-    /// Copies whole units, their flags and FP8 scales included, into newly allocated units on
-    /// `stream`, in stream order. The copies were checked ([`Self::check_copies`]).
+    /// Copies whole units, their flags, FP8 scales and index keys included, into newly
+    /// allocated units on `stream`, in stream order. The copies were checked
+    /// ([`Self::check_copies`]).
     pub(crate) fn copy_units(
         &self,
         copies: &[(ipc::UnitId, ipc::UnitId)],
@@ -761,6 +842,14 @@ impl Planes {
                             4,
                         );
                     }
+                }
+
+                if device.index_keys.is_some() {
+                    batch.push(
+                        self.index_address(column, to.0)?,
+                        self.index_address(column, from.0)?,
+                        self.layout.index_bytes() as usize,
+                    );
                 }
             }
         }
@@ -1167,6 +1256,7 @@ unsafe fn fill(
 #[cfg(test)]
 mod tests {
     use ipc::PrefixCacheDtype;
+    use nn::family::IndexKeys;
 
     use super::*;
 
@@ -1197,6 +1287,7 @@ mod tests {
         assert_eq!(layer.key_initialized.dims(), [8, 1, 1, 1]);
         assert_eq!(layer.value_initialized.dtype(), DType::U8);
         assert!(layer.key_scale.is_none() && layer.value_scale.is_none());
+        assert!(layer.index_keys.is_none());
         assert!(dense.layer(&group, 2).is_err());
 
         let fp8 = planes(PrefixCacheDtype::Float8E4m3Fn);
@@ -1206,6 +1297,53 @@ mod tests {
         assert_eq!(
             (scale.dims(), scale.dtype()),
             (&[8, 1, 1, 1][..], DType::F32)
+        );
+        Ok(())
+    }
+
+    /// A layer of a cache that keeps index keys lends them on its pages: one key of the stated
+    /// width per `ratio` tokens of each unit of its column, in the layers' compute type
+    /// whatever the keys and values are stored in.
+    #[test]
+    fn a_layer_lends_the_index_keys_of_its_pages() -> Result<()> {
+        let keys = IndexKeys { width: 6, ratio: 4 };
+
+        for dtype in [PrefixCacheDtype::BFloat16, PrefixCacheDtype::Float8E4m3Fn] {
+            let layout = CacheLayout::dense(16, 2, 1, 8, dtype).with_index_keys(keys)?;
+            let group = layout.groups[0].clone();
+            let planes = Planes::meta(Arc::new(layout), 8)?;
+
+            let layer = planes.layer(&group, 1)?;
+            let index_keys = layer.index_keys.expect("the layer keeps index keys");
+            assert_eq!(
+                (index_keys.dims(), index_keys.dtype()),
+                (&[8, 4, 6][..], DType::BF16)
+            );
+            assert_eq!(layer.key.dims(), [8, 16, 1, 8]);
+        }
+        Ok(())
+    }
+
+    /// A draft layer's index keys lie over the columns its pages do: one page per cell.
+    #[test]
+    fn a_draft_layer_lends_the_index_keys_of_its_span() -> Result<()> {
+        let keys = IndexKeys { width: 6, ratio: 4 };
+        let layout = CacheLayout::dense(16, 4, 1, 8, PrefixCacheDtype::BFloat16)
+            .with_index_keys(keys)?
+            .with_draft(1, 1, 8)?;
+        let draft = layout.groups[1].clone();
+        let span = layout.draft_span().expect("the layout holds a draft group");
+        assert_eq!(span, 4);
+        let planes = Planes::meta(Arc::new(layout), 8)?;
+
+        let layer = planes.draft_layer(&draft, 0, span)?;
+        assert_eq!(layer.key.dims(), [32, 16, 1, 8]);
+        assert_eq!(
+            layer
+                .index_keys
+                .expect("the drafter keeps index keys")
+                .dims(),
+            [32, 4, 6]
         );
         Ok(())
     }
@@ -1243,6 +1381,7 @@ mod tests {
         assert_eq!(planes.held_segments(), 0);
         assert!(planes.runs().is_empty());
         assert!(planes.plane_address(0, 0, 1).is_err());
+        assert!(planes.index_address(0, 1).is_err());
         assert!(
             planes
                 .release_segments(0, &crate::memory::exclusive::LocalStorage)

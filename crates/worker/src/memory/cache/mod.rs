@@ -5,7 +5,8 @@
 //! module is the rank's side. [`KvCacheMemory`] owns:
 //!
 //! - the **planes** ([`planes`]): the unit pool's exclusive storage at the host's Storage
-//!   Server, with each plane's initialization flag and, for an FP8 cache, its scale;
+//!   Server, with each plane's initialization flag and, for an FP8 cache, its scale, and the
+//!   index keys of a model whose attention reads the tokens an indexer selects;
 //! - the **page tables** ([`tables`]): the scheduler's page assignments per request slot and
 //!   cache group, and one pooled table per attention group that a forward gathers its rows
 //!   from;
@@ -273,8 +274,9 @@ impl KvCacheMemory {
 
     /// The planes of attention group `group`'s layers, in model order: each layer's keys and
     /// values `[units, block_size, kv_heads, head_dim]` in the group's stored type, its flags
-    /// `[units, 1, 1, 1]` U8 and, for an FP8 cache, its scales `[units, 1, 1, 1]` F32. A page
-    /// id of the group is a unit id.
+    /// `[units, 1, 1, 1]` U8, for an FP8 cache its scales `[units, 1, 1, 1]` F32, and for a
+    /// cache that keeps index keys its index keys `[units, block_size / ratio, width]` in the
+    /// group's compute type. A page id of the group is a unit id.
     ///
     /// The tensors are over the cache's memory: they are used only while the cache lives.
     ///
@@ -719,9 +721,9 @@ impl KvCacheMemory {
 
     /// Adopts the predecessor epoch's pages in the units `units` (half-open ranges): the value
     /// planes are the predecessor's segments, mapped whole, so its pages lie at their own
-    /// units, and what is copied is their flags and scales, from the predecessor's storages
-    /// into this rank's, as a task of the host's Transfer Server. Returns the units copied:
-    /// none for a standby, whose storages are the predecessor's.
+    /// units, and what is copied is their flags, scales and index keys, from the predecessor's
+    /// storages into this rank's, as a task of the host's Transfer Server. Returns the units
+    /// copied: none for a standby, whose storages are the predecessor's.
     ///
     /// # Errors
     ///
@@ -735,6 +737,10 @@ impl KvCacheMemory {
         let mut storages: Vec<(&str, u64)> = planes::FLAGS.iter().map(|name| (*name, 1)).collect();
         if self.config.layout.quantized {
             storages.extend(planes::SCALES.iter().map(|name| (*name, 4)));
+        }
+        let index_bytes = self.config.layout.index_bytes();
+        if index_bytes > 0 {
+            storages.push((planes::INDEX_KEYS, index_bytes));
         }
 
         client.copy_predecessor_cells(

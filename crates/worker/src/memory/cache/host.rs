@@ -13,7 +13,8 @@
 //!
 //! 1. keys `[layers, block_size, kv_heads, head_dim]`;
 //! 2. values, in the same shape;
-//! 3. for an FP8 cache, the scales `[2, layers]` as F32.
+//! 3. for an FP8 cache, the scales `[2, layers]` as F32;
+//! 4. for a cache that keeps index keys, the index keys `[layers, block_size / ratio, width]`.
 //!
 //! The state group's page holds its layers' checkpoints in the cache's state planes: every
 //! plane of each field run, in unit then column order, and no key, value or scale.
@@ -51,7 +52,7 @@ fn page_bytes(layout: &CacheLayout, group: &GroupLayout) -> u64 {
     }
 
     let scales = if layout.quantized { 2 * planes * 4 } else { 0 };
-    2 * planes * layout.plane_bytes + scales
+    2 * planes * layout.plane_bytes + scales + planes * layout.index_bytes()
 }
 
 /// The tokens one host page of `group` stands for: an attention or draft page holds its block
@@ -86,7 +87,7 @@ fn stored_name(dtype: DType) -> &'static str {
 }
 
 /// Adds what the logical content of `group`'s pages is to `digest`: the group's window, block
-/// size, layers and heads.
+/// size, layers and heads, and the shape of the index keys its layers keep.
 fn content_of(digest: &mut ::storage::key::Digest, group: &GroupLayout) {
     digest.number(u64::from(group.kind.window().unwrap_or(0)));
     digest.number(u64::from(group.block_size));
@@ -99,6 +100,13 @@ fn content_of(digest: &mut ::storage::key::Digest, group: &GroupLayout) {
     digest.numbers(&layers);
     digest.number(u64::from(group.total_kv_heads));
     digest.number(u64::from(group.head_dim));
+
+    // A group that keeps none adds nothing, so its pages keep the digest they had.
+    if let Some(keys) = group.index_keys {
+        digest.text("index_keys");
+        digest.number(u64::from(keys.width));
+        digest.number(u64::from(keys.ratio));
+    }
 }
 
 /// Adds the shape of a state page to `digest`: the units and field runs its checkpoints fill.
@@ -121,6 +129,12 @@ fn layout_digest(layout: &CacheLayout, group: &GroupLayout) -> [u8; 32] {
     digest.number(u64::from(layout.columns));
     content_of(&mut digest, group);
     digest.text(stored_name(group.dtype));
+
+    // The index keys are stored in the layers' compute type, whatever the planes store; a
+    // group that keeps none adds nothing.
+    if group.index_keys.is_some() {
+        digest.text(stored_name(group.compute_dtype));
+    }
     state_of(&mut digest, layout, group);
     digest.finish()
 }
@@ -333,7 +347,7 @@ impl HostTier {
     }
 
     /// One page's copies between its host page and its units, as `(device, host, bytes)`: every
-    /// field and plane, then every scale.
+    /// field and plane, then every scale, then every index-key plane.
     fn runs(
         &self,
         layout: &CacheLayout,
@@ -403,12 +417,24 @@ impl HostTier {
                 }
             }
         }
+
+        let index_bytes = layout.index_bytes();
+        if index_bytes > 0 {
+            let scales = if layout.quantized { 2 * count * 4 } else { 0 };
+
+            for index in 0..page_planes {
+                let device = planes.index_address(index % columns, unit(index))?;
+                let host = host + 2 * count * plane + scales + u64::from(index) * index_bytes;
+                runs.push((device, host, index_bytes as usize));
+            }
+        }
         Ok(runs)
     }
 
     /// Loads the units of `loads` from their host pages in `stream` order. The units are new
-    /// units of the batch, which the copies overwrite whole (every column of both fields, and
-    /// an FP8 cache's scales); an FP8 cache then raises their initialization flags.
+    /// units of the batch, which the copies overwrite whole (every column of both fields, an
+    /// FP8 cache's scales and the index keys of a cache that keeps them); an FP8 cache then
+    /// raises their initialization flags.
     pub(crate) fn load(
         &self,
         layout: &CacheLayout,
@@ -515,6 +541,23 @@ mod tests {
             token_bytes(&layout(PrefixCacheDtype::BFloat16)),
             2 * 4 * plane / 64
         );
+        Ok(())
+    }
+
+    /// A page of a cache that keeps index keys holds each layer's index-key plane after its
+    /// fields, sixteen keys of 128 BF16 elements for 64 tokens, and is no page of the cache
+    /// that keeps none.
+    #[test]
+    fn a_host_page_holds_the_index_keys_of_every_layer() -> Result<()> {
+        let plain = layout(PrefixCacheDtype::BFloat16);
+        let keyed = plain.clone().with_index_keys(nn::family::IndexKeys {
+            width: 128,
+            ratio: 4,
+        })?;
+
+        let (plain, keyed) = (page_shape(&plain, 0)?, page_shape(&keyed, 0)?);
+        assert_eq!(keyed.page_bytes, plain.page_bytes + 4 * (16 * 128 * 2));
+        assert_ne!(keyed.layout, plain.layout);
         Ok(())
     }
 

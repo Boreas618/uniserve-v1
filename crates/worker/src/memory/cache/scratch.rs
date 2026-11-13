@@ -9,7 +9,8 @@
 //! `pages` pages each gives row `r` the pages `r · pages .. (r + 1) · pages`, so two rows of one
 //! batch never write the same page, and the set's page table, which states the numbering once
 //! in order, reads as `[rows, pages]` at any width. A scratch page is one unit, as an
-//! attention page is, so a layer's scratch planes are its column of the set.
+//! attention page is, so a layer's scratch planes are its column of the set, its index keys
+//! included when the cache keeps them.
 
 use std::sync::Arc;
 
@@ -25,22 +26,23 @@ use crate::{Error, Result};
 /// The smallest extent the device's pools map, which every allocation of a set rounds up to.
 const SCRATCH_GRANULARITY: u64 = 2 << 20;
 
-/// The allocations a set takes beside its page table: both fields' values, flags and scales.
+/// The allocations a set takes beside its page table and its index keys: both fields' values,
+/// flags and scales.
 const ALLOCATIONS: u64 = 6;
 
 /// The bit pattern of `1.0f32`, the neutral FP8 scale.
 const UNIT_SCALE: u32 = 0x3F80_0000;
 
 /// The pages `bytes` of the scratch pool hold of a cache of `layout`: both value planes, the
-/// flags of each field, and the scales of each for an FP8 cache, over every column, and the
-/// page's entry of the set's page table, after the granularity each of the set's allocations
-/// rounds up to.
+/// flags of each field, the scales of each for an FP8 cache and the index keys of a cache that
+/// keeps them, over every column, and the page's entry of the set's page table, after the
+/// granularity each of the set's allocations rounds up to.
 pub fn pages_within(layout: &CacheLayout, bytes: u64) -> u64 {
-    let scales = if layout.quantized { 2 * 4 } else { 0 };
-    let page = u64::from(layout.columns.max(1)) * (2 * layout.plane_bytes + 2 + scales);
+    let page = u64::from(layout.columns.max(1)) * layout.cell_bytes();
+    let allocations = ALLOCATIONS + 1 + u64::from(layout.index_bytes() > 0);
 
     bytes
-        .saturating_sub((ALLOCATIONS + 1) * SCRATCH_GRANULARITY)
+        .saturating_sub(allocations * SCRATCH_GRANULARITY)
         .checked_div(page + 4)
         .unwrap_or(0)
 }
@@ -51,6 +53,8 @@ struct Buffers {
     values: [Buffer; 2],
     initialized: [Buffer; 2],
     scales: Option<[Buffer; 2]>,
+    /// The index-key planes of a cache whose layers keep index keys.
+    index_keys: Option<Buffer>,
     /// `[pages]` U32: the page numbers `0..pages` in order.
     table: Buffer,
 }
@@ -81,9 +85,10 @@ impl ScratchPages {
     }
 
     /// A set of `pages` pages taken from the scratch pool of `allocator`: both value planes,
-    /// the flags of each field and the scales of each for an FP8 cache, over every column, and
-    /// the page table. The flags are zeroed, the scales set to one and the table written on
-    /// `stream`, which is synchronized before returning.
+    /// the flags of each field, the scales of each for an FP8 cache and the index keys of a
+    /// cache that keeps them, over every column, and the page table. The flags and index keys
+    /// are zeroed, the scales set to one and the table written on `stream`, which is
+    /// synchronized before returning.
     ///
     /// # Errors
     ///
@@ -97,12 +102,18 @@ impl ScratchPages {
         let mut set = Self::meta(layout, pages)?;
         let cells = pages as usize * set.layout.columns as usize;
         let plane_bytes = cells * set.layout.plane_bytes as usize;
+        let index_bytes = cells * set.layout.index_bytes() as usize;
 
         let mut take = |bytes: usize| allocator.allocate(PoolKind::Scratch, bytes);
         let values = [take(plane_bytes)?, take(plane_bytes)?];
         let initialized = [take(cells)?, take(cells)?];
         let scales = if set.layout.quantized {
             Some([take(cells * 4)?, take(cells * 4)?])
+        } else {
+            None
+        };
+        let index_keys = if index_bytes > 0 {
+            Some(take(index_bytes)?)
         } else {
             None
         };
@@ -125,6 +136,12 @@ impl ScratchPages {
             for scales in scales.iter().flatten() {
                 memset_d32(scales.address(), UNIT_SCALE, cells, stream)?;
             }
+
+            // The index keys have no flag: zeroed once, they hold finite keys whatever a
+            // forward reads of them.
+            if let Some(index_keys) = &index_keys {
+                memset_d8(index_keys.address(), 0, index_bytes, stream)?;
+            }
             write.submit(stream)?;
         }
         stream.synchronize()?;
@@ -134,6 +151,7 @@ impl ScratchPages {
             values,
             initialized,
             scales,
+            index_keys,
             table,
         });
         Ok(set)
@@ -242,14 +260,46 @@ impl ScratchPages {
             Ok(Some(scales))
         };
 
+        // The layer's index keys are the same cells of the index-key buffer.
+        let index_keys = || -> Result<Option<Tensor>> {
+            let Some(shape) = self.layout.index_shape(group, pages, group.block_size)? else {
+                return Ok(None);
+            };
+            let keys = match &self.device {
+                Some(buffers) => {
+                    let index_keys = buffers.index_keys.as_ref().ok_or_else(|| {
+                        Error::Invariant(
+                            "a scratch set of a cache that keeps index keys holds no buffer of \
+                             them"
+                                .into(),
+                        )
+                    })?;
+
+                    // SAFETY: as in `Self::tensor`; a page's keys fill one index-key plane, so
+                    // the window is the buffer's cells from `cell`.
+                    unsafe {
+                        lend(
+                            index_keys.address() + cell * self.layout.index_bytes(),
+                            &shape,
+                            group.compute_dtype,
+                            Some(buffers.device),
+                        )
+                    }?
+                }
+                // SAFETY: a meta tensor has no data and its address is never read.
+                None => unsafe { lend(0, &shape, group.compute_dtype, None) }?,
+            };
+            Ok(Some(keys))
+        };
+
         Ok(KvPlanes {
-            index_keys: None,
             key: value(0)?,
             value: value(1)?,
             key_initialized: flags(0)?,
             value_initialized: flags(1)?,
             key_scale: scale(0)?,
             value_scale: scale(1)?,
+            index_keys: index_keys()?,
         })
     }
 
@@ -281,8 +331,8 @@ impl ScratchPages {
     /// Copies what the rows of a batch have cached in attention group `group` into their
     /// scratch pages on `stream`: for row `r`, each page of `pages[r]` (the units of the row's
     /// logical pages from page zero, unit 0 where it holds none) into scratch page
-    /// `r · width + page`, every layer's keys, values, flags and scales. The shadow forward
-    /// then reads the row's whole history in the set and writes over the copy.
+    /// `r · width + page`, every layer's keys, values, flags, scales and index keys. The
+    /// shadow forward then reads the row's whole history in the set and writes over the copy.
     pub(crate) fn copy_history(
         &self,
         planes: &Planes,
@@ -308,6 +358,7 @@ impl ScratchPages {
         }
 
         let plane_bytes = self.layout.plane_bytes;
+        let index_bytes = self.layout.index_bytes();
         let mut batch = CopyBatch::new(SourceOrder::Stream);
 
         for (row, units) in pages.iter().enumerate() {
@@ -339,6 +390,14 @@ impl ScratchPages {
                             );
                         }
                     }
+
+                    if let Some(index_keys) = &buffers.index_keys {
+                        batch.push(
+                            index_keys.address() + cell * index_bytes,
+                            planes.index_address(layer, *unit)?,
+                            index_bytes as usize,
+                        );
+                    }
                 }
             }
         }
@@ -354,6 +413,7 @@ impl ScratchPages {
 #[cfg(test)]
 mod tests {
     use ipc::PrefixCacheDtype;
+    use nn::family::IndexKeys;
 
     use super::*;
 
@@ -371,6 +431,20 @@ mod tests {
             (bytes - reserved) / (page + 4)
         );
         assert_eq!(pages_within(&layout, reserved), 0);
+
+        // Index keys of 128 elements per four tokens add sixteen BF16 keys to every cell, and
+        // one allocation to the set.
+        let keyed = layout
+            .with_index_keys(IndexKeys {
+                width: 128,
+                ratio: 4,
+            })
+            .expect("index keys a page holds");
+        let page = 48 * (2 * 65_536 + 2 + 16 * 128 * 2);
+        let reserved = 8 * SCRATCH_GRANULARITY;
+
+        assert_eq!(pages_within(&keyed, bytes), (bytes - reserved) / (page + 4));
+        assert_eq!(pages_within(&keyed, reserved), 0);
     }
 
     /// A set's planes have the cache's page shape over the set's pages, and its table reads at
@@ -392,6 +466,7 @@ mod tests {
         assert_eq!(layer.key.dtype(), DType::F8E4M3);
         assert_eq!(layer.value_initialized.dims(), [12, 1, 1, 1]);
         assert!(layer.key_scale.is_some());
+        assert!(layer.index_keys.is_none());
         assert!(set.layer(&layout.groups[0], 2).is_err());
 
         let table = set.table(3, 4)?;
@@ -399,6 +474,25 @@ mod tests {
         // Four rows of four pages are more than the set's twelve.
         assert!(set.table(4, 4).is_err());
         assert!(ScratchPages::meta(layout, 0).is_err());
+        Ok(())
+    }
+
+    /// A set of a cache that keeps index keys lends them over its own pages, in the shape the
+    /// cache's planes lend them.
+    #[test]
+    fn a_set_lends_the_index_keys_of_its_pages() -> Result<()> {
+        let keys = IndexKeys { width: 6, ratio: 4 };
+        let layout = Arc::new(
+            CacheLayout::dense(16, 2, 1, 8, PrefixCacheDtype::BFloat16).with_index_keys(keys)?,
+        );
+        let set = ScratchPages::meta(Arc::clone(&layout), 12)?;
+
+        let layer = set.layer(&layout.groups[0], 1)?;
+        let index_keys = layer.index_keys.expect("the layer keeps index keys");
+        assert_eq!(
+            (index_keys.dims(), index_keys.dtype()),
+            (&[12, 4, 6][..], DType::BF16)
+        );
         Ok(())
     }
 }
