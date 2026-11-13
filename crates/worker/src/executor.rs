@@ -308,8 +308,8 @@ impl std::fmt::Display for Job {
     }
 }
 
-/// The rank a batch runs on alone, when its media rows name one: a video decode round or its
-/// encode. `None` for a batch every rank of the group runs.
+/// The rank a batch runs on alone, when its media rows name one. `None` for a batch every rank of
+/// the group runs, a video decode round and its encode among them.
 ///
 /// # Errors
 ///

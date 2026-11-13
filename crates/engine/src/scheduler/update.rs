@@ -106,7 +106,8 @@ impl Scheduler {
                 .copied()
                 .unwrap_or(0);
             let valid = media_valid(request, batch.phase, before, &call, &self.groups);
-            request.complete(batch.phase, call_index(request, &batch, row));
+            let index = call_index(request, &batch, row, &self.groups);
+            request.complete(batch.phase, index);
             if let Some(group) = group {
                 self.groups[group].vacate(batch.phase, request);
             }
@@ -209,9 +210,10 @@ impl Scheduler {
     }
 
     /// A media call's output. A token request's image encoding holds the encoder output it
-    /// computed, which is committed under its key (SD §4.3). A video request reports its
-    /// progress after every applied call, and its final muxing call sends the artifact, then the
-    /// request's end (SD §7.3 "Progress and artifact").
+    /// computed, which is committed under its key (SD §4.3), and so does a video request's text
+    /// encoding, whose output is its conditioning. A video request reports its progress after
+    /// every applied call, and its final muxing call sends the artifact, then the request's end
+    /// (SD §7.3 "Progress and artifact").
     fn update_media(&mut self, id: RequestId, batch: &Batch, row: usize, call: CallOutput) {
         let Some(request) = self.requests.get(&id) else {
             return;
@@ -226,7 +228,13 @@ impl Scheduler {
             }
             return;
         }
+        if batch.phase == Phase::TextEncode {
+            self.commit_encoding(id, batch, row);
+        }
 
+        let Some(request) = self.requests.get(&id) else {
+            return;
+        };
         let progress = request.progress(batch.phase, &self.groups);
         let last = batch.phase == Phase::Mux
             && request.completed[Phase::Mux.index()] == request.needed(Phase::Mux, &self.groups);
@@ -1423,11 +1431,14 @@ fn skip_held_encodings(request: &mut Request) {
 }
 
 /// The index of call `row` of `batch` among its request's calls of the batch's phase: a video
-/// decode or encode round and a denoising step state their own (`MediaRow::unit`, `step`); every
-/// other call returns in the order it was scheduled, after the ones counted.
-fn call_index(request: &Request, batch: &Batch, row: usize) -> u32 {
+/// decode or encode round and a denoising step state their own (the round's first unit
+/// `MediaRow::unit`, `step`); every other call returns in the order it was scheduled, after the
+/// ones counted.
+fn call_index(request: &Request, batch: &Batch, row: usize, groups: &[WorkerGroup]) -> u32 {
     match (batch.phase, batch.media.get(row)) {
-        (Phase::VideoDecode | Phase::VideoEncode, Some(media)) => media.unit,
+        (Phase::VideoDecode | Phase::VideoEncode, Some(media)) => {
+            request.round_of(media.unit, groups)
+        }
         (Phase::Denoise, Some(media)) => media.step,
         (phase, _) => request.completed.get(phase.index()).copied().unwrap_or(0),
     }

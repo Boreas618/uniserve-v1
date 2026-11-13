@@ -20,7 +20,9 @@
 //!   ([`checkpoints`]). The checkpoint ending at boundary `b` lies at `b / block - 1` (`rows.rs`),
 //!   and one is asked for at a time, beyond the table's end.
 //! - **The encoder-output table** holds encoder input `i`'s output at position `i`; a product
-//!   table holds declared result `i` at position `i` of its kind's class.
+//!   table holds declared result `i` at position `i` of its kind's class. A video request's
+//!   conditioning is its one encoder output (entry 0 of `Request::encodings`), held at its
+//!   declared result's position: pinned there where cached, allocated otherwise.
 //!
 //! # Admission rounds
 //!
@@ -42,7 +44,7 @@ use std::time::{Duration, Instant};
 
 use ipc::CacheGroupKind;
 use ipc::batch::{Batch, Phase};
-use ipc::product::VISION_FEATURES;
+use ipc::product::{CONDITIONING, VISION_FEATURES};
 use proto::config::KvCacheConfig;
 use proto::request::{ImageEncoder, RequestId};
 use storage::Key;
@@ -56,6 +58,12 @@ use super::{Blocks, Request, RequestStatus, Scheduler, monotonic_nanos, span};
 
 /// The name of an image model's latent encoder output (SD §7.4).
 const LATENT_FEATURES: &str = "latent_features";
+
+/// The identity of what computes an encoder output (the weights' values and the identities of
+/// the encoder's modules), which its key covers (SD §4.3). No worker group states one yet, so
+/// every output is keyed with this empty identity; a weight update's `Flush` evicts the outputs
+/// the previous weights computed.
+const ENCODER_IDENTITY: &str = "";
 
 /// The pages of the largest block size between the aligned boundaries before which a sliding
 /// window is stored to the host, when the deployment states none (SD §4.4).
@@ -392,16 +400,26 @@ impl Scheduler {
         Some(page_key(&parent, u32::try_from(class).ok()?, 0, tokens))
     }
 
-    /// The key of each encoder output of a token request, in context order, with no position
-    /// held yet (SD §4.3): `encoder_output(name, identity, inputs)` over the image's digest and,
-    /// for an encoder that samples its posterior, the input's draw among the request's latent
-    /// encodings under a seed of 0 (`S/encodings.rs:35-72`). The groups state no encoder identity
-    /// yet: every output is keyed with an empty one and no draw.
+    /// The key of each encoder output of a request, with no position held yet (SD §4.3),
+    /// `encoder_output(name, identity, inputs)`. A token request's outputs are its images', in
+    /// context order, each over the image's digest and, for an encoder that samples its
+    /// posterior, the input's draw among the request's latent encodings under a seed of 0
+    /// (`S/encodings.rs:35-72`); no group states an encoder that samples yet, so none has a draw.
+    /// A video request's one output is its conditioning, over the digest of what its text encoder
+    /// reads (`EncoderInputs::text`: its prompt and the conditions its vision blocks present,
+    /// which the daemon computes from the request's facts); a request that names no digests has
+    /// none, and its conditioning is neither found nor stored (`S/encoder_outputs.rs:14-21`).
     pub(super) fn encodings_of(&self, request: &Request) -> Vec<(Key, Option<u32>)> {
-        let Some(input) = request.generation() else {
-            return Vec::new();
+        let input = match &request.input {
+            proto::request::Request::Generation(input) => input,
+            proto::request::Request::Diffusion(video) => {
+                let text = video.encoder_inputs.as_ref().map(|inputs| inputs.text);
+                let key =
+                    |text: [u8; 32]| Key(encoder_output(CONDITIONING, ENCODER_IDENTITY, &text));
+                return text.into_iter().map(|text| (key(text), None)).collect();
+            }
         };
-        let (identity, samples) = ("", false);
+        let samples = false;
         let mut draws = 0u64;
         let mut keys = Vec::new();
         for image in &input.multimodal_inputs.images {
@@ -420,7 +438,8 @@ impl Scheduler {
                     digest.number(0);
                 }
                 draws += u64::from(encoder.encoder == ImageEncoder::Latent);
-                keys.push((Key(encoder_output(name, identity, &digest.finish())), None));
+                let inputs = digest.finish();
+                keys.push((Key(encoder_output(name, ENCODER_IDENTITY, &inputs)), None));
             }
         }
         keys
@@ -452,6 +471,24 @@ impl Scheduler {
             .and_then(|region| self.regions.get(usize::from(region)))
             .map_or(1, |(_, stated)| stated.unit_bytes.max(1));
         u32::try_from(bytes.div_ceil(unit).max(1)).unwrap_or(u32::MAX)
+    }
+
+    /// Which of a request's encoder outputs position `at` of `class` holds, as an index into
+    /// `Request::encodings`, and its rows (SD §4.2, §4.3): for a token request, encoder input
+    /// `at`'s output in the encoder-output class, of its block's rows; for a video request, its
+    /// conditioning at its position in the conditioning's product class, of its prompt's rows.
+    /// `None` for any other block.
+    fn encoding_at(&self, request: &Request, class: u8, at: u32) -> Option<(usize, u32)> {
+        if let Some(video) = request.video() {
+            let conditioning = Some(class) == self.conditioning_class()
+                && Some(at) == request.conditioning_position();
+            return conditioning.then(|| (0, count(video.prompt_token_ids.len())));
+        }
+        if Some(class) != self.encoder_class(request) {
+            return None;
+        }
+        let rows = request.image_spans().nth(at as usize);
+        Some((at as usize, rows.map_or(0, |(_, rows, ..)| rows)))
     }
 }
 
@@ -1052,11 +1089,19 @@ impl Scheduler {
 
         if request.is_video() {
             let results = self.declared_results(request).unwrap_or_default();
+            // The conditioning is the request's encoder output, held where `cache` holds it.
+            let conditioning = request.conditioning_position();
+            let key = request.encodings.first().map(|&(key, _)| key);
             for (at, (phase, class, units)) in (0u32..).zip(results) {
-                let Some(owner) = request.owner_on(phase) else {
+                let (Some(owner), Some(group)) =
+                    (request.owner_on(phase), request.placement[phase.index()])
+                else {
                     continue;
                 };
-                asks.push(allocate(owner, class, at, 1, units));
+                asks.push(match key.filter(|_| Some(at) == conditioning) {
+                    Some(key) => self.encoder_ask(owner, class, at, key, Some(group), units),
+                    None => allocate(owner, class, at, 1, units),
+                });
                 if let Some(table) = blocks.get_mut(usize::from(class)) {
                     ask(table, at, 1);
                 }
@@ -1189,33 +1234,46 @@ impl Scheduler {
             else {
                 continue;
             };
-            let tiers = if reads {
-                self.expected_hit(&[*key], group)[0]
-            } else {
-                0
-            };
-            let keys = vec![*key];
-            asks.push(if tiers & DEVICE != 0 {
-                runtime::Request::Pin {
-                    owner,
-                    class,
-                    at,
-                    keys,
-                }
-            } else if tiers & HOST != 0 {
-                runtime::Request::Load {
-                    owner,
-                    class,
-                    at,
-                    keys,
-                }
-            } else {
-                let units = self.encoding_units(group, class, rows);
-                allocate(owner, class, at, 1, units)
-            });
+            let units = self.encoding_units(group, class, rows);
+            let read = reads.then_some(group);
+            asks.push(self.encoder_ask(owner, class, at, *key, read, units));
             if let Some(table) = blocks.get_mut(usize::from(class)) {
                 ask(table, at, 1);
             }
+        }
+    }
+
+    /// The request that gives `owner` the encoder output of `key` at position `at` of `class`
+    /// (SD §4.3, §4.4): with `read`, the owner's group whose copies `cache` is read for, a `Pin`
+    /// when it holds the output on the device there and a `Load` when on the host alone;
+    /// otherwise an `Allocate` of one block of `units`, which the output's encode fills.
+    fn encoder_ask(
+        &self,
+        owner: OwnerId,
+        class: u8,
+        at: u32,
+        key: Key,
+        read: Option<GroupId>,
+        units: u32,
+    ) -> runtime::Request {
+        let tiers = read.map_or(0, |group| self.expected_hit(&[key], group)[0]);
+        let keys = vec![key];
+        if tiers & DEVICE != 0 {
+            runtime::Request::Pin {
+                owner,
+                class,
+                at,
+                keys,
+            }
+        } else if tiers & HOST != 0 {
+            runtime::Request::Load {
+                owner,
+                class,
+                at,
+                keys,
+            }
+        } else {
+            allocate(owner, class, at, 1, units)
         }
     }
 
@@ -1317,6 +1375,8 @@ impl Scheduler {
                 self.raise_end(id, class, positions.end);
                 return follow;
             }
+            // A copy holds nothing yet: the answer to its `Finish` is its result.
+            (_, Completion::Copy { .. }) => return follow,
             (_, Completion::Pinned { runs, .. }) => {
                 let regions = self
                     .group(group)
@@ -1334,17 +1394,20 @@ impl Scheduler {
         };
         let held = count(held);
 
-        // An encoder output is one block at its input's position.
-        if Some(class) == self.encoder_class(request) {
-            let rows = request
-                .image_spans()
-                .nth(at as usize)
-                .map_or(0, |(_, rows, ..)| rows);
+        // An encoder output is one block at its position. One the answer did not hold is
+        // allocated, of its declared result's size for a video request's conditioning and of its
+        // rows of features for a chat image's.
+        if let Some((index, rows)) = self.encoding_at(request, class, at) {
             if held == 0 {
-                let units = self.encoding_units(group, class, rows);
+                let units = if request.is_video() {
+                    let results = self.declared_results(request).unwrap_or_default();
+                    results.get(at as usize).map_or(1, |&(_, _, units)| units)
+                } else {
+                    self.encoding_units(group, class, rows)
+                };
                 follow.push(allocate(owner, class, at, 1, units));
             } else if let Some(request) = self.requests.get_mut(&id) {
-                if let Some(entry) = request.encodings.get_mut(at as usize) {
+                if let Some(entry) = request.encodings.get_mut(index) {
                     entry.1 = Some(at);
                 }
                 self.raise_end(id, class, at.saturating_add(1));
@@ -1839,29 +1902,39 @@ impl Scheduler {
         }
     }
 
-    /// Commits the encoder output a chat request's encoding in `batch`'s row `row` computed, when
-    /// the request writes cached outputs (SD §3.7, §4.3), under its key with its rows as tokens;
-    /// either way the request holds it at its position from now on.
+    /// Commits the encoder output the call in `batch`'s row `row` computed, when the request
+    /// writes cached outputs (SD §3.7, §4.3), under its key with its rows as tokens; either way
+    /// the request holds it at its position from now on. The output is the one result the row
+    /// writes after those it reads: a chat image's encoding writes its encoder input's output,
+    /// and a video request's text encoding its conditioning, which a video request that names no
+    /// digests has no key for and keeps private.
     pub(super) fn commit_encoding(&mut self, id: RequestId, batch: &Batch, row: usize) {
         let Some(request) = self.requests.get(&id) else {
             return;
         };
-        let Some(&at) = batch.media.get(row).and_then(|media| media.results.first()) else {
+        let written = batch
+            .media
+            .get(row)
+            .and_then(|media| media.results.get(media.reads as usize));
+        let (Some(&at), Some(owner)) = (written, request.owner_on(batch.phase)) else {
             return;
         };
-        let (Some(class), Some(owner)) =
-            (self.encoder_class(request), request.owner_on(batch.phase))
-        else {
+        let class = if request.is_video() {
+            self.conditioning_class()
+        } else {
+            self.encoder_class(request)
+        };
+        let Some(class) = class else {
             return;
         };
-        let Some(&(key, _)) = request.encodings.get(at as usize) else {
+        let Some((index, rows)) = self.encoding_at(request, class, at) else {
             return;
         };
-        let rows = request
-            .image_spans()
-            .nth(at as usize)
-            .map_or(0, |(_, rows, _, _)| rows);
-        let writes = request.generation().is_some_and(|input| input.cache.write);
+        let Some(&(key, _)) = request.encodings.get(index) else {
+            return;
+        };
+        // A video request names the digests that key its conditioning to have it found and kept.
+        let writes = request.generation().is_none_or(|input| input.cache.write);
         if writes {
             let tokens = u16::try_from(rows).unwrap_or(u16::MAX);
             self.submit(commit(owner, class, at, key, tokens));
@@ -1876,7 +1949,7 @@ impl Scheduler {
             if !writes {
                 request.unpinned.push(key);
             }
-            if let Some(entry) = request.encodings.get_mut(at as usize) {
+            if let Some(entry) = request.encodings.get_mut(index) {
                 entry.1 = Some(at);
             }
         }

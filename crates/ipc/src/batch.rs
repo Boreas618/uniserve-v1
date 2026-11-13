@@ -454,10 +454,11 @@ pub enum Variant {
     /// One request's condition media read on the host: its bytes decoded and laid out as the
     /// model's encoders read them, in storage a later call of the request reads.
     MediaRead,
-    /// A condition encoder's own call, whose work a later call computes: the vision tower runs
-    /// inside the text encoding that splices its rows, and the latent encoders inside the
-    /// denoiser's first step, whose conditioner writes their rows. So this call computes nothing:
-    /// it is the scheduler's step between the media read and the call that consumes it.
+    /// An encoder's call over an image: a chat request's image encoded by its vision or latent
+    /// encoder ([`Phase::VisionEncode`], [`Phase::LatentEncode`]) into the encoder output its
+    /// prefill reads. A video request has no such call: its text encoding runs the vision tower
+    /// over its conditions' vision blocks, under this key and eagerly, and its latent preparation
+    /// encodes its condition latents.
     ConditionEncode,
     /// A rank's part in an expert step it has no tokens for: every expert layer, and nothing else.
     ExpertJoin,
@@ -817,12 +818,13 @@ pub struct MediaRow {
     /// The encoded rounds this call hands over, which only a muxing call states: the final muxing
     /// call hands none, and that is what makes it the one that finishes the artifact.
     pub rounds: u32,
-    /// The first timeline unit a unit-measured call covers: the clip a video decode is. Zero for
-    /// every other call.
+    /// The first timeline unit a unit-measured call covers: the first clip of the round a video
+    /// decode or its encode is. Zero for every other call.
     pub unit: u32,
-    /// The rank of the batch's worker group that runs this row when one rank runs it alone: a
-    /// video decode round, which the group's ranks take in turn, and the encode of the unit that
-    /// rank decoded. `None` when every rank of the group runs it.
+    /// The rank of the batch's worker group that runs this row when the call is that one rank's
+    /// alone. `None` when every rank of the group runs its share: a video decode round, whose
+    /// units are dealt in order to the ranks of the decoder group, each decoding its own, and the
+    /// encode of a round, which reads its units wherever they lie in the process.
     pub rank: Option<u32>,
     /// A chat image's encoded bytes, base64, for the vision or latent encoding of a token
     /// request's image; `None` for every other row.

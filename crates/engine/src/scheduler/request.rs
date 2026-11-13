@@ -113,7 +113,8 @@ pub struct Request {
     /// Images whose encoding is placed.
     pub num_encoded_inputs: u32,
     /// The key of each encoder output, and the position the scheduler named for it in the
-    /// request's encoder-output table, once held.
+    /// request's encoder-output table, once held. A video request's one encoder output is its
+    /// conditioning, held at its position in the request's product table.
     pub encodings: Vec<(Key, Option<u32>)>,
     /// The keys of blocks the request holds that `Cached::pins` does not count it among the
     /// holders of: a block answered `Duplicate`, which stays private to it (BP §9, R4), and an

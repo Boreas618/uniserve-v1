@@ -495,17 +495,9 @@ impl Scheduler {
             .map_or(0, |group| group.capacity.denoise_steps);
         let (named, read) = request.results(phase, index, &self.groups);
 
-        // A decode round runs on one rank of the decoder group, the ranks taking the rounds in
-        // turn, and the encode of a round on the rank that decoded it.
-        let rank = match phase {
-            Phase::VideoDecode | Phase::VideoEncode => request.placement
-                [Phase::VideoDecode.index()]
-            .and_then(|group| self.group(group))
-            .and_then(|group| u32::try_from(group.config.ranks.len()).ok())
-            .filter(|ranks| *ranks > 0)
-            .map(|ranks| index % ranks),
-            _ => None,
-        };
+        // A video call's row names no rank: every rank of the decoder group decodes the units of
+        // a round dealt to it, and the encode of a round reads its units wherever they lie in the
+        // process (SD §3.3).
         let unit = request.round_units(phase, index, &self.groups).start;
 
         // A muxing call hands over the encode round it follows; the last hands none.
@@ -524,7 +516,7 @@ impl Scheduler {
             frames: input.sampling.num_frames,
             rounds: mux_rounds,
             unit,
-            rank,
+            rank: None,
             image: None,
             results: named,
             reads: read,
@@ -945,6 +937,7 @@ mod tests {
         StateCopy, StateDirection, Variant, VisionRows,
     };
     use ipc::philox::{DrawAddress, request_sampling_key};
+    use proto::config::{BlockConfig, BlockDistribution, VIDEO_DECODER_BLOCK};
     use proto::module::commit::{self, COMMIT_FIELDS};
     use proto::request::{
         ConditionExtent, DiffusionRequest, DiffusionSamplingParams, GenerationRequest,
@@ -1863,12 +1856,23 @@ mod tests {
     }
 
     /// A video request's media rows name the results their call reads, then those it writes, by
-    /// their positions in its product table, in the order its admission declared them.
+    /// their positions in its product table, in the order its admission declared them (SD §2.3,
+    /// §3.3): the condition media, the vision pixels, the conditioning, both latents, the video
+    /// units, one splice tail per unit, the encoded units and the audio samples. No row names a
+    /// rank: a decode round covers a unit for each rank of the decoder group.
     #[test]
     fn a_video_requests_media_rows_name_what_they_read_then_write() {
         let mut scheduler = scheduler(&[]);
         let rank = scheduler.groups[0].config.ranks[0].clone();
         scheduler.groups[0].config.ranks.push(rank);
+        let decoder = BlockConfig {
+            distribution: Some(BlockDistribution::TemporalUnits),
+            ..BlockConfig::parallel(vec![0, 1])
+        };
+        scheduler.groups[0]
+            .config
+            .blocks
+            .insert(VIDEO_DECODER_BLOCK.to_owned(), decoder);
         scheduler.requests.insert(RequestId(1), video(1));
 
         // The row of the call `scheduled` counts of `phase`, with the calls `completed` counts.
@@ -1885,17 +1889,16 @@ mod tests {
             named(&media(&mut scheduler, Phase::MediaRead, 0)),
             (vec![0, 1, 2], 0)
         );
-        let visual = media(&mut scheduler, Phase::LatentEncode, 1);
-        assert_eq!((named(&visual), visual.unit), ((vec![0, 5], 1), 1));
-        let audio = media(&mut scheduler, Phase::LatentEncode, 2);
-        assert_eq!((named(&audio), audio.unit), ((vec![1, 6], 1), 0));
+        // The text encoding computes the vision features from the patches it reads; the latent
+        // preparation encodes the condition latents from the media it reads, after the
+        // conditioning.
         assert_eq!(
             named(&media(&mut scheduler, Phase::TextEncode, 0)),
-            (vec![3, 4], 1)
+            (vec![2, 3], 1)
         );
         assert_eq!(
             named(&media(&mut scheduler, Phase::LatentPrepare, 0)),
-            (vec![4, 5, 6], 3)
+            (vec![3, 0, 1], 3)
         );
 
         // The last of the four denoising steps writes the final latents.
@@ -1905,39 +1908,39 @@ mod tests {
             (0, 4, (Vec::new(), 0))
         );
         let last = media(&mut scheduler, Phase::Denoise, 3);
-        assert_eq!((last.step, named(&last)), (3, (vec![7, 8], 0)));
+        assert_eq!((last.step, named(&last)), (3, (vec![4, 5], 0)));
 
-        // A decode round after the first reads the tail of the one before it, and the decoder's
-        // two ranks take the rounds in turn.
+        // The decoder's two ranks take one unit each of a round: the first round decodes units 0
+        // and 1 and writes both tails; the second decodes unit 2 after reading unit 1's tail.
         let first = media(&mut scheduler, Phase::VideoDecode, 0);
         assert_eq!(
             (named(&first), first.unit, first.rank),
-            ((vec![7, 9, 10], 1), 0, Some(0))
+            ((vec![4, 6, 7, 8], 1), 0, None)
         );
         let second = media(&mut scheduler, Phase::VideoDecode, 1);
         assert_eq!(
             (named(&second), second.unit, second.rank),
-            ((vec![7, 10, 9, 11], 2), 1, Some(1))
+            ((vec![4, 8, 6, 9], 2), 2, None)
         );
         let encode = media(&mut scheduler, Phase::VideoEncode, 1);
         assert_eq!(
             (named(&encode), encode.unit, encode.rank),
-            ((vec![9, 13], 1), 1, Some(1))
+            ((vec![6, 10], 1), 2, None)
         );
         assert_eq!(
             named(&media(&mut scheduler, Phase::AudioDecode, 0)),
-            (vec![8, 14], 1)
+            (vec![5, 11], 1)
         );
         assert_eq!(
             named(&media(&mut scheduler, Phase::AudioEncode, 0)),
-            (vec![14], 1)
+            (vec![11], 1)
         );
 
         // A muxing call hands over the encode round it follows; the last hands none.
         scheduler.requests.get_mut(&RequestId(1)).unwrap().completed[Phase::VideoEncode.index()] =
-            3;
-        assert_eq!(media(&mut scheduler, Phase::Mux, 2).rounds, 1);
-        assert_eq!(media(&mut scheduler, Phase::Mux, 3).rounds, 0);
+            2;
+        assert_eq!(media(&mut scheduler, Phase::Mux, 1).rounds, 1);
+        assert_eq!(media(&mut scheduler, Phase::Mux, 2).rounds, 0);
 
         // A text encoding reads its prompt as one row of token columns.
         let mut text = batch(Phase::TextEncode);

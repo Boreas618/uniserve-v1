@@ -4,20 +4,29 @@
 //! preempted.
 //!
 //! A video request runs a fixed chain of media phases, vllm-omni's step scheduler with the stages
-//! around it: a conditioned request reads its condition media (`MediaRead`), encodes its vision
-//! blocks (`VisionEncode`) and its condition units and audio (`LatentEncode`); every request
-//! encodes its prompt (`TextEncode`), prepares its latents (`LatentPrepare`), denoises them one
-//! step per call (`Denoise`), decodes the video in rounds of media units and the audio once
-//! (`VideoDecode`, `AudioDecode`), encodes each decoded round and the audio track (`VideoEncode`,
-//! `AudioEncode`) and muxes the encoded rounds into the artifact (`Mux`). No graph object holds
-//! this: the calls of a phase are [`Request::video_needed`], whether one more may be given now is
-//! [`Request::video_ready`], and both read only the request's counters and its groups.
+//! around it: a conditioned request reads its condition media (`MediaRead`); every request
+//! encodes its prompt (`TextEncode`), whose text encoder computes the vision features of the
+//! conditions' vision blocks inside the call, prepares its latents (`LatentPrepare`), which
+//! encodes the condition latents inside the call (the model's `nn::Encoder::encode` and
+//! `nn::Denoiser::prepare_latents`), denoises them one step per call (`Denoise`), decodes the
+//! video in rounds of media units, every rank of the decoder group decoding its share of a round,
+//! and the audio once (`VideoDecode`, `AudioDecode`), encodes each decoded round and the audio
+//! track (`VideoEncode`, `AudioEncode`) and muxes the encoded rounds into the artifact (`Mux`). No
+//! graph object holds this: the calls of a phase are [`Request::video_needed`], whether one more
+//! may be given now is [`Request::video_ready`], and both read only the request's counters and
+//! its groups.
 //!
 //! Every product is a block of the buffer pool: one per declared result, allocated at admission
 //! for the owner on the group whose phase writes it, in the class of its product kind
 //! ([`PRODUCTS`]). A request's declared results list each kind's results together, in kind order,
 //! and a result's position in the request's product table is its index in that list; a media row
 //! names the results its call reads and writes by these positions ([`Request::results`]).
+//!
+//! The conditioning is the request's encoder output (SD §3.3, §4.3): keyed by what its text
+//! encoder reads (its prompt and the conditions its vision blocks present) and the encoder's
+//! identity, pinned at admission where cached instead of allocated, and committed once encoded.
+//! A request whose admission found it makes no text encoding, and its latent preparation reads
+//! the pinned block at the same position.
 
 use std::iter;
 use std::ops::Range;
@@ -36,17 +45,12 @@ use super::{Request, Scheduler, WorkerGroup};
 /// the request at a step boundary within that many steps.
 const DENOISING_LOOKAHEAD: u32 = 2;
 
-/// The block of a worker group that encodes condition units, as the deployment names it.
-const LATENT_ENCODER_BLOCK: &str = nn::family::Stage::LatentEncoder.name();
-
 /// The media phases of a video request, in the order a request offers the ones that are ready:
 /// the first is its next phase, which the policy reads. After denoising, completed decodes are
 /// encoded before further decodes are asked for (`S/execution/media.rs:380-410`).
-pub(super) const VIDEO_PHASES: [Phase; 11] = [
+pub(super) const VIDEO_PHASES: [Phase; 9] = [
     Phase::MediaRead,
-    Phase::VisionEncode,
     Phase::TextEncode,
-    Phase::LatentEncode,
     Phase::LatentPrepare,
     Phase::Denoise,
     Phase::VideoEncode,
@@ -60,14 +64,11 @@ pub(super) const VIDEO_PHASES: [Phase; 11] = [
 /// it. The class of kind `k` is the `k`-th of the `PRODUCTS.len()` classes just before the class
 /// of stored trajectories, and `Capacity::media_bytes` states the bytes of a block of each kind in
 /// this order.
-pub(super) const PRODUCTS: [(&str, Phase); 13] = [
+pub(super) const PRODUCTS: [(&str, Phase); 10] = [
     (product::CONDITION_PIXELS, Phase::MediaRead),
     (product::CONDITION_SAMPLES, Phase::MediaRead),
     (product::VISION_PIXELS, Phase::MediaRead),
-    (product::VISION_FEATURES, Phase::VisionEncode),
     (product::CONDITIONING, Phase::TextEncode),
-    (product::CONDITION_VIDEO_LATENTS, Phase::LatentEncode),
-    (product::CONDITION_AUDIO_LATENTS, Phase::LatentEncode),
     (product::VIDEO_LATENTS, Phase::Denoise),
     (product::AUDIO_LATENTS, Phase::Denoise),
     (product::VIDEO_UNITS, Phase::VideoDecode),
@@ -94,30 +95,23 @@ impl Request {
     /// How many calls of `phase` a video request makes in all (SD §3.3); 0 for a token request
     /// and for a phase a video request does not run.
     ///
-    /// The denoising steps are those the group that denoises states. A video decode round covers
-    /// the decoder's width in media units and a visual latent encoding round the latent
-    /// encoder's; the audio of the conditions is one more latent encoding call. Each decoded
-    /// round is encoded once and handed to the muxer once, before a final muxing call that
-    /// assembles the artifact.
+    /// The prompt is encoded once, unless the admission's `Pin` found its conditioning. The
+    /// denoising steps are those the group that denoises states. A video decode round covers the
+    /// decoder group's width in media units. Each decoded round is encoded once and handed to the
+    /// muxer once, before a final muxing call that assembles the artifact.
     pub(super) fn video_needed(&self, phase: Phase, groups: &[WorkerGroup]) -> u32 {
         let Some(video) = self.video() else {
             return 0;
         };
         match phase {
             Phase::MediaRead => u32::from(!video.conditions.is_empty()),
-            Phase::VisionEncode => self.declares(product::VISION_FEATURES),
-            Phase::LatentEncode => {
-                let width = self.width(Phase::LatentEncode, groups);
-                let visual = condition_units(video).div_ceil(width);
-                visual + self.declares(product::CONDITION_AUDIO_LATENTS)
-            }
-            Phase::TextEncode | Phase::LatentPrepare | Phase::AudioDecode | Phase::AudioEncode => 1,
+            Phase::TextEncode => u32::from(!self.found_conditioning()),
+            Phase::LatentPrepare | Phase::AudioDecode | Phase::AudioEncode => 1,
             Phase::Denoise => self
                 .serving(Phase::Denoise, groups)
                 .map_or(0, |group| group.capacity.denoise_steps),
             Phase::VideoDecode | Phase::VideoEncode => {
-                let width = self.width(Phase::VideoDecode, groups);
-                video.sampling.video_units.div_ceil(width)
+                video.sampling.video_units.div_ceil(self.width(groups))
             }
             Phase::Mux => self
                 .video_needed(Phase::VideoEncode, groups)
@@ -130,13 +124,12 @@ impl Request {
     /// of `S/execution/media.rs:269-403` and the splice tail of gap G11). It has calls of the
     /// phase left, and:
     ///
-    /// - every call but the media read waits until the read completed: the encoders read the
-    ///   condition media it wrote, and nothing later is offered before them;
-    /// - the text encoding waits until the vision encoding completed, whose features it splices
-    ///   in;
-    /// - the latent preparation waits until every text and latent encoding is handed over, and a
-    ///   denoising step until the preparation is, with at most [`DENOISING_LOOKAHEAD`] steps in
-    ///   flight;
+    /// - every call but the media read waits until the read completed: the text encoding reads
+    ///   the vision pixels it wrote and the latent preparation the condition pixels and samples,
+    ///   and nothing later is offered before them;
+    /// - the latent preparation waits until the text encoding is handed over (at once when the
+    ///   admission found the conditioning), and a denoising step until the preparation is, with
+    ///   at most [`DENOISING_LOOKAHEAD`] steps in flight;
     /// - the decoders wait until every denoising step is handed over, and a video decode round
     ///   until the round before it completed: its first unit splices onto the tail of that
     ///   round's last unit;
@@ -174,9 +167,8 @@ impl Request {
             return false;
         }
         match phase {
-            Phase::MediaRead | Phase::VisionEncode | Phase::LatentEncode => true,
-            Phase::TextEncode => done(Phase::VisionEncode),
-            Phase::LatentPrepare => handed(Phase::TextEncode) && handed(Phase::LatentEncode),
+            Phase::MediaRead | Phase::TextEncode => true,
+            Phase::LatentPrepare => handed(Phase::TextEncode),
             Phase::Denoise => {
                 handed(Phase::LatentPrepare) && in_flight(Phase::Denoise) < DENOISING_LOOKAHEAD
             }
@@ -198,10 +190,8 @@ impl Request {
     }
 
     /// The media units call `call` of `phase` covers: a video decode round and the encode of what
-    /// it decoded take the decoder's width of the request's media units, a visual latent encoding
-    /// round the latent encoder's width of its condition units, the last round what remains.
-    /// Empty for every other call, the latent encoding of the conditions' audio among them. A
-    /// media row's `unit` is the start.
+    /// it decoded take the decoder group's width of the request's media units, the last round
+    /// what remains. Empty for every other call. A media row's `unit` is the start.
     pub(super) fn round_units(
         &self,
         phase: Phase,
@@ -211,17 +201,10 @@ impl Request {
         let Some(video) = self.video() else {
             return 0..0;
         };
-        let (width, units) = match phase {
-            Phase::VideoDecode | Phase::VideoEncode => (
-                self.width(Phase::VideoDecode, groups),
-                video.sampling.video_units,
-            ),
-            Phase::LatentEncode => (
-                self.width(Phase::LatentEncode, groups),
-                condition_units(video),
-            ),
-            _ => return 0..0,
-        };
+        if !matches!(phase, Phase::VideoDecode | Phase::VideoEncode) {
+            return 0..0;
+        }
+        let (width, units) = (self.width(groups), video.sampling.video_units);
         let start = call.saturating_mul(width);
         if start >= units {
             return 0..0;
@@ -229,17 +212,26 @@ impl Request {
         start..start.saturating_add(width).min(units)
     }
 
+    /// The call of a video decode or encode round whose first unit is `unit`, a media row's
+    /// `unit`: the round's index among the request's calls of its phase ([`Request::round_units`]).
+    pub(super) fn round_of(&self, unit: u32, groups: &[WorkerGroup]) -> u32 {
+        unit / self.width(groups)
+    }
+
     /// The declared results call `call` of `phase` reads, then those it writes, as positions in
     /// the request's product table, and how many it reads: a media row's `results` and `reads`
     /// (SD §2.3; `S/execution/media.rs:1043-1150`).
     ///
-    /// The condition video latents, the video units and the encoded units are one block each,
-    /// reserved whole at admission, of which each round writes the slice of its units (from its
-    /// row's `unit`). A video decode round after the first reads the splice tail of the unit
-    /// before its own, which the round before it wrote, and every round writes the tail of each
-    /// unit it decodes, one block per unit. Only the last denoising step writes the latents the
-    /// decoders read; the steps before it keep the trajectory in the slot. A muxing call hands
-    /// over the encode round it follows, and the final one reads nothing.
+    /// The text encoding reads the vision pixels of the conditions' vision blocks, whose features
+    /// it computes inside the call. The latent preparation reads the conditioning, the condition
+    /// pixels and the condition samples, in the order the denoiser tells them apart by class, and
+    /// encodes the condition latents inside the call. The video units and the encoded units are
+    /// one block each, reserved whole at admission, of which each round writes the slice of its
+    /// units (from its row's `unit`). A video decode round after the first reads the splice tail
+    /// of the unit before its own, which the round before it wrote, and every round writes the
+    /// tail of each unit it decodes, one block per unit. Only the last denoising step writes the
+    /// latents the decoders read; the steps before it keep the trajectory in the slot. A muxing
+    /// call hands over the encode round it follows, and the final one reads nothing.
     pub(super) fn results(
         &self,
         phase: Phase,
@@ -248,23 +240,12 @@ impl Request {
     ) -> (Vec<u32>, u32) {
         use ipc::product::*;
 
-        let visual = !self.round_units(phase, call, groups).is_empty();
         let last = call.saturating_add(1) == self.video_needed(phase, groups);
         let rounds = self.video_needed(Phase::VideoEncode, groups);
         let (reads, writes): (&[&str], &[&str]) = match phase {
             Phase::MediaRead => (&[], &[CONDITION_PIXELS, CONDITION_SAMPLES, VISION_PIXELS]),
-            Phase::VisionEncode => (&[VISION_PIXELS], &[VISION_FEATURES]),
-            Phase::TextEncode => (&[VISION_FEATURES], &[CONDITIONING]),
-            Phase::LatentEncode if visual => (&[CONDITION_PIXELS], &[CONDITION_VIDEO_LATENTS]),
-            Phase::LatentEncode => (&[CONDITION_SAMPLES], &[CONDITION_AUDIO_LATENTS]),
-            Phase::LatentPrepare => (
-                &[
-                    CONDITIONING,
-                    CONDITION_VIDEO_LATENTS,
-                    CONDITION_AUDIO_LATENTS,
-                ],
-                &[],
-            ),
+            Phase::TextEncode => (&[VISION_PIXELS], &[CONDITIONING]),
+            Phase::LatentPrepare => (&[CONDITIONING, CONDITION_PIXELS, CONDITION_SAMPLES], &[]),
             Phase::Denoise if last => (&[], &[VIDEO_LATENTS, AUDIO_LATENTS]),
             Phase::VideoDecode => (&[VIDEO_LATENTS], &[VIDEO_UNITS]),
             Phase::AudioDecode => (&[AUDIO_LATENTS], &[AUDIO_SAMPLES]),
@@ -364,8 +345,8 @@ impl Request {
     }
 
     /// The progress a video request reports once a call of `phase` was applied
-    /// (`S/execution/results.rs:308-333`): `preparing` after the read or an encoding of its
-    /// conditions or prompt; after its preparation or a step, `denoising` while steps remain and
+    /// (`S/execution/results.rs:308-333`): `preparing` after the read of its conditions or the
+    /// encoding of its prompt; after its preparation or a step, `denoising` while steps remain and
     /// `decoding` once none does; `decoding` after a decode or an encode of its media;
     /// `finalizing` after a muxing call, the final one included; with the steps its trajectory
     /// completed. `None` for a token request and for a phase a video request does not run.
@@ -373,9 +354,7 @@ impl Request {
         self.video()?;
         let denoised = self.completed[Phase::Denoise.index()];
         let name = match phase {
-            Phase::MediaRead | Phase::VisionEncode | Phase::LatentEncode | Phase::TextEncode => {
-                "preparing"
-            }
+            Phase::MediaRead | Phase::TextEncode => "preparing",
             Phase::LatentPrepare | Phase::Denoise
                 if denoised >= self.video_needed(Phase::Denoise, groups) =>
             {
@@ -407,6 +386,20 @@ impl Request {
             .collect()
     }
 
+    /// The position of a video request's conditioning in its product table: where its admission
+    /// pins or allocates it, its text encoding writes it and its latent preparation reads it.
+    pub(super) fn conditioning_position(&self) -> Option<u32> {
+        self.result(product::CONDITIONING, 0)
+    }
+
+    /// Whether a video request holds its conditioning without encoding it: its admission's `Pin`
+    /// found it under its key (`encodings`, its one encoder output), before any text encoding
+    /// completed, which holds it from then on too.
+    fn found_conditioning(&self) -> bool {
+        let held = self.encodings.first().is_some_and(|(_, at)| at.is_some());
+        held && self.completed[Phase::TextEncode.index()] == 0
+    }
+
     /// The position of the `index`-th declared result of product `name`, if the request
     /// declares it.
     fn result(&self, name: &str, index: u32) -> Option<u32> {
@@ -432,11 +425,7 @@ impl Request {
         match name {
             product::CONDITION_PIXELS => has(|condition| condition.pixel_bytes / 3),
             product::CONDITION_SAMPLES => has(|condition| condition.audio_samples),
-            product::VISION_PIXELS | product::VISION_FEATURES => {
-                has(|condition| condition.vision_patches)
-            }
-            product::CONDITION_VIDEO_LATENTS => has(ConditionExtent::video_rows),
-            product::CONDITION_AUDIO_LATENTS => has(|condition| u64::from(condition.audio_rows)),
+            product::VISION_PIXELS => has(|condition| condition.vision_patches),
             product::VIDEO_TAIL => video.sampling.video_units,
             _ => 1,
         }
@@ -451,18 +440,15 @@ impl Request {
         }
     }
 
-    /// The media units one round covers on the group serving `phase`, `VideoDecode` or
-    /// `LatentEncode`: the ranks of the block that serves it, each taking `units_per_rank` units
-    /// when the block deals units to its ranks and one otherwise (`S/execution/media.rs:564-572`,
-    /// `:600-607`); 1 when the group states no such block.
-    fn width(&self, phase: Phase, groups: &[WorkerGroup]) -> u32 {
-        let name = match phase {
-            Phase::LatentEncode => LATENT_ENCODER_BLOCK,
-            _ => VIDEO_DECODER_BLOCK,
-        };
+    /// The media units one video decode round covers on the group that decodes the request's
+    /// video: the ranks of its video decoder block, each taking `units_per_rank` units when the
+    /// block deals units to its ranks and one otherwise (`S/execution/media.rs:564-572`); 1 when
+    /// the group states no such block. Every rank of the group decodes its share of a round in
+    /// one call, the round's units dealt to the ranks in order (SD §3.3).
+    fn width(&self, groups: &[WorkerGroup]) -> u32 {
         let Some(block) = self
-            .serving(phase, groups)
-            .and_then(|group| group.config.blocks.get(name))
+            .serving(Phase::VideoDecode, groups)
+            .and_then(|group| group.config.blocks.get(VIDEO_DECODER_BLOCK))
         else {
             return 1;
         };
@@ -485,7 +471,7 @@ impl Scheduler {
     /// - the request's own consistency (`DiffusionRequest::validate`);
     /// - a group serves every phase that produces the artifact, `Mux` among them;
     /// - a group denoises, with a positive number of steps;
-    /// - a conditioned request finds groups for the read and the encodings of its conditions;
+    /// - a conditioned request finds a group that reads its conditions;
     /// - each extent of its products fits the protocol's `u32` dimensions;
     /// - a group that denoises captured a shape that holds it and states the bytes of every
     ///   product kind there.
@@ -518,32 +504,25 @@ impl Scheduler {
             return Err("worker reports no video denoiser".to_owned());
         }
 
-        let patches = total(video, |condition| condition.vision_patches);
-        let audio = total(video, |condition| u64::from(condition.audio_rows));
-        let conditions = [
-            (Phase::MediaRead, !video.conditions.is_empty()),
-            (Phase::VisionEncode, patches > 0),
-            (Phase::LatentEncode, condition_units(video) > 0 || audio > 0),
-        ];
-        if conditions
-            .into_iter()
-            .any(|(phase, runs)| runs && !served(phase))
-        {
+        // The text encoder and the latent preparation encode the conditions inside their calls:
+        // only their read is a phase of its own.
+        if !video.conditions.is_empty() && !served(Phase::MediaRead) {
             return Err("the deployment's denoiser takes no conditions".to_owned());
         }
 
-        // The vision tokens size the vision features, which exist only with patches to encode.
-        let pixels = total(video, |condition| condition.pixel_bytes / 3);
-        let samples = total(video, |condition| condition.audio_samples);
-        let tokens = total(video, |condition| u64::from(condition.vision_tokens));
-        let rows = total(video, ConditionExtent::video_rows);
         let extents = [
-            ("condition pixels", pixels),
-            ("condition samples", samples),
-            ("vision patches", patches),
-            ("vision tokens", if patches > 0 { tokens } else { 0 }),
-            ("condition video rows", rows),
-            ("condition audio rows", audio),
+            (
+                "condition pixels",
+                total(video, |condition| condition.pixel_bytes / 3),
+            ),
+            (
+                "condition samples",
+                total(video, |condition| condition.audio_samples),
+            ),
+            (
+                "vision patches",
+                total(video, |condition| condition.vision_patches),
+            ),
         ];
         if let Some((quantity, _)) = extents
             .into_iter()
@@ -604,6 +583,14 @@ impl Scheduler {
         self.units_in(region, *bytes)
     }
 
+    /// The class of a video request's conditioning, the product class of its kind.
+    pub(super) fn conditioning_class(&self) -> Option<u8> {
+        let kind = PRODUCTS
+            .iter()
+            .position(|&(name, _)| name == product::CONDITIONING)?;
+        self.product_class(kind)
+    }
+
     /// The class of product kind `kind`: the `kind`-th of the classes just before the class of
     /// stored trajectories.
     fn product_class(&self, kind: usize) -> Option<u8> {
@@ -628,13 +615,6 @@ fn total(video: &DiffusionRequest, extent: impl Fn(&ConditionExtent) -> u64) -> 
         .iter()
         .map(extent)
         .fold(0, u64::saturating_add)
-}
-
-/// The temporal units of a video request's visual conditions, which its latent encoding covers
-/// in rounds.
-fn condition_units(video: &DiffusionRequest) -> u32 {
-    let units = total(video, |condition| condition.latent_units.len() as u64);
-    u32::try_from(units).unwrap_or(u32::MAX)
 }
 
 /// The smallest of `group`'s captured shapes that holds a video request and states the bytes of
@@ -681,24 +661,26 @@ fn holds(shape: &Shape, video: &DiffusionRequest) -> bool {
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
-    use std::sync::Arc;
     use std::sync::atomic::AtomicU64;
+    use std::sync::{Arc, Mutex};
     use std::time::Instant;
 
-    use ipc::batch::{Batch, Extent, Phase, Shape, Variant};
+    use ipc::batch::{Batch, BatchId, Columns, Extent, Phase, Shape, Variant};
+    use ipc::product;
     use proto::config::{
         BlockConfig, BlockDistribution, SchedulerConfig, VIDEO_DECODER_BLOCK, WorkerGroupConfig,
         WorkerGroupId, WorkerGroupRole, WorkerRank,
     };
     use proto::request::{
-        ConditionExtent, DiffusionRequest, DiffusionSamplingParams, Event, MigrationCause,
-        RequestId, Trajectory,
+        ConditionExtent, DiffusionRequest, DiffusionSamplingParams, EncoderInputs, Event,
+        MigrationCause, RequestId, Trajectory,
     };
-    use storage::key::latent_content;
+    use storage::key::{encoder_output, latent_content};
     use storage::runtime::{self, Class, Completion, GroupId, OwnerId, Region, Tier};
     use storage::{Key, QueuePair};
 
-    use super::{LATENT_ENCODER_BLOCK, PRODUCTS, VIDEO_PHASES};
+    use super::{PRODUCTS, VIDEO_PHASES};
+    use crate::scheduler::cache::DEVICE;
     use crate::scheduler::{Capacity, Executor, Request, RequestStatus, Scheduler, WorkerGroup};
 
     const A: GroupId = GroupId(0);
@@ -768,8 +750,7 @@ mod tests {
         }
     }
 
-    /// A group whose video decoder deals units to 2 ranks and whose latent encoder runs over 3
-    /// ranks as one model-parallel group.
+    /// A group of two ranks whose video decoder deals units to both, one unit each in a round.
     fn config(id: GroupId) -> WorkerGroupConfig {
         let mut blocks = BTreeMap::new();
         blocks.insert(
@@ -779,10 +760,6 @@ mod tests {
                 ..BlockConfig::parallel(vec![0, 1])
             },
         );
-        blocks.insert(
-            LATENT_ENCODER_BLOCK.to_owned(),
-            BlockConfig::parallel(vec![0, 1, 2]),
-        );
         let rank = WorkerRank {
             host: "localhost".to_owned(),
             device: "cpu".to_owned(),
@@ -791,7 +768,7 @@ mod tests {
             id: WorkerGroupId(format!("video-{}", id.0)),
             role: WorkerGroupRole::Model,
             replicas: 1,
-            ranks: vec![rank; 3],
+            ranks: vec![rank; 2],
             blocks,
             queue_depth: 2,
             mem_fraction_static: None,
@@ -927,9 +904,10 @@ mod tests {
         request.completed[phase.index()] += calls;
     }
 
-    struct Idle;
+    /// An executor that runs nothing and records what it is handed to stamp.
+    struct Stamps(Arc<Mutex<Vec<runtime::Request>>>);
 
-    impl Executor for Idle {
+    impl Executor for Stamps {
         fn submit(&self, _: Batch) {}
 
         fn map(
@@ -942,12 +920,19 @@ mod tests {
         ) {
         }
 
-        fn stamp(&self, _: GroupId, _: Vec<runtime::Request>) {}
+        fn stamp(&self, _: GroupId, requests: Vec<runtime::Request>) {
+            self.0.lock().unwrap().extend(requests);
+        }
     }
 
     /// A scheduler over `served`, in a session whose regions are the product buffer (units of 256
     /// bytes), the slot rows and the host latent pool (units of 4 096 bytes).
     fn scheduler(served: &[(GroupId, &[Phase])]) -> Scheduler {
+        stamping(served).0
+    }
+
+    /// A [`scheduler`] over `served`, with what its executors were handed to stamp.
+    fn stamping(served: &[(GroupId, &[Phase])]) -> (Scheduler, Arc<Mutex<Vec<runtime::Request>>>) {
         let region = |name: &str, tier, unit_bytes| Region {
             name: name.to_owned(),
             tier,
@@ -1005,7 +990,8 @@ mod tests {
             .map(|&(id, phases)| (config(id), capacity(phases)))
             .collect();
         let (output, _) = crossbeam_channel::unbounded();
-        Scheduler::new(
+        let stamped = Arc::new(Mutex::new(Vec::new()));
+        let scheduler = Scheduler::new(
             SchedulerConfig::default(),
             proto::request::GenerationLimits::default(),
             &layout,
@@ -1014,11 +1000,12 @@ mod tests {
             QueuePair::create(1 << 12, 16).unwrap(),
             configs,
             crate::scheduler::tests::idle_policy(),
-            Box::new(Idle),
+            Box::new(Stamps(Arc::clone(&stamped))),
             output,
             Arc::new(AtomicU64::new(0)),
         )
-        .unwrap()
+        .unwrap();
+        (scheduler, stamped)
     }
 
     /// The calls of each phase follow the request's conditions and the widths of the groups that
@@ -1037,9 +1024,7 @@ mod tests {
             needed(&text),
             [
                 (Phase::MediaRead, 0),
-                (Phase::VisionEncode, 0),
                 (Phase::TextEncode, 1),
-                (Phase::LatentEncode, 0),
                 (Phase::LatentPrepare, 1),
                 (Phase::Denoise, STEPS),
                 (Phase::VideoEncode, 2),
@@ -1050,14 +1035,16 @@ mod tests {
             ]
         );
 
-        // Nine condition units over a latent encoder of three ranks are three visual rounds, and
-        // the soundtrack is one more call.
+        // Conditions add their read, and nothing else: the text encoding and the latent
+        // preparation encode them inside their calls. One unit is one round.
         let conditioned = request(video(1, 40, reference()), &on(A));
         let counts = needed(&conditioned);
         assert_eq!(counts[0], (Phase::MediaRead, 1));
-        assert_eq!(counts[1], (Phase::VisionEncode, 1));
-        assert_eq!(counts[3], (Phase::LatentEncode, 4));
-        assert_eq!(counts[10], (Phase::Mux, 2));
+        assert_eq!(counts[1], (Phase::TextEncode, 1));
+        assert_eq!(counts[8], (Phase::Mux, 2));
+        for phase in [Phase::VisionEncode, Phase::LatentEncode] {
+            assert_eq!(conditioned.video_needed(phase, &groups), 0, "{phase:?}");
+        }
     }
 
     /// On one group, each phase is offered once the phase before it is scheduled; denoising
@@ -1096,10 +1083,11 @@ mod tests {
         );
     }
 
-    /// Nothing of a conditioned request runs before its media read completed, and its prompt is
-    /// encoded once its vision blocks were (SD §3.3).
+    /// A conditioned request's calls run in order with no encoder call of their own: its media
+    /// read first, then its text encoding once the read completed, its latent preparation once
+    /// the text encoding is handed over, and its denoising after that (SD §3.3).
     #[test]
-    fn a_conditioned_request_encodes_once_its_media_read_completed() {
+    fn a_conditioned_request_encodes_its_prompt_once_its_media_read_completed() {
         let groups = groups(&[(A, &VIDEO_PHASES)]);
         let mut request = request(video(1, 40, reference()), &on(A));
         assert_eq!(ready(&request, &groups), [Phase::MediaRead]);
@@ -1107,25 +1095,120 @@ mod tests {
         schedule(&mut request, Phase::MediaRead, 1);
         assert!(ready(&request, &groups).is_empty());
         complete(&mut request, Phase::MediaRead, 1);
-        assert_eq!(
-            ready(&request, &groups),
-            [Phase::VisionEncode, Phase::LatentEncode]
-        );
+        assert_eq!(ready(&request, &groups), [Phase::TextEncode]);
 
-        schedule(&mut request, Phase::VisionEncode, 1);
-        assert_eq!(ready(&request, &groups), [Phase::LatentEncode]);
-        complete(&mut request, Phase::VisionEncode, 1);
-        assert_eq!(
-            ready(&request, &groups),
-            [Phase::TextEncode, Phase::LatentEncode]
-        );
-
-        // The preparation reads every condition latent and the audio's.
         schedule(&mut request, Phase::TextEncode, 1);
-        schedule(&mut request, Phase::LatentEncode, 3);
-        assert_eq!(ready(&request, &groups), [Phase::LatentEncode]);
-        schedule(&mut request, Phase::LatentEncode, 1);
         assert_eq!(ready(&request, &groups), [Phase::LatentPrepare]);
+        schedule(&mut request, Phase::LatentPrepare, 1);
+        assert_eq!(ready(&request, &groups), [Phase::Denoise]);
+        for phase in [Phase::VisionEncode, Phase::LatentEncode] {
+            assert!(!request.video_ready(phase, &groups), "{phase:?}");
+        }
+    }
+
+    /// A request whose admission's `Pin` finds its conditioning under its key holds it at the
+    /// conditioning's position, makes no text encoding, and its latent preparation reads the
+    /// pinned block; one whose `Pin` finds nothing allocates the block, encodes its prompt into it
+    /// and commits it under its key (SD §3.3, §4.3).
+    #[test]
+    fn a_conditioning_the_admission_finds_is_read_without_a_text_encoding() {
+        let (mut scheduler, stamped) = stamping(&[(A, &VIDEO_PHASES)]);
+        let class = scheduler.conditioning_class().unwrap();
+        let mut input = video(1, 40, reference());
+        input.encoder_inputs = Some(Box::new(EncoderInputs {
+            text: [3; 32],
+            vision: None,
+            video_units: Vec::new(),
+            audio: None,
+        }));
+
+        // The conditioning is keyed by what the text encoder reads.
+        let mut admitted = request(input, &on(A));
+        admitted.encodings = scheduler.encodings_of(&admitted);
+        let key = Key(encoder_output(product::CONDITIONING, "", &[3; 32]));
+        assert_eq!(admitted.encodings, [(key, None)]);
+        let at = admitted.conditioning_position().unwrap();
+        let id = admitted.id;
+        scheduler.owners.insert(OwnerId(10), id);
+        scheduler.requests.insert(id, admitted.clone());
+
+        // Not cached: allocated at its position, of its kind's size, like every declared result.
+        let asks = scheduler.admission_requests(id);
+        let allocate = runtime::Request::Allocate {
+            owner: OwnerId(10),
+            class,
+            at,
+            count: 1,
+            units: u32::from(class),
+        };
+        assert!(asks.contains(&allocate), "{asks:?}");
+
+        // Cached on the device of the group that encodes it: pinned at the same position.
+        let listed = (key, class, 40, DEVICE, 1);
+        let mut list = runtime::Request::List;
+        let listing = Completion::Listing { keys: vec![listed] };
+        scheduler.learn(&mut list, &listing);
+        let asks = scheduler.admission_requests(id);
+        let pin = runtime::Request::Pin {
+            owner: OwnerId(10),
+            class,
+            at,
+            keys: vec![key],
+        };
+        assert!(asks.contains(&pin) && !asks.contains(&allocate), "{asks:?}");
+
+        // A `Pin` that finds nothing allocates the block at once.
+        let found = |runs: u32| Completion::Pinned {
+            runs: (0..runs).map(|unit| (4, unit, 1)).collect(),
+            host: 0,
+        };
+        assert_eq!(scheduler.filled(id, &pin, &found(0)), [allocate]);
+
+        // A `Pin` that finds it: no text encoding, and the preparation reads the pinned block.
+        assert!(scheduler.filled(id, &pin, &found(1)).is_empty());
+        let groups = &scheduler.groups;
+        let pinned = &scheduler.requests[&id];
+        assert_eq!(pinned.video_needed(Phase::TextEncode, groups), 0);
+        let mut pinned = pinned.clone();
+        schedule(&mut pinned, Phase::MediaRead, 1);
+        complete(&mut pinned, Phase::MediaRead, 1);
+        assert_eq!(ready(&pinned, groups), [Phase::LatentPrepare]);
+        let (results, reads) = pinned.results(Phase::LatentPrepare, 0, groups);
+        assert_eq!((results[0], reads), (at, 3));
+
+        // Encoded instead: the text encoding's output is committed under the key, the prompt's
+        // rows as its tokens, and the request still made its one text encoding.
+        scheduler.requests.insert(id, admitted);
+        let mut encoded = Batch {
+            id: BatchId(1),
+            group: A,
+            phase: Phase::TextEncode,
+            generation: 0,
+            shape: Shape::decode(1, Variant::Encode),
+            requests: vec![id],
+            columns: Columns::default(),
+            media: Vec::new(),
+            new_slots: Vec::new(),
+        };
+        assert!(scheduler.push_media_row(&mut encoded, id, Phase::TextEncode));
+        let row = scheduler.requests.get_mut(&id).unwrap();
+        schedule(row, Phase::TextEncode, 1);
+        complete(row, Phase::TextEncode, 1);
+        scheduler.commit_encoding(id, &encoded, 0);
+        let commit = runtime::Request::Commit {
+            owner: OwnerId(10),
+            class,
+            at,
+            key,
+            tokens: 40,
+            after: Vec::new(),
+        };
+        assert_eq!(*stamped.lock().unwrap(), [commit]);
+        let groups = &scheduler.groups;
+        assert_eq!(
+            scheduler.requests[&id].video_needed(Phase::TextEncode, groups),
+            1
+        );
     }
 
     /// A phase placed on another group than the one it reads from waits until that one's calls
@@ -1134,7 +1217,7 @@ mod tests {
     fn a_phase_on_another_group_waits_until_its_predecessor_completed() {
         let groups = groups(&[(A, &VIDEO_PHASES), (B, &[Phase::TextEncode])]);
         let mut placement = on(A);
-        placement[2] = (Phase::TextEncode, B);
+        placement[1] = (Phase::TextEncode, B);
         let mut request = request(video(1, 40, Vec::new()), &placement);
 
         schedule(&mut request, Phase::TextEncode, 1);
@@ -1191,8 +1274,11 @@ mod tests {
         let request = request(video(3, 40, Vec::new()), &on(A));
         let results = |phase, call| request.results(phase, call, &groups);
 
+        // A round takes a unit for each of the decoder's two ranks; the round a row is is its
+        // first unit over that width, whatever order rounds return in.
         assert_eq!(request.round_units(Phase::VideoDecode, 0, &groups), 0..2);
         assert_eq!(request.round_units(Phase::VideoDecode, 1, &groups), 2..3);
+        assert_eq!(request.round_of(2, &groups), 1);
         let (first, first_reads) = results(Phase::VideoDecode, 0);
         let (second, second_reads) = results(Phase::VideoDecode, 1);
         assert_eq!(first_reads, 1, "the first round reads the latents alone");
@@ -1224,9 +1310,9 @@ mod tests {
     }
 
     /// Every result a call writes is a declared result of the call's phase, and each is written
-    /// once, but the condition video latents, the video units and the encoded units, of which
-    /// each round writes its slice; each block is sized in its product class, rounded up to units
-    /// of the product region (SD §4.4 "Products").
+    /// once, but the video units and the encoded units, of which each round writes its slice;
+    /// each block is sized in its product class, rounded up to units of the product region
+    /// (SD §4.4 "Products").
     #[test]
     fn declared_results_are_written_by_their_phase_and_sized_in_their_class() {
         let scheduler = scheduler(&[(A, &VIDEO_PHASES)]);
@@ -1246,20 +1332,12 @@ mod tests {
                     }
                 }
             }
-            // The rounds of each sliced block: the visual latent rounds, which the soundtrack's
-            // call follows, and the decode rounds.
+            // The rounds of each sliced block: the decode rounds and their encodes.
             let rounds = request.video_needed(Phase::VideoDecode, groups);
-            let latent = request.results(Phase::LatentEncode, 0, groups);
-            let mut sliced = vec![
+            let sliced = [
                 (request.results(Phase::VideoDecode, 0, groups).0[1], rounds),
                 (request.results(Phase::VideoEncode, 0, groups).0[1], rounds),
             ];
-            if let Some(&position) = latent.0.get(latent.1 as usize) {
-                sliced.push((
-                    position,
-                    request.video_needed(Phase::LatentEncode, groups) - 1,
-                ));
-            }
             for (position, count) in written.into_iter().enumerate() {
                 let expected = sliced
                     .iter()
@@ -1276,10 +1354,14 @@ mod tests {
             }
         }
 
-        // A text request of three units declares the prompt features, both latents, the video
-        // units, one tail per unit, the encoded units and the audio.
+        // A text request of three units declares the conditioning, both latents, the video
+        // units, one tail per unit, the encoded units and the audio; a conditioned request of two
+        // the condition pixels and samples and the vision pixels besides, and no encoded
+        // condition of its own.
         let text = request(video(3, 40, Vec::new()), &on(A));
         assert_eq!(scheduler.declared_results(&text).unwrap().len(), 9);
+        let conditioned = request(video(2, 40, reference()), &on(A));
+        assert_eq!(scheduler.declared_results(&conditioned).unwrap().len(), 11);
     }
 
     /// A trajectory is sized from the smallest captured shape that holds its request, in units of
@@ -1325,7 +1407,7 @@ mod tests {
             without(&[Phase::Denoise]).validate_video(&video(2, 40, Vec::new())),
             Err("worker reports no video denoiser".to_owned())
         );
-        let unconditioned = without(&[Phase::MediaRead, Phase::VisionEncode, Phase::LatentEncode]);
+        let unconditioned = without(&[Phase::MediaRead]);
         assert_eq!(
             unconditioned.validate_video(&video(2, 40, Vec::new())),
             Ok(())
