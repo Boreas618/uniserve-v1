@@ -11,7 +11,7 @@
 //! | `admit` | the waiting queue in order ([`Waiting`]); the mechanism admits until the first request it cannot place |
 //! | `work` | requests in `(phase class, admission order)`, at most one call each, charged against the step's tokens and calls; a prefill chunk is [`prefill_chunk`] of the prompt left; a prefill-class call runs only in a prefill step; the prefill window holds while [`PREFILL_WINDOW_CREDITS`] batches with prefill work are in flight |
 //! | `reject` | a waiting request whose worst-case reservation is more than the device cache's whole capacity |
-//! | `offload` | the device pages no running request continues from, least recently used first |
+//! | `offload` | each device page no running request continues from, once: in the step after it became one, in the order it did (least recently used first) |
 //! | `prefetch` | the requests whose host hit deepens by at least `Limits::prefetch_min_tokens` |
 //! | `refill` | the requests whose draft cache has a gap, when the refill is worth its cost (see [`Arrival::refill_due`]) |
 //! | `preempt` | the least recently used page of the short storage, then the lowest-priority last-admitted request |
@@ -25,7 +25,7 @@
 //! ([`RequestView::refill_tokens`]) but not the remaining token budget; see
 //! [`Arrival::refill_due`].
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use crate::budget::{Shares, Step, prefill_chunk, work_tokens};
 use crate::decision::{DispatchOutput, Room, Shortage, Storage, Victim};
@@ -60,6 +60,25 @@ fn class_of(kind: Phase) -> PhaseClass {
     }
 }
 
+/// Whether a page is one a step offloads: a device page no running request
+/// continues from.
+fn offloadable(view: &PageView) -> bool {
+    !view.on_host && view.evictable
+}
+
+/// A device page this policy was not told of, which a request just held or
+/// gave up: its token count unknown. Its place in the order, not its
+/// `last_used`, says it was used last.
+fn held_page(page: PageId, evictable: bool) -> PageView {
+    PageView {
+        id: page,
+        tokens: 0,
+        last_used: Nanos::default(),
+        on_host: false,
+        evictable,
+    }
+}
+
 /// A policy that admits by a key derived from the request, and schedules by
 /// arrival.
 ///
@@ -86,6 +105,11 @@ pub struct Arrival<K: Order> {
     /// each with its view as the mechanism last stated it: whether it sits in
     /// host memory and whether no running request continues from it.
     pages: Lru<PageId, PageView>,
+    /// The pages that became device pages no request holds since the last
+    /// `dispatch`, in the order they did: what the next step offloads, each
+    /// once. A page the snapshot states is not one, since the instance before
+    /// this one had its own step to name it.
+    offers: Vec<PageId>,
     /// The encoder cache entries, least recently used first.
     encodings: Lru<EncodingId>,
     /// The rank the last `route` picked, so ties rotate as they do today.
@@ -117,6 +141,7 @@ impl<K: Order> Default for Arrival<K> {
             views: BTreeMap::new(),
             admission: Vec::new(),
             pages: Lru::new(),
+            offers: Vec::new(),
             encodings: Lru::new(),
             route_cursor: 0,
             media_first: false,
@@ -125,16 +150,6 @@ impl<K: Order> Default for Arrival<K> {
 }
 
 impl<K: Order> Arrival<K> {
-    /// The admission position of a request; running requests the snapshot listed
-    /// before this policy saw an admission event sort after them by admission
-    /// time, so the order is the mechanism's.
-    fn admission_index(&self, id: RequestId) -> usize {
-        self.admission
-            .iter()
-            .position(|running| *running == id)
-            .unwrap_or(usize::MAX)
-    }
-
     /// The phase kind of a request's next call, if it has one ready.
     fn next_kind(&self, view: &RequestView) -> Option<Phase> {
         view.phase.map(|phase| self.phases.kind(phase))
@@ -175,23 +190,35 @@ impl<K: Order> Arrival<K> {
     }
 
     /// The running requests in this step's assembly order: the preferred path first,
-    /// then the phase class, then admission order.
+    /// then the phase class, then admission order. A running request this policy
+    /// saw no admission of sorts after those it did, by id.
+    ///
+    /// Each request's key is computed once, its admission position read from one
+    /// index of the admission order, so a step of `n` running requests sorts in
+    /// `n log n` rather than searching the admission order at every comparison.
     fn assembly_order(&self) -> Vec<RequestId> {
-        let mut order: Vec<RequestId> = self
+        let admitted: BTreeMap<RequestId, usize> = self
+            .admission
+            .iter()
+            .enumerate()
+            .map(|(at, id)| (*id, at))
+            .collect();
+        let mut order: Vec<((u8, PhaseClass, usize, u64), RequestId)> = self
             .views
             .values()
             .filter(|view| view.state == RequestStatus::Running && view.phase.is_some())
-            .map(|view| view.id)
+            .map(|view| {
+                let kind = self.next_kind(view).unwrap_or(Phase::Other);
+                let media = view.class == RequestClass::Media;
+                // The path the policy did not prefer comes second.
+                let path = u8::from(media != self.media_first);
+                let at = admitted.get(&view.id).copied().unwrap_or(usize::MAX);
+                ((path, class_of(kind), at, view.id.0), view.id)
+            })
             .collect();
-        order.sort_by_key(|id| {
-            let view = &self.views[id];
-            let kind = self.next_kind(view).unwrap_or(Phase::Other);
-            let media = view.class == RequestClass::Media;
-            // The path the policy did not prefer comes second.
-            let path = u8::from(media != self.media_first);
-            (path, class_of(kind), self.admission_index(*id), id.0)
-        });
-        order
+        // The keys are distinct, since each ends with the request's id.
+        order.sort_unstable_by_key(|(key, _)| *key);
+        order.into_iter().map(|(_, id)| id).collect()
     }
 
     /// The token work of one call, and whether it writes the prefix cache.
@@ -280,34 +307,63 @@ impl<K: Order> Arrival<K> {
         view.prefetch_tokens >= self.limits.prefetch_min_tokens
     }
 
-    /// The device pages a step offloads: every page no running request
-    /// continues from, least recently used first, which is today's rule for
-    /// writing a prefix to the host KV cache.
-    fn offload_pages(&self) -> Vec<PageId> {
-        self.pages
-            .iter()
-            .filter(|(_, view)| !view.on_host && view.evictable)
-            .map(|(page, _)| page)
+    /// The device pages a step offloads: each page no running request
+    /// continues from, once, which is today's rule for writing a prefix to
+    /// the host KV cache. A page is named in the step after it became one,
+    /// in the order the pages did (least recently used first); one that a
+    /// request holds again, that went to the host alone or that left the
+    /// cache meanwhile is not, and one that became one twice is named once.
+    /// A page named before is not named again: the mechanism offered it, so
+    /// a warm cache costs a step nothing.
+    fn offload_pages(&mut self) -> Vec<PageId> {
+        let mut named = BTreeSet::new();
+        let offers = std::mem::take(&mut self.offers);
+        offers
+            .into_iter()
+            .filter(|page| self.pages.get(*page).is_some_and(offloadable))
+            .filter(|page| named.insert(*page))
             .collect()
     }
 
+    /// A page the mechanism states anew (`Event::Cached`): it is offered to
+    /// the host once it becomes a device page no request holds.
+    fn state(&mut self, page: &PageView) {
+        let was = self.pages.get(page.id).is_some_and(offloadable);
+        if offloadable(page) && !was {
+            self.offers.push(page.id);
+        }
+        self.pages.insert(page.id, page.clone());
+    }
+
     /// One page of a release (`Event::Released`): no request holds it any more,
-    /// so it is evictable, and it was used just now. A page this policy was
-    /// never told of is a device page, since a request held it, whose token
-    /// count it does not know.
+    /// so it is evictable, and it was used just now; a device page is offered
+    /// to the host at the next step. A page this policy was never told of is a
+    /// device page, since a request held it, whose token count it does not
+    /// know.
     fn release(&mut self, page: PageId) {
+        let on_host = match self.pages.touch(page) {
+            Some(view) => {
+                view.evictable = true;
+                view.on_host
+            }
+            None => {
+                self.pages.insert(page, held_page(page, true));
+                false
+            }
+        };
+        if !on_host {
+            self.offers.push(page);
+        }
+    }
+
+    /// One page of a hold (`Event::Held`): a request holds it again, so it is
+    /// not evictable, and it was used just now. A page this policy was never
+    /// told of is a device page, since a request holds it, whose token count
+    /// it does not know.
+    fn hold(&mut self, page: PageId) {
         match self.pages.touch(page) {
-            Some(view) => view.evictable = true,
-            None => self.pages.insert(
-                page,
-                PageView {
-                    id: page,
-                    tokens: 0,
-                    last_used: Nanos::default(),
-                    on_host: false,
-                    evictable: true,
-                },
-            ),
+            Some(view) => view.evictable = false,
+            None => self.pages.insert(page, held_page(page, false)),
         }
     }
 
@@ -415,8 +471,9 @@ impl<K: Order> Policy for Arrival<K> {
                         self.waiting.push(request);
                     }
                 }
-                // The view of a running request changed: its next phase,
-                // prompt progress, cached prefix or pages.
+                // The view of a request changed: its next phase, prompt
+                // progress, cached prefix or pages. The mechanism states no
+                // emission instant; the one `Emitted` gave stays.
                 Event::Updated { request } => {
                     let arrived = request.id;
                     if request.state == RequestStatus::Running
@@ -428,7 +485,14 @@ impl<K: Order> Policy for Arrival<K> {
                     if request.state == RequestStatus::Waiting {
                         self.waiting.push(request);
                     }
-                    self.views.insert(arrived, request.clone());
+                    let mut view = request.clone();
+                    if view.last_emitted_at.is_none() {
+                        view.last_emitted_at = self
+                            .views
+                            .get(&arrived)
+                            .and_then(|known| known.last_emitted_at);
+                    }
+                    self.views.insert(arrived, view);
                 }
                 Event::Admitted { request } => {
                     self.waiting.remove(*request);
@@ -449,6 +513,7 @@ impl<K: Order> Policy for Arrival<K> {
                 } => {
                     if let Some(view) = self.views.get_mut(request) {
                         view.generated_tokens = view.generated_tokens.saturating_add(*tokens);
+                        view.remaining_tokens = view.remaining_tokens.saturating_sub(*tokens);
                         view.last_emitted_at = Some(*at);
                     }
                 }
@@ -458,7 +523,7 @@ impl<K: Order> Policy for Arrival<K> {
                     self.admission.retain(|running| running != request);
                 }
                 Event::Stepped { .. } => {}
-                Event::Cached { page } => self.pages.insert(page.id, page.clone()),
+                Event::Cached { page } => self.state(page),
                 // A page this policy was never told of has no view to keep;
                 // it enters the order when it is stated.
                 Event::Hit { page } => {
@@ -467,6 +532,11 @@ impl<K: Order> Policy for Arrival<K> {
                 Event::Released { pages } => {
                     for page in pages {
                         self.release(*page);
+                    }
+                }
+                Event::Held { pages } => {
+                    for page in pages {
+                        self.hold(*page);
                     }
                 }
                 Event::Freed { page } => {
@@ -497,6 +567,7 @@ impl<K: Order> Policy for Arrival<K> {
         // as the step's prefill work only when the step is not a token step
         // (today's `pass_kind != Some(BatchKind::Decode)`).
         let pass = self.pass(room);
+        let offload = self.offload_pages();
         let mut output = DispatchOutput {
             // Every other waiting request, in order. The mechanism admits them
             // until the first it cannot place, which is the admission
@@ -508,9 +579,9 @@ impl<K: Order> Policy for Arrival<K> {
                 .collect(),
             reject,
             // The device pages no running request continues from go to the
-            // host KV cache, least recently used first, which is today's rule
-            // for writing a prefix out.
-            offload: self.offload_pages(),
+            // host KV cache, each once, least recently used first, which is
+            // today's rule for writing a prefix out.
+            offload,
             // Requests whose host hit deepens enough to be worth fetching, in
             // admission order.
             prefetch: self
@@ -1318,14 +1389,14 @@ mod tests {
                         tokens: 16,
                         last_used: Nanos(1),
                         on_host: false,
-                        evictable: true,
+                        evictable: false,
                     },
                     PageView {
                         id: PageId(2),
                         tokens: 16,
                         last_used: Nanos(2),
                         on_host: false,
-                        evictable: true,
+                        evictable: false,
                     },
                     PageView {
                         id: PageId(3),
@@ -1338,6 +1409,10 @@ mod tests {
                 ..Snapshot::default()
             },
         });
+        // The requests that held pages 1 and 2 gave them up.
+        fcfs.observe(&[Event::Released {
+            pages: vec![PageId(1), PageId(2)],
+        }]);
         let room = Room {
             token_budget: 1024,
             call_budget: 8,
@@ -1358,8 +1433,8 @@ mod tests {
         // The over-capacity request is rejected and not also admitted.
         assert_eq!(output.reject, vec![RequestId(11)]);
         assert_eq!(output.admit, vec![RequestId(10)]);
-        // The device pages no request continues from go to the host, in
-        // least-recently-used order; the host page stays.
+        // The device pages no request continues from any more go to the
+        // host, in least-recently-used order; the host page stays.
         assert_eq!(output.offload, vec![PageId(1), PageId(2)]);
         assert_eq!(output.prefetch, vec![RequestId(22)]);
         assert_eq!(output.refill, vec![RequestId(21)]);
@@ -1371,8 +1446,9 @@ mod tests {
         closed.inflight.prefill_batches = PREFILL_WINDOW_CREDITS;
         let output = fcfs.dispatch(&closed);
         // A token step schedules a refill-due request as its decode, so it names
-        // no refill.
+        // no refill; the pages were offloaded once.
         assert!(output.refill.is_empty());
+        assert!(output.offload.is_empty());
         let order: Vec<u64> = output.work.iter().map(|work| work.request.0).collect();
         assert_eq!(order, vec![21, 22]);
         assert!(output.work.iter().all(|work| work.tokens == 1));
@@ -1420,52 +1496,120 @@ mod tests {
     }
 
     /// **The pages a step offloads are the ones no running request continues
-    /// from, in least-recently-used order.**
+    /// from, each once, in the step after it became one.**
     ///
     /// The mechanism refuses to free a page a running request still continues
     /// from (`validate_victims`), so naming one would fail the policy at the
     /// first offload; `RequestView::cached_pages` and the mechanism's own
     /// `evictable` flag are how the policy knows. The flag moves after a page
-    /// is announced (a `Released` names the page its last user gave up), so
-    /// the case also shows the page becoming offloadable once its last user
-    /// finished.
+    /// is announced (a `Released` names the page its last user gave up), and
+    /// the page is offloaded in the next step. The mechanism offers a page to
+    /// the host once, so a page named in one step, or stated by the snapshot
+    /// a policy starts from (its instance before this one had its step to name
+    /// it), is not named again: a step costs what it changed, however many
+    /// pages the cache holds. A page a request holds again before the step
+    /// is not named, and one given up again after a later hold is.
     #[test]
-    fn a_page_a_request_still_continues_from_is_not_offloaded() {
+    fn a_page_no_request_continues_from_is_offloaded_once() {
+        let page = |id: u64, used: u64, evictable: bool| PageView {
+            id: PageId(id),
+            tokens: 16,
+            last_used: Nanos(used),
+            on_host: false,
+            evictable,
+        };
         let mut fcfs = Arrival::<crate::ArrivalOrder>::default();
         fcfs.instantiate(&Instantiation {
             parameters: Parameters::default(),
             state: Snapshot {
-                pages: vec![
-                    PageView {
-                        id: PageId(1),
-                        tokens: 16,
-                        last_used: Nanos(1),
-                        on_host: false,
-                        evictable: true,
-                    },
-                    PageView {
-                        id: PageId(2),
-                        tokens: 16,
-                        last_used: Nanos(2),
-                        on_host: false,
-                        evictable: false,
-                    },
-                ],
+                pages: vec![page(1, 1, true), page(2, 2, false), page(3, 3, false)],
                 ..Snapshot::default()
             },
         });
+        assert!(fcfs.dispatch(&room(1024, 8)).offload.is_empty());
 
-        assert_eq!(fcfs.dispatch(&room(1024, 8)).offload, vec![PageId(1)]);
+        // The mechanism states the last users of pages 2 and 3 are gone, and
+        // that page 3 is held again before the step: page 2 is now the most
+        // recently used page no request continues from.
+        fcfs.observe(&[
+            Event::Released {
+                pages: vec![PageId(2), PageId(3)],
+            },
+            Event::Held {
+                pages: vec![PageId(3)],
+            },
+        ]);
+        assert_eq!(fcfs.dispatch(&room(1024, 8)).offload, vec![PageId(2)]);
+        assert!(fcfs.dispatch(&room(1024, 8)).offload.is_empty());
 
-        // The mechanism states the page's last user is gone: it is now the
-        // most recently used page no request continues from.
-        fcfs.observe(&[Event::Released {
-            pages: vec![PageId(2)],
-        }]);
+        // A page that enters the cache as one no request holds is offloaded
+        // once too, and so is a page given up again after a hold.
+        fcfs.observe(&[
+            Event::Cached {
+                page: page(4, 4, true),
+            },
+            Event::Held {
+                pages: vec![PageId(2)],
+            },
+            Event::Released {
+                pages: vec![PageId(2)],
+            },
+        ]);
         assert_eq!(
             fcfs.dispatch(&room(1024, 8)).offload,
-            vec![PageId(1), PageId(2)]
+            vec![PageId(4), PageId(2)]
         );
+        assert!(fcfs.dispatch(&room(1024, 8)).offload.is_empty());
+    }
+
+    /// **A hold decides what restating each page as held decides.**
+    ///
+    /// The mechanism tells the pages an admission takes out of the eviction
+    /// order as one `Held`, in the order it takes them, where it could restate
+    /// each as a `Cached` page that is no longer evictable: the policy keeps
+    /// the same order and the same flags either way, so it offloads the same
+    /// pages and names the same victims: neither page held.
+    #[test]
+    fn a_hold_decides_as_restating_each_page_held() {
+        let page = |id: u64, used: u64, evictable: bool| Event::Cached {
+            page: PageView {
+                id: PageId(id),
+                tokens: 16,
+                last_used: Nanos(used),
+                on_host: false,
+                evictable,
+            },
+        };
+        let free = [
+            page(1, 1, true),
+            page(2, 2, true),
+            page(3, 3, true),
+            page(4, 4, true),
+        ];
+
+        let mut restated = policy();
+        restated.observe(&free);
+        restated.observe(&[page(3, 10, false), page(1, 11, false)]);
+        let mut held = policy();
+        held.observe(&free);
+        held.observe(&[Event::Held {
+            pages: vec![PageId(3), PageId(1)],
+        }]);
+
+        for fcfs in [&mut restated, &mut held] {
+            assert_eq!(
+                fcfs.dispatch(&room(1024, 8)).offload,
+                vec![PageId(2), PageId(4)]
+            );
+            let victims = fcfs.preempt(&Shortage {
+                kind: Storage::KvUnits,
+                need: 4,
+            });
+            assert_eq!(
+                victims,
+                vec![Victim::Page(PageId(2)), Victim::Page(PageId(4))]
+            );
+        }
     }
 
     /// **A release decides what restating each page as evictable decides.**

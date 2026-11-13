@@ -59,7 +59,7 @@ mod update;
 mod video;
 mod view;
 
-use std::collections::{BTreeSet, HashMap, VecDeque};
+use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::fmt;
 use std::num::NonZeroUsize;
 use std::ops::Range;
@@ -323,6 +323,11 @@ pub struct Scheduler {
     /// their copy ran): a block whose own `Store` stored nothing waits for this count, among
     /// others, to move before it is offered to the host again (`Cached::refused`, SD §4.4).
     stores: Vec<u64>,
+    /// The blocks, by [`Cached::id`], whose last `Store` to the host stored nothing: each step's
+    /// `offload` offers each again once something that could change that answer has happened
+    /// (SD §4.4 "The write policy"). A block leaves when it is offered again, has a host copy, or
+    /// has no device copy.
+    unstored: HashSet<u64>,
     /// Running requests whose next call waits for units of a region since their last shortage:
     /// per request, the region (by index) and the units its `available` must show before the
     /// request asks again (SD §3.6). A request listed here takes no further victims.
@@ -521,6 +526,7 @@ impl Scheduler {
             unmapped: HashMap::new(),
             detached: vec![false; count],
             stores: vec![0; count],
+            unstored: HashSet::new(),
             policy,
             executor,
             output,

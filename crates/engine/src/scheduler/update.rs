@@ -326,11 +326,24 @@ impl Scheduler {
                         },
                     );
                 }
-                self.policy.events.push(Change::Emitted {
-                    request: PolicyRequestId(id.0),
-                    tokens: 1,
-                    at: Nanos(monotonic_nanos(Instant::now())),
-                });
+                // The tokens one call published are one emission, at the last of them.
+                let request = PolicyRequestId(id.0);
+                let now = Nanos(monotonic_nanos(Instant::now()));
+                match self.policy.events.last_mut() {
+                    Some(Change::Emitted {
+                        request: emitted,
+                        tokens,
+                        at,
+                    }) if *emitted == request => {
+                        *tokens = tokens.saturating_add(1);
+                        *at = now;
+                    }
+                    _ => self.policy.events.push(Change::Emitted {
+                        request,
+                        tokens: 1,
+                        at: now,
+                    }),
+                }
             }
 
             if let Some((reason, stop_reason)) = stop {

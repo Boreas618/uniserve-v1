@@ -2,9 +2,9 @@
 //! mechanism's cache events.
 //!
 //! Design §4.4: an ordered structure such as this one is the policy's own,
-//! built from `Cached`, `Hit`, `Released` and `Freed`, so that a shortage takes
-//! its victims in order without evaluating every cached object. The mechanism
-//! records the state change; the policy keeps the order.
+//! built from `Cached`, `Hit`, `Released`, `Held` and `Freed`, so that a
+//! shortage takes its victims in order without evaluating every cached object.
+//! The mechanism records the state change; the policy keeps the order.
 //!
 //! One `Lru` holds one kind of object. Device KV units, host KV pages and
 //! encoder-cache entries are separate orders, because a shortage of one storage
@@ -100,8 +100,8 @@ impl<I: Copy + Ord, V> Lru<I, V> {
     }
 
     /// Records an object already in the order as the most recently used and
-    /// returns its state, for the caller to update: the `Hit` and `Released`
-    /// case. `None`, and no change, for an object not in the order.
+    /// returns its state, for the caller to update: the `Hit`, `Released` and
+    /// `Held` case. `None`, and no change, for an object not in the order.
     pub fn touch(&mut self, object: I) -> Option<&mut V> {
         let at = *self.index.get(&object)?;
         if self.tail != Some(at) {

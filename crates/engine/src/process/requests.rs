@@ -8,8 +8,9 @@
 //! opens. A request that passes is routed to a scheduler: with one scheduler to it, with several
 //! to the one the route instance of the epoch's policy names (`Policy::route`); an index that
 //! names no candidate is replaced by the least loaded candidate, and a fault of the route
-//! instance rolls it back. The engine answers `Accepted`, naming the scheduler, and hands the
-//! request to it as `Message::AddRequest`.
+//! instance is recovered from as a scheduler recovers from its policy's ([`routed`]). The engine
+//! answers `Accepted`, naming the scheduler, and hands the request to it as
+//! `Message::AddRequest`.
 //!
 //! Each accepted request has a [`RequestStream`]: the front its events go to and the events its
 //! consumer has not reported consumed. The scheduler bounds those by the event window
@@ -28,10 +29,11 @@ use proto::request::{
     ArtifactMedia, CachePolicy, Event, FinishReason, GenerationRequest, MigrationCause,
     RejectionKind, RequestId, SamplingParams,
 };
-use scheduling::view::{RankView, Snapshot};
+use scheduling::view::{RankView, RequestView, Snapshot};
 
 use super::MainProcess;
 use super::lifecycle::Lifecycle;
+use crate::scheduler::policy::Policy;
 use crate::scheduler::{Message, Request, WARMUP_REQUEST_IDS, view_of};
 
 /// The artifact bytes an event travels with, which a replay writes again with it.
@@ -118,6 +120,39 @@ pub(crate) fn candidate(index: usize, ranks: &[RankView]) -> usize {
         .map_or(0, |rank| rank.index)
 }
 
+/// The index the routing instance `route` chooses for `arrival` among `ranks`, or, after a fault
+/// of it, the reason and whether the fault ends the engine; [`candidate`] then sends the request
+/// to the least loaded rank.
+///
+/// A fault is recovered from by the scheduler's rule (SD §5.2 "Faults", `Policy::recover`): the
+/// policy the last switch replaced, or with none a fresh instance of the serving module, starts
+/// on a snapshot of `ranks` and routes from the next request on. The fault is fatal when that
+/// instantiation faults, or when the faulted instance was itself so made and had not routed a
+/// request since.
+fn routed(
+    route: &mut Policy,
+    arrival: &RequestView,
+    ranks: &[RankView],
+) -> Result<usize, (String, bool)> {
+    let fault = match route.route(arrival, ranks) {
+        Ok(index) => return Ok(index),
+        Err(fault) => fault,
+    };
+    let reason = format!("the route instance faulted: {fault}");
+    if !route.recoverable() {
+        return Err((reason, true));
+    }
+
+    let snapshot = Snapshot {
+        ranks: ranks.to_vec(),
+        ..Snapshot::default()
+    };
+    match route.recover(snapshot) {
+        Ok(()) => Err((reason, false)),
+        Err(restart) => Err((format!("{reason}; its restart faulted: {restart}"), true)),
+    }
+}
+
 impl MainProcess {
     /// Takes the requests of one submission, in order: each waits at the gate while admissions
     /// are paused, and is otherwise admitted ([`Self::admit`]).
@@ -202,7 +237,7 @@ impl MainProcess {
                 .to_owned();
             return self.reject(front, id, RejectionKind::Invalid, message);
         };
-        // A route instance whose fault had no policy to roll back to failed the engine.
+        // A route instance whose fault could not be recovered from failed the engine.
         if let Some(refusal) = self.lifecycle.refusal() {
             return self.reject(front, id, RejectionKind::Overloaded, refusal.to_owned());
         }
@@ -238,21 +273,11 @@ impl MainProcess {
         // The arrival as the policy reads a request no scheduler took yet: waiting, with no
         // group and no phase ready.
         let arrival = Request::new(input.clone(), self.launch.epoch, Instant::now());
-        let index = match route.route(&view_of(&arrival, &[]), &ranks) {
+        let index = match routed(route, &view_of(&arrival, &[]), &ranks) {
             Ok(index) => index,
-            Err(fault) => {
-                // The route instance faulted: the policy it replaced routes again, and this
-                // request goes to the least loaded scheduler.
-                let snapshot = Snapshot {
-                    ranks: ranks.clone(),
-                    ..Snapshot::default()
-                };
-                let fatal = route.rollback(snapshot).is_err();
-                self.policy_rolled_back(
-                    None,
-                    format!("the route instance faulted: {fault}"),
-                    fatal,
-                );
+            // This request goes to the least loaded scheduler.
+            Err((reason, fatal)) => {
+                self.policy_rolled_back(None, reason, fatal);
                 usize::MAX
             }
         };
@@ -491,6 +516,7 @@ impl MainProcess {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::scheduler::policy::tests::router;
 
     /// An event of request 9, distinct by its message.
     fn event(message: &str) -> wire::Event {
@@ -571,6 +597,58 @@ mod tests {
                 alive: true,
             })
             .collect()
+    }
+
+    /// A fault of the routing instance is recovered from by the scheduler's rule (SD §5.2
+    /// "Faults"): with no policy kept, a fresh instance of the serving module routes from the
+    /// next request on, and the request that met the fault goes to the least loaded rank. The
+    /// engine fails only when the instance a recovery made faults before it has routed a request;
+    /// one that routed a request recovers again.
+    #[test]
+    fn a_fault_of_the_routing_instance_restarts_it_and_a_second_before_it_routes_is_fatal() {
+        let arrival: RequestView = scheduling::wire::decode(
+            br#"{"id":7,"state":{"state":"waiting"},"class":{"class":"token"}}"#,
+        )
+        .unwrap();
+        // A load the instance routes, and one whose longer message it traps on.
+        let calm = ranks(&[3, 1]);
+        let busy = ranks(&[3_000_000_000, 1]);
+        let longest = scheduling::wire::encode(&(&arrival, &calm)).unwrap().len();
+        let module = router(&format!(
+            "(if (i32.gt_u (local.get $len) (i32.const {longest})) (then (unreachable))) \
+             (i32.const 0)"
+        ));
+        let start = || {
+            let snapshot = Snapshot {
+                ranks: calm.clone(),
+                ..Snapshot::default()
+            };
+            let ceilings = scheduling::Limits::default();
+            Policy::new(Arc::clone(&module), Default::default(), snapshot, &ceilings).unwrap()
+        };
+
+        let mut route = start();
+        assert_eq!(routed(&mut route, &arrival, &calm), Ok(0));
+        let Err((reason, fatal)) = routed(&mut route, &arrival, &busy) else {
+            panic!("the instance traps on the longer message");
+        };
+        assert!(!fatal, "the first fault restarts the instance: {reason}");
+        assert_eq!(candidate(usize::MAX, &busy), 1);
+        assert!(matches!(
+            routed(&mut route, &arrival, &busy),
+            Err((_, true))
+        ));
+
+        let mut route = start();
+        assert!(matches!(
+            routed(&mut route, &arrival, &busy),
+            Err((_, false))
+        ));
+        assert_eq!(routed(&mut route, &arrival, &calm), Ok(0));
+        assert!(matches!(
+            routed(&mut route, &arrival, &busy),
+            Err((_, false))
+        ));
     }
 
     #[test]

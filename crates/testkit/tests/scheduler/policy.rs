@@ -30,6 +30,7 @@ use storage::runtime::{Completion, GroupId, Request, Tier};
 use wasmtime::Module;
 
 use crate::harness::{A, B, BLOCK, Deployment, Harness, token};
+use crate::memory::{HYBRID, commits, host_stores, keys_of};
 
 /// Where a script module keeps its data in its memory: its limits, the needle its probes look
 /// for, its dispatch replies, and from its second page on the messages the host writes into it
@@ -794,47 +795,43 @@ fn a_starting_instance_is_given_the_blocks_of_cache() {
 /// The blocks the policy's `offload` names are stored to the host as one `Store` per group whose
 /// memory holds them, with their keys in the policy's order; a page `cache` does not hold is
 /// skipped (SD §3.4 "The policy's `offload` and `prefetch`", §4.4 "The write policy"). The blocks
-/// it names are ones the write policy could not store, the host region holding one block.
+/// it names are ones the write policy never offers, nor the scheduler again: the blocks of a
+/// sliding window of 8 tokens that left the window before the aligned boundary of a 21-token
+/// prompt, 20 tokens.
 #[test]
 fn the_policys_offload_is_stored_per_group_by_key() {
-    let mut harness = Deployment::tokens().replicas(2).host(1).build();
+    let mut harness = Deployment::tokens()
+        .cache(&HYBRID)
+        .replicas(2)
+        .host(64)
+        .build();
     let serving = Script {
         alternate: true,
         ..Script::serving(&[1, 2])
     };
     set_policy(&mut harness, serving.module(), Parameters::default()).unwrap();
-    let first = harness.submit(token(1, 9, 1));
-    let second = harness.submit(token(2, 9, 1));
+    let first = harness.submit(token(1, 21, 1));
+    let second = harness.submit(token(2, 21, 1));
     harness.settle(100);
-    // The write policy offers each committed block to the host as its `Committed` arrives; the
-    // copies of those that fit run with the groups' next batches.
+    // The write policy offers the blocks it stores as their `Committed` arrives; the copies run
+    // with the groups' next batches.
     harness.run(20);
     assert_eq!(harness.batches_of(first)[0].group, A);
     assert_eq!(harness.batches_of(second)[0].group, B);
 
-    // The blocks the write policy offered the host and the host had no room for, by group.
-    let unstored = |group: GroupId| -> Vec<Key> {
-        let answers = harness.answers().into_iter();
-        let full = answers.filter_map(|answer| match answer {
-            (
-                Request::Store {
-                    group: of,
-                    keys,
-                    tier: Tier::Host,
-                },
-                Completion::Full { .. },
-            ) if of == group => Some(keys),
-            _ => None,
-        });
-        full.flatten().collect()
+    // The window's blocks of a request that were never offered to the host.
+    let never = |id: RequestId, group: GroupId| -> Vec<Key> {
+        let offered = host_stores(&harness);
+        let cached = commits(&harness, harness.owner(id, group).unwrap());
+        let window = keys_of(&cached, 1).into_iter();
+        window.filter(|key| !offered.contains(key)).collect()
     };
-    let (on_a, on_b) = (unstored(A), unstored(B));
-    assert!(!on_a.is_empty() && !on_b.is_empty(), "{on_a:?} {on_b:?}");
+    let (on_a, on_b) = (never(first, A), never(second, B));
+    assert!(on_a.len() >= 2 && on_b.len() >= 2, "{on_a:?} {on_b:?}");
 
-    // The policy names a block of B, then one of A, then another of B when B has two, then a
-    // page `cache` does not hold.
-    let mut named = vec![on_b[0], on_a[0]];
-    named.extend(on_b.get(1));
+    // The policy names a block of B, then one of A, then another of B, then a page `cache` does
+    // not hold.
+    let named = [on_b[0], on_a[0], on_b[1]];
     let mut pages: Vec<PageId> = named.iter().map(|key| page(*key).0).collect();
     pages.push(PageId(42));
     let offload = Script {
@@ -862,7 +859,5 @@ fn the_policys_offload_is_stored_per_group_by_key() {
             _ => None,
         })
         .collect();
-    let mut expected = vec![(B, vec![on_b[0]]), (A, vec![on_a[0]])];
-    expected[0].1.extend(on_b.get(1));
-    assert_eq!(stores, expected);
+    assert_eq!(stores, [(B, vec![on_b[0], on_b[1]]), (A, vec![on_a[0]])]);
 }

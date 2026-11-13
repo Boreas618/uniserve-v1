@@ -25,7 +25,12 @@ pub struct DispatchOutput {
     /// this one decision.
     #[serde(default)]
     pub work: Vec<Work>,
-    /// Device pages to write to the host KV cache, in order.
+    /// Device pages to write to the host KV cache beyond the mechanism's own
+    /// write policy, in order. The mechanism offers each page named to the
+    /// host once: a page already on the host or being written there, or one
+    /// whose last write stored nothing while nothing that could change that
+    /// has happened since, is skipped. A page is named in the step it should
+    /// be written, not again in every step after it.
     #[serde(default)]
     pub offload: Vec<PageId>,
     /// Requests whose prefix hit to deepen through KV storage, in order. The

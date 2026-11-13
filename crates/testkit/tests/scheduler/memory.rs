@@ -34,10 +34,11 @@ use crate::harness::{A, BLOCK, Deployment, Harness, prompt, sharing, token};
 const WINDOW: CacheGroupKind = CacheGroupKind::SlidingWindow { window: 8 };
 
 /// The model of a full-attention cache group (class 0) and a sliding window (class 1).
-const HYBRID: [(CacheGroupKind, u32); 2] = [(CacheGroupKind::Full, BLOCK), (WINDOW, BLOCK)];
+pub(crate) const HYBRID: [(CacheGroupKind, u32); 2] =
+    [(CacheGroupKind::Full, BLOCK), (WINDOW, BLOCK)];
 
 /// The commits of `owner` the buffer pool took, per class, each class's keys by position.
-fn commits(harness: &Harness, owner: OwnerId) -> HashMap<u8, Vec<(u32, Key)>> {
+pub(crate) fn commits(harness: &Harness, owner: OwnerId) -> HashMap<u8, Vec<(u32, Key)>> {
     let mut commits: HashMap<u8, Vec<(u32, Key)>> = HashMap::new();
     for request in harness.taken() {
         if let Request::Commit {
@@ -59,7 +60,7 @@ fn commits(harness: &Harness, owner: OwnerId) -> HashMap<u8, Vec<(u32, Key)>> {
 }
 
 /// The keys of `class` among `commits`, by position.
-fn keys_of(commits: &HashMap<u8, Vec<(u32, Key)>>, class: u8) -> Vec<Key> {
+pub(crate) fn keys_of(commits: &HashMap<u8, Vec<(u32, Key)>>, class: u8) -> Vec<Key> {
     let keys = commits.get(&class).into_iter().flatten();
     keys.map(|(_, key)| *key).collect()
 }
@@ -779,7 +780,7 @@ fn a_resumed_requests_partial_last_block_is_cloned_and_written() {
 }
 
 /// The keys of every `Store` to the host the buffer pool took, in order, a key once per store.
-fn host_stores(harness: &Harness) -> Vec<Key> {
+pub(crate) fn host_stores(harness: &Harness) -> Vec<Key> {
     let stores = harness
         .taken()
         .into_iter()
@@ -937,10 +938,11 @@ fn offered_once(harness: &Harness, keys: &[Key]) {
 }
 
 /// A block whose `Store` to the host found no room is not offered to the host again until the
-/// host region has room: while the region holds no unit, the policy's `offload`, which names each
-/// step every block no request holds that the host lacks, stores none of them again, and once the
-/// region grows they are stored (SD §4.4 "The write policy": a store that stored nothing backs
-/// off until something that could change its answer happens).
+/// host region has room: while the region holds no unit, neither the scheduler nor the policy's
+/// `offload`, which names a block once no request holds it, stores any of them again, and once
+/// the region grows the scheduler offers them again and they are stored (SD §4.4 "The write
+/// policy": a store that stored nothing backs off until something that could change its answer
+/// happens).
 #[test]
 fn a_block_the_host_had_no_room_for_is_offered_again_once_the_host_has_room() {
     let mut harness = Deployment::tokens().host(64).build();
@@ -962,8 +964,8 @@ fn a_block_the_host_had_no_room_for_is_offered_again_once_the_host_has_room() {
 }
 
 /// A block whose copy to the host failed is not offered to the host again until a `Store` into
-/// the host region stores a block, which shows that the tier copies again: then it is stored (SD
-/// §4.4 "The write policy").
+/// the host region stores a block, which shows that the tier copies again: then the scheduler
+/// offers it again and it is stored (SD §4.4 "The write policy").
 #[test]
 fn a_block_whose_copy_to_the_host_failed_is_offered_again_once_the_host_stores_again() {
     let mut harness = Deployment::tokens().host(64).build();

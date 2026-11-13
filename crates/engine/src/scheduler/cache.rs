@@ -8,7 +8,7 @@
 //! Every completion read from the queue pair is applied here (`learn`), one dropped for a
 //! forgotten owner too, since what it states of the buffer pool's cache holds all the same; a
 //! request gives up the blocks it holds by `unpin`. Each change of a row is told to the policy
-//! (`Cached`, `Hit`, `Released`, `Freed`, `Encoded`, SD §5.2). Before a step schedules, `install_victims`
+//! (`Cached`, `Hit`, `Released`, `Held`, `Freed`, `Encoded`, SD §5.2). Before a step schedules, `install_victims`
 //! installs the head of each order by `Victims`, ahead of the step's allocations, and asks for a
 //! `List` when the buffer pool counts evictable units the scheduler cannot account for. The table is exact for what this queue pair
 //! commits and evicts; a wrong belief costs reuse, never a wrong block, since every request that
@@ -343,7 +343,8 @@ impl Scheduler {
 
     /// Records that a `Store` to the host stored nothing for `keys`: with `full` it was answered
     /// `Full`, and the block waits for its host region's `available` word to rise above what it
-    /// shows now as well as for a `Store` into the region that stores a block.
+    /// shows now as well as for a `Store` into the region that stores a block, when `offload`
+    /// offers it again.
     fn refuse(&mut self, keys: &[Key], full: bool) {
         for key in keys {
             let Some(region) = self.host_region_of(key) else {
@@ -352,6 +353,7 @@ impl Scheduler {
             let stores = self.stores.get(region).copied().unwrap_or(0);
             let word = full.then(|| self.capacity_word(region, 0));
             self.change_row(key, None, |row| row.refused = Some((stores, word)));
+            self.unstored.insert(Cached::id(key));
         }
     }
 
@@ -626,11 +628,14 @@ impl Scheduler {
     /// Tells the policy how a row changed (SD §5.2). A KV block (of a class with a block size)
     /// that the last request holding it gave up, and nothing else the policy sees changed, is one
     /// page of a `Released`, which lists the pages of consecutive releases in the order they
-    /// joined the eviction order; one that enters `cache`, or whose tier or evictability as the
-    /// policy sees them changes otherwise, is `Cached`; one held by one more request and nothing
-    /// else the policy sees is a `Hit`; one that leaves is `Freed`. An encoder output (of a sized
-    /// class a group of the scheduler computes into device memory) that enters `cache` or is used
-    /// again is `Encoded`. A stored trajectory, on the host alone, is no object of the policy's.
+    /// joined the eviction order; one that no request held and a request holds now, nothing else
+    /// the policy sees changed, is one page of a `Held`, which lists the pages of consecutive
+    /// holds in the order they were taken; one that enters `cache`, or whose tier or evictability
+    /// as the policy sees them changes otherwise, is `Cached`; one held by one more request and
+    /// nothing else the policy sees is a `Hit`; one that leaves is `Freed`. An encoder output (of
+    /// a sized class a group of the scheduler computes into device memory) that enters `cache` or
+    /// is used again is `Encoded`. A stored trajectory, on the host alone, is no object of the
+    /// policy's.
     fn tell(&mut self, before: Option<Cached>, after: Option<Cached>) {
         let Some(row) = after.or(before) else {
             return;
@@ -657,6 +662,22 @@ impl Scheduler {
                     return;
                 }
                 Event::Released {
+                    pages: vec![PageId(id)],
+                }
+            }
+            // A hold: a request takes the block out of the eviction order, which the event
+            // states, and uses it now, which its place in the order states.
+            (true, Some(old), Some(new))
+                if old.pins == 0
+                    && new.pins > 0
+                    && old.tokens == new.tokens
+                    && old.page().on_host == new.page().on_host =>
+            {
+                if let Some(Event::Held { pages }) = self.policy.events.last_mut() {
+                    pages.push(PageId(id));
+                    return;
+                }
+                Event::Held {
                     pages: vec![PageId(id)],
                 }
             }
@@ -1141,6 +1162,121 @@ mod tests {
         assert!(
             matches!(&events[..], [Event::Released { pages }] if *pages == [page(3), page(2), page(1)]),
             "{events:?}"
+        );
+    }
+
+    /// An admission that pins blocks no request held tells the policy one `Held`, which lists
+    /// them in the order they were pinned, and they leave the eviction order (SD §4.4, §4.5); a
+    /// block pinned by one more request is a `Hit`.
+    #[test]
+    fn a_pin_of_many_evictable_blocks_is_one_event_in_the_order_they_were_taken() {
+        let mut bench = bench(4096);
+        list(
+            &mut bench,
+            &[(key(1), DEVICE), (key(2), DEVICE), (key(3), DEVICE)],
+        );
+        bench.scheduler.install_victims();
+        assert_eq!(written(&mut bench), [victims(&[key(1), key(2), key(3)])]);
+        bench.scheduler.policy.events.clear();
+
+        bench.attach(&[(A, OWNER_A, 3)]);
+        let pin = |keys: &[Key]| runtime::Request::Pin {
+            owner: OWNER_A,
+            class: KV,
+            at: 0,
+            keys: keys.to_vec(),
+        };
+        let pinned = |blocks: u32| Completion::Pinned {
+            runs: (0..blocks).map(|block| (4, block + 1, 1)).collect(),
+            host: 0,
+        };
+        exchange(&mut bench, pin(&[key(3), key(1)]), &pinned(2));
+        exchange(&mut bench, pin(&[key(3)]), &pinned(1));
+        bench.scheduler.install_victims();
+        assert_eq!(written(&mut bench), [victims(&[key(2)])]);
+
+        let events = &bench.scheduler.policy.events;
+        assert!(
+            matches!(
+                &events[..],
+                [Event::Held { pages }, Event::Hit { page: hit }]
+                    if *pages == [page(3), page(1)] && *hit == page(3)
+            ),
+            "{events:?}"
+        );
+    }
+
+    /// An admission that reuses a warm cache, pinning 1000 blocks of 64 tokens no request held,
+    /// tells the policy one `Held` of them: the step's `observe` and `dispatch` together consume
+    /// at most half of a call's fuel (SD §5.2 "Faults"), where restating each block as a page
+    /// costs about as much as a call has. The policy saw the pins: a shortage of device units
+    /// takes none of the blocks.
+    #[test]
+    fn an_admission_pinning_a_thousand_cached_blocks_stays_well_within_a_calls_fuel() {
+        use scheduling::decision::{Room, Shortage, Storage, Victim};
+        use scheduling::limits::Parameters;
+
+        use crate::scheduler::packaged;
+        use crate::scheduler::policy::{self, DEFAULT_CALL_FUEL, Policy};
+
+        const BLOCKS: u64 = 1000;
+        let numbered = |number: u64| {
+            let mut bytes = [0; 32];
+            bytes[..8].copy_from_slice(&(number + 1).to_be_bytes());
+            Key(bytes)
+        };
+        let keys: Vec<Key> = (0..BLOCKS).map(numbered).collect();
+
+        let mut bench = bench(1 << 20);
+        let listed: Vec<(Key, u8)> = keys.iter().map(|&key| (key, DEVICE)).collect();
+        list(&mut bench, &listed);
+        bench.attach(&[(A, OWNER_A, 3)]);
+        let snapshot = bench.scheduler.snapshot();
+        let ceilings = policy::ceilings([]);
+        bench.scheduler.policy =
+            Policy::new(packaged("fcfs"), Parameters::default(), snapshot, &ceilings).unwrap();
+
+        let pin = runtime::Request::Pin {
+            owner: OWNER_A,
+            class: KV,
+            at: 0,
+            keys: keys.clone(),
+        };
+        let pinned = Completion::Pinned {
+            runs: vec![(4, 1, 1); keys.len()],
+            host: 0,
+        };
+        exchange(&mut bench, pin, &pinned);
+
+        let scheduler = &mut bench.scheduler;
+        let room = Room {
+            token_budget: 8192,
+            call_budget: 128,
+            page_tokens: 64,
+            ..Room::default()
+        };
+        let fuel = scheduler.policy.fuel;
+        let output = scheduler
+            .policy
+            .dispatch(&room, &mut scheduler.requests, &scheduler.groups)
+            .unwrap();
+        let spent = scheduler.policy.fuel - fuel;
+        assert!(
+            spent <= DEFAULT_CALL_FUEL / 2,
+            "observe and dispatch took {spent} fuel"
+        );
+        assert!(output.offload.is_empty());
+
+        let shortage = Shortage {
+            kind: Storage::KvUnits,
+            need: BLOCKS,
+        };
+        let victims = scheduler.policy.preempt(&shortage).unwrap();
+        assert!(
+            !victims
+                .iter()
+                .any(|victim| matches!(victim, Victim::Page(_))),
+            "{victims:?}"
         );
     }
 

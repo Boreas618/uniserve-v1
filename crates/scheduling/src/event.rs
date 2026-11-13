@@ -4,8 +4,10 @@
 //! order they happened, once per step (`Policy::observe`). Events are
 //! proportional to state changes, never to running requests or cache pages:
 //! an ordered structure such as an LRU list is the policy's own, maintained
-//! from [`Event::Cached`], [`Event::Hit`], [`Event::Released`] and
-//! [`Event::Freed`] (design §4.4).
+//! from [`Event::Cached`], [`Event::Hit`], [`Event::Released`],
+//! [`Event::Held`] and [`Event::Freed`] (design §4.4), and a request's view is
+//! the last one [`Event::Arrived`] or [`Event::Updated`] stated, advanced by
+//! [`Event::Admitted`] and [`Event::Emitted`].
 //!
 //! The list is append-only. A policy module older than the mechanism skips an
 //! event kind it does not know: the wire decodes it into [`Event::Unknown`].
@@ -69,17 +71,20 @@ pub enum Event {
     Arrived { request: RequestView },
     /// The mechanism admitted a waiting request.
     Admitted { request: RequestId },
-    /// A running request's view changed in a way the policy must see: its
-    /// next phase changed, its prompt progress or cached prefix moved, its
-    /// page count changed. Emitted before the `dispatch` of the step the
-    /// change belongs to, and always after the event that caused it.
+    /// A request's view changed in a way the policy must see: its next phase
+    /// changed, its prompt progress or cached prefix moved, its page count
+    /// changed. Emitted before the `dispatch` of the step the change belongs
+    /// to, and always after the event that caused it.
     ///
     /// This kind is an addition to §4.4's list, which allows a mechanism to
-    /// append events it needs: `next_tokens`, `remaining_tokens`,
-    /// `cached_pages`, `cache_rank` and `waiting_transfer` move without any
-    /// other event carrying them, and a policy cannot derive them. It is
-    /// emitted only when the view actually moved, so the event count stays
-    /// proportional to the step's state changes.
+    /// append events it needs: `next_tokens`, `cached_pages`, `cache_rank` and
+    /// `waiting_transfer` move without any other event carrying them, and a
+    /// policy cannot derive them. It is emitted only when the view differs
+    /// from the one the policy holds by the events before it (the last view
+    /// stated, advanced by `Admitted` and `Emitted`), so a request whose step
+    /// moved only what those events carry is not restated, and the event
+    /// count stays proportional to the step's state changes. The view states
+    /// no `last_emitted_at`: the policy keeps the one `Emitted` gave.
     Updated { request: RequestView },
     /// A call of the request advanced: its phase ran and produced `tokens`
     /// tokens (or latent units, for a media phase). One event per completed
@@ -89,7 +94,12 @@ pub enum Event {
         phase: PhaseId,
         tokens: u32,
     },
-    /// The request emitted `tokens` to the client.
+    /// The request emitted `tokens` to the client: it generated as many more
+    /// tokens (`RequestView::generated_tokens`), may generate as many fewer
+    /// (`RequestView::remaining_tokens`, at least 0) and last emitted `at`.
+    /// A running request's every generated token is emitted, so a policy
+    /// keeps both counts exact from this event, and no `Updated` restates
+    /// them.
     Emitted {
         request: RequestId,
         tokens: u32,
@@ -102,7 +112,8 @@ pub enum Event {
     /// A page entered the cache, or its tier or whether a request holds it
     /// changed other than by a release: the page as it stands now.
     Cached { page: PageView },
-    /// A device page was used again.
+    /// A device page was used again by one more request; whether a request
+    /// holds it did not change.
     Hit { page: PageId },
     /// A page was freed.
     Freed { page: PageId },
@@ -114,6 +125,12 @@ pub enum Event {
     /// page that consecutive releases gave up, so a request that ends holding
     /// many blocks costs one event rather than one restated page per block.
     Released { pages: Vec<PageId> },
+    /// Pages no request held and a request holds again, in the order they
+    /// were taken: each leaves the eviction order, is not evictable from now
+    /// on and was used just now, and nothing else of it changed. The
+    /// opposite of [`Event::Released`]: an admission that reuses many cached
+    /// blocks costs one event rather than one restated page per block.
+    Held { pages: Vec<PageId> },
     /// An event kind this policy does not know; skipped.
     #[serde(other)]
     Unknown,
@@ -225,6 +242,9 @@ enum Variants {
         entry: EncodingView,
     },
     Released {
+        pages: Vec<PageId>,
+    },
+    Held {
         pages: Vec<PageId>,
     },
     Unknown,
@@ -397,6 +417,9 @@ mod tests {
             },
             Event::Released {
                 pages: vec![PageId(61), PageId(u64::MAX), PageId(67)],
+            },
+            Event::Held {
+                pages: vec![PageId(71), PageId(u64::MAX)],
             },
             Event::Unknown,
         ]

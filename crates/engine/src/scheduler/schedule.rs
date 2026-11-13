@@ -26,7 +26,7 @@ use scheduling::{Duration as Span, Event as PolicyEvent};
 use storage::Key;
 use storage::runtime::{self, GroupId, OwnerId, Tier};
 
-use super::cache::HOST;
+use super::cache::{DEVICE, HOST};
 use super::group::variants;
 use super::update::migratable;
 use super::view::{call_view, replica_views, view_of};
@@ -650,6 +650,11 @@ impl Scheduler {
     /// offered to the host once, SD §4.4), whose last `Store` stored nothing while nothing that
     /// could change that has happened since ([`Scheduler::store_refused`]), or of a class without
     /// a host region is skipped.
+    ///
+    /// A policy names a block once. A block whose last `Store` to the host stored nothing is
+    /// offered again by the scheduler, after the policy's blocks and least recently used first,
+    /// once something that could change that answer has happened, while no request holds it and
+    /// it has a device copy and no host copy (SD §4.4 "The write policy").
     fn offload(&mut self, pages: &[PageId]) {
         // The keys a `Store` to the host held or outstanding names: until its answer, `cache`
         // does not show them on the host.
@@ -669,9 +674,31 @@ impl Scheduler {
             .copied()
             .collect();
 
+        // The blocks offered again; one still held back stays recorded, and one with a host copy
+        // or no device copy leaves the record.
+        let mut again: Vec<(u64, u64)> = Vec::new();
+        let mut held_back = HashSet::new();
+        for id in std::mem::take(&mut self.unstored) {
+            let Some(row) = self.cache.get(&id) else {
+                continue;
+            };
+            if row.tiers & HOST != 0 || row.tiers & DEVICE == 0 {
+                continue;
+            }
+            if row.pins > 0 || storing.contains(&row.key) || self.store_refused(row) {
+                held_back.insert(id);
+            } else {
+                again.push((row.last_used, id));
+            }
+        }
+        self.unstored = held_back;
+        again.sort_unstable();
+
+        let mut offered = HashSet::new();
         let mut stores: Vec<(GroupId, Vec<Key>)> = Vec::new();
-        for page in pages {
-            let Some(row) = self.cache.get(&page.0) else {
+        let named = pages.iter().map(|page| page.0);
+        for id in named.chain(again.into_iter().map(|(_, id)| id)) {
+            let Some(row) = self.cache.get(&id) else {
                 continue;
             };
             let hosted = self
@@ -682,6 +709,7 @@ impl Scheduler {
                 || !hosted
                 || storing.contains(&row.key)
                 || self.store_refused(row)
+                || !offered.insert(id)
             {
                 continue;
             }
@@ -1864,5 +1892,58 @@ mod tests {
         // Outstanding, it is not offered again either.
         bench.scheduler.offload(&[page]);
         assert!(written(&mut bench).is_empty());
+    }
+
+    /// A policy names a block once; a block whose `Store` to the host stored nothing is offered
+    /// again by the scheduler, unnamed, once a `Store` into its host region has stored a block,
+    /// and not before (SD §4.4 "The write policy").
+    #[test]
+    fn a_block_whose_store_stored_nothing_is_offered_again_once_its_host_region_stores_one() {
+        let mut bench = bench(4096);
+        // Group A's blocks of class `KV` have a host copy region (index 2); one no request holds
+        // is on the device in A.
+        bench.scheduler.classes[usize::from(KV)].host = Some((2, 1));
+        let block = super::super::Cached {
+            key: key(1),
+            class: KV,
+            tokens: 16,
+            tiers: super::super::cache::DEVICE,
+            groups: 1 << A.0,
+            pins: 0,
+            last_used: 1,
+            refused: None,
+        };
+        let page = PageId(super::super::Cached::id(&block.key));
+        bench.scheduler.cache.insert(page.0, block);
+        let store = runtime::Request::Store {
+            group: A,
+            keys: vec![key(1)],
+            tier: Tier::Host,
+        };
+
+        // The host region has no room for it.
+        bench.scheduler.offload(&[page]);
+        bench.scheduler.post().unwrap();
+        let taken = bench.take();
+        assert_eq!(taken.len(), 1);
+        assert_eq!(taken[0].1, store);
+        bench.complete(taken[0].0, &Completion::Full { region: 6 });
+        assert_eq!(bench.answers().len(), 1);
+
+        let offered = |bench: &mut Bench| -> Vec<runtime::Request> {
+            bench.scheduler.offload(&[]);
+            bench.scheduler.post().unwrap();
+            bench
+                .take()
+                .into_iter()
+                .map(|(_, request)| request)
+                .collect()
+        };
+        assert!(offered(&mut bench).is_empty(), "nothing has moved");
+
+        // A `Store` into the region stored a block.
+        bench.scheduler.stores[2] += 1;
+        assert_eq!(offered(&mut bench), [store]);
+        assert!(offered(&mut bench).is_empty(), "it is being stored");
     }
 }
