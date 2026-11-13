@@ -293,6 +293,7 @@ impl BufferPool {
             blocks: blocks.collect(),
             groups,
             copies,
+            ..BufferPoolListing::default()
         }
     }
 

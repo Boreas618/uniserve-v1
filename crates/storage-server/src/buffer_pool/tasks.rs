@@ -505,8 +505,9 @@ impl BufferPool {
     /// Tells the buffer pool the time. A task past its deadline is told to
     /// stop; a prefetch and a put are answered at once with what they
     /// brought, a transfer when its task has ended. R9: the blocks a task
-    /// holds stay held until its end.
-    pub fn tick(&mut self, now: u64) {
+    /// holds stay held until its end. Returns whether a task passed its
+    /// deadline.
+    pub fn tick(&mut self, now: u64) -> bool {
         self.now = now;
         let late = |copies: &Vec<Copy>| {
             copies
@@ -520,6 +521,7 @@ impl BufferPool {
             .filter(|(_, copies)| late(copies))
             .map(|(task, _)| *task)
             .collect();
+        let passed = !due.is_empty();
 
         for task in due {
             let Some(copies) = self.copies.get_mut(&task) else {
@@ -548,5 +550,6 @@ impl BufferPool {
             }
         }
         self.settle_counts();
+        passed
     }
 }

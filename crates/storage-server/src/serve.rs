@@ -60,6 +60,10 @@ pub struct ServeOptions {
     /// How long a buffer pool's put of host copies to the remote store may
     /// take before it is stopped and answered with the keys put so far.
     pub put_deadline: Duration,
+    /// Record the trace of every buffer pool's inputs in this directory.
+    pub buffer_pool_trace: Option<PathBuf>,
+    /// Check every buffer pool's tables after each input it acts on.
+    pub buffer_pool_check: bool,
     /// Go on with the server the predecessor of a restart in place passes on on
     /// the handoff socket at this descriptor, rather than binding the
     /// socket (`crate::restart`).
@@ -277,6 +281,7 @@ fn serve_on(options: &ServeOptions, ready: Option<service::Ready>) -> anyhow::Re
     }
     server.set_relaunch(crate::relaunch_arguments(std::env::args_os().collect()));
     server.set_deadlines(options.transfer_deadline, options.put_deadline);
+    server.watch_pools(options.buffer_pool_trace.clone(), options.buffer_pool_check);
     tracing::info!(socket = %socket.display(), "storage server listening");
     signal(ready);
     run_until_stopped(server, &wake, &stop, lock)
@@ -294,6 +299,7 @@ fn serve_resumed(options: &ServeOptions, descriptor: i32) -> anyhow::Result<()> 
     )
     .context("taking the server over from its predecessor")?;
     server.set_deadlines(options.transfer_deadline, options.put_deadline);
+    server.watch_pools(options.buffer_pool_trace.clone(), options.buffer_pool_check);
     let lock = service::SocketLock::resume(lock, options.socket.clone());
     tracing::info!(socket = %options.socket.display(), "storage server listening after a restart in place");
     run_until_stopped(server, &wake, &stop, lock)

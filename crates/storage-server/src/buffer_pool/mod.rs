@@ -38,6 +38,7 @@ mod region;
 mod sessions;
 mod state;
 mod tasks;
+pub mod trace;
 
 use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};

@@ -80,6 +80,19 @@ pub enum Command {
         /// keys put so far.
         #[arg(long, default_value_t = crate::sessions::PUT_DEADLINE.as_secs())]
         put_deadline_s: u64,
+        /// Record the trace of every buffer pool's inputs in this directory:
+        /// per deployment, every input its pool acts on and every completion
+        /// it produces (`specs/buffer-pool.md` §18), which
+        /// `verification/buffer-pool/replay.sh` replays and checks against
+        /// the design model. A failure to write stops the trace, not the
+        /// pool.
+        #[arg(long, value_name = "DIRECTORY")]
+        buffer_pool_trace: Option<PathBuf>,
+        /// Check every buffer pool's tables after each input it acts on: an
+        /// inconsistency is logged when the pool turns inconsistent and
+        /// counted in its listing (`check_failures`), and the pool goes on.
+        #[arg(long)]
+        buffer_pool_check: bool,
         /// The descriptor of the handoff socket to the server this one
         /// succeeds in a restart in place (`storage-server restart`), which it goes on
         /// with.
@@ -206,6 +219,8 @@ pub fn run(args: Args) -> anyhow::Result<()> {
             nixl_library,
             transfer_deadline_s,
             put_deadline_s,
+            buffer_pool_trace,
+            buffer_pool_check,
             predecessor,
         } => mooncake.settings().and_then(|connector| {
             let executable = std::env::current_exe().context("locating this executable")?;
@@ -230,6 +245,8 @@ pub fn run(args: Args) -> anyhow::Result<()> {
                 nixl_library,
                 transfer_deadline: std::time::Duration::from_secs(transfer_deadline_s),
                 put_deadline: std::time::Duration::from_secs(put_deadline_s),
+                buffer_pool_trace,
+                buffer_pool_check,
                 predecessor,
             })
         }),

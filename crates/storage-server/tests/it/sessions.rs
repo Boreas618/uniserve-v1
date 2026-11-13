@@ -202,7 +202,12 @@ pub(crate) fn listed(socket: &std::path::Path) -> ::storage::protocol::BufferPoo
 
 #[test]
 fn an_engine_opens_a_session_and_its_schedulers_are_served_on_their_queue_pairs() {
-    let server = Running::with_transfer(|_| None);
+    serve_a_session(&Running::with_transfer(|_| None));
+}
+
+/// An engine opens a session on `server`, its two schedulers are served on
+/// their queue pairs, and it closes the session.
+pub(crate) fn serve_a_session(server: &Running) {
     let mut engine = engine_head(&server.socket, 0);
     let (opened, descriptors) = engine.open_pool(layout(0)).unwrap();
     let units: Vec<u32> = opened.regions.iter().map(|(_, units)| *units).collect();

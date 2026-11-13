@@ -52,6 +52,7 @@ pub(crate) mod polling;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::os::fd::OwnedFd;
+use std::path::PathBuf;
 use std::sync::{Arc, mpsc};
 use std::time::Duration;
 
@@ -231,6 +232,13 @@ impl Sessions {
         self.transfer_deadline = transfer;
         let limits = limits(transfer, put);
         self.thread.send(move |pools| pools.set_limits(limits));
+    }
+
+    /// From now on, records the trace of every buffer pool's inputs in the
+    /// directory `trace`, and checks every pool's tables after each input
+    /// when `check` is set ([`polling::Pools::watch`]).
+    pub(crate) fn watch_pools(&self, trace: Option<PathBuf>, check: bool) {
+        self.thread.send(move |pools| pools.watch(trace, check));
     }
 
     fn with(thread: polling::Thread) -> std::io::Result<Self> {

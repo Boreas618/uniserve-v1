@@ -44,7 +44,13 @@ impl Running {
     /// A server that runs the Transfer Server `transfer` names for its
     /// socket.
     pub(crate) fn with_transfer(transfer: impl FnOnce(&Path) -> Option<Launch>) -> Self {
-        Self::serving(0, None, transfer)
+        Self::serving(0, |_| {}, transfer)
+    }
+
+    /// A server that `configure` sets up before it serves, with no Transfer
+    /// Server.
+    pub(crate) fn configured(configure: impl FnOnce(&mut Server) + Send + 'static) -> Self {
+        Self::serving(0, configure, |_| None)
     }
 
     /// A server whose buffer pools stop a transfer between worker groups
@@ -54,18 +60,22 @@ impl Running {
         deadlines: (Duration, Duration),
         transfer: impl FnOnce(&Path) -> Option<Launch>,
     ) -> Self {
-        Self::serving(0, Some(deadlines), transfer)
+        Self::serving(
+            0,
+            move |server: &mut Server| server.set_deadlines(deadlines.0, deadlines.1),
+            transfer,
+        )
     }
 
     /// A server that leaves `host_reserve` bytes of the host's available
     /// storage to other processes.
     fn reserving(host_reserve: u64) -> Self {
-        Self::serving(host_reserve, None, |_| None)
+        Self::serving(host_reserve, |_| {}, |_| None)
     }
 
     fn serving(
         host_reserve: u64,
-        deadlines: Option<(Duration, Duration)>,
+        configure: impl FnOnce(&mut Server) + Send + 'static,
         transfer: impl FnOnce(&Path) -> Option<Launch>,
     ) -> Self {
         let directory = tempfile::tempdir().unwrap();
@@ -87,9 +97,7 @@ impl Running {
             let _lock = lock;
             // Pools of four 16-byte pages.
             let mut server = Server::new(listener, 64, host_reserve, None, transfer).unwrap();
-            if let Some((transfer, put)) = deadlines {
-                server.set_deadlines(transfer, put);
-            }
+            configure(&mut server);
             server.listen_tcp(tcp).unwrap();
             server
                 .run(reader.as_fd(), &|| stopped.load(Ordering::Acquire))

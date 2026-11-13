@@ -1,7 +1,10 @@
 //! Every request sequence of small configurations, enumerated: no sequence
 //! breaks an invariant, and every state reached is written in the terms of
 //! the design model so that it can be compared with the states of the
-//! model's buffer pool (`verification/buffer-pool/agreement.sh`).
+//! model's buffer pool (`verification/buffer-pool/agreement.sh`), and every
+//! transition with the input that made it, so that it can be compared with
+//! the model's steps (`agreement_steps.sh`). The pool is driven by the
+//! inputs the buffer pool's thread records ([`super::trace`]).
 //!
 //! The configurations are those of `MC_Pool` there, one per [`Shape`]: one
 //! key and one position, one or two owners, a prefill group and for
@@ -11,12 +14,12 @@
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fmt::Write as _;
-use std::rc::Rc;
 
 use storage::protocol::Key;
-use storage::runtime::{Completion, GroupId, OwnerId, Request, RequestId, Source, Stamps, Tier};
+use storage::runtime::{GroupId, OwnerId, Request, RequestId, Source, Stamps, Tier};
 
-use super::{Block, BufferPool, Class, Copy, Deferred, Held, Target};
+use super::trace::{Input, apply, classes, copies_asked, layout, stated, stated_input};
+use super::{BufferPool, Class, Copy, Target};
 
 const KV: u8 = 0;
 const TRAJECTORY: u8 = 1;
@@ -211,14 +214,13 @@ impl Driver {
             number: 0,
             copies: 0,
         };
-        driver.submit(Request::Victims {
-            region: UNITS,
-            keys: vec![key()],
-        });
-        driver.submit(Request::Victims {
-            region: host,
-            keys: vec![key()],
-        });
+        for region in [UNITS, host] {
+            let victims = driver.request(Request::Victims {
+                region,
+                keys: vec![key()],
+            });
+            driver.act(&victims);
+        }
         driver
     }
 
@@ -235,15 +237,24 @@ impl Driver {
         }
     }
 
-    fn submit(&mut self, request: Request) {
+    /// A request on the queue pair, under the next number, as the buffer
+    /// pool's thread takes it.
+    fn request(&mut self, request: Request) -> Input {
         self.number += 1;
-        self.pool.take(QUEUE, RequestId(self.number), request);
-        // Every request has exactly one completion, now or later.
+        let mut record = Vec::new();
+        request.encode(RequestId(self.number), &mut record);
+        Input::Request(QUEUE, record)
+    }
+
+    /// Acts on an input as the buffer pool's thread does, and counts the
+    /// copies its completions ask for.
+    fn act(&mut self, input: &Input) {
+        apply(&mut self.pool, input).unwrap();
         for (_, _, completion) in self.pool.completions() {
-            if let Completion::Copy { .. } = completion {
-                self.copies += 1;
-            }
+            self.copies += copies_asked(&completion);
         }
+        self.pool.started();
+        self.pool.stopped();
     }
 
     /// The copies in flight by the request that started each: those an
@@ -341,351 +352,133 @@ impl Driver {
         steps
     }
 
-    fn apply(&mut self, step: Step) {
+    /// Takes a step: the input it is in this state, acted on as the buffer
+    /// pool's thread acts on it. Returns the input.
+    fn apply(&mut self, step: Step) -> Input {
         let owner = OwnerId;
-        match step {
-            Step::Attach(o, group) => self.submit(Request::Attach {
+        let request = match step {
+            Step::Attach(o, group) => Request::Attach {
                 owner: owner(o),
                 group: GroupId(group),
-            }),
-            Step::Allocate(o) => self.submit(Request::Allocate {
+            },
+            Step::Allocate(o) => Request::Allocate {
                 owner: owner(o),
                 class: KV,
                 at: 0,
                 count: 1,
                 units: 0,
-            }),
-            Step::Pin(o) => self.submit(Request::Pin {
+            },
+            Step::Pin(o) => Request::Pin {
                 owner: owner(o),
                 class: KV,
                 at: 0,
                 keys: vec![key()],
-            }),
-            Step::Clone(o) => self.submit(Request::Clone {
+            },
+            Step::Clone(o) => Request::Clone {
                 owner: owner(o),
                 class: KV,
                 at: 0,
                 key: key(),
-            }),
-            Step::Load(o) => self.submit(Request::Load {
+            },
+            Step::Load(o) => Request::Load {
                 owner: owner(o),
                 class: KV,
                 at: 0,
                 keys: vec![key()],
-            }),
-            Step::Save(o) => self.submit(Request::Save {
+            },
+            Step::Save(o) => Request::Save {
                 owner: owner(o),
                 key: key(),
                 units: 1,
-            }),
-            Step::Restore(o) => self.submit(Request::Restore {
+            },
+            Step::Restore(o) => Request::Restore {
                 owner: owner(o),
                 key: key(),
-            }),
-            Step::Store(group) => self.submit(Request::Store {
+            },
+            Step::Store(group) => Request::Store {
                 group: GroupId(group),
                 keys: vec![key()],
                 tier: Tier::Host,
-            }),
-            Step::Evict => self.submit(Request::Evict { keys: vec![key()] }),
-            Step::Release(o, mask) => {
-                self.submit(Request::Release {
-                    owner: owner(o),
-                    class: KV,
-                    at: 0,
-                    count: 1,
-                    after: stamps(mask),
-                });
-            }
-            Step::Detach(o, mask) => self.submit(Request::Detach {
+            },
+            Step::Evict => Request::Evict { keys: vec![key()] },
+            Step::Release(o, mask) => Request::Release {
+                owner: owner(o),
+                class: KV,
+                at: 0,
+                count: 1,
+                after: stamps(mask),
+            },
+            Step::Detach(o, mask) => Request::Detach {
                 owner: owner(o),
                 after: stamps(mask),
-            }),
-            Step::Commit(o, mask) => {
-                let commit = Request::Commit {
-                    owner: owner(o),
-                    class: KV,
-                    at: 0,
-                    key: key(),
-                    tokens: 64,
-                    after: stamps(mask),
-                };
-                self.submit(commit);
-            }
-            Step::Transfer(o, group, mask) => {
-                self.submit(Request::Transfer {
-                    owner: owner(o),
-                    group: GroupId(group),
-                    after: stamps(mask),
-                });
-            }
-            Step::Finish(copy, ok, mask) => {
-                let copy = self.in_flight(false)[copy].1;
-                self.submit(Request::Finish {
-                    copy,
-                    ok,
-                    after: stamps(mask),
-                });
-            }
-            Step::Advance(group) => {
-                let completed = self.pool.groups[&(SESSION, GroupId(group))].completed;
-                self.pool.advance(SESSION, GroupId(group), completed + 1);
-            }
-            Step::Prefetch => {
-                let prefetch = Request::Prefetch {
-                    class: KV,
-                    units: 0,
-                    keys: vec![key()],
-                    source: Source::Remote,
-                    deadline: u64::MAX - 1,
-                };
-                self.submit(prefetch);
-            }
-            Step::Put => self.submit(Request::Store {
+            },
+            Step::Commit(o, mask) => Request::Commit {
+                owner: owner(o),
+                class: KV,
+                at: 0,
+                key: key(),
+                tokens: 64,
+                after: stamps(mask),
+            },
+            Step::Transfer(o, group, mask) => Request::Transfer {
+                owner: owner(o),
+                group: GroupId(group),
+                after: stamps(mask),
+            },
+            Step::Finish(copy, ok, mask) => Request::Finish {
+                copy: self.in_flight(false)[copy].1,
+                ok,
+                after: stamps(mask),
+            },
+            Step::Prefetch => Request::Prefetch {
+                class: KV,
+                units: 0,
+                keys: vec![key()],
+                source: Source::Remote,
+                deadline: u64::MAX - 1,
+            },
+            Step::Put => Request::Store {
                 group: GroupId(0),
                 keys: vec![key()],
                 tier: Tier::Remote,
-            }),
-            Step::Deadline => self.pool.tick(u64::MAX - 1),
-            Step::Done(task) => self.pool.done(self.in_flight(true)[task], 64),
-            Step::Ended(task, ok) => self.pool.ended(self.in_flight(true)[task], ok),
-        }
-        self.pool.completions();
-        self.pool.started();
-        self.pool.stopped();
+            },
+            Step::Advance(group) => {
+                let completed = self.pool.groups[&(SESSION, GroupId(group))].completed;
+                return self.acted(Input::Completed(SESSION, GroupId(group), completed + 1));
+            }
+            Step::Deadline => return self.acted(Input::Tick(u64::MAX - 1)),
+            Step::Done(task) => return self.acted(Input::Done(self.in_flight(true)[task], 64)),
+            Step::Ended(task, ok) => {
+                return self.acted(Input::Ended(self.in_flight(true)[task], ok));
+            }
+        };
+        let input = self.request(request);
+        self.acted(input)
+    }
+
+    fn acted(&mut self, input: Input) -> Input {
+        self.act(&input);
+        input
     }
 
     /// The state in the terms of the design model, one line per fact.
     fn state(&self) -> String {
-        let pool = &self.pool;
-        let unit = |block: &Rc<Block>| {
-            block
-                .stated()
-                .map(|run| format!("{}:{}", run.0, run.1))
-                .collect::<Vec<_>>()
-                .join("+")
-        };
-        let units = |blocks: BTreeSet<String>| blocks.into_iter().collect::<Vec<_>>().join(" ");
-        let mut lines = vec![format!("ncopy {}", self.copies)];
-
-        let completed: BTreeMap<u8, u64> = pool
-            .groups
-            .iter()
-            .map(|((_, group), found)| (group.0, found.completed))
+        let owners: Vec<_> = (1..=self.shape.owners)
+            .map(|number| (QUEUE, OwnerId(number)))
             .collect();
-        lines.push(
-            completed
-                .iter()
-                .fold("completed".to_owned(), |line, (group, at)| {
-                    format!("{line} g{group}={at}")
-                }),
-        );
-
-        let mut free = BTreeSet::new();
-        for (id, region) in pool.regions.iter().enumerate() {
-            for (first, count) in region.free_runs() {
-                free.extend((first..first + count).map(|unit| format!("{id}:{unit}")));
-            }
-        }
-        lines.push(format!("free {}", units(free)));
-
-        // An owner's number is taken once: a number below the highest that
-        // names no owner is of an owner that is gone.
-        let taken = pool.numbers.get(&QUEUE).map_or(0, |numbers| numbers.0);
-        for number in 1..=self.shape.owners {
-            let line = match pool.owners.get(&(SESSION, OwnerId(number))) {
-                Some(owner) => {
-                    let mut line = format!(
-                        "owner {number} live g{} slot={}",
-                        owner.group.0,
-                        unit(&owner.slot)
-                    );
-                    for (position, held) in &owner.tables[usize::from(KV)] {
-                        let kind = if matches!(held, Held::Private(_)) {
-                            "private"
-                        } else {
-                            "shared"
-                        };
-                        let _ = write!(line, " p{position}={kind}:{}", unit(held.block()));
-                    }
-                    line
-                }
-                None if number <= taken => format!("owner {number} gone"),
-                None => format!("owner {number} new"),
-            };
-            lines.push(line);
-        }
-
-        let mut valid = BTreeMap::new();
-        let mut note = |block: &Rc<Block>| {
-            let memories: Vec<String> = (0..8)
-                .filter(|bit| block.valid.get() & (1 << bit) != 0)
-                .map(|bit| format!("m{bit}"))
-                .collect();
-            valid.insert(unit(block), memories.join(" "));
-        };
-        for owner in pool.owners.values() {
-            owner.tables[usize::from(KV)]
-                .values()
-                .for_each(|held| note(held.block()));
-        }
-        for (key, entry) in &pool.cache {
-            entry.device.iter().for_each(|(block, _)| note(block));
-            let device = entry
-                .device
-                .first()
-                .map_or("-".to_owned(), |(block, _)| unit(block));
-            let host = entry
-                .host
-                .as_ref()
-                .map_or("-".to_owned(), |(block, ..)| unit(block));
-            lines.push(format!(
-                "key {:02x} d={device} h={host} remote={}",
-                key.0[0],
-                u8::from(entry.remote)
-            ));
-        }
-        lines.extend(
-            valid
-                .into_iter()
-                .map(|(unit, memories)| format!("valid {unit} {memories}").trim_end().to_owned()),
-        );
-
-        let copy_line = |copy: &Copy| {
-            let (kind, owner, position, memory) = match copy.to {
-                Target::Owner {
-                    owner,
-                    at,
-                    key: None,
-                    ..
-                } => ("clone", owner.0.to_string(), at.to_string(), copy.memory),
-                Target::Owner {
-                    owner,
-                    at,
-                    key: Some(_),
-                    ..
-                } => ("load", owner.0.to_string(), at.to_string(), copy.memory),
-                Target::Slot { owner } => ("restore", owner.0.to_string(), "-".to_owned(), 0),
-                Target::Entry { .. }
-                    if copy
-                        .reads
-                        .first()
-                        .is_some_and(|block| block.class == super::SLOT) =>
-                {
-                    let owner = pool
-                        .owners
-                        .iter()
-                        .find(|(_, owner)| Rc::ptr_eq(&owner.slot, &copy.reads[0]));
-                    (
-                        "save",
-                        owner.map_or("-".to_owned(), |((_, owner), _)| owner.0.to_string()),
-                        "-".to_owned(),
-                        0,
-                    )
-                }
-                _ => ("store", "-".to_owned(), "-".to_owned(), 0),
-            };
-            let memory = if memory == 0 {
-                "-".to_owned()
-            } else {
-                format!("m{}", memory.trailing_zeros())
-            };
-            let fill = u8::from(copy.fill);
-            format!(
-                "kind={kind} o={owner} p={position} read={} write={} fill={fill} mem={memory}",
-                unit(&copy.reads[0]),
-                unit(&copy.write)
-            )
-        };
-
-        let mut released = BTreeSet::new();
-        for (_, work) in pool.groups.values().flat_map(|group| &group.deferred) {
-            match work {
-                Deferred::Release { blocks } => released.extend(blocks.iter().map(&unit)),
-                Deferred::Commit {
-                    owner, at, block, ..
-                } => {
-                    lines.push(format!("commit o={} p={at} u={}", owner.0, unit(block)));
-                }
-                Deferred::Finish {
-                    queue, copy, ok, ..
-                } => {
-                    let copies = pool
-                        .copies
-                        .get(&(*queue, *copy))
-                        .map_or(&[][..], Vec::as_slice);
-                    lines.extend(
-                        copies
-                            .iter()
-                            .map(|copy| format!("finish ok={} {}", u8::from(*ok), copy_line(copy))),
-                    );
-                }
-                Deferred::Transfer { owner, to, .. } => {
-                    lines.push(format!("transfer o={} to=g{}", owner.0, to.0))
-                }
-            }
-        }
-        if !released.is_empty() {
-            lines.push(format!("release {}", units(released)));
-        }
-
-        for (task, copies) in &pool.copies {
-            let expired = u8::from(!pool.answers.contains_key(task));
-            match copies.first().map(|copy| &copy.to) {
-                Some(Target::Group { owner, to }) => {
-                    let held = copies
-                        .iter()
-                        .flat_map(|copy| &copy.reads)
-                        .map(&unit)
-                        .collect();
-                    let writes = copies
-                        .iter()
-                        .filter(|copy| copy.fill)
-                        .map(|copy| unit(&copy.write))
-                        .collect();
-                    let slot = copies
-                        .iter()
-                        .find(|copy| !copy.fill)
-                        .map_or("-".to_owned(), |copy| unit(&copy.write));
-                    let line = format!(
-                        "task transfer o={} to=g{} slot={slot} units={} writes={}",
-                        owner.0,
-                        to.0,
-                        units(held),
-                        units(writes)
-                    );
-                    lines.push(line.trim_end().to_owned());
-                }
-                Some(Target::Entry { remote, .. }) if copies[0].deadline.is_some() => {
-                    let kind = if *remote { "put" } else { "prefetch" };
-                    lines.push(format!(
-                        "task {kind} h={} expired={expired}",
-                        unit(&copies[0].write)
-                    ));
-                }
-                _ => lines.extend(
-                    copies
-                        .iter()
-                        .map(|copy| format!("copy {}", copy_line(copy))),
-                ),
-            }
-        }
-        lines.sort_unstable();
-        lines.join("\n")
+        stated(&self.pool, &owners, self.copies)
     }
 }
 
 impl Driver {
     /// What tells two states of the enumeration apart: the state in the
     /// model's terms, and what the model does not state and a later step
-    /// depends on, in lines that start with `#` and are not written out.
-    /// The model has one kind of block and frees any row; the buffer pool
-    /// keeps a key's class and the order in which rows were given back.
+    /// depends on, in lines that start with `#`, which the states for the
+    /// model's states leave out. The model has one kind of block and frees
+    /// any row; the buffer pool keeps a key's class and the order in which
+    /// rows were given back.
     fn identity(&self) -> String {
-        let mut identity = self.state();
-        for (key, entry) in &self.pool.cache {
-            let _ = write!(identity, "\n# class {:02x} {}", key.0[0], entry.class);
-        }
+        let mut identity = format!("{}\n{}", self.state(), classes(&self.pool));
         for (id, region) in self.pool.regions.iter().enumerate() {
             let _ = write!(identity, "\n# rows {id} {:?}", region.returned());
         }
@@ -693,23 +486,54 @@ impl Driver {
     }
 }
 
+/// A transition the model does not allow, made by hand: a commit takes
+/// effect while the stamp it waits for is not reached (R3). The step check
+/// of `verification/buffer-pool/agreement_steps.sh` is to report it.
+fn forged() -> String {
+    let mut driver = Driver::new(SHAPES[0]);
+    driver.apply(Step::Attach(1, 0));
+    driver.apply(Step::Allocate(1));
+    let before = driver.state();
+
+    // The commit waits for the stamp 1 of the group; it is made due with
+    // `completed` at 1 and left with `completed` at 0.
+    let commit = driver.apply(Step::Commit(1, 1));
+    let group = (SESSION, GroupId(0));
+    driver.pool.groups.get_mut(&group).unwrap().completed = MAX_COMPLETED;
+    driver.pool.settle();
+    driver.pool.groups.get_mut(&group).unwrap().completed = 0;
+    driver.pool.settle_counts();
+    driver.pool.completions();
+    format!(
+        "{}state 0\n{before}\n\nstate 1\n{}\n\nstep 0 1 {}\n",
+        layout(&driver.pool),
+        driver.state(),
+        stated_input(&commit)
+    )
+}
+
 /// L1: every sequence of steps keeps the invariants. With
-/// `UNISERVE_POOL_STATES` set to a directory, the states each shape reaches
-/// and the transitions between them are written there for the comparison
-/// with the model.
+/// `UNISERVE_POOL_STATES` set to a directory, each shape's states and the
+/// transitions between them are written there for the comparison with the
+/// model's states (`<shape>.txt`), and with the input of each transition
+/// and the layout for the comparison with the model's steps
+/// (`<shape>.steps`, and the transition of [`forged`] as `forged.steps`).
 #[test]
 #[ignore = "enumerates every request sequence of four small configurations; run by verification/buffer-pool/agreement.sh"]
 fn every_request_sequence_keeps_the_invariants() {
+    let directory = std::env::var("UNISERVE_POOL_STATES").ok();
     for shape in SHAPES {
         let start = Driver::new(shape);
+        let layout = layout(&start.pool);
         let mut index = BTreeMap::from([(start.identity(), 0usize)]);
         let mut frontier = VecDeque::from([(0usize, start)]);
         let mut transitions = BTreeSet::new();
+        let mut steps = BTreeSet::new();
 
         while let Some((source, from)) = frontier.pop_front() {
             for step in from.steps() {
                 let mut driver = from.duplicate();
-                driver.apply(step);
+                let input = driver.apply(step);
                 if let Err(inconsistency) = driver.pool.check() {
                     panic!(
                         "{}: {inconsistency} after {step:?} from\n{}",
@@ -725,25 +549,32 @@ fn every_request_sequence_keeps_the_invariants() {
                 }
                 if target != source {
                     transitions.insert((source, target));
+                    steps.insert((source, target, stated_input(&input)));
                 }
             }
         }
 
-        if let Ok(directory) = std::env::var("UNISERVE_POOL_STATES") {
+        if let Some(directory) = &directory {
             let mut states: Vec<(&String, &usize)> = index.iter().collect();
             states.sort_unstable_by_key(|(_, number)| **number);
-            let mut text = String::new();
+            let (mut text, mut with_inputs) = (String::new(), layout.clone());
             for (state, number) in states {
                 let stated: Vec<&str> = state
                     .lines()
                     .filter(|line| !line.starts_with('#'))
                     .collect();
                 let _ = writeln!(text, "state {number}\n{}\n", stated.join("\n"));
+                let lines: Vec<&str> = state.lines().filter(|line| !line.is_empty()).collect();
+                let _ = writeln!(with_inputs, "state {number}\n{}\n", lines.join("\n"));
             }
             for (source, target) in &transitions {
                 let _ = writeln!(text, "step {source} {target}");
             }
+            for (source, target, input) in &steps {
+                let _ = writeln!(with_inputs, "step {source} {target} {input}");
+            }
             std::fs::write(format!("{directory}/{}.txt", shape.name), text).unwrap();
+            std::fs::write(format!("{directory}/{}.steps", shape.name), with_inputs).unwrap();
         }
         println!(
             "{}: {} states, {} transitions",
@@ -757,5 +588,8 @@ fn every_request_sequence_keeps_the_invariants() {
             shape.name,
             index.len()
         );
+    }
+    if let Some(directory) = &directory {
+        std::fs::write(format!("{directory}/forged.steps"), forged()).unwrap();
     }
 }
