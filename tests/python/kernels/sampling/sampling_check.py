@@ -686,7 +686,9 @@ def run_logprob_gather(case):
         0,
     ).to(torch.int32)
     failures, line = compare_exact("out", out.cpu(), expected)
-    rank_failures, rank_line = compare_exact("ranks", ranks.cpu(), expected_ranks)
+    rank_failures, rank_line = compare_exact(
+        "ranks", ranks.cpu(), expected_ranks
+    )
     failures += rank_failures
     print(
         f"{'exact' if failures == 0 else 'FAIL'}: logprob_gather, {case['label']} — "
@@ -703,13 +705,20 @@ def run_top_logprobs(case):
     import top_logprobs as kernels
 
     generator = torch.Generator().manual_seed(case["seed"])
-    rows, width, candidates, tile = case["rows"], case["width"], case["candidates"], case["tile"]
+    rows, width, candidates, tile = (
+        case["rows"],
+        case["width"],
+        case["candidates"],
+        case["tile"],
+    )
     values = -torch.rand(rows, width, generator=generator).float() * 8
     if case["ties"]:
         # Equal values in two chunks and inside one: the lower ids come first.
         values[0, [3, 1, tile + 2, 2 * tile - 1]] = 0.0
     chunks = -(-width // tile)
-    chunk_values = torch.full((rows, chunks * candidates), float("nan"), dtype=torch.float32)
+    chunk_values = torch.full(
+        (rows, chunks * candidates), float("nan"), dtype=torch.float32
+    )
     chunk_ids = torch.full((rows, chunks * candidates), -7, dtype=torch.int32)
     launch(
         kernels._top_logprobs_kernel,
@@ -727,7 +736,9 @@ def run_top_logprobs(case):
     )
     merged = chunks * candidates
     merge_tile = 1 << (merged - 1).bit_length()
-    out_values = torch.full((rows, candidates), float("nan"), dtype=torch.float32)
+    out_values = torch.full(
+        (rows, candidates), float("nan"), dtype=torch.float32
+    )
     out_ids = torch.full((rows, candidates), -7, dtype=torch.int32)
     launch(
         kernels._top_logprobs_kernel,
@@ -745,7 +756,9 @@ def run_top_logprobs(case):
     )
     failures = 0
     for row in range(rows):
-        order = torch.argsort(values[row].double(), descending=True, stable=True)
+        order = torch.argsort(
+            values[row].double(), descending=True, stable=True
+        )
         kept = min(candidates, width)
         wanted_ids = order[:kept].to(torch.int32)
         wanted_values = values[row][order][:kept]
