@@ -33,6 +33,8 @@
 //! | [`Column::Continuation`] | U8 `[R]` | whether a task's request continues | `0` |
 //! | [`Column::Points`] | I32 `[R]` | the span a verification accepted | `0` |
 //! | [`Column::LiveTokens`] | U32 `[1]` | the tokens the batch itself holds | |
+//! | [`Column::NextContext`] | U32 `[R, 2]` | where the two token ids its slot's next row continues from lie in the id history | the row's own context |
+//! | [`Column::StateIndices`] | U32 `[R, D + 1]` | each row's slots of a stepwise state field (`nn::VerifySlots::state_indices`) | [`NO_SLOT`] |
 //!
 //! A runner that speculates lays out the columns of its verifications and of the drafter's
 //! forward behind them, which `speculation` states and fills. `D` is the drafts a verification
@@ -69,6 +71,29 @@
 //! | [`Column::ChainIndex`] | U32 `[D, R]` | where each chained step of a row reads its slot in [`Column::ChainSlots`] | a [`NO_SLOT`] cell |
 //! | [`Column::ChainOffsets`] | U32 `[R + 1]` | the packed offsets of a chained step: one token a row | the batch's row count |
 //! | [`Column::LiveRows`] | U32 `[1]` | the rows the batch itself holds | |
+//! | [`Column::TokenContext`] | U32 `[T, 2]` | where the two token ids before each token lie in the id history | the token's own context |
+//!
+//! ## Token ids
+//!
+//! A model whose layers read token ids (`nn::family::TextModel::reads_token_ids`) reads the two
+//! ids before each row's first token (`nn::TokenBatch::ngram_context`), which the request slots
+//! keep (`slots`). A forward reads them from its **id history**, `[2 · rows + tokens]` U32: the
+//! context of each of the bucket's rows, gathered by its slot, then the bucket's token ids.
+//! Each row's slot continues from the row's last two ids in it, which
+//! [`Column::NextContext`] names: the row's last two tokens, its context's later id and its one
+//! token, or, for a row of no token, its own context. The forward writes them into the slot
+//! as the commit advances the slot's other state. A verification's rows are its tokens, each
+//! of which reads its request's context through its slot; [`Column::TokenContext`] names each
+//! token's two ids before it in that history, and the ids its slot continues from are those of
+//! the token its acceptance ends on (`speculation`).
+//!
+//! ## Verify slots
+//!
+//! A runner that speculates over a model whose state keeps a slot per verified token
+//! (`nn::family::StateField::stepwise`) gives each request `Q = D + 1` slots of such a field
+//! (`StateMemory`): request slot `s` owns its home row `s - 1` and the rows
+//! `slots + (s - 1)(Q - 1) .. slots + s(Q - 1)`. [`Column::StateIndices`] states them for each
+//! state row, its home row first ([`state_indices`]).
 //!
 //! ## Indices
 //!
@@ -190,11 +215,14 @@ pub(crate) enum Column {
     ChainIndex,
     ChainOffsets,
     LiveRows,
+    NextContext,
+    StateIndices,
+    TokenContext,
 }
 
 impl Column {
     /// Every column, in the order the layout places them.
-    const ALL: [Self; 47] = [
+    const ALL: [Self; 50] = [
         Self::InputIds,
         Self::Positions,
         Self::SlotMapping,
@@ -242,6 +270,9 @@ impl Column {
         Self::ChainIndex,
         Self::ChainOffsets,
         Self::LiveRows,
+        Self::NextContext,
+        Self::StateIndices,
+        Self::TokenContext,
     ];
 
     /// The element type of the column's tensor.
@@ -286,11 +317,12 @@ impl Column {
             | Self::TokenCap => tokens,
             Self::QueryOffsets | Self::StateOffsets | Self::ChainOffsets => rows + 1,
             Self::Parameters => rows * PARAMETER_COLUMNS as usize,
-            Self::Adjustments => rows * 2,
+            Self::Adjustments | Self::NextContext => rows * 2,
+            Self::TokenContext => tokens * 2,
             Self::Commit => rows * COMMIT_FIELDS,
             Self::LiveTokens | Self::LiveRows => 1,
             Self::Extras => tokens * drafts,
-            Self::Windows => rows * (drafts + 1),
+            Self::Windows | Self::StateIndices => rows * (drafts + 1),
             Self::DraftTokens
             | Self::DraftSteps
             | Self::ChainPositions
@@ -770,6 +802,16 @@ pub(crate) fn fill(
     }
     layout.put(block, Column::Checkpoints, &checkpoints)?;
 
+    // ---- What a row's slot continues from: its token ids and its verify slots ----
+
+    layout.put(block, Column::NextContext, &next_contexts(&offsets))?;
+    let owned = layout.drafts as u32 + 1;
+    layout.put(
+        block,
+        Column::StateIndices,
+        &state_indices(&sampler_slots, slots, owned),
+    )?;
+
     // ---- The commit: one row per call, the rest of the table inert ----
 
     // A paired forward commits nothing: the slots' state is the serving requests'.
@@ -796,6 +838,52 @@ pub(crate) fn fill(
     layout.put(block, Column::Points, &vec![0_i32; layout.rows])?;
 
     Ok(())
+}
+
+/// Where the two token ids each row's slot continues from lie in the id history of a forward
+/// whose rows' packed query offsets are `offsets`, `[rows + 1]` (module documentation, token
+/// ids): `[rows, 2]` row-major, each pair the earlier first.
+///
+/// History entries `2r` and `2r + 1` are row `r`'s context and entry `2 · rows + t` is token
+/// `t`, so a row continues from its last two tokens, from its context's later id and its one
+/// token, or, holding none, from its own context.
+fn next_contexts(offsets: &[u32]) -> Vec<u32> {
+    let rows = offsets.len().saturating_sub(1) as u32;
+    let token = |token: u32| 2 * rows + token;
+
+    let mut next = Vec::with_capacity(2 * rows as usize);
+    for (row, span) in (0..rows).zip(offsets.windows(2)) {
+        let (first, end) = (span[0], span[1]);
+
+        next.extend(match end.saturating_sub(first) {
+            0 => [2 * row, 2 * row + 1],
+            1 => [2 * row + 1, token(first)],
+            _ => [token(end - 2), token(end - 1)],
+        });
+    }
+    next
+}
+
+/// Each state row's slots of a stepwise state field whose requests own `owned` slots each
+/// (`nn::VerifySlots::state_indices`; module documentation, verify slots), `[homes, owned]`
+/// row-major, for a runner of `slots` request slots.
+///
+/// `homes` holds each row's home row (`slot_row` of its request slot), or [`NO_SLOT`] for a
+/// row on no slot, whose slots are all [`NO_SLOT`]. Column zero is the home row `h` and column
+/// `q` the row `slots + h · (owned − 1) + q − 1`: the rows past the home rows, `owned − 1` a
+/// request.
+pub(crate) fn state_indices(homes: &[u32], slots: u32, owned: u32) -> Vec<u32> {
+    let mut indices = Vec::with_capacity(homes.len() * owned as usize);
+
+    for &home in homes {
+        if home == NO_SLOT {
+            indices.extend(std::iter::repeat_n(NO_SLOT, owned as usize));
+            continue;
+        }
+        indices.push(home);
+        indices.extend((1..owned).map(|step| slots + home * (owned - 1) + step - 1));
+    }
+    indices
 }
 
 /// The columns of an idle step of `bucket`: a batch of the bucket's size whose rows address no

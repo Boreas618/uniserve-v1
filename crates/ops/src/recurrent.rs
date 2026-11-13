@@ -586,7 +586,8 @@ pub struct GatedDeltaRuleArgs {
     /// `[slots, value_heads, key_dim, value_dim]` FP32, contiguous: each slot's state, read for a
     /// row that continues and overwritten with the state after the row's last token.
     pub state: Operand,
-    /// `[slots, value_heads, key_dim, value_dim]` FP32, contiguous: receives a row's checkpoint.
+    /// `[slots, value_heads, key_dim, value_dim]` FP32, contiguous: receives a row's checkpoint
+    /// in its first slot, of which it holds one per request when a request owns several.
     pub checkpoint: Operand,
     /// `[tokens, value_heads, key_dim, value_dim]` FP32: receives the state after each token, when
     /// the batch keeps a trail; only [`Form::Recurrent`] keeps one.
@@ -724,7 +725,8 @@ impl Op for GatedDeltaRule {
             DType::F32,
             &dims,
         )?;
-        if kept != slots {
+        // A checkpoint keeps one slot of each request, which owns `owned` state slots.
+        if kept != slots && kept * owned.max(1) != slots {
             return Err(Error::argument(
                 Self::NAME,
                 format!("{kept} checkpoint slots for {slots} state slots"),

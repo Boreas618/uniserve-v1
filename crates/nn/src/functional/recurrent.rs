@@ -33,8 +33,8 @@
 //! ## Request slots
 //!
 //! A state that lends [`VerifySlots`] is a deployment's whose verifications copy no state: a
-//! request owns `Q` slots of the delta rule's field and one window of `Q − 1` rows more than
-//! the convolution's history, and a row starts from what its previous step left for the tokens
+//! request owns `Q` slots of the delta rule's field, whose checkpoint buffer keeps one slot per
+//! request, and one window of `Q − 1` rows more than the convolution's history, and a row starts from what its previous step left for the tokens
 //! that stand ([`VerifySlots`] states the rule; vLLM's `state_indices` and `num_accepted`). A
 //! decode-phase batch then leaves the state after each of a row's tokens for the next step to
 //! choose from, and every other batch the state after a row's last token in the row's first
@@ -121,17 +121,20 @@ fn rows_of(
 }
 
 /// Checks the three buffers of one field against `dims`, the extents of one slot's state, in
-/// `dtype`: as many checkpoint slots as live ones, and a trail row for each of `tokens` tokens.
+/// `dtype`: as many checkpoint slots as live ones, or one per request when a request owns
+/// `owned` live slots of the field (module documentation, Request slots), and a trail row for
+/// each of `tokens` tokens.
 fn check_buffers(
     owner: &'static str,
     (live, checkpoint, trail): (&Tensor, &Tensor, Option<&Tensor>),
     dtype: DType,
     dims: &[usize],
     tokens: usize,
+    owned: usize,
 ) -> Result<()> {
     let slots = rows_of(owner, "live", live, dtype, dims)?;
     let kept = rows_of(owner, "checkpoint", checkpoint, dtype, dims)?;
-    if kept != slots {
+    if kept != slots && kept * owned != slots {
         return Err(Error::shape(
             owner,
             format!("{kept} checkpoint slots for {slots} live slots"),
@@ -385,6 +388,7 @@ pub fn causal_conv1d(
         x.dtype(),
         &[window, channels],
         tokens,
+        1,
     )?;
     if let Some(trail) = trail
         && rows_of(OWNER, "trail", trail, x.dtype(), &[history, channels])? < tokens
@@ -644,12 +648,18 @@ pub fn gated_delta_rule(
         StateAxes::KeyValue => [value_heads, key_dim, value_dim],
         StateAxes::ValueKey => [value_heads, value_dim, key_dim],
     };
-    check_buffers(OWNER, (live, checkpoint, trail), DType::F32, &dims, tokens)?;
-
     let owned = match &state.verify {
         Some(verify) => owned_slots(OWNER, verify, state.seq_lens.elem_count())?,
         None => 0,
     };
+    check_buffers(
+        OWNER,
+        (live, checkpoint, trail),
+        DType::F32,
+        &dims,
+        tokens,
+        owned.max(1),
+    )?;
     if owned > 0 && trail.is_some() {
         return Err(Error::shape(
             OWNER,

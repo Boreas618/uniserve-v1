@@ -272,7 +272,7 @@ mod tests {
                 stepwise: false,
             }],
         };
-        let layout = CacheLayout::hybrid(4, 2, 1, 4, PrefixCacheDtype::BFloat16, &state)
+        let layout = CacheLayout::hybrid(4, 2, 1, 4, PrefixCacheDtype::BFloat16, &[state])
             .expect("a hybrid layout");
         assert!(layout.groups[1].state() && layout.groups[1].units_per_page == 2);
 

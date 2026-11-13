@@ -1,21 +1,33 @@
 //! The recurrent state a causal language model keeps per request slot: its buffers, and the
 //! copies between them and the KV cache's state pages.
 //!
-//! A model whose layers keep a recurrent state (`nn::family::TextModel::state`) states the
-//! fields one layer keeps. [`StateMemory`] owns, for every field of every such layer:
+//! A model whose layers keep a recurrent state states the fields each layer keeps, as runs of
+//! layers that keep the same ones (`nn::family::TextModel::state_layers`). [`StateMemory`]
+//! owns, for every field of every such layer, in the runs' order:
 //!
-//! - the **live** buffer, `[slots, …]`: each slot's state after its request's last computed
-//!   token, which every row of a batch reads and advances in place;
+//! - the **live** buffer: each slot's state after its request's last computed token, which
+//!   every row of a batch reads and advances in place;
 //! - the **checkpoint** buffer, `[slots, …]`: the state a row keeps at the page boundary the
 //!   batch's `checkpoints` column names;
-//! - in a deployment that speculates, the **trail** buffer, `[tokens, …]`: the state after
-//!   every token of a verification, whose accepted length is known only once its tokens are
-//!   sampled. The runner then settles each row's slot on the trail's entry after its last
-//!   accepted token ([`StateMemory::settle`]).
+//! - in a deployment that speculates with a trail, the **trail** buffer, `[tokens, …]`: the
+//!   state after every token of a verification, whose accepted length is known only once its
+//!   tokens are sampled. The runner then settles each row's slot on the trail's entry after
+//!   its last accepted token ([`StateMemory::settle`]).
 //!
-//! Request slot `s` (slots count from one) owns row `s - 1` of the live and checkpoint buffers
+//! Request slot `s` (slots count from one) owns row `s - 1` of every buffer, its **home row**
 //! ([`StateMemory::row`]); a padding row of a batch states `nn::NO_SLOT` in the batch's state
 //! slot column and reads and writes no row.
+//!
+//! ## Verify slots
+//!
+//! A field that keeps the state after each token of a decode-phase row in a slot of its own
+//! (`nn::family::StateField::stepwise`) lets a deployment that speculates verify without a
+//! trail: a request owns `Q` slots of it ([`StateConfig::owned`], the tokens a verification
+//! holds), and a verification's acceptance chooses the slot that stands (`nn::VerifySlots`).
+//! The live buffer of such a field holds `slots · Q` rows: rows `0..slots` are the home rows,
+//! and request slot `s` owns rows `slots + (s − 1)(Q − 1) .. slots + s(Q − 1)` beside its
+//! home row. Every other field's live buffer, and every checkpoint buffer, holds `slots` rows,
+//! and such a state keeps no trail.
 //!
 //! The buffers are taken once from the device's pool of memory that lives as long as the rank
 //! serves, so every captured graph addresses them unchanged.
@@ -26,10 +38,10 @@
 //! `cache_block_snapshot` and `cache_block_scatter` ([`StateMemory::copy`]): a keep gathers a
 //! slot's checkpoint row into the snapshot and scatters it into a page's planes after the
 //! forward, and a restore gathers a page's planes into the snapshot and scatters them into the
-//! slot's live row before it. Which rows copy what is the scheduler's decision, stated in the
-//! batch by the checkpoint's position in the request's state table (`ipc::batch::StateCopy`);
-//! the runner finds the page's run of units through the rank's device block table, and a
-//! keep writes only a block the table states writable.
+//! slot's live home row before it. Which rows copy what is the scheduler's decision, stated in
+//! the batch by the checkpoint's position in the request's state table
+//! (`ipc::batch::StateCopy`); the runner finds the page's run of units through the rank's
+//! device block table, and a keep writes only a block the table states writable.
 //!
 //! A checkpoint lays each layer's fields out in field order from plane boundaries
 //! ([`CacheLayout::state_planes`]); plane `p` of a state page is column `q % columns` of the
@@ -51,8 +63,8 @@ use std::ops::Range;
 use std::sync::Arc;
 
 use ipc::batch::StateDirection;
-use nn::RecurrentState;
 use nn::family::{StateField, StateShape};
+use nn::{RecurrentState, VerifySlots};
 use ops::block_copy::{
     BlockShape, COPY_BLOCK, CacheBlockScatter, CacheBlockSnapshot, ScatterArgs, SnapshotArgs,
 };
@@ -75,28 +87,65 @@ const RING: usize = 4;
 /// rank resolved for them.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct StateConfig {
-    /// The recurrent layers and the fields each keeps.
-    pub shape: StateShape,
-    /// Request slots: rows of every live and checkpoint buffer.
+    /// The runs of recurrent layers that keep the same fields, in the model's order of them
+    /// (`nn::family::TextModel::state_layers`): every layer of the first run, then of the
+    /// second.
+    pub shapes: Vec<StateShape>,
+    /// Request slots: the home rows of every live buffer, and the rows of every checkpoint
+    /// buffer.
     pub slots: u32,
     /// The most rows of a batch: a batch carries at most a restore and a keep per row.
     pub rows: u32,
     /// Rows of every trail buffer: the most tokens a verification batch holds. Zero for a
-    /// deployment that does not speculate, which keeps no trail.
+    /// deployment that keeps no trail: one that does not speculate, or whose stepwise fields
+    /// keep verify slots.
     pub trail: u32,
+    /// The slots a request owns of each stepwise field (module documentation, verify slots):
+    /// the tokens a verification holds, `draft_tokens + 1`, for a deployment that speculates,
+    /// and one for every other.
+    pub owned: u32,
+}
+
+/// Each recurrent layer's fields, in the order the state's buffers follow: the layers of the
+/// first of `runs`, then of the second (`nn::family::TextModel::state_layers`).
+pub(crate) fn layer_fields(runs: &[StateShape]) -> impl Iterator<Item = &[StateField]> {
+    runs.iter()
+        .flat_map(|run| (0..run.layers).map(move |_| run.fields.as_slice()))
 }
 
 impl StateConfig {
     /// The device bytes the state takes from the pool that lives as long as the rank serves,
     /// for a cache of `layout`: the live and checkpoint buffers of every field of every layer,
-    /// a row per slot, the trail's row per token, and the copies' index vectors. The snapshot
-    /// is the scratch pool's ([`CacheLayout::state_snapshot_bytes`]).
+    /// each live buffer's rows ([`Self::live_rows`]), a checkpoint row per slot and the
+    /// trail's row per token, and the copies' index vectors. The snapshot is the scratch
+    /// pool's ([`CacheLayout::state_snapshot_bytes`]).
     pub fn bytes(&self, layout: &CacheLayout) -> u64 {
-        let buffers = (2 * u64::from(self.slots) + u64::from(self.trail))
-            * u64::from(self.shape.layers)
-            * self.shape.layer_bytes();
+        let (slots, trail) = (u64::from(self.slots), u64::from(self.trail));
+        let buffers: u64 = layer_fields(&self.shapes)
+            .flatten()
+            .map(|field| (u64::from(self.live_rows(field)) + slots + trail) * field.bytes())
+            .sum();
 
         buffers + RING as u64 * self.index_bytes(layout)
+    }
+
+    /// The rows of `field`'s live buffer: a home row per request slot, and the further slots
+    /// each request owns of a stepwise field (module documentation, verify slots).
+    pub fn live_rows(&self, field: &StateField) -> u32 {
+        if field.stepwise {
+            self.slots * self.owned
+        } else {
+            self.slots
+        }
+    }
+
+    /// Whether a request owns several slots of a field: the deployment's forwards then lend
+    /// `nn::VerifySlots`.
+    pub fn verifies(&self) -> bool {
+        self.owned > 1
+            && layer_fields(&self.shapes)
+                .flatten()
+                .any(|field| field.stepwise)
     }
 
     /// The bytes of one set of index vectors: a slot row and a state page's planes for each of
@@ -159,13 +208,25 @@ impl StateMemory {
     /// A config of no slot, layer or field, or a cache whose layout holds no state group for
     /// the checkpoints.
     pub fn meta(config: StateConfig, cache: &KvCacheConfig) -> Result<Self> {
-        if config.slots == 0 || config.shape.layers == 0 || config.shape.fields.is_empty() {
+        let layers: Vec<&[StateField]> = layer_fields(&config.shapes).collect();
+        if config.slots == 0 || config.owned == 0 || layers.iter().any(|fields| fields.is_empty()) {
             return Err(Error::Invalid(format!(
-                "a recurrent state of {} slots and {} layers of {} fields",
-                config.slots,
-                config.shape.layers,
-                config.shape.fields.len()
+                "a recurrent state of {} slots, of which a request owns {} of a stepwise field, \
+                 whose every layer keeps a field",
+                config.slots, config.owned
             )));
+        }
+        if layers.is_empty() {
+            return Err(Error::Invalid(
+                "a recurrent state of no recurrent layer holds nothing".into(),
+            ));
+        }
+        if config.verifies() && config.trail > 0 {
+            return Err(Error::Invalid(
+                "a state whose requests own a slot of a stepwise field per verified token keeps \
+                 no trail"
+                    .into(),
+            ));
         }
 
         let layout: &CacheLayout = &cache.layout;
@@ -175,31 +236,40 @@ impl StateMemory {
             .ok_or_else(|| {
                 Error::Invalid("a model that keeps a recurrent state needs a state group".into())
             })?;
-        if layout.state_fields() == 0 {
-            return Err(Error::Invalid(
-                "the cache holds no state plane for the recurrent state's checkpoints".into(),
-            ));
+        if layout.state_fields() == 0 || layout.checkpoints.len() != layers.len() {
+            return Err(Error::Invalid(format!(
+                "the cache's state pages hold the checkpoints of {} recurrent layers, and the \
+                 state keeps {}",
+                layout.checkpoints.len(),
+                layers.len()
+            )));
         }
 
-        let planes: Vec<Vec<(u32, u64)>> = (0..config.shape.layers)
-            .map(|layer| layout.state_planes(layer, &config.shape.fields))
+        let planes: Vec<Vec<(u32, u64)>> = layers
+            .iter()
+            .enumerate()
+            .map(|(layer, fields)| layout.state_planes(layer as u32, fields))
             .collect();
 
-        // Every field's planes lie inside the checkpoints the layout states.
-        let page_planes = layout.checkpoint_planes();
-        for (first, bytes) in planes.iter().flatten() {
-            if u64::from(*first) + bytes.div_ceil(layout.plane_bytes) > u64::from(page_planes) {
-                return Err(Error::Invalid(format!(
-                    "a checkpoint field of {bytes} bytes from plane {first} lies outside a state \
-                     page of {page_planes} checkpoint planes"
-                )));
+        // Every field's planes lie inside its layer's checkpoint, which the layout laid out
+        // from the same runs.
+        for (fields, checkpoint) in planes.iter().zip(&layout.checkpoints) {
+            let end = u64::from(checkpoint.first_plane) + u64::from(checkpoint.planes);
+
+            for (first, bytes) in fields {
+                if u64::from(*first) + bytes.div_ceil(layout.plane_bytes) > end {
+                    return Err(Error::Invalid(format!(
+                        "a checkpoint field of {bytes} bytes from plane {first} lies outside its \
+                         layer's checkpoint, which ends at plane {end}"
+                    )));
+                }
             }
         }
 
         Ok(Self {
             config,
             planes,
-            page_planes,
+            page_planes: layout.checkpoint_planes(),
             plane_bytes: layout.plane_bytes,
             columns: layout.columns,
             units_per_page: group.units_per_page,
@@ -226,26 +296,26 @@ impl StateMemory {
         kernels: Arc<ops::Generation>,
     ) -> Result<Self> {
         let mut state = Self::meta(config, cache)?;
-        let shape = &state.config.shape;
+        let config = state.config.clone();
 
-        let mut take = |rows: u32| -> Result<Vec<Vec<Buffer>>> {
-            (0..shape.layers)
-                .map(|_| {
-                    shape
-                        .fields
+        // One buffer per field of every layer, of the rows `rows` states for the field.
+        let mut take = |rows: &dyn Fn(&StateField) -> u32| -> Result<Vec<Vec<Buffer>>> {
+            layer_fields(&config.shapes)
+                .map(|fields| {
+                    fields
                         .iter()
                         .map(|field| {
-                            let bytes = u64::from(rows) * field.bytes();
+                            let bytes = u64::from(rows(field)) * field.bytes();
                             Ok(allocator.allocate(PoolKind::Resident, bytes as usize)?)
                         })
                         .collect()
                 })
                 .collect()
         };
-        let live = take(state.config.slots)?;
-        let checkpoint = take(state.config.slots)?;
-        let trail = if state.config.trail > 0 {
-            take(state.config.trail)?
+        let live = take(&|field| config.live_rows(field))?;
+        let checkpoint = take(&|_| config.slots)?;
+        let trail = if config.trail > 0 {
+            take(&|_| config.trail)?
         } else {
             Vec::new()
         };
@@ -287,7 +357,7 @@ impl StateMemory {
         &self.config
     }
 
-    /// The row of the live and checkpoint buffers that request slot `slot` owns: what the
+    /// The home row request slot `slot` owns of the live and checkpoint buffers: what the
     /// batch's state slot column states for the slot's row.
     ///
     /// # Errors
@@ -330,15 +400,16 @@ impl StateMemory {
     }
 
     /// The tensors of one kind of buffer, `[layer][field]`: each `[rows, …]` in its field's
-    /// element type and extents, or `[rows, bytes]` U8 when `raw`, as a copy moves it.
+    /// element type and extents, or `[rows, bytes]` U8 when `raw`, as a copy moves it, `rows`
+    /// being what `rows` states for the field.
     fn tensors(
         &self,
-        rows: u32,
+        rows: impl Fn(&StateField) -> u32,
         raw: bool,
         buffers: impl Fn(&Buffers) -> &Vec<Vec<Buffer>>,
     ) -> Result<Vec<Vec<Tensor>>> {
         let shape = |field: &StateField| {
-            let mut dims = vec![rows as usize];
+            let mut dims = vec![rows(field) as usize];
             if raw {
                 dims.push(field.bytes() as usize);
             } else {
@@ -347,11 +418,10 @@ impl StateMemory {
             dims
         };
 
-        (0..self.config.shape.layers as usize)
-            .map(|layer| {
-                self.config
-                    .shape
-                    .fields
+        layer_fields(&self.config.shapes)
+            .enumerate()
+            .map(|(layer, fields)| {
+                fields
                     .iter()
                     .enumerate()
                     .map(|(index, field)| {
@@ -368,35 +438,44 @@ impl StateMemory {
             .collect()
     }
 
-    /// The live buffers: one entry per recurrent layer, each the layer's fields in the order
-    /// of the model's `StateShape`, `[slots, …]`.
+    /// The live buffers: one entry per recurrent layer of every run, in the runs' order, each
+    /// the layer's fields in the order of its run's `StateShape`, `[rows, …]`: a home row per
+    /// slot, and the further slots of a stepwise field ([`StateConfig::live_rows`]).
     pub fn live(&self) -> Result<Vec<Vec<Tensor>>> {
-        self.tensors(self.config.slots, false, |buffers| &buffers.live)
+        self.tensors(
+            |field| self.config.live_rows(field),
+            false,
+            |buffers| &buffers.live,
+        )
     }
 
-    /// The checkpoint buffers, in the same order and extents as [`Self::live`].
+    /// The checkpoint buffers, in the same order and extents as [`Self::live`] but a row per
+    /// slot of every field: a checkpoint keeps the state a home row holds.
     pub fn checkpoint(&self) -> Result<Vec<Vec<Tensor>>> {
-        self.tensors(self.config.slots, false, |buffers| &buffers.checkpoint)
+        self.tensors(|_| self.config.slots, false, |buffers| &buffers.checkpoint)
     }
 
-    /// The trail buffers, in the same order, `[trail, …]`; `None` in a deployment that does
-    /// not speculate.
+    /// The trail buffers, in the same order, `[trail, …]`; `None` in a deployment that keeps
+    /// no trail.
     pub fn trail(&self) -> Result<Option<Vec<Vec<Tensor>>>> {
         if self.config.trail == 0 {
             return Ok(None);
         }
-        self.tensors(self.config.trail, false, |buffers| &buffers.trail)
+        self.tensors(|_| self.config.trail, false, |buffers| &buffers.trail)
             .map(Some)
     }
 
     /// The state as a forward is lent it, for a batch whose state rows the four columns
     /// describe (`nn::RecurrentState`): `slots` holds [`Self::row`] of each row's request slot
     /// and `nn::NO_SLOT` for a padding row. A `trailing` batch, a verification, also receives
-    /// the trail.
+    /// the trail; a state whose requests own several slots of a stepwise field is lent
+    /// `verify`, the rows' slots and accepted counts, by every batch instead.
     ///
     /// # Errors
     ///
-    /// A trailing batch in a deployment whose state keeps no trail.
+    /// A trailing batch in a deployment whose state keeps no trail, and verify slots given to
+    /// a state whose requests own one slot of every field, or withheld from one whose requests
+    /// own several.
     pub fn lend(
         &self,
         query_offsets: Tensor,
@@ -404,12 +483,21 @@ impl StateMemory {
         slots: Tensor,
         checkpoints: Tensor,
         trailing: bool,
+        verify: Option<VerifySlots>,
     ) -> Result<RecurrentState> {
+        if verify.is_some() != self.config.verifies() {
+            return Err(Error::Invariant(format!(
+                "a batch is lent {} verify slots, and the state's requests own {} slots of a \
+                 stepwise field",
+                if verify.is_some() { "its" } else { "no" },
+                self.config.owned
+            )));
+        }
         let trail = if trailing {
             Some(self.trail()?.ok_or_else(|| {
                 Error::Invariant(
                     "a verification keeps a trail and the recurrent state holds none: the \
-                     deployment does not speculate"
+                     deployment does not speculate, or verifies over verify slots"
                         .into(),
                 )
             })?)
@@ -418,7 +506,7 @@ impl StateMemory {
         };
 
         Ok(RecurrentState {
-            verify: None,
+            verify,
             query_offsets,
             seq_lens,
             slots,
@@ -584,19 +672,19 @@ impl StateMemory {
         let runs = (0..self.runs)
             .map(|_| meta(&[cells, self.plane_bytes as usize], DType::U8))
             .collect::<Result<Vec<_>>>()?;
-        let fields = self
-            .config
-            .shape
-            .fields
-            .iter()
-            .map(|field| {
-                meta(
-                    &[self.config.slots as usize, field.bytes() as usize],
-                    DType::U8,
-                )
+        let buffers = layer_fields(&self.config.shapes)
+            .map(|fields| {
+                fields
+                    .iter()
+                    .map(|field| {
+                        meta(
+                            &[self.config.slots as usize, field.bytes() as usize],
+                            DType::U8,
+                        )
+                    })
+                    .collect::<Result<Vec<_>>>()
             })
             .collect::<Result<Vec<_>>>()?;
-        let buffers = vec![fields; self.config.shape.layers as usize];
 
         let page = self.cells(1..1 + self.units_per_page)?;
 
@@ -699,13 +787,11 @@ impl StateMemory {
         let Some(device) = &self.device else {
             return Ok(());
         };
+        // A copy moves a slot's home row, which the first `slots` rows of every buffer hold.
+        let slots = |_: &StateField| self.config.slots;
         let buffers = match direction {
-            StateDirection::Restore => {
-                self.tensors(self.config.slots, true, |buffers| &buffers.live)?
-            }
-            StateDirection::Keep => {
-                self.tensors(self.config.slots, true, |buffers| &buffers.checkpoint)?
-            }
+            StateDirection::Restore => self.tensors(slots, true, |buffers| &buffers.live)?,
+            StateDirection::Keep => self.tensors(slots, true, |buffers| &buffers.checkpoint)?,
         };
         let runs = cache.state_runs()?;
         let snapshot = |offset: u64, rows: usize, width: u64| {
@@ -773,8 +859,13 @@ impl StateMemory {
             return Ok(());
         };
         let mut batch = CopyBatch::new(SourceOrder::Stream);
-        for (live, trail) in device.live.iter().zip(&device.trail) {
-            for ((live, trail), field) in live.iter().zip(trail).zip(&self.config.shape.fields) {
+        let layers = device
+            .live
+            .iter()
+            .zip(&device.trail)
+            .zip(layer_fields(&self.config.shapes));
+        for ((live, trail), fields) in layers {
+            for ((live, trail), field) in live.iter().zip(trail).zip(fields) {
                 let bytes = field.bytes();
                 batch.push(
                     live.address() + u64::from(row) * bytes,
@@ -824,7 +915,7 @@ mod tests {
     /// state: planes of 64 bytes, so a layer's checkpoint is two planes and a state page of
     /// four planes is two units of two columns.
     fn cache() -> KvCacheConfig {
-        let layout = CacheLayout::hybrid(4, 2, 1, 8, PrefixCacheDtype::BFloat16, &shape())
+        let layout = CacheLayout::hybrid(4, 2, 1, 8, PrefixCacheDtype::BFloat16, &[shape()])
             .expect("a hybrid layout");
         assert_eq!(layout.plane_bytes, 64);
         assert_eq!(layout.groups[1].units_per_page, 2);
@@ -841,10 +932,11 @@ mod tests {
 
     fn config(trail: u32) -> StateConfig {
         StateConfig {
-            shape: shape(),
+            shapes: vec![shape()],
             slots: 3,
             rows: 2,
             trail,
+            owned: 1,
         }
     }
 
@@ -895,12 +987,12 @@ mod tests {
 
         // SAFETY: meta tensors have no data and their addresses are never read.
         let column = |rows: usize| unsafe { lend(0, rows, DType::U32, None) };
-        let lent = state.lend(column(3)?, column(2)?, column(2)?, column(2)?, false)?;
+        let lent = state.lend(column(3)?, column(2)?, column(2)?, column(2)?, false, None)?;
         assert!(lent.trail.is_none());
         assert_eq!((lent.live.len(), lent.checkpoint.len()), (2, 2));
 
         let refused = state
-            .lend(column(3)?, column(2)?, column(2)?, column(2)?, true)
+            .lend(column(3)?, column(2)?, column(2)?, column(2)?, true, None)
             .err()
             .expect("a verification without a trail");
         assert!(
@@ -980,5 +1072,124 @@ mod tests {
         let mut empty = config(0);
         empty.slots = 0;
         assert!(StateMemory::meta(empty, &cache()).is_err());
+    }
+
+    /// The runs of a state whose layers keep different fields: the two layers of [`shape`],
+    /// then one layer whose one field keeps a slot per verified token, 16 bytes.
+    fn runs() -> Vec<StateShape> {
+        vec![
+            shape(),
+            StateShape {
+                layers: 1,
+                fields: vec![StateField {
+                    name: "steps",
+                    dtype: DType::F32,
+                    dims: vec![4],
+                    stepwise: true,
+                }],
+            },
+        ]
+    }
+
+    /// The cache of three attention layers beside [`runs`]: three columns of 64-byte planes,
+    /// the two layers of the first run two planes each and the last layer one.
+    fn runs_cache() -> Result<KvCacheConfig> {
+        let layout = CacheLayout::hybrid(4, 3, 1, 8, PrefixCacheDtype::BFloat16, &runs())?;
+
+        Ok(KvCacheConfig {
+            layout: Arc::new(layout),
+            ..cache()
+        })
+    }
+
+    /// A state's buffers follow its runs in order, each layer with its own run's fields. A
+    /// request owns `Q` slots of a stepwise field, whose live buffer holds them past the home
+    /// rows, and one checkpoint row; such a state is lent verify slots by every batch and keeps
+    /// no trail.
+    #[test]
+    fn a_state_of_runs_keeps_every_slot_its_requests_own() -> Result<()> {
+        let cache = runs_cache()?;
+        let config = StateConfig {
+            shapes: runs(),
+            owned: 3,
+            ..config(0)
+        };
+        let state = StateMemory::meta(config.clone(), &cache)?;
+
+        let live = state.live()?;
+        let checkpoint = state.checkpoint()?;
+        assert_eq!((live.len(), checkpoint.len()), (3, 3));
+        for layer in &live[..2] {
+            assert_eq!(layer[0].dims(), [3, 2, 3]);
+            assert_eq!(layer[1].dims(), [3, 10]);
+        }
+        assert_eq!(live[2].len(), 1);
+        assert_eq!(
+            (live[2][0].dims(), live[2][0].dtype()),
+            (&[9, 4][..], DType::F32)
+        );
+        assert_eq!(checkpoint[2][0].dims(), [3, 4]);
+
+        // Each layer's checkpoint lies in its own planes of the state page: two planes for a
+        // layer of the first run and one for the last.
+        let first: Vec<u32> = cache
+            .layout
+            .checkpoints
+            .iter()
+            .map(|checkpoint| checkpoint.first_plane)
+            .collect();
+        assert_eq!(first, [0, 2, 4]);
+        assert_eq!(cache.layout.groups[1].units_per_page, 2);
+
+        // Three slots of 52 bytes in each of two layers, live and checkpoint, nine live slots
+        // and three checkpoints of 16 bytes, and four sets of index vectors of a slot row and
+        // five planes for each of the four copies a batch of two rows may carry.
+        assert_eq!(
+            config.bytes(&cache.layout),
+            2 * 2 * 3 * 52 + (9 + 3) * 16 + 4 * (4 * 6 * 8)
+        );
+
+        // Every batch is lent the requests' slots, and none keeps a trail.
+        // SAFETY: meta tensors have no data and their addresses are never read.
+        let column = |dims: &[usize]| unsafe { lend(0, dims, DType::U32, None) };
+        let verify = || -> Result<VerifySlots> {
+            Ok(VerifySlots {
+                state_indices: column(&[2, 3])?,
+                num_accepted: column(&[2])?,
+            })
+        };
+        let columns = || -> Result<[Tensor; 4]> {
+            Ok([column(&[3])?, column(&[2])?, column(&[2])?, column(&[2])?])
+        };
+        let [offsets, lens, slots, checkpoints] = columns()?;
+        let lent = state.lend(offsets, lens, slots, checkpoints, false, Some(verify()?))?;
+        assert!(lent.verify.is_some() && lent.trail.is_none());
+
+        let [offsets, lens, slots, checkpoints] = columns()?;
+        assert!(
+            state
+                .lend(offsets, lens, slots, checkpoints, false, None)
+                .is_err()
+        );
+        let [offsets, lens, slots, checkpoints] = columns()?;
+        assert!(
+            state
+                .lend(offsets, lens, slots, checkpoints, true, Some(verify()?))
+                .is_err()
+        );
+        assert!(StateMemory::meta(StateConfig { trail: 4, ..config }, &cache).is_err());
+
+        // A state whose requests own one slot is lent none.
+        let single = StateMemory::meta(self::config(0), &self::cache());
+        let [offsets, lens, slots, checkpoints] = columns()?;
+        assert!(
+            single?
+                .lend(offsets, lens, slots, checkpoints, false, Some(verify()?))
+                .is_err()
+        );
+
+        // A state of other runs than the ones its cache's state pages hold.
+        assert!(StateMemory::meta(self::config(0), &cache).is_err());
+        Ok(())
     }
 }

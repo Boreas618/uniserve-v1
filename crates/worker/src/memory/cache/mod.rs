@@ -1030,7 +1030,7 @@ mod tests {
                 stepwise: false,
             }],
         };
-        let layout = CacheLayout::hybrid(4, 2, 1, 4, PrefixCacheDtype::Float8E4m3Fn, &state)
+        let layout = CacheLayout::hybrid(4, 2, 1, 4, PrefixCacheDtype::Float8E4m3Fn, &[state])
             .and_then(|layout| layout.with_draft(1, 1, 4))
             .expect("a hybrid layout with a draft group");
 

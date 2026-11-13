@@ -63,7 +63,7 @@ fn shape() -> StateShape {
 /// The cache of two attention layers of 4-token pages of one 8-wide BF16 head beside that
 /// state: a state page is two units.
 fn cache() -> Outcome<KvCacheConfig> {
-    let layout = CacheLayout::hybrid(4, 2, 1, 8, PrefixCacheDtype::BFloat16, &shape())?;
+    let layout = CacheLayout::hybrid(4, 2, 1, 8, PrefixCacheDtype::BFloat16, &[shape()])?;
 
     Ok(KvCacheConfig {
         layout: Arc::new(layout),
@@ -77,10 +77,11 @@ fn cache() -> Outcome<KvCacheConfig> {
 
 fn config(trail: u32) -> StateConfig {
     StateConfig {
-        shape: shape(),
+        shapes: vec![shape()],
         slots: 3,
         rows: 2,
         trail,
+        owned: 1,
     }
 }
 

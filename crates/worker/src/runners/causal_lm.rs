@@ -14,6 +14,8 @@
 //! ```text
 //! pooled page tables [slots + 1, width] ─ index_select(slot rows) → KvCache::block_tables
 //! next input tokens  [slots + 1, …]     ─ index_select(slot rows) → a decode's input ids
+//! contexts           [slots + 1, 2]     ─ index_select(slot rows) → TokenBatch::ngram_context
+//! accepted counts    [slots + 1]        ─ index_select(slot rows) → VerifySlots::num_accepted
 //! input ids                             → embed_input_ids         → hidden [tokens, hidden]
 //! hidden, batch, cache, state           → forward                 → hidden [tokens, hidden]
 //! hidden                                ─ index_select(logits rows) → compute_logits
@@ -21,6 +23,8 @@
 //! logits, tokens                        → Sampler::score          → logprobs, ranks, candidates
 //! hidden, targets (a scoring bucket)    → compute_logits, Sampler::score, in chunks
 //! tokens, commit table                  → Sampler::commit_        → the slots' state
+//! contexts, input ids                   ─ index_select(next contexts) → scatter(slots) → contexts
+//! one per row                           ─ scatter(slots)          → accepted counts
 //! positions [slots + 1]                 ─ index_select(call slots) → each call's positions
 //! ```
 //!
@@ -29,6 +33,15 @@
 //! token per row and scores it: whether a row's request asked is not a value a captured graph
 //! branches on, and the completion keeps what the batch asked for. The outputs and their order
 //! are stated in [`output`].
+//!
+//! A model whose layers read token ids (`TextModel::reads_token_ids`) is lent the ids the
+//! forward embeds and the two ids before each row, which its slot keeps and the forward
+//! advances to the row's last two (`columns`, token ids). A runner that speculates over a
+//! model whose state keeps a slot per verified token (`nn::family::StateField::stepwise`) lends
+//! every forward its state rows' verify slots (`nn::VerifySlots`; `columns`, verify slots):
+//! their slots, which an input column states, and how many tokens of their slots' last steps
+//! stand, which the slots keep. A forward of a prompt or a decode leaves one standing, and a
+//! verification its accepted tokens (`speculation`). A paired forward advances neither.
 //!
 //! ## A step
 //!
@@ -109,8 +122,8 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use ipc::batch::{Batch, BatchOutput, Phase, Shape as BatchShape, TimingCounters, Variant};
-use nn::family::TextModel;
-use nn::{KvCache, PhaseKind, RecurrentState, TokenBatch};
+use nn::family::{StateField, TextModel};
+use nn::{KvCache, PhaseKind, RecurrentState, TokenBatch, VerifySlots};
 use platform::Stream;
 use proto::module::commit::COMMIT_FIELDS;
 use proto::module::sampler::{PARAMETER_COLUMNS, TEMPERATURE};
@@ -122,6 +135,7 @@ use self::slots::Slots;
 use self::speculation::{DraftPool, DraftTable, Kept, Speculation};
 use crate::buckets::{Bucket, Buckets};
 use crate::graphs::Graphs;
+use crate::memory::state::layer_fields;
 use crate::memory::tables::{BlockCopy, BlockTables, Change};
 use crate::runner::Runner;
 use crate::sampler::{self, Sampler, SamplerConfig};
@@ -274,21 +288,26 @@ impl CausalLmRunner {
         )
     }
 
-    /// The bytes of device memory the request slots' state takes for `config` over a
-    /// `vocabulary`-wide logit row: the count and bias tables, the commit state and the ban
-    /// masks, which the runner allocates when its graphs hold a device.
+    /// The bytes of device memory the request slots' state takes for a runner of `model` under
+    /// `config`: the count and bias tables over the model's vocabulary, the commit state, the
+    /// ban masks, and the contexts and accepted counts where its forwards read them, which the
+    /// runner allocates when its graphs hold a device.
     ///
     /// # Errors
     ///
-    /// [`Error::Invalid`] for a config with no bucket.
-    pub fn slot_bytes(config: &CausalLmConfig, vocabulary: u32) -> Result<u64> {
+    /// [`Error::Invalid`] for a config with no bucket, or a model whose state keeps a slot per
+    /// verified token under a config that states no drafts.
+    pub fn slot_bytes(config: &CausalLmConfig, model: &dyn TextModel) -> Result<u64> {
         let layout = stated(config)?.1;
+        let owned = owned_slots(model, config)?;
 
         Ok(Slots::bytes(
             config.slots,
-            vocabulary,
+            model.vocabulary(),
             layout.rows() as u32,
             1,
+            model.reads_token_ids(),
+            owned.is_some(),
         ))
     }
 
@@ -304,7 +323,10 @@ impl CausalLmRunner {
     ///   `slot` holding the pages of the request on that slot and the last row naming the
     ///   padding unit alone. A forward gathers its rows' tables from it.
     /// - `state` is the `(live, checkpoint)` buffers of the recurrent state, in the layout of
-    ///   `nn::RecurrentState`, for a model that keeps one.
+    ///   `nn::RecurrentState`, for a model that keeps one: a buffer per field of every layer of
+    ///   the model's runs (`TextModel::state_layers`), the live buffer of a field that keeps a
+    ///   slot per verified token holding `drafts + 1` rows a request slot when the config
+    ///   states drafts (`StateMemory`).
     ///
     /// The caller keeps the memory of `cache` and `state` valid and at its addresses for as
     /// long as the runner exists, and writes it only on `stream`.
@@ -313,9 +335,11 @@ impl CausalLmRunner {
     ///
     /// [`Error::Invalid`] for a bucket that is no causal forward, input tensors `graphs` do
     /// not hold, a stream without a device or the reverse, a cache that is not the model's
-    /// layers over `config`'s page size and slots, a state that is not the model's, or a
-    /// config that states drafts for a model that loaded no drafter or without the draft pool
-    /// of its cache; the refusals of the slot state's allocation and of the sampler.
+    /// layers over `config`'s page size and slots, a state that is not the model's over the
+    /// config's slots, a model whose state keeps a slot per verified token under a config that
+    /// states no drafts, or a config that states drafts for a model that loaded no drafter or
+    /// without the draft pool of its cache; the refusals of the slot state's allocation and
+    /// of the sampler.
     pub fn new(
         model: Arc<dyn TextModel>,
         config: CausalLmConfig,
@@ -337,7 +361,8 @@ impl CausalLmRunner {
             ));
         }
         check_cache(&*model, &config, &cache)?;
-        check_state(&*model, state.as_ref())?;
+        let owned = owned_slots(&*model, &config)?;
+        check_state(&*model, &config, owned, state.as_ref())?;
 
         let vocabulary = model.vocabulary();
         let slots = Slots::new(
@@ -346,6 +371,8 @@ impl CausalLmRunner {
             vocabulary,
             layout.rows() as u32,
             1,
+            model.reads_token_ids(),
+            owned.is_some(),
         )?;
         let sampler = Sampler::new(
             SamplerConfig {
@@ -430,14 +457,16 @@ impl CausalLmRunner {
     }
 
     /// Lends a runner that speculates the draft cache its drafter's forwards compute over,
-    /// and the trail of the recurrent state when its model keeps one.
+    /// and the trail of the recurrent state when its model keeps one and its forwards lend no
+    /// verify slots.
     ///
     /// - `draft` is the draft group as the rank's cache lends it: the drafter's planes, pages
     ///   of the draft pool's page size, and the workspace. Its `block_tables` is not read: a
     ///   forward states each row's pages as an input column.
     /// - `trail` is the trail buffers of the recurrent state, in the layout of
     ///   `nn::RecurrentState::trail`, with a row for each token of the largest verification
-    ///   bucket.
+    ///   bucket. A runner whose forwards lend verify slots keeps the state after each token in
+    ///   its requests' slots, and is lent none.
     ///
     /// The caller keeps their memory as it keeps the cache's and the state's.
     ///
@@ -445,7 +474,7 @@ impl CausalLmRunner {
     ///
     /// [`Error::Invalid`] for a runner that speculates nothing, a draft cache that is not the
     /// drafter's layers over the draft pool's pages, or a trail that is not the model's
-    /// recurrent state over the tokens of a verification.
+    /// recurrent state over the tokens of a verification, or that the runner keeps none of.
     pub fn set_draft_cache(&mut self, draft: KvCache, trail: Option<StateBuffers>) -> Result<()> {
         let layers = self.model.drafter().map(|drafter| drafter.cache().layers);
         let Some(speculation) = self.speculation.as_mut() else {
@@ -472,21 +501,28 @@ impl CausalLmRunner {
             .map(|bucket| bucket.tokens as usize)
             .max()
             .unwrap_or(0);
-        let fields = self.model.state().map(|shape| shape.fields.len());
-        let trailed = match (&trail, fields) {
-            (None, None) => true,
-            (Some(trail), Some(fields)) => trail.iter().all(|layer| {
-                layer.len() == fields
-                    && layer
-                        .iter()
-                        .all(|field| field.dims().first().is_some_and(|rows| *rows >= tokens))
-            }),
-            _ => false,
+        let runs = self.model.state_layers();
+        let layers: Vec<&[StateField]> = layer_fields(&runs).collect();
+        let trails = !layers.is_empty() && self.slots.accepted().is_none();
+
+        let trailed = match &trail {
+            None => !trails,
+            Some(trail) => {
+                trails
+                    && trail.len() == layers.len()
+                    && trail.iter().zip(&layers).all(|(layer, fields)| {
+                        layer.len() == fields.len()
+                            && layer.iter().all(|field| {
+                                field.dims().first().is_some_and(|rows| *rows >= tokens)
+                            })
+                    })
+            }
         };
         if !trailed {
             return Err(Error::Invalid(format!(
                 "a verification of a model that keeps a recurrent state keeps a trail of its \
-                 {tokens} tokens for every field, and a model that keeps none is lent none"
+                 {tokens} tokens for every field unless its forwards lend verify slots, and any \
+                 other verification is lent none"
             )));
         }
 
@@ -975,6 +1011,7 @@ impl CausalLmRunner {
             &batch.new_slots,
             base.variant.is_decode(),
         )?;
+        self.slots.restore(&batch.columns.state_copies)?;
         if !masks.is_empty() {
             self.slots.ban(&masks)?;
         }
@@ -1079,6 +1116,22 @@ impl CausalLmRunner {
                 })
             })
             .collect()
+    }
+
+    /// The verify slots of a forward's `rows` state rows (`nn::VerifySlots`): their slots, an
+    /// input column, and their slots' accepted counts, gathered by `slot_rows`, each row's row
+    /// of the slot state (the padding row for a row on no slot). `None` for a runner whose
+    /// forwards lend none.
+    fn verify_slots(&self, slot_rows: &Tensor, rows: usize) -> Result<Option<VerifySlots>> {
+        let Some(accepted) = self.slots.accepted() else {
+            return Ok(None);
+        };
+        let owned = self.layout.drafts() + 1;
+
+        Ok(Some(VerifySlots {
+            state_indices: self.column(Column::StateIndices, (rows, owned))?,
+            num_accepted: accepted.index_select(slot_rows, 0)?,
+        }))
     }
 
     /// Scores every token of a scoring bucket against its target: `[logprobs, ranks]`, then
@@ -1197,9 +1250,15 @@ impl Runner for CausalLmRunner {
 
         // ---- The model ----
 
+        // A model that reads token ids reads the two ids before each row, which its slot keeps.
+        let contexts = match self.slots.context() {
+            Some(table) => Some(table.index_select(&slot_rows, 0)?),
+            None => None,
+        };
+
         let batch = TokenBatch {
-            token_ids: None,
-            ngram_context: None,
+            token_ids: contexts.as_ref().map(|_| ids.clone()),
+            ngram_context: contexts.clone(),
             positions: self.column(Column::Positions, tokens)?,
             slot_mapping: self.column(Column::SlotMapping, tokens)?,
             seq_lens: self.column(Column::SeqLens, rows)?,
@@ -1222,7 +1281,7 @@ impl Runner for CausalLmRunner {
         // A batch's state rows are its attention rows.
         let state = match &self.state {
             Some((live, checkpoint)) => Some(RecurrentState {
-                verify: None,
+                verify: self.verify_slots(&slot_rows, rows)?,
                 query_offsets: batch.query_offsets.clone(),
                 seq_lens: batch.seq_lens.clone(),
                 slots: slots.clone(),
@@ -1310,6 +1369,19 @@ impl Runner for CausalLmRunner {
         let call_slots = self.column(Column::CallSlots, rows)?;
         let logical = self.slots.logical().index_select(&call_slots, 0)?;
         let sampling = self.slots.sampling().index_select(&call_slots, 0)?;
+
+        // ---- What each row's slot continues from: its last two ids, and one standing token ----
+
+        // A paired forward writes nothing a serving request reads.
+        if !self.paired.get() {
+            if let (Some(table), Some(contexts)) = (self.slots.context(), &contexts) {
+                let index = self.column(Column::NextContext, (rows, 2))?;
+                write_rows(table, &slots, &history_ids(contexts, &ids, &index)?)?;
+            }
+            if let Some(accepted) = self.slots.accepted() {
+                write_rows(accepted, &slots, &slots.ones_like()?)?;
+            }
+        }
 
         // The order `output` states, each entry with its place among the kept tensors.
         let mut scores = scores.into_iter();
@@ -1665,35 +1737,127 @@ fn check_cache(model: &dyn TextModel, config: &CausalLmConfig, cache: &[KvCache]
     Ok(())
 }
 
-/// Refuses recurrent state buffers that are not `model`'s.
-fn check_state(model: &dyn TextModel, state: Option<&(StateBuffers, StateBuffers)>) -> Result<()> {
-    match (model.state(), state) {
-        (None, None) => Ok(()),
-        (Some(shape), Some((live, checkpoint))) => {
-            let layered = |buffers: &[Vec<Tensor>]| {
-                buffers.len() == shape.layers as usize
-                    && buffers
-                        .iter()
-                        .all(|layer| layer.len() == shape.fields.len())
-            };
-            if layered(live) && layered(checkpoint) {
-                return Ok(());
-            }
+/// The slots a request owns of each stepwise field of `model`'s state under `config`
+/// (`nn::family::StateField::stepwise`): `drafts + 1` when the config states drafts and a field
+/// is stepwise, the forwards then lending verify slots (`nn::VerifySlots`), and `None` when no
+/// field is stepwise.
+///
+/// # Errors
+///
+/// [`Error::Invalid`] for a stepwise field under a config that states no drafts: the model was
+/// loaded for a deployment that speculates.
+fn owned_slots(model: &dyn TextModel, config: &CausalLmConfig) -> Result<Option<u32>> {
+    let runs = model.state_layers();
+    let stepwise = layer_fields(&runs).flatten().any(|field| field.stepwise);
 
-            Err(Error::Invalid(format!(
-                "the recurrent state lends {} live and {} checkpoint layers, and the model \
-                 keeps {} layers of {} fields",
-                live.len(),
-                checkpoint.len(),
-                shape.layers,
-                shape.fields.len()
-            )))
-        }
-        (Some(_), None) => Err(Error::Invalid(
-            "the model keeps a recurrent state and the runner was lent none".into(),
+    match (stepwise, config.drafts) {
+        (false, _) => Ok(None),
+        (true, 0) => Err(Error::Invalid(
+            "the model's state keeps a slot per verified token, and the runner's config states \
+             no drafts to verify"
+                .into(),
         )),
-        (None, Some(_)) => Err(Error::Invalid(
-            "the runner was lent a recurrent state its model does not keep".into(),
-        )),
+        (true, drafts) => Ok(Some(drafts + 1)),
     }
+}
+
+/// Refuses recurrent state buffers that are not `model`'s over `config`'s request slots: a
+/// buffer per field of every layer of the model's runs (`TextModel::state_layers`), in order,
+/// whose live buffers hold every row a forward addresses: a home row per slot, and `owned`
+/// rows a slot of a stepwise field when the forwards lend verify slots ([`owned_slots`]).
+fn check_state(
+    model: &dyn TextModel,
+    config: &CausalLmConfig,
+    owned: Option<u32>,
+    state: Option<&(StateBuffers, StateBuffers)>,
+) -> Result<()> {
+    let runs = model.state_layers();
+    let layers: Vec<&[StateField]> = layer_fields(&runs).collect();
+
+    let (live, checkpoint) = match (layers.is_empty(), state) {
+        (true, None) => return Ok(()),
+        (false, Some(state)) => state,
+        (false, None) => {
+            return Err(Error::Invalid(
+                "the model keeps a recurrent state and the runner was lent none".into(),
+            ));
+        }
+        (true, Some(_)) => {
+            return Err(Error::Invalid(
+                "the runner was lent a recurrent state its model does not keep".into(),
+            ));
+        }
+    };
+
+    let layered = |buffers: &[Vec<Tensor>]| {
+        buffers.len() == layers.len()
+            && buffers
+                .iter()
+                .zip(&layers)
+                .all(|(layer, fields)| layer.len() == fields.len())
+    };
+    if !layered(live) || !layered(checkpoint) {
+        return Err(Error::Invalid(format!(
+            "the recurrent state lends {} live and {} checkpoint layers, and the model keeps {} \
+             layers in {} runs, each of its run's fields",
+            live.len(),
+            checkpoint.len(),
+            layers.len(),
+            runs.len()
+        )));
+    }
+
+    // A forward addresses a row of a buffer by an index no kernel bounds: the verify slots
+    // name every row a request owns of a stepwise field.
+    for (buffers, fields) in live.iter().zip(&layers) {
+        for (buffer, field) in buffers.iter().zip(fields.iter()) {
+            let owned = if field.stepwise {
+                owned.unwrap_or(1)
+            } else {
+                1
+            };
+            let rows = config.slots as usize * owned as usize;
+
+            if buffer.dims().first().is_none_or(|held| *held < rows) {
+                return Err(Error::Invalid(format!(
+                    "the live buffer of field {} is {:?}, and the runner's {} request slots \
+                     address {rows} rows of it",
+                    field.name,
+                    buffer.dims(),
+                    config.slots
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// The ids `index` names in the id history of a forward (`columns`, token ids): `contexts`,
+/// `[rows, 2]` U32, the two ids before each of its rows, then `ids`, `[tokens]` U32, its token
+/// ids. The result has `index`'s shape.
+///
+/// # Errors
+///
+/// Tensors of other shapes or element types.
+pub(crate) fn history_ids(contexts: &Tensor, ids: &Tensor, index: &Tensor) -> Result<Tensor> {
+    let history = Tensor::cat(&[&contexts.flatten_all()?, ids], 0)?;
+
+    Ok(history
+        .index_select(&index.flatten_all()?, 0)?
+        .reshape(index.shape())?)
+}
+
+/// Writes `values`, one entry along the leading axis for each entry of `slots`, `[rows]` U32,
+/// into the rows of `table`, a per-slot buffer, that `slots` names; an entry of `slots` that
+/// names no row (`nn::NO_SLOT`, a row on no request slot) writes nothing.
+///
+/// # Errors
+///
+/// Tensors of other shapes or element types.
+pub(crate) fn write_rows(table: &Tensor, slots: &Tensor, values: &Tensor) -> Result<()> {
+    let mut broadcast = vec![1; values.rank()];
+    broadcast[0] = slots.elem_count();
+    let index = slots.reshape(broadcast)?.broadcast_as(values.shape())?;
+
+    Ok(table.scatter_set(&index, values, 0)?)
 }

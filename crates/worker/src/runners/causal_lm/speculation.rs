@@ -8,11 +8,10 @@
 //! target    a prompt batch from its prefill bucket, or a verification batch from a
 //!           verification bucket: each token of a verification is one attention row (the decode
 //!           step at its position) and one sampling row, while one state row per verification
-//!           advances the recurrent state through its tokens and keeps the state after each
-//!           (the trail). The graph samples every token, accepts on the device the drafts its
-//!           own samples agree with, settles the recurrent state on the trail's entry of the
-//!           last accepted token, and commits (`slot_commit`: the verification's row, then a
-//!           count row per accepted draft).
+//!           advances the recurrent state through its tokens and keeps the state after each.
+//!           The graph samples every token, accepts on the device the drafts its own samples
+//!           agree with, makes the state after the last accepted token the slot's, and commits
+//!           (`slot_commit`: the verification's row, then a count row per accepted draft).
 //! drafter   the drafter's bucket of the same rows and tokens: its entries over the positions
 //!           whose next token the target left, then the drafts each row proposes, each chained
 //!           step embedding the proposal of the step before it.
@@ -51,6 +50,21 @@
 //! The drafter's entry at offset `j` of a verification is written when `j <= agreed`, reads
 //! the token chosen at that offset, and the row's first proposal reads the entry at `agreed`.
 //!
+//! ## The recurrent state after a verification
+//!
+//! A model that keeps a recurrent state keeps the state after each token of a verification in
+//! one of two ways. A model whose every field keeps one slot per request keeps them in the
+//! **trail**, `[tokens, …]`, and the graph copies the trail's entry of `last` into the slot's
+//! live buffer. A model with a field that keeps a slot per verified token
+//! (`nn::family::StateField::stepwise`) is lent **verify slots** instead (`nn::VerifySlots`):
+//! the token at offset `t` leaves its state in the request's slot `t`, and the graph writes
+//! `agreed + 1`, the tokens of the step that stand, into the slot's accepted count, which the
+//! next forward reads to choose the slot it continues from. No state is copied, and such a
+//! runner is lent no trail.
+//!
+//! A model that reads token ids continues each request from the two ids before the sample
+//! after `last`: the token before `last` and `last` itself (`columns`, token ids).
+//!
 //! ## The draft cache
 //!
 //! The drafter's keys and values lie in the pool's draft group, which has no pooled page
@@ -77,7 +91,7 @@ use proto::module::sampler::PARAMETER_COLUMNS;
 use uniserve_tensor::{DType, Shape, Tensor};
 
 use super::columns::{self, Column, Layout, slot_row};
-use super::{CausalLmRunner, StateBuffers};
+use super::{CausalLmRunner, StateBuffers, history_ids, write_rows};
 use crate::buckets::Bucket;
 use crate::memory::allocation::Storage;
 use crate::memory::cache::CacheLayout;
@@ -445,6 +459,26 @@ pub(crate) fn accept(
     Ok((agreed, last))
 }
 
+/// The two token ids each verification's slot continues from, `[rows, 2]` U32 (module
+/// documentation): the id before `last`'s token and that token's own, `last`, `[rows]` U32,
+/// being the token each verification's acceptance ends on ([`accept`]).
+///
+/// - `before`: `[tokens, 2]` U32, the two ids before each token of the batch, the earlier
+///   first: the verification's `nn::TokenBatch::ngram_context`;
+/// - `ids`: `[tokens]` U32, the batch's token ids.
+///
+/// # Errors
+///
+/// Columns of another shape or element type.
+pub(crate) fn continued(before: &Tensor, ids: &Tensor, last: &Tensor) -> Result<Tensor> {
+    let earlier = before
+        .narrow(1, 1, 1)?
+        .flatten_all()?
+        .index_select(last, 0)?;
+
+    Ok(Tensor::stack(&[earlier, ids.index_select(last, 0)?], 1)?)
+}
+
 /// Whether `call` is a verification: a verification, or a decode, which a speculating runner
 /// serves as a verification of no draft.
 const fn verifying(call: &Row) -> bool {
@@ -698,6 +732,15 @@ pub(crate) fn fill_verification(
     let mut table = sampler::commit_table(&columns.commit, calls, layout.rows())?;
     let stride = layout.rows();
 
+    // ---- The two ids before each token, in the id history of its token rows ----
+
+    // Each token is a row whose context, gathered by its slot, is its request's: the two ids
+    // before a token are its row's context at its request's first token, the context's later
+    // id and the request's first token at the second, and the request's two tokens before it
+    // after that (`columns`, token ids). A token no request holds keeps its row's context.
+    let history = 2 * bucket_tokens as u32;
+    let mut contexts: Vec<u32> = (0..history).collect();
+
     for (index, call) in rows.calls.iter().enumerate() {
         let row = call.rows.start as usize;
         let (first, last) = span(call);
@@ -724,6 +767,16 @@ pub(crate) fn fill_verification(
                 compared[token] = *draft;
             }
             extras[token * drafts..][..ahead].copy_from_slice(&drafted[..ahead]);
+
+            let (at, ahead) = (token as u32, ahead as u32);
+            contexts[2 * token] = match ahead {
+                0 | 1 => 2 * at + ahead,
+                _ => history + at - 2,
+            };
+            contexts[2 * token + 1] = match ahead {
+                0 => 2 * at + 1,
+                _ => history + at - 1,
+            };
         }
         for offset in 0..=drafts {
             windows[index * (drafts + 1) + offset] = (first + offset.min(drafted.len())) as u32;
@@ -769,6 +822,16 @@ pub(crate) fn fill_verification(
     layout.put(block, Column::Windows, &windows)?;
     layout.put(block, Column::DraftTokens, &draft_tokens)?;
     layout.put(block, Column::DraftSteps, &steps)?;
+    layout.put(block, Column::TokenContext, &contexts)?;
+
+    // A verification's state rows are its sequences: their verify slots replace the token
+    // rows' that the generic columns state.
+    let owned = drafts as u32 + 1;
+    layout.put(
+        block,
+        Column::StateIndices,
+        &columns::state_indices(&state_slots, slots, owned),
+    )?;
     layout.put(block, Column::Commit, &table)
 }
 
@@ -1052,10 +1115,23 @@ impl CausalLmRunner {
 
         let slots = self.column(Column::Slots, tokens)?;
         let cache = self.gathered_cache(&self.column(Column::TableRows, tokens)?)?;
+        let ids = self.column(Column::InputIds, tokens)?;
+
+        // A model that reads token ids reads the two ids before each token: its request's
+        // context, which the slot keeps and each token row gathers, then its own tokens.
+        let contexts = match self.slots.context() {
+            Some(table) => {
+                let gathered = table.index_select(&self.column(Column::SlotRows, tokens)?, 0)?;
+                let index = self.column(Column::TokenContext, (tokens, 2))?;
+
+                Some(history_ids(&gathered, &ids, &index)?)
+            }
+            None => None,
+        };
 
         let batch = TokenBatch {
-            token_ids: None,
-            ngram_context: None,
+            token_ids: contexts.as_ref().map(|_| ids.clone()),
+            ngram_context: contexts.clone(),
             positions: self.column(Column::Positions, tokens)?,
             slot_mapping: self.column(Column::SlotMapping, tokens)?,
             seq_lens: self.column(Column::SeqLens, tokens)?,
@@ -1071,30 +1147,37 @@ impl CausalLmRunner {
         };
         batch.check()?;
 
+        // A verification's state rows are its calls, whose rows of the slot state the call
+        // slots name.
         let state_slots = self.column(Column::StateSlots, rows)?;
-        let state = match (&self.state, &speculation.trail) {
-            (Some((live, checkpoint)), Some(trail)) => Some(RecurrentState {
-                verify: None,
-                query_offsets: self.column(Column::StateOffsets, rows + 1)?,
-                seq_lens: self.column(Column::StateLens, rows)?,
-                slots: state_slots.clone(),
-                checkpoints: self.column(Column::Checkpoints, rows)?,
-                live: live.clone(),
-                checkpoint: checkpoint.clone(),
-                trail: Some(trail.clone()),
-            }),
-            (Some(_), None) => {
-                return Err(Error::State(
-                    "a verification of a model that keeps a recurrent state was lent no trail",
-                ));
+        let verify = self.verify_slots(&self.column(Column::CallSlots, rows)?, rows)?;
+        let state = match &self.state {
+            Some((live, checkpoint)) => {
+                // The state after each token is kept in the trail or in the request's verify
+                // slots, whichever the runner was lent.
+                if speculation.trail.is_some() == verify.is_some() {
+                    return Err(Error::State(
+                        "a verification of a model that keeps a recurrent state keeps the state \
+                         after each token in a trail or in verify slots, one of the two",
+                    ));
+                }
+
+                Some(RecurrentState {
+                    verify,
+                    query_offsets: self.column(Column::StateOffsets, rows + 1)?,
+                    seq_lens: self.column(Column::StateLens, rows)?,
+                    slots: state_slots.clone(),
+                    checkpoints: self.column(Column::Checkpoints, rows)?,
+                    live: live.clone(),
+                    checkpoint: checkpoint.clone(),
+                    trail: speculation.trail.clone(),
+                })
             }
-            (None, _) => None,
+            None => None,
         };
 
         let hidden = {
-            let embedded = self
-                .model
-                .embed_input_ids(&self.column(Column::InputIds, tokens)?)?;
+            let embedded = self.model.embed_input_ids(&ids)?;
             self.model
                 .forward(&batch, &cache, state.as_ref(), None, &embedded)?
         };
@@ -1146,15 +1229,7 @@ impl CausalLmRunner {
             for (live, trail) in live.iter().flatten().zip(trail.iter().flatten()) {
                 // A slot's state becomes the state its verification left after the last
                 // token it accepted. A row on no slot names none, which the scatter skips.
-                let settled = trail.index_select(&last, 0)?;
-
-                let mut broadcast = vec![1; settled.rank()];
-                broadcast[0] = rows;
-                let index = state_slots
-                    .reshape(broadcast)?
-                    .broadcast_as(settled.shape())?;
-
-                live.scatter_set(&index, &settled, 0)?;
+                write_rows(live, &state_slots, &trail.index_select(&last, 0)?)?;
             }
         }
 
@@ -1214,6 +1289,18 @@ impl CausalLmRunner {
         let call_slots = self.column(Column::CallSlots, rows)?;
         let logical = self.slots.logical().index_select(&call_slots, 0)?;
         let sampling = self.slots.sampling().index_select(&call_slots, 0)?;
+
+        // ---- What each verification's slot continues from ----
+
+        // Its next row follows the token its acceptance ends on: the two ids before that row
+        // are the one before that token and the token itself, and the tokens of this step
+        // that stand are the agreed drafts and the token before them.
+        if let (Some(table), Some(contexts)) = (self.slots.context(), &contexts) {
+            write_rows(table, &state_slots, &continued(contexts, &ids, &last)?)?;
+        }
+        if let Some(accepted) = self.slots.accepted() {
+            write_rows(accepted, &state_slots, &span.view(DType::U32)?)?;
+        }
 
         // ---- What the drafter and the completion read ----
 

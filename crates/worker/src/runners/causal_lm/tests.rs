@@ -78,6 +78,12 @@ struct Tiny {
     head: Linear,
     /// Whether the model keeps a recurrent state, which its forward then asks for.
     stateful: bool,
+    /// Whether the state keeps a second run of layers, whose field keeps a slot per verified
+    /// token of a deployment that drafts [`DRAFTS`] tokens: its forward then asks for the
+    /// rows' verify slots.
+    stepwise: bool,
+    /// Whether the model's layers read token ids, which its forward then asks for.
+    reads: bool,
     /// Whether the model's experts are split across ranks, whose exchange its forward then
     /// asks for.
     routed: bool,
@@ -98,6 +104,8 @@ impl Tiny {
             value: linear(HEADS * DIM),
             head: linear(VOCABULARY),
             stateful,
+            stepwise: false,
+            reads: false,
             routed: false,
             drafter: None,
         }
@@ -201,12 +209,36 @@ impl CausalLm for Tiny {
         exchange: Option<&ExpertExchange>,
         hidden: &Tensor,
     ) -> nn::Result<Tensor> {
-        // The state's rows are the batch's, or a verification's sequences, which keep a trail.
-        let lent = state
-            .is_some_and(|state| state.slots.dims() == [batch.rows()] || state.trail.is_some());
+        // The state's rows are the batch's, or a verification's sequences, which keep a trail
+        // or are lent their verify slots.
+        let lent = state.is_some_and(|state| {
+            state.slots.dims() == [batch.rows()] || state.trail.is_some() || state.verify.is_some()
+        });
         if self.stateful != lent {
             return Err(nn::Error::Unsupported(
                 "the model's recurrent state is not the batch's rows".to_owned(),
+            ));
+        }
+
+        // A stepwise field reads each state row's slots, `DRAFTS + 1` of them, and its count of
+        // standing tokens; the token ids beside the embeddings are read as the batch's pair.
+        let verified = state.and_then(|state| state.verify.as_ref().map(|verify| (state, verify)));
+        let slotted = verified.is_some_and(|(state, verify)| {
+            let rows = state.seq_lens.elem_count();
+
+            verify.state_indices.dims() == [rows, DRAFTS as usize + 1]
+                && verify.num_accepted.dims() == [rows]
+                && state.trail.is_none()
+        });
+        if self.stepwise != slotted {
+            return Err(nn::Error::Unsupported(
+                "the model's stepwise state reads its rows' verify slots (verify)".to_owned(),
+            ));
+        }
+        if self.reads != (batch.token_ids.is_some() && batch.ngram_context.is_some()) {
+            return Err(nn::Error::Unsupported(
+                "the model reads token ids exactly when it states it (token_ids, ngram_context)"
+                    .to_owned(),
             ));
         }
         let [group] = cache else {
@@ -286,15 +318,19 @@ impl TextModel for Tiny {
     }
 
     fn state(&self) -> Option<StateShape> {
-        self.stateful.then(|| StateShape {
-            layers: 1,
-            fields: vec![StateField {
-                name: "state",
-                dtype: DType::BF16,
-                dims: vec![HIDDEN],
-                stepwise: false,
-            }],
-        })
+        self.stateful.then(state_shape)
+    }
+
+    fn state_layers(&self) -> Vec<StateShape> {
+        let mut runs: Vec<StateShape> = self.state().into_iter().collect();
+        if self.stepwise {
+            runs.push(stepwise_shape());
+        }
+        runs
+    }
+
+    fn reads_token_ids(&self) -> bool {
+        self.reads
     }
 
     fn experts(&self) -> Option<ExpertShape> {
@@ -777,13 +813,13 @@ fn the_runner_s_memory_is_a_function_of_its_config() {
     assert!(inputs >= 4 * 320 + 21 * 256 - 4 * 256);
 
     // The two tables of a row per slot and vocabulary entry dominate the slot state.
-    let slots = CausalLmRunner::slot_bytes(&config, VOCABULARY as u32).unwrap();
+    let slots = CausalLmRunner::slot_bytes(&config, &Tiny::new(false)).unwrap();
     let tables = 2 * u64::from(SLOTS) * VOCABULARY as u64 * 4;
     assert!(slots >= tables && slots < tables + 8 * 256);
 
     let mut wider = config;
     wider.slots = 2 * SLOTS;
-    assert!(CausalLmRunner::slot_bytes(&wider, VOCABULARY as u32).unwrap() >= 2 * tables);
+    assert!(CausalLmRunner::slot_bytes(&wider, &Tiny::new(false)).unwrap() >= 2 * tables);
 }
 
 // ---- The bytes of the input tensors -------------------------------------------------------------
@@ -2049,6 +2085,20 @@ fn state_shape() -> StateShape {
     }
 }
 
+/// The second run of the stepwise test model's state: one layer whose field keeps a slot per
+/// verified token.
+fn stepwise_shape() -> StateShape {
+    StateShape {
+        layers: 1,
+        fields: vec![StateField {
+            name: "steps",
+            dtype: DType::F32,
+            dims: vec![HIDDEN],
+            stepwise: true,
+        }],
+    }
+}
+
 /// The rank's cache of the test model: one attention layer of the model's heads over
 /// [`PAGES`] units, a row of [`TABLE_WIDTH`] pages per request slot, and the state pages of a
 /// model that keeps a recurrent state.
@@ -2056,7 +2106,7 @@ fn cache_config(stateful: bool) -> KvCacheConfig {
     let (heads, dim) = (HEADS as u32, DIM as u32);
     let dtype = ipc::PrefixCacheDtype::BFloat16;
     let layout = if stateful {
-        CacheLayout::hybrid(PAGE, 1, heads, dim, dtype, &state_shape())
+        CacheLayout::hybrid(PAGE, 1, heads, dim, dtype, &[state_shape()])
     } else {
         CacheLayout::dense(PAGE, 1, heads, dim, dtype).validated()
     };
@@ -2098,10 +2148,11 @@ fn a_runner_over_the_rank_s_cache_and_state_profiles_and_captures_every_bucket()
     let cache = KvCacheMemory::meta(config.clone()).unwrap();
     let state = StateMemory::meta(
         StateConfig {
-            shape: state_shape(),
+            shapes: vec![state_shape()],
             slots: SLOTS,
             rows: 4,
             trail: 0,
+            owned: 1,
         },
         &config,
     )
@@ -2264,10 +2315,11 @@ fn a_state_checkpoint_is_read_and_written_at_the_run_its_position_names() {
     let cache = KvCacheMemory::meta(config.clone()).unwrap();
     let state = StateMemory::meta(
         StateConfig {
-            shape: state_shape(),
+            shapes: vec![state_shape()],
             slots: SLOTS,
             rows: 4,
             trail: 0,
+            owned: 1,
         },
         &config,
     )
@@ -3256,7 +3308,7 @@ fn a_draft_page_is_read_as_runs_of_the_pool_s_pages() {
 fn a_speculating_runner_is_built_over_the_rank_s_draft_group_and_trail() {
     let (heads, dim) = (HEADS as u32, DIM as u32);
     let dtype = ipc::PrefixCacheDtype::BFloat16;
-    let layout = CacheLayout::hybrid(PAGE, 1, heads, dim, dtype, &state_shape())
+    let layout = CacheLayout::hybrid(PAGE, 1, heads, dim, dtype, &[state_shape()])
         .and_then(|layout| layout.with_draft(1, heads, dim))
         .unwrap();
     let cache_config = KvCacheConfig {
@@ -3279,10 +3331,11 @@ fn a_speculating_runner_is_built_over_the_rank_s_draft_group_and_trail() {
     let state = |trail: u32| {
         StateMemory::meta(
             StateConfig {
-                shape: state_shape(),
+                shapes: vec![state_shape()],
                 slots: SLOTS,
                 rows: 4,
                 trail,
+                owned: 1,
             },
             &cache_config,
         )
@@ -3326,4 +3379,358 @@ fn a_speculating_runner_is_built_over_the_rank_s_draft_group_and_trail() {
     allocate(&mut tables, 2, pool.group as u8, 0, &[(UNITS, 30, 1)]);
     let refused = runner.execute(&verification(0.0), &tables).unwrap_err();
     assert!(matches!(refused, Error::State(_)), "{refused}");
+}
+
+// ---- Token ids and verify slots ----------------------------------------------------------------
+
+/// The test model with layers that read token ids, and its drafter when `drafting`.
+fn reading(drafting: bool) -> Tiny {
+    let model = if drafting {
+        Tiny::drafting(false)
+    } else {
+        Tiny::new(false)
+    };
+
+    Tiny {
+        reads: true,
+        ..model
+    }
+}
+
+/// A CPU column of `values`.
+fn u32_column(values: &[u32]) -> Tensor {
+    Tensor::from_slice(values, values.len(), &Device::Cpu).unwrap()
+}
+
+/// A context table of the runner's request slots and the padding row, all zero but the rows
+/// `started` names: request slot `s` started with the context `[a, b]`, as `Slots::start`
+/// writes `NewSlot::context`.
+fn context_table(started: &[(u32, [u32; 2])]) -> Vec<[u32; 2]> {
+    let mut rows = vec![[0, 0]; SLOTS as usize + 1];
+    for (slot, context) in started {
+        rows[(*slot - 1) as usize] = *context;
+    }
+    rows
+}
+
+/// The rows of a `[rows, 2]` U32 tensor.
+fn pairs(table: &Tensor) -> Vec<[u32; 2]> {
+    table
+        .to_vec2::<u32>()
+        .unwrap()
+        .into_iter()
+        .map(|row| [row[0], row[1]])
+        .collect()
+}
+
+/// The rows of `table` that `slots`, each a row of it, gather, as a forward's contexts:
+/// `[slots, 2]` U32.
+fn gather(table: &[[u32; 2]], slots: &Tensor) -> Tensor {
+    let flat: Vec<u32> = table.iter().flatten().copied().collect();
+    let table = Tensor::from_slice(&flat, (table.len(), 2), &Device::Cpu).unwrap();
+
+    table.index_select(slots, 0).unwrap()
+}
+
+/// Writes `next`, `[rows, 2]`, into the rows of `table` that `slots`, `[rows]`, name, as the
+/// forward's scatter does: a row on no slot writes nothing.
+fn scatter(table: &mut [[u32; 2]], slots: &Tensor, next: &Tensor) {
+    let slots = slots.to_vec1::<u32>().unwrap();
+    for (slot, pair) in slots.into_iter().zip(pairs(next)) {
+        if slot != NO_SLOT {
+            table[slot as usize] = pair;
+        }
+    }
+}
+
+/// A forward of `batch` in `bucket` over the context table `table`, on the host, through the
+/// columns the runner pads it with (`columns`, token ids): returns the context each row is lent
+/// (`nn::TokenBatch::ngram_context`), and leaves in `table` what each row's slot continues
+/// from. A decode's token is the one its slot's commit left, which the batch states as well.
+fn advance(table: &mut [[u32; 2]], batch: &Batch, bucket: &Bucket) -> Vec<[u32; 2]> {
+    let (layout, block) = filled(batch, bucket, &[], false);
+    let (rows, tokens) = (bucket.rows as usize, bucket.tokens as usize);
+    let column = |column, elements| u32_column(&layout.read::<u32>(&block, column, elements));
+
+    let contexts = gather(table, &column(Column::SlotRows, rows));
+    let index = column(Column::NextContext, 2 * rows)
+        .reshape((rows, 2))
+        .unwrap();
+    let next = super::history_ids(&contexts, &column(Column::InputIds, tokens), &index).unwrap();
+
+    scatter(table, &column(Column::Slots, rows), &next);
+    pairs(&contexts)
+}
+
+/// A prompt chunk of `ids` on slot 2, at cache positions from `start`: one call of one row.
+fn prompt(ids: &[i32], start: i32) -> Batch {
+    let positions: Vec<i32> = (start..start + ids.len() as i32).collect();
+    let mut batch = chunk(&positions);
+
+    batch.columns.input_ids = ids.to_vec();
+    batch
+}
+
+#[test]
+fn a_model_that_reads_token_ids_is_lent_them_by_every_forward() {
+    // The model refuses a forward that withholds the token ids it reads, and one that lends
+    // them to a model that reads none: every bucket, the drafter's among them, is profiled and
+    // captured.
+    for drafting in [false, true] {
+        let config = if drafting {
+            speculating_config()
+        } else {
+            config()
+        };
+        let graphs = Graphs::meta(
+            Arc::new(Generation::new(0, [])),
+            CausalLmRunner::input_bytes(&config).unwrap(),
+        );
+        let pooled = meta((SLOTS as usize + 1, TABLE_WIDTH), DType::U32);
+
+        let mut runner = CausalLmRunner::new(
+            Arc::new(reading(drafting)),
+            config,
+            graphs,
+            None,
+            vec![group(PAGES, pooled)],
+            None,
+        )
+        .unwrap();
+        if drafting {
+            runner.set_draft_cache(draft_cache(), None).unwrap();
+        }
+
+        runner.graphs().profile_run(&runner).unwrap();
+        for bucket in runner.buckets() {
+            runner.graphs().capture(&runner, &bucket).unwrap();
+        }
+    }
+
+    // The slots keep two ids each, and the padding row's, for such a model alone.
+    let plain = CausalLmRunner::slot_bytes(&config(), &Tiny::new(false)).unwrap();
+    let read = CausalLmRunner::slot_bytes(&config(), &reading(false)).unwrap();
+    assert!(read >= plain + 2 * 4 * (u64::from(SLOTS) + 1));
+}
+
+#[test]
+fn a_slot_s_context_follows_its_request_across_its_prompt_chunks_and_decodes() {
+    // Slot 2's request has no token before its prompt, which its start states as the
+    // end-of-text id twice; slot 4's started elsewhere.
+    let mut table = context_table(&[(2, [63, 63]), (4, [21, 22])]);
+    let bucket = Bucket::prefill(4, 8, Variant::PrefillWrite);
+
+    // Its first chunk, 5 6 7, reads the request's context, and the slot continues from the
+    // chunk's last two ids.
+    let lent = advance(&mut table, &prompt(&[5, 6, 7], 0), &bucket);
+    assert_eq!(lent[0], [63, 63]);
+    assert_eq!(table[1], [6, 7]);
+
+    // The second chunk, 8 alone, reads the two ids before it across the chunk boundary, and
+    // the slot continues from its context's later id and its token.
+    let lent = advance(&mut table, &prompt(&[8], 3), &bucket);
+    assert_eq!(lent[0], [6, 7]);
+    assert_eq!(table[1], [7, 8]);
+
+    // A decode of 9 continues the same way. A padding row reads the padding row, and writes
+    // nothing: every other slot and the padding row keep what they held.
+    let mut step = decode(&[2], &[0.0]);
+    step.columns.input_ids = vec![9];
+    let lent = advance(&mut table, &step, &Bucket::decode(2, Variant::DecodeGreedy));
+    assert_eq!(lent, [[7, 8], [0, 0]]);
+
+    let mut expected = vec![[0, 0]; SLOTS as usize + 1];
+    expected[1] = [8, 9];
+    expected[3] = [21, 22];
+    assert_eq!(table, expected);
+}
+
+#[test]
+fn a_verification_continues_each_slot_from_the_token_its_acceptance_ends_on() {
+    // Slot 2 verifies 6 and 7 after its committed token 5, its request's tokens before 5
+    // being 3 4; slot 4 verifies 9 after 8, its tokens before being 1 2.
+    let batch = verification(0.0);
+    let bucket = Bucket::verify(4, DRAFTS, Variant::VerifyGreedy);
+    let (layout, mut block) = speculating_block();
+    speculation::fill_verification(
+        &layout,
+        SLOTS,
+        VOCABULARY as u32,
+        &batch.columns,
+        &speculation::token_rows(&batch.columns),
+        &bucket,
+        &[],
+        &mut block,
+    )
+    .unwrap();
+
+    let (rows, tokens) = (bucket.rows as usize, bucket.tokens as usize);
+    let column = |column, elements| u32_column(&layout.read::<u32>(&block, column, elements));
+    let mut table = context_table(&[(2, [3, 4]), (4, [1, 2])]);
+
+    // Each token is a row of its own, which reads the two ids before it in its request.
+    let ids = column(Column::InputIds, tokens);
+    let gathered = gather(&table, &column(Column::SlotRows, tokens));
+    let index = column(Column::TokenContext, 2 * tokens)
+        .reshape((tokens, 2))
+        .unwrap();
+    let before = super::history_ids(&gathered, &ids, &index).unwrap();
+
+    let mut expected = vec![[3, 4], [4, 5], [5, 6], [1, 2], [2, 8]];
+    expected.resize(tokens, [0, 0]);
+    assert_eq!(pairs(&before), expected);
+
+    // Slot 2's samples agree with its first draft and not its second, and slot 4's with
+    // none: each slot continues after the token its acceptance ends on, 6 and 8.
+    let mut chosen = vec![6_u32, 40, 41, 30, 31];
+    chosen.resize(tokens, 0);
+    let (agreed, last) = speculation::accept(
+        &u32_column(&chosen),
+        &column(Column::Drafts, tokens),
+        &column(Column::Windows, rows * (DRAFTS as usize + 1))
+            .reshape((rows, DRAFTS as usize + 1))
+            .unwrap(),
+        &column(Column::Firsts, rows),
+    )
+    .unwrap();
+    assert_eq!(agreed.to_vec1::<u32>().unwrap()[..2], [1, 0]);
+
+    let next = speculation::continued(&before, &ids, &last).unwrap();
+    scatter(&mut table, &column(Column::StateSlots, rows), &next);
+
+    let mut expected = vec![[0, 0]; SLOTS as usize + 1];
+    expected[1] = [5, 6];
+    expected[3] = [2, 8];
+    assert_eq!(table, expected);
+}
+
+#[test]
+fn a_request_s_verify_slots_are_its_home_row_and_its_rows_past_the_home_rows() {
+    let owned = DRAFTS + 1;
+    let none = NO_SLOT;
+
+    // The slots of every request slot are the rows of a live buffer of `slots · Q` rows, no
+    // two requests sharing one, and each request's home row comes first.
+    let homes: Vec<u32> = (0..SLOTS).collect();
+    let mut indices = columns::state_indices(&homes, SLOTS, owned);
+    assert_eq!(indices[3..6], [1, 8, 9]);
+    indices.sort_unstable();
+    assert_eq!(indices, (0..SLOTS * owned).collect::<Vec<_>>());
+    assert_eq!(columns::state_indices(&[none], SLOTS, owned), [none; 3]);
+
+    // A prompt's rows state the slots of their requests, and a padding row none.
+    let (layout, mut block) = speculating_block();
+    let u32s = |block: &[u8], column, elements| layout.read::<u32>(block, column, elements);
+    let mut expected = vec![1, 8, 9, 3, 12, 13];
+    expected.resize(4 * 3, none);
+
+    let batch = prefill(Variant::PrefillGreedy);
+    let bucket = Bucket::prefill(4, 8, Variant::PrefillGreedy);
+    columns::fill(
+        &layout,
+        SLOTS,
+        VOCABULARY as u32,
+        &batch.columns,
+        &bucket,
+        &[],
+        false,
+        &mut block,
+    )
+    .unwrap();
+    assert_eq!(u32s(&block, Column::StateIndices, 4 * 3), expected);
+
+    // A verification's state rows are its requests, whose tokens are its rows.
+    let (_, mut block) = speculating_block();
+    let batch = verification(0.0);
+    speculation::fill_verification(
+        &layout,
+        SLOTS,
+        VOCABULARY as u32,
+        &batch.columns,
+        &speculation::token_rows(&batch.columns),
+        &Bucket::verify(4, DRAFTS, Variant::VerifyGreedy),
+        &[],
+        &mut block,
+    )
+    .unwrap();
+    assert_eq!(u32s(&block, Column::StateIndices, 4 * 3), expected);
+}
+
+#[test]
+fn a_runner_over_stepwise_state_lends_verify_slots_to_every_forward_and_keeps_no_trail() {
+    // The stepwise test model, which reads token ids, over the rank's cache of its two runs
+    // and its drafter's group.
+    let model = Tiny {
+        stepwise: true,
+        reads: true,
+        ..Tiny::drafting(true)
+    };
+    let runs = model.state_layers();
+    let model = Arc::new(model);
+
+    let (heads, dim) = (HEADS as u32, DIM as u32);
+    let layout = CacheLayout::hybrid(PAGE, 1, heads, dim, ipc::PrefixCacheDtype::BFloat16, &runs)
+        .and_then(|layout| layout.with_draft(1, heads, dim))
+        .unwrap();
+    let cache_config = KvCacheConfig {
+        layout: Arc::new(layout),
+        ..cache_config(true)
+    };
+    let cache = KvCacheMemory::meta(cache_config.clone()).unwrap();
+    let config = CausalLmConfig {
+        drafts: DRAFTS,
+        draft_pool: Some(DraftPool::of(&cache_config.layout, cache_config.units).unwrap()),
+        ..config()
+    };
+
+    let state = |owned: u32| {
+        StateMemory::meta(
+            StateConfig {
+                shapes: runs.clone(),
+                slots: SLOTS,
+                rows: 4,
+                trail: 0,
+                owned,
+            },
+            &cache_config,
+        )
+        .unwrap()
+    };
+    let over = |model: Arc<Tiny>, config: CausalLmConfig, state: &StateMemory| {
+        let graphs = Graphs::meta(
+            Arc::new(Generation::new(0, [])),
+            CausalLmRunner::input_bytes(&config)?,
+        );
+        CausalLmRunner::over(model, config, graphs, None, &cache, Some(state))
+    };
+
+    // A request owns a slot of the stepwise field per token of a verification: its live
+    // buffer holds them past the home rows, and the runner is lent no trail. The model
+    // refuses a forward without its verify slots or its token ids: every bucket, prompts',
+    // verifications' and the drafter's, is profiled and captured.
+    let owned = DRAFTS + 1;
+    assert_eq!(
+        state(owned).live().unwrap()[1][0].dims(),
+        [(SLOTS * owned) as usize, HIDDEN]
+    );
+    let runner = over(Arc::clone(&model), config.clone(), &state(owned)).unwrap();
+    runner.graphs().profile_run(&runner).unwrap();
+    for bucket in runner.buckets() {
+        runner.graphs().capture(&runner, &bucket).unwrap();
+    }
+
+    // A live buffer of one slot a request holds none of a verification's further slots.
+    let refused = over(Arc::clone(&model), config.clone(), &state(1))
+        .err()
+        .unwrap();
+    assert!(refused.to_string().contains("address 18 rows"), "{refused}");
+
+    // A model loaded for a deployment that drafts, under a config that drafts nothing.
+    let unspeculating = CausalLmConfig {
+        drafts: 0,
+        draft_pool: None,
+        ..config
+    };
+    let refused = over(model, unspeculating, &state(1)).err().unwrap();
+    assert!(refused.to_string().contains("no drafts"), "{refused}");
 }

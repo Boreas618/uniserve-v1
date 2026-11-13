@@ -83,13 +83,14 @@ impl CausalLmRunner {
     }
 
     /// Lends a runner that speculates the draft cache of `cache`, and the trail of `state`
-    /// for a model that keeps a recurrent state ([`CausalLmRunner::set_draft_cache`]).
+    /// for a model that keeps a recurrent state ([`CausalLmRunner::set_draft_cache`]); a state
+    /// whose requests own a slot per verified token keeps none.
     ///
     /// # Errors
     ///
     /// A cache that keeps no draft group or lies otherwise in the unit pool than the runner's
     /// config states, or what [`CausalLmRunner::set_draft_cache`] refuses: a state opened
-    /// with no trail.
+    /// with no trail for a runner whose forwards lend no verify slots, or the reverse.
     pub fn lend_draft(&mut self, cache: &KvCacheMemory, state: Option<&StateMemory>) -> Result<()> {
         let pool = DraftPool::of(cache.layout(), cache.config().units)?;
         if self.config.draft_pool != Some(pool) {
