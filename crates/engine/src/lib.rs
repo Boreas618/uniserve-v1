@@ -11,6 +11,7 @@
 //! device has recorded the packages its runners launch, and serves nothing.
 
 mod catalogue;
+pub mod executor;
 #[expect(
     dead_code,
     reason = "the process, the one caller of the module installation, is not declared in the crate"
