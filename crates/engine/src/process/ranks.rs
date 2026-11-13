@@ -21,6 +21,14 @@
 //!    workers over the ranks' runners, and [`capacities`] states what each worker group's
 //!    ranks serve.
 //!
+//! A rank that encodes images (`ModelRunner::encodes_images`) also profiles its vision runner at
+//! its load, and its division sizes the runner's region, its region of encoder outputs and its
+//! causal runner's feature buffer; the layout states a region of encoder outputs per group that
+//! encodes and the host region of them, and the rank's opening takes its media memory over that
+//! region from the resident pool, maps the one part of the host region its process copies with,
+//! lends both runners that memory and builds the vision runner as `RunnerId(1)` beside the causal
+//! runner (`specs/engine-worker-port.md` §1.1, §2.2).
+//!
 //! One sequence serves a first epoch, a successor of the same layout and a relaunch: a region an
 //! earlier session named has its table, which the ranks map, and creates nothing more.
 //!
@@ -67,6 +75,7 @@ use crate::runner::causal_lm::experts::JoinHook;
 use crate::runner::causal_lm::{CausalLmConfig, CausalLmRunner};
 use crate::runner::graphs::Graphs;
 use crate::runner::thread_pool::ThreadPool;
+use crate::runner::vision::VisionRunner;
 use crate::runner::{Runner, RunnerId};
 use crate::worker::{COPY_BUDGET, Sequences, Worker};
 use anyhow::{Context as _, Result, bail};
@@ -84,7 +93,9 @@ use crate::process::binding::{self, Served};
 use crate::process::ranks::rank::memory::{
     Peaks, fewest_units, granularity, plane_segments, scratch_bytes,
 };
-use crate::process::ranks::rank::text::{Keys, keys, profile};
+use crate::process::ranks::rank::text::{
+    Keys, encoder_class, encodes, feature_tensors, keys, profile, vision_runner,
+};
 use crate::process::ranks::rank::video::{
     VideoRank, backed_kinds, boxed, group_phases, latent_pages, product_classes, product_kind,
     slot_pages,
@@ -182,6 +193,10 @@ pub(crate) struct TextRank {
     pub(crate) first: u32,
     /// What the profile run states of the rank's runner, which its pools are sized by.
     pub(crate) peaks: Peaks,
+    /// What the profile run states of the rank's vision runner (`RunnerId(1)`), on a rank that
+    /// encodes images (`ModelRunner::encodes_images`); `None` on any other. It computes no paired
+    /// forward, so it states no shadow region.
+    pub(crate) vision: Option<Peaks>,
     /// The rank's tensor group's communicator; `None` for a group of one and on the meta device.
     pub(crate) tensor: Option<Arc<ops::Group>>,
     /// The config of the rank's runner: the profiled runner's until the rank is opened, the
@@ -194,6 +209,9 @@ pub(crate) struct TextRank {
     pub(crate) state: Option<Arc<Mutex<StateMemory>>>,
     /// The rank's serving runner, from its opening until its worker takes it ([`spawn`]).
     pub(crate) runner: Option<CausalLmRunner>,
+    /// The serving vision runner of a rank that encodes images, from its opening until its worker
+    /// takes it beside the causal runner.
+    pub(crate) vision_runner: Option<VisionRunner>,
     /// The node's expert union this rank is a member of: the union's host group, the members'
     /// workers once [`spawn`] set them, and the rank's place among them; `None` outside a
     /// union.
@@ -264,10 +282,14 @@ impl LoadedRank {
 
     /// Whether the rank computes encoder outputs: it serves a text encoding, a chat image's
     /// vision encoding or a condition latent's encoding, whose outputs the encoder identity of
-    /// its group keys (`Capacity::encoder_identity`).
+    /// its group keys (`Capacity::encoder_identity`). A text rank encodes chat images when it
+    /// holds a vision runner.
     pub(crate) fn encodes(&self) -> bool {
         let serves = |phase: Phase| match &self.loaded {
-            Loaded::Text(text) => text.config.phases.contains(&phase),
+            Loaded::Text(text) => {
+                let images = phase == Phase::VisionEncode && text.vision.is_some();
+                images || text.config.phases.contains(&phase)
+            }
             Loaded::Video(video) => video.capacity.serves(phase),
         };
         [Phase::TextEncode, Phase::VisionEncode, Phase::LatentEncode]
@@ -527,7 +549,7 @@ fn load_rank(
     };
     let inputs = CausalLmRunner::input_bytes(&meta_config)?;
     let unserved = Arc::new(Generation::new(0, []));
-    let profiled = model_runner.runner(
+    let mut profiled = model_runner.runner(
         Arc::clone(&meta),
         meta_config.clone(),
         Graphs::meta(Arc::clone(&unserved), inputs),
@@ -538,8 +560,28 @@ fn load_rank(
         meta_member,
         &unserved,
     )?;
+
+    // A rank that encodes images profiles its causal runner lent a feature buffer, whose
+    // prefills place image rows, and its vision runner, over a media memory of no device: the
+    // region numbers it states are none of a forward's concern.
+    let class = encoder_class(&layout)?;
+    let images = model_runner.image_rows(meta.as_ref());
+    let media = if model_runner.encodes_images(meta.as_ref())? {
+        let slots = (0, model_runner.slots());
+        let memory = Arc::new(BufferMemory::meta(
+            model_runner.rank(),
+            (1, 1),
+            slots,
+            0,
+            &[],
+        )?);
+        profiled.set_features(Arc::clone(&memory), class)?;
+        Some(memory)
+    } else {
+        None
+    };
     profile(&profiled)?;
-    let keys = keys(
+    let mut keys = keys(
         &profiled,
         &meta_cache,
         meta_state.as_ref().map(|state| state.as_ref()),
@@ -555,6 +597,33 @@ fn load_rank(
         inputs: graphs.input_peak(),
     };
     drop(profiled);
+
+    let vision = match media {
+        Some(memory) => {
+            let inputs = VisionRunner::input_bytes(meta.as_ref(), images)?;
+            let graphs = Graphs::meta(Arc::clone(&unserved), inputs);
+            let model = Arc::clone(&meta);
+            let runner = vision_runner(model, graphs, None, memory, (class, images))?;
+            let graphs = crate::runner::Runner::graphs(&runner);
+            keys.extend(graphs.keys());
+            Some(Peaks {
+                graph: graphs.peak(),
+                shadow: 0,
+                inputs: graphs.input_peak(),
+            })
+        }
+        None => None,
+    };
+    tracing::info!(
+        rank = model_runner.rank(),
+        graph = peaks.graph,
+        shadow = peaks.shadow,
+        inputs = peaks.inputs,
+        vision_graph = vision.map_or(0, |vision| vision.graph),
+        vision_inputs = vision.map_or(0, |vision| vision.inputs),
+        image_rows = images,
+        "the rank's runners were profiled: the bytes of their regions, shadow regions and inputs"
+    );
 
     let (storage, resolve) = match backing {
         Backing::Serving { storage, kernels } => (storage, kernels),
@@ -581,11 +650,13 @@ fn load_rank(
                     units,
                     first: units,
                     peaks,
+                    vision,
                     tensor,
                     config: meta_config,
                     cache: meta_cache,
                     state: meta_state,
                     runner: None,
+                    vision_runner: None,
                     union,
                 })),
             });
@@ -606,10 +677,17 @@ fn load_rank(
         .context("publishing the granules of the epoch's packed weights")?;
 
     // Steps 11-15: the division of the GPU's quota into the pools, the request slots and the
-    // cache's units.
-    let pools = model_runner.pools(device, &layout, peaks)?;
+    // cache's units; on a rank that encodes images, also its vision runner's region, its region
+    // of encoder outputs and its causal runner's feature buffer.
+    let (graph, scratch) = model_runner.pools(device, &layout, &runner_peaks(peaks, vision))?;
+    let mut regions = vec![("graph pool", graph), ("scratch pool", scratch)];
+    if vision.is_some() {
+        regions.push(("buffer pool", encoder_bytes(model.as_ref(), images)?));
+        let features = CausalLmRunner::image_bytes(&meta_config, model.as_ref())?;
+        regions.push(("image features", features));
+    }
     let (slots, units, first) =
-        model_runner.divide(&client, device, &host, model.as_ref(), &layout, pools)?;
+        model_runner.divide(&client, device, &host, model.as_ref(), &layout, &regions)?;
 
     // A rank whose share holds fewer slots than the deployment runs serves with those: the
     // storages its slots take are sized by them from here on. Its buckets and its pools are the
@@ -645,11 +723,13 @@ fn load_rank(
             units,
             first,
             peaks,
+            vision,
             tensor,
             config: meta_config,
             cache: meta_cache,
             state: meta_state,
             runner: None,
+            vision_runner: None,
             union,
         })),
     })
@@ -691,6 +771,24 @@ fn meta_owners(
         None => None,
     };
     Ok((config, cache, state))
+}
+
+/// The peaks of a text rank's runners, in the order of their ids: its causal runner's `peaks`,
+/// then the `vision` runner's of a rank that encodes images.
+fn runner_peaks(peaks: Peaks, vision: Option<Peaks>) -> Vec<Peaks> {
+    std::iter::once(peaks).chain(vision).collect()
+}
+
+/// The device bytes of the region of encoder outputs of a rank that encodes `model`'s images of
+/// at most `rows` rows (`VisionRunner::region_units`), which its media memory takes from the
+/// resident pool.
+///
+/// # Errors
+///
+/// A model without a vision tower, no rows, or a region of more units than a session numbers.
+fn encoder_bytes(model: &dyn TextModel, rows: u32) -> Result<u64> {
+    let units = VisionRunner::region_units(model, rows)?;
+    Ok(BufferMemory::device_bytes(units, 0, 0))
 }
 
 /// Loads a rank of a media deployment onto `backing` (steps 3-10), over `client`, its Storage
@@ -967,10 +1065,11 @@ fn short(digest: &[u8; 32]) -> String {
 /// The layout the engine epoch `launch` states to open its session with its host's buffer pool
 /// (`storage::runtime::Open`, `specs/buffer-pool.md` §11, §14.1), from `ranks`, this process's
 /// ranks loaded to their division: [`text_layout`] for the ranks of a text deployment, from the
-/// first rank's cache layout and units, its group's width and its request slots and their bytes,
-/// which every rank of the deployment's one configuration states alike; [`media_layout`] for the
-/// ranks of a media deployment. It is the one statement of a session's layout, whoever builds
-/// the ranks behind it.
+/// first rank's cache layout and units, its group's width, its request slots and their bytes,
+/// and its model when it has a vision tower whose images the engine admits, which every rank of
+/// the deployment's one configuration states alike; [`media_layout`] for the ranks of a media
+/// deployment. It is the one statement of a session's layout, whoever builds the ranks behind
+/// it.
 ///
 /// # Errors
 ///
@@ -985,7 +1084,16 @@ pub(crate) fn layout(launch: &EngineArgs, ranks: &[LoadedRank]) -> Result<Open> 
             let slots = first.model_runner.slots();
             let slot_bytes = CausalLmRunner::slot_bytes(&text.config, text.model.as_ref())?
                 / u64::from(slots.max(1));
-            text_layout(launch, &cache, text.units, tensor, (slots, slot_bytes))
+            let images = first.model_runner.image_rows(text.model.as_ref());
+            let vision = (images > 0).then_some((text.model.as_ref(), images));
+            text_layout(
+                launch,
+                &cache,
+                text.units,
+                tensor,
+                (slots, slot_bytes),
+                vision,
+            )
         }
         Loaded::Video(_) => media_layout(launch, ranks),
     }
@@ -993,8 +1101,10 @@ pub(crate) fn layout(launch: &EngineArgs, ranks: &[LoadedRank]) -> Result<Open> 
 
 /// The layout of a text deployment's session ([`layout`]), for ranks of the deployment's one
 /// configuration whose caches are laid out as `cache` with `units` units, the padding unit
-/// included, whose worker groups are `tensor` ranks wide, and whose groups each hold `slots`
-/// request slots, each taking `slot_bytes` of one rank's device memory:
+/// included, whose worker groups are `tensor` ranks wide, whose groups each hold `slots`
+/// request slots, each taking `slot_bytes` of one rank's device memory, and, when the engine
+/// admits images, whose model with a vision tower and the most rows of an image it encodes are
+/// `vision` (`ModelRunner::image_rows`; `None` otherwise):
 ///
 /// - **Regions.** Per scheduler, the device region of its KV units, the same units on every rank
 ///   and group of it, named by its layout alone and numbered `units`. It states no segment and
@@ -1005,10 +1115,17 @@ pub(crate) fn layout(launch: &EngineArgs, ranks: &[LoadedRank]) -> Result<Open> 
 ///   tier, the host region of its pages, one page a unit. Per worker group, the region of its
 ///   slot rows, numbered from 1, the epoch's own. A unit's bytes are summed over the tensor ranks
 ///   that hold a part of it.
-/// - **Classes**, in the numbering the worker uses: cache group `g` is class `g`, then one class
-///   per product kind in the order of the product classes (`crate::batch::product::KINDS`), then
-///   the class of stored trajectories. A text deployment holds no product and no trajectory:
-///   those classes name no region.
+/// - **Encoder outputs.** When a group encodes images (a group that prefills, of a model with a
+///   vision tower, [`encodes`]): per such group, the region of its encoder outputs, the epoch's
+///   own memory of its ranks, the same units on every rank of it (the tower is whole on each,
+///   and each holds every output whole), sized by `VisionRunner::region_units`; and the host
+///   region of encoder outputs ([`host_encoders`]), numbered for the outputs of every request
+///   slot of each such group, and as many again for requests that resume.
+/// - **Classes**, in the numbering the worker uses: cache group `g` is class `g`, then the class
+///   of encoder outputs when a group encodes images, sized per request, with its host copies in
+///   the host region of encoder outputs; then one class per product kind in the order of the
+///   product classes (`crate::batch::product::KINDS`), then the class of stored trajectories. A
+///   text deployment holds no product and no trajectory: those classes name no region.
 /// - **Groups**, numbered for the session ([`group_numbers`]), each with its memory, its slot
 ///   region and per class its device regions; **per scheduler** its groups; and the
 ///   deployment's peers.
@@ -1017,13 +1134,15 @@ pub(crate) fn layout(launch: &EngineArgs, ranks: &[LoadedRank]) -> Result<Open> 
 ///
 /// # Errors
 ///
-/// Worker groups no scheduler block holds, or a layout the regions' numbering cannot state.
+/// Worker groups no scheduler block holds, a layout the regions' numbering cannot state, or a
+/// vision tower that sizes no image.
 pub fn text_layout(
     launch: &EngineArgs,
     cache: &CacheLayout,
     units: u32,
     tensor: u32,
     (slots, slot_bytes): (u32, u64),
+    vision: Option<(&dyn TextModel, u32)>,
 ) -> Result<Open> {
     let config = &launch.engine_config;
     let groups = &config.parallel.worker_groups;
@@ -1034,6 +1153,28 @@ pub fn text_layout(
     let mut regions: Vec<Region> = Vec::new();
     let region_index = |regions: &Vec<Region>| -> Result<u8> {
         u8::try_from(regions.len()).context("more regions than a session numbers")
+    };
+
+    // The listed groups that encode images, by their index in the deployment.
+    let mut encoding: Vec<usize> = Vec::new();
+    for id in schedulers.iter().flatten() {
+        let index = numbers
+            .iter()
+            .position(|number| number == id)
+            .context("a listed group is numbered")?;
+        if vision.is_some() && encodes(groups[index].role) {
+            encoding.push(index);
+        }
+    }
+    // The largest encoder output the session holds, the units of each group's region of them
+    // on one rank, and the tensors they hold.
+    let images = match vision.filter(|_| !encoding.is_empty()) {
+        Some((model, rows)) => Some((
+            VisionRunner::output_bytes(model, rows)?,
+            VisionRunner::region_units(model, rows)?,
+            feature_tensors(model),
+        )),
+        None => None,
     };
 
     // The host region of each cache group's pages: the deployment's on the host, shared by its
@@ -1073,7 +1214,21 @@ pub fn text_layout(
         }
     }
 
-    // Per scheduler, the region of its KV units; per group, its slot rows.
+    // The host region of encoder outputs: the outputs of every request slot of each group that
+    // encodes images, and as many again for requests that resume.
+    let encoders_region = match &images {
+        Some((largest, _, tensors)) => {
+            let units = encoders::pool_pages(&[*largest], slots as usize)
+                .saturating_mul(encoding.len() as u64);
+            let index = region_index(&regions)?;
+            regions.push(host_encoders(tensors, units)?);
+            Some(index)
+        }
+        None => None,
+    };
+
+    // Per scheduler, the region of its KV units; per group, its slot rows and, on a group that
+    // encodes images, its region of encoder outputs.
     let slot_bytes = slot_bytes.max(1);
     let mut stated: Vec<Group> = Vec::new();
     for (scheduler, listed) in schedulers.iter().enumerate() {
@@ -1115,6 +1270,27 @@ pub fn text_layout(
                 segments: Vec::new(),
             });
             let mut per_class: Vec<Vec<u8>> = vec![vec![kv_region]; cache.groups.len()];
+            if let Some((_, units, _)) = images {
+                let outputs = if encoding.contains(&index) {
+                    let name = format!("encoders {} {}", launch.epoch, id.0);
+                    let region = region_index(&regions)?;
+                    regions.push(Region {
+                        space: name.clone(),
+                        name,
+                        tier: Tier::Device,
+                        unit_bytes: UNIT_BYTES * tensor,
+                        part_bytes: UNIT_BYTES,
+                        reserved: 0,
+                        units,
+                        limit: units,
+                        segments: Vec::new(),
+                    });
+                    vec![region]
+                } else {
+                    Vec::new()
+                };
+                per_class.push(outputs);
+            }
             per_class.extend((0..=product::KINDS.len()).map(|_| Vec::new()));
             stated.push(Group {
                 id: *id,
@@ -1125,11 +1301,12 @@ pub fn text_layout(
         }
     }
 
-    // Class `g` is cache group `g`; then the product kinds and the stored trajectories, which a
-    // text deployment sizes per request and holds none of.
+    // Class `g` is cache group `g`; then the encoder outputs of a deployment that encodes
+    // images; then the product kinds and the stored trajectories, which a text deployment sizes
+    // per request and holds none of.
     let ranks_per_unit = u32::try_from(tensor).unwrap_or(u32::MAX);
     let kinds = product::KINDS.len();
-    let mut classes: Vec<Class> = Vec::with_capacity(cache.groups.len() + kinds + 1);
+    let mut classes: Vec<Class> = Vec::with_capacity(cache.groups.len() + kinds + 2);
     for (index, (group, host)) in cache.groups.iter().zip(&host_regions).enumerate() {
         let (tensors, encoding) = host::class_digests(cache, index, ranks_per_unit)?;
         classes.push(Class {
@@ -1138,6 +1315,17 @@ pub fn text_layout(
             state_in_slot: group.state(),
             tensors,
             encoding,
+        });
+    }
+    // An encoder output's bytes are its rows in order under every parallel configuration, so
+    // its class states one encoding everywhere (`crate::memory::encoders`).
+    if let Some((_, _, tensors)) = images {
+        classes.push(Class {
+            units: 0,
+            host: encoders_region.map(|region| (region, 0)),
+            state_in_slot: false,
+            tensors,
+            encoding: encoders::layout(),
         });
     }
     // A text deployment keeps no product on the host, so no host copy of these classes is
@@ -1270,13 +1458,8 @@ fn media_layout(launch: &EngineArgs, ranks: &[LoadedRank]) -> Result<Open> {
             .iter()
             .map(|slots| encoders::pool_pages(&[largest], *slots as usize))
             .fold(0, u64::saturating_add);
-        let mut digest = storage::key::Digest::new(b"uniserve.host-encoders");
-        digest.bytes(&conditioning_digests.0);
-        digest.bytes(&encoders::layout());
-        digest.number(units);
-        let name = format!("host encoders {}", short(&digest.finish()));
         let index = region_index(&regions)?;
-        regions.push(host_region(name, encoders::PAGE_BYTES, units)?);
+        regions.push(host_encoders(&conditioning_digests.0, units)?);
         Some(index)
     };
 
@@ -1594,6 +1777,38 @@ fn reslot(rank: &mut LoadedRank, slots: u32) -> Result<()> {
     Ok(())
 }
 
+/// The host region of encoder outputs of `units` units whose class's tensors `tensors` digests
+/// (`storage::runtime::Class::tensors`): the deployment's on the host, its unit one part of
+/// `crate::memory::encoders::PAGE_BYTES`, since an output lies whole in one rank's memory and
+/// has one host copy, in the one part its process copies with. It is named by the outputs'
+/// tensors, the layout of its units and its numbering, not by the ranks of a layout, so another
+/// epoch of any parallel configuration that numbers it alike finds what this one stored; the
+/// buffer pool keeps a region's numbering under its name.
+///
+/// # Errors
+///
+/// A region of more units than a session numbers.
+fn host_encoders(tensors: &[u8; 32], units: u64) -> Result<Region> {
+    let mut digest = storage::key::Digest::new(b"uniserve.host-encoders");
+    digest.bytes(tensors);
+    digest.bytes(&encoders::layout());
+    digest.number(units);
+    let name = format!("host encoders {}", short(&digest.finish()));
+
+    let units = u32::try_from(units.max(1)).context("a host region of more units than u32")?;
+    Ok(Region {
+        space: name.clone(),
+        name,
+        tier: Tier::Host,
+        unit_bytes: encoders::PAGE_BYTES,
+        part_bytes: encoders::PAGE_BYTES,
+        reserved: 0,
+        units,
+        limit: units,
+        segments: Vec::new(),
+    })
+}
+
 /// The name of the product buffer of the deployment's rank `rank` in epoch `epoch`: memory of
 /// the rank's own process, which each epoch has its own of (`specs/buffer-pool.md` §14.1).
 fn products_region(epoch: u64, rank: usize) -> String {
@@ -1622,7 +1837,10 @@ fn product_buffer(layout: &Open, rank: &LoadedRank) -> Result<u8> {
 /// - the graph pool with the scratch and resident pools, the cache over those segments, the
 ///   recurrent state, the scratch pages of paired forwards, and the serving runner in its region
 ///   of the graph pool with its shadow region beside it, profiled again so its buckets can be
-///   captured.
+///   captured;
+/// - on a rank that encodes images, its media memory over its group's region of encoder outputs
+///   ([`encoder_memory`]), which its causal runner is lent with a feature buffer, and its vision
+///   runner in its own region of the graph pool, profiled again.
 ///
 /// On the meta device the owners hold no device and the segments no memory, so the cache, the
 /// state and the runner are made over the region's units again, as the profile run's were.
@@ -1661,12 +1879,21 @@ pub(crate) fn open_ranks(
         regions.push((region.name.clone(), (region.limit, table)));
     }
 
+    // The client of the process's first rank that encodes images, through which every rank that
+    // does maps the one part of the host region of encoder outputs the process copies with.
+    let holder = ranks
+        .iter()
+        .find(|rank| matches!(&rank.loaded, Loaded::Text(text) if text.vision.is_some()))
+        .and_then(|rank| rank.client.clone());
+    let session = (layout, opened);
+
     let opened: Vec<Segments> = std::thread::scope(|scope| {
         let mut handles = Vec::with_capacity(ranks.len());
         for (index, (rank, (_, region))) in ranks.iter_mut().zip(&regions).enumerate() {
+            let holder = holder.as_ref();
             let handle = std::thread::Builder::new()
                 .name(format!("rank-open-{index}"))
-                .spawn_scoped(scope, move || open_rank(rank, *region))
+                .spawn_scoped(scope, move || open_rank(rank, *region, session, holder))
                 .context("starting a rank's opening")?;
             handles.push(handle);
         }
@@ -1696,12 +1923,20 @@ pub(crate) fn open_ranks(
 }
 
 /// Opens one rank over its KV region of `units` units, the padding unit included, as the session
-/// numbers it, and the region's segment table `table` (steps 16-22, [`open_ranks`]). The rank's
-/// cache takes the region's numbering, which is its own division's count unless an earlier epoch
-/// of the layout numbered the region otherwise. Returns the segments it created, as
+/// numbers it, and the region's segment table `table` (steps 16-22, [`open_ranks`]), in the
+/// session whose layout is `session` and whose answer is `opened`. The rank's cache takes the
+/// region's numbering, which is its own division's count unless an earlier epoch of the layout
+/// numbered the region otherwise. A rank that encodes images maps the part of the host region of
+/// encoder outputs through `holder` ([`encoder_memory`]). Returns the segments it created, as
 /// `(segment, first unit, units)`.
-fn open_rank(rank: &mut LoadedRank, (units, table): (u32, &Segments)) -> Result<Segments> {
+fn open_rank(
+    rank: &mut LoadedRank,
+    (units, table): (u32, &Segments),
+    (session, opened): (&Open, &Opened),
+    holder: Option<&Arc<StorageClient>>,
+) -> Result<Segments> {
     let device = rank.device()?;
+    let group = stated_group(rank, session)?;
     let LoadedRank {
         model_runner,
         client,
@@ -1736,6 +1971,11 @@ fn open_rank(rank: &mut LoadedRank, (units, table): (u32, &Segments)) -> Result<
         )?,
         None => None,
     };
+    // The class of a rank's encoder outputs, the request slots its media memory's slot rows
+    // number, and the most rows of an image it encodes.
+    let class = encoder_class(&layout)?;
+    let slots = model_runner.slots();
+    let images = model_runner.image_rows(rank.model.as_ref());
 
     // Step 16: the segments of the region the table states, mapped, and the rest, created as
     // far as the quota held them at the division. A segment's every part is whole granules of
@@ -1764,7 +2004,17 @@ fn open_rank(rank: &mut LoadedRank, (units, table): (u32, &Segments)) -> Result<
             )?))),
             None => None,
         };
-        let runner = model_runner.runner(
+        let media = match rank.vision {
+            Some(_) => Some(Arc::new(encoder_memory(
+                model_runner.rank(),
+                (session, opened),
+                group,
+                (class, slots),
+                None,
+            )?)),
+            None => None,
+        };
+        let mut runner = model_runner.runner(
             Arc::clone(&rank.model),
             config.clone(),
             Graphs::meta(Arc::clone(kernels), inputs),
@@ -1775,26 +2025,51 @@ fn open_rank(rank: &mut LoadedRank, (units, table): (u32, &Segments)) -> Result<
             member,
             kernels,
         )?;
+        if let Some(memory) = &media {
+            runner.set_features(Arc::clone(memory), class)?;
+        }
         profile(&runner)?;
+        let vision = match media {
+            Some(memory) => {
+                let inputs = VisionRunner::input_bytes(rank.model.as_ref(), images)?;
+                let graphs = Graphs::meta(Arc::clone(kernels), inputs);
+                let model = Arc::clone(&rank.model);
+                Some(vision_runner(model, graphs, None, memory, (class, images))?)
+            }
+            None => None,
+        };
 
         rank.config = config;
         rank.cache = cache;
         rank.state = state;
         rank.runner = Some(runner);
+        rank.vision_runner = vision;
         return Ok(created);
     };
 
-    // Step 17: the graph pool, with the scratch and resident pools it reserves.
-    let (_, scratch) = model_runner.pools(device, &layout, rank.peaks)?;
+    // Step 17: the graph pool, with a region for each runner and the scratch and resident pools
+    // it reserves; the resident pool holds the recurrent state and, on a rank that encodes
+    // images, its region of encoder outputs.
+    let peaks = runner_peaks(rank.peaks, rank.vision);
+    let (_, scratch) = model_runner.pools(device, &layout, &peaks)?;
+    let outputs = match rank.vision {
+        Some(_) => encoder_bytes(rank.model.as_ref(), images)?,
+        None => 0,
+    };
     let resident = state_config
         .as_ref()
-        .map_or(0, |state| state.bytes(&layout));
+        .map_or(0, |state| state.bytes(&layout))
+        + outputs;
+    let regions: Vec<(RunnerId, u64)> = (0..)
+        .zip(&peaks)
+        .map(|(id, peaks)| (RunnerId(id), peaks.graph))
+        .collect();
     let (_, fraction) = model_runner.fractions()?;
     let mut pool = GraphPool::open(
         Arc::clone(&client),
         device,
         fraction,
-        &[(RunnerId(0), rank.peaks.graph)],
+        &regions,
         scratch,
         resident,
     )?;
@@ -1825,6 +2100,23 @@ fn open_rank(rank: &mut LoadedRank, (units, table): (u32, &Segments)) -> Result<
     }
     let cache = Arc::new(Mutex::new(cache));
 
+    // On a rank that encodes images, its media memory over its group's region of encoder
+    // outputs, from the resident pool.
+    let media = match rank.vision {
+        Some(_) => {
+            let holder = holder.unwrap_or(&client);
+            let memory = encoder_memory(
+                model_runner.rank(),
+                (session, opened),
+                group,
+                (class, slots),
+                Some((pool.allocator(), holder.as_ref())),
+            )?;
+            Some(Arc::new(memory))
+        }
+        None => None,
+    };
+
     // Steps 21-22: the serving runner in its region of the graph pool, its shadow region beside
     // it (the profile run's shadow figure less the scratch pages, which the scratch pool holds),
     // profiled again so its buckets can be captured.
@@ -1836,7 +2128,7 @@ fn open_rank(rank: &mut LoadedRank, (units, table): (u32, &Segments)) -> Result<
         rank.peaks.inputs,
         2,
     )?;
-    let runner = model_runner.runner(
+    let mut runner = model_runner.runner(
         Arc::clone(&rank.model),
         config.clone(),
         graphs,
@@ -1847,10 +2139,36 @@ fn open_rank(rank: &mut LoadedRank, (units, table): (u32, &Segments)) -> Result<
         member,
         kernels,
     )?;
+    if let Some(memory) = &media {
+        runner.set_features(Arc::clone(memory), class)?;
+    }
     let shadow = rank.peaks.shadow.saturating_sub(scratch_bytes);
     crate::runner::Runner::graphs(&runner).set_shadow(pool.shadow(shadow)?)?;
     profile(&runner)?;
     streams.push(("device", stream));
+
+    // The vision runner in its region of the graph pool, on a stream of its own, profiled again
+    // so its buckets can be captured; it computes no paired forward and keeps no shadow region.
+    let vision = match (media, rank.vision) {
+        (Some(memory), Some(peaks)) => {
+            let encoding = Stream::new(device)
+                .with_context(|| format!("creating device {}'s stream", device.0))?;
+            let graphs = Graphs::new(
+                encoding.clone(),
+                Arc::clone(kernels),
+                pool.region(RunnerId(1))?,
+                VisionRunner::input_bytes(rank.model.as_ref(), images)?,
+                peaks.inputs,
+                2,
+            )?;
+            let model = Arc::clone(&rank.model);
+            let issued = Some(encoding.clone());
+            let runner = vision_runner(model, graphs, issued, memory, (class, images))?;
+            streams.push(("device", encoding));
+            Some(runner)
+        }
+        _ => None,
+    };
 
     tracing::info!(
         rank = model_runner.rank(),
@@ -1864,7 +2182,85 @@ fn open_rank(rank: &mut LoadedRank, (units, table): (u32, &Segments)) -> Result<
     rank.state = state;
     *rank_pool = Some(Arc::new(Mutex::new(pool)));
     rank.runner = Some(runner);
+    rank.vision_runner = vision;
     Ok(created)
+}
+
+/// The media memory of rank index `rank` that encodes images, in its group `group` of the
+/// session `session` opened and `opened` answered, whose encoder outputs are of class `class`:
+/// over the group's region of encoder outputs, the same units on every rank of the group, and
+/// the group's slot rows of `slots` slots, which hold no trajectory, by the answer's numbers;
+/// with the one part of the host region of encoder outputs its process copies with. On a device
+/// (`Some` allocator) it is taken from the allocator's resident pool and maps that part through
+/// the client given beside it, the client of the process's first rank that encodes images, so
+/// every rank of the process maps the one part that rank's index names, and an output one group
+/// stored is where every group of the process loads it; otherwise it holds no device and states
+/// the part.
+///
+/// # Errors
+///
+/// A group the session states no region of encoder outputs for, a region the answer does not
+/// number, or the resident pool's or the server's refusal.
+fn encoder_memory(
+    rank: u32,
+    (session, opened): (&Open, &Opened),
+    group: &Group,
+    (class, slots): (u8, u32),
+    device: Option<(&mut platform::Allocator, &StorageClient)>,
+) -> Result<BufferMemory> {
+    let number = |index: u8| -> Result<u8> {
+        opened
+            .regions
+            .get(usize::from(index))
+            .map(|(number, _)| *number)
+            .with_context(|| format!("the answer numbers no region {index}"))
+    };
+    let outputs = group
+        .regions
+        .get(usize::from(class))
+        .and_then(|regions| regions.first())
+        .copied()
+        .with_context(|| {
+            format!(
+                "the session states no region of encoder outputs of group {}",
+                group.id.0
+            )
+        })?;
+    let products = (
+        number(outputs)?,
+        session.regions[usize::from(outputs)].units,
+    );
+    let slot_rows = (number(group.slots)?, slots);
+    let host = session
+        .classes
+        .get(usize::from(class))
+        .and_then(|class| class.host)
+        .map(|(region, _)| region);
+
+    let Some((allocator, holder)) = device else {
+        let part = match host {
+            Some(region) => {
+                let units = session.regions[usize::from(region)].units;
+                Some((number(region)?, encoders::PAGE_BYTES, units))
+            }
+            None => None,
+        };
+        return Ok(BufferMemory::meta(
+            rank,
+            products,
+            slot_rows,
+            0,
+            part.as_slice(),
+        )?);
+    };
+
+    let mut memory = BufferMemory::open(allocator, rank, products, slot_rows, 0)
+        .context("opening the rank's memory of encoder outputs")?;
+    if let Some(region) = host {
+        let name = &session.regions[usize::from(region)].name;
+        encoders::map_part(&mut memory, holder, (number(region)?, name))?;
+    }
+    Ok(memory)
 }
 
 /// Opens the ranks of a media deployment over the session `layout` opened and `opened`
@@ -2382,7 +2778,7 @@ fn session_group(rank: &LoadedRank, layout: &Open) -> Result<GroupId> {
     Ok(id)
 }
 
-/// Spawns one worker per rank of `ranks` over its runner (step 23), each a rank of its worker
+/// Spawns one worker per rank of `ranks` over its runners (step 23), each a rank of its worker
 /// group with the group's device block tables over the regions of the session `layout` opened
 /// and `opened` answered, and the copy budget, stating its ended sequence to the group's
 /// `completed` word where `registers` puts it; sets the expert union's join targets (step 24);
@@ -2450,7 +2846,11 @@ pub(crate) fn spawn(
                 let runner = text.runner.take().context(
                     "the rank's runner was spawned already, or the rank was never opened",
                 )?;
-                let runners: Vec<Box<dyn Runner>> = vec![Box::new(runner)];
+                // The vision runner of a rank that encodes images is `RunnerId(1)`.
+                let mut runners: Vec<Box<dyn Runner>> = vec![Box::new(runner)];
+                if let Some(vision) = text.vision_runner.take() {
+                    runners.push(Box::new(vision));
+                }
                 (BlockTables::new(*id, &mapped, &unit_bytes), runners)
             }
             // A media rank's tables keep the runs of a block in the other ranks' product buffers
@@ -2577,8 +2977,12 @@ pub(crate) fn capacities(
                     .iter()
                     .map(|identity| storage::key::page_seed(identity))
                     .collect();
+                let model = text.model.as_ref();
+                let vision = text
+                    .vision
+                    .map(|_| (model, rank.model_runner.image_rows(model)));
                 rank.model_runner
-                    .capacity(&text.config, cache.layout(), seeds)?
+                    .capacity(&text.config, cache.layout(), seeds, vision)?
             }
             Loaded::Video(video) => video.capacity.clone(),
         };

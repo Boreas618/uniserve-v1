@@ -100,12 +100,6 @@ pub mod graphs;
 pub(crate) mod media;
 pub(crate) mod sampler;
 pub(crate) mod thread_pool;
-// PORT §1.1 ("a model with a vision tower adds `VisionRunner` as `RunnerId(1)`") and §2.2; the
-// missing caller is the text rank's start, which builds no vision runner.
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "no text rank start builds the vision runner")
-)]
 pub(crate) mod vision;
 
 use platform::Stream;

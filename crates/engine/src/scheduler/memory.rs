@@ -456,7 +456,8 @@ impl Scheduler {
     }
 
     /// The units of an encoder output of `rows` rows computed by `group` in the encoder class's
-    /// region there: its rows' features, rounded up to whole units, at least one.
+    /// region there: its rows' features, rounded up to whole parts of a unit on one rank (each
+    /// rank of the group holds the output whole), at least one.
     fn encoding_units(&self, group: GroupId, class: u8, rows: u32) -> u32 {
         let Some(group) = self.group(group) else {
             return 1;
@@ -465,7 +466,7 @@ impl Scheduler {
         let region = group.regions(class).first().copied();
         let unit = region
             .and_then(|region| self.regions.get(usize::from(region)))
-            .map_or(1, |(_, stated)| stated.unit_bytes.max(1));
+            .map_or(1, |(_, stated)| stated.part_bytes.max(1));
         u32::try_from(bytes.div_ceil(unit).max(1)).unwrap_or(u32::MAX)
     }
 

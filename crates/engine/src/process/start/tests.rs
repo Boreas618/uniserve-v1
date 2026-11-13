@@ -1,21 +1,26 @@
 //! The binary's start on the meta device against a Storage Server in the test's process: one
 //! engine whose scheduler grew its KV region into the segments its rank created, and whose close
-//! ends the session; and one engine of a media launch. Then the generation limits an engine
-//! reports, against what its groups state.
+//! ends the session; one engine of a media launch; and one engine of a model with a vision tower,
+//! whose rank encodes images beside its prefills. Then the generation limits an engine reports,
+//! against what its groups state.
 //!
-//! The text model is the Qwen3-MoE fixture of the `qwen3` crate and the media model a released
-//! FastH3 checkpoint (`crate::process::ranks::tests::FAST_H3`, which the repository does not
-//! hold), each loaded from its shard headers alone, and the policy the packaged `fcfs`; no GPU
-//! and no Build Server is touched.
+//! The text model is the Qwen3-MoE fixture of the `qwen3` crate, the media model a released
+//! FastH3 checkpoint (`crate::process::ranks::tests::FAST_H3`) and the model with a vision tower
+//! a released Qwen3.6 checkpoint ([`QWEN_VISION`]), neither of which the repository holds, each
+//! loaded from its shard headers alone, and the policy the packaged `fcfs`; no GPU and no Build
+//! Server is touched.
 
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
 use crate::batch::Capacity;
+use crate::batch::product::KINDS;
 use crate::batch::{Phase, Shape, Variant};
 use crate::executor::peers::{LOST_EXIT, Liveness};
+use crate::memory::buffers::UNIT_BYTES;
+use crate::memory::encoders;
 use proto::request::GenerationLimits;
-use storage::runtime::GroupId;
+use storage::runtime::{GroupId, Tier};
 
 use super::{FIRST_GENERATION, lowered, start};
 use crate::memory::client::StorageClient;
@@ -159,6 +164,111 @@ fn a_meta_start_of_a_media_launch_builds_one_engine_whose_close_ends_the_session
     }
 
     // The close ends the epoch's session.
+    let mut outputs = Vec::new();
+    engine
+        .close(|scheduler, output| outputs.push((scheduler, output)))
+        .unwrap();
+    assert!(
+        outputs
+            .iter()
+            .all(|(_, output)| !matches!(output, crate::scheduler::Output::Failed(_))),
+        "{outputs:?}"
+    );
+}
+
+/// The released Qwen3.6 checkpoint (`Qwen3_5MoeForConditionalGeneration`) whose headers the
+/// start of a model with a vision tower loads: a tower whole on every rank, which merges
+/// `2 × 2` patches into a row of `2048` BF16 features over three rotary axes.
+const QWEN_VISION: &str = "/workspace/models/Qwen3.6-35B-A3B";
+
+#[test]
+#[ignore = "reads the headers of a released Qwen3.6 checkpoint, which the repository does not hold"]
+fn a_meta_start_of_a_model_with_a_vision_tower_encodes_images_beside_its_prefills() {
+    assert!(
+        std::path::Path::new(QWEN_VISION).is_dir(),
+        "{QWEN_VISION} is missing"
+    );
+    let server = StorageServer::start();
+    // The fixture's launch, one rank of one group with prefill buckets of up to 32 tokens, over
+    // the checkpoint, with the limits of a family that takes images.
+    let mut launch = launch();
+    launch.engine_config.device.device = "meta".to_owned();
+    launch.engine_config.model.model = QWEN_VISION.to_owned();
+    launch.engine_config.model.generation_limits = unbounded();
+    let registry = nn::family::Registry::new([models::qwen3::family::HYBRID_FAMILY]).unwrap();
+    let storage = crate::memory::client::StorageLaunch {
+        socket: server.socket.to_string_lossy().into_owned(),
+        deployment: launch.engine_config.deployment.clone(),
+        claim: [0; 16],
+        tcp: None,
+        peers: Vec::new(),
+        epoch: launch.epoch,
+        standby: false,
+        standby_storage: Default::default(),
+    };
+    let liveness = Liveness::new(Arc::new(|| {}), LOST_EXIT);
+    let parameters = crate::modules::load::parameters(&launch.modules.policy).unwrap();
+    let policy = (crate::scheduler::packaged("fcfs"), parameters);
+    let engine = start(&launch, &registry, &storage, None, policy, liveness).unwrap();
+
+    // The rank's one worker serves the prefills and the image encodings: its causal runner and
+    // its vision runner. A row of an encoder output is a row of features and its coordinates.
+    let feature_bytes: u32 = 2048 * 2 + 3 * 4;
+    assert_eq!(engine.workers.len(), 1);
+    for phase in [Phase::Prefill, Phase::Decode, Phase::VisionEncode] {
+        assert!(engine.workers[0].serves(phase), "{phase:?}");
+    }
+    let (_, capacity) = &engine.capacities[0];
+    assert!(capacity.serves(Phase::VisionEncode));
+    assert_eq!(capacity.feature_bytes, feature_bytes);
+    assert_ne!(capacity.encoder_identity, "");
+
+    // An admitted image's block is written whole by one prefill, so it holds at most the 32
+    // rows of the widest prefill bucket: the vision runner captures the grids of 32 rows and of
+    // each doubling below, of `2 × 2` patches a row, and none of the tower's larger grids.
+    let encodes: Vec<u32> = capacity
+        .buckets
+        .iter()
+        .filter(|shape| shape.variant == Variant::ConditionEncode)
+        .map(|shape| shape.tokens)
+        .collect();
+    assert_eq!(encodes, [128, 64, 32, 16, 8, 4]);
+
+    // The limits the engine reports: an image's grid within the widest prefill bucket, which
+    // writes it whole, and its features at that many rows.
+    assert_eq!(engine.limits.max_vit_grid_tokens, 32);
+    assert_eq!(
+        engine.limits.max_vision_feature_bytes,
+        32 * u64::from(feature_bytes)
+    );
+    assert_ne!(engine.limits.encoder_cache_entries, 0);
+
+    // The session: after the cache groups, the class of encoder outputs, sized per request, its
+    // host copies in the host region of encoder outputs; the group's region of them holds eight
+    // outputs of the largest admitted image, 32 rows, in 256-byte units.
+    {
+        let head = service::lock(engine.head.as_ref().unwrap());
+        let (open, _) = head.session().unwrap();
+        let class = capacity.cache_groups.len();
+        assert_eq!(usize::from(open.trajectory), class + 1 + KINDS.len());
+        let outputs = &open.classes[class];
+        assert_eq!(outputs.units, 0);
+        let (host, _) = outputs.host.unwrap();
+        let host = &open.regions[usize::from(host)];
+        assert!(host.name.starts_with("host encoders"), "{}", host.name);
+        assert_eq!(
+            (host.tier, host.part_bytes),
+            (Tier::Host, encoders::PAGE_BYTES)
+        );
+
+        let regions = &open.groups[0].regions[class];
+        assert_eq!(regions.len(), 1);
+        let region = &open.regions[usize::from(regions[0])];
+        assert_eq!((region.tier, region.part_bytes), (Tier::Device, UNIT_BYTES));
+        let largest = 32 * u64::from(feature_bytes);
+        assert_eq!(u64::from(region.units), 8 * largest.div_ceil(UNIT_BYTES));
+    }
+
     let mut outputs = Vec::new();
     engine
         .close(|scheduler, output| outputs.push((scheduler, output)))

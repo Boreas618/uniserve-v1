@@ -9,10 +9,22 @@
 //! are wired alike: the cache issues each batch's page work through the hook of
 //! `crate::runner::causal_lm::wiring::page_work`, the tensor group's split is set on the graphs,
 //! and a member of an expert union joins it before its buckets are profiled.
+//!
+//! A rank whose model has a vision tower and whose group prefills ([`encodes`]) also encodes the
+//! images of the requests it prefills: its vision runner (`RunnerId(1)`) writes each image's
+//! encoder output into the rank's region of encoder outputs, and its causal runner, lent a
+//! feature buffer (`CausalLmRunner::set_features`), copies the output of every image block of a
+//! prefill into it before the replay (`specs/engine-worker-port.md` §1.1, §2.2). Both read and
+//! write that region through one media memory of the rank (`BufferMemory`), and both are
+//! profiled with it, the meta runners over a media memory that holds no device. The tower is
+//! whole on every rank of a tensor group, so each rank encodes the whole output into its own
+//! region, at the units the session gives every rank of the group alike.
 
 use std::sync::{Arc, Mutex};
 
 use crate::batch::Phase;
+use crate::batch::product::VISION_FEATURES;
+use crate::memory::buffers::BufferMemory;
 use crate::memory::cache::{CacheLayout, KvCacheMemory};
 use crate::memory::state::StateMemory;
 use crate::runner::causal_lm::experts::Member;
@@ -20,10 +32,12 @@ use crate::runner::causal_lm::speculation::DraftPool;
 use crate::runner::causal_lm::wiring::page_work;
 use crate::runner::causal_lm::{CausalLmConfig, CausalLmRunner};
 use crate::runner::graphs::Graphs;
+use crate::runner::vision::VisionRunner;
 use anyhow::{Context as _, Result};
 use nn::family::TextModel;
 use ops::Generation;
 use platform::Stream;
+use proto::config::WorkerGroupRole;
 
 use super::ModelRunner;
 use super::buckets::served_phases;
@@ -160,6 +174,110 @@ impl ModelRunner {
         }
         Ok(runner)
     }
+}
+
+impl ModelRunner {
+    /// Whether this rank encodes the images of the requests it prefills (module documentation):
+    /// `model` has a vision tower whose images the engine admits ([`ModelRunner::image_rows`])
+    /// and the rank's group prefills ([`encodes`]).
+    ///
+    /// # Errors
+    ///
+    /// A rank whose group the deployment does not state.
+    pub(crate) fn encodes_images(&self, model: &dyn TextModel) -> Result<bool> {
+        let groups = &self.engine_config().parallel.worker_groups;
+        let group = groups
+            .iter()
+            .find(|group| group.id.0 == self.group())
+            .with_context(|| format!("the deployment states no group {}", self.group()))?;
+
+        Ok(self.image_rows(model) > 0 && encodes(group.role))
+    }
+
+    /// The most rows of an image `model`'s vision tower encodes on this rank: the tower's
+    /// largest image, within the rows of a block the engine admits, which are the generation
+    /// limits the launch states lowered to what the groups capture (`crate::process::start`'s
+    /// `lowered`): an image's grid within the widest prefill bucket, which writes its block
+    /// whole, and its features within the feature bytes. Every text group captures this rank's
+    /// buckets. Zero for a model without a vision tower or a launch that admits no image.
+    pub(crate) fn image_rows(&self, model: &dyn TextModel) -> u32 {
+        let Some(vision) = model.vision() else {
+            return 0;
+        };
+        let limits = &self.engine_config().model.generation_limits;
+        let widest = self
+            .buckets()
+            .iter()
+            .filter(|bucket| bucket.variant.stage() == "prefill")
+            .map(|bucket| bucket.tokens)
+            .max()
+            .unwrap_or(0);
+        let row = u64::from(VisionRunner::feature_bytes(model)).max(1);
+        let features = u32::try_from(limits.max_vision_feature_bytes / row).unwrap_or(u32::MAX);
+
+        vision
+            .max_image_rows()
+            .min(limits.max_vit_grid_tokens)
+            .min(widest)
+            .min(features)
+    }
+}
+
+/// Whether a text group of `role` encodes images, given a model with a vision tower: a group that
+/// prefills does, since a token request's image encodings are placed on the group of its prefill,
+/// which reads them (`crate::scheduler`'s placement). A decode group and an expert group encode
+/// none.
+pub(crate) fn encodes(role: WorkerGroupRole) -> bool {
+    matches!(role, WorkerGroupRole::Model | WorkerGroupRole::Prefill)
+}
+
+/// The class of encoder outputs in the session of a text deployment whose cache is laid out as
+/// `layout`: the one after the cache groups, before the product classes, where the scheduler
+/// finds it.
+///
+/// # Errors
+///
+/// More cache groups than a session numbers classes.
+pub(crate) fn encoder_class(layout: &CacheLayout) -> Result<u8> {
+    u8::try_from(layout.groups.len()).context("more cache groups than a session numbers classes")
+}
+
+/// The digest of the tensors an encoder output of `model`'s vision tower holds, which its class
+/// states (`storage::runtime::Class::tensors`): rows of features of the model's width in its
+/// activation type, then their rotary coordinates (`crate::runner::vision`).
+pub(crate) fn feature_tensors(model: &dyn TextModel) -> [u8; 32] {
+    let axes = model.vision().map_or(0, |vision| vision.position_axes());
+
+    let mut tensors = storage::key::Digest::new(b"uniserve.vision-features");
+    tensors.text(VISION_FEATURES);
+    tensors.text(ops::abi::name(model.dtype()));
+    tensors.number(u64::from(model.hidden()));
+    tensors.number(u64::from(axes));
+    tensors.finish()
+}
+
+/// The vision runner of `model` encoding images of at most `rows` rows
+/// ([`ModelRunner::image_rows`]) over `graphs`, which replay on `stream` (`None` for graphs that
+/// hold no device), writing the encoder outputs of class `class` into `memory`, the rank's media
+/// memory, profiled (steps 7 and 22): the forward of each grid it captures, which states its
+/// region and input bytes and the kernels every grid of at most `rows` rows launches.
+///
+/// # Errors
+///
+/// What the runner refuses of the model or its graphs, or a forward of the profile run.
+pub(crate) fn vision_runner(
+    model: Arc<dyn TextModel>,
+    graphs: Graphs,
+    stream: Option<Stream>,
+    memory: Arc<BufferMemory>,
+    (class, rows): (u8, u32),
+) -> Result<VisionRunner> {
+    let runner = VisionRunner::new(model, graphs, stream, memory, (class, rows))
+        .context("building the rank's vision runner")?;
+    crate::runner::Runner::graphs(&runner)
+        .profile_run(&runner)
+        .context("profiling the rank's vision runner")?;
+    Ok(runner)
 }
 
 /// Runs `runner`'s profile run: the forward of every bucket it states under the meta context, which

@@ -8,7 +8,9 @@ use crate::batch::capacity::variants;
 use crate::memory::cache::CacheLayout;
 use crate::memory::division::call_window;
 use crate::runner::causal_lm::CausalLmConfig;
+use crate::runner::vision::VisionRunner;
 use anyhow::{Context as _, Result};
+use nn::family::TextModel;
 
 use super::ModelRunner;
 
@@ -17,19 +19,26 @@ impl ModelRunner {
     /// phases its buckets serve, each held by every request slot at once (a token phase's
     /// stage is the slots), the shapes it captured that a batch states, the cache groups in
     /// class order with their page `seeds` and the deployment's cache configuration, and the
-    /// model's limits and control tokens. A text rank encodes nothing itself and denoises
-    /// nothing.
+    /// model's limits and control tokens. A text rank denoises nothing.
+    ///
+    /// A rank that encodes images of at most `rows` rows with the vision tower of `model`, given
+    /// as `vision: Some((model, rows))` (`None` on a rank that encodes none,
+    /// `ModelRunner::encodes_images`), also serves their encodings, held by every request slot,
+    /// in the shapes its vision runner captures, and states the bytes of a row of their encoder
+    /// outputs (`Capacity::feature_bytes`).
     ///
     /// Every rank of a group states the same: its config and layout are the deployment's.
     ///
     /// # Errors
     ///
-    /// A queue depth or a bucket of no rows, which bounds no window of calls.
+    /// A queue depth or a bucket of no rows, which bounds no window of calls; a tower that sizes
+    /// no image.
     pub(crate) fn capacity(
         &self,
         config: &CausalLmConfig,
         layout: &CacheLayout,
         seeds: Vec<storage::Key>,
+        vision: Option<(&dyn TextModel, u32)>,
     ) -> Result<Capacity> {
         let mut phases = 0;
         let mut rows = [0; Phase::COUNT];
@@ -40,7 +49,7 @@ impl ModelRunner {
 
         // The shapes a batch is formed against: a drafter's bucket is issued behind the batch it
         // follows, and no batch states it.
-        let buckets = config
+        let mut buckets: Vec<_> = config
             .buckets
             .iter()
             .filter(|bucket| {
@@ -50,6 +59,18 @@ impl ModelRunner {
             })
             .map(|bucket| bucket.shape())
             .collect();
+
+        // The image encodings, one image a batch: each bucket the vision runner captures holds
+        // one.
+        let mut feature_bytes = 0;
+        if let Some((model, images)) = vision {
+            let encode = Phase::VisionEncode.index();
+            phases |= 1 << encode;
+            rows[encode] = config.slots.max(1);
+            let captured = VisionRunner::captured(model, images)?;
+            buckets.extend(captured.iter().map(|bucket| bucket.shape()));
+            feature_bytes = VisionRunner::feature_bytes(model);
+        }
 
         let (calls, _) = config.buckets.bounds();
         let window = call_window(self.queue_depth(), calls as usize)
@@ -72,7 +93,7 @@ impl ModelRunner {
             denoise_steps: 0,
             bos_token_id: model.bos,
             eos_token_ids: model.eos.clone(),
-            feature_bytes: 0,
+            feature_bytes,
             // The group's encoder identity and latent seed are stated from its ranks' weights by
             // the rank start (`crate::process::ranks::capacities`).
             encoder_identity: String::new(),

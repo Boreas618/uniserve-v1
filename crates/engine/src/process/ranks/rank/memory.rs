@@ -4,14 +4,15 @@
 //!
 //! A rank divides what its GPU's quota leaves it once its weights are mapped, from figures that
 //! are stated or measured by then (`crate::memory::division`): the process's own bytes, the
-//! graph region and shadow region the runner's profile run states, the expert transport of a union
-//! member, and the storages its request slots and its cache's tables take, within its own share
-//! of the GPU (its worker group's `mem_fraction_static`). The request slots are the deployment's
-//! running requests, or as many as the share holds beside the rest and the cache's fewest units
-//! when fewer fit (`division::request_slots`). The cache's planes take what remains,
-//! in whole units agreed over the rank's host group and rounded to whole segments: the memory of
-//! the buffer pool's region is the segments the ranks map or create once the session is open
-//! (`specs/buffer-pool.md` §14.1).
+//! graph regions and shadow regions the runners' profile runs state, the expert transport of a
+//! union member, on a rank that encodes images its region of encoder outputs and its causal
+//! runner's feature buffer, and the storages its request slots and its cache's tables take,
+//! within its own share of the GPU (its worker group's `mem_fraction_static`). The request slots
+//! are the deployment's running requests, or as many as the share holds beside the rest and the
+//! cache's fewest units when fewer fit (`division::request_slots`). The cache's planes take what
+//! remains, in whole units agreed over the rank's host group and rounded to whole segments: the
+//! memory of the buffer pool's region is the segments the ranks map or create once the session is
+//! open (`specs/buffer-pool.md` §14.1).
 //!
 //! The region is numbered for what the quota holds as if the rank's epoch served the GPU alone,
 //! and the start creates the segments of it the quota holds now. They differ for an epoch that
@@ -227,9 +228,10 @@ impl ModelRunner {
         })
     }
 
-    /// The bytes the graph pool and the scratch pool of `device` map for a runner of `peaks` over
-    /// a cache of `layout` (step 13): its region, its shadow region and the state snapshots of a
-    /// model that keeps recurrent state, in whole allocation granules.
+    /// The bytes the graph pool and the scratch pool of `device` map for runners of `peaks` over
+    /// a cache of `layout` (step 13): each runner's region and shadow region (the causal runner's,
+    /// and a vision runner's), and the state snapshots of a model that keeps recurrent state, in
+    /// whole allocation granules.
     ///
     /// # Errors
     ///
@@ -238,12 +240,15 @@ impl ModelRunner {
         &self,
         device: DeviceId,
         layout: &CacheLayout,
-        peaks: Peaks,
+        peaks: &[Peaks],
     ) -> Result<(u64, u64)> {
+        let regions: Vec<u64> = peaks.iter().map(|peaks| peaks.graph).collect();
+        let shadows: Vec<u64> = peaks.iter().map(|peaks| peaks.shadow).collect();
+
         Ok(division::pool_bytes(
             granularity(device)?,
-            &[peaks.graph],
-            &[peaks.shadow],
+            &regions,
+            &shadows,
             layout.state_snapshot_bytes(),
         ))
     }
@@ -282,21 +287,25 @@ impl ModelRunner {
     /// The request slots, the units of the cache planes on `device` (steps 11-12 and 14-15) and
     /// the units of them the rank's start creates: `(slots, units, first)`.
     ///
+    /// `regions` are the `(name, bytes)` of the rank's regions that do not grow with the request
+    /// slots, made at its start: its graph and scratch pools ([`Self::pools`]) and, on a rank that
+    /// encodes images, its region of encoder outputs (which the resident pool holds) and its
+    /// causal runner's feature buffer. The expert transport of a union member joins them.
+    ///
     /// The request slots are the deployment's running requests, or as many as what the GPU's
-    /// quota holds now leaves once the weights are mapped and the graph and scratch `pools`, the
-    /// expert transport of a union member and the cache's fewest units are taken out, when fewer
-    /// fit ([`division::request_slots`]), each slot's storages as [`Self::slot_storage`] states
-    /// them; agreed over `host` as the fewest any of its ranks holds, since the ranks of a group
-    /// serve the same requests.
+    /// quota holds now leaves once the weights are mapped and those regions and the cache's
+    /// fewest units are taken out, when fewer fit ([`division::request_slots`]), each slot's
+    /// storages as [`Self::slot_storage`] states them; agreed over `host` as the fewest any of its
+    /// ranks holds, since the ranks of a group serve the same requests.
     ///
     /// The units are the region's numbering: what the GPU's quota leaves once the weights are
-    /// mapped as if the epoch served the GPU alone, less the pools, the expert transport and
-    /// the storages of the agreed slots, agreed over `host` as the smallest count of its ranks,
-    /// and rounded down to whole segments of whole granules. The first units are the whole
-    /// segments of them the quota holds free now ([`first_units`]), agreed over `host` alike: an
-    /// epoch that starts beside the epoch it succeeds has the units the serving epoch holds as
-    /// the rest, which its regions grow into by `Grow` as that epoch drains
-    /// (`specs/updates.md` §3.7). A first epoch holds every unit at once.
+    /// mapped as if the epoch served the GPU alone, less those regions and the storages of the
+    /// agreed slots, agreed over `host` as the smallest count of its ranks, and rounded down to
+    /// whole segments of whole granules. The first units are the whole segments of them the
+    /// quota holds free now ([`first_units`]), agreed over `host` alike: an epoch that starts
+    /// beside the epoch it succeeds has the units the serving epoch holds as the rest, which its
+    /// regions grow into by `Grow` as that epoch drains (`specs/updates.md` §3.7). A first epoch
+    /// holds every unit at once.
     ///
     /// # Errors
     ///
@@ -311,7 +320,7 @@ impl ModelRunner {
         host: &HostGroup,
         model: &dyn TextModel,
         layout: &Arc<CacheLayout>,
-        (graph, scratch): (u64, u64),
+        regions: &[(&'static str, u64)],
     ) -> Result<(u32, u32, u32)> {
         let granularity = granularity(device)?;
         let (share, _) = self.fractions()?;
@@ -319,11 +328,8 @@ impl ModelRunner {
 
         // The pools, the slots and the cache's tables are made at the start, so they fit what
         // the quota holds now; the planes are numbered for what it holds the epoch alone.
-        let pools = [
-            ("graph pool", graph),
-            ("scratch pool", scratch),
-            ("expert transport", self.transport_bytes(device, model)?),
-        ];
+        let mut pools = regions.to_vec();
+        pools.push(("expert transport", self.transport_bytes(device, model)?));
         let least = fewest_units(layout);
         let left = division::remainder(
             now,
@@ -340,7 +346,10 @@ impl ModelRunner {
         let slots = u32::try_from(slots).context("a negative count of request slots was agreed")?;
 
         let storage = self.slot_storage(model, layout, slots)?;
-        let regions = [pools[0], pools[1], pools[2], ("request slots", storage)];
+        let regions: Vec<(&str, u64)> = pools
+            .into_iter()
+            .chain([("request slots", storage)])
+            .collect();
         let remainder = division::remainder(now, &regions, 0, &[])?;
         let whole = division::remainder(alone, &regions, 0, &[])?;
 

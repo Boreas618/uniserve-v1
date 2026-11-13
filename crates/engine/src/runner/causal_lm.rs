@@ -752,9 +752,6 @@ impl CausalLmRunner {
     /// # Errors
     ///
     /// [`Error::Invalid`] for a config with no bucket.
-    // PORT §1.1 step 14 (the `image features` region); the missing caller is the text rank's
-    // division of a model with a vision tower.
-    #[expect(dead_code, reason = "no text rank start builds the vision runner")]
     pub(crate) fn image_bytes(config: &CausalLmConfig, model: &dyn TextModel) -> Result<u64> {
         Features::bytes(model, stated(config)?.1.tokens())
     }
@@ -769,9 +766,6 @@ impl CausalLmRunner {
     ///
     /// [`Error::Invalid`] for a model without a vision tower; the driver's refusal of the
     /// allocation.
-    // PORT §2.2 (`vision_features` copied into the causal runner's feature buffer); the missing
-    // caller is the text rank's opening of a model with a vision tower.
-    #[expect(dead_code, reason = "no text rank start builds the vision runner")]
     pub(crate) fn set_features(&mut self, memory: Arc<BufferMemory>, class: u8) -> Result<()> {
         let features = Features::new(
             &*self.model,
