@@ -38,6 +38,7 @@ mod request;
 mod stats;
 #[cfg(test)]
 mod tests;
+mod video;
 
 use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::fmt;
@@ -253,6 +254,8 @@ pub struct Scheduler {
 
     /// The classes of the session; a request names a class by its index here.
     classes: Vec<runtime::Class>,
+    /// The class of stored trajectories, as the session states it (`Open::trajectory`).
+    trajectory: u8,
     /// Per region of the session: the number completions and requests name it by, and its tier
     /// and unit size as the layout states them.
     regions: Vec<(u8, runtime::Region)>,
@@ -382,6 +385,7 @@ impl Scheduler {
             outstanding: HashMap::new(),
             next_submission: 1,
             classes: layout.classes.clone(),
+            trajectory: layout.trajectory,
             regions,
             registers,
             available: capacity.clone(),
