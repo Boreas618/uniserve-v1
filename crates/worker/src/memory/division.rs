@@ -9,7 +9,7 @@
 //! | --- | --- |
 //! | Weights | The checkpoint's, less what the server retains of them already |
 //! | Graph pool: one region per runner | Each runner's profile-run peak (`Graphs::peak`) |
-//! | Scratch pool | Each runner's shadow region, and the state snapshots of a model that keeps recurrent state |
+//! | Scratch pool | Each runner's shadow region, the scratch page set of a causal runner, and the state snapshots of a model that keeps recurrent state |
 //! | Encoder cache, latent buffers | Their owners' bytes per request slot, times the request slots |
 //! | Cache planes | What remains, in whole units |
 //!
@@ -34,18 +34,36 @@
 //! A paired forward launches every call of one operator whose kernel changed twice, and the
 //! runner's shadow region holds, per output of each such call, the new kernel's shadow output
 //! and a copy of the serving kernel's output (`ops::Twins::freeze`), each rounded up to
-//! `ops::twins::ALIGNMENT`. The region is emptied between paired forwards, not between calls,
-//! because the pairs are compared after the forward. A runner's shadow region therefore needs,
-//! for the operator that writes the most in any one forward of the runner's buckets, twice the
-//! sum of the aligned output bytes of that operator's calls.
+//! `ops::twins::ALIGNMENT`. An operand the call writes in place is copied into the region
+//! before the new kernel writes it and again once the serving kernel has (`ops::Twins::in_place`).
+//! The region is emptied between paired forwards, not between calls, because the pairs are
+//! compared after the forward. A runner's shadow region therefore needs, for the operator that
+//! writes the most in any one forward of the runner's buckets, twice the sum of the aligned
+//! bytes that operator's calls write.
 //!
 //! The forward's activation peak does not bound that sum: the context's allocator gives a
 //! freed block out again, so the outputs one operator writes over a forward of many layers
-//! add up to more than the forward ever holds at once. The bound is a profile run's figure
-//! like the peak: `Graphs::shadow_peak` states twice the bytes the largest forward of a runner
-//! allocates in total, which no operator's outputs exceed, and this module takes it per runner
-//! as an input. An operator that writes execution-owned memory in place is shadowed over the
-//! scratch memory its runner redirects it to, which that memory's owner adds to the figure.
+//! add up to more than the forward ever holds at once. The figure is the profile run's:
+//! each launch of a recorded launch table states the bytes the context's allocator handed out
+//! for it, its outputs (`ops::Context::record_launches`), and `Graphs::shadow_peak` sums them
+//! per operator over each profiled forward and states twice the largest sum. Memory a call
+//! writes in place that the forward did not allocate is not in that sum; the runner states the
+//! most one operator of its paired forward writes so (a causal runner's scratch page set, its
+//! request slots' state or its kept outputs: `CausalLmRunner::in_place_bytes`), and the region
+//! holds twice that when it is more. An operand a call writes in place that the forward
+//! allocated for an earlier launch is counted with that launch. A paired forward whose
+//! operator needs more than the region compares nothing: the update names the operator and the
+//! batch uncompared (`Graphs::shadow`).
+//!
+//! ## The scratch page set
+//!
+//! A causal runner's paired forwards write their keys and values to a scratch page set in the
+//! scratch pool, beside its shadow region (`KvCacheMemory::open_scratch`). The set is one set
+//! the rows of a batch share, `ceil(T / page) + R` pages for the `T` tokens and `R` rows of the
+//! runner's largest bucket (`CausalLmRunner::scratch_pages`), with a page table of a row per
+//! page (`memory::cache::scratch::bytes`). The rows take its pages in order, each the pages of
+//! the context it reads, so every batch whose rows' contexts sum to at most `T` tokens fits; a
+//! batch whose rows need more is not paired, and the update names it uncompared.
 //!
 //! ## After the division
 //!

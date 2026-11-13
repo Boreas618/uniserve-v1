@@ -1718,7 +1718,7 @@ mod tests {
             context
                 .take_launches()
                 .into_iter()
-                .map(|(operator, _, _)| operator)
+                .map(|(operator, ..)| operator)
                 .collect()
         };
 
@@ -1746,7 +1746,7 @@ mod tests {
         let launches = context.take_launches();
         let stated: Vec<(&str, &str)> = launches
             .iter()
-            .map(|(operator, key, _)| (*operator, key.as_str()))
+            .map(|(operator, key, ..)| (*operator, key.as_str()))
             .collect();
         assert_eq!(
             stated,

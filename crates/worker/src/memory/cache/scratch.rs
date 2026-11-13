@@ -5,12 +5,14 @@
 //! scratch pages. The set is one region of the device's scratch pool, sized once and reused by
 //! every shadow forward; it is never retained at the Storage Server.
 //!
-//! The set's pages are one numbering, shared by every attention group. A batch whose rows need
-//! `pages` pages each gives row `r` the pages `r · pages .. (r + 1) · pages`, so two rows of one
-//! batch never write the same page, and the set's page table, which states the numbering once
-//! in order, reads as `[rows, pages]` at any width. A scratch page is one unit, as an
-//! attention page is, so a layer's scratch planes are its column of the set, its index keys
-//! included when the cache keeps them.
+//! The set's pages are one numbering, shared by every attention group and by the rows of a
+//! batch: the runner hands the pages to the rows in order, each row the pages of the context it
+//! reads, so two rows of one batch never write the same page. The set's page table has a row
+//! for every page, row `i` naming the pages `i, i + 1, …` and the set's last page where they
+//! run past its end, so a row whose pages begin at page `i` gathers table row `i`. A table row is as wide as the
+//! set or, when narrower, the cache's pooled table, which bounds the pages a served row reads.
+//! A scratch page is one unit, as an attention page is, so a layer's scratch planes are its
+//! column of the set, its index keys included when the cache keeps them.
 
 use std::sync::Arc;
 
@@ -26,25 +28,64 @@ use crate::{Error, Result};
 /// The smallest extent the device's pools map, which every allocation of a set rounds up to.
 const SCRATCH_GRANULARITY: u64 = 2 << 20;
 
-/// The allocations a set takes beside its page table and its index keys: both fields' values,
-/// flags and scales.
-const ALLOCATIONS: u64 = 6;
-
 /// The bit pattern of `1.0f32`, the neutral FP8 scale.
 const UNIT_SCALE: u32 = 0x3F80_0000;
 
-/// The pages `bytes` of the scratch pool hold of a cache of `layout`: both value planes, the
-/// flags of each field, the scales of each for an FP8 cache and the index keys of a cache that
-/// keeps them, over every column, and the page's entry of the set's page table, after the
-/// granularity each of the set's allocations rounds up to.
-pub fn pages_within(layout: &CacheLayout, bytes: u64) -> u64 {
-    let page = u64::from(layout.columns.max(1)) * layout.cell_bytes();
-    let allocations = ALLOCATIONS + 1 + u64::from(layout.index_bytes() > 0);
+/// The bytes of the scratch pool a set of `pages` pages takes for a cache of `layout` whose
+/// pooled tables are `width` pages wide: both value planes, the flags of each field, the scales
+/// of each for an FP8 cache and the index keys of a cache that keeps them, over every column,
+/// and the set's page table, each allocation rounded up to the pool's granularity. Zero for a
+/// set of no pages.
+pub fn bytes(layout: &CacheLayout, pages: u32, width: u32) -> u64 {
+    if pages == 0 {
+        return 0;
+    }
+    let cells = u64::from(pages) * u64::from(layout.columns.max(1));
+    let taken = |bytes: u64| bytes.next_multiple_of(SCRATCH_GRANULARITY);
 
-    bytes
-        .saturating_sub(allocations * SCRATCH_GRANULARITY)
-        .checked_div(page + 4)
-        .unwrap_or(0)
+    let mut total = 2 * taken(cells * layout.plane_bytes) + 2 * taken(cells);
+    if layout.quantized {
+        total += 2 * taken(cells * 4);
+    }
+    if layout.index_bytes() > 0 {
+        total += taken(cells * layout.index_bytes());
+    }
+    total + taken(u64::from(pages) * u64::from(table_width(pages, width)) * 4)
+}
+
+/// The bytes the shadow path copies when the cache writes of a paired forward write a set of
+/// `pages` pages of a cache of `layout` in place (`ops::Twins::in_place`): each layer's key and
+/// value planes over the set, their flags, their scales for an FP8 cache and the layer's index
+/// keys, each copy rounded up to `ops::twins::ALIGNMENT`, over every column. Zero for a set of
+/// no pages.
+pub fn in_place(layout: &CacheLayout, pages: u32) -> u64 {
+    let pages = u64::from(pages);
+    let copy = |bytes: u64| bytes.next_multiple_of(ops::twins::ALIGNMENT);
+
+    let mut column = 2 * copy(pages * layout.plane_bytes) + 2 * copy(pages);
+    if layout.quantized {
+        column += 2 * copy(pages * 4);
+    }
+    if layout.index_bytes() > 0 {
+        column += copy(pages * layout.index_bytes());
+    }
+    u64::from(layout.columns) * column
+}
+
+/// The pages a row of a set of `pages` pages' table names, for a cache whose pooled tables are
+/// `width` pages wide: the set's pages, or the pooled width when that is smaller.
+fn table_width(pages: u32, width: u32) -> u32 {
+    pages.min(width).max(1)
+}
+
+/// The page table of a set of `pages` pages whose rows are `width` pages wide, row-major: row
+/// `i` names the pages `i, i + 1, …`, each past the set's last page naming the last page.
+fn table(pages: u32, width: u32) -> Vec<u32> {
+    let last = pages.saturating_sub(1);
+
+    (0..pages)
+        .flat_map(|first| (0..width).map(move |page| first.saturating_add(page).min(last)))
+        .collect()
 }
 
 /// The device side of a set: its buffers of the scratch pool.
@@ -55,7 +96,7 @@ struct Buffers {
     scales: Option<[Buffer; 2]>,
     /// The index-key planes of a cache whose layers keep index keys.
     index_keys: Option<Buffer>,
-    /// `[pages]` U32: the page numbers `0..pages` in order.
+    /// `[pages, width]` U32: row `i` names the pages from page `i` on ([`table`]).
     table: Buffer,
 }
 
@@ -64,13 +105,16 @@ pub(crate) struct ScratchPages {
     layout: Arc<CacheLayout>,
     /// Pages the set holds, each one unit of every column.
     pages: u32,
+    /// The pages a row of the set's page table names ([`table_width`]).
+    width: u32,
     /// The set's buffers; `None` for a set that holds no device.
     device: Option<Buffers>,
 }
 
 impl ScratchPages {
-    /// A set of `pages` pages that holds no device: its tensors are meta tensors.
-    pub(crate) fn meta(layout: Arc<CacheLayout>, pages: u32) -> Result<Self> {
+    /// A set of `pages` pages that holds no device, for a cache whose pooled tables are `width`
+    /// pages wide: its tensors are meta tensors.
+    pub(crate) fn meta(layout: Arc<CacheLayout>, pages: u32, width: u32) -> Result<Self> {
         if pages == 0 || layout.columns == 0 {
             return Err(Error::Invalid(
                 "a scratch page set needs pages and columns".into(),
@@ -80,15 +124,17 @@ impl ScratchPages {
         Ok(Self {
             layout,
             pages,
+            width: table_width(pages, width),
             device: None,
         })
     }
 
-    /// A set of `pages` pages taken from the scratch pool of `allocator`: both value planes,
-    /// the flags of each field, the scales of each for an FP8 cache and the index keys of a
-    /// cache that keeps them, over every column, and the page table. The flags and index keys
-    /// are zeroed, the scales set to one and the table written on `stream`, which is
-    /// synchronized before returning.
+    /// A set of `pages` pages taken from the scratch pool of `allocator`, for a cache whose
+    /// pooled tables are `width` pages wide ([`bytes`]): both value planes, the flags of each
+    /// field, the scales of each for an FP8 cache and the index keys of a cache that keeps
+    /// them, over every column, and the page table. The flags and index keys are zeroed, the
+    /// scales set to one and the table written on `stream`, which is synchronized before
+    /// returning.
     ///
     /// # Errors
     ///
@@ -96,10 +142,11 @@ impl ScratchPages {
     pub(crate) fn open(
         layout: Arc<CacheLayout>,
         pages: u32,
+        width: u32,
         allocator: &mut platform::Allocator,
         stream: &Stream,
     ) -> Result<Self> {
-        let mut set = Self::meta(layout, pages)?;
+        let mut set = Self::meta(layout, pages, width)?;
         let cells = pages as usize * set.layout.columns as usize;
         let plane_bytes = cells * set.layout.plane_bytes as usize;
         let index_bytes = cells * set.layout.index_bytes() as usize;
@@ -117,9 +164,9 @@ impl ScratchPages {
         } else {
             None
         };
-        let table = take(pages as usize * 4)?;
+        let numbering = table(pages, set.width);
+        let table = take(std::mem::size_of_val(numbering.as_slice()))?;
 
-        let numbering: Vec<u32> = (0..pages).collect();
         let mut write = CopyBatch::new(SourceOrder::DuringCall);
         write.push(
             table.address(),
@@ -128,7 +175,7 @@ impl ScratchPages {
         );
 
         // SAFETY: every range is one of the buffers just taken, which the set keeps; the host
-        // numbering is read during the call and the stream is drained below.
+        // table is read during the call and the stream is drained below.
         unsafe {
             for flags in &initialized {
                 memset_d8(flags.address(), 0, cells, stream)?;
@@ -303,42 +350,35 @@ impl ScratchPages {
         })
     }
 
-    /// The set's page table for a batch of `rows` rows of `pages` pages each, `[rows, pages]`
-    /// U32: row `r` names the pages `r · pages .. (r + 1) · pages`.
+    /// The set's page table, `[pages, width]` U32: row `i` names the pages from page `i` on, so
+    /// a row of a shadow forward whose pages begin at page `i` gathers row `i`.
     ///
     /// # Errors
     ///
-    /// When the rows need more pages than the set holds: the forward would write outside its
-    /// own pages.
-    pub(crate) fn table(&self, rows: u32, pages: u32) -> Result<Tensor> {
-        let asked = u64::from(rows) * u64::from(pages);
-        if rows == 0 || pages == 0 || asked > u64::from(self.pages) {
-            return Err(Error::Invalid(format!(
-                "a shadow forward asks for {rows} rows of {pages} pages and the scratch set \
-                 holds {} pages",
-                self.pages
-            )));
-        }
-
+    /// As [`lend`](crate::memory::lend).
+    pub(crate) fn table(&self) -> Result<Tensor> {
         self.tensor(
             |buffers| &buffers.table,
             0,
-            &[rows as usize, pages as usize],
+            &[self.pages as usize, self.width as usize],
             DType::U32,
         )
     }
 
     /// Copies what the rows of a batch have cached in attention group `group` into their
-    /// scratch pages on `stream`: for row `r`, each page of `pages[r]` (the units of the row's
-    /// logical pages from page zero, unit 0 where it holds none) into scratch page
-    /// `r · width + page`, every layer's keys, values, flags, scales and index keys. The
-    /// shadow forward then reads the row's whole history in the set and writes over the copy.
+    /// scratch pages on `stream`: for each row, `(first, units)`, the units of its logical
+    /// pages from page zero (unit 0 where it holds none) into the set's pages from `first` on,
+    /// every layer's keys, values, flags, scales and index keys. The shadow forward then reads
+    /// the row's whole history in the set and writes over the copy.
+    ///
+    /// # Errors
+    ///
+    /// A set that holds no device, or a row whose pages lie past the set's.
     pub(crate) fn copy_history(
         &self,
         planes: &Planes,
         group: &GroupLayout,
-        pages: &[Vec<u32>],
-        width: u32,
+        rows: &[(u32, Vec<u32>)],
         stream: &Stream,
     ) -> Result<()> {
         let Some(buffers) = &self.device else {
@@ -346,13 +386,14 @@ impl ScratchPages {
                 "the scratch page set holds no device: it copies no history",
             ));
         };
-        if pages.len() as u64 * u64::from(width) > u64::from(self.pages)
-            || pages.iter().any(|row| row.len() > width as usize)
-        {
+        let past = rows
+            .iter()
+            .find(|(first, units)| u64::from(*first) + units.len() as u64 > u64::from(self.pages));
+        if let Some((first, units)) = past {
             return Err(Error::Invalid(format!(
-                "a shadow forward of {} rows of {width} pages copies its history into a scratch \
+                "a shadow forward copies a history of {} pages from page {first} of a scratch \
                  set of {} pages",
-                pages.len(),
+                units.len(),
                 self.pages
             )));
         }
@@ -361,12 +402,12 @@ impl ScratchPages {
         let index_bytes = self.layout.index_bytes();
         let mut batch = CopyBatch::new(SourceOrder::Stream);
 
-        for (row, units) in pages.iter().enumerate() {
+        for (first, units) in rows {
             for (page, unit) in units.iter().enumerate() {
                 if *unit == 0 {
                     continue;
                 }
-                let target = row as u64 * u64::from(width) + page as u64;
+                let target = u64::from(*first) + page as u64;
 
                 for layer in 0..group.layers.len() as u32 {
                     let cell = u64::from(layer) * u64::from(self.pages) + target;
@@ -418,33 +459,32 @@ mod tests {
     use super::*;
 
     /// A page of the set spans every column of the cache, a layer's cell being one column of
-    /// one page: the figure is a BF16 page of 64 tokens over 48 layers of four heads of 128.
+    /// one page, and every allocation takes whole granules: the figure is a set of 384 BF16
+    /// pages of 64 tokens over 48 layers of four heads of 128, in a cache whose pooled tables
+    /// are 640 pages wide, and the table's rows the set's 384 pages wide.
     #[test]
-    fn a_page_of_the_set_spans_every_column() {
+    fn a_set_takes_its_pages_over_every_column_and_its_table() {
         let layout = CacheLayout::dense(64, 48, 4, 128, PrefixCacheDtype::BFloat16);
-        let page = 48 * (2 * 65_536 + 2);
-        let bytes = 1_237_319_680;
-        let reserved = 7 * SCRATCH_GRANULARITY;
+        let cells = 384 * 48;
+        let granules = |bytes: u64| bytes.next_multiple_of(SCRATCH_GRANULARITY);
 
-        assert_eq!(
-            pages_within(&layout, bytes),
-            (bytes - reserved) / (page + 4)
-        );
-        assert_eq!(pages_within(&layout, reserved), 0);
+        let values = 2 * granules(cells * 65_536);
+        let flags = 2 * granules(cells);
+        let table = granules(384 * 384 * 4);
+        assert_eq!(bytes(&layout, 384, 640), values + flags + table);
+        assert_eq!(bytes(&layout, 0, 640), 0);
 
-        // Index keys of 128 elements per four tokens add sixteen BF16 keys to every cell, and
-        // one allocation to the set.
+        // Index keys of 128 elements per four tokens add sixteen BF16 keys to every cell, in
+        // an allocation of their own; a pooled table narrower than the set narrows its table.
         let keyed = layout
             .with_index_keys(IndexKeys {
                 width: 128,
                 ratio: 4,
             })
             .expect("index keys a page holds");
-        let page = 48 * (2 * 65_536 + 2 + 16 * 128 * 2);
-        let reserved = 8 * SCRATCH_GRANULARITY;
-
-        assert_eq!(pages_within(&keyed, bytes), (bytes - reserved) / (page + 4));
-        assert_eq!(pages_within(&keyed, reserved), 0);
+        let keys = granules(cells * 16 * 128 * 2);
+        let table = granules(384 * 256 * 4);
+        assert_eq!(bytes(&keyed, 384, 256), values + flags + keys + table);
     }
 
     /// A set's planes have the cache's page shape over the set's pages, and its table reads at
@@ -458,7 +498,7 @@ mod tests {
             8,
             PrefixCacheDtype::Float8E4m3Fn,
         ));
-        let set = ScratchPages::meta(Arc::clone(&layout), 12)?;
+        let set = ScratchPages::meta(Arc::clone(&layout), 12, 4)?;
         assert_eq!(set.pages(), 12);
 
         let layer = set.layer(&layout.groups[0], 1)?;
@@ -469,12 +509,44 @@ mod tests {
         assert!(layer.index_keys.is_none());
         assert!(set.layer(&layout.groups[0], 2).is_err());
 
-        let table = set.table(3, 4)?;
-        assert_eq!((table.dims(), table.dtype()), (&[3, 4][..], DType::U32));
-        // Four rows of four pages are more than the set's twelve.
-        assert!(set.table(4, 4).is_err());
-        assert!(ScratchPages::meta(layout, 0).is_err());
+        // A row for every page, as wide as the pooled tables, which are narrower than the set.
+        let table = set.table()?;
+        assert_eq!((table.dims(), table.dtype()), (&[12, 4][..], DType::U32));
+        assert_eq!(
+            ScratchPages::meta(Arc::clone(&layout), 3, 4)?
+                .table()?
+                .dims(),
+            [3, 3]
+        );
+        assert!(ScratchPages::meta(layout, 0, 4).is_err());
         Ok(())
+    }
+
+    /// A paired forward's cache writes copy every layer's planes and flags over the set: the
+    /// figure is the set of 384 BF16 pages of 64 tokens over 48 layers of four heads of 128.
+    #[test]
+    fn the_cache_writes_of_a_paired_forward_copy_every_layer_of_the_set() {
+        let layout = CacheLayout::dense(64, 48, 4, 128, PrefixCacheDtype::BFloat16);
+
+        // Each layer's two planes of 384 pages of 64 KiB, and its two flag planes of 384 bytes,
+        // each copy taking whole blocks of 256 bytes.
+        assert_eq!(in_place(&layout, 384), 48 * (2 * 384 * 65_536 + 2 * 512));
+        assert_eq!(in_place(&layout, 0), 0);
+    }
+
+    /// Row `i` of the set's table names the pages from page `i` on, and a page past the set's
+    /// last names the last: a row whose pages begin at page `i` reads them from column zero.
+    #[test]
+    fn a_table_row_names_the_pages_from_its_own_on() {
+        assert_eq!(
+            table(4, 3),
+            [
+                0, 1, 2, //
+                1, 2, 3, //
+                2, 3, 3, //
+                3, 3, 3,
+            ]
+        );
     }
 
     /// A set of a cache that keeps index keys lends them over its own pages, in the shape the
@@ -485,7 +557,7 @@ mod tests {
         let layout = Arc::new(
             CacheLayout::dense(16, 2, 1, 8, PrefixCacheDtype::BFloat16).with_index_keys(keys)?,
         );
-        let set = ScratchPages::meta(Arc::clone(&layout), 12)?;
+        let set = ScratchPages::meta(Arc::clone(&layout), 12, 4)?;
 
         let layer = set.layer(&layout.groups[0], 1)?;
         let index_keys = layer.index_keys.expect("the layer keeps index keys");

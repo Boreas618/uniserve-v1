@@ -35,12 +35,14 @@ pub(crate) type Keys = std::collections::BTreeSet<(&'static str, String)>;
 impl ModelRunner {
     /// The config of the rank's runner of `model` over a cache of `layout` with `units` units
     /// (step 7): the phases its buckets serve, the deployment's request slots, pages and longest
-    /// sequence, the candidates a scored row reports, the scratch pages of a paired forward, and a
-    /// speculating deployment's drafts and draft pool.
+    /// sequence, the candidates a scored row reports, the scratch page set of its paired
+    /// forwards, and a speculating deployment's drafts and draft pool.
     ///
-    /// A paired forward's row addresses the pages of the largest prefill bucket's tokens; a model
-    /// that keeps a recurrent state has no scratch state to advance and computes no paired
-    /// forward.
+    /// The scratch page set is one set the rows of a paired forward share,
+    /// `ceil(T / page) + R` pages for the `T` tokens and `R` rows of the largest bucket
+    /// (`CausalLmRunner::scratch_pages`); a batch whose rows' contexts need more is not
+    /// compared. A model that keeps a recurrent state has no scratch state to advance and
+    /// computes no paired forward.
     ///
     /// # Errors
     ///
@@ -53,9 +55,8 @@ impl ModelRunner {
         units: u32,
     ) -> Result<CausalLmConfig> {
         let drafts = self.engine_config().speculative.num_draft_tokens;
-        let (_, tokens) = self.buckets.bounds();
         let scratch_pages = if model.state_layers().is_empty() {
-            tokens.div_ceil(PAGE_TOKENS)
+            CausalLmRunner::scratch_pages(&self.buckets, PAGE_TOKENS)
         } else {
             0
         };
@@ -107,8 +108,6 @@ impl ModelRunner {
         member: Option<Member>,
         kernels: &Generation,
     ) -> Result<CausalLmRunner> {
-        let scratch_pages = config.scratch_pages;
-
         let mut runner = {
             let cache = worker::lock(cache);
             let state = state.map(|state| worker::lock(state));
@@ -126,7 +125,6 @@ impl ModelRunner {
             Arc::clone(cache),
             state.map(Arc::clone),
             stream.clone(),
-            scratch_pages,
         ));
 
         // The meta contexts take the split alone: a profile run issues no collective.

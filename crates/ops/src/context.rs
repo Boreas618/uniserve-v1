@@ -72,9 +72,12 @@ pub(crate) struct State {
     /// What takes the graph breaks of a forward execution captures ([`Context::set_breaks`]).
     pub(crate) breaks: Option<Arc<dyn Fn(HostWork) -> Result<()> + Send + Sync>>,
 
-    /// The launch table being recorded, as `(operator, key, module path)` in launch order, or
-    /// `None` while none is.
-    pub(crate) launches: Option<Vec<(&'static str, String, String)>>,
+    /// The launch table being recorded, as `(operator, key, module path, bytes)` in launch
+    /// order, or `None` while none is ([`Context::record_launches`]).
+    pub(crate) launches: Option<Vec<(&'static str, String, String, u64)>>,
+    /// The bytes the allocator had handed out since the reset when the recorded table's last
+    /// launch was made, or its recording began: where the next launch's bytes start.
+    pub(crate) handed: u64,
     /// The paths of the profiler ranges the forward is inside, outermost first. A range adds its
     /// path only while a launch table is being recorded, the table being its one reader.
     pub(crate) paths: Vec<String>,
@@ -161,17 +164,12 @@ impl Context {
         let mut state = self.state();
         state.input_cursor = 0;
         state.input_copies.clear();
+        state.handed = 0;
     }
 
     /// The furthest byte of the region any forward reached.
     pub fn peak(&self) -> u64 {
         self.allocator.peak()
-    }
-
-    /// The most bytes any forward of this context allocated in total: the bytes of everything
-    /// one forward writes into tensors of its own.
-    pub fn allocated_peak(&self) -> u64 {
-        self.allocator.allocated_peak()
     }
 
     /// The furthest byte of the input buffer any forward reached.
@@ -195,17 +193,28 @@ impl Context {
         self.state().input_memory = (!base.is_null()).then_some((base as u64, bytes));
     }
 
-    /// Starts the recording of a launch table: `(operator, key, module path)` per launch, in
-    /// launch order. A table already being recorded is dropped.
+    /// Starts the recording of a launch table: `(operator, key, module path, bytes)` per launch,
+    /// in launch order. A table already being recorded is dropped.
+    ///
+    /// `bytes` is what the context's allocator handed out between the launch before (or the
+    /// start of the recording) and this one: the outputs the forward allocates for the call,
+    /// which an operation takes from the allocator right before it launches, each block
+    /// rounded up to the allocator's alignment. Memory the call writes in place that the
+    /// forward did not allocate for it is not counted. A graph break's entry states zero, and
+    /// what was handed out before it is the next launch's.
     ///
     /// Execution starts and takes a table outside the forward it records, so a profiler range
     /// lies wholly inside or wholly outside the recording.
     pub fn record_launches(&self) {
-        self.state().launches = Some(Vec::new());
+        let handed = self.allocator.allocated();
+        let mut state = self.state();
+
+        state.launches = Some(Vec::new());
+        state.handed = handed;
     }
 
     /// Ends the recording and returns the launch table; empty when none was being recorded.
-    pub fn take_launches(&self) -> Vec<(&'static str, String, String)> {
+    pub fn take_launches(&self) -> Vec<(&'static str, String, String, u64)> {
         self.state().launches.take().unwrap_or_default()
     }
 
@@ -369,6 +378,7 @@ impl State {
             profiler: None,
             breaks: None,
             launches: None,
+            handed: 0,
             paths: Vec::new(),
             input_memory: None,
             input_cursor: 0,

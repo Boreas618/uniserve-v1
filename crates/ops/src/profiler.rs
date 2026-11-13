@@ -115,7 +115,7 @@ mod tests {
         context
             .take_launches()
             .into_iter()
-            .map(|(_, _, path)| path)
+            .map(|(_, _, path, _)| path)
             .collect()
     }
 

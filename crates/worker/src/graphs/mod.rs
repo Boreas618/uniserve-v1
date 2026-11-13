@@ -6,9 +6,9 @@
 //!
 //! - **Profile run.** At load the forward runs under a meta context: it launches nothing and
 //!   yields the bucket's launch table (operator, key and module path of every launch, in launch
-//!   order), the peak of the allocator region and the bytes of its host-to-device copies. The
-//!   keys are what the engine resolves kernels for, and the peaks are what a device's memory is
-//!   divided by.
+//!   order), the peak of the allocator region, the bytes of its host-to-device copies and the
+//!   outputs of the operator that writes the most over it. The keys are what the engine resolves
+//!   kernels for, and the peaks and outputs are what a device's memory is divided by.
 //! - **Capture.** At warm-up the forward runs eagerly once over idle inputs and is then
 //!   captured, with its launch table, its input copies and its output tensors.
 //! - **Replay.** [`Graphs::prepare_inputs`] takes a slot of the input buffer, lets the runner
@@ -72,6 +72,10 @@ const ALIGNMENT: u64 = ops::allocator::ALIGNMENT;
 /// A launch table: `(operator, key, module path)` per launch, in launch order.
 type Table = Vec<(&'static str, String, String)>;
 
+/// A launch table as a context records it (`ops::Context::record_launches`): each launch with
+/// the bytes the forward allocated for its outputs.
+type Recorded = Vec<(&'static str, String, String, u64)>;
+
 /// Input copies: `(offset in a slot's values, device address, bytes)` per copy, in the order the
 /// forward makes them.
 type Copies = Vec<(u64, u64, u64)>;
@@ -126,13 +130,16 @@ struct State {
     update: Update,
     /// The launch table of each profiled bucket.
     profiles: HashMap<Bucket, Table>,
+    /// The outputs of the operator that writes the most in each profiled bucket's forward: the
+    /// bytes of its launches' outputs summed over the forward ([`outputs`]).
+    outputs: HashMap<Bucket, u64>,
     /// The graph of each captured bucket, by the generation it was captured or rebound for.
     graphs: HashMap<(Bucket, u64), Graph>,
     /// The input buffer; made at the first use for graphs that hold no device.
     buffer: Option<InputBuffer>,
-    /// The bucket whose inputs are prepared and the slot that holds them, until the replay or
-    /// the eager forward that issues them.
-    prepared: Option<(Bucket, usize)>,
+    /// The step prepared for a bucket, until the replay, the eager forward or the paired
+    /// forward that issues it.
+    prepared: Option<Prepared>,
     /// The step the next replay or eager forward is, when the executor stated one
     /// ([`Graphs::mark_step`]): its number and its stage.
     step: Option<(u64, &'static str)>,
@@ -144,6 +151,24 @@ struct State {
     /// The kernels the serving forwards launched since the graphs were made: a replay's
     /// captured kernel nodes, an eager forward's launches ([`Graphs::launches`]).
     launches: u64,
+}
+
+/// The step prepared for a bucket ([`Graphs::prepare_inputs`], [`Graphs::unpaired`]).
+enum Prepared {
+    /// The bucket's inputs, in this slot of the input buffer.
+    Inputs(Bucket, usize),
+    /// A paired forward of the bucket that its runner prepared no inputs for, with the reason:
+    /// it runs nothing, and the operator it was to compare is reported uncompared.
+    Unpaired(Bucket, String),
+}
+
+impl Prepared {
+    /// The bucket the step is of.
+    const fn bucket(&self) -> &Bucket {
+        match self {
+            Self::Inputs(bucket, _) | Self::Unpaired(bucket, _) => bucket,
+        }
+    }
 }
 
 /// Where a generation update stands.
@@ -373,16 +398,27 @@ impl Graphs {
     // ---- The profile run ----
 
     /// Runs the forward of every bucket `runner` states, the captured ones and the eager ones
-    /// ([`Runner::eager_buckets`]), under the meta context and keeps each bucket's launch table.
+    /// ([`Runner::eager_buckets`]), under the meta context and keeps each bucket's launch table
+    /// and the outputs of the operator that writes the most in it.
     ///
     /// # Errors
     ///
     /// What a forward refuses.
     pub fn profile_run(&self, runner: &dyn Runner) -> Result<()> {
         for bucket in runner.buckets().into_iter().chain(runner.eager_buckets()) {
-            let (table, _) = self.meta_forward(&self.profile, runner, &bucket)?;
-            self.state.borrow_mut().profiles.insert(bucket, table);
+            self.profile(runner, &bucket)?;
         }
+        Ok(())
+    }
+
+    /// Profiles `bucket`: its forward under the meta profile context, whose launch table and
+    /// largest operator outputs ([`outputs`]) these graphs keep.
+    fn profile(&self, runner: &dyn Runner, bucket: &Bucket) -> Result<()> {
+        let (table, _, outputs) = self.meta_forward(&self.profile, runner, bucket)?;
+
+        let mut state = self.state.borrow_mut();
+        state.profiles.insert(*bucket, table);
+        state.outputs.insert(*bucket, outputs);
         Ok(())
     }
 
@@ -407,14 +443,29 @@ impl Graphs {
         ALIGNMENT + self.inputs.next_multiple_of(ALIGNMENT) + self.profile.peak()
     }
 
-    /// A bound on the bytes of the shadow region a paired forward of a profiled bucket needs
-    /// for the outputs its operators allocate: the new kernel's shadow outputs and the copies of
-    /// the serving kernel's real outputs, each at most everything the forward allocates. An
-    /// operator that writes execution-owned memory in place (a cache page, a state row) is
-    /// shadowed over the scratch memory its runner redirects it to, whose bytes its owner
-    /// states beside this figure.
-    pub fn shadow_peak(&self) -> u64 {
-        2 * self.profile.allocated_peak()
+    /// The bytes of the shadow region the paired forwards of the profiled buckets need: twice
+    /// the outputs of the one operator that writes the most in any profiled forward (the bytes
+    /// its launches' outputs took, summed over the forward), or twice `in_place` when that is
+    /// more.
+    ///
+    /// A paired forward pairs one operator, and the region holds, for each of its calls, the
+    /// new kernel's shadow outputs and a copy of the serving kernel's (`ops::Twins`), so twice
+    /// the operator's outputs. `in_place` is the memory one operator of a paired forward writes
+    /// in place that the forward did not allocate, which the shadow path copies too, twice: a
+    /// runner's scratch pages or its request slots' state (the runner states it), zero for a
+    /// runner whose forwards write none. A paired forward whose operator needs more compares
+    /// nothing ([`Graphs::shadow`]).
+    pub fn shadow_peak(&self, in_place: u64) -> u64 {
+        let outputs = self
+            .state
+            .borrow()
+            .outputs
+            .values()
+            .copied()
+            .max()
+            .unwrap_or(0);
+
+        2 * outputs.max(in_place)
     }
 
     /// The bytes of host values the largest profiled forward copies to the device: the values
@@ -524,8 +575,17 @@ impl Graphs {
             self.meta_forward(&self.preparing, runner, bucket)?;
         }
 
-        self.state.borrow_mut().prepared = Some((*bucket, slot));
+        self.state.borrow_mut().prepared = Some(Prepared::Inputs(*bucket, slot));
         Ok(())
+    }
+
+    /// Prepares, in place of inputs, a paired forward of `bucket` that is not run, for
+    /// `reason`: its runner cannot compute the shadow batch it was given without writing what a
+    /// serving request reads (its rows need more scratch pages than its set holds). The paired
+    /// forward [`Graphs::shadow`] then issues for the bucket runs nothing, and
+    /// [`Graphs::uncompared`] names its operator with the reason.
+    pub fn unpaired(&self, bucket: &Bucket, reason: String) {
+        self.state.borrow_mut().prepared = Some(Prepared::Unpaired(*bucket, reason));
     }
 
     /// Issues the step [`Graphs::prepare_inputs`] prepared for `bucket`: the batched copy of
@@ -694,7 +754,7 @@ impl Graphs {
                 continue;
             };
 
-            let (profiled, _) = self.meta_forward(&self.profile, runner, &bucket)?;
+            let (profiled, _, _) = self.meta_forward(&self.profile, runner, &bucket)?;
             let needed = preparation(&table, &profiled, &serving, &next)?;
             if needed != Preparation::Keep {
                 pending.push((bucket, needed));
@@ -785,18 +845,36 @@ impl Graphs {
     /// are compared within each call's tolerance, and the elements compared are returned.
     ///
     /// The runner prepares the inputs of a paired forward so that it writes no state a serving
-    /// request reads.
+    /// request reads. A paired forward it prepared none for ([`Graphs::unpaired`]) runs
+    /// nothing and compares no element: the operator is named in [`Graphs::uncompared`] with
+    /// the runner's reason. So is one whose outputs exceed the shadow region
+    /// ([`Graphs::shadow_peak`]).
     ///
     /// # Errors
     ///
-    /// When no generation is being prepared, no shadow region was given, these graphs hold no
-    /// device, the forward fails, or a pair differs beyond its tolerance.
+    /// When no generation is being prepared, no step was prepared for `bucket`, no shadow region
+    /// was given, these graphs hold no device, the forward fails, or a pair differs beyond its
+    /// tolerance.
     pub fn shadow(
         &self,
         runner: &dyn Runner,
         bucket: &Bucket,
         operator: &'static str,
     ) -> Result<u64> {
+        if !matches!(self.state.borrow().update, Update::Prepared { .. }) {
+            return Err(Error::State("no generation is being prepared"));
+        }
+        let slot = match self.take_step(bucket)? {
+            Prepared::Inputs(_, slot) => slot,
+            Prepared::Unpaired(_, reason) => {
+                self.state
+                    .borrow_mut()
+                    .uncompared
+                    .push(format!("`{operator}` in bucket {bucket}: {reason}"));
+                return Ok(0);
+            }
+        };
+
         let cuda = self.cuda()?;
         let (serving, next, pairing) = {
             let state = self.state.borrow();
@@ -813,7 +891,6 @@ impl Graphs {
             (serving, Arc::clone(next), pairing)
         };
 
-        let slot = self.take_prepared(bucket)?;
         self.with_buffer(|buffer| buffer.issue(slot, &cuda.stream, cuda.inputs, self.inputs, &[]))?;
         self.lend_values(&cuda.launching, slot)?;
 
@@ -979,25 +1056,26 @@ impl Graphs {
     }
 
     /// Runs `bucket`'s forward under the meta context `context` from an empty allocator, and
-    /// returns its launch table and its input copies.
+    /// returns its launch table, its input copies and the outputs of the operator that writes
+    /// the most in it ([`outputs`]).
     fn meta_forward(
         &self,
         context: &Context,
         runner: &dyn Runner,
         bucket: &Bucket,
-    ) -> Result<(Table, Copies)> {
+    ) -> Result<(Table, Copies, u64)> {
         context.reset();
         context.record_launches();
 
-        let outputs = {
+        let forward = {
             let _guard = context.enter();
             runner.forward(bucket)
         };
 
-        let table = context.take_launches();
+        let (table, outputs) = outputs(context.take_launches());
         let copies = context.take_input_copies();
-        outputs?;
-        Ok((table, copies))
+        forward?;
+        Ok((table, copies, outputs))
     }
 
     /// Runs `operation` on the input buffer, making the host ring of graphs that hold no device
@@ -1049,10 +1127,21 @@ impl Graphs {
 
     /// The slot holding the inputs prepared for `bucket`, which the caller now issues.
     fn take_prepared(&self, bucket: &Bucket) -> Result<usize> {
+        match self.take_step(bucket)? {
+            Prepared::Inputs(_, slot) => Ok(slot),
+            Prepared::Unpaired(..) => Err(Error::Invariant(format!(
+                "bucket {bucket}'s step is a paired forward its runner prepared no inputs for"
+            ))),
+        }
+    }
+
+    /// The step prepared for `bucket`, which the caller now issues.
+    fn take_step(&self, bucket: &Bucket) -> Result<Prepared> {
         match self.state.borrow_mut().prepared.take() {
-            Some((prepared, slot)) if prepared == *bucket => Ok(slot),
-            Some((prepared, _)) => Err(Error::Invariant(format!(
-                "the inputs of bucket {prepared} are prepared, and bucket {bucket} was issued"
+            Some(step) if step.bucket() == bucket => Ok(step),
+            Some(step) => Err(Error::Invariant(format!(
+                "a step of bucket {} is prepared, and bucket {bucket} was issued",
+                step.bucket()
             ))),
             None => Err(Error::State("no inputs are prepared for the step")),
         }
@@ -1074,15 +1163,14 @@ impl Graphs {
         // A bucket captured without a profile run is profiled here: its keys and peaks are
         // then known, and the capture is checked against them like any other.
         if !self.state.borrow().profiles.contains_key(bucket) {
-            let (table, _) = self.meta_forward(&self.profile, runner, bucket)?;
-            self.state.borrow_mut().profiles.insert(*bucket, table);
+            self.profile(runner, bucket)?;
         }
 
         let slot = self.fill_slot(|columns| runner.idle_inputs(bucket, columns))?;
 
         let Some(cuda) = &self.device else {
             self.lend_values(&self.preparing, slot)?;
-            let (table, copies) = self.meta_forward(&self.preparing, runner, bucket)?;
+            let (table, copies, _) = self.meta_forward(&self.preparing, runner, bucket)?;
             self.check_profile(bucket, &table)?;
 
             return Ok(Graph {
@@ -1128,7 +1216,7 @@ impl Graphs {
         // lists follow from the forward's shapes alone, so they are one list or the forward
         // cannot be replayed.
         self.lend_values(&self.preparing, slot)?;
-        let (_, prepared) = self.meta_forward(&self.preparing, runner, bucket)?;
+        let (_, prepared, _) = self.meta_forward(&self.preparing, runner, bucket)?;
         if prepared != graph.copies {
             return Err(Error::Invariant(format!(
                 "the forward of bucket {bucket} makes {} host-to-device copies when it is \
@@ -1195,7 +1283,7 @@ impl Graphs {
         };
         cuda.launching.set_profiler(None);
 
-        let table = cuda.launching.take_launches();
+        let (table, _) = outputs(cuda.launching.take_launches());
         let copies = cuda.launching.take_input_copies();
 
         // The slot is free once the stream has passed the copy of the idle inputs.
@@ -1279,6 +1367,7 @@ impl State {
             serving,
             update: Update::Steady,
             profiles: HashMap::new(),
+            outputs: HashMap::new(),
             graphs: HashMap::new(),
             buffer,
             prepared: None,
@@ -1329,6 +1418,20 @@ fn served<'a>(
         .filter(|((held, generation), _)| held == bucket && *generation <= serving)
         .max_by_key(|((_, generation), _)| *generation)
         .map(|((_, generation), graph)| (*generation, graph))
+}
+
+/// The launch table of the forward `recorded` states, and the outputs of the operator that
+/// writes the most in it: the bytes of each operator's launches summed over the forward, the
+/// largest sum. A graph break writes nothing.
+fn outputs(recorded: Recorded) -> (Table, u64) {
+    let mut written: HashMap<&'static str, u64> = HashMap::new();
+    let mut table = Vec::with_capacity(recorded.len());
+
+    for (operator, key, path, bytes) in recorded {
+        *written.entry(operator).or_default() += bytes;
+        table.push((operator, key, path));
+    }
+    (table, written.into_values().max().unwrap_or(0))
 }
 
 /// Whether two launch tables hold the same launches: the same operators with the same keys in

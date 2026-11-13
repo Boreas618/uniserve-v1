@@ -92,9 +92,18 @@
 //! Before a generation switch the executor computes a served batch again as a paired forward
 //! (`Graphs::shadow`), whose inputs [`CausalLmRunner::prepare_shadow_inputs`] writes. It is the
 //! same forward over other pages: the rows write and read the scratch page set the cache lends
-//! ([`CausalLmRunner::set_scratch`]) in its own numbering, the commit table is inert and no
-//! slot is started, so nothing a serving request reads is written. A model that keeps a
-//! recurrent state has no scratch state to advance, and its paired forwards are refused.
+//! ([`CausalLmRunner::set_scratch`]), the commit table is inert and no slot is started, so
+//! nothing a serving request reads is written. A model that keeps a recurrent state has no
+//! scratch state to advance, and its paired forwards are refused.
+//!
+//! The scratch page set is one set the rows of a batch share: `ceil(T / page) + R` pages for
+//! the `T` tokens and `R` rows of the runner's largest bucket
+//! ([`CausalLmRunner::scratch_pages`]). It hands its pages to the rows in order, each row the
+//! pages of the context it reads, its history copied in before the forward
+//! ([`PageWork::BeforeShadow`]). A batch whose rows' contexts need no more than `T` tokens
+//! always fits, since a row wastes less than one page. A batch whose rows need more pages than
+//! the set holds has no paired forward: it is reported uncompared (`Graphs::unpaired`), and the
+//! batch itself was served as it was.
 //!
 //! ## Expert unions
 //!
@@ -132,6 +141,7 @@ pub mod wiring;
 mod tests;
 
 use std::cell::Cell;
+use std::ops::Range;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -151,6 +161,7 @@ use self::speculation::{DraftPool, DraftTable, Kept, Speculation};
 use crate::buckets::{Bucket, Buckets};
 use crate::graphs::Graphs;
 use crate::memory::buffers::BufferMemory;
+use crate::memory::cache::{CacheLayout, scratch};
 use crate::memory::state::layer_fields;
 use crate::memory::tables::{BlockCopy, BlockTables, Change};
 use crate::runner::Runner;
@@ -182,8 +193,9 @@ pub struct CausalLmConfig {
     /// The most likely tokens a scored row reports beside its own: the deployment's
     /// `max_logprobs`, and zero to report none.
     pub candidates: u32,
-    /// The pages each row of a paired forward addresses in the scratch page set, and zero for
-    /// a runner that computes no paired forward. A row whose tokens lie past them is refused.
+    /// The pages of the scratch page set a paired forward's rows share
+    /// ([`CausalLmRunner::scratch_pages`]), and zero for a runner that computes no paired
+    /// forward. A batch whose rows' contexts need more is not compared.
     pub scratch_pages: u32,
     /// The drafts a verification holds at most (`speculative_config.num_draft_tokens`), and
     /// zero for a runner that speculates nothing. A runner that states some serves its decode
@@ -220,8 +232,9 @@ pub enum PageWork<'a> {
     /// hook sets the flag when it does, and issues nothing.
     Holds(u8, &'a Cell<bool>),
     /// What a paired forward of the batch reads: the pages its rows have cached are copied into
-    /// the rows' scratch pages.
-    BeforeShadow(&'a Batch),
+    /// the rows' scratch pages, row `r`'s from the first page of the set it takes, the slice's
+    /// entry `r` (`columns::scratch_spans`).
+    BeforeShadow(&'a Batch, &'a [u32]),
 }
 
 /// The buffers of a recurrent state, as `nn::RecurrentState` lays them out: one entry per
@@ -285,6 +298,41 @@ impl CausalLmRunner {
     /// [`Error::Invalid`] for a config with no bucket.
     pub fn input_bytes(config: &CausalLmConfig) -> Result<u64> {
         Ok(stated(config)?.1.bytes())
+    }
+
+    /// The pages of the scratch page set paired forwards of a runner of `buckets` compute over,
+    /// for pages of `page_size` tokens: `ceil(T / page_size) + R` for the `T` tokens and `R`
+    /// rows of the largest bucket (`Buckets::bounds`).
+    ///
+    /// The rows of a batch share the set and take its pages in order, each the pages of the
+    /// context it reads, and a row wastes less than one page, so every batch whose rows' contexts
+    /// sum to at most `T` tokens fits: a prompt's chunks with no history always do.
+    pub fn scratch_pages(buckets: &Buckets, page_size: u32) -> u32 {
+        let (rows, tokens) = buckets.bounds();
+
+        tokens.div_ceil(page_size.max(1)).saturating_add(rows)
+    }
+
+    /// The bytes one operator of a paired forward of a runner of `model` under `config`, over
+    /// a cache of `layout`, may write in place that the forward did not allocate, which the
+    /// shadow path copies beside the operator's outputs (`Graphs::shadow_peak`): the scratch
+    /// page set's planes a cache write writes (`memory::cache::scratch::in_place`), the request
+    /// slots' state the commit writes, or the outputs a runner that speculates keeps, whichever
+    /// is largest, since each is written by other operators.
+    ///
+    /// # Errors
+    ///
+    /// As [`CausalLmRunner::slot_bytes`] and [`CausalLmRunner::kept_bytes`].
+    pub fn in_place_bytes(
+        config: &CausalLmConfig,
+        model: &dyn TextModel,
+        layout: &CacheLayout,
+    ) -> Result<u64> {
+        let pages = scratch::in_place(layout, config.scratch_pages);
+
+        Ok(pages
+            .max(Self::slot_bytes(config, model)?)
+            .max(Self::kept_bytes(config, model)?))
     }
 
     /// The bytes of device memory a runner of `model` that speculates under `config` keeps its
@@ -690,15 +738,17 @@ impl CausalLmRunner {
     }
 
     /// Lends the scratch page set paired forwards compute over: one `KvCache` per attention
-    /// group, in the order and with the layers of the runner's cache, whose `block_tables` is
-    /// the set's own page table, `[rows, scratch_pages]` U32 for at least the rows of the
-    /// runner's largest bucket, row `r` naming the pages `r · scratch_pages ..
-    /// (r + 1) · scratch_pages` of the set's planes.
+    /// group, in the order and with the layers of the runner's cache, over the config's
+    /// `scratch_pages` pages, whose `block_tables` is the set's own page table: `[pages, width]`
+    /// U32, row `i` naming the pages `i, i + 1, …` of the set's planes and the set's last page
+    /// where they run past its end, `width` the set's pages or, when fewer, the width of the
+    /// group's pooled table, which bounds the pages any served row reads. A row of a paired
+    /// forward whose pages begin at page `i` gathers row `i`.
     ///
     /// The caller keeps the set's memory as it keeps the cache's. Before each paired forward
-    /// the pages the batch's rows read are copied, on the runner's stream, into the rows'
-    /// scratch pages (page `k` of row `r`'s request into page `r · scratch_pages + k`), so the
-    /// forward attends over the context the served batch attended over: the runner asks the
+    /// the pages the batch's rows read are copied, on the runner's stream, into the pages the
+    /// set hands each row (page `k` of row `r`'s request into the `k`-th page row `r` takes), so
+    /// the forward attends over the context the served batch attended over: the runner asks the
     /// page-work hook for it ([`PageWork::BeforeShadow`]).
     ///
     /// # Errors
@@ -707,26 +757,24 @@ impl CausalLmRunner {
     /// cache's groups and layers over the config's page size and scratch pages.
     pub fn set_scratch(&mut self, scratch: Vec<KvCache>) -> Result<()> {
         let pages = self.config.scratch_pages as usize;
-        let rows = self.scratch_rows() as usize;
         let same_groups = scratch.len() == self.cache.len()
             && scratch
                 .iter()
                 .zip(&self.cache)
                 .all(|(lent, group)| lent.layers.len() == group.layers.len());
 
-        let tabled = scratch.iter().all(|group| {
-            let table = &group.block_tables;
+        let tabled = scratch.iter().zip(&self.cache).all(|(lent, group)| {
+            let table = &lent.block_tables;
+            let width = pages.min(group.block_tables.dims().get(1).copied().unwrap_or(0));
 
-            table.rank() == 2
-                && table.dims()[0] >= rows
-                && table.dims()[1] == pages
+            table.dims() == [pages, width]
                 && table.dtype() == DType::U32
-                && group.page_size == self.config.page_size
+                && lent.page_size == self.config.page_size
         });
         if pages == 0 || !same_groups || !tabled {
             return Err(Error::Invalid(format!(
                 "a scratch page set of {} groups for a cache of {}, whose tables are not u32 \
-                 rows of {pages} pages for the {rows} rows of the largest bucket",
+                 rows of the {pages} pages of the set",
                 scratch.len(),
                 self.cache.len()
             )));
@@ -734,12 +782,6 @@ impl CausalLmRunner {
 
         self.scratch = scratch;
         Ok(())
-    }
-
-    /// The rows of a paired forward: those of the largest bucket whose rows are sequences. A
-    /// verification's token rows share their request's pages and have no paired forward.
-    pub(crate) fn scratch_rows(&self) -> u32 {
-        self.config.buckets.bounds().0
     }
 
     /// The runner's config.
@@ -913,33 +955,35 @@ impl CausalLmRunner {
     }
 
     /// Prepares the inputs of a step of `batch` in `bucket` over `tables`: its padded columns,
-    /// with `mapping` the cache slot each token writes and `paired` for a paired forward
-    /// (`columns::fill`), and the host values the bucket's forward computes.
+    /// with `mapping` the cache slot each token writes and, for a paired forward, `scratch` the
+    /// scratch pages each row takes (`columns::fill`), and the host values the bucket's forward
+    /// computes.
     fn fill(
         &mut self,
         batch: &Batch,
         bucket: &Bucket,
         tables: &BlockTables,
         mapping: &[u32],
-        paired: bool,
+        scratch: Option<&[Range<u32>]>,
     ) -> Result<()> {
-        self.stage(batch, bucket, tables, mapping, paired)?;
+        self.stage(batch, bucket, tables, mapping, scratch)?;
         self.prepare_staged(bucket)
     }
 
     /// Pads `batch`'s columns to `bucket` in the runner's own bytes of the input block, with
-    /// `mapping` the cache slot each of its tokens writes and `paired` for a paired forward,
-    /// and returns the ban masks of the step's sampling rows (`sampler::adjustments`), empty
-    /// for a step that bans nothing. The columns of a bucket are those of every capacity class
-    /// of it. A runner that speculates also pads the columns of the drafter's forward behind
-    /// the bucket, which lie in the same block, with each row's draft pages from `tables`.
+    /// `mapping` the cache slot each of its tokens writes and `scratch` the scratch pages each
+    /// row of a paired forward takes, and returns the ban masks of the step's sampling rows
+    /// (`sampler::adjustments`), empty for a step that bans nothing. The columns of a bucket
+    /// are those of every capacity class of it. A runner that speculates also pads the columns
+    /// of the drafter's forward behind the bucket, which lie in the same block, with each row's
+    /// draft pages from `tables`.
     fn stage(
         &mut self,
         batch: &Batch,
         bucket: &Bucket,
         tables: &BlockTables,
         mapping: &[u32],
-        paired: bool,
+        scratch: Option<&[Range<u32>]>,
     ) -> Result<Vec<u32>> {
         self.staged.resize(self.layout.bytes() as usize, 0);
         let vocabulary = self.model.vocabulary();
@@ -974,7 +1018,7 @@ impl CausalLmRunner {
                 &batch.columns,
                 bucket,
                 mapping,
-                paired,
+                scratch,
                 &mut self.staged,
             )?;
             let columns = &batch.columns;
@@ -1105,7 +1149,7 @@ impl CausalLmRunner {
 
         // A refused call writes nothing and fails alone; the others are served.
         let (mapping, refused) = self.slot_mapping(batch, tables)?;
-        let masks = self.stage(batch, &base, tables, &mapping, false)?;
+        let masks = self.stage(batch, &base, tables, &mapping, None)?;
         let images = self.image_copies(batch, tables)?;
 
         // The slot state's writes, ahead of the replay that reads them.
@@ -1593,7 +1637,7 @@ impl Runner for CausalLmRunner {
             &idle,
             &target,
             &[],
-            false,
+            None,
             columns,
         )?;
 
@@ -1630,7 +1674,7 @@ impl Runner for CausalLmRunner {
         }
         let images = self.image_copies(batch, tables)?;
 
-        self.fill(batch, &bucket, tables, &mapping, false)?;
+        self.fill(batch, &bucket, tables, &mapping, None)?;
         self.place_images(batch, &images)?;
         Ok(bucket)
     }
@@ -1638,19 +1682,23 @@ impl Runner for CausalLmRunner {
     /// Prepares the inputs of a paired forward of `batch`, a batch the runner served, and
     /// returns the bucket the executor passes to `Graphs::shadow`.
     ///
-    /// The columns are the batch's own, padded as a serving step's, except that every token
-    /// writes its row's scratch pages at its cache position, every row gathers its own row of
-    /// the scratch set's page table, and the commit table is inert (`columns`). No slot is
-    /// started and none of the batch's own page work is issued: the forward reads the slots'
-    /// state as it stands and writes none of it.
+    /// The scratch page set hands each row the pages of the context it reads, in row order
+    /// (`columns::scratch_spans`). The columns are the batch's own, padded as a serving step's,
+    /// except that every token writes its row's scratch pages at its cache position, every row
+    /// gathers the row of the set's page table that begins at its first page, and the commit
+    /// table is inert (`columns`). No slot is started and none of the batch's own page work is
+    /// issued: the forward reads the slots' state as it stands and writes none of it.
+    ///
+    /// A batch whose rows need more pages than the set holds prepares nothing: its graphs are
+    /// told it has no paired forward (`Graphs::unpaired`), and each paired forward the executor
+    /// then asks of the bucket reports its operator uncompared.
     ///
     /// # Errors
     ///
     /// As [`Runner::prepare_inputs`]; [`Error::Unsupported`] for a model that keeps a
     /// recurrent state, which has no scratch state to advance, for a member of an expert
     /// union, whose exchange launches wait for the other members', for a verification, and
-    /// for a runner that was lent no scratch page set; [`Error::Invalid`] for a row whose
-    /// tokens lie past its scratch pages.
+    /// for a runner that was lent no scratch page set.
     fn prepare_shadow_inputs(&mut self, batch: &Batch, tables: &BlockTables) -> Result<Bucket> {
         if self.union.is_some() {
             return Err(Error::Unsupported(
@@ -1688,21 +1736,39 @@ impl Runner for CausalLmRunner {
         }
 
         let rows = &batch.columns.rows;
-        let scratch = columns::scratch_column(
+        let spans = columns::scratch_spans(rows, self.config.page_size)?;
+        let needed = spans.last().map_or(0, |span| span.end);
+        if needed > self.config.scratch_pages {
+            self.paired.set(false);
+            self.graphs.unpaired(
+                &bucket,
+                format!(
+                    "batch {}: its {} rows' contexts take {needed} scratch pages of {} tokens and \
+                     the scratch page set holds {}",
+                    batch.id.0,
+                    spans.len(),
+                    self.config.page_size,
+                    self.config.scratch_pages
+                ),
+            );
+            return Ok(bucket);
+        }
+
+        let mapping = columns::scratch_column(
             &rows.cache_positions,
             &rows.query_offsets,
             bucket.tokens as usize,
-            self.config.scratch_pages,
+            &spans,
             self.config.page_size,
         )?;
-
-        self.fill(batch, &bucket, tables, &scratch, true)?;
+        self.fill(batch, &bucket, tables, &mapping, Some(&spans))?;
         // No row an earlier batch's image marked stays marked.
         self.place_images(batch, &[])?;
 
         // The rows' cached history reaches their scratch pages ahead of the forward.
+        let first: Vec<u32> = spans.iter().map(|span| span.start).collect();
         if let Some(hook) = self.page_work.as_mut() {
-            hook(PageWork::BeforeShadow(batch))?;
+            hook(PageWork::BeforeShadow(batch, &first))?;
         }
         self.paired.set(true);
         Ok(bucket)

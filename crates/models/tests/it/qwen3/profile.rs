@@ -84,7 +84,7 @@ fn keys(context: &ops::Context) -> Keys {
     context
         .take_launches()
         .into_iter()
-        .map(|(operator, key, _)| {
+        .map(|(operator, key, ..)| {
             assert!(!operator.is_empty(), "a launch of no operator: {key}");
             assert!(!key.is_empty(), "{operator} states no key");
             assert!(

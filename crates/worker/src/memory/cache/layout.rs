@@ -251,13 +251,6 @@ impl CacheLayout {
             .map_or(0, |group| group.index_bytes(group.block_size))
     }
 
-    /// Device bytes one cell takes of the fields a forward reads: its key and value planes,
-    /// their flags and scales, and its index keys. A unit holds one per column, beside its
-    /// state planes.
-    pub(crate) fn cell_bytes(&self) -> u64 {
-        cell_bytes(self.plane_bytes, self.quantized, self.index_bytes())
-    }
-
     /// The shape of the index keys that `pages` pages of `tokens` tokens of one of `group`'s
     /// layers lend, `[pages, tokens / ratio, width]` in the group's compute type
     /// ([`nn::KvPlanes::index_keys`]); `None` for a group that keeps none.

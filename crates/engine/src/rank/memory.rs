@@ -519,12 +519,12 @@ pub(crate) fn plane_segments(
     Ok((segments, stated))
 }
 
-/// The bytes of the scratch pages a runner of `config` writes its paired forwards' keys and
-/// values into, over a cache of `layout`: `scratch_pages` pages of one unit for each row of the
-/// largest bucket (step 13), which the scratch pool holds beside the runner's shadow region.
-pub(crate) fn scratch_bytes(config: &CausalLmConfig, layout: &CacheLayout) -> u64 {
-    let rows = config.buckets.bounds().0;
-    u64::from(rows) * u64::from(config.scratch_pages) * layout.unit_bytes
+/// The bytes of the scratch page set a runner of `config` writes its paired forwards' keys and
+/// values into, over a cache of `cache` (step 13): its `scratch_pages` pages, which the rows of
+/// a batch share (`CausalLmRunner::scratch_pages`), and their page table, which the scratch pool
+/// holds beside the runner's shadow region. Zero for a runner that computes no paired forward.
+pub(crate) fn scratch_bytes(config: &CausalLmConfig, cache: &KvCacheConfig) -> u64 {
+    worker::memory::cache::scratch::bytes(&cache.layout, config.scratch_pages, cache.width)
 }
 
 /// The size and alignment unit of the exportable allocations of `device`, which a pool's mapping

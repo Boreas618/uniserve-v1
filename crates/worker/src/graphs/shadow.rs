@@ -111,15 +111,19 @@ impl Shadow {
 
     /// Compares the pairs of the paired forward `pairing` routed on `stream`, and returns the
     /// elements compared. A pair whose two outputs have other sizes cannot be compared: it is
-    /// named in `uncompared` and skipped.
+    /// named in `uncompared` and skipped. A forward whose operator's outputs exceed the region
+    /// compares nothing: the operator is named in `uncompared`, and the batch has no evidence
+    /// for it. Its calls whose shadow outputs had no room launched the new kernel over the
+    /// forward's own outputs, which the serving kernel then wrote again (`ops::Twins`), so the
+    /// forward still wrote nothing a serving request reads.
     ///
     /// The copies to the host are issued behind the forward and waited for on their own event.
     ///
     /// # Errors
     ///
-    /// When the region could not hold the forward's shadow outputs, when a pair differs beyond
-    /// its call's tolerance (the error names how many elements, the widest and the bound), or
-    /// when the driver refuses a copy or the wait.
+    /// When a call's outputs could not be shadowed for another reason than the region's size,
+    /// when a pair differs beyond its call's tolerance (the error names how many elements, the
+    /// widest and the bound), or when the driver refuses a copy or the wait.
     pub(crate) fn compare(
         &mut self,
         pairing: &Pairing,
@@ -128,11 +132,23 @@ impl Shadow {
     ) -> Result<u64> {
         let calls = std::mem::take(&mut *lock(&pairing.calls));
         let outputs = lock(&self.outputs);
-        if let Some(failure) = outputs.failure() {
-            return Err(Error::Invariant(format!(
-                "the shadow region could not hold the paired forward of `{}`: {failure}",
-                pairing.operator
-            )));
+        match outputs.failure() {
+            Some(failure @ ops::Error::Twins { .. }) => {
+                uncompared.push(format!(
+                    "`{}`: its outputs in this batch exceed the shadow region of {} bytes: \
+                     {failure}",
+                    pairing.operator,
+                    outputs.capacity()
+                ));
+                return Ok(0);
+            }
+            Some(failure) => {
+                return Err(Error::Invariant(format!(
+                    "the paired forward of `{}` could not shadow a call's outputs: {failure}",
+                    pairing.operator
+                )));
+            }
+            None => {}
         }
 
         // Each comparable pair: its element type, its element count, its offset in the host

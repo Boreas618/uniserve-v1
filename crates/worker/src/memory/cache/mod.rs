@@ -854,15 +854,11 @@ impl KvCacheMemory {
         self.planes.release_segments(first, owner)
     }
 
-    /// The pages a scratch set of `bytes` of the device's scratch pool holds
-    /// ([`scratch::pages_within`]).
-    pub fn scratch_pages_within(&self, bytes: u64) -> u32 {
-        u32::try_from(scratch::pages_within(&self.config.layout, bytes)).unwrap_or(u32::MAX)
-    }
-
-    /// Opens the scratch page set of shadow forwards, `pages` pages: taken from the scratch
-    /// pool of `allocator` and prepared on `stream` for a cache on a device, and with `None`
-    /// a set of meta tensors for a cache that holds none.
+    /// Opens the scratch page set of shadow forwards, `pages` pages, whose table rows are as
+    /// wide as the set or the cache's pooled tables, whichever is narrower: taken from the
+    /// scratch pool of `allocator` and prepared on `stream` for a cache on a device
+    /// ([`scratch::bytes`] of them), and with `None` a set of meta tensors for a cache that
+    /// holds none.
     ///
     /// # Errors
     ///
@@ -884,9 +880,12 @@ impl KvCacheMemory {
         }
 
         let layout = Arc::clone(&self.config.layout);
+        let width = self.config.width;
         self.scratch = Some(match device {
-            Some((allocator, stream)) => ScratchPages::open(layout, pages, allocator, stream)?,
-            None => ScratchPages::meta(layout, pages)?,
+            Some((allocator, stream)) => {
+                ScratchPages::open(layout, pages, width, allocator, stream)?
+            }
+            None => ScratchPages::meta(layout, pages, width)?,
         });
         Ok(())
     }
@@ -898,7 +897,7 @@ impl KvCacheMemory {
         ))
     }
 
-    /// The pages the scratch set holds over all of a shadow forward's rows; zero before it is
+    /// The pages the scratch set holds, which a shadow forward's rows share; zero before it is
     /// opened.
     pub fn scratch_capacity(&self) -> u32 {
         self.scratch.as_ref().map_or(0, ScratchPages::pages)
@@ -919,58 +918,58 @@ impl KvCacheMemory {
             .collect()
     }
 
-    /// The scratch set's page table for a shadow forward of `rows` rows of `pages` pages each,
-    /// `[rows, pages]` U32, for every attention group: row `r` names the scratch pages
-    /// `r · pages .. (r + 1) · pages`, which the runner numbers the row's slots in.
+    /// The scratch set's page table, `[pages, width]` U32, for every attention group: row `i`
+    /// names the set's pages from page `i` on, so a row of a shadow forward whose pages begin at
+    /// page `i` gathers row `i`.
     ///
     /// # Errors
     ///
-    /// A cache whose scratch pages are not open, or rows that need more pages than the set
-    /// holds.
-    pub fn scratch_table(&self, rows: u32, pages: u32) -> Result<Tensor> {
-        self.scratch()?.table(rows, pages)
+    /// A cache whose scratch pages are not open.
+    pub fn scratch_table(&self) -> Result<Tensor> {
+        self.scratch()?.table()
     }
 
     /// Copies what a batch's rows have cached in attention group `group` into their scratch
-    /// pages on `stream`, before a shadow forward of `pages` pages a row: `slots` are the rows'
-    /// request slots (`nn::NO_SLOT` for a padding row) and `lengths` the keys each row reads. A
-    /// row of no keys, or a padding row, copies nothing.
+    /// pages on `stream`, before a shadow forward: `slots` are the rows' request slots
+    /// (`nn::NO_SLOT` for a padding row), `lengths` the keys each row has cached and `first`
+    /// the first scratch page the set hands each row. A row of no keys, or a padding row, copies
+    /// nothing.
     ///
     /// # Errors
     ///
     /// A cache that holds no device or whose scratch pages are not open; a row whose slot
-    /// holds no entry of the group, or whose keys need more than `pages` pages.
+    /// holds no entry of the group, whose keys need more pages than its slot's table names, or
+    /// whose pages lie past the set's.
     pub fn copy_history(
         &self,
         group: usize,
         slots: &[u32],
         lengths: &[u32],
-        pages: u32,
+        first: &[u32],
         stream: &Stream,
     ) -> Result<()> {
         let layout = self.attention(group)?;
         let scratch = self.scratch()?;
-        if slots.len() != lengths.len() {
+        if slots.len() != lengths.len() || slots.len() != first.len() {
             return Err(Error::Invalid(format!(
-                "a shadow forward names {} slots and {} lengths",
+                "a shadow forward names {} slots, {} lengths and {} first pages",
                 slots.len(),
-                lengths.len()
+                lengths.len(),
+                first.len()
             )));
         }
 
         let table = self.tables.host_table(group)?;
         let width = self.tables.width() as usize;
         let mut history = Vec::with_capacity(slots.len());
-        for (slot, length) in slots.iter().zip(lengths) {
+        for ((slot, length), first) in slots.iter().zip(lengths).zip(first) {
             if *slot == nn::NO_SLOT || *length == 0 {
-                history.push(Vec::new());
                 continue;
             }
             let held = length.div_ceil(layout.block_size) as usize;
-            if held > pages as usize || held > width {
+            if held > width {
                 return Err(Error::Invalid(format!(
-                    "a row of {length} keys needs {held} pages of a shadow forward of {pages} \
-                     pages a row"
+                    "a row of {length} keys needs {held} pages of a table of {width}"
                 )));
             }
             let row = self.tables.row(*slot)? as usize;
@@ -980,10 +979,10 @@ impl KvCacheMemory {
                     "request slot {slot} holds no entry of cache group {group}"
                 )));
             }
-            history.push(units.to_vec());
+            history.push((*first, units.to_vec()));
         }
 
-        scratch.copy_history(&self.planes, layout, &history, pages, stream)
+        scratch.copy_history(&self.planes, layout, &history, stream)
     }
 
     /// The state group's checkpoint planes, one tensor per field run of a state page:
@@ -1302,8 +1301,10 @@ mod tests {
         let planes = cache.scratch_planes(1)?;
         assert_eq!(planes.len(), 2);
         assert_eq!(planes[0].key.dims(), [12, 4, 1, 4]);
-        assert_eq!(cache.scratch_table(3, 4)?.dims(), [3, 4]);
-        assert!(cache.scratch_table(4, 4).is_err());
+
+        // A table row for every page of the set, as wide as the set or the pooled tables.
+        let width = cache.config().width.min(12) as usize;
+        assert_eq!(cache.scratch_table()?.dims(), [12, width]);
         Ok(())
     }
 

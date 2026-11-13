@@ -839,7 +839,7 @@ impl ModelRunner {
                 *id,
                 Peaks {
                     graph: graphs.peak(),
-                    shadow: graphs.shadow_peak(),
+                    shadow: graphs.shadow_peak(0),
                     inputs: graphs.input_peak(),
                 },
             ));

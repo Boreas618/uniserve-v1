@@ -53,8 +53,6 @@ struct Blocks {
     peak: u64,
     /// The bytes of every block handed out since the reset, freed or not.
     allocated: u64,
-    /// The largest `allocated` reached under any reset.
-    allocated_peak: u64,
     /// `(bytes, offset)` of every free block, so the first entry at or above a size is the
     /// smallest block that holds it at the lowest address.
     by_size: BTreeSet<(u64, u64)>,
@@ -206,11 +204,11 @@ impl Allocator {
         self.lock().peak
     }
 
-    /// The most bytes any forward was handed in total between two resets, every block counted
-    /// whether or not it was freed and given out again: the bytes of everything a forward
-    /// writes, where [`Allocator::peak`] is what it holds at once.
-    pub fn allocated_peak(&self) -> u64 {
-        self.lock().allocated_peak
+    /// The bytes handed out since the reset, every block counted whether or not it was freed
+    /// and given out again: what a forward has written into tensors of its own so far, where
+    /// [`Allocator::peak`] is what a forward holds at once.
+    pub fn allocated(&self) -> u64 {
+        self.lock().allocated
     }
 
     /// The bytes of the region below which blocks are in use or free: zero when every tensor
@@ -232,7 +230,6 @@ impl Blocks {
     /// Counts a block of `bytes` handed out.
     fn count(&mut self, bytes: u64) {
         self.allocated += bytes;
-        self.allocated_peak = self.allocated_peak.max(self.allocated);
     }
 
     fn insert(&mut self, offset: u64, bytes: u64) {
@@ -279,13 +276,14 @@ mod tests {
         // 1000, 300, 512, 4096 and 100 bytes, each rounded up to 256: reused blocks count
         // again, so the total is above what the forward held at once.
         let handed = 1024 + 512 + 512 + 4096 + 256;
-        assert_eq!(allocator.allocated_peak(), handed);
+        assert_eq!(allocator.allocated(), handed);
         assert!(allocator.peak() < handed);
 
-        // A smaller forward after a reset leaves the largest total standing.
+        // A reset starts the count of the next forward.
         allocator.reset();
+        assert_eq!(allocator.allocated(), 0);
         allocator.allocate(100).unwrap();
-        assert_eq!(allocator.allocated_peak(), handed);
+        assert_eq!(allocator.allocated(), 256);
     }
 
     #[test]

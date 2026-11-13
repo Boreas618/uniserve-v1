@@ -118,16 +118,15 @@ impl CausalLmRunner {
     }
 
     /// Lends the runner the scratch page set `cache` opened, for its paired forwards: each
-    /// attention group's planes over the scratch pages, and the set's page table for the rows
-    /// of the runner's largest bucket at the config's scratch pages a row.
+    /// attention group's planes over the scratch pages, and the set's page table, whose row `i`
+    /// names the set's pages from page `i` on.
     ///
     /// # Errors
     ///
-    /// A cache whose scratch pages are not open or hold fewer pages than the runner's rows
-    /// address, or what [`CausalLmRunner::set_scratch`] refuses.
+    /// A cache whose scratch pages are not open, or what [`CausalLmRunner::set_scratch`]
+    /// refuses: a set of other pages than the config's.
     pub fn lend_scratch(&mut self, cache: &KvCacheMemory) -> Result<()> {
-        let rows = self.scratch_rows();
-        let table = cache.scratch_table(rows, self.config.scratch_pages)?;
+        let table = cache.scratch_table()?;
 
         let mut groups = Vec::new();
         for group in attention_groups(cache) {
@@ -165,14 +164,14 @@ fn attention_groups(cache: &KvCacheMemory) -> impl Iterator<Item = usize> + '_ {
 /// - [`PageWork::Holds`]: the flag is set when the region is the cache's
 ///   (`KvCacheMemory::holds`).
 /// - [`PageWork::BeforeShadow`]: what the rows of a paired forward have cached is copied into
-///   their scratch pages, `scratch_pages` pages a row, for every attention group.
+///   the scratch pages each row takes, from the first page the hook is given for it, for every
+///   attention group.
 ///
 /// The cache is locked before the state, for the time of one call.
 pub fn page_work(
     cache: Arc<Mutex<KvCacheMemory>>,
     state: Option<Arc<Mutex<StateMemory>>>,
     stream: Option<Stream>,
-    scratch_pages: u32,
 ) -> PageWorkHook {
     // The events behind the copies issued for the batch being served.
     let mut copied: Vec<Event> = Vec::new();
@@ -221,7 +220,7 @@ pub fn page_work(
                 }
             }
             PageWork::Holds(region, held) => held.set(cache.holds(region)),
-            PageWork::BeforeShadow(batch) => {
+            PageWork::BeforeShadow(batch, first) => {
                 let Some(stream) = &stream else {
                     return Ok(());
                 };
@@ -243,7 +242,7 @@ pub fn page_work(
                     .collect();
 
                 for group in attention_groups(&cache) {
-                    cache.copy_history(group, &slots, &lengths, scratch_pages, stream)?;
+                    cache.copy_history(group, &slots, &lengths, first, stream)?;
                 }
             }
         }

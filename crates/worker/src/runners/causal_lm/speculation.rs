@@ -713,7 +713,7 @@ pub(crate) fn fill_verification(
         expanded,
         &rows_of_tokens,
         mapping,
-        false,
+        None,
         block,
     )?;
 

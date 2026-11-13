@@ -9,6 +9,8 @@ use ipc::batch::{Batch, BatchId, BatchOutput, Columns, Phase, Shape as BatchShap
 use nn::functional::{WeightOrder, embedding, rms_norm};
 use nn::modules::Linear;
 use nn::{CausalLm, ExpertExchange, KvCache, PhaseKind, RecurrentState, TokenBatch};
+use ops::fill;
+use ops::norm::{RmsNorm, RmsNormArgs, RmsNormDescriptor};
 use ops::{Generation, Kernel, KernelEntry};
 use platform::NativeLibrary;
 use tensor::{DType, Device, Tensor};
@@ -269,7 +271,9 @@ fn captured() -> (TinyRunner, Arc<Generation>) {
 /// The host values the prepared replay's input copies read: the values area of its slot.
 fn prepared_values(graphs: &Graphs, bytes: usize) -> Vec<u8> {
     let mut state = graphs.state.borrow_mut();
-    let (_, slot) = state.prepared.expect("inputs are prepared");
+    let Some(super::Prepared::Inputs(_, slot)) = state.prepared else {
+        panic!("inputs are prepared");
+    };
     let (base, length) = state.buffer.as_mut().unwrap().values_ptr(slot);
     assert!(bytes as u64 <= length);
 
@@ -316,6 +320,111 @@ fn a_profile_run_states_keys_the_region_and_the_input_copy_bytes() {
 
     // One FP32 host value per token of the largest bucket.
     assert_eq!(runner.graphs.input_peak(), 4 * ROWS as u64);
+}
+
+/// A runner whose forward writes outputs of known sizes with two operators: `norms`
+/// normalizations of its rows of 64 BF16 elements, then one fill of a row of 512 FP32 elements
+/// each, in decode buckets of four and two rows.
+struct Writes {
+    graphs: Graphs,
+    weight: Tensor,
+    norms: usize,
+}
+
+impl Writes {
+    fn new(norms: usize) -> Self {
+        Self {
+            graphs: Graphs::meta(Arc::new(Generation::new(0, [])), 4 * 64 * 2),
+            weight: weight(0x4_0000, &[64]),
+            norms,
+        }
+    }
+}
+
+impl Runner for Writes {
+    fn phases(&self) -> &[Phase] {
+        &[Phase::Decode]
+    }
+
+    fn buckets(&self) -> Vec<Bucket> {
+        vec![
+            Bucket::decode(4, Variant::DecodeGreedy),
+            Bucket::decode(2, Variant::DecodeGreedy),
+        ]
+    }
+
+    fn forward(&self, bucket: &Bucket) -> Result<Vec<Tensor>> {
+        let rows = bucket.rows as usize;
+        let rows_in = self.graphs.input(0, (rows, 64), DType::BF16)?;
+        let mut outputs = Vec::new();
+
+        let norm = RmsNormDescriptor {
+            dtype: DType::BF16,
+            columns: 64,
+            tile: 64,
+            pdl: false,
+            centred: false,
+            groups: 1,
+        };
+        for _ in 0..self.norms {
+            let out = ops::empty((rows, 64), DType::BF16)?;
+            let args = RmsNormArgs {
+                x: ops::operand(&rows_in)?,
+                weight: ops::operand(&self.weight)?,
+                out: ops::operand(&out)?,
+                eps: 1e-6,
+            };
+            ops::launch::<RmsNorm>(&norm, args)?;
+            outputs.push(out);
+        }
+
+        let filled = ops::empty((rows, 512), DType::F32)?;
+        let args = fill::Args {
+            destination: ops::operand(&filled)?,
+            bits: 0,
+        };
+        ops::launch::<fill::Fill>(&fill::Descriptor::of(&args, 256, false), args)?;
+        outputs.push(filled);
+        Ok(outputs)
+    }
+
+    fn idle_inputs(&self, _bucket: &Bucket, columns: &mut [u8]) -> Result<()> {
+        columns.fill(0);
+        Ok(())
+    }
+
+    fn prepare_inputs(&mut self, _batch: &Batch, _tables: &BlockTables) -> Result<Bucket> {
+        Err(Error::State("the runner only profiles"))
+    }
+
+    fn execute(&mut self, _batch: &Batch, _tables: &BlockTables) -> Result<BatchOutput> {
+        Err(Error::State("the runner only profiles"))
+    }
+
+    fn graphs(&self) -> &Graphs {
+        &self.graphs
+    }
+}
+
+#[test]
+fn a_forward_s_shadow_region_holds_twice_its_largest_operator_s_outputs() {
+    // Four rows' fill writes 8192 bytes and their two normalizations 512 each: the fill writes
+    // the most, in the bucket of four rows, and the region holds twice its outputs, not twice
+    // everything the forward writes.
+    let writes = Writes::new(2);
+    writes.graphs.profile_run(&writes).unwrap();
+    assert_eq!(writes.graphs.shadow_peak(0), 2 * 8192);
+
+    // An operator's outputs are summed over its calls: twenty normalizations of four rows
+    // write 10240 bytes, more than the fill.
+    let writes = Writes::new(20);
+    writes.graphs.profile_run(&writes).unwrap();
+    assert_eq!(writes.graphs.shadow_peak(0), 2 * 20 * 512);
+
+    // Memory one operator writes in place that the forward did not allocate is copied twice
+    // too, when it is more than any operator's outputs.
+    assert_eq!(writes.graphs.shadow_peak(12_000), 2 * 12_000);
+    assert_eq!(writes.graphs.shadow_peak(1_000), 2 * 20 * 512);
 }
 
 #[test]

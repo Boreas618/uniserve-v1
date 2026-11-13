@@ -14,8 +14,8 @@
 //!   launches the next. No host callback is placed on the stream or in a graph;
 //! - a meta context runs nothing.
 //!
-//! While a launch table is being recorded, a break adds the entry `(BREAK, "", module path)`, so
-//! a profile run states where a capture of the same forward is segmented.
+//! While a launch table is being recorded, a break adds the entry `(BREAK, "", module path, 0)`,
+//! so a profile run states where a capture of the same forward is segmented.
 
 use std::error::Error as StdError;
 use std::sync::Arc;
@@ -47,7 +47,7 @@ pub fn graph_break(work: HostWork) -> Result<()> {
         let mut state = context.state();
         let path = profiler::path(&state.paths);
         if let Some(launches) = state.launches.as_mut() {
-            launches.push((BREAK, String::new(), path));
+            launches.push((BREAK, String::new(), path, 0));
         }
         state.breaks.clone()
     };
@@ -95,7 +95,7 @@ mod tests {
         assert_eq!(calls.load(Ordering::Relaxed), 0);
         assert_eq!(
             context.take_launches(),
-            [(BREAK, String::new(), String::new())]
+            [(BREAK, String::new(), String::new(), 0)]
         );
     }
 

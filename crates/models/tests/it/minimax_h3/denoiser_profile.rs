@@ -106,7 +106,7 @@ fn recorded_at<T>(
     let launches = context
         .take_launches()
         .into_iter()
-        .map(|(operator, key, _)| (operator, key))
+        .map(|(operator, key, ..)| (operator, key))
         .collect();
 
     (output, (launches, context.peak()))

@@ -506,7 +506,11 @@ fn load_rank(
     let graphs = worker::Runner::graphs(&profiled);
     let peaks = Peaks {
         graph: graphs.peak(),
-        shadow: graphs.shadow_peak() + scratch_bytes(&meta_config, &layout),
+        shadow: graphs.shadow_peak(CausalLmRunner::in_place_bytes(
+            &meta_config,
+            meta.as_ref(),
+            &layout,
+        )?) + scratch_bytes(&meta_config, worker::lock(&meta_cache).config()),
         inputs: graphs.input_peak(),
     };
     drop(profiled);
@@ -1567,6 +1571,7 @@ fn open_rank(rank: &mut LoadedRank, table: &Segments) -> Result<Segments> {
     // Step 18: the cache, whose segments the rank maps or creates at the Storage Server.
     let stream =
         Stream::new(device).with_context(|| format!("creating device {}'s stream", device.0))?;
+    let scratch_bytes = scratch_bytes(&config, &cache_config);
     let mut cache = KvCacheMemory::open(cache_config, device, &*client, &stream)
         .context("opening the rank's KV cache")?;
 
@@ -1582,11 +1587,10 @@ fn open_rank(rank: &mut LoadedRank, table: &Segments) -> Result<Segments> {
         None => None,
     };
 
-    // Step 20: the scratch pages of paired forwards, from the scratch pool.
-    let scratch_bytes = scratch_bytes(&config, &layout);
+    // Step 20: the scratch page set of paired forwards, the pages the rows of a batch share,
+    // from the scratch pool.
     if config.scratch_pages > 0 {
-        let pages = cache.scratch_pages_within(scratch_bytes);
-        cache.open_scratch(pages, Some((pool.allocator(), &stream)))?;
+        cache.open_scratch(config.scratch_pages, Some((pool.allocator(), &stream)))?;
     }
     let cache = Arc::new(Mutex::new(cache));
 

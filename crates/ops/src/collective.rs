@@ -759,8 +759,13 @@ mod tests {
             })
         ));
 
+        let launches: Vec<_> = context
+            .take_launches()
+            .into_iter()
+            .map(|(operator, key, path, _)| (operator, key, path))
+            .collect();
         assert_eq!(
-            context.take_launches(),
+            launches,
             [(
                 "expert_exchange",
                 "mode_dispatch_hidden_64_intermediate_128_top_2_experts_8_max_tokens_16_ranks_2_\

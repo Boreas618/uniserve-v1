@@ -21,9 +21,10 @@ use crate::{Error, Result, profiler};
 /// and the call is offered to the context's route when one is set; a call the route declines,
 /// and every call without a route, is one launch of that kernel on the context's stream.
 ///
-/// While the context records a launch table, each call adds `(O::NAME, key, module path)` to
-/// it, whichever way the call went. A call the route took is one entry, however many kernels
-/// the route launched for it.
+/// While the context records a launch table, each call adds `(O::NAME, key, module path,
+/// bytes)` to it, whichever way the call went, `bytes` being the outputs the forward allocated
+/// for it ([`Context::record_launches`]). A call the route took is one entry, however many
+/// kernels the route launched for it.
 ///
 /// # Errors
 ///
@@ -86,13 +87,17 @@ where
 }
 
 /// Adds a launch of `operator` with `key` to the launch table `context` is recording, under the
-/// innermost profiler range.
+/// innermost profiler range, with the bytes the context's allocator handed out since the
+/// table's previous launch.
 fn record(context: &Context, operator: &'static str, key: String) {
-    let mut state = context.state();
+    let handed = context.allocator().allocated();
+    let mut guard = context.state();
+    let state = &mut *guard;
     let path = profiler::path(&state.paths);
 
     if let Some(launches) = state.launches.as_mut() {
-        launches.push((operator, key, path));
+        launches.push((operator, key, path, handed.saturating_sub(state.handed)));
+        state.handed = handed;
     }
 }
 
@@ -158,13 +163,44 @@ pub(crate) mod tests {
         launch::<RmsNorm>(&descriptor(8), args(8, 8)).unwrap();
         launch::<RmsNorm>(&descriptor(16), args(16, 16)).unwrap();
 
+        // The calls' operands are memory no allocator handed out.
         assert_eq!(
             context.take_launches(),
             [
-                ("rms_norm", descriptor(8).to_string(), String::new()),
-                ("rms_norm", descriptor(16).to_string(), String::new()),
+                ("rms_norm", descriptor(8).to_string(), String::new(), 0),
+                ("rms_norm", descriptor(16).to_string(), String::new(), 0),
             ]
         );
+    }
+
+    #[test]
+    fn a_launch_states_the_bytes_the_forward_allocated_for_it() {
+        let context = Context::meta(None);
+        let _guard = context.enter();
+
+        // A tensor allocated before the recording begins is no launch's.
+        let _before = crate::empty(64, DType::BF16).unwrap();
+        context.record_launches();
+
+        // Two outputs before the first launch, of 400 and 2 bytes, each taken as whole blocks
+        // of the allocator's alignment; none before the second; one of 512 bytes before the
+        // third, counted although the block the first launch's dropped outputs left serves it.
+        let first = (
+            crate::empty(200, DType::BF16).unwrap(),
+            crate::empty(2, DType::U8).unwrap(),
+        );
+        launch_rms_norm().unwrap();
+        drop(first);
+        launch_rms_norm().unwrap();
+        let _third = crate::empty(128, DType::F32).unwrap();
+        launch_rms_norm().unwrap();
+
+        let bytes: Vec<u64> = context
+            .take_launches()
+            .into_iter()
+            .map(|(_, _, _, bytes)| bytes)
+            .collect();
+        assert_eq!(bytes, [512 + 256, 0, 512]);
     }
 
     #[test]

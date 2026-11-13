@@ -60,9 +60,11 @@ const SLOTS: u32 = 6;
 const PAGE: u32 = 16;
 const TABLE_WIDTH: usize = 4;
 const MAX_KV_LEN: u32 = PAGE * TABLE_WIDTH as u32;
-/// The pages of the cache's planes, and of each row of the scratch set.
+/// The pages of the cache's planes, and of the scratch page set the rows of a paired forward
+/// share: the largest bucket's eighty tokens are five pages, and its four rows one page more
+/// each.
 const PAGES: usize = 32;
-const SCRATCH_PAGES: u32 = 2;
+const SCRATCH_PAGES: u32 = 9;
 /// The most likely tokens a scored row reports.
 const CANDIDATES: u32 = 3;
 
@@ -671,8 +673,13 @@ fn performed(tokens: Vec<u32>, step_index: u32, computed: u32, visible: u32) -> 
 
 /// The input block `columns::fill` writes for `batch` in `bucket`, over bytes that held
 /// something else, with the layout its columns are read by: `mapping` is the cache slot each
-/// token writes, and `paired` states a paired forward.
-fn filled(batch: &Batch, bucket: &Bucket, mapping: &[u32], paired: bool) -> (Layout, Vec<u8>) {
+/// token writes, and `scratch` the scratch pages each row of a paired forward takes.
+fn filled(
+    batch: &Batch,
+    bucket: &Bucket,
+    mapping: &[u32],
+    scratch: Option<&[std::ops::Range<u32>]>,
+) -> (Layout, Vec<u8>) {
     let layout = Layout::of(config().buckets.iter(), 0, 0).unwrap();
     let mut block = vec![0xA5_u8; layout.bytes() as usize];
 
@@ -683,7 +690,7 @@ fn filled(batch: &Batch, bucket: &Bucket, mapping: &[u32], paired: bool) -> (Lay
         &batch.columns,
         bucket,
         mapping,
-        paired,
+        scratch,
         &mut block,
     )
     .unwrap();
@@ -918,7 +925,7 @@ fn a_decode_batch_is_padded_with_rows_that_address_nothing() {
     let batch = decode(&[3, 1, SLOTS as i32], &[0.0, 0.7, 1.0]);
     let bucket = Bucket::decode(4, Variant::DecodeSampled);
     let tables = held(&[3, 1, SLOTS]);
-    let (layout, block) = filled(&batch, &bucket, &mapping(&batch, &tables), false);
+    let (layout, block) = filled(&batch, &bucket, &mapping(&batch, &tables), None);
 
     let u32s = |column, elements| layout.read::<u32>(&block, column, elements);
     let i32s = |column, elements| layout.read::<i32>(&block, column, elements);
@@ -978,7 +985,7 @@ fn a_prefill_batch_is_padded_with_tokens_no_row_holds() {
     let mut batch = prefill(Variant::PrefillScored);
     batch.columns.targets = vec![6, 7, -1, 9, -1];
     let bucket = Bucket::prefill(4, 8, Variant::PrefillScored);
-    let (layout, block) = filled(&batch, &bucket, &mapping(&batch, &held(&[2, 4])), false);
+    let (layout, block) = filled(&batch, &bucket, &mapping(&batch, &held(&[2, 4])), None);
 
     let u32s = |column, elements| layout.read::<u32>(&block, column, elements);
 
@@ -1025,12 +1032,7 @@ fn a_row_s_adjustments_are_its_bias_flag_and_its_ban_mask() {
     let mut batch = decode(&[1, 2], &[0.0, 0.0]);
     batch.columns.biased = vec![true, false];
     batch.columns.banned = vec![Vec::new(), vec![3, 40]];
-    let (layout, block) = filled(
-        &batch,
-        &Bucket::decode(2, Variant::DecodeGreedy),
-        &[],
-        false,
-    );
+    let (layout, block) = filled(&batch, &Bucket::decode(2, Variant::DecodeGreedy), &[], None);
 
     // The second row is the first that bans, so its mask is mask zero.
     assert_eq!(
@@ -1293,7 +1295,7 @@ fn the_last_request_slot_serves_and_gathers_its_own_rows() {
     // Its rows gather row `SLOTS - 1` of the page tables and of the slot state, and its call
     // commits into that row; the padding row is the one after it.
     let bucket = Bucket::decode(2, Variant::DecodeGreedy);
-    let (layout, block) = filled(&batch, &bucket, &mapping(&batch, &tables), false);
+    let (layout, block) = filled(&batch, &bucket, &mapping(&batch, &tables), None);
     let u32s = |column| layout.read::<u32>(&block, column, 2);
 
     assert_eq!(u32s(Column::Slots), [SLOTS - 1, NO_SLOT]);
@@ -1481,7 +1483,7 @@ fn part(work: &PageWork<'_>) -> &'static str {
         PageWork::BeforeReplay(..) => "before replay",
         PageWork::AfterReplay => "after replay",
         PageWork::Ended => "ended",
-        PageWork::BeforeShadow(_) => "before shadow",
+        PageWork::BeforeShadow(..) => "before shadow",
         PageWork::Holds(..) => "holds",
     }
 }
@@ -1579,31 +1581,104 @@ fn a_slot_the_runner_does_not_hold_is_not_started() {
 // ---- Paired forwards ----------------------------------------------------------------------------
 
 #[test]
+fn the_scratch_page_set_holds_the_largest_bucket_s_tokens_and_a_page_a_row() {
+    // The buckets of a deployment of 128 running requests with prefill chunks of 16384 tokens,
+    // over pages of 64 tokens: 256 pages of the chunk's tokens and 128 more, one per row.
+    let buckets = Buckets::causal_lm(&[1, 2, 4, 8, 16, 32, 64, 128], &[512, 8192, 16384], true);
+    assert_eq!(CausalLmRunner::scratch_pages(&buckets, 64), 256 + 128);
+
+    // A partial page of tokens takes a whole one: the tests' eighty tokens of pages of sixteen
+    // are five pages, with the four rows' four.
+    assert_eq!(
+        CausalLmRunner::scratch_pages(&config().buckets, PAGE),
+        SCRATCH_PAGES
+    );
+}
+
+#[test]
+fn the_scratch_set_hands_its_pages_to_the_rows_in_order() {
+    // A decode at position 20, a chunk of three tokens from position 30, a row of nothing, and
+    // a row of four keys whose first token writes position 16 and whose second writes nothing.
+    let rows = Rows {
+        calls: Vec::new(),
+        positions: vec![20, 30, 31, 32, 16, 17],
+        cache_positions: vec![20, 30, 31, 32, 16, -1],
+        seq_lens: vec![21, 33, 0, 4],
+        query_offsets: vec![0, 1, 4, 4, 6],
+        logits_rows: vec![0, 3, -1, 5],
+    };
+
+    // Each row takes the pages of what it reads or writes, the next row from where it ended.
+    let spans = columns::scratch_spans(&rows, PAGE).unwrap();
+    assert_eq!(spans, [0..2, 2..5, 5..5, 5..7]);
+
+    // A token writes its position's page among its row's: the decode page 1 of its two, the
+    // chunk pages 1, 1 and 2 of its three (set pages 3, 3 and 4), the last row page 1 of its
+    // two (set page 6), and the unwritten token nothing.
+    let mapping =
+        columns::scratch_slot_mapping(&rows.cache_positions, &rows.query_offsets, &spans, PAGE)
+            .unwrap();
+    assert_eq!(
+        mapping,
+        [
+            PAGE + 4,
+            3 * PAGE + 14,
+            3 * PAGE + 15,
+            4 * PAGE,
+            6 * PAGE,
+            NO_SLOT
+        ]
+    );
+
+    // A position past its row's pages, a page size of zero, and lengths of other rows than
+    // the offsets', are refused; so is a negative length.
+    assert!(matches!(
+        columns::scratch_slot_mapping(&[32], &[0, 1], std::slice::from_ref(&(0..2)), PAGE),
+        Err(Error::Invariant(_))
+    ));
+    assert!(columns::scratch_spans(&rows, 0).is_err());
+    let mut unmatched = rows.clone();
+    unmatched.seq_lens.pop();
+    assert!(matches!(
+        columns::scratch_spans(&unmatched, PAGE),
+        Err(Error::Invariant(_))
+    ));
+    let mut negative = rows;
+    negative.seq_lens[2] = -1;
+    assert!(matches!(
+        columns::scratch_spans(&negative, PAGE),
+        Err(Error::Invalid(_))
+    ));
+}
+
+#[test]
 fn a_paired_forward_writes_its_rows_scratch_pages_and_commits_nothing() {
     let batch = prefill(Variant::PrefillOutput);
     let bucket = Bucket::prefill(4, 8, Variant::PrefillOutput);
 
+    // Slot 2's three tokens take page 0 of the set and slot 4's two take page 1.
     let rows = &batch.columns.rows;
-    let scratch = columns::scratch_column(
-        &rows.cache_positions,
-        &rows.query_offsets,
-        8,
-        SCRATCH_PAGES,
-        PAGE,
-    )
-    .unwrap();
+    let spans = columns::scratch_spans(rows, PAGE).unwrap();
+    assert_eq!(spans, [0..1, 1..2]);
+    let scratch =
+        columns::scratch_column(&rows.cache_positions, &rows.query_offsets, 8, &spans, PAGE)
+            .unwrap();
 
-    // Row `r` owns the pages `2r..2r + 2` of the set: its tokens at cache positions 0, 1 and
-    // 2 write slots of page `2r`, and the tokens the batch does not hold write nothing.
-    assert_eq!(scratch, [0, 1, 2, 32, 33, NO_SLOT, NO_SLOT, NO_SLOT]);
+    // The tokens at cache positions 0, 1 and 2 of the first row write page 0, those at 0 and
+    // 1 of the second page 1, and the tokens the batch does not hold write nothing.
+    assert_eq!(
+        scratch,
+        [0, 1, 2, PAGE, PAGE + 1, NO_SLOT, NO_SLOT, NO_SLOT]
+    );
 
-    let (layout, block) = filled(&batch, &bucket, &scratch, true);
+    let (layout, block) = filled(&batch, &bucket, &scratch, Some(&spans));
     assert_eq!(layout.read::<u32>(&block, Column::SlotMapping, 8), scratch);
 
-    // Every row gathers its own row of the scratch set's table, and reads its slot's state.
+    // Each row gathers the row of the set's table that begins at its first page, a row past
+    // the batch's row zero; each reads its slot's state.
     assert_eq!(
         layout.read::<u32>(&block, Column::TableRows, 4),
-        [0, 1, 2, 3]
+        [0, 1, 0, 0]
     );
     assert_eq!(
         layout.read::<u32>(&block, Column::SlotRows, 4),
@@ -1615,23 +1690,10 @@ fn a_paired_forward_writes_its_rows_scratch_pages_and_commits_nothing() {
     assert_eq!(table[column::TASK * 4..][..4], [-1; 4]);
 }
 
-#[test]
-fn a_scratch_slot_lies_in_its_row_s_pages_or_is_refused() {
-    // Two rows of two tokens around a page boundary; the second row's last token is not
-    // written by the served batch.
-    let mapping = columns::scratch_slot_mapping(&[15, 16, 30, -1], &[0, 2, 4], 2, PAGE).unwrap();
-    assert_eq!(mapping, [15, 16, 2 * PAGE + 30, NO_SLOT]);
-
-    // A position past the row's scratch pages, and columns of different token counts.
-    assert!(matches!(
-        columns::scratch_slot_mapping(&[32], &[0, 1], 2, PAGE),
-        Err(Error::Invalid(_))
-    ));
-    assert!(matches!(
-        columns::scratch_slot_mapping(&[0, 1], &[0, 1], 2, PAGE),
-        Err(Error::Invariant(_))
-    ));
-    assert!(columns::scratch_slot_mapping(&[0], &[0, 1], 0, PAGE).is_err());
+/// The scratch set's page table a runner of [`config`] over [`group`]s is lent: a row for every
+/// page of the set, as wide as the pooled table, which is narrower than the set.
+fn scratch_table() -> Tensor {
+    meta((SCRATCH_PAGES as usize, TABLE_WIDTH), DType::U32)
 }
 
 #[test]
@@ -1646,10 +1708,12 @@ fn a_paired_forward_is_prepared_over_a_scratch_set_the_cache_lends() {
         Err(Error::Unsupported(_))
     ));
 
-    // A set of fewer rows than the largest bucket, then one that holds them.
-    let table = |rows: usize| meta((rows, SCRATCH_PAGES as usize), DType::U32);
-    assert!(runner.set_scratch(vec![group(8, table(2))]).is_err());
-    runner.set_scratch(vec![group(8, table(4))]).unwrap();
+    // A set of other pages than the config's, then the config's.
+    let other = meta((SCRATCH_PAGES as usize - 1, TABLE_WIDTH), DType::U32);
+    assert!(runner.set_scratch(vec![group(8, other)]).is_err());
+    runner
+        .set_scratch(vec![group(SCRATCH_PAGES as usize, scratch_table())])
+        .unwrap();
 
     let bucket = runner.prepare_shadow_inputs(&batch, &tables).unwrap();
     assert_eq!(bucket, Bucket::decode(2, Variant::DecodeGreedy));
@@ -1665,17 +1729,137 @@ fn a_paired_forward_is_prepared_over_a_scratch_set_the_cache_lends() {
     let paired: Vec<&str> = context
         .take_launches()
         .into_iter()
-        .map(|(operator, _, _)| operator)
+        .map(|(operator, ..)| operator)
         .collect();
     assert_eq!(paired, serving);
+}
 
-    // A row whose cache position lies past its scratch pages is refused.
-    let mut far = decode(&[1, 2], &[0.0, 0.0]);
-    far.columns.rows.cache_positions[1] = (SCRATCH_PAGES * PAGE) as i32;
+/// A kernel no test launches: an entry of the C library stands in for a package's.
+fn kernel() -> Arc<ops::Kernel> {
+    let library = platform::NativeLibrary::open("libc.so.6").unwrap();
+    Arc::new(ops::Kernel::load_native(library, "getpid").unwrap())
+}
+
+/// One entry of `kernel` for every key of `keys`.
+fn entries<'a>(
+    keys: impl IntoIterator<Item = &'a (&'static str, String)>,
+    kernel: &Arc<ops::Kernel>,
+) -> Vec<ops::KernelEntry> {
+    keys.into_iter()
+        .map(|(operator, key)| ops::KernelEntry::keyed(operator, key.clone(), Arc::clone(kernel)))
+        .collect()
+}
+
+#[test]
+fn a_shadow_batch_whose_rows_do_not_fit_the_scratch_set_is_reported_uncompared() {
+    /// A bound on the waits that only a defect reaches.
+    const LONG: Duration = Duration::from_secs(30);
+
+    // The rank's cache with the runner's scratch page set, and the generation the runner
+    // serves, which holds a kernel for every key it launches.
+    let mut cache = KvCacheMemory::meta(cache_config(false)).unwrap();
+    cache.open_scratch(SCRATCH_PAGES, None).unwrap();
+    let cache = Arc::new(Mutex::new(cache));
+    let keys = over(&lock(&cache), None).graphs().keys();
+    let serving = Arc::new(Generation::new(1, entries(&keys, &kernel())));
+
+    // The runner over the cache, each part of a batch's page work recorded before the cache
+    // issues it.
+    let mut runner = CausalLmRunner::over(
+        Arc::new(Tiny::new(false)),
+        config(),
+        Graphs::meta(
+            Arc::clone(&serving),
+            CausalLmRunner::input_bytes(&config()).unwrap(),
+        ),
+        None,
+        &lock(&cache),
+        None,
+    )
+    .unwrap();
+    let issued = Arc::new(Mutex::new(Vec::new()));
+    let mut cache_work = wiring::page_work(Arc::clone(&cache), None, None);
+    let seen = Arc::clone(&issued);
+    runner.set_page_work(Box::new(move |work| {
+        seen.lock().unwrap().push(part(&work));
+        cache_work(work)
+    }));
+
+    let group = GroupId(0);
+    let sequences = Sequences::new(group, 1, Vec::new());
+    let executor = Executor::spawn(
+        None,
+        vec![Box::new(runner)],
+        Arc::clone(&serving),
+        held(&[1, 2, 3]),
+        Arc::clone(&sequences),
+        0,
+        COPY_BUDGET,
+    )
+    .unwrap();
+    let ended = |submission: crate::Result<crate::completion::Submission>| {
+        submission.unwrap().wait_timeout(LONG)
+    };
     assert!(matches!(
-        runner.prepare_shadow_inputs(&far, &tables),
-        Err(Error::Invalid(_))
+        ended(executor.warm_up()),
+        Some(Outcome::Success(_))
     ));
+
+    // Generation 2 replaces the attention kernel every bucket launches.
+    let attention = keys
+        .iter()
+        .filter(|(operator, _)| *operator == "paged_attention");
+    let next = Arc::new(serving.replace(2, entries(attention, &kernel())));
+    assert!(matches!(
+        ended(executor.prepare(next)),
+        Some(Outcome::Success(_))
+    ));
+
+    // Three decode rows that each read sixty-four keys take four pages each: twelve of the
+    // set's nine. The paired forward is not run, the shadow batch ends, and the update states
+    // that it has no comparison of the attention kernel on that batch.
+    let mut long = decode(&[1, 2, 3], &[0.0, 0.0, 0.0]);
+    long.generation = 2;
+    long.columns.rows.positions = vec![63; 3];
+    long.columns.rows.cache_positions = vec![63; 3];
+    long.columns.rows.seq_lens = vec![MAX_KV_LEN as i32; 3];
+    assert!(matches!(
+        ended(executor.shadow(1, long.clone())),
+        Some(Outcome::Success(_))
+    ));
+    let uncompared = executor.uncompared();
+    assert_eq!(uncompared.len(), 1, "{uncompared:?}");
+    assert!(
+        uncompared[0].contains("`paged_attention` in bucket")
+            && uncompared[0].contains("take 12 scratch pages")
+            && uncompared[0].contains("holds 9"),
+        "{uncompared:?}"
+    );
+    assert!(!issued.lock().unwrap().contains(&"before shadow"));
+
+    // The batch itself is served as every batch is: its page work is issued around the
+    // replay, which graphs with no device refuse.
+    long.generation = 1;
+    issued.lock().unwrap().clear();
+    let served = ended(executor.submit(2, long.clone()));
+    let Some(Outcome::Failed(refused)) = served else {
+        panic!("graphs with no device replay nothing: {served:?}");
+    };
+    assert!(refused.to_string().contains("no device"), "{refused}");
+    let work = std::mem::take(&mut *issued.lock().unwrap());
+    assert_eq!(work[..2], ["before replay", "ended"], "{work:?}");
+
+    // Rows that fit are paired: their history reaches the scratch pages, and the paired
+    // forward runs, which graphs with no device refuse.
+    let mut short = decode(&[1, 2], &[0.0, 0.0]);
+    short.generation = 2;
+    let shadowed = ended(executor.shadow(3, short));
+    let Some(Outcome::Failed(refused)) = shadowed else {
+        panic!("graphs with no device run no paired forward: {shadowed:?}");
+    };
+    assert!(refused.to_string().contains("no device"), "{refused}");
+    assert!(issued.lock().unwrap().contains(&"before shadow"));
+    executor.close().unwrap();
 }
 
 #[test]
@@ -2287,7 +2471,6 @@ fn wired(
         Arc::clone(cache),
         state.map(Arc::clone),
         None,
-        SCRATCH_PAGES,
     ));
     runner
 }
@@ -2575,17 +2758,20 @@ fn a_paired_forward_computes_over_the_scratch_pages_the_cache_opened() {
     let mut cache = KvCacheMemory::meta(cache_config(false)).unwrap();
     let tables = held(&[1, SLOTS]);
 
-    // A cache with no scratch pages lends none, and one whose set is too small for the rows
-    // of the largest bucket is refused.
+    // A cache with no scratch pages lends none, and a set of other pages than the runner's
+    // config states is refused.
     let mut unlent = over(&cache, None);
     assert!(unlent.lend_scratch(&cache).is_err());
     assert!(matches!(
         unlent.prepare_shadow_inputs(&decode(&[1, 2], &[0.0, 0.0]), &tables),
         Err(Error::Unsupported(_))
     ));
+    let mut other = KvCacheMemory::meta(cache_config(false)).unwrap();
+    other.open_scratch(SCRATCH_PAGES + 1, None).unwrap();
+    assert!(unlent.lend_scratch(&other).is_err());
 
-    // Four rows of the largest bucket at two scratch pages each.
-    cache.open_scratch(4 * SCRATCH_PAGES, None).unwrap();
+    // The set the rows of a batch share.
+    cache.open_scratch(SCRATCH_PAGES, None).unwrap();
     let mut runner = over(&cache, None);
     let bucket = runner
         .prepare_shadow_inputs(&decode(&[1, SLOTS as i32], &[0.0, 0.0]), &tables)
@@ -2603,7 +2789,7 @@ fn a_paired_forward_computes_over_the_scratch_pages_the_cache_opened() {
     let paired: Vec<&str> = context
         .take_launches()
         .into_iter()
-        .map(|(operator, _, _)| operator)
+        .map(|(operator, ..)| operator)
         .collect();
     assert_eq!(paired, serving);
 }
@@ -3780,7 +3966,7 @@ fn scatter(table: &mut [[u32; 2]], slots: &Tensor, next: &Tensor) {
 /// (`nn::TokenBatch::ngram_context`), and leaves in `table` what each row's slot continues
 /// from. A decode's token is the one its slot's commit left, which the batch states as well.
 fn advance(table: &mut [[u32; 2]], batch: &Batch, bucket: &Bucket) -> Vec<[u32; 2]> {
-    let (layout, block) = filled(batch, bucket, &[], false);
+    let (layout, block) = filled(batch, bucket, &[], None);
     let (rows, tokens) = (bucket.rows as usize, bucket.tokens as usize);
     let column = |column, elements| u32_column(&layout.read::<u32>(&block, column, elements));
 
@@ -3965,7 +4151,7 @@ fn a_request_s_verify_slots_are_its_home_row_and_its_rows_past_the_home_rows() {
         &batch.columns,
         &bucket,
         &[],
-        false,
+        None,
         &mut block,
     )
     .unwrap();

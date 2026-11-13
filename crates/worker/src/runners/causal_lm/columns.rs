@@ -144,10 +144,14 @@
 //! ## A paired forward
 //!
 //! A paired forward computes a served batch again beside the kernels of another generation,
-//! and must write nothing a serving request reads. Its columns are the batch's with three
-//! differences ([`fill`] of a paired forward): the tokens write the scratch page set in its own
-//! numbering ([`scratch_column`]), row `r` gathers row `r` of the scratch set's page table, and
-//! the commit table is inert.
+//! and must write nothing a serving request reads. Its rows share one scratch page set, which
+//! hands them its pages in row order, each row the pages of the context it reads
+//! ([`scratch_spans`]); a batch whose rows need more pages than the set holds has no paired
+//! forward. Its columns are the batch's with three differences ([`fill`] of a paired forward):
+//! the tokens write their rows' scratch pages ([`scratch_column`]), each row gathers the row of
+//! the set's page table that begins at its first page, and the commit table is inert.
+
+use std::ops::Range;
 
 use ipc::batch::{Columns, Phase, Row, Rows, Variant};
 use ipc::philox::DrawAddress;
@@ -639,8 +643,9 @@ pub(crate) fn slot_mapping(
 /// `slots` is the runner's request slots, whose count is also the padding row of the pooled
 /// page tables and of the slot state; `vocabulary` is the width of a logit row. `mapping` is
 /// the cache slot each of the batch's tokens writes: [`slot_mapping`] for a serving step,
-/// [`scratch_column`] for a paired forward (`paired`), and empty for a step that writes none;
-/// the bucket's tokens past it write nothing.
+/// [`scratch_column`] for a paired forward, and empty for a step that writes none; the
+/// bucket's tokens past it write nothing. `scratch` is the scratch pages each row of a paired
+/// forward takes ([`scratch_spans`]), and `None` for every other step.
 ///
 /// # Errors
 ///
@@ -659,7 +664,7 @@ pub(crate) fn fill(
     columns: &Columns,
     bucket: &Bucket,
     mapping: &[u32],
-    paired: bool,
+    scratch: Option<&[Range<u32>]>,
     block: &mut [u8],
 ) -> Result<()> {
     let rows = &columns.rows;
@@ -766,13 +771,20 @@ pub(crate) fn fill(
     layout.put(block, Column::Slots, &sampler_slots)?;
     layout.put(block, Column::SlotRows, &slot_rows)?;
 
-    // A serving row's pages are its slot's row of the pooled tables; a paired forward's are
-    // its own row of the scratch set's table.
-    if paired {
-        let own: Vec<u32> = (0..bucket.rows).collect();
-        layout.put(block, Column::TableRows, &own)?;
-    } else {
-        layout.put(block, Column::TableRows, &slot_rows)?;
+    // A serving row's pages are its slot's row of the pooled tables. A paired forward's row
+    // gathers the row of the scratch set's table that begins at its first page; a row that takes
+    // no page, and every row past the batch's, gathers row zero and reads no key of it.
+    match scratch {
+        Some(spans) => {
+            let mut first = vec![0_u32; bucket_rows];
+            for (row, span) in first.iter_mut().zip(spans) {
+                if !span.is_empty() {
+                    *row = span.start;
+                }
+            }
+            layout.put(block, Column::TableRows, &first)?;
+        }
+        None => layout.put(block, Column::TableRows, &slot_rows)?,
     }
 
     // A call's state is its slot's, which its rows share: the slot of the first row it owns.
@@ -815,7 +827,7 @@ pub(crate) fn fill(
     // ---- The commit: one row per call, the rest of the table inert ----
 
     // A paired forward commits nothing: the slots' state is the serving requests'.
-    let mut table = if paired {
+    let mut table = if scratch.is_some() {
         sampler::commit_table(&sampler::inert_commit(calls), calls, layout.rows)?
     } else {
         sampler::commit_table(&columns.commit, calls, layout.rows)?
@@ -947,48 +959,112 @@ pub(crate) fn idle(bucket: &Bucket, page_size: u32, max_kv_len: u32) -> Columns 
     }
 }
 
-/// The cache slots a paired forward writes for a batch: the batch's own tokens, in the scratch
-/// page set's numbering, as `[tokens]` U32.
+/// The pages of the scratch page set each row of a paired forward of `rows` takes, as ranges of
+/// the set's numbering, for pages of `page_size` tokens (module documentation, a paired
+/// forward).
 ///
-/// A slot is flat over one plane's pages, `page · page_size + offset`, and the scratch set
-/// gives row `r` the pages `r · pages .. (r + 1) · pages`, which is what its page table
-/// states. Token `t` of row `r` at cache position `p` therefore writes
-/// `(r · pages + p / page_size) · page_size + p % page_size`: a slot of the row's own scratch
-/// pages, and never one a serving request reads. A token the batch does not write (a negative
-/// cache position) writes nothing here either and holds [`NO_SLOT`].
+/// The set hands its pages to the rows in order: row `r` takes `ceil(reach / page_size)` pages
+/// from the first page row `r − 1` left, where `reach` is the context the row reads, its keys
+/// (`seq_lens`), or the position after the last token it writes when that lies further. A row
+/// that reads and writes nothing takes no page. The end of the last range is the pages the
+/// rows take together, which a set of fewer pages cannot hold.
+///
+/// # Errors
+///
+/// [`Error::Invariant`] for a page size of zero, or offsets, lengths and cache positions that
+/// describe different rows or token counts; [`Error::Invalid`] for a negative length or offset,
+/// or rows that take more pages than a page number holds.
+pub(crate) fn scratch_spans(rows: &Rows, page_size: u32) -> Result<Vec<Range<u32>>> {
+    if page_size == 0 {
+        return Err(Error::Invariant(
+            "a scratch page set needs a page size above zero".into(),
+        ));
+    }
+
+    let offsets = &rows.query_offsets;
+    let tokens = rows.cache_positions.len();
+    let closes = offsets
+        .last()
+        .is_some_and(|end| usize::try_from(*end).is_ok_and(|end| end == tokens));
+    if offsets.len() != rows.seq_lens.len() + 1 || !closes {
+        return Err(Error::Invariant(
+            "the batch's offsets, lengths and cache positions describe different rows or token \
+             counts"
+                .into(),
+        ));
+    }
+
+    let mut spans = Vec::with_capacity(rows.seq_lens.len());
+    let mut next = 0_u32;
+    for (row, (keys, span)) in rows.seq_lens.iter().zip(offsets.windows(2)).enumerate() {
+        let start = count("query offset", span[0])? as usize;
+        let end = count("query offset", span[1])? as usize;
+        let positions = rows.cache_positions.get(start..end).ok_or_else(|| {
+            Error::Invariant(format!(
+                "row {row}'s packed query offsets are {start}..{end}"
+            ))
+        })?;
+
+        // A token the row does not write states a negative position. A position is an `i32`,
+        // so the one after it is a `u32`.
+        let written = positions
+            .iter()
+            .filter_map(|position| u32::try_from(*position).ok())
+            .map(|position| position + 1)
+            .max()
+            .unwrap_or(0);
+        let reach = count("sequence length", *keys)?.max(written);
+
+        let end = next.checked_add(reach.div_ceil(page_size)).ok_or_else(|| {
+            Error::Invalid(format!(
+                "row {row} takes scratch pages past the {} a page number holds",
+                u32::MAX
+            ))
+        })?;
+        spans.push(next..end);
+        next = end;
+    }
+    Ok(spans)
+}
+
+/// The cache slots a paired forward writes for a batch whose rows take the scratch pages
+/// `spans` ([`scratch_spans`]): the batch's own tokens, as `[tokens]` U32.
+///
+/// A slot is flat over one plane's pages, `page · page_size + offset`, so token `t` of row `r`
+/// at cache position `p` writes `(spans[r].start + p / page_size) · page_size + p % page_size`:
+/// a slot of the row's own scratch pages, and never one a serving request reads. A token the
+/// batch does not write (a negative cache position) writes nothing here either and holds
+/// [`NO_SLOT`].
 ///
 /// `cache_positions` is the batch's `[tokens]` column and `query_offsets` its `[rows + 1]`
 /// packed offsets.
 ///
 /// # Errors
 ///
-/// [`Error::Invariant`] for a scratch set of no page or columns that describe different token
-/// counts; [`Error::Invalid`] for a token whose position lies past the row's scratch pages.
+/// [`Error::Invariant`] for a page size of zero, spans of other rows than the offsets', columns
+/// that describe different token counts, or a token whose position lies past its row's pages;
+/// [`Error::Invalid`] for a slot past those a cache column addresses.
 pub(crate) fn scratch_slot_mapping(
     cache_positions: &[i32],
     query_offsets: &[i32],
-    pages: u32,
+    spans: &[Range<u32>],
     page_size: u32,
 ) -> Result<Vec<u32>> {
-    if page_size == 0 || pages == 0 {
-        return Err(Error::Invariant(
-            "a scratch page set needs a page count and a page size above zero".into(),
-        ));
-    }
-
     let tokens = cache_positions.len();
     let closes = query_offsets
         .last()
         .is_some_and(|end| usize::try_from(*end).is_ok_and(|end| end == tokens));
-    if query_offsets.len() < 2 || !closes {
+    if page_size == 0 || query_offsets.len() != spans.len() + 1 || !closes {
         return Err(Error::Invariant(
-            "the batch's offsets and cache positions describe different token counts".into(),
+            "a paired forward's scratch pages, offsets and cache positions describe different \
+             rows or token counts"
+                .into(),
         ));
     }
 
     let mut mapping = vec![NO_SLOT; tokens];
-    for (row, span) in query_offsets.windows(2).enumerate() {
-        let (start, end) = (span[0], span[1]);
+    for (row, (span, offsets)) in spans.iter().zip(query_offsets.windows(2)).enumerate() {
+        let (start, end) = (offsets[0], offsets[1]);
         if start < 0 || end < start {
             return Err(Error::Invariant(format!(
                 "row {row}'s packed query offsets are {start}..{end}"
@@ -1000,15 +1076,15 @@ pub(crate) fn scratch_slot_mapping(
                 continue;
             };
             let (page, offset) = (position / page_size, position % page_size);
-            if page >= pages {
-                return Err(Error::Invalid(format!(
-                    "row {row} writes position {position}, which needs page {page} of a scratch \
-                     set of {pages} pages a row"
+            if page >= span.len() as u32 {
+                return Err(Error::Invariant(format!(
+                    "row {row} writes position {position}, which needs page {page} of the {} \
+                     scratch pages it takes",
+                    span.len()
                 )));
             }
 
-            let slot =
-                u64::from(row as u32 * pages + page) * u64::from(page_size) + u64::from(offset);
+            let slot = u64::from(span.start + page) * u64::from(page_size) + u64::from(offset);
             mapping[token] = u32::try_from(slot)
                 .ok()
                 .filter(|slot| *slot != NO_SLOT)
@@ -1038,7 +1114,7 @@ pub(crate) fn scratch_column(
     cache_positions: &[i32],
     query_offsets: &[i32],
     tokens: usize,
-    pages: u32,
+    spans: &[Range<u32>],
     page_size: u32,
 ) -> Result<Vec<u32>> {
     if cache_positions.len() > tokens {
@@ -1051,7 +1127,7 @@ pub(crate) fn scratch_column(
     let mut mapping = if cache_positions.is_empty() {
         Vec::new()
     } else {
-        scratch_slot_mapping(cache_positions, query_offsets, pages, page_size)?
+        scratch_slot_mapping(cache_positions, query_offsets, spans, page_size)?
     };
     mapping.resize(tokens, NO_SLOT);
     Ok(mapping)
