@@ -155,22 +155,15 @@ fn differing(served: &EngineConfig, target: &EngineConfig) -> Vec<&'static str> 
 /// set of graph buckets. Two epochs of one layout name the same regions; two
 /// of different layouts have regions of their own over the same device
 /// memory, so the drain gives the serving epoch's back (`shrink`) and the
-/// target grows into it. The cache's size and its tiers are no layout.
+/// target grows into it. The cache's size and its tiers are no layout. The
+/// engine names its device KV regions by the same layout
+/// (`EngineConfig::layout_hash`).
 fn layouts_differ(serving: &[EngineConfig], target: &[EngineConfig]) -> bool {
-    let layout = |config: &EngineConfig| {
-        (
-            config.parallel.clone(),
-            config.max_running_requests,
-            config.kv_cache.block_size,
-            config.kv_cache.dtype,
-            config.cuda_graph.clone(),
-        )
-    };
     serving.len() != target.len()
         || serving
             .iter()
             .zip(target)
-            .any(|(serving, target)| layout(serving) != layout(target))
+            .any(|(serving, target)| serving.layout_hash() != target.layout_hash())
 }
 
 impl Leader {

@@ -113,6 +113,10 @@ pub struct Engine {
     /// The Build Server's client and the targets of the node's devices, which a generation's
     /// kernels are selected and installed through; a preparation fails without it.
     pub(crate) build: Option<(Arc<Mutex<build_server::Client>>, Vec<Target>)>,
+    /// The kernel packages the first generation serves, by slot: what the ranks' selections of
+    /// their profiled keys name together (`crate::modules::select::served`); none for ranks that
+    /// resolve no kernel, as on the meta device.
+    pub(crate) kernels: proto::module::Packages,
     /// On the scheduler node, the links to the epoch's other main processes.
     pub(crate) remotes: Vec<Arc<Remote>>,
     /// On a peer, its link to the scheduler node.
@@ -174,7 +178,7 @@ impl Engine {
     /// Each scheduler's policy is instantiated on the scheduler's own state, so the replicas and
     /// the phases its groups serve are what it starts from. The generation batches are assembled
     /// for is [`FIRST_GENERATION`]. The ranks' side is empty: no worker, a weight binding of no
-    /// rank, no head, Build Server or peer link.
+    /// rank, no head, Build Server, kernel package or peer link.
     ///
     /// # Errors
     ///
@@ -339,6 +343,7 @@ impl Engine {
             )),
             head: None,
             build: None,
+            kernels: proto::module::Packages::new(),
             remotes: Vec::new(),
             upstream: None,
             prepared: None,
@@ -511,7 +516,10 @@ pub(crate) fn start(
     };
 
     // Step 9 of each rank: the kernels its profile run names, selected for the devices'
-    // architectures and installed on its own device as the start's generation.
+    // architectures and installed on its own device as the start's generation. Each device's
+    // selection is kept: together they are what the first generation serves, which an update is
+    // compared with, and not the module set's candidates, which name every package installed.
+    let selections: Mutex<Vec<proto::module::Packages>> = Mutex::new(Vec::new());
     let targets = if meta {
         Vec::new()
     } else {
@@ -533,6 +541,7 @@ pub(crate) fn start(
         let (packages, routes) =
             load::select(&mut client, &targets, &launch.modules.kernels, &by_operator)?;
         let entries = load::install(&mut client, device, &packages, &routes)?;
+        service::lock(&selections).push(packages);
         Ok(Arc::new(Generation::new(FIRST_GENERATION, entries)))
     };
     let backing = if meta {
@@ -544,25 +553,31 @@ pub(crate) fn start(
         }
     };
     let mut ranks = load_ranks(model_runner.ranks()?, backing, launch, meeting)?;
+    let kernels = crate::modules::select::served(service::lock(&selections).iter());
     let build = build.map(|client| (client, targets));
     if let Some(channel) = upstream {
-        return start_peer(
+        let mut engine = start_peer(
             launch,
             storage,
             (&model_runner, ranks),
             build,
             channel,
             liveness,
-        );
+        )?;
+        engine.kernels = kernels;
+        return Ok(engine);
     }
 
     // The session, opened before the ranks map memory: its device KV regions state no segment.
     // From the answer on, the layout states each region numbered as the buffer pool holds it: a
-    // region an earlier epoch named keeps that epoch's numbering.
+    // region an earlier epoch named keeps that epoch's numbering. The session is this engine's,
+    // named by its launch generation: a standby opens its own beside the serving engine's, of the
+    // same epoch, and maps the regions both name.
     let mut head = StorageClient::connect_head(
         Path::new(&storage.socket),
         &launch.engine_config.deployment,
         launch.epoch,
+        launch.engine,
     )?;
     let pairs = head.open(layout(launch, &ranks)?)?;
     let (open, opened) = head
@@ -665,6 +680,7 @@ pub(crate) fn start(
     engine.binding = binding;
     engine.counters = counters;
     engine.head = Some(head);
+    engine.kernels = kernels;
     engine.video = video;
     engine.build = build;
     if !remotes.is_empty() {
@@ -759,6 +775,7 @@ fn start_peer(
         Path::new(&storage.socket),
         &launch.engine_config.deployment,
         launch.epoch,
+        launch.engine,
     )?;
     hosts.open_hosts(&open)?;
 
@@ -830,6 +847,8 @@ fn start_peer(
         binding,
         head: None,
         build,
+        // The caller states what the peer's ranks selected.
+        kernels: proto::module::Packages::new(),
         video: Vec::new(),
         remotes: Vec::new(),
         upstream: Some(upstream),

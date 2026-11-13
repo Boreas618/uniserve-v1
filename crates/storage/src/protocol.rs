@@ -76,13 +76,15 @@
 //! [`Link`], within the link's byte budget, which a head halves and restores
 //! ([`Request::Throttle`]).
 //!
-//! **Session.** An engine epoch's session with the buffer pool of its
+//! **Session.** An engine's session with the buffer pool of its
 //! deployment on the host (`crate::runtime`): the engine's main process, a
-//! [`Role::Head`] of the epoch, opens it with [`Request::Open`] and gets one
-//! queue pair per scheduler, on which every request of the buffer pool
-//! travels in shared memory; it ends it with [`Request::Close`] once its
-//! workers have stopped, and the server closes it when the engine's
-//! processes are gone. Each rank states where its part of a device region's
+//! [`Role::Head`] of its epoch that states its launch generation, opens it
+//! with [`Request::Open`] and gets one queue pair per scheduler, on which
+//! every request of the buffer pool travels in shared memory; it ends it
+//! with [`Request::Close`] once its workers have stopped, and the server
+//! closes it when the engine's processes are gone. An epoch has a session
+//! per engine of it on the host: the serving engine's and its standby's,
+//! or a lost engine's and its relaunch's. Each rank states where its part of a device region's
 //! units lies ([`Request::Place`]), or the head states it for a rank of
 //! another host ([`Request::PlaceRemote`]), and each rank takes its part of
 //! a host region, which the server creates ([`Request::HostPart`]). The
@@ -117,7 +119,7 @@ use crate::runtime::{Open, Opened};
 /// (`proto::ENGINE_INTERFACE_VERSION`, through `proto::STORAGE_PROTOCOL`, which
 /// a change of this version changes with it), so an engine built for another
 /// storage protocol is refused at its hello to the daemon as well.
-pub const VERSION: u32 = 24;
+pub const VERSION: u32 = 25;
 
 /// The most bytes a [`Request::Read`] responds with: a weight manifest of the
 /// largest models the library serves fits many times over, and a reply of
@@ -185,7 +187,16 @@ pub enum Role {
     /// and it reads its own epoch's pages and those every epoch shares.
     /// Uncommitted epochs keep pages and tensors private until publication;
     /// retiring such an epoch discards its pages.
-    Head { deployment: String, epoch: u64 },
+    ///
+    /// An engine's main process also states its launch `generation`, the
+    /// one its workers state ([`Role::Worker`]), which names its session
+    /// among the sessions of its epoch; zero for a head that opens none.
+    Head {
+        deployment: String,
+        epoch: u64,
+        #[serde(default)]
+        generation: u64,
+    },
     /// A worker of `scope` in `epoch`, started by the launch `generation` of
     /// its group, for the head that holds `claim`.
     Worker {
@@ -1132,23 +1143,24 @@ pub enum Request {
         failure: Option<String>,
     },
     /// From an engine's main process, a [`Role::Head`] of the epoch the
-    /// layout states, connected on the host: open the epoch's session with
-    /// the buffer pool of its deployment (`specs/buffer-pool.md` §11).
+    /// layout states, connected on the host: open the engine's session with
+    /// the buffer pool of its deployment (`specs/buffer-pool.md` §11), one of
+    /// its epoch's sessions, named by the head's launch generation.
     /// Responded with [`Response::Opened`], with the descriptor of each
     /// scheduler's queue pair, in the order of [`Open::schedulers`]; the
     /// server's end of each is served from then on. A region another
     /// session of the deployment stated under the same name is that
     /// region, and groups that state one device memory read and write the
     /// same memory. Refused, opening nothing, when the server does not
-    /// serve the interface version the layout states, when the epoch's
-    /// session is open (or its engine's processes have not left since it
-    /// lost its connection), or when the layout does not fit the buffer
+    /// serve the interface version the layout states, when the engine's
+    /// session is open (or its processes have not left since it lost its
+    /// connection), or when the layout does not fit the buffer
     /// pool: a region stated again with another tier, space, unit size or
     /// numbering, or more than eight device memories over the deployment's
     /// sessions. A host region's storage is admitted part by part, as each
     /// rank of this host takes its part ([`Request::HostPart`]), not here.
     Open(Open),
-    /// From the engine's main process that opened its epoch's session: its
+    /// From the engine's main process that opened its session: its
     /// workers have stopped, and the session closes as the session of an
     /// engine that is gone (`specs/buffer-pool.md` §12.4). Responded with
     /// [`Response::Closed`].

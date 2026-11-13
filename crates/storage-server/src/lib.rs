@@ -782,12 +782,22 @@ impl Server {
                 self.finished(*task, results);
                 Ok(Handling::Response(Response::Finished, Vec::new()))
             }
-            (Request::Open(open), Role::Head { deployment, epoch }) => {
-                self.open_pool(id, &deployment, epoch, open)
-            }
-            (Request::Close, Role::Head { deployment, epoch }) => {
-                self.close_pool(&deployment, epoch)
-            }
+            (
+                Request::Open(open),
+                Role::Head {
+                    deployment,
+                    epoch,
+                    generation,
+                },
+            ) => self.open_pool(id, (&deployment, epoch, generation), open),
+            (
+                Request::Close,
+                Role::Head {
+                    deployment,
+                    epoch,
+                    generation,
+                },
+            ) => self.close_pool((&deployment, epoch, generation)),
             (
                 Request::PlaceRemote {
                     region,
@@ -796,7 +806,9 @@ impl Server {
                     endpoint,
                     runs,
                 },
-                Role::Head { deployment, epoch },
+                Role::Head {
+                    deployment, epoch, ..
+                },
             ) => self.place_remote(
                 id,
                 (&deployment, epoch),
@@ -811,11 +823,16 @@ impl Server {
                     first,
                     units,
                 },
-                Role::Head { deployment, epoch },
+                Role::Head {
+                    deployment, epoch, ..
+                },
             ) => self.grant(id, (&deployment, epoch), region, *segment, (*first, *units)),
-            (Request::Withdraw { region, segment }, Role::Head { deployment, epoch }) => {
-                self.withdraw(id, (&deployment, epoch), region, *segment)
-            }
+            (
+                Request::Withdraw { region, segment },
+                Role::Head {
+                    deployment, epoch, ..
+                },
+            ) => self.withdraw(id, (&deployment, epoch), region, *segment),
             (Request::PeerHold { deployment, keys }, Role::Peer) => {
                 self.peer_hold(id, deployment, keys)
             }

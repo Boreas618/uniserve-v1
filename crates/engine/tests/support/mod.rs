@@ -76,7 +76,7 @@ pub(crate) fn workspace() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../..")
 }
 
-/// The launch of epoch 1's one main process, serving the Qwen3-MoE fixture on one rank of one
+/// The launch of epoch 1's one main process, engine 1, serving the Qwen3-MoE fixture on one rank of one
 /// group of [`SLOTS`] request slots, on the device the configuration defaults to: decode buckets
 /// of one and two rows, prefill buckets of up to 32 tokens, and the `fcfs` policy package, whose
 /// limits the deployment pins to what those buckets serve.
@@ -162,6 +162,7 @@ pub(crate) fn launch() -> EngineArgs {
 
     let mut launch = EngineArgs::new(config, modules);
     launch.epoch = 1;
+    launch.engine = 1;
     launch.host = "localhost".to_owned();
     launch.devices = vec![0];
     launch.group = group.id.0.clone();

@@ -68,7 +68,7 @@ use storage::protocol::{
 };
 use storage::runtime::{self, Open, RequestId, Source, Tier};
 
-use crate::buffer_pool::QueueId;
+use crate::buffer_pool::{ClientId as PoolSession, QueueId};
 use crate::kv_storage::Task;
 use crate::{
     Attachment, Client, ClientId, Handling, Holder, Server, StorageEntry, StorageId, invalid,
@@ -106,6 +106,11 @@ type Placed = (Option<String>, Vec<UnitRun>);
 /// A session: its deployment and its epoch.
 type Session = (String, u64);
 
+/// An engine's session: its deployment, its epoch and the launch generation of the engine that
+/// opened it. An epoch has a session per engine of it on the host: the serving engine's, its
+/// standby's, a lost engine's beside its relaunch's.
+type Engine = (String, u64, u64);
+
 /// The pages of a part of a host region a connector task moves, with the
 /// copy of the pool's task each page is of.
 type Pages = (Vec<(Key, u32)>, Vec<usize>);
@@ -113,13 +118,14 @@ type Pages = (Vec<(Key, u32)>, Vec<usize>);
 /// The server's sessions and what it keeps for the buffer pools.
 pub(crate) struct Sessions {
     pub(crate) thread: polling::Thread,
-    /// The open sessions by deployment and epoch, with the client of the
-    /// engine's main process that opened each, while it is connected.
-    open: BTreeMap<(String, u64), ClientId>,
-    /// The sessions whose opener's connection closed, with the engine's
-    /// processes the server waits for: each closes once all of them have
-    /// exited and no GPU lists them.
-    gone: BTreeMap<(String, u64), Vec<Arc<OwnedFd>>>,
+    /// The open sessions by engine, each with the client of the engine's
+    /// main process that opened it, while it is connected, and its number in
+    /// the pool.
+    open: BTreeMap<Engine, (ClientId, PoolSession)>,
+    /// The sessions whose opener's connection closed, each with its number
+    /// in the pool and the engine's processes the server waits for: each
+    /// closes once all of them have exited and no GPU lists them.
+    gone: BTreeMap<Engine, (PoolSession, Vec<Arc<OwnedFd>>)>,
     /// The host regions the sessions stated, by deployment and name: the
     /// limit of their numbering and their bytes of a unit, summed over the
     /// parts.
@@ -143,8 +149,9 @@ pub(crate) struct Sessions {
     /// The tasks of a child whose connection closed, with the child's
     /// process: each ends once that process has exited.
     lost: Vec<(u32, u64)>,
-    /// The epochs on trial whose update was rolled back while their session
-    /// was open: the pool rolls each back once its session closes.
+    /// The epochs on trial whose update was rolled back while a session of
+    /// theirs was open: the pool rolls each back once its last session
+    /// closes.
     rolled: BTreeSet<(String, u64)>,
     /// How long a transfer between worker groups may take. A helper that
     /// runs one on another host cancels it after that long too, and then
@@ -210,10 +217,10 @@ pub(crate) struct SessionsHandoff {
     #[serde(with = "serde_bytes")]
     image: Vec<u8>,
     pub(crate) queues: usize,
-    open: Vec<((String, u64), ClientId)>,
+    open: Vec<(Engine, (ClientId, PoolSession))>,
     /// The sessions waiting for their engine's processes, each process by
     /// the index of its pidfd in the handoff.
-    gone: Vec<((String, u64), Vec<usize>)>,
+    gone: Vec<(Engine, (PoolSession, Vec<usize>))>,
     hosts: Vec<((String, String), (u32, u64))>,
     parts: Vec<((String, String, u32), Part)>,
     places: Vec<(Place, Placed)>,
@@ -293,7 +300,9 @@ impl Sessions {
             open: std::mem::take(&mut self.open).into_iter().collect(),
             gone: std::mem::take(&mut self.gone)
                 .into_iter()
-                .map(|(session, pidfds)| (session, pidfds.iter().map(&mut pidfd).collect()))
+                .map(|(engine, (pool, pidfds))| {
+                    (engine, (pool, pidfds.iter().map(&mut pidfd).collect()))
+                })
                 .collect(),
             hosts: std::mem::take(&mut self.hosts).into_iter().collect(),
             parts: std::mem::take(&mut self.parts).into_iter().collect(),
@@ -318,12 +327,12 @@ impl Sessions {
         let thread = polling::Thread::start(limits, image)?;
         let mut sessions = Self::with(thread)?;
         sessions.open = handoff.open.into_iter().collect();
-        for (session, indices) in handoff.gone {
+        for (engine, (pool, indices)) in handoff.gone {
             let pidfds = indices
                 .into_iter()
                 .map(&pidfd)
                 .collect::<std::io::Result<_>>()?;
-            sessions.gone.insert(session, pidfds);
+            sessions.gone.insert(engine, (pool, pidfds));
         }
         sessions.hosts = handoff.hosts.into_iter().collect();
         sessions.parts = handoff.parts.into_iter().collect();
@@ -425,12 +434,12 @@ fn spans(from: &[UnitRun], to: &[UnitRun], first: u32, count: u32) -> Result<Vec
 }
 
 impl Server {
-    /// See [`Request::Open`], from the head `id` of `epoch` of `deployment`.
+    /// See [`Request::Open`], from the head `id` of `epoch` of `deployment`, the main process
+    /// of the engine of launch `generation`.
     pub(crate) fn open_pool(
         &mut self,
         id: ClientId,
-        deployment: &str,
-        epoch: u64,
+        (deployment, epoch, generation): (&str, u64, u64),
         open: &Open,
     ) -> Result<Handling, (ErrorKind, String)> {
         if self
@@ -455,13 +464,16 @@ impl Server {
                 open.version
             )));
         }
+        // One session per engine: another engine of the epoch (its standby, a relaunch beside a
+        // lost engine) opens one of its own.
         let session = (deployment.to_owned(), epoch);
-        if self.sessions.open.contains_key(&session) || self.sessions.gone.contains_key(&session) {
+        let engine = (deployment.to_owned(), epoch, generation);
+        if self.sessions.open.contains_key(&engine) || self.sessions.gone.contains_key(&engine) {
             return Err((
                 ErrorKind::Held,
                 format!(
-                    "the session of epoch {epoch} of {deployment} is open, or its engine's \
-                     processes have not left yet"
+                    "the session of engine {generation} of epoch {epoch} of {deployment} is \
+                     open, or its engine's processes have not left yet"
                 ),
             ));
         }
@@ -486,23 +498,21 @@ impl Server {
             .thread
             .call(move |pools| pools.open(&named, &layout))
             .ok_or_else(|| resource(std::io::Error::other("the buffer pool's thread ended")))?;
-        let (opened, descriptors) = opened.map_err(|refusal| invalid(&refusal))?;
+        let (pool, opened, descriptors) = opened.map_err(|refusal| invalid(&refusal))?;
         for region in new {
             self.sessions.hosts.insert(
                 (deployment.to_owned(), region.name.clone()),
                 (region.limit, region.unit_bytes),
             );
         }
-        self.sessions
-            .peers
-            .insert(session.clone(), open.peers.clone());
-        self.sessions.open.insert(session, id);
+        self.sessions.peers.insert(session, open.peers.clone());
+        self.sessions.open.insert(engine, (id, pool));
         Ok(Handling::Descriptors(Response::Opened(opened), descriptors))
     }
 
     /// Whether the head `id` of `epoch` of `deployment` is on the host and
-    /// the epoch's session is open: what the requests a head makes about its
-    /// session's memory need.
+    /// holds its engine's session open: what the requests a head makes about
+    /// its session's memory need.
     fn session_head(
         &self,
         id: ClientId,
@@ -516,16 +526,38 @@ impl Server {
         {
             return Err(invalid("a session's memory is stated on its host"));
         }
-        if !self
+        let held = self
             .sessions
             .open
-            .contains_key(&(deployment.to_owned(), epoch))
-        {
+            .iter()
+            .any(|((of, at, _), (head, _))| of == deployment && *at == epoch && *head == id);
+        if !held {
             return Err(invalid(&format!(
                 "no session of epoch {epoch} of {deployment} is open"
             )));
         }
         Ok(())
+    }
+
+    /// What the end of `engine`'s session leaves of its epoch, the server
+    /// holding it open no more: when it was its epoch's last session, the
+    /// peers the epoch names go, and the return is whether the epoch's
+    /// update was rolled back while it was open, which the pool then rolls
+    /// back. An epoch's other sessions (its engine's standby) keep both.
+    fn epoch_ends(&mut self, engine: &Engine) -> bool {
+        let (deployment, epoch, _) = engine;
+        let others = self
+            .sessions
+            .open
+            .keys()
+            .chain(self.sessions.gone.keys())
+            .any(|(of, at, _)| of == deployment && at == epoch);
+        if others {
+            return false;
+        }
+        let session = (deployment.clone(), *epoch);
+        self.sessions.peers.remove(&session);
+        self.sessions.rolled.remove(&session)
     }
 
     /// See [`Request::Grant`], from the head `id` of `epoch` of `deployment`.
@@ -582,34 +614,33 @@ impl Server {
         Ok(Handling::Response(Response::Withdrawn, Vec::new()))
     }
 
-    /// See [`Request::Close`], from a head of `epoch` of `deployment`.
+    /// See [`Request::Close`], from the head of `epoch` of `deployment`
+    /// that opened the session of its engine of launch `generation`.
     pub(crate) fn close_pool(
         &mut self,
-        deployment: &str,
-        epoch: u64,
+        (deployment, epoch, generation): (&str, u64, u64),
     ) -> Result<Handling, (ErrorKind, String)> {
-        let session = (deployment.to_owned(), epoch);
-        let known = self.sessions.open.remove(&session).is_some()
-            | self.sessions.gone.remove(&session).is_some();
-        self.sessions.peers.remove(&session);
-        let rolled = self.sessions.rolled.remove(&session);
+        let engine = (deployment.to_owned(), epoch, generation);
+        let pool = match self.sessions.open.remove(&engine) {
+            Some((_, pool)) => Some(pool),
+            None => self.sessions.gone.remove(&engine).map(|(pool, _)| pool),
+        };
+        let Some(pool) = pool else {
+            return Err(invalid(&format!(
+                "no session of engine {generation} of epoch {epoch} of {deployment} is open"
+            )));
+        };
+        let rolled = self.epoch_ends(&engine);
         let named = deployment.to_owned();
-        let closed = self
-            .sessions
+        self.sessions
             .thread
             .call(move |pools| {
-                let closed = pools.close(&named, epoch);
+                pools.close(&named, pool);
                 if rolled {
                     pools.roll_back(&named, epoch);
                 }
-                closed
             })
-            .unwrap_or(false);
-        if !known && !closed {
-            return Err(invalid(&format!(
-                "no session of epoch {epoch} of {deployment} is open"
-            )));
-        }
+            .ok_or_else(|| resource(std::io::Error::other("the buffer pool's thread ended")))?;
         Ok(Handling::Response(Response::Closed, Vec::new()))
     }
 
@@ -869,23 +900,31 @@ impl Server {
     pub(crate) fn sessions_client_gone(&mut self, id: ClientId, client: &Client) {
         match &client.role {
             Some(Role::Peer) => self.sessions.thread.send(move |pools| pools.peer_gone(id)),
-            Some(Role::Head { deployment, epoch }) => {
-                let session = (deployment.clone(), *epoch);
-                if self.sessions.open.get(&session) == Some(&id) {
-                    self.follow_engine(session, client);
+            Some(Role::Head {
+                deployment,
+                epoch,
+                generation,
+            }) => {
+                let engine = (deployment.clone(), *epoch, *generation);
+                if let Some(&(head, pool)) = self.sessions.open.get(&engine)
+                    && head == id
+                {
+                    self.follow_engine(engine, pool, client);
                 }
             }
             _ => {}
         }
     }
 
-    /// Follows the processes of the engine of `session`, whose main
-    /// process's connection closed: that process, every worker of the epoch
-    /// connected, and every process that holds access to a tensor of the
-    /// epoch. Each is out once it has exited and no GPU the epoch's storage
-    /// lies on lists it.
-    fn follow_engine(&mut self, session: (String, u64), opener: &Client) {
-        let (deployment, epoch) = &session;
+    /// Follows the processes of `engine`, whose main process's connection
+    /// closed and whose session is `pool` in its deployment's pool: that
+    /// process, every worker of the engine (of its epoch and its launch
+    /// generation) connected, and every process of the engine that holds
+    /// access to a tensor of the epoch. Each is out once it has exited and no
+    /// GPU the epoch's storage lies on lists it. Another engine of the epoch,
+    /// its standby, is not followed: it serves on.
+    fn follow_engine(&mut self, engine: Engine, pool: PoolSession, opener: &Client) {
+        let (deployment, epoch, generation) = &engine;
         let mut processes: Vec<(i32, Arc<OwnedFd>)> = Vec::new();
         if let Some(pidfd) = &opener.pidfd {
             processes.push((opener.pid, Arc::clone(pidfd)));
@@ -893,24 +932,31 @@ impl Server {
         for client in self.clients.values() {
             if let (
                 Some(Role::Worker {
-                    scope, epoch: of, ..
+                    scope,
+                    epoch: of,
+                    generation: launched,
+                    ..
                 }),
                 Some(pidfd),
             ) = (&client.role, &client.pidfd)
                 && scope.deployment == *deployment
                 && of == epoch
+                && launched == generation
             {
                 processes.push((client.pid, Arc::clone(pidfd)));
             }
         }
         let mut gpus = BTreeSet::new();
         for tensor in self.tensors.values() {
-            let of_epoch =
-                |holder: &Holder| holder.scope.deployment == *deployment && holder.epoch == *epoch;
+            let of_engine = |holder: &Holder| {
+                holder.scope.deployment == *deployment
+                    && holder.epoch == *epoch
+                    && holder.generation == *generation
+            };
             let holders = tensor.writer.iter().chain(&tensor.standby);
             processes.extend(
                 holders
-                    .filter(|holder| of_epoch(holder))
+                    .filter(|holder| of_engine(holder))
                     .map(|holder| (holder.pid, Arc::clone(&holder.pidfd))),
             );
             let retained = tensor.retainers.iter().any(|retainer| {
@@ -939,38 +985,41 @@ impl Server {
         tracing::info!(
             deployment,
             epoch,
+            generation,
             processes = followed.len(),
             "an engine's main process left; its session closes once its processes are out"
         );
-        self.sessions.open.remove(&session);
-        self.sessions.gone.insert(session, followed);
+        self.sessions.open.remove(&engine);
+        self.sessions.gone.insert(engine, (pool, followed));
     }
 
     /// Closes every session whose engine's processes are all out.
     pub(crate) fn settle_sessions(&mut self) {
-        let out: Vec<(String, u64)> = self
+        let out: Vec<Engine> = self
             .sessions
             .gone
             .iter()
-            .filter(|(_, processes)| {
+            .filter(|(_, (_, processes))| {
                 processes
                     .iter()
                     .all(|pidfd| self.shootdowns.finished(pidfd))
             })
-            .map(|(session, _)| session.clone())
+            .map(|(engine, _)| engine.clone())
             .collect();
-        for session in out {
-            self.sessions.gone.remove(&session);
-            self.sessions.peers.remove(&session);
-            let rolled = self.sessions.rolled.remove(&session);
-            let (deployment, epoch) = session;
+        for engine in out {
+            let Some((pool, _)) = self.sessions.gone.remove(&engine) else {
+                continue;
+            };
+            let rolled = self.epoch_ends(&engine);
+            let (deployment, epoch, generation) = engine;
             tracing::info!(
                 deployment,
                 epoch,
+                generation,
                 "an engine's processes are out; its session closes"
             );
             self.sessions.thread.send(move |pools| {
-                pools.close(&deployment, epoch);
+                pools.close(&deployment, pool);
                 if rolled {
                     pools.roll_back(&deployment, epoch);
                 }
@@ -989,10 +1038,16 @@ impl Server {
 
     /// The head retired `epoch` of `deployment` on trial: its update is
     /// rolled back, and what it made in the buffer pool is evicted once its
-    /// session is closed.
+    /// last session is closed.
     pub(crate) fn update_rolled_back(&mut self, deployment: &str, epoch: u64) {
         let session = (deployment.to_owned(), epoch);
-        if self.sessions.open.contains_key(&session) || self.sessions.gone.contains_key(&session) {
+        let held = self
+            .sessions
+            .open
+            .keys()
+            .chain(self.sessions.gone.keys())
+            .any(|(of, at, _)| of == deployment && *at == epoch);
+        if held {
             self.sessions.rolled.insert(session);
             return;
         }
@@ -1497,8 +1552,8 @@ impl Server {
         self.sessions
             .thread
             .send(move |pools| pools.release(&named));
-        self.sessions.open.retain(|(of, _), _| of != deployment);
-        self.sessions.gone.retain(|(of, _), _| of != deployment);
+        self.sessions.open.retain(|(of, ..), _| of != deployment);
+        self.sessions.gone.retain(|(of, ..), _| of != deployment);
         self.sessions.hosts.retain(|(of, _), _| of != deployment);
         self.sessions.places.retain(|(of, ..), _| of != deployment);
         self.sessions.peers.retain(|(of, _), _| of != deployment);

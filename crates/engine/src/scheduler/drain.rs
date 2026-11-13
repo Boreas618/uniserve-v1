@@ -4,12 +4,14 @@
 //! an epoch of another layout also gives the device memory back as requests end, by `Resize`.
 //!
 //! The drain is answered by `reply_at_boundary` (`mod.rs`) once no request remains and, with
-//! `shrink`, no `Detach` and no `Resize` of the scheduler is still to be taken or answered and
-//! every device region answered a `Resize` submitted after the last `Detach` was answered.
-//! `shrink_regions` therefore asks for a region's units while something there is free beyond
-//! what the running requests may still take before they end, or still retiring once no request
-//! remains, and once after each `Detach` answered, whose units the capacity words read with its
-//! answer may not show yet; the shrink ends once nothing more frees.
+//! `shrink`, no `Resize` and no request that gives units back (`Scheduler::gives_back`: a
+//! `Detach`, the `Commit`s of a request that left, the `Store`s of its blocks to the host) of the
+//! scheduler is still to be taken or answered and every device region answered a `Resize`
+//! submitted after the last such request was answered. `shrink_regions` therefore asks for a
+//! region's units while something there is free beyond what the running requests may still take
+//! before they end, or still retiring once no request remains, and once after each such answer,
+//! whose units the capacity words read with it may not show yet; the shrink ends once nothing
+//! more frees.
 
 use std::time::Instant;
 
@@ -35,7 +37,7 @@ impl Scheduler {
         reply: Sender<()>,
     ) {
         self.draining = Some((reply, cause, deadline, shrink));
-        self.detached.fill(false);
+        self.released.fill(false);
         self.drain_due(Instant::now());
     }
 
@@ -80,7 +82,8 @@ impl Scheduler {
     /// or evictable now that no running request may still take before it ends
     /// (`Scheduler::units_to_end`), when there are such units; once no request remains, also
     /// while units still retire, which come free once the batches that may read them have ended;
-    /// and when a `Detach` was answered since the region's last `Resize` (`Scheduler::detached`).
+    /// and when a request that gives units back was answered since the region's last `Resize`
+    /// (`Scheduler::released`).
     /// A running request steps on to its end, and gives its units back as it leaves. The buffer
     /// pool evicts in the order this queue pair installed, the whole of each region's order
     /// while it shrinks (`install_victims`), and never takes a private or pinned block, so a
@@ -96,8 +99,8 @@ impl Scheduler {
             let available = self.available.get(index).copied().unwrap_or(0);
             let free = available.saturating_sub(kept.get(index).copied().unwrap_or(0));
             let retiring = self.retiring.get(index).copied().unwrap_or(0);
-            let detached = self.detached.get(index).copied().unwrap_or(false);
-            if free == 0 && (retiring == 0 || !ended) && !detached {
+            let released = self.released.get(index).copied().unwrap_or(false);
+            if free == 0 && (retiring == 0 || !ended) && !released {
                 continue;
             }
 
@@ -106,8 +109,8 @@ impl Scheduler {
                 region: number,
                 units: capacity.saturating_sub(free),
             });
-            if let Some(detached) = self.detached.get_mut(index) {
-                *detached = false;
+            if let Some(released) = self.released.get_mut(index) {
+                *released = false;
             }
         }
     }
@@ -347,6 +350,71 @@ mod tests {
         for (id, request) in resizes {
             let runtime::Request::Resize { units, .. } = request else {
                 continue;
+            };
+            let resized = Completion::Resized {
+                units,
+                evicted: Vec::new(),
+            };
+            bench.complete(id, &resized);
+        }
+        while let Some((id, owner, request, completion)) =
+            bench.scheduler.next_completion().unwrap()
+        {
+            bench.scheduler.answered(id, owner, request, completion);
+        }
+        bench.scheduler.drain_due(Instant::now());
+        bench.scheduler.reply_at_boundary();
+        assert_eq!(replied.try_recv(), Ok(()));
+    }
+
+    /// The host store of a block a request committed as it left holds the block's device copy
+    /// until it ends: a shrinking drain is answered only once the store was answered and every
+    /// device region answered a `Resize` submitted after it, which takes the block (SD §3.8; a
+    /// sleep then finds its regions holding no unit).
+    #[test]
+    fn a_shrinking_drain_answers_after_the_host_stores_of_its_blocks_end() {
+        let (mut bench, _outputs) = scheduler();
+        bench.scheduler.available = vec![0; 4];
+        let store = runtime::Request::Store {
+            group: A,
+            keys: vec![storage::Key([7; 32])],
+            tier: runtime::Tier::Host,
+        };
+        bench.scheduler.submit(store.clone());
+        let taken = {
+            bench.scheduler.post().unwrap();
+            bench.take()
+        };
+        let [(stored, ref request)] = taken[..] else {
+            panic!("the `Store` is written");
+        };
+        assert_eq!(*request, store);
+
+        // No request remains and nothing is free, but the store is outstanding: no answer.
+        let (reply, replied) = crossbeam_channel::bounded(1);
+        bench
+            .scheduler
+            .drain(MigrationCause::Drain, Instant::now(), true, reply);
+        bench.scheduler.reply_at_boundary();
+        assert!(replied.try_recv().is_err());
+
+        // The store ends; the words read with its answer may not show the block's units yet, so
+        // every device region is asked once more, and the drain waits for the answers.
+        bench.complete(stored, &Completion::Stored { keys: Vec::new() });
+        while let Some((id, owner, request, completion)) =
+            bench.scheduler.next_completion().unwrap()
+        {
+            bench.scheduler.answered(id, owner, request, completion);
+        }
+        bench.scheduler.drain_due(Instant::now());
+        bench.scheduler.reply_at_boundary();
+        assert!(replied.try_recv().is_err());
+        bench.scheduler.post().unwrap();
+        let resizes = bench.take();
+        assert_eq!(resizes.len(), 4, "{resizes:?}");
+        for (id, request) in resizes {
+            let runtime::Request::Resize { units, .. } = request else {
+                panic!("a `Resize` is written: {request:?}");
             };
             let resized = Completion::Resized {
                 units,

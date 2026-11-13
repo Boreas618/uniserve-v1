@@ -1,6 +1,6 @@
 //! Which packages a generation installs: the slots the Build Server's selection fills for each
-//! operator's descriptor keys, the keys each slot's package is asked for, and the operators a
-//! selection replaces or changes against what serves.
+//! operator's descriptor keys, the keys each slot's package is asked for, what the devices of a
+//! start serve together, and the operators a selection replaces or changes against what serves.
 //!
 //! The engine chooses nothing here. The Build Server owns coverage and selection
 //! (`BuildServer::cover`): for every key it returns the one package that builds it, the backend
@@ -93,6 +93,43 @@ pub(crate) fn selected_slots(
         routes.insert(slot, keys.clone());
     }
     Ok((slots, routes))
+}
+
+/// What the devices of a start serve together, from `selections`, each device's selection of the
+/// keys its own profile run names ([`crate::modules::load::select`]): every operator's packages
+/// in the slots one selection over the keys of every device fills, one package in the
+/// operator's single slot and several in a part slot each, named by the backend
+/// ([`selected_slots`]).
+///
+/// The Build Server selects each key's package alone, so the packages the devices' selections
+/// name are those an update's selection over all their keys names, and an operator an update
+/// keeps compares as unchanged ([`replaced_operators`], [`changed_operators`]) however the
+/// devices' keys divided it. A package is its backend: the module set fixes one revision of each.
+pub(crate) fn served<'a>(selections: impl IntoIterator<Item = &'a Packages>) -> Packages {
+    let mut by_operator: BTreeMap<&str, BTreeMap<&str, &PackageRevision>> = BTreeMap::new();
+    for selection in selections {
+        for (slot, package) in selection {
+            by_operator
+                .entry(slot.op.as_str())
+                .or_default()
+                .entry(package.backend.as_str())
+                .or_insert(package);
+        }
+    }
+
+    let mut served = Packages::new();
+    for (op, packages) in by_operator {
+        let divided = packages.len() > 1;
+        for (backend, package) in packages {
+            let slot = ModuleSlot {
+                op: op.to_owned(),
+                phase: None,
+                part: divided.then(|| backend.to_owned()),
+            };
+            served.insert(slot, package.clone());
+        }
+    }
+    served
 }
 
 /// Refuses a module built for another version of `operator`'s interface than this build
@@ -321,6 +358,47 @@ mod tests {
         let slot = ModuleSlot::all("dense_attention");
         assert_eq!(slots, vec![(slot.clone(), stated)]);
         assert_eq!(routes[&slot], keys.map(str::to_owned).to_vec());
+    }
+
+    /// A start serves what its devices selected, in the slots one selection over every device's
+    /// keys fills: one device whose keys one package covers and one whose keys two packages
+    /// divide serve the two packages in a part slot each. An update that selects the same
+    /// packages for the same keys under the module set's candidates, which name every backend
+    /// installed, replaces and changes no operator, so it installs no kernel again and shadows
+    /// none.
+    #[test]
+    fn a_start_serves_what_its_devices_selected_and_an_update_of_the_same_changes_nothing() {
+        let bf16 = "dtype_bf16_head_dim_128";
+        let f32 = "dtype_f32_head_dim_64";
+        let candidate = |backend: &str| ModuleSlot {
+            op: "dense_attention".to_owned(),
+            phase: None,
+            part: Some(backend.to_owned()),
+        };
+        let mut candidates = Packages::new();
+        for backend in ["f32", "fa4", "flashinfer"] {
+            candidates.insert(candidate(backend), package(backend, 1));
+        }
+        let selection = |covering: &build_server::Coverage| {
+            let (slots, _) = selected_slots("dense_attention", covering, &candidates)
+                .expect("every key is covered");
+            slots.into_iter().collect::<Packages>()
+        };
+
+        let one = selection(&coverage(&[("fa4", &[bf16])], &[]));
+        let two = selection(&coverage(&[("f32", &[f32]), ("fa4", &[bf16])], &[]));
+        let serving = served([&one, &two]);
+
+        let update = selection(&coverage(&[("f32", &[f32]), ("fa4", &[bf16])], &[]));
+        assert_eq!(serving, update);
+        assert!(replaced_operators(&update, &serving).is_empty());
+        assert!(changed_operators(&update, &serving).is_empty());
+
+        // Alone, the first device serves its one package in the operator's single slot.
+        assert_eq!(
+            served([&one]),
+            Packages::from([(ModuleSlot::all("dense_attention"), package("fa4", 1))])
+        );
     }
 
     /// A key the forward launches and no installed package covers refuses the operator, naming the

@@ -142,6 +142,7 @@ pub(crate) fn head(socket: &Path) -> Client {
         Role::Head {
             deployment: "model".into(),
             epoch: 0,
+            generation: 0,
         },
     )
     .unwrap()
@@ -592,6 +593,7 @@ fn head_of(socket: &Path, deployment: &str) -> Client {
         Role::Head {
             deployment: deployment.into(),
             epoch: 0,
+            generation: 0,
         },
     )
     .unwrap()
@@ -795,6 +797,7 @@ pub(crate) fn engine_head(socket: &Path, epoch: u64) -> Client {
         Role::Head {
             deployment: "model".into(),
             epoch,
+            generation: 0,
         },
     )
     .unwrap()

@@ -90,6 +90,7 @@ fn rank(server: &StorageServer) -> (Client, Arc<StorageClient>) {
         Role::Head {
             deployment: DEPLOYMENT.into(),
             epoch: EPOCH,
+            generation: 0,
         },
     )
     .unwrap();

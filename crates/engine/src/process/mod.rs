@@ -312,8 +312,10 @@ impl MainProcess {
         let timeout = launch
             .watchdog_timeout()
             .unwrap_or(launch.engine_config.worker.watchdog_timeout);
-        let mut serving = launch.modules.kernels.clone();
-        serving.insert(policy_slot(), launch.modules.policy.clone());
+        // The module set's kernels are candidates, every package installed for an operator; the
+        // kernels the first generation serves are those its start selected, added once it ends
+        // (`started`).
+        let serving = Packages::from([(policy_slot(), launch.modules.policy.clone())]);
         Ok(Self {
             inbox,
             fronts: vec![Some(front)],
@@ -594,6 +596,7 @@ impl MainProcess {
                 return self.fail(format!("the start failed: {reason}"), fault);
             }
         };
+        self.serving.extend(engine.kernels.clone());
         self.engine = Some(engine);
         // An engine that failed while it started is left as it is when the control thread ends.
         if self.lifecycle != Lifecycle::Starting {

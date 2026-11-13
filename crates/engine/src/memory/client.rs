@@ -158,15 +158,24 @@ impl State {
 }
 
 impl StorageClient {
-    /// Connects to the Storage Server at `socket` as the head of `epoch` of `deployment`.
+    /// Connects to the Storage Server at `socket` as the head of `epoch` of `deployment`: the
+    /// main process of the engine its daemon started at launch `generation`
+    /// (`EngineArgs::engine`), whose ranks state the same generation. The generation names the
+    /// engine's session among those of its epoch (a standby's beside the serving engine's).
     ///
     /// # Errors
     ///
     /// When the server cannot be reached or refuses the head.
-    pub fn connect_head(socket: &Path, deployment: &str, epoch: u64) -> anyhow::Result<Self> {
+    pub fn connect_head(
+        socket: &Path,
+        deployment: &str,
+        epoch: u64,
+        generation: u64,
+    ) -> anyhow::Result<Self> {
         let role = Role::Head {
             deployment: deployment.to_owned(),
             epoch,
+            generation,
         };
         let client = Client::connect(socket, role).with_context(|| {
             format!(

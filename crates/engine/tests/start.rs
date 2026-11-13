@@ -283,12 +283,16 @@ fn started(
     }
 }
 
-/// Whether `storage` holds the session of `epoch`: a head of the epoch cannot open one again
-/// while it is open, or while its engine's processes have not left.
-fn holds_session(storage: &StorageServer, epoch: u64) -> bool {
-    let mut head =
-        engine::memory::client::StorageClient::connect_head(&storage.socket, DEPLOYMENT, epoch)
-            .unwrap();
+/// Whether `storage` holds the session of the engine of launch `generation` of `epoch`: a head of
+/// that engine cannot open one again while it is open, or while its processes have not left.
+fn holds_session(storage: &StorageServer, epoch: u64, generation: u64) -> bool {
+    let mut head = engine::memory::client::StorageClient::connect_head(
+        &storage.socket,
+        DEPLOYMENT,
+        epoch,
+        generation,
+    )
+    .unwrap();
     let empty = storage::runtime::Open {
         version: storage::runtime::VERSION,
         epoch,
@@ -407,7 +411,7 @@ fn an_engine_started_on_the_meta_device_serves_and_shuts_down() {
     assert!(status.success(), "the engine exited with {status}");
 
     // The epoch's session is open no more: a head of the epoch opens one again.
-    assert!(!holds_session(&storage, launch.epoch));
+    assert!(!holds_session(&storage, launch.epoch, launch.engine));
 }
 
 /// The launch of the main process of host `host` in an epoch whose one worker group, of tensor
@@ -502,8 +506,8 @@ fn an_epoch_of_two_processes_of_one_host_standing_for_two_hosts_serves_and_shuts
 
     // The scheduler node holds the epoch's session; the peer's host holds the session of its
     // host regions, where the peer's ranks take their parts.
-    assert!(holds_session(&storage_a, head.epoch));
-    assert!(holds_session(&storage_b, peer.epoch));
+    assert!(holds_session(&storage_a, head.epoch, head.engine));
+    assert!(holds_session(&storage_b, peer.epoch, peer.engine));
 
     // One request is accepted by the one scheduler, whose group's batches reach both ranks.
     let request =
@@ -560,6 +564,6 @@ fn an_epoch_of_two_processes_of_one_host_standing_for_two_hosts_serves_and_shuts
     assert!(status.success(), "the scheduler node exited with {status}");
     let status = b.engine.exited(READ);
     assert!(status.success(), "the peer exited with {status}");
-    assert!(!holds_session(&storage_a, head.epoch));
-    assert!(!holds_session(&storage_b, peer.epoch));
+    assert!(!holds_session(&storage_a, head.epoch, head.engine));
+    assert!(!holds_session(&storage_b, peer.epoch, peer.engine));
 }

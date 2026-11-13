@@ -987,6 +987,30 @@ impl EngineConfig {
         let digest = <sha2::Sha256 as sha2::Digest>::digest(&bytes);
         digest.iter().map(|byte| format!("{byte:02x}")).collect()
     }
+
+    /// The identity of the layout this configuration lays an epoch's device memory out in
+    /// (`specs/buffer-pool.md` §14, "A change of layout"): the parallel configuration, whose worker
+    /// groups state the devices and the hosts; the request slots; the KV cache's block size and
+    /// element type; and the graph buckets. Two epochs of one layout name the same device KV
+    /// regions and share their blocks, and an epoch of another layout opens regions of its own,
+    /// into which the serving epoch's device memory moves as it drains, so the engine names its
+    /// regions by this and the daemon drains with `shrink` exactly when it differs.
+    #[expect(
+        clippy::expect_used,
+        reason = "a configuration is plain data with string keys, which JSON always encodes"
+    )]
+    pub fn layout_hash(&self) -> String {
+        let layout = (
+            &self.parallel,
+            self.max_running_requests,
+            self.kv_cache.block_size,
+            self.kv_cache.dtype,
+            &self.cuda_graph,
+        );
+        let bytes = serde_json::to_vec(&layout).expect("a configuration serializes");
+        let digest = <sha2::Sha256 as sha2::Digest>::digest(&bytes);
+        digest.iter().map(|byte| format!("{byte:02x}")).collect()
+    }
 }
 
 /// Everything one engine process starts with (`uniserve engine --launch <path>`): the epoch's

@@ -7,7 +7,7 @@ op = "engine"
 backend = "memcheck"
 # The engine interface of the engine it runs (`crates/engine/package.toml`): the daemon refuses an
 # engine package of another version than it speaks.
-interface_version = 6
+interface_version = 7
 
 # The executable is stored as it is: nothing compiles it.
 [toolchain]

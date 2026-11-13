@@ -87,7 +87,7 @@ fn a_meta_start_builds_one_engine_whose_close_ends_the_session() {
     let mut successor = launch.clone();
     successor.epoch = 2;
     let next_open = layout(&successor, &loaded(&successor)).unwrap();
-    let mut next = StorageClient::connect_head(&server.socket, DEPLOYMENT, 2).unwrap();
+    let mut next = StorageClient::connect_head(&server.socket, DEPLOYMENT, 2, 2).unwrap();
     let _pairs = next.open(next_open).unwrap();
     let (_, next_opened) = next.session().unwrap();
     let limit = open.regions[kv].limit;
@@ -109,12 +109,79 @@ fn a_meta_start_builds_one_engine_whose_close_ends_the_session() {
     engine
         .close(|scheduler, output| outputs.push((scheduler, output)))
         .unwrap();
-    let mut again = StorageClient::connect_head(&server.socket, DEPLOYMENT, launch.epoch).unwrap();
+    let mut again =
+        StorageClient::connect_head(&server.socket, DEPLOYMENT, launch.epoch, launch.engine)
+            .unwrap();
     let _pairs = again.open(open).unwrap();
     again.close().unwrap();
     assert!(
         outputs.iter().all(|(scheduler, output)| *scheduler == 0
             && !matches!(output, crate::scheduler::Output::Failed(_))),
+        "{outputs:?}"
+    );
+}
+
+/// The standby of the serving engine is another engine of the serving epoch (its own launch
+/// generation, started parked beside it): its start opens a session of its own beside the serving
+/// engine's, names the epoch's KV region and maps the segments the serving engine's rank created,
+/// creating none, and keeps slot rows of its own. Each engine's close ends its own session.
+#[test]
+fn a_standby_of_the_serving_epoch_opens_a_session_of_its_own_and_maps_its_region() {
+    let server = StorageServer::start();
+    let mut launch = launch();
+    launch.engine_config.device.device = "meta".to_owned();
+    let registry = nn::family::Registry::new([models::qwen3::family::FAMILY]).unwrap();
+    let storage = crate::memory::client::StorageLaunch {
+        socket: server.socket.to_string_lossy().into_owned(),
+        deployment: launch.engine_config.deployment.clone(),
+        claim: [0; 16],
+        tcp: None,
+        peers: Vec::new(),
+        epoch: launch.epoch,
+        standby: false,
+        standby_storage: Default::default(),
+    };
+    let parameters = crate::modules::load::parameters(&launch.modules.policy).unwrap();
+    let policy = || (crate::scheduler::packaged("fcfs"), parameters.clone());
+    let session = |engine: &super::Engine| {
+        let head = service::lock(engine.head.as_ref().unwrap());
+        let (open, opened) = head.session().unwrap();
+        (open.clone(), opened.clone())
+    };
+
+    let liveness = Liveness::new(Arc::new(|| {}), LOST_EXIT);
+    let serving = start(&launch, &registry, &storage, None, policy(), liveness).unwrap();
+    let (open, opened) = session(&serving);
+    let kv = kv_regions(&open)[0];
+
+    let mut parked = launch.clone();
+    parked.engine = launch.engine + 1;
+    parked.predecessor = Some(proto::request::wire::Predecessor {
+        epoch: launch.epoch,
+    });
+    let liveness = Liveness::new(Arc::new(|| {}), LOST_EXIT);
+    let standby = start(&parked, &registry, &storage, None, policy(), liveness).unwrap();
+    let (standby_open, standby_opened) = session(&standby);
+    assert_eq!(standby_open.regions[kv].name, open.regions[kv].name);
+    assert_eq!(standby_opened.regions[kv].0, opened.regions[kv].0);
+    assert!(!opened.segments[kv].is_empty());
+    assert_eq!(standby_opened.segments[kv], opened.segments[kv]);
+    let slots = |open: &storage::runtime::Open| {
+        open.regions[usize::from(open.groups[0].slots)].name.clone()
+    };
+    assert_ne!(slots(&standby_open), slots(&open));
+
+    let mut outputs = Vec::new();
+    standby
+        .close(|scheduler, output| outputs.push((scheduler, output)))
+        .unwrap();
+    serving
+        .close(|scheduler, output| outputs.push((scheduler, output)))
+        .unwrap();
+    assert!(
+        outputs
+            .iter()
+            .all(|(_, output)| !matches!(output, crate::scheduler::Output::Failed(_))),
         "{outputs:?}"
     );
 }

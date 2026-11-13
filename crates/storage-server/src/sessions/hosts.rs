@@ -185,7 +185,11 @@ fn transfer(
     cancel: &mpsc::Receiver<()>,
     limit: Duration,
 ) -> Result<bool> {
-    let role = Role::Head { deployment, epoch };
+    let role = Role::Head {
+        deployment,
+        epoch,
+        generation: 0,
+    };
     let mut client = Client::connect_remote(endpoint, role, REMOTE_TIMEOUT)?;
 
     // This host as the other one reaches it: the address the connection

@@ -346,12 +346,12 @@ pub struct Scheduler {
     /// completion's entries under the slot it is handed (SD §2.1 `Executor`, §3.1). They are
     /// handed over when that `Attached` is read, and dropped with the owners they concern.
     unmapped: HashMap<OwnerId, Vec<(GroupId, runtime::RequestId, runtime::Request, Completion)>>,
-    /// Per region, whether a `Detach` was answered since the region's last `Resize` was
-    /// submitted. The buffer pool writes a completion before the capacity words its request
-    /// changed, so the words read with a `Detach`'s answer may not show its units yet; a drain
-    /// that gives memory back owes such a region one more `Resize`, whose answer is read with
-    /// words that do (SD §3.8).
-    detached: Vec<bool>,
+    /// Per region, whether a request whose end gives units back was answered since the region's
+    /// last `Resize` was submitted ([`Scheduler::gives_back`]). The buffer pool writes a
+    /// completion before the capacity words its request changed, so the words read with such an
+    /// answer may not show its units yet; a drain that gives memory back owes such a region one
+    /// more `Resize`, whose answer is read with words that do (SD §3.8).
+    released: Vec<bool>,
 
     policy: Policy,
     executor: Box<dyn Executor>,
@@ -528,7 +528,7 @@ impl Scheduler {
             short: HashMap::new(),
             copies: HashMap::new(),
             unmapped: HashMap::new(),
-            detached: vec![false; count],
+            released: vec![false; count],
             stores: vec![0; count],
             unstored: HashSet::new(),
             policy,
@@ -893,11 +893,14 @@ impl Scheduler {
     }
 
     /// Answers `Pause` once the scheduler is paused and no group has a batch in flight, and a
-    /// drain once no request remains (SD §3.8): with `shrink`, also once no `Detach` and no
-    /// `Resize` of the scheduler is held, being stamped or outstanding, and every device region
-    /// answered a `Resize` submitted after the last `Detach` was answered, so that the capacity
-    /// words read with that answer show what the `Detach` gave back (the shrink submits one
-    /// whenever a region has none outstanding and something to give, `drain.rs`).
+    /// drain once no request remains (SD §3.8): with `shrink`, also once no request of the
+    /// scheduler that gives units back ([`Scheduler::gives_back`]) is held, being stamped or
+    /// outstanding, and every device region answered a `Resize` submitted after the last such
+    /// request was answered, so that the capacity words read with that answer show what it gave
+    /// back (the shrink submits one whenever a region has none outstanding and something to give,
+    /// `drain.rs`). A migratable request's last blocks, committed as it leaves and stored to the
+    /// host by the write policy, are therefore taken by the drain's shrink once their stores end,
+    /// and a drain to sleep leaves its regions with no unit of theirs.
     ///
     /// A drained scheduler then forms no batch until `Resume`, as if paused: it admits nothing,
     /// as the drain stated, and has nothing else to run.
@@ -912,7 +915,7 @@ impl Scheduler {
         let Some((_, _, _, shrink)) = &self.draining else {
             return;
         };
-        let given_back = !*shrink || (!self.giving_back() && !self.detached.contains(&true));
+        let given_back = !*shrink || (!self.giving_back() && !self.released.contains(&true));
         if self.requests.is_empty()
             && given_back
             && let Some((reply, ..)) = self.draining.take()
@@ -922,14 +925,42 @@ impl Scheduler {
         }
     }
 
-    /// Whether a `Detach` or a `Resize` of this scheduler is still to be taken or answered: held,
-    /// being stamped, waiting behind a request being stamped, or outstanding.
+    /// Whether the end of `request` may give units of the scheduler's regions back: what its
+    /// answer, or the end of its copies, releases or leaves unpinned and evictable. A `Detach`,
+    /// a `Release` and an `Evict`; a `Commit`, whose block is shared and unpinned once its owner
+    /// has left (a migratable request's last blocks); a `Transfer`, whose source blocks it holds
+    /// until it ends; and every copy the engine runs, whose blocks the buffer pool holds until
+    /// its `Finish` (a `Store` to the host reads its block's device copy). A `Store` to the
+    /// remote store and a `Prefetch` read and fill the host tier alone.
+    fn gives_back(request: &runtime::Request) -> bool {
+        match request {
+            runtime::Request::Detach { .. }
+            | runtime::Request::Release { .. }
+            | runtime::Request::Evict { .. }
+            | runtime::Request::Commit { .. }
+            | runtime::Request::Transfer { .. }
+            | runtime::Request::Load { .. }
+            | runtime::Request::Clone { .. }
+            | runtime::Request::Save { .. }
+            | runtime::Request::Restore { .. }
+            | runtime::Request::Finish { .. } => true,
+            runtime::Request::Store { tier, .. } => *tier == Tier::Host,
+            runtime::Request::Attach { .. }
+            | runtime::Request::Allocate { .. }
+            | runtime::Request::Pin { .. }
+            | runtime::Request::Victims { .. }
+            | runtime::Request::Prefetch { .. }
+            | runtime::Request::List
+            | runtime::Request::Resize { .. } => false,
+        }
+    }
+
+    /// Whether a request of this scheduler that gives units back ([`Self::gives_back`]) or a
+    /// `Resize` is still to be taken or answered: held, being stamped, waiting behind a request
+    /// being stamped, or outstanding.
     fn giving_back(&self) -> bool {
         let pending = |request: &runtime::Request| {
-            matches!(
-                request,
-                runtime::Request::Detach { .. } | runtime::Request::Resize { .. }
-            )
+            Self::gives_back(request) || matches!(request, runtime::Request::Resize { .. })
         };
         let stamping = self
             .stamping
@@ -1489,10 +1520,11 @@ impl Scheduler {
             })?;
             // What it states of the cache holds whether or not the completion is dropped.
             self.learn(&request, &completion);
-            // The capacity words read with a `Detach`'s answer may not show what it gave back.
-            if let runtime::Request::Detach { .. } = request {
+            // The capacity words read with the answer of a request that gives units back may not
+            // show what it gave.
+            if Self::gives_back(&request) {
                 for (region, _) in self.device_regions() {
-                    self.detached[region] = true;
+                    self.released[region] = true;
                 }
             }
 

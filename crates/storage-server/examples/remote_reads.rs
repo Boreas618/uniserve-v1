@@ -336,6 +336,7 @@ fn connect(options: &Options) -> anyhow::Result<(Client, Client)> {
         Role::Head {
             deployment: options.deployment.clone(),
             epoch: 0,
+            generation: 0,
         },
     )
     .with_context(|| format!("connecting to {}", options.socket.display()))?;

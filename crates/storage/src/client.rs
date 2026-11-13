@@ -758,6 +758,7 @@ impl ClaimClient {
         let role = Role::Head {
             deployment: deployment.to_owned(),
             epoch: 0,
+            generation: 0,
         };
         Ok(Self {
             client: Client::connect(socket, role)?,

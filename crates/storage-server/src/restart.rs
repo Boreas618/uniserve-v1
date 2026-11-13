@@ -697,6 +697,7 @@ mod tests {
             Role::Head {
                 deployment: "model".into(),
                 epoch: 0,
+                generation: 0,
             },
         )
         .unwrap();
@@ -928,6 +929,7 @@ mod tests {
             Role::Head {
                 deployment: "model".into(),
                 epoch: 0,
+                generation: 0,
             },
         )
         .unwrap();

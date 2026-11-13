@@ -431,7 +431,7 @@ fn a_session_is_refused_what_the_server_does_not_serve() {
         ErrorKind::Invalid
     );
 
-    // One session per epoch.
+    // One session per engine of an epoch.
     let (first, _) = engine.open_pool(layout(0)).unwrap();
     assert_eq!(server_error(engine.open_pool(layout(0))), ErrorKind::Held);
 
@@ -459,6 +459,43 @@ fn a_session_is_refused_what_the_server_does_not_serve() {
     let (second, _) = next.open_pool(layout(1)).unwrap();
     assert_eq!(second.regions[UNITS], first.regions[UNITS]);
     assert_ne!(second.regions[1].0, first.regions[1].0);
+}
+
+/// The standby of an epoch's serving engine, its own engine of the epoch (its own launch
+/// generation), opens a session of its own beside the serving engine's: it names the epoch's KV
+/// region and finds its segment table, and keeps slot rows of its own. Each engine's session
+/// closes on its own, and the other stays open.
+#[test]
+fn an_epochs_standby_opens_a_session_of_its_own_beside_its_serving_engines() {
+    let server = Running::with_transfer(|_| None);
+    let mut serving = engine_head(&server.socket, 0);
+    let (opened, _) = serving.open_pool(layout(0)).unwrap();
+
+    let mut standby = Client::connect(
+        &server.socket,
+        Role::Head {
+            deployment: "model".into(),
+            epoch: 0,
+            generation: 2,
+        },
+    )
+    .unwrap();
+    let mut own = layout(0);
+    for (index, name) in [
+        (1, "prefill rows of the standby"),
+        (2, "decode rows of the standby"),
+    ] {
+        own.regions[index].name = name.to_owned();
+        own.regions[index].space = name.to_owned();
+    }
+    let (beside, _) = standby.open_pool(own.clone()).unwrap();
+    assert_eq!(beside.regions[UNITS], opened.regions[UNITS]);
+    assert_eq!(beside.segments[UNITS], opened.segments[UNITS]);
+    assert_ne!(beside.regions[1].0, opened.regions[1].0);
+    assert_eq!(server_error(standby.open_pool(own)), ErrorKind::Held);
+
+    standby.close_pool().unwrap();
+    serving.close_pool().unwrap();
 }
 
 /// A worker of `group`'s rank `rank`, of epoch 0.

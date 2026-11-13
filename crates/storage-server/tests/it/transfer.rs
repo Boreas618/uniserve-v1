@@ -469,6 +469,7 @@ fn a_transfer_is_refused_whole_unless_every_span_fits_storage_of_its_deployment(
         Role::Head {
             deployment: "other".into(),
             epoch: 0,
+            generation: 0,
         },
     )
     .unwrap();

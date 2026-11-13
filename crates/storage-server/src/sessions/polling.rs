@@ -782,30 +782,29 @@ impl Pools {
         withdrawn
     }
 
-    /// Opens an engine epoch's session with the pool of `deployment`
-    /// ([`BufferPool::admit`]) and a queue pair per scheduler, whose
-    /// registers hold the `completed` word of each of its groups, in the
-    /// order the scheduler lists them, then the three capacity words of each
-    /// region its groups and its classes name, by the region's number.
-    /// Returns the answer and the queue pairs' memfds.
+    /// Opens an engine's session with the pool of `deployment`
+    /// ([`BufferPool::admit`]), one of the sessions its epoch may have
+    /// (an engine and its standby each open one), and a queue pair per
+    /// scheduler, whose registers hold the `completed` word of each of its
+    /// groups, in the order the scheduler lists them, then the three
+    /// capacity words of each region its groups and its classes name, by the
+    /// region's number. Returns the session's number in the pool, the
+    /// answer and the queue pairs' memfds.
     ///
     /// # Errors
     ///
-    /// Refuses, opening nothing, a layout the pool refuses, an epoch whose
-    /// session is open, or queue pairs that cannot be made.
+    /// Refuses, opening nothing, a layout the pool refuses, or queue pairs
+    /// that cannot be made.
     pub(crate) fn open(
         &mut self,
         deployment: &str,
         open: &Open,
-    ) -> Result<(Opened, Vec<OwnedFd>), String> {
+    ) -> Result<(ClientId, Opened, Vec<OwnedFd>), String> {
         let (limits, trace, check) = (self.limits, self.trace.as_deref(), self.check);
         let hosted = self
             .deployments
             .entry(deployment.to_owned())
             .or_insert_with(|| Hosted::new(deployment, limits, trace, check));
-        if hosted.pool.session(open.epoch).is_some() {
-            return Err(format!("the session of epoch {} is open", open.epoch));
-        }
         let client = hosted.next;
         let admitted = hosted.pool.admit(client, open);
         let input = || Input::Open(client, open.clone());
@@ -893,9 +892,10 @@ impl Pools {
             trial = open.trial,
             session = client,
             schedulers = open.schedulers.len(),
-            "an engine epoch opened its session with the buffer pool"
+            "an engine opened its session with the buffer pool"
         );
         Ok((
+            client,
             Opened {
                 regions,
                 segments,
@@ -906,13 +906,13 @@ impl Pools {
         ))
     }
 
-    /// Ends the session of `epoch` of `deployment` and drops its queue
-    /// pairs ([`BufferPool::end`]). Returns whether it was open.
-    pub(crate) fn close(&mut self, deployment: &str, epoch: u64) -> bool {
+    /// Ends the session `client` of the pool of `deployment` and drops its
+    /// queue pairs ([`BufferPool::end`]). Returns whether it was open.
+    pub(crate) fn close(&mut self, deployment: &str, client: ClientId) -> bool {
         let Some(hosted) = self.deployments.get_mut(deployment) else {
             return false;
         };
-        let Some(client) = hosted.pool.session(epoch) else {
+        let Some(epoch) = hosted.pool.epoch(client) else {
             return false;
         };
         // What the pool produced goes out first: the session's own
@@ -1217,7 +1217,7 @@ mod tests {
             schedulers: vec![vec![GroupId(0)]],
             peers: Vec::new(),
         };
-        let (_, descriptors) = pools.open("model", &open).unwrap();
+        let (_, _, descriptors) = pools.open("model", &open).unwrap();
         let engine = QueuePair::open(descriptors.into_iter().next().unwrap(), true).unwrap();
         (pools, engine)
     }

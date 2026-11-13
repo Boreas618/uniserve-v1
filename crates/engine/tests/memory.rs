@@ -216,6 +216,7 @@ fn head(server: &StorageServer) -> Client {
         Role::Head {
             deployment: DEPLOYMENT.into(),
             epoch: EPOCH,
+            generation: 0,
         },
     )
     .unwrap()

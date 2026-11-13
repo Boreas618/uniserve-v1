@@ -601,7 +601,9 @@ impl BufferPool {
         Ok(())
     }
 
-    /// The session of an engine epoch, while it is open.
+    /// A session of an engine epoch, while one is open: the epoch's only
+    /// one where a single engine of it opened one. An epoch whose engine has
+    /// a standby has a session per engine, which their numbers tell apart.
     pub fn session(&self, epoch: u64) -> Option<ClientId> {
         self.sessions
             .iter()

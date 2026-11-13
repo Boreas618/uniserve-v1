@@ -128,7 +128,7 @@ impl Node {
     pub(in crate::process) fn start() -> Self {
         let server = StorageServer::start();
         let layout = layout(1);
-        let mut head = StorageClient::connect_head(&server.socket, DEPLOYMENT, 1).unwrap();
+        let mut head = StorageClient::connect_head(&server.socket, DEPLOYMENT, 1, 1).unwrap();
         let mut pairs = head.open(layout.clone()).unwrap();
         let opened = head.session().unwrap().1.clone();
 
@@ -191,7 +191,8 @@ impl Node {
     /// The segment table of the KV planes' memory space as the Storage Server holds it: what a
     /// session of the same layout, of epoch `epoch`, opened now is answered.
     pub(in crate::process) fn segments_seen(&self, epoch: u64) -> Segments {
-        let mut head = StorageClient::connect_head(&self.server.socket, DEPLOYMENT, epoch).unwrap();
+        let mut head =
+            StorageClient::connect_head(&self.server.socket, DEPLOYMENT, epoch, epoch).unwrap();
         head.open(layout(epoch)).unwrap();
         let segments = head.session().unwrap().1.segments[0].clone();
         head.close().unwrap();

@@ -123,7 +123,9 @@ fn a_meta_rank_creates_its_region_s_segments_once_the_session_is_open_and_a_succ
     assert!(open.regions.iter().all(|region| region.segments.is_empty()));
     assert_eq!((open.regions[kv].units, open.regions[kv].limit), (0, units));
 
-    let mut client = StorageClient::connect_head(&server.socket, DEPLOYMENT, launch.epoch).unwrap();
+    let mut client =
+        StorageClient::connect_head(&server.socket, DEPLOYMENT, launch.epoch, launch.engine)
+            .unwrap();
     let mut pairs = client.open(open.clone()).unwrap();
     let opened = client.session().unwrap().1.clone();
     assert_eq!(pairs.len(), 1);
@@ -241,7 +243,7 @@ fn a_meta_rank_creates_its_region_s_segments_once_the_session_is_open_and_a_succ
     let next_open = stated(&successor, &successors);
     assert_eq!(next_open.regions[kv].name, open.regions[kv].name);
 
-    let mut next_client = StorageClient::connect_head(&server.socket, DEPLOYMENT, 2).unwrap();
+    let mut next_client = StorageClient::connect_head(&server.socket, DEPLOYMENT, 2, 2).unwrap();
     let _next_pairs = next_client.open(next_open.clone()).unwrap();
     let next_opened = next_client.session().unwrap().1.clone();
     assert_eq!(next_opened.regions[kv], (number, units - 1));
@@ -281,7 +283,7 @@ fn a_meta_rank_creates_its_region_s_segments_once_the_session_is_open_and_a_succ
     assert_eq!(other_open.regions[kv].name, open.regions[kv].name);
     assert_eq!(other_open.regions[kv].limit, 2 * units);
 
-    let mut other_client = StorageClient::connect_head(&server.socket, DEPLOYMENT, 3).unwrap();
+    let mut other_client = StorageClient::connect_head(&server.socket, DEPLOYMENT, 3, 3).unwrap();
     let _other_pairs = other_client.open(other_open).unwrap();
     let (held, other_opened) = {
         let (held, answered) = other_client.session().unwrap();
@@ -471,7 +473,9 @@ fn a_meta_media_rank_opens_its_media_memory_and_spawns_its_runners() {
 
     // The session opens, the rank opens its memory over the answer's numbers and creates no
     // segment, and its worker is spawned over its media runners.
-    let mut client = StorageClient::connect_head(&server.socket, DEPLOYMENT, launch.epoch).unwrap();
+    let mut client =
+        StorageClient::connect_head(&server.socket, DEPLOYMENT, launch.epoch, launch.engine)
+            .unwrap();
     let mut pairs = client.open(open.clone()).unwrap();
     let opened = client.session().unwrap().1.clone();
     assert!(opened.segments.iter().all(Vec::is_empty));
@@ -786,7 +790,9 @@ fn the_conditioning_lies_with_the_text_encoder_and_the_denoising_group_reads_it(
     }
 
     // Both ranks open, each reaching the other's buffer, and a worker serves each group.
-    let mut client = StorageClient::connect_head(&server.socket, DEPLOYMENT, launch.epoch).unwrap();
+    let mut client =
+        StorageClient::connect_head(&server.socket, DEPLOYMENT, launch.epoch, launch.engine)
+            .unwrap();
     let mut pairs = client.open(open.clone()).unwrap();
     let opened = client.session().unwrap().1.clone();
     assert!(open_ranks(&mut ranks, &open, &opened).unwrap().is_empty());
@@ -919,7 +925,9 @@ fn a_device_holds_a_rank_of_the_text_group_and_one_of_a_flow_replica() {
 
     // The session opens, every rank opens its own memory, two of them on each device, and an
     // worker serves each rank.
-    let mut client = StorageClient::connect_head(&server.socket, DEPLOYMENT, launch.epoch).unwrap();
+    let mut client =
+        StorageClient::connect_head(&server.socket, DEPLOYMENT, launch.epoch, launch.engine)
+            .unwrap();
     let mut pairs = client.open(open.clone()).unwrap();
     let opened = client.session().unwrap().1.clone();
     assert!(open_ranks(&mut ranks, &open, &opened).unwrap().is_empty());
@@ -1136,4 +1144,224 @@ fn the_e1_deployment_starts_within_its_gpu_s_quota_at_a_fraction_of_0_70() {
         limit - reserved
     );
     assert!(reserved + slot_storage <= limit);
+}
+
+/// The head of `launch`'s epoch on `server`, its session open over the layout of `ranks`, and
+/// that layout with the session's answer.
+fn opened_session(
+    server: &StorageServer,
+    launch: &EngineArgs,
+    ranks: &[LoadedRank],
+) -> (
+    StorageClient,
+    Vec<QueuePair>,
+    storage::runtime::Open,
+    storage::runtime::Opened,
+) {
+    let open = stated(launch, ranks);
+    let mut head =
+        StorageClient::connect_head(&server.socket, DEPLOYMENT, launch.epoch, launch.engine)
+            .unwrap();
+    let pairs = head.open(open).unwrap();
+    let (held, opened) = {
+        let (held, opened) = head.session().unwrap();
+        (held.clone(), opened.clone())
+    };
+    (head, pairs, held, opened)
+}
+
+/// The name of the one KV region of the session `open` states.
+fn kv_region(open: &storage::runtime::Open) -> &str {
+    let kv = usize::from(open.groups[0].regions[0][0]);
+    &open.regions[kv].name
+}
+
+/// Data-parallel replicas that each run an engine of their own (`daemon::leader::replica_configs`,
+/// each replica's configuration placing its own worker group on its own device) share no device
+/// memory: each names a KV region of its own, though each numbers its one scheduler 0, so two
+/// replicas starting at once each create and grant their own segments.
+#[test]
+fn replicas_in_engines_of_their_own_name_regions_of_their_own() {
+    let server = StorageServer::start();
+    let groups = WorkerGroupConfig::data_parallel(
+        &["localhost".to_owned()],
+        "cuda",
+        2,
+        1,
+        2,
+        WorkerGroupConfig::single_component(proto::config::DEFAULT_BLOCK, 1),
+    );
+    let replica = |index: usize| {
+        let mut launch = launch();
+        launch.engine_config.parallel.worker_groups = vec![groups[index].clone()];
+        launch.group = groups[index].id.0.clone();
+        launch.devices = vec![index as u32];
+        // The daemon numbers each replica's engine, and its epoch, apart.
+        launch.engine = 1 + index as u64;
+        launch.epoch = 1 + index as u64;
+        launch
+    };
+    let launches = [replica(0), replica(1)];
+
+    // Both replicas open their sessions before either grants, as two engines started together
+    // do: neither finds the other's segments, and each creates its own.
+    let mut ranks: Vec<Vec<LoadedRank>> = launches.iter().map(loaded).collect();
+    let mut sessions = Vec::new();
+    for (launch, ranks) in launches.iter().zip(&ranks) {
+        sessions.push(opened_session(&server, launch, ranks));
+    }
+    let names: Vec<String> = sessions
+        .iter()
+        .map(|(_, _, open, _)| kv_region(open).to_owned())
+        .collect();
+    assert_ne!(names[0], names[1], "the replicas share a KV region");
+
+    for (ranks, (head, _, open, opened)) in ranks.iter_mut().zip(&mut sessions) {
+        let kv = usize::from(open.groups[0].regions[0][0]);
+        assert!(
+            opened.segments[kv].is_empty(),
+            "a replica maps another's segments"
+        );
+        let created = open_ranks(ranks, open, opened).unwrap();
+        assert_eq!(created.len(), 1);
+        let (region, segments) = &created[0];
+        assert!(!segments.is_empty());
+        for &(segment, first, count) in segments {
+            head.grant(region, segment, first, count).unwrap();
+        }
+    }
+    for (mut head, ..) in sessions {
+        head.close().unwrap();
+    }
+}
+
+/// A target of another layout, here other graph buckets, which the daemon drains to with
+/// `shrink` (`specs/buffer-pool.md` §14, "A change of layout"), names a KV region of its own and
+/// maps none of the serving epoch's segments, while a successor of the same layout names the
+/// serving epoch's region and maps them.
+#[test]
+fn a_target_of_another_layout_maps_none_of_the_serving_epochs_segments() {
+    let server = StorageServer::start();
+    let serving = launch();
+    let mut ranks = loaded(&serving);
+    let (mut head, _pairs, open, opened) = opened_session(&server, &serving, &ranks);
+    let created = open_ranks(&mut ranks, &open, &opened).unwrap();
+    let (region, segments) = &created[0];
+    for &(segment, first, count) in segments {
+        head.grant(region, segment, first, count).unwrap();
+    }
+
+    let mut same = serving.clone();
+    same.epoch = 2;
+    let mut other = serving.clone();
+    other.epoch = 3;
+    other.engine_config.cuda_graph.decode_batch_sizes =
+        Some(vec![std::num::NonZeroU32::new(1).unwrap()]);
+    assert_eq!(
+        serving.engine_config.layout_hash(),
+        same.engine_config.layout_hash()
+    );
+    assert_ne!(
+        serving.engine_config.layout_hash(),
+        other.engine_config.layout_hash()
+    );
+
+    let same_ranks = loaded(&same);
+    let (mut same_head, _, same_open, same_opened) = opened_session(&server, &same, &same_ranks);
+    assert_eq!(kv_region(&same_open), kv_region(&open));
+    let kv = usize::from(same_open.groups[0].regions[0][0]);
+    assert_eq!(same_opened.segments[kv], *segments);
+    same_head.close().unwrap();
+
+    let mut other_ranks = loaded(&other);
+    let (mut other_head, _, other_open, other_opened) =
+        opened_session(&server, &other, &other_ranks);
+    assert_ne!(kv_region(&other_open), kv_region(&open));
+    let kv = usize::from(other_open.groups[0].regions[0][0]);
+    assert!(other_opened.segments[kv].is_empty());
+    let other_created = open_ranks(&mut other_ranks, &other_open, &other_opened).unwrap();
+    let (other_region, other_segments) = &other_created[0];
+    for &(segment, first, count) in other_segments {
+        other_head
+            .grant(other_region, segment, first, count)
+            .unwrap();
+    }
+    other_head.close().unwrap();
+    head.close().unwrap();
+}
+
+/// A deployment whose experts live on a dedicated expert group (`role = "experts"`, as
+/// `tests/python/e2e/http_helpers.py` places one) opens one KV region, its attention group's:
+/// the expert group serves no request, the session states it nowhere, and its rank opens a cache
+/// of the fewest units of its own, maps no region and creates nothing the head grants, beside
+/// the attention rank's region, whose segments the head grants.
+#[test]
+fn a_dedicated_expert_rank_maps_no_kv_region() {
+    let server = StorageServer::start();
+    let mut launch = launch();
+    let rank = |device: &str| WorkerRank {
+        host: "localhost".to_owned(),
+        device: device.to_owned(),
+    };
+    let attention = WorkerGroupConfig {
+        id: WorkerGroupId("attention".to_owned()),
+        role: Default::default(),
+        replicas: 1,
+        ranks: vec![rank("cuda:0")],
+        blocks: WorkerGroupConfig::single_component(proto::config::DEFAULT_BLOCK, 1),
+        queue_depth: 2,
+        mem_fraction_static: None,
+    };
+    let experts = WorkerGroupConfig {
+        id: WorkerGroupId("experts".to_owned()),
+        role: proto::config::WorkerGroupRole::Experts,
+        replicas: 1,
+        ranks: vec![rank("cuda:1")],
+        blocks: BTreeMap::new(),
+        queue_depth: 2,
+        mem_fraction_static: None,
+    };
+    launch.engine_config.parallel.worker_groups = vec![attention, experts];
+    launch.engine_config.moe.expert_parallel = true;
+    launch.group = "attention".to_owned();
+    launch.devices = vec![0, 1];
+    launch.world_size = 2;
+
+    let mut ranks = loaded(&launch);
+    assert_eq!(ranks.len(), 2);
+    let (mut head, pairs, open, opened) = opened_session(&server, &launch, &ranks);
+    assert_eq!(
+        open.groups.len(),
+        1,
+        "the session states the attention group alone"
+    );
+
+    let created = open_ranks(&mut ranks, &open, &opened).unwrap();
+    assert_eq!(created.len(), 1);
+    let (region, segments) = &created[0];
+    assert_eq!(region, kv_region(&open));
+    for &(segment, first, count) in segments {
+        head.grant(region, segment, first, count).unwrap();
+    }
+    let expert_cache = service::lock(&ranks[1].text().unwrap().cache)
+        .config()
+        .clone();
+    assert!(expert_cache.segments.is_none());
+    assert_eq!(
+        expert_cache.units,
+        crate::process::ranks::rank::memory::fewest_units(&expert_cache.layout)
+    );
+
+    bind(&mut ranks, &open, &opened, true).unwrap();
+    let (workers, spawned) = spawn(
+        &mut ranks,
+        (&open, &opened),
+        &|group| head.completed_registers(group, &pairs),
+        Vec::new(),
+    )
+    .unwrap();
+    assert_eq!(spawned.len(), 2);
+    drop(workers);
+    drop(spawned);
+    head.close().unwrap();
 }
