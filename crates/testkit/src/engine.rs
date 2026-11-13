@@ -136,7 +136,8 @@ fn start(launch: &EngineArgs, fixture: Fixture) -> Result<Engine> {
         pool,
     } = fixture;
     let cache = crate::cache();
-    let open = ::engine::text_layout(launch, &cache, units, 1, SLOT_BYTES)?;
+    let capacity = crate::capacity(launch, &cache);
+    let open = ::engine::text_layout(launch, &cache, units, 1, (capacity.slots, SLOT_BYTES))?;
 
     // Each scheduler's fake is made before the scheduler and its inbox, since the buffer pool
     // opens the session over the fakes and the schedulers over its answer: it sends to a channel
@@ -154,7 +155,6 @@ fn start(launch: &EngineArgs, fixture: Fixture) -> Result<Engine> {
     }
     let (session, opened, pairs) = serve_pool(&open, fakes.clone(), pool)?;
 
-    let capacity = crate::capacity(launch, &cache);
     let capacities: Vec<_> = open
         .groups
         .iter()

@@ -12,6 +12,11 @@
 #
 # The program compiles for any width; the module states sixteen-element
 # alignment for the gate row stride.
+#
+# The row indices are `u32` as the model library passes them
+# (`nn::modules::adaln`, whose parameter rows are `U32`), or `i32` and `i64`. A
+# parameter row times its stride stays far below 2^31 elements, so the index's
+# signedness never changes an address.
 
 op = "gated_residual"
 backend = "triton"
@@ -36,6 +41,6 @@ target = "arch"
 architectures = ["sm_100a", "sm_90a"]
 
 [kernel.descriptors]
-dimensions = { dtype = ["bf16", "f16", "f32"], indices = ["i32", "i64"], width = { min = 1 }, gate_stride = { multiple = 16 } }
+dimensions = { dtype = ["bf16", "f16", "f32"], indices = ["u32", "i32", "i64"], width = { min = 1 }, gate_stride = { multiple = 16 } }
 
 [parameters]

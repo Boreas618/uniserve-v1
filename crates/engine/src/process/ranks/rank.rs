@@ -130,8 +130,14 @@ pub(crate) struct ModelRunner {
     launch: Arc<EngineArgs>,
     /// This rank's devices, as the worker's names for them.
     devices: Vec<DeviceId>,
+    /// The request slots this rank holds: the deployment's `max_running_requests`, or the fewer
+    /// the division of its GPU's share decides ([`ModelRunner::with_slots`]).
+    slots: u32,
     /// The bucket catalog every device of this rank captures: the build config's sizes within the
-    /// batch bound, with a speculating deployment's verification and drafter buckets.
+    /// batch bound, with a speculating deployment's verification and drafter buckets. The bound is
+    /// the deployment's running requests whatever slots the division decides: the scheduling
+    /// policy's limits are stated against that catalogue, and a batch holds at most the group's
+    /// slots whatever its buckets hold (`Capacity::holds`).
     buckets: Buckets,
     /// This rank's ordinal among the deployment's ranks (every worker group's, in the order the
     /// deployment states them), which the storage claims are keyed by.
@@ -175,9 +181,10 @@ impl Default for ParallelShape {
 /// The collective groups one kind of a deployment's parallel groups forms over the host group, and
 /// this rank's place among them.
 pub(crate) struct Collective {
-    /// Each group's members, `(first, count)`: consecutive members of the host group.
-    pub(crate) spans: Vec<(usize, usize)>,
-    /// The span this rank is a member of and its rank in it, absent when it is in none.
+    /// Each group's members, as members of the host group in the group's rank order: a block's
+    /// ranks are any positions of its worker group, in the order the deployment states them.
+    pub(crate) groups: Vec<Vec<usize>>,
+    /// The group this rank is a member of and its rank in it, absent when it is in none.
     pub(crate) member: Option<(usize, usize)>,
 }
 
@@ -251,6 +258,7 @@ impl ModelRunner {
             family,
             launch: Arc::new(launch.clone()),
             devices,
+            slots: rows_bound,
             buckets,
             rank: launch.rank,
             group: launch.group.clone(),
@@ -258,6 +266,16 @@ impl ModelRunner {
             mapping,
             union: None,
         })
+    }
+
+    /// This rank holding `slots` request slots, as the division of its GPU's share decides
+    /// (`crate::memory::division::request_slots`): the storages its slots take are sized by them,
+    /// and its buckets are the deployment's.
+    pub(crate) fn with_slots(&self, slots: u32) -> Self {
+        Self {
+            slots,
+            ..self.clone()
+        }
     }
 
     /// The epoch's engine configuration.
@@ -422,10 +440,11 @@ impl ModelRunner {
         }
         let groups = &self.engine_config().parallel.worker_groups;
         let firsts = WorkerGroupConfig::first_ranks(groups);
-        let spans: Vec<(usize, usize)> = firsts
+        // A worker group's tensor group is its ranks in their order.
+        let members: Vec<Vec<usize>> = firsts
             .iter()
             .zip(groups)
-            .map(|(first, group)| (*first, group.ranks.len()))
+            .map(|(first, group)| (*first..*first + group.ranks.len()).collect())
             .collect();
         let (_, position, _) = self.placed(self.rank)?;
         let (group, _) =
@@ -433,7 +452,7 @@ impl ModelRunner {
                 format!("the deployment's worker groups place no rank {}", self.rank)
             })?;
         Ok(Some(Collective {
-            spans,
+            groups: members,
             member: Some((group, position as usize)),
         }))
     }

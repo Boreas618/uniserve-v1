@@ -74,9 +74,17 @@ fn task_of(request: &VideoRequest) -> VideoTask {
     )
 }
 
-/// A host index table on `like`'s device.
+/// A host index table on `like`'s device, uploaded as its own elements from the first byte of
+/// its block.
+///
+/// A captured step's kernels read each table at the address its capture gave it, and a replay
+/// writes there the bytes the step's forward computes for the request it serves
+/// (`ops::input`). A view moved as it is carries its whole storage and keeps its first element's
+/// offset in that address, and a view whose offset follows from the request (a modality's rows
+/// of the document, after the prompt's) would be read at the offset of the request the bucket
+/// was captured from.
 fn on_device(table: &Tensor, like: &Tensor) -> Result<Tensor> {
-    Ok(table.contiguous()?.to_device(like.device())?)
+    Ok(table.force_contiguous()?.to_device(like.device())?)
 }
 
 /// One checkpoint's denoiser: the network, the refiner of its prompt, its timestep modulation
@@ -791,5 +799,28 @@ impl Denoiser {
         audio.slice_set(&euler_step(audio, &velocity, self.audio_step(step)?)?, 0, 0)?;
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A table narrowed at any row reaches the device at the address the uploads before it
+    /// leave, which is what a replay of a captured step writes it to.
+    #[test]
+    fn a_narrowed_table_is_uploaded_from_its_first_element() {
+        let context = ops::Context::meta(None);
+        let _guard = context.enter();
+        let like = ops::retained(1 << 40, 4, DType::F32, &ops::meta()).unwrap();
+        let host = Tensor::arange(0_u32, 16, &Device::Cpu).unwrap();
+
+        let address = |first: usize| {
+            context.reset();
+            let table = on_device(&host.narrow(0, first, 4).unwrap(), &like).unwrap();
+            assert_eq!(table.dims(), [4]);
+            ops::operand(&table).unwrap().ptr.address()
+        };
+        assert_eq!(address(2), address(7));
     }
 }

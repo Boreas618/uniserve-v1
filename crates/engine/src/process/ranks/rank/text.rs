@@ -36,7 +36,7 @@ pub(crate) type Keys = std::collections::BTreeSet<(&'static str, String)>;
 impl ModelRunner {
     /// The config of the rank's runner of `model` over a cache of `layout` with `units` units
     /// (step 7): the phases its buckets serve (no refill for a model whose layers or drafter keep
-    /// a recurrent state), the deployment's request slots, pages and longest sequence, the
+    /// a recurrent state), the rank's request slots, pages and longest sequence, the
     /// candidates a scored row reports, the scratch page set of its paired forwards, and a
     /// speculating deployment's drafts and draft pool.
     ///
@@ -48,8 +48,7 @@ impl ModelRunner {
     ///
     /// # Errors
     ///
-    /// More request slots than the protocol addresses, or a speculating deployment whose cache
-    /// keeps no draft group.
+    /// A speculating deployment whose cache keeps no draft group.
     pub(crate) fn causal_config(
         &self,
         model: &dyn TextModel,
@@ -84,7 +83,7 @@ impl ModelRunner {
         Ok(CausalLmConfig {
             phases,
             buckets: self.buckets.clone(),
-            slots: self.slots()?,
+            slots: self.slots(),
             page_size: PAGE_TOKENS,
             max_kv_len: self.engine_config().model.max_model_len,
             candidates: self.engine_config().max_logprobs,

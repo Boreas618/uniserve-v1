@@ -534,8 +534,17 @@ impl Transport {
             error: [0; 512],
         };
         let handle = stream.raw() as *mut std::ffi::c_void;
-        // SAFETY: `call` has the layout the header declares, and `group` is the caller's to keep.
-        let status = unsafe { create(&mut call, handle) };
+        // The entry allocates the transport's device memory and exchanges its handles on the
+        // device the calling thread holds current, as the CUDA runtime it calls reads it
+        // (`cudaGetDevice`), so the stream's context is current for the call: the thread that
+        // creates a rank's transport may hold no context, or another device's.
+        let status = stream
+            .with_context(|| {
+                // SAFETY: `call` has the layout the header declares, and `group` is the caller's
+                // to keep.
+                unsafe { create(&mut call, handle) }
+            })
+            .map_err(Error::Platform)?;
         check(status, "create", &call.error)?;
         Ok(Self {
             _kernel: kernel,
@@ -597,8 +606,15 @@ impl Transport {
     pub fn step(&mut self, capacity: u32, stream: &Stream) -> Result<()> {
         self.call.capacity = i64::from(capacity);
         let handle = stream.raw() as *mut std::ffi::c_void;
-        // SAFETY: the transport is live and the call has the header's layout.
-        let status = unsafe { (self.step)(&mut self.call, handle) };
+        // The entry issues its write on the device the calling thread holds current, as `create`
+        // does, so the stream's context is current for the call.
+        let (step, call) = (self.step, &mut self.call);
+        let status = stream
+            .with_context(|| {
+                // SAFETY: the transport is live and the call has the header's layout.
+                unsafe { step(call, handle) }
+            })
+            .map_err(Error::Platform)?;
         check(status, "step", &self.call.error)
     }
 }

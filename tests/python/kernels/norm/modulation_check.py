@@ -29,6 +29,7 @@ read through padded strides so a wrong index is a wrong address, `update` off wi
 on, and an E4M3 output — whose per-row dequantization scale the check also recomputes. Two
 further cases reach paths the deployed one does not: a table whose rows are reused by many
 activation rows (the index is the only thing that selects a row), and an `i64` index table.
+`--indices u32` checks the index type the model library passes (`nn::modules::adaln`).
 
 `gated_residual` bakes its element count and masks its last tile, so it is checked with a
 count that is not a multiple of the block, next to one that is.
@@ -642,8 +643,13 @@ def cases(operator, flags):
     ]
 
 
-#: The index types a descriptor may declare, as torch spells them.
-TORCH_TYPES_INDICES = {"i32": torch.int32, "i64": torch.int64}
+#: The index types a descriptor may declare, as torch spells them: `u32` is what the model
+#: library passes to `modulated_rms_norm`, `i32` and `i64` what other callers may.
+TORCH_TYPES_INDICES = {
+    "u32": torch.uint32,
+    "i32": torch.int32,
+    "i64": torch.int64,
+}
 
 
 def main() -> int:

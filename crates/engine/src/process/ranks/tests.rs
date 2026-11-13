@@ -374,6 +374,14 @@ fn a_meta_media_rank_opens_its_media_memory_and_spawns_its_runners() {
     let video = ranks[0].video().unwrap();
     let (tensors, encoding, pages) = video.trajectory.unwrap();
     assert!(video.row > 0);
+    // No media runner is shadowed, so the rank's scratch pool maps nothing beside its graph
+    // pool's regions, whatever its forwards allocate.
+    let shadows: Vec<u64> = video.peaks.iter().map(|(_, peaks)| peaks.shadow).collect();
+    assert_eq!(video.peaks.len(), 4);
+    assert_eq!(
+        crate::memory::division::pool_bytes(UNIT_BYTES, &[], &shadows, 0).1,
+        0
+    );
     let media_bytes = video.capacity.media_bytes.clone();
     assert!(!media_bytes.is_empty());
     assert!(
@@ -550,6 +558,126 @@ fn a_meta_media_rank_opens_its_media_memory_and_spawns_its_runners() {
     drop(workers);
     drop(spawned);
     client.close().unwrap();
+}
+
+/// A media group's request slots are the deployment's running requests, or as many as its
+/// ranks' shares of their GPUs hold when fewer fit (`specs/engine-worker-port.md` §1,
+/// `request_slots`), a slot taking the trajectory row and the product blocks one request holds
+/// on a rank: the session's slot rows, product buffer and host latent pages and what the group
+/// states follow them, and its captured buckets, which the scheduling policy's limits are stated
+/// against, stay the deployment's. A share that holds no slot refuses the start, naming what one
+/// slot needs.
+#[test]
+#[ignore = "reads the headers of a released FastH3 checkpoint, which the repository does not hold"]
+fn a_media_group_holds_as_many_request_slots_as_its_ranks_shares_hold() {
+    assert!(
+        Path::new(FAST_H3).is_dir(),
+        "the media rank loads the headers of {FAST_H3}, which is missing"
+    );
+    let launch = video_launch();
+    let registry = nn::family::Registry::new([models::minimax_h3::family::FAMILY]).unwrap();
+    let family = crate::process::catalogue::resolve(&registry, Path::new(FAST_H3)).unwrap();
+    let model_runner = ModelRunner::of(&launch, family).unwrap();
+    let load = || {
+        load_ranks(
+            model_runner.ranks().unwrap(),
+            Backing::Meta,
+            &launch,
+            Meeting::Local,
+        )
+        .unwrap()
+    };
+    let region = |open: &storage::runtime::Open, name: &str| {
+        open.regions
+            .iter()
+            .find(|region| region.name == name)
+            .unwrap_or_else(|| panic!("the session states no region {name}"))
+            .clone()
+    };
+
+    // A start backed by nothing holds the deployment's slots. What one slot takes of the rank's
+    // share: its trajectory row and the product units one request's blocks take.
+    let mut ranks = load();
+    let open = layout(&launch, &ranks).unwrap();
+    let (products, rows) = (region(&open, "products 1 0"), region(&open, "slots 1 0"));
+    assert_eq!(rows.units, SLOTS);
+    assert_eq!(products.units % SLOTS, 0);
+    let request = products.units / SLOTS;
+    let slot = u64::from(request) * UNIT_BYTES + rows.part_bytes;
+
+    // A share that holds two slots and half a third holds two.
+    super::fit_media_slots(&mut ranks, |_| Ok(Some(2 * slot + slot / 2))).unwrap();
+    let open = layout(&launch, &ranks).unwrap();
+    assert_eq!(region(&open, "slots 1 0").units, 2);
+    assert_eq!(region(&open, "products 1 0").units, 2 * request);
+    let video = ranks[0].video().unwrap();
+    let pages = video.trajectory.unwrap().2;
+    assert_eq!(pages.pages, 2 * u64::from(pages.trajectory_pages));
+
+    // The group serves as many requests as its slots hold and encodes at most that many prompts
+    // in a batch, over the buckets of the deployment's running requests.
+    let stated = capacities(&ranks, &open).unwrap();
+    let capacity = &stated[0].1;
+    assert_eq!(capacity.slots, 2);
+    assert_eq!(capacity.rows[Phase::TextEncode.index()], 2);
+    let encodes = capacity
+        .buckets
+        .iter()
+        .filter(|shape| shape.variant == Variant::Encode)
+        .map(|shape| shape.rows);
+    assert_eq!(encodes.max(), Some(SLOTS));
+
+    // A share one byte short of a slot refuses the start.
+    let mut ranks = load();
+    let refusal = super::fit_media_slots(&mut ranks, |_| Ok(Some(slot - 1))).unwrap_err();
+    let message = format!("{refusal:#}");
+    assert!(
+        message.contains(&format!("one slot needs {slot} bytes")),
+        "{message}"
+    );
+}
+
+/// A block's ranks are any positions of its worker group, in the order the block states them:
+/// the denoiser's sequence group of a group whose transformer block holds ranks `[3, 1, 2, 0]`
+/// has the group's fourth rank as its rank 0, and each rank joins it at its place in the block.
+#[test]
+#[ignore = "reads the headers of a released FastH3 checkpoint, which the repository does not hold"]
+fn a_sequence_group_takes_its_block_s_ranks_in_their_stated_order() {
+    assert!(
+        Path::new(FAST_H3).is_dir(),
+        "the media rank loads the headers of {FAST_H3}, which is missing"
+    );
+    let mut launch = video_launch();
+    let mut group = launch.engine_config.parallel.worker_groups[0].clone();
+    group.ranks = (0..4)
+        .map(|device| WorkerRank {
+            host: "localhost".to_owned(),
+            device: format!("cuda:{device}"),
+        })
+        .collect();
+    let transformer = group.blocks.get_mut("transformer").unwrap();
+    transformer.ranks = vec![3, 1, 2, 0];
+    transformer.sequence_parallel = proto::config::SequenceParallel::Ulysses {
+        ulysses_degree: 4,
+        projection: Default::default(),
+        projection_rows: None,
+    };
+    launch.engine_config.parallel.worker_groups = vec![group];
+    launch.devices = vec![0, 1, 2, 3];
+    launch.world_size = 4;
+
+    let registry = nn::family::Registry::new([models::minimax_h3::family::FAMILY]).unwrap();
+    let family = crate::process::catalogue::resolve(&registry, Path::new(FAST_H3)).unwrap();
+    let runners = ModelRunner::of(&launch, family).unwrap().ranks().unwrap();
+    assert_eq!(runners.len(), 4);
+    for runner in &runners {
+        let (_, sequence) = runner.media_collectives().unwrap();
+        assert_eq!(sequence.groups, [vec![3, 1, 2, 0]]);
+        let place = [3, 1, 2, 0]
+            .iter()
+            .position(|rank| *rank == runner.rank() as usize);
+        assert_eq!(sequence.member, Some((0, place.unwrap())));
+    }
 }
 
 /// The launch of [`FAST_H3`] over two devices of one process, each the one rank of a group: the

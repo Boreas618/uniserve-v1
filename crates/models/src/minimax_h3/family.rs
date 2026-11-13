@@ -15,7 +15,8 @@
 //! `t2va` and `fl2va`) or `transformer_ref` (the network of `ref2va`), of which a rank holds
 //! one, `video_decoder`, `audio_decoder`, `latent_encoder` (the condition encoders, which
 //! live with the denoiser that reads them) and `video_postprocessor` (the clip splice, which
-//! holds no weights). A stage this rank does not place is absent from the loaded pipeline.
+//! holds no weights and is placed wherever `video_decoder` is). A stage this rank does not place
+//! is absent from the loaded pipeline.
 
 use std::collections::BTreeSet;
 use std::path::Path;
@@ -557,9 +558,15 @@ fn stages(
         }
     }
 
+    // The clip splice holds no weights and places the video decoder's clips into the
+    // timeline, so it goes wherever the video decoder goes.
+    let places = |names: &BTreeSet<String>, stage: Stage| {
+        names.contains(stage.name())
+            || (stage == Stage::VideoPostprocessor && names.contains(Stage::VideoDecoder.name()))
+    };
     let stages: Stages = needed
         .iter()
-        .filter(|stage| placed.is_none_or(|names| names.contains(stage.name())))
+        .filter(|stage| placed.is_none_or(|names| places(names, *stage)))
         .collect();
     if stages.contains(Stage::Transformer) && stages.contains(Stage::TransformerRef) {
         return Err(Error::config(
@@ -1040,10 +1047,29 @@ mod tests {
             Some(&placed(&["transformer_ref", "video_decoder"])),
         )
         .unwrap();
+        // The clip splice comes with the video decoder that a deployment names.
         assert_eq!(
             flow,
-            Stages::of([Stage::TransformerRef, Stage::VideoDecoder])
+            Stages::of([
+                Stage::TransformerRef,
+                Stage::VideoDecoder,
+                Stage::VideoPostprocessor
+            ])
         );
+        let decoders = stages(
+            &config,
+            &[VideoTask::TextToVideoAudio],
+            Some(&placed(&["video_decoder", "audio_decoder"])),
+        )
+        .unwrap();
+        assert!(decoders.contains(Stage::VideoPostprocessor));
+        let track = stages(
+            &config,
+            &[VideoTask::TextToVideoAudio],
+            Some(&placed(&["audio_decoder"])),
+        )
+        .unwrap();
+        assert_eq!(track, Stages::of([Stage::AudioDecoder]));
     }
 
     /// A video is `17n + 5` frames, and a duration is served by the least such count covering

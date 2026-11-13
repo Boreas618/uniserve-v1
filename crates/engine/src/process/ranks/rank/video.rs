@@ -56,7 +56,7 @@ use proto::config::{
 use proto::video::Layout;
 use tensor::DType;
 
-use super::memory::{Peaks, unreserved};
+use super::memory::{Peaks, granularity, unreserved};
 use super::text::Keys;
 use super::{ModelRunner, Weights};
 
@@ -152,6 +152,10 @@ pub(crate) struct VideoRank {
     /// On a rank that denoises: the trajectory class's `tensors` and `encoding` digests, and the
     /// pages of its host latent region.
     pub(crate) trajectory: Option<([u8; 32], [u8; 32], BankPages)>,
+    /// On a rank that denoises: the denoiser as its family describes it to request processing
+    /// (`nn::family::Description::details`), which the engine states to the daemon; empty on any
+    /// other rank.
+    pub(crate) description: Vec<u8>,
     /// What the rank states of its worker group: its own phases and the shapes of its runners.
     pub(crate) capacity: Capacity,
     /// The rank's media memory, from its opening until the process's memories are connected.
@@ -162,6 +166,22 @@ pub(crate) struct VideoRank {
     pub(crate) regions: (Vec<u8>, Vec<u8>),
     /// The rank's serving runners, from its opening until its worker takes them.
     pub(crate) runners: Vec<Box<dyn Runner>>,
+}
+
+impl VideoRank {
+    /// This rank holding `slots` request slots of its group, as the division of its GPU's share
+    /// decides (`crate::process::ranks::fit_media_slots`): what it states of its group (its slots,
+    /// and the prompts an encode holds) and the pages of its host latent region follow them. Its
+    /// buckets and its pools are the deployment's, which the slots do not change.
+    pub(crate) fn hold(&mut self, slots: u32) {
+        self.capacity.slots = slots;
+        if self.capacity.serves(Phase::TextEncode) {
+            self.capacity.rows[Phase::TextEncode.index()] = phase_rows(Phase::TextEncode, slots, 0);
+        }
+        if let Some((_, _, pages)) = &mut self.trajectory {
+            *pages = slot_pages(*pages, slots);
+        }
+    }
 }
 
 impl ModelRunner {
@@ -316,24 +336,25 @@ impl ModelRunner {
 
     /// The parallel groups of the deployment's media groups over the process's host group, whose
     /// members are the deployment's ranks: the text encoders' tensor groups and the denoisers'
-    /// sequence groups, each a block's ranks as consecutive members, with this rank's place
-    /// among them. Every rank forms both, in this order, so every member of the host group takes
-    /// part in every group's id broadcast.
+    /// sequence groups, each a block's ranks in the order the block states them (any positions of
+    /// its worker group, the block's rank `r` being its `r`-th), with this rank's place among
+    /// them. Every rank forms both, in this order, so every member of the host group takes part
+    /// in every group's id broadcast.
     ///
     /// # Errors
     ///
-    /// A split block whose ranks are not consecutive positions of its group.
+    /// A split block that states another number of ranks than its parallel size, or a rank twice.
     pub(crate) fn media_collectives(&self) -> Result<(super::Collective, super::Collective)> {
         let groups = &self.engine_config().parallel.worker_groups;
         let firsts = WorkerGroupConfig::first_ranks(groups);
         let text = Stage::TextEncoder.name();
 
         let mut tensor = super::Collective {
-            spans: Vec::new(),
+            groups: Vec::new(),
             member: None,
         };
         let mut sequence = super::Collective {
-            spans: Vec::new(),
+            groups: Vec::new(),
             member: None,
         };
         for (first, group) in firsts.iter().zip(groups) {
@@ -350,30 +371,33 @@ impl ModelRunner {
                     continue;
                 }
 
-                // A block's ranks form its group in their order, as consecutive members.
-                let Some(&lead) = block.ranks.first() else {
+                // A block's ranks form its group in the order the block states them, whichever
+                // positions of the worker group they are.
+                if block.ranks.is_empty() {
                     continue;
-                };
-                let consecutive = block
-                    .ranks
-                    .iter()
-                    .enumerate()
-                    .all(|(index, position)| *position == lead + index);
-                if !consecutive || block.ranks.len() != size {
+                }
+                let distinct: BTreeSet<usize> = block.ranks.iter().copied().collect();
+                if distinct.len() != block.ranks.len() || block.ranks.len() != size {
                     bail!(
                         "block {name} of worker group {} splits over its ranks {:?}, which are not \
-                         {size} consecutive ranks of the group",
+                         {size} distinct ranks of the group",
                         group.id,
                         block.ranks
                     );
                 }
 
-                let span = collective.spans.len();
-                collective.spans.push((first + lead, size));
+                let index = collective.groups.len();
+                collective.groups.push(
+                    block
+                        .ranks
+                        .iter()
+                        .map(|position| first + position)
+                        .collect(),
+                );
                 if group.id.0 == self.group {
                     let position = self.position()?;
                     if let Some(place) = block.ranks.iter().position(|held| *held == position) {
-                        collective.member = Some((span, place));
+                        collective.member = Some((index, place));
                     }
                 }
             }
@@ -425,23 +449,28 @@ impl ModelRunner {
     /// The config of the rank's text encoder of `model`, writing the conditioning and reading the
     /// vision pixels of their classes in `classes` (the session's class of each product kind, in
     /// `crate::batch::product::KINDS` order): one captured encode bucket per request count up to
-    /// the slots and prompt capacity the deployment captures, and for an encoder that takes images
-    /// the prompts with vision blocks the deployment admits, whose eager encodes it profiles.
+    /// the deployment's running requests and per prompt capacity the deployment captures, and
+    /// for an encoder that takes images the prompts with vision blocks the deployment admits,
+    /// whose eager encodes it profiles. The request counts are the deployment's whatever slots
+    /// the division decides, as a causal runner's decode rows are (`ModelRunner::buckets`): an
+    /// encode holds at most the group's slots whatever its buckets hold.
     ///
     /// # Errors
     ///
     /// Capacities the deployment states that are not strictly increasing or above its prompt
-    /// length, or prompts with vision blocks the model cannot state.
+    /// length, more running requests than the protocol addresses, or prompts with vision blocks
+    /// the model cannot state.
     pub(crate) fn encoder_config(
         &self,
         model: &dyn VideoModel,
         classes: &[u8; 10],
     ) -> Result<EncoderConfig> {
         let serving = self.video_serving()?;
-        let slots = self.slots()?;
+        let requests = u32::try_from(self.engine_config().max_running_requests.get())
+            .context("more running requests than the protocol addresses")?;
         let mut buckets = Vec::new();
         for capacity in &serving.text_capacities {
-            for rows in 1..=slots {
+            for rows in 1..=requests {
                 buckets.push(Bucket::prefill(rows, *capacity, Variant::Encode));
             }
         }
@@ -790,7 +819,7 @@ impl ModelRunner {
         pool_tasks: u32,
     ) -> Result<(VideoRank, Keys)> {
         let classes = product_classes(0);
-        let slots = self.slots()?;
+        let slots = self.slots();
         let row = self.row_bytes(model.as_ref(), &classes)?;
 
         // The region numbers the profile's memory states are none of a forward's concern: the
@@ -813,8 +842,10 @@ impl ModelRunner {
             .map(DecoderRunner::device_bytes)
             .sum();
         let (mut trajectory, mut media_bytes, mut units) = (None, Vec::new(), 0);
+        let mut description = Vec::new();
         if let Some(denoiser) = &denoiser {
             buffers += denoiser.device_bytes();
+            description = model.description(&self.video_serving()?)?.details;
             let (tensors, encoding) = denoiser.trajectory_digests();
             let shapes = denoiser.media_shapes()?;
             let largest = shapes.iter().map(|(_, bytes, _)| *bytes).max().unwrap_or(0);
@@ -831,11 +862,14 @@ impl ModelRunner {
                 .profile_run(runner.as_ref())
                 .with_context(|| format!("profiling the rank's runner {}", id.0))?;
             keys.extend(graphs.keys());
+            // A media runner prepares no inputs of a paired forward
+            // (`Runner::prepare_shadow_inputs` refuses), so it is never shadowed and its rank's
+            // scratch pool holds no shadow region for it.
             peaks.push((
                 *id,
                 Peaks {
                     graph: graphs.peak(),
-                    shadow: graphs.shadow_peak(0),
+                    shadow: 0,
                     inputs: graphs.input_peak(),
                 },
             ));
@@ -853,6 +887,7 @@ impl ModelRunner {
                 row,
                 units,
                 trajectory,
+                description,
                 capacity,
                 memory: None,
                 regions: (Vec::new(), Vec::new()),
@@ -1041,17 +1076,13 @@ impl ModelRunner {
         pool_tasks: u32,
     ) -> Result<Capacity> {
         let phases = self.media_phases()?;
-        let slots = self.slots()?;
+        let slots = self.slots();
 
         let mut served = 0;
         let mut rows = [0; Phase::COUNT];
         for phase in &phases {
             served |= 1 << phase.index();
-            rows[phase.index()] = match phase {
-                Phase::TextEncode => slots.max(1),
-                phase if HOST_PHASES.contains(phase) => pool_tasks.max(1),
-                _ => 1,
-            };
+            rows[phase.index()] = phase_rows(*phase, slots, pool_tasks);
         }
 
         // The shapes a batch of a phase it serves is formed against.
@@ -1144,6 +1175,40 @@ impl ModelRunner {
         Ok(())
     }
 
+    /// The bytes a media rank's share of its GPU leaves for its request slots on `device` once its
+    /// weights are mapped (steps 11-14): what the GPU's quota holds now within the rank's own
+    /// share, less the graph and scratch pools of its runners' regions `peaks` and the `buffers`
+    /// its runners hold beside them, none of which grows with the slots.
+    ///
+    /// # Errors
+    ///
+    /// The Storage Server's or the driver's refusal, or a pool the quota cannot hold.
+    pub(crate) fn media_left(
+        &self,
+        client: &StorageClient,
+        device: DeviceId,
+        peaks: &[(RunnerId, Peaks)],
+        buffers: u64,
+    ) -> Result<u64> {
+        let granularity = granularity(device)?;
+        let graphs: Vec<u64> = peaks.iter().map(|(_, peaks)| peaks.graph).collect();
+        let shadows: Vec<u64> = peaks.iter().map(|(_, peaks)| peaks.shadow).collect();
+        let (graph, scratch) = division::pool_bytes(granularity, &graphs, &shadows, 0);
+
+        let (share, _) = self.fractions()?;
+        let (unreserved, _) = unreserved(client, device, share)?;
+        Ok(division::remainder(
+            unreserved,
+            &[
+                ("graph pool", graph),
+                ("scratch pool", scratch),
+                ("runner buffers", buffers),
+            ],
+            0,
+            &[],
+        )?)
+    }
+
     /// The digests the class of a video request's conditioning states (`storage::runtime::Class`)
     /// for `model`: its tensors, rows of the text encoder's width in the deployment's element
     /// type, and its encoding, an output's bytes in row order over the host encoder region's
@@ -1215,6 +1280,27 @@ pub(crate) fn served_phases(group: &WorkerGroupConfig, position: usize) -> Vec<P
     }
     phases.sort_by_key(|phase| phase.index());
     phases
+}
+
+/// The product kinds the rank at `position` of `group` backs, as indices into
+/// `crate::batch::product::KINDS`: those its group's phases write, the conditioning only on the
+/// group's first text encoder rank, an encoder output being one rank's.
+///
+/// # Errors
+///
+/// A session that numbers no conditioning kind.
+pub(crate) fn backed_kinds(group: &WorkerGroupConfig, position: usize) -> Result<Vec<usize>> {
+    let conditioning = product_kind(product::CONDITIONING)?;
+    let phases = group_phases(group);
+    let encoder = (0..group.ranks.len())
+        .find(|position| served_phases(group, *position).contains(&Phase::TextEncode));
+
+    Ok((0..product::KINDS.len())
+        .filter(|&kind| {
+            phases.contains(&product::KINDS[kind].1)
+                && (kind != conditioning || encoder == Some(position))
+        })
+        .collect())
 }
 
 /// The phases any rank of `group` serves.
@@ -1312,11 +1398,32 @@ pub(crate) fn latent_pages(trajectory: u64, slots: u32) -> Result<BankPages> {
     let page_bytes = pages.page_bytes()?;
     let trajectory_pages = u32::try_from(trajectory.div_ceil(page_bytes))
         .context("a trajectory of more pages than a u32 counts")?;
-    Ok(BankPages {
-        trajectory_pages,
-        pages: u64::from(trajectory_pages) * u64::from(slots),
+    Ok(slot_pages(
+        BankPages {
+            trajectory_pages,
+            ..pages
+        },
+        slots,
+    ))
+}
+
+/// `pages` holding the trajectories of `slots` request slots: every slot's trajectory pages.
+pub(crate) fn slot_pages(pages: BankPages, slots: u32) -> BankPages {
+    BankPages {
+        pages: u64::from(pages.trajectory_pages) * u64::from(slots),
         ..pages
-    })
+    }
+}
+
+/// The requests a stage of `phase` holds at once on a rank of `slots` request slots, in a process
+/// whose media pool runs `pool_tasks` tasks: the slots of an encode, the pool's tasks for a host
+/// phase, and one request of a denoiser or a decoder.
+fn phase_rows(phase: Phase, slots: u32, pool_tasks: u32) -> u32 {
+    match phase {
+        Phase::TextEncode => slots.max(1),
+        phase if HOST_PHASES.contains(&phase) => pool_tasks.max(1),
+        _ => 1,
+    }
 }
 
 /// The prompt capacities a media deployment captures: its own statement, or the default ladder,

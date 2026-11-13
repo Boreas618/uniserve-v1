@@ -198,6 +198,15 @@ impl Stream {
         ContextScope::enter(self.context)
     }
 
+    /// Runs `call` with the stream's context current on the calling thread, and restores the
+    /// thread's previous context after it: what a library that takes its device from the
+    /// calling thread (the CUDA runtime's `cudaGetDevice`) needs to compute on this stream's
+    /// device, whichever device the thread's own work is on.
+    pub fn with_context<T>(&self, call: impl FnOnce() -> T) -> Result<T> {
+        let _scope = self.enter()?;
+        Ok(call())
+    }
+
     pub(crate) fn retention(&self) -> Retention {
         self.retention.clone()
     }

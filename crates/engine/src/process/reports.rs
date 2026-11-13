@@ -76,16 +76,14 @@ impl MainProcess {
         };
         Some(wire::EngineInfo {
             limits: Some((&engine.limits).into()),
-            video_denoiser: Vec::new(),
+            video_denoiser: engine.video.clone(),
             latent_encoding_units: 0,
             schedulers: u32::try_from(engine.schedulers.len()).unwrap_or(u32::MAX),
             capacity: Some(wire::BatchCapacity {
                 max_batch,
                 max_num_batched_tokens,
-                max_running_requests: u32::try_from(
-                    self.launch.engine_config.max_running_requests.get(),
-                )
-                .unwrap_or(u32::MAX),
+                max_running_requests: u32::try_from(engine.max_running_requests)
+                    .unwrap_or(u32::MAX),
             }),
             segments: Vec::new(),
             prefix_seeds,

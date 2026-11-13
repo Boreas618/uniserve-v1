@@ -505,7 +505,13 @@ impl WeightBinding {
             })
             .collect();
         for (rank, reservation) in self.ranks.iter().zip(&reservations) {
-            self.reserve(&lock(rank), reservation)?;
+            let rank = lock(rank);
+            tracing::info!(
+                device = rank.device.0,
+                process = reservation.process,
+                "the serving rank reserves its process's device storage"
+            );
+            self.reserve(&rank, reservation)?;
         }
 
         *reserved = reservations;

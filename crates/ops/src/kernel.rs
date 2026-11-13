@@ -631,12 +631,17 @@ impl Kernel {
                 actual: "cubin",
             });
         };
-        // SAFETY: the caller states that this symbol is the package's entry with the `Entry`
-        // signature.
-        // SAFETY: forwarded from the caller: the entry is this package's `Entry`, and the call
-        // structure has the layout the package's header declares for it.
-        let status =
-            unsafe { (entry.function)(call as *mut C as *const c_void, stream_handle(stream)) };
+        // An entry computes on the device the calling thread holds current, as the libraries it
+        // calls read it (`cudaGetDevice`), so the stream's context is current for the call as it
+        // is for a cubin's launch: a thread that issues the work of several devices would
+        // otherwise run the entry for another device than its stream's.
+        let status = stream
+            .with_context(|| {
+                // SAFETY: forwarded from the caller: the entry is this package's `Entry`, and the
+                // call structure has the layout the package's header declares for it.
+                unsafe { (entry.function)(call as *mut C as *const c_void, stream_handle(stream)) }
+            })
+            .map_err(Error::Platform)?;
         if status == 0 {
             Ok(())
         } else {

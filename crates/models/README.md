@@ -47,7 +47,7 @@ The family of the three tasks `t2va`, `fl2va` and `ref2va`. Its entry is its fam
 
 ### Stages
 
-A deployment places stages under the names of its deployment file: `text_encoder` (the Qwen3-VL model at its first 50 decoder layers, an `nn::Encoder`), `transformer` (the network of `t2va` and `fl2va`) or `transformer_ref` (the network of `ref2va`), of which a rank holds one, `video_decoder`, `audio_decoder`, `latent_encoder` (the condition encoders, which load with the denoiser that reads them) and `video_postprocessor` (the clip splice, which holds no weights). A rank builds the stages its tasks need that its group places.
+A deployment places stages under the names of its deployment file: `text_encoder` (the Qwen3-VL model at its first 50 decoder layers, an `nn::Encoder`), `transformer` (the network of `t2va` and `fl2va`) or `transformer_ref` (the network of `ref2va`), of which a rank holds one, `video_decoder`, `audio_decoder`, `latent_encoder` (the condition encoders, which load with the denoiser that reads them) and `video_postprocessor` (the clip splice, which holds no weights and is placed wherever `video_decoder` is). A rank builds the stages its tasks need that its group places.
 
 ### Checkpoints
 

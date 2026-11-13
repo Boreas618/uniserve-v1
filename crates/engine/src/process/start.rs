@@ -83,6 +83,9 @@ pub struct Engine {
     /// The ceilings a policy of this engine declares its limits within: those of every group's
     /// captured buckets.
     pub(crate) ceilings: Limits,
+    /// The requests every scheduler runs at once as it started: the deployment's
+    /// `max_running_requests`, within the slots the groups' ranks hold.
+    pub(crate) max_running_requests: usize,
     /// The generation batches are assembled for, which the schedulers read and a switch moves.
     pub(crate) served: Arc<AtomicU64>,
     /// What ends the session with the buffer pool once the workers have stopped: the head's
@@ -111,6 +114,10 @@ pub struct Engine {
     /// devices, for as long as the engine serves; `None` without devices, or when the process is
     /// not subscribed to CUPTI.
     pub(crate) counters: Option<Counters>,
+    /// The video denoiser of a denoising rank of this process as its family describes it to
+    /// request processing (`nn::family::Description::details`), which the daemon binds the video
+    /// processor with; empty for an engine that generates no video.
+    pub(crate) video: Vec<u8>,
 }
 
 /// One scheduler of an [`Engine`] and how the control thread reaches it.
@@ -227,6 +234,7 @@ impl Engine {
 
         let mut schedulers = Vec::with_capacity(open.schedulers.len());
         let mut features = GenerationFeatures::empty();
+        let mut max_running_requests = scheduling.max_running_requests;
         for (index, (listed, pair)) in open.schedulers.iter().zip(pairs).enumerate() {
             // The scheduler's groups, each with its configuration and what its ranks serve.
             let mut groups: Vec<(WorkerGroupConfig, Capacity)> = Vec::with_capacity(listed.len());
@@ -265,6 +273,7 @@ impl Engine {
             )
             .with_context(|| format!("starting scheduler {index}"))?;
             features |= scheduler.limits().features;
+            max_running_requests = max_running_requests.min(scheduler.max_running_requests());
 
             let thread = std::thread::Builder::new()
                 .name(format!("scheduler-{index}"))
@@ -305,6 +314,7 @@ impl Engine {
             limits,
             capacities,
             ceilings,
+            max_running_requests,
             served,
             session,
             workers: Vec::new(),
@@ -316,6 +326,7 @@ impl Engine {
             upstream: None,
             liveness: None,
             counters: None,
+            video: Vec::new(),
         })
     }
 
@@ -567,6 +578,13 @@ pub(crate) fn start(
 
     let capacities = capacities(&ranks, &open)?;
     let binding = weight_binding(launch, &model_runner, &ranks, &workers)?;
+    let video = ranks
+        .iter()
+        .filter_map(|rank| rank.video().ok())
+        .map(|video| &video.description)
+        .find(|description| !description.is_empty())
+        .cloned()
+        .unwrap_or_default();
     drop(ranks);
 
     let head = Arc::new(Mutex::new(head));
@@ -601,6 +619,7 @@ pub(crate) fn start(
     engine.binding = binding;
     engine.counters = counters;
     engine.head = Some(head);
+    engine.video = video;
     engine.build = build.map(|client| (client, targets));
     if !remotes.is_empty() {
         engine.liveness = Some(liveness);

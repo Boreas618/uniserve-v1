@@ -10,7 +10,7 @@
 //! | Weights | The checkpoint's, less what the server retains of them already |
 //! | Graph pool: one region per runner | Each runner's profile-run peak (`Graphs::peak`) |
 //! | Scratch pool | Each runner's shadow region, the scratch page set of a causal runner, and the state snapshots of a model that keeps recurrent state |
-//! | Encoder cache, latent buffers | Their owners' bytes per request slot, times the request slots |
+//! | Request slots | What one request holds on the rank (a causal runner's slot state with its page-table and recurrent-state rows, a denoising rank's trajectory row and the products a request takes in its buffer), times the request slots |
 //! | Cache planes | What remains, in whole units |
 //!
 //! The functions are the steps of one computation, in this order:
@@ -22,7 +22,10 @@
 //! 3. [`pool_bytes`] states what the graph pool and the scratch pool map for the runners.
 //! 4. [`remainder`] takes every region but the cache out of the unreserved bytes and refuses,
 //!    naming the region and the shortfall, when one does not fit.
-//! 5. [`cache_units`] gives the cache planes the remainder in whole units and agrees the count
+//! 5. [`request_slots`] gives the request slots what the regions that do not grow with them and
+//!    the cache's fewest units leave: the deployment's `max_running_requests`, or as many as
+//!    fit when fewer do.
+//! 6. [`cache_units`] gives the cache planes the remainder in whole units and agrees the count
 //!    over the rank's group, so every rank of a group schedules against the same count.
 //!
 //! No step uses a fraction of the device or an allowance: a figure is a profile run's, an
@@ -271,6 +274,46 @@ pub(crate) fn remainder(
     Ok(left)
 }
 
+/// The request slots a rank holds: the most, up to `stated` (the deployment's
+/// `max_running_requests`), whose storages fit in `left`, the bytes the rank's share of its GPU
+/// leaves once its weights, its graph and scratch pools and the fewest units of its cache are
+/// taken out. `storage(slots)` is the bytes the storages the rank keeps per request slot take
+/// for `slots` slots, which grows with them; a rank of no slot runs no request, so one slot is
+/// the least it starts with.
+///
+/// # Errors
+///
+/// [`Error::Unsupported`] when `left` holds no slot, naming the bytes one slot needs; what
+/// `storage` fails with.
+pub(crate) fn request_slots<E: From<Error>>(
+    stated: u32,
+    left: u64,
+    storage: impl Fn(u32) -> std::result::Result<u64, E>,
+) -> std::result::Result<u32, E> {
+    let one = storage(1)?;
+    if one > left {
+        return Err(E::from(Error::Unsupported(format!(
+            "the rank's share of its GPU holds no request slot: one slot needs {one} bytes, and \
+             {left} are left once its weights, its graph and scratch pools and the fewest units \
+             of its cache are taken out, {} short",
+            one - left
+        ))));
+    }
+
+    // The storages grow with the slots, so the slots that fit are `1..=held`: a bisection over
+    // `held` in `low..=high`, of which `low` fits.
+    let (mut low, mut high) = (1, stated.max(1));
+    while low < high {
+        let middle = low + (high - low).div_ceil(2);
+        if storage(middle)? <= left {
+            low = middle;
+        } else {
+            high = middle - 1;
+        }
+    }
+    Ok(low)
+}
+
 /// The units of the rank's cache planes: what `remainder` holds in whole units of
 /// `unit_bytes`, agreed over `group` as the smallest count any of its ranks holds.
 ///
@@ -410,6 +453,37 @@ mod tests {
                 .map(|handle| handle.join().unwrap())
                 .collect()
         })
+    }
+
+    /// Slots of 3 MiB each beside 1 MiB that does not grow with them, such as the padding row
+    /// of a page table.
+    fn storage(slots: u32) -> Result<u64> {
+        Ok(MIB + u64::from(slots) * 3 * MIB)
+    }
+
+    #[test]
+    fn a_rank_holds_the_stated_slots_or_as_many_as_its_share_leaves_room_for() {
+        // Room for every stated slot: the deployment's bound.
+        assert_eq!(request_slots(8, GIB, storage).unwrap(), 8);
+        // Room for five slots and most of a sixth: five, whichever bound is stated above it.
+        let five = storage(5).unwrap();
+        assert_eq!(request_slots(8, five + 2 * MIB, storage).unwrap(), 5);
+        assert_eq!(request_slots(128, five, storage).unwrap(), 5);
+        // Exactly one slot's storages.
+        assert_eq!(request_slots(8, 4 * MIB, storage).unwrap(), 1);
+    }
+
+    #[test]
+    fn a_share_that_holds_no_slot_names_what_one_slot_needs() {
+        let error: Error = request_slots(8, 4 * MIB - 1, storage).unwrap_err();
+        let message = error.to_string();
+
+        assert!(matches!(error, Error::Unsupported(_)), "{message}");
+        assert!(
+            message.contains(&format!("one slot needs {}", 4 * MIB)),
+            "{message}"
+        );
+        assert!(message.contains("1 short"), "{message}");
     }
 
     #[test]

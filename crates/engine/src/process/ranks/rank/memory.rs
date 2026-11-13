@@ -4,9 +4,11 @@
 //!
 //! A rank divides what its GPU's quota leaves it once its weights are mapped, from figures that
 //! are stated or measured by then (`crate::memory::division`): the process's own bytes, the
-//! graph region and shadow region the runner's profile run states, the storages its request slots
-//! and its cache's tables take, and the expert transport of a union member, within its own share
-//! of the GPU (its worker group's `mem_fraction_static`). The cache's planes take what remains,
+//! graph region and shadow region the runner's profile run states, the expert transport of a union
+//! member, and the storages its request slots and its cache's tables take, within its own share
+//! of the GPU (its worker group's `mem_fraction_static`). The request slots are the deployment's
+//! running requests, or as many as the share holds beside the rest and the cache's fewest units
+//! when fewer fit (`division::request_slots`). The cache's planes take what remains,
 //! in whole units agreed over the rank's host group and rounded to whole segments: the memory of
 //! the buffer pool's region is the segments the ranks map or create once the session is open
 //! (`specs/buffer-pool.md` §14.1).
@@ -26,7 +28,7 @@ use crate::memory::division;
 use crate::memory::state::StateConfig;
 use crate::parallel::host::HostGroup;
 use crate::runner::buckets::Buckets;
-use crate::runner::causal_lm::CausalLmConfig;
+use crate::runner::causal_lm::{CausalLmConfig, CausalLmRunner};
 use anyhow::{Context as _, Result, bail};
 use nn::family::{StateField, TextModel};
 use platform::DeviceId;
@@ -55,10 +57,10 @@ pub(crate) struct Peaks {
 }
 
 impl ModelRunner {
-    /// Request slots the rank's runner and cache hold: the deployment's running requests.
-    pub(crate) fn slots(&self) -> Result<u32> {
-        u32::try_from(self.engine_config().max_running_requests.get())
-            .context("more request slots than the protocol addresses")
+    /// Request slots the rank's runner and cache hold: the deployment's running requests, or the
+    /// fewer the division of the rank's share of its GPU decided ([`ModelRunner::with_slots`]).
+    pub(crate) fn slots(&self) -> u32 {
+        self.slots
     }
 
     /// The layout of the rank's cache for `model` (step 5): one attention group of the model's
@@ -142,30 +144,26 @@ impl ModelRunner {
     /// The cache of `layout` with `units` units, the padding unit included, made of `segments` on a
     /// device (`None` for planes that are not split): the rank's request slots, and rows of the
     /// pages a request of the model's length holds (step 6).
-    ///
-    /// # Errors
-    ///
-    /// More request slots than the protocol addresses.
     pub(crate) fn cache_config(
         &self,
         layout: Arc<CacheLayout>,
         units: u32,
         segments: Option<Vec<PlaneSegment>>,
-    ) -> Result<KvCacheConfig> {
+    ) -> KvCacheConfig {
         let width = self
             .engine_config()
             .model
             .max_model_len
             .div_ceil(PAGE_TOKENS);
 
-        Ok(KvCacheConfig {
+        KvCacheConfig {
             layout,
             units,
-            slots: self.slots()?,
+            slots: self.slots(),
             width,
             segments,
             workspace_bytes: ATTENTION_WORKSPACE_BYTES,
-        })
+        }
     }
 
     /// The recurrent state of `model` for a runner over `buckets` (step 6), with its drafter's
@@ -175,18 +173,14 @@ impl ModelRunner {
     /// A request owns `drafts + 1` slots of a stepwise field when the deployment speculates, and
     /// its verifications are then lent verify slots and keep no trail; any other speculating
     /// deployment keeps a trail of the tokens of its largest verification.
-    ///
-    /// # Errors
-    ///
-    /// More request slots than the protocol addresses.
     pub(crate) fn state_config(
         &self,
         model: &dyn TextModel,
         buckets: &Buckets,
-    ) -> Result<Option<StateConfig>> {
+    ) -> Option<StateConfig> {
         let shapes = model.state_layers();
         if shapes.is_empty() {
-            return Ok(None);
+            return None;
         }
 
         let drafts = self.engine_config().speculative.num_draft_tokens;
@@ -223,14 +217,14 @@ impl ModelRunner {
             .map(|drafter| drafter.state())
             .unwrap_or_default();
 
-        Ok(Some(StateConfig {
+        Some(StateConfig {
             shapes,
-            slots: self.slots()?,
+            slots: self.slots(),
             rows: buckets.bounds().0,
             trail,
             owned,
             drafter,
-        }))
+        })
     }
 
     /// The bytes the graph pool and the scratch pool of `device` map for a runner of `peaks` over
@@ -254,72 +248,109 @@ impl ModelRunner {
         ))
     }
 
-    /// The units of the cache planes on `device` (steps 11-12 and 14-15), and the units of them
-    /// the rank's start creates: `(units, first)`.
-    ///
-    /// The units are the region's numbering: what the GPU's quota leaves once the weights are
-    /// mapped as if the epoch served the GPU alone, less the graph and scratch `pools`, the
-    /// recurrent state's `resident` bytes, the request slots' `slot_bytes`, the bytes `fixed`
-    /// the cache keeps beside its planes and the expert transport of a union member, agreed
-    /// over `host` as the smallest count of its ranks, and rounded down to whole segments of
-    /// whole granules. The first units are the whole segments of them the quota holds free now
-    /// ([`first_units`]), agreed over `host` alike: an epoch that starts beside the epoch it
-    /// succeeds has the units the serving epoch holds as the rest, which its regions grow into
-    /// by `Grow` as that epoch drains (`specs/updates.md` §3.7). A first epoch holds every unit
-    /// at once.
+    /// The device bytes the storages of `slots` request slots take on this rank, serving `model`
+    /// over a cache of `layout`, as a runner of that many slots states them (steps 6-7): each
+    /// slot's state and the outputs a speculating runner keeps (`CausalLmRunner::slot_bytes`,
+    /// `CausalLmRunner::kept_bytes`), the cache's pooled page tables and the rest it keeps beside
+    /// its planes (`KvCacheConfig::fixed_bytes`), and the recurrent state of a model that keeps
+    /// one (`StateConfig::bytes`).
     ///
     /// # Errors
     ///
-    /// The Storage Server's or the driver's refusal, the region the quota cannot hold now, or a
-    /// cache too small for one segment of whole granules: the memory of a device KV region is
-    /// the segments its ranks create, and planes that do not split are none.
-    #[expect(
-        clippy::too_many_arguments,
-        reason = "the division's figures come from six owners: the client, the host group, the \
-                  layout, the pools, the state and the cache's tables"
-    )]
+    /// A runner config the model refuses.
+    pub(crate) fn slot_storage(
+        &self,
+        model: &dyn TextModel,
+        layout: &Arc<CacheLayout>,
+        slots: u32,
+    ) -> Result<u64> {
+        let runner = self.with_slots(slots);
+        let least = fewest_units(layout);
+        let config = runner.causal_config(model, layout, least)?;
+
+        let state = CausalLmRunner::slot_bytes(&config, model)?
+            + CausalLmRunner::kept_bytes(&config, model)?;
+        let tables = runner
+            .cache_config(Arc::clone(layout), least, None)
+            .fixed_bytes();
+        let recurrent = runner
+            .state_config(model, runner.buckets())
+            .map_or(0, |state| state.bytes(layout));
+        Ok(state + tables + recurrent)
+    }
+
+    /// The request slots, the units of the cache planes on `device` (steps 11-12 and 14-15) and
+    /// the units of them the rank's start creates: `(slots, units, first)`.
+    ///
+    /// The request slots are the deployment's running requests, or as many as what the GPU's
+    /// quota holds now leaves once the weights are mapped and the graph and scratch `pools`, the
+    /// expert transport of a union member and the cache's fewest units are taken out, when fewer
+    /// fit ([`division::request_slots`]), each slot's storages as [`Self::slot_storage`] states
+    /// them; agreed over `host` as the fewest any of its ranks holds, since the ranks of a group
+    /// serve the same requests.
+    ///
+    /// The units are the region's numbering: what the GPU's quota leaves once the weights are
+    /// mapped as if the epoch served the GPU alone, less the pools, the expert transport and
+    /// the storages of the agreed slots, agreed over `host` as the smallest count of its ranks,
+    /// and rounded down to whole segments of whole granules. The first units are the whole
+    /// segments of them the quota holds free now ([`first_units`]), agreed over `host` alike: an
+    /// epoch that starts beside the epoch it succeeds has the units the serving epoch holds as
+    /// the rest, which its regions grow into by `Grow` as that epoch drains
+    /// (`specs/updates.md` §3.7). A first epoch holds every unit at once.
+    ///
+    /// # Errors
+    ///
+    /// The Storage Server's or the driver's refusal, a share that holds no request slot (naming
+    /// the bytes one needs), the region the quota cannot hold now, or a cache too small for one
+    /// segment of whole granules: the memory of a device KV region is the segments its ranks
+    /// create, and planes that do not split are none.
     pub(crate) fn divide(
         &self,
         client: &StorageClient,
         device: DeviceId,
         host: &HostGroup,
         model: &dyn TextModel,
-        layout: &CacheLayout,
+        layout: &Arc<CacheLayout>,
         (graph, scratch): (u64, u64),
-        resident: u64,
-        slot_bytes: u64,
-        fixed: u64,
-    ) -> Result<(u32, u32)> {
+    ) -> Result<(u32, u32, u32)> {
         let granularity = granularity(device)?;
         let (share, _) = self.fractions()?;
         let (now, alone) = unreserved(client, device, share)?;
 
         // The pools, the slots and the cache's tables are made at the start, so they fit what
         // the quota holds now; the planes are numbered for what it holds the epoch alone.
-        let regions = [
+        let pools = [
             ("graph pool", graph),
             ("scratch pool", scratch),
-            ("resident pool", resident),
-            ("request slots", slot_bytes),
-            ("cache tables", fixed),
             ("expert transport", self.transport_bytes(device, model)?),
         ];
+        let least = fewest_units(layout);
+        let left = division::remainder(
+            now,
+            &pools,
+            u64::from(least),
+            &[("cache's fewest units", layout.unit_bytes)],
+        )?;
+        let slots = division::request_slots(self.slots(), left, |slots| {
+            self.slot_storage(model, layout, slots)
+        })?;
+        let slots = host
+            .all_reduce_min(&[i64::from(slots)])
+            .context("agreeing the request slots of the ranks")?[0];
+        let slots = u32::try_from(slots).context("a negative count of request slots was agreed")?;
+
+        let storage = self.slot_storage(model, layout, slots)?;
+        let regions = [pools[0], pools[1], pools[2], ("request slots", storage)];
         let remainder = division::remainder(now, &regions, 0, &[])?;
         let whole = division::remainder(alone, &regions, 0, &[])?;
 
-        let slots = u64::from(self.slots()?);
         let capacity = self
             .engine_config()
             .kv_cache
             .max_tokens
-            .map(|tokens| layout.token_units(tokens.get(), slots));
-        let units = division::cache_units(
-            whole,
-            layout.unit_bytes,
-            u64::from(fewest_units(layout)),
-            capacity,
-            host,
-        )?;
+            .map(|tokens| layout.token_units(tokens.get(), u64::from(slots)));
+        let units =
+            division::cache_units(whole, layout.unit_bytes, u64::from(least), capacity, host)?;
 
         // Whole segments of whole granules, an eighth of the cache each at most: what a resize
         // across layouts, a sleep and a wake give back and create again.
@@ -339,7 +370,7 @@ impl ModelRunner {
             .all_reduce_min(&[i64::from(first)])
             .context("agreeing the units the ranks create at their start")?[0];
         let first = u32::try_from(first).context("a negative count of units was agreed")?;
-        Ok((units, first))
+        Ok((slots, units, first))
     }
 
     /// This rank's share of its GPU's storage, and the fraction of the GPU its epoch's quota of
@@ -441,6 +472,14 @@ pub(crate) fn unreserved(
     // bytes are not the rank's alone (ranks of one process on one device share its context, and
     // NVML states the process whole), so the quota above counts them, and the share does not.
     let own = quota_limit(memory.total, share).saturating_sub(held);
+    tracing::info!(
+        device = device.0,
+        process,
+        held,
+        now = now.min(own),
+        alone = alone.min(own),
+        "the bytes of the GPU's quota the rank divides"
+    );
     Ok((now.min(own), alone.min(own)))
 }
 

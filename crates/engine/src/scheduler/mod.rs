@@ -553,6 +553,12 @@ impl Scheduler {
     pub(crate) fn limits(&self) -> &GenerationLimits {
         &self.limits
     }
+
+    /// The requests this scheduler runs at once: the deployment's `max_running_requests`, within
+    /// the slots its groups hold, until a `Configure` changes it.
+    pub(crate) fn max_running_requests(&self) -> usize {
+        self.config.max_running_requests
+    }
 }
 
 /// `config` with its limits lowered to what `groups`' workers hold, once the deployment passes
@@ -560,11 +566,10 @@ impl Scheduler {
 /// `S/run.rs:108-162`, `S/worker/codecs.rs`).
 ///
 /// The checks: at least one group; every group that runs calls of a token sequence states its
-/// longest sequence; a deployment whose groups hold a KV cache holds a slot for every running
-/// request, since its requests' cache lives in their slots; and, when a group encodes video, every
-/// group that decodes video has one that encodes its units on the hosts that decoded them
-/// ([`group::encodes_on_host`]). The limits: `max_running_requests` within `1..=` the slots
-/// ([`slots`]), `max_num_batched_tokens` within `1..=` the widest prefill bucket's tokens, and
+/// longest sequence; and, when a group encodes video, every group that decodes video has one that
+/// encodes its units on the hosts that decoded them ([`group::encodes_on_host`]). The limits:
+/// `max_running_requests` within `1..=` the slots ([`slots`]), which give each running request
+/// the slot its state lives in, `max_num_batched_tokens` within `1..=` the widest prefill bucket's tokens, and
 /// `max_batch` at most the largest bucket's rows ([`ceilings`]); a bound no group states binds
 /// nothing.
 ///
@@ -613,18 +618,12 @@ fn resolved(mut config: SchedulerConfig, groups: &[WorkerGroup]) -> Result<Sched
         )));
     }
 
+    // Every running request holds a slot of a group of each phase it runs, whose state (a KV
+    // cache's pages, a trajectory) lives in it: the groups' slots bound the running requests, and
+    // a rank holds fewer slots than the deployment states when its share of its GPU holds no
+    // more (`specs/engine-worker-port.md` §1, `request_slots`).
     if let Some(slots) = slots(groups) {
         let slots = usize::try_from(slots).unwrap_or(usize::MAX);
-        let caches = groups.iter().any(|group| {
-            group.capacity.kv_cache.is_some() || !group.capacity.cache_groups.is_empty()
-        });
-        if caches && slots < config.max_running_requests {
-            return Err(Error::InvalidRequest(format!(
-                "the worker groups hold {slots} request slots, but {} running requests need one \
-                 each",
-                config.max_running_requests
-            )));
-        }
         config.max_running_requests = config.max_running_requests.min(slots).max(1);
     }
 

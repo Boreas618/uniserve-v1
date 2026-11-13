@@ -955,9 +955,10 @@ fn a_scheduler_starts_by_listing_its_sessions_cached_blocks_and_orders_them() {
 }
 
 /// The constructor refuses a deployment its workers cannot serve (SD §7.1): no group, a group
-/// of token sequences without a longest sequence, a KV cache with fewer slots than running
-/// requests, encoders of weights of different identities, whose outputs no one key finds (SD
-/// §4.3), and a video decoder whose units no video encoder reads on the hosts that decoded them.
+/// of token sequences without a longest sequence, encoders of weights of different identities,
+/// whose outputs no one key finds (SD §4.3), and a video decoder whose units no video encoder
+/// reads on the hosts that decoded them. A KV cache of fewer slots than the stated running
+/// requests runs as many requests as it holds slots.
 #[test]
 fn the_startup_checks_refuse_a_deployment_its_workers_cannot_serve() {
     let idle = || (idle_policy(), Parameters::default());
@@ -980,13 +981,16 @@ fn the_startup_checks_refuse_a_deployment_its_workers_cannot_serve() {
     };
     assert!(refusal(vec![(a.clone(), unbounded)]).contains("longest sequence"));
 
-    // Two groups of 16 slots for the 128 running requests of the default limits.
+    // Two groups of 16 slots for the 128 running requests of the default limits run 32.
     let cached = Capacity {
         cache_groups: vec![(CacheGroupKind::Full, 16)],
         ..serving(Phase::Prefill)
     };
     let groups = vec![(a.clone(), cached.clone()), (b.clone(), cached)];
-    assert!(refusal(groups).contains("hold 32 request slots"));
+    let Ok(bench) = built(1024, SchedulerConfig::default(), groups, idle()) else {
+        panic!("a cache of fewer slots than running requests is served");
+    };
+    assert_eq!(bench.scheduler.max_running_requests(), 32);
 
     let encoding = |identity: &str| Capacity {
         encoder_identity: identity.to_owned(),

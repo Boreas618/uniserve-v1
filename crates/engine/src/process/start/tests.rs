@@ -150,6 +150,8 @@ fn a_meta_start_of_a_media_launch_builds_one_engine_whose_close_ends_the_session
         capacity.serves(crate::batch::Phase::Denoise) && capacity.serves(crate::batch::Phase::Mux)
     );
     assert!(capacity.denoise_steps > 0 && !capacity.media_bytes.is_empty());
+    // The daemon binds the video processor with the denoiser the engine states.
+    assert!(!engine.video.is_empty());
     {
         let head = service::lock(engine.head.as_ref().unwrap());
         let (open, _) = head.session().unwrap();

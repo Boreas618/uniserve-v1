@@ -51,6 +51,12 @@ def test_a_row_norm_matches_its_reference_on_the_interpreter(check, op):
     interpreted(FAMILY / check, "--op", op)
 
 
+@pytest.mark.parametrize("op", ["modulated_rms_norm", "gated_residual"])
+def test_a_modulation_selects_rows_by_u32_indices_on_the_interpreter(op):
+    """The model library's parameter rows are `U32` (`nn::modules::adaln`)."""
+    interpreted(FAMILY / "modulation_check.py", "--op", op, "--indices", "u32")
+
+
 @pytest.mark.parametrize("op", ["rms_norm", "add_rms_norm"])
 def test_a_zero_centred_row_norm_matches_its_reference_on_the_interpreter(op):
     interpreted(FAMILY / "row_norm_check.py", "--op", op, "--centred", "true")

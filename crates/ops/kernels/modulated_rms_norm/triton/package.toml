@@ -18,6 +18,11 @@
 # block is the width's power-of-two `tl.arange` extent, and the module states
 # sixteen-element alignment for the three strides; a gate stride of 0 is a
 # modulation without a gate.
+#
+# The row indices are `u32` as the model library passes them
+# (`nn::modules::adaln`, whose parameter rows are `U32`), or `i32` and `i64`. A
+# parameter row times its stride stays far below 2^31 elements, so the index's
+# signedness never changes an address.
 
 op = "modulated_rms_norm"
 backend = "triton"
@@ -42,6 +47,6 @@ target = "arch"
 architectures = ["sm_100a", "sm_90a"]
 
 [kernel.descriptors]
-dimensions = { dtype = ["bf16", "f16", "f32"], output = ["bf16", "f16", "f32", "f8e4m3"], indices = ["i32", "i64"], width = { min = 1 }, block = { power_of_two = true }, epsilon = { bits = 32 }, gate_stride = { min = 0, multiple = 16 }, shift_stride = { multiple = 16 }, scale_stride = { multiple = 16 }, update = ["true", "false"], retain = ["true", "false"] }
+dimensions = { dtype = ["bf16", "f16", "f32"], output = ["bf16", "f16", "f32", "f8e4m3"], indices = ["u32", "i32", "i64"], width = { min = 1 }, block = { power_of_two = true }, epsilon = { bits = 32 }, gate_stride = { min = 0, multiple = 16 }, shift_stride = { multiple = 16 }, scale_stride = { multiple = 16 }, update = ["true", "false"], retain = ["true", "false"] }
 
 [parameters]

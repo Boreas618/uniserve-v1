@@ -924,7 +924,8 @@ pub struct EngineConfig {
     /// The deployment: its served model name, under which the Storage Servers keep its claims
     /// and pages.
     pub deployment: String,
-    /// Concurrently resident requests: the request slots every rank holds.
+    /// Concurrently resident requests: the request slots every rank holds, or the fewer its share
+    /// of its GPU holds.
     pub max_running_requests: NonZeroUsize,
     /// Token work admitted in one scheduling step; the engine's default when unset.
     pub max_num_batched_tokens: Option<NonZeroUsize>,

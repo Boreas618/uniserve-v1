@@ -5,7 +5,8 @@
 //! 1. [`load_ranks`] loads each rank on a thread of its own up to the division of its GPU's
 //!    quota: its Storage Server client and quota, the host groups it agrees over, its tensor
 //!    group's communicator, the model's meta load and the runner's profile run, the kernels the
-//!    profile run names, the weights, and the units of its cache, agreed over its host group.
+//!    profile run names, the weights, and its request slots and the units of its cache, agreed
+//!    over its host group.
 //! 2. [`layout`] states the session's layout from those units; its device KV regions state no
 //!    segment and ask for no unit, since none of their memory exists yet. The head opens the
 //!    session with it, and the answer numbers each region as the buffer pool holds it: a region
@@ -25,7 +26,8 @@
 //!
 //! A rank of a media deployment ([`Loaded::Video`], `crate::process::ranks::rank::video`) takes the
 //! same steps and keeps no cache: its load profiles the media runners of the blocks its group
-//! places on it and forms its text encoder's and denoiser's groups; the layout states every rank's
+//! places on it and forms its text encoder's and denoiser's groups, and once every rank is loaded
+//! each group's request slots are decided ([`fit_media_slots`]); the layout states every rank's
 //! product buffer, the slot rows of each group with a trajectory's row, the host regions of encoder
 //! outputs and stored trajectories, and the product classes with the regions each group's blocks
 //! write and read; its opening takes its media memory from its graph pool's resident pool, the
@@ -41,6 +43,7 @@
 
 pub(crate) mod rank;
 
+use std::collections::BTreeMap;
 use std::net::TcpListener;
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 
@@ -81,7 +84,8 @@ use crate::process::ranks::rank::memory::{
 };
 use crate::process::ranks::rank::text::{Keys, keys, profile};
 use crate::process::ranks::rank::video::{
-    VideoRank, boxed, group_phases, latent_pages, product_classes, product_kind, served_phases,
+    VideoRank, backed_kinds, boxed, group_phases, latent_pages, product_classes, product_kind,
+    slot_pages,
 };
 
 /// The number of the generation a start serves: its kernels on a device, none on the meta device.
@@ -238,6 +242,24 @@ impl LoadedRank {
         }))
     }
 
+    /// The bytes this media rank's share of its GPU leaves for its request slots once its weights
+    /// are mapped (`ModelRunner::media_left`); `None` for a rank backed by nothing, which holds
+    /// no share of a device.
+    ///
+    /// # Errors
+    ///
+    /// A text rank; the Storage Server's or the driver's refusal, or a pool the quota cannot
+    /// hold.
+    pub(crate) fn media_left(&self) -> Result<Option<u64>> {
+        let Some(client) = &self.client else {
+            return Ok(None);
+        };
+        let video = self.video()?;
+        self.model_runner
+            .media_left(client, self.device()?, &video.peaks, video.buffers)
+            .map(Some)
+    }
+
     /// Whether the rank computes encoder outputs: it serves a text encoding, a chat image's
     /// vision encoding or a condition latent's encoding, whose outputs the encoder identity of
     /// its group keys (`Capacity::encoder_identity`).
@@ -359,7 +381,7 @@ pub(crate) fn load_ranks(
     // One join target list for the union, which `spawn` fills with its members' workers.
     let targets: Members = Arc::default();
 
-    std::thread::scope(|scope| {
+    let mut ranks = std::thread::scope(|scope| {
         let mut handles = Vec::with_capacity(count);
         for (index, model_runner) in model_runners.into_iter().enumerate() {
             let meeting = (address.clone(), listener.take());
@@ -391,8 +413,15 @@ pub(crate) fn load_ranks(
                     .join()
                     .map_err(|_| anyhow::anyhow!("a rank's load panicked"))?
             })
-            .collect()
-    })
+            .collect::<Result<Vec<LoadedRank>>>()
+    })?;
+
+    // A media group's request slots are its ranks' fewest, so they are decided once every rank
+    // of the process, which holds every rank of a media group, is loaded.
+    if ranks.iter().any(|rank| rank.video().is_ok()) {
+        fit_media_slots(&mut ranks, LoadedRank::media_left)?;
+    }
+    Ok(ranks)
 }
 
 /// A listener on the loopback for the members of a host group of this process, and its address.
@@ -484,18 +513,7 @@ fn load_rank(
         .context("loading the epoch's model from its checkpoint's headers")?;
     let layout = Arc::new(model_runner.cache_layout(meta.as_ref())?);
     let least = fewest_units(&layout);
-    let meta_config = model_runner.causal_config(meta.as_ref(), &layout, least)?;
-    let meta_cache = Arc::new(Mutex::new(KvCacheMemory::meta(
-        model_runner.cache_config(Arc::clone(&layout), least, None)?,
-    )?));
-    let state_config = model_runner.state_config(meta.as_ref(), model_runner.buckets())?;
-    let meta_state = match &state_config {
-        Some(config) => Some(Arc::new(Mutex::new(StateMemory::meta(
-            config.clone(),
-            service::lock(&meta_cache).config(),
-        )?))),
-        None => None,
-    };
+    let (meta_config, meta_cache, meta_state) = meta_owners(&model_runner, meta.as_ref(), &layout)?;
     let meta_member = match &union {
         Some((group, targets, place)) => model_runner.union_member(
             device,
@@ -585,30 +603,27 @@ fn load_rank(
         .finish()
         .context("publishing the granules of the epoch's packed weights")?;
 
-    // Steps 11-15: the division of the GPU's quota into the pools, the fixed regions and the
+    // Steps 11-15: the division of the GPU's quota into the pools, the request slots and the
     // cache's units.
-    let resident = state_config
-        .as_ref()
-        .map_or(0, |config| config.bytes(&layout));
-    let slot_bytes = CausalLmRunner::slot_bytes(&meta_config, model.as_ref())?
-        + CausalLmRunner::kept_bytes(&meta_config, model.as_ref())?;
-    let fixed = service::lock(&meta_cache).config().fixed_bytes();
     let pools = model_runner.pools(device, &layout, peaks)?;
-    let (units, first) = model_runner.divide(
-        &client,
-        device,
-        &host,
-        model.as_ref(),
-        &layout,
-        pools,
-        resident,
-        slot_bytes,
-        fixed,
-    )?;
+    let (slots, units, first) =
+        model_runner.divide(&client, device, &host, model.as_ref(), &layout, pools)?;
+
+    // A rank whose share holds fewer slots than the deployment runs serves with those: the
+    // storages its slots take are sized by them from here on. Its buckets and its pools are the
+    // deployment's, which the slots do not change.
+    let (model_runner, meta_config, meta_cache, meta_state) = if slots == model_runner.slots() {
+        (model_runner, meta_config, meta_cache, meta_state)
+    } else {
+        let model_runner = model_runner.with_slots(slots);
+        let (config, cache, state) = meta_owners(&model_runner, model.as_ref(), &layout)?;
+        (model_runner, config, cache, state)
+    };
 
     tracing::info!(
         rank = model_runner.rank(),
         group = model_runner.group(),
+        slots,
         units,
         first,
         storage = %storage.socket,
@@ -636,6 +651,44 @@ fn load_rank(
             union,
         })),
     })
+}
+
+/// The meta owners of a text rank's cache over `layout` and of its recurrent state, at the fewest
+/// units the cache serves with, and the config of its runner of `model` over them, as
+/// `model_runner` sizes them (steps 6-7): what the rank's profile run computes over, and what its
+/// statement reads until its opening.
+///
+/// # Errors
+///
+/// What the runner's config or the owners refuse.
+#[expect(
+    clippy::type_complexity,
+    reason = "the profiled runner's three owners, which `TextRank` holds apart"
+)]
+fn meta_owners(
+    model_runner: &ModelRunner,
+    model: &dyn TextModel,
+    layout: &Arc<CacheLayout>,
+) -> Result<(
+    CausalLmConfig,
+    Arc<Mutex<KvCacheMemory>>,
+    Option<Arc<Mutex<StateMemory>>>,
+)> {
+    let least = fewest_units(layout);
+    let config = model_runner.causal_config(model, layout, least)?;
+    let cache = Arc::new(Mutex::new(KvCacheMemory::meta(model_runner.cache_config(
+        Arc::clone(layout),
+        least,
+        None,
+    ))?));
+    let state = match model_runner.state_config(model, model_runner.buckets()) {
+        Some(state) => Some(Arc::new(Mutex::new(StateMemory::meta(
+            state,
+            service::lock(&cache).config(),
+        )?))),
+        None => None,
+    };
+    Ok((config, cache, state))
 }
 
 /// Loads a rank of a media deployment onto `backing` (steps 3-10), over `client`, its Storage
@@ -750,7 +803,7 @@ fn join_hook(targets: Members, place: usize) -> JoinHook {
 ///
 /// A group that communicates forms its NCCL communicator: each group's first member draws the
 /// group's id and the host group carries it, one broadcast per group of more than one member,
-/// which every member of the host group takes part in, in the order the spans state;
+/// which every member of the host group takes part in, in the order the groups are stated;
 /// `Communicator::init` then blocks until every member of the rank's own group joined. One that
 /// does not states the split alone, which the runner's graphs take
 /// ([`Graphs::set_group`]).
@@ -761,37 +814,36 @@ fn group_over(
     communicates: bool,
 ) -> Result<Option<Arc<ops::Group>>> {
     let members = host.size();
-    for &(first, size) in &collective.spans {
-        if size > 1 && first + size > members {
+    for group in &collective.groups {
+        if group.len() > 1 && group.iter().any(|member| *member >= members) {
             bail!(
-                "a parallel group of {size} ranks from member {first} in a host group of \
-                 {members}: a group's ranks are members of the host group"
+                "a parallel group of members {group:?} in a host group of {members}: a group's \
+                 ranks are members of the host group"
             );
         }
     }
-    let mine = collective.member.filter(|(span, _)| {
+    let mine = collective.member.filter(|(index, _)| {
         collective
-            .spans
-            .get(*span)
-            .is_some_and(|(_, size)| *size > 1)
+            .groups
+            .get(*index)
+            .is_some_and(|group| group.len() > 1)
     });
     if !communicates {
         return Ok(None);
     }
 
     let mut own = None;
-    for (index, &(first, size)) in collective.spans.iter().enumerate() {
-        if size <= 1 {
+    for (index, group) in collective.groups.iter().enumerate() {
+        let Some(&root) = group.first().filter(|_| group.len() > 1) else {
             continue;
-        }
-        let root = host.rank() == first;
-        let id = if root {
+        };
+        let id = if host.rank() == root {
             Some(platform::UniqueId::new()?)
         } else {
             None
         };
-        let bytes = host.broadcast_bytes(id.as_ref().map(|id| &id.0[..]), first)?;
-        if mine.is_some_and(|(span, _)| span == index) {
+        let bytes = host.broadcast_bytes(id.as_ref().map(|id| &id.0[..]), root)?;
+        if mine.is_some_and(|(held, _)| held == index) {
             own = Some(platform::UniqueId(bytes.try_into().map_err(
                 |bytes: Vec<u8>| {
                     anyhow::anyhow!("a communicator's id is 128 bytes, not {}", bytes.len())
@@ -799,10 +851,10 @@ fn group_over(
             )?));
         }
     }
-    let (Some((span, rank)), Some(id)) = (mine, own) else {
+    let (Some((index, rank)), Some(id)) = (mine, own) else {
         return Ok(None);
     };
-    let size = collective.spans[span].1;
+    let size = collective.groups[index].len();
     let size = i32::try_from(size).context("a group wider than NCCL addresses")?;
     let member = i32::try_from(rank).context("a rank past what NCCL addresses")?;
     let communicator = platform::Communicator::init(device, size, member, &id)
@@ -913,8 +965,8 @@ fn short(digest: &[u8; 32]) -> String {
 /// The layout the engine epoch `launch` states to open its session with its host's buffer pool
 /// (`storage::runtime::Open`, `specs/buffer-pool.md` §11, §14.1), from `ranks`, this process's
 /// ranks loaded to their division: [`text_layout`] for the ranks of a text deployment, from the
-/// first rank's cache layout and units, its group's width and its request slots' bytes, which
-/// every rank of the deployment's one configuration states alike; [`media_layout`] for the
+/// first rank's cache layout and units, its group's width and its request slots and their bytes,
+/// which every rank of the deployment's one configuration states alike; [`media_layout`] for the
 /// ranks of a media deployment. It is the one statement of a session's layout, whoever builds
 /// the ranks behind it.
 ///
@@ -928,10 +980,10 @@ pub(crate) fn layout(launch: &EngineArgs, ranks: &[LoadedRank]) -> Result<Open> 
             let cache = Arc::clone(service::lock(&text.cache).layout());
             let tensor = u32::try_from(first.model_runner.world_size())
                 .context("a worker group wider than a session states")?;
-            let slots = first.model_runner.slots()?;
+            let slots = first.model_runner.slots();
             let slot_bytes = CausalLmRunner::slot_bytes(&text.config, text.model.as_ref())?
                 / u64::from(slots.max(1));
-            text_layout(launch, &cache, text.units, tensor, slot_bytes)
+            text_layout(launch, &cache, text.units, tensor, (slots, slot_bytes))
         }
         Loaded::Video(_) => media_layout(launch, ranks),
     }
@@ -939,8 +991,8 @@ pub(crate) fn layout(launch: &EngineArgs, ranks: &[LoadedRank]) -> Result<Open> 
 
 /// The layout of a text deployment's session ([`layout`]), for ranks of the deployment's one
 /// configuration whose caches are laid out as `cache` with `units` units, the padding unit
-/// included, whose worker groups are `tensor` ranks wide, and whose request slots each take
-/// `slot_bytes` of one rank's device memory:
+/// included, whose worker groups are `tensor` ranks wide, and whose groups each hold `slots`
+/// request slots, each taking `slot_bytes` of one rank's device memory:
 ///
 /// - **Regions.** Per scheduler, the device region of its KV units, the same units on every rank
 ///   and group of it, named by its layout alone and numbered `units`. It states no segment and
@@ -969,13 +1021,11 @@ pub fn text_layout(
     cache: &CacheLayout,
     units: u32,
     tensor: u32,
-    slot_bytes: u64,
+    (slots, slot_bytes): (u32, u64),
 ) -> Result<Open> {
     let config = &launch.engine_config;
     let groups = &config.parallel.worker_groups;
     let (numbers, schedulers) = group_numbers(groups, config.parallel.data_parallel_size.get())?;
-    let slots = u32::try_from(config.max_running_requests.get())
-        .context("more request slots than the protocol addresses")?;
     let tensor = u64::from(tensor.max(1));
     let kv = &config.kv_cache;
 
@@ -1153,46 +1203,14 @@ fn media_layout(launch: &EngineArgs, ranks: &[LoadedRank]) -> Result<Open> {
     let groups = &config.parallel.worker_groups;
     let (numbers, schedulers) = group_numbers(groups, config.parallel.data_parallel_size.get())?;
     let firsts = WorkerGroupConfig::first_ranks(groups);
-    let first = ranks.first().context("this process loaded no rank")?;
-    let slots = first.model_runner.slots()?;
 
     // The sizes the group that denoises states, and the digests of the classes with host copies.
-    let (sizer, sizing) = ranks
-        .iter()
-        .find_map(|rank| match &rank.loaded {
-            Loaded::Video(video) if video.trajectory.is_some() => Some((&rank.model_runner, video)),
-            _ => None,
-        })
-        .context(
-            "no rank of this process denoises, and a media deployment's products and \
-             trajectories are sized by the group that does",
-        )?;
+    let (sizer, sizing) = sizing(ranks)?;
     let (tensors, encoding, pages) = sizing
         .trajectory
         .context("a denoising rank states its trajectory class")?;
     let conditioning = product_kind(product::CONDITIONING)?;
-    let tail = product_kind(product::VIDEO_TAIL)?;
-    let largest = |kind: usize| {
-        sizing
-            .capacity
-            .media_bytes
-            .iter()
-            .filter_map(|(_, _, bytes)| bytes.get(kind).copied())
-            .max()
-            .unwrap_or(0)
-    };
-    // The units a request's blocks of each kind take: a block at the largest size, as many blocks
-    // as the request declares (one splice tail per unit of the longest timeline).
-    let request_units: Vec<u64> = (0..product::KINDS.len())
-        .map(|kind| {
-            let blocks = if kind == tail {
-                u64::from(sizing.units)
-            } else {
-                1
-            };
-            largest(kind).div_ceil(UNIT_BYTES).max(1) * blocks
-        })
-        .collect();
+    let request_units = request_units(sizing)?;
 
     // The serving groups by their index in the deployment, each with the phases its ranks serve.
     let mut listed: Vec<(usize, GroupId, usize)> = Vec::new();
@@ -1207,11 +1225,14 @@ fn media_layout(launch: &EngineArgs, ranks: &[LoadedRank]) -> Result<Open> {
     }
     let phases: Vec<Vec<Phase>> = groups.iter().map(group_phases).collect();
     let serves = |index: usize, phase: Phase| phases[index].contains(&phase);
-    let serving = |phase: Phase| {
+    // The request slots of each group that serves `phase`, as its ranks hold them
+    // ([`fit_media_slots`]).
+    let serving = |phase: Phase| -> Result<Vec<u32>> {
         listed
             .iter()
             .filter(|(_, _, index)| serves(*index, phase))
-            .count() as u64
+            .map(|(_, _, index)| group_slots(ranks, &groups[*index]))
+            .collect()
     };
 
     let mut regions: Vec<Region> = Vec::new();
@@ -1238,53 +1259,53 @@ fn media_layout(launch: &EngineArgs, ranks: &[LoadedRank]) -> Result<Open> {
 
     // The host region of encoder outputs: the conditioning of every request slot of each group
     // that encodes prompts, and as many again for requests that resume.
-    let encoders_region = match serving(Phase::TextEncode) {
-        0 => None,
-        count => {
-            let units = encoders::pool_pages(&[largest(conditioning)], slots as usize)
-                .saturating_mul(count);
-            let mut digest = storage::key::Digest::new(b"uniserve.host-encoders");
-            digest.bytes(&conditioning_digests.0);
-            digest.bytes(&encoders::layout());
-            digest.number(units);
-            let name = format!("host encoders {}", short(&digest.finish()));
-            let index = region_index(&regions)?;
-            regions.push(host_region(name, encoders::PAGE_BYTES, units)?);
-            Some(index)
-        }
+    let encoding_slots = serving(Phase::TextEncode)?;
+    let encoders_region = if encoding_slots.is_empty() {
+        None
+    } else {
+        let largest = largest_block(sizing, conditioning);
+        let units = encoding_slots
+            .iter()
+            .map(|slots| encoders::pool_pages(&[largest], *slots as usize))
+            .fold(0, u64::saturating_add);
+        let mut digest = storage::key::Digest::new(b"uniserve.host-encoders");
+        digest.bytes(&conditioning_digests.0);
+        digest.bytes(&encoders::layout());
+        digest.number(units);
+        let name = format!("host encoders {}", short(&digest.finish()));
+        let index = region_index(&regions)?;
+        regions.push(host_region(name, encoders::PAGE_BYTES, units)?);
+        Some(index)
     };
 
     // The host region of stored trajectories: every trajectory of each denoising group's slots
     // a preemption saves, and those a trial keeps beside them.
-    let latents_region = match serving(Phase::Denoise) {
-        0 => None,
-        count => {
-            let units = latent::host::pool_pages(pages).saturating_mul(count);
-            let mut digest = storage::key::Digest::new(b"uniserve.host-latents");
-            digest.bytes(&tensors);
-            digest.bytes(&latent::host::share(&pages, WHOLE_SAMPLES));
-            digest.number(units);
-            let name = format!("host latents {}", short(&digest.finish()));
-            let index = region_index(&regions)?;
-            regions.push(host_region(name, pages.page_bytes()?, units)?);
-            Some(index)
-        }
+    let denoising_slots = serving(Phase::Denoise)?;
+    let latents_region = if denoising_slots.is_empty() {
+        None
+    } else {
+        let units = denoising_slots
+            .iter()
+            .map(|slots| latent::host::pool_pages(slot_pages(pages, *slots)))
+            .fold(0, u64::saturating_add);
+        let mut digest = storage::key::Digest::new(b"uniserve.host-latents");
+        digest.bytes(&tensors);
+        digest.bytes(&latent::host::share(&pages, WHOLE_SAMPLES));
+        digest.number(units);
+        let name = format!("host latents {}", short(&digest.finish()));
+        let index = region_index(&regions)?;
+        regions.push(host_region(name, pages.page_bytes()?, units)?);
+        Some(index)
     };
 
     // Per group, the product buffer of each rank and the kinds each backs, then its slot rows.
     let mut backing: Vec<(usize, [Vec<u8>; 10], u8)> = Vec::with_capacity(listed.len());
     for &(_, id, index) in &listed {
         let group = &groups[index];
-        let encoder = (0..group.ranks.len())
-            .find(|position| served_phases(group, *position).contains(&Phase::TextEncode));
+        let slots = group_slots(ranks, group)?;
         let mut kinds: [Vec<u8>; 10] = Default::default();
         for position in 0..group.ranks.len() {
-            let backs: Vec<usize> = (0..product::KINDS.len())
-                .filter(|&kind| {
-                    serves(index, product::KINDS[kind].1)
-                        && (kind != conditioning || encoder == Some(position))
-                })
-                .collect();
+            let backs = backed_kinds(group, position)?;
             let units: u64 = backs.iter().map(|kind| request_units[*kind]).sum();
             let units = u32::try_from((units * u64::from(slots)).max(1))
                 .context("a product buffer of more units than u32")?;
@@ -1399,6 +1420,176 @@ fn media_layout(launch: &EngineArgs, ranks: &[LoadedRank]) -> Result<Open> {
         schedulers,
         peers: config.kv_cache.peers.clone(),
     })
+}
+
+/// The rank of `ranks` that sizes a media deployment's products and trajectories, the first that
+/// denoises, with its model runner.
+///
+/// # Errors
+///
+/// No rank of `ranks` denoises.
+fn sizing(ranks: &[LoadedRank]) -> Result<(&ModelRunner, &VideoRank)> {
+    ranks
+        .iter()
+        .find_map(|rank| match &rank.loaded {
+            Loaded::Video(video) if video.trajectory.is_some() => {
+                Some((&rank.model_runner, &**video))
+            }
+            _ => None,
+        })
+        .context(
+            "no rank of this process denoises, and a media deployment's products and \
+             trajectories are sized by the group that does",
+        )
+}
+
+/// The bytes of the largest block of product kind `kind` (an index into
+/// `crate::batch::product::KINDS`) that the denoising rank `sizing` states.
+fn largest_block(sizing: &VideoRank, kind: usize) -> u64 {
+    sizing
+        .capacity
+        .media_bytes
+        .iter()
+        .filter_map(|(_, _, bytes)| bytes.get(kind).copied())
+        .max()
+        .unwrap_or(0)
+}
+
+/// The product buffer units one request's blocks of each kind take, in
+/// `crate::batch::product::KINDS` order, at the sizes the denoising rank `sizing` states: a block
+/// at the largest size, as many blocks as the request declares (one splice tail per unit of the
+/// longest timeline).
+///
+/// # Errors
+///
+/// A session that numbers no splice tail kind.
+fn request_units(sizing: &VideoRank) -> Result<Vec<u64>> {
+    let tail = product_kind(product::VIDEO_TAIL)?;
+    Ok((0..product::KINDS.len())
+        .map(|kind| {
+            let blocks = if kind == tail {
+                u64::from(sizing.units)
+            } else {
+                1
+            };
+            largest_block(sizing, kind).div_ceil(UNIT_BYTES).max(1) * blocks
+        })
+        .collect())
+}
+
+/// The request slots media group `group` holds: its ranks' among `ranks`, which every rank of a
+/// media group is ([`fit_media_slots`]).
+///
+/// # Errors
+///
+/// A group none of whose ranks is among `ranks`.
+fn group_slots(ranks: &[LoadedRank], group: &WorkerGroupConfig) -> Result<u32> {
+    ranks
+        .iter()
+        .find(|rank| rank.model_runner.group() == group.id.0)
+        .map(|rank| rank.model_runner.slots())
+        .with_context(|| format!("this process holds no rank of media group {}", group.id.0))
+}
+
+/// Decides the request slots of every media group of `ranks`, this process's ranks of a media
+/// deployment loaded to their division (`specs/engine-worker-port.md` §1, `request_slots`): the
+/// deployment's `max_running_requests`, or the fewest any rank of the group holds when fewer
+/// fit. `left(rank)` is the bytes the rank's share of its GPU leaves once its weights, its graph
+/// and scratch pools and its runners' buffers are taken out
+/// (`ModelRunner::media_left`), `None` for a rank backed by nothing, which holds the stated
+/// slots. A rank's slot holds what one request holds on it: its trajectory row
+/// (`DenoiserRunner::row_bytes`) on a denoising rank, and on any rank the blocks one request
+/// takes of each product kind it backs, at the largest sizes the denoising rank states
+/// ([`request_units`]): its media memory of that many slots (`BufferMemory::device_bytes`).
+///
+/// A rank whose group holds fewer slots than the deployment runs states them of its group and
+/// sizes its host latent pages and its media memory by them; its buckets and its pools are the
+/// deployment's, which the slots do not change.
+///
+/// # Errors
+///
+/// A rank whose share holds no request slot, naming the bytes one needs, or no denoising rank
+/// among `ranks`.
+pub(crate) fn fit_media_slots(
+    ranks: &mut [LoadedRank],
+    left: impl Fn(&LoadedRank) -> Result<Option<u64>>,
+) -> Result<()> {
+    let Some(first) = ranks.first() else {
+        return Ok(());
+    };
+    let config = first.model_runner.engine_config();
+    let stated = u32::try_from(config.max_running_requests.get())
+        .context("more request slots than the protocol addresses")?;
+    let groups = &config.parallel.worker_groups;
+    let request_units = request_units(sizing(ranks)?.1)?;
+
+    // Per group, the fewest slots any of its ranks holds.
+    let mut decided: BTreeMap<String, u32> = BTreeMap::new();
+    for rank in ranks.iter() {
+        let Some(left) = left(rank)? else {
+            continue;
+        };
+        let video = rank.video()?;
+        let runner = &rank.model_runner;
+        let group = groups
+            .iter()
+            .find(|group| group.id.0 == runner.group())
+            .with_context(|| format!("the deployment states no worker group {}", runner.group()))?;
+        let request: u64 = backed_kinds(group, runner.position()?)?
+            .iter()
+            .map(|kind| request_units[*kind])
+            .sum();
+        let slots = division::request_slots(stated, left, |slots| -> Result<u64> {
+            let units = u32::try_from((request * u64::from(slots)).max(1))
+                .context("a product buffer of more units than u32")?;
+            Ok(BufferMemory::device_bytes(units, slots, video.row))
+        })
+        .with_context(|| format!("sizing the request slots of rank {}", runner.rank()))?;
+        tracing::info!(
+            rank = runner.rank(),
+            left,
+            buffers = video.buffers,
+            slot = BufferMemory::device_bytes(
+                u32::try_from(request).unwrap_or(u32::MAX),
+                1,
+                video.row
+            ),
+            slots,
+            "the media rank's share holds its request slots"
+        );
+        decided
+            .entry(runner.group().to_owned())
+            .and_modify(|held| *held = (*held).min(slots))
+            .or_insert(slots);
+    }
+
+    for rank in ranks.iter_mut() {
+        if let Some(&slots) = decided.get(rank.model_runner.group())
+            && slots != rank.model_runner.slots()
+        {
+            reslot(rank, slots)?;
+        }
+    }
+    Ok(())
+}
+
+/// Makes media rank `rank` hold `slots` request slots: its model runner's, and what it states per
+/// slot (`VideoRank::hold`). Its buckets, its pools and its kernels are the deployment's, which
+/// the slots do not change.
+fn reslot(rank: &mut LoadedRank, slots: u32) -> Result<()> {
+    let Loaded::Video(video) = &mut rank.loaded else {
+        bail!("rank {} is a text rank", rank.model_runner.rank());
+    };
+    video.hold(slots);
+    rank.model_runner = rank.model_runner.with_slots(slots);
+
+    tracing::info!(
+        rank = rank.model_runner.rank(),
+        group = rank.model_runner.group(),
+        slots,
+        "the media rank holds fewer request slots than the deployment runs"
+    );
+    Ok(())
 }
 
 /// The name of the product buffer of the deployment's rank `rank` in epoch `epoch`: memory of
@@ -1531,7 +1722,7 @@ fn open_rank(rank: &mut LoadedRank, (units, table): (u32, &Segments)) -> Result<
         );
     }
     rank.units = units;
-    let state_config = model_runner.state_config(rank.model.as_ref(), model_runner.buckets())?;
+    let state_config = model_runner.state_config(rank.model.as_ref(), model_runner.buckets());
     let config = model_runner.causal_config(rank.model.as_ref(), &layout, units)?;
     let inputs = CausalLmRunner::input_bytes(&config)?;
     let member = match &rank.union {
@@ -1559,7 +1750,7 @@ fn open_rank(rank: &mut LoadedRank, (units, table): (u32, &Segments)) -> Result<
         granularity,
         table,
     )?;
-    let cache_config = model_runner.cache_config(Arc::clone(&layout), units, Some(segments))?;
+    let cache_config = model_runner.cache_config(Arc::clone(&layout), units, Some(segments));
 
     let Some(client) = client.clone() else {
         // Steps 18, 19 and 21-22 over owners that hold no device.
@@ -1825,7 +2016,7 @@ fn open_media_memory(
 
     // The rank's product buffer and its group's slot rows, as the session states them.
     let units = layout.regions[usize::from(products)].units;
-    let slots = model_runner.slots()?;
+    let slots = model_runner.slots();
 
     // The host regions the session states, and those the rank copies to: the encoder outputs'
     // when its product buffer holds its group's conditioning, the stored trajectories' when it
