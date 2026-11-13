@@ -10,10 +10,10 @@
 //! them.
 //!
 //! The scratch pool holds what no serving forward reads: the regions the shadow outputs of
-//! paired forwards are written in ([`GraphPool::shadow`]) and the state snapshots of a model
-//! that keeps recurrent state ([`GraphPool::scratch`]). The resident pool holds the recurrent
-//! state's live buffers, which the state owner maps through the pool's allocator
-//! ([`GraphPool::allocator`]).
+//! paired forwards are written in ([`GraphPool::shadow`]), and the state snapshots of a model
+//! that keeps recurrent state and the scratch page set of paired forwards, which their owners map
+//! through the pool's allocator ([`GraphPool::allocator`]). The resident pool holds the
+//! recurrent state's live buffers, mapped the same way.
 //!
 //! ## The quota
 //!
@@ -196,20 +196,6 @@ impl GraphPool {
     /// refuses the mapping.
     pub fn shadow(&mut self, bytes: u64) -> Result<ops::Twins> {
         Ok(ops::Twins::new(&mut self.allocator, bytes)?)
-    }
-
-    /// `bytes` of the scratch pool at an address the pool keeps: the state snapshots a model
-    /// with recurrent state copies units through. The buffer is valid until the pool drops.
-    ///
-    /// # Errors
-    ///
-    /// As [`GraphPool::shadow`].
-    #[expect(dead_code, reason = "no caller in the engine")]
-    pub(crate) fn scratch(&mut self, bytes: u64) -> Result<Buffer> {
-        let bytes = usize::try_from(bytes)
-            .map_err(|_| Error::Resource("a scratch buffer is larger than the address space"))?;
-
-        Ok(self.allocator.allocate(PoolKind::Scratch, bytes)?)
     }
 
     /// The device's allocator, for an owner that maps its buffers from the pools: the

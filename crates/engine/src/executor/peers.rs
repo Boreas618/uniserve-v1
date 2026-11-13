@@ -290,7 +290,12 @@ pub struct Remote {
     outbox: Sender<MainProcessRequest>,
     wake: service::Wake,
     pending: Arc<Pending>,
-    #[cfg_attr(not(test), expect(dead_code, reason = "only tests call it"))]
+    // docs/architecture.md "Reports" (a group whose first rank is a peer's is planned against the
+    // capacity the peer answers); no caller until the scheduler node starts such a group.
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "no start plans a group on a peer's rank")
+    )]
     infos: Arc<Infos>,
     /// The `message_id` of the next request.
     next: AtomicU64,
@@ -342,19 +347,18 @@ impl Remote {
         }))
     }
 
-    /// The first rank the peer's process serves.
-    #[expect(dead_code, reason = "no caller in the engine")]
-    pub(crate) fn rank(&self) -> u32 {
-        self.rank
-    }
-
     /// The capacity of the worker group of the peer's first rank, which the scheduler plans
     /// the group against: the peer responds once its ranks loaded, within `timeout`.
     ///
     /// # Errors
     ///
     /// Once the link is lost, when the peer refuses, or when no response arrives in time.
-    #[cfg_attr(not(test), expect(dead_code, reason = "only tests call it"))]
+    // docs/architecture.md "Reports"; the missing caller is the scheduler node's start of a
+    // worker group whose first rank is a peer's, which waits for the peer's own start.
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "no start plans a group on a peer's rank")
+    )]
     pub(crate) fn info(&self, timeout: Duration) -> Result<crate::batch::Capacity> {
         self.live()?;
 
@@ -803,27 +807,6 @@ fn upstream_link(
                         capacity: capacity.clone(),
                     };
                     if let Err(error) = channel.send(&response) {
-                        failed = Some(format!("responding to the scheduler node: {error}"));
-                        break;
-                    }
-                    continue;
-                }
-                other => {
-                    // The daemon commands this process over its own process interface (its
-                    // modules, a promotion, a shutdown); the peer channel carries a group's jobs.
-                    let id = match &other {
-                        MainProcessRequest::Promote { message_id }
-                        | MainProcessRequest::Hook { message_id, .. } => message_id.unwrap_or(0),
-                        _ => 0,
-                    };
-                    let refused = refusal(
-                        id,
-                        format!(
-                            "the peer channel serves a group's jobs, not {:?}",
-                            other.kind()
-                        ),
-                    );
-                    if let Err(error) = channel.send(&refused) {
                         failed = Some(format!("responding to the scheduler node: {error}"));
                         break;
                     }

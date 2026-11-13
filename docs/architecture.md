@@ -283,4 +283,4 @@ Dependency direction, as the crates' manifests state it (a crate on the right de
 | `sampler` | the token selection that ends a causal forward |
 | `memory/` | the rank's storage at the host's Storage Server: weights, the KV cache's planes, recurrent state, products and encoder outputs, the division of a GPU's quota and the graph pool |
 | `profiling/` | range markers, always-on counters and profiling sessions |
-| `thread_pool`, `parallel/`, `stream/`, `config/`, `error` | bounded pools of blocking host work, host collectives, event pools, the devices a rank computes on, and the crate's error |
+| `thread_pool`, `parallel/`, `error` | bounded pools of blocking host work, host collectives, and the crate's error |

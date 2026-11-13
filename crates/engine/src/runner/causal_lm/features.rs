@@ -40,7 +40,13 @@ use crate::runner::{DeviceCopy, address, element_bytes, issue};
 use crate::worker::{Error, Result};
 
 /// The alignment of each buffer in the feature buffer's memory.
-#[cfg_attr(not(test), expect(dead_code, reason = "only tests call it"))]
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "PORT §2.2: reached from `CausalLmRunner::{image_bytes, set_features}` alone"
+    )
+)]
 const ALIGNMENT: u64 = ops::allocator::ALIGNMENT;
 
 /// The runner's feature buffer (module documentation).
@@ -65,7 +71,13 @@ pub(super) struct Features {
 
 /// The byte offsets of the features, the coordinates and the marks of `tokens` rows of a model
 /// of `hidden`-wide rows of `dtype` over `axes` rotary axes, and the bytes of the three.
-#[cfg_attr(not(test), expect(dead_code, reason = "only tests call it"))]
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "PORT §2.2: reached from `CausalLmRunner::{image_bytes, set_features}` alone"
+    )
+)]
 fn offsets(tokens: usize, hidden: usize, dtype: DType, axes: usize) -> Result<([u64; 3], u64)> {
     let element = element_bytes(dtype)?;
 
@@ -107,7 +119,13 @@ fn holder(rows: &Rows, block: &VisionRows) -> Result<u32> {
 impl Features {
     /// The bytes of device memory the feature buffer of `model` takes for buckets of at most
     /// `tokens` tokens; zero for a model without a vision tower.
-    #[cfg_attr(not(test), expect(dead_code, reason = "only tests call it"))]
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "PORT §2.2: reached from `CausalLmRunner::{image_bytes, set_features}` alone"
+        )
+    )]
     pub(super) fn bytes(model: &dyn TextModel, tokens: usize) -> Result<u64> {
         match model.vision() {
             Some(vision) => Ok(offsets(
@@ -129,7 +147,13 @@ impl Features {
     ///
     /// [`Error::Invalid`] for a model without a vision tower; the driver's refusal of the
     /// allocation or of the fill.
-    #[cfg_attr(not(test), expect(dead_code, reason = "only tests call it"))]
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "PORT §2.2: reached from `CausalLmRunner::{image_bytes, set_features}` alone"
+        )
+    )]
     pub(super) fn new(
         model: &dyn TextModel,
         tokens: usize,

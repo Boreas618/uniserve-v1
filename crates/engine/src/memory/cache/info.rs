@@ -56,13 +56,6 @@ pub struct PrefixCacheInfo {
     /// (`storage::key::page_seed`); empty for a consumer without a model.
     #[serde(default)]
     pub identities: Vec<String>,
-    /// The bytes one token of the rank's pages takes in the host KV cache,
-    /// over every cache group (a group's page bytes over its block size,
-    /// rounded up); zero for a rank that copies no page through it. The
-    /// engine sizes the epoch's host KV cache in tokens from them
-    /// (`uniserve.host_cache`).
-    #[serde(default)]
-    pub host_token_bytes: u64,
     /// Where an engine on another host reaches the rank's host's Storage
     /// Server (`StorageLaunch::tcp`); `None` on the engine's host.
     #[serde(default)]

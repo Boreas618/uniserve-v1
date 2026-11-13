@@ -581,14 +581,6 @@ impl Markers {
         }
     }
 
-    /// Reads every device's halves ([`Self::read_device`]).
-    #[expect(dead_code, reason = "every reader reads one device's halves")]
-    pub(crate) fn read(&self, partial: bool) {
-        for device in &self.devices {
-            self.read_of(device, partial);
-        }
-    }
-
     /// Reads `device`'s complete halves, and the half being filled when [`PARTIAL_READ`] passed
     /// since its last read or `partial` asks; aggregates the steps that ended. Never waits for
     /// the device.

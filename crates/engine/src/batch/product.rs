@@ -16,12 +16,6 @@ pub(crate) const VISION_PIXELS: &str = "vision_pixels";
 pub const VISION_FEATURES: &str = "vision_features";
 /// The text encoder's prompt features, one row per presentation token.
 pub const CONDITIONING: &str = "conditioning";
-/// The latent encoder's visual condition rows in request order.
-#[expect(dead_code, reason = "no caller in the engine")]
-pub(crate) const CONDITION_VIDEO_LATENTS: &str = "condition_video_latents";
-/// The latent encoder's audio condition rows in request order.
-#[expect(dead_code, reason = "no caller in the engine")]
-pub(crate) const CONDITION_AUDIO_LATENTS: &str = "condition_audio_latents";
 /// The denoiser's final video latents.
 pub(crate) const VIDEO_LATENTS: &str = "video_latents";
 /// The denoiser's final audio latents.

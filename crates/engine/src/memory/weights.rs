@@ -305,12 +305,6 @@ impl WeightStore {
         lock(&self.state).order.push((key.clone(), true));
     }
 
-    /// How many weights this rank holds mapped.
-    #[expect(dead_code, reason = "no caller in the engine")]
-    pub(crate) fn mapped(&self) -> usize {
-        lock(&self.state).mapped.len()
-    }
-
     /// How many weights this rank read back from the Storage Server instead of converting them.
     pub fn from_store(&self) -> usize {
         lock(&self.state).from_store
@@ -323,15 +317,6 @@ impl WeightStore {
     /// after a key change added that many records beside the ones the previous key left.
     pub fn published(&self) -> usize {
         lock(&self.state).published
-    }
-
-    /// The device bytes packing saved: what the packed weights' own allocations would have
-    /// taken, less the allocations they share.
-    #[expect(dead_code, reason = "no caller in the engine")]
-    pub(crate) fn packing_saved(&self) -> u64 {
-        let state = lock(&self.state);
-
-        state.packed.saturating_sub(state.packed_allocations) as u64 * self.granularity as u64
     }
 
     /// The device bytes a replacement of the weight under `key` takes beside it: the weight's

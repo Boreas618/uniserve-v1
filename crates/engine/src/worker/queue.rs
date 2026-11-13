@@ -237,8 +237,7 @@ impl Queue {
     }
 
     /// Posts the completion of the job in flight, whose submission is `submission`. A failure is
-    /// posted with the work that was in flight when it was taken, in the error and as the
-    /// submission's failure label.
+    /// posted with the work that was in flight when it was taken, in the error.
     pub(super) fn complete(
         &self,
         submission: Arc<SubmissionState>,
@@ -253,10 +252,7 @@ impl Queue {
             Ok(returned) => Outcome::Success(returned),
             Err(error) => {
                 let error = match activity {
-                    Some(activity) => {
-                        submission.note_failure(activity.clone());
-                        Error::in_flight(activity, error)
-                    }
+                    Some(activity) => Error::in_flight(activity, error),
                     None => error,
                 };
                 let fault: Arc<Fault> = Arc::new(error);

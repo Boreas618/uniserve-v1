@@ -94,20 +94,8 @@ impl HostPart {
         })
     }
 
-    /// How many units the part holds.
-    #[expect(dead_code, reason = "no caller in the engine")]
-    pub(crate) fn units(&self) -> u32 {
-        self.units
-    }
-
-    /// The bytes of one unit of the part.
-    #[expect(dead_code, reason = "no caller in the engine")]
-    pub(crate) fn bytes(&self) -> u64 {
-        self.bytes
-    }
-
-    /// The host address of unit `unit`, the first of [`Self::bytes`] bytes a device copy reads
-    /// or writes.
+    /// The host address of unit `unit`, the first of the part's bytes of a unit that a device copy
+    /// reads or writes.
     ///
     /// # Errors
     ///

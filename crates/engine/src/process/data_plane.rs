@@ -665,21 +665,6 @@ impl DataPlane {
         lock(&self.target).clone()
     }
 
-    /// What the rank's pages are computed from, which keys them in the host KV cache: the identity
-    /// of the weights it serves. An epoch of the same weights finds the pages another left there,
-    /// and one of other weights, or this one after a weight update, keys its own.
-    ///
-    /// # Errors
-    ///
-    /// When this data plane holds no rank.
-    #[expect(dead_code, reason = "the identity is read through each rank's report")]
-    pub(crate) fn serving_identity(&self) -> Result<String> {
-        if self.ranks.is_empty() {
-            return Err(Error::State("the data plane holds no rank"));
-        }
-        Ok(self.identity_of_ranks())
-    }
-
     /// The identity of every rank's weights, in rank order. What a rank's pages hold follows from
     /// all of them: an expert union's rank computes each token's experts on its peers, so a page is
     /// another page once any rank's weights change, and every rank keys it alike.
@@ -909,14 +894,6 @@ impl DataPlane {
     pub(crate) fn stage(&self, replacement: Replacement) {
         if let Some(previous) = lock(&self.staged).replace(replacement) {
             self.discard(previous);
-        }
-    }
-
-    /// Ends a staged replacement that will not serve.
-    #[expect(dead_code, reason = "no job abandons a staged replacement")]
-    pub(crate) fn discard_staged(&self) {
-        if let Some(replacement) = lock(&self.staged).take() {
-            self.discard(replacement);
         }
     }
 

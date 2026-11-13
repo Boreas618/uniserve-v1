@@ -30,13 +30,12 @@
 //! the encode call that computed it was applied. An encoder input whose entry has no position
 //! still needs its encode call.
 
-use std::sync::Arc;
 use std::time::Instant;
 
 use crate::batch::Phase;
 use proto::request::{
-    ArtifactMedia, CacheResume, EVENT_WINDOW, Event, FinishReason, GenerationFeatures,
-    GenerationRequest, ImageEncoder, ImageEncoderInput, ImageInput, RequestId, StopReason,
+    CacheResume, EVENT_WINDOW, Event, FinishReason, GenerationFeatures, GenerationRequest,
+    ImageEncoder, ImageEncoderInput, ImageInput, RequestId, StopReason,
 };
 use storage::Key;
 use storage::runtime::{GroupId, OwnerId};
@@ -122,10 +121,6 @@ pub(crate) struct Request {
     pub unpinned: Vec<Key>,
     /// Output tokens the daemon's decoder has passed.
     pub num_acknowledged_tokens: u32,
-
-    // Video progress: the counters above, and the finished artifact.
-    #[expect(dead_code, reason = "no caller in the engine")]
-    pub artifact: Option<Arc<dyn ArtifactMedia>>,
 
     // Output and clocks.
     /// The terminal event, held until the calls in flight return when it is `Migratable`.
@@ -251,7 +246,6 @@ impl Request {
             encodings: Vec::new(),
             unpinned: Vec::new(),
             num_acknowledged_tokens: 0,
-            artifact: None,
             terminal: None,
             event_credit: u32::try_from(EVENT_WINDOW).unwrap_or(u32::MAX),
             last_progress: arrival,

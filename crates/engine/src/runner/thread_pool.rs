@@ -10,16 +10,15 @@
 //! ([`ThreadPool::submit`], as Python's `ThreadPoolExecutor.submit`); the [`HostTask`] it gets
 //! back is where the work's result is read or waited for.
 //!
-//! Aborting a pool stops admission without joining work that may wait on a failed device or peer;
-//! closing it lets the process exit once the pool's threads ended. A task's inputs are released
-//! by its pool, by the rule of [`HostAction::input_status`]: an action whose inputs' physical
-//! producer failed or was cancelled is kept until the process exits, because device work whose
-//! completion is unknown may still address them.
+//! A pool is aborted when its last owner drops it: admission stops and the queued tasks are
+//! cancelled, without joining work that may wait on a failed device or peer. A task's inputs are
+//! released by its pool, by the rule of [`HostAction::input_status`]: an action whose inputs'
+//! physical producer failed or was cancelled is kept until the process exits, because device work
+//! whose completion is unknown may still address them.
 
 use std::collections::VecDeque;
 use std::sync::{Arc, Condvar, Mutex, PoisonError, Weak};
-use std::thread::{self, JoinHandle};
-use std::time::Duration;
+use std::thread;
 
 use crate::worker::completion::{Completion, Outcome, Waker};
 use crate::worker::{Error, Result};
@@ -56,55 +55,28 @@ pub(crate) trait HostAction: Send + Sync + Sized + 'static {
     fn input_status(&self) -> Outcome;
 }
 
-/// Where a task is between its submission and its end.
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum Phase {
-    /// In the pool's queue, where [`HostTask::cancel`] may still withdraw it.
-    Queued,
-    /// On one of the pool's threads.
-    Running,
-    /// Ended or withdrawn: its capacity went back to the pool.
-    Finished,
-}
-
-struct TaskState<A> {
-    phase: Phase,
-    /// The action, until the thread that runs it or the call that withdraws it takes it.
-    action: Option<A>,
-}
-
 /// One submitted action and its result.
 ///
 /// A task holds one unit of its pool's capacity from its submission until it ended or was
-/// withdrawn. Its action, and the inputs the action holds, stay alive for the whole run.
+/// cancelled with its pool. Its action, and the inputs the action holds, stay alive for the whole
+/// run.
 pub(crate) struct HostTask<A: HostAction> {
     /// The pool's admission state, which the task returns its capacity to.
     pool: Weak<Mutex<PoolState>>,
-    state: Mutex<TaskState<A>>,
+    /// The action, until the thread that runs or cancels it takes it.
+    action: Mutex<Option<A>>,
     completion: Completion<Waker, Arc<A::Output>>,
 }
 
 impl<A: HostAction> HostTask<A> {
-    /// The task's result, once it ended.
-    #[cfg_attr(not(test), expect(dead_code, reason = "only tests call it"))]
-    pub(crate) fn result(&self) -> Option<Outcome<Arc<A::Output>>> {
-        self.completion.outcome()
-    }
-
     /// Waits for the task's result.
     pub(crate) fn wait(&self) -> Outcome<Arc<A::Output>> {
         self.completion.wait()
     }
 
-    /// Waits at most `timeout` for the task's result; `Duration::ZERO` reads it without waiting.
-    #[cfg_attr(not(test), expect(dead_code, reason = "only tests call it"))]
-    pub(crate) fn wait_timeout(&self, timeout: Duration) -> Option<Outcome<Arc<A::Output>>> {
-        self.completion.wait_timeout(timeout)
-    }
-
     /// Calls `wake` when the task ends, at once for a task that already has: a caller holding
-    /// several tasks waits on one signal of its own and reads [`Self::result`] of each when it
-    /// fires, instead of polling them.
+    /// several tasks waits on one signal of its own and reads [`Self::wait`] of each when it
+    /// fires, which then returns at once, instead of polling them.
     ///
     /// `wake` runs on the thread that ended the task, so it only signals.
     pub(crate) fn on_settled(&self, wake: &Waker) {
@@ -113,63 +85,12 @@ impl<A: HostAction> HostTask<A> {
         }
     }
 
-    /// Withdraws the task while it is still queued, and returns whether this call cancelled it.
-    ///
-    /// A withdrawn task returns its capacity to the pool before its waiters observe the
-    /// cancellation, and its inputs are released by the rule of [`HostAction::input_status`]. A
-    /// task that is running or ended is left as it is.
-    ///
-    /// # Errors
-    ///
-    /// The failure of releasing the withdrawn action's inputs.
-    #[cfg_attr(not(test), expect(dead_code, reason = "only tests call it"))]
-    pub(crate) fn cancel(&self) -> Result<bool> {
-        let pool = self.pool.upgrade();
-        // The pool's lock is taken first, as a pool's thread never holds a task's lock while it
-        // takes the pool's.
-        let mut pool = pool.as_ref().map(|pool| lock(pool));
-        let mut state = lock(&self.state);
-
-        if state.phase != Phase::Queued {
-            return Ok(false);
-        }
-
-        if let Some(pool) = pool.as_mut() {
-            // A thread may already have taken the task from the queue; it finds the task
-            // withdrawn when it claims it, and leaves the capacity to this call.
-            let address = std::ptr::from_ref(self).addr();
-            pool.queue.retain(|(queued, _)| *queued != address);
-            pool.admitted -= 1;
-        }
-        state.phase = Phase::Finished;
-        let action = state.action.take();
-        drop(state);
-        drop(pool);
-
-        let released = action.map_or(Ok(()), release_inputs);
-        let (cancelled, wakers) = self.completion.cancel();
-        wake(wakers);
-        released.map(|()| cancelled)
-    }
-
     /// Runs the task on the calling thread of its pool, or cancels it when the pool was
     /// `aborted` before a thread took it.
     fn run(&self, aborted: bool) {
-        let action = {
-            let mut state = lock(&self.state);
-            // A task withdrawn between its dequeue and this claim has nothing left to run.
-            if state.phase != Phase::Queued {
-                return;
-            }
-            let Some(action) = state.action.take() else {
-                return;
-            };
-            state.phase = if aborted {
-                Phase::Finished
-            } else {
-                Phase::Running
-            };
-            action
+        // The queue hands each task to one thread once, so the action is there to take.
+        let Some(action) = lock(&self.action).take() else {
+            return;
         };
 
         // The pool's threads carry their pool's name, which the log lines below name.
@@ -194,8 +115,6 @@ impl<A: HostAction> HostTask<A> {
                 ),
             }
         }
-        lock(&self.state).phase = Phase::Finished;
-
         // The capacity goes back before the result is observable, so whoever observes the result
         // can submit again at once.
         self.return_capacity();
@@ -248,20 +167,19 @@ struct PoolState {
     closed: bool,
     /// The queued tasks are cancelled instead of run.
     aborted: bool,
-    /// The queued tasks in submission order, each under its task's address.
-    queue: VecDeque<(usize, Queued)>,
+    /// The queued tasks in submission order.
+    queue: VecDeque<Queued>,
 }
 
 /// A bounded pool of threads for one kind of blocking host work.
 ///
 /// The pool admits at most `capacity` tasks at once, running and queued together, and refuses a
-/// submission beyond that instead of blocking its caller. Dropping the pool aborts it.
+/// submission beyond that instead of blocking its caller. Dropping the pool aborts it; its
+/// threads end once the task each runs ended, and are not joined.
 pub(crate) struct ThreadPool {
     state: Arc<Mutex<PoolState>>,
-    /// Signalled when a task is queued and when the pool closes.
+    /// Signalled when a task is queued and when the pool is aborted.
     ready: Arc<Condvar>,
-    #[cfg_attr(not(test), expect(dead_code, reason = "only tests call it"))]
-    threads: Mutex<Vec<JoinHandle<()>>>,
 }
 
 impl ThreadPool {
@@ -311,11 +229,7 @@ impl ThreadPool {
             }
         }
 
-        Ok(Self {
-            state,
-            ready,
-            threads: Mutex::new(handles),
-        })
+        Ok(Self { state, ready })
     }
 
     /// Queues `action` and returns the task its result is read from.
@@ -335,18 +249,14 @@ impl ThreadPool {
 
         let task = Arc::new(HostTask {
             pool: Arc::downgrade(&self.state),
-            state: Mutex::new(TaskState {
-                phase: Phase::Queued,
-                action: Some(action),
-            }),
+            action: Mutex::new(Some(action)),
             completion: Completion::default(),
         });
         let queued = Arc::clone(&task);
         state.admitted += 1;
-        state.queue.push_back((
-            Arc::as_ptr(&task).addr(),
-            Box::new(move |aborted| queued.run(aborted)),
-        ));
+        state
+            .queue
+            .push_back(Box::new(move |aborted| queued.run(aborted)));
         drop(state);
 
         self.ready.notify_one();
@@ -362,28 +272,6 @@ impl ThreadPool {
         drop(state);
 
         self.ready.notify_all();
-    }
-
-    /// Stops admission, lets the threads run what is queued and joins them.
-    ///
-    /// Returns the errors of the threads that did not end cleanly; an empty vector is an orderly
-    /// close. A pool closed from one of its own threads does not join that thread.
-    #[cfg_attr(not(test), expect(dead_code, reason = "only tests call it"))]
-    pub(crate) fn close(&self) -> Vec<Error> {
-        lock(&self.state).closed = true;
-        self.ready.notify_all();
-
-        let mut errors = Vec::new();
-        for handle in std::mem::take(&mut *lock(&self.threads)) {
-            if handle.thread().id() == thread::current().id() {
-                errors.push(Error::State("a thread pool's thread cannot join itself"));
-                continue;
-            }
-            if handle.join().is_err() {
-                errors.push(Error::State("a thread pool's thread panicked"));
-            }
-        }
-        errors
     }
 }
 
@@ -401,7 +289,7 @@ fn run_queue(pool: &Mutex<PoolState>, ready: &Condvar) {
         let mut state = ready
             .wait_while(lock(pool), |state| state.queue.is_empty() && !state.closed)
             .unwrap_or_else(PoisonError::into_inner);
-        let Some((_, run)) = state.queue.pop_front() else {
+        let Some(run) = state.queue.pop_front() else {
             return;
         };
         let aborted = state.aborted;
@@ -418,10 +306,11 @@ mod tests {
 
     use super::*;
 
-    /// An action that waits at `gate` when it has one, counts its run and returns the count.
-    /// `producer` is how the producer of its `input` ended.
+    /// An action that tells `started` it runs and waits at `gate` when it has them, counts its
+    /// run and returns the count. `producer` is how the producer of its `input` ended.
     struct Counted {
         runs: Arc<AtomicUsize>,
+        started: Option<crossbeam_channel::Sender<()>>,
         gate: Option<Arc<Barrier>>,
         producer: Outcome,
         input: Arc<()>,
@@ -431,6 +320,7 @@ mod tests {
         fn new(runs: &Arc<AtomicUsize>) -> Self {
             Self {
                 runs: Arc::clone(runs),
+                started: None,
                 gate: None,
                 producer: Outcome::Success(()),
                 input: Arc::new(()),
@@ -449,6 +339,9 @@ mod tests {
         type Output = usize;
 
         fn run(&self) -> Result<usize> {
+            if let Some(started) = &self.started {
+                let _ = started.send(());
+            }
             if let Some(gate) = &self.gate {
                 gate.wait();
             }
@@ -478,29 +371,11 @@ mod tests {
         }
 
         assert_eq!(runs.load(Ordering::SeqCst), 1);
-        assert!(matches!(task.result(), Some(Outcome::Success(_))));
-        assert!(pool.close().is_empty());
         Ok(())
     }
 
     #[test]
-    fn a_read_before_the_task_ends_returns_nothing_and_leaves_it_admitted() -> Result<()> {
-        let pool = ThreadPool::new("pool-test", 1, 1)?;
-        let runs = Arc::new(AtomicUsize::new(0));
-        let gate = Arc::new(Barrier::new(2));
-
-        let task = pool.submit(Counted::gated(&runs, &gate))?;
-        assert!(task.wait_timeout(Duration::ZERO).is_none());
-        assert!(task.result().is_none());
-
-        gate.wait();
-        assert!(matches!(task.wait(), Outcome::Success(_)));
-        assert!(task.result().is_some());
-        Ok(())
-    }
-
-    #[test]
-    fn a_full_pool_refuses_and_a_withdrawn_task_returns_its_capacity() -> Result<()> {
+    fn a_full_pool_refuses_and_an_ended_task_returns_its_capacity() -> Result<()> {
         let pool = ThreadPool::new("pool-test", 2, 1)?;
         let runs = Arc::new(AtomicUsize::new(0));
         let gate = Arc::new(Barrier::new(2));
@@ -513,20 +388,36 @@ mod tests {
             Err(Error::Resource(_))
         ));
 
-        assert!(queued.cancel()?);
-        assert!(matches!(queued.result(), Some(Outcome::Cancelled)));
-        assert!(!queued.cancel()?, "a withdrawn task is withdrawn once");
+        gate.wait();
+        assert!(matches!(running.wait(), Outcome::Success(_)));
+        assert!(matches!(queued.wait(), Outcome::Success(_)));
+        // The capacity goes back before the result is observable.
         let admitted = pool.submit(Counted::new(&runs))?;
+        assert!(matches!(admitted.wait(), Outcome::Success(_)));
+        assert_eq!(runs.load(Ordering::SeqCst), 3);
+        Ok(())
+    }
+
+    #[test]
+    fn an_aborted_pool_cancels_what_it_queued() -> Result<()> {
+        let pool = ThreadPool::new("pool-test", 2, 1)?;
+        let runs = Arc::new(AtomicUsize::new(0));
+        let gate = Arc::new(Barrier::new(2));
+
+        // The first task runs on the pool's one thread when the pool is aborted.
+        let (started, running_now) = crossbeam_channel::bounded(1);
+        let running = pool.submit(Counted {
+            started: Some(started),
+            ..Counted::gated(&runs, &gate)
+        })?;
+        let queued = pool.submit(Counted::new(&runs))?;
+        running_now.recv().expect("the first task starts");
+        pool.abort();
 
         gate.wait();
         assert!(matches!(running.wait(), Outcome::Success(_)));
-        assert!(matches!(admitted.wait(), Outcome::Success(_)));
-        assert!(!running.cancel()?, "an ended task is not withdrawn");
-        assert_eq!(
-            runs.load(Ordering::SeqCst),
-            2,
-            "the withdrawn task never ran"
-        );
+        assert!(matches!(queued.wait(), Outcome::Cancelled));
+        assert_eq!(runs.load(Ordering::SeqCst), 1, "the queued task never ran");
         Ok(())
     }
 
@@ -535,26 +426,24 @@ mod tests {
         let pool = ThreadPool::new("pool-test", 1, 1)?;
         let runs = Arc::new(AtomicUsize::new(0));
         let gate = Arc::new(Barrier::new(2));
-        let fired = Arc::new(AtomicUsize::new(0));
-        let wake: Waker = {
-            let fired = Arc::clone(&fired);
-            Arc::new(move || {
-                fired.fetch_add(1, Ordering::SeqCst);
-            })
-        };
+        let (fired, woken) = crossbeam_channel::unbounded();
+        let wake: Waker = Arc::new(move || {
+            let _ = fired.send(());
+        });
 
         let task = pool.submit(Counted::gated(&runs, &gate))?;
         task.on_settled(&wake);
-        assert_eq!(fired.load(Ordering::SeqCst), 0);
+        assert!(woken.try_recv().is_err());
 
         gate.wait();
-        task.wait();
-        // The pool's thread calls the wakers after it recorded the result: closing joins it.
-        assert!(pool.close().is_empty());
-        assert_eq!(fired.load(Ordering::SeqCst), 1);
+        // The pool's thread calls the wakers once it recorded the result.
+        woken
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("the waker fires when the task ends");
+        assert!(matches!(task.wait(), Outcome::Success(_)));
 
         task.on_settled(&wake);
-        assert_eq!(fired.load(Ordering::SeqCst), 2);
+        assert!(woken.try_recv().is_ok());
         Ok(())
     }
 
@@ -565,7 +454,6 @@ mod tests {
 
         let runs = Arc::new(AtomicUsize::new(0));
         assert!(pool.submit(Counted::new(&runs)).is_err());
-        assert!(pool.close().is_empty());
         Ok(())
     }
 
@@ -576,7 +464,8 @@ mod tests {
     }
 
     /// Runs one task whose input's producer ended with `producer` and returns whether the input
-    /// is still held once the pool, the task and every other owner are gone.
+    /// is still held once the pool, the task and every other owner are gone. The pool releases
+    /// a task's inputs before it records the task's result.
     fn held_after_close(producer: Outcome) -> Result<bool> {
         let pool = ThreadPool::new("pool-test", 1, 1)?;
         let runs = Arc::new(AtomicUsize::new(0));
@@ -590,9 +479,6 @@ mod tests {
         })?;
         assert!(matches!(task.wait(), Outcome::Success(_)));
 
-        if let Some(error) = pool.close().into_iter().next() {
-            return Err(error);
-        }
         drop(task);
         drop(pool);
         Ok(held.upgrade().is_some())

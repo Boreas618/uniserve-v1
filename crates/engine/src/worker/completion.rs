@@ -91,18 +91,6 @@ impl<C, T: Clone, E: ?Sized> Completion<C, T, E> {
         lock(&self.state)
     }
 
-    /// Whether the operation ended.
-    #[cfg_attr(not(test), expect(dead_code, reason = "only tests call it"))]
-    pub(crate) fn done(&self) -> bool {
-        self.state().outcome.is_some()
-    }
-
-    /// Whether the operation ended successfully.
-    #[cfg_attr(not(test), expect(dead_code, reason = "only tests call it"))]
-    pub(crate) fn succeeded(&self) -> bool {
-        matches!(self.state().outcome, Some(Outcome::Success(_)))
-    }
-
     /// The outcome, once the operation ended.
     pub(crate) fn outcome(&self) -> Option<Outcome<T, E>> {
         self.state().outcome.clone()
@@ -197,7 +185,8 @@ impl<C, T: Clone, E> Completion<C, T, E> {
     }
 }
 
-/// What a completion calls once its outcome lands ([`Submission::on_settled`]).
+/// What a completion calls once its outcome lands
+/// ([`HostTask::on_settled`](crate::runner::thread_pool::HostTask::on_settled)).
 ///
 /// It runs on the thread that completed the operation (a device's worker thread, a peer
 /// link's thread), so it must only signal: wake a waiter, never do the waiter's work.
@@ -223,22 +212,10 @@ pub struct Submission {
 }
 
 /// The completion state of one submission, which the worker's queue or a peer link completes.
+#[derive(Default)]
 pub(crate) struct SubmissionState {
-    /// The submission's own outcome, which `Completion` records once and waits on, with the
-    /// wakers [`Submission::on_settled`] registered.
+    /// The submission's own outcome, which `Completion` records once and waits on.
     completion: Completion<Waker, (BatchOutput, Vec<Request>), Fault>,
-    /// What the job was doing when it failed, written where the failure happened: the caller
-    /// cannot know it, and an error alone does not say which bucket or operator broke.
-    failure: Mutex<Option<String>>,
-}
-
-impl Default for SubmissionState {
-    fn default() -> Self {
-        Self {
-            completion: Completion::default(),
-            failure: Mutex::new(None),
-        }
-    }
 }
 
 impl Submission {
@@ -271,12 +248,6 @@ impl Submission {
         self
     }
 
-    /// The submission's number.
-    #[expect(dead_code, reason = "no caller in the engine")]
-    pub(crate) fn id(&self) -> SubmissionId {
-        self.id
-    }
-
     /// Waits until the submission completed and returns its outcome.
     pub(crate) fn wait(&self) -> Outcome<(BatchOutput, Vec<Request>), Fault> {
         let own = self.state.completion.wait();
@@ -302,22 +273,6 @@ impl Submission {
         Some(joined_outcome(own, peers))
     }
 
-    /// Calls `wake` when this rank's part or any peer's part settles, at once for a part that
-    /// already has: a caller holding several submissions waits on one signal of its own and reads
-    /// [`Submission::outcome`] of each when it fires, instead of polling them.
-    ///
-    /// `wake` may be called once per part, so a waiter checks the outcome again rather than
-    /// counting calls.
-    #[expect(dead_code, reason = "no caller in the engine")]
-    pub(crate) fn on_settled(&self, wake: &Waker) {
-        if let Some(wake) = self.state.completion.subscribe(Arc::clone(wake)) {
-            wake();
-        }
-        for peer in &self.peers {
-            peer.on_settled(wake);
-        }
-    }
-
     /// The submission's outcome, once every part completed.
     pub(crate) fn outcome(&self) -> Option<Outcome<(BatchOutput, Vec<Request>), Fault>> {
         let own = self.state.completion.outcome()?;
@@ -327,29 +282,9 @@ impl Submission {
         }
         Some(joined_outcome(own, peers))
     }
-
-    /// What the submission was doing when it failed, when it did.
-    ///
-    /// The worker thread writes it where the failure happens (the job it was performing and
-    /// the bucket, generation or operator that named it), because the caller holds only the
-    /// bare error.
-    #[cfg_attr(not(test), expect(dead_code, reason = "only tests call it"))]
-    pub(crate) fn failure_label(&self) -> Option<String> {
-        lock(&self.state.failure)
-            .clone()
-            .or_else(|| self.peers.iter().find_map(Self::failure_label))
-    }
 }
 
 impl SubmissionState {
-    /// Records what this submission was doing when it failed, for the report that reads it.
-    pub(crate) fn note_failure(&self, label: String) {
-        let mut slot = lock(&self.failure);
-        if slot.is_none() {
-            *slot = Some(label);
-        }
-    }
-
     /// Completes the submission with `outcome`; the first completion stands, and a later one (a
     /// cancellation racing a completion) is dropped.
     pub(crate) fn finish(self: Arc<Self>, outcome: Outcome<(BatchOutput, Vec<Request>), Fault>) {
@@ -518,7 +453,7 @@ mod tests {
             })?;
 
             assert_eq!(calls.load(Ordering::Relaxed), 1);
-            assert!(completion.succeeded());
+            assert!(matches!(completion.outcome(), Some(Outcome::Success(()))));
             assert!(!completion.cancel().0);
             assert!(completion.complete(Ok(())).is_err());
         }
@@ -528,10 +463,8 @@ mod tests {
     #[test]
     fn a_failure_and_a_cancellation_are_done_and_not_succeeded() -> Result<()> {
         let failed = Completion::<Waker>::default();
-        assert!(!failed.done());
+        assert!(failed.outcome().is_none());
         failed.complete(Err(Error::transport("device completion unknown")))?;
-        assert!(failed.done());
-        assert!(!failed.succeeded());
         let Some(Outcome::Failed(error)) = failed.outcome() else {
             return Err(Error::State("the producer error was lost"));
         };
@@ -539,8 +472,6 @@ mod tests {
 
         let cancelled = Completion::<Waker>::default();
         assert!(cancelled.cancel().0);
-        assert!(cancelled.done());
-        assert!(!cancelled.succeeded());
         assert!(matches!(cancelled.outcome(), Some(Outcome::Cancelled)));
         assert!(cancelled.cancel().0);
         assert!(cancelled.complete(Ok(())).is_err());

@@ -155,18 +155,6 @@ impl SharedMedia {
         })
     }
 
-    /// Number of published bytes owned by this mapping.
-    #[cfg_attr(not(test), expect(dead_code, reason = "only tests call it"))]
-    pub(crate) fn len(&self) -> usize {
-        self.bytes
-    }
-
-    /// Whether the published extent is empty; successful mappings are nonempty.
-    #[cfg_attr(not(test), expect(dead_code, reason = "only tests call it"))]
-    pub(crate) fn is_empty(&self) -> bool {
-        self.bytes == 0
-    }
-
     /// Borrows the immutable published extent for validation or response output.
     pub(crate) fn as_bytes(&self) -> &[u8] {
         // SAFETY: the mapping remains live for this borrow and is immutable after export.

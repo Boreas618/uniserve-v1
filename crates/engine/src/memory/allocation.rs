@@ -1,8 +1,8 @@
 //! One allocation the worker owns or maps.
 //!
-//! A [`Storage`] is one allocation: device storage this process created, page-locked or pageable
-//! host storage, or a mapping of storage the host's Storage Server retains (a weight's
-//! allocation, a cache plane, a rank's part of a host region). Dropping the last reference releases the allocation
+//! A [`Storage`] is one allocation: device storage this process created, or a mapping of storage
+//! the host's Storage Server retains (a weight's allocation, a cache plane, a rank's part of a
+//! host region). Dropping the last reference releases the allocation
 //! or the mapping without waiting for device work, so an owner retires every device access to a
 //! storage before it drops it.
 //!
@@ -14,8 +14,7 @@ use std::os::fd::OwnedFd;
 use std::sync::{Arc, Mutex};
 
 use platform::{
-    DeviceAllocation, DeviceId, HostRegistration, PeerMapping, PinnedBuffer, Protection,
-    SegmentedMapping,
+    DeviceAllocation, DeviceId, HostRegistration, PeerMapping, Protection, SegmentedMapping,
 };
 use tensor::{DType, Shape, Tensor};
 
@@ -23,8 +22,8 @@ use crate::worker::{Error, Result};
 
 use service::lock;
 
-/// One allocation owned by the worker: device storage, page-locked or pageable host storage, or
-/// a mapping of storage another process created.
+/// One allocation owned by the worker: device storage, or a mapping of storage another process
+/// created.
 pub struct Storage {
     kind: Kind,
 }
@@ -33,13 +32,6 @@ pub struct Storage {
 enum Kind {
     /// Device storage this process created and holds.
     Device(DeviceAllocation),
-    /// Page-locked host storage, a source and destination of device copies.
-    #[expect(dead_code, reason = "no caller in the engine")]
-    Pinned(PinnedBuffer),
-    /// Pageable host storage of a rank that computes on the host. Boxed so its address is
-    /// stable.
-    #[cfg_attr(not(test), expect(dead_code, reason = "only tests call it"))]
-    Host(Box<[u8]>),
     /// A device allocation the Storage Server retains, mapped into this process through its
     /// descriptor. Behind a lock because an in-place weight update replaces the physical
     /// allocation under the mapping's address ([`Storage::rebind`]).
@@ -181,25 +173,6 @@ impl Storage {
             }
         }
         Ok(peers)
-    }
-
-    /// Page-locked host storage usable as a source or destination of `device`'s copies. Contents
-    /// are uninitialized.
-    #[expect(dead_code, reason = "no caller in the engine")]
-    pub(crate) fn pinned(device: DeviceId, bytes: usize) -> Result<Arc<Self>> {
-        let buffer = PinnedBuffer::new(device, bytes)?;
-
-        Ok(Arc::new(Self {
-            kind: Kind::Pinned(buffer),
-        }))
-    }
-
-    /// Zeroed pageable host storage.
-    #[cfg_attr(not(test), expect(dead_code, reason = "only tests call it"))]
-    pub(crate) fn host(bytes: usize) -> Arc<Self> {
-        Arc::new(Self {
-            kind: Kind::Host(vec![0; bytes].into_boxed_slice()),
-        })
     }
 
     /// Device storage of segments of `lengths` bytes back to back, each a multiple of the
@@ -352,41 +325,13 @@ impl Storage {
         Ok(())
     }
 
-    /// The allocation's host-visible bytes. `None` for device storage.
-    ///
-    /// # Safety
-    ///
-    /// No device or other host access may write the returned range while the slice is alive.
-    #[expect(dead_code, reason = "no caller in the engine")]
-    pub(crate) unsafe fn host_bytes(&self) -> Option<&[u8]> {
-        match &self.kind {
-            Kind::Device(_) | Kind::Mapped(_) | Kind::Segmented { .. } => None,
-
-            Kind::Pinned(buffer) => {
-                // SAFETY: the buffer spans `len()` bytes and is owned by `self`, which the
-                // slice borrows; the caller excludes concurrent writers.
-                Some(unsafe { std::slice::from_raw_parts(buffer.as_ptr(), buffer.len()) })
-            }
-
-            Kind::Host(bytes) => Some(bytes),
-
-            Kind::HostMapped(mapping) => {
-                let first = mapping.address as *const u8;
-
-                // SAFETY: the mapping spans `bytes` and is owned by `self`, which the slice
-                // borrows; the caller excludes concurrent writers.
-                Some(unsafe { std::slice::from_raw_parts(first, mapping.bytes) })
-            }
-        }
-    }
-
-    /// The device the allocation is on; `None` for host storage, page-locked or not.
+    /// The device the allocation is on; `None` for host storage.
     pub(crate) fn device(&self) -> Option<DeviceId> {
         match &self.kind {
             Kind::Device(allocation) => Some(allocation.device()),
             Kind::Mapped(mapping) => Some(lock(mapping).device()),
             Kind::Segmented { device, .. } => Some(*device),
-            Kind::Pinned(_) | Kind::HostMapped(_) | Kind::Host(_) => None,
+            Kind::HostMapped(_) => None,
         }
     }
 
@@ -397,8 +342,6 @@ impl Storage {
             Kind::Device(allocation) => allocation.address(),
             Kind::Mapped(mapping) => lock(mapping).address(),
             Kind::Segmented { address, .. } => *address,
-            Kind::Pinned(buffer) => buffer.address(),
-            Kind::Host(bytes) => bytes.as_ptr() as u64,
             Kind::HostMapped(mapping) => mapping.address as u64,
         }
     }
@@ -409,27 +352,7 @@ impl Storage {
             Kind::Device(allocation) => allocation.len(),
             Kind::Mapped(mapping) => lock(mapping).len(),
             Kind::Segmented { bytes, .. } => *bytes,
-            Kind::Pinned(buffer) => buffer.len(),
-            Kind::Host(bytes) => bytes.len(),
             Kind::HostMapped(mapping) => mapping.bytes,
-        }
-    }
-
-    /// The most bytes one copy may address in this storage: the length of the shortest segment
-    /// of a segmented storage, whose segments are unmapped apart and where the driver refuses a
-    /// copy whose range holds an unmapped segment; no bound for any other storage.
-    #[expect(dead_code, reason = "no caller in the engine")]
-    pub(crate) fn copy_span(&self) -> u64 {
-        match &self.kind {
-            Kind::Segmented { mapping, .. } => {
-                let mapping = lock(mapping);
-
-                (0..mapping.segments())
-                    .map(|index| mapping.segment_len(index) as u64)
-                    .min()
-                    .unwrap_or(0)
-            }
-            _ => u64::MAX,
         }
     }
 
@@ -492,29 +415,5 @@ impl Storage {
             )
         }?;
         Ok(tensor)
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// A window is checked against its allocation before anything else, so a tensor never
-    /// addresses bytes its storage does not hold; host storage, which holds the window, is then
-    /// refused as no device's.
-    #[test]
-    fn a_window_stays_inside_its_allocation() {
-        let storage = Storage::host(64);
-
-        // SAFETY: neither call returns a tensor.
-        let (inside, outside) = unsafe {
-            (
-                storage.external(0, (4, 4), DType::F32),
-                storage.external(4, (4, 4), DType::F32),
-            )
-        };
-
-        assert!(matches!(inside, Err(Error::Unsupported(_))));
-        assert!(matches!(outside, Err(Error::Invariant(_))));
     }
 }

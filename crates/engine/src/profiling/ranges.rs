@@ -37,7 +37,6 @@ pub(crate) fn flag(value: Option<&str>) -> bool {
 }
 
 /// Whether ranges are emitted now.
-#[expect(dead_code, reason = "no host phase of a worker emits its range")]
 pub(crate) fn enabled() -> bool {
     switch().load(Ordering::Acquire)
 }
@@ -47,12 +46,12 @@ pub(crate) fn set_enabled(value: bool) -> bool {
     switch().swap(value, Ordering::AcqRel)
 }
 
-/// Marks a synchronous phase on its executing thread: a batch's inputs being prepared, a capture,
-/// a rebind, a storage job. The range closes when the returned guard drops.
+/// Marks a synchronous phase on its executing thread: a turn of a worker's job, which prepares a
+/// batch's inputs and launches it, captures a bucket, rebinds a generation or runs a control
+/// operation. The range closes when the returned guard drops.
 ///
 /// `batch` is the batch the phase belongs to, so a timeline can line the ranges up with the
 /// scheduler's steps; a phase with no single batch owner passes `None`.
-#[expect(dead_code, reason = "no host phase of a worker emits its range")]
 pub(crate) fn range(name: &'static CStr, batch: Option<u64>) -> Option<LocalRange<'static>> {
     static DOMAIN: OnceLock<Domain> = OnceLock::new();
 

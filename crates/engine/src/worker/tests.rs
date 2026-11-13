@@ -705,16 +705,14 @@ fn a_failed_job_states_the_work_in_flight_and_the_jobs_behind_it_run() {
     drop(release);
     output_of(&held);
 
-    // The error carries the job it was taken in, and so does the submission's label.
+    // The error carries the job it was taken in.
     let error = failure_of(&refused);
     assert!(error.contains("the runner refuses this batch"), "{error}");
     assert!(
-        error.contains("in flight: executing batch 13 of phase Decode"),
+        error.contains(
+            "in flight: executing batch 13 of phase Decode (decode_greedy/2 rows/2 tokens)"
+        ),
         "{error}"
-    );
-    assert_eq!(
-        refused.failure_label().as_deref(),
-        Some("executing batch 13 of phase Decode (decode_greedy/2 rows/2 tokens)")
     );
 
     let error = failure_of(&broken);
@@ -722,13 +720,6 @@ fn a_failed_job_states_the_work_in_flight_and_the_jobs_behind_it_run() {
         error.contains("the storage refused (in flight: giving the cache's segments back)"),
         "{error}"
     );
-
-    // A failure classifies as the error it carries.
-    let Some(Outcome::Failed(fault)) = broken.outcome() else {
-        panic!("the operation failed");
-    };
-    let failure = crate::worker::error::Failure::classify(Error::Shared(fault), None);
-    assert_eq!(failure.code, crate::worker::error::ErrorCode::ResourceError);
 
     output_of(&served);
     assert_eq!(worker.counters().0, 1);
@@ -1578,28 +1569,6 @@ fn a_batch_with_no_rows_takes_its_number_runs_the_copies_and_no_forward() {
 }
 
 #[test]
-fn a_control_operation_is_submitted_to_every_worker_of_a_node() {
-    let log = Log::default();
-    let (route, _, _) = group(ranks(3, &log), Vec::new());
-
-    let ranks = Arc::new(Mutex::new(Vec::new()));
-    let submission = route
-        .control("copying each rank's pages", |rank| {
-            let ranks = Arc::clone(&ranks);
-            Box::new(move |runners| {
-                lock(&ranks).push((rank, runners.len()));
-                Ok(())
-            })
-        })
-        .unwrap();
-    output_of(&submission);
-
-    let mut ranks = lock(&ranks).clone();
-    ranks.sort_unstable();
-    assert_eq!(ranks, [(0, 1), (1, 1), (2, 1)]);
-}
-
-#[test]
 fn a_group_s_ranks_on_another_host_take_its_jobs_and_state_what_they_ended() {
     let log = Log::default();
     let listener = crate::executor::peers::link::Listener::bind(&["127.0.0.1:0"]).unwrap();
@@ -1699,50 +1668,4 @@ fn a_group_s_ranks_on_another_host_take_its_jobs_and_state_what_they_ended() {
     drop(release);
     peer.join().unwrap();
     assert_eq!(liveness.lost(), None);
-}
-
-#[test]
-#[ignore = "requires a GPU"]
-fn a_worker_of_a_device_waits_for_events_recorded_on_its_streams() {
-    let log = Log::default();
-    let kernels = serving();
-    let device = platform::DeviceId(0);
-    let runner = LoggingRunner::new("a", Phase::Decode, Arc::clone(&kernels), &log);
-    let sequences = Sequences::new(GROUP, 1, Vec::new());
-    let tables = BlockTables::new(GROUP, &[DEVICE, HOST], &UNIT_BYTES);
-    let worker = Worker::spawn(
-        Some(device),
-        vec![Box::new(runner)],
-        kernels,
-        tables,
-        sequences,
-        0,
-        super::COPY_BUDGET,
-    )
-    .unwrap();
-
-    // A storage owner's work is issued by the worker: an event recorded on a stream in one
-    // job is waited for in a later one.
-    let event = Arc::new(platform::Event::new(platform::EventFlags::default()));
-    let recorded = Arc::clone(&event);
-    let issued = worker
-        .control(
-            "recording an event behind a storage owner's copies",
-            Box::new(move |_| {
-                let stream = platform::Stream::new(device)?;
-                recorded.record(&stream)?;
-                Ok(())
-            }),
-        )
-        .unwrap();
-    let waited = worker.wait(vec![Arc::clone(&event)]).unwrap();
-
-    output_of(&issued);
-    output_of(&waited);
-    assert!(event.query().unwrap());
-    assert!(matches!(worker.sticky_error(), Ok(None)));
-
-    // A batch's output carries what the rank observed, once something observes it.
-    let output = output_of(&worker.submit(1, batch(1, Phase::Decode, 2)).unwrap());
-    assert_eq!(output.calls.len(), 1);
 }

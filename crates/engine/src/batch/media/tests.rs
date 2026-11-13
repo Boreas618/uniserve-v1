@@ -13,8 +13,7 @@ fn claimed_media_remains_readable_after_its_name_and_first_consumer_are_gone() {
         .into_locator();
     // SAFETY: export completed every write and transferred ownership.
     let media = Arc::new(unsafe { SharedMedia::open(&locator.name, locator.bytes) }.unwrap());
-    assert_eq!(media.len(), 20);
-    assert!(!media.is_empty());
+    assert_eq!(media.as_bytes().len(), 20);
 
     // Opening unlinks the name, so a second claim of the same export
     // fails.

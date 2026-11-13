@@ -443,27 +443,6 @@ impl Buckets {
         Ok(Self::causal_lm(&decode, &prefill, sampled))
     }
 
-    /// The bucket set of an epoch that fixes no batch bound of its own: the configured sizes, or the
-    /// default sizes where the config names none, and no size dropped.
-    ///
-    /// This is the set an epoch captures; the bound it implies - the largest decode rows and the
-    /// largest prefill tokens - is what capacity fitting and the scheduler admit, so the buckets
-    /// come first and the batch bound follows them rather than the other way round.
-    #[cfg_attr(not(test), expect(dead_code, reason = "only tests call it"))]
-    pub(crate) fn default_causal_lm(
-        decode: Option<&[u32]>,
-        prefill: Option<&[u32]>,
-        sampled: bool,
-    ) -> Self {
-        let decode = decode.map_or_else(default_decode_rows, <[u32]>::to_vec);
-        let prefill = prefill.map_or_else(default_prefill_tokens, <[u32]>::to_vec);
-        // A zero size names no bucket; a config that states one is not refused, the size is
-        // dropped, since the rest of the set still serves.
-        let decode: Vec<u32> = decode.into_iter().filter(|size| *size != 0).collect();
-        let prefill: Vec<u32> = prefill.into_iter().filter(|size| *size != 0).collect();
-        Self::causal_lm(&decode, &prefill, sampled)
-    }
-
     /// The set of a deployment that speculates with its model's drafter, verifying at most
     /// `drafts` drafts a row: each decode bucket becomes the verification bucket of its rows
     /// ([`Bucket::verify`]), because a speculating request's every decode step is a
@@ -530,12 +509,6 @@ impl Buckets {
         self.ascending.iter()
     }
 
-    /// How many buckets the set holds.
-    #[cfg_attr(not(test), expect(dead_code, reason = "only tests call it"))]
-    pub(crate) fn len(&self) -> usize {
-        self.ascending.len()
-    }
-
     /// Whether the set holds no bucket.
     pub(crate) fn is_empty(&self) -> bool {
         self.ascending.is_empty()
@@ -555,15 +528,6 @@ impl Buckets {
             .iter()
             .copied()
             .find(|bucket| bucket.holds(shape))
-    }
-
-    /// `bucket`'s graph for an expert step of `capacity` rows per rank: the smallest of its
-    /// captures whose rows hold them.
-    #[cfg_attr(not(test), expect(dead_code, reason = "only tests call it"))]
-    pub(crate) fn at_capacity(&self, bucket: Bucket, capacity: u32) -> Option<Bucket> {
-        self.ascending.iter().copied().find(|candidate| {
-            candidate.at_capacity(0) == bucket.at_capacity(0) && candidate.capacity >= capacity
-        })
     }
 
     /// The smallest captured bucket that holds `shape`, or a refusal naming the shape.
@@ -590,26 +554,9 @@ impl Buckets {
         self.ascending.iter().rev()
     }
 
-    /// The largest bucket of `variant`, which that variant's static activations are sized for.
-    #[expect(dead_code, reason = "no caller in the engine")]
-    pub(crate) fn largest(&self, variant: Variant) -> Option<Bucket> {
-        self.ascending
-            .iter()
-            .rev()
-            .copied()
-            .find(|bucket| bucket.variant == variant)
-    }
-
     /// Whether the set holds `bucket`.
     pub(crate) fn contains(&self, bucket: &Bucket) -> bool {
         self.ascending.binary_search(bucket).is_ok()
-    }
-
-    /// The largest bucket of the set: the one whose footprint an allocator must be able to hold
-    /// before the set is captured.
-    #[cfg_attr(not(test), expect(dead_code, reason = "only tests call it"))]
-    pub(crate) fn largest_footprint(&self) -> Option<Bucket> {
-        self.ascending.last().copied()
     }
 }
 
@@ -1218,15 +1165,15 @@ mod tests {
     fn capture_order_is_largest_first() {
         let buckets = Buckets::causal_lm(&[1, 8], &[64], false);
         let order: Vec<Bucket> = buckets.capture_order().copied().collect();
-        assert_eq!(order.first(), buckets.largest_footprint().as_ref());
-        assert_eq!(order.len(), buckets.len());
+        assert_eq!(order.first(), buckets.iter().last());
+        assert_eq!(order.len(), buckets.iter().len());
         assert!(
             order.windows(2).all(|pair| pair[0] >= pair[1]),
             "capture order is not descending: {order:?}"
         );
         // The same bucket twice is one capture.
         let repeated = Buckets::new([Bucket::decode(4, Variant::DecodeGreedy); 3]);
-        assert_eq!(repeated.len(), 1);
+        assert_eq!(repeated.iter().len(), 1);
     }
 
     /// A prefill bucket never holds fewer tokens than rows, and a decode bucket's tokens are its
@@ -1264,7 +1211,7 @@ mod tests {
             .expect("the deployment's sizes");
         // 4 sizes x (greedy + sampled) decode, and one row bucket x 1 token count x (write, drawn
         // output, greedy output and scored) prefill: a prefill bucket holds any batch of fewer rows.
-        assert_eq!(buckets.len(), 12, "12 buckets, so 12 captures");
+        assert_eq!(buckets.iter().len(), 12, "12 buckets, so 12 captures");
 
         // With no configured size the default sizes are the set, and every size they state is
         // captured with each computation it admits. The count is derived from them here rather than
@@ -1292,7 +1239,7 @@ mod tests {
             }
         }
         assert_eq!(
-            defaults.len(),
+            defaults.iter().len(),
             stated.len(),
             "one bucket per (variant, rows, tokens) the default sizes state"
         );
@@ -1397,11 +1344,14 @@ mod tests {
     /// largest prefill tokens, which is what capacity fitting and the scheduler read.
     #[test]
     fn the_bounds_are_what_the_set_captures() {
-        let buckets = Buckets::default_causal_lm(Some(&[1, 8]), Some(&[0, 64, 256]), true);
+        let buckets =
+            Buckets::for_batch(Some(&[1, 8]), Some(&[0, 64, 256]), u32::MAX, u32::MAX, true)
+                .expect("sizes within the bound");
         assert_eq!(buckets.bounds(), (8, 256));
         // A zero size names no bucket, and an epoch that configures no size takes the default sizes.
         assert!(!buckets.contains(&Bucket::prefill(8, 0, Variant::PrefillWrite)));
-        let defaults = Buckets::default_causal_lm(None, None, false);
+        let defaults =
+            Buckets::for_batch(None, None, u32::MAX, u32::MAX, false).expect("the default sizes");
         let (rows, tokens) = defaults.bounds();
         assert_eq!(
             rows,

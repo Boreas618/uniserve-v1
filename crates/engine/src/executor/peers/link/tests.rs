@@ -10,8 +10,8 @@ use service::{Connection, Message};
 use crate::batch::cache::CacheGroupKind;
 use crate::batch::{self, Capacity, ErrorCode, TimingCounters};
 use crate::executor::peers::messages::{
-    MainProcessRequest, MainProcessResponse, MainProcessResponseError, RequestKind, ResponseKind,
-    Stall, decode_requests,
+    MainProcessRequest, MainProcessResponse, MainProcessResponseError, ResponseKind, Stall,
+    decode_requests,
 };
 
 /// Returns `message` as a receiver decodes it from the payload a sender encoded.
@@ -58,7 +58,10 @@ fn group_capacity() -> Capacity {
 fn a_group_s_capacity_round_trips_through_the_info_response() {
     let capacity = group_capacity();
 
-    let decoded = round_trip(&MainProcessResponse::info(capacity.clone()));
+    let decoded = round_trip(&MainProcessResponse::Info {
+        message_id: None,
+        capacity: capacity.clone(),
+    });
     let MainProcessResponse::Info {
         capacity: decoded, ..
     } = decoded
@@ -107,7 +110,7 @@ fn stamped() -> Vec<storage::runtime::Request> {
     ]
 }
 
-/// One fixture per `RequestKind`, the submit frame with and without a correlation identity.
+/// One fixture per kind of request, the submit frame with and without a correlation identity.
 fn request_fixtures() -> Vec<MainProcessRequest> {
     use storage::runtime::{Completion, GroupId, OwnerId, Request};
 
@@ -125,7 +128,7 @@ fn request_fixtures() -> Vec<MainProcessRequest> {
         evicted: Vec::new(),
     };
     vec![
-        MainProcessRequest::info(),
+        MainProcessRequest::Info { message_id: None },
         submit,
         MainProcessRequest::submit(13, true, group_batch()),
         MainProcessRequest::shadow(14, group_batch()),
@@ -162,9 +165,6 @@ fn response_fixtures() -> Vec<MainProcessResponse> {
             ended: 12,
         },
         MainProcessResponse::result(batch::BatchOutput::default(), &stamped(), 14),
-        MainProcessResponse::Ok {
-            message_id: Some(17),
-        },
         MainProcessResponse::Error {
             message_id: Some(17),
             error: MainProcessResponseError {
@@ -188,27 +188,8 @@ fn response_fixtures() -> Vec<MainProcessResponse> {
 
 #[test]
 fn every_request_kind_round_trips_through_ipc() {
-    let fixtures = request_fixtures();
-    for kind in [
-        RequestKind::Info,
-        RequestKind::Submit,
-        RequestKind::Shadow,
-        RequestKind::Map,
-        RequestKind::Stamp,
-        RequestKind::Close,
-    ] {
-        assert!(
-            fixtures.iter().any(|request| request.kind() == kind),
-            "no fixture covers request kind {kind:?}"
-        );
-    }
-    for request in fixtures {
-        assert_eq!(
-            round_trip(&request),
-            request,
-            "round trip for {:?}",
-            request.kind()
-        );
+    for request in request_fixtures() {
+        assert_eq!(round_trip(&request), request);
     }
 }
 
@@ -218,7 +199,6 @@ fn every_response_kind_round_trips_through_ipc() {
     for kind in [
         ResponseKind::Info,
         ResponseKind::Result,
-        ResponseKind::Ok,
         ResponseKind::Error,
         ResponseKind::Stalled,
     ] {
@@ -267,14 +247,18 @@ fn the_buffer_pool_s_requests_read_back_from_the_frames_that_carry_them() {
 
 #[test]
 fn a_message_decodes_only_as_the_message_it_is() {
-    let request = MainProcessRequest::info().encode().unwrap();
+    let request = MainProcessRequest::Info { message_id: None }
+        .encode()
+        .unwrap();
     let refused = MainProcessResponse::decode(&request).unwrap_err();
     assert_eq!(refused.kind(), std::io::ErrorKind::InvalidData);
 
     // A message cut short, as a frame of another build may be, is refused: the frame's length
     // field counts the shortened message, so the connection receives it whole and its decoding
     // fails.
-    let mut cut = MainProcessResponse::ok().encode().unwrap();
+    let mut cut = MainProcessResponse::result(batch::BatchOutput::default(), &[], 0)
+        .encode()
+        .unwrap();
     cut.pop();
     let frame = service::frame::length_prefixed(&cut).unwrap();
 

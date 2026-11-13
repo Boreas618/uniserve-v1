@@ -124,12 +124,6 @@ impl PageTables {
         Ok(slot - 1)
     }
 
-    /// The pooled table's last row, which names only the padding unit.
-    #[cfg_attr(not(test), expect(dead_code, reason = "only tests call it"))]
-    pub(crate) fn padding_row(&self) -> u32 {
-        self.slots
-    }
-
     /// The pooled table of attention group `group` as a `[slots + 1, width]` U32 tensor: on the
     /// device, or a meta tensor for tables that hold none.
     pub(crate) fn table(&self, group: usize) -> Result<Tensor> {
@@ -299,10 +293,8 @@ mod tests {
         let mut pooled = tables();
         assert_eq!(pooled.table(0)?.dims(), [3, 4]);
         assert_eq!(pooled.table(0)?.dtype(), DType::U32);
-        assert_eq!(
-            (pooled.row(1)?, pooled.row(2)?, pooled.padding_row()),
-            (0, 1, 2)
-        );
+        assert_eq!((pooled.row(1)?, pooled.row(2)?), (0, 1));
+        assert!(pooled.row(0).is_err() && pooled.row(3).is_err());
 
         let held: Vec<Change> = (0..3)
             .map(|position| change(2, 0, position, Some((5 + position, 1))))

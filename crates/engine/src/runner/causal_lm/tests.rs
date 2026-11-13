@@ -2068,7 +2068,6 @@ fn the_runner_serves_the_phases_of_its_config() {
     let runner = runner(false);
 
     assert_eq!(runner.phases(), [Phase::Prefill, Phase::Decode]);
-    assert_eq!(runner.config().slots, SLOTS);
 }
 
 // ---- Expert unions ------------------------------------------------------------------------------
@@ -2186,14 +2185,7 @@ fn a_union_member_captures_each_bucket_at_the_capacities_its_steps_meet() {
             .count(),
         1
     );
-    assert_eq!(classes.len(), 2 * 4 + 2 * 4 + 4 + 2);
-
-    // A step runs the smallest class that holds it.
-    assert_eq!(classes.at_capacity(decode, 3), Some(decode.at_capacity(4)));
-    assert_eq!(
-        classes.at_capacity(decode, 5),
-        Some(decode.at_capacity(UNION_ROWS))
-    );
+    assert_eq!(classes.iter().len(), 2 * 4 + 2 * 4 + 4 + 2);
 }
 
 #[test]
@@ -3870,8 +3862,12 @@ fn a_speculating_runner_is_built_over_the_rank_s_draft_group_and_trail() {
     // keeps none for it serves no such drafter.
     let ringed = StateMemory::meta(
         StateConfig {
+            shapes: vec![state_shape()],
+            slots: SLOTS,
+            rows: 4,
+            trail: 12,
+            owned: 1,
             drafter: vec![drafter_ring()],
-            ..state(12).config().clone()
         },
         &cache_config,
     )

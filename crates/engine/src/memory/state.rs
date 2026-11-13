@@ -73,7 +73,6 @@ use std::sync::Arc;
 
 use crate::batch::StateDirection;
 use nn::family::{StateField, StateShape};
-use nn::{RecurrentState, VerifySlots};
 use ops::block_copy::{
     BlockShape, COPY_BLOCK, CacheBlockScatter, CacheBlockSnapshot, ScatterArgs, SnapshotArgs,
 };
@@ -393,12 +392,6 @@ impl StateMemory {
         Ok(state)
     }
 
-    /// The config the state was opened with.
-    #[cfg_attr(not(test), expect(dead_code, reason = "only tests call it"))]
-    pub(crate) fn config(&self) -> &StateConfig {
-        &self.config
-    }
-
     /// The home row request slot `slot` owns of the live and checkpoint buffers: what the
     /// batch's state slot column states for the slot's row.
     ///
@@ -534,59 +527,6 @@ impl StateMemory {
             |buffers| &buffers.drafter,
         )
         .map(Some)
-    }
-
-    /// The state as a forward is lent it, for a batch whose state rows the four columns
-    /// describe (`nn::RecurrentState`): `slots` holds [`Self::row`] of each row's request slot
-    /// and `nn::NO_SLOT` for a padding row. A `trailing` batch, a verification, also receives
-    /// the trail; a state whose requests own several slots of a stepwise field is lent
-    /// `verify`, the rows' slots and accepted counts, by every batch instead.
-    ///
-    /// # Errors
-    ///
-    /// A trailing batch in a deployment whose state keeps no trail, and verify slots given to
-    /// a state whose requests own one slot of every field, or withheld from one whose requests
-    /// own several.
-    #[cfg_attr(not(test), expect(dead_code, reason = "only tests call it"))]
-    pub(crate) fn lend(
-        &self,
-        query_offsets: Tensor,
-        seq_lens: Tensor,
-        slots: Tensor,
-        checkpoints: Tensor,
-        trailing: bool,
-        verify: Option<VerifySlots>,
-    ) -> Result<RecurrentState> {
-        if verify.is_some() != self.config.verifies() {
-            return Err(Error::Invariant(format!(
-                "a batch is lent {} verify slots, and the state's requests own {} slots of a \
-                 stepwise field",
-                if verify.is_some() { "its" } else { "no" },
-                self.config.owned
-            )));
-        }
-        let trail = if trailing {
-            Some(self.trail()?.ok_or_else(|| {
-                Error::Invariant(
-                    "a verification keeps a trail and the recurrent state holds none: the \
-                     deployment does not speculate, or verifies over verify slots"
-                        .into(),
-                )
-            })?)
-        } else {
-            None
-        };
-
-        Ok(RecurrentState {
-            verify,
-            query_offsets,
-            seq_lens,
-            slots,
-            checkpoints,
-            live: self.live()?,
-            checkpoint: self.checkpoint()?,
-            trail,
-        })
     }
 
     /// The rows of the cache's state runs the planes of the state page in `units` lie in, in
@@ -1058,26 +998,12 @@ mod tests {
         Ok(())
     }
 
-    /// A deployment that does not speculate keeps no trail, and a verification is refused one.
+    /// A deployment that does not speculate keeps no trail.
     #[test]
     fn a_state_without_a_trail_lends_none() -> Result<()> {
         let state = StateMemory::meta(config(0), &cache())?;
         assert!(state.trail()?.is_none());
-
-        // SAFETY: meta tensors have no data and their addresses are never read.
-        let column = |rows: usize| unsafe { lend(0, rows, DType::U32, None) };
-        let lent = state.lend(column(3)?, column(2)?, column(2)?, column(2)?, false, None)?;
-        assert!(lent.trail.is_none());
-        assert_eq!((lent.live.len(), lent.checkpoint.len()), (2, 2));
-
-        let refused = state
-            .lend(column(3)?, column(2)?, column(2)?, column(2)?, true, None)
-            .err()
-            .expect("a verification without a trail");
-        assert!(
-            refused.to_string().contains("does not speculate"),
-            "{refused}"
-        );
+        assert_eq!((state.live()?.len(), state.checkpoint()?.len()), (2, 2));
         assert!(state.settle(1, 0).is_err());
         Ok(())
     }
@@ -1183,8 +1109,7 @@ mod tests {
 
     /// A state's buffers follow its runs in order, each layer with its own run's fields. A
     /// request owns `Q` slots of a stepwise field, whose live buffer holds them past the home
-    /// rows, and one checkpoint row; such a state is lent verify slots by every batch and keeps
-    /// no trail.
+    /// rows, and one checkpoint row; such a state keeps no trail.
     #[test]
     fn a_state_of_runs_keeps_every_slot_its_requests_own() -> Result<()> {
         let cache = runs_cache()?;
@@ -1228,44 +1153,11 @@ mod tests {
             2 * 2 * 3 * 52 + (9 + 3) * 16 + 4 * (4 * 6 * 8)
         );
 
-        // Every batch is lent the requests' slots, and none keeps a trail.
-        // SAFETY: meta tensors have no data and their addresses are never read.
-        let column = |dims: &[usize]| unsafe { lend(0, dims, DType::U32, None) };
-        let verify = || -> Result<VerifySlots> {
-            Ok(VerifySlots {
-                state_indices: column(&[2, 3])?,
-                num_accepted: column(&[2])?,
-            })
-        };
-        let columns = || -> Result<[Tensor; 4]> {
-            Ok([column(&[3])?, column(&[2])?, column(&[2])?, column(&[2])?])
-        };
-        let [offsets, lens, slots, checkpoints] = columns()?;
-        let lent = state.lend(offsets, lens, slots, checkpoints, false, Some(verify()?))?;
-        assert!(lent.verify.is_some() && lent.trail.is_none());
-
-        let [offsets, lens, slots, checkpoints] = columns()?;
-        assert!(
-            state
-                .lend(offsets, lens, slots, checkpoints, false, None)
-                .is_err()
-        );
-        let [offsets, lens, slots, checkpoints] = columns()?;
-        assert!(
-            state
-                .lend(offsets, lens, slots, checkpoints, true, Some(verify()?))
-                .is_err()
-        );
+        // Its requests own several slots of a stepwise field, so it keeps no trail, and one that
+        // states a trail is refused.
+        assert!(config.verifies() && state.trail()?.is_none());
         assert!(StateMemory::meta(StateConfig { trail: 4, ..config }, &cache).is_err());
-
-        // A state whose requests own one slot is lent none.
-        let single = StateMemory::meta(self::config(0), &self::cache());
-        let [offsets, lens, slots, checkpoints] = columns()?;
-        assert!(
-            single?
-                .lend(offsets, lens, slots, checkpoints, false, Some(verify()?))
-                .is_err()
-        );
+        assert!(!self::config(0).verifies());
 
         // A state of other runs than the ones its cache's state pages hold.
         assert!(StateMemory::meta(self::config(0), &cache).is_err());

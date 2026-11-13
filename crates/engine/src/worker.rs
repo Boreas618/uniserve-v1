@@ -132,19 +132,16 @@
 //! | [`sequences`] | [`Sequences`]: the ended sequences of a group's ranks and its `completed` word |
 //! | [`watchdog`] | [`Watchdog`](watchdog::Watchdog): when the control thread looks at the jobs in flight, and which it reports |
 //! | [`completion`] | How an operation ended, the completion its waiters share, and the submission of a job to a worker or to every rank of a group |
-//! | [`error`] | The one error of device work and its classification for the engine |
-//! | [`stream`] | [`EventPool`](stream::events::EventPool), the event leases storage owners defer their releases behind |
-//! | [`device`] | The devices a rank computes on, as an engine's launch names them |
+//! | [`error`] | The one error of device work |
 
 pub mod completion;
-pub(crate) mod device;
 pub(crate) mod error;
 pub(crate) mod queue;
 pub(crate) mod sequences;
-pub(crate) mod stream;
 pub(crate) mod watchdog;
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::ffi::CStr;
 use std::ops::ControlFlow;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -153,8 +150,8 @@ use std::time::{Duration, Instant};
 
 use crossbeam_channel::{Receiver, Sender};
 use ops::Generation;
+use platform::DeviceId;
 use platform::cupti::blocking::{Calls, Watched};
-use platform::{DeviceId, Event};
 use service::lock;
 use storage::runtime::{Completion, GroupId, Request, RequestId};
 
@@ -256,9 +253,6 @@ pub(crate) enum Job {
         change: Change,
         response: Sender<serde_json::Value>,
     },
-    /// Wait until the device has passed the latest record of each event.
-    #[cfg_attr(not(test), expect(dead_code, reason = "only tests call it"))]
-    Wait(Vec<Arc<Event>>),
     /// Call `operation` with the runners, once the device has passed everything they issued.
     Control {
         /// What the operation does, for a stall report and a failure.
@@ -293,6 +287,26 @@ impl Job {
         match self {
             Self::Resume { sequence, .. } => Some(*sequence),
             _ => None,
+        }
+    }
+
+    /// The name of the NVTX range a turn of the job is marked with on a timeline
+    /// ([`profiling::ranges`]): one per kind of job.
+    fn range(&self) -> &'static CStr {
+        match self {
+            Self::Execute { .. } => c"uniserve.worker.execute",
+            Self::Resume { .. } => c"uniserve.worker.resume",
+            Self::Pass(_) => c"uniserve.worker.pass",
+            Self::Shadow { .. } => c"uniserve.worker.shadow",
+            Self::Map { .. } => c"uniserve.worker.map",
+            Self::Stamp(_) => c"uniserve.worker.stamp",
+            Self::Capture => c"uniserve.worker.capture",
+            Self::Prepare(_) => c"uniserve.worker.prepare",
+            Self::Switch(_) => c"uniserve.worker.switch",
+            Self::Commit(_) => c"uniserve.worker.commit",
+            Self::Rollback(_) => c"uniserve.worker.rollback",
+            Self::Profile { .. } => c"uniserve.worker.profile",
+            Self::Control { .. } => c"uniserve.worker.control",
         }
     }
 }
@@ -336,11 +350,6 @@ impl std::fmt::Display for Job {
             Self::Commit(number) => write!(formatter, "committing generation {number}"),
             Self::Rollback(number) => write!(formatter, "rolling back generation {number}"),
             Self::Profile { .. } => formatter.write_str("changing the profiling session"),
-            Self::Wait(events) => write!(
-                formatter,
-                "waiting for {} events of deferred storage release",
-                events.len()
-            ),
             Self::Control { label, .. } => formatter.write_str(label),
         }
     }
@@ -706,18 +715,6 @@ impl Worker {
         returned(&submission, &responded)
     }
 
-    /// Submits a wait for `events`: the submission completes once the device has passed the
-    /// latest record of each, which is when storage whose release hangs on them may be released.
-    /// The events are recorded by jobs submitted before this one.
-    ///
-    /// # Errors
-    ///
-    /// Once the queue is closed.
-    #[cfg_attr(not(test), expect(dead_code, reason = "only tests call it"))]
-    pub(crate) fn wait(&self, events: Vec<Arc<Event>>) -> Result<Submission> {
-        self.queue.submit(Job::Wait(events))
-    }
-
     /// Submits the control operation `operation`, named `label` in a stall report and a failure:
     /// the worker calls it between the jobs submitted before and after it, once the device
     /// has passed everything the runners issued.
@@ -949,7 +946,12 @@ impl Thread {
             let counted = job.runs_forwards();
             let launched = if counted { self.launches() } else { 0 };
             let started = Instant::now();
+
+            // A timeline shows each turn's host work beside the kernels it issues, under the
+            // batch it belongs to (`docs/profiling.md`); the range closes with the turn.
+            let range = profiling::ranges::range(job.range(), job.batch().map(|batch| batch.id.0));
             let turn = self.turn(job, started.saturating_duration_since(submitted));
+            drop(range);
             if counted {
                 let elapsed = u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX);
                 self.counters
@@ -1144,12 +1146,6 @@ impl Thread {
 
                 // A caller that stopped waiting has nothing to be told.
                 let _ = response.send(changed);
-                Ok(done)
-            }
-            Job::Wait(events) => {
-                for event in &events {
-                    event.synchronize()?;
-                }
                 Ok(done)
             }
             Job::Control { operation, .. } => {

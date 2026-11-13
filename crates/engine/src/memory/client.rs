@@ -752,7 +752,9 @@ impl StorageClient {
     /// # Errors
     ///
     /// The server's refusal.
-    #[expect(dead_code, reason = "no caller in the engine")]
+    // BP §15 (the head relays `PlaceRemote` for each rank of another host); the missing caller
+    // is the scheduler node's start over peers, whose ranks' placements no peer frame carries.
+    #[expect(dead_code, reason = "no start relays a peer rank's placement")]
     pub(crate) fn place_remote(
         &mut self,
         region: &str,

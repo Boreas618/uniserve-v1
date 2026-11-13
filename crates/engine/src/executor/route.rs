@@ -44,7 +44,7 @@ use storage::runtime::{Completion, GroupId, Request, RequestId};
 use super::peers::Remote;
 use crate::worker::completion::Submission;
 use crate::worker::{Error, Result};
-use crate::worker::{Operation, Sequences, Worker, alone};
+use crate::worker::{Sequences, Worker, alone};
 use service::lock;
 
 /// A node's workers and peer links, by worker group, as the engine hands them its jobs.
@@ -291,30 +291,6 @@ impl Route {
     /// A group nothing here serves.
     pub fn completed(&self, group: GroupId) -> Result<u64> {
         Ok(self.group(group)?.sequences.completed())
-    }
-
-    /// Submits one control operation to every worker of this node, as one submission:
-    /// `operation` makes each worker's from its place among the node's workers, group by
-    /// group in the order the route was given them.
-    ///
-    /// # Errors
-    ///
-    /// When the node holds no worker, or a queue is closed.
-    #[cfg_attr(not(test), expect(dead_code, reason = "only tests call it"))]
-    pub(crate) fn control(
-        &self,
-        label: &str,
-        operation: impl Fn(usize) -> Operation,
-    ) -> Result<Submission> {
-        let parts = self
-            .groups
-            .iter()
-            .flat_map(|group| &group.workers)
-            .enumerate()
-            .map(|(place, worker)| worker.control(label, operation(place)))
-            .collect::<Result<Vec<_>>>()?;
-
-        joined(parts)
     }
 }
 

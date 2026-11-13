@@ -23,30 +23,6 @@ use storage::runtime::{Completion, GroupId, Request, RequestId};
 
 use crate::batch::{Batch, BatchOutput, Capacity, ErrorCode};
 
-/// Kind discriminator carried by each worker request frame.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub(crate) enum RequestKind {
-    /// Queries worker identity and capabilities.
-    Info,
-    /// Submits a batch.
-    Submit,
-    /// Submits a shadow batch.
-    Shadow,
-    /// Maps a completion of the buffer pool into the ranks' device block tables.
-    Map,
-    /// Applies requests to the ranks' device block tables and stamps them.
-    Stamp,
-    /// Requests orderly worker shutdown.
-    Close,
-    /// Promotes a standby worker to serving.
-    Promote,
-    /// Runs a named worker hook.
-    Hook,
-}
-
-impl RequestKind {}
-
 /// Engine-to-worker request envelope.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -115,41 +91,9 @@ pub(crate) enum MainProcessRequest {
         /// Optional request-response correlation identity.
         message_id: Option<u64>,
     },
-    /// Promotes a parked standby worker to serving: it takes write access
-    /// to the exclusive storages its predecessor held, once the predecessor
-    /// is out, and makes their mappings writable at unchanged addresses.
-    /// Responds with `Ok` once the worker serves.
-    Promote {
-        /// Optional request-response correlation identity.
-        message_id: Option<u64>,
-    },
-    /// Runs the worker hook `name` (`uniserve.hooks`), which a plugin
-    /// implements, with `payload`, a JSON value. The engine sends it while
-    /// the worker runs no forward. Responds with
-    /// [`MainProcessResponse::Hooked`] and the hook's JSON result.
-    Hook {
-        /// Optional request-response correlation identity.
-        message_id: Option<u64>,
-        name: String,
-        payload: String,
-    },
 }
 
 impl MainProcessRequest {
-    /// Returns this envelope's request-kind discriminator.
-    pub(crate) const fn kind(&self) -> RequestKind {
-        match self {
-            Self::Info { .. } => RequestKind::Info,
-            Self::Submit { .. } => RequestKind::Submit,
-            Self::Shadow { .. } => RequestKind::Shadow,
-            Self::Map { .. } => RequestKind::Map,
-            Self::Stamp { .. } => RequestKind::Stamp,
-            Self::Close { .. } => RequestKind::Close,
-            Self::Promote { .. } => RequestKind::Promote,
-            Self::Hook { .. } => RequestKind::Hook,
-        }
-    }
-
     /// Replaces the request-response correlation identity (`message_id`).
     pub(crate) fn set_message_id(&mut self, value: Option<u64>) {
         match self {
@@ -158,25 +102,8 @@ impl MainProcessRequest {
             | Self::Shadow { message_id, .. }
             | Self::Map { message_id, .. }
             | Self::Stamp { message_id, .. }
-            | Self::Close { message_id }
-            | Self::Promote { message_id }
-            | Self::Hook { message_id, .. } => *message_id = value,
+            | Self::Close { message_id } => *message_id = value,
         }
-    }
-
-    /// Returns the batch carried by this request, if any.
-    #[expect(dead_code, reason = "no caller in the engine")]
-    pub(crate) const fn batch(&self) -> Option<&Batch> {
-        match self {
-            Self::Submit { batch, .. } | Self::Shadow { batch, .. } => Some(batch),
-            _ => None,
-        }
-    }
-
-    /// Constructs a worker-capability request.
-    #[cfg_attr(not(test), expect(dead_code, reason = "only tests call it"))]
-    pub(crate) fn info() -> Self {
-        Self::Info { message_id: None }
     }
 
     /// Constructs a batch-submission request of the batch numbered
@@ -247,15 +174,11 @@ pub(crate) enum ResponseKind {
     Info,
     /// Partial or terminal batch result.
     Result,
-    /// Successful control acknowledgement.
-    Ok,
     /// Structured worker failure.
     Error,
     /// A job of the rank that has not completed within the rank's stall
     /// bound.
     Stalled,
-    /// A worker hook's result.
-    Hooked,
 }
 
 /// Structured worker failure.
@@ -324,23 +247,12 @@ pub(crate) enum MainProcessResponse {
         /// process has ended, with every earlier one ended.
         ended: u64,
     },
-    /// Acknowledges a successful control request.
-    Ok {
-        /// Optional request-response correlation identity.
-        message_id: Option<u64>,
-    },
     /// Returns a structured worker failure.
     Error {
         /// Optional request-response correlation identity.
         message_id: Option<u64>,
         /// Structured failure details.
         error: MainProcessResponseError,
-    },
-    /// Responds to a [`MainProcessRequest::Hook`] with the hook's JSON result.
-    Hooked {
-        /// Optional request-response correlation identity.
-        message_id: Option<u64>,
-        result: String,
     },
     /// Reports, unasked, a job the rank's builder thread stays inside. The
     /// rank's control thread sends it once, and goes on serving the
@@ -357,10 +269,8 @@ impl MainProcessResponse {
         match self {
             Self::Info { .. } => ResponseKind::Info,
             Self::Result { .. } => ResponseKind::Result,
-            Self::Ok { .. } => ResponseKind::Ok,
             Self::Error { .. } => ResponseKind::Error,
             Self::Stalled { .. } => ResponseKind::Stalled,
-            Self::Hooked { .. } => ResponseKind::Hooked,
         }
     }
 
@@ -370,28 +280,8 @@ impl MainProcessResponse {
         match self {
             Self::Info { message_id, .. }
             | Self::Result { message_id, .. }
-            | Self::Ok { message_id }
-            | Self::Error { message_id, .. }
-            | Self::Hooked { message_id, .. } => *message_id = value,
+            | Self::Error { message_id, .. } => *message_id = value,
             Self::Stalled { .. } => {}
-        }
-    }
-
-    /// Returns the batch result carried by this response, if any.
-    #[expect(dead_code, reason = "no caller in the engine")]
-    pub(crate) const fn output(&self) -> Option<&BatchOutput> {
-        match self {
-            Self::Result { result, .. } => Some(result),
-            _ => None,
-        }
-    }
-
-    /// Constructs the response that states a group's capacity.
-    #[cfg_attr(not(test), expect(dead_code, reason = "only tests call it"))]
-    pub(crate) fn info(capacity: Capacity) -> Self {
-        Self::Info {
-            message_id: None,
-            capacity,
         }
     }
 
@@ -404,21 +294,6 @@ impl MainProcessResponse {
             result,
             requests: records(requests),
             ended,
-        }
-    }
-
-    /// Constructs an acknowledgment response.
-    #[cfg_attr(not(test), expect(dead_code, reason = "only tests call it"))]
-    pub(crate) fn ok() -> Self {
-        Self::Ok { message_id: None }
-    }
-
-    /// Constructs a structured worker-error response.
-    #[expect(dead_code, reason = "no caller in the engine")]
-    pub(crate) fn error(error: MainProcessResponseError) -> Self {
-        Self::Error {
-            message_id: None,
-            error,
         }
     }
 }

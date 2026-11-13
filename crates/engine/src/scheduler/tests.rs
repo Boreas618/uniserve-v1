@@ -270,7 +270,6 @@ impl Bench {
             encodings: Vec::new(),
             unpinned: Vec::new(),
             num_acknowledged_tokens: 0,
-            artifact: None,
             terminal: None,
             event_credit: 64,
             last_progress: now,

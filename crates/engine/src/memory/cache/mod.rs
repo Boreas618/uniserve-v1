@@ -77,7 +77,7 @@ use self::info::{PoolConversion, PrefixCacheInfo};
 use nn::{KvCache, KvPlanes};
 use platform::{DeviceId, Event, Stream};
 use storage::runtime::Run;
-use tensor::{DType, Device, Tensor};
+use tensor::{DType, Tensor};
 
 use self::conversion::Conversion;
 use self::host::{HostPage, HostTier};
@@ -281,15 +281,6 @@ impl KvCacheMemory {
         &self.config.layout
     }
 
-    /// The device the cache's tensors are on: its GPU, or the meta device.
-    #[cfg_attr(not(test), expect(dead_code, reason = "only tests call it"))]
-    pub(crate) fn device(&self) -> Device {
-        match self.planes.device_id() {
-            Some(device) => ops::cuda(device.0 as usize),
-            None => ops::meta(),
-        }
-    }
-
     /// The attention group `group`'s layout.
     fn attention(&self, group: usize) -> Result<&GroupLayout> {
         self.config
@@ -345,10 +336,10 @@ impl KvCacheMemory {
             .collect()
     }
 
-    /// The pooled page table of attention group `group`, `[slots + 1, width]` U32: row
-    /// [`Self::table_row`] of a request slot names the unit of each of its logical pages, and
-    /// row [`Self::padding_row`] and every page a slot does not hold name unit 0. A forward
-    /// gathers its batch's rows from it.
+    /// The pooled page table of attention group `group`, `[slots + 1, width]` U32: row `s - 1`
+    /// of request slot `s` names the unit of each of its logical pages, and the last row, the
+    /// padding row, and every page a slot does not hold name unit 0. A forward gathers its
+    /// batch's rows from it.
     ///
     /// # Errors
     ///
@@ -358,23 +349,6 @@ impl KvCacheMemory {
         self.tables.table(group)
     }
 
-    /// The row of the pooled tables that request slot `slot` owns.
-    ///
-    /// # Errors
-    ///
-    /// A slot outside `1..=slots`.
-    #[cfg_attr(not(test), expect(dead_code, reason = "only tests call it"))]
-    pub(crate) fn table_row(&self, slot: u32) -> Result<u32> {
-        self.tables.row(slot)
-    }
-
-    /// The row of the pooled tables that names only the padding unit: what a bucket's padding
-    /// rows gather.
-    #[cfg_attr(not(test), expect(dead_code, reason = "only tests call it"))]
-    pub(crate) fn padding_row(&self) -> u32 {
-        self.tables.padding_row()
-    }
-
     /// The pooled page table of attention group `group` as the host holds it,
     /// `[slots + 1, width]` row-major: what the device's table holds once the changes applied
     /// so far completed.
@@ -382,7 +356,10 @@ impl KvCacheMemory {
     /// # Errors
     ///
     /// A group that is no attention group of the cache.
-    #[cfg_attr(not(test), expect(dead_code, reason = "only tests call it"))]
+    ///
+    /// The tests' view of the device's tables: no serving path reads it, and a meta cache's
+    /// tables hold no device bytes to read instead.
+    #[cfg(test)]
     pub(crate) fn host_table(&self, group: usize) -> Result<&[u32]> {
         self.tables.host_table(group)
     }
@@ -606,12 +583,6 @@ impl KvCacheMemory {
         Ok(converted)
     }
 
-    /// The bytes one token of the cache's pages takes in the host tier, over every group.
-    #[expect(dead_code, reason = "no caller in the engine")]
-    pub(crate) fn host_token_bytes(&self) -> u64 {
-        host::token_bytes(&self.config.layout)
-    }
-
     /// The page identity of each cache group for weights of `fingerprint`
     /// (`PrefixCacheInfo::identities`).
     pub(crate) fn page_identities(&self, fingerprint: &str) -> Vec<String> {
@@ -815,23 +786,6 @@ impl KvCacheMemory {
     /// When a conversion's descriptors refuse the cache's layout.
     pub(crate) fn keys(&self) -> Result<BTreeSet<(&'static str, String)>> {
         conversion::keys(&self.config.layout, self.config.units)
-    }
-
-    /// Gives every segment of the value planes back to the device, through `owner`, which
-    /// retained them: what a sleep releases. No request holds a unit and no device work
-    /// addresses the planes. Planes that are not split have nothing to give back, which is not
-    /// an error.
-    ///
-    /// # Errors
-    ///
-    /// When `owner` fails.
-    #[cfg_attr(not(test), expect(dead_code, reason = "only tests call it"))]
-    pub(crate) fn sleep(&mut self, owner: &dyn ExclusiveStorage) -> Result<()> {
-        if self.planes.segments().is_none() {
-            tracing::info!("the cache's planes are not split, so a sleep gives back nothing");
-            return Ok(());
-        }
-        self.planes.release_segments(0, owner)
     }
 
     /// Creates the segments given back again at their addresses, the first `limit` of them or
@@ -1097,7 +1051,10 @@ mod tests {
     #[test]
     fn a_cache_with_no_device_lends_tensors_of_its_shapes() -> Result<()> {
         let cache = KvCacheMemory::meta(config())?;
-        assert_eq!(cache.device().location(), ops::meta().location());
+        assert_eq!(
+            cache.workspace()?.device().location(),
+            ops::meta().location()
+        );
 
         // The attention group: one column per layer, FP8 with a scale and a flag per unit.
         let planes = cache.planes(0)?;
@@ -1165,22 +1122,21 @@ mod tests {
     }
 
     /// The pooled table's last row names only the padding unit, whatever the slots hold, and
-    /// a slot's entries are the row its slot gathers.
+    /// slot `s`'s entries are row `s - 1`, which its slot gathers.
     #[test]
     fn the_padding_row_names_only_the_padding_unit() -> Result<()> {
         let mut cache = KvCacheMemory::meta(config())?;
-        assert_eq!(cache.padding_row(), 2);
-        assert_eq!((cache.table_row(1)?, cache.table_row(2)?), (0, 1));
-        assert!(cache.table_row(0).is_err() && cache.table_row(3).is_err());
 
         let changes = [allocated(1, 0, &[5, 6, 7]), allocated(2, 0, &[8])].concat();
         cache.apply(&changes, None)?;
+        // A slot outside the two the cache holds names no row.
+        assert!(cache.apply(&allocated(3, 0, &[9]), None).is_err());
 
         let rows = cache.host_table(0)?;
-        let row = |row: u32| &rows[row as usize * 4..(row as usize + 1) * 4];
-        assert_eq!(row(cache.table_row(1)?), [5, 6, 7, 0]);
-        assert_eq!(row(cache.table_row(2)?), [8, 0, 0, 0]);
-        assert_eq!(row(cache.padding_row()), [0, 0, 0, 0]);
+        let row = |row: usize| &rows[row * 4..(row + 1) * 4];
+        assert_eq!(row(0), [5, 6, 7, 0]);
+        assert_eq!(row(1), [8, 0, 0, 0]);
+        assert_eq!(row(2), [0, 0, 0, 0]);
         assert!(rows.iter().all(|unit| *unit != nn::NO_SLOT));
 
         // Entries that left name the padding unit again.
@@ -1280,8 +1236,6 @@ mod tests {
         assert_eq!(cache.mapped_bytes(), 0);
         assert!(cache.segments().is_none());
         assert!(cache.release_segments(0, &local).is_err());
-        // A sleep of planes that are not split gives back nothing.
-        cache.sleep(&local)?;
 
         cache.set_regions(regions(3))?;
         assert!(cache.copy(&[], None)?.is_empty());
@@ -1383,7 +1337,10 @@ mod tests {
             &crate::memory::exclusive::LocalStorage,
             &stream,
         )?;
-        assert_ne!(cache.device().location(), ops::meta().location());
+        assert_ne!(
+            cache.workspace()?.device().location(),
+            ops::meta().location()
+        );
         assert!(cache.mapped_bytes() > 0);
         assert_eq!(cache.planes(0)?[1].key.dims(), [16, 4, 1, 4]);
 
@@ -1479,7 +1436,8 @@ mod tests {
         let mapped = cache.mapped_bytes();
         assert!(held > 0);
 
-        cache.sleep(&local)?;
+        // A sleep gives back every segment.
+        cache.release_segments(0, &local)?;
         assert_eq!(cache.held_segments(), 0);
         assert!(cache.mapped_bytes() < mapped);
 

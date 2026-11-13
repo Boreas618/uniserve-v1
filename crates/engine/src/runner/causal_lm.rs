@@ -179,7 +179,7 @@ const SCORE_ROWS: usize = 64;
 pub struct CausalLmConfig {
     /// The phases the runner serves, as the scheduler names them in a batch.
     pub phases: Vec<Phase>,
-    /// The buckets the runner captures (`Buckets::for_batch`, `Buckets::default_causal_lm`):
+    /// The buckets the runner captures (`Buckets::for_batch`):
     /// their largest rows and tokens are the batch bound the rank admits.
     pub buckets: Buckets,
     /// Request slots: the rows of the slot state and of the pooled page tables, which hold one
@@ -648,7 +648,9 @@ impl CausalLmRunner {
     /// # Errors
     ///
     /// [`Error::Invalid`] for a config with no bucket.
-    #[expect(dead_code, reason = "no caller in the engine")]
+    // PORT §1.1 step 14 (the `image features` region); the missing caller is the text rank's
+    // division of a model with a vision tower.
+    #[expect(dead_code, reason = "no text rank start builds the vision runner")]
     pub(crate) fn image_bytes(config: &CausalLmConfig, model: &dyn TextModel) -> Result<u64> {
         Features::bytes(model, stated(config)?.1.tokens())
     }
@@ -663,7 +665,9 @@ impl CausalLmRunner {
     ///
     /// [`Error::Invalid`] for a model without a vision tower; the driver's refusal of the
     /// allocation.
-    #[expect(dead_code, reason = "no caller in the engine")]
+    // PORT §2.2 (`vision_features` copied into the causal runner's feature buffer); the missing
+    // caller is the text rank's opening of a model with a vision tower.
+    #[expect(dead_code, reason = "no text rank start builds the vision runner")]
     pub(crate) fn set_features(&mut self, memory: Arc<BufferMemory>, class: u8) -> Result<()> {
         let features = Features::new(
             &*self.model,
@@ -784,12 +788,6 @@ impl CausalLmRunner {
 
         self.scratch = scratch;
         Ok(())
-    }
-
-    /// The runner's config.
-    #[cfg_attr(not(test), expect(dead_code, reason = "only tests call it"))]
-    pub(crate) const fn config(&self) -> &CausalLmConfig {
-        &self.config
     }
 
     /// The head of input tensor `column`, as `shape`.

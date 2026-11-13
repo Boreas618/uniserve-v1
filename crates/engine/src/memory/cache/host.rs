@@ -40,13 +40,6 @@ use crate::worker::{Error, Result};
 /// The version of the page encoding above: pages of another version are another content.
 const PAGE_ENCODING: u32 = 1;
 
-/// The pages of the state group's block size between the checkpoints the host tier keeps of a
-/// long prompt: the scheduler stores a state group's checkpoint before every aligned
-/// boundary, those of the default `kv_cache_config.boundary_interval`, and before a prompt's
-/// last ones.
-#[cfg_attr(not(test), expect(dead_code, reason = "only tests call it"))]
-const STATE_SPACING: u64 = 64;
-
 /// The bytes of one host page of `group` of a cache of `layout`.
 fn page_bytes(layout: &CacheLayout, group: &GroupLayout) -> u64 {
     let planes = layout.page_planes(group);
@@ -56,26 +49,6 @@ fn page_bytes(layout: &CacheLayout, group: &GroupLayout) -> u64 {
 
     let scales = if layout.quantized { 2 * planes * 4 } else { 0 };
     2 * planes * layout.plane_bytes + scales + planes * layout.index_bytes()
-}
-
-/// The tokens one host page of `group` stands for: an attention or draft page holds its block
-/// size's, and a state group keeps one checkpoint per [`STATE_SPACING`] pages.
-#[cfg_attr(not(test), expect(dead_code, reason = "only tests call it"))]
-fn page_tokens(group: &GroupLayout) -> u64 {
-    let pages = if group.state() { STATE_SPACING } else { 1 };
-    u64::from(group.block_size) * pages
-}
-
-/// The bytes one token of `layout`'s pages takes in the host tier over every cache group: each
-/// group's page bytes over the tokens a page stands for, rounded up, so host regions of
-/// `tokens` tokens take at most `tokens` times as many bytes.
-#[cfg_attr(not(test), expect(dead_code, reason = "only tests call it"))]
-pub(crate) fn token_bytes(layout: &CacheLayout) -> u64 {
-    layout
-        .groups
-        .iter()
-        .map(|group| page_bytes(layout, group).div_ceil(page_tokens(group)))
-        .sum()
 }
 
 /// The spelling of a stored element type inside a page layout digest. The digest names the
@@ -526,12 +499,6 @@ mod tests {
             2 * 4 * (plane / 2) + 2 * 4 * 4
         );
         assert!(page_shape(&layout(PrefixCacheDtype::BFloat16), 1).is_err());
-
-        // A token takes its share of a page, rounded up.
-        assert_eq!(
-            token_bytes(&layout(PrefixCacheDtype::BFloat16)),
-            2 * 4 * plane / 64
-        );
         Ok(())
     }
 

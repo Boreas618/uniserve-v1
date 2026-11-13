@@ -339,49 +339,6 @@ pub fn call_window(depth: usize, calls: usize) -> Result<usize> {
     Ok((depth * calls).min(depth.max(2)))
 }
 
-/// The device bytes of the relay entries of `slots` request slots over a window of `window`
-/// unresolved calls ([`call_window`]): a region of the division whose owner states it by slot.
-///
-/// A slot holds one entry per unresolved call and the one before them, whose completion the
-/// oldest still reads on the device; the padding slot holds as many. An entry is one element
-/// of every scalar a call relays (`RELAY_ENTRY_BYTES`).
-#[cfg_attr(not(test), expect(dead_code, reason = "only tests call it"))]
-pub(crate) fn relay_bytes(slots: usize, window: usize) -> u64 {
-    ((slots + 1) * (window + 1)) as u64 * RELAY_ENTRY_BYTES
-}
-
-/// Bytes of one relay entry: the scalars a call relays to the call after it, its sampled token
-/// (`i64`) and its completion flag (`u8`).
-#[cfg_attr(not(test), expect(dead_code, reason = "only tests call it"))]
-const RELAY_ENTRY_BYTES: u64 = (size_of::<i64>() + size_of::<u8>()) as u64;
-
-/// Bytes of the reader-acknowledgment header of an export pool chunk: one `u32` word per
-/// consumer slot.
-#[cfg_attr(not(test), expect(dead_code, reason = "only tests call it"))]
-const EXPORT_HEADER_BYTES: u64 = 64 * size_of::<u32>() as u64;
-
-/// The alignment of an export pool chunk.
-#[cfg_attr(not(test), expect(dead_code, reason = "only tests call it"))]
-const EXPORT_CHUNK_ALIGNMENT: u64 = 512;
-
-/// The device bytes of a CUDA VMM export pool that holds `count` payloads of at most `bytes`
-/// each at once, every payload in a chunk of its own: the reader-word header and the payload,
-/// rounded up to the chunk alignment.
-///
-/// Cache pages, latent pages and buffer-pool outputs are exported where they lie, so the pool
-/// of a rank that exports relay scalars holds one chunk per live scalar: `count` is
-/// [`relay_bytes`], since a scalar is at least one byte, and `bytes` the widest scalar's.
-#[cfg_attr(not(test), expect(dead_code, reason = "only tests call it"))]
-pub(crate) fn export_pool_bytes(count: u64, bytes: u64) -> u64 {
-    let chunk = bytes
-        .saturating_add(EXPORT_HEADER_BYTES)
-        .saturating_add(EXPORT_CHUNK_ALIGNMENT - 1)
-        / EXPORT_CHUNK_ALIGNMENT
-        * EXPORT_CHUNK_ALIGNMENT;
-
-    count.saturating_mul(chunk)
-}
-
 #[cfg(test)]
 mod tests {
     use std::net::TcpListener;
@@ -744,19 +701,5 @@ mod tests {
 
         assert!(call_window(0, 16).is_err());
         assert!(call_window(1, 0).is_err());
-    }
-
-    #[test]
-    fn the_relay_entries_and_their_export_pool_follow_the_slots() {
-        // Eight slots and the padding slot, each with the window's two entries and the one
-        // before them.
-        let relay = relay_bytes(8, 2);
-        assert_eq!(relay, 9 * 3 * RELAY_ENTRY_BYTES);
-
-        // One chunk per live scalar: the 256-byte header and an eight-byte scalar round up to
-        // one 512-byte chunk.
-        assert_eq!(export_pool_bytes(relay, 8), relay * 512);
-        // A payload that fills the chunk with its header takes the next one.
-        assert_eq!(export_pool_bytes(1, 257), 1024);
     }
 }
