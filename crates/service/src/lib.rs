@@ -57,6 +57,32 @@ pub fn lock<T>(mutex: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, T> {
         .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
+/// Raises the soft limit on open descriptors to the hard limit. Descriptors cross processes in
+/// bulk ([`frame`]): a Storage Server holds one per retained storage of every worker on its
+/// host, and a rank receives one per part of a KV region's segments it maps, thousands of
+/// them for a large cache, which a soft limit of a thousand would refuse.
+///
+/// # Errors
+///
+/// What `getrlimit` or `setrlimit` fails with.
+pub fn raise_descriptor_limit() -> io::Result<()> {
+    let mut limit = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    // SAFETY: getrlimit fills the struct it is given.
+    if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+
+    limit.rlim_cur = limit.rlim_max;
+    // SAFETY: setrlimit reads the struct it is given.
+    if unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &limit) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
 /// The directory of the calling user's host services:
 /// `$XDG_RUNTIME_DIR/uniserve`, or `/tmp/uniserve-<uid>` without a runtime
 /// directory.

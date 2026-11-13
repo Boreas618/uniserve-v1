@@ -2,19 +2,23 @@
 //!
 //! Each value plane, and each state plane of a cache that keeps recurrent state, is made of
 //! segments along the units, each column's part of a segment one allocation, mapped back to back
-//! so the plane keeps its layout and addresses. The segments are
-//! the memory of the cache's buffer pool region: the epoch that creates the region splits its
-//! units into at most [`SEGMENTS`] segments ([`own`]), and every other epoch that names the
-//! region maps the same segments, as the region's segment table states them ([`of_table`]). The
-//! last segments are given back to the device when a region of another layout needs their
-//! storage, or all of them while the deployment sleeps, and created again at their addresses
-//! afterwards; the buffer pool gives none of their units to a block meanwhile.
+//! so the plane keeps its layout and addresses. A segment is the fewest units whose part of a
+//! plane's column is whole allocation granules ([`segment_units`]): 32 units of 64 KiB planes on
+//! a device of 2 MiB granules. Each column's part of a plane is its own allocation at its own
+//! address, so this is the finest step in which the planes' memory can exist, and every creation,
+//! release and creation again of memory is in whole segments: a region holds what its GPU's quota
+//! holds to within one granule of each of its allocations, at a start, a grow, a wake and a
+//! release alike.
+//!
+//! The segments are the memory of the cache's buffer pool region: the epoch that creates the
+//! region splits its numbering into them ([`own`]), and every other epoch that names the region
+//! maps the same segments, as the region's segment table states them ([`of_table`]). The last
+//! segments are given back to the device when a region of another layout needs their storage,
+//! when the device must make room for other storage, or all of them while the deployment sleeps,
+//! and created again at their addresses afterwards; the buffer pool gives none of their units to
+//! a block meanwhile.
 
 use crate::worker::{Error, Result};
-
-/// The most segments an epoch splits its own units into: the granularity in which the cache
-/// gives storage back, an eighth of it.
-pub(crate) const SEGMENTS: u32 = 8;
 
 /// One segment of a cache's value and state planes, as the rank that maps it takes it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -26,55 +30,12 @@ pub struct PlaneSegment {
     pub create: bool,
 }
 
-/// How a cache of `num_units` units splits its planes into segments whose every column's
-/// part is whole allocation granules of `granularity` bytes, with planes of `plane_bytes` per
-/// unit: the segments' count and the units each holds. `None` when the cache is too small to
-/// split, or not a multiple of the split ([`segmented_units`] rounds it).
-pub(crate) fn segment_layout(
-    num_units: u32,
-    plane_bytes: u64,
-    granularity: u64,
-) -> Option<(u32, u32)> {
-    let granule = granule_units(plane_bytes, granularity)?;
-    let segments = SEGMENTS.min(num_units / granule);
-    if segments == 0 {
-        return None;
-    }
-
-    let units = num_units / segments / granule * granule;
-    (units * segments == num_units).then_some((segments, units))
-}
-
-/// `num_units` rounded down to the largest cache whose planes split into segments
-/// ([`segment_layout`]); `num_units` itself when it is too small to split.
-pub fn segmented_units(num_units: u32, plane_bytes: u64, granularity: u64) -> u32 {
-    let Some(granule) = granule_units(plane_bytes, granularity) else {
-        return num_units;
-    };
-    let segments = SEGMENTS.min(num_units / granule);
-    if segments == 0 {
-        return num_units;
-    }
-    num_units / segments / granule * granule * segments
-}
-
-/// The fewest units of at least `num_units` that split into the segments [`segmented_units`]
-/// makes.
-pub(crate) fn segmented_units_above(num_units: u32, plane_bytes: u64, granularity: u64) -> u32 {
-    let Some(granule) = granule_units(plane_bytes, granularity) else {
-        return num_units;
-    };
-    let segments = SEGMENTS.min(num_units / granule);
-    if segments == 0 {
-        return num_units;
-    }
-
-    let step = granule * segments;
-    num_units.div_ceil(step) * step
-}
-
-/// The fewest units whose planes of `plane_bytes` fill whole granules.
-fn granule_units(plane_bytes: u64, granularity: u64) -> Option<u32> {
+/// The units of one segment of a cache whose planes take `plane_bytes` per unit on a device of
+/// allocation granules of `granularity` bytes: the fewest units whose part of a plane's column
+/// fills whole granules, `granularity / gcd(plane_bytes, granularity)`. One granule a column
+/// when the plane's bytes divide the granule, as a plane of a power of two bytes does. `None` for
+/// planes or granules of no bytes.
+pub(crate) fn segment_units(plane_bytes: u64, granularity: u64) -> Option<u32> {
     if plane_bytes == 0 || granularity == 0 {
         return None;
     }
@@ -86,8 +47,42 @@ fn granule_units(plane_bytes: u64, granularity: u64) -> Option<u32> {
     u32::try_from(granularity / a).ok()
 }
 
+/// How a cache of `num_units` units splits its planes into segments ([`segment_units`]): the
+/// segments' count and the units each holds. `None` when the cache holds no whole segment or is
+/// not a whole number of them ([`segmented_units`] rounds it).
+pub(crate) fn segment_layout(
+    num_units: u32,
+    plane_bytes: u64,
+    granularity: u64,
+) -> Option<(u32, u32)> {
+    let units = segment_units(plane_bytes, granularity)?;
+    let count = num_units / units;
+
+    (count > 0 && num_units.is_multiple_of(units)).then_some((count, units))
+}
+
+/// `num_units` rounded down to whole segments ([`segment_layout`]): less by under one segment;
+/// `num_units` itself when it holds no whole segment.
+pub fn segmented_units(num_units: u32, plane_bytes: u64, granularity: u64) -> u32 {
+    let Some(units) = segment_units(plane_bytes, granularity) else {
+        return num_units;
+    };
+    if num_units < units {
+        return num_units;
+    }
+    num_units / units * units
+}
+
+/// The fewest units of at least `num_units` that are whole segments ([`segment_layout`]).
+pub(crate) fn segmented_units_above(num_units: u32, plane_bytes: u64, granularity: u64) -> u32 {
+    let Some(units) = segment_units(plane_bytes, granularity) else {
+        return num_units;
+    };
+    num_units.div_ceil(units).saturating_mul(units).max(units)
+}
+
 /// The segments of a cache of `num_units` units that `epoch` creates whole: its units split
-/// into at most [`SEGMENTS`] equal segments ([`segment_layout`]), numbered from zero. `None`
+/// into segments of [`segment_units`] each ([`segment_layout`]), numbered from zero. `None`
 /// when the cache does not split.
 pub fn own(
     epoch: u64,
@@ -157,29 +152,38 @@ pub(crate) fn units(segments: &[PlaneSegment]) -> u32 {
 mod tests {
     use super::*;
 
-    /// A plane of a thirty-second of a granule fills a granule every thirty-two units. A cache
-    /// fitted to a capacity keeps what it was asked for, and one fitted to the storage rounds
-    /// into it.
+    /// A plane of a thirty-second of a granule fills a granule every thirty-two units: a segment
+    /// is 32 units, and a cache fitted to the storage loses fewer than 32 of what it holds, one
+    /// granule of each column's allocation.
     #[test]
-    fn a_capacity_rounds_up_to_whole_segments_and_a_fit_rounds_down() {
+    fn a_cache_rounds_to_whole_segments_of_one_granule_a_column() {
         let (plane, granule) = (1 << 16, 1 << 21);
+        assert_eq!(segment_units(plane, granule), Some(32));
 
-        assert_eq!(segmented_units(640, plane, granule), 512);
-        assert_eq!(segmented_units_above(640, plane, granule), 768);
-        assert_eq!(segmented_units_above(768, plane, granule), 768);
-        // Too few units for a segment of whole granules stay as they are.
-        assert_eq!(segmented_units_above(7, plane, granule), 7);
+        // Fitted to the storage, a cache rounds down by fewer units than a segment; fitted to a
+        // capacity, up by as few.
+        assert_eq!(segmented_units(11_007, plane, granule), 10_976);
+        assert_eq!(segmented_units(11_008, plane, granule), 11_008);
+        assert_eq!(segmented_units_above(10_977, plane, granule), 11_008);
+        assert_eq!(segmented_units_above(7, plane, granule), 32);
+        assert_eq!(segment_layout(11_008, plane, granule), Some((344, 32)));
+
+        // Too few units for one segment, or a cache that is not whole segments, does not split.
+        assert_eq!(segmented_units(7, plane, granule), 7);
         assert_eq!(segment_layout(7, plane, granule), None);
-        // A cache that is not a multiple of the split does not split until it is rounded.
-        assert_eq!(segment_layout(640, plane, granule), None);
-        assert_eq!(segment_layout(512, plane, granule), Some((8, 64)));
+        assert_eq!(segment_layout(11_007, plane, granule), None);
+
+        // A plane whose bytes do not divide the granule (72 KiB against 2 MiB) fills whole
+        // granules every 256 units, nine granules of a column.
+        assert_eq!(segment_units(72 << 10, granule), Some(256));
+        assert_eq!(segment_layout(1024, 72 << 10, granule), Some((4, 256)));
     }
 
     /// An epoch's own segments are equal and numbered from zero, and created where missing.
     #[test]
     fn own_segments_split_the_units() {
-        let segments = own(7, 512, 1 << 16, 1 << 21).expect("512 units split into eight");
-        assert_eq!(segments.len(), 8);
+        let segments = own(7, 512, 1 << 16, 1 << 21).expect("512 units split into sixteen");
+        assert_eq!(segments.len(), 16);
         assert_eq!(units(&segments), 512);
         assert!(
             segments
@@ -196,7 +200,7 @@ mod tests {
     /// keys its parts, so both epochs map the same storages.
     #[test]
     fn a_region_s_table_gives_the_segments_its_creating_epoch_made() -> Result<()> {
-        let made = own(3, 512, 1 << 16, 1 << 21).expect("512 units split into eight");
+        let made = own(3, 512, 1 << 16, 1 << 21).expect("512 units split into sixteen");
         let mut first = 0;
         let table: storage::runtime::Segments = made
             .iter()

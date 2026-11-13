@@ -1273,6 +1273,10 @@ fn the_e1_deployment_starts_within_its_gpu_s_quota_at_a_fraction_of_0_70() {
         crate::memory::cache::segments::segment_layout(units, layout.plane_bytes, GB200_GRANULE)
             .unwrap();
     assert_eq!(first, segment);
+
+    // A segment is one granule of each column's allocation: 32 units of the 64 KiB pages of four
+    // heads of 128 BF16 elements, so a region holds what the quota holds to within 32 units.
+    assert_eq!(u64::from(segment) * layout.plane_bytes, GB200_GRANULE);
     assert!(first >= crate::process::ranks::rank::memory::fewest_units(&layout));
 
     // Every reservation the Storage Server admits the rank with, and what the quota leaves. The

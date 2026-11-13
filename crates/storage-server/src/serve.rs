@@ -335,7 +335,7 @@ fn serve_on(options: &ServeOptions, ready: Option<service::Ready>) -> anyhow::Re
         signal(ready);
         return Ok(());
     };
-    raise_descriptor_limit()?;
+    service::raise_descriptor_limit().context("raising the descriptor limit")?;
     let (wake, stop) = service::stop_signals().context("installing the stop signals")?;
     let mut server = Server::new(
         listener,
@@ -360,7 +360,7 @@ fn serve_on(options: &ServeOptions, ready: Option<service::Ready>) -> anyhow::Re
 /// Go on with the server a restart in place's predecessor passes on over the
 /// handoff socket at `descriptor`, and serve until stopped.
 fn serve_resumed(options: &ServeOptions, descriptor: i32) -> anyhow::Result<()> {
-    raise_descriptor_limit()?;
+    service::raise_descriptor_limit().context("raising the descriptor limit")?;
     let (wake, stop) = service::stop_signals().context("installing the stop signals")?;
     let (mut server, lock) = Server::resume(
         descriptor,
@@ -425,24 +425,4 @@ fn transfer_launch(options: &ServeOptions) -> Launch {
         program: program.into(),
         arguments: command,
     }
-}
-
-/// Raise the soft limit on open descriptors to the hard limit: the server
-/// holds one descriptor per retained storage of every worker on the host,
-/// thousands for a large model.
-fn raise_descriptor_limit() -> anyhow::Result<()> {
-    let mut limit = libc::rlimit {
-        rlim_cur: 0,
-        rlim_max: 0,
-    };
-    // SAFETY: getrlimit fills the struct it is given.
-    if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) } != 0 {
-        return Err(std::io::Error::last_os_error()).context("reading the descriptor limit");
-    }
-    limit.rlim_cur = limit.rlim_max;
-    // SAFETY: setrlimit reads the struct it is given.
-    if unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &limit) } != 0 {
-        return Err(std::io::Error::last_os_error()).context("raising the descriptor limit");
-    }
-    Ok(())
 }

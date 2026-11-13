@@ -698,8 +698,7 @@ fn load_rank(
         Backing::Serving { storage, kernels } => (storage, kernels),
         Backing::Meta => {
             // The meta device allocates nothing, so each unit is a whole granule of it: its cache
-            // is the fewest units it serves with, rounded up to at most eight segments of whole
-            // units.
+            // is the fewest units it serves with, each unit a segment.
             let units = crate::memory::cache::segments::segmented_units_above(
                 least,
                 layout.plane_bytes,

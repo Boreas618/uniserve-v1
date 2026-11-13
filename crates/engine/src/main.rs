@@ -144,6 +144,8 @@ fn main() -> Result<ExitCode> {
     }
 
     follow_lifeline(lifeline);
+    // A rank receives and creates a descriptor per part of its KV region's segments.
+    service::raise_descriptor_limit().context("raising the descriptor limit")?;
     logging::init(
         "Engine",
         cli.log_level.as_deref(),

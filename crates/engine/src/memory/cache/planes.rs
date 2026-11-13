@@ -110,6 +110,30 @@ impl Segments {
             .sum()
     }
 
+    /// The units of `segments`, ascending segment indices, as runs `(first unit, units)`: the
+    /// segments that lie back to back join one run, so a cache of many segments resets what it
+    /// created with a fill per run rather than per segment.
+    fn unit_runs(&self, segments: &[u32]) -> Vec<(u32, u32)> {
+        let mut runs: Vec<(u32, u32)> = Vec::new();
+        let (mut next, mut first) = (0, 0);
+
+        for &index in segments {
+            // The first unit of segment `index`, summed on from the last segment visited.
+            for segment in &self.segments[next as usize..index as usize] {
+                first += segment.units;
+            }
+            let units = self.segments[index as usize].units;
+            next = index + 1;
+
+            match runs.last_mut() {
+                Some((start, count)) if *start + *count == first => *count += units,
+                _ => runs.push((first, units)),
+            }
+            first += units;
+        }
+        runs
+    }
+
     /// The parts of segments `range`, every column's.
     fn parts_of(&self, range: std::ops::Range<u32>) -> Vec<usize> {
         let count = self.count();
@@ -385,9 +409,8 @@ impl Planes {
             }
         }
         if let Some(segments) = &held.segments {
-            for segment in created_segments {
-                let count = segments.segments[segment as usize].units;
-                planes.reset_units(segments.first_unit(segment), count, true, stream)?;
+            for (first, count) in segments.unit_runs(&created_segments) {
+                planes.reset_units(first, count, true, stream)?;
             }
         }
         stream.synchronize()?;

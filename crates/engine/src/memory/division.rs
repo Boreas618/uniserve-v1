@@ -164,15 +164,7 @@ pub(crate) fn unreserved(
             && reservation.scope.as_ref() == Some(scope)
             && reservation.epochs == [epoch]
     });
-    let transfers = if quota
-        .reservations
-        .iter()
-        .any(|reservation| reservation.item == Item::TransferContext)
-    {
-        0
-    } else {
-        quota.transfer_context
-    };
+    let transfers = unheld_context(quota);
 
     let reserved = quota
         .usage()
@@ -186,6 +178,20 @@ pub(crate) fn unreserved(
     Ok(limit
         .saturating_sub(reserved)
         .min(free.saturating_add(kept)))
+}
+
+/// The bytes of the Transfer Server's CUDA context on the GPU of `quota` that the quota counts
+/// but does not reserve now: the context's measured bytes while the server holds no context
+/// there, which it reserves again before its next task on the GPU and which the quota refuses
+/// once a storage took that room; zero while it holds the context, whose reservation is in the
+/// quota's usage.
+pub(crate) fn unheld_context(quota: &Quota) -> u64 {
+    let held = quota
+        .reservations
+        .iter()
+        .any(|reservation| reservation.item == Item::TransferContext);
+
+    if held { 0 } else { quota.transfer_context }
 }
 
 /// The bytes by which the reservations of `quota` would pass its limit once a rank of `scope` and
@@ -207,15 +213,7 @@ pub(crate) fn excess(quota: &Quota, scope: &Scope, epoch: u64, process: u64) -> 
             && reservation.scope.as_ref() == Some(scope)
             && reservation.epochs == [epoch]
     });
-    let transfers = if quota
-        .reservations
-        .iter()
-        .any(|reservation| reservation.item == Item::TransferContext)
-    {
-        0
-    } else {
-        quota.transfer_context
-    };
+    let transfers = unheld_context(quota);
 
     Ok(quota
         .usage()

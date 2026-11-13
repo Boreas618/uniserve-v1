@@ -671,7 +671,9 @@ impl Server {
             .call(move |pools| pools.grant(&named, &region_name, segment, first, units))
             .ok_or_else(|| resource(std::io::Error::other("the buffer pool's thread ended")))?
             .map_err(|refusal| invalid(&format!("{region}: {refusal}")))?;
-        tracing::info!(
+        // A region's memory is hundreds of segments of one granule a column each, granted one by
+        // one: each is a debug line, and the head states what it granted at once.
+        tracing::debug!(
             deployment,
             region,
             epoch = segment.epoch,
@@ -699,7 +701,7 @@ impl Server {
             .call(move |pools| pools.withdraw(&named, &region_name, segment))
             .ok_or_else(|| resource(std::io::Error::other("the buffer pool's thread ended")))?
             .map_err(|refusal| invalid(&format!("{region}: {refusal}")))?;
-        tracing::info!(
+        tracing::debug!(
             deployment,
             region,
             epoch = segment.epoch,

@@ -501,41 +501,55 @@ impl StorageClient {
             })
     }
 
-    /// Publishes the storage of part `index` of `config`, which `descriptor` maps, as an
-    /// exclusive tensor of the rank's scope.
-    fn publish_segment(
+    /// Publishes the storages of the parts `created` of `config`, each as its index, its key and
+    /// the descriptor that maps it, as exclusive tensors of the rank's scope, in one request: the
+    /// Storage Server admits a request's new device storages against the GPU's quota at once,
+    /// so a cache of many segments is admitted once, not part by part.
+    fn publish_segments(
         state: &mut State,
         config: &SegmentedConfig<'_>,
-        index: usize,
-        key: Key,
+        created: &[(usize, Key, OwnedFd)],
         gpu: [u8; 16],
-        descriptor: &OwnedFd,
     ) -> Result<()> {
-        let part = &config.parts[index];
-        let bytes = part.length as u64;
+        if created.is_empty() {
+            return Ok(());
+        }
 
-        let record = StorageRecord {
-            location: Location::Device { gpu },
-            bytes,
-            // The quota reserves the storages of one segment together, as the cache's.
-            segment: Some(Segment {
-                epoch: part.segment.epoch,
-                ordinal: part.segment.ordinal,
-            }),
-            fabric: None,
-        };
-        let tensor = byte_tensor(
-            key,
-            segment_name(config.name, part),
-            0,
-            bytes,
-            Access::Exclusive,
-        );
+        let mut tensors = Vec::with_capacity(created.len());
+        let mut storages = Vec::with_capacity(created.len());
+        for (storage, (index, key, descriptor)) in created.iter().enumerate() {
+            let part = &config.parts[*index];
+            let bytes = part.length as u64;
+
+            let record = StorageRecord {
+                location: Location::Device { gpu },
+                bytes,
+                // The quota reserves the storages of one segment together, as the cache's.
+                segment: Some(Segment {
+                    epoch: part.segment.epoch,
+                    ordinal: part.segment.ordinal,
+                }),
+                fabric: None,
+            };
+            let mut tensor = byte_tensor(
+                *key,
+                segment_name(config.name, part),
+                0,
+                bytes,
+                Access::Exclusive,
+            );
+            // Each tensor lies in the storage of the same position in the request.
+            tensor.storage = u32::try_from(storage)
+                .map_err(|_| Error::Invalid("a cache plane has too many parts".into()))?;
+
+            tensors.push(tensor);
+            storages.push((record, descriptor.as_fd()));
+        }
 
         state
             .client
-            .put(vec![tensor], &[(record, descriptor.as_fd())])
-            .map_err(|error| storage_error("publishing a segment", error))
+            .put(tensors, &storages)
+            .map_err(|error| storage_error("publishing a cache plane's segments", error))
     }
 }
 
@@ -1026,6 +1040,13 @@ impl ExclusiveStorage for StorageClient {
             .map(|part| self.part_key(config.name, part, &gpu))
             .collect::<Result<_>>()?;
 
+        // Each part's index by its key: a plane of many segments has thousands of parts.
+        let indices: BTreeMap<Key, usize> = keys
+            .iter()
+            .enumerate()
+            .map(|(index, key)| (*key, index))
+            .collect();
+
         let (got, descriptors) = state
             .client
             .get(keys.clone(), Mode::Region, Vec::new())
@@ -1036,9 +1057,9 @@ impl ExclusiveStorage for StorageClient {
         // create nothing, and the storages not taken yet include other planes' segments, which
         // their owner takes next: the value planes' after the key planes'.
         let creates = got.missing.iter().any(|missing| {
-            keys.iter()
-                .position(|key| key == missing)
-                .is_some_and(|index| config.parts[index].create)
+            indices
+                .get(missing)
+                .is_some_and(|index| config.parts[*index].create)
         });
         if creates {
             let taking = got.tensors.iter().map(|tensor| tensor.key).collect();
@@ -1057,9 +1078,8 @@ impl ExclusiveStorage for StorageClient {
                 .get_mut(tensor.storage as usize)
                 .and_then(Option::take)
                 .ok_or_else(|| Error::Interface("a retained storage was named twice".into()))?;
-            let index = keys
-                .iter()
-                .position(|key| *key == tensor.key)
+            let index = *indices
+                .get(&tensor.key)
                 .ok_or_else(|| Error::Interface("an unasked segment was found".into()))?;
 
             if record.bytes as usize != config.parts[index].length {
@@ -1072,18 +1092,26 @@ impl ExclusiveStorage for StorageClient {
 
         let storage = Storage::segmented(config.device, &config.lengths(), config.access)?;
         let mut created = vec![false; keys.len()];
+        let mut made = Vec::new();
         for (index, key) in keys.iter().enumerate() {
             match found.remove(key) {
                 Some(descriptor) => storage.import_segment(index, &descriptor)?,
                 // A part nobody holds stays unmapped when it was given back.
                 None if !config.parts[index].create => continue,
                 None => {
-                    let descriptor = storage.create_segment(index)?;
-                    Self::publish_segment(state, config, index, *key, gpu, &descriptor)?;
+                    made.push((index, *key, storage.create_segment(index)?));
                     created[index] = true;
                 }
             }
-            state.taken.insert(*key);
+        }
+
+        // The parts created here are published together; until then they are this storage's
+        // alone, which drops them if the server refuses.
+        Self::publish_segments(state, config, &made, gpu)?;
+        for (index, key) in keys.iter().enumerate() {
+            if storage.segment_mapped(index)? {
+                state.taken.insert(*key);
+            }
         }
 
         Ok((storage, created))
@@ -1135,13 +1163,32 @@ impl ExclusiveStorage for StorageClient {
         let mut state = lock(&self.state);
         let gpu = state.gpu(config.device)?;
 
-        for &index in segments {
-            let key = self.part_key(config.name, &config.parts[index], &gpu)?;
-            let descriptor = storage.create_segment(index)?;
-            Self::publish_segment(&mut state, config, index, key, gpu, &descriptor)?;
+        // Created, then published together, as a cache's segments are admitted at once.
+        let mut made = Vec::with_capacity(segments.len());
+        let published = segments
+            .iter()
+            .try_for_each(|&index| {
+                let key = self.part_key(config.name, &config.parts[index], &gpu)?;
+                made.push((index, key, storage.create_segment(index)?));
+                Ok(())
+            })
+            .and_then(|()| Self::publish_segments(&mut state, config, &made, gpu));
 
-            state.taken.insert(key);
+        // A failure unmaps what this call created, which nothing retains: the parts are given
+        // back as they were, and a later call creates them again.
+        if let Err(error) = published {
+            for (index, _, _) in &made {
+                storage.release_segment(*index).map_err(|undo| {
+                    Error::Invariant(format!(
+                        "creating a cache plane's segments failed ({error}), and unmapping part \
+                         {index} it created failed too ({undo})"
+                    ))
+                })?;
+            }
+            return Err(error);
         }
+
+        state.taken.extend(made.iter().map(|(_, key, _)| *key));
         Ok(())
     }
 }

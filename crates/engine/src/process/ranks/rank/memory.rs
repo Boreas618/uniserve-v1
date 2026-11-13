@@ -402,8 +402,9 @@ impl ModelRunner {
         let units =
             division::cache_units(whole, layout.unit_bytes, u64::from(least), capacity, host)?;
 
-        // Whole segments of whole granules, an eighth of the cache each at most: what a resize
-        // across layouts, a sleep and a wake give back and create again.
+        // Whole segments, each the fewest units that fill whole granules of every column's
+        // allocation: what a start, a grow and a wake create and a release gives back, so the
+        // region numbers what the quota holds less under one granule of each allocation.
         let units = segments::segmented_units(units, layout.plane_bytes, granularity);
         if segments::segment_layout(units, layout.plane_bytes, granularity).is_none() {
             bail!(
@@ -694,7 +695,7 @@ mod tests {
     const GRANULE: u64 = 2 << 20;
 
     /// A dense cache of four layers whose planes take 32 KiB a unit, so 64 units fill a granule:
-    /// 1024 units split into eight segments of 128.
+    /// 1024 units split into sixteen segments of 64.
     fn layout() -> CacheLayout {
         CacheLayout::dense(64, 4, 2, 128, PrefixCacheDtype::BFloat16)
     }
@@ -708,12 +709,13 @@ mod tests {
     fn the_start_creates_the_whole_segments_the_quota_holds_beside_the_unsplit_planes() {
         let layout = layout();
         let unsplit = 1024 * (layout.unit_bytes - values(&layout));
-        let segment = 128 * values(&layout);
+        let segment = 64 * values(&layout);
 
-        // Three segments and most of a fourth fit beside the planes that are made whole.
+        // Three segments and most of a fourth fit beside the planes that are made whole: what is
+        // left is less than one segment, one granule of each column's allocation.
         assert_eq!(
             first_units(1024, &layout, GRANULE, unsplit + 4 * segment - 1),
-            384
+            192
         );
         // A quota that holds every segment holds the whole cache, and never more.
         assert_eq!(
@@ -752,16 +754,16 @@ mod tests {
         assert_eq!(layout.split_bytes(), planes);
         assert_eq!(layout.unit_bytes, planes + flags);
 
-        // 1024 units split into eight segments of 128: three of them and the flags of every unit
+        // 1024 units split into sixteen segments of 64: three of them and the flags of every unit
         // fit, and a byte less leaves two.
-        let segment = 128 * planes;
+        let segment = 64 * planes;
         assert_eq!(
             first_units(1024, &layout, GRANULE, 1024 * flags + 3 * segment),
-            384
+            192
         );
         assert_eq!(
             first_units(1024, &layout, GRANULE, 1024 * flags + 3 * segment - 1),
-            256
+            128
         );
     }
 
@@ -773,9 +775,9 @@ mod tests {
         let layout = layout();
         let fewest = fewest_units(&layout);
 
-        // 1024 units of 32 KiB planes split into eight segments of 128: one holds the fewest.
-        assert_eq!(warm_units(1024, &layout, GRANULE), 128);
-        assert!(fewest <= 128);
+        // 1024 units of 32 KiB planes split into sixteen segments of 64: one holds the fewest.
+        assert_eq!(warm_units(1024, &layout, GRANULE), 64);
+        assert!(fewest <= 64);
         // Segments of one unit each (a granule of one plane): as many as the fewest units take.
         assert_eq!(warm_units(8, &layout, layout.plane_bytes), fewest);
         // A cache that does not split creates no segment.
@@ -785,24 +787,27 @@ mod tests {
     #[test]
     fn a_region_new_to_the_quota_creates_what_it_holds_and_leaves_the_rest_given_back() {
         let layout = layout();
-        let (segments, stated) = plane_segments(2, (1024, 384), &layout, GRANULE, &[]).unwrap();
+        let (segments, stated) = plane_segments(2, (1024, 192), &layout, GRANULE, &[]).unwrap();
 
         // Every segment of the split is the cache's; the first three are created and granted,
-        // the rest left given back for a grow to create.
-        assert_eq!(segments.len(), 8);
-        assert_eq!(
-            segments.iter().map(|part| part.create).collect::<Vec<_>>(),
-            [true, true, true, false, false, false, false, false]
-        );
+        // the other thirteen left given back for a grow to create.
+        assert_eq!(segments.len(), 16);
+        let created: Vec<bool> = segments.iter().map(|part| part.create).collect();
+        assert_eq!(created[..4], [true, true, true, false]);
+        assert!(created[3..].iter().all(|create| !create));
         let segment = |ordinal| Segment { epoch: 2, ordinal };
         assert_eq!(
             stated,
             [
-                (segment(0), 0, 128),
-                (segment(1), 128, 128),
-                (segment(2), 256, 128)
+                (segment(0), 0, 64),
+                (segment(1), 64, 64),
+                (segment(2), 128, 64)
             ]
         );
+
+        // The quota's figure is rounded down to whole segments, never up: 191 units hold two.
+        let (_, stated) = plane_segments(2, (1024, 191), &layout, GRANULE, &[]).unwrap();
+        assert_eq!(stated.len(), 2);
 
         // A region with no segment, which the quota holds none of, cannot open.
         let error = plane_segments(2, (1024, 0), &layout, GRANULE, &[]).unwrap_err();
@@ -813,11 +818,11 @@ mod tests {
     fn a_region_another_epoch_named_maps_its_table_and_creates_what_the_quota_holds_past_it() {
         let layout = layout();
         let first = |ordinal| Segment { epoch: 1, ordinal };
-        let table = [(first(0), 0, 128), (first(1), 128, 128)];
+        let table = [(first(0), 0, 64), (first(1), 64, 64)];
 
         // The two segments of the table are mapped; the third, which the quota holds, is created.
-        let (segments, stated) = plane_segments(2, (1024, 384), &layout, GRANULE, &table).unwrap();
-        assert_eq!(segments.len(), 8);
+        let (segments, stated) = plane_segments(2, (1024, 192), &layout, GRANULE, &table).unwrap();
+        assert_eq!(segments.len(), 16);
         assert_eq!(segments[0].segment.epoch, 1);
         assert_eq!(
             stated,
@@ -826,18 +831,18 @@ mod tests {
                     epoch: 2,
                     ordinal: 2
                 },
-                256,
-                128
+                128,
+                64
             )]
         );
         assert!(segments[2].create && !segments[3].create);
 
         // A table that covers the whole cache needs nothing of the quota.
-        let whole: Vec<_> = (0..8)
-            .map(|ordinal| (first(ordinal), ordinal * 128, 128))
+        let whole: Vec<_> = (0..16)
+            .map(|ordinal| (first(ordinal), ordinal * 64, 64))
             .collect();
         let (segments, stated) = plane_segments(2, (1024, 0), &layout, GRANULE, &whole).unwrap();
-        assert_eq!(segments.len(), 8);
+        assert_eq!(segments.len(), 16);
         assert!(stated.is_empty());
     }
 }

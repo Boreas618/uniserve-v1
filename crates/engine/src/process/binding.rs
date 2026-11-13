@@ -254,7 +254,8 @@ impl Replacement {
 /// The room one device has beside what it holds.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct Room {
-    /// Bytes the deployment's quota of the GPU leaves.
+    /// Bytes the deployment's quota of the GPU leaves, the Transfer Server's context counted
+    /// whether the server holds it now or not (`division::unheld_context`).
     pub quota: u64,
     /// Bytes the device has free.
     pub free: u64,
@@ -265,6 +266,25 @@ pub(crate) struct Room {
 }
 
 impl Room {
+    /// The room of a device whose deployment's quota is `quota` and which has `free` bytes free,
+    /// for a rank of `epoch`: what the quota leaves, what the device has free, and what other
+    /// epochs of the deployment hold of the quota. A quota of no limit leaves what the device has.
+    pub(crate) fn of(quota: &storage::Quota, free: u64, epoch: u64) -> Self {
+        // The Transfer Server's context is counted whether it holds it now or not: a storage that
+        // took its room would have the quota refuse the context, and the task that needs it.
+        let reserved = quota
+            .usage()
+            .saturating_add(division::unheld_context(quota));
+
+        Self {
+            quota: quota
+                .limit
+                .map_or(free, |limit| limit.saturating_sub(reserved)),
+            free,
+            elsewhere: division::held_elsewhere(quota, epoch),
+        }
+    }
+
     /// Whether a load of `bytes` fits here once `given_back` bytes of the device leave. The graph
     /// pools a process gives back free the device and the quota alike, because a rank that serves
     /// reserves them in the quota and a suspension takes them out of it.
@@ -450,19 +470,12 @@ fn joined_tables(
     Ok(tables)
 }
 
-/// The room `rank`'s device has: what the deployment's quota of the GPU leaves, what the device
-/// has free, and what other epochs of the deployment hold of the quota.
+/// The room `rank`'s device has ([`Room::of`]).
 fn room_of(rank: &Rank) -> Result<Room> {
     let (quota, _) = rank.client.usage(rank.device)?;
     let free = rank.device.memory_info()?.free;
 
-    Ok(Room {
-        quota: quota
-            .limit
-            .map_or(free, |limit| limit.saturating_sub(quota.usage())),
-        free,
-        elsewhere: division::held_elsewhere(&quota, rank.client.epoch()),
-    })
+    Ok(Room::of(&quota, free, rank.client.epoch()))
 }
 
 /// What `cache`'s planes are made of and how many of their segments exist; none for planes that
@@ -2275,6 +2288,49 @@ mod tests {
     /// The JSON of `value`, as a peer answers it.
     fn json(value: &impl Serialize) -> String {
         serde_json::to_string(value).unwrap()
+    }
+
+    /// The room a grow creates segments in leaves the Transfer Server's context, which the server
+    /// reserves again before its next task on the GPU, whether it holds it now or not: segments of
+    /// one granule a column fill the quota to within one of them, so a room that counted an idle
+    /// context as free would have the quota refuse the context afterwards.
+    #[test]
+    fn a_device_s_room_leaves_the_transfer_server_s_context_held_or_not() {
+        const GIB: u64 = 1 << 30;
+        let reservation = |item, bytes| storage::protocol::Reservation {
+            item,
+            scope: None,
+            epochs: Vec::new(),
+            segment: None,
+            bytes,
+        };
+        let quota = |reservations| storage::Quota {
+            gpu: [0; 16],
+            deployment: "model".into(),
+            total: 2 * 70 * GIB,
+            limit: Some(70 * GIB),
+            reservations,
+            host_link_bytes_per_second: None,
+            transfer_context: GIB,
+        };
+
+        // 60 GiB of weights: the 1 GiB context leaves 9 GiB of the quota's other 10 whether it is
+        // idle or held, when it is among the reservations and counted once.
+        let idle = quota(vec![reservation(Item::Weights, 60 * GIB)]);
+        assert_eq!(Room::of(&idle, 100 * GIB, 1).quota, 9 * GIB);
+        let held = quota(vec![
+            reservation(Item::Weights, 60 * GIB),
+            reservation(Item::TransferContext, GIB),
+        ]);
+        assert_eq!(Room::of(&held, 100 * GIB, 1).quota, 9 * GIB);
+
+        // The device's free bytes bound a load too, and a quota of no limit leaves those alone.
+        assert!(!Room::of(&idle, 8 * GIB, 1).holds(9 * GIB, 0));
+        let unlimited = storage::Quota {
+            limit: None,
+            ..idle
+        };
+        assert_eq!(Room::of(&unlimited, 8 * GIB, 1).quota, 8 * GIB);
     }
 
     #[test]
