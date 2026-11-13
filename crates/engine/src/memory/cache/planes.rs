@@ -13,11 +13,11 @@
 //!
 //! The names key the storages at the Storage Server, where every epoch that names the cache's
 //! region and a restarted engine find them, so they stay as they are whatever this module is
-//! called. Every storage of the planes is the memory of the region: the value planes' segments are
-//! keyed by the segments the region's segment table names, and the other storages by the epoch
-//! of its first segment, the epoch whose ranks created the region's memory. Two epochs of one
-//! layout therefore address the same cells, and the worker that is given a unit resets its
-//! flags and scales before a batch writes it ([`Planes::reset_units`]).
+//! called. Every storage of the planes is the memory of the region: the segments of the value
+//! and state planes are keyed by the segments the region's segment table names, and the other
+//! storages by the epoch of its first segment, the epoch whose ranks created the region's memory.
+//! Two epochs of one layout therefore address the same cells, and the worker that is given a unit
+//! resets its flags and scales before a batch writes it ([`Planes::reset_units`]).
 //!
 //! An attention group's page is one unit and each of its layers one column, so a layer's keys
 //! are the contiguous `[units, block_size, kv_heads, head_dim]` of its column and a page id is
@@ -26,10 +26,12 @@
 //! storage in the same way, `[units, block_size / ratio, width]`, so a page's keys, values and
 //! index keys are addressed by one page id.
 //!
-//! On a device whose cache splits ([`super::segments`]), each value storage is segmented: the
-//! last segments are given back ([`Planes::release_segments`]) and created again at their
-//! addresses ([`Planes::restore_segments`]). The index keys are not segmented: like the flags,
-//! the scales and the state planes they are one storage that stays mapped.
+//! On a device whose cache splits ([`super::segments`]), each value storage and each state
+//! storage is segmented alike, since a state plane is a value plane's size and lies at the same
+//! cell: the last segments are given back ([`Planes::release_segments`]) and created again at
+//! their addresses ([`Planes::restore_segments`]), so a region's state grows and shrinks with its
+//! keys and values. The flags, the scales and the index keys are not segmented: they are one
+//! storage each that stays mapped, a fraction of a plane's bytes.
 
 use std::sync::Arc;
 
@@ -78,7 +80,7 @@ pub(crate) fn unit_runs(units: &[u32]) -> Vec<(u32, u32)> {
     runs
 }
 
-/// The segments of a device cache's value planes and which of them are mapped.
+/// The segments of a device cache's value and state planes and which of them are mapped.
 struct Segments {
     /// The segments in unit order.
     segments: Vec<crate::memory::cache::info::CacheSegment>,
@@ -86,9 +88,12 @@ struct Segments {
     released_from: u32,
     /// The cache's columns, which `parts` is laid out by.
     columns: u32,
-    /// Each value plane's parts, column-major: the part of segment `k` that column `c` holds
+    /// Each split storage's parts, column-major: the part of segment `k` that column `c` holds
     /// is `c · segments.len() + k`.
     parts: Vec<SegmentPart>,
+    /// The names of the split storages, in the order of [`DevicePlanes::split`]: both value
+    /// planes, then each state field run's.
+    names: Vec<String>,
 }
 
 impl Segments {
@@ -132,10 +137,33 @@ struct DevicePlanes {
     index_keys: Option<Arc<Storage>>,
     /// The state group's checkpoint planes, one storage per field run of a state page.
     state: Vec<Arc<Storage>>,
-    /// The value planes' segments, when the cache splits into them.
+    /// The segments of the value and state planes, when the cache splits into them.
     segments: Option<Segments>,
     /// Where the Storage Server retains every unit's bytes, run by run.
     runs: Vec<crate::memory::cache::info::CachePlaneRun>,
+}
+
+impl DevicePlanes {
+    /// The storages that split into segments, each with its name: both value planes, then each
+    /// state field run's. Empty when the planes do not split.
+    fn split(&self) -> Vec<(&str, &Arc<Storage>)> {
+        let Some(segments) = &self.segments else {
+            return Vec::new();
+        };
+        segments
+            .names
+            .iter()
+            .map(String::as_str)
+            .zip(self.values.iter().chain(&self.state))
+            .collect()
+    }
+}
+
+/// The names of the state storages of `layout`, one per field run of a state page.
+fn state_names(layout: &CacheLayout) -> Vec<String> {
+    (0..layout.state_fields())
+        .map(|run| format!("prefix_cache.state.{run}.values"))
+        .collect()
 }
 
 /// The unit pool's storage: on one device, or none for a cache that holds no device, whose
@@ -159,9 +187,9 @@ impl Planes {
     }
 
     /// Takes the planes of `units` units (the padding unit included) on `device` from `owner`,
-    /// the value planes in `parts` segments when the cache splits, and resets what was created
-    /// for this rank on `stream`, which is synchronized before returning: values, flags and
-    /// index keys zero, scales one.
+    /// the value and state planes in `parts` segments when the cache splits, and resets what was
+    /// created for this rank on `stream`, which is synchronized before returning: values, state
+    /// planes, flags and index keys zero, scales one.
     ///
     /// Planes that exist keep their contents, which are finite whatever they hold: another
     /// epoch that names the region serves from them, a restarted engine reads the pages its
@@ -209,10 +237,10 @@ impl Planes {
         };
 
         // The exclusive storages, in the order they are taken apart below: the value planes of
-        // a cache that does not split, the flags, the scales, the index keys, the state runs.
-        let state_names: Vec<String> = (0..layout.state_fields())
-            .map(|run| format!("prefix_cache.state.{run}.values"))
-            .collect();
+        // a cache that does not split, the flags, the scales, the index keys, and the state runs
+        // of a cache that does not split. A split cache takes its value and state planes in
+        // segments.
+        let state_names = state_names(&layout);
         let mut configs = Vec::new();
         if parts.is_none() {
             configs.extend(VALUES.map(|name| config(name, plane_bytes)));
@@ -224,7 +252,9 @@ impl Planes {
         if index_bytes > 0 {
             configs.push(config(INDEX_KEYS, index_bytes));
         }
-        configs.extend(state_names.iter().map(|name| config(name, plane_bytes)));
+        if parts.is_none() {
+            configs.extend(state_names.iter().map(|name| config(name, plane_bytes)));
+        }
 
         let mut runs = Vec::new();
         for config in &configs {
@@ -243,10 +273,12 @@ impl Planes {
         };
 
         // Whether the values are new as a whole, and the segments created beside ones that
-        // exist, whose units are reset alone.
+        // exist, whose units are reset alone. A split cache's state planes are new with its
+        // values, segment by segment.
         let values_created;
         let mut created_segments: Vec<u32> = Vec::new();
         let mut segmented = None;
+        let mut split_state = None;
 
         let values = match parts {
             None => {
@@ -255,13 +287,20 @@ impl Planes {
                 values
             }
             Some(parts) => {
-                let (values, segments, created) =
-                    take_segmented(&layout, parts, device, &peers, owner, &mut runs)?;
+                let (values, state, segments, created) = take_segmented(
+                    &layout,
+                    parts,
+                    &state_names,
+                    (device, &peers),
+                    owner,
+                    &mut runs,
+                )?;
                 values_created = created.len() == parts.len();
                 if !values_created {
                     created_segments = created;
                 }
                 segmented = Some(segments);
+                split_state = Some(state);
                 values
             }
         };
@@ -281,12 +320,18 @@ impl Planes {
             (None, false)
         };
 
-        let mut state = Vec::with_capacity(state_names.len());
-        let mut state_created = false;
-        for (storage, created) in taken {
-            state_created |= created;
-            state.push(storage);
-        }
+        let (state, state_created) = match split_state {
+            Some(state) => (state, values_created),
+            None => {
+                let mut state = Vec::with_capacity(state_names.len());
+                let mut state_created = false;
+                for (storage, created) in taken {
+                    state_created |= created;
+                    state.push(storage);
+                }
+                (state, state_created)
+            }
+        };
         if state.len() != state_names.len() {
             return Err(Error::Invariant(
                 "a state plane's storage is missing".into(),
@@ -385,11 +430,11 @@ impl Planes {
             .map_or(0, |segments| segments.released_from)
     }
 
-    /// The device bytes one unit of both value planes holds over every column: what a segment
-    /// gives back per unit, which the flags, scales, index keys and state planes are no part
-    /// of.
+    /// The device bytes one unit of the split planes holds over every column
+    /// ([`CacheLayout::split_bytes`]): what a segment gives back per unit, which the flags,
+    /// scales and index keys are no part of.
     pub(crate) fn unit_bytes(&self) -> u64 {
-        2 * u64::from(self.layout.columns) * self.layout.plane_bytes
+        self.layout.split_bytes()
     }
 
     /// The bytes the planes map on the device: the value planes' mapped segments, the flags,
@@ -403,7 +448,7 @@ impl Planes {
             storages.iter().map(|storage| storage.bytes() as u64).sum()
         };
 
-        // A segment is given back from both value planes, and the storages keep their length
+        // A segment is given back from every split storage, and the storages keep their length
         // while their segments are unmapped.
         let released = device.segments.as_ref().map_or(0, |segments| {
             let plane: u64 = segments
@@ -411,7 +456,7 @@ impl Planes {
                 .into_iter()
                 .map(|part| segments.parts[part].length as u64)
                 .sum();
-            plane * device.values.len() as u64
+            plane * device.split().len() as u64
         });
 
         bytes(&device.values).saturating_sub(released)
@@ -689,10 +734,10 @@ impl Planes {
     }
 
     /// Resets units `[first, first + count)` of every column with fills issued on `stream`:
-    /// flags zero, scales one, and the values zero when `values`. The index keys stay as they
-    /// are: they have no flag, and a unit's next owner reads no key before it stored it. The
-    /// values of segmented planes fill column by column: a fill's rows may not span a segment
-    /// given back, which the driver refuses although no row touches it.
+    /// flags zero, scales one, and the values and state planes zero when `values`. The index
+    /// keys stay as they are: they have no flag, and a unit's next owner reads no key before it
+    /// stored it. The planes of a split cache fill column by column: a fill's rows may not span
+    /// a segment given back, which the driver refuses although no row touches it.
     pub(crate) fn reset_units(
         &self,
         first: u32,
@@ -711,15 +756,15 @@ impl Planes {
         let plane = self.layout.plane_bytes as usize;
         let (first, count) = (first as usize, count as usize);
 
-        for field in 0..2 {
-            // SAFETY: every row lies inside a storage this value owns: units
-            // `[first, first + count)` of each column, a column's units apart. The caller has
-            // those units mapped and orders the fills before their readers.
-            unsafe {
-                if values {
-                    let base = device.values[field].address() + (first * plane) as u64;
-                    let (rows, pitch) = (count * plane, units * plane);
+        if values {
+            for storage in device.values.iter().chain(&device.state) {
+                let base = storage.address() + (first * plane) as u64;
+                let (rows, pitch) = (count * plane, units * plane);
 
+                // SAFETY: every row lies inside a storage this value owns: units
+                // `[first, first + count)` of each column, a column's units apart. The caller
+                // has those units mapped and orders the fills before their readers.
+                unsafe {
                     if device.segments.is_some() {
                         for column in 0..columns {
                             fill(stream, base + (column * pitch) as u64, 0, 1, rows)?;
@@ -728,7 +773,14 @@ impl Planes {
                         fill_rows(stream, base, pitch, 0, 1, rows, columns)?;
                     }
                 }
+            }
+        }
 
+        for field in 0..2 {
+            // SAFETY: every row lies inside a storage this value owns: units
+            // `[first, first + count)` of each column, a column's units apart. The caller has
+            // those units mapped and orders the fills before their readers.
+            unsafe {
                 let flags = device.initialized[field].address() + first as u64;
                 fill_rows(stream, flags, units, 0, 1, count, columns)?;
 
@@ -851,23 +903,23 @@ impl Planes {
         Ok(())
     }
 
-    /// The config the value storage `field` was taken with, over `segments`' parts.
+    /// The config the split storage `name` was taken with, over `segments`' parts.
     fn segmented_config<'a>(
         device: &'a DevicePlanes,
         segments: &'a Segments,
-        field: usize,
+        name: &'a str,
     ) -> SegmentedConfig<'a> {
         SegmentedConfig {
-            name: VALUES[field],
+            name,
             device: device.device,
             parts: &segments.parts,
             access: &device.peers,
         }
     }
 
-    /// Gives back the storage of the value planes' segments from `first` on, every column's,
-    /// through `owner`, which retained them. The buffer pool gives none of their units to a
-    /// block and no device work addresses them any more.
+    /// Gives back the storage of the segments of the value and state planes from `first` on,
+    /// every column's, through `owner`, which retained them. The buffer pool gives none of their
+    /// units to a block and no device work addresses them any more.
     ///
     /// # Errors
     ///
@@ -901,10 +953,10 @@ impl Planes {
         }
 
         let indices = segments.parts_of(first..from);
-        for field in 0..device.values.len() {
+        for (name, storage) in device.split() {
             owner.release_segments(
-                &Self::segmented_config(device, segments, field),
-                &device.values[field],
+                &Self::segmented_config(device, segments, name),
+                storage,
                 &indices,
             )?;
         }
@@ -924,9 +976,9 @@ impl Planes {
 
     /// Creates the segments given back again at their addresses, the first `limit` of them or
     /// all, through `owner`, and resets their units on `stream`, which is synchronized before
-    /// returning: values and flags zero, scales one.
+    /// returning: values, state planes and flags zero, scales one.
     ///
-    /// A wake brings back every asked segment of both value planes or none: a failure part way
+    /// A wake brings back every asked segment of every split plane or none: a failure part way
     /// is undone here, so the count of held segments still agrees with the mappings and the
     /// next wake asks the server for segments that do not exist.
     ///
@@ -980,10 +1032,9 @@ impl Planes {
                 .as_ref()
                 .ok_or(Error::State("the cache's segments are gone"))?;
 
-            for field in 0..device.values.len() {
-                let config = Self::segmented_config(device, segments, field);
-                if let Err(error) = owner.restore_segments(&config, &device.values[field], &indices)
-                {
+            for (name, storage) in device.split() {
+                let config = Self::segmented_config(device, segments, name);
+                if let Err(error) = owner.restore_segments(&config, storage, &indices) {
                     failure = Some(error);
                     break;
                 }
@@ -1008,10 +1059,10 @@ impl Planes {
                 .as_ref()
                 .ok_or(Error::State("the cache's segments are gone"))?;
 
-            for field in 0..restored {
-                let config = Self::segmented_config(device, segments, field);
+            for (name, storage) in device.split().into_iter().take(restored) {
+                let config = Self::segmented_config(device, segments, name);
                 owner
-                    .release_segments(&config, &device.values[field], &indices)
+                    .release_segments(&config, storage, &indices)
                     .map_err(|undo| {
                         Error::Invariant(format!(
                             "a wake failed ({error}), and giving the {restored} storage(s) it \
@@ -1081,16 +1132,23 @@ fn cell_runs(
         .collect())
 }
 
-/// Takes both value planes of `layout` in `parts` segments from `owner`, adding their runs to
-/// `runs`. Returns the storages, the segments' state and the segments created for this rank.
+/// The storages a split cache takes in segments: both value planes, then each state field
+/// run's, as [`take_segmented`] returns them.
+type Split = ([Arc<Storage>; 2], Vec<Arc<Storage>>, Segments, Vec<u32>);
+
+/// Takes both value planes of `layout` and its state planes `state` (one per field run) in
+/// `parts` segments on `device`, which `peers` address, from `owner`, adding their runs to
+/// `runs`. A state plane is a value plane's size and is split alike, so a segment holds every
+/// plane of its units. Returns the value storages, the state storages, the segments' state and
+/// the segments created for this rank.
 fn take_segmented(
     layout: &CacheLayout,
     parts: &[PlaneSegment],
-    device: DeviceId,
-    peers: &[DeviceId],
+    state: &[String],
+    (device, peers): (DeviceId, &[DeviceId]),
     owner: &dyn ExclusiveStorage,
     runs: &mut Vec<crate::memory::cache::info::CachePlaneRun>,
-) -> Result<([Arc<Storage>; 2], Segments, Vec<u32>)> {
+) -> Result<Split> {
     let count = parts.len() as u32;
     let columns = layout.columns;
     let plane_bytes = layout.plane_bytes as usize;
@@ -1107,9 +1165,14 @@ fn take_segmented(
         })
         .collect();
 
-    let mut storages = Vec::with_capacity(2);
+    let names: Vec<String> = VALUES
+        .iter()
+        .map(|name| (*name).to_owned())
+        .chain(state.iter().cloned())
+        .collect();
+    let mut storages = Vec::with_capacity(names.len());
     let mut created = vec![false; parts.len()];
-    for name in VALUES {
+    for name in &names {
         let config = SegmentedConfig {
             name,
             device,
@@ -1142,22 +1205,21 @@ fn take_segmented(
         }
         storages.push(storage);
     }
-    let [key, value]: [Arc<Storage>; 2] = storages
-        .try_into()
-        .map_err(|_| Error::Invariant("a cache holds a key plane and a value plane".into()))?;
 
     // Segments given back, which no rank of the region holds, are the same ones of every
-    // column of both planes, from one segment on.
-    let mapped = |segment: u32, column: u32| -> Result<(bool, bool)> {
+    // column of every split plane, from one segment on.
+    let mapped = |segment: u32, column: u32| -> Result<Vec<bool>> {
         let index = (column * count + segment) as usize;
-        Ok((key.segment_mapped(index)?, value.segment_mapped(index)?))
+        storages
+            .iter()
+            .map(|storage| storage.segment_mapped(index))
+            .collect()
     };
     let mut released_from = count;
     for segment in 0..count {
         let mut all_gone = true;
         for column in 0..columns {
-            let (key, value) = mapped(segment, column)?;
-            all_gone &= !key && !value;
+            all_gone &= mapped(segment, column)?.iter().all(|mapped| !mapped);
         }
         if all_gone {
             released_from = segment;
@@ -1166,8 +1228,7 @@ fn take_segmented(
     }
     for column in 0..columns {
         for segment in 0..count {
-            let (key, value) = mapped(segment, column)?;
-            let gone = !key || !value;
+            let gone = mapped(segment, column)?.iter().any(|mapped| !mapped);
             if gone != (segment >= released_from) {
                 return Err(Error::Invalid(format!(
                     "the cache planes' segment {segment} of column {column} is {} while the \
@@ -1178,17 +1239,24 @@ fn take_segmented(
         }
     }
 
+    let mut storages = storages.into_iter();
+    let (Some(key), Some(value)) = (storages.next(), storages.next()) else {
+        return Err(Error::Invariant(
+            "a cache holds a key plane and a value plane".into(),
+        ));
+    };
     let segments = Segments {
         segments: parts.iter().map(|part| part.segment).collect(),
         released_from,
         columns,
         parts: segment_parts,
+        names,
     };
     let created = (0..count)
         .filter(|segment| created[*segment as usize])
         .collect();
 
-    Ok(([key, value], segments, created))
+    Ok(([key, value], storages.collect(), segments, created))
 }
 
 /// Fills `rows` rows of `count` elements of `width` bytes with `value`, `pitch` bytes apart,

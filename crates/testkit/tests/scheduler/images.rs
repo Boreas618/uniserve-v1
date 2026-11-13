@@ -12,12 +12,14 @@
 use engine::batch::Phase;
 use engine::batch::product::VISION_FEATURES;
 use engine::scheduler::Message;
+use proto::request::wire::WeightsInFlight;
 use proto::request::{Event, GenerationRequest, ImageEncoder, ImageEncoderInput, RequestId};
 use storage::Key;
 use storage::key::{Digest, encoder_output};
 use storage::runtime::{Completion, Request};
 
-use crate::harness::{Deployment, Harness, chat_image, row_positions};
+use crate::harness::{A, Deployment, Harness, chat_image, row_positions};
+use crate::pause_flush_resize::flush;
 
 /// The cache rows of every image of these cases.
 const ROWS: u32 = 6;
@@ -338,4 +340,50 @@ fn an_encoder_output_is_keyed_with_the_identity_of_the_weights_that_computed_it(
         })
         .collect();
     assert_ne!(keys[0], keys[1]);
+}
+
+/// A weight update keys the encoder outputs computed after it by the new weights' identity, which
+/// its `Flush` states for the group that encodes: the same image shown again is not read from the
+/// output the old weights computed, and its new output is committed under the new identity (SD
+/// §2.4 `Flush`, §4.3; E11: no request reads a block other weights computed).
+#[test]
+fn a_weight_update_keys_the_encoder_outputs_after_it_by_the_new_weights() {
+    let mut harness = Deployment::tokens()
+        .images()
+        .encoder_identity("vision-weights-a")
+        .build();
+    let first = chat_image(1, 12, ROWS, 2);
+    harness.submit(first.clone());
+    harness.settle(100);
+    let old = output_key("vision-weights-a", digest(&first));
+    let committed = of_outputs(&harness, 0);
+    assert!(
+        matches!(&committed[..], [.., Request::Commit { key, .. }] if *key == old),
+        "{committed:?}"
+    );
+
+    let seeds = (
+        vec![Key([9; 32])],
+        7,
+        vec![(A, "vision-weights-b".to_owned())],
+    );
+    let flushed = flush(&mut harness, Some(seeds), WeightsInFlight::Keep);
+    assert!(flushed.is_ok(), "{flushed:?}");
+    harness.settle(100);
+
+    let skip = harness.taken().len();
+    let again = showing(2, 1, 2);
+    let id = harness.submit(again.clone());
+    harness.settle(100);
+    // The scheduler knows no output under the new identity, so it pins none: the image is
+    // encoded again and its output committed under the new weights' key.
+    let new = output_key("vision-weights-b", digest(&again));
+    assert_ne!(new, old);
+    let asked = of_outputs(&harness, skip);
+    let [Request::Allocate { .. }, Request::Commit { key, .. }] = &asked[..] else {
+        panic!("{asked:?}");
+    };
+    assert_eq!(*key, new);
+    assert_eq!(harness.batches_of_phase(id, Phase::VisionEncode).len(), 1);
+    assert_eq!(harness.tokens(id).len(), 2);
 }

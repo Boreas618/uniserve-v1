@@ -2479,6 +2479,7 @@ mod tests {
         let opened = runtime::Opened {
             regions: vec![(4, 256), (5, 256), (6, 256)],
             segments: Vec::new(),
+            limits: Vec::new(),
             registers: vec![runtime::Registers {
                 completed: vec![0],
                 capacity: vec![(4, 1), (5, 4), (6, 7)],

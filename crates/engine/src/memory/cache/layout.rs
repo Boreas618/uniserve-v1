@@ -534,6 +534,14 @@ impl CacheLayout {
         self.checkpoint_planes().div_ceil(capacity)
     }
 
+    /// The device bytes one unit holds over every column in the planes a device cache splits
+    /// into segments: both value planes and each state field run's plane, which a segment's
+    /// release gives back and its creation takes (`crate::memory::cache::segments`). The flags,
+    /// scales and index keys of a unit are no part of it.
+    pub fn split_bytes(&self) -> u64 {
+        (2 + u64::from(self.state_fields())) * u64::from(self.columns) * self.plane_bytes
+    }
+
     /// The bytes of the snapshot a recurrent-state copy moves a state page through: every
     /// checkpoint plane of the page. It is taken from the device's scratch pool once
     /// ([`StateMemory`](crate::memory::state::StateMemory)); zero for a cache that keeps no

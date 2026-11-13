@@ -737,6 +737,7 @@ mod tests {
             eos_token_ids: Vec::new(),
             feature_bytes: 0,
             encoder_identity: String::new(),
+            latent_seed: 0,
             media_bytes,
             call_window: 2,
             cache_groups: Vec::new(),
@@ -973,6 +974,7 @@ mod tests {
         let opened = runtime::Opened {
             regions: vec![(4, 1 << 20), (5, 1 << 20), (6, 1 << 20)],
             segments: Vec::new(),
+            limits: Vec::new(),
             registers: vec![runtime::Registers {
                 completed: (0..ids.len() as u32).collect(),
                 capacity: vec![(4, 4), (5, 7), (6, 10)],

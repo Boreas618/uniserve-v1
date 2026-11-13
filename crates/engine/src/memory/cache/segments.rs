@@ -1,7 +1,8 @@
-//! The segments a device cache's value planes are made of.
+//! The segments a device cache's value and state planes are made of.
 //!
-//! Each value plane is made of segments along the units, each column's part of a segment one
-//! allocation, mapped back to back so the plane keeps its layout and addresses. The segments are
+//! Each value plane, and each state plane of a cache that keeps recurrent state, is made of
+//! segments along the units, each column's part of a segment one allocation, mapped back to back
+//! so the plane keeps its layout and addresses. The segments are
 //! the memory of the cache's buffer pool region: the epoch that creates the region splits its
 //! units into at most [`SEGMENTS`] segments ([`own`]), and every other epoch that names the
 //! region maps the same segments, as the region's segment table states them ([`of_table`]). The
@@ -15,7 +16,7 @@ use crate::worker::{Error, Result};
 /// gives storage back, an eighth of it.
 pub(crate) const SEGMENTS: u32 = 8;
 
-/// One segment of a cache's value planes, as the rank that maps it takes it.
+/// One segment of a cache's value and state planes, as the rank that maps it takes it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PlaneSegment {
     /// The segment: the epoch that created its storage, its ordinal there and its units.
@@ -25,7 +26,7 @@ pub struct PlaneSegment {
     pub create: bool,
 }
 
-/// How a cache of `num_units` units splits its value planes into segments whose every column's
+/// How a cache of `num_units` units splits its planes into segments whose every column's
 /// part is whole allocation granules of `granularity` bytes, with planes of `plane_bytes` per
 /// unit: the segments' count and the units each holds. `None` when the cache is too small to
 /// split, or not a multiple of the split ([`segmented_units`] rounds it).

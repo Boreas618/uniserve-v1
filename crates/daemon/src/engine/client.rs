@@ -563,7 +563,7 @@ impl EngineClient {
             .map(Response::results)
     }
 
-    /// Runs the data plane's operation `name` with the JSON `payload`, and
+    /// Runs the engine's operation `name` with the JSON `payload`, and
     /// returns each rank's JSON result.
     ///
     /// # Errors

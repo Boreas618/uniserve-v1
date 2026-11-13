@@ -197,6 +197,24 @@ impl BufferPool {
             .unwrap_or_default()
     }
 
+    /// The limit of the numbering of a region: the units from 0 its
+    /// memory space's units are numbered up to.
+    pub fn limit_of(&self, region: u8) -> u32 {
+        self.numbering(region).map_or(0, |(_, _, (_, limit))| limit)
+    }
+
+    /// The limit of the numbering a layout's region `stated` is opened with:
+    /// that of the region the pool holds under its name, whose numbering
+    /// stays what the session that first named it stated, else the one it
+    /// states. Two epochs of one layout whose engines measured their devices
+    /// differently thereby number one region alike.
+    fn stated_limit(&self, stated: &storage::runtime::Region) -> u32 {
+        self.regions
+            .iter()
+            .find(|region| region.name == stated.name)
+            .map_or(stated.limit, |region| region.span().1)
+    }
+
     /// The number of the region stated under `name`.
     pub fn region_number(&self, name: &str) -> Option<u8> {
         let found = self.regions.iter().position(|region| region.name == name)?;
@@ -271,14 +289,16 @@ impl BufferPool {
     /// region states none is granted that region's units asked for on the
     /// device, memory of the ranks' own processes, and its whole numbering
     /// on the host, whose memory the server creates; the space's other
-    /// regions grow from what that leaves. Returns, per region of the
-    /// layout, its number and its units.
+    /// regions grow from what that leaves. A region the pool holds keeps
+    /// its numbering, whatever limit the layout states for it
+    /// ([`Self::limit_of`] answers it). Returns, per region of the layout,
+    /// its number and its units.
     ///
     /// # Errors
     ///
     /// Refuses, changing nothing, a layout that does not fit: a name stated
     /// twice, a region stated again with another tier, space, unit size or
-    /// numbering, a segment that cannot join its space's table, an index
+    /// reserved units, a segment that cannot join its space's table, an index
     /// that names no region of the right tier, a group of no scheduler's or
     /// of two, more than [`MEMORIES`] device memories over the pool's
     /// sessions, or more regions than a run can number.
@@ -307,7 +327,8 @@ impl BufferPool {
             };
             // The segments the epoch's ranks created that the space's
             // table lacks join it, before its regions grow.
-            let numbering = (space, stated.unit_bytes, (stated.reserved, stated.limit));
+            let limit = self.stated_limit(stated);
+            let numbering = (space, stated.unit_bytes, (stated.reserved, limit));
             for segment in &stated.segments {
                 if !self.tabled(space, segment) {
                     self.enter_segment(numbering, *segment);
@@ -420,10 +441,11 @@ impl BufferPool {
                 ));
             }
             let space = self.spaces.iter().position(|space| *space == region.space);
+            let limit = self.stated_limit(region);
             for segment in &region.segments {
                 let (identity, first, units) = *segment;
                 let end = first.checked_add(units);
-                if units == 0 || end.is_none_or(|end| end > region.limit) {
+                if units == 0 || end.is_none_or(|end| end > limit) {
                     return Err(format!(
                         "region {} states segment {}/{} past its numbering",
                         region.name, identity.epoch, identity.ordinal
@@ -445,7 +467,7 @@ impl BufferPool {
                 if let Some(space) = space.map(|space| space as u8)
                     && !self.tabled(space, segment)
                 {
-                    let numbering = (space, region.unit_bytes, (region.reserved, region.limit));
+                    let numbering = (space, region.unit_bytes, (region.reserved, limit));
                     if let Some(refusal) = self.ungrantable(numbering, *segment) {
                         return Err(format!("region {}: {refusal}", region.name));
                     }
@@ -463,6 +485,8 @@ impl BufferPool {
             if !names.insert(region.name.as_str()) {
                 return Err(format!("region {} is stated twice", region.name));
             }
+            // The units a layout asks for lie in the numbering it states; of a region the pool
+            // holds, it gets those its own numbering has.
             let end = region.reserved.checked_add(region.units);
             // A unit is a whole number of parts, one on each rank that holds one.
             let parts = region.part_bytes > 0 && region.unit_bytes % region.part_bytes == 0;
@@ -483,13 +507,15 @@ impl BufferPool {
                     region.tier
                 ));
             }
+            // A region the pool holds keeps its numbering, whatever limit the layout states;
+            // everything else that lays its units out is the same.
             if let Some(found) = self.regions.iter().find(|found| found.name == region.name) {
                 let space = self.spaces.get(usize::from(found.space));
                 let same = found.tier == region.tier
                     && space == Some(&region.space)
                     && found.unit_bytes == region.unit_bytes
                     && found.part_bytes == region.part_bytes
-                    && found.span() == (region.reserved, region.limit);
+                    && found.span().0 == region.reserved;
                 if !same {
                     return Err(format!(
                         "region {} is stated with another layout than before",

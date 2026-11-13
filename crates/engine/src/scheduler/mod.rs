@@ -178,13 +178,11 @@ pub enum Message {
     /// Drop the policy kept for rollback.
     CommitPolicy,
     /// Evict every cached block the scheduler knows of, the requests it holds continuing as the
-    /// [`WeightsInFlight`] says (`Keep`, `Recompute`, `Abort`). With a weight update's seeds,
-    /// the page seed of each cache group and the latent seed of stored trajectories from here on.
-    Flush(
-        Option<(Vec<Key>, u64)>,
-        WeightsInFlight,
-        Sender<Result<(), Error>>,
-    ),
+    /// [`WeightsInFlight`] says (`Keep`, `Recompute`, `Abort`). With a weight update's
+    /// [`Seeds`], what keys the blocks computed from here on, as the new weights' `Capacity`
+    /// would state it. The reply refuses seeds whose encoder identities differ between the
+    /// scheduler's groups, changing nothing.
+    Flush(Option<Seeds>, WeightsInFlight, Sender<Result<(), Error>>),
     /// `Resize { region, units }` at the buffer pool, the region by its number; the reply, sent at
     /// its `Resized`, is the units the region reached, which a shrink and a grow may stop short of.
     Resize(u8, u32, Sender<u32>),
@@ -194,6 +192,12 @@ pub enum Message {
     /// End every request the scheduler holds, aborted, and stop.
     Shutdown,
 }
+
+/// What keys the blocks a scheduler computes, as a weight update's `Flush` renews it for the new
+/// weights: the page seed of each cache group in class order (`Capacity::seeds`), the latent seed
+/// of stored trajectories (`Capacity::latent_seed`), and per worker group whose ranks encode, the
+/// identity of the weights that compute its encoder outputs (`Capacity::encoder_identity`).
+pub type Seeds = (Vec<Key>, u64, Vec<(GroupId, String)>);
 
 /// What leaves the scheduler's thread, on its one channel (vLLM's `EngineCoreOutputs`).
 #[derive(Debug)]
@@ -309,10 +313,11 @@ pub struct Scheduler {
     seeds: Vec<Key>,
     /// The identity of the weights that compute the scheduler's encoder outputs, which keys them
     /// (`encoder_output`, SD §4.3): what its encoding groups state (`Capacity::encoder_identity`),
-    /// empty when none does.
+    /// empty when none does. A weight update's `Flush` replaces it with `seeds`.
     encoder_identity: String,
-    /// The seed of the keys of stored trajectories (`latent_content`, SD §4.3), replaced with
-    /// `seeds`; 0 until stated.
+    /// The seed of the keys of stored trajectories (`latent_content`, SD §4.3): what its
+    /// denoising groups state (`Capacity::latent_seed`), 0 when none does. A weight update's
+    /// `Flush` replaces it with `seeds`.
     latent_seed: u64,
     /// Per region, the `Store`s to the host into it that stored a block (answered `Stored` after
     /// their copy ran): a block whose own `Store` stored nothing waits for this count, among
@@ -453,18 +458,16 @@ impl Scheduler {
         // The page seeds every group of the scheduler states for its cache groups, one per class
         // in class order: one key chain serves all of them, so groups that state seeds must state
         // the same. A group without a KV cache states none. Likewise the identity that keys its
-        // encoder outputs: a request's outputs are found under one key whichever of its groups
-        // computed them. A group that encodes nothing states none.
+        // encoder outputs and the seed that keys its stored trajectories: a request's outputs
+        // and trajectory are found under one key whichever of its groups computed them. A group
+        // that encodes nothing, or denoises nothing, states none.
         let stated = || workers.iter().map(|worker| &worker.capacity);
-        let differ = |what: &str| {
-            Error::InvalidRequest(format!("the scheduler's groups state different {what}"))
-        };
         let seeds = agreed(stated().map(|capacity| &capacity.seeds))
             .ok_or_else(|| differ("page seeds for their cache groups"))?;
         let encoder_identity = agreed(stated().map(|capacity| &capacity.encoder_identity))
-            .ok_or_else(|| {
-                differ("identities of the weights that compute their encoder outputs")
-            })?;
+            .ok_or_else(|| differ(ENCODER_IDENTITIES))?;
+        let latent_seed = agreed(stated().map(|capacity| &capacity.latent_seed))
+            .ok_or_else(|| differ("latent seeds for their stored trajectories"))?;
 
         let regions: Vec<(u8, runtime::Region)> = opened
             .regions
@@ -512,7 +515,7 @@ impl Scheduler {
             next_owner: (rank << 48) + 1,
             seeds,
             encoder_identity,
-            latent_seed: 0,
+            latent_seed,
             short: HashMap::new(),
             copies: HashMap::new(),
             unmapped: HashMap::new(),
@@ -631,6 +634,14 @@ fn resolved(mut config: SchedulerConfig, groups: &[WorkerGroup]) -> Result<Sched
 /// The one value of `stated`, the statements of a scheduler's groups, that every group stating
 /// one (a value other than the empty default) states; the empty default when none does, `None`
 /// when two differ.
+/// What a refusal of the identities of the weights that compute the encoder outputs names.
+const ENCODER_IDENTITIES: &str = "identities of the weights that compute their encoder outputs";
+
+/// The refusal of what the scheduler's groups state differently, `what` naming it.
+fn differ(what: &str) -> Error {
+    Error::InvalidRequest(format!("the scheduler's groups state different {what}"))
+}
+
 fn agreed<'a, T>(stated: impl IntoIterator<Item = &'a T>) -> Option<T>
 where
     T: Clone + Default + PartialEq + 'a,
@@ -735,8 +746,7 @@ impl Scheduler {
             }
             Message::CommitPolicy => self.policy.commit(),
             Message::Flush(seeds, in_flight, reply) => {
-                self.flush(seeds, in_flight);
-                let _ = reply.send(Ok(()));
+                let _ = reply.send(self.flush(seeds, in_flight));
             }
             Message::Resize(region, units, reply) => {
                 self.submit(runtime::Request::Resize { region, units });
@@ -923,10 +933,11 @@ impl Scheduler {
                 .any(|(_, request, _)| pending(request))
     }
 
-    /// `Flush` (SD §2.4, gap G13 of the work breakdown): the requests the scheduler holds continue
-    /// as `in_flight` says, then every cached block the scheduler knows of is evicted, and with a
-    /// weight update's `seeds` the cache groups' page seeds and the latent seed are replaced. The
-    /// encoder identity stays the one the groups stated: the message states none of its own.
+    /// `Flush` (SD §2.4): the requests the scheduler holds continue as `in_flight` says, then
+    /// every cached block the scheduler knows of is evicted, and with a weight update's `seeds`
+    /// what keys the blocks computed from here on is replaced: the cache groups' page seeds, the
+    /// latent seed, and the encoder identity, which the identities `seeds` states for this
+    /// scheduler's groups agree on as their `Capacity` would (empty when none of them encodes).
     ///
     /// The requests are dealt with first, under the seeds their state was computed with:
     ///
@@ -938,9 +949,28 @@ impl Scheduler {
     ///   whose denoising is fully scheduled runs to its end. A request still queued waits.
     /// - `Abort`: every request ends, aborted.
     ///
-    /// `Evict` names every key of `cache`, as many per request as a record holds; the buffer pool
+    /// `Evict` names every key of `cache`, as many per record as a record holds; the buffer pool
     /// evicts those that no request pins, and `cache` keeps the keys its `Evicted` does not list.
-    fn flush(&mut self, seeds: Option<(Vec<Key>, u64)>, in_flight: WeightsInFlight) {
+    ///
+    /// # Errors
+    ///
+    /// [`Error::InvalidRequest`] when `seeds` states different encoder identities for two of the
+    /// scheduler's groups; nothing changes then.
+    fn flush(&mut self, seeds: Option<Seeds>, in_flight: WeightsInFlight) -> Result<(), Error> {
+        let seeds = match seeds {
+            Some((pages, latent, encoders)) => {
+                let ours = self.groups.iter().filter_map(|group| {
+                    encoders
+                        .iter()
+                        .find(|(id, _)| *id == group.id())
+                        .map(|(_, identity)| identity)
+                });
+                let identity = agreed(ours).ok_or_else(|| differ(ENCODER_IDENTITIES))?;
+                Some((pages, latent, identity))
+            }
+            None => None,
+        };
+
         let ids: Vec<RequestId> = self.requests.keys().copied().collect();
         match in_flight {
             WeightsInFlight::Keep => {
@@ -977,10 +1007,12 @@ impl Scheduler {
             });
         }
 
-        if let Some((pages, latent)) = seeds {
+        if let Some((pages, latent, identity)) = seeds {
             self.seeds = pages;
             self.latent_seed = latent;
+            self.encoder_identity = identity;
         }
+        Ok(())
     }
 
     /// Under a weight update that keeps the requests in flight: each token request commits no

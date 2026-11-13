@@ -156,15 +156,20 @@ impl InProcessPool {
             }
         };
         self.queues.extend(served);
-        // Each region's segment table, as the Storage Server answers it.
+        // Each region's segment table and numbering, as the Storage Server answers them.
         let segments = regions
             .iter()
             .map(|(number, _)| self.pool.segments_of(*number))
+            .collect();
+        let limits = regions
+            .iter()
+            .map(|(number, _)| self.pool.limit_of(*number))
             .collect();
         Ok((
             Opened {
                 regions,
                 segments,
+                limits,
                 registers,
             },
             ends,

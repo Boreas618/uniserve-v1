@@ -40,7 +40,7 @@ use super::operations::{ask, at_boundary, every, stopped};
 use crate::executor::Shadow;
 use crate::modules::load::{self, install, select};
 use crate::modules::select::{Routes, replaced_operators};
-use crate::process::data_plane::DataPlane;
+use crate::process::binding::WeightBinding;
 use crate::scheduler::Message;
 use crate::scheduler::policy::Policy;
 
@@ -333,7 +333,7 @@ pub(crate) fn shadow(
 pub(crate) fn switch(
     schedulers: &[Sender<Message>],
     workers: &[Arc<Worker>],
-    data: &DataPlane,
+    binding: &WeightBinding,
     served: &AtomicU64,
     generation: u64,
     policy: &(Arc<wasmtime::Module>, Parameters),
@@ -386,7 +386,8 @@ pub(crate) fn switch(
         }
 
         served.store(generation, Ordering::Release);
-        data.set_kernels()
+        binding
+            .set_kernels()
             .with_context(|| format!("the ranks' memories under generation {generation}"))?;
         Ok(())
     })
@@ -434,7 +435,7 @@ pub(crate) fn commit(
 pub(crate) fn rollback(
     schedulers: &[Sender<Message>],
     workers: &[Arc<Worker>],
-    data: &DataPlane,
+    binding: &WeightBinding,
     served: &AtomicU64,
     generation: u64,
     kept: u64,
@@ -449,7 +450,7 @@ pub(crate) fn rollback(
         );
         served.store(kept, Ordering::Release);
 
-        let memories = data
+        let memories = binding
             .set_kernels()
             .with_context(|| format!("the ranks' memories under generation {kept}"));
         let policies = ask(schedulers, Message::RollbackPolicy)

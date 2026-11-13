@@ -5,7 +5,8 @@
 //! The text rank: its load to its division, the session the engine opens over the layout its
 //! units state, the segments the rank creates once the answer shows the region new and the head
 //! grants, the worker spawned over the rank's runner, which maps the session's completions into
-//! its block tables, and a successor epoch of the same layout, whose rank maps those segments.
+//! its block tables, and successor epochs of the same layout, whose ranks map those segments at
+//! the region's numbering whatever their own division counted.
 //! Its model is the Qwen3-MoE fixture of the `qwen3` crate, loaded from its shard headers alone.
 //!
 //! The media rank: its load and its runners' profile run, the session's media regions and
@@ -32,7 +33,7 @@ use storage::QueuePair;
 use storage::runtime::{Completion, GroupId, OwnerId, Request, RequestId, Tier};
 
 use super::{
-    Backing, LoadedRank, Meeting, bind, capacities, layout, load_ranks, open_ranks, spawn,
+    Backing, Loaded, LoadedRank, Meeting, bind, capacities, layout, load_ranks, open_ranks, spawn,
 };
 use crate::batch::product::KINDS;
 use crate::memory::client::StorageClient;
@@ -214,7 +215,7 @@ fn a_meta_rank_creates_its_region_s_segments_once_the_session_is_open_and_a_succ
     // The group's one key chain roots at the seed of the page identity its cache states for the
     // weights the process serves, which a meta start loads none of.
     let identities = service::lock(&ranks[0].text().unwrap().cache)
-        .page_identities(&crate::process::data_plane::identity_of(&[]));
+        .page_identities(&crate::process::binding::identity_of(&[]));
     let seeds: Vec<storage::Key> = identities
         .iter()
         .map(|identity| storage::key::page_seed(identity))
@@ -255,6 +256,50 @@ fn a_meta_rank_creates_its_region_s_segments_once_the_session_is_open_and_a_succ
         .collect();
     assert_eq!(mapped, table);
     next_client.close().unwrap();
+
+    // A successor of the same layout whose own division numbers its cache otherwise, as one
+    // whose figure of its GPU's quota rounds to another count of segments does, still names the
+    // region, and takes the numbering the buffer pool holds for it: its rank maps the segments the
+    // first epoch's rank created, creates none, and lays its cache out over the region's units.
+    let mut measured = launch.clone();
+    measured.epoch = 3;
+    let mut others = loaded(&measured);
+    {
+        let Loaded::Text(text) = &mut others[0].loaded else {
+            panic!("a text rank");
+        };
+        text.units = 2 * units;
+        text.first = 2 * units;
+    }
+    let other_open = stated(&measured, &others);
+    assert_eq!(other_open.regions[kv].name, open.regions[kv].name);
+    assert_eq!(other_open.regions[kv].limit, 2 * units);
+
+    let mut other_client = StorageClient::connect_head(&server.socket, DEPLOYMENT, 3).unwrap();
+    let _other_pairs = other_client.open(other_open).unwrap();
+    let (held, other_opened) = {
+        let (held, answered) = other_client.session().unwrap();
+        (held.clone(), answered.clone())
+    };
+    assert_eq!(other_opened.limits[kv], units);
+    assert_eq!(held.regions[kv].limit, units);
+    assert_eq!(other_opened.regions[kv], (number, units - 1));
+    assert_eq!(other_opened.segments[kv], *segments);
+
+    let none = open_ranks(&mut others, &held, &other_opened).unwrap();
+    assert_eq!(none, vec![(open.regions[kv].name.clone(), Vec::new())]);
+    let cache = service::lock(&others[0].text().unwrap().cache);
+    assert_eq!(cache.config().units, units);
+    let mapped: Vec<(u64, u32, u32)> = cache
+        .config()
+        .segments
+        .iter()
+        .flatten()
+        .map(|part| (part.segment.epoch, part.segment.ordinal, part.segment.units))
+        .collect();
+    assert_eq!(mapped, table);
+    drop(cache);
+    other_client.close().unwrap();
 
     // The workers stop before the session closes.
     drop(workers);

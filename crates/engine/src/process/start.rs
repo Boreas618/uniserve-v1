@@ -6,7 +6,7 @@
 //! [`Engine::new`] builds it over a session and one executor per scheduler, which is where the
 //! binary and a test of the control thread part: the binary's executors are the ranks', a test's
 //! are fakes, and everything above them is the same. The ranks' side is what the rank start
-//! adds: the node's workers, the data plane over the ranks' storages, the head of the session,
+//! adds: the node's workers, the weight binding over the ranks' storages, the head of the session,
 //! the Build Server and the links to the epoch's other main processes.
 //!
 //! [`start`] is the binary's construction (`specs/engine-worker-port.md` §1.1,
@@ -55,7 +55,7 @@ use super::ranks::{
 use crate::executor::{Executor, Shadow, WorkerExecutor};
 use crate::memory::client::StorageClient;
 use crate::modules::load;
-use crate::process::data_plane::{DataPlane, Target as LoadTarget};
+use crate::process::binding::{Target as LoadTarget, WeightBinding};
 use crate::process::ranks::rank::ModelRunner;
 use crate::process::ranks::rank::text::Keys;
 use crate::scheduler::policy::{self, Policy};
@@ -95,7 +95,7 @@ pub struct Engine {
     pub(crate) groups: Option<Arc<Route>>,
     /// The changes the engine makes to what its ranks hold; of no rank by default, so every
     /// operation acts on none.
-    pub(crate) data: Arc<DataPlane>,
+    pub(crate) binding: Arc<WeightBinding>,
     /// The head of the session with the buffer pool, which grants and withdraws its segments.
     pub(crate) head: Option<Arc<Mutex<StorageClient>>>,
     /// The Build Server's client and the targets of the node's devices, which a generation's
@@ -153,7 +153,7 @@ impl Engine {
     ///
     /// Each scheduler's policy is instantiated on the scheduler's own state, so the replicas and
     /// the phases its groups serve are what it starts from. The generation batches are assembled
-    /// for is [`FIRST_GENERATION`]. The ranks' side is empty: no worker, a data plane of no
+    /// for is [`FIRST_GENERATION`]. The ranks' side is empty: no worker, a weight binding of no
     /// rank, no head, Build Server or peer link.
     ///
     /// # Errors
@@ -309,7 +309,7 @@ impl Engine {
             session,
             workers: Vec::new(),
             groups: None,
-            data: Arc::new(DataPlane::new(Vec::new(), LoadTarget::default())),
+            binding: Arc::new(WeightBinding::new(Vec::new(), LoadTarget::default())),
             head: None,
             build: None,
             remotes: Vec::new(),
@@ -344,7 +344,7 @@ impl Engine {
             route,
             workers,
             groups,
-            data,
+            binding,
             head,
             build,
             remotes,
@@ -393,8 +393,8 @@ impl Engine {
                 ),
             }
         }
-        // The data plane holds the owners of every rank's device storage.
-        let released = Arc::into_inner(data).is_some();
+        // The weight binding holds the owners of every rank's device storage.
+        let released = Arc::into_inner(binding).is_some();
 
         for remote in &remotes {
             remote.close();
@@ -415,8 +415,8 @@ impl Engine {
             outcome = outcome.and(reset.map(drop).context("resetting the devices' contexts"));
         } else if devices {
             tracing::warn!(
-                "the data plane is still held after the engine closed: the devices' contexts are \
-                 left to the process's exit"
+                "the weight binding is still held after the engine closed: the devices' contexts \
+                 are left to the process's exit"
             );
         }
         outcome
@@ -521,16 +521,17 @@ pub(crate) fn start(
     let mut ranks = load_ranks(model_runner.ranks()?, backing, launch, meeting)?;
 
     // The session, opened before the ranks map memory: its device KV regions state no segment.
-    let open = layout(launch, &ranks)?;
+    // From the answer on, the layout states each region numbered as the buffer pool holds it: a
+    // region an earlier epoch named keeps that epoch's numbering.
     let mut head = StorageClient::connect_head(
         Path::new(&storage.socket),
         &launch.engine_config.deployment,
         launch.epoch,
     )?;
-    let pairs = head.open(open.clone())?;
-    let opened = head
+    let pairs = head.open(layout(launch, &ranks)?)?;
+    let (open, opened) = head
         .session()
-        .map(|(_, opened)| opened.clone())
+        .map(|(open, opened)| (open.clone(), opened.clone()))
         .context("the session with the buffer pool is not open")?;
 
     // Every rank maps the segments the answer states and creates the rest, which the head
@@ -565,7 +566,7 @@ pub(crate) fn start(
     };
 
     let capacities = capacities(&ranks, &open)?;
-    let data = data_plane(launch, &model_runner, &ranks, &workers)?;
+    let binding = weight_binding(launch, &model_runner, &ranks, &workers)?;
     drop(ranks);
 
     let head = Arc::new(Mutex::new(head));
@@ -597,7 +598,7 @@ pub(crate) fn start(
 
     engine.workers = workers;
     engine.groups = Some(route);
-    engine.data = data;
+    engine.binding = binding;
     engine.counters = counters;
     engine.head = Some(head);
     engine.build = build.map(|client| (client, targets));
@@ -684,14 +685,14 @@ fn warm_up(workers: &[Arc<Worker>]) -> Result<()> {
     Ok(())
 }
 
-/// The data plane over `ranks`, each served by its worker of `workers`: what the engine
+/// The weight binding over `ranks`, each served by its worker of `workers`: what the engine
 /// changes of the ranks' storages, and how it loads the model the launch serves again.
-fn data_plane(
+fn weight_binding(
     launch: &EngineArgs,
     model_runner: &ModelRunner,
     ranks: &[LoadedRank],
     workers: &[Arc<Worker>],
-) -> Result<Arc<DataPlane>> {
+) -> Result<Arc<WeightBinding>> {
     let mut served = Vec::with_capacity(ranks.len());
     for (rank, worker) in ranks.iter().zip(workers) {
         if let Some(rank) = rank.data_rank(worker)? {
@@ -703,7 +704,7 @@ fn data_plane(
         checkpoint: PathBuf::from(&launch.engine_config.model.model),
         experts: model_runner.experts(),
     };
-    Ok(Arc::new(DataPlane::new(served, target)))
+    Ok(Arc::new(WeightBinding::new(served, target)))
 }
 
 /// Installs what the deployment's always-on profiling captures into every graph of `devices`:

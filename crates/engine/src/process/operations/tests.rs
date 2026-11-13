@@ -1,7 +1,7 @@
 //! The parts of a serving engine that the jobs act on, over a Storage Server in the test's
 //! process and workers that hold no device: one scheduler on its thread, over a session whose
 //! region of the KV planes is made of four segments, with the engine's worker of its one worker
-//! group, whose rank serves generation 1 of no kernel, and a data plane of no rank.
+//! group, whose rank serves generation 1 of no kernel, and a weight binding of no rank.
 //!
 //! The tests read what the jobs leave: the scheduler's replies and statistics, the generation
 //! each worker serves, and the segment table the Storage Server holds.
@@ -24,7 +24,7 @@ use super::at_boundary;
 use crate::executor::WorkerExecutor;
 use crate::executor::tests::{GROUP, node};
 use crate::memory::client::StorageClient;
-use crate::process::data_plane::{DataPlane, Target};
+use crate::process::binding::{Target, WeightBinding};
 use crate::scheduler::tests::{capacity, idle_policy};
 use crate::scheduler::{Message, Output, Scheduler};
 use crate::support::{DEPLOYMENT, StorageServer};
@@ -114,7 +114,7 @@ pub(in crate::process) struct Node {
     pub(in crate::process) outputs: Receiver<Output>,
     /// The worker group's one rank.
     pub(in crate::process) workers: Vec<Arc<crate::worker::Worker>>,
-    pub(in crate::process) data: Arc<DataPlane>,
+    pub(in crate::process) binding: Arc<WeightBinding>,
     pub(in crate::process) head: Mutex<StorageClient>,
     /// The generation the scheduler's batches carry.
     pub(in crate::process) served: Arc<AtomicU64>,
@@ -166,7 +166,7 @@ impl Node {
             schedulers: vec![inbox],
             outputs,
             workers,
-            data: Arc::new(DataPlane::new(Vec::new(), Target::default())),
+            binding: Arc::new(WeightBinding::new(Vec::new(), Target::default())),
             head: Mutex::new(head),
             served,
             threads: vec![thread],

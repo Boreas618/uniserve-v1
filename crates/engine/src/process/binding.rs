@@ -1,5 +1,8 @@
-//! The data plane of a serving epoch: the changes the engine makes to what its ranks hold on
-//! their devices, inside the epoch.
+//! The weight binding of a serving epoch: the operations thread's changes to what its ranks hold
+//! on their devices inside the epoch, weights above all. Another checkpoint's weights are staged
+//! beside the serving batches and bound at a batch boundary in place of the ones they replace; the
+//! KV planes' segments, the graph pools, LoRA adapters, profiling sessions and the process's
+//! reservation in its GPUs' quotas change through the same ranks.
 //!
 //! Every change reaches a device as a control operation of the rank's worker
 //! ([`Worker::control`]), which runs between the jobs submitted before and after it, once the
@@ -10,20 +13,20 @@
 //!
 //! The work comes in three kinds, which differ in who may run them when:
 //!
-//! - **At a batch boundary**: putting loaded weights in place ([`DataPlane::update_weights`],
-//!   [`DataPlane::commit_experts`]), suspending and restoring the graph pools, releasing and
+//! - **At a batch boundary**: binding staged weights in place ([`WeightBinding::update_weights`],
+//!   [`WeightBinding::commit_experts`]), suspending and restoring the graph pools, releasing and
 //!   creating the KV planes' segments, and the kernels the cache and the state launch, each
-//!   rank's from the generation its graphs serve ([`DataPlane::set_kernels`]). A control
+//!   rank's from the generation its graphs serve ([`WeightBinding::set_kernels`]). A control
 //!   operation is ordered against its own worker's jobs only, so the engine first pauses the
 //!   schedulers whose batches read what changes: every rank of a group then changes between the
 //!   same two batches.
-//! - **Beside the serving batches**: a load of another checkpoint of the same model, or of
-//!   another arrangement of its experts ([`DataPlane::pair`], [`DataPlane::load`]), published at
-//!   the Storage Server while requests go on; LoRA adapters; profiling sessions, which each
-//!   rank's worker starts and ends between two of its batches.
+//! - **Beside the serving batches**: staging a load of another checkpoint of the same model, or
+//!   of another arrangement of its experts ([`WeightBinding::pair`], [`WeightBinding::load`]),
+//!   published at the Storage Server while requests go on; LoRA adapters; profiling sessions,
+//!   which each rank's worker starts and ends between two of its batches.
 //! - **The quota**: what the process holds on each device beside its pools and the Storage
-//!   Server's storages, reserved in the GPU's quota ([`DataPlane::reserve_serving`]) with what a
-//!   profiling session's collectors hold.
+//!   Server's storages, reserved in the GPU's quota ([`WeightBinding::reserve_serving`]) with
+//!   what a profiling session's collectors hold.
 //!
 //! A weight is never written after it is published, by anyone. An update changes which published
 //! allocation an address maps: the graphs captured over that address stay valid, the mapping
@@ -37,25 +40,25 @@
 //! its own context (`specs/buffer-pool.md` §14.1). Memory changes by whole segments, around the
 //! tables' changes, and the head of the epoch's session states each change to the Storage Server,
 //! since only the head knows when every rank that maps a region has made it. A region's ranks are
-//! those of the worker groups that state it, which the segment operations name. The data plane is
-//! the ranks' side of each sequence:
+//! those of the worker groups that state it, which the segment operations name. The weight
+//! binding is the ranks' side of each sequence:
 //!
 //! 1. **Release from segment `k` on**, for a region of another layout to grow into the memory:
 //!    the schedulers `Resize` their regions below the first unit of segment `k`; the head sends
 //!    `Withdraw` for each segment from `k` on, which takes its units out of the space's free
-//!    ranges; then [`DataPlane::release_segments`]: every rank of the region unmaps them and ends
-//!    its retention, and the GPU's quota usage drops with the last rank.
+//!    ranges; then [`WeightBinding::release_segments`]: every rank of the region unmaps them and
+//!    ends its retention, and the GPU's quota usage drops with the last rank.
 //! 2. **Create given-back segments**, for a region to grow past the space's free ranges, as many
-//!    as [`DataPlane::fitting_segments`] finds room for: [`DataPlane::create_segments`]: every
-//!    rank of the region creates them again at their addresses and resets their units; the head
-//!    sends `Grant` for each segment the ranks hold now beyond those the space held; then the
-//!    schedulers `Resize` their regions into them.
+//!    as [`WeightBinding::fitting_segments`] finds room for: [`WeightBinding::create_segments`]:
+//!    every rank of the region creates them again at their addresses and resets their units; the
+//!    head sends `Grant` for each segment the ranks hold now beyond those the space held; then
+//!    the schedulers `Resize` their regions into them.
 //! 3. **Sleep**: the schedulers detach every owner and `Resize` every device region to nothing,
 //!    having stored what the write policy keeps; the head withdraws every segment;
-//!    [`DataPlane::sleep`] releases them all and suspends the graph pools.
-//! 4. **Wake**: [`DataPlane::wake`] restores the graph pools and creates every segment again; the
-//!    head grants them ([`DataPlane::segment_tables`] states each region's); the schedulers grow
-//!    their regions.
+//!    [`WeightBinding::sleep`] releases them all and suspends the graph pools.
+//! 4. **Wake**: [`WeightBinding::wake`] restores the graph pools and creates every segment again;
+//!    the head grants them ([`WeightBinding::segment_tables`] states each region's); the
+//!    schedulers grow their regions.
 //!
 //! Each returns its ranks' segment tables ([`crate::memory::cache::info::CacheTable`]), whose
 //! segment `i` holds the units from the sum of the units of the segments before it. An epoch switch
@@ -88,9 +91,9 @@ use storage::runtime::GroupId;
 use crate::runner::Runner;
 use crate::worker::{Error, Result, Worker};
 
-/// The name [`DataPlane::memory`] reports the planes of a device's KV regions under, beside the
-/// pools of its allocators (`graph`, `scratch`, `resident`): the segments the ranks map, with the
-/// flags, scales, index keys and state planes beside them.
+/// The name [`WeightBinding::memory`] reports the planes of a device's KV regions under, beside the
+/// pools of its allocators (`graph`, `scratch`, `resident`): the segments the ranks map of the
+/// value and state planes, with the flags, scales and index keys beside them.
 pub(crate) const KV_POOL: &str = "kv";
 
 /// What a load of the served model reads: which checkpoint, and which expert sits in which slot.
@@ -124,7 +127,7 @@ pub(crate) trait ModelLoad: Send + Sync {
     fn expert_layers(&self) -> BTreeMap<String, u32>;
 }
 
-/// What the data plane holds of one rank: the owners of its device's storage, which the rank's
+/// What the weight binding holds of one rank: the owners of its device's storage, which the rank's
 /// start opened, and the worker every change of them goes through.
 pub(crate) struct Rank {
     /// The rank's number in its epoch, as a profiling session's `workers` name it.
@@ -147,8 +150,8 @@ pub(crate) struct Rank {
     pub state: Option<Arc<Mutex<StateMemory>>>,
     /// The device's graph, scratch and resident pools.
     pub graphs: Arc<Mutex<GraphPool>>,
-    /// A stream of the device that only the data plane's control operations issue on: the resets
-    /// of the units of segments created again.
+    /// A stream of the device that only the weight binding's control operations issue on: the
+    /// resets of the units of segments created again.
     pub stream: Stream,
     /// The device bytes of the rank's communicators that NVML attributes to no process, as their
     /// owner states them: what a measurement of the process adds to NVML's figure.
@@ -158,6 +161,9 @@ pub(crate) struct Rank {
     /// The weights the rank serves, in its load's order, each with whether the model writes it
     /// after the load.
     pub serving: Vec<(WeightKey, bool)>,
+    /// Whether the rank computes encoder outputs, which the identity of its group's encoding
+    /// ranks' weights keys ([`encoder_identities`]).
+    pub encodes: bool,
 }
 
 impl Rank {
@@ -260,8 +266,8 @@ struct Adapter {
     tensors: BTreeMap<String, nn::Tensor>,
 }
 
-/// The data plane of one process: every rank it holds.
-pub(crate) struct DataPlane {
+/// The weight binding of one process: every rank it holds.
+pub(crate) struct WeightBinding {
     ranks: Vec<Mutex<Rank>>,
     /// What the ranks serve now.
     target: Mutex<Target>,
@@ -294,6 +300,28 @@ pub(crate) fn identity_of(order: &[(WeightKey, bool)]) -> String {
         digest.text(&key.to_string());
     }
     ::storage::Key(digest.finish()).hex()
+}
+
+/// The identity of the weights that compute each worker group's encoder outputs
+/// (`Capacity::encoder_identity`), from `ranks`, the ranks that encode, each with its group and
+/// the weights it serves, in rank order: per group, in the order of its first rank, the identity
+/// of its ranks' weights in rank order ([`identity_of`]). The rank start states it, and a weight
+/// update renews it from the same ranks, so one set of weights keys its outputs alike in both.
+pub(crate) fn encoder_identities<'a>(
+    ranks: impl IntoIterator<Item = (GroupId, &'a [(WeightKey, bool)])>,
+) -> Vec<(GroupId, String)> {
+    let mut groups: Vec<(GroupId, Vec<(WeightKey, bool)>)> = Vec::new();
+    for (group, weights) in ranks {
+        match groups.iter_mut().find(|(id, _)| *id == group) {
+            Some((_, held)) => held.extend(weights.iter().cloned()),
+            None => groups.push((group, weights.to_vec())),
+        }
+    }
+
+    groups
+        .into_iter()
+        .map(|(group, weights)| (group, identity_of(&weights)))
+        .collect()
 }
 
 /// The room `rank`'s device has: what the deployment's quota of the GPU leaves, and what the
@@ -340,8 +368,8 @@ fn reload(
     loaded
 }
 
-impl DataPlane {
-    /// The data plane over `ranks`, which serve `target`.
+impl WeightBinding {
+    /// The weight binding over `ranks`, which serve `target`.
     pub(crate) fn new(ranks: Vec<Rank>, target: Target) -> Self {
         Self {
             ranks: ranks.into_iter().map(Mutex::new).collect(),
@@ -400,7 +428,7 @@ impl DataPlane {
                 worker.control(
                     format!("{label} on rank {}", rank.rank),
                     Box::new(move |runners: &mut [Box<dyn Runner>]| {
-                        // A data plane that stopped waiting has nothing to be told.
+                        // A weight binding that stopped waiting has nothing to be told.
                         let _ = value.send(work(runners)?);
                         Ok(())
                     }),
@@ -452,7 +480,7 @@ impl DataPlane {
     /// When a rank's process does not fit its quota, or NVML cannot state the process's storage.
     pub(crate) fn reserve_serving(&self) -> Result<()> {
         let mut reserved = lock(&self.reserved);
-        // A data plane of no rank has no process storage to measure.
+        // A weight binding of no rank has no process storage to measure.
         if !reserved.is_empty() || self.ranks.is_empty() {
             return Ok(());
         }
@@ -675,6 +703,28 @@ impl DataPlane {
             .flat_map(|rank| lock(rank).serving.clone())
             .collect();
         identity_of(&order)
+    }
+
+    /// The identity of the weights that compute each worker group's encoder outputs, as the
+    /// ranks serve them now ([`encoder_identities`]): what a weight update keys the outputs
+    /// computed after it by. A group none of whose ranks encodes, or whose workers closed, has
+    /// none.
+    pub(crate) fn encoder_identities(&self) -> Vec<(GroupId, String)> {
+        let encoding: Vec<(GroupId, Vec<(WeightKey, bool)>)> = self
+            .ranks
+            .iter()
+            .filter_map(|rank| {
+                let rank = lock(rank);
+                let group = rank.worker.upgrade()?.group();
+                rank.encodes.then(|| (group, rank.serving.clone()))
+            })
+            .collect();
+
+        encoder_identities(
+            encoding
+                .iter()
+                .map(|(group, weights)| (*group, weights.as_slice())),
+        )
     }
 
     /// The room every device has for a load, in rank order.

@@ -30,7 +30,7 @@ pub struct PrefixCacheInfo {
     /// forwards. A standby worker warms up on them while its predecessor
     /// serves, so the engine never allocates them.
     pub scratch_units: u32,
-    /// The segments the rank's value planes are made of, in unit order, each
+    /// The segments the rank's value and state planes are made of, in unit order, each
     /// of whole units that give storage back and are created again whole;
     /// empty for planes not split.
     #[serde(default)]

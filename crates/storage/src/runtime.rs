@@ -25,7 +25,7 @@ use serde::{Deserialize, Serialize};
 use crate::{Error, Key, Result, Segment};
 
 /// The version of this interface.
-pub const VERSION: u32 = 1;
+pub const VERSION: u32 = 2;
 
 /// A request's number on its queue pair, drawn by the scheduler from a
 /// counter and never reused.
@@ -85,7 +85,8 @@ pub struct Open {
     pub epoch: u64,
     pub trial: bool,
     /// The regions of the layout. A region another session of the
-    /// deployment stated under the same name is that region.
+    /// deployment stated under the same name is that region, numbered as the
+    /// buffer pool holds it ([`Opened::limits`]).
     pub regions: Vec<Region>,
     /// The classes; a request names a class by its index here.
     pub classes: Vec<Class>,
@@ -131,7 +132,9 @@ pub struct Region {
     /// worker's scratch units of a cache, row 0 of the slot rows.
     pub reserved: u32,
     /// The units the engine asks to have in the region, and the limit of
-    /// the region's numbering.
+    /// the region's numbering. A region the buffer pool holds keeps the
+    /// numbering it was first opened with, whatever a later layout states:
+    /// every epoch that names it addresses the same units.
     pub units: u32,
     pub limit: u32,
     /// The segments of a device region's memory the engine's ranks created
@@ -242,6 +245,12 @@ pub struct Opened {
     /// space, whose storages the epoch's ranks map, so that an epoch of the
     /// same layout maps the segments another epoch created.
     pub segments: Vec<Segments>,
+    /// Per region of [`Open::regions`]: the limit of its numbering as the
+    /// buffer pool holds it. A region new to the pool is numbered as the
+    /// layout states it; a region an earlier session named keeps the
+    /// numbering that session's layout stated, which the epoch's ranks lay
+    /// their memory of the region out by.
+    pub limits: Vec<u32>,
     /// Per scheduler, where its queue pair's registers lie.
     pub registers: Vec<Registers>,
 }

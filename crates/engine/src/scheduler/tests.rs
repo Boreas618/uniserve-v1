@@ -169,6 +169,7 @@ fn built(
     let opened = runtime::Opened {
         regions: vec![(4, 64), (5, 64), (6, 64), (7, 16)],
         segments: Vec::new(),
+        limits: Vec::new(),
         registers: vec![runtime::Registers {
             completed: vec![0, 1],
             capacity: vec![(4, 2), (5, 5), (6, 8), (7, 11)],
@@ -217,6 +218,7 @@ pub(crate) fn capacity() -> Capacity {
         eos_token_ids: Vec::new(),
         feature_bytes: 0,
         encoder_identity: String::new(),
+        latent_seed: 0,
         media_bytes: Vec::new(),
         call_window: 2,
     }

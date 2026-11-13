@@ -34,9 +34,9 @@
 //! start loads ranks and opens a session with the node's Storage Server; a test's builds fakes,
 //! and everything above that seam is the same code.
 
+pub(crate) mod binding;
 pub(crate) mod catalogue;
 mod daemon;
-pub(crate) mod data_plane;
 mod epoch;
 mod generation;
 mod lifecycle;
@@ -54,7 +54,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use crate::executor::peers::{LOST_EXIT, Liveness};
-use crate::process::data_plane::WeightsUpdated;
+use crate::process::binding::WeightsUpdated;
 use crate::worker::watchdog::Watchdog;
 use anyhow::{Context as _, Result, bail};
 use crossbeam_channel::{Receiver, Select, Sender};
@@ -75,7 +75,7 @@ pub use start::Engine;
 use crate::memory::client::StorageClient;
 use crate::modules::load;
 use crate::modules::select::changed_operators;
-use crate::process::data_plane::Target;
+use crate::process::binding::Target;
 use crate::scheduler::{Message, Output};
 
 /// Builds the started epoch from the launch: the binary's rank start, or a test's fakes. It
@@ -600,9 +600,9 @@ impl MainProcess {
         if self.launch.standby_storage == proto::request::StandbyStorage::Suspended
             && let Some(engine) = self.engine.as_ref()
         {
-            let data = Arc::clone(&engine.data);
+            let binding = Arc::clone(&engine.binding);
             return self.serial(Box::new(move || {
-                let suspended = data.suspend_graphs();
+                let suspended = binding.suspend_graphs();
                 done(move |main| match suspended {
                     Ok(()) => main.park(),
                     Err(error) => {
@@ -631,9 +631,9 @@ impl MainProcess {
             return;
         };
         let schedulers = engine.inboxes();
-        let data = Arc::clone(&engine.data);
+        let binding = Arc::clone(&engine.binding);
         self.serial(Box::new(move || {
-            let opened = epoch::promote(&schedulers, &data);
+            let opened = epoch::promote(&schedulers, &binding);
             done(move |main| main.opened(opened))
         }));
     }
@@ -832,12 +832,18 @@ impl MainProcess {
 
         let schedulers = engine.inboxes();
         let workers = engine.workers.clone();
-        let data = Arc::clone(&engine.data);
+        let binding = Arc::clone(&engine.binding);
         let served = Arc::clone(&engine.served);
         let policy = (module, parameters);
         self.serial(Box::new(move || {
-            let switched =
-                generation::switch(&schedulers, &workers, &data, &served, generation, &policy);
+            let switched = generation::switch(
+                &schedulers,
+                &workers,
+                &binding,
+                &served,
+                generation,
+                &policy,
+            );
             done(move |main| main.switched(generation, packages, policy, switched))
         }));
     }
@@ -933,14 +939,14 @@ impl MainProcess {
         };
         let schedulers = engine.inboxes();
         let workers = engine.workers.clone();
-        let data = Arc::clone(&engine.data);
+        let binding = Arc::clone(&engine.binding);
         let served = Arc::clone(&engine.served);
         // The trial kept the generation before it: generations are numbered one past the one
         // that executed when each was prepared.
         let kept = generation - 1;
         self.serial(Box::new(move || {
             let rolled =
-                generation::rollback(&schedulers, &workers, &data, &served, generation, kept);
+                generation::rollback(&schedulers, &workers, &binding, &served, generation, kept);
             done(move |main| main.rolled_back(kept, reason, rolled))
         }));
     }
@@ -1049,9 +1055,9 @@ impl MainProcess {
             return;
         };
         let workers = engine.workers.clone();
-        let data = Arc::clone(&engine.data);
+        let binding = Arc::clone(&engine.binding);
         self.serial(Box::new(move || {
-            let released = epoch::release(&head, &data, &workers, region, units);
+            let released = epoch::release(&head, &binding, &workers, region, units);
             done(move |main| match released {
                 Ok((devices, _)) if devices.is_empty() => {}
                 Ok((devices, bytes)) => main.report(lifecycle::report(
@@ -1072,7 +1078,7 @@ impl MainProcess {
         if !lifecycle::grow(self.lifecycle, &mut self.grow) {
             return;
         }
-        let (schedulers, head, data) = match self.segment_parts() {
+        let (schedulers, head, binding) = match self.segment_parts() {
             Ok(parts) => parts,
             Err(error) => {
                 tracing::warn!(error = %format!("{error:#}"), "a grow changes nothing");
@@ -1080,7 +1086,7 @@ impl MainProcess {
             }
         };
         self.serial(Box::new(move || {
-            let grown = epoch::grow(&schedulers, &head, &data);
+            let grown = epoch::grow(&schedulers, &head, &binding);
             done(move |_| {
                 if let Err(error) = grown {
                     tracing::warn!(error = %format!("{error:#}"), "growing the cache failed");
@@ -1116,11 +1122,15 @@ impl MainProcess {
                 }));
             }
             Kind::Hook(hook) => {
-                let Some(data) = self.engine.as_ref().map(|engine| Arc::clone(&engine.data)) else {
+                let Some(binding) = self
+                    .engine
+                    .as_ref()
+                    .map(|engine| Arc::clone(&engine.binding))
+                else {
                     return self.hooked(front, hook.id, Err(starting()));
                 };
                 self.work(Box::new(move || {
-                    let results = operations::hook(&data, &hook.name, &hook.payload);
+                    let results = operations::hook(&binding, &hook.name, &hook.payload);
                     done(move |main| main.hooked(front, hook.id, results))
                 }));
             }
@@ -1139,9 +1149,9 @@ impl MainProcess {
                     return self.hooked(front, commit.id, Err(starting()));
                 };
                 let schedulers = engine.inboxes();
-                let data = Arc::clone(&engine.data);
+                let binding = Arc::clone(&engine.binding);
                 self.serial(Box::new(move || {
-                    let results = operations::commit_experts(&schedulers, &data, &order)
+                    let results = operations::commit_experts(&schedulers, &binding, &order)
                         .and_then(|reports| reported(&reports));
                     done(move |main| main.hooked(front, commit.id, results))
                 }));
@@ -1248,22 +1258,22 @@ impl MainProcess {
         {
             return self.hooked(front, id, Err(anyhow::anyhow!(refusal)));
         }
-        let (schedulers, head, data) = match self.segment_parts() {
+        let (schedulers, head, binding) = match self.segment_parts() {
             Ok(parts) => parts,
             Err(error) => return self.hooked(front, id, Err(error)),
         };
 
         let job: Job = match change {
             Ok(wire::CacheChange::Sleep) => Box::new(move || {
-                let slept = operations::sleep(&schedulers, &head, &data);
+                let slept = operations::sleep(&schedulers, &head, &binding);
                 done(move |main| main.hooked(front, id, slept.map(|()| Vec::new())))
             }),
             Ok(wire::CacheChange::Wake) => Box::new(move || {
-                let woken = operations::wake(&schedulers, &head, &data);
+                let woken = operations::wake(&schedulers, &head, &binding);
                 done(move |main| main.hooked(front, id, woken.map(|_| Vec::new())))
             }),
             Ok(wire::CacheChange::Grow) => Box::new(move || {
-                let grown = epoch::grow(&schedulers, &head, &data);
+                let grown = epoch::grow(&schedulers, &head, &binding);
                 done(move |main| main.hooked(front, id, grown.map(|_| Vec::new())))
             }),
             Ok(wire::CacheChange::MakeRoom) => {
@@ -1273,7 +1283,7 @@ impl MainProcess {
                     Err(error) => return self.hooked(front, id, Err(error)),
                 };
                 Box::new(move || {
-                    let made = operations::make_room(&schedulers, &head, &data, room, &devices);
+                    let made = operations::make_room(&schedulers, &head, &binding, room, &devices);
                     done(move |main| main.hooked(front, id, made.map(|()| Vec::new())))
                 })
             }
@@ -1297,7 +1307,7 @@ impl MainProcess {
         if let Some(refusal) = self.lifecycle.boundary_refusal() {
             return self.hooked(front, id, Err(anyhow::anyhow!(refusal)));
         }
-        let (schedulers, head, data) = match self.segment_parts() {
+        let (schedulers, head, binding) = match self.segment_parts() {
             Ok(parts) => parts,
             Err(error) => return self.hooked(front, id, Err(error)),
         };
@@ -1305,17 +1315,18 @@ impl MainProcess {
         // The same model from another checkpoint: the experts keep the order they serve in.
         let target = Target {
             checkpoint: PathBuf::from(&update.model_path),
-            ..data.target()
+            ..binding.target()
         };
         self.serial(Box::new(move || {
-            let updated = operations::update_weights(&schedulers, &head, &data, target, in_flight)
-                .and_then(|reports| reported(&reports));
+            let updated =
+                operations::update_weights(&schedulers, &head, &binding, target, in_flight)
+                    .and_then(|reports| reported(&reports));
             done(move |main| main.hooked(front, id, updated))
         }));
     }
 
     /// What a job that changes the KV planes' segments reads: each scheduler's inbox, the head of
-    /// the session, which states each change of them, and the data plane.
+    /// the session, which states each change of them, and the weight binding.
     ///
     /// # Errors
     ///
@@ -1329,14 +1340,14 @@ impl MainProcess {
     ) -> Result<(
         Vec<Sender<Message>>,
         Arc<Mutex<StorageClient>>,
-        Arc<crate::process::data_plane::DataPlane>,
+        Arc<crate::process::binding::WeightBinding>,
     )> {
         let engine = self.engine.as_ref().ok_or_else(starting)?;
         let head = engine.head.clone().context(
             "this engine holds no session with a Storage Server of its own, whose segments an \
              operation would change",
         )?;
-        Ok((engine.inboxes(), head, Arc::clone(&engine.data)))
+        Ok((engine.inboxes(), head, Arc::clone(&engine.binding)))
     }
 
     /// Answers the engine command `id` of front `front` with `Hooked`: each rank's result, or why

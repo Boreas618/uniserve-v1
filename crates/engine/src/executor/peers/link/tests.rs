@@ -47,6 +47,7 @@ fn group_capacity() -> Capacity {
         eos_token_ids: vec![2, 3],
         feature_bytes: 0,
         encoder_identity: String::new(),
+        latent_seed: 0,
         media_bytes: Vec::new(),
         call_window: 2,
     }

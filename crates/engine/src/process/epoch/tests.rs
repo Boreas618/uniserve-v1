@@ -35,7 +35,7 @@ fn a_release_after_a_shrink_withdraws_only_the_segments_past_the_units() {
     let reached = ask(&node.schedulers, |reply| Message::Resize(kv, 31, reply)).unwrap();
     assert_eq!(reached, [31]);
 
-    let (devices, bytes) = release(&node.head, &node.data, &node.workers, kv, 31).unwrap();
+    let (devices, bytes) = release(&node.head, &node.binding, &node.workers, kv, 31).unwrap();
     assert!(devices.is_empty(), "a rank of the meta device has no GPU");
     assert_eq!(bytes, 2 * u64::from(SEGMENT_UNITS) * UNIT_BYTES);
     assert_eq!(node.segments_seen(2), [segment(0), segment(1)]);
@@ -43,7 +43,7 @@ fn a_release_after_a_shrink_withdraws_only_the_segments_past_the_units() {
     // A region of no unit covers none of segment 0's units past the reserved one either.
     let reached = ask(&node.schedulers, |reply| Message::Resize(kv, 0, reply)).unwrap();
     assert_eq!(reached, [0]);
-    let (_, bytes) = release(&node.head, &node.data, &node.workers, kv, 0).unwrap();
+    let (_, bytes) = release(&node.head, &node.binding, &node.workers, kv, 0).unwrap();
     assert_eq!(bytes, 2 * u64::from(SEGMENT_UNITS) * UNIT_BYTES);
     assert!(node.segments_seen(3).is_empty());
 }

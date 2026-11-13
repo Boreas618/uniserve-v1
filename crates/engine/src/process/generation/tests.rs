@@ -72,7 +72,7 @@ fn on_trial() -> Node {
     switch(
         &node.schedulers,
         &node.workers,
-        &node.data,
+        &node.binding,
         &node.served,
         2,
         &policy(),
@@ -109,7 +109,7 @@ fn a_rollback_leaves_the_kept_generation_alone() {
     rollback(
         &node.schedulers,
         &node.workers,
-        &node.data,
+        &node.binding,
         &node.served,
         2,
         1,
@@ -130,7 +130,7 @@ fn a_policy_a_scheduler_refuses_rolls_the_switch_back() {
     let failed = switch(
         &node.schedulers,
         &node.workers,
-        &node.data,
+        &node.binding,
         &node.served,
         2,
         &refused,

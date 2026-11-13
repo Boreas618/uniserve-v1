@@ -56,6 +56,12 @@ pub struct Capacity {
     /// those outputs as `seeds` root the group's KV blocks, so an output other weights computed
     /// is another block. Empty for a group that encodes nothing.
     pub encoder_identity: String,
+    /// The seed of the keys of the trajectories the group stores (`storage::key::latent_content`'s
+    /// `seed`): `storage::key::latent_seed` of the identities of the weights of the process's
+    /// ranks, whose denoiser and encoders compute a trajectory and its conditioning. It keys the
+    /// stored trajectories as `seeds` root the group's KV blocks, so a trajectory other weights
+    /// computed is another block. 0 for a group that denoises nothing.
+    pub latent_seed: u64,
     /// Per captured media shape of a group that denoises: the bytes of a slot's trajectory, and
     /// of each product kind's block in the order of the product classes.
     pub media_bytes: Vec<(Shape, u64, Vec<u64>)>,

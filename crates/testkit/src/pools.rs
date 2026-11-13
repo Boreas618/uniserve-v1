@@ -209,6 +209,7 @@ pub fn capacity(launch: &EngineArgs, cache: &CacheLayout) -> Capacity {
         eos_token_ids: config.model.eos.clone(),
         feature_bytes: 0,
         encoder_identity: String::new(),
+        latent_seed: 0,
         media_bytes: Vec::new(),
         call_window: u32::try_from(window).unwrap_or(u32::MAX),
     }

@@ -17,7 +17,7 @@
 //!
 //! | Module | Holds | Thread |
 //! | --- | --- | --- |
-//! | `process` | The control thread: the daemon's request and process interfaces, the lifecycle, routing to schedulers, event streams, reports and metrics; the start (ranks, the session with the Storage Server, the [`Engine`]); jobs of generation updates, epochs and operations, and the data plane they change the ranks' devices through | control, operations, start |
+//! | `process` | The control thread: the daemon's request and process interfaces, the lifecycle, routing to schedulers, event streams, reports and metrics; the start (ranks, the session with the Storage Server, the [`Engine`]); jobs of generation updates, epochs and operations, and the weight binding (the weight updates' staging and binding, and the other changes of what the ranks hold on their devices) they act through | control, operations, start |
 //! | [`scheduler`] | One scheduler per data-parallel rank: requests, admission, the memory decisions over the buffer pool, batches, updates, drains; the scheduling policy host | one per DP rank |
 //! | [`batch`] | What a scheduler hands its executor and gets back: [`Batch`](batch::Batch), [`BatchOutput`](batch::BatchOutput), [`Capacity`](batch::Capacity), the products' order | — |
 //! | [`executor`] | A scheduler's executor: the [`Executor`](executor::Executor) trait the scheduler calls and [`WorkerExecutor`](executor::WorkerExecutor), which numbers a group's jobs and hands them to the workers of the group on this node and to peers on other nodes; the peer link | one waiter per worker group |

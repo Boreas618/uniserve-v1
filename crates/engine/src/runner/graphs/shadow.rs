@@ -112,12 +112,13 @@ impl Shadow {
     }
 
     /// Compares the pairs of the paired forward `pairing` routed on `stream`, and returns the
-    /// elements compared. A pair whose two outputs have other sizes cannot be compared: it is
-    /// named in `uncompared` and skipped. A forward whose operator's outputs exceed the region
-    /// compares nothing: the operator is named in `uncompared`, and the batch has no evidence
-    /// for it. Its calls whose shadow outputs had no room launched the new kernel over the
-    /// forward's own outputs, which the serving kernel then wrote again (`ops::Twins`), so the
-    /// forward still wrote nothing a serving request reads.
+    /// elements compared; `None` when no pair was, the reason being named in `uncompared`. A
+    /// pair whose two outputs have other sizes cannot be compared: it is named in `uncompared`
+    /// and skipped. A forward whose operator's outputs exceed the region compares nothing: the
+    /// operator is named in `uncompared`, and the batch has no evidence for it. Its calls whose
+    /// shadow outputs had no room launched the new kernel over the forward's own outputs, which
+    /// the serving kernel then wrote again (`ops::Twins`), so the forward still wrote nothing a
+    /// serving request reads. A forward that made no call of the operator is named too.
     ///
     /// The copies to the host are issued behind the forward and waited for on their own event.
     ///
@@ -131,7 +132,7 @@ impl Shadow {
         pairing: &Pairing,
         stream: &Stream,
         uncompared: &mut Vec<String>,
-    ) -> Result<u64> {
+    ) -> Result<Option<u64>> {
         let calls = std::mem::take(&mut *lock(&pairing.calls));
         let outputs = lock(&self.outputs);
         match outputs.failure() {
@@ -142,7 +143,7 @@ impl Shadow {
                     pairing.operator,
                     outputs.capacity()
                 ));
-                return Ok(0);
+                return Ok(None);
             }
             Some(failure) => {
                 return Err(Error::Invariant(format!(
@@ -182,6 +183,16 @@ impl Shadow {
             total += bytes as usize;
         }
 
+        if outputs.pairs().is_empty() {
+            uncompared.push(format!(
+                "`{}`: the paired forward made no call of it",
+                pairing.operator
+            ));
+        }
+        if pairs.is_empty() {
+            return Ok(None);
+        }
+
         let held = self.host.as_ref().map_or(0, |(real, _)| real.len());
         if held < total {
             self.host = Some((
@@ -189,8 +200,9 @@ impl Shadow {
                 PinnedBuffer::new(self.device, total)?,
             ));
         }
+        // Pairs of no bytes, with nothing allocated for them yet, hold no element to compare.
         let Some((real, shadow)) = &self.host else {
-            return Ok(0);
+            return Ok(Some(0));
         };
 
         for (pair, offset, bytes, _) in &pairs {
@@ -234,7 +246,7 @@ impl Shadow {
                 Error::Invariant(format!("shadow of `{}`: {error}", pairing.operator))
             })?;
         }
-        Ok(elements)
+        Ok(Some(elements))
     }
 }
 

@@ -172,10 +172,10 @@ pub fn encoder_page(content: &[u8; 32], page: u32) -> Key {
 }
 
 /// The latent seed of what a deployment's denoising computes, from the
-/// identities its denoising ranks report of the weights they compute with: the
-/// first eight bytes of the digest of the distinct identities in order, so
-/// that a parallel configuration of other ranks computing the same derives
-/// the same seed. Zero when no rank reports one.
+/// identities of the weights its ranks compute a trajectory and its
+/// conditioning with: the first eight bytes of the digest of the distinct
+/// identities in order, so that ranks holding the same weights count once.
+/// Zero when no rank reports one.
 pub fn latent_seed<'a>(identities: impl IntoIterator<Item = &'a str>) -> u64 {
     let distinct: std::collections::BTreeSet<&str> = identities.into_iter().collect();
     if distinct.is_empty() {

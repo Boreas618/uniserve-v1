@@ -109,7 +109,7 @@ pub struct KvCacheConfig {
     pub slots: u32,
     /// Pages per row of a pooled table: the pages a request of the model's length holds.
     pub width: u32,
-    /// The segments the value planes are made of on a device ([`segments`]), which hold
+    /// The segments the value and state planes are made of on a device ([`segments`]), which hold
     /// `units` units; `None` for planes that are not split.
     pub segments: Option<Vec<PlaneSegment>>,
     /// The bytes of the attention workspace a forward is lent.
@@ -425,8 +425,8 @@ impl KvCacheMemory {
         }
     }
 
-    /// The segments the value planes are made of, in unit order; `None` for planes that are
-    /// not split.
+    /// The segments the value and state planes are made of, in unit order; `None` for planes
+    /// that are not split.
     pub fn segments(&self) -> Option<&[crate::memory::cache::info::CacheSegment]> {
         self.planes.segments()
     }
@@ -436,7 +436,8 @@ impl KvCacheMemory {
         self.planes.held_segments()
     }
 
-    /// The device bytes one unit of both value planes holds over every column.
+    /// The device bytes one unit of the split planes holds over every column: both value planes
+    /// and its state planes (`CacheLayout::split_bytes`).
     pub(crate) fn unit_bytes(&self) -> u64 {
         self.planes.unit_bytes()
     }

@@ -883,6 +883,10 @@ impl Pools {
             .iter()
             .map(|(number, _)| hosted.pool.segments_of(*number))
             .collect();
+        let limits = regions
+            .iter()
+            .map(|(number, _)| hosted.pool.limit_of(*number))
+            .collect();
         tracing::info!(
             deployment,
             epoch = open.epoch,
@@ -895,6 +899,7 @@ impl Pools {
             Opened {
                 regions,
                 segments,
+                limits,
                 registers,
             },
             descriptors,

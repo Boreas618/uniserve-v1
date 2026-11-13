@@ -71,6 +71,10 @@ pub(crate) const EOS: u32 = testkit::EOS;
 /// The denoising steps of a video deployment.
 pub(crate) const STEPS: u32 = 4;
 
+/// The latent seed a group that denoises states for the weights it serves
+/// (`Capacity::latent_seed`), which keys the trajectories it stores.
+pub(crate) const LATENT_SEED: u64 = 0x5eed;
+
 /// Every phase of a video request, which a video deployment of one group serves.
 pub(crate) const VIDEO_PHASES: [Phase; 11] = [
     Phase::MediaRead,
@@ -664,6 +668,7 @@ impl Deployment {
             } else {
                 String::new()
             },
+            latent_seed: if denoises { LATENT_SEED } else { 0 },
             media_bytes,
             call_window: 2,
         }

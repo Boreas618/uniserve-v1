@@ -579,7 +579,7 @@ fn a_shadow_of_one_implementation_loaded_twice_compares_every_element() -> Outco
         .runner
         .graphs
         .shadow(&bench.runner, &bucket, "rms_norm")?;
-    assert_eq!(compared, (ROWS * HIDDEN) as u64);
+    assert_eq!(compared, Some((ROWS * HIDDEN) as u64));
     assert!(bench.runner.graphs.uncompared().is_empty());
 
     // The paired forward left the serving graphs as they were.

@@ -21,13 +21,14 @@ use storage::Key;
 use storage::key::latent_content;
 use storage::runtime::{Cause, Completion, Request};
 
-use crate::harness::{A, Deployment, Harness, STEPS, VIDEO_PHASES, video};
+use crate::harness::{A, Deployment, Harness, LATENT_SEED, STEPS, VIDEO_PHASES, video};
 
 /// The trajectory identity the daemon gives the cases' video requests.
 const TRAJECTORY: u64 = 7;
 
-/// The latent seed of the harness's epoch: no weight update stated one (SD §4.3).
-const SEED: u64 = 0;
+/// The latent seed of the harness's epoch: the one its denoising group states for its weights
+/// from the start (SD §2.1 `Capacity`, §4.3), with no weight update since.
+const SEED: u64 = LATENT_SEED;
 
 /// The host latent units of a stored trajectory: the harness's captured shape states 30 000 bytes
 /// for a slot's trajectory, and its latent region's units are 4096 bytes.

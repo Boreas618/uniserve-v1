@@ -527,6 +527,32 @@ fn graphs_with_no_device_replay_nothing() {
     assert!(runner.graphs.enter().is_err());
 }
 
+/// A batch the runner could not pair compares nothing: its paired forward reports no element
+/// count, and the update names the operator uncompared with the runner's reason.
+#[test]
+fn an_unpaired_batch_is_reported_uncompared_and_not_compared() {
+    let (runner, serving) = captured();
+    runner
+        .graphs
+        .prepare(&runner, replacing(&serving, 2, "rms_norm"))
+        .unwrap();
+
+    let bucket = runner.buckets()[0];
+    runner
+        .graphs
+        .unpaired(&bucket, "its rows hold no scratch page".to_owned());
+    let compared = runner.graphs.shadow(&runner, &bucket, "rms_norm").unwrap();
+
+    assert_eq!(compared, None);
+    let uncompared = runner.graphs.uncompared();
+    assert_eq!(uncompared.len(), 1, "{uncompared:?}");
+    assert!(uncompared[0].contains("`rms_norm`"), "{uncompared:?}");
+    assert!(
+        uncompared[0].contains("its rows hold no scratch page"),
+        "{uncompared:?}"
+    );
+}
+
 #[test]
 fn a_changed_kernel_under_an_unchanged_launch_table_is_a_rebind() {
     let (runner, serving) = captured();

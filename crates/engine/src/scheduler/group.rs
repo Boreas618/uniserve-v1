@@ -372,6 +372,7 @@ mod tests {
             eos_token_ids: Vec::new(),
             feature_bytes: 0,
             encoder_identity: String::new(),
+            latent_seed: 0,
             media_bytes: Vec::new(),
             call_window: 2,
         };
@@ -433,6 +434,7 @@ mod tests {
         let opened = runtime::Opened {
             regions: ids.iter().map(|id| (id.0 + 1, 9)).collect(),
             segments: Vec::new(),
+            limits: Vec::new(),
             registers: vec![runtime::Registers {
                 completed: Vec::new(),
                 capacity: Vec::new(),

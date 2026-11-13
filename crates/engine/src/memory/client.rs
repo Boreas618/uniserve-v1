@@ -538,13 +538,17 @@ impl StorageClient {
     /// `layout.schedulers`; the layout and the answer are kept ([`Self::session`]).
     ///
     /// The segments each device region of `layout` states were created by the engine's ranks
-    /// before this call, on every rank that maps the region (BP §14.2).
+    /// before this call, on every rank that maps the region (BP §14.2). A region an earlier
+    /// session named keeps the numbering the buffer pool holds for it (`Opened::limits`), which
+    /// may differ from the one `layout` states when the epochs measured their devices apart: the
+    /// kept layout states each region with the numbering the answer states, which the ranks lay
+    /// their memory out by and the schedulers grow their regions to.
     ///
     /// # Errors
     ///
     /// A session open already; the server's refusal of the layout; an answer that does not state
     /// every region and scheduler of the layout, or a queue pair that cannot be mapped.
-    pub fn open(&mut self, layout: Open) -> anyhow::Result<Vec<QueuePair>> {
+    pub fn open(&mut self, mut layout: Open) -> anyhow::Result<Vec<QueuePair>> {
         if self.session.is_some() {
             bail!(
                 "the session of epoch {} with the buffer pool is open already",
@@ -558,13 +562,19 @@ impl StorageClient {
             .with_context(|| format!("opening epoch {}'s session", layout.epoch))?;
         if opened.regions.len() != layout.regions.len()
             || opened.segments.len() != layout.regions.len()
+            || opened.limits.len() != layout.regions.len()
         {
             bail!(
-                "a layout of {} regions was answered for {} regions and {} segment tables",
+                "a layout of {} regions was answered for {} regions, {} segment tables and {} \
+                 numberings",
                 layout.regions.len(),
                 opened.regions.len(),
-                opened.segments.len()
+                opened.segments.len(),
+                opened.limits.len()
             );
+        }
+        for (region, &limit) in layout.regions.iter_mut().zip(&opened.limits) {
+            region.limit = limit;
         }
 
         // The engine's end of each queue pair: the scheduler writes its submission queue and
@@ -580,8 +590,9 @@ impl StorageClient {
         Ok(pairs)
     }
 
-    /// The layout the session was opened with and the buffer pool's answer to it; `None` before
-    /// the session is open and on a rank's connection. The answer's segment table of each region
+    /// The layout the session was opened with, each region numbered as the buffer pool holds it,
+    /// and the buffer pool's answer to it; `None` before the session is open and on a rank's
+    /// connection. The answer's segment table of each region
     /// is the one the Storage Server holds for the region's memory space: as `Open` answered it,
     /// with the segments this head granted since ([`Self::grant`]) and without those it withdrew
     /// ([`Self::withdraw`]).

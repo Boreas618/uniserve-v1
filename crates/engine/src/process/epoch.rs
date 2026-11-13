@@ -29,7 +29,7 @@ use crate::worker::Worker;
 
 use super::operations::{resume, stopped};
 use crate::memory::client::StorageClient;
-use crate::process::data_plane::DataPlane;
+use crate::process::binding::WeightBinding;
 use crate::scheduler::Message;
 
 /// Starts the drain of every scheduler (`specs/scheduler-design.md` §3.8): each admits nothing
@@ -83,7 +83,7 @@ pub(crate) fn drain(
 /// A region the session does not state, or a rank's failure to release what the head withdrew.
 pub(crate) fn release(
     head: &Mutex<StorageClient>,
-    data: &DataPlane,
+    binding: &WeightBinding,
     workers: &[Arc<Worker>],
     region: u8,
     units: u32,
@@ -126,7 +126,7 @@ pub(crate) fn release(
         return Ok((Vec::new(), 0));
     }
 
-    data.release_segments(&groups, u32::try_from(from).unwrap_or(u32::MAX))?;
+    binding.release_segments(&groups, u32::try_from(from).unwrap_or(u32::MAX))?;
     let devices = workers
         .iter()
         .filter(|worker| groups.contains(&worker.group()))
@@ -150,7 +150,7 @@ pub(crate) fn release(
 pub(crate) fn grow(
     schedulers: &[Sender<Message>],
     head: &Mutex<StorageClient>,
-    data: &DataPlane,
+    binding: &WeightBinding,
 ) -> Result<Vec<(u8, u32)>> {
     {
         let mut head = lock(head);
@@ -161,11 +161,11 @@ pub(crate) fn grow(
             .collect();
 
         for (index, groups) in regions {
-            let fitting = data.fitting_segments(&groups)?;
+            let fitting = binding.fitting_segments(&groups)?;
             if fitting == 0 {
                 continue;
             }
-            let tables = data.create_segments(&groups, Some(fitting))?;
+            let tables = binding.create_segments(&groups, Some(fitting))?;
             grant_held(&mut head, index, &tables)?;
         }
     }
@@ -181,10 +181,12 @@ pub(crate) fn grow(
 /// # Errors
 ///
 /// A device or quota that refuses the graph pools or the reservation; nothing admits then.
-pub(crate) fn promote(schedulers: &[Sender<Message>], data: &DataPlane) -> Result<()> {
-    data.restore_graphs()
+pub(crate) fn promote(schedulers: &[Sender<Message>], binding: &WeightBinding) -> Result<()> {
+    binding
+        .restore_graphs()
         .context("restoring the promoted engine's graph pools")?;
-    data.reserve_serving()
+    binding
+        .reserve_serving()
         .context("reserving what the ranks hold in their devices' quotas")?;
 
     resume(schedulers);

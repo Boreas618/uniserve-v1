@@ -12,8 +12,8 @@
 //! form of a process that serves no deployment, such as a test or a tool.
 //!
 //! A segmented storage is one address range whose parts are retained apart, so part of it is
-//! given back and created again while every address stays valid: the value planes of a KV
-//! cache, which a sleep gives back and a wake restores.
+//! given back and created again while every address stays valid: the value and state planes of a
+//! KV cache, which a sleep gives back and a wake restores.
 
 use std::sync::Arc;
 

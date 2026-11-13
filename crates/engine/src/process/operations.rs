@@ -14,7 +14,7 @@
 //!
 //! The schedulers are named by their inboxes, in the order of the session's schedulers
 //! (`Open::schedulers`); the head is the engine's connection to its host's Storage Server, which
-//! states each change of the KV planes' segments (`crate::process::data_plane`, "The KV planes'
+//! states each change of the KV planes' segments (`crate::process::binding`, "The KV planes'
 //! memory"). A `Resume` ends a drain as well as a pause, so no job that pauses the schedulers runs
 //! while the engine drains.
 
@@ -22,7 +22,7 @@ use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use crate::process::data_plane::WeightsUpdated;
+use crate::process::binding::WeightsUpdated;
 use anyhow::{Context as _, Result, anyhow, bail};
 use crossbeam_channel::Sender;
 use proto::config::SchedulerConfig;
@@ -33,7 +33,7 @@ use storage::runtime::GroupId;
 
 use super::epoch;
 use crate::memory::client::StorageClient;
-use crate::process::data_plane::{DataPlane, Target};
+use crate::process::binding::{Target, WeightBinding};
 use crate::scheduler::{self, Message};
 
 /// How long a release that makes room waits before it asks a region again for units its requests
@@ -132,52 +132,52 @@ pub(crate) fn at_boundary<T>(
 /// # Errors
 ///
 /// A checkpoint of another model, a load that failed (the ranks serve on as they did), a mapping
-/// change that failed part of the way (the data plane is poisoned, and the epoch must end), or
+/// change that failed part of the way (the weight binding is poisoned, and the epoch must end), or
 /// a scheduler that stopped.
 pub(crate) fn update_weights(
     schedulers: &[Sender<Message>],
     head: &Mutex<StorageClient>,
-    data: &DataPlane,
+    binding: &WeightBinding,
     target: Target,
     in_flight: WeightsInFlight,
 ) -> Result<Vec<WeightsUpdated>> {
     let checkpoint = target.checkpoint.display().to_string();
-    let replacement = data
+    let replacement = binding
         .pair(target, false)
         .with_context(|| format!("pairing the weights of {checkpoint}"))?;
 
     match in_flight {
         WeightsInFlight::Keep => {
             let bytes = replacement.bytes();
-            let rooms = data.room()?;
-            let graphs = data.graph_bytes();
+            let rooms = binding.room()?;
+            let graphs = binding.graph_bytes();
 
             if rooms.iter().all(|room| room.holds(bytes, 0)) {
-                let loaded = data.load(replacement)?;
+                let loaded = binding.load(replacement)?;
                 at_boundary(schedulers, || {
-                    data.stage(loaded);
-                    apply(schedulers, data)
+                    binding.stage(loaded);
+                    apply(schedulers, binding)
                 })
             } else if rooms.iter().all(|room| room.holds(bytes, graphs)) {
                 // The graph storage makes the room: nothing may replay a graph until it is back,
                 // and it comes back only once the old weights' storage went.
                 at_boundary(schedulers, || {
-                    data.suspend_graphs()?;
-                    let applied = data
+                    binding.suspend_graphs()?;
+                    let applied = binding
                         .load(replacement)
                         .map_err(anyhow::Error::from)
                         .and_then(|loaded| {
-                            data.stage(loaded);
-                            apply(schedulers, data)
+                            binding.stage(loaded);
+                            apply(schedulers, binding)
                         });
-                    let restored = data.restore_graphs();
+                    let restored = binding.restore_graphs();
 
                     let reports = applied?;
                     restored?;
                     Ok(reports)
                 })
             } else {
-                data.discard(replacement);
+                binding.discard(replacement);
                 bail!(
                     "the weights of {checkpoint} take {bytes} bytes beside the KV cache, and the \
                      devices have {rooms:?} of room with {graphs} bytes of graph storage to give \
@@ -196,12 +196,12 @@ pub(crate) fn update_weights(
 
             // The engine wakes whatever happened after the drain: a sleep that stopped part way
             // is undone by the wake, which grants back what the head withdrew.
-            let applied = sleep(schedulers, head, data).and_then(|()| {
-                let loaded = data.load(replacement)?;
-                data.stage(loaded);
-                apply(schedulers, data)
+            let applied = sleep(schedulers, head, binding).and_then(|()| {
+                let loaded = binding.load(replacement)?;
+                binding.stage(loaded);
+                apply(schedulers, binding)
             });
-            let woken = wake(schedulers, head, data);
+            let woken = wake(schedulers, head, binding);
 
             let reports = applied?;
             woken?;
@@ -211,16 +211,19 @@ pub(crate) fn update_weights(
 }
 
 /// Puts the staged weights in place on every rank, and has every scheduler flush its cache and
-/// key the pages and trajectories it stores from here on by the new weights. The requests the
-/// schedulers hold continue: under a weight update they commit nothing more.
+/// key the pages, encoder outputs and trajectories it stores from here on by the new weights. The
+/// requests the schedulers hold continue: under a weight update they commit nothing more.
 ///
-/// The page seed of each cache group is the one the ranks' page identities for the new weights
-/// give (`storage::key::page_seed`), as the rank start states the first ones; the latent seed is
-/// the one the new weights' identities give (`storage::key::latent_seed`), so that no trajectory
-/// another set of weights computed is restored. A data plane of no rank states no identity, and
-/// the seeds stay.
-fn apply(schedulers: &[Sender<Message>], data: &DataPlane) -> Result<Vec<WeightsUpdated>> {
-    let reports = data.update_weights()?;
+/// What keys them is what the rank start states in each group's `Capacity` for the weights it
+/// serves (`crate::process::ranks::capacities`), now for the new ones: the page seed of each cache
+/// group, from the ranks' page identities for the new weights (`storage::key::page_seed`); the
+/// latent seed, from every rank's identity of its new weights (`storage::key::latent_seed`); and
+/// per group whose ranks encode, the identity of their new weights
+/// ([`WeightBinding::encoder_identities`]), which each scheduler takes for its groups. So no
+/// block, encoder output or trajectory another set of weights computed is read. A weight binding
+/// of no rank states no identity, and the seeds stay.
+fn apply(schedulers: &[Sender<Message>], binding: &WeightBinding) -> Result<Vec<WeightsUpdated>> {
+    let reports = binding.update_weights()?;
 
     let seeds = reports.first().map(|report| {
         let pages: Vec<Key> = report
@@ -233,7 +236,7 @@ fn apply(schedulers: &[Sender<Message>], data: &DataPlane) -> Result<Vec<Weights
                 .iter()
                 .filter_map(|report| report.identity.as_deref()),
         );
-        (pages, latent)
+        (pages, latent, binding.encoder_identities())
     });
 
     let flushed = ask(schedulers, |reply| {
@@ -256,7 +259,7 @@ fn apply(schedulers: &[Sender<Message>], data: &DataPlane) -> Result<Vec<Weights
 pub(crate) fn sleep(
     schedulers: &[Sender<Message>],
     head: &Mutex<StorageClient>,
-    data: &DataPlane,
+    binding: &WeightBinding,
 ) -> Result<()> {
     let drained = epoch::drain(schedulers, Instant::now(), true)?;
     for (index, replied) in drained.into_iter().enumerate() {
@@ -273,7 +276,7 @@ pub(crate) fn sleep(
             withdrawn.context("withdrawing the KV cache's segments for the sleep")?;
         }
     }
-    data.sleep()?;
+    binding.sleep()?;
     Ok(())
 }
 
@@ -288,9 +291,9 @@ pub(crate) fn sleep(
 pub(crate) fn wake(
     schedulers: &[Sender<Message>],
     head: &Mutex<StorageClient>,
-    data: &DataPlane,
+    binding: &WeightBinding,
 ) -> Result<Vec<(u8, u32)>> {
-    data.wake()?;
+    binding.wake()?;
 
     {
         let mut head = lock(head);
@@ -300,7 +303,7 @@ pub(crate) fn wake(
             .map(|index| (index, epoch::groups_of(open, index)))
             .collect();
         for (index, groups) in regions {
-            epoch::grant_held(&mut head, index, &data.segment_tables(&groups))?;
+            epoch::grant_held(&mut head, index, &binding.segment_tables(&groups))?;
         }
     }
 
@@ -327,7 +330,7 @@ pub(crate) fn wake(
 pub(crate) fn make_room(
     schedulers: &[Sender<Message>],
     head: &Mutex<StorageClient>,
-    data: &DataPlane,
+    binding: &WeightBinding,
     bytes: u64,
     devices: &BTreeMap<[u8; 16], u64>,
 ) -> Result<()> {
@@ -348,7 +351,7 @@ pub(crate) fn make_room(
             ) else {
                 continue;
             };
-            let rooms = data.device_rooms(&epoch::groups_of(open, index))?;
+            let rooms = binding.device_rooms(&epoch::groups_of(open, index))?;
 
             // The release from `first` on gives each device the bytes of the segments there.
             let leaves_room = |first: usize| {
@@ -405,7 +408,7 @@ pub(crate) fn make_room(
             )
         };
         // What the head withdrew is released whatever stopped the withdrawals.
-        data.release_segments(&groups, u32::try_from(from).unwrap_or(u32::MAX))?;
+        binding.release_segments(&groups, u32::try_from(from).unwrap_or(u32::MAX))?;
         withdrawn.context("withdrawing the KV cache's tail segments")?;
     }
     Ok(())
@@ -426,20 +429,21 @@ pub(crate) fn flush(schedulers: &[Sender<Message>]) -> Result<()> {
     })
 }
 
-/// Puts the redistribution of the routed experts the data plane holds ready in place, at one
+/// Puts the redistribution of the routed experts the weight binding holds ready in place, at one
 /// boundary of every scheduler, and returns each rank's report (`docs/admin.md`, "Expert
 /// redistribution"). The numerical weights are the same, so nothing is flushed.
 ///
 /// # Errors
 ///
-/// As [`DataPlane::commit_experts`], or a scheduler that stopped.
+/// As [`WeightBinding::commit_experts`], or a scheduler that stopped.
 pub(crate) fn commit_experts(
     schedulers: &[Sender<Message>],
-    data: &DataPlane,
+    binding: &WeightBinding,
     order: &BTreeMap<String, Vec<u32>>,
 ) -> Result<Vec<WeightsUpdated>> {
     at_boundary(schedulers, || {
-        data.commit_experts(order)
+        binding
+            .commit_experts(order)
             .context("putting the experts' new order in place")
     })
 }
@@ -456,21 +460,21 @@ pub(crate) fn commit_experts(
 ///
 /// A name this process has no operation of, a payload the operation refuses, or the
 /// operation's failure.
-pub(crate) fn hook(data: &Arc<DataPlane>, name: &str, payload: &str) -> Result<Vec<String>> {
+pub(crate) fn hook(binding: &Arc<WeightBinding>, name: &str, payload: &str) -> Result<Vec<String>> {
     let results = match name {
         "uniserve.prepare_experts" => {
             let orders: BTreeMap<String, Vec<u32>> =
                 serde_json::from_str(payload).context("an expert order")?;
-            data.prepare_experts(orders)?
+            binding.prepare_experts(orders)?
         }
-        "uniserve.start_experts" => data.start_experts()?,
-        "uniserve.experts_ready" => data.experts_ready()?,
-        "uniserve.abort_experts" => data.abort_experts()?,
-        "load_lora_adapter" => data.load_adapter(payload)?,
-        "unload_lora_adapter" => data.unload_adapter(payload)?,
-        "uniserve.profile_start" => data.start_profile(payload)?,
-        "uniserve.profile_stop" => data.stop_profile(payload)?,
-        "uniserve.profile_release" => data.release_profile(payload)?,
+        "uniserve.start_experts" => binding.start_experts()?,
+        "uniserve.experts_ready" => binding.experts_ready()?,
+        "uniserve.abort_experts" => binding.abort_experts()?,
+        "load_lora_adapter" => binding.load_adapter(payload)?,
+        "unload_lora_adapter" => binding.unload_adapter(payload)?,
+        "uniserve.profile_start" => binding.start_profile(payload)?,
+        "uniserve.profile_stop" => binding.stop_profile(payload)?,
+        "uniserve.profile_release" => binding.release_profile(payload)?,
         "uniserve.fence_switch" => fence_switch(payload)?,
         other => bail!("this process has no operation named {other:?}"),
     };

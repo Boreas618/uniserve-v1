@@ -842,12 +842,13 @@ impl Graphs {
     /// `operator`: an eager forward under the generation being prepared in which every call of
     /// the operator whose kernel changed is launched with both generations' kernels over the
     /// same inputs, the serving kernel writing the outputs the forward continues on. The pairs
-    /// are compared within each call's tolerance, and the elements compared are returned.
+    /// are compared within each call's tolerance, and the elements compared are returned;
+    /// `None` when the batch compared no pair, which is then no evidence for the operator.
     ///
     /// The runner prepares the inputs of a paired forward so that it writes no state a serving
     /// request reads. A paired forward it prepared none for ([`Graphs::unpaired`]) runs
-    /// nothing and compares no element: the operator is named in [`Graphs::uncompared`] with
-    /// the runner's reason. So is one whose outputs exceed the shadow region
+    /// nothing and compares nothing: the operator is named in [`Graphs::uncompared`] with the
+    /// runner's reason, and `None` is returned. So is one whose outputs exceed the shadow region
     /// ([`Graphs::shadow_peak`]).
     ///
     /// # Errors
@@ -860,7 +861,7 @@ impl Graphs {
         runner: &dyn Runner,
         bucket: &Bucket,
         operator: &'static str,
-    ) -> Result<u64> {
+    ) -> Result<Option<u64>> {
         if !matches!(self.state.borrow().update, Update::Prepared { .. }) {
             return Err(Error::State("no generation is being prepared"));
         }
@@ -871,7 +872,7 @@ impl Graphs {
                     .borrow_mut()
                     .uncompared
                     .push(format!("`{operator}` in bucket {bucket}: {reason}"));
-                return Ok(0);
+                return Ok(None);
             }
         };
 

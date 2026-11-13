@@ -17,7 +17,7 @@
 //! As the binary's start grants the segments its ranks created and grows the KV regions into
 //! them, the pool's thread grants each device region the session opened short of its numbering
 //! one segment of the whole numbering, and each scheduler grows the region by `Resize` before the
-//! engine serves. The engine holds no rank: no worker of a device, a data plane of no rank, no
+//! engine serves. The engine holds no rank: no worker of a device, a weight binding of no rank, no
 //! head of a session with a Storage Server and no Build Server (`Engine::new`), so an operation
 //! on the ranks answers with no rank's result, an operation on the KV cache's segments is refused,
 //! and a preparation fails.

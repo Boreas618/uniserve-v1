@@ -139,8 +139,9 @@ impl MainProcess {
     /// States the process's metrics on every front: the schedulers' sums since the start; the
     /// device time the workers spent in forwards and the kernels their serving forwards
     /// launched (`Worker::counters`); and what each device maps now, against the limit of its
-    /// GPU's quota: each pool of its allocators and its KV regions' planes (`DataPlane::memory`),
-    /// which the daemon exports as `uniserve:memory_budget` and `uniserve:memory_mapped`.
+    /// GPU's quota: each pool of its allocators and its KV regions' planes
+    /// (`WeightBinding::memory`), which the daemon exports as `uniserve:memory_budget` and
+    /// `uniserve:memory_mapped`.
     pub(super) fn metrics(&mut self) {
         let Some(engine) = self.engine.as_ref() else {
             return;
@@ -153,7 +154,7 @@ impl MainProcess {
         }
         self.metrics.device_ns = device_ns;
         self.metrics.kernel_launches = kernel_launches;
-        self.metrics.memory = engine.data.memory();
+        self.metrics.memory = engine.binding.memory();
 
         let metrics = self.metrics.clone();
         self.broadcast(&from_engine::Kind::Metrics(metrics));
@@ -218,7 +219,7 @@ impl MainProcess {
         self.watchdog.settled(&in_flight);
 
         if failure.is_none()
-            && let Some(reason) = engine.data.poisoned()
+            && let Some(reason) = engine.binding.poisoned()
         {
             let reason = format!("a change of the ranks' weights failed part of the way: {reason}");
             failure = Some((reason.clone(), lifecycle::fault("weights", reason, 0)));

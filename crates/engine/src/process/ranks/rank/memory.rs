@@ -368,7 +368,7 @@ impl ModelRunner {
 
 /// The units of a cache of `units` units laid out in `layout`, split into segments of whole
 /// `granularity`-byte granules, that `remainder` bytes hold now: the planes that are not split
-/// (flags, scales, index keys, state planes) are made for every unit at once, and of the value
+/// (flags, scales, index keys) are made for every unit at once, and of the value and state
 /// planes the segments from the first on, as many whole ones as the rest holds. Zero when the
 /// unsplit planes do not fit, or the cache does not split.
 pub(crate) fn first_units(
@@ -383,11 +383,11 @@ pub(crate) fn first_units(
         return 0;
     };
 
-    // One unit of both value planes over every column, which its segment holds; the rest of a
+    // One unit of the split planes over every column, which its segment holds; the rest of a
     // unit's bytes is in planes that are not split.
-    let values = 2 * u64::from(layout.columns) * layout.plane_bytes;
-    let unsplit = u64::from(units) * layout.unit_bytes.saturating_sub(values);
-    let segment = (u64::from(per_segment) * values).max(1);
+    let split = layout.split_bytes();
+    let unsplit = u64::from(units) * layout.unit_bytes.saturating_sub(split);
+    let segment = (u64::from(per_segment) * split).max(1);
 
     let fitting = remainder
         .checked_sub(unsplit)
@@ -573,6 +573,7 @@ pub(super) fn cache_dtype(
 
 #[cfg(test)]
 mod tests {
+    use nn::family::StateShape;
     use proto::request::PrefixCacheDtype;
     use storage::Segment;
 
@@ -610,6 +611,47 @@ mod tests {
         );
         // The unsplit planes are made for every unit, or the start holds no segment at all.
         assert_eq!(first_units(1024, &layout, GRANULE, unsplit - 1), 0);
+    }
+
+    /// A hybrid cache's state planes are split with its key and value planes, a segment holding
+    /// the state planes of its units beside their keys and values: what the start makes for every
+    /// unit at once is a unit's flags alone, so a target of another layout creates its state as
+    /// the serving epoch drains, segment by segment, rather than whole at its start.
+    #[test]
+    fn a_hybrid_cache_creates_its_state_planes_with_its_segments() {
+        // Four attention layers and four recurrent ones, each of whose checkpoints fills one
+        // 32 KiB plane: four columns, and one state plane per column of a unit.
+        let state = StateShape {
+            layers: 4,
+            fields: vec![StateField {
+                name: "state",
+                dtype: DType::BF16,
+                dims: vec![16 << 10],
+                stepwise: false,
+            }],
+        };
+        let layout =
+            CacheLayout::hybrid(64, 4, 2, 128, PrefixCacheDtype::BFloat16, &[state]).unwrap();
+        assert_eq!((layout.columns, layout.state_fields()), (4, 1));
+
+        // A unit's keys, values and state plane in every column split; its two flags a column
+        // do not.
+        let planes = 3 * u64::from(layout.columns) * layout.plane_bytes;
+        let flags = 2 * u64::from(layout.columns);
+        assert_eq!(layout.split_bytes(), planes);
+        assert_eq!(layout.unit_bytes, planes + flags);
+
+        // 1024 units split into eight segments of 128: three of them and the flags of every unit
+        // fit, and a byte less leaves two.
+        let segment = 128 * planes;
+        assert_eq!(
+            first_units(1024, &layout, GRANULE, 1024 * flags + 3 * segment),
+            384
+        );
+        assert_eq!(
+            first_units(1024, &layout, GRANULE, 1024 * flags + 3 * segment - 1),
+            256
+        );
     }
 
     #[test]

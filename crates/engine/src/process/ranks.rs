@@ -8,7 +8,8 @@
 //!    profile run names, the weights, and the units of its cache, agreed over its host group.
 //! 2. [`layout`] states the session's layout from those units; its device KV regions state no
 //!    segment and ask for no unit, since none of their memory exists yet. The head opens the
-//!    session with it.
+//!    session with it, and the answer numbers each region as the buffer pool holds it: a region
+//!    an earlier session named keeps that session's numbering, which the ranks then take.
 //! 3. [`open_ranks`] maps on every rank the segments the answer's table states for its region,
 //!    creates the segments that cover the rest of the region's units as far as the GPU's quota
 //!    held them at the division (the rest a grow creates), and opens the graph pool,
@@ -165,8 +166,9 @@ pub(crate) struct TextRank {
     /// The rank's partition of the model.
     pub(crate) model: Arc<dyn TextModel>,
     /// The units of the rank's cache, the padding unit included: the division's count, which every
-    /// rank of its host group agreed, in whole segments. It numbers the region as if the epoch
-    /// served the GPU alone.
+    /// rank of its host group agreed, in whole segments, numbering the region as if the epoch
+    /// served the GPU alone; from the rank's opening on, the region's numbering as the session
+    /// holds it, which an earlier epoch of the layout may have stated ([`open_ranks`]).
     pub(crate) units: u32,
     /// The units of `units` the rank's start creates segments for, which every rank of its host
     /// group agreed: the whole segments the GPU's quota held at the division. The rest are
@@ -179,8 +181,8 @@ pub(crate) struct TextRank {
     /// The config of the rank's runner: the profiled runner's until the rank is opened, the
     /// serving runner's after.
     pub(crate) config: CausalLmConfig,
-    /// The rank's cache and recurrent state, which its runner reads and the data plane operates:
-    /// the profile run's owners, which hold no device, until the rank is opened over the
+    /// The rank's cache and recurrent state, which its runner reads and the weight binding
+    /// operates: the profile run's owners, which hold no device, until the rank is opened over the
     /// session's memory.
     pub(crate) cache: Arc<Mutex<KvCacheMemory>>,
     pub(crate) state: Option<Arc<Mutex<StateMemory>>>,
@@ -193,10 +195,10 @@ pub(crate) struct TextRank {
 }
 
 impl LoadedRank {
-    /// What the data plane holds of this rank once `worker` serves it
-    /// ([`crate::process::data_plane::Rank`]): the owners of its device's storage, a stream of the
-    /// device for the data plane's own operations, and how it loads its model again; `None` for a
-    /// rank of a meta start, which holds no device.
+    /// What the weight binding holds of this rank once `worker` serves it
+    /// ([`crate::process::binding::Rank`]): the owners of its device's storage, a stream of the
+    /// device for the weight binding's own operations, and how it loads its model again; `None`
+    /// for a rank of a meta start, which holds no device.
     ///
     /// # Errors
     ///
@@ -204,7 +206,7 @@ impl LoadedRank {
     pub(crate) fn data_rank(
         &self,
         worker: &Arc<Worker>,
-    ) -> Result<Option<crate::process::data_plane::Rank>> {
+    ) -> Result<Option<crate::process::binding::Rank>> {
         let (Some(client), Some(store), Some(pool)) = (&self.client, &self.store, &self.pool)
         else {
             return Ok(None);
@@ -216,7 +218,7 @@ impl LoadedRank {
         };
 
         let (_, fraction) = self.model_runner.fractions()?;
-        Ok(Some(crate::process::data_plane::Rank {
+        Ok(Some(crate::process::binding::Rank {
             rank: self.model_runner.rank(),
             worker: Arc::downgrade(worker),
             device,
@@ -232,7 +234,21 @@ impl LoadedRank {
             unattributed: 0,
             model: Arc::new(RankModel::new(self.model_runner.clone())),
             serving: self.weights.clone(),
+            encodes: self.encodes(),
         }))
+    }
+
+    /// Whether the rank computes encoder outputs: it serves a text encoding, a chat image's
+    /// vision encoding or a condition latent's encoding, whose outputs the encoder identity of
+    /// its group keys (`Capacity::encoder_identity`).
+    pub(crate) fn encodes(&self) -> bool {
+        let serves = |phase: Phase| match &self.loaded {
+            Loaded::Text(text) => text.config.phases.contains(&phase),
+            Loaded::Video(video) => video.capacity.serves(phase),
+        };
+        [Phase::TextEncode, Phase::VisionEncode, Phase::LatentEncode]
+            .into_iter()
+            .any(serves)
     }
 
     /// The rank's one device.
@@ -864,10 +880,13 @@ fn media_memory(groups: &[WorkerGroupConfig]) -> String {
     devices.join(",")
 }
 
-/// The name of the device region of scheduler `scheduler`'s KV units of `layout` and `units`: two
-/// epochs of one layout and one cache name one region, and any other layout another, whose memory
-/// space is its own (`specs/buffer-pool.md` §14.1).
-fn units_region(scheduler: usize, layout: &CacheLayout, units: u32) -> Result<String> {
+/// The name of the device region of scheduler `scheduler`'s KV units of `layout`: two epochs of one
+/// layout name one region, and any other layout another, whose memory space is its own
+/// (`specs/buffer-pool.md` §14.1). The name covers what lays a unit out, never how many units
+/// there are: an epoch numbers its cache from what its GPU's quota holds, a figure measured at
+/// its start, and a successor of the same layout that measures another figure still names its
+/// predecessor's region, whose numbering the buffer pool keeps (`Opened::limits`).
+fn units_region(scheduler: usize, layout: &CacheLayout) -> Result<String> {
     let mut digest = storage::key::Digest::new(b"uniserve.units-region");
     for group in 0..layout.groups.len() {
         let shape = host::page_shape(layout, group)?;
@@ -877,7 +896,6 @@ fn units_region(scheduler: usize, layout: &CacheLayout, units: u32) -> Result<St
         layout.unit_bytes,
         layout.plane_bytes,
         u64::from(layout.columns),
-        u64::from(units),
     ]);
     let digest = digest.finish();
     Ok(format!("kv {scheduler} {}", short(&digest)))
@@ -925,9 +943,11 @@ pub(crate) fn layout(launch: &EngineArgs, ranks: &[LoadedRank]) -> Result<Open> 
 /// `slot_bytes` of one rank's device memory:
 ///
 /// - **Regions.** Per scheduler, the device region of its KV units, the same units on every rank
-///   and group of it. It states no segment and asks for no unit: its memory is the segments its
-///   ranks map or create once the session is open, which the head grants, and its scheduler then
-///   grows it into them by `Resize`. Per class of a cache group, when the deployment keeps a host
+///   and group of it, named by its layout alone and numbered `units`. It states no segment and
+///   asks for no unit: its memory is the segments its ranks map or create once the session is
+///   open, which the head grants, and its scheduler then grows it into them by `Resize`. A
+///   region an earlier epoch named keeps that epoch's numbering, which the answer states. Per
+///   class of a cache group, when the deployment keeps a host
 ///   tier, the host region of its pages, one page a unit. Per worker group, the region of its
 ///   slot rows, numbered from 1, the epoch's own. A unit's bytes are summed over the tensor ranks
 ///   that hold a part of it.
@@ -1005,7 +1025,7 @@ pub fn text_layout(
     let slot_bytes = slot_bytes.max(1);
     let mut stated: Vec<Group> = Vec::new();
     for (scheduler, listed) in schedulers.iter().enumerate() {
-        let name = units_region(scheduler, cache, units)?;
+        let name = units_region(scheduler, cache)?;
         let kv_region = region_index(&regions)?;
         regions.push(Region {
             space: name.clone(),
@@ -1436,22 +1456,24 @@ pub(crate) fn open_ranks(
     }
     let tables = &opened.segments;
 
-    // Each rank's KV region and its table, read before the ranks go to their threads.
+    // Each rank's KV region, its numbering and its table, read before the ranks go to their
+    // threads.
     let mut regions = Vec::with_capacity(ranks.len());
     for rank in ranks.iter() {
         let (_, kv, _) = stated_regions(rank, layout)?;
         let table = tables
             .get(usize::from(kv))
             .with_context(|| format!("the answer states no segment table of region {kv}"))?;
-        regions.push((layout.regions[usize::from(kv)].name.clone(), table));
+        let region = &layout.regions[usize::from(kv)];
+        regions.push((region.name.clone(), (region.limit, table)));
     }
 
     let opened: Vec<Segments> = std::thread::scope(|scope| {
         let mut handles = Vec::with_capacity(ranks.len());
-        for (index, (rank, (_, table))) in ranks.iter_mut().zip(&regions).enumerate() {
+        for (index, (rank, (_, region))) in ranks.iter_mut().zip(&regions).enumerate() {
             let handle = std::thread::Builder::new()
                 .name(format!("rank-open-{index}"))
-                .spawn_scoped(scope, move || open_rank(rank, table))
+                .spawn_scoped(scope, move || open_rank(rank, *region))
                 .context("starting a rank's opening")?;
             handles.push(handle);
         }
@@ -1480,9 +1502,12 @@ pub(crate) fn open_ranks(
     Ok(created)
 }
 
-/// Opens one rank over its KV region's segment table `table` (steps 16-22, [`open_ranks`]).
-/// Returns the segments it created, as `(segment, first unit, units)`.
-fn open_rank(rank: &mut LoadedRank, table: &Segments) -> Result<Segments> {
+/// Opens one rank over its KV region of `units` units, the padding unit included, as the session
+/// numbers it, and the region's segment table `table` (steps 16-22, [`open_ranks`]). The rank's
+/// cache takes the region's numbering, which is its own division's count unless an earlier epoch
+/// of the layout numbered the region otherwise. Returns the segments it created, as
+/// `(segment, first unit, units)`.
+fn open_rank(rank: &mut LoadedRank, (units, table): (u32, &Segments)) -> Result<Segments> {
     let device = rank.device()?;
     let LoadedRank {
         model_runner,
@@ -1497,7 +1522,15 @@ fn open_rank(rank: &mut LoadedRank, table: &Segments) -> Result<Segments> {
         bail!("a media rank opens no cache");
     };
     let layout = Arc::clone(service::lock(&rank.cache).layout());
-    let units = rank.units;
+    if units != rank.units {
+        tracing::info!(
+            rank = model_runner.rank(),
+            divided = rank.units,
+            numbered = units,
+            "the rank takes the numbering an earlier epoch gave its region"
+        );
+    }
+    rank.units = units;
     let state_config = model_runner.state_config(rank.model.as_ref(), model_runner.buckets())?;
     let config = model_runner.causal_config(rank.model.as_ref(), &layout, units)?;
     let inputs = CausalLmRunner::input_bytes(&config)?;
@@ -2269,14 +2302,21 @@ fn text_regions(layout: &Open, opened: &Opened, group: Option<&Group>) -> Vec<u8
 ///
 /// A cache group's page seed is `storage::key::page_seed` of its page identity
 /// (`KvCacheMemory::page_identities`) for the identity of the weights this process's ranks serve,
-/// in rank order (`crate::process::data_plane::identity_of`): what the data plane keys the ranks'
+/// in rank order (`crate::process::binding::identity_of`): what the weight binding keys the ranks'
 /// pages by, so a block computed by other weights or in another layout is another block.
 ///
 /// A group's encoder identity is, in the same way, the identity of the weights of its ranks that
 /// compute encoder outputs (a text encoding's conditioning, a chat image's features), in rank
-/// order: the encoder's and its vision tower's, with whatever else those ranks hold, which keys
-/// the outputs (`storage::key::encoder_output`) so that an output other weights computed is
-/// another block. A group none of whose ranks encodes states none.
+/// order (`crate::process::binding::encoder_identities`): the encoder's and its vision tower's,
+/// with whatever else those ranks hold, which keys the outputs (`storage::key::encoder_output`)
+/// so that an output other weights computed is another block. A group none of whose ranks
+/// encodes states none.
+///
+/// A group that denoises states the latent seed of the identities of the weights of every rank
+/// of the process (`storage::key::latent_seed`), which keys the trajectories it stores
+/// (`storage::key::latent_content`): a trajectory follows from the denoiser's weights and from
+/// the encoders' that compute its conditioning. A weight update's `Flush` renews all three from
+/// the same weights (`crate::process::operations`).
 ///
 /// # Errors
 ///
@@ -2286,11 +2326,16 @@ pub(crate) fn capacities(ranks: &[LoadedRank], layout: &Open) -> Result<Vec<(Gro
         .iter()
         .flat_map(|rank| rank.weights.iter().cloned())
         .collect();
-    let identity = crate::process::data_plane::identity_of(&order);
+    let identity = crate::process::binding::identity_of(&order);
+    let identities: Vec<String> = ranks
+        .iter()
+        .map(|rank| crate::process::binding::identity_of(&rank.weights))
+        .collect();
+    let latent = storage::key::latent_seed(identities.iter().map(String::as_str));
 
     let mut stated: Vec<(GroupId, Capacity)> = Vec::new();
-    // Per group, the weights of its ranks that encode, in rank order.
-    let mut encoding: Vec<(GroupId, Vec<(WeightKey, bool)>)> = Vec::new();
+    // Each rank that encodes, with its group, in rank order.
+    let mut encoding: Vec<(GroupId, &[(WeightKey, bool)])> = Vec::new();
     for rank in ranks {
         let id = session_group(rank, layout)?;
         let capacity = match &rank.loaded {
@@ -2307,14 +2352,8 @@ pub(crate) fn capacities(ranks: &[LoadedRank], layout: &Open) -> Result<Vec<(Gro
             Loaded::Video(video) => video.capacity.clone(),
         };
 
-        let encodes = [Phase::TextEncode, Phase::VisionEncode, Phase::LatentEncode]
-            .into_iter()
-            .any(|phase| capacity.serves(phase));
-        if encodes {
-            match encoding.iter_mut().find(|(group, _)| *group == id) {
-                Some((_, weights)) => weights.extend(rank.weights.iter().cloned()),
-                None => encoding.push((id, rank.weights.clone())),
-            }
+        if rank.encodes() {
+            encoding.push((id, rank.weights.as_slice()));
         }
         match stated.iter_mut().find(|(group, _)| *group == id) {
             Some((_, group)) => join(group, &capacity),
@@ -2322,9 +2361,13 @@ pub(crate) fn capacities(ranks: &[LoadedRank], layout: &Open) -> Result<Vec<(Gro
         }
     }
 
-    for (id, weights) in encoding {
-        if let Some((_, capacity)) = stated.iter_mut().find(|(group, _)| *group == id) {
-            capacity.encoder_identity = crate::process::data_plane::identity_of(&weights);
+    let encoders = crate::process::binding::encoder_identities(encoding);
+    for (id, capacity) in &mut stated {
+        if let Some((_, identity)) = encoders.iter().find(|(group, _)| group == id) {
+            capacity.encoder_identity.clone_from(identity);
+        }
+        if capacity.serves(Phase::Denoise) {
+            capacity.latent_seed = latent;
         }
     }
     Ok(stated)

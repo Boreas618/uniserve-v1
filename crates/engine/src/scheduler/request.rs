@@ -1034,6 +1034,7 @@ mod tests {
             eos_token_ids: vec![EOS],
             feature_bytes: 0,
             encoder_identity: String::new(),
+            latent_seed: 0,
             media_bytes: Vec::new(),
             call_window: window,
             cache_groups: Vec::new(),

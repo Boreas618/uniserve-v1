@@ -73,7 +73,7 @@ impl<'a> Weights<'a> {
     }
 }
 
-/// How the data plane loads this rank's model again: the rank's model runner, pointed at the
+/// How the weight binding loads this rank's model again: the rank's model runner, pointed at the
 /// target.
 pub(crate) struct RankModel {
     model_runner: ModelRunner,
@@ -85,10 +85,10 @@ impl RankModel {
     }
 }
 
-impl crate::process::data_plane::ModelLoad for RankModel {
+impl crate::process::binding::ModelLoad for RankModel {
     fn load(
         &self,
-        target: &crate::process::data_plane::Target,
+        target: &crate::process::binding::Target,
         weights: &dyn nn::RetainedWeights,
     ) -> std::result::Result<(), String> {
         let mut model_runner = self.model_runner.clone();

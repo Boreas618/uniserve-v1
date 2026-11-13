@@ -6,7 +6,7 @@
 //! then on.
 
 use crossbeam_channel::{Receiver, bounded};
-use engine::scheduler::Message;
+use engine::scheduler::{Message, Seeds};
 use proto::request::wire::WeightsInFlight;
 use proto::request::{Event, FinishReason, MigrationCause, RejectionKind};
 use storage::Key;
@@ -16,9 +16,9 @@ use crate::harness::{A, Deployment, Harness, sharing, token};
 
 /// Sends `Flush` with the seeds and the treatment of the requests in flight of a weight update
 /// (`None`: a flush alone), and returns the reply, which the scheduler sends at once.
-fn flush(
+pub(crate) fn flush(
     harness: &mut Harness,
-    seeds: Option<(Vec<Key>, u64)>,
+    seeds: Option<Seeds>,
     in_flight: WeightsInFlight,
 ) -> Result<(), engine::Error> {
     let (reply, replied) = bounded(1);
@@ -26,9 +26,10 @@ fn flush(
     replied.try_recv().unwrap()
 }
 
-/// The page seeds of a weight update: one per cache group of the harness's token deployment.
-fn update_seeds() -> Option<(Vec<Key>, u64)> {
-    Some((vec![Key([9; 32])], 7))
+/// The page seeds of a weight update: one per cache group of the harness's token deployment,
+/// whose groups encode nothing.
+fn update_seeds() -> Option<Seeds> {
+    Some((vec![Key([9; 32])], 7, Vec::new()))
 }
 
 /// `Pause` is answered once no batch is in flight, and from it on the scheduler forms no batch;

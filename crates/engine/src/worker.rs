@@ -1487,16 +1487,27 @@ impl Thread {
             "shadowing `{operator}` of generation {} in bucket {bucket} on batch {} (runner {})",
             batch.generation, batch.id.0, index
         ));
-        let elements = runner.graphs().shadow(&**runner, &bucket, operator)?;
-        tracing::info!(
-            device = ?self.device,
-            runner = index,
-            operator,
-            %bucket,
-            generation = batch.generation,
-            elements,
-            "a replaced kernel was compared with the one it replaces"
-        );
+        // A batch the runner could not pair compares nothing: the operator is reported
+        // uncompared with the reason, not as compared over no element.
+        match runner.graphs().shadow(&**runner, &bucket, operator)? {
+            Some(elements) => tracing::info!(
+                device = ?self.device,
+                runner = index,
+                operator,
+                %bucket,
+                generation = batch.generation,
+                elements,
+                "a replaced kernel was compared with the one it replaces"
+            ),
+            None => tracing::info!(
+                device = ?self.device,
+                runner = index,
+                operator,
+                %bucket,
+                generation = batch.generation,
+                "a replaced kernel was not compared on this batch, and is reported uncompared"
+            ),
+        }
 
         self.publish_uncompared();
         Ok(compared + 1 < operators.len())

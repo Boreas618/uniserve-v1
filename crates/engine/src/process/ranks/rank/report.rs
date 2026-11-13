@@ -73,9 +73,10 @@ impl ModelRunner {
             bos_token_id: model.bos,
             eos_token_ids: model.eos.clone(),
             feature_bytes: 0,
-            // The group's encoder identity is stated from its encoding ranks' weights by the
-            // rank start (`crate::process::ranks::capacities`).
+            // The group's encoder identity and latent seed are stated from its ranks' weights by
+            // the rank start (`crate::process::ranks::capacities`).
             encoder_identity: String::new(),
+            latent_seed: 0,
             media_bytes: Vec::new(),
             call_window: u32::try_from(window).unwrap_or(u32::MAX),
         })
