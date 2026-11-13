@@ -35,6 +35,7 @@ mod cache;
 mod group;
 mod policy;
 mod request;
+mod stats;
 #[cfg(test)]
 mod tests;
 
@@ -280,6 +281,8 @@ pub struct Scheduler {
     executor: Box<dyn Executor>,
     output: Sender<Output>,
     stats: SchedulerStats,
+    /// When `stats` started counting: the scheduler's start, then its last `Output::Stats`.
+    published: Instant,
     /// The kernel and policy generation batches are assembled for.
     generation: Arc<AtomicU64>,
     paused: bool,
@@ -391,7 +394,8 @@ impl Scheduler {
             policy,
             executor,
             output,
-            stats: SchedulerStats::default(),
+            stats: stats::empty(),
+            published: Instant::now(),
             generation,
             paused: false,
             boundary: Vec::new(),

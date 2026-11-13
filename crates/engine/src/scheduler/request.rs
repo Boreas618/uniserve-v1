@@ -61,6 +61,13 @@ pub struct Request {
     pub num_computed_tokens: u32,
     /// The tokens of its prefix hit, over all tiers.
     pub num_cached_tokens: u32,
+    /// Of `num_cached_tokens`, the tokens its admission loaded from the host tier: the hit
+    /// beyond what its `Pin`s found on the device. Set with the hit once the admission's last
+    /// answer arrived, and counted as host hits at admission.
+    pub num_host_tokens: u32,
+    /// Of `num_host_tokens`, the tokens a `Prefetch` from the peers brought to the host (the
+    /// peers' `Prefetched`), counted as peer hits at admission.
+    pub num_peer_tokens: u32,
     /// Per cache group, the key of every complete block of `token_ids`.
     pub keys: Vec<Vec<Key>>,
     /// The drafts the next verification carries.

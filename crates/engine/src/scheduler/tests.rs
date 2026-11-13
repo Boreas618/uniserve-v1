@@ -66,15 +66,15 @@ impl Executor for Recording {
 }
 
 /// A scheduler of two groups on its queue pair, and the buffer pool's end of that queue pair.
-struct Bench {
-    scheduler: Scheduler,
+pub(super) struct Bench {
+    pub(super) scheduler: Scheduler,
     pool: QueuePair,
     executors: Arc<Mutex<Recorded>>,
 }
 
 /// The session: regions numbered 4 to 7 (the KV regions of groups A and B, the product region
 /// both state, the slot rows), and the capacity words of region `n` at register `2 + 3 * (n - 4)`.
-fn bench(ring_bytes: usize) -> Bench {
+pub(super) fn bench(ring_bytes: usize) -> Bench {
     let region = |name: &str, units| Region {
         name: name.to_owned(),
         tier: Tier::Device,
@@ -143,7 +143,7 @@ fn bench(ring_bytes: usize) -> Bench {
         0,
         engine,
         groups,
-        Policy {},
+        Policy { calls: 0, fuel: 0 },
         Box::new(Recording(Arc::clone(&executors))),
         output,
         Arc::new(AtomicU64::new(0)),
@@ -176,7 +176,7 @@ fn capacity() -> Capacity {
 
 impl Bench {
     /// Request 1, attached to the groups `attachments` names, with live owners.
-    fn attach(&mut self, attachments: &[(GroupId, OwnerId, u32)]) {
+    pub(super) fn attach(&mut self, attachments: &[(GroupId, OwnerId, u32)]) {
         let id = proto::request::RequestId(1);
         let input = GenerationRequest {
             request_id: id,
@@ -213,6 +213,8 @@ impl Bench {
             num_prompt_tokens: 3,
             num_computed_tokens: 0,
             num_cached_tokens: 0,
+            num_host_tokens: 0,
+            num_peer_tokens: 0,
             keys: Vec::new(),
             spec_token_ids: Vec::new(),
             num_draft_tokens: 0,

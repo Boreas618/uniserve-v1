@@ -150,6 +150,7 @@ impl SchedulerStatsReporter {
             batch_tokens: delta_batch_tokens,
             domain_stats: self.domain_stats(stats),
             numerical_faults: delta_numerical_faults,
+            ..Default::default()
         }
     }
 

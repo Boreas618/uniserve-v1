@@ -5,7 +5,13 @@
 
 /// The serving scheduling policy and the one it replaced, kept for rollback.
 #[derive(Debug)]
-pub struct Policy {}
+pub struct Policy {
+    /// The calls into the policy's instances since the scheduler started, over every generation
+    /// it served.
+    pub calls: u64,
+    /// The fuel those calls consumed.
+    pub fuel: u64,
+}
 
 /// A fault of a policy: a trap, exhausted fuel, an undecodable or empty reply, or limits outside
 /// the ceilings.

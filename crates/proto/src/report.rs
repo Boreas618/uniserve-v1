@@ -1,7 +1,7 @@
 //! Serializable scheduler, cache, and worker performance snapshots.
 //!
-//! The engine's `SchedulerStatsReporter` builds one [`SchedulerStats`] per
-//! reporting interval from its cumulative scheduler counters, and the
+//! A scheduler counts into one [`SchedulerStats`] as it works and sends it
+//! once a second, starting the next interval's counts from zero, and the
 //! daemon's `record_scheduler_stats` publishes it as Prometheus metrics:
 //! interval deltas are added to counters, while gauges and lifetime values
 //! are set. Each field's documentation says which kind it is when that is not
@@ -119,10 +119,8 @@ pub struct SchedulerStats {
     pub num_running_reqs: u64,
     /// Token and media requests waiting for admission (gauge).
     pub num_waiting_reqs: u64,
-    /// Generation and command-only batches the scheduler has finalized since
-    /// it started (a lifetime value, not a delta). Batches built by the media
-    /// scheduling pass for diffusion media requests, including its retirement
-    /// batch, are not counted.
+    /// Batches the scheduler has submitted to its executors since it started,
+    /// of every phase (a lifetime value, not a delta).
     pub step_counter: u64,
     /// Data-parallel wave number. The engine tracks no waves and reports zero.
     pub current_wave: u64,
@@ -152,7 +150,9 @@ pub struct SchedulerStats {
     /// Worker-reported execution time accumulated in the interval, in microseconds.
     #[serde(default)]
     pub worker_exec_us: u64,
-    /// Host-observed submit-to-result time accumulated in the interval, in microseconds.
+    /// Submit-to-result time of the interval's batches, accumulated, in microseconds: each
+    /// batch's wait in its executor's queue, its device time, and its copy and host time
+    /// (`TimingCounters`), from its submission to its output as its executor measured them.
     #[serde(default)]
     pub batch_roundtrip_us: u64,
     /// Completed batches represented by `worker_exec_us` and
@@ -170,6 +170,22 @@ pub struct SchedulerStats {
     /// Per-domain accounting, in `prefill`, `decode`, `flow` order.
     #[serde(default)]
     pub domain_stats: Vec<DomainSchedulerStats>,
+    /// Calls left out of a step in the interval because blocks they write had not arrived from
+    /// the buffer pool: the request's `Allocate` was still outstanding when the call was due.
+    #[serde(default)]
+    pub calls_without_blocks: u64,
+    /// The scheduler's steps since it started, each one decision of its policy (a lifetime
+    /// value). The main process reports it as `Metrics::steps`, `step_counter` as
+    /// `Metrics::batches` and the sum of `batch_tokens` as `Metrics::tokens`.
+    #[serde(default)]
+    pub steps: u64,
+    /// The calls into the scheduler's policy since it started, over every policy generation it
+    /// served (a lifetime value).
+    #[serde(default)]
+    pub policy_calls: u64,
+    /// The fuel those calls consumed (a lifetime value).
+    #[serde(default)]
+    pub policy_fuel: u64,
 }
 
 impl SchedulerStats {
