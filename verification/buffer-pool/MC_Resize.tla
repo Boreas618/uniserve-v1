@@ -2,7 +2,7 @@
 (* Two epochs of different layouts: each has a region of its own over the  *)
 (* same device memory, which moves from the serving epoch's region to the  *)
 (* target's by `Resize`.                                                   *)
-EXTENDS KvInductive, TLC
+EXTENDS KvInductive, KvP7, TLC
 
 CONSTANTS ga, gb, sa, sb, e1, e2, o1, o2, a1, a2, b1, b2
 

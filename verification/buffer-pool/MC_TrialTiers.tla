@@ -1,7 +1,7 @@
 ------------------------------ MODULE MC_TrialTiers -------------------------
 (* Two epochs of one layout: a serving epoch and a target on trial, each   *)
 (* with one group over the same device memory, with a host tier and copies. *)
-EXTENDS KvInductive, TLC
+EXTENDS KvInductive, KvP7, TLC
 
 CONSTANTS g1, g2, s1, s2, e1, e2, o1, o2, m
 

@@ -1,6 +1,6 @@
 ------------------------------ MODULE MC_Core ------------------------------
 (* The core of the design on one worker group of one epoch.                *)
-EXTENDS KvInductive, TLC
+EXTENDS KvInductive, KvP7, TLC
 
 CONSTANTS g1, e1
 

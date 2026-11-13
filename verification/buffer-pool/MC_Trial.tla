@@ -1,7 +1,7 @@
 ------------------------------ MODULE MC_Trial ------------------------------
 (* Two epochs of one layout: a serving epoch and a target on trial, each   *)
 (* with one group; the two groups map the same device memory.              *)
-EXTENDS KvInductive, TLC
+EXTENDS KvInductive, KvP7, TLC
 
 CONSTANTS g1, g2, s1, s2, e1, e2, o1, o2, m
 

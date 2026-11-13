@@ -1,7 +1,7 @@
 ---------------------------- MODULE MC_Transfer ----------------------------
 (* Two worker groups of one epoch over one unit space: a prefill group and *)
 (* a decode group, with transfers between them.                            *)
-EXTENDS KvInductive, TLC
+EXTENDS KvInductive, KvP7, TLC
 
 CONSTANTS ga, gb, sa, sb, e1
 

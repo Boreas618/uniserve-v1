@@ -116,6 +116,18 @@ OwnersOk ==
 DeferredOk ==
     \A d \in deferred :
         /\ d.kind \in {"release", "commit", "finish", "transfer"}
+        \* A release holds device blocks and slot rows; the end of a copy and a
+        \* transfer that waits hold nothing.
+        /\ d.kind = "release" =>
+             /\ d.units \subseteq Units \cup Slots
+             \* What a release holds left its owner: no owner holds it as a private
+             \* block or as its slot row.
+             /\ \A o \in Owners :
+                  /\ oslot[o] \notin d.units
+                  /\ \A p \in Positions : table[o][p].k = "private" => table[o][p].u \notin d.units
+             \* Nor the new block a clone or a load writes, which is the copy's alone.
+             /\ \A c \in copies : ~c.fill => c.write \notin d.units
+        /\ d.kind \in {"finish", "transfer"} => d.units = {}
         /\ d.kind = "commit" =>
              /\ d.o \in Owners /\ d.p \in Positions /\ d.k \in Keys
              /\ OwnerEpoch[d.o] \notin lost
@@ -124,6 +136,8 @@ DeferredOk ==
              /\ \A o \in Owners, p \in Positions :
                   table[o][p].u \in d.units => o = d.o /\ p = d.p /\ table[o][p].k = "private"
              /\ \A e \in deferred : (e.kind = "commit" /\ e.units = d.units) => e = d
+             \* No copy writes the block a commit waits to share.
+             /\ \A c \in copies : c.write \notin d.units
         /\ d.kind = "finish" =>
              /\ \E c \in copies :
                   /\ c.id = d.c
@@ -145,7 +159,10 @@ CopiesOk ==
         /\ c.done => c.seq > 0
         /\ c.kind \in {"clone", "load", "store", "save", "restore"}
         \* What it reads is shared, or the slot of the owner that saves.
-        /\ alloc[c.read] = "shared" \/ (c.kind = "save" /\ alloc[c.read] = c.o)
+        /\ IF c.kind = "save" THEN c.read \in Slots /\ alloc[c.read] = c.o
+                              ELSE alloc[c.read] = "shared"
+        \* Its owner is of its group's session.
+        /\ c.o \in Owners => OwnerEpoch[c.o] = GroupEpoch[c.g]
         /\ ~c.fill =>
              /\ c.kind \in {"clone", "load", "store", "save"}
              /\ c.kind \in {"clone", "load"} => c.write \in Units /\ alloc[c.write] = c.o
@@ -175,17 +192,29 @@ TasksOk ==
         /\ t.held
         /\ t.kind \in {"transfer", "prefetch", "put"}
         /\ t.kind = "transfer" =>
+             /\ t.h = NONE
              /\ t.o \in Owners /\ t.to \in Groups /\ GroupEpoch[t.to] = OwnerEpoch[t.o]
              /\ t.slot \in Slots /\ alloc[t.slot] = t.o /\ SlotGroup[t.slot] = t.to
+             \* Its slot row in the target group is held by nothing else.
              /\ \A o \in Owners : oslot[o] # t.slot
+             /\ \A d \in deferred : t.slot \notin d.units
+             /\ \A c \in copies : c.read # t.slot /\ c.write # t.slot
+             /\ \A x \in tasks : t.slot \notin x.units
+             /\ t.units \subseteq Units \cup Slots
              /\ t.writes \subseteq t.units \cap Units
              /\ \A u \in t.writes :
                   Mem(t.to) \notin valid[u] /\ (alloc[u] = t.o \/ alloc[u] = "shared")
              /\ \A x \in tasks : (x.kind = "transfer" /\ (x.o = t.o \/ x.slot = t.slot)) => x = t
+             \* One memory of a block is filled by one transfer at a time.
+             /\ \A x \in tasks :
+                  (x.kind = "transfer" /\ x # t /\ Mem(x.to) = Mem(t.to)) => x.writes \cap t.writes = {}
              /\ ~\E d \in deferred : d.kind = "transfer" /\ d.o = t.o
              /\ Live(t.o) =>
                   /\ t.units = TableUnits(t.o) \cup {oslot[t.o]}
                   /\ ~\E c \in copies : c.o = t.o
+                  \* What it does not copy is valid in the target group already.
+                  /\ \A u \in TableUnits(t.o) \ t.writes : Mem(t.to) \in valid[u]
+        /\ t.kind \in {"prefetch", "put"} => t.units = {} /\ t.writes = {} /\ t.slot = NONE
         /\ t.kind = "prefetch" =>
              /\ t.h \in HostUnits /\ alloc[t.h] = "task"
              /\ \A x \in tasks : (x.kind = "prefetch" /\ x.h = t.h) => x = t
@@ -250,6 +279,7 @@ RequestsOk ==
                  (dbt[g][r.o][p].u # NONE /\ (TakesRow(r, r.o, p) \/ CommitsRow(r, r.o, p))) =>
                      /\ g \in r.sg
                      /\ g \in r.by => CommitsRow(r, r.o, p) /\ ~dbt[g][r.o][p].w
+        /\ r.kind = "finish" => r.c \in 1 .. ncopy
         /\ r.kind = "finish" =>
              \A c \in copies :
                  (c.id = r.c /\ GroupEpoch[c.g] = r.e) =>

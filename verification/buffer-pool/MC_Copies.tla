@@ -1,6 +1,6 @@
 ------------------------------ MODULE MC_Copies ----------------------------
 (* Copies run by the executor and the host tier, on one worker group.      *)
-EXTENDS KvInductive, TLC
+EXTENDS KvInductive, KvP7, TLC
 
 CONSTANTS g1, e1
 

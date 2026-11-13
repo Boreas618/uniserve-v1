@@ -5,17 +5,17 @@
 # `unsat` to every goal of the address arithmetic; the pinned properties match
 # their pins. Prints one line per run and exits non-zero when a run differs
 # from what is stated here.
-#   suite.sh [pins|design|mutations|hazards|addresses]...      (all five by default)
+#   suite.sh [pins|design|mutations|hazards|validation|addresses]...      (all six by default)
 set -u
 cd "$(dirname "$0")"
 export TLC_LOGS=${TLC_LOGS:-$(mktemp -d)}
 export TLC_WORKERS=${TLC_WORKERS:-24}
-parts=${*:-pins design mutations hazards addresses}
+parts=${*:-pins design mutations hazards validation addresses}
 mkdir -p "$TLC_LOGS"
 results="$TLC_LOGS/suite.txt"; : > "$results"
 
 # The configurations of the design.
-design="MC_Core MC_Copies MC_Transfer MC_Trial MC_TrialTiers MC_Resize MC_Tiers MC_Loss MC_Finality"
+design="MC_Core MC_Copies MC_Transfer MC_TransferPair MC_Trial MC_TrialTiers MC_Resize MC_Tiers MC_Loss MC_LossCopies MC_Finality"
 
 # configuration, rule left out, the invariants one of which is reported.
 mutations="
@@ -48,6 +48,14 @@ MC_Core H10 WriteIsolation|SharedUnwritten
 MC_Core H11 Exactness
 MC_Core H12 NoLeak
 MC_Finality H13 CopyFinality
+"
+
+# configuration, rule left out or hazard switched on, and a property checked
+# alone, which must be violated: the behaviour each property was admitted with
+# where the runs above report another property first.
+validation="
+MC_Core H12 CapacityIdentity
+MC_Core NoR2 CapacityIdentity
 "
 
 # Runs one configuration and records whether it ended as `expected`: "none" for
@@ -84,6 +92,15 @@ for part in $parts; do
             while read -r config hazard expected; do
                 [ -n "$config" ] && HAZARDS=$hazard run "$config $hazard" "$config" "$expected"
             done <<< "$hazards" ;;
+        validation)
+            while read -r config change property; do
+                [ -n "$config" ] || continue
+                if [ "${change#NoR}" != "$change" ]; then
+                    RULES=$change ONLY=$property run "$config $change $property" "$config" "$property"
+                else
+                    HAZARDS=$change ONLY=$property run "$config $change $property" "$config" "$property"
+                fi
+            done <<< "$validation" ;;
         addresses)
             answers=$("${TLA_TOOLS:-/workspace/dev/tools/tla}"/tlaps/lib/tlapm/backends/bin/z3 addresses.smt2 | sort | uniq -c | tr -s ' ' | tr '\n' ';')
             if [ "$answers" = " 13 unsat;" ]; then echo "ok    addresses: 13 goals unsat" >> "$results"

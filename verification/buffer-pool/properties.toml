@@ -92,3 +92,17 @@ rules = ["R1"]
 assumptions = []
 violated_by = "An `Evict` is answered as done while the block stays cached (hazard H11): `Exactness`."
 status = "checked"
+
+[[property]]
+id = "P7"
+file = "KvP7.tla"
+name = "Capacity identity"
+kind = "safety"
+statement = """Per region, the units that are free, private, shared and retired add up to the \
+units in the region; a unit's observed state is the first of shared, private and retired that \
+applies to it (specs/buffer-pool.md §8)."""
+formulas = ["CapacityIdentity"]
+rules = ["R2", "R10"]
+assumptions = []
+violated_by = "An evicted block's unit that the free list misses (hazard H12): one unit of the region is in none of the four states."
+status = "checked"

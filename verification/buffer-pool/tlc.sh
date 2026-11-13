@@ -4,7 +4,8 @@
 #   tlc.sh MODULE [CONFIG] [-- extra TLC arguments]
 # With RULES=NoRn the configuration's rules are replaced by that definition of
 # the module: the mutation that leaves rule Rn out. With HAZARDS=Hn the hazard
-# Hn of the system as built is switched on.
+# Hn of the system as built is switched on. With ONLY="Inv..." the configuration's
+# invariants are replaced by TypeOK and the ones named.
 # The full output is kept in $TLC_LOGS (default: a temporary directory).
 set -u
 T=${TLA_TOOLS:-/workspace/dev/tools/tla}
@@ -13,11 +14,17 @@ logs=${TLC_LOGS:-$(mktemp -d)}; mkdir -p "$logs"
 cd "$(dirname "$0")"
 cfg="$config.cfg"; name="$config"
 if [ -n "${RULES:-}" ]; then
-    name="$config-$RULES"; cfg="$logs/$name.cfg"
-    sed "s/Rules <- AllRules/Rules <- $RULES/" "$config.cfg" > "$cfg"
-elif [ -n "${HAZARDS:-}" ]; then
-    name="$config-$HAZARDS"; cfg="$logs/$name.cfg"
-    sed "s/Hazards = {}/Hazards = {\"$HAZARDS\"}/" "$config.cfg" > "$cfg"
+    name="$name-$RULES"; sed "s/Rules <- AllRules/Rules <- $RULES/" "$cfg" > "$logs/$name.cfg"; cfg="$logs/$name.cfg"
+fi
+if [ -n "${HAZARDS:-}" ]; then
+    name="$name-$HAZARDS"; sed "s/Hazards = {}/Hazards = {\"$HAZARDS\"}/" "$cfg" > "$logs/$name.cfg"; cfg="$logs/$name.cfg"
+fi
+if [ -n "${ONLY:-}" ]; then
+    # The configuration's invariants are replaced by TypeOK and the named ones.
+    name="$name-$(echo $ONLY | tr ' ' '-')"
+    awk -v only="$ONLY" '/^INVARIANTS/ { print; print "    TypeOK " only; skip = 1; next }
+                         skip && /^    / { next } { skip = 0; print }' "$cfg" > "$logs/$name.cfg"
+    cfg="$logs/$name.cfg"
 fi
 log="$logs/$name.log"
 "$T"/jdk-21.0.13+9/bin/java -XX:+UseParallelGC -Xmx${TLC_HEAP:-32g} \

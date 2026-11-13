@@ -422,6 +422,8 @@ Load(o, p, k) ==
 
 Store(g, k) ==
     /\ ncopy < MaxCopies
+    \* R1: the group is of a session that is open.
+    /\ On("R1") => GroupEpoch[g] \notin lost
     /\ cache[k] # NONE
     /\ Mem(g) \in valid[cache[k]]
     /\ On("R8") => vis[k].d \in {NONE, GroupEpoch[g]}
@@ -867,8 +869,12 @@ TransferDue(d) ==
     /\ On("R3") => Reached(d.after)
     /\ LET units == {table[d.o][p].u : p \in Positions} \ {NONE}
            rows == {s \in free \cap Slots : SlotGroup[s] = d.to}
-       IN \* It waits while a load fills the target group's memory of a block it holds.
+       IN \* It waits while a load or another owner's transfer fills the target
+          \* group's memory of a block it holds: when that has ended the block
+          \* is valid there, or is copied by this transfer alone.
           /\ ~\E c \in copies : c.fill /\ Mem(c.g) = Mem(d.to) /\ c.write \in units
+          /\ ~\E t \in tasks :
+               t.kind = "transfer" /\ Mem(t.to) = Mem(d.to) /\ t.writes \cap units # {}
           /\ deferred' = deferred \ {d}
           /\ IF ostate[d.o] # "live" \/ rows = {}
              THEN UNCHANGED <<free, tasks, alloc>>

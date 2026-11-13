@@ -1,7 +1,7 @@
 ------------------------------ MODULE MC_Loss -------------------------------
 (* Two epochs of one layout over the same device memory, either of whose   *)
 (* engines may be lost.                                                    *)
-EXTENDS KvInductive, TLC
+EXTENDS KvInductive, KvP7, TLC
 
 CONSTANTS g1, g2, s1, s2, e1, e2, o1, o2, m
 

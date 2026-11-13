@@ -2,7 +2,7 @@
 (* The tiers below the device on one worker group: prefetches from the     *)
 (* remote store and from peers, puts to the remote store, and a media      *)
 (* request's trajectory saved and restored.                                *)
-EXTENDS KvInductive, TLC
+EXTENDS KvInductive, KvP7, TLC
 
 CONSTANTS g1, e1
 

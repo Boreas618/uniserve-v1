@@ -50,6 +50,41 @@ IndInit ==
     /\ bad = Gen(1)
     /\ IndInv
 
+(* The actions in ten groups, so that the inductive step is checked for    *)
+(* each group by a process of its own: Next is their disjunction.          *)
+Next1 == /\ \/ \E o \in Owners, g \in Groups : Attach(o, g)
+            \/ \E o \in Owners, p \in Positions : Allocate(o, p)
+            \/ \E o \in Owners, p \in Positions, k \in Keys : Pin(o, p, k)
+         /\ UNCHANGED rare
+Next2 == /\ \/ \E o \in Owners, p \in Positions, k \in Keys : Clone(o, p, k) \/ Load(o, p, k)
+            \/ \E o \in Owners, k \in Keys : Save(o, k) \/ Restore(o, k)
+            \/ \E g \in Groups, k \in Keys : Store(g, k)
+         /\ UNCHANGED rare
+Next3 == /\ \/ \E k \in Keys : Evict(k) \/ EvictHost(k)
+            \/ \E e \in Epochs : CommitUpdate(e) \/ Rollback(e)
+            \/ \E u \in Units : Shrink(u) \/ Grow(u)
+         /\ UNCHANGED rare
+Next4 == /\ \/ Issue
+            \/ \E g \in Groups, r \in requests : ExecStamp(g, r)
+            \/ \E h \in handoff : ExecMap(h) \/ DropCompletion(h)
+         /\ UNCHANGED rare
+Next5 == /\ \/ \E g \in Groups : Launch(g)
+            \/ \E b \in inflight : EndBatch(b)
+            \/ \E c \in copies, ok \in BOOLEAN : ExecFinish(c, ok)
+         /\ UNCHANGED rare
+Next6 == /\ \E r \in requests :
+              TakeRelease(r) \/ TakeDetach(r) \/ TakeCommit(r) \/ TakeFinish(r) \/ TakeTransfer(r)
+         /\ UNCHANGED rare
+Next7 == /\ \E d \in deferred : ReleaseDue(d) \/ CommitDue(d) \/ FinishDue(d)
+         /\ UNCHANGED rare
+Next8 == /\ \/ \E d \in deferred : TransferDue(d)
+            \/ \E t \in tasks, ok \in BOOLEAN : TransferEnd(t, ok)
+         /\ UNCHANGED rare
+Next9 == \/ \E k \in Keys : Prefetch(k, "remote") \/ Prefetch(k, "peer") \/ StoreRemote(k)
+         \/ \E t \in tasks : PeerLost(t) \/ Deadline(t)
+         \/ \E t \in tasks, ok \in BOOLEAN : PrefetchEnd(t, ok) \/ PutEnd(t, ok)
+Next10 == \E e \in Epochs : Lose(e)
+
 (* Witnesses that IndInit is satisfiable by states that hold work: each is  *)
 (* an invariant Apalache must refute.                                      *)
 NoState == FALSE
