@@ -1144,9 +1144,8 @@ mod tests {
 
         // Cached on the device of the group that encodes it: pinned at the same position.
         let listed = (key, class, 40, DEVICE, 1);
-        let mut list = runtime::Request::List;
         let listing = Completion::Listing { keys: vec![listed] };
-        scheduler.learn(&mut list, &listing);
+        scheduler.learn(&runtime::Request::List, &listing);
         let asks = scheduler.admission_requests(id);
         let pin = runtime::Request::Pin {
             owner: OwnerId(10),

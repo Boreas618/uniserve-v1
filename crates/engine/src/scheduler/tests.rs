@@ -709,6 +709,73 @@ fn the_answer_to_a_copys_finish_is_mapped_and_applied_as_the_copys_result() {
     assert_eq!(bench.maps(), [(A, 3, finished, finish, Completion::Loaded)]);
 }
 
+/// A `Finish` is written past held requests that wait for room in the completion queue, which
+/// keep their order (SD §3.1): a `List` owes the whole ring and waits for every answer
+/// outstanding, among them the copy whose `Finish` is held, which owes until that `Finish` is
+/// answered. Once it is, the `List` is written, and the request behind it once the `Listing` is
+/// read.
+#[test]
+fn a_finish_is_written_past_requests_that_wait_for_room() {
+    let mut bench = bench(1024);
+    bench.attach(&[(A, OWNER_A, 3)]);
+
+    let load = runtime::Request::Load {
+        owner: OWNER_A,
+        class: KV,
+        at: 0,
+        keys: vec![key(1)],
+    };
+    bench.scheduler.submit(load);
+    bench.scheduler.post().unwrap();
+    let [(id, _)] = bench.take()[..] else {
+        panic!("one request was written");
+    };
+    let copy = Completion::Copy {
+        group: A,
+        keys: vec![key(1)],
+        from: vec![(9, 0, 1)],
+        to: vec![(4, 2, 1)],
+        evicted: Vec::new(),
+        encodings: None,
+    };
+    bench.complete(id, &copy);
+    assert_eq!(bench.answers().len(), 1);
+
+    // A `List` and an `Allocate` are held when the executor returns the copy's `Finish`.
+    let finish = runtime::Request::Finish {
+        copy: id,
+        ok: true,
+        after: vec![(A, 12)],
+    };
+    bench.scheduler.submit(runtime::Request::List);
+    bench.scheduler.submit(allocate(OWNER_A, KV, 1, 1));
+    bench.scheduler.stamped(vec![finish.clone()]);
+    bench.scheduler.post().unwrap();
+    let taken = bench.take();
+    let [(finished, ref written)] = taken[..] else {
+        panic!("the `Finish` alone was written: {taken:?}");
+    };
+    assert_eq!(*written, finish);
+
+    bench.complete(finished, &Completion::Loaded);
+    assert_eq!(bench.answers().len(), 1);
+    bench.scheduler.post().unwrap();
+    let taken = bench.take();
+    let [(listed, runtime::Request::List)] = taken[..] else {
+        panic!("the `List` alone was written: {taken:?}");
+    };
+
+    bench.complete(listed, &Completion::Listing { keys: Vec::new() });
+    assert_eq!(bench.answers().len(), 1);
+    bench.scheduler.post().unwrap();
+    let written: Vec<runtime::Request> = bench
+        .take()
+        .into_iter()
+        .map(|(_, request)| request)
+        .collect();
+    assert_eq!(written, [allocate(OWNER_A, KV, 1, 1)]);
+}
+
 #[test]
 fn available_is_the_buffer_pools_word_less_the_units_of_allocates_not_yet_answered() {
     let mut bench = bench(1024);

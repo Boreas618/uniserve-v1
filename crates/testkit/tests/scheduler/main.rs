@@ -8,15 +8,21 @@
 
 mod columns;
 mod drain;
+mod failures;
+mod groups;
 mod harness;
 mod images;
 mod keys;
 mod l6;
 mod limits;
+mod memory;
+mod pause_flush_resize;
 mod policy;
+mod preemption;
 mod prefill;
 mod queue_pair;
 mod speculation;
+mod statistics;
 mod status;
 mod video;
 mod video_preemption;

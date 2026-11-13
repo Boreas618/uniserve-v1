@@ -333,6 +333,11 @@ pub struct Scheduler {
     /// Per region, the numbers of the keys of the last `Victims` this scheduler submitted there:
     /// the head of `order` it installed.
     installed: Vec<Vec<u64>>,
+    /// The blocks a request of this scheduler gave up before the buffer pool answered their
+    /// `Commit`, by [`Cached::id`] of the key: the last use each enters the eviction order with
+    /// once its `Committed` is read, as `unpin` ranked it among its request's blocks then. An
+    /// entry leaves when its `Commit` is answered.
+    given_up: HashMap<u64, u64>,
     /// The request each live owner is for.
     owners: HashMap<OwnerId, RequestId>,
     /// The counter owners are drawn from: the scheduler's data-parallel rank in the top 16 bits.
@@ -533,6 +538,7 @@ impl Scheduler {
             order: vec![BTreeSet::new(); count],
             ordered: vec![0; count],
             installed: vec![Vec::new(); count],
+            given_up: HashMap::new(),
             owners: HashMap::new(),
             next_owner: (rank << 48) + 1,
             seeds,
@@ -1327,9 +1333,16 @@ impl Scheduler {
     /// Writes the held requests into the submission queue, in order, each under the next number,
     /// while the submission queue has room and the completion queue has room for a completion of
     /// every request outstanding and of the one being written (SD §3.1). Each request's bound is
-    /// taken as it is written and kept with it in `outstanding` until its answer is read. The
-    /// first that does not fit and every one after it stay held for the next pass; nothing
-    /// waits.
+    /// taken as it is written and kept with it in `outstanding` until its answer is read. What is
+    /// not written stays held for the next pass, in order; nothing waits.
+    ///
+    /// A request the completion queue has no room for stays held, and every request behind it
+    /// with it, but a `Finish`, which is written as soon as it fits itself. The room is made by
+    /// the answers outstanding, and an answer may wait for a copy to end: a request answered
+    /// `Copy` owes until the answer to its `Finish`, and a transfer waits for a load that fills
+    /// its target group's memory (BP §11). A `Finish` held behind a request that waits for room
+    /// (a `List`, which owes the whole ring, waits for every answer) would hold back the very
+    /// answers that make it.
     ///
     /// # Errors
     ///
@@ -1342,33 +1355,42 @@ impl Scheduler {
             .map(|&(.., bytes)| bytes)
             .fold(0, usize::saturating_add);
 
-        let first = self.next_submission;
-        let mut written = Vec::new();
+        let mut requests = std::mem::take(&mut self.held).into_iter();
         let mut record = Vec::new();
-        while let Some(request) = self.held.get(written.len()) {
-            let owner = self.acting_owner(request);
-            let bytes = self.answer_bytes(request);
-            if owed.saturating_add(bytes) > ring {
-                break;
+        let mut waiting = false;
+        let mut posted = Ok(());
+        for request in requests.by_ref() {
+            let bytes = self.answer_bytes(&request);
+            let finish = matches!(request, runtime::Request::Finish { .. });
+            if (waiting && !finish) || owed.saturating_add(bytes) > ring {
+                waiting = true;
+                self.held.push(request);
+                continue;
             }
 
             record.clear();
-            let number = first + written.len() as u64;
+            let number = self.next_submission;
             request.encode(runtime::RequestId(number), &mut record);
-            if !self.queue.submit(&record).map_err(storage_error)? {
-                break;
+            match self.queue.submit(&record) {
+                Ok(true) => {}
+                // The submission queue is full: this request and every one after it wait.
+                Ok(false) => {
+                    self.held.push(request);
+                    break;
+                }
+                Err(error) => {
+                    self.held.push(request);
+                    posted = Err(storage_error(error));
+                    break;
+                }
             }
+            let owner = self.acting_owner(&request);
+            self.next_submission += 1;
             owed = owed.saturating_add(bytes);
-            written.push((owner, bytes));
-        }
-
-        self.next_submission = first + written.len() as u64;
-        let requests: Vec<runtime::Request> = self.held.drain(..written.len()).collect();
-        for (number, ((owner, bytes), request)) in (first..).zip(written.into_iter().zip(requests))
-        {
             self.outstanding.insert(number, (owner, request, bytes));
         }
-        Ok(())
+        self.held.extend(requests);
+        posted
     }
 
     /// Reads the next completion the scheduler applies: its request's number, the owner the
@@ -1388,12 +1410,13 @@ impl Scheduler {
     /// executor; any other enters `copies` until it ends. A `Refused` with the cause `copy`
     /// answers a `Finish` for a copy another `Finish` ended, and is dropped.
     ///
-    /// Before it is returned, a completion that gives entries is handed to `Executor::map`: to the
-    /// group an `Attach` or a `Transfer` names, to a copy's group, and otherwise to the owner's
-    /// group and every other group that reads the class, each with the slot of the request's own
-    /// owner there. Where that owner's `Attached` has not been read yet, the slot is not known
-    /// and the completion waits in `unmapped` for it ([`Scheduler::give`]): it is handed over as
-    /// that `Attached` is, whatever order the buffer pool answers in.
+    /// Before it is returned, a completion that gives entries is handed to `Executor::map`, with
+    /// the request as it was written: to the group an `Attach` or a `Transfer` names, to a copy's
+    /// group, and otherwise to the owner's group and every other group that reads the class, each
+    /// with the slot of the request's own owner there. Where that owner's `Attached` has not been
+    /// read yet, the slot is not known and the completion waits in `unmapped` for it
+    /// ([`Scheduler::give`]): it is handed over as that `Attached` is, whatever order the buffer
+    /// pool answers in.
     ///
     /// # Errors
     ///
@@ -1422,14 +1445,14 @@ impl Scheduler {
             .map_err(storage_error)?
         {
             let (id, completion) = Completion::decode(&record).map_err(storage_error)?;
-            let (owner, mut request, bytes) = self.outstanding.remove(&id.0).ok_or_else(|| {
+            let (owner, request, bytes) = self.outstanding.remove(&id.0).ok_or_else(|| {
                 Error::Storage(format!(
                     "a completion answers request {}, which is not outstanding",
                     id.0
                 ))
             })?;
             // What it states of the cache holds whether or not the completion is dropped.
-            self.learn(&mut request, &completion);
+            self.learn(&request, &completion);
             // The capacity words read with a `Detach`'s answer may not show what it gave back.
             if let runtime::Request::Detach { .. } = request {
                 for (region, _) in self.device_regions() {
@@ -1441,8 +1464,14 @@ impl Scheduler {
                 if let Some((owner, copied)) = self.matched_finish(id, copy, request, &completion) {
                     return Ok(Some((copy, owner, copied, completion)));
                 }
-            } else if self.matched(id, owner, &request, &completion, bytes) {
-                return Ok(Some((id, owner, request, completion)));
+                continue;
+            }
+            // A copy's request is applied, and kept for the answer to its `Finish`, as the keys
+            // its copy covers, for which that answer speaks; the executors are handed it as it
+            // was written, which the completion answers.
+            let applied = cache::covered(&request, &completion);
+            if self.matched(id, owner, &request, &applied, &completion, bytes) {
+                return Ok(Some((id, owner, applied, completion)));
             }
         }
         Ok(None)
@@ -1451,19 +1480,22 @@ impl Scheduler {
     /// Matches the completion of a request other than a `Finish`, as
     /// [`Scheduler::next_completion`] states: false when it is dropped, true when it was handed
     /// to the executors that take it, or waits for the slot it is handed under, and is to be
-    /// applied. `bytes` is what the request owed the completion queue.
+    /// applied. `request` is the request as it was written, which the executors are handed,
+    /// and `applied` the request as it is applied ([`cache::covered`]); `bytes` is what it owed
+    /// the completion queue.
     fn matched(
         &mut self,
         id: runtime::RequestId,
         owner: Option<OwnerId>,
         request: &runtime::Request,
+        applied: &runtime::Request,
         completion: &Completion,
         bytes: usize,
     ) -> bool {
         // A request answered `Copy` waits for the answer to its `Finish`, owing what it owed.
         if matches!(completion, Completion::Copy { .. }) {
             self.outstanding
-                .insert(id.0, (owner, request.clone(), bytes));
+                .insert(id.0, (owner, applied.clone(), bytes));
         }
 
         let gives = matches!(

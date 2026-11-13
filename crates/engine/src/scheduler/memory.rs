@@ -665,7 +665,8 @@ impl Scheduler {
     /// grown from `asked`; a recurrent-state class asks for the checkpoint its next call or refill
     /// keeps, or a later decode keeps within the low watermark, one ahead at a time; the draft
     /// cache is grown over the target's next call while it covers the request's tokens, or over
-    /// its next refill chunk, and no call needs it. A request with no next call asks for nothing.
+    /// its next refill chunk (the one after the refill in flight), and no call needs it. A
+    /// request with no next call asks for nothing.
     /// The caller asks only what the regions' `available` covers, and at most one `Allocate` per
     /// class outstanding; the request is short only when the blocks its next call writes are not
     /// covered (SD §3.6).
@@ -680,15 +681,27 @@ impl Scheduler {
         let state = self
             .state_shape(request)
             .map(|(class, block, _)| (class, block));
+        let budget = self.policy.limits.max_num_batched_tokens;
         let refill = (self.config.draft_tokens > 0
             && request.num_draft_tokens < request.refill_end())
         .then(|| {
             let from = request.refill_start(state);
-            let budget = self.policy.limits.max_num_batched_tokens;
             (
                 from,
                 from.saturating_add(request.refill_chunk(budget, state)),
             )
+        });
+        // A refill's draft blocks are asked for one step before it runs, as a prompt chunk's
+        // are: while a refill is in flight, those of the chunk after it, which starts where the
+        // one in flight ends, within the draft blocks the table holds.
+        let refilled = refill.map(|(_, end)| {
+            if request.in_flight(Phase::Refill) == 0 {
+                return end;
+            }
+            let held = self.allocated_draft(request);
+            held.saturating_add(budget)
+                .min(request.refill_end())
+                .max(end)
         });
 
         for (index, (&(kind, block), blocks)) in
@@ -712,10 +725,10 @@ impl Scheduler {
                 }
                 continue;
             }
-            let (end, required) = match (kind.is_draft(), refill) {
+            let (end, required) = match (kind.is_draft(), refilled) {
                 (false, _) => (end, true),
                 (true, None) => (end, false),
-                (true, Some((_, end))) => (end, false),
+                (true, Some(end)) => (end, false),
             };
             let written = end.div_ceil(block);
             let wanted = written.saturating_add(LOW_WATERMARK);

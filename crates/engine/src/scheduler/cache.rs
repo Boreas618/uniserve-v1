@@ -95,15 +95,21 @@ impl Cached {
 }
 
 impl Scheduler {
-    /// Applies what a completion of `request` states of the cache (SD §4.5). A request answered
-    /// `Copy` is narrowed to the keys the copy covers, for which the answer to its `Finish`
-    /// speaks: the leading keys of a `Load`, the copied keys of a `Store`.
-    pub(super) fn learn(&mut self, request: &mut runtime::Request, completion: &Completion) {
+    /// Applies what a completion of `request` states of the cache (SD §4.5). The answer to a
+    /// `Finish` speaks for the copy's request as `outstanding` keeps it, narrowed to the keys the
+    /// copy covers ([`covered`]).
+    pub(super) fn learn(&mut self, request: &runtime::Request, completion: &Completion) {
         use runtime::Request as R;
         let now = monotonic_nanos(Instant::now());
 
+        // A block given up before its commit was answered keeps the rank it was given up with.
+        let given_up = match request {
+            R::Commit { key, .. } => self.given_up.remove(&Cached::id(key)),
+            _ => None,
+        };
+
         // The keys a completion lists as evicted left the regions its request took blocks from.
-        let (taken, evicted) = match (&*request, completion) {
+        let (taken, evicted) = match (request, completion) {
             (_, Completion::Allocated { runs, evicted })
             | (
                 _,
@@ -129,17 +135,9 @@ impl Scheduler {
             self.drop_copy(key, region);
         }
 
-        if let (
-            R::Load { keys, .. } | R::Store { keys, .. },
-            Completion::Copy { keys: covered, .. },
-        ) = (&mut *request, completion)
-        {
-            keys.retain(|key| covered.contains(key));
-        }
-
         // The answer to a `Finish` is the result of its copy, with the copy's group as its stamp.
         let copied;
-        let (request, copy) = match &*request {
+        let (request, copy) = match request {
             R::Finish { copy, after, .. } => match self.outstanding.get(&copy.0) {
                 Some((_, request, _)) => {
                     copied = request.clone();
@@ -164,16 +162,18 @@ impl Scheduler {
                 Completion::Committed,
                 None,
             ) => {
-                // Held by its request while the entry is at or after the table's `first`.
+                // Held by its request while the entry is at or after the table's `first`; one
+                // its request gave up already enters the order as it was given up.
                 let row = self.request_of(*owner);
                 let held = row.and_then(|row| row.blocks.get(usize::from(*class)));
                 let held = held.is_some_and(|blocks| blocks.first <= *at);
+                let used = if held { now } else { given_up.unwrap_or(now) };
                 self.hold(
                     key,
                     (*class, *tokens),
                     stamped_groups(after),
                     u32::from(held),
-                    now,
+                    used,
                 );
             }
             (
@@ -294,13 +294,14 @@ impl Scheduler {
         }
     }
 
-    /// `key`'s block is on the device in `groups`, held by `pins` more requests and used now.
-    fn hold(&mut self, key: &Key, fresh: (u8, u16), groups: u8, pins: u32, now: u64) {
+    /// `key`'s block is on the device in `groups`, held by `pins` more requests and last used at
+    /// `used` (nanoseconds, its rank in the eviction order).
+    fn hold(&mut self, key: &Key, fresh: (u8, u16), groups: u8, pins: u32, used: u64) {
         self.change_row(key, Some(fresh), |row| {
             row.tiers |= DEVICE;
             row.groups |= groups;
             row.pins = row.pins.saturating_add(pins);
-            row.last_used = now;
+            row.last_used = used;
         });
     }
 
@@ -378,7 +379,9 @@ impl Scheduler {
     /// `Duplicate`, or an encoder output it computed and did not commit), which leaves that record
     /// instead. A block no request holds joins its orders as just used, the deepest key first in
     /// line, so that the prefix before it stays cached longest (vLLM's `free` frees a request's
-    /// tail first).
+    /// tail first). A block whose `Commit` the buffer pool has not answered is not in `cache`
+    /// yet: its rank waits in `given_up` for its `Committed`, so that it joins the order where it
+    /// would have had it been answered first.
     pub(super) fn unpin(&mut self, id: RequestId, keys: &[Key]) {
         let mut keys = keys.to_vec();
         if let Some(request) = self.requests.get_mut(&id) {
@@ -394,12 +397,39 @@ impl Scheduler {
         }
 
         let now = monotonic_nanos(Instant::now());
+        let mut committing = None;
         for (offset, key) in (0u64..).zip(keys.iter().rev()) {
+            let used = now.saturating_add(offset);
+            let number = Cached::id(key);
+            if !self.cache.get(&number).is_some_and(|row| row.key == *key) {
+                let committing = committing.get_or_insert_with(|| self.committing());
+                if committing.contains(&number) {
+                    self.given_up.insert(number, used);
+                }
+                continue;
+            }
             self.change_row(key, None, |row| {
                 row.pins = row.pins.saturating_sub(1);
-                row.last_used = now.saturating_add(offset);
+                row.last_used = used;
             });
         }
+    }
+
+    /// The keys, by [`Cached::id`], of this scheduler's `Commit`s the buffer pool has not
+    /// answered: held, being stamped, waiting behind a request being stamped, or outstanding.
+    fn committing(&self) -> HashSet<u64> {
+        let stamping = self
+            .stamping
+            .values()
+            .flat_map(|(request, _, following)| std::iter::once(request).chain(following));
+        let outstanding = self.outstanding.values().map(|(_, request, _)| request);
+        let commits = self.held.iter().chain(stamping).chain(outstanding);
+        commits
+            .filter_map(|request| match request {
+                runtime::Request::Commit { key, .. } => Some(Cached::id(key)),
+                _ => None,
+            })
+            .collect()
     }
 
     /// Applies `change` to the row of `key`, or to a new row of `fresh`'s class and tokens; a
@@ -782,6 +812,24 @@ fn bit(group: GroupId) -> u8 {
 /// tables held its entry.
 fn stamped_groups(after: &runtime::Stamps) -> u8 {
     after.iter().fold(0, |bits, &(group, _)| bits | bit(group))
+}
+
+/// `request` as the scheduler applies its answer `completion`: a `Load` or a `Store` answered
+/// `Copy` narrowed to the keys the copy covers, which are the leading keys of a `Load` that have
+/// a host copy and the keys of a `Store` whose device copy is valid in its group (BP §11), and
+/// for which the answer to its `Finish` speaks; any other request as it was written. The
+/// executors are handed the request as it was written, which its completion answers (SD §2.1
+/// `Executor::map`).
+pub(super) fn covered(request: &runtime::Request, completion: &Completion) -> runtime::Request {
+    let mut narrowed = request.clone();
+    if let (
+        runtime::Request::Load { keys, .. } | runtime::Request::Store { keys, .. },
+        Completion::Copy { keys: copied, .. },
+    ) = (&mut narrowed, completion)
+    {
+        keys.retain(|key| copied.contains(key));
+    }
+    narrowed
 }
 
 #[cfg(test)]

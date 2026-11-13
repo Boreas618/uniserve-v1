@@ -32,7 +32,7 @@ use scheduling_guest::view::{CallView, RankView, ReplicaView, RequestView, Snaps
 use scheduling_guest::wire::{self, Call};
 use wasmtime::{Memory, Module, Store, Trap, TypedFunc, WasmParams, WasmResults};
 
-use super::view::view_of;
+use super::view::view;
 use super::{Capacity, Error, Output, Request, RequestStatus, Scheduler, WorkerGroup};
 
 /// The fuel one call into a policy module may consume, and each export the host enters for that
@@ -257,8 +257,10 @@ impl Policy {
             };
             request.dirty = false;
             if request.status != RequestStatus::Finished {
+                // A refill is offered as a step of the policy's own token limit sizes it.
+                let tokens = Some(self.limits.max_num_batched_tokens);
                 self.events.push(Event::Updated {
-                    request: view_of(request, groups),
+                    request: view(request, groups, tokens),
                 });
             }
         }
@@ -687,6 +689,7 @@ pub(crate) mod tests {
     use scheduling_guest::ids::RequestId as GuestId;
 
     use super::super::view::tests::waiting;
+    use super::super::view::view_of;
     use super::*;
 
     /// The packaged policies, by name: `fcfs`, `priority` and `fixture`, built for

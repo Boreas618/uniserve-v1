@@ -38,7 +38,8 @@ use super::{Request, RequestStatus, Scheduler, WorkerGroup, monotonic_nanos};
 ///   included); `generated_tokens` every token it generated, on this engine and before;
 ///   `prefilled_tokens` where its next prompt chunk starts; `cached_pages` the blocks its cache
 ///   groups' tables hold; `refill_tokens` the draft cache's gap a refill can close, when one
-///   is ready.
+///   is ready and can be given its blocks ([`refill_writable`]), which a step of `tokens`
+///   tokens at most sizes its next chunk by; with `tokens` `None` no refill is offered.
 /// - `admitted_at` is the request's arrival once it is admitted: the row keeps no admission
 ///   instant, and arrival orders admitted requests as admission does but where the queue put a
 ///   resumed request first. `last_emitted_at`, `prefetch_tokens`, `reservation_units` and
@@ -46,10 +47,7 @@ use super::{Request, RequestStatus, Scheduler, WorkerGroup, monotonic_nanos};
 ///   its own prefetch threshold and capacity rejection at admission (SD §3.5, §4.4), and a
 ///   scheduler is never asked to route.
 /// - A token request may be preempted as migratable until it finishes; a media request is not.
-///
-/// A request the scheduler has not taken yet (the engine's routing of an arrival) is viewed with
-/// no groups: it is waiting, with no phase ready.
-pub fn view_of(request: &Request, groups: &[WorkerGroup]) -> RequestView {
+pub(super) fn view(request: &Request, groups: &[WorkerGroup], tokens: Option<u32>) -> RequestView {
     let (class, prompt, max_tokens) = match &request.input {
         proto::request::Request::Generation(input) => (
             RequestClass::Token,
@@ -127,12 +125,61 @@ pub fn view_of(request: &Request, groups: &[WorkerGroup]) -> RequestView {
         next_tokens,
         reservation_units: 0,
         prefetch_tokens: 0,
-        refill_tokens: (token && refill > 0 && request.ready(Phase::Refill, groups))
-            .then_some(refill),
+        refill_tokens: tokens
+            .filter(|&tokens| {
+                token
+                    && refill > 0
+                    && request.ready(Phase::Refill, groups)
+                    && refill_writable(request, groups, tokens)
+            })
+            .map(|_| refill),
         remaining_tokens: max_tokens.saturating_sub(generated),
         migratable: token && request.status != RequestStatus::Finished,
         cache_rank: None,
     }
+}
+
+/// The view of a request no step of a scheduler sizes a refill for ([`view`] with no refill
+/// offered): an arrival the engine routes before a scheduler takes it, which is viewed with no
+/// groups and so waits with no phase ready, and an arrival a scheduler tells its policy.
+pub fn view_of(request: &Request, groups: &[WorkerGroup]) -> RequestView {
+    view(request, groups, None)
+}
+
+/// Whether the scheduler can form `request`'s refill once the blocks it asked for arrive (SD
+/// §3.4, §3.6, §7.1): the refill starts at the draft cache's end, and its draft table holds or
+/// has asked for every block of its next chunk, which a step of `tokens` tokens sizes as
+/// `Scheduler::charge` and `allocate_ahead` do. Draft blocks take only the units the regions
+/// have free, so a table given up under a shortage, or one whose next chunk lies beyond what it
+/// was given, asks for nothing until units are free: a refill offered then could not be formed,
+/// and a policy that runs a refill as the only work of its step would form nothing while the
+/// shortage lasts. A drafter that keeps no cache of its own writes no draft block.
+fn refill_writable(request: &Request, groups: &[WorkerGroup], tokens: u32) -> bool {
+    let placed = request.placement[Phase::Refill.index()];
+    let Some(group) = groups.iter().find(|group| Some(group.id()) == placed) else {
+        return false;
+    };
+    let shapes = &group.capacity.cache_groups;
+    let state = shapes
+        .iter()
+        .position(|(kind, _)| kind.is_state())
+        .map(|class| (class, shapes[class].1));
+
+    // `charge` forms a chunk that continues the draft cache, of at least one token.
+    let start = request.num_draft_tokens;
+    let end = start.saturating_add(request.refill_chunk(tokens, state));
+    if request.refill_start(state) != start || end == start {
+        return false;
+    }
+    let Some(draft) = shapes.iter().position(|(kind, _)| kind.is_draft()) else {
+        return true;
+    };
+    // Positions are logical block indices: the table covers the tokens before `asked` blocks.
+    let block = shapes[draft].1;
+    request
+        .blocks
+        .get(draft)
+        .is_some_and(|table| table.asked.saturating_mul(block) >= end)
 }
 
 /// The call a `place` decision is about: `request`'s first call of `phase` on a group.
@@ -314,14 +361,16 @@ impl Scheduler {
     /// Everything a starting policy instance is told (SD §5.2): the view of every waiting
     /// request, in the queue's order, then of every running one; a page for every cached block
     /// of a cache group and an encoding for every other cached block (an encoder output); and
-    /// the groups of [`snapshot_of`].
+    /// the groups of [`snapshot_of`]. A refill is offered as a step of the serving policy's
+    /// token limit sizes it.
     pub(super) fn snapshot(&self) -> Snapshot {
+        let tokens = Some(self.policy.limits.max_num_batched_tokens);
         let requests = self
             .waiting
             .iter()
             .chain(&self.running)
             .filter_map(|id| self.requests.get(id))
-            .map(|request| view_of(request, &self.groups))
+            .map(|request| view(request, &self.groups, tokens))
             .collect();
         let (pages, encodings) = self.cache_views();
 

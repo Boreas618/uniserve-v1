@@ -38,18 +38,19 @@ use ipc::batch::{
     Batch, BatchOutput, CallOutput, CallStatus, ErrorCode, Extent, MediaRow, Phase, Shape, Variant,
 };
 use proto::config::{
-    KvCacheConfig, SchedulerConfig, WorkerGroupConfig, WorkerGroupId, WorkerGroupRole, WorkerRank,
+    KvCacheConfig, MooncakeConfig, SchedulerConfig, WorkerGroupConfig, WorkerGroupId,
+    WorkerGroupRole, WorkerRank,
 };
 use proto::report::SchedulerStats;
 use proto::request::{
-    DiffusionRequest, DiffusionSamplingParams, Event, GenerationFeatures, GenerationLimits,
-    GenerationRequest, ImageEncoder, ImageEncoderInput, ImageInput, MigrationCause, RequestId,
-    Trajectory,
+    DiffusionRequest, DiffusionSamplingParams, Event, FinishReason, GenerationFeatures,
+    GenerationLimits, GenerationRequest, ImageEncoder, ImageEncoderInput, ImageInput,
+    MigrationCause, RequestId, Trajectory,
 };
 use scheduling_guest::limits::Parameters;
-use storage::QueuePair;
 use storage::protocol::BlockState;
 use storage::runtime::{self, Class, Completion, GroupId, OwnerId, Region, Tier};
+use storage::{Key, QueuePair};
 use testkit::executor::output_of;
 use testkit::text::scored;
 use testkit::{FakeExecutor, InProcessPool};
@@ -133,6 +134,10 @@ pub(crate) struct Deployment {
     queue_depth: usize,
     /// The bytes of each ring of the queue pair.
     ring_bytes: usize,
+    /// Whether the deployment keeps its host copies in the remote store, and has peers whose
+    /// host copies a prefetch may read.
+    remote: bool,
+    peers: bool,
 }
 
 impl Deployment {
@@ -154,6 +159,8 @@ impl Deployment {
             queued: None,
             queue_depth: 2,
             ring_bytes: 1 << 16,
+            remote: false,
+            peers: false,
         }
     }
 
@@ -255,6 +262,20 @@ impl Deployment {
     /// A host tier of `units` KV units: committed full-attention blocks are stored there.
     pub(crate) fn host(mut self, units: u32) -> Self {
         self.host_units = units;
+        self
+    }
+
+    /// A remote store beside the host tier: every block stored on the host is stored on to it,
+    /// and an admission prefetches from it what it holds beyond the host.
+    pub(crate) fn remote(mut self) -> Self {
+        self.remote = true;
+        self
+    }
+
+    /// Peers beside the host tier: an admission whose prompt reaches far enough beyond what this
+    /// host holds prefetches from their host copies.
+    pub(crate) fn peers(mut self) -> Self {
+        self.peers = true;
         self
     }
 
@@ -574,6 +595,19 @@ impl Deployment {
                     .max()
                     .and_then(NonZeroU32::new),
                 host_tier: self.host_units > 0,
+                mooncake: self.remote.then(|| MooncakeConfig {
+                    master: "localhost:50051".to_owned(),
+                    metadata_server: "P2PHANDSHAKE".to_owned(),
+                    protocol: "tcp".to_owned(),
+                    device: String::new(),
+                    global_segment_gib: 0,
+                    library: None,
+                }),
+                peers: if self.peers {
+                    vec!["peer-1:7600".to_owned()]
+                } else {
+                    Vec::new()
+                },
                 ..KvCacheConfig::default()
             }),
             cache_groups: if tokens {
@@ -998,6 +1032,24 @@ impl Harness {
         self.pool.pool().region_number(name).unwrap()
     }
 
+    /// Resizes the session's region `name` to `units` as the engine does (`Message::Resize`),
+    /// stepping until the reply, and returns the units the region reached.
+    ///
+    /// # Panics
+    ///
+    /// When no reply arrives within 20 steps.
+    pub(crate) fn resize(&mut self, name: &str, units: u32) -> u32 {
+        let region = self.region(name);
+        let (reply, replied) = crossbeam_channel::bounded(1);
+        self.apply(Message::Resize(region, units, reply));
+        let mut reached = None;
+        self.run_until(20, |_| {
+            reached = replied.try_recv().ok();
+            reached.is_some()
+        });
+        reached.unwrap_or_default()
+    }
+
     /// Every output the scheduler sent, in order.
     pub(crate) fn outputs(&self) -> &[Output] {
         &self.record
@@ -1061,6 +1113,18 @@ impl Harness {
     ///
     /// When no report is sent within five seconds.
     pub(crate) fn calls_without_blocks(&mut self) -> u64 {
+        self.next_report();
+        let reports = self.reports().into_iter();
+        reports.map(|report| report.calls_without_blocks).sum()
+    }
+
+    /// Takes steps, 100 ms apart, until the scheduler sent its next statistics report, which it
+    /// sends once a second has passed since the last, and returns that report.
+    ///
+    /// # Panics
+    ///
+    /// When no report is sent within five seconds.
+    pub(crate) fn next_report(&mut self) -> SchedulerStats {
         let sent = self.reports().len();
         let started = Instant::now();
         while self.reports().len() == sent {
@@ -1071,8 +1135,8 @@ impl Harness {
             std::thread::sleep(Duration::from_millis(100));
             self.step();
         }
-        let reports = self.reports().into_iter();
-        reports.map(|report| report.calls_without_blocks).sum()
+        let reports = self.reports();
+        reports[sent].clone()
     }
 
     /// The requests the buffer pool took whose completions it has not written: what the
@@ -1217,6 +1281,40 @@ impl Harness {
         );
     }
 
+    /// The keys of the `Commit`s of `owner` the buffer pool took, in order.
+    pub(crate) fn committed(&self, owner: OwnerId) -> Vec<Key> {
+        let commits = self
+            .taken()
+            .into_iter()
+            .filter_map(|request| match request {
+                runtime::Request::Commit { owner: of, key, .. } if of == owner => Some(key),
+                _ => None,
+            });
+        commits.collect()
+    }
+
+    /// The first cache position request `id`'s first prefill after its `skip` earlier batches
+    /// wrote: where the computation of that life of it started, its prefix hit.
+    pub(crate) fn first_written(&self, id: RequestId, skip: usize) -> Option<i32> {
+        let batches = self.batches_of(id).into_iter().skip(skip);
+        let prefill = batches
+            .into_iter()
+            .find(|batch| batch.phase == Phase::Prefill)?;
+        let row = prefill.requests.iter().position(|of| *of == id)?;
+        let rows = &prefill.columns.rows;
+        let first = *rows
+            .query_offsets
+            .get(rows.calls.get(row)?.rows.start as usize)?;
+        rows.cache_positions
+            .get(usize::try_from(first).ok()?)
+            .copied()
+    }
+
+    /// Whether request `id`'s life ended with `Finished` for `reason`.
+    pub(crate) fn finished_with(&self, id: RequestId, reason: FinishReason) -> bool {
+        matches!(self.terminal(id), Some(Event::Finished { reason: of, .. }) if of == reason)
+    }
+
     /// The blocks the buffer pool holds for requests: slot rows and private blocks, in every
     /// region.
     pub(crate) fn held(&mut self) -> u32 {
@@ -1255,6 +1353,20 @@ pub(crate) fn prompt(id: u64, tokens: u32) -> Vec<u32> {
     (0..tokens)
         .map(|at| 10 + (id as u32 * 97 + at) % 900)
         .collect()
+}
+
+/// Token request `id` that may generate `max_tokens` tokens, whose prompt is request `of`'s
+/// prompt of `prompt_tokens` tokens: it reads the blocks that request committed.
+pub(crate) fn sharing(
+    id: u64,
+    of: u64,
+    prompt_tokens: u32,
+    max_tokens: usize,
+) -> GenerationRequest {
+    GenerationRequest {
+        prompt_token_ids: prompt(of, prompt_tokens),
+        ..token(id, prompt_tokens, max_tokens)
+    }
 }
 
 /// Token request `id` of a prompt of `prompt_tokens` tokens ([`prompt`]) that may generate

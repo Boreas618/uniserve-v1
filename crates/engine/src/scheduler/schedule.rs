@@ -504,7 +504,10 @@ impl Scheduler {
     /// not cover even those is not asked: the request is short there (SD §3.6), and `preempt`
     /// runs for it. A request that waits for a region's units since its last shortage takes no
     /// further victims: it asks again once `available` shows them there, or once nothing given
-    /// up is still on its way back to the region.
+    /// up is still on its way back to the region. The low watermark and the draft cache take
+    /// only the units the regions have free, and the units other requests wait for there are
+    /// not: what a shortage made others give up goes to the request that is short, not to
+    /// another request's headroom or draft cache, its own draft table's owner's included.
     ///
     /// Every running request is visited, those the step left out for want of blocks included:
     /// one comparison per request and class.
@@ -556,17 +559,33 @@ impl Scheduler {
                     continue;
                 };
                 let each = self.block_units(class, 0).unwrap_or(0);
-                let short = |blocks: u32| {
-                    let units = blocks.saturating_mul(each);
-                    regions
+                // The units of `region` the other short requests wait for.
+                let waited = |region: usize| {
+                    self.short
                         .iter()
-                        .copied()
-                        .find(|&region| self.available.get(region).copied().unwrap_or(0) < units)
+                        .filter(|&(other, &(at, _))| *other != id && at == region)
+                        .map(|(_, &(_, units))| units)
+                        .fold(0, u32::saturating_add)
+                };
+                // The region among the class's whose units do not cover `blocks`: of those left
+                // free beside what other requests wait for, or, with `waits` false, of all it
+                // has available.
+                let short = |blocks: u32, waits: bool| {
+                    let units = blocks.saturating_mul(each);
+                    regions.iter().copied().find(|&region| {
+                        let available = self.available.get(region).copied().unwrap_or(0);
+                        let free = if waits {
+                            available.saturating_sub(waited(region))
+                        } else {
+                            available
+                        };
+                        free < units
+                    })
                 };
                 // Every block asked for, or else those the next call writes. The low watermark
                 // and the draft cache take only the units the regions have free and wait for
                 // them; a next call whose own blocks are not covered leaves the request short.
-                let count = match (short(count), short(needed)) {
+                let count = match (short(count, true), short(needed, false)) {
                     (None, _) => count,
                     (Some(_), None) if needed > 0 => needed,
                     (Some(_), Some(region)) => {
@@ -1617,6 +1636,63 @@ mod tests {
             .filter(|(group, _)| *group == A)
             .collect();
         assert_eq!(stamps, [(A, release(OWNER_A, 3))]);
+    }
+
+    /// The low watermark and the draft cache take only the units the regions have free, and the
+    /// units a short request waits for are not: a request visited first that would only grow its
+    /// headroom leaves them, and the short request asks for the block its next call writes (SD
+    /// §3.6, §4.4).
+    #[test]
+    fn headroom_leaves_the_units_a_short_request_waits_for() {
+        let mut bench = bench(1024);
+        bench.scheduler.groups[0].capacity.cache_groups = vec![(CacheGroupKind::Full, 4)];
+        let first = running(&mut bench);
+        let scheduler = &mut bench.scheduler;
+        let table = |end| Blocks {
+            first: 0,
+            shared: 0,
+            end,
+            asked: end,
+        };
+
+        // Request 1 computed its prompt and holds the block its next decode writes: it would ask
+        // for its low watermark's block alone.
+        let request = scheduler.requests.get_mut(&first).unwrap();
+        request.num_computed_tokens = 3;
+        request.blocks[usize::from(KV)] = table(1);
+
+        // Request 2 generated a token: its next decode writes a block it has not asked for, and
+        // it waits for that block's unit, which the region now has.
+        let mut second = scheduler.requests[&first].clone();
+        let owner = OwnerId(12);
+        second.id = RequestId(2);
+        second.attachments = vec![(A, owner, 5, false)];
+        if let proto::request::Request::Generation(input) = &mut second.input {
+            input.request_id = RequestId(2);
+        }
+        second.token_ids.push(7);
+        second.num_computed_tokens = 4;
+        scheduler.owners.insert(owner, second.id);
+        scheduler.requests.insert(second.id, second);
+        scheduler.running.push(RequestId(2));
+        scheduler.short.insert(RequestId(2), (0, 1));
+        scheduler.available[0] = 1;
+
+        scheduler.allocate_ahead();
+        scheduler.post().unwrap();
+        let written: Vec<runtime::Request> = bench
+            .take()
+            .into_iter()
+            .map(|(_, request)| request)
+            .collect();
+        let asked = runtime::Request::Allocate {
+            owner,
+            class: KV,
+            at: 1,
+            count: 1,
+            units: 0,
+        };
+        assert_eq!(written, [asked]);
     }
 
     /// A step that forms no batch for a group whose executor holds a copy not yet finished sends

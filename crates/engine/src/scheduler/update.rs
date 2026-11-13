@@ -69,9 +69,9 @@ impl Scheduler {
     /// Applies a batch's output, once, as it arrives: the group has room for one more batch, and
     /// each call's output is applied to its request in row order. An executor that failed the
     /// batch, or answered it with other calls than it was given, stops the scheduler: the requests
-    /// of the epoch end as migratable with the cause `Loss` (SD §7.6). A call that computed
-    /// non-finite logits fails its request, and the batch and those requests are reported as
-    /// `Output::NumericalFault`.
+    /// of the epoch end as migratable with the cause `Loss` (SD §7.6), and the error the engine is
+    /// told names the batch. A call that computed non-finite logits fails its request, and the
+    /// batch and those requests are reported as `Output::NumericalFault`.
     pub(super) fn update(&mut self, batch: Batch, output: Result<BatchOutput, Error>) {
         let group = self.group_index(batch.group);
         if let Some(group) = group {
@@ -87,7 +87,17 @@ impl Scheduler {
                     batch.id.0
                 )));
             }
-            Err(error) => return self.fail(error),
+            // The executor states what the device said; the scheduler adds which batch it ended.
+            Err(error) => {
+                let said = match error {
+                    Error::Executor(message) => message,
+                    other => other.to_string(),
+                };
+                return self.fail(Error::Executor(format!(
+                    "batch {} failed: {said}",
+                    batch.id.0
+                )));
+            }
         };
         self.count_batch(&batch, &output);
 
