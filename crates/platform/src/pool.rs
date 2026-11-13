@@ -263,6 +263,106 @@ impl VirtualPool {
         }
     }
 
+    /// `parts` blocks of at least `bytes` each, mapped back to back from the end of what the
+    /// pool gave out: part `i + 1` starts where part `i` ends, so the parts are one range a
+    /// caller addresses as a whole, whose tail it can give back part by part
+    /// ([`Self::release`]). Every part is new storage, never a freed chunk, and is booked before
+    /// it is created.
+    ///
+    /// # Errors
+    ///
+    /// Fails when the pool is suspended, when the reservation cannot hold the range, when the
+    /// driver cannot create or map a part, and when a booking refuses; the parts this call
+    /// mapped before the failure are released again, so nothing of the range stays.
+    pub(crate) fn allocate_parts(
+        &mut self,
+        bytes: usize,
+        parts: usize,
+    ) -> Result<Vec<(u64, Arc<Block>)>> {
+        if self.suspended {
+            return Err(Error::invalid("a suspended pool gives out no storage"));
+        }
+        let bytes = bytes.max(1).next_multiple_of(self.granularity);
+        let range = bytes.checked_mul(parts).ok_or_else(|| {
+            Error::invalid(format!("{parts} parts of {bytes} bytes overflow a range"))
+        })?;
+        if self.reserved - self.used < range {
+            return Err(Error::invalid(format!(
+                "the pool's reservation of {} bytes on {} cannot give out {range} more",
+                self.reserved, self.device
+            )));
+        }
+
+        let mut given = Vec::with_capacity(parts);
+        for _ in 0..parts {
+            let offset = self.used as u64;
+            let handle = match self.map_handle(offset, bytes) {
+                Ok(handle) => handle,
+                Err(error) => {
+                    for (address, _) in given {
+                        let _ = self.release(address);
+                    }
+                    return Err(error);
+                }
+            };
+            self.used += bytes;
+            let block = Arc::new(Block::new(
+                handle,
+                bytes,
+                self.handle_type,
+                self.context.clone(),
+            ));
+            self.chunks.push(Chunk {
+                offset,
+                bytes,
+                block: Some(Arc::clone(&block)),
+                saved: None,
+                protection: Protection::ReadWrite,
+                free: false,
+            });
+            given.push((self.address + offset, block));
+        }
+        Ok(given)
+    }
+
+    /// Gives the storage of the block at `address` back to the driver for good: it is unmapped
+    /// and released, the pool's booked total drops by it, and the pool never gives its
+    /// addresses out again, unless they end what it gave out. A block given out before is no
+    /// storage afterwards, so its holder makes no use of it. An address the pool did not give
+    /// out is ignored.
+    ///
+    /// # Errors
+    ///
+    /// Fails when the pool is suspended, and when the driver refuses the unmap or the release;
+    /// the block is then as it was.
+    pub(crate) fn release(&mut self, address: u64) -> Result<()> {
+        if self.suspended {
+            return Err(Error::invalid(
+                "a suspended pool's blocks are released with the pool",
+            ));
+        }
+        let Some(index) = self
+            .chunks
+            .iter()
+            .position(|chunk| self.address + chunk.offset == address)
+        else {
+            return Ok(());
+        };
+
+        self.release_chunk(index)?;
+        let chunk = self.chunks.remove(index);
+        // The addresses of a block at the end of what the pool gave out are given out again.
+        if chunk.offset + chunk.bytes as u64 == self.used as u64 {
+            self.used = self
+                .chunks
+                .iter()
+                .map(|chunk| chunk.offset as usize + chunk.bytes)
+                .max()
+                .unwrap_or(0);
+        }
+        Ok(())
+    }
+
     /// Changes what the pool's device and its peers may do with the block at
     /// `address`, at its unchanged address (`cuMemSetAccess`): a parked
     /// standby's blocks become read-only and become read-write again when it

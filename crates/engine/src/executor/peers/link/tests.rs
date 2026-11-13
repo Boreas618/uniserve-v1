@@ -162,7 +162,6 @@ fn operations() -> Vec<DataOperation> {
         DataOperation::Room,
         DataOperation::GraphBytes,
         DataOperation::Sleep,
-        DataOperation::Wake,
         DataOperation::SuspendGraphs,
         DataOperation::RestoreGraphs,
         DataOperation::SetKernels,

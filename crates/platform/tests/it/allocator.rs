@@ -147,6 +147,76 @@ fn a_freed_block_is_given_out_again_at_its_address_with_its_contents() {
     assert_eq!(read(&host), vec![0x5a; 16]);
 }
 
+/// Parts lie back to back, so a holder addresses them as one range; releasing the tail gives its
+/// storage back to the driver and the budget while the parts before it keep their addresses and
+/// contents, and a suspension and restore afterwards bring back only what is still held.
+#[test]
+#[ignore = "requires a CUDA device"]
+fn parts_lie_back_to_back_and_a_released_tail_leaves_the_budget() {
+    let _driver = exclusive_driver();
+    let device = platform::Device::new(DEVICE).unwrap();
+    let budget = RecordingBudget::new(64 << 20);
+    let mut allocator = with_budget(&device, &budget);
+    allocator.reserve(PoolKind::Resident, 32 << 20).unwrap();
+    let stream = device.stream().unwrap();
+
+    // A freed block of the parts' size is not taken: every part is new storage after the last.
+    let freed = allocator.allocate(PoolKind::Resident, 4096).unwrap();
+    let part = freed.len();
+    allocator.free(freed);
+    let parts = allocator
+        .allocate_parts(PoolKind::Resident, 4096, 4)
+        .unwrap();
+    assert_eq!(parts.len(), 4);
+    for (index, buffer) in parts.iter().enumerate() {
+        assert_eq!(buffer.len(), part);
+        assert_eq!(
+            buffer.address(),
+            parts[0].address() + (index * part) as u64,
+            "part {index} starts where the one before it ends"
+        );
+    }
+    let mapped = 5 * part;
+    assert_eq!(allocator.mapped_bytes(PoolKind::Resident), mapped);
+    assert_eq!(budget.booked(PoolKind::Resident), Some(mapped as u64));
+
+    // One write across the boundary of the first two parts reads back whole.
+    let host = platform::PinnedBuffer::new(DEVICE, 32).unwrap();
+    let across = parts[1].address() - 16;
+    // SAFETY: the 32 bytes lie in the first two parts, which are mapped and outlive the fill and
+    // the copy, which the stream runs in order.
+    unsafe {
+        platform::memset_d8(across, 0x6b, 32, &stream).unwrap();
+        platform::memcpy_async(host.address(), across, 32, &stream).unwrap();
+    }
+    stream.synchronize().unwrap();
+    assert_eq!(read(&host), vec![0x6b; 32]);
+
+    // The last two parts are given back: the budget books what stays, and the first part keeps
+    // its contents across a suspension and a restore.
+    let mut parts = parts;
+    for buffer in parts.split_off(2) {
+        allocator.release(buffer).unwrap();
+    }
+    let held = 3 * part;
+    assert_eq!(allocator.mapped_bytes(PoolKind::Resident), held);
+    assert_eq!(budget.booked(PoolKind::Resident), Some(held as u64));
+
+    allocator.suspend().unwrap();
+    allocator.restore().unwrap();
+    assert_eq!(allocator.mapped_bytes(PoolKind::Resident), held);
+    // SAFETY: as above, the first part is mapped again with its saved contents.
+    unsafe { platform::memcpy_async(host.address(), across, 16, &stream) }.unwrap();
+    stream.synchronize().unwrap();
+    assert_eq!(read(&host)[..16], [0x6b; 16]);
+
+    // The released addresses ended what the pool gave out, so new parts take them again.
+    let again = allocator
+        .allocate_parts(PoolKind::Resident, 4096, 2)
+        .unwrap();
+    assert_eq!(again[0].address(), parts[1].address() + part as u64);
+}
+
 #[test]
 #[ignore = "requires a CUDA device"]
 fn each_pool_has_its_own_range_and_a_block_exports_a_working_descriptor() {

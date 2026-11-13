@@ -15,9 +15,13 @@
 //! open (`specs/buffer-pool.md` §14.1).
 //!
 //! The region is numbered for what the quota holds as if the rank's epoch served the GPU alone,
-//! and the start creates the segments of it the quota holds now. They differ for an epoch that
-//! starts beside the epoch it succeeds in another layout: its regions grow into the rest by
-//! `Grow` as the serving epoch drains (`specs/updates.md` §3.7).
+//! but the division counts the process as it is before the warm-up, whose instantiated graphs
+//! and library state the warm process adds (`specs/engine-worker-port.md` §1, "The process a
+//! division counts"). So the start creates only the region's first segments, those that hold the
+//! fewest units the warm-up reads ([`warm_units`]); once warm, the rank reserves its process and
+//! creates the segments the quota then holds, and the region grows into them as it does by `Grow`
+//! beside a draining predecessor of another layout, whose regions it grows into further as that
+//! epoch drains (`specs/updates.md` §3.7).
 
 use std::sync::Arc;
 
@@ -301,11 +305,12 @@ impl ModelRunner {
     /// The units are the region's numbering: what the GPU's quota leaves once the weights are
     /// mapped as if the epoch served the GPU alone, less those regions and the storages of the
     /// agreed slots, agreed over `host` as the smallest count of its ranks, and rounded down to
-    /// whole segments of whole granules. The first units are the whole segments of them the
-    /// quota holds free now ([`first_units`]), agreed over `host` alike: an epoch that starts
-    /// beside the epoch it succeeds has the units the serving epoch holds as the rest, which its
-    /// regions grow into by `Grow` as that epoch drains (`specs/updates.md` §3.7). A first epoch
-    /// holds every unit at once.
+    /// whole segments of whole granules. The first units are the segments the start creates
+    /// before the warm-up: those that hold the fewest units the warm-up reads ([`warm_units`]),
+    /// as far as the quota holds them free now ([`first_units`]), agreed over `host` alike. The
+    /// rest are created once the rank is warm, as far as the quota then holds them beside its warm
+    /// process, and an epoch that starts beside the epoch it succeeds gains what that epoch holds
+    /// by `Grow` as it drains (`specs/updates.md` §3.7).
     ///
     /// # Errors
     ///
@@ -409,8 +414,15 @@ impl ModelRunner {
             );
         }
 
-        // Every rank of a region creates the same segments of it.
-        let first = first_units(units, layout, granularity, remainder);
+        // Every rank of a region creates the same segments of it: at its start, the first of
+        // them, which hold the padding unit and the fewest units the warm-up reads, as far as the
+        // quota holds them now. The warm-up adds to the process what the division did not
+        // measure, so the rest are created once the rank is warm and its process is reserved.
+        let first = first_units(units, layout, granularity, remainder).min(warm_units(
+            units,
+            layout,
+            granularity,
+        ));
         let first = host
             .all_reduce_min(&[i64::from(first)])
             .context("agreeing the units the ranks create at their start")?[0];
@@ -469,6 +481,21 @@ pub(crate) fn first_units(
         .checked_sub(unsplit)
         .map_or(0, |left| left / segment);
     u32::try_from(fitting).unwrap_or(u32::MAX).min(count) * per_segment
+}
+
+/// The units of a cache of `units` units laid out in `layout`, split into segments of whole
+/// `granularity`-byte granules, that its start creates before the warm-up: the fewest whole
+/// segments from the first that hold the cache's fewest units (the padding unit and a page of
+/// every cache group), which is what the warm-up's batches read. Zero when the cache does not
+/// split.
+pub(crate) fn warm_units(units: u32, layout: &CacheLayout, granularity: u64) -> u32 {
+    let Some((count, per_segment)) =
+        segments::segment_layout(units, layout.plane_bytes, granularity)
+    else {
+        return 0;
+    };
+
+    fewest_units(layout).div_ceil(per_segment).min(count) * per_segment
 }
 
 /// The bytes of `device`'s quota a starting rank of `client`'s scope may divide (steps 11-12),
@@ -736,6 +763,23 @@ mod tests {
             first_units(1024, &layout, GRANULE, 1024 * flags + 3 * segment - 1),
             256
         );
+    }
+
+    /// Before its warm-up a start creates the first segments of its region, those that hold the
+    /// fewest units the warm-up reads (the padding unit and a page of every cache group); the
+    /// rest wait for the warm process to be measured.
+    #[test]
+    fn the_start_creates_the_first_segments_that_hold_the_warm_up_s_units() {
+        let layout = layout();
+        let fewest = fewest_units(&layout);
+
+        // 1024 units of 32 KiB planes split into eight segments of 128: one holds the fewest.
+        assert_eq!(warm_units(1024, &layout, GRANULE), 128);
+        assert!(fewest <= 128);
+        // Segments of one unit each (a granule of one plane): as many as the fewest units take.
+        assert_eq!(warm_units(8, &layout, layout.plane_bytes), fewest);
+        // A cache that does not split creates no segment.
+        assert_eq!(warm_units(7, &layout, GRANULE), 0);
     }
 
     #[test]

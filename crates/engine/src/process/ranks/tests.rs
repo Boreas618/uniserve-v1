@@ -38,6 +38,7 @@ use super::{
 use crate::batch::product::KINDS;
 use crate::memory::client::StorageClient;
 use crate::process::ranks::rank::ModelRunner;
+use crate::process::ranks::rank::text::Keys;
 use crate::support::{DEPLOYMENT, SLOTS, StorageServer, launch};
 
 /// Submits `request` under `number` on the scheduler's end `pair` and returns its completion, the
@@ -138,7 +139,7 @@ fn a_meta_rank_creates_its_region_s_segments_once_the_session_is_open_and_a_succ
 
     // The rank creates the segments that cover its region's units, back to back from unit 0 and
     // keyed by its epoch, and the head grants them.
-    let created = open_ranks(&mut ranks, &open, &opened).unwrap();
+    let created = open_ranks(&mut ranks, &open, &opened, None).unwrap();
     assert_eq!(created.len(), 1);
     let (region, segments) = &created[0];
     assert_eq!(*region, open.regions[kv].name);
@@ -249,7 +250,7 @@ fn a_meta_rank_creates_its_region_s_segments_once_the_session_is_open_and_a_succ
     assert_eq!(next_opened.regions[kv], (number, units - 1));
     assert_eq!(next_opened.segments[kv], *segments);
 
-    let none = open_ranks(&mut successors, &next_open, &next_opened).unwrap();
+    let none = open_ranks(&mut successors, &next_open, &next_opened, None).unwrap();
     assert_eq!(none, vec![(open.regions[kv].name.clone(), Vec::new())]);
     let mapped: Vec<(u64, u32, u32)> = service::lock(&successors[0].text().unwrap().cache)
         .config()
@@ -294,7 +295,7 @@ fn a_meta_rank_creates_its_region_s_segments_once_the_session_is_open_and_a_succ
     assert_eq!(other_opened.regions[kv], (number, units - 1));
     assert_eq!(other_opened.segments[kv], *segments);
 
-    let none = open_ranks(&mut others, &held, &other_opened).unwrap();
+    let none = open_ranks(&mut others, &held, &other_opened, None).unwrap();
     assert_eq!(none, vec![(open.regions[kv].name.clone(), Vec::new())]);
     let cache = service::lock(&others[0].text().unwrap().cache);
     assert_eq!(cache.config().units, units);
@@ -479,7 +480,7 @@ fn a_meta_media_rank_opens_its_media_memory_and_spawns_its_runners() {
     let mut pairs = client.open(open.clone()).unwrap();
     let opened = client.session().unwrap().1.clone();
     assert!(opened.segments.iter().all(Vec::is_empty));
-    let created = open_ranks(&mut ranks, &open, &opened).unwrap();
+    let created = open_ranks(&mut ranks, &open, &opened, None).unwrap();
     assert!(created.is_empty());
     bind(&mut ranks, &open, &opened, true).unwrap();
     let (workers, spawned) = spawn(
@@ -797,7 +798,11 @@ fn the_conditioning_lies_with_the_text_encoder_and_the_denoising_group_reads_it(
             .unwrap();
     let mut pairs = client.open(open.clone()).unwrap();
     let opened = client.session().unwrap().1.clone();
-    assert!(open_ranks(&mut ranks, &open, &opened).unwrap().is_empty());
+    assert!(
+        open_ranks(&mut ranks, &open, &opened, None)
+            .unwrap()
+            .is_empty()
+    );
     let (workers, spawned) = spawn(
         &mut ranks,
         (&open, &opened),
@@ -932,7 +937,11 @@ fn a_device_holds_a_rank_of_the_text_group_and_one_of_a_flow_replica() {
             .unwrap();
     let mut pairs = client.open(open.clone()).unwrap();
     let opened = client.session().unwrap().1.clone();
-    assert!(open_ranks(&mut ranks, &open, &opened).unwrap().is_empty());
+    assert!(
+        open_ranks(&mut ranks, &open, &opened, None)
+            .unwrap()
+            .is_empty()
+    );
     let (workers, spawned) = spawn(
         &mut ranks,
         (&open, &opened),
@@ -1185,7 +1194,8 @@ fn checkpoint_bytes(directory: &str) -> u64 {
 /// run sizes its pools, and its division of a GB200's quota at 0.70 holds every reservation the
 /// Storage Server admits it with: the weights, the cache's 131072 tokens in whole segments, the
 /// graph pool, the scratch pool of the shadow region and the scratch page set, and the warm
-/// process with its 128 request slots.
+/// process with its 128 request slots. Its start creates the cache's first segment before its
+/// warm-up and the rest once its warm process is reserved.
 #[test]
 #[ignore = "reads the headers of the released Qwen3-30B-A3B checkpoint, which the repository does not hold"]
 fn the_e1_deployment_starts_within_its_gpu_s_quota_at_a_fraction_of_0_70() {
@@ -1255,10 +1265,15 @@ fn the_e1_deployment_starts_within_its_gpu_s_quota_at_a_fraction_of_0_70() {
         .unwrap();
     assert_eq!(slots, 128);
     assert!(units >= 2048, "the cache holds {units} units");
-    assert_eq!(
-        first, units,
-        "a first epoch creates every unit at its start"
-    );
+
+    // The start creates the cache's first segment before its warm-up, which holds the fewest
+    // units the warm-up reads; the rest of the stated capacity is created once the rank is warm,
+    // beside the warm process the reservations below count.
+    let (_, segment) =
+        crate::memory::cache::segments::segment_layout(units, layout.plane_bytes, GB200_GRANULE)
+            .unwrap();
+    assert_eq!(first, segment);
+    assert!(first >= crate::process::ranks::rank::memory::fewest_units(&layout));
 
     // Every reservation the Storage Server admits the rank with, and what the quota leaves. The
     // warm process holds the request slots' storages, which are counted a second time here, as
@@ -1355,7 +1370,7 @@ fn replicas_in_engines_of_their_own_name_regions_of_their_own() {
             opened.segments[kv].is_empty(),
             "a replica maps another's segments"
         );
-        let created = open_ranks(ranks, open, opened).unwrap();
+        let created = open_ranks(ranks, open, opened, None).unwrap();
         assert_eq!(created.len(), 1);
         let (region, segments) = &created[0];
         assert!(!segments.is_empty());
@@ -1378,7 +1393,7 @@ fn a_target_of_another_layout_maps_none_of_the_serving_epochs_segments() {
     let serving = launch();
     let mut ranks = loaded(&serving);
     let (mut head, _pairs, open, opened) = opened_session(&server, &serving, &ranks);
-    let created = open_ranks(&mut ranks, &open, &opened).unwrap();
+    let created = open_ranks(&mut ranks, &open, &opened, None).unwrap();
     let (region, segments) = &created[0];
     for &(segment, first, count) in segments {
         head.grant(region, segment, first, count).unwrap();
@@ -1412,7 +1427,7 @@ fn a_target_of_another_layout_maps_none_of_the_serving_epochs_segments() {
     assert_ne!(kv_region(&other_open), kv_region(&open));
     let kv = usize::from(other_open.groups[0].regions[0][0]);
     assert!(other_opened.segments[kv].is_empty());
-    let other_created = open_ranks(&mut other_ranks, &other_open, &other_opened).unwrap();
+    let other_created = open_ranks(&mut other_ranks, &other_open, &other_opened, None).unwrap();
     let (other_region, other_segments) = &other_created[0];
     for &(segment, first, count) in other_segments {
         other_head
@@ -1469,7 +1484,7 @@ fn a_dedicated_expert_rank_maps_no_kv_region() {
         "the session states the attention group alone"
     );
 
-    let created = open_ranks(&mut ranks, &open, &opened).unwrap();
+    let created = open_ranks(&mut ranks, &open, &opened, None).unwrap();
     assert_eq!(created.len(), 1);
     let (region, segments) = &created[0];
     assert_eq!(region, kv_region(&open));
@@ -1497,4 +1512,227 @@ fn a_dedicated_expert_rank_maps_no_kv_region() {
     drop(workers);
     drop(spawned);
     head.close().unwrap();
+}
+
+/// A text deployment whose hosts hold its ranks interleaved, as the daemon launches one whose two
+/// tensor-parallel groups each span both hosts (hosts ordered by their first rank, each host's
+/// process launched from it): each host's process numbers its ranks by their places in the
+/// deployment, each on the device that places it and at its place in its group's tensor group,
+/// so the two hosts hold every rank of the deployment once.
+#[test]
+fn a_host_numbers_its_text_ranks_by_their_places_in_the_deployment() {
+    let placed = |host: &str, device: &str| WorkerRank {
+        host: host.to_owned(),
+        device: device.to_owned(),
+    };
+    let group = |id: &str, ranks: Vec<WorkerRank>| WorkerGroupConfig {
+        id: WorkerGroupId(id.to_owned()),
+        role: Default::default(),
+        replicas: 1,
+        blocks: WorkerGroupConfig::single_component(proto::config::DEFAULT_BLOCK, ranks.len()),
+        ranks,
+        queue_depth: 2,
+        mem_fraction_static: None,
+    };
+    // Ranks 0 and 1 are group `a`'s, on each host's device 0; ranks 2 and 3 group `b`'s, on each
+    // host's device 1.
+    let groups = vec![
+        group("a", vec![placed("h0", "cuda:0"), placed("h1", "cuda:0")]),
+        group("b", vec![placed("h0", "cuda:1"), placed("h1", "cuda:1")]),
+    ];
+
+    let mut numbered = Vec::new();
+    for (host, first) in [("h0", 0), ("h1", 1)] {
+        let mut launch = launch();
+        launch.engine_config.parallel.worker_groups = groups.clone();
+        launch.engine_config.parallel.tensor_parallel_size =
+            std::num::NonZeroUsize::new(2).unwrap();
+        launch.engine_config.parallel.data_parallel_size = std::num::NonZeroUsize::new(2).unwrap();
+        launch.host = host.to_owned();
+        launch.rank = first;
+        launch.devices = vec![0, 1];
+        launch.world_size = 4;
+
+        let registry = nn::family::Registry::new([models::qwen3::family::FAMILY]).unwrap();
+        let family = crate::process::catalogue::resolve(
+            &registry,
+            Path::new(&launch.engine_config.model.model),
+        )
+        .unwrap();
+        let ranks = ModelRunner::of(&launch, family).unwrap().ranks().unwrap();
+
+        let stated: Vec<(u32, String, u32, i32)> = ranks
+            .iter()
+            .map(|rank| {
+                (
+                    rank.rank(),
+                    rank.group().to_owned(),
+                    rank.tensor_rank(),
+                    rank.devices()[0].0,
+                )
+            })
+            .collect();
+        let position = u32::from(host == "h1");
+        assert_eq!(
+            stated,
+            vec![
+                (first, "a".to_owned(), position, 0),
+                (first + 2, "b".to_owned(), position, 1),
+            ],
+            "the ranks host {host} holds"
+        );
+        numbered.extend(stated.into_iter().map(|(rank, ..)| rank));
+    }
+    numbered.sort_unstable();
+    assert_eq!(numbered, vec![0, 1, 2, 3]);
+}
+
+/// A model that keeps a recurrent state copies it between its request slots and its cache's state
+/// pages with kernels whose keys carry the cache's units (a state plane's rows are the layout's
+/// columns times the units), which the load's profile run, over the fewest units, does not name.
+/// Once the session numbers the region, the rank's opening asks the Build Server, for the rank's
+/// device, for the kernels its cache launches over that numbering that its generation lacks, and
+/// the rank's kernels name them. A dense model's cache launches no such kernel and asks for none.
+#[test]
+fn a_rank_opening_resolves_the_kernels_of_its_cache_over_its_region_s_units() {
+    let fixtures = [
+        (
+            models::qwen3::family::HYBRID_FAMILY,
+            "crates/models/tests/it/qwen3/data/qwen3_5_moe/model",
+            true,
+        ),
+        (
+            models::qwen3::family::FAMILY,
+            "crates/models/tests/it/qwen3/data/qwen3_moe/model",
+            false,
+        ),
+    ];
+    for (family, fixture, keeps_state) in fixtures {
+        let server = StorageServer::start();
+        let mut launch = launch();
+        launch.engine_config.model.model = crate::support::workspace()
+            .join(fixture)
+            .to_string_lossy()
+            .into_owned();
+        let registry = nn::family::Registry::new([family]).unwrap();
+        let family = crate::process::catalogue::resolve(
+            &registry,
+            Path::new(&launch.engine_config.model.model),
+        )
+        .unwrap();
+        let model_runner = ModelRunner::of(&launch, family).unwrap();
+        let mut ranks = load_ranks(
+            model_runner.ranks().unwrap(),
+            Backing::Meta,
+            &launch,
+            Meeting::Local,
+        )
+        .unwrap();
+
+        // The region numbered for more units than the fewest, in whole segments, as a division
+        // of a device's quota numbers it.
+        let loaded = ranks[0].text().unwrap().units;
+        {
+            let Loaded::Text(text) = &mut ranks[0].loaded else {
+                panic!("a text rank");
+            };
+            text.units = 40 * loaded;
+            text.first = text.units;
+        }
+        let (mut head, _pairs, open, opened) = opened_session(&server, &launch, &ranks);
+
+        let asked: std::sync::Mutex<Vec<(platform::DeviceId, Keys)>> = Default::default();
+        let resolve = |device: platform::DeviceId, keys: &Keys| -> anyhow::Result<Vec<_>> {
+            asked.lock().unwrap().push((device, keys.clone()));
+            Ok(Vec::new())
+        };
+        open_ranks(&mut ranks, &open, &opened, Some(&resolve)).unwrap();
+
+        let text = ranks[0].text().unwrap();
+        let cache = service::lock(&text.cache);
+        let (units, layout) = (cache.config().units, cache.layout());
+        assert_eq!(units, 40 * loaded);
+        let shape = |units: u32| {
+            format!(
+                "shape_{}x{}_",
+                u64::from(layout.columns) * u64::from(units),
+                layout.plane_bytes
+            )
+        };
+        let copies = |keys: &Keys, units: u32| -> Vec<&'static str> {
+            keys.iter()
+                .filter(|(_, key)| key.contains(&shape(units)))
+                .map(|(operator, _)| *operator)
+                .collect()
+        };
+
+        let asked = asked.into_inner().unwrap();
+        if !keeps_state {
+            assert!(asked.is_empty(), "a dense cache asks for {asked:?}");
+            drop(cache);
+            head.close().unwrap();
+            continue;
+        }
+        assert_eq!(asked.len(), 1, "{asked:?}");
+        let (device, keys) = &asked[0];
+        assert_eq!(*device, ranks[0].model_runner.devices()[0]);
+        assert_eq!(
+            copies(keys, units),
+            ["cache_block_scatter", "cache_block_snapshot"]
+        );
+        assert!(copies(keys, loaded).is_empty(), "{keys:?}");
+        assert!(keys.is_subset(&ranks[0].keys));
+        drop(cache);
+        head.close().unwrap();
+    }
+}
+
+/// A media group whose warm ranks keep fewer request slots than they warmed up with states them,
+/// and the session's regions of the group serve them: its slot rows the slots kept, and the
+/// product buffer of each of its ranks the parts of those slots, a slot's part being the buffer's
+/// units over the slots it was opened with.
+#[test]
+#[ignore = "reads the headers of a released FastH3 checkpoint, which the repository does not hold"]
+fn the_regions_of_a_media_group_serve_the_slots_it_kept() {
+    assert!(
+        Path::new(FAST_H3).is_dir(),
+        "the media rank loads the headers of {FAST_H3}, which is missing"
+    );
+    let launch = video_launch();
+    let registry = nn::family::Registry::new([models::minimax_h3::family::FAMILY]).unwrap();
+    let family = crate::process::catalogue::resolve(&registry, Path::new(FAST_H3)).unwrap();
+    let model_runner = ModelRunner::of(&launch, family).unwrap();
+    let ranks = load_ranks(
+        model_runner.ranks().unwrap(),
+        Backing::Meta,
+        &launch,
+        Meeting::Local,
+    )
+    .unwrap();
+    let open = layout(&launch, &ranks).unwrap();
+    let group = &open.groups[0];
+    let slot_region = usize::from(group.slots);
+    let products = open
+        .regions
+        .iter()
+        .position(|region| region.name.starts_with("products "))
+        .unwrap();
+    assert_eq!(open.regions[slot_region].units, SLOTS);
+    let per_slot = open.regions[products].units / SLOTS;
+
+    // Every slot the group warmed up with is kept: no region changes.
+    let mut stated = capacities(&ranks, &open, (&[], Vec::new())).unwrap();
+    assert!(
+        super::kept_regions(&launch, &ranks, &open, &stated)
+            .unwrap()
+            .is_empty()
+    );
+
+    // One slot kept.
+    stated[0].1.slots = 1;
+    let mut kept = super::kept_regions(&launch, &ranks, &open, &stated).unwrap();
+    kept.sort_unstable();
+    let mut expected = vec![(slot_region, 1), (products, per_slot)];
+    expected.sort_unstable();
+    assert_eq!(kept, expected);
 }

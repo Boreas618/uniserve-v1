@@ -10,12 +10,28 @@
 //! the Build Server and the links to the epoch's other main processes.
 //!
 //! [`start`] is the binary's construction (`specs/engine-worker-port.md` §1.1,
-//! `specs/buffer-pool.md` §14.1): the ranks load to the division of their GPUs' quotas, the head
-//! opens the session stating each region's units with no segment, every rank maps the segments
-//! the answer states and creates the rest, the head grants what was created, the workers are
-//! spawned and warm, the schedulers are built over them, and each grows its KV regions into the
-//! granted segments. A start is not an update (`specs/updates.md` §2): the generation it serves
-//! is [`FIRST_GENERATION`], with nothing kept beside it.
+//! `specs/buffer-pool.md` §14.1), in this order:
+//!
+//! 1. the ranks load to the division of their GPUs' quotas, measuring their processes before any
+//!    warm-up, and resolve the kernels their profile runs name into the generation they serve;
+//! 2. the head opens the session stating each region's units with no segment;
+//! 3. every rank maps the segments the answer states and creates the first segments of its KV
+//!    region, those that hold the fewest units the warm-up reads, and its generation takes the
+//!    kernels its cache and recurrent state launch over the region's numbering;
+//! 4. the workers are spawned and warm, and the head grants the created segments;
+//! 5. what fills each share last is committed from the warm processes, measured, never estimated
+//!    (`specs/engine-worker-port.md` §1, "The process a division counts"): each media group keeps
+//!    the request slots whose storages fit beside its ranks' warm processes and gives the rest
+//!    back, every rank reserves its warm process in its GPU's quota, and the ranks of each KV
+//!    region create the segments their quotas then hold, which the head grants; a stated
+//!    capacity (`kv_cache_config.max_tokens`) is created whole or refused by name;
+//! 6. the schedulers are built over the workers, and each grows its KV regions into the granted
+//!    segments and resizes the regions of a media group to the slots it kept.
+//!
+//! A standby of the serving engine maps its epoch's regions and reserves its process when it is
+//! promoted, as the process it replaces held them until then: it commits nothing at its start. A
+//! start is not an update (`specs/updates.md` §2): the generation it serves is
+//! [`FIRST_GENERATION`], with nothing kept beside it.
 //!
 //! An epoch whose worker groups have ranks on several hosts runs one main process per host. The
 //! scheduler node's opens the session at its host's Storage Server and relays it to every peer,
@@ -29,7 +45,7 @@
 //! then the workers, the peer links, the session, and the devices' contexts.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::num::NonZeroUsize;
+use std::num::{NonZeroU64, NonZeroUsize};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicU64;
 use std::sync::{Arc, Mutex};
@@ -47,7 +63,7 @@ use crate::worker::completion::Outcome;
 use anyhow::{Context as _, Result, bail};
 use build_server::Target;
 use crossbeam_channel::{Receiver, Sender};
-use ops::Generation;
+use ops::KernelEntry;
 use platform::DeviceId;
 use proto::config::{EngineArgs, SchedulerConfig, WorkerGroupConfig};
 use proto::request::{GenerationFeatures, GenerationLimits};
@@ -57,8 +73,8 @@ use storage::QueuePair;
 use storage::runtime::{GroupId, Open, Opened, Segments};
 
 use super::ranks::{
-    Backing, FIRST_GENERATION, LoadedRank, Meeting, Place, bind, capacities, group_numbers, layout,
-    load_ranks, open_ranks, spawn,
+    Backing, FIRST_GENERATION, LoadedRank, Meeting, Place, Resolve, bind, capacities,
+    group_numbers, keep_warm_slots, kept_regions, layout, load_ranks, open_ranks, spawn,
 };
 use super::{epoch, operations};
 use crate::executor::{Executor, Shadow, WorkerExecutor};
@@ -516,7 +532,8 @@ pub(crate) fn start(
     };
 
     // Step 9 of each rank: the kernels its profile run names, selected for the devices'
-    // architectures and installed on its own device as the start's generation. Each device's
+    // architectures and installed on its own device as the start's generation, and once the
+    // session numbered the rank's cache the kernels its cache launches over that numbering. Each
     // selection is kept: together they are what the first generation serves, which an update is
     // compared with, and not the module set's candidates, which name every package installed.
     let selections: Mutex<Vec<proto::module::Packages>> = Mutex::new(Vec::new());
@@ -525,8 +542,9 @@ pub(crate) fn start(
     } else {
         model_runner.targets()?
     };
-    let resolve = |device: DeviceId, keys: &Keys| -> Result<Arc<Generation>> {
-        let build = build
+    let build = build.map(|client| (client, targets));
+    let resolve = |device: DeviceId, keys: &Keys| -> Result<Vec<KernelEntry>> {
+        let (build, targets) = build
             .as_ref()
             .context("the start holds no Build Server client to resolve a device's kernels")?;
         let mut by_operator: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
@@ -539,10 +557,10 @@ pub(crate) fn start(
 
         let mut client = service::lock(build);
         let (packages, routes) =
-            load::select(&mut client, &targets, &launch.modules.kernels, &by_operator)?;
+            load::select(&mut client, targets, &launch.modules.kernels, &by_operator)?;
         let entries = load::install(&mut client, device, &packages, &routes)?;
         service::lock(&selections).push(packages);
-        Ok(Arc::new(Generation::new(FIRST_GENERATION, entries)))
+        Ok(entries)
     };
     let backing = if meta {
         Backing::Meta
@@ -553,18 +571,18 @@ pub(crate) fn start(
         }
     };
     let mut ranks = load_ranks(model_runner.ranks()?, backing, launch, meeting)?;
-    let kernels = crate::modules::select::served(service::lock(&selections).iter());
-    let build = build.map(|client| (client, targets));
+    let resolved = (!meta).then_some(&resolve as &Resolve<'_>);
+    let served = || crate::modules::select::served(service::lock(&selections).iter());
     if let Some(channel) = upstream {
         let mut engine = start_peer(
             launch,
             storage,
             (&model_runner, ranks),
-            build,
+            (build.clone(), resolved),
             channel,
             liveness,
         )?;
-        engine.kernels = kernels;
+        engine.kernels = served();
         return Ok(engine);
     }
 
@@ -586,12 +604,13 @@ pub(crate) fn start(
         .context("the session with the buffer pool is not open")?;
 
     // Every rank, here and on every peer, maps the segments the answer states and creates the
-    // rest, which the head grants once every rank holds them.
+    // first ones the warm-up reads, which the head grants once every rank holds them.
     let answers = remotes
         .iter()
         .map(|(_, remote)| Ok((remote.rank(), remote.session(&open, &opened)?)))
         .collect::<Result<Vec<(u32, Answer)>>>()?;
-    let mut created = open_ranks(&mut ranks, &open, &opened)?;
+    let mut created = open_ranks(&mut ranks, &open, &opened, resolved)?;
+    let kernels = served();
     bind(&mut ranks, &open, &opened, true)?;
     let registers = |group: GroupId| head.completed_registers(group, &pairs);
     let (route, workers) = spawn(&mut ranks, (&open, &opened), &registers, remotes.clone())?;
@@ -623,6 +642,24 @@ pub(crate) fn start(
         }
     }
 
+    // What fills each share last, committed from the warm processes: the slots a media group
+    // keeps, each rank's warm process in its GPU's quota, and the segments of each KV region the
+    // quotas then hold, here and on every peer. A standby commits nothing until it is promoted.
+    // A peer kept its media groups' slots before it answered.
+    let binding = weight_binding(launch, &model_runner, &ranks, &workers, remotes.clone())?;
+    if !standby(launch) {
+        keep_warm_slots(&mut ranks)?;
+        binding
+            .reserve_serving()
+            .context("reserving the warm processes in their GPUs' quotas")?;
+        let capacity = launch
+            .engine_config
+            .kv_cache
+            .max_tokens
+            .map(NonZeroU64::get);
+        epoch::create_fitting(&mut head, &binding, capacity)?;
+    }
+
     // The always-on counters, once the ranks are warm: every stream a runner computes on is
     // `device`, and every one the copies of a rank's blocks move on is `copy`. A graph's launch
     // is one record unless the deployment keeps PC sampling on, which refuses that record.
@@ -636,9 +673,18 @@ pub(crate) fn start(
         Counters::start(&streams, !launch.engine_config.profiling.graph_pc_sampling)
     };
 
-    let binding = weight_binding(launch, &model_runner, &ranks, &workers, remotes.clone())?;
     let peers = binding.served_by_peers()?;
     let capacities = capacities(&ranks, &open, (&peers, stated_by_peers))?;
+
+    // The session's regions of each media group serve the slots it kept, as every rank of it
+    // states them; the schedulers resize them so.
+    for (region, units) in kept_regions(launch, &ranks, &open, &capacities)? {
+        head.keep_units(region, units)?;
+    }
+    let (open, opened) = head
+        .session()
+        .map(|(open, opened)| (open.clone(), opened.clone()))
+        .context("the session with the buffer pool is not open")?;
     let video = ranks
         .iter()
         .filter_map(|rank| rank.video().ok())
@@ -669,10 +715,10 @@ pub(crate) fn start(
         session,
     )?;
 
-    // The schedulers grow their device regions, the KV regions into the granted segments: no unit
-    // entered a region before its memory existed. A start that fails ends its process, whose
-    // session the Storage Server closes once the process has exited (`specs/buffer-pool.md`
-    // §14.1).
+    // The schedulers grow their device regions, the KV regions into the granted segments, and
+    // resize a media group's regions to the slots it kept: no unit entered a region before its
+    // memory existed. A start that fails ends its process, whose session the Storage Server
+    // closes once the process has exited (`specs/buffer-pool.md` §14.1).
     epoch::grow_regions(&engine.inboxes(), &head)?;
 
     engine.workers = workers;
@@ -751,7 +797,10 @@ fn agree(created: &mut Vec<(String, Segments)>, region: String, segments: Segmen
 /// connection, once its ranks (`ranks`, of `model_runner`) loaded (module documentation): it
 /// reads the session the scheduler node relays, opens the session's host regions at its own
 /// host's Storage Server (`storage`), opens, binds, spawns and warms its ranks over the relayed
-/// session, answers with what they hold, and serves the scheduler node's jobs and operations.
+/// session, resolving through `resolve` the kernels of their caches over the session's
+/// numbering, answers with what they hold, and serves the scheduler node's jobs and operations,
+/// among them the reservation of its ranks' warm processes and the segments their quotas then
+/// hold, which the scheduler node's start asks for once every rank is warm.
 ///
 /// The engine of a peer holds no scheduler and no session head: the scheduler node's schedulers
 /// drive its ranks, and its `session` closes the host regions' session at its host.
@@ -759,11 +808,19 @@ fn agree(created: &mut Vec<(String, Segments)>, region: String, segments: Segmen
 /// # Errors
 ///
 /// As [`start`]'s steps, or a session that does not arrive.
+#[expect(
+    clippy::type_complexity,
+    reason = "the Build Server's client with the devices' targets, and the resolution of the \
+              ranks' kernels through it"
+)]
 fn start_peer(
     launch: &EngineArgs,
     storage: &StorageLaunch,
     (model_runner, mut ranks): (&ModelRunner, Vec<LoadedRank>),
-    build: Option<(Arc<Mutex<build_server::Client>>, Vec<Target>)>,
+    (build, resolve): (
+        Option<(Arc<Mutex<build_server::Client>>, Vec<Target>)>,
+        Option<&Resolve<'_>>,
+    ),
     mut channel: service::Connection,
     liveness: Arc<Liveness>,
 ) -> Result<Engine> {
@@ -779,7 +836,7 @@ fn start_peer(
     )?;
     hosts.open_hosts(&open)?;
 
-    let created = open_ranks(&mut ranks, &open, &opened)?;
+    let created = open_ranks(&mut ranks, &open, &opened, resolve)?;
     let places = bind(&mut ranks, &open, &opened, false)?;
     // A peer holds no queue pair: its ended sequences reach the scheduler node over its link.
     let (route, workers) = spawn(
@@ -793,6 +850,13 @@ fn start_peer(
         instrument(launch, model_runner.devices())?;
     }
     warm_up(&workers)?;
+
+    // The slots its media groups keep beside their warm processes, which its answer states; the
+    // scheduler node has its ranks reserve their warm processes and create the segments their
+    // quotas then hold once every rank answered.
+    if !standby(launch) {
+        keep_warm_slots(&mut ranks)?;
+    }
 
     let streams: Vec<(&'static str, platform::Stream)> = ranks
         .iter()
@@ -911,6 +975,17 @@ fn lowered(
         limits.encoder_cache_entries = 0;
     }
     limits
+}
+
+/// Whether `launch` starts a standby of its epoch's serving engine: it succeeds an engine of its
+/// own epoch (a switch's target succeeds another epoch's), whose regions it maps and whose
+/// reservations in the GPUs' quotas the Storage Server keeps for the process that replaces it.
+/// It reserves its warm process and grows its regions once it is promoted.
+fn standby(launch: &EngineArgs) -> bool {
+    launch
+        .predecessor
+        .as_ref()
+        .is_some_and(|predecessor| predecessor.epoch == launch.epoch)
 }
 
 /// Captures every bucket of every worker's runners, all at once, and waits for each.

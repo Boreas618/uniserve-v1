@@ -267,9 +267,6 @@ pub enum DataOperation {
     GraphBytes,
     /// Suspends the graph pools and releases every segment. Answers every rank's segment table.
     Sleep,
-    /// Restores the graph pools and creates every segment again. Answers every rank's segment
-    /// table.
-    Wake,
     /// Suspends the graph pools.
     SuspendGraphs,
     /// Restores the graph pools.

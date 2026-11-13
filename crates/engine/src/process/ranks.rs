@@ -12,14 +12,19 @@
 //!    session with it, and the answer numbers each region as the buffer pool holds it: a region
 //!    an earlier session named keeps that session's numbering, which the ranks then take.
 //! 3. [`open_ranks`] maps on every rank the segments the answer's table states for its region,
-//!    creates the segments that cover the rest of the region's units as far as the GPU's quota
-//!    held them at the division (the rest a grow creates), and opens the graph pool,
-//!    the cache over those segments, the recurrent state, the scratch pages and the serving
-//!    runner. It returns the segments it created, which the head grants, and the schedulers
-//!    then grow their regions into them by `Resize`.
+//!    creates past them the first segments of the region's units, those that hold the fewest
+//!    units the warm-up reads, as far as the GPU's quota held them at the division, resolves into
+//!    the rank's generation the kernels its cache and recurrent state launch over the region's
+//!    numbering, and opens the graph pool, the cache over those segments, the recurrent state,
+//!    the scratch pages and the serving runner. It returns the segments it created, which the
+//!    head grants.
 //! 4. [`bind`] binds every rank to the regions the answer numbered, [`spawn`] spawns the
-//!    workers over the ranks' runners, and [`capacities`] states what each worker group's
-//!    ranks serve.
+//!    workers over the ranks' runners, which warm up; [`keep_warm_slots`] keeps the request
+//!    slots of each media group whose storages fit beside its ranks' warm processes; once every
+//!    warm process is reserved, the ranks create the segments their quotas then hold, which the
+//!    head grants (`crate::process::epoch::create_fitting`), and the schedulers grow their
+//!    regions into them by `Resize`; [`capacities`] states what each worker group's ranks
+//!    serve.
 //!
 //! A rank that encodes images (`ModelRunner::encodes_images`) also profiles its vision runner at
 //! its load, and its division sizes the runner's region, its region of encoder outputs and its
@@ -81,7 +86,7 @@ use crate::worker::{COPY_BUDGET, Sequences, Worker};
 use anyhow::{Context as _, Result, bail};
 use nn::WeightKey;
 use nn::family::TextModel;
-use ops::Generation;
+use ops::{Generation, KernelEntry};
 use platform::{DeviceId, Stream};
 use proto::config::{EngineArgs, WorkerGroupConfig};
 use storage::QueuePair;
@@ -105,9 +110,12 @@ use crate::process::ranks::rank::video::{
 /// A start is not an update (`specs/updates.md` §2): nothing is kept beside it.
 pub(crate) const FIRST_GENERATION: u64 = 1;
 
-/// What resolves the kernels a rank's profile run names into the generation the rank serves on
-/// its device: the engine's module load at the Build Server (step 9).
-pub(crate) type Resolve<'a> = dyn Fn(DeviceId, &Keys) -> Result<Arc<Generation>> + Sync + 'a;
+/// What resolves kernels a rank launches into kernels loaded on its device, each with its
+/// operator and key: the engine's module load at the Build Server. A rank's start resolves the
+/// kernels its profile run names into the generation it serves (step 9), and once the session
+/// numbered its cache the kernels its cache and recurrent state launch over that numbering that
+/// the generation lacks, into the same generation ([`open_ranks`]).
+pub(crate) type Resolve<'a> = dyn Fn(DeviceId, &Keys) -> Result<Vec<KernelEntry>> + Sync + 'a;
 
 /// The workers of the members of the node's expert union, in member order, once they are
 /// spawned: what each member's join hook submits join batches to. Weak, because each member's
@@ -162,7 +170,8 @@ pub(crate) struct LoadedRank {
     /// named as the always-on counters record their device time
     /// (`crate::profiling::counters::Counters::start`); empty for a meta start.
     pub(crate) streams: Vec<(&'static str, Stream)>,
-    /// Every kernel the rank launches.
+    /// Every kernel the rank launches: its profile run's, and from its opening those its cache
+    /// and recurrent state launch over the units its region numbers.
     pub(crate) keys: Keys,
     /// The generation the rank serves.
     pub(crate) kernels: Arc<Generation>,
@@ -187,9 +196,11 @@ pub(crate) struct TextRank {
     /// served the GPU alone; from the rank's opening on, the region's numbering as the session
     /// holds it, which an earlier epoch of the layout may have stated ([`open_ranks`]).
     pub(crate) units: u32,
-    /// The units of `units` the rank's start creates segments for, which every rank of its host
-    /// group agreed: the whole segments the GPU's quota held at the division. The rest are
-    /// created by a grow as the epoch the rank's succeeds gives its memory back.
+    /// The units of `units` the rank's start creates segments for before its warm-up, which
+    /// every rank of its host group agreed: the first whole segments, those that hold the fewest
+    /// units the warm-up reads, as far as the GPU's quota held them at the division. The rest are
+    /// created once the rank is warm, as far as its quota then holds them beside its warm
+    /// process, and by a grow as an epoch the rank's succeeds gives its memory back.
     pub(crate) first: u32,
     /// What the profile run states of the rank's runner, which its pools are sized by.
     pub(crate) peaks: Peaks,
@@ -723,7 +734,10 @@ fn load_rank(
     let client = client.context("a served rank holds its Storage Server client")?;
 
     // Step 9: the generation the rank serves, every kernel it launches resolved.
-    let kernels = resolve(device, &keys).context("resolving the rank's kernels")?;
+    let kernels = Arc::new(Generation::new(
+        FIRST_GENERATION,
+        resolve(device, &keys).context("resolving the rank's kernels")?,
+    ));
 
     // Step 10: the weights, retained at the Storage Server and mapped on the device.
     let store = Arc::new(WeightStore::new(Arc::clone(&client), device)?);
@@ -846,7 +860,7 @@ fn runner_peaks(peaks: Peaks, vision: Option<Peaks>) -> Vec<Peaks> {
 /// A model without a vision tower, no rows, or a region of more units than a session numbers.
 fn encoder_bytes(model: &dyn TextModel, rows: u32) -> Result<u64> {
     let units = VisionRunner::region_units(model, rows)?;
-    Ok(BufferMemory::device_bytes(units, 0, 0))
+    Ok(BufferMemory::device_bytes(units, 0, 0, UNIT_BYTES))
 }
 
 /// Loads a rank of a media deployment onto `backing` (steps 3-10), over `client`, its Storage
@@ -905,7 +919,11 @@ fn load_video_rank(
     let client = client.context("a served rank holds its Storage Server client")?;
 
     // Step 9: the generation the rank serves, every kernel it launches resolved.
-    let kernels = resolve(device, &keys).context("resolving the rank's kernels")?;
+    let kernels = Arc::new(Generation::new(
+        FIRST_GENERATION,
+        resolve(device, &keys).context("resolving the rank's kernels")?,
+    ));
+    video.granule = granularity(device)?;
 
     // Step 10: the weights, retained at the Storage Server and mapped on the device.
     let store = Arc::new(WeightStore::new(Arc::clone(&client), device)?);
@@ -1446,8 +1464,9 @@ pub fn text_layout(
 ///   configuration that numbers it alike finds what this one stored; the buffer pool keeps a
 ///   region's numbering under its name. Per group, the product buffer of each of its ranks, the
 ///   engine's own, of [`UNIT_BYTES`] units, holding the blocks of every request slot of each
-///   product kind the rank backs at the largest size the denoising group states; then the region
-///   of its slot rows, a unit the trajectory row of each of its denoising ranks.
+///   product kind the rank backs at the largest size the denoising group states, a slot's units
+///   whole granules of the devices ([`slot_units`]); then the region of its slot rows, a unit the
+///   trajectory row of each of its denoising ranks.
 /// - **Classes.** One per product kind in `crate::batch::product::KINDS` order, sized per request:
 ///   the conditioning with its host copies in the host encoder region and the digests its encoding
 ///   states, the others with none; then the class of stored trajectories, with its host copies in
@@ -1588,9 +1607,9 @@ fn media_layout(launch: &EngineArgs, ranks: &[LoadedRank]) -> Result<Open> {
         let mut kinds: [Vec<u8>; 10] = Default::default();
         for position in 0..group.ranks.len() {
             let backs = backed_kinds(group, position)?;
-            let units: u64 = backs.iter().map(|kind| request_units[*kind]).sum();
-            let units = u32::try_from((units * u64::from(slots)).max(1))
-                .context("a product buffer of more units than u32")?;
+            // The deployment's devices take allocations of the denoising rank's granules.
+            let per_slot = slot_units(&request_units, group, position, sizing.granule)?;
+            let units = buffer_units(per_slot, slots)?;
 
             let name = products_region(session_engine(launch), firsts[index] + position);
             let region = region_index(&regions)?;
@@ -1807,6 +1826,45 @@ fn request_units(sizing: &VideoRank) -> Result<Vec<u64>> {
         .collect())
 }
 
+/// The units of the product buffer of the rank at `position` of media group `group` that one
+/// request slot's part takes: the units one request's blocks take of each product kind the rank
+/// backs ([`request_units`], `request_units` in `crate::batch::product::KINDS` order), in whole
+/// allocation granules of `granule` bytes (`BufferMemory::slot_units`); 0 for a rank that backs
+/// no kind.
+///
+/// # Errors
+///
+/// A position the group's blocks do not place.
+fn slot_units(
+    request_units: &[u64],
+    group: &WorkerGroupConfig,
+    position: usize,
+    granule: u64,
+) -> Result<u64> {
+    let request: u64 = backed_kinds(group, position)?
+        .iter()
+        .map(|kind| request_units[*kind])
+        .sum();
+    Ok(match request {
+        0 => 0,
+        request => BufferMemory::slot_units(request, granule),
+    })
+}
+
+/// The units of a product buffer of `slots` request slots whose slots' parts take `slot_units`
+/// each ([`slot_units`]): one unit for a rank that backs no product kind, whose slots take none.
+///
+/// # Errors
+///
+/// A buffer of more units than a region numbers.
+pub(crate) fn buffer_units(slot_units: u64, slots: u32) -> Result<u32> {
+    let units = match slot_units {
+        0 => 1,
+        units => units.saturating_mul(u64::from(slots)),
+    };
+    u32::try_from(units).context("a product buffer of more units than u32")
+}
+
 /// Decides the request slots of every media group of the deployment of `ranks`, this process's
 /// ranks of it loaded to their division (`specs/engine-worker-port.md` §1, `request_slots`): the
 /// deployment's `max_running_requests`, or the fewest any rank of the group holds when fewer
@@ -1816,11 +1874,13 @@ fn request_units(sizing: &VideoRank) -> Result<Vec<u64>> {
 /// slots. A rank's slot holds what one request holds on it: its trajectory row
 /// (`DenoiserRunner::row_bytes`) on a denoising rank, and on any rank the blocks one request
 /// takes of each product kind it backs, at the largest sizes the denoising rank states
-/// ([`request_units`]): its media memory of that many slots (`BufferMemory::device_bytes`).
+/// ([`request_units`]), in whole granules of its device ([`slot_units`], which this states of
+/// every rank): its media memory of that many slots (`BufferMemory::device_bytes`).
 ///
 /// A rank whose group holds fewer slots than the deployment runs states them of its group and
 /// sizes its host latent pages and its media memory by them; its buckets and its pools are the
-/// deployment's, which the slots do not change.
+/// deployment's, which the slots do not change. These are the slots the rank warms up with: once
+/// warm it keeps those whose storages fit beside its process ([`keep_warm_slots`]).
 ///
 /// `ranks` decide the fewest slots of their own groups, and `agree` takes them, per worker group
 /// of the deployment in the order it states them (the deployment's slots for a group none of
@@ -1839,7 +1899,7 @@ pub(crate) fn fit_media_slots(
     let Some(first) = ranks.first() else {
         return Ok(());
     };
-    let config = first.model_runner.engine_config();
+    let config = first.model_runner.engine_config().clone();
     let stated = u32::try_from(config.max_running_requests.get())
         .context("more request slots than the protocol addresses")?;
     let groups = &config.parallel.worker_groups;
@@ -1859,6 +1919,16 @@ pub(crate) fn fit_media_slots(
         })
         .collect::<Result<Vec<usize>>>()?;
 
+    // Each rank's part of its product buffer per slot: the units one request's products take of
+    // the kinds it backs, in whole granules of its device.
+    for (rank, &index) in ranks.iter_mut().zip(&indices) {
+        let position = rank.model_runner.position()?;
+        let Loaded::Video(video) = &mut rank.loaded else {
+            bail!("rank {} is a text rank", rank.model_runner.rank());
+        };
+        video.slot_units = slot_units(&request_units, &groups[index], position, video.granule)?;
+    }
+
     // Per group, the fewest slots any of its ranks here holds.
     let mut fewest = vec![stated; groups.len()];
     for (rank, &index) in ranks.iter().zip(&indices) {
@@ -1867,26 +1937,21 @@ pub(crate) fn fit_media_slots(
         };
         let video = rank.video()?;
         let runner = &rank.model_runner;
-        let group = &groups[index];
-        let request: u64 = backed_kinds(group, runner.position()?)?
-            .iter()
-            .map(|kind| request_units[*kind])
-            .sum();
-        let slots = division::request_slots(stated, left, |slots| -> Result<u64> {
-            let units = u32::try_from((request * u64::from(slots)).max(1))
-                .context("a product buffer of more units than u32")?;
-            Ok(BufferMemory::device_bytes(units, slots, video.row))
-        })
-        .with_context(|| format!("sizing the request slots of rank {}", runner.rank()))?;
+        let storage = |slots: u32| -> Result<u64> {
+            Ok(BufferMemory::device_bytes(
+                video.product_units(slots)?,
+                slots,
+                video.row,
+                video.granule,
+            ))
+        };
+        let slots = division::request_slots(stated, left, storage)
+            .with_context(|| format!("sizing the request slots of rank {}", runner.rank()))?;
         tracing::info!(
             rank = runner.rank(),
             left,
             buffers = video.buffers,
-            slot = BufferMemory::device_bytes(
-                u32::try_from(request).unwrap_or(u32::MAX),
-                1,
-                video.row
-            ),
+            slot = storage(1)?,
             slots,
             "the media rank's share holds its request slots"
         );
@@ -1914,6 +1979,184 @@ pub(crate) fn fit_media_slots(
         video.group_slots.clone_from(&agreed);
     }
     Ok(())
+}
+
+/// Keeps, once the media ranks of `ranks`, this process's, are warm, the request slots of each
+/// of their groups whose storages fit beside its ranks' warm processes, and gives the storages of
+/// the rest back (`specs/engine-worker-port.md` §1, "The process a division counts"): a rank warms
+/// up with the slots its division bounds ([`fit_media_slots`]), measured before the warm-up, and
+/// the warm-up adds instantiated graphs and library state to its process.
+///
+/// Each rank of a group measures its process beside its pools and the Storage Server's storages
+/// (`division::process_bytes`), as its reservation in its GPU's quota will state it, and finds by
+/// how much the quota's reservations with it would pass the limit (`division::excess`); it keeps
+/// its slots less as many as that takes, a slot's storages being its part of the product buffer
+/// and its trajectory row (`BufferMemory::slot_bytes`). The group keeps the fewest any of its
+/// ranks keeps, and each of its ranks gives the parts of the slots past them back to its device
+/// (`BufferMemory::give_back`) and holds that many slots ([`reslot`]), which its capacity states.
+/// The groups are taken in turn, each measuring the quota as the groups before it left it: a
+/// group with ranks on the devices of another covers what it finds short there itself. The
+/// session's regions follow the slots each group states ([`kept_regions`]). A rank backed by
+/// nothing outside the process keeps its slots.
+///
+/// # Errors
+///
+/// A rank whose warm process leaves its GPU's quota no request slot, naming its process's bytes,
+/// what the quota is short and what one slot takes; NVML's, the Storage Server's or the driver's
+/// refusal.
+pub(crate) fn keep_warm_slots(ranks: &mut [LoadedRank]) -> Result<()> {
+    // The media groups whose ranks hold devices, in the order of their first rank.
+    let mut groups: Vec<String> = Vec::new();
+    for rank in ranks.iter() {
+        let group = rank.model_runner.group();
+        if rank.video().is_ok() && rank.pool.is_some() && !groups.iter().any(|held| held == group) {
+            groups.push(group.to_owned());
+        }
+    }
+    if groups.is_empty() {
+        return Ok(());
+    }
+    let nvml = platform::Nvml::init().context("opening NVML")?;
+
+    for group in groups {
+        let members: Vec<usize> = ranks
+            .iter()
+            .enumerate()
+            .filter(|(_, rank)| rank.model_runner.group() == group)
+            .map(|(index, _)| index)
+            .collect();
+
+        // The slots each rank's quota holds beside its warm process; the group keeps the fewest.
+        let mut kept = u32::MAX;
+        let mut slots = 0;
+        for &index in &members {
+            let rank = &ranks[index];
+            let (Some(client), Some(pool)) = (&rank.client, &rank.pool) else {
+                continue;
+            };
+            let device = rank.device()?;
+            let memory = rank
+                .video()?
+                .media
+                .as_ref()
+                .context("a warm media rank holds its media memory")?;
+            let process = division::process_bytes(&nvml, device, service::lock(pool).mapped(), 0)?;
+            let (quota, _) = client.usage(device)?;
+            let scope = client.scope().context("a rank's client states its scope")?;
+            let over = division::excess(&quota, scope, client.epoch(), process)?;
+
+            slots = memory.held_slots();
+            let slot = memory.slot_bytes();
+            let given = match (over, slot) {
+                (0, _) => 0,
+                (_, 0) => u64::from(slots),
+                (over, slot) => over.div_ceil(slot),
+            };
+            let fits = u64::from(slots).saturating_sub(given);
+            if fits == 0 {
+                bail!(
+                    "rank {}'s warm process of {process} bytes leaves its GPU's quota no request \
+                     slot: the quota's reservations with it pass its limit by {over} bytes, and \
+                     one slot's storages take {slot}",
+                    rank.model_runner.rank()
+                );
+            }
+            tracing::info!(
+                rank = rank.model_runner.rank(),
+                group = %group,
+                process,
+                over,
+                slot,
+                slots,
+                fits,
+                "the warm media rank's quota holds its request slots beside its process"
+            );
+            kept = kept.min(u32::try_from(fits).unwrap_or(u32::MAX));
+        }
+        if kept >= slots {
+            continue;
+        }
+
+        // Every rank of the group gives the storages of the slots past those back.
+        for &index in &members {
+            let rank = &mut ranks[index];
+            if let (Some(pool), Some(memory)) = (&rank.pool, &rank.video()?.media) {
+                let released = memory.give_back(service::lock(pool).allocator(), kept)?;
+                tracing::info!(
+                    rank = rank.model_runner.rank(),
+                    kept,
+                    released,
+                    "the warm media rank gave back the storages of the slots it does not keep"
+                );
+            }
+            reslot(rank, kept)?;
+        }
+    }
+    Ok(())
+}
+
+/// The regions of the session `layout` of a media deployment, by their index there, that its
+/// schedulers resize to the request slots a group keeps once warm ([`keep_warm_slots`]), with the
+/// units each keeps: for each group of `stated` (every group's statement, this process's ranks'
+/// and the peers', [`capacities`]) whose slots are fewer than its slot region holds, the slot
+/// region to those slots and the product buffer of each of its ranks to the units of that many
+/// slots' parts ([`slot_units`]). None for a text deployment, whose slots its division decided
+/// before its session opened.
+///
+/// # Errors
+///
+/// A media deployment with no denoising rank among `ranks`, or a group or product buffer the
+/// session does not state.
+pub(crate) fn kept_regions(
+    launch: &EngineArgs,
+    ranks: &[LoadedRank],
+    layout: &Open,
+    stated: &[(GroupId, Capacity)],
+) -> Result<Vec<(usize, u32)>> {
+    if !ranks.iter().any(|rank| rank.video().is_ok()) {
+        return Ok(Vec::new());
+    }
+    let config = &launch.engine_config;
+    let groups = &config.parallel.worker_groups;
+    let (numbers, _) = group_numbers(groups, config.parallel.data_parallel_size.get())?;
+    let firsts = WorkerGroupConfig::first_ranks(groups);
+    let (_, sizing) = sizing(ranks)?;
+    let request_units = request_units(sizing)?;
+    let region_of = |name: &str| -> Result<usize> {
+        layout
+            .regions
+            .iter()
+            .position(|region| region.name == name)
+            .with_context(|| format!("the session states no region {name}"))
+    };
+
+    let mut kept = Vec::new();
+    for (id, capacity) in stated {
+        let Some(session) = layout.groups.iter().find(|group| group.id == *id) else {
+            continue;
+        };
+        let slot_region = usize::from(session.slots);
+        let held = layout
+            .regions
+            .get(slot_region)
+            .map_or(0, |region| region.units);
+        if capacity.slots >= held {
+            continue;
+        }
+        let index = numbers
+            .iter()
+            .position(|number| number == id)
+            .with_context(|| format!("the deployment numbers no group {}", id.0))?;
+        let group = &groups[index];
+
+        kept.push((slot_region, capacity.slots));
+        for position in 0..group.ranks.len() {
+            let name = products_region(session_engine(launch), firsts[index] + position);
+            let per_slot = slot_units(&request_units, group, position, sizing.granule)?;
+            kept.push((region_of(&name)?, buffer_units(per_slot, capacity.slots)?));
+        }
+    }
+    Ok(kept)
 }
 
 /// Makes media rank `rank` hold `slots` request slots: its model runner's, and what it states per
@@ -2003,8 +2246,14 @@ fn product_buffer(layout: &Open, rank: &LoadedRank) -> Result<u8> {
 /// own (steps 16-22):
 ///
 /// - the segments of the rank's KV region: the table's, which the rank maps where their epoch
-///   created them, then those its epoch creates for the rest of the region's units
-///   ([`plane_segments`]);
+///   created them, then those its epoch creates before the warm-up, the first segments of the
+///   region's units, which hold the fewest units the warm-up reads ([`plane_segments`],
+///   `ModelRunner::divide`); the rest stay given back until the rank is warm;
+/// - the kernels its cache and its recurrent state launch over the region's numbering that the
+///   generation it serves lacks, which `resolve` resolves into that generation, as the load
+///   resolved its profile run's: a state copy's key carries the cache's units, which the profile
+///   run's owners hold the fewest of. Its graphs launch the same kernels whatever the
+///   numbering. A start with no Build Server (`None`, the meta device) resolves nothing;
 /// - the graph pool with the scratch and resident pools, the cache over those segments, the
 ///   recurrent state, the scratch pages of paired forwards, and the serving runner in its region
 ///   of the graph pool with its shadow region beside it, profiled again so its buckets can be
@@ -2033,6 +2282,7 @@ pub(crate) fn open_ranks(
     ranks: &mut [LoadedRank],
     layout: &Open,
     opened: &Opened,
+    resolve: Option<&Resolve<'_>>,
 ) -> Result<Vec<(String, Segments)>> {
     if ranks
         .iter()
@@ -2073,7 +2323,9 @@ pub(crate) fn open_ranks(
             let holder = holder.as_ref();
             let handle = std::thread::Builder::new()
                 .name(format!("rank-open-{index}"))
-                .spawn_scoped(scope, move || open_rank(rank, region, session, holder))
+                .spawn_scoped(scope, move || {
+                    open_rank(rank, region, session, holder, resolve)
+                })
                 .context("starting a rank's opening")?;
             handles.push(handle);
         }
@@ -2119,6 +2371,7 @@ fn open_rank(
     region: Option<(u32, &Segments)>,
     (session, opened): (&Open, &Opened),
     holder: Option<&Arc<StorageClient>>,
+    resolve: Option<&Resolve<'_>>,
 ) -> Result<Segments> {
     let device = rank.device()?;
     // The session's statement of the rank's group: none for a rank that maps no region, whose
@@ -2132,6 +2385,7 @@ fn open_rank(
         client,
         pool: rank_pool,
         streams,
+        keys,
         kernels,
         loaded,
         ..
@@ -2194,16 +2448,46 @@ fn open_rank(
     };
     let cache_config = model_runner.cache_config(Arc::clone(&layout), units, segments);
 
+    // The cache and the state over the region's numbering, holding no device: the kernels their
+    // own work launches, which the generation the rank serves takes those of it lacks.
+    let meta_cache = KvCacheMemory::meta(cache_config.clone())?;
+    let meta_state = match &state_config {
+        Some(state) => Some(StateMemory::meta(state.clone(), meta_cache.config())?),
+        None => None,
+    };
+    let mut owned = meta_cache.keys()?;
+    if let Some(state) = &meta_state {
+        owned.extend(state.keys()?);
+    }
+    let missing: Keys = owned
+        .iter()
+        .filter(|(operator, key)| !kernels.contains(operator, key))
+        .cloned()
+        .collect();
+    keys.extend(owned);
+    if let Some(resolve) = resolve.filter(|_| !missing.is_empty()) {
+        let resolved = resolve(device, &missing)
+            .context("resolving the kernels of the rank's cache over its region's units")?;
+        let held: Vec<KernelEntry> = kernels
+            .iter()
+            .map(|(operator, key, kernel)| KernelEntry::keyed(operator, key, Arc::clone(kernel)))
+            .collect();
+        *kernels = Arc::new(Generation::new(
+            FIRST_GENERATION,
+            held.into_iter().chain(resolved),
+        ));
+        tracing::info!(
+            rank = model_runner.rank(),
+            units,
+            kernels = missing.len(),
+            "the rank's generation took the kernels of its cache over its region's units"
+        );
+    }
+
     let Some(client) = client.clone() else {
         // Steps 18, 19 and 21-22 over owners that hold no device.
-        let cache = Arc::new(Mutex::new(KvCacheMemory::meta(cache_config)?));
-        let state = match state_config {
-            Some(state) => Some(Arc::new(Mutex::new(StateMemory::meta(
-                state,
-                service::lock(&cache).config(),
-            )?))),
-            None => None,
-        };
+        let cache = Arc::new(Mutex::new(meta_cache));
+        let state = meta_state.map(|state| Arc::new(Mutex::new(state)));
         let media = match (&rank.vision, group) {
             (Some(_), Some(group)) => Some(Arc::new(encoder_memory(
                 model_runner.rank(),
@@ -2456,7 +2740,8 @@ fn encoder_memory(
         )?);
     };
 
-    let mut memory = BufferMemory::open(allocator, rank, products, slot_rows, 0)
+    // The region of encoder outputs is the group's whole, not a part per slot.
+    let mut memory = BufferMemory::open(allocator, rank, products, slot_rows, 0, 1)
         .context("opening the rank's memory of encoder outputs")?;
     if let Some(region) = host {
         let name = &session.regions[usize::from(region)].name;
@@ -2535,7 +2820,11 @@ fn open_video_ranks(ranks: &mut [LoadedRank], layout: &Open, opened: &Opened) ->
             let handle = std::thread::Builder::new()
                 .name(format!("rank-runners-{index}"))
                 .spawn_scoped(scope, move || {
-                    open_media_runners(rank, Arc::new(memory), (pool, media))
+                    let memory = Arc::new(memory);
+                    if let Loaded::Video(video) = &mut rank.loaded {
+                        video.media = Some(Arc::clone(&memory));
+                    }
+                    open_media_runners(rank, memory, (pool, media))
                 })
                 .context("starting a rank's runners")?;
             handles.push(handle);
@@ -2679,7 +2968,7 @@ fn open_media_memory(
     let graphs: Vec<u64> = video.peaks.iter().map(|(_, peaks)| peaks.graph).collect();
     let shadows: Vec<u64> = video.peaks.iter().map(|(_, peaks)| peaks.shadow).collect();
     let pools = division::pool_bytes(granularity, &graphs, &shadows, 0);
-    let resident = BufferMemory::device_bytes(units, slots, video.row);
+    let resident = BufferMemory::device_bytes(units, slots, video.row, video.granule);
     model_runner.media_division(client, device, pools, resident, video.buffers)?;
     let regions: Vec<(RunnerId, u64)> = video
         .peaks
@@ -2702,6 +2991,7 @@ fn open_media_memory(
         products,
         slot_rows,
         video.row,
+        video.product_parts(slots),
     )
     .context("opening the rank's media memory")?;
     if let Some(region) = encoders.filter(|_| holds_parts) {

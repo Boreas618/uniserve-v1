@@ -20,7 +20,7 @@ use std::sync::Mutex;
 use std::time::Instant;
 
 use crate::memory::cache::info::CacheTable;
-use anyhow::{Context as _, Result};
+use anyhow::{Context as _, Result, bail};
 use crossbeam_channel::{Receiver, Sender};
 use proto::config::ParallelConfig;
 use proto::request::MigrationCause;
@@ -186,25 +186,121 @@ pub(crate) fn grow(
     head: &Mutex<StorageClient>,
     binding: &WeightBinding,
 ) -> Result<Vec<(u8, u32)>> {
-    {
-        let mut head = lock(head);
-        let (open, _) = session(&head)?;
-        let regions: Vec<(usize, Vec<GroupId>)> = kv_regions(open)
-            .into_iter()
-            .map(|index| (index, groups_of(open, index)))
-            .collect();
+    create_fitting(&mut lock(head), binding, None)?;
+    grow_regions(schedulers, head)
+}
 
-        for (index, groups) in regions {
-            let fitting = binding.fitting_segments(&groups)?;
-            if fitting == 0 {
-                continue;
-            }
-            let tables = binding.create_segments(&groups, Some(fitting))?;
-            grant_held(&mut head, index, &tables)?;
+/// The ranks' side of a grow ([`grow`]) and of a warm start: the ranks of each region of the KV
+/// planes create as many of the segments they gave back as their quotas and devices have room
+/// for, and the head grants them. A start creates its regions' first segments before its warm-up
+/// and the rest here once its ranks reserved their warm processes (`specs/engine-worker-port.md`
+/// §1, "The process a division counts").
+///
+/// `capacity` is the tokens a deployment states its cache holds (`kv_cache_config.max_tokens`)
+/// when a start creates its regions: such a region is created whole, and refused, naming the
+/// capacity and the warm processes of this process's ranks, when a rank's quota cannot hold what
+/// it gave back even as the epochs it starts beside drain (`Room::elsewhere`); what those epochs
+/// hold now it grows into by `Grow` as they drain.
+///
+/// # Errors
+///
+/// A stated capacity the quota cannot hold, a rank's failure or refusal, or the Storage
+/// Server's refusal of a grant.
+pub(crate) fn create_fitting(
+    head: &mut StorageClient,
+    binding: &WeightBinding,
+    capacity: Option<u64>,
+) -> Result<()> {
+    let (open, _) = session(head)?;
+    let regions: Vec<(usize, String, Vec<GroupId>)> = kv_regions(open)
+        .into_iter()
+        .map(|index| {
+            let name = open
+                .regions
+                .get(index)
+                .map(|region| region.name.clone())
+                .unwrap_or_default();
+            (index, name, groups_of(open, index))
+        })
+        .collect();
+
+    for (index, name, groups) in regions {
+        if let Some(tokens) = capacity {
+            whole(binding, &groups, (&name, tokens))?;
         }
+        let fitting = binding.fitting_segments(&groups)?;
+        if fitting == 0 {
+            continue;
+        }
+        let tables = binding.create_segments(&groups, Some(fitting))?;
+        let granted = grant_held(head, index, &tables)?;
+        tracing::info!(
+            region = %name,
+            granted,
+            "the ranks created the segments their quotas hold and the head granted them"
+        );
+    }
+    Ok(())
+}
+
+/// Refuses a KV region `name` of a stated capacity of `tokens` tokens whose ranks, those of the
+/// worker groups `groups`, cannot hold every segment they gave back: what the deployment's quota
+/// of a rank's GPU and its device have room for, with what other epochs of the deployment hold
+/// there, which returns as they drain ([`create_fitting`]).
+///
+/// # Errors
+///
+/// The refusal, naming the capacity, the bytes the given-back segments take on the rank's GPU, its
+/// room, and the warm processes this process's ranks reserved; a rank's failure to state its
+/// segments or its room.
+fn whole(binding: &WeightBinding, groups: &[GroupId], (name, tokens): (&str, u64)) -> Result<()> {
+    // Every rank of a region holds the same segments; the units given back are the most any
+    // rank's table leaves uncreated.
+    let given_back: u64 = binding
+        .segment_tables(groups)?
+        .iter()
+        .flatten()
+        .map(|table| {
+            table
+                .segments
+                .iter()
+                .skip(table.held as usize)
+                .map(|segment| u64::from(segment.units))
+                .sum()
+        })
+        .max()
+        .unwrap_or(0);
+    if given_back == 0 {
+        return Ok(());
     }
 
-    grow_regions(schedulers, head)
+    for (gpu, room, unit_bytes) in binding.device_rooms(groups)? {
+        let needed = given_back.saturating_mul(unit_bytes);
+        if room.holds(needed, room.elsewhere) {
+            continue;
+        }
+        let processes: Vec<String> = binding
+            .warm_processes()
+            .into_iter()
+            .map(|(device, bytes)| format!("{bytes} bytes on device {}", device.0))
+            .collect();
+        let gpu: String = gpu.iter().map(|byte| format!("{byte:02x}")).collect();
+        bail!(
+            "kv_cache_config.max_tokens = {tokens} does not fit beside the warm process: KV \
+             region {name} needs {needed} more bytes on GPU {gpu}, whose quota leaves {} and \
+             whose device has {} free, with {} that other epochs hold; the warm processes of this \
+             process's ranks hold {}",
+            room.quota,
+            room.free,
+            room.elsewhere,
+            if processes.is_empty() {
+                "nothing reserved".to_owned()
+            } else {
+                processes.join(", ")
+            }
+        );
+    }
+    Ok(())
 }
 
 /// Opens admission on an engine a drain or its start parked (`docs/architecture.md`, `Promote`):
@@ -388,11 +484,13 @@ pub(super) fn grant_held(
 }
 
 /// Resizes the regions each scheduler's queue pair uses to what the session states of them, and
-/// returns each region's number with the units it reached: every device region to every unit
-/// the session numbers for it past its reserved ones, and every host region to the units the
-/// epoch's layout asks for, within the numbering the buffer pool holds for it. A grow takes what
-/// its space's free ranges hold and a shrink frees what its blocks let it; either may stop short.
-/// Every region is asked before any reply is waited for.
+/// returns each region's number with the units it reached: every device region of the KV planes
+/// to every unit the session numbers for it past its reserved ones, and every other region to
+/// the units the session states it serves, within the numbering the buffer pool holds for it:
+/// what the epoch's layout asked for, or the fewer a region of a warm media rank's slots kept
+/// (`StorageClient::keep_units`). A grow takes what its space's free ranges hold and a shrink
+/// frees what its blocks let it; either may stop short. Every region is asked before any reply
+/// is waited for.
 ///
 /// The session asks for no unit of a region whose memory the ranks create once it is open, so
 /// this is how the start's regions, and a woken engine's, reach the segments the head granted.
@@ -410,20 +508,24 @@ pub(super) fn grow_regions(
     let targets: Vec<(usize, u8, u32)> = {
         let head = lock(head);
         let (open, opened) = session(&head)?;
+        let planes = kv_regions(open);
 
         let mut targets = Vec::new();
         for (scheduler, registers) in opened.registers.iter().enumerate() {
             for &(number, _) in &registers.capacity {
-                let stated = index_of(opened, number)
-                    .ok()
-                    .and_then(|index| open.regions.get(index));
-                let Some(stated) = stated else {
+                let Ok(index) = index_of(opened, number) else {
                     continue;
                 };
+                let Some(stated) = open.regions.get(index) else {
+                    continue;
+                };
+                // A region of the KV planes asks for no unit at `Open`: it reaches every unit it
+                // numbers as far as the segments granted to its space go. Every other region
+                // serves the units the session states of it.
                 let numbered = stated.limit.saturating_sub(stated.reserved);
                 let units = match stated.tier {
-                    Tier::Device => numbered,
-                    Tier::Host => stated.units.min(numbered),
+                    Tier::Device if planes.contains(&index) => numbered,
+                    Tier::Device | Tier::Host => stated.units.min(numbered),
                     Tier::Remote => continue,
                 };
                 targets.push((scheduler, number, units));

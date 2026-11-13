@@ -124,9 +124,12 @@ pub(crate) fn claim(
         bail!("the daemon admitted this engine but listed no node of the deployment");
     }
 
-    // The scopes are this process's ranks of its group: consecutive from its first, one per
-    // device.
-    let ranks = (0..launch.devices.len()).map(|index| launch.rank + index as u32);
+    // The scopes are this process's ranks, each of the worker group that places it under its
+    // number in the deployment, as each rank connects to the Storage Server.
+    let groups = &launch.engine_config.parallel.worker_groups;
+    let ranks = crate::process::ranks::rank::placed_ranks(launch)?
+        .into_iter()
+        .map(|(rank, group, ..)| (groups[group].id.0.clone(), rank));
     process.deliver(&proto::process::Upstream {
         kind: Some(upstream::Kind::Request(proto::process::Request {
             id: CLAIM,
@@ -134,10 +137,7 @@ pub(crate) fn claim(
                 host: launch.host.clone(),
                 deployment: launch.engine_config.deployment.clone(),
                 scopes: ranks
-                    .map(|rank| proto::process::Scope {
-                        group: launch.group.clone(),
-                        rank,
-                    })
+                    .map(|(group, rank)| proto::process::Scope { group, rank })
                     .collect(),
                 // A server the daemon starts for this claim takes the deployment's connector
                 // settings; the engine states none of its own.

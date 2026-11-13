@@ -37,7 +37,6 @@ use proto::config::SchedulerConfig;
 use proto::request::wire::WeightsInFlight;
 use service::lock;
 use storage::Key;
-use storage::runtime::GroupId;
 
 use super::epoch;
 use crate::memory::client::StorageClient;
@@ -295,9 +294,10 @@ pub(crate) fn sleep(
 }
 
 /// Wakes the engine from [`sleep`] (`docs/admin.md`, `/admin/wake_up`): the ranks restore their
-/// graph pools and create every segment of their KV planes again, the head grants them, every
-/// scheduler grows its device regions back to every unit the session numbers, and admits
-/// again. Returns each device region's number with the units it reached.
+/// graph pools, then create the segments of their KV planes their quotas hold beside what they
+/// reserve, their warm processes included, as a grow does ([`epoch::create_fitting`]), the head
+/// grants them, every scheduler grows its device regions back into them, and admits again.
+/// Returns each device region's number with the units it reached.
 ///
 /// # Errors
 ///
@@ -307,19 +307,10 @@ pub(crate) fn wake(
     head: &Mutex<StorageClient>,
     binding: &WeightBinding,
 ) -> Result<Vec<(u8, u32)>> {
-    binding.wake()?;
-
-    {
-        let mut head = lock(head);
-        let (open, _) = epoch::session(&head)?;
-        let regions: Vec<(usize, Vec<GroupId>)> = epoch::kv_regions(open)
-            .into_iter()
-            .map(|index| (index, epoch::groups_of(open, index)))
-            .collect();
-        for (index, groups) in regions {
-            epoch::grant_held(&mut head, index, &binding.segment_tables(&groups)?)?;
-        }
-    }
+    binding
+        .restore_graphs()
+        .context("restoring the graph pools")?;
+    epoch::create_fitting(&mut lock(head), binding, None)?;
 
     // The regions are grown first, so the first request admitted finds its units.
     let reached = epoch::grow_regions(schedulers, head)?;
@@ -556,7 +547,6 @@ fn operate(
         Operation::Room => encoded(&binding.room()?),
         Operation::GraphBytes => encoded(&binding.graph_bytes_here()),
         Operation::Sleep => encoded(&binding.sleep()?),
-        Operation::Wake => encoded(&binding.wake()?),
         Operation::SuspendGraphs => encoded(&binding.suspend_graphs()?),
         Operation::RestoreGraphs => encoded(&binding.restore_graphs()?),
         Operation::SetKernels => encoded(&binding.set_kernels()?),

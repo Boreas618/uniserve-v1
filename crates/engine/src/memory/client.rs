@@ -599,6 +599,29 @@ impl StorageClient {
         Ok(pairs)
     }
 
+    /// States that the session's region at `index` serves `units` units from here on, fewer than
+    /// it asked for at `Open`: the slot rows and the product buffers of a media group whose warm
+    /// ranks kept fewer request slots than they warmed up with and gave the storages of the rest
+    /// back (`crate::process::ranks::keep_warm_slots`). The region keeps its numbering; its
+    /// schedulers resize it to these units (`crate::process::epoch::grow_regions`), and no grow
+    /// takes it past them.
+    ///
+    /// # Errors
+    ///
+    /// No session, or no region at `index`.
+    pub(crate) fn keep_units(&mut self, index: usize, units: u32) -> anyhow::Result<()> {
+        let (layout, _) = self
+            .session
+            .as_mut()
+            .context("the head opened no session whose region keeps units")?;
+        let region = layout
+            .regions
+            .get_mut(index)
+            .with_context(|| format!("the session states no region {index}"))?;
+        region.units = region.units.min(units);
+        Ok(())
+    }
+
     /// The layout the session was opened with, each region numbered as the buffer pool holds it,
     /// and the buffer pool's answer to it; `None` before the session is open and on a rank's
     /// connection. The answer's segment table of each region

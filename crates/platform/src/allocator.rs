@@ -413,6 +413,60 @@ impl Allocator {
         }
     }
 
+    /// `parts` buffers of at least `bytes` each from `pool`, back to back: part
+    /// `i + 1` starts where part `i` ends, every part the same rounded length,
+    /// so a holder addresses them as one range and can give its tail back part
+    /// by part ([`Self::release`]). Every part is new storage, booked before it
+    /// is created.
+    ///
+    /// # Errors
+    ///
+    /// Fails when the pool is not reserved or suspended, when its reservation
+    /// cannot hold the range, when the driver cannot create or map a part, and
+    /// when a booking refuses; nothing of the range stays mapped then.
+    pub fn allocate_parts(
+        &mut self,
+        pool: PoolKind,
+        bytes: usize,
+        parts: usize,
+    ) -> Result<Vec<Buffer>> {
+        let device = self.device.id();
+        let allocator = self.pool(pool)?;
+        let given = allocator.allocate_parts(bytes, parts)?;
+
+        Ok(given
+            .into_iter()
+            .map(|(address, block)| Buffer {
+                block,
+                address,
+                device,
+                pool,
+            })
+            .collect())
+    }
+
+    /// Gives `buffer`'s storage back to the driver for good, where
+    /// [`Self::free`] keeps it mapped for the pool's next allocation: the
+    /// pool's booked total drops by it, and its addresses are not given out
+    /// again unless they end what the pool gave out. Nothing may address the
+    /// buffer any more.
+    ///
+    /// # Errors
+    ///
+    /// Fails when `buffer` belongs to another allocator, when its pool is not
+    /// reserved or is suspended, and when the driver refuses the unmap or the
+    /// release, the buffer's storage then being as it was.
+    pub fn release(&mut self, buffer: Buffer) -> Result<()> {
+        if buffer.device() != self.device.id() {
+            return Err(Error::invalid(format!(
+                "{buffer:?} belongs to {}, not to {}",
+                buffer.device(),
+                self.device.id()
+            )));
+        }
+        self.pool(buffer.pool())?.release(buffer.address())
+    }
+
     /// Changes what the pool's device and its peers may do with `buffer`'s
     /// storage, at its unchanged address: design 8's park makes a standby's
     /// blocks read-only and promotion makes them read-write again, so a

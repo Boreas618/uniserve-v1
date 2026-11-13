@@ -32,7 +32,7 @@ use crate::batch::Capacity;
 use crate::batch::capacity::variants;
 use crate::batch::product;
 use crate::batch::{Extent, Phase, Shape, Variant};
-use crate::memory::buffers::BufferMemory;
+use crate::memory::buffers::{BufferMemory, UNIT_BYTES};
 use crate::memory::client::StorageClient;
 use crate::memory::division::{self, call_window};
 use crate::memory::encoders;
@@ -159,6 +159,15 @@ pub(crate) struct VideoRank {
     pub(crate) description: Vec<u8>,
     /// What the rank states of its worker group: its own phases and the shapes of its runners.
     pub(crate) capacity: Capacity,
+    /// The allocation granularity of the rank's device, in bytes: what a slot's part of its
+    /// product buffer and its trajectory row are whole multiples of
+    /// (`BufferMemory::slot_units`). [`crate::memory::buffers::UNIT_BYTES`] on the meta device.
+    pub(crate) granule: u64,
+    /// The units of the rank's product buffer one request slot's part takes: the blocks one
+    /// request holds of each product kind the rank backs, in whole granules
+    /// (`crate::process::ranks::fit_media_slots`); 0 for a rank that backs no kind, whose
+    /// product buffer is one unit its slots take none of.
+    pub(crate) slot_units: u64,
     /// The request slots of each of the deployment's worker groups, in the order the deployment
     /// states them: its running requests until the ranks of every host agree the fewest each
     /// group's ranks hold (`crate::process::ranks::fit_media_slots`). The session's layout states
@@ -169,6 +178,10 @@ pub(crate) struct VideoRank {
     pub(crate) host: Option<HostGroup>,
     /// The rank's media memory, from its opening until the process's memories are connected.
     pub(crate) memory: Option<BufferMemory>,
+    /// The rank's media memory as its runners share it once the process's memories are
+    /// connected: what gives the storages of the slots the rank does not keep back
+    /// (`crate::process::ranks::keep_warm_slots`).
+    pub(crate) media: Option<Arc<BufferMemory>>,
     /// Once the rank is opened, by the numbers the session's answer gave them: the regions its
     /// device block tables map (its group's slot rows, its product buffer and its parts of host
     /// regions), and the product buffers of the process's other ranks, which its device reaches.
@@ -178,10 +191,27 @@ pub(crate) struct VideoRank {
 }
 
 impl VideoRank {
+    /// The units of the rank's product buffer for `slots` request slots: a part of
+    /// [`Self::slot_units`] per slot, or one unit for a rank that backs no product kind.
+    ///
+    /// # Errors
+    ///
+    /// A buffer of more units than a region numbers.
+    pub(crate) fn product_units(&self, slots: u32) -> Result<u32> {
+        crate::process::ranks::buffer_units(self.slot_units, slots)
+    }
+
+    /// The parts the rank's product buffer of `slots` slots is mapped in: one per slot, whose
+    /// storages a give-back releases with its slot, or one for a rank that backs no product kind.
+    pub(crate) fn product_parts(&self, slots: u32) -> u32 {
+        if self.slot_units > 0 { slots } else { 1 }
+    }
+
     /// This rank holding `slots` request slots of its group, as the division of its GPU's share
-    /// decides (`crate::process::ranks::fit_media_slots`): what it states of its group (its slots,
-    /// and the prompts an encode holds) and the pages of its host latent region follow them. Its
-    /// buckets and its pools are the deployment's, which the slots do not change.
+    /// decides (`crate::process::ranks::fit_media_slots`) and its warm process then keeps
+    /// (`crate::process::ranks::keep_warm_slots`): what it states of its group (its slots, and the
+    /// prompts an encode holds) and the pages of its host latent region follow them. Its buckets
+    /// and its pools are the deployment's, which the slots do not change.
     pub(crate) fn hold(&mut self, slots: u32) {
         self.capacity.slots = slots;
         if self.capacity.serves(Phase::TextEncode) {
@@ -208,9 +238,9 @@ impl ModelRunner {
     /// serves no video request.
     pub(super) fn media_ranks(&self) -> Result<Vec<Self>> {
         let groups = &self.engine_config().parallel.worker_groups;
-        let firsts = WorkerGroupConfig::first_ranks(groups);
         let mut ranks = Vec::new();
-        for (first, group) in firsts.iter().zip(groups) {
+        for (rank, index, _, device) in super::placed_ranks(self.launch())? {
+            let group = &groups[index];
             if group.role == WorkerGroupRole::Experts {
                 bail!(
                     "worker group {} is an expert group, which serves no video request",
@@ -218,41 +248,15 @@ impl ModelRunner {
                 );
             }
 
-            for (position, placed) in group.ranks.iter().enumerate() {
-                if placed.host != self.launch.host {
-                    continue;
-                }
-                let rank = u32::try_from(first + position)
-                    .context("a rank past what the protocol numbers")?;
-                let device = placed
-                    .device
-                    .strip_prefix("cuda:")
-                    .and_then(|ordinal| ordinal.parse::<i32>().ok())
-                    .map(DeviceId)
-                    .filter(|device| self.devices.contains(device));
-                let Some(device) = device else {
-                    bail!(
-                        "the deployment places rank {rank} (rank {position} of worker group {}) \
-                         on {}, which this process does not serve: it serves devices {:?}",
-                        group.id,
-                        placed.device,
-                        self.devices
-                            .iter()
-                            .map(|device| device.0)
-                            .collect::<Vec<_>>()
-                    );
-                };
-
-                let mut rank_runner = self.clone();
-                rank_runner.devices = vec![device];
-                rank_runner.rank = rank;
-                rank_runner.group.clone_from(&group.id.0);
-                rank_runner.world_size = group.ranks.len();
-                // The text encoder's split is its block's (`video_split`).
-                rank_runner.mapping.tensor_parallel = 1;
-                rank_runner.mapping.tensor_rank = 0;
-                ranks.push(rank_runner);
-            }
+            let mut rank_runner = self.clone();
+            rank_runner.devices = vec![device];
+            rank_runner.rank = rank;
+            rank_runner.group.clone_from(&group.id.0);
+            rank_runner.world_size = group.ranks.len();
+            // The text encoder's split is its block's (`video_split`).
+            rank_runner.mapping.tensor_parallel = 1;
+            rank_runner.mapping.tensor_rank = 0;
+            ranks.push(rank_runner);
         }
         Ok(ranks)
     }
@@ -882,9 +886,12 @@ impl ModelRunner {
                 trajectory,
                 description,
                 capacity,
+                granule: UNIT_BYTES,
+                slot_units: 0,
                 group_slots,
                 host: None,
                 memory: None,
+                media: None,
                 regions: (Vec::new(), Vec::new()),
                 runners: Vec::new(),
             },

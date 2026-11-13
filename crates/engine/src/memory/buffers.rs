@@ -20,12 +20,19 @@
 //!   resident pool (`GraphPool::allocator`) for as long as the rank serves. A media product has
 //!   one contiguous run in the product buffer of every rank that backs it, and an encoder output
 //!   one run; [`BufferMemory::lend`] lends the bytes of the block an entry of the tables names as
-//!   a tensor, and [`BufferMemory::address`] states where a run's bytes lie for a copy.
+//!   a tensor, and [`BufferMemory::address`] states where a run's bytes lie for a copy. A media
+//!   rank's buffer is mapped in one part per request slot, back to back, each the units one
+//!   request's products take in whole allocation granules ([`BufferMemory::slot_units`]).
 //! - **The trajectory rows.** The live state of a media request in its slot: one row per slot of
 //!   the slot region, each the bytes of the largest trajectory the rank holds, starting on a
-//!   [`UNIT_BYTES`] boundary. Slot `s` (slots count from one) owns row `s - 1`, the run
-//!   `(slot region, s, 1)` names it, and [`BufferMemory::trajectory`] lends from it. A trajectory
-//!   is laid out from its row's first byte, so a smaller one is a prefix of the row.
+//!   [`UNIT_BYTES`] boundary, and on a device a part of whole granules of its own. Slot `s`
+//!   (slots count from one) owns row `s - 1`, the run `(slot region, s, 1)` names it, and
+//!   [`BufferMemory::trajectory`] lends from it. A trajectory is laid out from its row's first
+//!   byte, so a smaller one is a prefix of the row.
+//! - **The slots kept.** A media rank warms up holding the storages of the slots its division
+//!   bounds, then keeps the slots whose storages fit beside its warm process and gives the parts
+//!   of the rest back to the device ([`BufferMemory::give_back`]), the last first: the slot
+//!   region and the product buffer then serve the slots kept, from slot 1 and unit 0.
 //! - **The parts of host regions.** The host encoder region and the host latent region are the
 //!   Storage Server's: one memfd per rank index that maps one
 //!   (`storage::protocol::Request::HostPart`), unit `u` of a part at byte `u × bytes`, mapped by
@@ -105,6 +112,7 @@
 //! hands no event. Its [`BufferMemory::byte_copies`] are the copies a memory on a device issues.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
@@ -114,6 +122,7 @@ use tensor::{DType, Tensor};
 
 use crate::memory::allocation::Storage;
 use crate::memory::client::StorageClient;
+use crate::memory::division;
 use crate::memory::latent::restore::{self, Stored};
 use crate::memory::lend;
 use crate::memory::tables::{BlockCopy, BlockTables};
@@ -147,18 +156,29 @@ type Part = (u8, u32, u64, u32, Option<Arc<Storage>>);
 pub(crate) struct BufferMemory {
     /// The rank's index: the index of its parts of host regions.
     rank: u32,
-    /// The device the memory lies on, with the product buffer and the trajectory rows taken from
-    /// its resident pool, each `None` when it holds no byte; `None` for memory that holds no
-    /// device.
-    device: Option<(DeviceId, Option<Buffer>, Option<Buffer>)>,
+    /// The device the memory lies on, with the first byte of the product buffer and of the
+    /// trajectory rows taken from its resident pool, each `None` when it holds no byte; `None`
+    /// for memory that holds no device.
+    device: Option<(DeviceId, Option<u64>, Option<u64>)>,
+    /// The parts the product buffer and the trajectory rows are mapped in, back to back from
+    /// their first bytes: the storage a device memory holds, which [`BufferMemory::give_back`]
+    /// releases the tail of. Empty for memory that holds no device.
+    held: Mutex<(Vec<Buffer>, Vec<Buffer>)>,
     /// The product buffer's region and its units.
     products: (u8, u32),
+    /// The parts the product buffer is made of: one, or one per slot, whose units are the
+    /// buffer's over its slots and which a give-back releases with their slots.
+    product_parts: u32,
     /// The slot region and its slots, numbered from 1.
     slots: (u8, u32),
+    /// The slots, from slot 1, whose storages the memory holds: every slot until a give-back
+    /// keeps fewer. A run of a slot or of product units past them is refused.
+    kept: AtomicU32,
     /// The bytes of one slot's trajectory; 0 for a rank that holds none.
     trajectory: u64,
     /// The bytes from one row's first byte to the next's: the trajectory's, rounded up to a
-    /// whole unit.
+    /// whole unit, and on a device to whole allocation granules, each row being a part of its
+    /// own.
     row: u64,
     /// The parts of host regions the rank reaches: its own, and those of the other ranks of its
     /// process.
@@ -214,15 +234,30 @@ fn stored(request: RequestId, (block, host): (u64, u64), load: bool) -> Result<u
 }
 
 impl BufferMemory {
-    /// The device bytes the media memory of a rank takes from the device's resident pool: a
-    /// product buffer of `units` units and the rows of `slots` slots for trajectories of
-    /// `trajectory` bytes. The pool is reserved with them when the device's `GraphPool` opens.
-    pub(crate) fn device_bytes(units: u32, slots: u32, trajectory: u64) -> u64 {
+    /// The device bytes the media memory of a rank takes from the device's resident pool, whose
+    /// allocations are whole granules of `granule` bytes: a product buffer of `units` units and
+    /// the rows of `slots` slots for trajectories of `trajectory` bytes, each row a part of its
+    /// own. The pool is reserved with them when the device's `GraphPool` opens.
+    pub(crate) fn device_bytes(units: u32, slots: u32, trajectory: u64, granule: u64) -> u64 {
         let rows = row_bytes(trajectory)
+            .map(|row| match row {
+                0 => 0,
+                row => division::granules(row, granule.max(UNIT_BYTES)),
+            })
             .and_then(|row| row.checked_mul(u64::from(slots)))
             .unwrap_or(u64::MAX);
 
         (u64::from(units) * UNIT_BYTES).saturating_add(rows)
+    }
+
+    /// The units of a product buffer a slot's part takes for `units` units of the products one
+    /// request holds, on a device whose allocations are whole granules of `granule` bytes: whole
+    /// granules of them, so the parts of a buffer split per slot lie back to back at the units
+    /// the region numbers ([`BufferMemory::open`]). `granule` is [`UNIT_BYTES`] for memory that
+    /// holds no device, whose parts are its units.
+    pub(crate) fn slot_units(units: u64, granule: u64) -> u64 {
+        let granule = granule.max(UNIT_BYTES);
+        (units.max(1) * UNIT_BYTES).next_multiple_of(granule) / UNIT_BYTES
     }
 
     /// The media memory of rank index `rank`, holding no device: `products` is the product
@@ -260,8 +295,11 @@ impl BufferMemory {
         let mut memory = Self {
             rank,
             device: None,
+            held: Mutex::new((Vec::new(), Vec::new())),
             products,
+            product_parts: 1,
             slots,
+            kept: AtomicU32::new(slots.1),
             trajectory,
             row,
             parts: Vec::new(),
@@ -282,32 +320,125 @@ impl BufferMemory {
     /// Their contents are unspecified: a block is written before a batch reads it, and a
     /// trajectory row by its request's latent preparation or by a `Restore`.
     ///
+    /// The product buffer is mapped in `parts` parts back to back: one, or one per slot, each the
+    /// buffer's units over its slots, which must be whole allocation granules
+    /// ([`BufferMemory::slot_units`]) for the parts to lie at the units the region numbers. Each
+    /// trajectory row is a part of its own, of whole granules. A memory of a part per slot gives
+    /// the storages of the slots it does not keep back ([`BufferMemory::give_back`]).
+    ///
     /// # Errors
     ///
-    /// As [`BufferMemory::meta`], and when the resident pool cannot hold the memory.
+    /// As [`BufferMemory::meta`]; a product buffer that does not split into `parts` parts of
+    /// whole granules; and when the resident pool cannot hold the memory.
     pub(crate) fn open(
         allocator: &mut Allocator,
         rank: u32,
         products: (u8, u32),
         slots: (u8, u32),
         trajectory: u64,
+        parts: u32,
     ) -> Result<Self> {
         let mut memory = Self::meta(rank, products, slots, trajectory, &[])?;
+        let parts = parts.max(1);
+        if !products.1.is_multiple_of(parts) {
+            return Err(Error::Invalid(format!(
+                "a product buffer of {} units does not split into {parts} parts",
+                products.1
+            )));
+        }
 
-        let mut take = |bytes: u64| -> Result<Option<Buffer>> {
-            if bytes == 0 {
-                return Ok(None);
+        let mut take = |bytes: u64, count: u32| -> Result<Vec<Buffer>> {
+            if bytes == 0 || count == 0 {
+                return Ok(Vec::new());
             }
             let bytes = usize::try_from(bytes)
                 .map_err(|_| Error::Resource("a rank's media memory exceeds the address space"))?;
 
-            Ok(Some(allocator.allocate(PoolKind::Resident, bytes)?))
+            Ok(allocator.allocate_parts(PoolKind::Resident, bytes, count as usize)?)
         };
-        let buffer = take(u64::from(products.1) * UNIT_BYTES)?;
-        let rows = take(memory.row * u64::from(slots.1))?;
+        let part = u64::from(products.1 / parts) * UNIT_BYTES;
+        let buffer = take(part, parts)?;
+        // Parts rounded past their units would leave a gap between the units of two slots.
+        if parts > 1 && buffer.iter().any(|held| held.len() as u64 != part) {
+            return Err(Error::Invalid(format!(
+                "a product buffer of {} units in {parts} parts of {part} bytes is not whole \
+                 allocation granules of the device",
+                products.1
+            )));
+        }
+        let rows = take(memory.row, slots.1)?;
+        if let Some(first) = rows.first() {
+            memory.row = first.len() as u64;
+        }
 
-        memory.device = Some((allocator.device(), buffer, rows));
+        memory.device = Some((
+            allocator.device(),
+            buffer.first().map(Buffer::address),
+            rows.first().map(Buffer::address),
+        ));
+        memory.held = Mutex::new((buffer, rows));
+        memory.product_parts = parts;
         Ok(memory)
+    }
+
+    /// The device bytes one slot's storages take in this memory: its part of a product buffer
+    /// split per slot and its trajectory row. Zero for a memory whose product buffer is one part
+    /// and which holds no trajectory: its slots take nothing of it.
+    pub(crate) fn slot_bytes(&self) -> u64 {
+        let products = if self.product_parts > 1 {
+            u64::from(self.products.1 / self.product_parts) * UNIT_BYTES
+        } else {
+            0
+        };
+        let rows = if self.trajectory > 0 { self.row } else { 0 };
+        products + rows
+    }
+
+    /// The slots, from slot 1, whose storages this memory holds.
+    pub(crate) fn held_slots(&self) -> u32 {
+        self.kept.load(Ordering::Acquire)
+    }
+
+    /// Gives the storages of the slots past the first `kept` back to `allocator`, the device's
+    /// allocator they were taken from: their trajectory rows and, of a product buffer split per
+    /// slot, their parts of it, the last first. The pool's reservation in the GPU's quota drops by
+    /// them, and a run of those slots or of their product units is refused from here on. The
+    /// rank's tables name none of them: the scheduler's regions are resized to the slots kept
+    /// before they serve. Returns the bytes given back.
+    ///
+    /// # Errors
+    ///
+    /// Keeping no slot, or the driver's refusal of a release, after which the memory holds what
+    /// it did not release yet.
+    pub(crate) fn give_back(&self, allocator: &mut Allocator, kept: u32) -> Result<u64> {
+        if kept >= self.held_slots() {
+            return Ok(0);
+        }
+        if kept == 0 {
+            return Err(Error::Invalid(
+                "a rank's media memory keeps at least one slot".into(),
+            ));
+        }
+
+        // Nothing addresses the slots past `kept` from here on.
+        self.kept.store(kept, Ordering::Release);
+        let mut held = lock(&self.held);
+        let (buffer, rows) = &mut *held;
+        // A product buffer of one part is the slots' together, and stays whole.
+        let mut parts = vec![rows];
+        if self.product_parts > 1 {
+            parts.push(buffer);
+        }
+
+        let mut released = 0;
+        for held in parts {
+            let past = held.split_off((kept as usize).min(held.len()));
+            for part in past.into_iter().rev() {
+                released += part.len() as u64;
+                allocator.release(part)?;
+            }
+        }
+        Ok(released)
     }
 
     /// Maps the rank's part of the host region `region`, its number and its name, which holds
@@ -406,7 +537,7 @@ impl BufferMemory {
             let address = memory
                 .device
                 .as_ref()
-                .map(|(_, buffer, _)| buffer.as_ref().map_or(0, Buffer::address));
+                .map(|(_, buffer, _)| buffer.unwrap_or(0));
             buffers.push((memory.products.0, memory.rank, memory.products.1, address));
         }
         for memory in memories.iter() {
@@ -1011,18 +1142,19 @@ impl BufferMemory {
     fn extent(&self, (region, first, count): Run) -> Result<(u64, u64)> {
         if region == self.slots.0 {
             // A slot's run is its row: slot `s` owns row `s - 1`.
-            if self.trajectory == 0 || count != 1 || first == 0 || first > self.slots.1 {
+            let held = self.held_slots();
+            if self.trajectory == 0 || count != 1 || first == 0 || first > held {
                 return Err(Error::Invalid(format!(
                     "the run of {count} slots from slot {first} names no trajectory row of a \
-                     rank that holds {} rows of {} bytes",
-                    self.slots.1, self.trajectory
+                     rank that holds {held} rows of {} bytes",
+                    self.trajectory
                 )));
             }
             return Ok((u64::from(first - 1) * self.row, self.trajectory));
         }
 
         let (unit, units) = if region == self.products.0 {
-            (UNIT_BYTES, self.products.1)
+            (UNIT_BYTES, self.held_units())
         } else if let Some(&(_, _, units, _)) = self.peer(region) {
             (UNIT_BYTES, units)
         } else if let Some((_, _, bytes, units, _)) = self.copied(region) {
@@ -1033,6 +1165,16 @@ impl BufferMemory {
             )));
         };
         Self::units((region, first, count), unit, units)
+    }
+
+    /// The units of the product buffer the memory holds: every unit, or for a buffer of a part
+    /// per slot the units of the slots it keeps.
+    fn held_units(&self) -> u32 {
+        if self.product_parts > 1 {
+            self.products.1 / self.product_parts * self.held_slots()
+        } else {
+            self.products.1
+        }
     }
 
     /// The first byte and the bytes of `run` in rank `rank`'s part of its host region.
@@ -1088,9 +1230,9 @@ impl BufferMemory {
         };
 
         let base = if region == self.products.0 && rank == self.rank {
-            buffer.as_ref().map(Buffer::address)
+            *buffer
         } else if region == self.slots.0 && rank == self.rank {
-            rows.as_ref().map(Buffer::address)
+            *rows
         } else if let Some((_, _, _, address)) = self.peer(region).filter(|peer| peer.1 == rank) {
             *address
         } else {

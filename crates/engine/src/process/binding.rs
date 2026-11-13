@@ -56,9 +56,10 @@
 //! 3. **Sleep**: the schedulers detach every owner and `Resize` every device region to nothing,
 //!    having stored what the write policy keeps; the head withdraws every segment;
 //!    [`WeightBinding::sleep`] releases them all and suspends the graph pools.
-//! 4. **Wake**: [`WeightBinding::wake`] restores the graph pools and creates every segment again;
-//!    the head grants them ([`WeightBinding::segment_tables`] states each region's); the
-//!    schedulers grow their regions.
+//! 4. **Wake**: [`WeightBinding::restore_graphs`] restores the graph pools; then, as a grow, every
+//!    rank of a region creates the segments it gave back that its quota holds beside its warm
+//!    process, which its start reserved, and the head grants them; the schedulers grow their
+//!    regions.
 //!
 //! Each returns its ranks' segment tables ([`crate::memory::cache::info::CacheTable`]), whose
 //! segment `i` holds the units from the sum of the units of the segments before it. An epoch switch
@@ -91,7 +92,7 @@ use crate::executor::peers::{Answer, Remote, operated};
 use crate::memory::cache::KvCacheMemory;
 use crate::memory::cache::info::CacheTable;
 use crate::memory::client::{StorageClient, quota_limit};
-use crate::memory::division::process_bytes;
+use crate::memory::division::{self, process_bytes};
 use crate::memory::graph_pool::GraphPool;
 use crate::memory::reload::{MetaWeights, Reload, paired};
 use crate::memory::state::StateMemory;
@@ -257,6 +258,10 @@ pub(crate) struct Room {
     pub quota: u64,
     /// Bytes the device has free.
     pub free: u64,
+    /// Bytes of the quota that other epochs of the deployment hold and the rank's does not
+    /// (`division::held_elsewhere`), which return to the quota and the device as those epochs
+    /// drain: what the rank's epoch holds beside the rest as if it served the GPU alone.
+    pub elsewhere: u64,
 }
 
 impl Room {
@@ -445,8 +450,8 @@ fn joined_tables(
     Ok(tables)
 }
 
-/// The room `rank`'s device has: what the deployment's quota of the GPU leaves, and what the
-/// device has free.
+/// The room `rank`'s device has: what the deployment's quota of the GPU leaves, what the device
+/// has free, and what other epochs of the deployment hold of the quota.
 fn room_of(rank: &Rank) -> Result<Room> {
     let (quota, _) = rank.client.usage(rank.device)?;
     let free = rank.device.memory_info()?.free;
@@ -456,6 +461,7 @@ fn room_of(rank: &Rank) -> Result<Room> {
             .limit
             .map_or(free, |limit| limit.saturating_sub(quota.usage())),
         free,
+        elsewhere: division::held_elsewhere(&quota, rank.client.epoch()),
     })
 }
 
@@ -694,6 +700,17 @@ impl WeightBinding {
 
         *reserved = reservations;
         Ok(())
+    }
+
+    /// What each of this process's ranks reserved as its warm process in its GPU's quota
+    /// ([`Self::reserve_serving`]), with the rank's device; none before the ranks reserved.
+    pub(crate) fn warm_processes(&self) -> Vec<(DeviceId, u64)> {
+        let reserved = lock(&self.reserved);
+        self.ranks
+            .iter()
+            .zip(reserved.iter())
+            .map(|(rank, reservation)| (lock(rank).device, reservation.process))
+            .collect()
     }
 
     /// States `reservation` as `rank`'s process in its GPU's quota.
@@ -1745,23 +1762,6 @@ impl WeightBinding {
         Ok(tables)
     }
 
-    /// The ranks' side of a wake (module documentation): what [`Self::sleep`] gave back is mapped
-    /// again on every rank. Returns each rank's segment table, from which the head grants every
-    /// segment.
-    ///
-    /// # Errors
-    ///
-    /// As [`Self::restore_graphs`] and [`Self::create_segments`].
-    pub(crate) fn wake(&self) -> Result<Vec<Option<CacheTable>>> {
-        let answers = self.ask_peers(None, || DataOperation::Wake)?;
-        let here = self
-            .restore_here()
-            .and_then(|()| self.create_of(None, None));
-        let tables = joined_tables(here, answers)?;
-        agreed(&tables)?;
-        Ok(tables)
-    }
-
     /// Has each rank's cache and state launch their own work from the generation the rank's
     /// graphs serve, from the rank's next job on: what the engine does after it switched or
     /// rolled back a generation, since no worker job sets it. Each rank takes its own device's
@@ -2415,6 +2415,7 @@ mod tests {
         let room = Room {
             quota: 100,
             free: 60,
+            elsewhere: 0,
         };
         assert!(room.holds(60, 0));
         assert!(!room.holds(61, 0));

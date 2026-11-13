@@ -294,9 +294,10 @@ impl ModelRunner {
     }
 
     /// One model runner per rank this process serves (one main process drives every device of its
-    /// node, one worker each).
+    /// node, one worker each), in rank order, each numbered and placed as the deployment places it
+    /// on this process's host ([`placed_ranks`]).
     ///
-    /// Each device is a rank of the deployment's worker group that places it, or a member of the
+    /// Each rank is a rank of the deployment's worker group that places it, or a member of the
     /// node's expert union when the deployment splits its experts.
     pub(crate) fn ranks(&self) -> Result<Vec<Self>> {
         let text = matches!(self.family.model, Model::Text(_));
@@ -315,24 +316,22 @@ impl ModelRunner {
                  served together"
             );
         }
-        let count = self.devices.len();
-        // Each device is a rank of the deployment's worker group that places it: its prefill or
+        // This process's ranks, each on the device that places it ([`placed_ranks`]).
+        let placed = placed_ranks(self.launch())?;
+        let count = placed.len();
+        // Each rank is a rank of the deployment's worker group that places it: its prefill or
         // decode group, a data-parallel replica, or the one group of a tensor-parallel deployment.
         // A group's ranks split every layer of one model over the group's devices: each loads its
         // block of every weight on its own device and joins the group's collectives, and every
         // batch of the group is handed to all of them (`crate::executor::Route`), those of
-        // another host's process through its peer link. This process holds `count` consecutive
-        // ranks of the deployment from its first, `self.rank`.
+        // another host's process through its peer link.
         if text && union_ranks == 1 {
-            return self
-                .devices
-                .iter()
-                .enumerate()
-                .map(|(index, device)| {
-                    let rank = self.rank + index as u32;
+            return placed
+                .into_iter()
+                .map(|(rank, _, _, device)| {
                     let (group, position, tensor) = self.placed(rank)?;
                     let mut rank_runner = self.clone();
-                    rank_runner.devices = vec![*device];
+                    rank_runner.devices = vec![device];
                     rank_runner.rank = rank;
                     rank_runner.group = group;
                     rank_runner.world_size = tensor as usize;
@@ -357,22 +356,15 @@ impl ModelRunner {
             );
         }
         let groups = &self.engine_config().parallel.worker_groups;
-        self.devices
-            .iter()
+        placed
+            .into_iter()
             .enumerate()
-            .map(|(index, device)| {
+            .map(|(index, (rank, group, _, device))| {
                 let mut rank_runner = self.clone();
-                rank_runner.devices = vec![*device];
-                rank_runner.rank = self.rank + index as u32;
+                rank_runner.devices = vec![device];
+                rank_runner.rank = rank;
                 rank_runner.world_size = 1;
                 // Each scheduler of the union drives its rank's own group.
-                let (group, _) = WorkerGroupConfig::place_rank(groups, rank_runner.rank as usize)
-                    .with_context(|| {
-                    format!(
-                        "the deployment's worker groups place no rank {}",
-                        rank_runner.rank
-                    )
-                })?;
                 rank_runner.group.clone_from(&groups[group].id.0);
                 // An attention rank holds the first rank's window and computes nothing with
                 // it; `DispatchViews::source_only` keeps it out of its forward.
@@ -663,6 +655,53 @@ impl ModelRunner {
         }
         Ok(targets)
     }
+}
+
+/// The deployment's ranks the main process of `launch` holds, in rank order, each as its number in
+/// the deployment, the index of its worker group there, its position in the group and the device
+/// that places it: every rank of every worker group the deployment places on the process's host
+/// (`EngineArgs::host`). A rank's number is its place among the ranks of the deployment's groups
+/// in their order (`WorkerGroupConfig::first_ranks`), whatever order the hosts hold them in, so
+/// the ranks of one host need not be consecutive; it is what the rank meets the deployment's host
+/// group under and what its storage scope names. The one rule of a text and a media deployment,
+/// and of the scopes the process claims at its host's Storage Server.
+///
+/// # Errors
+///
+/// A rank on this host placed on a device that is not a CUDA device the process serves
+/// (`EngineArgs::devices`), or a rank past what the protocol numbers.
+pub(crate) fn placed_ranks(launch: &EngineArgs) -> Result<Vec<(u32, usize, usize, DeviceId)>> {
+    let groups = &launch.engine_config.parallel.worker_groups;
+    let firsts = WorkerGroupConfig::first_ranks(groups);
+
+    let mut placed = Vec::new();
+    for (index, (first, group)) in firsts.iter().zip(groups).enumerate() {
+        for (position, rank) in group.ranks.iter().enumerate() {
+            if rank.host != launch.host {
+                continue;
+            }
+            let number =
+                u32::try_from(first + position).context("a rank past what the protocol numbers")?;
+            let device = rank
+                .device
+                .strip_prefix("cuda:")
+                .and_then(|ordinal| ordinal.parse::<u32>().ok())
+                .filter(|ordinal| launch.devices.contains(ordinal))
+                .and_then(|ordinal| i32::try_from(ordinal).ok());
+            let Some(device) = device else {
+                bail!(
+                    "the deployment places rank {number} (rank {position} of worker group {}) on \
+                     {}, which this process does not serve: it serves devices {:?}",
+                    group.id,
+                    rank.device,
+                    launch.devices
+                );
+            };
+            placed.push((number, index, position, DeviceId(device)));
+        }
+    }
+    placed.sort_unstable_by_key(|(number, ..)| *number);
+    Ok(placed)
 }
 
 /// The split a runner's graphs state for this rank, member `rank` of a parallel group of `ranks`
