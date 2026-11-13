@@ -771,6 +771,7 @@ mod tests {
             media_bytes,
             call_window: 2,
             cache_groups: Vec::new(),
+            seeds: Vec::new(),
         }
     }
 

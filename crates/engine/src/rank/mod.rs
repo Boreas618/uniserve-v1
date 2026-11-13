@@ -1,14 +1,14 @@
-//! Each rank's model runner: how a main process loads, sizes and captures one rank of the epoch's
+//! Each rank's model runner: how a main process loads, sizes and starts one rank of the epoch's
 //! engine configuration.
 //!
-//! `crate::process` is the main process itself: the control thread, the device workers, the
+//! `crate::process` is the main process itself: the control thread, the executors, the
 //! schedulers and the hot update. Everything it needs *before* it can start a thread comes from an
-//! epoch's configuration - which devices, which buckets are captured, how much of each device the
-//! graphs may map, which blocking pools exist, which Build Server socket and targets this rank
-//! speaks to - and none of that belongs in `proto::config::EngineConfig`: the config fixes the epoch
-//! and must not learn how the worker assembles its devices, its buckets or its graphs. It also
-//! does not hold every input, because half of what the main process needs is a property of the node
-//! it runs on (`EngineArgs`) or of the devices it measured.
+//! epoch's configuration - which devices, which buckets are captured, which thread pools exist,
+//! which Build Server socket and targets this rank speaks to - and none of that belongs in
+//! `proto::config::EngineConfig`: the config fixes the epoch and must not learn how the worker
+//! assembles its devices, its buckets or its graphs. It also does not hold every input, because
+//! half of what the main process needs is a property of the node it runs on (`EngineArgs`) or of
+//! the devices it measured.
 //!
 //! So the derivation lives here, on the consumer's side of the daemon/engine seam: a
 //! [`ModelRunner`] is one rank of the epoch's engine configuration resolved against the process's
@@ -16,16 +16,20 @@
 //! dispatches by the model of the family the checkpoint resolved to ([`Family::model`]) and by the
 //! capabilities the loaded model implements; no concrete model is named here.
 //!
-//! The capacity plan - what the rank's resident memory is - is not here: it is resolved from a
-//! measured device against the reported capacity, which is the capacity negotiation's own area
-//! (`worker::memory::Memory::new`'s caller).
+//! A rank starts in the order `specs/engine-worker-port.md` §1.1 states, which
+//! `crate::process::ranks` drives: the model's meta load and the runner's profile run ([`text`]),
+//! the cache's layout and the division of the GPU's quota ([`memory`]), the device's owners and
+//! the serving runner ([`text`]), and what the rank states of its group once its executors are
+//! ready ([`report`]).
+//!
+//! The media rank (`video.rs` beside this file) is not declared: its runners are the worker's
+//! media runners, which this crate does not build on yet.
 
 pub(crate) mod buckets;
-mod memory;
+pub(crate) mod memory;
 mod placement;
-mod report;
-mod text;
-mod video;
+pub(crate) mod report;
+pub(crate) mod text;
 
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -34,41 +38,24 @@ use std::time::Duration;
 
 use anyhow::{Context as _, Result, bail};
 use build_server::Target;
+use nn::Split;
+use nn::family::{ExpertOrder, Family, Model, TextModel, TextPlacement};
 use platform::DeviceId;
-use uniserve_tensor::DType;
-use worker::blocking::{BlockingKind, LaneLimits, Limits};
-use worker::device::GraphStorage;
-use worker::memory::Memory;
-use worker::plan::Buckets;
-use worker::stream::EventPool;
+use proto::config::{EngineArgs, WorkerGroupConfig, WorkerGroupRole};
+use worker::buckets::Buckets;
+use worker::parallel::host::HostGroup;
+use worker::runners::causal_lm::experts::{JoinHook, Member};
+use worker::thread_pool::ThreadPool;
 
-use buckets::{PrefillBound, expert_classes, tier_refusal};
+use buckets::{PrefillBound, tier_refusal};
 use placement::Mapping;
-use video::{SharedCodec, prompt_capacity};
-
-use nn::family::{
-    ExpertOrder, Family, Model, Split, TextModel, TextPlacement, VideoModel, VideoPlacement,
-};
-use proto::config::EngineArgs;
-
-/// What a rank holds once its model is loaded: the model of its family's kind.
-///
-/// A caller that has a [`Loaded`] cannot ask it for a figure of the other kind, which a bare
-/// `Arc<…>` would allow.
-#[derive(Clone)]
-pub(crate) enum Loaded {
-    /// The causal language model, one `Arc` per rank: every device's runner reads the same weights.
-    Text(Arc<dyn TextModel>),
-    /// The video pipeline, whose blocks the runners take one `Arc` each.
-    Video(Arc<dyn VideoModel>),
-}
 
 /// Where a rank's model load puts its weights.
 pub(crate) enum Weights<'a> {
     /// Retained storage: each weight is read from the checkpoint, converted and published.
-    Retained(&'a mut dyn nn::RetainedWeights),
+    Retained(&'a dyn nn::RetainedWeights),
     /// Nowhere: each weight's element type and extents come from the shard headers, at a synthetic
-    /// address ([`nn::WeightLoader::meta`]), for a start that records its walk and serves nothing.
+    /// address ([`nn::WeightLoader::meta`]), for a profile run, which launches nothing.
     Meta,
 }
 
@@ -102,7 +89,7 @@ impl crate::data_plane::ModelLoad for RankModel {
     fn load(
         &self,
         target: &crate::data_plane::Target,
-        weights: &mut dyn nn::RetainedWeights,
+        weights: &dyn nn::RetainedWeights,
     ) -> std::result::Result<(), String> {
         let mut model_runner = self.model_runner.clone();
         Arc::make_mut(&mut model_runner.launch)
@@ -126,33 +113,26 @@ impl crate::data_plane::ModelLoad for RankModel {
     }
 }
 
-/// One rank's model runner: it loads the rank's model on its devices, sizes the KV cache from what
-/// the device has left, captures the rank's CUDA graphs and builds its compute runners. The ranks
-/// of a process share the process's launch arguments; the rest is each rank's own.
+/// One rank's model runner: it loads the rank's model on its device, divides what the device's
+/// quota leaves among the rank's storages and builds the rank's runner. The ranks of a process
+/// share the process's launch arguments; the rest is each rank's own.
 #[derive(Clone)]
 pub(crate) struct ModelRunner {
     /// The family the checkpoint's declared class resolved to.
     family: Family,
-    /// The output and the media lane the ranks of this process share, once the first rank made them.
-    codec: Arc<std::sync::Mutex<Option<SharedCodec>>>,
-    /// The process's arguments, which every rank of it shares: the epoch's engine configuration
-    ///, the checkpoint, the epoch and the node's interfaces. A model runner that loads another
-    /// checkpoint holds its own copy, whose configuration names that checkpoint.
+    /// The process's arguments, which every rank of it shares: the epoch's engine configuration,
+    /// the checkpoint, the epoch and the node's interfaces.
     launch: Arc<EngineArgs>,
     /// This rank's devices, as the worker's names for them.
     devices: Vec<DeviceId>,
-    /// The targets this rank resolves a module for.
-    targets: Vec<Target>,
-    /// The bucket catalog every device of this rank captures.
+    /// The bucket catalog every device of this rank captures: the build config's sizes within the
+    /// batch bound, with a speculating deployment's verification and drafter buckets.
     buckets: Buckets,
     /// This rank's ordinal among the deployment's ranks (every worker group's, in the order the
-    /// deployment states them), which the storage claims and the cache plan's agreement over the
-    /// process's host group are keyed by.
+    /// deployment states them), which the storage claims are keyed by.
     rank: u32,
-    /// The worker group this rank serves in, as the scheduler addresses it: a text rank's group of
-    /// the deployment (its prefill or decode group, or one data-parallel replica), and the
-    /// process's own group for the ranks of a media deployment, whose groups one scheduler drives
-    /// as one pool.
+    /// The worker group this rank serves in: a text rank's group of the deployment (its prefill or
+    /// decode group, or one data-parallel replica).
     group: String,
     /// The epoch whose cache planes this rank maps, on a standby: it serves from the planes its
     /// predecessor serves from, whose segments that epoch created.
@@ -160,13 +140,13 @@ pub(crate) struct ModelRunner {
     /// The planes of the epoch `cache_epoch` names, as that epoch laid them out: what a standby
     /// maps is the serving rank's cache, which only that rank sized.
     adopted_cache: Option<ipc::CacheTable>,
-    /// Ranks in the deployment, whose minimum the cache plan's block size and slot count are
-    /// agreed by: the launch's, or this process's devices when its ranks are its devices.
+    /// Ranks in this rank's worker group on every host.
     world_size: usize,
     /// This rank's part of the epoch's parallel shape, resolved with the model runner.
     mapping: Mapping,
-    /// The expert union of this node's ranks, on a deployment whose experts are split.
-    union: Option<Arc<worker::runners::experts::Union>>,
+    /// The members of the expert union of this node's ranks, on a deployment whose experts are
+    /// split; `None` outside a union.
+    union: Option<u32>,
 }
 
 /// A rank's places in its deployment's parallel groups.
@@ -202,20 +182,8 @@ pub(crate) struct Collective {
     pub(crate) member: Option<(usize, usize)>,
 }
 
-/// The collective groups a rank's runners issue on, absent where one rank holds the block.
-///
-/// Two groups rather than one because the two blocks run on two streams of a device: a collective of
-/// one must not queue behind the other's, and each communicator keeps one issue order.
-#[derive(Clone, Default)]
-pub(crate) struct RankGroups {
-    /// The denoiser's sequence group.
-    pub(crate) sequence: Option<Arc<nn::Group>>,
-    /// The text encoder's tensor group.
-    pub(crate) tensor: Option<Arc<nn::Group>>,
-}
-
 impl ModelRunner {
-    /// The epoch `build` builds, with this node's arguments resolved against it.
+    /// The epoch `launch` builds, with this node's arguments resolved against it.
     ///
     /// The devices and the Build Server socket are the node's, not the epoch's: the daemon
     /// starts every rank of a node with the ordinals that rank serves, and a main process that
@@ -260,46 +228,36 @@ impl ModelRunner {
         let tokens_bound = build.model.max_model_len;
         // A stated token tier above the bound that admits it is refused here, before the
         // catalogue is built and long before any weight is mapped; a stated decode tier above the
-        // request bound is the clamp in `Scheduler::new`, not a refusal. `tier_refusal` is where
-        // that asymmetry is stated and argued.
+        // request bound only sizes a batch. `tier_refusal` is where that asymmetry is stated and
+        // argued.
         if let Some(sizes) = &tokens
             && let Some(refusal) = tier_refusal(rows.as_deref(), rows_bound, sizes, tokens_bound)
         {
             bail!("{refusal}");
         }
+        // A speculating deployment's decode steps are verifications, each prefill and
+        // verification followed by its drafter's bucket.
         let buckets = Buckets::for_batch(
             rows.as_deref(),
             tokens.as_deref(),
             rows_bound,
             tokens_bound,
             true,
-        )?;
+        )?
+        .with_drafts(build.speculative.num_draft_tokens);
         if buckets.is_empty() {
             bail!("the build config captures no graph bucket");
-        }
-        // The architecture-specific instruction set of every device the rank serves, each once.
-        let mut targets: Vec<Target> = Vec::with_capacity(devices.len());
-        for device in &devices {
-            let target = device
-                .compute_capability()
-                .map(Target::arch)
-                .with_context(|| format!("reading device {}'s architecture", device.0))?;
-            if !targets.contains(&target) {
-                targets.push(target);
-            }
         }
         Ok(Self {
             family,
             launch: Arc::new(launch.clone()),
             devices,
-            targets,
             buckets,
             rank: launch.rank,
             group: launch.group.clone(),
             cache_epoch: None,
             adopted_cache: None,
             world_size: launch.world_size as usize,
-            codec: Arc::default(),
             mapping,
             union: None,
         })
@@ -310,17 +268,21 @@ impl ModelRunner {
         &self.launch.engine_config
     }
 
+    /// The process's arguments.
+    pub(crate) fn launch(&self) -> &EngineArgs {
+        &self.launch
+    }
+
     /// The checkpoint this rank serves.
     fn checkpoint(&self) -> &Path {
         Path::new(&self.launch.engine_config.model.model)
     }
 
     /// One model runner per rank this process serves (one main process drives every device of its
-    /// node, one worker each).
+    /// node, one executor each).
     ///
-    /// A media deployment's ranks are its devices: a rank holds its own partition of the model on
-    /// its own device, so each is planned, loaded and opened as a rank of its own. The text class
-    /// keeps one model runner, whose second device is refused where its runner is built.
+    /// Each device is a rank of the deployment's worker group that places it, or a member of the
+    /// node's expert union when the deployment splits its experts.
     pub(crate) fn ranks(&self) -> Result<Vec<Self>> {
         let text = matches!(self.family.model, Model::Text(_));
         let attention = self.attention_ranks()?;
@@ -342,9 +304,9 @@ impl ModelRunner {
         // Each device is a rank of the deployment's worker group that places it: its prefill or
         // decode group, a data-parallel replica, or the one group of a tensor-parallel deployment.
         // A group's ranks split every layer of one model over the group's devices: each loads its
-        // block of every weight on its own device and joins the group's collectives, and the
-        // scheduler that drives the group submits each batch to all of them (`process::ranks::scheduler`), those
-        // of another host's process through its peer link. This process holds `count` consecutive
+        // block of every weight on its own device and joins the group's collectives, and every
+        // batch of the group is handed to all of them (`worker::executor::Executors`), those of
+        // another host's process through its peer link. This process holds `count` consecutive
         // ranks of the deployment from its first, `self.rank`.
         if text && union_ranks == 1 {
             return self
@@ -368,49 +330,46 @@ impl ModelRunner {
         // The schedulers of an expert-parallel deployment each hold one rank: its own cache and
         // attention, its share of the experts, and a member of the union that runs their steps. A
         // deployment of dedicated expert ranks puts its attention ranks first in the union.
-        let union = text.then(|| {
-            worker::runners::experts::Union::new(usize::try_from(union_ranks).unwrap_or(0))
-        });
-        if text && count != union_ranks as usize {
+        if !text {
+            bail!(
+                "this engine serves no media rank: the media runners the rank builds are not \
+                 declared by this build"
+            );
+        }
+        if count != union_ranks as usize {
             bail!(
                 "this node serves {count} devices and the deployment's experts are exchanged over \
                  {union_ranks} ranks: an expert union lives on one node's devices, one rank each"
             );
         }
-        let capacity = self.exchange_capacity();
-        Ok(self
-            .devices
+        let groups = &self.engine_config().parallel.worker_groups;
+        self.devices
             .iter()
             .enumerate()
             .map(|(index, device)| {
                 let mut rank_runner = self.clone();
                 rank_runner.devices = vec![*device];
                 rank_runner.rank = self.rank + index as u32;
-                // The group's ranks on every host: a media group's other hosts hold the ranks this
-                // process does not.
-                rank_runner.world_size = self.world_size.max(count);
-                if text {
-                    // Each scheduler of the union drives its rank's own group.
-                    if let Some((group, _)) = scheduler::WorkerGroupConfig::place_rank(
-                        &self.engine_config().parallel.worker_groups,
-                        rank_runner.rank as usize,
-                    ) {
-                        rank_runner
-                            .group
-                            .clone_from(&self.engine_config().parallel.worker_groups[group].id.0);
-                    }
-                    // An attention rank holds the first rank's window and computes nothing with
-                    // it; `DispatchViews::source_only` keeps it out of its forward.
-                    rank_runner.mapping.union_rank = index as u32;
-                    rank_runner.mapping.attention_ranks = attention;
-                    rank_runner.mapping.expert_parallel = expert_ranks;
-                    rank_runner.mapping.expert_rank = (index as u32).saturating_sub(attention);
-                    rank_runner.union.clone_from(&union);
-                    rank_runner.buckets = expert_classes(&rank_runner.buckets, capacity);
-                }
-                rank_runner
+                rank_runner.world_size = 1;
+                // Each scheduler of the union drives its rank's own group.
+                let (group, _) = WorkerGroupConfig::place_rank(groups, rank_runner.rank as usize)
+                    .with_context(|| {
+                    format!(
+                        "the deployment's worker groups place no rank {}",
+                        rank_runner.rank
+                    )
+                })?;
+                rank_runner.group.clone_from(&groups[group].id.0);
+                // An attention rank holds the first rank's window and computes nothing with
+                // it; `DispatchViews::source_only` keeps it out of its forward.
+                rank_runner.mapping.union_rank = index as u32;
+                rank_runner.mapping.attention_ranks = attention;
+                rank_runner.mapping.expert_parallel = expert_ranks;
+                rank_runner.mapping.expert_rank = (index as u32).saturating_sub(attention);
+                rank_runner.union = Some(union_ranks);
+                Ok(rank_runner)
             })
-            .collect())
+            .collect()
     }
 
     /// The worker group that places the deployment's rank `rank`, the rank's position in it and
@@ -422,8 +381,8 @@ impl ModelRunner {
     /// its `model` block.
     fn placed(&self, rank: u32) -> Result<(String, u32, u32)> {
         let groups = &self.engine_config().parallel.worker_groups;
-        let (index, position) = scheduler::WorkerGroupConfig::place_rank(groups, rank as usize)
-            .with_context(|| {
+        let (index, position) =
+            WorkerGroupConfig::place_rank(groups, rank as usize).with_context(|| {
                 format!("the deployment's worker groups place no rank {rank} for this process")
             })?;
         let group = &groups[index];
@@ -447,7 +406,7 @@ impl ModelRunner {
         ))
     }
 
-    /// The worker group this rank serves in, as the scheduler addresses it.
+    /// The worker group this rank serves in.
     pub(crate) fn group(&self) -> &str {
         &self.group
     }
@@ -455,8 +414,8 @@ impl ModelRunner {
     /// The tensor groups of a text deployment whose ranks are each one group's
     /// ([`Self::ranks`]), with this rank's place among them: every worker group of more than one
     /// rank, as consecutive members of the host group, whose members are the deployment's ranks.
-    /// `None` for a media rank and a member of an expert union, whose tensor group is the
-    /// parallel shape's over the whole host group.
+    /// `None` for a member of an expert union, whose tensor group is the parallel shape's over
+    /// the whole host group.
     ///
     /// # Errors
     ///
@@ -466,15 +425,15 @@ impl ModelRunner {
             return Ok(None);
         }
         let groups = &self.engine_config().parallel.worker_groups;
-        let firsts = scheduler::WorkerGroupConfig::first_ranks(groups);
+        let firsts = WorkerGroupConfig::first_ranks(groups);
         let spans: Vec<(usize, usize)> = firsts
             .iter()
             .zip(groups)
             .map(|(first, group)| (*first, group.ranks.len()))
             .collect();
         let (_, position, _) = self.placed(self.rank)?;
-        let (group, _) = scheduler::WorkerGroupConfig::place_rank(groups, self.rank as usize)
-            .with_context(|| {
+        let (group, _) =
+            WorkerGroupConfig::place_rank(groups, self.rank as usize).with_context(|| {
                 format!("the deployment's worker groups place no rank {}", self.rank)
             })?;
         Ok(Some(Collective {
@@ -496,9 +455,7 @@ impl ModelRunner {
     /// the ranks of every group that is not an expert group, and zero without one.
     fn attention_ranks(&self) -> Result<u32> {
         let groups = &self.engine_config().parallel.worker_groups;
-        let experts = |group: &&scheduler::WorkerGroupConfig| {
-            group.role == scheduler::WorkerGroupRole::Experts
-        };
+        let experts = |group: &&WorkerGroupConfig| group.role == WorkerGroupRole::Experts;
         if !groups.iter().any(|group| experts(&group)) {
             return Ok(0);
         }
@@ -512,19 +469,27 @@ impl ModelRunner {
         self.mapping.attention_ranks == 0 || self.mapping.union_rank < self.mapping.attention_ranks
     }
 
-    /// The expert union this rank is a member of, with its transport's shape.
+    /// The member of the node's expert union this rank is on `device`, over the union's host
+    /// group `group`, asking the other members to join its steps through `join`; `None` for a
+    /// rank of no union.
     pub(crate) fn union_member(
         &self,
         device: DeviceId,
         model: &dyn TextModel,
-    ) -> Result<Option<worker::runners::experts::Member>> {
-        let Some(union) = &self.union else {
+        group: Arc<HostGroup>,
+        join: JoinHook,
+    ) -> Result<Option<Member>> {
+        if self.union.is_none() {
             return Ok(None);
-        };
+        }
         let (shape, encoded) = self.transport_shape(device, model)?;
-        let member = worker::runners::experts::Member::new(Arc::clone(union), shape);
         // An encoded block runs in the exchange's one fused launch.
-        Ok(Some(if encoded { member.fused() } else { member }))
+        let mode = if encoded {
+            ops::moe::exchange::Mode::Fused
+        } else {
+            ops::moe::exchange::Mode::Dispatch
+        };
+        Ok(Some(Member::new(group, shape, mode, join)?))
     }
 
     /// The shape of the transport a member of an expert union creates on `device`.
@@ -554,7 +519,7 @@ impl ModelRunner {
         Ok((shape, experts.encoded))
     }
 
-    /// What this rank's expert transport takes of its device, for the capacity plan.
+    /// What this rank's expert transport takes of its device, for the division.
     fn transport_bytes(&self, device: DeviceId, model: &dyn TextModel) -> Result<u64> {
         if self.union.is_none() {
             return Ok(0);
@@ -563,11 +528,10 @@ impl ModelRunner {
         Ok(shape.device_bytes(encoded))
     }
 
-    /// The expert union this rank's worker answers wakes for.
-    pub(crate) fn union(&self) -> Option<(&Arc<worker::runners::experts::Union>, usize)> {
-        self.union
-            .as_ref()
-            .map(|union| (union, self.mapping.union_rank as usize))
+    /// The expert union this rank is a member of: its members and this rank's place among them;
+    /// `None` outside a union.
+    pub(crate) fn union(&self) -> Option<(u32, u32)> {
+        self.union.map(|members| (members, self.mapping.union_rank))
     }
 
     /// This model runner on the cache planes of `epoch`, when this rank stands by for that epoch's process.
@@ -581,26 +545,94 @@ impl ModelRunner {
         self
     }
 
-    /// This rank as the one pool the scheduler plans against.
-    ///
-    /// The ranks of a group run one batch together, and `worker::batch::Workers` hands it to
-    /// each of them, so a scheduler sees the deployment as one rank whose batches are the group's.
-    pub(crate) fn scheduled(&self) -> Self {
-        let mut rank_runner = self.clone();
-        rank_runner.world_size = 1;
-        // A scheduler of an expert union plans its one rank as a pool of its own.
-        if rank_runner.union.is_some() {
-            rank_runner.rank = 0;
-        }
-        rank_runner
+    /// This rank's ordinal among the deployment's ranks.
+    pub(crate) fn rank(&self) -> u32 {
+        self.rank
     }
 
+    /// This rank's devices, in the order the daemon named them.
+    pub(crate) fn devices(&self) -> &[DeviceId] {
+        &self.devices
+    }
+
+    /// The bucket catalog this rank captures.
+    pub(crate) fn buckets(&self) -> &Buckets {
+        &self.buckets
+    }
+
+    /// Batches the rank's groups keep in flight (the launch's `queue_depth`).
+    pub(crate) fn queue_depth(&self) -> usize {
+        self.launch.queue_depth as usize
+    }
+
+    /// The ranks of this rank's worker group on every host.
+    pub(crate) fn world_size(&self) -> usize {
+        self.world_size
+    }
+
+    /// The routed experts' distribution this epoch loads: what a redistribution committed, which
+    /// a relaunch and a standby load again; empty for the checkpoint's own order.
+    pub(crate) fn experts(&self) -> ExpertOrder {
+        self.launch
+            .expert_order
+            .iter()
+            .map(|(module, order)| (module.clone(), order.experts.clone()))
+            .collect()
+    }
+
+    /// The model this rank's checkpoint holds, its weights reached through `weights` in the order
+    /// the model's load asks for them. An update walks the same code, so what this function reads
+    /// is exactly what a load of another checkpoint or another expert order would, and a meta load
+    /// answers the same weights' element types and extents without reading them.
+    ///
+    /// # Errors
+    ///
+    /// The checkpoint's or the family's refusal, and a media family, whose rank this build does
+    /// not start.
+    pub(crate) fn load_model(
+        &self,
+        weights: Weights<'_>,
+        experts: &ExpertOrder,
+    ) -> Result<Arc<dyn TextModel>> {
+        let mapping = &self.mapping;
+        let Model::Text(family) = self.family.model else {
+            bail!(
+                "{} is a media model, and this engine serves no media rank: the media runners \
+                 the rank builds are not declared by this build",
+                self.checkpoint().display()
+            );
+        };
+        let opened = nn::Checkpoint::open(self.checkpoint())?;
+        let checkpoint = family.open(&opened)?;
+        let mut loader = weights.loader(&opened);
+        let drafts = self.engine_config().speculative.num_draft_tokens;
+        let placement = TextPlacement {
+            tensor: Split {
+                size: mapping.tensor_parallel,
+                rank: mapping.tensor_rank,
+            },
+            experts: Split {
+                size: mapping.expert_parallel,
+                rank: mapping.expert_rank,
+            },
+            // The drafter's layers load when the deployment speculates with them, and a model
+            // whose state keeps a window per request sizes it by the drafts.
+            drafter: drafts > 0,
+            draft_tokens: drafts,
+        };
+        Ok(checkpoint.load(&opened, &mut loader, &placement, experts)?)
+    }
+}
+
+/// What the main process reads of a rank to run it: its Build Server, its thread pools, its
+/// watchdog and the bounds a policy is held to.
+impl ModelRunner {
     /// The catalogue of prefill buckets this rank captures, and whether the deployment stated it.
     ///
     /// `Buckets::bounds` answers the largest prefill token count among the buckets this rank
-    /// captures, skipping media computations whose extents are not a language-model batch size, so
-    /// the figure is the ceiling the mechanism admits and the one a policy's limit is checked
-    /// against - not the build config's, which may be wider than the bound that dropped it.
+    /// captures, so the figure is the ceiling the mechanism admits and the one a policy's limit is
+    /// checked against - not the build config's, which may be wider than the bound that dropped
+    /// it.
     pub(crate) fn prefill_catalogue(&self) -> PrefillBound {
         let (_, bound) = self.buckets.bounds();
         PrefillBound {
@@ -613,56 +645,38 @@ impl ModelRunner {
         }
     }
 
-    /// The blocking pools' admission bounds, one lane per kind.
+    /// The thread pool the Build Server's selection and the module loads run on.
     ///
-    /// The build config sizes no pool - a blocking lane's width follows the work it carries, not
-    /// the epoch - so the bounds are derived from what the node has: the checkpoint's own reader
-    /// count for the lane that maps weights and installs packages, and the host's parallelism for
-    /// the lane that handles media. A lane whose bound is
-    /// narrower than the work in flight queues it; it never drops it.
-    pub(crate) fn blocking_limits(&self) -> Limits {
-        let available = std::thread::available_parallelism()
-            .map(|count| count.get())
-            .unwrap_or(4);
-        let shared = (available / 2).clamp(1, 8);
-        let lanes = BlockingKind::ALL.map(|kind| match kind {
-            BlockingKind::ModuleLoad => {
-                let workers = self
-                    .engine_config()
-                    .load
-                    .threads
-                    .map_or_else(|| shared.clamp(1, 8), |threads| threads.get() as usize);
-                LaneLimits {
-                    workers,
-                    capacity: workers.saturating_mul(2),
-                }
-            }
-            _ => LaneLimits {
-                workers: shared,
-                capacity: shared.saturating_mul(4),
-            },
-        });
-        Limits::new(lanes)
+    /// Its width follows the work it carries, not the epoch: the checkpoint's own reader count
+    /// when the build config states one, and half the host's parallelism within one to eight
+    /// otherwise. Work beyond the pool's capacity queues; it is never dropped.
+    pub(crate) fn module_pool(&self) -> Result<ThreadPool> {
+        let threads = self
+            .engine_config()
+            .load
+            .threads
+            .map_or_else(host_share, |threads| threads.get() as usize);
+        Ok(ThreadPool::new(
+            "module-load",
+            threads.saturating_mul(2),
+            threads,
+        )?)
+    }
+
+    /// The thread pool media host work runs on: half the host's parallelism within one to
+    /// eight, each thread with four tasks of room.
+    pub(crate) fn media_pool(&self) -> Result<ThreadPool> {
+        let threads = host_share();
+        Ok(ThreadPool::new(
+            "media",
+            threads.saturating_mul(4),
+            threads,
+        )?)
     }
 
     /// The Build Server's socket, which the rank's package client connects to.
     pub(crate) fn build_server(&self) -> &Path {
         Path::new(&self.launch.build_server)
-    }
-
-    /// This rank's ordinal inside its group.
-    pub(crate) fn rank(&self) -> u32 {
-        self.rank
-    }
-
-    /// This rank's devices, in the order the daemon named them.
-    pub(crate) fn devices(&self) -> &[DeviceId] {
-        &self.devices
-    }
-
-    /// The device's completion events: one pool per rank, shared by its workers.
-    pub(crate) fn events(&self) -> Arc<EventPool> {
-        EventPool::new()
     }
 
     /// How long a job may run without rank progress before it is reported `Stalled`: the
@@ -673,163 +687,32 @@ impl ModelRunner {
             .unwrap_or(self.engine_config().worker.watchdog_timeout)
     }
 
-    /// Whether this rank keeps a host KV cache: a text rank of a deployment with a host tier.
-    pub(crate) fn host_kv_cache(&self, loaded: &Loaded) -> bool {
-        matches!(loaded, Loaded::Text(_))
-            && self.engine_config().kv_cache.host_tier
-            && self.engine_config().kv_cache.prefix_caching
-    }
-
-    /// What this rank's scheduler starts with ([`scheduler::SchedulerHandle::over_batches`]):
-    /// the process's arguments `launch`, with the engine configuration as this process resolves it,
-    /// and the mechanism's limits for this rank ([`scheduler::SchedulerConfig::of`]).
+    /// The Build Server's targets this rank resolves a module for: the architecture-specific
+    /// instruction set of every device the rank serves, each once.
     ///
-    /// The model's control tokens and generation limits are the ones the leader resolved from the
-    /// checkpoint and launched this process with (`frontend::model::ModelConfig`), so the scheduler
-    /// stops on the same end-of-generation set the leader's decoder does. The configuration keeps
-    /// the host KV tier only where `host_kv_cache` says this scheduler keeps one.
+    /// # Errors
     ///
-    /// The limits are what this rank captured: a causal-language rank admits up to the largest
-    /// bucket of its catalog, whose sizes are the tiers a plan's batch must fit, and a media
-    /// rank admits the deployment's requests, one computation each, at the widest prompt capacity it
-    /// captures, with no tiers, since its buckets are not sized by tokens.
-    pub(crate) fn scheduler_args(
-        &self,
-        launch: &EngineArgs,
-        loaded: &Loaded,
-        host_kv_cache: bool,
-    ) -> Result<(EngineArgs, scheduler::SchedulerConfig)> {
-        let running = self.engine_config().max_running_requests.get();
-        let mut args = launch.clone();
-        // The scheduler plans its group as the one pool its batches go to (`Self::scheduled`):
-        // the ranks it places are this runner's, whatever the group's ranks on every host are.
-        args.world_size =
-            u32::try_from(self.world_size).context("a pool wider than the launch addresses")?;
-        let model = &mut args.engine_config.model;
-        let (max_batch, max_num_batched_tokens, graph_tiers) = match loaded {
-            Loaded::Text(_) => {
-                let (rows, tokens) = self.buckets.bounds();
-                let graph_tiers = self
-                    .buckets
-                    .iter()
-                    .map(|bucket| bucket.tokens)
-                    .collect::<std::collections::BTreeSet<u32>>()
-                    .into_iter()
-                    .collect();
-                (rows as usize, tokens as usize, graph_tiers)
-            }
-            Loaded::Video(_) => {
-                let tokens = prompt_capacity(&self.engine_config().video, model.max_model_len)?;
-                (running, tokens as usize, Vec::new())
-            }
-        };
-        if !host_kv_cache {
-            args.engine_config.kv_cache.host_tier = false;
-        }
-        let limits = scheduler::SchedulerConfig::of(
-            &args.engine_config,
-            max_batch,
-            max_num_batched_tokens,
-            graph_tiers,
-        );
-        Ok((args, limits))
-    }
-
-    /// The Build Server's targets this rank resolves a module for.
-    pub(crate) fn targets(&self) -> &[Target] {
-        &self.targets
-    }
-
-    /// Loads the rank's model and opens the resident owners it leaves room for.
-    ///
-    /// The memory is opened after the load because the capacity plan measures a device the weights
-    /// are already mapped on - what is left, not what was there before the load - so the caller
-    /// holds no knowledge of the order the two must be done in.
-    pub(crate) fn load_and_open(
-        &self,
-        weights: Weights<'_>,
-        storage: &mut dyn worker::memory::retained::ExclusiveStorage,
-        host_group: &worker::parallel::host::HostGroup,
-        experts: &ExpertOrder,
-    ) -> Result<(Loaded, Memory, ipc::MainProcessInfo, GraphStorage)> {
-        let loaded = self.load_model(weights, experts)?;
-        let (memory, info, graph) = self.open_memory(&loaded, storage, host_group)?;
-        Ok((loaded, memory, info, graph))
-    }
-
-    /// The model this rank's checkpoint holds, its weights reached through `weights` in the order
-    /// the model's load asks for them. An update walks the same code, so what this function reads
-    /// is exactly what a load of another checkpoint or another expert order would, and a meta load
-    /// answers the same weights' element types and extents without reading them.
-    pub(crate) fn load_model(&self, weights: Weights<'_>, experts: &ExpertOrder) -> Result<Loaded> {
-        let mapping = &self.mapping;
-        match self.family.model {
-            Model::Text(family) => {
-                // The checkpoint's own representation stands unless the deployment fixed another,
-                // which is the build config's `dtype` and `quantization`.
-                let opened = nn::Checkpoint::open(self.checkpoint())?;
-                let checkpoint = family.open(&opened)?;
-                let mut loader = weights.loader(&opened);
-                let placement = TextPlacement {
-                    tensor: Split {
-                        size: mapping.tensor_parallel,
-                        rank: mapping.tensor_rank,
-                    },
-                    experts: Split {
-                        size: mapping.expert_parallel,
-                        rank: mapping.expert_rank,
-                    },
-                    // The drafter's layers load when the deployment speculates with them.
-                    drafter: self.engine_config().speculative.num_draft_tokens > 0,
-                };
-                let model = checkpoint.load(&opened, &mut loader, &placement, experts)?;
-                Ok(Loaded::Text(model))
-            }
-            Model::Video(_) => {
-                // The deployment's own representation, which the daemon resolved against the
-                // checkpoint before it wrote this build config (`dtype = "auto"` never reaches a
-                // main process as `auto`).
-                let opened = self.open_video_checkpoint()?;
-                let checkpoint = self.open_video_family(&opened)?;
-                let mut loader = weights.loader(&opened);
-
-                // **The video pipeline's parallel shape is the deployment's, and the deployment
-                // file is where it is stated.** The build config carries the tensor-parallel width
-                // and no sequence degree; the page that placed this group states both beside the
-                // block they split.
-                let (sequence, tensor) = self.video_split(&*checkpoint)?;
-                let placement = VideoPlacement {
-                    stages: self.capability_groups().map(|groups| {
-                        groups
-                            .iter()
-                            .flat_map(|group| group.blocks.keys().cloned())
-                            .collect()
-                    }),
-                    sequence,
-                    tensor,
-                    dtype: self.dtype(),
-                    serving: self.video_serving()?,
-                };
-                let model = checkpoint.load(&opened, &mut loader, &placement)?;
-                Ok(Loaded::Video(model))
+    /// When a device does not state its architecture.
+    pub(crate) fn targets(&self) -> Result<Vec<Target>> {
+        let mut targets: Vec<Target> = Vec::with_capacity(self.devices.len());
+        for device in &self.devices {
+            let target = device
+                .compute_capability()
+                .map(Target::arch)
+                .with_context(|| format!("reading device {}'s architecture", device.0))?;
+            if !targets.contains(&target) {
+                targets.push(target);
             }
         }
+        Ok(targets)
     }
+}
 
-    /// The element type the deployment computes in, which the daemon resolved against the
-    /// checkpoint before it wrote this build config.
-    fn dtype(&self) -> DType {
-        ops::abi::from_wire(self.engine_config().model.dtype.into())
-    }
-
-    /// Batches this rank's schedulers keep in flight, which the capacity plan relays through (the
-    /// launch's `queue_depth`).
-    pub(crate) fn queue_depth(&self) -> usize {
-        self.launch.queue_depth as usize
-    }
-
-    /// The ranks of this process's group; one process holds one pool, so it is the deployment's.
-    pub(crate) fn world_size(&self) -> usize {
-        self.world_size
-    }
+/// The threads a pool of host work takes when nothing states its width: half the host's
+/// parallelism, within one to eight.
+fn host_share() -> usize {
+    let available = std::thread::available_parallelism()
+        .map(|count| count.get())
+        .unwrap_or(4);
+    (available / 2).clamp(1, 8)
 }

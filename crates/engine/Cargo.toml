@@ -19,6 +19,8 @@ path = "src/main.rs"
 
 [dependencies]
 anyhow.workspace = true
+# The collective group a rank's runner issues its tensor group's collectives through.
+backend.workspace = true
 clap.workspace = true
 crossbeam-channel.workspace = true
 ipc.workspace = true
@@ -50,6 +52,8 @@ worker.workspace = true
 [dev-dependencies]
 # A test states the serving a family it resolves names.
 processing.workspace = true
+# A rank's start opens its session with a Storage Server the test runs in its own process.
+storage-server.workspace = true
 # The engine policy modules are compiled for: a scheduler's tests load the packaged policies and
 # their own toy modules with it.
 scheduling.workspace = true

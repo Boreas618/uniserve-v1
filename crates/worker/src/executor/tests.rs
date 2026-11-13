@@ -1533,13 +1533,24 @@ fn a_group_s_ranks_on_another_host_take_its_jobs_and_state_what_they_ended() {
             let (ranks, _, _) = group(ranks(1, &log), Vec::new());
             let waker = ipc::Waker::new().unwrap();
             let liveness = Liveness::new(waker.wake(), Duration::from_secs(3600));
-            let upstream = Upstream::serve(
-                channel,
-                Arc::new(ranks),
-                ipc::MainProcessInfo::default(),
-                liveness,
-            )
-            .unwrap();
+            // The group's capacity, which this test's scheduler node never asks for.
+            let capacity = ipc::Capacity {
+                phases: 0,
+                slots: 1,
+                kv_cache: None,
+                cache_groups: Vec::new(),
+                seeds: Vec::new(),
+                buckets: Vec::new(),
+                rows: [0; Phase::COUNT],
+                max_model_len: 0,
+                denoise_steps: 0,
+                bos_token_id: 0,
+                eos_token_ids: Vec::new(),
+                feature_bytes: 0,
+                media_bytes: Vec::new(),
+                call_window: 1,
+            };
+            let upstream = Upstream::serve(channel, Arc::new(ranks), capacity, liveness).unwrap();
 
             let _ = released.recv();
             upstream.close();

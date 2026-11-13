@@ -76,6 +76,8 @@ macro_rules! ensure_valid {
 
 /// The batch the scheduler hands to its executor, and what it produces.
 pub mod batch;
+/// What a worker group's executors serve, as they state it once they are ready.
+pub mod capacity;
 pub mod channel;
 /// Failures at the channel boundary.
 pub mod error;
@@ -89,6 +91,7 @@ pub mod memory;
 /// Counter-based random draws of the rank's token sampler.
 pub mod philox;
 
+pub use capacity::Capacity;
 pub use channel::{Channel, Listener, Wake, Waker};
 pub use error::{EncodingError, IpcError, IpcResult, TransportError};
 pub use frame::Frame;

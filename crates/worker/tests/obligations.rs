@@ -1161,10 +1161,27 @@ impl Group {
         let held = Sequences::new(GROUP, 1, Vec::new());
         let (far, far_ends) = executor(PEER, 0, &held, &watch);
         let ranks = Executors::new(vec![held], vec![far], Vec::new()).unwrap();
+        // The group's capacity, which the scheduler node never asks for here.
+        let capacity = ipc::Capacity {
+            phases: 0,
+            slots: 1,
+            kv_cache: None,
+            cache_groups: Vec::new(),
+            seeds: Vec::new(),
+            buckets: Vec::new(),
+            rows: [0; ipc::batch::Phase::COUNT],
+            max_model_len: 0,
+            denoise_steps: 0,
+            bos_token_id: 0,
+            eos_token_ids: Vec::new(),
+            feature_bytes: 0,
+            media_bytes: Vec::new(),
+            call_window: 1,
+        };
         let upstream = Upstream::serve(
             dialling.join().unwrap(),
             Arc::new(ranks),
-            ipc::MainProcessInfo::default(),
+            capacity,
             Arc::clone(&peers.liveness),
         )
         .unwrap();

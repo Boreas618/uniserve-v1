@@ -50,7 +50,8 @@ impl RequestKind {}
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum MainProcessRequest {
-    /// Queries worker identity and capabilities.
+    /// Asks for the capacity of the worker group of the process's first rank. Responds with
+    /// [`MainProcessResponse::Info`].
     Info {
         /// Optional request-response correlation identity.
         message_id: Option<u64>,
@@ -309,12 +310,13 @@ pub struct Stall {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum MainProcessResponse {
-    /// Returns worker identity and capabilities.
+    /// States what the process's ranks of a worker group serve: the capacity its first rank
+    /// stated once its executors were ready, which the scheduler node plans the group against.
     Info {
         /// Optional request-response correlation identity.
         message_id: Option<u64>,
-        /// Loaded worker capabilities.
-        info: MainProcessInfo,
+        /// The group's capacity.
+        capacity: crate::Capacity,
     },
     /// Responds to a job of a worker group: a batch, a shadow batch, a
     /// completion mapped, requests stamped.
@@ -393,11 +395,11 @@ impl MainProcessResponse {
         }
     }
 
-    /// Constructs a worker-capability response.
-    pub fn info(info: MainProcessInfo) -> Self {
+    /// Constructs the response that states a group's capacity.
+    pub fn info(capacity: crate::Capacity) -> Self {
         Self::Info {
             message_id: None,
-            info,
+            capacity,
         }
     }
 

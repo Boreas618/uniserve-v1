@@ -18,7 +18,24 @@ pub mod executor;
     reason = "the process, the one caller of the module installation, is not declared in the crate"
 )]
 mod modules;
+/// The parts of the main process that start its ranks and record their kernels; the process's
+/// control thread and its start are not declared in the crate yet.
+mod process {
+    #[expect(
+        dead_code,
+        reason = "the main process's start, the caller of the served rank start, is not declared                   in the crate"
+    )]
+    pub(crate) mod ranks;
+    pub(crate) mod record;
+}
+#[expect(
+    dead_code,
+    reason = "the main process's start and the media rank, the callers of the rank's accessors               and of its parallel shape, are not declared in the crate"
+)]
+mod rank;
 pub mod scheduler;
+pub mod storage_client;
 
 pub use catalogue::resolve;
+pub use process::record::{Recorded, record};
 pub use scheduler::Error;

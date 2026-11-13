@@ -1010,6 +1010,7 @@ mod tests {
             media_bytes: Vec::new(),
             call_window: window,
             cache_groups: Vec::new(),
+            seeds: Vec::new(),
         };
         let layout = runtime::Group {
             id: GroupId(id),

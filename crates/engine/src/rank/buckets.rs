@@ -1,58 +1,10 @@
-//! The buckets a rank captures and the phases they serve, in the numbering the scheduler plans
-//! with.
+//! The buckets a rank captures and the phases they serve, as the scheduler names them in a
+//! batch.
 
-use ipc::PhaseId;
 use ipc::batch::Phase;
-use ipc::execution::Variant;
-use worker::plan::Buckets;
+use ipc::capacity::variants;
+use worker::buckets::Buckets;
 
-/// The buckets of a member of an expert union: each causal bucket, and the join, captured for the
-/// step sizes it meets.
-///
-/// A union's ranks agree a step's rows per rank before they launch, and the expert work of a graph
-/// is shaped for the rows it holds. Every rank decoding agrees at most the largest decode bucket's
-/// rows, which the smallest graph holds; a decode beside a peer's prefill of a few prompts takes a
-/// middle one, and a step a peer fills with a large prefill takes the graph of the whole capacity.
-/// One graph for every step would shape each decode's expert work for the largest prefill any rank
-/// could send.
-pub(super) fn expert_classes(buckets: &Buckets, capacity: u64) -> Buckets {
-    let capacity = u32::try_from(capacity).unwrap_or(u32::MAX);
-    let decode = buckets
-        .iter()
-        .filter(|bucket| bucket.variant.is_decode())
-        .map(|bucket| bucket.rows)
-        .max()
-        .unwrap_or(1);
-    Buckets::new(
-        buckets
-            .iter()
-            .copied()
-            .chain(std::iter::once(worker::plan::Bucket::expert_join()))
-            .flat_map(|bucket| {
-                // A step this graph would serve is within a quarter of the whole capacity, where the
-                // smaller shape saves little and the capture still costs its warmup's time.
-                let small = bucket.tokens.max(decode).min(capacity);
-                let mut classes = vec![bucket.at_capacity(capacity)];
-                if small.saturating_mul(4) <= capacity {
-                    classes.push(bucket.at_capacity(small));
-                }
-                // A decode beside a peer's prefill of a few prompts: the step is that prefill's
-                // rows, which a graph of the whole capacity would shape every expert layer for.
-                let beside = bucket.variant.is_decode()
-                    || bucket.variant == ipc::execution::Variant::ExpertJoin;
-                if beside && small < PREFILL_BESIDE && PREFILL_BESIDE.saturating_mul(4) <= capacity
-                {
-                    classes.push(bucket.at_capacity(PREFILL_BESIDE));
-                }
-                classes.into_iter()
-            }),
-    )
-}
-
-/// The rows per rank of a step in which a peer prefills a few prompts while this rank decodes.
-const PREFILL_BESIDE: u32 = 1024;
-
-/// One epoch's build config, resolved against the node the main process runs on.
 /// The catalogue of prefill buckets a rank captures, and where its bound came from.
 ///
 /// The bound is the largest token count any captured bucket holds, which is also the ceiling a
@@ -73,16 +25,16 @@ pub(crate) struct PrefillBound {
 ///
 /// The two bounds are not the same kind of thing, and this is where that is decided:
 ///
-/// - **The token bound is a contract a policy is checked against.** `ceilings_of` gives the
-///   scheduler's policy `max_num_batched_tokens` from the catalogue's captured token bound
-///   (`crates/scheduler/src/scheduler/policy.rs`), and a policy that declares more is refused by the
-///   mechanism. A token tier capture drops therefore changes what a deployment's policy may
+/// - **The token bound is a limit a policy is checked against.** The scheduler holds its
+///   policy's `max_num_batched_tokens` to the largest token count its groups' buckets hold
+///   (`crate::scheduler::policy::ceilings`, from `Capacity::buckets`), and a policy that declares
+///   more is refused. A token tier capture drops therefore changes what a deployment's policy may
 ///   declare, and the deployment would find that out at its precopy - after weights, from a
 ///   sentence about two numbers its own file does not contain. It is refused here instead.
 /// - **The row bound only sizes a batch.** A decode tier above the request bound changes no
-///   policy's declaration: `Scheduler::new` lowers the limit, names both figures and keeps serving
-///   (`crates/scheduler/src/scheduler/run.rs`), which is what a deployment whose limits move in place
-///   relies on - its tiers outlive one setting of the bound. It refuses nothing.
+///   policy's declaration: the scheduler forms batches of at most the group's slots
+///   (`Capacity::holds`), whatever its buckets hold, which is what a deployment whose limits move
+///   in place relies on - its tiers outlive one setting of the bound. It refuses nothing.
 ///
 /// A zero states no size at all and is dropped, as it always was.
 pub(super) fn tier_refusal(
@@ -105,106 +57,25 @@ pub(super) fn tier_refusal(
     ))
 }
 
-/// The phases this node's runner serves, in the numbering the scheduler plans with: one id per phase
-/// kind this rank's own buckets are launched as.
+/// The phases a runner over `buckets` serves: every phase a batch of which may be launched as
+/// the variant of one of the buckets (`ipc::capacity::variants`, the scheduler's own rule), in
+/// the order of [`Phase::ALL`].
 ///
-/// The kinds come from the buckets - what this rank's model runner can launch - and the ids from
-/// `scheduler::phase_id`, the table the scheduler's `Plan` numbers a request's work with. Never from a
-/// literal: a model runner that stated `PhaseId(0)` for its device (text encoding) served no phase the
-/// scheduler ever planned, and the worker refused the deployment's first completion with `no
-/// device of this rank serves phase PhaseId(3)`.
-/// The phases the artifact's three host calls are planned as.
-///
-/// They serve no graph, so no bucket states them: the mechanism plans each call by its phase, and a
-/// device that did not state these three would refuse the first encode of every request.
-/// The one host call every rank serves: the encode of the units it decoded.
-pub(super) fn unit_phases() -> Vec<PhaseId> {
-    vec![phase(Phase::VideoEncode)]
-}
-
-/// The phase id `kind` is planned as.
-///
-/// # Panics
-///
-/// For `Phase::Other`, the policy-side placeholder numbered `u32::MAX`, which no rank plans.
-#[expect(
-    clippy::expect_used,
-    reason = "every kind a rank plans is numbered below 21; only the policy-side placeholder \
-              `Phase::Other` is numbered past `u16`, and no rank plans it"
-)]
-pub(super) fn phase(kind: Phase) -> PhaseId {
-    PhaseId(u16::try_from(scheduler::phase_id(kind).0).expect("a phase id fits"))
-}
-
-pub(super) fn host_phases() -> Vec<PhaseId> {
-    [
-        Phase::VideoEncode,
-        Phase::AudioEncode,
-        Phase::Mux,
-        Phase::MediaRead,
-        Phase::VisionEncode,
-        Phase::LatentEncode,
-    ]
-    .into_iter()
-    .map(phase)
-    .collect()
-}
-
-pub(super) fn served_phases(buckets: &Buckets, verifies: bool) -> Vec<PhaseId> {
-    let mut kinds: Vec<Phase> = buckets
-        .iter()
-        .filter_map(|bucket| {
-            Some(match bucket.variant {
-                Variant::PrefillWrite
-                | Variant::PrefillOutput
-                | Variant::PrefillGreedy
-                | Variant::PrefillScored => Phase::Prefill,
-                Variant::DecodeGreedy | Variant::DecodeSampled => Phase::Decode,
-                Variant::Encode => Phase::TextEncode,
-                Variant::Denoise => Phase::Denoise,
-                // The scheduler plans a clip's decode as `VideoDecode` and a track's as
-                // `AudioDecode` (`call_phase`), so a device that advertised `ImageDecode` for
-                // either served no phase the scheduler ever planned - the same defect this
-                // function's doc records.
-                Variant::Decode => Phase::VideoDecode,
-                Variant::AudioDecode => Phase::AudioDecode,
-                // The artifact's three host calls are calls the mechanism submits and waits on, so
-                // the device states the phases they run in even though no graph serves them.
-                Variant::VideoEncode => Phase::VideoEncode,
-                Variant::AudioEncode => Phase::AudioEncode,
-                Variant::Mux => Phase::Mux,
-                Variant::LatentPrepare => Phase::LatentPrepare,
-                Variant::MediaRead => Phase::MediaRead,
-                // The two encoders whose work a later call computes are answered as they arrive,
-                // under the phase of either: a bucket of this variant names no one of them.
-                Variant::ConditionEncode => Phase::VisionEncode,
-                // A join is no phase a scheduler plans: a peer opens the step, and the union wakes
-                // this rank for it.
-                Variant::ExpertJoin => Phase::Decode,
-                // A step of a diffusion language model over a block of tokens is no phase.
-                Variant::TokenDenoise => return None,
-            })
-        })
-        .collect();
-    // A refill chunk is a prefill-class chunk of a decoding request and runs wherever a prefill
-    // chunk does, so the device that serves prefill states it as well: the scheduler may name a
-    // refill and the batch then routes here.
-    if kinds.contains(&Phase::Prefill) {
-        kinds.push(Phase::Refill);
-    }
-    // A speculating device's decoding requests verify: their calls run in the verification phase,
-    // which an eager step serves and no bucket names.
-    if verifies && kinds.contains(&Phase::Decode) {
-        kinds.push(Phase::Verify);
-    }
-    kinds.sort_by_key(|kind| scheduler::phase_id(*kind).0);
-    kinds.dedup();
-    kinds
+/// The rule is read from the scheduler's side so the two cannot disagree: a prefill bucket
+/// serves `Prefill` and `Refill` (a refill chunk is a prefill-class chunk of a decoding request),
+/// a decode bucket `Decode`, a verification bucket `Verify` (a speculating deployment's decode
+/// steps are verifications, [`Buckets::with_drafts`]), and a host bucket the host phase of its
+/// variant. The drafter's bucket and an expert join serve no phase: the executor issues the first
+/// behind the batch it follows, and a union member's join batch states the phase of the member
+/// that asks for it.
+pub(super) fn served_phases(buckets: &Buckets) -> Vec<Phase> {
+    Phase::ALL
         .into_iter()
-        // The scheduler numbers a phase with the epoch's `u32` and the worker names one with the
-        // wire's `u16`: the plan is where the two meet, and a kind that did not fit would be a table
-        // this process cannot state rather than a phase to serve quietly.
-        .map(phase)
+        .filter(|phase| {
+            buckets
+                .iter()
+                .any(|bucket| variants(*phase).contains(&bucket.variant))
+        })
         .collect()
 }
 
@@ -212,29 +83,27 @@ pub(super) fn served_phases(buckets: &Buckets, verifies: bool) -> Vec<PhaseId> {
 mod tests {
     use super::*;
 
-    /// A rank serves the phases its buckets are launched as, in the scheduler's numbering, and no
-    /// phase it does not run.
+    /// A rank serves the phases its buckets are launched as, and no phase it does not run.
     #[test]
     fn a_model_runner_serves_the_phases_its_buckets_are_planned_as() {
         let buckets = Buckets::causal_lm(&[8], &[64], true);
-        let phases = served_phases(&buckets, false);
-        let id =
-            |kind| PhaseId(u16::try_from(scheduler::phase_id(kind).0).expect("a phase id fits"));
-        assert!(
-            phases.contains(&id(Phase::Prefill)),
-            "a prefill batch routes to this node's device: {phases:?}"
+
+        assert_eq!(
+            served_phases(&buckets),
+            vec![Phase::Prefill, Phase::Decode, Phase::Refill],
+            "a prefill and a decode batch route to the rank, and a refill chunk runs as a prefill"
         );
-        assert!(
-            phases.contains(&id(Phase::Decode)),
-            "a decode batch routes to this node's device: {phases:?}"
-        );
-        assert!(
-            !phases.contains(&id(Phase::TextEncode)),
-            "this node encodes no request itself: {phases:?}"
-        );
-        assert!(
-            !phases.contains(&id(Phase::Denoise)),
-            "a batch this plan has no bucket for is not served: {phases:?}"
+    }
+
+    /// A speculating rank's decode steps are verifications: it serves `Verify` and no `Decode`,
+    /// and the drafter's buckets, which no batch states, serve no phase.
+    #[test]
+    fn a_speculating_rank_verifies_and_its_drafter_serves_no_phase() {
+        let buckets = Buckets::causal_lm(&[8], &[64], true).with_drafts(3);
+
+        assert_eq!(
+            served_phases(&buckets),
+            vec![Phase::Prefill, Phase::Verify, Phase::Refill]
         );
     }
 

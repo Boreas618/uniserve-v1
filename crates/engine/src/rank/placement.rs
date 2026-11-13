@@ -3,8 +3,9 @@
 use std::path::PathBuf;
 
 use anyhow::{Context as _, Result, bail};
-use nn::family::{Model, Projection, SequenceSplit, Split, VideoCheckpoint};
-use proto::config::EngineArgs;
+use nn::Split;
+use nn::family::{Model, Projection, SequenceSplit, VideoCheckpoint};
+use proto::config::{EngineArgs, WorkerGroupConfig};
 
 use super::{ModelRunner, ParallelShape};
 
@@ -32,7 +33,7 @@ impl ModelRunner {
     }
 
     /// This rank's video checkpoint, opened over its roots: the checkpoint the launch names and the
-    /// base release it continues, with the deployment's adapter fused into the component the
+    /// base release it continues, with the deployment's adapter fused into the block the
     /// family says it edits.
     pub(super) fn open_video_checkpoint(&self) -> Result<nn::Checkpoint> {
         let model = &self.engine_config().model;
@@ -68,7 +69,7 @@ impl ModelRunner {
     }
 
     /// The denoiser's sequence split and the text encoder's tensor split of this rank, as the
-    /// deployment page states them for `checkpoint`'s components.
+    /// deployment page states them for `checkpoint`'s blocks.
     pub(super) fn video_split(
         &self,
         checkpoint: &dyn VideoCheckpoint,
@@ -93,7 +94,7 @@ impl ModelRunner {
     /// The command-line shorthand places the whole model on every group, and a deployment file may
     /// as well. Such a deployment states no block to split, so it states no sequence degree and
     /// chooses no network of a checkpoint that holds two.
-    pub(super) fn capability_groups(&self) -> Option<&[scheduler::WorkerGroupConfig]> {
+    pub(super) fn capability_groups(&self) -> Option<&[WorkerGroupConfig]> {
         let groups = &self.engine_config().parallel.worker_groups;
         groups
             .iter()
@@ -157,16 +158,16 @@ impl Mapping {
 /// **The page is the one statement of the parallel shape, and this reads it rather than a second
 /// copy.** A main process knows its own devices and its rank number, and the build config states the
 /// tensor-parallel width; the sequence degree and the head projection are the deployment file's,
-/// written beside the component they split. So the group is found by the name the launch states, its
-/// one sequence-split component is read, and the rank's position inside that component is its
+/// written beside the block they split. So the group is found by the name the launch states, its
+/// one sequence-split block is read, and the rank's position inside that block is its
 /// sequence rank.
 ///
-/// It refuses what would otherwise be assumed: a group with two sequence-split components is not one
+/// It refuses what would otherwise be assumed: a group with two sequence-split blocks is not one
 /// partition, a projection this stack does not implement is refused rather than served at degree
 /// one, and a mode that is not Ulysses is refused by name because the denoiser's sequence exchange
 /// is Ulysses' alone.
 pub(super) fn video_split(
-    groups: Option<&[scheduler::WorkerGroupConfig]>,
+    groups: Option<&[WorkerGroupConfig]>,
     group: &str,
     rank: u32,
     tensor: Split,
@@ -201,15 +202,15 @@ pub(super) fn video_split(
     // epoch's bookkeeping name, while the page names the groups it places (`model`, `text`, `flow`).
     // A rank that looked itself up by the name it was launched under found neither and refused - so
     // the name is preferred when the page has it, and otherwise the page is asked the question it can
-    // answer: **which group places this class's component?** A media rank serves the denoiser, and a
+    // answer: **which group places this class's block?** A media rank serves the denoiser, and a
     // group that places no transformer is another engine's.
     let named = groups.iter().find(|candidate| candidate.id.0 == group);
-    let denoisers: Vec<&scheduler::WorkerGroupConfig> = groups
+    let denoisers: Vec<&WorkerGroupConfig> = groups
         .iter()
         .filter(|candidate| {
             denoisers
                 .iter()
-                .any(|component| candidate.blocks.contains_key(*component))
+                .any(|block| candidate.blocks.contains_key(*block))
         })
         .collect();
     // Both sides as a pair in either refusal: the launch's name is the daemon's roster label and the
@@ -242,7 +243,7 @@ pub(super) fn video_split(
         }
     };
     // The page states the text encoder's degree beside it, so the group's width is the page's and
-    // the rank's place in it is the rank's place in the component.
+    // the rank's place in it is the rank's place in the block.
     let (tensor_parallel, tensor_rank) = match placed.blocks.get(text_encoder) {
         Some(text) if text.tensor_parallel_size > 1 => {
             let position = if text.ranks.is_empty() {
@@ -262,13 +263,13 @@ pub(super) fn video_split(
         }
         _ => (tensor_parallel, tensor_rank),
     };
-    let mut splits = placed.blocks.iter().filter(|(_, component)| {
+    let mut splits = placed.blocks.iter().filter(|(_, block)| {
         !matches!(
-            component.sequence_parallel,
+            block.sequence_parallel,
             proto::config::SequenceParallel::Local
         )
     });
-    let (_, component) = match (splits.next(), splits.next()) {
+    let (_, block) = match (splits.next(), splits.next()) {
         // No split: the sequence is this rank's own, and the tensor degree is the whole shape.
         (None, _) => {
             return Ok((
@@ -281,29 +282,29 @@ pub(super) fn video_split(
         }
         (Some(one), None) => one,
         (Some(first), Some(second)) => bail!(
-            "worker group {group:?} states a sequence split on two components ({:?} and {:?}) and \
+            "worker group {group:?} states a sequence split on two blocks ({:?} and {:?}) and \
              one partition describes one split",
             first.0,
             second.0
         ),
     };
-    // A component that states no member list holds every rank of its replica, so a rank's position
+    // A block that states no member list holds every rank of its replica, so a rank's position
     // in it is the rank's own ordinal.
-    let sequence_rank = if component.ranks.is_empty() {
+    let sequence_rank = if block.ranks.is_empty() {
         rank
     } else {
-        component
+        block
             .ranks
             .iter()
             .position(|member| *member == rank)
             .with_context(|| {
                 format!(
-                    "this rank is {rank} and the group's sequence-split component holds ranks {:?}",
-                    component.ranks
+                    "this rank is {rank} and the group's sequence-split block holds ranks {:?}",
+                    block.ranks
                 )
             })?
     };
-    let sequence = match &component.sequence_parallel {
+    let sequence = match &block.sequence_parallel {
         proto::config::SequenceParallel::Ulysses {
             ulysses_degree,
             projection,
@@ -330,7 +331,7 @@ mod tests {
     /// [`video_split`] for a checkpoint whose networks are `transformer` and `transformer_ref` and
     /// whose text encoder is `text_encoder`, as a deployment file names them.
     fn split(
-        groups: Option<&[scheduler::WorkerGroupConfig]>,
+        groups: Option<&[WorkerGroupConfig]>,
         group: &str,
         rank: u32,
         tensor_parallel: u32,
@@ -352,14 +353,14 @@ mod tests {
     }
 
     /// A deployment page as written, parsed and placed on this host.
-    fn page(toml: &str) -> Vec<scheduler::WorkerGroupConfig> {
+    fn page(toml: &str) -> Vec<WorkerGroupConfig> {
         proto::config::WorkerGroupConfig::parse_file(toml, "localhost").expect("the page places")
     }
 
-    /// A deployment page holding one group named `model`, with the components it names.
-    fn groups(components: &str) -> Vec<scheduler::WorkerGroupConfig> {
+    /// A deployment page holding one group named `model`, with the blocks it names.
+    fn groups(blocks: &str) -> Vec<WorkerGroupConfig> {
         page(&format!(
-            "[[worker_groups]]\nid = \"model\"\nranks = [\"cuda:0-3\"]\nqueue_depth = 2\n{components}"
+            "[[worker_groups]]\nid = \"model\"\nranks = [\"cuda:0-3\"]\nqueue_depth = 2\n{blocks}"
         ))
     }
 
@@ -428,7 +429,7 @@ mod tests {
         );
         assert_eq!(
             sequence.split.rank, 2,
-            "a component of every rank places the rank at its ordinal"
+            "a block of every rank places the rank at its ordinal"
         );
     }
 
@@ -451,7 +452,7 @@ mod tests {
     }
 
     /// A page that states no split serves one rank's sequence, which is not a refusal. The group is
-    /// one rank: a component without a split on several ranks would be several whole denoisers, and
+    /// one rank: a block without a split on several ranks would be several whole denoisers, and
     /// the page's own validation refuses that.
     #[test]
     fn a_group_with_no_sequence_split_serves_one_rank() {
@@ -463,7 +464,7 @@ mod tests {
         assert_eq!(sequence.split, Split::WHOLE);
     }
 
-    /// A page with two sequence-split components is refused by name: a partition describes one split,
+    /// A page with two sequence-split blocks is refused by name: a partition describes one split,
     /// and serving the second at degree one would hold whole copies of it on every member. Both
     /// projections are served, so neither is a refusal.
     #[test]
@@ -489,7 +490,7 @@ mod tests {
         assert!(
             format!("{error:#}").contains("transformer")
                 && format!("{error:#}").contains("text_encoder"),
-            "the refusal names both components: {error:#}"
+            "the refusal names both blocks: {error:#}"
         );
     }
 }

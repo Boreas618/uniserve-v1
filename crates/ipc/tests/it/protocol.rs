@@ -184,12 +184,7 @@ fn main_process_info_round_trips() {
         }],
         ..Default::default()
     };
-    let response = MainProcessResponse::info(info.clone());
-    let decoded = round_trip(&response);
-    let MainProcessResponse::Info { info: decoded, .. } = decoded else {
-        panic!("decoded response must preserve its info variant");
-    };
-    assert_eq!(decoded, info);
+    assert_eq!(round_trip(&info), info);
 }
 
 /// A stage's distribution is omitted from its encoding when absent, so
@@ -253,12 +248,55 @@ fn cache_free_main_process_info_round_trips() {
         prefix_cache: None,
         ..MainProcessInfo::default()
     };
-    let response = MainProcessResponse::info(info.clone());
-    let decoded = round_trip(&response);
-    let MainProcessResponse::Info { info: decoded, .. } = decoded else {
-        panic!("decoded response must preserve its info variant");
+    assert_eq!(round_trip(&info), info);
+}
+
+/// A token group's capacity: prefill and decode on eight slots, over a full-attention and a
+/// sliding-window cache group.
+fn group_capacity() -> Capacity {
+    use ipc::batch::{Phase, Shape, Variant};
+
+    let mut rows = [0; Phase::COUNT];
+    rows[Phase::Prefill.index()] = 8;
+    rows[Phase::Decode.index()] = 8;
+    Capacity {
+        phases: (1 << Phase::Prefill.index()) | (1 << Phase::Decode.index()),
+        slots: 8,
+        kv_cache: Some(proto::config::KvCacheConfig::default()),
+        cache_groups: vec![
+            (CacheGroupKind::Full, 64),
+            (CacheGroupKind::SlidingWindow { window: 128 }, 64),
+        ],
+        seeds: vec![storage::Key([1; 32]), storage::Key([2; 32])],
+        buckets: vec![
+            Shape::decode(8, Variant::DecodeGreedy),
+            Shape::prefill(8, 512, Variant::PrefillOutput),
+        ],
+        rows,
+        max_model_len: 4096,
+        denoise_steps: 0,
+        bos_token_id: 1,
+        eos_token_ids: vec![2, 3],
+        feature_bytes: 0,
+        media_bytes: Vec::new(),
+        call_window: 2,
+    }
+}
+
+/// A group's capacity reaches the scheduler node as the peer's first rank stated it, its
+/// phases, buckets, rows and cache groups included.
+#[test]
+fn a_group_s_capacity_round_trips_through_the_info_response() {
+    let capacity = group_capacity();
+
+    let decoded = round_trip(&MainProcessResponse::info(capacity.clone()));
+    let MainProcessResponse::Info {
+        capacity: decoded, ..
+    } = decoded
+    else {
+        panic!("the decoded response is no info response: {decoded:?}");
     };
-    assert_eq!(decoded, info);
+    assert_eq!(decoded, capacity);
 }
 
 #[test]
@@ -481,12 +519,8 @@ fn request_fixtures() -> Vec<MainProcessRequest> {
 fn response_fixtures() -> Vec<MainProcessResponse> {
     vec![
         MainProcessResponse::Info {
-            message_id: None,
-            info: MainProcessInfo::default(),
-        },
-        MainProcessResponse::Info {
             message_id: Some(17),
-            info: full_caps(),
+            capacity: group_capacity(),
         },
         MainProcessResponse::Result {
             message_id: Some(17),

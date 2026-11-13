@@ -1,177 +1,183 @@
-//! The runner of a text rank: one causal language model over its paged cache.
+//! The runner of a text rank: one causal language model over the rank's cache and recurrent state
+//! (`specs/engine-worker-port.md` §1.1, steps 7 and 21-22).
+//!
+//! A rank builds its runner twice from the same config. First over owners that hold no device
+//! (`KvCacheMemory::meta`, `StateMemory::meta`) and graphs that hold none (`Graphs::meta`): its
+//! profile run states the region, shadow region and input bytes the division sizes the rank's pools
+//! by, and every kernel the rank launches. Then over the device's owners, in the region of the
+//! graph pool the division mapped, as the runner the rank's executor serves with. Both runners
+//! are wired alike: the cache issues each batch's page work through the hook of
+//! `worker::runners::causal_lm::wiring::page_work`, the tensor group's split is set on the graphs,
+//! and a member of an expert union joins it before its buckets are profiled.
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
-use anyhow::{Context as _, Result, bail};
-use ipc::execution::Variant;
+use anyhow::{Context as _, Result};
+use nn::family::TextModel;
 use ops::Generation;
-use platform::DeviceId;
-use worker::memory::Memory;
-use worker::runner::{Binding, NamedRunner, RunnerId};
-use worker::runners::causal_lm::{CausalLmRunner, KvProvider, Shared};
-use worker::runners::resident::ResidentCache;
+use platform::Stream;
+use worker::graphs::Graphs;
+use worker::memory::cache::{CacheLayout, KvCacheMemory};
+use worker::memory::state::StateMemory;
+use worker::runners::causal_lm::experts::Member;
+use worker::runners::causal_lm::speculation::DraftPool;
+use worker::runners::causal_lm::wiring::page_work;
+use worker::runners::causal_lm::{CausalLmConfig, CausalLmRunner};
 
+use super::ModelRunner;
 use super::buckets::served_phases;
-use super::{Loaded, ModelRunner, RankGroups};
+use super::memory::PAGE_TOKENS;
+
+/// The kernels a rank's runner and owners launch, as `(operator, key)`: what the engine resolves
+/// the rank's serving generation for.
+pub(crate) type Keys = std::collections::BTreeSet<(&'static str, String)>;
 
 impl ModelRunner {
-    /// The runners `device` serves: one per block of the loaded model.
+    /// The config of the rank's runner of `model` over a cache of `layout` with `units` units
+    /// (step 7): the phases its buckets serve, the deployment's request slots, pages and longest
+    /// sequence, the candidates a scored row reports, the scratch pages of a paired forward, and a
+    /// speculating deployment's drafts and draft pool.
     ///
-    /// The model's class was resolved once, when it was loaded and its resident memory opened
-    /// ([`ModelRunner::load_and_open`]), so this builds the runner that class needs from the model it
-    /// is handed. Everything downstream - the buckets, the arena, the sampler, the graphs - is
-    /// written against `nn`'s capability traits.
+    /// A paired forward's row addresses the pages of the largest prefill bucket's tokens; a model
+    /// that keeps a recurrent state has no scratch state to advance and computes no paired
+    /// forward.
     ///
-    /// A media rank also maps the host latent pool its denoiser writes preempted trajectories to,
-    /// at its Storage Server through `client`, keyed by `identity`, the weights it loaded; `report`
-    /// is the report that states the pool for the worker group, given to the rank that states it. A
-    /// recorded start has no Storage Server (`client` is `None`) and maps no host pool: a host page
-    /// is read and written by a request's copies, which no recorded walk makes.
+    /// # Errors
+    ///
+    /// More request slots than the protocol addresses, or a speculating deployment whose cache
+    /// keeps no draft group.
+    pub(crate) fn causal_config(
+        &self,
+        model: &dyn TextModel,
+        layout: &CacheLayout,
+        units: u32,
+    ) -> Result<CausalLmConfig> {
+        let drafts = self.engine_config().speculative.num_draft_tokens;
+        let (_, tokens) = self.buckets.bounds();
+        let scratch_pages = if model.state_layers().is_empty() {
+            tokens.div_ceil(PAGE_TOKENS)
+        } else {
+            0
+        };
+        let draft_pool = if drafts > 0 {
+            Some(DraftPool::of(layout, units)?)
+        } else {
+            None
+        };
+
+        Ok(CausalLmConfig {
+            phases: served_phases(&self.buckets),
+            buckets: self.buckets.clone(),
+            slots: self.slots()?,
+            page_size: PAGE_TOKENS,
+            max_kv_len: self.engine_config().model.max_model_len,
+            candidates: self.engine_config().max_logprobs,
+            scratch_pages,
+            drafts,
+            draft_pool,
+        })
+    }
+
+    /// The runner of `model` under `config`, over the rank's `cache` and `state` and computing
+    /// in `graphs`, which replay on `stream` (`None` for graphs that hold no device), profiled
+    /// (steps 7 and 22).
+    ///
+    /// The runner issues its page work through the cache, its forwards split over the tensor
+    /// group `group` at this rank's place, and `member` makes it the rank's member of the node's
+    /// expert union: on a device its transport is created first, with `kernels`, on the stream
+    /// the runner's executor issues on.
+    ///
+    /// # Errors
+    ///
+    /// What the runner, the graphs, the union or a forward of the profile run refuse.
     #[expect(
         clippy::too_many_arguments,
-        reason = "the device, the model and its memory, the generation, the lanes, the groups, and the host latent pool's storage"
+        reason = "the runner is joined to six owners: the model, its graphs and stream, the cache, \
+                  the state, the tensor group and the expert union"
     )]
-    pub(crate) fn runners(
+    pub(crate) fn runner(
         &self,
-        device: DeviceId,
-        loaded: &Loaded,
-        memory: &mut Memory,
-        generation: &Arc<Generation>,
-        blocking: &worker::blocking::ThreadPool,
-        groups: &RankGroups,
-        client: Option<&Arc<worker::memory::retained::Retained>>,
-        identity: &str,
-        report: Option<&mut ipc::MainProcessInfo>,
-    ) -> Result<Vec<NamedRunner>> {
-        let model = match loaded {
-            Loaded::Text(model) => model,
-            Loaded::Video(pipeline) => {
-                return self.media_runners(
-                    device, pipeline, generation, blocking, groups, client, identity, report,
-                );
-            }
+        model: Arc<dyn TextModel>,
+        config: CausalLmConfig,
+        graphs: Graphs,
+        stream: Option<Stream>,
+        cache: &Arc<Mutex<KvCacheMemory>>,
+        state: Option<&Arc<Mutex<StateMemory>>>,
+        group: Option<Arc<backend::Group>>,
+        member: Option<Member>,
+        kernels: &Generation,
+    ) -> Result<CausalLmRunner> {
+        let scratch_pages = config.scratch_pages;
+
+        let mut runner = {
+            let cache = worker::lock(cache);
+            let state = state.map(|state| worker::lock(state));
+            CausalLmRunner::over(
+                model,
+                config,
+                graphs,
+                stream.clone(),
+                &cache,
+                state.as_deref(),
+            )
+            .context("building the rank's causal runner")?
         };
-        let mut runners: Vec<NamedRunner> = Vec::new();
-        // One model per rank is loaded and mapped on the rank's first device, and a kernel on a
-        // second device would read the first device's addresses: a node whose rank serves two
-        // devices needs the model loaded per device. Refusing says so; serving would emit wrong
-        // tokens and look like a kernel defect.
-        if Some(&device) != self.devices.first() {
-            bail!(
-                "this build maps one model per rank, on device {}; a runner on device {} would \
-                 forward from another device's addresses",
-                self.devices.first().map_or(-1, |first| first.0),
-                device.0
-            );
-        }
-        {
-            {
-                // The sampler's penalty table holds a row per request slot the deployment serves.
-                let slots = u32::try_from(self.engine_config().max_running_requests.get())
-                    .context("more request slots than the protocol addresses")?;
-                let stream = platform::Stream::new(device)
-                    .with_context(|| format!("creating device {}'s stream", device.0))?;
-                let drafts = self.engine_config().speculative.num_draft_tokens;
-                let rows = self
-                    .buckets
-                    .largest(Variant::DecodeGreedy)
-                    .map_or(1, |bucket| bucket.rows);
-                // A verification attends as one row per token.
-                let rows = if drafts > 0 {
-                    CausalLmRunner::<Shared<dyn nn::family::TextModel>>::speculative_rows(
-                        slots, drafts, rows,
-                    )
-                } else {
-                    rows
-                };
-                let cache = memory.shared_cache().context(
-                    "a causal-language rank reads a paged cache, and this rank opened none",
-                )?;
-                let provider: Box<dyn KvProvider> =
-                    Box::new(ResidentCache::new(cache, device, rows)?);
-                let member = self.union_member(device, model.as_ref())?;
-                // A model that takes images also serves their vision encodings.
-                let images = model.vision().is_some();
-                let mut phases = served_phases(&self.buckets, drafts > 0);
-                if images {
-                    phases.push(super::buckets::phase(ipc::batch::Phase::VisionEncode));
-                    phases.sort_by_key(|phase| phase.0);
-                    phases.dedup();
-                }
-                let runner = CausalLmRunner::new(
-                    Binding {
-                        id: RunnerId(0),
-                        phases,
-                        device,
-                        stream,
-                    },
-                    Shared::new(Arc::clone(model)),
-                    Arc::clone(generation),
-                    self.buckets.clone(),
-                    provider,
-                    slots,
-                    // The attention descriptor's static key bound: the deployment's longest
-                    // sequence, which the resident cache's block-table rows were sized for.
-                    self.engine_config().model.max_model_len,
-                )?;
-                // Every sampling graph reports the deployment's candidates beside each token.
-                let runner = runner.reporting(self.engine_config().max_logprobs)?;
-                let runner = match member {
-                    Some(member) => runner.in_union(member),
-                    None => runner,
-                };
-                let runner = if drafts > 0 {
-                    runner.speculating(drafts)?
-                } else {
-                    runner
-                };
-                let runner = if images {
-                    // The images' reads run on the process's media lane: a text process builds no
-                    // other runner that takes it.
-                    let lane = blocking
-                        .lane::<worker::runners::vision::ImageRead>(
-                            worker::blocking::BlockingKind::Media,
-                        )
-                        .context("creating the lane that reads input images")?;
-                    let runner = runner.with_images(lane)?;
-                    // The host encoder pool an image's features are stored in and found again by
-                    // another request reading the same image: one per host, shared by its ranks
-                    // and epochs, keyed by the identity of the weights that compute them. A
-                    // recorded start, which has no Storage Server, maps none.
-                    match (client, runner.image_features()) {
-                        (Some(client), Some((row_bytes, rows))) => {
-                            let (pool, info) = worker::memory::encoders::EncoderHostPool::start(
-                                client,
-                                device,
-                                worker::memory::encoders::pool_pages(
-                                    &[u64::from(rows) * row_bytes],
-                                    self.engine_config().max_running_requests.get(),
-                                ),
-                                std::collections::BTreeMap::from([(
-                                    ipc::product::VISION_FEATURES.to_owned(),
-                                    identity.to_owned(),
-                                )]),
-                                None,
-                            )
-                            .context("mapping the host encoder pool")?;
-                            let writes = report.is_some();
-                            if let Some(report) = report {
-                                report.encoder_pool = Some(Box::new(info));
-                            }
-                            runner.with_encoder_pool(std::sync::Arc::new(pool), writes)
-                        }
-                        _ => runner,
-                    }
-                } else {
-                    runner
-                };
-                let runner = match &groups.tensor {
-                    Some(group) => runner.in_tensor_group(Arc::clone(group)),
-                    None => runner,
-                };
-                runners.push(NamedRunner::new(RunnerId(0), Box::new(runner)));
+        runner.set_page_work(page_work(
+            Arc::clone(cache),
+            state.map(Arc::clone),
+            stream.clone(),
+            scratch_pages,
+        ));
+
+        // The meta contexts take the split alone: a profile run issues no collective.
+        worker::Runner::graphs(&runner).set_group(
+            group,
+            u64::from(self.mapping.tensor_rank),
+            u64::from(self.mapping.tensor_parallel),
+        )?;
+
+        if let Some(mut member) = member {
+            if let Some(stream) = &stream {
+                member
+                    .create_transport(kernels, stream)
+                    .context("creating the expert union's transport")?;
             }
+            runner
+                .join_union(member)
+                .context("joining the node's expert union")?;
         }
-        Ok(runners)
+        Ok(runner)
     }
+}
+
+/// Runs `runner`'s profile run: the forward of every bucket it states under the meta context, which
+/// states its region, shadow and input bytes and the kernels its graphs launch.
+///
+/// # Errors
+///
+/// What a forward refuses.
+pub(crate) fn profile(runner: &CausalLmRunner) -> Result<()> {
+    let graphs = worker::Runner::graphs(runner);
+    graphs
+        .profile_run(runner)
+        .context("profiling the rank's causal runner")
+}
+
+/// Every kernel `runner` and the owners it reads launch: its graphs' profiled launches, the
+/// cache's copies and conversions, and the recurrent state's copies.
+///
+/// # Errors
+///
+/// When an owner's descriptors refuse its tensors.
+pub(crate) fn keys(
+    runner: &CausalLmRunner,
+    cache: &Mutex<KvCacheMemory>,
+    state: Option<&Mutex<StateMemory>>,
+) -> Result<Keys> {
+    let mut keys = worker::Runner::graphs(runner).keys();
+    keys.extend(worker::lock(cache).keys()?);
+    if let Some(state) = state {
+        keys.extend(worker::lock(state).keys()?);
+    }
+    Ok(keys)
 }

@@ -18,8 +18,8 @@
 //! which the scheduler node takes into the group's [`Sequences`] before it completes the
 //! submission, so the group's `completed` is the smallest over all of its ranks. The scheduler
 //! node asks [`ipc::MainProcessRequest::Info`] once the ranks loaded, and the peer responds with
-//! its first rank's report, which the scheduler sizes a worker group that starts on the peer's
-//! host by ([`Remote::info`]).
+//! the capacity its first rank's group stated, which the scheduler plans a worker group that
+//! starts on the peer's host against ([`Remote::info`]).
 //!
 //! Each end's connection is owned by one link thread, which sends what other threads queued
 //! (they fire the channel's wake), reads what arrived and settles it; nothing else touches the
@@ -268,8 +268,8 @@ pub fn register(address: &str, rank: u32, engine: u64, timeout: Duration) -> Res
 type Pending = Mutex<HashMap<u64, (Arc<SubmissionState>, Arc<Sequences>, usize)>>;
 
 /// The `Info` requests a peer has not responded to yet, by their `message_id`: each takes the
-/// peer's report, or its refusal.
-type Infos = Mutex<HashMap<u64, Sender<std::result::Result<ipc::MainProcessInfo, String>>>>;
+/// capacity the peer states, or its refusal.
+type Infos = Mutex<HashMap<u64, Sender<std::result::Result<ipc::Capacity, String>>>>;
 
 /// The scheduler node's link to one peer engine process: where a group's jobs for the peer's
 /// ranks go, and how what they return comes back.
@@ -335,13 +335,13 @@ impl Remote {
         self.rank
     }
 
-    /// What the peer's first rank reports of itself, which the scheduler sizes a worker group
-    /// by: the peer responds once its ranks loaded, within `timeout`.
+    /// The capacity of the worker group of the peer's first rank, which the scheduler plans
+    /// the group against: the peer responds once its ranks loaded, within `timeout`.
     ///
     /// # Errors
     ///
     /// Once the link is lost, when the peer refuses, or when no response arrives in time.
-    pub fn info(&self, timeout: Duration) -> Result<ipc::MainProcessInfo> {
+    pub fn info(&self, timeout: Duration) -> Result<ipc::Capacity> {
         self.live()?;
 
         let id = self.next.fetch_add(1, Ordering::Relaxed);
@@ -505,7 +505,7 @@ fn settle(rank: u32, pending: &Pending, infos: &Infos, response: MainProcessResp
     };
     if let Some(asked) = asked {
         let _ = asked.send(match response {
-            MainProcessResponse::Info { info, .. } => Ok(info),
+            MainProcessResponse::Info { capacity, .. } => Ok(capacity),
             MainProcessResponse::Error { error, .. } => Err(error.message),
             _ => Err("the peer responded to a report request with another kind".to_owned()),
         });
@@ -599,8 +599,8 @@ pub struct Upstream {
 
 impl Upstream {
     /// Serves the scheduler node's requests arriving on `channel` with `executors`, this
-    /// process's ranks, responding to a report request with `info`, its first rank's report; a
-    /// close of the connection marks `liveness` lost.
+    /// process's ranks, responding to a report request with `capacity`, what its first rank's
+    /// group serves; a close of the connection marks `liveness` lost.
     ///
     /// Two threads: the link, which owns the connection, and the responder, which waits for each
     /// submission in the order it was made (each executor takes its jobs in that order) and gives
@@ -612,7 +612,7 @@ impl Upstream {
     pub fn serve(
         channel: Channel,
         executors: Arc<Executors>,
-        info: ipc::MainProcessInfo,
+        capacity: ipc::Capacity,
         liveness: Arc<Liveness>,
     ) -> Result<Self> {
         let (responses, responded) = crossbeam_channel::unbounded::<MainProcessResponse>();
@@ -658,7 +658,7 @@ impl Upstream {
                     upstream_link(
                         channel,
                         executors.as_ref(),
-                        &info,
+                        &capacity,
                         &waiting,
                         &responded,
                         &liveness,
@@ -699,7 +699,7 @@ impl Drop for Upstream {
 fn upstream_link(
     mut channel: Channel,
     executors: &Executors,
-    info: &ipc::MainProcessInfo,
+    capacity: &ipc::Capacity,
     waiting: &Sender<(u64, GroupId, Submission)>,
     responded: &Receiver<MainProcessResponse>,
     liveness: &Liveness,
@@ -781,12 +781,12 @@ fn upstream_link(
                     failed = Some("the scheduler node closed the epoch's peer links".into());
                     break;
                 }
-                // The scheduler node sizes a worker group whose first rank is this process's by
-                // its report.
+                // The scheduler node plans a worker group whose first rank is this process's
+                // against the capacity that rank's group stated.
                 MainProcessRequest::Info { message_id } => {
                     let response = MainProcessResponse::Info {
                         message_id,
-                        info: info.clone(),
+                        capacity: capacity.clone(),
                     };
                     if let Err(error) = channel.send(&response) {
                         failed = Some(format!("responding to the scheduler node: {error}"));
@@ -991,9 +991,21 @@ mod tests {
 
     #[test]
     fn a_peer_reports_its_first_rank_and_a_refusal_is_the_request_s_error() {
-        let stated = ipc::MainProcessInfo {
-            request_slots: 7,
-            ..ipc::MainProcessInfo::default()
+        let stated = ipc::Capacity {
+            phases: 1 << ipc::batch::Phase::Decode.index(),
+            slots: 7,
+            kv_cache: None,
+            cache_groups: Vec::new(),
+            seeds: Vec::new(),
+            buckets: Vec::new(),
+            rows: [0; ipc::batch::Phase::COUNT],
+            max_model_len: 4096,
+            denoise_steps: 0,
+            bos_token_id: 0,
+            eos_token_ids: Vec::new(),
+            feature_bytes: 0,
+            media_bytes: Vec::new(),
+            call_window: 2,
         };
         let report = stated.clone();
         let (liveness, _waker) = liveness();
@@ -1008,7 +1020,7 @@ mod tests {
                 let response = if responded == 0 {
                     MainProcessResponse::Info {
                         message_id,
-                        info: report.clone(),
+                        capacity: report.clone(),
                     }
                 } else {
                     refusal(message_id.unwrap_or(0), "not loaded".to_owned())
