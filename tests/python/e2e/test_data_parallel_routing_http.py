@@ -29,12 +29,12 @@ import pytest
 from tests.python.e2e.http_helpers import (
     ATTENTION_BACKEND,
     QWEN3_CHECKPOINT,
+    engine_selection,
     find_free_port,
     granted_devices,
     host_asset,
     require_uniserve_binary,
     server_process,
-    engine_selection,
 )
 
 pytestmark = [

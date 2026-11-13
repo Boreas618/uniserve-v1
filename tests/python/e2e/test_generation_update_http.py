@@ -1,20 +1,21 @@
-"""A generation update while a deployment serves (design 7.3, 11 step 2).
+"""A generation update while a deployment serves (``specs/updates.md`` §3.1).
 
 One Qwen3-MoE deployment serves on one GPU while the test replaces kernel
-packages and the scheduling policy under it. The pass criteria are the delivery
-test's:
+packages and the scheduling policy under it:
 
 - one kernel package swapped by **rebind**, one by **recapture** together with
-  the **policy**, then **reverted**, with no request failing at any step;
-- a deliberately **wrong kernel** refused by shadow execution at precopy: the
-  serving generation does not change and requests keep succeeding;
+  the **policy**, then **rolled back**, with no request failing at any step;
+- a deliberately **wrong kernel** refused by the shadow while the update
+  prepares: the update is abandoned, the serving generation does not change
+  and requests keep succeeding;
 - the allocator's mapped bytes stay within the device's budget while both
   generations' graphs exist.
 
-The Build Server runs beside the deployment (design 6.1): the test starts it,
-installs a variant package into it, and applies the unchanged deployment
-configuration, which is what triggers a generation update (5.1). Phases are
-asserted on the daemon's events, never on sleeps.
+The Build Server runs beside the deployment: the test starts it, installs a
+variant package into it, and applies the unchanged deployment configuration,
+which is what moves a newly installed revision into a generation update
+(``docs/admin.md``, Updates). Phases are asserted on the daemon's events,
+never on sleeps.
 
 The model is ``UNISERVE_QWEN3_MODEL``'s checkpoint; the module is skipped
 when it is unset. The packages are the tree's fixtures under
@@ -36,11 +37,12 @@ The Build Server's interpreter, its precompiler and the binary are named by
 ``UNISERVE_BUILD_SERVER_PYTHON``, ``UNISERVE_SCHEDULING_PRECOMPILE`` and
 ``UNISERVE_BINARY``.
 
-The admin surface is front's (M488): `POST /admin/config/commit` and
-`/admin/config/rollback`, events whose `data.phase` names the phase and whose
-`kind` is `deployment`, and `/admin/config`'s `epochs` array whose elements
-carry `kernels` and `previous_kernels` as a list of
-`{op, phase, package: {backend, revision, arguments}}`.
+The admin surface is the operator socket's: `POST /admin/config/commit` and
+`/admin/config/rollback`, events whose `kind` is `deployment` and whose
+`data` is the update as it stood, its `phase` among them, and
+`/admin/config`'s `epochs` array whose elements carry `kernels` and
+`previous_kernels` as a list of `{op, phase, package: {backend, revision,
+arguments}}`.
 """
 
 from __future__ import annotations
@@ -63,6 +65,11 @@ from tests.python.e2e.build_server import (
 from tests.python.e2e.build_server import repository
 from tests.python.e2e.http_helpers import (
     QWEN3_CHECKPOINT,
+    admin,
+    admin_config,
+    admin_request,
+    admin_status,
+    apply_config,
     engine_selection,
     find_free_port,
     host_asset,
@@ -89,7 +96,7 @@ DEPLOYMENT_OPTIONS = (
     "max_num_batched_tokens=512",
 )
 
-#: Host KV cache this deployment holds, in GiB. The live-update file serves the
+#: The host tier this deployment holds, in GiB. The live-update file serves the
 #: same model with the same figure, so the two files' deployments size their
 #: host memory alike.
 HOST_GIB = 8
@@ -117,10 +124,11 @@ CONCURRENCY = 8
 MAX_TOKENS = 64
 STEP_TIMEOUT_S = 900.0
 
-# The phases the daemon reports for one update (design 7.3 steps 2-6).
-PRECOPY = ["precopy", "precopied", "switchover", "switched", "probation"]
-COMMITTED = ["committed", "purged"]
-REVERTED = ["reverted", "purged"]
+# The phases the daemon reports for one update, up to its trial and after it
+# (``docs/admin.md``, One update, two forms).
+TO_TRIAL = ["preparing", "switching", "trial"]
+COMMITTED = ["committed"]
+ROLLED_BACK = ["rolled_back"]
 
 
 #: The tree's fixture package each variable stands for when it is unset.
@@ -172,10 +180,10 @@ def server(
     file read "no failures" with no test executed.
 
     The deployment is module-scoped because the tests are one epoch history —
-    a rebind, a recapture with its policy, a revert and a refusal — each read
+    a rebind, a recapture with its policy, a rollback and a refusal — each read
     back through `/admin/status` and `/metrics` against the same deployment's
     records. The options are `DEPLOYMENT_OPTIONS`, the live-update file's
-    deliberately, and the host KV cache is `HOST_GIB`, the figure that file
+    deliberately, and the host tier is `HOST_GIB`, the figure that file
     serves the same model with.
     """
     directory = tmp_path_factory.mktemp("deployment")
@@ -214,16 +222,16 @@ RESIDENT_TOKENS = 512
 # from an update that
 # never ran one.
 COMPARED = "differ beyond tolerance"
-IDLE = "no resident request ran a step"
+IDLE = "no running request ran a step"
 
 
 class Resident:
-    """One streamed completion, held resident for a whole update window.
+    """One streamed completion, held running for a whole update window.
 
-    Shadow execution pairs a changed operator's kernel on one step of the
-    batches a scheduler forms from its **resident** requests. A closed loop of
-    short requests has moments with none in flight, and a precopy that lands in
-    one of them compares nothing and fails by name ("no resident request ran a
+    The shadow pairs a changed operator's kernel on one step of the batches a
+    scheduler forms from its **running** requests. A closed loop of short
+    requests has moments with none in flight, and a preparation that lands in
+    one of them compares nothing and fails by name ("no running request ran a
     step"). Holding one request open for as long as the caller keeps it makes
     the wrong-kernel assertion mean what it says.
 
@@ -251,12 +259,12 @@ class Resident:
             body = self._response.read()[:300]
             self.close()
             raise AssertionError(
-                "the resident request was refused: "
+                "the running request was refused: "
                 f"{self._response.status_code}: {body!r}"
             )
         self._lines = self._response.iter_lines()
         # The first line proves the engine formed a batch for this request: it
-        # is resident, not waiting behind admission.
+        # is running, not waiting behind admission.
         # An SSE comment or a blank line can precede the first frame, so a few
         # are read before the stream is called silent.
         first = ""
@@ -267,7 +275,7 @@ class Resident:
         if "data:" not in first:
             self.close()
             raise AssertionError(
-                f"the resident request produced no stream: {first!r}"
+                f"the running request produced no stream: {first!r}"
             )
         self._reader = threading.Thread(target=self._drain, daemon=True)
         self._reader.start()
@@ -382,21 +390,14 @@ def install(build_server, package: Path) -> int:
     return int(match.group(1))
 
 
-def apply_config(base_url: str, *, force: bool = False) -> httpx.Response:
-    """Apply the unchanged configuration, which triggers an update."""
-    body: dict[str, object] = {}
-    if force:
-        body["force"] = True
-    return httpx.put(
-        f"{base_url}/admin/config", json=body, timeout=STEP_TIMEOUT_S
-    )
+def next_event(base_url: str) -> int:
+    """The sequence number the daemon's next event takes."""
+    return admin_status(base_url)["next_event"]
 
 
 def end_update(base_url: str, action: str) -> None:
-    """Commit or revert the update on probation (design 7.3 step 5)."""
-    response = httpx.post(
-        f"{base_url}/admin/config/{action}", timeout=STEP_TIMEOUT_S
-    )
+    """Commit or roll back the update on trial."""
+    response = admin(base_url, f"config/{action}")
     assert response.status_code == 200, (
         f"POST /admin/config/{action} answered {response.status_code}: "
         f"{response.text[:500]}"
@@ -404,20 +405,17 @@ def end_update(base_url: str, action: str) -> None:
 
 
 def _phase_of(event: dict) -> str:
-    """The phase an event names, in the daemon's vocabulary (front, M357)."""
-    for source in (event.get("data"), event):
-        if isinstance(source, dict):
-            for key in ("phase", "kind"):
-                value = source.get(key)
-                if isinstance(value, str):
-                    return value
-    return ""
+    """The phase of the update a `deployment` event states."""
+    if event.get("kind") != "deployment":
+        return ""
+    phase = (event.get("data") or {}).get("phase")
+    return phase if isinstance(phase, str) else ""
 
 
-def wait_for_phases(
-    base_url: str, phases: list[str], after: int = 0
-) -> list[dict]:
-    """Long-poll the daemon's events until every phase arrived."""
+def wait_for_phases(base_url: str, phases: list[str], after: int) -> list[dict]:
+    """Long-poll the daemon's events after sequence number `after` until
+    every phase arrived.
+    """  # noqa: D205
     seen: list[dict] = []
     pending = list(phases)
     deadline = time.monotonic() + STEP_TIMEOUT_S
@@ -425,10 +423,12 @@ def wait_for_phases(
     while pending:
         if time.monotonic() > deadline:
             raise TimeoutError(f"phases {pending} did not arrive; saw {seen}")
-        response = httpx.get(
-            f"{base_url}/admin/events",
+        response = admin_request(
+            base_url,
+            "GET",
+            "/admin/events",
             params={"after": next_seq, "wait": 30},
-            timeout=60.0,
+            timeout_s=60,
         )
         response.raise_for_status()
         payload = response.json()
@@ -442,19 +442,15 @@ def wait_for_phases(
 
 
 def epoch_record(base_url: str) -> dict:
-    """The epoch the deployment serves, as the daemon records it (5.1).
+    """The epoch the deployment serves, as the daemon records it.
 
     `/admin/config` reports every epoch, ascending; the one that serves is the
-    highest-numbered epoch in `serving` or `probation`, and `/admin/events`
-    names it by number (`data.epoch`).
+    highest-numbered epoch in `serving` or `trial`, and `/admin/events` names
+    it by number (`data.epoch`).
     """
-    response = httpx.get(f"{base_url}/admin/config", timeout=60.0)
-    response.raise_for_status()
-    epochs = response.json()["epochs"]
+    epochs = admin_config(base_url)["epochs"]
     live = [
-        epoch
-        for epoch in epochs
-        if epoch.get("status") in ("serving", "probation")
+        epoch for epoch in epochs if epoch.get("status") in ("serving", "trial")
     ]
     assert live, f"the deployment serves no epoch: {epochs}"
     return max(live, key=lambda epoch: epoch["epoch"])
@@ -514,8 +510,9 @@ def test_a_kernel_package_is_swapped_by_rebind_while_requests_stream(
     before = epoch_record(server)
     revision = install(build_server, package)
 
+    after_event = next_event(server)
     assert apply_config(server).status_code == 200
-    wait_for_phases(server, PRECOPY)
+    wait_for_phases(server, TO_TRIAL, after_event)
     after = epoch_record(server)
     assert after["kernels"] != before["kernels"], (
         "the generation update did not change the recorded kernel packages"
@@ -529,8 +526,9 @@ def test_a_kernel_package_is_swapped_by_rebind_while_requests_stream(
         f"the recorded modules name no revision {revision}: {after['kernels']}"
     )
 
+    after_event = next_event(server)
     end_update(server, "commit")
-    wait_for_phases(server, COMMITTED)
+    wait_for_phases(server, COMMITTED, after_event)
     assert_no_failures("the rebind swap", traffic)
     mapped_within_budget(server)
 
@@ -544,13 +542,14 @@ def test_the_recapture_swap_and_the_policy_swap_keep_serving(
     install(build_server, package)
     install(build_server, policy)
 
-    # Shadow execution compares on a step of a resident request; without one the
-    # precopy refuses by name and the swap below would be asserted on an update
-    # that compared nothing.
+    # The shadow compares on a step of a running request; without one the
+    # preparation refuses by name and the swap below would be asserted on an
+    # update that compared nothing.
     resident = Resident(server, PROMPTS[0])
     try:
+        after_event = next_event(server)
         assert apply_config(server).status_code == 200
-        wait_for_phases(server, PRECOPY)
+        wait_for_phases(server, TO_TRIAL, after_event)
     finally:
         # Closed after the update answered and before any failure is read: a
         # request in flight here would race `assert_no_failures` below.
@@ -565,29 +564,28 @@ def test_the_recapture_swap_and_the_policy_swap_keep_serving(
     assert_no_failures("the recapture and policy swap", traffic)
     mapped_within_budget(server)
 
-    # The update stays on probation for the revert below (7.3 step 4).
-    assert after["status"] == "probation", (
-        f"expected probation, got {after['status']}"
-    )
+    # The update stays on trial for the rollback below.
+    assert after["status"] == "trial", f"expected trial, got {after['status']}"
 
 
-def test_revert_restores_the_previous_generation(
+def test_a_rollback_restores_the_previous_generation(
     server: str, traffic: Traffic
 ) -> None:
     before = epoch_record(server)
+    after_event = next_event(server)
     end_update(server, "rollback")
-    wait_for_phases(server, REVERTED)
+    wait_for_phases(server, ROLLED_BACK, after_event)
     assert before["previous_kernels"] is not None, (
-        "the epoch on probation kept no previous kernel packages to revert to"
+        "the epoch on trial kept no previous kernel packages to roll back to"
     )
     after = epoch_record(server)
     assert after["kernels"] == before["previous_kernels"], (
-        "the revert did not restore the previous kernel packages"
+        "the rollback did not restore the previous kernel packages"
     )
     assert after["policy"] == before["previous_policy"], (
-        "the revert did not restore the previous policy"
+        "the rollback did not restore the previous policy"
     )
-    assert_no_failures("the revert", traffic)
+    assert_no_failures("the rollback", traffic)
     mapped_within_budget(server)
 
 
@@ -598,25 +596,21 @@ def test_a_wrong_kernel_is_refused_by_shadow_execution(
     before = epoch_record(server)
     install(build_server, package)
 
-    # The comparison needs a request the scheduler is stepping when the precopy
-    # shadows: a wrong
-    # kernel can only be refused by a comparison that ran.
+    # The comparison needs a request the scheduler is stepping when the
+    # preparation shadows: a wrong kernel can only be refused by a comparison
+    # that ran.
     resident = Resident(server, PROMPTS[1])
     try:
+        # The update is abandoned while it prepares, which the answer states
+        # with the update as it ended (`409`).
         response = apply_config(server)
-        if response.status_code == 200:
-            events = wait_for_phases(server, ["precopy_failed"])
-            reasons = [
-                json.dumps(event)
-                for event in events
-                if _phase_of(event) == "precopy_failed"
-            ]
-            assert reasons, "precopy_failed carried no reason"
-            refusal = " ".join(reasons)
-        else:
-            refusal = response.text
     finally:
         resident.close()
+    assert response.status_code == 409, response.text
+    update = response.json()["result"]["update"]
+    assert update["phase"] == "abandoned", update
+    assert update["failure"]["kind"] == "prepare_failed", update
+    refusal = update["failure"]["reason"]
 
     # The comparison's own sentence, not a refusal for any reason at all: the
     # element past tolerance and the bound it left, and never the sentence that
@@ -633,14 +627,14 @@ def test_a_wrong_kernel_is_refused_by_shadow_execution(
     )
     assert IDLE not in refusal, (
         "the wrong kernel was not compared at all: the update was refused "
-        f"because no resident request ran a step: {refusal}"
+        f"because no running request ran a step: {refusal}"
     )
 
     after = epoch_record(server)
     assert after["kernels"] == before["kernels"], (
         "a refused update changed the serving generation"
     )
-    assert after["status"] in ("serving", "probation"), after["status"]
+    assert after["status"] in ("serving", "trial"), after["status"]
     assert_no_failures("the refused wrong kernel", traffic)
     mapped_within_budget(server)
 

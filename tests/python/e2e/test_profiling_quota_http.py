@@ -1,12 +1,14 @@
 """A profiling session's device storage in its GPU's quota.
 
-Qwen3 serves on the GPU the module's lease granted with its
-KV cache sized by the deployment's quota. A ``range_metrics`` session whose
+Qwen3 serves on the GPU the module's lease granted with its device KV
+region sized by the deployment's quota. A ``range_metrics`` session whose
 pass takes more device storage than the quota has room for first has the
-KV cache give back tail segments for it; the worker's process item reserves
-the pass while the session runs, and the cache grows back once it ends. A
-pass that even every segment past the first cannot make room for is
-refused, naming its bytes.
+region shrink (``Resize``, which evicts unpinned blocks and never takes a
+private or pinned one) and its rank release the tail segments the region no
+longer covers; the rank's process item reserves the pass while the session
+runs, and the region grows back into new segments once it ends. A pass that
+even every segment past the first cannot make room for is refused, naming
+its bytes.
 """
 
 from __future__ import annotations
@@ -14,10 +16,10 @@ from __future__ import annotations
 from collections.abc import Iterator
 from pathlib import Path
 
-import httpx
 import pytest
 
-from tests.python.e2e.profiling_helpers import ended, serve, start
+from tests.python.e2e.http_helpers import admin_config, admin_request
+from tests.python.e2e.profiling_helpers import ended, serve, start, stop
 
 pytestmark = [
     pytest.mark.e2e,
@@ -27,8 +29,8 @@ pytestmark = [
     pytest.mark.gpus(1),
 ]
 
-# No kv_cache_config.max_tokens: the cache takes the quota's rest beside the
-# share the capacity plan keeps for graphs.
+# No kv_cache_config.max_tokens: the KV region takes the quota's rest beside
+# the graph pool the profile run sized.
 OPTIONS = (
     "dtype=bfloat16",
     "attention_backend=trtllm",
@@ -41,11 +43,11 @@ OPTIONS = (
 # A pass's device storage per range, and the unit CUPTI takes it in
 # (docs/profiling.md).
 RANGE_STORAGE = 1_420_288
-GRANULE = 2 << 20
+GRANULARITY = 2 << 20
 
 
 def _pass_storage(ranges: int) -> int:
-    return -(-ranges * RANGE_STORAGE // GRANULE) * GRANULE
+    return -(-ranges * RANGE_STORAGE // GRANULARITY) * GRANULARITY
 
 
 def _ranges_past(storage: int) -> int:
@@ -66,7 +68,7 @@ def served(
 
 def _quota(base_url: str) -> dict:
     """The quota of the worker's GPU."""
-    status = httpx.get(f"{base_url}/admin/config", timeout=60).json()
+    status = admin_config(base_url)
     [quota] = [
         quota
         for node in status["quotas"]
@@ -78,12 +80,16 @@ def _quota(base_url: str) -> dict:
 
 def _bytes(quota: dict, item: str) -> int:
     return sum(
-        entry["bytes"] for entry in quota["reservations"] if entry["item"] == item
+        entry["bytes"]
+        for entry in quota["reservations"]
+        if entry["item"] == item
     )
 
 
 def _room(quota: dict) -> int:
-    return quota["limit"] - sum(entry["bytes"] for entry in quota["reservations"])
+    return quota["limit"] - sum(
+        entry["bytes"] for entry in quota["reservations"]
+    )
 
 
 def test_the_cache_makes_room_for_a_session_and_grows_back(
@@ -110,7 +116,7 @@ def test_the_cache_makes_room_for_a_session_and_grows_back(
     assert given_back >= storage - _room(before), during
     assert _room(during) >= 0, during
 
-    stopped = httpx.delete(f"{served}/admin/profile", timeout=600)
+    stopped = stop(served)
     assert stopped.status_code == 200, stopped.text
     assert ended(served, 60)["end_reason"] == "operator"
     after = _quota(served)
@@ -126,14 +132,16 @@ def test_a_pass_no_withdrawal_makes_room_for_is_refused(
     before = _quota(served)
     # Past the room and every segment of the cache together.
     ranges = _ranges_past(_room(before) + _bytes(before, "cache_segment"))
-    refused = httpx.post(
-        f"{served}/admin/profile",
-        json={
+    refused = admin_request(
+        served,
+        "POST",
+        "/admin/profile",
+        body={
             "collectors": ["range_metrics"],
             "range_metrics": {"pass_ranges": ranges},
             "output_dir": str(tmp_path),
         },
-        timeout=600,
+        timeout_s=600,
     )
     assert refused.status_code == 400, refused.text
     assert str(_pass_storage(ranges)) in refused.text, refused.text

@@ -17,6 +17,7 @@ from transformers import AutoTokenizer
 
 from tests.python.e2e.http_helpers import (
     H3_CHECKPOINT,
+    engine_selection,
     find_free_port,
     granted_devices,
     host_asset,
@@ -24,7 +25,6 @@ from tests.python.e2e.http_helpers import (
     second_host,
     server_process,
     t2va_request,
-    engine_selection,
     written_deployment,
 )
 from uniserve_eval.datasets.minimax_h3 import MiniMaxH3Dataset
@@ -448,7 +448,7 @@ def test_component_bindings_release_cancelled_requests(
 def test_video_jobs_retain_content_and_cancel_active_work(
     tmp_path: Path,
 ) -> None:
-    """Exercise async ownership and reuse through the HTTP contract.
+    """Exercise async ownership and reuse through the HTTP interface.
 
     The exercise runs on the documented four-device deployment, whose
     components, the media ones included, share one worker group.

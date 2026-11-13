@@ -23,11 +23,11 @@ import tokenizers
 
 from tests.python.e2e.http_helpers import (
     ATTENTION_BACKEND,
+    engine_selection,
     find_free_port,
     qwen3_checkpoint,
     require_uniserve_binary,
     server_process,
-    engine_selection,
 )
 
 pytestmark = [

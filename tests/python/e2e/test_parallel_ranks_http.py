@@ -1,10 +1,13 @@
-"""Public generation on ordered tensor, sequence and pipeline assignments.
+"""Generation on tensor, sequence and pipeline ranks listed out of order.
 
-Each assignment's greedy chat outputs agree with the outputs of the same
-model on one device: the tokens are equal, or at their first difference each
-side's token is among the other side's five most likely tokens, as a change
-in reduction order may break a near tie. The sequences are not compared past
-that position.
+One worker group of two ranks serves Qwen3 with a parallel degree of two
+along one axis, its ranks listed in descending device order: the order of a
+group's ranks assigns each rank its position in the parallel degrees
+(``docs/configuration.md``, Deployment files). Each configuration's greedy
+chat outputs agree with the outputs of the same model on one device: the
+tokens are equal, or at their first difference each side's token is among
+the other side's five most likely tokens, as a change in reduction order may
+break a near tie. The sequences are not compared past that position.
 """
 
 from __future__ import annotations
@@ -19,12 +22,12 @@ import pytest
 from tests.python.e2e.http_helpers import (
     ATTENTION_BACKEND,
     QWEN3_CHECKPOINT,
+    engine_selection,
     find_free_port,
     granted_devices,
     host_asset,
     require_uniserve_binary,
     server_process,
-    engine_selection,
     written_deployment,
 )
 
@@ -45,7 +48,7 @@ def _command(
     checkpoint: str,
     port: int,
     directory: Path,
-    worker_config: dict[str, Any],
+    group: dict[str, Any],
 ) -> list[str]:
     # Qwen3 states the step budget its attention keys are built for.
     step_tokens = "1024"
@@ -61,7 +64,7 @@ def _command(
         str(port),
         *engine_selection(),
         "--worker-groups",
-        str(written_deployment(directory, [worker_config])),
+        str(written_deployment(directory, [group])),
         "--set",
         "dtype=bfloat16",
         "--set",
@@ -149,16 +152,14 @@ def one_device(
             directory = tmp_path_factory.mktemp(f"{description}-one-device")
             port = find_free_port()
             base_url = f"http://127.0.0.1:{port}"
-            worker_config = {
+            group = {
                 "id": "model",
                 "ranks": ["cuda:0"],
                 "blocks": {"model": {"ranks": [0]}},
                 "queue_depth": 2,
             }
             with server_process(
-                _command(
-                    description, checkpoint, port, directory, worker_config
-                ),
+                _command(description, checkpoint, port, directory, group),
                 base_url,
                 directory / f"{description}.log",
                 timeout_s=300,
@@ -179,7 +180,7 @@ def one_device(
     ],
 )
 @pytest.mark.parametrize("parallel_axis", ["tensor", "pipeline", "sequence"])
-def test_ordered_bindings_generate_outputs(
+def test_ranks_out_of_order_generate_the_one_device_outputs(
     tmp_path: Path,
     description: str,
     model_env: str,
@@ -195,14 +196,14 @@ def test_ordered_bindings_generate_outputs(
         else {f"{parallel_axis}_parallel_size": 2}
     )
     # The module's two GPUs, listed in descending order.
-    worker_config = {
+    group = {
         "id": "model",
         "ranks": ["cuda:1", "cuda:0"],
         "blocks": {"model": {"ranks": [1, 0], **parallel}},
         "queue_depth": 2,
     }
     with server_process(
-        _command(description, checkpoint, port, tmp_path, worker_config),
+        _command(description, checkpoint, port, tmp_path, group),
         base_url,
         tmp_path / f"{description}-{parallel_axis}.log",
         timeout_s=300,

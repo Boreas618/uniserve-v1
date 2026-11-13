@@ -1,10 +1,10 @@
 """A BF16 model serving from a KV cache of the other half precision.
 
 Qwen3 with BF16 weights serves once with a BF16 cache and once with an FP16
-cache (``--kv-cache-dtype float16``), with CUDA graphs captured for prefill and
-decode. The FP16 deployment's attention reads
-and writes its pages in FP16, so its greedy outputs differ from the BF16
-deployment's only by rounding. They are compared by the rule of vLLM's
+cache (``kv_cache_config.dtype=float16``), with CUDA graphs captured for
+prefill and decode. The FP16 deployment's attention reads and writes its KV
+blocks in FP16, so its greedy outputs differ from the BF16 deployment's only
+by rounding. They are compared by the rule of vLLM's
 ``check_logprobs_close``: the two outputs of a prompt agree token for token
 until their first difference, where each output's token is among the other's
 ``TOP_LOGPROBS`` most likely tokens.
@@ -21,12 +21,12 @@ import pytest
 from tests.python.e2e.http_helpers import (
     ATTENTION_BACKEND,
     QWEN3_CHECKPOINT,
+    engine_selection,
     find_free_port,
     granted_devices,
     host_asset,
     require_uniserve_binary,
     server_process,
-    engine_selection,
 )
 
 pytestmark = [pytest.mark.e2e, pytest.mark.gpu, pytest.mark.model("qwen3")]

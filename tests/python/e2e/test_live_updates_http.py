@@ -6,18 +6,19 @@ and the server the daemon starts there is stopped at the end).
 
 - A node (``uniserve serve`` without a model) brings deployments up
   (``PUT /admin/config``) and down through its admin API without
-  restarting: each deployment's page pools and weights
-  belong to it, so bringing it down returns the host's shared memory and
-  the GPU's storage to what they were before it, and a deployment whose
-  page pools the host's available storage cannot hold is refused with the
-  sizes that decided it.
-- A serving deployment answers its admin API: new requests wait while
-  generation is paused and are served once it continues; a flush revokes
-  the cached prefix pages; scheduling limits within the batch the workers
-  were started for change in place while a request streams, and a change
-  of the decode batch sizes is an epoch change under the same stream,
-  which the operator commits; the manager attaches to the node, follows
-  its events and detaches while it serves.
+  restarting: each deployment's host regions (the host tier of its buffer
+  pool) and weights belong to it, so bringing it down returns the host's
+  shared memory and the GPU's storage to what they were before it, and a
+  deployment whose host regions the host's available storage cannot hold is
+  refused with the sizes that decided it.
+- A serving deployment answers its admin API, on the daemon's operator
+  socket: new requests wait while generation is paused and are served once
+  it continues; a flush evicts the device copies of the cached blocks;
+  scheduling limits within the batch the workers were started for change in
+  place while a request streams, and a change of the decode batch sizes is
+  an epoch change under the same stream, which the operator commits; the
+  manager attaches to the node, follows its events and detaches while it
+  serves.
 - A sleeping deployment gives back its KV cache and graph storage, holds
   new requests and recomputes the ones it ran once it wakes, and answers
   as before.
@@ -50,7 +51,10 @@ from tests.python.e2e.http_helpers import (
     QWEN3_UPDATED_CHECKPOINT,
     admin,
     admin_config,
+    admin_request,
+    admin_socket,
     admin_status,
+    apply_config,
     build_server_socket,
     engine_executable,
     engine_processes,
@@ -70,6 +74,9 @@ from tests.python.e2e.http_helpers import (
     serving_engine,
     start_server,
     stop_server,
+    tokens_found,
+    update_report,
+    wait_for_phase,
     wait_until,
 )
 
@@ -100,7 +107,7 @@ OPTIONS = (
 # A change of the options that only a new epoch executes: graphs of other
 # decode batch sizes.
 CHANGE = "cuda_graph_config.decode_batch_sizes=[1, 2, 8]"
-# The deployment's host KV cache on the host, in GiB.
+# The deployment's host tier on the host, in GiB.
 HOST_GIB = 8
 PROMPT = (
     "Count from 1 to 3000, separated by commas and spaces. "
@@ -142,16 +149,18 @@ def build_server_option() -> list[str]:
     return ["--set", f"build_config.socket={BUILD_SERVER}"]
 
 
-def _pool_gib(runtime: Path) -> float:
-    """The host page pools the test's Storage Server holds, in GiB: the
-    sizes of its ``uniserve-page-pool`` memfds, whose storage the host frees
-    once the server and the workers that map them let them go.
+def _host_region_gib(runtime: Path) -> float:
+    """The host regions the test's Storage Server holds, in GiB: the sizes
+    of its ``uniserve-host-region`` memfds, one per rank and region, whose
+    storage the host frees once the server and the ranks that map them let
+    them go.
     """  # noqa: D205
     pid = _storage_pid(runtime)
     held = 0
     for descriptor in Path(f"/proc/{pid}/fd").iterdir():
         try:
-            if os.readlink(descriptor).startswith("/memfd:uniserve-page-pool"):
+            target = os.readlink(descriptor)
+            if target.startswith("/memfd:uniserve-host-region"):
                 held += descriptor.stat().st_size
         except OSError:
             continue
@@ -193,13 +202,13 @@ def _storage_list(runtime: Path) -> str:
 
 
 def _held(runtime: Path) -> list[str]:
-    """What the test's Storage Server holds, its page pools without their
-    slot counters, which the deployment's offloads move as it serves. Its
-    Transfer Server's process, contexts, link measurements and tasks are no
-    storage it holds: a restarted server's Transfer Server measures anew.
+    """What the test's Storage Server holds: its tensors, deployments and
+    quotas. Its Transfer Server's process, contexts, link measurements and
+    tasks are no storage it holds: a restarted server's Transfer Server
+    measures anew.
     """  # noqa: D205
     return sorted(
-        line.split(": ", 1)[0] if line.startswith("page pool") else line
+        line
         for line in _storage_list(runtime).splitlines()
         if not line.startswith(("transfer ", "link "))
     )
@@ -420,12 +429,12 @@ def _node(runtime: Path, device: str, log: Path) -> Iterator[tuple[str, int]]:
             if process.poll() is not None:
                 raise RuntimeError(f"the node exited with {process.returncode}")
             try:
-                return (
-                    httpx.get(f"{base_url}/admin/node", timeout=2).status_code
-                    == 200
+                answered = admin_request(
+                    base_url, "GET", "/admin/node", timeout_s=2
                 )
-            except httpx.HTTPError:
+            except (httpx.HTTPError, FileNotFoundError):
                 return False
+            return answered.status_code == 200
 
         wait_until(answers, 60, "the node did not answer")
         yield base_url, process.pid
@@ -434,13 +443,16 @@ def _node(runtime: Path, device: str, log: Path) -> Iterator[tuple[str, int]]:
 
 
 def _node_state(base_url: str) -> dict:
-    return httpx.get(f"{base_url}/admin/node", timeout=10).json()
+    """``GET /admin/node``: the node's state and its last deployment's error."""
+    return admin_request(base_url, "GET", "/admin/node", timeout_s=10).json()
 
 
 def _deploy(base_url: str, name: str, *assignments: str) -> None:
-    response = httpx.put(
-        f"{base_url}/admin/config",
-        json={
+    response = admin_request(
+        base_url,
+        "PUT",
+        "/admin/config",
+        body={
             "config": "",
             "set": [
                 f"model={qwen3_checkpoint()}",
@@ -450,7 +462,7 @@ def _deploy(base_url: str, name: str, *assignments: str) -> None:
                 *assignments,
             ],
         },
-        timeout=60,
+        timeout_s=60,
     )
     assert response.status_code == 202, response.text
 
@@ -487,33 +499,33 @@ def test_a_node_serves_deployments_one_after_another_and_releases_their_storage(
             }, state
             reply = _chat(base_url, name, "Say hello.")
             assert reply["choices"][0]["message"]["content"]
-            pools = _pool_gib(runtime)
+            regions = _host_region_gib(runtime)
             print(
-                f"{name} serving: page pools {pools:.2f} GiB, "
+                f"{name} serving: host regions {regions:.2f} GiB, "
                 f"GPU {_gpu_used_mib(device)} MiB"
             )
-            # The deployment's page pools: its host KV cache of `HOST_GIB`.
-            assert pools >= HOST_GIB * 0.99, pools
+            # The deployment's host regions: its host tier of `HOST_GIB`.
+            assert regions >= HOST_GIB * 0.99, regions
             assert name in _storage_list(runtime)
 
-            response = httpx.post(
-                f"{base_url}/admin/shutdown", json={}, timeout=60
+            response = admin_request(
+                base_url, "POST", "/admin/shutdown", body={}, timeout_s=60
             )
             assert response.status_code == 202, response.text
             state = _settle(base_url)
             assert state["state"] == "idle", state
             assert state["last_error"] is None, state
-            after_pools = _pool_gib(runtime)
+            after_regions = _host_region_gib(runtime)
             after_gpu = _gpu_used_mib(device)
             print(
-                f"{name} down: page pools {after_pools:.2f} GiB, "
+                f"{name} down: host regions {after_regions:.2f} GiB, "
                 f"GPU {after_gpu} MiB"
             )
             assert name not in _storage_list(runtime)
-            assert after_pools == 0, after_pools
+            assert after_regions == 0, after_regions
             assert after_gpu <= gpu + 1024, (after_gpu, gpu)
 
-        # A host KV cache the host's available storage cannot hold.
+        # A host tier the host's available storage cannot hold.
         too_large = int(_available_gib()) * 2
         _deploy(
             base_url,
@@ -527,8 +539,8 @@ def test_a_node_serves_deployments_one_after_another_and_releases_their_storage(
         assert "available" in error and "reserve" in error, error
         # The node is the same process throughout.
         assert (
-            httpx.get(f"{base_url}/admin/node", timeout=10).status_code == 200
-        )
+            admin_request(base_url, "GET", "/admin/node", timeout_s=10)
+        ).status_code == 200
         assert runs(pid)
 
 
@@ -629,11 +641,7 @@ def _listens(port: int) -> bool:
 
 def _apply(base_url: str, *assignments: str) -> dict:
     """Applies `assignments` (``PUT /admin/config``); returns its result."""
-    response = httpx.put(
-        f"{base_url}/admin/config",
-        json={"set": list(assignments)},
-        timeout=1800,
-    )
+    response = apply_config(base_url, *assignments)
     assert response.status_code == 200, response.text
     return response.json()["result"]
 
@@ -643,13 +651,7 @@ def _apply_settled(base_url: str, *assignments: str) -> None:
     answers: list[httpx.Response] = []
 
     def applied() -> bool:
-        answers.append(
-            httpx.put(
-                f"{base_url}/admin/config",
-                json={"set": list(assignments)},
-                timeout=1800,
-            )
-        )
+        answers.append(apply_config(base_url, *assignments))
         return answers[-1].status_code != 409
 
     wait_until(applied, 120, "the replica stayed with the switch that ended")
@@ -674,9 +676,9 @@ def test_a_serving_deployment_answers_its_admin_api(
     name = "qwen3-live-admin"
     log = tmp_path / "server.log"
     with _serve(runtime, log, name) as base_url:
-        status = httpx.get(f"{base_url}/admin/status", timeout=10).json()
+        status = admin_status(base_url)
         assert status["deployment"]["deployment"] == name, status
-        assert status["deployment"]["engine"] == "ready", status
+        assert status["deployment"]["engine"] == "serving", status
 
         # New requests wait while generation is paused.
         paused = admin(base_url, "pause_generation")
@@ -696,9 +698,9 @@ def test_a_serving_deployment_answers_its_admin_api(
         waiting.join(timeout=300)
         assert answered["choices"][0]["message"]["content"], answered
 
-        # A flush revokes the pages the same prompt published: asked again,
-        # it finds none of them on the device, whatever the host KV cache
-        # still holds.
+        # A flush evicts the device copies of the blocks the same prompt
+        # committed: asked again, it finds none of them on the device,
+        # whatever the host tier still holds.
         prompt = "Describe the sea in one sentence. " * 40
         _chat(base_url, name, prompt)
         cached = _device_tokens_read(
@@ -735,22 +737,24 @@ def test_a_serving_deployment_answers_its_admin_api(
         numbers = [int(word) for word in re.findall(r"\d+", text)]
         assert numbers[:100] == list(range(1, 101)), text[:400]
 
-        # The manager attaches, follows the node's events and detaches.
+        # The manager attaches to the node by its operator socket, follows
+        # its events and detaches.
         manager = shutil.which("uniserve-manager") or str(
             Path(require_uniserve_binary()).with_name("uniserve-manager")
         )
+        node = f"unix:{admin_socket(base_url)}"
         status_line = subprocess.run(
-            [manager, "--node", base_url, "status"],
+            [manager, "--node", node, "status"],
             check=True,
             capture_output=True,
             text=True,
             timeout=60,
         ).stdout
-        assert name in status_line and "engine ready" in status_line, (
+        assert name in status_line and "engine serving" in status_line, (
             status_line
         )
         watching = subprocess.Popen(
-            [manager, "--node", base_url, "watch", "--from-start"],
+            [manager, "--node", node, "watch", "--from-start"],
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             text=True,
@@ -781,8 +785,8 @@ def test_a_serving_deployment_answers_its_admin_api(
         reply = _chat(base_url, name, "Say hello.")
         assert reply["choices"][0]["message"]["content"]
 
-        events = httpx.get(
-            f"{base_url}/admin/events?after=0", timeout=10
+        events = admin_request(
+            base_url, "GET", "/admin/events", params={"after": 0}, timeout_s=10
         ).json()
         kinds = [event["kind"] for event in events["events"]]
         assert "operation" in kinds, events
@@ -846,7 +850,7 @@ def test_a_switch_after_a_hot_restart_finds_the_storage_of_the_epoch_before(
         with _serve(runtime, log, name, {"RUST_LOG": "info"}) as base_url:
             answer = _chat(base_url, name, RECOVERY_PROMPT, tokens=32)
             _change_epoch(base_url, revisions[0])
-            _purged(base_url)
+            _committed(base_url)
             restarted = admin(base_url, "restart")
             assert restarted.status_code == 200, (
                 f"{restarted.text}{_log_trouble(log)}"
@@ -911,7 +915,7 @@ def _restart_while_streaming(
 ) -> None:
     engines_before = _engine_pids(base_url)
     status = admin_status(base_url)
-    assert status["deployment"]["engine"] == "ready", status
+    assert status["deployment"]["engine"] == "serving", status
 
     # One completion before any stream: a deployment that answers nothing says
     # so here, in seconds and with its own body, instead of as a stream that
@@ -1072,9 +1076,11 @@ def _restart_while_streaming(
     # serves now is the last of them.
     assert runs(successors[-1])
     status = admin_status(base_url)
-    assert status["deployment"]["engine"] == "ready", status
+    assert status["deployment"]["engine"] == "serving", status
     assert _engine_pids(base_url) == engines_before
-    events = httpx.get(f"{base_url}/admin/events?after=0", timeout=10).json()
+    events = admin_request(
+        base_url, "GET", "/admin/events", params={"after": 0}, timeout_s=10
+    ).json()
     messages = [event["message"] for event in events["events"]]
     assert any("after a hot restart" in message for message in messages), (
         messages
@@ -1119,7 +1125,7 @@ def _restart_while_streaming(
     )
     with pytest.raises(httpx.ConnectError):
         httpx.get(f"{base_url}/health", timeout=5)
-    status = httpx.get(f"{moved_url}/admin/config", timeout=10).json()
+    status = admin_config(moved_url)
     server = tomllib.loads(status["config"])["admin_config"]
     assert server["port"] == port, server
 
@@ -1130,12 +1136,12 @@ def _restart_while_streaming(
     port = find_free_port()
     both = _apply(moved_url, f"admin_config.port={port}", CHANGE)
     assert both["change"] == "daemon", both
-    assert both["then"] == "epoch", both
+    assert both["then"] == "update", both
     successors.append(both["pid"])
     both_url = f"http://127.0.0.1:{port}"
 
     def changed() -> dict | None:
-        status = httpx.get(f"{both_url}/admin/status", timeout=10).json()
+        status = admin_status(both_url)
         last = status["last_operation"]
         if status["operation"] is None and last and last["kind"] == "config":
             return last
@@ -1149,8 +1155,7 @@ def _restart_while_streaming(
     assert committed.status_code == 200, committed.text
 
     def served_config() -> dict:
-        status = httpx.get(f"{both_url}/admin/config", timeout=10).json()
-        return tomllib.loads(status["config"])
+        return tomllib.loads(admin_config(both_url)["config"])
 
     # A commit may be asked while the target is still being promoted, and it is
     # applied when the trial starts: the configuration moves once the target
@@ -1300,8 +1305,8 @@ def test_a_storage_server_restart_keeps_the_deployment_serving(
         reply = _chat(base_url, name, "Say hello.")
         assert reply["choices"][0]["message"]["content"]
         # The quota reserves a storage once however many epochs map it, so a
-        # successor that read the checkpoint again would reserve its weights beside
-        # these.
+        # target that read the checkpoint again would reserve its weights
+        # beside these.
         assert _weight_bytes(base_url) == weights
 
 
@@ -1352,10 +1357,11 @@ def test_a_target_that_finds_no_storage_leaves_the_serving_epoch_serving(
 ):
     """A target beside a full GPU ends the update and changes nothing that serves.
 
-    A switch asks the serving epoch for no storage: the target maps its cache,
-    and its graphs are its own to find. With two GiB left on the GPU it finds no
-    room for them, so the update ends on its exit, and the stream goes on with
-    the cache as it was.
+    A target prepares beside the serving epoch, which keeps its regions until
+    it drains: the target starts with what the GPU's quota has free. With two
+    GiB left on the GPU it finds no room for its graph pool, so the update is
+    abandoned on its exit before any switch, and the stream goes on with the
+    serving epoch's regions as they were.
     """  # noqa: E501
     name = "qwen3-live-pressure"
     log = tmp_path / "server.log"
@@ -1379,12 +1385,12 @@ def test_a_target_that_finds_no_storage_leaves_the_serving_epoch_serving(
             result = _apply(base_url, CHANGE)
             assert result["change"] == "epoch", result
             wait_until(
-                lambda: _update(base_url).get("phase") == "abandoned",
+                lambda: update_report(base_url).get("phase") == "abandoned",
                 600,
                 "the update did not end",
                 context=lambda: _log_trouble(log),
             )
-            report = _update(base_url)
+            report = update_report(base_url)
             print("epoch switch under pressure:", json.dumps(report))
             assert report["failure"]["kind"] == "process_exit", report
         streaming.join(timeout=1800)
@@ -1394,7 +1400,7 @@ def test_a_target_that_finds_no_storage_leaves_the_serving_epoch_serving(
         # The serving epoch's quota reserves at least the KV cache it held.
         assert admin_config(base_url)["executing"]["epoch"] == serving
         assert _cache_bytes(base_url, serving) >= cache, (
-            "the switch shrank the serving epoch's KV cache"
+            "the abandoned update shrank the serving epoch's KV regions"
         )
         after = _chat(base_url, name, prompt, 32)["choices"][0]["message"][
             "content"
@@ -1433,7 +1439,7 @@ def test_a_sleeping_deployment_gives_back_its_cache_and_graph_storage(
 
         slept = admin(base_url, "sleep")
         assert slept.status_code == 200, slept.text
-        status = httpx.get(f"{base_url}/admin/status", timeout=10).json()
+        status = admin_status(base_url)
         assert status["deployment"]["asleep"] is True, status
         asleep = _gpu_used_mib(device)
         answered: dict = {}
@@ -1468,7 +1474,7 @@ def test_a_sleeping_deployment_gives_back_its_cache_and_graph_storage(
         alone = _chat(base_url, name, prompt, 32)
         assert alone["choices"][0]["message"]["content"] == before, alone
         assert abs(after - awake) <= 2 * 1024, (awake, after)
-        status = httpx.get(f"{base_url}/admin/status", timeout=10).json()
+        status = admin_status(base_url)
         assert status["deployment"]["asleep"] is False, status
         assert status["deployment"]["paused"] is False, status
 
@@ -1562,7 +1568,7 @@ def _lose_the_serving_engine(
     )
     before = len(_numbers(read))
     serving = admin_status(base_url)["deployment"]
-    standby_generations = (serving["standby"] or {}).get("generations", [])
+    standby_generations = serving["standby"]
     killed = serving_engine(base_url)["pid"]
     started = time.monotonic()
     _stop_pid(killed)
@@ -1651,13 +1657,10 @@ def _lose_the_serving_engine(
 
 
 def _prepared_standby(base_url: str) -> list[int] | None:
-    """The launch generations of the parked standby once it captured its
-    graphs; `None` while there is none, or it is not prepared yet.
+    """The launch generations of the parked standby, which parks once it
+    captured its graphs; `None` while there is none.
     """  # noqa: D205
-    standby = admin_status(base_url)["deployment"]["standby"]
-    if standby is None or not standby["prepared"]:
-        return None
-    return standby["generations"]
+    return admin_status(base_url)["deployment"]["standby"] or None
 
 
 def test_a_lost_main_process_is_promoted_from_its_standby(
@@ -1722,7 +1725,7 @@ def test_a_standby_started_after_a_switch_maps_what_its_epoch_serves_from(
         _on_trial(base_url)
         committed = admin(base_url, "config/commit")
         assert committed.status_code == 200, committed.text
-        _purged(base_url)
+        _committed(base_url)
         wait_until(
             lambda: _prepared_standby(base_url) not in (None, first),
             600,
@@ -1742,7 +1745,7 @@ def test_a_relaunched_epoch_hands_its_own_storage_to_the_next_target(
 
     The epoch that replaces it maps that storage. So it does after a target's
     process is lost, when the first epoch's storage is gone with it, and after a
-    revert that started the epoch again on the weights it kept.
+    rollback that started the epoch again on the weights it kept.
     """
     name = "qwen3-live-relaunched-storage"
     log = tmp_path / "server.log"
@@ -1754,7 +1757,7 @@ def test_a_relaunched_epoch_hands_its_own_storage_to_the_next_target(
         _on_trial(base_url)
         committed = admin(base_url, "config/commit")
         assert committed.status_code == 200, committed.text
-        _purged(base_url)
+        _committed(base_url)
         _lose_the_serving_engine(
             base_url, log, name, "relaunched-after-a-switch", standby=False
         )
@@ -1768,9 +1771,9 @@ def test_a_relaunched_epoch_hands_its_own_storage_to_the_next_target(
         rolled = admin(base_url, "config/rollback", {"reason": "the check"})
         assert rolled.status_code == 200, rolled.text
         wait_until(
-            lambda: _update(base_url).get("phase") == "abandoned",
+            lambda: update_report(base_url).get("phase") == "rolled_back",
             300,
-            "the revert did not end",
+            "the rollback did not end",
             context=lambda: _log_trouble(log),
         )
         _apply_settled(base_url, revisions[2])
@@ -1860,16 +1863,8 @@ def _failed_requests(base_url: str) -> float:
     )
 
 
-def _update(base_url: str) -> dict:
-    """The update in flight or the last one, as ``GET /admin/config`` reports it."""  # noqa: E501
-    status = httpx.get(f"{base_url}/admin/config", timeout=60).json()
-    return status.get("update") or {}
-
-
 # The span a trial's step time and throughput are averaged over.
 TRIAL_WINDOW_S = 5
-# Longer than the period an engine reports its counters on.
-STATS_REPORT_S = 3
 
 
 def _slower_engine(directory: Path) -> str:
@@ -1953,66 +1948,36 @@ def _assert_whole(streaming: threading.Thread, streamed: dict) -> int:
     return len(numbers)
 
 
-def _cached_tokens_read(
-    base_url: str, ask: Callable[[], object]
-) -> tuple[float, float]:
-    """The prompt tokens `ask` finds cached, and those of them it reads from
-    the host KV cache (``uniserve:prefix_cache_hits`` and
-    ``uniserve:prefix_cache_host_hits``).
-
-    An engine reports its counters on a period, so each reading waits for the
-    report that holds what came before it.
-    """  # noqa: D205
-    time.sleep(STATS_REPORT_S)
-    hits = metric(base_url, "uniserve:prefix_cache_hits")
-    host = metric(base_url, "uniserve:prefix_cache_host_hits")
-    ask()
-    time.sleep(STATS_REPORT_S)
-    return (
-        metric(base_url, "uniserve:prefix_cache_hits") - hits,
-        metric(base_url, "uniserve:prefix_cache_host_hits") - host,
-    )
-
-
 def _host_tokens_read(base_url: str, ask: Callable[[], object]) -> float:
-    """The prompt tokens `ask` reads from the host KV cache."""
-    return _cached_tokens_read(base_url, ask)[1]
+    """The prompt tokens `ask` loads from the host tier."""
+    return tokens_found(base_url, ask)[1]["host_hits"]
 
 
 def _device_tokens_read(base_url: str, ask: Callable[[], object]) -> float:
     """The prompt tokens `ask` finds cached on the device."""
-    hits, host = _cached_tokens_read(base_url, ask)
-    return hits - host
+    found = tokens_found(base_url, ask)[1]
+    return found["hits"] - found["host_hits"]
 
 
-def _purged(base_url: str) -> None:
-    """Waits until the committed switch ended its previous epoch."""
-    wait_until(
-        lambda: _update(base_url).get("phase") == "purged",
-        300,
-        "the commit did not end the previous epoch",
-    )
+def _committed(base_url: str) -> None:
+    """Waits until the committed switch released its previous epoch."""
+    wait_for_phase(base_url, "committed", timeout_s=300)
 
 
 def _on_trial(base_url: str) -> dict:
-    """Waits until the update in flight stands on probation."""
-    wait_until(
-        lambda: _update(base_url).get("phase") == "probation",
-        600,
-        "the update did not reach its trial",
-    )
-    return _update(base_url)
+    """Waits until the update in flight stands on trial."""
+    return wait_for_phase(base_url, "trial", timeout_s=600)
 
 
 @pytest.mark.parametrize("previous_epoch", ["parked", "weights", "host"])
 def test_an_operator_rollback_returns_to_the_previous_epoch_under_a_request(
     tmp_path: Path, runtime: Path, previous_epoch: str
 ):
-    """A revert by hand ends the trial with no request lost.
+    """A rollback by hand ends the trial with no request lost.
 
     The previous epoch is kept as ``update_config.previous_epoch`` states: its
     drained processes stay alive through the trial, or they exit with its
-    weights kept, and the revert starts them again on those.
+    weights kept, and the rollback starts them again on those.
     """
     name = "qwen3-live-rollback"
     log = tmp_path / "server.log"
@@ -2037,18 +2002,23 @@ def test_an_operator_rollback_returns_to_the_previous_epoch_under_a_request(
                 )
         else:
             assert all(runs(pid) for pid in before)
+
         # A node that cannot move the weights keeps them on its GPUs, and says
         # why.
-        wait_until(
-            lambda: (
+        def kept_as_stated() -> bool:
+            report = update_report(base_url)
+            return (
                 previous_epoch == "parked"
-                or _update(base_url)["moved_to_host_bytes"] > 0
-                or _update(base_url)["previous_epoch_kept"] == previous_epoch
-            ),
+                or report["moved_to_host_bytes"] > 0
+                or report["previous_epoch_kept"] == previous_epoch
+            )
+
+        wait_until(
+            kept_as_stated,
             120,
             "the previous epoch's storage was not kept",
         )
-        trial = _update(base_url)
+        trial = update_report(base_url)
         print("kept:", json.dumps(trial))
         if not trial["host_refused"]:
             assert trial["previous_epoch_kept"] == previous_epoch, trial
@@ -2077,22 +2047,22 @@ def test_an_operator_rollback_returns_to_the_previous_epoch_under_a_request(
             after["choices"][0]["message"]["content"]
             == answer["choices"][0]["message"]["content"]
         )
-        update = _update(base_url)
-        assert update["phase"] == "abandoned", update
+        update = update_report(base_url)
+        assert update["phase"] == "rolled_back", update
         assert update["failure"]["reason"] == "the check", update
 
 
-def test_a_regression_of_the_epoch_on_trial_reverts_it(
+def test_a_regression_of_the_epoch_on_trial_rolls_it_back(
     tmp_path: Path, runtime: Path
 ):
-    """A target that steps slower past the threshold reverts by itself.
+    """A target that steps slower past the threshold rolls back by itself.
 
     The target's executable walks every batch instead of replaying a graph, so
     the same stream steps slower on it with no fault. The stream crosses the
-    switch and the revert whole, the update ends unavailable with the
+    switch and the rollback whole, the update ends unavailable with the
     threshold's reason, and applying it again needs ``force``. Forced without
     the threshold, the same slower target stands its trial: the threshold, and
-    nothing else, reverted it.
+    nothing else, rolled it back.
     """
     name = "qwen3-live-regression"
     log = tmp_path / "server.log"
@@ -2110,13 +2080,13 @@ def test_a_regression_of_the_epoch_on_trial_reverts_it(
         result = _apply(base_url, slower, *thresholds)
         assert result["change"] == "epoch", result
         wait_until(
-            lambda: _update(base_url).get("phase") == "abandoned",
+            lambda: update_report(base_url).get("phase") == "rolled_back",
             600,
-            "the slower epoch was not reverted",
+            "the slower epoch was not rolled back",
         )
-        update = _update(base_url)
+        update = update_report(base_url)
         assert update["failure"]["kind"] == "step_time_regression", update
-        print("reverted:", json.dumps(update))
+        print("rolled back:", json.dumps(update))
         (replica,) = update["trial"]["replicas"]
         assert replica["baseline"]["tokens_per_second"] > 0, update
         assert replica["rates"]["step_us"] > replica["baseline"]["step_us"], (
@@ -2129,39 +2099,31 @@ def test_a_regression_of_the_epoch_on_trial_reverts_it(
             == answer["choices"][0]["message"]["content"]
         )
 
-        again = httpx.put(
-            f"{base_url}/admin/config",
-            json={"set": [slower]},
-            timeout=1800,
-        )
+        again = apply_config(base_url, slower)
         assert again.status_code != 200, again.text
         assert "force" in again.text, again.text
 
         streaming, streamed = _start_count(base_url, name)
         time.sleep(TRIAL_WINDOW_S + 2)
-        forced = httpx.put(
-            f"{base_url}/admin/config",
-            json={"set": [slower], "force": True},
-            timeout=1800,
-        )
+        forced = apply_config(base_url, slower, force=True)
         assert forced.status_code == 200, forced.text
         _on_trial(base_url)
         time.sleep(2 * TRIAL_WINDOW_S)
-        unthresholded = _update(base_url)
-        assert unthresholded["phase"] == "probation", unthresholded
+        unthresholded = update_report(base_url)
+        assert unthresholded["phase"] == "trial", unthresholded
         committed = admin(base_url, "config/commit")
         assert committed.status_code == 200, committed.text
         _assert_whole(streaming, streamed)
 
 
-def test_a_package_update_past_a_threshold_reverts_in_its_epoch(
+def test_a_package_update_past_a_threshold_rolls_back_in_its_epoch(
     tmp_path: Path, runtime: Path
 ):
     """A generation update stands the same trial as an epoch switch.
 
     The serving epoch computes a stream before the update and a trickle after
-    it, so its token throughput falls past the threshold. The update reverts in
-    the same main process, with the threshold as its failure.
+    it, so its token throughput falls past the threshold. The update rolls
+    back in the same main process, with the threshold as its failure.
     """
     name = "qwen3-live-package-trial"
     log = tmp_path / "server.log"
@@ -2177,25 +2139,26 @@ def test_a_package_update_past_a_threshold_reverts_in_its_epoch(
         assert result["change"] == "generation", result
         _assert_whole(streaming, streamed)
 
-        def reverted() -> bool:
+        def rolled_back() -> bool:
             _chat(base_url, name, RECOVERY_PROMPT, tokens=2)
             time.sleep(1)
-            return bool(_update(base_url).get("failure"))
+            return bool(update_report(base_url).get("failure"))
 
-        wait_until(reverted, 120, "the update was not reverted")
-        update = _update(base_url)
-        print("reverted:", json.dumps(update))
+        wait_until(rolled_back, 120, "the update was not rolled back")
+        update = update_report(base_url)
+        print("rolled back:", json.dumps(update))
         assert update["failure"]["kind"] == "throughput_regression", update
 
 
-def test_a_request_that_ends_at_once_leaves_its_pages_in_the_host_cache(
+def test_a_request_that_ends_at_once_leaves_its_blocks_in_the_host_tier(
     tmp_path: Path, runtime: Path
 ):
-    """A prompt's pages reach the host KV cache though no batch follows them.
+    """A prompt's blocks reach the host tier though no batch follows them.
 
-    A request of one output token ends with the step that completes its pages,
-    and nothing else runs, so their copy has no later batch to go with: the
-    scheduler submits a batch of copies alone.
+    A request of one output token ends with the step that fills its blocks,
+    and nothing else runs, so the copies its stores need have no later batch
+    to go with: the scheduler sends its executor an empty batch, which runs
+    them on the device's copy stream (``specs/buffer-pool.md`` §10).
     """
     name = "qwen3-live-copies-alone"
     log = tmp_path / "server.log"
@@ -2210,7 +2173,7 @@ def test_a_request_that_ends_at_once_leaves_its_pages_in_the_host_cache(
         )
         print("host tokens of a request of one token:", found)
         assert found > 0, found
-        # What moved the pages is on the report beside what computed them.
+        # What moved the blocks is on the report beside what computed them.
         metrics = httpx.get(f"{base_url}/metrics", timeout=10).text
         copied = [
             line
@@ -2225,13 +2188,16 @@ def test_a_request_that_ends_at_once_leaves_its_pages_in_the_host_cache(
 def test_host_hits_beyond_the_device_cache_all_finish(
     tmp_path: Path, runtime: Path
 ):
-    """Requests that find more pages in the host than the device holds all end.
+    """Requests that find more blocks in the host tier than the device holds
+    all end.
 
-    A host hit takes the units of its pages at admission, and a resident keeps
-    its units until it ends. Admitted together, requests whose tails run past
-    their first chunk would hold every unit with none left for those tails, so
-    admission keeps the units the residents' prompts still need.
-    """
+    A host hit takes the units of its blocks at admission, and a running
+    request keeps its units until it ends. Admitted together, requests whose
+    tails run past their first chunk would hold every unit with none left for
+    those tails, so admission keeps available the units the running requests
+    still need to reach their next call and low watermark
+    (``specs/scheduler-design.md`` §4.4).
+    """  # noqa: D205
     name = "qwen3-live-host-hits"
     log = tmp_path / "server.log"
     prompts = [
@@ -2280,13 +2246,15 @@ def test_host_hits_beyond_the_device_cache_all_finish(
 def test_a_process_of_two_devices_keeps_the_host_kv_cache(
     tmp_path: Path, runtime: Path, parallel: tuple[str, tuple[str, ...]]
 ):
-    """A main process over two devices finds a prompt's pages in the host.
+    """A main process over two devices finds a prompt's blocks in the host
+    tier.
 
-    Each of its schedulers serves one device and keeps the host pools of its
-    own pages, which an expert union computes on both devices. A prompt flushed
-    from the device cache is read back from the host, and the answer is the one
-    it gave before.
-    """
+    Each of its schedulers serves one device with a queue pair of its own on
+    the host's buffer pool, whose host regions keep the blocks it stores,
+    which an expert union computes on both devices. A prompt whose device
+    copies a flush evicted is loaded back from the host, and the answer is the
+    one it gave before.
+    """  # noqa: D205
     kind, options = parallel
     name = f"qwen3-live-host-{kind}"
     log = tmp_path / "server.log"
@@ -2403,22 +2371,22 @@ def test_requests_that_outgrow_the_cache_in_decode_all_finish(
         assert reasons == ["length"], reasons
 
 
-def test_a_weight_update_leaves_the_pages_of_the_old_weights_in_the_host_cache(
+def test_a_weight_update_leaves_the_blocks_of_the_old_weights_unread(
     tmp_path: Path, runtime: Path
 ):
-    """A page in the host KV cache belongs to the weights that computed it.
+    """A block in the host tier belongs to the weights that computed it.
 
-    A prompt finds its pages in the host cache once the device's prefix cache is
-    flushed. After an update to other weights the same prompt finds none of
-    them, although the new weights name the same model: it computes its own,
-    which the next flush makes it find. The other checkpoint is another copy of
-    the files, so the two weights answer alike and a stale page would go unseen
-    in the text.
+    A prompt finds its blocks in the host tier once their device copies are
+    flushed. After an update to other weights the engine keys its blocks by
+    the new weights, so the same prompt finds none of them, although the new
+    weights name the same model: it computes its own, which the next flush
+    makes it find. The other checkpoint is another copy of the files, so the
+    two weights answer alike and a stale block would go unseen in the text.
     """
     other = str(
         host_asset("UNISERVE_QWEN3_UPDATED_MODEL", QWEN3_UPDATED_CHECKPOINT)
     )
-    name = "qwen3-live-weights-pages"
+    name = "qwen3-live-weights-blocks"
     log = tmp_path / "server.log"
     prompt = " ".join(f"item {index} of the list" for index in range(800))
 
@@ -2460,11 +2428,11 @@ def test_a_weight_update_leaves_the_pages_of_the_old_weights_in_the_host_cache(
 def test_a_previous_epoch_in_host_storage_moves_its_weights_and_returns(
     tmp_path: Path, runtime: Path
 ):
-    """``previous_epoch = "host"`` moves bytes, and a revert brings them back.
+    """``previous_epoch = "host"`` moves bytes, and a rollback brings them back.
 
     A target of other model files maps none of the serving epoch's weights, so
     the weights that epoch alone retains leave its GPU for host storage while
-    the target serves. The revert returns them and starts the epoch on them,
+    the target serves. The rollback returns them and starts the epoch on them,
     under a stream that crosses both moves whole, and it answers as it did.
     """
     other = str(
@@ -2485,13 +2453,13 @@ def test_a_previous_epoch_in_host_storage_moves_its_weights_and_returns(
         _on_trial(base_url)
         wait_until(
             lambda: (
-                _update(base_url)["moved_to_host_bytes"] > 0
-                or _update(base_url)["host_refused"]
+                update_report(base_url)["moved_to_host_bytes"] > 0
+                or update_report(base_url)["host_refused"]
             ),
             300,
             "the previous epoch's weights did not move",
         )
-        trial = _update(base_url)
+        trial = update_report(base_url)
         print("kept:", json.dumps(trial))
         assert not trial["host_refused"], trial
         assert trial["previous_epoch_kept"] == "host", trial
@@ -2503,8 +2471,8 @@ def test_a_previous_epoch_in_host_storage_moves_its_weights_and_returns(
             after["choices"][0]["message"]["content"]
             == answer["choices"][0]["message"]["content"]
         )
-        update = _update(base_url)
-        assert update["phase"] == "abandoned", update
+        update = update_report(base_url)
+        assert update["phase"] == "rolled_back", update
 
 
 def test_package_updates_under_a_request_keep_its_stream_whole(
@@ -2512,7 +2480,7 @@ def test_package_updates_under_a_request_keep_its_stream_whole(
 ):
     """In-place switches under a request leave its stream as a run without them.
 
-    A generation update reaches a process that serves: its switchover captures
+    A generation update reaches a process that serves: its switch captures
     nothing a batch of the running request can be mistaken for, so every token
     the request computes is the one its stream delivers. The count crosses as
     many switches as fit under it, each one committed.

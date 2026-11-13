@@ -16,13 +16,14 @@ from pathlib import Path
 import httpx
 
 from tests.python.e2e.http_helpers import (
+    admin_request,
+    engine_selection,
     find_free_port,
     granted_devices,
     qwen3_checkpoint,
     require_uniserve_binary,
     runtime_directory,
     server_process,
-    engine_selection,
 )
 
 NAME = "qwen3-profiling"
@@ -116,17 +117,24 @@ class Load:
 
 
 def profile(base_url: str) -> dict | None:
-    response = httpx.get(f"{base_url}/admin/profile", timeout=30)
+    """The running session, or the last that ended (``GET /admin/profile``)."""
+    response = admin_request(base_url, "GET", "/admin/profile", timeout_s=30)
     response.raise_for_status()
     return response.json()["session"]
 
 
 def start(base_url: str, request: dict) -> dict:
-    response = httpx.post(
-        f"{base_url}/admin/profile", json=request, timeout=600
+    """Starts a session of `request` (``POST /admin/profile``)."""
+    response = admin_request(
+        base_url, "POST", "/admin/profile", body=request, timeout_s=600
     )
     assert response.status_code == 200, response.text
     return response.json()["result"]
+
+
+def stop(base_url: str) -> httpx.Response:
+    """Ends the running session (``DELETE /admin/profile``)."""
+    return admin_request(base_url, "DELETE", "/admin/profile", timeout_s=600)
 
 
 def ended(base_url: str, timeout_s: float) -> dict:

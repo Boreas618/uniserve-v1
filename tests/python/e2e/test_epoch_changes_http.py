@@ -1,49 +1,55 @@
-"""An epoch change continues the requests in flight on a successor epoch.
+"""An epoch change moves the requests in flight to a target epoch.
 
-The successor serves on trial until the operator commits it or rolls it
-back.
+The target serves on trial until the operator commits it or rolls it back.
 
 Qwen3-MoE (``UNISERVE_QWEN3_MODEL``) streams a long greedy count. While it
-streams, ``PUT /admin/config`` changes the decode batch sizes the CUDA graphs
-capture, which only a new epoch executes: a successor epoch starts beside
-the serving one on the same GPUs and maps its weights and KV cache segments
-read-only; at a step boundary the serving epoch parks, its streaming
-request leaving it as migratable after every token it generated; the
-successor serves on trial, and the daemon submits the request again with
-those tokens. The client reads one uninterrupted stream, equal to the count
-the committed epoch decodes for the same request alone, with the same usage.
+streams, ``PUT /admin/config`` changes what only a new epoch executes: the
+target's engines start beside the serving ones on the same GPUs, open their
+sessions with the host's buffer pool, map the weights they share and park.
+The switch then lets both epochs step (``specs/updates.md`` §3.7): the target
+is promoted and admits every new request, and the serving engines drain beside
+it, stepping their running requests until each ends or the drain's deadline
+(``update_config.drain_s``) ends it as migratable, its blocks committed under
+their keys, the partial last one too. The daemon submits it again to the
+target with the tokens it generated. The client reads one uninterrupted
+stream, equal to the count the committed epoch decodes for the same request
+alone, with the same usage.
 
-- A commit releases the previous epoch: its engine's process exits and the
-  quotas reserve the committed epoch alone. The trial refuses another change
-  meanwhile. The deployment runs on one GPU, as two schedulers sharing their
-  experts (``--data-parallel-size 2`` with expert parallelism), or as
-  attention and expert workers exchanging through DeepEP.
-- A change that keeps the functions and formats invalidates nothing: the
-  successor maps every retained weight, and after the commit a cached prompt
-  finds as many tokens cached as before the change, on the device and, once
-  fill prompts pushed its pages out of it, in the host KV cache.
-- A change of the model's files loads the successor's weights beside the
-  serving epoch's; a commit leaves them alone on the GPU, and a rollback
+- A change of the engine alone keeps the layout: the two epochs name the
+  same regions, so every block the serving epoch committed is a hit of the
+  target at once, on the device; the request that migrates pays one admission
+  and the clone of its partial last block. A commit releases the previous
+  epoch: its engine's process exits and the quotas reserve the committed
+  epoch alone. The trial refuses another change meanwhile. The deployment
+  runs on one GPU, as two schedulers sharing their experts
+  (``--data-parallel-size 2`` with expert parallelism), or as attention and
+  expert workers exchanging through DeepEP.
+- A change of the graph buckets is another layout (``shrink``): the target
+  opens regions of its own, the serving engines give their device memory
+  back as their requests end, and the target grows into it, so no segment
+  is ever held by both epochs. A cached prompt reaches the target through
+  the host tier, where the write policy stored its blocks.
+- A change of the model's files keeps the layout and changes every key: the
+  target loads its weights beside the serving epoch's and reads none of its
+  blocks; a commit leaves its weights alone on the GPU, and a rollback
   resumes the previous epoch on the weights it kept
-  (``update_config.previous_epoch``).
-- A parked previous epoch whose cache the successor does not map evicts
-  every segment past its first, and a rollback reads the evicted pages back.
+  (``update_config.previous_epoch``) and finds the blocks the target evicted
+  from the shared regions in the host tier or the remote store behind it.
 
 What the tests check is what the admin API reports: ``PUT /admin/config``
 answers the change it started, ``GET /admin/config`` the epoch that executes
 (``executing``), the update with its phase (``update``), the node's main
 processes (``processes``) and every GPU's quota (``quotas``), and
-``/metrics`` the prefix cache's counters. The tests print the pause of every
-promotion. Each runs a Storage Server of its own: ``XDG_RUNTIME_DIR`` points
-the daemon at a directory of the test's, and the server the daemon starts
-there is stopped at the end.
+``/metrics`` the prefix cache's counters. The tests print the time of every
+switch. Each runs a Storage Server of its own: ``XDG_RUNTIME_DIR`` points the
+daemon at a directory of the test's, and the server the daemon starts there
+is stopped at the end.
 """
 
 from __future__ import annotations
 
 import json
 import os
-import subprocess
 import threading
 import time
 import tomllib
@@ -60,21 +66,25 @@ from tests.python.e2e.http_helpers import (
     QWEN3_UPDATED_CHECKPOINT,
     admin,
     admin_config,
+    apply_config,
     dedicated_experts,
     engine_processes,
+    engine_revision,
+    engine_selection,
     find_free_port,
     granted_devices,
     host_asset,
-    log_tail,
-    metric,
+    prefix_counters,
     qwen3_checkpoint,
     require_uniserve_binary,
     runs,
     runtime_directory,
     scaled,
     server_process,
+    tokens_found,
+    update_report,
+    wait_for_phase,
     wait_until,
-    engine_selection,
 )
 
 pytestmark = [pytest.mark.e2e, pytest.mark.gpu, pytest.mark.model("qwen3")]
@@ -86,7 +96,7 @@ PROMPT = (
     "Count from 1 to 5000, separated by commas and spaces. "
     "Write only the numbers."
 )
-# A prompt of several pages, whose pages the serving epoch publishes.
+# A prompt of several blocks, whose blocks the serving epoch commits.
 CACHED_PROMPT = "Describe the sea in one sentence. " * 40
 # Options every deployment of the tests serves with: few captured graphs,
 # so that epochs start while the count streams, and a small KV cache.
@@ -98,12 +108,13 @@ OPTIONS = (
     "cuda_graph_config.prefill_token_sizes=[512]",
     "cuda_graph_config.decode_batch_sizes=[1, 2, 4, 8]",
 )
-# The change every test applies: graphs of other decode batch sizes, which
-# a new epoch captures.
-CHANGE = "cuda_graph_config.decode_batch_sizes=[1, 2, 4, 8, 16]"
-# How long a successor takes to reach its trial, and a commit or a rollback
-# to end, at most.
+# A change of another layout: graphs of other decode batch sizes.
+OTHER_LAYOUT = "cuda_graph_config.decode_batch_sizes=[1, 2, 4, 8, 16]"
+# How long a target takes to reach its trial, and a commit or a rollback to
+# end, at most.
 UPDATE_TIMEOUT_S = 900
+# The items of a GPU's quota an epoch holds while it serves.
+EPOCH_ITEMS = ("weights", "cache_segment", "graph_pool", "process")
 
 
 def _topology(topology: str, tmp_path: Path) -> tuple[str, tuple[str, ...]]:
@@ -138,13 +149,8 @@ def _serve(
     name: str,
     devices: str | None = None,
     options: tuple[str, ...] = (),
-    storage: tuple[str, ...] | None = None,
 ) -> Iterator[str]:
-    """A deployment serving `name` on `devices`; its URL.
-
-    With `storage`, a Storage Server started by hand with those options
-    serves the deployment, which starts none of its own.
-    """
+    """A deployment serving `name` on `devices`; its URL."""
     port = find_free_port()
     base_url = f"http://127.0.0.1:{port}"
     command = [
@@ -167,23 +173,6 @@ def _serve(
             "CUDA_VISIBLE_DEVICES": devices or granted_devices(1),
             "XDG_RUNTIME_DIR": str(runtime),
         }
-        if storage is not None:
-            socket = runtime / "uniserve" / "storage-server.sock"
-            socket.parent.mkdir(mode=0o700)
-            subprocess.run(
-                [
-                    str(require_uniserve_binary()),
-                    "storage-server",
-                    "serve",
-                    "--socket",
-                    str(socket),
-                    "--daemon",
-                    *storage,
-                ],
-                env={**os.environ, **environment},
-                check=True,
-                timeout=120,
-            )
         with server_process(
             command,
             base_url,
@@ -314,38 +303,11 @@ class Streaming:
         assert self.error is None, f"the stream failed: {self.error!r}"
 
 
-def _apply(base_url: str, *assignments: str, **body: object) -> httpx.Response:
-    """``PUT /admin/config`` with `assignments` and the other fields of
-    `body` (``force``, ``in_flight``, ``dry_run``).
-    """  # noqa: D205
-    return httpx.put(
-        f"{base_url}/admin/config",
-        json={"set": list(assignments), **body},
-        timeout=scaled(1800),
-    )
-
-
 def _executing(base_url: str) -> int:
-    """The epoch that executes, which ``GET /admin/config`` reports."""
+    """The epoch that serves, which ``GET /admin/config`` reports."""
     executing = admin_config(base_url)["executing"]
-    assert executing["state"] == "executing", executing
+    assert executing["state"] == "serving", executing
     return executing["epoch"]
-
-
-def _update(base_url: str) -> dict:
-    """The update in flight, or the one that ended last."""
-    return admin_config(base_url).get("update") or {}
-
-
-def _phase(base_url: str, phase: str, what: str) -> dict:
-    """Waits until the update reaches `phase`; returns it."""
-    wait_until(
-        lambda: _update(base_url).get("phase") == phase,
-        UPDATE_TIMEOUT_S,
-        what,
-        context=lambda: f"\nupdate: {_update(base_url)}",
-    )
-    return _update(base_url)
 
 
 def _epoch_change(
@@ -354,27 +316,27 @@ def _epoch_change(
     """Applies `assignments` as an epoch change and waits for its trial;
     returns the update and the epoch on trial.
     """  # noqa: D205
-    response = _apply(base_url, *assignments, **body)
+    response = apply_config(base_url, *assignments, **body)
     assert response.status_code == 200, response.text
     result = response.json()["result"]
     assert result["change"] == "epoch", result
-    update = _phase(base_url, "probation", "the update did not reach its trial")
+    update = wait_for_phase(base_url, "trial", timeout_s=UPDATE_TIMEOUT_S)
     print(f"switch: {update['switch_ms']} ms")
     return update, _executing(base_url)
 
 
 def _commit(base_url: str) -> None:
-    """Commits the trial and waits until it ended the previous epoch."""
+    """Commits the trial and waits until it released the previous epoch."""
     committed = admin(base_url, "config/commit")
     assert committed.status_code == 200, committed.text
-    _phase(base_url, "purged", "the commit did not end the previous epoch")
+    wait_for_phase(base_url, "committed", timeout_s=UPDATE_TIMEOUT_S)
 
 
 def _rollback(base_url: str, reason: str) -> dict:
     """Rolls the trial back and waits until it ended; returns the update."""
     rolled = admin(base_url, "config/rollback", {"reason": reason})
     assert rolled.status_code == 200, rolled.text
-    update = _phase(base_url, "abandoned", "the rollback did not end")
+    update = wait_for_phase(base_url, "rolled_back", timeout_s=UPDATE_TIMEOUT_S)
     assert update["failure"]["reason"] == reason, update
     return update
 
@@ -385,9 +347,9 @@ def _change_under_traffic(
     """Keep one request running throughout preparation, retaining every
     result; returns the epoch on trial and the streams.
 
-    A finite request can finish while a successor warms. Start the next with
-    the same prompt and token limit so the test observes migration of a live
-    request regardless of the number of requests preparation spans.
+    A finite request can finish while a target prepares. Start the next with
+    the same prompt and token limit so the test observes the migration of a
+    live request regardless of the number of requests preparation spans.
     """  # noqa: D205
     streams = [streaming]
     with ThreadPoolExecutor(max_workers=1) as executor:
@@ -402,25 +364,26 @@ def _change_under_traffic(
     return epoch, streams
 
 
-def _planned(base_url: str, *assignments: str, **body: object) -> dict:
-    """The plan of a dry run of `assignments`, which changes nothing: the
-    epoch it would switch to, its executable, generation and nodes.
+def _dry_run(base_url: str, *assignments: str, **body: object) -> dict:
+    """The report of a dry run of `assignments`, which changes nothing: the
+    epoch it would switch to, its engine package, its engines, and whether
+    the layouts differ (``shrink``).
     """  # noqa: D205
     serving = _executing(base_url)
-    response = _apply(base_url, *assignments, dry_run=True, **body)
+    response = apply_config(base_url, *assignments, dry_run=True, **body)
     assert response.status_code == 200, response.text
     result = response.json()["result"]
-    assert result["change"] == "planned", result
-    plan = result["plan"]
-    assert plan["change"] == "epoch", plan
-    assert plan["epoch"] != serving, plan
+    assert result["change"] == "dry_run", result
+    report = result["dry_run"]
+    assert report["change"] == "epoch", report
+    assert report["epoch"] != serving, report
     assert _executing(base_url) == serving
-    return plan
+    return report
 
 
 def _quotas(status: dict) -> list[dict]:
     """Every GPU's quota ``GET /admin/config`` reports, each of
-    whose entries' bytes sum to no more than its quota.
+    whose reservations' bytes sum to no more than its limit.
     """  # noqa: D205
     nodes = status["quotas"]
     assert isinstance(nodes, list) and nodes, status
@@ -433,7 +396,7 @@ def _quotas(status: dict) -> list[dict]:
 
 
 def _epochs_of(quotas: list[dict], item: str) -> set[tuple[int, ...]]:
-    """The sets of epochs holding the quotas' entries of `item`."""
+    """The sets of epochs holding the quotas' reservations of `item`."""
     return {
         tuple(entry["epochs"])
         for quota in quotas
@@ -442,9 +405,37 @@ def _epochs_of(quotas: list[dict], item: str) -> set[tuple[int, ...]]:
     }
 
 
+def _segments_of(base_url: str, epoch: int) -> int:
+    """The KV cache segments `epoch` holds on the deployment's GPUs."""
+    return sum(
+        1
+        for quota in _quotas(admin_config(base_url))
+        for entry in quota["reservations"]
+        if entry["item"] == "cache_segment" and epoch in entry["epochs"]
+    )
+
+
 def _engine_pids(base_url: str) -> set[int]:
     """The process ids of the deployment's main processes."""
     return {process["pid"] for process in engine_processes(base_url)}
+
+
+def _reused_by_the_migrated_request(base_url: str, before: dict) -> None:
+    """The target's admission of the migrated request found every token it
+    looked up cached: the blocks the serving epoch committed under their
+    keys, the partial last one by its tail key, so admission leaves only the
+    last emitted token to compute.
+    """  # noqa: D205
+    wait_until(
+        lambda: prefix_counters(base_url)["queries"] > before["queries"],
+        30,
+        "the migrated request's cache query was not reported",
+    )
+    time.sleep(scaled(2.0))
+    after = prefix_counters(base_url)
+    reused = after["hits"] - before["hits"]
+    queried = after["queries"] - before["queries"]
+    assert reused == queried > 0, (reused, queried)
 
 
 @pytest.mark.parametrize(
@@ -455,7 +446,7 @@ def _engine_pids(base_url: str) -> set[int]:
         pytest.param("dedicated", marks=pytest.mark.gpus(2)),
     ],
 )
-def test_a_epoch_change_continues_a_streaming_request_and_commits(
+def test_an_epoch_change_continues_a_streaming_request_and_commits(
     tmp_path: Path, topology: str
 ):
     devices, options = _topology(topology, tmp_path)
@@ -464,69 +455,61 @@ def test_a_epoch_change_continues_a_streaming_request_and_commits(
         serving = _executing(base_url)
         engines_before = _engine_pids(base_url)
         # Every GPU's quota reserves the serving epoch alone, within its
-        # quota: its weights, KV cache segments, graph pool and process.
+        # limit: its weights, KV cache segments, graph pool and process.
         quotas = _quotas(admin_config(base_url))
-        for item in ("weights", "cache_segment", "graph_pool", "process"):
+        for item in EPOCH_ITEMS:
             assert _epochs_of(quotas, item) == {(serving,)}, quotas
 
+        change = engine_revision()
         streaming = Streaming(base_url, name)
         streaming.wait_for(EARLY_TOKENS)
         wait_until(
-            lambda: _prefix_counter(base_url, "queries") > 0,
+            lambda: prefix_counters(base_url)["queries"] > 0,
             30,
             "the original request's cache query was not reported",
         )
-        queries_before = _prefix_counter(base_url, "queries")
-        hits_before = _prefix_hits(base_url)
-        # A dry run plans the change and changes nothing.
-        plan = _planned(base_url, CHANGE)
-        print(f"planned: {json.dumps(plan)}")
-        _, epoch = _epoch_change(base_url, CHANGE)
+        counters = prefix_counters(base_url)
+        # A dry run reports the change and changes nothing; a change of the
+        # engine alone keeps the layout.
+        report = _dry_run(base_url, change)
+        print(f"dry run: {json.dumps(report)}")
+        assert report["shrink"] is False, report
+        update, epoch = _epoch_change(base_url, change)
         streaming.mark()
         assert epoch != serving
+        assert update["shrink"] is False, update
 
-        # The successor serves on trial beside the parked previous epoch,
-        # whose main process still runs, and the trial refuses another
-        # change. Both epochs share each GPU's quota: the weights and the
-        # segments the successor maps are reserved once, held by both, beside
-        # each epoch's graph pool and process.
+        # The target serves on trial beside the parked previous epoch, whose
+        # main process still runs, and the trial refuses another change.
+        # Both epochs share each GPU's quota: the weights and the segments of
+        # the regions both name are reserved once, held by both, beside each
+        # epoch's graph pool and process.
         assert all(runs(pid) for pid in engines_before), engines_before
         quotas = _quotas(admin_config(base_url))
         both = (serving, epoch)
         assert _epochs_of(quotas, "weights") == {both}, quotas
         assert both in _epochs_of(quotas, "cache_segment"), quotas
         assert _epochs_of(quotas, "process") == {(serving,), (epoch,)}
-        refused = _apply(base_url, "max_running_requests=4")
+        refused = apply_config(base_url, "max_running_requests=4")
         assert refused.status_code == 409, refused.text
 
-        # The operator commits while the count streams on the successor,
-        # which writes new pages only to its own segments until then.
+        # The operator commits while the count streams on the target.
         streaming.wait_for(streaming.marked + 64)
-        wait_until(
-            lambda: _prefix_counter(base_url, "queries") > queries_before,
-            30,
-            "the resumed request's cache query was not reported",
-        )
-        # The successor found every token the previous epoch computed of the
-        # request cached, including the final partial page. Admission leaves
-        # only the last emitted token to run.
-        reused = _prefix_hits(base_url) - hits_before
-        queried = _prefix_counter(base_url, "queries") - queries_before
-        assert reused == queried > 0, (reused, queried)
+        _reused_by_the_migrated_request(base_url, counters)
         _commit(base_url)
         status = admin_config(base_url)
         assert status["executing"]["epoch"] == epoch, status["executing"]
-        graphs = tomllib.loads(status["config"])["cuda_graph_config"]
-        assert graphs["decode_batch_sizes"] == [1, 2, 4, 8, 16], graphs
+        configured = tomllib.loads(status["config"])["worker_config"]
+        revision = configured["engine_revision"]
+        assert change == f"worker_config.engine_revision={revision}", status
         # The commit released everything only the previous epoch held: the
-        # segments the successor mapped are its own on the quota now. The
-        # previous epoch's workers end their reservations as their processes
-        # exit, a moment after its engine's.
-        items = ("weights", "cache_segment", "graph_pool", "process")
+        # segments the target mapped are its own on the quota now. The
+        # previous epoch's ranks end their reservations as its process
+        # exits.
         wait_until(
             lambda: all(
                 _epochs_of(_quotas(admin_config(base_url)), item) == {(epoch,)}
-                for item in items
+                for item in EPOCH_ITEMS
             ),
             30,
             "the quotas did not reserve the committed epoch alone",
@@ -542,118 +525,69 @@ def test_a_epoch_change_continues_a_streaming_request_and_commits(
         reference, reference_usage = _ask(base_url, name)
 
     assert len(streaming.tokens) > streaming.marked, (
-        "the stream ended before the successor served"
+        "the stream ended before the target served"
     )
     assert streaming.tokens == reference
     assert streaming.usage == reference_usage
 
 
-def _forwards(base_url: str, mode: str) -> float:
-    """The forwards every epoch ran in ``mode`` so far (``eager`` or
-    ``graph_replay``; ``uniserve:worker_forward_mode_counts``), once the
-    reports of what came before arrived.
-    """  # noqa: D205
-    time.sleep(scaled(REPORT_SETTLE))
-    return metric(
-        base_url, "uniserve:worker_forward_mode_counts", f'mode="{mode}"'
-    )
-
-
-@pytest.mark.parametrize(
-    "topology",
-    [
-        "single",
-        pytest.param("experts", marks=pytest.mark.gpus(2)),
-        pytest.param("dedicated", marks=pytest.mark.gpus(2)),
-    ],
-)
-def test_a_serving_epoch_gives_its_graph_storage_to_a_preparing_successor(
-    tmp_path: Path, topology: str
-):
-    devices, options = _topology(topology, tmp_path)
-    name = "qwen3-epoch-eager"
-    with _serve(tmp_path, name, devices, options) as base_url:
-        streaming = Streaming(base_url, name)
-        streaming.wait_for(EARLY_TOKENS)
-        eager = _forwards(base_url, "eager")
-
-        # The serving epoch decodes the count eagerly while the successor
-        # prepares in its graph storage.
-        _epoch_change(base_url, CHANGE, "update_config.eager_prepare=true")
-        assert _forwards(base_url, "eager") > eager
-
-        # Resumed, the previous epoch replays its graphs again.
-        _rollback(base_url, "the operator's check")
-        replays = _forwards(base_url, "graph_replay")
-        eager = _forwards(base_url, "eager")
-        streaming.wait_for(len(streaming.tokens) + 64)
-        assert _forwards(base_url, "graph_replay") > replays
-        assert _forwards(base_url, "eager") == eager
-        streaming.join()
-
-
-def test_a_successor_continues_a_request_from_its_predecessors_device_pages(
+def test_a_target_continues_a_request_from_its_predecessors_device_blocks(
     tmp_path: Path,
 ):
-    """The successor of an epoch change reads the streaming request's pages
-    where the serving epoch left them: with no host KV cache to warm through,
-    every token the request computed is a device prefix cache hit on its
-    first forward on the successor, and the stream is the count alone.
+    """A target of the same layout reads the streaming request's blocks
+    where the serving epoch left them: with no host tier, every token the
+    request computed is a device hit of its admission on the target, and the
+    stream is the count alone.
     """  # noqa: D205
-    name = "qwen3-device-warming"
+    name = "qwen3-device-blocks"
     options = ("--set", "kv_cache_config.host_tier=false")
     with _serve(tmp_path, name, options=options) as base_url:
+        change = engine_revision()
         streaming = Streaming(base_url, name)
         streaming.wait_for(EARLY_TOKENS)
         wait_until(
-            lambda: _prefix_counter(base_url, "queries") > 0,
+            lambda: prefix_counters(base_url)["queries"] > 0,
             30,
             "the original request's cache query was not reported",
         )
-        queries_before = _prefix_counter(base_url, "queries")
-        hits_before = _prefix_hits(base_url)
-        host_before = _prefix_counter(base_url, "host_hits")
+        counters = prefix_counters(base_url)
 
-        _epoch_change(base_url, CHANGE)
+        _epoch_change(base_url, change)
         streaming.mark()
         streaming.wait_for(streaming.marked + 64)
-        wait_until(
-            lambda: _prefix_counter(base_url, "queries") > queries_before,
-            30,
-            "the resumed request's cache query was not reported",
-        )
-        reused = _prefix_hits(base_url) - hits_before
-        queried = _prefix_counter(base_url, "queries") - queries_before
-        assert reused == queried > 0, (reused, queried)
-        assert _prefix_counter(base_url, "host_hits") == host_before
+        _reused_by_the_migrated_request(base_url, counters)
+        host_hits = prefix_counters(base_url)["host_hits"]
+        assert host_hits == counters["host_hits"], (host_hits, counters)
         streaming.join()
         reference, reference_usage = _ask(base_url, name)
 
     assert len(streaming.tokens) > streaming.marked, (
-        "the stream ended before the successor served"
+        "the stream ended before the target served"
     )
     assert streaming.tokens == reference
     assert streaming.usage == reference_usage
 
 
-# Distinct prompts whose pages together outgrow the device KV cache (32768
-# tokens), pushing out the pages of a prompt asked before them, which the
-# host KV cache keeps.
+# Distinct prompts whose blocks together outgrow the device KV cache (32768
+# tokens), pushing out the blocks of a prompt asked before them, which the
+# host tier keeps.
 EVICTING_FILLS = 6
+# A prompt longer than one segment of the KV cache (an eighth of its 32768
+# tokens).
+FILL_PROMPT = "Name one colour of the rainbow. " * 900
 
 
-def _host_hits_of(
-    base_url: str, name: str, prompt: str, first: int
-) -> tuple[float, float]:
-    """The prompt tokens a query of `prompt` finds cached once fill prompts
-    numbered from `first` pushed its pages out of the device KV cache, and
-    those of them loaded from the host KV cache.
+def _fill(base_url: str, name: str, first: int) -> None:
+    """Asks `EVICTING_FILLS` fill prompts numbered from `first`, whose blocks
+    push older blocks out of the device KV cache.
     """  # noqa: D205
     for index in range(first, first + EVICTING_FILLS):
         _chat(base_url, name, f"{index}: {FILL_PROMPT}", tokens=1)
-    host = _prefix_counter(base_url, "host_hits")
-    _, hits = _hits_of(base_url, name, prompt)
-    return hits, _prefix_counter(base_url, "host_hits") - host
+
+
+def _found(base_url: str, name: str, prompt: str) -> tuple[str, dict]:
+    """The answer to `prompt` and the tokens it found cached per tier."""
+    return tokens_found(base_url, lambda: _chat(base_url, name, prompt))
 
 
 def test_a_resource_change_continues_requests_with_a_smaller_cache(
@@ -667,8 +601,9 @@ def test_a_resource_change_continues_requests_with_a_smaller_cache(
         "kv_cache_config.max_tokens=32768",
         "kv_cache_config.host_gib=8",
     )
-    # The cache also holds graph scratch units. Both capacities must fit
-    # the full count beside those units throughout successor preparation.
+    # The cache also holds the executor's scratch units. Both capacities must
+    # fit the full count beside those units throughout the target's
+    # preparation.
     with _serve(
         tmp_path,
         name,
@@ -695,68 +630,116 @@ def test_a_resource_change_continues_requests_with_a_smaller_cache(
             assert stream.usage == usage
 
 
-def test_a_change_of_the_executable_alone_invalidates_nothing(tmp_path: Path):
+def test_a_change_of_the_engine_alone_invalidates_nothing(tmp_path: Path):
     name = "qwen3-same-keys"
     with _serve(tmp_path, name) as base_url:
         serving = _executing(base_url)
-        # The prompt's pages are computed once and then found cached, on the
-        # device and, once pushed out of it, in the host KV cache.
+        # The prompt's blocks are computed once and then found cached, on the
+        # device and, once pushed out of it, in the host tier.
         answer = _chat(base_url, name, CACHED_PROMPT)
-        cached_answer, hits = _hits_of(base_url, name, CACHED_PROMPT)
-        assert cached_answer == answer and hits > 0, (cached_answer, hits)
-        host_before = _host_hits_of(base_url, name, CACHED_PROMPT, 0)
-        assert host_before[1] > 0, host_before
+        cached_answer, device_before = _found(base_url, name, CACHED_PROMPT)
+        assert cached_answer == answer and device_before["hits"] > 0, (
+            cached_answer,
+            device_before,
+        )
+        _fill(base_url, name, 0)
+        _, host_before = _found(base_url, name, CACHED_PROMPT)
+        assert host_before["host_hits"] > 0, host_before
 
-        # Graph capture changes none of the weights or page keys: the
-        # successor maps every weight the serving epoch holds.
-        _, epoch = _epoch_change(base_url, CHANGE)
+        # Another engine revision changes none of the weights or keys: the
+        # target maps every weight the serving epoch holds.
+        _, epoch = _epoch_change(base_url, engine_revision())
         weights = _epochs_of(_quotas(admin_config(base_url)), "weights")
         assert weights == {(serving, epoch)}, weights
         _commit(base_url)
 
         # The committed epoch finds as many of the prompt's tokens cached,
-        # on the device and in the host KV cache, and answers it as before.
-        assert _hits_of(base_url, name, CACHED_PROMPT) == (answer, hits)
-        host_after = _host_hits_of(
-            base_url, name, CACHED_PROMPT, EVICTING_FILLS
-        )
-        assert host_after == host_before, (host_after, host_before)
+        # on the device and in the host tier, and answers it as before.
+        cached_answer, device_after = _found(base_url, name, CACHED_PROMPT)
+        assert cached_answer == answer
+        assert device_after["hits"] == device_before["hits"], device_after
+        _fill(base_url, name, EVICTING_FILLS)
+        _, host_after = _found(base_url, name, CACHED_PROMPT)
+        assert (host_after["hits"], host_after["host_hits"]) == (
+            host_before["hits"],
+            host_before["host_hits"],
+        ), (host_after, host_before)
 
 
-# How long the counters an engine reports every second take to include
-# what a request it answered counted: two report intervals.
-REPORT_SETTLE = 2.0
-
-
-def _prefix_counter(base_url: str, name: str) -> float:
-    """A prefix cache counter every epoch counted so far, in tokens
-    (``uniserve:prefix_cache_<name>``).
+def test_a_change_of_layout_moves_device_memory_and_reaches_the_host_tier(
+    tmp_path: Path,
+):
+    """A change of the graph buckets is another layout. The target opens
+    regions of its own; the serving engines give their device memory back as
+    their requests end or migrate, and the target grows into it, segment by
+    segment, so no segment is held by the two epochs at once (R10). The
+    streaming request migrates at the drain's deadline and computes on the
+    target what it reaches through the host tier. A prompt the serving epoch
+    cached is found as deep as before, every block of it loaded from the host
+    tier, where the write policy stored it.
     """  # noqa: D205
-    return metric(base_url, f"uniserve:prefix_cache_{name}")
+    name = "qwen3-layout-change"
+    with _serve(tmp_path, name) as base_url:
+        serving = _executing(base_url)
+        engines_before = _engine_pids(base_url)
+        held = _segments_of(base_url, serving)
+        answer = _chat(base_url, name, CACHED_PROMPT)
+        _, cached = _found(base_url, name, CACHED_PROMPT)
+        assert cached["hits"] > 0, cached
 
+        report = _dry_run(base_url, OTHER_LAYOUT)
+        assert report["shrink"] is True, report
+        streaming = Streaming(base_url, name)
+        streaming.wait_for(EARLY_TOKENS)
+        update, epoch = _epoch_change(base_url, OTHER_LAYOUT)
+        streaming.mark()
+        assert update["shrink"] is True, update
 
-def _prefix_hits(base_url: str) -> float:
-    """The prefix cache hits every epoch counted so far."""
-    return _prefix_counter(base_url, "hits")
+        # The two layouts' device memory is never in two regions: no segment
+        # is reserved for both epochs, the drained epoch holds fewer than it
+        # did, and the target holds the rest.
+        quotas = _quotas(admin_config(base_url))
+        assert (serving, epoch) not in _epochs_of(quotas, "cache_segment"), (
+            quotas
+        )
+        assert _segments_of(base_url, serving) < held, quotas
+        assert _segments_of(base_url, epoch) > 0, quotas
 
+        # The migrated request streams on the target, so its admission is
+        # counted before the cached prompt's is read.
+        streaming.wait_for(streaming.marked + 64)
+        time.sleep(scaled(2.0))
+        cached_answer, found = _found(base_url, name, CACHED_PROMPT)
+        assert cached_answer == answer
+        assert found["hits"] == cached["hits"], (found, cached)
+        assert found["host_hits"] == found["hits"], found
 
-def _hits_of(base_url: str, name: str, prompt: str) -> tuple[str, float]:
-    """The answer to `prompt` and the prompt tokens it found cached.
+        _commit(base_url)
+        status = admin_config(base_url)
+        graphs = tomllib.loads(status["config"])["cuda_graph_config"]
+        assert graphs["decode_batch_sizes"] == [1, 2, 4, 8, 16], graphs
+        wait_until(
+            lambda: all(
+                _epochs_of(_quotas(admin_config(base_url)), item) == {(epoch,)}
+                for item in EPOCH_ITEMS
+            ),
+            30,
+            "the quotas did not reserve the committed epoch alone",
+        )
+        for pid in engines_before:
+            wait_until(
+                lambda pid=pid: not runs(pid),
+                120,
+                f"engine {pid} of the previous epoch outlived the commit",
+            )
+        streaming.join()
+        reference, reference_usage = _ask(base_url, name)
 
-    Its query is counted at admission and the pages it loads from the host
-    KV cache once they arrive, before it computes, so the hits are read once
-    the report carrying the query arrived and another followed.
-    """
-    queries = _prefix_counter(base_url, "queries")
-    hits = _prefix_hits(base_url)
-    answer = _chat(base_url, name, prompt)
-    wait_until(
-        lambda: _prefix_counter(base_url, "queries") > queries,
-        30,
-        "the request's prefix cache query was not reported",
+    assert len(streaming.tokens) > streaming.marked, (
+        "the stream ended before the target served"
     )
-    time.sleep(scaled(REPORT_SETTLE))
-    return answer, _prefix_hits(base_url) - hits
+    assert streaming.tokens == reference
+    assert streaming.usage == reference_usage
 
 
 def _updated_checkpoint() -> str:
@@ -768,9 +751,9 @@ def _updated_checkpoint() -> str:
     )
 
 
-# The share of the GPU a deployment whose successor loads every weight
-# again serves with: both epochs' weights, the successor's graph share and
-# both KV caches fit in it.
+# The share of the GPU a deployment whose target loads every weight again
+# serves with: both epochs' weights, the target's graph pool and the KV
+# regions fit in it.
 WEIGHTS_SHARE = ("--set", "mem_fraction_static=0.9")
 
 
@@ -782,7 +765,7 @@ def _weights_of(base_url: str) -> set[tuple[int, ...]]:
 @pytest.mark.parametrize(
     ("previous_epoch", "end"),
     [
-        # The successor serves without the predecessor's weights of the
+        # The target serves without the predecessor's weights of the
         # changed files: they are loaded, not mapped.
         pytest.param("parked", "commit", marks=pytest.mark.missing_state),
         ("parked", "rollback"),
@@ -790,17 +773,18 @@ def _weights_of(base_url: str) -> set[tuple[int, ...]]:
         ("host", "rollback"),
     ],
 )
-def test_a_change_of_model_files_loads_the_successors_weights(
+def test_a_change_of_model_files_loads_the_targets_weights(
     tmp_path: Path, previous_epoch: str, end: str
 ):
     """An epoch change to other model files of the same model loads the
-    successor's changed weights from them beside the serving epoch's and
-    maps the tensors both checkpoints hold alike; the count streaming
-    meanwhile continues on the state it reached. The successor answers with
-    its weights. A commit leaves its weights alone on the GPU; a rollback
-    answers as before on the previous epoch: parked, started again on the
-    weights it kept on the GPU, or on the weights it kept in host storage,
-    which return to the GPU first.
+    target's changed weights from them beside the serving epoch's and maps
+    the tensors both checkpoints hold alike; the count streaming meanwhile
+    migrates at the drain's deadline and computes its state again on the
+    target, whose keys reach none of the serving epoch's blocks. The target
+    answers with its weights. A commit leaves its weights alone on the GPU; a
+    rollback answers as before on the previous epoch: parked, started again
+    on the weights it kept on the GPU, or on the weights it kept in host
+    storage, which return to the GPU first.
     """  # noqa: D205
     name = "qwen3-epoch-weights"
     updated = _updated_checkpoint()
@@ -817,22 +801,23 @@ def test_a_change_of_model_files_loads_the_successors_weights(
 
         update, epoch = _epoch_change(base_url, *change)
         streaming.mark()
+        assert update["shrink"] is False, update
         if previous_epoch == "host":
-            # The previous epoch's weights the successor does not map leave
-            # its GPU for host storage while the successor serves.
+            # The previous epoch's weights the target does not map leave
+            # its GPU for host storage while the target serves.
             wait_until(
                 lambda: (
-                    _update(base_url)["moved_to_host_bytes"] > 0
-                    or _update(base_url)["host_refused"]
+                    update_report(base_url)["moved_to_host_bytes"] > 0
+                    or update_report(base_url)["host_refused"]
                 ),
                 300,
                 "the previous epoch's weights did not move",
             )
-            update = _update(base_url)
+            update = update_report(base_url)
             assert not update["host_refused"], update
         assert update["previous_epoch_kept"] == previous_epoch, update
 
-        # The successor answers with its own weights. Both epochs hold the
+        # The target answers with its own weights. Both epochs hold the
         # tensors the checkpoints share; the previous epoch keeps its other
         # weights on the GPU, or in host storage, which leaves no weights of
         # the previous epoch alone in the GPU's quota.
@@ -853,7 +838,7 @@ def test_a_change_of_model_files_loads_the_successors_weights(
                 "the previous epoch's weights outlived the commit",
             )
             streaming.join()
-            # The committed epoch answers with the successor's weights. Its
+            # The committed epoch answers with the target's weights. Its
             # answer during the trial shared its batch with the count, whose
             # greedy decoding may part from an answer computed alone.
             assert _chat(base_url, name, CACHED_PROMPT) != original
@@ -865,32 +850,25 @@ def test_a_change_of_model_files_loads_the_successors_weights(
         wait_until(
             lambda: _weights_of(base_url) == {(previous,)},
             60,
-            "the successor's weights outlived the rollback",
+            "the target's weights outlived the rollback",
         )
 
 
-# A prompt longer than one segment of the KV cache (an eighth of its 32768
-# tokens), which leaves the next prompt's pages in later segments.
-FILL_PROMPT = "Name one colour of the rainbow. " * 900
-# Another such prompt, which shares no page with the first.
-SECOND_FILL_PROMPT = "Name one planet of the solar system. " * 900
-
-# The KV storage behind the host KV cache (`kv_cache_config.mooncake`): the
+# The remote store behind the host tier (`kv_cache_config.mooncake`): the
 # Mooncake master this host runs (`host:port`) and the library its clients
 # load (`libmooncake_store.so`).
 MOONCAKE_MASTER = os.environ.get("UNISERVE_MOONCAKE_MASTER")
 MOONCAKE_LIBRARY = os.environ.get("MOONCAKE_STORE_LIBRARY")
 
-
-# A prompt of 17 pages of 64 tokens, which the fill prompts cached after it
-# push out of a small host KV cache, and which a rollback prefetches from
-# the KV storage whole.
+# A prompt of 17 blocks of 64 tokens, which the fill prompts cached after it
+# push out of a small host tier, and which a rollback prefetches from the
+# remote store whole.
 LONG_CACHED_PROMPT = "Describe the sea in one sentence. " * 160
 
 
 def _mooncake_options() -> tuple[str, ...]:
-    """Mooncake behind the host KV cache. The deployment's Storage Server
-    gives Mooncake a segment of 4 GiB, which holds every page.
+    """Mooncake behind the host tier. The deployment's Storage Server gives
+    Mooncake a segment of 4 GiB, which holds every block.
     """  # noqa: D205
     return (
         "--set",
@@ -902,25 +880,8 @@ def _mooncake_options() -> tuple[str, ...]:
     )
 
 
-def _no_pool_storage() -> tuple[str, ...]:
-    """The options of a Storage Server whose host admits no page pool, its
-    whole storage reserved, with Mooncake behind its pools: it stages the
-    pages of each rank through a pool of `STAGING_POOL_BYTES` (256 MiB).
-    """  # noqa: D205
-    return (
-        "--host-reserve-gib",
-        str(1 << 20),
-        "--mooncake-master",
-        str(MOONCAKE_MASTER),
-        "--mooncake-segment-bytes",
-        str(4 << 30),
-        "--mooncake-library",
-        str(MOONCAKE_LIBRARY),
-    )
-
-
-# Without a Mooncake master and its library, the cases with a KV storage
-# do not run.
+# Without a Mooncake master and its library, the case with a remote store
+# does not run.
 WITHOUT_MOONCAKE = pytest.mark.skipif(
     not (MOONCAKE_MASTER and MOONCAKE_LIBRARY),
     reason="no Mooncake master (UNISERVE_MOONCAKE_MASTER) and library "
@@ -928,82 +889,50 @@ WITHOUT_MOONCAKE = pytest.mark.skipif(
 )
 
 
-def _segments_of(base_url: str, epoch: int) -> int:
-    """The KV cache segments `epoch` holds on the deployment's GPUs."""
-    return sum(
-        1
-        for quota in _quotas(admin_config(base_url))
-        for entry in quota["reservations"]
-        if entry["item"] == "cache_segment" and epoch in entry["epochs"]
-    )
-
-
 @pytest.mark.parametrize(
-    "host_cache",
-    [
-        "host",
-        pytest.param("kv_storage", marks=WITHOUT_MOONCAKE),
-        pytest.param("no_host_pool", marks=WITHOUT_MOONCAKE),
-    ],
+    "tiers",
+    ["host", pytest.param("remote_store", marks=WITHOUT_MOONCAKE)],
 )
-def test_a_parked_epoch_evicts_the_cache_its_successor_does_not_map(
-    tmp_path: Path, host_cache: str
+def test_a_rollback_finds_the_blocks_its_target_evicted_in_the_lower_tiers(
+    tmp_path: Path, tiers: str
 ):
-    """A change to other model files whose requests in flight compute their
-    state again maps none of the serving epoch's KV cache. The previous
-    epoch, parked, evicts every segment past its first once the idle pages
-    there reached the host KV cache, and the successor's cache grows into
-    their storage. A rollback creates the segments again and reads the
-    evicted pages back from the host KV cache, answering as before.
+    """A change to other model files keeps the layout, so the target shares
+    the serving epoch's regions, and changes every key, so it reads none of
+    their blocks. Filling the regions with its own blocks, the target evicts
+    the previous epoch's unpinned blocks, which it learns of from the buffer
+    pool's listing. A rollback promotes the previous epoch again, which finds
+    its prompt's blocks in the host tier, where its write policy stored
+    them, and answers as before.
 
-    With `kv_storage`, the host KV cache of 1 GiB holds about 10900 tokens
-    of Qwen3-30B-A3B at 96 KiB a token, fewer than the pages the change
-    evicts, and Mooncake keeps what it commits: every evicted page passes
-    through it into the KV storage, from which the rollback reads back what
-    the host KV cache no longer holds. With `no_host_pool`, the host admits
-    no page pool at all, and the pages pass through a staging pool into the
-    KV storage.
+    With `remote_store`, the host tier of 1 GiB holds about 10900 tokens of
+    Qwen3-30B-A3B at 96 KiB a token, fewer than the target's fills store, and
+    every block stored on the host is stored on to Mooncake: the rollback's
+    admission prefetches what the host tier no longer holds from the remote
+    store, and loads it from the host.
     """  # noqa: D205
     name = "qwen3-epoch-evict"
     change = (
         f"model={_updated_checkpoint()}",
         "update_config.previous_epoch=parked",
     )
-    options, storage, cached = WEIGHTS_SHARE, None, CACHED_PROMPT
-    if host_cache == "kv_storage":
+    options, cached = WEIGHTS_SHARE, CACHED_PROMPT
+    if tiers == "remote_store":
         options += ("--set", "kv_cache_config.host_gib=1", *_mooncake_options())
         cached = LONG_CACHED_PROMPT
-    if host_cache == "no_host_pool":
-        options += _mooncake_options()
-        storage, cached = _no_pool_storage(), LONG_CACHED_PROMPT
-    with _serve(tmp_path, name, options=options, storage=storage) as base_url:
-        # The prompt's pages lie past the first segment.
-        _chat(base_url, name, FILL_PROMPT)
+    with _serve(tmp_path, name, options=options) as base_url:
         original = _chat(base_url, name, cached)
-        if host_cache != "host":
-            _chat(base_url, name, SECOND_FILL_PROMPT)
         previous = _executing(base_url)
-        held = _segments_of(base_url, previous)
-        assert held > 1
 
-        # A dry run plans the change and changes nothing.
-        _planned(base_url, *change, in_flight="recompute")
-        _, epoch = _epoch_change(base_url, *change, in_flight="recompute")
-        # The previous epoch keeps its first segment once the pages past it
-        # reached the host KV cache; the successor's cache grew past its
-        # head segment into the storage freed.
-        wait_until(
-            lambda: _segments_of(base_url, previous) == 1,
-            300,
-            "the parked epoch did not evict its segments past the first",
-            context=lambda: log_tail(tmp_path / "server.log"),
-        )
-        assert _segments_of(base_url, epoch) > 1
+        report = _dry_run(base_url, *change, in_flight="recompute")
+        assert report["shrink"] is False, report
+        _epoch_change(base_url, *change, in_flight="recompute")
         assert _chat(base_url, name, cached) != original
+        _fill(base_url, name, 0)
 
         _rollback(base_url, "the check")
         assert _executing(base_url) == previous
-        assert _segments_of(base_url, previous) == held
-        answer, hits = _hits_of(base_url, name, cached)
+        answer, found = _found(base_url, name, cached)
         assert answer == original
-        assert hits > 0, "the evicted pages were not read back"
+        assert found["host_hits"] > 0, (
+            f"the evicted blocks were not read back: {found}"
+        )

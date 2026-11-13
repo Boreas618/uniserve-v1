@@ -1,17 +1,19 @@
-"""A prefill group hands each request to a decode group.
+"""A prefill group transfers each request to a decode group.
 
 Qwen3 is served by a deployment of two worker groups: a ``prefill`` group
 that computes each prompt and samples its first token, and a ``decode``
-group that continues the request from that token. The scheduler drives both
-as separate workers: once the prefill group's call that sampled the first
-token is accepted, it copies the request's KV cache units from the prefill
-rank's device planes into the same units of the decode rank's, device to
-device through the host's Transfer Server, and the request decodes on the
-decode group (``docs/architecture.md``, Transfers). Each case compares the
-greedy tokens of fixed prompts with an undivided deployment's on one GPU,
-and finds every request's hand-off in the log. The time a hand-off took,
-from the copy's submission to its last task's end, is reported as measured,
-once per case; it is no benchmark.
+group that continues the request from that token. One scheduler drives both
+as separate groups of its session with the host's buffer pool: once the
+prefill group's call that sampled the first token is output, the scheduler
+submits a ``Transfer`` of the request's owner to the decode group, stamped by
+the prefill group's executor; a task of the Transfer Server copies the
+request's blocks that are not valid in the decode group's memory, device to
+device, the owner gets a slot there, and the request decodes on the decode
+group (``specs/buffer-pool.md`` §11, ``specs/scheduler-design.md`` §4.1). Each
+case compares the greedy tokens of fixed prompts, one of several blocks with
+a partial last one, with an undivided deployment's on one GPU: a prefill
+group computes no decode, so the tokens after the first are the decode
+group's, computed over the blocks it was transferred.
 
 The one-host case places both groups on this host's two GPUs. The two-host
 case places the decode group on a second host, named by the suite's
@@ -27,9 +29,7 @@ unless stated). Without these variables the two-host case is skipped.
 from __future__ import annotations
 
 import os
-import re
 import shutil
-import statistics
 import tempfile
 from collections.abc import Iterator
 from contextlib import contextmanager
@@ -38,9 +38,11 @@ from pathlib import Path
 import httpx
 import pytest
 
+from tests.python.e2e.build_server import remote_build_server
 from tests.python.e2e.http_helpers import (
     ATTENTION_BACKEND,
     QWEN3_CHECKPOINT,
+    engine_selection,
     find_free_port,
     granted_devices,
     host_asset,
@@ -48,10 +50,8 @@ from tests.python.e2e.http_helpers import (
     second_host,
     server_process,
     stop_storage_server,
-    engine_selection,
     written_deployment,
 )
-from tests.python.e2e.build_server import remote_build_server
 
 # The module's cases share two GPUs: the undivided reference serves on the
 # first, and the one-host prefill/decode deployment on both.
@@ -73,7 +73,7 @@ PROMPTS = (
     "Name the planets of the solar system in order from the sun.",
     "Write a haiku about a lighthouse in winter.",
     "Explain in two sentences why the sky is blue.",
-    # A prompt of several cache pages, whose last page is partial.
+    # A prompt of several blocks, whose last block is partial.
     " ".join(
         f"Record {i}: item {i * 7919 % 1000} is {i * 104729 % 997}."
         for i in range(60)
@@ -90,11 +90,6 @@ OPTIONS = (
     "cuda_graph_config.prefill_token_sizes=[1024]",
     "cuda_graph_config.decode_batch_sizes=[1, 2, 4, 8]",
 )
-
-# The scheduler's line for a hand-off that completed.
-HANDED_OFF = "handed a request's KV cache to its decode group"
-# The first request id of the scheduler's warm-up requests; clients' are lower.
-WARMUP_IDS = 1 << 63
 
 
 def _checkpoint() -> str:
@@ -170,22 +165,6 @@ def _greedy(base_url: str, prompt: str) -> list[str]:
     ]
 
 
-def _hand_offs(log: Path) -> list[int]:
-    """The microseconds of every hand-off of a client's request the server
-    log reports, in order; the serving path's warm-up requests, which may end
-    after the server answers its health, take ids from ``WARMUP_IDS`` on.
-    """  # noqa: D205
-    colors = re.compile(r"\x1b\[[0-9;]*m")
-    fields = re.compile(r"request=(\d+).*micros=(\d+)")
-    return [
-        int(found.group(2))
-        for line in log.read_text(errors="replace").splitlines()
-        if HANDED_OFF in line
-        and (found := fields.search(colors.sub("", line))) is not None
-        and int(found.group(1)) < WARMUP_IDS
-    ]
-
-
 @contextmanager
 def _runtime(tmp_path: Path) -> Iterator[Path]:
     """A runtime directory of its own, whose Storage Server is stopped and
@@ -215,19 +194,8 @@ def reference(tmp_path_factory: pytest.TempPathFactory) -> list[list[str]]:
         return [_greedy(base_url, prompt) for prompt in PROMPTS]
 
 
-def _report(record_property, case: str, micros: list[int]) -> None:
-    """Report the hand-offs a case measured: one run, no benchmark."""
-    summary = (
-        f"{case}: {len(micros)} hand-offs, "
-        f"median {statistics.median(micros)} us, "
-        f"min {min(micros)} us, max {max(micros)} us"
-    )
-    print(summary)
-    record_property("hand_off_us", micros)
-
-
-def test_a_prefill_group_hands_requests_to_a_decode_group_on_one_host(
-    tmp_path: Path, reference: list[list[str]], record_property
+def test_a_prefill_group_transfers_requests_to_a_decode_group_on_one_host(
+    tmp_path: Path, reference: list[list[str]]
 ):
     port = find_free_port()
     base_url = f"http://127.0.0.1:{port}"
@@ -247,17 +215,12 @@ def test_a_prefill_group_hands_requests_to_a_decode_group_on_one_host(
         ),
     ):
         tokens = [_greedy(base_url, prompt) for prompt in PROMPTS]
-        micros = _hand_offs(log)
 
     assert tokens == reference
-    # Every request prefilled on the prefill group decoded on the decode
-    # group after its hand-off.
-    assert len(micros) == len(PROMPTS), micros
-    _report(record_property, "one host", micros)
 
 
-def test_a_prefill_group_hands_requests_to_a_decode_group_on_another_host(
-    tmp_path: Path, reference: list[list[str]], record_property
+def test_a_prefill_group_transfers_requests_to_a_decode_group_on_another_host(
+    tmp_path: Path, reference: list[list[str]]
 ):
     if FOLLOWER is None or LEADER_ADDRESS is None or NIXL_LIBRARY is None:
         pytest.skip(
@@ -293,7 +256,6 @@ def test_a_prefill_group_hands_requests_to_a_decode_group_on_another_host(
             address,
             devices=FOLLOWER_DEVICE,
             env={"LD_LIBRARY_PATH": library_path},
-            leader_log=log,
             arguments=("--set", f"build_config.socket={follower_modules}"),
         ),
         server_process(
@@ -309,8 +271,5 @@ def test_a_prefill_group_hands_requests_to_a_decode_group_on_another_host(
         ),
     ):
         tokens = [_greedy(base_url, prompt) for prompt in PROMPTS]
-        micros = _hand_offs(log)
 
     assert tokens == reference
-    assert len(micros) == len(PROMPTS), micros
-    _report(record_property, "two hosts", micros)

@@ -40,10 +40,10 @@ from typing import IO
 
 import pytest
 
-from tests.python.e2e.http_helpers import modules_from
 from tests.python.e2e.build_server import (
     build_server as running_build_server,
 )
+from tests.python.e2e.http_helpers import modules_from
 
 #: How long a case waits between attempts to lease its GPUs, in seconds.
 LEASE_RETRY_S = 2.0

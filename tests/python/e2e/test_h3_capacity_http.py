@@ -12,11 +12,11 @@ from transformers import AutoTokenizer
 
 from tests.python.e2e.http_helpers import (
     H3_CHECKPOINT,
+    engine_selection,
     find_free_port,
     host_asset,
     require_uniserve_binary,
     server_process,
-    engine_selection,
 )
 from tests.python.e2e.test_h3_parallel_http import _assert_media_values_close
 from uniserve_eval.datasets.minimax_h3 import _PROMPT

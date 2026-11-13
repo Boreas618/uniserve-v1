@@ -13,9 +13,9 @@ from __future__ import annotations
 from collections.abc import Iterator
 from pathlib import Path
 
-import httpx
 import pytest
 
+from tests.python.e2e.http_helpers import admin_request
 from tests.python.e2e.profiling_helpers import Load, ended, serve, start
 from uniserve_eval.profile import ProfileFile
 
@@ -62,10 +62,12 @@ def served(
 def test_collectors_cupti_cannot_run_beside_it_are_refused(
     served: str, tmp_path: Path, request_body: dict
 ):
-    response = httpx.post(
-        f"{served}/admin/profile",
-        json={**request_body, "output_dir": str(tmp_path)},
-        timeout=600,
+    response = admin_request(
+        served,
+        "POST",
+        "/admin/profile",
+        body={**request_body, "output_dir": str(tmp_path)},
+        timeout_s=600,
     )
     assert response.status_code == 400, response.text
     assert "profiling_config.graph_pc_sampling" in response.text

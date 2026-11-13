@@ -35,12 +35,20 @@ from pathlib import Path
 import httpx
 import pytest
 
-from tests.python.e2e.http_helpers import metric, wait_until
+from tests.python.e2e.http_helpers import (
+    admin,
+    admin_config,
+    admin_request,
+    apply_config,
+    metric,
+    wait_until,
+)
 from tests.python.e2e.profiling_helpers import NAME, RANGE_PASS_STORAGE, serve
 from tests.python.e2e.profiling_helpers import Load as _Load
 from tests.python.e2e.profiling_helpers import ended as _ended
 from tests.python.e2e.profiling_helpers import profile as _profile
 from tests.python.e2e.profiling_helpers import start as _start
+from tests.python.e2e.profiling_helpers import stop as _stop
 from uniserve_eval.profile import ProfileFile, convert
 
 pytestmark = [
@@ -106,11 +114,7 @@ def _fence_count(base_url: str, stage: str, component: str) -> int:
 
 
 def _apply(base_url: str, *assignments: str) -> dict:
-    response = httpx.put(
-        f"{base_url}/admin/config",
-        json={"set": list(assignments)},
-        timeout=1800,
-    )
+    response = apply_config(base_url, *assignments)
     assert response.status_code == 200, response.text
     return response.json()["result"]
 
@@ -204,8 +208,8 @@ def test_a_session_records_its_collectors_into_its_file(
     }
     # Two collectors of the performance monitors are refused together.
     conflicting = {**request, "collectors": ["pm_sampling", "pc_sampling"]}
-    refused = httpx.post(
-        f"{served}/admin/profile", json=conflicting, timeout=600
+    refused = admin_request(
+        served, "POST", "/admin/profile", body=conflicting, timeout_s=600
     )
     assert refused.status_code == 400, refused.text
     assert "performance monitors" in refused.text, refused.text
@@ -218,8 +222,8 @@ def test_a_session_records_its_collectors_into_its_file(
             state == "prepared" for state in worker["collectors"].values()
         ), worker
         # One session at a time.
-        refused = httpx.post(
-            f"{served}/admin/profile", json=request, timeout=600
+        refused = admin_request(
+            served, "POST", "/admin/profile", body=request, timeout_s=600
         )
         assert refused.status_code == 400, refused.text
         ended = _ended(served, 600)
@@ -259,7 +263,7 @@ def test_a_session_records_its_collectors_into_its_file(
 
 def _process_bytes(base_url: str) -> int:
     """The bytes the worker's process item reserves in its GPU's quota."""
-    status = httpx.get(f"{base_url}/admin/config", timeout=60).json()
+    status = admin_config(base_url)
     entries = [
         entry
         for node in status["quotas"]
@@ -284,7 +288,7 @@ def test_a_range_metrics_session_books_its_pass_while_it_runs(
         },
     )
     assert _process_bytes(served) == before + RANGE_PASS_STORAGE
-    stopped = httpx.delete(f"{served}/admin/profile", timeout=600)
+    stopped = _stop(served)
     assert stopped.status_code == 200, stopped.text
     assert _ended(served, 60)["end_reason"] == "operator"
     assert _process_bytes(served) == before
@@ -310,9 +314,7 @@ def test_a_epoch_change_ends_the_session_of_the_epoch_it_replaces(
         assert session["state"] == "ended", session
         assert session["end_reason"] == "epoch change", session
         assert session["files"][0]["file"]["rows"]["kernel"] > 0, session
-        committed = httpx.post(
-            f"{served}/admin/config/commit", json={}, timeout=600
-        )
+        committed = admin(served, "config/commit")
         assert committed.status_code == 200, committed.text
 
 
@@ -343,7 +345,7 @@ def test_the_guard_releases_collectors_then_ends_the_session(
             time.sleep(1.0)
         session = _profile(served)
         if session["state"] == "running":
-            stopped = httpx.delete(f"{served}/admin/profile", timeout=600)
+            stopped = _stop(served)
             assert stopped.status_code == 200, stopped.text
         ended = _ended(served, 60)
     print(json.dumps(ended, indent=2))

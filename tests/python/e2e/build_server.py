@@ -4,7 +4,7 @@ A deployment's epoch is resolved at this host's Build Server before its main
 processes serve, and a package's module exists nowhere else, so every test that
 serves needs one. :func:`build_server` starts one for a test module over an
 empty store, with every kernel package of the tree and the scheduling policy
-installed. The engine's recorded walk then asks the server to build exactly the
+installed. The engine's profile runs then ask the server to build exactly the
 kernels the deployment launches at startup.
 
 The kernels build with the Build Server's own Python environment
@@ -43,8 +43,8 @@ from tests.python.e2e.http_helpers import (
 
 # The packages this file installs: the scheduling policy, and every kernel
 # package of the tree. A deployment's epoch is resolved at this host's Build
-# Server before its main processes serve (design 5.1, 6.1): the policy fills the
-# scheduling slot, and the engine's recorded walk names every kernel the
+# Server before its main processes serve (``specs/design.md`` §3): the policy
+# fills the scheduling slot, and the engine's profile runs name every kernel the
 # deployment launches, which the server builds from the installed packages on
 # the first prepare. A server that holds the policy alone refuses the epoch by
 # the first kernel it lacks.
@@ -93,16 +93,16 @@ def precompiler() -> Path:
     """The wasm precompiler the Build Server turns a policy module into.
 
     A policy is built for wasm32 and precompiled for this host's CPU, so the
-    server needs the precompiler before it can install a policy (design 5.3):
-    a ``uniserve-engine`` executable, whose ``precompile`` command the server
+    server needs the precompiler before it can install a policy: a
+    ``uniserve-engine`` executable, whose ``precompile`` command the server
     runs. ``UNISERVE_SCHEDULING_PRECOMPILE`` names it.
     """
     named = os.environ.get("UNISERVE_SCHEDULING_PRECOMPILE")
     if not named:
         pytest.fail(
             "UNISERVE_SCHEDULING_PRECOMPILE must name the precompiler, a "
-            "uniserve-engine executable: `cargo build -p engine --bin uniserve-engine` "
-            "builds it"
+            "uniserve-engine executable: `cargo build -p engine --bin "
+            "uniserve-engine` builds it"
         )
     return Path(named)
 
@@ -110,10 +110,10 @@ def precompiler() -> Path:
 def module_target() -> str:
     """The target this host's modules are built for.
 
-    The engine derives it from the device it serves — ``sm_{major}{minor}a``
-    (``src/model_runner.rs``) — and a store built for another target describes
-    nothing to overlay: the precopy then fails at the module lane rather than
-    the build. So the default is the compute capability of the first GPU the
+    The engine derives it from the device it serves (``sm_{major}{minor}a``),
+    and a store built for another target holds no module the engine can load:
+    the epoch then fails when its modules are resolved rather than at the
+    build. So the default is the compute capability of the first GPU the
     lease granted (:func:`granted_devices`), which the module serves on; the
     environment's ``UNISERVE_MODULE_TARGET`` names a target instead, for a
     host whose store is provisioned elsewhere.
@@ -154,15 +154,15 @@ def build_server(
     packages:
 
     * the kernels — every package under ``KERNEL_PACKAGES``. Installing copies
-      a package's source and registers its revision; the engine's recorded walk
-      names every descriptor key the deployment launches, and the server builds
+      a package's source and registers its revision; the engine's profile runs
+      name every descriptor key the deployment launches, and the server builds
       each on its first prepare, so a deployment's startup builds exactly what
       it launches;
     * the policy — ``POLICY_PACKAGE``, a wasm package this host precompiles.
 
     The package root and the store live as long as the module, and every test
     of the module deploys against this one server, so a module is built once and
-    every later deployment of the module reuses it (design 5.3). They are not
+    every later deployment of the module reuses it. They are not
     shared with another run: a store entry is keyed by operator, backend,
     revision, target and descriptor, and a revision counts from 1 in a fresh
     package root, so a store kept across runs would answer a changed package

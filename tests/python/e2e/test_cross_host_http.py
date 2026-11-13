@@ -33,9 +33,11 @@ from pathlib import Path
 import httpx
 import pytest
 
+from tests.python.e2e.build_server import remote_build_server
 from tests.python.e2e.http_helpers import (
     ATTENTION_BACKEND,
     admin_status,
+    engine_selection,
     find_free_port,
     granted_devices,
     log_tail,
@@ -45,9 +47,7 @@ from tests.python.e2e.http_helpers import (
     second_host,
     server_process,
     wait_until,
-    engine_selection,
 )
-from tests.python.e2e.build_server import remote_build_server
 
 pytestmark = [pytest.mark.e2e, pytest.mark.gpu, pytest.mark.model("qwen3")]
 
@@ -194,11 +194,9 @@ def test_a_group_over_two_hosts_promotes_its_standby_when_a_hosts_rank_is_lost(
         ):
             # The standby epoch over both hosts parked with its graphs.
             wait_until(
-                lambda: (
-                    admin_status(base_url)["deployment"]["standby"] or {}
-                ).get("prepared"),
+                lambda: admin_status(base_url)["deployment"]["standby"],
                 1800,
-                "the deployment reported no prepared standby",
+                "the deployment reported no parked standby",
                 context=lambda: log_tail(log),
             )
             before = admin_status(base_url)["deployment"]
@@ -235,7 +233,7 @@ def test_a_group_over_two_hosts_promotes_its_standby_when_a_hosts_rank_is_lost(
 
     # The domain's standby epoch serves now, rather than an engine launched
     # anew, and the request continued on it where the kill stopped it.
-    assert after["generation"] == before["standby"]["generations"][0], (
+    assert after["generation"] == before["standby"][0], (
         before,
         after,
     )

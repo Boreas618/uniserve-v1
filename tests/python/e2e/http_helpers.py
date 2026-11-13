@@ -22,11 +22,11 @@ from PIL import Image
 
 from uniserve_eval.transport.sse import iter_sse_events
 
-# The host KV cache a test's epoch holds unless the test sizes it itself.
-# Every test runs its own Storage Server, which budgets the host's available
-# storage as if it were the host's only one, so concurrent tests sized by
-# `kv_cache_config.host_ratio` alone would together commit more host storage
-# than the host has.
+# The host tier a test's deployment holds unless the test sizes it itself:
+# the host regions of its buffer pool. Every test runs its own Storage
+# Server, which budgets the host's available storage as if it were the host's
+# only one, so concurrent tests sized by `kv_cache_config.host_ratio` alone
+# would together commit more host storage than the host has.
 HOST_CACHE_GIB = 16
 
 #: The attention package the suite's Qwen3 deployments serve: trtllm-gen, the
@@ -362,15 +362,38 @@ def _serves_a_deployment(args: list[str]) -> bool:
     return len(args) > 1 and args[1] == "serve"
 
 
+#: The runtime directories (``XDG_RUNTIME_DIR``) of the daemons this process
+#: started, where each daemon's operator socket lies (:func:`admin_socket`).
+_RUNTIMES: list[Path] = []
+
+
+def _daemon_directory(runtime: str | None) -> Path:
+    """The directory a daemon under the runtime directory `runtime` keeps its
+    sockets in, as the daemon names it: ``uniserve`` under its
+    ``XDG_RUNTIME_DIR``, else ``/tmp/uniserve-<uid>``.
+    """  # noqa: D205
+    if runtime:
+        return Path(runtime) / "uniserve"
+    return Path(f"/tmp/uniserve-{os.getuid()}")
+
+
 def start_server(
     args: list[str], log_path: Path, env: dict[str, str] | None = None
 ) -> subprocess.Popen[str]:
     """Start `args` in a session of its own, its output to `log_path`.
 
-    A deployment that sizes no host KV cache (``kv_cache_config.host_*``) holds
+    A deployment that sizes no host tier (``kv_cache_config.host_*``) holds
     `HOST_CACHE_GIB` of it; one that names no Build Server is given the
     module's (:func:`modules_from`); and every deployment adds `E2E_SET`.
+    The runtime directory the process runs under is kept, so that
+    :func:`admin_socket` finds the daemon's operator socket there.
     """
+    runtime = (env or {}).get("XDG_RUNTIME_DIR") or os.environ.get(
+        "XDG_RUNTIME_DIR"
+    )
+    directory = _daemon_directory(runtime)
+    if directory not in _RUNTIMES:
+        _RUNTIMES.append(directory)
     if _serves_a_deployment(args):
         named = any("build_config.socket" in arg for arg in args)
         if not named and _BUILD_SERVER is not None:
@@ -611,18 +634,63 @@ def server_process(
             stop_server(process)
 
 
+def admin_socket(base_url: str) -> Path:
+    """The operator socket of the daemon whose client API is `base_url`.
+
+    A daemon serves its admin API apart from the client API, on a Unix
+    socket of its own (``docs/admin.md``, Listeners): ``admin-<port>.sock``
+    in its runtime directory, named by its client API's port. A daemon that
+    moved to another port binds the socket of that port in the same
+    directory, so every runtime directory this process started a daemon
+    under is searched.
+    """
+    port = httpx.URL(base_url).port
+    candidates = [
+        *_RUNTIMES,
+        _daemon_directory(os.environ.get("XDG_RUNTIME_DIR")),
+    ]
+    for directory in candidates:
+        socket_path = directory / f"admin-{port}.sock"
+        if socket_path.exists():
+            return socket_path
+    raise FileNotFoundError(
+        f"no operator socket admin-{port}.sock in "
+        f"{', '.join(str(directory) for directory in candidates)}"
+    )
+
+
+def admin_request(
+    base_url: str,
+    method: str,
+    path: str,
+    *,
+    body: dict[str, Any] | None = None,
+    params: dict[str, Any] | None = None,
+    timeout_s: float = 1800,
+) -> httpx.Response:
+    """`method` on the admin route `path` (``/admin/...``) of the daemon
+    whose client API is `base_url`, through its operator socket, waiting at
+    most `timeout_s` seconds stretched by `TIME_SCALE`.
+    """  # noqa: D205
+    transport = httpx.HTTPTransport(uds=str(admin_socket(base_url)))
+    with httpx.Client(
+        transport=transport,
+        base_url="http://admin",
+        timeout=scaled(timeout_s),
+    ) as client:
+        return client.request(method, path, json=body, params=params)
+
+
 def admin(
     base_url: str, path: str, body: dict[str, Any] | None = None
 ) -> httpx.Response:
     """``POST /admin/<path>`` with `body`, answered once the operation ends."""
-    return httpx.post(
-        f"{base_url}/admin/{path}", json=body or {}, timeout=scaled(1800)
-    )
+    return admin_request(base_url, "POST", f"/admin/{path}", body=body or {})
 
 
 def admin_status(base_url: str) -> dict[str, Any]:
     """``GET /admin/status``: what the deployment serves and its operations."""
-    response = httpx.get(f"{base_url}/admin/status", timeout=10)
+    response = admin_request(base_url, "GET", "/admin/status", timeout_s=10)
     response.raise_for_status()
     return response.json()
 
@@ -633,9 +701,48 @@ def admin_config(base_url: str) -> dict[str, Any]:
     epoch records (``epochs``), the node's processes (``processes``) and the
     quotas (``quotas``).
     """  # noqa: D205
-    response = httpx.get(f"{base_url}/admin/config", timeout=60)
+    response = admin_request(base_url, "GET", "/admin/config", timeout_s=60)
     response.raise_for_status()
     return response.json()
+
+
+def apply_config(
+    base_url: str, *assignments: str, **fields: object
+) -> httpx.Response:
+    """``PUT /admin/config`` with `assignments` (``set``) and the request's
+    other `fields` (``force``, ``in_flight``, ``dry_run``, ``deadline_s``,
+    ``wait``): answered, for an update, once it reached its trial or ended
+    before one (``docs/admin.md``, Updates).
+    """  # noqa: D205
+    return admin_request(
+        base_url,
+        "PUT",
+        "/admin/config",
+        body={"set": list(assignments), **fields},
+    )
+
+
+def update_report(base_url: str) -> dict[str, Any]:
+    """The update in flight, or the one that ended last, as ``GET
+    /admin/config`` reports it (``update``); empty before any.
+    """  # noqa: D205
+    return admin_config(base_url).get("update") or {}
+
+
+def wait_for_phase(
+    base_url: str, *phases: str, timeout_s: float = 900
+) -> dict[str, Any]:
+    """Waits until the update stands in one of `phases` (``preparing``,
+    ``switching``, ``trial``, ``committed``, ``rolled_back``,
+    ``abandoned``); returns its report.
+    """  # noqa: D205
+    wait_until(
+        lambda: update_report(base_url).get("phase") in phases,
+        timeout_s,
+        f"the update did not reach {' or '.join(phases)}",
+        context=lambda: f"\nupdate: {update_report(base_url)}",
+    )
+    return update_report(base_url)
 
 
 def engine_processes(base_url: str) -> list[dict[str, Any]]:
@@ -681,6 +788,52 @@ def metric(base_url: str, name: str, label: str | None = None) -> float:
             continue
         total += float(line.rsplit(" ", 1)[1])
     return total
+
+
+#: The prefix cache's counters, in tokens (``uniserve:prefix_cache_<name>``):
+#: the tokens admissions looked up (``queries``, a request's prompt less its
+#: last token), the tokens of their hits (``hits``), those of the hits loaded
+#: from the host tier (``host_hits``), and those of the host hits a prefetch
+#: from the peers brought (``peer_hits``).
+PREFIX_COUNTERS = ("queries", "hits", "host_hits", "peer_hits")
+
+#: How long the statistics a scheduler reports once a second take to include
+#: what came before: two report intervals.
+REPORT_SETTLE_S = 2.0
+
+
+def prefix_counters(base_url: str) -> dict[str, float]:
+    """The prefix cache's counters of every epoch so far."""
+    return {
+        name: metric(base_url, f"uniserve:prefix_cache_{name}")
+        for name in PREFIX_COUNTERS
+    }
+
+
+def tokens_found(
+    base_url: str, ask: Callable[[], Any]
+) -> tuple[Any, dict[str, float]]:
+    """What `ask` returns, and how much each prefix cache counter grew over
+    it: the tokens its admissions found cached, per tier and per source.
+
+    A hit is counted when its admission's answers arrive, before the request
+    computes, so the counters are read once the report holding the query
+    arrived and another followed. `ask` must look its prompt up: a deployment
+    without ``prefix_caching`` counts no query.
+    """  # noqa: D205
+    before = prefix_counters(base_url)
+    result = ask()
+    wait_until(
+        lambda: (
+            metric(base_url, "uniserve:prefix_cache_queries")
+            > before["queries"]
+        ),
+        30,
+        "the request's prefix cache query was not reported",
+    )
+    time.sleep(scaled(REPORT_SETTLE_S))
+    after = prefix_counters(base_url)
+    return result, {name: after[name] - before[name] for name in after}
 
 
 def post_sse(

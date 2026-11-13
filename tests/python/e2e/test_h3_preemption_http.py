@@ -2,46 +2,47 @@
 
 Serves a FastH3 checkpoint (``UNISERVE_H3_MODEL``) on the two GPUs the
 module leases (``UNISERVE_WORLD_DEVICES``): a Ulysses-2 denoiser and a TP2
-text encoder beside the decoders and the media components. One
-``t2va`` request is served uninterrupted as the reference. The same
-request, as a video job, is then preempted at a denoising step boundary:
+text encoder beside the decoders and the media stages. One ``t2va`` request
+is served uninterrupted as the reference. The same request, as a video job,
+is then preempted at a denoising step boundary, where the scheduler saves its
+trajectory (``Save``) into a host block of the deployment's buffer pool under
+the trajectory's key (``specs/buffer-pool.md`` §6, §13), and later restores
+it (``Restore``) into the slot of the admission that continues it:
 
-- by a sleep, which serving uses to give back device storage: the engine
-  stores the trajectory in the host latent pools and the request waits in
-  the hold until the wake, after which the engine restores the stored step
-  and denoises the steps left;
+- by a sleep, which serving uses to give back device storage: the request
+  waits in the hold until the wake, after which the engine restores the
+  stored step and denoises the steps left;
 - by an epoch change whose denoising computes the same (a change of the
-  workers' watchdog): the serving epoch parks with the trajectory stored,
-  and the successor restores it and continues. A FastH3 request denoises
-  in seconds while a successor prepares for tens of them, so the request
-  starts once the successor prepares, and the serving epoch's model group
-  is paused (``SIGSTOP``, as fault-injection suites pause a process) with
-  the request mid-trajectory and resumed once the change warms the
-  successor's cache (which reads the serving scheduler's requests between
-  steps) or promotes it: the park then lands at a step boundary after the
-  paused calls, whatever the two durations.
+  workers' watchdog): the switch promotes the target and drains the serving
+  engine with a deadline of zero (``update_config.drain_s``), which ends the
+  request in flight at its next step boundary with its trajectory saved; the
+  daemon resubmits it to the target, which restores it and continues
+  (``specs/updates.md`` §3.7). A FastH3 request denoises in seconds while a
+  target prepares for tens of them, so the request starts once the target
+  prepares, and the serving engine's process is paused (``SIGSTOP``, as
+  fault-injection suites pause a process) after its first denoising step and
+  continued once the switch begins: the drain then lands at a step boundary
+  of the trajectory, whatever the two durations.
 
 Each preempted video is the reference video, frame for frame and sample
 for sample. Preemption starts only after the public job status reports
-that denoising has begun. The reference computes its
-prompt's conditioning and stores it in the host encoder pool; the job reads
-the same prompt, so each of its admissions, on the serving epoch and on the
-one that resumes it, reads the stored conditioning instead of encoding it,
-and the videos' equality shows the stored conditioning is the computed one.
+that denoising has begun. The reference computes its prompt's encoder output
+and commits it under its key; the job reads the same prompt, so each of its
+admissions, on the serving epoch and on the one that resumes it, pins the
+committed encoder output instead of encoding it, and the videos' equality
+shows the stored output is the computed one.
 
 An epoch change of the denoiser's parallel configuration, from Ulysses 2 on
-both GPUs to the whole denoiser on the first, computes the same: the
-successor's one denoising rank lays the pages both serving ranks stored
-out in its own pages and continues from the stored step. The re-layout
-moves values without computing any (the in-process test that checked its
-exactness retired with the planner it used, ``latent_restore_copies``), but
-the steps after it run with another division of the rows and
-so another order of reductions, which a parallel configuration may change
-without changing what the denoiser computes: the video is not expected to
-equal either configuration's uninterrupted video bit for bit. The test
-asserts that the request survives the configuration change and finishes
-with the reference's video and audio frame counts. The layout conversion
-is checked independently through the latent restore interface.
+both GPUs to the whole denoiser on the first, is another layout (``shrink``)
+and computes the same: the target's one denoising rank restores the
+trajectory both serving ranks saved, found by its key under any layout and
+converted through the copy manifest of the two layouts' encodings, and
+continues from the stored step. The steps after it run with another division
+of the rows and so another order of reductions, which a parallel
+configuration may change without changing what the denoiser computes: the
+video is not expected to equal either configuration's uninterrupted video bit
+for bit. The test asserts that the request survives the configuration change
+and finishes with the reference's video and audio frame counts.
 """
 
 from __future__ import annotations
@@ -64,14 +65,17 @@ import pytest
 from tests.python.e2e.http_helpers import (
     H3_CHECKPOINT,
     admin,
+    admin_status,
+    apply_config,
+    engine_selection,
     find_free_port,
     granted_devices,
     host_asset,
     require_uniserve_binary,
     runtime_directory,
     server_process,
+    serving_engine,
     t2va_request,
-    engine_selection,
     written_deployment,
 )
 
@@ -103,12 +107,12 @@ def _deployment(
 ) -> Path:
     """One group on two GPUs: the denoiser Ulysses-2 on both GPUs, or on the
     first alone for one denoising rank, beside the encoders, the decoders and
-    the media components; `fraction` is the group's share of each GPU
+    the media stages; `fraction` is the group's share of each GPU
     (`mem_fraction_static`), the deployment's default without one.
 
-    The media components run on the host inside the main process, which
-    serves CUDA devices only, so they are placed on the group's CUDA ranks as
-    the deployment files of ``configs/minimax_h3`` place them.
+    The media stages run on the host inside the main process, which serves
+    CUDA devices only, so they are placed on the group's CUDA ranks as the
+    deployment files of ``configs/minimax_h3`` place them.
     """  # noqa: D205
     directory.mkdir(parents=True, exist_ok=True)
     transformer = (
@@ -139,41 +143,16 @@ def _deployment(
 # The model group's share of each GPU while an epoch change of the
 # denoiser's parallel configuration runs: both epochs lie on the two GPUs
 # during the change, the serving Ulysses-2 epoch with a transformer replica
-# on each, and the default share leaves the successor's second rank, which
+# on each, and the default share leaves the target's second rank, which
 # holds the text encoder and the decoders, less than one request slot's
 # tensors beside it.
 CHANGE_FRACTION = 0.85
 
 
-def _group_workers(runtime: Path, group: str) -> list[int]:
-    """The worker processes of worker group `group` the deployment serving
-    from `runtime` runs now, found by their command line and environment.
-    """  # noqa: D205
-    workers = []
-    for entry in Path("/proc").iterdir():
-        if not entry.name.isdigit():
-            continue
-        try:
-            command = (entry / "cmdline").read_bytes().split(b"\0")
-            environment = (entry / "environ").read_bytes().split(b"\0")
-        except OSError:
-            continue
-        if (
-            b"worker" in command
-            and b"--worker-id" in command[:-1]
-            and command[command.index(b"--worker-id") + 1] == group.encode()
-            and f"XDG_RUNTIME_DIR={runtime}".encode() in environment
-        ):
-            workers.append(int(entry.name))
-    return workers
-
-
 @contextmanager
-def _serve(
-    tmp_path: Path, deployment=_deployment
-) -> Iterator[tuple[str, Path, Path]]:
+def _serve(tmp_path: Path, deployment=_deployment) -> Iterator[str]:
     """The deployment `deployment` writes, with a Storage Server of its own;
-    its URL, log and runtime directory.
+    its URL.
     """  # noqa: D205
     port = find_free_port()
     base_url = f"http://127.0.0.1:{port}"
@@ -214,7 +193,7 @@ def _serve(
         with server_process(
             command, base_url, log, timeout_s=3600, env=environment
         ):
-            yield base_url, log, runtime
+            yield base_url
 
 
 def _decoded(video: bytes) -> tuple[list[np.ndarray], list[np.ndarray]]:
@@ -277,32 +256,20 @@ def _wait_denoising(base_url: str, job: str, steps: int) -> int:
     raise TimeoutError("the job did not denoise")
 
 
-# An epoch change's phases in their order (``GET /admin/config``, the steps
-# ``docs/admin.md`` lists).
-_PHASES = (
-    "eager",
-    "shrink",
-    "baseline",
-    "prepare",
-    "warm_cache",
-    "park",
-    "evict",
-    "materialize",
-    "promote",
-    "keep_previous",
-    "trial",
-)
+# The drain's deadline every change of the tests states: the serving
+# engine ends its running request as migratable at the drain, at the
+# request's next denoising step boundary.
+DRAIN_AT_ONCE = "update_config.drain_s=0"
 
 
-def _wait_phase(base_url: str, change: Future, *phases: str) -> None:
-    """Waits until the epoch change `change` is in one of `phases`, as
-    ``GET /admin/config`` reports it; fails when the change answers or
-    passes the last of them before.
+def _wait_phase(base_url: str, change: Future, phase: str) -> None:
+    """Waits until the epoch change `change` stands in `phase`, as ``GET
+    /admin/status`` reports the update in flight, which the daemon answers
+    from its own state while the serving engine is paused; fails when the
+    change answers before.
     """  # noqa: D205
-    phase = " or ".join(phases)
-    last = max(_PHASES.index(name) for name in phases)
-    # A successor prepares in tens of seconds; ten minutes bounds a change
-    # whose preparation waits on the paused workers.
+    # A target prepares in tens of seconds; ten minutes bounds a change
+    # whose preparation is slow.
     deadline = time.monotonic() + 600
     while time.monotonic() < deadline:
         if change.done():
@@ -311,14 +278,41 @@ def _wait_phase(base_url: str, change: Future, *phases: str) -> None:
                 f"the change ended before its {phase} phase: "
                 f"{response.status_code} {response.text}"
             )
-        config = httpx.get(f"{base_url}/admin/config", timeout=60).json()
-        current = (config.get("update") or {}).get("phase")
-        if current in phases:
+        update = admin_status(base_url)["deployment"]["update"] or {}
+        if update.get("phase") == phase:
             return
-        if current in _PHASES and _PHASES.index(current) > last:
-            pytest.fail(f"the change passed its {phase} phase: {current}")
         time.sleep(0.05)
     raise TimeoutError(f"the epoch change did not reach its {phase} phase")
+
+
+def _change_under_a_denoising_request(
+    base_url: str, *assignments: str
+) -> tuple[str, dict]:
+    """Applies `assignments` as an epoch change while a video job denoises
+    on the serving epoch; returns the job and the update as its trial began.
+
+    The job starts once the target prepares. The serving engine's process
+    is paused after the job's first denoising step and continued once the
+    switch begins, so the drain finds the job mid-trajectory.
+    """  # noqa: D205
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        change = pool.submit(
+            apply_config, base_url, *assignments, DRAIN_AT_ONCE
+        )
+        _wait_phase(base_url, change, "preparing")
+        job = _start_job(base_url)
+        _wait_denoising(base_url, job, 1)
+        engine = serving_engine(base_url)["pid"]
+        os.kill(engine, signal.SIGSTOP)
+        try:
+            _wait_phase(base_url, change, "switching")
+        finally:
+            os.kill(engine, signal.SIGCONT)
+        changed = change.result()
+    assert changed.status_code == 200, changed.text
+    result = changed.json()["result"]
+    assert result["change"] == "epoch", result
+    return job, result["update"]
 
 
 def _content(base_url: str, job: str) -> bytes:
@@ -339,7 +333,7 @@ def _content(base_url: str, job: str) -> bytes:
 def test_a_preempted_video_request_continues_its_trajectory_exactly(
     tmp_path: Path,
 ) -> None:
-    with _serve(tmp_path) as (base_url, log, runtime):
+    with _serve(tmp_path) as base_url:
         steps = httpx.get(f"{base_url}/v1/capabilities", timeout=60).json()[
             "video"
         ]["model"]["num_inference_steps"]
@@ -364,43 +358,13 @@ def test_a_preempted_video_request_continues_its_trajectory_exactly(
         assert woke.status_code == 200, woke.text
         _assert_same_video(_content(base_url, job), reference)
 
-        # An epoch change whose denoising computes the same parks the serving
-        # epoch at a step boundary; its successor continues the trajectory.
-        # The request starts once the serving epoch answered the change's
-        # shrink (its scheduler answers between steps, which paused workers
-        # never end) and the successor prepares; the serving epoch's model
-        # group stays paused from the request's first step until the change
-        # warms the successor's cache or parks the serving epoch, well
-        # within the workers' five-minute watchdog.
-        workers = _group_workers(runtime, "model")
-        assert len(workers) == 2, workers
-        with ThreadPoolExecutor(max_workers=1) as pool:
-            change = pool.submit(
-                httpx.put,
-                f"{base_url}/admin/config",
-                json={"set": ["worker_config.watchdog_timeout=6m"]},
-                timeout=3600,
-            )
-            _wait_phase(base_url, change, "prepare")
-            job = _start_job(base_url)
-            _wait_denoising(base_url, job, 1)
-            for worker in workers:
-                os.kill(worker, signal.SIGSTOP)
-            try:
-                # Warming the successor's cache reads the requests the
-                # serving scheduler holds, which answers between steps, and
-                # the park ends them at the step boundary their calls in
-                # flight reach: the workers resume once the change warms or
-                # parks.
-                _wait_phase(base_url, change, "warm_cache", "park")
-            finally:
-                for worker in workers:
-                    os.kill(worker, signal.SIGCONT)
-            changed = change.result()
-        assert changed.status_code == 200, changed.text
-        result = changed.json()["result"]
-        assert result["change"] == "epoch", result
-        assert result["epoch"]["numerics"] == "unchanged", result
+        # An epoch change whose denoising computes the same keeps the layout;
+        # its drain ends the request at a step boundary and the target
+        # continues the trajectory.
+        job, update = _change_under_a_denoising_request(
+            base_url, "worker_config.watchdog_timeout=6m"
+        )
+        assert update["shrink"] is False, update
         _assert_same_video(_content(base_url, job), reference)
         committed = admin(base_url, "config/commit")
         assert committed.status_code == 200, committed.text
@@ -410,7 +374,7 @@ def test_a_video_request_continues_under_another_parallel_configuration(
     tmp_path: Path,
 ) -> None:
     serving = functools.partial(_deployment, fraction=CHANGE_FRACTION)
-    with _serve(tmp_path, serving) as (base_url, log, runtime):
+    with _serve(tmp_path, serving) as base_url:
         steps = httpx.get(f"{base_url}/v1/capabilities", timeout=60).json()[
             "video"
         ]["model"]["num_inference_steps"]
@@ -423,41 +387,16 @@ def test_a_video_request_continues_under_another_parallel_configuration(
         assert reference.status_code == 200, reference.text
         reference = reference.content
 
-        # The change parks the Ulysses-2 epoch at a step boundary, as the
-        # epoch change of the other test does; its successor denoises on
-        # the first GPU alone.
-        workers = _group_workers(runtime, "model")
-        assert len(workers) == 2, workers
-        successor = _deployment(
-            tmp_path / "successor", denoising_ranks=1, fraction=CHANGE_FRACTION
+        # The drain ends the Ulysses-2 epoch's request at a step boundary, as
+        # the epoch change of the other test does; the target, another
+        # layout, denoises on the first GPU alone.
+        target = _deployment(
+            tmp_path / "target", denoising_ranks=1, fraction=CHANGE_FRACTION
         )
-        with ThreadPoolExecutor(max_workers=1) as pool:
-            change = pool.submit(
-                httpx.put,
-                f"{base_url}/admin/config",
-                json={"set": [f"worker_groups={successor}"]},
-                timeout=3600,
-            )
-            _wait_phase(base_url, change, "prepare")
-            job = _start_job(base_url)
-            _wait_denoising(base_url, job, 1)
-            for worker in workers:
-                os.kill(worker, signal.SIGSTOP)
-            try:
-                # Warming the successor's cache reads the requests the
-                # serving scheduler holds, which answers between steps, and
-                # the park ends them at the step boundary their calls in
-                # flight reach: the workers resume once the change warms or
-                # parks.
-                _wait_phase(base_url, change, "warm_cache", "park")
-            finally:
-                for worker in workers:
-                    os.kill(worker, signal.SIGCONT)
-            changed = change.result()
-        assert changed.status_code == 200, changed.text
-        result = changed.json()["result"]
-        assert result["change"] == "epoch", result
-        assert result["epoch"]["numerics"] == "unchanged", result
+        job, update = _change_under_a_denoising_request(
+            base_url, f"worker_groups={target}"
+        )
+        assert update["shrink"] is True, update
         video = _content(base_url, job)
         # Kept beside the server's log, for comparison with the reference.
         (tmp_path / "reference.mp4").write_bytes(reference)

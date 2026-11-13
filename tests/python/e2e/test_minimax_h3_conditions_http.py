@@ -31,11 +31,11 @@ import pytest
 from tests.python.e2e.http_helpers import (
     H3_CHECKPOINT,
     MINIMAX_H3_CHECKPOINT,
+    engine_selection,
     find_free_port,
     host_asset,
     require_uniserve_binary,
     server_process,
-    engine_selection,
 )
 from uniserve_eval.transport.video import inspect_video_bytes
 

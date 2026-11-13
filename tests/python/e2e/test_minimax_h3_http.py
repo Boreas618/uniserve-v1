@@ -20,12 +20,12 @@ import pytest
 from tests.python.e2e.http_helpers import (
     FASTH3_ADAPTER,
     MINIMAX_H3_CHECKPOINT,
+    engine_selection,
     find_free_port,
     host_asset,
     require_uniserve_binary,
     server_process,
     t2va_request,
-    engine_selection,
 )
 from uniserve_eval.transport.video import inspect_video_bytes
 
