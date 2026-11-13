@@ -117,7 +117,8 @@ pub enum Command {
         #[arg(long)]
         nixl_library: Option<PathBuf>,
     },
-    /// Print the tensors, bytes and deployments the running server holds.
+    /// Print the tensors, bytes and deployments the running server holds,
+    /// and the buffer pool of each deployment.
     List {
         #[arg(long)]
         socket: Option<PathBuf>,
@@ -261,8 +262,10 @@ pub fn run(args: Args) -> anyhow::Result<()> {
                 nixl_library,
             },
         ),
-        Command::List { socket } => crate::list(&socket.unwrap_or_else(storage::default_socket))
-            .map_err(anyhow::Error::from),
+        Command::List { socket } => crate::list(
+            &socket.unwrap_or_else(storage::default_socket),
+            &mut std::io::stdout().lock(),
+        ),
         Command::Retire { socket, deployment } => {
             crate::retire(&socket.unwrap_or_else(storage::default_socket), &deployment)
                 .map_err(anyhow::Error::from)

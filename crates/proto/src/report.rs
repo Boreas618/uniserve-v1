@@ -174,6 +174,19 @@ pub struct SchedulerStats {
     /// the buffer pool: the request's `Allocate` was still outstanding when the call was due.
     #[serde(default)]
     pub calls_without_blocks: u64,
+    /// Transfers of a request between worker groups, from the group that prefilled it to a decode
+    /// group, that the buffer pool answered `Transferred` in the interval.
+    #[serde(default)]
+    pub transfers: u64,
+    /// Transfers the buffer pool answered `Failed` in the interval; each request ended as
+    /// migratable.
+    #[serde(default)]
+    pub failed_transfers: u64,
+    /// The blocks the target groups of the interval's transfers received: every entry each
+    /// `Transferred` states, by class and position, whether its task copied the block or the
+    /// target group's memory held it already.
+    #[serde(default)]
+    pub transferred_blocks: u64,
     /// The scheduler's steps since it started, each one decision of its policy (a lifetime
     /// value). The main process reports it as `Metrics::steps`, `step_counter` as
     /// `Metrics::batches` and the sum of `batch_tokens` as `Metrics::tokens`.

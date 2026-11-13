@@ -205,12 +205,13 @@ def _held(runtime: Path) -> list[str]:
     """What the test's Storage Server holds: its tensors, deployments and
     quotas. Its Transfer Server's process, contexts, link measurements and
     tasks are no storage it holds: a restarted server's Transfer Server
-    measures anew.
+    measures anew. Its buffer pools' blocks, groups and copies change with
+    every step of the requests the deployment serves.
     """  # noqa: D205
     return sorted(
         line
         for line in _storage_list(runtime).splitlines()
-        if not line.startswith(("transfer ", "link "))
+        if not line.startswith(("transfer ", "link ", "buffer pool of "))
     )
 
 

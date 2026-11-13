@@ -153,6 +153,20 @@ pub(crate) fn record_scheduler_stats(
         .get_or_create(&labels)
         .inc_by(stats.prefix_cache_stats.peer_hits);
 
+    // Transfers of requests between worker groups, by their answers, and the blocks they gave.
+    metrics
+        .request_transfers
+        .get_or_create(&labels)
+        .inc_by(stats.transfers);
+    metrics
+        .request_transfers_failed
+        .get_or_create(&labels)
+        .inc_by(stats.failed_transfers);
+    metrics
+        .request_transfer_blocks
+        .get_or_create(&labels)
+        .inc_by(stats.transferred_blocks);
+
     // Worker-local forward/kernel counters. The reporter sends `None` when no
     // worker counter changed in the interval, and then none of these families
     // is touched.
@@ -714,5 +728,34 @@ mod tests {
                 && line.contains("domain=\"decode\"")
                 && line.ends_with(" 4")
         }));
+    }
+
+    // A scheduler's transfers between worker groups reach the exposition as counters that add
+    // each interval's answers and blocks.
+    #[test]
+    fn transfers_reach_openmetrics_and_add_up_over_intervals() {
+        let metrics = Metrics::new();
+        let stats = SchedulerStats {
+            transfers: 2,
+            failed_transfers: 1,
+            transferred_blocks: 9,
+            ..Default::default()
+        };
+
+        record_scheduler_stats(&metrics.scheduler, "model", 0, &stats);
+        record_scheduler_stats(&metrics.scheduler, "model", 0, &stats);
+        let rendered = metrics.render().expect("metrics render");
+
+        for (name, value) in [
+            ("uniserve:request_transfers_total", 4),
+            ("uniserve:request_transfers_failed_total", 2),
+            ("uniserve:request_transfer_blocks_total", 18),
+        ] {
+            let sample = format!("{name}{{model_name=\"model\",engine=\"0\"}} {value}");
+            assert!(
+                rendered.lines().any(|line| line == sample),
+                "{sample}: {rendered}"
+            );
+        }
     }
 }

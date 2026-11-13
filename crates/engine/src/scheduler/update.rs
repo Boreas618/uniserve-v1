@@ -900,10 +900,10 @@ impl Scheduler {
     /// answers, the owner that request acts for, the request and the completion. A refusal that
     /// is no miss names something the scheduler chose from its own counts, which is its defect:
     /// the scheduler stops. A block committed, or stored on the host, is stored on as the write
-    /// policy says (`write_policy`), whether or not its owner is still live. Completions of
-    /// requests that act for no owner change the scheduler's regions and its admissions'
-    /// prefetches; the rest apply to the request the owner is for, as an admission's, a
-    /// transfer's or a running request's answer.
+    /// policy says (`write_policy`), whether or not its owner is still live, and the answer to a
+    /// `Transfer` is counted in the statistics (SD §7.5). Completions of requests that act for no
+    /// owner change the scheduler's regions and its admissions' prefetches; the rest apply to the
+    /// request the owner is for, as an admission's, a transfer's or a running request's answer.
     pub(super) fn answered(
         &mut self,
         _: runtime::RequestId,
@@ -929,6 +929,9 @@ impl Scheduler {
             (runtime::Request::Prefetch { .. }, Completion::Prefetched { .. }) => {
                 return self.prefetched(&request, &completion);
             }
+            // Every transfer the scheduler asked for is counted by its answer, also the transfer
+            // of a request cancelled meanwhile.
+            (runtime::Request::Transfer { .. }, _) => self.count_transfer(&completion),
             _ => {}
         }
 

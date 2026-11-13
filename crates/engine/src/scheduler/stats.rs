@@ -4,7 +4,8 @@
 //!
 //! The report message is the accumulator. Counters add into it where the scheduler acts: a batch
 //! submitted, a batch's output applied, a verification's drafts, an admission's queue wait and
-//! hit, a call left out of a step because its blocks had not arrived. Publishing takes the report
+//! hit, a call left out of a step because its blocks had not arrived, a transfer's answer.
+//! Publishing takes the report
 //! and starts the next interval from an empty one that keeps the lifetime values (the batches
 //! submitted, the longest queue wait, each domain's credits in flight and their peak); the gauges
 //! (requests running and waiting, the cache's usage) and the lifetime counts other parts of the
@@ -22,6 +23,7 @@ use ipc::batch::{Batch, BatchOutput, CallOutput, CallStatus, ErrorCode, Phase};
 use proto::report::{DomainSchedulerStats, ForwardStats, SchedulerStats};
 use proto::request::RequestId;
 use scheduling::PhaseClass;
+use storage::runtime::Completion;
 
 use super::{Output, Scheduler};
 
@@ -199,6 +201,28 @@ impl Scheduler {
     /// pool (SD §7.6).
     pub(super) fn count_without_blocks(&mut self) {
         add(&mut self.stats.calls_without_blocks, 1);
+    }
+
+    /// Counts the answer to a transfer's `Transfer` (SD §3.5 "Prefill to decode transfer"):
+    /// `Transferred` is one more transfer and the blocks its runs state, one per entry (a block
+    /// of several runs, a product's, states each of them at its one position); `Failed` is one
+    /// more failed transfer.
+    pub(super) fn count_transfer(&mut self, completion: &Completion) {
+        match completion {
+            Completion::Transferred { runs, .. } => {
+                let mut entries: Vec<(u8, u32)> = runs
+                    .iter()
+                    .map(|&(class, position, _, _)| (class, position))
+                    .collect();
+                entries.sort_unstable();
+                entries.dedup();
+
+                add(&mut self.stats.transfers, 1);
+                add(&mut self.stats.transferred_blocks, entries.len() as u64);
+            }
+            Completion::Failed => add(&mut self.stats.failed_transfers, 1),
+            _ => {}
+        }
     }
 
     /// When the next report is due: the loop need not wake for statistics before it.

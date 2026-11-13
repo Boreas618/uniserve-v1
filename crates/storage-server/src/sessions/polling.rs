@@ -280,7 +280,7 @@ fn serve(jobs: &mpsc::Receiver<Work>, mut pools: Pools) {
 
 /// The host's monotonic clock in nanoseconds, the clock of the tasks'
 /// deadlines.
-fn monotonic() -> u64 {
+pub(crate) fn monotonic() -> u64 {
     let now = rustix::time::clock_gettime(rustix::time::ClockId::Monotonic);
     (now.tv_sec as u64)
         .saturating_mul(1_000_000_000)

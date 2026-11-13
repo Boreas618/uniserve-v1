@@ -12,12 +12,14 @@
 //! always runs its Transfer Server ([`run_transfer_server`]) the same way.
 
 use std::ffi::OsString;
+use std::io::Write;
 use std::os::fd::{AsFd, OwnedFd};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use ::storage::connector::Settings;
+use ::storage::protocol::{BlockState, BufferPoolListing, Waiting};
 use ::storage::{Client, Role};
 use anyhow::Context;
 
@@ -141,17 +143,21 @@ pub fn run_transfer_server(
     ran
 }
 
-/// Print the tensors, bytes and deployments the server on `socket` holds.
+/// Write to `out` what the server on `socket` holds, a line each: its
+/// tensors, its deployments, its connector and Transfer Server, the quotas
+/// of its GPUs, and the buffer pool of each deployment (`list_pool`).
 ///
 /// # Errors
 ///
-/// Fails when the server cannot be reached or refuses the listing.
-pub fn list(socket: &Path) -> ::storage::Result<()> {
+/// Fails when the server cannot be reached or refuses the listing, or `out`
+/// cannot be written.
+pub fn list(socket: &Path, out: &mut impl Write) -> anyhow::Result<()> {
     let mut client = Client::connect(socket, Role::Operator)?;
     let listing = client.list()?;
     for tensor in &listing.tensors {
         let scopes: Vec<String> = tensor.scopes.iter().map(ToString::to_string).collect();
-        println!(
+        writeln!(
+            out,
             "{} {:?} {} bytes {:?} {} [{}]{}",
             tensor.key.hex(),
             tensor.location,
@@ -163,10 +169,11 @@ pub fn list(socket: &Path) -> ::storage::Result<()> {
                 .writer
                 .map(|pid| format!(" writer {pid}"))
                 .unwrap_or_default()
-        );
+        )?;
     }
     for deployment in &listing.deployments {
-        println!(
+        writeln!(
+            out,
             "deployment {} head {}",
             deployment.deployment,
             if deployment.head_connected {
@@ -174,30 +181,33 @@ pub fn list(socket: &Path) -> ::storage::Result<()> {
             } else {
                 "gone"
             }
-        );
+        )?;
     }
     if listing.connector {
-        println!("mooncake connector connected");
+        writeln!(out, "mooncake connector connected")?;
     }
     if let Some(transfer) = &listing.transfer {
-        println!("transfer server {} connected", transfer.pid);
+        writeln!(out, "transfer server {} connected", transfer.pid)?;
         for context in &transfer.contexts {
-            println!(
+            writeln!(
+                out,
                 "transfer server context on {}: {} bytes",
                 platform::DeviceUuid(context.gpu),
                 context.bytes
-            );
+            )?;
         }
         for measured in &transfer.links {
-            println!(
+            writeln!(
+                out,
                 "link {} -> {}: {:.1} GB/s",
                 storage_name(&measured.link.source),
                 storage_name(&measured.link.destination),
                 measured.bytes_per_second as f64 / 1e9
-            );
+            )?;
         }
         for task in &transfer.tasks {
-            println!(
+            writeln!(
+                out,
                 "transfer {} of {} update {} {:?}: {} of {} bytes{}",
                 task.task,
                 task.deployment,
@@ -206,11 +216,91 @@ pub fn list(socket: &Path) -> ::storage::Result<()> {
                 task.copied,
                 task.bytes,
                 if task.cancelled { ", cancelled" } else { "" }
-            );
+            )?;
         }
     }
     for quota in &listing.quotas {
-        println!("{}", quota.describe());
+        writeln!(out, "{}", quota.describe())?;
+    }
+    for pool in &listing.buffer_pools {
+        list_pool(pool, out)?;
+    }
+    Ok(())
+}
+
+/// Write one deployment's buffer pool as `specs/buffer-pool.md` §8 states
+/// it, each line led by `buffer pool of <deployment>:`: the inconsistencies
+/// its checks found, the blocks of each region and class in each observed
+/// state, each worker group with the `completed` word last read and the
+/// stamps its deferred work waits for, and each request whose copies are in
+/// flight, with the time left to a task's deadline.
+fn list_pool(pool: &BufferPoolListing, out: &mut impl Write) -> std::io::Result<()> {
+    let of = format!("buffer pool of {}:", pool.deployment);
+    writeln!(out, "{of} {} check failures", pool.check_failures)?;
+
+    for count in &pool.blocks {
+        let state = match count.state {
+            BlockState::Shared => "shared",
+            BlockState::Private => "private",
+            BlockState::Retired => "retired",
+        };
+        let what = match count.class {
+            Some(class) => format!("blocks of class {class}"),
+            None => "slot rows".to_owned(),
+        };
+        writeln!(
+            out,
+            "{of} {} {state} {what} in region {}",
+            count.blocks, count.region
+        )?;
+    }
+
+    for group in &pool.groups {
+        let waiting: Vec<String> = group
+            .waiting
+            .iter()
+            .map(|(stamp, work)| {
+                let work = match work {
+                    Waiting::Release => "release",
+                    Waiting::Commit => "commit",
+                    Waiting::Transfer => "transfer",
+                    Waiting::Finish => "finish",
+                };
+                format!("{work} at {stamp}")
+            })
+            .collect();
+        let waiting = if waiting.is_empty() {
+            "nothing waits".to_owned()
+        } else {
+            format!("waiting {}", waiting.join(", "))
+        };
+        writeln!(
+            out,
+            "{of} group {} of epoch {} completed {}, {waiting}",
+            group.group, group.epoch, group.completed
+        )?;
+    }
+
+    // A task's deadline is on the host's monotonic clock, which this
+    // process, on the same host, reads too.
+    let now = crate::sessions::polling::monotonic();
+    for copy in &pool.copies {
+        let session = match copy.epoch {
+            Some(epoch) => format!("epoch {epoch}"),
+            None => "a closed session".to_owned(),
+        };
+        let deadline = match copy.deadline {
+            Some(deadline) if deadline > now => {
+                format!(", due in {} ms", (deadline - now) / 1_000_000)
+            }
+            Some(_) => ", past its deadline".to_owned(),
+            None => String::new(),
+        };
+        writeln!(
+            out,
+            "{of} {} copies in flight of request {} of scheduler {} of {session}{deadline}",
+            copy.copies, copy.request, copy.scheduler
+        )?;
     }
     Ok(())
 }

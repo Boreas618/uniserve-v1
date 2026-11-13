@@ -181,6 +181,14 @@ pub struct SchedulerMetrics {
     /// The part of the host hit tokens read from peer hosts' pools first.
     pub prefix_cache_peer_hits: Family<EngineLabels, U64Counter>,
 
+    // Transfers of requests from the worker group that prefilled them to a decode group.
+    /// Transfers the buffer pool answered `Transferred`.
+    pub request_transfers: Family<EngineLabels, U64Counter>,
+    /// Transfers the buffer pool answered `Failed`.
+    pub request_transfers_failed: Family<EngineLabels, U64Counter>,
+    /// The blocks the transfers' target groups received, one per entry a `Transferred` states.
+    pub request_transfer_blocks: Family<EngineLabels, U64Counter>,
+
     // Worker-local forward/kernel counters.
     /// Attention kernel launches.
     pub worker_attention_launches: Family<EngineLabels, U64Counter>,
@@ -376,6 +384,27 @@ impl SchedulerMetrics {
             "uniserve:prefix_cache_peer_hits",
             "The host KV cache hits read from peer hosts' pools first, in tokens.",
             prefix_cache_peer_hits.clone(),
+        );
+        let request_transfers: Family<EngineLabels, U64Counter> = Default::default();
+        registry.register(
+            "uniserve:request_transfers",
+            "Requests moved from the worker group that prefilled them to a decode group: \
+             transfers the buffer pool answered as transferred.",
+            request_transfers.clone(),
+        );
+        let request_transfers_failed: Family<EngineLabels, U64Counter> = Default::default();
+        registry.register(
+            "uniserve:request_transfers_failed",
+            "Transfers of requests to a decode group that the buffer pool answered as failed; \
+             each request ended as migratable.",
+            request_transfers_failed.clone(),
+        );
+        let request_transfer_blocks: Family<EngineLabels, U64Counter> = Default::default();
+        registry.register(
+            "uniserve:request_transfer_blocks",
+            "Blocks the decode groups received by transfer: every entry of the transferred \
+             requests' tables, by class and position.",
+            request_transfer_blocks.clone(),
         );
         let worker_attention_launches: Family<EngineLabels, U64Counter> = Default::default();
         registry.register(
@@ -650,6 +679,9 @@ impl SchedulerMetrics {
             prefix_cache_hits,
             prefix_cache_host_hits,
             prefix_cache_peer_hits,
+            request_transfers,
+            request_transfers_failed,
+            request_transfer_blocks,
             worker_attention_launches,
             worker_attention_us,
             worker_attention_backend_counts,

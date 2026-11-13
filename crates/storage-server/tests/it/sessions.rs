@@ -324,6 +324,99 @@ pub(crate) fn serve_a_session(server: &Running) {
     );
 }
 
+/// The operator's `list` prints each deployment's buffer pool as `specs/buffer-pool.md` §8 states
+/// it, a line each: the inconsistencies the checks found, the blocks of each region and class in
+/// each observed state, each worker group's `completed` word with the stamps of what waits on it,
+/// and each request whose copies are in flight.
+#[test]
+fn the_operator_s_list_prints_the_buffer_pool_s_blocks_groups_copies_and_check_failures() {
+    let server = Running::configured(|server| server.watch_pools(None, true));
+    let mut engine = engine_head(&server.socket, 0);
+    let (opened, descriptors) = engine.open_pool(layout(0)).unwrap();
+    let mut schedulers = Scheduler::all(&opened, descriptors);
+    let prefill = &mut schedulers[0];
+
+    // An owner on the prefill group holds a slot row and three private blocks.
+    let attach = Request::Attach {
+        owner: OwnerId(1),
+        group: PREFILL,
+    };
+    assert_eq!(prefill.ask(attach), Completion::Attached { slot: 1 });
+    let allocate = Request::Allocate {
+        owner: OwnerId(1),
+        class: KV,
+        at: 0,
+        count: 3,
+        units: 0,
+    };
+    assert!(matches!(
+        prefill.ask(allocate),
+        Completion::Allocated { .. }
+    ));
+
+    // The first block is committed at once: shared, the owner's pin on it. The second's commit
+    // waits for the prefill group's batch 9, and the second stays private. The third leaves the
+    // owner's table at once, but its release waits for batch 9: only the waiting release holds
+    // it, and it is retired.
+    let commit = |at, byte, after| Request::Commit {
+        owner: OwnerId(1),
+        class: KV,
+        at,
+        key: key(byte),
+        tokens: 64,
+        after,
+    };
+    assert_eq!(prefill.ask(commit(0, 7, Vec::new())), Completion::Committed);
+    prefill.submit(commit(1, 8, vec![(PREFILL, 9)]));
+    let release = Request::Release {
+        owner: OwnerId(1),
+        class: KV,
+        at: 2,
+        count: 1,
+        after: vec![(PREFILL, 9)],
+    };
+    assert_eq!(prefill.ask(release), Completion::Done);
+
+    // A store of the shared block to the host: its copy, which the prefill group's executor
+    // runs, is in flight until its `Finish`, and the host block it writes is private until then.
+    let store = prefill.submit(Request::Store {
+        group: PREFILL,
+        keys: vec![key(7)],
+        tier: Tier::Host,
+    });
+    let (answered, answer) = prefill.next();
+    assert!(
+        answered == store && matches!(answer, Completion::Copy { .. }),
+        "{answered:?} answered {answer:?}"
+    );
+
+    let mut printed = Vec::new();
+    storage_server::list(&server.socket, &mut printed).unwrap();
+    let printed = String::from_utf8(printed).unwrap();
+    let mut pool: Vec<&str> = printed
+        .lines()
+        .filter(|line| line.starts_with("buffer pool of model: "))
+        .collect();
+    pool.sort_unstable();
+    let copies = format!(
+        "buffer pool of model: 1 copies in flight of request {} of scheduler 0 of epoch 0",
+        store.0
+    );
+    let mut expected = vec![
+        "buffer pool of model: 0 check failures",
+        "buffer pool of model: 1 shared blocks of class 0 in region units",
+        "buffer pool of model: 1 private blocks of class 0 in region units",
+        "buffer pool of model: 1 retired blocks of class 0 in region units",
+        "buffer pool of model: 1 private blocks of class 0 in region host",
+        "buffer pool of model: 1 private slot rows in region prefill rows 0",
+        "buffer pool of model: group 0 of epoch 0 completed 0, waiting commit at 9, release at 9",
+        "buffer pool of model: group 1 of epoch 0 completed 0, nothing waits",
+        &copies,
+    ];
+    expected.sort_unstable();
+    assert_eq!(pool, expected, "{printed}");
+}
+
 #[test]
 fn a_session_is_refused_what_the_server_does_not_serve() {
     let server = Running::with_transfer(|_| None);

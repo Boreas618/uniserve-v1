@@ -13,7 +13,11 @@ group (``specs/buffer-pool.md`` §11, ``specs/scheduler-design.md`` §4.1). Each
 case compares the greedy tokens of fixed prompts, one of several blocks with
 a partial last one, with an undivided deployment's on one GPU: a prefill
 group computes no decode, so the tokens after the first are the decode
-group's, computed over the blocks it was transferred.
+group's, computed over the blocks it was transferred. Each case also reads
+the scheduler's transfer counters on ``/metrics``
+(``specs/scheduler-design.md`` §7.5): every prompt was transferred, none
+failed, and the decode group received every block the request held when its
+prompt was computed, those of its prompt and the low watermark's.
 
 The one-host case places both groups on this host's two GPUs. The two-host
 case places the decode group on a second host, named by the suite's
@@ -28,10 +32,12 @@ unless stated). Without these variables the two-host case is skipped.
 
 from __future__ import annotations
 
+import math
 import os
 import shutil
 import tempfile
-from collections.abc import Iterator
+import time
+from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from pathlib import Path
 
@@ -42,14 +48,18 @@ from tests.python.e2e.build_server import remote_build_server
 from tests.python.e2e.http_helpers import (
     ATTENTION_BACKEND,
     QWEN3_CHECKPOINT,
+    REPORT_SETTLE_S,
     engine_selection,
     find_free_port,
     granted_devices,
     host_asset,
+    metric,
     require_uniserve_binary,
+    scaled,
     second_host,
     server_process,
     stop_storage_server,
+    wait_until,
     written_deployment,
 )
 
@@ -81,11 +91,31 @@ PROMPTS = (
     + " Which record has the largest value?",
 )
 
+# The tokens of a KV block.
+BLOCK_TOKENS = 64
+# The blocks of each cache group a request holds beyond its next call: the
+# low watermark (``specs/scheduler-design.md`` §4.4).
+LOW_WATERMARK = 1
+
+# The scheduler's transfer counters (``specs/scheduler-design.md`` §7.5): the
+# transfers answered ``Transferred``, those answered ``Failed``, and the
+# blocks the decode groups received, one per entry of each transferred
+# request's tables.
+TRANSFER_COUNTERS = (
+    "uniserve:request_transfers",
+    "uniserve:request_transfers_failed",
+    "uniserve:request_transfer_blocks",
+)
+
+# A request's answer: its greedy tokens and its prompt's tokens.
+Answer = tuple[list[str], int]
+
 # Every deployment of the module serves with these options.
 OPTIONS = (
     "dtype=bfloat16",
     f"attention_backend={ATTENTION_BACKEND}",
     "kv_cache_config.max_tokens=32768",
+    f"kv_cache_config.block_size={BLOCK_TOKENS}",
     "chat_config.reasoning_parser=none",
     "cuda_graph_config.prefill_token_sizes=[1024]",
     "cuda_graph_config.decode_batch_sizes=[1, 2, 4, 8]",
@@ -140,8 +170,8 @@ def _split(directory: Path, decode_host: str | None) -> Path:
     )
 
 
-def _greedy(base_url: str, prompt: str) -> list[str]:
-    """The tokens `prompt` decodes to greedily."""
+def _greedy(base_url: str, prompt: str) -> Answer:
+    """The tokens `prompt` decodes to greedily, and its prompt's tokens."""
     response = httpx.post(
         f"{base_url}/v1/chat/completions",
         json={
@@ -159,10 +189,72 @@ def _greedy(base_url: str, prompt: str) -> list[str]:
         timeout=900,
     )
     response.raise_for_status()
-    return [
-        entry["token"]
-        for entry in response.json()["choices"][0]["logprobs"]["content"]
+    reply = response.json()
+    tokens = [
+        entry["token"] for entry in reply["choices"][0]["logprobs"]["content"]
     ]
+    return tokens, reply["usage"]["prompt_tokens"]
+
+
+def _transfer_counters(base_url: str) -> tuple[float, ...]:
+    """The scheduler's transfer counters, in the order of
+    ``TRANSFER_COUNTERS``.
+    """  # noqa: D205
+    return tuple(metric(base_url, name) for name in TRANSFER_COUNTERS)
+
+
+def _idle(base_url: str) -> bool:
+    """Whether the schedulers reported, and reported no request running or
+    waiting.
+    """  # noqa: D205
+    text = httpx.get(f"{base_url}/metrics", timeout=10).text
+    busy = metric(base_url, "uniserve:num_requests_running") + metric(
+        base_url, "uniserve:num_requests_waiting"
+    )
+    return "uniserve:num_requests_running{" in text and busy == 0
+
+
+def _transfers(
+    base_url: str, ask: Callable[[], list[Answer]]
+) -> tuple[list[Answer], tuple[int, ...]]:
+    """What `ask` returns, and how much each transfer counter grew over it.
+
+    The serving path's warm-up requests may end after the server answers
+    its health and are transferred too, so the counters are first read once
+    a report taken after them states no request running or waiting. The
+    scheduler reports once a second: the counters are read again once they
+    hold a transfer per request `ask` answered and another report followed.
+    """
+    time.sleep(scaled(REPORT_SETTLE_S))
+    wait_until(lambda: _idle(base_url), 120, "the warm-up requests did not end")
+    before = _transfer_counters(base_url)
+    answers = ask()
+    wait_until(
+        lambda: (
+            sum(_transfer_counters(base_url)[:2])
+            >= sum(before[:2]) + len(answers)
+        ),
+        30,
+        "the requests' transfers were not reported",
+    )
+    time.sleep(scaled(REPORT_SETTLE_S))
+    after = _transfer_counters(base_url)
+    return answers, tuple(
+        int(a - b) for a, b in zip(after, before, strict=True)
+    )
+
+
+def _expected(answers: list[Answer]) -> tuple[int, ...]:
+    """The transfer counters' growth over `answers`: each request was
+    transferred, and its decode group received the blocks the request held
+    when its prompt was computed: those of its prompt and the low
+    watermark's.
+    """  # noqa: D205
+    blocks = sum(
+        math.ceil(prompt_tokens / BLOCK_TOKENS) + LOW_WATERMARK
+        for _, prompt_tokens in answers
+    )
+    return len(answers), 0, blocks
 
 
 @contextmanager
@@ -191,7 +283,7 @@ def reference(tmp_path_factory: pytest.TempPathFactory) -> list[list[str]]:
     with server_process(
         _command(port), base_url, directory / "server.log", 1800, env=env
     ):
-        return [_greedy(base_url, prompt) for prompt in PROMPTS]
+        return [_greedy(base_url, prompt)[0] for prompt in PROMPTS]
 
 
 def test_a_prefill_group_transfers_requests_to_a_decode_group_on_one_host(
@@ -214,9 +306,12 @@ def test_a_prefill_group_transfers_requests_to_a_decode_group_on_one_host(
             },
         ),
     ):
-        tokens = [_greedy(base_url, prompt) for prompt in PROMPTS]
+        answers, transferred = _transfers(
+            base_url, lambda: [_greedy(base_url, prompt) for prompt in PROMPTS]
+        )
 
-    assert tokens == reference
+    assert [tokens for tokens, _ in answers] == reference
+    assert transferred == _expected(answers), answers
 
 
 def test_a_prefill_group_transfers_requests_to_a_decode_group_on_another_host(
@@ -270,6 +365,9 @@ def test_a_prefill_group_transfers_requests_to_a_decode_group_on_another_host(
             },
         ),
     ):
-        tokens = [_greedy(base_url, prompt) for prompt in PROMPTS]
+        answers, transferred = _transfers(
+            base_url, lambda: [_greedy(base_url, prompt) for prompt in PROMPTS]
+        )
 
-    assert tokens == reference
+    assert [tokens for tokens, _ in answers] == reference
+    assert transferred == _expected(answers), answers

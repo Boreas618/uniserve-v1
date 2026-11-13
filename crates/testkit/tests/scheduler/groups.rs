@@ -11,13 +11,14 @@
 //! placed on by an owner of its own, and a product one group writes and another reads is mapped
 //! and stamped by both.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use ipc::batch::{Batch, Phase};
+use proto::report::SchedulerStats;
 use proto::request::{Event, MigrationCause, RejectionKind, RequestId};
 use storage::runtime::{Completion, GroupId, OwnerId, Request};
 
-use crate::harness::{A, B, Deployment, Harness, chat_image, token, video};
+use crate::harness::{A, B, BLOCK, Deployment, Harness, chat_image, token, video};
 
 /// The slot of request `id`'s row in `batch`: a token row's, or a media row's.
 fn slot_in(batch: &Batch, id: RequestId) -> Option<u32> {
@@ -51,6 +52,22 @@ fn detached_by(harness: &Harness, owner: OwnerId) -> Option<Vec<GroupId>> {
             }
             _ => None,
         })
+}
+
+/// The transfers the scheduler's statistics counted over every report it sent, once it sent the
+/// next one: those answered `Transferred`, those answered `Failed`, and the blocks the target
+/// groups received.
+fn transfers_counted(harness: &mut Harness) -> (u64, u64, u64) {
+    harness.next_report();
+    let sum = |field: fn(&SchedulerStats) -> u64| {
+        let reports = harness.reports().into_iter();
+        reports.map(field).sum::<u64>()
+    };
+    (
+        sum(|report| report.transfers),
+        sum(|report| report.failed_transfers),
+        sum(|report| report.transferred_blocks),
+    )
 }
 
 /// On a deployment that prefills on one group and decodes on another, every prefill of every
@@ -156,7 +173,7 @@ fn a_prefill_then_its_transfer_then_its_decodes_on_another_group() {
     assert_eq!(target, B);
     assert!(after.iter().any(|(group, _)| *group == A), "{after:?}");
 
-    let slot =
+    let transferred =
         harness
             .fake
             .mapped()
@@ -165,15 +182,28 @@ fn a_prefill_then_its_transfer_then_its_decodes_on_another_group() {
                 |(group, slot, _, request, completion)| match (request, completion) {
                     (
                         Request::Transfer { owner: of, .. },
-                        Completion::Transferred { slot: given, .. },
+                        Completion::Transferred { slot: given, runs },
                     ) if of == owner && group == B => {
                         assert_eq!(slot, given, "mapped under the slot it gave");
-                        Some(given)
+                        Some((given, runs))
                     }
                     _ => None,
                 },
             );
-    let slot = slot.unwrap();
+    let (slot, runs) = transferred.unwrap();
+
+    // The statistics count one transfer and the blocks the decode group received, one per entry
+    // `Transferred` stated (SD §7.5): the prompt's blocks and the low watermark's, which the
+    // prefill group held when its prompt was computed (SD §4.4).
+    let entries: HashSet<(u8, u32)> = runs
+        .iter()
+        .map(|&(class, position, _, _)| (class, position))
+        .collect();
+    assert_eq!(entries.len() as u32, 9_u32.div_ceil(BLOCK) + 1, "{runs:?}");
+    assert_eq!(
+        transfers_counted(&mut harness),
+        (1, 0, entries.len() as u64)
+    );
 
     let batches = harness.batches_of(id);
     let decodes: Vec<&Batch> = batches
@@ -237,6 +267,9 @@ fn a_failed_transfer_ends_as_migratable_and_detaches_its_owner_with_no_stamp() {
         "it never decoded"
     );
     assert_eq!(harness.held(), 0);
+
+    // The statistics count the failed transfer, and no block received (SD §7.5).
+    assert_eq!(transfers_counted(&mut harness), (0, 1, 0));
 }
 
 /// A video request placed on two groups (the first prepares its latents and denoises them, the
