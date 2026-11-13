@@ -1482,6 +1482,7 @@ fn part(work: &PageWork<'_>) -> &'static str {
         PageWork::AfterReplay => "after replay",
         PageWork::Ended => "ended",
         PageWork::BeforeShadow(_) => "before shadow",
+        PageWork::Holds(..) => "holds",
     }
 }
 

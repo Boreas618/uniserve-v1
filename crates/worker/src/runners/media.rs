@@ -793,6 +793,17 @@ impl Runner for MediaHost {
 
         self.memory.copy(copies, self.stream.as_ref())
     }
+
+    /// The rank's media memory: its product buffer and its parts of host regions
+    /// (`BufferMemory::holds`).
+    fn maps(&mut self, region: u8) -> bool {
+        self.memory.holds(region)
+    }
+
+    /// The copies were issued on the runner's stream, which this waits for.
+    fn wait_copies(&mut self) -> Result<()> {
+        settle(self.stream.as_ref())
+    }
 }
 
 /// The two turns of a host batch: see [`Runner::start`] and [`Runner::execute`].

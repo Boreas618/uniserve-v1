@@ -20,12 +20,20 @@
 //! the block's start on every axis ([`CausalLmRunner::set_features`]): the runner checks at
 //! construction that the model's coordinates from position `p` are those from 0 plus `p`.
 //!
-//! ## The bucket
+//! ## The buckets
 //!
-//! One bucket, the largest image's: a grid of [`Vision::max_image_rows`] rows, whose patch rows
-//! the input block holds, so every image the processor sizes fits it. Its profile run sizes the
-//! runner's region; an image of exactly that grid replays its captured graph, and every other
-//! grid runs eagerly over the same input block and region.
+//! A forward's bucket is its grid's patch rows. One bucket is captured, the largest image's: a
+//! grid of [`Vision::max_image_rows`] rows, whose patch rows the input block holds, so every
+//! image the processor sizes fits it. An image of exactly that grid replays its captured graph,
+//! and every other grid runs eagerly over the same input block and region.
+//!
+//! The processor sizes an image to any grid of whole merge blocks up to the largest, and
+//! [`Vision`] enumerates none of them, so the runner states its eager buckets by their extent,
+//! which the largest grid's bounds: one grid per doubling of the merged rows below the largest's,
+//! each the most nearly square grid of those rows ([`Runner::eager_buckets`]). A forward's
+//! launches and memory follow its patch rows, so the profile run of the captured bucket and of
+//! the eager ones sizes the runner's region for every grid and states the kernels an eager
+//! forward launches.
 //!
 //! [`CausalLmRunner::set_features`]: super::CausalLmRunner::set_features
 
@@ -63,8 +71,10 @@ pub struct VisionRunner {
     memory: Arc<BufferMemory>,
     /// The class of encoder outputs, in whose table a row names its output's position.
     class: u8,
-    /// The grid of the largest image: the bucket's.
+    /// The grid of the largest image: the captured bucket's.
     largest: [u32; 3],
+    /// The eager buckets, smallest first, each with the grid a profile run computes it over.
+    eager: Vec<(Bucket, [u32; 3])>,
     /// The grid of the forward being prepared or run: the largest image's but while an image of
     /// another grid is encoded.
     grid: Cell<[u32; 3]>,
@@ -149,6 +159,15 @@ impl VisionRunner {
             ));
         }
 
+        // One eager grid per doubling of the merged rows below the largest image's.
+        let rows = std::iter::successors(Some(1_u32), |rows| rows.checked_mul(2))
+            .take_while(|rows| *rows < vision.max_image_rows());
+        let mut eager = Vec::new();
+        for rows in rows {
+            let grid = grid(vision, rows)?;
+            eager.push((bucket_of(grid)?, grid));
+        }
+
         Ok(Self {
             model,
             graphs,
@@ -156,6 +175,7 @@ impl VisionRunner {
             memory,
             class,
             largest,
+            eager,
             grid: Cell::new(largest),
         })
     }
@@ -165,15 +185,29 @@ impl VisionRunner {
         tower(&*self.model)
     }
 
-    /// The bucket a forward of an image of `grid` runs as: the one bucket for the largest
-    /// image's grid, which is captured, and one that is not for any other.
-    fn bucket(&self, grid: [u32; 3]) -> Result<Bucket> {
-        let patches = grid
-            .iter()
-            .try_fold(1_u32, |product, extent| product.checked_mul(*extent))
-            .ok_or_else(|| Error::Invalid(format!("an image grid {grid:?} overflows")))?;
+    /// The grid a forward of `bucket` computes over: the grid of the image being encoded when
+    /// the bucket is its, otherwise the grid the runner states the bucket by, the largest
+    /// image's or an eager one's.
+    ///
+    /// # Errors
+    ///
+    /// A bucket that is neither.
+    fn grid_of(&self, bucket: &Bucket) -> Result<[u32; 3]> {
+        let prepared = self.grid.get();
+        if bucket_of(prepared)? == *bucket {
+            return Ok(prepared);
+        }
 
-        Ok(Bucket::prefill(1, patches, Variant::ConditionEncode))
+        self.eager
+            .iter()
+            .find(|(eager, _)| eager == bucket)
+            .map(|(_, grid)| *grid)
+            .ok_or_else(|| {
+                Error::Invariant(format!(
+                    "bucket {bucket} is neither the one of the image grid {prepared:?} being \
+                     encoded nor one the runner states"
+                ))
+            })
     }
 
     /// Sizes the image of `row` and finds the block it is written to in `tables`: `Ok(Err(..))`
@@ -251,7 +285,7 @@ impl VisionRunner {
 
         let format = self.vision()?.patch_format();
         let patches = patch_bytes(&format, *grid)? as usize;
-        let bucket = self.bucket(*grid)?;
+        let bucket = bucket_of(*grid)?;
 
         self.grid.set(*grid);
         self.graphs.prepare_inputs(self, &bucket, |block| {
@@ -347,20 +381,21 @@ impl Runner for VisionRunner {
     }
 
     fn buckets(&self) -> Vec<Bucket> {
-        self.bucket(self.largest).into_iter().collect()
+        bucket_of(self.largest).into_iter().collect()
     }
 
-    /// The tower over the patch rows at the head of the input block, for the grid the runner
-    /// prepared: `[rows, hidden]` features, then their `[rows, axes]` I32 rotary coordinates
-    /// from position 0.
+    /// The buckets of the grids the runner states below the largest image's (module
+    /// documentation), smallest first.
+    fn eager_buckets(&self) -> Vec<Bucket> {
+        self.eager.iter().map(|(bucket, _)| *bucket).collect()
+    }
+
+    /// The tower over the patch rows at the head of the input block, for the grid of the image
+    /// the runner prepared, or for the grid it states the bucket by: `[rows, hidden]` features,
+    /// then their `[rows, axes]` I32 rotary coordinates from position 0.
     fn forward(&self, bucket: &Bucket) -> Result<Vec<Tensor>> {
         let vision = self.vision()?;
-        let grid = self.grid.get();
-        if *bucket != self.bucket(grid)? {
-            return Err(Error::Invariant(format!(
-                "bucket {bucket} is not the one of the image grid {grid:?} being encoded"
-            )));
-        }
+        let grid = self.grid_of(bucket)?;
 
         let format = vision.patch_format();
         let pixels = self.graphs.input(
@@ -391,7 +426,7 @@ impl Runner for VisionRunner {
 
     /// The largest image's grid over patch rows of zeros, which encode to rows no request reads.
     fn idle_inputs(&self, bucket: &Bucket, columns: &mut [u8]) -> Result<()> {
-        if *bucket != self.bucket(self.largest)? {
+        if *bucket != bucket_of(self.largest)? {
             return Err(Error::Invariant(format!(
                 "bucket {bucket} is none the runner states"
             )));
@@ -441,12 +476,22 @@ impl Runner for VisionRunner {
         &self.graphs
     }
 
+    /// The rank's media memory, where the encoder outputs lie: its product buffer and its parts
+    /// of host regions (`BufferMemory::holds`).
+    fn maps(&mut self, region: u8) -> bool {
+        self.memory.holds(region)
+    }
+
     /// Issues the copies of encoder outputs between the product buffer and the host encoder
     /// pool through the rank's media memory (`BufferMemory::copy`), on the runner's stream ahead
-    /// of its batch, whose end covers them. A copy of other memory, such as the KV cache's, is
-    /// refused.
+    /// of the batch, whose end covers them.
     fn copy(&mut self, copies: &[BlockCopy]) -> Result<()> {
         self.memory.copy(copies, self.stream.as_ref())
+    }
+
+    /// The copies were issued on the runner's stream, which this waits for.
+    fn wait_copies(&mut self) -> Result<()> {
+        settle(self.stream.as_ref())
     }
 }
 
@@ -457,11 +502,27 @@ fn tower(model: &dyn TextModel) -> Result<&dyn Vision> {
     })
 }
 
-/// The grid of the largest image `vision` sizes: one time step and [`Vision::max_image_rows`]
-/// rows, its sides the most nearly equal whole merge blocks that make them. The tower's work and
-/// memory follow its patch rows, which no image the processor sizes exceeds.
+/// The grid of the largest image `vision` sizes: the grid of [`Vision::max_image_rows`] rows.
+/// The tower's work and memory follow its patch rows, which no image the processor sizes
+/// exceeds.
 fn largest(vision: &dyn Vision) -> Result<[u32; 3]> {
-    let rows = vision.max_image_rows();
+    grid(vision, vision.max_image_rows())
+}
+
+/// The bucket a forward of an image of `grid` runs as: its patch rows, one image of them. The
+/// largest image's is captured, and every other is eager.
+fn bucket_of(grid: [u32; 3]) -> Result<Bucket> {
+    let patches = grid
+        .iter()
+        .try_fold(1_u32, |product, extent| product.checked_mul(*extent))
+        .ok_or_else(|| Error::Invalid(format!("an image grid {grid:?} overflows")))?;
+
+    Ok(Bucket::prefill(1, patches, Variant::ConditionEncode))
+}
+
+/// The grid the runner states an image of `rows` merged rows by: one time step, its sides the
+/// most nearly equal whole merge blocks that make them.
+fn grid(vision: &dyn Vision, rows: u32) -> Result<[u32; 3]> {
     let merge = vision.patch_format().merge;
     let short = (1..=rows.isqrt())
         .rev()
@@ -489,7 +550,7 @@ pub(crate) mod tests {
 
     use base64::Engine as _;
     use ipc::RequestId as CallRequest;
-    use ipc::batch::MediaRow;
+    use ipc::batch::{MediaRow, Variant};
     use nn::capability::{CausalLm, PatchFormat, PixelNorm, Vision};
     use nn::family::{CacheShape, ExpertShape, StateShape, TextModel};
     use nn::{Drafter, ExpertExchange, KvCache, RecurrentState, TokenBatch};
@@ -498,6 +559,7 @@ pub(crate) mod tests {
     use uniserve_tensor::{DType, Device, Tensor};
 
     use super::VisionRunner;
+    use crate::buckets::Bucket;
     use crate::graphs::Graphs;
     use crate::memory::buffers::BufferMemory;
     use crate::memory::tables::BlockTables;
@@ -753,5 +815,34 @@ pub(crate) mod tests {
         assert!(runner.size(&row(b"no image"), &tables).unwrap().is_err());
         assert!(runner.size(&row(&bmp(8, 4)), &self::tables(&[1])).is_err());
         assert!(runner.size(&row(&bmp(200, 200)), &tables).is_err());
+    }
+
+    #[test]
+    fn the_profile_run_states_a_grid_per_doubling_of_rows_below_the_largest_image() {
+        let graphs = Graphs::meta(
+            Arc::new(Generation::new(0, [])),
+            VisionRunner::input_bytes(&Seeing).unwrap(),
+        );
+        let memory = BufferMemory::meta(0, (PRODUCTS, 64), (SLOTS, 4), 0, &[]).unwrap();
+        let runner =
+            VisionRunner::new(Arc::new(Seeing), graphs, None, Arc::new(memory), ENCODER).unwrap();
+
+        // Below the largest image's six rows: the grids of one, two and four merged rows, each
+        // `MERGE × MERGE` patches a row: 1 × 1, 1 × 2 and 2 × 2 merge blocks.
+        let encode = |patches| Bucket::prefill(1, patches, Variant::ConditionEncode);
+        assert_eq!(runner.buckets(), [encode(24)]);
+        assert_eq!(runner.eager_buckets(), [encode(4), encode(8), encode(16)]);
+
+        // The profile run states the launches of every one, the captured and the eager.
+        runner.graphs().profile_run(&runner).unwrap();
+        for bucket in runner.buckets().into_iter().chain(runner.eager_buckets()) {
+            assert!(runner.graphs().launch_table(&bucket).is_some(), "{bucket}");
+        }
+
+        // An 8 × 4 image, two merged rows, is encoded eagerly as the bucket profiled for them.
+        let mut tables = tables(&[1]);
+        encoded(&mut tables, 1, 2, (PRODUCTS, 3, 1));
+        let image = runner.size(&row(&bmp(8, 4)), &tables).unwrap().unwrap();
+        assert_eq!(runner.prepare(&image).unwrap().unwrap(), encode(8));
     }
 }

@@ -83,6 +83,11 @@ struct LoggingRunner {
     held: Option<(Vec<u64>, Sender<u64>, Receiver<()>)>,
     /// What the executor last stated with `Runner::set_warming`.
     warming: AtomicBool,
+    /// The regions whose memory the runner maps: every region of the tests' ranks, unless a
+    /// test states fewer.
+    regions: Vec<u8>,
+    /// Whether the runner issued copies that no wait has covered yet.
+    copying: bool,
 }
 
 impl LoggingRunner {
@@ -105,6 +110,8 @@ impl LoggingRunner {
             log: Arc::clone(log),
             held: None,
             warming: AtomicBool::new(false),
+            regions: vec![DEVICE, HOST, PRODUCTS[0], PRODUCTS[1]],
+            copying: false,
         }
     }
 
@@ -216,12 +223,25 @@ impl Runner for LoggingRunner {
         Ok(())
     }
 
+    fn maps(&mut self, region: u8) -> bool {
+        self.regions.contains(&region)
+    }
+
     fn copy(&mut self, copies: &[BlockCopy]) -> Result<()> {
         let copies: Vec<(u64, Vec<(Run, Run)>)> = copies
             .iter()
             .map(|copy| (copy.request.0, copy.runs.clone()))
             .collect();
         self.state(format!("copy {copies:?}"));
+        self.copying = true;
+        Ok(())
+    }
+
+    /// States the wait that covers the copies issued since the last one.
+    fn wait_copies(&mut self) -> Result<()> {
+        if std::mem::take(&mut self.copying) {
+            self.state("wait for copies".to_owned());
+        }
         Ok(())
     }
 }
@@ -1337,10 +1357,89 @@ fn every_rank_starts_the_same_copies_with_a_batch_whatever_runs_it_maps() {
             "[(11, [((0, 176, 2), (1, 176, 2))])]",
         ]
     );
+    // Rank 1 holds no run of the first copy, which asks nothing of it.
     assert_eq!(
         copied(&log, "rank-1"),
-        ["[(10, [])]", "[(11, [((0, 176, 2), (1, 176, 2))])]"]
+        ["[(11, [((0, 176, 2), (1, 176, 2))])]"]
     );
+}
+
+/// The one rank of `GROUP` as a text rank holds it: a causal runner serving `Decode` over the KV
+/// units and their host pool, and a vision runner serving `VisionEncode` over the product buffer
+/// alone, in that order, with tables that map all three regions.
+fn text_rank(log: &Log) -> Executors {
+    let kernels = serving();
+    let mut causal = LoggingRunner::new("causal", Phase::Decode, Arc::clone(&kernels), log);
+    causal.regions = vec![DEVICE, HOST];
+    let mut vision = LoggingRunner::new("vision", Phase::VisionEncode, Arc::clone(&kernels), log);
+    vision.regions = vec![PRODUCTS[0]];
+
+    let sequences = Sequences::new(GROUP, 1, Vec::new());
+    let executor = spawn(
+        vec![Box::new(causal), Box::new(vision)],
+        &kernels,
+        &sequences,
+        0,
+        &[DEVICE, HOST, PRODUCTS[0]],
+    );
+    Executors::new(vec![sequences], vec![Arc::new(executor)], Vec::new()).unwrap()
+}
+
+/// The `Finish` of `copy`, `ok` as stated, stamped with the batch numbered `sequence`.
+fn finish(copy: u64, ok: bool, sequence: u64) -> Request {
+    Request::Finish {
+        copy: runtime::RequestId(copy),
+        ok,
+        after: vec![(GROUP, sequence)],
+    }
+}
+
+#[test]
+fn a_kv_copy_that_starts_with_a_vision_encode_is_run_by_the_causal_runner() {
+    let log = Log::default();
+    let route = text_rank(&log);
+
+    // A store of a KV block to the host, and the vision encode it starts with.
+    store(&route, 10, DEVICE, 1);
+    let (_, requests) = returned_by(&route.submit(batch(1, Phase::VisionEncode, 1)).unwrap());
+    assert_eq!(requests, [finish(10, true, 1)]);
+
+    // The causal runner issued the copy, and the batch ended once its copies were waited for.
+    assert_eq!(
+        entries(&log),
+        [
+            "causal: copy [(10, [((0, 160, 1), (1, 160, 1))])]",
+            "vision: execute 1 at generation 1",
+            "causal: wait for copies",
+        ]
+    );
+}
+
+#[test]
+fn a_copy_no_runner_maps_fails_and_the_copies_beside_it_run() {
+    let log = Log::default();
+    let route = text_rank(&log);
+
+    // A store from the product buffer to the KV host pool, whose two regions no runner maps
+    // together, queued ahead of a store of a KV block.
+    store(&route, 10, PRODUCTS[0], 1);
+    store(&route, 11, DEVICE, 1);
+    let (_, requests) = returned_by(&route.submit(batch(1, Phase::Decode, 1)).unwrap());
+    assert_eq!(requests, [finish(10, false, 1), finish(11, true, 1)]);
+
+    // No runner was handed the first, and the batch's own runner ran the second.
+    assert_eq!(
+        entries(&log),
+        [
+            "causal: copy [(11, [((0, 176, 1), (1, 176, 1))])]",
+            "causal: execute 1 at generation 1",
+            "causal: wait for copies",
+        ]
+    );
+
+    // The failed copy ended with its batch: no later batch starts it.
+    let (_, requests) = returned_by(&route.submit(batch(2, Phase::VisionEncode, 1)).unwrap());
+    assert!(requests.is_empty());
 }
 
 #[test]

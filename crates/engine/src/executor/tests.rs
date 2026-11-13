@@ -96,6 +96,11 @@ impl Runner for Answering {
     fn copy(&mut self, _: &[BlockCopy]) -> worker::Result<()> {
         Ok(())
     }
+
+    /// The test's runner holds the device and host regions every copy of these tests names.
+    fn maps(&mut self, region: u8) -> bool {
+        [DEVICE, HOST].contains(&region)
+    }
 }
 
 /// A call's output that sampled `token`.

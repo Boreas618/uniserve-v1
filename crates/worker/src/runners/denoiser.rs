@@ -79,7 +79,7 @@ use platform::{Event, EventFlags, PitchedBatch, SourceOrder, Stream};
 use uniserve_tensor::{DType, Tensor};
 
 use super::decoder::{elements, pitched, voxels};
-use super::{address, element_bytes, performed};
+use super::{address, element_bytes, performed, settle};
 use crate::buckets::{Bucket, Buckets};
 use crate::graphs::Graphs;
 use crate::memory::allocation::Storage;
@@ -952,6 +952,17 @@ impl Runner for DenoiserRunner {
             self.memory.restore(copy, (&sources[..], target), stream)?;
         }
         Ok(())
+    }
+
+    /// The rank's media memory, its trajectory rows included: the denoiser is the media runner
+    /// that saves and restores trajectories (`BufferMemory::rows`).
+    fn maps(&mut self, region: u8) -> bool {
+        self.memory.holds(region) || self.memory.rows(region)
+    }
+
+    /// The copies were issued on the runner's stream, which this waits for.
+    fn wait_copies(&mut self) -> Result<()> {
+        settle(self.stream.as_ref())
     }
 
     fn graphs(&self) -> &Graphs {

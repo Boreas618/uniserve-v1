@@ -161,7 +161,9 @@ fn attention_groups(cache: &KvCacheMemory) -> impl Iterator<Item = usize> + '_ {
 ///   group's class (the class of cache group `g` is class `g`), and refused unless every one
 ///   names an entry and every keep a writable one; then every restore is issued.
 /// - [`PageWork::AfterReplay`]: the keeps resolved before the replay are issued.
-/// - [`PageWork::Ended`]: the copies issued for the batch are waited for.
+/// - [`PageWork::Ended`]: the copies issued since the last end are waited for.
+/// - [`PageWork::Holds`]: the flag is set when the region is the cache's
+///   (`KvCacheMemory::holds`).
 /// - [`PageWork::BeforeShadow`]: what the rows of a paired forward have cached is copied into
 ///   their scratch pages, `scratch_pages` pages a row, for every attention group.
 ///
@@ -218,6 +220,7 @@ pub fn page_work(
                     event.synchronize()?;
                 }
             }
+            PageWork::Holds(region, held) => held.set(cache.holds(region)),
             PageWork::BeforeShadow(batch) => {
                 let Some(stream) = &stream else {
                     return Ok(());

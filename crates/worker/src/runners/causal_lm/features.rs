@@ -287,6 +287,11 @@ impl Features {
         Ok(marks.where_cond(&image, &text)?)
     }
 
+    /// Whether the rank's media memory holds `region` (`BufferMemory::holds`).
+    pub(super) fn holds(&self, region: u8) -> bool {
+        self.memory.holds(region)
+    }
+
     /// Issues, through the rank's media memory on `stream`, those of `copies` that move encoder
     /// outputs between the product buffer and the host encoder pool, and returns the others.
     ///

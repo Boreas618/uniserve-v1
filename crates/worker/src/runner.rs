@@ -22,12 +22,29 @@
 //!    changed since the last call ([`BlockTables::take_changes`]), each change once. A runner
 //!    that keeps a device block table writes them into it before its next forward reads it, and
 //!    resets the per-unit state of the units a change marks `reset`.
-//! 2. [`Runner::copy`] on the runner that serves the batch, with the copies that start with it
-//!    ([`BlockTables::start_copy`]), when there are any. Copies start only with a batch the engine
-//!    numbered and that every rank of the group runs; never with a shadow batch, an expert join,
-//!    or a batch one rank runs alone.
+//! 2. [`Runner::copy`] on the runners whose memory holds the copies that start with the batch
+//!    ([`BlockTables::start_copy`]), when there are any, each runner once with its copies in the
+//!    order they were queued. Copies start only with a batch the engine numbered and that every
+//!    rank of the group runs; never with a shadow batch, an expert join, or a batch one rank runs
+//!    alone.
 //! 3. [`Runner::execute`] with the batch and the tables, or for a shadow turn
 //!    [`Runner::prepare_shadow_inputs`] with the batch and the tables.
+//! 4. [`Runner::wait_copies`] on every runner that was handed copies in step 2, once the batch's
+//!    runner returned.
+//!
+//! ## Which runner runs a copy
+//!
+//! A runner states the memory it holds by region, the number the buffer pool's answer to `Open`
+//! gave it ([`Runner::maps`]): the regions of the memory its owners lent it, such as the KV
+//! cache's units and host pages, or the rank's media memory. A copy is run by a runner that maps
+//! the regions of both runs of each of its pairs, whichever phase the batch it starts with is:
+//! the batch's runner when it does, so the copy shares the batch's stream, and otherwise the
+//! first runner of the rank that does, in the executor's order. A KV copy that starts with a
+//! vision encode is run by the causal runner, and a trajectory's save that starts with an encode
+//! by the denoiser, the one media runner that maps the trajectory rows. A copy without runs lies
+//! in other ranks' memory and asks nothing of this rank. A copy with runs that no runner maps is
+//! a defect of the rank's wiring: no runner is handed it, and the executor reports it failed
+//! (`Finish { ok: false }`) and logs the regions no runner maps.
 //!
 //! A batch whose work is the host's, a host phase of a media request, runs off the executor
 //! thread: the executor first calls [`Runner::start`], and when the runner started host work it
@@ -45,9 +62,9 @@
 //! - A batch writes only entries [`BlockTables::writable`] states writable; a row that would write
 //!   a read-only entry, or a position without an entry, is refused before anything is launched.
 //! - [`Runner::copy`] issues each copy from its first run to its second on the rank's copy stream,
-//!   and writes nothing but the second run. The end of the batch that follows covers the copies:
-//!   [`Runner::execute`] returns only once the device has completed the copies as well as the
-//!   batch, also when `copy` failed after issuing part of them.
+//!   and writes nothing but the second run. The end of the batch the copies start with covers
+//!   them: [`Runner::wait_copies`] returns only once the device has completed the copies the
+//!   runner issued, also when `copy` failed after issuing part of them.
 //! - [`Runner::execute`] returns only once the device has completed the batch: the executor counts
 //!   the batch as ended, and lets the buffer pool reuse what it addressed, on its return.
 
@@ -133,8 +150,7 @@ pub trait Runner: Send {
     }
 
     /// One step: prepare the inputs from `batch` and `tables`, run the bucket's graph, read the
-    /// outputs. It returns once the device has completed the step and the copies
-    /// [`Runner::copy`] issued for it.
+    /// outputs. It returns once the device has completed the step.
     ///
     /// For a batch whose host work [`Runner::start`] started, it is called once that work
     /// ended: it writes what the work produced into the memory `start` found the batch's blocks
@@ -198,23 +214,46 @@ pub trait Runner: Send {
         Ok(())
     }
 
-    /// Issues `copies` on the rank's copy stream, each from its first run to its second, ahead of
-    /// the batch [`Runner::execute`] runs next, whose end covers them. A copy without runs lies
-    /// in other ranks' memory and asks nothing of this one.
+    /// Whether the runner's memory holds `region`, by the number the buffer pool's answer to
+    /// `Open` gave it (module documentation). It is asked when copies start, once the rank's
+    /// memory owners were told the numbers; a runner reaches some owners only through what
+    /// issues its work, so it is asked mutably.
+    ///
+    /// The default maps none: a runner that holds no request memory is handed no copy.
+    fn maps(&mut self, region: u8) -> bool {
+        let _ = region;
+        false
+    }
+
+    /// Issues `copies`, whose runs all lie in regions the runner maps ([`Runner::maps`]), on the
+    /// rank's copy stream, each from its first run to its second, ahead of the batch the
+    /// executor runs next, whose end covers them ([`Runner::wait_copies`]).
     ///
     /// # Errors
     ///
     /// When a copy cannot be issued. The executor then reports every one of `copies` failed
     /// (`Finish { ok: false }`) and still runs the batch, whose end covers whatever was issued.
-    /// The default refuses any copy with runs: a runner that holds no request memory copies
-    /// none.
+    /// The default refuses every copy: a runner that maps no region is handed none.
     fn copy(&mut self, copies: &[BlockCopy]) -> Result<()> {
-        match copies.iter().find(|copy| !copy.runs.is_empty()) {
+        match copies.first() {
             Some(copy) => Err(crate::Error::Unsupported(format!(
                 "this runner holds no request memory to run the copies of request {}",
                 copy.request.0
             ))),
             None => Ok(()),
         }
+    }
+
+    /// Returns once the device has completed every copy [`Runner::copy`] issued, also when
+    /// another runner serves the batch the copies started with. The executor calls it on each
+    /// runner it handed copies to once the batch's runner returned, and on every runner before
+    /// a job that needs nothing in flight on the device.
+    ///
+    /// # Errors
+    ///
+    /// The device's failure; whether the copies ended is then unknown. The default waits for
+    /// nothing: a runner that maps no region issues no copy.
+    fn wait_copies(&mut self) -> Result<()> {
+        Ok(())
     }
 }

@@ -62,6 +62,13 @@
 //! of a group has the same budget, so all start the same copies with the same batch and return
 //! the same `Finish`es.
 //!
+//! Each copy a batch starts is run by a runner whose memory holds both runs of each of its pairs
+//! ([`Runner::maps`]), whichever runner serves the batch: the batch's own when it does, otherwise
+//! the first that does (`crate::runner`, "Which runner runs a copy"). The batch ends with the
+//! copies: once its runner returned, the executor waits for the copies of every runner it handed
+//! some to ([`Runner::wait_copies`]) before it applies their `Finish`. A copy is reported run
+//! when its runner issued it, and failed when the runner refused it or no runner maps it.
+//!
 //! No copy runs outside a batch. A group whose executor holds copies not yet finished, and for
 //! which a step formed no other batch, is sent a batch with no rows (`specs/scheduler-design.md`
 //! §2.1): it takes its number, hands the runners the tables' changes and starts the copies the
@@ -147,6 +154,11 @@ use crate::{Error, Result, lock};
 /// at a sixteenth by none.
 pub const COPY_BUDGET: u64 = 512 << 20;
 
+/// The copies one batch started: the request of each, in the order they were queued, with
+/// whether it was issued; and the runners, by index, that were handed copies, whose copies the
+/// batch's end waits for.
+type Started = (Vec<(RequestId, bool)>, Vec<usize>);
+
 /// A control operation: what the executor calls with its runners at a batch boundary, with
 /// nothing in flight on the device. The runners are in the order the executor was given them,
 /// so `RunnerId(index)` names `runners[index]`.
@@ -167,9 +179,8 @@ pub enum Job {
     Resume {
         batch: Box<Batch>,
         sequence: u64,
-        /// The requests of the copies that started with the batch, and whether the runner
-        /// issued them.
-        copies: (Vec<RequestId>, bool),
+        /// The copies that started with the batch, and the runners that issued them.
+        copies: Started,
         /// The batch's wait in the queue, and when its first turn began.
         queued: (Duration, Instant),
     },
@@ -1147,7 +1158,7 @@ impl Thread {
         let copies = if sequence.is_some() && alone(&batch)?.is_none() {
             self.start_copies(index)
         } else {
-            (Vec::new(), true)
+            (Vec::new(), Vec::new())
         };
 
         // A numbered batch whose work its runner runs on the host leaves the executor while the
@@ -1182,22 +1193,30 @@ impl Thread {
         ))
     }
 
-    /// Ends `batch`, whose runner returned `output`, with `copies`, the requests of the copies
-    /// that started with it and whether the runner issued them; the batch waited `queued.0` in
-    /// the queue, and its first turn began at `queued.1`. Returns the output and the stamped
-    /// `Finish` of each copy.
+    /// Ends `batch`, whose runner returned `output`, with `copies`, the copies that started with
+    /// it and the runners that issued them; the batch waited `queued.0` in the queue, and its
+    /// first turn began at `queued.1`. Returns the output and the stamped `Finish` of each copy.
     ///
     /// # Errors
     ///
-    /// The runner's failure, carrying the copies' `Finish { ok: false }` ([`Thread::failed`]).
+    /// The runner's failure, or a wait for the copies that failed, carrying the copies'
+    /// `Finish { ok: false }` ([`Thread::failed`]).
     fn ended(
         &mut self,
         batch: &Batch,
         output: Result<BatchOutput>,
-        (copies, copied): (Vec<RequestId>, bool),
+        (copies, issuers): Started,
         (queued, started): (Duration, Instant),
     ) -> Result<(BatchOutput, Vec<Request>)> {
         let step = batch.id.0;
+
+        // The batch ends with its copies, whichever runners issued them.
+        let output = output.and_then(|output| {
+            for &index in &issuers {
+                self.runners[index].wait_copies()?;
+            }
+            Ok(output)
+        });
         let mut output = match output {
             Ok(output) => output,
             Err(error) => return Err(self.failed(error, copies)),
@@ -1213,7 +1232,7 @@ impl Thread {
         }
 
         // The batch ended, and the copies with it.
-        let finished = self.finish(copies, copied)?;
+        let finished = self.finish(copies)?;
 
         // The runner states the step's device and host time; the wait in the queue is the
         // executor's to state.
@@ -1239,14 +1258,14 @@ impl Thread {
         Ok((output, finished))
     }
 
-    /// The `Finish` of each of `copies`, which started with the batch that just ended, `ok` when
-    /// the runner issued them and the batch was served: each is applied to the tables, as every
-    /// `Finish` is, and stamped with the last batch the rank launched, which covers it.
-    fn finish(&mut self, copies: Vec<RequestId>, ok: bool) -> Result<Vec<Request>> {
+    /// The `Finish` of each of `copies`, which started with the batch that just ended, each `ok`
+    /// as stated: it was issued, and the batch was served. Each is applied to the tables, as
+    /// every `Finish` is, and stamped with the last batch the rank launched, which covers it.
+    fn finish(&mut self, copies: Vec<(RequestId, bool)>) -> Result<Vec<Request>> {
         let group = self.tables.group();
         let mut finished = Vec::with_capacity(copies.len());
 
-        for copy in copies {
+        for (copy, ok) in copies {
             let mut finish = Request::Finish {
                 copy,
                 ok,
@@ -1261,14 +1280,13 @@ impl Thread {
 
     /// The failure of a batch whose runner failed with `error` after `copies` started with it.
     ///
-    /// The runner returns once the device has completed the copies it issued, also when it fails
-    /// ([`Runner::execute`]); once the device has also passed everything the runners issued, each
-    /// copy is reported failed: its result is unknown, and the scheduler learns it with the batch
-    /// instead of at its bound. The failure then carries their `Finish { ok: false }`, stamped
+    /// Once the device has passed everything the runners issued, their copies included
+    /// ([`Thread::settle`]), each copy is reported failed: its result is unknown, and the
+    /// scheduler learns it with the batch instead of at its bound. The failure then carries their `Finish { ok: false }`, stamped
     /// with this batch ([`Error::Copies`]). While the device's progress is unknown it carries
     /// none: the batch stays open, the group's `completed` stays below it, and whatever later
     /// gives the copies up is covered by a stamp no lower than the batch's.
-    fn failed(&mut self, error: Error, copies: Vec<RequestId>) -> Error {
+    fn failed(&mut self, error: Error, copies: Vec<(RequestId, bool)>) -> Error {
         if copies.is_empty() {
             return error;
         }
@@ -1284,7 +1302,8 @@ impl Thread {
         }
 
         // Applying a `Finish` that gives a copy up cannot be refused.
-        match self.finish(copies, false) {
+        let given_up = copies.into_iter().map(|(copy, _)| (copy, false)).collect();
+        match self.finish(given_up) {
             Ok(finished) => Error::Copies {
                 error: Box::new(error),
                 finished,
@@ -1306,11 +1325,12 @@ impl Thread {
         Ok(())
     }
 
-    /// Starts on the runner `index`, for the batch it runs next, the oldest copies no batch has
-    /// started that the copy budget admits. Returns the requests the copies are for, and whether
-    /// the runner issued them: a copy the runner cannot issue is reported failed, and the batch
-    /// still runs.
-    fn start_copies(&mut self, index: usize) -> (Vec<RequestId>, bool) {
+    /// Starts, for the batch runner `index` runs next, the oldest copies no batch has started
+    /// that the copy budget admits, each on the runner whose memory holds it
+    /// ([`Thread::copier`]). Returns the copies with whether each was issued, and the runners
+    /// that were handed some: a copy its runner cannot issue, or that no runner maps, is
+    /// reported failed, and the batch still runs.
+    fn start_copies(&mut self, index: usize) -> Started {
         // The queue's order and each copy's bytes over the group are the same on every rank, so
         // every rank starts the same copies with this batch.
         let admitted = admitted(
@@ -1320,23 +1340,77 @@ impl Thread {
         let copies: Vec<BlockCopy> = std::iter::from_fn(|| self.tables.start_copy())
             .take(admitted)
             .collect();
-        if copies.is_empty() {
-            return (Vec::new(), true);
+
+        // Each copy's request, its runner, and whether a runner can run it. A copy without runs
+        // lies in other ranks' memory and asks nothing of this rank.
+        let mut routes = Vec::with_capacity(copies.len());
+        let mut handed: BTreeMap<usize, Vec<BlockCopy>> = BTreeMap::new();
+        for copy in copies {
+            let request = copy.request;
+            if copy.runs.is_empty() {
+                routes.push((request, None, true));
+                continue;
+            }
+
+            let regions: BTreeSet<u8> = copy
+                .runs
+                .iter()
+                .flat_map(|(from, to)| [from.0, to.0])
+                .collect();
+            match self.copier(index, &regions) {
+                Some(runner) => {
+                    routes.push((request, Some(runner), true));
+                    handed.entry(runner).or_default().push(copy);
+                }
+                None => {
+                    tracing::error!(
+                        device = ?self.device,
+                        request = request.0,
+                        ?regions,
+                        "no runner of the rank maps both runs of a copy's pairs; the copy is \
+                         reported failed"
+                    );
+                    routes.push((request, None, false));
+                }
+            }
         }
 
-        let issued = self.runners[index].copy(&copies);
-        if let Err(error) = &issued {
-            tracing::warn!(
-                device = ?self.device,
-                %error,
-                copies = copies.len(),
-                "the copies that start with a batch were not issued and are reported failed"
-            );
+        // Each runner issues its copies in one call, in the order they were queued.
+        let mut issued = BTreeMap::new();
+        for (&runner, copies) in &handed {
+            let result = self.runners[runner].copy(copies);
+            if let Err(error) = &result {
+                tracing::warn!(
+                    device = ?self.device,
+                    runner,
+                    %error,
+                    copies = copies.len(),
+                    "the copies a runner was handed were not issued and are reported failed"
+                );
+            }
+            issued.insert(runner, result.is_ok());
         }
-        (
-            copies.into_iter().map(|copy| copy.request).collect(),
-            issued.is_ok(),
-        )
+
+        let started = routes
+            .into_iter()
+            .map(|(request, runner, runs)| {
+                let ok = runs && runner.is_none_or(|runner| issued.get(&runner) == Some(&true));
+                (request, ok)
+            })
+            .collect();
+        (started, handed.into_keys().collect())
+    }
+
+    /// The runner that runs a copy whose runs lie in `regions`, those of both runs of each of its
+    /// pairs: runner `index`, which serves the batch, when it maps every one ([`Runner::maps`]),
+    /// otherwise the first runner of the rank that does; `None` when no runner does.
+    fn copier(&mut self, index: usize, regions: &BTreeSet<u8>) -> Option<usize> {
+        let maps = |runner: &mut Box<dyn Runner>| regions.iter().all(|region| runner.maps(*region));
+
+        if maps(&mut self.runners[index]) {
+            return Some(index);
+        }
+        self.runners.iter_mut().position(maps)
     }
 
     /// One paired forward of the shadow batch `batch`, `compared` of whose changed operators
@@ -1585,11 +1659,13 @@ impl Thread {
         *lock(&self.uncompared) = uncompared;
     }
 
-    /// Waits for the device to pass the last forward of every runner's graphs: what a job that
+    /// Waits for the device to pass everything the runners issued: the last forward of every
+    /// runner's graphs and every copy a runner issued ([`Runner::wait_copies`]). What a job that
     /// needs nothing in flight on the device starts with.
-    fn settle(&self) -> Result<()> {
-        for runner in &self.runners {
+    fn settle(&mut self) -> Result<()> {
+        for runner in &mut self.runners {
             runner.graphs().wait()?;
+            runner.wait_copies()?;
         }
         Ok(())
     }

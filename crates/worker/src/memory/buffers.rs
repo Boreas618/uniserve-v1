@@ -45,11 +45,13 @@
 //!
 //! ## Copies
 //!
-//! A `Copy` completion queues the copies a rank runs in its tables, and the runner that serves
-//! the next batch issues them ([`Runner::copy`](crate::Runner::copy)). Every media runner of a
-//! rank shares one [`BufferMemory`], so whichever runner serves that batch issues every copy
-//! through [`BufferMemory::copy`], or a restore of a trajectory written in another encoding
-//! through [`BufferMemory::restore`]:
+//! A `Copy` completion queues the copies a rank runs in its tables, and the executor hands each,
+//! with the next batch, to a runner that maps its memory ([`Runner::maps`](crate::Runner::maps)).
+//! Every media runner of a rank shares one [`BufferMemory`] and maps its product buffer and its
+//! parts of host regions ([`BufferMemory::holds`]); the trajectory rows are the denoiser's alone
+//! ([`BufferMemory::rows`]), so it issues every `Save` and `Restore`. A runner issues its copies
+//! through [`BufferMemory::copy`], and the denoiser a restore of a trajectory written in another
+//! encoding through [`BufferMemory::restore`]:
 //!
 //! | From | To | Request | Bytes copied |
 //! | --- | --- | --- | --- |
@@ -440,14 +442,20 @@ impl BufferMemory {
         self.rank
     }
 
-    /// Whether `region` is memory of this rank's media: its product buffer, its slot rows when it
-    /// holds trajectories, or a host region whose part it maps. A runner that is handed the copies
+    /// Whether `region` is memory of this rank's media that holds blocks: its product buffer, or
+    /// a host region whose part it maps. Every media runner of the rank maps it; the trajectory
+    /// rows are the denoiser's alone ([`BufferMemory::rows`]). A runner that is handed the copies
     /// of other memory too, such as the KV cache's, issues through this memory those that name
     /// it.
     pub fn holds(&self, region: u8) -> bool {
-        region == self.products.0
-            || (region == self.slots.0 && self.trajectory > 0)
-            || self.part(region, self.rank).is_some()
+        region == self.products.0 || self.part(region, self.rank).is_some()
+    }
+
+    /// Whether `region` is the slot region and this memory holds trajectories in its rows: the
+    /// memory a denoiser reads and writes, and whose `Save` and `Restore` it alone lays out
+    /// across encodings.
+    pub fn rows(&self, region: u8) -> bool {
+        region == self.slots.0 && self.trajectory > 0
     }
 
     /// Lends the bytes of the block that `slot` holds at `position` of `class` in the rank's

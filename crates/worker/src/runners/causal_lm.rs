@@ -212,9 +212,13 @@ pub enum PageWork<'a> {
     /// What the forward left: each kept checkpoint of the recurrent state is copied to the
     /// block its position names.
     AfterReplay,
-    /// The batch ended, or failed: the copies issued for it are waited for, so the device has
-    /// completed them when the runner returns.
+    /// The batch ended, or failed, or the batch another runner served that the copies started
+    /// with ([`Runner::wait_copies`]): the copies issued since the last end are waited for, so
+    /// the device has completed them when the runner returns.
     Ended,
+    /// Whether the cache's memory holds the region of this number (`KvCacheMemory::holds`): the
+    /// hook sets the flag when it does, and issues nothing.
+    Holds(u8, &'a Cell<bool>),
     /// What a paired forward of the batch reads: the pages its rows have cached are copied into
     /// the rows' scratch pages.
     BeforeShadow(&'a Batch),
@@ -576,7 +580,9 @@ impl CausalLmRunner {
     /// the copies that start with a batch, and for every batch it serves with
     /// [`PageWork::BeforeReplay`] after the slot state's writes and before the replay, with
     /// [`PageWork::AfterReplay`] after the replay and before its stream event is waited for,
-    /// and with [`PageWork::Ended`] once the batch ended or failed. The hook issues on the
+    /// and with [`PageWork::Ended`] once the batch ended or failed; between batches, with
+    /// [`PageWork::Holds`] for the regions the executor asks the runner whether it maps, and
+    /// with [`PageWork::Ended`] when the executor waits for its copies. The hook issues on the
     /// stream the runner's graphs replay on, or on the rank's copy stream, and waits for
     /// nothing but at the end: the stream's order places the table writes, unit resets and
     /// state restores ahead of the replay that reads the pooled tables, the planes and the
@@ -1709,17 +1715,9 @@ impl Runner for CausalLmRunner {
         let served = self.serve(batch, tables);
 
         // The copies the batch took end with it, also when it failed.
-        let ended = match self.page_work.as_mut() {
-            Some(hook) => hook(PageWork::Ended),
-            None => Ok(()),
-        };
-        let settled = match self.features.as_mut() {
-            Some(features) => features.settle(self.stream.as_ref()),
-            None => Ok(()),
-        };
+        let ended = self.wait_copies();
         let output = served?;
         ended?;
-        settled?;
         Ok(output)
     }
 
@@ -1742,9 +1740,26 @@ impl Runner for CausalLmRunner {
         }
     }
 
+    /// The cache's memory, asked through the page-work hook ([`PageWork::Holds`]), and for a
+    /// runner lent a feature buffer the rank's media memory, where the encoder outputs lie.
+    fn maps(&mut self, region: u8) -> bool {
+        let media = self
+            .features
+            .as_ref()
+            .is_some_and(|features| features.holds(region));
+
+        let cached = Cell::new(false);
+        if let Some(hook) = self.page_work.as_mut()
+            && let Err(error) = hook(PageWork::Holds(region, &cached))
+        {
+            tracing::warn!(region, %error, "the page-work hook does not state the cache's regions");
+        }
+        media || cached.get()
+    }
+
     /// Issues `copies` through the page-work hook ([`PageWork::Copies`]), and those of encoder
     /// outputs, for a runner lent a feature buffer, through the rank's media memory on its
-    /// stream; the next step's end covers them ([`PageWork::Ended`]).
+    /// stream; the batch's end covers them ([`Runner::wait_copies`]).
     ///
     /// # Errors
     ///
@@ -1768,6 +1783,22 @@ impl Runner for CausalLmRunner {
                 None => Ok(()),
             },
         }
+    }
+
+    /// Waits for the copies the cache issued ([`PageWork::Ended`]) and for those of encoder
+    /// outputs, on the runner's stream.
+    fn wait_copies(&mut self) -> Result<()> {
+        let ended = match self.page_work.as_mut() {
+            Some(hook) => hook(PageWork::Ended),
+            None => Ok(()),
+        };
+        let settled = match self.features.as_mut() {
+            Some(features) => features.settle(self.stream.as_ref()),
+            None => Ok(()),
+        };
+
+        ended?;
+        settled
     }
 
     fn graphs(&self) -> &Graphs {

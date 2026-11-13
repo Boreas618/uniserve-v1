@@ -1049,6 +1049,11 @@ impl Runner for Reader {
         Ok(())
     }
 
+    /// The rank's KV units and their host pool, which its tables map.
+    fn maps(&mut self, region: u8) -> bool {
+        [KV, HOST].contains(&region)
+    }
+
     fn copy(&mut self, copies: &[BlockCopy]) -> Result<()> {
         self.copies.extend(
             copies

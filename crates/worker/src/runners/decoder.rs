@@ -95,7 +95,7 @@ use crate::memory::buffers::{BufferMemory, UNIT_BYTES};
 use crate::memory::lend;
 use crate::memory::tables::{BlockCopy, BlockTables};
 use crate::runner::Runner;
-use crate::runners::{address, element_bytes, performed};
+use crate::runners::{address, element_bytes, performed, settle};
 use crate::{Error, Result};
 
 /// The channels of a decoded raster and of its packed bytes: red, green and blue.
@@ -1025,6 +1025,17 @@ impl Runner for DecoderRunner {
     /// batch whose end covers them.
     fn copy(&mut self, copies: &[BlockCopy]) -> Result<()> {
         self.memory.copy(copies, self.stream.as_ref())
+    }
+
+    /// The rank's media memory: its product buffer and its parts of host regions
+    /// (`BufferMemory::holds`).
+    fn maps(&mut self, region: u8) -> bool {
+        self.memory.holds(region)
+    }
+
+    /// The copies were issued on the runner's stream, which this waits for.
+    fn wait_copies(&mut self) -> Result<()> {
+        settle(self.stream.as_ref())
     }
 
     fn graphs(&self) -> &Graphs {

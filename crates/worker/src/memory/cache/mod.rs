@@ -485,6 +485,17 @@ impl KvCacheMemory {
         Ok(())
     }
 
+    /// Whether `region` is memory of the cache, as [`Self::set_regions`] stated it: its units,
+    /// or a cache group's host pages or converted-load source buffer. A cache whose regions are
+    /// not stated holds none.
+    pub fn holds(&self, region: u8) -> bool {
+        self.regions.as_ref().is_some_and(|regions| {
+            regions.units == region
+                || regions.host.contains(&Some(region))
+                || regions.sources.contains(&Some(region))
+        })
+    }
+
     /// Applies `changes`, the rank's device block table's changes since the last batch
     /// (`BlockTables::take_changes`), on `stream` for a cache on a device and with `None` for
     /// one that holds none: the units of each entry the buffer pool allocated since are reset
