@@ -23,7 +23,8 @@
 //!   is drawn as it is written, so the numbers rise in the order the buffer pool takes the
 //!   requests, which it requires (BP §7, R1).
 //! - `next_completion` reads the completion queue, matches each completion to its request by
-//!   number, drops what belongs to a forgotten owner or to entries a later stamped request names
+//!   number, applies what it states of the cache (`cache.rs`), drops what belongs to a forgotten
+//!   owner or to entries a later stamped request names
 //!   (BP §9, obligation 1), and hands every completion that gives entries to the executors
 //!   (`Executor::map`) before the scheduler applies it.
 //! - `read_capacity` reads the capacity words of every region.
@@ -272,7 +273,8 @@ pub struct Scheduler {
     /// Per region, its units, from the answer to `Open` and from `Resized`.
     capacity: Vec<u32>,
     /// Per region, the units an allocation of this queue pair can take: the buffer pool's word,
-    /// less the units of the `Allocate`s held, being stamped or outstanding.
+    /// less the units of the `Allocate`s held, being stamped or outstanding, and with the units
+    /// of `order` beyond the head this scheduler installed.
     available: Vec<u32>,
     /// Per region, the units of retired blocks the buffer pool reclaims once the batches that may
     /// read them have ended.
@@ -282,6 +284,11 @@ pub struct Scheduler {
     /// Per region, the cached blocks no request of this scheduler holds, by last use and id: the
     /// eviction order it installs.
     order: Vec<BTreeSet<(u64, u64)>>,
+    /// Per region, the units of the blocks in `order`.
+    ordered: Vec<u32>,
+    /// Per region, the numbers of the keys of the last `Victims` this scheduler submitted there:
+    /// the head of `order` it installed.
+    installed: Vec<Vec<u64>>,
     /// The request each live owner is for.
     owners: HashMap<OwnerId, RequestId>,
     /// The counter owners are drawn from: the scheduler's data-parallel rank in the top 16 bits.
@@ -409,6 +416,8 @@ impl Scheduler {
             retiring: vec![0; count],
             cache: HashMap::new(),
             order: vec![BTreeSet::new(); count],
+            ordered: vec![0; count],
+            installed: vec![Vec::new(); count],
             owners: HashMap::new(),
             next_owner: (rank << 48) + 1,
             policy,
@@ -718,12 +727,14 @@ impl Scheduler {
             .map_err(storage_error)?
         {
             let (id, completion) = Completion::decode(&record).map_err(storage_error)?;
-            let (owner, request) = self.outstanding.remove(&id.0).ok_or_else(|| {
+            let (owner, mut request) = self.outstanding.remove(&id.0).ok_or_else(|| {
                 Error::Storage(format!(
                     "a completion answers request {}, which is not outstanding",
                     id.0
                 ))
             })?;
+            // What it states of the cache holds whether or not the completion is dropped.
+            self.learn(&mut request, &completion);
 
             if let runtime::Request::Finish { copy, .. } = request {
                 if let Some((owner, copied)) = self.matched_finish(id, copy, request, &completion) {
@@ -814,9 +825,11 @@ impl Scheduler {
         Some((owner, copied))
     }
 
-    /// Reads the `available` and `retiring` words of every region this queue pair uses, and lowers
-    /// `available` by the units of the scheduler's `Allocate`s held, being stamped or
-    /// outstanding, which the buffer pool's word may not show yet.
+    /// Reads the `available` and `retiring` words of every region this queue pair uses, raises
+    /// `available` by the units of `order` beyond the installed head, which the buffer pool may
+    /// evict once a later `Victims` names them, and lowers it by the units of the scheduler's
+    /// `Allocate`s held, being stamped or outstanding, which the buffer pool's word may not show
+    /// yet.
     fn read_capacity(&mut self) {
         let words: Vec<(usize, u32, u32)> = self
             .registers
@@ -829,7 +842,7 @@ impl Scheduler {
             })
             .collect();
         for (region, available, retiring) in words {
-            self.available[region] = available;
+            self.available[region] = available.saturating_add(self.beyond_head(region));
             self.retiring[region] = retiring;
         }
 

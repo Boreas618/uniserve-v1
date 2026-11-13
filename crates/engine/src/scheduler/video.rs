@@ -1014,7 +1014,11 @@ mod tests {
             0,
             QueuePair::create(1 << 12, 16).unwrap(),
             configs,
-            Policy { calls: 0, fuel: 0 },
+            Policy {
+                calls: 0,
+                fuel: 0,
+                events: Vec::new(),
+            },
             Box::new(Idle),
             output,
             Arc::new(AtomicU64::new(0)),

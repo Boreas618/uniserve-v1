@@ -11,6 +11,9 @@ pub struct Policy {
     pub calls: u64,
     /// The fuel those calls consumed.
     pub fuel: u64,
+    /// The state changes since the policy was last told, in the order they happened: what its
+    /// next `observe` carries.
+    pub events: Vec<scheduling_guest::Event>,
 }
 
 /// A fault of a policy: a trap, exhausted fuel, an undecodable or empty reply, or limits outside

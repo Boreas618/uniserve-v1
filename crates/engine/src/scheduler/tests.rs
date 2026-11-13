@@ -14,17 +14,17 @@ use storage::{Key, QueuePair};
 
 use super::{Blocks, Capacity, Executor, Policy, Request, RequestStatus, Scheduler};
 
-const A: GroupId = GroupId(0);
-const B: GroupId = GroupId(1);
+pub(super) const A: GroupId = GroupId(0);
+pub(super) const B: GroupId = GroupId(1);
 
 /// The class of KV blocks, one unit each, in a region of each group's own memory.
-const KV: u8 = 0;
+pub(super) const KV: u8 = 0;
 /// A sized class both groups take from one region: a product one group writes and the other
 /// reads.
 const PRODUCT: u8 = 1;
 
 /// The owners of request 1: one on each group, in slot rows 3 and 4.
-const OWNER_A: OwnerId = OwnerId(10);
+pub(super) const OWNER_A: OwnerId = OwnerId(10);
 const OWNER_B: OwnerId = OwnerId(11);
 
 /// What the executors were handed.
@@ -68,7 +68,7 @@ impl Executor for Recording {
 /// A scheduler of two groups on its queue pair, and the buffer pool's end of that queue pair.
 pub(super) struct Bench {
     pub(super) scheduler: Scheduler,
-    pool: QueuePair,
+    pub(super) pool: QueuePair,
     executors: Arc<Mutex<Recorded>>,
 }
 
@@ -147,7 +147,11 @@ pub(super) fn bench(ring_bytes: usize) -> Bench {
         0,
         engine,
         groups,
-        Policy { calls: 0, fuel: 0 },
+        Policy {
+            calls: 0,
+            fuel: 0,
+            events: Vec::new(),
+        },
         Box::new(Recording(Arc::clone(&executors))),
         output,
         Arc::new(AtomicU64::new(0)),
@@ -238,7 +242,7 @@ impl Bench {
     }
 
     /// Every request the scheduler wrote that the buffer pool has not taken, with its number.
-    fn take(&mut self) -> Vec<(runtime::RequestId, runtime::Request)> {
+    pub(super) fn take(&mut self) -> Vec<(runtime::RequestId, runtime::Request)> {
         let mut record = Vec::new();
         let mut taken = Vec::new();
         while self.pool.next_request(&mut record).unwrap() {
@@ -248,14 +252,14 @@ impl Bench {
     }
 
     /// Answers request `id` with `completion`.
-    fn complete(&mut self, id: runtime::RequestId, completion: &Completion) {
+    pub(super) fn complete(&mut self, id: runtime::RequestId, completion: &Completion) {
         let mut record = Vec::new();
         completion.encode(id, &mut record);
         assert!(self.pool.complete(&record).unwrap());
     }
 
     /// Every completion the scheduler applies, as it reads them.
-    fn answers(
+    pub(super) fn answers(
         &mut self,
     ) -> Vec<(
         runtime::RequestId,
@@ -270,7 +274,7 @@ impl Bench {
         answers
     }
 
-    fn stamps(&self) -> Vec<(GroupId, runtime::Request)> {
+    pub(super) fn stamps(&self) -> Vec<(GroupId, runtime::Request)> {
         std::mem::take(&mut self.executors.lock().unwrap().stamps)
     }
 
@@ -287,7 +291,7 @@ impl Bench {
     }
 }
 
-fn key(byte: u8) -> Key {
+pub(super) fn key(byte: u8) -> Key {
     Key([byte; 32])
 }
 
