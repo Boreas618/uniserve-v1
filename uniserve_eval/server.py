@@ -302,6 +302,45 @@ class ManagedDeployment:
             return None
         return max(value for value in times if value is not None)
 
+    @property
+    def admin_socket(self) -> Path | None:
+        """The first process's admin listener, once the deployment started.
+
+        A relative `ServerProfile.admin_socket` is taken in the runtime
+        directory; `None` when the profile states none.
+        """
+        socket_path = self.servers[0].profile.admin_socket
+        if socket_path is None or self.runtime is None:
+            return None
+        return self.runtime / socket_path
+
+    def pids(self) -> list[int]:
+        """Return the processes of this deployment, in increasing order.
+
+        They are the members of each server's process group, which its
+        workers inherit, and the host services serving inside its runtime
+        directory (`_service_pids`), which run in sessions of their own.
+        """
+        groups = {
+            server.process.pid
+            for server in self.servers
+            if server.process is not None
+        }
+        pids = set()
+        for entry in Path("/proc").iterdir():
+            if not entry.name.isdigit():
+                continue
+            try:
+                stat = (entry / "stat").read_text()
+            except OSError:
+                continue
+            # After the parenthesized command name: state, parent, group.
+            if int(stat.rpartition(")")[2].split()[2]) in groups:
+                pids.add(int(entry.name))
+        if self.runtime is not None:
+            pids.update(_service_pids(self.runtime / "uniserve"))
+        return sorted(pids)
+
     def exited(self) -> list[Path]:
         """Return the logs of processes that are no longer running."""
         return [

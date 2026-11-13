@@ -5,10 +5,12 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+import re
 import time
 from dataclasses import asdict, dataclass, field
 from enum import StrEnum
 from pathlib import Path
+from signal import Signals
 from typing import Any, Literal, TypeGuard
 
 # Endpoint paths. `send_request` in `uniserve_eval.transport.client` sends a
@@ -63,11 +65,19 @@ class LoadConfig:
 
     Attributes:
         num_prompts: Number of measured rows; dataset loading fails unless
-            exactly this many rows resolve.
+            exactly this many rows resolve. A timeline load cycles over
+            them: its request ``n`` takes row ``n mod num_prompts``.
         request_rate: Mean Poisson arrival rate in requests per second;
-            ``inf`` submits every request without delay.
+            ``inf`` submits every request without delay, or, in a timeline
+            load, runs a closed loop of ``max_concurrency`` streams.
         max_concurrency: In-flight request limit shared by warmup and
             measured requests, or ``None`` for no limit.
+        duration_s: Makes the load a timeline load
+            (``uniserve_eval.load.timeline``): it issues requests from its
+            start until this many seconds later and then waits for every
+            stream to end, instead of sending each row once.
+        settle_s: Seconds a timeline load keeps issuing after its last
+            change ended, when that is later than ``duration_s``.
         warmup_requests: Number of concurrent warmup requests, all built
             from the first row and completed before measurement; ``0`` skips
             warmup. A point with a ``warmup_manifest`` or a session trace
@@ -88,6 +98,8 @@ class LoadConfig:
     warmup_manifest: str | None = None
     priming_manifest: str | None = None
     request_timeout_s: float = 6 * 60 * 60
+    duration_s: float | None = None
+    settle_s: float = 0.0
 
     def __post_init__(self) -> None:
         """Validate load parameters that govern request scheduling."""
@@ -104,6 +116,95 @@ class LoadConfig:
             or self.request_timeout_s <= 0
         ):
             raise ValueError("request_timeout_s must be finite and positive")
+        if self.duration_s is not None:
+            if not math.isfinite(self.duration_s) or self.duration_s <= 0:
+                raise ValueError("duration_s must be finite and positive")
+            # Unbounded arrivals over a duration would never stop arriving;
+            # the closed loop's streams are its concurrency.
+            if math.isinf(self.request_rate) and self.max_concurrency is None:
+                raise ValueError(
+                    "a timeline load at an unbounded request_rate is a "
+                    "closed loop and needs max_concurrency, its streams"
+                )
+        if not math.isfinite(self.settle_s) or self.settle_s < 0:
+            raise ValueError("settle_s must be finite and non-negative")
+        if self.settle_s and self.duration_s is None:
+            raise ValueError("settle_s applies only with duration_s")
+
+
+@dataclass(frozen=True)
+class Change:
+    """One change to the deployment that a timeline load applies as it runs.
+
+    A change acts once: ``at_s`` seconds after the load's start, or
+    ``delay_s`` seconds after the earlier change ``after`` ended. With
+    ``phase``, the delay counts instead from the first event of the admin
+    event log (``GET /admin/events``), recorded after ``after`` was issued,
+    that reports the update entering that phase; ``trial`` is the end of an
+    update's switch. Its action is exactly one of:
+
+    - an HTTP call, ``method`` and ``path`` with an optional JSON ``body``,
+      to the deployment's admin listener (``ServerProfile.admin_socket``),
+      which succeeds on a 2xx answer;
+    - ``signal`` (a name such as ``SIGSTOP``) to the one process of the
+      deployment whose command line, its arguments joined by spaces,
+      ``process`` matches (``re.search``);
+    - ``command``, run in the deployment's environment and working
+      directory, which succeeds on exit status 0.
+    """
+
+    name: str
+    at_s: float | None = None
+    after: str | None = None
+    phase: str | None = None
+    delay_s: float = 0.0
+    method: str | None = None
+    path: str | None = None
+    body: dict[str, Any] | None = None
+    signal: str | None = None
+    process: str | None = None
+    command: tuple[str, ...] = ()
+
+    def __post_init__(self) -> None:
+        """Validate the change's time and its one action."""
+        if not self.name:
+            raise ValueError("a change needs a name")
+        if (self.at_s is None) == (self.after is None):
+            raise ValueError("a change states exactly one of at_s and after")
+        if self.at_s is not None and (
+            not math.isfinite(self.at_s) or self.at_s < 0
+        ):
+            raise ValueError("at_s must be finite and non-negative")
+        if not math.isfinite(self.delay_s) or self.delay_s < 0:
+            raise ValueError("delay_s must be finite and non-negative")
+        if self.after is None and (self.phase is not None or self.delay_s):
+            raise ValueError("phase and delay_s count from the change after")
+
+        actions = (self.path is not None, self.signal is not None)
+        if sum(actions) + bool(self.command) != 1:
+            raise ValueError(
+                "a change states exactly one of path, signal and command"
+            )
+        if self.path is not None and not self.path.startswith("/"):
+            raise ValueError("path must be an absolute URL path")
+        if (self.path is None) != (self.method is None):
+            raise ValueError("method and path go together")
+        if self.method not in {None, "GET", "POST", "PUT", "PATCH", "DELETE"}:
+            raise ValueError(f"unknown HTTP method {self.method!r}")
+        if (self.signal is None) != (self.process is None):
+            raise ValueError("signal and process go together")
+        if self.signal is not None and self.signal not in Signals.__members__:
+            raise ValueError(f"unknown signal {self.signal!r}")
+        if self.process is not None:
+            try:
+                re.compile(self.process)
+            except re.error as error:
+                raise ValueError(f"process is not a pattern: {error}") from None
+
+    @property
+    def calls_admin(self) -> bool:
+        """Whether the change uses the admin listener: its call or events."""
+        return self.path is not None or self.phase is not None
 
 
 @dataclass(frozen=True)
@@ -674,6 +775,15 @@ class RequestRecord:
     ttft: float = 0.0
     itl: list[float] = field(default_factory=list)
     text_times: list[float] = field(default_factory=list)
+    # The arrival time of every chunk of a stream, whether it carries a
+    # token or not.
+    chunk_times: list[float] = field(default_factory=list)
+    # Per generated token in stream order (`add_tokens`): its id, the
+    # arrival time of the chunk that carried it, and its logprob entry's
+    # candidates as `[id, logprob]` pairs.
+    token_ids: list[int | str] = field(default_factory=list)
+    token_times: list[float | None] = field(default_factory=list)
+    top_logprobs: list[list[list[Any]]] = field(default_factory=list)
     token_timing_available: bool = False
     prompt_len: int = 0
     output_len: int = 0
@@ -848,6 +958,44 @@ class RequestRecord:
         elif count_itl:
             self.itl.append(timestamp - last_text_time)
 
+    def add_tokens(
+        self, choice: dict[str, Any], timestamp: float | None
+    ) -> None:
+        """Append the tokens one streamed choice carries.
+
+        A server names generated ids in the choice's ``token_ids`` (vLLM's
+        and UniServe's ``return_token_ids``) and its logprob entries'
+        tokens as ``token_id:<id>`` (``return_tokens_as_token_ids``).
+        The ids come from ``token_ids``, else from the logprob entries; a
+        token's candidates are its entry's ``top_logprobs``, in the form
+        ``_token_identity`` gives, and a token without an entry has none.
+        """
+        logprobs = choice.get("logprobs")
+        content = logprobs.get("content") if isinstance(logprobs, dict) else []
+        entries = [
+            entry
+            for entry in (content if isinstance(content, list) else [])
+            if isinstance(entry, dict)
+        ]
+        ids = choice.get("token_ids")
+        if not isinstance(ids, list):
+            ids = [_token_identity(entry.get("token")) for entry in entries]
+
+        for index, token in enumerate(ids):
+            entry = entries[index] if index < len(entries) else {}
+            candidates = entry.get("top_logprobs")
+            self.token_ids.append(token)
+            self.token_times.append(timestamp)
+            self.top_logprobs.append(
+                [
+                    [_token_identity(item.get("token")), item.get("logprob")]
+                    for item in candidates
+                    if isinstance(item, dict)
+                ]
+                if isinstance(candidates, list)
+                else []
+            )
+
     def add_image_arrival(self, count: int, timestamp: float | None) -> None:
         """Record completion latency for newly observed image parts.
 
@@ -929,6 +1077,10 @@ class RequestRecord:
                 else None
             ),
             "itl_count": len(self.itl),
+            "chunk_times": list(self.chunk_times),
+            "token_ids": list(self.token_ids),
+            "token_times": list(self.token_times),
+            "top_logprobs": list(self.top_logprobs),
             # Token provenance distinguishes authoritative server counts from
             # client-side fallbacks. The full text is persisted along with its
             # UTF-8 size and SHA-256 digest.
@@ -1014,6 +1166,9 @@ class BenchmarkPoint:
     endpoint: str = CHAT_COMPLETIONS
     question: str | None = None
     provenance: dict[str, Any] = field(default_factory=dict)
+    # The changes a timeline load (`load.duration_s`) applies, in the
+    # profile's order; an `after` names a change before it.
+    changes: tuple[Change, ...] = ()
 
     def __post_init__(self) -> None:
         """Normalize the task identifier and require protected metrics."""
@@ -1051,6 +1206,7 @@ class BenchmarkPoint:
             "image": asdict(self.image),
             "video": asdict(self.video),
             "metrics": [metric.as_dict() for metric in self.metrics],
+            "changes": [asdict(change) for change in self.changes],
         }
 
 
@@ -1103,6 +1259,17 @@ class RunResult:
 
     summary: dict[str, Any]
     output_dir: Path
+
+
+def _token_identity(token: Any) -> int | str:
+    """Return a logprob entry's token as its id when it names one.
+
+    ``token_id:<id>`` is the placeholder vLLM and UniServe render for
+    ``return_tokens_as_token_ids``; any other token keeps its text.
+    """
+    text = str(token)
+    digits = text.removeprefix("token_id:")
+    return int(digits) if digits != text and digits.isdecimal() else text
 
 
 def _is_token_count(value: Any) -> TypeGuard[int]:

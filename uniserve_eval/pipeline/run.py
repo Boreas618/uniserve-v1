@@ -22,6 +22,9 @@ The bundle in the output directory contains:
   checksums, request identities, timing records, and validity checks.
 - `server_metrics.json`: each replica's `/metrics` exposition immediately
   before and after the measured window, when available.
+- `timeline.json`, for a timeline load (`load.duration_s`): the load's clock,
+  the changes it applied with their answers and times, and the admin events
+  it read (`uniserve_eval.load.timeline`).
 - `summary.json` and `summary.md`: the validated summary, written only on the
   completion path.
 
@@ -48,7 +51,8 @@ import numpy as np
 
 from ..artifacts import ArtifactWriter
 from ..datasets import load_examples
-from ..load import GpuStorageSampler, WarmupFailure, run_load
+from ..load import GpuStorageSampler, WarmupFailure, run_load, run_timeline
+from ..server import ManagedDeployment
 from ..server_metrics import scrape_metrics, window_summary
 from ..tasks import get_task
 from ..tasks.video import VideoTask
@@ -70,6 +74,7 @@ async def run_point(
     *,
     launch: dict[str, Any] | None = None,
     timeout_s: float | None = None,
+    deployment: ManagedDeployment | None = None,
 ) -> RunResult:
     """Run dataset loading, warmup, measured load, validation, and persistence.
 
@@ -82,10 +87,14 @@ async def run_point(
         launch: The `describe_deployment` provenance record, if any.
         timeout_s: Override the profile's logical video request deadline and
             HTTP operation timeout. Provenance uses a separate short timeout.
+        deployment: The running deployment a timeline load's changes act
+            on and whose admin events it reads.
 
     Returns:
         The summary and bundle directory. A point whose validation fails
-        still returns normally, with `validation.valid` false.
+        still returns normally, with `validation.valid` false. A point with
+        changes is valid only if every change was applied
+        (`changes_applied`).
 
     Raises:
         FileExistsError: If `output_dir` or the point's `video.media_dir`
@@ -123,6 +132,7 @@ async def run_point(
     duration = 0.0
     phase = "measured"
     metrics_before: dict[str, str | None] = {}
+    timeline: dict[str, Any] = {}
 
     # Empty streams and the preparing record make partial failures
     # inspectable with the same artifact names as completed points.
@@ -282,18 +292,33 @@ async def run_point(
                         raise WarmupFailure(priming_records)
                     # Priming is excluded from metrics. Inspection runs after
                     # measurement to preserve the primed queues and caches.
-                load_result = await run_load(
-                    rows,
-                    request_rate=point.load.request_rate,
-                    max_concurrency=point.load.max_concurrency,
-                    submit=submit,
-                    warmup_requests=0
-                    if priming_rows
-                    else point.load.warmup_requests,
-                    warmup_rows=[] if priming_rows else warmup_rows,
-                    inspect_warmup=inspect,
-                    before_measure=snapshot_metrics,
+                warmup_requests = (
+                    0 if priming_rows else point.load.warmup_requests
                 )
+                if point.load.duration_s is not None:
+                    load_result = await run_timeline(
+                        rows,
+                        load=point.load,
+                        changes=point.changes,
+                        submit=submit,
+                        deployment=deployment,
+                        record=timeline,
+                        warmup_requests=warmup_requests,
+                        warmup_rows=[] if priming_rows else warmup_rows,
+                        inspect_warmup=inspect,
+                        before_measure=snapshot_metrics,
+                    )
+                else:
+                    load_result = await run_load(
+                        rows,
+                        request_rate=point.load.request_rate,
+                        max_concurrency=point.load.max_concurrency,
+                        submit=submit,
+                        warmup_requests=warmup_requests,
+                        warmup_rows=[] if priming_rows else warmup_rows,
+                        inspect_warmup=inspect,
+                        before_measure=snapshot_metrics,
+                    )
             finally:
                 sampler.stop()
 
@@ -328,13 +353,18 @@ async def run_point(
             server_version=server_version,
             launch=launch_record,
         )
+        checks = summary["validation"]["checks"]
         if priming_records:
-            summary["validation"]["checks"]["priming_valid"] = all(
+            checks["priming_valid"] = all(
                 record.success for record in priming_records
             )
-            summary["validation"]["valid"] = all(
-                summary["validation"]["checks"].values()
+        # A run of changes that did not all apply is not a run of its point.
+        if point.changes:
+            checks["changes_applied"] = all(
+                "issued_s" in entry and "error" not in entry
+                for entry in timeline["changes"]
             )
+        summary["validation"]["valid"] = all(checks.values())
 
         if sampler.summary() is not None:
             summary["gpu_storage"] = sampler.summary()
@@ -371,6 +401,8 @@ async def run_point(
             "server_metrics.json",
             {"before": metrics_before, "after": metrics_after},
         )
+        if point.load.duration_s is not None:
+            writer.write_json("timeline.json", timeline)
         writer.write_json("summary.json", summary)
         (output_path / "summary.md").write_text(
             render_markdown(summary), encoding="utf-8"
@@ -425,6 +457,8 @@ async def run_point(
             _write_records(
                 writer, "requests.jsonl", records, point.video.media_dir
             )
+            if point.load.duration_s is not None:
+                writer.write_json("timeline.json", timeline)
         except Exception as artifact_error:
             failure["artifact_error"] = {
                 "type": type(artifact_error).__name__,

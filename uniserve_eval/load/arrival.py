@@ -155,38 +155,18 @@ async def run_load(
             sessions.setdefault(row.session_id, []).append((index, row))
 
     # Warmup and arrival-driven measurement share the declared in-flight
-    # limit. The arrival timestamp is taken before the semaphore, so time
-    # queued here appears as the gap between ``scheduled`` and the moment
-    # ``submit`` starts.
-    semaphore = asyncio.Semaphore(max_concurrency) if max_concurrency else None
+    # limit.
+    limited = limit(submit, max_concurrency)
 
-    async def limited(row: Example, scheduled: float | None) -> T:
-        """Submit one row within the optional concurrency semaphore."""
-        if semaphore is None:
-            return await submit(row, scheduled)
-        async with semaphore:
-            return await submit(row, scheduled)
-
-    # Warmup exercises the same request path outside the reported duration.
-    # Repeating the first row is the warmup of a load that names no corpus;
-    # in a session trace that row is a session's measured cold request.
-    warmup_outputs: list[T] = []
-    if warmup_rows is not None:
-        excluded = warmup_rows
-    elif sessions:
-        excluded = []
-    else:
-        excluded = [rows[0]] * warmup_requests
-    if excluded:
-        warmup_outputs = await asyncio.gather(
-            *[limited(row, None) for row in excluded]
-        )
-        if inspect_warmup is not None:
-            inspect_warmup(warmup_outputs)
-        if not all(
-            getattr(output, "success", False) for output in warmup_outputs
-        ):
-            raise WarmupFailure(list(warmup_outputs))
+    # In a session trace the first row is a session's measured cold request,
+    # so a trace sends no repeated-row warmup.
+    warmup_outputs = await warm_up(
+        rows,
+        limited,
+        warmup_requests=0 if sessions else warmup_requests,
+        warmup_rows=warmup_rows,
+        inspect_warmup=inspect_warmup,
+    )
 
     if before_measure is not None:
         await before_measure()
@@ -237,9 +217,71 @@ async def run_load(
             task.cancel()
         await asyncio.gather(*tasks, return_exceptions=True)
         raise
-    # Every attempted request, including errors and deadlines, contributes to
-    # the window. Coroutine cleanup and subsequent inspection do not.
-    # Request dispatch closes every record on each path, failures included.
+    return measured(warmup_outputs, outputs, clock_offset)
+
+
+def limit(submit: Submit[T], max_concurrency: int | None) -> Submit[T]:
+    """Return ``submit`` within an in-flight limit of ``max_concurrency``.
+
+    ``None`` (or ``0``) sets no limit. The arrival timestamp a caller passes
+    is taken before the limit, so time queued here appears as the gap
+    between ``scheduled`` and the moment ``submit`` starts.
+    """
+    if not max_concurrency:
+        return submit
+    semaphore = asyncio.Semaphore(max_concurrency)
+
+    async def limited(row: Example, scheduled: float | None) -> T:
+        async with semaphore:
+            return await submit(row, scheduled)
+
+    return limited
+
+
+async def warm_up(
+    rows: list[Example],
+    submit: Submit[T],
+    *,
+    warmup_requests: int,
+    warmup_rows: list[Example] | None,
+    inspect_warmup: Callable[[list[T]], None] | None,
+) -> list[T]:
+    """Send a load's excluded warmup requests together and check them.
+
+    Warmup exercises the measured request path outside the reported
+    duration: the rows of an explicit excluded corpus, or else ``rows[0]``
+    repeated ``warmup_requests`` times.
+
+    Raises:
+        WarmupFailure: If any warmup output lacks a truthy ``success``,
+            after ``inspect_warmup`` has seen them.
+    """
+    excluded = (
+        warmup_rows if warmup_rows is not None else rows[:1] * warmup_requests
+    )
+    if not excluded:
+        return []
+    outputs = await asyncio.gather(*[submit(row, None) for row in excluded])
+    if inspect_warmup is not None:
+        inspect_warmup(outputs)
+    if not all(getattr(output, "success", False) for output in outputs):
+        raise WarmupFailure(list(outputs))
+    return outputs
+
+
+def measured(
+    warmup_outputs: list[T], outputs: list[T], clock_offset: float
+) -> LoadResult:
+    """Return a load's result, its window bounded by its measured records.
+
+    Every attempted request, including errors and deadlines, contributes to
+    the window; coroutine cleanup and subsequent inspection do not.
+    ``clock_offset`` is ``time.time()`` minus ``time.perf_counter()``.
+
+    Raises:
+        RuntimeError: If a record was never closed; request dispatch closes
+            every record on each path, failures included.
+    """
     ends = []
     for output in outputs:
         if output.final_event_time is None:

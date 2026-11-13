@@ -10,6 +10,7 @@ from pathlib import Path
 
 from .artifacts import supersede
 from .config import DEFAULT_CONFIG, load_config, server_launch
+from .pipeline.check import change_report, render_change_report
 from .pipeline.compare import compare_runs
 from .pipeline.run import run_point
 from .pipeline.setup import (
@@ -194,6 +195,7 @@ def run(args: argparse.Namespace) -> None:
                                 output_root / point.name,
                                 launch=launch_record,
                                 timeout_s=args.request_timeout_s,
+                                deployment=deployment,
                             )
                         )
                         valid = result.summary["validation"]["valid"]
@@ -229,6 +231,31 @@ def compare(args: argparse.Namespace) -> None:
         raise SystemExit(1) from error
     print(json.dumps(report, indent=2, sort_keys=True))
     if report["verdict"] != "accepted":
+        raise SystemExit(2)
+
+
+def check_change(args: argparse.Namespace) -> None:
+    """Check a timeline run with changes against its control run.
+
+    Writes `result.md` (into the run's bundle unless `--result` names
+    another path) and prints the report as one JSON line. Exits with status
+    0 when every item of the pass under change holds, 2 when one does not,
+    and 1 when a bundle or the verdict file cannot be read.
+    """
+    try:
+        report = change_report(
+            args.run,
+            args.control,
+            check_metric=args.check_metric,
+            replay=args.replay,
+        )
+    except (OSError, ValueError, KeyError) as error:
+        print(f"uniserve-eval check-change: {error}", file=sys.stderr)
+        raise SystemExit(1) from error
+    result = args.result or args.run / "result.md"
+    result.write_text(render_change_report(report), encoding="utf-8")
+    print(json.dumps(report, sort_keys=True))
+    if not report["pass"]:
         raise SystemExit(2)
 
 
@@ -282,6 +309,16 @@ def build_parser() -> argparse.ArgumentParser:
     command.add_argument("candidate", type=Path)
     command.add_argument("--confidence", type=float, default=0.95)
     command.set_defaults(function=compare)
+
+    # `check-change` reads two completed timeline bundles, a run of changes
+    # and its control, and the evidence of the buffer pool's invariants.
+    command = subparsers.add_parser("check-change")
+    command.add_argument("run", type=Path)
+    command.add_argument("--control", type=Path, required=True)
+    command.add_argument("--check-metric", required=True)
+    command.add_argument("--replay", type=Path, required=True)
+    command.add_argument("--result", type=Path)
+    command.set_defaults(function=check_change)
     return parser
 
 

@@ -4,7 +4,8 @@ An evaluator profile is a TOML file with optional `root` (default `.`) and
 `artifact_root` (where `run` writes without `--output-root`) keys and up to
 three tables: `[servers.<name>]` describes how to launch a server,
 `[benchmarks.<name>]` describes one measured workload against a named
-server, and `[suites.<name>]`
+server, with the changes a timeline load applies to it as
+`[[benchmarks.<name>.changes]]`, and `[suites.<name>]`
 lists benchmark names in execution order. `load_config` turns the file into
 an `EvaluationConfig`, rejecting unknown keys at the top level and in every
 server, benchmark, and suite table. The adapters that
@@ -37,6 +38,7 @@ from .tasks import get_task
 from .tasks.base import BenchmarkTask
 from .types import (
     BenchmarkPoint,
+    Change,
     ImageConfig,
     LoadConfig,
     MetricDefinition,
@@ -75,8 +77,10 @@ _ROOT_FIELDS = {
     "video",
     "metrics",
     "provenance",
+    "changes",
 }
 _LOAD_FIELDS = set(LoadConfig.__dataclass_fields__)
+_CHANGE_FIELDS = set(Change.__dataclass_fields__)
 _SAMPLING_FIELDS = set(SamplingConfig.__dataclass_fields__)
 _IMAGE_FIELDS = set(ImageConfig.__dataclass_fields__)
 _VIDEO_FIELDS = set(VideoConfig.__dataclass_fields__)
@@ -98,7 +102,7 @@ _TOKEN_SAMPLING_CONTROLS = {
 
 # The settings dataclasses a benchmark table's nested tables construct.
 _Settings = TypeVar(
-    "_Settings", LoadConfig, SamplingConfig, ImageConfig, VideoConfig
+    "_Settings", LoadConfig, SamplingConfig, ImageConfig, VideoConfig, Change
 )
 
 
@@ -114,6 +118,14 @@ class ServerProfile:
     A server is ready once its listener accepts a connection and, when
     `ready_path` names one, that path answers HTTP 200: a server that listens
     before it finishes starting reports its readiness there.
+
+    `admin_socket` is the Unix socket of a single-process server's admin
+    listener, which a timeline load's changes call and whose event log it
+    reads. A relative path is taken in the deployment's runtime directory,
+    the `XDG_RUNTIME_DIR` the evaluator creates for it
+    (`server.ManagedDeployment`); `uniserve serve` listens at
+    `uniserve/admin-<port>.sock` there unless `admin_config.admin_uds`
+    names another socket.
     """
 
     name: str
@@ -123,6 +135,7 @@ class ServerProfile:
     environment: dict[str, str]
     replicas: tuple[ServerProfile, ...] = ()
     ready_path: str | None = None
+    admin_socket: str | None = None
 
     @property
     def instances(self) -> tuple[ServerProfile, ...]:
@@ -350,17 +363,25 @@ def _server_profile(name: str, raw: Any) -> ServerProfile:
     value = expand_environment(_mapping(raw, f"servers.{name}"))
     _reject_unknown(
         value,
-        {"command", "host", "port", "environment", "ready_path", "replicas"},
+        {
+            "command",
+            "host",
+            "port",
+            "environment",
+            "ready_path",
+            "replicas",
+            "admin_socket",
+        },
         f"servers.{name}",
     )
     if "replicas" not in value:
         return _server_process(name, value)
 
     replicas_value = value["replicas"]
-    if "command" in value or "port" in value:
+    if "command" in value or "port" in value or "admin_socket" in value:
         raise ValueError(
             f"servers.{name} declares replicas and cannot also declare "
-            "a command or port"
+            "a command, port or admin_socket"
         )
     if not isinstance(replicas_value, list) or len(replicas_value) < 2:
         raise ValueError(f"servers.{name}.replicas must list two or more")
@@ -423,6 +444,11 @@ def _server_process(
         or not 0 < port < 65536
     ):
         raise ValueError(f"{context}.port must be a valid TCP port")
+    admin_socket = value.get("admin_socket")
+    if admin_socket is not None and (
+        not isinstance(admin_socket, str) or not admin_socket
+    ):
+        raise ValueError(f"{context}.admin_socket must be a non-empty string")
     return ServerProfile(
         name,
         tuple(command),
@@ -430,6 +456,7 @@ def _server_process(
         port,
         _server_environment(value, context),
         ready_path=_server_ready_path(value, context),
+        admin_socket=admin_socket,
     )
 
 
@@ -509,6 +536,9 @@ def _benchmark_point(
     # enforce modality and source requirements that cross table boundaries.
     metrics = _metrics(value.get("metrics"), f"benchmarks.{name}")
     load = _load_config(value.get("load"), f"benchmarks.{name}.load")
+    changes = _changes(
+        value.get("changes"), servers[server], load, f"benchmarks.{name}"
+    )
     sampling = _sampling_config(
         value.get("sampling"), task, f"benchmarks.{name}.sampling"
     )
@@ -549,6 +579,7 @@ def _benchmark_point(
         provenance=_mapping(
             value.get("provenance", {}), f"benchmarks.{name}.provenance"
         ),
+        changes=changes,
     )
 
 
@@ -675,6 +706,60 @@ def _load_config(raw: Any, context: str) -> LoadConfig:
     if "request_rate" in value and value["request_rate"] == "inf":
         value["request_rate"] = float("inf")
     return _build_settings(LoadConfig, value, context)
+
+
+def _changes(
+    raw: Any, server: ServerProfile, load: LoadConfig, context: str
+) -> tuple[Change, ...]:
+    """Parse a point's `[[changes]]`, which its timeline load applies.
+
+    Names are unique and an `after` names a change declared before it, so
+    the references form no cycle. A change that calls the admin listener
+    or waits for its events requires the point's server to state
+    `admin_socket`.
+    """
+    if raw is None:
+        return ()
+    if not isinstance(raw, list):
+        raise ValueError(f"{context}.changes must be an array of tables")
+    if load.duration_s is None:
+        raise ValueError(
+            f"{context}.changes apply on a timeline load and require "
+            "load.duration_s"
+        )
+
+    changes: list[Change] = []
+    for index, item in enumerate(raw):
+        where = f"{context}.changes[{index}]"
+        value = _mapping(item, where)
+        _reject_unknown(value, _CHANGE_FIELDS, where)
+        if "command" in value:
+            command = value["command"]
+            if (
+                not isinstance(command, list)
+                or not command
+                or not all(isinstance(argument, str) for argument in command)
+            ):
+                raise ValueError(
+                    f"{where}.command must be a non-empty string array"
+                )
+            value["command"] = tuple(command)
+        if "body" in value:
+            value["body"] = _mapping(value["body"], f"{where}.body")
+        change = _build_settings(Change, value, where)
+
+        names = {earlier.name for earlier in changes}
+        if change.name in names:
+            raise ValueError(f"{where} repeats the name {change.name!r}")
+        if change.after is not None and change.after not in names:
+            raise ValueError(f"{where}.after must name an earlier change")
+        if change.calls_admin and server.admin_socket is None:
+            raise ValueError(
+                f"{where} uses the admin listener, and servers."
+                f"{server.name} states no admin_socket"
+            )
+        changes.append(change)
+    return tuple(changes)
 
 
 def _sampling_config(

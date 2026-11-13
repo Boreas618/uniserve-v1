@@ -276,24 +276,27 @@ async def _send_chat_stream(
 
     # Fold deltas in arrival order. A text gap that spans an image event is
     # excluded from ITL, and each image part records the latency of the
-    # event that delivered it.
+    # event that delivered it. Tokens keep the arrival of their chunk.
     last_text_time: float | None = None
     image_since_last_text = False
     image_parts: list[dict[str, Any]] = []
     for event in events:
+        timestamp = event.get("_client_t")
+        timestamp_f = float(timestamp) if timestamp is not None else None
+        if timestamp_f is not None and event.get("type") != "sse_done":
+            record.chunk_times.append(timestamp_f)
         choices = event.get("choices")
         if isinstance(choices, list):
             for choice in choices:
                 if isinstance(choice, dict):
                     record.apply_choice_metadata(choice)
+                    record.add_tokens(choice, timestamp_f)
         usage = event.get("usage")
         if isinstance(usage, dict):
             record.apply_usage(usage)
         record.apply_cached_prompt_tokens(event)
         content = OpenAIChat.delta_text(event)
         images = OpenAIChat.delta_images(event)
-        timestamp = event.get("_client_t")
-        timestamp_f = float(timestamp) if timestamp is not None else None
         if content:
             record.add_text(
                 content,
