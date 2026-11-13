@@ -173,7 +173,7 @@ A checkpoint that declares its own quantization (ModelOpt's `quantization_config
 | --- | --- | --- |
 | `max_tokens` | Sized from storage: what `mem_fraction_static` of the device leaves once the weights, the graph pools and the process's allowance are counted | Capacity in tokens |
 | `block_size` | Largest supported up to 64 | Tokens per page of the cache group with the widest token rows, a power of two |
-| `dtype` | Each layer's compute type | `bfloat16`, `float16`, `float32` or `float8_e4m3fn` |
+| `dtype` | Each layer's compute type | `bfloat16`, `float16`, `float32` or `float8_e4m3fn`. A dense cache of another type than the layers' (a `bfloat16` model's `float16` cache) holds each key and value rounded to nearest into its type as the cache write stores it, and is read by the `triton` attention package, since trtllm-gen has kernels only for a cache of the queries' own type; that package serves those keys whatever `attention_backend` names |
 | `prefix_caching` | `true` | Reuse and retain cached prompt prefixes across requests |
 | `host_tier` | `true` | With `prefix_caching`, offload prompt pages to the host KV cache of each host's Storage Server and load them back when a later prompt's prefix continues past the device cache's match: every published page of a full-attention cache group, and a sliding-window group's window before each aligned boundary (`boundary_interval`) |
 | `host_ratio` | `2.0` | With `host_tier`, the host KV cache's token count over the device KV cache's, the same on every rank of an epoch (as SGLang's `--hicache-ratio`): each cache group's host region holds that many tokens' pages |

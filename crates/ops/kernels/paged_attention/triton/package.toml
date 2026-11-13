@@ -1,9 +1,16 @@
-# The paged_attention operator's Triton backend: the program for a cache the vendor libraries refuse.
+# The paged_attention operator's Triton backend: the program for the caches the vendor libraries do
+# not read.
 #
 # `fa4` and `trtllm` both refuse a plane carrying an f32 scale, by name, and both are right to: a
 # manifest field that made one of them declare `kv = f8e4m3` would be a cell that builds and then dies
 # inside a vendor library on the first launch. So the quantized cache needs a program of ours, and this
-# package is it: `ops::attention::PagedAttention` states the operator's contract.
+# package is it: `ops::attention::PagedAttention` states what the operator computes. The same program
+# widens a dense page (BF16, F16 or F32) to f32 as it reads it, so it also serves a cache of another
+# dense type than the queries, such as a BF16 model's FP16 cache, which trtllm-gen's artifact holds no
+# kernel for.
+#
+# It declares the dense pairs the vendor package covers as well, and the vendor package's higher
+# `priority` keeps them there: this program is selected for a key only where no faster one covers it.
 #
 # **Two phases, two programs, one key field between them.** Decode is one query row per table row;
 # prefill is one program per (query row, head) of a batch row, causally masked, and it reads the
@@ -40,4 +47,4 @@ architectures = ["sm_100a"]
 # `head_dim` and `page` are `tl.arange` extents; the head counts compile into the query group, which
 # the compile script refuses unless `kv_heads` divides `q_heads`; `len` changes no program.
 [kernel.descriptors]
-dimensions = { phase = ["decode", "prefill"], dtype = ["bf16"], kv = ["f8e4m3"], out = ["bf16"], head_dim = { power_of_two = true }, page = { power_of_two = true }, q_heads = { min = 1 }, kv_heads = { min = 1 }, mask = ["causal"], window = ["false"], len = { min = 1 } }
+dimensions = { phase = ["decode", "prefill"], dtype = ["bf16", "f16"], kv = ["f8e4m3", "bf16", "f16", "f32"], out = ["bf16", "f16"], head_dim = { power_of_two = true }, page = { power_of_two = true }, q_heads = { min = 1 }, kv_heads = { min = 1 }, mask = ["causal"], window = ["false"], len = { min = 1 } }

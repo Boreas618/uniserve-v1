@@ -71,7 +71,10 @@
 //! TMA descriptors, carves its workspace and computes its own grid and cluster, so [`Op::launch`]
 //! computes no grid and hands the library [`Call`]. FlashAttention-4's CuTe DSL package implements
 //! the same operation and the same call structure, and is chosen by `attention_backend` /
-//! `decode_attention_backend` / `prefill_attention_backend`.
+//! `decode_attention_backend` / `prefill_attention_backend`. This crate's Triton package serves
+//! the caches the vendor programs do not read, an E4M3 page and a dense page of another type than
+//! the queries, with the arguments its programs declare instead of [`Call`]; a key no package a
+//! deployment names covers goes to a package that covers it (`cover` at the Build Server).
 //!
 //! The workspace is the program's `workspace_size` argument (512 MiB for trtllm-gen), a transient
 //! region the worker allocates from its scratch pool and zeroes before its first use: trtllm-gen
@@ -998,19 +1001,23 @@ fn words(phase: Phase) -> Vec<PagedWord> {
 }
 
 impl PagedAttention {
-    /// Launch this crate's own Triton program for an `E4M3` page.
+    /// Launch this crate's own Triton program for a page the vendor programs do not read: an
+    /// `E4M3` page, or a dense page (BF16, F16 or F32) of another type than the queries.
     ///
-    /// The vendor libraries refuse a plane carrying an f32 page scale, by name, so the quantized
-    /// cache needs a program of ours. **It serves both
-    /// phases from two kernels of one module**: decode walks one program per (query row, query head)
-    /// along the row's page table with a running maximum, normaliser and accumulator; prefill takes
-    /// the packed query rows as its first grid dimension, masks each row at its own key count and
-    /// reads the row's first token from the offsets.
+    /// The vendor libraries refuse a plane carrying an f32 page scale, by name, and trtllm-gen's
+    /// artifact holds dense kernels only for a cache of the queries' own type, so those caches
+    /// need a program of ours. It widens each element to f32 as it reads it, multiplying an
+    /// `E4M3` page's scale back, and is handed null scale pointers, never read, for a dense page.
+    /// **It serves both phases from two kernels of one module**: decode walks one program per
+    /// (query row, query head) along the row's page table with a running maximum, normaliser and
+    /// accumulator; prefill takes the packed query rows as its first grid dimension, places each
+    /// row's queries at the end of its keys, masks each at its own key and reads the row's first
+    /// token from the offsets.
     ///
     /// The refusals here are the operator's own conditions stated where the program's compilation
-    /// makes them true: an E4M3 cache read without its scale, a window this program was not compiled
-    /// for, a phase it does not serve. Each names what it refused, so a store that resolved the
-    /// wrong program is a launch error rather than plausible attention.
+    /// makes them true: a cache of a type the program does not read, an E4M3 cache read without its
+    /// scale, a window this program was not compiled for. Each names what it refused, so a store
+    /// that resolved the wrong program is a launch error rather than plausible attention.
     #[allow(clippy::too_many_arguments)]
     fn launch_program(
         kernel: &Kernel,
@@ -1019,21 +1026,31 @@ impl PagedAttention {
         launch: PagedLaunch,
         stream: &Stream,
     ) -> Result<()> {
-        if descriptor.key_value != DType::F8E4M3 {
-            return Err(Error::argument(
-                Self::NAME,
-                format!(
-                    "the Triton program decodes an E4M3 page and the descriptor's cache is {}; the                      full-precision rows are the vendor modules'",
-                    abi::name(descriptor.key_value)
-                ),
-            ));
-        }
-        let (Some(key_scale), Some(value_scale)) = (&args.key_scale, &args.value_scale) else {
-            return Err(Error::argument(
-                Self::NAME,
-                "an E4M3 page is read through one scale per page, and the call passes none"
-                    .to_owned(),
-            ));
+        // The page scales: an E4M3 page's own, and the null address for a dense page, whose
+        // program never reads them (`QUANTIZED` is compiled from the descriptor's `kv`).
+        let null = DevicePtr::from_address(0);
+        let (key_scale, value_scale) = match descriptor.key_value {
+            DType::F8E4M3 => {
+                let (Some(key), Some(value)) = (&args.key_scale, &args.value_scale) else {
+                    return Err(Error::argument(
+                        Self::NAME,
+                        "an E4M3 page is read through one scale per page, and the call passes none"
+                            .to_owned(),
+                    ));
+                };
+                (key.ptr, value.ptr)
+            }
+            DType::BF16 | DType::F16 | DType::F32 => (null, null),
+            other => {
+                return Err(Error::argument(
+                    Self::NAME,
+                    format!(
+                        "the Triton program reads an E4M3, BF16, F16 or F32 page, and the \
+                         descriptor's cache is {}",
+                        abi::name(other)
+                    ),
+                ));
+            }
         };
         // `-1` is the encoding for "no window", which is what a program compiled without one
         // needs; a window is set when the value is not negative. A check against zero refuses the
@@ -1091,10 +1108,10 @@ impl PagedAttention {
                     let _ = arguments.view(&args.value);
                 }
                 PagedWord::KeyScale => {
-                    let _ = arguments.view(key_scale);
+                    let _ = arguments.pointer(key_scale);
                 }
                 PagedWord::ValueScale => {
-                    let _ = arguments.view(value_scale);
+                    let _ = arguments.pointer(value_scale);
                 }
                 PagedWord::PageTable => {
                     let _ = arguments.view(&args.page_table);

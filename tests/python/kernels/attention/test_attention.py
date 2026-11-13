@@ -1,8 +1,9 @@
 """The attention and KV-write packages' kernels against their references.
 
-The Triton paged attention and the KV writes run on the interpreter. The
-dense, sparse and trtllm attention backends are native modules: their checks
-load a built module (``UNISERVE_KERNEL_MODULES``) and launch it on a device.
+The Triton paged attention and the KV writes run on the interpreter, and again
+compiled for a device. The dense, sparse and trtllm attention backends are
+native modules: their checks load a built module (``UNISERVE_KERNEL_MODULES``)
+and launch it on a device.
 """
 
 import pathlib
@@ -27,6 +28,15 @@ INTERPRETED = (
 @pytest.mark.parametrize("check", INTERPRETED)
 def test_an_attention_kernel_matches_its_reference_on_the_interpreter(check):
     interpreted(FAMILY / check)
+
+
+@pytest.mark.gpu
+@pytest.mark.parametrize(
+    "check", ["paged_triton_decode_check.py", "paged_triton_prefill_check.py"]
+)
+def test_the_triton_paged_attention_matches_its_reference_on_the_device(check):
+    """The same cases, with the device's rounding of the narrowed store."""
+    on_device(FAMILY / check, "--device")
 
 
 @pytest.mark.gpu

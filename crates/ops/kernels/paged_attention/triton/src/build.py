@@ -1,9 +1,9 @@
 """The paged_attention package's compile script: one descriptor -> one module.
 
-This package serves the cache the vendor libraries refuse — an `E4M3` page with one f32 scale per
-page — so its decode row is the one program here. `phase` is compiled by choosing the kernel (only
-`decode` is served), `page` and `head_dim` are the tiles, and `q_heads`/`kv_heads` give the group a
-program divides its query head by.
+This package serves the caches the vendor libraries do not read: an `E4M3` page with one f32 scale
+per page, and a dense page (BF16, F16 or F32) of another type than the queries. `phase` is compiled
+by choosing the kernel, `page` and `head_dim` are the tiles, and `q_heads`/`kv_heads` give the group
+a program divides its query head by.
 
 `kv` decides the cache's element type and `quantized` whether the program multiplies a page's scale
 back: both are compiled, because a program that read a scale it was not given, or read an E4M3 page as
@@ -14,7 +14,7 @@ import paged_attention as kernels
 from uniserve_build_server import triton as driver
 
 #: The element types a cache plane may have, as Triton spells them.
-PLANES = {"bf16": "bf16", "f16": "fp16", "f8e4m3": "fp8e4nv"}
+PLANES = {"bf16": "bf16", "f16": "fp16", "f32": "fp32", "f8e4m3": "fp8e4nv"}
 
 #: The element types the query and the output may have, as Triton spells them.
 ACTIVATIONS = {"bf16": "bf16", "f16": "fp16", "f32": "fp32"}

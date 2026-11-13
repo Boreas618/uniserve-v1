@@ -487,10 +487,21 @@ mod tests {
         assert_eq!(bytes(&keyed, 384, 256), values + flags + keys + table);
     }
 
-    /// A set's planes have the cache's page shape over the set's pages, and its table reads at
-    /// any width the set's pages cover.
+    /// A set's planes have the cache's page shape and element type over the set's pages, so a
+    /// paired forward writes and reads them as the serving forward does the cache's own (an FP16
+    /// cache of a BF16 model through the same converting write), and its table reads at any
+    /// width the set's pages cover.
     #[test]
     fn a_sets_tensors_are_its_pages_in_the_caches_shape() -> Result<()> {
+        let float16 = Arc::new(CacheLayout::dense(16, 2, 1, 8, PrefixCacheDtype::Float16));
+        let layer =
+            ScratchPages::meta(Arc::clone(&float16), 12, 4)?.layer(&float16.groups[0], 0)?;
+        assert_eq!(
+            (layer.key.dtype(), layer.value.dtype()),
+            (DType::F16, DType::F16)
+        );
+        assert!(layer.key_scale.is_none() && layer.value_scale.is_none());
+
         let layout = Arc::new(CacheLayout::dense(
             16,
             2,

@@ -5,9 +5,10 @@
 # descriptor's configurations can select published beside the module under
 # `cubins/`. The entry is the operator's `attention::paged::Call`.
 #
-# Whole-query prefill is not declared: that is `fa4`'s package (FlashAttention's
-# Blackwell pass), and a key must name one program. This package serves the decode
-# cells, where trtllm-gen's paged kernel is the one the design names.
+# It serves both phases over a cache of the queries' own type: decode with
+# trtllm-gen's generation kernels and prefill with its context kernels. Its
+# `priority` puts it ahead of the Triton package, which declares the same keys as a
+# fallback, wherever both cover a key.
 #
 # The manifest records where the kernels come from: `[toolchain] packages` names
 # the FlashInfer distribution that carries the launch code, and
@@ -17,6 +18,7 @@
 op = "paged_attention"
 backend = "trtllm"
 interface_version = 1
+priority = 1
 
 [toolchain]
 kind = "nvcc"
@@ -47,11 +49,20 @@ architectures = ["sm_100a", "sm_100f"]
 # operator's call carries one FP32 scale per page, so the module could not read
 # the scales the kernel asks for.
 #
+# A dense cache is declared only in the queries' own type, with an output of that
+# type: the artifact's dense kernels are `QkvBfloat16OBfloat16` and `QkvFp16OFp16`
+# and nothing else, so a BF16 query over an FP16 cache has no kernel here. One table
+# per element type states exactly those pairs, and a key of another pair is the
+# Triton package's at selection rather than a build that fails.
+#
 # `head_dim` and `page` select the artifact's cubins, which exist for the listed
 # values; the head counts are call words the entry checks and `len` changes no
 # program.
-[kernel.descriptors]
-dimensions = { phase = ["decode", "prefill"], dtype = ["bf16", "f16"], kv = ["bf16", "f16"], out = ["bf16", "f16"], head_dim = ["128", "64", "256"], page = ["64", "16", "32"], q_heads = { min = 1 }, kv_heads = { min = 1 }, mask = ["causal", "dense"], window = ["false"], len = { min = 1 } }
+[[kernel.descriptors]]
+dimensions = { phase = ["decode", "prefill"], dtype = ["bf16"], kv = ["bf16"], out = ["bf16"], head_dim = ["128", "64", "256"], page = ["64", "16", "32"], q_heads = { min = 1 }, kv_heads = { min = 1 }, mask = ["causal", "dense"], window = ["false"], len = { min = 1 } }
+
+[[kernel.descriptors]]
+dimensions = { phase = ["decode", "prefill"], dtype = ["f16"], kv = ["f16"], out = ["f16"], head_dim = ["128", "64", "256"], page = ["64", "16", "32"], q_heads = { min = 1 }, kv_heads = { min = 1 }, mask = ["causal", "dense"], window = ["false"], len = { min = 1 } }
 
 [parameters]
 # The trtllm-gen artifact: the pin its manifest is hashed by.

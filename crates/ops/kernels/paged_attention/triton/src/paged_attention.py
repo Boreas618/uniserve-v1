@@ -1,14 +1,17 @@
-"""The paged attention's Triton program: one decode row, an E4M3 page decoded once.
+"""The paged attention's Triton program: a page of any cache type, widened once to f32.
 
 The operator, its descriptor and its refusals are `ops::attention::PagedAttention`'s
-(`crates/ops/src/attention/mod.rs`); what this program adds to an ordinary paged attention is the
-cache's encoding: a page of `E4M3` bytes and **one f32 scale for the whole page**.
+(`crates/ops/src/attention/mod.rs`). This program serves the caches the vendor programs do not:
+a page of `E4M3` bytes with **one f32 scale for the whole page** (`QUANTIZED`), and a dense page
+(BF16, F16 or F32) of another type than the queries, such as a BF16 model's FP16 cache, which
+has no scale and whose scale pointers are null and never read.
 
 The order is the contract's:
 
 1. per page the query row's table names, load the page's scalar `s = key_scale[page]` (and the value
-   plane's own);
-2. **decode each element once**, `x = f32(byte) * s`, in f32, before any product or sum;
+   plane's own) when the page is quantized;
+2. **decode each element once**, `x = f32(byte) * s`, or `x = f32(element)` for a dense page, in
+   f32, before any product or sum;
 3. the attention itself unchanged — `Q · Kᵀ · softmax_scale` in f32, an online softmax in f32, the
    `P · V` sum in f32 — and one rounding into the output's type;
 4. **nothing is written back**: the page stays E4M3 and the next step decodes it again.
@@ -24,6 +27,12 @@ One program is one (query row, query head): it walks the pages once, carrying a 
 running normaliser and a `[HEAD_DIM]` accumulator. The key-value head is the query head divided by the
 group, so a call whose `q_heads` is not a whole multiple of `kv_heads` is the launch's refusal, not
 this program's rounding.
+
+A page is loaded whole, and the lanes of its keys a query does not see hold whatever the page held:
+a slot past the row's length was written by an earlier request or never, and an FP16 cache of a
+BF16 model holds an infinity where a value overflowed FP16. A hidden lane's score is `-inf`, so its
+weight is zero, and its value is replaced by zero before the product: `0 · inf` is NaN, and a hidden
+lane must not reach the sum.
 """
 
 import triton
@@ -128,9 +137,11 @@ def _paged_attention_decode_kernel(
 
         scores = tl.sum(keys * query[None, :], axis=1) * softmax_scale
         # The last page is partial: the keys past the row's length are not attended to, and a
-        # masked score cannot win the maximum or the normaliser.
+        # masked score cannot win the maximum or the normaliser. Their values are zeroed, so a
+        # stale non-finite value meets a zero weight as zero rather than as NaN.
         live = lanes < seq_len - index * PAGE
         scores = tl.where(live, scores, float("-inf"))
+        values = tl.where(live[:, None], values, 0.0)
 
         page_max = tl.max(scores, axis=0)
         new_max = tl.maximum(running_max, page_max)
@@ -185,11 +196,13 @@ def _paged_attention_prefill_kernel(
 ):
     """One query row of one batch row, over the pages its table names, causally.
 
-    The query row is a *position in its batch row*: the cache already holds that row's keys from
-    `kv_write`, so key `j` is position `j` and the causal mask is `j <= position`. A packed batch
-    states each row's first query token in `cum_seq_lens_q`; an unpacked one gives every row
-    `max_q_len` tokens, so the row's first token is `row * max_q_len`. Either way the output row is
-    `first + position`, which is what the operator's `[tokens, q_heads, head_dim]` view means.
+    A batch row's queries are the last `length` of its `seq_len` keys: the cache already holds
+    them from `kv_write`, after any prefix an earlier step or the prefix cache left there, so query
+    `position` of the row sits at key `seq_len - length + position` and the causal mask is
+    `j <= seq_len - length + position`. A packed batch states each row's first query token in
+    `cum_seq_lens_q`; an unpacked one gives every row `max_q_len` tokens, so the row's first token
+    is `row * max_q_len`. Either way the output row is `first + position`, which is what the
+    operator's `[tokens, q_heads, head_dim]` view means.
     """
     position = tl.program_id(0)
     head = tl.program_id(1)
@@ -232,6 +245,8 @@ def _paged_attention_prefill_kernel(
         return
 
     seq_len = tl.load(seq_lens_ptr + row)
+    # The query's own key: the row's queries are its last `length` keys.
+    causal = seq_len - length + position
     query = tl.load(
         query_ptr + token * q_stride_tokens + head * q_stride_heads + dims * q_stride_dim
     ).to(tl.float32)
@@ -270,11 +285,12 @@ def _paged_attention_prefill_kernel(
 
         scores = tl.sum(keys * query[None, :], axis=1) * softmax_scale
         # Two masks, one where: a key past the row's length is not there, and a key after this query
-        # row's position is in its future. The second is the causal mask and it is the whole
-        # difference from the decode program.
+        # row's own key is in its future. The second is the causal mask and it is the whole
+        # difference from the decode program. A hidden lane's value is zeroed, as at decode.
         key_position = index * PAGE + lanes
-        visible = (key_position <= position) & (key_position < seq_len)
+        visible = (key_position <= causal) & (key_position < seq_len)
         scores = tl.where(visible, scores, float("-inf"))
+        values = tl.where(visible[:, None], values, 0.0)
 
         page_max = tl.max(scores, axis=0)
         new_max = tl.maximum(running_max, page_max)

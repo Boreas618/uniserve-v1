@@ -391,3 +391,87 @@ fn a_package_for_another_target_covers_nothing() {
     assert!(coverage.covered.is_empty());
     assert_eq!(coverage.uncovered, vec![BF16.to_owned()]);
 }
+
+/// Copies the tree's package `crates/ops/kernels/<op>/<backend>` into the package root as revision
+/// 1, as an installation leaves it, with a record of its inputs.
+fn installed_from_tree(configuration: &ServerConfig, op: &str, backend: &str) {
+    fn copy(from: &Path, to: &Path) {
+        std::fs::create_dir_all(to).unwrap();
+        for entry in std::fs::read_dir(from).unwrap() {
+            let path = entry.unwrap().path();
+            let target = to.join(path.file_name().unwrap());
+            if path.is_dir() {
+                copy(&path, &target);
+            } else {
+                std::fs::copy(&path, &target).unwrap();
+            }
+        }
+    }
+
+    let tree = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../ops/kernels")
+        .join(op)
+        .join(backend);
+    let directory = configuration.package_root.join(op).join(backend).join("1");
+    copy(&tree, &directory);
+    Inputs::of(&directory, format!("{backend} toolchain"))
+        .unwrap()
+        .write(&directory)
+        .unwrap();
+}
+
+/// The tree's two paged attention packages: a deployment that names `trtllm` keeps the keys of a
+/// cache of the queries' own type there, and a BF16 model's FP16 cache and an E4M3 cache, which
+/// trtllm-gen's artifact has no kernel for, go to the Triton package at selection rather than to a
+/// build that fails. With no backend named the vendor package's priority keeps the keys both
+/// packages cover.
+#[test]
+fn the_tree_s_paged_attention_keys_go_to_the_package_that_holds_their_kernel() {
+    let temporary = tempfile::tempdir().unwrap();
+    let configuration = config(temporary.path());
+    let op = "paged_attention";
+    installed_from_tree(&configuration, op, "trtllm");
+    installed_from_tree(&configuration, op, "triton");
+    let server = BuildServer::open(&configuration).unwrap();
+
+    let key = |phase: &str, dtype: &str, kv: &str| {
+        format!(
+            "phase_{phase}_dtype_{dtype}_kv_{kv}_out_{dtype}_head_dim_128_page_64_q_heads_32\
+             _kv_heads_4_mask_causal_window_false_len_40960"
+        )
+    };
+    let own = [
+        key("decode", "bf16", "bf16"),
+        key("prefill", "bf16", "bf16"),
+    ];
+    let other = [
+        key("decode", "bf16", "f16"),
+        key("prefill", "bf16", "f16"),
+        key("decode", "bf16", "f8e4m3"),
+        key("decode", "f16", "bf16"),
+    ];
+    let package = |backend: &str| Package {
+        op: op.to_owned(),
+        backend: backend.to_owned(),
+        revision: 1,
+    };
+
+    for preferred in [vec![named(None, "trtllm")], Vec::new()] {
+        let asked = CoverRequest {
+            op: op.to_owned(),
+            targets: vec![Target::new("sm_100a")],
+            keys: own.iter().chain(&other).cloned().collect(),
+            preferred,
+            fixed: Vec::new(),
+        };
+        let coverage = server.cover(&asked).unwrap();
+        assert_eq!(
+            coverage.covered,
+            vec![
+                (package("trtllm"), own.to_vec()),
+                (package("triton"), other.to_vec()),
+            ]
+        );
+        assert!(coverage.uncovered.is_empty());
+    }
+}
