@@ -76,11 +76,14 @@ pub(super) struct Task {
 
 /// Who submitted a task, and learns of its progress and end.
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum Owner {
+pub(super) enum Owner {
     /// A head or a worker, which receives its events.
     Client(ClientId),
     /// Item `index` of the server's own weight move `number`.
     Move { number: u64, index: usize },
+    /// The buffer pool task the server numbered `number`: a transfer
+    /// between worker groups ([`crate::sessions`]).
+    Pool { number: u64 },
 }
 
 /// The Transfer Server process, its connection and its tasks.
@@ -277,7 +280,8 @@ impl Server {
                 priority,
                 update,
             } => {
-                let task = self.submit(id, &deployment, spans, *priority, *update)?;
+                let owner = Owner::Client(id);
+                let task = self.submit_for(owner, &deployment, spans, *priority, *update)?;
                 Ok(Handling::Response(Response::Submitted { task }, Vec::new()))
             }
             Request::OpenSession { gpus } => {
@@ -413,9 +417,12 @@ impl Server {
         let mut placed = Vec::with_capacity(regions.len());
         let mut needed = BTreeMap::new();
         for region in regions {
-            if !matches!(region, Region::Tensor { .. } | Region::Pool { .. }) {
+            if !matches!(
+                region,
+                Region::Tensor { .. } | Region::Pool { .. } | Region::Part { .. }
+            ) {
                 return Err(invalid(
-                    "a host exposes its own retained tensors and page pools",
+                    "a host exposes its own retained tensors, page pools and host regions' parts",
                 ));
             }
             let resolved = self.resolve(deployment, region, false)?;
@@ -595,10 +602,10 @@ impl Server {
         self.serve_queue(exposure.client);
     }
 
-    /// Check and forward a transfer; returns its task.
-    fn submit(
+    /// Check and forward a transfer of `owner`'s; returns its task.
+    pub(super) fn submit_for(
         &mut self,
-        client: ClientId,
+        owner: Owner,
         deployment: &str,
         spans: &[Span],
         priority: Priority,
@@ -700,7 +707,7 @@ impl Server {
         self.transfers.insert(
             task,
             Task {
-                owner: Owner::Client(client),
+                owner,
                 deployment: deployment.to_owned(),
                 update,
                 priority,
@@ -899,6 +906,23 @@ impl Server {
                     writable: true,
                 })
             }
+            Region::Part { region, rank } => {
+                let (storage, bytes) = self.part_storage(deployment, region, *rank).ok_or_else(
+                    || {
+                        invalid(&format!(
+                            "rank {rank} holds no part of a host region {region} of {deployment}"
+                        ))
+                    },
+                )?;
+                Ok(Resolved {
+                    allocation: Allocation::Storage { storage },
+                    end: LinkEnd::Host,
+                    base: 0,
+                    bytes,
+                    attachment: Some(Attachment::Storage(storage)),
+                    writable: true,
+                })
+            }
             Region::Fabric {
                 handle,
                 gpu,
@@ -955,6 +979,11 @@ impl Server {
             }
         }
         cancelled
+    }
+
+    /// Cancels the Transfer Server's task of the buffer pool task `number`.
+    pub(super) fn cancel_pool_transfer(&mut self, number: u64) {
+        self.cancel_where(|_, task| task.owner == Owner::Pool { number });
     }
 
     /// See [`Request::Throttle`](::storage::protocol::Request::Throttle).
@@ -1024,7 +1053,10 @@ impl Server {
                     .push((client, Event::TaskProgress { task, bytes }, Vec::new()));
             }
             (Owner::Move { number, index }, Some(end)) => self.moved(number, index, &end),
-            (Owner::Move { .. }, None) => {}
+            (Owner::Pool { number }, Some(end)) => {
+                self.end_pool_task(number, end == TaskStatus::Complete);
+            }
+            (Owner::Move { .. } | Owner::Pool { .. }, None) => {}
         }
     }
 
@@ -1116,6 +1148,11 @@ impl Server {
                     self.submitter_task_ended(client);
                 }
                 Owner::Move { number, index } => self.moved(number, index, &failed),
+                // The Transfer Server may still copy until its process has exited.
+                Owner::Pool { number } => {
+                    let pid = self.transfers.process.pid();
+                    self.pool_task_lost(number, pid);
+                }
             }
         }
         // The device storage it was creating for a move is never reported.
@@ -1237,9 +1274,13 @@ fn remote(
     endpoint: &str,
     region: &Region,
 ) -> Result<Allocation, (ErrorKind, String)> {
-    if !matches!(region, Region::Tensor { .. } | Region::Pool { .. }) {
+    if !matches!(
+        region,
+        Region::Tensor { .. } | Region::Pool { .. } | Region::Part { .. }
+    ) {
         return Err(invalid(
-            "another host's region is one of its retained tensors or page pools",
+            "another host's region is one of its retained tensors, page pools or host regions' \
+             parts",
         ));
     }
     if endpoint.is_empty() {

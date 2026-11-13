@@ -1,21 +1,16 @@
 //! What the buffer pool states about itself: the capacity words of a
-//! region, what each block is observed as, and whether its tables are
-//! consistent.
+//! region, what each block is observed as ([`BlockState`], the first row
+//! that applies), what waits, and whether its tables are consistent.
 
 use std::collections::{BTreeMap, HashMap};
 use std::rc::Rc;
 
+use storage::protocol::{
+    BlockCount, BlockState, BufferPoolListing, CopyListing, GroupListing, Waiting,
+};
 use storage::runtime::Tier;
 
 use super::{Block, BufferPool, ClientId, Copy, Deferred, Held, QueueId, SLOT, Target};
-
-/// What a block is observed as, from who holds it.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
-pub enum Observed {
-    Shared,
-    Private,
-    Retired,
-}
 
 impl BufferPool {
     /// Whether what a copy writes for still exists.
@@ -33,9 +28,9 @@ impl BufferPool {
     /// shared (an entry of the cache), private (an owner's slot or private
     /// entry, a waiting commit, a copy writing it for a target that exists)
     /// and retired (only deferred releases, ended copies and reads).
-    fn blocks(&self) -> Vec<(&Rc<Block>, Observed, usize)> {
-        let mut found: HashMap<*const Block, (&Rc<Block>, Observed, usize)> = HashMap::new();
-        let mut hold = |block, observed: Observed| {
+    pub(super) fn blocks(&self) -> Vec<(&Rc<Block>, BlockState, usize)> {
+        let mut found: HashMap<*const Block, (&Rc<Block>, BlockState, usize)> = HashMap::new();
+        let mut hold = |block, observed: BlockState| {
             let entry = found
                 .entry(Rc::as_ptr(block))
                 .or_insert((block, observed, 0));
@@ -45,16 +40,16 @@ impl BufferPool {
 
         for entry in self.cache.values() {
             for (block, _) in entry.device.iter().chain(&entry.host) {
-                hold(block, Observed::Shared);
+                hold(block, BlockState::Shared);
             }
         }
         for owner in self.owners.values() {
-            hold(&owner.slot, Observed::Private);
+            hold(&owner.slot, BlockState::Private);
             for held in owner.tables.iter().flat_map(BTreeMap::values) {
                 match held {
-                    Held::Private(block) => hold(block, Observed::Private),
+                    Held::Private(block) => hold(block, BlockState::Private),
                     // A pin: the block is shared by its entry of the cache.
-                    Held::Shared(block) => hold(block, Observed::Retired),
+                    Held::Shared(block) => hold(block, BlockState::Retired),
                 }
             }
         }
@@ -62,23 +57,27 @@ impl BufferPool {
             match work {
                 Deferred::Release { blocks } => blocks
                     .iter()
-                    .for_each(|block| hold(block, Observed::Retired)),
-                Deferred::Commit { block, .. } => hold(block, Observed::Private),
+                    .for_each(|block| hold(block, BlockState::Retired)),
+                Deferred::Commit { block, .. } => hold(block, BlockState::Private),
                 Deferred::Transfer { .. } | Deferred::Finish { .. } => {}
             }
+        }
+        // A peer's hold reads a cached block, as a pin does.
+        for block in self.peers.values().flatten() {
+            hold(block, BlockState::Retired);
         }
         for ((queue, _), copies) in &self.copies {
             for copy in copies {
                 copy.reads
                     .iter()
-                    .for_each(|block| hold(block, Observed::Retired));
+                    .for_each(|block| hold(block, BlockState::Retired));
                 let written = self.target_exists(queue.0, &copy.to) && !written_in_place(copy);
                 hold(
                     &copy.write,
                     if written {
-                        Observed::Private
+                        BlockState::Private
                     } else {
-                        Observed::Retired
+                        BlockState::Retired
                     },
                 );
             }
@@ -95,7 +94,7 @@ fn written_in_place(copy: &Copy) -> bool {
 
 impl BufferPool {
     /// The number of blocks in each observed state, per region and class.
-    pub fn counts(&self) -> BTreeMap<(u8, u8, Observed), u32> {
+    pub fn counts(&self) -> BTreeMap<(u8, u8, BlockState), u32> {
         let mut counts = BTreeMap::new();
         for (block, observed, _) in self.blocks() {
             *counts
@@ -103,6 +102,66 @@ impl BufferPool {
                 .or_default() += 1;
         }
         counts
+    }
+
+    /// What the pool of `deployment` exports to an operator: per region and
+    /// class the blocks in each observed state, every group of an open
+    /// session with the stamps of what waits on it, and every request whose
+    /// copies are in flight. A transfer that waits for a copy to end waits
+    /// at stamp 0.
+    pub fn listing(&self, deployment: &str) -> BufferPoolListing {
+        let blocks = self
+            .counts()
+            .into_iter()
+            .map(|((region, class, state), blocks)| {
+                let region = self.region_name(region).unwrap_or_default().to_owned();
+                let class = (class != SLOT).then_some(class);
+                BlockCount {
+                    region,
+                    class,
+                    state,
+                    blocks,
+                }
+            });
+        let waiting = |work: &Deferred| match work {
+            Deferred::Release { .. } => Waiting::Release,
+            Deferred::Commit { .. } => Waiting::Commit,
+            Deferred::Transfer { .. } => Waiting::Transfer,
+            Deferred::Finish { .. } => Waiting::Finish,
+        };
+        let mut groups: Vec<GroupListing> = self
+            .groups
+            .iter()
+            .map(|((client, group), found)| GroupListing {
+                epoch: self.epoch(*client).unwrap_or_default(),
+                group: group.0,
+                completed: found.completed,
+                waiting: found
+                    .deferred
+                    .iter()
+                    .map(|(stamp, work)| (*stamp, waiting(work)))
+                    .collect(),
+            })
+            .collect();
+        groups.sort_by_key(|group| (group.epoch, group.group));
+        let mut copies: Vec<CopyListing> = self
+            .copies
+            .iter()
+            .map(|((queue, request), copies)| CopyListing {
+                epoch: self.epoch(queue.0),
+                scheduler: queue.1,
+                request: request.0,
+                copies: copies.len() as u32,
+                deadline: copies.first().and_then(|copy| copy.deadline),
+            })
+            .collect();
+        copies.sort_by_key(|copy| (copy.epoch, copy.scheduler, copy.request));
+        BufferPoolListing {
+            deployment: deployment.to_owned(),
+            blocks: blocks.collect(),
+            groups,
+            copies,
+        }
     }
 
     /// What `Open` states of a region: its tier, the bytes of a unit, and
@@ -143,6 +202,7 @@ impl BufferPool {
                 blocks.iter().for_each(&mut pass);
             }
         }
+        self.peers.values().flatten().for_each(&mut pass);
         for ((of, _), copies) in &self.copies {
             for copy in copies {
                 copy.reads.iter().for_each(&mut pass);
@@ -239,7 +299,7 @@ impl BufferPool {
         }
         let cached = |block: &Rc<Block>| {
             blocks.iter().any(|(other, observed, _)| {
-                Rc::ptr_eq(other, block) && *observed == Observed::Shared
+                Rc::ptr_eq(other, block) && *observed == BlockState::Shared
             })
         };
         for (block, _, _) in &blocks {
@@ -249,6 +309,16 @@ impl BufferPool {
                     "block {:?} is private in {places} places, cached {}",
                     block.stated().next(),
                     cached(block)
+                ));
+            }
+        }
+
+        // A peer holds only host copies of the cache.
+        for (peer, held) in &self.peers {
+            if let Some(block) = held.iter().find(|block| !cached(block)) {
+                return Err(format!(
+                    "peer {peer} holds block {:?}, which is not cached",
+                    block.stated().next()
                 ));
             }
         }

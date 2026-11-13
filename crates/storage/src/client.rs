@@ -25,10 +25,12 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::{Error, Result};
 use crate::protocol::{
-    Claim, ClientMessage, Event, Hello, Item, Key, Link, Listing, Location, Mode, PeerPool,
-    Priority, Quota, Region, Registration, Request, Response, Role, Scope, ServerMessage, Span,
-    StorageRecord, TaskStatus, TensorRecord, Tensors, Throttle, Usage, VERSION, Welcome,
+    Claim, ClientMessage, Event, Hello, HostCopy, Item, Key, Link, Listing, Location, Mode,
+    PeerPool, Priority, Quota, Region, RegionPart, Registration, Request, Response, Role, Scope,
+    ServerMessage, Span, StorageRecord, TaskStatus, TensorRecord, Tensors, Throttle, UnitRun,
+    Usage, VERSION, Welcome,
 };
+use crate::runtime::{Open, Opened};
 use crate::transport::Connection;
 
 /// A connection to a Storage Server.
@@ -571,6 +573,101 @@ impl Client {
         match self.request(&Request::Retire { deployment }, &[])?.0 {
             Response::Retired { released } => Ok(released),
             other => Err(unexpected("retire", &other)),
+        }
+    }
+
+    /// See [`Request::Open`]: open the epoch's session with the buffer
+    /// pool. Returns the answer and one queue pair's memfd per scheduler,
+    /// in the order the layout lists them, each for
+    /// [`QueuePair::open`](crate::QueuePair::open) as the engine's end.
+    pub fn open_pool(&mut self, open: Open) -> Result<(Opened, Vec<OwnedFd>)> {
+        let schedulers = open.schedulers.len();
+        match self.request(&Request::Open(open), &[])? {
+            (Response::Opened(opened), descriptors) => {
+                if descriptors.len() != schedulers || opened.registers.len() != schedulers {
+                    return Err(Error::Protocol(format!(
+                        "{schedulers} schedulers were answered with {} queue pairs",
+                        descriptors.len()
+                    )));
+                }
+                Ok((opened, descriptors))
+            }
+            (other, _) => Err(unexpected("open", &other)),
+        }
+    }
+
+    /// See [`Request::Close`]: the epoch's executors have stopped.
+    pub fn close_pool(&mut self) -> Result<()> {
+        match self.request(&Request::Close, &[])?.0 {
+            Response::Closed => Ok(()),
+            other => Err(unexpected("close", &other)),
+        }
+    }
+
+    /// See [`Request::Place`]: where this rank's part of the units of the
+    /// device region `region` lies in the device memory `memory`.
+    pub fn place(&mut self, region: String, memory: String, runs: Vec<UnitRun>) -> Result<()> {
+        let request = Request::Place {
+            region,
+            memory,
+            runs,
+        };
+        match self.request(&request, &[])?.0 {
+            Response::Placed => Ok(()),
+            other => Err(unexpected("place", &other)),
+        }
+    }
+
+    /// See [`Request::HostPart`]: this rank's part of the host region
+    /// `region`, `bytes` of every unit. Returns the part's units and its
+    /// memfd.
+    pub fn host_part(
+        &mut self,
+        region: String,
+        bytes: u64,
+        numa_node: Option<u32>,
+    ) -> Result<(u32, OwnedFd)> {
+        let request = Request::HostPart {
+            region,
+            bytes,
+            numa_node,
+        };
+        match self.request(&request, &[])? {
+            (Response::HostPart { units }, descriptors) => {
+                let descriptor = descriptors.into_iter().next().ok_or_else(|| {
+                    Error::Protocol("a host region's part arrived without its memfd".into())
+                })?;
+                Ok((units, descriptor))
+            }
+            (other, _) => Err(unexpected("host part", &other)),
+        }
+    }
+
+    /// See [`Request::PeerHold`]: hold the host copies of `keys` in
+    /// `deployment`'s buffer pool for this connection, a [`Role::Peer`].
+    /// Returns the copies held and the parts of their host regions.
+    pub fn peer_hold(
+        &mut self,
+        deployment: String,
+        keys: Vec<Key>,
+    ) -> Result<(Vec<HostCopy>, Vec<RegionPart>)> {
+        match self
+            .request(&Request::PeerHold { deployment, keys }, &[])?
+            .0
+        {
+            Response::PeerHeld { copies, parts } => Ok((copies, parts)),
+            other => Err(unexpected("peer hold", &other)),
+        }
+    }
+
+    /// See [`Request::PeerRelease`]: end this connection's holds in
+    /// `deployment`'s buffer pool. Returns whether they stood until now
+    /// ([`Response::Valid`]), so what was read under them is valid.
+    pub fn peer_release(&mut self, deployment: String) -> Result<bool> {
+        match self.request(&Request::PeerRelease { deployment }, &[])?.0 {
+            Response::Valid => Ok(true),
+            Response::Gone => Ok(false),
+            other => Err(unexpected("peer release", &other)),
         }
     }
 }

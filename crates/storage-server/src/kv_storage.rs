@@ -41,6 +41,17 @@ pub(super) enum Task {
         pages: Vec<(Key, u32)>,
         keys: Vec<Key>,
     },
+    /// The pages of a buffer pool task (the server's number `number`) in
+    /// one part of a host region, the connector's pool `pool`: written to
+    /// the KV storage when `upload`, read from it otherwise. `keys` names,
+    /// for each page, the copy of the task it is part of.
+    Blocks {
+        number: u64,
+        pool: u64,
+        pages: Vec<(Key, u32)>,
+        keys: Vec<usize>,
+        upload: bool,
+    },
 }
 
 /// The connector process and its connection.

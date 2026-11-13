@@ -22,6 +22,9 @@ use super::{
 /// The deadline of a task that was told to stop: it has no further one.
 const STOPPING: u64 = u64::MAX;
 
+/// Runs of units as a completion states them.
+pub(super) type Runs = Vec<storage::runtime::Run>;
+
 impl BufferPool {
     /// The tasks to start since the last call.
     pub fn started(&mut self) -> Vec<(QueueId, RequestId)> {
@@ -34,17 +37,14 @@ impl BufferPool {
         std::mem::take(&mut self.stopped)
     }
 
-    /// What a task copies: per copy, the key it is for if any, and the runs
-    /// it reads and writes. A transfer's copies read and write the same
-    /// runs, in the memory of the owner's group and of the target group.
-    pub fn work(
-        &self,
-        task: (QueueId, RequestId),
-    ) -> Vec<(
-        Option<Key>,
-        Vec<storage::runtime::Run>,
-        Vec<storage::runtime::Run>,
-    )> {
+    /// What a task copies: per copy, the key it is for if any, the runs it
+    /// reads and writes, the memories that hold the content it reads and
+    /// the memory it writes, as bits of a block's validity. A transfer's
+    /// copies have no key and read and write the same runs, from a memory
+    /// of the owner's group into the target group's, and its last copy
+    /// takes the slot row in the target group; a prefetch's copies read
+    /// nothing; a put's read and write the host block it puts.
+    pub fn work(&self, task: (QueueId, RequestId)) -> Vec<(Option<Key>, Runs, Runs, u8, u8)> {
         let copies = self.copies.get(&task).map_or(&[][..], Vec::as_slice);
         let stated = |copy: &Copy| {
             let key = match copy.to {
@@ -52,13 +52,20 @@ impl BufferPool {
                 _ => None,
             };
             // A transfer's last copy also holds the blocks it does not copy.
-            let reads = copy
-                .reads
-                .first()
-                .map_or_else(Vec::new, |block| block.stated().collect());
-            (key, reads, copy.write.stated().collect())
+            let read = copy.reads.first();
+            let reads = read.map_or_else(Vec::new, |block| block.stated().collect());
+            let memories = read.map_or(0, |block| block.valid.get());
+            let writes = copy.write.stated().collect();
+            (key, reads, writes, memories, copy.memory)
         };
         copies.iter().map(stated).collect()
+    }
+
+    /// Whether a task is outstanding: started and not ended, or not yet
+    /// handed to whoever runs it. A restart in place waits until none is.
+    pub fn tasks(&self) -> bool {
+        let task = |copies: &Vec<Copy>| copies.iter().any(|copy| copy.deadline.is_some());
+        !self.started.is_empty() || !self.stopped.is_empty() || self.copies.values().any(task)
     }
 
     /// A transfer waits for its stamps: until then the source group's

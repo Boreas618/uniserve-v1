@@ -17,6 +17,8 @@ platform.workspace = true
 libc.workspace = true
 mooncake_store.workspace = true
 nixl.workspace = true
+rmp-serde.workspace = true
+serde_bytes.workspace = true
 rustix = { workspace = true, features = ["event", "fs", "mm", "net", "pipe", "process", "time"] }
 serde.workspace = true
 service.workspace = true

@@ -3,15 +3,18 @@
 //! A [`Run`] is the only thing that stands for units: it is made when a
 //! region is created, it is split and joined, and it is never cloned, so a
 //! unit is in one run at a time and a run is in one place at a time: a
-//! region's free list, the runs outside the region, or one block.
+//! region's free list, the runs outside the region, or one block. A pool
+//! made again from its image ([`super::image`]) makes its runs again from
+//! the image's, and the pool the image was taken of is not used afterwards.
 
 use std::collections::BTreeMap;
 
+use serde::{Deserialize, Serialize};
 use storage::protocol::Key;
 use storage::runtime::Tier;
 
 /// A contiguous range of units of one region.
-#[derive(Debug)]
+#[derive(Debug, Serialize, Deserialize)]
 pub(crate) struct Run {
     region: u8,
     first: u32,
@@ -58,7 +61,11 @@ impl Run {
 /// occupies the bytes from `i * unit_bytes` of the region's memory, which
 /// regions of other layouts may occupy too, so a unit enters the region only
 /// when its bytes are in no other region (R10).
+#[derive(Serialize, Deserialize)]
 pub(crate) struct Region {
+    /// The name sessions state it under: a region another session states
+    /// under the same name is this region.
+    pub(crate) name: String,
     pub(crate) tier: Tier,
     /// The memory space whose bytes the region's units occupy; regions of
     /// two layouts over the same memory state the same space.
@@ -85,8 +92,10 @@ impl Region {
     /// A region of `limit` units numbered from 0, of which those from
     /// `reserved` to `reserved + units` are in the region and free; the units
     /// before `reserved` are never allocated, and the rest are outside.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         id: u8,
+        name: &str,
         tier: Tier,
         space: u8,
         unit_bytes: u64,
@@ -95,6 +104,7 @@ impl Region {
         limit: u32,
     ) -> Self {
         let mut region = Self {
+            name: name.to_owned(),
             tier,
             space,
             unit_bytes,
@@ -285,45 +295,9 @@ impl Region {
 
 #[cfg(test)]
 impl Region {
-    /// A second region in the same state, for a second buffer pool: the
-    /// enumeration of request sequences branches from a state this way.
-    pub(super) fn duplicate(&self) -> Self {
-        let runs = |runs: &BTreeMap<u32, Run>| {
-            runs.iter()
-                .map(|(first, run)| (*first, run.duplicate()))
-                .collect()
-        };
-        Self {
-            tier: self.tier,
-            space: self.space,
-            unit_bytes: self.unit_bytes,
-            free: runs(&self.free),
-            outside: runs(&self.outside),
-            units: self.units,
-            span: self.span,
-            returned: self.returned.clone(),
-            orders: self.orders.clone(),
-        }
-    }
-}
-
-#[cfg(test)]
-impl Region {
     /// The rows given back and not taken again, the last one last.
     pub(super) fn returned(&self) -> &[u32] {
         &self.returned
-    }
-}
-
-#[cfg(test)]
-impl Run {
-    /// The same units for a second buffer pool; see [`Region::duplicate`].
-    pub(super) fn duplicate(&self) -> Self {
-        Self {
-            region: self.region,
-            first: self.first,
-            count: self.count,
-        }
     }
 }
 
@@ -352,7 +326,7 @@ mod tests {
     use super::*;
 
     fn region(units: u32, limit: u32) -> Region {
-        Region::new(0, Tier::Device, 0, 64, 1, units, limit)
+        Region::new(0, "units", Tier::Device, 0, 64, 1, units, limit)
     }
 
     #[test]

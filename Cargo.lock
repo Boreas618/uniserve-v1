@@ -1234,6 +1234,7 @@ dependencies = [
  "proto",
  "qwen3",
  "scheduler",
+ "scheduling-guest",
  "serde_json",
  "service",
  "storage",
@@ -1242,6 +1243,7 @@ dependencies = [
  "toml",
  "tracing",
  "uniserve-tensor",
+ "wasmtime",
  "worker",
 ]
 
@@ -4348,8 +4350,10 @@ dependencies = [
  "mooncake_store",
  "nixl",
  "platform",
+ "rmp-serde",
  "rustix",
  "serde",
+ "serde_bytes",
  "serde_json",
  "service",
  "storage",

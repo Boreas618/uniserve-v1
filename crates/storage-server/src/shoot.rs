@@ -7,6 +7,11 @@
 //! process that has not left a GPU by the deadline is a failed shoot-down:
 //! it keeps its access, and the requests that waited for it fail.
 //!
+//! The same evidence closes the session of an engine that is gone
+//! ([`crate::sessions`]): the server follows its processes without killing
+//! them ([`ShootDowns::follow`]), and a process is out once it has exited
+//! and no GPU lists it. The deadline then runs from its exit.
+//!
 //! Processes are identified by their pidfd, never by a process id alone, so
 //! a reused id is never mistaken for a process that was shot down.
 
@@ -26,7 +31,11 @@ struct ShootDown {
     pidfd: Arc<OwnedFd>,
     gpus: Vec<[u8; 16]>,
     exited: bool,
+    /// When the process was killed, or for a process followed when it was
+    /// seen to exit: the deadline runs from then.
     started: Instant,
+    /// Whether the server killed the process, or only follows it.
+    killed: bool,
 }
 
 /// The shoot-downs in progress and their results.
@@ -75,7 +84,48 @@ impl ShootDowns {
             gpus,
             exited: false,
             started: Instant::now(),
+            killed: true,
         });
+    }
+
+    /// Follow the process behind `pidfd`, without killing it, until it has
+    /// exited and left `gpus`. A process already followed or out is not
+    /// followed again.
+    pub(super) fn follow(&mut self, pid: i32, pidfd: Arc<OwnedFd>, gpus: Vec<[u8; 16]>) {
+        let known = |list: &[Arc<OwnedFd>]| list.iter().any(|other| Arc::ptr_eq(other, &pidfd));
+        if known(&self.finished)
+            || known(&self.failed)
+            || self
+                .running
+                .iter()
+                .any(|shot| Arc::ptr_eq(&shot.pidfd, &pidfd))
+        {
+            return;
+        }
+        self.running.push(ShootDown {
+            pid,
+            pidfd,
+            gpus,
+            exited: false,
+            started: Instant::now(),
+            killed: false,
+        });
+    }
+
+    /// The processes followed that have not left, with their GPUs, as a
+    /// restart in place passes them over.
+    pub(super) fn followed(&self) -> Vec<(i32, Arc<OwnedFd>, Vec<[u8; 16]>)> {
+        self.running
+            .iter()
+            .filter(|shot| !shot.killed)
+            .map(|shot| (shot.pid, Arc::clone(&shot.pidfd), shot.gpus.clone()))
+            .collect()
+    }
+
+    /// Whether a process the server killed has not left yet: a restart in
+    /// place waits for it.
+    pub(super) fn killing(&self) -> bool {
+        self.running.iter().any(|shot| shot.killed)
     }
 
     /// The pidfds of victims that have not exited, which become readable
@@ -89,9 +139,10 @@ impl ShootDowns {
     }
 
     /// Whether a shoot-down waits on something no descriptor signals: NVML,
-    /// or its deadline.
+    /// or its deadline. A process followed that has not exited waits on its
+    /// pidfd.
     pub(super) fn polling(&self) -> bool {
-        !self.running.is_empty()
+        self.running.iter().any(|shot| shot.killed || shot.exited)
     }
 
     /// Follow every running shoot-down. Returns whether any ended.
@@ -102,6 +153,9 @@ impl ShootDowns {
             if !shot.exited {
                 let mut fd = [PollFd::new(shot.pidfd.as_ref(), PollFlags::IN)];
                 shot.exited = matches!(poll(&mut fd, Some(&rustix::time::Timespec::default())), Ok(count) if count > 0);
+                if shot.exited && !shot.killed {
+                    shot.started = Instant::now();
+                }
             }
             let out = shot.exited
                 && shot.gpus.iter().all(|gpu| match listed(*gpu, shot.pid) {
@@ -115,11 +169,12 @@ impl ShootDowns {
                 tracing::info!(
                     pid = shot.pid,
                     elapsed_ms = shot.started.elapsed().as_millis() as u64,
-                    "a previous writer is out"
+                    killed = shot.killed,
+                    "a process is out"
                 );
                 self.finished.push(shot.pidfd);
                 ended = true;
-            } else if shot.started.elapsed() > DEADLINE {
+            } else if (shot.killed || shot.exited) && shot.started.elapsed() > DEADLINE {
                 tracing::error!(
                     pid = shot.pid,
                     exited = shot.exited,

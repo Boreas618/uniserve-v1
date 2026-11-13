@@ -301,6 +301,7 @@ impl Server {
                 tensors: 0,
                 moved_from,
                 moving: true,
+                part: false,
             },
         );
         id

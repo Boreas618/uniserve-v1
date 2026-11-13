@@ -9,15 +9,14 @@
 //! `completed` goes up to 1, a sequence makes as many copies as the shape
 //! states, and one prefetch or put is in flight at a time.
 
-use std::cell::Cell;
-use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fmt::Write as _;
 use std::rc::Rc;
 
 use storage::protocol::Key;
 use storage::runtime::{Completion, GroupId, OwnerId, Request, RequestId, Source, Stamps, Tier};
 
-use super::{Block, BufferPool, Class, Copy, Deferred, Entry, Group, Held, Owner, Target};
+use super::{Block, BufferPool, Class, Copy, Deferred, Held, Target};
 
 const KV: u8 = 0;
 const TRAJECTORY: u8 = 1;
@@ -160,11 +159,36 @@ impl Driver {
         for space in 0..=host {
             pool.grant(space, 0, 1 << 16);
         }
-        pool.open_region(Tier::Device, 0, 64, 1, shape.units, shape.units + 1);
+        pool.open_region(
+            "units",
+            Tier::Device,
+            0,
+            64,
+            1,
+            shape.units,
+            shape.units + 1,
+        );
         for group in 0..shape.groups {
-            pool.open_region(Tier::Device, group + 1, 8, 1, shape.rows, shape.rows + 1);
+            let rows = format!("rows {group}");
+            pool.open_region(
+                &rows,
+                Tier::Device,
+                group + 1,
+                8,
+                1,
+                shape.rows,
+                shape.rows + 1,
+            );
         }
-        pool.open_region(Tier::Host, host, 64, 0, shape.host_units, shape.host_units);
+        pool.open_region(
+            "host",
+            Tier::Host,
+            host,
+            64,
+            0,
+            shape.host_units,
+            shape.host_units,
+        );
         let groups = (0..shape.groups).map(|group| {
             (
                 GroupId(group),
@@ -195,167 +219,13 @@ impl Driver {
     }
 
     /// A second driver in the same state: the enumeration branches from a
-    /// state without replaying the steps that led to it.
+    /// state without replaying the steps that led to it, by making the
+    /// pool again from its image.
     fn duplicate(&self) -> Self {
-        let pool = &self.pool;
-        let mut blocks: HashMap<*const Block, Rc<Block>> = HashMap::new();
-        let mut block = |block: &Rc<Block>| {
-            let copy = || {
-                let runs = block.runs.iter().map(super::Run::duplicate).collect();
-                Rc::new(Block {
-                    class: block.class,
-                    runs,
-                    valid: Cell::new(block.valid.get()),
-                })
-            };
-            Rc::clone(blocks.entry(Rc::as_ptr(block)).or_insert_with(copy))
-        };
-
-        let mut copy = BufferPool::new(pool.limits);
-        for (client, (classes, trajectory)) in &pool.classes {
-            let classes = classes.iter().map(|class| Class {
-                units: class.units,
-                host: class.host,
-                state_in_slot: class.state_in_slot,
-            });
-            copy.classes
-                .insert(*client, (classes.collect(), *trajectory));
-        }
-        copy.regions = pool.regions.iter().map(super::Region::duplicate).collect();
-        copy.quota = pool.quota.clone();
-        for (key, entry) in &pool.cache {
-            let device = entry
-                .device
-                .iter()
-                .map(|(held, maker)| (block(held), *maker))
-                .collect();
-            let host = entry
-                .host
-                .as_ref()
-                .map(|(held, maker)| (block(held), *maker));
-            copy.cache.insert(
-                *key,
-                Entry {
-                    class: entry.class,
-                    device,
-                    host,
-                    tokens: entry.tokens,
-                    remote: entry.remote,
-                },
-            );
-        }
-        for (id, owner) in &pool.owners {
-            let mut table = |table: &BTreeMap<u32, Held>| {
-                let mut entry = |held: &Held| match held {
-                    Held::Private(held) => Held::Private(block(held)),
-                    Held::Shared(held) => Held::Shared(block(held)),
-                };
-                table
-                    .iter()
-                    .map(|(position, held)| (*position, entry(held)))
-                    .collect()
-            };
-            let tables = owner.tables.iter().map(&mut table).collect();
-            copy.owners.insert(
-                *id,
-                Owner {
-                    group: owner.group,
-                    slot: block(&owner.slot),
-                    tables,
-                    moving: owner.moving,
-                },
-            );
-        }
-        for (id, group) in &pool.groups {
-            let mut work = |work: &Deferred| match work {
-                Deferred::Release { blocks } => Deferred::Release {
-                    blocks: blocks.iter().map(&mut block).collect(),
-                },
-                Deferred::Commit {
-                    queue,
-                    request,
-                    owner,
-                    class,
-                    at,
-                    block: held,
-                    key,
-                    tokens,
-                    rest,
-                } => Deferred::Commit {
-                    queue: *queue,
-                    request: *request,
-                    owner: *owner,
-                    class: *class,
-                    at: *at,
-                    block: block(held),
-                    key: *key,
-                    tokens: *tokens,
-                    rest: rest.clone(),
-                },
-                Deferred::Transfer {
-                    queue,
-                    request,
-                    owner,
-                    to,
-                    rest,
-                } => Deferred::Transfer {
-                    queue: *queue,
-                    request: *request,
-                    owner: *owner,
-                    to: *to,
-                    rest: rest.clone(),
-                },
-                Deferred::Finish {
-                    queue,
-                    request,
-                    copy,
-                    ok,
-                    rest,
-                } => Deferred::Finish {
-                    queue: *queue,
-                    request: *request,
-                    copy: *copy,
-                    ok: *ok,
-                    rest: rest.clone(),
-                },
-            };
-            let deferred = group
-                .deferred
-                .iter()
-                .map(|(stamp, deferred)| (*stamp, work(deferred)))
-                .collect();
-            let regions = group.regions.clone();
-            copy.groups.insert(
-                *id,
-                Group {
-                    memory: group.memory,
-                    slots: group.slots,
-                    regions,
-                    completed: group.completed,
-                    deferred,
-                },
-            );
-        }
-        for (id, copies) in &pool.copies {
-            let mut one = |held: &Copy| Copy {
-                memory: held.memory,
-                reads: held.reads.iter().map(&mut block).collect(),
-                write: block(&held.write),
-                to: held.to,
-                fill: held.fill,
-                deadline: held.deadline,
-            };
-            copy.copies
-                .insert(*id, copies.iter().map(&mut one).collect());
-        }
-        copy.answers = pool.answers.clone();
-        copy.sessions = pool.sessions.clone();
-        copy.trial = pool.trial.clone();
-        copy.numbers = pool.numbers.clone();
-        copy.now = pool.now;
+        let image = rmp_serde::to_vec(&self.pool).unwrap();
         Self {
             shape: self.shape,
-            pool: copy,
+            pool: rmp_serde::from_slice(&image).unwrap(),
             number: self.number,
             copies: self.copies,
         }

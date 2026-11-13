@@ -18,8 +18,15 @@
 //!
 //! The rules R1 to R10 of the design are guards of this module; each is
 //! marked where it stands. The design model is `verification/buffer-pool`.
+//!
+//! The types that hold blocks take the reference to a block as a parameter,
+//! a shared `Rc<Block>` by default: the pool's whole state also travels as
+//! an image ([`image`]), in which the same types name each block by its
+//! index in one list of blocks, and from which a pool is made again.
 
 mod copies;
+mod image;
+mod peers;
 mod region;
 mod sessions;
 mod state;
@@ -29,10 +36,14 @@ use std::cell::Cell;
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::rc::Rc;
 
+use serde::{Deserialize, Serialize};
 use storage::protocol::Key;
 use storage::runtime::{Cause, Completion, GroupId, OwnerId, Request, RequestId, Stamps};
 
 use region::{Region, Run};
+/// A kind of block, as a session states it in its layout; the pool keeps
+/// its host region by the pool's number of that region.
+pub use storage::runtime::Class;
 
 /// A session: an engine epoch's.
 pub type ClientId = u32;
@@ -51,18 +62,12 @@ const SLOT: u8 = u8::MAX;
 /// its region reads it.
 const EVERYWHERE: u8 = u8::MAX;
 
-/// A kind of block.
-pub struct Class {
-    /// The units of one block; 0 when the request states the size.
-    pub units: u32,
-    /// The host region of the class's host copies and the units of one; 0
-    /// units when a host copy takes the units that hold the block's bytes.
-    pub host: Option<(u8, u32)>,
-    /// Whether the class's live state is in the slot, which a clone cannot copy.
-    pub state_in_slot: bool,
-}
+/// The most device memories a deployment's sessions state: one bit each in
+/// a block's validity.
+const MEMORIES: usize = 8;
 
 /// A block's memory: one run, or one run per backing rank of a product.
+#[derive(Serialize, Deserialize)]
 struct Block {
     class: u8,
     runs: Vec<Run>,
@@ -88,9 +93,10 @@ impl Block {
 }
 
 /// One entry of an owner's table.
-enum Held {
-    Private(Rc<Block>),
-    Shared(Rc<Block>),
+#[derive(Serialize, Deserialize)]
+enum Held<B = Rc<Block>> {
+    Private(B),
+    Shared(B),
 }
 
 impl Held {
@@ -108,24 +114,26 @@ impl Held {
 }
 
 /// A request's attachment to one worker group.
-struct Owner {
+#[derive(Serialize, Deserialize)]
+struct Owner<B = Rc<Block>> {
     group: GroupId,
-    slot: Rc<Block>,
+    slot: B,
     /// Per class, by position.
-    tables: Vec<BTreeMap<u32, Held>>,
+    tables: Vec<BTreeMap<u32, Held<B>>>,
     /// Whether its transfer waits or runs: it then takes only a detach.
     moving: bool,
 }
 
 /// A key's content, per tier.
-struct Entry {
+#[derive(Serialize, Deserialize)]
+struct Entry<B = Rc<Block>> {
     class: u8,
     /// One per region that holds a device copy: the block and the epoch on
     /// trial that made it, to which alone it is visible until its update
     /// is committed.
-    device: Vec<(Rc<Block>, Option<u64>)>,
+    device: Vec<(B, Option<u64>)>,
     /// The host copy, with the epoch on trial that made it.
-    host: Option<(Rc<Block>, Option<u64>)>,
+    host: Option<(B, Option<u64>)>,
     /// 64, or fewer for a request's last block.
     tokens: u16,
     /// The remote store acknowledged a copy.
@@ -144,31 +152,38 @@ impl Entry {
 
 /// Work that waits until a worker group's `completed` reaches a stamp. The
 /// stamps of the other groups it still waits for are `rest`.
-enum Deferred {
+#[derive(Serialize, Deserialize)]
+enum Deferred<B = Rc<Block>> {
     Release {
-        blocks: Vec<Rc<Block>>,
+        blocks: Vec<B>,
     },
     Commit {
         queue: QueueId,
+        #[serde(with = "image::request_id")]
         request: RequestId,
+        #[serde(with = "image::owner_id")]
         owner: OwnerId,
         class: u8,
         at: u32,
-        block: Rc<Block>,
+        block: B,
         key: Key,
         tokens: u16,
         rest: Stamps,
     },
     Transfer {
         queue: QueueId,
+        #[serde(with = "image::request_id")]
         request: RequestId,
+        #[serde(with = "image::owner_id")]
         owner: OwnerId,
         to: GroupId,
         rest: Stamps,
     },
     Finish {
         queue: QueueId,
+        #[serde(with = "image::request_id")]
         request: RequestId,
+        #[serde(with = "image::request_id")]
         copy: RequestId,
         ok: bool,
         rest: Stamps,
@@ -176,7 +191,8 @@ enum Deferred {
 }
 
 /// One worker group of one engine epoch.
-struct Group {
+#[derive(Serialize, Deserialize)]
+struct Group<B = Rc<Block>> {
     /// The device memory its ranks address, as a bit of a block's validity.
     memory: u8,
     /// The region of its slot rows.
@@ -187,15 +203,16 @@ struct Group {
     /// The last batch whose end its executor has seen, as last read.
     completed: u64,
     /// What waits on it, in order of stamp.
-    deferred: VecDeque<(u64, Deferred)>,
+    deferred: VecDeque<(u64, Deferred<B>)>,
 }
 
 /// Where the result of a copy goes.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Serialize, Deserialize)]
 enum Target {
     /// An entry of an owner's table: a private clone, or with a key a block
     /// that is cached and pinned for the owner.
     Owner {
+        #[serde(with = "image::owner_id")]
         owner: OwnerId,
         class: u8,
         at: u32,
@@ -204,21 +221,29 @@ enum Target {
     /// A cache entry's copy on the host, or in the remote store.
     Entry { key: Key, remote: bool },
     /// The owner's slot, restored from a stored trajectory.
-    Slot { owner: OwnerId },
+    Slot {
+        #[serde(with = "image::owner_id")]
+        owner: OwnerId,
+    },
     /// The memory of the group an owner is transferred to.
-    Group { owner: OwnerId, to: GroupId },
+    Group {
+        #[serde(with = "image::owner_id")]
+        owner: OwnerId,
+        to: GroupId,
+    },
 }
 
 /// A copy in flight, run by an executor, the Transfer Server or the
 /// connector. It holds what it reads and what it writes until it has ended.
-struct Copy {
+#[derive(Serialize, Deserialize)]
+struct Copy<B = Rc<Block>> {
     /// The memory it writes, as a bit of a block's validity; 0 when it
     /// writes a block whose units exist once.
     memory: u8,
-    reads: Vec<Rc<Block>>,
+    reads: Vec<B>,
     /// The block it writes. A put to the remote store writes no block: this
     /// is the host block it reads.
-    write: Rc<Block>,
+    write: B,
     to: Target,
     /// Whether it fills one more memory of a block that others may read.
     fill: bool,
@@ -232,6 +257,11 @@ pub struct BufferPool {
     /// Per session, its classes and which of them holds stored trajectories.
     classes: HashMap<ClientId, (Vec<Class>, u8)>,
     regions: Vec<Region>,
+    /// The names of the memory spaces the sessions stated, by number.
+    spaces: Vec<String>,
+    /// The names of the device memories the sessions' groups stated, by
+    /// their bit in a block's validity; at most [`MEMORIES`].
+    memories: Vec<String>,
     /// Per memory space, the byte ranges in no region: the deployment's free quota there.
     quota: Vec<BTreeMap<u64, u64>>,
     cache: HashMap<Key, Entry>,
@@ -257,6 +287,9 @@ pub struct BufferPool {
     /// Transfer Server or the connector.
     started: Vec<(QueueId, RequestId)>,
     stopped: Vec<(QueueId, RequestId)>,
+    /// The host copies each peer, another host's Storage Server, holds for
+    /// its reads, by the peer's connection: holders like any other.
+    peers: HashMap<u64, Vec<Rc<Block>>>,
 }
 
 impl BufferPool {
@@ -266,6 +299,8 @@ impl BufferPool {
         Self {
             classes: HashMap::new(),
             regions: Vec::new(),
+            spaces: Vec::new(),
+            memories: Vec::new(),
             quota: Vec::new(),
             cache: HashMap::new(),
             owners: HashMap::new(),
@@ -280,7 +315,14 @@ impl BufferPool {
             completions: Vec::new(),
             started: Vec::new(),
             stopped: Vec::new(),
+            peers: HashMap::new(),
         }
+    }
+
+    /// Whether deferred work waits for a group's `completed` word: the
+    /// buffer pool's thread then keeps reading the words.
+    pub fn deferred(&self) -> bool {
+        self.groups.values().any(|group| !group.deferred.is_empty())
     }
 
     /// The completions produced since the last call, for their queue pairs.

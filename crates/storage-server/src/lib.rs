@@ -18,6 +18,13 @@
 //! server holds, for the tasks heads and workers submit; that process, not
 //! the server, holds the CUDA contexts the copies need.
 //!
+//! The server also keeps one buffer pool per deployment ([`buffer_pool`]):
+//! the blocks every request of the deployment's engines holds on the
+//! device and on the host, which an engine epoch reaches through the queue
+//! pairs of its session ([`sessions`]). The pools live on a thread of their
+//! own, which polls the queue pairs; the main loop opens and closes the
+//! sessions and runs the pools' tasks on the children.
+//!
 //! [`command`] is the `uniserve storage-server` command: [`serve`] runs a
 //! server, and [`list`] and [`retire`] are the operator's commands against a
 //! running one.
@@ -39,6 +46,7 @@ mod pages;
 mod quota;
 mod restart;
 mod serve;
+mod sessions;
 mod shoot;
 pub mod transfer;
 mod transfers;
@@ -136,6 +144,9 @@ struct StorageEntry {
     /// Whether a move is filling the storage, which holds no tensor until
     /// the move ends.
     moving: bool,
+    /// Whether the storage is a rank's part of a buffer pool's host region
+    /// ([`sessions`]), which holds no tensor and lives with its deployment.
+    part: bool,
 }
 
 struct TensorEntry {
@@ -198,6 +209,9 @@ enum Handling {
         regions: Vec<(usize, u64)>,
         fabric: Vec<Option<(::storage::protocol::FabricHandle, u64)>>,
     },
+    /// A response whose descriptors travel with it and are not the
+    /// server's to keep: the queue pairs of a session.
+    Descriptors(Response, Vec<OwnedFd>),
     /// A head's weight move, checked, responded once its copies ended: its
     /// deployment, its direction and its storages.
     Moving {
@@ -250,6 +264,9 @@ pub struct Server {
     /// A restart in place under way, which passes the server over once nothing is
     /// in flight.
     restart: Option<restart::Pending>,
+    /// The sessions of engine epochs with the deployments' buffer pools,
+    /// and the pools' thread.
+    sessions: sessions::Sessions,
 }
 
 impl Server {
@@ -286,6 +303,7 @@ impl Server {
             events: Vec::new(),
             relaunch: Vec::new(),
             restart: None,
+            sessions: sessions::Sessions::new()?,
         })
     }
 
@@ -321,9 +339,12 @@ impl Server {
     fn turn(&mut self, wake: BorrowedFd<'_>) -> io::Result<()> {
         let ids: Vec<ClientId> = self.clients.keys().copied().collect();
         let pidfds = self.shootdowns.pending_pidfds();
-        let mut fds = Vec::with_capacity(3 + ids.len() + pidfds.len());
+        // The buffer pool's thread's notices.
+        let notices = self.sessions.thread.wake();
+        let mut fds = Vec::with_capacity(4 + ids.len() + pidfds.len());
         fds.push(PollFd::new(&self.listener, PollFlags::IN));
         fds.push(PollFd::new(&wake, PollFlags::IN));
+        fds.push(PollFd::new(&notices, PollFlags::IN));
         let tcp = self.tcp.as_ref().map(|(listener, _)| listener);
         if let Some(listener) = tcp {
             fds.push(PollFd::new(listener, PollFlags::IN));
@@ -362,7 +383,7 @@ impl Server {
         if !fds[1].revents().is_empty() {
             drain(wake);
         }
-        let accept_tcp = tcp.is_some() && !fds[2].revents().is_empty();
+        let accept_tcp = tcp.is_some() && !fds[3].revents().is_empty();
         let ready: Vec<ClientId> = ids
             .iter()
             .zip(&fds[first..first + ids.len()])
@@ -382,11 +403,15 @@ impl Server {
         }
         if self.shootdowns.advance() {
             self.settle_shootdowns();
+            self.settle_sessions();
         }
         self.kv_storage.process.reap();
         self.kv_storage.process.start_due();
         self.transfers.process.reap();
         self.transfers.process.start_due();
+        self.take_notices();
+        self.settle_lost();
+        self.send_events();
         self.serve_queues();
         self.flush_and_reap();
         Ok(())
@@ -508,6 +533,7 @@ impl Server {
                     }
                     if self.kv_storage.client == Some(id) {
                         self.offer_pools();
+                        self.offer_parts();
                         self.send_events();
                     }
                 }
@@ -620,6 +646,12 @@ impl Server {
                         );
                     }
                 }
+                Ok(Handling::Descriptors(reply, descriptors)) => {
+                    let borrowed: Vec<BorrowedFd<'_>> =
+                        descriptors.iter().map(AsFd::as_fd).collect();
+                    self.respond_with(id, request_id, reply, &borrowed);
+                    self.send_events();
+                }
                 Ok(Handling::KvStorage(mut task)) => {
                     if let Task::Lookup { request, .. } = &mut task {
                         *request = request_id;
@@ -682,16 +714,18 @@ impl Server {
                 Attachment::Pool(pool) => self.pages.get(*pool).map(|pool| pool.descriptor.as_fd()),
             })
             .collect();
-        let Some(client) = self.clients.get_mut(&id) else {
-            return;
-        };
-        let message = ServerMessage::Response {
-            id: request,
-            response: reply,
-        };
-        if let Err(error) = client.connection.send(&message, &descriptors) {
-            tracing::warn!(pid = client.pid, %error, "a reply to a storage client failed");
-        }
+        send_reply(&mut self.clients, id, request, reply, &descriptors);
+    }
+
+    /// Send a reply with `descriptors`, in order.
+    fn respond_with(
+        &mut self,
+        id: ClientId,
+        request: u64,
+        reply: Response,
+        descriptors: &[BorrowedFd<'_>],
+    ) {
+        send_reply(&mut self.clients, id, request, reply, descriptors);
     }
 
     /// Handle one request. A request that needs previous writers shot down
@@ -806,6 +840,16 @@ impl Server {
                 self.pages.settle();
                 Ok(Handling::Response(Response::Finished, Vec::new()))
             }
+            (Request::Open(open), Role::Head { deployment, epoch }) => {
+                self.open_pool(id, &deployment, epoch, open)
+            }
+            (Request::Close, Role::Head { deployment, epoch }) => {
+                self.close_pool(&deployment, epoch)
+            }
+            (Request::PeerHold { deployment, keys }, Role::Peer) => {
+                self.peer_hold(id, deployment, keys)
+            }
+            (Request::PeerRelease { deployment }, Role::Peer) => self.peer_release(id, deployment),
             (Request::Retire { deployment }, Role::Operator) => self.retire(deployment),
             (Request::Restart { executable }, Role::Operator) => self
                 .begin_restart(executable.as_deref())
@@ -929,6 +973,16 @@ impl Server {
                     Request::Promote { keys } => self.promote(&holder, keys),
                     Request::Release { keys } => self.release(&holder, keys),
                     Request::Rekey { moves, at } => self.rekey(&holder, moves, at),
+                    Request::Place {
+                        region,
+                        memory,
+                        runs,
+                    } => self.place(&holder, region, memory, runs),
+                    Request::HostPart {
+                        region,
+                        bytes,
+                        numa_node,
+                    } => self.host_part(&holder, region, *bytes, *numa_node),
                     _ => Err(invalid(&format!(
                         "{} is not a worker request",
                         request_name(request)
@@ -1057,6 +1111,7 @@ impl Server {
         for &old in &trial {
             if retired.contains(&old) {
                 self.pages.discard_epoch(deployment, old);
+                self.update_rolled_back(deployment, old);
                 discarded.insert(old);
             }
         }
@@ -1140,6 +1195,7 @@ impl Server {
             for (pool, pages) in self.pages.published_by(deployment, epoch) {
                 self.upload(pool, pages);
             }
+            self.update_committed(deployment, epoch);
         }
         Ok(Handling::Response(Response::Published, Vec::new()))
     }
@@ -1188,6 +1244,7 @@ impl Server {
         }
         let pools = self.pages.release(deployment);
         self.pools_released(&pools);
+        self.release_pools(deployment);
         self.quotas.release(deployment);
         tracing::info!(
             deployment,
@@ -1253,6 +1310,7 @@ impl Server {
             available: available_storage()?,
             reserve: self.host_reserve,
             unallocated: self.pages.unallocated()
+                + self.sessions.unallocated()
                 + self
                     .storages
                     .values()
@@ -1599,6 +1657,8 @@ impl Server {
                 (Access::Exclusive, Mode::Write) => {
                     victims.extend(self.writer_out(holder, tensor.writer.as_ref())?);
                 }
+                // A buffer pool region's storage records no writer: every
+                // session maps it writable, and the pool keeps blocks apart.
                 _ => {}
             }
         }
@@ -1629,7 +1689,7 @@ impl Server {
                             .retain(|standby| !Arc::ptr_eq(&standby.pidfd, &holder.pidfd));
                         tensor.standby.push(holder.clone());
                     }
-                    Mode::Read => {}
+                    Mode::Read | Mode::Region => {}
                 }
             }
             tensor.retainers.insert(holder.retainer());
@@ -1742,6 +1802,7 @@ impl Server {
                         tensors: 0,
                         moved_from: None,
                         moving: false,
+                        part: false,
                     },
                 );
                 id
@@ -1800,9 +1861,10 @@ impl Server {
                 },
             );
         }
-        // A storage no tensor names is not retained, unless a move fills it.
+        // A storage no tensor names is not retained, unless a move fills it
+        // or it is a part of a host region.
         self.storages
-            .retain(|_, entry| entry.tensors > 0 || entry.moving);
+            .retain(|_, entry| entry.tensors > 0 || entry.moving || entry.part);
         Ok(Handling::Response(Response::Put, Vec::new()))
     }
 
@@ -2101,6 +2163,7 @@ impl Server {
             }
             _ => {}
         }
+        self.sessions_client_gone(id, &client);
         self.transfer_client_gone(id);
         if let Some(Role::Head { deployment, .. }) = &client.role
             && let Some(entry) = self.deployments.get_mut(deployment)
@@ -2278,6 +2341,11 @@ impl Server {
             connector: self.kv_storage.client.is_some(),
             transfer: self.listed_transfer(),
             quotas: self.quotas_of(&[], None),
+            buffer_pools: self
+                .sessions
+                .thread
+                .call(|pools| pools.listing())
+                .unwrap_or_default(),
         }
     }
 
@@ -2346,7 +2414,23 @@ impl Server {
                 pool: *pool,
                 pages: wide(pages),
             },
-            Task::Download { pool, pages, .. } => Event::Download {
+            Task::Download { pool, pages, .. }
+            | Task::Blocks {
+                pool,
+                pages,
+                upload: false,
+                ..
+            } => Event::Download {
+                task: id,
+                pool: *pool,
+                pages: wide(pages),
+            },
+            Task::Blocks {
+                pool,
+                pages,
+                upload: true,
+                ..
+            } => Event::Upload {
                 task: id,
                 pool: *pool,
                 pages: wide(pages),
@@ -2509,6 +2593,10 @@ impl Server {
                     .push((head, Event::Prefetched { tag, results }, Vec::new()));
                 self.send_events();
             }
+            Task::Blocks { number, keys, .. } => {
+                let results: Vec<bool> = (0..keys.len()).map(succeeded).collect();
+                self.pool_pages_moved(number, &keys, &results);
+            }
         }
     }
 
@@ -2524,8 +2612,13 @@ impl Server {
             .drain()
             .map(|(_, task)| task)
             .collect();
+        let pid = self.kv_storage.process.pid();
         for task in tasks {
-            self.fail(task);
+            match task {
+                // The connector may still move pages until its process has exited.
+                Task::Blocks { number, .. } => self.pool_task_lost(number, pid),
+                task => self.fail(task),
+            }
         }
         self.pages.connector_gone();
         // The connector maps no pool any more: released pools leave.
@@ -2758,6 +2851,26 @@ impl Server {
     }
 }
 
+/// Send client `id` the reply to `request`, with `descriptors` in order.
+fn send_reply(
+    clients: &mut BTreeMap<ClientId, Client>,
+    id: ClientId,
+    request: u64,
+    reply: Response,
+    descriptors: &[BorrowedFd<'_>],
+) {
+    let Some(client) = clients.get_mut(&id) else {
+        return;
+    };
+    let message = ServerMessage::Response {
+        id: request,
+        response: reply,
+    };
+    if let Err(error) = client.connection.send(&message, descriptors) {
+        tracing::warn!(pid = client.pid, %error, "a reply to a storage client failed");
+    }
+}
+
 /// Slots in the protocol's width.
 fn wide(pages: &[(Key, u32)]) -> Vec<(Key, u64)> {
     pages
@@ -2910,6 +3023,12 @@ fn request_name(request: &Request) -> &'static str {
         Request::Offload { .. } => "offload",
         Request::Restore { .. } => "restore",
         Request::Allocated { .. } => "allocated",
+        Request::Open(_) => "open",
+        Request::Close => "close",
+        Request::Place { .. } => "place",
+        Request::HostPart { .. } => "host_part",
+        Request::PeerHold { .. } => "peer hold",
+        Request::PeerRelease { .. } => "peer release",
     }
 }
 

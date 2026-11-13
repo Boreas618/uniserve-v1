@@ -89,6 +89,18 @@
 //! [`Link`], within the link's byte budget, which a head halves and restores
 //! ([`Request::Throttle`]).
 //!
+//! **Session.** An engine epoch's session with the buffer pool of its
+//! deployment on the host (`crate::runtime`): the engine's main process, a
+//! [`Role::Head`] of the epoch, opens it with [`Request::Open`] and gets one
+//! queue pair per scheduler, on which every request of the buffer pool
+//! travels in shared memory; it ends it with [`Request::Close`] once its
+//! executors have stopped, and the server closes it when the engine's
+//! processes are gone. Each rank states where its part of a device region's
+//! units lies ([`Request::Place`]) and takes its part of a host region,
+//! which the server creates ([`Request::HostPart`]). Another host's Storage
+//! Server holds the host copies it reads ([`Request::PeerHold`],
+//! [`Request::PeerRelease`]).
+//!
 //! A span's source may lie on another host ([`Region::Remote`]): the
 //! destination host's Transfer Server READs it through NIXL. It asks the
 //! source host's server, over that server's TCP endpoint as a
@@ -106,11 +118,13 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::runtime::{Open, Opened};
+
 /// The protocol version a Storage Server and its clients speak; a server
 /// refuses a client of any other. The engine interface carries it
 /// (`proto::ENGINE_INTERFACE_VERSION`), so an engine built for another
 /// storage protocol is refused at its hello to the daemon as well.
-pub const VERSION: u32 = 21;
+pub const VERSION: u32 = 22;
 
 /// The most bytes a [`Request::Read`] responds with: a weight manifest of the
 /// largest models the library serves fits many times over, and a reply of
@@ -607,6 +621,11 @@ pub enum Mode {
     /// Map exclusive tensors without becoming their writer, to be promoted
     /// later.
     Standby,
+    /// Map exclusive tensors writable without becoming their writer: the
+    /// storage of a buffer pool region, which every session that names the
+    /// region maps writable at once, and whose blocks the buffer pool, not
+    /// a writer, keeps apart. No writer is recorded and none is shot down.
+    Region,
 }
 
 /// Storage a transfer copies from or into, as its client names it.
@@ -624,6 +643,10 @@ pub enum Region {
     /// A live page pool of the caller's deployment; offsets count from slot
     /// 0, at `slot × page_bytes`.
     Pool { pool: u64 },
+    /// Rank `rank`'s part of the host region `region` of the caller's
+    /// deployment's buffer pool ([`Request::HostPart`]); offsets count from
+    /// unit 0, at `unit × bytes` for the part's bytes of a unit.
+    Part { region: String, rank: u32 },
     /// A device allocation of another host that shares this host's NVLink
     /// fabric (multi-node NVLink): its 64-byte fabric handle, which the
     /// process that created the allocation exported, its GPU and size, and
@@ -864,6 +887,49 @@ pub struct FabricExport {
     pub handle: FabricHandle,
     pub bytes: u64,
     pub offset: u64,
+}
+
+/// Where one run of a buffer pool region's units lies in one rank, for one
+/// field of a unit: for each unit `u` in `first..first + count`, `bytes`
+/// bytes at `offset + (u - first) * bytes` of the retained exclusive tensor
+/// `key` at `location`. This is the content of a rank's cache plane run
+/// (`ipc::CachePlaneRun`), with the GPU stated as the location.
+///
+/// A unit is not one byte range: its value planes, flags, scales and state
+/// planes are fields of their own. The runs of one field hold that field's
+/// bytes of every unit once, and two ranks of one layout name the same
+/// fields at the same bytes per unit, so a unit copies between them field
+/// by field, from the run of one holding the unit to the run of the other.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UnitRun {
+    pub field: String,
+    pub key: Key,
+    pub location: Location,
+    pub first: u32,
+    pub count: u32,
+    pub offset: u64,
+    pub bytes: u64,
+}
+
+/// A host copy another host's Storage Server holds for its reads
+/// ([`Request::PeerHold`]): the key, and the units of the host region
+/// `region` that hold it, `count` from `first`. Each part of the region
+/// ([`RegionPart`]) holds its bytes of those units.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HostCopy {
+    pub key: Key,
+    pub region: String,
+    pub first: u32,
+    pub count: u32,
+}
+
+/// One rank's part of a host region: unit `u` lies at byte `u × bytes` of
+/// the part, which a transfer names as [`Region::Part`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RegionPart {
+    pub region: String,
+    pub rank: u32,
+    pub bytes: u64,
 }
 
 /// The device storage the Transfer Server's CUDA context takes on one GPU,
@@ -1209,6 +1275,67 @@ pub enum Request {
         bytes: u64,
         failure: Option<String>,
     },
+    /// From an engine's main process, a [`Role::Head`] of the epoch the
+    /// layout states, connected on the host: open the epoch's session with
+    /// the buffer pool of its deployment (`specs/buffer-pool.md` §11).
+    /// Responded with [`Response::Opened`], with the descriptor of each
+    /// scheduler's queue pair, in the order of [`Open::schedulers`]; the
+    /// server's end of each is served from then on. A region another
+    /// session of the deployment stated under the same name is that
+    /// region, and groups that state one device memory read and write the
+    /// same memory. Refused, opening nothing, when the server does not
+    /// serve the interface version the layout states, when the epoch's
+    /// session is open (or its engine's processes have not left since it
+    /// lost its connection), or when the layout does not fit the buffer
+    /// pool: a region stated again with another tier, space, unit size or
+    /// numbering, more than eight device memories over the deployment's
+    /// sessions, or host regions the host's storage cannot hold.
+    Open(Open),
+    /// From the engine's main process that opened its epoch's session: its
+    /// executors have stopped, and the session closes as the session of an
+    /// engine that is gone (`specs/buffer-pool.md` §12.4). Responded with
+    /// [`Response::Closed`].
+    Close,
+    /// From a worker: where its part of the units of the device region
+    /// `region` of its deployment's buffer pool lies, in the device memory
+    /// `memory` its group addresses (the memory a group of the layout
+    /// states), field by field. It replaces what the rank stated before for
+    /// the region and memory. The server turns a task's runs into copies
+    /// with it, matching the ranks of two memories by their rank index.
+    /// Responded with [`Response::Placed`].
+    Place {
+        region: String,
+        memory: String,
+        runs: Vec<UnitRun>,
+    },
+    /// From a worker: its rank's part of the host region `region` of its
+    /// deployment's buffer pool, `bytes` of every unit, whose memfd the
+    /// server creates at the first request (on `numa_node` when given) and
+    /// holds until the deployment is released. Ranks of one rank index
+    /// share the part. Responded with [`Response::HostPart`], whose memfd
+    /// travels with it; refused when the region is not a host region an
+    /// open session stated, or when the parts' bytes of a unit exceed the
+    /// region's unit size.
+    HostPart {
+        region: String,
+        bytes: u64,
+        numa_node: Option<u32>,
+    },
+    /// From another host's Storage Server ([`Role::Peer`]): hold the host
+    /// copies of `keys` in `deployment`'s buffer pool that every epoch may
+    /// use, for that host to READ, until its [`Request::PeerRelease`] or
+    /// its connection closes. A held copy is a holder of its block like
+    /// any other, so it is not evicted. Responded with
+    /// [`Response::PeerHeld`], naming the copies held; keys without such a
+    /// copy are left out.
+    PeerHold { deployment: String, keys: Vec<Key> },
+    /// From another host's Storage Server: its reads of the copies it holds
+    /// in `deployment`'s buffer pool ended, and every hold ends. Responded
+    /// with [`Response::Valid`] when the holds stood until now, so what it
+    /// read is what the copies held, and with [`Response::Gone`] when this
+    /// connection holds nothing there; the reading host commits what it
+    /// read only on `Valid`.
+    PeerRelease { deployment: String },
 }
 
 /// Why a request failed.
@@ -1338,6 +1465,28 @@ pub enum Response {
     },
     /// A [`Request::Unexpose`] was taken.
     Unexposed,
+    /// The session a [`Request::Open`] opened. The descriptor of each
+    /// scheduler's queue pair travels with it, in the order of
+    /// [`Open::schedulers`].
+    Opened(Opened),
+    Closed,
+    Placed,
+    /// The rank's part of a host region, `units` units of the bytes the
+    /// request stated: unit `u` at byte `u × bytes`. Its memfd travels with
+    /// the response.
+    HostPart {
+        units: u32,
+    },
+    /// The host copies a [`Request::PeerHold`] holds, and every part of
+    /// the host regions they lie in.
+    PeerHeld {
+        copies: Vec<HostCopy>,
+        parts: Vec<RegionPart>,
+    },
+    /// The holds a [`Request::PeerRelease`] ended stood until now.
+    Valid,
+    /// The connection held nothing to release.
+    Gone,
     Error {
         kind: ErrorKind,
         message: String,
@@ -1393,6 +1542,79 @@ pub struct Listing {
     pub transfer: Option<TransferListing>,
     /// Every deployment's quota of every GPU the server reserves.
     pub quotas: Vec<Quota>,
+    /// The buffer pool of every deployment that opened a session.
+    pub buffer_pools: Vec<BufferPoolListing>,
+}
+
+/// One deployment's buffer pool in a [`Listing`]: what it holds and what
+/// waits (`specs/buffer-pool.md` §8).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BufferPoolListing {
+    pub deployment: String,
+    /// Per region and class, the blocks observed in each state; free units
+    /// are in no block.
+    pub blocks: Vec<BlockCount>,
+    /// Every worker group of an open session, with what waits on it.
+    pub groups: Vec<GroupListing>,
+    /// Every request whose copies are in flight.
+    pub copies: Vec<CopyListing>,
+}
+
+/// The blocks of one region and class observed in one state.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BlockCount {
+    pub region: String,
+    /// The class, as the sessions number it; `None` for slot rows.
+    pub class: Option<u8>,
+    pub state: BlockState,
+    pub blocks: u32,
+}
+
+/// What a block is observed as, from who holds it: an entry of the cache
+/// (shared), an owner, a waiting commit or a copy writing it (private), or
+/// only deferred releases and ended copies (retired). The first that
+/// applies is the state, in the order declared.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BlockState {
+    Shared,
+    Private,
+    Retired,
+}
+
+/// One worker group of a session: the `completed` word as the buffer pool
+/// last read it, and the stamps its deferred work waits for, in order.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GroupListing {
+    pub epoch: u64,
+    pub group: u8,
+    pub completed: u64,
+    pub waiting: Vec<(u64, Waiting)>,
+}
+
+/// What deferred work does when its stamp is reached.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Waiting {
+    Release,
+    Commit,
+    Transfer,
+    Finish,
+}
+
+/// The copies one request started, while they are in flight: an
+/// executor's copies, whose `Finish` they wait for, or a task's, which ends
+/// by its deadline.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CopyListing {
+    /// The epoch of the session, or `None` once its session closed.
+    pub epoch: Option<u64>,
+    pub scheduler: u16,
+    pub request: u64,
+    pub copies: u32,
+    /// The task's deadline in nanoseconds of the host's monotonic clock;
+    /// `None` for an executor's copies.
+    pub deadline: Option<u64>,
 }
 
 /// The Transfer Server in a [`Listing`].

@@ -6,11 +6,17 @@
 //! storage-server serve ... --predecessor FD`) with one end of a socket pair at that
 //! descriptor and responds with its process id. The server serves on until
 //! nothing is in flight: no request waits, no shoot-down runs, neither the
-//! connector nor the Transfer Server runs a task, and every reply was
-//! written. It then stops both, and passes the successor its state with
-//! every descriptor it holds: the
+//! connector nor the Transfer Server runs a task, the buffer pools have no
+//! task outstanding, and every reply was written. From the restart's start
+//! the buffer pools' thread takes no request and reads no `completed` word,
+//! so no work starts there while the tasks end; an engine's requests wait
+//! in its queue pairs meanwhile. The server then stops both children, and
+//! passes the successor its state with every descriptor it holds: the
 //! listening sockets and their lock, each client's connection and pidfd,
-//! each storage's storage and each page pool's memfd ([`Server::handoff`]).
+//! each storage's storage, each queue pair's memfd and each page pool's
+//! memfd ([`Server::handoff`]). The buffer pools travel as images, with
+//! the sessions, the parts of the host regions and where the units lie,
+//! and the queue pairs keep their indices.
 //! The successor goes on from there ([`Server::resume`]), starts its own
 //! connector and Transfer Server, says it serves, and this server exits. A client's request
 //! sent meanwhile waits in its connection until the successor reads it.
@@ -31,6 +37,7 @@ use serde::{Deserialize, Serialize};
 use crate::kv_storage::KvStorage;
 use crate::pages::{Pools, PoolsHandoff};
 use crate::quota::Quotas;
+use crate::sessions::{Sessions, SessionsHandoff};
 use crate::transfers::Transfers;
 use crate::{ClientId, Deployment, Holder, Launch, Server, StorageEntry, TensorEntry};
 use ::storage::protocol::Retainer;
@@ -63,7 +70,7 @@ enum Message {
 /// A server's state, its descriptors travelling apart: first the listener
 /// and its lock, then the TCP listener when there is one, then every pidfd
 /// of [`Handoff::pidfds`], every client's connection, every storage's
-/// storage and every page pool's memfd.
+/// storage, every queue pair's memfd and every page pool's memfd.
 #[derive(Debug, Serialize, Deserialize)]
 struct Handoff {
     tcp: Option<String>,
@@ -71,7 +78,8 @@ struct Handoff {
     pidfds: usize,
     clients: Vec<ClientHandoff>,
     next_client: ClientId,
-    storages: Vec<(u64, StorageRecord, usize)>,
+    /// Each storage, its tensors and whether it is a host region's part.
+    storages: Vec<(u64, StorageRecord, usize, bool)>,
     /// The host copies of epochs' weights, with the GPU each left
     /// ([`crate::moves`]).
     moved: Vec<(u64, [u8; 16])>,
@@ -91,6 +99,11 @@ struct Handoff {
     quotas: Quotas,
     /// What each deployment's tasks copied, by priority.
     task_totals: Vec<(String, Vec<::storage::protocol::TaskTotal>)>,
+    /// The sessions with the buffer pools and the pools' images.
+    sessions: SessionsHandoff,
+    /// The processes followed for a session whose engine is gone: each
+    /// process's id, its pidfd's index and the GPUs it must leave.
+    followed: Vec<(i32, usize, Vec<[u8; 16]>)>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -200,6 +213,8 @@ impl Server {
         drop(theirs);
         let pid = successor.id();
         tracing::info!(pid, executable = %executable.display(), "started the successor server");
+        // The buffer pools start no work from now on, and their tasks end.
+        self.sessions.thread.send(|pools| pools.freeze());
         self.restart = Some(Pending {
             successor,
             channel: ours,
@@ -209,15 +224,17 @@ impl Server {
 
     /// Whether nothing is in flight: no request waits or is held, no
     /// shoot-down runs, neither the connector nor the Transfer Server runs a
-    /// task, and every reply was written.
+    /// task, the buffer pools have no task outstanding, and every reply was
+    /// written. The processes followed for a session pass over.
     pub(crate) fn quiescent(&self) -> bool {
-        self.shootdowns.pending_pidfds().is_empty()
+        !self.shootdowns.killing()
             && self.kv_storage.tasks.is_empty()
             && self.transfers.tasks.is_empty()
             && self.events.is_empty()
             && self.clients.values().all(|client| {
                 !client.held && client.queue.is_empty() && !client.connection.wants_write()
             })
+            && self.sessions.quiet()
     }
 
     /// The arguments a successor server starts with, before
@@ -299,11 +316,18 @@ impl Server {
         let mut storage_descriptors = Vec::with_capacity(self.storages.len());
         let mut moved = Vec::new();
         for (id, storage) in std::mem::take(&mut self.storages) {
-            storages.push((id, storage.record, storage.tensors));
+            storages.push((id, storage.record, storage.tensors, storage.part));
             moved.extend(storage.moved_from.map(|gpu| (id, gpu)));
             storage_descriptors.push(storage._descriptor);
         }
         let (pages, pool_descriptors) = self.pages.handoff();
+        let followed = self
+            .shootdowns
+            .followed()
+            .into_iter()
+            .map(|(pid, pidfd, gpus)| (pid, pidfds.index(&pidfd), gpus))
+            .collect();
+        let (sessions, queue_descriptors) = self.sessions.hand_off(|pidfd| pidfds.index(pidfd))?;
 
         let tcp = self.tcp.take();
         let mut descriptors: Vec<OwnedFd> = vec![OwnedFd::from(self.listener.try_clone()?), lock];
@@ -315,6 +339,7 @@ impl Server {
         }
         descriptors.extend(client_descriptors);
         descriptors.extend(storage_descriptors);
+        descriptors.extend(queue_descriptors);
         descriptors.extend(pool_descriptors);
         let handoff = Handoff {
             tcp: tcp.map(|(_, address)| address),
@@ -333,6 +358,8 @@ impl Server {
             relaunch: std::mem::take(&mut self.relaunch),
             quotas: std::mem::take(&mut self.quotas),
             task_totals: self.transfers.task_totals(),
+            sessions,
+            followed,
         };
 
         let Pending {
@@ -503,7 +530,7 @@ impl Server {
         let locations: HashMap<u64, Location> = handoff
             .storages
             .iter()
-            .map(|(id, record, _)| (*id, record.location))
+            .map(|(id, record, _, _)| (*id, record.location))
             .collect();
         let mut tensors = HashMap::with_capacity(handoff.tensors.len());
         let mut copies: HashMap<Key, Vec<Location>> = HashMap::new();
@@ -538,7 +565,7 @@ impl Server {
         }
         let moved: HashMap<u64, [u8; 16]> = handoff.moved.into_iter().collect();
         let mut storages = HashMap::with_capacity(handoff.storages.len());
-        for (id, record, count) in handoff.storages {
+        for (id, record, count, part) in handoff.storages {
             storages.insert(
                 id,
                 StorageEntry {
@@ -547,9 +574,14 @@ impl Server {
                     tensors: count,
                     moved_from: moved.get(&id).copied(),
                     moving: false,
+                    part,
                 },
             );
         }
+        let queues = (0..handoff.sessions.queues)
+            .map(|_| next())
+            .collect::<io::Result<Vec<_>>>()?;
+        let sessions = Sessions::resume(handoff.sessions, queues, pidfd)?;
         let pool_descriptors: Vec<OwnedFd> = descriptors.collect();
         let pages = Pools::resume(handoff.pages, pool_descriptors)?;
         let mut shootdowns = crate::shoot::ShootDowns::default();
@@ -558,6 +590,9 @@ impl Server {
         }
         for index in handoff.shot_failed {
             shootdowns.note_failed(pidfd(index)?);
+        }
+        for (pid, index, gpus) in handoff.followed {
+            shootdowns.follow(pid, pidfd(index)?, gpus);
         }
         let server = Self {
             listener,
@@ -583,6 +618,7 @@ impl Server {
             events: Vec::new(),
             relaunch: handoff.relaunch,
             restart: None,
+            sessions,
         };
         tracing::info!(
             clients = server.clients.len(),
@@ -817,6 +853,173 @@ mod tests {
             ),
             "{refused:?}"
         );
+
+        stop.store(true, Ordering::Release);
+        (&waker).write_all(b"x").unwrap();
+        drop(thread.join().unwrap());
+    }
+
+    /// The next completion on the engine's end of a queue pair, within ten
+    /// seconds.
+    fn completion(
+        pair: &mut ::storage::QueuePair,
+    ) -> (
+        ::storage::runtime::RequestId,
+        ::storage::runtime::Completion,
+    ) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut record = Vec::new();
+        loop {
+            if pair.next_completion(&mut record).unwrap() {
+                return ::storage::runtime::Completion::decode(&record).unwrap();
+            }
+            assert!(Instant::now() < deadline, "no completion arrived");
+            std::thread::sleep(Duration::from_micros(100));
+        }
+    }
+
+    /// An engine's session goes on across a restart in place: its queue
+    /// pair keeps its indices, and a commit taken before the restart takes
+    /// effect in the successor when its stamp is reached.
+    #[test]
+    fn a_session_survives_a_restart_with_a_request_deferred_across_it() {
+        use ::storage::runtime::{
+            Class, Completion, Group, GroupId, Open, OwnerId, Region, Request, RequestId, Tier,
+            VERSION,
+        };
+
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("storage.sock");
+        let (listener, lock) = service::bind(&path).unwrap().unwrap();
+        let server = Server::new(listener, 64, 0, None, None).unwrap();
+        let stop = Arc::new(AtomicBool::new(false));
+        let (thread, waker) = running(server, Arc::clone(&stop));
+
+        let region = |name: &str, units| Region {
+            name: name.into(),
+            tier: Tier::Device,
+            space: name.into(),
+            unit_bytes: 64,
+            reserved: 1,
+            units,
+            limit: units + 1,
+        };
+        let open = Open {
+            version: VERSION,
+            epoch: 0,
+            trial: false,
+            regions: vec![region("units", 4), region("rows", 2)],
+            classes: vec![Class {
+                units: 1,
+                host: None,
+                state_in_slot: false,
+            }],
+            trajectory: 0,
+            groups: vec![Group {
+                id: GroupId(0),
+                memory: "gpu0".into(),
+                slots: 1,
+                regions: vec![vec![0]],
+            }],
+            schedulers: vec![vec![GroupId(0)]],
+        };
+        let mut engine = Client::connect(
+            &path,
+            Role::Head {
+                deployment: "model".into(),
+                epoch: 0,
+            },
+        )
+        .unwrap();
+        let (opened, descriptors) = engine.open_pool(open).unwrap();
+        let mut pair =
+            ::storage::QueuePair::open(descriptors.into_iter().next().unwrap(), true).unwrap();
+        let completed = opened.registers[0].completed[0] as usize;
+        let submit = |pair: &mut ::storage::QueuePair, number, request: Request| {
+            let mut record = Vec::new();
+            request.encode(RequestId(number), &mut record);
+            assert!(pair.submit(&record).unwrap());
+        };
+        submit(
+            &mut pair,
+            1,
+            Request::Attach {
+                owner: OwnerId(1),
+                group: GroupId(0),
+            },
+        );
+        submit(
+            &mut pair,
+            2,
+            Request::Allocate {
+                owner: OwnerId(1),
+                class: 0,
+                at: 0,
+                count: 1,
+                units: 0,
+            },
+        );
+        submit(
+            &mut pair,
+            3,
+            Request::Commit {
+                owner: OwnerId(1),
+                class: 0,
+                at: 0,
+                key: Key([7; 32]),
+                tokens: 64,
+                after: vec![(GroupId(0), 2)],
+            },
+        );
+        assert_eq!(
+            completion(&mut pair),
+            (RequestId(1), Completion::Attached { slot: 1 })
+        );
+        assert!(matches!(
+            completion(&mut pair),
+            (RequestId(2), Completion::Allocated { .. })
+        ));
+
+        // The restart: the commit waits for batch 2 in the pool handed over.
+        stop.store(true, Ordering::Release);
+        (&waker).write_all(b"x").unwrap();
+        let server = thread.join().unwrap();
+        let (ours, theirs) = UnixStream::pair().unwrap();
+        let descriptor = theirs.into_raw_fd();
+        let successor = std::thread::spawn(move || Server::resume(descriptor, None, None).unwrap());
+        let placeholder = std::process::Command::new("sleep")
+            .arg("60")
+            .spawn()
+            .unwrap();
+        let pending = Pending {
+            successor: placeholder,
+            channel: ours,
+        };
+        let pid = server.handoff(pending, lock.hand_over()).unwrap();
+        let (resumed, lock) = successor.join().unwrap();
+        let _ = std::process::Command::new("kill")
+            .arg(pid.to_string())
+            .status();
+        let _lock = service::SocketLock::resume(lock, path.clone());
+        let stop = Arc::new(AtomicBool::new(false));
+        let (thread, waker) = running(resumed, Arc::clone(&stop));
+
+        // The executor completes batch 2 after the restart, and submits more.
+        pair.register(completed).store(2, Ordering::Release);
+        assert_eq!(completion(&mut pair), (RequestId(3), Completion::Committed));
+        submit(
+            &mut pair,
+            4,
+            Request::Detach {
+                owner: OwnerId(1),
+                after: Vec::new(),
+            },
+        );
+        assert_eq!(completion(&mut pair), (RequestId(4), Completion::Done));
+        let listing = engine.list().unwrap();
+        let groups = listing.buffer_pools.iter().flat_map(|pool| &pool.groups);
+        assert_eq!(groups.map(|group| group.completed).collect::<Vec<_>>(), [2]);
+        engine.close_pool().unwrap();
 
         stop.store(true, Ordering::Release);
         (&waker).write_all(b"x").unwrap();

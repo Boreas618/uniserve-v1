@@ -67,13 +67,19 @@ impl Fixture {
         for space in 0..7 {
             pool.grant(space, 0, 1 << 20);
         }
-        assert_eq!(pool.open_region(Tier::Device, 0, 64, 1, 4, 5), UNITS);
-        pool.open_region(Tier::Device, 1, 8, 1, 2, 3);
-        pool.open_region(Tier::Device, 2, 8, 1, 2, 3);
-        assert_eq!(pool.open_region(Tier::Host, 3, 64, 0, 2, 2), HOST);
-        assert_eq!(pool.open_region(Tier::Host, 4, 16, 0, 8, 8), LATENTS);
-        pool.open_region(Tier::Device, 5, 256, 0, 4, 4);
-        pool.open_region(Tier::Device, 6, 256, 0, 4, 4);
+        assert_eq!(
+            pool.open_region("units", Tier::Device, 0, 64, 1, 4, 5),
+            UNITS
+        );
+        pool.open_region("prefill rows", Tier::Device, 1, 8, 1, 2, 3);
+        pool.open_region("decode rows", Tier::Device, 2, 8, 1, 2, 3);
+        assert_eq!(pool.open_region("host", Tier::Host, 3, 64, 0, 2, 2), HOST);
+        assert_eq!(
+            pool.open_region("latents", Tier::Host, 4, 16, 0, 8, 8),
+            LATENTS
+        );
+        pool.open_region("products 0", Tier::Device, 5, 256, 0, 4, 4);
+        pool.open_region("products 1", Tier::Device, 6, 256, 0, 4, 4);
 
         let regions = || vec![vec![UNITS], Vec::new(), vec![5, 6]];
         pool.open(
@@ -933,7 +939,7 @@ fn a_transfer_moves_an_owner_and_copies_what_the_target_group_lacks() {
     let work = fixture.pool.work((QUEUE, id));
     let copied: Vec<_> = work
         .iter()
-        .map(|(_, from, to)| (from.clone(), to.clone()))
+        .map(|(_, from, to, _, _)| (from.clone(), to.clone()))
         .collect();
     assert_eq!(
         copied[..2],
@@ -1140,7 +1146,13 @@ fn a_store_to_the_remote_store_is_answered_when_the_connector_has_put_the_keys()
     assert_eq!(fixture.answer(put), None);
     assert_eq!(
         fixture.pool.work((QUEUE, put)),
-        [(Some(key(7)), vec![(HOST, 0, 1)], vec![(HOST, 0, 1)])]
+        [(
+            Some(key(7)),
+            vec![(HOST, 0, 1)],
+            vec![(HOST, 0, 1)],
+            u8::MAX,
+            0
+        )]
     );
     fixture.pool.done((QUEUE, put), 0);
     fixture.checked();
@@ -1333,7 +1345,9 @@ fn a_resize_moves_free_units_between_a_region_and_the_quota() {
 
     // R10: a region of another layout over the same memory grows only by
     // bytes that left this one.
-    let other = fixture.pool.open_region(Tier::Device, 0, 128, 0, 0, 2);
+    let other = fixture
+        .pool
+        .open_region("other layout", Tier::Device, 0, 128, 0, 0, 2);
     let grow = Request::Resize {
         region: other,
         units: 2,
@@ -1364,4 +1378,52 @@ fn a_resize_moves_free_units_between_a_region_and_the_quota() {
             evicted: Vec::new()
         })
     );
+}
+
+#[test]
+fn a_peer_s_hold_keeps_a_host_copy_until_it_is_released() {
+    let mut fixture = Fixture::new();
+    // Both host units hold a copy: of key 7, then of key 8.
+    for (owner, name) in [(1, 7), (2, 8)] {
+        fixture.cached(owner, name);
+        let store = fixture.submit(
+            QUEUE,
+            Request::Store {
+                group: PREFILL,
+                keys: vec![key(name)],
+                tier: Tier::Host,
+            },
+        );
+        fixture.finish(store, true);
+    }
+    assert_eq!(fixture.pool.capacity(QUEUE, HOST), (0, 0, 2));
+
+    // A key without a host copy is not held; one with a copy is, and a
+    // hold is a holder: the copy is no longer evictable.
+    let held = fixture.pool.hold(9, &[key(7), key(9)]);
+    fixture.checked();
+    assert_eq!(held, [(key(7), (HOST, 0, 1))]);
+    assert_eq!(fixture.pool.capacity(QUEUE, HOST), (0, 0, 1));
+
+    // A store that needs room evicts in the installed order and skips it.
+    fixture.ask(Request::Victims {
+        region: HOST,
+        keys: vec![key(7), key(8)],
+    });
+    fixture.cached(3, 9);
+    let store = Request::Store {
+        group: PREFILL,
+        keys: vec![key(9)],
+        tier: Tier::Host,
+    };
+    let Some(Completion::Copy { evicted, .. }) = fixture.ask(store) else {
+        panic!("no copy")
+    };
+    assert_eq!(evicted, [key(8)]);
+
+    // The release ends every hold of the peer; a second finds none.
+    assert!(fixture.pool.release_peer(9));
+    fixture.checked();
+    assert!(!fixture.pool.release_peer(9));
+    assert_eq!(fixture.pool.capacity(QUEUE, HOST), (1, 0, 1));
 }

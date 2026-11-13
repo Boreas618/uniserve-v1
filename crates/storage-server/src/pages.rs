@@ -343,6 +343,15 @@ impl Pools {
         }
     }
 
+    /// Takes the next pool number for a pool the connector maps that is not
+    /// one of these: a part of a buffer pool's host region
+    /// ([`crate::sessions`]). No pool here ever takes it.
+    pub(super) fn number(&mut self) -> u64 {
+        let number = self.next;
+        self.next += 1;
+        number
+    }
+
     /// The live pool of `deployment` for pages of `shape` on `numa_node`.
     pub(super) fn find(
         &self,
