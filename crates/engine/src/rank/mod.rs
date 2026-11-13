@@ -322,7 +322,8 @@ impl ModelRunner {
                 })
                 .collect();
         }
-        // A media deployment's devices are each a rank of the worker group that places it.
+        // A media deployment's ranks are every rank of its worker groups, each on the device
+        // that places it, which may hold ranks of several groups.
         if !text {
             return self.media_ranks();
         }

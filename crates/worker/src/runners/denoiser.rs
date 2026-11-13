@@ -37,8 +37,8 @@
 //!   before the replay and the latents back after it, on the runner's stream. The last step also
 //!   copies the latents into the video latents and audio latents blocks its row names, which the
 //!   decoders read as `[channels, frames · rows · columns]` and as the track's elements in the
-//!   sample type, their `latent_type`. The first denoising rank of a process
-//!   ([`DenoiserConfig::shares`]) copies them on to the backing ranks of its process
+//!   sample type, their `latent_type`. The first rank of the denoising group
+//!   ([`DenoiserConfig::first`]) copies them on to the backing ranks of its process
 //!   ([`BufferMemory::share`]).
 //!
 //! ## Buckets
@@ -54,15 +54,18 @@
 //!
 //! ## Save and restore
 //!
-//! [`Runner::copy`] issues the copies of a batch through the rank's [`BufferMemory`]: a `Save`
-//! copies the slot's row into the rank's part of a host latent block, and a `Restore` copies it
-//! back. Every rank of every parallel configuration holds a request's whole samples, laid out by
-//! the request's layout alone, so a trajectory saved by a group of another size holds the same
-//! bytes in each saving rank's part. The class of stored trajectories states its tensors and its
-//! encoding over [`trajectory_layout`] of the largest layout, once per rank of the group
-//! ([`DenoiserRunner::trajectory_digests`]); a `Restore` whose copy names another encoding is
-//! decoded as that class at another number of ranks, and is laid out through the copy manifest
-//! from a saving rank's part ([`BufferMemory::restore`]).
+//! [`Runner::copy`] issues the copies of a batch through the rank's [`BufferMemory`]. Every rank
+//! of every parallel configuration holds a request's whole samples in its slot's row, laid out by
+//! the request's layout alone, so a saved trajectory has one host copy: a `Save` copies the
+//! row of the group's first rank ([`DenoiserConfig::first`]) into the part of the host latent
+//! region the rank copies with ([`BufferMemory::part_holder`]), and a `Restore` copies it back
+//! into the row of every rank of the restoring group, whichever group and layout saved it. The
+//! class of stored trajectories states its tensors and its encoding over [`trajectory_layout`]
+//! of the largest layout, once ([`DenoiserRunner::trajectory_digests`]). A `Restore` whose copy
+//! names another encoding of the same tensors was saved by a deployment whose largest layout is
+//! another; the request's trajectory is its own layout's bytes under both, so it is laid out
+//! through the copy manifest from that same part as the bytes they are
+//! ([`BufferMemory::restore`]).
 
 use std::cell::RefCell;
 use std::sync::Arc;
@@ -110,11 +113,6 @@ const NAMES: [&str; 5] = [
     "audio latents",
 ];
 
-/// The most ranks of a group whose saved trajectory a rank restores across encodings: the host
-/// latent region is one host's, so the ranks that saved into it are ranks of that host, of which
-/// there are at most eight GPUs. A trajectory saved in an encoding of more ranks is a miss.
-const SAVING_RANKS: u32 = 8;
-
 /// A served bucket: the step's bucket, its layout, the candidate it is captured from, and the
 /// condition sets a request of it may open with.
 type Served = (Bucket, Layout, VideoRequest, Vec<Vec<ConditionShape>>);
@@ -158,11 +156,12 @@ pub struct DenoiserConfig {
     pub classes: [u8; 5],
     /// The ranks of the denoising group, each holding the whole samples of its requests.
     pub ranks: u32,
-    /// The bytes of a unit of a rank's part of the host latent region (`BankPages::page_bytes`).
+    /// The bytes of a unit of a part of the host latent region (`BankPages::page_bytes`).
     pub page_bytes: u64,
-    /// Whether this rank is the first denoising rank of its process, which copies the latents
-    /// the last step wrote to the backing ranks of the process.
-    pub shares: bool,
+    /// Whether this rank is the first of its denoising group: it copies the latents the last
+    /// step wrote to the backing ranks of its process, and it alone writes a saved trajectory's
+    /// host copy, which every rank of the group holds whole.
+    pub first: bool,
 }
 
 /// The runner of a denoiser (module documentation).
@@ -186,10 +185,9 @@ pub struct DenoiserRunner {
     /// `None` for graphs that hold no device.
     state: Option<Arc<Storage>>,
     bytes: u64,
-    /// The digest of the trajectory class's tensors, and its encoding at each number of ranks
-    /// from one.
+    /// The digests of the trajectory class's tensors and of its encoding.
     tensors: [u8; 32],
-    encodings: Vec<[u8; 32]>,
+    encoding: [u8; 32],
     /// The step or the latent preparation being served, which the forward reads; `None` while
     /// a profile run or a capture computes over a candidate.
     current_step: RefCell<Option<(Step, VideoRequest)>>,
@@ -228,16 +226,11 @@ impl DenoiserRunner {
         let text_width = model.text_width().unwrap_or(config.width);
         let (bytes, largest) = extents(&served, &config, text_width)?;
 
-        // The trajectory class, by the largest trajectory a row holds, laid out alike on every
-        // rank of a group of each size.
+        // The trajectory class, by the largest trajectory a row holds: one host copy whatever
+        // the group's width, since every rank of a group holds the whole samples.
         let laid = trajectory_layout(largest, config.sample)?;
-        let (mut tensors, mut encodings) = ([0; 32], Vec::new());
-        for count in 1..=SAVING_RANKS.max(config.ranks) {
-            let (named, encoding) = runtime::encoding(&vec![laid.clone(); count as usize])
-                .map_err(|error| Error::Invalid(format!("a trajectory's layout: {error}")))?;
-            tensors = named;
-            encodings.push(encoding);
-        }
+        let (tensors, encoding) = runtime::encoding(std::slice::from_ref(&laid))
+            .map_err(|error| Error::Invalid(format!("a trajectory's layout: {error}")))?;
 
         // The state buffer holds defined values for the capture's first forward.
         let state = match &stream {
@@ -268,7 +261,7 @@ impl DenoiserRunner {
             state,
             bytes,
             tensors,
-            encodings,
+            encoding,
             current_step: RefCell::new(None),
             current_opening: RefCell::new(None),
         };
@@ -295,10 +288,9 @@ impl DenoiserRunner {
     }
 
     /// The trajectory class's `tensors` and `encoding` digests (`storage::runtime::Class`): the
-    /// largest trajectory's [`trajectory_layout`] on each rank of the group.
+    /// largest trajectory's [`trajectory_layout`], its one host copy.
     pub fn trajectory_digests(&self) -> ([u8; 32], [u8; 32]) {
-        let encoding = self.encodings[self.config.ranks as usize - 1];
-        (self.tensors, encoding)
+        (self.tensors, self.encoding)
     }
 
     /// Per captured shape, as `Capacity::media_bytes` states it: the request shape it serves, the
@@ -699,9 +691,11 @@ impl DenoiserRunner {
         Ok((before, after, written))
     }
 
-    /// The layouts a restore across encodings lays out (`BufferMemory::restore`): the part of
-    /// the saving rank this rank reads and its own row, both the trajectory's bytes, which every
-    /// rank of every group lays out alike (module documentation).
+    /// The layouts a restore across encodings lays out (`BufferMemory::restore`): the one host
+    /// copy, in the part of the host latent region the rank copies with, which every layout that
+    /// names the region saves into ([`BufferMemory::part_holder`]), and the rank's own row, both
+    /// the request's trajectory as its own layout lays it out (module documentation). The buffer
+    /// pool names another encoding only of the class's tensors.
     fn restoring(&self, copy: &BlockCopy) -> Result<(Vec<(u32, Stored)>, Stored)> {
         let refused = |problem: &str| {
             Error::Invalid(format!(
@@ -712,22 +706,27 @@ impl DenoiserRunner {
         let ([(host, _)], Some((source, target))) = (copy.runs.as_slice(), copy.encodings) else {
             return Err(refused("from no one block in another encoding"));
         };
-        let (_, encoding) = self.trajectory_digests();
-        let saving = self.encodings.iter().position(|held| *held == source);
-        let saving = match saving {
-            Some(index) if target == encoding => index as u32 + 1,
-            _ => return Err(refused("in an encoding this denoiser does not lay out")),
-        };
+        if target != self.encoding || source == self.encoding {
+            return Err(refused(
+                "between encodings this class does not restore across",
+            ));
+        }
+        let holder = self
+            .memory
+            .part_holder(host.0)
+            .ok_or_else(|| refused("from a host region no part of which the rank copies with"))?;
 
-        // Each saving rank's part holds the whole trajectory: a rank reads its own when it
-        // saved, and otherwise the part of a saving rank.
         let bytes = u64::from(host.2) * self.config.page_bytes;
         let pages = Stored {
             layout: bytes_layout(bytes),
             page_bytes: self.config.page_bytes,
         };
-        let rank = self.memory.rank() % saving;
-        Ok((vec![(rank, pages.clone())], pages))
+        Ok((vec![(holder, pages.clone())], pages))
+    }
+
+    /// Whether `copy` is a `Save`, which reads the slot rows.
+    fn saves(&self, copy: &BlockCopy) -> bool {
+        copy.runs.iter().any(|(from, _)| self.memory.rows(from.0))
     }
 
     /// Serves `batch` over `tables` on the stream: returns when the call was issued, and its
@@ -779,7 +778,7 @@ impl DenoiserRunner {
         self.graphs.replay(&bucket)?;
         // SAFETY: as above.
         unsafe { after.submit(stream) }?;
-        if self.config.shares {
+        if self.config.first {
             for (class, position) in written {
                 self.memory
                     .share(tables, (row.slot, class, position), Some(stream))?;
@@ -933,12 +932,14 @@ impl Runner for DenoiserRunner {
 
     /// Issues `copies` through the rank's media memory on the runner's stream, ahead of the
     /// batch whose end covers them: a restore of a trajectory saved in another encoding through
-    /// the copy manifest, every other copy as its bytes are.
+    /// the copy manifest, every other copy as its bytes are. A `Save` is the group's first
+    /// rank's alone, since it writes the one host copy every rank of the group holds.
     fn copy(&mut self, copies: &[BlockCopy]) -> Result<()> {
         let stream = self.stream.as_ref();
         let plain: Vec<BlockCopy> = copies
             .iter()
             .filter(|copy| copy.encodings.is_none())
+            .filter(|copy| self.config.first || !self.saves(copy))
             .cloned()
             .collect();
         let across = copies

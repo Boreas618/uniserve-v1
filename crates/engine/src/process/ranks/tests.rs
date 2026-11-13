@@ -35,9 +35,9 @@ use super::{
     Backing, LoadedRank, Meeting, bind, capacities, layout, load_ranks, open_ranks, spawn,
 };
 use crate::rank::ModelRunner;
-use crate::rank::video::{HOST_PARTS, PRODUCTS};
 use crate::storage_client::StorageClient;
 use crate::support::{DEPLOYMENT, SLOTS, StorageServer, launch};
+use ipc::product::KINDS;
 
 /// Submits `request` under `number` on the scheduler's end `pair` and returns its completion, the
 /// next to arrive, within ten seconds.
@@ -332,7 +332,7 @@ fn a_meta_media_rank_opens_its_media_memory_and_spawns_its_runners() {
     assert!(
         media_bytes
             .iter()
-            .all(|(_, trajectory, bytes)| bytes.len() == PRODUCTS.len() && *trajectory > 0)
+            .all(|(_, trajectory, bytes)| bytes.len() == KINDS.len() && *trajectory > 0)
     );
 
     // The session: the host regions of encoder outputs and stored trajectories, the rank's
@@ -348,16 +348,15 @@ fn a_meta_media_rank_opens_its_media_memory_and_spawns_its_runners() {
             .unwrap_or_else(|| panic!("the session states no region {prefix}"));
         (u8::try_from(index).unwrap(), &open.regions[index])
     };
+    // A host region's unit is one part, the one host copy of a block one rank holds whole.
     let (encoders_index, encoders_region) = named("host encoders");
     assert_eq!(encoders_region.tier, Tier::Host);
     assert_eq!(encoders_region.part_bytes, encoders::PAGE_BYTES);
-    assert_eq!(
-        encoders_region.unit_bytes,
-        encoders::PAGE_BYTES * HOST_PARTS
-    );
+    assert_eq!(encoders_region.unit_bytes, encoders::PAGE_BYTES);
     let (latents_index, latents_region) = named("host latents");
     assert_eq!(latents_region.tier, Tier::Host);
     assert_eq!(latents_region.part_bytes, pages.page_bytes().unwrap());
+    assert_eq!(latents_region.unit_bytes, latents_region.part_bytes);
     assert_eq!(
         u64::from(latents_region.units),
         worker::memory::latent::host::pool_pages(pages)
@@ -373,19 +372,19 @@ fn a_meta_media_rank_opens_its_media_memory_and_spawns_its_runners() {
     assert_eq!(slot_rows.part_bytes, video.row.next_multiple_of(UNIT_BYTES));
     assert_eq!(open.regions.len(), 4);
 
-    assert_eq!(open.classes.len(), PRODUCTS.len() + 1);
-    assert_eq!(usize::from(open.trajectory), PRODUCTS.len());
-    for (kind, class) in open.classes[..PRODUCTS.len()].iter().enumerate() {
-        assert_eq!(class.units, 0, "{}", PRODUCTS[kind]);
-        let conditioning = PRODUCTS[kind] == ipc::product::CONDITIONING;
+    assert_eq!(open.classes.len(), KINDS.len() + 1);
+    assert_eq!(usize::from(open.trajectory), KINDS.len());
+    for (kind, class) in open.classes[..KINDS.len()].iter().enumerate() {
+        let name = KINDS[kind].0;
+        assert_eq!(class.units, 0, "{name}");
+        let conditioning = name == ipc::product::CONDITIONING;
         assert_eq!(
             class.host,
             conditioning.then_some((encoders_index, 0)),
-            "{}",
-            PRODUCTS[kind]
+            "{name}"
         );
     }
-    let trajectory = &open.classes[PRODUCTS.len()];
+    let trajectory = &open.classes[KINDS.len()];
     assert_eq!(trajectory.host, Some((latents_index, 0)));
     assert_eq!(
         (trajectory.tensors, trajectory.encoding),
@@ -397,11 +396,11 @@ fn a_meta_media_rank_opens_its_media_memory_and_spawns_its_runners() {
     let group = &open.groups[0];
     assert_eq!(group.slots, slots_index);
     assert_eq!(group.regions.len(), open.classes.len());
-    for regions in &group.regions[..PRODUCTS.len()] {
+    for regions in &group.regions[..KINDS.len()] {
         assert_eq!(*regions, vec![products_index]);
     }
-    assert!(group.regions[PRODUCTS.len()].is_empty());
-    let request_units: u64 = (0..PRODUCTS.len())
+    assert!(group.regions[KINDS.len()].is_empty());
+    let request_units: u64 = (0..KINDS.len())
         .map(|kind| {
             let largest = media_bytes.iter().map(|(_, _, bytes)| bytes[kind]).max();
             largest.unwrap().div_ceil(UNIT_BYTES).max(1)
@@ -433,13 +432,7 @@ fn a_meta_media_rank_opens_its_media_memory_and_spawns_its_runners() {
         panic!("the owner is attached: {attached:?}");
     };
     succeeded(executors.map(GroupId(0), slot, RequestId(1), attach, attached));
-    let latents = u8::try_from(
-        PRODUCTS
-            .iter()
-            .position(|name| *name == ipc::product::VIDEO_LATENTS)
-            .unwrap(),
-    )
-    .unwrap();
+    let latents = u8::try_from(ipc::product::kind(ipc::product::VIDEO_LATENTS).unwrap()).unwrap();
     let allocate = Request::Allocate {
         owner: OwnerId(1),
         class: latents,
@@ -593,7 +586,7 @@ fn the_conditioning_lies_with_the_text_encoder_and_the_denoising_group_reads_it(
     };
     let (text_buffer, flow_buffer) = (region("products 1 0"), region("products 1 1"));
     let (text, flow) = (&open.groups[0], &open.groups[1]);
-    for (kind, name) in PRODUCTS.iter().enumerate() {
+    for (kind, (name, ..)) in KINDS.iter().enumerate() {
         let (texts, flows) = match *name {
             ipc::product::CONDITIONING => (vec![text_buffer], vec![text_buffer]),
             ipc::product::VISION_PIXELS => (vec![flow_buffer], vec![flow_buffer]),
@@ -624,10 +617,7 @@ fn the_conditioning_lies_with_the_text_encoder_and_the_denoising_group_reads_it(
         succeeded(executors.map(group, slot, RequestId(number), attach, attached));
         slots.push(slot);
     }
-    let conditioning = PRODUCTS
-        .iter()
-        .position(|name| *name == ipc::product::CONDITIONING)
-        .unwrap();
+    let conditioning = ipc::product::kind(ipc::product::CONDITIONING).unwrap();
     let allocate = Request::Allocate {
         owner: OwnerId(1),
         class: u8::try_from(conditioning).unwrap(),
@@ -652,6 +642,142 @@ fn the_conditioning_lies_with_the_text_encoder_and_the_denoising_group_reads_it(
             allocated.clone(),
         );
         succeeded(mapped);
+    }
+
+    drop(executors);
+    drop(spawned);
+    client.close().unwrap();
+}
+
+/// The launch of [`FAST_H3`] as `configs/minimax_h3/fasth3-dp8-text-tp8.toml` places it on one
+/// host of eight devices: the `text` group's eight ranks encode prompts eight-way tensor
+/// parallel, and eight one-rank `flow` replicas serve every other phase, replica `i` on the
+/// device of text rank `i`.
+fn dp8_launch() -> EngineArgs {
+    let mut launch = video_launch();
+    let file = crate::support::workspace().join("configs/minimax_h3/fasth3-dp8-text-tp8.toml");
+    let text = std::fs::read_to_string(file).unwrap();
+    launch.engine_config.parallel.worker_groups =
+        WorkerGroupConfig::parse_file(&text, "localhost").unwrap();
+    launch.devices = (0..8).collect();
+    launch.world_size = 8;
+    launch
+}
+
+#[test]
+#[ignore = "reads the headers of a released FastH3 checkpoint, which the repository does not hold"]
+fn a_device_holds_a_rank_of_the_text_group_and_one_of_a_flow_replica() {
+    assert!(Path::new(FAST_H3).is_dir(), "{FAST_H3} is missing");
+    let server = StorageServer::start();
+    let launch = dp8_launch();
+    assert_eq!(launch.engine_config.parallel.worker_groups.len(), 9);
+
+    // Sixteen ranks, two on each device: text rank `i` and the rank of flow replica `i`.
+    let registry = nn::family::Registry::new([minimax_h3::family::FAMILY]).unwrap();
+    let family = crate::resolve(&registry, Path::new(FAST_H3)).unwrap();
+    let model_runner = ModelRunner::of(&launch, family).unwrap();
+    let placed = model_runner.ranks().unwrap();
+    assert_eq!(placed.len(), 16);
+    for device in 0..8 {
+        let on: Vec<u32> = placed
+            .iter()
+            .filter(|rank| rank.devices() == [platform::DeviceId(device)])
+            .map(ModelRunner::rank)
+            .collect();
+        assert_eq!(on, [device as u32, 8 + device as u32], "device {device}");
+    }
+    let mut ranks = load_ranks(placed, Backing::Meta, &launch, Meeting::Local).unwrap();
+    for (index, rank) in ranks.iter().enumerate() {
+        let denoises = rank.video().unwrap().row > 0;
+        assert_eq!(denoises, index >= 8, "rank {index}");
+    }
+
+    // One scheduler of the nine groups; a product buffer per rank; a host region's unit is one
+    // part, the one host copy of a block one rank holds whole.
+    let open = layout(&launch, &ranks).unwrap();
+    assert_eq!(
+        open.schedulers,
+        vec![(0..9).map(GroupId).collect::<Vec<_>>()]
+    );
+    let region = |name: &str| {
+        let index = open.regions.iter().position(|region| region.name == name);
+        u8::try_from(index.unwrap_or_else(|| panic!("no region {name}"))).unwrap()
+    };
+    for rank in 0..16 {
+        region(&format!("products 1 {rank}"));
+    }
+    for host in ["host encoders", "host latents"] {
+        let stated = open
+            .regions
+            .iter()
+            .find(|region| region.name.starts_with(host));
+        let stated = stated.unwrap_or_else(|| panic!("no region {host}"));
+        assert_eq!(stated.unit_bytes, stated.part_bytes, "{host}");
+    }
+
+    // The conditioning lies with text rank 0 alone, where every flow replica reads it.
+    let conditioning = ipc::product::kind(ipc::product::CONDITIONING).unwrap();
+    let text_buffer = region("products 1 0");
+    for group in &open.groups {
+        assert_eq!(group.regions[conditioning], vec![text_buffer]);
+    }
+
+    // The session opens, every rank opens its own memory, two of them on each device, and an
+    // executor serves each rank.
+    let mut client = StorageClient::connect(&server.socket, DEPLOYMENT, launch.epoch).unwrap();
+    let mut pairs = client.open(open.clone()).unwrap();
+    let opened = client.session().unwrap().1.clone();
+    assert!(open_ranks(&mut ranks, &open, &opened).unwrap().is_empty());
+    let (executors, spawned) = spawn(&mut ranks, &client, &pairs, Vec::new()).unwrap();
+    assert_eq!(spawned.len(), 16);
+
+    // A request's conditioning, allocated for its owner on the text group in text rank 0's
+    // buffer, is mapped into the tables of the flow replica that serves the request, whose ranks
+    // share text rank 0's device or not.
+    let pair = &mut pairs[0];
+    let mut slots = Vec::new();
+    for (number, (owner, group)) in [(1, (OwnerId(1), GroupId(0))), (2, (OwnerId(2), GroupId(4)))] {
+        let attach = Request::Attach { owner, group };
+        let attached = ask(pair, number, &attach);
+        let Completion::Attached { slot } = attached else {
+            panic!("the owner is attached: {attached:?}");
+        };
+        succeeded(executors.map(group, slot, RequestId(number), attach, attached));
+        slots.push(slot);
+    }
+    let allocate = Request::Allocate {
+        owner: OwnerId(1),
+        class: u8::try_from(conditioning).unwrap(),
+        at: 3,
+        count: 1,
+        units: 2,
+    };
+    let allocated = ask(pair, 3, &allocate);
+    let Completion::Allocated { runs, .. } = &allocated else {
+        panic!("a block is allocated: {allocated:?}");
+    };
+    assert_eq!(
+        *runs,
+        vec![(opened.regions[usize::from(text_buffer)].0, 0, 2)]
+    );
+    for (group, slot) in [(GroupId(0), slots[0]), (GroupId(4), slots[1])] {
+        let mapped = executors.map(
+            group,
+            slot,
+            RequestId(3),
+            allocate.clone(),
+            allocated.clone(),
+        );
+        succeeded(mapped);
+    }
+
+    // What the groups state: the text group encodes prompts, and each replica every other phase.
+    let stated = capacities(&ranks, &open).unwrap();
+    assert_eq!(stated.len(), 9);
+    for (id, capacity) in &stated {
+        let text = *id == GroupId(0);
+        assert_eq!(capacity.serves(Phase::TextEncode), text, "group {}", id.0);
+        assert_eq!(capacity.serves(Phase::Denoise), !text, "group {}", id.0);
     }
 
     drop(executors);

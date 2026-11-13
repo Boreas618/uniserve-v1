@@ -16,6 +16,13 @@
 //! first, lent in place. The eager encode takes its memory from the runner's region, over the
 //! inputs of the bucket that holds the prompt.
 //!
+//! The runner states its eager buckets ([`Runner::eager_buckets`]): the extent of each one-row
+//! bucket that a prompt with vision blocks the deployment admits fits
+//! ([`EncoderConfig::warm`]), under [`Variant::ConditionEncode`]. A profile run of one encodes
+//! every such prompt that fits it, its ids padded to the bucket's tokens, over patch rows of its
+//! grids, so the runner's region holds the eager vision encodes and every generation resolves
+//! their kernels.
+//!
 //! An encode reads no cache and samples no token: its batch's slot mapping writes nothing, and
 //! its output is the one tensor its forward returns.
 
@@ -70,6 +77,11 @@ pub struct EncoderConfig {
     pub conditioning: u8,
     /// The class of the vision pixels product, which a prompt with vision blocks reads.
     pub pixels: u8,
+    /// The prompts with vision blocks the deployment admits whose grids it fixes
+    /// (`nn::family::VideoModel::warm_prompts`): each prompt's grids and the token ids that
+    /// present them, which its eager encodes are profiled over. Empty for an encoder that takes
+    /// no image.
+    pub warm: Vec<(Vec<[u32; 3]>, Vec<u32>)>,
 }
 
 /// The runner of a text encoder (module documentation).
@@ -203,6 +215,53 @@ impl EncoderRunner {
     /// The input column `column`, its first `elements` elements of `dtype`.
     fn column(&self, column: usize, elements: usize, dtype: DType) -> Result<Tensor> {
         self.graphs.input(self.offsets[column], elements, dtype)
+    }
+
+    /// The admitted prompts with vision blocks whose ids `bucket`'s tokens hold.
+    fn warm_fitting(&self, bucket: &Bucket) -> Vec<&(Vec<[u32; 3]>, Vec<u32>)> {
+        self.config
+            .warm
+            .iter()
+            .filter(|(_, ids)| ids.len() <= bucket.tokens as usize)
+            .collect()
+    }
+
+    /// Patch rows of `grids`, one `[patches, width]` tensor per grid in the vision pixels
+    /// product's format, from the context installed on this thread; their values are
+    /// unspecified, as a profile run reads none.
+    fn patch_rows(&self, grids: &[[u32; 3]]) -> Result<Vec<Tensor>> {
+        let format = self.config.patches.ok_or_else(|| {
+            Error::Invariant("an encoder that takes no image profiles no vision prompt".into())
+        })?;
+
+        grids
+            .iter()
+            .map(|grid| {
+                let patches: usize = grid.iter().map(|extent| *extent as usize).product();
+                let shape = (patches, format.width() as usize);
+                Ok(backend::empty(shape, format.dtype)?)
+            })
+            .collect()
+    }
+
+    /// Encodes `prompt`, its ids `ids` on the device and its packed rows `batch`, with the
+    /// vision blocks of `grids` whose patch rows are `pixels`, into a new output of its layout's
+    /// rows.
+    fn encode(
+        &self,
+        prompt: &[u32],
+        (ids, batch): (&Tensor, &TokenBatch),
+        grids: &[[u32; 3]],
+        pixels: &[Tensor],
+    ) -> Result<Tensor> {
+        let layout = self.model.layout(batch, grids);
+        let shape = (layout.rows as usize, self.config.width as usize);
+
+        // SAFETY: the encode writes every row of its layout before anything reads them.
+        let out = unsafe { Tensor::empty(shape, self.config.dtype, &self.graphs.device()) }?;
+        self.model
+            .encode(prompt, ids, batch, pixels, &layout, &out)?;
+        Ok(out)
     }
 
     /// Writes `values`, padded with `padding` to `elements`, into column `column` of `block`.
@@ -446,6 +505,21 @@ impl Runner for EncoderRunner {
         self.config.buckets.capture_order().copied().collect()
     }
 
+    /// The extent of each one-row bucket a prompt with vision blocks the deployment admits fits,
+    /// as such a prompt is encoded alone in it (module documentation).
+    fn eager_buckets(&self) -> Vec<Bucket> {
+        if self.config.patches.is_none() {
+            return Vec::new();
+        }
+
+        self.config
+            .buckets
+            .capture_order()
+            .filter(|bucket| bucket.rows == 1 && !self.warm_fitting(bucket).is_empty())
+            .map(|bucket| Bucket::prefill(1, bucket.tokens, Variant::ConditionEncode))
+            .collect()
+    }
+
     /// The encode of the prompt the runner prepared, padded to `bucket`, over the input
     /// columns, with the vision blocks of a prompt encoded eagerly: `[rows, width]`, one output
     /// row per row of the encode's layout.
@@ -488,23 +562,30 @@ impl Runner for EncoderRunner {
             ngram_context: None,
         };
 
+        let ids = self.column(IDS, tokens, DType::U32)?;
         let images = self.images.borrow();
+
+        // A profile run of an eager bucket encodes every admitted prompt with vision blocks that
+        // fits it, over patch rows of its grids.
+        if bucket.variant == Variant::ConditionEncode && images.is_empty() {
+            let mut out = Vec::new();
+            for (grids, warm) in self.warm_fitting(bucket) {
+                let mut prompt = warm.clone();
+                prompt.resize(tokens, 0);
+                let pixels = self.patch_rows(grids)?;
+                out = vec![self.encode(&prompt, (&ids, &batch), grids, &pixels)?];
+            }
+            return Ok(out);
+        }
+
         let grids: Vec<[u32; 3]> = images.iter().map(|(grid, _)| *grid).collect();
         let pixels: Vec<Tensor> = images.iter().map(|(_, pixels)| pixels.clone()).collect();
-        let layout = self.model.layout(&batch, &grids);
-
-        let shape = (layout.rows as usize, self.config.width as usize);
-        // SAFETY: the encode writes every row of its layout before anything reads them.
-        let out = unsafe { Tensor::empty(shape, self.config.dtype, &self.graphs.device()) }?;
-        self.model.encode(
+        Ok(vec![self.encode(
             &prompt,
-            &self.column(IDS, tokens, DType::U32)?,
-            &batch,
+            (&ids, &batch),
+            &grids,
             &pixels,
-            &layout,
-            &out,
-        )?;
-        Ok(vec![out])
+        )?])
     }
 
     /// A prompt of zeros in one empty row: an encode that writes no request's conditioning.
@@ -573,12 +654,12 @@ impl Runner for EncoderRunner {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
+    use std::sync::{Arc, Mutex};
 
     use ipc::RequestId;
     use ipc::batch::{Batch, BatchId, Columns, Extent, MediaRow, Phase, Rows, Shape, Variant};
     use nn::TokenBatch;
-    use nn::capability::{Encoder, EncoderLayout};
+    use nn::capability::{Encoder, EncoderLayout, PatchFormat, PixelNorm};
     use ops::Generation;
     use storage::Key;
     use storage::runtime::{Completion, GroupId, OwnerId, Request};
@@ -642,6 +723,7 @@ mod tests {
             patches: None,
             conditioning: CONDITIONING,
             pixels: PIXELS,
+            warm: Vec::new(),
         };
         let graphs = Graphs::meta(
             Arc::new(Generation::new(0, [])),
@@ -791,5 +873,126 @@ mod tests {
         // the batch.
         assert!(runner.place(&encoding(4), &tables).is_err());
         assert!(runner.place(&batch, &self::tables(true)).is_err());
+    }
+
+    /// An encoder that records the grids and the prompt length of each encode it is given.
+    #[derive(Default)]
+    struct Recording(Mutex<Vec<(Vec<[u32; 3]>, usize)>>);
+
+    impl Encoder for Recording {
+        fn layout(&self, batch: &TokenBatch, images: &[[u32; 3]]) -> EncoderLayout {
+            Silent.layout(batch, images)
+        }
+
+        fn encode(
+            &self,
+            prompt: &[u32],
+            _: &Tensor,
+            _: &TokenBatch,
+            images: &[Tensor],
+            layout: &EncoderLayout,
+            _: &Tensor,
+        ) -> nn::Result<()> {
+            // Each grid's patch rows, twelve elements wide.
+            for (grid, pixels) in layout.images.iter().zip(images) {
+                let patches: u32 = grid.iter().product();
+                assert_eq!(pixels.dims(), [patches as usize, 12]);
+            }
+            assert_eq!(images.len(), layout.images.len());
+
+            self.0
+                .lock()
+                .unwrap()
+                .push((layout.images.clone(), prompt.len()));
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn a_profile_run_encodes_each_admitted_vision_prompt_in_every_bucket_it_rides() {
+        // Patch rows of three channels of 2x2 pixels, merged 2x2: twelve elements a row, and a
+        // 4x4 grid merges to four tokens, which a prompt presents between two markers.
+        let patches = PatchFormat {
+            side: 2,
+            temporal: 1,
+            merge: 2,
+            channels: 3,
+            norm: PixelNorm {
+                mean: [0.5; 3],
+                std: [0.5; 3],
+            },
+            dtype: DType::BF16,
+        };
+        let block = [0, 9, 9, 9, 9, 0];
+        let warm = vec![
+            (vec![[1, 4, 4]], block.to_vec()),
+            (vec![[1, 4, 4]; 2], block.repeat(2)),
+        ];
+        let config = EncoderConfig {
+            buckets: Buckets::new([
+                Bucket::prefill(1, 8, Variant::Encode),
+                Bucket::prefill(2, 8, Variant::Encode),
+                Bucket::prefill(1, 16, Variant::Encode),
+                Bucket::prefill(2, 16, Variant::Encode),
+            ]),
+            width: 4,
+            dtype: DType::BF16,
+            patches: Some(patches),
+            conditioning: CONDITIONING,
+            pixels: PIXELS,
+            warm,
+        };
+        let graphs = Graphs::meta(
+            Arc::new(Generation::new(0, [])),
+            EncoderRunner::input_bytes(&config),
+        );
+        let memory = BufferMemory::meta(0, (PRODUCTS, 64), (SLOTS, 4), 0, &[]).unwrap();
+        let model = Arc::new(Recording::default());
+        let runner = EncoderRunner::new(
+            Arc::clone(&model) as _,
+            config,
+            graphs,
+            None,
+            Arc::new(memory),
+        )
+        .unwrap();
+
+        // A prompt with vision blocks is encoded alone: the one-row buckets its ids fit, the one
+        // keyframe's of eight tokens and both prompts' of sixteen.
+        let eager = runner.eager_buckets();
+        assert_eq!(
+            eager,
+            [
+                Bucket::prefill(1, 16, Variant::ConditionEncode),
+                Bucket::prefill(1, 8, Variant::ConditionEncode),
+            ]
+        );
+
+        // The profile run encodes each such prompt in each bucket it rides, padded to the
+        // bucket's tokens, beside the captured buckets' text encodes.
+        runner.graphs().profile_run(&runner).unwrap();
+        let mut vision: Vec<(Vec<[u32; 3]>, usize)> = model
+            .0
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(grids, _)| !grids.is_empty())
+            .cloned()
+            .collect();
+        vision.sort();
+        assert_eq!(
+            vision,
+            [
+                (vec![[1, 4, 4]], 8),
+                (vec![[1, 4, 4]], 16),
+                (vec![[1, 4, 4]; 2], 16),
+            ]
+        );
+        for bucket in &eager {
+            assert!(runner.graphs().launch_table(bucket).is_some());
+        }
+
+        // An encoder that takes no image states no eager bucket.
+        assert!(self::runner().eager_buckets().is_empty());
     }
 }

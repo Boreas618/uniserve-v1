@@ -9,18 +9,20 @@
 //! `Restore` copies the block back into a slot's row ([`BufferMemory::copy`], or
 //! [`BufferMemory::restore`] for a block saved in another encoding).
 //!
-//! The region is one unit space with one part per rank index, which the Storage Server creates on
-//! the NUMA node closest to the rank's device (`storage::protocol::Request::HostPart`). A unit of
-//! a rank's part is one page of its trajectory row ([`BankPages`]), so a block of `n` units holds
-//! the first `n` pages of the row on every rank: each rank of a denoising group holds its share
-//! of the request's samples in its own row and copies it to its own part, and the scheduler sizes
-//! the block by the most pages a rank's share takes. The same rank of every epoch of the
-//! deployment that names the region maps the same part, whatever its parallel configuration, so
-//! an epoch that succeeds another finds the trajectories its predecessor saved; one that lays
-//! them out otherwise restores them through the copy manifest of the two layouts, reading every
-//! saving rank's part it reaches ([`super::restore`]). The region is sized for the trajectories
-//! the ranks can have saved at once ([`pool_pages`]). The scheduler decides what is saved and
-//! restored and keys it; the rank only copies, on a stream of its device.
+//! The region is one unit space with one part per rank index that maps one, which the Storage
+//! Server creates on the NUMA node closest to the rank's device
+//! (`storage::protocol::Request::HostPart`). A unit of a part is one page of a trajectory row
+//! ([`BankPages`]), so a block of `n` units holds the first `n` pages of the row. Every rank of a denoising group holds the request's
+//! whole samples in its own row, so a saved trajectory has one host copy: the group's first rank
+//! copies its row to the part it copies with ([`BufferMemory::part_holder`]), every rank of the
+//! restoring group copies it back, and the scheduler sizes the block by the trajectory's pages. A
+//! media deployment maps one part of the region, on the first rank of its process, which every
+//! group and every epoch of the deployment that names the region copies with, whatever its
+//! parallel configuration, so an epoch that succeeds another finds the trajectories its
+//! predecessor saved; one that lays them out otherwise restores them through the copy manifest of
+//! the two layouts ([`super::restore`]). The region is sized for the trajectories the groups can
+//! have saved at once ([`pool_pages`]). The scheduler decides what is saved and restored and keys
+//! it; the rank only copies, on a stream of its device.
 
 use uniserve_tensor::DType;
 
@@ -48,9 +50,9 @@ const PAGE_ENCODING: u32 = 1;
 /// A trajectory the region evicted beyond that, as when requests reach the engine in another
 /// order, is a miss: its request starts from noise.
 ///
-/// These are the units one denoising group's trajectories take, `pages` a rank's of it: every
-/// rank of the group fills its own part of the same units. Two groups save into units apart, so
-/// the region's numbering is the sum of this over the groups that save there.
+/// These are the units one denoising group's trajectories take, `pages` a rank's of it: the
+/// group's first rank fills them in the part it copies with. Two groups save into units apart,
+/// so the region's numbering is the sum of this over the groups that save there.
 pub fn pool_pages(pages: BankPages) -> u64 {
     host_pages::resuming_pages(pages.pages)
 }

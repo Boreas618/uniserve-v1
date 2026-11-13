@@ -142,7 +142,7 @@ fn config(candidates: Vec<VideoRequest>, ranks: u32) -> DenoiserConfig {
         classes: CLASSES,
         ranks,
         page_bytes: PAGE,
-        shares: true,
+        first: true,
     }
 }
 
@@ -153,20 +153,14 @@ fn runner(config: DenoiserConfig, memory: BufferMemory) -> DenoiserRunner {
     DenoiserRunner::new(Arc::new(Model), config, graphs, None, Arc::new(memory)).unwrap()
 }
 
-/// The meta memory of rank `rank` with its product buffer in `products`, three slot rows and
-/// its part of the host latent region.
-fn memory(rank: u32, products: u8) -> BufferMemory {
+/// The meta memory of rank `rank` with its product buffer in `products`, three slot rows and,
+/// when it `maps` one, its part of the host latent region.
+fn memory(rank: u32, products: u8, maps: bool) -> BufferMemory {
     let row = DenoiserRunner::row_bytes(&Model, &config(vec![candidate(8, 8)], 1)).unwrap();
     assert_eq!(row, SOURCE + 288);
 
-    BufferMemory::meta(
-        rank,
-        (products, 64),
-        (SLOTS, 3),
-        row,
-        &[(LATENTS, PAGE, 32)],
-    )
-    .unwrap()
+    let parts: &[(u8, u64, u32)] = if maps { &[(LATENTS, PAGE, 32)] } else { &[] };
+    BufferMemory::meta(rank, (products, 64), (SLOTS, 3), row, parts).unwrap()
 }
 
 /// The tables of a rank with its product buffer in `products`, the request attached on `slot`
@@ -304,7 +298,7 @@ fn a_preparation_and_two_steps_keep_the_state_in_the_row_and_the_last_writes_the
             (CLASSES[4], 2, (PRODUCTS, 8, 1)),
         ],
     );
-    let runner = runner(config(vec![candidate(8, 8)], 1), memory(0, PRODUCTS));
+    let runner = runner(config(vec![candidate(8, 8)], 1), memory(0, PRODUCTS, true));
 
     // The preparation reads the prompt's five rows from the conditioning block, and opens the
     // request over its slot's row: the latents from the row's first byte, then the two widths
@@ -385,7 +379,7 @@ fn a_trajectory_saved_and_restored_in_its_encoding_returns_to_the_rows_latents()
         &Completion::Attached { slot: 1 },
     )
     .unwrap();
-    let mut runner = runner(config(vec![candidate(8, 8)], 1), memory(0, PRODUCTS));
+    let mut runner = runner(config(vec![candidate(8, 8)], 1), memory(0, PRODUCTS, true));
 
     // The trajectory of the request's shape is its latents, three pages of the host region.
     let shapes = runner.media_shapes().unwrap();
@@ -442,15 +436,18 @@ fn a_trajectory_saved_and_restored_in_its_encoding_returns_to_the_rows_latents()
 }
 
 #[test]
-fn a_trajectory_saved_by_fewer_ranks_is_restored_from_a_saving_ranks_part() {
-    // Two ranks of one process; the trajectory was saved by a group of one, into rank 0's part.
-    let mut memories = vec![memory(0, PRODUCTS), memory(1, OTHER_PRODUCTS)];
+fn a_trajectory_saved_in_another_encoding_is_restored_from_the_part_its_process_maps() {
+    // Two ranks of one process: rank 0 maps the process's part of the host latent region, and
+    // rank 1, a rank of a group of two that restores, maps none and copies with rank 0's.
+    let mut memories = vec![memory(0, PRODUCTS, true), memory(1, OTHER_PRODUCTS, false)];
     BufferMemory::connect(&mut memories).unwrap();
     let other = memories.pop().unwrap();
     let mut runner = runner(config(vec![candidate(8, 8)], 2), other);
-    let one = runner.encodings[0];
-    let (_, two) = runner.trajectory_digests();
-    assert_ne!(one, two, "the class's encoding states its ranks");
+
+    // The class states one host copy, whatever the width of the group that wrote it.
+    let (_, encoding) = runner.trajectory_digests();
+    let alone = self::runner(config(vec![candidate(8, 8)], 1), memory(0, PRODUCTS, true));
+    assert_eq!(alone.trajectory_digests().1, encoding);
 
     let trajectory = VIDEO + AUDIO;
     let pages = trajectory.div_ceil(PAGE) as u32;
@@ -460,29 +457,31 @@ fn a_trajectory_saved_by_fewer_ranks_is_restored_from_a_saving_ranks_part() {
     let mut mirrors = HashMap::from([
         ((SLOTS, 1), vec![0; (3 * ROW) as usize]),
         ((LATENTS, 0), part),
-        ((LATENTS, 1), vec![0; (32 * PAGE) as usize]),
     ]);
 
+    // Saved by a deployment whose largest layout is another: another encoding of the class's
+    // tensors, which the request's own layout lays out alike.
     let mut held = tables(OTHER_PRODUCTS, SLOT, &[]);
     let restore = Request::Restore {
         owner: OwnerId(1),
         key: Key([1; 32]),
     };
     let runs = ((LATENTS, 5, pages), (SLOTS, SLOT, 1));
-    let copy = started(&mut held, (50, &restore), runs, Some((one, two)));
+    let elsewhere = [9; 32];
+    let copy = started(&mut held, (50, &restore), runs, Some((elsewhere, encoding)));
 
-    // Rank 1 saved nothing, so it reads rank 0's part through the manifest.
     let (sources, target) = runner.restoring(&copy).unwrap();
     assert_eq!(sources.len(), 1);
-    assert_eq!(sources[0].0, 0);
+    assert_eq!(sources[0].0, 0, "the part rank 0 maps holds the host copy");
     let moved = runner.memory.restored(&copy, &sources, &target).unwrap();
     apply(&mut mirrors, &moved);
     let row = ROW as usize..(ROW + trajectory) as usize;
     assert_eq!(mirrors[&(SLOTS, 1)][row], saved[..]);
     runner.copy(std::slice::from_ref(&copy)).unwrap();
 
-    // An encoding the runner does not lay out, or another class's, is refused.
-    for encodings in [([9; 32], two), (one, one)] {
+    // A copy into an encoding other than the class's, or one naming the class's on both sides,
+    // is refused.
+    for encodings in [(elsewhere, [8; 32]), (encoding, encoding)] {
         let copy = BlockCopy {
             encodings: Some(encodings),
             ..copy.clone()
@@ -495,7 +494,7 @@ fn a_trajectory_saved_by_fewer_ranks_is_restored_from_a_saving_ranks_part() {
 fn each_layout_is_profiled_its_steps_captured_and_a_batch_with_no_row_returns_no_call() {
     // A shorter prompt of the first shape takes its layout: two buckets for three candidates.
     let candidates = vec![candidate(8, 8), candidate(8, 4), candidate(16, 8)];
-    let mut runner = runner(config(candidates, 1), memory(0, PRODUCTS));
+    let mut runner = runner(config(candidates, 1), memory(0, PRODUCTS, true));
     let (steps, preparations) = (runner.buckets(), runner.eager_buckets());
     assert_eq!(steps.len(), 2);
     assert!(

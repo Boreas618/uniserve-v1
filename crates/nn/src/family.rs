@@ -643,13 +643,16 @@ pub trait VideoModel: Send + Sync {
     /// The prompts with vision blocks a deployment serving `serving` admits whose grids the
     /// deployment fixes: one per distinct set of grids, each as a request of a served resolution
     /// presents it, as the patch grids (`[time, rows, columns]`) of its vision blocks in
-    /// presentation order and the vision placeholder tokens those blocks present.
+    /// presentation order and the token ids of a prompt that presents those blocks: each block's
+    /// placeholder tokens, one per merged row, and the tokens that delimit the blocks, as the
+    /// text encoder reads a prompt ([`Encoder::encode`]).
     ///
     /// A prompt that presents vision blocks is encoded eagerly over its own layout and not by a
     /// captured graph, in the same stream region the captured encodes take their memory from,
     /// so the text encoder's profile run encodes each beside the captured encodes and the
     /// region's peak holds the eager vision encode as well. A prompt holding the blocks is at
-    /// least their tokens long, so it rides only an encode bucket of at least that many tokens.
+    /// least as long as these ids, so it rides only an encode bucket of at least that many
+    /// tokens.
     ///
     /// Empty for a deployment whose tasks present no vision block.
     ///
@@ -657,7 +660,11 @@ pub trait VideoModel: Send + Sync {
     ///
     /// Fails when `serving` states a size the pipeline does not serve, or when a task presents
     /// vision blocks and the checkpoint states no rule to size them.
-    fn warm_prompts(&self, serving: &VideoServing) -> Result<Vec<(Vec<[u32; 3]>, u32)>>;
+    #[expect(
+        clippy::type_complexity,
+        reason = "each prompt's grids and ids, as the text encoder's runner reads them"
+    )]
+    fn warm_prompts(&self, serving: &VideoServing) -> Result<Vec<(Vec<[u32; 3]>, Vec<u32>)>>;
 
     /// What the placed denoiser serves under `serving`, as the deployment's request processing
     /// admits requests against it.

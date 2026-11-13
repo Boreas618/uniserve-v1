@@ -26,9 +26,10 @@
 //! and forms its text encoder's and denoiser's groups; the layout states every rank's product
 //! buffer, the slot rows of each group with a trajectory's row, the host regions of encoder
 //! outputs and stored trajectories, and the product classes with the regions each group's
-//! blocks write and read; its opening takes its media memory from its graph pool's resident pool
-//! and maps its parts of the host regions, connects the process's memories, and builds the
-//! serving runners over them. It creates no segment.
+//! blocks write and read; its opening takes its media memory from its graph pool's resident pool,
+//! the process's first rank maps the one part of each host region, the process's memories are
+//! connected, and the serving runners are built over them. It creates no segment. A device that
+//! holds ranks of several groups opens one graph pool and one media memory per rank.
 //!
 //! A start that is backed by nothing outside the process ([`Backing::Meta`]) takes the same
 //! steps over owners that hold no device: its loads stop after the profile run, its "segments"
@@ -72,8 +73,7 @@ use worker::{Runner, RunnerId};
 use crate::rank::memory::{Peaks, fewest_units, granularity, plane_segments, scratch_bytes};
 use crate::rank::text::{Keys, keys, profile};
 use crate::rank::video::{
-    FLOWS, HOST_PARTS, PRODUCTS, VideoRank, boxed, group_phases, product_classes, product_kind,
-    served_phases,
+    VideoRank, boxed, group_phases, latent_pages, product_classes, product_kind, served_phases,
 };
 use crate::rank::{Collective, ModelRunner, RankModel, Weights, media_tasks};
 
@@ -817,6 +817,23 @@ fn memory(group: &WorkerGroupConfig) -> String {
         .join(",")
 }
 
+/// The device memory the ranks of a media deployment's groups address: every rank's product
+/// buffer and the host parts of its one process, which each rank reaches
+/// (`BufferMemory::connect`), named by the devices of the deployment's serving ranks. Every group
+/// of every layout over those devices states this one memory, however many groups a layout
+/// places on them: the buffer pool numbers a deployment's memories with a bit each.
+fn media_memory(groups: &[WorkerGroupConfig]) -> String {
+    let mut devices: Vec<String> = groups
+        .iter()
+        .filter(|group| group.role.serves_requests())
+        .flat_map(|group| group.ranks.iter())
+        .map(|rank| format!("{}/{}", rank.host, rank.device))
+        .collect();
+    devices.sort_unstable();
+    devices.dedup();
+    devices.join(",")
+}
+
 /// The name of the device region of scheduler `scheduler`'s KV units of `layout` and `units`: two
 /// epochs of one layout and one cache name one region, and any other layout another, whose memory
 /// space is its own (`specs/buffer-pool.md` §14.1).
@@ -885,7 +902,7 @@ pub(crate) fn layout(launch: &EngineArgs, ranks: &[LoadedRank]) -> Result<Open> 
 ///   slot rows, numbered from 1, the epoch's own. A unit's bytes are summed over the tensor ranks
 ///   that hold a part of it.
 /// - **Classes**, in the numbering the worker uses: cache group `g` is class `g`, then one class
-///   per product kind in the order of the product classes (`crate::rank::video::PRODUCTS`), then
+///   per product kind in the order of the product classes (`ipc::product::KINDS`), then
 ///   the class of stored trajectories. A text deployment holds no product and no trajectory:
 ///   those classes name no region.
 /// - **Groups**, numbered for the session ([`group_numbers`]), each with its memory, its slot
@@ -996,7 +1013,7 @@ pub fn text_layout(
                 segments: Vec::new(),
             });
             let mut per_class: Vec<Vec<u8>> = vec![vec![kv_region]; cache.groups.len()];
-            per_class.extend((0..=PRODUCTS.len()).map(|_| Vec::new()));
+            per_class.extend((0..=product::KINDS.len()).map(|_| Vec::new()));
             stated.push(Group {
                 id: *id,
                 memory: memory(group),
@@ -1009,7 +1026,8 @@ pub fn text_layout(
     // Class `g` is cache group `g`; then the product kinds and the stored trajectories, which a
     // text deployment sizes per request and holds none of.
     let ranks_per_unit = u32::try_from(tensor).unwrap_or(u32::MAX);
-    let mut classes: Vec<Class> = Vec::with_capacity(cache.groups.len() + PRODUCTS.len() + 1);
+    let kinds = product::KINDS.len();
+    let mut classes: Vec<Class> = Vec::with_capacity(cache.groups.len() + kinds + 1);
     for (index, (group, host)) in cache.groups.iter().zip(&host_regions).enumerate() {
         let (tensors, encoding) = host::class_digests(cache, index, ranks_per_unit)?;
         classes.push(Class {
@@ -1022,7 +1040,7 @@ pub fn text_layout(
     }
     // A text deployment keeps no product on the host, so no host copy of these classes is
     // written or compared: they state no tensors and no encoding.
-    classes.extend((0..=PRODUCTS.len()).map(|_| Class {
+    classes.extend((0..=kinds).map(|_| Class {
         units: 0,
         host: None,
         state_in_slot: false,
@@ -1049,24 +1067,29 @@ pub fn text_layout(
 /// media groups (`ModelRunner::media_ranks` refuses a group with ranks in another process):
 ///
 /// - **Regions.** The host region of encoder outputs when a group encodes prompts, and the host
-///   region of stored trajectories when a group denoises: the deployment's on the host, each a
-///   unit of [`HOST_PARTS`] parts (`worker::memory::encoders::PAGE_BYTES` and a latent page),
-///   numbered for the outputs or trajectories every such group can have stored at once, and
-///   named by their layout and numbering, so another epoch that states them alike finds what
-///   this one stored. Per group, the product buffer of each of its ranks, the epoch's own, of
-///   [`UNIT_BYTES`] units, holding the blocks of every request slot of each product kind the
-///   rank backs at the largest size the denoising group states; then the region of its slot
-///   rows, a unit the trajectory row of each of its denoising ranks.
-/// - **Classes.** One per product kind in [`PRODUCTS`] order, sized per request: the
+///   region of stored trajectories when a group denoises: the deployment's on the host, numbered
+///   for the outputs or trajectories every such group can have stored at once. A block of either
+///   lies whole in one rank's memory and has one host copy, so a unit is one part
+///   (`worker::memory::encoders::PAGE_BYTES` and a latent page), the part of the process's first
+///   rank, which every rank copies with (`BufferMemory::part_holder`). Each is named by its
+///   class's tensors, the layout of its units and its numbering, not by the ranks of a layout, so
+///   another epoch of any parallel configuration that numbers it alike finds what this one
+///   stored; the buffer pool keeps a region's numbering under its name. Per group, the product
+///   buffer of each of its ranks, the epoch's own, of [`UNIT_BYTES`] units, holding the blocks of
+///   every request slot of each product kind the rank backs at the largest size the denoising
+///   group states; then the region of its slot rows, a unit the trajectory row of each of its
+///   denoising ranks.
+/// - **Classes.** One per product kind in `ipc::product::KINDS` order, sized per request: the
 ///   conditioning with its host copies in the host encoder region and the digests its encoding
 ///   states, the others with none; then the class of stored trajectories, with its host copies
 ///   in the host latent region and the digests the denoiser states (`trajectory_digests`).
-/// - **Groups.** Each with its memory and its slot rows, and per product class the regions its
-///   blocks lie in: for a group whose phase writes the product, the product buffers of its
-///   ranks, or for the conditioning its first text encoder rank's alone, an encoder output
-///   being one rank's; for a group whose phase reads it, the regions of the groups of its
-///   scheduler that write it, so the scheduler maps the writer's completions into the reader's
-///   tables. **Per scheduler** its groups, and the deployment's peers.
+/// - **Groups.** Each with the process's media memory ([`media_memory`]) and its slot rows, and
+///   per product class the regions its blocks lie in: for a group whose phase writes the
+///   product, the product buffers of its ranks, or for the conditioning its first text encoder
+///   rank's alone, an encoder output being one rank's; for a group whose phase reads it, the
+///   regions of the groups of its scheduler that write it, so the scheduler maps the writer's
+///   completions into the reader's tables. **Per scheduler** its groups, and the deployment's
+///   peers.
 ///
 /// A rank backs the products its group writes. The sizes come from a rank of the group that
 /// denoises, which states them for every product kind (`Capacity::media_bytes`).
@@ -1110,7 +1133,7 @@ fn media_layout(launch: &EngineArgs, ranks: &[LoadedRank]) -> Result<Open> {
     };
     // The units a request's blocks of each kind take: a block at the largest size, as many blocks
     // as the request declares (one splice tail per unit of the longest timeline).
-    let request_units: Vec<u64> = (0..PRODUCTS.len())
+    let request_units: Vec<u64> = (0..product::KINDS.len())
         .map(|kind| {
             let blocks = if kind == tail {
                 u64::from(sizing.units)
@@ -1145,13 +1168,15 @@ fn media_layout(launch: &EngineArgs, ranks: &[LoadedRank]) -> Result<Open> {
     let region_index = |regions: &Vec<Region>| -> Result<u8> {
         u8::try_from(regions.len()).context("more regions than a session numbers")
     };
+    // A host region's one part per unit: a block of it lies whole in one rank's memory, and its
+    // one host copy in the part the process's first rank maps.
     let host_region = |name: String, part_bytes: u64, units: u64| -> Result<Region> {
         let units = u32::try_from(units.max(1)).context("a host region of more units than u32")?;
         Ok(Region {
             space: name.clone(),
             name,
             tier: Tier::Host,
-            unit_bytes: part_bytes * HOST_PARTS,
+            unit_bytes: part_bytes,
             part_bytes,
             reserved: 0,
             units,
@@ -1159,6 +1184,7 @@ fn media_layout(launch: &EngineArgs, ranks: &[LoadedRank]) -> Result<Open> {
             segments: Vec::new(),
         })
     };
+    let conditioning_digests = sizer.conditioning_digests(sizing.model.as_ref());
 
     // The host region of encoder outputs: the conditioning of every request slot of each group
     // that encodes prompts, and as many again for requests that resume.
@@ -1168,8 +1194,9 @@ fn media_layout(launch: &EngineArgs, ranks: &[LoadedRank]) -> Result<Open> {
             let units = encoders::pool_pages(&[largest(conditioning)], slots as usize)
                 .saturating_mul(count);
             let mut digest = storage::key::Digest::new(b"uniserve.host-encoders");
+            digest.bytes(&conditioning_digests.0);
             digest.bytes(&encoders::layout());
-            digest.numbers(&[units, HOST_PARTS]);
+            digest.number(units);
             let name = format!("host encoders {}", short(&digest.finish()));
             let index = region_index(&regions)?;
             regions.push(host_region(name, encoders::PAGE_BYTES, units)?);
@@ -1184,8 +1211,9 @@ fn media_layout(launch: &EngineArgs, ranks: &[LoadedRank]) -> Result<Open> {
         count => {
             let units = latent::host::pool_pages(pages).saturating_mul(count);
             let mut digest = storage::key::Digest::new(b"uniserve.host-latents");
+            digest.bytes(&tensors);
             digest.bytes(&latent::host::share(&pages, WHOLE_SAMPLES));
-            digest.numbers(&[units, HOST_PARTS]);
+            digest.number(units);
             let name = format!("host latents {}", short(&digest.finish()));
             let index = region_index(&regions)?;
             regions.push(host_region(name, pages.page_bytes()?, units)?);
@@ -1201,9 +1229,9 @@ fn media_layout(launch: &EngineArgs, ranks: &[LoadedRank]) -> Result<Open> {
             .find(|position| served_phases(group, *position).contains(&Phase::TextEncode));
         let mut kinds: [Vec<u8>; 10] = Default::default();
         for position in 0..group.ranks.len() {
-            let backs: Vec<usize> = (0..PRODUCTS.len())
+            let backs: Vec<usize> = (0..product::KINDS.len())
                 .filter(|&kind| {
-                    serves(index, FLOWS[kind].0)
+                    serves(index, product::KINDS[kind].1)
                         && (kind != conditioning || encoder == Some(position))
                 })
                 .collect();
@@ -1257,10 +1285,10 @@ fn media_layout(launch: &EngineArgs, ranks: &[LoadedRank]) -> Result<Open> {
     }
 
     // The product classes and the class of stored trajectories.
-    let mut classes: Vec<Class> = Vec::with_capacity(PRODUCTS.len() + 1);
-    for kind in 0..PRODUCTS.len() {
+    let mut classes: Vec<Class> = Vec::with_capacity(product::KINDS.len() + 1);
+    for kind in 0..product::KINDS.len() {
         let stated = (kind == conditioning)
-            .then(|| sizer.conditioning_digests(sizing.model.as_ref()))
+            .then_some(conditioning_digests)
             .zip(encoders_region);
         classes.push(Class {
             units: 0,
@@ -1281,11 +1309,12 @@ fn media_layout(launch: &EngineArgs, ranks: &[LoadedRank]) -> Result<Open> {
         u8::try_from(classes.len() - 1).context("more classes than a session numbers")?;
 
     // Each group's regions per class: those it writes, or those the groups of its scheduler that
-    // write what it reads write.
+    // write what it reads write; and the one memory every group addresses.
+    let memory = media_memory(groups);
     let mut stated: Vec<Group> = Vec::with_capacity(listed.len());
     for (&(scheduler, id, index), (_, kinds, slot_region)) in listed.iter().zip(&backing) {
         let mut per_class: Vec<Vec<u8>> = Vec::with_capacity(classes.len());
-        for (kind, (writer, reader)) in FLOWS.iter().enumerate() {
+        for (kind, (_, writer, reader)) in product::KINDS.iter().enumerate() {
             let regions = if serves(index, *writer) {
                 kinds[kind].clone()
             } else if serves(index, *reader) {
@@ -1303,7 +1332,7 @@ fn media_layout(launch: &EngineArgs, ranks: &[LoadedRank]) -> Result<Open> {
         per_class.push(Vec::new());
         stated.push(Group {
             id,
-            memory: memory(&groups[index]),
+            memory: memory.clone(),
             slots: *slot_region,
             regions: per_class,
         });
@@ -1581,13 +1610,13 @@ fn open_rank(rank: &mut LoadedRank, table: &Segments) -> Result<Segments> {
 /// Opens the ranks of a media deployment over the session `layout` opened and `opened`
 /// answered (steps 11-22 for a rank that keeps no cache):
 ///
-/// 1. each rank, on a thread of its own, checks that its regions fit its GPU's quota, opens its
-///    graph pool with its runners' regions and its media memory in the resident pool, and maps
-///    its parts of the host regions it copies to: the encoder outputs' when its product buffer
-///    holds its group's conditioning, the stored trajectories' when it denoises
-///    ([`open_media_memory`]);
-/// 2. the process's media memories are connected, so each rank's device reaches every other's
-///    product buffer and parts, and they share their hand-offs;
+/// 1. each rank, on a thread of its own, checks that its regions fit its GPU's quota and opens
+///    its graph pool with its runners' regions and its media memory in the resident pool; the
+///    process's first rank maps the one part of every host region the session states, which
+///    every rank copies with ([`open_media_memory`]). Two ranks on one device each open their
+///    own;
+/// 2. the process's media memories are connected, so each rank reaches every other's product
+///    buffer and the parts, and they share their hand-offs;
 /// 3. each rank, on a thread of its own, builds its serving runners over its memory in their
 ///    regions of the graph pool, with their shadow regions, profiled again so their buckets can
 ///    be captured, and its media host over the process's one media pool and media runner.
@@ -1606,6 +1635,9 @@ fn open_video_ranks(ranks: &mut [LoadedRank], layout: &Open, opened: &Opened) ->
         ffmpeg: first.model_runner.engine_config().media.ffmpeg.clone(),
     }));
     let numbers: Vec<u8> = opened.regions.iter().map(|(number, _)| *number).collect();
+    // The rank that maps the host regions' parts: the process's first, which every epoch of
+    // the deployment on this host holds.
+    let holder = first.model_runner.rank();
 
     // The product buffers of the process's ranks, which each rank's device reaches.
     let buffers = ranks
@@ -1619,7 +1651,7 @@ fn open_video_ranks(ranks: &mut [LoadedRank], layout: &Open, opened: &Opened) ->
         })
         .collect::<Result<Vec<u8>>>()?;
     each_rank(ranks, "media-memory", |rank| {
-        open_media_memory(rank, layout, &numbers, &buffers)
+        open_media_memory(rank, layout, (&numbers, &buffers), holder)
     })?;
 
     // Every rank's device reaches the other ranks' product buffers and parts.
@@ -1693,14 +1725,16 @@ fn each_rank(
 
 /// Opens a media rank's memory over the session `layout` states, its regions by the answer's
 /// `numbers` ([`open_video_ranks`], step 1): its product buffer, its group's slot rows with a
-/// slot's trajectory row, and its parts of the host regions it copies to; and the regions its
-/// device block tables map and, of `buffers`, the product buffers of the process's ranks, those
-/// of the other ranks, which its device reaches.
+/// slot's trajectory row, and on the rank `holder`, the process's first, the one part of every
+/// host region the session states; and the regions its device block tables map (the host
+/// regions it copies to among them, the encoder outputs' when its product buffer holds its
+/// group's conditioning, the stored trajectories' when it denoises) and, of `buffers`, the
+/// product buffers of the process's ranks, those of the other ranks, which its device reaches.
 fn open_media_memory(
     rank: &mut LoadedRank,
     layout: &Open,
-    numbers: &[u8],
-    buffers: &[u8],
+    (numbers, buffers): (&[u8], &[u8]),
+    holder: u32,
 ) -> Result<()> {
     let device = rank.device()?;
     let group = stated_group(rank, layout)?;
@@ -1726,41 +1760,38 @@ fn open_media_memory(
     let units = layout.regions[usize::from(products)].units;
     let slots = model_runner.slots()?;
 
-    // The host regions the rank copies to: the encoder outputs' when its product buffer holds its
-    // group's conditioning, the stored trajectories' when it denoises.
+    // The host regions the session states, and those the rank copies to: the encoder outputs'
+    // when its product buffer holds its group's conditioning, the stored trajectories' when it
+    // denoises.
     let classes = product_classes(0);
     let conditioning = usize::from(classes[product_kind(product::CONDITIONING)?]);
     let holds_conditioning = group.regions.get(conditioning) == Some(&vec![products]);
-    let encoders = layout.classes[conditioning]
-        .host
-        .filter(|_| holds_conditioning)
-        .map(|(region, _)| region);
+    let encoders = layout.classes[conditioning].host.map(|(region, _)| region);
     let latents = layout.classes[usize::from(layout.trajectory)]
         .host
-        .filter(|_| video.row > 0)
         .map(|(region, _)| region);
-    let pages = video.trajectory.map(|(_, _, pages)| pages);
+    let pages = latent_pages(0, 0)?;
 
+    // The holder's parts, one of each host region, which every rank of the process copies with.
+    let holds_parts = model_runner.rank() == holder;
     let mut parts: Vec<(u8, u64, u32)> = Vec::new();
-    if let Some(region) = encoders {
-        parts.push((
-            region,
-            encoders::PAGE_BYTES,
-            layout.regions[usize::from(region)].units,
-        ));
+    if let Some(region) = encoders.filter(|_| holds_parts) {
+        let units = layout.regions[usize::from(region)].units;
+        parts.push((region, encoders::PAGE_BYTES, units));
     }
-    if let (Some(region), Some(pages)) = (latents, pages) {
-        parts.push((
-            region,
-            pages.page_bytes()?,
-            layout.regions[usize::from(region)].units,
-        ));
+    if let Some(region) = latents.filter(|_| holds_parts) {
+        let units = layout.regions[usize::from(region)].units;
+        parts.push((region, pages.page_bytes()?, units));
     }
 
     // The regions the rank's tables map, and the other ranks' product buffers its device reaches.
     let mut mapped = vec![number(group.slots)?, number(products)?];
-    for (region, _, _) in &parts {
-        mapped.push(number(*region)?);
+    let copied = [
+        encoders.filter(|_| holds_conditioning),
+        latents.filter(|_| video.row > 0),
+    ];
+    for region in copied.into_iter().flatten() {
+        mapped.push(number(region)?);
     }
     let own = number(products)?;
     let peers = buffers
@@ -1814,13 +1845,13 @@ fn open_media_memory(
         video.row,
     )
     .context("opening the rank's media memory")?;
-    if let Some(region) = encoders {
+    if let Some(region) = encoders.filter(|_| holds_parts) {
         let name = &layout.regions[usize::from(region)].name;
         encoders::map_part(&mut memory, client, (number(region)?, name))?;
     }
-    if let (Some(region), Some(pages)) = (latents, &pages) {
+    if let Some(region) = latents.filter(|_| holds_parts) {
         let name = &layout.regions[usize::from(region)].name;
-        latent::host::map_part(&mut memory, client, (number(region)?, name), pages)?;
+        latent::host::map_part(&mut memory, client, (number(region)?, name), &pages)?;
     }
 
     tracing::info!(

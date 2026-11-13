@@ -5,7 +5,16 @@
 //! The buffer pool in the Storage Server decides which units of a region a block takes; the
 //! rank's [`BlockTables`] keep, by slot, class and position, the runs of each block that lie in
 //! the memory the rank's process maps. [`BufferMemory`] is the memory those runs address on one
-//! rank, and lends it:
+//! rank, and lends it.
+//!
+//! There is one [`BufferMemory`] per rank, not per device: a device that holds ranks of several
+//! worker groups (a text encoder's rank and a denoising rank, as a deployment that places two
+//! groups on the same devices does) holds one memory per rank, each with its own product buffer,
+//! its group's trajectory rows and its own rank index, taken from that rank's graph pool. The
+//! ranks of a process are told apart by their rank index alone ([`BufferMemory::connect`]); two
+//! of them on one device reach each other's memory as ranks on two devices do.
+//!
+//! What a rank's memory holds:
 //!
 //! - **The product buffer.** One region of [`UNIT_BYTES`]-byte units, taken from the device's
 //!   resident pool (`GraphPool::allocator`) for as long as the rank serves. A media product has
@@ -18,48 +27,52 @@
 //!   `(slot region, s, 1)` names it, and [`BufferMemory::trajectory`] lends from it. A trajectory
 //!   is laid out from its row's first byte, so a smaller one is a prefix of the row.
 //! - **The parts of host regions.** The host encoder region and the host latent region are the
-//!   Storage Server's: one memfd per rank index (`storage::protocol::Request::HostPart`), unit `u`
-//!   of a part at byte `u × bytes`, mapped here writable and registered with the device
-//!   ([`BufferMemory::map_part`]). A host block's run is the same units in every rank's part, so
-//!   its bytes on one rank are one contiguous range of that rank's part.
+//!   Storage Server's: one memfd per rank index that maps one
+//!   (`storage::protocol::Request::HostPart`), unit `u` of a part at byte `u × bytes`, mapped by
+//!   that rank writable and registered with its device ([`BufferMemory::map_part`]). A host
+//!   block's run is the same units in every part, so its bytes in one part are one contiguous
+//!   range of it.
 //! - **The process's other ranks.** The ranks of one process reach each other's product buffers
-//!   by peer access (the resident pool grants it to every device that can take it) and each
-//!   other's parts through their host mappings, which every device of the process may address
-//!   ([`BufferMemory::connect`]). A rank lends a block from its own run, and from another rank's
-//!   when it backs none of the block.
+//!   by peer access (the resident pool grants it to every device that can take it; two ranks of
+//!   one device address each other's memory directly) and each other's parts through their host
+//!   mappings, which every device of the process may address ([`BufferMemory::connect`]). A rank
+//!   lends a block from its own run, and from another rank's when it backs none of the block.
 //!
 //! ## A block on the parts of a host block
 //!
-//! Each rank copies between its own memory and its own part of a host block, the part of its
-//! rank index:
+//! A rank copies between its own memory and one part of a host block:
 //!
 //! - A block whose units exist on every rank of its region, a KV block, moves each rank's share
-//!   of every unit to that rank's part: the KV cache's host tier, one page per unit
+//!   of every unit to that rank's own part: the KV cache's host tier, one page per unit
 //!   (`crate::memory::cache`).
-//! - A block that lies in one rank's memory moves whole to that rank's part. An encoder output in
-//!   the rank's product buffer is one: the buffer pool sizes its host copy by the bytes one part
-//!   holds of a unit (`storage::runtime::Region::part_bytes`), so the rank's part holds the whole
-//!   output and the other parts of those units hold nothing of it. A trajectory is one on each
-//!   rank of a denoising group, every rank holding its share of the samples in its own row: each
-//!   copies its row to its own part of one block, sized by the scheduler in pages of a part.
+//! - A block that one rank holds whole has one host copy, in one part. An encoder output in the
+//!   rank's product buffer is one: the buffer pool sizes its host copy by the bytes one part holds
+//!   of a unit (`storage::runtime::Region::part_bytes`). A trajectory is one too: every rank of a
+//!   denoising group holds the whole samples in its own row, so one of them writes the host copy
+//!   and every one of them reads it back. The part is the one the rank copies with
+//!   ([`BufferMemory::part_holder`]): its own when it maps one, otherwise the one part of the
+//!   region another rank of its process maps. A media deployment maps one part of each of its
+//!   host regions, on the first rank of its process, so a host copy one group wrote is where every
+//!   group of every epoch that names the region reads it.
 //!
 //! ## Copies
 //!
 //! A `Copy` completion queues the copies a rank runs in its tables, and the executor hands each,
 //! with the next batch, to a runner that maps its memory ([`Runner::maps`](crate::Runner::maps)).
-//! Every media runner of a rank shares one [`BufferMemory`] and maps its product buffer and its
-//! parts of host regions ([`BufferMemory::holds`]); the trajectory rows are the denoiser's alone
-//! ([`BufferMemory::rows`]), so it issues every `Save` and `Restore`. A runner issues its copies
-//! through [`BufferMemory::copy`], and the denoiser a restore of a trajectory written in another
-//! encoding through [`BufferMemory::restore`]:
+//! Every media runner of a rank shares one [`BufferMemory`] and maps its product buffer and the
+//! parts of host regions it copies with ([`BufferMemory::holds`]); the trajectory rows are the
+//! denoiser's alone ([`BufferMemory::rows`]), so it issues every `Save` and `Restore`, a `Save`
+//! on the first rank of its group alone. A runner issues its copies through
+//! [`BufferMemory::copy`], and the denoiser a restore of a trajectory written in another encoding
+//! through [`BufferMemory::restore`]:
 //!
 //! | From | To | Request | Bytes copied |
 //! | --- | --- | --- | --- |
 //! | product buffer | product buffer | `Clone` | the block's, both runs of one size |
-//! | product buffer | the rank's part | `Store` of an encoder output | the device block's, which the rank's part of the host block holds |
-//! | the rank's part | product buffer | `Load` of an encoder output | the rank's part of the host block, which the device block holds |
-//! | a slot's row | the rank's part | `Save` | the row's first bytes, as many as the rank's part of the host block holds |
-//! | the rank's part | a slot's row | `Restore` of a trajectory saved in the class's encoding | as above |
+//! | product buffer | the part the rank copies with | `Store` of an encoder output | the device block's, which the part's share of the host block holds |
+//! | the part the rank copies with | product buffer | `Load` of an encoder output | the part's share of the host block, which the device block holds |
+//! | a slot's row | the part the rank copies with | `Save` | the row's first bytes, as many as the part's share of the host block holds |
+//! | the part the rank copies with | a slot's row | `Restore` of a trajectory saved in the class's encoding | as above |
 //! | the saving ranks' parts | a slot's row | `Restore` of a trajectory saved in another encoding | what the copy manifest of the two layouts has the rank read ([`BufferMemory::restored`]) |
 //!
 //! The size of a sized block is the scheduler's (`specs/buffer-pool.md` §11): a trajectory block
@@ -346,30 +359,32 @@ impl BufferMemory {
     }
 
     /// Joins the media memories of the ranks of one process, after each mapped its parts: each
-    /// reaches every other's product buffer, by peer access, and every other's parts of host
-    /// regions, and they share one table of hand-offs. A memory joined before is joined again
-    /// with the memories given.
+    /// reaches every other's product buffer, by peer access or on its own device, and every
+    /// other's parts of host regions, and they share one table of hand-offs. A memory joined
+    /// before is joined again with the memories given.
+    ///
+    /// The memories are keyed by their rank index: several of them may lie on one device, the
+    /// ranks of several worker groups that the deployment places on it, each with its own product
+    /// buffer and rows.
     ///
     /// The caller keeps every memory joined, and the device memory behind it, for as long as any
     /// of them may address another's: the ranks of a process serve and retire together.
     ///
     /// # Errors
     ///
-    /// Memories of one rank index, of one product buffer or of one device; memories on a device
-    /// beside memories that hold none; two parts of one region of other bytes of a unit. Nothing
-    /// changes when they are refused.
+    /// Memories of one rank index or of one product buffer; memories on a device beside memories
+    /// that hold none; two parts of one region of other bytes of a unit. Nothing changes when
+    /// they are refused.
     pub fn connect(memories: &mut [BufferMemory]) -> Result<()> {
         for (index, memory) in memories.iter().enumerate() {
             for other in &memories[index + 1..] {
-                let device = |held: &BufferMemory| held.device.as_ref().map(|(device, ..)| *device);
                 if memory.rank == other.rank
                     || memory.products.0 == other.products.0
                     || memory.device.is_some() != other.device.is_some()
-                    || device(memory).is_some_and(|one| device(other) == Some(one))
                 {
                     return Err(Error::Invalid(format!(
-                        "the media memories of ranks {} and {} share a rank index, a product \
-                         buffer or a device, or one holds a device and the other none",
+                        "the media memories of ranks {} and {} share a rank index or a product \
+                         buffer, or one holds a device and the other none",
                         memory.rank, other.rank
                     )));
                 }
@@ -443,12 +458,20 @@ impl BufferMemory {
     }
 
     /// Whether `region` is memory of this rank's media that holds blocks: its product buffer, or
-    /// a host region whose part it maps. Every media runner of the rank maps it; the trajectory
-    /// rows are the denoiser's alone ([`BufferMemory::rows`]). A runner that is handed the copies
-    /// of other memory too, such as the KV cache's, issues through this memory those that name
-    /// it.
+    /// a host region with a part it copies with ([`BufferMemory::part_holder`]). Every media
+    /// runner of the rank maps it; the trajectory rows are the denoiser's alone
+    /// ([`BufferMemory::rows`]). A runner that is handed the copies of other memory too, such as
+    /// the KV cache's, issues through this memory those that name it.
     pub fn holds(&self, region: u8) -> bool {
-        region == self.products.0 || self.part(region, self.rank).is_some()
+        region == self.products.0 || self.copied(region).is_some()
+    }
+
+    /// The rank index whose part of host region `region` this rank copies a block it holds whole
+    /// to and from (module documentation): its own when it maps one, otherwise the one part of
+    /// the region another rank of its process maps. `None` when it reaches no part of the
+    /// region, or several and none of its own.
+    pub fn part_holder(&self, region: u8) -> Option<u32> {
+        self.copied(region).map(|(_, rank, ..)| *rank)
     }
 
     /// Whether `region` is the slot region and this memory holds trajectories in its rows: the
@@ -924,15 +947,16 @@ impl BufferMemory {
     /// The bytes a copy from `from` to `to`, for `request`, moves: see the module
     /// documentation.
     fn byte_copy(&self, request: RequestId, from: Run, to: Run) -> Result<ByteCopy> {
-        // `extent` stated every run's region: the product buffer, the slot rows, or a host part.
+        // `extent` stated every run's region: the product buffer, the slot rows, or the part of
+        // a host region the rank copies with.
         let (read, written) = (self.extent(from)?, self.extent(to)?);
         let (products, slots) = (self.products.0, self.slots.0);
-        let part = |region: u8| self.part(region, self.rank).is_some();
+        let part = |region: u8| self.copied(region).is_some();
         let own = |region: u8| region == products || region == slots || part(region);
         if !own(from.0) || !own(to.0) {
             return Err(Error::Invalid(format!(
-                "request {} copies region {} into region {}, and this rank's own memory holds \
-                 one of them only",
+                "request {} copies region {} into region {}, and the memory this rank copies \
+                 with holds one of them only",
                 request.0, from.0, to.0
             )));
         }
@@ -976,12 +1000,13 @@ impl BufferMemory {
             }
         };
 
-        let place = |region: u8, offset: u64| (region, self.rank, offset);
+        let place = |region: u8, offset: u64| (region, self.rank_of(region), offset);
         Ok((place(from.0, read.0), place(to.0, written.0), bytes))
     }
 
     /// The first byte and the bytes of `run` in the memory it lies in, from that memory's first
-    /// byte: this rank's product buffer, slot rows or part, or another rank's product buffer.
+    /// byte: this rank's product buffer or slot rows, the part it copies with, or another rank's
+    /// product buffer.
     fn extent(&self, (region, first, count): Run) -> Result<(u64, u64)> {
         if region == self.slots.0 {
             // A slot's run is its row: slot `s` owns row `s - 1`.
@@ -999,7 +1024,7 @@ impl BufferMemory {
             (UNIT_BYTES, self.products.1)
         } else if let Some(&(_, _, units, _)) = self.peer(region) {
             (UNIT_BYTES, units)
-        } else if let Some((_, _, bytes, units, _)) = self.part(region, self.rank) {
+        } else if let Some((_, _, bytes, units, _)) = self.copied(region) {
             (*bytes, *units)
         } else {
             return Err(Error::Invalid(format!(
@@ -1046,9 +1071,13 @@ impl BufferMemory {
         Ok((run.0, self.rank_of(run.0), first + offset))
     }
 
-    /// The rank index whose memory region `region` is, among those `extent` addresses.
+    /// The rank index whose memory region `region` is, among those `extent` addresses: another
+    /// rank's product buffer, the part this rank copies with, or this rank's own memory.
     fn rank_of(&self, region: u8) -> u32 {
-        self.peer(region).map_or(self.rank, |(_, rank, ..)| *rank)
+        match self.peer(region) {
+            Some((_, rank, ..)) => *rank,
+            None => self.part_holder(region).unwrap_or(self.rank),
+        }
     }
 
     /// The address of `place`: see [`BufferMemory::address`].
@@ -1093,6 +1122,20 @@ impl BufferMemory {
         self.parts
             .iter()
             .find(|(held, of, ..)| *held == region && *of == rank)
+    }
+
+    /// The part of host region `region` this rank copies with: see
+    /// [`BufferMemory::part_holder`].
+    fn copied(&self, region: u8) -> Option<&Part> {
+        if let Some(own) = self.part(region, self.rank) {
+            return Some(own);
+        }
+
+        let mut reached = self.parts.iter().filter(|(held, ..)| *held == region);
+        match (reached.next(), reached.next()) {
+            (Some(only), None) => Some(only),
+            _ => None,
+        }
     }
 
     /// The product buffer of another rank of the process in `region`, if the rank reaches one.
@@ -1625,6 +1668,69 @@ mod tests {
         )
         .unwrap();
         assert!(alone.restored(&copy, &sources, &target).is_err());
+    }
+
+    #[test]
+    fn a_rank_without_a_part_copies_with_the_part_its_process_maps() {
+        // Rank 0 maps the process's part of the host latent and encoder regions; the other rank
+        // maps none, and holds trajectories in its rows.
+        let parts = [(LATENTS, PAGE, 32), (ENCODERS, 512, 8)];
+        let mapping = BufferMemory::meta(RANK, (PRODUCTS, 16), (SLOTS, 3), 0, &parts).unwrap();
+        let rows = BufferMemory::meta(OTHER, (OTHER_PRODUCTS, 16), (SLOTS, 3), TRAJECTORY, &[]);
+        let mut memories = vec![mapping, rows.unwrap()];
+        assert!(!memories[1].holds(LATENTS));
+        BufferMemory::connect(&mut memories).unwrap();
+
+        let other = &memories[1];
+        assert!(other.holds(LATENTS) && other.holds(ENCODERS));
+        assert_eq!(other.part_holder(LATENTS), Some(RANK));
+        assert_eq!(memories[0].part_holder(LATENTS), Some(RANK));
+        let copy = |from, to| BlockCopy {
+            request: RequestId(1),
+            runs: vec![(from, to)],
+            encodings: None,
+        };
+
+        // A save from the other rank's slot 2, a restore into its slot 1, and a store of an
+        // encoder output in its buffer each move the whole block to or from rank 0's part.
+        let copies = [
+            copy((SLOTS, 2, 1), (LATENTS, 5, 4)),
+            copy((LATENTS, 5, 4), (SLOTS, 1, 1)),
+            copy((OTHER_PRODUCTS, 10, 5), (ENCODERS, 2, 3)),
+        ];
+        assert_eq!(
+            other.byte_copies(&copies).unwrap(),
+            [
+                ((SLOTS, OTHER, ROW), (LATENTS, RANK, 5 * PAGE), TRAJECTORY),
+                ((LATENTS, RANK, 5 * PAGE), (SLOTS, OTHER, 0), TRAJECTORY),
+                (
+                    (OTHER_PRODUCTS, OTHER, 10 * UNIT_BYTES),
+                    (ENCODERS, RANK, 1024),
+                    5 * UNIT_BYTES
+                ),
+            ]
+        );
+
+        // A rank that reaches two ranks' parts of a region and none of its own copies with
+        // neither, and two memories of one rank index are not joined.
+        let third = BufferMemory::meta(2, (7, 16), (SLOTS, 3), TRAJECTORY, &[]).unwrap();
+        let mut joined = process(TRAJECTORY);
+        joined.push(third);
+        BufferMemory::connect(&mut joined).unwrap();
+        assert_eq!(joined[2].part_holder(LATENTS), None);
+        assert!(!joined[2].holds(LATENTS));
+        assert!(
+            joined[2]
+                .byte_copies(&[copy((SLOTS, 2, 1), (LATENTS, 5, 4))])
+                .is_err()
+        );
+
+        let twice = BufferMemory::meta(RANK, (8, 16), (SLOTS, 3), 0, &[]).unwrap();
+        let mut refused = vec![
+            BufferMemory::meta(RANK, (7, 16), (SLOTS, 3), 0, &[]).unwrap(),
+            twice,
+        ];
+        assert!(BufferMemory::connect(&mut refused).is_err());
     }
 
     #[test]

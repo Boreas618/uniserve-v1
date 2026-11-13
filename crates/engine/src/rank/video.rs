@@ -2,13 +2,16 @@
 //! deployment's worker groups, its share of the video pipeline, the runners of the blocks its
 //! group places on it over one media memory, and what it states of its group.
 //!
-//! **Ranks and blocks.** A media rank is one device and one rank of one worker group, as a text
-//! rank is. Its group's blocks name the phases it serves: the text encoder's block its text
-//! encodings, the denoiser's its latent preparations and steps, the video decoder's its decode
-//! rounds, the audio decoder's first rank the request's track, and the host blocks
-//! ([`MEDIA_READER`], [`VIDEO_CODEC_BLOCK`], [`MUXER`]) its host work. A group that places the
-//! whole model ([`DEFAULT_BLOCK`]) serves every phase on its one rank. The rank loads every stage
-//! its group places, split as the group's blocks state ([`ModelRunner::video_split`]).
+//! **Ranks and blocks.** A media rank is one rank of one worker group, on the device the
+//! deployment places it on; a device may hold ranks of several groups (a text encoder's and a
+//! denoiser's, as `configs/minimax_h3/fasth3-dp8-text-tp8.toml` places them), each a rank of its
+//! own with its own media memory, graph pool and runners. Its group's blocks name the phases it
+//! serves: the text encoder's block its text encodings, the denoiser's its latent preparations
+//! and steps, the video decoder's its decode rounds, the audio decoder's first rank the request's
+//! track, and the host blocks ([`MEDIA_READER`], [`VIDEO_CODEC_BLOCK`], [`MUXER`]) its host work.
+//! A group that places the whole model ([`DEFAULT_BLOCK`]) serves every phase on its one rank.
+//! The rank loads every stage its group places, split as the group's blocks state
+//! ([`ModelRunner::video_split`]).
 //!
 //! **Runners.** One per block the rank serves, each on a stream of its own: [`EncoderRunner`],
 //! [`DenoiserRunner`], a [`DecoderRunner`] for the video and one for the track, and the
@@ -18,7 +21,7 @@
 //!
 //! **Sizes.** A rank of the group that denoises states its group's captured request shapes with
 //! the bytes of a slot's trajectory and of a block of each product kind there
-//! (`Capacity::media_bytes`, in [`PRODUCTS`] order), from its denoiser's shapes and its
+//! (`Capacity::media_bytes`, in `ipc::product::KINDS` order), from its denoiser's shapes and its
 //! decoders, which that group therefore holds. The session sizes every rank's product buffer
 //! and its host regions from them (`crate::process::ranks::layout`).
 
@@ -64,38 +67,6 @@ pub(crate) const MEDIA_READER: &str = "media_reader";
 /// of its group assembles the request's artifact.
 pub(crate) const MUXER: &str = "muxer";
 
-/// The product kinds, in the order of the session's product classes, which the scheduler numbers
-/// alike (`crate::scheduler::video`): the product class of kind `k` is the `k`-th of the classes
-/// just before the class of stored trajectories, and `Capacity::media_bytes` states a block of
-/// each in this order.
-pub(crate) const PRODUCTS: [&str; 10] = [
-    product::CONDITION_PIXELS,
-    product::CONDITION_SAMPLES,
-    product::VISION_PIXELS,
-    product::CONDITIONING,
-    product::VIDEO_LATENTS,
-    product::AUDIO_LATENTS,
-    product::VIDEO_UNITS,
-    product::VIDEO_TAIL,
-    product::ENCODED_UNITS,
-    product::AUDIO_SAMPLES,
-];
-
-/// Per product kind, in [`PRODUCTS`] order: the phase whose calls write it, and the phase whose
-/// calls read it (SD §3.3, the declared results of a video request's calls).
-pub(crate) const FLOWS: [(Phase, Phase); 10] = [
-    (Phase::MediaRead, Phase::LatentPrepare),
-    (Phase::MediaRead, Phase::LatentPrepare),
-    (Phase::MediaRead, Phase::TextEncode),
-    (Phase::TextEncode, Phase::LatentPrepare),
-    (Phase::Denoise, Phase::VideoDecode),
-    (Phase::Denoise, Phase::AudioDecode),
-    (Phase::VideoDecode, Phase::VideoEncode),
-    (Phase::VideoDecode, Phase::VideoDecode),
-    (Phase::VideoEncode, Phase::Mux),
-    (Phase::AudioDecode, Phase::AudioEncode),
-];
-
 /// Every phase of a video request, which a group that places the whole model serves.
 const MEDIA_PHASES: [Phase; 9] = [
     Phase::MediaRead,
@@ -119,12 +90,6 @@ const HOST_PHASES: [Phase; 4] = [
 
 /// The values of one page of the host latent region: a mebibyte of float32 samples.
 const LATENT_PAGE_VALUES: u32 = 1 << 18;
-
-/// The parts every unit of a media deployment's host regions has, one per rank index of a host:
-/// the most ranks whose saved trajectory a denoiser restores from (`worker::runners::denoiser`).
-/// A region's unit is this many parts whatever the parallel configuration, so every epoch of the
-/// deployment that sizes it alike names one region and finds what another stored there.
-pub(crate) const HOST_PARTS: u64 = 8;
 
 /// The runners of a media rank that compute on the device, by the region of the graph pool
 /// each replays in. The media host computes nothing there.
@@ -199,17 +164,20 @@ pub(crate) struct VideoRank {
 }
 
 impl ModelRunner {
-    /// One model runner per device of a media deployment's process: each device is the rank of
-    /// the deployment's worker group that places it, as on a text deployment.
+    /// One model runner per rank of a media deployment, every rank of its worker groups in the
+    /// deployment's rank order, each on the device the deployment places it on, which this
+    /// process serves. A device that holds ranks of several groups serves each as a rank of its
+    /// own.
     ///
     /// # Errors
     ///
-    /// A device that is not the one the deployment places its rank on, which a device serving
-    /// ranks of two worker groups is; and a media group with a rank on another host
-    /// (`specs/engine-worker-port.md` §5 D2): a product lies in the product buffer of every
-    /// rank that backs it, and this build reaches no product buffer of another process.
+    /// A rank on a device this process does not serve; an expert group, which serves no video
+    /// request; and a media group with a rank on another host (`specs/engine-worker-port.md` §5
+    /// D2): a product lies in the product buffer of every rank that backs it, and this build
+    /// reaches no product buffer of another process.
     pub(super) fn media_ranks(&self) -> Result<Vec<Self>> {
         let groups = &self.engine_config().parallel.worker_groups;
+        let names: Vec<&str> = product::KINDS.iter().map(|(name, ..)| *name).collect();
         for group in groups.iter().filter(|group| group.role.serves_requests()) {
             if let Some((position, rank)) = group
                 .ranks
@@ -225,55 +193,55 @@ impl ModelRunner {
                     group.id,
                     rank.host,
                     self.launch.host,
-                    PRODUCTS.join(", ")
+                    names.join(", ")
                 );
             }
         }
 
-        self.devices
-            .iter()
-            .enumerate()
-            .map(|(index, device)| {
-                let rank = self.rank + index as u32;
-                let (at, position) = WorkerGroupConfig::place_rank(groups, rank as usize)
-                    .with_context(|| {
-                        format!("the deployment's worker groups place no rank {rank}")
-                    })?;
-                let group = &groups[at];
-                if group.role == WorkerGroupRole::Experts {
-                    bail!(
-                        "worker group {} is an expert group, which serves no video request",
-                        group.id
-                    );
-                }
+        let firsts = WorkerGroupConfig::first_ranks(groups);
+        let mut ranks = Vec::new();
+        for (first, group) in firsts.iter().zip(groups) {
+            if group.role == WorkerGroupRole::Experts {
+                bail!(
+                    "worker group {} is an expert group, which serves no video request",
+                    group.id
+                );
+            }
 
-                // The device the deployment places the rank on is this one: a device that served
-                // ranks of two groups would hold two ranks' media memories.
-                let placed = &group.ranks[position].device;
-                let ordinal = placed
+            for (position, placed) in group.ranks.iter().enumerate() {
+                let rank = u32::try_from(first + position)
+                    .context("a rank past what the protocol numbers")?;
+                let device = placed
+                    .device
                     .strip_prefix("cuda:")
-                    .and_then(|ordinal| ordinal.parse::<i32>().ok());
-                if ordinal != Some(device.0) {
+                    .and_then(|ordinal| ordinal.parse::<i32>().ok())
+                    .map(DeviceId)
+                    .filter(|device| self.devices.contains(device));
+                let Some(device) = device else {
                     bail!(
                         "the deployment places rank {rank} (rank {position} of worker group {}) \
-                         on {placed}, and this process serves it on device {}: a device of a \
-                         media deployment serves one rank of one worker group",
+                         on {}, which this process does not serve: it serves devices {:?}",
                         group.id,
-                        device.0
+                        placed.device,
+                        self.devices
+                            .iter()
+                            .map(|device| device.0)
+                            .collect::<Vec<_>>()
                     );
-                }
+                };
 
                 let mut rank_runner = self.clone();
-                rank_runner.devices = vec![*device];
+                rank_runner.devices = vec![device];
                 rank_runner.rank = rank;
                 rank_runner.group.clone_from(&group.id.0);
                 rank_runner.world_size = group.ranks.len();
                 // The text encoder's split is its block's (`video_split`).
                 rank_runner.mapping.tensor_parallel = 1;
                 rank_runner.mapping.tensor_rank = 0;
-                Ok(rank_runner)
-            })
-            .collect()
+                ranks.push(rank_runner);
+            }
+        }
+        Ok(ranks)
     }
 
     /// The share of the video pipeline this rank's checkpoint holds that its group places, split
@@ -459,13 +427,14 @@ impl ModelRunner {
 
     /// The config of the rank's text encoder of `model`, writing the conditioning and reading
     /// the vision pixels of their classes in `classes` (the session's class of each product kind,
-    /// in [`PRODUCTS`] order): one captured encode bucket per request count up to the slots and
-    /// prompt capacity the deployment captures.
+    /// in `ipc::product::KINDS` order): one captured encode bucket per request count up to the
+    /// slots and prompt capacity the deployment captures, and for an encoder that takes images
+    /// the prompts with vision blocks the deployment admits, whose eager encodes it profiles.
     ///
     /// # Errors
     ///
     /// Capacities the deployment states that are not strictly increasing or above its prompt
-    /// length.
+    /// length, or prompts with vision blocks the model cannot state.
     pub(crate) fn encoder_config(
         &self,
         model: &dyn VideoModel,
@@ -483,6 +452,10 @@ impl ModelRunner {
         // A checkpoint whose text encoder has no vision tower states no patch format, and takes
         // no image.
         let patches = model.format().ok().map(|format| format.patches);
+        let warm = match patches {
+            Some(_) => model.warm_prompts(&serving)?,
+            None => Vec::new(),
+        };
         Ok(EncoderConfig {
             buckets: Buckets::new(buckets),
             width: model.text_width(),
@@ -490,13 +463,14 @@ impl ModelRunner {
             patches,
             conditioning: classes[product_kind(product::CONDITIONING)?],
             pixels: classes[product_kind(product::VISION_PIXELS)?],
+            warm,
         })
     }
 
     /// The config of the rank's denoiser of `model`: the requests the deployment serves, the
     /// classes it reads and writes, the ranks of its group's denoiser block, and the host latent
     /// region's page bytes. The first rank of the block shares the latents its last step writes
-    /// with the process's other backing ranks.
+    /// with the process's other backing ranks and writes a saved trajectory's host copy.
     ///
     /// # Errors
     ///
@@ -511,7 +485,7 @@ impl ModelRunner {
             bail!("this deployment serves no request layout, so a denoiser would capture nothing");
         }
 
-        let (ranks, shares) = match self.denoiser_block() {
+        let (ranks, first) = match self.denoiser_block() {
             Some(block) => {
                 let position = self.position()?;
                 let ranks = u32::try_from(block.ranks.len()).context("a block wider than u32")?;
@@ -535,7 +509,7 @@ impl ModelRunner {
             ],
             ranks: ranks.max(1),
             page_bytes: latent_pages(0, 0)?.page_bytes()?,
-            shares,
+            first,
         })
     }
 
@@ -660,9 +634,9 @@ impl ModelRunner {
 
         Ok(HostConfig {
             phases,
-            classes: PRODUCTS
+            classes: product::KINDS
                 .iter()
-                .copied()
+                .map(|(name, ..)| *name)
                 .zip(classes.iter().copied())
                 .collect(),
             timelines,
@@ -909,7 +883,7 @@ impl ModelRunner {
 
     /// Per captured request shape of the rank's denoiser (`DenoiserRunner::media_shapes`): the
     /// shape, the bytes of a slot's trajectory, and the bytes of a block of each product kind in
-    /// [`PRODUCTS`] order (`Capacity::media_bytes`); and the most units a timeline of the
+    /// `ipc::product::KINDS` order (`Capacity::media_bytes`); and the most units a timeline of the
     /// deployment has, the splice tails a request declares.
     ///
     /// - The condition pixels, samples and vision pixels of a shape with condition rows: the
@@ -1248,22 +1222,19 @@ pub(crate) fn group_phases(group: &WorkerGroupConfig) -> Vec<Phase> {
     phases
 }
 
-/// The session's class of each product kind, in [`PRODUCTS`] order, when the product classes
-/// follow `first` classes of cache groups.
+/// The session's class of each product kind, in `ipc::product::KINDS` order, when the product
+/// classes follow `first` classes of cache groups.
 pub(crate) fn product_classes(first: u8) -> [u8; 10] {
     std::array::from_fn(|kind| first.saturating_add(kind as u8))
 }
 
-/// The index of product kind `name` in [`PRODUCTS`].
+/// The index of product kind `name` in `ipc::product::KINDS`.
 ///
 /// # Errors
 ///
 /// A name that is no product kind of the session.
 pub(crate) fn product_kind(name: &str) -> Result<usize> {
-    PRODUCTS
-        .iter()
-        .position(|held| *held == name)
-        .with_context(|| format!("{name} is no product kind of the session"))
+    product::kind(name).with_context(|| format!("{name} is no product kind of the session"))
 }
 
 /// The bytes of one element of `dtype`.

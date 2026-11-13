@@ -61,21 +61,19 @@ pub(super) const VIDEO_PHASES: [Phase; 9] = [
 ];
 
 /// The product kinds, in the order of the product classes, each with the phase whose calls write
-/// it. The class of kind `k` is the `k`-th of the `PRODUCTS.len()` classes just before the class
-/// of stored trajectories, and `Capacity::media_bytes` states the bytes of a block of each kind in
-/// this order.
-pub(super) const PRODUCTS: [(&str, Phase); 10] = [
-    (product::CONDITION_PIXELS, Phase::MediaRead),
-    (product::CONDITION_SAMPLES, Phase::MediaRead),
-    (product::VISION_PIXELS, Phase::MediaRead),
-    (product::CONDITIONING, Phase::TextEncode),
-    (product::VIDEO_LATENTS, Phase::Denoise),
-    (product::AUDIO_LATENTS, Phase::Denoise),
-    (product::VIDEO_UNITS, Phase::VideoDecode),
-    (product::VIDEO_TAIL, Phase::VideoDecode),
-    (product::ENCODED_UNITS, Phase::VideoEncode),
-    (product::AUDIO_SAMPLES, Phase::AudioDecode),
-];
+/// it: the one list of `ipc::product::KINDS`, which the ranks read too. The class of kind `k` is
+/// the `k`-th of the `PRODUCTS.len()` classes just before the class of stored trajectories, and
+/// `Capacity::media_bytes` states the bytes of a block of each kind in this order.
+pub(super) const PRODUCTS: [(&str, Phase); 10] = {
+    let mut kinds = [("", Phase::Other); product::KINDS.len()];
+    let mut kind = 0;
+    while kind < kinds.len() {
+        let (name, writer, _) = product::KINDS[kind];
+        kinds[kind] = (name, writer);
+        kind += 1;
+    }
+    kinds
+};
 
 /// A video request's calls, products and trajectory.
 impl Request {

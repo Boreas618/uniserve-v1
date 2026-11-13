@@ -465,11 +465,17 @@ impl VideoModel for MinimaxH3 {
         )?)
     }
 
-    fn warm_prompts(&self, serving: &VideoServing) -> nn::Result<Vec<(Vec<[u32; 3]>, u32)>> {
+    fn warm_prompts(&self, serving: &VideoServing) -> nn::Result<Vec<(Vec<[u32; 3]>, Vec<u32>)>> {
+        let placeholder = self
+            .config
+            .text_encoder
+            .vision
+            .as_ref()
+            .map(|vision| vision.image_token_id);
         Ok(warm_prompts(
             &self.tasks,
             serving,
-            self.config.processor.as_ref(),
+            (self.config.processor.as_ref(), placeholder),
         )?)
     }
 
@@ -852,13 +858,24 @@ fn keyframe_openings(
 /// resolution, an `fl2va` prompt of each keyframe count, each keyframe at the processor's grid
 /// of the resolution. A `t2va` prompt presents none, and a `ref2va` reference's grid follows
 /// the client's media.
+///
+/// A prompt's ids present each keyframe as the text encoder reads a vision block: one
+/// `placeholder` (the tower's image token) per merged row, between two text tokens that stand
+/// for the block's `<|vision_start|>` and `<|vision_end|>` markers. An encode's work follows from
+/// the placeholder runs and the prompt's length alone, so any text token stands for a marker.
+#[expect(
+    clippy::type_complexity,
+    reason = "each prompt's grids and ids, as `VideoModel::warm_prompts` states them"
+)]
 fn warm_prompts(
     tasks: &[VideoTask],
     serving: &VideoServing,
-    processor: Option<&processing::qwen_vl::ProcessorConfig>,
-) -> Result<Vec<(Vec<[u32; 3]>, u32)>> {
+    (processor, placeholder): (Option<&processing::qwen_vl::ProcessorConfig>, Option<u32>),
+) -> Result<Vec<(Vec<[u32; 3]>, Vec<u32>)>> {
     /// The keyframes an `fl2va` prompt presents at most: the first frame and the last.
     const KEYFRAMES: u32 = 2;
+    /// The text token that stands for a block's markers.
+    const MARKER: u32 = 0;
 
     if !tasks.contains(&VideoTask::FirstLastToVideoAudio) {
         return Ok(Vec::new());
@@ -871,8 +888,15 @@ fn warm_prompts(
                 .to_owned(),
         )
     })?;
+    let placeholder = placeholder.ok_or_else(|| {
+        Error::checkpoint(
+            "the deployment serves fl2va and the text encoder states no vision tower, so no \
+             prompt presents a keyframe"
+                .to_owned(),
+        )
+    })?;
 
-    let mut prompts: Vec<(Vec<[u32; 3]>, u32)> = Vec::new();
+    let mut prompts: Vec<(Vec<[u32; 3]>, Vec<u32>)> = Vec::new();
     for resolution in served_resolutions(&serving.sizes)? {
         let (width, height) = (resolution.canvas.width, resolution.canvas.height);
         let grid = processor
@@ -881,10 +905,13 @@ fn warm_prompts(
 
         // Each temporal step of a block presents one run of merged tokens.
         let tokens = grid.t * processor.block_tokens(grid);
+        let mut block = vec![MARKER];
+        block.extend(std::iter::repeat_n(placeholder, tokens as usize));
+        block.push(MARKER);
         for keyframes in 1..=KEYFRAMES {
             let prompt = (
                 vec![[grid.t, grid.h, grid.w]; keyframes as usize],
-                tokens * keyframes,
+                block.repeat(keyframes as usize),
             );
             if !prompts.contains(&prompt) {
                 prompts.push(prompt);
@@ -1068,27 +1095,50 @@ mod tests {
     /// admits none.
     #[test]
     fn a_keyframe_presents_the_grid_of_its_resolution() {
-        // 768x1344 pixels are 48x84 patches of one temporal step, which merge to 1008 tokens.
-        assert_eq!(
-            warm_prompts(
-                &[VideoTask::FirstLastToVideoAudio],
-                &serving(),
-                Some(&processor())
-            )
-            .unwrap(),
-            vec![
-                (vec![[1, 48, 84]], 1008),
-                (vec![[1, 48, 84], [1, 48, 84]], 2016),
-            ]
-        );
+        // 768x1344 pixels are 48x84 patches of one temporal step, which merge to 1008 tokens:
+        // a keyframe's run of placeholders between its two markers.
+        const IMAGE: u32 = 151_655;
+        let prompts = warm_prompts(
+            &[VideoTask::FirstLastToVideoAudio],
+            &serving(),
+            (Some(&processor()), Some(IMAGE)),
+        )
+        .unwrap();
+        let grids: Vec<&Vec<[u32; 3]>> = prompts.iter().map(|(grids, _)| grids).collect();
+        assert_eq!(grids, [&vec![[1, 48, 84]], &vec![[1, 48, 84], [1, 48, 84]]]);
+        for (grids, ids) in &prompts {
+            let placeholders = ids.iter().filter(|id| **id == IMAGE).count();
+            assert_eq!(placeholders, 1008 * grids.len());
+            assert_eq!(ids.len(), 1010 * grids.len());
+            // Each block is one run of placeholders, apart from the next.
+            let runs = ids
+                .chunk_by(|left, right| (*left == IMAGE) == (*right == IMAGE))
+                .filter(|run| run[0] == IMAGE)
+                .count();
+            assert_eq!(runs, grids.len());
+        }
 
         assert_eq!(
-            warm_prompts(&[VideoTask::TextToVideoAudio], &serving(), None).unwrap(),
+            warm_prompts(&[VideoTask::TextToVideoAudio], &serving(), (None, None)).unwrap(),
             Vec::new()
         );
         assert!(
-            warm_prompts(&[VideoTask::FirstLastToVideoAudio], &serving(), None).is_err(),
+            warm_prompts(
+                &[VideoTask::FirstLastToVideoAudio],
+                &serving(),
+                (None, Some(IMAGE))
+            )
+            .is_err(),
             "an fl2va deployment cannot size a keyframe without the processor"
+        );
+        assert!(
+            warm_prompts(
+                &[VideoTask::FirstLastToVideoAudio],
+                &serving(),
+                (Some(&processor()), None)
+            )
+            .is_err(),
+            "an fl2va deployment presents no keyframe without a vision tower"
         );
     }
 
