@@ -35,7 +35,7 @@ use ipc::Capacity;
 use ops::Generation;
 use platform::DeviceId;
 use proto::config::{EngineArgs, SchedulerConfig, WorkerGroupConfig};
-use proto::request::GenerationLimits;
+use proto::request::{GenerationFeatures, GenerationLimits};
 use scheduling_guest::limits::{Limits, Parameters};
 use scheduling_guest::view::{RankView, Snapshot};
 use storage::QueuePair;
@@ -188,8 +188,9 @@ impl Engine {
         )?;
 
         // The workers compute `max_logprobs` candidates at every position: what a request may ask
-        // for.
-        let limits = GenerationLimits {
+        // for. The model's facts state no feature before its workers do: the engine serves the
+        // features its schedulers' groups serve, which each scheduler resolves for its own.
+        let mut limits = GenerationLimits {
             max_logprobs: config.max_logprobs,
             ..config.model.generation_limits.clone()
         };
@@ -214,6 +215,7 @@ impl Engine {
         );
 
         let mut schedulers = Vec::with_capacity(open.schedulers.len());
+        let mut features = GenerationFeatures::empty();
         for (index, (listed, pair)) in open.schedulers.iter().zip(pairs).enumerate() {
             // The scheduler's groups, each with its configuration and what its ranks serve.
             let mut groups: Vec<(WorkerGroupConfig, Capacity)> = Vec::with_capacity(listed.len());
@@ -251,6 +253,7 @@ impl Engine {
                 Arc::clone(&served),
             )
             .with_context(|| format!("starting scheduler {index}"))?;
+            features |= scheduler.limits().features;
 
             let thread = std::thread::Builder::new()
                 .name(format!("scheduler-{index}"))
@@ -263,6 +266,8 @@ impl Engine {
                 thread,
             });
         }
+
+        limits.features = features;
 
         // With several schedulers the routing policy chooses each new request's, from every
         // scheduler as a rank of its own.

@@ -130,11 +130,11 @@ impl ModelRunner {
         ));
 
         // The meta contexts take the split alone: a profile run issues no collective.
-        worker::Runner::graphs(&runner).set_group(
-            group,
-            u64::from(self.mapping.tensor_rank),
-            u64::from(self.mapping.tensor_parallel),
-        )?;
+        let (rank, ranks) = super::split(
+            self.mapping.tensor_rank as usize,
+            self.mapping.tensor_parallel as usize,
+        );
+        worker::Runner::graphs(&runner).set_group(group, rank, ranks)?;
 
         if let Some(mut member) = member {
             if let Some(stream) = &stream {

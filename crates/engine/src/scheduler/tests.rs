@@ -36,7 +36,7 @@ pub(super) const B: GroupId = GroupId(1);
 pub(super) const KV: u8 = 0;
 /// A sized class both groups take from one region: a product one group writes and the other
 /// reads.
-const PRODUCT: u8 = 1;
+pub(super) const PRODUCT: u8 = 1;
 
 /// The owners of request 1: one on each group, in slot rows 3 and 4.
 pub(super) const OWNER_A: OwnerId = OwnerId(10);

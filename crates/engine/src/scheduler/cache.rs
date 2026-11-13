@@ -488,16 +488,14 @@ impl Scheduler {
     }
 
     /// The regions (by index) whose order holds `row`, each with the units the block takes
-    /// there: none while a request holds it; else the device regions of its class in the groups
-    /// that hold its device copy, and its class's host region.
+    /// there: the device regions of its class in the groups that hold its device copy while no
+    /// request holds it, and its class's host region while it has a host copy. A pin holds the
+    /// device block a request reads (BP §4); the host copy is no request's, and the buffer pool's
+    /// `evictable` word of the host region counts it whether or not its device block is pinned.
     fn placed(&self, row: &Cached) -> Vec<(usize, u32)> {
-        if row.pins > 0 {
-            return Vec::new();
-        }
-        let devices = self
-            .groups
-            .iter()
-            .filter(|group| row.tiers & DEVICE != 0 && row.groups & bit(group.id()) != 0);
+        let devices = self.groups.iter().filter(|group| {
+            row.pins == 0 && row.tiers & DEVICE != 0 && row.groups & bit(group.id()) != 0
+        });
         let class = self.classes.get(usize::from(row.class));
         let host = class
             .and_then(|class| class.host)
@@ -849,7 +847,7 @@ mod tests {
     use proto::request::RequestId;
 
     use super::{Cached, DEVICE, HOST, REMOTE};
-    use crate::scheduler::tests::{A, B, Bench, KV, OWNER_A, bench, key};
+    use crate::scheduler::tests::{A, B, Bench, KV, OWNER_A, PRODUCT, bench, key};
 
     /// The request `Bench::attach` adds.
     const ID: RequestId = RequestId(1);
@@ -1171,6 +1169,50 @@ mod tests {
         bench.complete(taken[0].0, &Completion::Done);
         bench.answers();
         assert_eq!(written(&mut bench), [runtime::Request::List]);
+    }
+
+    /// A pin holds a key's device block; its host copy stays in the host region's order, which
+    /// the buffer pool's `evictable` word of that region counts: no `List` is asked for it.
+    #[test]
+    fn a_pinned_blocks_host_copy_stays_in_the_host_regions_order() {
+        let mut bench = bench(4096);
+        // The region numbered 6 stands for the host region of class `KV`, its blocks one unit.
+        bench.scheduler.classes[usize::from(KV)].host = Some((2, 1));
+        bench.scheduler.classes[usize::from(PRODUCT)].units = 1;
+        list(&mut bench, &[(key(1), DEVICE | HOST)]);
+        bench.scheduler.install_victims();
+        let host_victims = runtime::Request::Victims {
+            region: 6,
+            keys: vec![key(1)],
+        };
+        assert_eq!(written(&mut bench), [victims(&[key(1)]), host_victims]);
+
+        // A request pins the device block; the host copy is still evictable there.
+        bench.pool.register(10).store(1, Ordering::Release);
+        bench.attach(&[(A, OWNER_A, 3)]);
+        let pin = runtime::Request::Pin {
+            owner: OWNER_A,
+            class: KV,
+            at: 0,
+            keys: vec![key(1)],
+        };
+        let pinned = Completion::Pinned {
+            runs: vec![(4, 1, 1)],
+            host: 0,
+        };
+        exchange(&mut bench, pin, &pinned);
+
+        // The device region's order loses the block, the host region's keeps it: the scheduler
+        // accounts for every evictable unit and asks for no `List`.
+        bench.scheduler.install_victims();
+        bench.scheduler.post().unwrap();
+        let taken = bench.take();
+        let requests: Vec<_> = taken.iter().map(|(_, request)| request.clone()).collect();
+        assert_eq!(requests, [victims(&[])]);
+        bench.complete(taken[0].0, &Completion::Done);
+        bench.answers();
+        bench.scheduler.install_victims();
+        assert!(written(&mut bench).is_empty());
     }
 
     #[test]

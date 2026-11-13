@@ -676,7 +676,8 @@ impl ModelRunner {
             )?;
             let config = self.encoder_config(model.as_ref(), classes)?;
             let (graphs, stream) = graphs(ENCODER, EncoderRunner::input_bytes(&config))?;
-            graphs.set_group(tensor, shape.tensor_rank as u64, shape.tensor as u64)?;
+            let (rank, ranks) = super::split(shape.tensor_rank, shape.tensor);
+            graphs.set_group(tensor, rank, ranks)?;
             let runner = EncoderRunner::new(text, config, graphs, stream, Arc::clone(memory))
                 .context("building the rank's text encoder")?;
             Some(runner)
@@ -690,7 +691,8 @@ impl ModelRunner {
                 .context("the rank denoises and its share of the checkpoint holds no denoiser")?;
             let config = self.denoiser_config(model.as_ref(), classes)?;
             let (graphs, stream) = graphs(DENOISER, 0)?;
-            graphs.set_group(sequence, shape.sequence_rank as u64, shape.sequence as u64)?;
+            let (rank, ranks) = super::split(shape.sequence_rank, shape.sequence);
+            graphs.set_group(sequence, rank, ranks)?;
             let runner = DenoiserRunner::new(network, config, graphs, stream, Arc::clone(memory))
                 .context("building the rank's denoiser")?;
             Some(runner)

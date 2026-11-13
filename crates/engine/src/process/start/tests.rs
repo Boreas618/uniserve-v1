@@ -49,6 +49,19 @@ fn a_meta_start_builds_one_engine_whose_close_ends_the_session() {
     assert!(engine.route.is_none());
     assert_eq!(engine.executors.len(), 1);
     assert_eq!(engine.capacities.len(), 1);
+    // The launch's model states no feature; the engine serves what its group's phases do.
+    assert!(
+        launch
+            .engine_config
+            .model
+            .generation_limits
+            .features
+            .is_empty()
+    );
+    assert_eq!(
+        engine.limits.features,
+        proto::request::GenerationFeatures::UNDERSTANDING
+    );
     let (open, opened) = {
         let head = engine.head.as_ref().unwrap();
         let head = worker::lock(head);

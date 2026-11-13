@@ -637,6 +637,19 @@ impl ModelRunner {
     }
 }
 
+/// The split a runner's graphs state for this rank, member `rank` of a parallel group of `ranks`
+/// (`worker::graphs::Graphs::set_group`): a group of one rank is no partition
+/// (`nn::collective::Split::WHOLE`) and forms no communicator (`process::ranks::group_over`), so
+/// its forwards state none, `(0, 0)`; a context that launches refuses a split without a
+/// communicator.
+pub(crate) fn split(rank: usize, ranks: usize) -> (u64, u64) {
+    if ranks > 1 {
+        (rank as u64, ranks as u64)
+    } else {
+        (0, 0)
+    }
+}
+
 /// The tasks of host work one thread of the media pool has room for.
 const MEDIA_TASKS: usize = 4;
 

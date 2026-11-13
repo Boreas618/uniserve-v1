@@ -567,6 +567,12 @@ impl Scheduler {
         scheduler.submit(runtime::Request::List);
         Ok(scheduler)
     }
+
+    /// The generation limits requests are checked against at their arrival: the engine's, with
+    /// the features this scheduler's groups serve.
+    pub fn limits(&self) -> &GenerationLimits {
+        &self.limits
+    }
 }
 
 /// `config` with its limits lowered to what `groups`' executors hold, once the deployment passes

@@ -1990,6 +1990,23 @@ pub(crate) fn bind(ranks: &[LoadedRank], layout: &Open, opened: &Opened) -> Resu
                 &group.memory,
                 &cache.info().plane_runs,
             )?;
+
+            // The stores and loads the buffer pool asks of this rank copy between its units and
+            // its part of each group's host region, unit `u` of the region being page `u`.
+            if host.iter().any(Option::is_some) {
+                let names: Vec<Option<&str>> = host
+                    .iter()
+                    .map(|region| {
+                        region.map(|index| layout.regions[usize::from(index)].name.as_str())
+                    })
+                    .collect();
+                let device = rank.device()?;
+                let stream = Stream::new(device)
+                    .with_context(|| format!("creating device {}'s copy stream", device.0))?;
+                cache
+                    .map_host_parts(client, &names, stream, Arc::clone(&rank.kernels))
+                    .context("mapping the rank's parts of the host KV regions")?;
+            }
         }
 
         let groups = cache.layout().groups.len();
