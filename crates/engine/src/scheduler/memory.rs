@@ -1223,6 +1223,7 @@ impl Scheduler {
                 continue;
             }
             asks.push(runtime::Request::Prefetch {
+                group,
                 class: u8::try_from(class).unwrap_or(u8::MAX),
                 units: 0,
                 keys: keys.to_vec(),
@@ -2488,6 +2489,7 @@ mod tests {
             units: 256,
             limit: 256,
             segments: Vec::new(),
+            memory: String::new(),
         };
         let class = |units| Class {
             units,
@@ -2513,6 +2515,8 @@ mod tests {
                 memory: "memory".to_owned(),
                 slots: 2,
                 regions: classes.iter().map(|_| vec![0]).collect(),
+                receives: Vec::new(),
+                parts: Vec::new(),
             }],
             classes,
             schedulers: vec![vec![A]],
@@ -2635,7 +2639,7 @@ mod tests {
         fn list(&mut self, keys: &[(Key, u8, u8)]) {
             let keys = keys
                 .iter()
-                .map(|&(key, class, tiers)| (key, class, 4, tiers, 1))
+                .map(|&(key, class, tiers)| (key, class, 4, tiers, 1, 0))
                 .collect();
             self.answer(&[runtime::Request::List], &[Completion::Listing { keys }]);
         }

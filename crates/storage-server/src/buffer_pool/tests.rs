@@ -5,7 +5,7 @@
 use storage::protocol::Key;
 use storage::runtime::{Cause, Completion, GroupId, OwnerId, Request, RequestId, Source, Tier};
 
-use super::{BufferPool, Class};
+use super::{BufferPool, Class, Group};
 
 /// The KV class: one unit per block, host copies of one unit.
 const KV: u8 = 0;
@@ -28,6 +28,23 @@ const ENCODERS: u8 = 7;
 
 const PREFILL: GroupId = GroupId(0);
 const DECODE: GroupId = GroupId(1);
+
+/// The host part both groups copy with unless a test says otherwise, as its
+/// bit in a block's validity: part 0 on the one host, after the two groups'
+/// memories.
+const PART: u64 = 1 << 2;
+/// Part 0 on a second host.
+const OTHER_PART: u64 = 1 << 3;
+
+/// A group whose ranks address the memory of bit `memory`, with its slot
+/// rows in `slots`, its device regions per class, and `parts` the host
+/// parts it copies every class with a host region with.
+fn group(memory: u8, slots: u8, regions: Vec<Vec<u8>>, parts: u64) -> Group {
+    Group {
+        parts: vec![parts, parts, 0, parts],
+        ..Group::new(memory, slots, regions)
+    }
+}
 
 /// The serving engine's session and its queue pair.
 const SERVING: u32 = 1;
@@ -72,8 +89,14 @@ impl Fixture {
     /// A pool with four KV units (1 to 4), two slot rows per group, two host
     /// KV units, eight host latent units, the product buffers of two ranks
     /// and sixteen host encoder units, and one session of two groups over
-    /// two memories.
+    /// two memories, both copying with one host part.
     fn new() -> Self {
+        Self::with_parts(PART, PART)
+    }
+
+    /// As [`Self::new`], the prefill group copying with the host parts
+    /// `prefill` and the decode group with `decode`.
+    fn with_parts(prefill: u64, decode: u64) -> Self {
         let mut pool = BufferPool::new((1_000, 1_000));
         for space in 0..8 {
             pool.grant(space, 0, 1 << 20);
@@ -105,7 +128,10 @@ impl Fixture {
             1,
             false,
             classes(),
-            vec![(PREFILL, 0, 1, regions()), (DECODE, 1, 2, regions())],
+            vec![
+                (PREFILL, group(0, 1, regions(), prefill)),
+                (DECODE, group(1, 2, regions(), decode)),
+            ],
         );
         let mut fixture = Self { pool, number: 0 };
         fixture.checked();
@@ -248,7 +274,7 @@ impl Fixture {
         self.pool.regions[usize::from(region)].free_units()
     }
 
-    fn listing(&mut self) -> Vec<(Key, u8, u16, u8, u8)> {
+    fn listing(&mut self) -> Vec<(Key, u8, u16, u8, u8, u8)> {
         match self.ask(Request::List) {
             Some(Completion::Listing { keys }) => keys,
             other => panic!("list answered {other:?}"),
@@ -441,7 +467,7 @@ fn a_commit_takes_effect_at_its_stamp_and_shares_the_block() {
             host: 0
         })
     );
-    assert_eq!(fixture.listing(), [(key(7), KV, 40, 0b001, 0b01)]);
+    assert_eq!(fixture.listing(), [(key(7), KV, 40, 0b001, 0b01, 0)]);
 
     // R5: a shared block is not committed again.
     assert_eq!(
@@ -733,12 +759,12 @@ fn a_store_and_a_load_move_a_key_between_the_device_and_the_host() {
         (keys, from, to),
         (vec![key(7)], vec![(UNITS, unit, 1)], vec![(HOST, 0, 1)])
     );
-    assert_eq!(fixture.listing(), [(key(7), KV, 64, 0b001, 0b01)]);
+    assert_eq!(fixture.listing(), [(key(7), KV, 64, 0b001, 0b01, 0)]);
     assert_eq!(
         fixture.finish(store, true),
         Some(Completion::Stored { keys: Vec::new() })
     );
-    assert_eq!(fixture.listing(), [(key(7), KV, 64, 0b011, 0b01)]);
+    assert_eq!(fixture.listing(), [(key(7), KV, 64, 0b011, 0b01, 0b11)]);
 
     // The device copy leaves; a pin now states the host copy.
     assert_eq!(
@@ -1013,12 +1039,8 @@ fn a_trajectory_saved_under_one_layout_is_restored_under_another_through_the_man
     // A session of another parallel configuration, the same tensors in another encoding, and
     // one whose trajectories are other tensors; each group's slot rows are the decode group's.
     let group = || {
-        (
-            GroupId(0),
-            0,
-            2,
-            vec![vec![UNITS], Vec::new(), vec![5, 6], vec![5]],
-        )
+        let regions = vec![vec![UNITS], Vec::new(), vec![5, 6], vec![5]];
+        (GroupId(0), group(0, 2, regions, PART))
     };
     let (other, unlike) = ((2, 0), (3, 0));
     fixture
@@ -1093,7 +1115,7 @@ fn a_load_names_the_encoding_of_the_host_copies_it_reads() {
         2,
         false,
         laid_out([9; 32]),
-        vec![(GroupId(0), 0, 1, regions)],
+        vec![(GroupId(0), group(0, 1, regions, PART))],
     );
     let other = (2, 0);
 
@@ -1247,12 +1269,12 @@ fn a_transfer_moves_an_owner_and_copies_what_the_target_group_lacks() {
     assert_eq!(fixture.free(1), 2);
 
     // The shared block is valid in both groups; the private one in the decode group alone.
-    assert_eq!(fixture.listing(), [(key(7), KV, 64, 0b001, 0b11)]);
+    assert_eq!(fixture.listing(), [(key(7), KV, 64, 0b001, 0b11, 0)]);
     assert_eq!(
         fixture.commit(2, 1, 8, Vec::new()),
         Some(Completion::Committed)
     );
-    assert_eq!(fixture.listing()[1], (key(8), KV, 64, 0b001, 0b10));
+    assert_eq!(fixture.listing()[1], (key(8), KV, 64, 0b001, 0b10, 0));
 }
 
 #[test]
@@ -1358,6 +1380,7 @@ fn a_prefetch_brings_the_leading_keys_into_the_host_tier_by_its_deadline() {
     let mut fixture = Fixture::new();
     let keys = vec![key(1), key(2), key(3)];
     let request = Request::Prefetch {
+        group: PREFILL,
         class: KV,
         units: 0,
         keys,
@@ -1371,7 +1394,7 @@ fn a_prefetch_brings_the_leading_keys_into_the_host_tier_by_its_deadline() {
     assert_eq!(fixture.pool.work((QUEUE, id)).len(), 2);
     fixture.pool.done((QUEUE, id), 64);
     fixture.checked();
-    assert_eq!(fixture.listing(), [(key(1), KV, 64, 0b010, 0)]);
+    assert_eq!(fixture.listing(), [(key(1), KV, 64, 0b010, 0, 0b11)]);
 
     // At the deadline the request is answered with what was found; R9: the
     // block of the second key stays held until the task has ended.
@@ -1388,6 +1411,7 @@ fn a_prefetch_brings_the_leading_keys_into_the_host_tier_by_its_deadline() {
 
     // A key that is on the host counts as found without a task.
     let again = Request::Prefetch {
+        group: PREFILL,
         class: KV,
         units: 0,
         keys: vec![key(1)],
@@ -1429,7 +1453,7 @@ fn a_store_to_the_remote_store_is_answered_when_the_connector_has_put_the_keys()
             Some(key(7)),
             vec![(HOST, 0, 1)],
             vec![(HOST, 0, 1)],
-            u8::MAX,
+            PART,
             0
         )]
     );
@@ -1439,7 +1463,7 @@ fn a_store_to_the_remote_store_is_answered_when_the_connector_has_put_the_keys()
         fixture.answer(put),
         Some(Completion::Stored { keys: vec![key(7)] })
     );
-    assert_eq!(fixture.listing(), [(key(7), KV, 64, 0b111, 0b01)]);
+    assert_eq!(fixture.listing(), [(key(7), KV, 64, 0b111, 0b01, 0b11)]);
 
     // Nothing left to put: answered at once.
     let again = Request::Store {
@@ -1457,9 +1481,13 @@ fn a_store_to_the_remote_store_is_answered_when_the_connector_has_put_the_keys()
 fn a_copy_made_on_trial_is_visible_to_its_epoch_alone_until_the_update_is_committed() {
     let mut fixture = Fixture::new();
     let regions = vec![vec![UNITS], Vec::new(), vec![5, 6]];
-    fixture
-        .pool
-        .open(2, 2, true, classes(), vec![(GroupId(0), 0, 1, regions)]);
+    fixture.pool.open(
+        2,
+        2,
+        true,
+        classes(),
+        vec![(GroupId(0), group(0, 1, regions, PART))],
+    );
     let trial = (2, 0);
 
     // The epoch on trial commits a block.
@@ -1513,9 +1541,13 @@ fn a_copy_made_on_trial_is_visible_to_its_epoch_alone_until_the_update_is_commit
 fn what_a_rolled_back_epoch_made_is_evicted() {
     let mut fixture = Fixture::new();
     let regions = vec![vec![UNITS], Vec::new(), vec![5, 6]];
-    fixture
-        .pool
-        .open(2, 2, true, classes(), vec![(GroupId(0), 0, 1, regions)]);
+    fixture.pool.open(
+        2,
+        2,
+        true,
+        classes(),
+        vec![(GroupId(0), group(0, 1, regions, PART))],
+    );
     let trial = (2, 0);
     fixture.submit(
         trial,
@@ -1705,4 +1737,494 @@ fn a_peer_s_hold_keeps_a_host_copy_until_it_is_released() {
     fixture.checked();
     assert!(!fixture.pool.release_peer(9));
     assert_eq!(fixture.pool.capacity(QUEUE, HOST), (1, 0, 1));
+}
+
+/// A `Replicate` of the block at `at` of an owner's table of a class, read
+/// from its run in region `from`, into the memories `group` reads it in.
+fn replicate(
+    owner: u64,
+    class: u8,
+    at: u32,
+    from: u8,
+    group: GroupId,
+    after: Vec<(GroupId, u64)>,
+) -> Request {
+    Request::Replicate {
+        owner: OwnerId(owner),
+        class,
+        at,
+        from,
+        group,
+        after,
+    }
+}
+
+#[test]
+fn a_crossing_waits_for_its_stamps_and_its_task_and_makes_the_block_valid_where_the_group_reads_it()
+{
+    let mut fixture = Fixture::new();
+    fixture.attach(1, PREFILL);
+    let unit = fixture.allocate(1, 0, 1)[0];
+
+    // R3: nothing is copied while a batch that may write the block has not ended, and the
+    // owner is not transferred meanwhile.
+    let crossing = fixture.submit(
+        QUEUE,
+        replicate(1, KV, 0, UNITS, DECODE, vec![(PREFILL, 1)]),
+    );
+    assert_eq!(fixture.answer(crossing), None);
+    assert_eq!(fixture.pool.started(), Vec::new());
+    let transfer = Request::Transfer {
+        owner: OwnerId(1),
+        group: DECODE,
+        after: Vec::new(),
+    };
+    let refused = Some(Completion::Refused { cause: Cause::Copy });
+    assert_eq!(fixture.ask(transfer.clone()), refused);
+
+    // R1: one crossing of a position into a group at a time.
+    let again = replicate(1, KV, 0, UNITS, DECODE, Vec::new());
+    let position = Some(Completion::Refused {
+        cause: Cause::Position,
+    });
+    assert_eq!(fixture.ask(again), position);
+
+    // Due, a task copies the block from the prefill group's memory into the decode group's.
+    fixture.pool.advance(SERVING, PREFILL, 1);
+    fixture.checked();
+    assert_eq!(fixture.pool.started(), [(QUEUE, crossing)]);
+    let run = vec![(UNITS, unit, 1)];
+    assert_eq!(
+        fixture.pool.work((QUEUE, crossing)),
+        [(None, run.clone(), run.clone(), 1 << 0, 1 << 1)]
+    );
+    assert_eq!(fixture.ask(transfer), refused);
+    fixture.pool.ended((QUEUE, crossing), true);
+    fixture.checked();
+    let replicated = Some(Completion::Replicated { runs: run.clone() });
+    assert_eq!(fixture.answer(crossing), replicated);
+
+    // R5: a crossing into memory that holds the block is answered at once.
+    for group in [DECODE, PREFILL] {
+        let again = replicate(1, KV, 0, UNITS, group, vec![(PREFILL, 2)]);
+        assert_eq!(fixture.ask(again), replicated);
+    }
+    assert!(!fixture.pool.deferred());
+
+    // Both groups' memories hold the block: shared, its device copy is listed for both.
+    assert_eq!(
+        fixture.commit(1, 0, 7, Vec::new()),
+        Some(Completion::Committed)
+    );
+    assert_eq!(fixture.listing(), [(key(7), KV, 64, 0b001, 0b11, 0)]);
+}
+
+#[test]
+fn a_crossing_that_names_what_does_not_fit_is_refused_and_changes_nothing() {
+    let mut fixture = Fixture::new();
+    fixture.cached(1, 7);
+    fixture.attach(2, PREFILL);
+    fixture.allocate(2, 0, 1);
+    let refused = |cause| Some(Completion::Refused { cause });
+
+    let cases = [
+        (replicate(9, KV, 0, UNITS, DECODE, Vec::new()), Cause::Owner),
+        (
+            replicate(2, KV, 1, UNITS, DECODE, Vec::new()),
+            Cause::Position,
+        ),
+        (replicate(2, 9, 0, UNITS, DECODE, Vec::new()), Cause::Class),
+        // A region the block has no run in.
+        (replicate(2, KV, 0, 5, DECODE, Vec::new()), Cause::Class),
+        (
+            replicate(2, KV, 0, UNITS, GroupId(9), Vec::new()),
+            Cause::Group,
+        ),
+        (
+            replicate(2, KV, 0, UNITS, DECODE, vec![(GroupId(9), 1)]),
+            Cause::Group,
+        ),
+    ];
+    for (request, cause) in cases {
+        assert_eq!(fixture.ask(request), refused(cause));
+    }
+
+    // An owner whose transfer waits.
+    let transfer = Request::Transfer {
+        owner: OwnerId(2),
+        group: DECODE,
+        after: vec![(PREFILL, 1)],
+    };
+    fixture.submit(QUEUE, transfer);
+    let crossing = replicate(2, KV, 0, UNITS, DECODE, Vec::new());
+    assert_eq!(fixture.ask(crossing), refused(Cause::Owner));
+
+    // R8: an epoch on trial replicates no shared block another epoch may use.
+    let regions = vec![vec![UNITS], Vec::new(), vec![5, 6]];
+    fixture.pool.open(
+        2,
+        2,
+        true,
+        classes(),
+        vec![
+            (GroupId(0), group(0, 1, regions.clone(), PART)),
+            (GroupId(1), group(1, 2, regions, PART)),
+        ],
+    );
+    let trial = (2, 0);
+    let attach = Request::Attach {
+        owner: OwnerId(1),
+        group: GroupId(0),
+    };
+    fixture.submit(trial, attach);
+    let pin = Request::Pin {
+        owner: OwnerId(1),
+        class: KV,
+        at: 0,
+        keys: vec![key(7)],
+    };
+    let pinned = fixture.submit(trial, pin);
+    assert!(
+        matches!(fixture.answer(pinned), Some(Completion::Pinned { runs, .. }) if runs.len() == 1)
+    );
+    let crossing = fixture.submit(trial, replicate(1, KV, 0, UNITS, GroupId(1), Vec::new()));
+    assert_eq!(fixture.answer(crossing), refused(Cause::Key));
+    assert_eq!(fixture.pool.started(), Vec::new());
+}
+
+#[test]
+fn a_detached_owner_s_crossing_holds_its_block_until_its_task_ends() {
+    let mut fixture = Fixture::new();
+    fixture.attach(1, PREFILL);
+    fixture.allocate(1, 0, 1);
+    let crossing = fixture.submit(QUEUE, replicate(1, KV, 0, UNITS, DECODE, Vec::new()));
+    assert_eq!(fixture.pool.started(), [(QUEUE, crossing)]);
+
+    // R9: the detach lets go of the owner's entry; the task still holds the block.
+    assert_eq!(fixture.detach(1, Vec::new()), Some(Completion::Done));
+    assert_eq!(fixture.free(UNITS), 3);
+    fixture.pool.ended((QUEUE, crossing), true);
+    fixture.checked();
+    assert_eq!(fixture.answer(crossing), Some(Completion::Failed));
+    assert_eq!(fixture.free(UNITS), 4);
+
+    // A crossing that waits for its stamps holds the block too, and is answered when due.
+    fixture.attach(2, PREFILL);
+    fixture.allocate(2, 0, 1);
+    let waiting = fixture.submit(
+        QUEUE,
+        replicate(2, KV, 0, UNITS, DECODE, vec![(PREFILL, 1)]),
+    );
+    assert_eq!(fixture.detach(2, Vec::new()), Some(Completion::Done));
+    assert_eq!(fixture.free(UNITS), 3);
+    fixture.pool.advance(SERVING, PREFILL, 1);
+    fixture.checked();
+    assert_eq!(fixture.answer(waiting), Some(Completion::Failed));
+    assert_eq!(
+        (fixture.free(UNITS), fixture.pool.started()),
+        (4, Vec::new())
+    );
+}
+
+/// A pool with one session over the processes of two hosts: KV units (region 0), the slot rows
+/// of two groups (1, 2), a product buffer in each process (3 in `process a`, 4 in
+/// `process b`), and a host KV region (5). The classes are KV blocks with host copies and
+/// products; the groups are `groups`. Admitted as the Storage Server admits an engine's layout.
+fn processes(groups: Vec<storage::runtime::Group>) -> BufferPool {
+    use storage::runtime::{Open, Region};
+
+    let region = |name: &str, tier, unit_bytes, reserved, units, memory: &str| Region {
+        name: name.into(),
+        tier,
+        space: name.into(),
+        unit_bytes,
+        part_bytes: unit_bytes,
+        reserved,
+        units,
+        limit: reserved + units,
+        segments: Vec::new(),
+        memory: memory.into(),
+    };
+    let class = |units, host| Class {
+        units,
+        host,
+        state_in_slot: false,
+        tensors: [units as u8; 32],
+        encoding: [0; 32],
+    };
+    let schedulers = vec![groups.iter().map(|group| group.id).collect()];
+    let open = Open {
+        version: storage::runtime::VERSION,
+        epoch: 1,
+        trial: false,
+        regions: vec![
+            region("units", Tier::Device, 64, 1, 4, ""),
+            region("rows a", Tier::Device, 8, 1, 2, ""),
+            region("rows b", Tier::Device, 8, 1, 2, ""),
+            region("products a", Tier::Device, 256, 0, 4, "process a"),
+            region("products b", Tier::Device, 256, 0, 4, "process b"),
+            region("host", Tier::Host, 64, 0, 2, ""),
+        ],
+        classes: vec![class(1, Some((5, 1))), class(0, None)],
+        trajectory: 1,
+        groups,
+        schedulers,
+        peers: Vec::new(),
+    };
+    let mut pool = BufferPool::new((1_000, 1_000));
+    pool.admit(SERVING, &open).unwrap();
+    pool
+}
+
+/// A group of [`processes`]' layout.
+fn stated(id: u8, memory: &str, slots: u8, regions: Vec<Vec<u8>>) -> storage::runtime::Group {
+    storage::runtime::Group {
+        id: GroupId(id),
+        memory: memory.into(),
+        slots,
+        regions,
+        receives: Vec::new(),
+        parts: Vec::new(),
+    }
+}
+
+#[test]
+fn a_crossing_takes_a_run_in_the_receiving_region_of_a_memory_where_the_block_has_none() {
+    // The writer backs products in process a; the reader reads them in process b, where it
+    // receives them in that process's product buffer.
+    let writer = stated(0, "process a", 1, vec![vec![0], vec![3]]);
+    let reader = storage::runtime::Group {
+        receives: vec![Vec::new(), vec![4]],
+        ..stated(1, "process b", 2, vec![vec![0], Vec::new()])
+    };
+    let mut fixture = Fixture {
+        pool: processes(vec![writer, reader]),
+        number: 0,
+    };
+    fixture.attach(1, GroupId(0));
+    let allocate = Request::Allocate {
+        owner: OwnerId(1),
+        class: 1,
+        at: 0,
+        count: 1,
+        units: 3,
+    };
+    let allocated = Completion::Allocated {
+        runs: vec![(3, 0, 3)],
+        evicted: Vec::new(),
+    };
+    assert_eq!(fixture.ask(allocate), Some(allocated));
+
+    // All or none: without room in the receiving region nothing changes.
+    let shrink = |units| Request::Resize { region: 4, units };
+    fixture.ask(shrink(2));
+    let crossing = replicate(1, 1, 0, 3, GroupId(1), vec![(GroupId(0), 1)]);
+    assert_eq!(
+        fixture.ask(crossing.clone()),
+        Some(Completion::Full { region: 4 })
+    );
+    assert_eq!((fixture.free(4), fixture.pool.deferred()), (2, false));
+    fixture.ask(shrink(4));
+
+    // A run of the source run's bytes is taken in process b; the task fills it from process a.
+    let crossing = fixture.submit(QUEUE, crossing);
+    assert_eq!((fixture.answer(crossing), fixture.free(4)), (None, 1));
+    // R11: the run just taken holds nothing yet, and no crossing reads it.
+    let unwritten = replicate(1, 1, 0, 4, GroupId(0), Vec::new());
+    let refused = Some(Completion::Refused {
+        cause: Cause::Class,
+    });
+    assert_eq!(fixture.ask(unwritten), refused);
+    fixture.pool.advance(SERVING, GroupId(0), 1);
+    fixture.checked();
+    assert_eq!(
+        fixture.pool.work((QUEUE, crossing)),
+        [(None, vec![(3, 0, 3)], vec![(4, 0, 3)], 1 << 0, 1 << 1)]
+    );
+    fixture.pool.ended((QUEUE, crossing), true);
+    fixture.checked();
+    let runs = vec![(4, 0, 3)];
+    assert_eq!(
+        fixture.answer(crossing),
+        Some(Completion::Replicated { runs })
+    );
+
+    // The runs leave with the block.
+    let release = Request::Release {
+        owner: OwnerId(1),
+        class: 1,
+        at: 0,
+        count: 1,
+        after: Vec::new(),
+    };
+    assert_eq!(fixture.ask(release), Some(Completion::Done));
+    assert_eq!((fixture.free(3), fixture.free(4)), (4, 4));
+}
+
+#[test]
+fn a_product_backed_in_two_processes_is_valid_where_the_crossing_names_its_written_run() {
+    // The decoder's ranks back products in both processes; the muxer reads them in process a.
+    let decoder = stated(0, "process a", 1, vec![vec![0], vec![3, 4]]);
+    let muxer = stated(1, "process a", 2, vec![vec![0], vec![3]]);
+    let mut fixture = Fixture {
+        pool: processes(vec![decoder, muxer]),
+        number: 0,
+    };
+    fixture.attach(1, GroupId(0));
+    let allocate = Request::Allocate {
+        owner: OwnerId(1),
+        class: 1,
+        at: 0,
+        count: 1,
+        units: 2,
+    };
+    fixture.ask(allocate);
+
+    // A9: the block's content is in process b, where the rank that decoded it wrote it; the
+    // task copies it into the muxer's process.
+    let crossing = fixture.submit(QUEUE, replicate(1, 1, 0, 4, GroupId(1), Vec::new()));
+    assert_eq!(
+        fixture.pool.work((QUEUE, crossing)),
+        [(None, vec![(4, 0, 2)], vec![(3, 0, 2)], 1 << 1, 1 << 0)]
+    );
+    fixture.pool.ended((QUEUE, crossing), true);
+    fixture.checked();
+    let replicated = Some(Completion::Replicated {
+        runs: vec![(3, 0, 2)],
+    });
+    assert_eq!(fixture.answer(crossing), replicated);
+
+    // Both processes hold it now: another crossing is answered at once.
+    let again = replicate(1, 1, 0, 3, GroupId(1), Vec::new());
+    assert_eq!(fixture.ask(again), replicated);
+}
+
+#[test]
+fn a_store_fills_the_host_parts_a_host_copy_lacks() {
+    // The decode group's ranks lie on two hosts: it copies with the part of each.
+    let mut fixture = Fixture::with_parts(PART, PART | OTHER_PART);
+    fixture.attach(1, PREFILL);
+    let unit = fixture.allocate(1, 0, 1)[0];
+    fixture.commit(1, 0, 7, Vec::new());
+    let crossing = fixture.submit(QUEUE, replicate(1, KV, 0, UNITS, DECODE, Vec::new()));
+    fixture.pool.ended((QUEUE, crossing), true);
+    fixture.checked();
+
+    let store = |group| Request::Store {
+        group,
+        keys: vec![key(7)],
+        tier: Tier::Host,
+    };
+    let copy = |group| Completion::Copy {
+        group,
+        keys: vec![key(7)],
+        from: vec![(UNITS, unit, 1)],
+        to: vec![(HOST, 0, 1)],
+        evicted: Vec::new(),
+        encodings: None,
+    };
+    let stored = fixture.submit(QUEUE, store(PREFILL));
+    assert_eq!(fixture.answer(stored), Some(copy(PREFILL)));
+    fixture.finish(stored, true);
+    // The host copy holds the prefill group's part alone: the decode group cannot load it.
+    assert_eq!(fixture.listing(), [(key(7), KV, 64, 0b011, 0b11, 0b01)]);
+
+    // The decode group's store fills the part the copy lacks, in the same host block; one copy
+    // fills a host block at a time.
+    let filled = fixture.submit(QUEUE, store(DECODE));
+    assert_eq!(fixture.answer(filled), Some(copy(DECODE)));
+    assert_eq!(fixture.free(HOST), 1);
+    let nothing = Some(Completion::Stored { keys: Vec::new() });
+    assert_eq!(fixture.ask(store(DECODE)), nothing);
+    fixture.finish(filled, true);
+    assert_eq!(fixture.listing(), [(key(7), KV, 64, 0b011, 0b11, 0b11)]);
+
+    // Every part of each group holds it: nothing is left to store.
+    for group in [PREFILL, DECODE] {
+        assert_eq!(fixture.ask(store(group)), nothing);
+    }
+}
+
+#[test]
+fn a_host_copy_on_other_host_parts_is_neither_offered_nor_loaded_nor_restored() {
+    // The groups' ranks lie on two hosts, each copying with its own host's part.
+    let mut fixture = Fixture::with_parts(PART, OTHER_PART);
+    fixture.cached(1, 7);
+    let stored = fixture.submit(
+        QUEUE,
+        Request::Store {
+            group: PREFILL,
+            keys: vec![key(7)],
+            tier: Tier::Host,
+        },
+    );
+    fixture.finish(stored, true);
+    fixture.ask(Request::Evict { keys: vec![key(7)] });
+
+    // R11: the host copy is a hit for the group whose part holds it and a miss for the other.
+    fixture.attach(2, PREFILL);
+    fixture.attach(3, DECODE);
+    let offered = |host| {
+        Some(Completion::Pinned {
+            runs: Vec::new(),
+            host,
+        })
+    };
+    assert_eq!(fixture.pin(2, 0, &[7]), offered(1));
+    assert_eq!(fixture.pin(3, 0, &[7]), offered(0));
+    let load = |owner| Request::Load {
+        owner: OwnerId(owner),
+        class: KV,
+        at: 0,
+        keys: vec![key(7)],
+    };
+    assert_eq!(fixture.ask(load(3)), Some(Completion::Loaded));
+    assert!(matches!(
+        fixture.ask(load(2)),
+        Some(Completion::Copy { .. })
+    ));
+
+    // A trajectory saved on one host is not restored on the other.
+    fixture.attach(4, PREFILL);
+    let save = fixture.submit(
+        QUEUE,
+        Request::Save {
+            owner: OwnerId(4),
+            key: key(9),
+            units: 2,
+        },
+    );
+    assert_eq!(fixture.finish(save, true), Some(Completion::Saved));
+    let restore = |owner| Request::Restore {
+        owner: OwnerId(owner),
+        key: key(9),
+    };
+    let refused = Some(Completion::Refused { cause: Cause::Key });
+    assert_eq!(fixture.ask(restore(3)), refused);
+    assert!(matches!(
+        fixture.ask(restore(4)),
+        Some(Completion::Copy { .. })
+    ));
+}
+
+#[test]
+fn a_pool_made_again_from_its_image_carries_a_waiting_crossing() {
+    let mut fixture = Fixture::new();
+    fixture.attach(1, PREFILL);
+    fixture.allocate(1, 0, 1);
+    let crossing = fixture.submit(
+        QUEUE,
+        replicate(1, KV, 0, UNITS, DECODE, vec![(PREFILL, 1)]),
+    );
+
+    let image = rmp_serde::to_vec(&fixture.pool).unwrap();
+    fixture.pool = rmp_serde::from_slice(&image).unwrap();
+    fixture.checked();
+    // The crossing still holds the block after its owner let go of it, and comes due.
+    assert_eq!(fixture.release(1, 0, 1, Vec::new()), Some(Completion::Done));
+    assert_eq!(fixture.free(UNITS), 3);
+    fixture.pool.advance(SERVING, PREFILL, 1);
+    fixture.checked();
+    assert_eq!(fixture.answer(crossing), Some(Completion::Failed));
+    assert_eq!(fixture.free(UNITS), 4);
 }

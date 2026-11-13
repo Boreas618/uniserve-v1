@@ -903,6 +903,7 @@ mod tests {
             units,
             limit: units + 1,
             segments: Vec::new(),
+            memory: String::new(),
         };
         let open = Open {
             version: VERSION,
@@ -922,6 +923,8 @@ mod tests {
                 memory: "gpu0".into(),
                 slots: 1,
                 regions: vec![vec![0]],
+                receives: Vec::new(),
+                parts: Vec::new(),
             }],
             schedulers: vec![vec![GroupId(0)]],
             peers: Vec::new(),

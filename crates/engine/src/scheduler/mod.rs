@@ -949,7 +949,8 @@ impl Scheduler {
             | runtime::Request::Clone { .. }
             | runtime::Request::Save { .. }
             | runtime::Request::Restore { .. }
-            | runtime::Request::Finish { .. } => true,
+            | runtime::Request::Finish { .. }
+            | runtime::Request::Replicate { .. } => true,
             runtime::Request::Store { tier, .. } => *tier == Tier::Host,
             runtime::Request::Attach { .. }
             | runtime::Request::Allocate { .. }
@@ -2107,7 +2108,7 @@ impl Scheduler {
                 .region_index(*region)
                 .and_then(|index| self.capacity.get(index))
                 .map(|capacity| 4 + LIST + KEY * capacity.saturating_sub(*units) as usize),
-            runtime::Request::List => None,
+            runtime::Request::List | runtime::Request::Replicate { .. } => None,
         };
 
         // The number, the variant, and at least the one byte of a `Refused` or a `Full`.

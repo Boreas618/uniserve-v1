@@ -785,6 +785,8 @@ mod tests {
                     }
                 })
                 .collect(),
+            receives: Vec::new(),
+            parts: Vec::new(),
         }
     }
 
@@ -938,6 +940,7 @@ mod tests {
             units: 1 << 20,
             limit: 1 << 20,
             segments: Vec::new(),
+            memory: String::new(),
         };
         let sized = |host| Class {
             units: 0,
@@ -1141,7 +1144,7 @@ mod tests {
         assert!(asks.contains(&allocate), "{asks:?}");
 
         // Cached on the device of the group that encodes it: pinned at the same position.
-        let listed = (key, class, 40, DEVICE, 1);
+        let listed = (key, class, 40, DEVICE, 1, 0);
         let listing = Completion::Listing { keys: vec![listed] };
         scheduler.learn(&runtime::Request::List, &listing);
         let asks = scheduler.admission_requests(id);

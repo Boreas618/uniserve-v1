@@ -16,7 +16,7 @@
 //! the block by `Rc`, and [`BufferPool::reclaim`] is the only code that
 //! returns runs to a region: it needs the last reference.
 //!
-//! The rules R1 to R10 of the design are guards of this module; each is
+//! The rules R1 to R11 of the design are guards of this module; each is
 //! marked where it stands. The design model is `verification/buffer-pool`.
 //!
 //! The types that hold blocks take the reference to a block as a parameter,
@@ -66,13 +66,14 @@ type Taken = Result<Option<Completion>, Cause>;
 /// The class of a slot row's block.
 const SLOT: u8 = u8::MAX;
 
-/// The validity of a block whose units exist once: every memory that maps
-/// its region reads it.
-const EVERYWHERE: u8 = u8::MAX;
+/// The validity of a slot row: memory of the ranks' own processes, which
+/// every memory that maps its region reads.
+const EVERYWHERE: u64 = u64::MAX;
 
-/// The most device memories a deployment's sessions state: one bit each in
-/// a block's validity.
-const MEMORIES: usize = 8;
+/// The most memories a deployment's sessions state, device memories, the
+/// memories of the main processes that hold product buffers, and host parts
+/// together: one bit each in a block's validity.
+const MEMORIES: usize = 64;
 
 /// What a block's units count as in the capacity words of their regions.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -88,15 +89,23 @@ enum Counted {
     Retired,
 }
 
-/// A block's memory: one run, or one run per backing rank of a product.
+/// A block's memory: one run for a KV block, an encoder output or a
+/// trajectory; one run per backing rank of a product, and one more in each
+/// memory a `Replicate` brought it to.
 #[derive(Serialize, Deserialize)]
 struct Block {
     class: u8,
-    runs: Vec<Run>,
-    /// The memories that hold the block's content, a bit each: the block's
-    /// own from its allocation, changed by a transfer and by a load that
-    /// fills one more memory.
-    valid: Cell<u8>,
+    /// The runs, the first the one it was allocated with: a cached block is
+    /// found in its entry by the region of its first run. A `Replicate`
+    /// appends a run in a receiving region while others hold the block.
+    runs: RefCell<Vec<Run>>,
+    /// The memories that hold the block's content, a bit each: device
+    /// memories and the memories of main processes for a device block, from
+    /// its allocation, changed by a transfer, by a load that fills one more
+    /// memory and by a `Replicate`; host parts for a host block, from the
+    /// end of the copy that wrote it, grown by a store that fills the parts
+    /// it lacks.
+    valid: Cell<u64>,
     /// The key it is cached under, while an entry of the cache holds it.
     /// What follows is the counting's: an image leaves it out, and the pool
     /// made of the image finds it again from the holders.
@@ -115,10 +124,10 @@ struct Block {
 impl Block {
     /// A block of `runs` of a class, valid in the memories `valid`, with
     /// `owned` references that make it private.
-    fn new(class: u8, runs: Vec<Run>, valid: u8, owned: u32) -> Self {
+    fn new(class: u8, runs: Vec<Run>, valid: u64, owned: u32) -> Self {
         Self {
             class,
-            runs,
+            runs: RefCell::new(runs),
             valid: Cell::new(valid),
             cached: Cell::new(None),
             owned: Cell::new(owned),
@@ -136,17 +145,24 @@ impl Block {
         self.owned.set(self.owned.get().saturating_sub(1));
     }
 
-    /// The region of the block's first run: its only one when it is cached.
+    /// The region of the block's first run: the one its entry finds it by
+    /// when it is cached.
     fn region(&self) -> u8 {
-        self.runs.first().map_or(0, Run::region)
+        self.runs.borrow().first().map_or(0, Run::region)
     }
 
     fn units(&self) -> u32 {
-        self.runs.iter().map(Run::count).sum()
+        self.runs.borrow().iter().map(Run::count).sum()
     }
 
-    fn stated(&self) -> impl Iterator<Item = storage::runtime::Run> + '_ {
-        self.runs.iter().map(Run::stated)
+    /// The block's runs as a completion states them, in the order it holds them.
+    fn stated(&self) -> Vec<storage::runtime::Run> {
+        self.runs.borrow().iter().map(Run::stated).collect()
+    }
+
+    /// The regions of the block's runs, in the order it holds them.
+    fn regions(&self) -> Vec<u8> {
+        self.runs.borrow().iter().map(Run::region).collect()
     }
 }
 
@@ -281,22 +297,63 @@ enum Deferred<B = Rc<Block>> {
         ok: bool,
         rest: Stamps,
     },
+    /// A crossing waits for the stamps of the batches that may still write
+    /// its block, holding the block, and then while something else fills a
+    /// memory it is to fill (at stamp 0 of the reading group).
+    Replicate {
+        queue: QueueId,
+        #[serde(with = "image::request_id")]
+        request: RequestId,
+        #[serde(with = "image::owner_id")]
+        owner: OwnerId,
+        class: u8,
+        at: u32,
+        block: B,
+        from: u8,
+        to: GroupId,
+        rest: Stamps,
+    },
 }
 
 /// One worker group of one engine epoch.
 #[derive(Serialize, Deserialize)]
 struct Group<B = Rc<Block>> {
-    /// The device memory its ranks address, as a bit of a block's validity.
+    /// The device memory its ranks address, as the number of its bit in a
+    /// block's validity.
     memory: u8,
     /// The region of its slot rows.
     slots: u8,
     /// Per class, the device regions its owners' blocks are taken from: one,
     /// or one per backing rank of a product; none for a class it lacks.
     regions: Vec<Vec<u8>>,
+    /// Per class, the regions a `Replicate` into its memories takes runs in:
+    /// one in each memory its ranks read the class in and none of its
+    /// `regions` lies in.
+    receives: Vec<Vec<u8>>,
+    /// Per class, the host parts its ranks copy with, as bits of a block's
+    /// validity; 0 for a class without a host region.
+    parts: Vec<u64>,
     /// The last batch whose end its workers have seen, as last read.
     completed: u64,
     /// What waits on it, in order of stamp.
     deferred: VecDeque<(u64, Deferred<B>)>,
+}
+
+impl Group {
+    /// A group whose ranks address the memory of bit `memory`, with the
+    /// region of its slot rows and per class its device regions, no
+    /// receiving region, no host part, and nothing waiting on it.
+    fn new(memory: u8, slots: u8, regions: Vec<Vec<u8>>) -> Self {
+        Self {
+            memory,
+            slots,
+            regions,
+            receives: Vec::new(),
+            parts: Vec::new(),
+            completed: 0,
+            deferred: VecDeque::new(),
+        }
+    }
 }
 
 /// Where the result of a copy goes.
@@ -324,15 +381,27 @@ enum Target {
         owner: OwnerId,
         to: GroupId,
     },
+    /// A crossing: the block at an owner's position, read from its run in
+    /// region `from`, in one memory the group reads the class in.
+    Memory {
+        #[serde(with = "image::owner_id")]
+        owner: OwnerId,
+        class: u8,
+        at: u32,
+        group: GroupId,
+        from: u8,
+    },
 }
 
 /// A copy in flight, run by a worker, the Transfer Server or the
 /// connector. It holds what it reads and what it writes until it has ended.
 #[derive(Serialize, Deserialize)]
 struct Copy<B = Rc<Block>> {
-    /// The memory it writes, as a bit of a block's validity; 0 when it
-    /// writes a block whose units exist once.
-    memory: u8,
+    /// The memories it writes, as bits of a block's validity: the device
+    /// memory a clone, a load, a transfer or a crossing writes; the host
+    /// parts a store, a save or a prefetch writes; 0 for a restore, which
+    /// writes the slot row, and a put.
+    memory: u64,
     reads: Vec<B>,
     /// The block it writes. A put to the remote store writes no block: this
     /// is the host block it reads.
@@ -352,9 +421,10 @@ pub struct BufferPool {
     regions: Vec<Region>,
     /// The names of the memory spaces the sessions stated, by number.
     spaces: Vec<String>,
-    /// The names of the device memories the sessions' groups stated, by
-    /// their bit in a block's validity; at most [`MEMORIES`].
-    memories: Vec<String>,
+    /// The memories the sessions stated, by their bit in a block's
+    /// validity: a device memory or a main process's memory by its name, a
+    /// host part by its host and its part index; at most [`MEMORIES`].
+    memories: Vec<(String, Option<u32>)>,
     /// Per memory space, the byte ranges in no region: the deployment's free quota there.
     quota: Vec<BTreeMap<u64, u64>>,
     /// Per memory space, its segment table: the segments the engines'
@@ -453,7 +523,7 @@ impl BufferPool {
             self.touch(&block);
         }
         if let Ok(block) = Rc::try_unwrap(block) {
-            for run in block.runs {
+            for run in block.runs.into_inner() {
                 let region = &mut self.regions[usize::from(run.region())];
                 if block.class == SLOT {
                     region.give_row(run);
@@ -538,12 +608,21 @@ impl BufferPool {
                 after,
             } => self.transfer(queue, id, owner, group, after),
             Request::Prefetch {
+                group,
                 class,
                 units,
                 keys,
                 source: _,
                 deadline,
-            } => self.prefetch(queue, id, class, units, &keys, deadline),
+            } => self.prefetch(queue, id, group, class, units, &keys, deadline),
+            Request::Replicate {
+                owner,
+                class,
+                at,
+                from,
+                group,
+                after,
+            } => self.replicate(queue, id, (owner, class, at), from, group, after),
         });
         match result {
             Ok(Some(completion)) => self.complete(queue, id, completion),
@@ -640,10 +719,43 @@ impl BufferPool {
     }
 
     /// A group's bit in a block's validity.
-    fn memory(&self, client: ClientId, group: GroupId) -> u8 {
+    fn memory(&self, client: ClientId, group: GroupId) -> u64 {
         self.groups
             .get(&(client, group))
             .map_or(0, |found| 1 << found.memory)
+    }
+
+    /// The memory in which a block's run in `region` lies, for a group whose
+    /// memory is `own`: the region's memory when its units exist once, the
+    /// group's when they exist in every memory that maps the region.
+    fn lies_in(&self, region: u8, own: u64) -> u64 {
+        let found = self.regions.get(usize::from(region));
+        match found.and_then(|region| region.memory) {
+            Some(memory) => 1 << memory,
+            None => own,
+        }
+    }
+
+    /// The memories in which runs in `regions` lie, for a group whose
+    /// memory is `own`.
+    fn spread(&self, regions: &[u8], own: u64) -> u64 {
+        regions
+            .iter()
+            .fold(0, |all, region| all | self.lies_in(*region, own))
+    }
+
+    /// The host parts a group copies a class with.
+    fn parts(&self, client: ClientId, group: GroupId, class: u8) -> u64 {
+        let found = self.groups.get(&(client, group));
+        let parts = found.and_then(|found| found.parts.get(usize::from(class)).copied());
+        parts.unwrap_or(0)
+    }
+
+    /// R11: whether a group's owners may load or restore a host copy: it
+    /// holds every host part the group copies the class with.
+    fn loadable(&self, client: ClientId, group: GroupId, class: u8, host: &Block) -> bool {
+        let parts = self.parts(client, group, class);
+        host.valid.get() & parts == parts
     }
 
     /// The one device region of a group for a class whose blocks have one run.
@@ -772,7 +884,10 @@ impl BufferPool {
             if Rc::strong_count(block) != 1 || !seen.insert(*key) {
                 continue;
             }
-            for run in &block.runs {
+            // A block holds runs in other regions too once a `Replicate`
+            // brought it to another memory: only its runs here make room.
+            let held = block.runs.borrow();
+            for run in held.iter().filter(|run| run.region() == region) {
                 // Join the run with the free runs that touch it.
                 let (mut first, mut count) = (run.first(), run.count());
                 if let Some(next) = runs.remove(&(first + count)) {
@@ -834,7 +949,7 @@ impl BufferPool {
         count: u32,
         size: u32,
         keys: &[Key],
-        valid: u8,
+        valid: u64,
     ) -> Vec<Rc<Block>> {
         for key in keys {
             self.evict_in(key, region);
@@ -888,14 +1003,14 @@ impl BufferPool {
             }
         }
 
-        // A block of regions whose units exist once is read by every group
-        // that maps them; a block of a region that each memory holds is
-        // valid where its owner's group writes it.
-        let valid = if regions.len() > 1 {
-            EVERYWHERE
-        } else {
-            self.memory(client, group)
-        };
+        // A block is valid where its owner's group writes it: in the one
+        // memory its runs lie in, a group's for a region each memory holds.
+        // A block whose runs lie in several memories, a product backed by
+        // ranks of several processes, is valid in none until a `Replicate`
+        // names the run its writer wrote: which process's runs a dealt call
+        // wrote is the scheduler's knowledge (A9).
+        let spread = self.spread(&regions, self.memory(client, group));
+        let valid = if spread.count_ones() == 1 { spread } else { 0 };
         // Each is private by the owner's entry.
         let mut blocks: Vec<Block> = (0..count)
             .map(|_| Block::new(class, Vec::new(), valid, 1))
@@ -907,6 +1022,7 @@ impl BufferPool {
             for block in &mut blocks {
                 block
                     .runs
+                    .get_mut()
                     .extend(self.regions[usize::from(*region)].take(size));
             }
         }
@@ -924,11 +1040,12 @@ impl BufferPool {
     }
 
     /// The device copy of a key that a group of a session may use: of the
-    /// class, in the group's region, valid in its memory and visible to its
+    /// class, in the group's region, valid in the memory the group reads it
+    /// in (its own for KV, its region's for a product) and visible to its
     /// epoch (R8).
     fn usable(&self, client: ClientId, group: GroupId, class: u8, key: &Key) -> Option<&Rc<Block>> {
         let region = self.region(client, group, class).ok()?;
-        let memory = self.memory(client, group);
+        let memory = self.lies_in(region, self.memory(client, group));
         let entry = self.cache.get(key).filter(|entry| entry.class == class)?;
         let found = entry.device.iter().find(|(block, maker)| {
             block.region() == region
@@ -950,10 +1067,13 @@ impl BufferPool {
             return Err(Cause::Position);
         }
 
-        // The further leading keys that have a host copy the epoch may use.
+        // The further leading keys that have a host copy the epoch may use
+        // and the owner's group can load (R11).
         let on_host = |key: &&Key| {
             let host = self.cache.get(*key).and_then(|entry| entry.host.as_ref());
-            host.is_some_and(|(_, maker, _)| self.visible(*maker, client))
+            host.is_some_and(|(block, maker, _)| {
+                self.visible(*maker, client) && self.loadable(client, group, class, block)
+            })
         };
         let host = keys[blocks.len()..].iter().take_while(on_host).count() as u32;
 
@@ -1022,7 +1142,7 @@ impl BufferPool {
         if waits {
             return Err(Cause::Position);
         }
-        if block.runs.len() != 1 {
+        if block.runs.borrow().len() != 1 {
             return Err(Cause::Class);
         }
         // The waiting commit makes the block private too, whatever its
@@ -1051,7 +1171,8 @@ impl BufferPool {
                 match &mut work {
                     Deferred::Commit { rest, .. }
                     | Deferred::Transfer { rest, .. }
-                    | Deferred::Finish { rest, .. } => {
+                    | Deferred::Finish { rest, .. }
+                    | Deferred::Replicate { rest, .. } => {
                         *rest = after;
                     }
                     Deferred::Release { .. } => {}
@@ -1066,10 +1187,11 @@ impl BufferPool {
         }
     }
 
-    /// Queues a transfer that is due and waits for a copy to end: it is
-    /// looked at again whenever deferred work is done.
+    /// Queues a transfer or a crossing that is due and waits for a copy to
+    /// end, under stamp 0 of the group it copies to: it is looked at again
+    /// whenever deferred work is done.
     fn wait(&mut self, client: ClientId, work: Deferred) {
-        let Deferred::Transfer { to, .. } = &work else {
+        let (Deferred::Transfer { to, .. } | Deferred::Replicate { to, .. }) = &work else {
             return;
         };
         if let Some(found) = self.groups.get_mut(&(client, *to)) {
@@ -1108,7 +1230,8 @@ impl BufferPool {
                 let rest = match &work {
                     Deferred::Commit { rest, .. }
                     | Deferred::Transfer { rest, .. }
-                    | Deferred::Finish { rest, .. } => rest.clone(),
+                    | Deferred::Finish { rest, .. }
+                    | Deferred::Replicate { rest, .. } => rest.clone(),
                     Deferred::Release { .. } => Vec::new(),
                 };
                 if !rest.is_empty() {
@@ -1128,7 +1251,7 @@ impl BufferPool {
     }
 
     /// Deferred work takes effect: every stamp it waited for is reached.
-    /// Returns a transfer that cannot start yet.
+    /// Returns a transfer or a crossing that cannot start yet.
     fn effect(&mut self, client: ClientId, work: Deferred) -> Option<Deferred> {
         match work {
             Deferred::Release { blocks } => {
@@ -1177,6 +1300,7 @@ impl BufferPool {
                     });
                 }
             }
+            Deferred::Replicate { .. } => return self.cross(work),
         }
         None
     }
@@ -1270,15 +1394,15 @@ impl BufferPool {
     }
 
     fn list(&self, client: ClientId) -> Completion {
-        // The session's groups: the bit of each one's memory and its own bit.
-        let groups: Vec<(u8, u8)> = self
+        // The session's groups: each one's number, the bit of its memory and its own bit.
+        let groups: Vec<(GroupId, u64, u8)> = self
             .groups
             .iter()
             .filter(|((of, group), _)| *of == client && group.0 < 8)
-            .map(|((_, group), found)| (1 << found.memory, 1 << group.0))
+            .map(|((_, group), found)| (*group, 1 << found.memory, 1 << group.0))
             .collect();
 
-        let mut keys: Vec<(Key, u8, u16, u8, u8)> = Vec::new();
+        let mut keys: Vec<(Key, u8, u16, u8, u8, u8)> = Vec::new();
         for (key, entry) in &self.cache {
             let device = entry
                 .device
@@ -1287,15 +1411,25 @@ impl BufferPool {
             let valid = device.fold(0, |all, (block, _)| all | block.valid.get());
             let held = groups
                 .iter()
-                .filter(|(memory, _)| valid & memory != 0)
-                .fold(0, |all, (_, group)| all | group);
+                .filter(|(_, memory, _)| valid & memory != 0)
+                .fold(0, |all, (_, _, bit)| all | bit);
             let host = entry
                 .host
                 .as_ref()
-                .is_some_and(|(_, maker, _)| self.visible(*maker, client));
-            let tiers = u8::from(held != 0) | u8::from(host) << 1 | u8::from(entry.remote) << 2;
+                .filter(|(_, maker, _)| self.visible(*maker, client));
+            // The groups that can load the host copy: it holds their host parts (R11).
+            let hosts = groups
+                .iter()
+                .filter(|(group, _, _)| {
+                    host.is_some_and(|(block, ..)| {
+                        self.loadable(client, *group, entry.class, block)
+                    })
+                })
+                .fold(0, |all, (_, _, bit)| all | bit);
+            let tiers =
+                u8::from(held != 0) | u8::from(host.is_some()) << 1 | u8::from(entry.remote) << 2;
             if tiers != 0 {
-                keys.push((*key, entry.class, entry.tokens, tiers, held));
+                keys.push((*key, entry.class, entry.tokens, tiers, held, hosts));
             }
         }
         keys.sort_unstable_by_key(|listed| listed.0);

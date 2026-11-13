@@ -25,7 +25,7 @@ use serde::{Deserialize, Serialize};
 use crate::{Error, Key, Result, Segment};
 
 /// The version of this interface.
-pub const VERSION: u32 = 2;
+pub const VERSION: u32 = 3;
 
 /// A request's number on its queue pair, drawn by the scheduler from a
 /// counter and never reused.
@@ -145,6 +145,14 @@ pub struct Region {
     /// memory of the ranks' own processes (slot rows, product buffers),
     /// whose space is granted the units asked for.
     pub segments: Segments,
+    /// The memory a region whose units exist once lies in: the memory of the
+    /// main process whose rank holds it (a rank's product buffer), named as
+    /// [`Group::memory`] names one. Empty for a region whose units exist in
+    /// every memory that maps it (KV units, slot rows) and for a host region.
+    /// A block whose runs lie in one memory is valid there from its
+    /// allocation; one whose runs lie in several is valid in none until a
+    /// [`Request::Replicate`] names the run its writer wrote.
+    pub memory: String,
 }
 
 /// A kind of block.
@@ -232,6 +240,20 @@ pub struct Group {
     /// [`Open::regions`].
     pub slots: u8,
     pub regions: Vec<Vec<u8>>,
+    /// Per class, the receiving regions: in each memory in which the
+    /// group's ranks read the class and none of its `regions` lies, the
+    /// region a [`Request::Replicate`] into that memory takes the block's
+    /// run in (the product buffer of the group's first rank there). Indices
+    /// into [`Open::regions`]; empty for a class read where it is written.
+    pub receives: Vec<Vec<u8>>,
+    /// Per class, the host parts the group's ranks copy the class's host
+    /// copies with, each as its host and its part index: for a KV class the
+    /// host of each rank with the rank's index; for a block that lies in one
+    /// rank's memory, part 0 on each host the ranks that copy it lie on.
+    /// Empty for a class without a host region. A host copy is loaded or
+    /// restored for an owner of the group only when every one of these
+    /// parts holds it.
+    pub parts: Vec<Vec<(String, u32)>>,
 }
 
 /// The answer to [`Open`]. The descriptors of the queue pairs travel with
@@ -361,11 +383,14 @@ pub enum Request {
         ok: bool,
         after: Stamps,
     },
-    /// Bring the leading keys the source holds into the host tier by the
-    /// deadline, in nanoseconds of the host's monotonic clock. The keys are
-    /// of one class; `units` is the size of each block of a sized class and
-    /// 0 otherwise.
+    /// Bring the leading keys the source holds into the host tier, on the
+    /// host parts the group copies the class with ([`Group::parts`]), by
+    /// the deadline, in nanoseconds of the host's monotonic clock. The keys
+    /// are of one class; `units` is the size of each block of a sized class
+    /// and 0 otherwise. A key whose host copy holds the group's parts counts
+    /// as found.
     Prefetch {
+        group: GroupId,
         class: u8,
         units: u32,
         keys: Vec<Key>,
@@ -376,6 +401,22 @@ pub enum Request {
     List,
     /// Take units out of the region's free list or put them back, up to `units` in all.
     Resize { region: u8, units: u32 },
+    /// Copy the block at `at` of the owner's table of a class from its run in
+    /// region `from` into each memory the group reads the class in (the
+    /// memories of its regions and receiving regions of the class) that does
+    /// not hold it, taking a run in the group's receiving region there where
+    /// the block has none: a task of the Transfer Server, once the stamps are
+    /// reached. For a private block whose runs lie in several memories,
+    /// `from` is a run its writer wrote, and its memory holds the block from
+    /// when the request is taken.
+    Replicate {
+        owner: OwnerId,
+        class: u8,
+        at: u32,
+        from: u8,
+        group: GroupId,
+        after: Stamps,
+    },
 }
 
 /// The result a completion carries.
@@ -400,7 +441,8 @@ pub enum Completion {
         evicted: Vec<Key>,
     },
     /// The runs of the pinned blocks in position order; `host` counts the
-    /// further leading keys that have a host copy.
+    /// further leading keys that have a host copy the owner's group can
+    /// load: one that holds every host part the group copies the class with.
     Pinned {
         runs: Vec<Run>,
         host: u32,
@@ -448,15 +490,22 @@ pub enum Completion {
         found: u32,
     },
     /// Each cached key: its class, its tokens, the tiers that hold it (bit 0
-    /// device, bit 1 host, bit 2 remote) and the groups whose memory holds
-    /// its device copy (bit per group).
+    /// device, bit 1 host, bit 2 remote), the groups whose memory holds its
+    /// device copy and the groups whose host parts hold its host copy (a
+    /// bit per group each).
     Listing {
-        keys: Vec<(Key, u8, u16, u8, u8)>,
+        keys: Vec<(Key, u8, u16, u8, u8, u8)>,
     },
     /// The region's units after the resize, and the keys evicted for a shrink.
     Resized {
         units: u32,
         evicted: Vec<Key>,
+    },
+    /// The block a `Replicate` named is valid in every memory the group
+    /// reads its class in: its runs in the group's regions and receiving
+    /// regions of the class, in the order the block holds them.
+    Replicated {
+        runs: Vec<Run>,
     },
 }
 
@@ -775,6 +824,7 @@ impl Request {
                 writer.stamps(after);
             }
             Self::Prefetch {
+                group,
                 class,
                 units,
                 keys,
@@ -782,6 +832,7 @@ impl Request {
                 deadline,
             } => {
                 writer.byte(15);
+                writer.byte(group.0);
                 writer.byte(*class);
                 writer.word(*units);
                 writer.keys(keys);
@@ -796,6 +847,22 @@ impl Request {
                 writer.byte(17);
                 writer.byte(*region);
                 writer.word(*units);
+            }
+            Self::Replicate {
+                owner,
+                class,
+                at,
+                from,
+                group,
+                after,
+            } => {
+                writer.byte(18);
+                writer.long(owner.0);
+                writer.byte(*class);
+                writer.word(*at);
+                writer.byte(*from);
+                writer.byte(group.0);
+                writer.stamps(after);
             }
         }
     }
@@ -893,6 +960,7 @@ impl Request {
                 after: reader.stamps()?,
             },
             15 => Self::Prefetch {
+                group: GroupId(reader.byte()?),
                 class: reader.byte()?,
                 units: reader.word()?,
                 keys: reader.keys()?,
@@ -909,6 +977,14 @@ impl Request {
             17 => Self::Resize {
                 region: reader.byte()?,
                 units: reader.word()?,
+            },
+            18 => Self::Replicate {
+                owner: OwnerId(reader.long()?),
+                class: reader.byte()?,
+                at: reader.word()?,
+                from: reader.byte()?,
+                group: GroupId(reader.byte()?),
+                after: reader.stamps()?,
             },
             other => {
                 return Err(Error::Protocol(format!(
@@ -1004,18 +1080,23 @@ impl Completion {
             Self::Listing { keys } => {
                 writer.byte(18);
                 writer.word(keys.len() as u32);
-                for (key, class, tokens, tiers, groups) in keys {
+                for (key, class, tokens, tiers, groups, hosts) in keys {
                     writer.key(key);
                     writer.byte(*class);
                     writer.short(*tokens);
                     writer.byte(*tiers);
                     writer.byte(*groups);
+                    writer.byte(*hosts);
                 }
             }
             Self::Resized { units, evicted } => {
                 writer.byte(19);
                 writer.word(*units);
                 writer.keys(evicted);
+            }
+            Self::Replicated { runs } => {
+                writer.byte(20);
+                writer.runs(runs);
             }
         }
     }
@@ -1101,12 +1182,13 @@ impl Completion {
                 found: reader.word()?,
             },
             18 => Self::Listing {
-                keys: (0..reader.length(37)?)
+                keys: (0..reader.length(38)?)
                     .map(|_| {
                         Ok((
                             reader.key()?,
                             reader.byte()?,
                             reader.short()?,
+                            reader.byte()?,
                             reader.byte()?,
                             reader.byte()?,
                         ))
@@ -1116,6 +1198,9 @@ impl Completion {
             19 => Self::Resized {
                 units: reader.word()?,
                 evicted: reader.keys()?,
+            },
+            20 => Self::Replicated {
+                runs: reader.runs()?,
             },
             other => {
                 return Err(Error::Protocol(format!(
@@ -1218,6 +1303,7 @@ mod tests {
                 after,
             },
             Request::Prefetch {
+                group: GroupId(1),
                 class: 0,
                 units: 0,
                 keys: vec![key(7), key(8)],
@@ -1228,6 +1314,14 @@ mod tests {
             Request::Resize {
                 region: 1,
                 units: 4096,
+            },
+            Request::Replicate {
+                owner: OwnerId(3),
+                class: 2,
+                at: 5,
+                from: 7,
+                group: GroupId(1),
+                after: vec![(GroupId(0), 4), (GroupId(1), 2)],
             },
         ];
 
@@ -1291,11 +1385,14 @@ mod tests {
             Completion::Evicted { keys: vec![key(5)] },
             Completion::Prefetched { found: 2 },
             Completion::Listing {
-                keys: vec![(key(6), 0, 64, 0b011, 0b01)],
+                keys: vec![(key(6), 0, 64, 0b011, 0b01, 0b10)],
             },
             Completion::Resized {
                 units: 100,
                 evicted: vec![key(7)],
+            },
+            Completion::Replicated {
+                runs: vec![(5, 0, 2), (9, 4, 2)],
             },
         ];
 

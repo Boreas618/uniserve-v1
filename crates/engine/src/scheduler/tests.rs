@@ -136,12 +136,15 @@ fn built(
         units,
         limit: units,
         segments: Vec::new(),
+        memory: String::new(),
     };
     let group = |id: GroupId, kv: u8| runtime::Group {
         id,
         memory: format!("memory-{}", id.0),
         slots: 3,
         regions: vec![vec![kv], vec![2]],
+        receives: Vec::new(),
+        parts: Vec::new(),
     };
     let class = |units| Class {
         units,
@@ -938,7 +941,7 @@ fn a_scheduler_starts_by_listing_its_sessions_cached_blocks_and_orders_them() {
     };
 
     // Two blocks of the KV class whose device copies lie in group A's memory (region 4).
-    let block = |byte| (key(byte), KV, 16, DEVICE, 1 << A.0);
+    let block = |byte| (key(byte), KV, 16, DEVICE, 1 << A.0, 0);
     let keys = vec![block(1), block(2)];
     bench.complete(list, &Completion::Listing { keys });
     bench.scheduler.step();

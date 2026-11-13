@@ -1304,6 +1304,7 @@ pub fn text_layout(
                 units: pages,
                 limit: pages,
                 segments: Vec::new(),
+                memory: String::new(),
             });
         }
     }
@@ -1341,6 +1342,7 @@ pub fn text_layout(
             units: 0,
             limit: units,
             segments: Vec::new(),
+            memory: String::new(),
         });
 
         for id in listed {
@@ -1362,6 +1364,7 @@ pub fn text_layout(
                 units: slots,
                 limit: slots + 1,
                 segments: Vec::new(),
+                memory: String::new(),
             });
             let mut per_class: Vec<Vec<u8>> = vec![vec![kv_region]; cache.groups.len()];
             if let Some((_, units, _)) = images {
@@ -1378,6 +1381,7 @@ pub fn text_layout(
                         units,
                         limit: units,
                         segments: Vec::new(),
+                        memory: String::new(),
                     });
                     vec![region]
                 } else {
@@ -1391,6 +1395,8 @@ pub fn text_layout(
                 memory: memory(group),
                 slots: slot_region,
                 regions: per_class,
+                receives: Vec::new(),
+                parts: Vec::new(),
             });
         }
     }
@@ -1558,6 +1564,7 @@ fn media_layout(launch: &EngineArgs, ranks: &[LoadedRank]) -> Result<Open> {
             units,
             limit: units,
             segments: Vec::new(),
+            memory: String::new(),
         })
     };
     let conditioning_digests = sizer.conditioning_digests(sizing.model.as_ref());
@@ -1622,6 +1629,7 @@ fn media_layout(launch: &EngineArgs, ranks: &[LoadedRank]) -> Result<Open> {
                 units,
                 limit: units,
                 segments: Vec::new(),
+                memory: String::new(),
             });
             for kind in backs {
                 kinds[kind].push(region);
@@ -1649,6 +1657,7 @@ fn media_layout(launch: &EngineArgs, ranks: &[LoadedRank]) -> Result<Open> {
             units: slots,
             limit: slots + 1,
             segments: Vec::new(),
+            memory: String::new(),
         });
         backing.push((index, kinds, slot_region));
     }
@@ -1728,6 +1737,8 @@ fn media_layout(launch: &EngineArgs, ranks: &[LoadedRank]) -> Result<Open> {
             memory: media_memory(groups, &groups[index]),
             slots: *slot_region,
             regions: per_class,
+            receives: Vec::new(),
+            parts: Vec::new(),
         });
     }
 
@@ -2206,6 +2217,7 @@ fn host_encoders(tensors: &[u8; 32], units: u64) -> Result<Region> {
         units,
         limit: units,
         segments: Vec::new(),
+        memory: String::new(),
     })
 }
 

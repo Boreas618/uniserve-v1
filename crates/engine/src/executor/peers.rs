@@ -1231,6 +1231,7 @@ mod tests {
                 units: 0,
                 limit: 65,
                 segments: Vec::new(),
+                memory: String::new(),
             }],
             classes: Vec::new(),
             trajectory: 0,

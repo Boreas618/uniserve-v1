@@ -789,6 +789,7 @@ fn stated_request(request: &Request) -> String {
             ok, after: stamps, ..
         } => format!("finish ok={} after={}", u8::from(*ok), after(stamps)),
         Request::Prefetch {
+            group,
             class,
             keys: named,
             source,
@@ -798,8 +799,25 @@ fn stated_request(request: &Request) -> String {
                 storage::runtime::Source::Remote => "remote",
                 storage::runtime::Source::Peers => "peers",
             };
-            format!("prefetch class={class} ks={} source={source}", keys(named))
+            format!(
+                "prefetch g=g{} class={class} ks={} source={source}",
+                group.0,
+                keys(named)
+            )
         }
+        Request::Replicate {
+            owner,
+            class,
+            at,
+            group,
+            after: stamps,
+            ..
+        } => format!(
+            "replicate o={} class={class} ps={at} to=g{} after={}",
+            owner.0,
+            group.0,
+            after(stamps)
+        ),
     }
 }
 
@@ -823,8 +841,9 @@ pub(crate) fn classes(pool: &BufferPool) -> String {
 
 /// The layout of the pool's session in the terms of [`stated`], or
 /// `layout none` unless exactly one session is open: per group, the bit of
-/// its memory, the region of its slot rows and its regions of the class 0;
-/// per class, its host region.
+/// its memory, the region of its slot rows, its regions of the class 0 and
+/// the bits of the host parts it copies that class with; per class, its
+/// host region.
 pub(crate) fn layout(pool: &BufferPool) -> String {
     if pool.sessions.len() != 1 {
         return "layout none\n".into();
@@ -843,12 +862,18 @@ pub(crate) fn layout(pool: &BufferPool) -> String {
             .flatten()
             .map(u8::to_string)
             .collect();
+        let parts = found.parts.first().copied().unwrap_or(0);
+        let parts: Vec<String> = (0..64)
+            .filter(|bit| parts & (1 << bit) != 0)
+            .map(|bit| format!("m{bit}"))
+            .collect();
         let _ = writeln!(
             text,
-            "layout group g{group} memory m{} rows {} kv {}",
+            "layout group g{group} memory m{} rows {} kv {} parts {}",
             found.memory,
             found.slots,
-            kv.join(",")
+            kv.join(","),
+            parts.join(",")
         );
     }
     let hosts: BTreeSet<u8> = pool
@@ -871,14 +896,16 @@ pub(crate) fn layout(pool: &BufferPool) -> String {
 /// `completed` word, the free units, each owner of `owners` by the queue pair
 /// that attaches it (live with its group, slot and its table of the class 0
 /// by position, or gone, or new), each cached key with its copies, the
-/// memories that hold each block an owner or the cache holds, the copies in
-/// flight, what waits for a stamp, and the tasks. A unit is `region:unit`, a
-/// key its first byte. `verification/buffer-pool/agreement.py` writes the
+/// memories that hold each block an owner or the cache holds on the device
+/// and the host parts that hold each host copy, the copies in flight, what
+/// waits for a stamp, and the tasks. A unit is `region:unit`, a key its
+/// first byte. `verification/buffer-pool/agreement.py` writes the
 /// model's states in the same lines.
 pub(crate) fn stated(pool: &BufferPool, owners: &[(QueueId, OwnerId)], copies: u32) -> String {
     let unit = |block: &Rc<Block>| {
         let runs: Vec<String> = block
             .stated()
+            .into_iter()
             .map(|run| format!("{}:{}", run.0, run.1))
             .collect();
         runs.join("+")
@@ -938,7 +965,7 @@ pub(crate) fn stated(pool: &BufferPool, owners: &[(QueueId, OwnerId)], copies: u
 
     let mut valid = BTreeMap::new();
     let mut note = |block: &Rc<Block>| {
-        let memories: Vec<String> = (0..8)
+        let memories: Vec<String> = (0..64)
             .filter(|bit| block.valid.get() & (1 << bit) != 0)
             .map(|bit| format!("m{bit}"))
             .collect();
@@ -954,6 +981,7 @@ pub(crate) fn stated(pool: &BufferPool, owners: &[(QueueId, OwnerId)], copies: u
     }
     for (key, entry) in &pool.cache {
         entry.device.iter().for_each(|(block, _)| note(block));
+        entry.host.iter().for_each(|(block, ..)| note(block));
         let device = entry
             .device
             .first()
@@ -1038,6 +1066,18 @@ pub(crate) fn stated(pool: &BufferPool, owners: &[(QueueId, OwnerId)], copies: u
             Deferred::Transfer { owner, to, .. } => {
                 lines.push(format!("transfer o={} to=g{}", owner.0, to.0))
             }
+            Deferred::Replicate {
+                owner,
+                at,
+                block,
+                to,
+                ..
+            } => lines.push(format!(
+                "replicate o={} p={at} to=g{} u={}",
+                owner.0,
+                to.0,
+                unit(block)
+            )),
         }
     }
     if !released.is_empty() {
@@ -1071,6 +1111,14 @@ pub(crate) fn stated(pool: &BufferPool, owners: &[(QueueId, OwnerId)], copies: u
                 );
                 lines.push(line.trim_end().to_owned());
             }
+            Some(Target::Memory {
+                owner, at, group, ..
+            }) => lines.push(format!(
+                "task replicate o={} p={at} to=g{} u={}",
+                owner.0,
+                group.0,
+                unit(&copies[0].write)
+            )),
             Some(Target::Entry { remote, .. }) if copies[0].deadline.is_some() => {
                 let kind = if *remote { "put" } else { "prefetch" };
                 lines.push(format!(

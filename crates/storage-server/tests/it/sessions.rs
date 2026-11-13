@@ -55,6 +55,7 @@ fn region(
         units,
         limit: reserved + units,
         segments: Vec::new(),
+        memory: String::new(),
     }
 }
 
@@ -87,12 +88,16 @@ pub(crate) fn layout(epoch: u64) -> Open {
                 memory: "gpu0".into(),
                 slots: 1,
                 regions: vec![vec![UNITS as u8]],
+                receives: Vec::new(),
+                parts: Vec::new(),
             },
             Group {
                 id: DECODE,
                 memory: "gpu1".into(),
                 slots: 2,
                 regions: vec![vec![UNITS as u8]],
+                receives: Vec::new(),
+                parts: Vec::new(),
             },
         ],
         schedulers: vec![vec![PREFILL], vec![DECODE]],
@@ -441,14 +446,16 @@ fn a_session_is_refused_what_the_server_does_not_serve() {
     restated.regions[UNITS].unit_bytes = 128;
     assert_eq!(server_error(next.open_pool(restated)), ErrorKind::Invalid);
 
-    // At most eight device memories over the deployment's sessions.
+    // At most 64 memories and host parts over the deployment's sessions.
     let mut wide = layout(1);
-    for index in 2..9 {
+    for index in 2..66 {
         wide.groups.push(Group {
             id: GroupId(index),
             memory: format!("gpu{index}"),
             slots: 1,
             regions: vec![vec![UNITS as u8]],
+            receives: Vec::new(),
+            parts: Vec::new(),
         });
         wide.schedulers.push(vec![GroupId(index)]);
     }
@@ -926,6 +933,7 @@ fn a_put_and_a_prefetch_move_host_copies_through_the_connector_part_by_part() {
     // A prefetch of two keys: the second's page fails on one part, so the
     // first alone is found.
     let prefetch = prefill.submit(Request::Prefetch {
+        group: PREFILL,
         class: KV,
         units: 0,
         keys: vec![key(8), key(9)],
@@ -959,6 +967,7 @@ fn a_put_and_a_prefetch_move_host_copies_through_the_connector_part_by_part() {
 
     // The session names no peer: a prefetch from the peers finds nothing.
     let peers = Request::Prefetch {
+        group: PREFILL,
         class: KV,
         units: 0,
         keys: vec![key(10)],
@@ -1020,6 +1029,7 @@ fn a_put_and_a_prefetch_move_each_part_through_the_connector_of_its_host() {
     // A prefetch of two keys: the second's page fails on the other host's
     // part, so the first alone is found.
     let prefetch = prefill.submit(Request::Prefetch {
+        group: PREFILL,
         class: KV,
         units: 0,
         keys: vec![key(8), key(9)],

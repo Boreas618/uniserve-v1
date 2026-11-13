@@ -1050,6 +1050,8 @@ mod tests {
             memory: format!("memory-{id}"),
             slots: 0,
             regions: Vec::new(),
+            receives: Vec::new(),
+            parts: Vec::new(),
         };
         WorkerGroup::new(configs[0].clone(), capacity, layout)
     }

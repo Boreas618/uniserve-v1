@@ -1512,6 +1512,8 @@ pub enum Waiting {
     Commit,
     Transfer,
     Finish,
+    /// A crossing (`storage::runtime::Request::Replicate`).
+    Replicate,
 }
 
 /// The copies one request started, while they are in flight: an

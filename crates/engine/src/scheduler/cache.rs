@@ -404,7 +404,7 @@ impl Scheduler {
     /// A `Listing` states every cached key: a row it lists becomes what it states, keeping its
     /// holders and last use (a key new to `cache` was never used here and is first in its
     /// order); a row it does not list leaves `cache`.
-    fn listed(&mut self, keys: &[(Key, u8, u16, u8, u8)]) {
+    fn listed(&mut self, keys: &[(Key, u8, u16, u8, u8, u8)]) {
         let listed: HashSet<u64> = keys.iter().map(|(key, ..)| Cached::id(key)).collect();
         let gone: Vec<Key> = self
             .cache
@@ -415,7 +415,7 @@ impl Scheduler {
         for key in &gone {
             self.change_row(key, None, |row| row.tiers = 0);
         }
-        for &(key, class, tokens, tiers, groups) in keys {
+        for &(key, class, tokens, tiers, groups, _) in keys {
             self.change_row(&key, Some((class, tokens)), |row| {
                 if row.tiers == 0 {
                     row.last_used = 0;
@@ -1069,7 +1069,7 @@ mod tests {
     fn list(bench: &mut Bench, keys: &[(Key, u8)]) {
         let keys = keys
             .iter()
-            .map(|&(key, tiers)| (key, KV, 64, tiers, 1))
+            .map(|&(key, tiers)| (key, KV, 64, tiers, 1, 0))
             .collect();
         exchange(bench, runtime::Request::List, &Completion::Listing { keys });
     }
@@ -1604,6 +1604,7 @@ mod tests {
             &Completion::Stored { keys: vec![key(1)] },
         );
         let prefetch = runtime::Request::Prefetch {
+            group: A,
             class: KV,
             units: 0,
             keys: vec![key(4), key(5), key(6)],

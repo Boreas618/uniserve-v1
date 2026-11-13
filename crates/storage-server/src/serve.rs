@@ -265,6 +265,7 @@ fn list_pool(pool: &BufferPoolListing, out: &mut impl Write) -> std::io::Result<
                     Waiting::Commit => "commit",
                     Waiting::Transfer => "transfer",
                     Waiting::Finish => "finish",
+                    Waiting::Replicate => "replicate",
                 };
                 format!("{work} at {stamp}")
             })

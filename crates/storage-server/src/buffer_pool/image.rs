@@ -32,7 +32,7 @@ struct Image<R, B> {
     classes: Vec<(ClientId, Vec<Class>, u8)>,
     regions: R,
     spaces: Vec<String>,
-    memories: Vec<String>,
+    memories: Vec<(String, Option<u32>)>,
     quota: Vec<BTreeMap<u64, u64>>,
     segments: Vec<Segments>,
     /// Every block a holder holds, once.
@@ -362,6 +362,27 @@ impl<B> Deferred<B> {
                 ok: *ok,
                 rest: rest.clone(),
             },
+            Self::Replicate {
+                queue,
+                request,
+                owner,
+                class,
+                at,
+                block,
+                from,
+                to,
+                rest,
+            } => Deferred::Replicate {
+                queue: *queue,
+                request: *request,
+                owner: *owner,
+                class: *class,
+                at: *at,
+                block: name(block)?,
+                from: *from,
+                to: *to,
+                rest: rest.clone(),
+            },
         })
     }
 }
@@ -377,6 +398,8 @@ impl<B> Group<B> {
             memory: self.memory,
             slots: self.slots,
             regions: self.regions.clone(),
+            receives: self.receives.clone(),
+            parts: self.parts.clone(),
             completed: self.completed,
             deferred,
         })

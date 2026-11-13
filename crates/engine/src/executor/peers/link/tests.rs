@@ -114,6 +114,7 @@ fn session() -> (storage::runtime::Open, storage::runtime::Opened) {
             units: 0,
             limit: 129,
             segments: vec![(segment, 0, 129)],
+            memory: String::new(),
         }],
         classes: Vec::new(),
         trajectory: 0,

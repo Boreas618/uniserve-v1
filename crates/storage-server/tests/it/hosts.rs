@@ -233,6 +233,7 @@ fn files(parts: Vec<std::os::fd::OwnedFd>) -> Vec<File> {
 /// A prefetch of keys 7 and 9 from the peers.
 fn from_peers() -> Request {
     Request::Prefetch {
+        group: PREFILL,
         class: KV,
         units: 0,
         keys: vec![key(7), key(9)],
@@ -292,7 +293,7 @@ fn a_prefetch_from_the_peers_reads_the_host_copies_a_peer_held_throughout() {
         assert_eq!(read(part, 0, 16), *bytes);
     }
     let listed = Completion::Listing {
-        keys: vec![(key(7), KV, 64, 0b010, 0)],
+        keys: vec![(key(7), KV, 64, 0b010, 0, 0b11)],
     };
     assert_eq!(prefill.ask(Request::List), listed);
 
@@ -348,7 +349,7 @@ fn a_prefetch_from_the_peers_reads_each_part_on_the_host_it_lies_on() {
         assert_eq!(read(part, 0, 16), *bytes);
     }
     let listed = Completion::Listing {
-        keys: vec![(key(7), KV, 64, 0b010, 0)],
+        keys: vec![(key(7), KV, 64, 0b010, 0, 0b11)],
     };
     assert_eq!(prefill.ask(Request::List), listed);
 }

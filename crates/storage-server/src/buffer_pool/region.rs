@@ -74,6 +74,10 @@ pub(crate) struct Region {
     /// The bytes of one rank's part of a unit (`storage::runtime::Region::part_bytes`):
     /// what a block that lies in one rank's memory holds of each of its units.
     pub(crate) part_bytes: u64,
+    /// The memory the region lies in, as its bit's number in a block's
+    /// validity, when its units exist once (a rank's product buffer); `None`
+    /// when they exist in every memory that maps it (`storage::runtime::Region::memory`).
+    pub(crate) memory: Option<u8>,
     /// The free runs by their first unit; neighbours are joined.
     free: BTreeMap<u32, Run>,
     /// The runs outside the region by their first unit.
@@ -130,6 +134,7 @@ impl Region {
             space,
             unit_bytes,
             part_bytes,
+            memory: None,
             free: BTreeMap::new(),
             outside: BTreeMap::new(),
             units,

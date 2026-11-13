@@ -8,7 +8,8 @@
 //!
 //! The configurations are those of `MC_Pool` there, one per [`Shape`]: one
 //! key and one position, one or two owners, a prefill group and for
-//! transfers a decode group with a memory each. The bounds are the model's:
+//! transfers, crossings and host parts a decode group, with a memory each
+//! and the host parts the shape states. The bounds are the model's:
 //! `completed` goes up to 1, a sequence makes as many copies as the shape
 //! states, and one prefetch or put is in flight at a time.
 
@@ -19,7 +20,7 @@ use storage::protocol::Key;
 use storage::runtime::{GroupId, OwnerId, Request, RequestId, Source, Stamps, Tier};
 
 use super::trace::{Input, apply, classes, copies_asked, layout, stated, stated_input};
-use super::{BufferPool, Class, Copy, Target};
+use super::{BufferPool, Class, Copy, Group, Target};
 
 const KV: u8 = 0;
 const TRAJECTORY: u8 = 1;
@@ -45,9 +46,16 @@ struct Shape {
     transfers: bool,
     /// Whether prefetches and puts to the remote store arrive.
     tiers: bool,
+    /// Whether the decode group reads, in its own memory, the class an
+    /// owner of the prefill group holds: crossings into it arrive (the
+    /// model's `Readers`).
+    crossings: bool,
+    /// The host parts each group copies with, as bits of a block's validity
+    /// after the groups' memories (the model's `GroupParts`).
+    parts: [u64; 2],
 }
 
-const SHAPES: [Shape; 4] = [
+const SHAPES: [Shape; 6] = [
     Shape {
         name: "core",
         owners: 2,
@@ -58,6 +66,8 @@ const SHAPES: [Shape; 4] = [
         copies: 0,
         transfers: false,
         tiers: false,
+        crossings: false,
+        parts: [1 << 1, 0],
     },
     Shape {
         name: "copies",
@@ -69,6 +79,8 @@ const SHAPES: [Shape; 4] = [
         copies: 2,
         transfers: false,
         tiers: false,
+        crossings: false,
+        parts: [1 << 1, 0],
     },
     Shape {
         name: "transfer",
@@ -80,6 +92,8 @@ const SHAPES: [Shape; 4] = [
         copies: 0,
         transfers: true,
         tiers: false,
+        crossings: false,
+        parts: [1 << 2, 1 << 2],
     },
     Shape {
         name: "tiers",
@@ -91,6 +105,41 @@ const SHAPES: [Shape; 4] = [
         copies: 2,
         transfers: false,
         tiers: true,
+        crossings: false,
+        parts: [1 << 1, 0],
+    },
+    // Two memories, the decode group's reading what owners of the prefill
+    // group hold: crossings, with the transfers, commits and detaches they
+    // must agree with. One owner and one unit, so that every step is
+    // checked too.
+    Shape {
+        name: "cross",
+        owners: 1,
+        groups: 2,
+        rows: 1,
+        units: 1,
+        host_units: 0,
+        copies: 0,
+        transfers: true,
+        tiers: false,
+        crossings: true,
+        parts: [1 << 2, 1 << 2],
+    },
+    // Two host parts: the prefill group's ranks on one host, the decode
+    // group's on that host and another. One owner and one unit, so that
+    // every step is checked too.
+    Shape {
+        name: "parts",
+        owners: 1,
+        groups: 2,
+        rows: 1,
+        units: 1,
+        host_units: 1,
+        copies: 2,
+        transfers: false,
+        tiers: false,
+        crossings: false,
+        parts: [1 << 2, 1 << 2 | 1 << 3],
     },
 ];
 
@@ -111,6 +160,8 @@ enum Step {
     Detach(u64, u8),
     Commit(u64, u8),
     Transfer(u64, u8, u8),
+    /// A crossing of the owner's block into the decode group's memory.
+    Replicate(u64, u8),
     /// The `Finish` of the n-th copy a worker runs, with its result.
     Finish(usize, bool, u8),
     Advance(u8),
@@ -196,13 +247,14 @@ impl Driver {
             shape.host_units,
             shape.host_units,
         );
+        // Each group copies both classes with the host parts the shape states.
         let groups = (0..shape.groups).map(|group| {
-            (
-                GroupId(group),
-                group,
-                group + 1,
-                vec![vec![UNITS], Vec::new()],
-            )
+            let parts = shape.parts[usize::from(group)];
+            let found = Group {
+                parts: vec![parts, parts],
+                ..Group::new(group, group + 1, vec![vec![UNITS], Vec::new()])
+            };
+            (GroupId(group), found)
         });
         pool.open(SESSION, 1, false, (classes, TRAJECTORY), groups.collect());
 
@@ -318,6 +370,9 @@ impl Driver {
                 if shape.transfers {
                     steps.extend((0..shape.groups).map(|group| Step::Transfer(owner, group, mask)));
                 }
+                if shape.crossings {
+                    steps.push(Step::Replicate(owner, mask));
+                }
             }
         }
         for group in 0..shape.groups {
@@ -425,12 +480,21 @@ impl Driver {
                 group: GroupId(group),
                 after: stamps(mask),
             },
+            Step::Replicate(o, mask) => Request::Replicate {
+                owner: owner(o),
+                class: KV,
+                at: 0,
+                from: UNITS,
+                group: GroupId(1),
+                after: stamps(mask),
+            },
             Step::Finish(copy, ok, mask) => Request::Finish {
                 copy: self.in_flight(false)[copy].1,
                 ok,
                 after: stamps(mask),
             },
             Step::Prefetch => Request::Prefetch {
+                group: GroupId(0),
                 class: KV,
                 units: 0,
                 keys: vec![key()],
@@ -519,7 +583,7 @@ fn forged() -> String {
 /// and the layout for the comparison with the model's steps
 /// (`<shape>.steps`, and the transition of [`forged`] as `forged.steps`).
 #[test]
-#[ignore = "enumerates every request sequence of four small configurations; run by verification/buffer-pool/agreement.sh"]
+#[ignore = "enumerates every request sequence of six small configurations; run by verification/buffer-pool/agreement.sh"]
 fn every_request_sequence_keeps_the_invariants() {
     let directory = std::env::var("UNISERVE_POOL_STATES").ok();
     for shape in SHAPES {

@@ -611,12 +611,12 @@ impl Hosted {
                 })
                 .collect()
         };
-        // The memories of a validity; none for a block whose units exist once.
-        let memories = |bits: u8| -> Vec<String> {
-            if bits == u8::MAX {
+        // The memories of a validity; none for a slot row, whose units exist once.
+        let memories = |bits: u64| -> Vec<String> {
+            if bits == u64::MAX {
                 return Vec::new();
             }
-            (0..8)
+            (0..64)
                 .filter(|bit| bits & (1 << bit) != 0)
                 .filter_map(|bit| pool.memory_name(bit).map(str::to_owned))
                 .collect()
@@ -1194,6 +1194,7 @@ mod tests {
             units,
             limit: units + 1,
             segments: Vec::new(),
+            memory: String::new(),
         };
         let open = Open {
             version: VERSION,
@@ -1213,6 +1214,8 @@ mod tests {
                 memory: "gpu0".into(),
                 slots: 1,
                 regions: vec![vec![0]],
+                receives: Vec::new(),
+                parts: Vec::new(),
             }],
             schedulers: vec![vec![GroupId(0)]],
             peers: Vec::new(),

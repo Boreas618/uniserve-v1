@@ -432,6 +432,8 @@ mod tests {
             memory: "memory".to_owned(),
             slots: 0,
             regions: Vec::new(),
+            receives: Vec::new(),
+            parts: Vec::new(),
         };
         WorkerGroup::new(config, capacity, layout)
     }
@@ -458,6 +460,7 @@ mod tests {
                     units: 9,
                     limit: 9,
                     segments: Vec::new(),
+                    memory: String::new(),
                 })
                 .collect(),
             classes: Vec::new(),
@@ -470,6 +473,8 @@ mod tests {
                     memory: format!("memory-{}", id.0),
                     slots: id.0,
                     regions: Vec::new(),
+                    receives: Vec::new(),
+                    parts: Vec::new(),
                 })
                 .collect(),
             schedulers: vec![ids.clone()],

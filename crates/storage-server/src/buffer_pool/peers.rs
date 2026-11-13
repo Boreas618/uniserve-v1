@@ -28,10 +28,11 @@ impl BufferPool {
                 continue;
             };
             // A host block is one run: its units in every part of its region.
-            let [run] = block.runs.as_slice() else {
-                continue;
+            let run = match block.runs.borrow().as_slice() {
+                [run] => run.stated(),
+                _ => continue,
             };
-            held.push((*key, run.stated(), *tokens));
+            held.push((*key, run, *tokens));
             let block = Rc::clone(block);
             // A hold is a holder: the copy is no longer evictable.
             self.touch(&block);

@@ -71,7 +71,7 @@ impl BufferPool {
             return;
         }
         block.counted.set(now);
-        for run in &block.runs {
+        for run in block.runs.borrow().iter() {
             let region = &mut self.regions[usize::from(run.region())];
             for (state, adds) in [(was, false), (now, true)] {
                 match state {
@@ -148,9 +148,10 @@ impl BufferPool {
     /// Whether what a copy writes for still exists.
     fn target_exists(&self, client: ClientId, target: &Target) -> bool {
         match target {
-            Target::Owner { owner, .. } | Target::Slot { owner } | Target::Group { owner, .. } => {
-                self.owners.contains_key(&(client, *owner))
-            }
+            Target::Owner { owner, .. }
+            | Target::Slot { owner }
+            | Target::Group { owner, .. }
+            | Target::Memory { owner, .. } => self.owners.contains_key(&(client, *owner)),
             Target::Entry { .. } => true,
         }
     }
@@ -191,6 +192,8 @@ impl BufferPool {
                     .iter()
                     .for_each(|block| hold(block, BlockState::Retired)),
                 Deferred::Commit { block, .. } => hold(block, BlockState::Private),
+                // A crossing reads its block, as a release holds it.
+                Deferred::Replicate { block, .. } => hold(block, BlockState::Retired),
                 Deferred::Transfer { .. } | Deferred::Finish { .. } => {}
             }
         }
@@ -260,6 +263,7 @@ impl BufferPool {
             Deferred::Commit { .. } => Waiting::Commit,
             Deferred::Transfer { .. } => Waiting::Transfer,
             Deferred::Finish { .. } => Waiting::Finish,
+            Deferred::Replicate { .. } => Waiting::Replicate,
         };
         let mut groups: Vec<GroupListing> = self
             .groups
@@ -331,7 +335,7 @@ impl BufferPool {
             if only_entry {
                 evictable.insert(Rc::as_ptr(block));
             }
-            for run in &block.runs {
+            for run in block.runs.borrow().iter() {
                 let counts = &mut words[usize::from(run.region())];
                 if only_entry {
                     counts.1 += run.count();
@@ -370,7 +374,7 @@ impl BufferPool {
                 cached.get(&at).copied(),
                 owned.get(&at).copied().unwrap_or(0),
             );
-            let first = block.stated().next();
+            let first = block.stated().first().copied();
             if recorded != held {
                 return Err(format!(
                     "block {first:?} records {recorded:?} of cache and owners, its holders {held:?}"
@@ -427,11 +431,11 @@ impl BufferPool {
         for (id, region) in self.regions.iter().enumerate() {
             let mut runs: Vec<(u32, u32)> =
                 region.free_runs().chain(region.outside_runs()).collect();
-            let held = blocks
-                .iter()
-                .flat_map(|(block, _, _)| &block.runs)
-                .filter(|run| usize::from(run.region()) == id);
-            runs.extend(held.map(|run| (run.first(), run.count())));
+            for (block, _, _) in &blocks {
+                let held = block.runs.borrow();
+                let here = held.iter().filter(|run| usize::from(run.region()) == id);
+                runs.extend(here.map(|run| (run.first(), run.count())));
+            }
             runs.sort_unstable();
 
             let (mut next, limit) = region.span();
@@ -459,7 +463,7 @@ impl BufferPool {
         // R2: a block has no holder the tables do not show.
         for (block, _, references) in &blocks {
             if Rc::strong_count(block) != *references {
-                let (count, first) = (Rc::strong_count(block), block.stated().next());
+                let (count, first) = (Rc::strong_count(block), block.stated().first().copied());
                 return Err(format!(
                     "block {first:?} has {count} references, its holders {references}"
                 ));
@@ -493,7 +497,7 @@ impl BufferPool {
             if places > 1 || places == 1 && cached(block) {
                 return Err(format!(
                     "block {:?} is private in {places} places, cached {}",
-                    block.stated().next(),
+                    block.stated().first().copied(),
                     cached(block)
                 ));
             }
@@ -504,29 +508,37 @@ impl BufferPool {
             if let Some(block) = held.iter().find(|block| !cached(block)) {
                 return Err(format!(
                     "peer {peer} holds block {:?}, which is not cached",
-                    block.stated().next()
+                    block.stated().first().copied()
                 ));
             }
         }
 
-        // P2: a pin is of a cached block; a table's entry is valid in its owner's group.
+        // P2: a pin is of a cached block; a table's entry is valid in the
+        // memory its group reads the class in where its regions of the class
+        // lie in one. A block allocated over regions of several memories is
+        // valid where a `Replicate` named the run its writer wrote (A9).
         for ((client, owner), found) in &self.owners {
             let memory = self.memory(*client, found.group);
-            for held in found.tables.iter().flat_map(BTreeMap::values) {
-                let block = held.block();
-                if matches!(held, Held::Shared(_)) && !cached(block) {
-                    return Err(format!(
-                        "owner {} pins block {:?}, which is not cached",
-                        owner.0,
-                        block.stated().next()
-                    ));
-                }
-                if block.valid.get() & memory == 0 {
-                    return Err(format!(
-                        "owner {} holds block {:?}, which is not valid in its group",
-                        owner.0,
-                        block.stated().next()
-                    ));
+            let group = self.groups.get(&(*client, found.group));
+            for (class, table) in found.tables.iter().enumerate() {
+                let regions = group.and_then(|group| group.regions.get(class));
+                let spread = self.spread(regions.map_or(&[][..], Vec::as_slice), memory);
+                for held in table.values() {
+                    let block = held.block();
+                    if matches!(held, Held::Shared(_)) && !cached(block) {
+                        return Err(format!(
+                            "owner {} pins block {:?}, which is not cached",
+                            owner.0,
+                            block.stated().first().copied()
+                        ));
+                    }
+                    if spread.count_ones() == 1 && block.valid.get() & spread == 0 {
+                        return Err(format!(
+                            "owner {} holds block {:?}, which is not valid in its group",
+                            owner.0,
+                            block.stated().first().copied()
+                        ));
+                    }
                 }
             }
         }
@@ -536,7 +548,7 @@ impl BufferPool {
             if copy.fill && copy.write.class != SLOT && copy.write.valid.get() & copy.memory != 0 {
                 return Err(format!(
                     "a copy fills valid memory of block {:?}",
-                    copy.write.stated().next()
+                    copy.write.stated().first().copied()
                 ));
             }
         }
@@ -552,15 +564,15 @@ impl BufferPool {
                 .iter()
                 .filter(|region| usize::from(region.space) == space)
             {
-                let inside = region.free_runs().chain(
-                    blocks
-                        .iter()
-                        .flat_map(|(block, _, _)| &block.runs)
-                        .filter(|run| {
-                            std::ptr::eq(&self.regions[usize::from(run.region())], region)
-                        })
-                        .map(|run| (run.first(), run.count())),
-                );
+                let mut held: Vec<(u32, u32)> = Vec::new();
+                for (block, _, _) in &blocks {
+                    let runs = block.runs.borrow();
+                    let here = runs.iter().filter(|run| {
+                        std::ptr::eq(&self.regions[usize::from(run.region())], region)
+                    });
+                    held.extend(here.map(|run| (run.first(), run.count())));
+                }
+                let inside = region.free_runs().chain(held);
                 ranges.extend(inside.map(|(first, count)| {
                     (
                         u64::from(first) * region.unit_bytes,

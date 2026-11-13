@@ -444,6 +444,7 @@ impl Deployment {
             units,
             limit: reserved + units,
             segments: Vec::new(),
+            memory: String::new(),
         };
         let mut regions = Vec::new();
         for index in 0..self.groups.len() {
@@ -523,6 +524,8 @@ impl Deployment {
                     memory: format!("gpu-{at}"),
                     slots: index(2 * at + 1),
                     regions: per_class.collect(),
+                    receives: Vec::new(),
+                    parts: Vec::new(),
                 }
             })
             .collect();

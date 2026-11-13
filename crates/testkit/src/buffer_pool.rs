@@ -566,12 +566,15 @@ mod tests {
             units,
             limit: reserved + units,
             segments: Vec::new(),
+            memory: String::new(),
         };
         let group = |id, memory: &str, slots| Group {
             id,
             memory: memory.to_owned(),
             slots,
             regions: vec![vec![UNITS]],
+            receives: Vec::new(),
+            parts: Vec::new(),
         };
         Open {
             version: VERSION,
@@ -898,6 +901,7 @@ mod tests {
         bench.pool.hold_in(Source::Remote, key(2), 4);
         bench.pool.hold_in(Source::Peers, key(3), 4);
         let prefetch = Request::Prefetch {
+            group: A,
             class: KV,
             units: 0,
             keys: vec![key(1), key(2), key(3)],

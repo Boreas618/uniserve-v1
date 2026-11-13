@@ -4,11 +4,13 @@
 //!
 //! A session states its layout by name ([`BufferPool::admit`]): a region
 //! another session stated under the same name is that region, a memory space
-//! and a device memory are named the same way, and the pool numbers each
-//! name once. A device memory is a bit of a block's validity, so a
-//! deployment's sessions state at most eight of them over the pool's life.
+//! and a memory are named the same way, and the pool numbers each name once.
+//! A memory, a group's device memory, the memory of the main process a
+//! product buffer lies in, or a host part (a host and a part index), is a
+//! bit of a block's validity, so a deployment's sessions state at most 64 of
+//! them over the pool's life.
 
-use std::collections::{BTreeMap, BTreeSet, HashSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 
 use storage::protocol::Segment;
 use storage::runtime::{GroupId, Open, Segments, Tier};
@@ -309,9 +311,9 @@ impl BufferPool {
         self.fits(open)?;
 
         // Every check passed: nothing below refuses.
-        for group in &open.groups {
-            if !self.memories.contains(&group.memory) {
-                self.memories.push(group.memory.clone());
+        for memory in stated_memories(open) {
+            if !self.memories.contains(&memory) {
+                self.memories.push(memory);
             }
         }
         let named = self.named_by_sessions();
@@ -348,7 +350,7 @@ impl BufferPool {
                 numbers.push(found as u8);
                 continue;
             }
-            numbers.push(self.open_region(
+            let number = self.open_region(
                 &stated.name,
                 stated.tier,
                 space,
@@ -356,7 +358,12 @@ impl BufferPool {
                 stated.reserved,
                 stated.units,
                 stated.limit,
-            ));
+            );
+            if !stated.memory.is_empty() {
+                let memory = self.bit(&(stated.memory.clone(), None));
+                self.regions[usize::from(number)].memory = Some(memory);
+            }
+            numbers.push(number);
         }
 
         let number = |index: u8| numbers[usize::from(index)];
@@ -364,18 +371,25 @@ impl BufferPool {
             host: class.host.map(|(region, units)| (number(region), units)),
             ..class.clone()
         });
+        let numbered = |lists: &Vec<Vec<u8>>| -> Vec<Vec<u8>> {
+            let numbered = lists
+                .iter()
+                .map(|list| list.iter().map(|region| number(*region)));
+            numbered.map(Iterator::collect).collect()
+        };
         let groups = open.groups.iter().map(|group| {
-            let memory = self
-                .memories
-                .iter()
-                .position(|memory| *memory == group.memory)
-                .unwrap_or_default() as u8;
-            let regions = group
-                .regions
-                .iter()
-                .map(|regions| regions.iter().map(|region| number(*region)).collect())
-                .collect();
-            (group.id, memory, number(group.slots), regions)
+            let memory = self.bit(&(group.memory.clone(), None));
+            let parts = group.parts.iter().map(|parts| {
+                parts.iter().fold(0u64, |all, (host, part)| {
+                    all | 1 << self.bit(&(host.clone(), Some(*part)))
+                })
+            });
+            let found = Group {
+                receives: numbered(&group.receives),
+                parts: parts.collect(),
+                ..Group::new(memory, number(group.slots), numbered(&group.regions))
+            };
+            (group.id, found)
         });
         let groups: Vec<_> = groups.collect();
         self.open(
@@ -417,6 +431,13 @@ impl BufferPool {
             self.grant(space, first, bytes);
         }
         space
+    }
+
+    /// The number of a memory's bit in a block's validity; the memories a
+    /// session states are numbered when it is admitted.
+    fn bit(&self, memory: &(String, Option<u32>)) -> u8 {
+        let found = self.memories.iter().position(|known| known == memory);
+        found.unwrap_or_default() as u8
     }
 
     /// Whether a memory space's table holds a segment as stated.
@@ -507,15 +528,27 @@ impl BufferPool {
                     region.tier
                 ));
             }
+            // Units that exist once lie in a memory of the device.
+            if !region.memory.is_empty() && region.tier != Tier::Device {
+                return Err(format!(
+                    "region {} states a memory off the device",
+                    region.name
+                ));
+            }
             // A region the pool holds keeps its numbering, whatever limit the layout states;
-            // everything else that lays its units out is the same.
+            // everything else that lays its units out, and the memory it lies in, is the same.
             if let Some(found) = self.regions.iter().find(|found| found.name == region.name) {
                 let space = self.spaces.get(usize::from(found.space));
+                let memory = found
+                    .memory
+                    .and_then(|bit| self.memories.get(usize::from(bit)));
+                let lies = memory.map_or("", |(name, _)| name.as_str());
                 let same = found.tier == region.tier
                     && space == Some(&region.space)
                     && found.unit_bytes == region.unit_bytes
                     && found.part_bytes == region.part_bytes
-                    && found.span().0 == region.reserved;
+                    && found.span().0 == region.reserved
+                    && lies == region.memory;
                 if !same {
                     return Err(format!(
                         "region {} is stated with another layout than before",
@@ -560,15 +593,17 @@ impl BufferPool {
         }
 
         let mut ids = HashSet::new();
-        let mut memories: Vec<&String> = self.memories.iter().collect();
         for group in &open.groups {
             if !ids.insert(group.id) {
                 return Err(format!("group {} is stated twice", group.id.0));
             }
-            let device = group.regions.iter().flatten().chain([&group.slots]);
+            let device = group.regions.iter().flatten();
+            let device = device.chain(group.receives.iter().flatten());
             if group.regions.len() > open.classes.len()
+                || group.receives.len() > open.classes.len()
+                || group.parts.len() > open.classes.len()
                 || device
-                    .into_iter()
+                    .chain([&group.slots])
                     .any(|region| tier(*region) != Some(Tier::Device))
             {
                 return Err(format!(
@@ -576,13 +611,18 @@ impl BufferPool {
                     group.id.0
                 ));
             }
-            if !memories.contains(&&group.memory) {
-                memories.push(&group.memory);
+        }
+        let mut memories: Vec<&(String, Option<u32>)> = self.memories.iter().collect();
+        let stated = stated_memories(open);
+        for memory in &stated {
+            if !memories.contains(&memory) {
+                memories.push(memory);
             }
         }
         if memories.len() > MEMORIES {
             return Err(format!(
-                "the deployment's sessions state {} device memories, more than {MEMORIES}",
+                "the deployment's sessions state {} memories and host parts, more than \
+                 {MEMORIES}",
                 memories.len()
             ));
         }
@@ -622,10 +662,23 @@ impl BufferPool {
         Some(&found.name)
     }
 
-    /// The name of the device memory of a bit of a block's validity, by
-    /// the bit's position.
+    /// The name of the device memory, or of the memory of a main process,
+    /// of a bit of a block's validity, by the bit's position; `None` for a
+    /// host part's bit.
     pub fn memory_name(&self, bit: u32) -> Option<&str> {
-        self.memories.get(bit as usize).map(String::as_str)
+        match self.memories.get(bit as usize)? {
+            (name, None) => Some(name),
+            (_, Some(_)) => None,
+        }
+    }
+
+    /// The host and the part index of a host part's bit of a block's
+    /// validity, by the bit's position; `None` for a memory's bit.
+    pub fn host_part(&self, bit: u32) -> Option<(&str, u32)> {
+        match self.memories.get(bit as usize)? {
+            (host, Some(part)) => Some((host, *part)),
+            (_, None) => None,
+        }
     }
 
     /// The regions a session names: its groups' slot rows and device
@@ -660,26 +713,20 @@ impl BufferPool {
     /// the one that holds stored trajectories, and its worker groups. Each
     /// group states the device memory its ranks address (a bit of a block's
     /// validity), the region of its slot rows, and per class the device
-    /// regions its owners' blocks are taken from.
-    pub fn open(
+    /// regions its owners' blocks are taken from, the regions a `Replicate`
+    /// into its memories takes runs in, and the host parts it copies with.
+    pub(super) fn open(
         &mut self,
         client: ClientId,
         epoch: u64,
         trial: bool,
         classes: (Vec<Class>, u8),
-        groups: Vec<(GroupId, u8, u8, Vec<Vec<u8>>)>,
+        groups: Vec<(GroupId, Group)>,
     ) {
         self.classes.insert(client, classes);
         self.sessions.insert(client, epoch);
         self.trial.entry(epoch).or_insert(trial);
-        for (group, memory, slots, regions) in groups {
-            let found = Group {
-                memory,
-                slots,
-                regions,
-                completed: 0,
-                deferred: VecDeque::new(),
-            };
+        for (group, found) in groups {
             self.groups.insert((client, group), found);
         }
     }
@@ -743,6 +790,7 @@ impl BufferPool {
                         block.disown();
                         self.reclaim(block);
                     }
+                    Deferred::Replicate { block, .. } => self.reclaim(block),
                     Deferred::Transfer { .. } | Deferred::Finish { .. } => {}
                 }
             }
@@ -826,4 +874,28 @@ impl BufferPool {
             self.evict_in(&key, region);
         }
     }
+}
+
+/// The memories a layout states, each a bit of a block's validity: its
+/// groups' device memories, the memories its regions lie in, and its groups'
+/// host parts.
+fn stated_memories(open: &Open) -> Vec<(String, Option<u32>)> {
+    let devices = open.groups.iter().map(|group| (group.memory.clone(), None));
+    let regions = open
+        .regions
+        .iter()
+        .filter(|region| !region.memory.is_empty())
+        .map(|region| (region.memory.clone(), None));
+    let parts = open
+        .groups
+        .iter()
+        .flat_map(|group| group.parts.iter().flatten());
+    let parts = parts.map(|(host, part)| (host.clone(), Some(*part)));
+    let mut stated = Vec::new();
+    for memory in devices.chain(regions).chain(parts) {
+        if !stated.contains(&memory) {
+            stated.push(memory);
+        }
+    }
+    stated
 }
