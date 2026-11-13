@@ -1,474 +1,1059 @@
-//! The denoiser runner: one denoising step of a batch's requests, per layout, captured and replayed
-//! (4.5).
+//! `DenoiserRunner`: the runner of a diffusion model's denoiser (`nn::Denoiser`), which prepares
+//! a video request's latents and advances them one denoising step per call.
 //!
-//! A denoising step is one computation over one request's latents: the model reads `Latents` and
-//! `Conditioning`, runs the DiT stack once and writes the velocity, which its solver applies to the
-//! same latents in place. **The loop over a request's steps is not here.** The mechanism schedules
-//! one step per batch (`plan::Variant::Denoise`: "a request's steps are one batch each, never a loop
-//! inside a batch"), so this runner serves one step and the trajectory belongs to whoever batches
-//! the steps.
+//! The runner holds its model through `nn::Denoiser` and names no concrete model. A media row
+//! names the products its call reads and writes as positions in the request's product table
+//! (`ipc::batch::MediaRow::results`); the runner tells them apart by the class whose entry the
+//! rank's device block tables hold at each position, and finds their blocks in the product
+//! buffer of the rank's [`BufferMemory`].
 //!
-//! **What the runner owns and what the model owns.** The schedule is the model's:
-//! `Denoiser::schedule(task)` states the steps a request of a task runs, with the sigmas and the step
-//! count the solver checks itself against. This runner passes a `Step` through without reading a
-//! sigma, computing a delta, or counting a step. The model computes the coefficients a step reads
-//! from the `Step` and the request inside its `forward` and uploads them, and the update is the
-//! model's, because the trait's contract for that call is that it updates the latents in place.
+//! ## The request's state in its slot
 //!
-//! **One arena per bucket, never rewound.** The arena is the graph pool's: mapped whole, never a
-//! bucket at a time (4.5). The first walk of a bucket records what it used, so the pool's figure is
-//! measured from the model's own launches rather than estimated beside them.
+//! A request's state lives from its latent preparation to its last step in its slot's row of the
+//! rank's trajectory rows ([`BufferMemory::trajectory`]), laid out by the request's layout from
+//! the row's first byte: its video latents `[channels, frames, rows, columns]` and its audio
+//! latents `[channels, steps]` in the sample type, back to back, then from a unit boundary the
+//! conditioning rows the denoiser reads (`[prefix rows, text width]`) and from the next the
+//! encoder's rows the conditioner reads (`[prefix rows, width]`), both in the stack's type. The
+//! latents lead, so the trajectory a `Save` copies is the row's first bytes
+//! ([`trajectory_layout`]); a `Restore` may write a page past them, which the request's latent
+//! preparation, which follows its restore, writes again.
 //!
-//! **Host values are the forward's.** The packing indices, rotary positions and step coefficients
-//! a step reads are computed by the model's `forward` from the request and the step and uploaded
-//! through the runner's staging region ([`crate::staging`]). A graph is captured from the bucket's
-//! warm request, and before each replay the same forward runs in staging mode with the served
-//! request, writing its values where the captured copies read them ([`Lifecycle::replay`]).
+//! ## A call
 //!
-//! **The seam from the mechanism.** A media batch's columns state, per request, what the mechanism
-//! owns: the request's conditioning exactly as the model family planned it, and the step, seed and
-//! canvas the request states ([`ipc::execution::StagedRequest`], written by the scheduler's media
-//! arm). A step also reads its encoded conditioning rows, which the encoder published to the
-//! product store, and the request's latent trajectory, which this runner owns.
+//! Every batch is one request's call; a batch with no row carries copies alone and returns no
+//! call.
 //!
-//! **The trajectory lives in the runner's latent columns from the request's opening to its last
-//! step.** The scheduler holds the denoiser for one request from its latent preparation to its last
-//! step, so the columns hold that request's trajectory throughout. The latent preparation is served
-//! here: it states how the columns hold the request's samples (`ipc::RankLatentLayout`) and, for a
-//! request resumed from a stored trajectory, copies the stored pages of the host latent pool into
-//! the columns (`ipc::LatentRestore`). The request's first step on this runner then folds its
-//! conditioning and draws its noise, or continues from the restored trajectory. A preempted
-//! request's trajectory is written from the columns to the host latent pool
-//! (`ipc::LatentOffload`, [`Runner::offload_latents`]).
+//! - **A latent preparation** runs eagerly ([`Graphs::eager`]) over the slot's row: it copies the
+//!   prompt's conditioning rows into the encoder's rows, and into the denoiser's when the two
+//!   widths agree, the rest of both zero; lends the condition pixels and samples as the media host
+//!   left them, each condition's after the ones before it in request order; draws each condition's
+//!   anchoring noise and the request's noise; runs the model's `prepare_conditioning`; and starts
+//!   the schedule (`prepare_latents`). A request whose row states a step past zero was restored
+//!   from a stored trajectory at that step: its latents are kept, and only its conditioning is
+//!   prepared again.
+//! - **A denoising step** is replayed from its bucket's graph, which reads the runner's state
+//!   buffer at fixed addresses: the slot's latents and conditioning are copied into the buffer
+//!   before the replay and the latents back after it, on the runner's stream. The last step also
+//!   copies the latents into the video latents and audio latents blocks its row names, which the
+//!   decoders read as `[channels, frames · rows · columns]` and as the track's elements in the
+//!   sample type, their `latent_type`. The first denoising rank of a process
+//!   ([`DenoiserConfig::shares`]) copies them on to the backing ranks of its process
+//!   ([`BufferMemory::share`]).
+//!
+//! ## Buckets
+//!
+//! One bucket per distinct layout of each served request shape, from the deployment's
+//! candidates (`nn::family::VideoModel::candidates`) in their order: the model's layout of a
+//! candidate is the bucket's extent, and candidates its padding collapses onto one layout share
+//! the bucket of the first, which is the request its graph is captured from. A step's bucket is
+//! captured; a preparation's bucket of the same extent is profiled and run eagerly
+//! ([`Runner::eager_buckets`]), and its profile opens the candidate and each condition set a
+//! request of it may open with, after the model's initialization, so the runner's region holds
+//! the largest opening and every generation resolves their kernels.
+//!
+//! ## Save and restore
+//!
+//! [`Runner::copy`] issues the copies of a batch through the rank's [`BufferMemory`]: a `Save`
+//! copies the slot's row into the rank's part of a host latent block, and a `Restore` copies it
+//! back. Every rank of every parallel configuration holds a request's whole samples, laid out by
+//! the request's layout alone, so a trajectory saved by a group of another size holds the same
+//! bytes in each saving rank's part. The class of stored trajectories states its tensors and its
+//! encoding over [`trajectory_layout`] of the largest layout, once per rank of the group
+//! ([`DenoiserRunner::trajectory_digests`]); a `Restore` whose copy names another encoding is
+//! decoded as that class at another number of ranks, and is laid out through the copy manifest
+//! from a saving rank's part ([`BufferMemory::restore`]).
 
-use std::sync::{Arc, Mutex};
-
-use ipc::TimingCounters;
-use nn::capability::{Conditioning, Denoiser, Latents, Step, VideoRequest, WarmRequest};
-use ops::{Operand, Shape};
-use platform::DeviceId;
-use proto::video::{LatentShape, Layout};
-use uniserve_tensor::DType;
+use std::cell::RefCell;
+use std::sync::Arc;
+use std::time::Instant;
 
 use ::storage::manifest::{Encoding, Field, Logical, Segment, Span, StorageLayout};
+use ::storage::runtime;
+use ipc::batch::{
+    Batch, BatchOutput, CallOutput, Extent, MediaRow, Phase, Shape, TimingCounters, Variant,
+};
+use nn::{ConditionPiece, ConditionRole, ConditionShape, Conditioning, Denoiser, Layout};
+use nn::{LatentShape, MediaInput, Step, VideoRequest};
+use platform::{Event, EventFlags, PitchedBatch, SourceOrder, Stream};
+use uniserve_tensor::{DType, Tensor};
 
-use crate::arena::Pools;
-use crate::batch::{Job, Jobs};
-use crate::memory::latent::host::LatentHostPool;
-use crate::memory::latent::restore;
-use crate::plan::Bucket;
-use crate::runner::{Binding, Runner, RunnerId};
-use crate::runners::columns::Column;
-use crate::runners::lifecycle::{Lifecycle, RunnerLifecycle};
-use crate::runners::products::{self, Product, Products};
-use crate::runners::recording::{Footprint, Walk};
+use super::decoder::{elements, pitched, voxels};
+use super::{address, element_bytes, performed};
+use crate::buckets::{Bucket, Buckets};
+use crate::graphs::Graphs;
+use crate::memory::allocation::Storage;
+use crate::memory::buffers::{BufferMemory, UNIT_BYTES};
+use crate::memory::latent::restore::Stored;
+use crate::memory::lend;
+use crate::memory::tables::{BlockCopy, BlockTables};
+use crate::runner::Runner;
 use crate::{Error, Result};
-use ipc::execution::{Batch, BatchOutput, CallId, CallOutput, RowState};
-use ipc::execution::{Extent, Variant};
 
-/// The figures a denoiser's columns are sized by, which the deployment states once at open.
-#[derive(Clone, Copy, Debug)]
-pub struct DenoiserShape {
-    /// The element type of the **stack**: the packed conditioning rows a step reads and the
-    /// checkpoint's own arithmetic. The text encoder writes these, so this is the encoder's type.
+/// The element type the media host lays a request's condition pixels and samples out in: the
+/// form `nn::MediaFormat` states for the encoders the conditioner runs.
+pub const CONDITION_MEDIA: DType = DType::F32;
+
+/// The products a call reads and writes, as indices into [`DenoiserConfig::classes`].
+const CONDITIONING: usize = 0;
+const PIXELS: usize = 1;
+const SAMPLES: usize = 2;
+const VIDEO: usize = 3;
+const AUDIO: usize = 4;
+
+/// The products' names, in the order of [`DenoiserConfig::classes`].
+const NAMES: [&str; 5] = [
+    "conditioning",
+    "condition pixels",
+    "condition samples",
+    "video latents",
+    "audio latents",
+];
+
+/// The most ranks of a group whose saved trajectory a rank restores across encodings: the host
+/// latent region is one host's, so the ranks that saved into it are ranks of that host, of which
+/// there are at most eight GPUs. A trajectory saved in an encoding of more ranks is a miss.
+const SAVING_RANKS: u32 = 8;
+
+/// A served bucket: the step's bucket, its layout, the candidate it is captured from, and the
+/// condition sets a request of it may open with.
+type Served = (Bucket, Layout, VideoRequest, Vec<Vec<ConditionShape>>);
+
+/// A request's state over the parts of its layout: its video latents, its audio latents, the
+/// conditioning rows the denoiser reads and the encoder's rows the conditioner reads.
+type State = (Tensor, Option<Tensor>, Tensor, Tensor);
+
+/// The latent preparation being served: its row, the request it states, the model's pieces of
+/// its conditions, and the conditioning, condition pixels and condition samples it reads, lent
+/// from their blocks.
+type Opening = (
+    MediaRow,
+    VideoRequest,
+    Vec<ConditionPiece>,
+    [Option<Tensor>; 3],
+);
+
+/// What a step moves around its replay: the slot's state into the state buffer before it, the
+/// latents back and, on the last step, into their blocks after it, and the blocks it wrote, by
+/// class and position.
+type Moves = (PitchedBatch, PitchedBatch, Vec<(u8, u32)>);
+
+/// What a deployment fixes of a denoiser runner. Immutable once the runner is built.
+#[derive(Clone, Debug)]
+pub struct DenoiserConfig {
+    /// The phases the runner serves: a video request's latent preparation and its steps.
+    pub phases: Vec<Phase>,
+    /// The requests the deployment serves (`nn::family::VideoModel::candidates`): one per layout a
+    /// request may take, each with the condition sets a request of it may open with.
+    pub candidates: Vec<(VideoRequest, Vec<Vec<ConditionShape>>)>,
+    /// The element type of the conditioning the text encoder writes, which the stack reads.
     pub stack: DType,
-    /// The element type of the **sample**: the trajectory the solver accumulates into, and its
-    /// noise. It is the model's own statement rather than this runner's
-    /// (`minimax_h3::denoiser::SAMPLE_DTYPE` is FP32) and it is not the stack's: the reference keeps
-    /// its trajectory in FP32 and refuses any other type at its entry, because a sample in the
-    /// stack's type would round the trajectory once per evaluation.
-    ///
-    /// **Two types, therefore two sizes.** A latent column sized at the stack's type is half the
-    /// bytes the model reads, so a runner that held one type here would refuse every step with
-    /// "the video latents are bf16 and a trajectory is f32".
+    /// The element type of the trajectory and its noise (`VideoModel::sample_type`).
     pub sample: DType,
-    /// The width of the encoded conditioning rows: the text encoder's hidden width, which a layout
-    /// counts rows of and states no width for.
-    ///
-    /// **This is `source`'s width, not necessarily `text`'s.** A conditioner may widen what the
-    /// denoiser reads, and the model states that width itself (`Denoiser::text_width`), so the pair
-    /// is resolved in [`conditioning_width`] rather than read from here twice.
+    /// The width of the conditioning rows the text encoder writes (`VideoModel::text_width`).
     pub width: u32,
-    /// The width of the rows the denoiser reads (`nn::Denoiser::text_width`), which `text` is sized
-    /// by while `source`, holding what the encoder wrote, is sized by [`Self::width`].
+    /// The classes of the products: the conditioning, the condition pixels and the condition
+    /// samples a preparation reads, then the video latents and the audio latents the last step
+    /// writes.
+    pub classes: [u8; 5],
+    /// The ranks of the denoising group, each holding the whole samples of its requests.
+    pub ranks: u32,
+    /// The bytes of a unit of a rank's part of the host latent region (`BankPages::page_bytes`).
+    pub page_bytes: u64,
+    /// Whether this rank is the first denoising rank of its process, which copies the latents
+    /// the last step wrote to the backing ranks of the process.
+    pub shares: bool,
+}
+
+/// The runner of a denoiser (module documentation).
+pub struct DenoiserRunner {
+    model: Arc<dyn Denoiser + Send + Sync>,
+    config: DenoiserConfig,
+    graphs: Graphs,
+    /// The rank's media memory, which every media runner of the rank shares.
+    memory: Arc<BufferMemory>,
+    /// The stream the graphs replay on; `None` for graphs that hold no device.
+    stream: Option<Stream>,
+    /// Recorded behind a batch's last copy: what `execute` waits for.
+    done: Option<Event>,
+    /// The served buckets, in the candidates' order.
+    served: Vec<Served>,
+    /// The steps' buckets.
+    buckets: Buckets,
+    /// The width of the conditioning rows the denoiser reads.
+    text_width: u32,
+    /// The state buffer the captured steps read, `bytes` long, laid out as a slot's row is;
+    /// `None` for graphs that hold no device.
+    state: Option<Arc<Storage>>,
+    bytes: u64,
+    /// The digest of the trajectory class's tensors, and its encoding at each number of ranks
+    /// from one.
+    tensors: [u8; 32],
+    encodings: Vec<[u8; 32]>,
+    /// The step or the latent preparation being served, which the forward reads; `None` while
+    /// a profile run or a capture computes over a candidate.
+    current_step: RefCell<Option<(Step, VideoRequest)>>,
+    current_opening: RefCell<Option<Opening>>,
+}
+
+impl DenoiserRunner {
+    /// A runner of `model` under `config`, over `memory`, whose trajectory rows are
+    /// [`DenoiserRunner::row_bytes`] long.
     ///
-    /// **The shape is where the model's statement lives, not the runner.** The engine asks the model
-    /// once when it binds the runner and puts the answer here, so a runner never asks the model a
-    /// second time and two statements of one width cannot drift.
-    pub text_width: u32,
-}
+    /// - `graphs` are made for no input tensors: a step's host values are its forward's.
+    /// - `stream` is the stream `graphs` replay on, on which the runner issues its copies; `None`
+    ///   for graphs that hold no device, whose runner computes over meta tensors.
+    ///
+    /// The model's tables are filled here on a device ([`Denoiser::initialize`]).
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Invalid`] for no candidate, no rank, a stream without a device or the reverse;
+    /// what the model refuses of a candidate; the driver's refusal of the state buffer.
+    pub fn new(
+        model: Arc<dyn Denoiser + Send + Sync>,
+        config: DenoiserConfig,
+        graphs: Graphs,
+        stream: Option<Stream>,
+        memory: Arc<BufferMemory>,
+    ) -> Result<Self> {
+        if graphs.enter().is_ok() != stream.is_some() || config.ranks == 0 {
+            return Err(Error::Invalid(
+                "a denoiser runner takes a group of ranks, and the stream of its graphs or none \
+                 for graphs that hold no device"
+                    .into(),
+            ));
+        }
+        let served = served(&*model, &config.candidates)?;
+        let text_width = model.text_width().unwrap_or(config.width);
+        let (bytes, largest) = extents(&served, &config, text_width)?;
 
-/// The elements of one latent's block.
-fn numel(latent: &LatentShape) -> Result<u64> {
-    let product = u64::from(latent.channels)
-        .checked_mul(u64::from(latent.frames))
-        .and_then(|value| value.checked_mul(u64::from(latent.height)))
-        .and_then(|value| value.checked_mul(u64::from(latent.width)))
-        .ok_or_else(|| Error::Invalid("a latent's extent overflows".into()))?;
-    Ok(product.max(1))
-}
+        // The trajectory class, by the largest trajectory a row holds, laid out alike on every
+        // rank of a group of each size.
+        let laid = trajectory_layout(largest, config.sample)?;
+        let (mut tensors, mut encodings) = ([0; 32], Vec::new());
+        for count in 1..=SAVING_RANKS.max(config.ranks) {
+            let (named, encoding) = runtime::encoding(&vec![laid.clone(); count as usize])
+                .map_err(|error| Error::Invalid(format!("a trajectory's layout: {error}")))?;
+            tensors = named;
+            encodings.push(encoding);
+        }
 
-/// The shape of one latent's block, as the model declares it.
-fn latent_shape(latent: &LatentShape) -> Shape {
-    Shape::new(&[
-        u64::from(latent.channels),
-        u64::from(latent.frames),
-        u64::from(latent.height),
-        u64::from(latent.width),
-    ])
-}
+        // The state buffer holds defined values for the capture's first forward.
+        let state = match &stream {
+            Some(stream) => {
+                let length = usize::try_from(bytes)
+                    .map_err(|_| Error::Invalid("the denoiser's state exceeds memory".into()))?;
+                let storage = Storage::linear(stream.device(), length)?;
 
-/// One latent block's bytes in `dtype`.
-fn latent_bytes(latent: &LatentShape, dtype: DType) -> Result<u64> {
-    let width = ops::abi::bytes(dtype).ok_or_else(|| {
-        Error::Invalid(format!(
-            "{dtype} has no whole-byte size",
-            dtype = ops::abi::name(dtype)
+                // SAFETY: the range is the whole allocation, which this runner keeps for as long
+                // as the graphs captured over it exist.
+                unsafe { platform::memset_d8(storage.address(), 0, length, stream) }?;
+                Some(storage)
+            }
+            None => None,
+        };
+
+        let buckets = Buckets::new(served.iter().map(|(bucket, ..)| *bucket));
+        let runner = Self {
+            done: stream.as_ref().map(|_| Event::new(EventFlags::default())),
+            model,
+            config,
+            graphs,
+            memory,
+            stream,
+            served,
+            buckets,
+            text_width,
+            state,
+            bytes,
+            tensors,
+            encodings,
+            current_step: RefCell::new(None),
+            current_opening: RefCell::new(None),
+        };
+        runner.initialize()?;
+        Ok(runner)
+    }
+
+    /// The bytes of one slot's row in the rank's media memory (`BufferMemory::open`), and of the
+    /// runner's state buffer: the state of the largest request `config` serves.
+    ///
+    /// # Errors
+    ///
+    /// No candidate, what the model refuses of one, or an element type with no whole bytes.
+    pub fn row_bytes(model: &dyn Denoiser, config: &DenoiserConfig) -> Result<u64> {
+        let text_width = model.text_width().unwrap_or(config.width);
+        let served = served(model, &config.candidates)?;
+
+        extents(&served, config, text_width).map(|(bytes, _)| bytes)
+    }
+
+    /// The bytes of device memory the runner holds beside its graphs' region: its state buffer.
+    pub const fn device_bytes(&self) -> u64 {
+        self.bytes
+    }
+
+    /// The trajectory class's `tensors` and `encoding` digests (`storage::runtime::Class`): the
+    /// largest trajectory's [`trajectory_layout`] on each rank of the group.
+    pub fn trajectory_digests(&self) -> ([u8; 32], [u8; 32]) {
+        let encoding = self.encodings[self.config.ranks as usize - 1];
+        (self.tensors, encoding)
+    }
+
+    /// Per captured shape, as `Capacity::media_bytes` states it: the request shape it serves, the
+    /// bytes of a request's trajectory, and of its video latents and audio latents blocks.
+    pub fn media_shapes(&self) -> Result<Vec<(Shape, u64, [u64; 2])>> {
+        let mut shapes = Vec::with_capacity(self.served.len());
+        for (bucket, layout, ..) in &self.served {
+            let (frames, width, height) = bucket.serves.ok_or_else(|| {
+                Error::Invariant(format!("bucket {bucket} serves no request shape"))
+            })?;
+            let [video, audio, ..] = self.parts(layout)?;
+            let shape = Shape {
+                rows: bucket.rows,
+                tokens: 0,
+                variant: Variant::Denoise,
+                extent: Extent::Request {
+                    frames,
+                    width,
+                    height,
+                    text_rows: layout.text_rows,
+                    condition_rows: layout.condition_rows,
+                },
+            };
+            shapes.push((shape, video.1 + audio.1, [video.1, audio.1]));
+        }
+        Ok(shapes)
+    }
+
+    /// Fills the model's tables on the device, under the launching context, and waits for them.
+    fn initialize(&self) -> Result<()> {
+        let Some(stream) = &self.stream else {
+            return Ok(());
+        };
+
+        {
+            let _guard = self.graphs.enter()?;
+            self.model.initialize()?;
+        }
+        Ok(stream.synchronize()?)
+    }
+
+    /// The parts of a request of `layout` in a slot's row.
+    fn parts(&self, layout: &Layout) -> Result<[(u64, u64); 4]> {
+        parts(layout, &self.config, self.text_width)
+    }
+
+    /// The served bucket of `bucket`'s extent, a step's or a preparation's.
+    fn served(&self, bucket: &Bucket) -> Result<&Served> {
+        let step = Bucket {
+            variant: Variant::Denoise,
+            ..*bucket
+        };
+        self.served
+            .iter()
+            .find(|(held, ..)| *held == step)
+            .ok_or_else(|| Error::Invariant(format!("bucket {bucket} is none the runner states")))
+    }
+
+    /// The tensor of `shape` elements of `dtype` from byte `offset` of the state buffer.
+    fn buffer(&self, offset: u64, shape: &[usize], dtype: DType) -> Result<Tensor> {
+        let count: usize = shape.iter().product();
+        if offset + count as u64 * element_bytes(dtype)? > self.bytes {
+            return Err(Error::Invariant(format!(
+                "{shape:?} {dtype:?} from byte {offset} lies past the denoiser's state"
+            )));
+        }
+        let base = self.state.as_ref().map_or(0, |storage| storage.address());
+
+        // SAFETY: the tensor lies inside the state buffer, which this runner owns for as long as
+        // its graphs exist; only the copies it issues on its stream and its forwards write it.
+        unsafe {
+            lend(
+                base + offset,
+                shape,
+                dtype,
+                self.stream.as_ref().map(Stream::device),
+            )
+        }
+    }
+
+    /// A request's state over `layout`: in `slot`'s row, or for no slot in the state buffer.
+    fn state(&self, layout: &Layout, slot: Option<u32>) -> Result<State> {
+        let [video, audio, text, source] = self.parts(layout)?;
+        let (sample, stack) = (self.config.sample, self.config.stack);
+        let lent = |(offset, _): (u64, u64), shape: &[usize], dtype| match slot {
+            Some(slot) => self.memory.trajectory(slot, offset, shape, dtype),
+            None => self.buffer(offset, shape, dtype),
+        };
+
+        let shape = layout.video;
+        let dims = [shape.channels, shape.frames, shape.height, shape.width].map(|d| d as usize);
+        let rows = nn::capability::prefix_rows(layout) as usize;
+        let track = match layout.audio {
+            Some(track) => {
+                let dims = [track.channels as usize, voxels(&track) as usize];
+                Some(lent(audio, &dims, sample)?)
+            }
+            None => None,
+        };
+        Ok((
+            lent(video, &dims, sample)?,
+            track,
+            lent(text, &[rows, self.text_width as usize], stack)?,
+            lent(source, &[rows, self.config.width as usize], stack)?,
         ))
-    })?;
-    numel(latent)?
-        .checked_mul(width)
-        .ok_or_else(|| Error::Invalid("a latent's bytes overflow".into()))
-}
+    }
 
-/// The host side of a runner's columns: one flat byte buffer per column, staged whole and uploaded
-/// once per batch.
-///
-/// A column's device address never moves, so a captured graph addresses it directly and every step
-/// rewrites its contents instead of allocating (4.5): the staging buffers here are the host side of
-/// that one buffer, and the offsets are the requests' own blocks.
-///
-/// **The conditioning columns are not here.** They are hundreds of megabytes, a capture only needs
-/// them to hold defined values, and a request writes every row of them it reads, so they are zeroed
-/// once, where they are allocated.
-#[derive(Default)]
-struct Staged {
-    video: Vec<u8>,
-    audio: Vec<u8>,
-}
+    /// The bucket of `batch`, a step's or a preparation's of the extent its shape states, and
+    /// its one row.
+    fn call<'a>(&self, batch: &'a Batch) -> Result<(Bucket, &'a MediaRow)> {
+        batch.check()?;
+        let variant = batch.shape.variant;
+        if !matches!(variant, Variant::Denoise | Variant::LatentPrepare) {
+            return Err(Error::Invalid(format!(
+                "a denoiser runner serves no {} batch",
+                variant.name()
+            )));
+        }
+        let step = Shape {
+            variant: Variant::Denoise,
+            ..batch.shape
+        };
+        let bucket = self.buckets.select(&step).ok_or_else(|| {
+            Error::Invalid(format!("no bucket of the denoiser holds {}", batch.shape))
+        })?;
+        let [row] = batch.media.as_slice() else {
+            return Err(Error::Invalid(format!(
+                "batch {} carries {} requests in a bucket of one",
+                batch.id.0,
+                batch.media.len()
+            )));
+        };
+        Ok((Bucket { variant, ..bucket }, row))
+    }
 
-impl Staged {
-    /// Resizes `buffer` to `bytes` and zeroes it, so a warm capture reads defined values.
-    fn zero(buffer: &mut Vec<u8>, bytes: u64) -> Result<()> {
-        let length = usize::try_from(bytes)
-            .map_err(|_| Error::Invalid("a batch column is larger than memory".into()))?;
-        buffer.clear();
-        buffer.resize(length, 0);
+    /// The position of each product of `wanted` among `results`, by the class whose entry the
+    /// tables hold at each position.
+    fn named<const N: usize>(
+        &self,
+        tables: &BlockTables,
+        row: &MediaRow,
+        results: &[u32],
+        wanted: [usize; N],
+    ) -> Result<[Option<u32>; N]> {
+        let mut found = [None; N];
+        for &position in results {
+            let held = |kind: usize| {
+                let class = self.config.classes[kind];
+                !tables.runs(row.slot, class, position).is_empty()
+            };
+            let index = wanted.iter().position(|&kind| held(kind)).ok_or_else(|| {
+                Error::Invalid(format!(
+                    "request {} names result {position}, which the call neither reads nor writes",
+                    row.request.0
+                ))
+            })?;
+            found[index] = Some(position);
+        }
+        Ok(found)
+    }
+
+    /// The latent preparation of `row` in `bucket`: the request it states and the products it
+    /// reads, lent from their blocks (module documentation).
+    fn opening(&self, bucket: &Bucket, row: &MediaRow, tables: &BlockTables) -> Result<Opening> {
+        let refused = |problem: String| {
+            Error::Invalid(format!(
+                "the latent preparation of request {} {problem}",
+                row.request.0
+            ))
+        };
+        let (_, _, warm, _) = self.served(bucket)?;
+        let request = stated(warm, &row.conditioning)?;
+        let steps = self.model.schedule(&request)?.len();
+        if row.reads as usize != row.results.len() || row.step as usize >= steps {
+            return Err(refused(format!(
+                "writes a result, or starts at step {} of {steps}",
+                row.step
+            )));
+        }
+
+        let read = self.named(tables, row, &row.results, [CONDITIONING, PIXELS, SAMPLES])?;
+        let pieces = self.model.condition_pieces(&request)?;
+        let total = |extent: fn(&ConditionPiece) -> Option<&nn::Shape>| -> usize {
+            pieces
+                .iter()
+                .filter_map(extent)
+                .map(nn::Shape::elem_count)
+                .sum()
+        };
+        let lent = |kind: usize, shape: &[usize], dtype: DType| -> Result<Tensor> {
+            let position =
+                read[kind].ok_or_else(|| refused(format!("names no {} block", NAMES[kind])))?;
+            let entry = (row.slot, self.config.classes[kind], position);
+
+            self.memory.lend(tables, entry, false, 0, shape, dtype)
+        };
+        // A condition medium is read only by a request whose pieces hold some of it.
+        let media = |kind: usize, total: usize| match total {
+            0 => Ok(None),
+            total => lent(kind, &[total], CONDITION_MEDIA).map(Some),
+        };
+
+        let prompt = [request.text_tokens as usize, self.config.width as usize];
+        let products = [
+            Some(lent(CONDITIONING, &prompt, self.config.stack)?),
+            media(PIXELS, total(|piece| piece.pixels.as_ref()))?,
+            media(SAMPLES, total(|piece| piece.track.as_ref()))?,
+        ];
+        Ok((row.clone(), request, pieces, products))
+    }
+
+    /// Opens `request` of `layout` over `state` (module documentation): its conditioning from the
+    /// `products` it reads, its noise from `seed` unless it was `restored`, and the model's
+    /// preparation of both.
+    fn open(
+        &self,
+        layout: &Layout,
+        (request, pieces): (&VideoRequest, &[ConditionPiece]),
+        (seed, restored): (u64, bool),
+        (video, audio, text, source): State,
+        [conditioning, pixels, samples]: [Option<Tensor>; 3],
+    ) -> Result<()> {
+        let conditioning = conditioning
+            .ok_or_else(|| Error::Invariant("an opening reads its conditioning".into()))?;
+
+        // The prompt's rows; every other row is zero: the prompt's padding, the condition rows
+        // the conditioner writes, and the packing's zero row.
+        source.zero_set()?;
+        source.slice_set(&conditioning, 0, 0)?;
+        text.zero_set()?;
+        if self.text_width == self.config.width {
+            text.slice_set(&conditioning, 0, 0)?;
+        }
+
+        let media = self.media(request, pieces, seed, (pixels, samples))?;
+        let cond = Conditioning {
+            text,
+            source: Some(source),
+            media,
+            images: None,
+            audio: None,
+        };
+
+        // The request's own condition draws lead its stream, so its noise is drawn at their end.
+        let drawn = Layout {
+            condition_elements: self.model.layout(request)?.condition_elements,
+            ..*layout
+        };
+        if !restored {
+            self.model
+                .draw_noise(seed, &drawn, &video, audio.as_ref())?;
+        }
+        self.model.prepare_conditioning(request, &cond)?;
+        if !restored {
+            self.model.prepare_latents(&cond, &video, audio.as_ref())?;
+        }
         Ok(())
+    }
+
+    /// The raw media of a request's conditions, in the order of `pieces`, each visual piece with
+    /// its anchoring draw: each condition's pixels and samples lie after those of the conditions
+    /// before it in request order, as the media host lays them out.
+    fn media(
+        &self,
+        request: &VideoRequest,
+        pieces: &[ConditionPiece],
+        seed: u64,
+        (pixels, samples): (Option<Tensor>, Option<Tensor>),
+    ) -> Result<Vec<MediaInput>> {
+        let mut offsets = vec![(0, 0); request.conditions.len()];
+        let mut ordered: Vec<&ConditionPiece> = pieces.iter().collect();
+        ordered.sort_by_key(|piece| piece.condition);
+        let (mut pixel, mut sample) = (0, 0);
+        for piece in ordered {
+            let at = offsets.get_mut(piece.condition as usize).ok_or_else(|| {
+                Error::Invalid(format!("a piece of condition {}", piece.condition))
+            })?;
+            *at = (pixel, sample);
+            pixel += piece.pixels.as_ref().map_or(0, nn::Shape::elem_count);
+            sample += piece.track.as_ref().map_or(0, nn::Shape::elem_count);
+        }
+
+        let view = |source: Option<&Tensor>, at: usize, shape: &nn::Shape| -> Result<Tensor> {
+            let source = source.ok_or_else(|| {
+                Error::Invalid("a condition piece reads media its row names no block of".into())
+            })?;
+            Ok(source.narrow(0, at, shape.elem_count())?.reshape(shape)?)
+        };
+        let mut media = Vec::with_capacity(pieces.len());
+        for piece in pieces {
+            let (pixel, sample) = offsets[piece.condition as usize];
+            let noise = match piece.draw {
+                Some(draw) => {
+                    let dims = [draw.channels, draw.frames, draw.height, draw.width];
+                    let out = backend::empty(&dims.map(|d| d as usize)[..], self.config.sample)?;
+                    self.model.draw_condition_noise(seed, piece, &out)?;
+                    Some(out)
+                }
+                None => None,
+            };
+            media.push(MediaInput {
+                role: piece.role,
+                rows: piece.rows,
+                audio_rows: piece.audio_rows,
+                pixels: piece
+                    .pixels
+                    .as_ref()
+                    .map(|shape| view(pixels.as_ref(), pixel, shape))
+                    .transpose()?,
+                audio: piece
+                    .track
+                    .as_ref()
+                    .map(|shape| view(samples.as_ref(), sample, shape))
+                    .transpose()?,
+                noise,
+            });
+        }
+        Ok(media)
+    }
+
+    /// The step `row` names and the request it states, checked against the model's schedule.
+    fn staged(&self, bucket: &Bucket, row: &MediaRow) -> Result<(Step, VideoRequest)> {
+        let (_, _, warm, _) = self.served(bucket)?;
+        let request = stated(warm, &row.conditioning)?;
+        let schedule = self.model.schedule(&request)?;
+
+        match schedule.get(row.step as usize) {
+            Some(step) if row.steps as usize == schedule.len() => Ok((*step, request)),
+            _ => Err(Error::Invalid(format!(
+                "request {} asks for step {} of {}, and its schedule has {}",
+                row.request.0,
+                row.step,
+                row.steps,
+                schedule.len()
+            ))),
+        }
+    }
+
+    /// What the step of `row` in `bucket` moves around its replay, `last` when it ends the
+    /// schedule (module documentation).
+    fn moves(
+        &self,
+        bucket: &Bucket,
+        row: &MediaRow,
+        tables: &BlockTables,
+        last: bool,
+    ) -> Result<Moves> {
+        let refused = |problem: &str| {
+            Error::Invalid(format!(
+                "denoising step {} of request {} {problem}",
+                row.step, row.request.0
+            ))
+        };
+        let (_, layout, ..) = self.served(bucket)?;
+        let [video, audio, text, _] = self.parts(layout)?;
+        let (latents, read) = (video.1 + audio.1, text.0 + text.1);
+        let slot = address(
+            &self
+                .memory
+                .trajectory(row.slot, 0, &[read as usize], DType::U8)?,
+        )?;
+        let base = self.state.as_ref().map_or(0, |storage| storage.address());
+
+        let mut before = PitchedBatch::new(SourceOrder::Stream);
+        before.push(pitched((base, read), (slot, read), read, 1)?)?;
+        let mut after = PitchedBatch::new(SourceOrder::Stream);
+        after.push(pitched((slot, latents), (base, latents), latents, 1)?)?;
+
+        // Only the last step names results: the latents it writes.
+        let writes = row.results.get(row.reads as usize..).unwrap_or_default();
+        if row.reads != 0 || last == writes.is_empty() {
+            return Err(refused("names results it does not write"));
+        }
+        let mut written = Vec::new();
+        if last {
+            let named = self.named(tables, row, writes, [VIDEO, AUDIO])?;
+            for (kind, (offset, bytes)) in [(VIDEO, video), (AUDIO, audio)] {
+                // A layout without a track writes nothing into an audio latents block.
+                if bytes == 0 {
+                    continue;
+                }
+                let position = named[kind - VIDEO].ok_or_else(|| refused("names no latents"))?;
+                let class = self.config.classes[kind];
+                let entry = (row.slot, class, position);
+                let block =
+                    self.memory
+                        .lend(tables, entry, true, 0, &[bytes as usize], DType::U8)?;
+
+                after.push(pitched(
+                    (address(&block)?, bytes),
+                    (base + offset, bytes),
+                    bytes,
+                    1,
+                )?)?;
+                written.push((class, position));
+            }
+        }
+        Ok((before, after, written))
+    }
+
+    /// The layouts a restore across encodings lays out (`BufferMemory::restore`): the part of
+    /// the saving rank this rank reads and its own row, both the trajectory's bytes, which every
+    /// rank of every group lays out alike (module documentation).
+    fn restoring(&self, copy: &BlockCopy) -> Result<(Vec<(u32, Stored)>, Stored)> {
+        let refused = |problem: &str| {
+            Error::Invalid(format!(
+                "request {} restores a trajectory {problem}",
+                copy.request.0
+            ))
+        };
+        let ([(host, _)], Some((source, target))) = (copy.runs.as_slice(), copy.encodings) else {
+            return Err(refused("from no one block in another encoding"));
+        };
+        let (_, encoding) = self.trajectory_digests();
+        let saving = self.encodings.iter().position(|held| *held == source);
+        let saving = match saving {
+            Some(index) if target == encoding => index as u32 + 1,
+            _ => return Err(refused("in an encoding this denoiser does not lay out")),
+        };
+
+        // Each saving rank's part holds the whole trajectory: a rank reads its own when it
+        // saved, and otherwise the part of a saving rank.
+        let bytes = u64::from(host.2) * self.config.page_bytes;
+        let pages = Stored {
+            layout: bytes_layout(bytes),
+            page_bytes: self.config.page_bytes,
+        };
+        let rank = self.memory.rank() % saving;
+        Ok((vec![(rank, pages.clone())], pages))
+    }
+
+    /// Serves `batch` over `tables` on the stream: returns when the call was issued, and its
+    /// output; a batch that names no call carries copies alone.
+    fn serve(
+        &self,
+        batch: &Batch,
+        tables: &BlockTables,
+    ) -> Result<(Option<Instant>, Vec<CallOutput>)> {
+        if batch.requests.is_empty() {
+            return Ok((None, Vec::new()));
+        }
+        let (bucket, row) = self.call(batch)?;
+        let stream = self.stream.as_ref().ok_or(Error::State(
+            "a denoiser runner with no device denoises nothing",
+        ))?;
+
+        if bucket.variant == Variant::LatentPrepare {
+            *self.current_opening.borrow_mut() = Some(self.opening(&bucket, row, tables)?);
+            let launched = Instant::now();
+            let ran = self
+                .graphs
+                .prepare_inputs(self, &bucket, |_| Ok(()))
+                .and_then(|()| self.graphs.eager(self, &bucket));
+            self.current_opening.borrow_mut().take();
+            ran?;
+
+            let output = CallOutput {
+                step_index: row.step,
+                ..performed()
+            };
+            return Ok((Some(launched), vec![output]));
+        }
+
+        let (step, request) = self.staged(&bucket, row)?;
+        let last = step.index + 1 == row.steps;
+        let (before, after, written) = self.moves(&bucket, row, tables, last)?;
+        *self.current_step.borrow_mut() = Some((step, request));
+        let prepared = self.graphs.prepare_inputs(self, &bucket, |_| Ok(()));
+        self.current_step.borrow_mut().take();
+        prepared?;
+
+        let launched = Instant::now();
+        // SAFETY: every range lies in the slot's row, the state buffer or a block the tables
+        // give this call writable (`moves`), which stay mapped until the batch ends; the stream
+        // orders the copies before the replay that reads the state buffer and after the one
+        // that writes it.
+        unsafe { before.submit(stream) }?;
+        self.graphs.replay(&bucket)?;
+        // SAFETY: as above.
+        unsafe { after.submit(stream) }?;
+        if self.config.shares {
+            for (class, position) in written {
+                self.memory
+                    .share(tables, (row.slot, class, position), Some(stream))?;
+            }
+        }
+
+        let output = CallOutput {
+            step_index: step.index + 1,
+            ..performed()
+        };
+        Ok((Some(launched), vec![output]))
     }
 }
 
-/// The columns a denoiser stages a batch into, sized for the largest bucket it was bound with.
-struct DenoiseColumns {
-    /// `[requests x channels x frames x height x width]` video latents, one block per request.
-    video: Column,
-    /// The audio latents, in the same per-request blocks; one element when a bucket serves a task
-    /// with no soundtrack, so the column is never empty.
-    audio: Column,
-    /// `[requests x prefix rows x text_width]` conditioning rows: the prefix source
-    /// ([`nn::capability::PrefixSource`]), whose zero row every generated and padding row gathers.
-    text: Column,
-    /// `[requests x prefix rows x width]` the text encoder's own features.
-    ///
-    /// A model with a conditioner between the encoder and the denoiser reads these and folds them
-    /// into `text` in place ([`nn::Denoiser::prepare_conditioning`]).
-    ///
-    /// **Both buffers are the runner's even though the conditioner runs eagerly, once per request and
-    /// outside the graph** ([`DenoiserRunner::first_step`]): `text` is the region the captured graph
-    /// reads, so an output buffer the conditioner allocated for itself would be a per-request
-    /// allocation no capture addresses, and `source` is where [`DenoiserRunner::seed`] puts the
-    /// encoder's bytes on the store's clock.
-    source: Column,
-    /// The encoder's width: elements in one `source` row.
-    source_width: u64,
-    /// What the denoiser reads: elements in one `text` row.
-    ///
-    /// **Two widths, because a conditioner may widen.** H3's refiner projects the encoder's 5120
-    /// columns into the stack's 5376, so a runner that sized both buffers from the encoder's width
-    /// handed the conditioner one too narrow for its own output - and no launch refused until the
-    /// packed rows were gathered, as `out is [rows, 5376], [rows, 5120] expected`. The model states
-    /// the second width (`Denoiser::text_width`); `None` is one width.
-    text_width: u64,
-    /// The host side of each column.
-    staged: Staged,
-}
+impl Runner for DenoiserRunner {
+    fn phases(&self) -> &[Phase] {
+        &self.config.phases
+    }
 
-impl DenoiseColumns {
-    /// Columns that hold a request of any of `layouts`, `rows` requests to a batch.
-    ///
-    /// The extents are taken one by one rather than from a largest layout: the longest timeline and
-    /// the highest condition rung are two axes, and a bucket that is largest on one need not be on
-    /// the other.
-    fn new(device: DeviceId, shape: DenoiserShape, layouts: &[Layout], rows: u32) -> Result<Self> {
-        let rows = u64::from(rows.max(1));
-        let (mut video, mut audio, mut width) = (0, 1, 0);
-        for layout in layouts {
-            video = video.max(numel(&layout.video)?);
-            if let Some(track) = layout.audio {
-                audio = audio.max(numel(&track)?);
-            }
-            width = width.max(u64::from(nn::capability::PrefixSource::of(layout).rows()));
+    fn buckets(&self) -> Vec<Bucket> {
+        self.buckets.capture_order().copied().collect()
+    }
+
+    /// The latent preparation of each step's layout.
+    fn eager_buckets(&self) -> Vec<Bucket> {
+        let prepare = |bucket: &Bucket| Bucket {
+            variant: Variant::LatentPrepare,
+            ..*bucket
+        };
+        self.buckets.capture_order().map(prepare).collect()
+    }
+
+    /// A step's forward advances the latents of the state buffer in place, and a preparation's
+    /// opens its request (module documentation); neither returns an output.
+    fn forward(&self, bucket: &Bucket) -> Result<Vec<Tensor>> {
+        let (_, layout, warm, sets) = self.served(bucket)?;
+
+        if bucket.variant == Variant::Denoise {
+            let staged = self.current_step.borrow().clone();
+            let (step, request) = match staged {
+                Some(staged) => staged,
+                None => {
+                    let first = self.model.schedule(warm)?.first().copied();
+                    let step = first.ok_or_else(|| {
+                        Error::Invalid(format!("bucket {bucket}'s schedule has no step"))
+                    })?;
+                    (step, warm.clone())
+                }
+            };
+            let (video, audio, text, _) = self.state(layout, None)?;
+            let cond = Conditioning {
+                text,
+                source: None,
+                media: Vec::new(),
+                images: None,
+                audio: None,
+            };
+
+            self.model
+                .forward(step, &request, &video, audio.as_ref(), &cond)?;
+            return Ok(Vec::new());
         }
-        let (source_width, text_width) = conditioning_width(&shape);
-        let mut text = Column::new(device, shape.stack, rows * width * text_width)?;
-        let mut source = Column::new(device, shape.stack, rows * width * source_width)?;
-        // SAFETY: the columns were allocated above and nothing reads them yet.
-        unsafe {
-            text.host.as_mut_slice().fill(0);
-            source.host.as_mut_slice().fill(0);
+
+        if let Some((row, request, pieces, products)) = self.current_opening.borrow().clone() {
+            let state = self.state(layout, Some(row.slot))?;
+            let seed = (row.seed, row.step > 0);
+            self.open(layout, (&request, &pieces), seed, state, products)?;
+            return Ok(Vec::new());
         }
-        Ok(Self {
-            video: Column::new(device, shape.sample, rows * video)?,
-            audio: Column::new(device, shape.sample, rows * audio)?,
-            text,
-            source,
-            staged: Staged::default(),
-            source_width,
-            text_width,
+
+        // A profile run: the model's initialization, then the candidate and each condition set
+        // it may open with, over the state buffer and products of their own extents.
+        self.model.initialize()?;
+        let requests = std::iter::once(warm.clone()).chain(
+            sets.iter()
+                .map(|set| opened(warm, set.clone(), warm.text_tokens, Vec::new())),
+        );
+        for request in requests {
+            let pieces = self.model.condition_pieces(&request)?;
+            let placeholder = |extent: fn(&ConditionPiece) -> Option<&nn::Shape>| -> Result<_> {
+                let total: usize = pieces
+                    .iter()
+                    .filter_map(extent)
+                    .map(nn::Shape::elem_count)
+                    .sum();
+                match total {
+                    0 => Ok(None),
+                    total => Ok(Some(backend::empty(total, CONDITION_MEDIA)?)),
+                }
+            };
+            let prompt = (request.text_tokens as usize, self.config.width as usize);
+            let products = [
+                Some(backend::empty(prompt, self.config.stack)?),
+                placeholder(|piece| piece.pixels.as_ref())?,
+                placeholder(|piece| piece.track.as_ref())?,
+            ];
+
+            let state = self.state(layout, None)?;
+            self.open(layout, (&request, &pieces), (0, false), state, products)?;
+        }
+        Ok(Vec::new())
+    }
+
+    /// A step reads no input tensor: its state is the runner's buffer.
+    fn idle_inputs(&self, bucket: &Bucket, _columns: &mut [u8]) -> Result<()> {
+        self.served(bucket).map(|_| ())
+    }
+
+    fn prepare_inputs(&mut self, batch: &Batch, tables: &BlockTables) -> Result<Bucket> {
+        let (bucket, row) = self.call(batch)?;
+        if bucket.variant == Variant::Denoise {
+            let staged = self.staged(&bucket, row)?;
+            *self.current_step.borrow_mut() = Some(staged);
+        } else {
+            *self.current_opening.borrow_mut() = Some(self.opening(&bucket, row, tables)?);
+        }
+
+        let prepared = self.graphs.prepare_inputs(&*self, &bucket, |_| Ok(()));
+        self.current_step.borrow_mut().take();
+        self.current_opening.borrow_mut().take();
+        prepared.map(|()| bucket)
+    }
+
+    /// One call of `batch` over `tables` (module documentation). It returns once the device
+    /// completed the call and the copies [`Runner::copy`] issued for it, whether the call was
+    /// served or failed.
+    fn execute(&mut self, batch: &Batch, tables: &BlockTables) -> Result<BatchOutput> {
+        let started = Instant::now();
+        let served = self.serve(batch, tables);
+
+        let ended = match (&self.stream, &self.done) {
+            (Some(stream), Some(done)) => done.record(stream).and_then(|()| done.synchronize()),
+            _ => Ok(()),
+        };
+        let (launched, calls) = served?;
+        ended?;
+
+        let landed = Instant::now();
+        let launched = launched.unwrap_or(landed);
+        Ok(BatchOutput {
+            calls,
+            timing: TimingCounters {
+                queued_us: 0,
+                device_us: landed.duration_since(launched).as_micros() as u64,
+                copy_us: 0,
+                host_us: launched.duration_since(started).as_micros() as u64,
+            },
+            forward_stats: None,
         })
     }
 
-    /// Zeroes the latents' host side for `bucket`'s layout, so a warm capture reads defined values.
-    fn warm(&mut self, layout: &Layout, shape: DenoiserShape, rows: u32) -> Result<()> {
-        let rows = u64::from(rows.max(1));
-        Staged::zero(
-            &mut self.staged.video,
-            rows * latent_bytes(&layout.video, shape.sample)?,
-        )?;
-        let audio = match layout.audio {
-            Some(audio) => latent_bytes(&audio, shape.sample)?,
-            None => ops::abi::bytes(shape.sample).unwrap_or(1),
-        };
-        Staged::zero(&mut self.staged.audio, rows * audio)?;
+    /// Issues `copies` through the rank's media memory on the runner's stream, ahead of the
+    /// batch whose end covers them: a restore of a trajectory saved in another encoding through
+    /// the copy manifest, every other copy as its bytes are.
+    fn copy(&mut self, copies: &[BlockCopy]) -> Result<()> {
+        let stream = self.stream.as_ref();
+        let plain: Vec<BlockCopy> = copies
+            .iter()
+            .filter(|copy| copy.encodings.is_none())
+            .cloned()
+            .collect();
+        let across = copies
+            .iter()
+            .filter(|copy| copy.encodings.is_some())
+            .map(|copy| Ok((copy, self.restoring(copy)?)))
+            .collect::<Result<Vec<_>>>()?;
+
+        self.memory.copy(&plain, stream)?;
+        for (copy, (sources, target)) in &across {
+            self.memory.restore(copy, (&sources[..], target), stream)?;
+        }
         Ok(())
     }
-}
 
-/// The products one denoising step reads, in the order a refusal names them.
-///
-/// **This is the list the runner reads from the store, and nothing else.** A step here reads the
-/// encoded conditioning rows (`text`) and the encoder's own features (`source`), which
-/// `Denoiser::prepare_conditioning` folds into `text` before the first evaluation.
-///
-/// **The trajectory is not on the list although the model's `Layout` states it**, because this
-/// runner *owns* it: the latents are its own columns, which the captured graph updates in place, so
-/// asking a store for them would be asking for a second name for memory the runner already holds.
-/// The runner is what *publishes* them, as `VideoLatents`/`AudioLatents`, for the decode that reads
-/// them next.
-///
-/// `images` and `audio` are `Conditioning` fields another model fills; this runner passes `None`
-/// for both, so requiring them would refuse every step of a model that does not use them - the
-/// defect of a list written from the capability's fields rather than from this file's own
-/// assembly.
-///
-/// The request's raw condition media is not here either: it is an input to the conditioning rather
-/// than a row of it, it is per condition, and the scheduler names it
-/// (`crate::runners::products`).
-const STEP_PRODUCTS: &[Product] = &[Product::Text];
+    fn graphs(&self) -> &Graphs {
+        &self.graphs
+    }
 
-/// The products a step of `layout` reads, in the order a refusal names them.
-///
-/// **One list for every layout, because one product has a producer.** `Product::Text` is what the
-/// encoder publishes (`crate::runners::encoder`), and `Product::Source` is published by nobody -
-/// the product table says so as a contract (`crate::runners::products`) - so a conditioned layout
-/// that required it refused every step with `absent(request, Source)` before the conditioner could
-/// run. The encoder's rows are the conditioner's input as well as a prompt's: where they land is
-/// decided by [`DenoiserRunner::seed`], not by asking the store for a second name for them.
-fn step_products(_layout: &proto::video::Layout) -> &'static [Product] {
-    STEP_PRODUCTS
-}
-
-/// `forward` over `group`, when the runner's rank is in one: a launching forward issues its
-/// collectives through the group, and a staging or recording forward follows the group's split.
-///
-/// # Errors
-///
-/// When the group's rank is not a member of it.
-pub(crate) fn grouped<'a>(
-    forward: nn::Forward<'a>,
-    group: Option<&'a nn::Group>,
-) -> Result<nn::Forward<'a>> {
-    match group {
-        Some(group) if forward.launches() => Ok(forward.with_group(group)),
-        Some(group) => {
-            // NCCL reports a member's rank as a non-negative `int`, as `nn::Forward::split` reads it.
-            let rank = u64::try_from(group.rank()).unwrap_or(0);
-            Ok(forward.with_split(rank, group.ranks())?)
-        }
-        None => Ok(forward),
+    /// The model's tables are computed from its weights, so they are filled again.
+    fn weights_changed(&mut self) -> Result<()> {
+        self.initialize()
     }
 }
 
-/// The rows of one request's conditioning and the encoder's width: the layout's prefix source
-/// ([`nn::capability::PrefixSource::rows`]), the encoder writing `width` elements in each.
-///
-/// The packing gathers every generated and padding row from the source's zero row, so that row is
-/// part of the column: a column that ended before it would hand every such row whatever follows the
-/// allocation.
-///
-/// One statement for the two readers that need it - the view a step hands the model
-/// ([`DenoiserRunner::conditioning`]) and the rows [`DenoiserRunner::seed`] gives their bytes to.
-/// Two statements of this arithmetic would be a step that reads a row the copies never filled, which
-/// is a plausible clip rather than an error.
-///
-/// **`width` is `source`'s alone.** A conditioner may widen what the denoiser reads, so `text`'s
-/// width is the model's statement and the pair is resolved in [`conditioning_width`].
-fn conditioning_row(shape: &DenoiserShape, layout: &proto::video::Layout) -> (u64, u64) {
-    let width = u64::from(shape.width.max(1));
-    (
-        u64::from(nn::capability::PrefixSource::of(layout).rows()),
-        width,
-    )
-}
+/// One bucket per distinct layout of each served request shape (module documentation), with
+/// the candidate the first of it states and the condition sets of every candidate it collapses.
+fn served(
+    model: &dyn Denoiser,
+    candidates: &[(VideoRequest, Vec<Vec<ConditionShape>>)],
+) -> Result<Vec<Served>> {
+    let mut served: Vec<Served> = Vec::new();
+    for (request, sets) in candidates {
+        let layout = model.layout(request)?;
+        let bucket =
+            Bucket::denoise(1, layout).serving(request.frames, request.width, request.height);
 
-/// The two widths one request's conditioning columns hold: `(source, text)`.
-///
-/// `source` is what the text encoder wrote, which [`DenoiserShape::width`] states; `text` is what
-/// the denoiser reads, which [`DenoiserShape::text_width`] states - the planning boundary asked the
-/// model once and equal to the encoder's width when the model has no conditioner. **One width for both
-/// is the defect this pair removes**: the conditioner's own output then does not fit the buffer it
-/// writes, and the refusal arrives one operator later, at the gather.
-fn conditioning_width(shape: &DenoiserShape) -> (u64, u64) {
-    let source = u64::from(shape.width.max(1));
-    let text = u64::from(shape.text_width.max(1));
-    (source, text)
-}
-
-/// How a product's bytes fill one row of a conditioning column: `(copied, zeroed)`.
-///
-/// A row is the layout's **capacity** - `text_rows + condition_rows` rows of `width` - and a
-/// product holds the request's own rows, which the encoder wrote. The prefix's rows past the
-/// request's are the padding the packing names, and its value is zeros
-/// (`packing::DensePacking::zero_row`). So a short product fills the row's front and the rest is
-/// zeroed rather than refused.
-///
-/// **A product longer than the row is refused**, and by name: it is not padding, it is a plan
-/// disagreement - the store holds more of the request's rows than the layout those rows are copied
-/// into can carry - and truncating it would drop states the denoiser was told are there.
-fn fills(
-    request: ipc::RequestKey,
-    kind: Product,
-    available: u64,
-    bytes: u64,
-) -> Result<(u64, u64)> {
-    if available == 0 {
-        return Err(Error::Invalid(format!(
-            "request {} presents no byte(s) of {} where a row of {bytes} bytes must be filled: an \
-             empty region is a product no call wrote",
-            request.request_id.0,
-            kind.name()
-        )));
-    }
-    if available > bytes {
-        return Err(Error::Invalid(format!(
-            "request {} presents {available} byte(s) of {} where a row holds {bytes}: the store's \
-             region is longer than the conditioning block it is copied into, so the deployment's \
-             text capacity is below the rows the request was encoded with",
-            request.request_id.0,
-            kind.name()
-        )));
-    }
-    Ok((available, bytes - available))
-}
-
-/// The first of [`STEP_PRODUCTS`] that `products` does not hold for `request`, if any.
-///
-/// A free function so the presence rule is testable without a runner: constructing one takes a
-/// device, and the rule is about a store rather than about a device.
-fn missing_product(
-    products: &dyn Products,
-    request: ipc::RequestKey,
-    kinds: &[Product],
-) -> Result<Option<Product>> {
-    // **Presence, not device and stream.** Whether a product exists is a fact about the store; where a
-    // reader wants it is `copy_into`'s question. Asking `borrow` here made a deployment that puts
-    // the text encoder on its own GPU refuse every step with "no call produced it".
-    for kind in kinds {
-        if !products.holds(request, *kind) {
-            return Ok(Some(*kind));
+        match served.iter_mut().find(|(held, ..)| *held == bucket) {
+            Some((.., held)) => {
+                for set in sets {
+                    if !held.contains(set) {
+                        held.push(set.clone());
+                    }
+                }
+            }
+            None => served.push((bucket, layout, request.clone(), sets.clone())),
         }
     }
-    Ok(None)
+
+    if served.is_empty() {
+        return Err(Error::Invalid(
+            "a denoiser runner serves no candidate request, so it would capture nothing".into(),
+        ));
+    }
+    Ok(served)
 }
 
-/// One row of the batch a replay serves.
-///
-/// The request and its row are what the store is seeded and published by; the seed is what the
-/// first step's draw is addressed by, and it is kept here because the draw is issued by the
-/// replay rather than by the `submit` that read it.
-#[derive(Clone, Debug)]
-struct Pending {
-    /// The request this row belongs to.
-    request: ipc::RequestKey,
-    /// The row of the bucket's columns the request occupies.
-    index: u32,
-    /// The request's noise seed: the draw is addressed by it and the element's index.
-    seed: nn::capability::Seed,
-    /// The request as its steps read it: its own prompt length and its own conditions.
-    stated: Arc<WarmRequest>,
+/// The bytes of the largest request's state in a slot's row, and the layout of the largest
+/// trajectory, among the served buckets.
+fn extents<'a>(
+    served: &'a [Served],
+    config: &DenoiserConfig,
+    text_width: u32,
+) -> Result<(u64, &'a Layout)> {
+    let (mut row, mut largest) = (0, None);
+    for (_, layout, ..) in served {
+        let [video, audio, _, (offset, source)] = parts(layout, config, text_width)?;
+        row = u64::max(row, offset + source);
+
+        let trajectory = video.1 + audio.1;
+        if largest.is_none_or(|(held, _)| trajectory > held) {
+            largest = Some((trajectory, layout));
+        }
+    }
+
+    let (_, layout) =
+        largest.ok_or_else(|| Error::Invalid("a denoiser runner serves no layout".into()))?;
+    Ok((row, layout))
 }
 
-/// What opening one request on this runner reads: its row of the columns, its seed, its stated
-/// request, its condition pieces and the regions their raw media lie in.
-///
-/// A replay builds it from a staged row and the product store; the recorded walk builds it from a
-/// bucket's warm request and placeholder regions of the same extents.
-struct Opening<'a> {
-    /// The row of the bucket's columns the request occupies.
-    index: u32,
-    /// The request's noise seed.
-    seed: nn::capability::Seed,
-    /// The request as its first step reads it.
-    stated: &'a WarmRequest,
-    /// The model's condition pieces of `stated`, in the order it packs them.
-    pieces: &'a [nn::capability::ConditionPiece],
-    /// `[elements]` the pixels of every condition, conditions in request order.
-    pixels: Option<Operand>,
-    /// `[elements]` the soundtrack samples of every condition, conditions in request order.
-    samples: Option<Operand>,
-    /// Whether a latent preparation restored the request's trajectory: it then draws no noise and
-    /// starts no schedule.
-    restored: bool,
+/// The parts of a request of `layout` in a slot's row, `(offset, bytes)` each from its first
+/// byte (module documentation): the video latents, the audio latents (no byte without a track),
+/// the conditioning rows of `text_width` the denoiser reads, and the encoder's rows.
+fn parts(layout: &Layout, config: &DenoiserConfig, text_width: u32) -> Result<[(u64, u64); 4]> {
+    let (sample, stack) = (element_bytes(config.sample)?, element_bytes(config.stack)?);
+    let rows = u64::from(nn::capability::prefix_rows(layout));
+
+    let video = elements(&layout.video) * sample;
+    let audio = layout.audio.as_ref().map_or(0, elements) * sample;
+    let text = rows * u64::from(text_width) * stack;
+    let source = rows * u64::from(config.width) * stack;
+    let at = (video + audio).next_multiple_of(UNIT_BYTES);
+    let after = (at + text).next_multiple_of(UNIT_BYTES);
+    Ok([(0, video), (video, audio), (at, text), (after, source)])
 }
 
-/// The elements of a piece's extents.
-fn elements(extents: &[u64]) -> u64 {
-    extents.iter().product::<u64>()
-}
-
-/// The request a staged row states, within the bucket `warm` plans.
-///
-/// A graph is captured for a bucket's capacity, and the values a request's forward uploads say how
-/// much of that capacity it fills: the refiner's keys stop at its prompt, and every packed row
-/// takes its place on the rotary clock from that length. So the task, the canvas and the frames stay the plan's, and
-/// everything the request itself states replaces the plan's figures.
-fn stated_request(warm: &WarmRequest, conditioning: &[u8]) -> Result<WarmRequest> {
-    use proto::video::{ConditionRole, Conditions};
-
-    let decoded = Conditions::decode(conditioning).map_err(|error| {
+/// The request a row's `conditioning` states, in the bucket of `warm`: the conditions, prompt
+/// and vision spans the conditioning states, and the resolution, timeline, frame rate and
+/// condition rung of the candidate.
+fn stated(warm: &VideoRequest, conditioning: &[u8]) -> Result<VideoRequest> {
+    let decoded = proto::video::Conditions::decode(conditioning).map_err(|error| {
         Error::Invalid(format!(
-            "a media request's conditioning does not decode: {error}"
+            "a video request's conditioning does not decode: {error}"
         ))
     })?;
     let conditions = decoded
         .conditions
         .iter()
         .map(|condition| {
-            let (frames, height, width) = condition
-                .media
-                .pixels()
-                .map_or((0, 0, 0), |(frames, canvas)| {
-                    (frames, canvas.height, canvas.width)
-                });
-            nn::ConditionShape {
-                role: match condition.role {
-                    ConditionRole::FirstFrame => nn::ConditionRole::FirstFrame,
-                    ConditionRole::LastFrame => nn::ConditionRole::LastFrame,
-                    ConditionRole::Reference => nn::ConditionRole::Reference,
-                },
-                frames,
-                height,
-                width,
+            let (frames, canvas) = condition.media.pixels().unzip();
+            ConditionShape {
+                role: condition.role,
+                frames: frames.unwrap_or(0),
+                height: canvas.map_or(0, |canvas| canvas.height),
+                width: canvas.map_or(0, |canvas| canvas.width),
                 audio_samples: condition
                     .media
                     .audio()
@@ -476,6 +1061,7 @@ fn stated_request(warm: &WarmRequest, conditioning: &[u8]) -> Result<WarmRequest
             }
         })
         .collect();
+
     Ok(opened(
         warm,
         conditions,
@@ -484,1516 +1070,38 @@ fn stated_request(warm: &WarmRequest, conditioning: &[u8]) -> Result<WarmRequest
     ))
 }
 
-/// `warm` as a request presenting `conditions`, a prompt of `text_tokens` tokens and the vision
-/// spans `vision_spans` states it: the role counts follow the conditions, and the task, the canvas,
-/// the frames and the rung stay the bucket's.
-///
-/// A served request's opening states its request through this from its conditioning
-/// ([`stated_request`]), and the recorded walk states each of the bucket's admitted condition sets
-/// ([`WarmRequest::openings`]) through it, so both open the same request.
+/// `warm` presenting `conditions`, a prompt of `text_tokens` tokens and `vision_spans`: the role
+/// counts follow the conditions, and the rest is the candidate's.
 fn opened(
-    warm: &WarmRequest,
-    conditions: Vec<nn::ConditionShape>,
+    warm: &VideoRequest,
+    conditions: Vec<ConditionShape>,
     text_tokens: u32,
     vision_spans: Vec<(u32, u32)>,
-) -> WarmRequest {
-    let count = |role: nn::ConditionRole| {
-        conditions
-            .iter()
-            .filter(|condition| condition.role == role)
-            .count() as u32
+) -> VideoRequest {
+    let count = |role: ConditionRole| {
+        let counted = conditions.iter().filter(|held| held.role == role).count();
+        u32::try_from(counted).unwrap_or(u32::MAX)
     };
-    WarmRequest {
-        first_frames: count(nn::ConditionRole::FirstFrame),
-        last_frames: count(nn::ConditionRole::LastFrame),
-        references: count(nn::ConditionRole::Reference),
+    VideoRequest {
+        first_frames: count(ConditionRole::FirstFrame),
+        last_frames: count(ConditionRole::LastFrame),
+        references: count(ConditionRole::Reference),
         text_tokens,
         conditions,
         vision_spans,
-        // An opened request is one request: the sets its layout admits are the bucket's.
-        openings: Vec::new(),
         ..warm.clone()
     }
 }
 
-/// One bucket and the request it was derived from.
-#[derive(Clone, Debug)]
-pub struct BucketPlan {
-    /// The bucket: one step over one request of the warm request's layout.
-    pub bucket: Bucket,
-    /// The request the bucket's layout and schedule are stated by, and its graph is captured from.
-    pub warm: WarmRequest,
-}
-
-/// The denoiser's runner: one device stream, the buckets its plan captures, and its model.
-pub struct DenoiserRunner<M: Denoiser + Send + Sync + ?Sized> {
-    id: RunnerId,
-    phases: Vec<ipc::PhaseId>,
-    model: Arc<M>,
-    lifecycle: Lifecycle,
-    /// The buckets this runner captures, each with the warm request it was derived from: a bucket's
-    /// task is what its schedule is asked for, and the two are one object so they cannot disagree.
-    buckets: Vec<BucketPlan>,
-    device: DeviceId,
-    stream: platform::Stream,
-    shape: DenoiserShape,
-    counters: Option<Arc<crate::device::SharedCounters>>,
-    columns: DenoiseColumns,
-    /// The epoch's product store: what a call of this request produced for this one to read.
-    ///
-    /// `None` until the worker attaches it, and a step that needs a product without one refuses by
-    /// name rather than staging zeros.
-    products: Option<Arc<dyn Products>>,
-    /// The step of the schedule the staged batch is.
-    staged_step: Option<Step>,
-    /// The rows of the batch being served: what a replay seeds from the store, what it publishes
-    /// its trajectory back to, and the seed its first step's draw is addressed by.
-    ///
-    /// A batch is one step, so this is filled by `submit` and consumed by the replay that follows;
-    /// a second `submit` before a replay would be a second batch, which the worker does not do.
-    pending: Vec<Pending>,
-    /// Whether the model's writable constants of this load are filled ([`Denoiser::initialize`]).
-    initialized: bool,
-    /// The sequence group this runner's rank exchanges over, absent at one rank.
-    group: Option<Arc<nn::Group>>,
-    /// The calls of the batch staged last, which its replay answers.
-    calls: Vec<CallId>,
-    /// The steps those calls' trajectories have completed once the replay ran: a call reports it,
-    /// and that report is what moves the request to its next step.
-    steps_completed: u32,
-    /// The request whose trajectory the latent columns hold, and the bucket it is laid out in: the
-    /// request whose first step this runner ran last. A step of any other request opens that
-    /// request first ([`Self::first_step`]). The scheduler holds the denoiser for one request from
-    /// its latent preparation to its last step, so a trajectory is never displaced mid-schedule.
-    opened: Option<(ipc::RequestKey, Bucket)>,
-    /// The request a latent preparation restored a stored trajectory for, and the step that
-    /// trajectory stands at: its first step continues from the columns instead of drawing noise.
-    restored: Option<(ipc::RequestKey, u32)>,
-    /// The latent preparations of the batch submitted last, which its jobs perform.
-    preparations: Vec<Preparation>,
-    /// The host latent pool of this runner's device: a preempted request's trajectory is written to
-    /// it and a resumed one's read through it. `None` on a device that maps none.
-    host_pool: Option<Arc<LatentHostPool>>,
-    /// The rank of the worker group this device belongs to, which the engine's page copies and
-    /// restore readers name.
-    pool_rank: u32,
-    /// Whether this device states a trajectory's page layout for its rank: every device of a
-    /// sequence group holds the whole samples, so one of them states them for all.
-    reports_layout: bool,
-}
-
-/// One latent preparation of a submitted batch.
-struct Preparation {
-    /// The call it answers.
-    call: CallId,
-    /// The request whose trajectory it opens.
-    request: ipc::RequestKey,
-    /// The denoising bucket the request's steps run in, whose layout the trajectory has.
-    bucket: Bucket,
-    /// The stored trajectory it opens at, for a resumed request.
-    restore: Option<ipc::LatentRestore>,
-}
-
-impl<M: Denoiser + Send + Sync + ?Sized> DenoiserRunner<M> {
-    /// Binds a denoiser to one device stream.
-    ///
-    /// The buckets are derived here from the deployment's warm requests, one per task and canvas it
-    /// serves: `Denoiser::layout` states the layout, and the bucket is `Bucket::denoise(1, layout)` -
-    /// one request per batch, because the model's step is one request's (`Denoiser::denoise`).
-    pub fn new(
-        binding: Binding,
-        model: Arc<M>,
-        warm: Vec<WarmRequest>,
-        shape: DenoiserShape,
-        generation: Arc<ops::Generation>,
-    ) -> Result<Self> {
-        if warm.is_empty() {
-            return Err(Error::Invalid(
-                "a denoiser runner was bound with no served task and canvas; its plan must state \
-                 one warm request for every layout the checkpoint serves"
-                    .into(),
-            ));
-        }
-        let mut buckets: Vec<BucketPlan> = Vec::with_capacity(warm.len());
-        for request in warm {
-            let layout = model.layout(&request.view())?;
-            let bucket =
-                Bucket::denoise(1, layout).serving(request.frames, request.width, request.height);
-            if buckets.iter().any(|plan| plan.bucket == bucket) {
-                // Two served tasks of one layout share one graph: the bucket is the layout, so a
-                // second entry would capture the same extent twice.
-                continue;
-            }
-            buckets.push(BucketPlan {
-                bucket,
-                warm: request,
-            });
-        }
-        let rows = buckets
-            .iter()
-            .map(|plan| plan.bucket.rows)
-            .max()
-            .ok_or_else(|| Error::Invalid("a denoiser runner derived no bucket".into()))?;
-        let layouts = buckets
-            .iter()
-            .map(|plan| layout_of(plan.bucket))
-            .collect::<Result<Vec<_>>>()?;
-        let columns = DenoiseColumns::new(binding.device, shape, &layouts, rows)?;
-        let lifecycle = Lifecycle::new(binding.id, generation, binding.stream.clone());
-        Ok(Self {
-            id: binding.id,
-            phases: binding.phases,
-            model,
-            lifecycle,
-            buckets,
-            device: binding.device,
-            stream: binding.stream,
-            shape,
-            counters: None,
-            columns,
-            products: None,
-            staged_step: None,
-            pending: Vec::new(),
-            initialized: false,
-            group: None,
-            calls: Vec::new(),
-            steps_completed: 0,
-            opened: None,
-            restored: None,
-            preparations: Vec::new(),
-            host_pool: None,
-            pool_rank: 0,
-            reports_layout: false,
-        })
-    }
-
-    /// This runner as a rank of the sequence `group`: every forward it runs carries the group.
-    #[must_use]
-    pub fn in_group(mut self, group: Option<Arc<nn::Group>>) -> Self {
-        self.group = group;
-        self
-    }
-
-    /// The bytes of the largest trajectory this runner holds: the video and audio latents of its
-    /// largest layout, which a host latent pool's trajectory pages are sized for.
-    pub fn trajectory_bytes(&self) -> Result<u64> {
-        let element = ops::abi::bytes(self.shape.sample).ok_or_else(|| {
-            Error::Invalid(format!(
-                "{} has no whole-byte size",
-                ops::abi::name(self.shape.sample)
-            ))
-        })?;
-        let mut largest = 0;
-        for plan in &self.buckets {
-            let layout = layout_of(plan.bucket)?;
-            let audio = layout.audio.as_ref().map_or(Ok(0), numel)?;
-            largest = largest.max((numel(&layout.video)? + audio) * element);
-        }
-        Ok(largest)
-    }
-
-    /// This runner with its device's host latent pool, as a device of rank `rank` of its worker
-    /// group: preempted trajectories are written to the pool and resumed ones read through it, and
-    /// when `reports` is set this device states the trajectory's page layout for the rank.
-    #[must_use]
-    pub fn with_host_latents(
-        mut self,
-        pool: Arc<LatentHostPool>,
-        rank: u32,
-        reports: bool,
-    ) -> Self {
-        self.host_pool = Some(pool);
-        self.pool_rank = rank;
-        self.reports_layout = reports;
-        self
-    }
-
-    /// The buckets this runner captures, largest first: the longest timeline, and within it the
-    /// highest condition rung.
-    fn capture_order(&self) -> Vec<Bucket> {
-        let mut buckets: Vec<Bucket> = self.buckets.iter().map(|plan| plan.bucket).collect();
-        buckets.sort_by_key(|bucket| std::cmp::Reverse(*bucket));
-        buckets
-    }
-
-    /// The plan entry of `bucket`, or a refusal naming a bucket this runner does not serve.
-    fn plan_of(&self, bucket: Bucket) -> Result<&BucketPlan> {
-        self.buckets
-            .iter()
-            .find(|plan| plan.bucket == bucket)
-            .ok_or_else(|| {
-                Error::Invalid(format!(
-                    "this denoiser runner serves no bucket {bucket}; its warm requests state {}",
-                    self.buckets.len()
-                ))
-            })
-    }
-
-    /// The steps of `bucket`'s schedule, as the model states them for its task.
-    ///
-    /// The model refuses a task it states no schedule for, and that refusal is passed on rather
-    /// than turned into an empty ladder: empty is the same value as a schedule with no steps, which
-    /// is the opposite fact.
-    pub fn schedule(&self, bucket: Bucket) -> Result<Vec<Step>> {
-        let plan = self.plan_of(bucket)?;
-        self.model.schedule(&plan.warm.view()).map_err(Error::from)
-    }
-
-    /// The video latents of request `index` of `bucket`, as a view of the runner's own column.
-    fn video_latents(&self, bucket: Bucket, index: u32) -> Result<Operand> {
-        let layout = layout_of(bucket)?;
-        let elements = numel(&layout.video)?;
-        let view = self.columns.video.shaped(&[elements]);
-        Ok(view
-            .at(view.offset_elements(u64::from(index) * elements))
-            .reshape(latent_shape(&layout.video)))
-    }
-
-    /// The audio latents of request `index` of `bucket`, when the bucket's layout has a soundtrack.
-    fn audio_latents(&self, bucket: Bucket, index: u32) -> Result<Option<Operand>> {
-        let layout = layout_of(bucket)?;
-        let Some(audio) = layout.audio else {
-            return Ok(None);
-        };
-        let elements = numel(&audio)?;
-        let view = self.columns.audio.shaped(&[elements]);
-        Ok(Some(
-            view.at(view.offset_elements(u64::from(index) * elements))
-                .reshape(latent_shape(&audio)),
-        ))
-    }
-
-    /// The latents of request `index` of `bucket`.
-    fn latents(&self, bucket: Bucket, index: u32) -> Result<Latents> {
-        Ok(Latents {
-            video: self.video_latents(bucket, index)?,
-            audio: self.audio_latents(bucket, index)?,
-        })
-    }
-
-    /// The rows and the two widths one request's conditioning occupies: `(rows, source, text)`.
-    ///
-    /// Read from the columns rather than recomputed, so the view a step hands the model and the row
-    /// size [`Self::seed`] fills are the ones the buffers were allocated for.
-    fn conditioning_row(&self, layout: &proto::video::Layout) -> (u64, u64, u64) {
-        let (rows, _) = conditioning_row(&self.shape, layout);
-        (rows, self.columns.source_width, self.columns.text_width)
-    }
-
-    /// The conditioning of request `index` of `bucket`.
-    ///
-    /// `text` and `source` are two views of **two widths**: a conditioner may widen what the
-    /// denoiser reads, so a step that handed the model one width for both would address the wrong
-    /// columns of one of them.
-    fn conditioning<'a>(
-        &self,
-        bucket: Bucket,
-        index: u32,
-        media: &'a [nn::capability::MediaInput],
-    ) -> Result<Conditioning<'a>> {
-        let layout = layout_of(bucket)?;
-        let (rows, source_width, text_width) = self.conditioning_row(&layout);
-        let view = self.columns.text.shaped(&[rows * text_width]);
-        let text = view
-            .at(view.offset_elements(u64::from(index) * rows * text_width))
-            .reshape(Shape::new(&[rows, text_width]));
-        let features = self.columns.source.shaped(&[rows * source_width]);
-        let source = features
-            .at(features.offset_elements(u64::from(index) * rows * source_width))
-            .reshape(Shape::new(&[rows, source_width]));
-        Ok(Conditioning {
-            text,
-            source: Some(source),
-            media,
-            images: None,
-            audio: None,
-        })
-    }
-
-    /// Copies each pending row's conditioning from the store into its row of the columns.
-    ///
-    /// **Device to device, on the runner's stream, after `upload()`**: the store holds views of
-    /// regions other calls wrote, so a host round-trip would move a request's conditioning rows out
-    /// of the device and back on every step. Issued on one stream, the copy is ordered after
-    /// `upload()`'s writes and after whatever the producer issued, so the row the graph reads is the
-    /// row the store holds.
-    ///
-    /// A view shorter than the row it must fill is refused by name: a short copy would leave the
-    /// tail of the row holding the previous request's values, which is worse than a refusal because
-    /// the graph runs either way.
-    fn seed(&mut self, bucket: Bucket) -> Result<()> {
-        // A replay always follows the `submit` that produced it, and that submit is what names the
-        // rows: an empty set means the batch was served already, or a job outlived its submit. The
-        // graph would then read the host columns - which are a warm capture's zeros - so this is
-        // refused rather than served, because a request whose conditioning is zeros produces a
-        // plausible clip and no error.
-        if self.pending.is_empty() {
-            return Err(Error::Invariant(format!(
-                "a replay of bucket {bucket} names no staged row: its batch was served already, or the job \
-                 outlived the submit that produced it, and the columns hold a warm capture's zeros \
-                 rather than a request's conditioning"
-            )));
-        }
-        // The encoder's rows stay in `source` for the request's life, and only the step that opens
-        // the request on this runner folds them: a later step's copy would write bytes no launch
-        // reads.
-        if !self.opens() {
-            return Ok(());
-        }
-        self.zero_rows(bucket)?;
-        let Some(products) = self.products.clone() else {
-            return Ok(());
-        };
-        // The rows and the stream are copied out before the columns are borrowed mutably: the
-        // padding below writes a column's host side, which is the memory its graph reads.
-        let pending = self.pending.clone();
-        let stream = self.stream.clone();
-        let layout = layout_of(bucket)?;
-        let (rows, source_width, text_width) = self.conditioning_row(&layout);
-        let element = ops::abi::bytes(self.shape.stack).ok_or_else(|| {
-            Error::Invalid(format!(
-                "{} has no whole-byte size",
-                ops::abi::name(self.shape.stack)
-            ))
-        })?;
-        // One row's size per kind: the two columns are two widths, so a single number would make
-        // the shorter kind's copy land inside the wrong column's row (`conditioning_width`).
-        let text_bytes = rows * text_width * element;
-        let source_bytes = rows * source_width * element;
-        // What the conditioner reads of `source` is the text capacity: the rows past it are the
-        // conditions', which the encoders write into `text` and no launch reads here.
-        let folded_bytes = u64::from(layout.text_rows) * source_width * element;
-        // **The encoder's rows go where the model consumes them next.** A conditioner that widens
-        // reads `source` and writes `text` in place, so the product lands in `source` and `text`
-        // belongs to the fold alone - copying it into `text` as well would be a second, mis-strided
-        // copy of the same bytes (`text_width != source_width`, so the rows would not line up). A
-        // model with no conditioner reads the encoder's rows themselves, so they land in `text`.
-        //
-        // The reference settles the direction: its `condition()` takes the encoder's features as the
-        // conditioner's **input** and its `text_condition` is written only by the conditioner's
-        // output, for every task. The two widths are therefore the only statement the interface makes
-        // about whether a conditioner runs (`Denoiser::text_width` answers `None` for no conditioner
-        // and for one that keeps the encoder's width alike), which is why the branch reads them
-        // rather than asking a second question.
-        let folded = text_width != source_width;
-        for row in &pending {
-            let (request, index) = (row.request, row.index);
-            let kind = Product::Text;
-            // `stride` is the row of the column and `bytes` what this copy fills of it.
-            let (column, stride, bytes) = if folded {
-                (&mut self.columns.source, source_bytes, folded_bytes)
-            } else {
-                (&mut self.columns.text, text_bytes, text_bytes)
-            };
-            {
-                // **The copy is the store's, not this runner's.** A deployment can put the text
-                // phase on its own GPU, so the product may be on another device or another stream,
-                // and only the store holds both ends: it waits on the producer's write before this
-                // stream copies. A runner issuing its own `memcpy_async` from another device's
-                // region would be reading bytes no ordering protects.
-                let Some(published) = products.product(request, kind)? else {
-                    return Err(products::absent(request, kind));
-                };
-                let (copied, zeroed) = fills(request, kind, published.bytes, bytes)?;
-                let destination = Operand::new(
-                    ops::DevicePtr::new(column.host.address() + u64::from(index) * stride),
-                    self.shape.stack,
-                    Shape::new(&[copied / element]),
-                );
-                if !products.copy_into(request, kind, &destination, &stream)? {
-                    return Err(products::absent(request, kind));
-                }
-                // The rest of the row is the packing's zero row. A layout's prefix is the
-                // **deployment's capacity** (`DensePacking::text_rows` - "a layout holds every
-                // prompt that fits it") while the encoder publishes the request's own rows, so the
-                // tail is the padding the packing names and its value is zeros
-                // (`DensePacking::zero_row`). It is written here, on the host side of the column,
-                // because that is the memory the captured graph reads: a column's device view is
-                // its pinned buffer's address (`columns.rs`), so these bytes are the graph's.
-                if zeroed > 0 {
-                    let start = usize::try_from(u64::from(index) * stride + copied)
-                        .map_err(|_| Error::Invalid("a row is larger than memory".into()))?;
-                    let end = usize::try_from(u64::from(index) * stride + bytes)
-                        .map_err(|_| Error::Invalid("a row is larger than memory".into()))?;
-                    // SAFETY: `start..end` is inside this column's row `index`, which the column
-                    // was sized for, and no copy or launch writes it concurrently: the front copy
-                    // is issued on the stream before the launch and covers `..start` alone.
-                    unsafe {
-                        column.host.as_mut_slice()[start..end].fill(0);
-                    }
-                }
-            }
-        }
-        Ok(())
-    }
-
-    /// Writes the zero row of each pending request's prefix source.
-    ///
-    /// Every generated and padding row gathers it ([`nn::capability::PrefixSource::zero_row`]), and
-    /// it follows the layout's text and condition rows, so it sits at another place in the column
-    /// for each condition rung: a request of a higher rung wrote a condition row where a lower rung
-    /// reads its zeros. The rest of a request's `text` is the refiner's and the encoders' to write,
-    /// and no gather reads a row they left.
-    fn zero_rows(&mut self, bucket: Bucket) -> Result<()> {
-        let layout = layout_of(bucket)?;
-        let (rows, _, text_width) = self.conditioning_row(&layout);
-        let element = ops::abi::bytes(self.shape.stack).ok_or_else(|| {
-            Error::Invalid(format!(
-                "{} has no whole-byte size",
-                ops::abi::name(self.shape.stack)
-            ))
-        })?;
-        let stride = rows * text_width * element;
-        let row = text_width * element;
-        let zero = u64::from(nn::capability::PrefixSource::of(&layout).zero_row()) * row;
-        for pending in &self.pending {
-            let start = usize::try_from(u64::from(pending.index) * stride + zero)
-                .map_err(|_| Error::Invalid("a row is larger than memory".into()))?;
-            let end = start + row as usize;
-            // SAFETY: the row lies inside this request's block of the column, and `settle_opening`
-            // waited out the launches of the previous request, which are the column's only readers.
-            unsafe {
-                self.columns.text.host.as_mut_slice()[start..end].fill(0);
-            }
-        }
-        Ok(())
-    }
-
-    /// Issues each pending row's first step: the model's own draw, its conditioner and its fold, on
-    /// the replay's arena and stream, before the captured graph launches.
-    ///
-    /// A trajectory's value at step zero is not a step: it is `Denoiser::draw_noise` (Philox
-    /// addressed by the request's seed and the element's index, section 9) followed by
-    /// `Denoiser::prepare_latents` (the schedule's start over that draw), and both take a
-    /// `Forward` because their operators reserve scratch in an arena. `Denoiser::prepare_conditioning`
-    /// runs between them: the encoder's rows are raw until it refines them, and the fold reads
-    /// `cond.text`, so refining after the fold would start the schedule from unrefined rows.
-    ///
-    /// **None of the three is in the captured graph.** Each runs once per request, and a graph
-    /// replays once per step; `prepare_conditioning` writes `text` in place, so a refinement inside
-    /// the graph would compound over the schedule.
-    ///
-    /// The replay's arena is the one its captured graph addresses: `Pool::base` is the stream's
-    /// range and `Pool::begin` answers only whether a bucket is planning or replaying, so the same
-    /// range serves a replay. That is what makes the draw affordable here - its reservations are
-    /// the walk's own, and the graph's nodes address their recorded offsets above a column the draw
-    /// writes rather than above scratch it overwrites. A later step needs none of this: its
-    /// trajectory is the column the previous replay advanced in place.
-    ///
-    /// **This runs for the step that opens a request on this runner**, which is step zero for a
-    /// request that starts here and the stored step for one a latent preparation restored. A
-    /// restored request's columns already hold its trajectory at that step, so it draws no noise
-    /// and starts no schedule; its conditioner and its condition draws are computed again from the
-    /// request, which is all they depend on.
-    fn first_step(&mut self, bucket: Bucket, generation: u64) -> Result<()> {
-        if !self.opens() {
-            return Ok(());
-        }
-        let request = self.pending[0].request;
-        let restored = match self.restored {
-            Some((stored, steps)) if stored == request => Some(steps),
-            _ => None,
-        };
-        let stands = restored.unwrap_or(0);
-        if self.staged_step.map(|step| step.index) != Some(stands) {
-            return Err(Error::Invalid(format!(
-                "request {request:?} opens on this denoiser at step {:?} and its trajectory here \
-                 stands at step {stands}: a request that continues past its first step on another \
-                 runner has nothing to continue from unless its latent preparation restored it",
-                self.staged_step.map(|step| step.index)
-            )));
-        }
-        let kernels = self.lifecycle.generation_named(generation)?;
-        let stream = self.stream.clone();
-        let arena = self.lifecycle.arena()?;
-        let group = self.group.clone();
-        let staging = self.lifecycle.staging.slot()?;
-        let forward = grouped(
-            nn::Forward::new(&stream, &kernels, &arena).with_staging(staging),
-            group.as_deref(),
-        )?;
-        for row in &self.pending {
-            let pieces = self
-                .model
-                .condition_pieces(&row.stated.view())
-                .map_err(Error::from)?;
-            let (pixels, samples) = self.regions(row, &pieces)?;
-            let opening = Opening {
-                index: row.index,
-                seed: row.seed,
-                stated: &row.stated,
-                pieces: &pieces,
-                pixels,
-                samples,
-                restored: restored.is_some(),
-            };
-            self.open(&forward, bucket, &opening)?;
-        }
-        self.lifecycle.staging.release(&stream)?;
-        self.opened = Some((request, bucket));
-        self.restored = None;
-        Ok(())
-    }
-
-    /// Whether the pending request's step opens it on this runner: the step whose host work folds
-    /// its conditioning before the graph runs.
-    fn opens(&self) -> bool {
-        match self.pending.as_slice() {
-            [row] => self
-                .opened
-                .is_none_or(|(request, _)| request != row.request),
-            _ => false,
-        }
-    }
-
-    /// Notes the latent preparations of `batch`: each opens a trajectory of the denoising bucket
-    /// whose layout the request's shape selected, and a resumed request's opens at the stored
-    /// trajectory the engine pinned.
-    fn submit_preparation(
-        &mut self,
-        batch: &Batch,
-        media: &ipc::execution::MediaColumns,
-    ) -> Result<Jobs> {
-        let computation = media.computation;
-        let bucket = self
-            .buckets
-            .iter()
-            .map(|plan| plan.bucket)
-            .find(|bucket| bucket.extent == computation.extent)
-            .ok_or_else(|| {
-                Error::Invalid(format!(
-                    "a latent preparation names a layout no denoising bucket of this runner holds \
-                     ({:?})",
-                    computation.extent
-                ))
-            })?;
-        if media.inputs.len() != batch.calls.len() {
-            return Err(Error::Invalid(format!(
-                "a latent preparation batch of {} call(s) carries {} row(s) of staged inputs",
-                batch.calls.len(),
-                media.inputs.len()
-            )));
-        }
-        self.preparations.clear();
-        for (index, call) in batch.calls.iter().enumerate() {
-            let stated = media.request(index)?;
-            let restore = batch
-                .latent_restores
-                .iter()
-                .find(|(request, _)| *request == stated.request)
-                .map(|(_, restore)| restore.clone());
-            self.preparations.push(Preparation {
-                call: *call,
-                request: stated.request,
-                bucket,
-                restore,
-            });
-        }
-        Ok(Jobs::new(batch.calls.iter().map(|call| Job::Prepare {
-            runner: self.id,
-            call: *call,
-        })))
-    }
-
-    /// Performs the latent preparation of `call`: a new trajectory begins on this runner, its page
-    /// layout is stated for the engine, and a resumed request's stored pages are copied into it.
-    ///
-    /// Whatever request the columns held is finished or was preempted and stored, because the
-    /// scheduler holds the denoiser for one request at a time.
-    fn prepare(&mut self, call: CallId) -> Result<BatchOutput> {
-        let index = self
-            .preparations
-            .iter()
-            .position(|preparation| preparation.call == call)
-            .ok_or_else(|| {
-                Error::Invariant(format!(
-                    "a preparation job names call {}, which the batch submitted last did not \
-                     prepare",
-                    call.0
-                ))
-            })?;
-        let preparation = self.preparations.remove(index);
-        let layout = trajectory_layout(&layout_of(preparation.bucket)?, self.shape.sample)?;
-        self.opened = None;
-        self.restored = None;
-        let step = match &preparation.restore {
-            Some(restore) => {
-                self.restore(preparation.bucket, &layout, restore)?;
-                self.restored = Some((preparation.request, restore.steps));
-                tracing::info!(
-                    request = ?preparation.request,
-                    steps = restore.steps,
-                    "restored a stored trajectory into the denoiser"
-                );
-                restore.steps
-            }
-            None => 0,
-        };
-        let mut output = CallOutput::completed(
-            call,
-            Vec::new(),
-            RowState {
-                step_index: step,
-                ..RowState::default()
-            },
-        );
-        if self.reports_layout && self.host_pool.is_some() {
-            output.latent_layouts.push(ipc::RankLatentLayout {
-                rank: self.pool_rank,
-                layout: serde_json::to_string(&layout).map_err(|error| {
-                    Error::Invalid(format!(
-                        "a trajectory's page layout does not serialize: {error}"
-                    ))
-                })?,
-            });
-        }
-        Ok(BatchOutput {
-            calls: vec![output],
-            ..BatchOutput::default()
-        })
-    }
-
-    /// Copies the stored pages `restore` names into the trajectory of `bucket`, laid out in this
-    /// runner's columns as `layout` states: the copy manifest from the stored ranks' pages this
-    /// rank reads to the rank's own (`crate::memory::latent::restore`), which copies a page laid out
-    /// alike whole. The copies have completed when this returns, before the engine releases the
-    /// pages it pinned.
-    fn restore(
-        &self,
-        bucket: Bucket,
-        layout: &StorageLayout,
-        restore: &ipc::LatentRestore,
-    ) -> Result<()> {
-        let pool = self.host_pool.as_ref().ok_or_else(|| {
-            Error::Invalid(
-                "a latent preparation restores a stored trajectory on a device that maps no host \
-                 latent pool"
-                    .into(),
-            )
-        })?;
-        let sources: Vec<&ipc::LatentSource> = restore
-            .sources
-            .iter()
-            .filter(|source| source.readers.contains(&self.pool_rank))
-            .collect();
-        if sources.is_empty() {
-            return Err(Error::Invalid(format!(
-                "a latent restore names no stored pages rank {} reads",
-                self.pool_rank
-            )));
-        }
-        let stored = sources
-            .iter()
-            .map(|source| {
-                Ok(restore::Stored {
-                    layout: serde_json::from_str(&source.layout).map_err(|error| {
-                        Error::Invalid(format!("a stored trajectory's page layout: {error}"))
-                    })?,
-                    page_bytes: source.pool.page_bytes,
-                })
-            })
-            .collect::<Result<Vec<_>>>()?;
-        let target = restore::Stored {
-            layout: layout.clone(),
-            page_bytes: pool.page_bytes(),
-        };
-        let gpu = self.device.uuid()?.0;
-        let copies = restore::copies(&stored, &target, restore.content, gpu)?;
-        let regions = trajectory_regions(&self.latents(bucket, 0)?)?;
-        let total: u64 = regions.iter().map(|(_, bytes)| bytes).sum();
-        for copy in &copies {
-            // A page laid out alike is copied whole, and the trajectory's last page holds fewer
-            // bytes than a page: what lies past the trajectory is no value of it, and the columns
-            // end there for the largest layout.
-            if copy.target >= total {
-                continue;
-            }
-            let length = copy.bytes.min(total - copy.target);
-            let source = sources[copy.source];
-            let slot = *source.slots.get(copy.page as usize).ok_or_else(|| {
-                Error::Invalid(format!(
-                    "a latent restore copies stored page {} of a source of {} pages",
-                    copy.page,
-                    source.slots.len()
-                ))
-            })?;
-            let page = pool.source(&source.pool, slot)?;
-            let from = page.address() + copy.offset;
-            for (address, offset, bytes) in pieces(&regions, copy.target, length)? {
-                // SAFETY: the stored page stays pinned until this call's result, and the copies
-                // complete before this returns; the destination lies in this runner's column, which
-                // no graph reads while the denoiser serves this preparation.
-                unsafe {
-                    platform::memcpy_async(address, from + offset, bytes as usize, &self.stream)
-                }?;
-            }
-        }
-        self.stream.synchronize()?;
-        Ok(())
-    }
-
-    /// The condition media regions `row`'s pieces read, as the media reader published them: the
-    /// pixels and the soundtrack samples of every condition, each kind in one region.
-    fn regions(
-        &self,
-        row: &Pending,
-        pieces: &[nn::capability::ConditionPiece],
-    ) -> Result<(Option<Operand>, Option<Operand>)> {
-        if pieces.is_empty() {
-            return Ok((None, None));
-        }
-        let products = self
-            .products
-            .as_ref()
-            .ok_or_else(|| products::no_store(row.request))?;
-        let region = |kind: Product, wanted: bool| -> Result<Option<Operand>> {
-            if !wanted {
-                return Ok(None);
-            }
-            products
-                .ordered(row.request, kind, &self.stream)?
-                .map(Some)
-                .ok_or_else(|| products::absent(row.request, kind))
-        };
-        let pixels = region(
-            Product::ConditionPixels,
-            pieces.iter().any(|piece| piece.pixels.is_some()),
-        )?;
-        let samples = region(
-            Product::ConditionSamples,
-            pieces.iter().any(|piece| piece.track.is_some()),
-        )?;
-        Ok((pixels, samples))
-    }
-
-    /// The raw media of a request's conditions, in the order the model packs them, with each
-    /// visual piece's anchoring draw reserved in `forward`'s arena and drawn there.
-    ///
-    /// The media reader left each kind in one region, conditions in request order, so a piece's
-    /// place in its region is the sum of the extents of the conditions before it. Those extents are
-    /// the model's statement ([`nn::capability::ConditionPiece`]), and the two regions are read in
-    /// place: a condition is read once, by this forward.
-    fn media(
-        &self,
-        forward: &nn::Forward<'_>,
-        opening: &Opening<'_>,
-    ) -> Result<Vec<nn::capability::MediaInput>> {
-        let pieces = opening.pieces;
-        if pieces.is_empty() {
-            return Ok(Vec::new());
-        }
-        let mut offsets = vec![(0_u64, 0_u64); opening.stated.conditions.len()];
-        let mut ordered: Vec<&nn::capability::ConditionPiece> = pieces.iter().collect();
-        ordered.sort_by_key(|piece| piece.condition);
-        let (mut pixel_at, mut sample_at) = (0_u64, 0_u64);
-        for piece in ordered {
-            offsets[piece.condition as usize] = (pixel_at, sample_at);
-            pixel_at += piece.pixels.as_ref().map_or(0, |shape| elements(shape));
-            sample_at += piece.track.as_ref().map_or(0, |shape| elements(shape));
-        }
-        let view = |source: Option<Operand>, at: u64, shape: &[u64]| -> Result<Operand> {
-            let source = source.ok_or_else(|| {
-                Error::Invalid(
-                    "a request states a condition piece the media reader left no region for".into(),
-                )
-            })?;
-            Ok(source
-                .at(source.offset_elements(at))
-                .reshape(Shape::new(shape)))
-        };
-        let mut media = Vec::with_capacity(pieces.len());
-        for piece in pieces {
-            let (pixel_at, sample_at) = offsets[piece.condition as usize];
-            let noise = match piece.draw {
-                Some(draw) => {
-                    let view = forward.empty(self.shape.sample, latent_shape(&draw))?;
-                    self.model
-                        .draw_condition_noise(forward, opening.seed, piece, view)
-                        .map_err(Error::from)?;
-                    Some(view)
-                }
-                None => None,
-            };
-            media.push(nn::capability::MediaInput {
-                role: piece.role,
-                rows: piece.rows,
-                audio_rows: piece.audio_rows,
-                pixels: piece
-                    .pixels
-                    .as_ref()
-                    .map(|shape| view(opening.pixels, pixel_at, shape))
-                    .transpose()?,
-                audio: piece
-                    .track
-                    .as_ref()
-                    .map(|shape| view(opening.samples, sample_at, shape))
-                    .transpose()?,
-                noise,
-            });
-        }
-        Ok(media)
-    }
-
-    /// Opens one request on this runner, eagerly on `forward`: its condition draws, its noise, its
-    /// conditioner (the conditioning encode of its condition media included) and its schedule's
-    /// start, in that order (see [`Self::first_step`]).
-    ///
-    /// The replay that opens a request and the recorded walk both run this, so the forwards a
-    /// request's opening launches are the ones the walk records.
-    fn open(&self, forward: &nn::Forward<'_>, bucket: Bucket, opening: &Opening<'_>) -> Result<()> {
-        let layout = layout_of(bucket)?;
-        let latents = self.latents(bucket, opening.index)?;
-        // The raw media a conditioner encodes, each visual piece with its anchoring draw: the
-        // request's first step is the one forward that reads them.
-        let media = self.media(forward, opening)?;
-        let cond = self.conditioning(bucket, opening.index, &media)?;
-        // The stream's first elements are the conditions' draws, so the trajectory's offsets
-        // are the request's own and not the warm request's the bucket was captured from.
-        let drawn = Layout {
-            condition_elements: self
-                .model
-                .layout(&opening.stated.view())?
-                .condition_elements,
-            ..layout
-        };
-        if !opening.restored {
-            self.model
-                .draw_noise(forward, opening.seed, drawn, latents)?;
-        }
-        // **The conditioner, eager and once per request, outside the graph.** `text` holds the
-        // encoder's rows as `seed` copied them; this folds `source` into it in place, so every
-        // replay of the bucket reads rows refined for its own request. It is not a graph node
-        // because a graph replays once per *step* while this runs once per *request* - a
-        // refinement inside the captured graph would compound over the schedule, and `text` is
-        // written in place.
-        self.model
-            .prepare_conditioning(forward, &opening.stated.view(), cond)?;
-        if !opening.restored {
-            self.model.prepare_latents(forward, cond, latents)?;
-        }
-        Ok(())
-    }
-
-    /// Opens `bucket`'s warm request and every condition set a request of it may open with, and
-    /// walks the step its graph captures, on recording forwards of `walk` ([`Runner::record_walk`]).
-    ///
-    /// Each opening and the step start at the stream region's first address, as the replay's eager
-    /// opening and the captured graph do. A condition set ([`WarmRequest::openings`]) is opened as
-    /// a served request presenting it is ([`opened`]), so the conditioning encode of its media is
-    /// walked with the opening.
-    fn walk_recorded(&self, walk: &Walk, bucket: Bucket) -> Result<()> {
-        let warm = &self.plan_of(bucket)?.warm;
-        let group = self.group.as_deref();
-        self.walk_opening(walk, bucket, warm)?;
-        for conditions in &warm.openings {
-            walk.reset();
-            let stated = opened(warm, conditions.clone(), warm.text_tokens, Vec::new());
-            self.walk_opening(walk, bucket, &stated)?;
-        }
-        walk.reset();
-        let step = self
-            .schedule(bucket)?
-            .first()
-            .copied()
-            .ok_or_else(|| self.no_step(bucket))?;
-        self.step(&walk.forward(group)?, bucket, step, &warm.view())
-    }
-
-    /// Opens `stated` in `bucket` on a recording forward of `walk`, through the opening a replay
-    /// runs ([`Self::open`]): its condition media regions are placeholders of the extents the
-    /// request's own pieces would have.
-    fn walk_opening(&self, walk: &Walk, bucket: Bucket, stated: &WarmRequest) -> Result<()> {
-        let pieces = self
-            .model
-            .condition_pieces(&stated.view())
-            .map_err(Error::from)?;
-        // The media reader's regions hold every condition's pixels, then every condition's samples,
-        // in its own element type.
-        let region = |extents: Vec<u64>| -> Result<Option<Operand>> {
-            match extents.iter().sum::<u64>() {
-                0 => Ok(None),
-                total => walk
-                    .placeholder(products::CONDITION_MEDIA, Shape::new(&[total]))
-                    .map(Some),
-            }
-        };
-        let pixels = region(
-            pieces
-                .iter()
-                .filter_map(|piece| piece.pixels.as_ref().map(|shape| elements(shape)))
-                .collect(),
-        )?;
-        let samples = region(
-            pieces
-                .iter()
-                .filter_map(|piece| piece.track.as_ref().map(|shape| elements(shape)))
-                .collect(),
-        )?;
-        let opening = Opening {
-            index: 0,
-            seed: nn::capability::Seed(0),
-            stated,
-            pieces: &pieces,
-            pixels,
-            samples,
-            restored: false,
-        };
-        self.open(&walk.forward(self.group.as_deref())?, bucket, &opening)
-    }
-
-    /// Publishes each pending row's trajectory as this runner's columns hold it.
-    ///
-    /// **No copy**: the captured graph updates the latents in place, so the column *is* the
-    /// trajectory and what the store records is a view of it. That is the handoff to a decode, and
-    /// it is why the store's `VideoLatents` is a name for memory rather than a second buffer.
-    ///
-    /// **The same lifetime rule as the encoder's text states**: a second batch's step zero gives its
-    /// own request the same row of this column (`prepare_latents` writes it), so a second media batch
-    /// on this runner before the first request's trajectory is forgotten replaces the bytes the first
-    /// request's product still names - silently, because the view is a name and not a copy. One
-    /// in-flight batch per runner, and the rule is execution's to keep (an encode and a denoise are
-    /// the same shape: a captured graph addresses one output region per row).
-    fn publish(&self, bucket: Bucket) -> Result<()> {
-        let Some(products) = self.products.as_ref() else {
-            return Ok(());
-        };
-        for row in &self.pending {
-            let request = row.request;
-            let latents = self.latents(bucket, row.index)?;
-            let written = products::written_on(&self.stream)?;
-            products.publish(
-                request,
-                Product::VideoLatents,
-                self.device,
-                self.lifecycle.stream_id(),
-                Some(written),
-                &latents.video,
-            )?;
-            if let Some(audio) = latents.audio {
-                let written = products::written_on(&self.stream)?;
-                products.publish(
-                    request,
-                    Product::AudioLatents,
-                    self.device,
-                    self.lifecycle.stream_id(),
-                    Some(written),
-                    &audio,
-                )?;
-            }
-        }
-        Ok(())
-    }
-
-    /// Refuses a step whose request has no store, or whose store lacks one of the kinds it reads.
-    ///
-    /// The kinds are [`STEP_PRODUCTS`], and they are what this file places into a `Conditioning`.
-    /// A store that answers `None` for one of them is refused by name - which is the difference
-    /// between a step that fails because nobody ran the encoder and one that runs on zeros.
-    fn require_products(&self, request: ipc::RequestKey, bucket: Bucket) -> Result<()> {
-        let Some(products) = self.products.as_ref() else {
-            return Err(products::no_store(request));
-        };
-        let kinds = step_products(&layout_of(bucket)?);
-        match missing_product(products.as_ref(), request, kinds)? {
-            Some(kind) => Err(products::absent(request, kind)),
-            None => Ok(()),
-        }
-    }
-
-    /// Records the step a walk or a replay evaluates: its forward computes the step's coefficients
-    /// from it.
-    fn stage_step(&mut self, step: &Step) {
-        self.staged_step = Some(*step);
-    }
-
-    /// The refusal for a bucket whose request the model states no schedule for.
-    ///
-    /// It names the chain a reader needs - the bucket, the request the bucket's schedule was asked
-    /// for, and the fact that the answer had no step - because the model's own refusal names the
-    /// request and this one is reached through the bucket.
-    fn no_step(&self, bucket: Bucket) -> Error {
-        let request = self
-            .plan_of(bucket)
-            .map(|plan| {
-                let warm = &plan.warm;
-                format!(
-                    "{}x{} of {} frames with {} anchor(s) and {} reference(s)",
-                    warm.width,
-                    warm.height,
-                    warm.frames,
-                    warm.first_frames + warm.last_frames,
-                    warm.references
-                )
-            })
-            .unwrap_or_else(|_| "no request".to_owned());
-        Error::Invalid(format!(
-            "the schedule of bucket {bucket} states no step to capture; the bucket asked for the \
-             schedule of a request of {request}"
-        ))
-    }
-
-    /// Stages a bucket with no batch behind it, so a first capture has defined columns to read.
-    fn stage_warm(&mut self, bucket: Bucket) -> Result<()> {
-        let layout = layout_of(bucket)?;
-        self.columns.warm(&layout, self.shape, bucket.rows)?;
-        let step = self
-            .schedule(bucket)?
-            .first()
-            .copied()
-            .ok_or_else(|| self.no_step(bucket))?;
-        self.stage_step(&step);
-        Ok(())
-    }
-
-    /// Copies the staged host sides to the device, **every column**, for a walk.
-    ///
-    /// A capture has no trajectory and must still read defined values, so it stages zeros into the
-    /// latent columns and uploads them here. A replay does not: see [`Self::upload_step`].
-    fn upload(&mut self) -> Result<()> {
-        let stream = self.stream.clone();
-        // The host side and the device column are two fields of one value, so the copy borrows
-        // them apart rather than cloning a buffer the graph is about to read anyway.
-        let DenoiseColumns {
-            video,
-            audio,
-            staged,
-            ..
-        } = &mut self.columns;
-        video.write(&staged.video)?;
-        audio.write(&staged.audio)?;
-        self.columns.video.upload(&stream)?;
-        self.columns.audio.upload(&stream)?;
-        Ok(())
-    }
-
-    /// Waits out the previous request's launches before a first step writes the conditioning
-    /// columns from the host ([`Self::seed`], [`Self::zero_rows`]).
-    ///
-    /// The refined rows are the request's for its whole schedule: `first_step` folds them once, and
-    /// every later step reads them where they are, so only a step that opens a request writes them.
-    /// **The trajectory is not written here**: the captured graph advances the latents in place,
-    /// and the draw at the opening writes the whole block itself.
-    fn settle_opening(&self) -> Result<()> {
-        if self.opens() {
-            self.stream.synchronize()?;
-        }
-        Ok(())
-    }
-
-    /// Fills the model's writable constants once per load and ahead of every capture
-    /// ([`Denoiser::initialize`]): values folded from the weights, such as an AdaLN cache, which
-    /// every step reads. Left unwritten they are zeros, so the stack's gates close and it passes its
-    /// input through unchanged, with nothing refusing.
-    fn initialize(&mut self, kernels: &Arc<ops::Generation>) -> Result<()> {
-        if self.initialized {
-            return Ok(());
-        }
-        let stream = self.stream.clone();
-        let arena = self.lifecycle.arena()?;
-        let staging = self.lifecycle.staging.slot()?;
-        self.model
-            .initialize(&nn::Forward::new(&stream, kernels, &arena).with_staging(staging))
-            .map_err(Error::from)?;
-        self.lifecycle.staging.release(&stream)?;
-        self.initialized = true;
-        Ok(())
-    }
-
-    /// One step of `request`, request zero of `bucket`, on `forward`: the model call a capture
-    /// walk, the staging walk before each replay and the recorded walk all make.
-    fn step(
-        &self,
-        forward: &nn::Forward<'_>,
-        bucket: Bucket,
-        step: Step,
-        request: &VideoRequest<'_>,
-    ) -> Result<()> {
-        let media: [nn::capability::MediaInput; 0] = [];
-        let latents = self.latents(bucket, 0)?;
-        let cond = self.conditioning(bucket, 0, &media)?;
-        self.model
-            .forward(forward, step, request, latents, cond)
-            .map_err(Error::from)
-    }
-}
-
-impl<M: Denoiser + Send + Sync + ?Sized> Runner for DenoiserRunner<M> {
-    /// The writable constants are folded from the weights, so they are folded again from the new
-    /// ones. A runner that has not filled them yet does so before its first capture anyway.
-    fn weights_changed(&mut self) -> Result<()> {
-        if !self.initialized {
-            return Ok(());
-        }
-        self.initialized = false;
-        let generation = self.lifecycle.generation.number();
-        let kernels = self.lifecycle.generation_named(generation)?;
-        self.initialize(&kernels)
-    }
-
-    fn phases(&self) -> &[ipc::PhaseId] {
-        &self.phases
-    }
-
-    /// A step's values reach its graph through the staging region, which a replay reuses only once
-    /// the stream consumed the previous one, so the next step can be issued behind it.
-    fn overlaps_replays(&self) -> bool {
-        true
-    }
-
-    fn stream(&self) -> Option<&platform::Stream> {
-        Some(&self.stream)
-    }
-
-    /// Serves one denoising step: choose its bucket, stage its requests, and return the replay (4.5).
-    ///
-    /// The bucket is chosen from the computation the batch states - the layout is the extent - and
-    /// never from how many requests it happens to carry: a graph is captured for one layout, and a
-    /// batch of another canvas must not be served by it.
-    fn lifecycle_mut(&mut self) -> Option<&mut Lifecycle> {
-        Some(&mut self.lifecycle)
-    }
-
-    fn submit(&mut self, batch: Batch) -> Result<Jobs> {
-        let media = batch.media.clone().ok_or_else(|| {
-            Error::Invalid(
-                "a denoiser runner serves a media batch; this one states no computation".into(),
-            )
-        })?;
-        media.check()?;
-        let computation = media.computation;
-        if computation.variant() == Some(Variant::LatentPrepare) {
-            return self.submit_preparation(&batch, &media);
-        }
-        if computation.variant() != Some(Variant::Denoise) {
-            return Err(Error::Invalid(format!(
-                "a denoiser runner serves a denoise or a latent preparation; this batch states a {:?}",
-                computation.call
-            )));
-        }
-        let bucket = self
-            .buckets
-            .iter()
-            .map(|plan| plan.bucket)
-            .find(|bucket| bucket.extent == computation.extent && bucket.rows == computation.rows)
-            .ok_or_else(|| {
-                Error::Invalid(format!(
-                    "no bucket was captured for {} request(s) of this layout; this runner serves \
-                     {} layout(s)",
-                    computation.rows,
-                    self.buckets.len()
-                ))
-            })?;
-        if media.inputs.len() != computation.rows as usize {
-            return Err(Error::Invalid(format!(
-                "a denoise batch of {} request(s) carries {} row(s) of staged inputs",
-                computation.rows,
-                media.inputs.len()
-            )));
-        }
-        let steps = self.schedule(bucket)?;
-        // A batch is one step of its requests, and the replay that follows serves exactly this one:
-        // a row left from an earlier batch would be seeded and published again.
-        self.pending.clear();
-        let mut step = None;
-        for (index, _row) in media.inputs.iter().enumerate() {
-            // The mechanism states the request's parameters: which step this is, and the seed and
-            // canvas it runs at. `StagedRequest` is that record and this is the one reader of it.
-            let stated_request = media.request(index)?;
-            let index = u32::try_from(index)
-                .map_err(|_| Error::Invalid("a batch of more requests than rows".into()))?;
-            // What a step also reads is produced by other calls of the same request - the text
-            // encoder's rows, the trajectory an earlier step advanced - so it is asked for by name
-            // and never derived here.
-            self.require_products(stated_request.request, bucket)?;
-            // A request's first step has no trajectory yet: its values are the model's own draw
-            // and fold, which the replay issues before its graph launches (`first_step`). The seed
-            // travels with the row, because the draw is addressed by it and by the element's index.
-            self.pending.push(Pending {
-                request: stated_request.request,
-                index,
-                seed: nn::capability::Seed(stated_request.seed),
-                stated: Arc::new(self::stated_request(
-                    &self.plan_of(bucket)?.warm,
-                    &stated_request.conditioning,
-                )?),
-            });
-            // Every row of one batch is the same step of the same schedule: a batch is one step
-            // (`Variant::Denoise`), so a row that names another step describes another batch.
-            let stated = steps
-                .get(stated_request.step as usize)
-                .copied()
-                .ok_or_else(|| {
-                    Error::Invalid(format!(
-                        "a request of bucket {bucket} states step {} and the schedule has {}",
-                        stated_request.step,
-                        steps.len()
-                    ))
-                })?;
-            match step {
-                None => step = Some(stated),
-                Some(first) if first.index == stated.index => {}
-                Some(first) => {
-                    return Err(Error::Invalid(format!(
-                        "a batch carries two requests of different steps ({} and {}); a batch is \
-                         one step",
-                        first.index, stated.index
-                    )));
-                }
-            }
-        }
-        let step = step.ok_or_else(|| Error::Invalid("a denoise batch of no request".into()))?;
-        self.stage_step(&step);
-        self.calls.clone_from(&batch.calls);
-        self.steps_completed = step.index + 1;
-        Ok(Jobs::new([Job::Replay {
-            runner: self.id,
-            bucket,
-            generation: batch.generation,
-            batch: batch.id,
-        }]))
-    }
-
-    fn media_plan(&self) -> Vec<Bucket> {
-        // A latent preparation opens a trajectory of a layout this runner steps, so each denoising
-        // bucket has a preparation bucket of the same extent and the request's shape selects both
-        // alike. A preparation captures no graph, so `capture_plan` names the denoising buckets
-        // alone.
-        let steps = self.capture_order();
-        let preparations: Vec<Bucket> = steps
-            .iter()
-            .map(|bucket| Bucket {
-                variant: Variant::LatentPrepare,
-                ..*bucket
-            })
-            .collect();
-        steps.into_iter().chain(preparations).collect()
-    }
-
-    fn capture_plan(&self) -> Vec<Bucket> {
-        self.capture_order()
-    }
-
-    fn cache(&self) -> Option<Arc<Mutex<crate::memory::prefix_cache::PrefixCache>>> {
-        // A denoiser reads no paged cache: its latents are the request's, staged by its own columns.
-        None
-    }
-
-    fn purge(&mut self, generation: u64) {
-        self.lifecycle.purge(generation);
-    }
-
-    fn attach_pools(&mut self, pools: Arc<Mutex<Pools>>) {
-        self.lifecycle.attach_pools(pools);
-    }
-
-    /// The model's initialization once, then for every bucket the opening of its warm request and
-    /// the step its graph captures.
-    fn record_walk(&mut self) -> Result<Footprint> {
-        let mut footprint = Footprint::default();
-        footprint.walk(None, |walk| {
-            self.model
-                .initialize(&walk.forward(None)?)
-                .map_err(Error::from)
-        })?;
-        for bucket in self.capture_order() {
-            footprint.walk(Some(bucket), |walk| self.walk_recorded(walk, bucket))?;
-        }
-        Ok(footprint)
-    }
-
-    fn attach_counters(&mut self, counters: Arc<crate::device::SharedCounters>) {
-        self.counters = Some(counters);
-    }
-
-    fn attach_products(&mut self, products: Arc<dyn Products>) {
-        self.products = Some(products);
-    }
-
-    fn serve(&mut self, job: &Job) -> Result<BatchOutput> {
-        match job {
-            Job::Replay {
-                bucket, generation, ..
-            } => {
-                // What a replay writes from the host is the conditioning rows of a request it opens;
-                // the trajectory is the column's own, advanced in place by the previous step.
-                self.settle_opening()?;
-                self.seed(*bucket)?;
-                // The first step's trajectory is drawn and folded here, on the arena the graph
-                // below addresses, so the graph advances a trajectory rather than a warm capture's
-                // zeros (4.5, section 9).
-                self.first_step(*bucket, *generation)?;
-                let (served, _) = self
-                    .lifecycle
-                    .graphs
-                    .captured_for(*bucket, *generation)
-                    .ok_or_else(|| {
-                        Error::Invariant(format!(
-                            "no graph of bucket {bucket} in generation {generation} or in a \
-                                 generation it replaces"
-                        ))
-                    })?;
-                if served != *generation {
-                    tracing::debug!(
-                        bucket = %bucket,
-                        generation,
-                        served,
-                        "the bucket was prepared for an earlier generation; its programs did not change"
-                    );
-                }
-                let launched = std::time::Instant::now();
-                let (_, captured) = self
-                    .lifecycle
-                    .graphs
-                    .captured_for(*bucket, *generation)
-                    .ok_or_else(|| {
-                        Error::Invariant(format!(
-                            "no graph of bucket {bucket} at generation {generation}"
-                        ))
-                    })?;
-                // The staging walk runs the step the graph was captured from with this request and
-                // this step, so the values the captured copies read are this replay's.
-                let step = self.staged_step.ok_or_else(|| self.no_step(*bucket))?;
-                let stated = Arc::clone(&self.pending[0].stated);
-                let group = self.group.clone();
-                self.lifecycle.replay(captured, |arena, staging| {
-                    let forward = grouped(nn::Forward::staging(arena, staging), group.as_deref())?;
-                    self.step(&forward, *bucket, step, &stated.view())
-                })?;
-                // The graph advanced the trajectory in place; what a decode reads next is this
-                // column, and the store records that view rather than a copy of it.
-                self.publish(*bucket)?;
-                self.pending.clear();
-                if let Some(counters) = &self.counters {
-                    counters.launches(captured.kernel_nodes());
-                }
-                // The step's latents are the columns the graph updated in place, and the mechanism
-                // reads them through its own products: the stream's order is what makes them
-                // readable, and the wait is the worker's on the runner's stream.
-                Ok(BatchOutput {
-                    calls: self
-                        .calls
-                        .drain(..)
-                        .map(|call| {
-                            let state = RowState {
-                                step_index: self.steps_completed,
-                                ..RowState::default()
-                            };
-                            CallOutput::completed(call, Vec::new(), state)
-                        })
-                        .collect(),
-                    timing: TimingCounters {
-                        device_us: launched.elapsed().as_micros() as u64,
-                        ..Default::default()
-                    },
-                    forward_stats: None,
-                })
-            }
-            Job::Capture {
-                bucket, generation, ..
-            } => self
-                .capture(*bucket, *generation)
-                .map(|()| BatchOutput::default()),
-            Job::Rebind {
-                bucket, generation, ..
-            } => self
-                .rebind(*bucket, *generation)
-                .map(|()| BatchOutput::default()),
-            Job::Join { .. } => Err(Error::Invariant(
-                "a denoiser runner joins no expert step".into(),
-            )),
-            Job::Shadow { operator, key, .. } => Err(Error::Invariant(format!(
-                "a denoiser runner compares no operator, and the device asked it to shadow \
-                 {operator} {key}"
-            ))),
-            // A host call is no device work: the media stage performs it, and a device runner
-            // handed one was given a job another runner returned.
-            Job::Host { call, .. } => Err(Error::Invariant(format!(
-                "a runner that serves device work was asked for host call {}",
-                call.0
-            ))),
-            Job::Prepare { call, .. } => self.prepare(*call),
-        }
-    }
-
-    fn offload_latents(&mut self, offloads: &[ipc::LatentOffload]) -> Result<bool> {
-        if offloads.is_empty() {
-            return Ok(false);
-        }
-        let Some(pool) = self.host_pool.clone() else {
-            return Ok(false);
-        };
-        let page_bytes = pool.page_bytes();
-        for offload in offloads {
-            let Some((_, bucket)) = self
-                .opened
-                .filter(|(request, _)| *request == offload.request_key)
-            else {
-                return Err(Error::Invariant(format!(
-                    "the engine asked for the trajectory of {:?} and this denoiser's columns hold \
-                     {:?}'s: the denoiser is held for one request from its preparation to its \
-                     last step, so a preempted request's trajectory is the one it holds",
-                    offload.request_key,
-                    self.opened.map(|(request, _)| request)
-                )));
-            };
-            let regions = trajectory_regions(&self.latents(bucket, 0)?)?;
-            let total: u64 = regions.iter().map(|(_, bytes)| bytes).sum();
-            for copy in &offload.pages {
-                let start = u64::from(copy.page) * page_bytes;
-                if start >= total {
-                    return Err(Error::Invalid(format!(
-                        "latent page {} lies past a trajectory of {total} bytes in pages of \
-                         {page_bytes}",
-                        copy.page
-                    )));
-                }
-                let destination = pool.address(copy)?;
-                for (address, offset, bytes) in
-                    pieces(&regions, start, page_bytes.min(total - start))?
-                {
-                    // SAFETY: the slot is reserved for this rank until the engine commits it after
-                    // this command's output, which waits for the copies below; the columns are
-                    // not written while the denoiser is held for the preempted request.
-                    unsafe {
-                        platform::memcpy_async(
-                            destination + offset,
-                            address,
-                            bytes as usize,
-                            &self.stream,
-                        )
-                    }?;
-                }
-            }
-            tracing::info!(
-                request = ?offload.request_key,
-                pages = offload.pages.len(),
-                "offloading a preempted trajectory to the host latent pool"
-            );
-        }
-        self.stream.synchronize()?;
-        Ok(true)
-    }
-}
-
-/// How a runner's latent columns hold one request's trajectory, as the copy manifest library reads
-/// it: the whole video latent, then the whole audio latent when the layout has a soundtrack, back to
-/// back from the first byte. Every rank of a sequence group holds the whole samples (the velocity is
-/// gathered to every rank before the solver's update), so two ranks or epochs whose layouts agree
-/// lay out every page alike.
-fn trajectory_layout(layout: &Layout, dtype: DType) -> Result<StorageLayout> {
-    let element = ops::abi::bytes(dtype).ok_or_else(|| {
-        Error::Invalid(format!(
-            "{dtype} has no whole-byte size",
-            dtype = ops::abi::name(dtype)
-        ))
-    })?;
+/// How a slot's row holds one request's trajectory, as the copy manifest library reads it: the
+/// whole video latent, then the whole audio latent when the layout has a track, back to back
+/// from the first byte. Every rank of a sequence group holds the whole samples (the velocity is
+/// gathered to every rank before the solver's update), so two ranks or epochs whose layouts
+/// agree lay out every page alike.
+pub fn trajectory_layout(layout: &Layout, dtype: DType) -> Result<StorageLayout> {
+    let element = element_bytes(dtype)?;
     let field = |tensor: &str, shape: &LatentShape, offset: u64| {
-        let dims = [
-            u64::from(shape.channels),
-            u64::from(shape.frames),
-            u64::from(shape.height),
-            u64::from(shape.width),
-        ];
+        let dims = [shape.channels, shape.frames, shape.height, shape.width].map(u64::from);
         let strides = [dims[1] * dims[2] * dims[3], dims[2] * dims[3], dims[3], 1];
         Field {
             tensor: tensor.to_owned(),
@@ -2023,545 +1131,44 @@ fn trajectory_layout(layout: &Layout, dtype: DType) -> Result<StorageLayout> {
             encoding: Encoding::Affine,
         }
     };
-    let video = numel(&layout.video)? * element;
+
+    let video = elements(&layout.video) * element;
     let mut fields = vec![field("video_latents", &layout.video, 0)];
     let mut bytes = video;
     if let Some(audio) = &layout.audio {
         fields.push(field("audio_latents", audio, video));
-        bytes += numel(audio)? * element;
+        bytes += elements(audio) * element;
     }
     Ok(StorageLayout { bytes, fields })
 }
 
-/// The device ranges a trajectory's bytes lie in, in the order [`trajectory_layout`] lays them back
-/// to back: the video latent, then the audio latent.
-fn trajectory_regions(latents: &Latents) -> Result<Vec<(u64, u64)>> {
-    let region = |view: &Operand| -> Result<(u64, u64)> {
-        let bytes = ops::abi::bytes(view.dtype).ok_or_else(|| {
-            Error::Invalid(format!(
-                "{} has no whole-byte size",
-                ops::abi::name(view.dtype)
-            ))
-        })?;
-        Ok((view.ptr.address(), view.shape.numel() * bytes))
+/// `bytes` bytes of a trajectory, whole on the rank that holds them: what each rank's part of a
+/// saved block holds, whatever the group that saved it.
+fn bytes_layout(bytes: u64) -> StorageLayout {
+    let field = Field {
+        tensor: "trajectory".to_owned(),
+        source: String::new(),
+        dtype: ops::abi::name(DType::U8).to_owned(),
+        element: 1,
+        offset: 0,
+        shape: vec![bytes],
+        strides: vec![1],
+        logical: Logical {
+            shape: vec![bytes],
+            dims: vec!["byte".to_owned()],
+            units: vec![0],
+            segments: vec![vec![Segment {
+                span: Span::range(0, bytes),
+                local: 0,
+            }]],
+        },
+        encoding: Encoding::Affine,
     };
-    let mut regions = vec![region(&latents.video)?];
-    if let Some(audio) = &latents.audio {
-        regions.push(region(audio)?);
-    }
-    Ok(regions)
-}
-
-/// The pieces of the byte range `start..start + bytes` of a trajectory laid back to back over
-/// `regions`: each piece's device address, its offset from `start` and its length.
-fn pieces(regions: &[(u64, u64)], start: u64, bytes: u64) -> Result<Vec<(u64, u64, u64)>> {
-    let end = start + bytes;
-    let mut pieces = Vec::new();
-    let mut base = 0;
-    for (address, length) in regions {
-        let (first, last) = (start.max(base), end.min(base + length));
-        if first < last {
-            pieces.push((address + (first - base), first - start, last - first));
-        }
-        base += length;
-    }
-    if base < end {
-        return Err(Error::Invalid(format!(
-            "bytes {start}..{end} lie past a trajectory of {base} bytes"
-        )));
-    }
-    Ok(pieces)
-}
-
-impl<M: Denoiser + Send + Sync + ?Sized> RunnerLifecycle for DenoiserRunner<M> {
-    fn lifecycle(&mut self) -> &mut Lifecycle {
-        &mut self.lifecycle
-    }
-
-    /// Walks one step of `bucket`'s first request, recording every operator launch into the
-    /// generation's capture (4.5).
-    ///
-    /// One request, because the model's step is one request's: `Bucket::denoise` carries the layout
-    /// and this runner walks request zero of it, the rest of the bucket being the same graph over
-    /// another block of the columns.
-    fn walk(&mut self, bucket: Bucket, generation: &Arc<ops::Generation>) -> Result<()> {
-        // The model's writable constants are filled once per load, ahead of the first walk that
-        // reads them; a later walk finds them filled and launches nothing for them.
-        self.initialize(generation)?;
-        let stream = self.stream.clone();
-        self.stage_warm(bucket)?;
-        let first = self
-            .lifecycle
-            .pool()?
-            .begin(self.lifecycle.stream_id(), bucket)?;
-        self.upload()?;
-        let arena = self.lifecycle.arena()?;
-        let group = self.group.clone();
-        let probes = crate::profiling::fences::capturing(&stream);
-        // A capture's uploads are copies from the staging region that every replay reads again;
-        // the warm walk's eager copies are drained before the capture begins (`warmed_capture`).
-        let staging = self.lifecycle.staging.captured(&stream)?;
-        let forward = grouped(
-            nn::Forward::new(&stream, generation, &arena)
-                .with_staging(staging)
-                .with_fence(probes.as_ref().map(|probes| probes as &dyn nn::Fence)),
-            group.as_deref(),
-        )?;
-        let step = self
-            .schedule(bucket)?
-            .first()
-            .copied()
-            .ok_or_else(|| self.no_step(bucket))?;
-        let warm = self.plan_of(bucket)?.warm.clone();
-        self.step(&forward, bucket, step, &warm.view())?;
-        if first {
-            self.lifecycle
-                .pool()?
-                .record(self.lifecycle.stream_id(), bucket, arena.peak())?;
-        }
-        Ok(())
-    }
-}
-
-/// The layout a denoising bucket is captured for.
-fn layout_of(bucket: Bucket) -> Result<Layout> {
-    match bucket.extent {
-        Extent::Latents(layout) => Ok(layout),
-        other => Err(Error::Invalid(format!(
-            "a denoiser runner serves a denoising bucket; Extent {other:?} is not one"
-        ))),
+    StorageLayout {
+        bytes,
+        fields: vec![field],
     }
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// A trajectory's bytes lie back to back over the video and the audio column, so a range that
-    /// straddles the two is two pieces, and a range past the trajectory is refused.
-    #[test]
-    fn a_range_across_the_two_latents_is_two_pieces() {
-        let regions = [(0x1000_u64, 100_u64), (0x9000, 50)];
-        assert_eq!(pieces(&regions, 0, 100).unwrap(), vec![(0x1000, 0, 100)]);
-        assert_eq!(
-            pieces(&regions, 90, 20).unwrap(),
-            vec![(0x1000 + 90, 0, 10), (0x9000, 10, 10)]
-        );
-        assert_eq!(
-            pieces(&regions, 140, 10).unwrap(),
-            vec![(0x9000 + 40, 0, 10)]
-        );
-        assert!(pieces(&regions, 140, 11).is_err());
-    }
-
-    /// A trajectory stored by a rank of the same layout is restored page by page and whole: every
-    /// copy is a whole stored page into the same page of the trajectory, and the pages cover every
-    /// byte the trajectory holds.
-    #[test]
-    fn a_trajectory_of_the_same_layout_restores_whole_pages() {
-        let mut layout = layout(24, 37, 48, 84, 1024);
-        layout.audio = Some(LatentShape {
-            channels: 64,
-            frames: 251,
-            height: 1,
-            width: 1,
-        });
-        let stored = trajectory_layout(&layout, DType::F32).unwrap();
-        stored.validate().unwrap();
-        assert_eq!(stored.bytes, (24 * 37 * 48 * 84 + 64 * 251) * 4);
-        let page = 1 << 20;
-        let copies = restore::copies(
-            &[restore::Stored {
-                layout: stored.clone(),
-                page_bytes: page,
-            }],
-            &restore::Stored {
-                layout: stored.clone(),
-                page_bytes: page,
-            },
-            [7; 32],
-            [1; 16],
-        )
-        .unwrap();
-        assert!(
-            copies.iter().all(|copy| copy.offset == 0
-                && copy.bytes == page
-                && copy.target == copy.page * page),
-            "a page laid out alike is copied whole into its own place: {copies:?}"
-        );
-        let mut targets: Vec<u64> = copies.iter().map(|copy| copy.target).collect();
-        targets.sort_unstable();
-        assert_eq!(
-            targets,
-            (0..stored.bytes.div_ceil(page))
-                .map(|index| index * page)
-                .collect::<Vec<_>>()
-        );
-    }
-
-    /// A layout whose video latent is `channels x frames x height x width`.
-    fn layout(channels: u32, frames: u32, height: u32, width: u32, text_rows: u32) -> Layout {
-        Layout {
-            video: LatentShape {
-                channels,
-                frames,
-                height,
-                width,
-            },
-            audio: None,
-            text_rows,
-            condition_rows: 0,
-            condition_elements: 0,
-        }
-    }
-
-    /// A widening conditioner gets a `text` column wider than its `source` one, by exactly the
-    /// width the model states - and a model that keeps the encoder's width gets one width.
-    ///
-    /// The stop this closes was `out is [19904, 5376], [19904, 5120] expected`. A gather cannot
-    /// change a row's width (`IndexRows::gather` requires `[count, table width]`), so a runner that
-    /// sized both conditioning columns from the encoder's width handed the conditioner a buffer too
-    /// narrow for its own output, and the refusal arrived one operator later than the mistake. Both
-    /// models are asserted, so an implementation that always used one of the two numbers - either one
-    /// - fails here rather than at a gather.
-    #[test]
-    fn a_widening_conditioner_writes_into_a_text_column_of_its_own_width() {
-        // H3's refiner projects the encoder's 5120 columns into the stack's 5376.
-        let widened = DenoiserShape {
-            stack: DType::BF16,
-            sample: DType::F32,
-            width: 5120,
-            text_width: 5376,
-        };
-        assert_eq!(conditioning_width(&widened), (5120, 5376));
-        // A model with no conditioner, or one that keeps the encoder's width.
-        let kept = DenoiserShape {
-            text_width: 5120,
-            ..widened
-        };
-        assert_eq!(conditioning_width(&kept), (5120, 5120));
-    }
-
-    /// A layout survives the bucket that carries it and the reader that unwraps it.
-    ///
-    /// The equality is the seam's own: a runner hands the model the layout its bucket carries, and
-    /// every bucket was built from a layout the model stated, so anything but an identity through
-    /// `Bucket::denoise` and `layout_of` is a transposition the model can never see - it receives
-    /// one layout in place of another and computes correctly over the wrong one.
-    ///
-    /// **A square latent cannot show it**, which is why this case carries paint on four distinct
-    /// numbers: the same reason a decoder's rectangle is only caught by a canvas whose extents
-    /// differ. The transposed layout is asserted different too, so a change that made every layout
-    /// compare equal could not pass this by being vacuous.
-    #[test]
-    fn a_layout_survives_its_bucket_and_back() {
-        let stated = Layout {
-            video: LatentShape {
-                channels: 16,
-                frames: 2,
-                height: 3,
-                width: 5,
-            },
-            audio: Some(LatentShape {
-                channels: 8,
-                frames: 3,
-                height: 2,
-                width: 4,
-            }),
-            text_rows: 7,
-            condition_rows: 2,
-            condition_elements: 6,
-        };
-        let bucket = Bucket::denoise(1, stated);
-        assert_eq!(
-            layout_of(bucket).expect("a denoising bucket names the layout it serves"),
-            stated,
-            "the layout the model stated is the layout the runner hands it back"
-        );
-        let transposed = Layout {
-            video: LatentShape {
-                channels: 16,
-                frames: 2,
-                height: 5,
-                width: 3,
-            },
-            ..stated
-        };
-        assert_ne!(stated, transposed, "the two video extents differ");
-        assert_ne!(
-            layout_of(Bucket::denoise(1, transposed)).expect("a denoising bucket names its layout"),
-            stated,
-            "a transposed canvas is not the canvas that was stated"
-        );
-    }
-
-    #[test]
-    fn a_latent_block_is_its_channels_by_its_extents() {
-        let shape = LatentShape {
-            channels: 16,
-            frames: 2,
-            height: 3,
-            width: 4,
-        };
-        assert_eq!(numel(&shape).unwrap(), 384);
-        assert_eq!(latent_bytes(&shape, DType::F32).unwrap(), 384 * 4);
-        assert_eq!(latent_bytes(&shape, DType::BF16).unwrap(), 384 * 2);
-    }
-
-    #[test]
-    fn a_bucket_that_is_not_a_denoise_states_what_it_is() {
-        let error = layout_of(Bucket::prefill(1, 16, Variant::Encode)).unwrap_err();
-        assert!(format!("{error}").contains("serves a denoising bucket"));
-    }
-}
-
-#[cfg(test)]
-mod product_tests {
-    use super::*;
-    use crate::arena::StreamId;
-
-    /// A product store that answers for exactly the kinds it was given.
-    ///
-    /// It records nothing about how a caller asks: whether a kind is present is the store's
-    /// answer, and how many questions a step put to it is not a fact about the deployment.
-    struct Store {
-        held: Vec<Product>,
-    }
-
-    impl Products for Store {
-        fn publish(
-            &self,
-            _request: ipc::RequestKey,
-            _kind: Product,
-            _device: platform::DeviceId,
-            _stream: StreamId,
-            _written: Option<Arc<platform::Event>>,
-            _view: &Operand,
-        ) -> Result<()> {
-            // The presence rule reads the store; who published what is `Store::held`'s own setup.
-            Ok(())
-        }
-
-        fn holds(&self, _request: ipc::RequestKey, kind: Product) -> bool {
-            self.held.contains(&kind)
-        }
-
-        fn await_published(
-            &self,
-            request: ipc::RequestKey,
-            kind: Product,
-            _timeout: std::time::Duration,
-        ) -> bool {
-            self.holds(request, kind)
-        }
-
-        fn product(
-            &self,
-            _request: ipc::RequestKey,
-            _kind: Product,
-        ) -> Result<Option<products::Published>> {
-            unreachable!("the presence rule reads existence, not a device and stream")
-        }
-
-        fn copy_into(
-            &self,
-            _request: ipc::RequestKey,
-            _kind: Product,
-            _destination: &Operand,
-            _stream: &platform::Stream,
-        ) -> Result<bool> {
-            unreachable!("the presence rule never copies")
-        }
-
-        fn forget(&self, _request: ipc::RequestKey) -> usize {
-            unreachable!("the presence rule never ends a request")
-        }
-
-        fn borrow(
-            &self,
-            _request: ipc::RequestKey,
-            kind: Product,
-            _device: platform::DeviceId,
-            _stream: StreamId,
-        ) -> Result<Option<Operand>> {
-            Ok(self
-                .held
-                .contains(&kind)
-                .then(|| Operand::new(ops::DevicePtr::new(0), DType::BF16, Shape::new(&[1, 1]))))
-        }
-    }
-
-    fn request() -> ipc::RequestKey {
-        ipc::RequestKey::new(1, ipc::RequestId(41), 0)
-    }
-
-    /// The capacity rule a served request depends on: the layout's conditioning block is the
-    /// **deployment's** capacity, the product holds the request's own rows, and the difference is
-    /// the packing's zero row.
-    ///
-    /// Both directions matter. A short product is padded rather than refused - refusing it is every
-    /// request, because a prompt is shorter than the prefix capacity a deployment plans for. A long
-    /// one is refused by name: it is not padding but a plan disagreement, and truncating it would
-    /// drop states the denoiser was told are there.
-    #[test]
-    fn a_short_product_fills_the_rows_front_and_a_long_one_is_refused() {
-        let (copied, zeroed) = fills(request(), Product::Text, 300, 512).expect("a short product");
-        assert_eq!((copied, zeroed), (300, 212));
-
-        let exact = fills(request(), Product::Text, 512, 512).expect("an exact product");
-        assert_eq!(exact, (512, 0));
-
-        let refusal = fills(request(), Product::Text, 640, 512)
-            .expect_err("a product longer than the block")
-            .to_string();
-        assert!(
-            refusal.contains("640"),
-            "the refusal names what it got: {refusal}"
-        );
-        assert!(
-            refusal.contains("512"),
-            "and what the block holds: {refusal}"
-        );
-
-        let empty = fills(request(), Product::Text, 0, 512)
-            .expect_err("a product no call wrote")
-            .to_string();
-        assert!(empty.contains("no byte(s)"), "{empty}");
-    }
-
-    /// The rule a step depends on: the refusal names **the first kind the store lacks, in the
-    /// runner's own order**, so a failure says which call never ran rather than that something did.
-    #[test]
-    fn the_first_absent_kind_is_the_one_a_step_refuses() {
-        let store = Store {
-            held: vec![Product::VideoLatents],
-        };
-        let missing = missing_product(&store, request(), STEP_PRODUCTS).expect("a store answers");
-        assert_eq!(
-            missing,
-            Some(Product::Text),
-            "the encoder's rows are the first kind this store lacks"
-        );
-        let refusal = products::absent(request(), Product::Text).to_string();
-        assert!(
-            refusal.contains("text"),
-            "the refusal names the kind: {refusal}"
-        );
-    }
-
-    /// A store holding every kind a step reads has nothing missing, and a store holding none names
-    /// the first kind the step would have read.
-    #[test]
-    fn a_store_holding_every_kind_leaves_nothing_missing() {
-        let full = Store {
-            held: STEP_PRODUCTS.to_vec(),
-        };
-        let missing = missing_product(&full, request(), STEP_PRODUCTS).expect("a store answers");
-        assert_eq!(missing, None);
-
-        let empty = Store { held: Vec::new() };
-        let missing = missing_product(&empty, request(), STEP_PRODUCTS).expect("a store answers");
-        assert_eq!(
-            missing,
-            STEP_PRODUCTS.first().copied(),
-            "an empty store is refused for the first kind the step reads, not for the last"
-        );
-    }
-
-    /// A staged row's own prompt replaces the capacity the plan captured, and the plan keeps the
-    /// canvas: the refiner's keys and the rotary clock stop at the prompt the request presents.
-    #[test]
-    fn a_staged_request_states_its_own_prompt_length_within_the_plan() {
-        let warm = WarmRequest {
-            width: 768,
-            height: 768,
-            frames: 107,
-            fps: 24,
-            first_frames: 0,
-            last_frames: 0,
-            references: 0,
-            text_tokens: 1024,
-            conditions: Vec::new(),
-            vision_spans: Vec::new(),
-            condition_rows: None,
-            openings: Vec::new(),
-        };
-        let conditioning = proto::video::Conditions {
-            conditions: Vec::new(),
-            prompt_tokens: 9,
-            vision_spans: Vec::new(),
-        };
-        let stated = stated_request(
-            &warm,
-            &conditioning.encode().expect("a conditioning encodes"),
-        )
-        .expect("an unconditioned request states a request");
-        assert_eq!(stated.text_tokens, 9);
-        assert_eq!(
-            (stated.width, stated.height, stated.frames),
-            (768, 768, 107)
-        );
-        assert!(stated.conditions.is_empty());
-        assert!(
-            stated_request(&warm, b"not a conditioning").is_err(),
-            "a blob that does not decode is refused, because the capture's capacity is no request"
-        );
-    }
-
-    /// A task whose request carries no condition element reads no source rows, so a store holding
-    /// the prompt's states serves it: a layout with no conditioning elements asks for one kind, and a
-    /// layout with them asks for two.
-    ///
-    /// The rule is what keeps a prompt-only task from being refused for a product no call can
-    /// produce, so it is asserted from the layout side rather than from the store side.
-    #[test]
-    fn a_layout_without_conditioning_elements_reads_only_the_prompts_states() {
-        let mut layout = Layout {
-            video: proto::video::LatentShape {
-                channels: 16,
-                frames: 2,
-                height: 2,
-                width: 2,
-            },
-            audio: None,
-            text_rows: 64,
-            condition_rows: 0,
-            condition_elements: 0,
-        };
-        assert_eq!(step_products(&layout), STEP_PRODUCTS);
-        assert_eq!(step_products(&layout).len(), 1);
-
-        // A conditioned layout asks for the same one kind: the encoder's rows are the conditioner's
-        // input, and no producer exists for a second name of them.
-        layout.condition_elements = 3;
-        assert_eq!(step_products(&layout), STEP_PRODUCTS);
-
-        let store = Store {
-            held: vec![Product::Text],
-        };
-        let missing =
-            missing_product(&store, request(), step_products(&layout)).expect("a store answers");
-        assert_eq!(
-            missing, None,
-            "a store holding the encoder's rows leaves a conditioned step nothing missing: the \
-             conditioner reads those rows, and asking for `Source` refused a step for a product no \
-             call publishes"
-        );
-    }
-
-    /// A step with no store at all is a different fact from one whose store lacks a kind, and it says
-    /// so: the first is the worker not having attached one, the second is a call that never ran.
-    #[test]
-    fn no_store_is_its_own_refusal() {
-        let refusal = products::no_store(request()).to_string();
-        assert!(
-            refusal.contains("no product store"),
-            "the refusal names the attached store: {refusal}"
-        );
-        assert_eq!(
-            Product::VideoLatents.name(),
-            "video latents",
-            "a kind is named as the design names it"
-        );
-    }
-}
+mod tests;

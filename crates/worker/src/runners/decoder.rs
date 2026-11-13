@@ -73,7 +73,7 @@ use crate::memory::buffers::{BufferMemory, UNIT_BYTES};
 use crate::memory::lend;
 use crate::memory::tables::{BlockCopy, BlockTables};
 use crate::runner::Runner;
-use crate::runners::{address, performed};
+use crate::runners::{address, element_bytes, performed};
 use crate::{Error, Result};
 
 /// The channels of a decoded raster and of its packed bytes: red, green and blue.
@@ -182,8 +182,8 @@ impl DecoderRunner {
         let overlap = splices.iter().map(|splice| splice.overlap).max();
 
         // Each bucket's layout, and the bytes its latents and the tail a clip fades against take.
-        let latent = element(model.latent_type())?;
-        let raster = element(model.element_type())?;
+        let latent = element_bytes(model.latent_type())?;
+        let raster = element_bytes(model.element_type())?;
         let (mut layouts, mut latents, mut tails) = (Vec::new(), 0, 0);
         for bucket in config.buckets.iter().copied() {
             let layout = match bucket.extent {
@@ -284,7 +284,7 @@ impl DecoderRunner {
     /// The tensor of `shape` elements of `dtype` from byte `offset` of the runner's buffers.
     fn buffer(&self, offset: u64, shape: impl Into<Shape>, dtype: DType) -> Result<Tensor> {
         let shape = shape.into();
-        if offset + shape.elem_count() as u64 * element(dtype)? > self.bytes {
+        if offset + shape.elem_count() as u64 * element_bytes(dtype)? > self.bytes {
             return Err(Error::Invariant(format!(
                 "{shape:?} {dtype:?} from byte {offset} lies past the decoder's buffers"
             )));
@@ -391,13 +391,13 @@ impl DecoderRunner {
         // A latent frame's bytes of one channel, and a decoded frame's in the raster and packed.
         let video = self.layout(bucket)?.video;
         let plane = u64::from(video.height) * u64::from(video.width);
-        let plane = plane * element(self.model.latent_type())?;
+        let plane = plane * element_bytes(self.model.latent_type())?;
         let (window, pitch) = (
             u64::from(video.frames) * plane,
             u64::from(trajectory) * plane,
         );
         let pixels = u64::from(height) * u64::from(width);
-        let raster = pixels * element(self.model.element_type())?;
+        let raster = pixels * element_bytes(self.model.element_type())?;
         let base = self.buffers.as_ref().map_or(0, |storage| storage.address());
 
         let mut units = Vec::with_capacity(tails.len());
@@ -509,7 +509,7 @@ impl DecoderRunner {
             )));
         };
 
-        let bytes = elements(&track) * element(self.model.latent_type())?;
+        let bytes = elements(&track) * element_bytes(self.model.latent_type())?;
         let source = self.place(tables, row, (latents_class, latents), false, (0, bytes))?;
         let (window, channels) = self.model.pcm_window(&track)?;
         let pcm = (0, window * u64::from(channels) * 2);
@@ -722,23 +722,13 @@ impl Runner for DecoderRunner {
     }
 }
 
-/// The bytes of one element of `dtype`.
-fn element(dtype: DType) -> Result<u64> {
-    match dtype.size_in_bytes() {
-        0 => Err(Error::Invalid(format!(
-            "{dtype:?} has no whole-byte element"
-        ))),
-        bytes => Ok(bytes as u64),
-    }
-}
-
 /// The elements of a latent shape per channel: its frames, rows and columns.
-fn voxels(shape: &nn::LatentShape) -> u64 {
+pub(super) fn voxels(shape: &nn::LatentShape) -> u64 {
     u64::from(shape.frames) * u64::from(shape.height) * u64::from(shape.width)
 }
 
 /// The elements of a latent shape.
-fn elements(shape: &nn::LatentShape) -> u64 {
+pub(super) fn elements(shape: &nn::LatentShape) -> u64 {
     u64::from(shape.channels) * voxels(shape)
 }
 
@@ -753,7 +743,7 @@ fn after(
     let mut copies = PitchedBatch::new(SourceOrder::Stream);
 
     let kept = outputs.get(output).ok_or_else(missing)?;
-    let bytes = kept.elem_count() as u64 * element(kept.dtype())?;
+    let bytes = kept.elem_count() as u64 * element_bytes(kept.dtype())?;
     copies.push(pitched((at, bytes), (address(kept)?, bytes), bytes, 1)?)?;
 
     // The raster is `[3, frames, rows, columns]`: the tail is the end of each channel's frames.
@@ -764,7 +754,7 @@ fn after(
                 "a clip's raster is not four-dimensional".into(),
             ));
         };
-        let plane = (height * width) as u64 * element(raster.dtype())?;
+        let plane = (height * width) as u64 * element_bytes(raster.dtype())?;
         let (kept, length) = (u64::from(frames) * plane, length as u64 * plane);
 
         let source = address(raster)? + length - kept;
@@ -780,7 +770,7 @@ fn after(
 
 /// The copy of `rows` rows of `width` bytes, a row the destination's pitch after the one before
 /// it in the destination and the source's pitch in the source.
-fn pitched(
+pub(super) fn pitched(
     (destination, destination_pitch): (u64, u64),
     (source, source_pitch): (u64, u64),
     width: u64,

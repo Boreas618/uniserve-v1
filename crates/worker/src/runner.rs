@@ -75,6 +75,14 @@ pub trait Runner: Send {
     /// one rank's graph meets the same collective of every other rank's.
     fn buckets(&self) -> Vec<Bucket>;
 
+    /// The buckets of the forwards the runner runs eagerly ([`Graphs::eager`]) and captures no
+    /// graph of. A profile run states their launches and their peak with the captured buckets',
+    /// so the runner's region holds them and every generation resolves their kernels; warm-up
+    /// captures none of them. The default states none.
+    fn eager_buckets(&self) -> Vec<Bucket> {
+        Vec::new()
+    }
+
     /// The forward of one bucket over the runner's input tensors: the one function that is run
     /// on the meta device, captured, and run again by `prepare_inputs` before each replay.
     ///

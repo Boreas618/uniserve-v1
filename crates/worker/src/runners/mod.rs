@@ -10,6 +10,7 @@
 //! | [`EncoderRunner`] | `nn::capability::Encoder` | a video request's text encoding |
 //! | [`VisionRunner`] | `nn::capability::Vision` of a `TextModel` | a token request's image encoding |
 //! | [`MediaHost`] | none | a video request's host work: reading its condition media, encoding its video and audio, muxing its artifact |
+//! | [`DenoiserRunner`] | `nn::Denoiser` | a video request's latent preparation and its denoising steps, over its state in its slot's row |
 //! | [`DecoderRunner`] | `nn::Decoder`, with `nn::Splicer` for a video | a video request's decode of its clips and its audio track, from the latents in the rank's media products |
 //!
 //! A media runner reads and writes a request's products and encoder outputs in the blocks the
@@ -21,6 +22,7 @@ pub mod causal_lm;
 // video request's condition pixels and tracks for the media host.
 pub(crate) mod conditions;
 pub mod decoder;
+pub mod denoiser;
 pub mod encoder;
 pub mod media;
 pub mod vision;
@@ -31,6 +33,7 @@ use uniserve_tensor::Tensor;
 
 pub use causal_lm::CausalLmRunner;
 pub use decoder::{DecoderConfig, DecoderRunner};
+pub use denoiser::{DenoiserConfig, DenoiserRunner};
 pub use encoder::EncoderRunner;
 pub use media::MediaHost;
 pub use vision::VisionRunner;

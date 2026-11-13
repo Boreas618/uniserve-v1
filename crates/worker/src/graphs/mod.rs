@@ -369,14 +369,14 @@ impl Graphs {
 
     // ---- The profile run ----
 
-    /// Runs the forward of every bucket `runner` states under the meta context and keeps each
-    /// bucket's launch table.
+    /// Runs the forward of every bucket `runner` states, the captured ones and the eager ones
+    /// ([`Runner::eager_buckets`]), under the meta context and keeps each bucket's launch table.
     ///
     /// # Errors
     ///
     /// What a forward refuses.
     pub fn profile_run(&self, runner: &dyn Runner) -> Result<()> {
-        for bucket in runner.buckets() {
+        for bucket in runner.buckets().into_iter().chain(runner.eager_buckets()) {
             let (table, _) = self.meta_forward(&self.profile, runner, &bucket)?;
             self.state.borrow_mut().profiles.insert(bucket, table);
         }
