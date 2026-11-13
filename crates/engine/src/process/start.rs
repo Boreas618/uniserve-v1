@@ -6,19 +6,19 @@
 //! [`Engine::new`] builds it over a session and one executor per scheduler, which is where the
 //! binary and a test of the control thread part: the binary's executors are the ranks', a test's
 //! are fakes, and everything above them is the same. The ranks' side is what the rank start
-//! adds: the node's executors, the data plane over the ranks' storages, the head of the session,
+//! adds: the node's workers, the data plane over the ranks' storages, the head of the session,
 //! the Build Server and the links to the epoch's other main processes.
 //!
 //! [`start`] is the binary's construction (`specs/engine-worker-port.md` §1.1,
 //! `specs/buffer-pool.md` §14.1): the ranks load to the division of their GPUs' quotas, the head
 //! opens the session stating each region's units with no segment, every rank maps the segments
-//! the answer states and creates the rest, the head grants what was created, the executors are
+//! the answer states and creates the rest, the head grants what was created, the workers are
 //! spawned and warm, the schedulers are built over them, and each grows its KV regions into the
 //! granted segments. A start is not an update (`specs/updates.md` §2): the generation it serves
 //! is [`FIRST_GENERATION`], with nothing kept beside it.
 //!
 //! [`Engine::close`] ends the epoch in the order its parts depend on one another: the schedulers,
-//! then the executors, the peer links, the session, and the devices' contexts.
+//! then the workers, the peer links, the session, and the devices' contexts.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::num::NonZeroUsize;
@@ -28,11 +28,16 @@ use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
+use crate::batch::Capacity;
+use crate::batch::Phase;
+use crate::executor::Route;
+use crate::executor::peers::{Liveness, Remote, Upstream};
+use crate::profiling::counters::Counters;
+use crate::worker::Worker;
+use crate::worker::completion::Outcome;
 use anyhow::{Context as _, Result, bail};
 use build_server::Target;
 use crossbeam_channel::{Receiver, Sender};
-use ipc::Capacity;
-use ipc::batch::Phase;
 use ops::Generation;
 use platform::DeviceId;
 use proto::config::{EngineArgs, SchedulerConfig, WorkerGroupConfig};
@@ -41,25 +46,20 @@ use scheduling::limits::{Limits, Parameters};
 use scheduling::view::{RankView, Snapshot};
 use storage::QueuePair;
 use storage::runtime::{GroupId, Open, Opened};
-use worker::Executor;
-use worker::completion::Outcome;
-use worker::executor::Executors;
-use worker::executor::peers::{Liveness, Remote, Upstream};
-use worker::profiling::counters::Counters;
 
 use super::epoch;
 use super::ranks::{
     Backing, FIRST_GENERATION, LoadedRank, Meeting, bind, capacities, group_numbers, layout,
     load_ranks, open_ranks, spawn,
 };
-use crate::data_plane::{DataPlane, Target as LoadTarget};
-use crate::executor::{Groups, Shadow};
+use crate::executor::{Executor, Shadow, WorkerExecutor};
+use crate::memory::client::StorageClient;
 use crate::modules::load;
-use crate::rank::ModelRunner;
-use crate::rank::text::Keys;
+use crate::process::data_plane::{DataPlane, Target as LoadTarget};
+use crate::process::ranks::rank::ModelRunner;
+use crate::process::ranks::rank::text::Keys;
 use crate::scheduler::policy::{self, Policy};
-use crate::scheduler::{self, Message, Output, Scheduler};
-use crate::storage_client::StorageClient;
+use crate::scheduler::{Message, Output, Scheduler};
 
 /// The device a launch names when its ranks are backed by nothing outside the process
 /// (`engine_config.device.device`): [`Backing::Meta`].
@@ -85,14 +85,14 @@ pub struct Engine {
     pub(crate) ceilings: Limits,
     /// The generation batches are assembled for, which the schedulers read and a switch moves.
     pub(crate) served: Arc<AtomicU64>,
-    /// What ends the session with the buffer pool once the executors have stopped: the head's
+    /// What ends the session with the buffer pool once the workers have stopped: the head's
     /// `Close`, or whatever stands for the buffer pool in its place.
     pub(crate) session: Box<dyn FnOnce() -> Result<()> + Send>,
-    /// The node's executors, one per rank, in rank order; empty for an engine of no rank.
-    pub(crate) executors: Vec<Arc<Executor>>,
-    /// The node's executors and peer links by worker group, which the schedulers' executors
+    /// The node's workers, one per rank, in rank order; empty for an engine of no rank.
+    pub(crate) workers: Vec<Arc<Worker>>,
+    /// The node's workers and peer links by worker group, which the schedulers' executors
     /// hand their jobs to.
-    pub(crate) groups: Option<Arc<Executors>>,
+    pub(crate) groups: Option<Arc<Route>>,
     /// The changes the engine makes to what its ranks hold; of no rank by default, so every
     /// operation acts on none.
     pub(crate) data: Arc<DataPlane>,
@@ -153,7 +153,7 @@ impl Engine {
     ///
     /// Each scheduler's policy is instantiated on the scheduler's own state, so the replicas and
     /// the phases its groups serve are what it starts from. The generation batches are assembled
-    /// for is [`FIRST_GENERATION`]. The ranks' side is empty: no executor, a data plane of no
+    /// for is [`FIRST_GENERATION`]. The ranks' side is empty: no worker, a data plane of no
     /// rank, no head, Build Server or peer link.
     ///
     /// # Errors
@@ -177,8 +177,7 @@ impl Engine {
             usize,
             &[GroupId],
             Sender<Message>,
-        )
-            -> Result<(Box<dyn scheduler::Executor>, Arc<Mutex<Shadow>>)>,
+        ) -> Result<(Box<dyn Executor>, Arc<Mutex<Shadow>>)>,
         session: Box<dyn FnOnce() -> Result<()> + Send>,
     ) -> Result<Self> {
         let config = &launch.engine_config;
@@ -210,7 +209,7 @@ impl Engine {
         let served = Arc::new(AtomicU64::new(FIRST_GENERATION));
 
         // The schedulers' limits as the deployment states them, which each scheduler lowers to
-        // what its groups' executors captured; the captured sizes in tokens are the graph tiers.
+        // what its groups' workers captured; the captured sizes in tokens are the graph tiers.
         let mut tiers: Vec<u32> = capacities
             .iter()
             .flat_map(|(_, capacity)| capacity.buckets.iter().map(|shape| shape.tokens))
@@ -308,7 +307,7 @@ impl Engine {
             ceilings,
             served,
             session,
-            executors: Vec::new(),
+            workers: Vec::new(),
             groups: None,
             data: Arc::new(DataPlane::new(Vec::new(), LoadTarget::default())),
             head: None,
@@ -325,25 +324,25 @@ impl Engine {
     /// 1. every scheduler is told to shut down, which ends every request it holds as aborted;
     ///    each output it sends until its channel closes goes to `forward` with the scheduler's
     ///    index, the events of those requests among them, and its thread is joined;
-    /// 2. the executors' queues close, ending the job in flight and cancelling the rest, and
+    /// 2. the workers' queues close, ending the job in flight and cancelling the rest, and
     ///    their threads are joined;
     /// 3. the peer links close, which the epoch's other main processes read as this one's end;
-    /// 4. the session ends ([`Engine::new`]'s `session`), the executors having stopped;
+    /// 4. the session ends ([`Engine::new`]'s `session`), the workers having stopped;
     /// 5. the devices' primary contexts are reset, which releases the driver state the process
-    ///    created, when the engine's executors served on devices and nothing else holds the
+    ///    created, when the engine's workers served on devices and nothing else holds the
     ///    owners of their storage (`docs/architecture.md`, the orderly close).
     ///
     /// The caller makes no use of a device afterwards: this is the main process's last.
     ///
     /// # Errors
     ///
-    /// The first failure: a scheduler or an executor thread that panicked, the session's end, or
+    /// The first failure: a scheduler or a worker thread that panicked, the session's end, or
     /// a context's reset. Every step runs whatever an earlier one returned.
     pub fn close(self, mut forward: impl FnMut(usize, Output)) -> Result<()> {
         let Self {
             schedulers,
             route,
-            executors,
+            workers,
             groups,
             data,
             head,
@@ -371,25 +370,25 @@ impl Engine {
             }
         }
         drop(route);
-        // The counters record the streams the executors issue on, and stop before they close.
+        // The counters record the streams the workers issue on, and stop before they close.
         drop(counters);
 
-        // An executor's thread holds its runners, and an expert union's runners reach the other
-        // members' executors: every queue closes before any executor is joined.
-        let devices = executors.iter().any(|executor| executor.device().is_some());
-        for executor in &executors {
-            executor.queue().close();
+        // A worker's thread holds its runners, and an expert union's runners reach the other
+        // members' workers: every queue closes before any worker is joined.
+        let devices = workers.iter().any(|worker| worker.device().is_some());
+        for worker in &workers {
+            worker.queue().close();
         }
         drop(groups);
-        for executor in executors {
-            match Arc::into_inner(executor) {
-                Some(executor) => {
-                    if let Err(error) = executor.close() {
+        for worker in workers {
+            match Arc::into_inner(worker) {
+                Some(worker) => {
+                    if let Err(error) = worker.close() {
                         outcome = outcome.and(Err(error.into()));
                     }
                 }
                 None => tracing::warn!(
-                    "an executor is still held after the engine closed; its thread ends when the \
+                    "a worker is still held after the engine closed; its thread ends when the \
                      last holder drops it"
                 ),
             }
@@ -409,7 +408,7 @@ impl Engine {
         drop(head);
 
         if devices && released {
-            // SAFETY: the engine's executors are joined and the owners of their devices' storage
+            // SAFETY: the engine's workers are joined and the owners of their devices' storage
             // released above; the main process makes no use of a device after its engine's close,
             // which is its last step, and no other thread of it issues on one.
             let reset = unsafe { platform::PrimaryContext::reset_all() };
@@ -425,7 +424,7 @@ impl Engine {
 }
 
 /// Starts the epoch `launch` describes on this node: its ranks, the session with the buffer
-/// pool, the executors and the schedulers (module documentation). Its checkpoint is served by
+/// pool, the workers and the schedulers (module documentation). Its checkpoint is served by
 /// the family of `registry` that claims the class it declares, its ranks' storage is at the
 /// Storage Server the daemon's claim answered with (`storage`), their kernels are resolved
 /// through `build`, the Build Server's client, and `policy` is the module set's scheduling
@@ -444,12 +443,13 @@ impl Engine {
 pub(crate) fn start(
     launch: &EngineArgs,
     registry: &nn::family::Registry,
-    storage: &ipc::StorageLaunch,
+    storage: &crate::memory::client::StorageLaunch,
     build: Option<Arc<Mutex<build_server::Client>>>,
     policy: (Arc<wasmtime::Module>, Parameters),
     liveness: Arc<Liveness>,
 ) -> Result<Engine> {
-    let family = crate::resolve(registry, Path::new(&launch.engine_config.model.model))?;
+    let family =
+        crate::process::catalogue::resolve(registry, Path::new(&launch.engine_config.model.model))?;
     let model_runner = ModelRunner::of(launch, family)?;
     let meta = launch.engine_config.device.device == META_DEVICE;
 
@@ -457,7 +457,7 @@ pub(crate) fn start(
     // so a process that serves on devices subscribes before it loads a module
     // (`docs/profiling.md`).
     if !meta {
-        worker::profiling::counters::subscribe();
+        crate::profiling::counters::subscribe();
     }
 
     // The epoch's other main processes, before any rank loads: the ranks' host group and their
@@ -504,7 +504,7 @@ pub(crate) fn start(
                 .insert(key.clone());
         }
 
-        let mut client = worker::lock(build);
+        let mut client = service::lock(build);
         let (packages, routes) =
             load::select(&mut client, &targets, &launch.modules.kernels, &by_operator)?;
         let entries = load::install(&mut client, device, &packages, &routes)?;
@@ -522,7 +522,7 @@ pub(crate) fn start(
 
     // The session, opened before the ranks map memory: its device KV regions state no segment.
     let open = layout(launch, &ranks)?;
-    let mut head = StorageClient::connect(
+    let mut head = StorageClient::connect_head(
         Path::new(&storage.socket),
         &launch.engine_config.deployment,
         launch.epoch,
@@ -542,14 +542,14 @@ pub(crate) fn start(
         }
     }
     bind(&mut ranks, &open, &opened)?;
-    let (route, executors) = spawn(&mut ranks, &head, &pairs, remotes.clone())?;
+    let (route, workers) = spawn(&mut ranks, &head, &pairs, remotes.clone())?;
 
     // Range markers and PC sampling attach to what a graph captures, so they precede the
     // captures of the warm-up.
     if !meta {
         instrument(launch, model_runner.devices())?;
     }
-    warm_up(&executors)?;
+    warm_up(&workers)?;
 
     // The always-on counters, once the ranks are warm: every stream a runner computes on is
     // `device`, and every one the copies of a rank's blocks move on is `copy`. A graph's launch
@@ -565,13 +565,13 @@ pub(crate) fn start(
     };
 
     let capacities = capacities(&ranks, &open)?;
-    let data = data_plane(launch, &model_runner, &ranks, &executors)?;
+    let data = data_plane(launch, &model_runner, &ranks, &workers)?;
     drop(ranks);
 
     let head = Arc::new(Mutex::new(head));
     let session: Box<dyn FnOnce() -> Result<()> + Send> = {
         let head = Arc::clone(&head);
-        Box::new(move || worker::lock(&head).close())
+        Box::new(move || service::lock(&head).close())
     };
     let mut engine = Engine::new(
         launch,
@@ -582,8 +582,9 @@ pub(crate) fn start(
         policy,
         |_, groups, inbox| {
             let shadow = Arc::new(Mutex::new(Shadow::default()));
-            let groups = Groups::new(Arc::clone(&route), groups, inbox, Arc::clone(&shadow))?;
-            Ok((Box::new(groups) as Box<dyn scheduler::Executor>, shadow))
+            let groups =
+                WorkerExecutor::new(Arc::clone(&route), groups, inbox, Arc::clone(&shadow))?;
+            Ok((Box::new(groups) as Box<dyn Executor>, shadow))
         },
         session,
     )?;
@@ -594,7 +595,7 @@ pub(crate) fn start(
     // §14.1).
     epoch::grow_regions(&engine.inboxes(), &head)?;
 
-    engine.executors = executors;
+    engine.workers = workers;
     engine.groups = Some(route);
     engine.data = data;
     engine.counters = counters;
@@ -662,16 +663,16 @@ fn lowered(
     limits
 }
 
-/// Captures every bucket of every executor's runners, all at once, and waits for each.
+/// Captures every bucket of every worker's runners, all at once, and waits for each.
 ///
 /// # Errors
 ///
-/// The first executor whose warm-up failed or was cancelled.
-fn warm_up(executors: &[Arc<Executor>]) -> Result<()> {
-    let submissions = executors
+/// The first worker whose warm-up failed or was cancelled.
+fn warm_up(workers: &[Arc<Worker>]) -> Result<()> {
+    let submissions = workers
         .iter()
-        .map(|executor| executor.warm_up())
-        .collect::<worker::Result<Vec<_>>>()?;
+        .map(|worker| worker.warm_up())
+        .collect::<crate::worker::Result<Vec<_>>>()?;
 
     for (index, submission) in submissions.into_iter().enumerate() {
         match submission.wait() {
@@ -683,17 +684,17 @@ fn warm_up(executors: &[Arc<Executor>]) -> Result<()> {
     Ok(())
 }
 
-/// The data plane over `ranks`, each served by its executor of `executors`: what the engine
+/// The data plane over `ranks`, each served by its worker of `workers`: what the engine
 /// changes of the ranks' storages, and how it loads the model the launch serves again.
 fn data_plane(
     launch: &EngineArgs,
     model_runner: &ModelRunner,
     ranks: &[LoadedRank],
-    executors: &[Arc<Executor>],
+    workers: &[Arc<Worker>],
 ) -> Result<Arc<DataPlane>> {
     let mut served = Vec::with_capacity(ranks.len());
-    for (rank, executor) in ranks.iter().zip(executors) {
-        if let Some(rank) = rank.data_rank(executor)? {
+    for (rank, worker) in ranks.iter().zip(workers) {
+        if let Some(rank) = rank.data_rank(worker)? {
             served.push(rank);
         }
     }
@@ -716,7 +717,7 @@ fn data_plane(
 fn instrument(launch: &EngineArgs, devices: &[DeviceId]) -> Result<()> {
     let profiling = &launch.engine_config.profiling;
     if !profiling.fence_components.is_empty() {
-        worker::profiling::markers::Markers::install(
+        crate::profiling::markers::Markers::install(
             devices,
             profiling.fence_components.clone(),
             profiling.fence_probes,
@@ -728,7 +729,7 @@ fn instrument(launch: &EngineArgs, devices: &[DeviceId]) -> Result<()> {
     if profiling.graph_pc_sampling {
         for device in devices {
             let context = platform::PrimaryContext::retain(*device)?;
-            worker::profiling::pc_sampling::enable(&context)
+            crate::profiling::pc_sampling::enable(&context)
                 .context("enabling PC sampling for this rank's graphs")?;
         }
     }
@@ -793,14 +794,14 @@ fn meet(launch: &EngineArgs) -> Result<(Meeting, Links)> {
                     <std::net::TcpListener as std::os::fd::FromRawFd>::from_raw_fd(inherited.store),
                 )
             };
-            let listener = ipc::Listener::from_tcp(channel)
+            let listener = crate::executor::peers::link::Listener::from_tcp(channel)
                 .context("taking the peer listener this process inherited")?;
             tracing::info!(
                 peers = world.peers,
                 channel = %world.channel,
                 "awaiting the epoch's peer main processes"
             );
-            let accepted = worker::executor::peers::accept(
+            let accepted = crate::executor::peers::accept(
                 &listener,
                 world.peers as usize,
                 launch.engine,
@@ -815,7 +816,7 @@ fn meet(launch: &EngineArgs) -> Result<(Meeting, Links)> {
             ))
         }
         None => {
-            let channel = worker::executor::peers::register(
+            let channel = crate::executor::peers::register(
                 &world.channel,
                 launch.rank,
                 world.scheduler,

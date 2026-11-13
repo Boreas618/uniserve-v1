@@ -46,7 +46,7 @@ const VICTIMS_RECORD: usize = 14;
 /// side (a device region of its class in a group of `groups`, its class's host region) exactly
 /// when `pins == 0`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Cached {
+pub(crate) struct Cached {
     pub key: Key,
     pub class: u8,
     /// The tokens the block holds: the class's block size, or fewer for a request's tail; 0 when
@@ -72,7 +72,7 @@ impl Cached {
     /// The number the scheduler knows a cached block by: its key's leading eight bytes,
     /// big-endian. It is the policy's `PageId` for a KV block and its `EncodingId` for an encoder
     /// output, so a policy's id finds its block in one lookup.
-    pub fn id(key: &Key) -> u64 {
+    pub(crate) fn id(key: &Key) -> u64 {
         let mut leading = [0; 8];
         leading.copy_from_slice(&key.0[..8]);
         u64::from_be_bytes(leading)
@@ -465,7 +465,7 @@ impl Scheduler {
     }
 
     /// Request `id` gave up the read-only blocks of `keys`, in position order, by a `Release` or
-    /// a `Detach` handed to the executors: one fewer request holds each, but a key among its
+    /// a `Detach` handed to the executor: one fewer request holds each, but a key among its
     /// `Request::unpinned`, whose block `cache` never counted it a holder of (answered
     /// `Duplicate`, or an encoder output it computed and did not commit), which leaves that record
     /// instead. A block no request holds joins its orders as just used, the deepest key first in
@@ -696,7 +696,7 @@ impl Scheduler {
     }
 
     /// A group whose memory holds `row`'s device copy, the first of the scheduler's groups that
-    /// does: the group a `Store` of the block to the host names, whose executor copies it (SD
+    /// does: the group a `Store` of the block to the host names, whose workers copy it (SD
     /// §3.4, §4.4). `None` for a block with no device copy.
     pub(super) fn holder(&self, row: &Cached) -> Option<GroupId> {
         if row.tiers & DEVICE == 0 {
@@ -908,7 +908,7 @@ fn stamped_groups(after: &runtime::Stamps) -> u8 {
 /// `Copy` narrowed to the keys the copy covers, which are the leading keys of a `Load` that have
 /// a host copy and the keys of a `Store` whose device copy is valid in its group (BP §11), and
 /// for which the answer to its `Finish` speaks; any other request as it was written. The
-/// executors are handed the request as it was written, which its completion answers (SD §2.1
+/// executor is handed the request as it was written, which its completion answers (SD §2.1
 /// `Executor::map`).
 pub(super) fn covered(request: &runtime::Request, completion: &Completion) -> runtime::Request {
     let mut narrowed = request.clone();
@@ -931,7 +931,7 @@ mod tests {
     use std::num::NonZeroU32;
     use std::sync::atomic::Ordering;
 
-    use ipc::CacheGroupKind;
+    use crate::batch::cache::CacheGroupKind;
     use proto::config::KvCacheConfig;
     use scheduling::{Event, PageId};
     use storage::Key;
@@ -967,7 +967,7 @@ mod tests {
         bench.answers()
     }
 
-    /// Writes a request stamped by group A's executor (a `Commit`, or the `Finish` of a copy it
+    /// Writes a request stamped by group A's workers (a `Commit`, or the `Finish` of a copy it
     /// ran), answers it with `completion`, and returns what the scheduler applies.
     fn stamped(
         bench: &mut Bench,

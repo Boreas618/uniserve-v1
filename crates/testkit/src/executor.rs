@@ -1,9 +1,9 @@
-//! The fake executor: a scheduler's executors at their public boundary
-//! ([`engine::scheduler::Executor`]), over device block tables kept on the host and batches
+//! The fake executor: a scheduler's executor at its public boundary
+//! ([`engine::executor::Executor`]), over device block tables kept on the host and batches
 //! answered by a fixed rule (`specs/scheduler-design.md` §8, SD).
 //!
-//! A [`FakeExecutor`] stands for the executors of one scheduler's worker groups and keeps one
-//! record per group, as the engine keeps one device executor per group:
+//! A [`FakeExecutor`] stands for the executor of one scheduler's worker groups and keeps one
+//! record per group, as the engine's workers of a group keep their device block tables:
 //!
 //! - `submit` numbers the batch among its group's batches (its sequence), starts the copies
 //!   queued on the group, and answers the batch with [`Message::Output`]: at once, or when the
@@ -42,11 +42,12 @@ use std::sync::{Arc, Mutex, MutexGuard};
 
 use crossbeam_channel::Sender;
 use engine::Error;
-use engine::scheduler::{Executor, Message};
-use ipc::batch::{
+use engine::batch::{
     Batch, BatchOutput, CallOutput, CallStatus, ErrorCode, Phase, Rows, StateDirection,
     TimingCounters,
 };
+use engine::executor::Executor;
+use engine::scheduler::Message;
 use proto::request::RequestId;
 use service::lock;
 use storage::runtime::{self, Completion, GroupId, OwnerId, Request, Run, Stamps};
@@ -76,8 +77,8 @@ pub struct Entry {
     pub from: runtime::RequestId,
 }
 
-/// The executors of one scheduler's worker groups. A clone is another handle on the same
-/// executors: the scheduler holds one, the case and the [`crate::InProcessPool`] others.
+/// The executor of one scheduler's worker groups. A clone is another handle on the same
+/// executor: the scheduler holds one, the case and the [`crate::InProcessPool`] others.
 #[derive(Clone)]
 pub struct FakeExecutor(Arc<Mutex<State>>);
 
@@ -92,7 +93,8 @@ struct Copying {
     given_up: bool,
 }
 
-/// One group's executor: its tables, its copies and its batch sequences.
+/// One group's workers, as the fake keeps them: their tables, their copies and their batch
+/// sequences.
 #[derive(Default)]
 struct Tables {
     entries: BTreeMap<Place, Entry>,
@@ -143,7 +145,7 @@ struct State {
 }
 
 impl FakeExecutor {
-    /// The executors of `groups`, which send their messages to the scheduler's `inbox`. A
+    /// The executor of `groups`, which sends its messages to the scheduler's `inbox`. A
     /// prefill, decode or verification row writes every class of `cache`, each with its block's
     /// tokens, at the block of each cache position.
     pub fn new(groups: &[GroupId], cache: Vec<(u8, u32)>, inbox: Sender<Message>) -> Self {
@@ -320,7 +322,7 @@ impl FakeExecutor {
     }
 
     /// The buffer pool took `request` under `id`: the request a completion of `id` answers. A
-    /// request the executors stamp is checked against A2 here, as it enters the submission queue.
+    /// request the workers stamp is checked against A2 here, as it enters the submission queue.
     pub(crate) fn taken(&self, id: runtime::RequestId, request: &Request) {
         let mut state = self.lock();
         state.requests.insert(id.0, request.clone());
@@ -632,7 +634,7 @@ impl Executor for FakeExecutor {
 
         let Some(tables) = state.groups.get_mut(&batch.group) else {
             let message = format!(
-                "batch {} names group {}, which has no executor",
+                "batch {} names group {}, which this executor does not serve",
                 batch.id.0, batch.group.0
             );
             state.violate(message.clone());
@@ -733,7 +735,7 @@ impl Executor for FakeExecutor {
         for mut request in requests {
             let Some(tables) = state.groups.get_mut(&group) else {
                 state.violate(format!(
-                    "group {} has no executor to stamp {request:?}",
+                    "group {} is not this executor's, which cannot stamp {request:?}",
                     group.0
                 ));
                 continue;
@@ -767,7 +769,7 @@ impl Executor for FakeExecutor {
                 }
                 _ => {
                     state.violate(format!(
-                        "group {} is handed {request:?}, which an executor does not stamp",
+                        "group {} is handed {request:?}, which a worker does not stamp",
                         group.0
                     ));
                     continue;
@@ -887,7 +889,7 @@ fn completed(tokens: Vec<u32>, seen: u32) -> CallOutput {
 
 /// Publishes `bytes` as a POSIX shared-memory object, as a worker's media host relinquishes an
 /// artifact for the scheduler to take.
-fn publish(bytes: &[u8]) -> Result<ipc::MediaOutput, String> {
+fn publish(bytes: &[u8]) -> Result<engine::batch::MediaOutput, String> {
     let storage = || -> std::io::Result<String> {
         let mut storage = tempfile::Builder::new()
             .prefix("uniserve-fake-video-")
@@ -901,8 +903,8 @@ fn publish(bytes: &[u8]) -> Result<ipc::MediaOutput, String> {
     };
     let name = storage().map_err(|error| format!("publishing the artifact: {error}"))?;
 
-    Ok(ipc::MediaOutput {
-        handle: ipc::ArtifactHandle::PosixShm { name },
+    Ok(engine::batch::MediaOutput {
+        handle: engine::batch::ArtifactHandle::PosixShm { name },
         bytes: bytes.len() as u64,
     })
 }
@@ -955,7 +957,7 @@ fn names(request: &Request, owner: OwnerId, class: u8, position: u32) -> bool {
     }
 }
 
-/// The stamps of a request an executor stamps; `None` for every other request.
+/// The stamps of a request a worker stamps; `None` for every other request.
 fn stamps(request: &mut Request) -> Option<&mut Stamps> {
     match request {
         Request::Detach { after, .. }
@@ -979,8 +981,8 @@ fn unstamped(request: &Request) -> Request {
 #[cfg(test)]
 mod tests {
     use crossbeam_channel::{Receiver, unbounded};
-    use ipc::batch::{BatchId, Columns, Row, Shape, Variant};
-    use ipc::philox::DrawAddress;
+    use engine::batch::philox::DrawAddress;
+    use engine::batch::{BatchId, Columns, Row, Shape, Variant};
     use storage::Key;
 
     use super::*;
@@ -1496,7 +1498,7 @@ mod tests {
 
         // A checkpoint kept at a state position the slot does not hold.
         let mut decode = batch(2, Phase::Decode, &[(1, SLOT, Vec::new(), 4)]);
-        decode.columns.state_copies.push(ipc::batch::StateCopy {
+        decode.columns.state_copies.push(engine::batch::StateCopy {
             slot: SLOT,
             position: 0,
             direction: StateDirection::Keep,

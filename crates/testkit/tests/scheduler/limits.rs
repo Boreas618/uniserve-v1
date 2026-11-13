@@ -12,8 +12,8 @@
 
 use std::num::NonZeroUsize;
 
+use engine::batch::{Batch, Phase};
 use engine::scheduler::Message;
-use ipc::batch::{Batch, Phase};
 use proto::config::SchedulerConfig;
 use proto::request::{Event, FinishReason, RejectionKind, RequestId};
 use storage::runtime::Request;
@@ -400,11 +400,11 @@ fn a_terminal_is_sent_behind_a_full_window() {
     harness.settle(100);
 }
 
-/// `Configure` refuses a limit above what the executors were started for, and leaves the limits
+/// `Configure` refuses a limit above what the workers were started for, and leaves the limits
 /// as they were; a limit within them serves from the next step on (SD §2.4 `Configure`; §7.1
-/// "`Configure` refuses a value above the executors' capacity").
+/// "`Configure` refuses a value above the workers' capacity").
 #[test]
-fn configure_applies_limits_in_place_and_refuses_what_the_executors_cannot_hold() {
+fn configure_applies_limits_in_place_and_refuses_what_the_workers_cannot_hold() {
     // Eight slots, buckets of eight rows and 64 tokens.
     let mut harness = Deployment::tokens().build();
     let refusals = [

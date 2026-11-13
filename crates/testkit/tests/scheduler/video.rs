@@ -17,8 +17,8 @@
 
 use std::collections::HashSet;
 
-use ipc::batch::{MediaRow, Phase};
-use ipc::product;
+use engine::batch::product;
+use engine::batch::{MediaRow, Phase};
 use proto::config::{BlockConfig, BlockDistribution, VIDEO_CODEC_BLOCK, VIDEO_DECODER_BLOCK};
 use proto::request::{
     ConditionExtent, DiffusionRequest, EncoderInputs, Event, FinishReason, MediaKind,
@@ -618,7 +618,7 @@ fn unsupported_media_is_rejected_and_the_deployment_serves_on() {
 
 /// A call that reads what a call on another group wrote waits for that call to complete, since
 /// nothing else orders the write before the read; one on the same group follows it once it is
-/// scheduled, its executor running the two in submission order (SD §3.3). While the batches are
+/// scheduled, its workers running the two in submission order (SD §3.3). While the batches are
 /// held on the device, the latent preparation joins the text encoding on one group, and waits for
 /// it on a denoiser of its own.
 #[test]

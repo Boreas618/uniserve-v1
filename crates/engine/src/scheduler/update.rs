@@ -15,7 +15,7 @@
 //! # The buffer pool's completions
 //!
 //! `next_completion` (`mod.rs`) has matched each completion to its request, handed what gives
-//! entries to the executors, and applied what it states of the cache (`learn`); `answered` applies
+//! entries to the executor, and applied what it states of the cache (`learn`); `answered` applies
 //! the rest to the request the owner is for. What an answer holds of the request's tables, and
 //! the requests it calls for, are the memory rules' (`filled`, `memory.rs`); `answered` keeps the
 //! request's slots, its admission's count of answers and its transfer.
@@ -33,15 +33,15 @@
 //! as it may be (a `Migratable` once no call of the request is in flight, a `Finished` under stop
 //! strings once the daemon's decoder passed every output token), a preempted video request saves
 //! its trajectory first, and once nothing of the request is in flight and its terminal is sent,
-//! `free` gives up its blocks (each owner's `Detach`, through the executors) and the request is
+//! `free` gives up its blocks (each owner's `Detach`, through the executor) and the request is
 //! forgotten.
 
 use std::ops::Range;
 use std::sync::Arc;
 use std::time::Instant;
 
-use ipc::batch::{ArtifactHandle, Batch, BatchOutput, CallOutput, CallStatus, ErrorCode, Phase};
-use ipc::{SharedMedia, SharedMediaError};
+use crate::batch::media::{SharedMedia, SharedMediaError};
+use crate::batch::{ArtifactHandle, Batch, BatchOutput, CallOutput, CallStatus, ErrorCode, Phase};
 use proto::config::WorkerGroupRole;
 use proto::request::{
     ArtifactEvent, EVENT_WINDOW, Event, FinishReason, MediaKind, MigrationCause, PositionLogprobs,
@@ -67,7 +67,7 @@ const MEDIA_CALL_FAILED: &str = "media worker call failed";
 /// A batch's output (SD §3.7).
 impl Scheduler {
     /// Applies a batch's output, once, as it arrives: the group has room for one more batch, and
-    /// each call's output is applied to its request in row order. An executor that failed the
+    /// each call's output is applied to its request in row order. The executor that failed the
     /// batch, or answered it with other calls than it was given, stops the scheduler: the requests
     /// of the epoch end as migratable with the cause `Loss` (SD §7.6), and the error the engine is
     /// told names the batch. A call that computed non-finite logits fails its request, and the
@@ -611,7 +611,7 @@ impl Scheduler {
     /// Gives up everything a request holds, once no call of it is in flight (SD §3.7): for a
     /// request whose terminal, not yet sent, is a `Migratable`, the `Commit` of each partial last
     /// block under its tail key first (§4.3); then the pins `cache` counts for it, and each
-    /// owner's `Detach`, which every executor whose device block tables hold the owner's entries
+    /// owner's `Detach`, which every worker whose device block tables hold the owner's entries
     /// stamps (§3.1). A `Detach` the buffer pool takes while a `Commit` waits for its stamps does
     /// not cancel the commit (`specs/buffer-pool.md` §9, R6).
     pub(super) fn free(&mut self, id: RequestId) {
@@ -626,7 +626,7 @@ impl Scheduler {
     }
 
     /// Gives up the pins `cache` counts for request `id` and submits each of its owners'
-    /// `Detach`, which every executor whose device block tables hold the owner's entries stamps
+    /// `Detach`, which every worker whose device block tables hold the owner's entries stamps
     /// (§3.1). `submit` finds those groups from the request's attachments, which the caller
     /// clears only after this.
     fn detach(&mut self, id: RequestId) {
@@ -1008,7 +1008,7 @@ impl Scheduler {
     /// Starts moving a request a prefill group served to a decode group, once its prompt is
     /// computed and nothing of it is in flight (SD §3.5 "Prefill to decode transfer"): the decode
     /// group is placed as any phase is, and the request's owner on the prefill group is moved
-    /// there by `Transfer`, which the prefill group's executor stamps. The request waits in
+    /// there by `Transfer`, which the prefill group's workers stamp. The request waits in
     /// `WaitingForRemoteKvs` for the answer, out of every batch and of admission. With no decode
     /// group able to take it now, it stays where it is and a later step tries again
     /// (`start_transfers`).
@@ -1355,7 +1355,7 @@ impl Scheduler {
         self.groups.iter().any(|group| group.serves(Phase::Verify))
     }
 
-    /// The end-of-sequence tokens the executors of `group` state.
+    /// The end-of-sequence tokens the workers of `group` state.
     fn eos_on(&self, group: GroupId) -> Vec<u32> {
         self.group(group)
             .map(|group| group.capacity.eos_token_ids.clone())
@@ -1557,7 +1557,7 @@ fn requested_candidates(entries: &mut Vec<TokenLogprob>, count: u32) {
 /// Opens the artifact a final muxing call published: the scheduler is the one opener of the
 /// name, which it unlinks, and it maps the bytes.
 fn open_artifact(
-    published: &ipc::batch::MediaOutput,
+    published: &crate::batch::MediaOutput,
 ) -> Result<Arc<SharedMedia>, SharedMediaError> {
     let ArtifactHandle::PosixShm { name } = &published.handle;
     // SAFETY: the media host wrote the object's bytes before it relinquished the object and never
@@ -1579,11 +1579,11 @@ mod tests {
     //! with a prompt of three tokens and room for four more. Its requests hold no keys and no
     //! blocks, so no call commits or gives up a block.
 
-    use crossbeam_channel::Receiver;
-    use ipc::batch::{
+    use crate::batch::{
         Batch, BatchId, BatchOutput, CallOutput, CallStatus, Columns, ErrorCode, Extent, Phase,
         Row, Shape, TimingCounters, Variant,
     };
+    use crossbeam_channel::Receiver;
     use proto::config::WorkerGroupRole;
     use proto::request::{
         Event, FinishReason, MigrationCause, RejectionKind, RequestId, StopReason, TokenLogprob,
@@ -1745,7 +1745,7 @@ mod tests {
     }
 
     /// A decode's token is appended and sent; an end-of-sequence token is not sent, ends the
-    /// request with the usage it generated, and its owner is detached through its group's
+    /// request with the usage it generated, and its owner is detached through the
     /// executor once no call of it is in flight.
     #[test]
     fn a_decode_sends_its_token_and_an_end_of_sequence_token_finishes_the_request() {
@@ -2269,7 +2269,7 @@ mod tests {
         apply(bench, batch(Phase::Prefill, 0, 3), output(&[7]));
     }
 
-    /// Group A's executor returns request 1's `Transfer`, stamped.
+    /// Group A's workers return request 1's `Transfer`, stamped.
     fn stamp_transfer(bench: &mut Bench) {
         bench.scheduler.stamped(vec![runtime::Request::Transfer {
             owner: OWNER_A,

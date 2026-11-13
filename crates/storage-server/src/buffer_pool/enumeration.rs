@@ -111,7 +111,7 @@ enum Step {
     Detach(u64, u8),
     Commit(u64, u8),
     Transfer(u64, u8, u8),
-    /// The `Finish` of the n-th copy an executor runs, with its result.
+    /// The `Finish` of the n-th copy a worker runs, with its result.
     Finish(usize, bool, u8),
     Advance(u8),
     Prefetch,
@@ -258,7 +258,7 @@ impl Driver {
     }
 
     /// The copies in flight by the request that started each: those an
-    /// executor runs, or the tasks.
+    /// worker runs, or the tasks.
     fn in_flight(&self, tasks: bool) -> Vec<((u32, u16), RequestId)> {
         let of_kind = |copies: &Vec<Copy>| {
             copies
@@ -294,7 +294,7 @@ impl Driver {
     /// The steps the model's environment can take in this state.
     fn steps(&self) -> Vec<Step> {
         let shape = self.shape;
-        // The prefill group's executor stamps: the model's `Stamping`.
+        // The prefill group's workers stamp: the model's `Stamping`.
         let masks = 2;
         let mut steps = vec![Step::Evict];
         let room = self.copies < shape.copies;

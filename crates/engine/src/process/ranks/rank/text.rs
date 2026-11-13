@@ -1,0 +1,196 @@
+//! The runner of a text rank: one causal language model over the rank's cache and recurrent state
+//! (`specs/engine-worker-port.md` §1.1, steps 7 and 21-22).
+//!
+//! A rank builds its runner twice from the same config. First over owners that hold no device
+//! (`KvCacheMemory::meta`, `StateMemory::meta`) and graphs that hold none (`Graphs::meta`): its
+//! profile run states the region, shadow region and input bytes the division sizes the rank's pools
+//! by, and every kernel the rank launches. Then over the device's owners, in the region of the
+//! graph pool the division mapped, as the runner the rank's worker serves with. Both runners
+//! are wired alike: the cache issues each batch's page work through the hook of
+//! `crate::runner::causal_lm::wiring::page_work`, the tensor group's split is set on the graphs,
+//! and a member of an expert union joins it before its buckets are profiled.
+
+use std::sync::{Arc, Mutex};
+
+use crate::batch::Phase;
+use crate::memory::cache::{CacheLayout, KvCacheMemory};
+use crate::memory::state::StateMemory;
+use crate::runner::causal_lm::experts::Member;
+use crate::runner::causal_lm::speculation::DraftPool;
+use crate::runner::causal_lm::wiring::page_work;
+use crate::runner::causal_lm::{CausalLmConfig, CausalLmRunner};
+use crate::runner::graphs::Graphs;
+use anyhow::{Context as _, Result};
+use nn::family::TextModel;
+use ops::Generation;
+use platform::Stream;
+
+use super::ModelRunner;
+use super::buckets::served_phases;
+use super::memory::PAGE_TOKENS;
+
+/// The kernels a rank's runner and owners launch, as `(operator, key)`: what the engine resolves
+/// the rank's serving generation for.
+pub(crate) type Keys = std::collections::BTreeSet<(&'static str, String)>;
+
+impl ModelRunner {
+    /// The config of the rank's runner of `model` over a cache of `layout` with `units` units
+    /// (step 7): the phases its buckets serve (no refill for a model whose layers or drafter keep
+    /// a recurrent state), the deployment's request slots, pages and longest sequence, the
+    /// candidates a scored row reports, the scratch page set of its paired forwards, and a
+    /// speculating deployment's drafts and draft pool.
+    ///
+    /// The scratch page set is one set the rows of a paired forward share,
+    /// `ceil(T / page) + R` pages for the `T` tokens and `R` rows of the largest bucket
+    /// (`CausalLmRunner::scratch_pages`); a batch whose rows' contexts need more is not
+    /// compared. A model that keeps a recurrent state has no scratch state to advance and
+    /// computes no paired forward.
+    ///
+    /// # Errors
+    ///
+    /// More request slots than the protocol addresses, or a speculating deployment whose cache
+    /// keeps no draft group.
+    pub(crate) fn causal_config(
+        &self,
+        model: &dyn TextModel,
+        layout: &CacheLayout,
+        units: u32,
+    ) -> Result<CausalLmConfig> {
+        let drafts = self.engine_config().speculative.num_draft_tokens;
+        let scratch_pages = if model.state_layers().is_empty() {
+            CausalLmRunner::scratch_pages(&self.buckets, PAGE_TOKENS)
+        } else {
+            0
+        };
+        let draft_pool = if drafts > 0 {
+            Some(DraftPool::of(layout, units)?)
+        } else {
+            None
+        };
+
+        // A refill evaluates positions behind its slot's own from a state of their own, which
+        // the runner has none of for a model whose layers or drafter keep a recurrent state, and
+        // refuses: such a rank serves no refill, and a request whose draft cache lags verifies
+        // without drafts.
+        let stateless = model.state_layers().is_empty()
+            && model
+                .drafter()
+                .is_none_or(|drafter| drafter.state().is_empty());
+        let phases = served_phases(&self.buckets)
+            .into_iter()
+            .filter(|phase| *phase != Phase::Refill || stateless)
+            .collect();
+
+        Ok(CausalLmConfig {
+            phases,
+            buckets: self.buckets.clone(),
+            slots: self.slots()?,
+            page_size: PAGE_TOKENS,
+            max_kv_len: self.engine_config().model.max_model_len,
+            candidates: self.engine_config().max_logprobs,
+            scratch_pages,
+            drafts,
+            draft_pool,
+        })
+    }
+
+    /// The runner of `model` under `config`, over the rank's `cache` and `state` and computing
+    /// in `graphs`, which replay on `stream` (`None` for graphs that hold no device), profiled
+    /// (steps 7 and 22).
+    ///
+    /// The runner issues its page work through the cache, its forwards split over the tensor
+    /// group `group` at this rank's place, and `member` makes it the rank's member of the node's
+    /// expert union: on a device its transport is created first, with `kernels`, on the stream
+    /// the runner's worker issues on.
+    ///
+    /// # Errors
+    ///
+    /// What the runner, the graphs, the union or a forward of the profile run refuse.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the runner is joined to six owners: the model, its graphs and stream, the cache, \
+                  the state, the tensor group and the expert union"
+    )]
+    pub(crate) fn runner(
+        &self,
+        model: Arc<dyn TextModel>,
+        config: CausalLmConfig,
+        graphs: Graphs,
+        stream: Option<Stream>,
+        cache: &Arc<Mutex<KvCacheMemory>>,
+        state: Option<&Arc<Mutex<StateMemory>>>,
+        group: Option<Arc<ops::Group>>,
+        member: Option<Member>,
+        kernels: &Generation,
+    ) -> Result<CausalLmRunner> {
+        let mut runner = {
+            let cache = service::lock(cache);
+            let state = state.map(|state| service::lock(state));
+            CausalLmRunner::over(
+                model,
+                config,
+                graphs,
+                stream.clone(),
+                &cache,
+                state.as_deref(),
+            )
+            .context("building the rank's causal runner")?
+        };
+        runner.set_page_work(page_work(
+            Arc::clone(cache),
+            state.map(Arc::clone),
+            stream.clone(),
+        ));
+
+        // The meta contexts take the split alone: a profile run issues no collective.
+        let (rank, ranks) = super::split(
+            self.mapping.tensor_rank as usize,
+            self.mapping.tensor_parallel as usize,
+        );
+        crate::runner::Runner::graphs(&runner).set_group(group, rank, ranks)?;
+
+        if let Some(mut member) = member {
+            if let Some(stream) = &stream {
+                member
+                    .create_transport(kernels, stream)
+                    .context("creating the expert union's transport")?;
+            }
+            runner
+                .join_union(member)
+                .context("joining the node's expert union")?;
+        }
+        Ok(runner)
+    }
+}
+
+/// Runs `runner`'s profile run: the forward of every bucket it states under the meta context, which
+/// states its region, shadow and input bytes and the kernels its graphs launch.
+///
+/// # Errors
+///
+/// What a forward refuses.
+pub(crate) fn profile(runner: &CausalLmRunner) -> Result<()> {
+    let graphs = crate::runner::Runner::graphs(runner);
+    graphs
+        .profile_run(runner)
+        .context("profiling the rank's causal runner")
+}
+
+/// Every kernel `runner` and the owners it reads launch: its graphs' profiled launches, the
+/// cache's copies and conversions, and the recurrent state's copies.
+///
+/// # Errors
+///
+/// When an owner's descriptors refuse its tensors.
+pub(crate) fn keys(
+    runner: &CausalLmRunner,
+    cache: &Mutex<KvCacheMemory>,
+    state: Option<&Mutex<StateMemory>>,
+) -> Result<Keys> {
+    let mut keys = crate::runner::Runner::graphs(runner).keys();
+    keys.extend(service::lock(cache).keys()?);
+    if let Some(state) = state {
+        keys.extend(service::lock(state).keys()?);
+    }
+    Ok(keys)
+}

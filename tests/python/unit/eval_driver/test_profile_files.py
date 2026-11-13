@@ -13,8 +13,8 @@ from uniserve_eval.profile.reader import STEP_BEGIN, STEP_END
 
 pytestmark = pytest.mark.unit
 
-# The tables of schema version 1 this test writes (`crates/worker/src/
-# profiling/session/artifact.rs` states the whole schema).
+# The tables of schema version 1 this test writes (`crates/engine/src/
+# profiling/artifact.rs` states the whole schema).
 _TABLES = """
 CREATE TABLE schema_version (version INTEGER NOT NULL);
 CREATE TABLE metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL);

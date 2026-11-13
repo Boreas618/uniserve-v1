@@ -1,6 +1,6 @@
 //! The scheduler's end of its queue pair, over a real `storage::QueuePair` whose buffer pool end
 //! the tests play by hand: they read the records the scheduler wrote and write completions.
-//! The executors are a recording double of the [`Executor`] interface.
+//! The executor is a recording double of the [`Executor`] interface.
 
 use std::collections::BTreeMap;
 use std::num::NonZeroUsize;
@@ -8,9 +8,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use crate::batch::cache::CacheGroupKind;
+use crate::batch::{Phase, Shape, Variant};
 use crossbeam_channel::{Receiver, Sender};
-use ipc::CacheGroupKind;
-use ipc::batch::{Phase, Shape, Variant};
 use proto::config::{
     BlockConfig, SchedulerConfig, VIDEO_CODEC_BLOCK, VIDEO_DECODER_BLOCK, WorkerGroupConfig,
     WorkerRank,
@@ -42,7 +42,7 @@ pub(super) const PRODUCT: u8 = 1;
 pub(super) const OWNER_A: OwnerId = OwnerId(10);
 const OWNER_B: OwnerId = OwnerId(11);
 
-/// What the executors were handed.
+/// What the executor was handed.
 #[derive(Default)]
 struct Recorded {
     stamps: Vec<(GroupId, runtime::Request)>,
@@ -58,7 +58,7 @@ struct Recorded {
 struct Recording(Arc<Mutex<Recorded>>);
 
 impl Executor for Recording {
-    fn submit(&self, _: ipc::batch::Batch) {}
+    fn submit(&self, _: crate::batch::Batch) {}
 
     fn map(
         &self,
@@ -84,7 +84,7 @@ impl Executor for Recording {
 pub(super) struct Bench {
     pub(super) scheduler: Scheduler,
     pub(super) pool: QueuePair,
-    executors: Arc<Mutex<Recorded>>,
+    executor: Arc<Mutex<Recorded>>,
 }
 
 /// The bench of [`built`] over groups A and B, both as [`capacity`] states them, once the
@@ -178,7 +178,7 @@ fn built(
     let pool = QueuePair::create(ring_bytes, 14).unwrap();
     let engine = QueuePair::open(pool.descriptor().try_clone_to_owned().unwrap(), true).unwrap();
 
-    let executors = Arc::new(Mutex::new(Recorded::default()));
+    let executor = Arc::new(Mutex::new(Recorded::default()));
     let (output, _) = crossbeam_channel::unbounded();
     let scheduler = Scheduler::new(
         config,
@@ -190,7 +190,7 @@ fn built(
         groups,
         policy.0,
         policy.1,
-        Box::new(Recording(Arc::clone(&executors))),
+        Box::new(Recording(Arc::clone(&executor))),
         output,
         Arc::new(AtomicU64::new(0)),
     )?;
@@ -198,7 +198,7 @@ fn built(
     Ok(Bench {
         scheduler,
         pool,
-        executors,
+        executor,
     })
 }
 
@@ -210,7 +210,7 @@ pub(crate) fn capacity() -> Capacity {
         cache_groups: Vec::new(),
         seeds: Vec::new(),
         buckets: Vec::new(),
-        rows: [0; ipc::batch::Phase::COUNT],
+        rows: [0; crate::batch::Phase::COUNT],
         max_model_len: 4096,
         denoise_steps: 0,
         bos_token_id: 0,
@@ -246,13 +246,13 @@ impl Bench {
             input: input.into(),
             arrival: now,
             status: RequestStatus::WaitingForRemoteKvs,
-            placement: [None; ipc::batch::Phase::COUNT],
+            placement: [None; crate::batch::Phase::COUNT],
             attachments: attachments
                 .iter()
                 .map(|&(group, owner, slot)| (group, owner, slot, false))
                 .collect(),
-            scheduled: [0; ipc::batch::Phase::COUNT],
-            completed: [0; ipc::batch::Phase::COUNT],
+            scheduled: [0; crate::batch::Phase::COUNT],
+            completed: [0; crate::batch::Phase::COUNT],
             early: Vec::new(),
             blocks: vec![Blocks::default(); 2],
             queued: true,
@@ -316,7 +316,7 @@ impl Bench {
     }
 
     pub(super) fn stamps(&self) -> Vec<(GroupId, runtime::Request)> {
-        std::mem::take(&mut self.executors.lock().unwrap().stamps)
+        std::mem::take(&mut self.executor.lock().unwrap().stamps)
     }
 
     fn maps(
@@ -328,7 +328,7 @@ impl Bench {
         runtime::Request,
         Completion,
     )> {
-        std::mem::take(&mut self.executors.lock().unwrap().maps)
+        std::mem::take(&mut self.executor.lock().unwrap().maps)
     }
 }
 
@@ -639,7 +639,7 @@ fn a_completion_for_a_forgotten_owner_is_dropped_and_its_copy_given_up() {
 
     assert!(bench.answers().is_empty());
     assert!(bench.maps().is_empty());
-    // The copy no executor will run is given up through its group's executor.
+    // The copy no worker will run is given up through the executor.
     assert_eq!(
         bench.stamps(),
         [(
@@ -953,12 +953,12 @@ fn a_scheduler_starts_by_listing_its_sessions_cached_blocks_and_orders_them() {
     assert_eq!(requests, [victims]);
 }
 
-/// The constructor refuses a deployment its executors cannot serve (SD §7.1): no group, a group
+/// The constructor refuses a deployment its workers cannot serve (SD §7.1): no group, a group
 /// of token sequences without a longest sequence, a KV cache with fewer slots than running
 /// requests, encoders of weights of different identities, whose outputs no one key finds (SD
 /// §4.3), and a video decoder whose units no video encoder reads on the hosts that decoded them.
 #[test]
-fn the_startup_checks_refuse_a_deployment_its_executors_cannot_serve() {
+fn the_startup_checks_refuse_a_deployment_its_workers_cannot_serve() {
     let idle = || (idle_policy(), Parameters::default());
     let refusal = |groups| match built(1024, SchedulerConfig::default(), groups, idle()) {
         Err(super::Error::InvalidRequest(message)) => message,
@@ -1030,11 +1030,11 @@ fn the_startup_checks_refuse_a_deployment_its_executors_cannot_serve() {
     assert!(built(1024, SchedulerConfig::default(), beside, idle()).is_ok());
 }
 
-/// `Configure` refuses a limit above what the executors hold, naming it: running requests beyond
+/// `Configure` refuses a limit above what the workers hold, naming it: running requests beyond
 /// the slots of the groups that serve a phase together, a step's tokens beyond the widest prefill
 /// bucket, its calls beyond the largest bucket's rows (SD §7.1). Limits within them are taken.
 #[test]
-fn configure_refuses_a_limit_above_what_the_executors_hold() {
+fn configure_refuses_a_limit_above_what_the_workers_hold() {
     // Both groups prefill over 16 slots each and captured one bucket of 8 rows and 512 tokens.
     let prefills = Capacity {
         phases: 1 << Phase::Prefill.index(),
@@ -1092,7 +1092,7 @@ fn configure_refuses_a_limit_above_what_the_executors_hold() {
     ];
     for (name, config) in beyond {
         let Err(super::Error::InvalidRequest(message)) = configure(config) else {
-            panic!("{name} beyond the executors is refused");
+            panic!("{name} beyond the workers is refused");
         };
         assert!(message.contains(name), "{message}");
     }
@@ -1182,7 +1182,7 @@ fn the_loop_ends_at_shutdown_and_once_its_inbox_has_no_sender() {
     }
 }
 
-/// An executor's failed job outside a batch stops the scheduler at once: `run` returns, and the
+/// The executor's failed job outside a batch stops the scheduler at once: `run` returns, and the
 /// engine is told with `Output::Failed`, which carries the executor's error.
 #[test]
 fn a_failed_executor_job_stops_the_loop_and_reaches_the_engine() {

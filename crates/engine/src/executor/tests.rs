@@ -1,27 +1,31 @@
-//! The engine's executor over the worker's executors with no device: a worker group of one or two
-//! ranks, each an executor over a runner that holds no model. The tests read what reaches the
+//! A scheduler's executor over workers with no device: a worker group of one or two ranks, each
+//! a worker over a runner that holds no model. The tests read what reaches the
 //! scheduler's channel.
 
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use crossbeam_channel::{Receiver, Sender};
-use ipc::RequestId;
-use ipc::batch::{
+use crate::batch::{
     Batch, BatchId, BatchOutput, CallOutput, CallStatus, Columns, Phase, Shape, Variant,
 };
+use crate::executor::Route;
+use crate::memory::tables::{BlockCopy, BlockTables};
+use crate::runner::Runner;
+use crate::runner::buckets::Bucket;
+use crate::runner::graphs::Graphs;
+use crate::worker::Sequences;
+use crate::worker::completion::Outcome;
+use crossbeam_channel::{Receiver, Sender};
 use ops::Generation;
+use proto::request::RequestId;
+use service::lock;
 use storage::Key;
 use storage::runtime::{self, Completion, GroupId, OwnerId, Request, Tier};
 use tensor::Tensor;
-use worker::buckets::Bucket;
-use worker::completion::Outcome;
-use worker::executor::{Executors, Sequences};
-use worker::memory::tables::{BlockCopy, BlockTables};
-use worker::{Graphs, Runner, lock};
 
-use super::{Groups, Shadow};
-use crate::scheduler::{Executor as _, Message};
+use super::{Shadow, WorkerExecutor};
+use crate::executor::Executor as _;
+use crate::scheduler::Message;
 
 pub(crate) const GROUP: GroupId = GroupId(3);
 
@@ -53,17 +57,17 @@ impl Runner for Answering {
         Vec::new()
     }
 
-    fn forward(&self, _: &Bucket) -> worker::Result<Vec<Tensor>> {
-        Err(worker::Error::Unsupported(
+    fn forward(&self, _: &Bucket) -> crate::worker::Result<Vec<Tensor>> {
+        Err(crate::worker::Error::Unsupported(
             "the runner holds no model".to_owned(),
         ))
     }
 
-    fn idle_inputs(&self, _: &Bucket, _: &mut [u8]) -> worker::Result<()> {
+    fn idle_inputs(&self, _: &Bucket, _: &mut [u8]) -> crate::worker::Result<()> {
         Ok(())
     }
 
-    fn prepare_inputs(&mut self, batch: &Batch, _: &BlockTables) -> worker::Result<Bucket> {
+    fn prepare_inputs(&mut self, batch: &Batch, _: &BlockTables) -> crate::worker::Result<Bucket> {
         Ok(Bucket::decode(batch.shape.rows, batch.shape.variant))
     }
 
@@ -71,14 +75,14 @@ impl Runner for Answering {
         &mut self,
         batch: &Batch,
         tables: &BlockTables,
-    ) -> worker::Result<Bucket> {
+    ) -> crate::worker::Result<Bucket> {
         lock(&self.shadowed).push(batch.id.0);
         self.prepare_inputs(batch, tables)
     }
 
-    fn execute(&mut self, batch: &Batch, _: &BlockTables) -> worker::Result<BatchOutput> {
+    fn execute(&mut self, batch: &Batch, _: &BlockTables) -> crate::worker::Result<BatchOutput> {
         if batch.id.0 == FAILING {
-            return Err(worker::Error::Invalid(
+            return Err(crate::worker::Error::Invalid(
                 "the runner fails this batch".to_owned(),
             ));
         }
@@ -93,7 +97,7 @@ impl Runner for Answering {
         &self.graphs
     }
 
-    fn copy(&mut self, _: &[BlockCopy]) -> worker::Result<()> {
+    fn copy(&mut self, _: &[BlockCopy]) -> crate::worker::Result<()> {
         Ok(())
     }
 
@@ -120,24 +124,24 @@ fn sampled(token: u64) -> CallOutput {
     }
 }
 
-/// A node's `ranks` ranks of `GROUP` serving generation 1, each an executor over one
+/// A node's `ranks` ranks of `GROUP` serving generation 1, each a worker over one
 /// [`Answering`] that records the batches it prepares paired forwards for into `shadowed`, and
 /// the route over them.
 pub(crate) fn node(
     ranks: usize,
     shadowed: &Arc<Mutex<Vec<u64>>>,
-) -> (Arc<Executors>, Vec<Arc<worker::Executor>>) {
+) -> (Arc<Route>, Vec<Arc<crate::worker::Worker>>) {
     let kernels = Arc::new(Generation::new(1, []));
     let sequences = Sequences::new(GROUP, ranks, Vec::new());
 
-    let executors: Vec<Arc<worker::Executor>> = (0..ranks)
+    let workers: Vec<Arc<crate::worker::Worker>> = (0..ranks)
         .map(|rank| {
             let runner = Answering {
                 phases: vec![Phase::Decode],
                 graphs: Graphs::meta(Arc::clone(&kernels), 0),
                 shadowed: Arc::clone(shadowed),
             };
-            let executor = worker::Executor::spawn(
+            let worker = crate::worker::Worker::spawn(
                 None,
                 vec![Box::new(runner)],
                 Arc::clone(&kernels),
@@ -145,34 +149,35 @@ pub(crate) fn node(
                 BlockTables::new(GROUP, &[DEVICE, HOST], &[(DEVICE, 64), (HOST, 64)]),
                 Arc::clone(&sequences),
                 rank,
-                worker::executor::COPY_BUDGET,
+                crate::worker::COPY_BUDGET,
             );
-            Arc::new(executor.unwrap())
+            Arc::new(worker.unwrap())
         })
         .collect();
 
-    let route = Executors::new(vec![sequences], executors.clone(), Vec::new()).unwrap();
-    (Arc::new(route), executors)
+    let route = Route::new(vec![sequences], workers.clone(), Vec::new()).unwrap();
+    (Arc::new(route), workers)
 }
 
-/// The engine's executor of a scheduler of `GROUP` over `route`, with the shadow pass `shadow`,
+/// The executor of a scheduler of `GROUP` over `route`, with the shadow pass `shadow`,
 /// and the scheduler's channel.
-fn groups(route: &Arc<Executors>, shadow: &Arc<Mutex<Shadow>>) -> (Groups, Receiver<Message>) {
+fn groups(route: &Arc<Route>, shadow: &Arc<Mutex<Shadow>>) -> (WorkerExecutor, Receiver<Message>) {
     let (inbox, messages) = crossbeam_channel::unbounded();
-    let groups = Groups::new(Arc::clone(route), &[GROUP], inbox, Arc::clone(shadow)).unwrap();
+    let groups =
+        WorkerExecutor::new(Arc::clone(route), &[GROUP], inbox, Arc::clone(shadow)).unwrap();
     (groups, messages)
 }
 
-/// The engine's executor of a scheduler of `GROUP` over `ranks` new ranks, with no shadow pass
+/// The executor of a scheduler of `GROUP` over `ranks` new ranks, with no shadow pass
 /// open, and the scheduler's channel.
-fn served(ranks: usize) -> (Groups, Receiver<Message>) {
+fn served(ranks: usize) -> (WorkerExecutor, Receiver<Message>) {
     let (route, _) = node(ranks, &Arc::default());
     groups(&route, &Arc::default())
 }
 
 /// Everything the scheduler is ever sent: the executor is dropped, so its waiters have sent all
 /// they will.
-fn sent(groups: Groups, messages: &Receiver<Message>) -> Vec<Message> {
+fn sent(groups: WorkerExecutor, messages: &Receiver<Message>) -> Vec<Message> {
     drop(groups);
     messages.try_iter().collect()
 }
@@ -196,7 +201,7 @@ fn decode(id: u64, rows: u32) -> Batch {
 
 /// Holds `rank` inside a control operation until the returned sender is dropped; returns once
 /// the operation is in flight.
-fn hold(rank: &worker::Executor) -> Sender<()> {
+fn hold(rank: &crate::worker::Worker) -> Sender<()> {
     let (entered, in_flight) = crossbeam_channel::bounded(1);
     let (release, released) = crossbeam_channel::bounded::<()>(1);
 

@@ -20,8 +20,8 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use engine::batch::Phase;
 use engine::scheduler::{Message, policy};
-use ipc::batch::Phase;
 use proto::request::{Event, FinishReason, MigrationCause, RequestId};
 use scheduling::{Nanos, Parameters};
 use storage::runtime::Request;
@@ -129,7 +129,7 @@ fn a_shortage_that_retiring_units_cover_waits_for_available_and_takes_no_victim(
 
 /// Under a shortage, draft blocks are given up before any victim is taken: the idle running
 /// request with the fewest tokens left gives up its whole draft table by one `Release` through
-/// the executors, before anything is evicted, any request returns to the queue or ends, and
+/// the executor, before anything is evicted, any request returns to the queue or ends, and
 /// before the idle request with more tokens left gives up its own (SD §3.6, §4.4 "Drafts
 /// first", §7.2 "Draft release"). Two requests are idle while the daemon's decoder has not
 /// passed their outputs (stop strings); the third grows until the region is short.
@@ -184,7 +184,7 @@ fn draft_blocks_are_given_up_first_by_the_idle_request_with_the_fewest_tokens_le
 
 /// Under a shortage that no draft relieves, an admission under way returns to the waiting queue
 /// before the policy is asked for victims: its owner is detached (its `Detach` handed to the
-/// executors), nothing is evicted and no running request ends; the admission starts again later
+/// executor), nothing is evicted and no running request ends; the admission starts again later
 /// with a new owner, and every request runs to its end (SD §3.6 `return_admissions`, §3.5
 /// `Full`). The admission reads the prompt blocks of the request that grows, and its `Pinned` is
 /// withheld, so that it holds the blocks of its `Allocated` while it waits; the withheld answer

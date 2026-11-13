@@ -1,14 +1,15 @@
-//! The engine's executor: the [`scheduler::Executor`](crate::scheduler::Executor) of one
-//! scheduler, over the node's executors ([`worker::executor::Executors`]).
+//! A scheduler's executor: the [`Executor`] the scheduler hands its batches, completions and
+//! stamps to, and [`WorkerExecutor`], the executor over the node's workers and peers.
 //!
 //! A scheduler hands its executor a batch to run, a completion of the buffer pool to map into a
 //! group's device block tables, and requests for a group to stamp (`specs/scheduler-design.md`
-//! §2.1, `Executor`). [`Groups`] hands each to the node's executors of the worker group it names,
-//! which number the group's jobs and give them to every rank of the group in the order they were
-//! handed, and returns what they produce to the scheduler as [`Message`]s on its one channel:
+//! §2.1, `Executor`). [`WorkerExecutor`] hands each to the node's [`Route`], which numbers the
+//! jobs of the worker group they name and gives them to every rank of the group, the workers of
+//! this node and the peers that hold its other ranks ([`peers`]), in the order they were handed,
+//! and it returns what they produce to the scheduler as [`Message`]s on its one channel:
 //!
 //! - a batch's output arrives exactly once, as `Message::Output`: the runner's output, or the
-//!   error of a batch the executors refused or failed;
+//!   error of a batch the workers refused or failed;
 //! - the `Finish` of each copy that ran with a batch arrives just before the batch's output, as
 //!   one `Message::Submit`, each `Finish` stamped by the group with that batch. A batch that
 //!   failed after copies had started with it carries a `Finish { ok: false }` for each
@@ -23,44 +24,90 @@
 //! ## Threads and state
 //!
 //! The scheduler's thread calls `submit`, `map` and `stamp`, which hand the job to the node's
-//! executors and never wait for it. Each worker group of the scheduler has one waiter thread,
-//! which takes the group's submissions in the order they were handed and blocks on each in turn
-//! until it completes. The executors complete a group's jobs in that order, so a waiter never
-//! waits behind a job that ended after a later one, and since it is the only thread that sends
-//! its group's messages, they arrive in the order the group's jobs were done. Nothing runs on an
-//! executor's thread: a waker would run there, and may only signal.
+//! route and never wait for it. Each worker group of the scheduler has one waiter thread, which
+//! takes the group's submissions in the order they were handed and blocks on each in turn until
+//! it completes. The workers complete a group's jobs in that order, so a waiter never waits
+//! behind a job that ended after a later one, and since it is the only thread that sends its
+//! group's messages, they arrive in the order the group's jobs were done. Nothing runs on a
+//! worker's thread: a waker would run there, and may only signal.
 //!
-//! [`Groups`] owns the waiters: dropping it closes their channels and joins them once the
-//! submissions they hold have completed. The node's executors are shared with the control thread
-//! and the node's other schedulers, whose groups are other groups.
+//! [`WorkerExecutor`] owns the waiters: dropping it closes their channels and joins them once the
+//! submissions they hold have completed. The node's route is shared with the control thread and
+//! the node's other schedulers, whose groups are other groups.
 //!
 //! ## Shadow batches
 //!
 //! A generation update compares each kernel it replaces with the serving one on the batches the
-//! scheduler serves (`worker::Executor::shadow`). The scheduler does not know of it: the engine's
+//! scheduler serves (`worker::Worker::shadow`). The scheduler does not know of it: the engine's
 //! control thread opens a pass of the prepared generation on a [`Shadow`], and while the pass is
-//! open `submit` also hands the executors each batch whose group and shape the pass has not
-//! shadowed yet as a shadow batch of that generation, right after the batch itself. The pass
-//! answers once every shadow batch it started has ended.
+//! open `submit` also hands the route each batch whose group and shape the pass has not shadowed
+//! yet as a shadow batch of that generation, right after the batch itself. The pass answers once
+//! every shadow batch it started has ended.
+
+pub mod peers;
+pub(crate) mod route;
 
 use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 
 use crossbeam_channel::{Receiver, Sender};
-use ipc::batch::{Batch, BatchOutput, Shape};
+use service::lock;
 use storage::runtime::{self, Completion, GroupId};
-use worker::completion::{Outcome, Submission};
-use worker::executor::Executors;
-use worker::lock;
 
-use crate::scheduler::{self, Error, Message};
+pub use self::route::Route;
+use crate::batch::{Batch, BatchOutput, Shape};
+use crate::scheduler::{Error, Message};
+use crate::worker::completion::{Outcome, Submission};
 
-/// The executor of one scheduler's worker groups (module documentation).
-pub struct Groups {
-    /// The node's executors, by worker group: shared with the control thread and the node's
-    /// other schedulers.
-    executors: Arc<Executors>,
+/// The executor of a scheduler's worker groups, as the scheduler drives it (BP §9 and §17, A1
+/// to A4).
+///
+/// - `submit`: the batch's output arrives exactly once as [`Message::Output`].
+/// - `map`: a completion that gives entries (`Attached`, `Allocated`, `Pinned`, `Transferred`,
+///   `Copy`, and the answers to a copy's `Finish`: `Loaded`, `Cloned`, `Duplicate`), with the
+///   request it answers and that request's number, is written into `group`'s device block tables
+///   at the positions the request names, under `slot` (the slot row of the request's owner on
+///   that group; for a group that reads a class it does not write, the slot of the request's own
+///   owner there), or its copies are queued, before the group's next batch launches. The entries
+///   of a `Load` or a `Clone` appear with the answer to its `Finish`, read-only for a `Load` and
+///   writable for a `Clone`. The executor writes no entry from any other source. A queued copy
+///   runs with the group's next batch, and its `Finish { copy, ok, after }`, with the group's
+///   stamp, returns in [`Message::Submit`].
+/// - `stamp`: `Release`, `Detach`, `Commit` and `Transfer`, and the `Finish { ok: false }` that
+///   gives a copy up, are applied to `group`'s device block tables (the entries a `Release`, a
+///   `Detach` or a `Transfer` names are removed, the entry a `Commit` names is marked read-only; a
+///   given-up copy joins no further batch and is dropped if it has not started), stamped with
+///   the sequence of the last batch the group launched in their `after`, and every one of them
+///   returns in [`Message::Submit`]. A given-up copy that has started is covered by that stamp
+///   and gets no `Finish` of its own.
+/// - A batch writes only entries that came from `Allocated` or `Cloned` and that no `Commit` has
+///   marked, and a copy's destination is written only by that copy.
+pub trait Executor: Send {
+    /// Runs a batch on its group.
+    fn submit(&self, batch: Batch);
+
+    /// Writes the entries a completion gives into `group`'s device block tables, or queues its
+    /// copies.
+    fn map(
+        &self,
+        group: GroupId,
+        slot: u32,
+        id: runtime::RequestId,
+        request: runtime::Request,
+        completion: Completion,
+    );
+
+    /// Applies requests to `group`'s device block tables and returns them stamped.
+    fn stamp(&self, group: GroupId, requests: Vec<runtime::Request>);
+}
+
+/// The executor of one scheduler's worker groups over the node's workers and peers (module
+/// documentation).
+pub(crate) struct WorkerExecutor {
+    /// The route of each worker group's jobs to its ranks: shared with the control thread and
+    /// the node's other schedulers.
+    route: Arc<Route>,
     /// Per worker group of the scheduler, in the order given: the group and the channel of its
     /// waiter.
     waiters: Vec<(GroupId, Sender<Wait>)>,
@@ -71,8 +118,8 @@ pub struct Groups {
 }
 
 /// One submission a group's waiter waits for, in the order the job was handed to the group's
-/// executors, with what the scheduler is sent once it completes. A job the executors refused
-/// carries the refusal in place of its submission.
+/// ranks, with what the scheduler is sent once it completes. A job the route refused carries the
+/// refusal in place of its submission.
 #[expect(
     clippy::large_enum_variant,
     reason = "a batch travels by value once per batch, to its `Message::Output`"
@@ -80,30 +127,30 @@ pub struct Groups {
 enum Wait {
     /// A batch: the `Finish` of each copy that ran with it goes to the scheduler as
     /// `Message::Submit`, then its output as `Message::Output`.
-    Batch(Batch, worker::Result<Submission>),
+    Batch(Batch, crate::worker::Result<Submission>),
     /// A shadow batch of the pass numbered here: its outcome goes to the pass.
-    Shadow(u64, worker::Result<Submission>),
+    Shadow(u64, crate::worker::Result<Submission>),
     /// The map of the completion of the request numbered here: nothing is sent.
-    Map(runtime::RequestId, worker::Result<Submission>),
+    Map(runtime::RequestId, crate::worker::Result<Submission>),
     /// A stamp: its requests go to the scheduler as `Message::Submit`.
-    Stamp(worker::Result<Submission>),
+    Stamp(crate::worker::Result<Submission>),
 }
 
-impl Groups {
-    /// The executor of a scheduler whose worker groups are `groups`, over `executors`, the
-    /// node's, with one waiter thread per group, which sends what the group's executors return
-    /// to the scheduler's channel `inbox`. `shadow` is the pass the engine opens over this
-    /// scheduler's batches; the engine keeps a clone of it.
+impl WorkerExecutor {
+    /// The executor of a scheduler whose worker groups are `groups`, over `route`, the node's,
+    /// with one waiter thread per group, which sends what the group's ranks return to the
+    /// scheduler's channel `inbox`. `shadow` is the pass the engine opens over this scheduler's
+    /// batches; the engine keeps a clone of it.
     ///
-    /// A job of a group that is not one of `groups` is refused without reaching the executors:
-    /// they hold other schedulers' groups too.
+    /// A job of a group that is not one of `groups` is refused without reaching the route: it
+    /// holds other schedulers' groups too.
     ///
     /// # Errors
     ///
     /// [`Error::Executor`] for no group, a group given twice, or a waiter thread that cannot
     /// start.
-    pub fn new(
-        executors: Arc<Executors>,
+    pub(crate) fn new(
+        route: Arc<Route>,
         groups: &[GroupId],
         inbox: Sender<Message>,
         shadow: Arc<Mutex<Shadow>>,
@@ -121,7 +168,7 @@ impl Groups {
         // Built as the waiters start, so a thread that cannot start leaves the ones before it to
         // be joined by `Drop`.
         let mut built = Self {
-            executors,
+            route,
             waiters: Vec::with_capacity(groups.len()),
             threads: Vec::with_capacity(groups.len()),
             shadow,
@@ -146,18 +193,18 @@ impl Groups {
         Ok(built)
     }
 
-    /// Hands a job of `group` to the executors through `hand`, unless `group` is not one of the
+    /// Hands a job of `group` to the route through `hand`, unless `group` is not one of the
     /// scheduler's.
     fn hand(
         &self,
         group: GroupId,
-        hand: impl FnOnce(&Executors) -> worker::Result<Submission>,
-    ) -> worker::Result<Submission> {
+        hand: impl FnOnce(&Route) -> crate::worker::Result<Submission>,
+    ) -> crate::worker::Result<Submission> {
         if self.waiters.iter().any(|(served, _)| *served == group) {
-            return hand(&self.executors);
+            return hand(&self.route);
         }
 
-        Err(worker::Error::Invalid(format!(
+        Err(crate::worker::Error::Invalid(format!(
             "worker group {} is not one of this scheduler's",
             group.0
         )))
@@ -183,13 +230,13 @@ impl Groups {
     }
 }
 
-impl scheduler::Executor for Groups {
-    /// Hands `batch` to the executors of its group, and while a shadow pass is open, a shadow
-    /// batch of it right after when the pass has not shadowed its group and shape. The batch is
-    /// kept for its `Message::Output`; the executors take a copy.
+impl Executor for WorkerExecutor {
+    /// Hands `batch` to the ranks of its group, and while a shadow pass is open, a shadow batch
+    /// of it right after when the pass has not shadowed its group and shape. The batch is kept
+    /// for its `Message::Output`; the ranks take a copy.
     fn submit(&self, batch: Batch) {
         let group = batch.group;
-        let submission = self.hand(group, |executors| executors.submit(batch.clone()));
+        let submission = self.hand(group, |route| route.submit(batch.clone()));
 
         let shadow = match &submission {
             Ok(_) => lock(&self.shadow).shadow(&batch),
@@ -198,7 +245,7 @@ impl scheduler::Executor for Groups {
         self.send(group, Wait::Batch(batch, submission));
 
         if let Some((pass, shadow)) = shadow {
-            let submission = self.hand(group, |executors| executors.shadow(shadow));
+            let submission = self.hand(group, |route| route.shadow(shadow));
             self.send(group, Wait::Shadow(pass, submission));
         }
     }
@@ -211,8 +258,8 @@ impl scheduler::Executor for Groups {
         request: runtime::Request,
         completion: Completion,
     ) {
-        let submission = self.hand(group, |executors| {
-            executors.map(group, slot, id, request, completion)
+        let submission = self.hand(group, |route| {
+            route.map(group, slot, id, request, completion)
         });
         self.send(group, Wait::Map(id, submission));
     }
@@ -222,12 +269,12 @@ impl scheduler::Executor for Groups {
             return;
         }
 
-        let submission = self.hand(group, |executors| executors.stamp(group, requests));
+        let submission = self.hand(group, |route| route.stamp(group, requests));
         self.send(group, Wait::Stamp(submission));
     }
 }
 
-impl Drop for Groups {
+impl Drop for WorkerExecutor {
     fn drop(&mut self) {
         // A waiter ends once its channel is closed and the submissions in it have completed.
         self.waiters.clear();
@@ -298,23 +345,23 @@ fn wait(group: GroupId, waits: &Receiver<Wait>, inbox: &Sender<Message>, shadow:
 }
 
 /// What a submission returned once it completed: a batch's output and the requests the group's
-/// executors hand back for the submission queue; or the failure in words, the refusal of a job
-/// the executors did not take included, with the `Finish { ok: false }` of each copy that had
-/// started with a failed batch, which the group's executors applied and stamped
+/// workers hand back for the submission queue; or the failure in words, the refusal of a job the
+/// route did not take included, with the `Finish { ok: false }` of each copy that had started
+/// with a failed batch, which the group's workers applied and stamped
 /// (`worker::Error::finished`; none for any other failure).
 fn returned(
-    submission: worker::Result<Submission>,
+    submission: crate::worker::Result<Submission>,
 ) -> Result<(BatchOutput, Vec<runtime::Request>), (String, Vec<runtime::Request>)> {
     match submission.map(|submission| submission.wait()) {
         Ok(Outcome::Success(returned)) => Ok(returned),
         Ok(Outcome::Failed(fault)) => {
             let finished = fault
-                .downcast_ref::<worker::Error>()
+                .downcast_ref::<crate::worker::Error>()
                 .map_or_else(Vec::new, |error| error.finished().to_vec());
             Err((fault.to_string(), finished))
         }
         Ok(Outcome::Cancelled) => Err((
-            "the executors closed before they ran the job".to_owned(),
+            "the workers closed before they ran the job".to_owned(),
             Vec::new(),
         )),
         Err(refused) => Err((refused.to_string(), refused.finished().to_vec())),
@@ -348,11 +395,11 @@ pub struct Shadow {
 
 impl Shadow {
     /// Opens a pass of `generation`, which every rank of the scheduler's groups has prepared
-    /// beside the serving one (`worker::Executor::prepare`). From the next batch on, each batch
+    /// beside the serving one (`worker::Worker::prepare`). From the next batch on, each batch
     /// whose group and shape the pass has not shadowed is also run as a shadow batch of
     /// `generation`. Once every shadow batch the pass started has ended, and at least one has,
     /// the pass closes and `reply` receives `Ok(())`, or [`Error::Executor`] with its first
-    /// failure: a pair of kernels beyond its tolerance, or a shadow batch the executors refused
+    /// failure: a pair of kernels beyond its tolerance, or a shadow batch the ranks refused
     /// or failed. A pass still open is ended first, unanswered.
     pub fn open(&mut self, generation: u64, reply: Sender<Result<(), Error>>) {
         self.passes += 1;

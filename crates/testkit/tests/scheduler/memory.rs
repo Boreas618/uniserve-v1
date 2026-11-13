@@ -20,9 +20,9 @@
 use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 
+use engine::batch::cache::CacheGroupKind;
+use engine::batch::{Batch, Phase};
 use engine::scheduler::Message;
-use ipc::CacheGroupKind;
-use ipc::batch::{Batch, Phase};
 use proto::request::{Event, FinishReason, MigrationCause, RejectionKind, RequestId};
 use storage::Key;
 use storage::key::{page_key, page_root};
@@ -243,7 +243,7 @@ fn a_prompt_longer_than_the_region_is_computed_in_chunks_when_a_window_bounds_it
     assert!(released, "the blocks behind the window were given up");
 }
 
-/// The batches `harness`'s executors launched on group `group`, in launch order: a stamp names
+/// The batches `harness`'s workers launched on group `group`, in launch order: a stamp names
 /// the last of them by its position from 1.
 fn launched(harness: &Harness, group: GroupId) -> Vec<Batch> {
     let batches = harness.batches().into_iter();
@@ -252,7 +252,7 @@ fn launched(harness: &Harness, group: GroupId) -> Vec<Batch> {
 
 /// A sliding window gives up its blocks behind the window as the request runs, and never one a
 /// later call reads: every `Release` of the window's class names blocks that lie entirely before
-/// the window of every row launched after the executor stamped it (`[position + 1 - window,
+/// the window of every row launched after the workers stamped it (`[position + 1 - window,
 /// position]`), the releases follow each other from the table's first block, and the
 /// full-attention class gives up nothing (SD §4.4 "Giving up behind", §7.4).
 #[test]

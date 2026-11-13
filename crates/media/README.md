@@ -1,6 +1,6 @@
 # media
 
-Host media of the main process: H.264/AAC output encoding and MP4 muxing, conditional media reading, and the host resamplers model conditioning uses. The crate is called by `crates/worker`'s media runner on the main process's blocking thread pool.
+Host media of the main process: H.264/AAC output encoding and MP4 muxing, conditional media reading, and the host resamplers model conditioning uses. The crate is called by the engine's media runner (`crates/engine/src/runner/media.rs`) on the main process's blocking thread pool.
 
 ## Native runtime
 

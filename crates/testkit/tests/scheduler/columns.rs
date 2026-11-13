@@ -1,6 +1,6 @@
 //! The batch's columns (SD §8.1): what each token phase's row writes into the host columns the
 //! runner copies into its input tensors (SD §2.3, §3.4 "What the three row functions write", §7.2
-//! "Sampling address"), restated on the batches `schedule` hands to the executors.
+//! "Sampling address"), restated on the batches `schedule` hands to the executor.
 //!
 //! A row's commit cells follow the commit table's meaning (`proto::module::commit`): its slot; its
 //! mode (a prefill that samples states its lengths explicitly, a decode advances them by one, a
@@ -11,11 +11,11 @@
 //! sampling position counts its draws: one for the prompt's token and one per decode, none for a
 //! verification (SD §7.2 "Sampling address").
 
-use ipc::CacheGroupKind;
-use ipc::batch::{
+use engine::batch::cache::CacheGroupKind;
+use engine::batch::philox::request_sampling_key;
+use engine::batch::{
     Batch, DraftWork, NewSlot, Phase, Row, StateCopy, StateDirection, Variant, VisionRows,
 };
-use ipc::philox::request_sampling_key;
 use proto::module::commit::{COMMIT_FIELDS, column, mode};
 use proto::request::{GenerationRequest, SamplingParams};
 use storage::runtime::{Completion, Request};

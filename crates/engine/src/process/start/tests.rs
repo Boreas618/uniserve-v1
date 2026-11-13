@@ -11,17 +11,17 @@
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
-use ipc::Capacity;
-use ipc::batch::{Phase, Shape, Variant};
+use crate::batch::Capacity;
+use crate::batch::{Phase, Shape, Variant};
+use crate::executor::peers::{LOST_EXIT, Liveness};
 use proto::request::GenerationLimits;
 use storage::runtime::GroupId;
-use worker::executor::peers::{LOST_EXIT, Liveness};
 
 use super::{FIRST_GENERATION, lowered, start};
+use crate::memory::client::StorageClient;
 use crate::process::epoch::kv_regions;
 use crate::process::ranks::layout;
 use crate::process::ranks::tests::{FAST_H3, loaded, video_launch};
-use crate::storage_client::StorageClient;
 use crate::support::{DEPLOYMENT, StorageServer, launch};
 
 #[test]
@@ -30,7 +30,7 @@ fn a_meta_start_builds_one_engine_whose_close_ends_the_session() {
     let mut launch = launch();
     launch.engine_config.device.device = "meta".to_owned();
     let registry = nn::family::Registry::new([models::qwen3::family::FAMILY]).unwrap();
-    let storage = ipc::StorageLaunch {
+    let storage = crate::memory::client::StorageLaunch {
         socket: server.socket.to_string_lossy().into_owned(),
         deployment: launch.engine_config.deployment.clone(),
         claim: [0; 16],
@@ -52,7 +52,7 @@ fn a_meta_start_builds_one_engine_whose_close_ends_the_session() {
     assert_eq!(engine.served.load(Ordering::Acquire), FIRST_GENERATION);
     assert_eq!(engine.schedulers.len(), 1);
     assert!(engine.route.is_none());
-    assert_eq!(engine.executors.len(), 1);
+    assert_eq!(engine.workers.len(), 1);
     assert_eq!(engine.capacities.len(), 1);
     // The launch's model states no feature; the engine serves what its group's phases do.
     assert!(
@@ -69,7 +69,7 @@ fn a_meta_start_builds_one_engine_whose_close_ends_the_session() {
     );
     let (open, opened) = {
         let head = engine.head.as_ref().unwrap();
-        let head = worker::lock(head);
+        let head = service::lock(head);
         let (open, opened) = head.session().unwrap();
         (open.clone(), opened.clone())
     };
@@ -82,7 +82,7 @@ fn a_meta_start_builds_one_engine_whose_close_ends_the_session() {
     let mut successor = launch.clone();
     successor.epoch = 2;
     let next_open = layout(&successor, &loaded(&successor)).unwrap();
-    let mut next = StorageClient::connect(&server.socket, DEPLOYMENT, 2).unwrap();
+    let mut next = StorageClient::connect_head(&server.socket, DEPLOYMENT, 2).unwrap();
     let _pairs = next.open(next_open).unwrap();
     let (_, next_opened) = next.session().unwrap();
     let limit = open.regions[kv].limit;
@@ -104,7 +104,7 @@ fn a_meta_start_builds_one_engine_whose_close_ends_the_session() {
     engine
         .close(|scheduler, output| outputs.push((scheduler, output)))
         .unwrap();
-    let mut again = StorageClient::connect(&server.socket, DEPLOYMENT, launch.epoch).unwrap();
+    let mut again = StorageClient::connect_head(&server.socket, DEPLOYMENT, launch.epoch).unwrap();
     let _pairs = again.open(open).unwrap();
     again.close().unwrap();
     assert!(
@@ -121,7 +121,7 @@ fn a_meta_start_of_a_media_launch_builds_one_engine_whose_close_ends_the_session
     let mut launch = video_launch();
     launch.engine_config.device.device = "meta".to_owned();
     let registry = nn::family::Registry::new([models::minimax_h3::family::FAMILY]).unwrap();
-    let storage = ipc::StorageLaunch {
+    let storage = crate::memory::client::StorageLaunch {
         socket: server.socket.to_string_lossy().into_owned(),
         deployment: launch.engine_config.deployment.clone(),
         claim: [0; 16],
@@ -135,7 +135,7 @@ fn a_meta_start_of_a_media_launch_builds_one_engine_whose_close_ends_the_session
     let parameters = crate::modules::load::parameters(&launch.modules.policy).unwrap();
     let policy = (crate::scheduler::packaged("fcfs"), parameters);
 
-    // One scheduler over the one media group of the one rank, whose executor is warm, with no
+    // One scheduler over the one media group of the one rank, whose worker is warm, with no
     // KV region to grow: every video phase on the group, with its steps and product sizes.
     assert!(
         std::path::Path::new(FAST_H3).is_dir(),
@@ -143,13 +143,15 @@ fn a_meta_start_of_a_media_launch_builds_one_engine_whose_close_ends_the_session
     );
     let engine = start(&launch, &registry, &storage, None, policy, liveness).unwrap();
     assert_eq!(engine.schedulers.len(), 1);
-    assert_eq!(engine.executors.len(), 1);
+    assert_eq!(engine.workers.len(), 1);
     let (id, capacity) = &engine.capacities[0];
     assert_eq!(id.0, 0);
-    assert!(capacity.serves(ipc::batch::Phase::Denoise) && capacity.serves(ipc::batch::Phase::Mux));
+    assert!(
+        capacity.serves(crate::batch::Phase::Denoise) && capacity.serves(crate::batch::Phase::Mux)
+    );
     assert!(capacity.denoise_steps > 0 && !capacity.media_bytes.is_empty());
     {
-        let head = worker::lock(engine.head.as_ref().unwrap());
+        let head = service::lock(engine.head.as_ref().unwrap());
         let (open, _) = head.session().unwrap();
         assert!(kv_regions(open).is_empty());
     }

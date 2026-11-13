@@ -18,7 +18,7 @@ use std::collections::HashSet;
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
-use ipc::batch::{Batch, BatchId, Columns, Extent, Phase, Shape};
+use crate::batch::{Batch, BatchId, Columns, Extent, Phase, Shape};
 use proto::request::{Event, FinishReason, MigrationCause, RejectionKind, RequestId};
 use scheduling::decision::{Shortage, Storage, Victim};
 use scheduling::ids::{EncodingId, PageId, PhaseId};
@@ -67,7 +67,7 @@ impl Scheduler {
     /// `Overloaded`; neither is kept. Any other is queued: a resumed request behind the other
     /// resumed requests and ahead of every new one, a new one last. The policy is told of it as
     /// `Arrived`.
-    pub fn add_request(&mut self, input: proto::request::Request) {
+    pub(crate) fn add_request(&mut self, input: proto::request::Request) {
         let id = input.request_id();
 
         // Refusals answer at once and keep nothing.
@@ -114,19 +114,19 @@ impl Scheduler {
     /// its queue holds beside its batches in flight, each sealed with its number, generation and
     /// shape.
     ///
-    /// The policy is told what changed and asked for the step's decision; a fault rolls it back
-    /// and forms nothing. The running requests named in the decision's work are scheduled in its
-    /// order, then the draft refills it names; then every running request whose blocks no longer
-    /// cover its next call and the low watermark asks for more, ahead of the step's admissions;
-    /// then the blocks the policy offloads are stored to the host and the waiting requests it
-    /// names are prefetched for; then, unless the scheduler drains, the waiting requests it
-    /// rejects leave and those it admits start their admission, resumed requests first and in
-    /// its order otherwise, until the first that does not fit. A group with copies its executor has not finished, for which the step
-    /// formed no batch, is sent an empty one, which runs the copies (SD §2.1).
+    /// The policy is told what changed and asked for the step's decision; a fault rolls it back and
+    /// forms nothing. The running requests named in the decision's work are scheduled in its order,
+    /// then the draft refills it names; then every running request whose blocks no longer cover its
+    /// next call and the low watermark asks for more, ahead of the step's admissions; then the
+    /// blocks the policy offloads are stored to the host and the waiting requests it names are
+    /// prefetched for; then, unless the scheduler drains, the waiting requests it rejects leave and
+    /// those it admits start their admission, resumed requests first and in its order otherwise,
+    /// until the first that does not fit. A group with copies its workers have not finished, for
+    /// which the step formed no batch, is sent an empty one, which runs the copies (SD §2.1).
     ///
     /// Nothing is formed while every group's queue is full, and nothing once the scheduler has
     /// failed (a starved request alone, or a batch the step could not seal).
-    pub fn schedule(&mut self) -> Vec<Batch> {
+    pub(crate) fn schedule(&mut self) -> Vec<Batch> {
         // No group has room in its queue: nothing can be formed, and the policy is not asked.
         if self.groups.iter().all(|group| !queue_open(group)) {
             return Vec::new();
@@ -340,7 +340,7 @@ impl Scheduler {
             if !self.push_media_row(batch, id, phase) {
                 return false;
             }
-            let rank = |row: Option<&ipc::batch::MediaRow>| row.map(|row| row.rank);
+            let rank = |row: Option<&crate::batch::MediaRow>| row.map(|row| row.rank);
             if rank(batch.media.last()) == rank(batch.media.first()) {
                 return true;
             }
@@ -467,9 +467,9 @@ impl Scheduler {
     }
 
     /// The empty batches of the step (SD §2.1): one for each group with room in its queue,
-    /// nothing in flight and no batch among `formed`, whose executor holds copies not yet
+    /// nothing in flight and no batch among `formed`, whose workers hold copies not yet
     /// finished (`Scheduler::copies`: from its `Copy` until the executor returns its `Finish` or
-    /// the scheduler gives it up). Its executor runs the copies its copy budget admits with it,
+    /// the scheduler gives it up). Its workers run the copies their copy budget admits with it,
     /// so that a load an admission waits for never waits for other work. The batch names the
     /// first of [`COPY_PHASES`] the group serves, or else the first phase it serves.
     fn copy_batches(&mut self, formed: &[Batch]) -> Vec<Batch> {
@@ -1270,7 +1270,7 @@ impl Scheduler {
     /// of it (SD §3.6, §7.2 "Draft release"; `S/speculation.rs:474-525`). Draft blocks are outside
     /// admission: the idle running requests with the fewest tokens left to generate go first
     /// (`draft_order`), each giving up its whole draft table by one `Release` through the
-    /// executors and starting its draft cache again from nothing (`give_up_draft`).
+    /// executor and starting its draft cache again from nothing (`give_up_draft`).
     fn give_up_drafts(&mut self, region: usize, need: u32) -> u32 {
         let mut need = need;
         for id in self.draft_order(region) {
@@ -1391,8 +1391,8 @@ fn refund(budget: &mut Budget, tokens: u32) {
 mod tests {
     use std::time::{Duration, Instant};
 
-    use ipc::CacheGroupKind;
-    use ipc::batch::Phase;
+    use crate::batch::Phase;
+    use crate::batch::cache::CacheGroupKind;
     use proto::config::{KvCacheConfig, WorkerGroupRole};
     use proto::request::{GenerationFeatures, GenerationLimits, GenerationRequest, RequestId};
     use scheduling::Event as PolicyEvent;
@@ -1581,7 +1581,7 @@ mod tests {
     }
 
     /// Under a shortage, the idle requests with the fewest tokens left give up their whole draft
-    /// tables first, each by one `Release` the executors of its entries stamp, until the units
+    /// tables first, each by one `Release` the workers of its entries stamp, until the units
     /// cover it; a request with a call in flight keeps its table.
     #[test]
     fn draft_tables_are_given_up_fewest_tokens_left_first() {
@@ -1703,7 +1703,7 @@ mod tests {
         assert_eq!(written, [asked]);
     }
 
-    /// A step that forms no batch for a group whose executor holds a copy not yet finished sends
+    /// A step that forms no batch for a group whose workers hold a copy not yet finished sends
     /// it an empty batch of a phase it serves, once its queue has nothing in flight; once the
     /// executor returned the copy's `Finish`, it sends none (SD §2.1).
     #[test]
@@ -1734,7 +1734,7 @@ mod tests {
     }
 
     /// A copy that has not finished `prefetch_wait` of the tokens it moves after its `Copy`
-    /// arrived is given up through its group's executor with `Finish { ok: false }`, and its group
+    /// arrived is given up through the executor with `Finish { ok: false }`, and its group
     /// is sent no more empty batches for it (SD §4.4 "The bound of a copy"). A copy of no tokens
     /// is given a second.
     #[test]
@@ -1758,7 +1758,7 @@ mod tests {
     }
 
     /// Request 1's `Load` of one block on group A, answered `Copy`, which the scheduler handed to
-    /// group A's executor; groups A and B serve prefills and decodes under `fcfs`. Returns the
+    /// group A's workers; groups A and B serve prefills and decodes under `fcfs`. Returns the
     /// number of the `Load`.
     fn copying() -> (Bench, runtime::RequestId) {
         let mut bench = bench(4096);

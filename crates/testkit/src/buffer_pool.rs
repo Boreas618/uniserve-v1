@@ -9,7 +9,7 @@
 //! of the server's thread:
 //!
 //! 1. each group's `completed` word is written from its [`FakeExecutor`]'s ended batches, as the
-//!    executor writes it, and read back into the pool;
+//!    workers write it, and read back into the pool;
 //! 2. the requests of each submission queue are taken in order;
 //! 3. the tasks the pool started run to their end: a transfer copies the owner's blocks, a
 //!    prefetch brings the leading keys its source holds ([`InProcessPool::hold_in`]), a put to
@@ -256,7 +256,7 @@ impl InProcessPool {
         }
         self.turns += 1;
 
-        // 1. The executors' `completed` words, as the fakes' ended batches state them.
+        // 1. The groups' `completed` words, as the fakes' ended batches state them.
         for served in &self.queues {
             for &(group, register) in &served.completed {
                 let word = served.pair.register(register);
@@ -530,8 +530,9 @@ fn monotonic() -> u64 {
 #[cfg(test)]
 mod tests {
     use crossbeam_channel::{Receiver, unbounded};
-    use engine::scheduler::{Executor, Message};
-    use ipc::batch::{Batch, BatchId, Columns, Phase, Row, Rows, Shape, Variant};
+    use engine::batch::{Batch, BatchId, Columns, Phase, Row, Rows, Shape, Variant};
+    use engine::executor::Executor;
+    use engine::scheduler::Message;
     use storage::runtime::{Class, Group, OwnerId, Region, Tier, VERSION};
 
     use super::*;
@@ -813,7 +814,7 @@ mod tests {
     }
 
     #[test]
-    fn a_commit_takes_effect_once_the_executors_completed_word_passes_its_stamp() {
+    fn a_commit_takes_effect_once_the_groups_completed_word_passes_its_stamp() {
         let mut bench = bench(4096);
         bench.ask(A, 0, attach(1, A));
         bench.ask(A, 1, allocate(1, 1));
@@ -863,7 +864,7 @@ mod tests {
         let stamped = bench.stamped().remove(0);
         assert!(
             bench.fake.entries(A).is_empty(),
-            "the source's executor removed the entries"
+            "the source's workers removed the entries"
         );
         let transferred = bench.ask(B, 1, stamped);
         let Completion::Transferred { slot, runs } = transferred else {

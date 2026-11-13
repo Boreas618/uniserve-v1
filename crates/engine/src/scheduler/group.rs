@@ -2,7 +2,7 @@
 //! `WorkerGroup` and `Capacity`).
 //!
 //! A worker group is the ranks that run the same blocks under one queue depth. Its
-//! [`WorkerGroup`] row holds what the deployment configures for it, what its executors stated
+//! [`WorkerGroup`] row holds what the deployment configures for it, what its workers stated
 //! when they were ready ([`Capacity`]), how the epoch's session with the buffer pool states it
 //! (its [`GroupId`], memory, slot region and per class its device regions), and the occupancy the
 //! scheduler counts. A scheduler's groups are its own: the data-parallel replicas of a configured
@@ -11,23 +11,23 @@
 //!
 //! The rules here are SD §3.4 and §3.5:
 //!
-//! - **Phases and roles.** A group serves a phase when its executors stated it and its role
+//! - **Phases and roles.** A group serves a phase when its workers stated it and its role
 //!   allows it: a `Prefill` group never decodes or verifies, a `Decode` group does nothing else.
 //! - **Occupancy.** The stage that serves a phase holds at most `Capacity::rows` requests at once.
 //!   A request holds the stage while a call of the phase is in flight, so its further calls (a
 //!   pipelined decode, the next denoising step) run beside it; the denoiser is held from the
 //!   request's latent preparation to its last applied step, since its trajectory lives there
 //!   across the gaps between its calls (SD §7.3).
-//! - **Buckets.** A batch is formed only while it fits a bucket the executors captured.
+//! - **Buckets.** A batch is formed only while it fits a bucket the workers captured.
 //! - **Placement.** The candidates of a request's phase are the groups that serve it and have a
 //!   free slot or hold the request already; among them the request's own group, then the
 //!   policy's choice for a request placed nowhere, then the least loaded group (SD §3.5, §7.3).
 
 use std::cmp::Reverse;
 
-pub use ipc::Capacity;
-use ipc::batch::Phase;
-pub(super) use ipc::capacity::variants;
+use crate::batch::Capacity;
+use crate::batch::Phase;
+pub(super) use crate::batch::capacity::variants;
 use proto::config::{VIDEO_CODEC_BLOCK, VIDEO_DECODER_BLOCK, WorkerGroupConfig, WorkerGroupRole};
 use storage::runtime::{self, GroupId};
 
@@ -38,10 +38,10 @@ use super::{Request, Scheduler};
 /// Invariants: `in_flight <= config.queue_depth` and `occupied[p] <= capacity.rows[p]` for every
 /// phase index `p`.
 #[derive(Clone, Debug)]
-pub struct WorkerGroup {
+pub(crate) struct WorkerGroup {
     /// The group as the deployment configures it: its role, ranks and queue depth.
     pub config: WorkerGroupConfig,
-    /// What the group's executors serve, as they stated it once they were ready.
+    /// What the group's workers serve, as they stated it once they were ready.
     pub capacity: Capacity,
     /// The group as the epoch's session with the buffer pool states it: the [`GroupId`] batches,
     /// requests and stamps name it by, the device memory its ranks address, its slot region, and
@@ -59,7 +59,11 @@ pub struct WorkerGroup {
 
 impl WorkerGroup {
     /// A group with nothing placed on it and nothing in flight.
-    pub fn new(config: WorkerGroupConfig, capacity: Capacity, layout: runtime::Group) -> Self {
+    pub(crate) fn new(
+        config: WorkerGroupConfig,
+        capacity: Capacity,
+        layout: runtime::Group,
+    ) -> Self {
         Self {
             config,
             capacity,
@@ -71,24 +75,24 @@ impl WorkerGroup {
     }
 
     /// The number the session gives the group.
-    pub fn id(&self) -> GroupId {
+    pub(crate) fn id(&self) -> GroupId {
         self.layout.id
     }
 
     /// The device regions the group's owners take blocks of `class` from, as indices into the
     /// session's regions; empty for a class the group lacks.
-    pub fn regions(&self, class: u8) -> &[u8] {
+    pub(crate) fn regions(&self, class: u8) -> &[u8] {
         self.layout
             .regions
             .get(usize::from(class))
             .map_or(&[], Vec::as_slice)
     }
 
-    /// Whether the group runs calls of `phase`: its executors stated the phase, and its role
+    /// Whether the group runs calls of `phase`: its workers stated the phase, and its role
     /// allows it. A `Prefill` group runs no decode or verification, which a request reaches on a
     /// decode group by the transfer of its blocks; a `Decode` group runs nothing else; an
     /// `Experts` group serves the deployment's schedulers and runs no phase of a request.
-    pub fn serves(&self, phase: Phase) -> bool {
+    pub(crate) fn serves(&self, phase: Phase) -> bool {
         let decodes = matches!(phase, Phase::Decode | Phase::Verify);
         let allowed = match self.config.role {
             WorkerGroupRole::Model => true,
@@ -102,7 +106,7 @@ impl WorkerGroup {
     /// Whether the stage that serves `phase` can take the next call of `request`: the request
     /// holds the stage already, or the stage holds fewer requests than its rows. `request` is as
     /// it stands before the call is counted in `scheduled`.
-    pub fn has_room(&self, phase: Phase, request: &Request) -> bool {
+    pub(crate) fn has_room(&self, phase: Phase, request: &Request) -> bool {
         let stage = self.stage(phase).index();
         match (self.occupied.get(stage), self.capacity.rows.get(stage)) {
             (Some(occupied), Some(rows)) => self.holding(phase, request) || occupied < rows,
@@ -113,7 +117,7 @@ impl WorkerGroup {
     /// Counts a scheduled call of `phase` of `request`, whose `scheduled` already counts it: the
     /// request takes the stage when the call is its only one of the phase in flight, or, on the
     /// denoiser, when the call is its latent preparation. Its further calls take nothing more.
-    pub fn occupy(&mut self, phase: Phase, request: &Request) {
+    pub(crate) fn occupy(&mut self, phase: Phase, request: &Request) {
         let stage = self.stage(phase);
         let takes = match stage {
             Phase::Denoise => phase == Phase::LatentPrepare,
@@ -128,7 +132,7 @@ impl WorkerGroup {
     /// counts it: the request gives the stage up when no call of the phase remains in flight, or,
     /// on the denoiser, when the output is its last step. An output that returned ahead of an
     /// earlier call keeps the stage until that call returns.
-    pub fn vacate(&mut self, phase: Phase, request: &Request) {
+    pub(crate) fn vacate(&mut self, phase: Phase, request: &Request) {
         let stage = self.stage(phase);
         let gives_up = match stage {
             Phase::Denoise => {
@@ -143,7 +147,7 @@ impl WorkerGroup {
     }
 
     /// Counts a request placed on the group; [`WorkerGroup::leave`] takes it out again.
-    pub fn join(&mut self) {
+    pub(crate) fn join(&mut self) {
         self.num_requests += 1;
     }
 
@@ -152,7 +156,7 @@ impl WorkerGroup {
     /// on the group is given up, the denoiser of a request that ended before its last step
     /// included, which it holds until it leaves since its stored step is copied from there.
     /// `request` is read as the scheduler counts it, with its `placement` on this group.
-    pub fn leave(&mut self, request: &Request) {
+    pub(crate) fn leave(&mut self, request: &Request) {
         self.num_requests = self.num_requests.saturating_sub(1);
 
         let id = Some(self.id());
@@ -303,7 +307,7 @@ mod tests {
     use std::sync::atomic::AtomicU64;
     use std::time::Instant;
 
-    use ipc::batch::{Batch, BatchId, Columns, Extent, Phase, Shape, Variant};
+    use crate::batch::{Batch, BatchId, Columns, Extent, Phase, Shape, Variant};
     use proto::config::{
         BlockConfig, BlockDistribution, SchedulerConfig, VIDEO_CODEC_BLOCK, VIDEO_DECODER_BLOCK,
         WorkerGroupConfig, WorkerGroupId, WorkerGroupRole, WorkerRank,
@@ -352,7 +356,7 @@ mod tests {
         }
     }
 
-    /// Executors that state `phases`, each served by a stage of `rows` requests, over 8 slots.
+    /// Workers that state `phases`, each served by a stage of `rows` requests, over 8 slots.
     fn capacity(phases: &[Phase], rows: u32) -> Capacity {
         let mut capacity = Capacity {
             phases: 0,

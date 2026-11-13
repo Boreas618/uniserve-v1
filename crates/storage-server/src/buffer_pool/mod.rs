@@ -293,7 +293,7 @@ struct Group<B = Rc<Block>> {
     /// Per class, the device regions its owners' blocks are taken from: one,
     /// or one per backing rank of a product; none for a class it lacks.
     regions: Vec<Vec<u8>>,
-    /// The last batch whose end its executor has seen, as last read.
+    /// The last batch whose end its workers have seen, as last read.
     completed: u64,
     /// What waits on it, in order of stamp.
     deferred: VecDeque<(u64, Deferred<B>)>,
@@ -326,7 +326,7 @@ enum Target {
     },
 }
 
-/// A copy in flight, run by an executor, the Transfer Server or the
+/// A copy in flight, run by a worker, the Transfer Server or the
 /// connector. It holds what it reads and what it writes until it has ended.
 #[derive(Serialize, Deserialize)]
 struct Copy<B = Rc<Block>> {
@@ -341,7 +341,7 @@ struct Copy<B = Rc<Block>> {
     /// Whether it fills one more memory of a block that others may read.
     fill: bool,
     /// A task's deadline, in nanoseconds of the host's monotonic clock; none
-    /// for a copy an executor runs, which its scheduler gives up.
+    /// for a copy a worker runs, which its scheduler gives up.
     deadline: Option<u64>,
 }
 
@@ -1077,7 +1077,7 @@ impl BufferPool {
         }
     }
 
-    /// Records what a group's executor wrote into its `completed` word.
+    /// Records what a group's workers wrote into its `completed` word.
     pub fn advance(&mut self, client: ClientId, group: GroupId, completed: u64) {
         if let Some(found) = self.groups.get_mut(&(client, group))
             && completed > found.completed

@@ -31,8 +31,8 @@
 use std::iter;
 use std::ops::Range;
 
-use ipc::batch::{Extent, Phase, Shape};
-use ipc::product;
+use crate::batch::product;
+use crate::batch::{Extent, Phase, Shape};
 use proto::config::VIDEO_DECODER_BLOCK;
 use proto::request::{ConditionExtent, DiffusionRequest, Event, MigrationCause};
 use storage::Key;
@@ -61,9 +61,9 @@ pub(super) const VIDEO_PHASES: [Phase; 9] = [
 ];
 
 /// The product kinds, in the order of the product classes, each with the phase whose calls write
-/// it: the one list of `ipc::product::KINDS`, which the ranks read too. The class of kind `k` is
-/// the `k`-th of the `PRODUCTS.len()` classes just before the class of stored trajectories, and
-/// `Capacity::media_bytes` states the bytes of a block of each kind in this order.
+/// it: the one list of `crate::batch::product::KINDS`, which the ranks read too. The class of kind
+/// `k` is the `k`-th of the `PRODUCTS.len()` classes just before the class of stored trajectories,
+/// and `Capacity::media_bytes` states the bytes of a block of each kind in this order.
 pub(super) const PRODUCTS: [(&str, Phase); 10] = {
     let mut kinds = [("", Phase::Other); product::KINDS.len()];
     let mut kind = 0;
@@ -136,7 +136,7 @@ impl Request {
     ///   call at a time; the final one waits for every encode round and the audio encode.
     ///
     /// A predecessor is handed over once its calls are scheduled when it runs on the same group
-    /// as `phase`, whose executor runs them in submission order, and once they completed
+    /// as `phase`, whose workers run them in submission order, and once they completed
     /// otherwise, since nothing else orders another group's write before the read.
     pub(super) fn video_ready(&self, phase: Phase, groups: &[WorkerGroup]) -> bool {
         if self.video().is_none() || phase.index() >= Phase::COUNT {
@@ -236,7 +236,7 @@ impl Request {
         call: u32,
         groups: &[WorkerGroup],
     ) -> (Vec<u32>, u32) {
-        use ipc::product::*;
+        use crate::batch::product::*;
 
         let last = call.saturating_add(1) == self.video_needed(phase, groups);
         let rounds = self.video_needed(Phase::VideoEncode, groups);
@@ -624,7 +624,7 @@ fn captured<'a>(
         .min_by_key(|(shape, _, _)| *shape)
 }
 
-/// Whether a captured denoising shape holds a video request (`worker::buckets`, the rule a
+/// Whether a captured denoising shape holds a video request (`crate::runner::buckets`, the rule a
 /// bucket serves a request by): the request's frames and raster when the shape states them, and
 /// its prompt and condition rows within the shape's, which has condition rows exactly when the
 /// request has conditions.
@@ -658,8 +658,8 @@ mod tests {
     use std::sync::{Arc, Mutex};
     use std::time::Instant;
 
-    use ipc::batch::{Batch, BatchId, Columns, Extent, Phase, Shape, Variant};
-    use ipc::product;
+    use crate::batch::product;
+    use crate::batch::{Batch, BatchId, Columns, Extent, Phase, Shape, Variant};
     use proto::config::{
         BlockConfig, BlockDistribution, SchedulerConfig, VIDEO_DECODER_BLOCK, WorkerGroupConfig,
         WorkerGroupId, WorkerGroupRole, WorkerRank,
@@ -925,7 +925,7 @@ mod tests {
         stamping(served).0
     }
 
-    /// A [`scheduler`] over `served`, with what its executors were handed to stamp.
+    /// A [`scheduler`] over `served`, with what its executor was handed to stamp.
     fn stamping(served: &[(GroupId, &[Phase])]) -> (Scheduler, Arc<Mutex<Vec<runtime::Request>>>) {
         let region = |name: &str, tier, unit_bytes| Region {
             name: name.to_owned(),
@@ -1206,7 +1206,7 @@ mod tests {
     }
 
     /// A phase placed on another group than the one it reads from waits until that one's calls
-    /// completed, since no executor orders the two.
+    /// completed, since no worker orders the two.
     #[test]
     fn a_phase_on_another_group_waits_until_its_predecessor_completed() {
         let groups = groups(&[(A, &VIDEO_PHASES), (B, &[Phase::TextEncode])]);

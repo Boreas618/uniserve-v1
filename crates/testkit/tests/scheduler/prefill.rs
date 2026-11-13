@@ -5,7 +5,7 @@
 //! that ask for them at every position but the first; `min_tokens` holds the end of a request
 //! back; and a banned word bans its last token wherever the history ends with its prefix.
 
-use ipc::batch::{Batch, Phase, Variant};
+use engine::batch::{Batch, Phase, Variant};
 use proto::request::{Event, FinishReason, RequestId};
 
 use crate::harness::{

@@ -12,8 +12,8 @@
 
 use std::time::{Duration, Instant};
 
+use engine::batch::Phase;
 use engine::scheduler::{Message, Output};
-use ipc::batch::Phase;
 use proto::request::{
     DiffusionRequest, Event, FinishReason, MigrationCause, RequestId, Trajectory,
 };
@@ -88,7 +88,7 @@ fn ended(harness: &mut Harness, id: RequestId, steps: u64) {
 }
 
 /// Steps until the buffer pool took a `Detach`: a request's `Detach` reaches it once the
-/// executors stamped it.
+/// workers stamped it.
 fn detached(harness: &mut Harness) {
     harness.run_until(20, |harness| {
         let taken = harness.taken();

@@ -686,10 +686,10 @@ impl BufferPool {
             .copied()
             .collect();
         for task in mine {
-            let run_by_executor = self.copies[&task]
+            let run_by_worker = self.copies[&task]
                 .iter()
                 .all(|copy| copy.deadline.is_none());
-            if run_by_executor {
+            if run_by_worker {
                 self.finished(task.0, task.1, false);
             } else if self.answers.remove(&task).is_some() {
                 self.stopped.push(task);

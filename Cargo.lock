@@ -1230,31 +1230,41 @@ name = "engine"
 version = "2.0.0"
 dependencies = [
  "anyhow",
+ "base64 0.22.1",
  "build-server",
+ "bytemuck",
  "clap",
  "crossbeam-channel",
- "ipc",
+ "half",
+ "indexmap 2.14.0",
  "libc",
+ "libloading",
  "media",
  "mimalloc",
  "models",
  "nn",
+ "nvtx",
  "ops",
  "platform",
  "processing",
  "proto",
+ "rmp-serde",
+ "rusqlite",
+ "rustix",
  "scheduling",
+ "serde",
  "serde_json",
  "service",
  "storage",
  "storage-server",
  "tempfile",
  "tensor",
+ "thiserror 2.0.18",
+ "time",
  "tokio",
  "toml",
  "tracing",
  "wasmtime",
- "worker",
 ]
 
 [[package]]
@@ -2201,21 +2211,6 @@ dependencies = [
  "unicode-width 0.2.2",
  "unit-prefix",
  "web-time",
-]
-
-[[package]]
-name = "ipc"
-version = "2.0.0"
-dependencies = [
- "libc",
- "proto",
- "rmp-serde",
- "scheduling",
- "serde",
- "service",
- "storage",
- "tempfile",
- "thiserror 2.0.18",
 ]
 
 [[package]]
@@ -4414,7 +4409,6 @@ dependencies = [
  "anyhow",
  "crossbeam-channel",
  "engine",
- "ipc",
  "libc",
  "proto",
  "scheduling",
@@ -4424,7 +4418,6 @@ dependencies = [
  "tempfile",
  "uuid",
  "wasmtime",
- "worker",
 ]
 
 [[package]]
@@ -5882,38 +5875,6 @@ dependencies = [
  "serde_json",
  "unicode-xid",
  "wasmparser 0.244.0",
-]
-
-[[package]]
-name = "worker"
-version = "2.0.0"
-dependencies = [
- "base64 0.22.1",
- "build-server",
- "bytemuck",
- "crossbeam-channel",
- "half",
- "indexmap 2.14.0",
- "ipc",
- "libc",
- "libloading",
- "media",
- "nn",
- "nvtx",
- "ops",
- "platform",
- "proto",
- "rusqlite",
- "rustix",
- "serde",
- "serde_json",
- "storage",
- "storage-server",
- "tempfile",
- "tensor",
- "thiserror 2.0.18",
- "time",
- "tracing",
 ]
 
 [[package]]

@@ -42,9 +42,9 @@
 use std::ops::Range;
 use std::time::{Duration, Instant};
 
-use ipc::CacheGroupKind;
-use ipc::batch::{Batch, Phase};
-use ipc::product::{CONDITIONING, VISION_FEATURES};
+use crate::batch::cache::CacheGroupKind;
+use crate::batch::product::{CONDITIONING, VISION_FEATURES};
+use crate::batch::{Batch, Phase};
 use proto::config::KvCacheConfig;
 use proto::request::{ImageEncoder, RequestId};
 use storage::Key;
@@ -1897,7 +1897,7 @@ impl Scheduler {
     }
 
     /// Gives up positions `range` of a request's class `class` by one `Release` through the
-    /// executors; the keys of the read-only entries among them, those before `shared`, join
+    /// executor; the keys of the read-only entries among them, those before `shared`, join
     /// `unpinned`, to leave the request's holds in `cache`.
     #[expect(
         clippy::too_many_arguments,
@@ -1942,7 +1942,7 @@ impl Scheduler {
     /// when the request's keys are given (SD §3.7, §4.4 "Commit"): per class, in index order from
     /// `shared`, every complete block of the tokens written (of the draft cache's, for the draft
     /// class) and the recurrent-state checkpoint the call kept, each under its key with the
-    /// class's block size. Each `Commit` is handed to the executors, which mark the entry
+    /// class's block size. Each `Commit` is handed to the executor, whose workers mark the entry
     /// read-only and stamp it; `shared` rises at the hand-off.
     pub(super) fn commit_filled(&mut self, id: RequestId, batch: &Batch, row: usize) {
         self.extend_keys(id);
@@ -2043,7 +2043,7 @@ impl Scheduler {
         commits
     }
 
-    /// Hands request `id`'s commits to the executors and raises `shared` over each.
+    /// Hands request `id`'s commits to the executor and raises `shared` over each.
     fn hand_commits(&mut self, id: RequestId, commits: Vec<(u8, u32, Key, u16)>) {
         let Some(owner) = self
             .requests
@@ -2122,7 +2122,7 @@ impl Scheduler {
     /// sliding window the blocks entirely before `visible - window`; a recurrent-state table,
     /// once the call wrote the checkpoint ahead of its base, its base, unless a refill continues
     /// from the base, which then stays while a checkpoint the target wrote is given up. A
-    /// full-attention table keeps everything. Each by one `Release` through the executors.
+    /// full-attention table keeps everything. Each by one `Release` through the executor.
     pub(super) fn give_up_behind(&mut self, id: RequestId, batch: &Batch, row: usize) {
         let Some(request) = self.requests.get(&id) else {
             return;
@@ -2326,7 +2326,7 @@ impl Scheduler {
         order.into_iter().map(|(_, id)| id).collect()
     }
 
-    /// Gives up request `id`'s whole draft table by one `Release` through the executors; its
+    /// Gives up request `id`'s whole draft table by one `Release` through the executor; its
     /// draft cache is empty from now on, and its table starts again at the first block its next
     /// call needs (SD §4.2). Returns, per region, the units the release frees once the buffer
     /// pool reclaims them.
@@ -2383,8 +2383,8 @@ mod tests {
     use std::sync::{Arc, Mutex};
     use std::time::Instant;
 
-    use ipc::CacheGroupKind;
-    use ipc::batch::{Batch, BatchId, Columns, Phase, Shape, Variant};
+    use crate::batch::cache::CacheGroupKind;
+    use crate::batch::{Batch, BatchId, Columns, Phase, Shape, Variant};
     use proto::config::{KvCacheConfig, SchedulerConfig, WorkerGroupConfig};
     use proto::request::{Event, FinishReason, GenerationLimits, GenerationRequest, RequestId};
     use storage::runtime::{self, Class, Completion, GroupId, OwnerId, Region, Tier};
@@ -2399,7 +2399,7 @@ mod tests {
 
     const A: GroupId = GroupId(0);
 
-    /// What the executors were handed to stamp.
+    /// What the executor was handed to stamp.
     struct Stamps(Arc<Mutex<Vec<runtime::Request>>>);
 
     impl Executor for Stamps {
@@ -3578,7 +3578,7 @@ mod tests {
 
         // The encode computed it: it is committed under its key, its rows as tokens, and held.
         let mut encoded = batch(Phase::VisionEncode, 0);
-        encoded.media.push(ipc::batch::MediaRow {
+        encoded.media.push(crate::batch::MediaRow {
             request: id,
             slot: 1,
             conditioning: Vec::new(),

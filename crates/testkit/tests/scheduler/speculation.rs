@@ -13,9 +13,9 @@
 use std::ops::Range;
 use std::sync::Arc;
 
+use engine::batch::philox::DrawAddress;
+use engine::batch::{Batch, Phase};
 use engine::scheduler::{Message, policy};
-use ipc::batch::{Batch, Phase};
-use ipc::philox::DrawAddress;
 use proto::request::RequestId;
 use scheduling::limits::Parameters;
 use storage::runtime::Request;

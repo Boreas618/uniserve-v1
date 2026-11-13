@@ -4,9 +4,9 @@
 //!
 //! A request is one row of plain fields, vLLM's `Request`: what the daemon submitted, where the
 //! request runs, the calls of each phase scheduled and applied, its token and video progress, the
-//! owners it holds at the buffer pool and the positions of each class's table. It holds no unit
-//! and no run: a batch names its slot and positions, and the executor finds its blocks through
-//! its device block tables. Everything else about it is derived from these fields (SD §2.2, §3.3).
+//! owners it holds at the buffer pool and the positions of each class's table. It holds no unit and
+//! no run: a batch names its slot and positions, and the workers find its blocks through their
+//! device block tables. Everything else about it is derived from these fields (SD §2.2, §3.3).
 //!
 //! This file also holds what a token request's fields say about its next call (SD §3.3): how
 //! many calls of a phase it makes ([`Request::needed`]), whether it may be given one more now
@@ -33,7 +33,7 @@
 use std::sync::Arc;
 use std::time::Instant;
 
-use ipc::batch::Phase;
+use crate::batch::Phase;
 use proto::request::{
     ArtifactMedia, CacheResume, EVENT_WINDOW, Event, FinishReason, GenerationFeatures,
     GenerationRequest, ImageEncoder, ImageEncoderInput, ImageInput, RequestId, StopReason,
@@ -59,7 +59,7 @@ const TERMINAL_RESERVE: u32 = 2;
 /// per group it is attached to, from that group's `Attach` (or the `Transfer` that moves the
 /// owner there) until that owner's `Detach`.
 #[derive(Clone, Debug)]
-pub struct Request {
+pub(crate) struct Request {
     // What the daemon submitted. Immutable.
     pub id: RequestId,
     /// The token or video request: prompt, sampling, images, limits, priority, cache policy, and
@@ -75,7 +75,7 @@ pub struct Request {
     /// row there (from `Attached` or `Transferred`; 0, a row no owner holds, until then), and
     /// whether that group has seen it.
     pub attachments: Vec<(GroupId, OwnerId, u32, bool)>,
-    /// Per phase, the calls handed to executors.
+    /// Per phase, the calls handed to the executor.
     pub scheduled: [u32; Phase::COUNT],
     /// Per phase, the calls whose output was applied, in index order.
     pub completed: [u32; Phase::COUNT],
@@ -124,6 +124,7 @@ pub struct Request {
     pub num_acknowledged_tokens: u32,
 
     // Video progress: the counters above, and the finished artifact.
+    #[expect(dead_code, reason = "no caller in the engine")]
     pub artifact: Option<Arc<dyn ArtifactMedia>>,
 
     // Output and clocks.
@@ -141,7 +142,7 @@ pub struct Request {
 ///
 /// Only `Running` requests are in batches; `Finished` is absorbing.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum RequestStatus {
+pub(crate) enum RequestStatus {
     Waiting,
     /// Answers of its admission or its transfer are outstanding at the buffer pool.
     WaitingForRemoteKvs,
@@ -155,7 +156,7 @@ pub enum RequestStatus {
 /// owner on the group that writes the class; in a cache group's table a position is the logical
 /// index of its block.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct Blocks {
+pub(crate) struct Blocks {
     /// Entries before it were given up or never asked for: for a sliding window, its window's
     /// first block.
     pub first: u32,
@@ -169,7 +170,7 @@ pub struct Blocks {
 
 impl Request {
     /// The group the owner `owner` of this request is attached to, and its slot row there.
-    pub fn attachment(&self, owner: OwnerId) -> Option<(GroupId, u32)> {
+    pub(crate) fn attachment(&self, owner: OwnerId) -> Option<(GroupId, u32)> {
         self.attachments
             .iter()
             .find(|(_, attached, _, _)| *attached == owner)
@@ -177,7 +178,7 @@ impl Request {
     }
 
     /// The slot row of this request's own owner on `group`, if it is attached there.
-    pub fn slot_on(&self, group: GroupId) -> Option<u32> {
+    pub(crate) fn slot_on(&self, group: GroupId) -> Option<u32> {
         self.attachments
             .iter()
             .find(|(attached, _, _, _)| *attached == group)
@@ -187,7 +188,7 @@ impl Request {
     /// The owner of this request on the group placed for `phase`, which every request for the
     /// classes that phase writes names (SD §4.2); `None` while the phase is placed nowhere or the
     /// request is not attached to its group.
-    pub fn owner_on(&self, phase: Phase) -> Option<OwnerId> {
+    pub(crate) fn owner_on(&self, phase: Phase) -> Option<OwnerId> {
         let group = self.placement.get(phase.index()).copied().flatten()?;
         self.attachments
             .iter()
@@ -207,7 +208,7 @@ impl Request {
     /// epoch's (`S/admission.rs:116-121`). The request is queued, with nothing placed, held or
     /// scheduled and the consumer's whole window as its credit; its `blocks`, `keys` and
     /// `encodings` are its admission's to fill.
-    pub fn new(input: proto::request::Request, epoch: u64, arrival: Instant) -> Self {
+    pub(crate) fn new(input: proto::request::Request, epoch: u64, arrival: Instant) -> Self {
         let mut input = input;
         let token_ids = match &mut input {
             proto::request::Request::Generation(request) => {
@@ -259,7 +260,7 @@ impl Request {
     }
 
     /// The token request this request is; `None` for a video request.
-    pub fn generation(&self) -> Option<&GenerationRequest> {
+    pub(crate) fn generation(&self) -> Option<&GenerationRequest> {
         match &self.input {
             proto::request::Request::Generation(request) => Some(request),
             proto::request::Request::Diffusion(_) => None,
@@ -269,7 +270,7 @@ impl Request {
     /// Whether the request continues what an engine began before the daemon resubmitted it: a
     /// token request that carries generated tokens, a video request with stored denoising steps.
     /// Such a request waits ahead of every other (SD §3.2).
-    pub fn resumes(&self) -> bool {
+    pub(crate) fn resumes(&self) -> bool {
         match &self.input {
             proto::request::Request::Generation(request) => request.is_migrated(),
             proto::request::Request::Diffusion(video) => video.trajectory.denoised_steps > 0,
@@ -278,15 +279,15 @@ impl Request {
 
     /// The tokens a token request generated, those a resumed request brought included: what its
     /// token limit, its `min_tokens` and its usage count.
-    pub fn generated(&self) -> u32 {
+    pub(crate) fn generated(&self) -> u32 {
         let resumed = self
             .generation()
             .map_or(0, |request| len32(request.generated_token_ids.len()));
         resumed.saturating_add(self.output_tokens())
     }
 
-    /// The calls of `phase` handed to executors whose output has not been applied.
-    pub fn in_flight(&self, phase: Phase) -> u32 {
+    /// The calls of `phase` handed to the executor whose output has not been applied.
+    pub(crate) fn in_flight(&self, phase: Phase) -> u32 {
         let index = phase.index();
         match (self.scheduled.get(index), self.completed.get(index)) {
             (Some(scheduled), Some(completed)) => scheduled.saturating_sub(*completed),
@@ -295,7 +296,7 @@ impl Request {
     }
 
     /// Whether no call of the request is in flight.
-    pub fn idle(&self) -> bool {
+    pub(crate) fn idle(&self) -> bool {
         Phase::ALL
             .into_iter()
             .all(|phase| self.in_flight(phase) == 0)
@@ -305,7 +306,7 @@ impl Request {
     /// image spans"), in context order: each block's first cache position, its rows, its image
     /// and its encoder input. The `i`-th block is encoder input `i`, whose output is
     /// `encodings[i]`. Empty for a video request.
-    pub fn image_spans(
+    pub(crate) fn image_spans(
         &self,
     ) -> impl Iterator<Item = (u32, u32, &ImageInput, &ImageEncoderInput)> + '_ {
         let images = self
@@ -328,7 +329,7 @@ impl Request {
     /// calls for it, and this is `u32::MAX`. Its vision and latent encodings are one per encoder
     /// input of that kind whose output its admission's `Pin` did not find: those applied, and
     /// those whose output it still lacks. A video request's calls are `video_needed`'s.
-    pub fn needed(&self, phase: Phase, groups: &[WorkerGroup]) -> u32 {
+    pub(crate) fn needed(&self, phase: Phase, groups: &[WorkerGroup]) -> u32 {
         if self.is_video() {
             return self.video_needed(phase, groups);
         }
@@ -360,7 +361,7 @@ impl Request {
     ///   nothing in flight, while the draft cache ends before [`Request::refill_end`];
     /// - under stop strings, no token call while the outputs of as many calls as the group's call
     ///   window are unacknowledged (`:486`).
-    pub fn ready(&self, phase: Phase, groups: &[WorkerGroup]) -> bool {
+    pub(crate) fn ready(&self, phase: Phase, groups: &[WorkerGroup]) -> bool {
         if self.status != RequestStatus::Running {
             return false;
         }
@@ -402,7 +403,7 @@ impl Request {
     /// the policy's view of it names the first (SD §5.2). A token request's encodings come before
     /// its prefill; a video request's phases follow `VIDEO_PHASES`. A refill is never named: only
     /// the policy's `refill` asks for one.
-    pub fn ready_phases<'a>(
+    pub(crate) fn ready_phases<'a>(
         &'a self,
         groups: &'a [WorkerGroup],
     ) -> impl Iterator<Item = Phase> + 'a {
@@ -422,7 +423,7 @@ impl Request {
     /// ends it with `Stop` unless at most `min_tokens` tokens are generated; reaching the token
     /// limit ends it with `MaxTokens` whatever the floor; an end-of-sequence token of `eos` ends
     /// it with `Eos` unless it ignores them or is under the floor.
-    pub fn check_stop(
+    pub(crate) fn check_stop(
         &self,
         token: u32,
         eos: &[u32],
@@ -445,7 +446,7 @@ impl Request {
     /// Whether a token that [`Request::check_stop`] judged `stop` is sent to the daemon
     /// (`S/output.rs:862-893`): every token that continues the request; a stop token only with
     /// `include_stop_token`; any other token that ends it unless it is one of `eos`.
-    pub fn publishes(
+    pub(crate) fn publishes(
         &self,
         token: u32,
         stop: Option<&(FinishReason, Option<StopReason>)>,
@@ -463,7 +464,7 @@ impl Request {
     /// Whether the consumer's window holds the events one more call of `phase` may add (SD §3.4,
     /// §7.1): the credit covers the bound of every call in flight, the terminal's reserve and
     /// the call's own bound. A request whose consumer is slow keeps its slot and blocks nobody.
-    pub fn has_event_room(&self, phase: Phase) -> bool {
+    pub(crate) fn has_event_room(&self, phase: Phase) -> bool {
         let in_flight = Phase::ALL
             .into_iter()
             .map(|phase| self.in_flight(phase).saturating_mul(output_bound(phase)))
@@ -482,7 +483,7 @@ impl Request {
     /// first (a bad word's prefix forming across the drafts, or the `min_tokens` floor crossed),
     /// since a verification's rows sample under one banned set. `eos` are the deployment's
     /// end-of-sequence tokens.
-    pub fn drafts(&self, eos: &[u32]) -> u32 {
+    pub(crate) fn drafts(&self, eos: &[u32]) -> u32 {
         let Some(request) = self.generation() else {
             return 0;
         };
@@ -517,7 +518,7 @@ impl Request {
     /// whose prefix the generated tokens and the drafts end with (vLLM's `apply_bad_words`). The
     /// tokens `ahead` are not known yet; a request that bans a multi-token word has none in
     /// flight when it decodes, so they matter only for the floor.
-    pub fn banned(&self, eos: &[u32], ahead: u32, drafts: &[u32]) -> Vec<u32> {
+    pub(crate) fn banned(&self, eos: &[u32], ahead: u32, drafts: &[u32]) -> Vec<u32> {
         let Some(request) = self.generation() else {
             return Vec::new();
         };
@@ -556,7 +557,7 @@ impl Request {
     /// `state` is the class of the model's state checkpoints, by its index in `blocks`, with the
     /// tokens one checkpoint block spans, `None` for a model that keeps no state per slot; the
     /// checkpoint ending at token `t` is at position `t / block - 1` of that class's table.
-    pub fn refill_start(&self, state: Option<(usize, u32)>) -> u32 {
+    pub(crate) fn refill_start(&self, state: Option<(usize, u32)>) -> u32 {
         let start = self.num_draft_tokens;
         let resumes = match state {
             None => true,
@@ -580,7 +581,7 @@ impl Request {
     /// and none takes one as the token after its last (`rows.rs`). The draft cache counts its
     /// entries from its start, so it never grows past the image either: such a request verifies
     /// without drafts from there on.
-    pub fn refill_end(&self) -> u32 {
+    pub(crate) fn refill_end(&self) -> u32 {
         let image = self
             .image_spans()
             .filter(|&(_, rows, ..)| rows > 0)
@@ -595,7 +596,7 @@ impl Request {
     /// §7.2 "A refill chunk", `S/speculation.rs:394-441`): from [`Request::refill_start`] toward
     /// [`Request::refill_end`], ending on a checkpoint boundary of `state` when it stops short of
     /// it, so that the next chunk continues from a kept checkpoint. 0 when no chunk fits.
-    pub fn refill_chunk(&self, budget: u32, state: Option<(usize, u32)>) -> u32 {
+    pub(crate) fn refill_chunk(&self, budget: u32, state: Option<(usize, u32)>) -> u32 {
         let start = self.refill_start(state);
         let target = self.refill_end();
         let mut end = start.saturating_add(budget).min(target);
@@ -614,7 +615,7 @@ impl Request {
     /// limit holds the block or the block starts the chunk (the step's budget then decides alone,
     /// in `charge`); otherwise the chunk ends before the block. A latent block is a prefill of its
     /// own: a chunk that starts with it takes it whole and nothing more, any other ends before it.
-    pub fn clip_to_images(&self, tokens: u32) -> u32 {
+    pub(crate) fn clip_to_images(&self, tokens: u32) -> u32 {
         let start = self.num_computed_tokens;
         let mut end = start.saturating_add(tokens);
         for (index, (block, rows, _, input)) in self.image_spans().enumerate() {
@@ -771,7 +772,7 @@ impl Request {
     /// allows (`S/execution/projection.rs:290-352`): its generated tokens and one token for each
     /// prefill, decode and verification in flight reach `max_und_tokens`. Its next token call,
     /// if any, waits for their outputs. False for a video request.
-    pub fn reaches_limit(&self) -> bool {
+    pub(crate) fn reaches_limit(&self) -> bool {
         let Some(request) = self.generation() else {
             return false;
         };
@@ -880,7 +881,7 @@ impl Scheduler {
     }
 }
 
-/// The generation features the groups serve (SD §7.2 "the executors' features",
+/// The generation features the groups serve (SD §7.2, the features of the workers,
 /// `S/run.rs:22-45`): understanding where prefill and decode are served, and each image encoder
 /// whose encoding is.
 pub(super) fn served_features(groups: &[WorkerGroup]) -> GenerationFeatures {
@@ -966,7 +967,7 @@ mod tests {
     use std::collections::BTreeMap;
     use std::time::Instant;
 
-    use ipc::batch::{Phase, Shape, Variant};
+    use crate::batch::{Phase, Shape, Variant};
     use proto::config::{KvCacheConfig, WorkerGroupConfig};
     use proto::request::{
         CacheResume, FinishReason, GenerationFeatures, GenerationLimits, GenerationRequest,

@@ -22,7 +22,7 @@
 //! answers or a request waits for units, one polling period (`SchedulerConfig::poll_period`): the
 //! queue pair runs in poll mode, and no wake-up crosses from the buffer pool.
 //!
-//! - `submit` takes a request for the buffer pool. A request the executors first apply to their
+//! - `submit` takes a request for the buffer pool. A request the workers first apply to their
 //!   device block tables (`Release`, `Detach`, `Commit`, `Transfer`, and the `Finish` that gives a
 //!   copy up) waits in `stamping` until every group whose tables may hold its entries stamped it
 //!   (BP §9, obligation 2); a request that names positions such a `Release` frees waits behind
@@ -36,7 +36,7 @@
 //!   number, applies what it states of the cache (`cache.rs`), drops what belongs to a forgotten
 //!   owner (but a `Committed`, which outlives its owner's `Detach`) or to entries a later stamped
 //!   request names (BP §9, obligation 1), and hands every completion that gives entries to the
-//!   executors (`Executor::map`) before the scheduler applies it. A `Copy` it hands over is
+//!   executor (`Executor::map`) before the scheduler applies it. A `Copy` it hands over is
 //!   recorded in `copies` until the executor returns its `Finish`, or the step gives it up at its
 //!   bound (SD §4.4).
 //! - `read_capacity` reads the capacity words of every region.
@@ -67,8 +67,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use crate::batch::{Batch, BatchId, BatchOutput, Capacity, Phase};
+use crate::executor::Executor;
 use crossbeam_channel::{Receiver, RecvTimeoutError, Sender, TryRecvError};
-use ipc::batch::{Batch, BatchId, BatchOutput, Phase};
 use proto::config::{SchedulerConfig, WorkerGroupConfig};
 use proto::report::SchedulerStats;
 use proto::request::wire::WeightsInFlight;
@@ -77,14 +78,14 @@ use scheduling::Parameters;
 use storage::runtime::{self, Cause, Completion, GroupId, OwnerId, Tier};
 use storage::{Key, QueuePair};
 
-pub use cache::Cached;
-pub use group::{Capacity, WorkerGroup};
+pub(crate) use cache::Cached;
+pub(crate) use group::WorkerGroup;
 /// The packaged policies this tree builds, for the tests of the engine that serves them.
 #[cfg(test)]
 pub(crate) use policy::tests::packaged;
 use policy::{Policy, PolicyError, ceilings};
-pub use request::{Blocks, Request, RequestStatus};
-pub use view::view_of;
+pub(crate) use request::{Blocks, Request, RequestStatus};
+pub(crate) use view::view_of;
 
 /// The first request id of the warm-up requests the engine adds when admission opens: an
 /// ordinary request whose id is at or above it has its events dropped (SD §3.2).
@@ -112,7 +113,7 @@ const SEQUENCE_PHASES: [Phase; 4] = [Phase::Prefill, Phase::Decode, Phase::Verif
 pub enum Error {
     /// The scheduling policy faulted.
     Policy(PolicyError),
-    /// An executor failed a batch or its group.
+    /// The executor failed a batch or its group.
     Executor(String),
     /// The buffer pool or the queue pair broke the interface, or answered a request the
     /// scheduler chose from its own counts with a refusal.
@@ -155,12 +156,12 @@ pub enum Message {
     Acknowledge(RequestId, u32),
     /// The events of a request its consumer took: credit returned.
     Consumed(RequestId, u32),
-    /// A submitted batch's output, from an executor, exactly once per batch.
+    /// A submitted batch's output, from the executor, exactly once per batch.
     Output(Batch, Result<BatchOutput, Error>),
-    /// From an executor: the requests it applied to its group's device block tables, each with
-    /// its group's stamp, and the stamped `Finish` of each copy it ran.
+    /// From the executor: the requests a group's workers applied to its device block tables,
+    /// each with the group's stamp, and the stamped `Finish` of each copy they ran.
     Submit(Vec<runtime::Request>),
-    /// From an executor: a job of a worker group outside a batch, a `map` or a `stamp`, failed.
+    /// From the executor: a job of a worker group outside a batch, a `map` or a `stamp`, failed.
     /// The group's device block tables lack what the scheduler counts on, so it fails at once.
     Failed(Error),
     /// Form no batch; the reply is sent once nothing is in flight.
@@ -188,7 +189,7 @@ pub enum Message {
     /// its `Resized`, is the units the region reached, which a shrink and a grow may stop short of.
     Resize(u8, u32, Sender<u32>),
     /// The scheduler's limits, applied in place; the reply refuses a limit above what the
-    /// executors hold, which leaves the limits as they were.
+    /// workers hold, which leaves the limits as they were.
     Configure(SchedulerConfig, Sender<Result<(), Error>>),
     /// End every request the scheduler holds, aborted, and stop.
     Shutdown,
@@ -215,52 +216,10 @@ pub enum Output {
     Failed(Error),
 }
 
-/// The executors of a scheduler's worker groups, as the scheduler drives them (BP §9 and §17,
-/// A1 to A4).
-///
-/// - `submit`: the batch's output arrives exactly once as [`Message::Output`].
-/// - `map`: a completion that gives entries (`Attached`, `Allocated`, `Pinned`, `Transferred`,
-///   `Copy`, and the answers to a copy's `Finish`: `Loaded`, `Cloned`, `Duplicate`), with the
-///   request it answers and that request's number, is written into `group`'s device block tables
-///   at the positions the request names, under `slot` (the slot row of the request's owner on
-///   that group; for a group that reads a class it does not write, the slot of the request's own
-///   owner there), or its copies are queued, before the group's next batch launches. The entries
-///   of a `Load` or a `Clone` appear with the answer to its `Finish`, read-only for a `Load` and
-///   writable for a `Clone`. The executor writes no entry from any other source. A queued copy
-///   runs with the group's next batch, and its `Finish { copy, ok, after }`, with the group's
-///   stamp, returns in [`Message::Submit`].
-/// - `stamp`: `Release`, `Detach`, `Commit` and `Transfer`, and the `Finish { ok: false }` that
-///   gives a copy up, are applied to `group`'s device block tables (the entries a `Release`, a
-///   `Detach` or a `Transfer` names are removed, the entry a `Commit` names is marked read-only; a
-///   given-up copy joins no further batch and is dropped if it has not started), stamped with
-///   the sequence of the last batch the group launched in their `after`, and every one of them
-///   returns in [`Message::Submit`]. A given-up copy that has started is covered by that stamp
-///   and gets no `Finish` of its own.
-/// - A batch writes only entries that came from `Allocated` or `Cloned` and that no `Commit` has
-///   marked, and a copy's destination is written only by that copy.
-pub trait Executor: Send {
-    /// Runs a batch on its group.
-    fn submit(&self, batch: Batch);
-
-    /// Writes the entries a completion gives into `group`'s device block tables, or queues its
-    /// copies.
-    fn map(
-        &self,
-        group: GroupId,
-        slot: u32,
-        id: runtime::RequestId,
-        request: runtime::Request,
-        completion: Completion,
-    );
-
-    /// Applies requests to `group`'s device block tables and returns them stamped.
-    fn stamp(&self, group: GroupId, requests: Vec<runtime::Request>);
-}
-
 /// The scheduler of one data-parallel rank and its state (SD §2.1, §2.5).
 ///
 /// Invariants: every id in `waiting` or `running` is in `requests` with the matching status; an
-/// owner is in `owners` from its `Attach` until its `Detach` is handed to the executors, and no
+/// owner is in `owners` from its `Attach` until its `Detach` is handed to the executor, and no
 /// owner is drawn twice; a block is in its region's `order` exactly when it is in `cache`, on
 /// that region's tier, with no pin of this scheduler's requests; the completions of `outstanding`
 /// always fit the completion queue; a request is in at most one of `stamping`, `held` and
@@ -273,7 +232,7 @@ pub trait Executor: Send {
 pub struct Scheduler {
     config: SchedulerConfig,
     /// The generation limits requests are checked against at their arrival: the model's sizing
-    /// facts lowered to what the groups' executors hold (SD §7.1), with the features the groups'
+    /// facts lowered to what the groups' workers hold (SD §7.1), with the features the groups'
     /// phases serve.
     limits: GenerationLimits,
     /// The engine epoch of the session, which names the private continuation of a token request
@@ -289,9 +248,9 @@ pub struct Scheduler {
     queue: QueuePair,
     /// Requests the submission queue had no room for, in the order they are to be written.
     held: Vec<runtime::Request>,
-    /// Requests handed to executors for their stamps, by the number they were handed under: each
-    /// with the stamps it has gathered (in its `after`), the count of groups still to stamp it,
-    /// and the requests that must follow it into the submission queue.
+    /// Requests handed to the executor for the groups' stamps, by the number they were handed
+    /// under: each with the stamps it has gathered (in its `after`), the count of groups still to
+    /// stamp it, and the requests that must follow it into the submission queue.
     stamping: HashMap<u64, (runtime::Request, u8, Vec<runtime::Request>)>,
     /// Every request written into the submission queue whose completion has not been read, by its
     /// number, with the owner it acts for and the bytes of the completion queue its answer may
@@ -362,9 +321,9 @@ pub struct Scheduler {
     /// per request, the region (by index) and the units its `available` must show before the
     /// request asks again (SD §3.6). A request listed here takes no further victims.
     short: HashMap<RequestId, (usize, u32)>,
-    /// The copies the groups' executors hold, by the number of the request answered `Copy` (a
+    /// The copies the groups' workers hold, by the number of the request answered `Copy` (a
     /// `Load`, a `Clone`, a `Store` to the host, a `Save` or a `Restore`): the group whose
-    /// executor runs it, and the moment the scheduler gives it up (SD §4.4 "The bound of a
+    /// workers run it, and the moment the scheduler gives it up (SD §4.4 "The bound of a
     /// copy"). A copy enters when its `Copy` is handed to the executor and leaves when the
     /// executor returns its `Finish` or the scheduler gives it up: a group with an entry is sent
     /// an empty batch when the step forms none for it (SD §2.1).
@@ -372,7 +331,7 @@ pub struct Scheduler {
     /// Completions that give entries, read before the `Attached` that states the slot row they
     /// are written under: by the owner of the attachment whose slot they wait for, each with the
     /// group it is handed to and the number, request and completion `Executor::map` takes. The
-    /// buffer pool may answer an admission's requests in any order, and an executor writes a
+    /// buffer pool may answer an admission's requests in any order, and a worker writes a
     /// completion's entries under the slot it is handed (SD §2.1 `Executor`, §3.1). They are
     /// handed over when that `Attached` is read, and dropped with the owners they concern.
     unmapped: HashMap<OwnerId, Vec<(GroupId, runtime::RequestId, runtime::Request, Completion)>>,
@@ -410,17 +369,17 @@ impl Scheduler {
     /// A scheduler of the session the engine opened with `layout` and that `opened` answered:
     /// the `scheduler`-th of `layout.schedulers`, which is its data-parallel rank, on its end of
     /// its queue pair. `groups` are its worker groups' configurations and the capacities their
-    /// executors stated, in the order `layout.schedulers` lists its groups. `limits` are the
+    /// workers stated, in the order `layout.schedulers` lists its groups. `limits` are the
     /// generation limits the engine resolved for the deployment; their features are the ones the
     /// groups' phases serve.
     ///
-    /// The scheduler's limits are `config`'s, lowered to what the executors hold (SD §7.1): the
+    /// The scheduler's limits are `config`'s, lowered to what the workers hold (SD §7.1): the
     /// running requests to the slots the groups hold for them, a step's tokens to the widest
-    /// prefill bucket the executors captured and its calls to their largest bucket's rows. Its
+    /// prefill bucket the workers captured and its calls to their largest bucket's rows. Its
     /// policy is `module`, constructed from the package's `parameters` and instantiated on the
     /// scheduler's own snapshot, as every later generation's is (SD §3.9, §5.2): the groups and
     /// the phases they serve, with no request and no cached block; its limits are checked against
-    /// what the executors captured. Its first request to the buffer pool is `List`, which teaches
+    /// what the workers captured. Its first request to the buffer pool is `List`, which teaches
     /// it the cached blocks its session can reach (SD §4.5).
     ///
     /// # Errors
@@ -429,11 +388,11 @@ impl Scheduler {
     /// scheduler, other groups than `groups`, or regions and registers that do not match.
     /// [`Error::InvalidRequest`] for a deployment the startup checks refuse ([`resolved`]).
     /// [`Error::Policy`] when the policy does not instantiate, or declares limits outside the
-    /// ceilings of the executors' captures.
+    /// ceilings of the workers' captures.
     #[expect(
         clippy::too_many_arguments,
         reason = "the scheduler's parts come from five owners: the configuration, the session \
-                  with the buffer pool, the policy package, the executors and the engine's \
+                  with the buffer pool, the policy package, the executor and the engine's \
                   channels"
     )]
     pub fn new(
@@ -581,12 +540,12 @@ impl Scheduler {
 
     /// The generation limits requests are checked against at their arrival: the engine's, with
     /// the features this scheduler's groups serve.
-    pub fn limits(&self) -> &GenerationLimits {
+    pub(crate) fn limits(&self) -> &GenerationLimits {
         &self.limits
     }
 }
 
-/// `config` with its limits lowered to what `groups`' executors hold, once the deployment passes
+/// `config` with its limits lowered to what `groups`' workers hold, once the deployment passes
 /// the startup checks (SD §7.1; `S/core.rs:185-236`, `S/submission.rs:93-105`,
 /// `S/run.rs:108-162`, `S/worker/codecs.rs`).
 ///
@@ -605,7 +564,7 @@ impl Scheduler {
 fn resolved(mut config: SchedulerConfig, groups: &[WorkerGroup]) -> Result<SchedulerConfig, Error> {
     if groups.is_empty() {
         return Err(Error::InvalidRequest(
-            "the executors state no worker group to schedule on".into(),
+            "the workers state no worker group to schedule on".into(),
         ));
     }
 
@@ -709,7 +668,7 @@ impl Scheduler {
     /// batch may have left room for another (a pipelined decode), which the next pass finds
     /// without waiting. It then waits until the next message or the next deadline of
     /// [`Scheduler::next_deadline`].
-    pub fn run(mut self, inbox: Receiver<Message>) {
+    pub(crate) fn run(mut self, inbox: Receiver<Message>) {
         let mut formed = false;
         while !self.stopped {
             let first = if formed {
@@ -796,7 +755,7 @@ impl Scheduler {
     ///    eviction order of each region whose head changed is installed, ahead of the requests
     ///    the step's allocations make;
     /// 2. unless the scheduler is paused, `schedule` assembles the batches that fit now, and each
-    ///    is handed to its group's executor;
+    ///    is handed to the executor;
     /// 3. the step's requests are written into the submission queue as far as it and the
     ///    completion queue have room;
     /// 4. a drain's deadline ends what it ends, `Pause` and `Drain` are answered once due
@@ -1050,12 +1009,12 @@ impl Scheduler {
     }
 
     /// `Configure` (SD §2.4): `config`'s limits serve from the next step on, but the epoch's own,
-    /// which the executors were started for: its drafts per verification and the graph sizes they
+    /// which the workers were started for: its drafts per verification and the graph sizes they
     /// captured. The policy's limits, which budget a step, change with the policy (`SetPolicy`).
     ///
     /// # Errors
     ///
-    /// [`Error::InvalidRequest`] naming the first limit above what the executors hold: running
+    /// [`Error::InvalidRequest`] naming the first limit above what the workers hold: running
     /// requests beyond their slots, a step's tokens beyond the widest prefill bucket, its calls
     /// beyond the largest bucket's rows (`S/run.rs:287-347`). The limits are then unchanged.
     fn configure(&mut self, config: SchedulerConfig) -> Result<(), Error> {
@@ -1077,8 +1036,8 @@ impl Scheduler {
         if let Some((name, value, held)) = limits.into_iter().find(|&(_, value, held)| value > held)
         {
             return Err(Error::InvalidRequest(format!(
-                "scheduler_config.{name} = {value} exceeds the {held} the executors were started \
-                 for; an epoch change starts executors for it"
+                "scheduler_config.{name} = {value} exceeds the {held} the workers were started \
+                 for; an epoch change starts workers for it"
             )));
         }
 
@@ -1095,7 +1054,7 @@ impl Scheduler {
     /// Stops the scheduler on a fault it cannot recover from (SD §3.7). Every request whose
     /// terminal has not been sent leaves as `Migratable { Loss }`, which the daemon resubmits; a
     /// `Finished` held for the daemon's decoder is sent as it is, since that generation ended.
-    /// Each request gives up what it holds as far as the executors still take it.
+    /// Each request gives up what it holds as far as the workers still take it.
     /// `Output::Failed` tells the engine, and the loop ends. A failed executor cannot stamp its
     /// group's `Detach`: the buffer pool detaches the epoch's owners when its session closes
     /// (BP §12.4). Called once; later faults are dropped.
@@ -1221,8 +1180,8 @@ impl Scheduler {
         self.unmapped.retain(|_, waiting| !waiting.is_empty());
     }
 
-    /// Hands `request` to the executors of `groups` for their stamps and keeps it in `stamping`
-    /// until each has returned it; with no group it is held at once, with no stamp.
+    /// Hands `request` to the executor for the stamps of the workers of `groups` and keeps it in
+    /// `stamping` until each has returned it; with no group it is held at once, with no stamp.
     fn hand(&mut self, request: runtime::Request, groups: Vec<GroupId>) {
         if groups.is_empty() {
             self.held.push(request);
@@ -1306,10 +1265,10 @@ impl Scheduler {
             .max()
     }
 
-    /// Takes the requests an executor returns ([`Message::Submit`]). A request handed for stamps
+    /// Takes the requests the executor returns ([`Message::Submit`]). A request handed for stamps
     /// gathers the stamp each returned copy carries, and once every group has returned it, it is
     /// held, followed by the requests that waited behind it. A request no executor was handed
-    /// for stamps (the `Finish` of a copy an executor ran) is held as it is, and its copy leaves
+    /// for stamps (the `Finish` of a copy a worker ran) is held as it is, and its copy leaves
     /// `copies`.
     fn stamped(&mut self, requests: Vec<runtime::Request>) {
         for mut request in requests {
@@ -1436,7 +1395,7 @@ impl Scheduler {
     /// left `owners` (what it gave goes with that owner's `Detach`), but a `Committed`, whose
     /// block a `Detach` does not take back (BP §9, R6) and which the write policy may store; and
     /// a completion that gives entries when a `Release`, a `Commit` or a `Transfer` naming them
-    /// was handed to the executors after its request was submitted (BP §9, obligation 1). A
+    /// was handed to the executor after its request was submitted (BP §9, obligation 1). A
     /// dropped `Copy` is given up at once with `Finish { ok: false }` through its group's
     /// executor; any other enters `copies` until it ends. A `Refused` with the cause `copy`
     /// answers a `Finish` for a copy another `Finish` ended, and is dropped.
@@ -1498,7 +1457,7 @@ impl Scheduler {
                 continue;
             }
             // A copy's request is applied, and kept for the answer to its `Finish`, as the keys
-            // its copy covers, for which that answer speaks; the executors are handed it as it
+            // its copy covers, for which that answer speaks; the executor is handed it as it
             // was written, which the completion answers.
             let applied = cache::covered(&request, &completion);
             if self.matched(id, owner, &request, &applied, &completion, bytes) {
@@ -1510,8 +1469,8 @@ impl Scheduler {
 
     /// Matches the completion of a request other than a `Finish`, as
     /// [`Scheduler::next_completion`] states: false when it is dropped, true when it was handed
-    /// to the executors that take it, or waits for the slot it is handed under, and is to be
-    /// applied. `request` is the request as it was written, which the executors are handed,
+    /// to the executor that takes it, or waits for the slot it is handed under, and is to be
+    /// applied. `request` is the request as it was written, which the executor is handed,
     /// and `applied` the request as it is applied ([`cache::covered`]); `bytes` is what it owed
     /// the completion queue.
     fn matched(
@@ -1563,8 +1522,8 @@ impl Scheduler {
         true
     }
 
-    /// Hands a completion that gives entries to `group`'s executor under `slot` (SD §2.1
-    /// `Executor::map`); a `Copy` it hands over is the executor's to run from then on, and enters
+    /// Hands a completion that gives entries to the executor, for `group`, under `slot` (SD §2.1
+    /// `Executor::map`); a `Copy` it hands over is the workers' to run from then on, and enters
     /// `copies` with its bound (SD §4.4). With `Err(owner)`, the slot is that of `owner`'s
     /// attachment to `group`, whose `Attached` has not been read: the completion waits in
     /// `unmapped` until it is.
@@ -1598,7 +1557,7 @@ impl Scheduler {
     }
 
     /// Gives up the copy that answered request `copy` with `Finish { copy, ok: false }`, stamped
-    /// by its group's executor, which drops it if it has not started (SD §3.1, §4.4). The
+    /// by its group's workers, which drop it if it has not started (SD §3.1, §4.4). The
     /// destination is released only once the copy has ended; the answer to the `Finish` is the
     /// copy's result.
     fn give_up_copy(&mut self, copy: runtime::RequestId, group: GroupId) {
@@ -1841,7 +1800,7 @@ impl Scheduler {
         groups
     }
 
-    /// The group whose executor runs the copies of `request`: the group a `Store` names, and the
+    /// The group whose workers run the copies of `request`: the group a `Store` names, and the
     /// owner's group of a `Load`, a `Clone`, a `Save` or a `Restore`.
     fn copy_group(&self, request: &runtime::Request) -> Option<GroupId> {
         match request {
@@ -1885,7 +1844,7 @@ impl Scheduler {
     }
 
     /// Whether a `Release`, a `Commit` or a `Transfer` naming entries `request` gives was handed
-    /// to the executors after `request`, numbered `number`, was submitted: it is being stamped,
+    /// to the executor after `request`, numbered `number`, was submitted: it is being stamped,
     /// held, or outstanding under a later number. A request submitted after such a `Release`
     /// waited behind it, so it was written after it.
     fn superseded(&self, number: u64, owner: Option<OwnerId>, request: &runtime::Request) -> bool {

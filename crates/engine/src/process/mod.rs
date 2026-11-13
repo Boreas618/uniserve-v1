@@ -34,7 +34,9 @@
 //! start loads ranks and opens a session with the node's Storage Server; a test's builds fakes,
 //! and everything above that seam is the same code.
 
+pub(crate) mod catalogue;
 mod daemon;
+pub(crate) mod data_plane;
 mod epoch;
 mod generation;
 mod lifecycle;
@@ -51,9 +53,11 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use crate::executor::peers::{LOST_EXIT, Liveness};
+use crate::process::data_plane::WeightsUpdated;
+use crate::worker::watchdog::Watchdog;
 use anyhow::{Context as _, Result, bail};
 use crossbeam_channel::{Receiver, Select, Sender};
-use ipc::memory::WeightsUpdated;
 use proto::config::{EngineArgs, EngineConfig, SchedulerConfig};
 use proto::module::{ModuleSlot, Packages};
 use proto::process::command;
@@ -62,19 +66,17 @@ use proto::request::{ArtifactMedia, RequestId};
 use scheduling::Parameters;
 use scheduling::view::Snapshot;
 use service::Connection;
-use worker::executor::peers::{LOST_EXIT, Liveness};
-use worker::executor::watchdog::Watchdog;
 
 pub use daemon::connect;
 use lifecycle::{Lifecycle, Update};
 use requests::RequestStream;
 pub use start::Engine;
 
-use crate::data_plane::Target;
+use crate::memory::client::StorageClient;
 use crate::modules::load;
 use crate::modules::select::changed_operators;
+use crate::process::data_plane::Target;
 use crate::scheduler::{Message, Output};
-use crate::storage_client::StorageClient;
 
 /// Builds the started epoch from the launch: the binary's rank start, or a test's fakes. It
 /// runs on a thread of its own while the control thread serves.
@@ -132,7 +134,7 @@ fn kernels_of(packages: &Packages) -> Packages {
 /// claim. A process whose epoch fails or loses a peer exits with status 1 without its orderly
 /// close: a device or a collective may hold every rank.
 pub fn run(launch_file: &Path, registry: &nn::family::Registry) -> Result<()> {
-    worker::profiling::counters::inject();
+    crate::profiling::counters::inject();
 
     let launch: EngineArgs = std::fs::read(launch_file)
         .map_err(anyhow::Error::new)
@@ -341,7 +343,7 @@ impl MainProcess {
     }
 
     /// What the start's peer links call once one is lost: it tells the control thread.
-    fn peer_lost(&self) -> worker::completion::Waker {
+    fn peer_lost(&self) -> crate::worker::completion::Waker {
         let inbox = self.inbox.0.clone();
         Arc::new(move || {
             let reason = "a peer link of this epoch closed".to_owned();
@@ -544,7 +546,7 @@ impl MainProcess {
     /// collective may hold every rank.
     fn end(mut self, ending: Result<()>) -> Result<()> {
         if let Err(error) = ending {
-            // Nothing of the engine is dropped: dropping an executor joins its thread, which a
+            // Nothing of the engine is dropped: dropping a worker joins its thread, which a
             // device that stopped making progress never lets end.
             let _ = std::mem::ManuallyDrop::new(self.engine.take());
             return Err(error);
@@ -711,7 +713,7 @@ impl MainProcess {
     }
 
     /// `Prepare`: the next generation is made ready beside the one that executes, on a thread
-    /// of its own: its kernels selected, installed and prepared on every executor, its policy
+    /// of its own: its kernels selected, installed and prepared on every worker, its policy
     /// instantiated once against the ceilings, and, when a kernel package changed, a shadow pass
     /// of every scheduler.
     fn prepare(&mut self, prepare: proto::process::Prepare) {
@@ -740,14 +742,14 @@ impl MainProcess {
         };
 
         let shadows = engine.shadows();
-        let executors = engine.executors.clone();
+        let workers = engine.workers.clone();
         let ceilings = engine.ceilings;
         let serving = kernels_of(&self.serving);
         // A preparation whose shadow pass no running request reaches within twice the stall
         // bound is abandoned, naming the operators it could not compare.
         let bound = 2 * self.watchdog.stall_bound();
         self.work(Box::new(move || {
-            let prepared = generation::kernels(&executors, &build, &named, &serving, generation)
+            let prepared = generation::kernels(&workers, &build, &named, &serving, generation)
                 .and_then(|kernels| {
                     let (module, parameters) = generation::policy(&build.0, &policy, &ceilings)?;
                     // Only an operator whose package changed has an old kernel to compare with.
@@ -755,7 +757,7 @@ impl MainProcess {
                     let uncompared = if changed.is_empty() {
                         Vec::new()
                     } else {
-                        generation::shadow(&shadows, &executors, generation, &changed, bound)?
+                        generation::shadow(&shadows, &workers, generation, &changed, bound)?
                     };
                     let mut packages = kernels;
                     packages.insert(policy_slot(), policy);
@@ -803,9 +805,9 @@ impl MainProcess {
             return;
         };
         let shadows = engine.shadows();
-        let executors = engine.executors.clone();
+        let workers = engine.workers.clone();
         self.serial(Box::new(move || {
-            let discarded = generation::discard(&shadows, &executors, generation);
+            let discarded = generation::discard(&shadows, &workers, generation);
             done(move |_| {
                 if let Err(error) = discarded {
                     tracing::warn!(generation, %error, "a discarded generation was not released");
@@ -829,13 +831,13 @@ impl MainProcess {
         };
 
         let schedulers = engine.inboxes();
-        let executors = engine.executors.clone();
+        let workers = engine.workers.clone();
         let data = Arc::clone(&engine.data);
         let served = Arc::clone(&engine.served);
         let policy = (module, parameters);
         self.serial(Box::new(move || {
             let switched =
-                generation::switch(&schedulers, &executors, &data, &served, generation, &policy);
+                generation::switch(&schedulers, &workers, &data, &served, generation, &policy);
             done(move |main| main.switched(generation, packages, policy, switched))
         }));
     }
@@ -863,7 +865,7 @@ impl MainProcess {
             let route = engine.route.as_mut()?;
             Some(route.switch(module, parameters, snapshot, &ceilings))
         }) {
-            // The executors execute the generation and the route instance cannot: the route
+            // The workers execute the generation and the route instance cannot: the route
             // keeps the policy it served, and the whole generation goes back as on any fault on
             // trial.
             let reason = format!("the route instance of generation {generation} failed: {error}");
@@ -896,9 +898,9 @@ impl MainProcess {
             return;
         };
         let schedulers = engine.inboxes();
-        let executors = engine.executors.clone();
+        let workers = engine.workers.clone();
         self.serial(Box::new(move || {
-            let committed = generation::commit(&schedulers, &executors, generation);
+            let committed = generation::commit(&schedulers, &workers, generation);
             done(move |main| main.committed(generation, committed))
         }));
     }
@@ -930,7 +932,7 @@ impl MainProcess {
             return;
         };
         let schedulers = engine.inboxes();
-        let executors = engine.executors.clone();
+        let workers = engine.workers.clone();
         let data = Arc::clone(&engine.data);
         let served = Arc::clone(&engine.served);
         // The trial kept the generation before it: generations are numbered one past the one
@@ -938,7 +940,7 @@ impl MainProcess {
         let kept = generation - 1;
         self.serial(Box::new(move || {
             let rolled =
-                generation::rollback(&schedulers, &executors, &data, &served, generation, kept);
+                generation::rollback(&schedulers, &workers, &data, &served, generation, kept);
             done(move |main| main.rolled_back(kept, reason, rolled))
         }));
     }
@@ -1046,10 +1048,10 @@ impl MainProcess {
         else {
             return;
         };
-        let executors = engine.executors.clone();
+        let workers = engine.workers.clone();
         let data = Arc::clone(&engine.data);
         self.serial(Box::new(move || {
-            let released = epoch::release(&head, &data, &executors, region, units);
+            let released = epoch::release(&head, &data, &workers, region, units);
             done(move |main| match released {
                 Ok((devices, _)) if devices.is_empty() => {}
                 Ok((devices, bytes)) => main.report(lifecycle::report(
@@ -1327,7 +1329,7 @@ impl MainProcess {
     ) -> Result<(
         Vec<Sender<Message>>,
         Arc<Mutex<StorageClient>>,
-        Arc<crate::data_plane::DataPlane>,
+        Arc<crate::process::data_plane::DataPlane>,
     )> {
         let engine = self.engine.as_ref().ok_or_else(starting)?;
         let head = engine.head.clone().context(

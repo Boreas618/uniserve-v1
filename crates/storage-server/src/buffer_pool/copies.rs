@@ -1,10 +1,10 @@
-//! The copies an executor runs: `Clone`, `Load`, `Store` to the host, `Save`
+//! The copies a worker runs: `Clone`, `Load`, `Store` to the host, `Save`
 //! and `Restore`, and the `Finish` that ends each.
 //!
 //! The handler allocates the destination and answers `Copy` with the runs to
 //! read and to write. The copy holds what it reads and what it writes until
 //! its `Finish` takes effect, which is when the `completed` of the copy's
-//! group has reached the stamp of the `Finish`: the executor has then ended
+//! group has reached the stamp of the `Finish`: the worker has then ended
 //! the batch the copy ran with.
 
 use std::rc::Rc;
@@ -105,7 +105,7 @@ impl BufferPool {
         Ok((written.1 != found.encoding).then_some((written.1, found.encoding)))
     }
 
-    /// R5: a clone is a new private block that the executor fills from the
+    /// R5: a clone is a new private block that the worker fills from the
     /// cached one; the cached block is never handed out as private.
     pub(super) fn clone_block(
         &mut self,
@@ -493,7 +493,7 @@ impl BufferPool {
     }
 
     /// One `Finish` ends a copy: R1 refuses one that names no copy an
-    /// executor of the session runs, or a copy whose `Finish` waits.
+    /// worker of the session runs, or a copy whose `Finish` waits.
     pub(super) fn finish(
         &mut self,
         queue: QueueId,
@@ -502,14 +502,14 @@ impl BufferPool {
         ok: bool,
         after: Stamps,
     ) -> Taken {
-        let run_by_executor = self
+        let run_by_worker = self
             .copies
             .get(&(queue, copy))
             .is_some_and(|copies| copies.iter().all(|copy| copy.deadline.is_none()));
         let waits = self.groups.values().flat_map(|group| &group.deferred).any(|(_, work)| {
             matches!(work, Deferred::Finish { queue: of, copy: other, .. } if *of == queue && *other == copy)
         });
-        if !run_by_executor || waits {
+        if !run_by_worker || waits {
             return Err(Cause::Copy);
         }
         self.stamped(queue.0, &after)?;
@@ -528,7 +528,7 @@ impl BufferPool {
         Ok(None)
     }
 
-    /// The end of a copy takes effect (R3: its executor has ended the batch
+    /// The end of a copy takes effect (R3: its workers have ended the batch
     /// it ran with). When it failed the destinations retire, nothing is
     /// cached and the positions are free.
     pub(super) fn finished(&mut self, queue: QueueId, copy: RequestId, ok: bool) -> Completion {

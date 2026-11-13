@@ -1004,7 +1004,7 @@ mod tests {
         let stop = Arc::new(AtomicBool::new(false));
         let (thread, waker) = running(resumed, Arc::clone(&stop));
 
-        // The executor completes batch 2 after the restart, and submits more.
+        // The workers complete batch 2 after the restart, and submits more.
         pair.register(completed).store(2, Ordering::Release);
         assert_eq!(completion(&mut pair), (RequestId(3), Completion::Committed));
         submit(

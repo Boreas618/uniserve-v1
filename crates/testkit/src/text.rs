@@ -6,7 +6,7 @@
 //! where a request's text ends in the logical positions the mechanism writes, a prompt of `p`
 //! tokens sampling its `n`-th token at position `p + n`.
 
-use ipc::philox::DrawAddress;
+use engine::batch::philox::DrawAddress;
 
 /// The first token id a fake samples: every token it samples lies in `SAMPLED..SAMPLED + 5000`, a
 /// window of legal ids that no prompt of the tests uses.
@@ -19,8 +19,9 @@ const VOCABULARY: u32 = 5_000;
 /// position of the token alone, as a device sampler's draw is.
 ///
 /// A case computes what a request samples from the request's sampling key
-/// (`ipc::philox::request_sampling_key`) and the position, so a request that continues on another
-/// engine, in another slot or another batch, samples what it would have sampled uninterrupted.
+/// (`engine::batch::philox::request_sampling_key`) and the position, so a request that continues on
+/// another engine, in another slot or another batch, samples what it would have sampled
+/// uninterrupted.
 pub fn draw_token(draw: DrawAddress) -> u32 {
     // SplitMix64's finalizer over the two halves of the address: a fixed bijective mix, so nearby
     // keys and positions give unrelated tokens.
@@ -39,10 +40,10 @@ pub const EOS: u32 = 151_645;
 /// The raw log-probability the fake reports for every token it samples.
 pub const LOGPROB: f32 = -0.5;
 
-/// The scores the fake reports for a sampled `token` (`ipc::batch::CallOutput::token_logprobs`):
+/// The scores the fake reports for a sampled `token` (`engine::batch::CallOutput::token_logprobs`):
 /// the token itself at [`LOGPROB`], its position's most likely, and no other candidate.
-pub fn scored(token: u32) -> Vec<ipc::TokenLogprob> {
-    vec![ipc::TokenLogprob {
+pub fn scored(token: u32) -> Vec<proto::request::TokenLogprob> {
+    vec![proto::request::TokenLogprob {
         token_id: token,
         logprob: LOGPROB,
         rank: 1,

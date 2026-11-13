@@ -8,8 +8,8 @@
 //!   non-finite logits fail it and are reported with the batch (`Output::NumericalFault`), and a
 //!   rank that can no longer serve stops the scheduler.
 
+use engine::batch::{BatchOutput, ErrorCode, Phase};
 use engine::scheduler::{Message, Output};
-use ipc::batch::{BatchOutput, ErrorCode, Phase};
 use proto::request::{Event, FinishReason, MigrationCause, RejectionKind, RequestId};
 
 use crate::harness::{Deployment, Harness, token};
@@ -48,7 +48,7 @@ fn decoding_and_waiting() -> (Harness, RequestId, RequestId) {
     (harness, running, waiting)
 }
 
-/// A batch the device failed after it launched (its executor answers it with an error) stops the
+/// A batch the device failed after it launched (its workers answer it with an error) stops the
 /// scheduler: the running request and the waiting one both leave as `Migratable { Loss }`, and
 /// the engine is told once, by the first error, which names the failed batch and what the device
 /// said (SD §3.7, §7.6; `in_process_stalls.rs`).
@@ -84,7 +84,7 @@ fn a_failed_batch_ends_its_requests_as_migratable_and_the_first_error_names_it()
     assert_eq!(harness.outputs().len(), outputs);
 }
 
-/// A batch whose executor answers it with other calls than it was given stops the scheduler: its
+/// A batch the executor answers with other calls than it was given stops the scheduler: its
 /// requests and the waiting one leave as `Migratable { Loss }`, and the failure names the batch
 /// (SD §3.7 `update`).
 #[test]

@@ -217,7 +217,7 @@ impl Allocator {
         self.lock().top
     }
 
-    /// The block state. One executor thread issues a device's work, so the lock is uncontended;
+    /// The block state. One worker thread issues a device's work, so the lock is uncontended;
     /// it exists because a tensor may be dropped on another thread. A panic while it was held
     /// cannot leave the indexes inconsistent in a way a later forward observes, since every
     /// forward starts with a reset.

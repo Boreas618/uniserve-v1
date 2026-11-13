@@ -8,7 +8,7 @@
 //! - **Sessions.** An engine's main process, a head of its epoch, opens the
 //!   epoch's session ([`Request::Open`]) and gets one queue pair per
 //!   scheduler; the server refuses an interface version it does not serve.
-//!   The engine closes it ([`Request::Close`]) once its executors stopped.
+//!   The engine closes it ([`Request::Close`]) once its workers stopped.
 //!   When its connection closes first, the session closes only once the
 //!   engine's processes have exited and no GPU lists them (A7), the
 //!   evidence a shoot-down gathers, never on the connection's close alone:

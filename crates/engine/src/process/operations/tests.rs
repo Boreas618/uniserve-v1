@@ -1,10 +1,10 @@
 //! The parts of a serving engine that the jobs act on, over a Storage Server in the test's
-//! process and executors that hold no device: one scheduler on its thread, over a session whose
-//! region of the KV planes is made of four segments, with the engine's executor of its one worker
+//! process and workers that hold no device: one scheduler on its thread, over a session whose
+//! region of the KV planes is made of four segments, with the engine's worker of its one worker
 //! group, whose rank serves generation 1 of no kernel, and a data plane of no rank.
 //!
 //! The tests read what the jobs leave: the scheduler's replies and statistics, the generation
-//! each executor serves, and the segment table the Storage Server holds.
+//! each worker serves, and the segment table the Storage Server holds.
 
 use std::collections::BTreeMap;
 use std::sync::atomic::AtomicU64;
@@ -17,16 +17,16 @@ use crossbeam_channel::{Receiver, Sender};
 use proto::config::{SchedulerConfig, WorkerGroupConfig};
 use proto::report::SchedulerStats;
 use proto::request::GenerationLimits;
+use service::lock;
 use storage::runtime::{self, Class, Open, Region, Segments, Tier};
-use worker::lock;
 
 use super::at_boundary;
-use crate::data_plane::{DataPlane, Target};
-use crate::executor::Groups;
+use crate::executor::WorkerExecutor;
 use crate::executor::tests::{GROUP, node};
+use crate::memory::client::StorageClient;
+use crate::process::data_plane::{DataPlane, Target};
 use crate::scheduler::tests::{capacity, idle_policy};
 use crate::scheduler::{Message, Output, Scheduler};
-use crate::storage_client::StorageClient;
 use crate::support::{DEPLOYMENT, StorageServer};
 
 /// The units of the region of the KV planes, the first of them reserved, in four segments.
@@ -113,7 +113,7 @@ pub(in crate::process) struct Node {
     /// What the scheduler reports.
     pub(in crate::process) outputs: Receiver<Output>,
     /// The worker group's one rank.
-    pub(in crate::process) executors: Vec<Arc<worker::Executor>>,
+    pub(in crate::process) workers: Vec<Arc<crate::worker::Worker>>,
     pub(in crate::process) data: Arc<DataPlane>,
     pub(in crate::process) head: Mutex<StorageClient>,
     /// The generation the scheduler's batches carry.
@@ -126,16 +126,16 @@ impl Node {
     pub(in crate::process) fn start() -> Self {
         let server = StorageServer::start();
         let layout = layout(1);
-        let mut head = StorageClient::connect(&server.socket, DEPLOYMENT, 1).unwrap();
+        let mut head = StorageClient::connect_head(&server.socket, DEPLOYMENT, 1).unwrap();
         let mut pairs = head.open(layout.clone()).unwrap();
         let opened = head.session().unwrap().1.clone();
 
-        let (route, executors) = node(1, &Arc::default());
+        let (route, workers) = node(1, &Arc::default());
         let (inbox, messages) = crossbeam_channel::unbounded();
         let (output, outputs) = crossbeam_channel::unbounded();
         let served = Arc::new(AtomicU64::new(1));
 
-        let groups = Groups::new(route, &[GROUP], inbox.clone(), Arc::default()).unwrap();
+        let groups = WorkerExecutor::new(route, &[GROUP], inbox.clone(), Arc::default()).unwrap();
         let config = WorkerGroupConfig::data_parallel(
             &["localhost".to_owned()],
             "cpu",
@@ -165,7 +165,7 @@ impl Node {
         Self {
             schedulers: vec![inbox],
             outputs,
-            executors,
+            workers,
             data: Arc::new(DataPlane::new(Vec::new(), Target::default())),
             head: Mutex::new(head),
             served,
@@ -182,7 +182,7 @@ impl Node {
     /// The segment table of the KV planes' memory space as the Storage Server holds it: what a
     /// session of the same layout, of epoch `epoch`, opened now is answered.
     pub(in crate::process) fn segments_seen(&self, epoch: u64) -> Segments {
-        let mut head = StorageClient::connect(&self.server.socket, DEPLOYMENT, epoch).unwrap();
+        let mut head = StorageClient::connect_head(&self.server.socket, DEPLOYMENT, epoch).unwrap();
         head.open(layout(epoch)).unwrap();
         let segments = head.session().unwrap().1.segments[0].clone();
         head.close().unwrap();

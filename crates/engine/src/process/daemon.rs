@@ -86,7 +86,10 @@ pub fn connect(connection: &mut Connection, launch: &EngineArgs) -> Result<()> {
 pub(crate) fn claim(
     process: &mut Connection,
     launch: &EngineArgs,
-) -> Result<(ipc::StorageLaunch, Vec<proto::process::Command>)> {
+) -> Result<(
+    crate::memory::client::StorageLaunch,
+    Vec<proto::process::Command>,
+)> {
     // The daemon keys this connection by the engine number, so a process that states none would
     // be filed in the place of a process it can never command.
     if launch.engine == 0 {
@@ -181,7 +184,7 @@ pub(crate) fn claim(
             claimed.claim.len()
         )
     })?;
-    let storage = ipc::StorageLaunch {
+    let storage = crate::memory::client::StorageLaunch {
         socket: claimed.socket,
         deployment: launch.engine_config.deployment.clone(),
         claim: token,

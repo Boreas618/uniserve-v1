@@ -16,8 +16,8 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use engine::batch::{Batch, Phase};
 use engine::scheduler::{Message, Output, policy};
-use ipc::batch::{Batch, Phase};
 use proto::report::SchedulerStats;
 use proto::request::{Event, FinishReason, MigrationCause, RequestId};
 use scheduling::decision::{DispatchOutput, Work};
@@ -364,7 +364,7 @@ fn observe_and_dispatch_are_called_once_per_step_and_limits_once_per_instance() 
 }
 
 /// A switch to a module that traps or runs out of fuel as it starts, or that declares limits above
-/// the ceilings the executors' buckets state, is refused with the fault, and the serving policy
+/// the ceilings the workers' buckets state, is refused with the fault, and the serving policy
 /// is untouched: nothing is kept to roll back to, and it serves on with its own limits (SD §3.9,
 /// §5.2 "Limits", "Faults").
 #[test]

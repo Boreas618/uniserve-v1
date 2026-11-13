@@ -12,7 +12,7 @@
 
 use std::collections::BTreeSet;
 
-use ipc::batch::Phase;
+use crate::batch::Phase;
 use proto::config::WorkerGroupRole;
 use proto::request::RequestId;
 use scheduling::decision::{Inflight, Room};
@@ -142,7 +142,7 @@ pub(super) fn view(request: &Request, groups: &[WorkerGroup], tokens: Option<u32
 /// The view of a request no step of a scheduler sizes a refill for ([`view`] with no refill
 /// offered): an arrival the engine routes before a scheduler takes it, which is viewed with no
 /// groups and so waits with no phase ready, and an arrival a scheduler tells its policy.
-pub fn view_of(request: &Request, groups: &[WorkerGroup]) -> RequestView {
+pub(crate) fn view_of(request: &Request, groups: &[WorkerGroup]) -> RequestView {
     view(request, groups, None)
 }
 

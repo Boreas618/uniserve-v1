@@ -10,9 +10,9 @@
 //!
 //! Every deployment here roots its chains at the zero seed: its groups state no page seeds.
 
+use engine::batch::Phase;
+use engine::batch::cache::CacheGroupKind;
 use engine::scheduler::Message;
-use ipc::CacheGroupKind;
-use ipc::batch::Phase;
 use proto::request::wire::WeightsInFlight;
 use proto::request::{Event, GenerationRequest, MigrationCause, RequestId};
 use storage::Key;
@@ -80,7 +80,7 @@ fn reads(harness: &Harness, owner: OwnerId) -> bool {
 }
 
 /// The first cache position request `id`'s first prefill after the `skip` first batches the
-/// executors were handed wrote: where its computation started.
+/// executor was handed wrote: where its computation started.
 fn first_written(harness: &Harness, id: RequestId, skip: usize) -> i32 {
     let batches = harness.batches().into_iter().skip(skip);
     let mut prefills =

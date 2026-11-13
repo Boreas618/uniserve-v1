@@ -16,19 +16,19 @@
 //!    runner. It returns the segments it created, which the head grants, and the schedulers
 //!    then grow their regions into them by `Resize`.
 //! 4. [`bind`] binds every rank to the regions the answer numbered, [`spawn`] spawns the
-//!    executors over the ranks' runners, and [`capacities`] states what each worker group's
+//!    workers over the ranks' runners, and [`capacities`] states what each worker group's
 //!    ranks serve.
 //!
 //! One sequence serves a first epoch, a successor of the same layout and a relaunch: a region an
 //! earlier session named has its table, which the ranks map, and creates nothing more.
 //!
-//! A rank of a media deployment ([`Loaded::Video`], `crate::rank::video`) takes the same steps
-//! and keeps no cache: its load profiles the media runners of the blocks its group places on it
-//! and forms its text encoder's and denoiser's groups; the layout states every rank's product
-//! buffer, the slot rows of each group with a trajectory's row, the host regions of encoder
-//! outputs and stored trajectories, and the product classes with the regions each group's
-//! blocks write and read; its opening takes its media memory from its graph pool's resident pool,
-//! the process's first rank maps the one part of each host region, the process's memories are
+//! A rank of a media deployment ([`Loaded::Video`], `crate::process::ranks::rank::video`) takes the
+//! same steps and keeps no cache: its load profiles the media runners of the blocks its group
+//! places on it and forms its text encoder's and denoiser's groups; the layout states every rank's
+//! product buffer, the slot rows of each group with a trajectory's row, the host regions of encoder
+//! outputs and stored trajectories, and the product classes with the regions each group's blocks
+//! write and read; its opening takes its media memory from its graph pool's resident pool, the
+//! process's first rank maps the one part of each host region, the process's memories are
 //! connected, and the serving runners are built over them. It creates no segment. A device that
 //! holds ranks of several groups opens one graph pool and one media memory per rank.
 //!
@@ -38,13 +38,34 @@
 //! [`FIRST_GENERATION`] of no kernel. That is what a recorded start reads and what the engine's
 //! host tests start.
 
+pub(crate) mod rank;
+
 use std::net::TcpListener;
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 
+use crate::batch::Capacity;
+use crate::batch::product;
+use crate::batch::{Batch, Phase};
+use crate::executor::Route;
+use crate::executor::peers::Remote;
+use crate::memory::buffers::{BufferMemory, UNIT_BYTES};
+use crate::memory::cache::{CacheLayout, CacheRegions, KvCacheMemory, host};
+use crate::memory::client::StorageClient;
+use crate::memory::division;
+use crate::memory::encoders;
+use crate::memory::graph_pool::GraphPool;
+use crate::memory::latent;
+use crate::memory::state::StateMemory;
+use crate::memory::tables::BlockTables;
+use crate::memory::weights::WeightStore;
+use crate::parallel::host::{HostGroup, STARTUP_TIMEOUT};
+use crate::runner::causal_lm::experts::JoinHook;
+use crate::runner::causal_lm::{CausalLmConfig, CausalLmRunner};
+use crate::runner::graphs::Graphs;
+use crate::runner::thread_pool::ThreadPool;
+use crate::runner::{Runner, RunnerId};
+use crate::worker::{COPY_BUDGET, Sequences, Worker};
 use anyhow::{Context as _, Result, bail};
-use ipc::Capacity;
-use ipc::batch::{Batch, Phase};
-use ipc::product;
 use nn::WeightKey;
 use nn::family::TextModel;
 use ops::Generation;
@@ -52,31 +73,15 @@ use platform::{DeviceId, Stream};
 use proto::config::{EngineArgs, WorkerGroupConfig};
 use storage::QueuePair;
 use storage::runtime::{Class, Group, GroupId, Open, Opened, Region, Segments, Tier, VERSION};
-use worker::executor::peers::Remote;
-use worker::executor::{COPY_BUDGET, Executor, Executors, Sequences};
-use worker::graphs::Graphs;
-use worker::memory::buffers::{BufferMemory, UNIT_BYTES};
-use worker::memory::cache::{CacheLayout, CacheRegions, KvCacheMemory, host};
-use worker::memory::client::StorageClient;
-use worker::memory::division;
-use worker::memory::encoders;
-use worker::memory::graph_pool::GraphPool;
-use worker::memory::latent;
-use worker::memory::state::StateMemory;
-use worker::memory::tables::BlockTables;
-use worker::memory::weights::WeightStore;
-use worker::parallel::host::{HostGroup, STARTUP_TIMEOUT};
-use worker::runners::causal_lm::experts::JoinHook;
-use worker::runners::causal_lm::{CausalLmConfig, CausalLmRunner};
-use worker::thread_pool::ThreadPool;
-use worker::{Runner, RunnerId};
 
-use crate::rank::memory::{Peaks, fewest_units, granularity, plane_segments, scratch_bytes};
-use crate::rank::text::{Keys, keys, profile};
-use crate::rank::video::{
+use self::rank::{Collective, ModelRunner, RankModel, Weights, media_tasks};
+use crate::process::ranks::rank::memory::{
+    Peaks, fewest_units, granularity, plane_segments, scratch_bytes,
+};
+use crate::process::ranks::rank::text::{Keys, keys, profile};
+use crate::process::ranks::rank::video::{
     VideoRank, boxed, group_phases, latent_pages, product_classes, product_kind, served_phases,
 };
-use crate::rank::{Collective, ModelRunner, RankModel, Weights, media_tasks};
 
 /// The number of the generation a start serves: its kernels on a device, none on the meta device.
 /// A start is not an update (`specs/updates.md` §2): nothing is kept beside it.
@@ -86,10 +91,10 @@ pub(crate) const FIRST_GENERATION: u64 = 1;
 /// its device: the engine's module load at the Build Server (step 9).
 pub(crate) type Resolve<'a> = dyn Fn(DeviceId, &Keys) -> Result<Arc<Generation>> + Sync + 'a;
 
-/// The executors of the members of the node's expert union, in member order, once they are
+/// The workers of the members of the node's expert union, in member order, once they are
 /// spawned: what each member's join hook submits join batches to. Weak, because each member's
-/// runner holds its hook and its executor holds its runner: the epoch's close owns the executors.
-type Members = Arc<OnceLock<Vec<Weak<Executor>>>>;
+/// runner holds its hook and its worker holds its runner: the epoch's close owns the workers.
+type Members = Arc<OnceLock<Vec<Weak<Worker>>>>;
 
 /// The host KV cache's token count over the device KV cache's when `kv_cache_config.host_ratio`
 /// is unset (SGLang's `--hicache-ratio` default).
@@ -98,7 +103,7 @@ const HOST_RATIO: f64 = 2.0;
 /// What the layout states of a sample a trajectory holds on a rank of a denoising group: the
 /// whole video and audio latents on every rank, since a step gathers the velocity to every rank
 /// of its sequence group before the solver's update. Two ranks of one statement lay every
-/// trajectory out alike (`worker::memory::latent::host::share`).
+/// trajectory out alike (`crate::memory::latent::host::share`).
 const WHOLE_SAMPLES: &str = "video and audio latents, whole on every rank";
 
 /// What the ranks of a start load onto.
@@ -109,7 +114,7 @@ pub(crate) enum Backing<'a> {
     /// forms its communicator. `kernels` resolves the rank's profiled keys into its serving
     /// generation.
     Serving {
-        storage: &'a ipc::StorageLaunch,
+        storage: &'a crate::memory::client::StorageLaunch,
         kernels: &'a Resolve<'a>,
     },
     /// Nothing outside this process: each rank's model is loaded from the shard headers alone
@@ -120,7 +125,7 @@ pub(crate) enum Backing<'a> {
 }
 
 /// One rank of this process: loaded to its division by [`load_ranks`], then opened over the
-/// session's memory by [`open_ranks`], which is what its executor is spawned over.
+/// session's memory by [`open_ranks`], which is what its worker is spawned over.
 pub(crate) struct LoadedRank {
     /// The rank's own model runner, whose one device is the rank's.
     pub(crate) model_runner: ModelRunner,
@@ -137,7 +142,7 @@ pub(crate) struct LoadedRank {
     pub(crate) pool: Option<Arc<Mutex<GraphPool>>>,
     /// The streams the rank's runners compute on (`device`) and its copies run on (`copy`),
     /// named as the always-on counters record their device time
-    /// (`worker::profiling::counters::Counters::start`); empty for a meta start.
+    /// (`crate::profiling::counters::Counters::start`); empty for a meta start.
     pub(crate) streams: Vec<(&'static str, Stream)>,
     /// Every kernel the rank launches.
     pub(crate) keys: Keys,
@@ -179,27 +184,27 @@ pub(crate) struct TextRank {
     /// session's memory.
     pub(crate) cache: Arc<Mutex<KvCacheMemory>>,
     pub(crate) state: Option<Arc<Mutex<StateMemory>>>,
-    /// The rank's serving runner, from its opening until its executor takes it ([`spawn`]).
+    /// The rank's serving runner, from its opening until its worker takes it ([`spawn`]).
     pub(crate) runner: Option<CausalLmRunner>,
     /// The node's expert union this rank is a member of: the union's host group, the members'
-    /// executors once [`spawn`] set them, and the rank's place among them; `None` outside a
+    /// workers once [`spawn`] set them, and the rank's place among them; `None` outside a
     /// union.
     pub(crate) union: Option<(Arc<HostGroup>, Members, usize)>,
 }
 
 impl LoadedRank {
-    /// What the data plane holds of this rank once `executor` serves it
-    /// ([`crate::data_plane::Rank`]): the owners of its device's storage, a stream of the device
-    /// for the data plane's own operations, and how it loads its model again; `None` for a rank of
-    /// a meta start, which holds no device.
+    /// What the data plane holds of this rank once `worker` serves it
+    /// ([`crate::process::data_plane::Rank`]): the owners of its device's storage, a stream of the
+    /// device for the data plane's own operations, and how it loads its model again; `None` for a
+    /// rank of a meta start, which holds no device.
     ///
     /// # Errors
     ///
     /// When the device gives no stream.
     pub(crate) fn data_rank(
         &self,
-        executor: &Arc<Executor>,
-    ) -> Result<Option<crate::data_plane::Rank>> {
+        worker: &Arc<Worker>,
+    ) -> Result<Option<crate::process::data_plane::Rank>> {
         let (Some(client), Some(store), Some(pool)) = (&self.client, &self.store, &self.pool)
         else {
             return Ok(None);
@@ -211,9 +216,9 @@ impl LoadedRank {
         };
 
         let (_, fraction) = self.model_runner.fractions()?;
-        Ok(Some(crate::data_plane::Rank {
+        Ok(Some(crate::process::data_plane::Rank {
             rank: self.model_runner.rank(),
-            executor: Arc::downgrade(executor),
+            worker: Arc::downgrade(worker),
             device,
             fraction,
             client: Arc::clone(client),
@@ -335,7 +340,7 @@ pub(crate) fn load_ranks(
         Some((address, listener)) => (address, Some(listener)),
         None => (String::new(), None),
     };
-    // One join target list for the union, which `spawn` fills with its members' executors.
+    // One join target list for the union, which `spawn` fills with its members' workers.
     let targets: Members = Arc::default();
 
     std::thread::scope(|scope| {
@@ -405,7 +410,7 @@ fn load_rank(
     // every rank the deployment places on the GPU, which each of them states alike.
     let client = match backing {
         Backing::Serving { storage, .. } => {
-            let client = StorageClient::connect(
+            let client = StorageClient::connect_rank(
                 storage,
                 model_runner.group(),
                 model_runner.rank(),
@@ -471,7 +476,7 @@ fn load_rank(
     let meta_state = match &state_config {
         Some(config) => Some(Arc::new(Mutex::new(StateMemory::meta(
             config.clone(),
-            worker::lock(&meta_cache).config(),
+            service::lock(&meta_cache).config(),
         )?))),
         None => None,
     };
@@ -503,14 +508,14 @@ fn load_rank(
         &meta_cache,
         meta_state.as_ref().map(|state| state.as_ref()),
     )?;
-    let graphs = worker::Runner::graphs(&profiled);
+    let graphs = crate::runner::Runner::graphs(&profiled);
     let peaks = Peaks {
         graph: graphs.peak(),
         shadow: graphs.shadow_peak(CausalLmRunner::in_place_bytes(
             &meta_config,
             meta.as_ref(),
             &layout,
-        )?) + scratch_bytes(&meta_config, worker::lock(&meta_cache).config()),
+        )?) + scratch_bytes(&meta_config, service::lock(&meta_cache).config()),
         inputs: graphs.input_peak(),
     };
     drop(profiled);
@@ -521,7 +526,7 @@ fn load_rank(
             // The meta device allocates nothing, so each unit is a whole granule of it: its cache
             // is the fewest units it serves with, rounded up to at most eight segments of whole
             // units.
-            let units = worker::memory::cache::segments::segmented_units_above(
+            let units = crate::memory::cache::segments::segmented_units_above(
                 least,
                 layout.plane_bytes,
                 layout.plane_bytes,
@@ -571,7 +576,7 @@ fn load_rank(
         .map_or(0, |config| config.bytes(&layout));
     let slot_bytes = CausalLmRunner::slot_bytes(&meta_config, model.as_ref())?
         + CausalLmRunner::kept_bytes(&meta_config, model.as_ref())?;
-    let fixed = worker::lock(&meta_cache).config().fixed_bytes();
+    let fixed = service::lock(&meta_cache).config().fixed_bytes();
     let pools = model_runner.pools(device, &layout, peaks)?;
     let (units, first) = model_runner.divide(
         &client,
@@ -702,23 +707,23 @@ fn load_video_rank(
 }
 
 /// The hook through which union member `place` asks every other member to join its step: a
-/// join batch to each one's executor, of the group that executor serves, once [`spawn`] set the
-/// members' executors in `targets`.
+/// join batch to each one's worker, of the group that worker serves, once [`spawn`] set the
+/// members' workers in `targets`.
 fn join_hook(targets: Members, place: usize) -> JoinHook {
     Arc::new(move |batch: Batch| {
-        let members = targets.get().ok_or(worker::Error::State(
-            "the expert union's executors are not spawned",
+        let members = targets.get().ok_or(crate::worker::Error::State(
+            "the expert union's workers are not spawned",
         ))?;
-        for (index, executor) in members.iter().enumerate() {
+        for (index, worker) in members.iter().enumerate() {
             if index == place {
                 continue;
             }
-            let executor = executor.upgrade().ok_or(worker::Error::State(
-                "an executor of the expert union is closed",
+            let worker = worker.upgrade().ok_or(crate::worker::Error::State(
+                "a worker of the expert union is closed",
             ))?;
             let mut join = batch.clone();
-            join.group = executor.group();
-            executor.join(join)?;
+            join.group = worker.group();
+            worker.join(join)?;
         }
         Ok(())
     })
@@ -902,7 +907,7 @@ pub(crate) fn layout(launch: &EngineArgs, ranks: &[LoadedRank]) -> Result<Open> 
     let first = ranks.first().context("this process loaded no rank")?;
     match &first.loaded {
         Loaded::Text(text) => {
-            let cache = Arc::clone(worker::lock(&text.cache).layout());
+            let cache = Arc::clone(service::lock(&text.cache).layout());
             let tensor = u32::try_from(first.model_runner.world_size())
                 .context("a worker group wider than a session states")?;
             let slots = first.model_runner.slots()?;
@@ -927,7 +932,7 @@ pub(crate) fn layout(launch: &EngineArgs, ranks: &[LoadedRank]) -> Result<Open> 
 ///   slot rows, numbered from 1, the epoch's own. A unit's bytes are summed over the tensor ranks
 ///   that hold a part of it.
 /// - **Classes**, in the numbering the worker uses: cache group `g` is class `g`, then one class
-///   per product kind in the order of the product classes (`ipc::product::KINDS`), then
+///   per product kind in the order of the product classes (`crate::batch::product::KINDS`), then
 ///   the class of stored trajectories. A text deployment holds no product and no trajectory:
 ///   those classes name no region.
 /// - **Groups**, numbered for the session ([`group_numbers`]), each with its memory, its slot
@@ -1095,7 +1100,7 @@ pub fn text_layout(
 ///   region of stored trajectories when a group denoises: the deployment's on the host, numbered
 ///   for the outputs or trajectories every such group can have stored at once. A block of either
 ///   lies whole in one rank's memory and has one host copy, so a unit is one part
-///   (`worker::memory::encoders::PAGE_BYTES` and a latent page), the part of the process's first
+///   (`crate::memory::encoders::PAGE_BYTES` and a latent page), the part of the process's first
 ///   rank, which every rank copies with (`BufferMemory::part_holder`). Each is named by its
 ///   class's tensors, the layout of its units and its numbering, not by the ranks of a layout, so
 ///   another epoch of any parallel configuration that numbers it alike finds what this one
@@ -1104,10 +1109,10 @@ pub fn text_layout(
 ///   every request slot of each product kind the rank backs at the largest size the denoising
 ///   group states; then the region of its slot rows, a unit the trajectory row of each of its
 ///   denoising ranks.
-/// - **Classes.** One per product kind in `ipc::product::KINDS` order, sized per request: the
-///   conditioning with its host copies in the host encoder region and the digests its encoding
-///   states, the others with none; then the class of stored trajectories, with its host copies
-///   in the host latent region and the digests the denoiser states (`trajectory_digests`).
+/// - **Classes.** One per product kind in `crate::batch::product::KINDS` order, sized per request:
+///   the conditioning with its host copies in the host encoder region and the digests its encoding
+///   states, the others with none; then the class of stored trajectories, with its host copies in
+///   the host latent region and the digests the denoiser states (`trajectory_digests`).
 /// - **Groups.** Each with the process's media memory ([`media_memory`]) and its slot rows, and
 ///   per product class the regions its blocks lie in: for a group whose phase writes the
 ///   product, the product buffers of its ranks, or for the conditioning its first text encoder
@@ -1491,7 +1496,7 @@ fn open_rank(rank: &mut LoadedRank, table: &Segments) -> Result<Segments> {
     let Loaded::Text(rank) = loaded else {
         bail!("a media rank opens no cache");
     };
-    let layout = Arc::clone(worker::lock(&rank.cache).layout());
+    let layout = Arc::clone(service::lock(&rank.cache).layout());
     let units = rank.units;
     let state_config = model_runner.state_config(rank.model.as_ref(), model_runner.buckets())?;
     let config = model_runner.causal_config(rank.model.as_ref(), &layout, units)?;
@@ -1529,7 +1534,7 @@ fn open_rank(rank: &mut LoadedRank, table: &Segments) -> Result<Segments> {
         let state = match state_config {
             Some(state) => Some(Arc::new(Mutex::new(StateMemory::meta(
                 state,
-                worker::lock(&cache).config(),
+                service::lock(&cache).config(),
             )?))),
             None => None,
         };
@@ -1617,7 +1622,7 @@ fn open_rank(rank: &mut LoadedRank, table: &Segments) -> Result<Segments> {
         kernels,
     )?;
     let shadow = rank.peaks.shadow.saturating_sub(scratch_bytes);
-    worker::Runner::graphs(&runner).set_shadow(pool.shadow(shadow)?)?;
+    crate::runner::Runner::graphs(&runner).set_shadow(pool.shadow(shadow)?)?;
     profile(&runner)?;
     streams.push(("device", stream));
 
@@ -1846,7 +1851,7 @@ fn open_media_memory(
 
     // Steps 11-14 and 17: the regions fit what the quota leaves, and the graph pool opens with
     // each runner's region, their shadow regions and the media memory in its resident pool.
-    let granularity = crate::rank::memory::granularity(device)?;
+    let granularity = crate::process::ranks::rank::memory::granularity(device)?;
     let graphs: Vec<u64> = video.peaks.iter().map(|(_, peaks)| peaks.graph).collect();
     let shadows: Vec<u64> = video.peaks.iter().map(|(_, peaks)| peaks.shadow).collect();
     let pools = division::pool_bytes(granularity, &graphs, &shadows, 0);
@@ -1930,7 +1935,7 @@ fn open_media_runners(
             &classes,
         )?),
         Some(pool) => {
-            let mut pool = worker::lock(pool);
+            let mut pool = service::lock(pool);
             let peaks = video.peaks.clone();
             let peak = |id: RunnerId| {
                 peaks
@@ -2017,15 +2022,18 @@ pub(crate) fn bind(ranks: &mut [LoadedRank], layout: &Open, opened: &Opened) -> 
                 .with_context(|| format!("the answer numbers no region {index}"))
         };
 
-        let mut cache = worker::lock(&text.cache);
+        let mut cache = service::lock(&text.cache);
         let mut copies = None;
         if let Some(client) = &rank.client {
-            crate::storage_client::place(
-                client,
-                &layout.regions[usize::from(kv)].name,
-                &group.memory,
-                &cache.info().plane_runs,
-            )?;
+            let region = &layout.regions[usize::from(kv)].name;
+            client
+                .place(region, &group.memory, &cache.info().plane_runs)
+                .with_context(|| {
+                    format!(
+                        "placing the rank's units of region {region} in {}",
+                        group.memory
+                    )
+                })?;
 
             // The stores and loads the buffer pool asks of this rank copy between its units and
             // its part of each group's host region, unit `u` of the region being page `u`.
@@ -2078,7 +2086,7 @@ fn stated_regions<'a>(
         .and_then(|regions| regions.first())
         .copied()
         .context("the session states no KV region of the rank's group")?;
-    let groups = worker::lock(&rank.text()?.cache).layout().groups.len();
+    let groups = service::lock(&rank.text()?.cache).layout().groups.len();
     let host = layout
         .classes
         .iter()
@@ -2121,26 +2129,26 @@ fn session_group(rank: &LoadedRank, layout: &Open) -> Result<GroupId> {
     Ok(id)
 }
 
-/// Spawns one executor per rank of `ranks` over its runner (step 23), each a rank of its worker
+/// Spawns one worker per rank of `ranks` over its runner (step 23), each a rank of its worker
 /// group with the group's device block tables over the session's regions and the copy budget,
 /// stating its ended sequence to the group's `completed` word in `pairs`, the session's queue
 /// pairs (`client` maps them again); sets the expert union's join targets (step 24); and routes
-/// the node's executors and `remotes`, the peer links with the groups each holds ranks of, by
+/// the node's workers and `remotes`, the peer links with the groups each holds ranks of, by
 /// worker group (step 27).
 ///
-/// A group's ranks report to its sequences in the order `Executors` states: this process's
-/// executors of the group, then its peer links. The unit sizes the tables count a copy by are
+/// A group's ranks report to its sequences in the order `Route` states: this process's
+/// workers of the group, then its peer links. The unit sizes the tables count a copy by are
 /// every region's of the session, so every rank of a group starts the same copies with a batch.
 ///
 /// # Errors
 ///
-/// A session not open, a rank whose runner was taken, or an executor that cannot start.
+/// A session not open, a rank whose runner was taken, or a worker that cannot start.
 pub(crate) fn spawn(
     ranks: &mut [LoadedRank],
-    client: &crate::storage_client::StorageClient,
+    client: &crate::memory::client::StorageClient,
     pairs: &[QueuePair],
     remotes: Vec<(Vec<GroupId>, Arc<Remote>)>,
-) -> Result<(Arc<Executors>, Vec<Arc<Executor>>)> {
+) -> Result<(Arc<Route>, Vec<Arc<Worker>>)> {
     let (layout, opened) = client
         .session()
         .context("the session with the buffer pool is not open")?;
@@ -2176,7 +2184,7 @@ pub(crate) fn spawn(
         sequences.push(Sequences::new(*id, local + links, registers));
     }
 
-    let mut executors = Vec::with_capacity(ranks.len());
+    let mut workers = Vec::with_capacity(ranks.len());
     for (rank, (id, place)) in ranks.iter_mut().zip(&placed) {
         let device = rank.pool.as_ref().map(|_| rank.model_runner.devices()[0]);
         let group = layout.groups.iter().find(|group| group.id == *id);
@@ -2205,7 +2213,7 @@ pub(crate) fn spawn(
             .iter()
             .find(|group| group.group() == *id)
             .context("every placed group has sequences")?;
-        let executor = Executor::spawn(
+        let worker = Worker::spawn(
             device,
             runners,
             Arc::clone(&rank.kernels),
@@ -2214,22 +2222,22 @@ pub(crate) fn spawn(
             *place,
             COPY_BUDGET,
         )?;
-        executors.push(Arc::new(executor));
+        workers.push(Arc::new(worker));
     }
 
-    // The union's members ask each other to join through their executors.
+    // The union's members ask each other to join through their workers.
     let union = ranks.first().and_then(|rank| match &rank.loaded {
         Loaded::Text(text) => text.union.as_ref(),
         Loaded::Video(_) => None,
     });
     if let Some((_, targets, _)) = union {
         targets
-            .set(executors.iter().map(Arc::downgrade).collect())
-            .map_err(|_| anyhow::anyhow!("the expert union's executors were set already"))?;
+            .set(workers.iter().map(Arc::downgrade).collect())
+            .map_err(|_| anyhow::anyhow!("the expert union's workers were set already"))?;
     }
 
-    let route = Executors::new(sequences, executors.clone(), remotes)?;
-    Ok((Arc::new(route), executors))
+    let route = Route::new(sequences, workers.clone(), remotes)?;
+    Ok((Arc::new(route), workers))
 }
 
 /// The regions a text rank of the session's group `group` maps, by the answer's numbers: the
@@ -2260,8 +2268,8 @@ fn text_regions(layout: &Open, opened: &Opened, group: Option<&Group>) -> Vec<u8
 /// media group's ranks each state the phases of the blocks that hold them.
 ///
 /// A cache group's page seed is `storage::key::page_seed` of its page identity
-/// (`KvCacheMemory::page_identities`) for the identity of the weights this process's ranks
-/// serve, in rank order (`crate::data_plane::identity_of`): what the data plane keys the ranks'
+/// (`KvCacheMemory::page_identities`) for the identity of the weights this process's ranks serve,
+/// in rank order (`crate::process::data_plane::identity_of`): what the data plane keys the ranks'
 /// pages by, so a block computed by other weights or in another layout is another block.
 ///
 /// A group's encoder identity is, in the same way, the identity of the weights of its ranks that
@@ -2278,7 +2286,7 @@ pub(crate) fn capacities(ranks: &[LoadedRank], layout: &Open) -> Result<Vec<(Gro
         .iter()
         .flat_map(|rank| rank.weights.iter().cloned())
         .collect();
-    let identity = crate::data_plane::identity_of(&order);
+    let identity = crate::process::data_plane::identity_of(&order);
 
     let mut stated: Vec<(GroupId, Capacity)> = Vec::new();
     // Per group, the weights of its ranks that encode, in rank order.
@@ -2287,7 +2295,7 @@ pub(crate) fn capacities(ranks: &[LoadedRank], layout: &Open) -> Result<Vec<(Gro
         let id = session_group(rank, layout)?;
         let capacity = match &rank.loaded {
             Loaded::Text(text) => {
-                let cache = worker::lock(&text.cache);
+                let cache = service::lock(&text.cache);
                 let seeds = cache
                     .page_identities(&identity)
                     .iter()
@@ -2316,7 +2324,7 @@ pub(crate) fn capacities(ranks: &[LoadedRank], layout: &Open) -> Result<Vec<(Gro
 
     for (id, weights) in encoding {
         if let Some((_, capacity)) = stated.iter_mut().find(|(group, _)| *group == id) {
-            capacity.encoder_identity = crate::data_plane::identity_of(&weights);
+            capacity.encoder_identity = crate::process::data_plane::identity_of(&weights);
         }
     }
     Ok(stated)

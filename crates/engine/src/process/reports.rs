@@ -5,7 +5,7 @@
 
 use std::time::{Duration, Instant};
 
-use ipc::batch::BatchId;
+use crate::batch::BatchId;
 use proto::process::report;
 use proto::report::SchedulerStats;
 use proto::request::RequestId;
@@ -39,7 +39,7 @@ impl MainProcess {
     }
 
     /// What the daemon records of this engine: the limits every request is checked against, its
-    /// schedulers, the batch its executors were started for and the page seeds of its cache
+    /// schedulers, the batch its workers were started for and the page seeds of its cache
     /// groups. `None` before the start ended.
     ///
     /// A process with no scheduler (a peer) states its limits and no scheduler. It states no KV
@@ -60,7 +60,9 @@ impl MainProcess {
                     .seeds
                     .iter()
                     .zip(&capacity.cache_groups)
-                    .filter(|(_, (kind, _))| !matches!(kind, ipc::CacheGroupKind::Draft))
+                    .filter(|(_, (kind, _))| {
+                        !matches!(kind, crate::batch::cache::CacheGroupKind::Draft)
+                    })
                     .map(|(seed, _)| seed.0.to_vec())
                     .collect()
             })
@@ -135,8 +137,8 @@ impl MainProcess {
     }
 
     /// States the process's metrics on every front: the schedulers' sums since the start; the
-    /// device time the executors spent in forwards and the kernels their serving forwards
-    /// launched (`Executor::counters`); and what each device maps now, against the limit of its
+    /// device time the workers spent in forwards and the kernels their serving forwards
+    /// launched (`Worker::counters`); and what each device maps now, against the limit of its
     /// GPU's quota: each pool of its allocators and its KV regions' planes (`DataPlane::memory`),
     /// which the daemon exports as `uniserve:memory_budget` and `uniserve:memory_mapped`.
     pub(super) fn metrics(&mut self) {
@@ -144,8 +146,8 @@ impl MainProcess {
             return;
         };
         let (mut device_ns, mut kernel_launches) = (0, 0);
-        for executor in &engine.executors {
-            let (_, forward_ns, launches) = executor.counters();
+        for worker in &engine.workers {
+            let (_, forward_ns, launches) = worker.counters();
             device_ns += forward_ns;
             kernel_launches += launches;
         }
@@ -157,7 +159,7 @@ impl MainProcess {
         self.broadcast(&from_engine::Kind::Metrics(metrics));
     }
 
-    /// The watchdog's rules at `now` and the metrics' second: a job an executor has been inside
+    /// The watchdog's rules at `now` and the metrics' second: a job a worker has been inside
     /// for the stall bound is a stall, and while a job has been in flight for a second every
     /// device's context is checked once a second for a sticky error; both fail the epoch. A
     /// change of the ranks' weights that failed part of the way fails it too.
@@ -174,9 +176,9 @@ impl MainProcess {
         let mut failure = None;
         if let Some((rank, stall)) = self.watchdog.stalls(now, &in_flight).into_iter().next() {
             let job = engine
-                .executors
+                .workers
                 .get(rank)
-                .and_then(|executor| executor.performing())
+                .and_then(|worker| worker.performing())
                 .unwrap_or_default();
             let reason = format!(
                 "a job of rank {rank} ({job}) ran {} ms, past the stall bound",
@@ -196,10 +198,10 @@ impl MainProcess {
 
         if failure.is_none() && self.watchdog.check_due(now, &in_flight) {
             self.watchdog.checked(now);
-            for executor in &engine.executors {
-                let device = executor.device().map_or(0, |device| device.0);
+            for worker in &engine.workers {
+                let device = worker.device().map_or(0, |device| device.0);
                 let device = u32::try_from(device).unwrap_or_default();
-                match executor.sticky_error() {
+                match worker.sticky_error() {
                     Ok(None) => {}
                     Ok(Some(error)) => {
                         let reason = format!("device {device} reports a sticky error: {error}");
@@ -226,13 +228,13 @@ impl MainProcess {
         }
     }
 
-    /// What each executor of the process has in flight, in rank order, as the watchdog reads it.
+    /// What each worker of the process has in flight, in rank order, as the watchdog reads it.
     pub(super) fn in_flight(&self) -> Vec<Option<(Instant, Option<BatchId>)>> {
         self.engine.as_ref().map_or_else(Vec::new, |engine| {
             engine
-                .executors
+                .workers
                 .iter()
-                .map(|executor| executor.in_flight())
+                .map(|worker| worker.in_flight())
                 .collect()
         })
     }

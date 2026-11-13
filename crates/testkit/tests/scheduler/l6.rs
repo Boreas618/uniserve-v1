@@ -10,7 +10,7 @@
 
 use std::collections::HashSet;
 
-use ipc::batch::Phase;
+use engine::batch::Phase;
 use proto::request::{Event, FinishReason, RequestId};
 use storage::runtime::{Completion, Request};
 

@@ -52,7 +52,7 @@ const ENDS: usize = 16;
 ///
 /// Execution creates one group per communicator and sets it on the contexts of the runners that
 /// share it ([`Context::set_group`]). The communicator may be called from one thread at a time,
-/// which the one executor thread of a device already keeps; the lock states it in the type, so
+/// which the one worker thread of a device already keeps; the lock states it in the type, so
 /// that contexts sharing a group move to their device's thread with their runners.
 pub struct Group {
     communicator: Mutex<Communicator>,

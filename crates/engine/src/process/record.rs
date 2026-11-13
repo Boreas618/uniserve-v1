@@ -12,7 +12,7 @@
 //!   headers ([`nn::WeightLoader::meta`]), no payload is read and nothing is published;
 //! - no device memory and no communicator: a profile run launches nothing, and a parallel group
 //!   states its split alone;
-//! - no session with the buffer pool, Build Server, scheduler or executor.
+//! - no session with the buffer pool, Build Server, scheduler or worker.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
@@ -21,7 +21,7 @@ use anyhow::Result;
 use proto::config::EngineArgs;
 
 use super::ranks::{Backing, Meeting, load_ranks};
-use crate::rank::ModelRunner;
+use crate::process::ranks::rank::ModelRunner;
 
 /// Every kernel a main process launches: descriptor keys by operator name (`ops::Op::NAME`).
 pub type Recorded = BTreeMap<String, BTreeSet<String>>;
@@ -36,7 +36,8 @@ pub type Recorded = BTreeMap<String, BTreeSet<String>>;
 /// placement, the model's load from its shard headers, the cache's layout, the runner, or a
 /// forward of the profile run.
 pub fn record(launch: &EngineArgs, registry: &nn::family::Registry) -> Result<Recorded> {
-    let family = crate::resolve(registry, Path::new(&launch.engine_config.model.model))?;
+    let family =
+        crate::process::catalogue::resolve(registry, Path::new(&launch.engine_config.model.model))?;
     let model_runner = ModelRunner::of(launch, family)?;
     let ranks = load_ranks(model_runner.ranks()?, Backing::Meta, launch, Meeting::Local)?;
 

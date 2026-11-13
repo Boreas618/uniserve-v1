@@ -4,9 +4,9 @@
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
+use crate::worker::completion::Outcome;
 use ops::Generation;
 use scheduling::limits::Parameters;
-use worker::completion::Outcome;
 
 use super::{commit, named, rollback, switch};
 use crate::process::operations::ask;
@@ -16,10 +16,10 @@ use crate::scheduler::tests::toy;
 
 /// The generation every rank's graphs serve, in rank order.
 fn serving(node: &Node) -> Vec<u64> {
-    node.executors
+    node.workers
         .iter()
-        .map(|executor| {
-            executor
+        .map(|worker| {
+            worker
                 .call("reading the generation the rank serves", |runners| {
                     Ok(runners[0].graphs().generation())
                 })
@@ -31,8 +31,8 @@ fn serving(node: &Node) -> Vec<u64> {
 /// Whether every rank prepares `generation` beside the one it serves, which it refuses while
 /// another update is prepared or on trial. A rank that prepared it is left preparing it.
 fn prepares(node: &Node, generation: u64) -> bool {
-    node.executors.iter().all(|executor| {
-        let submission = executor
+    node.workers.iter().all(|worker| {
+        let submission = worker
             .prepare(Arc::new(Generation::new(generation, [])))
             .unwrap();
         matches!(submission.wait_timeout(LONG), Some(Outcome::Success(_)))
@@ -43,8 +43,8 @@ fn prepares(node: &Node, generation: u64) -> bool {
 /// back.
 fn holds_one(node: &Node) -> bool {
     let steady = prepares(node, 99);
-    for executor in &node.executors {
-        let rolled = executor.rollback(99).unwrap();
+    for worker in &node.workers {
+        let rolled = worker.rollback(99).unwrap();
         assert!(matches!(
             rolled.wait_timeout(LONG),
             Some(Outcome::Success(_))
@@ -71,7 +71,7 @@ fn on_trial() -> Node {
     assert!(prepares(&node, 2));
     switch(
         &node.schedulers,
-        &node.executors,
+        &node.workers,
         &node.data,
         &node.served,
         2,
@@ -82,7 +82,7 @@ fn on_trial() -> Node {
 }
 
 #[test]
-fn a_switch_moves_the_schedulers_and_every_executor_to_the_generation() {
+fn a_switch_moves_the_schedulers_and_every_worker_to_the_generation() {
     let node = on_trial();
 
     assert_eq!(node.served.load(Ordering::Acquire), 2);
@@ -95,7 +95,7 @@ fn a_switch_moves_the_schedulers_and_every_executor_to_the_generation() {
 fn a_commit_leaves_the_generation_on_trial_alone() {
     let node = on_trial();
 
-    commit(&node.schedulers, &node.executors, 2).unwrap();
+    commit(&node.schedulers, &node.workers, 2).unwrap();
     assert_eq!(node.served.load(Ordering::Acquire), 2);
     assert_eq!(serving(&node), [2]);
     assert!(holds_one(&node));
@@ -108,7 +108,7 @@ fn a_rollback_leaves_the_kept_generation_alone() {
 
     rollback(
         &node.schedulers,
-        &node.executors,
+        &node.workers,
         &node.data,
         &node.served,
         2,
@@ -129,7 +129,7 @@ fn a_policy_a_scheduler_refuses_rolls_the_switch_back() {
     let refused = (toy("(unreachable)"), Parameters::default());
     let failed = switch(
         &node.schedulers,
-        &node.executors,
+        &node.workers,
         &node.data,
         &node.served,
         2,

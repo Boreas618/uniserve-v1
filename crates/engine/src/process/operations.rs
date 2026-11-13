@@ -14,27 +14,27 @@
 //!
 //! The schedulers are named by their inboxes, in the order of the session's schedulers
 //! (`Open::schedulers`); the head is the engine's connection to its host's Storage Server, which
-//! states each change of the KV planes' segments (`crate::data_plane`, "The KV planes' memory").
-//! A `Resume` ends a drain as well as a pause, so no job that pauses the schedulers runs while
-//! the engine drains.
+//! states each change of the KV planes' segments (`crate::process::data_plane`, "The KV planes'
+//! memory"). A `Resume` ends a drain as well as a pause, so no job that pauses the schedulers runs
+//! while the engine drains.
 
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use crate::process::data_plane::WeightsUpdated;
 use anyhow::{Context as _, Result, anyhow, bail};
 use crossbeam_channel::Sender;
-use ipc::memory::WeightsUpdated;
 use proto::config::SchedulerConfig;
 use proto::request::wire::WeightsInFlight;
+use service::lock;
 use storage::Key;
 use storage::runtime::GroupId;
-use worker::lock;
 
 use super::epoch;
-use crate::data_plane::{DataPlane, Target};
+use crate::memory::client::StorageClient;
+use crate::process::data_plane::{DataPlane, Target};
 use crate::scheduler::{self, Message};
-use crate::storage_client::StorageClient;
 
 /// How long a release that makes room waits before it asks a region again for units its requests
 /// still hold: the requests that hold the tail run on, and the release takes it once they let it
@@ -492,7 +492,7 @@ fn fence_switch(payload: &str) -> Result<Vec<String>> {
         _ => Vec::new(),
     };
 
-    let switched = worker::profiling::markers::Markers::installed()
+    let switched = crate::profiling::markers::Markers::installed()
         .map(|markers| markers.switch(enabled, &off))
         .transpose()?;
     Ok(vec![
@@ -507,7 +507,7 @@ fn fence_switch(payload: &str) -> Result<Vec<String>> {
 
 /// Applies `config`'s scheduling limits in place on every scheduler (`Configure`,
 /// `specs/updates.md` §1): each takes them from its next step on, or refuses a limit above what
-/// its executors were started for and keeps its own.
+/// its workers were started for and keeps its own.
 ///
 /// # Errors
 ///

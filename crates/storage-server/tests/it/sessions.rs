@@ -5,7 +5,7 @@
 //!
 //! The test process plays the engine: its main process (a head of the
 //! epoch), its schedulers (the engine's ends of the queue pairs, whose
-//! `completed` registers they write as the executors would) and its ranks
+//! `completed` registers they write as the workers would) and its ranks
 //! (workers). No GPU is needed: the regions' memory is host storage.
 
 use std::io::BufRead as _;
@@ -157,7 +157,7 @@ impl Scheduler {
     }
 
     /// Writes the `completed` word of the scheduler's group `index`, as its
-    /// executor does.
+    /// worker does.
     pub(crate) fn complete_batches(&self, index: usize, completed: u64) {
         let register = self.registers.completed[index] as usize;
         self.pair
@@ -247,7 +247,7 @@ pub(crate) fn serve_a_session(server: &Running) {
     });
     prefill.await_capacity(region, (6, 0, 0));
 
-    // The commit takes effect when the executor's `completed` reaches its stamp.
+    // The commit takes effect when the group's `completed` reaches its stamp.
     prefill.complete_batches(0, 4);
     let release = Request::Release {
         owner: OwnerId(1),
@@ -377,7 +377,7 @@ fn the_operator_s_list_prints_the_buffer_pool_s_blocks_groups_copies_and_check_f
     };
     assert_eq!(prefill.ask(release), Completion::Done);
 
-    // A store of the shared block to the host: its copy, which the prefill group's executor
+    // A store of the shared block to the host: its copy, which the prefill group's workers
     // runs, is in flight until its `Finish`, and the host block it writes is private until then.
     let store = prefill.submit(Request::Store {
         group: PREFILL,

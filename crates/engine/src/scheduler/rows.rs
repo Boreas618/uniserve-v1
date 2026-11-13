@@ -6,7 +6,7 @@
 //! A row carries a slot, positions and inputs, never a unit or a run: a token's cache position
 //! in its request, a recurrent-state checkpoint's position in the request's state table, an
 //! encoder output's position in its encoder-output table and a media product's position in its
-//! product table. The executor finds every block through its device block tables.
+//! product table. The workers find every block through their device block tables.
 //!
 //! # A token request's positions
 //!
@@ -30,12 +30,12 @@ use std::ops::Range;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
-use ipc::ValidationResult;
-use ipc::batch::{
+use crate::batch::ValidationResult;
+use crate::batch::philox::{DrawAddress, request_sampling_key};
+use crate::batch::{
     Batch, Columns, DraftWork, Extent, MediaRow, NewSlot, Phase, Row, Shape, StateCopy,
     StateDirection, Variant, VisionRows,
 };
-use ipc::philox::{DrawAddress, request_sampling_key};
 use proto::module::commit::{self, COMMIT_FIELDS};
 use proto::module::sampler::{PARAMETER_COLUMNS, TEMPERATURE};
 use proto::request::{
@@ -528,7 +528,7 @@ impl Scheduler {
     /// greedily when every row that samples is greedy and with a draw otherwise; a decode or a
     /// verification batch greedily only when every row is greedy. A media batch is served by its
     /// phase's variant, and a video request's batch states its first request's extent, by which
-    /// the executor finds the bucket that holds it.
+    /// the workers find the bucket that holds it.
     ///
     /// # Errors
     ///
@@ -936,12 +936,12 @@ fn put<T: Clone + PartialEq>(column: &mut Vec<T>, before: usize, values: Vec<T>,
 mod tests {
     use std::time::Instant;
 
-    use ipc::CacheGroupKind;
-    use ipc::batch::{
+    use crate::batch::cache::CacheGroupKind;
+    use crate::batch::philox::{DrawAddress, request_sampling_key};
+    use crate::batch::{
         Batch, BatchId, Columns, DraftWork, Extent, MediaRow, NewSlot, Phase, Row, Shape,
         StateCopy, StateDirection, Variant, VisionRows,
     };
-    use ipc::philox::{DrawAddress, request_sampling_key};
     use proto::config::{BlockConfig, BlockDistribution, VIDEO_DECODER_BLOCK};
     use proto::module::commit::{self, COMMIT_FIELDS};
     use proto::request::{

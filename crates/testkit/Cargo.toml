@@ -14,7 +14,6 @@ publish = false
 anyhow.workspace = true
 crossbeam-channel.workspace = true
 engine.workspace = true
-ipc.workspace = true
 # The host's monotonic clock, which the buffer pool's task deadlines are stated in.
 libc.workspace = true
 # The connections of a fake engine's request and process interfaces.
@@ -29,8 +28,6 @@ proto.workspace = true
 tempfile.workspace = true
 # The runtime of the policy module a test engine's schedulers instantiate.
 wasmtime.workspace = true
-# The cache layout a fake engine's session is laid out for.
-worker.workspace = true
 
 [dev-dependencies]
 # The policy modules the scheduler's suite states as WebAssembly text.

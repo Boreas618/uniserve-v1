@@ -3,15 +3,15 @@
 //! [`args`] and [`launch`] are a deployment's launch arguments on the CPU, as the daemon writes
 //! them; [`cache`] is the cache a fake engine's ranks hold and [`capacity`] what each of its
 //! worker groups serves, from which the engine's schedulers build their whole view of the groups
-//! (`engine::scheduler::Capacity`), as they do from a rank start's.
+//! (`engine::batch::Capacity`), as they do from a rank start's.
 
 use std::num::NonZeroUsize;
 
-use ipc::Capacity;
-use ipc::batch::{Phase, Shape, Variant};
+use engine::batch::Capacity;
+use engine::batch::{Phase, Shape, Variant};
+use engine::memory::cache::CacheLayout;
 use proto::config::{EngineArgs, WorkerGroupConfig};
 use proto::request::{ModelDtype, PrefixCacheDtype};
-use worker::memory::cache::CacheLayout;
 
 /// The tokens of a block of [`cache`].
 pub const BLOCK_TOKENS: u32 = 64;
@@ -153,7 +153,7 @@ pub fn cache() -> CacheLayout {
 }
 
 /// What each worker group of a fake engine of `launch` serves over `cache`, as a rank start
-/// states it of a text model's ranks (`engine::scheduler::Capacity`): prefill and decode, the
+/// states it of a text model's ranks (`engine::batch::Capacity`): prefill and decode, the
 /// launch's request slots in each, the cache's groups seeded by the model's name as by the
 /// weights that compute their pages, the launch's sequences and control tokens, and buckets of up
 /// to 16 calls and of prefills of up to 512 tokens in every variant a token batch chooses among.
@@ -174,7 +174,7 @@ pub fn capacity(launch: &EngineArgs, cache: &CacheLayout) -> Capacity {
         rows[phase.index()] = slots;
     }
 
-    let prefills = ipc::capacity::variants(Phase::Prefill)
+    let prefills = engine::batch::capacity::variants(Phase::Prefill)
         .iter()
         .map(|variant| Shape::prefill(BATCH_CALLS, BATCH_TOKENS, *variant));
     let decodes = [Variant::DecodeGreedy, Variant::DecodeSampled]
@@ -184,7 +184,7 @@ pub fn capacity(launch: &EngineArgs, cache: &CacheLayout) -> Capacity {
         clippy::expect_used,
         reason = "a fixture's launch has batches in flight"
     )]
-    let window = worker::memory::division::call_window(
+    let window = engine::memory::division::call_window(
         launch.queue_depth.max(1) as usize,
         BATCH_CALLS as usize,
     )

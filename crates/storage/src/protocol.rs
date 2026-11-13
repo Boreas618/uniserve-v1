@@ -81,7 +81,7 @@
 //! [`Role::Head`] of the epoch, opens it with [`Request::Open`] and gets one
 //! queue pair per scheduler, on which every request of the buffer pool
 //! travels in shared memory; it ends it with [`Request::Close`] once its
-//! executors have stopped, and the server closes it when the engine's
+//! workers have stopped, and the server closes it when the engine's
 //! processes are gone. Each rank states where its part of a device region's
 //! units lies ([`Request::Place`]), or the head states it for a rank of
 //! another host ([`Request::PlaceRemote`]), and each rank takes its part of
@@ -836,7 +836,7 @@ pub struct FabricExport {
 /// field of a unit: for each unit `u` in `first..first + count`, `bytes`
 /// bytes at `offset + (u - first) * bytes` of the retained exclusive tensor
 /// `key` at `location`. This is the content of a rank's cache plane run
-/// (`ipc::CachePlaneRun`), with the GPU stated as the location.
+/// (`engine::memory::cache::info::CachePlaneRun`), with the GPU stated as the location.
 ///
 /// A unit is not one byte range: its value planes, flags, scales and state
 /// planes are fields of their own. The runs of one field hold that field's
@@ -1148,7 +1148,7 @@ pub enum Request {
     /// sessions, or host regions the host's storage cannot hold.
     Open(Open),
     /// From the engine's main process that opened its epoch's session: its
-    /// executors have stopped, and the session closes as the session of an
+    /// workers have stopped, and the session closes as the session of an
     /// engine that is gone (`specs/buffer-pool.md` §12.4). Responded with
     /// [`Response::Closed`].
     Close,
@@ -1465,7 +1465,7 @@ pub enum Waiting {
 }
 
 /// The copies one request started, while they are in flight: an
-/// executor's copies, whose `Finish` they wait for, or a task's, which ends
+/// worker's copies, whose `Finish` they wait for, or a task's, which ends
 /// by its deadline.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CopyListing {
@@ -1475,7 +1475,7 @@ pub struct CopyListing {
     pub request: u64,
     pub copies: u32,
     /// The task's deadline in nanoseconds of the host's monotonic clock;
-    /// `None` for an executor's copies.
+    /// `None` for a worker's copies.
     pub deadline: Option<u64>,
 }
 

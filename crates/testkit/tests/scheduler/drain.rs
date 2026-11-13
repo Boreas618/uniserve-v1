@@ -13,8 +13,8 @@
 use std::collections::HashSet;
 use std::time::{Duration, Instant};
 
+use engine::batch::{Batch, Phase};
 use engine::scheduler::{Message, Output};
-use ipc::batch::{Batch, Phase};
 use proto::request::{Event, FinishReason, GenerationRequest, MigrationCause, RequestId};
 use storage::Key;
 use storage::runtime::{Completion, Request};
@@ -198,7 +198,7 @@ fn migrated(harness: &mut Harness, prompt: u32) -> (GenerationRequest, Vec<u32>)
     assert!(replied_within(harness, &replied, 10));
     assert!(drained(harness.events(id).last()));
 
-    // Its tails' `Commit`s and its `Detach` reach the buffer pool once the executor stamped them.
+    // Its tails' `Commit`s and its `Detach` reach the buffer pool once the workers stamped them.
     harness.run_until(10, |harness| {
         let taken = harness.taken();
         taken

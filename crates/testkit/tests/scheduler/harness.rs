@@ -9,10 +9,10 @@
 //!   groups serve), and answers its startup `List`.
 //! - [`Harness::step`] is one pass: the buffer pool's turn (it takes the requests the last pass
 //!   wrote, and writes the completions that are due), every message of the scheduler's inbox
-//!   applied (the outputs of the batches the executors ran, the requests they stamped), then the
+//!   applied (the outputs of the batches the workers ran, the requests they stamped), then the
 //!   scheduler's step. The fake answers a batch as it is submitted, from its own rule and the
 //!   tokens a case scripts ([`Harness::sample`]); the answer reaches the scheduler at the next
-//!   pass, as a real executor's would, and the copies queued on a group run with its next batch.
+//!   pass, as real workers' would, and the copies queued on a group run with its next batch.
 //!   Every pass ends with the fake's record of A1 to A4 empty.
 //! - The pace of the buffer pool: [`InProcessPool::delay`] and [`InProcessPool::withhold`] on
 //!   [`Harness::pool`], and [`Harness::reorder`] for completions reordered within a window.
@@ -32,11 +32,12 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use crossbeam_channel::{Receiver, unbounded};
-use engine::scheduler::{Capacity, Message, Output, Scheduler, policy};
-use ipc::CacheGroupKind;
-use ipc::batch::{
+use engine::batch::Capacity;
+use engine::batch::cache::CacheGroupKind;
+use engine::batch::{
     Batch, BatchOutput, CallOutput, CallStatus, ErrorCode, Extent, MediaRow, Phase, Shape, Variant,
 };
+use engine::scheduler::{Message, Output, Scheduler, policy};
 use proto::config::{
     BlockConfig, KvCacheConfig, MooncakeConfig, SchedulerConfig, WorkerGroupConfig, WorkerGroupId,
     WorkerGroupRole, WorkerRank,
@@ -561,7 +562,7 @@ impl Deployment {
         }
     }
 
-    /// What group `index`'s executors state: its phases, its slots (every stage holds that many
+    /// What group `index`'s workers state: its phases, its slots (every stage holds that many
     /// requests), the model's cache groups for a group that runs token calls, a bucket of the
     /// deployment's rows for each phase it serves (and its tokens for prefills), for a group that
     /// denoises the steps and the shapes of the harness's video requests, and for a group that
@@ -1019,7 +1020,7 @@ impl Harness {
     /// the completions that turn wrote for them, in order: what another epoch does to the blocks
     /// the two share, which this scheduler learns only from the answers to its own requests (SD
     /// §4.5). The turn serves this scheduler's queue pair too, as a turn between two of its steps.
-    /// The other epoch's executors stamp nothing: a request it submits names `after` itself.
+    /// The other epoch's workers stamp nothing: a request it submits names `after` itself.
     ///
     /// # Panics
     ///
@@ -1184,7 +1185,7 @@ impl Harness {
         taken.filter(|(_, id, _)| !written.contains(&id.0)).count()
     }
 
-    /// The batches the scheduler handed to the executors, in order.
+    /// The batches the scheduler handed to the executor, in order.
     pub(crate) fn batches(&self) -> Vec<Batch> {
         self.fake.submitted()
     }

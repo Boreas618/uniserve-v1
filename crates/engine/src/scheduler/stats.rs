@@ -13,13 +13,13 @@
 //!
 //! A call is counted in the domain of its batch's phase: `prefill` for context ingestion
 //! (prefills, refills, encodes), `decode` for decodes and verifications, `flow` for media work and
-//! latent preparation. A batch's times are its executor's measurements (`BatchOutput::timing`),
-//! once per batch in its one domain: the wait in the executor's queue, the device time, and the
+//! latent preparation. A batch's times are its workers' measurements (`BatchOutput::timing`),
+//! once per batch in its one domain: the wait in the worker's queue, the device time, and the
 //! copy and host time.
 
 use std::time::{Duration, Instant};
 
-use ipc::batch::{Batch, BatchOutput, CallOutput, CallStatus, ErrorCode, Phase};
+use crate::batch::{Batch, BatchOutput, CallOutput, CallStatus, ErrorCode, Phase};
 use proto::report::{DomainSchedulerStats, ForwardStats, SchedulerStats};
 use proto::request::RequestId;
 use scheduling::PhaseClass;
@@ -67,9 +67,9 @@ impl Scheduler {
 
     /// Counts the output of a batch, once, as `update` applies it: its calls return their
     /// credits, failed calls and non-finite logits are counted, and the batch's time, its query
-    /// tokens and its executors' forward counters join the interval.
+    /// tokens and its workers' forward counters join the interval.
     ///
-    /// The batch's roundtrip is the time from its submission to its output as its executor
+    /// The batch's roundtrip is the time from its submission to its output as its workers
     /// measured it: the wait in its queue, its device time, and the copy and host time after it.
     pub(super) fn count_batch(&mut self, batch: &Batch, output: &BatchOutput) {
         let timing = output.timing;
@@ -333,11 +333,11 @@ fn micros(duration: Duration) -> u64 {
 mod tests {
     use std::time::Duration;
 
-    use crossbeam_channel::Receiver;
-    use ipc::batch::{
+    use crate::batch::{
         Batch, BatchId, BatchOutput, CallOutput, CallStatus, Columns, ErrorCode, Extent, Phase,
         Row, Shape, TimingCounters, Variant,
     };
+    use crossbeam_channel::Receiver;
     use proto::report::{DomainSchedulerStats, ForwardStats, SchedulerStats};
     use proto::request::RequestId;
     use storage::runtime::GroupId;

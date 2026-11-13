@@ -487,7 +487,7 @@ pub(crate) fn apply(pool: &mut BufferPool, input: &Input) -> Result<(), String> 
     Ok(())
 }
 
-/// The copies a completion asks an executor to run: the model's `ncopy`
+/// The copies a completion asks a worker to run: the model's `ncopy`
 /// counts them.
 pub(crate) fn copies_asked(completion: &Completion) -> u32 {
     match completion {
@@ -867,7 +867,7 @@ pub(crate) fn layout(pool: &BufferPool) -> String {
 }
 
 /// The pool's state in the terms of the design model, one line per fact, in
-/// order: the copies the executors were asked for (`copies`), each group's
+/// order: the copies the workers were asked for (`copies`), each group's
 /// `completed` word, the free units, each owner of `owners` by the queue pair
 /// that attaches it (live with its group, slot and its table of the class 0
 /// by position, or gone, or new), each cached key with its copies, the

@@ -9,9 +9,9 @@
 //! ([`chat_image`]), and its encoder output takes [`UNITS`] units of the device buffers: the
 //! harness's encoder states 64 bytes of features a row, and its buffers 256 bytes a unit.
 
+use engine::batch::Phase;
+use engine::batch::product::VISION_FEATURES;
 use engine::scheduler::Message;
-use ipc::batch::Phase;
-use ipc::product::VISION_FEATURES;
 use proto::request::{Event, GenerationRequest, ImageEncoder, ImageEncoderInput, RequestId};
 use storage::Key;
 use storage::key::{Digest, encoder_output};
@@ -51,7 +51,7 @@ fn digest(request: &GenerationRequest) -> [u8; 32] {
     request.multimodal_inputs.images[0].digest
 }
 
-/// The index, among the batches the executors were handed, of request `id`'s first batch of
+/// The index, among the batches the executor was handed, of request `id`'s first batch of
 /// `phase`.
 fn first_of(harness: &Harness, id: RequestId, phase: Phase) -> Option<usize> {
     let batches = harness.batches().into_iter();

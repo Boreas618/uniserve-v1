@@ -23,7 +23,7 @@
 //!
 //! ## The source: the host page encoding
 //!
-//! The staged page is a page of the host page pools (`worker::memory::prefix_cache::host`), which is
+//! The staged page is a page of the host page pools (`engine::memory::cache::host`), which is
 //! layer-major: keys `[layers, block_size, heads, head_dim]`, values in the same shape, and for an FP8
 //! page the scales `[2, layers]` as `f32`, one per field and layer. A page assembled from several
 //! source pools (another tensor-parallel split) carries one scale per source pool's head range, so

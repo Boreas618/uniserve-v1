@@ -377,7 +377,7 @@ fn a_released_block_is_reclaimed_when_completed_reaches_every_stamp() {
     fixture.attach(1, PREFILL);
     fixture.allocate(1, 0, 2);
 
-    // R3: both groups' executors stamped the release.
+    // R3: both groups' workers stamped the release.
     let after = vec![(PREFILL, 3), (DECODE, 2)];
     assert_eq!(fixture.release(1, 0, 2, after), Some(Completion::Done));
     assert_eq!(fixture.free(UNITS), 2);
@@ -600,7 +600,7 @@ fn evict_reclaims_only_shared_blocks_that_nothing_else_holds() {
 }
 
 #[test]
-fn a_clone_is_a_new_private_block_filled_by_the_executor() {
+fn a_clone_is_a_new_private_block_filled_by_the_worker() {
     let mut fixture = Fixture::new();
     let cached = fixture.cached(1, 7);
     fixture.attach(2, PREFILL);
@@ -717,7 +717,7 @@ fn a_store_and_a_load_move_a_key_between_the_device_and_the_host() {
     let mut fixture = Fixture::new();
     let unit = fixture.cached(1, 7);
 
-    // Store: the group's executor copies the device block into a new host block.
+    // Store: the group's workers copy the device block into a new host block.
     let store = fixture.submit(
         QUEUE,
         Request::Store {

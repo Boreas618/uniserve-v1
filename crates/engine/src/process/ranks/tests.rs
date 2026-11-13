@@ -4,12 +4,12 @@
 //!
 //! The text rank: its load to its division, the session the engine opens over the layout its
 //! units state, the segments the rank creates once the answer shows the region new and the head
-//! grants, the executor spawned over the rank's runner, which maps the session's completions into
+//! grants, the worker spawned over the rank's runner, which maps the session's completions into
 //! its block tables, and a successor epoch of the same layout, whose rank maps those segments.
 //! Its model is the Qwen3-MoE fixture of the `qwen3` crate, loaded from its shard headers alone.
 //!
 //! The media rank: its load and its runners' profile run, the session's media regions and
-//! classes, its opening over the answer's numbers, the executor spawned over its media runners,
+//! classes, its opening over the answer's numbers, the worker spawned over its media runners,
 //! whose tables map a product the session allocates, and what its group states. Its model is a
 //! released FastH3 checkpoint, loaded from its shard headers alone; the checkpoint is not part of
 //! the repository, so the test is ignored by default and fails when the checkpoint is missing.
@@ -20,24 +20,24 @@ use std::collections::BTreeMap;
 use std::path::Path;
 use std::time::{Duration, Instant};
 
-use ipc::CacheGroupKind;
-use ipc::batch::{Phase, Variant};
+use crate::batch::cache::CacheGroupKind;
+use crate::batch::{Phase, Variant};
+use crate::memory::buffers::UNIT_BYTES;
+use crate::memory::encoders;
+use crate::worker::completion::{Outcome, Submission};
 use proto::config::{
     BlockConfig, BlockDistribution, EngineArgs, WorkerGroupConfig, WorkerGroupId, WorkerRank,
 };
 use storage::QueuePair;
 use storage::runtime::{Completion, GroupId, OwnerId, Request, RequestId, Tier};
-use worker::completion::{Outcome, Submission};
-use worker::memory::buffers::UNIT_BYTES;
-use worker::memory::encoders;
 
 use super::{
     Backing, LoadedRank, Meeting, bind, capacities, layout, load_ranks, open_ranks, spawn,
 };
-use crate::rank::ModelRunner;
-use crate::storage_client::StorageClient;
+use crate::batch::product::KINDS;
+use crate::memory::client::StorageClient;
+use crate::process::ranks::rank::ModelRunner;
 use crate::support::{DEPLOYMENT, SLOTS, StorageServer, launch};
-use ipc::product::KINDS;
 
 /// Submits `request` under `number` on the scheduler's end `pair` and returns its completion, the
 /// next to arrive, within ten seconds.
@@ -66,19 +66,21 @@ fn ask(pair: &mut QueuePair, number: u64, request: &Request) -> Completion {
     }
 }
 
-/// Waits for a job of the group's executors, which must succeed.
-fn succeeded(submission: worker::Result<Submission>) {
+/// Waits for a job of the group's workers, which must succeed.
+fn succeeded(submission: crate::worker::Result<Submission>) {
     match submission.unwrap().wait() {
         Outcome::Success(_) => {}
-        Outcome::Failed(fault) => panic!("the executors refused the job: {fault:?}"),
-        Outcome::Cancelled => panic!("the executors cancelled the job"),
+        Outcome::Failed(fault) => panic!("the workers refused the job: {fault:?}"),
+        Outcome::Cancelled => panic!("the workers cancelled the job"),
     }
 }
 
 /// The ranks of `launch`'s process loaded onto the meta device to their division.
 pub(crate) fn loaded(launch: &EngineArgs) -> Vec<LoadedRank> {
     let registry = nn::family::Registry::new([models::qwen3::family::FAMILY]).unwrap();
-    let family = crate::resolve(&registry, Path::new(&launch.engine_config.model.model)).unwrap();
+    let family =
+        crate::process::catalogue::resolve(&registry, Path::new(&launch.engine_config.model.model))
+            .unwrap();
     let model_runner = ModelRunner::of(launch, family).unwrap();
 
     load_ranks(
@@ -120,7 +122,7 @@ fn a_meta_rank_creates_its_region_s_segments_once_the_session_is_open_and_a_succ
     assert!(open.regions.iter().all(|region| region.segments.is_empty()));
     assert_eq!((open.regions[kv].units, open.regions[kv].limit), (0, units));
 
-    let mut client = StorageClient::connect(&server.socket, DEPLOYMENT, launch.epoch).unwrap();
+    let mut client = StorageClient::connect_head(&server.socket, DEPLOYMENT, launch.epoch).unwrap();
     let mut pairs = client.open(open.clone()).unwrap();
     let opened = client.session().unwrap().1.clone();
     assert_eq!(pairs.len(), 1);
@@ -149,7 +151,7 @@ fn a_meta_rank_creates_its_region_s_segments_once_the_session_is_open_and_a_succ
     }
 
     bind(&mut ranks, &open, &opened).unwrap();
-    let (executors, spawned) = spawn(&mut ranks, &client, &pairs, Vec::new()).unwrap();
+    let (workers, spawned) = spawn(&mut ranks, &client, &pairs, Vec::new()).unwrap();
     assert_eq!(spawned.len(), 1);
 
     // The region grows into the granted segments: every unit past the padding unit.
@@ -179,7 +181,7 @@ fn a_meta_rank_creates_its_region_s_segments_once_the_session_is_open_and_a_succ
     let Completion::Attached { slot } = attached else {
         panic!("the owner is attached: {attached:?}");
     };
-    succeeded(executors.map(GroupId(0), slot, RequestId(2), attach, attached));
+    succeeded(workers.map(GroupId(0), slot, RequestId(2), attach, attached));
 
     let allocate = Request::Allocate {
         owner: OwnerId(1),
@@ -193,7 +195,7 @@ fn a_meta_rank_creates_its_region_s_segments_once_the_session_is_open_and_a_succ
         panic!("a block is allocated: {allocated:?}");
     };
     assert_eq!(*runs, vec![(number, 1, 1)]);
-    succeeded(executors.map(GroupId(0), slot, RequestId(3), allocate, allocated));
+    succeeded(workers.map(GroupId(0), slot, RequestId(3), allocate, allocated));
 
     // What the group's ranks state of it: prefill, refill and decode on every slot, over its one
     // full-attention cache group of 64-token pages.
@@ -211,8 +213,8 @@ fn a_meta_rank_creates_its_region_s_segments_once_the_session_is_open_and_a_succ
 
     // The group's one key chain roots at the seed of the page identity its cache states for the
     // weights the process serves, which a meta start loads none of.
-    let identities = worker::lock(&ranks[0].text().unwrap().cache)
-        .page_identities(&crate::data_plane::identity_of(&[]));
+    let identities = service::lock(&ranks[0].text().unwrap().cache)
+        .page_identities(&crate::process::data_plane::identity_of(&[]));
     let seeds: Vec<storage::Key> = identities
         .iter()
         .map(|identity| storage::key::page_seed(identity))
@@ -232,7 +234,7 @@ fn a_meta_rank_creates_its_region_s_segments_once_the_session_is_open_and_a_succ
     let next_open = stated(&successor, &successors);
     assert_eq!(next_open.regions[kv].name, open.regions[kv].name);
 
-    let mut next_client = StorageClient::connect(&server.socket, DEPLOYMENT, 2).unwrap();
+    let mut next_client = StorageClient::connect_head(&server.socket, DEPLOYMENT, 2).unwrap();
     let _next_pairs = next_client.open(next_open.clone()).unwrap();
     let next_opened = next_client.session().unwrap().1.clone();
     assert_eq!(next_opened.regions[kv], (number, units - 1));
@@ -240,7 +242,7 @@ fn a_meta_rank_creates_its_region_s_segments_once_the_session_is_open_and_a_succ
 
     let none = open_ranks(&mut successors, &next_open, &next_opened).unwrap();
     assert_eq!(none, vec![(open.regions[kv].name.clone(), Vec::new())]);
-    let mapped: Vec<(u64, u32, u32)> = worker::lock(&successors[0].text().unwrap().cache)
+    let mapped: Vec<(u64, u32, u32)> = service::lock(&successors[0].text().unwrap().cache)
         .config()
         .segments
         .iter()
@@ -254,8 +256,8 @@ fn a_meta_rank_creates_its_region_s_segments_once_the_session_is_open_and_a_succ
     assert_eq!(mapped, table);
     next_client.close().unwrap();
 
-    // The executors stop before the session closes.
-    drop(executors);
+    // The workers stop before the session closes.
+    drop(workers);
     drop(spawned);
     client.close().unwrap();
 }
@@ -313,7 +315,7 @@ fn a_meta_media_rank_opens_its_media_memory_and_spawns_its_runners() {
     // The rank's load and its runners' profile run: every phase of a video request on its one
     // rank, a slot's row holding the largest trajectory, and its group's product sizes.
     let registry = nn::family::Registry::new([models::minimax_h3::family::FAMILY]).unwrap();
-    let family = crate::resolve(&registry, Path::new(FAST_H3)).unwrap();
+    let family = crate::process::catalogue::resolve(&registry, Path::new(FAST_H3)).unwrap();
     let model_runner = ModelRunner::of(&launch, family).unwrap();
     let mut ranks = load_ranks(
         model_runner.ranks().unwrap(),
@@ -359,7 +361,7 @@ fn a_meta_media_rank_opens_its_media_memory_and_spawns_its_runners() {
     assert_eq!(latents_region.unit_bytes, latents_region.part_bytes);
     assert_eq!(
         u64::from(latents_region.units),
-        worker::memory::latent::host::pool_pages(pages)
+        crate::memory::latent::host::pool_pages(pages)
     );
     let (products_index, products) = named("products 1 0");
     assert_eq!(
@@ -377,7 +379,7 @@ fn a_meta_media_rank_opens_its_media_memory_and_spawns_its_runners() {
     for (kind, class) in open.classes[..KINDS.len()].iter().enumerate() {
         let name = KINDS[kind].0;
         assert_eq!(class.units, 0, "{name}");
-        let conditioning = name == ipc::product::CONDITIONING;
+        let conditioning = name == crate::batch::product::CONDITIONING;
         assert_eq!(
             class.host,
             conditioning.then_some((encoders_index, 0)),
@@ -409,15 +411,15 @@ fn a_meta_media_rank_opens_its_media_memory_and_spawns_its_runners() {
     assert!(u64::from(products.units) >= request_units * u64::from(SLOTS));
 
     // The session opens, the rank opens its memory over the answer's numbers and creates no
-    // segment, and its executor is spawned over its media runners.
-    let mut client = StorageClient::connect(&server.socket, DEPLOYMENT, launch.epoch).unwrap();
+    // segment, and its worker is spawned over its media runners.
+    let mut client = StorageClient::connect_head(&server.socket, DEPLOYMENT, launch.epoch).unwrap();
     let mut pairs = client.open(open.clone()).unwrap();
     let opened = client.session().unwrap().1.clone();
     assert!(opened.segments.iter().all(Vec::is_empty));
     let created = open_ranks(&mut ranks, &open, &opened).unwrap();
     assert!(created.is_empty());
     bind(&mut ranks, &open, &opened).unwrap();
-    let (executors, spawned) = spawn(&mut ranks, &client, &pairs, Vec::new()).unwrap();
+    let (workers, spawned) = spawn(&mut ranks, &client, &pairs, Vec::new()).unwrap();
     assert_eq!(spawned.len(), 1);
 
     // An owner attached to the group and the video latents allocated to it: one run in the rank's
@@ -431,8 +433,10 @@ fn a_meta_media_rank_opens_its_media_memory_and_spawns_its_runners() {
     let Completion::Attached { slot } = attached else {
         panic!("the owner is attached: {attached:?}");
     };
-    succeeded(executors.map(GroupId(0), slot, RequestId(1), attach, attached));
-    let latents = u8::try_from(ipc::product::kind(ipc::product::VIDEO_LATENTS).unwrap()).unwrap();
+    succeeded(workers.map(GroupId(0), slot, RequestId(1), attach, attached));
+    let latents =
+        u8::try_from(crate::batch::product::kind(crate::batch::product::VIDEO_LATENTS).unwrap())
+            .unwrap();
     let allocate = Request::Allocate {
         owner: OwnerId(1),
         class: latents,
@@ -448,7 +452,7 @@ fn a_meta_media_rank_opens_its_media_memory_and_spawns_its_runners() {
         *runs,
         vec![(opened.regions[usize::from(products_index)].0, 0, 3)]
     );
-    succeeded(executors.map(GroupId(0), slot, RequestId(2), allocate, allocated));
+    succeeded(workers.map(GroupId(0), slot, RequestId(2), allocate, allocated));
 
     // What the group states: every phase of a video request, one request a stage of the
     // denoiser and the decoders, the encode's slots, the model's steps, and its product sizes.
@@ -497,8 +501,8 @@ fn a_meta_media_rank_opens_its_media_memory_and_spawns_its_runners() {
         );
     }
 
-    // The executors stop before the session closes.
-    drop(executors);
+    // The workers stop before the session closes.
+    drop(workers);
     drop(spawned);
     client.close().unwrap();
 }
@@ -557,7 +561,7 @@ fn the_conditioning_lies_with_the_text_encoder_and_the_denoising_group_reads_it(
     let launch = split_launch();
 
     let registry = nn::family::Registry::new([models::minimax_h3::family::FAMILY]).unwrap();
-    let family = crate::resolve(&registry, Path::new(FAST_H3)).unwrap();
+    let family = crate::process::catalogue::resolve(&registry, Path::new(FAST_H3)).unwrap();
     let model_runner = ModelRunner::of(&launch, family).unwrap();
     let mut ranks = load_ranks(
         model_runner.ranks().unwrap(),
@@ -588,20 +592,20 @@ fn the_conditioning_lies_with_the_text_encoder_and_the_denoising_group_reads_it(
     let (text, flow) = (&open.groups[0], &open.groups[1]);
     for (kind, (name, ..)) in KINDS.iter().enumerate() {
         let (texts, flows) = match *name {
-            ipc::product::CONDITIONING => (vec![text_buffer], vec![text_buffer]),
-            ipc::product::VISION_PIXELS => (vec![flow_buffer], vec![flow_buffer]),
+            crate::batch::product::CONDITIONING => (vec![text_buffer], vec![text_buffer]),
+            crate::batch::product::VISION_PIXELS => (vec![flow_buffer], vec![flow_buffer]),
             _ => (Vec::new(), vec![flow_buffer]),
         };
         assert_eq!(text.regions[kind], texts, "{name} on the text group");
         assert_eq!(flow.regions[kind], flows, "{name} on the flow group");
     }
 
-    // Both ranks open, each reaching the other's buffer, and an executor serves each group.
-    let mut client = StorageClient::connect(&server.socket, DEPLOYMENT, launch.epoch).unwrap();
+    // Both ranks open, each reaching the other's buffer, and a worker serves each group.
+    let mut client = StorageClient::connect_head(&server.socket, DEPLOYMENT, launch.epoch).unwrap();
     let mut pairs = client.open(open.clone()).unwrap();
     let opened = client.session().unwrap().1.clone();
     assert!(open_ranks(&mut ranks, &open, &opened).unwrap().is_empty());
-    let (executors, spawned) = spawn(&mut ranks, &client, &pairs, Vec::new()).unwrap();
+    let (workers, spawned) = spawn(&mut ranks, &client, &pairs, Vec::new()).unwrap();
     assert_eq!(spawned.len(), 2);
 
     // A request's conditioning, allocated for its owner on the text group in the text rank's
@@ -614,10 +618,10 @@ fn the_conditioning_lies_with_the_text_encoder_and_the_denoising_group_reads_it(
         let Completion::Attached { slot } = attached else {
             panic!("the owner is attached: {attached:?}");
         };
-        succeeded(executors.map(group, slot, RequestId(number), attach, attached));
+        succeeded(workers.map(group, slot, RequestId(number), attach, attached));
         slots.push(slot);
     }
-    let conditioning = ipc::product::kind(ipc::product::CONDITIONING).unwrap();
+    let conditioning = crate::batch::product::kind(crate::batch::product::CONDITIONING).unwrap();
     let allocate = Request::Allocate {
         owner: OwnerId(1),
         class: u8::try_from(conditioning).unwrap(),
@@ -634,7 +638,7 @@ fn the_conditioning_lies_with_the_text_encoder_and_the_denoising_group_reads_it(
         vec![(opened.regions[usize::from(text_buffer)].0, 0, 2)]
     );
     for (group, slot) in [(GroupId(0), slots[0]), (GroupId(1), slots[1])] {
-        let mapped = executors.map(
+        let mapped = workers.map(
             group,
             slot,
             RequestId(3),
@@ -644,7 +648,7 @@ fn the_conditioning_lies_with_the_text_encoder_and_the_denoising_group_reads_it(
         succeeded(mapped);
     }
 
-    drop(executors);
+    drop(workers);
     drop(spawned);
     client.close().unwrap();
 }
@@ -674,7 +678,7 @@ fn a_device_holds_a_rank_of_the_text_group_and_one_of_a_flow_replica() {
 
     // Sixteen ranks, two on each device: text rank `i` and the rank of flow replica `i`.
     let registry = nn::family::Registry::new([models::minimax_h3::family::FAMILY]).unwrap();
-    let family = crate::resolve(&registry, Path::new(FAST_H3)).unwrap();
+    let family = crate::process::catalogue::resolve(&registry, Path::new(FAST_H3)).unwrap();
     let model_runner = ModelRunner::of(&launch, family).unwrap();
     let placed = model_runner.ranks().unwrap();
     assert_eq!(placed.len(), 16);
@@ -716,19 +720,19 @@ fn a_device_holds_a_rank_of_the_text_group_and_one_of_a_flow_replica() {
     }
 
     // The conditioning lies with text rank 0 alone, where every flow replica reads it.
-    let conditioning = ipc::product::kind(ipc::product::CONDITIONING).unwrap();
+    let conditioning = crate::batch::product::kind(crate::batch::product::CONDITIONING).unwrap();
     let text_buffer = region("products 1 0");
     for group in &open.groups {
         assert_eq!(group.regions[conditioning], vec![text_buffer]);
     }
 
     // The session opens, every rank opens its own memory, two of them on each device, and an
-    // executor serves each rank.
-    let mut client = StorageClient::connect(&server.socket, DEPLOYMENT, launch.epoch).unwrap();
+    // worker serves each rank.
+    let mut client = StorageClient::connect_head(&server.socket, DEPLOYMENT, launch.epoch).unwrap();
     let mut pairs = client.open(open.clone()).unwrap();
     let opened = client.session().unwrap().1.clone();
     assert!(open_ranks(&mut ranks, &open, &opened).unwrap().is_empty());
-    let (executors, spawned) = spawn(&mut ranks, &client, &pairs, Vec::new()).unwrap();
+    let (workers, spawned) = spawn(&mut ranks, &client, &pairs, Vec::new()).unwrap();
     assert_eq!(spawned.len(), 16);
 
     // A request's conditioning, allocated for its owner on the text group in text rank 0's
@@ -742,7 +746,7 @@ fn a_device_holds_a_rank_of_the_text_group_and_one_of_a_flow_replica() {
         let Completion::Attached { slot } = attached else {
             panic!("the owner is attached: {attached:?}");
         };
-        succeeded(executors.map(group, slot, RequestId(number), attach, attached));
+        succeeded(workers.map(group, slot, RequestId(number), attach, attached));
         slots.push(slot);
     }
     let allocate = Request::Allocate {
@@ -761,7 +765,7 @@ fn a_device_holds_a_rank_of_the_text_group_and_one_of_a_flow_replica() {
         vec![(opened.regions[usize::from(text_buffer)].0, 0, 2)]
     );
     for (group, slot) in [(GroupId(0), slots[0]), (GroupId(4), slots[1])] {
-        let mapped = executors.map(
+        let mapped = workers.map(
             group,
             slot,
             RequestId(3),
@@ -780,7 +784,7 @@ fn a_device_holds_a_rank_of_the_text_group_and_one_of_a_flow_replica() {
         assert_eq!(capacity.serves(Phase::Denoise), !text, "group {}", id.0);
     }
 
-    drop(executors);
+    drop(workers);
     drop(spawned);
     client.close().unwrap();
 }

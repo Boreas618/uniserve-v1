@@ -6,7 +6,7 @@
 //! A rank's start calls them on its load thread (`specs/engine-worker-port.md` §1.1, step 9) and
 //! a generation update on a job thread of its own: a call to the Build Server has no deadline of
 //! its own, since a module it does not hold is built first, and a build takes minutes, so no
-//! scheduler, executor or control thread makes one. Each module is loaded into the device's
+//! scheduler, worker or control thread makes one. Each module is loaded into the device's
 //! context as a kernel, a cubin or a native library chosen by the entry it defines.
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -402,8 +402,8 @@ impl Drop for NativeModule {
 fn native_library(
     files: Vec<build_server::ModuleFile>,
     entry: &str,
-) -> worker::Result<NativeModule> {
-    let invalid = |reason: String| worker::Error::Invalid(reason);
+) -> crate::worker::Result<NativeModule> {
+    let invalid = |reason: String| crate::worker::Error::Invalid(reason);
     let siblings = files.len() > 1;
     let chosen = match files.len() {
         0 => return Err(invalid("a native module carries no library".to_owned())),
@@ -504,11 +504,11 @@ fn as_raw_fd(file: &build_server::ModuleFile) -> std::os::fd::RawFd {
 fn native_module(
     file: &build_server::ModuleFile,
     copy_allowed: bool,
-) -> worker::Result<NativeModule> {
+) -> crate::worker::Result<NativeModule> {
     use std::io::Read as _;
     use std::os::fd::AsRawFd as _;
 
-    let invalid = |reason: String| worker::Error::Invalid(reason);
+    let invalid = |reason: String| crate::worker::Error::Invalid(reason);
     let link = format!("/proc/self/fd/{}", file.file.as_raw_fd());
     if let Ok(target) = std::fs::read_link(&link) {
         let named = !target.to_string_lossy().ends_with(" (deleted)");
@@ -576,7 +576,7 @@ impl Resolved {
     }
 
     /// The module as `ops::install` takes it.
-    fn as_ops(&self) -> worker::Result<ops::Module<'_>> {
+    fn as_ops(&self) -> crate::worker::Result<ops::Module<'_>> {
         match (&self.image, &self.native) {
             (Some(image), _) => Ok(ops::Module::Cubin {
                 image,
@@ -587,7 +587,7 @@ impl Resolved {
                 path: native.path.as_path(),
                 entry: &self.entry,
             }),
-            (None, None) => Err(worker::Error::Invalid(
+            (None, None) => Err(crate::worker::Error::Invalid(
                 "a resolved module carries neither a cubin image nor a native library".to_owned(),
             )),
         }
@@ -655,10 +655,10 @@ fn defined_entries(path: &std::path::Path) -> Option<(usize, Vec<String>)> {
 /// Reads a resolved module into the form `ops::install` takes, or refuses a form this build cannot
 /// install: a scheduling policy's wasm package and a package the main process runs as its
 /// own process are not kernels.
-fn resolved(module: build_server::Module) -> worker::Result<Resolved> {
+fn resolved(module: build_server::Module) -> crate::worker::Result<Resolved> {
     use std::io::Read as _;
 
-    let invalid = |reason: String| worker::Error::Invalid(reason);
+    let invalid = |reason: String| crate::worker::Error::Invalid(reason);
     let mut files = module.files.into_iter();
     match module.form {
         build_server::manifest::ModuleForm::Cubin => {

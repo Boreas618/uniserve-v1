@@ -8,8 +8,8 @@
 //! waiting queue, its tokens while it runs, and one terminal event when it ends, after which
 //! nothing more is sent for it.
 
+use engine::batch::{ErrorCode, Phase};
 use engine::scheduler::Message;
-use ipc::batch::{ErrorCode, Phase};
 use proto::request::{Event, FinishReason, RejectionKind, RequestId, StopReason};
 
 use crate::harness::{Deployment, EOS, Harness, VIDEO_PHASES, chat_image, token, video};

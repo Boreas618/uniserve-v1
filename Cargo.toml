@@ -10,8 +10,6 @@ members = [
     "crates/platform",
     "crates/daemon",
     "crates/engine",
-    "crates/worker",
-    "crates/ipc",
     "crates/manager",
     "crates/media",
     "crates/models",
@@ -76,8 +74,6 @@ platform = { path = "crates/platform" }
 tensor = { path = "crates/tensor" }
 daemon = { path = "crates/daemon" }
 engine = { path = "crates/engine" }
-worker = { path = "crates/worker" }
-ipc = { path = "crates/ipc" }
 media = { path = "crates/media" }
 nn = { path = "crates/nn" }
 ops = { path = "crates/ops" }
@@ -146,7 +142,7 @@ protox = "0.9.0"
 reqwest = { version = "0.12.28", default-features = false, features = ["rustls-tls"] }
 rmp-serde = "1.3.1"
 # A profiling session's file: SQLite, built from its amalgamation so the
-# worker library depends on no system SQLite.
+# engine depends on no system SQLite.
 rusqlite = { version = "0.41.0", features = ["bundled"] }
 # The safetensors format: the header a checkpoint file starts with, and its tensors.
 safetensors = "0.8.0"

@@ -128,7 +128,7 @@ pub struct Region {
     /// bytes, and a block loaded from it the units that hold a part's.
     pub part_bytes: u64,
     /// The units before this one are never allocated: unit 0 and the
-    /// executor's scratch units of a cache, row 0 of the slot rows.
+    /// worker's scratch units of a cache, row 0 of the slot rows.
     pub reserved: u32,
     /// The units the engine asks to have in the region, and the limit of
     /// the region's numbering.
@@ -164,7 +164,7 @@ pub struct Class {
     /// ([`encoding`]). A host copy records the encoding of the class that
     /// wrote it; a `Load` or a `Restore` of a copy of the same tensors in
     /// another encoding is answered with a [`Completion::Copy`] that names
-    /// both, and the executor runs it through the copy manifest of the two.
+    /// both, and the worker runs it through the copy manifest of the two.
     pub encoding: [u8; 32],
 }
 
@@ -250,7 +250,7 @@ pub struct Opened {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Registers {
     /// Per group of the scheduler, in the order it listed them: the index
-    /// of the group's `completed` word, which the group's executor writes.
+    /// of the group's `completed` word, which the group's workers write.
     pub completed: Vec<u32>,
     /// Per region the scheduler uses, by its number: the index of the first
     /// of its three capacity words (`available`, `retiring`, `evictable`),
@@ -259,7 +259,7 @@ pub struct Registers {
 }
 
 /// The stamps of a request: per stamping group, the sequence of the last
-/// batch its executor had launched when it applied the request.
+/// batch its workers had launched when they applied the request.
 pub type Stamps = Vec<(GroupId, u64)>;
 
 /// A run of units as a completion states it: its region, its first unit and
@@ -307,7 +307,7 @@ pub enum Request {
         tokens: u16,
         after: Stamps,
     },
-    /// A private block at `at` that the executor fills from the cached one.
+    /// A private block at `at` that the worker fills from the cached one.
     Clone {
         owner: OwnerId,
         class: u8,
@@ -399,7 +399,7 @@ pub enum Completion {
     Committed,
     /// The key is cached already; the block stays private.
     Duplicate,
-    /// Copies for the group's executor to run: for each of `keys`, from the
+    /// Copies for the group's workers to run: for each of `keys`, from the
     /// run of `from` to the run of `to`; and the keys evicted for the destinations.
     /// `encodings` is `None` when what the copies read is in the encoding of
     /// the class they write ([`Class::encoding`]), whose bytes they copy as

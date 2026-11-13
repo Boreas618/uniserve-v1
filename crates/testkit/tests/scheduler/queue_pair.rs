@@ -2,7 +2,7 @@
 //! §3.5, §4.1; `specs/buffer-pool.md` §9, §11). Admissions that wait for answers let later ones
 //! pass; a request whose blocks have not arrived is left out; requests are held and merged when
 //! the queues have no room; each completion is matched to its request by its number, dropped when
-//! its owner is gone or its entries were given up, and handed to the executors before a batch
+//! its owner is gone or its entries were given up, and handed to the executor before a batch
 //! reads it; requests that name entries reach the buffer pool only with every stamp; copies end
 //! with one `Finish`; refusals and `Full` answers are applied by kind.
 //!
@@ -12,9 +12,9 @@
 use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 
+use engine::batch::Phase;
+use engine::batch::cache::CacheGroupKind;
 use engine::scheduler::Message;
-use ipc::CacheGroupKind;
-use ipc::batch::Phase;
 use proto::request::{
     Event, FinishReason, GenerationRequest, MigrationCause, RequestId, Trajectory,
 };
@@ -422,7 +422,7 @@ fn nothing_is_written_while_the_completion_queue_lacks_room_for_every_answer() {
 }
 
 /// A completion for an owner the scheduler gave up is dropped: a request cancelled while its
-/// admission's answers were withheld has its owner detached, and its answers reach no executor
+/// admission's answers were withheld has its owner detached, and its answers reach no worker
 /// (SD §3.5 `answered`).
 #[test]
 fn a_completion_for_a_forgotten_owner_is_dropped() {
@@ -452,10 +452,7 @@ fn a_completion_for_a_forgotten_owner_is_dropped() {
             Request::Attach { owner: of, .. } | Request::Allocate { owner: of, .. } => of == owner,
             _ => false,
         });
-    assert!(
-        !mapped,
-        "an answer of the forgotten owner reached an executor"
-    );
+    assert!(!mapped, "an answer of the forgotten owner reached a worker");
     let detached = harness
         .taken()
         .into_iter()
@@ -511,7 +508,7 @@ fn each_placed_group_gets_an_owner_and_the_slot_its_attached_gave() {
 
 /// Every completion is matched to its request by its number, whatever the order the buffer pool
 /// writes them in: with every answer held over windows of steps and written in reverse, each
-/// answer reaches the executors with the request it answers, and every request ends.
+/// answer reaches the executor with the request it answers, and every request ends.
 #[test]
 fn completions_in_any_order_are_matched_to_their_requests_by_number() {
     let mut harness = Deployment::tokens().build();
@@ -543,7 +540,7 @@ fn completions_of_stamped_requests_in_another_order_are_matched_by_number() {
 }
 
 /// The buffer pool wrote some completion before that of a request it took earlier; every
-/// completion the executors were handed is the buffer pool's answer to the request handed with
+/// completion the executor was handed is the buffer pool's answer to the request handed with
 /// it (the fake's record, checked at every step); each of `ids` generated all its tokens.
 fn reversed_and_ended(harness: &Harness, ids: &[RequestId]) {
     let order: HashMap<u64, usize> = numbered(harness)
@@ -567,9 +564,9 @@ fn reversed_and_ended(harness: &Harness, ids: &[RequestId]) {
     assert_eq!(harness.failure(), None);
 }
 
-/// Every completion that gives entries is handed to the executors with the request it answers,
+/// Every completion that gives entries is handed to the executor with the request it answers,
 /// and before any batch reads the entries: every block a batch's rows read, the cached prefix a
-/// request pinned included, is in the executors' tables under the row's slot when the batch is
+/// request pinned included, is in the workers' tables under the row's slot when the batch is
 /// formed (SD §3.5 `answered`; BP §9, obligation 1).
 #[test]
 fn every_completion_with_entries_is_mapped_before_a_batch_reads_them() {
@@ -788,10 +785,10 @@ fn a_commit_followed_by_its_requests_detach_still_commits() {
 }
 
 /// Every `Copy` is answered with a `Finish`: the stores the write policy asks for, run by the
-/// group's executor with its next batch, end with the executor's `Finish { ok: true }` (SD §3.5
+/// group's workers with its next batch, end with the workers' `Finish { ok: true }` (SD §3.5
 /// `answered`; BP §11).
 #[test]
-fn every_copy_ends_with_the_executors_finish() {
+fn every_copy_ends_with_the_workers_finish() {
     let harness = host_hit();
     let copies: Vec<u64> = harness
         .pool
@@ -817,7 +814,7 @@ fn finished(harness: &Harness, copy: u64, ok: bool) -> bool {
 }
 
 /// The `Copy` of a request cancelled while it was withheld is given up with `Finish { ok: false }`
-/// through its group's executor, and the request's owner is detached (SD §3.5 `answered`; BP §11
+/// through the executor, and the request's owner is detached (SD §3.5 `answered`; BP §11
 /// "Deadlines").
 #[test]
 fn a_dropped_copy_is_given_up_with_a_finish_that_fails_it() {
@@ -837,7 +834,7 @@ fn a_dropped_copy_is_given_up_with_a_finish_that_fails_it() {
         answer_to(&harness, load),
         Some(Completion::Copy { .. })
     ));
-    // The give-up is stamped by the copy's executor first (SD §3.1), so it reaches the buffer
+    // The give-up is stamped by the copy's workers first (SD §3.1), so it reaches the buffer
     // pool a pass or two after the request ended.
     harness.run_until(5, |harness| finished(harness, load, false));
     let stamped = harness.fake.stamps().into_iter().any(|(group, request)| {
@@ -1013,11 +1010,11 @@ fn any_other_refusal_fails_the_scheduler() {
     ));
 }
 
-/// The scheduler gives a copy up at its bound while the executor's own `Finish` of it is on its
+/// The scheduler gives a copy up at its bound while the workers' own `Finish` of it is on its
 /// way: the buffer pool answers the first `Finish` it takes and refuses the second with the cause
 /// `copy`, which the scheduler drops; the copy ends once (SD §3.5 `Refused`; BP §11 "Deadlines").
 #[test]
-fn a_give_up_crossing_the_executors_finish_ends_the_copy_once() {
+fn a_give_up_crossing_the_workers_finish_ends_the_copy_once() {
     let mut harness = host_hit();
     // The empty batch that runs the load's copy stays on the device past the copy's bound.
     harness.fake.hold();
@@ -1025,7 +1022,7 @@ fn a_give_up_crossing_the_executors_finish_ends_the_copy_once() {
     harness.run_until(10, |harness| harness.fake.held() == 1);
     std::thread::sleep(Duration::from_millis(1_100));
 
-    // The batch ends and the executor's `Finish` is on its way when the step gives the copy up.
+    // The batch ends and the workers' `Finish` is on its way when the step gives the copy up.
     harness.fake.release(1);
     harness.scheduler.step();
     harness.fake.resume();

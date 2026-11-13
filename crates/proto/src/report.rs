@@ -119,7 +119,7 @@ pub struct SchedulerStats {
     pub num_running_reqs: u64,
     /// Token and media requests waiting for admission (gauge).
     pub num_waiting_reqs: u64,
-    /// Batches the scheduler has submitted to its executors since it started,
+    /// Batches the scheduler has submitted to its executor since it started,
     /// of every phase (a lifetime value, not a delta).
     pub step_counter: u64,
     /// Data-parallel wave number. The engine tracks no waves and reports zero.
@@ -151,8 +151,8 @@ pub struct SchedulerStats {
     #[serde(default)]
     pub worker_exec_us: u64,
     /// Submit-to-result time of the interval's batches, accumulated, in microseconds: each
-    /// batch's wait in its executor's queue, its device time, and its copy and host time
-    /// (`TimingCounters`), from its submission to its output as its executor measured them.
+    /// batch's wait in its worker's queue, its device time, and its copy and host time
+    /// (`TimingCounters`), from its submission to its output as its workers measured them.
     #[serde(default)]
     pub batch_roundtrip_us: u64,
     /// Completed batches represented by `worker_exec_us` and

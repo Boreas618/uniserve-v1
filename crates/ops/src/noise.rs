@@ -3,7 +3,7 @@
 //! A diffusion request starts from standard normal noise. Drawing it on the device means every
 //! element has an address, so a restored request redraws exactly the same values from its seed, and
 //! two requests in one batch draw independent streams.
-//! The address is the one `crates/ipc/src/philox.rs` gives a random draw:
+//! The address is the one `crates/engine/src/batch/philox.rs` gives a random draw:
 //!
 //! ```text
 //! counter = [pair_low, pair_high, stage, draw]      pair = element_index / 2

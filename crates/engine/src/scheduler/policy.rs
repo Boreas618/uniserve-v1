@@ -23,7 +23,7 @@ use std::collections::HashMap;
 use std::fmt;
 use std::sync::Arc;
 
-use ipc::batch::Shape;
+use crate::batch::Shape;
 use proto::request::RequestId;
 use scheduling::decision::{DispatchOutput, Room, Shortage, Victim};
 use scheduling::event::Event;
@@ -54,7 +54,7 @@ pub const WASMTIME_VERSION: &str = "50.0.1";
 /// within it: the module store keeps one artifact per architecture, and any host of that
 /// architecture loads it whatever its CPU model. `None` on an architecture with no policy target,
 /// where [`runtime`] fails rather than compiling a module no other host can load.
-pub fn target() -> Option<&'static str> {
+pub(crate) fn target() -> Option<&'static str> {
     match std::env::consts::ARCH {
         "x86_64" => Some("x86_64-unknown-linux-gnu"),
         "aarch64" => Some("aarch64-unknown-linux-gnu"),
@@ -165,7 +165,7 @@ const PREFETCH_FLOOR_TOKENS: u32 = 256;
 /// before the next `dispatch`; `limits` is within the ceilings the policy was instantiated
 /// under. The policy's own memory is never carried: every instantiation starts from `init` with
 /// the snapshot of that moment.
-pub struct Policy {
+pub(crate) struct Policy {
     /// The module's instance with its exports.
     instance: Instance,
     /// The module and the package arguments the instance was made from.
@@ -247,7 +247,7 @@ impl Policy {
     ///
     /// The fault of `init` or `limits`, or [`PolicyError::Limits`] for limits outside the
     /// ceilings.
-    pub fn new(
+    pub(crate) fn new(
         module: Arc<Module>,
         parameters: Parameters,
         snapshot: Snapshot,
@@ -284,7 +284,7 @@ impl Policy {
     /// # Errors
     ///
     /// [`Error::Policy`] with the new module's fault; the serving policy is then untouched.
-    pub fn switch(
+    pub(crate) fn switch(
         &mut self,
         module: Arc<Module>,
         parameters: Parameters,
@@ -316,7 +316,7 @@ impl Policy {
     ///
     /// [`Error::InvalidRequest`] when no switch is left to roll back, and [`Error::Policy`] with
     /// the previous module's fault; either way the serving policy and `previous` are untouched.
-    pub fn rollback(&mut self, snapshot: Snapshot) -> Result<(), Error> {
+    pub(crate) fn rollback(&mut self, snapshot: Snapshot) -> Result<(), Error> {
         let Some((module, parameters)) = self.previous.take() else {
             return Err(Error::InvalidRequest(
                 "no replaced policy is kept to roll back to".into(),
@@ -347,7 +347,7 @@ impl Policy {
 
     /// The trial of the last switch ends in its favour (SD §3.9): the module and arguments it
     /// replaced are dropped, and nothing is left to roll back to.
-    pub fn commit(&mut self) {
+    pub(crate) fn commit(&mut self) {
         self.previous = None;
     }
 
@@ -359,7 +359,7 @@ impl Policy {
     ///
     /// The fault of `observe` or `dispatch`; an empty `dispatch` reply is
     /// [`PolicyError::Malformed`].
-    pub fn dispatch(
+    pub(crate) fn dispatch(
         &mut self,
         room: &Room,
         requests: &mut HashMap<RequestId, Request>,
@@ -397,7 +397,7 @@ impl Policy {
     /// # Errors
     ///
     /// The fault of `preempt`.
-    pub fn preempt(&mut self, shortage: &Shortage) -> Result<Vec<Victim>, PolicyError> {
+    pub(crate) fn preempt(&mut self, shortage: &Shortage) -> Result<Vec<Victim>, PolicyError> {
         match self.call(Call::Preempt, wire::encode(shortage))? {
             Some(reply) => decoded(Call::Preempt, wire::decode(&reply)),
             None => Ok(Vec::new()),
@@ -410,7 +410,7 @@ impl Policy {
     /// # Errors
     ///
     /// The fault of `route`.
-    pub fn route(
+    pub(crate) fn route(
         &mut self,
         request: &RequestView,
         ranks: &[RankView],
@@ -424,7 +424,7 @@ impl Policy {
     /// # Errors
     ///
     /// The fault of `place`.
-    pub fn place(
+    pub(crate) fn place(
         &mut self,
         call: &CallView,
         replicas: &[ReplicaView],
@@ -733,7 +733,7 @@ fn check(limits: &Limits, ceilings: &Limits) -> Result<(), PolicyError> {
 }
 
 /// The ceilings a scheduler's policy declares its limits within (SD §5.2), from what the
-/// executors of its groups captured: the step's tokens and a prefill chunk at most the widest
+/// workers of its groups captured: the step's tokens and a prefill chunk at most the widest
 /// prefill bucket's tokens, its calls at most the largest bucket's rows, a prefetch threshold of
 /// at least 256 tokens and a starvation bound of at most 30 s. A bound no captured bucket states
 /// (no group captured a prefill, or any, bucket: no such batch is formed) does not bind. The queue
@@ -875,7 +875,7 @@ pub(crate) mod tests {
         Arc::new(load(text.as_bytes()).unwrap())
     }
 
-    /// Arguments that state a deployment's limits, and the ceilings of executors that captured
+    /// Arguments that state a deployment's limits, and the ceilings of workers that captured
     /// exactly that much.
     fn limited(tokens: u32, calls: usize) -> (Parameters, Limits) {
         let parameters = Parameters {
@@ -1048,8 +1048,8 @@ pub(crate) mod tests {
     /// The ceilings are the widest prefill bucket's tokens and the largest bucket's rows; a
     /// bound no bucket states does not bind.
     #[test]
-    fn the_ceilings_are_what_the_executors_captured() {
-        use ipc::batch::Variant;
+    fn the_ceilings_are_what_the_workers_captured() {
+        use crate::batch::Variant;
 
         let mut capacity = super::super::tests::capacity();
         capacity.buckets = vec![

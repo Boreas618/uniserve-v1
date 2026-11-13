@@ -325,9 +325,12 @@ fn an_engine_started_on_the_meta_device_serves_and_shuts_down() {
     assert!(status.success(), "the engine exited with {status}");
 
     // The epoch's session is open no more: a head of the epoch opens one again.
-    let mut head =
-        engine::storage_client::StorageClient::connect(&storage.socket, DEPLOYMENT, launch.epoch)
-            .unwrap();
+    let mut head = engine::memory::client::StorageClient::connect_head(
+        &storage.socket,
+        DEPLOYMENT,
+        launch.epoch,
+    )
+    .unwrap();
     let empty = storage::runtime::Open {
         version: storage::runtime::VERSION,
         epoch: launch.epoch,

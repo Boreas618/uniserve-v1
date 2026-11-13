@@ -17,18 +17,20 @@
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
+use crate::memory::cache::info::CacheTable;
 use anyhow::{Context as _, Result};
 use crossbeam_channel::{Receiver, Sender};
-use ipc::CacheTable;
 use proto::request::MigrationCause;
+use service::lock;
 use storage::Segment;
 use storage::runtime::{GroupId, Open, Opened, Tier};
-use worker::{Executor, lock};
+
+use crate::worker::Worker;
 
 use super::operations::{resume, stopped};
-use crate::data_plane::DataPlane;
+use crate::memory::client::StorageClient;
+use crate::process::data_plane::DataPlane;
 use crate::scheduler::Message;
-use crate::storage_client::StorageClient;
 
 /// Starts the drain of every scheduler (`specs/scheduler-design.md` §3.8): each admits nothing
 /// from here on, ends its queued requests as migratable at once and its running ones by
@@ -82,7 +84,7 @@ pub(crate) fn drain(
 pub(crate) fn release(
     head: &Mutex<StorageClient>,
     data: &DataPlane,
-    executors: &[Arc<Executor>],
+    workers: &[Arc<Worker>],
     region: u8,
     units: u32,
 ) -> Result<(Vec<u32>, u64)> {
@@ -125,10 +127,10 @@ pub(crate) fn release(
     }
 
     data.release_segments(&groups, u32::try_from(from).unwrap_or(u32::MAX))?;
-    let devices = executors
+    let devices = workers
         .iter()
-        .filter(|executor| groups.contains(&executor.group()))
-        .filter_map(|executor| executor.device())
+        .filter(|worker| groups.contains(&worker.group()))
+        .filter_map(|worker| worker.device())
         .filter_map(|device| u32::try_from(device.0).ok())
         .collect();
     Ok((devices, released.saturating_mul(part_bytes)))

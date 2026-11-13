@@ -2,13 +2,13 @@
 //! the jobs that make the next generation of kernel and policy modules ready beside the serving
 //! one, switch to it at one batch boundary, and end its trial in a commit or a rollback.
 //!
-//! The engine numbers its generations and keeps the packages each was built from; the executors
+//! The engine numbers its generations and keeps the packages each was built from; the workers
 //! hold each device's generation of kernels (`ops::Generation`): the one that serves and, during
 //! an update, the one prepared beside it or kept through the trial, with the graphs of each. The
 //! schedulers hold the policy's instance, and the one a switch replaced until the commit.
 //!
 //! - **Prepare**: [`named`] reads the packages the daemon's `Prepare` names; [`kernels`] selects and installs the kernels of every key the devices launch and
-//!   has every executor rebind or recapture its graphs; [`policy`] resolves the policy package and
+//!   has every worker rebind or recapture its graphs; [`policy`] resolves the policy package and
 //!   instantiates it once against the ceilings, so that a policy that faults fails the
 //!   preparation and not the switch; [`shadow`] compares each changed kernel with the serving one
 //!   on the batches the schedulers serve. Serving is untouched, and [`discard`] gives back what a
@@ -25,20 +25,22 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use crate::worker::completion::{Outcome, Submission};
 use anyhow::{Context as _, Result, anyhow};
 use build_server::{Client, Target};
 use crossbeam_channel::{RecvTimeoutError, Sender};
 use proto::module::{ModuleSlot, PackageRevision, Packages, PhaseKind};
 use scheduling::limits::{Limits, Parameters};
 use scheduling::view::Snapshot;
-use worker::completion::{Outcome, Submission};
-use worker::{Executor, lock};
+use service::lock;
+
+use crate::worker::Worker;
 
 use super::operations::{ask, at_boundary, every, stopped};
-use crate::data_plane::DataPlane;
 use crate::executor::Shadow;
 use crate::modules::load::{self, install, select};
 use crate::modules::select::{Routes, replaced_operators};
+use crate::process::data_plane::DataPlane;
 use crate::scheduler::Message;
 use crate::scheduler::policy::Policy;
 
@@ -104,16 +106,16 @@ fn phase_of(phase: i32) -> Result<Option<PhaseKind>> {
     })
 }
 
-/// Makes generation `generation` of kernels ready beside the serving one on every executor and
+/// Makes generation `generation` of kernels ready beside the serving one on every worker and
 /// returns the packages it is built from (`Prepare`, `specs/updates.md` §3.1).
 ///
 /// Every descriptor key the devices launch is asked of the Build Server once, with the packages
 /// the daemon names (`named`), and the server selects the package of each key. The operators
 /// whose selected packages differ from `serving`'s (the packages the serving generation was built
 /// from) are installed on every device, in its own context; every other operator keeps its
-/// kernels, and with them the graphs that launch them. Each executor then prepares the device's
+/// kernels, and with them the graphs that launch them. Each worker then prepares the device's
 /// generation beside the serving one: it rebinds the graphs whose launch table is unchanged and
-/// recaptures the others, between the batches it serves. An executor of no device installs
+/// recaptures the others, between the batches it serves. A worker of no device installs
 /// nothing.
 ///
 /// # Errors
@@ -121,14 +123,14 @@ fn phase_of(phase: i32) -> Result<Option<PhaseKind>> {
 /// The Build Server's refusal, an install that failed, or a device that did not prepare the
 /// generation: what was prepared is given back on every device, and serving is untouched.
 pub(crate) fn kernels(
-    executors: &[Arc<Executor>],
+    workers: &[Arc<Worker>],
     build: &(Arc<Mutex<Client>>, Vec<Target>),
     named: &Packages,
     serving: &Packages,
     generation: u64,
 ) -> Result<Packages> {
     let (client, targets) = build;
-    let held = serving_kernels(executors)?;
+    let held = serving_kernels(workers)?;
 
     // An update changes implementations and never the keys: the serving generations' keys are
     // every key the devices' forwards launch.
@@ -154,11 +156,11 @@ pub(crate) fn kernels(
         .filter(|(slot, _)| replaced.contains(&slot.op))
         .collect();
 
-    // Every device's kernels are installed, each in its own context, before any executor is
+    // Every device's kernels are installed, each in its own context, before any worker is
     // given its generation, so a failed install leaves nothing to give back.
-    let mut installed = Vec::with_capacity(executors.len());
-    for executor in executors {
-        installed.push(match executor.device() {
+    let mut installed = Vec::with_capacity(workers.len());
+    for worker in workers {
+        installed.push(match worker.device() {
             Some(device) => {
                 install(&mut client, device, &packages, &routes).with_context(|| {
                     format!("installing the generation's kernels on device {}", device.0)
@@ -170,16 +172,16 @@ pub(crate) fn kernels(
     drop(client);
 
     // One generation per device: a kernel belongs to the context that loaded it.
-    let submitted: Vec<worker::Result<Submission>> = executors
+    let submitted: Vec<crate::worker::Result<Submission>> = workers
         .iter()
         .zip(&held)
         .zip(installed)
-        .map(|((executor, kernels), entries)| {
-            executor.prepare(Arc::new(kernels.replace(generation, entries)))
+        .map(|((worker, kernels), entries)| {
+            worker.prepare(Arc::new(kernels.replace(generation, entries)))
         })
         .collect();
     if let Err(failure) = ended(submitted, &format!("preparing generation {generation}")) {
-        if let Err(error) = discard(&[], executors, generation) {
+        if let Err(error) = discard(&[], workers, generation) {
             tracing::warn!(%error, generation, "a preparation that failed was not given back");
         }
         return Err(failure);
@@ -196,21 +198,21 @@ pub(crate) fn kernels(
     Ok(prepared)
 }
 
-/// The generation of kernels each executor's device serves, in the executors' order: what the
+/// The generation of kernels each worker's device serves, in the workers' order: what the
 /// next one is built from.
 ///
 /// # Errors
 ///
-/// An executor that closed, or that holds no runner.
-fn serving_kernels(executors: &[Arc<Executor>]) -> Result<Vec<Arc<ops::Generation>>> {
-    executors
+/// A worker that closed, or that holds no runner.
+fn serving_kernels(workers: &[Arc<Worker>]) -> Result<Vec<Arc<ops::Generation>>> {
+    workers
         .iter()
-        .map(|executor| {
-            let kernels = executor.call("reading the generation the rank serves", |runners| {
+        .map(|worker| {
+            let kernels = worker.call("reading the generation the rank serves", |runners| {
                 runners
                     .first()
                     .map(|runner| runner.graphs().kernels())
-                    .ok_or(worker::Error::State("the rank holds no runner"))
+                    .ok_or(crate::worker::Error::State("the rank holds no runner"))
             })?;
             Ok(kernels)
         })
@@ -219,7 +221,7 @@ fn serving_kernels(executors: &[Arc<Executor>]) -> Result<Vec<Arc<ops::Generatio
 
 /// Resolves the policy package `package` at the Build Server and returns its module with the
 /// arguments it was given (`Prepare`'s policy half). The module is instantiated once against
-/// `ceilings`, the limits the executors hold, and dropped: a policy that faults at its start or
+/// `ceilings`, the limits the workers hold, and dropped: a policy that faults at its start or
 /// declares limits outside the ceilings fails the preparation, with serving untouched, rather
 /// than the switch (`specs/scheduler-design.md` §3.9).
 ///
@@ -248,11 +250,11 @@ pub(crate) fn policy(
     Ok((module, parameters))
 }
 
-/// Compares each changed kernel of generation `generation`, which every executor has prepared,
+/// Compares each changed kernel of generation `generation`, which every worker has prepared,
 /// with the serving one on the batches the schedulers serve: a pass of every scheduler's
 /// [`Shadow`] runs each batch of a group and shape it has not shadowed as a shadow batch of the
 /// generation, whose paired forwards compare the pairs within their tolerances. Returns the
-/// operators the executors could not compare, each with the reason, without repeats; empty states
+/// operators the workers could not compare, each with the reason, without repeats; empty states
 /// that every replaced operator a shadow batch reached was compared.
 ///
 /// A pass answers once a batch of its scheduler ran, so an engine whose running requests run no
@@ -265,7 +267,7 @@ pub(crate) fn policy(
 /// `bound`; every pass is ended then.
 pub(crate) fn shadow(
     shadows: &[Arc<Mutex<Shadow>>],
-    executors: &[Arc<Executor>],
+    workers: &[Arc<Worker>],
     generation: u64,
     changed: &[String],
     bound: Duration,
@@ -305,8 +307,8 @@ pub(crate) fn shadow(
     }
 
     let mut uncompared: Vec<String> = Vec::new();
-    for executor in executors {
-        for entry in executor.uncompared() {
+    for worker in workers {
+        for entry in worker.uncompared() {
             if !uncompared.contains(&entry) {
                 uncompared.push(entry);
             }
@@ -315,8 +317,8 @@ pub(crate) fn shadow(
     Ok(uncompared)
 }
 
-/// Switches every scheduler and every executor to generation `generation` at one batch boundary
-/// (`Switch`): every executor serves the prepared generation from its next batch, keeping the
+/// Switches every scheduler and every worker to generation `generation` at one batch boundary
+/// (`Switch`): every worker serves the prepared generation from its next batch, keeping the
 /// one it replaces; every rank's cache and state launch their own work from it; every scheduler
 /// instantiates `policy`, the generation's module and arguments, on its state, keeping the one it
 /// replaces; and the batches formed from here on carry `generation` (`served`, which the
@@ -325,12 +327,12 @@ pub(crate) fn shadow(
 /// # Errors
 ///
 /// A device that did not switch, or a scheduler that refused the policy: the switch is rolled
-/// back, so every scheduler serves its previous policy and every executor the generation that
+/// back, so every scheduler serves its previous policy and every worker the generation that
 /// served (the prepared one is given back), and `served` is unchanged; or a rank whose cache
 /// and state did not take the kernels, with the switch made.
 pub(crate) fn switch(
     schedulers: &[Sender<Message>],
-    executors: &[Arc<Executor>],
+    workers: &[Arc<Worker>],
     data: &DataPlane,
     served: &AtomicU64,
     generation: u64,
@@ -339,9 +341,9 @@ pub(crate) fn switch(
     at_boundary(schedulers, || {
         let what = format!("switching to generation {generation}");
         let switched = ended(
-            executors
+            workers
                 .iter()
-                .map(|executor| executor.switch(generation))
+                .map(|worker| worker.switch(generation))
                 .collect(),
             &what,
         );
@@ -371,9 +373,9 @@ pub(crate) fn switch(
             // A rollback returns a device that switched to the generation it kept, and gives
             // the prepared generation back on one that did not.
             let rolled = ended(
-                executors
+                workers
                     .iter()
-                    .map(|executor| executor.rollback(generation))
+                    .map(|worker| worker.rollback(generation))
                     .collect(),
                 &format!("rolling generation {generation} back"),
             );
@@ -390,7 +392,7 @@ pub(crate) fn switch(
     })
 }
 
-/// Ends the trial of generation `generation` in its favour (`Commit`): every executor releases the
+/// Ends the trial of generation `generation` in its favour (`Commit`): every worker releases the
 /// generation it kept, behind the batches it holds and so after the kept generation's last one,
 /// and every scheduler drops the policy it kept. The control thread's route instance commits too.
 ///
@@ -399,13 +401,13 @@ pub(crate) fn switch(
 /// A device that did not commit, or a scheduler that stopped.
 pub(crate) fn commit(
     schedulers: &[Sender<Message>],
-    executors: &[Arc<Executor>],
+    workers: &[Arc<Worker>],
     generation: u64,
 ) -> Result<()> {
     ended(
-        executors
+        workers
             .iter()
-            .map(|executor| executor.commit(generation))
+            .map(|worker| worker.commit(generation))
             .collect(),
         &format!("committing generation {generation}"),
     )?;
@@ -419,7 +421,7 @@ pub(crate) fn commit(
 }
 
 /// Ends the trial of generation `generation` against it (`Rollback`): at one batch boundary every
-/// executor serves `kept`, the generation the trial kept, again and releases `generation`'s
+/// worker serves `kept`, the generation the trial kept, again and releases `generation`'s
 /// graphs, the batches formed from here on carry `kept`, every rank's cache and state launch
 /// their own work from it, and every scheduler serves the policy it kept again. The control
 /// thread's route instance rolls back too.
@@ -431,7 +433,7 @@ pub(crate) fn commit(
 /// policy faults again. Each part is done whatever another did.
 pub(crate) fn rollback(
     schedulers: &[Sender<Message>],
-    executors: &[Arc<Executor>],
+    workers: &[Arc<Worker>],
     data: &DataPlane,
     served: &AtomicU64,
     generation: u64,
@@ -439,9 +441,9 @@ pub(crate) fn rollback(
 ) -> Result<()> {
     at_boundary(schedulers, || {
         let devices = ended(
-            executors
+            workers
                 .iter()
-                .map(|executor| executor.rollback(generation))
+                .map(|worker| worker.rollback(generation))
                 .collect(),
             &format!("rolling generation {generation} back"),
         );
@@ -458,7 +460,7 @@ pub(crate) fn rollback(
 
 /// Gives back what was prepared of generation `generation`, which never served (a `Rollback`
 /// before the switch, or a preparation that failed or was abandoned): every scheduler's shadow
-/// pass ends unanswered, and every executor releases the generation's graphs and the kernels only
+/// pass ends unanswered, and every worker releases the generation's graphs and the kernels only
 /// they held. The policy was only tried, and nothing of it is held.
 ///
 /// # Errors
@@ -466,7 +468,7 @@ pub(crate) fn rollback(
 /// A device that did not release the generation.
 pub(crate) fn discard(
     shadows: &[Arc<Mutex<Shadow>>],
-    executors: &[Arc<Executor>],
+    workers: &[Arc<Worker>],
     generation: u64,
 ) -> Result<()> {
     for shadow in shadows {
@@ -474,28 +476,28 @@ pub(crate) fn discard(
     }
 
     ended(
-        executors
+        workers
             .iter()
-            .map(|executor| executor.rollback(generation))
+            .map(|worker| worker.rollback(generation))
             .collect(),
         &format!("discarding generation {generation}"),
     )
 }
 
-/// Waits for every submission, which the caller handed every executor before it waits for any,
-/// in the executors' order, and returns the first failure once every one ended, naming `what`
-/// and the executor.
-fn ended(submitted: Vec<worker::Result<Submission>>, what: &str) -> Result<()> {
+/// Waits for every submission, which the caller handed every worker before it waits for any,
+/// in the workers' order, and returns the first failure once every one ended, naming `what`
+/// and the worker.
+fn ended(submitted: Vec<crate::worker::Result<Submission>>, what: &str) -> Result<()> {
     let mut failure = None;
     for (rank, submission) in submitted.into_iter().enumerate() {
         let outcome = submission.map(|submission| submission.wait());
         let failed = match outcome {
             Ok(Outcome::Success(_)) => continue,
-            Ok(Outcome::Failed(fault)) => anyhow!("{what} on executor {rank}: {fault}"),
+            Ok(Outcome::Failed(fault)) => anyhow!("{what} on worker {rank}: {fault}"),
             Ok(Outcome::Cancelled) => {
-                anyhow!("{what} on executor {rank}: the executor closed before it ran")
+                anyhow!("{what} on worker {rank}: the worker closed before it ran")
             }
-            Err(refused) => anyhow!("{what} on executor {rank}: {refused}"),
+            Err(refused) => anyhow!("{what} on worker {rank}: {refused}"),
         };
         failure.get_or_insert(failed);
     }

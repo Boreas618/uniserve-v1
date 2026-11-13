@@ -5,11 +5,14 @@ edition.workspace = true
 license.workspace = true
 publish = false
 
-# A node's main process for one epoch: its control thread, its schedulers,
-# one executor per device and its blocking pool, and the generation
-# update between them. The library dispatches by computational capability and
-# names no concrete model; the package's executable, `uniserve-engine`
-# (`src/main.rs`), registers the model families it loads.
+# A node's main process for one epoch: its control thread, one scheduler per
+# data-parallel rank, the executor each scheduler hands its batches to, one
+# worker thread per device with the runners, captured graphs, sampler and device
+# memory it serves from, and the generation update between them
+# (`engine → nn → ops → platform`, beside the tensor library). The library
+# dispatches by computational capability and names no concrete model; the
+# package's executable, `uniserve-engine` (`src/main.rs`), registers the model
+# families it loads.
 #
 # The crate is the engine package (`package.toml`): the Build Server builds
 # the executable from a snapshot of this crate and the crates it depends on.
@@ -19,10 +22,16 @@ path = "src/main.rs"
 
 [dependencies]
 anyhow.workspace = true
+base64.workspace = true
+# Byte views of plain numeric slices handed to device copies.
+bytemuck.workspace = true
 clap.workspace = true
 crossbeam-channel.workspace = true
-ipc.workspace = true
+# A shadow comparison reads 16-bit floating elements as the tensor library does.
+half = "2.5.0"
+indexmap.workspace = true
 libc.workspace = true
+libloading.workspace = true
 # The encoders, muxers and readers a media rank's host work runs on (`media::MediaRunner`), one
 # per process.
 media.workspace = true
@@ -31,18 +40,31 @@ mimalloc.workspace = true
 models.workspace = true
 service.workspace = true
 nn.workspace = true
+nvtx.workspace = true
+# The execution context a runner's forwards compute under, and tensors over memory a rank owns:
+# weights, cache planes, recurrent state and a graph's inputs; the operators it launches.
 ops.workspace = true
-# The element type of a kernel operand (`DType`).
+# Tensors: a runner's inputs and a forward's outputs, and the element type of a kernel operand
+# (`DType`).
 tensor.workspace = true
 platform.workspace = true
-# The one rule a checkpoint's root files resolve to a model family by (`catalogue`).
+# The one rule a checkpoint's root files resolve to a model family by (`process::catalogue`).
 processing.workspace = true
 build-server.workspace = true
 proto.workspace = true
-# The scheduling policy's interface: its parameters, limits and messages.
+# The peer link's messages between the engine processes of an epoch, in MessagePack.
+rmp-serde.workspace = true
+# A profiling session's file.
+rusqlite.workspace = true
+rustix = { workspace = true, features = ["fs", "pipe", "system"] }
+# The scheduling policy's interface: its parameters, limits and messages, and the phase a batch
+# computes.
 scheduling.workspace = true
+serde = { workspace = true, features = ["rc"] }
 serde_json.workspace = true
 storage.workspace = true
+thiserror.workspace = true
+time.workspace = true
 tokio = { workspace = true, features = ["sync"] }
 # A package's arguments, which the daemon's `Prepare` carries as the TOML text of each value
 # (`proto::module::PackageRevision::arguments`).
@@ -52,10 +74,10 @@ tracing.workspace = true
 # (`scheduler::policy`) at the workspace's one pin, which also precompiles a policy package for
 # the Build Server (`uniserve-engine precompile`).
 wasmtime.workspace = true
-worker.workspace = true
 
 [dev-dependencies]
-# A rank's start opens its session with a Storage Server the test runs in its own process.
+# A rank's start opens its session with a Storage Server the test runs in its own process, as do
+# the device tests of the weight store.
 storage-server.workspace = true
 # A toy policy module in a test is written as `wat`.
 wasmtime = { workspace = true, features = ["wat"] }

@@ -13,7 +13,7 @@
 //! their keys, and its host-to-device copies write the input buffer and issue nothing. The
 //! profile run and the forward of `prepare_inputs` run under meta contexts.
 //!
-//! One executor thread issues a device's work, so nothing here is contended. The state is behind
+//! One worker thread issues a device's work, so nothing here is contended. The state is behind
 //! a lock all the same, because a runner is built on one thread and moved to the thread of its
 //! device with its context.
 

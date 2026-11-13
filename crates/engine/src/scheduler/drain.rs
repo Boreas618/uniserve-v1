@@ -13,8 +13,8 @@
 
 use std::time::Instant;
 
+use crate::batch::Phase;
 use crossbeam_channel::Sender;
-use ipc::batch::Phase;
 use proto::request::MigrationCause;
 use storage::runtime::{self, Tier};
 
@@ -309,7 +309,7 @@ mod tests {
         scheduler.available = vec![0; 4];
 
         // At its deadline the running request leaves, and its owner's `Detach` is handed to
-        // group A's executor; nothing is free yet.
+        // group A's workers; nothing is free yet.
         let (reply, replied) = crossbeam_channel::bounded(1);
         scheduler.drain(MigrationCause::Drain, Instant::now(), true, reply);
         assert!(bench.scheduler.requests.is_empty());

@@ -13,7 +13,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use ipc::batch::{Batch, Phase};
+use engine::batch::{Batch, Phase};
 use proto::report::SchedulerStats;
 use proto::request::{Event, MigrationCause, RejectionKind, RequestId};
 use storage::runtime::{Completion, GroupId, OwnerId, Request};
@@ -142,7 +142,7 @@ fn a_request_goes_where_the_policy_places_it_and_its_later_phases_follow_it() {
 
 /// A request prefilled on a `Prefill` group moves to a decode group once its prompt is computed:
 /// its one owner, attached to the prefill group, is moved by `Transfer`, which reaches the buffer
-/// pool with the prefill group's stamp (its executor removed the owner's entries); the decode
+/// pool with the prefill group's stamp (its workers removed the owner's entries); the decode
 /// group is handed the `Transferred` runs under the slot it gave, its first decode carries the
 /// request's `NewSlot`, and the request decodes there to its end (SD §3.5 "Prefill to decode
 /// transfer").
@@ -273,9 +273,9 @@ fn a_failed_transfer_ends_as_migratable_and_detaches_its_owner_with_no_stamp() {
 }
 
 /// A video request placed on two groups (the first prepares its latents and denoises them, the
-/// second decodes, encodes and muxes) holds one owner on each; each group runs only the phases
-/// it serves; a product the first group's owner holds and the second group reads (the denoised
-/// latents its decode reads) is handed to both groups' executors, and that owner's `Detach` is
+/// second decodes, encodes and muxes) holds one owner on each; each group runs only the phases it
+/// serves; a product the first group's owner holds and the second group reads (the denoised latents
+/// its decode reads) is handed to the executor for both groups, and that owner's `Detach` is
 /// stamped by both (SD §4.2 "Owners of the classes", §3.1).
 #[test]
 fn a_video_request_holds_one_owner_per_group_and_a_product_is_read_by_both() {

@@ -9,8 +9,8 @@
 //! request is an ordinary request whose id is at or above `WARMUP_REQUEST_IDS`: it is served and
 //! counted like any other, and its events are dropped.
 
+use engine::batch::Phase;
 use engine::scheduler::{Output, WARMUP_REQUEST_IDS};
-use ipc::batch::Phase;
 use proto::report::SchedulerStats;
 use proto::request::{CachePolicy, FinishReason, GenerationRequest, RequestId, SamplingParams};
 

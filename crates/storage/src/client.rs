@@ -560,7 +560,7 @@ impl Client {
         }
     }
 
-    /// See [`Request::Close`]: the epoch's executors have stopped.
+    /// See [`Request::Close`]: the epoch's workers have stopped.
     pub fn close_pool(&mut self) -> Result<()> {
         match self.request(&Request::Close, &[])?.0 {
             Response::Closed => Ok(()),
