@@ -197,8 +197,12 @@ fn regions_past_the_quota_are_refused_and_reserve_nothing() {
     let total = device.memory_info().unwrap().total;
     let sizes = [(RunnerId(0), 2 * MIB), (RunnerId(1), total / 50)];
     let refused = GraphPool::open(Arc::clone(&client), device, 0.01, &sizes, 0, 0);
-
     assert!(refused.is_err());
+
+    // The first region was mapped and reserved before the second was refused; its storage
+    // goes back through the process's reclaimer, which unmaps it and then books the pool's
+    // reservation down to nothing. A flush waits for that release.
+    platform::reclaim::flush().unwrap();
     assert_eq!(reserved(&client, device), 0);
 }
 

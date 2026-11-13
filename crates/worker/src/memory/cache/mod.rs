@@ -1374,23 +1374,26 @@ mod tests {
         cache.set_regions(regions(2))?;
         cache.apply(&allocated(1, 0, &[3, 4]), Some(&stream))?;
 
-        // A clone moves a unit's bytes into the unit its copy names.
-        let pattern: Vec<u8> = (0..64).collect();
+        // A clone moves a unit's bytes into the unit its copy names. A column's planes lie unit
+        // after unit, so the key plane of unit 1 in column 0 is the layout's plane bytes (four
+        // tokens of one 4-wide BF16 head, 32 bytes) and the next unit's plane follows it.
+        let plane = cache.layout().plane_bytes as usize;
+        let pattern: Vec<u8> = (0..plane as u8).collect();
         let (source, destination) = (
             cache.planes.plane_address(0, 0, 1)?,
             cache.planes.plane_address(0, 0, 5)?,
         );
-        // SAFETY: 64 bytes of the key plane of unit 1 in column 0, which the cache owns and
-        // nothing else writes; the host pattern is read before the stream is synchronized.
-        unsafe { platform::memcpy_async(source, pattern.as_ptr() as u64, 64, &stream)? };
+        // SAFETY: the key plane of unit 1 in column 0, which the cache owns and nothing else
+        // writes; the host pattern is read before the stream is synchronized.
+        unsafe { platform::memcpy_async(source, pattern.as_ptr() as u64, plane, &stream)? };
         stream.synchronize()?;
         for cloned in cache.copy(&[((UNITS, 1, 1), (UNITS, 5, 1))], Some(&stream))? {
             cloned.synchronize()?;
         }
-        let mut moved = vec![0_u8; 64];
-        // SAFETY: as above, the same bytes of unit 5, read behind the copy; the host buffer
-        // holds them.
-        unsafe { platform::memcpy_async(moved.as_mut_ptr() as u64, destination, 64, &stream)? };
+        let mut moved = vec![0_u8; plane];
+        // SAFETY: as above, the key plane of unit 5, read behind the copy; the host buffer
+        // holds it.
+        unsafe { platform::memcpy_async(moved.as_mut_ptr() as u64, destination, plane, &stream)? };
         stream.synchronize()?;
         assert_eq!(moved, pattern);
 

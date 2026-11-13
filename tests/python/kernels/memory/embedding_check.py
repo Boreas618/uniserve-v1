@@ -13,7 +13,8 @@ another rank's values would be a silent aliasing rather than an absent embedding
 tolerance is `Tolerance::exact()`: a lookup copies values and rounds nothing.
 
 Cases: every id inside the shard; a shard offset with ids on both sides of it, so the zeros are
-exercised next to real rows; `i64` ids, whose arithmetic is wider than the table; and a
+exercised next to real rows; `u32` ids, as the model library passes them; `i64` ids, whose
+arithmetic is wider than the table; and a
 `hidden` that the inner tile does not divide, so the column tail is masked. The shard's `rows`
 is small on purpose — the operator is the same at 151936 rows, and a check that needs a
 gigabyte of weights to run is a check that stops being run.
@@ -43,7 +44,7 @@ TORCH_TYPES = {
     "f32": torch.float32,
 }
 
-ID_TYPES = {"i32": torch.int32, "i64": torch.int64}
+ID_TYPES = {"u32": torch.uint32, "i32": torch.int32, "i64": torch.int64}
 
 
 def check(case):

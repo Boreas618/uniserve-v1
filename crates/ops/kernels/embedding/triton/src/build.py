@@ -11,8 +11,11 @@ from uniserve_build_server import triton as driver
 #: The vocabulary weight's dtype, and the output row's.
 DTYPES = {"bf16": "bf16", "f16": "fp16", "fp16": "fp16", "fp32": "fp32", "f32": "fp32"}
 
-#: Token id dtypes: a fused embedding table arrives as int32 or int64 ids.
-IDS = {"i32": "i32", "i64": "i64"}
+#: Token id dtypes: a model's token ids are uint32
+#: (`nn::functional::embedding`), and a fused embedding table arrives as int32
+#: or int64 ids. A uint32 id widens to int64 by zero extension, so an id past
+#: the shard is outside it, never negative.
+IDS = {"u32": "u32", "i32": "i32", "i64": "i64"}
 
 
 def spec(fields, parameters, target):
