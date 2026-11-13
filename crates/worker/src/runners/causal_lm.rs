@@ -68,6 +68,11 @@
 //! between them: the replay reads the slot state, the pooled page tables and the pages as the
 //! copies before it left them.
 //!
+//! A batch with no rows, which a group with copies queued and no other work is sent
+//! (`specs/scheduler-design.md` §2.1), takes only step 8: the table's changes and the copies
+//! reached the runner before it, nothing is replayed, the copies are waited for, and its output
+//! names no call. A step that fails waits for the copies all the same before it returns.
+//!
 //! ## Page work
 //!
 //! The key/value cache and the recurrent state belong to the rank, which two runners of a
@@ -961,7 +966,9 @@ impl CausalLmRunner {
             return self.join_step(batch, started);
         }
 
-        // Any other batch that names no call computes nothing: it carries copies alone.
+        // Any other batch that names no call has no rows: it carries the table's changes and the
+        // copies alone, which reached the runner before it, and computes nothing. Its output
+        // names no call, and `execute` ends the copies with it.
         if batch.requests.is_empty() && batch.columns.calls() == 0 {
             return Ok(BatchOutput::default());
         }

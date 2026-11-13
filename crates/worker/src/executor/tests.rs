@@ -1402,6 +1402,99 @@ fn a_joined_submission_fails_with_the_rank_that_failed() {
 }
 
 #[test]
+fn a_batch_that_fails_reports_the_copies_that_started_with_it_failed() {
+    let log = Log::default();
+    let (pool, engine) = queue_pair(1);
+    let (route, _, sequences) = group(ranks(2, &log), vec![(engine, 0)]);
+
+    // A store every rank starts with the batch the runners refuse, the group's number 1.
+    store(&route, 10, DEVICE, 1);
+    let submission = route.submit(batch(REFUSED, Phase::Decode, 2)).unwrap();
+    let Some(Outcome::Failed(fault)) = submission.wait_timeout(LONG) else {
+        panic!("the refused batch fails");
+    };
+    assert!(
+        fault.to_string().contains("the runner refuses this batch"),
+        "{fault}"
+    );
+
+    // The failure carries the copy's `Finish`, failed and stamped with the batch, and it was
+    // posted once every rank had ended the batch: the group's word covers it.
+    let finished = fault.downcast_ref::<Error>().map(Error::finished);
+    let failed = Request::Finish {
+        copy: runtime::RequestId(10),
+        ok: false,
+        after: vec![(GROUP, 1)],
+    };
+    assert_eq!(finished, Some(&[failed][..]));
+    assert_eq!(sequences.completed(), 1);
+    assert_eq!(pool.register(0).load(Ordering::Acquire), 1);
+
+    // The copy ended with the batch: no later batch starts it or reports it again.
+    let (_, requests) = returned_by(&route.submit(reading(2, 2)).unwrap());
+    assert!(requests.is_empty());
+    assert_eq!(
+        copied(&log, "rank-0"),
+        ["[(10, [((0, 160, 1), (1, 160, 1))])]"]
+    );
+
+    // A failed batch that started no copy carries none.
+    let submission = route.submit(batch(REFUSED, Phase::Decode, 2)).unwrap();
+    let Some(Outcome::Failed(fault)) = submission.wait_timeout(LONG) else {
+        panic!("the refused batch fails");
+    };
+    assert_eq!(
+        fault.downcast_ref::<Error>().map(Error::finished),
+        Some(&[][..])
+    );
+}
+
+/// A batch numbered `id` of group `GROUP` with no rows: what a step sends a group whose executor
+/// holds copies not yet finished when it formed no other batch for the group.
+fn rowless(id: u64) -> Batch {
+    Batch {
+        requests: Vec::new(),
+        ..batch(id, Phase::Decode, 0)
+    }
+}
+
+#[test]
+fn a_batch_with_no_rows_takes_its_number_runs_the_copies_and_no_forward() {
+    let log = Log::default();
+    let (pool, engine) = queue_pair(1);
+    let (route, executors, sequences) = group(ranks(2, &log), vec![(engine, 0)]);
+
+    // Two copies of two units under a budget of three: each batch with no rows starts one.
+    store(&route, 10, DEVICE, 2);
+    store(&route, 11, DEVICE, 2);
+
+    for (sequence, copy) in [(1, 10), (2, 11)] {
+        let (output, requests) = returned_by(&route.submit(rowless(sequence)).unwrap());
+        assert!(output.calls.is_empty(), "batch {sequence}");
+        assert_eq!(requests, finished(&[copy], sequence), "batch {sequence}");
+        assert_eq!(sequences.completed(), sequence);
+    }
+    assert_eq!(pool.register(0).load(Ordering::Acquire), 2);
+    assert_eq!(
+        copied(&log, "rank-1"),
+        [
+            "[(10, [((0, 160, 2), (1, 160, 2))])]",
+            "[(11, [((0, 176, 2), (1, 176, 2))])]",
+        ]
+    );
+
+    // No forward ran: the executors spent no time in one.
+    for executor in &executors {
+        assert_eq!(executor.counters().1, 0);
+    }
+
+    // With nothing queued, a batch with no rows still takes its number and returns no `Finish`.
+    let (output, requests) = returned_by(&route.submit(rowless(3)).unwrap());
+    assert!(output.calls.is_empty() && requests.is_empty());
+    assert_eq!(sequences.completed(), 3);
+}
+
+#[test]
 fn a_control_operation_is_submitted_to_every_executor_of_a_node() {
     let log = Log::default();
     let (route, _, _) = group(ranks(3, &log), Vec::new());

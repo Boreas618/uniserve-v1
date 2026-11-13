@@ -40,6 +40,8 @@ use super::wiring;
 use super::{CausalLmConfig, CausalLmRunner, PageWork};
 use crate::Error;
 use crate::buckets::{Bucket, Buckets};
+use crate::completion::Outcome;
+use crate::executor::{COPY_BUDGET, Executor, Sequences};
 use crate::graphs::Graphs;
 use crate::memory::cache::{CacheLayout, CacheRegions, KvCacheConfig, KvCacheMemory};
 use crate::memory::state::{StateConfig, StateMemory};
@@ -2305,6 +2307,109 @@ fn a_copy_between_two_runs_is_issued_on_the_cache_and_ends_with_the_batch() {
         .execute(&decode(&[1, 2], &[0.0, 0.0]), &tables)
         .unwrap_err();
     assert!(matches!(refused, Error::State(_)), "{refused}");
+}
+
+#[test]
+fn a_batch_with_no_rows_writes_the_tables_and_runs_the_copies_without_a_forward() {
+    /// A bound on the waits that only a defect reaches.
+    const LONG: Duration = Duration::from_secs(30);
+
+    let cache = Arc::new(Mutex::new(
+        KvCacheMemory::meta(cache_config(false)).unwrap(),
+    ));
+    let stated = regions(&lock(&cache));
+    lock(&cache).set_regions(stated).unwrap();
+
+    // The executor of the one rank of group 0, over the runner wired to the rank's cache. Its
+    // graphs hold no device, so any forward the batch ran would fail it.
+    let group = GroupId(0);
+    let sequences = Sequences::new(group, 1, Vec::new());
+    let tables = BlockTables::new(group, &[UNITS], &[(UNITS, 1024)]);
+    let executor = Executor::spawn(
+        None,
+        vec![Box::new(wired(&cache, None))],
+        Arc::new(Generation::new(0, [])),
+        tables,
+        Arc::clone(&sequences),
+        0,
+        COPY_BUDGET,
+    )
+    .unwrap();
+    let map = |id: u64, request: Request, completion: Completion| {
+        let mapped = executor
+            .map(1, storage::runtime::RequestId(id), request, completion)
+            .unwrap();
+        assert!(matches!(
+            mapped.wait_timeout(LONG),
+            Some(Outcome::Success(_))
+        ));
+    };
+
+    // Slot 1's owner is given two blocks, and its clone of a cached block into a third is
+    // queued.
+    let owner = OwnerId(1);
+    map(
+        1,
+        Request::Attach { owner, group },
+        Completion::Attached { slot: 1 },
+    );
+    let allocate = Request::Allocate {
+        owner,
+        class: 0,
+        at: 0,
+        count: 2,
+        units: 0,
+    };
+    let allocated = Completion::Allocated {
+        runs: vec![(UNITS, 7, 1), (UNITS, 8, 1)],
+        evicted: vec![],
+    };
+    map(2, allocate, allocated);
+    let clone = Request::Clone {
+        owner,
+        class: 0,
+        at: 2,
+        key: Key([3; 32]),
+    };
+    let copy = Completion::Copy {
+        group,
+        keys: vec![Key([3; 32])],
+        from: vec![(UNITS, 3, 1)],
+        to: vec![(UNITS, 9, 1)],
+        evicted: vec![],
+    };
+    map(3, clone, copy);
+
+    // The batch takes its number, writes the changes into the slot's pooled row, starts the
+    // clone and ends it, and names no call.
+    let empty = Batch {
+        id: BatchId(1),
+        group,
+        phase: Phase::Decode,
+        generation: 0,
+        shape: BatchShape::decode(0, Variant::DecodeGreedy),
+        requests: Vec::new(),
+        columns: Columns::default(),
+        media: Vec::new(),
+        new_slots: Vec::new(),
+    };
+    let submission = executor.submit(1, empty).unwrap();
+    let Some(Outcome::Success((output, requests))) = submission.wait_timeout(LONG) else {
+        panic!("the batch with no rows is served");
+    };
+
+    assert!(output.calls.is_empty());
+    let cloned = Request::Finish {
+        copy: storage::runtime::RequestId(3),
+        ok: true,
+        after: vec![(group, 1)],
+    };
+    assert_eq!(requests, [cloned]);
+    assert_eq!(sequences.completed(), 1);
+    assert_eq!(
+        lock(&cache).host_table(0).unwrap()[..TABLE_WIDTH],
+        [7, 8, 0, 0]
+    );
 }
 
 #[test]

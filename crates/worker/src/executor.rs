@@ -58,6 +58,14 @@
 //! of a group has the same budget, so all start the same copies with the same batch and return
 //! the same `Finish`es.
 //!
+//! No copy runs outside a batch. A group whose executor holds copies not yet finished, and for
+//! which a step formed no other batch, is sent a batch with no rows (`specs/scheduler-design.md`
+//! §2.1): it takes its number, hands the runners the tables' changes and starts the copies the
+//! budget admits like any batch, and runs no forward; its runner ends the copies and returns an
+//! output with no calls. A batch whose runner fails after copies started with it reports each of
+//! them failed: once the device has passed what the batch issued, the batch's failure carries
+//! their `Finish { ok: false }`, stamped with the batch ([`Error::Copies`]).
+//!
 //! The rank counts the numbered jobs it has *launched* (the stamp a request gets when the rank
 //! applies it) and the ones it has *ended*: the last number whose job, and every earlier one,
 //! completed on the device. It states its ended sequence to the group's [`Sequences`] before the
@@ -214,12 +222,14 @@ impl Job {
         }
     }
 
-    /// Whether the job runs a runner's forwards, whose time the executor counts.
+    /// Whether the job runs a runner's forwards, whose time the executor counts: a batch with
+    /// no rows runs none.
     fn runs_forwards(&self) -> bool {
-        matches!(
-            self,
-            Self::Execute { .. } | Self::Shadow { .. } | Self::Capture | Self::Prepare(_)
-        )
+        match self {
+            Self::Execute { batch, .. } => !empty(batch),
+            Self::Shadow { .. } | Self::Capture | Self::Prepare(_) => true,
+            _ => false,
+        }
     }
 }
 
@@ -285,6 +295,15 @@ pub(crate) fn alone(batch: &Batch) -> Result<Option<u32>> {
         ))),
         None => Ok(first.rank),
     }
+}
+
+/// Whether `batch` has no rows: it advances no request, and it is no expert join, whose forward
+/// serves a peer's step. A scheduler sends one to a group whose executor holds copies not yet
+/// finished when a step formed no other batch for the group (`specs/scheduler-design.md` §2.1):
+/// it takes its number, hands the runners the tables' changes and starts the copies the copy
+/// budget admits as any batch does, and runs no forward.
+fn empty(batch: &Batch) -> bool {
+    batch.requests.is_empty() && batch.shape.variant != Variant::ExpertJoin
 }
 
 /// How many of the oldest queued copies, which move `sizes` bytes each in the order they were
@@ -451,8 +470,10 @@ impl Executor {
     }
 
     /// Submits `batch`, the group's job number `sequence`, for execution; the submission completes
-    /// with the step's output and the stamped `Finish` of each copy that ran with it. The group's
-    /// jobs reach every rank in the order of their numbers ([`Executors`]).
+    /// with the step's output and the stamped `Finish` of each copy that ran with it. When the
+    /// batch fails after copies started with it, the failure carries their `Finish { ok: false }`
+    /// ([`Error::finished`]). The group's jobs reach every rank in the order of their numbers
+    /// ([`Executors`]).
     ///
     /// # Errors
     ///
@@ -1036,7 +1057,13 @@ impl Thread {
     /// Executes `batch`, numbered `sequence` unless it is an expert join, through the runner that
     /// serves its phase: the tables' changes go to every runner first, and the queued copies the
     /// copy budget admits start with a numbered batch every rank of the group runs. Returns the
-    /// output and the stamped `Finish` of each copy that ran.
+    /// output and the stamped `Finish` of each copy that ran. A batch with no rows is no step of
+    /// a profiling session and marks none: its runner runs no forward.
+    ///
+    /// # Errors
+    ///
+    /// What fails the batch. A runner's failure after copies started with the batch carries
+    /// their `Finish { ok: false }` ([`Thread::failed`]).
     fn execute(
         &mut self,
         batch: &Batch,
@@ -1046,14 +1073,16 @@ impl Thread {
         let index = self.runner_of(batch.phase)?;
         let step = batch.id.0;
         let started = Instant::now();
+        let forwards = !empty(batch);
 
         // A session's window is made of whole steps: its collectors are armed and disarmed
         // between two steps, with nothing of the device in flight.
         let stage = batch.shape.variant.stage();
-        if self
-            .session
-            .as_mut()
-            .is_some_and(|session| session.begin(step, stage))
+        if forwards
+            && self
+                .session
+                .as_mut()
+                .is_some_and(|session| session.begin(step, stage))
         {
             self.apply_session()?;
         }
@@ -1067,31 +1096,25 @@ impl Thread {
         };
 
         // The step's range markers are launched by the graphs, around the forward itself.
-        self.runners[index].graphs().mark_step(step, stage);
-        let mut output = self.runners[index].execute(batch, &self.tables)?;
+        if forwards {
+            self.runners[index].graphs().mark_step(step, stage);
+        }
+        let mut output = match self.runners[index].execute(batch, &self.tables) {
+            Ok(output) => output,
+            Err(error) => return Err(self.failed(error, copies)),
+        };
 
-        if self
-            .session
-            .as_mut()
-            .is_some_and(|session| session.end(step))
+        if forwards
+            && self
+                .session
+                .as_mut()
+                .is_some_and(|session| session.end(step))
         {
             self.apply_session()?;
         }
 
-        // The batch ended, and the copies with it: each copy's `Finish` is applied to the
-        // tables, as every `Finish` is, and stamped with this batch, which covers it.
-        let group = self.tables.group();
-        let mut finished = Vec::with_capacity(copies.len());
-        for copy in copies {
-            let mut finish = Request::Finish {
-                copy,
-                ok: copied,
-                after: Vec::new(),
-            };
-            self.tables.apply(&finish)?;
-            add_stamp(&mut finish, group, self.launched);
-            finished.push(finish);
-        }
+        // The batch ended, and the copies with it.
+        let finished = self.finish(copies, copied)?;
 
         // The runner states the step's device and host time; the wait in the queue is the
         // executor's to state.
@@ -1115,6 +1138,60 @@ impl Thread {
             );
         }
         Ok((output, finished))
+    }
+
+    /// The `Finish` of each of `copies`, which started with the batch that just ended, `ok` when
+    /// the runner issued them and the batch was served: each is applied to the tables, as every
+    /// `Finish` is, and stamped with the last batch the rank launched, which covers it.
+    fn finish(&mut self, copies: Vec<RequestId>, ok: bool) -> Result<Vec<Request>> {
+        let group = self.tables.group();
+        let mut finished = Vec::with_capacity(copies.len());
+
+        for copy in copies {
+            let mut finish = Request::Finish {
+                copy,
+                ok,
+                after: Vec::new(),
+            };
+            self.tables.apply(&finish)?;
+            add_stamp(&mut finish, group, self.launched);
+            finished.push(finish);
+        }
+        Ok(finished)
+    }
+
+    /// The failure of a batch whose runner failed with `error` after `copies` started with it.
+    ///
+    /// The runner returns once the device has completed the copies it issued, also when it fails
+    /// ([`Runner::execute`]); once the device has also passed everything the runners issued, each
+    /// copy is reported failed: its result is unknown, and the scheduler learns it with the batch
+    /// instead of at its bound. The failure then carries their `Finish { ok: false }`, stamped
+    /// with this batch ([`Error::Copies`]). While the device's progress is unknown it carries
+    /// none: the batch stays open, the group's `completed` stays below it, and whatever later
+    /// gives the copies up is covered by a stamp no lower than the batch's.
+    fn failed(&mut self, error: Error, copies: Vec<RequestId>) -> Error {
+        if copies.is_empty() {
+            return error;
+        }
+        if let Err(unsettled) = self.settle() {
+            tracing::error!(
+                device = ?self.device,
+                %unsettled,
+                copies = copies.len(),
+                "a failed batch's device work cannot be awaited; the copies that started with it \
+                 are not reported"
+            );
+            return error;
+        }
+
+        // Applying a `Finish` that gives a copy up cannot be refused.
+        match self.finish(copies, false) {
+            Ok(finished) => Error::Copies {
+                error: Box::new(error),
+                finished,
+            },
+            Err(_) => error,
+        }
     }
 
     /// Hands every runner the tables' changes since the last batch, each change once.

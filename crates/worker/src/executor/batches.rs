@@ -150,7 +150,9 @@ impl Executors {
 
     /// Hands `batch` to every rank of its group under the group's next number: the ranks that
     /// run it run it, the others pass its number. The submission completes with the batch's
-    /// output and the `Finish` of each copy that ran with it, stamped by the group.
+    /// output and the `Finish` of each copy that ran with it, stamped by the group. A batch that
+    /// a rank of this node fails after copies started with it fails with their
+    /// `Finish { ok: false }` ([`Error::finished`]).
     ///
     /// # Errors
     ///

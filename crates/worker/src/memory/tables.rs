@@ -46,7 +46,7 @@
 //! | [`BlockTables::apply`] | 2, the part before the stamp: the entries of a `Release`, a `Detach` or a `Transfer` leave, the entry of a `Commit` becomes read-only, a given-up copy that no batch has started is dropped and its destinations are no longer awaited. The stamp itself, the sequence of the last batch launched, is the executor's |
 //! | [`BlockTables::run`], [`BlockTables::units`], [`BlockTables::entries`] | 1: the only source of a kernel's addresses |
 //! | [`BlockTables::writable`] | 4: whether a batch may write a position |
-//! | [`BlockTables::take_changes`] | 1: what the runner writes into the device block table, each change once. A run is stated for reset only while its entry is in the table, so the units of a block that left are never touched |
+//! | [`BlockTables::take_changes`] | 1: what the runner writes into the device block table, each change once. A run is stated for reset only while its entry is in the table, so the units of a block that left are never touched. 4: and only while a batch may write it, so a block a `Commit` marked before the next batch is never reset |
 //! | [`BlockTables::queued_copies`], [`BlockTables::start_copy`] | 2 and 4: a copy is started once, by the batch that takes it, and only that copy writes its destination; a copy given up before a batch takes it never runs |
 //!
 //! Obligation 3, advancing `completed`, concerns batches and is not the table's.
@@ -87,7 +87,8 @@ pub struct Change {
     pub run: Option<Run>,
     /// Whether the run's units were given by `Allocated` since the changes were last taken:
     /// the runner resets their per-unit state before a batch addresses them. Never set for a
-    /// position without an entry, nor for a block that holds content.
+    /// position without an entry, for a block that holds content, nor for an entry a batch may
+    /// not write, since a reset writes the units.
     pub reset: bool,
 }
 
@@ -229,20 +230,24 @@ impl BlockTables {
 
     /// Takes the changes since the last call, in slot, class and position order, one per
     /// position that changed: the state the position has now, whatever it passed through.
+    ///
+    /// A change asks for a reset only of an entry that `Allocated` gave since the last call and
+    /// that a batch may still write: a reset writes the units, and a `Commit` handed between the
+    /// `Allocated` and the next batch made the block read-only (obligation 4).
     pub fn take_changes(&mut self) -> Vec<Change> {
         let changed = std::mem::take(&mut self.changed);
 
         changed
             .into_iter()
             .map(|((slot, class, position), allocated)| {
-                let run = self.run(slot, class, position);
+                let entry = self.entries.get(&(slot, class, position));
 
                 Change {
                     slot,
                     class,
                     position,
-                    run,
-                    reset: allocated && run.is_some(),
+                    run: entry.map(|(run, ..)| *run),
+                    reset: allocated && entry.is_some_and(|(_, writable, _)| *writable),
                 }
             })
             .collect()
@@ -272,7 +277,9 @@ impl BlockTables {
     /// A pair that gives the table nothing (`Done`, `Refused`, `Full`, `Committed`, `Evicted`
     /// and the like, a `Load` or a `Store` answered at once, the answer of a `Finish` whose
     /// copies fill no position here) changes nothing. The answer of a `Finish` for a copy that
-    /// was given up or whose owner left since is such a pair. The caller hands a pair only
+    /// was given up or whose owner left since is such a pair. A `Copy` of a `Load` or a `Clone`
+    /// whose owner left the group before it arrived queues the copies, which must run and end,
+    /// and fills nothing: the owner is not held again. The caller hands a pair only
     /// before any `Release`, `Detach`, `Commit` or `Transfer` that names its entries is
     /// applied.
     ///
@@ -729,9 +736,13 @@ impl BlockTables {
     }
 
     /// Queues the copies of request `id`: for each of `keys` keys, from the run of `from` to
-    /// the run of `to`, with the bytes they move over the group. `destination` is the owner, the slot its entries are kept under, the
-    /// class, the first position and whether the request is a clone, for a request whose copies
-    /// fill positions.
+    /// the run of `to`, with the bytes they move over the group. `destination` is the owner,
+    /// the slot its entries are kept under, the class, the first position and whether the
+    /// request is a clone, for a request whose copies fill positions.
+    ///
+    /// The copy of an owner the table no longer holds, whose `Detach` or `Transfer` was applied
+    /// before its `Copy` arrived, is queued all the same, since it must run and end with its
+    /// `Finish`, and fills nothing: the owner gets no slot and no destination is awaited.
     fn queue(
         &mut self,
         id: RequestId,
@@ -749,6 +760,10 @@ impl BlockTables {
                 to.len()
             )));
         }
+
+        // A copy's group is its owner's, so an owner this table does not hold has left the
+        // group: the slot the scheduler names for it is no longer the owner's to fill.
+        let destination = destination.filter(|(owner, ..)| self.slots.contains_key(owner));
         if let Some((owner, slot, ..)) = destination {
             self.check_held(owner, slot)?;
         }
@@ -785,8 +800,7 @@ impl BlockTables {
 
         self.queued
             .push_back((BlockCopy { request: id, runs }, bytes));
-        if let Some((owner, slot, ..)) = destination {
-            self.slots.entry(owner).or_insert((slot, false));
+        if let Some((owner, ..)) = destination {
             self.destinations.insert(id, (owner, false, entries));
         }
         Ok(())
@@ -1399,6 +1413,81 @@ mod tests {
             ]
         );
         assert_eq!(tables.take_changes(), []);
+    }
+
+    #[test]
+    fn an_allocated_entry_a_commit_marked_before_the_next_batch_is_not_reset() {
+        let mut tables = tables();
+        attach(&mut tables, 1, 2);
+        allocate(&mut tables, 1, 0, 0, &[(DEVICE, 7, 1), (DEVICE, 8, 1)]).unwrap();
+
+        // The first block is committed before a batch takes the changes: it is read-only, and a
+        // reset would write its units. The second is still the owner's to write.
+        let commit = Request::Commit {
+            owner: OwnerId(1),
+            class: 0,
+            at: 0,
+            key: Key([1; 32]),
+            tokens: 64,
+            after: vec![],
+        };
+        tables.apply(&commit).unwrap();
+
+        let change = |position, unit, reset| Change {
+            slot: 2,
+            class: 0,
+            position,
+            run: Some((DEVICE, unit, 1)),
+            reset,
+        };
+        assert_eq!(
+            tables.take_changes(),
+            [change(0, 7, false), change(1, 8, true)]
+        );
+    }
+
+    #[test]
+    fn a_copy_mapped_after_its_owner_left_runs_and_fills_nothing() {
+        let mut tables = tables();
+        attach(&mut tables, 1, 1);
+        tables.apply(&detach(1)).unwrap();
+
+        // The `Copy` of the owner's load arrives after its detach: the copy is queued, since it
+        // must run and end with its `Finish`, and the owner is not held again.
+        let request = Request::Load {
+            owner: OwnerId(1),
+            class: 0,
+            at: 0,
+            keys: keys(1),
+        };
+        let completion = Completion::Copy {
+            group: GROUP,
+            keys: keys(1),
+            from: vec![(HOST, 0, 1)],
+            to: vec![(DEVICE, 7, 1)],
+            evicted: vec![],
+        };
+        tables.map(1, RequestId(5), &request, &completion).unwrap();
+        assert_eq!(tables.slot(OwnerId(1)), None);
+
+        // The slot's next owner gets nothing from the copy, which runs with the next batch,
+        // whatever answers its `Finish`.
+        attach(&mut tables, 2, 1);
+        assert_eq!(
+            tables.start_copy(),
+            Some(BlockCopy {
+                request: RequestId(5),
+                runs: vec![((HOST, 0, 1), (DEVICE, 7, 1))]
+            })
+        );
+        tables.apply(&finish(5, true)).unwrap();
+        tables
+            .map(1, RequestId(6), &finish(5, true), &Completion::Loaded)
+            .unwrap();
+
+        assert_eq!(entries(&tables, 1, 0), []);
+        assert_eq!(tables.slot(OwnerId(1)), None);
+        assert_eq!(tables.slot(OwnerId(2)), Some(1));
     }
 
     #[test]

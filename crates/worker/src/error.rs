@@ -69,6 +69,17 @@ pub enum Error {
         /// The failure taken while it ran.
         error: Box<Error>,
     },
+    /// The failure of a batch that copies had started with, and what the executor returns for
+    /// them: their result is unknown, so each is reported failed. It reports and classifies as
+    /// the batch's failure.
+    #[error("{error}")]
+    Copies {
+        /// The batch's failure.
+        error: Box<Error>,
+        /// A `Finish { ok: false }` per copy that started with the batch, stamped with the
+        /// batch's group and number, returned once the device has passed what the batch issued.
+        finished: Vec<storage::runtime::Request>,
+    },
     /// A failure every party of one operation observes: the result of a read,
     /// the state of a pool or an export that several owners consult. It
     /// reports and classifies as the failure it shares.
@@ -91,6 +102,19 @@ impl Error {
         Self::InFlight {
             activity: activity.into(),
             error: Box::new(error),
+        }
+    }
+
+    /// The `Finish { ok: false }` of each copy that started with a failed batch, which the
+    /// batch's failure carries ([`Error::Copies`]), also inside the statement of the work in
+    /// flight or a failure a submission shares: what the scheduler submits for those copies.
+    /// Empty for any other failure.
+    pub fn finished(&self) -> &[storage::runtime::Request] {
+        match self {
+            Self::Copies { finished, .. } => finished,
+            Self::InFlight { error, .. } => error.finished(),
+            Self::Shared(shared) => shared.downcast_ref::<Error>().map_or(&[], Error::finished),
+            _ => &[],
         }
     }
 
@@ -222,7 +246,7 @@ pub fn report(error: &dyn std::error::Error) -> String {
 }
 
 /// The CUDA failure an error is: the worker's own, an operator launch's, a model layer's, or one
-/// a shared failure or the work in flight carries.
+/// a shared failure, the work in flight or a batch's failure with its copies carries.
 fn driver_failure(error: &Error) -> Option<&platform::Error> {
     match error {
         Error::Cuda(failure) => Some(failure),
@@ -238,7 +262,7 @@ fn driver_failure(error: &Error) -> Option<&platform::Error> {
             ),
         ) => ops_driver_failure(failure),
         Error::Shared(shared) => shared.downcast_ref::<Error>().and_then(driver_failure),
-        Error::InFlight { error, .. } => driver_failure(error),
+        Error::InFlight { error, .. } | Error::Copies { error, .. } => driver_failure(error),
         _ => None,
     }
 }
@@ -270,7 +294,7 @@ fn kind_code(error: &Error) -> ErrorCode {
         Error::Shared(shared) => shared
             .downcast_ref::<Error>()
             .map_or(ErrorCode::ComputeError, kind_code),
-        Error::InFlight { error, .. } => kind_code(error),
+        Error::InFlight { error, .. } | Error::Copies { error, .. } => kind_code(error),
         Error::Invalid(_) => ErrorCode::InvalidDescriptor,
         Error::Resource(_) | Error::ReadBackpressure { .. } => ErrorCode::ResourceError,
         Error::Unsupported(_) | Error::Interface(_) => ErrorCode::UnsupportedSetup,
