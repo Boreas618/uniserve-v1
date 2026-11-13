@@ -2,10 +2,11 @@
 
 from __future__ import annotations
 
-import contextlib
 import io
 import json
 import os
+import re
+from concurrent.futures import ThreadPoolExecutor
 from itertools import zip_longest
 from pathlib import Path
 
@@ -21,6 +22,7 @@ from tests.python.e2e.http_helpers import (
     find_free_port,
     granted_devices,
     host_asset,
+    log_tail,
     require_uniserve_binary,
     second_host,
     server_process,
@@ -145,7 +147,7 @@ EIGHT_RANK_PARALLEL_CONFIGS = {
 # nothing about the layout while making every such layout unrunnable there.
 EIGHT_RANK_DENOISER_RANKS = [2, 3, 0, 1, 6, 7, 4, 5]
 
-# A layout needing more devices than this host has runs on two hosts when
+# A layout needing more devices than this host has is placed on two hosts when
 # UNISERVE_H3_FOLLOWER names the second (an ssh destination whose checkout
 # path holds the same build) and UNISERVE_H3_LEADER_ADDRESS the address of
 # this host that the second reaches. The second host's daemon
@@ -154,6 +156,17 @@ EIGHT_RANK_DENOISER_RANKS = [2, 3, 0, 1, 6, 7, 4, 5]
 # placed on its devices.
 FOLLOWER = os.environ.get("UNISERVE_H3_FOLLOWER")
 LEADER_ADDRESS = os.environ.get("UNISERVE_H3_LEADER_ADDRESS")
+
+# A product block is reached only by the ranks of the main process that holds
+# it, so a deployment whose products would pass between the main processes of
+# two hosts is refused when its ranks start, with an error naming each such
+# product, the worker group that writes it and the worker group that reads it,
+# with the hosts of each (docs/minimax_h3/minimax_h3.md, Two hosts).
+CROSSING_REFUSAL = "would pass between the main processes of two hosts"
+CROSSING = re.compile(
+    r"(\w+), written by worker group (\S+) \(hosts ([^)]*)\) "
+    r"and read by worker group (\S+) \(hosts ([^)]*)\)"
+)
 
 
 def _eight_rank_worker_config(parallel_kind: str) -> dict:
@@ -174,6 +187,34 @@ def _eight_rank_worker_config(parallel_kind: str) -> dict:
         },
         "audio_decoder": {"ranks": [0]},
     }
+
+
+def _assert_refused_across_hosts(
+    command: list[str],
+    base_url: str,
+    log: Path,
+    environment: dict[str, str],
+    address: str,
+) -> None:
+    """The leader of `command`, joined by the second host's daemon at
+    `address`, refuses to start the deployment and exits, naming at least one
+    product with the worker group that writes it and the one that reads it,
+    which together lie on both hosts.
+    """  # noqa: D205
+    assert FOLLOWER is not None
+    with second_host(FOLLOWER, log.with_name("h3-follower.log"), address):
+        with pytest.raises(RuntimeError, match="server exited early"):
+            with server_process(
+                command, base_url, log, timeout_s=1800, env=environment
+            ):
+                pass
+    text = re.sub(r"\x1b\[[0-9;]*m", "", log.read_text())
+    assert CROSSING_REFUSAL in text, log_tail(log)
+    crossings = CROSSING.findall(text)
+    assert crossings, log_tail(log)
+    for product, writer, written_on, reader, read_on in crossings:
+        hosts = {host.strip() for host in f"{written_on},{read_on}".split(",")}
+        assert {"rank-0", "rank-1"} <= hosts, (product, writer, reader, hosts)
 
 
 @pytest.mark.parametrize(
@@ -388,23 +429,23 @@ def test_component_bindings_release_cancelled_requests(
             leased[: min(visible_devices, local_devices)]
         )
     }
-    follower = (
-        second_host(FOLLOWER, tmp_path / "h3-follower.log", address)
-        if two_hosts
-        else contextlib.nullcontext()
-    )
-    with (
-        follower,
-        server_process(
-            command,
-            base_url,
-            # Startup prepares and captures every admitted duration at both
-            # text capacities; two-way tensor or pipeline layouts took 9 to
-            # 11 minutes to become ready on 4 x GB200.
-            log,
-            timeout_s=1800,
-            env=environment,
-        ),
+    if two_hosts:
+        # Every eight-rank layout places its worker groups on all eight
+        # devices, four on each host, so the products its groups write and
+        # read would pass between the two hosts' main processes.
+        _assert_refused_across_hosts(
+            command, base_url, log, environment, address
+        )
+        return
+    with server_process(
+        command,
+        base_url,
+        # Startup prepares and captures every admitted duration at both text
+        # capacities; two-way tensor or pipeline layouts took 9 to 11 minutes
+        # to become ready on 4 x GB200.
+        log,
+        timeout_s=1800,
+        env=environment,
     ):
         # Warm both decode geometries before exercising cancellation. Three
         # disconnects exceed the two provisioned slots and require their reuse.
@@ -442,6 +483,99 @@ def test_component_bindings_release_cancelled_requests(
                 response.content, declared_mime=response.headers["content-type"]
             )
             assert media.frame_count == 124
+            assert (media.audio_channels, media.audio_sample_rate) == (2, 32000)
+
+
+def test_replicas_on_two_hosts_serve_complete_media(tmp_path: Path) -> None:
+    """`fasth3-ulysses4x2-two-host.toml` serves across two hosts of four GPUs.
+
+    Each Ulysses4 replica, with its text encoder, decoders, codecs, muxer and
+    media reader, lies on one host, so no product passes between the hosts'
+    main processes, and the server places each request's stages on the
+    replicas of one host (docs/minimax_h3/minimax_h3.md, Two hosts). Twice as
+    many concurrent requests as one replica's slots reach both hosts'
+    replicas, and each answer is complete media.
+    """
+    if FOLLOWER is None or LEADER_ADDRESS is None:
+        pytest.skip(
+            "the two-host replicas need UNISERVE_H3_FOLLOWER and "
+            "UNISERVE_H3_LEADER_ADDRESS"
+        )
+    model = str(host_asset("UNISERVE_H3_MODEL", H3_CHECKPOINT))
+    deployment = (
+        Path(__file__).resolve().parents[3]
+        / "configs"
+        / "minimax_h3"
+        / "fasth3-ulysses4x2-two-host.toml"
+    )
+    port = find_free_port()
+    base_url = f"http://127.0.0.1:{port}"
+    address = f"{LEADER_ADDRESS}:{find_free_port()}"
+    # The validated throughput setting of 8 x GB200 over two hosts, bounded to
+    # one five-second duration and one text capacity so that startup captures
+    # little.
+    max_running_requests = 4
+    command = [
+        str(require_uniserve_binary()),
+        "serve",
+        model,
+        "--served-model-name",
+        "FastH3",
+        "--host",
+        "127.0.0.1",
+        "--port",
+        str(port),
+        *engine_selection(),
+        "--worker-groups",
+        str(deployment),
+        "--max-running-requests",
+        str(max_running_requests),
+        "--max-model-len",
+        "1024",
+        "--set",
+        "video_config.max_seconds=5",
+        "--set",
+        "video_config.text_capacities=1024",
+        "--host-identity",
+        "rank-0",
+        "--nnodes",
+        "2",
+        "--dist-init-addr",
+        address,
+    ]
+    payloads = [
+        t2va_request(
+            "FastH3",
+            f"A river at dawn, seen from bank {index}.",
+            124,
+            1000 + index,
+        )
+        for index in range(2 * max_running_requests)
+    ]
+    environment = {"CUDA_VISIBLE_DEVICES": granted_devices(4)}
+
+    def generate(payload: dict) -> tuple[bytes, str]:
+        response = httpx.post(
+            f"{base_url}/v1/videos/sync", json=payload, timeout=1200
+        )
+        response.raise_for_status()
+        return response.content, response.headers["content-type"]
+
+    with (
+        second_host(FOLLOWER, tmp_path / "h3-follower.log", address),
+        server_process(
+            command,
+            base_url,
+            tmp_path / "h3-replicas.log",
+            timeout_s=1800,
+            env=environment,
+        ),
+        ThreadPoolExecutor(max_workers=len(payloads)) as pool,
+    ):
+        for content, content_type in pool.map(generate, payloads):
+            media = inspect_video_bytes(content, declared_mime=content_type)
+            assert media.frame_count == 124
+            assert (media.width, media.height) == (1344, 768)
             assert (media.audio_channels, media.audio_sample_rate) == (2, 32000)
 
 

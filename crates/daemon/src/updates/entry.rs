@@ -405,10 +405,10 @@ impl Leader {
             let Some(client) = replica.hold().client() else {
                 continue;
             };
-            let ranks = service::lock(&replica.config)
-                .engine_config()
-                .ok()
-                .and_then(|config| crate::engine::control::world_hosts(&config).ok())
+            let config = service::lock(&replica.config).engine_config().ok();
+            let ranks = config
+                .as_ref()
+                .and_then(|config| crate::engine::control::world_hosts(config).ok())
                 .unwrap_or_default();
             let first_of = |host: &str| {
                 ranks
@@ -425,7 +425,10 @@ impl Leader {
             for process in processes {
                 let rank = first_of(&process.host);
                 let head = head.unwrap_or(process.engine);
-                nodes.push(Node::new(process.host, rank, process.engine, head));
+                let scopes = config.as_ref().map_or_else(Vec::new, |config| {
+                    crate::engine::control::host_scopes(config, &process.host)
+                });
+                nodes.push(Node::new(process.host, rank, process.engine, head, scopes));
             }
         }
         nodes

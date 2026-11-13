@@ -1421,6 +1421,101 @@ fn a_epoch_kept_as_its_weights_leaves_its_successor_the_rest() {
     );
 }
 
+/// The bytes reserved on `GPU` over every quota: none when nothing is
+/// reserved there and the GPU has no quota.
+fn usage_on_gpu(client: &mut Client) -> u64 {
+    let quotas = client.usage(vec![GPU]).unwrap().quotas;
+    quotas.iter().map(::storage::Quota::usage).sum()
+}
+
+/// A previous epoch's processes the head stopped end without withdrawing what
+/// they reserved, as lost processes do. Once the epoch keeps its weights
+/// alone, nothing of theirs stays reserved, whether a process ended before the
+/// request or after it; a rollback's relaunch reserves again, and its
+/// reservation is kept for its own relaunch.
+#[test]
+fn a_epoch_kept_as_its_weights_keeps_nothing_its_stopped_processes_reserved() {
+    let server = Running::start();
+    let mut head = head(&server.socket);
+    let scopes = vec![scope("text", 0), scope("text", 1)];
+    let claim = head.claim(1, scopes.clone(), Vec::new()).unwrap();
+    head.publish(vec![1]).unwrap();
+    let mut stopped = epoch_worker(&server.socket, scope("text", 0), 1, claim);
+    stopped
+        .reserve(
+            GPU,
+            1000,
+            Some(700),
+            vec![(Item::Process, 300), (Item::GraphPool, 200)],
+        )
+        .unwrap();
+    let mut later = epoch_worker(&server.socket, scope("text", 1), 1, claim);
+    later
+        .reserve(GPU, 1000, Some(700), vec![(Item::Process, 100)])
+        .unwrap();
+    head.claim(2, scopes, Vec::new()).unwrap();
+
+    // One process is stopped before the request: its 500 bytes are kept as a
+    // lost process's until the epoch keeps its weights alone.
+    drop(stopped);
+    head.keep_weights(vec![1], Vec::new()).unwrap();
+    await_usage(&mut head, 100);
+
+    // The other is stopped after it.
+    drop(later);
+    for _ in 0..200 {
+        if usage_on_gpu(&mut head) == 0 {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert_eq!(usage_on_gpu(&mut head), 0);
+
+    // A rollback starts the epoch again: its process reserves, and a loss of
+    // it keeps the reservation for its relaunch, once the server has seen the
+    // connection end.
+    let mut relaunch = epoch_worker(&server.socket, scope("text", 0), 1, claim);
+    relaunch
+        .reserve(GPU, 1000, Some(700), vec![(Item::Process, 250)])
+        .unwrap();
+    drop(relaunch);
+    std::thread::sleep(Duration::from_millis(500));
+    assert_eq!(usage_on_gpu(&mut head), 250);
+}
+
+/// A process of an epoch that a commit retired while the process was still
+/// connected, as a head's stop and its claim race, keeps nothing reserved once
+/// its connection ends: no relaunch of a retired epoch takes it over.
+#[test]
+fn a_retired_epoch_s_process_keeps_nothing_reserved_when_it_ends() {
+    let server = Running::start();
+    let mut head = head(&server.socket);
+    let claim = head.claim(1, vec![scope("text", 0)], Vec::new()).unwrap();
+    head.publish(vec![1]).unwrap();
+    let mut stopped = epoch_worker(&server.socket, scope("text", 0), 1, claim);
+    stopped
+        .reserve(
+            GPU,
+            1000,
+            Some(700),
+            vec![(Item::Process, 300), (Item::GraphPool, 200)],
+        )
+        .unwrap();
+    head.claim(2, vec![scope("text", 0)], Vec::new()).unwrap();
+    head.publish(vec![2]).unwrap();
+    head.claim(2, vec![scope("text", 0)], vec![1]).unwrap();
+    assert_eq!(usage_on_gpu(&mut head), 500);
+
+    drop(stopped);
+    for _ in 0..200 {
+        if usage_on_gpu(&mut head) == 0 {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert_eq!(usage_on_gpu(&mut head), 0);
+}
+
 /// A head moves an epoch's weights between its GPUs and host storage only
 /// through the Transfer Server: without one, an offload of weights is
 /// refused and moves nothing, while an epoch with no weights to move (none

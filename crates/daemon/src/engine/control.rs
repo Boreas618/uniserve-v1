@@ -1440,6 +1440,37 @@ pub(crate) struct HostRanks {
     pub(crate) devices: Vec<u32>,
 }
 
+/// The Storage Server scopes of `config`'s ranks on `host`: each rank's worker
+/// group and its number in the deployment, its place among the ranks of the
+/// deployment's groups in their order
+/// ([`proto::config::WorkerGroupConfig::first_ranks`]), as the engine numbers
+/// its ranks. A rank's workers retain their tensors under this scope, and a
+/// claim of the epoch states the scopes it places on the node: one that leaves
+/// a scope out ends the epoch's retention of it.
+pub(crate) fn host_scopes(
+    config: &proto::config::EngineConfig,
+    host: &str,
+) -> Vec<proto::process::Scope> {
+    let groups = &config.parallel.worker_groups;
+    let firsts = proto::config::WorkerGroupConfig::first_ranks(groups);
+    let mut scopes = Vec::new();
+    for (first, group) in firsts.into_iter().zip(groups) {
+        for (position, rank) in group.ranks.iter().enumerate() {
+            if rank.host != host {
+                continue;
+            }
+            if let Ok(number) = u32::try_from(first + position) {
+                scopes.push(proto::process::Scope {
+                    group: group.id.0.clone(),
+                    rank: number,
+                });
+            }
+        }
+    }
+    scopes.sort_unstable_by_key(|scope| scope.rank);
+    scopes
+}
+
 /// The hosts of the deployment's worker groups, in the order of the first rank each holds, each
 /// with that rank and the devices of its ranks: one engine per host serves an epoch
 /// (`docs/architecture.md`, The channel), the engine host's first, holding rank 0 and the

@@ -436,6 +436,28 @@ impl Epochs {
             .map(|(epoch, record)| (*epoch, record.clone()))
     }
 
+    /// Records `adopted`, a process a hot restart's successor took over: the
+    /// row its daemon's service already lists for the same launch (group, rank
+    /// and launch generation) takes the epoch, build and state it serves under
+    /// and keeps the pid the service read; a row is added when none lists it.
+    pub fn adopt_process(&self, adopted: ManagedProcess) {
+        let mut processes = self.processes();
+        let listed = processes.iter_mut().find(|row| {
+            row.group == adopted.group
+                && row.rank == adopted.rank
+                && row.generation == adopted.generation
+        });
+        match listed {
+            Some(row) => {
+                row.epoch = adopted.epoch;
+                row.build = adopted.build;
+                row.state = adopted.state;
+            }
+            None => processes.push(adopted),
+        }
+        self.set_processes(processes);
+    }
+
     /// Replaces the node's process table with `processes`.
     pub fn set_processes(&self, processes: Vec<ManagedProcess>) {
         match self.supervised.get() {
@@ -930,6 +952,37 @@ mod tests {
         assert_eq!(reported["processes"][0]["pid"], serde_json::json!(42));
         assert_eq!(reported["processes"][0]["generation"], serde_json::json!(4));
         assert_eq!(reported["processes"][0]["state"], "serving");
+    }
+
+    /// A process a hot restart's successor adopted is one row: the row the
+    /// successor's service lists for it takes the epoch it serves, with the
+    /// pid the service read.
+    #[test]
+    fn an_adopted_process_is_one_row_of_the_table() {
+        let epochs = Epochs::new();
+        let table = std::sync::Arc::new(Mutex::new(vec![ManagedProcess {
+            group: "engine".to_owned(),
+            rank: 0,
+            pid: Some(42),
+            epoch: None,
+            build: "uniserve".to_owned(),
+            generation: 1,
+            state: ProcessState::Serving,
+        }]));
+        epochs.attach_processes(std::sync::Arc::clone(&table));
+
+        epochs.adopt_process(ManagedProcess {
+            group: "engine".to_owned(),
+            rank: 0,
+            pid: None,
+            epoch: Some(3),
+            build: "engine".to_owned(),
+            generation: 1,
+            state: ProcessState::Serving,
+        });
+        let processes = epochs.processes();
+        assert_eq!(processes.len(), 1, "{processes:?}");
+        assert_eq!((processes[0].pid, processes[0].epoch), (Some(42), Some(3)));
     }
 
     /// The policy's declared limits are the launch's own bounds: the token

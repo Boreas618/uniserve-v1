@@ -836,6 +836,7 @@ def test_a_change_of_model_files_loads_the_targets_weights(
                 lambda: _weights_of(base_url) == {(epoch,)},
                 60,
                 "the previous epoch's weights outlived the commit",
+                context=lambda: f": weights held by {_weights_of(base_url)}",
             )
             streaming.join()
             # The committed epoch answers with the target's weights. Its
@@ -851,6 +852,7 @@ def test_a_change_of_model_files_loads_the_targets_weights(
             lambda: _weights_of(base_url) == {(previous,)},
             60,
             "the target's weights outlived the rollback",
+            context=lambda: f": weights held by {_weights_of(base_url)}",
         )
 
 

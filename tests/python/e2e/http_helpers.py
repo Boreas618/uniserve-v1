@@ -162,11 +162,15 @@ def build_server_socket() -> Path:
 def engine_revision() -> str:
     """An assignment that selects a new revision of the tree's engine.
 
-    The revision is installed now at the module's Build Server. It runs the
-    same code as the serving one under another revision, which is a change
-    of the epoch's engine and of nothing else.
+    The revision is installed and built now at the module's Build Server. It
+    runs the same code as the serving one under another revision, which is a
+    change of the epoch's engine and of nothing else, and an update to it
+    builds nothing while it prepares: a request started after this still
+    streams when the switch comes.
     """
-    revision = install_engine(build_server_socket())
+    socket = build_server_socket()
+    revision = install_engine(socket)
+    engine_executable(socket, revision)
     return f"worker_config.engine_revision={revision}"
 
 

@@ -38,6 +38,7 @@ impl Deployment {
             join_timeout: TIMEOUT,
             devices: || Ok(Vec::new()),
             build_server: build_server::command::Settings::default(),
+            storage_server: Vec::new(),
         };
 
         // The leader's start returns once every member joined, and a
@@ -146,6 +147,7 @@ fn a_node_joins_a_running_deployment_and_the_next_engine_runs_processes_there() 
         join_timeout: TIMEOUT,
         devices: || Ok(Vec::new()),
         build_server: build_server::command::Settings::default(),
+        storage_server: Vec::new(),
     };
 
     // A leader of one node that names its address serves at once.

@@ -1196,6 +1196,24 @@ fn route(
             ..Reply::default()
         });
     }
+    // A claim that states no Storage Server arguments takes the deployment's
+    // (its Mooncake connector), here or on the member it goes to: the server a
+    // node starts for the claim then runs the deployment's connector.
+    let stated;
+    let request = match &request.kind {
+        Some(request::Kind::Claim(claim))
+            if claim.server_arguments.is_empty() && !local.claims.server_arguments().is_empty() =>
+        {
+            let mut claim = claim.clone();
+            claim.server_arguments = local.claims.server_arguments().to_vec();
+            stated = Request {
+                id: request.id,
+                kind: Some(request::Kind::Claim(claim)),
+            };
+            &stated
+        }
+        _ => request,
+    };
     let target = match &request.kind {
         Some(request::Kind::Spawn(spawn)) => Some(spawn.host.as_str()),
         Some(request::Kind::Reserve(reserve)) => Some(reserve.host.as_str()),

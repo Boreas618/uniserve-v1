@@ -975,7 +975,10 @@ pub enum Request {
     /// `cache_keys` holding completed rollback copies. Their retention of
     /// every other exclusive tensor ends. A tensor no other epoch retains
     /// is released, while segments mapped by the successor remain retained
-    /// by that successor. Call after the predecessor's processes exit.
+    /// by that successor. What their processes reserved on the GPUs' quotas
+    /// ends, whether a process ended in order or was stopped, and nothing is
+    /// kept for a process of theirs until one of them reserves again (a
+    /// rollback's relaunch). Call after the predecessor's processes exit.
     /// Responded with `Retained`.
     KeepWeights {
         epochs: Vec<u64>,

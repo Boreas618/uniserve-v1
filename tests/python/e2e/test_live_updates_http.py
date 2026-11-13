@@ -2125,14 +2125,15 @@ def test_an_operator_rollback_returns_to_the_previous_epoch_under_a_request(
         rolled = admin(base_url, "config/rollback", {"reason": "the check"})
         assert rolled.status_code == 200, rolled.text
         _assert_whole(streaming, streamed)
+        # The previous epoch serves again once its processes stopped for the
+        # trial started again; the target serves until then.
+        update = wait_for_phase(base_url, "rolled_back", timeout_s=600)
+        assert update["failure"]["reason"] == "the check", update
         after = _chat(base_url, name, RECOVERY_PROMPT, tokens=32)
         assert (
             after["choices"][0]["message"]["content"]
             == answer["choices"][0]["message"]["content"]
         )
-        update = update_report(base_url)
-        assert update["phase"] == "rolled_back", update
-        assert update["failure"]["reason"] == "the check", update
 
 
 def test_a_regression_of_the_epoch_on_trial_rolls_it_back(

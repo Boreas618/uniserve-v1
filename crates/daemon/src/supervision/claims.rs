@@ -38,6 +38,10 @@ pub(crate) struct ClaimHolder {
     remote_pages: bool,
     /// This node's address other nodes reach, which names that listener.
     address: Option<std::net::IpAddr>,
+    /// The arguments of `storage-server serve` that the deployment's
+    /// configuration states (its Mooncake connector, `kv_cache_config.mooncake`),
+    /// which a claim that states none of its own takes ([`Self::server_arguments`]).
+    server_arguments: Vec<String>,
     /// Each deployment's claim, with the `host:port` other nodes reach the
     /// server at (empty when they cannot), as its engines are told.
     claims: HashMap<String, (storage::ClaimClient, String)>,
@@ -50,6 +54,8 @@ pub(crate) struct ClaimHolder {
 pub(crate) struct Handoff {
     executable: std::path::PathBuf,
     remote_pages: bool,
+    #[serde(default)]
+    server_arguments: Vec<String>,
     claims: Vec<(storage::ClaimHandoff, String)>,
 }
 
@@ -58,13 +64,22 @@ impl ClaimHolder {
         executable: std::path::PathBuf,
         remote_pages: bool,
         address: Option<std::net::IpAddr>,
+        server_arguments: Vec<String>,
     ) -> Self {
         Self {
             executable,
             remote_pages,
             address,
+            server_arguments,
             claims: HashMap::new(),
         }
+    }
+
+    /// The arguments of `storage-server serve` the deployment's configuration
+    /// states, which the leader gives every claim that states none, so that the
+    /// Storage Server a node starts for it runs the deployment's connector.
+    pub(crate) fn server_arguments(&self) -> &[String] {
+        &self.server_arguments
     }
 
     /// Claims `claim`'s deployment for its epoch at this node's Storage
@@ -319,6 +334,7 @@ impl ClaimHolder {
         let handoff = Handoff {
             executable: self.executable.clone(),
             remote_pages: self.remote_pages,
+            server_arguments: self.server_arguments.clone(),
             claims,
         };
         Ok((handoff, descriptors))
@@ -331,7 +347,12 @@ impl ClaimHolder {
         handoff: Handoff,
         descriptors: Vec<OwnedFd>,
     ) -> storage::Result<Self> {
-        let mut holder = Self::new(handoff.executable, handoff.remote_pages, address);
+        let mut holder = Self::new(
+            handoff.executable,
+            handoff.remote_pages,
+            address,
+            handoff.server_arguments,
+        );
         for ((claim, tcp), descriptor) in handoff.claims.into_iter().zip(descriptors) {
             let deployment = claim.deployment.clone();
             let client = storage::ClaimClient::resume(claim, descriptor)?;

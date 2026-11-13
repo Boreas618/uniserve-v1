@@ -1403,6 +1403,9 @@ impl Server {
         for copy in released {
             self.remove_tensor(&copy);
         }
+        // The head stopped these epochs' processes: what they reserved ends
+        // with them, however they ended.
+        self.quotas.keep_weights(deployment, epochs);
         tracing::info!(
             deployment,
             ?epochs,
@@ -2077,8 +2080,14 @@ impl Server {
             return;
         };
         // What the process reserved ends with it: the storage it reserved is its
-        // own, which the driver frees as the process ends.
-        self.quotas.disconnect(id);
+        // own, which the driver frees as the process ends. A worker's that is
+        // lost is kept for its relaunch while its epoch is claimed.
+        let deployments = &self.deployments;
+        self.quotas.disconnect(id, |deployment, epoch| {
+            deployments
+                .get(deployment)
+                .is_some_and(|entry| entry.epochs.contains(&epoch))
+        });
         match &client.role {
             Some(Role::Connector) if self.kv_storage.client == Some(id) => self.connector_gone(),
             Some(Role::Transfer) if self.transfers.client == Some(id) => {

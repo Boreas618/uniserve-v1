@@ -157,16 +157,19 @@ def test_fence_probes_report_steps_and_switch_in_place(served: str):
 
     off = _apply(served, "profiling_config.fence_probes=false")
     assert off["change"] == "in_place", off
-    # The steps whose probes ran before the switch are read with the next
-    # results; none is counted after them, while the workers report the
-    # forwards they run.
-    with _Load(served, streams=1):
-        _forwards_reported(served)
-        settled = steps()
-        _forwards_reported(served)
-        assert steps() == settled
-
-    on = _apply(served, "profiling_config.fence_probes=true")
+    try:
+        # The steps whose probes ran before the switch are read with the next
+        # results; none is counted after them, while the workers report the
+        # forwards they run.
+        with _Load(served, streams=1):
+            _forwards_reported(served)
+            settled = steps()
+            _forwards_reported(served)
+            assert steps() == settled
+    finally:
+        # The module's server goes on to the sessions of the tests after this
+        # one with its probes as it was started, whatever this one found.
+        on = _apply(served, "profiling_config.fence_probes=true")
     assert on["change"] == "in_place", on
     with _Load(served, streams=1):
         wait_until(

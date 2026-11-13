@@ -76,6 +76,11 @@ pub struct DaemonOptions {
     /// This node's Build Server, which the engines the node starts resolve their
     /// modules from (`build_config`).
     pub build_server: build_server::command::Settings,
+    /// The arguments of `storage-server serve` that the deployment's
+    /// configuration states: its Mooncake connector (`kv_cache_config.mooncake`),
+    /// none without one. The leader gives them to every claim of the
+    /// deployment, so the Storage Server a node starts for it runs the connector.
+    pub storage_server: Vec<String>,
 }
 
 /// Reads the ordinals of this host's idle devices from the driver.
@@ -529,7 +534,12 @@ fn local(
         supervisor: Supervisor::new(options.host.clone())
             .context("creating the daemon's lifeline")?
             .with_build_server(options.build_server.clone()),
-        claims: ClaimHolder::new(options.executable.clone(), remote_pages, address),
+        claims: ClaimHolder::new(
+            options.executable.clone(),
+            remote_pages,
+            address,
+            options.storage_server.clone(),
+        ),
         address,
         devices: options.devices,
     })
@@ -699,6 +709,7 @@ mod tests {
             join_timeout: Duration::from_secs(5),
             devices: || Ok(Vec::new()),
             build_server: build_server::command::Settings::default(),
+            storage_server: Vec::new(),
         })
         .unwrap();
         let address = daemon.address().unwrap().to_owned();

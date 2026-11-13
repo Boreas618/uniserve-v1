@@ -895,4 +895,39 @@ mod tests {
             assert!(!refused(token_option, &Chat), "{token_option}");
         }
     }
+
+    /// A deployment with a Mooncake connector starts its Storage Servers with
+    /// the connector's settings on their command line; one without states none.
+    #[test]
+    fn a_mooncake_connector_is_stated_to_the_storage_server() {
+        let (plain, _) = resolved(&["m"]).unwrap();
+        assert!(
+            plain
+                .daemon_options(|| Ok(Vec::new()))
+                .storage_server
+                .is_empty()
+        );
+
+        let (config, _) = resolved(&[
+            "m",
+            "--set",
+            "kv_cache_config.mooncake.master=\"10.0.0.1:50051\"",
+            "--set",
+            "kv_cache_config.mooncake.global_segment_gib=4",
+            "--set",
+            "kv_cache_config.mooncake.library=\"/opt/mooncake/libmooncake_store.so\"",
+        ])
+        .unwrap();
+        let arguments = config.daemon_options(|| Ok(Vec::new())).storage_server;
+        let value = |flag: &str| {
+            let at = arguments.iter().position(|argument| argument == flag);
+            at.and_then(|at| arguments.get(at + 1)).map(String::as_str)
+        };
+        assert_eq!(value("--mooncake-master"), Some("10.0.0.1:50051"));
+        assert_eq!(value("--mooncake-segment-bytes"), Some("4294967296"));
+        assert_eq!(
+            value("--mooncake-library"),
+            Some("/opt/mooncake/libmooncake_store.so")
+        );
+    }
 }

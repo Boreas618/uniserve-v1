@@ -28,6 +28,7 @@ pub(crate) fn single_node(host: &str, socket: PathBuf) -> DaemonOptions {
         join_timeout: TIMEOUT,
         devices: || Ok(Vec::new()),
         build_server: build_server::command::Settings::default(),
+        storage_server: Vec::new(),
     }
 }
 

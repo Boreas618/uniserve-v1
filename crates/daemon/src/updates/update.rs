@@ -98,19 +98,31 @@ pub(crate) struct Node {
     /// The generation of modules it numbered: what a serving engine
     /// prepared, or what a target holds.
     generation: Option<u64>,
+    /// The Storage Server scopes of its epoch's ranks on its host
+    /// ([`crate::engine::control::host_scopes`]): the scopes its workers
+    /// retain their tensors under, which every claim of the epoch there states.
+    scopes: Vec<process::Scope>,
 }
 
 impl Node {
     /// The engine of launch generation `launch` on `host`, whose first rank
     /// is group rank `rank`, of the world whose scheduler node's main
-    /// process is of launch generation `head`.
-    pub(crate) fn new(host: String, rank: u32, launch: u64, head: u64) -> Self {
+    /// process is of launch generation `head`, and whose epoch's ranks on
+    /// `host` have the storage scopes `scopes`.
+    pub(crate) fn new(
+        host: String,
+        rank: u32,
+        launch: u64,
+        head: u64,
+        scopes: Vec<process::Scope>,
+    ) -> Self {
         Self {
             host,
             rank,
             launch,
             head,
             generation: None,
+            scopes,
         }
     }
 }
@@ -486,7 +498,9 @@ impl Update {
     /// Claims `epoch`'s storage on every host either epoch runs on, retiring
     /// `retire`'s epochs: a claim retires storage only on the node it is made
     /// on, and a host only one epoch uses keeps or releases its storage all
-    /// the same. Each host's scopes are those of `keeping`'s engines there.
+    /// the same. Each host's scopes are those of `keeping`'s engines there:
+    /// the scopes their workers retain tensors under, since a claim ends its
+    /// epoch's retention of every scope it does not state.
     fn claim_everywhere(
         &self,
         processes: &mut Processes,
@@ -501,12 +515,10 @@ impl Update {
         for host in hosts {
             let mut scopes: Vec<process::Scope> = Vec::new();
             for node in keeping.iter().filter(|node| node.host == host) {
-                let scope = process::Scope {
-                    group: self.group.clone(),
-                    rank: node.rank,
-                };
-                if !scopes.contains(&scope) {
-                    scopes.push(scope);
+                for scope in &node.scopes {
+                    if !scopes.contains(scope) {
+                        scopes.push(scope.clone());
+                    }
                 }
             }
             processes.claim(host, epoch, &scopes, retire)?;
@@ -581,6 +593,7 @@ impl Update {
                         .world
                         .as_ref()
                         .map_or(launch.engine, |world| world.scheduler),
+                    crate::engine::control::host_scopes(&launch.engine_config, &launch.host),
                 ));
             }
         }

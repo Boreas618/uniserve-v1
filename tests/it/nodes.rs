@@ -52,6 +52,7 @@ fn a_follower_joins_without_a_model() {
         join_timeout: Duration::from_secs(10),
         devices: || Ok(Vec::new()),
         build_server: build_server::command::Settings::default(),
+        storage_server: Vec::new(),
     })
     .unwrap();
     assert!(leader.address().is_some());

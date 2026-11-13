@@ -23,8 +23,11 @@
 //!   kept for the process that replaces it, which takes each item over as
 //!   it reserves it, so a successor epoch cannot take a lost rank's storage
 //!   before its relaunch does. A kept reservation ends with its epoch's
-//!   retirement or the deployment. The Transfer Server's reservations end
-//!   with its connection.
+//!   retirement or the deployment, or when its epoch keeps its weights alone
+//!   ([`Request::KeepWeights`]): the head stopped that epoch's processes, and
+//!   nothing replaces them until a rollback starts them again, which reserves
+//!   afresh, so what they reserved ends with them however they ended. The
+//!   Transfer Server's reservations end with its connection.
 //!
 //! The limit of a deployment's quota is `⌊total × fraction⌋` of the whole
 //! GPU, which its workers state with their reservations; while two epochs
@@ -36,6 +39,7 @@
 //! refuses the context and the work that needed it.
 //!
 //! [`Request::Quota`]: ::storage::protocol::Request::Quota
+//! [`Request::KeepWeights`]: ::storage::protocol::Request::KeepWeights
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -79,6 +83,11 @@ pub(crate) struct Quotas {
     /// lost, per GPU and item, until a process of the scope and epoch
     /// reserves the item again or the epoch retires.
     lost: BTreeMap<(Scope, u64), ItemBytes>,
+    /// The `(deployment, epoch)`s that keep their weights alone: no
+    /// reservation is kept for their processes, which the head stopped,
+    /// until one of their processes reserves again.
+    #[serde(default)]
+    weights_only: BTreeSet<(String, u64)>,
 }
 
 /// A reservation's identity within a quota, under which its bytes add up.
@@ -104,6 +113,16 @@ impl Quotas {
         if let (Reserver::Worker { scope, epoch }, Some(limit)) = (&reserver, limit) {
             self.limits
                 .insert((scope.deployment.clone(), gpu, *epoch), limit);
+        }
+
+        // A process of an epoch kept as its weights that reserves storage runs
+        // again (a rollback started the epoch again): what it reserves is kept
+        // for its relaunch, as any serving process's is.
+        if let Reserver::Worker { scope, epoch } = &reserver
+            && items.iter().any(|&(_, bytes)| bytes > 0)
+        {
+            self.weights_only
+                .remove(&(scope.deployment.clone(), *epoch));
         }
 
         // A process of a scope and epoch takes each item it reserves over
@@ -137,12 +156,23 @@ impl Quotas {
     /// The connection of `client` ends: its process is gone. A worker's
     /// remaining reservations that no other process of its scope and epoch
     /// holds (one that ended in order released them first) are kept for the
-    /// process that replaces it; the Transfer Server's end.
-    pub(crate) fn disconnect(&mut self, client: ClientId) {
+    /// process that replaces it, unless its epoch keeps its weights alone or
+    /// is no longer claimed (`claimed` says whether its deployment still holds
+    /// it: a commit or a rollback may retire the epoch of a process the head
+    /// stopped before the server sees its connection end); the Transfer
+    /// Server's end.
+    pub(crate) fn disconnect(&mut self, client: ClientId, claimed: impl Fn(&str, u64) -> bool) {
         let Some((Reserver::Worker { scope, epoch }, items)) = self.reservations.remove(&client)
         else {
             return;
         };
+        if !claimed(&scope.deployment, epoch)
+            || self
+                .weights_only
+                .contains(&(scope.deployment.clone(), epoch))
+        {
+            return;
+        }
 
         let served: BTreeSet<([u8; 16], Item)> = self
             .reservations
@@ -171,6 +201,17 @@ impl Quotas {
         }
     }
 
+    /// The epochs `epochs` of `deployment` keep their weights alone: the
+    /// reservations kept for their processes end, and none is kept for a
+    /// process of theirs that ends from now on, until one of them reserves
+    /// again. Their limits stay, which a rollback's relaunch states again.
+    pub(crate) fn keep_weights(&mut self, deployment: &str, epochs: &[u64]) {
+        self.lost
+            .retain(|(scope, epoch), _| scope.deployment != deployment || !epochs.contains(epoch));
+        self.weights_only
+            .extend(epochs.iter().map(|&epoch| (deployment.to_owned(), epoch)));
+    }
+
     /// The limits the epochs of `retired` stated, and the reservations kept
     /// for their lost processes, end with their storage.
     pub(crate) fn retire(&mut self, deployment: &str, retired: &BTreeSet<u64>) {
@@ -178,6 +219,8 @@ impl Quotas {
             .retain(|(of, _, epoch), _| of != deployment || !retired.contains(epoch));
         self.lost
             .retain(|(scope, epoch), _| scope.deployment != deployment || !retired.contains(epoch));
+        self.weights_only
+            .retain(|(of, epoch)| of != deployment || !retired.contains(epoch));
     }
 
     /// Every limit and kept reservation of `deployment` ends: it is no
@@ -186,6 +229,7 @@ impl Quotas {
         self.limits.retain(|(of, _, _), _| of != deployment);
         self.lost
             .retain(|(scope, _), _| scope.deployment != deployment);
+        self.weights_only.retain(|(of, _)| of != deployment);
     }
 
     /// The quotas of the GPUs `gpus` admits and the deployments `deployment`

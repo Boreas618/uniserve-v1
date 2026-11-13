@@ -900,7 +900,33 @@ impl ServerArgs {
             join_timeout: crate::supervision::JOIN_TIMEOUT,
             devices,
             build_server: self.build_config.clone(),
+            storage_server: self.storage_server_arguments(),
         }
+    }
+
+    /// The arguments of `storage-server serve` the deployment's configuration
+    /// states: its Mooncake connector (`kv_cache_config.mooncake`), whose
+    /// library is `MOONCAKE_STORE_LIBRARY` when the configuration names none;
+    /// none without a connector.
+    fn storage_server_arguments(&self) -> Vec<String> {
+        let Some(mooncake) = &self.kv_cache_config.mooncake else {
+            return Vec::new();
+        };
+        let library = mooncake.library.clone().or_else(|| {
+            std::env::var_os("MOONCAKE_STORE_LIBRARY")
+                .filter(|library| !library.is_empty())
+                .map(PathBuf::from)
+        });
+        storage::connector::Settings {
+            master: mooncake.master.clone(),
+            metadata: mooncake.metadata_server.clone(),
+            protocol: mooncake.protocol.clone(),
+            device: mooncake.device.clone(),
+            hostname: None,
+            segment_bytes: mooncake.global_segment_gib << 30,
+            library,
+        }
+        .arguments()
     }
 }
 

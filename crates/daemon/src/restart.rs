@@ -879,9 +879,7 @@ async fn prepared_successor(
     {
         let (record, process) = adopted_epoch(served_epoch, handoff.engine, &options, modules)?;
         epoch_records.record(served_epoch, record);
-        let mut processes = epoch_records.processes();
-        processes.push(process);
-        epoch_records.set_processes(processes);
+        epoch_records.adopt_process(process);
     }
     if frontend_paused {
         // The predecessor was gated when it handed over, so the successor's
@@ -922,7 +920,12 @@ async fn prepared_successor(
 
     *service::lock(&leader.replicas.adapters) = adapters;
     let retire = Arc::new(AtomicBool::new(false));
-    let admin = Admin::resume(shutdown.clone(), Arc::clone(&retire), admin);
+    let admin = Admin::resume(
+        shutdown.clone(),
+        Arc::clone(&retire),
+        admin,
+        Arc::clone(&epoch_records),
+    );
     admin.record(
         "deployment",
         format!("serving {} after a hot restart", leader.served_model_name()),

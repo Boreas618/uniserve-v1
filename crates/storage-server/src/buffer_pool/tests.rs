@@ -814,6 +814,49 @@ fn a_store_and_a_load_move_a_key_between_the_device_and_the_host() {
     assert_eq!(fixture.ask(none), Some(Completion::Loaded));
 }
 
+/// A store copies a key from a region of the group's own: an epoch of another layout holds the
+/// key in its own region of the same device, valid in the same memory, which the group's workers
+/// do not map, so the store leaves the key to the epoch whose region holds it.
+#[test]
+fn a_store_reads_no_block_of_another_layout_s_region() {
+    let mut fixture = Fixture::new();
+    let unit = fixture.cached(1, 7);
+    let other = fixture.pool.open_region(
+        "units of another layout",
+        Tier::Device,
+        0,
+        (64, 64),
+        1,
+        4,
+        5,
+    );
+    let regions = vec![vec![other], Vec::new(), vec![5, 6], vec![5]];
+    fixture.pool.open(
+        2,
+        2,
+        false,
+        classes(),
+        vec![(GroupId(0), group(0, 2, regions, 1))],
+    );
+
+    let store = |group| Request::Store {
+        group,
+        keys: vec![key(7)],
+        tier: Tier::Host,
+    };
+    let across = fixture.submit((2, 0), store(GroupId(0)));
+    assert_eq!(
+        fixture.answer(across),
+        Some(Completion::Stored { keys: Vec::new() })
+    );
+
+    let same = fixture.submit(QUEUE, store(PREFILL));
+    let Some(Completion::Copy { from, .. }) = fixture.answer(same) else {
+        panic!("no copy")
+    };
+    assert_eq!(from, vec![(UNITS, unit, 1)]);
+}
+
 #[test]
 fn a_key_that_gained_a_copy_before_the_finish_keeps_it() {
     let mut fixture = Fixture::new();

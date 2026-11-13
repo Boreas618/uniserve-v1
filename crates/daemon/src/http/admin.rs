@@ -126,8 +126,9 @@ fn now() -> f64 {
 
 impl Admin {
     /// An admin whose shutdown cancels `shutdown` and, when asked to, sets
-    /// `retire`.
-    ///
+    /// `retire`, over epoch records of its own: a test's, which no leader
+    /// keeps.
+    #[cfg(test)]
     pub(crate) fn new(shutdown: CancellationToken, retire: Arc<AtomicBool>) -> Arc<Self> {
         Self::with_epochs(shutdown, retire, Arc::new(crate::epoch::Epochs::new()))
     }
@@ -174,13 +175,17 @@ impl Admin {
     }
 
     /// An admin that goes on with the event log and the operations' record
-    /// of the daemon a hot restart replaced; as [`Admin::new`] otherwise.
+    /// of the daemon a hot restart replaced, over `epochs`, the records the
+    /// successor's leader keeps: the successor's `GET /admin/config` reports
+    /// them and the processes its daemon supervises, as [`Admin::with_epochs`]
+    /// states.
     pub(crate) fn resume(
         shutdown: CancellationToken,
         retire: Arc<AtomicBool>,
         handoff: AdminHandoff,
+        epochs: Arc<crate::epoch::Epochs>,
     ) -> Arc<Self> {
-        let admin = Self::new(shutdown, retire);
+        let admin = Self::with_epochs(shutdown, retire, epochs);
         *service::lock(&admin.events) = handoff.events.into_iter().collect();
         admin
             .next_event
@@ -1245,6 +1250,31 @@ mod tests {
         let (events, _, gap) = admin.events_after(0, Duration::ZERO).await;
         assert!(gap);
         assert_eq!(events.len(), EVENT_CAPACITY);
+    }
+
+    /// A hot restart's successor reports the epochs and processes of the
+    /// records its leader keeps, not records of its own.
+    #[test]
+    fn a_resumed_admin_reports_its_leader_s_records() {
+        let epochs = Arc::new(crate::epoch::Epochs::new());
+        epochs.set_processes(vec![crate::epoch::ManagedProcess {
+            group: crate::engine::control::ENGINE_GROUP.to_owned(),
+            rank: 0,
+            pid: Some(42),
+            epoch: Some(1),
+            build: String::new(),
+            generation: 1,
+            state: crate::epoch::ProcessState::Serving,
+        }]);
+        let predecessor = Admin::new(CancellationToken::new(), Arc::new(AtomicBool::new(false)));
+        let admin = Admin::resume(
+            CancellationToken::new(),
+            Arc::new(AtomicBool::new(false)),
+            predecessor.hand_over(),
+            Arc::clone(&epochs),
+        );
+        let report = admin.epochs().report();
+        assert_eq!(report["processes"][0]["pid"], serde_json::json!(42));
     }
 
     #[tokio::test]

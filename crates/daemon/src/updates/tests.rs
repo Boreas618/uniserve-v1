@@ -96,10 +96,16 @@ impl Deployment {
 
     /// The serving engines a generation update moves: one, or two.
     fn nodes(&mut self, engines: usize) -> Vec<Node> {
-        let mut nodes = vec![Node::new(HOST.to_owned(), 0, PREVIOUS, PREVIOUS)];
+        let mut nodes = vec![Node::new(
+            HOST.to_owned(),
+            0,
+            PREVIOUS,
+            PREVIOUS,
+            scopes(0..1),
+        )];
         if engines == 2 {
             self.engines.serve(SECOND);
-            nodes.push(Node::new(HOST.to_owned(), 1, SECOND, SECOND));
+            nodes.push(Node::new(HOST.to_owned(), 1, SECOND, SECOND, scopes(1..2)));
         }
         nodes
     }
@@ -123,7 +129,13 @@ impl Deployment {
     fn epoch(&self, number: u64, keeps: PreviousEpoch, deadline: Option<Instant>) -> Update {
         let mut switch = self.switch(vec![(target_launch(HOST, 0, SPAWNED), Vec::new())]);
         switch.keeps = keeps;
-        let nodes = vec![Node::new(HOST.to_owned(), 0, PREVIOUS, PREVIOUS)];
+        let nodes = vec![Node::new(
+            HOST.to_owned(),
+            0,
+            PREVIOUS,
+            PREVIOUS,
+            scopes(0..1),
+        )];
         self.epoch_over(number, nodes, switch, deadline)
     }
 
@@ -215,6 +227,16 @@ impl Deployment {
     fn record(&self, epoch: u64) -> EpochRecord {
         self.epochs.get(epoch).expect("the epoch's record")
     }
+}
+
+/// The storage scopes of the deployment's ranks `ranks` of its group `model`.
+fn scopes(ranks: std::ops::Range<u32>) -> Vec<process::Scope> {
+    ranks
+        .map(|rank| process::Scope {
+            group: "model".to_owned(),
+            rank,
+        })
+        .collect()
 }
 
 /// The launch file of the target engine `launch` on `host`, whose first rank
@@ -767,9 +789,19 @@ fn a_release_grows_the_scheduler_node_of_each_target_world_with_an_engine_on_its
 fn an_epoch_update_covers_every_node_of_both_epochs() {
     let mut deployment = Deployment::new(Refusals::default());
     deployment.engines.serve(SECOND);
+    // Both epochs place their group's ranks 0 and 1 on HOST, 2 and 3 on OTHER.
+    let group = &mut deployment.target.engine.parallel.worker_groups[0];
+    group.ranks = [HOST, HOST, OTHER, OTHER]
+        .iter()
+        .enumerate()
+        .map(|(rank, host)| proto::config::WorkerRank {
+            host: (*host).to_owned(),
+            device: format!("cuda:{}", rank % 2),
+        })
+        .collect();
     let nodes = vec![
-        Node::new(HOST.to_owned(), 0, PREVIOUS, PREVIOUS),
-        Node::new(OTHER.to_owned(), 2, SECOND, PREVIOUS),
+        Node::new(HOST.to_owned(), 0, PREVIOUS, PREVIOUS, scopes(0..2)),
+        Node::new(OTHER.to_owned(), 2, SECOND, PREVIOUS, scopes(2..4)),
     ];
     let switch = deployment.switch(vec![
         (target_launch(HOST, 0, SPAWNED), vec![1, 2]),
@@ -821,14 +853,23 @@ fn an_epoch_update_covers_every_node_of_both_epochs() {
         deployment.engines.stops(),
         vec![Some(PREVIOUS), Some(SECOND)]
     );
+    // The commit's claims state the scopes the target's workers retain
+    // their tensors under, so the target keeps them as the serving epoch
+    // retires.
     let retired: Vec<_> = deployment
         .engines
         .claims()
         .iter()
         .filter(|claim| claim.retire == [SERVING])
-        .map(|claim| claim.host.clone())
+        .map(|claim| (claim.host.clone(), claim.scopes.clone()))
         .collect();
-    assert_eq!(retired, [HOST, OTHER]);
+    assert_eq!(
+        retired,
+        [
+            (HOST.to_owned(), scopes(0..2)),
+            (OTHER.to_owned(), scopes(2..4))
+        ]
+    );
 }
 
 /// The two epochs need not have as many replicas: two serving replicas move

@@ -329,18 +329,31 @@ impl BufferPool {
         let maker = self.made_by(client);
 
         // Each named key that has a device copy valid in the group and
-        // visible to its epoch, with what its copy writes: a new host block
-        // when the key has no host copy, or the host parts of the group its
-        // host copy lacks. A host copy that holds every part of the group
-        // needs nothing; one that another copy fills, or that another epoch
-        // may use while this one is on trial (R8), is not filled.
+        // visible to its epoch, in a region of the group's class, with what
+        // its copy writes: a new host block when the key has no host copy, or
+        // the host parts of the group its host copy lacks. The group's workers
+        // run the copy and map only their own regions: an epoch of another
+        // layout keeps the same key in its own region on the same device,
+        // valid in the same memory, which they cannot read. A host copy that
+        // holds every part of the group needs nothing; one that another copy
+        // fills, or that another epoch may use while this one is on trial
+        // (R8), is not filled.
         let mut sources = Vec::new();
         for key in keys {
             let Some(entry) = self.cache.get(key) else {
                 continue;
             };
+            let Some(own) = self
+                .groups
+                .get(&(client, group))
+                .and_then(|found| found.regions.get(usize::from(entry.class)))
+            else {
+                continue;
+            };
             let device = entry.device.iter().find(|(block, maker)| {
-                block.valid.get() & memory != 0 && self.visible(*maker, client)
+                own.contains(&block.region())
+                    && block.valid.get() & memory != 0
+                    && self.visible(*maker, client)
             });
             let Some((block, _)) = device else { continue };
             let parts = self.parts(client, group, entry.class);
