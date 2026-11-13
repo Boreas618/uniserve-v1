@@ -21,7 +21,7 @@ formulas = ["FreeUnheld", "Exclusive", "WriteIsolation", "ReadIsolation", "CopyI
 rules = ["R1", "R2", "R3", "R7", "R9", "R10"]
 assumptions = ["A1", "A2", "A3", "A4", "A5", "A7"]
 violated_by = "A `Release` that takes effect while the batch that writes the block is in flight (R3 left out): `WriteIsolation`."
-status = "checked"
+status = "proved"
 
 [[property]]
 id = "P2"
@@ -36,7 +36,7 @@ formulas = ["KeyStable", "PinsCached", "OneKey", "SharedUnwritten", "CopiesReadS
 rules = ["R3", "R4", "R5", "R6"]
 assumptions = ["A1", "A2", "A3", "A4", "A5", "A6"]
 violated_by = "A second block committed under a cached key replaces the first, which an owner still pins (R4 left out): `KeyStable`."
-status = "checked"
+status = "proved"
 
 [[property]]
 id = "P3"
@@ -50,7 +50,7 @@ formulas = ["NoLeak", "Quiescent", "OneRegion"]
 rules = ["R2", "R10"]
 assumptions = []
 violated_by = "An owner that is attached is attached again and its first slot row is neither free nor held (R1 left out): `NoLeak`."
-status = "checked"
+status = "proved"
 
 [[property]]
 id = "P4"
@@ -77,7 +77,7 @@ formulas = ["TrialVisibility"]
 rules = ["R8"]
 assumptions = ["A6"]
 violated_by = "An owner of the serving epoch pins a block the epoch on trial committed (R8 left out): `TrialVisibility`."
-status = "checked"
+status = "proved"
 
 [[property]]
 id = "P6"
@@ -91,7 +91,7 @@ formulas = ["Exactness"]
 rules = ["R1"]
 assumptions = []
 violated_by = "An `Evict` is answered as done while the block stays cached (hazard H11): `Exactness`."
-status = "checked"
+status = "proved"
 
 [[property]]
 id = "P7"
@@ -105,4 +105,4 @@ formulas = ["CapacityIdentity"]
 rules = ["R2", "R10"]
 assumptions = []
 violated_by = "An evicted block's unit that the free list misses (hazard H12): one unit of the region is in none of the four states."
-status = "checked"
+status = "proved"

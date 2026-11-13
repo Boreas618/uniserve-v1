@@ -69,6 +69,19 @@ TypeInv ==
          /\ b.cr \subseteq AllUnits /\ b.cw \subseteq AllUnits
     /\ \A h \in handoff :
          h.g \in Groups /\ h.o \in Owners /\ h.p \in Rows /\ h.u \in AllUnits
+    \* A copy, a task and a stamped request are records of their fields alone, so a
+    \* record changed with EXCEPT keeps the others.
+    /\ \A c \in copies :
+         c = [id |-> c.id, kind |-> c.kind, o |-> c.o, p |-> c.p, k |-> c.k, g |-> c.g,
+              read |-> c.read, write |-> c.write, fill |-> c.fill, seq |-> c.seq,
+              done |-> c.done, stopped |-> c.stopped]
+    /\ \A t \in tasks :
+         t = [kind |-> t.kind, k |-> t.k, h |-> t.h, src |-> t.src, ok |-> t.ok,
+              expired |-> t.expired, o |-> t.o, to |-> t.to, slot |-> t.slot, held |-> t.held,
+              units |-> t.units, writes |-> t.writes]
+    /\ \A r \in requests :
+         r = [kind |-> r.kind, e |-> r.e, o |-> r.o, ps |-> r.ps, p |-> r.p, k |-> r.k,
+              c |-> r.c, ok |-> r.ok, to |-> r.to, after |-> r.after, by |-> r.by, sg |-> r.sg]
 
 -----------------------------------------------------------------------------
 (* The buffer pool: whom each unit is allocated to.                        *)
@@ -166,6 +179,8 @@ CopiesOk ==
         /\ ~c.fill =>
              /\ c.kind \in {"clone", "load", "store", "save"}
              /\ c.kind \in {"clone", "load"} => c.write \in Units /\ alloc[c.write] = c.o
+             \* Nor does a task hold the new block a clone or a load writes.
+             /\ c.kind \in {"clone", "load"} => \A t \in tasks : c.write \notin t.units
              /\ c.kind \in {"store", "save"} => c.write \in HostUnits /\ alloc[c.write] = "copy"
              /\ \A o \in Owners, p \in Positions : table[o][p].u # c.write
              /\ \A x \in copies : x.write = c.write => x = c

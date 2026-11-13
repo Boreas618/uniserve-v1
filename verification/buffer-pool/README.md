@@ -11,6 +11,10 @@ The model of `specs/buffer-pool.md` and what checks it. Nothing here needs a dev
 | `KvInductive.tla` | `IndInv`, the inductive invariant under the design (every rule in force, no hazard) |
 | `KvProof.tla` | The TLAPS proof, under the assumptions `Design` and `Sizes` |
 | `KvProofP7.tla` | `IndInv => P7`, under `Design`, `Sizes` and `Finite` |
+| `KvFrame.tla` | Typing and frame lemmas the step proofs share: what an action that leaves a part of the state alone keeps of each conjunct of `IndInv` |
+| `KvStep1.tla` to `KvStep10.tla` | The inductive step for each group of actions (`Next1` to `Next10` of `MC_Apalache`): `IndInv /\ NextN => IndInv'` |
+| `KvStep.tla` | The step for all of `[Next]_vars`, `Spec => []IndInv` and `Spec => []Safety` |
+| `KvSafeP7.tla` | `Spec => []P7` from `Spec => []IndInv` and `IndInv => P7` |
 | `MC_*.tla`, `MC_*.cfg` | The configurations TLC searches; `MC_Apalache.tla` fixes constants and generates the states for Apalache |
 | `addresses.smt2` | The address arithmetic as thirteen goals for z3 |
 | `predictions.md` | Every run with the prediction written before it and its outcome |
@@ -34,7 +38,8 @@ verification/buffer-pool/agreement.sh                     # L1; about 25 minutes
 verification/buffer-pool/agreement_steps.sh               # L1 step by step, core; about 4 minutes
 verification/buffer-pool/replay.sh TRACE_DIR              # a run's trace: its replay, and its states against the model
 verification/buffer-pool/mutations.py                     # L4; about 5 minutes, edits the crate in place and restores it
-tlapm --threads 24 --stretch 6 KvProof.tla                # the proof, in this directory
+tlapm --threads 48 --stretch 6 KvProof.tla                # the proof, in this directory: then KvFrame,
+                                                          # KvStep1..KvStep10, KvStep, KvProofP7, KvSafeP7 (about 2 hours)
 apalache-mc check --init=Init --inv=IndInv --length=0 --cinit=ConstInit MC_Apalache.tla
 apalache-mc check --init=IndInit --inv=Safety --length=0 --cinit=ConstInit MC_Apalache.tla
 apalache-mc check --init=IndInit --inv=IndInv --length=1 --cinit=ConstInit \
@@ -46,10 +51,11 @@ apalache-mc check --init=IndInit --inv=IndInv --length=1 --cinit=ConstInit \
 Terms. Checked: no violation in a complete search of a stated configuration. Proved: safety of the design model, under the stated assumptions. Not proved: liveness; that the implementation refines the model. A run that times out or stops at a bound is INCONCLUSIVE.
 
 - **Checked (TLC).** P1, P2, P3, P5, P6 and P7 hold in the eleven configurations of `suite.sh`; P4 holds in `MC_Finality`. P7 is violated by the hazard H12 and by leaving out R2 (the part `validation`). Each rule R1 to R10 left out, and each hazard H1 to H13 but H6 and H13's safety side, violates the property `suite.sh` states for it; H6 and H13 violate P4. `IndInv` is an invariant of every configuration.
-- **Proved (TLAPS), under `Design` and `Sizes`.** `Init => IndInv` and `IndInv => Safety` (164 obligations); with `Finite` as well, `IndInv => P7` (135 obligations).
+- **Proved (TLAPS), under `Design` and `Sizes`.** `Spec => []Safety`: `Init => IndInv` and `IndInv => Safety` (`KvProof`, 164 obligations), the step `IndInv /\ [Next]_vars => IndInv'` group by group (`KvFrame` and `KvStep1` to `KvStep10`, 9,743 obligations) and its assembly by PTL (`KvStep`, 117); with `Finite` as well, `IndInv => P7` (`KvProofP7`, 135) and `Spec => []P7` (`KvSafeP7`). Every obligation proved, none omitted (`predictions.md` entry 42).
 - **Checked (Apalache), for the constants of `MC_Apalache` and collections of at most three elements.** `Init => IndInv`; `IndInv => Safety`.
 - **Proved (z3).** The thirteen goals of `addresses.smt2`, under A8.
-- **Not established.** That `IndInv` is inductive: Apalache has given counterexamples to induction from states no behaviour reaches, each answered by strengthening `IndInv` (`predictions.md`, entries 28 to 34); the step `IndInv /\ [Next]_vars => IndInv'` is being proved group by group (`KvStep*.tla`) and is not proved yet. So `Spec => []Safety` and `Spec => []P7` are not proved.
+- **How `IndInv` was found.** Apalache and TLAPS gave counterexamples to induction from states no behaviour reaches, each answered by strengthening `IndInv` with a clause TLC then checks on every configuration (`predictions.md`, entries 28 to 34, 36, 41).
+- **Not established.** Liveness (P4 is checked, not proved), and that the implementation refines the model (below).
 
 ## The implementation against the model
 
