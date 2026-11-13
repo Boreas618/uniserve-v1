@@ -44,16 +44,30 @@ impl Running {
     /// A server that runs the Transfer Server `transfer` names for its
     /// socket.
     pub(crate) fn with_transfer(transfer: impl FnOnce(&Path) -> Option<Launch>) -> Self {
-        Self::serving(0, transfer)
+        Self::serving(0, None, transfer)
+    }
+
+    /// A server whose buffer pools stop a transfer between worker groups
+    /// and a put to the remote store after `deadlines`, running the
+    /// Transfer Server `transfer` names for its socket.
+    pub(crate) fn with_deadlines(
+        deadlines: (Duration, Duration),
+        transfer: impl FnOnce(&Path) -> Option<Launch>,
+    ) -> Self {
+        Self::serving(0, Some(deadlines), transfer)
     }
 
     /// A server that leaves `host_reserve` bytes of the host's available
     /// storage to other processes.
     fn reserving(host_reserve: u64) -> Self {
-        Self::serving(host_reserve, |_| None)
+        Self::serving(host_reserve, None, |_| None)
     }
 
-    fn serving(host_reserve: u64, transfer: impl FnOnce(&Path) -> Option<Launch>) -> Self {
+    fn serving(
+        host_reserve: u64,
+        deadlines: Option<(Duration, Duration)>,
+        transfer: impl FnOnce(&Path) -> Option<Launch>,
+    ) -> Self {
         let directory = tempfile::tempdir().unwrap();
         let socket = directory.path().join("storage.sock");
         let transfer = transfer(&socket);
@@ -73,6 +87,9 @@ impl Running {
             let _lock = lock;
             // Pools of four 16-byte pages.
             let mut server = Server::new(listener, 64, host_reserve, None, transfer).unwrap();
+            if let Some((transfer, put)) = deadlines {
+                server.set_deadlines(transfer, put);
+            }
             server.listen_tcp(tcp).unwrap();
             server
                 .run(reader.as_fd(), &|| stopped.load(Ordering::Acquire))

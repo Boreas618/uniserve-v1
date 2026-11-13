@@ -83,6 +83,7 @@ pub(super) fn bench(ring_bytes: usize) -> Bench {
         reserved: 1,
         units,
         limit: units,
+        segments: Vec::new(),
     };
     let group = |id: GroupId, kv: u8| runtime::Group {
         id,
@@ -107,11 +108,13 @@ pub(super) fn bench(ring_bytes: usize) -> Bench {
         ],
         classes: vec![class(1), class(0)],
         trajectory: PRODUCT,
+        peers: Vec::new(),
         groups: vec![group(A, 0), group(B, 1)],
         schedulers: vec![vec![A, B]],
     };
     let opened = runtime::Opened {
         regions: vec![(4, 64), (5, 64), (6, 64), (7, 16)],
+        segments: Vec::new(),
         registers: vec![runtime::Registers {
             completed: vec![0, 1],
             capacity: vec![(4, 2), (5, 5), (6, 8), (7, 11)],

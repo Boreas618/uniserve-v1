@@ -27,8 +27,8 @@ use crate::error::{Error, Result};
 use crate::protocol::{
     Claim, ClientMessage, Event, Hello, HostCopy, Item, Key, Link, Listing, Location, Mode,
     PeerPool, Priority, Quota, Region, RegionPart, Registration, Request, Response, Role, Scope,
-    ServerMessage, Span, StorageRecord, TaskStatus, TensorRecord, Tensors, Throttle, UnitRun,
-    Usage, VERSION, Welcome,
+    Segment, ServerMessage, Span, StorageRecord, TaskStatus, TensorRecord, Tensors, Throttle,
+    UnitRun, Usage, VERSION, Welcome,
 };
 use crate::runtime::{Open, Opened};
 use crate::transport::Connection;
@@ -67,6 +67,17 @@ impl Client {
     /// a response, so a host that stopped responding fails the caller's task
     /// instead of holding it.
     pub fn connect_peer(address: &str, timeout: Duration) -> Result<Self> {
+        Self::connect_remote(address, Role::Peer, timeout)
+    }
+
+    /// Connect to the server of another host at `address` (`host:port`,
+    /// its `Endpoint`) as `role`, as [`Self::connect_peer`] does: connecting
+    /// and every blocking call fail once `timeout` passes without a
+    /// response. A Storage Server reaches another host's this way for its
+    /// buffer pools' tasks: as a [`Role::Peer`] to hold host copies it
+    /// reads, as a [`Role::Head`] of the deployment to submit a transfer
+    /// into a rank of that host.
+    pub fn connect_remote(address: &str, role: Role, timeout: Duration) -> Result<Self> {
         let mut refused = None;
         for candidate in address.to_socket_addrs()? {
             match std::net::TcpStream::connect_timeout(&candidate, timeout) {
@@ -74,7 +85,7 @@ impl Client {
                     stream.set_nodelay(true)?;
                     stream.set_read_timeout(Some(timeout))?;
                     stream.set_write_timeout(Some(timeout))?;
-                    return Self::open(Connection::new(stream), Role::Peer);
+                    return Self::open(Connection::new(stream), role);
                 }
                 Err(error) => refused = Some(error),
             }
@@ -615,6 +626,61 @@ impl Client {
         match self.request(&request, &[])?.0 {
             Response::Placed => Ok(()),
             other => Err(unexpected("place", &other)),
+        }
+    }
+
+    /// See [`Request::PlaceRemote`]: where the part of the units of the
+    /// device region `region` lies for rank `rank` of the device memory
+    /// `memory`, a rank of the host whose Storage Server listens at
+    /// `endpoint`.
+    pub fn place_remote(
+        &mut self,
+        region: String,
+        memory: String,
+        rank: u32,
+        endpoint: String,
+        runs: Vec<UnitRun>,
+    ) -> Result<()> {
+        let request = Request::PlaceRemote {
+            region,
+            memory,
+            rank,
+            endpoint,
+            runs,
+        };
+        match self.request(&request, &[])?.0 {
+            Response::Placed => Ok(()),
+            other => Err(unexpected("place remote", &other)),
+        }
+    }
+
+    /// See [`Request::Grant`]: the ranks created `segment` of the device
+    /// region `region`, `units` units from `first`.
+    pub fn grant(
+        &mut self,
+        region: String,
+        segment: Segment,
+        first: u32,
+        units: u32,
+    ) -> Result<()> {
+        let request = Request::Grant {
+            region,
+            segment,
+            first,
+            units,
+        };
+        match self.request(&request, &[])?.0 {
+            Response::Granted => Ok(()),
+            other => Err(unexpected("grant", &other)),
+        }
+    }
+
+    /// See [`Request::Withdraw`]: the ranks are to release `segment` of the
+    /// memory space of the device region `region`.
+    pub fn withdraw(&mut self, region: String, segment: Segment) -> Result<()> {
+        match self.request(&Request::Withdraw { region, segment }, &[])?.0 {
+            Response::Withdrawn => Ok(()),
+            other => Err(unexpected("withdraw", &other)),
         }
     }
 

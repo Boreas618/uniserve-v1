@@ -18,7 +18,7 @@ use serde::de::Error as _;
 use serde::ser::Error as _;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use storage::protocol::Key;
-use storage::runtime::{Completion, GroupId, OwnerId, RequestId};
+use storage::runtime::{Completion, GroupId, OwnerId, RequestId, Segments};
 
 use super::{
     Block, BufferPool, Class, ClientId, Copy, Deferred, Entry, Group, Held, Owner, QueueId, Region,
@@ -34,6 +34,7 @@ struct Image<R, B> {
     spaces: Vec<String>,
     memories: Vec<String>,
     quota: Vec<BTreeMap<u64, u64>>,
+    segments: Vec<Segments>,
     /// Every block a holder holds, once.
     blocks: B,
     cache: Vec<(Key, Entry<u32>)>,
@@ -122,6 +123,7 @@ impl Serialize for BufferPool {
             spaces: self.spaces.clone(),
             memories: self.memories.clone(),
             quota: self.quota.clone(),
+            segments: self.segments.clone(),
             blocks: held
                 .iter()
                 .map(|(block, _, _)| Rc::as_ref(*block))
@@ -190,6 +192,7 @@ impl<'de> Deserialize<'de> for BufferPool {
         pool.spaces = image.spaces;
         pool.memories = image.memories;
         pool.quota = image.quota;
+        pool.segments = image.segments;
         for (key, entry) in image.cache {
             pool.cache.insert(key, entry.map(&mut block)?);
         }
@@ -237,6 +240,10 @@ impl<'de> Deserialize<'de> for BufferPool {
             .into_iter()
             .map(|(queue, id)| (queue, RequestId(id)))
             .collect();
+        // The image leaves out the counts the capacity words are made of,
+        // which follow from the holders' references alone.
+        drop(blocks);
+        pool.recount();
         Ok(pool)
     }
 }

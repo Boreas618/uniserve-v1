@@ -23,6 +23,13 @@
 //! a shared `Rc<Block>` by default: the pool's whole state also travels as
 //! an image ([`image`]), in which the same types name each block by its
 //! index in one list of blocks, and from which a pool is made again.
+//!
+//! The capacity words cost no scan: each region keeps the counts they are
+//! made of, and each block what it is counted as. A handler that changes a
+//! block's holders notes the block ([`BufferPool::touch`]), and the block
+//! is counted again from its holders once the handler is done
+//! ([`BufferPool::settle_counts`]), so a turn costs the work of its own
+//! requests. [`BufferPool::check`] compares the counts with a scan.
 
 mod copies;
 mod image;
@@ -32,13 +39,13 @@ mod sessions;
 mod state;
 mod tasks;
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
-use std::rc::Rc;
+use std::rc::{Rc, Weak};
 
 use serde::{Deserialize, Serialize};
 use storage::protocol::Key;
-use storage::runtime::{Cause, Completion, GroupId, OwnerId, Request, RequestId, Stamps};
+use storage::runtime::{Cause, Completion, GroupId, OwnerId, Request, RequestId, Segments, Stamps};
 
 use region::{Region, Run};
 /// A kind of block, as a session states it in its layout; the pool keeps
@@ -66,6 +73,20 @@ const EVERYWHERE: u8 = u8::MAX;
 /// a block's validity.
 const MEMORIES: usize = 8;
 
+/// What a block's units count as in the capacity words of their regions.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum Counted {
+    /// Private, held as a shared block by more than its entry, or free.
+    #[default]
+    Nothing,
+    /// Shared under the key and held by nothing but its entry:
+    /// `evictable`, and `available` to the queue pairs whose order names
+    /// the key.
+    Evictable(Key),
+    /// Retired: `retiring`.
+    Retired,
+}
+
 /// A block's memory: one run, or one run per backing rank of a product.
 #[derive(Serialize, Deserialize)]
 struct Block {
@@ -75,9 +96,45 @@ struct Block {
     /// own from its allocation, changed by a transfer and by a load that
     /// fills one more memory.
     valid: Cell<u8>,
+    /// The key it is cached under, while an entry of the cache holds it.
+    /// What follows is the counting's: an image leaves it out, and the pool
+    /// made of the image finds it again from the holders.
+    #[serde(skip)]
+    cached: Cell<Option<Key>>,
+    /// The references that make it private (§8): an owner's private entry
+    /// or slot, a waiting commit, a copy writing it for a target that
+    /// exists.
+    #[serde(skip)]
+    owned: Cell<u32>,
+    /// What its units are counted as now.
+    #[serde(skip)]
+    counted: Cell<Counted>,
 }
 
 impl Block {
+    /// A block of `runs` of a class, valid in the memories `valid`, with
+    /// `owned` references that make it private.
+    fn new(class: u8, runs: Vec<Run>, valid: u8, owned: u32) -> Self {
+        Self {
+            class,
+            runs,
+            valid: Cell::new(valid),
+            cached: Cell::new(None),
+            owned: Cell::new(owned),
+            counted: Cell::new(Counted::Nothing),
+        }
+    }
+
+    /// One more reference makes it private.
+    fn own(&self) {
+        self.owned.set(self.owned.get() + 1);
+    }
+
+    /// A reference that made it private is gone or no longer does.
+    fn disown(&self) {
+        self.owned.set(self.owned.get().saturating_sub(1));
+    }
+
     /// The region of the block's first run: its only one when it is cached.
     fn region(&self) -> u8 {
         self.runs.first().map_or(0, Run::region)
@@ -111,6 +168,26 @@ impl Held {
             Self::Private(block) | Self::Shared(block) => block,
         }
     }
+
+    /// The block of an entry that leaves its table: a private entry no
+    /// longer makes it private.
+    fn released(self) -> Rc<Block> {
+        if let Self::Private(block) = &self {
+            block.disown();
+        }
+        self.into_block()
+    }
+}
+
+/// The blocks of an owner that goes, its slot first: its slot and its
+/// private entries no longer make them private.
+fn disowned(owner: Owner) -> Vec<Rc<Block>> {
+    owner.slot.disown();
+    let mut blocks = vec![owner.slot];
+    for table in owner.tables {
+        blocks.extend(table.into_values().map(Held::released));
+    }
+    blocks
 }
 
 /// A request's attachment to one worker group.
@@ -264,6 +341,9 @@ pub struct BufferPool {
     memories: Vec<String>,
     /// Per memory space, the byte ranges in no region: the deployment's free quota there.
     quota: Vec<BTreeMap<u64, u64>>,
+    /// Per memory space, its segment table: the segments the engines'
+    /// ranks created and the head granted, which back its units.
+    segments: Vec<Segments>,
     cache: HashMap<Key, Entry>,
     owners: HashMap<(ClientId, OwnerId), Owner>,
     groups: HashMap<(ClientId, GroupId), Group>,
@@ -290,6 +370,9 @@ pub struct BufferPool {
     /// The host copies each peer, another host's Storage Server, holds for
     /// its reads, by the peer's connection: holders like any other.
     peers: HashMap<u64, Vec<Rc<Block>>>,
+    /// The blocks whose holders the handler running now changed, counted
+    /// again when it is done; empty between handlers.
+    touched: RefCell<Vec<Weak<Block>>>,
 }
 
 impl BufferPool {
@@ -302,6 +385,7 @@ impl BufferPool {
             spaces: Vec::new(),
             memories: Vec::new(),
             quota: Vec::new(),
+            segments: Vec::new(),
             cache: HashMap::new(),
             owners: HashMap::new(),
             groups: HashMap::new(),
@@ -316,7 +400,14 @@ impl BufferPool {
             started: Vec::new(),
             stopped: Vec::new(),
             peers: HashMap::new(),
+            touched: RefCell::new(Vec::new()),
         }
+    }
+
+    /// How long a transfer and a put to the remote store may take from now
+    /// on, in nanoseconds; the tasks under way keep their deadlines.
+    pub fn set_limits(&mut self, limits: (u64, u64)) {
+        self.limits = limits;
     }
 
     /// Whether deferred work waits for a group's `completed` word: the
@@ -338,6 +429,13 @@ impl BufferPool {
     /// reference to the block; otherwise the block lives on with its other
     /// holders.
     fn reclaim(&mut self, block: Rc<Block>) {
+        // The last reference leaves its counts with it; otherwise the block
+        // is counted again from the holders it keeps.
+        if Rc::strong_count(&block) == 1 {
+            self.uncount(&block);
+        } else {
+            self.touch(&block);
+        }
         if let Ok(block) = Rc::try_unwrap(block) {
             for run in block.runs {
                 let region = &mut self.regions[usize::from(run.region())];
@@ -439,6 +537,7 @@ impl BufferPool {
             Err(cause) => self.complete(queue, id, Completion::Refused { cause }),
         }
         self.settle();
+        self.settle_counts();
     }
 
     /// R1: a request's number is above every number its queue pair's
@@ -558,11 +657,8 @@ impl BufferPool {
             .get(&client)
             .map_or(0, |(classes, _)| classes.len());
         let tables = (0..classes).map(|_| BTreeMap::new()).collect();
-        let block = Rc::new(Block {
-            class: SLOT,
-            runs: vec![run],
-            valid: Cell::new(EVERYWHERE),
-        });
+        // The owner's slot makes the row private.
+        let block = Rc::new(Block::new(SLOT, vec![run], EVERYWHERE, 1));
         self.owners.insert(
             (client, owner),
             Owner {
@@ -611,16 +707,28 @@ impl BufferPool {
     fn detach(&mut self, queue: QueueId, owner: OwnerId, after: &Stamps) -> Taken {
         self.owner(queue.0, owner)?;
         self.stamped(queue.0, after)?;
+        self.orphan(queue.0, owner);
         let found = self.owners.remove(&(queue.0, owner)).ok_or(Cause::Owner)?;
 
         // R6: a commit of this owner that waits holds its block and still
         // takes effect. R9: so does a transfer's task hold what it copies.
-        let mut blocks = vec![found.slot];
-        for table in found.tables {
-            blocks.extend(table.into_values().map(Held::into_block));
-        }
+        let blocks = disowned(found);
         self.retire(queue.0, blocks, after);
         Ok(Some(Completion::Done))
+    }
+
+    /// The copies that write for an owner about to go write for a target
+    /// that is gone: what they write is no longer private by them.
+    fn orphan(&self, client: ClientId, owner: OwnerId) {
+        for copy in self.copies_of(client) {
+            let named = matches!(copy.to, Target::Owner { owner: target, .. }
+                | Target::Slot { owner: target }
+                | Target::Group { owner: target, .. } if target == owner);
+            if named && self.live(client, copy) {
+                copy.write.disown();
+                self.touch(&copy.write);
+            }
+        }
     }
 
     /// The keys whose copies in `region` are to be evicted, in the order the
@@ -696,6 +804,7 @@ impl BufferPool {
         if entry.device.is_empty() && entry.host.is_none() && !entry.remote {
             self.cache.remove(key);
         }
+        left.cached.set(None);
         self.reclaim(left);
         true
     }
@@ -719,11 +828,8 @@ impl BufferPool {
             let Some(run) = self.regions[usize::from(region)].take(size) else {
                 break;
             };
-            blocks.push(Rc::new(Block {
-                class,
-                runs: vec![run],
-                valid: Cell::new(valid),
-            }));
+            // The copy that writes it makes it private ([`Self::hold_copies`]).
+            blocks.push(Rc::new(Block::new(class, vec![run], valid, 0)));
         }
         blocks
     }
@@ -774,12 +880,9 @@ impl BufferPool {
         } else {
             self.memory(client, group)
         };
+        // Each is private by the owner's entry.
         let mut blocks: Vec<Block> = (0..count)
-            .map(|_| Block {
-                class,
-                runs: Vec::new(),
-                valid: Cell::new(valid),
-            })
+            .map(|_| Block::new(class, Vec::new(), valid, 1))
             .collect();
         for (region, keys) in regions.iter().zip(&evictions) {
             for key in keys {
@@ -839,6 +942,8 @@ impl BufferPool {
         let host = keys[blocks.len()..].iter().take_while(on_host).count() as u32;
 
         let runs = blocks.iter().flat_map(|block| block.stated()).collect();
+        // A pin holds the block: it is no longer evictable.
+        blocks.iter().for_each(|block| self.touch(block));
         if let Some(found) = self.owners.get_mut(&(client, owner)) {
             for (position, block) in (at..).zip(blocks) {
                 found.tables[usize::from(class)].insert(position, Held::Shared(block));
@@ -870,7 +975,7 @@ impl BufferPool {
 
         let blocks = (at..end)
             .filter_map(|position| table.remove(&position))
-            .map(Held::into_block)
+            .map(Held::released)
             .collect();
         self.retire(client, blocks, after);
         Ok(Some(Completion::Done))
@@ -904,6 +1009,9 @@ impl BufferPool {
         if block.runs.len() != 1 {
             return Err(Cause::Class);
         }
+        // The waiting commit makes the block private too, whatever its
+        // owner does meanwhile (R6).
+        block.own();
         Ok(Rc::clone(block))
     }
 
@@ -960,6 +1068,7 @@ impl BufferPool {
         {
             found.completed = completed;
             self.settle();
+            self.settle_counts();
         }
     }
 
@@ -1073,6 +1182,8 @@ impl BufferPool {
             .cache
             .get(&key)
             .is_some_and(|entry| entry.class != class || entry.copy_in(region).is_some());
+        // The commit's reference passes to the entry, or is let go.
+        block.disown();
         // R4: a key that is cached keeps its block; this one stays private.
         if cached {
             self.reclaim(block);
@@ -1086,8 +1197,11 @@ impl BufferPool {
             && let Some(held) = found.tables[usize::from(class)].get_mut(&at)
             && matches!(held, Held::Private(other) if Rc::ptr_eq(other, &block))
         {
+            block.disown();
             *held = Held::Shared(Rc::clone(&block));
         }
+        block.cached.set(Some(key));
+        self.touch(&block);
         let maker = self.made_by(client);
         let entry = self.cache.entry(key).or_insert(Entry {
             class,
@@ -1123,11 +1237,19 @@ impl BufferPool {
     }
 
     fn victims(&mut self, queue: QueueId, region: u8, keys: Vec<Key>) -> Taken {
-        let found = self
-            .regions
-            .get_mut(usize::from(region))
-            .ok_or(Cause::Class)?;
-        found.orders.insert(queue, keys);
+        if usize::from(region) >= self.regions.len() {
+            return Err(Cause::Class);
+        }
+        // The units of the order's blocks that may be evicted: a cost of
+        // the order's length, once.
+        let distinct: HashSet<&Key> = keys.iter().collect();
+        let units = distinct
+            .into_iter()
+            .filter_map(|key| self.cache.get(key)?.copy_in(region))
+            .filter(|block| matches!(block.counted.get(), Counted::Evictable(_)))
+            .map(|block| block.units())
+            .sum();
+        self.regions[usize::from(region)].install(queue, keys, units);
         Ok(Some(Completion::Done))
     }
 

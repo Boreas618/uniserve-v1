@@ -7,7 +7,7 @@
 //! made again from its image ([`super::image`]) makes its runs again from
 //! the image's, and the pool the image was taken of is not used afterwards.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 
 use serde::{Deserialize, Serialize};
 use storage::protocol::Key;
@@ -86,6 +86,23 @@ pub(crate) struct Region {
     /// Per queue pair (its session and its scheduler's index), the keys its
     /// allocations may evict here, first first.
     pub(crate) orders: BTreeMap<(u32, u16), Vec<Key>>,
+    /// The counts the capacity words are made of, kept by the handlers
+    /// that change them so that a word costs no scan (`specs/buffer-pool.md`
+    /// §10, F6); an image leaves them out and the pool made of it counts
+    /// them again. This one is the units of the free runs.
+    #[serde(skip)]
+    free_units: u32,
+    /// The units here of the shared blocks nothing but their entry holds.
+    #[serde(skip)]
+    pub(crate) evictable: u32,
+    /// The units here of the retired blocks.
+    #[serde(skip)]
+    pub(crate) retiring: u32,
+    /// Per queue pair with an order here: the keys of its order, and the
+    /// units here of the shared blocks among them nothing but their entry
+    /// holds.
+    #[serde(skip)]
+    pub(crate) installed: BTreeMap<(u32, u16), (HashSet<Key>, u32)>,
 }
 
 impl Region {
@@ -114,6 +131,10 @@ impl Region {
             span: (reserved, limit),
             returned: Vec::new(),
             orders: BTreeMap::new(),
+            free_units: units,
+            evictable: 0,
+            retiring: 0,
+            installed: BTreeMap::new(),
         };
         if units > 0 {
             region.free.insert(
@@ -150,9 +171,79 @@ impl Region {
         self.span
     }
 
-    /// The free units.
+    /// The free units, as counted.
     pub(crate) fn free_units(&self) -> u32 {
+        self.free_units
+    }
+
+    /// The free units, by a scan of the free runs: what [`Self::free_units`]
+    /// counts.
+    pub(crate) fn free_scanned(&self) -> u32 {
         self.free.values().map(Run::count).sum()
+    }
+
+    /// Counts the free units again, and starts the other counts afresh: of
+    /// a region made from an image, whose blocks are counted next.
+    pub(crate) fn recount(&mut self) {
+        self.free_units = self.free_scanned();
+        self.evictable = 0;
+        self.retiring = 0;
+        self.installed = self
+            .orders
+            .iter()
+            .map(|(queue, keys)| (*queue, (keys.iter().copied().collect(), 0)))
+            .collect();
+    }
+
+    /// Replaces the order a queue pair installed; the units of its keys'
+    /// blocks that may be evicted are `units`.
+    pub(crate) fn install(&mut self, queue: (u32, u16), keys: Vec<Key>, units: u32) {
+        self.installed
+            .insert(queue, (keys.iter().copied().collect(), units));
+        self.orders.insert(queue, keys);
+    }
+
+    /// Drops the orders of a session's queue pairs.
+    pub(crate) fn uninstall(&mut self, client: u32) {
+        self.orders.retain(|queue, _| queue.0 != client);
+        self.installed.retain(|queue, _| queue.0 != client);
+    }
+
+    /// Counts `units` of a shared block cached under `key` that nothing but
+    /// its entry holds (`adds`), or takes them out of the count once
+    /// something else holds it or it is gone: in the evictable units, and
+    /// in the installed units of every queue pair whose order names the key.
+    pub(crate) fn count_evictable(&mut self, key: &Key, units: u32, adds: bool) {
+        let change = |count: &mut u32| {
+            *count = if adds {
+                *count + units
+            } else {
+                count.saturating_sub(units)
+            };
+        };
+        change(&mut self.evictable);
+        for (keys, installed) in self.installed.values_mut() {
+            if keys.contains(key) {
+                change(installed);
+            }
+        }
+    }
+
+    /// Counts `units` of a retired block (`adds`), or takes them out of the
+    /// count once it is no longer retired or gone.
+    pub(crate) fn count_retiring(&mut self, units: u32, adds: bool) {
+        self.retiring = if adds {
+            self.retiring + units
+        } else {
+            self.retiring.saturating_sub(units)
+        };
+    }
+
+    /// The units an allocation of a queue pair can take: the free units,
+    /// and the units of the blocks of its order that may be evicted.
+    pub(crate) fn available(&self, queue: (u32, u16)) -> u32 {
+        let installed = self.installed.get(&queue).map_or(0, |(_, units)| *units);
+        self.free_units + installed
     }
 
     /// The free runs as `(first, count)`, for the exported state.
@@ -171,10 +262,12 @@ impl Region {
         let first = self.free.values().find(|run| run.count >= count)?.first;
         let mut run = self.free.remove(&first)?;
         if run.count == count {
+            self.free_units -= run.count;
             return Some(run);
         }
         let head = run.split(count);
         self.free.insert(run.first, run);
+        self.free_units -= head.count;
         Some(head)
     }
 
@@ -196,6 +289,7 @@ impl Region {
             };
 
             // Cut the unit out of the run: what lies before it and after it stays free.
+            self.free_units -= 1;
             if unit > first {
                 let head = run.split(unit - first);
                 self.free.insert(head.first, head);
@@ -213,6 +307,7 @@ impl Region {
     /// Returns a run to the free list (R2: only [`super::BufferPool::reclaim`]
     /// calls this, with the runs of a block nothing else holds).
     pub(crate) fn give(&mut self, run: Run) {
+        self.free_units += run.count;
         insert_joined(&mut self.free, run);
     }
 
@@ -245,6 +340,7 @@ impl Region {
             };
             wanted -= taken.count;
             self.units -= taken.count;
+            self.free_units -= taken.count;
             left.push((
                 u64::from(taken.first) * self.unit_bytes,
                 u64::from(taken.count) * self.unit_bytes,
@@ -289,7 +385,28 @@ impl Region {
             }
         }
         self.units += grown;
+        self.free_units += grown;
         grown
+    }
+
+    /// Whether every unit of `first..end` that the region numbers is
+    /// outside it: in no free run and no block.
+    pub(crate) fn outside_holds(&self, first: u32, end: u32) -> bool {
+        let (from, to) = (first.max(self.span.0), end.min(self.span.1));
+        let mut unit = from;
+        while unit < to {
+            let holder = self
+                .outside
+                .range(..=unit)
+                .next_back()
+                .map(|(_, run)| run.first + run.count)
+                .filter(|run_end| *run_end > unit);
+            let Some(run_end) = holder else {
+                return false;
+            };
+            unit = run_end;
+        }
+        true
     }
 }
 

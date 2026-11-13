@@ -1402,7 +1402,7 @@ fn a_peer_s_hold_keeps_a_host_copy_until_it_is_released() {
     // hold is a holder: the copy is no longer evictable.
     let held = fixture.pool.hold(9, &[key(7), key(9)]);
     fixture.checked();
-    assert_eq!(held, [(key(7), (HOST, 0, 1))]);
+    assert_eq!(held, [(key(7), (HOST, 0, 1), 64)]);
     assert_eq!(fixture.pool.capacity(QUEUE, HOST), (0, 0, 1));
 
     // A store that needs room evicts in the installed order and skips it.

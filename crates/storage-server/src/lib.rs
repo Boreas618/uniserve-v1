@@ -307,6 +307,13 @@ impl Server {
         })
     }
 
+    /// How long a transfer between worker groups and a put to the remote
+    /// store may take before the buffer pools stop them, from now on; a
+    /// minute each unless set.
+    pub fn set_deadlines(&mut self, transfer: Duration, put: Duration) {
+        self.sessions.set_deadlines(transfer, put);
+    }
+
     /// Also accept connections from other hosts on `listener`: a head's
     /// page requests, without descriptors. Returns the bound address.
     pub fn listen_tcp(&mut self, listener: TcpListener) -> io::Result<String> {
@@ -845,6 +852,34 @@ impl Server {
             }
             (Request::Close, Role::Head { deployment, epoch }) => {
                 self.close_pool(&deployment, epoch)
+            }
+            (
+                Request::PlaceRemote {
+                    region,
+                    memory,
+                    rank,
+                    endpoint,
+                    runs,
+                },
+                Role::Head { deployment, epoch },
+            ) => self.place_remote(
+                id,
+                (&deployment, epoch),
+                (region, memory, *rank),
+                endpoint,
+                runs,
+            ),
+            (
+                Request::Grant {
+                    region,
+                    segment,
+                    first,
+                    units,
+                },
+                Role::Head { deployment, epoch },
+            ) => self.grant(id, (&deployment, epoch), region, *segment, (*first, *units)),
+            (Request::Withdraw { region, segment }, Role::Head { deployment, epoch }) => {
+                self.withdraw(id, (&deployment, epoch), region, *segment)
             }
             (Request::PeerHold { deployment, keys }, Role::Peer) => {
                 self.peer_hold(id, deployment, keys)
@@ -3026,6 +3061,9 @@ fn request_name(request: &Request) -> &'static str {
         Request::Open(_) => "open",
         Request::Close => "close",
         Request::Place { .. } => "place",
+        Request::PlaceRemote { .. } => "place_remote",
+        Request::Grant { .. } => "grant",
+        Request::Withdraw { .. } => "withdraw",
         Request::HostPart { .. } => "host_part",
         Request::PeerHold { .. } => "peer hold",
         Request::PeerRelease { .. } => "peer release",

@@ -20,22 +20,22 @@ use ::storage::runtime::{
     Cause, Class, Completion, Group, GroupId, Open, Opened, OwnerId, Region, Registers, Request,
     RequestId, Source, Tier, VERSION,
 };
-use ::storage::{Access, Claim, Client, Key, Location, Mode, QueuePair, Role};
+use ::storage::{Access, Claim, Client, Key, Location, Mode, QueuePair, Role, Segment};
 
 use crate::server::{
     FORKING, Running, engine_head, head, host, key, memfd, scope, server_error, tensor, worker,
 };
 use crate::transfer::{Gpus, pattern, read, serving};
 
-const PREFILL: GroupId = GroupId(0);
-const DECODE: GroupId = GroupId(1);
+pub(crate) const PREFILL: GroupId = GroupId(0);
+pub(crate) const DECODE: GroupId = GroupId(1);
 
 /// The class of KV blocks: one unit each, host copies of one unit.
-const KV: u8 = 0;
+pub(crate) const KV: u8 = 0;
 
 /// The indices of the layout's regions.
-const UNITS: usize = 0;
-const HOST: usize = 3;
+pub(crate) const UNITS: usize = 0;
+pub(crate) const HOST: usize = 3;
 
 /// A region of a layout.
 fn region(name: &str, tier: Tier, unit_bytes: u64, reserved: u32, units: u32) -> Region {
@@ -47,6 +47,7 @@ fn region(name: &str, tier: Tier, unit_bytes: u64, reserved: u32, units: u32) ->
         reserved,
         units,
         limit: reserved + units,
+        segments: Vec::new(),
     }
 }
 
@@ -54,7 +55,7 @@ fn region(name: &str, tier: Tier, unit_bytes: u64, reserved: u32, units: u32) ->
 /// memories of their own, each the only group of its scheduler, over one
 /// KV region of eight units, their slot rows (two each, the epoch's own)
 /// and a host region of four units of 32 bytes, two parts of 16.
-fn layout(epoch: u64) -> Open {
+pub(crate) fn layout(epoch: u64) -> Open {
     Open {
         version: VERSION,
         epoch,
@@ -86,6 +87,7 @@ fn layout(epoch: u64) -> Open {
             },
         ],
         schedulers: vec![vec![PREFILL], vec![DECODE]],
+        peers: Vec::new(),
     }
 }
 
@@ -179,7 +181,7 @@ impl Scheduler {
 }
 
 /// The buffer pool of the deployment as an operator lists it.
-fn listed(socket: &std::path::Path) -> ::storage::protocol::BufferPoolListing {
+pub(crate) fn listed(socket: &std::path::Path) -> ::storage::protocol::BufferPoolListing {
     let mut operator = Client::connect(socket, Role::Operator).unwrap();
     let listing = operator.list().unwrap();
     listing
@@ -353,13 +355,13 @@ fn a_session_is_refused_what_the_server_does_not_serve() {
 }
 
 /// A worker of `group`'s rank `rank`, of epoch 0.
-fn rank(socket: &Path, group: &str, rank: u32, claim: Claim) -> Client {
+pub(crate) fn rank(socket: &Path, group: &str, rank: u32, claim: Claim) -> Client {
     worker(socket, scope(group, rank), 1, claim)
 }
 
 /// Where a rank's values of all nine units of the KV region lie: 16 bytes
 /// a unit in the host tensor `key`.
-fn values(key: Key) -> Vec<UnitRun> {
+pub(crate) fn values(key: Key) -> Vec<UnitRun> {
     vec![UnitRun {
         field: "values".into(),
         key,
@@ -498,8 +500,9 @@ fn connector_event(connector: &mut Client) -> Event {
 
 /// An engine of epoch 0 with its schedulers, whose two prefill ranks took
 /// their parts of the host region, and whose prefill scheduler cached key
-/// 7 on the device and on the host.
-fn host_copy(server: &Running) -> (Client, Vec<Scheduler>, Opened) {
+/// 7 on the device and on the host, in unit 0 of the host region; with the
+/// parts' memfds, by rank.
+pub(crate) fn host_copy(server: &Running) -> (Client, Vec<Scheduler>, Opened, Vec<OwnedFd>) {
     let claim = head(&server.socket)
         .claim(
             0,
@@ -509,11 +512,7 @@ fn host_copy(server: &Running) -> (Client, Vec<Scheduler>, Opened) {
         .unwrap();
     let mut engine = engine_head(&server.socket, 0);
     let (opened, descriptors) = engine.open_pool(layout(0)).unwrap();
-    for index in 0..2 {
-        let mut part = rank(&server.socket, "prefill", index, claim);
-        let (units, _) = part.host_part("host".into(), 16, None).unwrap();
-        assert_eq!(units, 4);
-    }
+    let parts = host_parts(&server.socket, claim);
 
     let mut schedulers = Scheduler::all(&opened, descriptors);
     let prefill = &mut schedulers[0];
@@ -552,7 +551,20 @@ fn host_copy(server: &Running) -> (Client, Vec<Scheduler>, Opened) {
     };
     let stored = Completion::Stored { keys: Vec::new() };
     assert_eq!(prefill.ask(finish), stored);
-    (engine, schedulers, opened)
+    (engine, schedulers, opened, parts)
+}
+
+/// The memfds of the host region's parts, of 16 bytes a unit, that the two
+/// prefill ranks of the deployment take.
+pub(crate) fn host_parts(socket: &Path, claim: Claim) -> Vec<OwnedFd> {
+    (0..2)
+        .map(|index| {
+            let mut part = rank(socket, "prefill", index, claim);
+            let (units, descriptor) = part.host_part("host".into(), 16, None).unwrap();
+            assert_eq!(units, 4);
+            descriptor
+        })
+        .collect()
 }
 
 #[test]
@@ -560,7 +572,7 @@ fn a_put_and_a_prefetch_move_host_copies_through_the_connector_part_by_part() {
     let server = Running::with_transfer(|_| None);
     // The test plays the server's connector.
     let mut connector = Client::connect(&server.socket, Role::Connector).unwrap();
-    let (_engine, mut schedulers, opened) = host_copy(&server);
+    let (_engine, mut schedulers, opened, _parts) = host_copy(&server);
     let host = opened.regions[HOST].0;
     let mut parts = Vec::new();
     for _ in 0..2 {
@@ -636,7 +648,7 @@ fn a_put_and_a_prefetch_move_host_copies_through_the_connector_part_by_part() {
     assert_eq!(host_blocks, 2, "keys 7 and 8 have host copies");
     prefill.await_capacity(host, (2, 0, 2));
 
-    // The server knows no peer: a prefetch from the peers finds nothing.
+    // The session names no peer: a prefetch from the peers finds nothing.
     let peers = Request::Prefetch {
         class: KV,
         units: 0,
@@ -650,7 +662,7 @@ fn a_put_and_a_prefetch_move_host_copies_through_the_connector_part_by_part() {
 #[test]
 fn a_peer_holds_the_host_copies_it_reads_until_it_releases_them() {
     let server = Running::with_transfer(|_| None);
-    let (_engine, schedulers, opened) = host_copy(&server);
+    let (_engine, schedulers, opened, _parts) = host_copy(&server);
     let host = opened.regions[HOST].0;
     let prefill = &schedulers[0];
     prefill.await_capacity(host, (3, 0, 1));
@@ -663,6 +675,7 @@ fn a_peer_holds_the_host_copies_it_reads_until_it_releases_them() {
         .unwrap();
     let held = HostCopy {
         key: key(7),
+        tokens: 64,
         region: "host".into(),
         first: 0,
         count: 1,
@@ -818,4 +831,80 @@ fn what_an_epoch_on_trial_commits_is_its_own_until_its_head_publishes_it() {
     assert_eq!(prefill.ask(pin.clone()), none);
     daemon.publish(vec![1]).unwrap();
     assert!(matches!(prefill.ask(pin), Completion::Pinned { runs, .. } if runs.len() == 1));
+}
+
+/// A segment of the KV region's memory space.
+fn segment(epoch: u64, ordinal: u32) -> Segment {
+    Segment { epoch, ordinal }
+}
+
+/// The layout of an engine epoch whose ranks created the first segment of
+/// the KV region's memory, units 0 to 4, of which it asks for the three
+/// past the reserved unit.
+fn segmented(epoch: u64) -> Open {
+    let mut open = layout(epoch);
+    open.regions[UNITS].units = 3;
+    open.regions[UNITS].segments = vec![(segment(epoch, 0), 0, 4)];
+    open
+}
+
+#[test]
+fn a_region_grows_into_the_segments_its_ranks_created_and_releases_them_after_a_shrink() {
+    let server = Running::with_transfer(|_| None);
+    let mut engine = engine_head(&server.socket, 0);
+    let (opened, descriptors) = engine.open_pool(segmented(0)).unwrap();
+    assert_eq!(opened.regions[UNITS].1, 3);
+    assert_eq!(opened.segments[UNITS], [(segment(0, 0), 0, 4)]);
+    assert!(opened.segments[HOST].is_empty());
+    let region = opened.regions[UNITS].0;
+    let mut schedulers = Scheduler::all(&opened, descriptors);
+    let prefill = &mut schedulers[0];
+    let resize = |units| Request::Resize { region, units };
+    let resized = |units| Completion::Resized {
+        units,
+        evicted: Vec::new(),
+    };
+
+    // The region grows only into units whose segments exist: a grant of
+    // the next segment lets it.
+    assert_eq!(prefill.ask(resize(7)), resized(3));
+    engine.grant("units".into(), segment(0, 1), 4, 4).unwrap();
+    assert_eq!(prefill.ask(resize(7)), resized(7));
+
+    // A segment is granted once, and none shares a unit with another.
+    let again = engine.grant("units".into(), segment(0, 1), 4, 4);
+    assert_eq!(server_error(again), ErrorKind::Invalid);
+    let overlapping = engine.grant("units".into(), segment(0, 2), 6, 3);
+    assert_eq!(server_error(overlapping), ErrorKind::Invalid);
+
+    // Its units are in the region: it is not withdrawn until a shrink has
+    // taken them out; then the region grows no more into them.
+    let withdrawn = engine.withdraw("units".into(), segment(0, 1));
+    assert_eq!(server_error(withdrawn), ErrorKind::Invalid);
+    assert_eq!(prefill.ask(resize(3)), resized(3));
+    engine.withdraw("units".into(), segment(0, 1)).unwrap();
+    assert_eq!(prefill.ask(resize(7)), resized(3));
+
+    // The next epoch of the layout maps the segments the serving one created.
+    let mut next = engine_head(&server.socket, 1);
+    let (second, _) = next.open_pool(layout(1)).unwrap();
+    assert_eq!(second.regions[UNITS].0, region);
+    assert_eq!(second.segments[UNITS], [(segment(0, 0), 0, 4)]);
+
+    // Sleep: the region shrunk to nothing, its last segment withdrawn.
+    assert_eq!(prefill.ask(resize(0)), resized(0));
+    engine.withdraw("units".into(), segment(0, 0)).unwrap();
+    let (asleep, _) = engine_head(&server.socket, 2).open_pool(layout(2)).unwrap();
+    assert!(asleep.segments[UNITS].is_empty());
+
+    // Wake: the ranks of epoch 1 create the segments again, its head
+    // grants them, and the region grows.
+    next.grant("units".into(), segment(1, 0), 0, 4).unwrap();
+    next.grant("units".into(), segment(1, 1), 4, 4).unwrap();
+    assert_eq!(prefill.ask(resize(7)), resized(7));
+    let (awake, _) = engine_head(&server.socket, 3).open_pool(layout(3)).unwrap();
+    assert_eq!(
+        awake.segments[UNITS],
+        [(segment(1, 0), 0, 4), (segment(1, 1), 4, 4)]
+    );
 }

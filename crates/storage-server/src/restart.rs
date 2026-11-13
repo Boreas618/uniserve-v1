@@ -903,6 +903,7 @@ mod tests {
             reserved: 1,
             units,
             limit: units + 1,
+            segments: Vec::new(),
         };
         let open = Open {
             version: VERSION,
@@ -922,6 +923,7 @@ mod tests {
                 regions: vec![vec![0]],
             }],
             schedulers: vec![vec![GroupId(0)]],
+            peers: Vec::new(),
         };
         let mut engine = Client::connect(
             &path,

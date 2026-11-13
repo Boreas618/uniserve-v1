@@ -70,6 +70,16 @@ pub enum Command {
         /// other hosts; found on the loader's search path when unset.
         #[arg(long)]
         nixl_library: Option<PathBuf>,
+        /// How long a buffer pool's transfer of a request between worker
+        /// groups may take, in seconds, before it is stopped and answered
+        /// as failed.
+        #[arg(long, default_value_t = crate::sessions::TRANSFER_DEADLINE.as_secs())]
+        transfer_deadline_s: u64,
+        /// How long a buffer pool's put of host copies to the remote store
+        /// may take, in seconds, before it is stopped and answered with the
+        /// keys put so far.
+        #[arg(long, default_value_t = crate::sessions::PUT_DEADLINE.as_secs())]
+        put_deadline_s: u64,
         /// The descriptor of the handoff socket to the server this one
         /// succeeds in a restart in place (`storage-server restart`), which it goes on
         /// with.
@@ -194,6 +204,8 @@ pub fn run(args: Args) -> anyhow::Result<()> {
             mooncake,
             transfer_chunk_us,
             nixl_library,
+            transfer_deadline_s,
+            put_deadline_s,
             predecessor,
         } => mooncake.settings().and_then(|connector| {
             let executable = std::env::current_exe().context("locating this executable")?;
@@ -216,6 +228,8 @@ pub fn run(args: Args) -> anyhow::Result<()> {
                 ],
                 transfer_chunk: std::time::Duration::from_micros(transfer_chunk_us),
                 nixl_library,
+                transfer_deadline: std::time::Duration::from_secs(transfer_deadline_s),
+                put_deadline: std::time::Duration::from_secs(put_deadline_s),
                 predecessor,
             })
         }),
@@ -292,5 +306,28 @@ mod tests {
             panic!("the arguments are not a `serve` command");
         };
         assert_eq!(mooncake.settings().unwrap(), Some(settings));
+    }
+
+    /// A transfer and a put to the remote store may take a minute unless
+    /// the server is told otherwise.
+    #[test]
+    fn the_deadlines_of_transfers_and_puts_are_a_minute_unless_stated() {
+        let deadlines = |arguments: &[&str]| {
+            let mut command = vec!["storage-server", "serve"];
+            command.extend(arguments);
+            match Args::parse_from(command).command {
+                Command::Serve {
+                    transfer_deadline_s,
+                    put_deadline_s,
+                    ..
+                } => (transfer_deadline_s, put_deadline_s),
+                other => panic!("{other:?} is not a `serve` command"),
+            }
+        };
+        assert_eq!(deadlines(&[]), (60, 60));
+        assert_eq!(
+            deadlines(&["--transfer-deadline-s", "5", "--put-deadline-s", "300"]),
+            (5, 300)
+        );
     }
 }

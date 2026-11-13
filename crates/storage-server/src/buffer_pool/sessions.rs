@@ -10,15 +10,21 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashSet, VecDeque};
 
-use storage::runtime::{GroupId, Open, Tier};
+use storage::protocol::Segment;
+use storage::runtime::{GroupId, Open, Segments, Tier};
 
 use super::{
-    BufferPool, Class, ClientId, Deferred, Group, Held, MEMORIES, Region, insert_range,
+    BufferPool, Class, ClientId, Deferred, Group, MEMORIES, Region, disowned, insert_range,
     remove_range,
 };
 
 /// The most regions a pool numbers at once: a run names its region by a byte.
 const REGIONS: usize = u8::MAX as usize;
+
+/// How a region numbers the units of its memory space: the space, the
+/// bytes of a unit, and the first unit it may allocate with the limit of
+/// its numbering.
+type Numbering = (u8, u64, (u32, u32));
 
 impl BufferPool {
     /// Adds a range of a memory space to its free ranges: its memory exists
@@ -41,6 +47,160 @@ impl BufferPool {
     pub fn withdraw(&mut self, space: u8, offset: u64, bytes: u64) -> bool {
         let ranges = self.quota.get_mut(usize::from(space));
         ranges.is_some_and(|ranges| remove_range(ranges, offset, bytes))
+    }
+
+    /// The bytes of the units of a segment, `units` from `first`, that a
+    /// region numbered as `numbering` allocates from: those past its
+    /// reserved ones. `None` when it allocates none of them.
+    fn segment_bytes(numbering: Numbering, first: u32, units: u32) -> Option<(u64, u64)> {
+        let (_, unit_bytes, (reserved, limit)) = numbering;
+        let (from, to) = (first.max(reserved), first.saturating_add(units).min(limit));
+        (from < to).then(|| {
+            (
+                u64::from(from) * unit_bytes,
+                u64::from(to - from) * unit_bytes,
+            )
+        })
+    }
+
+    /// Why a segment stated by a region numbered as `numbering` cannot
+    /// join its memory space's table and free ranges, if it cannot: it has
+    /// no unit or lies past the numbering, or a segment of the table is the
+    /// same segment or shares a unit with it, or a unit of it is in the
+    /// free ranges or in a region.
+    fn ungrantable(&self, numbering: Numbering, stated: (Segment, u32, u32)) -> Option<String> {
+        let (space, _, (_, limit)) = numbering;
+        let (segment, first, units) = stated;
+        let name = format!("segment {}/{}", segment.epoch, segment.ordinal);
+        let end = first
+            .checked_add(units)
+            .filter(|end| units > 0 && *end <= limit);
+        let Some(end) = end else {
+            return Some(format!(
+                "{name} of {units} units from {first} lies past a numbering of {limit}"
+            ));
+        };
+        let table = self.segments.get(usize::from(space)).into_iter().flatten();
+        let taken = table
+            .clone()
+            .any(|(other, from, count)| *other == segment || (*from < end && first < from + count));
+        if taken {
+            return Some(format!("{name} or one of its units is in the table"));
+        }
+
+        let (offset, bytes) = Self::segment_bytes(numbering, first, units)?;
+        let quota = self.quota.get(usize::from(space)).into_iter().flatten();
+        let free = quota
+            .clone()
+            .any(|(start, length)| *start < offset + bytes && offset < start + length);
+        let held = self
+            .regions
+            .iter()
+            .filter(|region| region.space == space)
+            .any(|region| {
+                let from = offset / region.unit_bytes;
+                let to = (offset + bytes).div_ceil(region.unit_bytes);
+                let (from, to) = (from as u32, u32::try_from(to).unwrap_or(u32::MAX));
+                !region.outside_holds(from, to)
+            });
+        (free || held).then(|| format!("a unit of {name} is free or in a region"))
+    }
+
+    /// Enters a segment stated by a region numbered as `numbering` into its
+    /// memory space's table, and the units it allocates from among the
+    /// segment's into the space's free ranges ([`Self::ungrantable`] says
+    /// when it may).
+    fn enter_segment(&mut self, numbering: Numbering, stated: (Segment, u32, u32)) {
+        let (space, _, _) = numbering;
+        let (_, first, units) = stated;
+        if let Some((offset, bytes)) = Self::segment_bytes(numbering, first, units) {
+            self.grant(space, offset, bytes);
+        }
+        while self.segments.len() <= usize::from(space) {
+            self.segments.push(Vec::new());
+        }
+        let table = &mut self.segments[usize::from(space)];
+        let at = table.partition_point(|(_, from, _)| *from < first);
+        table.insert(at, stated);
+    }
+
+    /// How a region numbers its units: its memory space, the bytes of a
+    /// unit, and its span.
+    fn numbering(&self, region: u8) -> Option<Numbering> {
+        let found = self.regions.get(usize::from(region))?;
+        Some((found.space, found.unit_bytes, found.span()))
+    }
+
+    /// The engine's ranks created `segment` of the device region `region`,
+    /// `units` units from `first`: it joins its memory space's table, and
+    /// its units the free ranges a resize grows the space's regions from.
+    ///
+    /// # Errors
+    ///
+    /// Refuses, changing nothing, a segment of a region that is not a
+    /// device region, or that is in the table, or a unit of which lies past
+    /// the region's numbering, in the free ranges or in a region.
+    pub fn grant_segment(
+        &mut self,
+        region: u8,
+        segment: Segment,
+        first: u32,
+        units: u32,
+    ) -> Result<(), String> {
+        let numbering = self
+            .numbering(region)
+            .filter(|_| self.regions[usize::from(region)].tier == Tier::Device)
+            .ok_or_else(|| format!("region {region} is no device region"))?;
+        let stated = (segment, first, units);
+        if let Some(refusal) = self.ungrantable(numbering, stated) {
+            return Err(refusal);
+        }
+        self.enter_segment(numbering, stated);
+        Ok(())
+    }
+
+    /// The engine's ranks are to release `segment` of the memory space of
+    /// the device region `region`: its units leave the space's free ranges
+    /// and the segment its table, so no region grows into them.
+    ///
+    /// # Errors
+    ///
+    /// Refuses, changing nothing, while a unit of the segment is in a
+    /// region, or when the table holds no such segment.
+    pub fn withdraw_segment(&mut self, region: u8, segment: Segment) -> Result<(), String> {
+        let numbering = self
+            .numbering(region)
+            .ok_or_else(|| format!("no region {region}"))?;
+        let space = usize::from(numbering.0);
+        let name = format!("segment {}/{}", segment.epoch, segment.ordinal);
+        let table = self.segments.get(space).map_or(&[][..], Vec::as_slice);
+        let at = table
+            .iter()
+            .position(|(other, _, _)| *other == segment)
+            .ok_or_else(|| format!("{name} is not in the table"))?;
+        let (_, first, units) = table[at];
+        if let Some((offset, bytes)) = Self::segment_bytes(numbering, first, units)
+            && !self.withdraw(numbering.0, offset, bytes)
+        {
+            return Err(format!("a unit of {name} is in a region"));
+        }
+        self.segments[space].remove(at);
+        Ok(())
+    }
+
+    /// The segment table of the memory space of a region.
+    pub fn segments_of(&self, region: u8) -> Segments {
+        let space = self.numbering(region).map(|(space, _, _)| space);
+        space
+            .and_then(|space| self.segments.get(usize::from(space)))
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    /// The number of the region stated under `name`.
+    pub fn region_number(&self, name: &str) -> Option<u8> {
+        let found = self.regions.iter().position(|region| region.name == name)?;
+        Some(found as u8)
     }
 
     /// Opens a region named `name` of `limit` units over a memory space, of
@@ -97,25 +257,29 @@ impl BufferPool {
         for (offset, bytes) in found.shrink(u32::MAX) {
             insert_range(&mut self.quota[space], offset, bytes);
         }
+        self.settle_counts();
     }
 
     /// Opens the session `client` of the layout an engine epoch states in
     /// `open`: every name is resolved to the pool's number, and the regions
     /// new to the pool, or closed since, are opened with the units the
-    /// layout asks for. A memory space new to the pool is granted the bytes
-    /// of the first of its regions: the units it asks for on the device,
-    /// which the engine's ranks created, and its whole numbering on the
-    /// host, whose memory the server creates; the space's other regions
-    /// grow from what that leaves. Returns, per region of the layout, its
-    /// number and its units.
+    /// layout asks for. The segments a device region states that its
+    /// memory space's table lacks join it first, with their units
+    /// ([`Self::grant_segment`]); a memory space new to the pool whose first
+    /// region states none is granted that region's units asked for on the
+    /// device, memory of the ranks' own processes, and its whole numbering
+    /// on the host, whose memory the server creates; the space's other
+    /// regions grow from what that leaves. Returns, per region of the
+    /// layout, its number and its units.
     ///
     /// # Errors
     ///
     /// Refuses, changing nothing, a layout that does not fit: a name stated
     /// twice, a region stated again with another tier, space, unit size or
-    /// numbering, an index that names no region of the right tier, a group
-    /// of no scheduler's or of two, more than [`MEMORIES`] device memories
-    /// over the pool's sessions, or more regions than a run can number.
+    /// numbering, a segment that cannot join its space's table, an index
+    /// that names no region of the right tier, a group of no scheduler's or
+    /// of two, more than [`MEMORIES`] device memories over the pool's
+    /// sessions, or more regions than a run can number.
     pub fn admit(&mut self, client: ClientId, open: &Open) -> Result<Vec<(u8, u32)>, String> {
         if self.sessions.contains_key(&client) {
             return Err(format!("session {client} is open"));
@@ -131,11 +295,24 @@ impl BufferPool {
         let named = self.named_by_sessions();
         let mut numbers = Vec::with_capacity(open.regions.len());
         for stated in &open.regions {
-            if let Some(found) = self
+            let known = self
                 .regions
                 .iter()
-                .position(|region| region.name == stated.name)
-            {
+                .position(|region| region.name == stated.name);
+            let space = match known {
+                Some(found) => self.regions[found].space,
+                None => self.space(stated),
+            };
+            // The segments the epoch's ranks created that the space's
+            // table lacks join it, before its regions grow.
+            let numbering = (space, stated.unit_bytes, (stated.reserved, stated.limit));
+            for segment in &stated.segments {
+                if !self.tabled(space, segment) {
+                    self.enter_segment(numbering, *segment);
+                }
+            }
+
+            if let Some(found) = known {
                 // A region every session left opens again with the units
                 // asked for, as far as the quota holds them.
                 let region = &mut self.regions[found];
@@ -148,25 +325,6 @@ impl BufferPool {
                 numbers.push(found as u8);
                 continue;
             }
-
-            let space = match self.spaces.iter().position(|space| *space == stated.space) {
-                Some(space) => space as u8,
-                None => {
-                    self.spaces.push(stated.space.clone());
-                    let space = (self.spaces.len() - 1) as u8;
-                    let end = match stated.tier {
-                        Tier::Host => stated.limit,
-                        Tier::Device | Tier::Remote => stated.reserved + stated.units,
-                    };
-                    let first = u64::from(stated.reserved) * stated.unit_bytes;
-                    let bytes = u64::from(end - stated.reserved) * stated.unit_bytes;
-                    self.ledger(space);
-                    if bytes > 0 {
-                        self.grant(space, first, bytes);
-                    }
-                    space
-                }
-            };
             numbers.push(self.open_region(
                 &stated.name,
                 stated.tier,
@@ -211,8 +369,94 @@ impl BufferPool {
             .collect())
     }
 
+    /// The number of the memory space a region of a layout states. A space
+    /// new to the pool is granted the units of the segments the region
+    /// states when it states any, which the caller enters; otherwise the
+    /// region's units asked for on the device, memory of the ranks' own
+    /// processes, and its whole numbering on the host, whose memory the
+    /// server creates.
+    fn space(&mut self, stated: &storage::runtime::Region) -> u8 {
+        if let Some(space) = self.spaces.iter().position(|space| *space == stated.space) {
+            return space as u8;
+        }
+        self.spaces.push(stated.space.clone());
+        let space = (self.spaces.len() - 1) as u8;
+        self.ledger(space);
+        if !stated.segments.is_empty() {
+            return space;
+        }
+        let end = match stated.tier {
+            Tier::Host => stated.limit,
+            Tier::Device | Tier::Remote => stated.reserved + stated.units,
+        };
+        let first = u64::from(stated.reserved) * stated.unit_bytes;
+        let bytes = u64::from(end - stated.reserved) * stated.unit_bytes;
+        if bytes > 0 {
+            self.grant(space, first, bytes);
+        }
+        space
+    }
+
+    /// Whether a memory space's table holds a segment as stated.
+    fn tabled(&self, space: u8, stated: &(Segment, u32, u32)) -> bool {
+        self.segments
+            .get(usize::from(space))
+            .is_some_and(|table| table.contains(stated))
+    }
+
+    /// Whether the segments a layout states fit: each of a device region
+    /// and inside its numbering; two that state one segment or share a
+    /// unit of one space state the same; and each segment of a space the
+    /// pool has is in its table as stated or may join it
+    /// ([`Self::ungrantable`]).
+    fn segments_fit(&self, open: &Open) -> Result<(), String> {
+        let mut stated: Vec<(&str, (Segment, u32, u32))> = Vec::new();
+        for region in &open.regions {
+            if !region.segments.is_empty() && region.tier != Tier::Device {
+                return Err(format!(
+                    "region {} states segments off the device",
+                    region.name
+                ));
+            }
+            let space = self.spaces.iter().position(|space| *space == region.space);
+            for segment in &region.segments {
+                let (identity, first, units) = *segment;
+                let end = first.checked_add(units);
+                if units == 0 || end.is_none_or(|end| end > region.limit) {
+                    return Err(format!(
+                        "region {} states segment {}/{} past its numbering",
+                        region.name, identity.epoch, identity.ordinal
+                    ));
+                }
+                let clash = stated.iter().find(|(of, (other, from, count))| {
+                    *of == region.space
+                        && (*other == identity || (*from < first + units && first < from + count))
+                        && (*other, *from, *count) != *segment
+                });
+                if clash.is_some() {
+                    return Err(format!(
+                        "segment {}/{} of {} is stated twice, or shares a unit with another",
+                        identity.epoch, identity.ordinal, region.space
+                    ));
+                }
+                stated.push((&region.space, *segment));
+
+                if let Some(space) = space.map(|space| space as u8)
+                    && !self.tabled(space, segment)
+                {
+                    let numbering = (space, region.unit_bytes, (region.reserved, region.limit));
+                    if let Some(refusal) = self.ungrantable(numbering, *segment) {
+                        return Err(format!("region {}: {refusal}", region.name));
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Whether a layout fits the pool; see [`Self::admit`].
     fn fits(&self, open: &Open) -> Result<(), String> {
+        self.segments_fit(open)?;
         let mut names = HashSet::new();
         for region in &open.regions {
             if !names.insert(region.name.as_str()) {
@@ -460,7 +704,10 @@ impl BufferPool {
                     Deferred::Release { blocks } => {
                         blocks.into_iter().for_each(|block| self.reclaim(block))
                     }
-                    Deferred::Commit { block, .. } => self.reclaim(block),
+                    Deferred::Commit { block, .. } => {
+                        block.disown();
+                        self.reclaim(block);
+                    }
                     Deferred::Transfer { .. } | Deferred::Finish { .. } => {}
                 }
             }
@@ -473,21 +720,19 @@ impl BufferPool {
             .copied()
             .collect();
         for owner in owners {
+            // R9: a task that writes for the owner holds what it writes.
+            self.orphan(owner.0, owner.1);
             let Some(found) = self.owners.remove(&owner) else {
                 continue;
             };
-            self.reclaim(found.slot);
-            for table in found.tables {
-                table
-                    .into_values()
-                    .map(Held::into_block)
-                    .for_each(|block| self.reclaim(block));
+            for block in disowned(found) {
+                self.reclaim(block);
             }
         }
 
         // The eviction orders of its queue pairs are dropped with it.
         for region in &mut self.regions {
-            region.orders.retain(|queue, _| queue.0 != client);
+            region.uninstall(client);
         }
         self.numbers.retain(|queue, _| queue.0 != client);
         self.completions.retain(|(queue, _, _)| queue.0 != client);
@@ -495,6 +740,7 @@ impl BufferPool {
         self.classes.remove(&client);
         self.sweep();
         self.settle();
+        self.settle_counts();
     }
 
     /// The update of an epoch on trial is committed: what the epoch made is
@@ -523,6 +769,7 @@ impl BufferPool {
         if self.trial.get(&epoch) == Some(&true) && !self.sessions.values().any(|of| *of == epoch) {
             self.trial.remove(&epoch);
             self.sweep();
+            self.settle_counts();
         }
     }
 

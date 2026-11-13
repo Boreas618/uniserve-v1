@@ -96,9 +96,14 @@
 //! travels in shared memory; it ends it with [`Request::Close`] once its
 //! executors have stopped, and the server closes it when the engine's
 //! processes are gone. Each rank states where its part of a device region's
-//! units lies ([`Request::Place`]) and takes its part of a host region,
-//! which the server creates ([`Request::HostPart`]). Another host's Storage
-//! Server holds the host copies it reads ([`Request::PeerHold`],
+//! units lies ([`Request::Place`]), or the head states it for a rank of
+//! another host ([`Request::PlaceRemote`]), and each rank takes its part of
+//! a host region, which the server creates ([`Request::HostPart`]). The
+//! head grants a device region's memory space each segment its ranks
+//! created ([`Request::Grant`]) and withdraws one before they release it
+//! ([`Request::Withdraw`]). The server reads the host copies of other hosts
+//! that serve the deployment for a prefetch from the peers; another host's
+//! Storage Server holds the host copies it reads ([`Request::PeerHold`],
 //! [`Request::PeerRelease`]).
 //!
 //! A span's source may lie on another host ([`Region::Remote`]): the
@@ -124,7 +129,7 @@ use crate::runtime::{Open, Opened};
 /// refuses a client of any other. The engine interface carries it
 /// (`proto::ENGINE_INTERFACE_VERSION`), so an engine built for another
 /// storage protocol is refused at its hello to the daemon as well.
-pub const VERSION: u32 = 22;
+pub const VERSION: u32 = 23;
 
 /// The most bytes a [`Request::Read`] responds with: a weight manifest of the
 /// largest models the library serves fits many times over, and a reply of
@@ -213,10 +218,11 @@ pub enum Role {
     /// A process of another host, connected to the server's TCP endpoint:
     /// that host's Transfer Server, which READs storage of this host through
     /// NIXL for the tasks of its own host and asks the server to expose
-    /// regions ([`Request::Expose`]), or that host's scheduler, which pins
-    /// the published pages it reads ([`Request::PeerPin`]). A peer states
-    /// no credential: the endpoint is unauthenticated and relies on network
-    /// isolation.
+    /// regions ([`Request::Expose`]), that host's scheduler, which pins
+    /// the published pages it reads ([`Request::PeerPin`]), or that host's
+    /// Storage Server, which holds the host copies of a buffer pool it
+    /// reads ([`Request::PeerHold`]). A peer states no credential: the
+    /// endpoint is unauthenticated and relies on network isolation.
     Peer,
     /// An operator's client, which lists what the server holds and retires
     /// deployments that are no longer served.
@@ -912,12 +918,13 @@ pub struct UnitRun {
 }
 
 /// A host copy another host's Storage Server holds for its reads
-/// ([`Request::PeerHold`]): the key, and the units of the host region
-/// `region` that hold it, `count` from `first`. Each part of the region
-/// ([`RegionPart`]) holds its bytes of those units.
+/// ([`Request::PeerHold`]): the key, the tokens its block holds, and the
+/// units of the host region `region` that hold it, `count` from `first`.
+/// Each part of the region ([`RegionPart`]) holds its bytes of those units.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HostCopy {
     pub key: Key,
+    pub tokens: u16,
     pub region: String,
     pub first: u32,
     pub count: u32,
@@ -1308,6 +1315,48 @@ pub enum Request {
         memory: String,
         runs: Vec<UnitRun>,
     },
+    /// From the head of an epoch whose session is open, on the host: where
+    /// the part of the units of the device region `region` lies for rank
+    /// `rank` of the device memory `memory`, a rank of another host, as
+    /// that rank stated it to its engine. The runs name tensors retained at
+    /// that host's Storage Server, listening at `endpoint`, whose Transfer
+    /// Server reaches them: a task writing them runs there, and one reading
+    /// them here READs them from there. It replaces what was stated before
+    /// for the rank, region and memory. Responded with [`Response::Placed`].
+    PlaceRemote {
+        region: String,
+        memory: String,
+        rank: u32,
+        endpoint: String,
+        runs: Vec<UnitRun>,
+    },
+    /// From the head of an epoch whose session is open, on the host: the
+    /// engine's ranks created the storages of `segment` of the device
+    /// region `region`, units `first` to `first + units` of its memory
+    /// space, on every rank that maps the region. The units the region
+    /// may allocate among them join the space's free ranges, from which a
+    /// resize grows its regions, and the segment joins the space's table,
+    /// which [`Response::Opened`] states to every later session. Responded
+    /// with [`Response::Granted`]; refused, changing nothing, when the
+    /// region is no device region of the deployment's buffer pool, the
+    /// units lie past its numbering, or the segment or a unit of it is in
+    /// the table, the free ranges or a region already.
+    Grant {
+        region: String,
+        segment: Segment,
+        first: u32,
+        units: u32,
+    },
+    /// From the head of an epoch whose session is open, on the host: the
+    /// engine's ranks are to release the storages of `segment` of the
+    /// memory space of the device region `region`. Its units leave the
+    /// space's free ranges and the segment leaves its table, so no region
+    /// grows into them again until a grant. Responded with
+    /// [`Response::Withdrawn`], after which the ranks may unmap and release
+    /// the storages; refused, changing nothing, while a unit of it is in a
+    /// region (a resize shrinks the regions first), or when the table holds
+    /// no such segment.
+    Withdraw { region: String, segment: Segment },
     /// From a worker: its rank's part of the host region `region` of its
     /// deployment's buffer pool, `bytes` of every unit, whose memfd the
     /// server creates at the first request (on `numa_node` when given) and
@@ -1471,6 +1520,8 @@ pub enum Response {
     Opened(Opened),
     Closed,
     Placed,
+    Granted,
+    Withdrawn,
     /// The rank's part of a host region, `units` units of the bytes the
     /// request stated: unit `u` at byte `u × bytes`. Its memfd travels with
     /// the response.

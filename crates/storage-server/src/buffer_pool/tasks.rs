@@ -8,7 +8,6 @@
 //! the tasks to start and to stop; whoever runs them reports each key done
 //! and the task's end.
 
-use std::cell::Cell;
 use std::rc::Rc;
 
 use storage::protocol::Key;
@@ -173,11 +172,7 @@ impl BufferPool {
         }
         // The slot's row: it reads the row of the source group, and holds
         // the blocks the task does not copy.
-        let slot = Rc::new(Block {
-            class: SLOT,
-            runs: vec![row],
-            valid: Cell::new(EVERYWHERE),
-        });
+        let slot = Rc::new(Block::new(SLOT, vec![row], EVERYWHERE, 0));
         let to = Target::Group { owner, to };
         copies.push(Copy {
             memory: 0,
@@ -188,7 +183,7 @@ impl BufferPool {
             deadline,
         });
 
-        self.copies.insert((queue, request), copies);
+        self.hold_copies((queue, request), copies);
         self.answers.insert((queue, request), Vec::new());
         self.started.push((queue, request));
         true
@@ -248,7 +243,10 @@ impl BufferPool {
         }
         found.group = to;
         let row = slot.runs.first().map_or(0, super::Run::first);
+        // The new row is the owner's slot, and the old one no longer.
+        slot.own();
         let old = std::mem::replace(&mut found.slot, slot);
+        old.disown();
         self.reclaim(old);
         Completion::Transferred { slot: row, runs }
     }
@@ -304,11 +302,7 @@ impl BufferPool {
             let Some(run) = self.regions[usize::from(region)].take(size) else {
                 break;
             };
-            let write = Rc::new(Block {
-                class,
-                runs: vec![run],
-                valid: Cell::new(EVERYWHERE),
-            });
+            let write = Rc::new(Block::new(class, vec![run], EVERYWHERE, 0));
             let to = Target::Entry {
                 key: *key,
                 remote: false,
@@ -328,7 +322,7 @@ impl BufferPool {
             }));
         }
 
-        self.copies.insert((queue, id), copies);
+        self.hold_copies((queue, id), copies);
         self.answers.insert((queue, id), found);
         self.started.push((queue, id));
         Ok(None)
@@ -372,7 +366,7 @@ impl BufferPool {
             return Ok(Some(Completion::Stored { keys: Vec::new() }));
         }
 
-        self.copies.insert((queue, id), copies);
+        self.hold_copies((queue, id), copies);
         self.answers.insert((queue, id), Vec::new());
         self.started.push((queue, id));
         Ok(None)
@@ -419,6 +413,7 @@ impl BufferPool {
                 // What the remote store and the peers hold is what every epoch may use.
                 Some(entry) if entry.host.is_none() && entry.class == class => {
                     entry.host = Some((Rc::clone(&copy.write), None));
+                    copy.write.cached.set(Some(key));
                     true
                 }
                 // R4: the key gained a host copy meanwhile and keeps it.
@@ -428,6 +423,7 @@ impl BufferPool {
                 }
                 None => {
                     let host = Some((Rc::clone(&copy.write), None));
+                    copy.write.cached.set(Some(key));
                     self.cache.insert(
                         key,
                         Entry {
@@ -445,10 +441,7 @@ impl BufferPool {
                 keys.push(key);
             }
         }
-        for block in copy.reads {
-            self.reclaim(block);
-        }
-        self.reclaim(copy.write);
+        self.drop_copy(task.0.0, copy);
 
         if last {
             self.copies.remove(&task);
@@ -463,6 +456,7 @@ impl BufferPool {
                 self.complete(task.0, task.1, completion);
             }
         }
+        self.settle_counts();
     }
 
     /// A5: a task is over and touches its blocks no more. R9: what it held
@@ -490,16 +484,14 @@ impl BufferPool {
         };
 
         for copy in copies {
-            for block in copy.reads {
-                self.reclaim(block);
-            }
-            self.reclaim(copy.write);
+            self.drop_copy(task.0.0, copy);
         }
         if let Some(completion) = completion {
             self.complete(task.0, task.1, completion);
         }
         self.sweep();
         self.settle();
+        self.settle_counts();
     }
 
     /// Tells the buffer pool the time. A task past its deadline is told to
@@ -547,5 +539,6 @@ impl BufferPool {
                 self.complete(task.0, task.1, completion);
             }
         }
+        self.settle_counts();
     }
 }

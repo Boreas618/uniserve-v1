@@ -23,7 +23,8 @@
 //! - The thread sends notices ([`Thread::notices`]): a task to start, with
 //!   what it copies, and a task to stop. A notice wakes the main loop
 //!   through a pipe in its poll set; a task runs on a child process, which
-//!   the main loop owns.
+//!   the main loop owns. The helpers that talk to other hosts' Storage
+//!   Servers for a task send their notices the same way ([`Notifier`]).
 //!
 //! Each turn, for each deployment: read each group's `completed` register
 //! and advance the pool; take the requests of each submission queue in
@@ -49,13 +50,13 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::io;
 use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
 use std::sync::atomic::Ordering;
-use std::sync::mpsc;
+use std::sync::{Arc, mpsc};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 use storage::QueuePair;
-use storage::protocol::{BufferPoolListing, HostCopy, Key};
+use storage::protocol::{BufferPoolListing, HostCopy, Key, Segment};
 use storage::runtime::{
     Cause, Completion, GroupId, Open, Opened, Registers, Request, RequestId, Source,
 };
@@ -97,12 +98,31 @@ pub(crate) type Copied = (
 /// `retiring`, `evictable` ([`BufferPool::capacity`]).
 type Capacity = (u32, u32, u32);
 
+/// What sends the main loop notices and wakes it: the buffer pool's
+/// thread, and the helpers that talk to other hosts for its tasks.
+#[derive(Clone)]
+pub(crate) struct Notifier {
+    notices: mpsc::Sender<Notice>,
+    /// The write end of the main loop's wake pipe.
+    wake: Arc<OwnedFd>,
+}
+
+impl Notifier {
+    /// Sends the main loop a notice and wakes it.
+    pub(crate) fn send(&self, notice: Notice) {
+        if self.notices.send(notice).is_ok() {
+            let _ = rustix::io::write(&*self.wake, b"n");
+        }
+    }
+}
+
 /// The main loop's end of the thread.
 pub(crate) struct Thread {
     work: Option<mpsc::Sender<Work>>,
     notices: mpsc::Receiver<Notice>,
     /// The read end of the pipe a notice wakes the main loop through.
     wake: OwnedFd,
+    notifier: Notifier,
     thread: Option<JoinHandle<()>>,
 }
 
@@ -125,6 +145,11 @@ impl Thread {
         let (reader, writer) = pipe_with(PipeFlags::CLOEXEC | PipeFlags::NONBLOCK)?;
         let (work, jobs) = mpsc::channel::<Work>();
         let (notify, notices) = mpsc::channel::<Notice>();
+        let notifier = Notifier {
+            notices: notify,
+            wake: Arc::new(writer),
+        };
+        let thread_notifier = notifier.clone();
         let (started, result) = mpsc::channel::<io::Result<()>>();
         let thread = std::thread::Builder::new()
             .name("buffer-pool".into())
@@ -147,8 +172,7 @@ impl Thread {
                     deployments,
                     frozen: false,
                     limits,
-                    notices: notify,
-                    wake: writer,
+                    notifier: thread_notifier,
                 };
                 serve(&jobs, pools);
             })?;
@@ -159,8 +183,14 @@ impl Thread {
             work: Some(work),
             notices,
             wake: reader,
+            notifier,
             thread: Some(thread),
         })
+    }
+
+    /// What a helper sends the main loop its notices with.
+    pub(crate) fn notifier(&self) -> Notifier {
+        self.notifier.clone()
     }
 
     /// Runs `work` on the thread, at its next turn.
@@ -250,9 +280,7 @@ pub(crate) struct Pools {
     frozen: bool,
     /// How long a transfer and a put to the remote store may take.
     limits: (u64, u64),
-    notices: mpsc::Sender<Notice>,
-    /// The write end of the main loop's wake pipe.
-    wake: OwnedFd,
+    notifier: Notifier,
 }
 
 /// One deployment's buffer pool and the queue pairs of its sessions.
@@ -415,11 +443,13 @@ impl Hosted {
         (busy || (!frozen && self.pool.deferred()), notices)
     }
 
-    /// The notice that starts a task: what it copies, by the names of
-    /// regions and memories, and for a prefetch its source.
+    /// The notice that starts a task: the epoch of its session, what it
+    /// copies, by the names of regions and memories, and for a prefetch
+    /// its source.
     fn start(&mut self, deployment: &str, task: (QueueId, RequestId)) -> Notice {
         let source = self.sources.remove(&task);
         let pool = &self.pool;
+        let epoch = pool.epoch(task.0.0).unwrap_or_default();
         let named = |runs: Vec<storage::runtime::Run>| -> Vec<NamedRun> {
             runs.into_iter()
                 .map(|(region, first, count)| {
@@ -448,7 +478,7 @@ impl Hosted {
             .collect();
         let deployment = deployment.to_owned();
         Box::new(move |server: &mut Server| {
-            server.start_pool_task(deployment, task, source, copies);
+            server.start_pool_task((deployment, epoch), task, source, copies);
         })
     }
 }
@@ -522,9 +552,56 @@ impl Pools {
 
     /// Sends the main loop a notice and wakes it.
     fn notify(&self, notice: Notice) {
-        if self.notices.send(notice).is_ok() {
-            let _ = rustix::io::write(&self.wake, b"n");
+        self.notifier.send(notice);
+    }
+
+    /// How long a transfer and a put to the remote store may take from now
+    /// on, in nanoseconds, in every pool.
+    pub(crate) fn set_limits(&mut self, limits: (u64, u64)) {
+        self.limits = limits;
+        for hosted in self.deployments.values_mut() {
+            hosted.pool.set_limits(limits);
         }
+    }
+
+    /// See [`BufferPool::grant_segment`], for the region `region` of the
+    /// pool of `deployment`.
+    pub(crate) fn grant(
+        &mut self,
+        deployment: &str,
+        region: &str,
+        segment: Segment,
+        first: u32,
+        units: u32,
+    ) -> Result<(), String> {
+        let hosted = self
+            .deployments
+            .get_mut(deployment)
+            .ok_or_else(|| format!("{deployment} has no buffer pool"))?;
+        let number = hosted
+            .pool
+            .region_number(region)
+            .ok_or_else(|| format!("no session of {deployment} stated a region {region}"))?;
+        hosted.pool.grant_segment(number, segment, first, units)
+    }
+
+    /// See [`BufferPool::withdraw_segment`], for the region `region` of the
+    /// pool of `deployment`.
+    pub(crate) fn withdraw(
+        &mut self,
+        deployment: &str,
+        region: &str,
+        segment: Segment,
+    ) -> Result<(), String> {
+        let hosted = self
+            .deployments
+            .get_mut(deployment)
+            .ok_or_else(|| format!("{deployment} has no buffer pool"))?;
+        let number = hosted
+            .pool
+            .region_number(region)
+            .ok_or_else(|| format!("no session of {deployment} stated a region {region}"))?;
+        hosted.pool.withdraw_segment(number, segment)
     }
 
     /// Opens an engine epoch's session with the pool of `deployment`
@@ -618,6 +695,10 @@ impl Pools {
             });
         }
         hosted.queues.extend(queues);
+        let segments = regions
+            .iter()
+            .map(|(number, _)| hosted.pool.segments_of(*number))
+            .collect();
         tracing::info!(
             deployment,
             epoch = open.epoch,
@@ -626,7 +707,14 @@ impl Pools {
             schedulers = open.schedulers.len(),
             "an engine epoch opened its session with the buffer pool"
         );
-        Ok((Opened { regions, registers }, descriptors))
+        Ok((
+            Opened {
+                regions,
+                segments,
+                registers,
+            },
+            descriptors,
+        ))
     }
 
     /// Ends the session of `epoch` of `deployment` and drops its queue
@@ -700,8 +788,9 @@ impl Pools {
         hosted.dirty = true;
         let held = hosted.pool.hold(peer, keys);
         held.into_iter()
-            .map(|(key, (region, first, count))| HostCopy {
+            .map(|(key, (region, first, count), tokens)| HostCopy {
                 key,
+                tokens,
                 region: hosted
                     .pool
                     .region_name(region)

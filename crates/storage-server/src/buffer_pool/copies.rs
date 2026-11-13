@@ -18,6 +18,33 @@ use super::{
 };
 
 impl BufferPool {
+    /// Records the copies the request `task` started. Each holds what it
+    /// reads and what it writes until it ends, and what it writes for a
+    /// target that exists, in place of no content others read, is private
+    /// by it.
+    pub(super) fn hold_copies(&mut self, task: (QueueId, RequestId), copies: Vec<Copy>) {
+        for copy in &copies {
+            copy.reads.iter().for_each(|block| self.touch(block));
+            if self.live(task.0.0, copy) {
+                copy.write.own();
+            }
+            self.touch(&copy.write);
+        }
+        self.copies.insert(task, copies);
+    }
+
+    /// A copy of the session `client` ended: it lets go of what it read and
+    /// what it wrote.
+    pub(super) fn drop_copy(&mut self, client: ClientId, copy: Copy) {
+        if self.live(client, &copy) {
+            copy.write.disown();
+        }
+        for block in copy.reads {
+            self.reclaim(block);
+        }
+        self.reclaim(copy.write);
+    }
+
     /// Whether a copy reads or writes for the owner: one that writes for a
     /// position of its tables or for its slot, or reads its slot.
     pub(super) fn copied(&self, client: ClientId, owner: OwnerId) -> bool {
@@ -98,7 +125,7 @@ impl BufferPool {
             fill: false,
             deadline: None,
         };
-        self.copies.insert((queue, id), vec![copy]);
+        self.hold_copies((queue, id), vec![copy]);
         Ok(Some(Completion::Copy {
             group,
             keys: vec![key],
@@ -224,7 +251,7 @@ impl BufferPool {
                 deadline: None,
             });
         }
-        self.copies.insert((queue, id), copies);
+        self.hold_copies((queue, id), copies);
         Ok(Some(Completion::Copy {
             group,
             keys: stated,
@@ -303,7 +330,7 @@ impl BufferPool {
                 deadline: None,
             });
         }
-        self.copies.insert((queue, id), copies);
+        self.hold_copies((queue, id), copies);
         Ok(Some(Completion::Copy {
             group,
             keys: stated,
@@ -357,7 +384,7 @@ impl BufferPool {
             fill: false,
             deadline: None,
         };
-        self.copies.insert((queue, id), vec![copy]);
+        self.hold_copies((queue, id), vec![copy]);
         Ok(Some(Completion::Copy {
             group,
             keys: vec![key],
@@ -402,7 +429,7 @@ impl BufferPool {
             fill: false,
             deadline: None,
         };
-        self.copies.insert((queue, id), vec![copy]);
+        self.hold_copies((queue, id), vec![copy]);
         Ok(Some(Completion::Copy {
             group,
             keys: vec![key],
@@ -481,6 +508,9 @@ impl BufferPool {
                             ),
                         };
                         if let Some(found) = self.owners.get_mut(&(client, owner)) {
+                            if let Held::Private(block) = &held {
+                                block.own();
+                            }
                             found.tables[usize::from(class)].insert(at, held);
                         }
                         completion
@@ -491,10 +521,7 @@ impl BufferPool {
                     Target::Group { .. } => Completion::Done,
                 };
             }
-            for block in copy.reads {
-                self.reclaim(block);
-            }
-            self.reclaim(copy.write);
+            self.drop_copy(client, copy);
         }
         completion
     }
@@ -539,6 +566,7 @@ impl BufferPool {
         }
         // The block is shared on the device and pinned for the owner.
         entry.device.push((Rc::clone(&copy.write), maker));
+        copy.write.cached.set(Some(key));
         (Held::Shared(Rc::clone(&copy.write)), answer)
     }
 
@@ -563,6 +591,7 @@ impl BufferPool {
         });
         if entry.host.is_none() {
             entry.host = Some((Rc::clone(&copy.write), maker));
+            copy.write.cached.set(Some(key));
         }
         answer
     }

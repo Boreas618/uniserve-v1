@@ -516,10 +516,12 @@ mod tests {
                     reserved: 1,
                     units: 9,
                     limit: 9,
+                    segments: Vec::new(),
                 })
                 .collect(),
             classes: Vec::new(),
             trajectory: 0,
+            peers: Vec::new(),
             groups: ids
                 .iter()
                 .map(|id| runtime::Group {
@@ -533,6 +535,7 @@ mod tests {
         };
         let opened = runtime::Opened {
             regions: ids.iter().map(|id| (id.0 + 1, 9)).collect(),
+            segments: Vec::new(),
             registers: vec![runtime::Registers {
                 completed: Vec::new(),
                 capacity: Vec::new(),

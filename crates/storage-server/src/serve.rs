@@ -54,6 +54,12 @@ pub struct ServeOptions {
     /// NIXL's C API library the Transfer Server's agent loads for copies
     /// between hosts; the loader's search path finds it when `None`.
     pub nixl_library: Option<PathBuf>,
+    /// How long a buffer pool's transfer of an owner between worker groups
+    /// may take before it is stopped and answered as failed.
+    pub transfer_deadline: Duration,
+    /// How long a buffer pool's put of host copies to the remote store may
+    /// take before it is stopped and answered with the keys put so far.
+    pub put_deadline: Duration,
     /// Go on with the server the predecessor of a restart in place passes on on
     /// the handoff socket at this descriptor, rather than binding the
     /// socket (`crate::restart`).
@@ -270,6 +276,7 @@ fn serve_on(options: &ServeOptions, ready: Option<service::Ready>) -> anyhow::Re
         tracing::info!(address = %bound, "accepting other hosts' page requests");
     }
     server.set_relaunch(crate::relaunch_arguments(std::env::args_os().collect()));
+    server.set_deadlines(options.transfer_deadline, options.put_deadline);
     tracing::info!(socket = %socket.display(), "storage server listening");
     signal(ready);
     run_until_stopped(server, &wake, &stop, lock)
@@ -280,12 +287,13 @@ fn serve_on(options: &ServeOptions, ready: Option<service::Ready>) -> anyhow::Re
 fn serve_resumed(options: &ServeOptions, descriptor: i32) -> anyhow::Result<()> {
     raise_descriptor_limit()?;
     let (wake, stop) = service::stop_signals().context("installing the stop signals")?;
-    let (server, lock) = Server::resume(
+    let (mut server, lock) = Server::resume(
         descriptor,
         connector_launch(options),
         Some(transfer_launch(options)),
     )
     .context("taking the server over from its predecessor")?;
+    server.set_deadlines(options.transfer_deadline, options.put_deadline);
     let lock = service::SocketLock::resume(lock, options.socket.clone());
     tracing::info!(socket = %options.socket.display(), "storage server listening after a restart in place");
     run_until_stopped(server, &wake, &stop, lock)

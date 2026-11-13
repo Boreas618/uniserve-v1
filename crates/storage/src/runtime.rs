@@ -22,7 +22,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::{Error, Key, Result};
+use crate::{Error, Key, Result, Segment};
 
 /// The version of this interface.
 pub const VERSION: u32 = 1;
@@ -96,7 +96,17 @@ pub struct Open {
     /// registers hold the `completed` word of each of its groups and the
     /// capacity words of each region its groups and their classes name.
     pub schedulers: Vec<Vec<GroupId>>,
+    /// The Storage Servers of the other hosts that serve the deployment
+    /// (`host:port`, each one's endpoint), which a prefetch from the peers
+    /// reads the host copies of, in the order they are asked.
+    pub peers: Vec<String>,
 }
+
+/// A region's segment table: each segment of its memory space, in the order
+/// of its first unit, as the segment (the epoch whose ranks created its
+/// storages, and its ordinal there), its first unit and its units. A rank
+/// derives the keys of its parts of a segment's storages from the segment.
+pub type Segments = Vec<(Segment, u32, u32)>;
 
 /// The memory blocks are taken from, on one tier and in one layout.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -116,6 +126,14 @@ pub struct Region {
     /// the region's numbering.
     pub units: u32,
     pub limit: u32,
+    /// The segments of a device region's memory the engine's ranks created
+    /// before the session opened, each in every rank that maps the region:
+    /// each joins the free ranges of the region's memory space as a
+    /// [`Request::Grant`](crate::protocol::Request::Grant) of it does, unless
+    /// the space's table holds it already. Empty for a host region, and for
+    /// memory of the ranks' own processes (slot rows, product buffers),
+    /// whose space is granted the units asked for.
+    pub segments: Segments,
 }
 
 /// A kind of block.
@@ -153,6 +171,10 @@ pub struct Opened {
     /// Per region of [`Open::regions`]: the number completions name it by,
     /// and the units in it.
     pub regions: Vec<(u8, u32)>,
+    /// Per region of [`Open::regions`]: the segment table of its memory
+    /// space, whose storages the epoch's ranks map, so that an epoch of the
+    /// same layout maps the segments another epoch created.
+    pub segments: Vec<Segments>,
     /// Per scheduler, where its queue pair's registers lie.
     pub registers: Vec<Registers>,
 }

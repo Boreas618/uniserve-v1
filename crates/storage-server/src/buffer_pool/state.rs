@@ -1,18 +1,150 @@
 //! What the buffer pool states about itself: the capacity words of a
 //! region, what each block is observed as ([`BlockState`], the first row
 //! that applies), what waits, and whether its tables are consistent.
+//!
+//! The capacity words are made of counts the regions keep: the free units,
+//! the units of shared blocks nothing but their entry holds (evictable, and
+//! available to the queue pairs whose order names their keys), and the
+//! units of retired blocks. A block records what its units count as
+//! ([`Counted`]), which follows from whether an entry holds it, how many
+//! references make it private, and how many it has.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::rc::Rc;
 
 use storage::protocol::{
-    BlockCount, BlockState, BufferPoolListing, CopyListing, GroupListing, Waiting,
+    BlockCount, BlockState, BufferPoolListing, CopyListing, GroupListing, Key, Waiting,
 };
 use storage::runtime::Tier;
 
-use super::{Block, BufferPool, ClientId, Copy, Deferred, Held, QueueId, SLOT, Target};
+use super::{Block, BufferPool, ClientId, Copy, Counted, Deferred, Held, QueueId, SLOT, Target};
+
+/// Per block, by its address: the key an entry caches it under.
+type CachedBy = HashMap<*const Block, Key>;
+
+/// Per block, by its address: the references that make it private.
+type Owning = HashMap<*const Block, u32>;
+
+/// What a block's units count as, with `references` references held: a
+/// shared block only its entry holds is evictable, and a block no entry
+/// holds and no reference makes private is retired.
+fn counted(block: &Block, references: usize) -> Counted {
+    match block.cached.get() {
+        Some(key) if references == 1 => Counted::Evictable(key),
+        Some(_) => Counted::Nothing,
+        None if references > 0 && block.owned.get() == 0 => Counted::Retired,
+        None => Counted::Nothing,
+    }
+}
 
 impl BufferPool {
+    /// Notes that the holders of a block changed: it is counted again once
+    /// the handler running now is done ([`Self::settle_counts`]).
+    pub(super) fn touch(&self, block: &Rc<Block>) {
+        self.touched.borrow_mut().push(Rc::downgrade(block));
+    }
+
+    /// Counts again every block whose holders changed since the last time:
+    /// the work of the requests that changed them, never a scan.
+    pub(super) fn settle_counts(&mut self) {
+        let touched = std::mem::take(self.touched.get_mut());
+        for noted in touched {
+            // A block gone meanwhile left its counts with its last reference.
+            if let Some(block) = noted.upgrade() {
+                // The reference upgraded here is no holder's.
+                let now = counted(&block, Rc::strong_count(&block) - 1);
+                self.count(&block, now);
+            }
+        }
+    }
+
+    /// The last reference to a block goes: its units count as nothing.
+    pub(super) fn uncount(&mut self, block: &Block) {
+        self.count(block, Counted::Nothing);
+    }
+
+    /// Moves a block's units from what they were counted as to `now`, in
+    /// every region it has a run of.
+    fn count(&mut self, block: &Block, now: Counted) {
+        let was = block.counted.get();
+        if was == now {
+            return;
+        }
+        block.counted.set(now);
+        for run in &block.runs {
+            let region = &mut self.regions[usize::from(run.region())];
+            for (state, adds) in [(was, false), (now, true)] {
+                match state {
+                    Counted::Nothing => {}
+                    Counted::Evictable(key) => region.count_evictable(&key, run.count(), adds),
+                    Counted::Retired => region.count_retiring(run.count(), adds),
+                }
+            }
+        }
+    }
+
+    /// Whether a copy of the session `client` makes the block it writes
+    /// private: it writes for a target that exists, in place of no content
+    /// others read.
+    pub(super) fn live(&self, client: ClientId, copy: &Copy) -> bool {
+        self.target_exists(client, &copy.to) && !written_in_place(copy)
+    }
+
+    /// By a scan of every holder: the key each cached block is cached
+    /// under, and the references that make each block private.
+    fn holders(&self) -> (CachedBy, Owning) {
+        let mut cached = HashMap::new();
+        for (key, entry) in &self.cache {
+            for (block, _) in entry.device.iter().chain(&entry.host) {
+                cached.insert(Rc::as_ptr(block), *key);
+            }
+        }
+        let mut owned: Owning = HashMap::new();
+        let mut own = |block: &Rc<Block>| *owned.entry(Rc::as_ptr(block)).or_default() += 1;
+        for owner in self.owners.values() {
+            own(&owner.slot);
+            for held in owner.tables.iter().flat_map(BTreeMap::values) {
+                if let Held::Private(block) = held {
+                    own(block);
+                }
+            }
+        }
+        for (_, work) in self.groups.values().flat_map(|group| &group.deferred) {
+            if let Deferred::Commit { block, .. } = work {
+                own(block);
+            }
+        }
+        for ((queue, _), copies) in &self.copies {
+            for copy in copies.iter().filter(|copy| self.live(queue.0, copy)) {
+                own(&copy.write);
+            }
+        }
+        (cached, owned)
+    }
+
+    /// Counts every block from its holders, and every region afresh: of a
+    /// pool made from an image, which leaves the counts out.
+    pub(super) fn recount(&mut self) {
+        for region in &mut self.regions {
+            region.recount();
+        }
+        let (cached, owned) = self.holders();
+        let blocks: Vec<Rc<Block>> = self
+            .blocks()
+            .into_iter()
+            .map(|(block, _, _)| Rc::clone(block))
+            .collect();
+        for block in blocks {
+            let at = Rc::as_ptr(&block);
+            block.cached.set(cached.get(&at).copied());
+            block.owned.set(owned.get(&at).copied().unwrap_or(0));
+            block.counted.set(Counted::Nothing);
+            // The reference cloned here is no holder's.
+            let now = counted(&block, Rc::strong_count(&block) - 1);
+            self.count(&block, now);
+        }
+        self.touched.get_mut().clear();
+    }
     /// Whether what a copy writes for still exists.
     fn target_exists(&self, client: ClientId, target: &Target) -> bool {
         match target {
@@ -178,54 +310,106 @@ impl BufferPool {
     /// without a pin, in any order or none.
     pub fn capacity(&self, queue: QueueId, region: u8) -> (u32, u32, u32) {
         let found = &self.regions[usize::from(region)];
-        let unheld = |key| {
-            let copy = self.cache.get(key).and_then(|entry| entry.copy_in(region));
-            copy.filter(|block| Rc::strong_count(block) == 1)
-                .map_or(0, |block| block.units())
-        };
-        let evictable = self.cache.keys().map(unheld).sum();
-        let mut order: Vec<_> = found
-            .orders
-            .get(&queue)
-            .map_or(&[][..], Vec::as_slice)
-            .to_vec();
-        order.sort_unstable();
-        order.dedup();
-        let installed: u32 = order.iter().map(unheld).sum();
+        (found.available(queue), found.retiring, found.evictable)
+    }
 
-        // A block is retired when every reference to it is a deferred
-        // release's, a read's, or a write's for a target that is gone.
-        let mut passing: HashMap<*const Block, (&Rc<Block>, usize)> = HashMap::new();
-        let mut pass = |block| passing.entry(Rc::as_ptr(block)).or_insert((block, 0)).1 += 1;
-        for (_, work) in self.groups.values().flat_map(|group| &group.deferred) {
-            if let Deferred::Release { blocks } = work {
-                blocks.iter().for_each(&mut pass);
+    /// The capacity words of every region and queue pair, by a scan of
+    /// every holder: what the counts must equal. Per region: its free
+    /// units, evictable and retiring units, and per queue pair with an
+    /// order there its installed units.
+    fn scanned_words(&self) -> Vec<(u32, u32, u32, BTreeMap<QueueId, u32>)> {
+        let blocks = self.blocks();
+        let mut words: Vec<_> = self
+            .regions
+            .iter()
+            .map(|region| (region.free_scanned(), 0, 0, BTreeMap::new()))
+            .collect();
+        let mut evictable: HashSet<*const Block> = HashSet::new();
+        for (block, observed, _) in &blocks {
+            let only_entry = *observed == BlockState::Shared && Rc::strong_count(block) == 1;
+            if only_entry {
+                evictable.insert(Rc::as_ptr(block));
             }
-        }
-        self.peers.values().flatten().for_each(&mut pass);
-        for ((of, _), copies) in &self.copies {
-            for copy in copies {
-                copy.reads.iter().for_each(&mut pass);
-                if !self.target_exists(of.0, &copy.to) {
-                    pass(&copy.write);
+            for run in &block.runs {
+                let counts = &mut words[usize::from(run.region())];
+                if only_entry {
+                    counts.1 += run.count();
+                } else if *observed == BlockState::Retired {
+                    counts.2 += run.count();
                 }
             }
         }
-        let retired = passing
-            .values()
-            .filter(|(block, references)| Rc::strong_count(block) == *references);
-        let retiring = retired
-            .map(|(block, _)| {
-                block
-                    .runs
-                    .iter()
-                    .filter(|run| run.region() == region)
-                    .map(super::Run::count)
-                    .sum::<u32>()
-            })
-            .sum();
+        for (id, region) in self.regions.iter().enumerate() {
+            for (queue, order) in &region.orders {
+                let distinct: HashSet<&Key> = order.iter().collect();
+                let installed = distinct
+                    .into_iter()
+                    .filter_map(|key| self.cache.get(key)?.copy_in(id as u8))
+                    .filter(|block| evictable.contains(&Rc::as_ptr(block)))
+                    .map(|block| block.units())
+                    .sum();
+                words[id].3.insert(*queue, installed);
+            }
+        }
+        words
+    }
 
-        (found.free_units() + installed, retiring, evictable)
+    /// Checks the counts the capacity words are made of against a scan:
+    /// what each block records against its holders, and each region's
+    /// counts against its blocks and orders. Returns the first difference.
+    fn check_counts(&self) -> Result<(), String> {
+        if !self.touched.borrow().is_empty() {
+            return Err("a handler left blocks it touched uncounted".into());
+        }
+        let (cached, owned) = self.holders();
+        for (block, _, references) in self.blocks() {
+            let at = Rc::as_ptr(block);
+            let recorded = (block.cached.get(), block.owned.get());
+            let held = (
+                cached.get(&at).copied(),
+                owned.get(&at).copied().unwrap_or(0),
+            );
+            let first = block.stated().next();
+            if recorded != held {
+                return Err(format!(
+                    "block {first:?} records {recorded:?} of cache and owners, its holders {held:?}"
+                ));
+            }
+            if block.counted.get() != counted(block, references) {
+                return Err(format!(
+                    "block {first:?} counts as {:?}, its holders make it {:?}",
+                    block.counted.get(),
+                    counted(block, references)
+                ));
+            }
+        }
+        for (id, (region, words)) in self.regions.iter().zip(self.scanned_words()).enumerate() {
+            let (free, evictable, retiring, installed) = words;
+            let counts = (region.free_units(), region.evictable, region.retiring);
+            if counts != (free, evictable, retiring) {
+                return Err(format!(
+                    "region {id} counts {counts:?} free, evictable and retiring units, a scan \
+                     {:?}",
+                    (free, evictable, retiring)
+                ));
+            }
+            let kept: BTreeMap<QueueId, u32> = region
+                .installed
+                .iter()
+                .map(|(queue, (_, units))| (*queue, *units))
+                .collect();
+            let named = region.installed.iter().all(|(queue, (keys, _))| {
+                let order = region.orders.get(queue).map_or(&[][..], Vec::as_slice);
+                *keys == order.iter().copied().collect::<HashSet<Key>>()
+            });
+            if kept != installed || !named {
+                return Err(format!(
+                    "region {id} counts {kept:?} units in the queue pairs' orders, a scan \
+                     {installed:?}"
+                ));
+            }
+        }
+        Ok(())
     }
 
     /// Checks that the tables are consistent: every unit of every region is
@@ -233,7 +417,8 @@ impl BufferPool {
     /// every block is held as often as its references say; a private block
     /// is in one place; a pin is of a cached block; an entry of an owner's
     /// table is valid in the owner's group; no two regions hold the same
-    /// bytes. Returns the first inconsistency.
+    /// bytes; the counts the capacity words are made of are those a scan
+    /// finds. Returns the first inconsistency.
     pub fn check(&self) -> Result<(), String> {
         let blocks = self.blocks();
 
@@ -392,6 +577,6 @@ impl BufferPool {
                 }
             }
         }
-        Ok(())
+        self.check_counts()
     }
 }

@@ -15,37 +15,50 @@
 //!   the processes are the main process and every worker of the epoch the
 //!   server knows.
 //! - **Where units lie.** A rank states where its part of a device region's
-//!   units lies ([`Request::Place`]). A host region is one memfd per rank
-//!   index, which the server creates as it creates a page pool, admitted
-//!   with the host's storage when a session first states the region
+//!   units lies ([`Request::Place`]); the head states it for a rank of
+//!   another host, whose tensors that host's Storage Server retains
+//!   ([`Request::PlaceRemote`]). A host region is one memfd per rank index,
+//!   which the server creates as it creates a page pool, admitted with the
+//!   host's storage when a session first states the region
 //!   ([`Request::HostPart`]). With them a task's runs turn into the Transfer
 //!   Server's spans and the connector's pages.
+//! - **Segments.** The head grants a device region's memory space each
+//!   segment the engine's ranks created ([`Request::Grant`]), and withdraws
+//!   one before they release it ([`Request::Withdraw`]); `Open`'s answer
+//!   states each region's segment table.
 //! - **Tasks.** A transfer between worker groups goes to the Transfer
 //!   Server as one task of spans, field by field and rank by rank, from each
 //!   rank of the memory the content is in to the rank of the same index of
 //!   the target memory; a region no rank placed (slot rows, product
 //!   buffers) is memory of the ranks' own processes, whose copies move no
-//!   bytes. A prefetch from the remote store and a put to it go to the
+//!   bytes. The spans into a rank of another host run on that host's
+//!   Transfer Server, and a source on another host is read from there
+//!   ([`hosts`]). A prefetch from the remote store and a put to it go to the
 //!   connector as the pages of each part of the host region, a block of `n`
 //!   units being `n` pages under keys derived from its key ([`unit_key`]).
-//!   A child's report ends the task; a child's loss ends its tasks as
-//!   failed once its process has exited, so an end is reported only when
-//!   nothing touches the blocks any more (A5). A prefetch from the peers
-//!   ends at once having found nothing: the server knows no peer endpoint.
+//!   A prefetch from the peers holds the keys at the peers the session
+//!   names, has this host's Transfer Server read each held copy from the
+//!   peer's parts of its host region, and keeps what was read only from a
+//!   peer whose holds stood until the read ended ([`hosts`]). A child's
+//!   report ends the task; a child's loss ends its tasks as failed once its
+//!   process has exited, so an end is reported only when nothing touches
+//!   the blocks any more (A5).
 //! - **Peers.** Another host's Storage Server holds the host copies it
 //!   reads ([`Request::PeerHold`]) until it releases them
 //!   ([`Request::PeerRelease`]) or its connection closes.
 
+mod hosts;
 pub(crate) mod polling;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::os::fd::OwnedFd;
-use std::sync::Arc;
+use std::sync::{Arc, mpsc};
+use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 use storage::protocol::{
     Allocation, ErrorKind, Event, Key, Location, PageShape, Priority, Region, RegionPart, Response,
-    Role, Span, StorageRecord, UnitRun,
+    Role, Segment, Span, StorageRecord, UnitRun,
 };
 use storage::runtime::{self, Open, RequestId, Source, Tier};
 
@@ -55,16 +68,18 @@ use crate::{
     Attachment, Client, ClientId, Handling, Holder, Server, StorageEntry, StorageId, invalid,
     resource,
 };
-use polling::Copied;
+use polling::{Copied, NamedRun};
 
 #[cfg(doc)]
 use storage::protocol::Request;
 
-/// How long a transfer between worker groups may take, in nanoseconds.
-const TRANSFER_LIMIT: u64 = 60_000_000_000;
+/// How long a transfer between worker groups may take unless the server's
+/// options say otherwise (`--transfer-deadline-s`).
+pub(crate) const TRANSFER_DEADLINE: Duration = Duration::from_secs(60);
 
-/// How long a put to the remote store may take, in nanoseconds.
-const PUT_LIMIT: u64 = 60_000_000_000;
+/// How long a put to the remote store may take unless the server's options
+/// say otherwise (`--put-deadline-s`).
+pub(crate) const PUT_DEADLINE: Duration = Duration::from_secs(60);
 
 /// The tokens a block brought from the remote store holds: the store keeps
 /// no count, and it keeps whole blocks.
@@ -76,6 +91,14 @@ type PoolTask = (QueueId, RequestId);
 /// Where a rank states the units of a device region lie: its deployment, the
 /// region, the device memory and the rank index.
 type Place = (String, String, String, u32);
+
+/// Where a rank's units lie: the endpoint of the Storage Server of its host
+/// when it is another host, at which its runs' tensors are retained, and
+/// the runs.
+type Placed = (Option<String>, Vec<UnitRun>);
+
+/// A session: its deployment and its epoch.
+type Session = (String, u64);
 
 /// The pages of a part of a host region a connector task moves, with the
 /// copy of the pool's task each page is of.
@@ -99,7 +122,9 @@ pub(crate) struct Sessions {
     parts: BTreeMap<(String, String, u32), Part>,
     /// Where the units of the device regions lie, by deployment, region,
     /// device memory and rank index, as each rank stated it.
-    places: BTreeMap<Place, Vec<UnitRun>>,
+    places: BTreeMap<Place, Placed>,
+    /// The peers each session names, which a prefetch from the peers reads.
+    peers: BTreeMap<Session, Vec<String>>,
     /// The pools' tasks that run on a child, by the number the server gave
     /// each.
     running: BTreeMap<u64, Running>,
@@ -110,6 +135,10 @@ pub(crate) struct Sessions {
     /// The epochs on trial whose update was rolled back while their session
     /// was open: the pool rolls each back once its session closes.
     rolled: BTreeSet<(String, u64)>,
+    /// How long a transfer between worker groups may take. A helper that
+    /// runs one on another host cancels it after that long too, and then
+    /// waits that long again for its end.
+    transfer_deadline: Duration,
 }
 
 /// One rank's part of a host region: the storage that holds it, its bytes
@@ -121,15 +150,45 @@ struct Part {
     pool: u64,
 }
 
-/// A pool's task that runs on a child: its deployment and the pool's task;
-/// for the connector, the keys of its copies in their order, each with
-/// whether every page of it moved so far, and the connector's tasks that
-/// have not reported.
+/// A pool's task that runs on a child or on another host: its session and
+/// the pool's task; the keys of its copies in their order, each with
+/// whether every page of it moved so far; and its parts that have not
+/// reported, the connector's tasks or the transfers here and on other
+/// hosts, with whether every part that reported ended well.
 struct Running {
-    deployment: String,
+    session: Session,
     task: PoolTask,
     keys: Vec<(Key, bool)>,
     waiting: usize,
+    ok: bool,
+    /// The task was told to stop: what it has not started, it does not.
+    stopped: bool,
+    /// What cancels its transfers on other hosts' Transfer Servers.
+    cancels: Vec<mpsc::Sender<()>>,
+    /// A read from the peers: what has the helper release its holds once
+    /// dropped, and per copy the peer connection it is read from with the
+    /// tokens its block holds, for the leading copies being read.
+    release: Option<mpsc::Sender<()>>,
+    reads: Vec<(usize, u16)>,
+    /// For a read from the peers, the block each copy writes.
+    writes: Vec<NamedRun>,
+}
+
+impl Running {
+    fn new(session: Session, task: PoolTask, keys: Vec<(Key, bool)>) -> Self {
+        Self {
+            session,
+            task,
+            keys,
+            waiting: 0,
+            ok: true,
+            stopped: false,
+            cancels: Vec::new(),
+            release: None,
+            reads: Vec::new(),
+            writes: Vec::new(),
+        }
+    }
 }
 
 /// What the sessions are as a restart in place hands them over: the
@@ -146,15 +205,32 @@ pub(crate) struct SessionsHandoff {
     gone: Vec<((String, u64), Vec<usize>)>,
     hosts: Vec<((String, String), (u32, u64))>,
     parts: Vec<((String, String, u32), Part)>,
-    places: Vec<(Place, Vec<UnitRun>)>,
+    places: Vec<(Place, Placed)>,
+    peers: Vec<(Session, Vec<String>)>,
     next: u64,
     rolled: Vec<(String, u64)>,
+}
+
+/// The limits of a transfer and of a put to the remote store, in
+/// nanoseconds, as the buffer pool keeps them.
+fn limits(transfer: Duration, put: Duration) -> (u64, u64) {
+    let nanoseconds = |deadline: Duration| u64::try_from(deadline.as_nanos()).unwrap_or(u64::MAX);
+    (nanoseconds(transfer), nanoseconds(put))
 }
 
 impl Sessions {
     /// No session, and the buffer pool's thread started.
     pub(crate) fn new() -> std::io::Result<Self> {
-        Self::with(polling::Thread::start((TRANSFER_LIMIT, PUT_LIMIT), None)?)
+        let limits = limits(TRANSFER_DEADLINE, PUT_DEADLINE);
+        Self::with(polling::Thread::start(limits, None)?)
+    }
+
+    /// How long a transfer between worker groups and a put to the remote
+    /// store may take from now on.
+    pub(crate) fn set_deadlines(&mut self, transfer: Duration, put: Duration) {
+        self.transfer_deadline = transfer;
+        let limits = limits(transfer, put);
+        self.thread.send(move |pools| pools.set_limits(limits));
     }
 
     fn with(thread: polling::Thread) -> std::io::Result<Self> {
@@ -165,10 +241,12 @@ impl Sessions {
             hosts: BTreeMap::new(),
             parts: BTreeMap::new(),
             places: BTreeMap::new(),
+            peers: BTreeMap::new(),
             running: BTreeMap::new(),
             next: 1,
             lost: Vec::new(),
             rolled: BTreeSet::new(),
+            transfer_deadline: TRANSFER_DEADLINE,
         })
     }
 
@@ -223,6 +301,7 @@ impl Sessions {
             hosts: std::mem::take(&mut self.hosts).into_iter().collect(),
             parts: std::mem::take(&mut self.parts).into_iter().collect(),
             places: std::mem::take(&mut self.places).into_iter().collect(),
+            peers: std::mem::take(&mut self.peers).into_iter().collect(),
             next: self.next,
             rolled: std::mem::take(&mut self.rolled).into_iter().collect(),
         };
@@ -238,7 +317,8 @@ impl Sessions {
         pidfd: impl Fn(usize) -> std::io::Result<Arc<OwnedFd>>,
     ) -> std::io::Result<Self> {
         let image = Some((handoff.image, queues));
-        let thread = polling::Thread::start((TRANSFER_LIMIT, PUT_LIMIT), image)?;
+        let limits = limits(TRANSFER_DEADLINE, PUT_DEADLINE);
+        let thread = polling::Thread::start(limits, image)?;
         let mut sessions = Self::with(thread)?;
         sessions.open = handoff.open.into_iter().collect();
         for (session, indices) in handoff.gone {
@@ -251,6 +331,7 @@ impl Sessions {
         sessions.hosts = handoff.hosts.into_iter().collect();
         sessions.parts = handoff.parts.into_iter().collect();
         sessions.places = handoff.places.into_iter().collect();
+        sessions.peers = handoff.peers.into_iter().collect();
         sessions.next = handoff.next;
         sessions.rolled = handoff.rolled.into_iter().collect();
         Ok(sessions)
@@ -414,8 +495,93 @@ impl Server {
                 (region.limit, region.unit_bytes),
             );
         }
+        self.sessions
+            .peers
+            .insert(session.clone(), open.peers.clone());
         self.sessions.open.insert(session, id);
         Ok(Handling::Descriptors(Response::Opened(opened), descriptors))
+    }
+
+    /// Whether the head `id` of `epoch` of `deployment` is on the host and
+    /// the epoch's session is open: what the requests a head makes about its
+    /// session's memory need.
+    fn session_head(
+        &self,
+        id: ClientId,
+        deployment: &str,
+        epoch: u64,
+    ) -> Result<(), (ErrorKind, String)> {
+        if self
+            .clients
+            .get(&id)
+            .is_none_or(|client| client.pidfd.is_none())
+        {
+            return Err(invalid("a session's memory is stated on its host"));
+        }
+        if !self
+            .sessions
+            .open
+            .contains_key(&(deployment.to_owned(), epoch))
+        {
+            return Err(invalid(&format!(
+                "no session of epoch {epoch} of {deployment} is open"
+            )));
+        }
+        Ok(())
+    }
+
+    /// See [`Request::Grant`], from the head `id` of `epoch` of `deployment`.
+    pub(crate) fn grant(
+        &mut self,
+        id: ClientId,
+        (deployment, epoch): (&str, u64),
+        region: &str,
+        segment: Segment,
+        (first, units): (u32, u32),
+    ) -> Result<Handling, (ErrorKind, String)> {
+        self.session_head(id, deployment, epoch)?;
+        let (named, region_name) = (deployment.to_owned(), region.to_owned());
+        self.sessions
+            .thread
+            .call(move |pools| pools.grant(&named, &region_name, segment, first, units))
+            .ok_or_else(|| resource(std::io::Error::other("the buffer pool's thread ended")))?
+            .map_err(|refusal| invalid(&format!("{region}: {refusal}")))?;
+        tracing::info!(
+            deployment,
+            region,
+            epoch = segment.epoch,
+            ordinal = segment.ordinal,
+            first,
+            units,
+            "a segment joined a memory space"
+        );
+        Ok(Handling::Response(Response::Granted, Vec::new()))
+    }
+
+    /// See [`Request::Withdraw`], from the head `id` of `epoch` of
+    /// `deployment`.
+    pub(crate) fn withdraw(
+        &mut self,
+        id: ClientId,
+        (deployment, epoch): (&str, u64),
+        region: &str,
+        segment: Segment,
+    ) -> Result<Handling, (ErrorKind, String)> {
+        self.session_head(id, deployment, epoch)?;
+        let (named, region_name) = (deployment.to_owned(), region.to_owned());
+        self.sessions
+            .thread
+            .call(move |pools| pools.withdraw(&named, &region_name, segment))
+            .ok_or_else(|| resource(std::io::Error::other("the buffer pool's thread ended")))?
+            .map_err(|refusal| invalid(&format!("{region}: {refusal}")))?;
+        tracing::info!(
+            deployment,
+            region,
+            epoch = segment.epoch,
+            ordinal = segment.ordinal,
+            "a segment left a memory space"
+        );
+        Ok(Handling::Response(Response::Withdrawn, Vec::new()))
     }
 
     /// See [`Request::Close`], from a head of `epoch` of `deployment`.
@@ -427,6 +593,7 @@ impl Server {
         let session = (deployment.to_owned(), epoch);
         let known = self.sessions.open.remove(&session).is_some()
             | self.sessions.gone.remove(&session).is_some();
+        self.sessions.peers.remove(&session);
         let rolled = self.sessions.rolled.remove(&session);
         let named = deployment.to_owned();
         let closed = self
@@ -471,7 +638,41 @@ impl Server {
             memory.to_owned(),
             holder.scope.rank,
         );
-        self.sessions.places.insert(place, runs.to_vec());
+        self.sessions.places.insert(place, (None, runs.to_vec()));
+        Ok(Handling::Response(Response::Placed, Vec::new()))
+    }
+
+    /// See [`Request::PlaceRemote`], from the head `id` of `epoch` of
+    /// `deployment`: `rank` of `memory` lies on the host whose Storage
+    /// Server listens at `endpoint`.
+    pub(crate) fn place_remote(
+        &mut self,
+        id: ClientId,
+        (deployment, epoch): (&str, u64),
+        (region, memory, rank): (&str, &str, u32),
+        endpoint: &str,
+        runs: &[UnitRun],
+    ) -> Result<Handling, (ErrorKind, String)> {
+        self.session_head(id, deployment, epoch)?;
+        if endpoint.is_empty() {
+            return Err(invalid(
+                "a rank of another host names the endpoint of its host's Storage Server",
+            ));
+        }
+        if let Some(run) = runs.iter().find(|run| run.count == 0 || run.bytes == 0) {
+            return Err(invalid(&format!(
+                "a run of {} holds no unit or no byte",
+                run.field
+            )));
+        }
+        let place = (
+            deployment.to_owned(),
+            region.to_owned(),
+            memory.to_owned(),
+            rank,
+        );
+        let placed = (Some(endpoint.to_owned()), runs.to_vec());
+        self.sessions.places.insert(place, placed);
         Ok(Handling::Response(Response::Placed, Vec::new()))
     }
 
@@ -759,6 +960,7 @@ impl Server {
             .collect();
         for session in out {
             self.sessions.gone.remove(&session);
+            self.sessions.peers.remove(&session);
             let rolled = self.sessions.rolled.remove(&session);
             let (deployment, epoch) = session;
             tracing::info!(
@@ -806,12 +1008,13 @@ impl Server {
         }
     }
 
-    /// A pool's task starts: a transfer goes to the Transfer Server, a
-    /// prefetch from the remote store and a put to the connector; whatever
-    /// cannot run ends at once as failed.
+    /// A pool's task starts: a transfer goes to the Transfer Servers of the
+    /// hosts its destinations lie on, a prefetch from the remote store and
+    /// a put to the connector, a prefetch from the peers to the peers its
+    /// session names; whatever cannot run ends at once as failed.
     pub(crate) fn start_pool_task(
         &mut self,
-        deployment: String,
+        session: Session,
         task: PoolTask,
         source: Option<Source>,
         copies: Vec<Copied>,
@@ -822,23 +1025,15 @@ impl Server {
             .iter()
             .filter_map(|(key, ..)| key.map(|key| (key, true)))
             .collect();
-        self.sessions.running.insert(
-            number,
-            Running {
-                deployment: deployment.clone(),
-                task,
-                keys,
-                waiting: 0,
-            },
-        );
+        let deployment = session.0.clone();
+        let running = Running::new(session.clone(), task, keys);
+        self.sessions.running.insert(number, running);
         let started = if copies.iter().all(|(key, ..)| key.is_none()) {
-            self.transfer_blocks(&deployment, number, &copies)
+            self.transfer_blocks(&session, number, &copies)
         } else if copies.iter().all(|(_, reads, ..)| reads.is_empty()) {
             match source {
                 Some(Source::Remote) => self.move_pages(&deployment, number, &copies, false),
-                Some(Source::Peers) | None => {
-                    Err("the server knows no peer to prefetch from".to_owned())
-                }
+                Some(Source::Peers) | None => self.read_from_peers(&session, number, &copies),
             }
         } else {
             self.move_pages(&deployment, number, &copies, true)
@@ -854,36 +1049,45 @@ impl Server {
         }
     }
 
-    /// A transfer's spans as one task of the Transfer Server. Returns
-    /// whether the task moves bytes.
+    /// The ranks of a deployment's memory that placed a region's units,
+    /// by rank index, with where their units lie.
+    fn ranks(&self, deployment: &str, region: &str, memory: &str) -> BTreeMap<u32, &Placed> {
+        self.sessions
+            .places
+            .iter()
+            .filter(|((of, name, at, _), _)| of == deployment && name == region && at == memory)
+            .map(|((_, _, _, rank), placed)| (*rank, placed))
+            .collect()
+    }
+
+    /// A transfer's spans as one task of the Transfer Server of each host
+    /// a destination lies on: this host's, or another's through its
+    /// Storage Server ([`hosts::transfer_at`]). A source on another host
+    /// than its destination's is read from there. Returns whether the task
+    /// moves bytes.
     fn transfer_blocks(
         &mut self,
-        deployment: &str,
+        session: &Session,
         number: u64,
         copies: &[Copied],
     ) -> Result<bool, String> {
-        let mut all = Vec::new();
+        let deployment = session.0.as_str();
+        // By the host of the destinations, `None` for this one: the spans,
+        // each with whether its source is storage of this host that
+        // another host reads.
+        let mut tasks: BTreeMap<Option<String>, Vec<(Span, bool)>> = BTreeMap::new();
         for (_, reads, writes, from, to) in copies {
             let Some(to) = to else {
                 // The slot row: memory of the ranks' own processes.
                 continue;
             };
             for ((region, first, count), _) in reads.iter().zip(writes) {
-                let ranks = |memory: &str| {
-                    let places = self.sessions.places.iter();
-                    places
-                        .filter(|((of, name, at, _), _)| {
-                            of == deployment && name == region && at == memory
-                        })
-                        .map(|((_, _, _, rank), runs)| (*rank, runs))
-                        .collect::<BTreeMap<u32, &Vec<UnitRun>>>()
-                };
                 // The content is read from a memory that holds it and whose
                 // ranks placed the region's units.
-                let destinations = ranks(to);
+                let destinations = self.ranks(deployment, region, to);
                 let source = from
                     .iter()
-                    .map(|memory| (memory, ranks(memory)))
+                    .map(|memory| (memory, self.ranks(deployment, region, memory)))
                     .find(|(_, sources)| !sources.is_empty());
                 let Some((from, sources)) = source else {
                     if destinations.is_empty() {
@@ -896,21 +1100,236 @@ impl Server {
                 if destinations.is_empty() {
                     return Err(format!("no rank of {to} placed the units of {region}"));
                 }
-                for (rank, destination) in destinations {
-                    let source = sources.get(&rank).ok_or_else(|| {
+                for (rank, (at, destination)) in destinations {
+                    let (source_at, source) = sources.get(&rank).ok_or_else(|| {
                         format!("rank {rank} of {from} placed no unit of {region}")
                     })?;
-                    all.extend(spans(source, destination, *first, *count)?);
+                    for mut span in spans(source, destination, *first, *count)? {
+                        let here = match (source_at, at) {
+                            (source_at, at) if source_at == at => false,
+                            (Some(endpoint), _) => {
+                                span.source = Region::Remote {
+                                    endpoint: endpoint.clone(),
+                                    region: Box::new(span.source),
+                                };
+                                false
+                            }
+                            (None, _) => true,
+                        };
+                        tasks.entry(at.clone()).or_default().push((span, here));
+                    }
                 }
             }
         }
-        if all.is_empty() {
+        if tasks.is_empty() {
             return Ok(false);
         }
-        let owner = crate::transfers::Owner::Pool { number };
-        self.submit_for(owner, deployment, &all, Priority::Request, 0)
-            .map_err(|(_, message)| message)?;
+
+        let local = tasks.remove(&None);
+        let parts = tasks.len() + usize::from(local.is_some());
+        if let Some(spans) = local {
+            let spans: Vec<Span> = spans.into_iter().map(|(span, _)| span).collect();
+            let owner = crate::transfers::Owner::Pool { number };
+            self.submit_for(owner, deployment, &spans, Priority::Request, 0)
+                .map_err(|(_, message)| message)?;
+        }
+        if let Some(running) = self.sessions.running.get_mut(&number) {
+            running.waiting = parts;
+        }
+        let port = self
+            .tcp
+            .as_ref()
+            .and_then(|(_, address)| address.rsplit_once(':'))
+            .and_then(|(_, port)| port.parse().ok());
+        let mut failed = 0;
+        for (endpoint, spans) in tasks {
+            let Some(endpoint) = endpoint else {
+                continue;
+            };
+            let (cancel, cancelled) = mpsc::channel();
+            let started = hosts::transfer_at(
+                self.sessions.thread.notifier(),
+                number,
+                endpoint,
+                session.clone(),
+                spans,
+                port,
+                (cancelled, self.sessions.transfer_deadline),
+            );
+            match started {
+                Ok(()) => {
+                    if let Some(running) = self.sessions.running.get_mut(&number) {
+                        running.cancels.push(cancel);
+                    }
+                }
+                Err(error) => {
+                    tracing::warn!(deployment, %error, "a transfer on another host cannot start");
+                    failed += 1;
+                }
+            }
+        }
+        for _ in 0..failed {
+            self.end_pool_task(number, false);
+        }
         Ok(true)
+    }
+
+    /// A prefetch from the peers the session names: a helper holds the
+    /// keys there ([`hosts::read_from_peers`]), then
+    /// [`Self::peers_held`] reads what they hold. Returns whether there is
+    /// a peer to ask.
+    fn read_from_peers(
+        &mut self,
+        session: &Session,
+        number: u64,
+        copies: &[Copied],
+    ) -> Result<bool, String> {
+        let endpoints = self
+            .sessions
+            .peers
+            .get(session)
+            .cloned()
+            .unwrap_or_default();
+        if endpoints.is_empty() {
+            return Ok(false);
+        }
+        let keys = copies.iter().filter_map(|(key, ..)| *key).collect();
+        let (release, released) = mpsc::channel();
+        let notifier = self.sessions.thread.notifier();
+        hosts::read_from_peers(
+            notifier,
+            number,
+            session.0.clone(),
+            endpoints,
+            keys,
+            released,
+        )
+        .map_err(|error| format!("a read from the peers cannot start: {error}"))?;
+        if let Some(running) = self.sessions.running.get_mut(&number) {
+            running.release = Some(release);
+            running.writes = copies
+                .iter()
+                .map(|(_, _, writes, ..)| writes.first().cloned().unwrap_or_default())
+                .collect();
+        }
+        Ok(true)
+    }
+
+    /// The peers hold what they hold of a read's keys: this host's Transfer
+    /// Server reads the leading copies held into the blocks the buffer pool
+    /// allocated for them, each part of this host's region from the peer's
+    /// part of the same rank, which must hold the same bytes of a unit, and
+    /// the copy the same units. With nothing to read, the holds are
+    /// released at once.
+    pub(crate) fn peers_held(&mut self, number: u64, (sources, peers): hosts::Held) {
+        let Some(running) = self.sessions.running.get(&number) else {
+            return;
+        };
+        let deployment = running.session.0.clone();
+        let writes = if running.stopped {
+            Vec::new()
+        } else {
+            running.writes.clone()
+        };
+
+        let (mut spans, mut reads) = (Vec::new(), Vec::new());
+        for (index, (region, first, count)) in writes.iter().enumerate() {
+            let Some(Some((connection, copy))) = sources.get(index) else {
+                break;
+            };
+            let Some((endpoint, held)) = peers.get(*connection) else {
+                break;
+            };
+            let parts: Vec<(u32, u64)> = self
+                .sessions
+                .parts
+                .iter()
+                .filter(|((of, name, _), _)| *of == deployment && name == region)
+                .map(|((_, _, rank), part)| (*rank, part.bytes))
+                .collect();
+            let matched = parts.iter().all(|(rank, bytes)| {
+                held.iter().any(|part| {
+                    part.region == copy.region && part.rank == *rank && part.bytes == *bytes
+                })
+            });
+            if copy.count != *count || parts.is_empty() || !matched {
+                break;
+            }
+            for (rank, bytes) in parts {
+                spans.push(Span {
+                    source: Region::Remote {
+                        endpoint: endpoint.clone(),
+                        region: Box::new(Region::Part {
+                            region: copy.region.clone(),
+                            rank,
+                        }),
+                    },
+                    source_offset: u64::from(copy.first) * bytes,
+                    destination: Region::Part {
+                        region: region.clone(),
+                        rank,
+                    },
+                    destination_offset: u64::from(*first) * bytes,
+                    bytes: u64::from(*count) * bytes,
+                    rows: 1,
+                    source_pitch: 0,
+                    destination_pitch: 0,
+                });
+            }
+            reads.push((*connection, copy.tokens));
+        }
+
+        let submitted = if spans.is_empty() {
+            Err(None)
+        } else {
+            let owner = crate::transfers::Owner::Pool { number };
+            self.submit_for(owner, &deployment, &spans, Priority::Request, 0)
+                .map_err(|(_, message)| Some(message))
+        };
+        let Some(running) = self.sessions.running.get_mut(&number) else {
+            return;
+        };
+        running.reads = reads;
+        match submitted {
+            Ok(_) => running.waiting = 1,
+            Err(failure) => {
+                if let Some(message) = failure {
+                    tracing::warn!(deployment, %message, "a peer's host copies cannot be read");
+                }
+                running.ok = false;
+                running.release = None;
+            }
+        }
+    }
+
+    /// A read from the peers released its holds: `valid` says, per peer
+    /// connection, whether its holds stood until then. The copies read are
+    /// cached, in order, up to the first read from a peer whose holds did
+    /// not stand, or not read whole; the task then ends.
+    pub(crate) fn peers_released(&mut self, number: u64, valid: Vec<bool>) {
+        let Some(running) = self.sessions.running.remove(&number) else {
+            return;
+        };
+        let stood = |connection: &usize| valid.get(*connection).copied().unwrap_or(false);
+        let done: Vec<u16> = if running.ok {
+            running
+                .reads
+                .iter()
+                .map_while(|(connection, tokens)| stood(connection).then_some(*tokens))
+                .collect()
+        } else {
+            Vec::new()
+        };
+        let whole = done.len() == running.keys.len();
+        let ((deployment, _), task) = (running.session, running.task);
+        self.sessions.thread.send(move |pools| {
+            for tokens in done {
+                pools.done(&deployment, task, tokens);
+            }
+            if !whole {
+                pools.ended(&deployment, task, false);
+            }
+        });
     }
 
     /// A prefetch's or a put's pages as one connector task per part of the
@@ -991,7 +1410,7 @@ impl Server {
         // The keys done, in order, up to the first that did not move whole.
         let done = running.keys.iter().take_while(|(_, moved)| *moved).count();
         let whole = done == running.keys.len();
-        let (deployment, task) = (running.deployment, running.task);
+        let ((deployment, _), task) = (running.session, running.task);
         self.sessions.thread.send(move |pools| {
             for _ in 0..done {
                 pools.done(&deployment, task, BLOCK_TOKENS);
@@ -1002,12 +1421,28 @@ impl Server {
         });
     }
 
-    /// A pool's task ended on its child, which touches its blocks no more.
+    /// A part of a pool's task ended on a child or on another host, which
+    /// touches its blocks no more: the task ends with its last part, as
+    /// having copied everything when every part did. A read from the peers
+    /// releases its holds first ([`Self::peers_released`]).
     pub(crate) fn end_pool_task(&mut self, number: u64, ok: bool) {
+        let Some(running) = self.sessions.running.get_mut(&number) else {
+            return;
+        };
+        running.ok &= ok;
+        running.waiting = running.waiting.saturating_sub(1);
+        if running.waiting > 0 {
+            return;
+        }
+        if running.release.is_some() {
+            // The helper releases the holds once the sender is gone.
+            running.release = None;
+            return;
+        }
         let Some(running) = self.sessions.running.remove(&number) else {
             return;
         };
-        let (deployment, task) = (running.deployment, running.task);
+        let ((deployment, _), task, ok) = (running.session, running.task, running.ok);
         self.sessions
             .thread
             .send(move |pools| pools.ended(&deployment, task, ok));
@@ -1034,18 +1469,24 @@ impl Server {
         }
     }
 
-    /// A pool's task is past its deadline or its session closed: the
-    /// Transfer Server cancels it; the connector's runs to its end.
+    /// A pool's task is past its deadline or its session closed: its
+    /// transfers here and on other hosts are cancelled, and what it has not
+    /// started it does not; the connector's runs to its end.
     pub(crate) fn stop_pool_task(&mut self, deployment: &str, task: PoolTask) {
-        let number = self
+        let found = self
             .sessions
             .running
-            .iter()
-            .find(|(_, running)| running.deployment == deployment && running.task == task)
-            .map(|(number, _)| *number);
-        if let Some(number) = number {
-            self.cancel_pool_transfer(number);
+            .iter_mut()
+            .find(|(_, running)| running.session.0 == deployment && running.task == task);
+        let Some((number, running)) = found else {
+            return;
+        };
+        running.stopped = true;
+        for cancel in &running.cancels {
+            let _ = cancel.send(());
         }
+        let number = *number;
+        self.cancel_pool_transfer(number);
     }
 
     /// The deployment is no longer served: its pool goes with every session,
@@ -1059,6 +1500,7 @@ impl Server {
         self.sessions.gone.retain(|(of, _), _| of != deployment);
         self.sessions.hosts.retain(|(of, _), _| of != deployment);
         self.sessions.places.retain(|(of, ..), _| of != deployment);
+        self.sessions.peers.retain(|(of, _), _| of != deployment);
         let parts: Vec<Part> = self
             .sessions
             .parts
