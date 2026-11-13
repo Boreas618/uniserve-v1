@@ -9,6 +9,7 @@
 //! | [`CausalLmRunner`] | `nn::family::TextModel` | prefill, decode, verification |
 //! | [`EncoderRunner`] | `nn::capability::Encoder` | a video request's text encoding |
 //! | [`VisionRunner`] | `nn::capability::Vision` of a `TextModel` | a token request's image encoding |
+//! | [`MediaHost`] | none | a video request's host work: reading its condition media, encoding its video and audio, muxing its artifact |
 //! | [`DecoderRunner`] | `nn::Decoder`, with `nn::Splicer` for a video | a video request's decode of its clips and its audio track, from the latents in the rank's media products |
 //!
 //! A media runner reads and writes a request's products and encoder outputs in the blocks the
@@ -16,18 +17,12 @@
 //! start with its batches through it, on its own stream.
 
 pub mod causal_lm;
-// The host conversions of condition media: the vision runner lays out an image's patch rows,
-// and the media host, which converts a video request's conditions, is not in the crate yet.
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "the media host that converts condition pixels and tracks is not in the crate yet"
-    )
-)]
+// The host conversions of condition media: an image's patch rows for the vision runner, a
+// video request's condition pixels and tracks for the media host.
 pub(crate) mod conditions;
 pub mod decoder;
 pub mod encoder;
+pub mod media;
 pub mod vision;
 
 use ipc::batch::{CallOutput, CallStatus, ErrorCode};
@@ -37,6 +32,7 @@ use uniserve_tensor::Tensor;
 pub use causal_lm::CausalLmRunner;
 pub use decoder::{DecoderConfig, DecoderRunner};
 pub use encoder::EncoderRunner;
+pub use media::MediaHost;
 pub use vision::VisionRunner;
 
 use crate::Result;
@@ -116,7 +112,7 @@ pub(crate) unsafe fn issue(copies: &[DeviceCopy], stream: Option<&Stream>) -> Re
 
 /// Waits for everything issued on `stream`, a media runner's: its forwards, the copies of their
 /// outputs and the copies that started with its batch. With no stream nothing was issued.
-fn settle(stream: Option<&Stream>) -> Result<()> {
+pub(crate) fn settle(stream: Option<&Stream>) -> Result<()> {
     match stream {
         Some(stream) => Ok(stream.synchronize()?),
         None => Ok(()),

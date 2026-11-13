@@ -3,8 +3,9 @@
 //! The media reader decodes a condition's bytes into RGB frames and stereo PCM, the media's own
 //! forms. What an encoder reads is stated by the model ([`MediaFormat`]): the normalization of its
 //! pixels, the patch rows of its vision tower, the padding of a track. The conversions here execute
-//! that statement on the media lane's thread that reads the request's conditions, sharing a large
-//! image's work out over [`share`]'s scoped threads, so no model holds a thread or a byte format.
+//! that statement on the host thread that reads the request's conditions (a thread of the media
+//! host's pool, or the vision runner's image read), sharing a large image's work out over
+//! [`share`]'s scoped threads, so no model holds a thread or a byte format.
 
 use nn::DType;
 use nn::capability::{MediaFormat, PatchFormat, PixelNorm};
@@ -192,6 +193,70 @@ pub(crate) fn patches(
     Ok(())
 }
 
+/// One vision block's frames, `[frames, height, width, 3]` RGB at `raster`, as its patch rows.
+///
+/// The tower reads a grid's own pixels, so each frame is resized to the raster the processor sized
+/// the grid from ([`PatchFormat::raster`]) first and packed second.
+pub(crate) fn pack_block(
+    format: &PatchFormat,
+    rgb: &[u8],
+    frames: u32,
+    raster: (u32, u32),
+    grid: [u32; 3],
+    out: &mut [u8],
+) -> Result<()> {
+    let (height, width) = raster;
+    let (rows, columns) = format.raster(grid);
+    let planes = planes_of(rgb, frames as usize, height as usize, width as usize);
+    let planes = if (rows, columns) == (height, width) {
+        planes
+    } else {
+        let frame = 3 * height as usize * width as usize;
+        let mut resized = Vec::with_capacity(frames as usize * 3 * (rows * columns) as usize);
+        for source in planes.chunks_exact(frame) {
+            resized.extend(media::resample::bicubic_antialias_u8(
+                source, 3, height, width, rows, columns,
+            )?);
+        }
+        resized
+    };
+    patches(format, &planes, frames, grid, out)
+}
+
+/// `[frames, height, width, 3]` interleaved RGB as `[frames, 3, height, width]` planes.
+fn planes_of(rgb: &[u8], frames: usize, height: usize, width: usize) -> Vec<u8> {
+    let area = height * width;
+    let mut planes = vec![0_u8; frames * 3 * area];
+
+    // A reference image at its encoding size is seven million pixels on a request's critical path,
+    // so a frame's pixels are shared out in bands of its three planes.
+    let band = band(area, frames);
+    let mut bands = Vec::new();
+    for (frame, block) in planes.chunks_mut((3 * area).max(1)).enumerate() {
+        let (red, rest) = block.split_at_mut(area);
+        let (green, blue) = rest.split_at_mut(area);
+        let mut first = frame * area;
+        for ((red, green), blue) in red
+            .chunks_mut(band)
+            .zip(green.chunks_mut(band))
+            .zip(blue.chunks_mut(band))
+        {
+            let pixels = red.len();
+            bands.push((first, red, green, blue));
+            first += pixels;
+        }
+    }
+    share(&mut bands, |(first, red, green, blue)| {
+        let pixels = &rgb[*first * 3..(*first + red.len()) * 3];
+        for (index, pixel) in pixels.as_chunks::<3>().0.iter().enumerate() {
+            red[index] = pixel[0];
+            green[index] = pixel[1];
+            blue[index] = pixel[2];
+        }
+    });
+    planes
+}
+
 /// `values` in `dtype`'s little-endian bytes.
 fn encode(dtype: DType, values: &[f32]) -> Result<Vec<u8>> {
     Ok(ops::values::encode(dtype, values)?)
@@ -262,6 +327,18 @@ mod tests {
     fn row_value(rows: &[u8], index: usize) -> f32 {
         let bits = u16::from_le_bytes([rows[2 * index], rows[2 * index + 1]]);
         bf16_to_f32(bits)
+    }
+
+    /// Frames reach the resize as planes, one frame after another: an interleaved raster read as
+    /// planes would resize a mixture of the channels, and every shape would agree.
+    #[test]
+    fn interleaved_frames_become_planes_one_frame_after_another() {
+        // Two frames of one row of two pixels.
+        let rgb = [1_u8, 2, 3, 4, 5, 6, 11, 12, 13, 14, 15, 16];
+        assert_eq!(
+            planes_of(&rgb, 2, 1, 2),
+            [1, 4, 2, 5, 3, 6, 11, 14, 12, 15, 13, 16]
+        );
     }
 
     /// Patch rows run over merge blocks: the four patches of a `2 x 2` block are consecutive rows,

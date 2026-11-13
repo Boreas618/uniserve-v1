@@ -29,6 +29,12 @@
 //! 3. [`Runner::execute`] with the batch and the tables, or for a shadow turn
 //!    [`Runner::prepare_shadow_inputs`] with the batch and the tables.
 //!
+//! A batch whose work is the host's, a host phase of a media request, runs off the executor
+//! thread: the executor first calls [`Runner::start`], and when the runner started host work it
+//! calls [`Runner::execute`] with the same batch once that work ended, other jobs of the queue
+//! running in between. The batch keeps its number open meanwhile, so nothing it reads or writes
+//! is given up before it ends.
+//!
 //! What a runner must keep, for the buffer pool's guarantees to hold (the obligations of the
 //! control plane in the buffer pool's design):
 //!
@@ -50,6 +56,7 @@ use uniserve_tensor::Tensor;
 
 use crate::Result;
 use crate::buckets::Bucket;
+use crate::completion::Waker;
 use crate::graphs::Graphs;
 use crate::memory::tables::{BlockCopy, BlockTables, Change};
 
@@ -121,10 +128,29 @@ pub trait Runner: Send {
     /// outputs. It returns once the device has completed the step and the copies
     /// [`Runner::copy`] issued for it.
     ///
+    /// For a batch whose host work [`Runner::start`] started, it is called once that work
+    /// ended: it writes what the work produced into the memory `start` found the batch's blocks
+    /// at, and reads nothing of `tables`, whose entries may have been taken away meanwhile.
+    ///
     /// # Errors
     ///
     /// As [`Runner::prepare_inputs`], or the device's failure.
     fn execute(&mut self, batch: &Batch, tables: &BlockTables) -> Result<BatchOutput>;
+
+    /// Starts the host work of `batch`, a batch with rows, on a thread that is not the
+    /// executor's, and returns whether it started any. What the work reads of the rank's memory
+    /// is found through `tables` and copied to the host before this returns; `resume` is called
+    /// once, from the thread the work ended on, and the executor then calls
+    /// [`Runner::execute`] with the same batch.
+    ///
+    /// # Errors
+    ///
+    /// What refuses the batch; no work of it is left running then. The default starts none: a
+    /// device runner's [`Runner::execute`] does all of a batch's work.
+    fn start(&mut self, batch: &Batch, tables: &BlockTables, resume: Waker) -> Result<bool> {
+        let _ = (batch, tables, resume);
+        Ok(false)
+    }
 
     /// The runner's graphs: what the executor captures, switches and releases at a batch
     /// boundary, and what a profile run of the runner is recorded in.

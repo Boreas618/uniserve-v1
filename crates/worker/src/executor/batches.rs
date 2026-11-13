@@ -24,6 +24,14 @@
 //!   other rank: the batch names the rank that runs it ([`ipc::batch::MediaRow::rank`], among this
 //!   node's executors of the group), and every other rank, here or on a peer, passes its number.
 //!   A rank whose runners do not serve the batch's phase passes it too.
+//! - **Host work once.** A batch of a host phase (a media request's reading, encoding and
+//!   muxing, [`ipc::batch::Variant::host`]) is work of the host, not of a rank's device, and
+//!   runs once: a batch whose rows name no rank is named the first of this node's executors of
+//!   the group that serves its phase, as a decode round is named its rank, and every other rank
+//!   passes its number. Its rows then start no copy, as no batch one rank runs alone does; a
+//!   host batch with no rows is every rank's and runs the copies. A group none of whose
+//!   executors here serves the phase hands the batch to its first peer link to run, and the
+//!   others pass it.
 
 use std::sync::{Arc, Mutex};
 
@@ -174,8 +182,11 @@ impl Executors {
 
     /// Numbers `batch` for its group and hands it to the group's ranks, as a shadow batch when
     /// `shadow` is set.
-    fn numbered(&self, batch: Batch, shadow: bool) -> Result<Submission> {
+    fn numbered(&self, mut batch: Batch, shadow: bool) -> Result<Submission> {
         let group = self.group(batch.group)?;
+        if !shadow {
+            group.name_host(&mut batch)?;
+        }
         let mut next = lock(&group.next);
 
         // A batch refused before any rank took it takes no number.
@@ -190,11 +201,14 @@ impl Executors {
     pub(super) fn run(
         &self,
         sequence: u64,
-        batch: Batch,
+        mut batch: Batch,
         pass: bool,
         shadow: bool,
     ) -> Result<Submission> {
         let group = self.group(batch.group)?;
+        if !pass && !shadow {
+            group.name_host(&mut batch)?;
+        }
         let mut next = lock(&group.next);
 
         group.check(&batch, pass, shadow)?;
@@ -301,6 +315,29 @@ impl Executors {
 }
 
 impl Group {
+    /// Names the rank that runs `batch` in its rows when it is a batch of a host phase with rows
+    /// that name none: the first of this node's executors of the group that serves its phase. A
+    /// group none of whose executors here serves the phase leaves it unnamed for its peers.
+    fn name_host(&self, batch: &mut Batch) -> Result<()> {
+        if !batch.shape.variant.host() || batch.media.is_empty() || alone(batch)?.is_some() {
+            return Ok(());
+        }
+        let Some(place) = self
+            .executors
+            .iter()
+            .position(|executor| executor.serves(batch.phase))
+        else {
+            return Ok(());
+        };
+
+        let rank = u32::try_from(place)
+            .map_err(|_| Error::Invalid(format!("rank {place} of a group overflows a u32")))?;
+        for row in &mut batch.media {
+            row.rank = Some(rank);
+        }
+        Ok(())
+    }
+
     /// Whether the group's ranks can take `batch`: a rank it names is one of this node's
     /// executors and serves its phase, and a batch that is not passed has a rank to run it.
     fn check(&self, batch: &Batch, pass: bool, shadow: bool) -> Result<()> {
@@ -340,6 +377,10 @@ impl Group {
         let named = if pass || shadow { None } else { alone(&batch)? };
         let peers_pass = pass || named.is_some();
 
+        // Host work left unnamed is no executor's here (`Group::name_host`): it runs once, on the
+        // first peer link.
+        let host = !peers_pass && !shadow && batch.shape.variant.host() && !batch.media.is_empty();
+
         // The parts whose output counts come first, this node's before the peers': the joined
         // submission's output is its first part's.
         let mut running = Vec::new();
@@ -347,14 +388,15 @@ impl Group {
         let mut passing = Vec::new();
 
         for (index, link) in self.remotes.iter().enumerate() {
+            let link_pass = peers_pass || (host && index > 0);
             let frame = if shadow {
                 MainProcessRequest::shadow(sequence, batch.clone())
             } else {
-                MainProcessRequest::submit(sequence, peers_pass, batch.clone())
+                MainProcessRequest::submit(sequence, link_pass, batch.clone())
             };
             let part = link.send(frame, &self.sequences, self.executors.len() + index)?;
 
-            if peers_pass {
+            if link_pass {
                 passing.push(part);
             } else {
                 remote.push(part);

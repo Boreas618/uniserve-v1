@@ -8,7 +8,9 @@
 //! - **Order.** A job is taken after every job submitted before it. A job of several turns (a
 //!   warm-up, a generation being prepared, a shadow batch) goes back to the tail after each
 //!   turn, so whatever was submitted meanwhile runs between two of its turns, and its
-//!   submission completes with its last turn.
+//!   submission completes with its last turn. A batch whose host work runs on another thread
+//!   is held aside after its first turn and goes back to the tail once that work ended
+//!   ([`Queue::resume`]).
 //! - **The job in flight.** From the moment the executor takes a job until it posts the job's
 //!   completion, the queue states what the executor is performing and since when. The control
 //!   thread reads it without waiting for the executor: the watchdog for a job that stopped making
@@ -46,6 +48,11 @@ struct State {
     pending: VecDeque<Entry>,
     in_flight: Option<InFlight>,
     closed: bool,
+    /// The remainders of batches whose host work runs, each under the batch's number, which
+    /// stays open until the remainder ran.
+    parked: Vec<(u64, Entry)>,
+    /// The numbers of batches whose host work ended before their remainder was held aside.
+    resumed: Vec<u64>,
 }
 
 /// One job in the queue, with the completion its submitter waits on.
@@ -77,6 +84,8 @@ impl Queue {
                 pending: VecDeque::new(),
                 in_flight: None,
                 closed: false,
+                parked: Vec::new(),
+                resumed: Vec::new(),
             }),
             ready: Condvar::new(),
         })
@@ -173,6 +182,59 @@ impl Queue {
         self.ready.notify_one();
     }
 
+    /// Ends the turn of the job in flight, which started the host work of the batch numbered
+    /// `sequence`, and holds `entry`, the batch's remainder, aside until that work ended
+    /// ([`Queue::resume`]): it then goes to the tail. In a queue closed meanwhile the job ends
+    /// as cancelled.
+    pub(super) fn park(&self, sequence: u64, entry: Entry) {
+        let mut state = lock(&self.state);
+        state.in_flight = None;
+
+        if state.closed {
+            drop(state);
+            entry.submission.finish(Outcome::Cancelled);
+            return;
+        }
+
+        // The work may have ended before its batch's turn did.
+        match state
+            .resumed
+            .iter()
+            .position(|resumed| *resumed == sequence)
+        {
+            Some(at) => {
+                state.resumed.swap_remove(at);
+                state.pending.push_back(entry);
+                drop(state);
+                self.ready.notify_one();
+            }
+            None => state.parked.push((sequence, entry)),
+        }
+    }
+
+    /// The host work of the batch numbered `sequence` ended: the batch's remainder goes to the
+    /// tail, now or when its turn holds it aside. The thread the work ended on calls it.
+    pub(super) fn resume(&self, sequence: u64) {
+        let mut state = lock(&self.state);
+        if state.closed {
+            return;
+        }
+
+        match state
+            .parked
+            .iter()
+            .position(|(parked, _)| *parked == sequence)
+        {
+            Some(at) => {
+                let (_, entry) = state.parked.swap_remove(at);
+                state.pending.push_back(entry);
+                drop(state);
+                self.ready.notify_one();
+            }
+            None => state.resumed.push(sequence),
+        }
+    }
+
     /// Posts the completion of the job in flight, whose submission is `submission`. A failure is
     /// posted with the work that was in flight when it was taken, in the error and as the
     /// submission's failure label.
@@ -221,13 +283,16 @@ impl Queue {
             .map(|in_flight| in_flight.activity.clone())
     }
 
-    /// Closes the queue: no further job is taken, the queued jobs end as cancelled, and the
-    /// executor returns once the job in flight ended.
+    /// Closes the queue: no further job is taken, the queued jobs and the batches held aside for
+    /// their host work end as cancelled, and the executor returns once the job in flight ended.
     pub fn close(&self) {
         let cancelled: Vec<Entry> = {
             let mut state = lock(&self.state);
             state.closed = true;
-            state.pending.drain(..).collect()
+            state.resumed.clear();
+
+            let parked: Vec<Entry> = state.parked.drain(..).map(|(_, entry)| entry).collect();
+            state.pending.drain(..).chain(parked).collect()
         };
         self.ready.notify_all();
 
@@ -244,6 +309,7 @@ impl std::fmt::Debug for Queue {
         formatter
             .debug_struct("Queue")
             .field("pending", &state.pending.len())
+            .field("parked", &state.parked.len())
             .field("in_flight", &state.in_flight.is_some())
             .field("closed", &state.closed)
             .finish()

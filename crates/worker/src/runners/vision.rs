@@ -258,7 +258,7 @@ impl VisionRunner {
             let out = block.get_mut(..patches).ok_or_else(|| {
                 Error::Invariant("an image's patch rows exceed the input block".into())
             })?;
-            pack_block(&format, &rgb, 1, (*height, *width), *grid, out)
+            conditions::pack_block(&format, &rgb, 1, (*height, *width), *grid, out)
         })?;
         Ok(Ok(bucket))
     }
@@ -481,70 +481,6 @@ fn largest(vision: &dyn Vision) -> Result<[u32; 3]> {
 fn patch_bytes(format: &PatchFormat, grid: [u32; 3]) -> Result<u64> {
     let patches: u64 = grid.iter().map(|extent| u64::from(*extent)).product();
     Ok(patches * u64::from(format.width()) * element_bytes(format.dtype)?)
-}
-
-/// One vision block's frames, `[frames, height, width, 3]` RGB at `raster`, as its patch rows.
-///
-/// The tower reads a grid's own pixels, so each frame is resized to the raster the processor sized
-/// the grid from ([`PatchFormat::raster`]) first and packed second.
-pub(crate) fn pack_block(
-    format: &PatchFormat,
-    rgb: &[u8],
-    frames: u32,
-    raster: (u32, u32),
-    grid: [u32; 3],
-    out: &mut [u8],
-) -> Result<()> {
-    let (height, width) = raster;
-    let (rows, columns) = format.raster(grid);
-    let planes = planes_of(rgb, frames as usize, height as usize, width as usize);
-    let planes = if (rows, columns) == (height, width) {
-        planes
-    } else {
-        let frame = 3 * height as usize * width as usize;
-        let mut resized = Vec::with_capacity(frames as usize * 3 * (rows * columns) as usize);
-        for source in planes.chunks_exact(frame) {
-            resized.extend(media::resample::bicubic_antialias_u8(
-                source, 3, height, width, rows, columns,
-            )?);
-        }
-        resized
-    };
-    conditions::patches(format, &planes, frames, grid, out)
-}
-
-/// `[frames, height, width, 3]` interleaved RGB as `[frames, 3, height, width]` planes.
-fn planes_of(rgb: &[u8], frames: usize, height: usize, width: usize) -> Vec<u8> {
-    let area = height * width;
-    let mut planes = vec![0_u8; frames * 3 * area];
-
-    // A reference image at its encoding size is seven million pixels on a request's critical path,
-    // so a frame's pixels are shared out in bands of its three planes.
-    let band = conditions::band(area, frames);
-    let mut bands = Vec::new();
-    for (frame, block) in planes.chunks_mut((3 * area).max(1)).enumerate() {
-        let (red, rest) = block.split_at_mut(area);
-        let (green, blue) = rest.split_at_mut(area);
-        let mut first = frame * area;
-        for ((red, green), blue) in red
-            .chunks_mut(band)
-            .zip(green.chunks_mut(band))
-            .zip(blue.chunks_mut(band))
-        {
-            let pixels = red.len();
-            bands.push((first, red, green, blue));
-            first += pixels;
-        }
-    }
-    conditions::share(&mut bands, |(first, red, green, blue)| {
-        let pixels = &rgb[*first * 3..(*first + red.len()) * 3];
-        for (index, pixel) in pixels.as_chunks::<3>().0.iter().enumerate() {
-            red[index] = pixel[0];
-            green[index] = pixel[1];
-            blue[index] = pixel[2];
-        }
-    });
-    planes
 }
 
 #[cfg(test)]

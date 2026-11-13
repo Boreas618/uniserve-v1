@@ -16,7 +16,11 @@
 //!   expert-union member with no tokens of its own serves its part of a peer's step as a batch of
 //!   variant `ExpertJoin`, which the stepping peer submits through [`Executor::join`] and which
 //!   takes no number: it addresses no device block table. A batch another rank of the group runs
-//!   alone is **passed**: the rank takes its number and runs nothing;
+//!   alone is **passed**: the rank takes its number and runs nothing. A batch whose work is the
+//!   host's (a media request's reading, encoding and muxing) takes two turns: the first starts
+//!   the work on its runner's thread pool ([`Runner::start`]) and the job is held aside until the
+//!   work ended, the second writes what it produced and ends the batch ([`Runner::execute`]); the
+//!   jobs behind it run in between, and its number stays open across them;
 //! - a **shadow batch** of the generation being prepared: one paired forward
 //!   ([`Graphs::shadow`](crate::Graphs::shadow)) per operator the batch's bucket launches whose
 //!   kernel the generation replaces. It reads the device block tables, so it takes a number;
@@ -127,7 +131,7 @@ use self::queue::Entry;
 pub use self::queue::Queue;
 pub use self::sequences::Sequences;
 use crate::buckets::Bucket;
-use crate::completion::{Outcome, Submission, add_stamp};
+use crate::completion::{Outcome, Submission, Waker, add_stamp};
 use crate::memory::tables::{BlockCopy, BlockTables};
 use crate::profiling;
 use crate::profiling::session::{Change, Session};
@@ -158,6 +162,18 @@ pub enum Job {
     Execute {
         batch: Box<Batch>,
         sequence: Option<u64>,
+    },
+    /// End `batch`, numbered `sequence`, whose host work its runner started and which ended:
+    /// the runner writes what the work produced, and the batch ends with the copies that started
+    /// with it.
+    Resume {
+        batch: Box<Batch>,
+        sequence: u64,
+        /// The requests of the copies that started with the batch, and whether the runner
+        /// issued them.
+        copies: (Vec<RequestId>, bool),
+        /// The batch's wait in the queue, and when its first turn began.
+        queued: (Duration, Instant),
     },
     /// Take the number of a batch another rank of the group runs alone, and run nothing.
     Pass(u64),
@@ -214,21 +230,31 @@ pub enum Job {
 }
 
 impl Job {
-    /// The batch the job executes or shadows.
+    /// The batch the job executes, ends or shadows.
     fn batch(&self) -> Option<&Batch> {
         match self {
-            Self::Execute { batch, .. } | Self::Shadow { batch, .. } => Some(batch),
+            Self::Execute { batch, .. }
+            | Self::Resume { batch, .. }
+            | Self::Shadow { batch, .. } => Some(batch),
             _ => None,
         }
     }
 
     /// Whether the job runs a runner's forwards, whose time the executor counts: a batch with
-    /// no rows runs none.
+    /// no rows runs none, and a host batch's work is the host's.
     fn runs_forwards(&self) -> bool {
         match self {
-            Self::Execute { batch, .. } => !empty(batch),
+            Self::Execute { batch, .. } => forwards(batch),
             Self::Shadow { .. } | Self::Capture | Self::Prepare(_) => true,
             _ => false,
+        }
+    }
+
+    /// The number of the batch whose remainder the job is, which waits for its host work.
+    fn waits(&self) -> Option<u64> {
+        match self {
+            Self::Resume { sequence, .. } => Some(*sequence),
+            _ => None,
         }
     }
 }
@@ -240,6 +266,11 @@ impl std::fmt::Display for Job {
             Self::Execute { batch, .. } => write!(
                 formatter,
                 "executing batch {} of phase {:?} ({})",
+                batch.id.0, batch.phase, batch.shape
+            ),
+            Self::Resume { batch, .. } => write!(
+                formatter,
+                "ending batch {} of phase {:?} ({}) after its host work",
                 batch.id.0, batch.phase, batch.shape
             ),
             Self::Pass(sequence) => write!(
@@ -304,6 +335,12 @@ pub(crate) fn alone(batch: &Batch) -> Result<Option<u32>> {
 /// budget admits as any batch does, and runs no forward.
 fn empty(batch: &Batch) -> bool {
     batch.requests.is_empty() && batch.shape.variant != Variant::ExpertJoin
+}
+
+/// Whether `batch` runs a forward on the device: it has rows, and its work is not the host's. Only
+/// such a batch is a step of a profiling session and marks one.
+fn forwards(batch: &Batch) -> bool {
+    !empty(batch) && !batch.shape.variant.host()
 }
 
 /// How many of the oldest queued copies, which move `sizes` bytes each in the order they were
@@ -862,11 +899,19 @@ impl Thread {
             }
 
             match turn {
-                Ok(ControlFlow::Continue(job)) => self.queue.requeue(Entry {
-                    job,
-                    submission,
-                    submitted,
-                }),
+                Ok(ControlFlow::Continue(job)) => {
+                    let waits = job.waits();
+                    let entry = Entry {
+                        job,
+                        submission,
+                        submitted,
+                    };
+
+                    match waits {
+                        Some(sequence) => self.queue.park(sequence, entry),
+                        None => self.queue.requeue(entry),
+                    }
+                }
                 Ok(ControlFlow::Break(returned)) => self.queue.complete(submission, Ok(returned)),
                 Err(error) => {
                     tracing::warn!(
@@ -896,6 +941,7 @@ impl Thread {
         // The number of a numbered job, and whether this turn is its first.
         let (sequence, first) = match &job {
             Job::Execute { sequence, .. } => (*sequence, true),
+            Job::Resume { sequence, .. } => (Some(*sequence), false),
             Job::Pass(sequence) => (Some(*sequence), true),
             Job::Shadow {
                 sequence, compared, ..
@@ -963,8 +1009,18 @@ impl Thread {
         let done = ControlFlow::Break((BatchOutput::default(), Vec::new()));
 
         match job {
-            Job::Execute { batch, sequence } => {
-                Ok(ControlFlow::Break(self.execute(&batch, sequence, queued)?))
+            Job::Execute { batch, sequence } => self.execute(batch, sequence, queued),
+            Job::Resume {
+                batch,
+                copies,
+                queued,
+                ..
+            } => {
+                let index = self.runner_of(batch.phase)?;
+                let output = self.runners[index].execute(&batch, &self.tables);
+                Ok(ControlFlow::Break(
+                    self.ended(&batch, output, copies, queued)?,
+                ))
             }
             Job::Pass(_) => Ok(done),
             Job::Shadow {
@@ -1057,8 +1113,10 @@ impl Thread {
     /// Executes `batch`, numbered `sequence` unless it is an expert join, through the runner that
     /// serves its phase: the tables' changes go to every runner first, and the queued copies the
     /// copy budget admits start with a numbered batch every rank of the group runs. Returns the
-    /// output and the stamped `Finish` of each copy that ran. A batch with no rows is no step of
-    /// a profiling session and marks none: its runner runs no forward.
+    /// output and the stamped `Finish` of each copy that ran, or, when the runner started the
+    /// batch's host work ([`Runner::start`]), the batch's remainder, which waits for that work.
+    /// A batch with no rows and a host batch are no step of a profiling session and mark none:
+    /// their runner runs no forward.
     ///
     /// # Errors
     ///
@@ -1066,19 +1124,18 @@ impl Thread {
     /// their `Finish { ok: false }` ([`Thread::failed`]).
     fn execute(
         &mut self,
-        batch: &Batch,
+        batch: Box<Batch>,
         sequence: Option<u64>,
         queued: Duration,
-    ) -> Result<(BatchOutput, Vec<Request>)> {
+    ) -> Result<ControlFlow<(BatchOutput, Vec<Request>), Job>> {
         let index = self.runner_of(batch.phase)?;
         let step = batch.id.0;
-        let started = Instant::now();
-        let forwards = !empty(batch);
+        let queued = (queued, Instant::now());
 
         // A session's window is made of whole steps: its collectors are armed and disarmed
         // between two steps, with nothing of the device in flight.
         let stage = batch.shape.variant.stage();
-        if forwards
+        if forwards(&batch)
             && self
                 .session
                 .as_mut()
@@ -1089,22 +1146,66 @@ impl Thread {
         self.renew()?;
 
         self.write_tables()?;
-        let (copies, copied) = if sequence.is_some() && alone(batch)?.is_none() {
+        let copies = if sequence.is_some() && alone(&batch)?.is_none() {
             self.start_copies(index)
         } else {
             (Vec::new(), true)
         };
 
+        // A numbered batch whose work its runner runs on the host leaves the executor while the
+        // work runs, its number open; the work's end puts its remainder back in the queue.
+        if let Some(sequence) = sequence
+            && !empty(&batch)
+        {
+            let queue = Arc::clone(&self.queue);
+            let resume: Waker = Arc::new(move || queue.resume(sequence));
+
+            match self.runners[index].start(&batch, &self.tables, resume) {
+                Ok(false) => {}
+                Ok(true) => {
+                    return Ok(ControlFlow::Continue(Job::Resume {
+                        batch,
+                        sequence,
+                        copies,
+                        queued,
+                    }));
+                }
+                Err(error) => return Err(self.failed(error, copies.0)),
+            }
+        }
+
         // The step's range markers are launched by the graphs, around the forward itself.
-        if forwards {
+        if forwards(&batch) {
             self.runners[index].graphs().mark_step(step, stage);
         }
-        let mut output = match self.runners[index].execute(batch, &self.tables) {
+        let output = self.runners[index].execute(&batch, &self.tables);
+        Ok(ControlFlow::Break(
+            self.ended(&batch, output, copies, queued)?,
+        ))
+    }
+
+    /// Ends `batch`, whose runner returned `output`, with `copies`, the requests of the copies
+    /// that started with it and whether the runner issued them; the batch waited `queued.0` in
+    /// the queue, and its first turn began at `queued.1`. Returns the output and the stamped
+    /// `Finish` of each copy.
+    ///
+    /// # Errors
+    ///
+    /// The runner's failure, carrying the copies' `Finish { ok: false }` ([`Thread::failed`]).
+    fn ended(
+        &mut self,
+        batch: &Batch,
+        output: Result<BatchOutput>,
+        (copies, copied): (Vec<RequestId>, bool),
+        (queued, started): (Duration, Instant),
+    ) -> Result<(BatchOutput, Vec<Request>)> {
+        let step = batch.id.0;
+        let mut output = match output {
             Ok(output) => output,
             Err(error) => return Err(self.failed(error, copies)),
         };
 
-        if forwards
+        if forwards(batch)
             && self
                 .session
                 .as_mut()
