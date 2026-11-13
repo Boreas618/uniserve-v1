@@ -29,6 +29,7 @@ mimalloc.workspace = true
 # The model families the executable loads.
 minimax-h3.workspace = true
 qwen3.workspace = true
+qwen4-exp.workspace = true
 service.workspace = true
 nn.workspace = true
 ops.workspace = true
@@ -37,7 +38,9 @@ uniserve-tensor.workspace = true
 platform.workspace = true
 build-server.workspace = true
 proto.workspace = true
-scheduler.workspace = true
+# The engine policy modules are compiled for: the module set's policy is loaded with it, and a
+# scheduler's tests load the packaged policies and their own toy modules with it.
+scheduling.workspace = true
 # The scheduling policy's interface: its parameters, limits and messages.
 scheduling-guest.workspace = true
 serde_json.workspace = true
@@ -54,9 +57,6 @@ worker.workspace = true
 processing.workspace = true
 # A rank's start opens its session with a Storage Server the test runs in its own process.
 storage-server.workspace = true
-# The engine policy modules are compiled for: a scheduler's tests load the packaged policies and
-# their own toy modules with it.
-scheduling.workspace = true
 # A toy policy module in a test is written as `wat`.
 wasmtime = { workspace = true, features = ["wat"] }
 tempfile.workspace = true

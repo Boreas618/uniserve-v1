@@ -102,11 +102,9 @@
 //! | [`batches`] | [`Executors`]: a node's executors and peer links by worker group, numbering each group's jobs and handing them to every rank |
 //! | [`sequences`] | [`Sequences`]: the ended sequences of a group's ranks and its `completed` word |
 //! | [`watchdog`] | [`Watchdog`](watchdog::Watchdog): when the control thread looks at the jobs in flight, and which it reports |
-//! | [`control`] | [`Control`](control::Control): the control thread's connections to the daemon and its wake |
 //! | [`peers`] | The channel between the engine processes of an epoch: registration, a group's jobs for ranks on other hosts and what they return |
 
 pub mod batches;
-pub mod control;
 pub mod peers;
 pub mod queue;
 pub mod sequences;

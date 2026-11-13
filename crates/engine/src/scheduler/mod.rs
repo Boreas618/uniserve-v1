@@ -54,7 +54,7 @@ mod rows;
 mod schedule;
 mod stats;
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;
 mod update;
 mod video;
 mod view;
@@ -79,6 +79,9 @@ use storage::{Key, QueuePair};
 
 pub use cache::Cached;
 pub use group::{Capacity, WorkerGroup};
+/// The packaged policies this tree builds, for the tests of the engine that serves them.
+#[cfg(test)]
+pub(crate) use policy::tests::packaged;
 pub use policy::{Policy, PolicyError, ceilings};
 pub use request::{Blocks, Request, RequestStatus};
 pub use view::view_of;
@@ -181,9 +184,9 @@ pub enum Message {
         WeightsInFlight,
         Sender<Result<(), Error>>,
     ),
-    /// `Resize { region, units }` at the buffer pool, the region by its number; the reply is sent
-    /// at its `Resized`.
-    Resize(u8, u32, Sender<()>),
+    /// `Resize { region, units }` at the buffer pool, the region by its number; the reply, sent at
+    /// its `Resized`, is the units the region reached, which a shrink and a grow may stop short of.
+    Resize(u8, u32, Sender<u32>),
     /// The scheduler's limits, applied in place; the reply refuses a limit above what the
     /// executors hold, which leaves the limits as they were.
     Configure(SchedulerConfig, Sender<Result<(), Error>>),
@@ -374,8 +377,9 @@ pub struct Scheduler {
     boundary: Vec<Sender<()>>,
     /// The reply, cause, deadline and whether memory is given back, of a drain under way.
     draining: Option<(Sender<()>, MigrationCause, Instant, bool)>,
-    /// The region, by number, of each `Resize` outstanding and its reply, owed at `Resized`.
-    resizing: Vec<(u8, Sender<()>)>,
+    /// The region, by number, of each `Resize` outstanding and its reply, owed at `Resized` with
+    /// the units the region reached.
+    resizing: Vec<(u8, Sender<u32>)>,
     next_batch: u64,
     step: u64,
 }
@@ -711,7 +715,7 @@ impl Scheduler {
                 let snapshot = self.snapshot();
                 let _ = reply.send(self.policy.rollback(snapshot));
             }
-            Message::CommitPolicy => self.policy.previous = None,
+            Message::CommitPolicy => self.policy.commit(),
             Message::Flush(seeds, in_flight, reply) => {
                 self.flush(seeds, in_flight);
                 let _ = reply.send(Ok(()));

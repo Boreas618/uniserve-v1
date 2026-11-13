@@ -622,6 +622,13 @@ impl Graphs {
         self.state.borrow().serving.number()
     }
 
+    /// The generation that serves: the kernels a replay launches, which the device's context
+    /// loaded. The engine builds the next generation of the device from it, and the memories of
+    /// the device's rank launch their own work from it.
+    pub fn kernels(&self) -> Arc<Generation> {
+        Arc::clone(&self.state.borrow().serving)
+    }
+
     /// Begins preparing `next` beside the serving generation and returns the buckets whose
     /// graphs it changes, largest first: each is prepared by [`Graphs::prepare_bucket`], between
     /// serving batches. A bucket that is not returned keeps its graph.

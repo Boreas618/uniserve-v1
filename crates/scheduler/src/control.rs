@@ -36,6 +36,7 @@ fn engine_command_name(kind: &proto::process::command::Kind) -> &'static str {
         Kind::Promote(_) => "promote",
         Kind::Pause(_) => "pause",
         Kind::Serve(_) => "serve",
+        Kind::Grow(_) => "grow",
     }
 }
 

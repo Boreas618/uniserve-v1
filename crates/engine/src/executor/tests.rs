@@ -23,7 +23,7 @@ use worker::{Graphs, Runner, lock};
 use super::{Groups, Shadow};
 use crate::scheduler::{Executor as _, Message};
 
-const GROUP: GroupId = GroupId(3);
+pub(crate) const GROUP: GroupId = GroupId(3);
 
 /// The regions every rank maps: the KV units on the device and the host pool of their copies.
 const DEVICE: u8 = 0;
@@ -118,7 +118,7 @@ fn sampled(token: u64) -> CallOutput {
 /// A node's `ranks` ranks of `GROUP` serving generation 1, each an executor over one
 /// [`Answering`] that records the batches it prepares paired forwards for into `shadowed`, and
 /// the route over them.
-fn node(
+pub(crate) fn node(
     ranks: usize,
     shadowed: &Arc<Mutex<Vec<u64>>>,
 ) -> (Arc<Executors>, Vec<Arc<worker::Executor>>) {

@@ -34,7 +34,6 @@ pub(crate) mod text;
 use std::collections::BTreeMap;
 use std::path::Path;
 use std::sync::Arc;
-use std::time::Duration;
 
 use anyhow::{Context as _, Result, bail};
 use build_server::Target;
@@ -47,7 +46,7 @@ use worker::parallel::host::HostGroup;
 use worker::runners::causal_lm::experts::{JoinHook, Member};
 use worker::thread_pool::ThreadPool;
 
-use buckets::{PrefillBound, tier_refusal};
+use buckets::tier_refusal;
 use placement::Mapping;
 
 /// Where a rank's model load puts its weights.
@@ -144,6 +143,10 @@ pub(crate) struct ModelRunner {
 }
 
 /// A rank's places in its deployment's parallel groups.
+#[expect(
+    dead_code,
+    reason = "the media rank, which reads it, is not started by the main process yet"
+)]
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct ParallelShape {
     /// Members of the denoiser's sequence group.
@@ -456,11 +459,6 @@ impl ModelRunner {
             .context("more attention ranks than the exchange addresses")
     }
 
-    /// Whether this rank holds a scheduler: every rank but a dedicated expert rank does.
-    pub(crate) fn schedules(&self) -> bool {
-        self.mapping.attention_ranks == 0 || self.mapping.union_rank < self.mapping.attention_ranks
-    }
-
     /// The member of the node's expert union this rank is on `device`, over the union's host
     /// group `group`, asking the other members to join its steps through `join`; `None` for a
     /// rank of no union.
@@ -605,47 +603,15 @@ impl ModelRunner {
     }
 }
 
-/// What the main process reads of a rank to run it: its Build Server, its thread pools, its
-/// watchdog and the bounds a policy is held to.
+/// What the main process reads of a rank to run it: its thread pools and its devices' build
+/// targets.
 impl ModelRunner {
-    /// The catalogue of prefill buckets this rank captures, and whether the deployment stated it.
-    ///
-    /// `Buckets::bounds` answers the largest prefill token count among the buckets this rank
-    /// captures, so the figure is the ceiling the mechanism admits and the one a policy's limit is
-    /// checked against - not the build config's, which may be wider than the bound that dropped
-    /// it.
-    pub(crate) fn prefill_catalogue(&self) -> PrefillBound {
-        let (_, bound) = self.buckets.bounds();
-        PrefillBound {
-            bound,
-            stated: self
-                .engine_config()
-                .cuda_graph
-                .prefill_token_sizes
-                .is_some(),
-        }
-    }
-
-    /// The thread pool the Build Server's selection and the module loads run on.
-    ///
-    /// Its width follows the work it carries, not the epoch: the checkpoint's own reader count
-    /// when the build config states one, and half the host's parallelism within one to eight
-    /// otherwise. Work beyond the pool's capacity queues; it is never dropped.
-    pub(crate) fn module_pool(&self) -> Result<ThreadPool> {
-        let threads = self
-            .engine_config()
-            .load
-            .threads
-            .map_or_else(host_share, |threads| threads.get() as usize);
-        Ok(ThreadPool::new(
-            "module-load",
-            threads.saturating_mul(2),
-            threads,
-        )?)
-    }
-
     /// The thread pool media host work runs on: half the host's parallelism within one to
     /// eight, each thread with four tasks of room.
+    #[expect(
+        dead_code,
+        reason = "the media rank, which reads it, is not started by the main process yet"
+    )]
     pub(crate) fn media_pool(&self) -> Result<ThreadPool> {
         let threads = host_share();
         Ok(ThreadPool::new(
@@ -653,19 +619,6 @@ impl ModelRunner {
             threads.saturating_mul(4),
             threads,
         )?)
-    }
-
-    /// The Build Server's socket, which the rank's package client connects to.
-    pub(crate) fn build_server(&self) -> &Path {
-        Path::new(&self.launch.build_server)
-    }
-
-    /// How long a job may run without rank progress before it is reported `Stalled`: the
-    /// launch file's when it states one apart from the build config, and the build config's else.
-    pub(crate) fn watchdog_timeout(&self) -> Duration {
-        self.launch
-            .watchdog_timeout()
-            .unwrap_or(self.engine_config().worker.watchdog_timeout)
     }
 
     /// The Build Server's targets this rank resolves a module for: the architecture-specific
@@ -691,6 +644,10 @@ impl ModelRunner {
 
 /// The threads a pool of host work takes when nothing states its width: half the host's
 /// parallelism, within one to eight.
+#[expect(
+    dead_code,
+    reason = "the media rank, which reads it, is not started by the main process yet"
+)]
 fn host_share() -> usize {
     let available = std::thread::available_parallelism()
         .map(|count| count.get())

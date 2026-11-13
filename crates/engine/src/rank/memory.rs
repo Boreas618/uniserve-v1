@@ -6,8 +6,9 @@
 //! are stated or measured by then (`worker::memory::division`): the process's own bytes, the
 //! graph region and shadow region the runner's profile run states, the storages its request slots
 //! and its cache's tables take, and the expert transport of a union member. The cache's planes
-//! take what remains, in whole units agreed over the rank's host group, laid out in the segments
-//! the ranks create and the buffer pool's region names (`specs/buffer-pool.md` §14.1).
+//! take what remains, in whole units agreed over the rank's host group and rounded to whole
+//! segments: the memory of the buffer pool's region is the segments the ranks map or create once
+//! the session is open (`specs/buffer-pool.md` §14.1).
 
 use std::sync::Arc;
 
@@ -15,6 +16,7 @@ use anyhow::{Context as _, Result, bail};
 use ipc::batch::Variant;
 use nn::family::{StateField, TextModel};
 use platform::DeviceId;
+use storage::runtime::Segments;
 use uniserve_tensor::DType;
 use worker::buckets::Buckets;
 use worker::memory::cache::segments::{self, PlaneSegment};
@@ -23,6 +25,7 @@ use worker::memory::client::StorageClient;
 use worker::memory::division;
 use worker::memory::state::StateConfig;
 use worker::parallel::host::HostGroup;
+use worker::runners::causal_lm::CausalLmConfig;
 
 use super::ModelRunner;
 
@@ -244,16 +247,17 @@ impl ModelRunner {
         ))
     }
 
-    /// The units of the cache planes on `device` (steps 11-12 and 14-16), and the segments they
-    /// are made of: what the GPU's quota leaves once the weights are mapped, less the graph and
-    /// scratch `pools`, the recurrent state's `resident` bytes, the request slots' `slot_bytes`,
-    /// the bytes `fixed` the cache keeps beside its planes and the expert transport of a union
-    /// member, agreed over `host` as the smallest count of its ranks. A rank that stands by for
-    /// another epoch's takes that epoch's segments instead, and divides nothing for them.
+    /// The units of the cache planes on `device` (steps 11-12 and 14-15): what the GPU's quota
+    /// leaves once the weights are mapped, less the graph and scratch `pools`, the recurrent
+    /// state's `resident` bytes, the request slots' `slot_bytes`, the bytes `fixed` the cache
+    /// keeps beside its planes and the expert transport of a union member, agreed over `host` as
+    /// the smallest count of its ranks, and rounded down to whole segments of whole granules.
     ///
     /// # Errors
     ///
-    /// The Storage Server's or the driver's refusal, or the region the quota cannot hold.
+    /// The Storage Server's or the driver's refusal, the region the quota cannot hold, or a
+    /// cache too small for one segment of whole granules: the memory of a device KV region is
+    /// the segments its ranks create, and planes that do not split are none.
     #[expect(
         clippy::too_many_arguments,
         reason = "the division's figures come from six owners: the client, the host group, the \
@@ -270,7 +274,7 @@ impl ModelRunner {
         resident: u64,
         slot_bytes: u64,
         fixed: u64,
-    ) -> Result<(u32, Option<Vec<PlaneSegment>>)> {
+    ) -> Result<u32> {
         let granularity = granularity(device)?;
 
         // What the process holds beside its pools and the server's storages. The weight store
@@ -317,14 +321,90 @@ impl ModelRunner {
         // Whole segments of whole granules, an eighth of the cache each at most: what a resize
         // across layouts, a sleep and a wake give back and create again.
         let units = segments::segmented_units(units, layout.plane_bytes, granularity);
-        let made = segments::own(self.launch.epoch, units, layout.plane_bytes, granularity);
-        Ok((units, made))
+        if segments::segment_layout(units, layout.plane_bytes, granularity).is_none() {
+            bail!(
+                "a cache of {units} units of {} plane bytes holds no segment of whole \
+                 {granularity}-byte granules, and a device KV region's memory is the segments its \
+                 ranks create",
+                layout.plane_bytes
+            );
+        }
+        Ok(units)
     }
+}
+
+/// The segments of a cache of `units` units laid out in `layout` whose planes are allocated in
+/// granules of `granularity` bytes (step 16), given the region's segment table `table`
+/// (`storage::runtime::Opened::segments`): the segments the table states, which the rank maps
+/// where their epoch created them (`segments::of_table`), then the segments `epoch` creates for
+/// the units past them; and those created alone, as a segment table states them (the segment,
+/// its first unit and its units), which the session's head grants.
+///
+/// The created segments are the ones `segments::own` splits the whole cache into, from the end
+/// of the table on: a region of one layout is split alike by every epoch that names it, so a
+/// table that ends inside one of them is not this layout's.
+///
+/// # Errors
+///
+/// A table whose segments do not lie back to back from unit 0, that covers more than `units` or
+/// ends inside a segment of the split, or a cache that does not split.
+pub(crate) fn plane_segments(
+    epoch: u64,
+    units: u32,
+    layout: &CacheLayout,
+    granularity: u64,
+    table: &[(storage::Segment, u32, u32)],
+) -> Result<(Vec<PlaneSegment>, Segments)> {
+    let mapped = segments::of_table(table)?;
+    let covered = segments::units(&mapped);
+    if covered > units {
+        bail!("the region's segment table covers {covered} units of a cache of {units}");
+    }
+    let plane_bytes = layout.plane_bytes;
+    let split = segments::own(epoch, units, plane_bytes, granularity).with_context(|| {
+        format!(
+            "a cache of {units} units of {plane_bytes} plane bytes holds no segment of whole \
+             {granularity}-byte granules"
+        )
+    })?;
+
+    let mut first = 0;
+    let mut created = Vec::new();
+    let mut stated = Vec::new();
+    for part in split {
+        if first >= covered {
+            let segment = storage::Segment {
+                epoch: part.segment.epoch,
+                ordinal: part.segment.ordinal,
+            };
+            stated.push((segment, first, part.segment.units));
+            created.push(part);
+        } else if first + part.segment.units > covered {
+            bail!(
+                "the region's segment table ends at unit {covered}, inside segment {} of units \
+                 {first}..{} this layout splits the cache into",
+                part.segment.ordinal,
+                first + part.segment.units
+            );
+        }
+        first += part.segment.units;
+    }
+
+    let segments = mapped.into_iter().chain(created).collect();
+    Ok((segments, stated))
+}
+
+/// The bytes of the scratch pages a runner of `config` writes its paired forwards' keys and
+/// values into, over a cache of `layout`: `scratch_pages` pages of one unit for each row of the
+/// largest bucket (step 13), which the scratch pool holds beside the runner's shadow region.
+pub(crate) fn scratch_bytes(config: &CausalLmConfig, layout: &CacheLayout) -> u64 {
+    let rows = config.buckets.bounds().0;
+    u64::from(rows) * u64::from(config.scratch_pages) * layout.unit_bytes
 }
 
 /// The size and alignment unit of the exportable allocations of `device`, which a pool's mapping
 /// and a segment's every part take whole.
-fn granularity(device: DeviceId) -> Result<u64> {
+pub(crate) fn granularity(device: DeviceId) -> Result<u64> {
     let granularity = platform::DeviceAllocation::granularity(device)
         .with_context(|| format!("reading device {}'s allocation granularity", device.0))?;
     Ok(granularity as u64)

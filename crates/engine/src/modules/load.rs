@@ -1,157 +1,339 @@
-//! The module-load lane's work: the Build Server's selection of a generation's packages and one
-//! device's installs, and the loading of each resolved module into the device's context as a
-//! kernel, a cubin or a native library chosen by the entry it defines.
+//! The engine's module load at the Build Server, as plain functions its callers run where they
+//! may wait: the selection of a generation's kernel packages for the keys its devices launch
+//! ([`select`]), one device's installs of the selected packages' modules ([`install`]), and the
+//! scheduling policy's module ([`policy`]).
+//!
+//! A rank's start calls them on its load thread (`specs/engine-worker-port.md` §1.1, step 9) and
+//! a generation update on a job thread of its own: a call to the Build Server has no deadline of
+//! its own, since a module it does not hold is built first, and a build takes minutes, so no
+//! scheduler, executor or control thread makes one. Each module is loaded into the device's
+//! context as a kernel, a cubin or a native library chosen by the entry it defines.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
-use build_server::{Client, CoverRequest, PrepareRequest, Target};
+use anyhow::{Context as _, Result, bail};
+use build_server::{
+    Client, CoverRequest, Descriptors, PackageRequest, PrepareRequest, Selector, Target,
+};
 use ops::KernelEntry;
-use proto::module::Packages;
-use worker::completion::Outcome;
-use worker::thread_pool::HostAction;
+use platform::DeviceId;
+use proto::module::{PackageRevision, Packages};
+use scheduling_guest::limits::Parameters;
 
 use crate::modules::select::{
     Routes, fixed_revisions, interface_agrees, named_backends, selected_slots,
 };
 
-/// The Build Server's selection of a generation's packages, on the module-load lane.
+/// The operator a scheduling policy's package fills (`specs/scheduler-design.md` §5).
+const POLICY_OP: &str = "scheduling";
+
+/// The Build Server's selection of a generation's packages for `keys`, every descriptor key the
+/// generation launches by operator, on `targets`, the devices' architectures: the packages by
+/// slot, and the keys each slot's package builds.
 ///
-/// Every operator the generation launches is asked once, with every descriptor key it launches and
-/// the backends the deployment names for it; the server returns the package of each key
-/// (`BuildServer::cover`), and the response gives the generation's slots and the keys each slot's
-/// package builds. The call has no deadline of its own, so it runs where a build runs: on the lane,
-/// a store that never responds costs a build slot and not the control thread that serves the
-/// daemon, the requests and the watchdog.
-pub(crate) struct Select {
-    pub(crate) packages: Arc<Mutex<Client>>,
-    pub(crate) targets: Vec<Target>,
-    /// The packages the deployment names, by slot.
-    pub(crate) named: Packages,
-    /// Every descriptor key the generation launches, by operator.
-    pub(crate) keys: BTreeMap<String, BTreeSet<String>>,
+/// Every operator is asked once, with every key it launches and the backends the deployment
+/// names for it in `named`; the server returns the package of each key (`BuildServer::cover`).
+///
+/// # Errors
+///
+/// An operator this build has no implementation of, the Build Server's refusal, or a key no
+/// installed package covers.
+pub(crate) fn select(
+    client: &mut Client,
+    targets: &[Target],
+    named: &Packages,
+    keys: &BTreeMap<String, BTreeSet<String>>,
+) -> Result<(Packages, Routes)> {
+    let mut packages = Packages::new();
+    let mut routes = Routes::new();
+
+    for (op, keys) in keys {
+        if proto::module::operator::named(op).is_none() {
+            bail!("operator {op} has no implementation in this build");
+        }
+        if keys.is_empty() {
+            continue;
+        }
+
+        let request = CoverRequest {
+            op: op.clone(),
+            targets: targets.to_vec(),
+            keys: keys.iter().cloned().collect(),
+            preferred: named_backends(op, named),
+            fixed: fixed_revisions(op, named),
+        };
+        let coverage = client
+            .cover(&request)
+            .with_context(|| format!("asking the Build Server to select {op}'s packages"))?;
+        let (slots, selected) = selected_slots(op, &coverage, named).map_err(anyhow::Error::msg)?;
+        for (slot, package) in &slots {
+            tracing::info!(
+                %op,
+                backend = %package.backend,
+                revision = package.revision,
+                part = slot.part.as_deref().unwrap_or(""),
+                keys = selected.get(slot).map_or(0, Vec::len),
+                named = !request.preferred.is_empty(),
+                "the Build Server selected a package for this operator's keys"
+            );
+        }
+        packages.extend(slots);
+        routes.extend(selected);
+    }
+    Ok((packages, routes))
 }
 
-/// What a selection returns: the generation's packages by slot, and the keys of each slot.
-#[derive(Clone, Debug, Default)]
-pub(crate) struct Selection {
-    pub(crate) packages: Packages,
-    pub(crate) routes: Routes,
-}
+/// `device`'s kernels of the generation whose packages are `packages`, each slot's package asked
+/// for exactly the keys `routes` selected for it: the Build Server prepares every slot's modules
+/// in one request for the device's architecture, each module is resolved, and each is loaded
+/// into the device's context. A generation that changes no kernel package asks nothing.
+///
+/// # Errors
+///
+/// A device that states no architecture or has no context, the Build Server's refusal to prepare
+/// or resolve a module, a module whose interface or form this build does not install, or the
+/// driver's refusal to load it.
+pub(crate) fn install(
+    client: &mut Client,
+    device: DeviceId,
+    packages: &Packages,
+    routes: &Routes,
+) -> Result<Vec<KernelEntry>> {
+    if packages.is_empty() {
+        return Ok(Vec::new());
+    }
 
-impl HostAction for Select {
-    type Output = Selection;
+    let target = device
+        .compute_capability()
+        .map(Target::arch)
+        .with_context(|| format!("reading device {}'s architecture", device.0))?;
+    let ordinal = device;
+    let device =
+        platform::Device::new(device).with_context(|| format!("opening device {}", ordinal.0))?;
 
-    fn run(&self) -> worker::Result<Self::Output> {
-        let mut client = self
-            .packages
-            .lock()
-            .map_err(|_| worker::Error::State("the Build Server client was poisoned"))?;
-        let mut selection = Selection::default();
-        for (op, keys) in &self.keys {
-            if keys.is_empty() {
-                continue;
+    // The generation's one admission: every slot's package with exactly the keys selected for
+    // it, so the Build Server prepares the whole generation at once and no package is asked for
+    // another slot's keys.
+    let request = PrepareRequest {
+        targets: vec![target.clone()],
+        packages: packages
+            .iter()
+            .map(|(slot, package)| PackageRequest {
+                slot: slot.clone(),
+                selector: Selector::Fixed(package.clone()),
+            })
+            .collect(),
+        descriptors: packages
+            .keys()
+            .map(|slot| Descriptors {
+                slot: slot.clone(),
+                keys: routes.get(slot).cloned().unwrap_or_default(),
+            })
+            .collect(),
+    };
+
+    // The one call that leaves this process while a generation is prepared: a run that hangs
+    // before it reaches the Build Server and one that hangs inside it look the same from the
+    // daemon, so both sides state it, naming every slot's package and key count.
+    let asking: Vec<String> = packages
+        .iter()
+        .map(|(slot, package)| {
+            let keys = routes.get(slot).map_or(0, Vec::len);
+            format!(
+                "{}/{}@{} keys={keys}",
+                slot.op, package.backend, package.revision
+            )
+        })
+        .collect();
+    tracing::info!(
+        packages = ?asking,
+        %target,
+        "asking the Build Server to prepare this generation's modules"
+    );
+    let prepared = client
+        .prepare(&request, &mut |progress| {
+            tracing::debug!(
+                path = %progress.path,
+                state = ?progress.state,
+                "building a module for the new generation"
+            );
+        })
+        .map_err(|error| anyhow::anyhow!("building the new generation: {}", causes(&error)))?;
+
+    let mut entries = Vec::new();
+    let mut copies = 0_usize;
+    for (slot, package) in &prepared {
+        let operator = proto::module::operator::named(&slot.op)
+            .with_context(|| format!("operator {} has no implementation in this build", slot.op))?;
+
+        // A slot's package is resolved for the keys selected for that slot alone.
+        for key in routes.get(slot).into_iter().flatten() {
+            let module = client
+                .resolve(&slot.op, package, &target, key, &mut |progress| {
+                    tracing::debug!(
+                        path = %progress.path,
+                        state = ?progress.state,
+                        "resolving a module of the new generation"
+                    );
+                })
+                .map_err(|error| {
+                    tracing::warn!(
+                        op = %slot.op,
+                        key = %key,
+                        error = ?error,
+                        "resolving this generation's module failed"
+                    );
+                    anyhow::anyhow!("resolving {} for {key}: {}", slot.op, causes(&error))
+                })?;
+            interface_agrees(operator, package, module.interface_version)
+                .map_err(anyhow::Error::msg)?;
+            let module = resolved(module)?;
+            if module.copied() {
+                copies += 1;
             }
-            let request = CoverRequest {
-                op: op.clone(),
-                targets: self.targets.clone(),
-                keys: keys.iter().cloned().collect(),
-                preferred: named_backends(op, &self.named),
-                fixed: fixed_revisions(op, &self.named),
+
+            let entry = match ops::install(&device, operator, key, module.as_ops()?) {
+                Ok(entry) => entry,
+                Err(error) => {
+                    // The refusal that travels is one line; this is the whole value, so a
+                    // failure whose own message is empty still shows which call, status and code
+                    // it carried.
+                    tracing::warn!(
+                        operator,
+                        key = %key,
+                        error = ?error,
+                        "installing this generation's kernel failed"
+                    );
+                    report_missing_entry(&error);
+                    bail!("installing {operator} for {key}: {}", causes(&error));
+                }
             };
-            let coverage = client.cover(&request).map_err(|error| {
-                worker::Error::Invalid(format!(
-                    "asking the Build Server to select {op}'s packages: {error}"
-                ))
-            })?;
-            let (slots, routes) =
-                selected_slots(op, &coverage, &self.named).map_err(worker::Error::Invalid)?;
-            for (slot, package) in &slots {
-                tracing::info!(
-                    %op,
-                    backend = %package.backend,
-                    revision = package.revision,
-                    part = slot.part.as_deref().unwrap_or(""),
-                    keys = routes.get(slot).map_or(0, Vec::len),
-                    named = !request.preferred.is_empty(),
-                    "the Build Server selected a package for this operator's keys"
-                );
+            if let Some(entry) = entry {
+                entries.push(entry);
             }
-            selection.packages.extend(slots);
-            selection.routes.extend(routes);
         }
-        Ok(selection)
     }
 
-    /// Nothing to give back: the client this action borrows belongs to the process, and its reply
-    /// holds no device or pinned memory.
-    fn release(&self) -> worker::Result<()> {
-        Ok(())
-    }
-
-    fn input_status(&self) -> Outcome {
-        Outcome::Success(())
-    }
+    tracing::info!(
+        modules = entries.len(),
+        copies,
+        %target,
+        "this device's modules are installed for the new generation"
+    );
+    Ok(entries)
 }
 
-/// One piece of the module-load lane's work.
+/// The scheduling policy of `package` (`specs/scheduler-design.md` §5.3): its module, which the
+/// Build Server resolves for the store's wasm target under the operator's single descriptor and
+/// builds first when its store does not hold it, compiled by the engine
+/// `scheduling::Engine` configures (fuel metered), and the package's arguments as the policy's
+/// [`Parameters`]. The module is loaded once here, and every scheduler and the routing policy
+/// instantiate it.
 ///
-/// The lane has two tenants and one order: the selection, which says which package builds each
-/// key, and the installs that follow from it. Keeping them in one lane keeps that order where it
-/// belongs and keeps both off the control thread.
-pub(crate) enum ModuleWork {
-    Select(Select),
-    Install(Install),
-}
-
-impl HostAction for ModuleWork {
-    type Output = ModuleOutput;
-
-    fn run(&self) -> worker::Result<Self::Output> {
-        match self {
-            Self::Select(select) => select.run().map(ModuleOutput::Selected),
-            Self::Install(install) => install.run().map(ModuleOutput::Installed),
-        }
-    }
-
-    fn release(&self) -> worker::Result<()> {
-        match self {
-            Self::Select(select) => select.release(),
-            Self::Install(install) => install.release(),
-        }
-    }
-
-    fn input_status(&self) -> Outcome {
-        match self {
-            Self::Select(select) => select.input_status(),
-            Self::Install(install) => install.input_status(),
-        }
-    }
-}
-
-/// What one piece of the module-load work returns.
-pub(crate) enum ModuleOutput {
-    /// The generation's packages, as the Build Server selected them.
-    Selected(Selection),
-    /// One device's kernels for the generation being prepared.
-    Installed(Vec<KernelEntry>),
-}
-
-/// One device's half of the precopy, on the module-load lane: the Build
-/// Server compiles and caches what the generation's descriptors need, each
-/// module is resolved for this node's target, and each is loaded into this
-/// device's context as a kernel.
+/// # Errors
 ///
-/// It runs on the blocking pool because compiling can take minutes and no
-/// device stream and no scheduler thread may wait on it.
-pub(crate) struct Install {
-    pub(crate) packages: Arc<Mutex<Client>>,
-    pub(crate) device: platform::Device,
-    pub(crate) target: Target,
-    /// The generation's one admission: every slot's package with exactly the keys selected for
-    /// it, so the Build Server prepares the whole generation at once and no package is asked
-    /// for another slot's keys.
-    pub(crate) request: PrepareRequest,
+/// The Build Server's refusal, a module of another version of the policy interface or with no
+/// wasm, bytes the engine does not load, or an argument that is not a policy parameter or does
+/// not have its type.
+pub(crate) fn policy(
+    client: &mut Client,
+    package: &PackageRevision,
+) -> Result<(Arc<wasmtime::Module>, Parameters)> {
+    let parameters = parameters(package)?;
+    let target = Target::new(build_server::manifest::WASM_TARGET);
+    let named = format!("the {}/{} policy", package.backend, package.revision);
+
+    let started = std::time::Instant::now();
+    tracing::info!(
+        backend = %package.backend,
+        revision = package.revision,
+        %target,
+        "resolving the scheduling policy"
+    );
+    let module = client
+        .resolve(
+            POLICY_OP,
+            package,
+            &target,
+            build_server::manifest::SINGLE_KEY,
+            &mut |progress| {
+                tracing::info!(
+                    path = %progress.path,
+                    state = ?progress.state,
+                    "the Build Server is building the policy's module"
+                );
+            },
+        )
+        .map_err(|error| anyhow::anyhow!("resolving {named} for {target}: {}", causes(&error)))?;
+    tracing::info!(
+        backend = %package.backend,
+        revision = package.revision,
+        ms = started.elapsed().as_millis() as u64,
+        "the scheduling policy resolved"
+    );
+
+    // A module built for another version of the policy interface would be asked decisions
+    // through calls whose messages mean something else to it.
+    if module.interface_version != scheduling_guest::INTERFACE_VERSION {
+        bail!(
+            "{named} implements version {} of the scheduling policy interface and this engine \
+             instantiates version {}",
+            module.interface_version,
+            scheduling_guest::INTERFACE_VERSION
+        );
+    }
+    let file = module
+        .files
+        .into_iter()
+        .find(|file| file.name == build_server::source::MODULE_WASM)
+        .with_context(|| {
+            format!(
+                "{named}'s module carries no {}",
+                build_server::source::MODULE_WASM
+            )
+        })?;
+    let mut bytes = Vec::with_capacity(file.size as usize);
+    std::io::Read::read_to_end(&mut &file.file, &mut bytes)
+        .with_context(|| format!("reading {named}'s module"))?;
+
+    let engine = scheduling::Engine::new().map_err(|error| anyhow::anyhow!("{error}"))?;
+    let module = engine
+        .load(&bytes)
+        .map_err(|error| anyhow::anyhow!("loading {named}'s module: {error}"))?;
+    Ok((Arc::new(module), parameters))
+}
+
+/// The policy's [`Parameters`] a package's `arguments` state, each a TOML value of the
+/// parameter's type under the parameter's name; an argument the parameters do not name is
+/// refused, as a misspelt limit would otherwise be dropped unsaid.
+///
+/// # Errors
+///
+/// An argument that is not a policy parameter or does not have its type.
+pub(crate) fn parameters(package: &PackageRevision) -> Result<Parameters> {
+    let named = serde_json::to_value(Parameters::default())?;
+    let named = named
+        .as_object()
+        .context("the policy's parameters are a table")?;
+    if let Some(unknown) = package
+        .arguments
+        .keys()
+        .find(|name| !named.contains_key(name.as_str()))
+    {
+        bail!(
+            "the {} policy package states `{unknown}`, which no policy parameter is named",
+            package.backend
+        );
+    }
+
+    let stated = serde_json::to_value(&package.arguments)?;
+    serde_json::from_value(stated).with_context(|| {
+        format!(
+            "the {}/{} policy package's arguments are not its parameters",
+            package.backend, package.revision
+        )
+    })
 }
 
 /// One module the Build Server resolved, held open while its kernel loads.
@@ -533,152 +715,36 @@ fn resolved(module: build_server::Module) -> worker::Result<Resolved> {
     }
 }
 
-impl HostAction for Install {
-    type Output = Vec<KernelEntry>;
-
-    /// This device's half of the precopy: the generation's packages prepared in one request, each
-    /// slot's keys resolved for this node's target, and each module loaded into this device's
-    /// context as a kernel. A generation that changes no kernel package asks nothing.
-    fn run(&self) -> worker::Result<Self::Output> {
-        let request = &self.request;
-        if request.packages.is_empty() {
-            return Ok(Vec::new());
-        }
-        let mut client = self
-            .packages
-            .lock()
-            .map_err(|_| worker::Error::State("the Build Server client was poisoned"))?;
-        // The one call that leaves this process while a generation is prepared: a run that hangs
-        // before it reaches the Build Server and one that hangs inside it look the same from the
-        // daemon, so both sides state it, naming every slot's package and key count.
-        let asking: Vec<String> = request
-            .descriptors
-            .iter()
-            .map(|descriptors| {
-                let package = request
-                    .packages
-                    .iter()
-                    .find(|entry| entry.slot == descriptors.slot)
-                    .and_then(|entry| match &entry.selector {
-                        build_server::Selector::Fixed(package) => {
-                            Some(format!("{}@{}", package.backend, package.revision))
-                        }
-                        build_server::Selector::Latest { .. } => None,
-                    })
-                    .unwrap_or_default();
-                format!(
-                    "{}/{package} keys={}",
-                    descriptors.slot.op,
-                    descriptors.keys.len()
-                )
-            })
-            .collect();
-        tracing::info!(
-            packages = request.packages.len(),
-            packages = ?asking,
-            target = %self.target,
-            "asking the Build Server to prepare this generation's modules"
-        );
-        let prepared = client
-            .prepare(request, &mut |progress| {
-                tracing::debug!(
-                    path = %progress.path,
-                    state = ?progress.state,
-                    "building a module for the new generation"
-                );
-            })
-            .map_err(|error| {
-                worker::Error::Invalid(format!("building the new generation: {}", causes(&error)))
-            })?;
-
-        let mut entries = Vec::new();
-        let mut copies = 0_usize;
-        for (slot, package) in &prepared {
-            let operator = proto::module::operator::named(&slot.op).ok_or_else(|| {
-                worker::Error::Invalid(format!(
-                    "operator {} has no implementation in this build",
-                    slot.op
-                ))
-            })?;
-            // A slot's package is resolved for the keys selected for that slot alone.
-            let keys = request
-                .descriptors
-                .iter()
-                .filter(|descriptor| descriptor.slot == *slot)
-                .flat_map(|descriptor| descriptor.keys.iter());
-            for key in keys {
-                let module = client
-                    .resolve(&slot.op, package, &self.target, key, &mut |progress| {
-                        tracing::debug!(
-                            path = %progress.path,
-                            state = ?progress.state,
-                            "resolving a module of the new generation"
-                        );
-                    })
-                    .map_err(|error| {
-                        tracing::warn!(
-                            op = %slot.op,
-                            key = %key,
-                            error = ?error,
-                            "resolving this generation's module failed"
-                        );
-                        worker::Error::Invalid(format!(
-                            "resolving {} for {key}: {}",
-                            slot.op,
-                            causes(&error)
-                        ))
-                    })?;
-                interface_agrees(operator, package, module.interface_version)
-                    .map_err(worker::Error::Invalid)?;
-                let module = resolved(module)?;
-                if module.copied() {
-                    copies += 1;
-                }
-                let entry = match ops::install(&self.device, operator, key, module.as_ops()?) {
-                    Ok(entry) => entry,
-                    Err(error) => {
-                        // The refusal that travels is one line; this is the whole value, so a
-                        // failure whose own message is empty still shows which call, status and
-                        // code it carried.
-                        tracing::warn!(
-                            operator,
-                            key = %key,
-                            error = ?error,
-                            "installing this generation's kernel failed"
-                        );
-                        report_missing_entry(&error);
-                        return Err(worker::Error::Invalid(format!(
-                            "installing {operator} for {key}: {}",
-                            causes(&error)
-                        )));
-                    }
-                };
-                if let Some(entry) = entry {
-                    entries.push(entry);
-                }
-            }
-        }
-        tracing::info!(
-            modules = entries.len(),
-            copies,
-            target = %self.target,
-            "this device's modules are installed for the new generation"
-        );
-        Ok(entries)
-    }
-
-    fn release(&self) -> worker::Result<()> {
-        Ok(())
-    }
-
-    fn input_status(&self) -> Outcome {
-        Outcome::Success(())
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A policy package's arguments are its parameters by name, each a TOML value of the
+    /// parameter's type, and a name no parameter has is refused rather than dropped.
+    #[test]
+    fn a_policy_package_s_arguments_are_its_parameters() {
+        let package = |arguments: &str| PackageRevision {
+            backend: "fcfs".to_owned(),
+            revision: 3,
+            arguments: toml::from_str(arguments).unwrap(),
+        };
+
+        let stated = parameters(&package(
+            "max_batch = 8\ntimeout = 1000\nexpected_speedup = 1.5",
+        ))
+        .unwrap();
+        assert_eq!(stated.max_batch, Some(8));
+        assert_eq!(stated.timeout, Some(scheduling_guest::time::Nanos(1000)));
+        assert_eq!(stated.expected_speedup, Some(1.5));
+        assert_eq!(stated.chunked_prefill_size, None);
+
+        let unknown = parameters(&package("max_batches = 8")).unwrap_err();
+        assert!(
+            format!("{unknown:#}").contains("max_batches"),
+            "{unknown:#}"
+        );
+        assert!(parameters(&package("max_batch = \"eight\"")).is_err());
+    }
 
     /// The library of a multi-file native module is chosen by what it defines, never by position.
     ///

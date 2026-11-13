@@ -1,0 +1,238 @@
+//! The parts of a serving engine that the jobs act on, over a Storage Server in the test's
+//! process and executors that hold no device: one scheduler on its thread, over a session whose
+//! region of the KV planes is made of four segments, with the engine's executor of its one worker
+//! group, whose rank serves generation 1 of no kernel, and a data plane of no rank.
+//!
+//! The tests read what the jobs leave: the scheduler's replies and statistics, the generation
+//! each executor serves, and the segment table the Storage Server holds.
+
+use std::collections::BTreeMap;
+use std::sync::atomic::AtomicU64;
+use std::sync::{Arc, Mutex};
+use std::thread::JoinHandle;
+use std::time::Duration;
+
+use anyhow::bail;
+use crossbeam_channel::{Receiver, Sender};
+use proto::config::{SchedulerConfig, WorkerGroupConfig};
+use proto::report::SchedulerStats;
+use proto::request::GenerationLimits;
+use storage::runtime::{self, Class, Open, Region, Segments, Tier};
+use worker::lock;
+
+use super::at_boundary;
+use crate::data_plane::{DataPlane, Target};
+use crate::executor::Groups;
+use crate::executor::tests::{GROUP, node};
+use crate::scheduler::tests::{capacity, idle_policy};
+use crate::scheduler::{Message, Output, Scheduler};
+use crate::storage_client::StorageClient;
+use crate::support::{DEPLOYMENT, StorageServer};
+
+/// The units of the region of the KV planes, the first of them reserved, in four segments.
+pub(in crate::process) const KV_UNITS: u32 = 64;
+pub(in crate::process) const SEGMENT_UNITS: u32 = 16;
+
+/// The bytes of one unit of the KV planes on one rank.
+pub(in crate::process) const UNIT_BYTES: u64 = 4096;
+
+/// A bound on the tests' waits that only a defect reaches.
+pub(in crate::process) const LONG: Duration = Duration::from_secs(30);
+
+/// Segment `ordinal` of the KV planes, which epoch 1's ranks created, as a segment table states
+/// it.
+pub(in crate::process) fn segment(ordinal: u32) -> (storage::Segment, u32, u32) {
+    let stated = storage::Segment { epoch: 1, ordinal };
+    (stated, ordinal * SEGMENT_UNITS, SEGMENT_UNITS)
+}
+
+/// The layout of epoch `epoch`'s session: the region of the KV planes, `kv`, of one block class,
+/// and the slot rows of group [`GROUP`]; the class of stored trajectories takes from no region.
+/// Epoch 1's ranks created the four segments of `kv` before it opened; a later epoch of the same
+/// layout states none, and maps those the Storage Server holds.
+fn layout(epoch: u64) -> Open {
+    let segments = if epoch == 1 {
+        (0..KV_UNITS / SEGMENT_UNITS).map(segment).collect()
+    } else {
+        Vec::new()
+    };
+    let slots = format!("slots {epoch}");
+    let class = |units| Class {
+        units,
+        host: None,
+        state_in_slot: false,
+        tensors: [0; 32],
+        encoding: [0; 32],
+    };
+
+    Open {
+        version: runtime::VERSION,
+        epoch,
+        trial: false,
+        regions: vec![
+            Region {
+                name: "kv".to_owned(),
+                tier: Tier::Device,
+                space: "kv".to_owned(),
+                unit_bytes: UNIT_BYTES,
+                part_bytes: UNIT_BYTES,
+                reserved: 1,
+                units: KV_UNITS - 1,
+                limit: KV_UNITS,
+                segments,
+            },
+            Region {
+                name: slots.clone(),
+                tier: Tier::Device,
+                space: slots,
+                unit_bytes: 256,
+                part_bytes: 256,
+                reserved: 1,
+                units: 4,
+                limit: 5,
+                segments: Vec::new(),
+            },
+        ],
+        classes: vec![class(1), class(0)],
+        trajectory: 1,
+        groups: vec![runtime::Group {
+            id: GROUP,
+            memory: "memory".to_owned(),
+            slots: 1,
+            regions: vec![vec![0], Vec::new()],
+        }],
+        schedulers: vec![vec![GROUP]],
+        peers: Vec::new(),
+    }
+}
+
+/// The parts of a serving engine of epoch 1 on the meta device (module documentation).
+pub(in crate::process) struct Node {
+    /// The scheduler's inbox.
+    pub(in crate::process) schedulers: Vec<Sender<Message>>,
+    /// What the scheduler reports.
+    pub(in crate::process) outputs: Receiver<Output>,
+    /// The worker group's one rank.
+    pub(in crate::process) executors: Vec<Arc<worker::Executor>>,
+    pub(in crate::process) data: Arc<DataPlane>,
+    pub(in crate::process) head: Mutex<StorageClient>,
+    /// The generation the scheduler's batches carry.
+    pub(in crate::process) served: Arc<AtomicU64>,
+    threads: Vec<JoinHandle<()>>,
+    server: StorageServer,
+}
+
+impl Node {
+    pub(in crate::process) fn start() -> Self {
+        let server = StorageServer::start();
+        let layout = layout(1);
+        let mut head = StorageClient::connect(&server.socket, DEPLOYMENT, 1).unwrap();
+        let mut pairs = head.open(layout.clone()).unwrap();
+        let opened = head.session().unwrap().1.clone();
+
+        let (route, executors) = node(1, &Arc::default());
+        let (inbox, messages) = crossbeam_channel::unbounded();
+        let (output, outputs) = crossbeam_channel::unbounded();
+        let served = Arc::new(AtomicU64::new(1));
+
+        let groups = Groups::new(route, &[GROUP], inbox.clone(), Arc::default()).unwrap();
+        let config = WorkerGroupConfig::data_parallel(
+            &["localhost".to_owned()],
+            "cpu",
+            1,
+            1,
+            2,
+            BTreeMap::new(),
+        )
+        .remove(0);
+        let scheduler = Scheduler::new(
+            SchedulerConfig::default(),
+            GenerationLimits::default(),
+            &layout,
+            &opened,
+            0,
+            pairs.remove(0),
+            vec![(config, capacity())],
+            idle_policy(),
+            Box::new(groups),
+            output,
+            Arc::clone(&served),
+        )
+        .unwrap();
+        let thread = std::thread::spawn(move || scheduler.run(messages));
+
+        Self {
+            schedulers: vec![inbox],
+            outputs,
+            executors,
+            data: Arc::new(DataPlane::new(Vec::new(), Target::default(), 0.9)),
+            head: Mutex::new(head),
+            served,
+            threads: vec![thread],
+            server,
+        }
+    }
+
+    /// The number the buffer pool gave the region of the KV planes.
+    pub(in crate::process) fn kv(&self) -> u8 {
+        lock(&self.head).session().unwrap().1.regions[0].0
+    }
+
+    /// The segment table of the KV planes' memory space as the Storage Server holds it: what a
+    /// session of the same layout, of epoch `epoch`, opened now is answered.
+    pub(in crate::process) fn segments_seen(&self, epoch: u64) -> Segments {
+        let mut head = StorageClient::connect(&self.server.socket, DEPLOYMENT, epoch).unwrap();
+        head.open(layout(epoch)).unwrap();
+        let segments = head.session().unwrap().1.segments[0].clone();
+        head.close().unwrap();
+        segments
+    }
+
+    /// The next statistics the scheduler reports.
+    pub(in crate::process) fn next_stats(&self) -> SchedulerStats {
+        loop {
+            match self.outputs.recv_timeout(LONG).unwrap() {
+                Output::Stats(stats) => return stats,
+                Output::Failed(error) => panic!("the scheduler failed: {error}"),
+                _ => {}
+            }
+        }
+    }
+
+    /// The steps the scheduler took from one of its reports to the next, both sent after this
+    /// call: a paused scheduler takes none.
+    pub(in crate::process) fn steps_in_a_second(&self) -> u64 {
+        // A report already sent may have been counted before the scheduler's last message.
+        while self.outputs.try_recv().is_ok() {}
+        let first = self.next_stats();
+        let second = self.next_stats();
+        second.steps - first.steps
+    }
+}
+
+impl Drop for Node {
+    fn drop(&mut self) {
+        for inbox in &self.schedulers {
+            let _ = inbox.send(Message::Shutdown);
+        }
+        for thread in self.threads.drain(..) {
+            thread.join().unwrap();
+        }
+        let _ = lock(&self.head).close();
+    }
+}
+
+#[test]
+fn a_boundary_resumes_every_scheduler_after_its_work_failed() {
+    let node = Node::start();
+
+    let failed: anyhow::Result<()> = at_boundary(&node.schedulers, || {
+        // The work runs at the boundary: the scheduler takes no step meanwhile.
+        assert_eq!(node.steps_in_a_second(), 0);
+        bail!("the work fails")
+    });
+    assert_eq!(failed.unwrap_err().to_string(), "the work fails");
+
+    // The scheduler resumed: it steps again.
+    assert!(node.steps_in_a_second() > 0);
+}

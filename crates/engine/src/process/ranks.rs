@@ -1,20 +1,34 @@
-//! Starting this process's ranks (`specs/engine-worker-port.md` §1.1): each rank's load on a
-//! thread of its own ([`load_ranks`]), the layout the engine opens its epoch's session with the
-//! buffer pool with ([`layout`]), each rank bound to the regions the answer numbered ([`bind`]),
-//! and the executors spawned over the ranks' runners ([`spawn`]), with what each worker group's
-//! ranks state of it ([`capacities`]).
+//! Starting this process's ranks (`specs/engine-worker-port.md` §1.1) in two halves around the
+//! session the engine opens with its host's buffer pool (`specs/buffer-pool.md` §14.1, "A session
+//! opens before its ranks map memory"):
 //!
-//! A rank's load is the worker's start order: its Storage Server client and quota, the host
-//! groups it agrees over, its tensor group's communicator, the model's meta load and the runner's
-//! profile run, the kernels the profile run names, the weights, the division of the GPU's quota,
-//! the graph pool, the cache (whose segments the rank creates and the session's layout names),
-//! the recurrent state, the scratch pages, and the serving runner. A start that is backed by
-//! nothing outside the process ([`Backing::Meta`]) stops after the profile run: its runner and
-//! owners hold no device, and it serves as that, which is what a recorded start reads and what
-//! the engine's host tests start.
+//! 1. [`load_ranks`] loads each rank on a thread of its own up to the division of its GPU's
+//!    quota: its Storage Server client and quota, the host groups it agrees over, its tensor
+//!    group's communicator, the model's meta load and the runner's profile run, the kernels the
+//!    profile run names, the weights, and the units of its cache, agreed over its host group.
+//! 2. [`layout`] states the session's layout from those units; its device KV regions state no
+//!    segment and ask for no unit, since none of their memory exists yet. The head opens the
+//!    session with it.
+//! 3. [`open_ranks`] maps on every rank the segments the answer's table states for its region,
+//!    creates the segments that cover the rest of the region's units, and opens the graph pool,
+//!    the cache over those segments, the recurrent state, the scratch pages and the serving
+//!    runner. It returns the segments it created, which the head grants, and the schedulers
+//!    then grow their regions into them by `Resize`.
+//! 4. [`bind`] binds every rank to the regions the answer numbered, [`spawn`] spawns the
+//!    executors over the ranks' runners, and [`capacities`] states what each worker group's
+//!    ranks serve.
+//!
+//! One sequence serves a first epoch, a successor of the same layout and a relaunch: a region an
+//! earlier session named has its table, which the ranks map, and creates nothing more.
+//!
+//! A start that is backed by nothing outside the process ([`Backing::Meta`]) takes the same
+//! steps over owners that hold no device: its loads stop after the profile run, its "segments"
+//! are statements of units with no memory behind them, and it serves generation
+//! [`FIRST_GENERATION`] of no kernel. That is what a recorded start reads and what the engine's
+//! host tests start.
 
 use std::net::TcpListener;
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock, Weak};
 
 use anyhow::{Context as _, Result, bail};
 use ipc::Capacity;
@@ -25,7 +39,7 @@ use ops::Generation;
 use platform::{DeviceId, Stream};
 use proto::config::{EngineArgs, WorkerGroupConfig};
 use storage::QueuePair;
-use storage::runtime::{Class, Group, GroupId, Open, Opened, Region, Tier, VERSION};
+use storage::runtime::{Class, Group, GroupId, Open, Opened, Region, Segments, Tier, VERSION};
 use worker::executor::peers::Remote;
 use worker::executor::{COPY_BUDGET, Executor, Executors, Sequences};
 use worker::graphs::Graphs;
@@ -40,17 +54,22 @@ use worker::runners::causal_lm::experts::JoinHook;
 use worker::runners::causal_lm::{CausalLmConfig, CausalLmRunner};
 use worker::{Runner, RunnerId};
 
-use crate::rank::memory::{Peaks, fewest_units};
+use crate::rank::memory::{Peaks, fewest_units, granularity, plane_segments, scratch_bytes};
 use crate::rank::text::{Keys, keys, profile};
 use crate::rank::{Collective, ModelRunner, RankModel, Weights};
 
-/// What resolves the kernels a rank's profile run names into the generation the rank serves:
-/// the engine's module load at the Build Server (step 9).
-pub(crate) type Resolve = dyn Fn(&Keys) -> Result<Arc<Generation>> + Sync;
+/// The number of the generation a start serves: its kernels on a device, none on the meta device.
+/// A start is not an update (`specs/updates.md` §2): nothing is kept beside it.
+pub(crate) const FIRST_GENERATION: u64 = 1;
+
+/// What resolves the kernels a rank's profile run names into the generation the rank serves on
+/// its device: the engine's module load at the Build Server (step 9).
+pub(crate) type Resolve<'a> = dyn Fn(DeviceId, &Keys) -> Result<Arc<Generation>> + Sync + 'a;
 
 /// The executors of the members of the node's expert union, in member order, once they are
-/// spawned: what each member's join hook submits join batches to.
-type Members = Arc<OnceLock<Vec<Arc<Executor>>>>;
+/// spawned: what each member's join hook submits join batches to. Weak, because each member's
+/// runner holds its hook and its executor holds its runner: the epoch's close owns the executors.
+type Members = Arc<OnceLock<Vec<Weak<Executor>>>>;
 
 /// The host KV cache's token count over the device KV cache's when `kv_cache_config.host_ratio`
 /// is unset (SGLang's `--hicache-ratio` default).
@@ -64,19 +83,22 @@ const PRODUCTS: usize = 13;
 #[derive(Clone, Copy)]
 pub(crate) enum Backing<'a> {
     /// The node's Storage Server, whose claim the daemon answered: each rank publishes its weights
-    /// there, creates its cache's segments and divides its GPU's quota, and its tensor group forms
-    /// its communicator. `kernels` resolves the rank's profiled keys into its serving generation.
+    /// there, divides its GPU's quota and creates its cache's segments, and its tensor group
+    /// forms its communicator. `kernels` resolves the rank's profiled keys into its serving
+    /// generation.
     Serving {
         storage: &'a ipc::StorageLaunch,
-        kernels: &'a Resolve,
+        kernels: &'a Resolve<'a>,
     },
     /// Nothing outside this process: each rank's model is loaded from the shard headers alone
     /// ([`nn::WeightLoader::meta`]), its runner and owners hold no device, its tensor group
-    /// states its split with no communicator, and it serves generation `0` of no kernel.
+    /// states its split with no communicator, and it serves generation [`FIRST_GENERATION`] of
+    /// no kernel.
     Meta,
 }
 
-/// One rank of this process, loaded: what its executor is spawned over.
+/// One rank of this process: loaded to its division by [`load_ranks`], then opened over the
+/// session's memory by [`open_ranks`], which is what its executor is spawned over.
 pub(crate) struct LoadedRank {
     /// The rank's own model runner, whose one device is the rank's.
     pub(crate) model_runner: ModelRunner,
@@ -90,23 +112,34 @@ pub(crate) struct LoadedRank {
     pub(crate) weights: Vec<(WeightKey, bool)>,
     /// The rank's partition of the model.
     pub(crate) model: Arc<dyn TextModel>,
-    /// The config of the rank's runner.
+    /// The units of the rank's cache, the padding unit included: the division's count, which every
+    /// rank of its host group agreed, in whole segments.
+    pub(crate) units: u32,
+    /// What the profile run states of the rank's runner, which its pools are sized by.
+    pub(crate) peaks: Peaks,
+    /// The rank's tensor group's communicator; `None` for a group of one and on the meta device.
+    pub(crate) tensor: Option<Arc<backend::Group>>,
+    /// The config of the rank's runner: the profiled runner's until the rank is opened, the
+    /// serving runner's after.
     pub(crate) config: CausalLmConfig,
-    /// The rank's cache and recurrent state, which its runner reads and the data plane operates.
+    /// The rank's cache and recurrent state, which its runner reads and the data plane operates:
+    /// the profile run's owners, which hold no device, until the rank is opened over the
+    /// session's memory.
     pub(crate) cache: Arc<Mutex<KvCacheMemory>>,
     pub(crate) state: Option<Arc<Mutex<StateMemory>>>,
-    /// The device's graph and scratch pools, which the runner's graphs address; `None` for a
-    /// meta start.
+    /// The device's graph and scratch pools, which the runner's graphs address, once the rank is
+    /// opened; `None` for a meta start.
     pub(crate) pool: Option<Arc<Mutex<GraphPool>>>,
-    /// The rank's runner, until its executor takes it ([`spawn`]).
+    /// The rank's serving runner, from its opening until its executor takes it ([`spawn`]).
     pub(crate) runner: Option<CausalLmRunner>,
     /// Every kernel the rank launches.
     pub(crate) keys: Keys,
     /// The generation the rank serves.
     pub(crate) kernels: Arc<Generation>,
-    /// The executors of the node's expert union, in member order, which the rank's join hook
-    /// submits join batches to once [`spawn`] set them; `None` outside a union.
-    pub(crate) union: Option<Members>,
+    /// The node's expert union this rank is a member of: the union's host group, the members'
+    /// executors once [`spawn`] set them, and the rank's place among them; `None` outside a
+    /// union.
+    pub(crate) union: Option<(Arc<HostGroup>, Members, usize)>,
 }
 
 impl LoadedRank {
@@ -126,11 +159,7 @@ impl LoadedRank {
         else {
             return Ok(None);
         };
-        let device = *self
-            .model_runner
-            .devices()
-            .first()
-            .context("this rank serves no device")?;
+        let device = self.device()?;
 
         Ok(Some(crate::data_plane::Rank {
             rank: self.model_runner.rank(),
@@ -149,6 +178,15 @@ impl LoadedRank {
             serving: self.weights.clone(),
         }))
     }
+
+    /// The rank's one device.
+    fn device(&self) -> Result<DeviceId> {
+        self.model_runner
+            .devices()
+            .first()
+            .copied()
+            .context("this rank serves no device")
+    }
 }
 
 /// Where the ranks of a process's worker group form their host group.
@@ -163,7 +201,8 @@ pub(crate) enum Meeting {
     },
 }
 
-/// Loads every rank of this process, each on a thread of its own, onto `backing`.
+/// Loads every rank of this process to its division, each on a thread of its own, onto
+/// `backing` (steps 1-15).
 ///
 /// The ranks agree their cache's units and exchange their communicators' ids over one host group,
 /// whose collectives every member must reach, so they run side by side rather than one after
@@ -271,9 +310,9 @@ fn loopback(what: &str) -> Result<(String, TcpListener)> {
     Ok((address, listener))
 }
 
-/// Loads one rank onto `backing`: it joins the process's host group at `meeting` as `member` of
-/// `members` and, in an expert union, the union's host group, then runs the steps of the rank's
-/// start (module documentation).
+/// Loads one rank onto `backing` to its division: it joins the process's host group at
+/// `meeting` as `member` of `members` and, in an expert union, the union's host group, then runs
+/// steps 1-15 of the rank's start (module documentation).
 fn load_rank(
     model_runner: ModelRunner,
     meeting: (String, Option<TcpListener>),
@@ -355,14 +394,14 @@ fn load_rank(
         )?))),
         None => None,
     };
-    let join = union
-        .as_ref()
-        .map(|(_, targets, place)| join_hook(Arc::clone(targets), *place));
-    let meta_member = match (&union, &join) {
-        (Some((group, _, _)), Some(join)) => {
-            model_runner.union_member(device, meta.as_ref(), Arc::clone(group), Arc::clone(join))?
-        }
-        _ => None,
+    let meta_member = match &union {
+        Some((group, targets, place)) => model_runner.union_member(
+            device,
+            meta.as_ref(),
+            Arc::clone(group),
+            join_hook(Arc::clone(targets), *place),
+        )?,
+        None => None,
     };
     let inputs = CausalLmRunner::input_bytes(&meta_config)?;
     let unserved = Arc::new(Generation::new(0, []));
@@ -383,31 +422,49 @@ fn load_rank(
         &meta_cache,
         meta_state.as_ref().map(|state| state.as_ref()),
     )?;
+    let graphs = worker::Runner::graphs(&profiled);
+    let peaks = Peaks {
+        graph: graphs.peak(),
+        shadow: graphs.shadow_peak() + scratch_bytes(&meta_config, &layout),
+        inputs: graphs.input_peak(),
+    };
+    drop(profiled);
 
     let (storage, resolve) = match backing {
         Backing::Serving { storage, kernels } => (storage, kernels),
         Backing::Meta => {
+            // The meta device allocates nothing, so each unit is a whole granule of it: its cache
+            // is the fewest units it serves with, rounded up to at most eight segments of whole
+            // units.
+            let units = worker::memory::cache::segments::segmented_units_above(
+                least,
+                layout.plane_bytes,
+                layout.plane_bytes,
+            );
             return Ok(LoadedRank {
                 model_runner,
                 client: None,
                 store: None,
                 weights: Vec::new(),
                 model: meta,
+                units,
+                peaks,
+                tensor,
                 config: meta_config,
                 cache: meta_cache,
                 state: meta_state,
                 pool: None,
-                runner: Some(profiled),
+                runner: None,
                 keys,
-                kernels: unserved,
-                union: union.map(|(_, targets, _)| targets),
+                kernels: Arc::new(Generation::new(FIRST_GENERATION, [])),
+                union,
             });
         }
     };
     let client = client.context("a served rank holds its Storage Server client")?;
 
     // Step 9: the generation the rank serves, every kernel it launches resolved.
-    let kernels = resolve(&keys).context("resolving the rank's kernels")?;
+    let kernels = resolve(device, &keys).context("resolving the rank's kernels")?;
 
     // Step 10: the weights, retained at the Storage Server and mapped on the device.
     let store = Arc::new(WeightStore::new(Arc::clone(&client), device)?);
@@ -418,113 +475,33 @@ fn load_rank(
         .finish()
         .context("publishing the granules of the epoch's packed weights")?;
 
-    // Steps 11-16: the division of the GPU's quota; the cache's units and segments.
-    let graphs = worker::Runner::graphs(&profiled);
-    let scratch_pages = meta_config.scratch_pages;
-    let rows = meta_config.buckets.bounds().0;
-    let scratch_bytes = u64::from(rows) * u64::from(scratch_pages) * layout.unit_bytes;
-    let peaks = Peaks {
-        graph: graphs.peak(),
-        shadow: graphs.shadow_peak() + scratch_bytes,
-        inputs: graphs.input_peak(),
-    };
-    let shadow = graphs.shadow_peak();
+    // Steps 11-15: the division of the GPU's quota into the pools, the fixed regions and the
+    // cache's units.
     let resident = state_config
         .as_ref()
         .map_or(0, |config| config.bytes(&layout));
     let slot_bytes = CausalLmRunner::slot_bytes(&meta_config, model.as_ref())?
         + CausalLmRunner::kept_bytes(&meta_config, model.as_ref())?;
     let fixed = worker::lock(&meta_cache).config().fixed_bytes();
-    drop(profiled);
-    let (graph, scratch) = model_runner.pools(device, &layout, peaks)?;
-    let (units, segments) = model_runner.divide(
+    let pools = model_runner.pools(device, &layout, peaks)?;
+    let units = model_runner.divide(
         &client,
         device,
         &host,
         model.as_ref(),
         &layout,
-        (graph, scratch),
+        pools,
         resident,
         slot_bytes,
         fixed,
     )?;
-
-    // Step 17: the graph pool, with the scratch and resident pools it reserves.
-    let mut pool = GraphPool::open(
-        Arc::clone(&client),
-        device,
-        model_runner.engine_config().mem_fraction_static,
-        &[(RunnerId(0), peaks.graph)],
-        scratch,
-        resident,
-    )?;
-
-    // Step 18: the cache, whose segments the rank creates or maps at the Storage Server.
-    let stream =
-        Stream::new(device).with_context(|| format!("creating device {}'s stream", device.0))?;
-    let config = model_runner.cache_config(Arc::clone(&layout), units, segments)?;
-    let mut cache = KvCacheMemory::open(config, device, &*client, &stream)
-        .context("opening the rank's KV cache")?;
-
-    // Step 19: the recurrent state, from the resident pool.
-    let state = match state_config {
-        Some(state) => Some(Arc::new(Mutex::new(StateMemory::open(
-            state,
-            cache.config(),
-            pool.allocator(),
-            stream.clone(),
-            Arc::clone(&kernels),
-        )?))),
-        None => None,
-    };
-
-    // Step 20: the scratch pages of paired forwards, from the scratch pool.
-    if scratch_pages > 0 {
-        let pages = cache.scratch_pages_within(scratch_bytes);
-        cache.open_scratch(pages, Some((pool.allocator(), &stream)))?;
-    }
-    let cache = Arc::new(Mutex::new(cache));
-
-    // Steps 21-22: the serving runner in its region of the graph pool, its shadow region beside
-    // it, profiled again so its buckets can be captured.
-    let config = model_runner.causal_config(model.as_ref(), &layout, units)?;
-    let graphs = Graphs::new(
-        stream.clone(),
-        Arc::clone(&kernels),
-        pool.region(RunnerId(0))?,
-        inputs,
-        peaks.inputs,
-        2,
-    )?;
-    let member = match (&union, &join) {
-        (Some((group, _, _)), Some(join)) => model_runner.union_member(
-            device,
-            model.as_ref(),
-            Arc::clone(group),
-            Arc::clone(join),
-        )?,
-        _ => None,
-    };
-    let runner = model_runner.runner(
-        Arc::clone(&model),
-        config.clone(),
-        graphs,
-        Some(stream),
-        &cache,
-        state.as_ref(),
-        tensor,
-        member,
-        &kernels,
-    )?;
-    worker::Runner::graphs(&runner).set_shadow(pool.shadow(shadow)?)?;
-    profile(&runner)?;
 
     tracing::info!(
         rank = model_runner.rank(),
         group = model_runner.group(),
         units,
         storage = %storage.socket,
-        "the rank loaded its model and opened its memory"
+        "the rank loaded its model and divided its device's quota"
     );
     Ok(LoadedRank {
         model_runner,
@@ -532,14 +509,17 @@ fn load_rank(
         store: Some(store),
         weights,
         model,
-        config,
-        cache,
-        state,
-        pool: Some(Arc::new(Mutex::new(pool))),
-        runner: Some(runner),
+        units,
+        peaks,
+        tensor,
+        config: meta_config,
+        cache: meta_cache,
+        state: meta_state,
+        pool: None,
+        runner: None,
         keys,
         kernels,
-        union: union.map(|(_, targets, _)| targets),
+        union,
     })
 }
 
@@ -555,6 +535,9 @@ fn join_hook(targets: Members, place: usize) -> JoinHook {
             if index == place {
                 continue;
             }
+            let executor = executor.upgrade().ok_or(worker::Error::State(
+                "an executor of the expert union is closed",
+            ))?;
             let mut join = batch.clone();
             join.group = executor.group();
             executor.join(join)?;
@@ -705,14 +688,19 @@ fn units_region(scheduler: usize, layout: &CacheLayout, units: u32) -> Result<St
 }
 
 /// The layout the engine epoch `launch` states to open its session with its host's buffer pool
-/// (`storage::runtime::Open`, `specs/buffer-pool.md` §11), from `ranks`, this process's loaded
-/// ranks, every one of which a rank of the deployment's one configuration:
+/// (`storage::runtime::Open`, `specs/buffer-pool.md` §11, §14.1), for ranks of the deployment's
+/// one configuration whose caches are laid out as `cache` with `units` units, the padding unit
+/// included, whose worker groups are `tensor` ranks wide, and whose request slots each take
+/// `slot_bytes` of one rank's device memory. It is the one statement of a session's layout,
+/// whoever builds the ranks behind it:
 ///
 /// - **Regions.** Per scheduler, the device region of its KV units, the same units on every rank
-///   and group of it, with the segments the ranks created; per class of a cache group, when the
-///   deployment keeps a host tier, the host region of its pages, one page a unit; per worker
-///   group, the region of its slot rows, numbered from 1, the epoch's own. A unit's bytes are
-///   summed over the tensor ranks that hold a part of it.
+///   and group of it. It states no segment and asks for no unit: its memory is the segments its
+///   ranks map or create once the session is open, which the head grants, and its scheduler then
+///   grows it into them by `Resize`. Per class of a cache group, when the deployment keeps a host
+///   tier, the host region of its pages, one page a unit. Per worker group, the region of its
+///   slot rows, numbered from 1, the epoch's own. A unit's bytes are summed over the tensor ranks
+///   that hold a part of it.
 /// - **Classes**, in the numbering the worker uses: cache group `g` is class `g`, then one class
 ///   per product kind in `ipc::product` order, then the class of stored trajectories. A text
 ///   deployment holds no product and no trajectory: those classes name no region.
@@ -724,16 +712,20 @@ fn units_region(scheduler: usize, layout: &CacheLayout, units: u32) -> Result<St
 ///
 /// # Errors
 ///
-/// No loaded rank, worker groups no scheduler block holds, or a layout the regions' numbering
-/// cannot state.
-pub(crate) fn layout(ranks: &[LoadedRank], launch: &EngineArgs) -> Result<Open> {
+/// Worker groups no scheduler block holds, or a layout the regions' numbering cannot state.
+pub(crate) fn layout(
+    launch: &EngineArgs,
+    cache: &CacheLayout,
+    units: u32,
+    tensor: u32,
+    slot_bytes: u64,
+) -> Result<Open> {
     let config = &launch.engine_config;
     let groups = &config.parallel.worker_groups;
     let (numbers, schedulers) = group_numbers(groups, config.parallel.data_parallel_size.get())?;
-    let first = ranks.first().context("this process loaded no rank")?;
-    let layout = Arc::clone(worker::lock(&first.cache).layout());
-    let units = worker::lock(&first.cache).config().units;
-    let tensor = first.model_runner.world_size().max(1) as u64;
+    let slots = u32::try_from(config.max_running_requests.get())
+        .context("more request slots than the protocol addresses")?;
+    let tensor = u64::from(tensor.max(1));
     let kv = &config.kv_cache;
 
     let mut regions: Vec<Region> = Vec::new();
@@ -744,7 +736,7 @@ pub(crate) fn layout(ranks: &[LoadedRank], launch: &EngineArgs) -> Result<Open> 
     // The host region of each cache group's pages: the deployment's on the host, shared by its
     // replicas' ranks of one rank index.
     let host_tier = kv.host_tier && kv.prefix_caching;
-    let mut host_regions: Vec<Option<u8>> = vec![None; layout.groups.len()];
+    let mut host_regions: Vec<Option<u8>> = vec![None; cache.groups.len()];
     if host_tier {
         let pages_of = |page_bytes: u64, units_per_page: u32| -> u32 {
             let device_pages = u64::from(units.saturating_sub(1) / units_per_page.max(1));
@@ -754,12 +746,12 @@ pub(crate) fn layout(ranks: &[LoadedRank], launch: &EngineArgs) -> Result<Open> 
             };
             u32::try_from(pages.max(1)).unwrap_or(u32::MAX)
         };
-        for (index, group) in layout.groups.iter().enumerate() {
+        for (index, group) in cache.groups.iter().enumerate() {
             // A draft page is given up first under pressure and never stored.
             if group.draft() {
                 continue;
             }
-            let shape = host::page_shape(&layout, index)?;
+            let shape = host::page_shape(cache, index)?;
             let digest: String = shape.layout.0[..8]
                 .iter()
                 .map(|byte| format!("{byte:02x}"))
@@ -783,49 +775,24 @@ pub(crate) fn layout(ranks: &[LoadedRank], launch: &EngineArgs) -> Result<Open> 
     }
 
     // Per scheduler, the region of its KV units; per group, its slot rows.
+    let slot_bytes = slot_bytes.max(1);
     let mut stated: Vec<Group> = Vec::new();
     for (scheduler, listed) in schedulers.iter().enumerate() {
-        let cache = ranks
-            .iter()
-            .find(|rank| {
-                numbers.iter().zip(groups).any(|(id, group)| {
-                    listed.contains(id) && group.id.0 == rank.model_runner.group()
-                })
-            })
-            .unwrap_or(first);
-        let cache = worker::lock(&cache.cache);
-        let units = cache.config().units;
-        let name = units_region(scheduler, cache.layout(), units)?;
-        let mut first_unit = 0;
-        let segments = cache
-            .segments()
-            .unwrap_or_default()
-            .iter()
-            .map(|segment| {
-                let stated = (
-                    storage::Segment {
-                        epoch: segment.epoch,
-                        ordinal: segment.ordinal,
-                    },
-                    first_unit,
-                    segment.units,
-                );
-                first_unit += segment.units;
-                stated
-            })
-            .collect();
+        let name = units_region(scheduler, cache, units)?;
         let kv_region = region_index(&regions)?;
         regions.push(Region {
             space: name.clone(),
             name,
             tier: Tier::Device,
-            unit_bytes: cache.layout().unit_bytes * tensor,
-            part_bytes: cache.layout().unit_bytes,
+            unit_bytes: cache.unit_bytes * tensor,
+            part_bytes: cache.unit_bytes,
             // Unit 0 is the padding unit a pooled table names where a row holds no page.
             reserved: 1,
-            units: units.saturating_sub(1),
+            // No unit enters the region before the segments behind it exist (`Resize` after the
+            // grants); the numbering covers the cache.
+            units: 0,
             limit: units,
-            segments,
+            segments: Vec::new(),
         });
 
         for id in listed {
@@ -834,9 +801,6 @@ pub(crate) fn layout(ranks: &[LoadedRank], launch: &EngineArgs) -> Result<Open> 
                 .position(|number| number == id)
                 .context("a listed group is numbered")?;
             let group = &groups[index];
-            let slots = first.model_runner.slots()?;
-            let slot_bytes = CausalLmRunner::slot_bytes(&first.config, first.model.as_ref())?
-                / u64::from(slots.max(1));
             let name = format!("slots {} {}", launch.epoch, id.0);
             let slot_region = region_index(&regions)?;
             regions.push(Region {
@@ -844,14 +808,14 @@ pub(crate) fn layout(ranks: &[LoadedRank], launch: &EngineArgs) -> Result<Open> 
                 name,
                 tier: Tier::Device,
                 // An accounting figure: the rows are memory of the ranks' own processes.
-                unit_bytes: slot_bytes.max(1) * tensor,
-                part_bytes: slot_bytes.max(1),
+                unit_bytes: slot_bytes * tensor,
+                part_bytes: slot_bytes,
                 reserved: 1,
                 units: slots,
                 limit: slots + 1,
                 segments: Vec::new(),
             });
-            let mut per_class: Vec<Vec<u8>> = vec![vec![kv_region]; layout.groups.len()];
+            let mut per_class: Vec<Vec<u8>> = vec![vec![kv_region]; cache.groups.len()];
             per_class.extend((0..=PRODUCTS).map(|_| Vec::new()));
             stated.push(Group {
                 id: *id,
@@ -865,9 +829,9 @@ pub(crate) fn layout(ranks: &[LoadedRank], launch: &EngineArgs) -> Result<Open> 
     // Class `g` is cache group `g`; then the product kinds and the stored trajectories, which a
     // text deployment sizes per request and holds none of.
     let ranks_per_unit = u32::try_from(tensor).unwrap_or(u32::MAX);
-    let mut classes: Vec<Class> = Vec::with_capacity(layout.groups.len() + PRODUCTS + 1);
-    for (index, (group, host)) in layout.groups.iter().zip(&host_regions).enumerate() {
-        let (tensors, encoding) = host::class_digests(&layout, index, ranks_per_unit)?;
+    let mut classes: Vec<Class> = Vec::with_capacity(cache.groups.len() + PRODUCTS + 1);
+    for (index, (group, host)) in cache.groups.iter().zip(&host_regions).enumerate() {
+        let (tensors, encoding) = host::class_digests(cache, index, ranks_per_unit)?;
         classes.push(Class {
             units: group.units_per_page,
             host: host.map(|region| (region, 1)),
@@ -899,6 +863,224 @@ pub(crate) fn layout(ranks: &[LoadedRank], launch: &EngineArgs) -> Result<Open> 
         schedulers,
         peers: kv.peers.clone(),
     })
+}
+
+/// Opens every rank of `ranks` over the session `layout` opened, whose answer states each
+/// region's segment table in `tables` (`Opened::segments`), each rank on a thread of its own
+/// (steps 16-22):
+///
+/// - the segments of the rank's KV region: the table's, which the rank maps where their epoch
+///   created them, then those its epoch creates for the rest of the region's units
+///   ([`plane_segments`]);
+/// - the graph pool with the scratch and resident pools, the cache over those segments, the
+///   recurrent state, the scratch pages of paired forwards, and the serving runner in its region
+///   of the graph pool with its shadow region beside it, profiled again so its buckets can be
+///   captured.
+///
+/// On the meta device the owners hold no device and the segments no memory, so the cache, the
+/// state and the runner are made over the region's units again, as the profile run's were.
+///
+/// Returns, per KV region by name, the segments its ranks created, as `(segment, first unit,
+/// units)`: the head grants each once every rank that maps the region holds it.
+///
+/// # Errors
+///
+/// A rank whose group the session does not state, ranks of one region that created different
+/// segments, or the first rank's failure.
+pub(crate) fn open_ranks(
+    ranks: &mut [LoadedRank],
+    layout: &Open,
+    tables: &[Segments],
+) -> Result<Vec<(String, Segments)>> {
+    // Each rank's KV region and its table, read before the ranks go to their threads.
+    let mut regions = Vec::with_capacity(ranks.len());
+    for rank in ranks.iter() {
+        let (_, kv, _) = stated_regions(rank, layout)?;
+        let table = tables
+            .get(usize::from(kv))
+            .with_context(|| format!("the answer states no segment table of region {kv}"))?;
+        regions.push((layout.regions[usize::from(kv)].name.clone(), table));
+    }
+
+    let opened: Vec<Segments> = std::thread::scope(|scope| {
+        let mut handles = Vec::with_capacity(ranks.len());
+        for (index, (rank, (_, table))) in ranks.iter_mut().zip(&regions).enumerate() {
+            let handle = std::thread::Builder::new()
+                .name(format!("rank-open-{index}"))
+                .spawn_scoped(scope, move || open_rank(rank, table))
+                .context("starting a rank's opening")?;
+            handles.push(handle);
+        }
+        handles
+            .into_iter()
+            .map(|handle| {
+                handle
+                    .join()
+                    .map_err(|_| anyhow::anyhow!("a rank's opening panicked"))?
+            })
+            .collect::<Result<Vec<_>>>()
+    })?;
+
+    // Every rank that maps a region creates the same segments of it, which the head grants once.
+    let mut created: Vec<(String, Segments)> = Vec::new();
+    for ((name, _), segments) in regions.into_iter().zip(opened) {
+        match created.iter().find(|(region, _)| *region == name) {
+            Some((_, first)) if *first != segments => bail!(
+                "the ranks of region {name} created different segments: {first:?} and \
+                 {segments:?}"
+            ),
+            Some(_) => {}
+            None => created.push((name, segments)),
+        }
+    }
+    Ok(created)
+}
+
+/// Opens one rank over its KV region's segment table `table` (steps 16-22, [`open_ranks`]).
+/// Returns the segments it created, as `(segment, first unit, units)`.
+fn open_rank(rank: &mut LoadedRank, table: &Segments) -> Result<Segments> {
+    let device = rank.device()?;
+    let model_runner = &rank.model_runner;
+    let layout = Arc::clone(worker::lock(&rank.cache).layout());
+    let units = rank.units;
+    let state_config = model_runner.state_config(rank.model.as_ref(), model_runner.buckets())?;
+    let config = model_runner.causal_config(rank.model.as_ref(), &layout, units)?;
+    let inputs = CausalLmRunner::input_bytes(&config)?;
+    let member = match &rank.union {
+        Some((group, targets, place)) => model_runner.union_member(
+            device,
+            rank.model.as_ref(),
+            Arc::clone(group),
+            join_hook(Arc::clone(targets), *place),
+        )?,
+        None => None,
+    };
+
+    // Step 16: the segments of the region the table states, mapped, and the rest, created. A
+    // segment's every part is whole granules of the device's allocations; the meta device
+    // allocates nothing, and each unit is a whole granule of it.
+    let granularity = match &rank.client {
+        Some(_) => granularity(device)?,
+        None => layout.plane_bytes,
+    };
+    let (segments, created) = plane_segments(
+        model_runner.launch().epoch,
+        units,
+        &layout,
+        granularity,
+        table,
+    )?;
+    let cache_config = model_runner.cache_config(Arc::clone(&layout), units, Some(segments))?;
+
+    let Some(client) = rank.client.clone() else {
+        // Steps 18, 19 and 21-22 over owners that hold no device.
+        let cache = Arc::new(Mutex::new(KvCacheMemory::meta(cache_config)?));
+        let state = match state_config {
+            Some(state) => Some(Arc::new(Mutex::new(StateMemory::meta(
+                state,
+                worker::lock(&cache).config(),
+            )?))),
+            None => None,
+        };
+        let runner = model_runner.runner(
+            Arc::clone(&rank.model),
+            config.clone(),
+            Graphs::meta(Arc::clone(&rank.kernels), inputs),
+            None,
+            &cache,
+            state.as_ref(),
+            None,
+            member,
+            &rank.kernels,
+        )?;
+        profile(&runner)?;
+
+        rank.config = config;
+        rank.cache = cache;
+        rank.state = state;
+        rank.runner = Some(runner);
+        return Ok(created);
+    };
+
+    // Step 17: the graph pool, with the scratch and resident pools it reserves.
+    let (_, scratch) = model_runner.pools(device, &layout, rank.peaks)?;
+    let resident = state_config
+        .as_ref()
+        .map_or(0, |state| state.bytes(&layout));
+    let mut pool = GraphPool::open(
+        Arc::clone(&client),
+        device,
+        model_runner.engine_config().mem_fraction_static,
+        &[(RunnerId(0), rank.peaks.graph)],
+        scratch,
+        resident,
+    )?;
+
+    // Step 18: the cache, whose segments the rank maps or creates at the Storage Server.
+    let stream =
+        Stream::new(device).with_context(|| format!("creating device {}'s stream", device.0))?;
+    let mut cache = KvCacheMemory::open(cache_config, device, &*client, &stream)
+        .context("opening the rank's KV cache")?;
+
+    // Step 19: the recurrent state, from the resident pool.
+    let state = match state_config {
+        Some(state) => Some(Arc::new(Mutex::new(StateMemory::open(
+            state,
+            cache.config(),
+            pool.allocator(),
+            stream.clone(),
+            Arc::clone(&rank.kernels),
+        )?))),
+        None => None,
+    };
+
+    // Step 20: the scratch pages of paired forwards, from the scratch pool.
+    let scratch_bytes = scratch_bytes(&config, &layout);
+    if config.scratch_pages > 0 {
+        let pages = cache.scratch_pages_within(scratch_bytes);
+        cache.open_scratch(pages, Some((pool.allocator(), &stream)))?;
+    }
+    let cache = Arc::new(Mutex::new(cache));
+
+    // Steps 21-22: the serving runner in its region of the graph pool, its shadow region beside
+    // it (the profile run's shadow figure less the scratch pages, which the scratch pool holds),
+    // profiled again so its buckets can be captured.
+    let graphs = Graphs::new(
+        stream.clone(),
+        Arc::clone(&rank.kernels),
+        pool.region(RunnerId(0))?,
+        inputs,
+        rank.peaks.inputs,
+        2,
+    )?;
+    let runner = model_runner.runner(
+        Arc::clone(&rank.model),
+        config.clone(),
+        graphs,
+        Some(stream),
+        &cache,
+        state.as_ref(),
+        rank.tensor.clone(),
+        member,
+        &rank.kernels,
+    )?;
+    let shadow = rank.peaks.shadow.saturating_sub(scratch_bytes);
+    worker::Runner::graphs(&runner).set_shadow(pool.shadow(shadow)?)?;
+    profile(&runner)?;
+
+    tracing::info!(
+        rank = model_runner.rank(),
+        group = model_runner.group(),
+        units,
+        created = created.len(),
+        "the rank opened its memory over the session's region"
+    );
+    rank.config = config;
+    rank.cache = cache;
+    rank.state = state;
+    rank.pool = Some(Arc::new(Mutex::new(pool)));
+    rank.runner = Some(runner);
+    Ok(created)
 }
 
 /// Binds each rank of `ranks` to the session `layout` opened and `opened` answered: a served rank
@@ -1075,7 +1257,7 @@ pub(crate) fn spawn(
         let runner = rank
             .runner
             .take()
-            .context("the rank's runner was spawned already")?;
+            .context("the rank's runner was spawned already, or the rank was never opened")?;
         let device = rank.pool.as_ref().map(|_| rank.model_runner.devices()[0]);
         let group_sequences = sequences
             .iter()
@@ -1094,9 +1276,9 @@ pub(crate) fn spawn(
     }
 
     // The union's members ask each other to join through their executors.
-    if let Some(targets) = ranks.first().and_then(|rank| rank.union.as_ref()) {
+    if let Some((_, targets, _)) = ranks.first().and_then(|rank| rank.union.as_ref()) {
         targets
-            .set(executors.clone())
+            .set(executors.iter().map(Arc::downgrade).collect())
             .map_err(|_| anyhow::anyhow!("the expert union's executors were set already"))?;
     }
 
@@ -1143,4 +1325,4 @@ pub(crate) fn capacities(ranks: &[LoadedRank], layout: &Open) -> Result<Vec<(Gro
 }
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;

@@ -1,310 +1,523 @@
-//! The operator's operations inside an epoch: pause and continue, a cache flush, sleep and wake
-//! (a cache resize), LoRA load and unload, expert rebalancing and profiling sessions. The weight
-//! update in place is `weights`.
+//! The operator's operations inside an epoch (`docs/admin.md`): a weight update in place, sleep
+//! and wake, the room a profiling session's storage takes from the KV cache, a cache flush, the
+//! commit of an expert redistribution, the named operations beside the batches (LoRA adapters,
+//! the experts' copies, profiling sessions, the fence probes' switch), and the scheduling
+//! limits.
 //!
-//! Each operation is started here and given to whoever does the work: a scheduler, which
-//! applies it at its next batch boundary, or a work thread of the data plane. Its completion
-//! wakes the control thread, which then acknowledges it ([`MainProcess::continue_operations`]);
-//! the control thread waits for none of them.
+//! Each operation is a job: a function of the parts it reads, which returns once the operation
+//! ended and touches nothing of the control thread's. One that changes what a batch reads does so
+//! at a batch boundary of every scheduler ([`at_boundary`]): every scheduler is paused, the work
+//! runs once none has a batch in flight, and every scheduler resumes, whatever the work did
+//! (`specs/scheduler-design.md` §2.4). The control thread runs these jobs one at a time on its
+//! operations thread, so two boundaries never interleave; the named operations run beside the
+//! batches, on threads of their own.
+//!
+//! The schedulers are named by their inboxes, in the order of the session's schedulers
+//! (`Open::schedulers`); the head is the engine's connection to its host's Storage Server, which
+//! states each change of the KV planes' segments (`crate::data_plane`, "The KV planes' memory").
+//! A `Resume` ends a drain as well as a pause, so no job that pauses the schedulers runs while
+//! the engine drains.
 
 use std::collections::BTreeMap;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
-use super::MainProcess;
-use super::requests::{QUOTAS, fence_switch};
+use anyhow::{Context as _, Result, anyhow, bail};
+use crossbeam_channel::Sender;
+use ipc::memory::WeightsUpdated;
+use proto::config::SchedulerConfig;
+use proto::request::wire::WeightsInFlight;
+use storage::Key;
+use storage::runtime::GroupId;
+use worker::lock;
 
-/// The completion of one part of an operation: its results, or why it failed.
-pub(super) type Completion = crossbeam_channel::Receiver<std::result::Result<Vec<String>, String>>;
+use super::epoch;
+use crate::data_plane::{DataPlane, Target};
+use crate::scheduler::{self, Message};
+use crate::storage_client::StorageClient;
 
-/// An operation still working: what completes it, and the daemon front that is told.
-pub(super) struct Operation {
-    id: u64,
-    front: usize,
-    completions: Vec<Completion>,
-    results: Vec<String>,
-    failure: Option<String>,
-    effect: Effect,
+/// How long a release that makes room waits before it asks a region again for units its requests
+/// still hold: the requests that hold the tail run on, and the release takes it once they let it
+/// go.
+const RESIZE_RETRY: Duration = Duration::from_millis(10);
+
+/// The scheduler at `index` of the session's has stopped: its thread ended, on a fault it
+/// reported itself (`Output::Failed`) or at its shutdown.
+pub(super) fn stopped(index: usize) -> anyhow::Error {
+    anyhow!("scheduler {index} has stopped")
 }
 
-/// What an operation changes of what this process states about itself, once it succeeded.
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub(super) enum Effect {
-    /// Nothing.
-    None,
-    /// What the storage holds: what this process announced of it is read again.
-    Storage,
-    /// As `Storage`, and the schedulers now sleep or do not.
-    Sleep(bool),
+/// Sends every scheduler the message `message` makes with a reply channel, then waits for every
+/// reply, and returns them in the schedulers' order. Every scheduler is asked before any reply is
+/// waited for, so they answer at once.
+///
+/// # Errors
+///
+/// When a scheduler has stopped before it replied.
+pub(super) fn ask<T>(
+    schedulers: &[Sender<Message>],
+    message: impl Fn(Sender<T>) -> Message,
+) -> Result<Vec<T>> {
+    let mut replies = Vec::with_capacity(schedulers.len());
+    for (index, inbox) in schedulers.iter().enumerate() {
+        let (reply, replied) = crossbeam_channel::bounded(1);
+        inbox.send(message(reply)).map_err(|_| stopped(index))?;
+        replies.push((index, replied));
+    }
+
+    replies
+        .into_iter()
+        .map(|(index, replied)| replied.recv().map_err(|_| stopped(index)))
+        .collect()
 }
 
-/// Reads the completions that arrived; `true` once none is left to wait for.
-pub(super) fn collect(
-    completions: &mut Vec<Completion>,
-    results: &mut Vec<String>,
-    failure: &mut Option<String>,
-) -> bool {
-    completions.retain(|completion| match completion.try_recv() {
-        Ok(Ok(completed)) => {
-            results.extend(completed);
-            false
-        }
-        Ok(Err(error)) => {
-            failure.get_or_insert(error);
-            false
-        }
-        Err(crossbeam_channel::TryRecvError::Empty) => true,
-        Err(crossbeam_channel::TryRecvError::Disconnected) => {
-            failure.get_or_insert_with(|| "the work ended before it completed".to_owned());
-            false
-        }
-    });
-    completions.is_empty()
+/// The first refusal among the schedulers' replies, naming the scheduler and `what` it refused.
+///
+/// # Errors
+///
+/// The first scheduler's refusal.
+pub(super) fn every(replies: Vec<Result<(), scheduler::Error>>, what: &str) -> Result<()> {
+    for (index, reply) in replies.into_iter().enumerate() {
+        reply.map_err(|error| anyhow!("scheduler {index} refused {what}: {error}"))?;
+    }
+    Ok(())
 }
 
-impl MainProcess {
-    /// Holds or releases admissions (`/admin/pause_generation`, `/admin/continue_generation`):
-    /// submissions are refused while the gate is held, and no request in flight is ended.
-    pub(super) fn pause(&mut self, paused: bool) {
-        self.paused = paused;
+/// Sends `Resume` to every scheduler: each forms batches again from its next step, and one a
+/// drain parked admits again. A scheduler that has stopped reported its own end.
+pub(super) fn resume(schedulers: &[Sender<Message>]) {
+    for inbox in schedulers {
+        let _ = inbox.send(Message::Resume);
     }
+}
 
-    /// Revokes every cached prefix page; requests in flight keep theirs. Each scheduler applies
-    /// it at its next batch boundary.
-    pub(super) fn flush_cache(&mut self) {
-        for scheduler in &self.schedulers {
-            scheduler.flush_cache();
-        }
-    }
+/// Runs `work` at one batch boundary of every scheduler (`specs/scheduler-design.md` §2.4): each
+/// is sent `Pause`, the work runs once every one replied that it has no batch in flight, and each
+/// is sent `Resume`, whether the work, or a pause, failed or not. The schedulers keep taking
+/// their messages while paused, so the work may send them `SetPolicy`, `Flush` or `Resize` and
+/// wait for the replies.
+///
+/// # Errors
+///
+/// What the work fails with, or a scheduler that stopped before it paused; the work does not
+/// run then.
+pub(crate) fn at_boundary<T>(
+    schedulers: &[Sender<Message>],
+    work: impl FnOnce() -> Result<T>,
+) -> Result<T> {
+    let paused = ask(schedulers, Message::Pause);
+    let done = paused.and_then(|_| work());
 
-    /// Installs the expert copies a rebalancing prepared: every scheduler applies the new order
-    /// at one common drained step boundary.
-    pub(super) fn commit_experts(
-        &mut self,
-        front: usize,
-        commit: proto::request::wire::CommitExperts,
-    ) {
-        let order: BTreeMap<String, Vec<u32>> = commit
-            .order
-            .into_iter()
-            .map(|(module, order)| (module, order.experts))
-            .collect();
-        let together = scheduler::HookBarrier::new(self.schedulers.len());
-        let completions = self
-            .schedulers
-            .iter()
-            .map(|scheduler| scheduler.commit_experts(order.clone(), Arc::clone(&together)))
-            .collect();
-        self.operate(front, commit.id, completions, Effect::Storage);
-    }
+    resume(schedulers);
+    done
+}
 
-    /// Changes the KV cache's device storage - a sleep, a wake, a resize: every scheduler
-    /// withdraws, gives back or restores its units at its next batch boundary.
-    pub(super) fn resize_cache(
-        &mut self,
-        front: usize,
-        resize: &proto::request::wire::ResizeCache,
-    ) {
-        // The storage of a previous epoch is each node's daemon's to keep or release over its
-        // claim; this process holds no claim of the deployment's.
-        if !resize.keep_weights.is_empty() {
-            self.refuse(front, resize.id, QUOTAS.to_owned());
-            return;
-        }
-        let change = match scheduler::CacheChange::from_wire(resize) {
-            Ok(change) => change,
-            Err(error) => {
-                self.refuse(front, resize.id, error);
-                return;
-            }
-        };
-        tracing::info!(?change, "changing the KV cache storage");
-        let effect = match change {
-            scheduler::CacheChange::Sleep => Effect::Sleep(true),
-            scheduler::CacheChange::Wake => Effect::Sleep(false),
-            _ => Effect::Storage,
-        };
-        let completions = self
-            .schedulers
-            .iter()
-            .map(|scheduler| scheduler.resize_cache(change.clone()))
-            .collect();
-        self.operate(front, resize.id, completions, effect);
-    }
+/// Puts the weights of `target`, another checkpoint of the served model, in place on every rank
+/// (`docs/admin.md`, `/admin/update_weights`), and returns each rank's report.
+///
+/// The model's load first walks the checkpoint's headers alone, and a checkpoint that loads other
+/// tensors is refused with the weights as they were. Then, as `in_flight` says:
+///
+/// - `Keep`: the new weights load beside the batches, and at one boundary they are put in place
+///   and the cache is flushed under the new weights' page seeds; the requests in flight go on
+///   with the KV cache they reached and commit nothing from there. When the room beside the KV
+///   cache does not hold the load, the graph storage is given back for it and the batches stop
+///   for as long as it runs; when even that leaves too little room, the update is refused,
+///   changing nothing.
+/// - `Recompute`: the engine sleeps ([`sleep`]), so that the KV cache's storage holds the load,
+///   puts the new weights in place, flushes under their seeds and wakes ([`wake`]); every
+///   request in flight is computed again by the daemon's resubmission.
+/// - `Abort`: every request the schedulers hold ends, aborted, then as `Recompute`.
+///
+/// # Errors
+///
+/// A checkpoint of another model, a load that failed (the ranks serve on as they did), a mapping
+/// change that failed part of the way (the data plane is poisoned, and the epoch must end), or
+/// a scheduler that stopped.
+pub(crate) fn update_weights(
+    schedulers: &[Sender<Message>],
+    head: &Mutex<StorageClient>,
+    data: &DataPlane,
+    target: Target,
+    in_flight: WeightsInFlight,
+) -> Result<Vec<WeightsUpdated>> {
+    let checkpoint = target.checkpoint.display().to_string();
+    let replacement = data
+        .pair(target, false)
+        .with_context(|| format!("pairing the weights of {checkpoint}"))?;
 
-    /// Serves one named operation.
-    ///
-    /// The names are the daemon's own: an expert rebalancing's stages, a LoRA adapter's load and
-    /// unload, and a profiling session's. They run beside the batches: nothing here touches what
-    /// a batch reads, because a rebalancing's copies go to new storage and its one change of the
-    /// served weights is the `CommitExperts` that follows, at a boundary.
-    pub(super) fn named_operation(&mut self, front: usize, hook: proto::request::wire::Hook) {
-        let id = hook.id;
-        match hook.name.as_str() {
-            "uniserve.prepare_experts" => {
-                let orders: BTreeMap<String, Vec<u32>> = match serde_json::from_str(&hook.payload) {
-                    Ok(orders) => orders,
-                    Err(error) => {
-                        self.refuse(front, id, format!("an expert order: {error}"));
-                        return;
-                    }
-                };
-                self.data_work(front, id, move |data| data.prepare_experts(orders));
-            }
-            "uniserve.start_experts" => {
-                let data = Arc::clone(&self.data);
-                self.data_work(front, id, move |_| data.start_experts());
-            }
-            "uniserve.experts_ready" => match self.data.experts_ready() {
-                Ok(results) => self.respond(front, id, results),
-                Err(error) => self.refuse(front, id, error.to_string()),
-            },
-            "uniserve.abort_experts" => {
-                self.data_work(front, id, |data| data.abort_experts());
-            }
-            "load_lora_adapter" => {
-                let payload = hook.payload;
-                self.data_work(front, id, move |data| data.load_adapter(&payload));
-            }
-            "unload_lora_adapter" => {
-                let payload = hook.payload;
-                self.data_work(front, id, move |data| data.unload_adapter(&payload));
-            }
-            // A session's collectors begin and end between two batches, which each rank's device
-            // thread alone knows: the work thread waits for it, and the control thread does not.
-            "uniserve.profile_start" => {
-                let payload = hook.payload;
-                self.data_work(front, id, move |data| data.start_profile(&payload));
-            }
-            "uniserve.profile_stop" => {
-                let payload = hook.payload;
-                self.data_work(front, id, move |data| data.stop_profile(&payload));
-            }
-            "uniserve.profile_release" => {
-                let payload = hook.payload;
-                self.data_work(front, id, move |data| data.release_profile(&payload));
-            }
-            // The range markers read the switch in device storage, and writing it waits for
-            // nothing.
-            "uniserve.fence_switch" => match fence_switch(&hook.payload) {
-                Ok(results) => self.respond(front, id, results),
-                Err(error) => self.refuse(front, id, error),
-            },
-            other => {
-                self.refuse(
-                    front,
-                    id,
-                    format!("this process has no operation named {other:?}"),
+    match in_flight {
+        WeightsInFlight::Keep => {
+            let bytes = replacement.bytes();
+            let rooms = data.room()?;
+            let graphs = data.graph_bytes();
+
+            if rooms.iter().all(|room| room.holds(bytes, 0)) {
+                let loaded = data.load(replacement)?;
+                at_boundary(schedulers, || {
+                    data.stage(loaded);
+                    apply(schedulers, data)
+                })
+            } else if rooms.iter().all(|room| room.holds(bytes, graphs)) {
+                // The graph storage makes the room: nothing may replay a graph until it is back,
+                // and it comes back only once the old weights' storage went.
+                at_boundary(schedulers, || {
+                    data.suspend_graphs()?;
+                    let applied = data
+                        .load(replacement)
+                        .map_err(anyhow::Error::from)
+                        .and_then(|loaded| {
+                            data.stage(loaded);
+                            apply(schedulers, data)
+                        });
+                    let restored = data.restore_graphs();
+
+                    let reports = applied?;
+                    restored?;
+                    Ok(reports)
+                })
+            } else {
+                data.discard(replacement);
+                bail!(
+                    "the weights of {checkpoint} take {bytes} bytes beside the KV cache, and the \
+                     devices have {rooms:?} of room with {graphs} bytes of graph storage to give \
+                     back: `keep` cannot load them, and `recompute` or `abort` gives the KV \
+                     cache's storage to the load"
                 );
             }
         }
-    }
+        WeightsInFlight::Recompute | WeightsInFlight::Abort => {
+            if in_flight == WeightsInFlight::Abort {
+                let aborted = ask(schedulers, |reply| {
+                    Message::Flush(None, WeightsInFlight::Abort, reply)
+                })?;
+                every(aborted, "aborting the requests it holds")?;
+            }
 
-    /// Runs one operation on a work thread of the data plane, whose end wakes the control
-    /// thread: an expert rebalancing walks the model's load, and an adapter reads its file.
-    fn data_work(
-        &mut self,
-        front: usize,
-        id: u64,
-        work: impl FnOnce(&crate::data_plane::DataPlane) -> worker::Result<Vec<String>> + Send + 'static,
-    ) {
-        let (complete, completion) = crossbeam_channel::bounded(1);
-        let data = Arc::clone(&self.data);
-        let wake = self.wake.clone();
-        let spawned = std::thread::Builder::new()
-            .name("data-plane".into())
-            .spawn(move || {
-                let _ = complete.send(work(&data).map_err(|error| error.to_string()));
-                wake.wake();
+            // The engine wakes whatever happened after the drain: a sleep that stopped part way
+            // is undone by the wake, which grants back what the head withdrew.
+            let applied = sleep(schedulers, head, data).and_then(|()| {
+                let loaded = data.load(replacement)?;
+                data.stage(loaded);
+                apply(schedulers, data)
             });
-        if spawned.is_err() {
-            self.refuse(
-                front,
-                id,
-                "the data plane's work thread did not start".to_owned(),
-            );
-            return;
+            let woken = wake(schedulers, head, data);
+
+            let reports = applied?;
+            woken?;
+            Ok(reports)
         }
-        self.operate(front, id, vec![completion], Effect::None);
-    }
-
-    /// Keeps operation `id` of `front` until `completions` arrive.
-    fn operate(&mut self, front: usize, id: u64, completions: Vec<Completion>, effect: Effect) {
-        self.operations.push(Operation {
-            id,
-            front,
-            completions,
-            results: Vec::new(),
-            failure: None,
-            effect,
-        });
-        // A scheduler that completed at once has already woken this thread, or never will.
-        self.continue_operations();
-    }
-
-    /// Acknowledges every operation whose completions arrived.
-    pub(super) fn continue_operations(&mut self) {
-        let mut finished = Vec::new();
-        for (index, operation) in self.operations.iter_mut().enumerate() {
-            if collect(
-                &mut operation.completions,
-                &mut operation.results,
-                &mut operation.failure,
-            ) {
-                finished.push(index);
-            }
-        }
-        for index in finished.into_iter().rev() {
-            let operation = self.operations.remove(index);
-            if let Effect::Sleep(asleep) = operation.effect
-                && operation.failure.is_none()
-            {
-                self.asleep = asleep;
-            }
-            if operation.effect != Effect::None {
-                self.refresh_announced();
-            }
-            self.send_event(
-                operation.front,
-                proto::request::wire::from_engine::Kind::Hooked(proto::request::wire::Hooked {
-                    id: operation.id,
-                    results: operation.results,
-                    error: operation.failure.unwrap_or_default(),
-                }),
-            );
-        }
-    }
-
-    /// Reads again what a successor and an attaching daemon are told of this process's storage. A
-    /// change of the cache's segments or of the weights' identity leaves the old description
-    /// stale.
-    pub(super) fn refresh_announced(&mut self) {
-        match self.engine_info() {
-            Ok(info) => self.announced = Some(info),
-            Err(error) => tracing::warn!(%error, "the engine's description was not read again"),
-        }
-    }
-
-    /// Acknowledges operation `id` of `front` with `results`.
-    fn respond(&mut self, front: usize, id: u64, results: Vec<String>) {
-        self.send_event(
-            front,
-            proto::request::wire::from_engine::Kind::Hooked(proto::request::wire::Hooked {
-                id,
-                results,
-                error: String::new(),
-            }),
-        );
-    }
-
-    /// Refuses operation `id` of `front` with `error`.
-    pub(super) fn refuse(&mut self, front: usize, id: u64, error: String) {
-        self.send_event(
-            front,
-            proto::request::wire::from_engine::Kind::Hooked(proto::request::wire::Hooked {
-                id,
-                results: Vec::new(),
-                error,
-            }),
-        );
     }
 }
+
+/// Puts the staged weights in place on every rank, and has every scheduler flush its cache and
+/// key the pages and trajectories it stores from here on by the new weights. The requests the
+/// schedulers hold continue: under a weight update they commit nothing more.
+///
+/// The page seed of each cache group is the one the ranks' page identities for the new weights
+/// give (`storage::key::page_seed`), as the rank start states the first ones; the latent seed is
+/// the one the new weights' identities give (`storage::key::latent_seed`), so that no trajectory
+/// another set of weights computed is restored. A data plane of no rank states no identity, and
+/// the seeds stay.
+fn apply(schedulers: &[Sender<Message>], data: &DataPlane) -> Result<Vec<WeightsUpdated>> {
+    let reports = data.update_weights()?;
+
+    let seeds = reports.first().map(|report| {
+        let pages: Vec<Key> = report
+            .identities
+            .iter()
+            .map(|identity| storage::key::page_seed(identity))
+            .collect();
+        let latent = storage::key::latent_seed(
+            reports
+                .iter()
+                .filter_map(|report| report.identity.as_deref()),
+        );
+        (pages, latent)
+    });
+
+    let flushed = ask(schedulers, |reply| {
+        Message::Flush(seeds.clone(), WeightsInFlight::Keep, reply)
+    })?;
+    every(flushed, "flushing the cache under the new weights")?;
+    Ok(reports)
+}
+
+/// Puts the engine to sleep (`docs/admin.md`, `/admin/sleep`): every scheduler drains at once
+/// with its device memory given back, as a drain to another layout does (token requests leave
+/// as migratable and are computed again, video requests at their next denoising step with their
+/// trajectories stored), the head withdraws every segment of the KV planes, and the ranks release
+/// them and suspend their graph pools. The drained schedulers form no batch until [`wake`].
+///
+/// # Errors
+///
+/// A scheduler that stopped, the Storage Server's refusal of a withdrawal, or a rank's failure;
+/// [`wake`] undoes what was done.
+pub(crate) fn sleep(
+    schedulers: &[Sender<Message>],
+    head: &Mutex<StorageClient>,
+    data: &DataPlane,
+) -> Result<()> {
+    let drained = epoch::drain(schedulers, Instant::now(), true)?;
+    for (index, replied) in drained.into_iter().enumerate() {
+        replied.recv().map_err(|_| stopped(index))?;
+    }
+
+    // Every segment leaves its space's ledger before any rank releases it: a segment the ledger
+    // still held would be given to a region with no memory behind it.
+    {
+        let mut head = lock(head);
+        let regions = epoch::kv_regions(epoch::session(&head)?.0);
+        for index in regions {
+            let (_, withdrawn) = epoch::withdraw_from(&mut head, index, 0);
+            withdrawn.context("withdrawing the KV cache's segments for the sleep")?;
+        }
+    }
+    data.sleep()?;
+    Ok(())
+}
+
+/// Wakes the engine from [`sleep`] (`docs/admin.md`, `/admin/wake_up`): the ranks restore their
+/// graph pools and create every segment of their KV planes again, the head grants them, every
+/// scheduler grows its device regions back to every unit the session numbers, and admits
+/// again. Returns each device region's number with the units it reached.
+///
+/// # Errors
+///
+/// A rank's failure, the Storage Server's refusal of a grant, or a scheduler that stopped.
+pub(crate) fn wake(
+    schedulers: &[Sender<Message>],
+    head: &Mutex<StorageClient>,
+    data: &DataPlane,
+) -> Result<Vec<(u8, u32)>> {
+    data.wake()?;
+
+    {
+        let mut head = lock(head);
+        let (open, _) = epoch::session(&head)?;
+        let regions: Vec<(usize, Vec<GroupId>)> = epoch::kv_regions(open)
+            .into_iter()
+            .map(|index| (index, epoch::groups_of(open, index)))
+            .collect();
+        for (index, groups) in regions {
+            epoch::grant_held(&mut head, index, &data.segment_tables(&groups))?;
+        }
+    }
+
+    // The regions are grown first, so the first request admitted finds its units.
+    let reached = epoch::grow_regions(schedulers, head)?;
+    resume(schedulers);
+    Ok(reached)
+}
+
+/// Gives the KV cache's tail segments back until every device of the engine has the room the
+/// device's quota must hold beside everything it reserves: `bytes`, or for a GPU `devices` names
+/// by its identity, the bytes stated for it (`ResizeCache { MakeRoom }`, a profiling session's
+/// storage). The requests that hold the tail run on, and the release takes it once they let it
+/// go; [`epoch::grow`] takes it back.
+///
+/// For each region of the KV planes, the segments released are the fewest from the tail whose
+/// release leaves every device of the region's ranks the room; segment 0 is kept. Every region
+/// is decided before any changes.
+///
+/// # Errors
+///
+/// When even a release of every segment past the first leaves a device too little room, with
+/// nothing changed; a scheduler that stopped, the Storage Server's refusal, or a rank's failure.
+pub(crate) fn make_room(
+    schedulers: &[Sender<Message>],
+    head: &Mutex<StorageClient>,
+    data: &DataPlane,
+    bytes: u64,
+    devices: &BTreeMap<[u8; 16], u64>,
+) -> Result<()> {
+    let needed = |gpu: &[u8; 16]| devices.get(gpu).copied().unwrap_or(bytes);
+
+    // Per region of the KV planes whose release makes room: its index, its number, the
+    // scheduler that resizes it, the first segment released and the units the region keeps,
+    // those below that segment's.
+    let mut releases = Vec::new();
+    {
+        let head = lock(head);
+        let (open, opened) = epoch::session(&head)?;
+        for index in epoch::kv_regions(open) {
+            let (Some(stated), Some(&(number, _)), Some(table)) = (
+                open.regions.get(index),
+                opened.regions.get(index),
+                opened.segments.get(index),
+            ) else {
+                continue;
+            };
+            let rooms = data.device_rooms(&epoch::groups_of(open, index))?;
+
+            // The release from `first` on gives each device the bytes of the segments there.
+            let leaves_room = |first: usize| {
+                let units: u64 = table
+                    .iter()
+                    .skip(first)
+                    .map(|&(_, _, units)| u64::from(units))
+                    .sum();
+                rooms.iter().all(|(gpu, room, unit_bytes)| {
+                    room.holds(needed(gpu), units.saturating_mul(*unit_bytes))
+                })
+            };
+            // Segment 0 holds the unit a pooled table names where a row holds no page: it stays.
+            let held = table.len();
+            let Some(first) = (1..=held.max(1)).rev().find(|first| leaves_room(*first)) else {
+                bail!(
+                    "a release of every KV cache segment of region {number} past the first leaves \
+                     a device too little room for {bytes} bytes (by device {devices:?}): {rooms:?}"
+                );
+            };
+            let Some(&(_, start, _)) = table.get(first) else {
+                continue;
+            };
+
+            let scheduler = epoch::scheduler_of(opened, number)?;
+            let kept = start.saturating_sub(stated.reserved);
+            releases.push((index, number, scheduler, first, kept));
+        }
+    }
+
+    for (index, number, scheduler, first, kept) in releases {
+        // The region gives back its units from the segment's first on; the requests that hold
+        // some of them run on, and the region is asked again until it reached the units it keeps.
+        let inbox = schedulers
+            .get(scheduler)
+            .ok_or_else(|| stopped(scheduler))?;
+        loop {
+            let reached = ask(std::slice::from_ref(inbox), |reply| {
+                Message::Resize(number, kept, reply)
+            })?;
+            if reached.first().is_some_and(|reached| *reached <= kept) {
+                break;
+            }
+            std::thread::sleep(RESIZE_RETRY);
+        }
+
+        let (from, withdrawn, groups) = {
+            let mut head = lock(head);
+            let (from, withdrawn) = epoch::withdraw_from(&mut head, index, first);
+            (
+                from,
+                withdrawn,
+                epoch::groups_of(epoch::session(&head)?.0, index),
+            )
+        };
+        // What the head withdrew is released whatever stopped the withdrawals.
+        data.release_segments(&groups, u32::try_from(from).unwrap_or(u32::MAX))?;
+        withdrawn.context("withdrawing the KV cache's tail segments")?;
+    }
+    Ok(())
+}
+
+/// Flushes the cache (`docs/admin.md`, `/admin/flush_cache`): at one boundary every scheduler
+/// evicts every cached block it knows of; the requests it holds keep theirs.
+///
+/// # Errors
+///
+/// A scheduler that stopped or refused.
+pub(crate) fn flush(schedulers: &[Sender<Message>]) -> Result<()> {
+    at_boundary(schedulers, || {
+        let flushed = ask(schedulers, |reply| {
+            Message::Flush(None, WeightsInFlight::Keep, reply)
+        })?;
+        every(flushed, "flushing the cache")
+    })
+}
+
+/// Puts the redistribution of the routed experts the data plane holds ready in place, at one
+/// boundary of every scheduler, and returns each rank's report (`docs/admin.md`, "Expert
+/// redistribution"). The numerical weights are the same, so nothing is flushed.
+///
+/// # Errors
+///
+/// As [`DataPlane::commit_experts`], or a scheduler that stopped.
+pub(crate) fn commit_experts(
+    schedulers: &[Sender<Message>],
+    data: &DataPlane,
+    order: &BTreeMap<String, Vec<u32>>,
+) -> Result<Vec<WeightsUpdated>> {
+    at_boundary(schedulers, || {
+        data.commit_experts(order)
+            .context("putting the experts' new order in place")
+    })
+}
+
+/// Runs the operation the daemon names `name` with the JSON `payload`, beside the batches, and
+/// returns each rank's result: an expert redistribution's stages (`uniserve.prepare_experts`,
+/// `start_experts`, `experts_ready`, `abort_experts`), a LoRA adapter's load and unload
+/// (`load_lora_adapter`, `unload_lora_adapter`), a profiling session's changes
+/// (`uniserve.profile_start`, `profile_stop`, `profile_release`) and the fence probes' switch
+/// (`uniserve.fence_switch`). Nothing here changes what a batch reads: a redistribution copies
+/// into new storage, and its change of the served weights is [`commit_experts`].
+///
+/// # Errors
+///
+/// A name this process has no operation of, a payload the operation refuses, or the
+/// operation's failure.
+pub(crate) fn hook(data: &Arc<DataPlane>, name: &str, payload: &str) -> Result<Vec<String>> {
+    let results = match name {
+        "uniserve.prepare_experts" => {
+            let orders: BTreeMap<String, Vec<u32>> =
+                serde_json::from_str(payload).context("an expert order")?;
+            data.prepare_experts(orders)?
+        }
+        "uniserve.start_experts" => data.start_experts()?,
+        "uniserve.experts_ready" => data.experts_ready()?,
+        "uniserve.abort_experts" => data.abort_experts()?,
+        "load_lora_adapter" => data.load_adapter(payload)?,
+        "unload_lora_adapter" => data.unload_adapter(payload)?,
+        "uniserve.profile_start" => data.start_profile(payload)?,
+        "uniserve.profile_stop" => data.stop_profile(payload)?,
+        "uniserve.profile_release" => data.release_profile(payload)?,
+        "uniserve.fence_switch" => fence_switch(payload)?,
+        other => bail!("this process has no operation named {other:?}"),
+    };
+    Ok(results)
+}
+
+/// Writes the fence probes' device switch (`docs/profiling.md`): `{"enabled": bool, "off":
+/// [patterns]}`. The range markers read it in device storage, and writing it waits for nothing.
+/// A process without range markers says so.
+fn fence_switch(payload: &str) -> Result<Vec<String>> {
+    let payload: serde_json::Value = serde_json::from_str(payload).context("fence_switch")?;
+    let enabled = payload["enabled"]
+        .as_bool()
+        .context("fence_switch states no enabled")?;
+    let off: Vec<String> = match payload.get("off") {
+        Some(off) if !off.is_null() => {
+            serde_json::from_value(off.clone()).context("fence_switch off")?
+        }
+        _ => Vec::new(),
+    };
+
+    let switched = worker::profiling::markers::Markers::installed()
+        .map(|markers| markers.switch(enabled, &off))
+        .transpose()?;
+    Ok(vec![
+        serde_json::json!({
+            "probes": switched.is_some(),
+            "enabled": enabled,
+            "off": switched.unwrap_or_default(),
+        })
+        .to_string(),
+    ])
+}
+
+/// Applies `config`'s scheduling limits in place on every scheduler (`Configure`,
+/// `specs/updates.md` §1): each takes them from its next step on, or refuses a limit above what
+/// its executors were started for and keeps its own.
+///
+/// # Errors
+///
+/// A scheduler that stopped or refused.
+pub(crate) fn configure(schedulers: &[Sender<Message>], config: &SchedulerConfig) -> Result<()> {
+    let configured = ask(schedulers, |reply| {
+        Message::Configure(config.clone(), reply)
+    })?;
+    every(configured, "the scheduling limits")
+}
+
+#[cfg(test)]
+pub(super) mod tests;

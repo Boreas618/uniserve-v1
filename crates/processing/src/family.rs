@@ -46,9 +46,10 @@ impl Eq for Family {}
 /// The request-processing side of every model family this tree serves: what a daemon registers,
 /// without linking a model. The engine executable registers the numerical side of the same
 /// families, each of which holds its value of this list.
-pub const FAMILIES: [Family; 3] = [
+pub const FAMILIES: [Family; 4] = [
     crate::qwen::QWEN3,
     crate::qwen::QWEN3_5_MOE,
+    crate::qwen::QWEN4_EXP,
     crate::minimax_h3::FAMILY,
 ];
 

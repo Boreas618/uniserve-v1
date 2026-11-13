@@ -1234,7 +1234,7 @@ dependencies = [
  "processing",
  "proto",
  "qwen3",
- "scheduler",
+ "qwen4-exp",
  "scheduling",
  "scheduling-guest",
  "serde_json",

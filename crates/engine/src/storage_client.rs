@@ -23,7 +23,7 @@ use std::path::Path;
 
 use anyhow::{Context as _, Result, bail};
 use storage::protocol::UnitRun;
-use storage::runtime::{GroupId, Open, Opened};
+use storage::runtime::{GroupId, Open, Opened, Segments};
 use storage::{Client, Location, QueuePair, Role, Segment};
 
 /// The engine's head connection to its host's Storage Server, and the session it opened with the
@@ -107,7 +107,9 @@ impl StorageClient {
     }
 
     /// The layout the session was opened with and the buffer pool's answer to it; `None` before
-    /// the session is open.
+    /// the session is open. The answer's segment table of each region is the one the Storage
+    /// Server holds for the region's memory space: as `Open` answered it, with the segments this
+    /// head granted since ([`Self::grant`]) and without those it withdrew ([`Self::withdraw`]).
     pub fn session(&self) -> Option<(&Open, &Opened)> {
         self.session
             .as_ref()
@@ -202,7 +204,14 @@ impl StorageClient {
                     "granting segment {}/{} of region {region}",
                     segment.epoch, segment.ordinal
                 )
-            })
+            })?;
+
+        // The space's table holds the segment from here on, in the order of its first unit.
+        self.change_table(region, |table| {
+            let at = table.partition_point(|(_, from, _)| *from < first);
+            table.insert(at, (segment, first, units));
+        });
+        Ok(())
     }
 
     /// States that the ranks are about to release the storages of `segment` of the memory space
@@ -221,7 +230,35 @@ impl StorageClient {
                     "withdrawing segment {}/{} of region {region}",
                     segment.epoch, segment.ordinal
                 )
-            })
+            })?;
+
+        self.change_table(region, |table| {
+            table.retain(|(held, _, _)| *held != segment);
+        });
+        Ok(())
+    }
+
+    /// Applies `change` to the segment table of the memory space of the region named `region`,
+    /// as the session's answer states it for every region of that space: the Storage Server keeps
+    /// one table per space. Nothing changes before the session is open, or for a region it does
+    /// not state.
+    fn change_table(&mut self, region: &str, change: impl Fn(&mut Segments)) {
+        let Some((layout, opened)) = self.session.as_mut() else {
+            return;
+        };
+        let Some(space) = layout
+            .regions
+            .iter()
+            .find(|stated| stated.name == region)
+            .map(|stated| stated.space.clone())
+        else {
+            return;
+        };
+
+        let tables = layout.regions.iter().zip(opened.segments.iter_mut());
+        for (_, table) in tables.filter(|(stated, _)| stated.space == space) {
+            change(table);
+        }
     }
 
     /// States where rank `rank` of the device memory `memory`, a rank of the host whose Storage

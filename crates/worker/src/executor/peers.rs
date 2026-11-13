@@ -24,8 +24,8 @@
 //! Each end's connection is owned by one link thread, which sends what other threads queued
 //! (they fire the channel's wake), reads what arrived and settles it; nothing else touches the
 //! socket. A connection's close is the only death signal of the process at its other end: the
-//! link marks the process's [`Liveness`] lost and wakes its control thread, which ends the
-//! process, and the daemon then replaces the epoch's failure domain.
+//! link marks the process's [`Liveness`] lost and calls the control thread's callback, which ends
+//! the process, and the daemon then replaces the epoch's failure domain.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -41,7 +41,7 @@ use ipc::{
 use storage::runtime::{Completion, GroupId, Request};
 
 use super::{Executors, Sequences};
-use crate::completion::{Fault, Outcome, Submission, SubmissionId, SubmissionState};
+use crate::completion::{Fault, Outcome, Submission, SubmissionId, SubmissionState, Waker};
 use crate::{Error, Result, lock};
 
 /// The longest a link thread waits for its connection before it looks at its queue unasked.
@@ -58,25 +58,27 @@ pub const LOST_EXIT: Duration = Duration::from_secs(20);
 /// Whether the processes at the far ends of an engine process's peer links still serve, and the
 /// first reason one stopped.
 ///
-/// A link that closes sets it and wakes the control thread, which reads it on its next pass and
-/// ends the process: a group missing a rank cannot run a batch, and the daemon replaces the
-/// whole failure domain, not one process of it.
+/// A link that closes sets it and calls the control thread's callback, which tells the control
+/// thread, and the control thread ends the process: a group missing a rank cannot run a batch,
+/// and the daemon replaces the whole failure domain, not one process of it.
 pub struct Liveness {
     lost: AtomicBool,
     reason: Mutex<Option<String>>,
-    wake: ipc::Wake,
+    /// Called once, on the link thread that lost its link, after the reason is recorded: it only
+    /// signals the control thread.
+    callback: Waker,
     /// How long the process has to end once a link is lost.
     exit_after: Duration,
 }
 
 impl Liveness {
-    /// Liveness that wakes the control thread through `wake` when a link is lost, and ends the
-    /// process `exit_after` later if the control thread has not ([`LOST_EXIT`]).
-    pub fn new(wake: ipc::Wake, exit_after: Duration) -> Arc<Self> {
+    /// Liveness that calls `callback` when a link is first lost, and ends the process
+    /// `exit_after` later if the control thread has not ([`LOST_EXIT`]).
+    pub fn new(callback: Waker, exit_after: Duration) -> Arc<Self> {
         Arc::new(Self {
             lost: AtomicBool::new(false),
             reason: Mutex::new(None),
-            wake,
+            callback,
             exit_after,
         })
     }
@@ -89,8 +91,8 @@ impl Liveness {
         lock(&self.reason).clone()
     }
 
-    /// Records that a link was lost for `reason`, keeping the first reason, and wakes the
-    /// control thread.
+    /// Records that a link was lost for `reason`, keeping the first reason, and calls the
+    /// control thread's callback the first time.
     fn lose(&self, reason: String) {
         let first = {
             let mut slot = lock(&self.reason);
@@ -102,7 +104,9 @@ impl Liveness {
             first
         };
         self.lost.store(true, Ordering::Release);
-        self.wake.wake();
+        if first {
+            (self.callback)();
+        }
 
         // The control thread ends the process on its next pass. A pass that never comes (a call
         // of the control thread that waits on a device whose collective waits for the lost
@@ -890,13 +894,14 @@ mod tests {
     /// A bound on the tests' waits that only a defect reaches.
     const LONG: Duration = Duration::from_secs(30);
 
-    /// Liveness of a test process, which a lost link must not end, with the waker it fires.
-    fn liveness() -> (Arc<Liveness>, ipc::Waker) {
-        let waker = ipc::Waker::new().expect("a waker");
-        (
-            Liveness::new(waker.wake(), Duration::from_secs(3600)),
-            waker,
-        )
+    /// Liveness of a test process, which a lost link must not end, with what its callback
+    /// receives once a link is lost.
+    fn liveness() -> (Arc<Liveness>, Receiver<()>) {
+        let (lost, called) = crossbeam_channel::unbounded();
+        let callback: Waker = Arc::new(move || {
+            let _ = lost.send(());
+        });
+        (Liveness::new(callback, Duration::from_secs(3600)), called)
     }
 
     /// The submission of a decode batch of one row of group 0, numbered 1, which the tests
@@ -1008,7 +1013,7 @@ mod tests {
             call_window: 2,
         };
         let report = stated.clone();
-        let (liveness, _waker) = liveness();
+        let (liveness, _called) = liveness();
 
         let (remote, peer) = linked(2, 5, liveness, move |mut channel| {
             // The first request gets the report and the second a refusal.
@@ -1048,7 +1053,7 @@ mod tests {
 
     #[test]
     fn a_closed_peer_fails_its_submissions_and_is_lost() {
-        let (liveness, waker) = liveness();
+        let (liveness, called) = liveness();
 
         let (remote, peer) = linked(1, 3, Arc::clone(&liveness), |mut channel| {
             // Read the one submission, then go away without responding.
@@ -1063,11 +1068,12 @@ mod tests {
         assert!(matches!(submission.wait(), Outcome::Failed(_)));
         peer.join().expect("the peer");
 
-        // The close is the peer's death signal: the link fires the control thread's wake.
-        let mut wake = [waker.poll_fd()];
-        // SAFETY: the call borrows this live array for its own duration only.
-        let woken = unsafe { libc::poll(wake.as_mut_ptr(), 1, 30_000) };
-        assert_eq!(woken, 1, "the lost link did not wake the control thread");
+        // The close is the peer's death signal: the link calls the control thread's callback,
+        // once, with the reason recorded.
+        assert!(
+            called.recv_timeout(LONG).is_ok(),
+            "the lost link did not call the control thread's callback"
+        );
         assert!(liveness.lost().is_some());
         assert!(remote.send(submit(), &sequences, 0).is_err());
 

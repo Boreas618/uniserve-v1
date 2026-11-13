@@ -9,6 +9,10 @@ use proto::config::{EngineArgs, WorkerGroupConfig};
 
 use super::{ModelRunner, ParallelShape};
 
+#[expect(
+    dead_code,
+    reason = "the media rank, which reads it, is not started by the main process yet"
+)]
 impl ModelRunner {
     /// The parallel groups this rank joins: `(sequence group's ranks, tensor group's ranks)` and its
     /// place in each. A rank of a media deployment is in both; the text class joins neither here.
@@ -166,6 +170,13 @@ impl Mapping {
 /// partition, a projection this stack does not implement is refused rather than served at degree
 /// one, and a mode that is not Ulysses is refused by name because the denoiser's sequence exchange
 /// is Ulysses' alone.
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "the media rank, which reads it, is not started by the main process yet"
+    )
+)]
 pub(super) fn video_split(
     groups: Option<&[WorkerGroupConfig]>,
     group: &str,

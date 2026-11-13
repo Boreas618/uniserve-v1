@@ -69,19 +69,24 @@ An epoch whose worker groups have ranks on several hosts runs one main process p
 
 ## The threads of a main process
 
-A main process's threads are named by their role: the control thread, the scheduler threads, the executors and the blocking pool.
+A main process's threads are named by their role: the control thread, the readers of its daemon's interfaces, the operations thread and the work threads, the scheduler threads, the executors and the blocking pool (`crates/engine/src/process`).
 
 | Thread | One per | Blocks only on | Does |
 | --- | --- | --- | --- |
-| Control thread | process | The daemon's request interface and the daemon's process supervision (`crates/worker/src/control.rs`), at the latest for the watchdog's deadline | Serves the process interface and the generation commands, and reports a job that stopped making progress while the channels go on being served |
-| Peer links | process, on an epoch of several hosts | One connection to another main process of the epoch (`crates/worker/src/peers.rs`) | The scheduler node's: sends its schedulers' batches to a peer and settles their answers. A peer's: runs the scheduler node's batches on its devices and answers them. A close ends the process |
-| Scheduler threads | DP rank | Its own queue and wake descriptor | Request state, the scheduling mechanism, each step's event batch and plan, batch assembly and completions |
-| Executors | device | The device's work | The only issuer of work on the device's streams: forwards, graph replays, copies, captures and rebinds, in submission order (`crates/worker/src/job.rs`) |
-| Blocking pool | pool | One kind of host work | Module loading, media encoding and muxing, and condition media reads (`crates/worker/src/blocking.rs`) |
+| Control thread | process | One `Select` over its inbox and every scheduler's outputs, until the earliest of the watchdog's deadline and the next metrics second | Holds the engine's lifecycle and generation update, the requests and their event streams; serves the request interface's frames and the process interface's commands, routes and submits requests, writes events, states and reports, starts jobs, and reports a job that stopped making progress |
+| Request readers | daemon front | A read of its request connection | Hands each frame to the control thread's inbox, then the front's close |
+| Command reader | process | A read of the process interface | Hands each command to the control thread's inbox, then the interface's close |
+| Start | process, once | The rank start | Loads the ranks, opens the session with the Storage Server and starts the schedulers, and hands the started epoch to the control thread |
+| Operations | process | Its job channel, then the job's own waits | Runs, one at a time and in order, every job that pauses the schedulers or changes the ranks' device memory (a switch, a commit, a rollback, a weight update, sleep and wake, a flush, an expert commit, making room, growing, a release after a shrink, the start and the end of a drain), so two pause sequences never interleave; since a scheduler's `Resume` ends its drain as well as its pause, none that pauses the schedulers starts while the engine drains |
+| Work | job beside the batches | The job's own waits | A preparation, an adapter, a profiling change, a drain's wait, an attach |
+| Peer links | process, on an epoch of several hosts | One connection to another main process of the epoch (`crates/worker/src/executor/peers.rs`) | The scheduler node's: sends its schedulers' batches to a peer and settles their answers. A peer's: runs the scheduler node's batches on its devices and answers them. A close tells the control thread, which ends the process |
+| Scheduler threads | DP rank | Its inbox | Request state, the scheduling mechanism, each step's batches and the buffer pool's queue pair |
+| Executors | device | The device's work | The only issuer of work on the device's streams: forwards, graph replays, copies, captures and rebinds, in submission order (`crates/worker/src/executor.rs`) |
+| Blocking pool | pool | One kind of host work | Media encoding and muxing, and condition media reads (`crates/worker/src/thread_pool.rs`) |
 
 Threads exchange messages only. The control thread never waits for a job, so a slow launch, a driver call that waits on the device or a job that does not end does not keep it from serving the channel, handling a cancellation or reporting status. The executor is the only issuer of work on its device's streams, so each stream's order is the order the jobs were submitted in; it posts a job's completion once it has issued the job's work, not once the device has finished it, and storage a job used is read, rewritten or freed afterwards only behind something that waited for the device (a read in the job, a stream wait the job recorded, events the job completes after, or the fences that retire storage). A runner is called only on its device executor's thread and only one job at a time, which is why the runner trait takes `&mut self` and carries no synchronization (`crates/worker/src/runner.rs`).
 
-Blocking host work runs on bounded pools of threads (`<pool>-<index>`) that each serve one kind of work: module loading and media. Signals, a video runner's host reports and, during startup, the engine watch are dedicated threads (`crates/worker/src/blocking.rs`).
+Blocking host work runs on bounded pools of threads (`<pool>-<index>`) that each serve one kind of work: media. Signals, a video runner's host reports and the lifeline are dedicated threads (`crates/worker/src/thread_pool.rs`, `crates/engine/src/main.rs`).
 
 ## The numerical library
 
@@ -197,7 +202,7 @@ A main process moves no bytes to another process itself. Every copy between proc
 
 Every rank of a group runs these phases in the same order, because several are collective:
 
-1. The main process reads its launch file, and its control thread connects to the daemon (`crates/daemon/src/engine/launch.rs`, `crates/worker/src/control.rs`); until serving starts, a watch ends the process at once if the daemon's connection closes. The executor makes its device's primary context current.
+1. The main process reads its launch file, says hello on the daemon's request interface and states `Starting`, and claims the node's Storage Server on the process interface (`crates/daemon/src/engine/launch.rs`, `crates/engine/src/process/daemon.rs`); its lifeline ends the process at once if the daemon is gone. The executor makes its device's primary context current.
 2. The checkpoint resolves to its model family by the class it declares (`crates/engine/src/catalogue.rs`), the family reads the model's configuration, and the parallel configuration is validated against the components each rank holds (`crates/models`).
 3. The ranks' communicators are planned and created (`crates/nn`, `crates/platform`).
 4. The weights are loaded, or bound from what the same model at the same rank position in the same parallel configuration retained (`crates/worker/src/memory/weights.rs`): the checkpoint reader reads each source file front to back into the page cache before mapping its tensors, so ranks loading one cold file do not fault it page by page. A rank that loaded moves its weights into retained storage and publishes them.
@@ -276,7 +281,6 @@ Dependency direction, as the crates' manifests state it (a crate on the right de
 
 | Module (`crates/worker/src`) | Responsibility |
 | --- | --- |
-| `control` | the control thread's channels: the daemon's request interface and its process supervision |
 | `peers` | the channel to the epoch's other main processes: registration, the scheduler node's link to each peer and a peer's link back, each on a thread of its own |
 | `job`, `batch`, `completion` | jobs, the job queue the executor performs and its completions; a batch's open, lease, seal, commit and materialize |
 | `runner`, `runners/` | the runner trait and the runners a device executor holds: `CausalLmRunner`, `EncoderRunner`, `DenoiserRunner`, `DecoderRunner`, and the host-side `MediaRunner`; the recorded walk (`runners/recording.rs`) |

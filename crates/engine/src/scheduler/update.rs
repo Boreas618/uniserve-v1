@@ -1275,8 +1275,8 @@ impl Scheduler {
     }
 
     /// A region's units after a `Resize` (SD §3.8): the reply owed to a `Message::Resize` for the
-    /// region, or, for the shrink of a drain, `Output::Shrunk`, which the engine divides among the
-    /// target epoch's schedulers.
+    /// region, which states them, or, for the shrink of a drain, `Output::Shrunk`, which the
+    /// engine divides among the target epoch's schedulers.
     fn resized(&mut self, region: u8, units: u32) {
         if let Some(index) = self.region_index(region)
             && let Some(capacity) = self.capacity.get_mut(index)
@@ -1287,7 +1287,7 @@ impl Scheduler {
             Some(at) => {
                 let (_, reply) = self.resizing.remove(at);
                 // A requester that stopped waiting needs no reply.
-                let _ = reply.send(());
+                let _ = reply.send(units);
             }
             None => {
                 let _ = self.output.send(Output::Shrunk(region, units));
@@ -2291,8 +2291,8 @@ mod tests {
         );
     }
 
-    /// A `Resize` the engine asked for is answered at its `Resized`, which sets the region's
-    /// capacity.
+    /// A `Resize` the engine asked for is answered at its `Resized` with the units the region
+    /// reached, which set the region's capacity.
     #[test]
     fn a_resize_is_answered_at_its_resized() {
         let (mut bench, outputs) = scheduler();
@@ -2309,7 +2309,7 @@ mod tests {
                 evicted: Vec::new(),
             }],
         );
-        assert_eq!(replied.try_recv(), Ok(()));
+        assert_eq!(replied.try_recv(), Ok(30));
         assert_eq!(bench.scheduler.capacity[1], 30);
         assert!(bench.scheduler.resizing.is_empty());
         assert!(

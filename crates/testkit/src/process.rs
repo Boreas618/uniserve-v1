@@ -200,7 +200,9 @@ impl Engine {
                 let serving = self.serving_report();
                 self.acknowledge(serving)
             }
-            command::Kind::Pause(_) | command::Kind::Serve(_) => Vec::new(),
+            command::Kind::Pause(_) | command::Kind::Serve(_) | command::Kind::Grow(_) => {
+                Vec::new()
+            }
         }
     }
 

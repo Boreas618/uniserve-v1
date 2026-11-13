@@ -1534,8 +1534,7 @@ fn a_group_s_ranks_on_another_host_take_its_jobs_and_state_what_they_ended() {
         std::thread::spawn(move || {
             let channel = register(&address, 0, 7, LONG).unwrap();
             let (ranks, _, _) = group(ranks(1, &log), Vec::new());
-            let waker = ipc::Waker::new().unwrap();
-            let liveness = Liveness::new(waker.wake(), Duration::from_secs(3600));
+            let liveness = Liveness::new(Arc::new(|| {}), Duration::from_secs(3600));
             // The group's capacity, which this test's scheduler node never asks for.
             let capacity = ipc::Capacity {
                 phases: 0,
@@ -1563,8 +1562,7 @@ fn a_group_s_ranks_on_another_host_take_its_jobs_and_state_what_they_ended() {
     // The scheduler node: it holds no rank of the group, only the link to the peer, whose
     // ended sequence its register holds.
     let (rank, channel) = accept(&listener, 1, 7, LONG).unwrap().pop().unwrap();
-    let waker = ipc::Waker::new().unwrap();
-    let liveness = Liveness::new(waker.wake(), Duration::from_secs(3600));
+    let liveness = Liveness::new(Arc::new(|| {}), Duration::from_secs(3600));
     let remote = Remote::spawn(rank, channel, Arc::clone(&liveness)).unwrap();
     let (pool, engine) = queue_pair(1);
     let sequences = Sequences::new(GROUP, 1, vec![(engine, 0)]);

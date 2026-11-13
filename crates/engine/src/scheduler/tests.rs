@@ -23,7 +23,8 @@ use storage::runtime::{self, Class, Completion, GroupId, OwnerId, Region, Tier};
 use storage::{Key, QueuePair};
 
 use super::cache::DEVICE;
-use super::policy::tests::{packaged, toy};
+use super::policy::tests::packaged;
+pub(crate) use super::policy::tests::toy;
 use super::{
     Blocks, Cached, Capacity, Executor, Message, Output, Policy, Request, RequestStatus, Scheduler,
 };
@@ -196,7 +197,7 @@ fn built(
     })
 }
 
-pub(super) fn capacity() -> Capacity {
+pub(crate) fn capacity() -> Capacity {
     Capacity {
         phases: 0,
         slots: 16,
@@ -1107,7 +1108,7 @@ fn a_failed_executor_job_stops_the_loop_and_reaches_the_engine() {
 
 /// A policy that admits nothing: tests that drive the queue pair, the views or the placement,
 /// which no policy decision reaches.
-pub(super) fn idle_policy() -> Policy {
+pub(crate) fn idle_policy() -> Policy {
     Policy::new(
         toy("(i64.const 0)"),
         Parameters::default(),

@@ -415,4 +415,4 @@ impl Shadow {
 }
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;

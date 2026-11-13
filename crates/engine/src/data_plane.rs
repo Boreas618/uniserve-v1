@@ -12,10 +12,11 @@
 //!
 //! - **At a batch boundary**: putting loaded weights in place ([`DataPlane::update_weights`],
 //!   [`DataPlane::commit_experts`]), suspending and restoring the graph pools, releasing and
-//!   creating the KV planes' segments, and the kernels the cache and the state launch
-//!   ([`DataPlane::set_kernels`]). A control operation is ordered against its own executor's
-//!   jobs only, so the engine first pauses the schedulers whose batches read what changes: every
-//!   rank of a group then changes between the same two batches.
+//!   creating the KV planes' segments, and the kernels the cache and the state launch, each
+//!   rank's from the generation its graphs serve ([`DataPlane::set_kernels`]). A control
+//!   operation is ordered against its own executor's jobs only, so the engine first pauses the
+//!   schedulers whose batches read what changes: every rank of a group then changes between the
+//!   same two batches.
 //! - **Beside the serving batches**: a load of another checkpoint of the same model, or of
 //!   another arrangement of its experts ([`DataPlane::pair`], [`DataPlane::load`]), published at
 //!   the Storage Server while requests go on; LoRA adapters; profiling sessions, which each
@@ -35,25 +36,28 @@
 //! memory behind the units is the ranks' segments of the KV planes, which each rank creates in
 //! its own context (`specs/buffer-pool.md` §14.1). Memory changes by whole segments, around the
 //! tables' changes, and the head of the epoch's session states each change to the Storage Server,
-//! since only the head knows when every rank that maps a region has made it. The data plane is
+//! since only the head knows when every rank that maps a region has made it. A region's ranks are
+//! those of the worker groups that state it, which the segment operations name. The data plane is
 //! the ranks' side of each sequence:
 //!
 //! 1. **Release from segment `k` on**, for a region of another layout to grow into the memory:
 //!    the schedulers `Resize` their regions below the first unit of segment `k`; the head sends
 //!    `Withdraw` for each segment from `k` on, which takes its units out of the space's free
-//!    ranges; then [`DataPlane::release_segments`]: every rank unmaps them and ends its
-//!    retention, and the GPU's quota usage drops with the last rank.
-//! 2. **Create given-back segments**, for a region to grow past the space's free ranges:
-//!    [`DataPlane::create_segments`]: every rank creates them again at their addresses and resets
-//!    their units; the head sends `Grant` for each segment the ranks hold now beyond those the
-//!    space held; then the schedulers `Resize` their regions into them.
+//!    ranges; then [`DataPlane::release_segments`]: every rank of the region unmaps them and ends
+//!    its retention, and the GPU's quota usage drops with the last rank.
+//! 2. **Create given-back segments**, for a region to grow past the space's free ranges, as many
+//!    as [`DataPlane::fitting_segments`] finds room for: [`DataPlane::create_segments`]: every
+//!    rank of the region creates them again at their addresses and resets their units; the head
+//!    sends `Grant` for each segment the ranks hold now beyond those the space held; then the
+//!    schedulers `Resize` their regions into them.
 //! 3. **Sleep**: the schedulers detach every owner and `Resize` every device region to nothing,
 //!    having stored what the write policy keeps; the head withdraws every segment;
 //!    [`DataPlane::sleep`] releases them all and suspends the graph pools.
 //! 4. **Wake**: [`DataPlane::wake`] restores the graph pools and creates every segment again; the
-//!    head grants them; the schedulers grow their regions.
+//!    head grants them ([`DataPlane::segment_tables`] states each region's); the schedulers grow
+//!    their regions.
 //!
-//! Each returns every rank's segment table ([`ipc::CacheTable`]), whose segment `i` holds the
+//! Each returns its ranks' segment tables ([`ipc::CacheTable`]), whose segment `i` holds the
 //! units from the sum of the units of the segments before it. An epoch switch changes no
 //! plane: two epochs of one layout name the same regions and map the same segments, and nothing
 //! of the cache is handed over or adopted (`specs/updates.md` §3.4).
@@ -68,6 +72,7 @@ use ipc::memory::WeightsUpdated;
 use nn::WeightKey;
 use platform::{DeviceId, Nvml, Stream};
 use storage::Item;
+use storage::runtime::GroupId;
 use worker::completion::Outcome;
 use worker::memory::cache::KvCacheMemory;
 use worker::memory::client::{StorageClient, quota_limit};
@@ -150,11 +155,24 @@ impl Rank {
             .upgrade()
             .ok_or(Error::State("the rank's executor has closed"))
     }
+
+    /// Whether the rank is one of the worker groups `groups`, as its executor's block tables
+    /// number its group in the session. A rank whose executor closed is of none.
+    fn of(&self, groups: &[GroupId]) -> bool {
+        self.executor
+            .upgrade()
+            .is_some_and(|executor| groups.contains(&executor.group()))
+    }
 }
 
 /// What a control operation computes on one rank: called on the rank's executor thread with its
 /// runners, once the device has passed everything they issued.
 type Work<T> = Box<dyn FnOnce(&mut [Box<dyn Runner>]) -> Result<T> + Send>;
+
+/// What a segment decision reads of one rank whose KV planes are split: its GPU's identity, its
+/// device's room, its segment table, and the device bytes one unit of its planes takes, which a
+/// unit's release gives back.
+type SegmentFacts = ([u8; 16], Room, CacheTable, u64);
 
 /// One rank's share of a replacement: which weights it moves, and what that takes.
 struct Share {
@@ -268,6 +286,20 @@ pub fn identity_of(order: &[(WeightKey, bool)]) -> String {
     ::storage::Key(digest.finish()).hex()
 }
 
+/// The room `rank`'s device has: what the deployment's quota of the GPU leaves, and what the
+/// device has free.
+fn room_of(rank: &Rank) -> Result<Room> {
+    let (quota, _) = rank.client.usage(rank.device)?;
+    let free = rank.device.memory_info()?.free;
+
+    Ok(Room {
+        quota: quota
+            .limit
+            .map_or(free, |limit| limit.saturating_sub(quota.usage())),
+        free,
+    })
+}
+
 /// What `cache`'s planes are made of and how many of their segments exist; none for planes that
 /// are not split.
 fn segment_table(cache: &KvCacheMemory) -> Option<CacheTable> {
@@ -320,10 +352,26 @@ impl DataPlane {
     ///
     /// # Errors
     ///
-    /// The first rank's failure, once every rank's operation has ended: a rank whose executor
-    /// closed, an operation that failed, or an executor that closed before it ran the operation.
+    /// As [`Self::each_of`].
     fn each<T: Send + 'static>(
         &self,
+        label: &str,
+        work: impl Fn(usize, &Rank) -> Work<T>,
+    ) -> Result<Vec<T>> {
+        self.each_of(None, label, work)
+    }
+
+    /// Runs the operation `work` makes for each rank of the worker groups `groups` (every rank
+    /// for `None`), given its index among all ranks, as a control operation named `label` on the
+    /// rank's executor, and returns each such rank's value in rank order.
+    ///
+    /// # Errors
+    ///
+    /// The first rank's failure, once every rank's operation has ended: a rank whose executor
+    /// closed, an operation that failed, or an executor that closed before it ran the operation.
+    fn each_of<T: Send + 'static>(
+        &self,
+        groups: Option<&[GroupId]>,
         label: &str,
         work: impl Fn(usize, &Rank) -> Work<T>,
     ) -> Result<Vec<T>> {
@@ -331,6 +379,11 @@ impl DataPlane {
         let mut submitted = Vec::with_capacity(self.ranks.len());
         for (index, rank) in self.ranks.iter().enumerate() {
             let rank = lock(rank);
+            if let Some(groups) = groups
+                && !rank.of(groups)
+            {
+                continue;
+            }
             let work = work(index, &rank);
             let (value, produced) = crossbeam_channel::bounded(1);
 
@@ -390,7 +443,8 @@ impl DataPlane {
     /// When a rank's process does not fit its quota, or NVML cannot state the process's storage.
     pub fn reserve_serving(&self) -> Result<()> {
         let mut reserved = lock(&self.reserved);
-        if !reserved.is_empty() {
+        // A data plane of no rank has no process storage to measure.
+        if !reserved.is_empty() || self.ranks.is_empty() {
             return Ok(());
         }
 
@@ -634,21 +688,7 @@ impl DataPlane {
     ///
     /// When the quota or the device cannot be read.
     pub fn room(&self) -> Result<Vec<Room>> {
-        self.ranks
-            .iter()
-            .map(|rank| {
-                let rank = lock(rank);
-                let (quota, _) = rank.client.usage(rank.device)?;
-                let free = rank.device.memory_info()?.free;
-
-                Ok(Room {
-                    quota: quota
-                        .limit
-                        .map_or(free, |limit| limit.saturating_sub(quota.usage())),
-                    free,
-                })
-            })
-            .collect()
+        self.ranks.iter().map(|rank| room_of(&lock(rank))).collect()
     }
 
     /// The bytes of device storage the graph pools map, on the device that maps the fewest: what
@@ -969,16 +1009,30 @@ impl DataPlane {
     }
 
     /// The ranks' side of a release from segment `first` on (module documentation): every rank
-    /// unmaps the segments of its KV planes from `first` on and ends its retention of them. The
-    /// head has withdrawn them, so no region holds a unit of them and no job addresses them.
-    /// Returns each rank's segment table; none for a rank that keeps no cache or whose planes
-    /// are not split, which has nothing to release.
+    /// of the worker groups `groups`, which state the region, unmaps the segments of its KV
+    /// planes from `first` on and ends its retention of them. The head has withdrawn them, so no
+    /// region holds a unit of them and no job addresses them. Segments given back already are
+    /// not given back twice. Returns each such rank's segment table; none for a rank that keeps
+    /// no cache or whose planes are not split, which has nothing to release.
     ///
     /// # Errors
     ///
-    /// For segments a predecessor epoch writes, or when the Storage Server refuses.
-    pub fn release_segments(&self, first: u32) -> Result<Vec<Option<CacheTable>>> {
-        self.each("releasing the KV planes' segments", |_, rank| {
+    /// When the Storage Server refuses.
+    pub fn release_segments(
+        &self,
+        groups: &[GroupId],
+        first: u32,
+    ) -> Result<Vec<Option<CacheTable>>> {
+        self.release_of(Some(groups), first)
+    }
+
+    /// [`Self::release_segments`] on the ranks of `groups`, or on every rank for `None`.
+    fn release_of(
+        &self,
+        groups: Option<&[GroupId]>,
+        first: u32,
+    ) -> Result<Vec<Option<CacheTable>>> {
+        self.each_of(groups, "releasing the KV planes' segments", |_, rank| {
             let cache = rank.cache.as_ref().map(Arc::clone);
             let client = Arc::clone(&rank.client);
 
@@ -999,17 +1053,30 @@ impl DataPlane {
         })
     }
 
-    /// The ranks' side of creating given-back segments (module documentation): every rank creates
-    /// the first `limit` segments of its KV planes it gave back, or all of them, at their
-    /// addresses, and resets their units. Returns each rank's segment table, from which the head
-    /// grants the segments held now; none for a rank that keeps no cache or whose planes are not
-    /// split.
+    /// The ranks' side of creating given-back segments (module documentation): every rank of the
+    /// worker groups `groups`, which state the region, creates the first `limit` segments of its
+    /// KV planes it gave back, or all of them, at their addresses, and resets their units.
+    /// Returns each such rank's segment table, from which the head grants the segments held now;
+    /// none for a rank that keeps no cache or whose planes are not split.
     ///
     /// # Errors
     ///
     /// When the Storage Server or the device refuses; a rank's planes are then as they were.
-    pub fn create_segments(&self, limit: Option<u32>) -> Result<Vec<Option<CacheTable>>> {
-        self.each("creating the KV planes' segments", |_, rank| {
+    pub fn create_segments(
+        &self,
+        groups: &[GroupId],
+        limit: Option<u32>,
+    ) -> Result<Vec<Option<CacheTable>>> {
+        self.create_of(Some(groups), limit)
+    }
+
+    /// [`Self::create_segments`] on the ranks of `groups`, or on every rank for `None`.
+    fn create_of(
+        &self,
+        groups: Option<&[GroupId]>,
+        limit: Option<u32>,
+    ) -> Result<Vec<Option<CacheTable>>> {
+        self.each_of(groups, "creating the KV planes' segments", |_, rank| {
             let cache = rank.cache.as_ref().map(Arc::clone);
             let client = Arc::clone(&rank.client);
             let stream = rank.stream.clone();
@@ -1027,45 +1094,133 @@ impl DataPlane {
         })
     }
 
+    /// The segment table of the KV planes of every rank of the worker groups `groups`, as the
+    /// rank holds it now, in rank order; none for a rank that keeps no cache or whose planes are
+    /// not split. What the head grants after a wake, which creates every rank's segments at once.
+    pub fn segment_tables(&self, groups: &[GroupId]) -> Vec<Option<CacheTable>> {
+        self.ranks
+            .iter()
+            .map(|rank| lock(rank))
+            .filter(|rank| rank.of(groups))
+            .map(|rank| {
+                let cache = rank.cache.as_ref()?;
+                segment_table(&lock(cache))
+            })
+            .collect()
+    }
+
+    /// How many of the segments the ranks of the worker groups `groups` gave back, counted from
+    /// the first of them, every such rank has room for in its GPU's quota and on its device: what
+    /// a grow creates ([`Self::create_segments`]). Zero when a rank has none given back or no
+    /// room for the first, and when no rank of the groups splits its planes.
+    ///
+    /// # Errors
+    ///
+    /// When a rank's quota or device cannot be read.
+    pub fn fitting_segments(&self, groups: &[GroupId]) -> Result<u32> {
+        let mut fitting: Option<u32> = None;
+        for (_, room, table, unit_bytes) in self.segment_facts(groups)? {
+            // The bytes the next given-back segments take on this rank, the first of them first.
+            let given_back = table.segments.iter().skip(table.held as usize);
+            let mut bytes: u64 = 0;
+            let mut fits: u32 = 0;
+            for segment in given_back {
+                bytes = bytes.saturating_add(u64::from(segment.units).saturating_mul(unit_bytes));
+                if !room.holds(bytes, 0) {
+                    break;
+                }
+                fits += 1;
+            }
+            fitting = Some(fitting.map_or(fits, |fitting| fitting.min(fits)));
+        }
+        Ok(fitting.unwrap_or(0))
+    }
+
+    /// The room of the device of every rank of the worker groups `groups` whose KV planes are
+    /// split, in rank order: its GPU's identity, its room, and the device bytes one unit of its
+    /// planes takes, which a release of a unit gives back to the quota and the device alike. What
+    /// a release to make room for other storage decides from.
+    ///
+    /// # Errors
+    ///
+    /// When a rank's quota, device or identity cannot be read.
+    pub fn device_rooms(&self, groups: &[GroupId]) -> Result<Vec<([u8; 16], Room, u64)>> {
+        Ok(self
+            .segment_facts(groups)?
+            .into_iter()
+            .map(|(gpu, room, _, unit_bytes)| (gpu, room, unit_bytes))
+            .collect())
+    }
+
+    /// What a segment decision reads of each rank of the worker groups `groups` whose KV planes
+    /// are split, in rank order.
+    fn segment_facts(&self, groups: &[GroupId]) -> Result<Vec<SegmentFacts>> {
+        let mut facts = Vec::new();
+        for rank in &self.ranks {
+            let rank = lock(rank);
+            if !rank.of(groups) {
+                continue;
+            }
+            let Some(cache) = rank.cache.as_ref() else {
+                continue;
+            };
+            let (table, unit_bytes) = {
+                let cache = lock(cache);
+                (segment_table(&cache), cache.unit_bytes())
+            };
+            let Some(table) = table else {
+                continue;
+            };
+
+            facts.push((rank.device.uuid()?.0, room_of(&rank)?, table, unit_bytes));
+        }
+        Ok(facts)
+    }
+
     /// The ranks' side of a sleep (module documentation): the graph pools are suspended and every
-    /// segment of the KV planes is released. Returns each rank's segment table.
+    /// segment of every rank's KV planes is released. Returns each rank's segment table.
     ///
     /// # Errors
     ///
     /// As [`Self::suspend_graphs`] and [`Self::release_segments`]; a wake undoes what was done.
     pub fn sleep(&self) -> Result<Vec<Option<CacheTable>>> {
         self.suspend_graphs()?;
-        let tables = self.release_segments(0)?;
+        let tables = self.release_of(None, 0)?;
 
         tracing::info!("the ranks sleep: their graph storage and KV planes are given back");
         Ok(tables)
     }
 
     /// The ranks' side of a wake (module documentation): what [`Self::sleep`] gave back is mapped
-    /// again. Returns each rank's segment table, from which the head grants every segment.
+    /// again on every rank. Returns each rank's segment table, from which the head grants every
+    /// segment.
     ///
     /// # Errors
     ///
     /// As [`Self::restore_graphs`] and [`Self::create_segments`].
     pub fn wake(&self) -> Result<Vec<Option<CacheTable>>> {
         self.restore_graphs()?;
-        self.create_segments(None)
+        self.create_of(None, None)
     }
 
-    /// Has the cache's and the state's own launches use `kernels`, the generation that serves,
-    /// from the rank's next job on: what the engine does on every rank after it switched, committed
-    /// or rolled back a generation, since no executor job sets it.
+    /// Has each rank's cache and state launch their own work from the generation the rank's
+    /// graphs serve, from the rank's next job on: what the engine does after it switched or
+    /// rolled back a generation, since no executor job sets it. Each rank takes its own device's
+    /// generation, whose kernels its context loaded.
     ///
     /// # Errors
     ///
     /// When a rank's executor is gone.
-    pub fn set_kernels(&self, kernels: &Arc<ops::Generation>) -> Result<()> {
+    pub fn set_kernels(&self) -> Result<()> {
         self.each("setting the cache's and the state's kernels", |_, rank| {
             let cache = rank.cache.as_ref().map(Arc::clone);
             let state = rank.state.as_ref().map(Arc::clone);
-            let kernels = Arc::clone(kernels);
 
-            Box::new(move |_: &mut [Box<dyn Runner>]| {
+            Box::new(move |runners: &mut [Box<dyn Runner>]| {
+                // Every runner of a device serves one generation: the switch moves them together.
+                let Some(kernels) = runners.first().map(|runner| runner.graphs().kernels()) else {
+                    return Ok(());
+                };
                 if let Some(cache) = cache {
                     lock(&cache).set_kernels(Arc::clone(&kernels));
                 }

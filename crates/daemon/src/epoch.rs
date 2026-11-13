@@ -243,6 +243,7 @@ impl Failure {
             | Kind::Committed(_)
             | Kind::RolledBack(_)
             | Kind::Drained(_)
+            | Kind::Shrunk(_)
             | Kind::PrepareFailed(_) => None,
         }
     }

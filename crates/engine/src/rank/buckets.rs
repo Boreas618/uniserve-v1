@@ -5,22 +5,6 @@ use ipc::batch::Phase;
 use ipc::capacity::variants;
 use worker::buckets::Buckets;
 
-/// The catalogue of prefill buckets a rank captures, and where its bound came from.
-///
-/// The bound is the largest token count any captured bucket holds, which is also the ceiling a
-/// policy's `max_num_batched_tokens` is checked against: a policy that wants a wider step
-/// than the rank's graphs can serve is refused, and the refusal is only actionable when it says
-/// which figure came from which place. `stated` separates the deployment's own
-/// `cuda_graph.prefill_token_sizes` from the build's default catalogue, because a deployment that
-/// configured none cannot find its bound in its own launch file.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct PrefillBound {
-    /// The largest prefill token count any captured bucket holds.
-    pub(crate) bound: u32,
-    /// Whether the deployment stated the sizes rather than taking the build's default catalogue.
-    pub(crate) stated: bool,
-}
-
 /// The refusal a stated graph tier earns, if any.
 ///
 /// The two bounds are not the same kind of thing, and this is where that is decided:

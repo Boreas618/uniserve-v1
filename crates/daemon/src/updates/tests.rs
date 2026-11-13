@@ -243,6 +243,7 @@ fn names(commands: &[command::Kind]) -> Vec<&'static str> {
             command::Kind::Promote(_) => "promote",
             command::Kind::Pause(_) => "pause",
             command::Kind::Serve(_) => "serve",
+            command::Kind::Grow(_) => "grow",
         })
         .collect()
 }

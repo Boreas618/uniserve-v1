@@ -228,6 +228,12 @@ impl Policy {
         }
     }
 
+    /// The trial of the last switch ends in its favour (SD §3.9): the module and arguments it
+    /// replaced are dropped, and nothing is left to roll back to.
+    pub fn commit(&mut self) {
+        self.previous = None;
+    }
+
     /// One step's decision (SD §5.2): every request marked since the last step is told once as
     /// `Updated` with its view now (and its mark cleared), the step's events go to `observe`, and
     /// `dispatch` is asked with `room`. `groups` are the scheduler's, which a view reads.
@@ -673,7 +679,7 @@ impl Scheduler {
 }
 
 #[cfg(test)]
-pub(super) mod tests {
+pub(crate) mod tests {
     use std::path::PathBuf;
     use std::process::Command;
     use std::sync::OnceLock;
@@ -687,7 +693,7 @@ pub(super) mod tests {
     /// `wasm32-unknown-unknown` from this tree once per test process, into a target directory of
     /// their own (`it-policy`, as `testkit` builds `fcfs`), and each compiled on first use by the
     /// engine `scheduling::Engine` configures.
-    pub(in super::super) fn packaged(name: &str) -> Arc<Module> {
+    pub(crate) fn packaged(name: &str) -> Arc<Module> {
         const NAMES: [&str; 3] = ["fcfs", "priority", "fixture"];
         static BUILT: OnceLock<PathBuf> = OnceLock::new();
         static MODULES: [OnceLock<Arc<Module>>; 3] = [const { OnceLock::new() }; 3];
@@ -728,7 +734,7 @@ pub(super) mod tests {
     /// A module that speaks the interface's exports, whose `sched_init` runs `body` (a `wat`
     /// expression of type `i64`), whose `sched_limits` and `sched_dispatch` reply `{}` (every limit
     /// at its default; a decision that names nothing) and whose other exports reply nothing.
-    pub(in super::super) fn toy(body: &str) -> Arc<Module> {
+    pub(crate) fn toy(body: &str) -> Arc<Module> {
         // The `{}` reply lies at 2048: `ptr << 32 | len`.
         let empty = (2048_u64 << 32) | 2;
         let text = format!(

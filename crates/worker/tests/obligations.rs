@@ -1115,16 +1115,13 @@ fn executor(
 struct Peers {
     listener: ipc::Listener,
     liveness: Arc<Liveness>,
-    _waker: ipc::Waker,
 }
 
 impl Peers {
     fn new() -> Self {
-        let waker = ipc::Waker::new().unwrap();
         Self {
             listener: ipc::Listener::bind(&["127.0.0.1:0"]).unwrap(),
-            liveness: Liveness::new(waker.wake(), DAY),
-            _waker: waker,
+            liveness: Liveness::new(Arc::new(|| {}), DAY),
         }
     }
 }
@@ -1136,7 +1133,6 @@ struct Group {
     watch: Arc<Watch>,
     remote: Arc<Remote>,
     upstream: Upstream,
-    _waker: ipc::Waker,
 }
 
 impl Group {
@@ -1189,8 +1185,7 @@ impl Group {
 
         // The scheduler node: its rank 0, and the link that holds rank 1.
         let (near, near_ends) = executor(0, 0, &sequences, &watch);
-        let waker = ipc::Waker::new().unwrap();
-        let remote = Remote::spawn(first, channel, Liveness::new(waker.wake(), DAY)).unwrap();
+        let remote = Remote::spawn(first, channel, Liveness::new(Arc::new(|| {}), DAY)).unwrap();
         let route = Executors::new(
             vec![sequences],
             vec![near],
@@ -1204,7 +1199,6 @@ impl Group {
             watch,
             remote,
             upstream,
-            _waker: waker,
         }
     }
 

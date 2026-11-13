@@ -1,591 +1,712 @@
-//! Starting and closing an engine process: the control thread's connections, the ranks' load,
-//! the device workers, the schedulers, and the first generation, which the launch file's module
-//! set names; and the orderly close that ends them.
+//! The started epoch of a main process, [`Engine`], and how it is built and ended.
 //!
-//! A start is not an update. The process is built `Starting`, begins preparing the module set
-//! as its first generation, and then runs its ordinary loop: when the preparation completes the
-//! generation is installed with nothing kept, and when its captures complete the start ends -
-//! parked for an engine launched beside a serving one, serving otherwise.
+//! An engine has two sides. The schedulers' side is one [`Scheduler`] per data-parallel rank on
+//! a thread of its own, each over its end of a queue pair of the epoch's session with the buffer
+//! pool and an executor of its worker groups, and the routing policy of a node with several.
+//! [`Engine::new`] builds it over a session and one executor per scheduler, which is where the
+//! binary and a test of the control thread part: the binary's executors are the ranks', a test's
+//! are fakes, and everything above them is the same. The ranks' side is what the rank start
+//! adds: the node's executors, the data plane over the ranks' storages, the head of the session,
+//! the Build Server and the links to the epoch's other main processes.
+//!
+//! [`start`] is the binary's construction (`specs/engine-worker-port.md` §1.1,
+//! `specs/buffer-pool.md` §14.1): the ranks load to the division of their GPUs' quotas, the head
+//! opens the session stating each region's units with no segment, every rank maps the segments
+//! the answer states and creates the rest, the head grants what was created, the executors are
+//! spawned and warm, the schedulers are built over them, and each grows its KV regions into the
+//! granted segments. A start is not an update (`specs/updates.md` §2): the generation it serves
+//! is [`FIRST_GENERATION`], with nothing kept beside it.
+//!
+//! [`Engine::close`] ends the epoch in the order its parts depend on one another: the schedulers,
+//! then the executors, the peer links, the session, and the devices' contexts.
 
+use std::collections::{BTreeMap, BTreeSet};
+use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::AtomicU64;
 use std::sync::{Arc, Mutex};
+use std::thread::JoinHandle;
 use std::time::Duration;
 
 use anyhow::{Context as _, Result, bail};
-use build_server::Client;
-use proto::config::EngineArgs;
-use worker::blocking::{BlockingKind, ThreadPool};
-use worker::control::{Control, Endpoints};
-use worker::runners::products::GroupProducts;
-use worker::watchdog::Watchdog;
+use build_server::Target;
+use crossbeam_channel::{Receiver, Sender};
+use ipc::Capacity;
+use ops::Generation;
+use platform::DeviceId;
+use proto::config::{EngineArgs, SchedulerConfig, WorkerGroupConfig};
+use proto::request::GenerationLimits;
+use scheduling_guest::limits::{Limits, Parameters};
+use scheduling_guest::view::{RankView, Snapshot};
+use storage::QueuePair;
+use storage::runtime::{GroupId, Open, Opened};
+use worker::Executor;
+use worker::completion::Outcome;
+use worker::executor::Executors;
+use worker::executor::peers::{Liveness, Remote, Upstream};
 
-use super::claim::claim;
-use super::device_command;
-use super::generation::Generations;
-use super::launch::{Epoch, ProcessInterface, handshake};
-use super::lifecycle::State;
-use super::ranks::{Backing, LoadedRank, Meeting, load_ranks};
-use super::reports::{announce, state_failure};
-use super::{MainProcess, Peers};
-use crate::modules::load::ModuleWork;
+use super::epoch;
+use super::ranks::{
+    Backing, FIRST_GENERATION, LoadedRank, Meeting, bind, capacities, group_numbers, layout,
+    load_ranks, open_ranks, spawn,
+};
+use crate::data_plane::{DataPlane, Target as LoadTarget};
+use crate::executor::{Groups, Shadow};
+use crate::modules::load;
 use crate::rank::ModelRunner;
+use crate::rank::text::Keys;
+use crate::scheduler::{self, Message, Output, Policy, Scheduler};
+use crate::storage_client::StorageClient;
 
-impl MainProcess {
-    /// Connects to the daemon, loads the epoch's model, and starts the epoch's threads in the order
-    /// the architecture lists them (`docs/architecture.md`, The threads of a main process).
-    ///
-    /// The epoch's configuration is resolved against this process's launch first
-    /// ([`ModelRunner`]), because three of the things the main process needs are the
-    /// node's rather than the epoch's: which devices it serves, where its Build
-    /// Server is, and what those devices measure.
-    pub(super) fn start(launch: &EngineArgs, catalogue: &nn::family::Catalogue) -> Result<Self> {
-        let build = &launch.engine_config;
-        let family = crate::resolve(catalogue, Path::new(&launch.engine_config.model.model))?;
-        let model_runner = ModelRunner::of(launch, family)?;
-        let mut control = Control::connect(
-            &Endpoints {
-                requests: launch.requests.clone(),
-            },
-            launch.engine,
-        )?;
-        // The request interface's handshake: this process says who it is, and the
-        // daemon replies with the epoch this node serves.
-        // The epoch this rank belongs to is the daemon's, and it decides the storage this process
-        // claims. A zero epoch names no epoch, and a world whose processes do not divide its ranks
-        // between them is another deployment's: each is refused here, by name, rather than at the
-        // claim or the first collective.
-        if launch.epoch == 0 {
-            bail!("the launch file states epoch 0, which names no epoch for this rank to serve");
-        }
-        if let Some(world) = &launch.world {
-            if world.peers == 0 {
-                bail!("the launch file states a world of several hosts with no peer main process");
-            }
-            if launch.scheduler_node != world.inherited.is_some() {
-                bail!(
-                    "the scheduler node's main process, and only it, inherits the world's reserved \
-                     sockets: this one is{} the scheduler node",
-                    if launch.scheduler_node { "" } else { " not" }
-                );
-            }
-        } else if !launch.scheduler_node {
-            bail!("a main process that holds every rank of its group holds its schedulers too");
-        }
-        let epoch = handshake(&mut control, launch)?;
-        // The daemon's launch path waits for the state this start ends in. `STARTING` goes out
-        // before the model load, which is minutes long, so the daemon's log and the caller's show
-        // a process that is alive rather than one that vanished after the storage claim.
-        announce(
-            &mut control,
-            proto::request::wire::EngineState::Starting,
-            None,
-        )?;
-        // The daemon waits for what this process became, so a start that fails says why: the
-        // process ends and its connection closes, which says only that it went.
-        let mut control = Some(control);
-        let started = Self::load(&mut control, model_runner, epoch, launch, build);
-        if let (Err(error), Some(control)) = (&started, control.as_mut()) {
-            state_failure(control, &format!("{error:#}"));
-        }
-        started
-    }
-
-    /// Everything of a start past the handshake. It takes `control` for the process it builds, and
-    /// leaves it to the caller when it fails before that.
-    fn load(
-        control: &mut Option<Control>,
-        model_runner: ModelRunner,
-        epoch: Epoch,
-        launch: &EngineArgs,
-        build: &proto::config::EngineConfig,
-    ) -> Result<Self> {
-        let connected = control
-            .as_mut()
-            .context("a main process starts on the connection it opened")?;
-        // The daemon's two interfaces are two sockets: the epoch's requests and metrics travel on
-        // the request connection above, and everything the daemon asks of this process - the claim,
-        // its reports, and every command - travels on this one.
-        let mut process = ProcessInterface::connect(
-            &launch.processes,
-            &launch.engine_config.deployment,
-            launch.engine,
-        )?;
-        // Every command arrives on this socket: the control thread blocks on it as it does on
-        // the request socket.
-        connected.watch_process(Some(process.connection.descriptor()));
-
-        // The rank's Storage Server and its claim are the node's, which the daemon holds for it;
-        // the retained weights outlive the epoch, so the store is built once, before the model
-        // loads, and keeps what it maps for the process's life.
-        // A host tier is the build config's, and it needs prefix caching to have pages to keep.
-        let host_kv_cache = build.kv_cache.host_tier && build.kv_cache.prefix_caching;
-        // CUPTI accepts one subscriber per process, and what it observes begins at the subscription,
-        // so the process subscribes before it loads a module (`docs/profiling.md`).
-        worker::profiling::counters::subscribe();
-        // This process serves every rank of its node, each on its own device.
-        let rank_runners = model_runner.ranks()?;
-        let rank_numbers: Vec<u32> = rank_runners.iter().map(ModelRunner::rank).collect();
-        // The epoch's other main processes, before any rank loads: the ranks' host group and their
-        // communicators span every host, so each process must know the others are there first.
-        let (meeting, links) = meet(launch)?;
-        let storage = claim(
-            &mut process,
-            launch,
-            &epoch.host,
-            host_kv_cache,
-            &rank_numbers,
-        )?;
-        let ranks = load_ranks(
-            rank_runners,
-            Backing::Serving(&storage),
-            launch,
-            &epoch,
-            meeting,
-        )?;
-
-        // The resident owners are opened before any thread that borrows them, and
-        // released in reverse order by `close`. The weights are mapped before the pools are
-        // sized, so the sizing sees a device with the model already in it - the figure it
-        // computes is what is left, not what was there before the load. Pools sized first and
-        // weights after would over-commit the device by exactly the model's size.
-        let blocking = ThreadPool::new(model_runner.blocking_limits());
-        let modules = blocking.lane::<ModuleWork>(BlockingKind::ModuleLoad)?;
-        let packages = Arc::new(Mutex::new(Client::connect(model_runner.build_server())?));
-
-        // The watchdog exists before any device command: `start`'s own commands
-        // are bounded by the same stall bound as every command the control thread
-        // issues afterwards.
-        let watchdog = Watchdog::new(
-            launch
-                .watchdog_timeout()
-                .unwrap_or_else(|| model_runner.watchdog_timeout()),
-        )?;
-
-        let mut workers = Vec::with_capacity(model_runner.devices().len());
-        let mut generations = Vec::with_capacity(model_runner.devices().len());
-        // A rank with no device serves nothing, and saying it here names the deployment's fault
-        // rather than leaving the pool's figure to a sizing that never ran.
-        if model_runner.devices().is_empty() {
-            bail!("this rank serves no device");
-        }
-        // Every capture of this process carries the range markers the deployment names, and the
-        // graphs keep them for good: only their switch changes while the process serves.
-        if !epoch.profiling.fence_components.is_empty() {
-            worker::profiling::fences::Fences::install(
-                model_runner.devices(),
-                epoch.profiling.fence_components.clone(),
-                epoch.profiling.fence_probes,
-                &epoch.profiling.fence_probes_off,
-            )
-            .context("installing the range markers")?;
-        }
-        // CUPTI attributes a graph kernel's PC samples only when sampling was enabled before the
-        // graph was captured.
-        if epoch.profiling.graph_pc_sampling {
-            for device in model_runner.devices() {
-                let context = platform::PrimaryContext::retain(*device)?;
-                worker::profiling::pc_sampling::enable(&context)
-                    .context("enabling PC sampling for this rank's graphs")?;
-            }
-        }
-        let mut memories = Vec::with_capacity(ranks.len());
-        let mut clients = Vec::with_capacity(ranks.len());
-        let mut models = Vec::with_capacity(ranks.len());
-        let mut inventories = Vec::with_capacity(ranks.len());
-        let mut data_ranks = Vec::with_capacity(ranks.len());
-        let first_plan = ranks
-            .first()
-            .map(|rank| rank.model_runner.scheduled())
-            .context("this process serves no rank")?;
-        // Each rank of an expert union is a scheduler's own; the ranks of a media group are one
-        // pool, which the first rank describes.
-        let union = first_plan.union().map(|(union, _)| Arc::clone(union));
-        let mut scheduled = Vec::with_capacity(ranks.len());
-        // The group's products, which every rank's runners reach through their own view of them.
-        let group_products = GroupProducts::new(ranks.len());
-        // The worker group of each device, in the order `workers` holds them.
-        let mut groups: Vec<String> = Vec::with_capacity(ranks.len());
-        let placed_groups: Vec<String> = ranks
-            .iter()
-            .map(|rank| rank.model_runner.group().to_owned())
-            .collect();
-        for (rank_index, mut rank) in ranks.into_iter().enumerate() {
-            // The ranks of its group this process holds, which the scheduler counts as one.
-            let group_ranks = placed_groups
-                .iter()
-                .filter(|group| **group == placed_groups[rank_index])
-                .count();
-            let spawned = rank.spawn_workers(
-                (rank_index, group_ranks),
-                &group_products,
-                epoch.generation,
-                &blocking,
-            )?;
-            let LoadedRank {
-                model_runner: rank_runner,
-                weights,
-                client,
-                model,
-                memory,
-                inventory,
-                ..
-            } = rank;
-            let client = client.context("a serving rank holds its Storage Server client")?;
-            for (device, worker, generation) in spawned {
-                // A preparation shadows a replaced operator beside the serving one, so the region
-                // it runs in is mapped before any batch: the worker reserves it from the scratch
-                // pool the graph storage sized. Nothing is serving yet, so the control thread
-                // waits here; `serve` never does.
-                //
-                // The captures are not here: the generation the worker starts with holds no
-                // kernel, and the first one with kernels is prepared once this process is built.
-                let shadow = worker.set_shadow()?;
-                device_command(&watchdog, device, "shadow region", shadow)
-                    .with_context(|| format!("mapping the shadow region of device {}", device.0))?;
-                // The park's and the wake's commands reach the Storage Server's quota from the
-                // device thread, which owns the stream a wake resets its units on, so the client is
-                // bound beside the cache handle rather than kept only here.
-                worker.bind_storage(Arc::clone(&client));
-                if let Some((union, member)) = rank_runner.union() {
-                    union.bind(
-                        member,
-                        Arc::clone(worker.queue()),
-                        worker::runner::RunnerId(0),
-                    )?;
-                }
-                let worker = Arc::new(worker);
-                data_ranks.push(crate::data_plane::Rank {
-                    rank: rank_runner.rank(),
-                    worker: Arc::downgrade(&worker),
-                    device,
-                    storage: Arc::clone(&client),
-                    cache: memory.shared_cache(),
-                    model: Arc::new(crate::rank::RankModel::new(rank_runner.clone())),
-                    serving: weights.clone(),
-                    host: epoch.host.clone(),
-                });
-                workers.push(worker);
-                groups.push(rank_runner.group().to_owned());
-                generations.push(generation);
-            }
-            scheduled.push(rank_runner.scheduled());
-            memories.push(memory);
-            clients.push(client);
-            models.push(model);
-            inventories.push(inventory);
-        }
-
-        // The quota comes after the load: what a process holds to serve at all is the deployment's
-        // statement, and what the quota governs is what it retains beside that.
-        for rank in &data_ranks {
-            rank.storage
-                .state_quota(rank.device, build.mem_fraction_static)
-                .context("stating this rank's quota of its device")?;
-        }
-        // The storage operations and the loads that change what the ranks hold.
-        let data = Arc::new(crate::data_plane::DataPlane::new(
-            data_ranks,
-            crate::data_plane::Target {
-                checkpoint: PathBuf::from(&launch.engine_config.model.model),
-                experts: epoch.experts.clone(),
-            },
-            build.mem_fraction_static,
-        ));
-        // Each device with the worker group its rank serves in, which routes a batch to it.
-        let placed: Vec<(String, Arc<worker::device::Worker>)> = groups
-            .iter()
-            .cloned()
-            .zip(workers.iter().map(Arc::clone))
-            .collect();
-        // The links to the epoch's other main processes, over the channels `meet` opened: on the
-        // scheduler node one per peer, which the schedulers' batches go through, and on a peer the
-        // one that runs the scheduler node's batches on this process's workers.
-        let peers = match links {
-            Links::Alone => Peers::Alone,
-            Links::Accepted(channels) => {
-                let liveness = worker::peers::Liveness::new(connected.wake());
-                let remotes = channels
-                    .into_iter()
-                    .map(|(rank, channel)| {
-                        worker::peers::Remote::spawn(rank, channel, Arc::clone(&liveness))
-                    })
-                    .collect::<worker::Result<Vec<_>>>()?;
-                Peers::Scheduler { remotes, liveness }
-            }
-            Links::Registered(channel) => {
-                let liveness = worker::peers::Liveness::new(connected.wake());
-                let ranks = Arc::new(worker::batch::Workers::shared(placed.clone())?);
-                // The scheduler node sizes a group whose first rank is this process's from
-                // that rank's report.
-                let report =
-                    super::ranks::stated_report(&inventories[0], &memories[0], &data, false)?;
-                Peers::Peer {
-                    upstream: worker::peers::Upstream::serve(
-                        channel,
-                        ranks,
-                        report,
-                        Arc::clone(&liveness),
-                    )?,
-                    liveness,
-                }
-            }
-        };
-        let remotes = match &peers {
-            Peers::Scheduler { remotes, .. } => remotes.clone(),
-            Peers::Alone | Peers::Peer { .. } => Vec::new(),
-        };
-        // This node's schedulers, one thread per DP rank, each handing its batches to the workers
-        // above through `worker::Batches`. A node that holds none keeps an empty list
-        // and serves only what the scheduler node's batches ask of it; a node that is the scheduler
-        // node and holds none would accept requests and dispatch nothing, which is refused by name.
-        let schedulers = if !launch.scheduler_node {
-            Vec::new()
-        } else if union.is_some() {
-            let mut handles = Vec::with_capacity(workers.len());
-            for (index, model_runner) in scheduled.iter().enumerate() {
-                // A dedicated expert rank takes no request: it joins the steps the others open.
-                if !model_runner.schedules() {
-                    continue;
-                }
-                let host_cache = model_runner.host_kv_cache(&models[index]);
-                let pool = super::ranks::Pool {
-                    group: groups[index].clone(),
-                    report: super::ranks::stated_report(
-                        &inventories[index],
-                        &memories[index],
-                        &data,
-                        host_cache,
-                    )?,
-                };
-                handles.push(super::ranks::scheduler(
-                    model_runner,
-                    launch,
-                    &models[index],
-                    vec![placed[index].clone()],
-                    Vec::new(),
-                    vec![pool],
-                    host_cache,
-                    connected.wake(),
-                    &data,
-                )?);
-            }
-            handles
-        } else {
-            let blocks = super::ranks::Blocks {
-                first: launch.rank as usize,
-                groups: &groups,
-                inventories: &inventories,
-                memories: &memories,
-                remotes: &remotes,
-                data: &data,
-            };
-            let mut handles = Vec::new();
-            for block in blocks.of(&first_plan, &models[0], launch)? {
-                handles.push(super::ranks::scheduler(
-                    &first_plan,
-                    launch,
-                    &models[0],
-                    placed
-                        .iter()
-                        .filter(|(group, _)| block.groups.contains(group))
-                        .cloned()
-                        .collect(),
-                    block.remotes,
-                    block.pools,
-                    block.host_cache,
-                    connected.wake(),
-                    &data,
-                )?);
-            }
-            handles
-        };
-
-        // The always-on counters: every stream a runner computes on is `device`, and the one the
-        // host KV cache's pages move on is `copy`.
-        let observed: Vec<(&'static str, platform::Stream)> = workers
-            .iter()
-            .flat_map(|worker| worker.streams().iter().cloned())
-            .map(|stream| ("device", stream))
-            .chain(
-                workers
-                    .iter()
-                    .map(|worker| ("copy", worker.copy_stream().clone())),
-            )
-            .collect();
-        let counters = worker::profiling::counters::Counters::start(
-            &observed,
-            !epoch.profiling.graph_pc_sampling,
-        );
-        let stats_reporters = (0..schedulers.len())
-            .map(|_| scheduler::SchedulerStatsReporter::default())
-            .collect();
-        // The route instance is held to the ceilings of the batch the schedulers were built for,
-        // as theirs are.
-        let router = scheduler::Router::new(
-            schedulers
-                .first()
-                .map(|handle| scheduler::ceilings_of(scheduler::BatchCapacity::of(handle.info())))
-                .unwrap_or_default(),
-        );
-        let control = control
-            .take()
-            .context("an engine process starts on the connection it opened")?;
-        let mut process = Self {
-            wake: control.wake(),
-            control,
-            peers,
-            schedulers,
-            union,
-            stats_reporters,
-            _counters: counters,
-            control_calls: platform::cupti::blocking::Calls::default(),
-            workers,
-            memory: memories,
-            storage: clients,
-            blocking,
-            modules,
-            state: State::new(launch.engine, Generations::new(generations)),
-            starts_parked: launch.parked(),
-            watchdog,
-            packages,
-            preparing: None,
-            switching: None,
-            draining: None,
-            daemon_closed: false,
-            announced: None,
-            noted_process_closed: false,
-            router,
-            route_prepared: None,
-            targets: model_runner.targets().to_vec(),
-            build_server: model_runner.build_server().to_path_buf(),
-            process,
-            streams: Vec::new(),
-            max_running_requests: u32::try_from(build.max_running_requests.get())
-                .unwrap_or(u32::MAX),
-            prefill_bound: model_runner.prefill_catalogue(),
-            standby_storage: launch.standby_storage,
-            graphs_suspended: false,
-            parked: None,
-            paused: false,
-            data,
-            operations: Vec::new(),
-            weights: None,
-            asleep: false,
-        };
-        // The engine's first generation: the kernel and policy packages the launch file's
-        // module set names, for every key this node's devices launch. Nothing serves and nothing
-        // is admitted until it executes and its graphs are captured.
-        let generation = process.state.generations.next();
-        let modules = &launch.modules;
-        if let Some(failure) =
-            process.start_prepare(generation, &modules.kernels, &modules.policy)?
-        {
-            bail!(
-                "the engine's first generation could not be prepared: {}",
-                failure.reason()
-            );
-        }
-        Ok(process)
-    }
-
-    /// Ends the start: the first generation executes on every device, its captures finished and
-    /// every scheduler decides by its policy. An engine launched beside a serving one parks, with
-    /// its graph pools kept as its launch states; any other serves.
-    pub(super) fn finish_start(&mut self) -> Result<()> {
-        // The first generation has nothing before it, so its policy is the serving one at once.
-        self.commit_policy();
-        if self.starts_parked {
-            self.park_graph_storage()?;
-        } else {
-            self.open_admission()
-                .context("opening admission at the end of the start")?;
-        }
-        let report = self.state.started(self.starts_parked);
-        self.send_report(report);
-        self.announce(true)
-    }
-
-    /// Keeps a parked engine's graph pools as its launch states (`standby_storage`): resident,
-    /// or suspended to host storage at unchanged addresses until the promotion restores them.
-    fn park_graph_storage(&mut self) -> Result<()> {
-        match self.standby_storage {
-            proto::request::StandbyStorage::Suspended => {
-                self.data
-                    .suspend_graphs()
-                    .context("suspending the parked engine's graph pools")?;
-                self.graphs_suspended = true;
-                tracing::info!("the parked engine suspended its graph storage");
-            }
-            proto::request::StandbyStorage::Resident | proto::request::StandbyStorage::Auto => {
-                tracing::info!("the parked engine keeps its graph storage resident");
-            }
-        }
-        Ok(())
-    }
-
-    /// Stops every thread in dependency order and releases the owners.
-    pub(super) fn close(&mut self) {
-        // A shutdown finishes every request in flight as aborted, and the daemon learns that
-        // from the request's own event - a connection that closes under it says only that the
-        // process ended, not which request was lost with it. An epoch that lost another of its
-        // main processes is a loss and not a shutdown: its requests are left to the close of this
-        // connection, which the daemon reads as the engine's loss and migrates them on.
-        let streams = std::mem::take(&mut self.streams);
-        let lost = self.peers.lost().is_some();
-        for served in streams.into_iter().filter(|_| !lost) {
-            let event = proto::request::wire::Event {
-                request: served.request,
-                kind: Some(proto::request::wire::event::Kind::Error(
-                    proto::request::wire::Failed {
-                        message: "the epoch was shut down with this request in flight".to_owned(),
-                    },
-                )),
-            };
-            self.send_event(
-                served.front,
-                proto::request::wire::from_engine::Kind::Event(event),
-            );
-        }
-        // A rank that waits for its peers inside a step stops waiting: the peers are ending too.
-        if let Some(union) = &self.union {
-            union.end();
-        }
-        // The peer links close first: a scheduler waiting for a peer's response is released by
-        // the close, and the peers read it as this process's end. The schedulers go next: their
-        // `Batches` holds a clone of every worker, and a device thread cannot be joined while a
-        // scheduler could still submit to it.
-        self.peers.close();
-        self.schedulers.clear();
-        for worker in std::mem::take(&mut self.workers) {
-            let Some(worker) = Arc::into_inner(worker) else {
-                tracing::warn!(
-                    "a device worker is still held after its schedulers ended; its thread ends \
-                     when the last holder drops it"
-                );
-                continue;
-            };
-            if let Err(error) = worker.close() {
-                tracing::warn!(%error, "closing a device worker failed");
-            }
-        }
-        for error in self.blocking.close() {
-            tracing::warn!(%error, "closing a blocking lane failed");
-        }
-        // The caches a drain kept name segments of the pools below: they go before the
-        // resident owners close, so nothing the memory releases is still described as parked.
-        self.parked = None;
-        for memory in std::mem::take(&mut self.memory) {
-            if let Err(error) = memory.close() {
-                tracing::warn!(%error, "closing the resident owners failed");
-            }
-        }
-        self.control.close();
-    }
-}
+/// The device a launch names when its ranks are backed by nothing outside the process
+/// (`engine_config.device.device`): [`Backing::Meta`].
+const META_DEVICE: &str = "meta";
 
 /// How long the scheduler node waits for every peer main process to register, and a peer for the
 /// scheduler node to accept it: each starts at once and registers before it loads anything.
 const PEER_START: Duration = Duration::from_secs(300);
+
+/// The started epoch: its schedulers and the ranks they drive (module documentation).
+pub struct Engine {
+    /// One per data-parallel rank, in the order of the session's schedulers.
+    pub(crate) schedulers: Vec<SchedulerThread>,
+    /// The routing policy's instance, which chooses a new request's scheduler; `None` with one
+    /// scheduler, which every request goes to.
+    pub(crate) route: Option<Policy>,
+    /// The generation limits requests are checked against, as the schedulers took them.
+    pub(crate) limits: GenerationLimits,
+    /// What each worker group of the session serves, by its number.
+    pub(crate) capacities: Vec<(GroupId, Capacity)>,
+    /// The ceilings a policy of this engine declares its limits within: those of every group's
+    /// captured buckets.
+    pub(crate) ceilings: Limits,
+    /// The generation batches are assembled for, which the schedulers read and a switch moves.
+    pub(crate) served: Arc<AtomicU64>,
+    /// What ends the session with the buffer pool once the executors have stopped: the head's
+    /// `Close`, or whatever stands for the buffer pool in its place.
+    pub(crate) session: Box<dyn FnOnce() -> Result<()> + Send>,
+    /// The node's executors, one per rank, in rank order; empty for an engine of no rank.
+    pub(crate) executors: Vec<Arc<Executor>>,
+    /// The node's executors and peer links by worker group, which the schedulers' executors
+    /// hand their jobs to.
+    pub(crate) groups: Option<Arc<Executors>>,
+    /// The changes the engine makes to what its ranks hold; of no rank by default, so every
+    /// operation acts on none.
+    pub(crate) data: Arc<DataPlane>,
+    /// The head of the session with the buffer pool, which grants and withdraws its segments.
+    pub(crate) head: Option<Arc<Mutex<StorageClient>>>,
+    /// The Build Server's client and the targets of the node's devices, which a generation's
+    /// kernels are selected and installed through; a preparation fails without it.
+    pub(crate) build: Option<(Arc<Mutex<build_server::Client>>, Vec<Target>)>,
+    /// On the scheduler node, the links to the epoch's other main processes.
+    pub(crate) remotes: Vec<Arc<Remote>>,
+    /// On a peer, its link to the scheduler node.
+    pub(crate) upstream: Option<Upstream>,
+    /// Whether every peer link still serves, which ends the process when one is lost.
+    pub(crate) liveness: Option<Arc<Liveness>>,
+}
+
+/// One scheduler of an [`Engine`] and how the control thread reaches it.
+pub(crate) struct SchedulerThread {
+    /// The scheduler's one channel in.
+    pub(crate) inbox: Sender<Message>,
+    /// The scheduler's one channel out.
+    pub(crate) outputs: Receiver<Output>,
+    /// The shadow pass a generation update opens over the scheduler's batches.
+    pub(crate) shadow: Arc<Mutex<Shadow>>,
+    /// The thread the scheduler runs on until it stops.
+    pub(crate) thread: JoinHandle<()>,
+}
+
+impl Engine {
+    /// Each scheduler's inbox, in the order of the session's schedulers: what a job sends its
+    /// messages to.
+    pub(crate) fn inboxes(&self) -> Vec<Sender<Message>> {
+        self.schedulers
+            .iter()
+            .map(|scheduler| scheduler.inbox.clone())
+            .collect()
+    }
+
+    /// Each scheduler's shadow pass, in the order of the session's schedulers.
+    pub(crate) fn shadows(&self) -> Vec<Arc<Mutex<Shadow>>> {
+        self.schedulers
+            .iter()
+            .map(|scheduler| Arc::clone(&scheduler.shadow))
+            .collect()
+    }
+
+    /// The schedulers of the session `open` stated and `opened` answered, one per entry of
+    /// `open.schedulers` in that order, each on its thread over its end of its queue pair in
+    /// `pairs` and the executor `executor_of(index, groups, inbox)` gives it: the executor of
+    /// its worker groups `groups`, which sends to its channel `inbox`, and the shadow pass over
+    /// its batches. `capacities` is what each worker group of the session serves, by its number;
+    /// `policy` the module set's policy module and its parameters, which every scheduler and, with
+    /// several, the routing policy instantiate; `session` what ends the session.
+    ///
+    /// Each scheduler's policy is instantiated on the scheduler's own state, so the replicas and
+    /// the phases its groups serve are what it starts from. The generation batches are assembled
+    /// for is [`FIRST_GENERATION`]. The ranks' side is empty: no executor, a data plane of no
+    /// rank, no head, Build Server or peer link.
+    ///
+    /// # Errors
+    ///
+    /// A layout whose schedulers, groups or queue pairs do not match, an executor that cannot be
+    /// built, a policy that does not instantiate or declares limits outside a scheduler's
+    /// ceilings, a scheduler the startup checks refuse, or a thread that cannot start.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the schedulers' side comes from five owners: the launch, the session with its \
+                  queue pairs, the groups' capacities, the policy and the executors"
+    )]
+    pub fn new(
+        launch: &EngineArgs,
+        open: &Open,
+        opened: &Opened,
+        pairs: Vec<QueuePair>,
+        capacities: Vec<(GroupId, Capacity)>,
+        (module, parameters): (Arc<wasmtime::Module>, Parameters),
+        mut executor_of: impl FnMut(
+            usize,
+            &[GroupId],
+            Sender<Message>,
+        )
+            -> Result<(Box<dyn scheduler::Executor>, Arc<Mutex<Shadow>>)>,
+        session: Box<dyn FnOnce() -> Result<()> + Send>,
+    ) -> Result<Self> {
+        let config = &launch.engine_config;
+        if pairs.len() != open.schedulers.len() {
+            bail!(
+                "a session of {} schedulers was answered with {} queue pairs",
+                open.schedulers.len(),
+                pairs.len()
+            );
+        }
+        let (numbers, _) = group_numbers(
+            &config.parallel.worker_groups,
+            config.parallel.data_parallel_size.get(),
+        )?;
+
+        // The workers compute `max_logprobs` candidates at every position: what a request may ask
+        // for.
+        let limits = GenerationLimits {
+            max_logprobs: config.max_logprobs,
+            ..config.model.generation_limits.clone()
+        };
+        let ceilings = scheduler::ceilings(capacities.iter().map(|(_, capacity)| capacity));
+        let served = Arc::new(AtomicU64::new(FIRST_GENERATION));
+
+        // The schedulers' limits as the deployment states them, which each scheduler lowers to
+        // what its groups' executors captured; the captured sizes in tokens are the graph tiers.
+        let mut tiers: Vec<u32> = capacities
+            .iter()
+            .flat_map(|(_, capacity)| capacity.buckets.iter().map(|shape| shape.tokens))
+            .collect();
+        tiers.sort_unstable();
+        tiers.dedup();
+        let scheduling = SchedulerConfig::of(
+            config,
+            config.scheduler.max_batch.get(),
+            config
+                .max_num_batched_tokens
+                .map_or(config.scheduler.max_num_batched_tokens, NonZeroUsize::get),
+            tiers,
+        );
+
+        let mut schedulers = Vec::with_capacity(open.schedulers.len());
+        for (index, (listed, pair)) in open.schedulers.iter().zip(pairs).enumerate() {
+            // The scheduler's groups, each with its configuration and what its ranks serve.
+            let mut groups: Vec<(WorkerGroupConfig, Capacity)> = Vec::with_capacity(listed.len());
+            for id in listed {
+                let group = numbers
+                    .iter()
+                    .position(|number| number == id)
+                    .map(|position| config.parallel.worker_groups[position].clone())
+                    .with_context(|| format!("the deployment numbers no group {}", id.0))?;
+                let capacity = capacities
+                    .iter()
+                    .find(|(group, _)| group == id)
+                    .map(|(_, capacity)| capacity.clone())
+                    .with_context(|| format!("worker group {} states no capacity", id.0))?;
+                groups.push((group, capacity));
+            }
+
+            let (inbox, mailbox) = crossbeam_channel::unbounded();
+            let (output, outputs) = crossbeam_channel::unbounded();
+            let (executor, shadow) = executor_of(index, listed, inbox.clone())?;
+
+            // `Scheduler::new` takes an instance, made here on no state; the instance that
+            // serves is made on the scheduler's own state, as every later generation's is.
+            let bounds = scheduler::ceilings(groups.iter().map(|(_, capacity)| capacity));
+            let policy = Policy::new(
+                Arc::clone(&module),
+                parameters.clone(),
+                Snapshot::default(),
+                &bounds,
+            )?;
+            let mut scheduler = Scheduler::new(
+                scheduling.clone(),
+                limits.clone(),
+                open,
+                opened,
+                index,
+                pair,
+                groups,
+                policy,
+                executor,
+                output,
+                Arc::clone(&served),
+            )?;
+            let (reply, replied) = crossbeam_channel::bounded(1);
+            scheduler.apply(Message::SetPolicy(
+                Arc::clone(&module),
+                parameters.clone(),
+                reply,
+            ));
+            replied
+                .recv()
+                .context("the scheduler answered no policy")?
+                .with_context(|| format!("instantiating scheduler {index}'s policy"))?;
+            scheduler.apply(Message::CommitPolicy);
+
+            let thread = std::thread::Builder::new()
+                .name(format!("scheduler-{index}"))
+                .spawn(move || scheduler.run(mailbox))
+                .with_context(|| format!("starting scheduler {index}'s thread"))?;
+            schedulers.push(SchedulerThread {
+                inbox,
+                outputs,
+                shadow,
+                thread,
+            });
+        }
+
+        // With several schedulers the routing policy chooses each new request's, from every
+        // scheduler as a rank of its own.
+        let route = if schedulers.len() > 1 {
+            let ranks = (0..schedulers.len())
+                .map(|index| RankView {
+                    index,
+                    in_flight: 0,
+                    alive: true,
+                })
+                .collect();
+            let snapshot = Snapshot {
+                ranks,
+                ..Snapshot::default()
+            };
+            Some(Policy::new(module, parameters, snapshot, &ceilings)?)
+        } else {
+            None
+        };
+
+        Ok(Self {
+            schedulers,
+            route,
+            limits,
+            capacities,
+            ceilings,
+            served,
+            session,
+            executors: Vec::new(),
+            groups: None,
+            data: Arc::new(DataPlane::new(
+                Vec::new(),
+                LoadTarget::default(),
+                config.mem_fraction_static,
+            )),
+            head: None,
+            build: None,
+            remotes: Vec::new(),
+            upstream: None,
+            liveness: None,
+        })
+    }
+
+    /// Ends the epoch in the order its parts depend on one another:
+    ///
+    /// 1. every scheduler is told to shut down, which ends every request it holds as aborted;
+    ///    each output it sends until its channel closes goes to `forward` with the scheduler's
+    ///    index, the events of those requests among them, and its thread is joined;
+    /// 2. the executors' queues close, ending the job in flight and cancelling the rest, and
+    ///    their threads are joined;
+    /// 3. the peer links close, which the epoch's other main processes read as this one's end;
+    /// 4. the session ends ([`Engine::new`]'s `session`), the executors having stopped;
+    /// 5. the devices' primary contexts are reset, which releases the driver state the process
+    ///    created, when the engine's executors served on devices and nothing else holds the
+    ///    owners of their storage (`docs/architecture.md`, the orderly close).
+    ///
+    /// The caller makes no use of a device afterwards: this is the main process's last.
+    ///
+    /// # Errors
+    ///
+    /// The first failure: a scheduler or an executor thread that panicked, the session's end, or
+    /// a context's reset. Every step runs whatever an earlier one returned.
+    pub fn close(self, mut forward: impl FnMut(usize, Output)) -> Result<()> {
+        let Self {
+            schedulers,
+            route,
+            executors,
+            groups,
+            data,
+            head,
+            build,
+            remotes,
+            upstream,
+            liveness,
+            session,
+            ..
+        } = self;
+        let mut outcome: Result<()> = Ok(());
+
+        // A scheduler holds a sender to its own channel through its executor's waiters, so its
+        // loop ends at `Shutdown`, not when this side's sender goes.
+        for scheduler in &schedulers {
+            let _ = scheduler.inbox.send(Message::Shutdown);
+        }
+        for (index, scheduler) in schedulers.into_iter().enumerate() {
+            for output in &scheduler.outputs {
+                forward(index, output);
+            }
+            if scheduler.thread.join().is_err() {
+                outcome = outcome.and(Err(anyhow::anyhow!("scheduler {index} panicked")));
+            }
+        }
+        drop(route);
+
+        // An executor's thread holds its runners, and an expert union's runners reach the other
+        // members' executors: every queue closes before any executor is joined.
+        let devices = executors.iter().any(|executor| executor.device().is_some());
+        for executor in &executors {
+            executor.queue().close();
+        }
+        drop(groups);
+        for executor in executors {
+            match Arc::into_inner(executor) {
+                Some(executor) => {
+                    if let Err(error) = executor.close() {
+                        outcome = outcome.and(Err(error.into()));
+                    }
+                }
+                None => tracing::warn!(
+                    "an executor is still held after the engine closed; its thread ends when the \
+                     last holder drops it"
+                ),
+            }
+        }
+        // The data plane holds the owners of every rank's device storage.
+        let released = Arc::into_inner(data).is_some();
+
+        for remote in &remotes {
+            remote.close();
+        }
+        if let Some(upstream) = &upstream {
+            upstream.close();
+        }
+        drop((remotes, upstream, liveness, build));
+
+        outcome = outcome.and(session().context("ending the session with the buffer pool"));
+        drop(head);
+
+        if devices && released {
+            // SAFETY: the engine's executors are joined and the owners of their devices' storage
+            // released above; the main process makes no use of a device after its engine's close,
+            // which is its last step, and no other thread of it issues on one.
+            let reset = unsafe { platform::PrimaryContext::reset_all() };
+            outcome = outcome.and(reset.map(drop).context("resetting the devices' contexts"));
+        } else if devices {
+            tracing::warn!(
+                "the data plane is still held after the engine closed: the devices' contexts are \
+                 left to the process's exit"
+            );
+        }
+        outcome
+    }
+}
+
+/// Starts the epoch `launch` describes on this node: its ranks, the session with the buffer
+/// pool, the executors and the schedulers (module documentation). Its checkpoint is served by
+/// the family of `registry` that claims the class it declares, its ranks' storage is at the
+/// Storage Server the daemon's claim answered with (`storage`), their kernels are resolved
+/// through `build`, the Build Server's client, and `policy` is the module set's scheduling
+/// policy, resolved through the same client (`modules::load::policy`). `liveness` is what a lost
+/// peer link marks; an engine of one main process holds it nowhere.
+///
+/// The ranks load onto the meta device when the launch's `engine_config.device.device` is
+/// `meta`: nothing is allocated, no kernel is resolved, and the generation served holds none.
+///
+/// # Errors
+///
+/// What the family, a rank's load or opening, the session, a warm-up, a scheduler or the
+/// policy refuses; a rank on a device with no Build Server to resolve its kernels; and a peer
+/// main process, whose ranks map their memory from the session the scheduler node opens, which
+/// no peer frame carries to it.
+pub(crate) fn start(
+    launch: &EngineArgs,
+    registry: &nn::family::Registry,
+    storage: &ipc::StorageLaunch,
+    build: Option<Arc<Mutex<build_server::Client>>>,
+    policy: (Arc<wasmtime::Module>, Parameters),
+    liveness: Arc<Liveness>,
+) -> Result<Engine> {
+    let family = crate::resolve(registry, Path::new(&launch.engine_config.model.model))?;
+    let model_runner = ModelRunner::of(launch, family)?;
+    let meta = launch.engine_config.device.device == META_DEVICE;
+
+    // CUPTI accepts one subscriber per process, and what it observes begins at the subscription,
+    // so a process that serves on devices subscribes before it loads a module
+    // (`docs/profiling.md`).
+    if !meta {
+        worker::profiling::counters::subscribe();
+    }
+
+    // The epoch's other main processes, before any rank loads: the ranks' host group and their
+    // communicators span every host, so each process must know the others are there first.
+    let config = &launch.engine_config.parallel;
+    let (numbers, _) = group_numbers(&config.worker_groups, config.data_parallel_size.get())?;
+    let (meeting, links) = meet(launch)?;
+    let remotes = match links {
+        Links::Alone => Vec::new(),
+        Links::Accepted(channels) => {
+            let mut remotes = Vec::with_capacity(channels.len());
+            for (rank, channel) in channels {
+                let held = held_groups(&config.worker_groups, &numbers, rank)?;
+                remotes.push((held, Remote::spawn(rank, channel, Arc::clone(&liveness))?));
+            }
+            remotes
+        }
+        Links::Registered(channel) => {
+            drop(channel);
+            bail!(
+                "this main process is a peer of its epoch's scheduler node, and its ranks map \
+                 their memory from the session the scheduler node opens, which no peer frame \
+                 carries"
+            )
+        }
+    };
+
+    // Step 9 of each rank: the kernels its profile run names, selected for the devices'
+    // architectures and installed on its own device as the start's generation.
+    let targets = if meta {
+        Vec::new()
+    } else {
+        model_runner.targets()?
+    };
+    let resolve = |device: DeviceId, keys: &Keys| -> Result<Arc<Generation>> {
+        let build = build
+            .as_ref()
+            .context("the start holds no Build Server client to resolve a device's kernels")?;
+        let mut by_operator: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+        for (operator, key) in keys {
+            by_operator
+                .entry((*operator).to_owned())
+                .or_default()
+                .insert(key.clone());
+        }
+
+        let mut client = worker::lock(build);
+        let (packages, routes) =
+            load::select(&mut client, &targets, &launch.modules.kernels, &by_operator)?;
+        let entries = load::install(&mut client, device, &packages, &routes)?;
+        Ok(Arc::new(Generation::new(FIRST_GENERATION, entries)))
+    };
+    let backing = if meta {
+        Backing::Meta
+    } else {
+        Backing::Serving {
+            storage,
+            kernels: &resolve,
+        }
+    };
+    let mut ranks = load_ranks(model_runner.ranks()?, backing, launch, meeting)?;
+
+    // The session, opened before the ranks map memory: its device KV regions state no segment.
+    let open = session_layout(launch, &ranks)?;
+    let mut head = StorageClient::connect(
+        Path::new(&storage.socket),
+        &launch.engine_config.deployment,
+        launch.epoch,
+    )?;
+    let pairs = head.open(open.clone())?;
+    let opened = head
+        .session()
+        .map(|(_, opened)| opened.clone())
+        .context("the session with the buffer pool is not open")?;
+
+    // Every rank maps the segments the answer states and creates the rest, which the head
+    // grants once every rank holds them.
+    let created = open_ranks(&mut ranks, &open, &opened.segments)?;
+    for (region, segments) in &created {
+        for &(segment, first, units) in segments {
+            head.grant(region, segment, first, units)?;
+        }
+    }
+    bind(&ranks, &open, &opened)?;
+    let (route, executors) = spawn(&mut ranks, &head, &pairs, remotes.clone())?;
+
+    // Range markers and PC sampling attach to what a graph captures, so they precede the
+    // captures of the warm-up.
+    if !meta {
+        instrument(launch, model_runner.devices())?;
+    }
+    warm_up(&executors)?;
+
+    let capacities = capacities(&ranks, &open)?;
+    let data = data_plane(launch, &model_runner, &ranks, &executors)?;
+    drop(ranks);
+
+    let head = Arc::new(Mutex::new(head));
+    let session: Box<dyn FnOnce() -> Result<()> + Send> = {
+        let head = Arc::clone(&head);
+        Box::new(move || worker::lock(&head).close())
+    };
+    let mut engine = Engine::new(
+        launch,
+        &open,
+        &opened,
+        pairs,
+        capacities,
+        policy,
+        |_, groups, inbox| {
+            let shadow = Arc::new(Mutex::new(Shadow::default()));
+            let groups = Groups::new(Arc::clone(&route), groups, inbox, Arc::clone(&shadow))?;
+            Ok((Box::new(groups) as Box<dyn scheduler::Executor>, shadow))
+        },
+        session,
+    )?;
+
+    // The schedulers grow their device regions, the KV regions into the granted segments: no unit
+    // entered a region before its memory existed. A start that fails ends its process, whose
+    // session the Storage Server closes once the process has exited (`specs/buffer-pool.md`
+    // §14.1).
+    epoch::grow_regions(&engine.inboxes(), &head)?;
+
+    engine.executors = executors;
+    engine.groups = Some(route);
+    engine.data = data;
+    engine.head = Some(head);
+    engine.build = build.map(|client| (client, targets));
+    if !remotes.is_empty() {
+        engine.liveness = Some(liveness);
+    }
+    engine.remotes = remotes.into_iter().map(|(_, remote)| remote).collect();
+    Ok(engine)
+}
+
+/// The layout of the session of `ranks`, this process's ranks loaded to their division: the
+/// first rank's cache layout and units, its group's width and its request slots' bytes, which
+/// every rank of the deployment's one configuration states alike.
+fn session_layout(launch: &EngineArgs, ranks: &[LoadedRank]) -> Result<Open> {
+    let first = ranks.first().context("this process loaded no rank")?;
+    let cache = Arc::clone(worker::lock(&first.cache).layout());
+    let tensor = u32::try_from(first.model_runner.world_size())
+        .context("a worker group wider than a session states")?;
+    let slots = first.model_runner.slots()?;
+    let slot_bytes = worker::CausalLmRunner::slot_bytes(&first.config, first.model.as_ref())?
+        / u64::from(slots.max(1));
+    layout(launch, &cache, first.units, tensor, slot_bytes)
+}
+
+/// Captures every bucket of every executor's runners, all at once, and waits for each.
+///
+/// # Errors
+///
+/// The first executor whose warm-up failed or was cancelled.
+fn warm_up(executors: &[Arc<Executor>]) -> Result<()> {
+    let submissions = executors
+        .iter()
+        .map(|executor| executor.warm_up())
+        .collect::<worker::Result<Vec<_>>>()?;
+
+    for (index, submission) in submissions.into_iter().enumerate() {
+        match submission.wait() {
+            Outcome::Success(_) => {}
+            Outcome::Failed(fault) => bail!("rank {index}'s warm-up failed: {fault}"),
+            Outcome::Cancelled => bail!("rank {index}'s warm-up was cancelled"),
+        }
+    }
+    Ok(())
+}
+
+/// The data plane over `ranks`, each served by its executor of `executors`: what the engine
+/// changes of the ranks' storages, and how it loads the model the launch serves again.
+fn data_plane(
+    launch: &EngineArgs,
+    model_runner: &ModelRunner,
+    ranks: &[LoadedRank],
+    executors: &[Arc<Executor>],
+) -> Result<Arc<DataPlane>> {
+    let mut served = Vec::with_capacity(ranks.len());
+    for (rank, executor) in ranks.iter().zip(executors) {
+        if let Some(rank) = rank.data_rank(executor)? {
+            served.push(rank);
+        }
+    }
+
+    let target = LoadTarget {
+        checkpoint: PathBuf::from(&launch.engine_config.model.model),
+        experts: model_runner.experts(),
+    };
+    Ok(Arc::new(DataPlane::new(
+        served,
+        target,
+        launch.engine_config.mem_fraction_static,
+    )))
+}
+
+/// Installs what the deployment's always-on profiling captures into every graph of `devices`:
+/// the range markers of the classes `profiling_config.fence_components` names, and PC sampling
+/// when `graph_pc_sampling` keeps it on, which CUPTI attributes to a graph only when enabled
+/// before its capture.
+///
+/// # Errors
+///
+/// When a device cannot load the markers' kernels or enable sampling.
+fn instrument(launch: &EngineArgs, devices: &[DeviceId]) -> Result<()> {
+    let profiling = &launch.engine_config.profiling;
+    if !profiling.fence_components.is_empty() {
+        worker::profiling::markers::Markers::install(
+            devices,
+            profiling.fence_components.clone(),
+            profiling.fence_probes,
+            &profiling.fence_probes_off,
+        )
+        .context("installing the range markers")?;
+    }
+
+    if profiling.graph_pc_sampling {
+        for device in devices {
+            let context = platform::PrimaryContext::retain(*device)?;
+            worker::profiling::pc_sampling::enable(&context)
+                .context("enabling PC sampling for this rank's graphs")?;
+        }
+    }
+    Ok(())
+}
+
+/// The session's numbers of the worker groups `groups` (numbered as `numbers`) that hold a rank on
+/// the host of the deployment's rank `rank`: the groups a peer link whose ranks start at `rank`
+/// serves ranks of.
+///
+/// # Errors
+///
+/// A rank the deployment's groups do not place.
+fn held_groups(
+    groups: &[WorkerGroupConfig],
+    numbers: &[GroupId],
+    rank: u32,
+) -> Result<Vec<GroupId>> {
+    let (group, position) = WorkerGroupConfig::place_rank(groups, rank as usize)
+        .with_context(|| format!("the deployment's worker groups place no rank {rank}"))?;
+    let host = &groups[group].ranks[position].host;
+
+    Ok(groups
+        .iter()
+        .zip(numbers)
+        .filter(|(group, _)| group.ranks.iter().any(|placed| placed.host == *host))
+        .map(|(_, number)| *number)
+        .collect())
+}
 
 /// The channels to the epoch's other main processes, as [`meet`] opened them.
 enum Links {
@@ -628,8 +749,12 @@ fn meet(launch: &EngineArgs) -> Result<(Meeting, Links)> {
                 channel = %world.channel,
                 "awaiting the epoch's peer main processes"
             );
-            let accepted =
-                worker::peers::accept(&listener, world.peers as usize, launch.engine, PEER_START)?;
+            let accepted = worker::executor::peers::accept(
+                &listener,
+                world.peers as usize,
+                launch.engine,
+                PEER_START,
+            )?;
             Ok((
                 Meeting::World {
                     address: world.store.clone(),
@@ -639,8 +764,12 @@ fn meet(launch: &EngineArgs) -> Result<(Meeting, Links)> {
             ))
         }
         None => {
-            let channel =
-                worker::peers::register(&world.channel, launch.rank, world.scheduler, PEER_START)?;
+            let channel = worker::executor::peers::register(
+                &world.channel,
+                launch.rank,
+                world.scheduler,
+                PEER_START,
+            )?;
             tracing::info!(
                 rank = launch.rank,
                 scheduler = %world.channel,
@@ -656,3 +785,6 @@ fn meet(launch: &EngineArgs) -> Result<(Meeting, Links)> {
         }
     }
 }
+
+#[cfg(test)]
+mod tests;

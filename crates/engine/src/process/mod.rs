@@ -1,365 +1,1423 @@
-//! `uniserve-engine`: a node's engine process for one epoch.
+//! A node's main process for one epoch: its control thread.
 //!
-//! The daemon starts one engine per node and epoch from the epoch's launch file, and [`run`]
-//! serves it until the daemon commands it down or it fails. The process computes nothing itself;
-//! it assembles
+//! The daemon starts one main process per node and epoch from the epoch's launch file, and
+//! [`run`] serves it until the daemon commands it down, it loses its daemon, or the epoch fails.
+//! The control thread is [`MainProcess`]: it holds where the engine is ([`lifecycle`]), the
+//! requests and their streams ([`requests`]), and the started epoch ([`Engine`]), and it blocks
+//! in one place: a `Select` over its inbox and every scheduler's outputs, until the earliest of
+//! the watchdog's deadline and the next metrics second ([`MainProcess::serve`]). Nothing reaches
+//! it but messages, and nothing it does waits:
 //!
-//! - the [`Control`] thread, which serves the daemon's request interface and its process
-//!   interface, and blocks on its channels;
-//! - one `scheduler::Scheduler` per DP rank, on the node that holds them;
-//! - the peer links of an epoch whose worker group has ranks on other hosts ([`worker::peers`]):
-//!   on the scheduler node one per peer process, which carries the schedulers' batches to the
-//!   peer's ranks, and on a peer the one link that runs them;
-//! - one `worker::device::Worker` per device, the only thread that issues to that device's streams;
-//! - the node's resident memory ([`Memory`]);
-//! - the blocking pool host work runs on ([`ThreadPool`]).
+//! | Thread | One per | Blocks on | Sends |
+//! | --- | --- | --- | --- |
+//! | Control | process | its `Select` | frames to the fronts, reports to the process interface, `Message`s to the schedulers, jobs |
+//! | Request reader | daemon front | a read of its connection | `Input::Frame`, then `FrontClosed` |
+//! | Command reader | process | a read of the process interface | `Input::Command` |
+//! | Start | process, once | the rank start (`start`) | the `Engine` or the failure, as `Done` |
+//! | Operations | process | its job channel, then each job's waits | each job's `Done`, in submission order |
+//! | Work | job beside the batches | the job's waits | its `Done` |
+//! | Scheduler | DP rank | its inbox | `Output`s; batches to its executor |
 //!
-//! ## Lifecycle
+//! A job is a closure that runs elsewhere and returns the [`Input`] the control thread applies
+//! when it ends ([`Input::Done`]). The operations thread runs, one at a time and in order, every
+//! job that pauses the schedulers or changes the ranks' device memory (a switch, a commit, a
+//! rollback, a weight update, sleep and wake, a flush, an expert commit, making room, growing,
+//! the release after a `Shrunk`, the start and the end of a drain), so two pause sequences never
+//! interleave; while the engine drains the control thread starts none that pauses the schedulers,
+//! since a `Resume` ends a drain as well as a pause (`Lifecycle::boundary_refusal`). A job beside
+//! the batches (a preparation, an adapter, a profiling change, a drain's wait, an attach) runs on
+//! a thread of its own. The job functions are `generation`, `epoch` and `operations`, which read
+//! the engine's parts and never this thread's state.
 //!
-//! Where the engine is is one value ([`lifecycle::State`]): its [`lifecycle::Lifecycle`]
-//! (`Starting`, `Parked`, `Serving`, `Draining`, `Stopped`, `Failed`) and, while it serves, its
-//! generation update ([`generation::Generation`]: `Steady`, `Preparing`, `Prepared`, `Trial`).
-//! Both are moved by messages alone: a command of the daemon's process interface, the completion
-//! of work a command started, or a failure the engine observed. Nothing is polled: the control
-//! thread blocks until a socket is readable, a completion wakes it (a device submission, a host
-//! task, a scheduler's response, a work thread), or a timer is due (the watchdog's stall bound,
-//! the once-a-second metrics report, the bound of a stage in flight).
-//!
-//! A new engine starts with its epoch's module set in its launch file: while `Starting` it
-//! resolves every module its devices' profile runs name, installs them as its first generation
-//! and captures its graphs, and then parks (launched beside a serving engine) or serves. Startup
-//! keeps nothing and is no update. An update of a serving engine's generation is the daemon's:
-//! `Prepare`, `Switch`, then `Commit` or `Rollback`, each acknowledged by a report
-//! (`crates/proto/src/process.proto`). No module content crosses that interface: the engine
-//! resolves its modules from the Build Server itself (`crate::modules`).
-//!
-//! ## Modules
-//!
-//! - `launch`, `claim`, `ranks`, `start`: the launch file, the handshake, the Storage Server
-//!   claim, the ranks' load, the first generation and the process's close.
-//! - `record`: a start that records the packages its devices launch and serves nothing
-//!   ([`record()`]).
-//! - `lifecycle`, `generation`: the two enums, their transitions and the reports that
-//!   acknowledge them.
-//! - `serve`, `commands`, `requests`, `reports`: the control thread's loop and what it serves -
-//!   the daemon's messages, requests and their event streams, reports and metrics.
-//! - `prepare`, `installs`, `policy`, `switch`: the generation's preparation, its switch with the
-//!   captures that follow, the commit, the rollback and the release.
-//! - `epoch`: the drain, the promotion and admission.
-//! - `operations`, `weights`: the operator's operations inside an epoch.
+//! The control thread and the request interface are library code: [`serve`] runs them over two
+//! given connections and a [`Start`], the function that builds the [`Engine`]. The binary's
+//! start loads ranks and opens a session with the node's Storage Server; a test's builds fakes,
+//! and everything above that seam is the same code.
 
-mod claim;
-mod commands;
+mod daemon;
 mod epoch;
 mod generation;
-mod installs;
-mod launch;
 mod lifecycle;
 mod operations;
-mod policy;
-mod prepare;
-mod ranks;
-mod record;
+pub(crate) mod ranks;
+pub(crate) mod record;
 mod reports;
 mod requests;
-mod serve;
 mod start;
-mod switch;
-mod weights;
 
+use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
-use anyhow::{Result, bail};
-use build_server::{Client, Target};
-use ipc::execution::Outcome;
-use ipc::execution::Submission;
-use worker::blocking::ThreadPool;
-use worker::control::Control;
-use worker::device::Worker;
-use worker::host::Lane;
-use worker::memory::Memory;
-use worker::memory::retained::Retained;
-use worker::watchdog::Watchdog;
+use anyhow::{Context as _, Result, bail};
+use crossbeam_channel::{Receiver, Select, Sender};
+use ipc::memory::WeightsUpdated;
+use proto::Connection;
+use proto::config::{EngineArgs, EngineConfig, SchedulerConfig};
+use proto::module::{ModuleSlot, Packages};
+use proto::process::command;
+use proto::request::wire::{self, engine_command, from_engine};
+use proto::request::{ArtifactMedia, RequestId};
+use scheduling_guest::Parameters;
+use scheduling_guest::view::Snapshot;
+use worker::executor::peers::{LOST_EXIT, Liveness};
+use worker::executor::watchdog::Watchdog;
 
-use crate::modules::load::ModuleWork;
-use crate::rank::buckets::PrefillBound;
-use epoch::Draining;
-use launch::{ProcessInterface, read_engine_args};
-use lifecycle::State;
-use operations::Operation;
-use prepare::Prepare;
-pub use record::{Recorded, record};
+pub use daemon::connect;
+use lifecycle::{Lifecycle, Update};
 use requests::RequestStream;
-use switch::Switching;
-use weights::WeightUpdate;
+pub use start::Engine;
 
-/// Runs the main process the launch file at `launch_file` describes, until its
-/// daemon commands it down or its epoch fails. Its checkpoint is served by the
-/// family of `catalogue` that claims the class it declares.
+use crate::data_plane::Target;
+use crate::modules::load;
+use crate::modules::select::changed_operators;
+use crate::scheduler::{Message, Output};
+use crate::storage_client::StorageClient;
+
+/// Builds the started epoch from the launch: the binary's rank start, or a test's fakes. It
+/// runs on a thread of its own while the control thread serves.
+pub type Start = Box<dyn FnOnce(&EngineArgs) -> Result<Engine> + Send>;
+
+/// A job: work off the control thread, which returns what the control thread applies when it
+/// ends.
+type Job = Box<dyn FnOnce() -> Input + Send>;
+
+/// What reaches the control thread's inbox.
+pub(crate) enum Input {
+    /// A frame of the request interface from front `.0`.
+    Frame(usize, wire::ToEngine),
+    /// Front `.0` closed.
+    FrontClosed(usize),
+    /// A command of the process interface; `None` once the daemon closed it.
+    Command(Option<proto::process::Command>),
+    /// A peer link of the epoch was lost.
+    PeerLost(String),
+    /// A job ended: what it produced, applied on the control thread.
+    Done(Box<dyn FnOnce(&mut MainProcess) + Send>),
+}
+
+/// The `Done` of a job that applies `apply`.
+fn done(apply: impl FnOnce(&mut MainProcess) + Send + 'static) -> Input {
+    Input::Done(Box::new(apply))
+}
+
+/// The slot the scheduling policy's package is kept under in the packages a generation is made
+/// of, beside the kernels' slots: the interface it implements, which no operator is named.
+fn policy_slot() -> ModuleSlot {
+    ModuleSlot::all(proto::module::POLICY)
+}
+
+/// `packages` without the policy's slot: the kernel packages of a generation.
+fn kernels_of(packages: &Packages) -> Packages {
+    let policy = policy_slot();
+    packages
+        .iter()
+        .filter(|(slot, _)| **slot != policy)
+        .map(|(slot, package)| (slot.clone(), package.clone()))
+        .collect()
+}
+
+/// Runs the main process the launch file at `launch_file` describes, until its daemon commands
+/// it down or its epoch fails. Its checkpoint is served by the family of `registry` that claims
+/// the class it declares.
 ///
-/// Must be called while no other thread reads the environment: the profiling
-/// counters' injection sets variables before the first NVTX call.
+/// Must be called while no other thread reads the environment: the profiling counters' injection
+/// sets variables before the first NVTX call.
 ///
 /// # Errors
 ///
-/// Fails when the launch file cannot be read, the process cannot start, its
-/// control thread fails, or its epoch fails.
-pub fn run(launch_file: &Path, catalogue: &nn::family::Catalogue) -> Result<()> {
+/// When the launch file cannot be read or is refused, or the daemon refuses the process or its
+/// claim. A process whose epoch fails or loses a peer exits with status 1 without its orderly
+/// close: a device or a collective may hold every rank.
+pub fn run(launch_file: &Path, registry: &nn::family::Registry) -> Result<()> {
     worker::profiling::counters::inject();
 
-    let launch = read_engine_args(launch_file)?;
-    let mut main = MainProcess::start(&launch, catalogue)?;
-    let ending = main.serve();
-    // A process that lost another of its epoch's main processes ends without its orderly close:
-    // its device's collectives wait for ranks that are gone, so no close of its workers ends. Its
-    // requests go with its connection, which the daemon reads as the engine's loss.
-    if let Some(reason) = main.peers.lost() {
-        tracing::error!(%reason, "the main process ends: a main process of its epoch was lost");
+    let launch: EngineArgs = std::fs::read(launch_file)
+        .map_err(anyhow::Error::new)
+        .and_then(|text| serde_json::from_slice(&text).map_err(anyhow::Error::new))
+        .with_context(|| format!("reading the launch file {}", launch_file.display()))?;
+    let mut requests = Connection::connect(&launch.requests)
+        .with_context(|| format!("connecting to the daemon's requests at {}", launch.requests))?;
+    connect(&mut requests, &launch)?;
+
+    // What fails before the control thread runs is said on the request interface: the daemon
+    // waits for the state a start ends in, and a connection that closes says only that it went.
+    let claimed = check(&launch).and_then(|()| {
+        let mut process = Connection::connect(&launch.processes).with_context(|| {
+            format!(
+                "connecting to the daemon's processes at {}",
+                launch.processes
+            )
+        })?;
+        let (storage, filed) = daemon::claim(&mut process, &launch)?;
+        Ok((process, storage, filed))
+    });
+    let (process, storage, filed) = match claimed {
+        Ok(claimed) => claimed,
+        Err(error) => {
+            let failed = wire::State {
+                state: wire::EngineState::Failed as i32,
+                info: None,
+                error: format!("{error:#}"),
+            };
+            let _ = daemon::send(&mut requests, from_engine::Kind::State(failed), None);
+            return Err(error);
+        }
+    };
+
+    let main = MainProcess::new(requests, process, launch)?;
+    let lost = main.peer_lost();
+    let registry = registry.clone();
+    let start: Start = Box::new(move |launch| {
+        // The module set's policy is resolved at the node's Build Server, which the ranks'
+        // kernels and every later generation are resolved through too.
+        let socket = Path::new(&launch.build_server);
+        let mut build = build_server::Client::connect(socket)
+            .with_context(|| format!("connecting to the Build Server at {}", socket.display()))?;
+        let policy = load::policy(&mut build, &launch.modules.policy)?;
+        let liveness = Liveness::new(lost, LOST_EXIT);
+
+        let build = Some(Arc::new(Mutex::new(build)));
+        start::start(launch, &registry, &storage, build, policy, liveness)
+    });
+    if let Err(error) = main.serve(start, filed) {
+        tracing::error!(error = %format!("{error:#}"), "the main process ends: the epoch failed");
         std::process::exit(1);
     }
-    main.close();
-
-    // Why this process ends is the daemon's own diagnostic: the supervisor reports
-    // "the engine process ended" and nothing more, so a handover that loses its engine
-    // has no line to read unless this one says which way it went. A commanded end and a
-    // failed epoch both stop the process, and only the second is a fault.
-    match &ending {
-        Ok(None) => tracing::warn!("the main process ends: a shutdown was commanded"),
-        Ok(Some(failure)) => {
-            tracing::warn!(
-                reason = failure.reason(),
-                "the main process ends: the epoch failed"
-            )
-        }
-        // The whole chain: the outer context names the stage, and only the causes say what failed.
-        Err(error) => tracing::warn!(
-            error = %format!("{error:#}"),
-            "the main process ends: the control thread failed"
-        ),
-    }
-    if let Some(failure) = ending? {
-        bail!("the main process ended: {}", failure.reason());
-    }
+    tracing::warn!("the main process ends: a shutdown was commanded");
     Ok(())
 }
 
-/// A main process's links to the other main processes of its epoch ([`worker::peers`]).
-pub(super) enum Peers {
-    /// The process holds every rank of its worker group.
-    Alone,
-    /// The scheduler node's process: one link per peer, which its schedulers' batches reach the
-    /// peers' ranks through.
-    Scheduler {
-        remotes: Vec<Arc<worker::peers::Remote>>,
-        liveness: Arc<worker::peers::Liveness>,
-    },
-    /// A peer's process: the one link the scheduler node's batches arrive on.
-    Peer {
-        upstream: worker::peers::Upstream,
-        liveness: Arc<worker::peers::Liveness>,
-    },
-}
-
-impl Peers {
-    /// Why a link to another main process of the epoch was lost, once one was: the group cannot
-    /// run a batch without that process's ranks, so this process ends.
-    pub(super) fn lost(&self) -> Option<String> {
-        match self {
-            Self::Alone => None,
-            Self::Scheduler { liveness, .. } | Self::Peer { liveness, .. } => liveness.lost(),
-        }
+/// Refuses a launch that states no epoch or host, or a world whose inherited sockets disagree
+/// with the role it states, by name rather than at the claim or the first collective.
+fn check(launch: &EngineArgs) -> Result<()> {
+    if launch.epoch == 0 {
+        bail!("the launch file states epoch 0, which names no epoch for this process to serve");
     }
-
-    /// Closes every link, which the processes at their other ends read as this one's end.
-    pub(super) fn close(&mut self) {
-        match std::mem::replace(self, Self::Alone) {
-            Self::Alone => {}
-            Self::Scheduler { remotes, .. } => {
-                for remote in remotes {
-                    remote.close();
-                }
-            }
-            Self::Peer { upstream, .. } => upstream.close(),
-        }
+    if launch.host.is_empty() {
+        bail!("the launch file states no host identity, which the storage claim is keyed by");
     }
-}
-
-/// One node's engine process for one epoch: the threads it started and the owners they borrow.
-///
-/// Every field is owned by exactly one thread: the control thread owns itself,
-/// each worker thread owns its runners and streams, each scheduler thread its
-/// mechanism. The fields below are the handles those threads were given and the
-/// owners that must outlive them.
-pub(crate) struct MainProcess {
-    control: Control,
-    /// Fires the control thread's wake. Every completion of work this thread started calls it,
-    /// so the thread blocks instead of looking: a device submission, a host task and a work
-    /// thread are each given a clone.
-    wake: ipc::Wake,
-    /// This process's links to the epoch's other engine processes, when its worker group has
-    /// ranks on other hosts.
-    peers: Peers,
-    /// This node's schedulers, one per DP rank. The handle is the interface: each scheduler's thread
-    /// owns the instance, so every call the control thread makes goes through the handle and the
-    /// command channel carries the mutation.
-    schedulers: Vec<scheduler::SchedulerHandle>,
-    /// The routing policy that names the scheduler of every request when this node holds several
-    /// (`requests::route`): the control thread's instance of the epoch's policy package, switched
-    /// with the schedulers' instances.
-    router: scheduler::Router,
-    /// The route instance the preparation in flight builds on a thread of its own, taken by the
-    /// switch.
-    route_prepared: Option<crossbeam_channel::Receiver<scheduler::Candidate>>,
-    /// The expert union of this node's ranks, ended before their device threads are.
-    union: Option<Arc<worker::runners::experts::Union>>,
-    /// One statistics reporter per scheduler, in the schedulers' order.
-    ///
-    /// A reporter keeps the cumulative baselines of the counters it has already
-    /// reported, so each increment appears in exactly one snapshot: the same
-    /// reporter must see every pass (the daemon's `/metrics`, `uniserve:num_requests_running`
-    /// and its kind).
-    stats_reporters: Vec<scheduler::SchedulerStatsReporter>,
-    /// CUPTI's always-on counters, for as long as the process serves.
-    _counters: Option<worker::profiling::counters::Counters>,
-    /// The control thread's driver calls that waited for the device, as of its last report.
-    control_calls: platform::cupti::blocking::Calls,
-    /// This node's device workers, shared with the schedulers that submit through them: one
-    /// worker thread per device, reached both by this process's own verbs (`prepare`, `switch`,
-    /// `warmup`, `release`) and by the scheduler's `Batches`.
-    workers: Vec<Arc<Worker>>,
-    memory: Vec<Memory>,
-    /// The rank's Storage Server client, kept for the two calls that reach its quota and no
-    /// other: a park gives the cache's segments back, and a wake maps them again. Every caller takes
-    /// `&mut` of its own `&Retained` (`impl ExclusiveStorage for &Retained`), so the device thread can
-    /// hold one beside the control thread without a lock.
-    storage: Vec<Arc<Retained>>,
-    blocking: ThreadPool,
-    /// The blocking lane the Build Server's selection and the module loads run on.
-    modules: Lane<ModuleWork>,
-    /// Where the engine is: its lifecycle and its generation update.
-    state: State,
-    /// Whether the launch file started this engine parked, beside a serving one: its start ends
-    /// parked instead of serving.
-    starts_parked: bool,
-    /// The stall and sticky-error rules of the control thread.
-    watchdog: Watchdog,
-    /// The Build Server client, shared with the module-load lane.
-    packages: Arc<Mutex<Client>>,
-    /// The preparation in flight: the start's first generation, or an update's.
-    preparing: Option<Prepare>,
-    /// The switch in flight: the captures every device queued for the generation that took over
-    /// and the schedulers' responses to its policy.
-    switching: Option<Switching>,
-    /// The drain in flight: the schedulers still to park.
-    draining: Option<Draining>,
-    /// Whether the daemon that launched this process closed its front: at a handover the
-    /// predecessor leaves, and the attached daemons serve on. Stated once, and not read
-    /// again, because a closed connection gives every read the same error.
-    daemon_closed: bool,
-    /// What this process last announced it is, kept so that a daemon attaching mid-epoch is
-    /// told it without asking the schedulers anything: the attach is a handover's step and a
-    /// control thread blocked in a cache description cannot serve one.
-    announced: Option<proto::request::wire::EngineInfo>,
-    /// Whether the closing of the daemon's process interface has been reported: the interface
-    /// stays closed, and the line is worth stating once.
-    noted_process_closed: bool,
-    /// What this node resolves a module for.
-    targets: Vec<Target>,
-    /// The Build Server's socket, which a policy's source resolves its module through.
-    build_server: PathBuf,
-    /// The daemon's process interface: the claim, the reports and every command the daemon
-    /// sends this engine.
-    process: ProcessInterface,
-    /// Each admitted request with the stream it produces, the scheduler rank a command for it
-    /// reaches, and the daemon front it belongs to: the scheduler responds to a submission with
-    /// the stream of what the request produced, and this process is what carries those events
-    /// back to the daemon. A stream leaves when its request ends.
-    streams: Vec<RequestStream>,
-    /// The launch's own request-slot count, which the daemon records as the epoch's capacity: the
-    /// worker's row count includes the guidance prefix, which is not a request.
-    max_running_requests: u32,
-    /// The prefill buckets this rank captures and whether the deployment stated them: the
-    /// ceiling a policy's `max_num_batched_tokens` is refused against, named with the policy's
-    /// own figure when that refusal is rendered.
-    prefill_bound: PrefillBound,
-    /// How an engine that starts parked keeps its graph pools' device storage while it parks, as
-    /// the daemon resolved `worker_config.standby_storage` for its failure domain.
-    standby_storage: proto::request::StandbyStorage,
-    /// Whether the graph pools' storage was given back while this engine parks: a promotion takes
-    /// it again, at the addresses the graphs hold, before anything is admitted.
-    graphs_suspended: bool,
-    /// What each scheduler parked with, in `schedulers` order: kept from the drain to the
-    /// promotion that serves this engine again, which adopts it.
-    parked: Option<Vec<scheduler::ParkedCache>>,
-    /// The admission gate, the daemon's `/admin/pause_generation`: submissions are refused while
-    /// it is held, and no request in flight is ended by it.
-    paused: bool,
-    /// What this process's storage operations reach.
-    data: Arc<crate::data_plane::DataPlane>,
-    /// The operator's operations still working, each acknowledged when its completions arrive.
-    operations: Vec<Operation>,
-    /// A weight update in progress.
-    weights: Option<WeightUpdate>,
-    /// Whether the schedulers sleep: their storage is given back until a wake.
-    asleep: bool,
-}
-
-/// Waits on one device command, and no longer than the watchdog's stall bound.
-///
-/// The control thread issues a handful of device commands of its own - the switch, a rollback and
-/// a release - and none of them may hold it indefinitely: a device that has not finished by half the
-/// watchdog timeout is stalled, and a stall is a failure the epoch reports rather than something the
-/// control thread waits out.
-fn device_command(
-    watchdog: &Watchdog,
-    device: platform::DeviceId,
-    what: &str,
-    submission: Submission,
-) -> Result<()> {
-    match submission.wait_timeout(watchdog.stall_bound()) {
-        Some(Outcome::Success(_)) => Ok(()),
-        Some(Outcome::Failed(error)) => bail!("the {what} of device {} failed: {error}", device.0),
-        Some(Outcome::Cancelled) => bail!("the {what} of device {} was cancelled", device.0),
-        None => bail!(
-            "the {what} of device {} did not finish within the stall bound",
-            device.0
+    match &launch.world {
+        Some(world) if world.peers == 0 => {
+            bail!("the launch file states a world of several hosts with no peer main process")
+        }
+        Some(world) if launch.scheduler_node != world.inherited.is_some() => bail!(
+            "the scheduler node's main process, and only it, inherits the world's reserved \
+             sockets: this one is{} the scheduler node",
+            if launch.scheduler_node { "" } else { " not" }
         ),
+        None if !launch.scheduler_node => {
+            bail!("a main process that holds every rank of its group holds its schedulers too")
+        }
+        _ => Ok(()),
     }
+}
+
+/// Runs the control thread over `requests`, the daemon's request connection after [`connect`],
+/// and `process`, its process interface, with the engine `start` builds from `launch`, until the
+/// daemon shuts the engine down or closes both interfaces.
+///
+/// # Errors
+///
+/// When the epoch fails: the start, a scheduler, a device, a stall or a lost peer. The engine is
+/// then left as it is, without its orderly close.
+pub fn serve(
+    requests: Connection,
+    process: Connection,
+    launch: EngineArgs,
+    start: Start,
+) -> Result<()> {
+    MainProcess::new(requests, process, launch)?.serve(start, Vec::new())
+}
+
+/// The control thread's state, touched on that thread only.
+pub(crate) struct MainProcess {
+    /// The control thread's inbox, and the sender every reader, job and callback is given.
+    inbox: (Sender<Input>, Receiver<Input>),
+    /// The write half of each daemon front's request connection, by front: the launching
+    /// daemon's first, then each that attached; `None` once it closed.
+    fronts: Vec<Option<Connection>>,
+    /// The write half of the process interface; `None` once the daemon closed it.
+    process: Option<Connection>,
+    launch: EngineArgs,
+    lifecycle: Lifecycle,
+    update: Update,
+    /// The generation that executes, and its packages (the kernels' and, under
+    /// [`policy_slot`], the policy's); the packages a trial keeps; and a prepared generation's
+    /// packages with its policy module and arguments.
+    generation: u64,
+    serving: Packages,
+    kept: Option<Packages>,
+    prepared: Option<(Packages, Arc<wasmtime::Module>, Parameters)>,
+    /// The started epoch; `None` while starting.
+    engine: Option<Engine>,
+    streams: HashMap<RequestId, RequestStream>,
+    /// The requests the pause gate holds, in arrival order, each with its front.
+    held: VecDeque<(usize, wire::Request)>,
+    paused: bool,
+    /// Whether requests carried from another epoch compute their state again
+    /// (`Promote.recompute`).
+    recompute: bool,
+    /// Whether admission opened once and the serving path's warm-up ran.
+    warmed: bool,
+    operations: Sender<Job>,
+    watchdog: Watchdog,
+    /// The metrics' running sums since the start, and each scheduler's lifetime counts as its
+    /// last statistics stated them (steps, batches, policy calls, policy fuel).
+    metrics: wire::Metrics,
+    lifetime: Vec<[u64; 4]>,
+    next_metrics: Instant,
+    /// What the engine last announced it serves, which an attaching daemon is told.
+    announced: Option<wire::EngineInfo>,
+    /// Why the control thread ends: a shutdown or the daemon gone (`Ok`), or a failure.
+    ending: Option<Result<()>>,
 }
 
 impl MainProcess {
-    /// Wakes the control thread when `submission` settles, at once when it already has.
-    fn wake_on_submission(&self, submission: &Submission) {
-        let wake = self.wake.clone();
-        let waker: ipc::execution::Waker = Arc::new(move || wake.wake());
-        submission.on_settled(&waker);
+    /// The control thread over `requests` and `process`, its readers and its operations thread
+    /// started.
+    fn new(requests: Connection, process: Connection, launch: EngineArgs) -> Result<Self> {
+        let inbox = crossbeam_channel::unbounded();
+        let front = requests
+            .writer()
+            .context("a write half of the request connection")?;
+        let writer = process
+            .writer()
+            .context("a write half of the process interface")?;
+        daemon::read_requests(0, requests, inbox.0.clone())?;
+        daemon::read_commands(process, inbox.0.clone())?;
+
+        let (operations, jobs) = crossbeam_channel::unbounded::<Job>();
+        let done = inbox.0.clone();
+        std::thread::Builder::new()
+            .name("operations".to_owned())
+            .spawn(move || {
+                for job in jobs {
+                    if done.send(job()).is_err() {
+                        return;
+                    }
+                }
+            })
+            .context("starting the operations thread")?;
+
+        let timeout = launch
+            .watchdog_timeout()
+            .unwrap_or(launch.engine_config.worker.watchdog_timeout);
+        let mut serving = launch.modules.kernels.clone();
+        serving.insert(policy_slot(), launch.modules.policy.clone());
+        Ok(Self {
+            inbox,
+            fronts: vec![Some(front)],
+            process: Some(writer),
+            watchdog: Watchdog::new(timeout)?,
+            launch,
+            lifecycle: Lifecycle::Starting,
+            update: Update::Steady,
+            // A start installs the epoch's module set as its first generation, with nothing kept.
+            generation: ranks::FIRST_GENERATION,
+            serving,
+            kept: None,
+            prepared: None,
+            engine: None,
+            streams: HashMap::new(),
+            held: VecDeque::new(),
+            paused: false,
+            recompute: false,
+            warmed: false,
+            operations,
+            metrics: wire::Metrics::default(),
+            lifetime: Vec::new(),
+            next_metrics: Instant::now() + reports::METRICS_EVERY,
+            announced: None,
+            ending: None,
+        })
     }
 
-    /// Wakes the control thread when `task` ends, at once when it already has.
-    fn wake_on_task<A: worker::host::HostAction>(&self, task: &worker::host::HostTask<A>) {
-        let wake = self.wake.clone();
-        if let Some(settled) = task.completion.subscribe(Box::new(move || wake.wake())) {
-            settled();
+    /// What the start's peer links call once one is lost: it tells the control thread.
+    fn peer_lost(&self) -> worker::completion::Waker {
+        let inbox = self.inbox.0.clone();
+        Arc::new(move || {
+            let reason = "a peer link of this epoch closed".to_owned();
+            let _ = inbox.send(Input::PeerLost(reason));
+        })
+    }
+
+    /// Starts `start` on its thread, serves `filed` (commands the claim read first), and then
+    /// serves what arrives until the control thread ends.
+    fn serve(mut self, start: Start, filed: Vec<proto::process::Command>) -> Result<()> {
+        let inbox = self.inbox.0.clone();
+        let launch = self.launch.clone();
+        std::thread::Builder::new()
+            .name("start".to_owned())
+            .spawn(move || {
+                let started = start(&launch);
+                let _ = inbox.send(done(move |main| main.started(started)));
+            })
+            .context("starting the rank start's thread")?;
+        for command in filed {
+            self.command(command);
         }
+
+        loop {
+            if let Some(ending) = self.ending.take() {
+                return self.end(ending);
+            }
+
+            // The wait ends at the watchdog's deadline while a job is in flight, and at the
+            // metrics second otherwise.
+            let deadline = self
+                .watchdog
+                .deadline(&self.in_flight())
+                .unwrap_or(self.next_metrics)
+                .min(self.next_metrics);
+            let inbox = self.inbox.1.clone();
+            let outputs = self.outputs();
+            let mut select = Select::new();
+            select.recv(&inbox);
+            for output in &outputs {
+                select.recv(output);
+            }
+            if let Ok(ready) = select.select_deadline(deadline) {
+                match ready.index() {
+                    0 => {
+                        // The control thread holds a sender of its own inbox: it never closes.
+                        if let Ok(input) = ready.recv(&inbox) {
+                            self.input(input);
+                        }
+                    }
+                    index => {
+                        let scheduler = index - 1;
+                        match ready.recv(&outputs[scheduler]) {
+                            Ok(output) => self.output(scheduler, output),
+                            Err(_) => self.fail(
+                                format!("scheduler {scheduler} stopped"),
+                                lifecycle::fault("scheduler", "its thread ended".to_owned(), 0),
+                            ),
+                        }
+                    }
+                }
+            }
+            self.watch(Instant::now());
+        }
+    }
+
+    /// Applies one input of the inbox.
+    fn input(&mut self, input: Input) {
+        match input {
+            Input::Frame(front, frame) => match frame.kind {
+                Some(wire::to_engine::Kind::Submit(submit)) => self.submit(front, submit),
+                Some(wire::to_engine::Kind::Command(command)) => {
+                    self.request_command(front, command);
+                }
+                Some(wire::to_engine::Kind::Engine(command)) => {
+                    self.engine_command(front, command);
+                }
+                None => {}
+            },
+            Input::FrontClosed(front) => {
+                tracing::warn!(
+                    front,
+                    "a daemon front closed; its requests wait for a takeover"
+                );
+                if let Some(slot) = self.fronts.get_mut(front)
+                    && let Some(connection) = slot.take()
+                {
+                    connection.close();
+                }
+                self.end_when_unserved();
+            }
+            Input::Command(Some(command)) => self.command(command),
+            Input::Command(None) => {
+                tracing::warn!("the daemon closed this engine's process interface");
+                self.process = None;
+                self.end_when_unserved();
+            }
+            Input::PeerLost(reason) => {
+                let reason = self
+                    .engine
+                    .as_ref()
+                    .and_then(|engine| engine.liveness.as_ref())
+                    .and_then(|liveness| liveness.lost())
+                    .unwrap_or(reason);
+                let fault = lifecycle::fault("process_exit", reason.clone(), 0);
+                self.fail(
+                    format!("a main process of this epoch was lost: {reason}"),
+                    fault,
+                );
+            }
+            Input::Done(apply) => apply(self),
+        }
+    }
+
+    /// Ends the control thread in order once no daemon serves it any more: the process interface
+    /// and every front closed. A hot restart closes the launching daemon's interfaces and leaves
+    /// the attached front serving.
+    fn end_when_unserved(&mut self) {
+        if self.process.is_none() && self.fronts.iter().all(Option::is_none) {
+            self.ending.get_or_insert(Ok(()));
+        }
+    }
+
+    /// Applies one output of scheduler `scheduler`.
+    fn output(&mut self, scheduler: usize, output: Output) {
+        match output {
+            Output::Event(id, event) => self.event(id, event),
+            Output::Stats(stats) => self.stats(scheduler, stats),
+            Output::PolicyRolledBack(reason) => {
+                self.policy_rolled_back(Some(scheduler), reason, false);
+            }
+            Output::NumericalFault(batch, requests) => self.numerical_fault(batch, requests),
+            Output::Shrunk(region, units) => self.shrunk(region, units),
+            Output::Failed(error) => {
+                let reason = format!("scheduler {scheduler} failed: {error}");
+                self.fail(reason, lifecycle::fault("scheduler", error.to_string(), 0));
+            }
+        }
+    }
+
+    /// Each scheduler's channel out, in the order of the session's schedulers; none while
+    /// starting.
+    fn outputs(&self) -> Vec<Receiver<Output>> {
+        self.engine
+            .iter()
+            .flat_map(|engine| &engine.schedulers)
+            .map(|scheduler| scheduler.outputs.clone())
+            .collect()
+    }
+
+    /// Applies every output the schedulers have sent, before what arrived after them.
+    fn outputs_sent(&mut self) {
+        for (index, outputs) in self.outputs().into_iter().enumerate() {
+            for output in outputs.try_iter() {
+                self.output(index, output);
+            }
+        }
+    }
+
+    /// Queues `job` on the operations thread, after every job queued before it.
+    fn serial(&mut self, job: Job) {
+        if self.operations.send(job).is_err() {
+            let reason = "the operations thread ended".to_owned();
+            self.fail(reason.clone(), lifecycle::fault("operations", reason, 0));
+        }
+    }
+
+    /// Runs `job` beside the batches, on a thread of its own.
+    fn work(&mut self, job: Job) {
+        let inbox = self.inbox.0.clone();
+        let spawned = std::thread::Builder::new()
+            .name("work".to_owned())
+            .spawn(move || {
+                let _ = inbox.send(job());
+            });
+        if let Err(error) = spawned {
+            let reason = format!("a job beside the batches could not start: {error}");
+            self.fail(reason.clone(), lifecycle::fault("work", reason, 0));
+        }
+    }
+
+    /// Writes one frame to front `front`, with the artifact bytes it travels with. A front that
+    /// closed reads nothing; its streams wait for a takeover.
+    fn send(
+        &mut self,
+        front: usize,
+        kind: from_engine::Kind,
+        media: Option<&Arc<dyn ArtifactMedia>>,
+    ) {
+        let Some(Some(connection)) = self.fronts.get_mut(front) else {
+            return;
+        };
+        if let Err(error) = daemon::send(connection, kind, media) {
+            tracing::warn!(%error, front, "writing to a daemon front failed");
+        }
+    }
+
+    /// Ends the control thread: in order after a shutdown or once no daemon serves it; without
+    /// its orderly close after a failure, leaving the engine as it is, since a device or a
+    /// collective may hold every rank.
+    fn end(mut self, ending: Result<()>) -> Result<()> {
+        if let Err(error) = ending {
+            // Nothing of the engine is dropped: dropping an executor joins its thread, which a
+            // device that stopped making progress never lets end.
+            let _ = std::mem::ManuallyDrop::new(self.engine.take());
+            return Err(error);
+        }
+
+        self.lifecycle = Lifecycle::Stopped;
+        self.refuse_held("the engine shut down");
+        self.metrics();
+        // Every scheduler ends the requests it holds as aborted and stops, and their events are
+        // written before the engine states that it stopped.
+        let closed = self.engine.take().map_or(Ok(()), |engine| {
+            engine.close(|_, output| {
+                if let Output::Event(id, event) = output {
+                    self.event(id, event);
+                }
+            })
+        });
+        self.announce(false);
+        closed?;
+
+        for connection in self.fronts.iter().flatten() {
+            connection.close();
+        }
+        if let Some(process) = &self.process {
+            process.close();
+        }
+        Ok(())
+    }
+
+    /// The start ended: the engine is installed, and parks or opens admission.
+    fn started(&mut self, started: Result<Engine>) {
+        let engine = match started {
+            Ok(engine) => engine,
+            Err(error) => {
+                let reason = format!("{error:#}");
+                let fault = lifecycle::fault("start", reason.clone(), 0);
+                return self.fail(format!("the start failed: {reason}"), fault);
+            }
+        };
+        self.engine = Some(engine);
+        // An engine that failed while it started is left as it is when the control thread ends.
+        if self.lifecycle != Lifecycle::Starting {
+            return;
+        }
+
+        if !self.launch.parked() {
+            return self.open_admission();
+        }
+        // A standby gives its graph pools' storage back while it parks, as its failure domain
+        // resolved.
+        if self.launch.standby_storage == proto::request::StandbyStorage::Suspended
+            && let Some(engine) = self.engine.as_ref()
+        {
+            let data = Arc::clone(&engine.data);
+            return self.serial(Box::new(move || {
+                let suspended = data.suspend_graphs();
+                done(move |main| match suspended {
+                    Ok(()) => main.park(),
+                    Err(error) => {
+                        let reason = format!("suspending the graph storage: {error}");
+                        main.fail(reason.clone(), lifecycle::fault("start", reason, 0));
+                    }
+                })
+            }));
+        }
+        self.park();
+    }
+
+    /// The start ends parked.
+    fn park(&mut self) {
+        self.lifecycle = lifecycle::started(true);
+        self.announce(true);
+        self.report(lifecycle::parked(self.launch.engine, self.generation));
+    }
+
+    /// Opens admission: the graph storage restored, what serving holds reserved and every
+    /// scheduler resumed on the operations thread; then the warm-up on the first opening, and
+    /// `Serving`.
+    fn open_admission(&mut self) {
+        let Some(engine) = self.engine.as_ref() else {
+            return;
+        };
+        let schedulers = engine.inboxes();
+        let data = Arc::clone(&engine.data);
+        self.serial(Box::new(move || {
+            let opened = epoch::promote(&schedulers, &data);
+            done(move |main| main.opened(opened))
+        }));
+    }
+
+    fn opened(&mut self, opened: Result<()>) {
+        if let Err(error) = opened {
+            let reason = format!("opening admission: {error:#}");
+            return self.fail(reason.clone(), lifecycle::fault("promote", reason, 0));
+        }
+        if !matches!(self.lifecycle, Lifecycle::Starting | Lifecycle::Parked) {
+            return;
+        }
+
+        if !self.warmed {
+            self.warm_up();
+            self.warmed = true;
+        }
+        self.lifecycle = Lifecycle::Serving;
+        self.announce(true);
+        self.report(lifecycle::serving(self.launch.engine, self.generation));
+        self.release();
+    }
+
+    /// One command of the process interface.
+    fn command(&mut self, command: proto::process::Command) {
+        let Some(kind) = command.kind else {
+            return;
+        };
+        tracing::info!(
+            command = ?kind,
+            lifecycle = ?self.lifecycle,
+            update = ?self.update,
+            "a command of the process interface"
+        );
+        match kind {
+            command::Kind::Prepare(prepare) => self.prepare(prepare),
+            command::Kind::Switch(switch) => self.switch(switch.generation),
+            command::Kind::Commit(_) => self.commit(),
+            command::Kind::Rollback(rollback) => {
+                let reason = if rollback.reason.is_empty() {
+                    "the daemon rolled the update back".to_owned()
+                } else {
+                    rollback.reason
+                };
+                match lifecycle::rollback(self.lifecycle, &mut self.update, &reason) {
+                    Ok((generation, executed)) => self.roll_back(generation, executed, reason),
+                    Err(report) => self.report(report),
+                }
+            }
+            command::Kind::Drain(drain) => self.drain(drain),
+            command::Kind::Promote(promote) => {
+                self.recompute = promote.recompute;
+                let serving = lifecycle::serving(self.launch.engine, self.generation);
+                match lifecycle::promote(&mut self.lifecycle, serving) {
+                    Ok(true) => {
+                        self.open_admission();
+                        if promote.grow {
+                            self.grow();
+                        }
+                    }
+                    Ok(false) => {}
+                    Err(report) => self.report(report),
+                }
+            }
+            command::Kind::Pause(pause) => {
+                self.paused = pause.paused;
+                self.release();
+            }
+            // A frontend's command: no engine is told where requests go.
+            command::Kind::Serve(_) => {}
+            command::Kind::Grow(_) => self.grow(),
+        }
+    }
+
+    /// `Prepare`: the next generation is made ready beside the one that executes, on a thread
+    /// of its own: its kernels selected, installed and prepared on every executor, its policy
+    /// instantiated once against the ceilings, and, when a kernel package changed, a shadow pass
+    /// of every scheduler.
+    fn prepare(&mut self, prepare: proto::process::Prepare) {
+        let generation = match lifecycle::prepare(self.lifecycle, &mut self.update, self.generation)
+        {
+            Ok(generation) => generation,
+            Err(report) => return self.report(report),
+        };
+        let command = proto::process::Command {
+            kind: Some(command::Kind::Prepare(prepare)),
+        };
+        let parts = match ipc::GenerationCommand::from_command(command, self.generation) {
+            Ok(Some(ipc::GenerationCommand::Prepare {
+                packages, policy, ..
+            })) => self
+                .engine
+                .as_ref()
+                .and_then(|engine| Some((engine, engine.build.clone()?)))
+                .map(|(engine, build)| (engine, build, *packages, policy))
+                .ok_or_else(|| {
+                    "this engine holds no Build Server to resolve modules at".to_owned()
+                }),
+            Ok(_) => Err("the command did not read as a preparation".to_owned()),
+            Err(error) => Err(error.to_string()),
+        };
+        let (engine, build, named, policy) = match parts {
+            Ok(parts) => parts,
+            Err(reason) => {
+                lifecycle::prepare_ended(&mut self.update, generation);
+                return self.report(lifecycle::prepare_failed(reason));
+            }
+        };
+
+        let shadows = engine.shadows();
+        let executors = engine.executors.clone();
+        let ceilings = engine.ceilings;
+        let serving = kernels_of(&self.serving);
+        // A preparation whose shadow pass no running request reaches within twice the stall
+        // bound is abandoned, naming the operators it could not compare.
+        let bound = 2 * self.watchdog.stall_bound();
+        self.work(Box::new(move || {
+            let prepared = generation::kernels(&executors, &build, &named, &serving, generation)
+                .and_then(|kernels| {
+                    let (module, parameters) = generation::policy(&build.0, &policy, &ceilings)?;
+                    // Only an operator whose package changed has an old kernel to compare with.
+                    let changed = changed_operators(&kernels, &serving);
+                    let uncompared = if changed.is_empty() {
+                        Vec::new()
+                    } else {
+                        generation::shadow(&shadows, &executors, generation, &changed, bound)?
+                    };
+                    let mut packages = kernels;
+                    packages.insert(policy_slot(), policy);
+                    Ok(((packages, module, parameters), uncompared))
+                });
+            done(move |main| main.prepared(generation, prepared))
+        }));
+    }
+
+    #[expect(
+        clippy::type_complexity,
+        reason = "the result of one preparation, as its job returns it"
+    )]
+    fn prepared(
+        &mut self,
+        generation: u64,
+        prepared: Result<((Packages, Arc<wasmtime::Module>, Parameters), Vec<String>)>,
+    ) {
+        match prepared {
+            Ok((prepared, uncompared)) => {
+                if !lifecycle::prepared(&mut self.update, generation) {
+                    // A rollback or a drain discarded the update while it was prepared.
+                    return self.discard(generation);
+                }
+                self.prepared = Some(prepared);
+                self.report(lifecycle::report(proto::process::report::Kind::Prepared(
+                    proto::process::Prepared {
+                        generation,
+                        uncompared,
+                    },
+                )));
+            }
+            Err(error) => {
+                lifecycle::prepare_ended(&mut self.update, generation);
+                self.discard(generation);
+                self.report(lifecycle::prepare_failed(format!("{error:#}")));
+            }
+        }
+    }
+
+    /// Discards `generation`, prepared or being prepared, on the operations thread.
+    fn discard(&mut self, generation: u64) {
+        self.prepared = None;
+        let Some(engine) = self.engine.as_ref() else {
+            return;
+        };
+        let shadows = engine.shadows();
+        let executors = engine.executors.clone();
+        self.serial(Box::new(move || {
+            let discarded = generation::discard(&shadows, &executors, generation);
+            done(move |_| {
+                if let Err(error) = discarded {
+                    tracing::warn!(generation, %error, "a discarded generation was not released");
+                }
+            })
+        }));
+    }
+
+    /// `Switch`: the prepared generation executes from one batch boundary of every scheduler,
+    /// the previous one kept; the route instance switches with it.
+    fn switch(&mut self, generation: u64) {
+        if let Err(report) = lifecycle::switch(self.lifecycle, &mut self.update, generation) {
+            return self.report(report);
+        }
+        let (Some(engine), Some((packages, module, parameters))) =
+            (self.engine.as_ref(), self.prepared.take())
+        else {
+            lifecycle::switch_failed(&mut self.update, generation);
+            let reason = format!("generation {generation} holds nothing prepared to switch to");
+            return self.report(lifecycle::prepare_failed(reason));
+        };
+
+        let schedulers = engine.inboxes();
+        let executors = engine.executors.clone();
+        let data = Arc::clone(&engine.data);
+        let served = Arc::clone(&engine.served);
+        let policy = (module, parameters);
+        self.serial(Box::new(move || {
+            let switched =
+                generation::switch(&schedulers, &executors, &data, &served, generation, &policy);
+            done(move |main| main.switched(generation, packages, policy, switched))
+        }));
+    }
+
+    fn switched(
+        &mut self,
+        generation: u64,
+        packages: Packages,
+        (module, parameters): (Arc<wasmtime::Module>, Parameters),
+        switched: Result<()>,
+    ) {
+        if let Err(error) = switched {
+            if lifecycle::switch_failed(&mut self.update, generation) {
+                let reason = format!("the switch to generation {generation} failed: {error:#}");
+                self.report(lifecycle::rolled_back(reason));
+            }
+            return self.discard(generation);
+        }
+
+        self.kept = Some(std::mem::replace(&mut self.serving, packages));
+        self.generation = generation;
+        let snapshot = self.snapshot();
+        if let Some(Err(error)) = self.engine.as_mut().and_then(|engine| {
+            let ceilings = engine.ceilings;
+            let route = engine.route.as_mut()?;
+            Some(route.switch(module, parameters, snapshot, &ceilings))
+        }) {
+            // The executors execute the generation and the route instance cannot: the route
+            // keeps the policy it served, and the whole generation goes back as on any fault on
+            // trial.
+            let reason = format!("the route instance of generation {generation} failed: {error}");
+            self.policy_rolled_back(None, reason, false);
+            if self.update != Update::Trial(generation) {
+                return;
+            }
+        }
+        self.report(lifecycle::report(proto::process::report::Kind::Switched(
+            proto::process::Switched { generation },
+        )));
+    }
+
+    /// The snapshot a route instance starts from: the schedulers and their requests in flight.
+    fn snapshot(&self) -> Snapshot {
+        Snapshot {
+            ranks: self.ranks(),
+            ..Snapshot::default()
+        }
+    }
+
+    /// `Commit`: the generation on trial stays, and the kept one is released after its last
+    /// batch.
+    fn commit(&mut self) {
+        let generation = match lifecycle::commit(&mut self.update, self.generation) {
+            Ok(generation) => generation,
+            Err(report) => return self.report(report),
+        };
+        let Some(engine) = self.engine.as_ref() else {
+            return;
+        };
+        let schedulers = engine.inboxes();
+        let executors = engine.executors.clone();
+        self.serial(Box::new(move || {
+            let committed = generation::commit(&schedulers, &executors, generation);
+            done(move |main| main.committed(generation, committed))
+        }));
+    }
+
+    fn committed(&mut self, generation: u64, committed: Result<()>) {
+        if let Err(error) = committed {
+            let reason = format!("the commit of generation {generation} failed: {error:#}");
+            return self.fail(reason.clone(), lifecycle::fault("commit", reason, 0));
+        }
+        self.kept = None;
+        if let Some(route) = self
+            .engine
+            .as_mut()
+            .and_then(|engine| engine.route.as_mut())
+        {
+            route.commit();
+        }
+        self.report(lifecycle::committed());
+    }
+
+    /// Leaves `generation` for `reason`: switched back at a batch boundary when it `executed`,
+    /// discarded otherwise; acknowledged with `RolledBack` either way.
+    fn roll_back(&mut self, generation: u64, executed: bool, reason: String) {
+        if !executed {
+            self.discard(generation);
+            return self.report(lifecycle::rolled_back(reason));
+        }
+        let Some(engine) = self.engine.as_ref() else {
+            return;
+        };
+        let schedulers = engine.inboxes();
+        let executors = engine.executors.clone();
+        let data = Arc::clone(&engine.data);
+        let served = Arc::clone(&engine.served);
+        // The trial kept the generation before it: generations are numbered one past the one
+        // that executed when each was prepared.
+        let kept = generation - 1;
+        self.serial(Box::new(move || {
+            let rolled =
+                generation::rollback(&schedulers, &executors, &data, &served, generation, kept);
+            done(move |main| main.rolled_back(kept, reason, rolled))
+        }));
+    }
+
+    /// A switch back to `kept` ended.
+    fn rolled_back(&mut self, kept: u64, reason: String, rolled: Result<()>) {
+        if let Err(error) = rolled {
+            let reason = format!("the rollback to generation {kept} failed: {error:#}");
+            return self.fail(reason.clone(), lifecycle::fault("rollback", reason, 0));
+        }
+        // A switch that never took effect kept nothing, and nothing returns.
+        if let Some(packages) = self.kept.take() {
+            self.serving = packages;
+            self.generation = kept;
+            let snapshot = self.snapshot();
+            if let Some(Err(error)) = self
+                .engine
+                .as_mut()
+                .and_then(|engine| engine.route.as_mut())
+                .map(|route| route.rollback(snapshot))
+            {
+                tracing::warn!(%error, "the route instance kept no policy to roll back to");
+            }
+        }
+        self.report(lifecycle::rolled_back(reason));
+    }
+
+    /// `Drain`: every scheduler admits nothing more and steps its requests in flight until each
+    /// ends by itself or the deadline ends it as migratable; an update no switch took is
+    /// discarded. The drain begins on the operations thread, behind every job accepted before it
+    /// that pauses the schedulers, whose `Resume` would end it; a thread of its own then awaits
+    /// every scheduler's reply and queues the drain's end on the operations thread, behind the
+    /// releases of the `Shrunk`s that preceded it.
+    fn drain(&mut self, drain: proto::process::Drain) {
+        match lifecycle::drain(&mut self.lifecycle, drain.epoch) {
+            Ok(true) => {}
+            Ok(false) => return,
+            Err(report) => return self.report(report),
+        }
+        if let Some(generation) = lifecycle::discarded_by_drain(&mut self.update) {
+            self.discard(generation);
+            let reason =
+                format!("the engine drained before generation {generation} was switched to");
+            self.report(lifecycle::rolled_back(reason));
+        }
+        // The daemon's client reads this before the first request ends migratable, on the same
+        // connection, so a request that moves never finds this engine serving.
+        self.announce(false);
+        self.refuse_held("the engine drains and admits nothing");
+
+        let Some(engine) = self.engine.as_ref() else {
+            return;
+        };
+        let deadline = Instant::now() + Duration::from_millis(drain.deadline_ms);
+        let schedulers = engine.inboxes();
+        let (epoch, shrink) = (drain.epoch, drain.shrink);
+        self.serial(Box::new(move || {
+            let replies = epoch::drain(&schedulers, deadline, shrink);
+            done(move |main| main.draining(epoch, replies))
+        }));
+    }
+
+    /// Every scheduler was told to drain, and `replies` arrive once each drained.
+    fn draining(&mut self, epoch: u64, replies: Result<Vec<Receiver<()>>>) {
+        let replies = match replies {
+            Ok(replies) => replies,
+            Err(error) => {
+                let reason = format!("draining: {error:#}");
+                return self.fail(reason.clone(), lifecycle::fault("drain", reason, 0));
+            }
+        };
+        self.work(Box::new(move || {
+            // A scheduler that stopped drops its reply; its `Failed` output says why.
+            for reply in replies {
+                let _ = reply.recv();
+            }
+            done(move |main| {
+                main.outputs_sent();
+                main.serial(Box::new(move || done(move |main| main.drained(epoch))));
+            })
+        }));
+    }
+
+    fn drained(&mut self, epoch: u64) {
+        if !matches!(self.lifecycle, Lifecycle::Draining { .. }) {
+            return;
+        }
+        let serves_again = lifecycle::drained(&mut self.lifecycle);
+        self.metrics();
+        self.report(lifecycle::drained_report(epoch));
+        self.announce(false);
+        if serves_again {
+            self.open_admission();
+        }
+    }
+
+    /// A scheduler's region `region` shrank to `units`: the segments it no longer covers are
+    /// withdrawn and released on the operations thread, and the daemon is told.
+    fn shrunk(&mut self, region: u8, units: u32) {
+        // An engine with no session head of its own holds no segment to release.
+        let Some((engine, head)) = self
+            .engine
+            .as_ref()
+            .and_then(|engine| Some((engine, engine.head.clone()?)))
+        else {
+            return;
+        };
+        let executors = engine.executors.clone();
+        let data = Arc::clone(&engine.data);
+        self.serial(Box::new(move || {
+            let released = epoch::release(&head, &data, &executors, region, units);
+            done(move |main| match released {
+                Ok((devices, _)) if devices.is_empty() => {}
+                Ok((devices, bytes)) => main.report(lifecycle::report(
+                    proto::process::report::Kind::Shrunk(proto::process::Shrunk { devices, bytes }),
+                )),
+                Err(error) => {
+                    let reason = format!("releasing region {region} past unit {units}: {error:#}");
+                    main.fail(reason.clone(), lifecycle::fault("release", reason, 0));
+                }
+            })
+        }));
+    }
+
+    /// `Grow`, or a promotion with `grow`: the ranks create the segments their quotas now hold,
+    /// the head grants them, and the schedulers grow their regions into them.
+    fn grow(&mut self) {
+        let (schedulers, head, data) = match self.segment_parts() {
+            Ok(parts) => parts,
+            Err(error) => {
+                tracing::warn!(error = %format!("{error:#}"), "a grow changes nothing");
+                return;
+            }
+        };
+        self.serial(Box::new(move || {
+            let grown = epoch::grow(&schedulers, &head, &data);
+            done(move |_| {
+                if let Err(error) = grown {
+                    tracing::warn!(error = %format!("{error:#}"), "growing the cache failed");
+                }
+            })
+        }));
+    }
+
+    /// One command of the request interface for the whole engine.
+    fn engine_command(&mut self, front: usize, command: wire::EngineCommand) {
+        use engine_command::Kind;
+
+        let Some(kind) = command.kind else {
+            return;
+        };
+        tracing::info!(front, command = ?kind, "an engine command");
+        match kind {
+            Kind::Shutdown(_) => {
+                self.ending.get_or_insert(Ok(()));
+            }
+            Kind::Attach(attach) => {
+                let engine = self.launch.engine;
+                self.work(Box::new(move || {
+                    let attached = daemon::attach(&attach.requests, engine);
+                    done(move |main| main.attached(&attach.requests, attached))
+                }));
+            }
+            Kind::Hook(hook) => {
+                let Some(data) = self.engine.as_ref().map(|engine| Arc::clone(&engine.data)) else {
+                    return self.hooked(front, hook.id, Err(starting()));
+                };
+                self.work(Box::new(move || {
+                    let results = operations::hook(&data, &hook.name, &hook.payload);
+                    done(move |main| main.hooked(front, hook.id, results))
+                }));
+            }
+            Kind::ResizeCache(resize) => self.resize_cache(front, &resize),
+            Kind::UpdateWeights(update) => self.update_weights(front, update),
+            Kind::CommitExperts(commit) => {
+                let order: BTreeMap<String, Vec<u32>> = commit
+                    .order
+                    .into_iter()
+                    .map(|(module, order)| (module, order.experts))
+                    .collect();
+                if let Some(refusal) = self.lifecycle.boundary_refusal() {
+                    return self.hooked(front, commit.id, Err(anyhow::anyhow!(refusal)));
+                }
+                let Some(engine) = self.engine.as_ref() else {
+                    return self.hooked(front, commit.id, Err(starting()));
+                };
+                let schedulers = engine.inboxes();
+                let data = Arc::clone(&engine.data);
+                self.serial(Box::new(move || {
+                    let results = operations::commit_experts(&schedulers, &data, &order)
+                        .and_then(|reports| reported(&reports));
+                    done(move |main| main.hooked(front, commit.id, results))
+                }));
+            }
+            Kind::FlushCache(_) => {
+                if let Some(refusal) = self.lifecycle.boundary_refusal() {
+                    tracing::warn!(refusal, "a flush is refused");
+                    return;
+                }
+                let Some(engine) = self.engine.as_ref() else {
+                    return;
+                };
+                let schedulers = engine.inboxes();
+                self.serial(Box::new(move || {
+                    let flushed = operations::flush(&schedulers);
+                    done(move |_| {
+                        if let Err(error) = flushed {
+                            tracing::warn!(error = %format!("{error:#}"), "a flush failed");
+                        }
+                    })
+                }));
+            }
+            Kind::Configure(configure) => {
+                let id = configure.id;
+                let (Some(engine), Some(scheduling)) = (self.engine.as_ref(), configure.scheduling)
+                else {
+                    let error = "the engine is starting, or the command states no limits";
+                    return self.configured(front, id, Err(anyhow::anyhow!(error)));
+                };
+                let schedulers = engine.inboxes();
+                let limits = scheduling_limits(&self.launch.engine_config, &scheduling);
+                self.work(Box::new(move || {
+                    let configured = operations::configure(&schedulers, &limits);
+                    done(move |main| main.configured(front, id, configured))
+                }));
+            }
+            // The quotas are each node's daemon's, read over the claim it holds.
+            Kind::DescribeStorage(describe) => {
+                let error = "the quotas are read by each node's daemon over its claim, not by an \
+                             engine";
+                self.hooked(front, describe.id, Err(anyhow::anyhow!(error)));
+            }
+            // Nothing of a request's cache crosses to another epoch, which learns the buffer
+            // pool's cache by `List`.
+            Kind::DescribeRequests(describe) => {
+                let described = wire::RequestsDescribed {
+                    id: describe.id,
+                    error: "nothing of the cache is handed to another epoch".to_owned(),
+                    requests: Vec::new(),
+                };
+                self.send(front, from_engine::Kind::RequestsDescribed(described), None);
+            }
+            Kind::CacheWarm(warm) => {
+                let error = "nothing of the cache is handed to another epoch, which learns the \
+                             buffer pool's cache by `List`";
+                self.hooked(front, warm.id, Err(anyhow::anyhow!(error)));
+            }
+        }
+    }
+
+    /// An attach ended: the daemon at `address` is a further front, told what this engine is.
+    fn attached(&mut self, address: &str, attached: Result<Connection>) {
+        let connection = match attached {
+            Ok(connection) => connection,
+            Err(error) => {
+                // A failed hot restart, not this engine's end: the fronts it has serve on.
+                tracing::warn!(daemon = address, error = %format!("{error:#}"), "an attach failed");
+                return;
+            }
+        };
+        let front = self.fronts.len();
+        let started = connection
+            .writer()
+            .map_err(anyhow::Error::from)
+            .and_then(|writer| {
+                daemon::read_requests(front, connection, self.inbox.0.clone())?;
+                Ok(writer)
+            });
+        match started {
+            Ok(writer) => self.fronts.push(Some(writer)),
+            Err(error) => {
+                tracing::warn!(daemon = address, error = %format!("{error:#}"), "an attach failed");
+                return;
+            }
+        }
+        let state = wire::State {
+            state: self.lifecycle.state() as i32,
+            info: self.announced.clone(),
+            error: String::new(),
+        };
+        self.send(front, from_engine::Kind::State(state), None);
+        tracing::info!(daemon = address, front, "a daemon attached to this engine");
+    }
+
+    /// `ResizeCache`: a sleep, a wake, a growth or room made for a profiling session, each on the
+    /// operations thread, answered with `Hooked`.
+    fn resize_cache(&mut self, front: usize, resize: &wire::ResizeCache) {
+        let id = resize.id;
+        let change = wire::CacheChange::try_from(resize.change);
+        if matches!(
+            change,
+            Ok(wire::CacheChange::Sleep | wire::CacheChange::Wake)
+        ) && let Some(refusal) = self.lifecycle.boundary_refusal()
+        {
+            return self.hooked(front, id, Err(anyhow::anyhow!(refusal)));
+        }
+        let (schedulers, head, data) = match self.segment_parts() {
+            Ok(parts) => parts,
+            Err(error) => return self.hooked(front, id, Err(error)),
+        };
+
+        let job: Job = match change {
+            Ok(wire::CacheChange::Sleep) => Box::new(move || {
+                let slept = operations::sleep(&schedulers, &head, &data);
+                done(move |main| main.hooked(front, id, slept.map(|()| Vec::new())))
+            }),
+            Ok(wire::CacheChange::Wake) => Box::new(move || {
+                let woken = operations::wake(&schedulers, &head, &data);
+                done(move |main| main.hooked(front, id, woken.map(|_| Vec::new())))
+            }),
+            Ok(wire::CacheChange::Grow) => Box::new(move || {
+                let grown = epoch::grow(&schedulers, &head, &data);
+                done(move |main| main.hooked(front, id, grown.map(|_| Vec::new())))
+            }),
+            Ok(wire::CacheChange::MakeRoom) => {
+                let room = resize.room_bytes;
+                let devices = match device_bytes(&resize.device_bytes) {
+                    Ok(devices) => devices,
+                    Err(error) => return self.hooked(front, id, Err(error)),
+                };
+                Box::new(move || {
+                    let made = operations::make_room(&schedulers, &head, &data, room, &devices);
+                    done(move |main| main.hooked(front, id, made.map(|()| Vec::new())))
+                })
+            }
+            Ok(wire::CacheChange::Unspecified) | Err(_) => {
+                let error = anyhow::anyhow!("a cache change that states no change");
+                return self.hooked(front, id, Err(error));
+            }
+        };
+        self.serial(job);
+    }
+
+    /// `UpdateWeights`: the weights are rewritten in place from another checkpoint of the same
+    /// model on the operations thread, answered with each rank's report. With `abort` every
+    /// request the schedulers hold ends first.
+    fn update_weights(&mut self, front: usize, update: wire::UpdateWeights) {
+        let id = update.id;
+        let Ok(in_flight) = wire::WeightsInFlight::try_from(update.in_flight) else {
+            let error = anyhow::anyhow!("unknown in-flight choice {}", update.in_flight);
+            return self.hooked(front, id, Err(error));
+        };
+        if let Some(refusal) = self.lifecycle.boundary_refusal() {
+            return self.hooked(front, id, Err(anyhow::anyhow!(refusal)));
+        }
+        let (schedulers, head, data) = match self.segment_parts() {
+            Ok(parts) => parts,
+            Err(error) => return self.hooked(front, id, Err(error)),
+        };
+
+        // The same model from another checkpoint: the experts keep the order they serve in.
+        let target = Target {
+            checkpoint: PathBuf::from(&update.model_path),
+            ..data.target()
+        };
+        self.serial(Box::new(move || {
+            let updated = operations::update_weights(&schedulers, &head, &data, target, in_flight)
+                .and_then(|reports| reported(&reports));
+            done(move |main| main.hooked(front, id, updated))
+        }));
+    }
+
+    /// What a job that changes the KV planes' segments reads: each scheduler's inbox, the head of
+    /// the session, which states each change of them, and the data plane.
+    ///
+    /// # Errors
+    ///
+    /// While the engine starts, or for an engine that holds no session head of its own.
+    #[expect(
+        clippy::type_complexity,
+        reason = "the three parts a segment job takes, each its own owner's type"
+    )]
+    fn segment_parts(
+        &self,
+    ) -> Result<(
+        Vec<Sender<Message>>,
+        Arc<Mutex<StorageClient>>,
+        Arc<crate::data_plane::DataPlane>,
+    )> {
+        let engine = self.engine.as_ref().ok_or_else(starting)?;
+        let head = engine.head.clone().context(
+            "this engine holds no session with a Storage Server of its own, whose segments an \
+             operation would change",
+        )?;
+        Ok((engine.inboxes(), head, Arc::clone(&engine.data)))
+    }
+
+    /// Answers the engine command `id` of front `front` with `Hooked`: each rank's result, or why
+    /// the command failed.
+    fn hooked(&mut self, front: usize, id: u64, results: Result<Vec<String>>) {
+        let hooked = match results {
+            Ok(results) => wire::Hooked {
+                id,
+                results,
+                error: String::new(),
+            },
+            Err(error) => wire::Hooked {
+                id,
+                results: Vec::new(),
+                error: format!("{error:#}"),
+            },
+        };
+        self.send(front, from_engine::Kind::Hooked(hooked), None);
+    }
+
+    /// Answers the `Configure` `id` of front `front`.
+    fn configured(&mut self, front: usize, id: u64, configured: Result<()>) {
+        let error = configured
+            .err()
+            .map(|error| format!("{error:#}"))
+            .unwrap_or_default();
+        self.send(
+            front,
+            from_engine::Kind::Configured(wire::Configured { id, error }),
+            None,
+        );
     }
 }
 
-/// Waits on one scheduler's response, no longer than the stall bound.
-fn response(
-    receiver: crossbeam_channel::Receiver<std::result::Result<(), String>>,
-    bound: Duration,
-    what: &str,
-) -> Result<()> {
-    match receiver.recv_timeout(bound) {
-        Ok(Ok(())) => Ok(()),
-        Ok(Err(error)) => bail!("{what} failed: {error}"),
-        Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
-            bail!("{what} did not respond within the stall bound")
-        }
-        Err(crossbeam_channel::RecvTimeoutError::Disconnected) => {
-            bail!("{what} lost its scheduler")
-        }
+/// Why an operation is refused while the engine starts.
+fn starting() -> anyhow::Error {
+    anyhow::anyhow!("the engine is starting and holds nothing to operate on yet")
+}
+
+/// Each rank's report of a change of its weights, as the JSON text a `Hooked` result is.
+///
+/// # Errors
+///
+/// A report that does not encode.
+fn reported(reports: &[WeightsUpdated]) -> Result<Vec<String>> {
+    reports
+        .iter()
+        .map(|report| serde_json::to_string(report).context("encoding a rank's report"))
+        .collect()
+}
+
+/// The bytes a `MakeRoom` states for each GPU it names, by the GPU's identity.
+///
+/// # Errors
+///
+/// An identity that is not the sixteen bytes of a GPU's UUID.
+fn device_bytes(devices: &[wire::DeviceBytes]) -> Result<BTreeMap<[u8; 16], u64>> {
+    devices
+        .iter()
+        .map(|device| {
+            let gpu: [u8; 16] = device.gpu.as_slice().try_into().map_err(|_| {
+                anyhow::anyhow!(
+                    "a GPU's identity is 16 bytes, and a room names one of {}",
+                    device.gpu.len()
+                )
+            })?;
+            Ok((gpu, device.bytes))
+        })
+        .collect()
+}
+
+/// The scheduling limits a `Configure` states (`Scheduling`), each one it leaves out the epoch's
+/// configuration `config` resolves: the batch, the running requests, the token budget and the
+/// prefill chunk the configuration states, and an unbounded waiting queue. A reconfigure carries
+/// no graph catalog.
+fn scheduling_limits(config: &EngineConfig, scheduling: &wire::Scheduling) -> SchedulerConfig {
+    let max_batch = match scheduling.max_batch {
+        0 => config.scheduler.max_batch.get(),
+        batch => batch as usize,
+    };
+    let tokens = scheduling.max_num_batched_tokens.map_or_else(
+        || {
+            config
+                .max_num_batched_tokens
+                .map_or(config.scheduler.max_num_batched_tokens, NonZeroUsize::get)
+        },
+        |tokens| tokens as usize,
+    );
+
+    let mut limits = SchedulerConfig::of(config, max_batch, tokens, Vec::new());
+    if scheduling.max_running_requests > 0 {
+        limits.max_running_requests = scheduling.max_running_requests as usize;
     }
+    limits.max_queued_requests = scheduling
+        .max_queued_requests
+        .and_then(|requests| NonZeroUsize::new(usize::try_from(requests).unwrap_or(usize::MAX)));
+    if let Some(chunk) = scheduling.chunked_prefill_size {
+        limits.chunked_prefill_size = NonZeroUsize::new(chunk as usize);
+    }
+    limits
 }

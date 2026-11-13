@@ -1,18 +1,18 @@
 //! A recorded start: the kernels a deployment's main process launches, read from the start a
 //! serving process makes, with nothing served (`uniserve packages`).
 //!
-//! [`record`] takes the launch a serving main process is started with and runs each of its
-//! ranks' starts through the runner's profile run on the meta device
+//! [`record`] takes the launch a serving main process is started with and runs the first half of
+//! each of its ranks' starts, to the runner's profile run, on the meta device
 //! (`specs/engine-worker-port.md` §1.1, steps 4 to 8): the same family resolution, rank placement,
-//! model construction, cache layout and runner construction, through the same functions
-//! ([`Backing::Meta`]). It starts nothing the profile run does not read:
+//! model construction, cache layout and runner construction, through the same function
+//! ([`load_ranks`] onto [`Backing::Meta`]). It starts nothing the profile run does not read:
 //!
 //! - no daemon connection: the epoch is the one the launch states;
 //! - no Storage Server: each weight's element type and extents come from the checkpoint's shard
 //!   headers ([`nn::WeightLoader::meta`]), no payload is read and nothing is published;
 //! - no device memory and no communicator: a profile run launches nothing, and a parallel group
 //!   states its split alone;
-//! - no Build Server, scheduler or executor.
+//! - no session with the buffer pool, Build Server, scheduler or executor.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;

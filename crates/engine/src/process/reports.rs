@@ -1,349 +1,330 @@
-//! What this process states to its daemon: the schedulers' and devices' counters once a second,
-//! its reports on the process interface, and its lifecycle state and description on the request
+//! What the process states to its daemon: its lifecycle state and what it serves on every
+//! request front, the schedulers' statistics and the process's metrics once a second, the
+//! watchdog's stalls and sticky errors, and the failures and faults it observed on the process
 //! interface.
 
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
-use anyhow::{Context as _, Result};
-use worker::control::Control;
+use ipc::batch::BatchId;
+use proto::process::report;
+use proto::report::SchedulerStats;
+use proto::request::RequestId;
+use proto::request::wire::{self, from_engine};
 
 use super::MainProcess;
+use super::lifecycle::{self, Lifecycle};
 
-/// States an engine's lifecycle state on the request interface.
-pub(super) fn announce(
-    control: &mut Control,
-    state: proto::request::wire::EngineState,
-    info: Option<proto::request::wire::EngineInfo>,
-) -> Result<()> {
-    let message = proto::request::wire::FromEngine {
-        kind: Some(proto::request::wire::from_engine::Kind::State(
-            proto::request::wire::State {
-                state: state as i32,
-                info,
-                error: String::new(),
-            },
-        )),
-    };
-
-    // Every live front is told: a handover closes the launching daemon's front and leaves the
-    // attached ones serving, so a state stated to that front alone would end this process for a
-    // daemon that left.
-    let mut delivered = 0;
-    let mut failure = None;
-    for front in control.report_fronts() {
-        let Some(connection) = control.front_mut(front) else {
-            continue;
-        };
-        match connection.send(&message) {
-            Ok(()) => delivered += 1,
-            Err(error) => failure = Some(error),
-        }
-    }
-    match failure {
-        Some(error) if delivered == 0 => {
-            Err(error).context("stating what this process is to the daemon")
-        }
-        _ => Ok(()),
-    }
-}
-
-/// States on every live front that this engine failed, and why: the process ends next, and a
-/// connection that closes says only that it went.
-pub(super) fn state_failure(control: &mut Control, reason: &str) {
-    let message = proto::request::wire::FromEngine {
-        kind: Some(proto::request::wire::from_engine::Kind::State(
-            proto::request::wire::State {
-                state: proto::request::wire::EngineState::Failed as i32,
-                info: None,
-                error: reason.to_owned(),
-            },
-        )),
-    };
-    for front in control.report_fronts() {
-        let Some(connection) = control.front_mut(front) else {
-            continue;
-        };
-        if let Err(error) = connection.send(&message) {
-            tracing::warn!(%error, front, "a daemon was not told why this engine failed");
-        }
-    }
-}
-
-/// How long a metrics pass waits on one scheduler's counters: the report is sent once a second and a
-/// pass that waited longer than this would be reporting what the next pass reports anyway.
-const METRICS_WAIT: Duration = Duration::from_millis(50);
+/// How often the process states its metrics.
+pub(super) const METRICS_EVERY: Duration = Duration::from_secs(1);
 
 impl MainProcess {
-    /// Sends the engine's counters to the daemon, one report a second and a
-    /// final flush when the process ends.
-    ///
-    /// The worker states its own figures: the launches and device nanoseconds
-    /// its runners counted, the jobs in flight the control thread's watchdog
-    /// reads, and the pools the arena reserves against the rank's budget - which is
-    /// the Storage Server's quota invariant, a device never mapping more than its budget
-    /// allows. The scheduler-owned counters (`steps`, `batches`, `tokens`, the
-    /// policy's fuel and calls) come from the schedulers' handle and stay zero
-    /// until it exists.
-    pub(super) fn send_metrics(&mut self) {
-        // The driver calls this thread waited in, and the range records an idle device left
-        // unread, reach the next batch output.
-        let current = platform::cupti::blocking::Calls::current();
-        worker::profiling::counters::add_blocking("control", &current.since(&self.control_calls));
-        self.control_calls = current;
-        if let Some(fences) = worker::profiling::fences::Fences::installed() {
-            fences.poll(false);
-        }
-        let mut kernel_launches = 0_u64;
-        let mut device_ns = 0_u64;
-        let mut queue = Vec::with_capacity(self.workers.len());
-        let mut memory = Vec::with_capacity(self.workers.len());
-        for (rank, worker) in self.workers.iter().enumerate() {
-            let counters = worker.counters();
-            kernel_launches += counters.kernel_launches;
-            device_ns += counters.device_ns;
-            queue.push(proto::request::wire::QueueDepth {
-                rank: rank as u32,
-                depth: u32::from(worker.running(0).is_some()),
-            });
-            // One allocator reserves the device's three pools (`arena::DeviceMemory`), so the three
-            // figures sum against one budget and item 5's invariant is reported as it is decided.
-            let pools = worker.memory();
-            memory.push(proto::request::wire::DeviceMemory {
-                device: worker.device().0 as u32,
-                budget: pools.budget,
-                pools: ["graph", "scratch", "resident"]
-                    .into_iter()
-                    .zip([pools.graph, pools.scratch, pools.resident])
-                    .map(|(pool, mapped)| proto::request::wire::PoolMemory {
-                        pool: pool.to_owned(),
-                        mapped,
-                    })
-                    .collect(),
-            });
-        }
-        // The schedulers state their own figures; a node that holds none reports the workers'
-        // and a step count of zero, because no step happened here.
-        let (mut steps, mut batches, mut tokens, mut policy_fuel, mut policy_calls) =
-            (0, 0, 0, 0, 0);
-        for scheduler in &self.schedulers {
-            // A scheduler states its counters on its own thread: a metrics report is not worth
-            // stalling the control thread for, so the report takes what is there.
-            let Ok(counters) = scheduler.counters().recv_timeout(METRICS_WAIT) else {
-                continue;
-            };
-            steps += counters.steps;
-            batches += counters.batches;
-            tokens += counters.tokens;
-            policy_fuel += counters.policy_fuel;
-            policy_calls += counters.policy_calls;
-            // The launches and the device time are the workers', counted where they are issued:
-            // a scheduler's copy of them would be a second source for one figure.
-        }
-        let metrics = proto::request::wire::Metrics {
-            steps,
-            batches,
-            tokens,
-            kernel_launches,
-            device_ns,
-            queue,
-            policy_fuel,
-            policy_calls,
-            memory,
-        };
-        // The scheduler statistics travel beside the counters: a daemon records
-        // `uniserve:num_requests_running` and its kind from this snapshot, so a process that
-        // sent only the allocator's figures would report an idle deployment forever.
-        let mut snapshots = Vec::with_capacity(self.schedulers.len());
-        for (index, (scheduler, reporter)) in self
-            .schedulers
-            .iter()
-            .zip(&mut self.stats_reporters)
-            .enumerate()
-        {
-            let snapshot = reporter.snapshot(scheduler.stats());
-            if let Ok(snapshot) = snapshot.encode() {
-                snapshots.push(proto::request::wire::Stats {
-                    scheduler: index as u32,
-                    snapshot,
-                });
-            }
-        }
-        // Every live front is told: the daemon that launched this process, and each daemon
-        // that attached to it. A handover closes the launching daemon's front
-        // and leaves the successor's serving, so a report aimed at index 0 alone would stop
-        // exactly when the successor owns the engine - and the successor's `/metrics` would
-        // hold no figure of what it inherited. Each daemon keeps its own registry, so a report
-        // on each front is one figure per registry.
-        let fronts = self.control.report_fronts();
-        let mut delivered = 0;
-        let mut failure = None;
-        for front in fronts {
-            let Some(connection) = self.control.front_mut(front) else {
-                continue;
-            };
-            let sent = connection
-                .send(&proto::request::wire::FromEngine {
-                    kind: Some(proto::request::wire::from_engine::Kind::Metrics(
-                        metrics.clone(),
-                    )),
-                })
-                .and_then(|()| {
-                    for stats in &snapshots {
-                        connection.send(&proto::request::wire::FromEngine {
-                            kind: Some(proto::request::wire::from_engine::Kind::Stats(
-                                stats.clone(),
-                            )),
-                        })?;
-                    }
-                    Ok(())
-                });
-            match sent {
-                Ok(()) => delivered += 1,
-                Err(error) => failure = Some(error),
-            }
-        }
-        if delivered == 0
-            && let Some(error) = failure
-        {
-            tracing::warn!(
-                %error,
-                "reporting the engine's metrics failed: no front of this process is live"
-            );
-        }
-    }
-
-    /// States the lifecycle state this engine is in on the request interface, to every live
-    /// front, `described` with what it serves: the limits, the batch capacity and the KV cache
-    /// segments a successor maps.
-    ///
-    /// The daemon's launch path waits for the state a start ends in - `SERVING`, or `PARKED` for
-    /// an engine started beside a serving one - and records the description it carries. A state
-    /// that changes nothing of what the engine holds (a drain's `DRAINING` and `PARKED`) is
-    /// stated without one and keeps what was announced: describing the cache asks every scheduler
-    /// for what it holds.
-    pub(super) fn announce(&mut self, described: bool) -> Result<()> {
-        let state = self.state.lifecycle().state();
+    /// States the lifecycle state the engine is in on every live front, `described` with what it
+    /// serves ([`Self::engine_info`]), which the daemon records from the state a start or a
+    /// promotion ends in. A state that changes nothing the engine serves (`Draining`, a drained
+    /// `Parked`, `Stopped`) is stated without it.
+    pub(super) fn announce(&mut self, described: bool) {
         let info = if described {
-            let info = self.engine_info()?;
-            self.announced = Some(info.clone());
-            Some(info)
+            self.announced = self.engine_info();
+            self.announced.clone()
         } else {
             None
         };
-        tracing::info!(
-            state = ?state,
-            schedulers = self.schedulers.len(),
-            devices = self.workers.len(),
-            "stating what this engine is to the daemon"
-        );
-        announce(&mut self.control, state, info)
+        let state = wire::State {
+            state: self.lifecycle.state() as i32,
+            info,
+            error: String::new(),
+        };
+        tracing::info!(state = ?self.lifecycle.state(), "stating what this engine is");
+        self.broadcast(&from_engine::Kind::State(state));
     }
 
-    /// What an attaching daemon is told this process is: the info it announced, for a state that
-    /// carries one, and nothing otherwise.
-    pub(super) fn announced_info(&mut self) -> Option<proto::request::wire::EngineInfo> {
-        // The value announced, not a fresh one: describing the cache asks every scheduler for
-        // what it holds, and a scheduler that is busy does not respond for as long as the stall
-        // bound - which is a control thread that cannot serve the handover's own attach.
-        self.announced.clone()
-    }
-
-    /// What the daemon records of this process: the limits every request is checked against, the
-    /// batch the workers were started for, and the KV cache segments a successor on the same
-    /// devices maps.
+    /// What the daemon records of this engine: the limits every request is checked against, its
+    /// schedulers, the batch its executors were started for and the page seeds of its cache
+    /// groups. `None` before the start ended.
     ///
-    /// The figures are the workers' own (`SchedulerHandle::info`), except the cache segments, which
-    /// each scheduler describes for itself: a successor needs what the workers hold now, not what
-    /// this process sized at its start.
-    pub(super) fn engine_info(&self) -> Result<proto::request::wire::EngineInfo> {
-        // A peer of an epoch over several hosts holds ranks and no scheduler: it admits no request
-        // and holds no cache a successor maps, so it states that it schedules nothing.
-        if self.schedulers.is_empty() && matches!(self.peers, super::Peers::Peer { .. }) {
-            return Ok(proto::request::wire::EngineInfo::default());
-        }
-        let first = self
-            .schedulers
-            .first()
-            .context("this process runs no scheduler, so it states no engine info")?;
-        let info = first.info();
-        let mut segments = Vec::new();
-        for scheduler in &self.schedulers {
-            // A group that cannot describe its cache is reported with what the others stated rather
-            // than failing the start: the segments are what a *successor* maps, and a successor that
-            // finds one missing refuses by name.
-            let groups = match scheduler
-                .describe_cache()
-                .recv_timeout(self.watchdog.stall_bound())
-            {
-                Ok(Ok(groups)) => groups,
-                Ok(Err(error)) => {
-                    tracing::warn!(%error, "a worker group did not describe its cache");
-                    continue;
-                }
-                Err(error) => {
-                    tracing::warn!(%error, "a scheduler did not describe its cache in time");
-                    continue;
-                }
-            };
-            segments.extend(groups.into_iter().map(|group| {
-                proto::request::wire::CacheSegments {
-                    worker_group: group.worker_group,
-                    segments: group
-                        .segments
-                        .into_iter()
-                        .map(|segment| proto::request::wire::CacheSegment {
-                            epoch: segment.epoch,
-                            ordinal: segment.ordinal,
-                            units: segment.units,
-                        })
-                        .collect(),
-                    held: group.held,
-                    units: group.units,
-                    scratch: group.scratch,
-                }
-            }));
-        }
-        Ok(proto::request::wire::EngineInfo {
-            limits: Some((&first.generation_limits()).into()),
-            video_denoiser: info
-                .video_denoiser
-                .as_ref()
-                .map(|denoiser| denoiser.description.clone())
-                .unwrap_or_default(),
-            latent_encoding_units: first
-                .media_units(ipc::MediaCall::LatentEncoding)
-                .unwrap_or(0),
-            schedulers: u32::try_from(self.schedulers.len()).unwrap_or(u32::MAX),
-            capacity: Some(proto::request::wire::BatchCapacity {
-                max_batch: info.max_batch_calls,
-                max_num_batched_tokens: u64::from(info.max_batch_tokens),
-                // The launch's own figure, not the worker's row count: the rows include the
-                // guidance prefix, which is not a request.
-                max_running_requests: self.max_running_requests,
-            }),
-            segments,
-            prefix_seeds: info.prefix_cache.as_ref().map_or_else(Vec::new, |cache| {
-                scheduler::prefix_seeds(cache)
-                    .into_iter()
-                    .zip(&cache.groups)
-                    .filter_map(|(seed, group)| {
-                        (!matches!(group.kind, ipc::CacheGroupKind::Draft))
-                            .then_some(seed.0.to_vec())
-                    })
+    /// A process with no scheduler (a peer) states its limits and no scheduler. It states no KV
+    /// cache segments: nothing of the cache is handed to another epoch, which learns the buffer
+    /// pool's cache by `List`.
+    pub(super) fn engine_info(&self) -> Option<wire::EngineInfo> {
+        let engine = self.engine.as_ref()?;
+
+        // The seeds of the cache groups every rank computes; a draft cache's pages are its own
+        // and reach no other epoch.
+        let prefix_seeds = engine
+            .capacities
+            .iter()
+            .map(|(_, capacity)| capacity)
+            .find(|capacity| !capacity.seeds.is_empty())
+            .map(|capacity| {
+                capacity
+                    .seeds
+                    .iter()
+                    .zip(&capacity.cache_groups)
+                    .filter(|(_, (kind, _))| !matches!(kind, ipc::CacheGroupKind::Draft))
+                    .map(|(seed, _)| seed.0.to_vec())
                     .collect()
+            })
+            .unwrap_or_default();
+
+        // A bound no captured bucket states binds nothing, which the wire states as zero.
+        let max_batch = u32::try_from(engine.ceilings.max_batch).unwrap_or(0);
+        let max_num_batched_tokens = match engine.ceilings.max_num_batched_tokens {
+            u32::MAX => 0,
+            tokens => u64::from(tokens),
+        };
+        Some(wire::EngineInfo {
+            limits: Some((&engine.limits).into()),
+            video_denoiser: Vec::new(),
+            latent_encoding_units: 0,
+            schedulers: u32::try_from(engine.schedulers.len()).unwrap_or(u32::MAX),
+            capacity: Some(wire::BatchCapacity {
+                max_batch,
+                max_num_batched_tokens,
+                max_running_requests: u32::try_from(
+                    self.launch.engine_config.max_running_requests.get(),
+                )
+                .unwrap_or(u32::MAX),
             }),
-            latent_seed: first.latent_seed(),
+            segments: Vec::new(),
+            prefix_seeds,
+            latent_seed: 0,
         })
     }
 
-    /// States one report to the daemon on the process interface.
-    ///
-    /// A report is unasked, so a failure to state it costs the daemon's record and not this
-    /// engine's service: it is logged, and the engine's own transition has already happened.
-    pub(super) fn send_report(&mut self, report: proto::process::Report) {
+    /// One scheduler's statistics of the last second: forwarded to every front, and counted into
+    /// the metrics. The scheduler's step, batch and policy counts are lifetime values, of which
+    /// the metrics state the sum over the schedulers; its tokens are the interval's, which the
+    /// metrics sum since the start.
+    pub(super) fn stats(&mut self, scheduler: usize, stats: SchedulerStats) {
+        let lifetime = [
+            stats.steps,
+            stats.step_counter,
+            stats.policy_calls,
+            stats.policy_fuel,
+        ];
+        if self.lifetime.len() <= scheduler {
+            self.lifetime.resize(scheduler + 1, [0; 4]);
+        }
+        let before = std::mem::replace(&mut self.lifetime[scheduler], lifetime);
+        let grown = |index: usize| lifetime[index].saturating_sub(before[index]);
+        self.metrics.steps += grown(0);
+        self.metrics.batches += grown(1);
+        self.metrics.policy_calls += grown(2);
+        self.metrics.policy_fuel += grown(3);
+        self.metrics.tokens += stats.batch_tokens;
+
+        let rank = u32::try_from(scheduler).unwrap_or(u32::MAX);
+        let depth = u32::try_from(stats.num_waiting_reqs).unwrap_or(u32::MAX);
+        match self
+            .metrics
+            .queue
+            .iter_mut()
+            .find(|queue| queue.rank == rank)
+        {
+            Some(queue) => queue.depth = depth,
+            None => self.metrics.queue.push(wire::QueueDepth { rank, depth }),
+        }
+
+        match stats.encode() {
+            Ok(snapshot) => self.broadcast(&from_engine::Kind::Stats(wire::Stats {
+                scheduler: rank,
+                snapshot,
+            })),
+            Err(error) => tracing::warn!(%error, "a scheduler's statistics did not encode"),
+        }
+    }
+
+    /// States the process's metrics on every front: the schedulers' sums since the start, and the
+    /// device time the executors spent in forwards (`Executor::counters`).
+    pub(super) fn metrics(&mut self) {
+        let Some(engine) = self.engine.as_ref() else {
+            return;
+        };
+        // The executors count the forwards they ran and their time, not the kernels those
+        // launched: the launches are stated as none.
+        self.metrics.device_ns = engine
+            .executors
+            .iter()
+            .map(|executor| executor.counters().1)
+            .sum();
+        let metrics = self.metrics.clone();
+        self.broadcast(&from_engine::Kind::Metrics(metrics));
+    }
+
+    /// The watchdog's rules at `now` and the metrics' second: a job an executor has been inside
+    /// for the stall bound is a stall, and while a job has been in flight for a second every
+    /// device's context is checked once a second for a sticky error; both fail the epoch. A
+    /// change of the ranks' weights that failed part of the way fails it too.
+    pub(super) fn watch(&mut self, now: Instant) {
+        if now >= self.next_metrics {
+            self.metrics();
+            self.next_metrics = now + METRICS_EVERY;
+        }
+        let Some(engine) = self.engine.as_ref() else {
+            return;
+        };
+
+        let in_flight = self.in_flight();
+        let mut failure = None;
+        if let Some((rank, stall)) = self.watchdog.stalls(now, &in_flight).into_iter().next() {
+            let job = engine
+                .executors
+                .get(rank)
+                .and_then(|executor| executor.performing())
+                .unwrap_or_default();
+            let reason = format!(
+                "a job of rank {rank} ({job}) ran {} ms, past the stall bound",
+                stall.running_ms
+            );
+            let stalled = lifecycle::report(report::Kind::Stalled(proto::process::Stalled {
+                generation: self.generation,
+                batch: stall
+                    .batch_id
+                    .map(|batch| batch.to_string())
+                    .unwrap_or_default(),
+                job,
+                elapsed_ms: stall.running_ms,
+            }));
+            failure = Some((reason, stalled));
+        }
+
+        if failure.is_none() && self.watchdog.check_due(now, &in_flight) {
+            self.watchdog.checked(now);
+            for executor in &engine.executors {
+                let device = executor.device().map_or(0, |device| device.0);
+                let device = u32::try_from(device).unwrap_or_default();
+                match executor.sticky_error() {
+                    Ok(None) => {}
+                    Ok(Some(error)) => {
+                        let reason = format!("device {device} reports a sticky error: {error}");
+                        let fault = lifecycle::fault("sticky", error.to_string(), device);
+                        failure = Some((reason, fault));
+                        break;
+                    }
+                    Err(error) => {
+                        tracing::warn!(device, %error, "a device's context could not be read");
+                    }
+                }
+            }
+        }
+        self.watchdog.settled(&in_flight);
+
+        if failure.is_none()
+            && let Some(reason) = engine.data.poisoned()
+        {
+            let reason = format!("a change of the ranks' weights failed part of the way: {reason}");
+            failure = Some((reason.clone(), lifecycle::fault("weights", reason, 0)));
+        }
+        if let Some((reason, report)) = failure {
+            self.fail(reason, report);
+        }
+    }
+
+    /// What each executor of the process has in flight, in rank order, as the watchdog reads it.
+    pub(super) fn in_flight(&self) -> Vec<Option<(Instant, Option<BatchId>)>> {
+        self.engine.as_ref().map_or_else(Vec::new, |engine| {
+            engine
+                .executors
+                .iter()
+                .map(|executor| executor.in_flight())
+                .collect()
+        })
+    }
+
+    /// The epoch fails for `reason`: every request this engine holds ends as migratable, every
+    /// front is told why, the daemon receives `report`, and the process ends without its orderly
+    /// close. A failure after the first changes nothing more.
+    pub(super) fn fail(&mut self, reason: String, report: proto::process::Report) {
+        if self.lifecycle == Lifecycle::Failed {
+            return;
+        }
+        tracing::error!(%reason, "the epoch fails");
+        self.lifecycle = Lifecycle::Failed;
+        self.lose();
+        self.broadcast(&from_engine::Kind::State(wire::State {
+            state: wire::EngineState::Failed as i32,
+            info: None,
+            error: reason.clone(),
+        }));
+        self.report(report);
+        self.ending = Some(Err(anyhow::anyhow!(reason)));
+    }
+
+    /// A batch computed non-finite logits for `requests`: each is reported, and a generation on
+    /// trial rolls back by itself; outside a trial the daemon decides.
+    pub(super) fn numerical_fault(&mut self, batch: BatchId, requests: Vec<RequestId>) {
+        tracing::warn!(
+            batch = batch.0,
+            ?requests,
+            "a batch computed non-finite logits"
+        );
+        for request in &requests {
+            self.report(lifecycle::report(report::Kind::NonFiniteLogits(
+                proto::process::NonFiniteLogits {
+                    request: request.0.to_string(),
+                },
+            )));
+        }
+        if let Some(generation) = lifecycle::fault_on_trial(self.lifecycle, &mut self.update) {
+            let reason = format!(
+                "batch {} of generation {generation} computed non-finite logits",
+                batch.0
+            );
+            self.roll_back(generation, true, reason);
+        }
+    }
+
+    /// The scheduling policy of scheduler `scheduler` (the route instance for `None`) faulted:
+    /// the previous policy serves again unless `fatal`, when none is left. Reported with the
+    /// serving policy package; a generation on trial rolls back by itself, and a fatal fault
+    /// outside a trial fails the epoch.
+    pub(super) fn policy_rolled_back(
+        &mut self,
+        scheduler: Option<usize>,
+        reason: String,
+        fatal: bool,
+    ) {
+        let policy = self.serving.get(&super::policy_slot());
+        let report = lifecycle::report(report::Kind::PolicyRolledBack(
+            proto::process::PolicyRolledBack {
+                scheduler: scheduler.map(|index| u32::try_from(index).unwrap_or(u32::MAX)),
+                backend: policy
+                    .map(|package| package.backend.clone())
+                    .unwrap_or_default(),
+                revision: policy.map_or(0, |package| package.revision),
+                reason: reason.clone(),
+                fatal,
+            },
+        ));
+        self.report(report);
+
+        if let Some(generation) = lifecycle::fault_on_trial(self.lifecycle, &mut self.update) {
+            let reason = format!("the policy of generation {generation} faulted: {reason}");
+            self.roll_back(generation, true, reason);
+        } else if fatal {
+            let reason =
+                format!("the scheduling policy faulted with none to roll back to: {reason}");
+            self.fail(reason.clone(), lifecycle::fault("policy", reason, 0));
+        }
+    }
+
+    /// Sends one report on the process interface. A report is unasked, so one the daemon cannot
+    /// read costs its record and not the engine's service.
+    pub(super) fn report(&mut self, report: proto::process::Report) {
         tracing::info!(report = ?report.kind, "reporting to the daemon");
-        if let Err(error) = self.process.report(report) {
-            tracing::warn!(%error, "reporting this engine's state to the daemon failed");
+        let Some(process) = self.process.as_mut() else {
+            tracing::debug!("the process interface closed; a report goes nowhere");
+            return;
+        };
+        if let Err(error) = super::daemon::report(process, report) {
+            tracing::warn!(%error, "reporting to the daemon failed");
+        }
+    }
+
+    /// Sends one frame to every live front: every daemon keeps its own record of the engine.
+    pub(super) fn broadcast(&mut self, kind: &from_engine::Kind) {
+        for front in 0..self.fronts.len() {
+            self.send(front, kind.clone(), None);
         }
     }
 }

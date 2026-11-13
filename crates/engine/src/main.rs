@@ -33,9 +33,10 @@ static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 /// The model families this executable loads. A model is added with its crate
 /// and one entry here, and its request-processing side in
 /// `processing::FAMILIES`, which the daemon serves.
-const FAMILIES: [nn::family::Family; 3] = [
+const FAMILIES: [nn::family::Family; 4] = [
     qwen3::family::FAMILY,
     qwen3::family::HYBRID_FAMILY,
+    qwen4_exp::family::FAMILY,
     minimax_h3::family::FAMILY,
 ];
 
@@ -77,7 +78,7 @@ fn main() -> Result<ExitCode> {
     }));
     let lifeline = take_lifeline();
     let cli = Cli::parse();
-    let registry = nn::family::Catalogue::new(FAMILIES)?;
+    let registry = nn::family::Registry::new(FAMILIES)?;
 
     if cli.keys {
         // The key list is this command's output, so its logs go to standard
