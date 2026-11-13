@@ -154,7 +154,7 @@ pub(crate) fn groups(
     let servable = |what: &str, requests: Vec<GenerationRequest>| {
         // A deployment with block sampling generates every request in
         // blocks, so admission checks its block features.
-        let blocks = facts.block_sampling.is_some();
+        let blocks = crate::BLOCK_SAMPLING.is_some();
         let (kept, refused): (Vec<_>, Vec<_>) = requests.into_iter().partition(|request| {
             let needs = if blocks {
                 request.block_features()
@@ -191,7 +191,7 @@ pub(crate) fn groups(
     }
 
     if info.diffusion_lm_step_rows > 0 {
-        let sampling = facts.block_sampling.context(
+        let sampling = crate::BLOCK_SAMPLING.context(
             "workers report diffusion LM step rows but the deployment has no block sampling",
         )?;
         let length = sampling.block_length as usize;
@@ -318,7 +318,6 @@ fn await_finish(core: &Warm, group: &str, stream: &mut EventRx) -> anyhow::Resul
 #[cfg(test)]
 mod tests {
     use crate::{GenerationFeatures, GenerationLimits};
-    use ipc::BlockSampling;
 
     use super::*;
 
@@ -383,55 +382,5 @@ mod tests {
             commands: crate::CommandSender::new(commands),
         };
         warm(&intent, &args).expect("a CPU deployment has nothing to warm");
-    }
-
-    #[test]
-    fn a_diffusion_lm_steps_at_every_row_count_and_commits_a_block() {
-        let sampling = BlockSampling {
-            block_length: 16,
-            max_steps: 2,
-            entropy_bound: 0.1,
-            t_min: 0.4,
-            t_max: 0.8,
-            confidence_threshold: 0.005,
-            stability_threshold: 1,
-        };
-        // The rank prefills prompts and denoises blocks, three rows a step.
-        let info = ipc::MainProcessInfo {
-            supported_calls: vec![
-                CallKind::Forward(ForwardMode::Prefill),
-                CallKind::Forward(ForwardMode::TokenDenoising),
-            ],
-            diffusion_lm_step_rows: 3,
-            ..testkit::rank("localhost")
-        };
-        let mut args = cuda_args();
-        let model = &mut args.engine_config.model;
-        model.generation_limits = GenerationLimits {
-            features: GenerationFeatures::UNDERSTANDING | GenerationFeatures::TOKEN_DENOISING,
-            ..model.generation_limits.clone()
-        };
-        model.block_sampling = Some(sampling);
-        let limits = model.generation_limits.clone();
-
-        let groups = groups_of(&args, &info, &limits);
-        let rows: Vec<usize> = groups
-            .iter()
-            .filter(|group| group.what == "diffusion LM")
-            .map(|group| group.requests.len())
-            .collect();
-        assert_eq!(
-            rows,
-            [3, 2, 1],
-            "every row count from the rank's largest down to one, as its own group"
-        );
-        // Each group asks for its own number of blocks; the one-row request
-        // asks for two, so its committed block runs the prefill of a commit.
-        let blocks: Vec<usize> = groups
-            .iter()
-            .filter(|group| group.what == "diffusion LM")
-            .map(|group| group.requests[0].max_und_tokens / sampling.block_length as usize)
-            .collect();
-        assert_eq!(blocks, [1, 1, 2]);
     }
 }

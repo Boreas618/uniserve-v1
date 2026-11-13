@@ -118,8 +118,6 @@ fn launch(model: impl Into<String>) -> EngineArgs {
             // The end of text a fake samples (`crate::EOS`), which the scheduler must
             // recognize to finish a request.
             eos: vec![crate::EOS],
-            block_sampling: None,
-            prefill_outputs: true,
         },
         parallel: proto::config::ParallelConfig {
             tensor_parallel_size: NonZeroUsize::MIN,

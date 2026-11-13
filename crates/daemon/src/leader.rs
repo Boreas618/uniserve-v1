@@ -821,11 +821,6 @@ impl Leader {
         model.generation_limits = model_config.generation_limits(config.dtype);
         model.bos = control_tokens.bos;
         model.eos = control_tokens.eos;
-        // No model this daemon serves generates canvases: canvas sampling
-        // reaches a worker with the request that needs it, and every prefill
-        // returns the outputs its caller asked for.
-        model.block_sampling = None;
-        model.prefill_outputs = true;
         // Video workers prepare exactly the configured sizes, refusing one
         // their model does not generate, and report them back as the only
         // sizes requests may target. Other models prepare none.

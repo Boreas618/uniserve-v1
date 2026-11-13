@@ -723,8 +723,6 @@ impl ModelRunner {
                 (running, tokens as usize, Vec::new())
             }
         };
-        model.block_sampling = None;
-        model.prefill_outputs = true;
         if !host_kv_cache {
             args.engine_config.kv_cache.host_tier = false;
         }

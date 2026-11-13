@@ -94,7 +94,7 @@ impl Scheduler {
         match phase {
             Phase::Prefill => {
                 let st = self.requests.tokens(&id)?;
-                let samples = self.config.block_sampling.is_none();
+                let samples = crate::BLOCK_SAMPLING.is_none();
                 let n = st.req.prompt_token_ids.len();
                 let cursor = self.num_scheduled_prompt_tokens(id)? as usize;
                 // Chunked prefill with the clip rule: the chunk is bounded by
@@ -240,7 +240,7 @@ impl Scheduler {
                 // chunk, or the previous block's commit, which makes the
                 // prepared step the next block's step zero.
                 let st = self.requests.tokens(&id)?;
-                let sampling = self.config.block_sampling?;
+                let sampling = crate::BLOCK_SAMPLING?;
                 let block_length = sampling.block_length as usize;
                 let pending = self.inflight.num_pending_calls(id);
                 if (pending > 0
@@ -512,7 +512,7 @@ impl Scheduler {
         }
 
         let sampling_state = self.build_token_masks(id, 0);
-        let samples = self.config.block_sampling.is_none();
+        let samples = crate::BLOCK_SAMPLING.is_none();
         self.prepare_call(id, |_scheduler, request| {
             generation::prepare_prompt(
                 request,

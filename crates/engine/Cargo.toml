@@ -36,10 +36,19 @@ platform.workspace = true
 build-server.workspace = true
 proto.workspace = true
 scheduler.workspace = true
+# The scheduling policy's interface: its parameters, limits and messages.
+scheduling-guest.workspace = true
 serde_json.workspace = true
 storage.workspace = true
 tokio = { workspace = true, features = ["sync"] }
 tracing.workspace = true
+# The compiled policy module a scheduler instantiates; the version and features are the policy
+# host's (`crates/scheduling/Cargo.toml`), whose precompiled modules the engine loads.
+wasmtime = { version = "50.0.1", default-features = false, features = [
+    "cranelift",
+    "runtime",
+    "std",
+] }
 worker.workspace = true
 
 [dev-dependencies]

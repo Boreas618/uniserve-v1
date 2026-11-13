@@ -176,7 +176,7 @@ impl Scheduler {
                     && self.num_scheduled_images(id)?
                         >= state.req.multimodal_inputs.images.len() =>
             {
-                if self.config.block_sampling.is_some() {
+                if crate::BLOCK_SAMPLING.is_some() {
                     Phase::Block
                 } else if self.decodes_elsewhere(id) {
                     Phase::TransferState

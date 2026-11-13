@@ -156,6 +156,10 @@ mod epoch;
 pub(crate) mod views;
 mod warming;
 
+/// The block sampling of the deployment: none, since no served model generates in blocks and the
+/// configuration states none. The text-diffusion paths that read it are unreachable.
+pub(crate) const BLOCK_SAMPLING: Option<ipc::BlockSampling> = None;
+
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 
 use std::sync::atomic::Ordering;

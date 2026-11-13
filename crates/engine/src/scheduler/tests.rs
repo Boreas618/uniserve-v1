@@ -1,0 +1,680 @@
+//! The scheduler's end of its queue pair, over a real `storage::QueuePair` whose buffer pool end
+//! the tests play by hand: they read the records the scheduler wrote and write completions.
+//! The executors are a recording double of the [`Executor`] interface.
+
+use std::collections::BTreeMap;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::Instant;
+
+use proto::config::{SchedulerConfig, WorkerGroupConfig};
+use proto::request::GenerationRequest;
+use storage::runtime::{self, Class, Completion, GroupId, OwnerId, Region, Tier};
+use storage::{Key, QueuePair};
+
+use super::{Blocks, Capacity, Executor, Policy, Request, RequestStatus, Scheduler};
+
+const A: GroupId = GroupId(0);
+const B: GroupId = GroupId(1);
+
+/// The class of KV blocks, one unit each, in a region of each group's own memory.
+const KV: u8 = 0;
+/// A sized class both groups take from one region: a product one group writes and the other
+/// reads.
+const PRODUCT: u8 = 1;
+
+/// The owners of request 1: one on each group, in slot rows 3 and 4.
+const OWNER_A: OwnerId = OwnerId(10);
+const OWNER_B: OwnerId = OwnerId(11);
+
+/// What the executors were handed.
+#[derive(Default)]
+struct Recorded {
+    stamps: Vec<(GroupId, runtime::Request)>,
+    maps: Vec<(
+        GroupId,
+        u32,
+        runtime::RequestId,
+        runtime::Request,
+        Completion,
+    )>,
+}
+
+struct Recording(Arc<Mutex<Recorded>>);
+
+impl Executor for Recording {
+    fn submit(&self, _: ipc::batch::Batch) {}
+
+    fn map(
+        &self,
+        group: GroupId,
+        slot: u32,
+        id: runtime::RequestId,
+        request: runtime::Request,
+        completion: Completion,
+    ) {
+        let mut recorded = self.0.lock().unwrap();
+        recorded.maps.push((group, slot, id, request, completion));
+    }
+
+    fn stamp(&self, group: GroupId, requests: Vec<runtime::Request>) {
+        let mut recorded = self.0.lock().unwrap();
+        recorded
+            .stamps
+            .extend(requests.into_iter().map(|request| (group, request)));
+    }
+}
+
+/// A scheduler of two groups on its queue pair, and the buffer pool's end of that queue pair.
+struct Bench {
+    scheduler: Scheduler,
+    pool: QueuePair,
+    executors: Arc<Mutex<Recorded>>,
+}
+
+/// The session: regions numbered 4 to 7 (the KV regions of groups A and B, the product region
+/// both state, the slot rows), and the capacity words of region `n` at register `2 + 3 * (n - 4)`.
+fn bench(ring_bytes: usize) -> Bench {
+    let region = |name: &str, units| Region {
+        name: name.to_owned(),
+        tier: Tier::Device,
+        space: name.to_owned(),
+        unit_bytes: 1 << 20,
+        reserved: 1,
+        units,
+        limit: units,
+    };
+    let group = |id: GroupId, kv: u8| runtime::Group {
+        id,
+        memory: format!("memory-{}", id.0),
+        slots: 3,
+        regions: vec![vec![kv], vec![2]],
+    };
+    let class = |units| Class {
+        units,
+        host: None,
+        state_in_slot: false,
+    };
+    let layout = runtime::Open {
+        version: runtime::VERSION,
+        epoch: 1,
+        trial: false,
+        regions: vec![
+            region("kv-a", 64),
+            region("kv-b", 64),
+            region("products", 64),
+            region("slots", 16),
+        ],
+        classes: vec![class(1), class(0)],
+        trajectory: PRODUCT,
+        groups: vec![group(A, 0), group(B, 1)],
+        schedulers: vec![vec![A, B]],
+    };
+    let opened = runtime::Opened {
+        regions: vec![(4, 64), (5, 64), (6, 64), (7, 16)],
+        registers: vec![runtime::Registers {
+            completed: vec![0, 1],
+            capacity: vec![(4, 2), (5, 5), (6, 8), (7, 11)],
+        }],
+    };
+
+    let pool = QueuePair::create(ring_bytes, 14).unwrap();
+    let engine = QueuePair::open(pool.descriptor().try_clone_to_owned().unwrap(), true).unwrap();
+
+    let configs = WorkerGroupConfig::data_parallel(
+        &["localhost".to_owned()],
+        "cpu",
+        2,
+        1,
+        2,
+        BTreeMap::new(),
+    );
+    let groups = configs
+        .into_iter()
+        .map(|config| (config, capacity()))
+        .collect();
+
+    let executors = Arc::new(Mutex::new(Recorded::default()));
+    let (output, _) = crossbeam_channel::unbounded();
+    let scheduler = Scheduler::new(
+        SchedulerConfig::default(),
+        &layout,
+        &opened,
+        0,
+        engine,
+        groups,
+        Policy {},
+        Box::new(Recording(Arc::clone(&executors))),
+        output,
+        Arc::new(AtomicU64::new(0)),
+    )
+    .unwrap();
+
+    Bench {
+        scheduler,
+        pool,
+        executors,
+    }
+}
+
+fn capacity() -> Capacity {
+    Capacity {
+        phases: 0,
+        slots: 16,
+        kv_cache: None,
+        buckets: Vec::new(),
+        rows: [0; ipc::batch::Phase::COUNT],
+        max_model_len: 4096,
+        denoise_steps: 0,
+        bos_token_id: 0,
+        eos_token_ids: Vec::new(),
+        feature_bytes: 0,
+        media_bytes: Vec::new(),
+        call_window: 2,
+    }
+}
+
+impl Bench {
+    /// Request 1, attached to the groups `attachments` names, with live owners.
+    fn attach(&mut self, attachments: &[(GroupId, OwnerId, u32)]) {
+        let id = proto::request::RequestId(1);
+        let input = GenerationRequest {
+            request_id: id,
+            prompt_token_ids: vec![1, 2, 3],
+            multimodal_inputs: Default::default(),
+            sampling: Default::default(),
+            max_und_tokens: 4,
+            stop_strings: Vec::new(),
+            stop_token_ids: Vec::new(),
+            priority: 0,
+            cache: Default::default(),
+            include_stop_token: false,
+            generated_token_ids: Vec::new(),
+            adapter: 0,
+        };
+        let now = Instant::now();
+        let request = Request {
+            id,
+            input: input.into(),
+            arrival: now,
+            status: RequestStatus::WaitingForRemoteKvs,
+            placement: [None; ipc::batch::Phase::COUNT],
+            attachments: attachments
+                .iter()
+                .map(|&(group, owner, slot)| (group, owner, slot, false))
+                .collect(),
+            scheduled: [0; ipc::batch::Phase::COUNT],
+            completed: [0; ipc::batch::Phase::COUNT],
+            early: Vec::new(),
+            blocks: vec![Blocks::default(); 2],
+            queued: true,
+            pending: 0,
+            token_ids: vec![1, 2, 3],
+            num_prompt_tokens: 3,
+            num_computed_tokens: 0,
+            num_cached_tokens: 0,
+            keys: Vec::new(),
+            spec_token_ids: Vec::new(),
+            num_draft_tokens: 0,
+            num_encoded_inputs: 0,
+            encodings: Vec::new(),
+            num_acknowledged_tokens: 0,
+            artifact: None,
+            terminal: None,
+            event_credit: 64,
+            last_progress: now,
+            dirty: false,
+        };
+        for &(_, owner, _) in attachments {
+            self.scheduler.owners.insert(owner, id);
+        }
+        self.scheduler.requests.insert(id, request);
+    }
+
+    /// Every request the scheduler wrote that the buffer pool has not taken, with its number.
+    fn take(&mut self) -> Vec<(runtime::RequestId, runtime::Request)> {
+        let mut record = Vec::new();
+        let mut taken = Vec::new();
+        while self.pool.next_request(&mut record).unwrap() {
+            taken.push(runtime::Request::decode(&record).unwrap());
+        }
+        taken
+    }
+
+    /// Answers request `id` with `completion`.
+    fn complete(&mut self, id: runtime::RequestId, completion: &Completion) {
+        let mut record = Vec::new();
+        completion.encode(id, &mut record);
+        assert!(self.pool.complete(&record).unwrap());
+    }
+
+    /// Every completion the scheduler applies, as it reads them.
+    fn answers(
+        &mut self,
+    ) -> Vec<(
+        runtime::RequestId,
+        Option<OwnerId>,
+        runtime::Request,
+        Completion,
+    )> {
+        let mut answers = Vec::new();
+        while let Some(answer) = self.scheduler.next_completion().unwrap() {
+            answers.push(answer);
+        }
+        answers
+    }
+
+    fn stamps(&self) -> Vec<(GroupId, runtime::Request)> {
+        std::mem::take(&mut self.executors.lock().unwrap().stamps)
+    }
+
+    fn maps(
+        &self,
+    ) -> Vec<(
+        GroupId,
+        u32,
+        runtime::RequestId,
+        runtime::Request,
+        Completion,
+    )> {
+        std::mem::take(&mut self.executors.lock().unwrap().maps)
+    }
+}
+
+fn key(byte: u8) -> Key {
+    Key([byte; 32])
+}
+
+fn allocate(owner: OwnerId, class: u8, at: u32, count: u32) -> runtime::Request {
+    runtime::Request::Allocate {
+        owner,
+        class,
+        at,
+        count,
+        units: if class == PRODUCT { 4 } else { 0 },
+    }
+}
+
+fn release(owner: OwnerId, class: u8, at: u32, count: u32) -> runtime::Request {
+    runtime::Request::Release {
+        owner,
+        class,
+        at,
+        count,
+        after: Vec::new(),
+    }
+}
+
+#[test]
+fn each_request_gets_a_fresh_number_and_each_completion_finds_its_request_in_any_order() {
+    let mut bench = bench(1024);
+    let submitted = [
+        runtime::Request::Evict { keys: vec![key(1)] },
+        runtime::Request::Evict { keys: vec![key(2)] },
+        runtime::Request::Victims {
+            region: 4,
+            keys: vec![key(3)],
+        },
+    ];
+    for request in submitted.clone() {
+        bench.scheduler.submit(request);
+    }
+    bench.scheduler.post().unwrap();
+
+    // The buffer pool takes them in the order submitted, under rising numbers (BP §7).
+    let taken = bench.take();
+    let requests: Vec<_> = taken.iter().map(|(_, request)| request.clone()).collect();
+    assert_eq!(requests, submitted);
+    assert!(taken.windows(2).all(|pair| pair[0].0 < pair[1].0));
+
+    // A later request's number is above every number before it.
+    bench
+        .scheduler
+        .submit(runtime::Request::Evict { keys: vec![key(4)] });
+    bench.scheduler.post().unwrap();
+    let later = bench.take();
+    assert_eq!(later.len(), 1);
+    assert!(later[0].0 > taken[2].0);
+
+    // Completions arrive in another order than their requests; each carries only its number.
+    let answered = [
+        (taken[2].0, Completion::Done),
+        (later[0].0, Completion::Evicted { keys: vec![key(4)] }),
+        (taken[0].0, Completion::Evicted { keys: vec![key(1)] }),
+        (taken[1].0, Completion::Evicted { keys: vec![] }),
+    ];
+    for (id, completion) in &answered {
+        bench.complete(*id, completion);
+    }
+
+    let everything: Vec<_> = taken.iter().chain(&later).cloned().collect();
+    let expected: Vec<_> = answered
+        .iter()
+        .map(|(id, completion)| {
+            let request = everything
+                .iter()
+                .find(|(number, _)| number == id)
+                .map(|(_, request)| request.clone())
+                .unwrap();
+            (*id, None, request, completion.clone())
+        })
+        .collect();
+    assert_eq!(bench.answers(), expected);
+}
+
+#[test]
+fn a_full_submission_queue_holds_requests_and_merges_a_further_allocate_of_one_owner_and_class() {
+    let mut bench = bench(128);
+    bench.attach(&[(A, OWNER_A, 3)]);
+
+    // Two records of 56 bytes leave 16 of the ring's 128: no room for an `Allocate` (40).
+    for byte in [1, 2] {
+        bench.scheduler.submit(runtime::Request::Victims {
+            region: 4,
+            keys: vec![key(byte)],
+        });
+    }
+    bench.scheduler.submit(allocate(OWNER_A, KV, 0, 1));
+    bench.scheduler.post().unwrap();
+
+    // The next need of the same owner and class raises the held one's count.
+    bench.scheduler.submit(allocate(OWNER_A, KV, 1, 1));
+    bench.scheduler.post().unwrap();
+
+    let taken = bench.take();
+    assert_eq!(taken.len(), 2, "only the victims fit the submission queue");
+    for (id, _) in &taken {
+        bench.complete(*id, &Completion::Done);
+    }
+    assert_eq!(bench.answers().len(), 2);
+
+    bench.scheduler.post().unwrap();
+    let requests: Vec<_> = bench
+        .take()
+        .into_iter()
+        .map(|(_, request)| request)
+        .collect();
+    assert_eq!(requests, [allocate(OWNER_A, KV, 0, 2)]);
+}
+
+#[test]
+fn nothing_is_written_while_the_completion_queue_lacks_room_for_every_outstanding_answer() {
+    let mut bench = bench(256);
+    bench.attach(&[(A, OWNER_A, 3)]);
+
+    // A `Load` of one key takes 72 bytes of the submission queue. Its answer may be a `Copy` of
+    // that key with one run to read, one to write and one key evicted for it: a record of 108
+    // bytes, 120 in the completion queue. Two answers fit its 256 bytes; a third does not.
+    let load = |at| runtime::Request::Load {
+        owner: OWNER_A,
+        class: KV,
+        at,
+        keys: vec![key(at as u8)],
+    };
+    for at in 0..3 {
+        bench.scheduler.submit(load(at));
+    }
+    bench.scheduler.post().unwrap();
+    let taken = bench.take();
+    assert_eq!(
+        taken
+            .iter()
+            .map(|(_, request)| request.clone())
+            .collect::<Vec<_>>(),
+        [load(0), load(1)]
+    );
+
+    // Still no room while both are outstanding.
+    bench.scheduler.post().unwrap();
+    assert!(bench.take().is_empty());
+
+    // Once an answer is read, the third is written.
+    bench.complete(taken[0].0, &Completion::Full { region: 4 });
+    assert_eq!(bench.answers().len(), 1);
+    bench.scheduler.post().unwrap();
+    let requests: Vec<_> = bench
+        .take()
+        .into_iter()
+        .map(|(_, request)| request)
+        .collect();
+    assert_eq!(requests, [load(2)]);
+}
+
+#[test]
+fn a_stamped_request_is_written_once_every_group_holding_its_entries_stamped_it() {
+    let mut bench = bench(1024);
+    bench.attach(&[(A, OWNER_A, 3), (B, OWNER_B, 4)]);
+
+    // A product block both groups map: the writer's group and the reader's stamp its release.
+    bench.scheduler.submit(release(OWNER_A, PRODUCT, 0, 1));
+    let mut stamps = bench.stamps();
+    stamps.sort_by_key(|(group, _)| *group);
+    assert_eq!(
+        stamps,
+        [
+            (A, release(OWNER_A, PRODUCT, 0, 1)),
+            (B, release(OWNER_A, PRODUCT, 0, 1))
+        ]
+    );
+
+    // A KV block lies in the memory of the owner's group alone.
+    bench.scheduler.submit(release(OWNER_A, KV, 0, 1));
+    assert_eq!(bench.stamps(), [(A, release(OWNER_A, KV, 0, 1))]);
+
+    // A block allocated at the position the product release frees waits behind it.
+    bench.scheduler.submit(allocate(OWNER_A, PRODUCT, 0, 1));
+    bench.scheduler.post().unwrap();
+    assert!(bench.take().is_empty());
+
+    let stamped = |group: GroupId, sequence, class| runtime::Request::Release {
+        owner: OWNER_A,
+        class,
+        at: 0,
+        count: 1,
+        after: vec![(group, sequence)],
+    };
+    bench.scheduler.stamped(vec![stamped(A, 7, PRODUCT)]);
+    bench.scheduler.post().unwrap();
+    assert!(bench.take().is_empty(), "group B has not stamped it");
+
+    bench
+        .scheduler
+        .stamped(vec![stamped(A, 8, KV), stamped(B, 3, PRODUCT)]);
+    bench.scheduler.post().unwrap();
+    let requests: Vec<_> = bench
+        .take()
+        .into_iter()
+        .map(|(_, request)| request)
+        .collect();
+    assert_eq!(
+        requests,
+        [
+            runtime::Request::Release {
+                owner: OWNER_A,
+                class: KV,
+                at: 0,
+                count: 1,
+                after: vec![(A, 8)],
+            },
+            runtime::Request::Release {
+                owner: OWNER_A,
+                class: PRODUCT,
+                at: 0,
+                count: 1,
+                after: vec![(A, 7), (B, 3)],
+            },
+            allocate(OWNER_A, PRODUCT, 0, 1),
+        ]
+    );
+}
+
+#[test]
+fn entries_a_release_handed_after_their_request_names_are_not_mapped() {
+    let mut bench = bench(1024);
+    bench.attach(&[(A, OWNER_A, 3)]);
+
+    bench.scheduler.submit(allocate(OWNER_A, KV, 0, 2));
+    bench.scheduler.submit(allocate(OWNER_A, PRODUCT, 0, 1));
+    bench.scheduler.post().unwrap();
+    let taken = bench.take();
+
+    // Position 1 of the KV table is given up before the `Allocate` that fills it is answered.
+    bench.scheduler.submit(release(OWNER_A, KV, 1, 1));
+    let kv = Completion::Allocated {
+        runs: vec![(4, 9, 1), (4, 10, 1)],
+        evicted: Vec::new(),
+    };
+    let product = Completion::Allocated {
+        runs: vec![(6, 0, 4)],
+        evicted: Vec::new(),
+    };
+    bench.complete(taken[0].0, &kv);
+    bench.complete(taken[1].0, &product);
+
+    // The KV answer is dropped; the product's, whose entries the release does not name, is
+    // handed to the owner's group under the owner's slot and applied.
+    let answers = bench.answers();
+    assert_eq!(
+        answers,
+        [(
+            taken[1].0,
+            Some(OWNER_A),
+            allocate(OWNER_A, PRODUCT, 0, 1),
+            product.clone()
+        )]
+    );
+    assert_eq!(
+        bench.maps(),
+        [(A, 3, taken[1].0, allocate(OWNER_A, PRODUCT, 0, 1), product)]
+    );
+}
+
+#[test]
+fn a_completion_for_a_forgotten_owner_is_dropped_and_its_copy_given_up() {
+    let mut bench = bench(1024);
+    bench.attach(&[(A, OWNER_A, 0)]);
+
+    let load = runtime::Request::Load {
+        owner: OWNER_A,
+        class: KV,
+        at: 0,
+        keys: vec![key(1)],
+    };
+    bench.scheduler.submit(runtime::Request::Attach {
+        owner: OWNER_A,
+        group: A,
+    });
+    bench.scheduler.submit(load);
+    bench.scheduler.post().unwrap();
+    let taken = bench.take();
+
+    // The admission is returned: its owner is detached before its answers arrive.
+    bench.scheduler.submit(runtime::Request::Detach {
+        owner: OWNER_A,
+        after: Vec::new(),
+    });
+    bench.stamps();
+
+    bench.complete(taken[0].0, &Completion::Attached { slot: 3 });
+    let copy = Completion::Copy {
+        group: A,
+        keys: vec![key(1)],
+        from: vec![(9, 0, 1)],
+        to: vec![(4, 2, 1)],
+        evicted: Vec::new(),
+    };
+    bench.complete(taken[1].0, &copy);
+
+    assert!(bench.answers().is_empty());
+    assert!(bench.maps().is_empty());
+    // The copy no executor will run is given up through its group's executor.
+    assert_eq!(
+        bench.stamps(),
+        [(
+            A,
+            runtime::Request::Finish {
+                copy: taken[1].0,
+                ok: false,
+                after: Vec::new(),
+            }
+        )]
+    );
+}
+
+#[test]
+fn the_answer_to_a_copys_finish_is_mapped_and_applied_as_the_copys_result() {
+    let mut bench = bench(1024);
+    bench.attach(&[(A, OWNER_A, 3)]);
+
+    let load = runtime::Request::Load {
+        owner: OWNER_A,
+        class: KV,
+        at: 0,
+        keys: vec![key(1)],
+    };
+    bench.scheduler.submit(load.clone());
+    bench.scheduler.post().unwrap();
+    let taken = bench.take();
+    let [(id, _)] = taken[..] else {
+        panic!("one request was written");
+    };
+
+    let copy = Completion::Copy {
+        group: A,
+        keys: vec![key(1)],
+        from: vec![(9, 0, 1)],
+        to: vec![(4, 2, 1)],
+        evicted: Vec::new(),
+    };
+    bench.complete(id, &copy);
+    assert_eq!(
+        bench.answers(),
+        [(id, Some(OWNER_A), load.clone(), copy.clone())]
+    );
+    assert_eq!(bench.maps(), [(A, 3, id, load.clone(), copy)]);
+
+    // The executor ran the copy and returns its `Finish`, which is written as it is.
+    let finish = runtime::Request::Finish {
+        copy: id,
+        ok: true,
+        after: vec![(A, 12)],
+    };
+    bench.scheduler.stamped(vec![finish.clone()]);
+    bench.scheduler.post().unwrap();
+    let taken = bench.take();
+    let [(finished, ref written)] = taken[..] else {
+        panic!("one request was written");
+    };
+    assert_eq!(*written, finish);
+
+    // Its answer gives the loaded entries: handed to the copy's group with the `Finish`, and
+    // applied as the result of the `Load`.
+    bench.complete(finished, &Completion::Loaded);
+    assert_eq!(
+        bench.answers(),
+        [(id, Some(OWNER_A), load, Completion::Loaded)]
+    );
+    assert_eq!(bench.maps(), [(A, 3, finished, finish, Completion::Loaded)]);
+}
+
+#[test]
+fn available_is_the_buffer_pools_word_less_the_units_of_allocates_not_yet_answered() {
+    let mut bench = bench(1024);
+    bench.attach(&[(A, OWNER_A, 3)]);
+
+    // Region 4 (the KV region of group A): 50 units available, 3 retiring.
+    bench.pool.register(2).store(50, Ordering::Release);
+    bench.pool.register(3).store(3, Ordering::Release);
+    // Region 6 (the products): 40 available.
+    bench.pool.register(8).store(40, Ordering::Release);
+
+    // Two KV blocks outstanding, and a held product block of 4 units.
+    bench.scheduler.submit(allocate(OWNER_A, KV, 0, 2));
+    bench.scheduler.post().unwrap();
+    bench.scheduler.submit(allocate(OWNER_A, PRODUCT, 0, 1));
+    bench.scheduler.read_capacity();
+
+    assert_eq!(bench.scheduler.available[0], 48);
+    assert_eq!(bench.scheduler.retiring[0], 3);
+    assert_eq!(bench.scheduler.available[2], 36);
+}

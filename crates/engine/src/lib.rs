@@ -16,5 +16,7 @@ mod catalogue;
     reason = "the process, the one caller of the module installation, is not declared in the crate"
 )]
 mod modules;
+pub mod scheduler;
 
 pub use catalogue::resolve;
+pub use scheduler::Error;

@@ -51,7 +51,7 @@ pub mod handoff {
 /// The revision of the messages this crate states (the process, request and
 /// handoff interfaces). A change that only adds messages or fields leaves it;
 /// any other change raises it.
-const MESSAGES_REVISION: u32 = 1;
+const MESSAGES_REVISION: u32 = 2;
 
 /// The storage protocol's version at version 1 of the engine interface.
 const STORAGE_PROTOCOL_BASE: u32 = 21;

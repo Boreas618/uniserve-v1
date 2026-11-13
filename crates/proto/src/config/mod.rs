@@ -236,6 +236,9 @@ pub const DEFAULT_MAX_NUM_BATCHED_TOKENS: usize = 8192;
 pub const DEFAULT_MAX_RUNNING_REQUESTS: usize = 128;
 /// Default token threshold above which a prefill is chunked.
 pub const DEFAULT_CHUNKED_PREFILL_SIZE: usize = DEFAULT_MAX_NUM_BATCHED_TOKENS;
+/// Default period at which a scheduler reads its completion queue while it waits on the buffer
+/// pool and forms no batch.
+pub const DEFAULT_POLL_PERIOD: Duration = Duration::from_millis(1);
 
 /// Admission and batching (`scheduler_config`), and the limits a scheduler runs with once the
 /// engine resolved them.
@@ -268,11 +271,6 @@ pub struct SchedulerConfig {
     /// configuration's `max_running_requests`.
     #[serde(skip)]
     pub max_running_requests: usize,
-    /// Block-diffusion sampling of every block the deployment generates, resolved from the model.
-    /// A block-diffusion runtime has no autoregressive decode, so each request it serves runs
-    /// under this sampling.
-    #[serde(skip)]
-    pub block_sampling: Option<crate::request::BlockSampling>,
     /// The most draft tokens a verification carries per request
     /// (`speculative_config.num_draft_tokens`); zero when the deployment does not speculate.
     #[serde(skip)]
@@ -283,6 +281,11 @@ pub struct SchedulerConfig {
     /// eagerly, and the tier bound is honest but vacuous.
     #[serde(skip)]
     pub graph_tiers: Vec<u32>,
+    /// The period at which the scheduler reads its completion queue and capacity words while
+    /// requests to the buffer pool are outstanding and its last pass formed no batch: the queue
+    /// pair runs in poll mode, and no wake-up crosses from the Storage Server to the engine.
+    #[serde(with = "values::duration")]
+    pub poll_period: Duration,
 }
 
 impl Default for SchedulerConfig {
@@ -294,9 +297,9 @@ impl Default for SchedulerConfig {
             max_batch: positive(DEFAULT_MAX_BATCH),
             max_num_batched_tokens: DEFAULT_MAX_NUM_BATCHED_TOKENS,
             max_running_requests: DEFAULT_MAX_RUNNING_REQUESTS,
-            block_sampling: None,
             draft_tokens: 0,
             graph_tiers: Vec::new(),
+            poll_period: DEFAULT_POLL_PERIOD,
         }
     }
 }
@@ -306,8 +309,8 @@ impl SchedulerConfig {
     /// `max_batch` calls and `max_num_batched_tokens` tokens, `graph_tiers` being the catalog's
     /// sizes in tokens, ascending (§4.4, §4.5).
     ///
-    /// The rest is the configuration's: its running requests, its waiting queue and its prefill
-    /// chunk, the model's block sampling, and the drafter's tokens.
+    /// The rest is the configuration's: its running requests, its waiting queue, its prefill
+    /// chunk and its polling period, and the drafter's tokens.
     pub fn of(
         engine: &EngineConfig,
         max_batch: usize,
@@ -326,9 +329,9 @@ impl SchedulerConfig {
             max_batch: positive(max_batch),
             max_num_batched_tokens,
             max_running_requests: engine.max_running_requests.get(),
-            block_sampling: engine.model.block_sampling,
             draft_tokens: engine.speculative.num_draft_tokens as usize,
             graph_tiers,
+            poll_period: engine.scheduler.poll_period,
         }
     }
 
@@ -874,23 +877,16 @@ pub struct ModelConfig {
     pub bos: u32,
     /// Every end-of-sequence token, the primary one first.
     pub eos: Vec<u32>,
-    /// A block-diffusion model's block sampling; absent for other models.
-    pub block_sampling: Option<crate::request::BlockSampling>,
-    /// Whether a prompt's prefill returns outputs, which only conditioning prefills of
-    /// block-diffusion models do not.
-    pub prefill_outputs: bool,
 }
 
 impl ModelConfig {
     /// Whether `other` processes requests as this model does: the same generation limits,
-    /// control tokens, context length and block sampling, read from the checkpoint.
+    /// control tokens and context length, read from the checkpoint.
     pub fn processes_as(&self, other: &Self) -> bool {
         self.generation_limits == other.generation_limits
             && self.bos == other.bos
             && self.eos == other.eos
             && self.max_model_len == other.max_model_len
-            && self.block_sampling == other.block_sampling
-            && self.prefill_outputs == other.prefill_outputs
     }
 }
 

@@ -334,7 +334,7 @@ impl Scheduler {
                         })
                     {
                         let bos = self.special_tokens.bos;
-                        let generates_blocks = self.config.block_sampling.is_some();
+                        let generates_blocks = crate::BLOCK_SAMPLING.is_some();
                         if let Some(st) = self.requests.tokens_mut(&id) {
                             if generates_blocks {
                                 st.phase = Phase::Block;
@@ -372,7 +372,7 @@ impl Scheduler {
                 // A block-generating request's complete prompt samples
                 // nothing, and nor does each of its block commits, which
                 // extend the context the same way; the next block follows.
-                if self.config.block_sampling.is_some()
+                if crate::BLOCK_SAMPLING.is_some()
                     && let Some(st) = self.requests.tokens_mut(&id)
                 {
                     st.phase = Phase::Block;
@@ -1057,7 +1057,7 @@ impl Scheduler {
             .record(views::finished(request, terminal.end()));
         self.watchdog.finished(request);
         if terminal.migration().is_some()
-            && self.config.block_sampling.is_none()
+            && crate::BLOCK_SAMPLING.is_none()
             && self
                 .requests
                 .tokens(&id)
@@ -1249,7 +1249,7 @@ impl Scheduler {
     pub(super) fn advance_request_cache(&mut self, id: RequestId, immutable: bool) {
         // A block deployment's requests write blocks, not their generated
         // tokens in order.
-        let tokens_in_order = self.config.block_sampling.is_none();
+        let tokens_in_order = crate::BLOCK_SAMPLING.is_none();
         // While a refill restores the request's draft cache, its state
         // tables keep the checkpoint the refill continues from.
         let refill_cursor = self.refill_cursor(id);

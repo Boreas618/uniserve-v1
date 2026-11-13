@@ -604,8 +604,6 @@ impl ServerArgs {
                 generation_limits: Default::default(),
                 bos: 0,
                 eos: Vec::new(),
-                block_sampling: None,
-                prefill_outputs: true,
             },
             parallel: proto::config::ParallelConfig {
                 tensor_parallel_size: self.tensor_parallel_size,

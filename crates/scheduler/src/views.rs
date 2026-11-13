@@ -530,10 +530,9 @@ fn next_tokens(scheduler: &Scheduler, state: &TokenState, id: RequestId) -> u32 
         }
         // A block step spends a whole block of a step's token budget, the
         // same bound the deployment was checked against.
-        Some(CallKind::Forward(ForwardMode::TokenDenoising)) => scheduler
-            .config
-            .block_sampling
-            .map_or(0, |sampling| sampling.block_length),
+        Some(CallKind::Forward(ForwardMode::TokenDenoising)) => {
+            crate::BLOCK_SAMPLING.map_or(0, |sampling| sampling.block_length)
+        }
         Some(CallKind::Media(_)) => 1,
     }
 }

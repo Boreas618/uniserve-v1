@@ -864,7 +864,7 @@ impl Scheduler {
     /// and which the engine that serves next continues. A request already
     /// finishing finishes. Video requests go on.
     pub(super) fn migrate_requests(&mut self, cause: MigrationCause) {
-        if self.config.block_sampling.is_some() {
+        if crate::BLOCK_SAMPLING.is_some() {
             return;
         }
         let waiting: Vec<RequestId> = self
@@ -900,7 +900,7 @@ impl Scheduler {
         cause: MigrationCause,
         select: impl Fn(RequestId) -> bool,
     ) {
-        if self.config.block_sampling.is_some() {
+        if crate::BLOCK_SAMPLING.is_some() {
             return;
         }
         for id in self.running.clone() {

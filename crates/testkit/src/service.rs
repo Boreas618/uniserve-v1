@@ -1785,11 +1785,11 @@ fn scheduler_limits(scheduling: &Scheduling) -> anyhow::Result<SchedulerConfig> 
             .max_queued_requests
             .map(|requests| requests as usize)
             .and_then(std::num::NonZeroUsize::new),
-        block_sampling: None,
         draft_tokens: 0,
         // A `Configure` command states the scheduling limits, not the
         // deployment's graph catalog.
         graph_tiers: Vec::new(),
+        poll_period: proto::config::DEFAULT_POLL_PERIOD,
     })
 }
 

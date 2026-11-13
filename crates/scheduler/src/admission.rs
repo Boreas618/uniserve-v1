@@ -206,7 +206,7 @@ impl Scheduler {
         }
         // A request the deployment generates in blocks names the seed its
         // draws follow.
-        if self.config.block_sampling.is_some() {
+        if crate::BLOCK_SAMPLING.is_some() {
             if req.sampling.seed.is_none() {
                 return Err(format!(
                     "invalid generation request: {:?}",
@@ -280,7 +280,7 @@ impl Scheduler {
         }
         // A prefill group hands a request's cache to a decode group once,
         // after its prompt: such a deployment generates text.
-        if self.splits_prefill() && self.config.block_sampling.is_some() {
+        if self.splits_prefill() && crate::BLOCK_SAMPLING.is_some() {
             return Err("a deployment of prefill and decode groups generates text only".into());
         }
         // Resource validation includes the cache bound, so a request that passes
@@ -847,7 +847,7 @@ impl Scheduler {
         request: &GenerationRequest,
     ) -> Option<crate::GenerationFeatures> {
         // A block-diffusion runtime generates every request in blocks.
-        let features = if self.config.block_sampling.is_some() {
+        let features = if crate::BLOCK_SAMPLING.is_some() {
             request.block_features()
         } else {
             request.required_features()

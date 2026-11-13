@@ -794,7 +794,7 @@ impl Scheduler {
                     image_cache,
                     state,
                     &record,
-                    self.config.block_sampling.as_ref(),
+                    crate::BLOCK_SAMPLING.as_ref(),
                 ) {
                     self.fail_after_inflight(id, rejection_cause(&call, &error));
                     continue;

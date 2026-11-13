@@ -164,7 +164,7 @@ impl Scheduler {
         // A block step and a block commit each spend a whole block of one
         // scheduling step's token budget, so the deployment's block must
         // fit it.
-        if let Some(sampling) = config.block_sampling {
+        if let Some(sampling) = crate::BLOCK_SAMPLING {
             if let Some(parameter) = sampling.invalid_parameter() {
                 anyhow::bail!("block-diffusion sampling parameter `{parameter}` is out of range");
             }
@@ -312,7 +312,7 @@ impl Scheduler {
         if calls > 0 && limits.max_batch > proto::config::positive(calls) {
             return Err(beyond("max_batch", limits.max_batch.get(), calls));
         }
-        if let Some(sampling) = self.config.block_sampling
+        if let Some(sampling) = crate::BLOCK_SAMPLING
             && sampling.block_length as usize > limits.max_num_batched_tokens.max(1)
         {
             return Err(format!(
@@ -336,11 +336,11 @@ impl Scheduler {
             max_queued_requests: limits
                 .max_queued_requests
                 .map(|bound| bound.max(proto::config::positive(1))),
-            block_sampling: self.config.block_sampling,
             // The draft limit is the epoch's; the refill policy is a
             // scheduling choice.
             draft_tokens: self.config.draft_tokens,
             graph_tiers,
+            poll_period: self.config.poll_period,
         };
         tracing::info!(config = ?self.config, "the scheduler took new limits");
         Ok(())
