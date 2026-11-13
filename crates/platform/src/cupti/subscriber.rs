@@ -41,6 +41,23 @@ pub(crate) const GRAPH_TRACE: u32 = 51;
 /// `CUPTI_ACTIVITY_FLAG_FLUSH_FORCED`.
 const FLUSH_FORCED: u32 = 1;
 
+/// The `CUPTI_API_VERSION` of the CUDA 13.0 release's CUPTI (the toolkit's
+/// `libcupti.so.2025.3.0`), which [`subscribe`] refuses.
+///
+/// On GB200 with driver 580.82.07 it faults inside `cuGraphLaunch` as soon
+/// as graph launches traced by node have filled the device buffers it
+/// pre-allocates (`CUPTI_ACTIVITY_ATTR_DEVICE_BUFFER_PRE_ALLOCATE_VALUE`),
+/// although the records of the earlier launches were delivered: launches of
+/// a 1,000-kernel graph fault at the 312th launch with the default 3 buffers
+/// of 3.2 MB, at the 606th with 6 buffers and at the 608th with 6.4 MB
+/// buffers, whatever the pool limit. CUPTI's release notes for CUDA 13.0
+/// Update 1 list a fixed segmentation fault in initializing that device
+/// buffer. The same release stalled a serving worker that replayed CUDA
+/// graphs while kernels were recorded. Releases 13.0.85 (API version 130001)
+/// and 13.4.92 (130401) record every kernel of 1,024 such launches with its
+/// timestamps through a pool of 4 buffers.
+const REFUSED_VERSION: u32 = 130_000;
+
 /// Each activity buffer CUPTI fills: 1 MiB (about 4,800 kernel records),
 /// aligned as CUPTI requires. While a stream runs without pause, the buffer
 /// it fills always holds the record of an operation in flight, and a flush
@@ -80,13 +97,21 @@ static DROPPED: AtomicU64 = AtomicU64::new(0);
 ///
 /// # Errors
 ///
-/// Fails when `libcupti.so` is missing or another CUPTI client (a profiler
-/// that injected CUPTI) holds the process's subscription, with
-/// [`Error::Cupti`] code `CUPTI_ERROR_MULTIPLE_SUBSCRIBERS_NOT_SUPPORTED`.
+/// Fails when `libcupti.so` is missing, when the loaded CUPTI is the release
+/// [`REFUSED_VERSION`] names ([`Error::CuptiRefused`]), or when another CUPTI
+/// client (a profiler that injected CUPTI) holds the process's subscription,
+/// with [`Error::Cupti`] code `CUPTI_ERROR_MULTIPLE_SUBSCRIBERS_NOT_SUPPORTED`.
 pub fn subscribe() -> Result<()> {
     SUBSCRIPTION
         .get_or_init(|| {
             let cupti = cupti()?;
+            let version = super::version()?;
+            if version == REFUSED_VERSION {
+                return Err(Error::CuptiRefused {
+                    library: super::library(),
+                    version,
+                });
+            }
             let mut handle = std::ptr::null_mut();
             check(
                 // SAFETY: CUPTI writes the subscriber handle; the dispatch

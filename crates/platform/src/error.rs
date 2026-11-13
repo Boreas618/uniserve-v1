@@ -81,6 +81,15 @@ pub enum Error {
     #[error("{call} failed with CUPTI result {code}")]
     Cupti { call: &'static str, code: i32 },
 
+    /// The process loaded a CUPTI release the subscription refuses
+    /// (`cupti::subscriber::subscribe`), by its `CUPTI_API_VERSION`.
+    #[error(
+        "{library} is CUPTI API version {version}, which faults and stalls the CUDA graph \
+         replays it records; name a later CUPTI in NVTX_INJECTION64_PATH, or state a Python \
+         environment with the `nvidia-cuda-cupti` package in VIRTUAL_ENV"
+    )]
+    CuptiRefused { library: &'static str, version: u32 },
+
     /// The operation is not issued on a stream that is being captured into a
     /// CUDA graph.
     #[error("{call} is not permitted on a capturing stream")]

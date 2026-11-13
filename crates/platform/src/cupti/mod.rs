@@ -27,14 +27,16 @@
 //! A collector that stops disables what it enabled; the library stays
 //! loaded.
 //!
-//! The process loads the CUPTI beside the CUDA runtime it already loaded
-//! ([`library`]): CUPTI belongs to a CUDA release, and both the toolkit and
-//! the environment's CUDA packages keep `libcupti.so.N` beside
-//! `libcudart.so.N`. A worker thereby loads the CUPTI of the runtime it
-//! loaded. The toolkit's CUPTI 2025.3.0 stalled a
-//! serving worker that replayed CUDA graphs while kernels were recorded,
-//! within a minute of load; the environment's `nvidia-cuda-cupti` 13.0.85
-//! served the same load.
+//! The process loads the CUPTI its environment names ([`library`]): the one
+//! NVTX loaded as its injection library, else the `nvidia-cuda-cupti`
+//! package of the Python environment `VIRTUAL_ENV` states ([`packaged`]),
+//! the release the project pins, else the CUPTI beside the CUDA runtime it
+//! loaded: CUPTI belongs to a CUDA release, and both the toolkit and the
+//! environment's CUDA packages keep `libcupti.so.N` beside `libcudart.so.N`.
+//! The loader's own `libcupti.so` comes last; on a host with the CUDA 13.0
+//! toolkit that is its CUPTI 2025.3.0, which faults and stalls the CUDA graph
+//! replays it records, and which the subscription therefore refuses
+//! ([`subscriber::subscribe`]).
 
 pub mod activity;
 pub mod blocking;
@@ -47,6 +49,7 @@ pub mod subscriber;
 pub mod timeline;
 
 use std::ffi::{CStr, c_char, c_void};
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
 
 use libloading::Library;
@@ -59,13 +62,15 @@ const LIBCUPTI: &str = "libcupti.so";
 
 /// The CUPTI library this process loads: the CUPTI the process named as its
 /// NVTX injection library (`NVTX_INJECTION64_PATH`), which NVTX already
-/// loaded; else `libcupti.so.N` in the directory of the `libcudart.so.N` the
-/// process loaded, when that file exists; else `LIBCUPTI`. Resolved once,
-/// at the first load.
+/// loaded; else the CUPTI of the Python environment `VIRTUAL_ENV` states
+/// ([`packaged`]); else `libcupti.so.N` in the directory of the
+/// `libcudart.so.N` the process loaded, when that file exists; else
+/// `LIBCUPTI`. Resolved once, at the first load.
 pub fn library() -> &'static str {
     static LIBRARY: OnceLock<String> = OnceLock::new();
     LIBRARY.get_or_init(|| {
         injected()
+            .or_else(|| packaged().map(|path| path.to_string_lossy().into_owned()))
             .or_else(beside_runtime)
             .unwrap_or_else(|| LIBCUPTI.to_owned())
     })
@@ -75,9 +80,45 @@ pub fn library() -> &'static str {
 /// `libcupti.so*` (a profiler's own injection library is not CUPTI).
 fn injected() -> Option<String> {
     let path = std::env::var("NVTX_INJECTION64_PATH").ok()?;
-    let named = std::path::Path::new(&path);
+    let named = Path::new(&path);
     let file = named.file_name()?.to_string_lossy();
     (file.starts_with("libcupti.so") && named.is_file()).then_some(path)
+}
+
+/// `libcupti.so.N` of the NVIDIA CUDA packages of the Python environment
+/// `VIRTUAL_ENV` states, if it has one: the `nvidia-cuda-cupti` release the
+/// project pins (`pyproject.toml`). The process runs no Python; the file is
+/// only a library.
+pub fn packaged() -> Option<PathBuf> {
+    let prefix = std::env::var_os("VIRTUAL_ENV")?;
+    packaged_in(Path::new(&prefix))
+}
+
+/// `libcupti.so.N` of the NVIDIA CUDA packages of the Python environment at
+/// `prefix`: `<prefix>/lib/pythonX.Y/site-packages/nvidia/cuN/lib`.
+fn packaged_in(prefix: &Path) -> Option<PathBuf> {
+    for entry in std::fs::read_dir(prefix.join("lib")).ok()?.flatten() {
+        if !entry.file_name().to_string_lossy().starts_with("python") {
+            continue;
+        }
+        let nvidia = entry.path().join("site-packages").join("nvidia");
+        for package in std::fs::read_dir(&nvidia).into_iter().flatten().flatten() {
+            if !package.file_name().to_string_lossy().starts_with("cu") {
+                continue;
+            }
+            let lib = package.path().join("lib");
+            for library in std::fs::read_dir(&lib).into_iter().flatten().flatten() {
+                if library
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with("libcupti.so.")
+                {
+                    return Some(library.path());
+                }
+            }
+        }
+    }
+    None
 }
 
 /// `libcupti.so.N` beside the first `libcudart.so.N` among the objects the
@@ -386,5 +427,21 @@ pub(crate) mod tests {
         let capture = Capture::begin(stream, CaptureMode::Relaxed)?;
         issue(stream)?;
         record(capture.end()?)
+    }
+
+    #[test]
+    fn the_environments_cupti_is_found_beside_its_packages() {
+        let prefix = tempfile::tempdir().unwrap();
+        let lib = prefix
+            .path()
+            .join("lib/python3.12/site-packages/nvidia/cu13/lib");
+        std::fs::create_dir_all(&lib).unwrap();
+        assert_eq!(super::packaged_in(prefix.path()), None);
+
+        std::fs::write(lib.join("libcupti.so.13"), b"").unwrap();
+        assert_eq!(
+            super::packaged_in(prefix.path()),
+            Some(lib.join("libcupti.so.13"))
+        );
     }
 }
