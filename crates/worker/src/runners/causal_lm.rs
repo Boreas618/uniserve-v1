@@ -117,7 +117,7 @@
 
 mod columns;
 pub mod experts;
-mod output;
+pub(crate) mod output;
 mod slots;
 pub mod speculation;
 pub mod wiring;

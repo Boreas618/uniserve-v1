@@ -76,7 +76,7 @@ fn position(column: &[i32], index: usize) -> u32 {
 
 /// A call's output before anything is known of it: performed, with no token and the default
 /// state.
-fn performed() -> CallOutput {
+pub(crate) fn performed() -> CallOutput {
     CallOutput {
         status: CallStatus::Ok,
         error_code: None,

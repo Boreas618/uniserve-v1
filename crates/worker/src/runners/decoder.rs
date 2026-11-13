@@ -1,1677 +1,812 @@
-//! The decoder runner: one clip's latents, walked once per canvas and replayed (4.5), and the clip
-//! spliced into the request's timeline by the component's second block when the deployment serves
-//! one.
+//! `DecoderRunner`: the runner of every decoder, a video decoder with its splicer and an audio
+//! decoder alike.
 //!
-//! A decoder is the encoder's mirror in every respect this runner cares about - one stream, a bucket
-//! per declared extent, a captured graph per bucket, and the generation lifecycle the hot update
-//! runs through - and it differs in two ways that belong here rather than in the model:
+//! The runner holds its model through `nn::Decoder`, and a video decoder's splicer through
+//! `nn::Splicer`; it names no concrete model. A media row names the products its call reads and
+//! writes as positions in the request's product table (`ipc::batch::MediaRow::results`), and the
+//! runner finds their blocks through the rank's device block tables, in the product buffer of
+//! the rank's [`BufferMemory`].
 //!
-//! **Its extent is a raster and its graphs are keyed by latents.** A decode bucket states the frames,
-//! rows and columns of the media a clip decodes *to*; the arena and the captured graph belong to
-//! the latents it decodes *from*. The ratios between the two are the checkpoint's, so the
-//! model states the map ([`nn::capability::Decoder::layout_of`]) and this file never divides by a
-//! temporal or spatial compression.
+//! ## A call
 //!
-//! **Its output is media, not hidden states.** The clip's raster is a column of this runner's own, so
-//! a replay writes it where the transport reads it; an encode's output is read through resident
-//! products instead, which is why that runner allocates its output from the arena and this one does
-//! not.
+//! A video decode is a round of the timeline's units: `row.unit` and the units after it, one per
+//! splice tail the row writes. An audio decode is the request's track, one unit. Each unit is
+//! one replay of its bucket's graph on the runner's stream, in unit order:
 //!
-//! **The decode's values are the model's and the clip is the denoiser's.** What a decode reads
-//! beyond its latents (copy-block offsets, rotary positions) the model computes inside
-//! [`nn::capability::Decoder::decode`] from the layout and uploads through the runner's staging
-//! regions; before each replay the same decode runs in staging mode. The trajectory is not this
-//! runner's to compute either: a denoise step
-//! publishes it under the request's name, so `stage` copies it from the product store - ordered on
-//! this runner's stream, which also works when the denoiser ran on another device - and reads a
-//! batch buffer as the clip only when the store holds none.
+//! 1. the unit's latents are copied into the runner's latent buffer: a clip's window of the
+//!    trajectory, the latent frames from `Decoder::clip_start`, or the whole track; a clip whose
+//!    splice fades against its predecessor has the predecessor's tail copied into the runner's
+//!    tail buffer;
+//! 2. the graph replays: the window gathered and decoded into a raster, which is placed and packed
+//!    into bytes under every distinct splice of the deployment's timelines; or the track decoded
+//!    and interleaved into 16-bit PCM;
+//! 3. the unit's output is copied into its product: the bytes of the unit's own splice into the
+//!    video units block from the splice's first frame, or the PCM into the audio samples block;
+//!    a clip that a successor fades against copies the raster's last frames into its tail block.
+//!
+//! Every address is computed and every block checked before anything is issued: a position the
+//! tables hold no entry for, a write to a read-only entry, or bytes past a block refuse the
+//! batch. The copies are the driver's, so the graph's launches are the only kernels of a call.
+//!
+//! ## Why a clip's graph places every distinct splice
+//!
+//! A captured graph's launches follow from its bucket, and a splice's runs, their number and
+//! their frames, follow from the clip's place in its timeline. A canvas's graph therefore places
+//! the decoded clip under each distinct splice of the deployment's timelines (`first` taken as
+//! zero), and a unit keeps the bytes of its own. That costs the packing of a few clips' frames
+//! beside the decode, and keeps one graph per canvas.
+//!
+//! ## What the products hold
+//!
+//! | Product | Bytes |
+//! | --- | --- |
+//! | Video latents | The trajectory, `[channels, frames · rows · columns]` in `Decoder::latent_type`, `frames` the timeline's latent frames ([`DecoderConfig::timelines`]) |
+//! | Video units | The timeline's frames, `[frames, rows, columns, 3]` bytes, each unit's kept frames from its splice's `first`; without a splicer, unit `u`'s raster in the decoder's element type at `u` times its bytes |
+//! | Video tail of unit `u` | The last frames of unit `u`'s raster that unit `u + 1` fades against, `[3, frames, rows, columns]` in the decoder's element type |
+//! | Audio latents | The track's elements in `Decoder::latent_type` |
+//! | Audio samples | `[samples, 2]` interleaved `i16` |
+//!
+//! ## The tail between rounds
+//!
+//! Within a round the units run on one rank in order, and a unit reads the tail the unit before
+//! it wrote on the same stream. A round after the first reads the tail of the round before it,
+//! which the scheduler gives it only once that round completed, and `execute` returns only once
+//! its stream passed every copy: the tail's write is ordered before its read by completion, and
+//! no event passes between executors. A round reads the tail from the run of the rank it runs
+//! on: a round's last tail is written into this rank's run of the tail block, and lies in
+//! another rank's run only once copied there.
 
-use std::collections::{BTreeMap, BTreeSet};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
+use std::time::Instant;
 
-use nn::capability::{Clip, DecodedMedia, Decoder, Splicer};
-use ops::{Operand, Shape};
-use platform::DeviceId;
-use proto::video::Layout;
-use uniserve_tensor::DType;
+use ipc::batch::{Batch, BatchOutput, Extent, MediaRow, Phase, TimingCounters};
+use nn::{Clip, Decoder, Layout, Splice, Splicer};
+use ops::pcm::{self, PcmInterleave};
+use ops::rgb::{self, RgbBytes};
+use platform::{Event, EventFlags, Pitched, PitchedBatch, SourceOrder, Stream};
+use uniserve_tensor::{DType, Device, Shape, Tensor};
 
-use crate::arena::Pools;
-use crate::batch::{Job, Jobs, answered};
-use crate::plan::{Bucket, Buckets};
-use crate::runner::{Binding, Runner, RunnerId};
-use crate::runners::columns::Column;
-use crate::runners::lifecycle::{Lifecycle, RunnerLifecycle};
-use crate::runners::output::RgbBytes;
-use crate::runners::products::{Product, Products};
-use crate::runners::recording::{Footprint, Walk};
-use crate::staging::StagingRegion;
+use crate::buckets::{Bucket, Buckets};
+use crate::graphs::Graphs;
+use crate::memory::allocation::Storage;
+use crate::memory::buffers::{BufferMemory, UNIT_BYTES};
+use crate::memory::lend;
+use crate::memory::tables::{BlockCopy, BlockTables};
+use crate::runner::Runner;
+use crate::runners::causal_lm::output::performed;
 use crate::{Error, Result};
-use ipc::execution::{Batch, BatchOutput, CallId};
-use ipc::execution::{Extent, Variant};
 
-/// How long a clip waits for its predecessor's tail before it names the rank that never answered.
-const TAIL_WAIT: std::time::Duration = std::time::Duration::from_secs(120);
+/// The channels of a decoded raster and of its packed bytes: red, green and blue.
+const CHANNELS: u64 = rgb::CHANNELS as u64;
 
-/// The channels of a decoded raster: red, green and blue, whatever the latents carry.
-const RASTER_CHANNELS: u32 = 3;
+/// The channels of the interleaved PCM.
+const PCM_CHANNELS: u32 = 2;
 
-/// The rows of the latent block `layout`'s decode reads: the decoder's own, or one per voxel.
-fn block_rows<M: nn::capability::Decoder + ?Sized>(model: &M, layout: &Layout) -> Result<u64> {
-    let video = layout.video;
-    Ok(match model.latent_rows(layout).map_err(Error::from)? {
-        Some(rows) => rows.len() as u64,
-        None => u64::from(video.frames) * u64::from(video.height) * u64::from(video.width),
-    })
+/// What one unit of a call moves around its replay: the copies into the runner's buffers before
+/// it; the forward's output the unit keeps, with the address in the product buffer it lands at;
+/// and the tail it leaves its successor, with the address it lands at and its frames.
+type Unit = (PitchedBatch, (usize, u64), Option<(u64, u32)>);
+
+/// What a deployment fixes of a decoder runner. Immutable once the runner is built.
+#[derive(Clone, Debug)]
+pub struct DecoderConfig {
+    /// The phases the runner serves, as the scheduler names them in a batch.
+    pub phases: Vec<Phase>,
+    /// The buckets the runner captures: one clip of the decoder's window per canvas
+    /// (`Bucket::clip`), or one per track (`Bucket::audio`).
+    pub buckets: Buckets,
+    /// The classes of the products a call reads and writes: the latents it decodes, the media it
+    /// writes (the video units or the audio samples), and a video's splice tails.
+    pub classes: [u8; 3],
+    /// For a video decoder, each timeline the deployment serves, in frames, with the latent
+    /// frames of its trajectory as the denoiser lays the request out: the splices of its units,
+    /// and the stride of the trajectory in its latents block.
+    pub timelines: Vec<(u32, u32)>,
 }
 
-/// The columns one clip's decode is staged into, sized for the largest canvas the runner serves.
-///
-/// A decoder's buckets differ by canvas, and its columns are sized by the largest of them: the clip
-/// the bucket was captured for reads exactly its own prefix, the way an encoder's columns are read.
-struct DecoderColumns {
-    /// `[voxels, channels]` the clip's latents, in the type the decoder reads them in.
-    latents: Column,
-    /// The clip's raster, `[channels, frames, rows, columns]`, in the decoder's own element type.
-    raster: Column,
+/// The runner of a decoder (module documentation).
+pub struct DecoderRunner {
+    model: Arc<dyn Decoder + Send + Sync>,
+    /// A video decoder's splicer; `None` for a track's decoder, or a clip's that places none.
+    splicer: Option<Arc<dyn Splicer + Send + Sync>>,
+    config: DecoderConfig,
+    graphs: Graphs,
+    /// The rank's media memory, which every media runner of the rank shares.
+    memory: Arc<BufferMemory>,
+    /// The stream the graphs replay on; `None` for graphs that hold no device.
+    stream: Option<Stream>,
+    /// Recorded behind a batch's last copy: what `execute` waits for.
+    done: Option<Event>,
+    /// Each bucket's latent layout: the model's map of a clip, or a track's own.
+    layouts: Vec<(Bucket, Layout)>,
+    /// The distinct splices of the deployment's timelines, each from frame zero, in the order a
+    /// clip bucket's forward returns their bytes after its raster.
+    splices: Vec<Splice>,
+    /// The latent buffer from byte 0 and the tail buffer from byte `tail`, `bytes` in all;
+    /// `None` for graphs that hold no device.
+    buffers: Option<Arc<Storage>>,
+    tail: u64,
+    bytes: u64,
 }
 
-impl DecoderColumns {
-    /// The clip's own two columns.
-    fn new(
-        device: DeviceId,
-        layout: &Layout,
-        latent: DType,
-        dtype: DType,
-        rows: u64,
-    ) -> Result<Self> {
-        let video = layout.video;
-        let elements = rows
-            .checked_mul(u64::from(video.channels))
-            .ok_or_else(|| Error::Invalid("a clip's latent extent overflows".into()))?;
-        let latents = Column::new(device, latent, elements)?;
-        Ok(Self {
-            latents,
-            // Sized by `size_raster` when a bucket is first staged: the raster's frame count is the
-            // bucket's rather than the layout's, since a layout states **latent** frames and the
-            // clip writes the decoded ones. One element until then, because a column of a length
-            // this constructor cannot know must not pretend to a length it can.
-            raster: Column::new(device, dtype, 1)?,
-        })
-    }
-}
-
-/// The media computation a batch states, or the refusal a decoder runner gives a batch with none.
-///
-/// A decoder serves one computation and the mechanism states it in the batch rather than in the
-/// runner: `Batch::media` is `Some` for a media batch and `None` for every token batch. The check is
-/// its own function because it is the one part of `submit` that is a fact about the batch alone - a
-/// device-free test can state a batch with no computation and read the message, where a test of
-/// `submit` itself would need a constructed runner and therefore a device.
-fn media_of(batch: &Batch) -> Result<&ipc::execution::MediaColumns> {
-    batch.media.as_ref().ok_or_else(|| {
-        Error::Invalid(
-            "a decoder runner serves a media batch; this one states no computation".into(),
-        )
-    })
-}
-
-/// The decoder's runner: one device stream, the canvas its model serves, and its graphs.
-pub struct DecoderRunner<M: Decoder + Send + Sync + ?Sized> {
-    id: RunnerId,
-    phases: Vec<ipc::PhaseId>,
-    model: Arc<M>,
-    lifecycle: Lifecycle,
-    buckets: Buckets,
-    device: DeviceId,
-    stream: platform::Stream,
-    counters: Option<Arc<crate::device::SharedCounters>>,
-    /// The model's own map from each bucket's raster to the latents its graph is keyed by, asked once
-    /// at bind: a bucket the model refuses is a plan that names a canvas its decoder does not serve,
-    /// and the refusal belongs at load rather than at a capture.
-    layouts: std::collections::BTreeMap<Bucket, Layout>,
-    /// The element type the raster is stated in, as the model declares it.
-    dtype: DType,
-    /// The element type the model reads its latents in.
-    latent: DType,
-    columns: DecoderColumns,
-    /// The bucket the columns are staged for, so a capture of a canvas knows how far they run.
-    /// The calls of the batch staged last, which its replay answers.
-    calls: Vec<CallId>,
-    staged: Option<Bucket>,
-    /// The raster's element count for the bucket staged last: a clip's raster is a function of its
-    /// bucket, and the column is sized for the largest one.
-    raster_elements: u64,
-    /// The epoch's product store, or `None` when the worker attached none. A decode then writes
-    /// its clip and publishes nothing, and the read that expects a frame refuses by name rather
-    /// than reading whatever the column held before.
-    products: Option<Arc<dyn Products>>,
-    /// The request whose clip is staged. A decode bucket serves one clip (`clip_of` refuses two),
-    /// so one name covers a batch, and a later decode of the same request replaces it — which is
-    /// what a reader that copied in time expects.
-    staged_request: Option<ipc::RequestKey>,
-    /// The denoiser's trajectory, copied here from the store on this runner's stream, which is what
-    /// orders a clip's read after the producing step and works across devices. Sized to the first one
-    /// staged and grown after.
-    trajectory: Option<Column>,
-    /// The latent frame the clip staged last starts at, when its block is still to be gathered from
-    /// `trajectory`: the replay gathers it, on the stream that then reads it.
-    gather: Option<u32>,
-    /// The elements of the trajectory staged last.
-    trajectory_elements: u64,
-    /// The request whose clip the raster column last held, so a decode of another can be refused
-    /// while the first is unread ([`clip_is_releasable`]).
-    published_for: Option<ipc::RequestKey>,
-    /// The [`Splicer`], when the deployment serves one: the postprocessor that writes a clip's
-    /// frames into the request's timeline with the seam fade and the checkpoint's
-    /// de-normalization. Without one the runner publishes the clip's own raster.
-    postprocessor: Option<Arc<dyn Splicer + Send + Sync>>,
-    /// The byte packing of what the postprocessor places, de-normalized by its pixel normalization;
-    /// present exactly when the postprocessor is.
-    bytes: Option<RgbBytes>,
-    /// `[frames, rows, columns, 3]` bytes: the frames a splice wrote for the clip staged last.
+impl DecoderRunner {
+    /// A runner of `model`, with `splicer` for a video decoder that places its clips, under
+    /// `config`, over `memory`.
     ///
-    /// Sized at bind for the bucket's own clip raster, which no splice exceeds - a splice keeps at
-    /// most the frames the decoder wrote, since the tail it adds is a subset of them.
-    frames: Option<Column>,
-    /// The tails this runner's clips leave, one `[channels, overlap, rows, columns]` slot per clip of
-    /// the timeline in the model's type, which the next clip's five-frame fade reads. Sized on the
-    /// first splice from the schedule's own overlap count, which is the model's number rather than
-    /// this runner's, and reused after.
-    tail: Option<Column>,
-    /// The frames the staged request's timeline holds, from its own row
-    /// (`StagedRequest::frames`): the schedule's length, which is what the last clip's keep depends
-    /// on.
-    staged_frames: Option<u32>,
-    /// The frames the splice staged last wrote for the staged request's clip: the extent the product
-    /// states, taken from the schedule rather than recomputed here.
-    staged_keep: Option<u32>,
-    /// The timeline frame the clip staged last starts at, and the unit it is.
-    staged_first: u32,
-    staged_unit: u32,
-    /// The units of `published_for`'s timeline this runner has published.
-    published_units: u32,
-    /// The timelines, in frames, a request of each decode bucket's canvas may ask for: the splice
-    /// schedules the recorded walk splices. Empty without a postprocessor.
-    timelines: BTreeMap<Bucket, BTreeSet<u32>>,
-}
-
-/// Whether a decode of `request` may start while a clip published under `published` is still held.
-///
-/// **One raster column, and a clip nobody has read yet.** A decode writes this runner's raster
-/// column, so decoding a second clip would overwrite the first before its artifact exists — silently,
-/// after the step that produced it, with no event that could order the read (the transport reads
-/// after the step, where a stream wait cannot reach). The first clip's life ends at
-/// `Products::forget`, which the transport calls once it has the bytes, so this asks the store and
-/// refuses by name: what a refusal means is *this request must wait for one read*, not *this
-/// deployment cannot serve two*.
-///
-/// A re-decode of the **same** request is allowed: its clip is its own, and the transport has either
-/// read it or not, in which case it is about to.
-fn clip_is_releasable(
-    request: ipc::RequestKey,
-    published: Option<ipc::RequestKey>,
-    still_held: bool,
-) -> Result<()> {
-    let Some(published) = published else {
-        return Ok(());
-    };
-    if published == request || !still_held {
-        return Ok(());
-    }
-    Err(Error::Invalid(format!(
-        "request {} asks for a decode and this runner's raster column still holds request {}'s \
-         clip: a decode writes the one column, so the second clip would replace the first before \
-         its artifact was read. The clip's life ends at `forget`, which the reader calls once it \
-         has the bytes; a second decode before that is a request that must wait, not a canvas this \
-         device cannot serve",
-        request.request_id.0, published.request_id.0
-    )))
-}
-
-impl<M: Decoder + Send + Sync + ?Sized> DecoderRunner<M> {
-    /// Binds a decoder to one device stream.
+    /// - `graphs` are made for no input tensors: a decode's host values are its forward's.
+    /// - `stream` is the stream `graphs` replay on, on which the runner issues its copies; `None`
+    ///   for graphs that hold no device, whose runner computes over meta tensors.
     ///
-    /// Every decode bucket in `buckets` is mapped through the model's own `layout_of` here, so the
-    /// bind fails by name when the plan holds a canvas the model's decoder does not serve. **That is
-    /// the measured bound on a decoder runner's buckets:** a `VideoDecoder` is built for one canvas,
-    /// so a plan offering it another is refused at load rather than at the canvas's first request.
+    /// # Errors
+    ///
+    /// [`Error::Invalid`] for no bucket, a bucket that is neither a clip nor a track, a video
+    /// decoder serving no timeline, a splicer of another element type, a track that is not
+    /// stereo, a stream without a device or the reverse; what the model or the splicer refuses:
+    /// a canvas the model lays out no clip of, a timeline the splicer has no splices of; the
+    /// driver's refusal of the buffers.
     pub fn new(
-        binding: Binding,
-        model: Arc<M>,
-        buckets: Buckets,
-        generation: Arc<ops::Generation>,
-        postprocessor: Option<Arc<dyn Splicer + Send + Sync>>,
+        model: Arc<dyn Decoder + Send + Sync>,
+        splicer: Option<Arc<dyn Splicer + Send + Sync>>,
+        config: DecoderConfig,
+        graphs: Graphs,
+        stream: Option<Stream>,
+        memory: Arc<BufferMemory>,
     ) -> Result<Self> {
-        let mut layouts = std::collections::BTreeMap::new();
-        let mut largest: Option<(Bucket, Layout)> = None;
-        for bucket in buckets.iter().copied() {
-            if bucket.variant != Variant::Decode {
-                continue;
-            }
-            let layout = Self::layout_of(&*model, bucket)?;
-            if largest
-                .as_ref()
-                .is_none_or(|(held, _)| bucket.rows > held.rows)
-            {
-                largest = Some((bucket, layout));
-            }
-            layouts.insert(bucket, layout);
-        }
-        let (_, layout) = largest.as_ref().ok_or_else(|| {
-            Error::Invalid(
-                "a decoder runner was bound with no decode bucket to capture; its plan must state \
-                 the canvases the checkpoint's decoder serves"
+        if graphs.enter().is_ok() != stream.is_some() || config.buckets.is_empty() {
+            return Err(Error::Invalid(
+                "a decoder runner takes buckets, and the stream of its graphs or none for graphs \
+                 that hold no device"
                     .into(),
-            )
-        })?;
-        let dtype = model.element_type();
-        let latent = model.latent_type();
-        let rows = block_rows(model.as_ref(), layout)?;
-        let columns = DecoderColumns::new(binding.device, layout, latent, dtype, rows)?;
-        let lifecycle = Lifecycle::new(binding.id, generation, binding.stream.clone());
-        let bytes = postprocessor
-            .as_deref()
-            .map(|postprocessor| -> Result<RgbBytes> {
-                let norm = postprocessor.pixel_norm();
-                RgbBytes::new(binding.device, postprocessor.element_type(), norm)
-            })
-            .transpose()?;
-        Ok(Self {
-            id: binding.id,
-            phases: binding.phases,
-            model,
-            lifecycle,
-            buckets,
-            device: binding.device,
-            stream: binding.stream,
-            counters: None,
-            layouts,
-            dtype,
-            latent,
-            columns,
-            calls: Vec::new(),
-            staged: None,
-            raster_elements: 0,
-            products: None,
-            staged_request: None,
-            trajectory: None,
-            gather: None,
-            trajectory_elements: 0,
-            published_for: None,
-            postprocessor,
-            bytes,
-            frames: None,
-            tail: None,
-            staged_frames: None,
-            staged_keep: None,
-            staged_first: 0,
-            staged_unit: 0,
-            published_units: 0,
-            timelines: BTreeMap::new(),
-        })
-    }
-
-    /// This runner with the timelines, in frames, a request of each decode bucket's canvas may ask
-    /// for: what a clip's splice depends on beyond its bucket, so the recorded walk splices every
-    /// clip of every timeline the deployment serves.
-    #[must_use]
-    pub fn serving(mut self, timelines: BTreeMap<Bucket, BTreeSet<u32>>) -> Self {
-        self.timelines = timelines;
-        self
-    }
-
-    /// One decode bucket's latent layout, from the model's map.
-    fn layout_of(model: &M, bucket: Bucket) -> Result<Layout> {
-        let Extent::Clip {
-            frames,
-            height,
-            width,
-        } = bucket.extent
-        else {
-            return Err(Error::Invariant(format!(
-                "bucket {bucket} is not a decode bucket and a decoder runner was asked for its \
-                 layout"
-            )));
-        };
-        model
-            .layout_of(Clip {
-                frames,
-                height,
-                width,
-            })
-            .map_err(|error| {
-                Error::Invalid(format!(
-                    "the decoder serves no clip of {frames} frame(s) at {height}x{width}: {error}"
-                ))
-            })
-    }
-
-    /// The buckets this runner captures: the decode ones, largest first.
-    fn capture_order(&self) -> Vec<Bucket> {
-        let mut buckets: Vec<Bucket> = self
-            .buckets
-            .iter()
-            .filter(|bucket| bucket.variant == Variant::Decode)
-            .copied()
-            .collect();
-        buckets.sort_by_key(|bucket| std::cmp::Reverse(bucket.rows));
-        buckets
-    }
-
-    /// The layout of `bucket`, which `new` asked the model for.
-    fn layout(&self, bucket: Bucket) -> Result<Layout> {
-        self.layouts.get(&bucket).copied().ok_or_else(|| {
-            Error::Invalid(format!(
-                "no latent layout was mapped for the decode bucket of {bucket}"
-            ))
-        })
-    }
-
-    /// Sizes this runner's raster column for `bucket`'s clip, the first time a bucket is staged.
-    ///
-    /// The raster is a column rather than an arena extent because a replay's output leaves the
-    /// device: an arena is a graph's scratch and is reused by the next capture, while the clip a
-    /// request asked for is read by the transport after the step.
-    fn size_raster(&mut self, bucket: Bucket) -> Result<()> {
-        let Extent::Clip {
-            frames,
-            height,
-            width,
-        } = bucket.extent
-        else {
-            return Err(Error::Invariant(format!(
-                "bucket {bucket} is not a decode bucket"
-            )));
-        };
-        self.layout(bucket)?;
-        let elements = u64::from(RASTER_CHANNELS)
-            .checked_mul(u64::from(frames))
-            .and_then(|elements| elements.checked_mul(u64::from(height)))
-            .and_then(|elements| elements.checked_mul(u64::from(width)))
-            .ok_or_else(|| Error::Invalid("a clip's raster extent overflows".into()))?;
-        if elements > self.raster_elements {
-            self.columns.raster = Column::new(self.device, self.dtype, elements)?;
-            self.raster_elements = elements;
+            ));
         }
-        // The frames a splice writes are bytes - `[frames, rows, columns, 3]` - and there are as
-        // many of them as the clip's own decoded frames at most: the body a splice keeps and the tail
-        // it adds both come out of that raster, never beside it.
-        if self.postprocessor.is_some() {
-            let frames = u64::from(frames)
-                .checked_mul(u64::from(height))
-                .and_then(|elements| elements.checked_mul(u64::from(width)))
-                .and_then(|elements| elements.checked_mul(3))
-                .ok_or_else(|| Error::Invalid("a splice's raster extent overflows".into()))?;
-            if self
-                .frames
-                .as_ref()
-                .is_none_or(|column| column.device.numel() < frames)
-            {
-                self.frames = Some(Column::new(self.device, DType::U8, frames)?);
+        if let Some(splicer) = &splicer
+            && splicer.element_type() != model.element_type()
+        {
+            return Err(Error::Invalid(
+                "the splicer places rasters of another element type than the decoder's".into(),
+            ));
+        }
+
+        // The distinct splices of every timeline a canvas's graph places.
+        let mut splices = Vec::new();
+        if let Some(splicer) = &splicer {
+            for &(frames, _) in &config.timelines {
+                for splice in splicer.splices(frames)? {
+                    let splice = Splice { first: 0, ..splice };
+                    if !splices.contains(&splice) {
+                        splices.push(splice);
+                    }
+                }
             }
         }
-        Ok(())
-    }
+        let overlap = splices.iter().map(|splice| splice.overlap).max();
 
-    /// Sizes the frames column for a timeline of `frames` frames.
-    ///
-    /// Each clip keeps its frames at their place in the timeline, so a decode that runs ahead of the
-    /// encodes leaves every clip readable until its own encode copies it.
-    fn size_timeline(&mut self, bucket: Bucket, frames: u32) -> Result<()> {
-        let Extent::Clip { height, width, .. } = bucket.extent else {
-            return Ok(());
-        };
-        if self.postprocessor.is_none() {
-            return Ok(());
-        }
-        let elements = u64::from(frames)
-            .checked_mul(u64::from(height))
-            .and_then(|elements| elements.checked_mul(u64::from(width)))
-            .and_then(|elements| elements.checked_mul(3))
-            .ok_or_else(|| Error::Invalid("a timeline's raster extent overflows".into()))?;
-        if self
-            .frames
-            .as_ref()
-            .is_none_or(|column| column.device.numel() < elements)
-        {
-            self.frames = Some(Column::new(self.device, DType::U8, elements)?);
-        }
-        Ok(())
-    }
-
-    /// The one clip a decode bucket serves, or the refusal that names how many the batch carries.
-    ///
-    /// The bucket's extent names one raster, so a batch of two requests for it describes two clips in
-    /// one graph - a plan the mechanism does not make, and one whose second clip would be decoded
-    /// from the first clip's columns.
-    fn clip_of(media: &ipc::execution::MediaColumns) -> Result<&Vec<Vec<u8>>> {
-        let [buffers] = media.inputs.as_slice() else {
-            return Err(Error::Invalid(format!(
-                "a decode bucket holds one clip and this batch carries {} request(s)",
-                media.inputs.len()
-            )));
-        };
-        Ok(buffers)
-    }
-
-    /// Stages `bucket`'s latents.
-    ///
-    /// A warm capture passes no latents, so the column is zeroed - defined values in its own element
-    /// type, which is what a capture needs and all it needs.
-    ///
-    /// A replay passes the batch's buffer - a staged row is the request's conditioning blob and its
-    /// parameter record - but `stage` reaches this only when the product store holds no trajectory
-    /// for the request, and a blob of another length is then refused rather than copied over a prefix.
-    fn stage_columns(&mut self, bucket: Bucket, latents: Option<&[u8]>) -> Result<()> {
-        self.size_raster(bucket)?;
-        self.layout(bucket)?;
-        match latents {
-            Some(bytes) => {
-                // The column is the model's extent for this layout, so a blob of another length is
-                // a request for another clip: refused by name rather than copied over a prefix.
-                let expected = self.columns.latents.host.len();
-                if bytes.len() != expected {
+        // Each bucket's layout, and the bytes its latents and the tail a clip fades against take.
+        let latent = element(model.latent_type())?;
+        let raster = element(model.element_type())?;
+        let (mut layouts, mut latents, mut tails) = (Vec::new(), 0, 0);
+        for bucket in config.buckets.iter().copied() {
+            let layout = match bucket.extent {
+                Extent::Clip {
+                    frames,
+                    height,
+                    width,
+                } if config.timelines.is_empty() => {
                     return Err(Error::Invalid(format!(
-                        "a decode of bucket {bucket} states {expected} byte(s) of latents and the \
-                         batch carries {}: the clip is not this bucket's",
-                        bytes.len()
+                        "a video decoder of {frames}x{height}x{width} clips serves no timeline"
                     )));
                 }
-                self.columns.latents.write(bytes)?;
-            }
-            None => {
-                // The clip is this runner's own column, empty until a request publishes one: zeros
-                // are defined, hold no clip's arithmetic and cost no copy.
-                //
-                // SAFETY: the column is this runner's own pinned storage, sized for the largest
-                // bucket it was bound with, and nothing else writes it here: the capture this stages
-                // is the next job on the stream, and a replay of this bucket is not concurrent with
-                // a stage (a batch is staged once, before its jobs are issued).
-                unsafe {
-                    self.columns.latents.host.as_mut_slice().fill(0);
+                Extent::Clip {
+                    frames,
+                    height,
+                    width,
+                } => {
+                    let layout = model.layout_of(Clip {
+                        frames,
+                        height,
+                        width,
+                    })?;
+                    let pixels = u64::from(height) * u64::from(width);
+                    let video = layout.video;
+                    latents = latents.max(u64::from(video.channels) * voxels(&video) * latent);
+                    tails = tails.max(CHANNELS * u64::from(overlap.unwrap_or(0)) * pixels * raster);
+                    layout
                 }
-            }
+                Extent::Latents(layout) => {
+                    let track = layout.audio.ok_or_else(|| {
+                        Error::Invalid(format!("bucket {bucket} states no audio track to decode"))
+                    })?;
+                    if model.pcm_window(&track)?.1 != PCM_CHANNELS {
+                        return Err(Error::Invalid(format!(
+                            "bucket {bucket}'s track is not the stereo track PCM interleaves"
+                        )));
+                    }
+                    latents = latents.max(elements(&track) * latent);
+                    layout
+                }
+                _ => {
+                    return Err(Error::Invalid(format!(
+                        "bucket {bucket} is no decode of a clip or of a track"
+                    )));
+                }
+            };
+            layouts.push((bucket, layout));
         }
-        self.staged = Some(bucket);
-        Ok(())
+        let tail = latents.next_multiple_of(UNIT_BYTES);
+        let bytes = tail + tails;
+
+        // The buffers hold defined values for the capture's first forward.
+        let buffers = match &stream {
+            Some(stream) => {
+                let length = usize::try_from(bytes)
+                    .map_err(|_| Error::Invalid("the decoder's buffers exceed memory".into()))?;
+                let storage = Storage::linear(stream.device(), length)?;
+
+                // SAFETY: the range is the whole allocation, which this runner keeps for as long
+                // as the graphs captured over it exist.
+                unsafe { platform::memset_d8(storage.address(), 0, length, stream) }?;
+                Some(storage)
+            }
+            None => None,
+        };
+
+        Ok(Self {
+            done: stream.as_ref().map(|_| Event::new(EventFlags::default())),
+            model,
+            splicer,
+            config,
+            graphs,
+            memory,
+            stream,
+            layouts,
+            splices,
+            buffers,
+            tail,
+            bytes,
+        })
     }
 
-    /// Stages a batch's clip into the columns `bucket`'s graph reads.
-    fn stage(&mut self, batch: &Batch, bucket: Bucket) -> Result<()> {
-        let media = batch.media.as_ref().ok_or_else(|| {
-            Error::Invalid(
-                "a decoder runner serves a media batch; this one states no computation".into(),
-            )
-        })?;
-        // The batch names its requests, and a decode bucket serves one clip, so the name kept here
-        // is the one the replay's publish uses.
-        let request = media.request(0)?.request;
-        // The column may still hold another request's clip: the store is where that clip's life
-        // ends, so the store is asked.
-        let still_held = match (self.products.as_deref(), self.published_for) {
-            (Some(store), Some(last)) if last != request => {
-                (0..self.published_units).any(|unit| store.holds(last, Product::Video(unit)))
-            }
-            _ => false,
-        };
-        clip_is_releasable(request, self.published_for, still_held)?;
-        self.staged_request = Some(request);
-        self.staged_frames = Some(media.request(0)?.frames);
-        self.staged_unit = media.request(0)?.unit;
-        self.size_timeline(bucket, media.request(0)?.frames)?;
-        // **The trajectory is the denoiser's product, and the store is where it lives.** A staged row
-        // is the request's conditioning blob and its parameter record; the latent trajectory is
-        // explicitly not the batch's (`MediaColumns::staged`: "It does not own what the model
-        // prepares on the device - the encoded conditioning rows, the latent trajectory"), and a
-        // denoise step publishes it under this request's name at every step. So the clip is copied
-        // from there, ordered on this runner's stream, which is the only path that also works when
-        // the denoiser ran on another device.
-        if let Some(products) = self.products.clone()
-            && products.holds(request, Product::VideoLatents)
-        {
-            return self.stage_product(bucket, request, products.as_ref());
-        }
-        let row = Self::clip_of(media)?;
-        let Some(latents) = row.first() else {
-            return Err(Error::Invalid(
-                "a staged decode row carries no buffer: a media row is the request's conditioning \
-                 blob and its parameter record"
-                    .into(),
-            ));
-        };
-        self.stage_columns(bucket, Some(latents))
+    /// The bytes of device memory the runner holds beside its graphs' region: its latent and
+    /// tail buffers, sized for its largest bucket.
+    pub const fn device_bytes(&self) -> u64 {
+        self.bytes
     }
 
-    /// Stages the trajectory the denoiser published for `request`, and notes the clip to gather.
-    ///
-    /// **Nothing here waits or crosses to the host.** The copy is on this runner's stream and the store
-    /// orders it after the producing step's write, which is what makes it correct when the denoiser ran
-    /// on another stream or another device; the replay then gathers the clip's rows on the same stream.
-    /// So staging the next clip costs the previous clip's decode nothing.
-    fn stage_product(
-        &mut self,
-        bucket: Bucket,
-        request: ipc::RequestKey,
-        store: &dyn Products,
-    ) -> Result<()> {
-        self.size_raster(bucket)?;
-        let Some(published) = store.product(request, Product::VideoLatents)? else {
-            return Err(crate::runners::products::absent(
-                request,
-                Product::VideoLatents,
-            ));
-        };
-        // The boundary converts nothing: the decoder states the type it reads its latents in, and a
-        // trajectory of another type would be a reinterpretation of its bytes.
-        if published.dtype != self.latent {
-            return Err(Error::Invalid(format!(
-                "the decoder reads its latents as {} and the denoiser published {}",
-                ops::abi::name(self.latent),
-                ops::abi::name(published.dtype)
+    /// The latent layout of `bucket`.
+    fn layout(&self, bucket: &Bucket) -> Result<Layout> {
+        self.layouts
+            .iter()
+            .find(|(held, _)| held == bucket)
+            .map(|(_, layout)| *layout)
+            .ok_or_else(|| Error::Invariant(format!("bucket {bucket} is none the runner states")))
+    }
+
+    /// The tensor of `shape` elements of `dtype` from byte `offset` of the runner's buffers.
+    fn buffer(&self, offset: u64, shape: impl Into<Shape>, dtype: DType) -> Result<Tensor> {
+        let shape = shape.into();
+        if offset + shape.elem_count() as u64 * element(dtype)? > self.bytes {
+            return Err(Error::Invariant(format!(
+                "{shape:?} {dtype:?} from byte {offset} lies past the decoder's buffers"
             )));
         }
-        let element = ops::abi::bytes(published.dtype).ok_or_else(|| {
-            Error::Invalid(format!(
-                "{} has no whole-byte size",
-                ops::abi::name(published.dtype)
-            ))
-        })?;
-        let elements = published.bytes / element;
-        if self
-            .trajectory
-            .as_ref()
-            .is_none_or(|column| column.device.numel() < elements)
-        {
-            self.trajectory = Some(Column::new(self.device, published.dtype, elements)?);
+        let base = self.buffers.as_ref().map_or(0, |storage| storage.address());
+
+        // SAFETY: the tensor lies inside the buffers, which this runner owns for as long as its
+        // graphs exist; only the copies it issues on its stream and its graphs write them.
+        unsafe {
+            lend(
+                base + offset,
+                shape,
+                dtype,
+                self.stream.as_ref().map(Stream::device),
+            )
         }
-        let column = self
-            .trajectory
-            .as_ref()
-            .ok_or_else(|| Error::Invariant("the trajectory column was just sized".into()))?;
-        let destination = Operand::new(column.device.ptr, published.dtype, Shape::new(&[elements]));
-        if !store.copy_into(request, Product::VideoLatents, &destination, &self.stream)? {
-            return Err(crate::runners::products::absent(
-                request,
-                Product::VideoLatents,
-            ));
-        }
-        self.gather = Some(self.model.clip_start(self.staged_unit));
-        self.trajectory_elements = elements;
-        self.staged = Some(bucket);
-        Ok(())
     }
 
-    /// Gathers the staged clip's block out of the trajectory, on the stream the replay runs on.
-    fn gather_replayed(&mut self, bucket: Bucket, generation: u64, first: u32) -> Result<()> {
-        let kernels = self.lifecycle.generation_named(generation)?;
-        let stream = self.stream.clone();
-        let arena = self.lifecycle.arena()?;
-        let staging = self.lifecycle.staging.slot()?;
-        let forward = nn::Forward::new(&stream, &kernels, &arena).with_staging(staging);
-        let column = self
-            .trajectory
-            .as_ref()
-            .ok_or_else(|| Error::Invariant("a clip was staged with no trajectory".into()))?;
-        let trajectory = Operand::new(
-            column.device.ptr,
-            self.latent,
-            Shape::new(&[self.trajectory_elements]),
-        );
-        self.gather(&forward, bucket, trajectory, first)?;
-        self.lifecycle.staging.release(&stream)
-    }
-
-    /// Gathers the clip starting at latent frame `first` of `trajectory` into the latents column:
-    /// the model call a replay makes before its graph launches, and the recorded walk records.
-    fn gather(
+    /// The address of `bytes` bytes from byte `offset` of the block `row`'s slot holds at
+    /// `position` of `class`, which the call writes when `writes`.
+    fn place(
         &self,
-        forward: &nn::Forward<'_>,
-        bucket: Bucket,
-        trajectory: Operand,
-        first: u32,
-    ) -> Result<()> {
-        let layout = self.layout(bucket)?;
-        let block = self.latents(&layout)?;
-        self.model
-            .gather_latents(forward, &layout, trajectory, first, block)
-            .map_err(Error::from)
+        tables: &BlockTables,
+        row: &MediaRow,
+        (class, position): (u8, u32),
+        writes: bool,
+        (offset, bytes): (u64, u64),
+    ) -> Result<u64> {
+        let length = usize::try_from(bytes)
+            .map_err(|_| Error::Invalid("a product's bytes exceed memory".into()))?;
+        let block = self.memory.lend(
+            tables,
+            (row.slot, class, position),
+            writes,
+            offset,
+            &[length],
+            DType::U8,
+        )?;
+        address(&block)
     }
 
-    /// Stages `bucket` with no batch behind it, so a first capture has defined columns to read.
-    fn stage_warm(&mut self, bucket: Bucket) -> Result<()> {
-        if self.staged == Some(bucket) {
-            return Ok(());
-        }
-        self.stage_columns(bucket, None)
+    /// Checks `batch` and states its call: the bucket that holds it and the units it decodes.
+    fn units(&self, batch: &Batch, tables: &BlockTables) -> Result<(Bucket, Vec<Unit>)> {
+        batch.check()?;
+        let bucket = self.config.buckets.select(&batch.shape).ok_or_else(|| {
+            Error::Invalid(format!("no bucket of the decoder holds {}", batch.shape))
+        })?;
+        let [row] = batch.media.as_slice() else {
+            return Err(Error::Invalid(format!(
+                "batch {} decodes {} requests in a bucket of one",
+                batch.id.0,
+                batch.media.len()
+            )));
+        };
+
+        let decoded = match bucket.extent {
+            Extent::Clip { .. } => self.round(&bucket, row, tables)?,
+            _ => vec![self.track(&bucket, row, tables)?],
+        };
+        Ok((bucket, decoded))
     }
 
-    /// Uploads the staged columns, in one place, so a capture and a replay agree on what the graph
-    /// reads.
-    fn upload(&self) -> Result<()> {
-        self.columns.latents.upload(&self.stream)
-    }
-
-    /// The clip's latents, `[voxels, channels]`, as the model reads them.
-    fn latents(&self, layout: &Layout) -> Result<Operand> {
-        let video = layout.video;
-        let rows = block_rows(self.model.as_ref(), layout)?;
-        Ok(Operand::new(
-            self.columns.latents.device.ptr,
-            self.latent,
-            Shape::new(&[rows, u64::from(video.channels)]),
-        ))
-    }
-
-    /// The raster this runner's replay writes, `[channels, frames, rows, columns]`.
-    fn raster(&self, bucket: Bucket) -> Result<Operand> {
-        Ok(Operand::new(
-            self.columns.raster.device.ptr,
-            self.dtype,
-            self.raster_shape(bucket)?,
-        ))
-    }
-
-    /// `[channels, frames, rows, columns]` of `bucket`'s raster.
-    fn raster_shape(&self, bucket: Bucket) -> Result<Shape> {
+    /// The units of a video decode round (module documentation).
+    fn round(&self, bucket: &Bucket, row: &MediaRow, tables: &BlockTables) -> Result<Vec<Unit>> {
+        let refused = |problem: String| Error::Invalid(format!("a video decode {problem}"));
         let Extent::Clip {
             frames,
             height,
             width,
         } = bucket.extent
         else {
-            return Err(Error::Invariant(format!(
-                "bucket {bucket} is not a decode bucket"
-            )));
+            return Err(Error::Invariant(format!("bucket {bucket} is no clip")));
         };
-        Ok(Shape::new(&[
-            u64::from(RASTER_CHANNELS),
-            u64::from(frames),
-            u64::from(height),
-            u64::from(width),
-        ]))
-    }
+        let [latents_class, media_class, tail_class] = self.config.classes;
 
-    /// Publishes the clip a replay just wrote, so the transport can read it by the request's name.
-    ///
-    /// **A decoded clip has nowhere to go without this.** The raster is this runner's own column and
-    /// no call outside it can name the region; `BatchOutput` carries calls and timings, and `Runner`
-    /// has no accessor for a media output. The store is the tree's one way for a runner to hand
-    /// another call a region, so the clip is published like the encoded states are.
-    ///
-    /// The contract is the store's: the view names memory the **reader** must copy before this
-    /// runner's next decode of the bucket, and the copy is issued on the reader's stream. Publishing
-    /// nothing when no store was attached is deliberate — the consumer's read refuses by name, and a
-    /// decode that refused here would fail a step whose own work succeeded.
-    fn publish(&mut self, bucket: Bucket) -> Result<()> {
-        let Some(products) = self.products.as_ref() else {
-            return Ok(());
+        // The results: the latents and, after the first round, the tail before the round; then
+        // the video units and one tail per unit the round decodes.
+        let reads = row.reads as usize;
+        let (Some(&latents), Some((&media, tails))) = (
+            row.results.first(),
+            row.results.get(reads..).and_then(<[u32]>::split_first),
+        ) else {
+            return Err(refused(format!("row names {:?}", row.results)));
         };
-        let Some(request) = self.staged_request else {
-            return Err(Error::Invariant(format!(
-                "a replay of bucket {bucket} publishes a clip and no request is staged: the batch \
-                 it served was never staged, so the clip has no name to publish under"
+        if tails.is_empty() || reads != 1 + usize::from(row.unit > 0) {
+            return Err(refused(format!(
+                "of unit {} reads {reads} results and writes {} tails",
+                row.unit,
+                tails.len()
             )));
-        };
-        self.layout(bucket)?;
-        // With a postprocessor the request's product is the timeline's frames - `[frames, rows,
-        // columns, 3]` bytes, which is what an encoder takes - and without one it is the clip's own
-        // raster, which is all such a deployment has to publish.
-        let published = match self.postprocessor {
-            Some(_) => self.frames_view(bucket)?,
-            None => self.raster(bucket)?,
-        };
-        let written = crate::runners::products::written_on(&self.stream)?;
-        products.publish(
-            request,
-            Product::Video(self.staged_unit),
-            self.device,
-            self.lifecycle.stream_id(),
-            Some(written),
-            &published,
-        )?;
-        // The column now holds this request's clip until a reader forgets it: that is what a second
-        // decode of another request is refused against.
-        if self.published_for != Some(request) {
-            self.published_units = 0;
         }
-        self.published_units = self.published_units.max(self.staged_unit + 1);
-        self.published_for = Some(request);
-        Ok(())
-    }
-
-    /// Decodes the staged clip of `layout` into `raster` on `forward`: the model call a capture
-    /// walk records, the staging walk before each replay repeats, and the recorded walk records.
-    fn decode(&self, forward: &nn::Forward<'_>, layout: &Layout, raster: Operand) -> Result<()> {
-        let latents = self.latents(layout)?;
-        self.model
-            .decode(
-                forward,
-                layout,
-                latents,
-                DecodedMedia {
-                    video: Some(raster),
-                    // A video decoder writes frames; a bucket that states a clip states no audio, so
-                    // asking this block for audio would be a plan whose extent cannot say so.
-                    audio: None,
-                },
-            )
-            .map_err(Error::from)
-    }
-
-    /// Walks every forward a decode of `bucket` launches, on recording forwards of `walk`
-    /// ([`Runner::record_walk`]): the gather of a clip from its trajectory, the decode its graph
-    /// captures, and the splice of every clip of every timeline the bucket's canvas serves. Each
-    /// starts at the stream region's first address, as a replay's do.
-    ///
-    /// The gathered trajectory is one clip long: the gather's programs follow the clip and the
-    /// element type, not the trajectory's length. The columns a replay writes are placeholders of
-    /// their extents.
-    fn walk_recorded(&self, walk: &Walk, bucket: Bucket) -> Result<()> {
-        let layout = self.layout(bucket)?;
-        let block = self.latents(&layout)?;
-        let trajectory = walk.placeholder(self.latent, Shape::new(&[block.numel()]))?;
-        self.gather(
-            &walk.forward(None)?,
-            bucket,
-            trajectory,
-            self.model.clip_start(0),
-        )?;
-        walk.reset();
-        let raster = self.raster_shape(bucket)?;
-        let raster = walk.placeholder(self.dtype, raster)?;
-        self.decode(&walk.forward(None)?, &layout, raster)?;
-        let Some(postprocessor) = self.postprocessor.as_deref() else {
-            return Ok(());
+        let trajectory = self
+            .config
+            .timelines
+            .iter()
+            .find(|(served, _)| *served == row.frames)
+            .map(|(_, latent)| *latent)
+            .ok_or_else(|| refused(format!("of {} frames serves no timeline", row.frames)))?;
+        let schedule = match &self.splicer {
+            Some(splicer) => Some(splicer.splices(row.frames)?),
+            None => None,
         };
-        let Extent::Clip { height, width, .. } = bucket.extent else {
-            return Err(Error::Invariant(format!(
-                "bucket {bucket} is not a decode bucket"
+
+        // A latent frame's bytes of one channel, and a decoded frame's in the raster and packed.
+        let video = self.layout(bucket)?.video;
+        let plane = u64::from(video.height) * u64::from(video.width);
+        let plane = plane * element(self.model.latent_type())?;
+        let (window, pitch) = (
+            u64::from(video.frames) * plane,
+            u64::from(trajectory) * plane,
+        );
+        let pixels = u64::from(height) * u64::from(width);
+        let raster = pixels * element(self.model.element_type())?;
+        let base = self.buffers.as_ref().map_or(0, |storage| storage.address());
+
+        let mut units = Vec::with_capacity(tails.len());
+        for (index, unit) in (row.unit..).take(tails.len()).enumerate() {
+            let mut before = PitchedBatch::new(SourceOrder::Stream);
+
+            // The clip's window: its latent frames of every channel, a trajectory's row apart.
+            let first = self.model.clip_start(unit);
+            if first + video.frames > trajectory {
+                return Err(refused(format!(
+                    "of unit {unit} reads latent frames past the trajectory's {trajectory}"
+                )));
+            }
+            let extent = u64::from(video.channels).saturating_sub(1) * pitch + window;
+            let source = self.place(
+                tables,
+                row,
+                (latents_class, latents),
+                false,
+                (u64::from(first) * plane, extent),
+            )?;
+            before.push(pitched(
+                (base, window),
+                (source, pitch),
+                window,
+                video.channels,
+            )?)?;
+
+            let Some(schedule) = &schedule else {
+                // A clip no splicer places is kept as its raster, unit after unit.
+                let bytes = CHANNELS * u64::from(frames) * raster;
+                let at = (u64::from(unit) * bytes, bytes);
+                let kept = self.place(tables, row, (media_class, media), true, at)?;
+                units.push((before, (0, kept), None));
+                continue;
+            };
+            let splice = schedule.get(unit as usize).copied().ok_or_else(|| {
+                refused(format!(
+                    "of unit {unit} lies past its {} units",
+                    schedule.len()
+                ))
+            })?;
+            let successor = schedule
+                .get(unit as usize + 1)
+                .map_or(0, |next| next.overlap);
+            if successor > frames {
+                return Err(refused(format!(
+                    "of unit {unit} leaves a tail past its clip"
+                )));
+            }
+
+            // The tail it fades against: the round's own before it, or the one before the round.
+            if splice.overlap > 0 {
+                let previous = match index {
+                    0 => row.results.get(1),
+                    _ => tails.get(index - 1),
+                };
+                let previous = previous.ok_or_else(|| {
+                    refused(format!("of unit {unit} fades and names no tail before it"))
+                })?;
+                let bytes = CHANNELS * u64::from(splice.overlap) * raster;
+                let source = self.place(tables, row, (tail_class, *previous), false, (0, bytes))?;
+                before.push(pitched(
+                    (base + self.tail, bytes),
+                    (source, bytes),
+                    bytes,
+                    1,
+                )?)?;
+            }
+
+            // The bytes of its own splice, from the splice's first frame of the timeline.
+            let output = self
+                .splices
+                .iter()
+                .position(|held| *held == Splice { first: 0, ..splice })
+                .ok_or_else(|| Error::Invariant(format!("{splice:?} is none the graph places")))?;
+            let at = (
+                u64::from(splice.first) * pixels * CHANNELS,
+                u64::from(splice.keep) * pixels * CHANNELS,
+            );
+            let kept = self.place(tables, row, (media_class, media), true, at)?;
+
+            let tail = match successor {
+                0 => None,
+                frames => {
+                    let bytes = (0, CHANNELS * u64::from(frames) * raster);
+                    let at = self.place(tables, row, (tail_class, tails[index]), true, bytes)?;
+                    Some((at, frames))
+                }
+            };
+            units.push((before, (1 + output, kept), tail));
+        }
+        Ok(units)
+    }
+
+    /// The one unit of an audio decode: the track's latents, and its PCM.
+    fn track(&self, bucket: &Bucket, row: &MediaRow, tables: &BlockTables) -> Result<Unit> {
+        let track = self
+            .layout(bucket)?
+            .audio
+            .ok_or_else(|| Error::Invariant(format!("bucket {bucket} states no track")))?;
+        let [latents_class, media_class, _] = self.config.classes;
+        let (Some(&latents), Some(&samples), 1) =
+            (row.results.first(), row.results.get(1), row.reads)
+        else {
+            return Err(Error::Invalid(format!(
+                "an audio decode reads its latents and writes its samples, and its row names {:?}",
+                row.results
             )));
         };
-        for frames in self.timelines.get(&bucket).into_iter().flatten() {
-            let schedule = postprocessor.splices(*frames).map_err(Error::from)?;
-            let clips = u32::try_from(schedule.len())
-                .map_err(|_| Error::Invalid("a timeline of more clips than a u32 counts".into()))?;
-            for (index, splice) in (0..clips).zip(schedule.iter().copied()) {
-                walk.reset();
-                let successor = tail_for_successor(&schedule, index);
-                let previous = (splice.overlap > 0)
-                    .then(|| {
-                        walk.placeholder(
-                            self.dtype,
-                            tail_shape(RASTER_CHANNELS, splice.overlap, height, width),
-                        )
-                    })
-                    .transpose()?;
-                let video =
-                    walk.placeholder(DType::U8, splice_shape(splice.keep, height, width))?;
-                // The tail column a replay sizes for the timeline's fades, when it fades at all.
-                let overlap = successor.max(splice.overlap);
-                let tail = (overlap > 0)
-                    .then(|| -> Result<Operand> {
-                        let elements =
-                            tail_elements(RASTER_CHANNELS, height, width, overlap, clips)?;
-                        walk.placeholder(self.dtype, Shape::new(&[elements]))
-                    })
-                    .transpose()?;
-                self.splice(
-                    &walk.forward(None)?,
-                    postprocessor,
-                    Splicing {
-                        previous,
-                        clip: raster,
-                        splice,
-                        video,
-                        tail,
-                        index,
-                        successor,
+
+        let bytes = elements(&track) * element(self.model.latent_type())?;
+        let source = self.place(tables, row, (latents_class, latents), false, (0, bytes))?;
+        let (window, channels) = self.model.pcm_window(&track)?;
+        let pcm = (0, window * u64::from(channels) * 2);
+        let kept = self.place(tables, row, (media_class, samples), true, pcm)?;
+
+        let base = self.buffers.as_ref().map_or(0, |storage| storage.address());
+        let mut before = PitchedBatch::new(SourceOrder::Stream);
+        before.push(pitched((base, bytes), (source, bytes), bytes, 1)?)?;
+        Ok((before, (0, kept), None))
+    }
+
+    /// Serves `batch`: every unit's copies and replay, on the stream. Returns when the units
+    /// were issued, for a batch that names a call.
+    fn serve(&self, batch: &Batch, tables: &BlockTables) -> Result<Option<Instant>> {
+        // A batch that names no call carries copies alone.
+        if batch.requests.is_empty() {
+            return Ok(None);
+        }
+        let (bucket, units) = self.units(batch, tables)?;
+        let stream = self.stream.as_ref().ok_or(Error::State(
+            "a decoder runner with no device decodes nothing",
+        ))?;
+
+        let launched = Instant::now();
+        for (before, kept, tail) in &units {
+            self.graphs.prepare_inputs(self, &bucket, |_| Ok(()))?;
+
+            // SAFETY: every range lies in a block the tables give this call or in the runner's
+            // buffers (`units`), which stay mapped until the batch ends; the stream orders the
+            // copies after the replay before them, whose graph read the buffers.
+            unsafe { before.submit(stream) }?;
+            let outputs = self.graphs.replay(&bucket)?;
+
+            // SAFETY: as above, and the graph's outputs stay until its next replay, which the
+            // stream orders after these copies.
+            unsafe { after(&outputs, *kept, *tail)?.submit(stream) }?;
+        }
+        Ok(Some(launched))
+    }
+
+    /// The clip forward of `layout` decoding to rasters of `extent`, `(frames, rows, columns)`.
+    fn decode_clip(
+        &self,
+        layout: &Layout,
+        (frames, height, width): (u32, u32, u32),
+    ) -> Result<Vec<Tensor>> {
+        let video = layout.video;
+        let (latent, dtype) = (self.model.latent_type(), self.model.element_type());
+
+        // The window the unit's copy left in the latent buffer, gathered into the decode's rows.
+        let channels = video.channels as usize;
+        let window = self.buffer(0, (channels, voxels(&video) as usize), latent)?;
+        let rows = match self.model.latent_rows(layout)? {
+            Some(rows) => rows.elem_count(),
+            None => voxels(&video) as usize,
+        };
+        let block = backend::empty((rows, channels), latent)?;
+        self.model.gather_latents(layout, &window, 0, &block)?;
+
+        let (rgb, height, width) = (CHANNELS as usize, height as usize, width as usize);
+        let raster = backend::empty((rgb, frames as usize, height, width), dtype)?;
+        self.model.decode(layout, &block, Some(&raster), None)?;
+        let Some(splicer) = &self.splicer else {
+            return Ok(vec![raster]);
+        };
+
+        // The de-normalization's constants: the three means, then the three deviations.
+        let norm = splicer.pixel_norm();
+        let constants: Vec<f32> = norm.mean.iter().chain(&norm.std).copied().collect();
+        let constants =
+            Tensor::from_slice(&constants, 2 * rgb, &Device::Cpu)?.to_device(raster.device())?;
+        let (mean, std) = (constants.narrow(0, 0, rgb)?, constants.narrow(0, rgb, rgb)?);
+
+        let mut outputs = vec![raster];
+        for splice in &self.splices {
+            let previous = match splice.overlap as usize {
+                0 => None,
+                overlap => Some(self.buffer(self.tail, (rgb, overlap, height, width), dtype)?),
+            };
+            let bytes = backend::empty((splice.keep as usize, height, width, rgb), DType::U8)?;
+
+            for (run, frame) in splicer.splice(previous.as_ref(), &outputs[0], *splice)? {
+                let length = run.dims().get(1).copied().unwrap_or(0);
+                let out = bytes.narrow(0, frame as usize, length)?;
+                backend::launch::<RgbBytes>(
+                    &rgb::Descriptor {
+                        dtype,
+                        channels: rgb::CHANNELS,
+                        block: rgb::BLOCK,
+                        pdl: false,
+                    },
+                    rgb::Args {
+                        input: backend::operand(&run)?,
+                        mean: backend::operand(&mean)?,
+                        std: backend::operand(&std)?,
+                        out: backend::operand(&out)?,
                     },
                 )?;
             }
+            outputs.push(bytes);
         }
-        Ok(())
+        Ok(outputs)
     }
 
-    /// Splices the clip a replay just decoded, on the stream that replayed it.
-    ///
-    /// This is not part of the walk. A graph holds one bucket's decode, and a splice belongs to a
-    /// request: which clip of the timeline this is, how many frames it keeps and how many it fades
-    /// are that request's, and they change from clip to clip, so a capture has none to record. The
-    /// stream's order is what lets it read the raster the graph wrote.
-    fn splice_replayed(&mut self, bucket: Bucket, generation: u64) -> Result<()> {
-        if self.postprocessor.is_none() {
-            return Ok(());
-        }
-        let kernels = self.lifecycle.generation_named(generation)?;
-        let stream = self.stream.clone();
-        let arena = self.lifecycle.arena()?;
-        self.layout(bucket)?;
-        // The splice updates this runner's tail bookkeeping, so the staging regions are held apart
-        // from it for the call: moving them moves their handles, not the memory graphs address.
-        let regions = std::mem::replace(&mut self.lifecycle.staging, StagingRegion::empty());
-        let spliced = regions.slot().and_then(|staging| {
-            let forward = nn::Forward::new(&stream, &kernels, &arena).with_staging(staging);
-            self.splice_clip(&forward, bucket)?;
-            regions.release(&stream)
-        });
-        self.lifecycle.staging = regions;
-        spliced
-    }
+    /// The track forward of `layout`: its waveform, interleaved into PCM.
+    fn decode_track(&self, layout: &Layout) -> Result<Vec<Tensor>> {
+        let track = layout
+            .audio
+            .ok_or_else(|| Error::Invariant("a track's layout states no track".into()))?;
+        let latent = self.model.latent_type();
+        let shape = (voxels(&track) as usize, track.channels as usize);
+        let latents = self.buffer(0, shape, latent)?;
 
-    /// Writes the clip a replay just decoded into its request's timeline.
-    ///
-    /// **The component has two entry points and this is the second:** a decode turns latents into a
-    /// clip, and the postprocessor puts the clip's frames where the timeline holds them, fading its
-    /// first kept frames against the predecessor's tail and de-normalising the bytes. Without a
-    /// postprocessor there is no timeline - a deployment that serves none publishes the clip's own
-    /// raster, which is what the encoder of such a deployment reads.
-    ///
-    /// The schedule is the block's (`Splicer::splices`), so the frame count a timeline holds, the
-    /// body each clip keeps and the overlap the fade reads are all the checkpoint's arithmetic. This
-    /// runner states only where the clip is: **each clip gets its own raster**, so the splice's
-    /// destination starts at frame zero and the product names the frames this clip wrote.
-    fn splice_clip(&mut self, forward: &nn::Forward, bucket: Bucket) -> Result<()> {
-        let Some(postprocessor) = self.postprocessor.clone() else {
-            return Ok(());
-        };
-        let request = self.staged_request.ok_or_else(|| {
-            Error::Invariant(
-                "a replay splices a clip and no request is staged: the splice would have no \
-                 timeline to write into"
-                    .into(),
-            )
-        })?;
-        let frames = self.staged_frames.ok_or_else(|| {
-            Error::Invariant(format!(
-                "request {} was staged without a timeline length, so the splice schedule cannot be \
-                 asked for",
-                request.request_id.0
-            ))
-        })?;
-        let index = self.staged_unit;
-        let schedule = postprocessor.splices(frames).map_err(|error| {
-            Error::Invalid(format!(
-                "request {} asked for a timeline of {frames} frame(s) and the postprocessor serves \
-                 no such timeline: {error}",
-                request.request_id.0
-            ))
-        })?;
-        let Some(splice) = schedule.get(index as usize).copied() else {
-            return Err(Error::Invalid(format!(
-                "request {} asks for clip {index} of a timeline of {frames} frame(s), and the \
-                 timeline is {} clip(s)",
-                request.request_id.0,
-                schedule.len()
-            )));
-        };
-        let Extent::Clip { height, width, .. } = bucket.extent else {
-            return Err(Error::Invariant(format!(
-                "bucket {bucket} is not a decode bucket and a clip was spliced"
-            )));
-        };
-        let channels = RASTER_CHANNELS;
-        // What this clip fades against is the schedule's `overlap`, and what it must leave behind is
-        // its **successor's**: the timeline's first clip fades nothing and still owes the second clip
-        // its tail, and the last clip has no one to hand one to.
-        let successor = tail_for_successor(&schedule, index);
-        let overlap = successor.max(splice.overlap);
-        self.size_tail(channels, height, width, overlap, schedule.len() as u32)?;
-        let previous = if splice.overlap > 0 {
-            Some(self.predecessor_tail(request, index)?)
-        } else {
-            None
-        };
-        let clip = self.raster(bucket)?;
-        let column = self.frames.as_ref().ok_or_else(|| {
-            Error::Invariant(
-                "a postprocessor is bound and no frames column was sized for the bucket".into(),
-            )
-        })?;
-        let video = Operand::new(
-            timeline_frame(column, splice.first, height, width),
-            DType::U8,
-            splice_shape(splice.keep, height, width),
-        );
-        let kept = self.splice(
-            forward,
-            postprocessor.as_ref(),
-            Splicing {
-                previous,
-                clip,
-                splice,
-                video,
-                tail: self.tail.as_ref().map(|tail| tail.device),
-                index,
-                successor,
+        let (samples, channels) = self.model.pcm_window(&track)?;
+        let waveform = backend::empty((channels as usize, samples as usize), DType::F32)?;
+        self.model.decode(layout, &latents, None, Some(&waveform))?;
+
+        let pcm = backend::empty((samples as usize, PCM_CHANNELS as usize), DType::I16)?;
+        backend::launch::<PcmInterleave>(
+            &pcm::Descriptor {
+                dtype: DType::F32,
+                block: pcm::BLOCK,
+                pdl: false,
+            },
+            pcm::Args {
+                left: backend::operand(&waveform.get(0)?)?,
+                right: backend::operand(&waveform.get(1)?)?,
+                out: backend::operand(&pcm)?,
+                samples: u32::try_from(samples).map_err(|_| {
+                    Error::Invalid("a track's samples exceed a launch value".into())
+                })?,
             },
         )?;
-        if let Some(kept) = kept {
-            self.publish_tail(request, index, kept)?;
-        }
-        self.staged_keep = Some(splice.keep);
-        self.staged_first = splice.first;
-        Ok(())
-    }
-
-    /// Writes one clip into its timeline's frames and keeps the frames its successor fades
-    /// against: the calls a replay's splice makes and the recorded walk records.
-    ///
-    /// The postprocessor places the clip's kept frames as normalized runs, and each run is packed
-    /// into its frames' bytes here, in the order it was placed. Answers the tail kept for the
-    /// successor, `[channels, overlap, rows, columns]`, or `None` when the clip owes no successor a
-    /// tail.
-    fn splice(
-        &self,
-        forward: &nn::Forward<'_>,
-        postprocessor: &(dyn Splicer + Send + Sync),
-        splicing: Splicing,
-    ) -> Result<Option<Operand>> {
-        let bytes = self.bytes.as_ref().ok_or_else(|| {
-            Error::Invariant("a postprocessor is bound and its byte packing is not".into())
-        })?;
-        let placed = postprocessor
-            .splice(
-                forward,
-                splicing.previous,
-                splicing.clip,
-                nn::capability::Splice {
-                    first: 0,
-                    ..splicing.splice
-                },
-            )
-            .map_err(Error::from)?;
-        for run in placed {
-            let frames = run.raster.shape.dim(1);
-            let first = u64::from(run.frame);
-            if run.raster.shape.rank() != 4 || first + frames > splicing.video.shape.dim(0) {
-                return Err(Error::Invalid(format!(
-                    "the postprocessor placed {:?} at frame {first} of a clip that keeps {}",
-                    run.raster.shape.dims(),
-                    splicing.video.shape.dim(0)
-                )));
-            }
-            bytes.forward(
-                forward,
-                run.raster,
-                splicing.video.narrow(0, first, frames)?,
-            )?;
-        }
-        self.keep_tail(forward, &splicing)
-    }
-
-    /// Sizes the tail columns for an overlap of `overlap` frames and a timeline of `clips` clips, the
-    /// first time they are needed.
-    ///
-    /// The count is the schedule's, not this runner's: a timeline whose fade reads five frames and one
-    /// that reads ten are one formula apart in the block and one column here. **Each clip keeps its
-    /// own slot**, because a rank's next clip is decoded while its neighbour may still be reading the
-    /// last one's tail.
-    fn size_tail(
-        &mut self,
-        channels: u32,
-        height: u32,
-        width: u32,
-        overlap: u32,
-        clips: u32,
-    ) -> Result<()> {
-        if overlap == 0 {
-            return Ok(());
-        }
-        let slots = tail_elements(channels, height, width, overlap, clips)?;
-        if self
-            .tail
-            .as_ref()
-            .is_none_or(|column| column.device.numel() < slots)
-        {
-            self.tail = Some(Column::new(self.device, self.dtype, slots)?);
-        }
-        Ok(())
-    }
-
-    /// The tail clip `index` fades against, which its predecessor's rank published.
-    ///
-    /// The predecessor may be on another rank, decoding at the same time, so this waits for the
-    /// publication. A decode needs nothing but its own latents, so no rank waits on one that waits
-    /// on it, and the wait is bounded by one decode; the bound here names a rank that never answers.
-    fn predecessor_tail(&self, request: ipc::RequestKey, index: u32) -> Result<Operand> {
-        let store = self
-            .products
-            .as_ref()
-            .ok_or_else(|| crate::runners::products::no_store(request))?;
-        let kind = Product::Tail(index - 1);
-        // The publication wakes this wait; the bound only names a rank that never publishes.
-        if !store.await_published(request, kind, TAIL_WAIT) {
-            return Err(Error::Invalid(format!(
-                "request {} waited {} s for the tail of clip {} and its rank published none",
-                request.request_id.0,
-                TAIL_WAIT.as_secs(),
-                index - 1
-            )));
-        }
-        // The tail lies in pinned host storage, which every device reads, so the splice reads it
-        // where its rank left it: a copy between two pinned regions is the driver's host copy, which
-        // waits for this stream and holds the device thread for the clip just launched.
-        store
-            .lent(request, kind, &self.stream)?
-            .ok_or_else(|| crate::runners::products::absent(request, kind))
-    }
-
-    /// Keeps the clip's last `successor` frames in its slot of the tail column, for the next clip's
-    /// fade, and answers the slot; `None` when the clip owes no successor a tail.
-    ///
-    /// The tail is one contiguous run per channel of the clip's own raster (`[channels, frames, rows,
-    /// columns]`), so this is one block copy on the runner's stream and no arithmetic. It has to
-    /// happen before the next decode, which writes over the clip's column. Both columns are pinned
-    /// host memory, which the driver's `cuMemcpyAsync` copies on the host once the stream drains, so
-    /// the copy is a kernel: a memcpy here held the device thread for the whole decode.
-    fn keep_tail(&self, forward: &nn::Forward<'_>, splicing: &Splicing) -> Result<Option<Operand>> {
-        let overlap = splicing.successor;
-        let Some(tail) = splicing.tail else {
-            return Ok(None);
-        };
-        if overlap == 0 {
-            return Ok(None);
-        }
-        let clip = splicing.clip;
-        let channels = clip.shape.dim(0);
-        let frames = clip.shape.dim(1);
-        let (height, width) = (clip.shape.dim(2), clip.shape.dim(3));
-        let start = frames
-            .checked_sub(u64::from(overlap))
-            .ok_or_else(|| Error::Invalid("a clip is shorter than its own tail".into()))?;
-        let stride = u64::from(overlap)
-            .saturating_mul(height)
-            .saturating_mul(width);
-        let slot = u64::from(splicing.index) * channels * stride;
-        let plane = frames.saturating_mul(height).saturating_mul(width);
-        let block = Shape::new(&[channels, 1, 1, stride]);
-        let source = Operand::with_strides(
-            clip.element(&[0, start, 0, 0]),
-            self.dtype,
-            block,
-            nn::Strides::new(&[plane, stride, stride, 1]),
-        );
-        let destination = Operand::new(tail.element(&[slot]), self.dtype, block);
-        let strides = [stride as i64, stride as i64, stride as i64, 1];
-        nn::layers::Copy::new(self.dtype, nn::layers::Access::Vector)
-            .map_err(Error::from)?
-            .forward(forward, source, destination, &strides)
-            .map_err(Error::from)?;
-        Ok(Some(Operand::new(
-            tail.element(&[slot]),
-            self.dtype,
-            Shape::new(&[channels, u64::from(overlap), height, width]),
-        )))
-    }
-
-    /// Publishes the tail clip `index` kept, for its successor's rank to fade against.
-    fn publish_tail(&self, request: ipc::RequestKey, index: u32, tail: Operand) -> Result<()> {
-        let store = self
-            .products
-            .as_ref()
-            .ok_or_else(|| crate::runners::products::no_store(request))?;
-        store.publish(
-            request,
-            Product::Tail(index),
-            self.device,
-            self.lifecycle.stream_id(),
-            Some(crate::runners::products::written_on(&self.stream)?),
-            &tail,
-        )
-    }
-
-    /// The frames the splice wrote, `[frames, rows, columns, 3]` bytes, as the product states them.
-    fn frames_view(&self, bucket: Bucket) -> Result<Operand> {
-        let Extent::Clip { height, width, .. } = bucket.extent else {
-            return Err(Error::Invariant(format!(
-                "bucket {bucket} is not a decode bucket and its frames were asked for"
-            )));
-        };
-        let column = self.frames.as_ref().ok_or_else(|| {
-            Error::Invariant("no frames column was sized for a spliced bucket".into())
-        })?;
-        let keep = self.staged_keep.ok_or_else(|| {
-            Error::Invariant("a splice wrote frames and the schedule's keep was not staged".into())
-        })?;
-        Ok(Operand::new(
-            timeline_frame(column, self.staged_first, height, width),
-            DType::U8,
-            Shape::new(&[u64::from(keep), u64::from(height), u64::from(width), 3_u64]),
-        ))
+        Ok(vec![pcm])
     }
 }
 
-/// What one clip's splice reads and writes.
-struct Splicing {
-    /// `[channels, overlap, rows, columns]` the predecessor's tail the clip fades against, absent
-    /// for the timeline's first clip.
-    previous: Option<Operand>,
-    /// `[channels, frames, rows, columns]` the clip's decoded raster.
-    clip: Operand,
-    /// The clip's place in its timeline.
-    splice: nn::capability::Splice,
-    /// `[keep, rows, columns, 3]` bytes: the timeline frames the clip writes.
-    video: Operand,
-    /// The tail column, one slot per clip of the timeline; absent when no clip of the timeline
-    /// owes a successor a tail.
-    tail: Option<Operand>,
-    /// The clip's index in its timeline, which names its tail slot.
-    index: u32,
-    /// The frames the clip leaves its successor; zero when it owes none.
-    successor: u32,
-}
-
-/// `[keep, rows, columns, 3]`: the timeline frames one splice writes.
-fn splice_shape(keep: u32, height: u32, width: u32) -> Shape {
-    Shape::new(&[u64::from(keep), u64::from(height), u64::from(width), 3_u64])
-}
-
-/// `[channels, overlap, rows, columns]`: one clip's tail.
-fn tail_shape(channels: u32, overlap: u32, height: u32, width: u32) -> Shape {
-    Shape::new(&[
-        u64::from(channels),
-        u64::from(overlap),
-        u64::from(height),
-        u64::from(width),
-    ])
-}
-
-/// The elements of a tail column holding `clips` tails of `overlap` frames.
-fn tail_elements(channels: u32, height: u32, width: u32, overlap: u32, clips: u32) -> Result<u64> {
-    let elements = u64::from(channels)
-        .checked_mul(u64::from(overlap))
-        .and_then(|elements| elements.checked_mul(u64::from(height)))
-        .and_then(|elements| elements.checked_mul(u64::from(width)))
-        .ok_or_else(|| Error::Invalid("a clip's tail extent overflows".into()))?;
-    elements
-        .checked_mul(u64::from(clips))
-        .ok_or_else(|| Error::Invalid("a timeline's tails overflow".into()))
-}
-
-/// The frames clip `index` must leave behind: what its successor fades against, none for the last.
-///
-/// A splice's `overlap` is the fade it **reads**, so reading it for the tail a clip keeps left the
-/// timeline's first clip keeping nothing, and the second clip then faded against a column nobody wrote.
-fn tail_for_successor(schedule: &[nn::capability::Splice], index: u32) -> u32 {
-    schedule
-        .get(index as usize + 1)
-        .map_or(0, |next| next.overlap)
-}
-
-/// Where timeline frame `first` of a `[frames, rows, columns, 3]` byte column starts.
-fn timeline_frame(column: &Column, first: u32, height: u32, width: u32) -> ops::DevicePtr {
-    let elements = u64::from(first) * u64::from(height) * u64::from(width) * 3;
-    Operand::new(column.device.ptr, DType::U8, Shape::new(&[1])).offset_elements(elements)
-}
-
-impl<M: Decoder + Send + Sync + ?Sized> Runner for DecoderRunner<M> {
-    fn phases(&self) -> &[ipc::PhaseId] {
-        &self.phases
+impl Runner for DecoderRunner {
+    fn phases(&self) -> &[Phase] {
+        &self.config.phases
     }
 
-    /// A clip's replay reads and writes on the stream, in order, and each clip keeps its own frames
-    /// in the timeline, so the next clip can be launched behind it and a finished clip's encode runs
-    /// beside it.
-    fn overlaps_replays(&self) -> bool {
-        true
+    fn buckets(&self) -> Vec<Bucket> {
+        self.config.buckets.capture_order().copied().collect()
     }
 
-    fn stream(&self) -> Option<&platform::Stream> {
-        Some(&self.stream)
-    }
-
-    /// Serves one clip: choose its bucket, stage its buffers, and return the replay (4.5).
-    ///
-    /// The bucket is chosen from the computation the batch states - the clip's raster is the extent -
-    /// and never from how many requests it happens to carry: a decode graph is captured for one
-    /// canvas, and a clip of another canvas must hear that it has no bucket rather than be served by
-    /// a graph whose constants belong to a different raster.
-    fn lifecycle_mut(&mut self) -> Option<&mut Lifecycle> {
-        Some(&mut self.lifecycle)
-    }
-
-    fn submit(&mut self, batch: Batch) -> Result<Jobs> {
-        let media = media_of(&batch)?.clone();
-        media.check()?;
-        let computation = media.computation;
-        if computation.variant() != Some(Variant::Decode) {
-            return Err(Error::Invalid(format!(
-                "a decoder runner serves a decode; this batch states a {:?}",
-                computation.call
-            )));
-        }
-        let bucket = self.buckets.select_media(&computation).ok_or_else(|| {
-            Error::Invalid(format!(
-                "no bucket was captured for {:?} of {} request(s) at {:?}",
-                computation.call, computation.rows, computation.extent
-            ))
-        })?;
-        self.stage(&batch, bucket)?;
-        self.calls.clone_from(&batch.calls);
-        Ok(Jobs::new([Job::Replay {
-            runner: self.id,
-            bucket,
-            generation: batch.generation,
-            batch: batch.id,
-        }]))
-    }
-
-    fn media_plan(&self) -> Vec<Bucket> {
-        self.capture_order()
-    }
-
-    fn capture_plan(&self) -> Vec<Bucket> {
-        self.capture_order()
-    }
-
-    fn cache(&self) -> Option<Arc<Mutex<crate::memory::prefix_cache::PrefixCache>>> {
-        // A decoder reads no paged cache: its latents arrive as the batch's own buffers.
-        None
-    }
-
-    fn purge(&mut self, generation: u64) {
-        self.lifecycle.purge(generation);
-    }
-
-    fn attach_products(&mut self, products: Arc<dyn Products>) {
-        self.products = Some(products);
-    }
-
-    /// For every decode bucket: the gather, the decode and every splice a request of its canvas
-    /// launches.
-    fn record_walk(&mut self) -> Result<Footprint> {
-        let mut footprint = Footprint::default();
-        for bucket in self.capture_order() {
-            footprint.walk(Some(bucket), |walk| self.walk_recorded(walk, bucket))?;
-        }
-        Ok(footprint)
-    }
-
-    fn attach_pools(&mut self, pools: Arc<Mutex<Pools>>) {
-        self.lifecycle.attach_pools(pools);
-    }
-
-    fn attach_counters(&mut self, counters: Arc<crate::device::SharedCounters>) {
-        self.counters = Some(counters);
-    }
-
-    fn serve(&mut self, job: &Job) -> Result<BatchOutput> {
-        match job {
-            Job::Replay {
-                bucket, generation, ..
-            } => {
-                match self.gather.take() {
-                    Some(first) => self.gather_replayed(*bucket, *generation, first)?,
-                    None => self.upload()?,
-                }
-                let (served, captured) = self
-                    .lifecycle
-                    .graphs
-                    .captured_for(*bucket, *generation)
-                    .ok_or_else(|| {
-                    Error::Invariant(format!(
-                        "no graph of bucket {bucket} in generation {generation} or in a \
-                             generation it replaces"
-                    ))
-                })?;
-                if served != *generation {
-                    tracing::debug!(
-                        bucket = %bucket,
-                        generation,
-                        served,
-                        "the bucket was prepared for an earlier generation; its programs did not change"
-                    );
-                }
-                let launched = std::time::Instant::now();
-                // The staging walk runs the decode the graph was captured from, so the values its
-                // captured copies read are this layout's.
-                let layout = self.layout(*bucket)?;
-                let raster = self.raster(*bucket)?;
-                self.lifecycle.replay(captured, |arena, staging| {
-                    self.decode(&nn::Forward::staging(arena, staging), &layout, raster)
-                })?;
-                if let Some(counters) = &self.counters {
-                    counters.launches(captured.kernel_nodes());
-                }
-                self.splice_replayed(*bucket, *generation)?;
-                // The clip is written by the graph that just launched, and the stream's order is
-                // what makes the view readable: a reader's copy is issued after this one.
-                self.publish(*bucket)?;
-                // The clip's raster is this runner's own column, written by the graph that just
-                // launched: the stream's order is what makes it readable, and the completion that
-                // turns it into an artifact is the transport's rather than this step's.
-                Ok(BatchOutput {
-                    calls: answered(&mut self.calls),
-                    timing: ipc::TimingCounters {
-                        device_us: launched.elapsed().as_micros() as u64,
-                        ..Default::default()
-                    },
-                    forward_stats: None,
-                })
-            }
-            Job::Capture {
-                bucket, generation, ..
-            } => self
-                .capture(*bucket, *generation)
-                .map(|()| BatchOutput::default()),
-            Job::Rebind {
-                bucket, generation, ..
-            } => self
-                .rebind(*bucket, *generation)
-                .map(|()| BatchOutput::default()),
-            Job::Join { .. } => Err(Error::Invariant(
-                "a video decoder runner joins no expert step".into(),
-            )),
-            Job::Shadow { operator, key, .. } => Err(Error::Invariant(format!(
-                "a decoder runner compares no operator, and the device asked it to shadow \
-                 {operator} {key}"
-            ))),
-            Job::Prepare { call, .. } => Err(Error::Invariant(format!(
-                "a runner that steps no trajectory was asked to prepare call {}",
-                call.0
-            ))),
-            // A host call is no device work: the media stage performs it, and a device runner
-            // handed one was given a job another runner returned.
-            Job::Host { call, .. } => Err(Error::Invariant(format!(
-                "a runner that serves device work was asked for host call {}",
-                call.0
-            ))),
-        }
-    }
-}
-
-impl<M: Decoder + Send + Sync + ?Sized> RunnerLifecycle for DecoderRunner<M> {
-    fn lifecycle(&mut self) -> &mut Lifecycle {
-        &mut self.lifecycle
-    }
-
-    /// Walks the decode once for `bucket`, recording every operator launch's nodes into the
-    /// generation's capture (4.5).
-    fn walk(&mut self, bucket: Bucket, generation: &Arc<ops::Generation>) -> Result<()> {
-        let stream = self.stream.clone();
-        if self.staged != Some(bucket) {
-            self.stage_warm(bucket)?;
-        }
-        let first = self
-            .lifecycle
-            .pool()?
-            .begin(self.lifecycle.stream_id(), bucket)?;
-        self.upload()?;
-        let arena = self.lifecycle.arena()?;
-        let staging = self.lifecycle.staging.captured(&stream)?;
-        let forward = nn::Forward::new(&stream, generation, &arena).with_staging(staging);
+    /// A clip bucket's forward returns its raster and then, with a splicer, the bytes of each
+    /// distinct splice in turn; a track bucket's returns its PCM.
+    fn forward(&self, bucket: &Bucket) -> Result<Vec<Tensor>> {
         let layout = self.layout(bucket)?;
-        let raster = self.raster(bucket)?;
-        self.decode(&forward, &layout, raster)?;
-        if first {
-            self.lifecycle
-                .pool()?
-                .record(self.lifecycle.stream_id(), bucket, arena.peak())?;
+
+        match bucket.extent {
+            Extent::Clip {
+                frames,
+                height,
+                width,
+            } => self.decode_clip(&layout, (frames, height, width)),
+            _ => self.decode_track(&layout),
         }
-        Ok(())
     }
+
+    /// A decode reads no input tensor: its latents are the runner's buffers.
+    fn idle_inputs(&self, bucket: &Bucket, _columns: &mut [u8]) -> Result<()> {
+        self.layout(bucket).map(|_| ())
+    }
+
+    fn prepare_inputs(&mut self, batch: &Batch, tables: &BlockTables) -> Result<Bucket> {
+        let (bucket, _) = self.units(batch, tables)?;
+
+        self.graphs.prepare_inputs(&*self, &bucket, |_| Ok(()))?;
+        Ok(bucket)
+    }
+
+    /// One call of `batch` over `tables` (module documentation). It returns once the device
+    /// completed the call and the copies [`Runner::copy`] issued for it, whether the call was
+    /// served or failed.
+    fn execute(&mut self, batch: &Batch, tables: &BlockTables) -> Result<BatchOutput> {
+        let started = Instant::now();
+        let served = self.serve(batch, tables);
+
+        let ended = match (&self.stream, &self.done) {
+            (Some(stream), Some(done)) => done.record(stream).and_then(|()| done.synchronize()),
+            _ => Ok(()),
+        };
+        let launched = served?;
+        ended?;
+
+        let landed = Instant::now();
+        let launched = launched.unwrap_or(landed);
+        Ok(BatchOutput {
+            calls: batch.requests.iter().map(|_| performed()).collect(),
+            timing: TimingCounters {
+                queued_us: 0,
+                device_us: landed.duration_since(launched).as_micros() as u64,
+                copy_us: 0,
+                host_us: launched.duration_since(started).as_micros() as u64,
+            },
+            forward_stats: None,
+        })
+    }
+
+    /// Issues `copies` through the rank's media memory on the runner's stream, ahead of the
+    /// batch whose end covers them.
+    fn copy(&mut self, copies: &[BlockCopy]) -> Result<()> {
+        self.memory.copy(copies, self.stream.as_ref())
+    }
+
+    fn graphs(&self) -> &Graphs {
+        &self.graphs
+    }
+}
+
+/// The bytes of one element of `dtype`.
+fn element(dtype: DType) -> Result<u64> {
+    match dtype.size_in_bytes() {
+        0 => Err(Error::Invalid(format!(
+            "{dtype:?} has no whole-byte element"
+        ))),
+        bytes => Ok(bytes as u64),
+    }
+}
+
+/// The elements of a latent shape per channel: its frames, rows and columns.
+fn voxels(shape: &nn::LatentShape) -> u64 {
+    u64::from(shape.frames) * u64::from(shape.height) * u64::from(shape.width)
+}
+
+/// The elements of a latent shape.
+fn elements(shape: &nn::LatentShape) -> u64 {
+    u64::from(shape.channels) * voxels(shape)
+}
+
+/// The address of `tensor`'s first element.
+fn address(tensor: &Tensor) -> Result<u64> {
+    Ok(backend::operand(tensor)?.ptr.address())
+}
+
+/// The copies of a unit's output after its replay, from the forward's `outputs`: the output it
+/// keeps into the product, and the last frames of the raster into its tail block.
+fn after(
+    outputs: &[Tensor],
+    (output, at): (usize, u64),
+    tail: Option<(u64, u32)>,
+) -> Result<PitchedBatch> {
+    let missing = || Error::Invariant(format!("the forward returned no output {output}"));
+    let mut copies = PitchedBatch::new(SourceOrder::Stream);
+
+    let kept = outputs.get(output).ok_or_else(missing)?;
+    let bytes = kept.elem_count() as u64 * element(kept.dtype())?;
+    copies.push(pitched((at, bytes), (address(kept)?, bytes), bytes, 1)?)?;
+
+    // The raster is `[3, frames, rows, columns]`: the tail is the end of each channel's frames.
+    if let Some((at, frames)) = tail {
+        let raster = outputs.first().ok_or_else(missing)?;
+        let &[channels, length, height, width] = raster.dims() else {
+            return Err(Error::Invariant(
+                "a clip's raster is not four-dimensional".into(),
+            ));
+        };
+        let plane = (height * width) as u64 * element(raster.dtype())?;
+        let (kept, length) = (u64::from(frames) * plane, length as u64 * plane);
+
+        let source = address(raster)? + length - kept;
+        copies.push(pitched(
+            (at, kept),
+            (source, length),
+            kept,
+            channels as u32,
+        )?)?;
+    }
+    Ok(copies)
+}
+
+/// The copy of `rows` rows of `width` bytes, a row the destination's pitch after the one before
+/// it in the destination and the source's pitch in the source.
+fn pitched(
+    (destination, destination_pitch): (u64, u64),
+    (source, source_pitch): (u64, u64),
+    width: u64,
+    rows: u32,
+) -> Result<Pitched> {
+    let size = |bytes: u64| {
+        usize::try_from(bytes).map_err(|_| Error::Invalid("a copy exceeds memory".into()))
+    };
+
+    Ok(Pitched {
+        destination,
+        destination_pitch: size(destination_pitch)?,
+        destination_layer: 1,
+        source,
+        source_pitch: size(source_pitch)?,
+        source_layer: 1,
+        width: size(width)?,
+        height: rows as usize,
+        depth: 1,
+    })
 }
 
 #[cfg(test)]
-mod tests {
-    //! The decoder runner's behaviour at its own boundary: which canvas a bucket states, what the
-    //! plan is told its tables need, and what a request for a canvas the decoder cannot serve gets.
-    //!
-    //! Nothing here needs a device: each behaviour is a function of the bucket and the model, which is
-    //! why a model that refuses a canvas can be driven without one.
-
-    /// A clip keeps the tail its successor fades against, which the timeline's first clip owes too
-    /// though it fades nothing itself, and the last clip has no one to hand one to.
-    #[test]
-    fn a_clip_keeps_the_tail_its_successor_reads() {
-        use nn::capability::Splice;
-        let schedule = [
-            Splice {
-                first: 0,
-                keep: 17,
-                overlap: 0,
-            },
-            Splice {
-                first: 17,
-                keep: 17,
-                overlap: 5,
-            },
-            Splice {
-                first: 34,
-                keep: 22,
-                overlap: 5,
-            },
-        ];
-        let tails: Vec<u32> = (0..3)
-            .map(|index| super::tail_for_successor(&schedule, index))
-            .collect();
-        assert_eq!(tails, [5, 5, 0]);
-    }
-
-    /// A clip still held under another request refuses a second decode, by both requests' names.
-    ///
-    /// The rule is one raster column's: a decode of another request would replace the clip before its
-    /// artifact was read, and nothing orders that read against the step that writes the column. What
-    /// the refusal must therefore carry is the pair — who holds the column, and who is asking — because
-    /// the reader that has to act on it is the holder's transport.
-    #[test]
-    fn a_second_clip_is_refused_while_the_first_is_unread() {
-        let first = ipc::RequestKey::new(0, ipc::RequestId(1), 0);
-        let second = ipc::RequestKey::new(0, ipc::RequestId(2), 0);
-
-        assert!(
-            clip_is_releasable(second, None, false).is_ok(),
-            "a runner that has published no clip decodes any request"
-        );
-        assert!(
-            clip_is_releasable(second, Some(first), false).is_ok(),
-            "a clip the reader forgot no longer holds the column"
-        );
-        assert!(
-            clip_is_releasable(first, Some(first), true).is_ok(),
-            "the holder decoding again reads its own clip, which the transport is about to take"
-        );
-
-        let error = clip_is_releasable(second, Some(first), true)
-            .expect_err("the column still holds the first request's clip");
-        let message = format!("{error}");
-        for expected in [
-            "request 2 asks for a decode",
-            "still holds request 1's clip",
-            "`forget`",
-        ] {
-            assert!(
-                message.contains(expected),
-                "the refusal must name {expected:?}: {message}"
-            );
-        }
-    }
-    use super::*;
-
-    /// The clip the stub decoder serves, and the layout it decodes it from.
-    const SERVED: (u32, u32, u32) = (2, 3, 4);
-
-    fn layout_of_served() -> Layout {
-        Layout {
-            video: proto::video::LatentShape {
-                channels: 8,
-                frames: 1,
-                height: 1,
-                width: 1,
-            },
-            audio: None,
-            text_rows: 2,
-            condition_rows: 0,
-            condition_elements: 0,
-        }
-    }
-
-    /// A decoder that serves one canvas and refuses every other.
-    struct Fixed;
-
-    impl Decoder for Fixed {
-        fn element_type(&self) -> DType {
-            DType::F16
-        }
-
-        fn layout_of(&self, clip: Clip) -> nn::Result<Layout> {
-            if (clip.frames, clip.height, clip.width) == SERVED {
-                return Ok(layout_of_served());
-            }
-            Err(nn::Error::Shape {
-                owner: "the stub decoder",
-                problem: format!("it serves {}x{}x{} only", SERVED.0, SERVED.1, SERVED.2),
-            })
-        }
-
-        fn decode(
-            &self,
-            _f: &nn::Forward,
-            _layout: &Layout,
-            _latents: Operand,
-            _out: DecodedMedia,
-        ) -> nn::Result<()> {
-            Ok(())
-        }
-    }
-
-    #[test]
-    fn a_bucket_that_is_not_a_decode_states_what_it_is() {
-        // A prefill bucket has no clip, and a decoder asked for its layout must say so by name rather
-        // than answer with a layout that reads as one.
-        let error =
-            DecoderRunner::<Fixed>::layout_of(&Fixed, Bucket::prefill(1, 16, Variant::Encode))
-                .expect_err("a prefill bucket is not a decode");
-        assert!(
-            format!("{error}").contains("is not a decode bucket"),
-            "the refusal names the bucket's kind: {error}"
-        );
-    }
-
-    #[test]
-    fn a_canvas_the_decoder_cannot_serve_is_refused_by_name() {
-        // The bound is the decoder's: a canvas it was not built for is refused where the runner
-        // maps its buckets at bind - before a capture, and never mid-clip.
-        let error = DecoderRunner::<Fixed>::layout_of(&Fixed, Bucket::clip(2, 3, 5))
-            .expect_err("a canvas the decoder does not serve");
-        let message = format!("{error}");
-        assert!(
-            message.contains("serves no clip of 2 frame(s) at 3x5"),
-            "the refusal names the clip: {message}"
-        );
-        assert!(
-            message.contains("it serves 2x3x4 only"),
-            "and it carries the decoder's own reason: {message}"
-        );
-    }
-
-    #[test]
-    fn a_batch_of_two_requests_for_one_canvas_is_refused_by_its_count() {
-        // A bucket's extent names one raster, so two requests in one batch of it describe two clips in
-        // one graph: the second would be decoded from the first's columns. The refusal names the count
-        // rather than serving one and silently dropping the other.
-        let media = ipc::execution::MediaColumns {
-            computation: ipc::execution::Computation {
-                call: ipc::MediaCall::VideoDecoding,
-                rows: 2,
-                tokens: 0,
-                extent: ipc::execution::Extent::Clip {
-                    frames: SERVED.0,
-                    height: SERVED.1,
-                    width: SERVED.2,
-                },
-            },
-            inputs: vec![vec![vec![0_u8; 8]], vec![vec![0_u8; 8]]],
-        };
-        let error = DecoderRunner::<Fixed>::clip_of(&media).expect_err("two clips, one bucket");
-        assert!(
-            format!("{error}").contains("holds one clip and this batch carries 2 request(s)"),
-            "the refusal counts the batch: {error}"
-        );
-
-        let one = ipc::execution::MediaColumns {
-            inputs: vec![vec![vec![0_u8; 8]]],
-            ..media
-        };
-        assert_eq!(
-            DecoderRunner::<Fixed>::clip_of(&one)
-                .expect("one clip")
-                .len(),
-            1,
-            "one request carries the clip's one set of buffers"
-        );
-    }
-
-    #[test]
-    fn a_staged_row_is_the_conditioning_blob_the_batch_was_built_with() {
-        // The row's shape is the engine's, not this file's: `MediaColumns::staged` writes the
-        // request's conditioning blob and its parameter record, one row per request, and the record is
-        // read by `media.request`. The blob is the clip only as a fallback: `stage` takes the
-        // trajectory from the product store first, so this ordering is what a batch without a
-        // published product has to satisfy.
-        let media = ipc::execution::MediaColumns {
-            computation: ipc::execution::Computation {
-                call: ipc::MediaCall::VideoDecoding,
-                rows: 1,
-                tokens: 0,
-                extent: ipc::execution::Extent::Clip {
-                    frames: SERVED.0,
-                    height: SERVED.1,
-                    width: SERVED.2,
-                },
-            },
-            inputs: vec![vec![vec![7_u8; 32], vec![0_u8; 40]]],
-        };
-        let row = DecoderRunner::<Fixed>::clip_of(&media).expect("one clip");
-        assert_eq!(row.len(), 2, "a staged row is the blob and the record");
-        assert_eq!(
-            row.first().map(Vec::len),
-            Some(32),
-            "the first buffer is the clip's latents"
-        );
-    }
-
-    #[test]
-    fn a_canvas_is_decoded_at_the_element_type_the_decoder_states() {
-        // `dtype = "auto"` leaves the element type to the checkpoint, so the runner reads it from the
-        // model rather than from its own deployment: the plan's columns are sized before a graph
-        // exists, and a byte count cannot say whether a column holds f16 or bf16.
-        assert_eq!(Fixed.element_type(), DType::F16);
-        assert_eq!(ops::abi::bytes(DType::F16), Some(2));
-    }
-
-    /// A batch with a phase, no calls and no media: what the mechanism sends when it has nothing to
-    /// compute, and the shape whose refusal is a fact about the batch rather than about a runner.
-    fn no_computation() -> Batch {
-        Batch {
-            page_loads: Vec::new(),
-            page_offloads: Vec::new(),
-            latent_restores: Vec::new(),
-            host_outputs: Vec::new(),
-            images: Vec::new(),
-            frees: Vec::new(),
-            id: ipc::execution::BatchId(1),
-            phase: ipc::PhaseId(0),
-            group: "model".to_owned(),
-            calls: Vec::new(),
-            shape: ipc::execution::Shape::decode(1, Variant::DecodeGreedy),
-            columns: ipc::execution::BatchColumns::default(),
-            generation: 1,
-            cache_units: Vec::new(),
-            block_tables: Vec::new(),
-            media: None,
-        }
-    }
-
-    #[test]
-    fn a_batch_that_states_no_computation_is_refused_by_name() {
-        let refused =
-            media_of(&no_computation()).expect_err("a batch with no media computation is refused");
-        let message = refused.to_string();
-        assert!(
-            message.contains("a decoder runner serves a media batch")
-                && message.contains("states no computation"),
-            "the refusal names what the runner serves and what the batch states, got: {message}"
-        );
-    }
-}
+mod tests;
