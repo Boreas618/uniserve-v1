@@ -65,16 +65,30 @@
 //! 6. the padded columns are written into the input block, with the host values the forward
 //!    computes, and the bucket's graph is replayed;
 //! 7. the page work that follows the forward is issued ([`PageWork::AfterReplay`]);
-//! 8. the stream event behind the replay is waited for, and the copies the batch took
-//!    ([`PageWork::Ended`]); the outputs are read and one `CallOutput` per call is assembled,
-//!    in the batch's order, a refused call's as a failure.
+//! 8. the step's outputs are copied to page-locked host memory behind it (`readback`);
+//! 9. the event behind that copy is waited for, and the copies the batch took
+//!    ([`PageWork::Ended`]); one `CallOutput` per call is assembled from the outputs on the
+//!    host, in the batch's order, a refused call's as a failure.
 //!
-//! Steps 4 to 7 are issued on one stream in that order, which is the only synchronization
+//! Steps 4 to 8 are issued on one stream in that order, which is the only synchronization
 //! between them: the replay reads the slot state, the pooled page tables and the pages as the
 //! copies before it left them.
 //!
+//! ## Steps in flight
+//!
+//! A batch that overlaps (`CausalLmRunner::overlaps`: no speculation, no expert union, no
+//! feature buffer) is served in two turns of the worker. [`Runner::start`] issues steps 1 to 8
+//! and returns; the runner's lander thread waits for the event behind the step's read and wakes
+//! the worker, which meanwhile issues its next job, the next step included, on the stream
+//! behind it. [`Runner::execute`] of the batch then lands the step: step 9. The host's work for
+//! a step (its columns, the forward that writes the host values, the launch) is thus done while
+//! the device computes the step before it, as the scheduler's queue depth intends: the next
+//! decode reads its input token from the slot state the previous one committed on the device.
+//! The step's outputs are read from the host copy, which no later replay writes, and the slot
+//! state's write buffer is written again only once the stream has passed its last copies.
+//!
 //! A batch with no rows, which a group with copies queued and no other work is sent
-//! (`specs/scheduler-design.md` §2.1), takes only step 8: the table's changes and the copies
+//! (`specs/scheduler-design.md` §2.1), takes only step 9: the table's changes and the copies
 //! reached the runner before it, nothing is replayed, the copies are waited for, and its output
 //! names no call. A step that fails waits for the copies all the same before it returns.
 //!
@@ -133,6 +147,7 @@ mod columns;
 pub(crate) mod experts;
 mod features;
 mod output;
+mod readback;
 mod slots;
 pub mod speculation;
 pub(crate) mod wiring;
@@ -141,14 +156,16 @@ pub(crate) mod wiring;
 mod tests;
 
 use std::cell::Cell;
+use std::collections::VecDeque;
 use std::ops::Range;
 use std::sync::Arc;
+use std::thread::JoinHandle;
 use std::time::Instant;
 
 use crate::batch::{Batch, BatchOutput, Phase, Shape as BatchShape, TimingCounters, Variant};
 use nn::family::{StateField, StateShape, TextModel};
 use nn::{KvCache, PhaseKind, RecurrentState, TokenBatch, VerifySlots};
-use platform::Stream;
+use platform::{Event, Stream};
 use proto::module::commit::COMMIT_FIELDS;
 use proto::module::sampler::{PARAMETER_COLUMNS, TEMPERATURE};
 use tensor::{DType, Shape, Tensor};
@@ -156,6 +173,7 @@ use tensor::{DType, Shape, Tensor};
 use self::columns::{Column, Layout, Refusal};
 use self::experts::Member;
 use self::features::Features;
+use self::readback::{Pending, Readback};
 use self::slots::Slots;
 use self::speculation::{DraftPool, DraftTable, Kept, Speculation};
 use crate::memory::buffers::BufferMemory;
@@ -167,6 +185,7 @@ use crate::runner::Runner;
 use crate::runner::buckets::{Bucket, Buckets};
 use crate::runner::graphs::Graphs;
 use crate::runner::sampler::{self, Sampler, SamplerConfig};
+use crate::worker::completion::Waker;
 use crate::worker::{Error, Result};
 
 /// The tokens one chunk of a scoring bucket's prompt projection holds: a chunk's logits and
@@ -287,6 +306,86 @@ pub struct CausalLmRunner {
     /// The bytes of the input block of the step being prepared: a batch's columns are padded
     /// here, where a refusal costs nothing, before anything of the step is issued.
     staged: Vec<u8>,
+    /// The page-locked memory each step's outputs are copied to behind it; `None` for graphs
+    /// that hold no device.
+    readback: Option<Readback>,
+    /// How many steps the runner has launched: the number of the last one.
+    launched: u64,
+    /// The steps [`Runner::start`] launched and whose landing turn has not come, oldest first.
+    flights: VecDeque<Flight>,
+    /// The thread that wakes the worker once a step in `flights` completed on the device,
+    /// started with the runner's first such step.
+    lander: Option<Lander>,
+}
+
+/// A step the runner launched and has not landed: what its landing reads beside its batch.
+struct Flight {
+    /// The batch whose step this is: its landing is [`Runner::execute`] of the same batch.
+    batch: crate::batch::BatchId,
+    /// The step's number among the runner's launches.
+    number: u64,
+    /// The bucket that served the batch.
+    bucket: Bucket,
+    /// The calls refused before the step was issued, by their index among the batch's calls.
+    refused: Vec<Refusal>,
+    /// The step's outputs, and behind them the drafter's proposals, on their way to the host.
+    pending: Pending,
+    /// How many of the read tensors are the drafter's proposals, the last ones.
+    proposals: usize,
+    /// When the runner took the batch, and when it launched the step.
+    started: Instant,
+    launched: Instant,
+}
+
+/// The thread that waits, for each step a runner launched ahead of its landing, until the device
+/// completed it, and then wakes the worker for the step's landing turn ([`Runner::start`]).
+/// It is what keeps the worker thread from blocking on a step while it could issue the next
+/// one: the wait for the device moves here, and the worker blocks only on its queue.
+struct Lander {
+    steps: Option<crossbeam_channel::Sender<(Arc<Event>, Waker)>>,
+    thread: Option<JoinHandle<()>>,
+}
+
+impl Lander {
+    /// Starts the thread, which ends once the lander is dropped and every step handed to it was
+    /// waited for.
+    fn spawn() -> Result<Self> {
+        let (steps, landing) = crossbeam_channel::unbounded::<(Arc<Event>, Waker)>();
+        let thread = std::thread::Builder::new()
+            .name("lander".to_owned())
+            .spawn(move || {
+                for (event, resume) in landing {
+                    // A failed wait is the landing's to report: it waits on the same event, and
+                    // the device's failure fails the batch there.
+                    let _ = event.synchronize();
+                    resume();
+                }
+            })
+            .map_err(|error| Error::transport_source("starting a runner's lander thread", error))?;
+
+        Ok(Self {
+            steps: Some(steps),
+            thread: Some(thread),
+        })
+    }
+
+    /// Calls `resume` once the work `event` captured has completed, after every step handed
+    /// over before it.
+    fn watch(&self, event: Arc<Event>, resume: Waker) -> Result<()> {
+        self.steps
+            .as_ref()
+            .and_then(|steps| steps.send((event, resume)).ok())
+            .ok_or(Error::State("a runner's lander thread has stopped"))
+    }
+}
+
+impl Drop for Lander {
+    fn drop(&mut self) {
+        drop(self.steps.take());
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
 }
 
 impl CausalLmRunner {
@@ -500,6 +599,7 @@ impl CausalLmRunner {
             _ => None,
         };
 
+        let readback = stream.as_ref().map(|stream| Readback::new(stream.device()));
         let runner = Self {
             buckets,
             speculation,
@@ -518,6 +618,10 @@ impl CausalLmRunner {
             stream,
             features: None,
             staged: Vec::new(),
+            readback,
+            launched: 0,
+            flights: VecDeque::new(),
+            lander: None,
         };
 
         // Every input tensor lies inside the block the graphs were made for.
@@ -634,8 +738,8 @@ impl CausalLmRunner {
     /// stream the runner's graphs replay on, or on the rank's copy stream, and waits for
     /// nothing but at the end: the stream's order places the table writes, unit resets and
     /// state restores ahead of the replay that reads the pooled tables, the planes and the
-    /// live state, and the state keeps behind it. The step's outputs are read after the end,
-    /// so a completion is behind every copy of its batch.
+    /// live state, and the state keeps behind it. A step's completion is returned after the
+    /// end, so it is behind every copy of its batch.
     ///
     /// A hook's error fails the batch.
     pub fn set_page_work(&mut self, hook: PageWorkHook) {
@@ -1098,8 +1202,8 @@ impl CausalLmRunner {
         })
     }
 
-    /// Serves one step of `batch` over `tables`: everything of [`Runner::execute`] but waiting
-    /// for the copies the batch took.
+    /// Serves one step of `batch` over `tables` and waits for it: everything of
+    /// [`Runner::execute`] but waiting for the copies the batch took.
     fn serve(&mut self, batch: &Batch, tables: &BlockTables) -> Result<BatchOutput> {
         let started = Instant::now();
 
@@ -1114,6 +1218,31 @@ impl CausalLmRunner {
         if batch.requests.is_empty() && batch.columns.calls() == 0 {
             return Ok(BatchOutput::default());
         }
+
+        let flight = self.launch(batch, tables, started)?;
+        self.land(batch, flight)
+    }
+
+    /// Whether the step of `batch` may land after the runner launched the next one
+    /// ([`Runner::start`]): a batch with rows, on a runner whose graphs hold a device, that
+    /// neither speculates (a verification never pipelines, and the drafter's graph reads what
+    /// the step kept), nor is a member of an expert union (whose members agree one step at a
+    /// time), nor was lent a feature buffer (whose image rows each batch places for its own
+    /// step). Every other batch is served by [`Runner::execute`] alone.
+    fn overlaps(&self, batch: &Batch) -> bool {
+        self.readback.is_some()
+            && self.speculation.is_none()
+            && self.union.is_none()
+            && self.features.is_none()
+            && batch.shape.variant != Variant::ExpertJoin
+            && !(batch.requests.is_empty() && batch.columns.calls() == 0)
+    }
+
+    /// Issues one step of `batch`, a batch with rows, over `tables`, which the runner took at
+    /// `started`: steps 1 to 7 of the module documentation, then the copy of the step's
+    /// outputs to the host behind them. Nothing of the step is waited for; the returned flight
+    /// is what [`CausalLmRunner::land`] reads once the device completed it.
+    fn launch(&mut self, batch: &Batch, tables: &BlockTables, started: Instant) -> Result<Flight> {
         if self.union.as_ref().is_some_and(Member::experts_only) {
             return Err(Error::Invalid(format!(
                 "batch {} reached a member of an expert union that holds experts alone and \
@@ -1132,7 +1261,6 @@ impl CausalLmRunner {
         // Everything that can refuse the batch comes first: the choice of a bucket, the cache
         // slots its tokens write and the padding of the columns.
         let base = self.choose(batch)?;
-        let verify = verifies(base.variant);
 
         // A runner that speculates issues the drafter's graph behind the batch's own.
         let drafter = match &self.speculation {
@@ -1153,7 +1281,8 @@ impl CausalLmRunner {
         let masks = self.stage(batch, &base, tables, &mapping, None)?;
         let images = self.image_copies(batch, tables)?;
 
-        // The slot state's writes, ahead of the replay that reads them.
+        // The slot state's writes, ahead of the replay that reads them. A step launched while
+        // an earlier one's writes may still be read waits for the stream here (`Slots::begin`).
         self.slots.begin()?;
         self.slots.start(
             &self.sampler,
@@ -1190,48 +1319,92 @@ impl CausalLmRunner {
 
         let launched = Instant::now();
         let outputs = self.graphs.replay(&bucket)?;
+        self.launched += 1;
 
         // The drafter's columns lie in the block the batch's graph was issued with, and its
         // graph reads what that graph kept: the stream's order is their synchronization.
         let proposals = match &drafter {
             Some(drafter) => {
                 self.prepare_staged(drafter)?;
-                Some(self.graphs.replay(drafter)?)
+                self.graphs.replay(drafter)?
             }
-            None => None,
+            None => Vec::new(),
         };
 
         if let Some(hook) = self.page_work.as_mut() {
             hook(PageWork::AfterReplay)?;
         }
 
-        self.graphs.wait()?;
-        let landed = Instant::now();
-        self.slots.settled();
-
-        // The read waits for the stream, and so for the copies issued behind the replay.
-        let calls = {
-            let _guard = self.graphs.enter()?;
-            let vocabulary = self.model.vocabulary();
-            let candidates = self.config.candidates;
-
-            let mut calls = if verify {
-                output::verification_output(
-                    &batch.columns,
-                    &bucket,
-                    vocabulary,
-                    candidates,
-                    &outputs,
-                )?
-            } else {
-                output::calls_output(&batch.columns, &bucket, vocabulary, candidates, &outputs)?
-            };
-            if let Some(proposals) = &proposals {
-                speculation::propose(batch, vocabulary, proposals, &mut calls)?;
-            }
-            output::refuse(&mut calls, &refused);
-            calls
+        // The outputs, then the drafter's proposals, are copied to the host behind everything
+        // of the step, the state keeps included, before anything of a later step is issued:
+        // the next replay of the bucket writes the same memory again.
+        let (Some(readback), Some(stream)) = (self.readback.as_mut(), self.stream.as_ref()) else {
+            return Err(Error::State(
+                "the runner's graphs hold no device to read a step from",
+            ));
         };
+        let read: Vec<Tensor> = outputs
+            .into_iter()
+            .chain(proposals.iter().cloned())
+            .collect();
+        let pending = readback.issue(&read, stream)?;
+
+        Ok(Flight {
+            batch: batch.id,
+            number: self.launched,
+            bucket,
+            refused,
+            pending,
+            proposals: proposals.len(),
+            started,
+            launched,
+        })
+    }
+
+    /// Lands `flight`, the step the runner launched for `batch`: waits until the device completed
+    /// it and its outputs reached the host, and assembles one `CallOutput` per call, in the
+    /// batch's order, a refused call's as a failure (step 8 of the module documentation, but for
+    /// the copies the batch took).
+    fn land(&mut self, batch: &Batch, flight: Flight) -> Result<BatchOutput> {
+        let Flight {
+            number,
+            bucket,
+            refused,
+            pending,
+            proposals,
+            started,
+            launched,
+            ..
+        } = flight;
+
+        let mut outputs = self
+            .readback
+            .as_mut()
+            .ok_or(Error::State(
+                "the runner's graphs hold no device to read a step from",
+            ))?
+            .read(pending)?;
+        let landed = Instant::now();
+
+        // The stream has passed every slot write since `Slots::begin` only when no later step
+        // began writing again.
+        if number == self.launched {
+            self.slots.settled();
+        }
+
+        let proposals = outputs.split_off(outputs.len().saturating_sub(proposals));
+        let vocabulary = self.model.vocabulary();
+        let candidates = self.config.candidates;
+
+        let mut calls = if verifies(bucket.variant) {
+            output::verification_output(&batch.columns, &bucket, vocabulary, candidates, &outputs)?
+        } else {
+            output::calls_output(&batch.columns, &bucket, vocabulary, candidates, &outputs)?
+        };
+        if self.speculation.is_some() {
+            speculation::propose(batch, vocabulary, &proposals, &mut calls)?;
+        }
+        output::refuse(&mut calls, &refused);
 
         let host = launched.duration_since(started) + landed.elapsed();
         Ok(BatchOutput {
@@ -1775,11 +1948,57 @@ impl Runner for CausalLmRunner {
         Ok(bucket)
     }
 
-    /// One step of `batch` over `tables` (module documentation). It returns once the device
-    /// completed the step and the copies [`Runner::copy`] issued for it, whether the step was
-    /// served or failed.
+    /// Launches the step of `batch` without waiting for it, when the batch overlaps
+    /// ([`CausalLmRunner::overlaps`]): steps 1 to 7 of the module documentation and the copy of
+    /// its outputs to the host are issued, and `resume` is called from the runner's lander thread
+    /// once the device has completed them. The worker meanwhile takes its next job, which may
+    /// be the next step, issued on the stream behind this one; [`Runner::execute`] of the batch
+    /// then lands it. A batch that does not overlap starts nothing.
+    fn start(&mut self, batch: &Batch, tables: &BlockTables, resume: Waker) -> Result<bool> {
+        if !self.overlaps(batch) {
+            return Ok(false);
+        }
+        if self.lander.is_none() {
+            self.lander = Some(Lander::spawn()?);
+        }
+
+        let flight = self.launch(batch, tables, Instant::now())?;
+        let event = self
+            .readback
+            .as_ref()
+            .map(|readback| readback.event(&flight.pending))
+            .ok_or(Error::State(
+                "the runner's graphs hold no device to read a step from",
+            ))?;
+        let watched = self
+            .lander
+            .as_ref()
+            .ok_or(Error::State("a runner's lander thread has stopped"))
+            .and_then(|lander| lander.watch(event, resume));
+
+        // A step no thread waits for would never land: it is read here, which frees its turn,
+        // and the batch fails.
+        if let Err(error) = watched {
+            let _ = self.land(batch, flight);
+            return Err(error);
+        }
+        self.flights.push_back(flight);
+        Ok(true)
+    }
+
+    /// One step of `batch` over `tables` (module documentation), or the landing of the step
+    /// [`Runner::start`] launched for it. It returns once the device completed the step and the
+    /// copies [`Runner::copy`] issued for it, whether the step was served or failed.
     fn execute(&mut self, batch: &Batch, tables: &BlockTables) -> Result<BatchOutput> {
-        let served = self.serve(batch, tables);
+        let launched = self
+            .flights
+            .iter()
+            .position(|flight| flight.batch == batch.id)
+            .and_then(|at| self.flights.remove(at));
+        let served = match launched {
+            Some(flight) => self.land(batch, flight),
+            None => self.serve(batch, tables),
+        };
 
         // The copies the batch took end with it, also when it failed.
         let ended = self.wait_copies();

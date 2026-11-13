@@ -28,7 +28,7 @@ use crate::memory::tables::{BlockCopy, BlockTables};
 use crate::runner::Runner;
 use crate::runner::buckets::Bucket;
 use crate::runner::graphs::Graphs;
-use crate::worker::completion::{Outcome, Submission};
+use crate::worker::completion::{Outcome, Submission, Waker};
 use crate::worker::{Error, Result};
 use service::lock;
 
@@ -90,6 +90,12 @@ struct LoggingRunner {
     regions: Vec<u8>,
     /// Whether the runner issued copies that no wait has covered yet.
     copying: bool,
+    /// Where a runner that serves its batches as steps in flight hands the test each batch it
+    /// launched with what wakes the worker for its landing, which the test calls when the
+    /// batch's device work ends; `None` for a runner that serves a batch in one turn.
+    in_flight: Option<Sender<(u64, Waker)>>,
+    /// The batches launched and not landed.
+    launched: Vec<u64>,
 }
 
 impl LoggingRunner {
@@ -114,6 +120,8 @@ impl LoggingRunner {
             warming: AtomicBool::new(false),
             regions: vec![DEVICE, HOST, PRODUCTS[0], PRODUCTS[1]],
             copying: false,
+            in_flight: None,
+            launched: Vec::new(),
         }
     }
 
@@ -171,7 +179,38 @@ impl Runner for LoggingRunner {
         self.prepare_inputs(batch, tables)
     }
 
+    /// A runner with steps in flight launches every batch with rows and returns: the test ends
+    /// its device work.
+    fn start(&mut self, batch: &Batch, tables: &BlockTables, resume: Waker) -> Result<bool> {
+        let _ = tables;
+        let Some(in_flight) = &self.in_flight else {
+            return Ok(false);
+        };
+
+        self.state(format!("launch {}", batch.id.0));
+        self.launched.push(batch.id.0);
+        in_flight.send((batch.id.0, resume)).unwrap();
+        Ok(true)
+    }
+
     fn execute(&mut self, batch: &Batch, tables: &BlockTables) -> Result<BatchOutput> {
+        // The landing of a batch `start` launched, once its device work ended.
+        if let Some(at) = self.launched.iter().position(|id| *id == batch.id.0) {
+            self.launched.remove(at);
+            self.state(format!("land {}", batch.id.0));
+            if batch.id.0 == REFUSED {
+                return Err(Error::Invalid("the runner refuses this batch".into()));
+            }
+            return Ok(BatchOutput {
+                calls: batch
+                    .requests
+                    .iter()
+                    .map(|_| completed(batch.id.0))
+                    .collect(),
+                ..BatchOutput::default()
+            });
+        }
+
         if let Some((held, entered, released)) = &self.held
             && held.contains(&batch.id.0)
         {
@@ -480,6 +519,82 @@ fn jobs_run_in_submission_order_and_a_control_operation_runs_between_two_batches
     assert!(queued <= (completed - before).as_micros(), "{queued}");
 
     assert_eq!(worker.counters().0, 2);
+    worker.close().unwrap();
+}
+
+/// A worker of one rank over one runner `a` whose steps are in flight across two turns, the
+/// group's sequences, and the runner's launches with what lands each.
+fn in_flight(log: &Log) -> (Worker, Arc<Sequences>, Receiver<(u64, Waker)>) {
+    let kernels = serving();
+    let (launches, launched) = crossbeam_channel::unbounded();
+    let mut runner = LoggingRunner::new("a", Phase::Decode, Arc::clone(&kernels), log);
+    runner.in_flight = Some(launches);
+
+    let sequences = Sequences::new(GROUP, 1, Vec::new());
+    let worker = spawn(
+        vec![Box::new(runner)],
+        &kernels,
+        &sequences,
+        0,
+        &[DEVICE, HOST],
+    );
+    (worker, sequences, launched)
+}
+
+#[test]
+fn a_batch_submitted_while_the_one_before_is_in_flight_runs_and_both_end_in_order() {
+    let log = Log::default();
+    let (worker, sequences, launched) = in_flight(&log);
+
+    let first = worker.submit(1, batch(1, Phase::Decode, 2)).unwrap();
+    let second = worker.submit(2, batch(2, Phase::Decode, 2)).unwrap();
+
+    // The second batch is launched while the first is in flight, and neither has ended.
+    let (one, land_first) = launched.recv_timeout(LONG).unwrap();
+    let (two, land_second) = launched.recv_timeout(LONG).unwrap();
+    assert_eq!((one, two), (1, 2));
+    assert!(first.outcome().is_none());
+    assert!(second.outcome().is_none());
+    assert_eq!(sequences.completed(), 0);
+
+    // The first step's end completes its batch with its output, and the group's `completed`
+    // reaches it and not the batch still in flight.
+    land_first();
+    assert_eq!(output_of(&first).calls[0].tokens, [1]);
+    assert_eq!(sequences.completed(), 1);
+    assert!(second.outcome().is_none());
+
+    land_second();
+    assert_eq!(output_of(&second).calls[0].tokens, [2]);
+    assert_eq!(sequences.completed(), 2);
+
+    assert_eq!(
+        entries(&log),
+        ["a: launch 1", "a: launch 2", "a: land 1", "a: land 2"]
+    );
+    worker.close().unwrap();
+}
+
+#[test]
+fn a_step_that_fails_as_it_lands_fails_its_batch_and_the_one_behind_it_ends() {
+    let log = Log::default();
+    let (worker, sequences, launched) = in_flight(&log);
+
+    let refused = worker.submit(1, batch(REFUSED, Phase::Decode, 2)).unwrap();
+    let behind = worker
+        .submit(2, batch(REFUSED + 1, Phase::Decode, 2))
+        .unwrap();
+    let (_, land_refused) = launched.recv_timeout(LONG).unwrap();
+    let (_, land_behind) = launched.recv_timeout(LONG).unwrap();
+
+    // The failed batch ends: the device has passed it, so `completed` reaches it.
+    land_refused();
+    assert!(failure_of(&refused).contains("refuses"));
+    assert_eq!(sequences.completed(), 1);
+
+    land_behind();
+    assert_eq!(output_of(&behind).calls[0].tokens, [REFUSED as u32 + 1]);
+    assert_eq!(sequences.completed(), 2);
     worker.close().unwrap();
 }
 

@@ -16,11 +16,13 @@
 //!   expert-union member with no tokens of its own serves its part of a peer's step as a batch of
 //!   variant `ExpertJoin`, which the stepping peer submits through [`Worker::join`] and which
 //!   takes no number: it addresses no device block table. A batch another rank of the group runs
-//!   alone is **passed**: the rank takes its number and runs nothing. A batch whose work is the
-//!   host's (a media request's reading, encoding and muxing) takes two turns: the first starts
-//!   the work on its runner's thread pool ([`Runner::start`]) and the job is held aside until the
-//!   work ended, the second writes what it produced and ends the batch ([`Runner::execute`]); the
-//!   jobs behind it run in between, and its number stays open across them;
+//!   alone is **passed**: the rank takes its number and runs nothing. A batch whose work runs on
+//!   beyond its runner's call takes two turns: the first starts the work ([`Runner::start`]) and
+//!   the job is held aside until the work ended, the second ends the batch
+//!   ([`Runner::execute`]); the jobs behind it run in between, and its number stays open across
+//!   them. Such work is a media request's reading, encoding and muxing on its runner's thread
+//!   pool, which the second turn writes out, and a token step the device computes while the
+//!   worker issues the next batch behind it, which the second turn reads;
 //! - a **shadow batch** of the generation being prepared: one paired forward
 //!   ([`Graphs::shadow`](crate::runner::graphs::Graphs::shadow)) per operator the batch's bucket
 //!   launches whose kernel the generation replaces. It reads the device block tables, so it takes a
@@ -48,8 +50,8 @@
 //! request it has stamped are jobs, so a batch sees exactly the entries of the jobs before it:
 //! "before the group's next batch launches" is the queue's order. Before each batch the worker
 //! hands every runner the table's changes and starts the queued copies the copy budget admits;
-//! when the batch has ended it applies the `Finish` of each copy it ran and returns it, stamped,
-//! with the batch's output.
+//! when the batch has ended it applies the `Finish` of each copy it ran and returns it, stamped
+//! with the batch's number, with the batch's output.
 //!
 //! ## Copies
 //!
@@ -1076,14 +1078,14 @@ impl Thread {
             Job::Execute { batch, sequence } => self.execute(batch, sequence, queued),
             Job::Resume {
                 batch,
+                sequence,
                 copies,
                 queued,
-                ..
             } => {
                 let index = self.runner_of(batch.phase)?;
                 let output = self.runners[index].execute(&batch, &self.tables);
                 Ok(ControlFlow::Break(
-                    self.ended(&batch, output, copies, queued)?,
+                    self.ended(&batch, sequence, output, copies, queued)?,
                 ))
             }
             Job::Pass(_) => Ok(done),
@@ -1210,8 +1212,15 @@ impl Thread {
             (Vec::new(), Vec::new())
         };
 
-        // A numbered batch whose work its runner runs on the host leaves the worker while the
-        // work runs, its number open; the work's end puts its remainder back in the queue.
+        // The step's range markers are launched by the graphs, around the forward itself, which
+        // `start` may issue.
+        if forwards(&batch) {
+            self.runners[index].graphs().mark_step(step, stage);
+        }
+
+        // A numbered batch whose work runs on beyond its runner's call (host work on a thread
+        // pool, or a step the device computes while the worker issues the next) leaves the worker
+        // while it runs, its number open; the work's end puts its remainder back in the queue.
         if let Some(sequence) = sequence
             && !empty(&batch)
         {
@@ -1228,23 +1237,24 @@ impl Thread {
                         queued,
                     }));
                 }
-                Err(error) => return Err(self.failed(error, copies.0)),
+                Err(error) => return Err(self.failed(error, Some(sequence), copies.0)),
             }
         }
 
-        // The step's range markers are launched by the graphs, around the forward itself.
-        if forwards(&batch) {
-            self.runners[index].graphs().mark_step(step, stage);
-        }
         let output = self.runners[index].execute(&batch, &self.tables);
-        Ok(ControlFlow::Break(
-            self.ended(&batch, output, copies, queued)?,
-        ))
+        Ok(ControlFlow::Break(self.ended(
+            &batch,
+            sequence.unwrap_or(self.launched),
+            output,
+            copies,
+            queued,
+        )?))
     }
 
-    /// Ends `batch`, whose runner returned `output`, with `copies`, the copies that started with
-    /// it and the runners that issued them; the batch waited `queued.0` in the queue, and its
-    /// first turn began at `queued.1`. Returns the output and the stamped `Finish` of each copy.
+    /// Ends `batch`, numbered `sequence`, whose runner returned `output`, with `copies`, the
+    /// copies that started with it and the runners that issued them; the batch waited `queued.0`
+    /// in the queue, and its first turn began at `queued.1`. Returns the output and the stamped
+    /// `Finish` of each copy.
     ///
     /// # Errors
     ///
@@ -1253,6 +1263,7 @@ impl Thread {
     fn ended(
         &mut self,
         batch: &Batch,
+        sequence: u64,
         output: Result<BatchOutput>,
         (copies, issuers): Started,
         (queued, started): (Duration, Instant),
@@ -1268,7 +1279,7 @@ impl Thread {
         });
         let mut output = match output {
             Ok(output) => output,
-            Err(error) => return Err(self.failed(error, copies)),
+            Err(error) => return Err(self.failed(error, Some(sequence), copies)),
         };
 
         if forwards(batch)
@@ -1281,7 +1292,7 @@ impl Thread {
         }
 
         // The batch ended, and the copies with it.
-        let finished = self.finish(copies)?;
+        let finished = self.finish(copies, sequence)?;
 
         // The runner states the step's device and host time; the wait in the queue is the
         // worker's to state.
@@ -1307,10 +1318,12 @@ impl Thread {
         Ok((output, finished))
     }
 
-    /// The `Finish` of each of `copies`, which started with the batch that just ended, each `ok`
-    /// as stated: it was issued, and the batch was served. Each is applied to the tables, as
-    /// every `Finish` is, and stamped with the last batch the rank launched, which covers it.
-    fn finish(&mut self, copies: Vec<(RequestId, bool)>) -> Result<Vec<Request>> {
+    /// The `Finish` of each of `copies`, which started with the batch numbered `sequence` that
+    /// just ended, each `ok` as stated: it was issued, and the batch was served. Each is applied
+    /// to the tables, as every `Finish` is, and stamped with that batch, whose end covers the
+    /// copy: a later batch may already be in flight on the rank ([`Runner::start`]), and the
+    /// copy's end does not wait for it.
+    fn finish(&mut self, copies: Vec<(RequestId, bool)>, sequence: u64) -> Result<Vec<Request>> {
         let group = self.tables.group();
         let mut finished = Vec::with_capacity(copies.len());
 
@@ -1321,13 +1334,14 @@ impl Thread {
                 after: Vec::new(),
             };
             self.tables.apply(&finish)?;
-            add_stamp(&mut finish, group, self.launched);
+            add_stamp(&mut finish, group, sequence);
             finished.push(finish);
         }
         Ok(finished)
     }
 
-    /// The failure of a batch whose runner failed with `error` after `copies` started with it.
+    /// The failure of a batch, numbered `sequence` when it is a numbered one, whose runner failed
+    /// with `error` after `copies` started with it.
     ///
     /// Once the device has passed everything the runners issued, their copies included
     /// ([`Thread::settle`]), each copy is reported failed: its result is unknown, and the
@@ -1335,7 +1349,12 @@ impl Thread {
     /// with this batch ([`Error::Copies`]). While the device's progress is unknown it carries
     /// none: the batch stays open, the group's `completed` stays below it, and whatever later
     /// gives the copies up is covered by a stamp no lower than the batch's.
-    fn failed(&mut self, error: Error, copies: Vec<(RequestId, bool)>) -> Error {
+    fn failed(
+        &mut self,
+        error: Error,
+        sequence: Option<u64>,
+        copies: Vec<(RequestId, bool)>,
+    ) -> Error {
         if copies.is_empty() {
             return error;
         }
@@ -1352,7 +1371,7 @@ impl Thread {
 
         // Applying a `Finish` that gives a copy up cannot be refused.
         let given_up = copies.into_iter().map(|(copy, _)| (copy, false)).collect();
-        match self.finish(given_up) {
+        match self.finish(given_up, sequence.unwrap_or(self.launched)) {
             Ok(finished) => Error::Copies {
                 error: Box::new(error),
                 finished,

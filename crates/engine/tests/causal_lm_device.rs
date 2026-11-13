@@ -1,5 +1,6 @@
 //! `CausalLmRunner` on a device: a prefill commits its first token into its slot and a decode
-//! step continues from it; a slot whose first step is a decode starts from its batch's row;
+//! step continues from it, also when it is launched while the step before it is in flight; a
+//! slot whose first step is a decode starts from its batch's row;
 //! a batch's page work is issued around the replay; a runner that speculates commits the
 //! prefix a verification's samples agree with and proposes the drafts after it.
 //!
@@ -470,6 +471,42 @@ fn a_prefill_commits_its_first_token_and_a_decode_step_continues_from_it() -> Ou
     let output = bench.runner.execute(&step(2, 0, 4), &tables())?;
     assert_eq!(output.calls[0].tokens, [next(next(next(7)))]);
     assert!(output.timing.device_us > 0);
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires a GPU and a Build Server"]
+fn a_decode_launched_while_the_step_before_is_in_flight_continues_from_its_token() -> Outcome {
+    let mut bench = Bench::open()?;
+    bench.runner.execute(&prompt(2, &[5, 6, 7]), &tables())?;
+
+    // Two decode steps are launched before either lands; the second reads the token the first
+    // commits on the device. The device completes them in order, and each wakes its landing.
+    let (landed, lands) = std::sync::mpsc::channel();
+    let mut first = step(2, 0, 3);
+    first.id = BatchId(2);
+    let mut second = step(2, 0, 4);
+    second.id = BatchId(3);
+    for batch in [&first, &second] {
+        let (landed, id) = (landed.clone(), batch.id.0);
+        let resume = Arc::new(move || landed.send(id).unwrap());
+        assert!(bench.runner.start(batch, &tables(), resume)?);
+    }
+    let wait = std::time::Duration::from_secs(30);
+    assert_eq!(
+        (lands.recv_timeout(wait)?, lands.recv_timeout(wait)?),
+        (2, 3)
+    );
+
+    let output = bench.runner.execute(&first, &tables())?;
+    let call = &output.calls[0];
+    assert_eq!(call.tokens, [next(next(7))]);
+    assert_eq!((call.cache_computed_len, call.step_index), (4, 2));
+
+    let output = bench.runner.execute(&second, &tables())?;
+    let call = &output.calls[0];
+    assert_eq!(call.tokens, [next(next(next(7)))]);
+    assert_eq!((call.cache_computed_len, call.step_index), (5, 3));
     Ok(())
 }
 

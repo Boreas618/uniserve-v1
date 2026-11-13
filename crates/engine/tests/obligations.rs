@@ -11,6 +11,12 @@
 //! copies that started with it) and holds the batch until the test ends it on that rank, which
 //! stands for the batch's device work ending there.
 //!
+//! A reader serves a batch in one of two ways ([`Turns`]), and every recording is replayed under
+//! both: in the one turn of `Runner::execute`, which holds the worker until the batch ends, or as
+//! a device runner whose step is in flight across two turns, launched by `Runner::start` and
+//! landed by `Runner::execute` once the batch ended, the worker taking the jobs behind it, the
+//! next batch's launch included, meanwhile.
+//!
 //! ## The recordings
 //!
 //! A recording is what a scheduler hands the group's [`Route`]: completions with the requests
@@ -60,7 +66,7 @@
 // The helpers below unwrap, as tests do (`clippy.toml`).
 #![cfg(test)]
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -966,22 +972,100 @@ impl Watch {
     }
 }
 
+/// How a [`Reader`] serves a batch.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Turns {
+    /// In `Runner::execute`, which holds the worker until the test releases the batch.
+    One,
+    /// As a step in flight: `Runner::start` states what the batch reads and returns, and the
+    /// test's release of the batch wakes the worker for `Runner::execute`, which lands it.
+    Two,
+}
+
+/// What `Runner::start` is given to wake the worker with.
+type Resume = Arc<dyn Fn() + Send + Sync>;
+
+/// The steps a two-turn reader launched and the test has not released, oldest first; `closed`
+/// once the test dropped its end, after which every step lands at once.
+#[derive(Default)]
+struct Flights {
+    steps: VecDeque<Resume>,
+    closed: bool,
+}
+
 /// A rank's runner over [`Graphs::meta`]: it states what each batch reads, and holds the batch
 /// until the test releases it, which is when the batch's device work ends.
 struct Reader {
     rank: usize,
     phases: [Phase; 1],
     graphs: Graphs,
+    turns: Turns,
     /// The device block table, as the runner writes it from the changes it is handed.
     device: BTreeMap<Position, Run>,
     resets: BTreeSet<Position>,
     /// The copies issued for the batch that runs next.
     copies: Vec<Copies>,
     entered: Sender<Seen>,
-    release: Receiver<()>,
+    /// The test's releases, which a one-turn reader takes itself; a two-turn reader's releases
+    /// are taken by a thread of its own, which wakes the worker for the oldest step in `flights`.
+    release: Option<Receiver<()>>,
+    flights: Arc<Mutex<Flights>>,
+    /// The batches launched by `start` whose landing has not run.
+    launched: BTreeSet<u64>,
     /// Where the runner reports a batch ended, once it checked `completed` at its end.
     left: Sender<u64>,
     watch: Arc<Watch>,
+}
+
+impl Reader {
+    /// What `batch` reads of `tables` and of what the runner was handed since its last batch.
+    fn seen(&mut self, batch: &Batch, tables: &BlockTables) -> Seen {
+        let mut entries = BTreeMap::new();
+        for slot in SLOTS {
+            for (position, run) in tables.entries(slot, CLASS) {
+                let writable = tables.writable(slot, CLASS, position);
+                entries.insert((slot, CLASS, position), (run, writable));
+            }
+        }
+        Seen {
+            rank: self.rank,
+            batch: batch.id.0,
+            tables: entries,
+            device: self.device.clone(),
+            resets: std::mem::take(&mut self.resets),
+            copies: std::mem::take(&mut self.copies),
+        }
+    }
+
+    /// Batch `number` ended: the last moment before the worker learns it, `completed` only rises,
+    /// so it has not reached the batch at any earlier moment either.
+    fn left(&self, number: u64) {
+        self.watch.below(self.rank, number);
+        let _ = self.left.send(number);
+    }
+}
+
+/// Takes the test's releases of a two-turn reader's steps: each wakes the worker for the oldest
+/// step in flight, and once the test drops its end every step left lands, and so does every
+/// later one.
+fn release_flights(released: Receiver<()>, flights: Arc<Mutex<Flights>>) {
+    std::thread::spawn(move || {
+        while released.recv().is_ok() {
+            let resume = lock(&flights).steps.pop_front();
+            if let Some(resume) = resume {
+                resume();
+            }
+        }
+
+        let left = {
+            let mut flights = lock(&flights);
+            flights.closed = true;
+            std::mem::take(&mut flights.steps)
+        };
+        for resume in left {
+            resume();
+        }
+    });
 }
 
 impl Runner for Reader {
@@ -1005,33 +1089,44 @@ impl Runner for Reader {
         Err(Error::Unsupported("the reader runs no forward".to_owned()))
     }
 
+    /// A two-turn reader launches the batch: it states what the batch reads now, as a device
+    /// step reads its tables when it is issued, and returns with the step in flight.
+    fn start(&mut self, batch: &Batch, tables: &BlockTables, resume: Resume) -> Result<bool> {
+        if self.turns == Turns::One {
+            return Ok(false);
+        }
+
+        // The step is queued for its release before the test can see it and release it.
+        {
+            let mut flights = lock(&self.flights);
+            if flights.closed {
+                return Ok(false);
+            }
+            flights.steps.push_back(resume);
+        }
+        self.launched.insert(batch.id.0);
+        let seen = self.seen(batch, tables);
+        let _ = self.entered.send(seen);
+        Ok(true)
+    }
+
     fn execute(&mut self, batch: &Batch, tables: &BlockTables) -> Result<BatchOutput> {
         let number = batch.id.0;
 
-        let mut entries = BTreeMap::new();
-        for slot in SLOTS {
-            for (position, run) in tables.entries(slot, CLASS) {
-                let writable = tables.writable(slot, CLASS, position);
-                entries.insert((slot, CLASS, position), (run, writable));
-            }
+        // The landing of a step `start` launched, which the test's release woke: it reads no
+        // table.
+        if self.launched.remove(&number) {
+            self.left(number);
+            return Ok(BatchOutput::default());
         }
-        let seen = Seen {
-            rank: self.rank,
-            batch: number,
-            tables: entries,
-            device: self.device.clone(),
-            resets: std::mem::take(&mut self.resets),
-            copies: std::mem::take(&mut self.copies),
-        };
 
         // The batch's device work ends when the test releases it, or drops its end at a close.
+        let seen = self.seen(batch, tables);
         let _ = self.entered.send(seen);
-        let _ = self.release.recv();
-
-        // The last moment before the worker learns the batch ended: `completed` only rises, so
-        // it has not reached the batch at any earlier moment either.
-        self.watch.below(self.rank, number);
-        let _ = self.left.send(number);
+        if let Some(release) = &self.release {
+            let _ = release.recv();
+        }
+        self.left(number);
         Ok(BatchOutput::default())
     }
 
@@ -1076,27 +1171,39 @@ struct Ends {
 }
 
 /// The worker with no device of rank `rank` (the test's number), reporting to `sequences` as
-/// rank `place`, with the test's ends of it.
+/// rank `place`, its reader serving batches in `turns`, with the test's ends of it.
 fn worker(
     rank: usize,
     place: usize,
     sequences: &Arc<Sequences>,
     watch: &Arc<Watch>,
+    turns: Turns,
 ) -> (Arc<Worker>, Ends) {
     let (entered, seen) = crossbeam_channel::unbounded();
     let (release, released) = crossbeam_channel::unbounded();
     let (left, ended) = crossbeam_channel::unbounded();
     let kernels = Arc::new(Generation::new(1, []));
 
+    let flights = Arc::new(Mutex::new(Flights::default()));
+    let release_taken = match turns {
+        Turns::One => Some(released),
+        Turns::Two => {
+            release_flights(released, Arc::clone(&flights));
+            None
+        }
+    };
     let runner = Reader {
         rank,
         phases: [Phase::Decode],
         graphs: Graphs::meta(Arc::clone(&kernels), 0),
+        turns,
         device: BTreeMap::new(),
         resets: BTreeSet::new(),
         copies: Vec::new(),
         entered,
-        release: released,
+        release: release_taken,
+        flights,
+        launched: BTreeSet::new(),
         left,
         watch: Arc::clone(watch),
     };
@@ -1145,7 +1252,7 @@ struct Group {
 }
 
 impl Group {
-    fn start(peers: &Peers) -> Self {
+    fn start(peers: &Peers, turns: Turns) -> Self {
         let pool = QueuePair::create(4096, 1).unwrap();
         let engine =
             QueuePair::open(pool.descriptor().try_clone_to_owned().unwrap(), true).unwrap();
@@ -1165,7 +1272,7 @@ impl Group {
             .pop()
             .unwrap();
         let held = Sequences::new(GROUP, 1, Vec::new());
-        let (far, far_ends) = worker(PEER, 0, &held, &watch);
+        let (far, far_ends) = worker(PEER, 0, &held, &watch, turns);
         let ranks = Route::new(vec![held], vec![far], Vec::new()).unwrap();
         // The group's capacity, which the scheduler node never asks for here.
         let capacity = engine::batch::Capacity {
@@ -1195,7 +1302,7 @@ impl Group {
         .unwrap();
 
         // The scheduler node: its rank 0, and the link that holds rank 1.
-        let (near, near_ends) = worker(0, 0, &sequences, &watch);
+        let (near, near_ends) = worker(0, 0, &sequences, &watch, turns);
         let remote = Remote::spawn(first, channel, Liveness::new(Arc::new(|| {}), DAY)).unwrap();
         let route = Route::new(
             vec![sequences],
@@ -1275,7 +1382,8 @@ fn stamped(request: &Request, stamps: Stamps) -> Request {
     request
 }
 
-/// The group's batch numbered `number`: one row, which no forward reads.
+/// The group's batch numbered `number`: one row of one request, which no forward reads. A batch
+/// with a request is one a runner may serve in two turns (`Runner::start`).
 fn batch(number: u64) -> Batch {
     Batch {
         id: BatchId(number),
@@ -1283,7 +1391,7 @@ fn batch(number: u64) -> Batch {
         phase: Phase::Decode,
         generation: 1,
         shape: Shape::decode(1, Variant::DecodeGreedy),
-        requests: Vec::new(),
+        requests: vec![proto::request::RequestId(number)],
         columns: Columns::default(),
         media: Vec::new(),
         new_slots: Vec::new(),
@@ -1291,10 +1399,10 @@ fn batch(number: u64) -> Batch {
 }
 
 impl<'a> Replay<'a> {
-    fn new(recording: &'a [Event], peers: &Peers) -> Self {
+    fn new(recording: &'a [Event], peers: &Peers, turns: Turns) -> Self {
         Self {
             recording,
-            group: Group::start(peers),
+            group: Group::start(peers, turns),
             expected: Expected::default(),
             views: Vec::new(),
             ended: [0; RANKS],
@@ -1497,15 +1605,16 @@ fn describe(recording: &[Event], path: &[Step]) -> String {
     words.join(", ")
 }
 
-/// Replays every interleaving of `recording`, of which there are `count`, and fails at the first
-/// step where the group breaks an obligation, with the steps that led to it.
-fn replay_all(recording: &[Event], count: usize) {
+/// Replays every interleaving of `recording`, of which there are `count`, with readers serving
+/// batches in `turns`, and fails at the first step where the group breaks an obligation, with the
+/// steps that led to it.
+fn replay_all(recording: &[Event], count: usize, turns: Turns) {
     let paths = interleavings(recording);
     assert_eq!(paths.len(), count, "the interleavings of the recording");
 
     let peers = Peers::new();
     for path in &paths {
-        let mut replay = Replay::new(recording, &peers);
+        let mut replay = Replay::new(recording, &peers, turns);
         let failed = path
             .iter()
             .enumerate()
@@ -1513,31 +1622,58 @@ fn replay_all(recording: &[Event], count: usize) {
 
         replay.group.close();
         if let Some((steps, finding)) = failed {
-            panic!("{finding}\nafter: {}", describe(recording, &path[..steps]));
+            panic!(
+                "{finding}\nwith readers in {turns:?} turns, after: {}",
+                describe(recording, &path[..steps])
+            );
         }
     }
 }
 
-/// 2,988 interleavings.
+/// 2,988 interleavings, with a batch held in its one turn.
 #[test]
 fn allocated_and_pinned_entries_are_read_until_their_release_and_detach() {
-    replay_all(&entries(), 2_988);
+    replay_all(&entries(), 2_988, Turns::One);
 }
 
-/// 4,004 interleavings.
+/// The same 2,988 interleavings, with each step in flight across two turns.
+#[test]
+fn allocated_and_pinned_entries_are_read_until_their_release_and_detach_with_steps_in_flight() {
+    replay_all(&entries(), 2_988, Turns::Two);
+}
+
+/// 4,004 interleavings, with a batch held in its one turn.
 #[test]
 fn a_loaded_or_cloned_block_is_an_entry_only_once_its_copy_is_answered() {
-    replay_all(&copies(), 4_004);
+    replay_all(&copies(), 4_004, Turns::One);
 }
 
-/// 3,528 interleavings.
+/// The same 4,004 interleavings, with each step in flight across two turns.
+#[test]
+fn a_loaded_or_cloned_block_is_an_entry_only_once_its_copy_is_answered_with_steps_in_flight() {
+    replay_all(&copies(), 4_004, Turns::Two);
+}
+
+/// 3,528 interleavings, with a batch held in its one turn.
 #[test]
 fn a_copy_given_up_before_a_batch_starts_it_never_runs() {
-    replay_all(&give_up_store(), 3_528);
+    replay_all(&give_up_store(), 3_528, Turns::One);
 }
 
-/// 1,260 interleavings.
+/// The same 3,528 interleavings, with each step in flight across two turns.
+#[test]
+fn a_copy_given_up_before_a_batch_starts_it_never_runs_with_steps_in_flight() {
+    replay_all(&give_up_store(), 3_528, Turns::Two);
+}
+
+/// 1,260 interleavings, with a batch held in its one turn.
 #[test]
 fn an_owner_moving_in_brings_its_entries_and_one_moving_out_takes_them() {
-    replay_all(&transfer(), 1_260);
+    replay_all(&transfer(), 1_260, Turns::One);
+}
+
+/// The same 1,260 interleavings, with each step in flight across two turns.
+#[test]
+fn an_owner_moving_in_brings_its_entries_and_one_moving_out_takes_them_with_steps_in_flight() {
+    replay_all(&transfer(), 1_260, Turns::Two);
 }

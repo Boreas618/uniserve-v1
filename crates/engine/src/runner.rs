@@ -195,25 +195,28 @@ pub trait Runner: Send {
     /// One step: prepare the inputs from `batch` and `tables`, run the bucket's graph, read the
     /// outputs. It returns once the device has completed the step.
     ///
-    /// For a batch whose host work [`Runner::start`] started, it is called once that work
-    /// ended: it writes what the work produced into the memory `start` found the batch's blocks
-    /// at, and reads nothing of `tables`, whose entries may have been taken away meanwhile.
+    /// For a batch whose work [`Runner::start`] started, it is called once that work ended: it
+    /// writes what host work produced into the memory `start` found the batch's blocks at, or
+    /// reads the outputs of the step `start` launched, and reads nothing of `tables`, whose
+    /// entries may have been taken away meanwhile.
     ///
     /// # Errors
     ///
     /// As [`Runner::prepare_inputs`], or the device's failure.
     fn execute(&mut self, batch: &Batch, tables: &BlockTables) -> Result<BatchOutput>;
 
-    /// Starts the host work of `batch`, a batch with rows, on a thread that is not the
-    /// worker's, and returns whether it started any. What the work reads of the rank's memory
-    /// is found through `tables` and copied to the host before this returns; `resume` is called
-    /// once, from the thread the work ended on, and the worker then calls
-    /// [`Runner::execute`] with the same batch.
+    /// Starts the work of `batch`, a batch with rows, that runs on beyond this call, and returns
+    /// whether it started any: host work on a thread that is not the worker's, whose reads of
+    /// the rank's memory are found through `tables` and copied to the host before this returns,
+    /// or a step issued on the device that this call does not wait for. `resume` is called once,
+    /// from the thread that saw the work end, and the worker then calls [`Runner::execute`]
+    /// with the same batch; it performs other jobs in between, the next batch's start
+    /// included, so a device runner issues the next step behind this one on its stream.
     ///
     /// # Errors
     ///
-    /// What refuses the batch; no work of it is left running then. The default starts none: a
-    /// device runner's [`Runner::execute`] does all of a batch's work.
+    /// What refuses the batch; no work of it is left running then. The default starts none: the
+    /// runner's [`Runner::execute`] does all of a batch's work.
     fn start(&mut self, batch: &Batch, tables: &BlockTables, resume: Waker) -> Result<bool> {
         let _ = (batch, tables, resume);
         Ok(false)
