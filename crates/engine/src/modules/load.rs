@@ -9,7 +9,7 @@ use build_server::{Client, CoverRequest, PrepareRequest, Target};
 use ops::KernelEntry;
 use proto::module::Packages;
 use worker::completion::Outcome;
-use worker::host::HostAction;
+use worker::thread_pool::HostAction;
 
 use crate::modules::select::{
     Routes, fixed_revisions, interface_agrees, named_backends, selected_slots,
@@ -89,7 +89,7 @@ impl HostAction for Select {
         Ok(())
     }
 
-    fn input_outcome(&self) -> Outcome {
+    fn input_status(&self) -> Outcome {
         Outcome::Success(())
     }
 }
@@ -121,10 +121,10 @@ impl HostAction for ModuleWork {
         }
     }
 
-    fn input_outcome(&self) -> Outcome {
+    fn input_status(&self) -> Outcome {
         match self {
-            Self::Select(select) => select.input_outcome(),
-            Self::Install(install) => install.input_outcome(),
+            Self::Select(select) => select.input_status(),
+            Self::Install(install) => install.input_status(),
         }
     }
 }
@@ -671,7 +671,7 @@ impl HostAction for Install {
         Ok(())
     }
 
-    fn input_outcome(&self) -> Outcome {
+    fn input_status(&self) -> Outcome {
         Outcome::Success(())
     }
 }

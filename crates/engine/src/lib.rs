@@ -11,10 +11,10 @@
 //! device has recorded the packages its runners launch, and serves nothing.
 
 mod catalogue;
-pub mod data_plane;
+#[expect(
+    dead_code,
+    reason = "the process, the one caller of the module installation, is not declared in the crate"
+)]
 mod modules;
-mod process;
-mod rank;
 
 pub use catalogue::resolve;
-pub use process::{Recorded, record, run};

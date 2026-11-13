@@ -1,27 +1,27 @@
 //! The family a checkpoint resolves to.
 //!
-//! The executable registers each family once (`nn::family::Catalogue`); a main process resolves
+//! The executable registers each family once ([`nn::family::Registry`]); a main process resolves
 //! its checkpoint by the class the checkpoint declares ([`resolve`]) and from then on dispatches by
 //! the family's model and the capabilities it implements. Nothing else in this crate names a model.
 
 use std::path::Path;
 
 use anyhow::{Context as _, Result, bail};
-use nn::family::{Catalogue, Family};
+use nn::family::{Family, Registry};
 
 /// The family of the checkpoint at `checkpoint`, by the class it declares.
 ///
 /// # Errors
 ///
-/// Fails when the checkpoint declares no class, or one no family of `catalogue` claims; the
+/// Fails when the checkpoint declares no class, or one no family of `registry` claims; the
 /// refusal names the classes the build serves.
-pub fn resolve(catalogue: &Catalogue, checkpoint: &Path) -> Result<Family> {
+pub fn resolve(registry: &Registry, checkpoint: &Path) -> Result<Family> {
     let declared = architectural_class(checkpoint)?;
-    catalogue.by_class(&declared).with_context(|| {
+    registry.by_class(&declared).with_context(|| {
         format!(
             "{} declares model class {declared}, which this build cannot serve: it serves {}",
             checkpoint.display(),
-            catalogue
+            registry
                 .families()
                 .iter()
                 .flat_map(|family| family.request.classes.iter().copied())
@@ -99,13 +99,13 @@ mod tests {
     }
 
     /// The families of a text class and a video class.
-    fn catalogue() -> Catalogue {
+    fn registry() -> Registry {
         let chat = Serving::Chat(ChatProfile {
             reasoning: None,
             tool_calls: None,
             images: None,
         });
-        Catalogue::new([
+        Registry::new([
             Family {
                 request: processing::Family {
                     id: "text",
@@ -133,7 +133,7 @@ mod tests {
     /// `modular_model_index.json`.
     #[test]
     fn a_checkpoint_resolves_by_the_class_it_declares() {
-        let catalogue = catalogue();
+        let registry = registry();
         let root = tempfile::tempdir().unwrap();
 
         std::fs::write(
@@ -141,21 +141,21 @@ mod tests {
             r#"{"_class_name": "VideoModularPipeline"}"#,
         )
         .unwrap();
-        assert_eq!(resolve(&catalogue, root.path()).unwrap().id(), "video");
+        assert_eq!(resolve(&registry, root.path()).unwrap().id(), "video");
 
         std::fs::write(
             root.path().join("config.json"),
             r#"{"architectures": ["TextForCausalLM"]}"#,
         )
         .unwrap();
-        assert_eq!(resolve(&catalogue, root.path()).unwrap().id(), "text");
+        assert_eq!(resolve(&registry, root.path()).unwrap().id(), "text");
     }
 
     /// A class no family claims is refused naming the classes the build serves, and a checkpoint
     /// that declares none is refused naming both files a class is read from.
     #[test]
     fn an_unknown_or_missing_class_is_refused_by_name() {
-        let catalogue = catalogue();
+        let registry = registry();
         let root = tempfile::tempdir().unwrap();
 
         std::fs::write(
@@ -163,7 +163,7 @@ mod tests {
             r#"{"architectures": ["OtherForCausalLM"]}"#,
         )
         .unwrap();
-        let error = format!("{:#}", resolve(&catalogue, root.path()).unwrap_err());
+        let error = format!("{:#}", resolve(&registry, root.path()).unwrap_err());
         assert!(error.contains("OtherForCausalLM"), "{error}");
         assert!(
             error.contains("TextForCausalLM, VideoModularPipeline"),
@@ -171,7 +171,7 @@ mod tests {
         );
 
         std::fs::remove_file(root.path().join("config.json")).unwrap();
-        let error = format!("{:#}", resolve(&catalogue, root.path()).unwrap_err());
+        let error = format!("{:#}", resolve(&registry, root.path()).unwrap_err());
         assert!(error.contains("declares no model class"), "{error}");
         assert!(error.contains("modular_model_index.json"), "{error}");
     }
