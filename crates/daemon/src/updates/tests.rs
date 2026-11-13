@@ -717,6 +717,37 @@ fn the_drain_states_its_deadline_and_shrinks_across_layouts() {
     );
 }
 
+/// A serving engine that gives its device memory back as it drains across layouts reports
+/// each release, and the target engines on its host are sent `Grow` for it; without `shrink`
+/// nothing is relayed.
+#[test]
+fn a_release_of_a_draining_engine_grows_the_targets_on_its_host() {
+    let shrunk = || process::Report {
+        kind: Some(process::report::Kind::Shrunk(process::Shrunk {
+            devices: vec![0],
+            bytes: 1 << 30,
+        })),
+    };
+
+    for shrink in [true, false] {
+        let mut deployment = Deployment::new(Refusals::default());
+        let mut switch = deployment.switch(vec![(target_launch(HOST, 0, SPAWNED), Vec::new())]);
+        switch.shrink = shrink;
+        let nodes = deployment.nodes(1);
+        let update = deployment.epoch_over(1, nodes, switch, None);
+        deployment.apply(update);
+
+        deployment.engines.report(PREVIOUS, shrunk());
+        deployment.run();
+        let expected: &[&str] = if shrink {
+            &["promote", "grow"]
+        } else {
+            &["promote"]
+        };
+        assert_eq!(names(&deployment.engines.received(SPAWNED)), expected);
+    }
+}
+
 /// The epoch form covers every node of both epochs: a target whose world
 /// spans two hosts starts one engine on each, its scheduler node inheriting
 /// the world's sockets, every node claims the target's storage, every target

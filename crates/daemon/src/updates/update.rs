@@ -746,6 +746,11 @@ impl Update {
             (Phase::Switching, true, Some(report::Kind::Drained(_))) => {
                 trial.target_left.insert(target);
             }
+            // On the way back the targets drain beside the previous epoch, which grows into what
+            // they give back on their host.
+            (Phase::Switching, true, Some(report::Kind::Shrunk(_))) if trial.switch.shrink => {
+                grow_on(processes, &trial.targets[target].host, &self.nodes);
+            }
             // A target that fails while the switch runs back is stopped: it
             // drains nothing more.
             (Phase::Switching, true, _) => {
@@ -780,6 +785,13 @@ impl Update {
             }
             (Phase::Switching, true, Some(report::Kind::Serving(_))) => {
                 self.previous_serves(processes, node);
+            }
+            // A serving engine draining across layouts gave device memory back: the targets on
+            // its host grow into it, one release at a time.
+            (Phase::Switching | Phase::Trial, false, Some(report::Kind::Shrunk(_)))
+                if trial.switch.shrink =>
+            {
+                grow_on(processes, &self.nodes[node].host, &trial.targets);
             }
             _ => {}
         }
@@ -1261,6 +1273,19 @@ impl Update {
 /// One command of `kind`.
 fn command(kind: command::Kind) -> process::Command {
     process::Command { kind: Some(kind) }
+}
+
+/// Sends `Grow` to each of `engines` on `host`: an engine draining there across layouts gave its
+/// device memory back to the GPUs' quotas, and these grow their regions into it
+/// (`specs/updates.md` §3.7). An engine on another host shares no quota with it.
+fn grow_on(processes: &mut Processes, host: &str, engines: &[Node]) {
+    for engine in engines.iter().filter(|engine| engine.host == host) {
+        processes.command(
+            &engine.host,
+            engine.launch,
+            command(command::Kind::Grow(process::Grow {})),
+        );
+    }
 }
 
 /// The promotion of an epoch switch: whether the requests that migrate onto
