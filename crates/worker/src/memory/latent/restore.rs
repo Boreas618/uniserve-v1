@@ -1,61 +1,69 @@
-//! The copies that lay a stored trajectory's pages out in a restoring
-//! rank's request slot pages.
+//! The copies that lay a saved trajectory's pages out in a restoring
+//! rank's trajectory row.
 //!
-//! A denoising rank's request slot pages hold the rank's part of a video
-//! request's latent samples: each modality's sample is a logical tensor of
-//! rows by channels, the rank holds some of its rows, and its values lie at
-//! an offset of the slot's pages (`uniserve.worker.video.plan.
-//! SampleLayout.storage`). The worker declares this as one storage of the
-//! copy manifest library (`::storage::manifest`): the slot's pages up to the
-//! last one holding a value ([`Stored::pages`]), each page a chunk keyed by
-//! the part of the samples it holds and where, with the trajectory's
-//! content ([`::storage::manifest::Storage::paged`]).
+//! A denoising rank's trajectory row holds the rank's part of a video
+//! request's latent samples, in pages of the units of its part of the host
+//! latent region: each modality's sample is a logical tensor of rows by
+//! channels, the rank holds some of its rows, and its values lie at an offset
+//! of the row's pages (`uniserve.worker.video.plan.SampleLayout.storage`).
+//! The worker declares this as one storage of the copy manifest library
+//! (`::storage::manifest`): the row's pages up to the last one holding a
+//! value, each page a chunk keyed by the part of the samples it holds and
+//! where, with the trajectory's content
+//! ([`::storage::manifest::Storage::paged`]).
 //!
-//! A rank that restores a trajectory stored by ranks of another parallel
+//! A rank that restores a trajectory saved by ranks of another parallel
 //! configuration (another Ulysses degree, other ranks) holds other rows at
-//! other offsets than any stored rank did. Its copies are the manifest from
-//! the stored ranks' pages it reads (the source epoch) to its own slot pages
-//! (a target world of one rank): a page the rank lays out as a stored rank
+//! other offsets than any saving rank did. Its copies are the manifest from
+//! the saving ranks' pages it reads (the source epoch) to its own row's pages
+//! (a target world of one rank): a page the rank lays out as a saving rank
 //! did has that page's key and is copied whole (a mapping, which host pages
 //! cannot be for device pages); every other region of the rank's samples is
-//! copied from the stored page that holds it, as byte runs split at the
-//! stored pages' bounds. Both epochs lie on the rank's GPU, which reads the
-//! host pool pages directly, so the manifest's one link is the GPU's to
-//! itself. The copies of a rank depend on the sources and its own pages
-//! alone, so ranks plan their own without agreeing on anything.
+//! copied from the saved page that holds it, as byte runs split at the saved
+//! pages' bounds. Both epochs lie on the rank's GPU, which reads the host
+//! pages directly, so the manifest's one link is the GPU's to itself. The
+//! copies of a rank depend on the sources and its own pages alone, so ranks
+//! compute their own without agreeing on anything.
 
 use ::storage::manifest::{self, Gpu, Manifest, StorageLayout};
 use ::storage::protocol::{Link, LinkBandwidth, LinkEnd};
 
 use crate::{Error, Result};
 
-/// A rank's request slot pages of one request: how they hold its samples
+/// A rank's pages of one request's trajectory: how they hold its samples
 /// and the bytes of one page.
-pub(crate) struct Stored {
-    pub(crate) layout: StorageLayout,
-    pub(crate) page_bytes: u64,
+pub struct Stored {
+    /// How the pages, back to back, hold the rank's part of the samples.
+    pub layout: StorageLayout,
+    /// The bytes of one page.
+    pub page_bytes: u64,
 }
 
-/// `bytes` bytes from byte `offset` of page `page` of stored rank `source`
-/// to byte `target` of the restoring rank's slot pages, which lie back to
+/// `bytes` bytes from byte `offset` of page `page` of saving rank `source`
+/// to byte `target` of the restoring rank's row, whose pages lie back to
 /// back.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct PageCopy {
-    pub(crate) source: usize,
-    pub(crate) page: u64,
-    pub(crate) offset: u64,
-    pub(crate) target: u64,
-    pub(crate) bytes: u64,
+pub struct PageCopy {
+    /// The saving rank, by its index in the sources.
+    pub source: usize,
+    /// The saving rank's page.
+    pub page: u64,
+    /// The first byte read in that page.
+    pub offset: u64,
+    /// The first byte written in the restoring rank's row.
+    pub target: u64,
+    /// The bytes copied.
+    pub bytes: u64,
 }
 
-/// The copies that fill `target`, the restoring rank's slot pages, from
-/// `sources`, the stored ranks' pages it reads, whose values are `content`
-/// (`ipc::LatentRestore::content`), on GPU `gpu`.
+/// The copies that fill `target`, the restoring rank's row, from `sources`,
+/// the saving ranks' pages it reads, whose values are `content` (the
+/// trajectory's key, `storage::key::latent_content`), on GPU `gpu`.
 ///
 /// Fails when a description is malformed, when the sources do not hold
 /// every element the target holds, or when the target holds padding or an
 /// encoding that a copy of bytes does not reproduce.
-pub(crate) fn copies(
+pub fn copies(
     sources: &[Stored],
     target: &Stored,
     content: [u8; 32],
@@ -90,14 +98,14 @@ pub(crate) fn copies(
             bytes_per_second: 1,
         }],
     };
-    let planned = Manifest::compute(&request).map_err(invalid)?;
-    if !planned.missing.is_empty() {
+    let computed = Manifest::compute(&request).map_err(invalid)?;
+    if !computed.missing.is_empty() {
         return Err(Error::Invalid(format!(
             "the stored pages do not hold every latent value of the rank: {:?}",
-            planned.missing
+            computed.missing
         )));
     }
-    if !(planned.stagings.is_empty() && planned.fills.is_empty()) {
+    if !(computed.stagings.is_empty() && computed.fills.is_empty()) {
         return Err(Error::Invalid(
             "a latent layout declares padding or an encoding that a byte copy does not \
              reproduce"
@@ -107,7 +115,7 @@ pub(crate) fn copies(
 
     let mut copies = Vec::new();
     // A target page that a stored page lays out alike is copied whole.
-    for mapping in &planned.mappings {
+    for mapping in &computed.mappings {
         let source = mapping.source_rank as usize;
         copies.push(PageCopy {
             source,
@@ -120,7 +128,7 @@ pub(crate) fn copies(
     // Every other region, as runs of bytes within one stored page each. The
     // target's pages lie back to back in the slot, so only the stored
     // pages' bounds split a run.
-    for copy in &planned.copies {
+    for copy in &computed.copies {
         let source = copy.source.rank as usize;
         let page_bytes = sources[source].page_bytes;
         for row in 0..copy.rows {

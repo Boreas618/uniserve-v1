@@ -1,67 +1,56 @@
-//! The host latent pool of a denoising rank (a video model's, or an image
-//! model's): the Storage Server page pool its preempted requests'
-//! trajectories are written to (`ipc::LatentOffload`), and the pools of the
-//! stored ranks a resumed request's trajectory is restored from
-//! (`ipc::LatentRestore`).
+//! The host latent region of a denoising rank (a video model's, or an image model's): where a
+//! preempted request's trajectory is saved and where it is restored from when the request
+//! resumes.
 //!
-//! A pool page is one page of the rank's latent banks: its values of a
-//! stored rank's own share of the trajectory (a video model's float32
-//! values; an image model's latent rows, each of the bank's width and
-//! element type), in the order its banks held them. The pool is the rank's:
-//! the same rank (its worker group and its rank) of every epoch of the
-//! deployment whose pages have that encoding maps it, whatever its parallel
-//! configuration, so an epoch that succeeds another finds the trajectories
-//! its predecessor stored, and it is sized for the trajectories that rank
-//! can have stored at once ([`pool_pages`]). A restore reads the pages of every stored rank on the
-//! host, so a rank also maps, on first use, the pools of the other ranks a
-//! trajectory was stored by ([`LatentHostPool::source`]). The engine
-//! decides which pages move and keys them; the rank only copies, on a copy
-//! stream of its device.
+//! A trajectory is its slot's row of the rank's trajectory rows ([`BufferMemory::trajectory`]):
+//! a video model's float32 values, or an image model's latent rows, each of the row's width and
+//! element type, in the order the row holds them. A `Save` copies the row into a block of the
+//! trajectory class, cached under the trajectory's key (`storage::key::latent_content`), and a
+//! `Restore` copies the block back into a slot's row ([`BufferMemory::copy`]).
+//!
+//! The region is one unit space with one part per rank index, which the Storage Server creates on
+//! the NUMA node closest to the rank's device (`storage::protocol::Request::HostPart`). A unit of
+//! a rank's part is one page of its trajectory row ([`BankPages`]), so a block of `n` units holds
+//! the first `n` pages of the row on every rank. The same rank of every epoch of the deployment
+//! that names the region maps the same part, whatever its parallel configuration, so an epoch
+//! that succeeds another finds the trajectories its predecessor saved; the region is sized for the
+//! trajectories that rank can have saved at once ([`pool_pages`]). The scheduler decides what is
+//! saved and restored and keys it; the rank only copies, on a stream of its device.
 
-use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use uniserve_tensor::DType;
 
-use ::storage::Key;
-use ::storage::protocol::PageShape;
-use ipc::{LatentPageCopy, LatentPoolInfo, LatentPoolRef};
-use platform::DeviceId;
-
-use crate::memory::allocation::{ElementType, StorageView};
-use crate::memory::host_pages::{self, HostPages};
-use crate::memory::retained::Retained;
+use crate::memory::buffers::BufferMemory;
+use crate::memory::client::StorageClient;
+use crate::memory::host_pages;
 use crate::{Error, Result};
 
-/// The version of the page encoding above: pages of another version are
-/// another shape.
+/// The version of the page encoding above: pages of another version are another layout.
 const PAGE_ENCODING: u32 = 1;
 
-/// The pages a rank's pool holds: every trajectory the rank can have
-/// stored at once, twice the trajectory pages of its banks.
+/// The units of the rank's part: every trajectory the rank can have saved at once, twice the
+/// trajectory pages of its rows.
 ///
-/// - One preemption (a park, a sleep, a weight update, a shrink of the KV
-///   cache) stores every trajectory the rank's banks hold: at most
-///   `pages.pages` pages, a video model's request slots' pages or the
-///   pages an image model's scheduler assigns its trajectories.
-/// - A stored trajectory is needed until the request's latent preparation
-///   restores it. A video request that resumes one is admitted before
-///   every request that starts one (`Scheduler::queue_media`), so the
-///   slots take the resumed requests first, and the trajectories an epoch
-///   still has to restore are at most those of its latest preemption.
-/// - An epoch on trial stores its own trajectories while the epoch it
-///   succeeds keeps the ones it stored, which a rollback restores: as many
-///   again.
+/// - One preemption (a park, a sleep, a weight update, a shrink of the KV cache) saves every
+///   trajectory the rank's rows hold: at most `pages.pages` pages, a video model's request slots'
+///   pages or the pages an image model's scheduler assigns its trajectories.
+/// - A saved trajectory is needed until the request's latent preparation restores it. A video
+///   request that resumes one is admitted before every request that starts one, so the slots take
+///   the resumed requests first, and the trajectories an epoch still has to restore are at most
+///   those of its latest preemption.
+/// - An epoch on trial saves its own trajectories while the epoch it succeeds keeps the ones it
+///   saved, which a rollback restores: as many again.
 ///
-/// A trajectory the pool evicted beyond that, as when requests reach the
-/// engine in another order, is a miss: its request starts from noise.
-fn pool_pages(pages: BankPages) -> u64 {
+/// A trajectory the region evicted beyond that, as when requests reach the engine in another
+/// order, is a miss: its request starts from noise.
+pub fn pool_pages(pages: BankPages) -> u64 {
     host_pages::resuming_pages(pages.pages)
 }
 
-/// The latent pages a rank holds trajectories in.
+/// The pages a rank holds trajectories in.
 #[derive(Debug, Clone, Copy)]
 pub struct BankPages {
     /// The element type of the values.
-    pub dtype: ElementType,
+    pub dtype: DType,
     /// The values one page holds.
     pub page_values: u32,
     /// The most pages one trajectory occupies.
@@ -72,39 +61,41 @@ pub struct BankPages {
 }
 
 impl BankPages {
-    /// The bytes of one page.
-    fn page_bytes(&self) -> u64 {
-        u64::from(self.page_values) * self.dtype.bytes() as u64
+    /// The bytes of one page: the bytes of every unit of the rank's part of the host latent
+    /// region.
+    ///
+    /// # Errors
+    ///
+    /// An element type narrower than a byte, or a page whose bytes overflow.
+    pub fn page_bytes(&self) -> Result<u64> {
+        ops::abi::bytes(self.dtype)
+            .and_then(|bytes| bytes.checked_mul(u64::from(self.page_values)))
+            .ok_or_else(|| {
+                Error::Invalid(format!(
+                    "a latent page of {} values of {} has no whole bytes",
+                    self.page_values,
+                    ops::abi::name(self.dtype)
+                ))
+            })
     }
 }
 
-/// The rank's host latent pool, mapped and registered for device copies,
-/// and the pools of other ranks it read stored pages from.
-pub struct LatentHostPool {
-    pool: LatentPoolRef,
-    pages: Arc<HostPages>,
-    retained: Arc<Retained>,
-    device: DeviceId,
-    /// The other ranks' pools mapped for restores, by pool.
-    sources: Mutex<HashMap<u64, Arc<HostPages>>>,
-}
-
-/// The digest of the byte layout of a pool's pages: the page encoding, the
-/// values' element type and the values of a page.
+/// The digest of the byte layout of a part's pages: the page encoding, the values' element type
+/// and the values of a page.
 fn layout(pages: &BankPages) -> [u8; 32] {
     let mut digest = ::storage::key::Digest::new(b"uniserve-latent-page-layout");
     digest.number(u64::from(PAGE_ENCODING));
-    digest.text(pages.dtype.name());
+    digest.text(ops::abi::name(pages.dtype));
     digest.number(u64::from(pages.page_values));
     digest.finish()
 }
 
-/// The digest of what determines the rank's share of every request's
-/// samples (`LatentPoolInfo::region`): the page encoding, the most pages a
-/// trajectory occupies and the statement of the rank's share (`region`: a
-/// video worker's statement of its plan and the rank's share of the
-/// denoiser).
-fn rank_region(pages: &BankPages, region: &str) -> [u8; 32] {
+/// The digest of what determines the rank's share of every request's samples: the byte layout of
+/// its pages, the most pages a trajectory occupies and `region`, the statement of the rank's share
+/// (a video worker's statement of its layout and the rank's share of the denoiser). Two ranks of
+/// one share lay every trajectory out alike, so a block one saved is a block the other restores
+/// byte for byte.
+pub fn share(pages: &BankPages, region: &str) -> [u8; 32] {
     let mut digest = ::storage::key::Digest::new(b"uniserve-latent-region");
     digest.bytes(&layout(pages));
     digest.number(u64::from(pages.trajectory_pages));
@@ -112,141 +103,20 @@ fn rank_region(pages: &BankPages, region: &str) -> [u8; 32] {
     digest.finish()
 }
 
-/// The digest that identifies the rank's pool (`PageShape::layout`): the
-/// byte layout of its pages, and the worker group and rank it serves, so
-/// that each rank maps a pool of its own, sized for its own trajectories,
-/// which the same rank of a succeeding epoch maps again whatever its
-/// parallel configuration.
-fn rank_pool(pages: &BankPages, scope: &::storage::Scope) -> [u8; 32] {
-    let mut key = ::storage::key::Digest::new(b"latent-pool");
-    key.bytes(&layout(pages));
-    key.text(&scope.group);
-    key.number(u64::from(scope.rank));
-    key.finish()
-}
+/// Maps the rank's part of the host latent region `region`, its number and its name, into
+/// `memory`: one page of `pages` of every unit, on the host NUMA node closest to the memory's
+/// device, so the copies between them cross no inter-node link. Returns the part's units.
+///
+/// # Errors
+///
+/// A page without whole bytes; as [`BufferMemory::map_part`].
+pub fn map_part(
+    memory: &mut BufferMemory,
+    client: &StorageClient,
+    region: (u8, &str),
+    pages: &BankPages,
+) -> Result<u32> {
+    let numa_node = memory.device().and_then(host_pages::numa_node);
 
-impl LatentHostPool {
-    /// Map the rank's latent pool for pages of its banks (`pages`) at its
-    /// host's Storage Server, registered with `device` and sized by
-    /// [`pool_pages`]. `identity` keys what the rank's denoising computes
-    /// (`Fingerprints::pages`), `region` states what determines the rank's
-    /// share of a request's samples, and `endpoint` is where an engine on
-    /// another host reaches the server. Returns the pool and what the rank
-    /// reports of it.
-    pub fn start(
-        retained: &Arc<Retained>,
-        device: DeviceId,
-        pages: BankPages,
-        identity: &str,
-        region: &str,
-        endpoint: Option<&str>,
-    ) -> Result<(Self, LatentPoolInfo)> {
-        let page_bytes = pages.page_bytes();
-        // The pool lies on the host NUMA node closest to the device, so the
-        // copies between them cross no inter-node link.
-        let numa_node = host_pages::numa_node(device);
-        let shape = PageShape {
-            layout: Key(rank_pool(&pages, retained.scope())),
-            kv_head_offset: 0,
-            kv_head_count: 0,
-            page_bytes,
-        };
-        let mapped = HostPages::map(
-            retained,
-            device,
-            shape,
-            numa_node,
-            Some(pool_pages(pages) * page_bytes),
-            "the host latent pool",
-        )?;
-        let pool = LatentPoolRef {
-            pool: mapped.pool(),
-            shape: shape.layout.0,
-            numa_node,
-            page_bytes,
-        };
-        let info = LatentPoolInfo {
-            pool,
-            trajectory_pages: pages.trajectory_pages,
-            region: rank_region(&pages, region),
-            identity: identity.to_owned(),
-            endpoint: endpoint.map(str::to_owned),
-        };
-        Ok((
-            Self {
-                pool,
-                pages: Arc::new(mapped),
-                retained: Arc::clone(retained),
-                device,
-                sources: Mutex::new(HashMap::new()),
-            },
-            info,
-        ))
-    }
-
-    /// The host address of the pool slot `copy` names, after checking that
-    /// it is this pool's.
-    pub(crate) fn address(&self, copy: &LatentPageCopy) -> Result<u64> {
-        if copy.pool != self.pool.pool {
-            return Err(Error::Invalid(format!(
-                "latent pool {} is not this rank's pool {}",
-                copy.pool, self.pool.pool
-            )));
-        }
-        self.pages.address(copy.host_page)
-    }
-
-    /// The bytes of one page of the rank's pool.
-    pub(crate) fn page_bytes(&self) -> u64 {
-        self.pool.page_bytes
-    }
-
-    /// The `uint8 [page_bytes]` view of slot `slot` of `pool`, a pool of
-    /// the rank's host that holds stored pages a restore reads: the rank's
-    /// own, or another rank's, which is mapped on first use and kept for
-    /// later restores.
-    ///
-    /// Fails when the server holds no such pool or the slot lies outside
-    /// it.
-    pub(crate) fn source(&self, pool: &LatentPoolRef, slot: u64) -> Result<StorageView> {
-        let pages = if pool.pool == self.pool.pool {
-            Arc::clone(&self.pages)
-        } else {
-            let mut sources = self
-                .sources
-                .lock()
-                .map_err(|_| Error::State("the latent source pools' lock is poisoned"))?;
-            match sources.get(&pool.pool) {
-                Some(pages) => Arc::clone(pages),
-                None => {
-                    let shape = PageShape {
-                        layout: Key(pool.shape),
-                        kv_head_offset: 0,
-                        kv_head_count: 0,
-                        page_bytes: pool.page_bytes,
-                    };
-                    // The pool holds pinned pages, so the server finds it;
-                    // a pool of another identity is not the one named.
-                    let found = HostPages::map(
-                        &self.retained,
-                        self.device,
-                        shape,
-                        pool.numa_node,
-                        None,
-                        "another rank's host latent pool",
-                    )?;
-                    if found.pool() != pool.pool {
-                        return Err(Error::Invalid(format!(
-                            "latent pool {} is no longer at the storage server",
-                            pool.pool
-                        )));
-                    }
-                    let found = Arc::new(found);
-                    sources.insert(pool.pool, Arc::clone(&found));
-                    found
-                }
-            }
-        };
-        pages.view(slot)
-    }
+    memory.map_part(client, region, pages.page_bytes()?, numa_node)
 }

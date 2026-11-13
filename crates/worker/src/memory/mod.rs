@@ -8,11 +8,14 @@
 //! | Module | Holds |
 //! | --- | --- |
 //! | [`allocation`] | [`Storage`](allocation::Storage): one allocation the rank owns or maps, and the tensor over a window of it that execution lends to a forward |
+//! | [`buffers`] | [`BufferMemory`](buffers::BufferMemory): a rank's media memory (its product buffer, its slots' trajectory rows and its parts of the host encoder and latent regions), lent by the runs of the rank's device block tables, and the copies between them |
 //! | [`cache`] | [`KvCacheMemory`](cache::KvCacheMemory): the KV cache's planes, pooled page tables, host tier and scratch pages, lent to a causal forward as `nn::KvPlanes` and page-table tensors |
 //! | [`client`] | [`StorageClient`](client::StorageClient): the rank's connection to the Storage Server, the exclusive storages it takes there and its share of each GPU's quota |
 //! | [`exclusive`] | [`ExclusiveStorage`](exclusive::ExclusiveStorage): how an owner takes exclusive storage, at the server or local to the process |
 //! | [`host_pages`] | [`HostPages`](host_pages::HostPages): a rank's mapping of one host page pool |
+//! | [`encoders`] | The host encoder region: the size of its units and of the rank's part |
 //! | [`division`] | How a GPU's quota is divided when a rank starts: the weights, the runners' regions, the scratch pool, the storages sized by request slots, and the cache's units from what remains |
+//! | [`latent`] | The host latent region: the size of its units and of the rank's part, and the copy manifest of a trajectory saved under another parallel configuration |
 //! | [`graph_pool`] | [`GraphPool`](graph_pool::GraphPool): the runners' regions and the scratch pool of one device, mapped at fixed addresses and reserved in the GPU's quota |
 //! | [`weights`] | [`WeightStore`](weights::WeightStore): the retained weights of one device, which `nn::WeightLoader` publishes to and maps from |
 //! | [`reload`] | A second load of a serving model: its order compared with the one that serves, and the load that publishes what changed for an update in place |
@@ -27,27 +30,31 @@
 //! modules and graphs of a rank hold addresses that an update in place keeps while it changes
 //! the bytes behind them.
 //!
-//! **Exclusive storages** have one writer: the cache planes, the encoder cache and the latent
-//! buffers. Their owner takes them by name and length, resets what was created for it and
-//! keeps what a predecessor left, and lends windows of them to forwards as
-//! `backend::external` tensors.
+//! **Exclusive storages** have one writer: the cache planes. Their owner takes them by name and
+//! length, resets what was created for it and keeps what a predecessor left, and lends windows
+//! of them to forwards as `backend::external` tensors.
 //!
-//! Host page pools are the third kind of storage the server keeps for a rank: host memory of
-//! equal pages, which the rank maps, registers for device copies and copies pages to and from.
+//! Host page pools and the rank's parts of the buffer pool's host regions are the third kind of
+//! storage the server keeps for a rank: host memory of equal pages or units, which the rank
+//! maps, registers for device copies and copies to and from.
 //!
 //! ## What the process maps itself
 //!
 //! The memory a forward computes in is the process's own and is not retained: one region per
-//! runner, which its captured graphs address, and the scratch pool. The rank reserves it in
-//! the same quota, so the division of a GPU counts it beside the server's storages.
+//! runner, which its captured graphs address, the scratch pool, and the resident pool, which
+//! holds the recurrent state and the rank's media memory. The rank reserves it in the same
+//! quota, so the division of a GPU counts it beside the server's storages.
 
 pub mod allocation;
+pub mod buffers;
 pub mod cache;
 pub mod client;
 pub mod division;
+pub mod encoders;
 pub mod exclusive;
 pub mod graph_pool;
 pub mod host_pages;
+pub mod latent;
 pub mod reload;
 pub mod state;
 pub mod tables;

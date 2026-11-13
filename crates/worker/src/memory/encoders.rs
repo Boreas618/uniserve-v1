@@ -1,57 +1,46 @@
-//! The host encoder pool of a rank that executes encoder calls: the Storage
-//! Server page pool holding encoder outputs (a video prompt's text
-//! conditioning, its vision features, its condition latents; an image's
-//! vision and latent features), each keyed by what the encoder read and what
-//! computes it (`ipc::HostOutput`).
+//! The host encoder region: where the encoder outputs a rank computes (a video prompt's text
+//! conditioning, its vision features, its condition latents; an image's vision and latent
+//! features) are kept on the host, each a block of the encoder-output class cached under the key
+//! of what the encoder read and what computes it (`storage::key::encoder_output`).
 //!
-//! The pool is the deployment's on the rank's host: every rank there that
-//! executes an encoder maps the same pool, in every epoch of the
-//! deployment, so an output one rank or epoch stored is found by another
-//! that computes the same, and a resumed request's encoders read their
-//! outputs instead of computing them again. A stored output takes the pages
-//! its bytes fill, rows in order; the engine decides what is stored and
-//! keys it, and a rank only copies the rows of its calls' outputs, on the
-//! stream of the encoder that writes them.
-
-use ::storage::Key;
-use ::storage::protocol::PageShape;
-use ipc::{EncoderPoolInfo, HostPoolInfo};
-use platform::DeviceId;
+//! The region is the deployment's on the rank's host: the Storage Server creates one part per
+//! rank index (`storage::protocol::Request::HostPart`), which every epoch of the deployment that
+//! names the region maps, so an output one epoch stored is found by another that computes the
+//! same, and a resumed request's encoders read their outputs instead of computing them again. A
+//! stored output takes the consecutive units its bytes fill, [`PAGE_BYTES`] each on the rank's
+//! part, rows in order. The scheduler decides what is stored and loaded and keys it; the rank only
+//! copies, between its product buffer and its part ([`BufferMemory::copy`]).
 
 use crate::Result;
-use crate::memory::allocation::StorageView;
-use crate::memory::host_pages::HostPages;
-use crate::memory::retained::Retained;
+use crate::memory::buffers::BufferMemory;
+use crate::memory::client::StorageClient;
 
-/// The version of the page encoding: an output's bytes, rows in order,
-/// in consecutive pages.
+/// The version of the unit encoding: an output's bytes, rows in order, in consecutive units.
 const PAGE_ENCODING: u32 = 1;
 
-/// The bytes of one page. A stored output's last page holds the remainder of
-/// its bytes, so the pool's pages exceed the outputs' bytes by less than a
-/// page each.
+/// The bytes of one unit of a rank's part. A stored output's last unit holds the remainder of its
+/// bytes, so the region's units exceed the outputs' bytes by less than a unit each.
 pub const PAGE_BYTES: u64 = 256 << 10;
 
-/// The pages the pool holds: the encoder outputs of every request whose
-/// outputs can be needed at once, `largest` holding each output of a request
-/// at its largest bytes (a video request's outputs; the vision and latent
-/// features of one image of an image request).
+/// The units the region holds: the encoder outputs of every request whose outputs can be needed
+/// at once, `largest` holding each output of a request at its largest bytes (a video request's
+/// outputs; the vision and latent features of one image of an image request).
 ///
-/// A request's outputs are needed while it is in flight, to be read again
-/// when it resumes. An epoch runs at most `request_slots` requests at once,
-/// and as many preempted ones wait to resume (a video request that resumes
-/// is admitted before every request that starts, `Scheduler::queue_media`):
-/// twice the request slots' outputs. An image request reads and generates
-/// images mostly smaller than the largest, whose features take fewer
-/// pages. An output evicted beyond that is a miss, and its encoder computes
-/// it again.
+/// A request's outputs are needed while it is in flight, to be read again when it resumes. An
+/// epoch runs at most `request_slots` requests at once, and as many preempted ones wait to resume
+/// (a video request that resumes is admitted before every request that starts): twice the request
+/// slots' outputs. An image request reads and generates images mostly smaller than the largest,
+/// whose features take fewer units. An output evicted beyond that is a miss, and its encoder
+/// computes it again.
 pub fn pool_pages(largest: &[u64], request_slots: usize) -> u64 {
     let request: u64 = largest.iter().map(|bytes| bytes.div_ceil(PAGE_BYTES)).sum();
     crate::memory::host_pages::resuming_pages(request_slots as u64 * request)
 }
 
-/// The pool layout identifier: its domain, encoding version and page size.
-fn layout() -> [u8; 32] {
+/// The digest of the byte layout of the region's units: its domain, the unit encoding's version
+/// and the unit's bytes. Two epochs whose regions have one layout hold outputs alike, so the
+/// region's name carries it and an encoding of another version names another region.
+pub fn layout() -> [u8; 32] {
     let mut key = [0; 32];
     key[..16].copy_from_slice(b"encoder-pages\0\0\0");
     key[16..20].copy_from_slice(&PAGE_ENCODING.to_le_bytes());
@@ -59,86 +48,39 @@ fn layout() -> [u8; 32] {
     key
 }
 
-/// The rank's view of its host's encoder pool, mapped and registered for
-/// device copies.
-pub struct EncoderHostPool {
-    pages: HostPages,
+/// Maps the rank's part of the host encoder region `region`, its number and its name, into
+/// `memory`, [`PAGE_BYTES`] of every unit. Returns the part's units.
+///
+/// # Errors
+///
+/// As [`BufferMemory::map_part`].
+pub fn map_part(
+    memory: &mut BufferMemory,
+    client: &StorageClient,
+    region: (u8, &str),
+) -> Result<u32> {
+    // Ranks of one index share the part across epochs whose devices may lie on other NUMA
+    // nodes, so it names none.
+    memory.map_part(client, region, PAGE_BYTES, None)
 }
 
-impl EncoderHostPool {
-    /// Map the host's encoder pool at its Storage Server, registered with
-    /// `device`, holding `pages` pages when the rank creates it.
-    /// `identities` names what computes each encoder output the rank writes
-    /// (the weights' values and the modules' identities), and `endpoint` is
-    /// where an engine on another host reaches the server. Returns the pool
-    /// and what the rank reports of it.
-    pub fn start(
-        retained: &Retained,
-        device: DeviceId,
-        pages: u64,
-        identities: std::collections::BTreeMap<String, String>,
-        endpoint: Option<&str>,
-    ) -> Result<(Self, EncoderPoolInfo)> {
-        let shape = PageShape {
-            layout: Key(layout()),
-            kv_head_offset: 0,
-            kv_head_count: 0,
-            page_bytes: PAGE_BYTES,
-        };
-        // The host's ranks share the pool across their NUMA nodes, so it
-        // names none.
-        let pages = HostPages::map(
-            retained,
-            device,
-            shape,
-            None,
-            Some(pages * PAGE_BYTES),
-            "the host encoder pool",
-        )?;
-        let info = EncoderPoolInfo {
-            pages: HostPoolInfo {
-                pool: pages.pool(),
-                shape: pages.shape(),
-                endpoint: endpoint.map(str::to_owned),
-                conversion: None,
-            },
-            identities,
-        };
-        Ok((Self { pages }, info))
-    }
-
-    /// The pool's identity at its Storage Server.
-    pub(crate) fn pool(&self) -> u64 {
-        self.pages.pool()
-    }
-
-    /// The bytes of one page.
-    pub(crate) fn page_bytes(&self) -> u64 {
-        self.pages.page_bytes()
-    }
-
-    /// The `uint8 [page_bytes]` view of pool slot `slot`.
-    pub(crate) fn view(&self, slot: u64) -> Result<StorageView> {
-        self.pages.view(slot)
-    }
-}
-
-/// One copy between a call's output and a page of its stored output: the
-/// byte offset in the output, the page's index in the stored output, the
-/// byte offset in the page and the bytes copied.
+/// One copy between a call's output and a unit of its stored output.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct PageCopy {
-    pub(crate) output: u64,
-    pub(crate) page: usize,
-    pub(crate) offset: u64,
-    pub(crate) bytes: u64,
+pub struct PageCopy {
+    /// The byte offset in the call's output.
+    pub output: u64,
+    /// The unit's index in the stored output's run.
+    pub page: usize,
+    /// The byte offset in the unit.
+    pub offset: u64,
+    /// The bytes copied.
+    pub bytes: u64,
 }
 
-/// The copies of a call's output rows `rows` (call-local, end exclusive)
-/// whose output holds the stored output's rows from `first` on, rows of
-/// `row_bytes` bytes, in pages of `page_bytes`: the rows' bytes split at
-/// the page boundaries they cross.
-pub(crate) fn page_copies(
+/// The copies of a call's output rows `rows` (call-local, end exclusive) whose output holds the
+/// stored output's rows from `first` on, rows of `row_bytes` bytes, in units of `page_bytes`: the
+/// rows' bytes split at the unit boundaries they cross.
+pub fn page_copies(
     first: u32,
     rows: std::ops::Range<u64>,
     row_bytes: u64,
@@ -167,12 +109,12 @@ pub(crate) fn page_copies(
 mod tests {
     use super::*;
 
-    /// A round's rows of a stored output split at every page boundary they
-    /// cross, each piece at its place in the call's output and in its page.
+    /// A round's rows of a stored output split at every unit boundary they cross, each piece at
+    /// its place in the call's output and in its unit.
     #[test]
     fn a_rounds_rows_split_at_the_page_boundaries() {
-        // Rows of 3 bytes from stored row 2 on, pages of 8 bytes: stored
-        // bytes 6..15 cross the boundary at 8.
+        // Rows of 3 bytes from stored row 2 on, units of 8 bytes: stored bytes 6..15 cross the
+        // boundary at 8.
         let copies = page_copies(2, 0..3, 3, 8);
         assert_eq!(
             copies,
