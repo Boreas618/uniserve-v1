@@ -30,6 +30,15 @@ def test_an_attention_kernel_matches_its_reference_on_the_interpreter(check):
 
 
 @pytest.mark.gpu
+def test_the_kv_write_rounds_into_every_cache_type_on_the_device():
+    """The roundings into a BF16 cache need a device.
+
+    The interpreter truncates a cast into BF16.
+    """
+    on_device(FAMILY / "kv_write_check.py", "--device")
+
+
+@pytest.mark.gpu
 @pytest.mark.parametrize("mask", ["causal", "dense"])
 def test_the_f32_dense_attention_matches_its_reference(mask):
     on_device(

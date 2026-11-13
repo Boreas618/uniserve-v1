@@ -24,9 +24,10 @@
 //! ```
 //!
 //! [`kv_write_`] is the write that precedes it: it scatters a batch's keys and values into the
-//! slots the scheduler assigned them. A cache whose planes are E4M3 holds each page divided by
-//! the page's own FP32 scale, which the write derives from the values it stores and the read
-//! multiplies back.
+//! slots the scheduler assigned them. A dense cache may hold another of BF16, F16 and F32 than
+//! the projections, and the write rounds each element into it to nearest even. A cache whose
+//! planes are E4M3 holds each page divided by the page's own FP32 scale, which the write derives
+//! from the values it stores and the read multiplies back.
 //!
 //! The element types of the tensors decide the kernel, so an FP32 attention is the same function
 //! over FP32 tensors; the widths and head counts are the tensors' own extents.
@@ -716,9 +717,12 @@ fn paged_formula(
 /// `layer` of `cache`, in place: token `t` into slot `slot_mapping[t]` of both planes, raising
 /// the flag of every page that receives a row. A slot of [`NO_SLOT`] writes nothing.
 ///
-/// The planes' element type decides the write. Planes of the projections' own type receive the
-/// rows as they are, both planes in one launch. E4M3 planes receive them quantized, one launch
-/// per plane, each page by its own scale:
+/// The planes' element type decides the write. Dense planes, BF16, F16 or F32 in both, receive
+/// the rows rounded once into their type, to nearest even, both planes in one launch: planes of
+/// the projections' own type receive them as they are, and a BF16 model's F16 cache receives
+/// each element at F16's nearest value. The rounding is the scatter's own store, so a cache of
+/// another type than the projections costs no pass of its own. E4M3 planes receive the rows
+/// quantized, one launch per plane, each page by its own scale:
 ///
 /// ```text
 /// proposed = max(|rows written to the page|) / 448
@@ -733,9 +737,9 @@ fn paged_formula(
 /// # Errors
 ///
 /// A cache of another page size than the batch's, projections that are not the batch's tokens
-/// of the planes' heads or that are strided views (the kernels address a token's row from the
-/// tensor's first element), planes that are neither the projections' type nor E4M3 in both, an
-/// E4M3 plane without its page scales, or the operator's refusal.
+/// of the planes' heads, that are strided views (the kernels address a token's row from the
+/// tensor's first element) or that differ in type, planes that are neither one dense type in
+/// both nor E4M3 in both, an E4M3 plane without its page scales, or the operator's refusal.
 pub fn kv_write_(
     cache: &KvCache,
     layer: usize,
@@ -788,23 +792,38 @@ pub fn kv_write_(
         ));
     }
 
-    // A cache of the projections' own type is a scatter of both planes in one launch, and an
-    // E4M3 cache is the quantizing write. A cache of any other type, or one whose planes differ,
-    // has no kernel that fills it and no reader that could interpret it.
-    if planes.key.dtype() != key.dtype() || planes.value.dtype() != value.dtype() {
-        if planes.key.dtype() != DType::F8E4M3 || planes.value.dtype() != DType::F8E4M3 {
+    // Both writes take one source type for the keys and the values, as each kernel is compiled
+    // for one.
+    if key.dtype() != value.dtype() {
+        return Err(Error::shape(
+            OWNER,
+            format!(
+                "the keys are {} and the values {}: the cache write reads one element type",
+                ops::abi::name(key.dtype()),
+                ops::abi::name(value.dtype())
+            ),
+        ));
+    }
+
+    // Dense planes of one type are a scatter of both planes in one launch, rounding into the
+    // planes' type, and E4M3 planes are the quantizing write. Planes of two types, or of a type
+    // that is neither, have no kernel that fills them and no reader that could interpret them.
+    let dense = |dtype| matches!(dtype, DType::BF16 | DType::F16 | DType::F32);
+    match (planes.key.dtype(), planes.value.dtype()) {
+        (DType::F8E4M3, DType::F8E4M3) => return write_scaled(planes, slots, page, key, value),
+        (keys, values) if keys == values && dense(keys) => {}
+        (keys, values) => {
             return Err(Error::shape(
                 OWNER,
                 format!(
-                    "the cache is {} keys and {} values over {} projections: a cache is the \
-                     projections' own type or E4M3 in both planes",
-                    ops::abi::name(planes.key.dtype()),
-                    ops::abi::name(planes.value.dtype()),
+                    "the cache is {} keys and {} values over {} projections: a cache is bf16, \
+                     f16 or f32 in both planes, or E4M3 in both",
+                    ops::abi::name(keys),
+                    ops::abi::name(values),
                     ops::abi::name(key.dtype())
                 ),
             ));
         }
-        return write_scaled(planes, slots, page, key, value);
     }
 
     if on_cpu(key) {
@@ -812,7 +831,9 @@ pub fn kv_write_(
             (&planes.key, &planes.key_initialized, key),
             (&planes.value, &planes.value_initialized, value),
         ] {
-            scatter_rows(plane, slots, rows)?;
+            // The kernel's store: each element rounded once, to nearest even, from its exact
+            // value into the plane's type, which leaves a row of the plane's own type as it is.
+            scatter_rows(plane, slots, &rows.to_dtype(plane.dtype())?)?;
             raise_flags(flags, &pages_of(slots, page)?)?;
         }
         return Ok(());
@@ -853,8 +874,8 @@ fn write_scaled(
 ) -> Result<()> {
     let (tokens, heads, head_dim) = key.dims3()?;
 
-    // One descriptor serves both planes: the projections are one element type, and a value of
-    // another is refused by the operator.
+    // One descriptor serves both planes: the projections are one element type, which
+    // `kv_write_` has checked.
     let descriptor = kv::ScaledWriteDescriptor {
         dtype: key.dtype(),
         scale: DType::F32,

@@ -5,8 +5,9 @@
 #
 # One program writes one tile of one token's cache row and raises the page's
 # initialization flag, so one module serves every token count. The cache's dtype
-# equals the keys' here; an FP8 page needs a per-page scale the operator's
-# arguments do not carry, so no descriptor declares one yet.
+# is the keys' own or another of BF16, FP16 and FP32, each element rounded to
+# nearest even into it by the store; an FP8 page needs a per-page scale this
+# operator does not carry, and is `kv_write_scaled`'s.
 
 op = "kv_write"
 backend = "triton"

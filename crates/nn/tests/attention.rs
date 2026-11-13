@@ -541,6 +541,84 @@ fn an_fp8_cache_scales_each_page_by_the_rows_it_holds() {
     assert_close(&values(&attended), &expected, F32_TOLERANCE);
 }
 
+/// A dense cache of another type than the projections holds each element rounded once into its
+/// type, to nearest even, with ties to the even neighbour: a BF16 model's F16 cache, and an F32
+/// model's BF16 one. Every source value below is exact in the source type, and its expected
+/// value is the nearest one of the cache's type, worked out by hand.
+#[test]
+fn a_dense_cache_of_another_type_holds_each_element_at_its_nearest_value() {
+    let row = KV_HEADS * DIM;
+    // F16's smallest subnormal, and BF16's unit in the last place at one.
+    let tiny = 2f32.powi(-24);
+    let unit = 2f32.powi(-7);
+
+    // Values F16 holds exactly stay as they are; below F16's normal range its subnormals are
+    // coarser than BF16, and a source between two of them takes the nearer.
+    let bf16_into_f16 = [
+        (1.5, 1.5),
+        (-2.25, -2.25),
+        (0.75 * tiny, tiny),
+        (0.25 * tiny, 0.0),
+        (0.5 * tiny, 0.0),
+        (1.5 * tiny, 2.0 * tiny),
+        (-1.5 * tiny, -2.0 * tiny),
+        (2.5 * tiny, 2.0 * tiny),
+    ];
+    // BF16 keeps seven fraction bits: a tie at one goes to one, a tie at one unit up goes to two
+    // units up, and anything off the middle goes to the nearer side.
+    let f32_into_bf16 = [
+        (1.0 + unit / 2.0, 1.0),
+        (1.0 + 1.5 * unit, 1.0 + 2.0 * unit),
+        (1.0 + unit / 4.0, 1.0),
+        (1.0 + 0.75 * unit, 1.0 + unit),
+        (-(1.0 + unit / 2.0), -1.0),
+        (0.5, 0.5),
+    ];
+
+    for (source, plane, pairs) in [
+        (DType::BF16, DType::F16, &bf16_into_f16[..]),
+        (DType::F32, DType::BF16, &f32_into_bf16[..]),
+    ] {
+        let cache = cache(plane, &[0, 1], 1);
+        let planes = &cache.layers[0];
+
+        // Two tokens, into page 1 then page 0; the values are the keys negated.
+        let keys: Vec<f32> = pairs
+            .iter()
+            .map(|pair| pair.0)
+            .cycle()
+            .take(2 * row)
+            .collect();
+        let expected: Vec<f32> = pairs
+            .iter()
+            .map(|pair| pair.1)
+            .cycle()
+            .take(2 * row)
+            .collect();
+        let negated = |x: &[f32]| x.iter().map(|x| -x).collect::<Vec<f32>>();
+        let prefill = batch(PhaseKind::Prefill, &[5, 2], &[2], &[0, 2]);
+        functional::kv_write_(
+            &cache,
+            0,
+            &prefill,
+            &tensor(&keys, (2, KV_HEADS, DIM), source),
+            &tensor(&negated(&keys), (2, KV_HEADS, DIM), source),
+        )
+        .unwrap();
+
+        // The planes keep their type, each token's row is at its slot, and every other slot is
+        // as the cache's owner left it.
+        assert_eq!((planes.key.dtype(), planes.value.dtype()), (plane, plane));
+        let mut stored = vec![0.0; PAGES * PAGE as usize * row];
+        stored[5 * row..6 * row].copy_from_slice(&expected[..row]);
+        stored[2 * row..3 * row].copy_from_slice(&expected[row..]);
+        assert_eq!(values(&planes.key), stored, "{source:?} into {plane:?}");
+        assert_eq!(values(&planes.value), negated(&stored));
+        assert_eq!(values(&planes.key_initialized), [1.0, 1.0, 0.0]);
+        assert_eq!(values(&planes.value_initialized), [1.0, 1.0, 0.0]);
+    }
+}
+
 #[test]
 fn the_cache_functions_refuse_what_no_kernel_reads() {
     let prefill = batch(PhaseKind::Prefill, &[0, 1], &[2], &[0, 2]);
@@ -594,8 +672,8 @@ fn the_cache_functions_refuse_what_no_kernel_reads() {
     let short = functional::paged_attention(&query, &prefill, &plain, 0, 0.5, None, 2);
     assert!(short.unwrap_err().to_string().contains("shorter than"));
 
-    // A layer the group does not hold, a strided projection and a cache of a third type have
-    // no write.
+    // A layer the group does not hold, a strided projection, keys and values of two types, and
+    // planes of two types or of a type no write fills have no write.
     assert!(functional::kv_write_(&plain, 1, &prefill, &key, &key).is_err());
 
     let wide = tensor(
@@ -607,14 +685,34 @@ fn the_cache_functions_refuse_what_no_kernel_reads() {
     let refused = functional::kv_write_(&plain, 0, &prefill, &strided, &key);
     assert!(refused.unwrap_err().to_string().contains("strided view"));
 
-    let narrow = cache(DType::BF16, &[0], 1);
-    let refused = functional::kv_write_(&narrow, 0, &prefill, &key, &key);
+    let half = key.to_dtype(DType::BF16).unwrap();
+    let refused = functional::kv_write_(&plain, 0, &prefill, &key, &half);
     assert!(
         refused
             .unwrap_err()
             .to_string()
-            .contains("own type or E4M3")
+            .contains("one element type")
     );
+
+    let mut mixed = cache(DType::BF16, &[0], 1);
+    mixed.layers[0].value = Tensor::zeros(
+        (PAGES, PAGE as usize, KV_HEADS, DIM),
+        DType::F16,
+        &Device::Cpu,
+    )
+    .unwrap();
+    let mut integer = cache(DType::F32, &[0], 1);
+    integer.layers[0].key = Tensor::zeros(
+        (PAGES, PAGE as usize, KV_HEADS, DIM),
+        DType::I32,
+        &Device::Cpu,
+    )
+    .unwrap();
+    integer.layers[0].value = integer.layers[0].key.zeros_like().unwrap();
+    for cache in [mixed, integer] {
+        let refused = functional::kv_write_(&cache, 0, &prefill, &key, &key);
+        assert!(refused.unwrap_err().to_string().contains("in both planes"));
+    }
 }
 
 /// A meta batch of `tokens` tokens in one row over 64-token pages.
@@ -693,6 +791,19 @@ fn the_cache_writes_key_the_plane_type_and_the_reads_key_the_phase() {
             ),
         ]
     );
+
+    // A dense cache of another type is the same one scatter, compiled for the pair of types:
+    // the rounding into the cache is the kernel's store, not a launch of its own.
+    let converted = paged_launches(PhaseKind::Prefill, 8, DType::F16);
+    assert_eq!(
+        converted[0],
+        (
+            "kv_write",
+            "dtype_bf16_kv_f16_page_64_heads_4_head_dim_128_tile_128_pdl_false".to_owned()
+        )
+    );
+    assert_eq!(converted.len(), 2);
+    assert!(converted[1].1.contains("_dtype_bf16_kv_f16_out_bf16_"));
 
     // An E4M3 cache is the quantizing write, one launch per plane, and another attention
     // kernel.

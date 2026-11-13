@@ -15,12 +15,18 @@
 //! flag is raised when a page receives its first element: the owner of a page zeroes only storage
 //! it created, and a reader must not read a page before it is initialized.
 //!
+//! A **dense cache** (BF16, F16 or F32) may hold another element type than the keys and values: a
+//! BF16 model may keep an F16 cache, and an F32 model a BF16 one. `kv_write` rounds each element once
+//! into the cache's type, to nearest even, as it stores it; a cache of the keys' own type receives
+//! them unchanged. The rounding is the store's own, so a narrower cache costs no pass of its own and
+//! a source of the cache's type is a plain copy.
+//!
 //! An **FP8 cache** is filled by a scaled write instead: the same scatter, with each element divided by
 //! the page's own scale and rounded to E4M3 on the way in. That scale is one `[pages, 1, 1, 1]` f32
 //! per plane, the same buffer the read side multiplies back, and the write derives it from the values
 //! it is about to store rather than receiving it.
-//! Splitting the two writes is what keeps the storage decision (which element type the cache holds)
-//! out of the scatter that does not care: `kv_write` stays exact and has no scale operand.
+//! Splitting the two writes is what keeps the scale out of the scatter that does not need one:
+//! `kv_write` has no scale operand, and two implementations of it agree bit for bit.
 
 use std::fmt;
 
@@ -39,11 +45,11 @@ use crate::{Error, Op, Result, Twins};
 pub struct Descriptor {
     /// Element type of the keys and values being written.
     pub dtype: DType,
-    /// Element type of the cache.
+    /// Element type of the cache: BF16, F16 or F32, the keys' own or another of the three.
     ///
-    /// It is the source's own: this operator moves values, it does not encode them. An FP8 cache is
-    /// filled by [`KvWriteScaled`], which divides by the page's scale on the way in, and a launch that
-    /// asks this one for a narrower cache is refused rather than writing values no reader could
+    /// Each element is rounded once into it, to nearest even, as it is stored. An FP8 cache is
+    /// filled by [`KvWriteScaled`], which divides by the page's scale on the way in, and a launch
+    /// that asks this one for an FP8 cache is refused rather than writing values no reader could
     /// interpret (a reader of an FP8 plane multiplies by a scale this operator would not have
     /// applied).
     pub kv: DType,
@@ -107,15 +113,17 @@ impl Op for KvWrite {
         // The token count is the first extent of a `[tokens, heads, head_dim]` view; `rows()` is the
         // product of every extent but the last and would count tokens times heads.
         let tokens = args.key.dim(0);
-        // The cache is filled in the source's type. An FP8 cache needs the page's scale applied
-        // first, which is the scaled write's job: allowing it here would write values that a reader
-        // multiplies by a scale they never had applied, which is wrong by orders of magnitude
-        // rather than by a rounding.
-        if descriptor.kv != descriptor.dtype {
+        // The source and the cache are dense: a store into a dense cache is one rounding of each
+        // element. An FP8 cache needs the page's scale applied first, which is the scaled write's
+        // job: allowing it here would write values that a reader multiplies by a scale they never
+        // had applied, which is wrong by orders of magnitude rather than by a rounding.
+        let dense = |dtype| matches!(dtype, DType::BF16 | DType::F16 | DType::F32);
+        if !dense(descriptor.dtype) || !dense(descriptor.kv) {
             return Err(Error::argument(
                 Self::NAME,
                 format!(
-                    "this writes a {} cache from {} values; an FP8 cache is filled by kv_write_scaled",
+                    "this writes a bf16, f16 or f32 cache from bf16, f16 or f32 values, not a {} \
+                     cache from {} values; an FP8 cache is filled by kv_write_scaled",
                     abi::name(descriptor.kv),
                     abi::name(descriptor.dtype)
                 ),
@@ -230,8 +238,9 @@ impl Op for KvWrite {
     }
 
     fn tolerance(_descriptor: &Self::Descriptor) -> Tolerance {
-        // A scatter of values, possibly rounded once into the cache's element type by the kernel
-        // itself; two implementations that use the same rounding agree bit for bit.
+        // A scatter of values, rounded once into the cache's element type to nearest even when it
+        // is not the source's; the rounding of one value is a function of that value alone, so two
+        // implementations agree bit for bit.
         Tolerance::exact()
     }
 }
