@@ -12,7 +12,7 @@
 //! | [`cache`] | [`KvCacheMemory`](cache::KvCacheMemory): the KV cache's planes, pooled page tables, host tier and scratch pages, lent to a causal forward as `nn::KvPlanes` and page-table tensors |
 //! | [`client`] | [`StorageClient`](client::StorageClient): the rank's connection to the Storage Server, the exclusive storages it takes there and its share of each GPU's quota |
 //! | [`exclusive`] | [`ExclusiveStorage`](exclusive::ExclusiveStorage): how an owner takes exclusive storage, at the server or local to the process |
-//! | [`host_pages`] | [`HostPages`](host_pages::HostPages): a rank's mapping of one host page pool |
+//! | [`host_pages`] | [`HostPart`](host_pages::HostPart): a rank's mapping of its part of one host region |
 //! | [`encoders`] | The host encoder region: the size of its units and of the rank's part |
 //! | [`division`] | How a GPU's quota is divided when a rank starts: the weights, the runners' regions, the scratch pool, the storages sized by request slots, and the cache's units from what remains |
 //! | [`latent`] | The host latent region: the size of its units and of the rank's part, and the copy manifest of a trajectory saved under another parallel configuration |
@@ -30,13 +30,15 @@
 //! modules and graphs of a rank hold addresses that an update in place keeps while it changes
 //! the bytes behind them.
 //!
-//! **Exclusive storages** have one writer: the cache planes. Their owner takes them by name and
-//! length, resets what was created for it and keeps what a predecessor left, and lends windows
-//! of them to forwards as `backend::external` tensors.
+//! **Exclusive storages** are the rank's scope's own: the cache planes, the memory of a buffer
+//! pool region, which every epoch that names the region maps writable while the buffer pool
+//! keeps the blocks they write apart. Their owner takes them by name and length, resets what was
+//! created for it and keeps what exists, and lends windows of them to forwards as
+//! `backend::external` tensors.
 //!
-//! Host page pools and the rank's parts of the buffer pool's host regions are the third kind of
-//! storage the server keeps for a rank: host memory of equal pages or units, which the rank
-//! maps, registers for device copies and copies to and from.
+//! The rank's parts of the buffer pool's host regions are the third kind of storage the server
+//! keeps for a rank: host memory of equal units, which the rank maps, registers for device
+//! copies and copies to and from.
 //!
 //! ## What the process maps itself
 //!

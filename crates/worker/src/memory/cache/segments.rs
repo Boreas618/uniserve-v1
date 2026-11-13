@@ -1,12 +1,15 @@
 //! The segments a device cache's value planes are made of.
 //!
 //! Each value plane is made of segments along the units, each column's part of a segment one
-//! allocation, mapped back to back so the plane keeps its layout and addresses. An epoch's own
-//! units come first, split into at most [`SEGMENTS`] segments; an epoch that succeeds another on
-//! the same devices maps, after them, the segments its predecessor holds, read-only. The last
-//! segments are given back to the device when a successor epoch needs their storage, or all of
-//! them while the deployment sleeps, and created again at their addresses afterwards; the engine
-//! allocates none of their units meanwhile.
+//! allocation, mapped back to back so the plane keeps its layout and addresses. The segments are
+//! the memory of the cache's buffer pool region: the epoch that creates the region splits its
+//! units into at most [`SEGMENTS`] segments ([`own`]), and every other epoch that names the
+//! region maps the same segments, as the region's segment table states them ([`of_table`]). The
+//! last segments are given back to the device when a region of another layout needs their
+//! storage, or all of them while the deployment sleeps, and created again at their addresses
+//! afterwards; the buffer pool gives none of their units to a block meanwhile.
+
+use crate::{Error, Result};
 
 /// The most segments an epoch splits its own units into: the granularity in which the cache
 /// gives storage back, an eighth of it.
@@ -17,8 +20,6 @@ pub const SEGMENTS: u32 = 8;
 pub struct PlaneSegment {
     /// The segment: the epoch that created its storage, its ordinal there and its units.
     pub segment: ipc::CacheSegment,
-    /// Whether the predecessor epoch writes the segment: it is mapped read-only.
-    pub inherited: bool,
     /// Whether the rank creates the segment when its storage does not exist; one that is not
     /// created is left unmapped, as a segment given back.
     pub create: bool,
@@ -99,25 +100,45 @@ pub fn own(
                     ordinal,
                     units,
                 },
-                inherited: false,
                 create: true,
             })
             .collect(),
     )
 }
 
-/// The exact segments a rank's planes were made of: as the serving rank of a standby's scope
-/// holds them, or as an epoch's rank held them before its relaunch. None is inherited, and the
-/// segments past the ones held are left unmapped.
-pub fn adopted(table: &ipc::CacheTable) -> Vec<PlaneSegment> {
+/// The segments of a region's memory as its segment table states them
+/// (`storage::runtime::Opened::segments`): the segments an epoch's ranks created, which a rank
+/// of every epoch that names the region maps at the same units. Every rank that maps the
+/// region holds its parts of each segment of the table; a part the Storage Server does not hold
+/// is created.
+///
+/// # Errors
+///
+/// A table that does not lay its segments back to back from unit 0, which the planes' layout
+/// requires.
+pub fn of_table(table: &[(storage::Segment, u32, u32)]) -> Result<Vec<PlaneSegment>> {
+    let mut next = 0;
+
     table
-        .segments
         .iter()
-        .enumerate()
-        .map(|(index, segment)| PlaneSegment {
-            segment: *segment,
-            inherited: false,
-            create: (index as u32) < table.held,
+        .map(|(segment, first, units)| {
+            if *first != next || *units == 0 {
+                return Err(Error::Invalid(format!(
+                    "the region's segment {}/{} holds {units} units from unit {first}, and the \
+                     planes' segments lie back to back from unit 0: the next is at unit {next}",
+                    segment.epoch, segment.ordinal
+                )));
+            }
+            next += units;
+
+            Ok(PlaneSegment {
+                segment: ipc::CacheSegment {
+                    epoch: segment.epoch,
+                    ordinal: segment.ordinal,
+                    units: *units,
+                },
+                create: true,
+            })
         })
         .collect()
 }
@@ -125,26 +146,6 @@ pub fn adopted(table: &ipc::CacheTable) -> Vec<PlaneSegment> {
 /// The units `segments` hold.
 pub fn units(segments: &[PlaneSegment]) -> u32 {
     segments.iter().map(|part| part.segment.units).sum()
-}
-
-/// The units of the segments the predecessor writes, `[start, end)`: from the first inherited
-/// segment's first unit to the last one's end. Empty when none is inherited.
-pub fn inherited(segments: &[PlaneSegment]) -> std::ops::Range<u32> {
-    let mut range = 0..0;
-    let mut first = 0;
-
-    for part in segments {
-        let end = first + part.segment.units;
-        if part.inherited {
-            range = if range.is_empty() {
-                first..end
-            } else {
-                range.start..end
-            };
-        }
-        first = end;
-    }
-    range
 }
 
 #[cfg(test)]
@@ -169,10 +170,9 @@ mod tests {
         assert_eq!(segment_layout(512, plane, granule), Some((8, 64)));
     }
 
-    /// An epoch's own segments are equal and numbered from zero; adopted ones are exactly the
-    /// table's, created as far as they are held.
+    /// An epoch's own segments are equal and numbered from zero, and created where missing.
     #[test]
-    fn own_segments_split_the_units_and_adopted_ones_follow_the_table() {
+    fn own_segments_split_the_units() {
         let segments = own(7, 512, 1 << 16, 1 << 21).expect("512 units split into eight");
         assert_eq!(segments.len(), 8);
         assert_eq!(units(&segments), 512);
@@ -182,33 +182,42 @@ mod tests {
                 .enumerate()
                 .all(|(ordinal, part)| part.segment.epoch == 7
                     && part.segment.ordinal == ordinal as u32
-                    && part.create
-                    && !part.inherited)
+                    && part.create)
         );
-        assert!(inherited(&segments).is_empty());
-
-        let table = ipc::CacheTable {
-            segments: segments.iter().map(|part| part.segment).collect(),
-            held: 3,
-        };
-        let taken = adopted(&table);
-        assert_eq!(taken.iter().filter(|part| part.create).count(), 3);
     }
 
-    /// The inherited units are the range the predecessor's segments span.
+    /// A rank of another epoch that names the region lays its planes out from the region's
+    /// segment table: the segments the creating epoch's ranks made, each with the identity that
+    /// keys its parts, so both epochs map the same storages.
     #[test]
-    fn the_inherited_units_span_the_predecessors_segments() {
-        let part = |ordinal: u32, inherited: bool| PlaneSegment {
-            segment: ipc::CacheSegment {
-                epoch: u64::from(inherited),
-                ordinal,
-                units: 64,
-            },
-            inherited,
-            create: !inherited,
-        };
+    fn a_region_s_table_gives_the_segments_its_creating_epoch_made() -> Result<()> {
+        let made = own(3, 512, 1 << 16, 1 << 21).expect("512 units split into eight");
+        let mut first = 0;
+        let table: storage::runtime::Segments = made
+            .iter()
+            .map(|part| {
+                let entry = (
+                    storage::Segment {
+                        epoch: part.segment.epoch,
+                        ordinal: part.segment.ordinal,
+                    },
+                    first,
+                    part.segment.units,
+                );
+                first += part.segment.units;
+                entry
+            })
+            .collect();
 
-        let segments = [part(0, false), part(1, false), part(0, true), part(1, true)];
-        assert_eq!(inherited(&segments), 128..256);
+        assert_eq!(of_table(&table)?, made);
+        assert!(of_table(&[])?.is_empty());
+
+        // A table whose segments do not lie back to back from unit 0 lays out no planes.
+        let refused = of_table(&[table[0], table[2]])
+            .expect_err("a table with a gap")
+            .to_string();
+        assert!(refused.contains("segment 3/2"), "{refused}");
+        assert!(of_table(&table[1..]).is_err());
+        Ok(())
     }
 }

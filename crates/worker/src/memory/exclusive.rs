@@ -1,13 +1,15 @@
-//! Exclusive storage: device storage with one writer, as its owner takes it.
+//! Exclusive storage: device storage no other owner of the rank's scope uses, as its owner takes
+//! it.
 //!
 //! An owner whose contents outlive the engine's process takes its storage through
-//! [`ExclusiveStorage`] instead of allocating it: the cache planes, the encoder cache and the
-//! latent buffers. Two things implement the interface. The rank's
+//! [`ExclusiveStorage`] instead of allocating it: the cache planes, which are the memory of a
+//! buffer pool region. Two things implement the interface. The rank's
 //! [`StorageClient`](crate::memory::client::StorageClient) takes each storage at the host's
-//! Storage Server, keyed by the epoch that created it and what fixes its shape, so a restarted
-//! engine of the same scope and epoch maps what its predecessor left. [`LocalStorage`]
-//! allocates the same storages in the process, where they end with it: the form of a process
-//! that serves no deployment, such as a test or a tool.
+//! Storage Server, keyed by the region's memory and what fixes its shape, so every epoch that
+//! names the region, and a restarted engine of the same scope, maps the same storage; every
+//! one of them maps it writable, and the buffer pool keeps the blocks they write apart.
+//! [`LocalStorage`] allocates the same storages in the process, where they end with it: the
+//! form of a process that serves no deployment, such as a test or a tool.
 //!
 //! A segmented storage is one address range whose parts are retained apart, so part of it is
 //! given back and created again while every address stays valid: the value planes of a KV
@@ -21,8 +23,8 @@ use storage::Key;
 use crate::memory::allocation::Storage;
 use crate::{Error, Result};
 
-/// One exclusive device storage an owner takes: its name, its device and its length, which key
-/// it at the Storage Server.
+/// One exclusive device storage an owner takes: its name, its device, its length and the epoch
+/// of its region's memory, which key it at the Storage Server.
 #[derive(Debug, Clone, Copy)]
 pub struct ExclusiveConfig<'a> {
     /// The storage's name within the rank's scope, such as `prefix_cache.key.values`.
@@ -33,6 +35,11 @@ pub struct ExclusiveConfig<'a> {
     pub bytes: usize,
     /// Other local devices that address the storage.
     pub access: &'a [DeviceId],
+    /// The epoch whose ranks created the memory of the region the storage belongs to, as the
+    /// region's segment table states it (the epoch of its first segment): it keys the storage,
+    /// so every epoch that maps the region maps the same storage. `None` for a storage of no
+    /// segmented region, which the rank's own epoch keys.
+    pub epoch: Option<u64>,
 }
 
 /// One exclusive device storage of segments, each part retained on its own
@@ -66,9 +73,6 @@ pub struct SegmentPart {
     pub column: u32,
     /// The segment: the epoch that created its storage and its ordinal there.
     pub segment: ipc::CacheSegment,
-    /// Whether the segment is the predecessor epoch's: it is mapped read-only and never created
-    /// here.
-    pub inherited: bool,
     /// Whether the part is created when its storage does not exist; one that is not is left
     /// unmapped, as a segment given back.
     pub create: bool,
@@ -79,10 +83,10 @@ pub trait ExclusiveStorage {
     /// One storage per config, in order, mapped read-write, each with whether it was created
     /// for the owner.
     ///
-    /// A created storage's contents are uninitialized, and its owner resets them. One a
-    /// predecessor left holds the finite values that predecessor last wrote, which the owner
-    /// keeps: a standby's predecessor still serves from them, and the target epoch of a switch
-    /// reads the pages they hold.
+    /// A created storage's contents are uninitialized, and its owner resets them. One that
+    /// exists holds the finite values last written to it, which the owner keeps: another epoch
+    /// that names the region may serve from them, and a restarted engine reads the pages they
+    /// hold.
     fn exclusive(&self, configs: &[ExclusiveConfig<'_>]) -> Result<Vec<(Arc<Storage>, bool)>>;
 
     /// The key the Storage Server retains the storage of `config` under and the UUID of its
@@ -94,7 +98,7 @@ pub trait ExclusiveStorage {
     /// owner (its contents are uninitialized).
     ///
     /// A part left unmapped ([`Storage::segment_mapped`]) is one whose `create` is unset and
-    /// whose storage does not exist, or one a standby's predecessor gave back.
+    /// whose storage does not exist.
     fn segmented(&self, config: &SegmentedConfig<'_>) -> Result<(Arc<Storage>, Vec<bool>)>;
 
     /// The key the Storage Server retains part `index` of `config` under and the UUID of its
@@ -148,12 +152,6 @@ impl ExclusiveStorage for LocalStorage {
     }
 
     fn segmented(&self, config: &SegmentedConfig<'_>) -> Result<(Arc<Storage>, Vec<bool>)> {
-        if config.parts.iter().any(|part| part.inherited) {
-            return Err(Error::Invalid(
-                "storage local to a process inherits no other epoch's segments".into(),
-            ));
-        }
-
         let storage = Storage::segmented(config.device, &config.lengths(), config.access)?;
         for (index, part) in config.parts.iter().enumerate() {
             if part.create {

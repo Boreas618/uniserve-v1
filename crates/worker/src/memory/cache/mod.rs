@@ -5,14 +5,15 @@
 //! module is the rank's side. [`KvCacheMemory`] owns:
 //!
 //! - the **planes** ([`planes`]): the unit pool's exclusive storage at the host's Storage
-//!   Server, with each plane's initialization flag and, for an FP8 cache, its scale, and the
-//!   index keys of a model whose attention reads the tokens an indexer selects;
+//!   Server, the memory of the cache's buffer pool region, with each plane's initialization
+//!   flag and, for an FP8 cache, its scale, and the index keys of a model whose attention reads
+//!   the tokens an indexer selects;
 //! - the **pooled page tables** ([`tables`]): one per attention group, the device copy of the
 //!   group's entries of the rank's device block table, which a forward gathers its rows from;
 //! - the **attention workspace**, which the paged-attention kernel uses during a forward;
-//! - the **host tier** ([`host`]): the host page pools pages are loaded from and stored to
-//!   on the rank's copy stream, with the converted loads ([`conversion`]) of a cache that
-//!   admits them;
+//! - the **host tier** ([`host`]): the rank's parts of the host regions of the cache groups'
+//!   pages, which pages are loaded from and stored to on the rank's copy stream, with the
+//!   converted loads ([`conversion`]) of a cache that admits them;
 //! - the **scratch pages** ([`scratch`]) a shadow forward writes.
 //!
 //! A model reads and writes none of this directly: the runner that holds the cache lends it for
@@ -44,6 +45,15 @@
 //! The class of cache group `g` is class `g` of the buffer pool, and the classes past the
 //! cache groups are no cache's.
 //!
+//! ## Two epochs of one region
+//!
+//! Every storage of the planes is keyed by the region's memory, so a cache that another epoch
+//! opens from the region's segment table ([`segments::of_table`]) addresses the same cells:
+//! values, flags, scales, index keys and state planes. Nothing of the cache is copied or handed
+//! over at an epoch switch (`specs/updates.md` §3.4): the buffer pool keeps the two epochs'
+//! blocks apart, and the units it gives an epoch are reset by that epoch's
+//! [`KvCacheMemory::apply`] before a batch writes them.
+//!
 //! ## Index tensors
 //!
 //! Page tables and unit ids are `u32`. A pooled table never holds `nn::NO_SLOT`: a page a row
@@ -62,7 +72,7 @@ mod tables;
 use std::collections::BTreeSet;
 use std::sync::Arc;
 
-use ipc::{HostPoolInfo, PrefixCacheInfo};
+use ipc::{PoolConversion, PrefixCacheInfo};
 use nn::{KvCache, KvPlanes};
 use platform::{DeviceId, Event, Stream};
 use storage::runtime::Run;
@@ -180,7 +190,8 @@ pub struct KvCacheMemory {
     regions: Option<CacheRegions>,
     /// The attention workspace on the device; `None` for a cache that holds no device.
     workspace: Option<Arc<Storage>>,
-    /// The host tier, once the engine sized it ([`Self::map_host_tier`]).
+    /// The host tier, once the rank's parts of the host regions are mapped
+    /// ([`Self::map_host_parts`]).
     host: Option<HostTier>,
     /// The scratch pages of shadow forwards, once opened ([`Self::open_scratch`]).
     scratch: Option<ScratchPages>,
@@ -418,10 +429,8 @@ impl KvCacheMemory {
     }
 
     /// The cache as the rank reports it to the engine: its layout, units, plane runs and
-    /// segments. The rank adds its page pools, identities and endpoint.
+    /// segments. The rank adds its identities and endpoint.
     pub fn info(&self) -> PrefixCacheInfo {
-        let inherited = self.planes.inherited();
-
         PrefixCacheInfo {
             plane_runs: self.planes.runs().to_vec(),
             segments: self
@@ -430,8 +439,6 @@ impl KvCacheMemory {
                 .map(<[_]>::to_vec)
                 .unwrap_or_default(),
             held_segments: self.planes.held_segments(),
-            inherited_start: inherited.start,
-            inherited_units: inherited.end - inherited.start,
             ..self.config.layout.info(self.config.units)
         }
     }
@@ -534,25 +541,26 @@ impl KvCacheMemory {
         Ok(())
     }
 
-    /// Maps the cache's host tier: a page pool of `tokens` tokens per cache group at the
+    /// Maps the cache's host tier: the rank's part of each cache group's host region at the
     /// rank's host's Storage Server through `client`, whose copies run on `stream`, the rank's
-    /// copy stream. A cache that admits converted loads also takes its source buffers and
-    /// conversion scratch, and launches its conversions with `kernels`. Returns what the rank
-    /// reports of each pool, in group order; `endpoint` is where an engine on another host
-    /// reaches the server.
+    /// copy stream. `regions` names, per cache group, the host region of its pages as the
+    /// session's layout states it (unit `u` of the region is page `u` of the group), or `None`
+    /// for a group whose pages have no host copy; the open session must state them. A cache
+    /// that admits converted loads also takes its source buffers and conversion scratch, and
+    /// launches its conversions with `kernels`. Returns what the rank reports of each group's
+    /// converted loads, in group order; empty for a cache that converts none.
     ///
     /// # Errors
     ///
-    /// A cache that holds no device, or one whose host tier is mapped already; the server's
-    /// refusal.
-    pub fn map_host_tier(
+    /// A cache that holds no device, one whose host tier is mapped already, or regions stated
+    /// for another number of cache groups; the server's refusal.
+    pub fn map_host_parts(
         &mut self,
         client: &StorageClient,
+        regions: &[Option<&str>],
         stream: Stream,
-        endpoint: Option<&str>,
-        tokens: u64,
         kernels: Arc<ops::Generation>,
-    ) -> Result<Vec<HostPoolInfo>> {
+    ) -> Result<Vec<PoolConversion>> {
         let device = self.planes.device_id().ok_or(Error::State(
             "the cache holds no device: it maps no host tier",
         ))?;
@@ -561,6 +569,14 @@ impl KvCacheMemory {
         }
 
         let layout = &self.config.layout;
+        if regions.len() != layout.groups.len() {
+            return Err(Error::Invalid(format!(
+                "host regions stated for {} cache groups of a cache of {}",
+                regions.len(),
+                layout.groups.len()
+            )));
+        }
+
         let conversion =
             Conversion::open(client, layout, device, self.config.width, &stream, kernels)?;
         let (conversion, converted) = match conversion {
@@ -568,14 +584,10 @@ impl KvCacheMemory {
             None => (None, Vec::new()),
         };
 
-        let (tier, mut pools) =
-            HostTier::map(client, layout, device, endpoint, tokens, stream, conversion)?;
-        for (pool, converted) in pools.iter_mut().zip(converted) {
-            pool.conversion = Some(converted);
-        }
-
-        self.host = Some(tier);
-        Ok(pools)
+        self.host = Some(HostTier::map(
+            client, layout, device, regions, stream, conversion,
+        )?);
+        Ok(converted)
     }
 
     /// The bytes one token of the cache's pages takes in the host tier, over every group.
@@ -820,48 +832,15 @@ impl KvCacheMemory {
         self.planes.restore_segments(owner, stream, limit)
     }
 
-    /// Gives back the segments from `first` on, through `owner`: a successor epoch needs
-    /// their storage. The scheduler withdrew their units and no device work addresses them.
+    /// Gives back the segments from `first` on, through `owner`: a region of another layout
+    /// needs their storage. The buffer pool withdrew their units and no device work addresses
+    /// them.
     ///
     /// # Errors
     ///
-    /// For planes that are not split, for segments the predecessor epoch writes, or when
-    /// `owner` fails.
+    /// For planes that are not split, or when `owner` fails.
     pub fn release_segments(&mut self, first: u32, owner: &dyn ExclusiveStorage) -> Result<()> {
         self.planes.release_segments(first, owner)
-    }
-
-    /// Adopts the predecessor epoch's pages in the units `units` (half-open ranges): the value
-    /// planes are the predecessor's segments, mapped whole, so its pages lie at their own
-    /// units, and what is copied is their flags, scales and index keys, from the predecessor's
-    /// storages into this rank's, as a task of the host's Transfer Server. Returns the units
-    /// copied: none for a standby, whose storages are the predecessor's.
-    ///
-    /// # Errors
-    ///
-    /// A cache that holds no device; the server's refusal or the task's failure, after which
-    /// the caller adopts none of the units.
-    pub fn adopt(&self, client: &StorageClient, units: &[[u32; 2]]) -> Result<u32> {
-        let device = self.planes.device_id().ok_or(Error::State(
-            "the cache holds no device: it adopts no pages",
-        ))?;
-
-        let mut storages: Vec<(&str, u64)> = planes::FLAGS.iter().map(|name| (*name, 1)).collect();
-        if self.config.layout.quantized {
-            storages.extend(planes::SCALES.iter().map(|name| (*name, 4)));
-        }
-        let index_bytes = self.config.layout.index_bytes();
-        if index_bytes > 0 {
-            storages.push((planes::INDEX_KEYS, index_bytes));
-        }
-
-        client.copy_predecessor_cells(
-            device,
-            &storages,
-            self.config.layout.columns,
-            self.config.units,
-            units,
-        )
     }
 
     /// The pages a scratch set of `bytes` of the device's scratch pool holds

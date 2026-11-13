@@ -16,13 +16,16 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
+use ipc::PrefixCacheDtype;
 use nn::{Checkpoint, DType, RetainedWeights, Shape, Tensor, WeightKey, WeightLoader};
 use platform::DeviceId;
 use storage::{Claim, Client, Role, Scope};
 use storage_server::Server;
 use uniserve_tensor::DeviceLocation;
+use worker::memory::cache::{CacheLayout, KvCacheConfig, KvCacheMemory, segments};
 use worker::memory::client::StorageClient;
 use worker::memory::reload::{MetaWeights, Reload, paired};
+use worker::memory::tables::Change;
 use worker::memory::weights::WeightStore;
 
 /// The deployment, worker group and epoch the device tests' rank belongs to.
@@ -240,47 +243,18 @@ fn rank(server: &StorageServer) -> (Client, Arc<StorageClient>) {
     let mut head = head(server);
     let claim = head.claim(EPOCH, vec![scope()], Vec::new()).unwrap();
 
-    let client =
-        StorageClient::connect(&launch(server, claim, EPOCH, false), GROUP, 0, 1, None).unwrap();
+    let client = StorageClient::connect(&launch(server, claim, EPOCH, false), GROUP, 0, 1).unwrap();
     (head, client)
 }
 
 /// A rank connects to its host's Storage Server under the claim its deployment's head holds,
-/// and makes requests as its scope. It keys the exclusive storages it takes by its own epoch;
-/// a standby keys them by the epoch of the worker it stands by for, whose storages it maps.
+/// and makes requests as its scope.
 #[test]
-fn a_rank_keys_its_exclusive_storages_by_its_epoch_and_a_standby_by_its_predecessor_s() {
+fn a_rank_connects_under_its_heads_claim_as_its_scope() {
     let server = StorageServer::start();
-    let mut head = head(&server);
-    let claim = head.claim(EPOCH, vec![scope()], Vec::new()).unwrap();
-
-    let serving =
-        StorageClient::connect(&launch(&server, claim, EPOCH, false), GROUP, 0, 1, None).unwrap();
+    let (_head, serving) = rank(&server);
     assert_eq!(serving.scope(), &scope());
-    assert_eq!((serving.epoch(), serving.storage_epoch()), (EPOCH, EPOCH));
-
-    // The head adds the next epoch under the claim it holds; the rank of that epoch that
-    // succeeds the serving one keys its own storages, and its standby the serving rank's.
-    let next = EPOCH + 1;
-    let claim = head.claim(next, vec![scope()], Vec::new()).unwrap();
-    let successor = StorageClient::connect(
-        &launch(&server, claim, next, false),
-        GROUP,
-        0,
-        2,
-        Some(EPOCH),
-    )
-    .unwrap();
-    let standby = StorageClient::connect(
-        &launch(&server, claim, next, true),
-        GROUP,
-        0,
-        2,
-        Some(EPOCH),
-    )
-    .unwrap();
-    assert_eq!((successor.epoch(), successor.storage_epoch()), (next, next));
-    assert_eq!((standby.epoch(), standby.storage_epoch()), (next, EPOCH));
+    assert_eq!(serving.epoch(), EPOCH);
 
     // A request on the connection reaches the server as the rank's: the deployment it lists
     // is the one the rank's scope names.
@@ -409,4 +383,124 @@ fn an_update_in_place_puts_the_changed_weights_at_the_serving_addresses() {
         device_bytes(&embed, device),
         embed_bytes(DEVICE_ROWS, 100.0)
     );
+}
+
+/// `bytes` bytes at `address` of device memory, copied to the host on `stream`.
+fn read_device(address: u64, bytes: usize, stream: &platform::Stream) -> Vec<u8> {
+    let mut read = vec![0_u8; bytes];
+
+    // SAFETY: the caller names bytes of a storage it keeps mapped, which no work writes while
+    // the stream copies them; the vector holds them and is read after the synchronization.
+    unsafe { platform::memcpy_async(read.as_mut_ptr() as u64, address, bytes, stream).unwrap() };
+    stream.synchronize().unwrap();
+    read
+}
+
+/// Writes `bytes` to device memory at `address` on `stream`.
+fn write_device(address: u64, bytes: &[u8], stream: &platform::Stream) {
+    // SAFETY: the caller names bytes of a storage it keeps mapped, which no other work
+    // addresses; the host bytes are read before the stream is synchronized.
+    unsafe { platform::memcpy_async(address, bytes.as_ptr() as u64, bytes.len(), stream).unwrap() };
+    stream.synchronize().unwrap();
+}
+
+/// The KV caches a rank of each of two epochs opens over one region address the same cells:
+/// the second lays its planes out from the region's segment table, as the answer to `Open`
+/// states it, and maps every storage the first created, the flags and the FP8 scales included.
+/// A flag and a scale one cache writes the other reads, and a unit the buffer pool gives the
+/// second epoch is reset where both read it, with nothing copied between them.
+#[test]
+#[ignore = "requires a GPU"]
+fn two_epochs_of_one_region_address_the_same_flags_and_scales() {
+    let device = DeviceId(0);
+    let stream = platform::Stream::new(device).unwrap();
+    let server = StorageServer::start();
+    let mut head = head(&server);
+    let claim = head.claim(EPOCH, vec![scope()], Vec::new()).unwrap();
+    // The serving epoch is committed, so the epoch on trial beside it sees what it published.
+    head.publish(vec![EPOCH]).unwrap();
+    let next = EPOCH + 1;
+    head.claim(next, vec![scope()], Vec::new()).unwrap();
+    let serving =
+        StorageClient::connect(&launch(&server, claim, EPOCH, false), GROUP, 0, 1).unwrap();
+    let target = StorageClient::connect(&launch(&server, claim, next, false), GROUP, 0, 2).unwrap();
+
+    // An FP8 cache whose planes split into segments of whole granules.
+    let layout = Arc::new(
+        CacheLayout::dense(64, 2, 2, 256, PrefixCacheDtype::Float8E4m3Fn)
+            .validated()
+            .unwrap(),
+    );
+    let granularity = platform::DeviceAllocation::granularity(device).unwrap() as u64;
+    let units = segments::segmented_units(512, layout.plane_bytes, granularity);
+    let config = |segments| KvCacheConfig {
+        layout: Arc::clone(&layout),
+        units,
+        slots: 2,
+        width: 4,
+        segments,
+        workspace_bytes: 1 << 20,
+    };
+
+    // The serving epoch's rank creates the region's memory; the target's maps it from the
+    // segment table the buffer pool keeps of it.
+    let made = segments::own(EPOCH, units, layout.plane_bytes, granularity);
+    assert!(made.is_some(), "the planes split");
+    let first = KvCacheMemory::open(config(made), device, &*serving, &stream).unwrap();
+    let mut unit = 0;
+    let table: storage::runtime::Segments = first
+        .segments()
+        .unwrap()
+        .iter()
+        .map(|segment| {
+            let stated = (
+                storage::Segment {
+                    epoch: segment.epoch,
+                    ordinal: segment.ordinal,
+                },
+                unit,
+                segment.units,
+            );
+            unit += segment.units;
+            stated
+        })
+        .collect();
+    let mapped = segments::of_table(&table).unwrap();
+    let mut second = KvCacheMemory::open(config(Some(mapped)), device, &*target, &stream).unwrap();
+
+    // Both state the same storage and offset for every field of every unit.
+    let (runs, theirs) = (first.info().plane_runs, second.info().plane_runs);
+    assert!(runs.iter().any(|run| run.field.contains("initialized")));
+    assert!(runs.iter().any(|run| run.field.contains("scale")));
+    assert_eq!(runs, theirs);
+
+    // A flag and a scale of unit 6, written through the serving epoch's tensors, are what the
+    // target's tensors read.
+    let address = |cache: &KvCacheMemory| {
+        let layer = cache.planes(0).unwrap().remove(1);
+        let scale = layer.value_scale.expect("an FP8 cache states its scales");
+        let start = |tensor: &Tensor| backend::operand(tensor).unwrap().ptr.address();
+
+        // The cells of layer 1's column are `[units]`: a byte of flag, four of scale, per unit.
+        (start(&layer.key_initialized) + 6, start(&scale) + 6 * 4)
+    };
+    let ((flag, scale), (their_flag, their_scale)) = (address(&first), address(&second));
+    write_device(flag, &[1], &stream);
+    write_device(scale, &2.0_f32.to_le_bytes(), &stream);
+    assert_eq!(read_device(their_flag, 1, &stream), [1]);
+    assert_eq!(read_device(their_scale, 4, &stream), 2.0_f32.to_le_bytes());
+
+    // The buffer pool gives unit 6 to a block of the target: its executor resets the unit, and
+    // the serving epoch's tensors read the reset cells.
+    let allocated = Change {
+        slot: 1,
+        class: 0,
+        position: 0,
+        run: Some((0, 6, 1)),
+        reset: true,
+    };
+    second.apply(&[allocated], Some(&stream)).unwrap();
+    stream.synchronize().unwrap();
+    assert_eq!(read_device(flag, 1, &stream), [0]);
+    assert_eq!(read_device(scale, 4, &stream), 1.0_f32.to_le_bytes());
 }

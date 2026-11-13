@@ -236,12 +236,6 @@ impl Storage {
         Ok(lock(self.segments()?).import(index, descriptor)?)
     }
 
-    /// Maps segment `index` read-only from the descriptor of storage another epoch writes: a
-    /// fault of this process cannot change its bytes.
-    pub fn import_segment_read_only(&self, index: usize, descriptor: &OwnedFd) -> Result<()> {
-        Ok(lock(self.segments()?).import_protected(index, descriptor, Protection::ReadOnly)?)
-    }
-
     /// Unmaps segment `index` at once, as its storage is given back. The caller has retired
     /// every device access to it.
     pub fn release_segment(&self, index: usize) -> Result<()> {

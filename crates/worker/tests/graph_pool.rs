@@ -106,7 +106,7 @@ fn rank(server: &StorageServer) -> (Client, Arc<StorageClient>) {
         standby: false,
         standby_storage: ipc::StandbyStorage::default(),
     };
-    let client = StorageClient::connect(&launch, GROUP, 0, 1, None).unwrap();
+    let client = StorageClient::connect(&launch, GROUP, 0, 1).unwrap();
     (head, client)
 }
 

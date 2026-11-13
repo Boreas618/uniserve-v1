@@ -243,8 +243,8 @@ pub fn remainder(
 /// (`kv_cache_config.max_tokens`), which sizes the planes instead of the remainder and is
 /// refused, not trimmed, when the remainder cannot hold it.
 ///
-/// A rank that adopts the planes of the epoch it stands by for divides nothing for them: the
-/// quota reserves them already, and its count is the adopted planes'.
+/// A rank that maps the planes of a region another epoch created divides nothing for them: the
+/// quota reserves them already, and its count is the region's segment table's.
 ///
 /// # Errors
 ///

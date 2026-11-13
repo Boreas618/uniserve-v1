@@ -11,8 +11,13 @@
 //! | `prefix_cache.index_key.values` (index keys only) | bytes | `[columns, units, index_bytes]` |
 //! | `prefix_cache.state.{run}.values` (state group only) | bytes | `[columns, units, plane_bytes]` |
 //!
-//! The names key the storages at the Storage Server, where a successor epoch and a restarted
-//! engine find them, so they stay as they are whatever this module is called.
+//! The names key the storages at the Storage Server, where every epoch that names the cache's
+//! region and a restarted engine find them, so they stay as they are whatever this module is
+//! called. Every storage of the planes is the memory of the region: the value planes' segments are
+//! keyed by the segments the region's segment table names, and the other storages by the epoch
+//! of its first segment, the epoch whose ranks created the region's memory. Two epochs of one
+//! layout therefore address the same cells, and the executor that is given a unit resets its
+//! flags and scales before a batch writes it ([`Planes::reset_units`]).
 //!
 //! An attention group's page is one unit and each of its layers one column, so a layer's keys
 //! are the contiguous `[units, block_size, kv_heads, head_dim]` of its column and a page id is
@@ -23,10 +28,8 @@
 //!
 //! On a device whose cache splits ([`super::segments`]), each value storage is segmented: the
 //! last segments are given back ([`Planes::release_segments`]) and created again at their
-//! addresses ([`Planes::restore_segments`]), and the segments a predecessor epoch writes are
-//! mapped read-only. The index keys are not segmented: like the flags, the scales and the
-//! state planes they are one storage that stays mapped, and a successor epoch copies the cells
-//! of the pages it adopts.
+//! addresses ([`Planes::restore_segments`]). The index keys are not segmented: like the flags,
+//! the scales and the state planes they are one storage that stays mapped.
 
 use std::sync::Arc;
 
@@ -45,16 +48,16 @@ use crate::{Error, Result};
 const VALUES: [&str; 2] = ["prefix_cache.key.values", "prefix_cache.value.values"];
 
 /// The initialization flag storages' names, keys then values.
-pub(crate) const FLAGS: [&str; 2] = [
+const FLAGS: [&str; 2] = [
     "prefix_cache.key.initialized",
     "prefix_cache.value.initialized",
 ];
 
 /// The FP8 scale storages' names, keys then values.
-pub(crate) const SCALES: [&str; 2] = ["prefix_cache.key.scale", "prefix_cache.value.scale"];
+const SCALES: [&str; 2] = ["prefix_cache.key.scale", "prefix_cache.value.scale"];
 
 /// The index-key storage's name.
-pub(crate) const INDEX_KEYS: &str = "prefix_cache.index_key.values";
+const INDEX_KEYS: &str = "prefix_cache.index_key.values";
 
 /// The bit pattern of `1.0f32`, the neutral FP8 scale.
 const UNIT_SCALE: u32 = 0x3F80_0000;
@@ -79,8 +82,6 @@ pub(crate) fn unit_runs(units: &[u32]) -> Vec<(u32, u32)> {
 struct Segments {
     /// The segments in unit order.
     segments: Vec<ipc::CacheSegment>,
-    /// Whether the predecessor epoch writes each segment.
-    inherited: Vec<bool>,
     /// The first segment given back; the segment count while none is.
     released_from: u32,
     /// The cache's columns, which `parts` is laid out by.
@@ -115,20 +116,6 @@ impl Segments {
                     .map(move |segment| (column * count + segment) as usize)
             })
             .collect()
-    }
-
-    /// The units the predecessor epoch writes, `[start, end)`.
-    fn inherited_units(&self) -> std::ops::Range<u32> {
-        let mut range = 0..0;
-
-        for (index, segment) in self.segments.iter().enumerate() {
-            if self.inherited[index] {
-                let first = self.first_unit(index as u32);
-                let start = if range.is_empty() { first } else { range.start };
-                range = start..first + segment.units;
-            }
-        }
-        range
     }
 }
 
@@ -176,9 +163,12 @@ impl Planes {
     /// for this rank on `stream`, which is synchronized before returning: values, flags and
     /// index keys zero, scales one.
     ///
-    /// Planes a predecessor left keep their contents, which are finite whatever they hold: a
-    /// standby's predecessor serves from them, a successor engine reads the pages its
-    /// predecessor published, and every unit is reset for its next owner.
+    /// Planes that exist keep their contents, which are finite whatever they hold: another
+    /// epoch that names the region serves from them, a restarted engine reads the pages its
+    /// predecessor published, and every unit is reset for its next owner. Every storage is
+    /// keyed by the region's memory (module documentation): the storages that are not split by
+    /// the epoch of the first of `parts`, and by the rank's own epoch when the planes do not
+    /// split.
     ///
     /// # Errors
     ///
@@ -203,11 +193,19 @@ impl Planes {
         let cells = layout.columns as usize * units as usize;
         let plane_bytes = cells * layout.plane_bytes as usize;
         let index_bytes = cells * layout.index_bytes() as usize;
+
+        // The epoch whose ranks created the region's memory: that of its first segment, which
+        // holds unit 0. A segment given back and created again keeps its identity, so the epoch
+        // stays the same for the region's life.
+        let epoch = parts
+            .and_then(|parts| parts.first())
+            .map(|part| part.segment.epoch);
         let config = |name, bytes| ExclusiveConfig {
             name,
             device,
             bytes,
             access: &peers,
+            epoch,
         };
 
         // The exclusive storages, in the order they are taken apart below: the value planes of
@@ -244,8 +242,8 @@ impl Planes {
             }
         };
 
-        // Whether the values are new as a whole, and the segments created beside ones a
-        // predecessor left, whose units are reset alone.
+        // Whether the values are new as a whole, and the segments created beside ones that
+        // exist, whose units are reset alone.
         let values_created;
         let mut created_segments: Vec<u32> = Vec::new();
         let mut segmented = None;
@@ -385,15 +383,6 @@ impl Planes {
             .as_ref()
             .and_then(|device| device.segments.as_ref())
             .map_or(0, |segments| segments.released_from)
-    }
-
-    /// The units the planes map read-only from the predecessor epoch's planes; empty for
-    /// planes of their own.
-    pub(crate) fn inherited(&self) -> std::ops::Range<u32> {
-        self.device
-            .as_ref()
-            .and_then(|device| device.segments.as_ref())
-            .map_or(0..0, Segments::inherited_units)
     }
 
     /// The device bytes one unit of both value planes holds over every column: what a segment
@@ -781,11 +770,9 @@ impl Planes {
     }
 
     /// Checks the `(source, destination)` unit copies of a block's copy: both units inside the
-    /// pool, neither the padding unit, not the same unit, and no destination a read-only unit
-    /// of the predecessor epoch. A refusal names the pair and the reason.
+    /// pool, neither the padding unit, and not the same unit. A refusal names the pair and the
+    /// reason.
     pub(crate) fn check_copies(&self, copies: &[(u32, u32)]) -> Result<()> {
-        let inherited = self.inherited();
-
         for &(from, to) in copies {
             self.require_unit(from)?;
             self.require_unit(to)?;
@@ -796,8 +783,6 @@ impl Planes {
                 Some("the destination is unit 0, the padding unit")
             } else if from == to {
                 Some("the destination is the source")
-            } else if inherited.contains(&to) {
-                Some("the destination is an inherited read-only unit of the predecessor epoch")
             } else {
                 None
             };
@@ -881,13 +866,12 @@ impl Planes {
     }
 
     /// Gives back the storage of the value planes' segments from `first` on, every column's,
-    /// through `owner`, which retained them. The engine allocates none of their units and no
-    /// device work addresses them any more.
+    /// through `owner`, which retained them. The buffer pool gives none of their units to a
+    /// block and no device work addresses them any more.
     ///
     /// # Errors
     ///
-    /// For planes that are not split, for segments the predecessor epoch writes, or when
-    /// `owner` fails.
+    /// For planes that are not split, or when `owner` fails.
     pub(crate) fn release_segments(
         &mut self,
         first: u32,
@@ -914,14 +898,6 @@ impl Planes {
                 "no cache segment is left to give back: these were given back already"
             );
             return Ok(());
-        }
-        if segments.inherited[first as usize..from as usize]
-            .iter()
-            .any(|inherited| *inherited)
-        {
-            return Err(Error::Invalid(
-                "the predecessor epoch's segments are not given back by its successor".into(),
-            ));
         }
 
         let indices = segments.parts_of(first..from);
@@ -1126,7 +1102,6 @@ fn take_segmented(
                 length: part.segment.units as usize * plane_bytes,
                 column,
                 segment: part.segment,
-                inherited: part.inherited,
                 create: part.create,
             })
         })
@@ -1171,7 +1146,7 @@ fn take_segmented(
         .try_into()
         .map_err(|_| Error::Invariant("a cache holds a key plane and a value plane".into()))?;
 
-    // A standby finds none of the segments its predecessor gave back: the same ones of every
+    // Segments given back, which no rank of the region holds, are the same ones of every
     // column of both planes, from one segment on.
     let mapped = |segment: u32, column: u32| -> Result<(bool, bool)> {
         let index = (column * count + segment) as usize;
@@ -1205,7 +1180,6 @@ fn take_segmented(
 
     let segments = Segments {
         segments: parts.iter().map(|part| part.segment).collect(),
-        inherited: parts.iter().map(|part| part.inherited).collect(),
         released_from,
         columns,
         parts: segment_parts,

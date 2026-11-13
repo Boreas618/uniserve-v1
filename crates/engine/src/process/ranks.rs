@@ -294,11 +294,6 @@ fn load_rank(
                 model_runner.group(),
                 model_runner.rank(),
                 model_runner.launch().engine,
-                model_runner
-                    .launch()
-                    .predecessor
-                    .as_ref()
-                    .map(|predecessor| predecessor.epoch),
             )
             .context("connecting to the Storage Server")?;
             client

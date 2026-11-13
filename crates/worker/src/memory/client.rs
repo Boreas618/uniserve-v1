@@ -2,35 +2,33 @@
 //!
 //! Everything a rank would lose by exiting, and that costs time or memory to rebuild, is storage
 //! the host's Storage Server retains: the weights, which every process that maps them shares
-//! read-only, and the exclusive storages (the cache planes, the encoder cache, the latent
-//! buffers), which have one writer at a time. A [`StorageClient`] is the rank's one connection
-//! to that server. The owners of exclusive storage take it through the client
-//! ([`ExclusiveStorage`]), the weight store publishes and maps weights through it
+//! read-only, and the exclusive storages of the rank's scope (the cache planes, the memory of a
+//! buffer pool region). A [`StorageClient`] is the rank's one connection to that server. The
+//! owners of exclusive storage take it through the client ([`ExclusiveStorage`]), the weight
+//! store publishes and maps weights through it
 //! ([`WeightStore`](crate::memory::weights::WeightStore)), and the rank's share of its GPU's
 //! quota is stated and read through it.
 //!
-//! ## Exclusive storage across processes and epochs
+//! ## A region's storage across processes and epochs
 //!
-//! An exclusive storage is keyed by the epoch that created it and what fixes its shape. A
-//! restarted engine of the same scope and epoch maps the storage its predecessor left, at
-//! whatever address, instead of allocating it again; the server first shoots the predecessor
-//! down if it still holds write access. A standby maps the storages of the worker it stands by
-//! for without taking write access. A worker of an epoch that succeeds another maps the KV
-//! cache segments of its predecessor's worker of its scope read-only and creates everything
-//! else of its own, so neither epoch writes the other's storage.
+//! A cache plane's storage is keyed by its region's memory and what fixes its shape: a segment's
+//! part by the segment the region's segment table names (the epoch that created it and its
+//! ordinal), and a storage that is not split into segments by the epoch of the table's first
+//! segment ([`ExclusiveConfig::epoch`]). Every epoch that names the region, a standby and a
+//! restarted engine of the same scope map the same storages, writable, with an access that
+//! records no writer (`Mode::Region`): the buffer pool, not a writer, keeps the blocks they
+//! write apart, so nothing of the cache is copied or handed over between them.
 //!
-//! A rank makes no Storage Server call while it serves: only at startup, at its epoch's switch
-//! and commit, at a sleep and a wake, and at its orderly close.
+//! A rank makes no Storage Server call while it serves: only at startup, when the segments of
+//! its planes are given back or created again, and at its orderly close.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd};
+use std::os::fd::{AsFd, OwnedFd};
 use std::sync::{Arc, Mutex};
 
 use ipc::StorageLaunch;
 use platform::{DeviceId, Protection};
-use storage::protocol::{
-    Access, ErrorKind, Priority, Region, Span, TaskStatus, TensorListing, gpu_name,
-};
+use storage::protocol::{Access, ErrorKind, TensorListing};
 use storage::{
     Claim, Client, HostStorage, Item, Key, Location, Mode, Quota, Role, Scope, Segment,
     StorageRecord, TensorRecord,
@@ -53,14 +51,9 @@ pub fn quota_limit(total: u64, fraction: f64) -> u64 {
 /// interleave on the connection.
 pub struct StorageClient {
     scope: Scope,
-    /// The epoch the rank belongs to, which creates its exclusive storages.
+    /// The epoch the rank belongs to, which retains what the rank uses and keys the storages
+    /// of no segmented region.
     epoch: u64,
-    /// The epoch whose exclusive storages this rank keys: its own, or the epoch of the worker
-    /// a standby stands by for.
-    storage_epoch: u64,
-    /// The epoch whose exclusive storages the predecessor epoch on the same devices keys, for
-    /// a rank that succeeds one; `None` for a first epoch.
-    predecessor_epoch: Option<u64>,
     state: Mutex<State>,
 }
 
@@ -69,18 +62,8 @@ struct State {
     client: Client,
     /// The GPU UUID of each device the rank addressed, by ordinal.
     gpus: BTreeMap<i32, [u8; 16]>,
-    /// The exclusive storages the rank took, with write access or not.
+    /// The exclusive storages the rank took and maps.
     taken: BTreeSet<Key>,
-    /// The exclusive storages the rank holds write access to.
-    written: BTreeSet<Key>,
-    /// The keys of the exclusive storages a standby mapped without write access, which its
-    /// promotion takes write access to; `None` for a rank that takes write access at once.
-    standby: Option<Vec<Key>>,
-    /// The mappings of the storages a standby mapped, held while it stands by.
-    standby_storages: Vec<Arc<Storage>>,
-    /// The parts of the predecessor epoch's segments the rank maps read-only, each with the
-    /// storage that maps it, until the rank takes them at its epoch's commit.
-    inherited: Vec<(Key, Arc<Storage>)>,
 }
 
 impl State {
@@ -109,9 +92,7 @@ impl State {
 
 impl StorageClient {
     /// Connects as rank `rank` of worker group `group`, started by the group's launch
-    /// `generation`, to the server `launch` names. A standby (`StorageLaunch::standby`) maps
-    /// exclusive storages without taking write access, and keys them by `predecessor_epoch`,
-    /// the epoch of the worker it stands by for.
+    /// `generation`, to the server `launch` names.
     ///
     /// # Errors
     ///
@@ -121,7 +102,6 @@ impl StorageClient {
         group: &str,
         rank: u32,
         generation: u64,
-        predecessor_epoch: Option<u64>,
     ) -> Result<Arc<Self>> {
         let scope = Scope {
             deployment: launch.deployment.clone(),
@@ -142,20 +122,10 @@ impl StorageClient {
         Ok(Arc::new(Self {
             scope,
             epoch: launch.epoch,
-            // A standby maps what its predecessor holds, which was created in another epoch
-            // than the one the standby serves once promoted.
-            storage_epoch: predecessor_epoch
-                .filter(|_| launch.standby)
-                .unwrap_or(launch.epoch),
-            predecessor_epoch,
             state: Mutex::new(State {
                 client,
                 gpus: BTreeMap::new(),
                 taken: BTreeSet::new(),
-                written: BTreeSet::new(),
-                standby: launch.standby.then(Vec::new),
-                standby_storages: Vec::new(),
-                inherited: Vec::new(),
             }),
         }))
     }
@@ -168,11 +138,6 @@ impl StorageClient {
     /// The rank's epoch.
     pub fn epoch(&self) -> u64 {
         self.epoch
-    }
-
-    /// The epoch whose name keys this rank's exclusive storages: the one that created them.
-    pub fn storage_epoch(&self) -> u64 {
-        self.storage_epoch
     }
 
     /// Makes one request on the connection, as the rank doing `what`.
@@ -198,16 +163,17 @@ impl StorageClient {
         self.release_keys(&mut lock(&self.state), keys, doing)
     }
 
-    /// The key of an exclusive storage of the rank: the digest of its scope, the epoch that
-    /// created it, its name, its length and its GPU. It covers the storage's shape only, so a
-    /// restart of the epoch maps the storage again whatever else changed.
+    /// The key of an exclusive storage of the rank: the digest of its scope, the epoch of its
+    /// region's memory (the rank's own for a storage of no segmented region), its name, its
+    /// length and its GPU. It covers the storage's shape only, so every epoch that names the
+    /// region, and a restart of the epoch, maps the storage again whatever else changed.
     fn exclusive_key(&self, config: &ExclusiveConfig<'_>, gpu: &[u8; 16]) -> Key {
         storage::key::exclusive(
             &self.scope,
             config.name,
             config.bytes as u64,
             gpu,
-            self.storage_epoch,
+            config.epoch.unwrap_or(self.epoch),
         )
     }
 
@@ -248,7 +214,7 @@ impl StorageClient {
             .sum();
 
         // Every exclusive tensor is a storage of its own. Those another epoch uses, as the
-        // predecessor's segments a successor maps, are not free.
+        // storages of a region two epochs name, are not free.
         let untaken: u64 = listing
             .tensors
             .iter()
@@ -260,7 +226,6 @@ impl StorageClient {
                         .retainers
                         .iter()
                         .all(|retainer| retainer.epoch == self.epoch)
-                    && !state.written.contains(&tensor.key)
                     && !state.taken.contains(&tensor.key)
             })
             .map(|tensor| tensor.storage_bytes)
@@ -283,7 +248,6 @@ impl StorageClient {
         let mut untaken = 0;
         for tensor in listing.tensors.iter().filter(|tensor| self.retains(tensor)) {
             if tensor.access == Access::Exclusive
-                && !state.written.contains(&tensor.key)
                 && !state.taken.contains(&tensor.key)
                 && !taking.contains(&tensor.key)
             {
@@ -308,9 +272,8 @@ impl StorageClient {
     }
 
     /// Ends the epoch's retention of `keys` alone. The server's retention is the scope's in the
-    /// epoch, which every worker of the scope shares: a standby maps its predecessor's storages
-    /// under it, and the rank's own owners take theirs later in its startup, so every other
-    /// storage the scope retains stays.
+    /// epoch, which every worker of the scope shares, and the rank's owners take their storages
+    /// one after another in its startup, so every other storage the scope retains stays.
     fn release_keys(&self, state: &mut State, keys: &BTreeSet<Key>, doing: &str) -> Result<()> {
         if keys.is_empty() {
             return Ok(());
@@ -416,106 +379,8 @@ impl StorageClient {
             })
     }
 
-    /// Copies the cells of the cache units `units` (half-open ranges) of the predecessor
-    /// epoch's exclusive storages to this rank's own of the same names, as a task of the host's
-    /// Transfer Server, and waits for it. Each storage is `(name, cell_bytes)` of cells
-    /// `[columns, num_units]`, as a cache's flag and scale planes are laid out.
-    ///
-    /// Returns how many units it copied: none when the rank keys its storages under the
-    /// predecessor's epoch (a standby), whose storages are its own, or when it succeeds no
-    /// epoch.
-    ///
-    /// # Errors
-    ///
-    /// When the server refuses the copy or the task fails: the cells are then partly copied,
-    /// and the caller adopts none of the units.
-    pub fn copy_predecessor_cells(
-        &self,
-        device: DeviceId,
-        storages: &[(&str, u64)],
-        columns: u32,
-        num_units: u32,
-        units: &[[u32; 2]],
-    ) -> Result<u32> {
-        const WHAT: &str = "copying the predecessor's cache cells";
-
-        let Some(predecessor) = self
-            .predecessor_epoch
-            .filter(|epoch| *epoch != self.storage_epoch)
-        else {
-            return Ok(0);
-        };
-
-        let mut state = lock(&self.state);
-        let gpu = state.gpu(device)?;
-        let cells = u64::from(columns) * u64::from(num_units);
-
-        let mut spans = Vec::new();
-        for &(name, cell_bytes) in storages {
-            let bytes = cells * cell_bytes;
-            let source = storage::key::exclusive(&self.scope, name, bytes, &gpu, predecessor);
-            let destination =
-                storage::key::exclusive(&self.scope, name, bytes, &gpu, self.storage_epoch);
-
-            for column in 0..u64::from(columns) {
-                for &[start, end] in units {
-                    if start >= end || end > num_units {
-                        return Err(Error::Invalid(format!(
-                            "the cache units {start}..{end} are not units of a pool of {num_units}"
-                        )));
-                    }
-
-                    let offset = (column * u64::from(num_units) + u64::from(start)) * cell_bytes;
-                    spans.push(Span {
-                        source: Region::Tensor {
-                            key: source,
-                            at: None,
-                        },
-                        source_offset: offset,
-                        destination: Region::Tensor {
-                            key: destination,
-                            at: None,
-                        },
-                        destination_offset: offset,
-                        bytes: u64::from(end - start) * cell_bytes,
-                        rows: 1,
-                        source_pitch: 0,
-                        destination_pitch: 0,
-                    });
-                }
-            }
-        }
-        if spans.is_empty() {
-            return Ok(0);
-        }
-
-        let task = state
-            .client
-            .copy(spans, Priority::Promotion, 0)
-            .map_err(|error| storage_error(WHAT, error))?;
-
-        // The copy is a few cells per unit, and the rank waits for it at the boundary it runs
-        // at: until the task's end arrives, the connection is the only thing to wait on.
-        loop {
-            let ended = state
-                .client
-                .poll_task(task)
-                .map_err(|error| storage_error(WHAT, error))?;
-
-            match ended {
-                Some((_, TaskStatus::Complete)) => break,
-                Some((_, end)) => {
-                    return Err(Error::Interface(format!("{WHAT} ended as {end:?}")));
-                }
-                None => wait_readable(state.client.as_fd(), WHAT)?,
-            }
-        }
-
-        Ok(units.iter().map(|[start, end]| end - start).sum())
-    }
-
     /// Publishes the storage of part `index` of `config`, which `descriptor` maps, as an
-    /// exclusive tensor the rank writes.
+    /// exclusive tensor of the rank's scope.
     fn publish_segment(
         state: &mut State,
         config: &SegmentedConfig<'_>,
@@ -550,61 +415,14 @@ impl StorageClient {
             .put(vec![tensor], &[(record, descriptor.as_fd())])
             .map_err(|error| storage_error("publishing a segment", error))
     }
-
-    /// Why a standby found no storage under the key of `config`: what the scope holds under
-    /// that name, so that the refusal names the part of the shape that differs.
-    fn standby_refusal(
-        &self,
-        state: &mut State,
-        config: &ExclusiveConfig<'_>,
-        gpu: &[u8; 16],
-    ) -> Error {
-        let held: Vec<String> = state
-            .client
-            .list()
-            .map(|listing| {
-                listing
-                    .tensors
-                    .iter()
-                    .filter(|tensor| tensor.name == config.name)
-                    .filter_map(|tensor| {
-                        let epochs: Vec<u64> = tensor
-                            .retainers
-                            .iter()
-                            .filter(|retainer| retainer.scope == self.scope)
-                            .map(|retainer| retainer.epoch)
-                            .collect();
-
-                        (!epochs.is_empty()).then(|| {
-                            format!(
-                                "{} bytes on {:?} in epochs {epochs:?}",
-                                tensor.storage_bytes, tensor.location
-                            )
-                        })
-                    })
-                    .collect()
-            })
-            .unwrap_or_default();
-
-        Error::Invalid(format!(
-            "the standby found no {} of its predecessor's shape: it asks for {} bytes on GPU {} \
-             in epoch {}, and its scope holds {}",
-            config.name,
-            config.bytes,
-            gpu_name(gpu),
-            self.storage_epoch,
-            if held.is_empty() {
-                "none".to_owned()
-            } else {
-                held.join("; ")
-            }
-        ))
-    }
 }
 
+/// The storages of a cache's planes are the memory of a buffer pool region: they are taken
+/// with `Mode::Region`, which records no writer and shoots no other process down, so every
+/// epoch that names the region maps them writable at once (`specs/buffer-pool.md` §14.1).
 impl ExclusiveStorage for StorageClient {
-    /// Maps the storages the scope retains, with write access unless the rank stands by, and
-    /// creates and publishes the others.
+    /// Maps the storages the server holds under the configs' keys, and creates and publishes
+    /// the others.
     fn exclusive(&self, configs: &[ExclusiveConfig<'_>]) -> Result<Vec<(Arc<Storage>, bool)>> {
         let mut state = lock(&self.state);
         let state = &mut *state;
@@ -616,26 +434,10 @@ impl ExclusiveStorage for StorageClient {
         }
         let keys: Vec<Key> = keyed.iter().map(|(key, _)| *key).collect();
 
-        // A standby maps what its predecessor holds, and creates nothing.
-        let standby = state.standby.is_some();
-        let mode = if standby { Mode::Standby } else { Mode::Write };
         let (got, descriptors) = state
             .client
-            .get(keys, mode, Vec::new())
+            .get(keys, Mode::Region, Vec::new())
             .map_err(|error| storage_error("taking exclusive storages", error))?;
-
-        if standby && let Some(missing) = got.missing.first() {
-            let Some((config, (_, gpu))) = configs
-                .iter()
-                .zip(&keyed)
-                .find(|(_, (key, _))| key == missing)
-            else {
-                return Err(Error::Interface(
-                    "the storage server named a storage nobody asked for".into(),
-                ));
-            };
-            return Err(self.standby_refusal(state, config, gpu));
-        }
         if !got.missing.is_empty() {
             let taking = got.tensors.iter().map(|tensor| tensor.key).collect();
             self.release_untaken(state, &taking)?;
@@ -700,15 +502,6 @@ impl ExclusiveStorage for StorageClient {
             };
 
             state.taken.insert(*key);
-            match &mut state.standby {
-                Some(standby) => {
-                    standby.push(*key);
-                    state.standby_storages.push(Arc::clone(&storage));
-                }
-                None => {
-                    state.written.insert(*key);
-                }
-            }
             taken.push((storage, created));
         }
 
@@ -727,10 +520,8 @@ impl ExclusiveStorage for StorageClient {
     }
 
     /// Takes the parts of a segmented storage as [`Self::exclusive`] takes whole storages,
-    /// except that a standby leaves a part its predecessor gave back unmapped, and that the
-    /// parts of the predecessor epoch's segments are mapped read-only without write access,
-    /// never created: the predecessor's worker of the scope writes them until the successor's
-    /// commit.
+    /// except that a missing part whose `create` is unset (a segment given back) is left
+    /// unmapped.
     fn segmented(&self, config: &SegmentedConfig<'_>) -> Result<(Arc<Storage>, Vec<bool>)> {
         let mut state = lock(&self.state);
         let state = &mut *state;
@@ -742,121 +533,64 @@ impl ExclusiveStorage for StorageClient {
             .map(|part| self.part_key(config.name, part, &gpu))
             .collect();
 
-        let standby = state.standby.is_some();
-        let mode = if standby { Mode::Standby } else { Mode::Write };
-        let (inherited, own): (Vec<usize>, Vec<usize>) =
-            (0..config.parts.len()).partition(|&index| config.parts[index].inherited);
+        let (got, descriptors) = state
+            .client
+            .get(keys.clone(), Mode::Region, Vec::new())
+            .map_err(|error| storage_error("taking a segmented storage", error))?;
 
-        let mut found = BTreeMap::new();
-        for (indices, mode) in [(&own, mode), (&inherited, Mode::Standby)] {
-            if indices.is_empty() {
-                continue;
-            }
-
-            let asked: Vec<Key> = indices.iter().map(|&index| keys[index]).collect();
-            let (got, descriptors) = state
-                .client
-                .get(asked, mode, Vec::new())
-                .map_err(|error| storage_error("taking a segmented storage", error))?;
-
-            if mode == Mode::Standby
-                && !standby
-                && let Some(missing) = got.missing.first()
-            {
-                let index = keys
-                    .iter()
-                    .position(|key| key == missing)
-                    .unwrap_or_default();
-                return Err(Error::Invalid(format!(
-                    "the predecessor epoch holds no {}",
-                    segment_name(config.name, &config.parts[index])
-                )));
-            }
-
-            // The storages a predecessor left that no owner takes again are released before a
-            // missing part is created in their place. Parts left unmapped (segments given
-            // back) create nothing, and the storages not taken yet include other planes'
-            // segments, which their owner takes next: the value planes' after the key planes'.
-            let creates = got.missing.iter().any(|missing| {
-                keys.iter()
-                    .position(|key| key == missing)
-                    .is_some_and(|index| config.parts[index].create)
-            });
-            if mode == Mode::Write && creates {
-                let taking = got.tensors.iter().map(|tensor| tensor.key).collect();
-                self.release_untaken(state, &taking)?;
-            }
-
-            let mut storages: Vec<Option<(StorageRecord, OwnedFd)>> = got
-                .storages
-                .into_iter()
-                .zip(descriptors)
-                .map(Some)
-                .collect();
-            for tensor in &got.tensors {
-                let (record, descriptor) = storages
-                    .get_mut(tensor.storage as usize)
-                    .and_then(Option::take)
-                    .ok_or_else(|| Error::Interface("a retained storage was named twice".into()))?;
-                let index = keys
-                    .iter()
-                    .position(|key| *key == tensor.key)
-                    .ok_or_else(|| Error::Interface("an unasked segment was found".into()))?;
-
-                if record.bytes as usize != config.parts[index].length {
-                    return Err(Error::Interface(
-                        "a retained segment has another length".into(),
-                    ));
-                }
-                found.insert(tensor.key, descriptor);
-            }
+        // The storages a predecessor left that no owner takes again are released before a
+        // missing part is created in their place. Parts left unmapped (segments given back)
+        // create nothing, and the storages not taken yet include other planes' segments, which
+        // their owner takes next: the value planes' after the key planes'.
+        let creates = got.missing.iter().any(|missing| {
+            keys.iter()
+                .position(|key| key == missing)
+                .is_some_and(|index| config.parts[index].create)
+        });
+        if creates {
+            let taking = got.tensors.iter().map(|tensor| tensor.key).collect();
+            self.release_untaken(state, &taking)?;
         }
 
-        // A standby maps the planes its predecessor serves from: one that finds none of them
-        // asked for another shape, and a cache of no storage would fault at its first warm-up.
-        if standby && found.is_empty() {
-            return Err(Error::Invalid(format!(
-                "the standby found no {} of its predecessor's shape: its scope holds no segment \
-                 of these lengths in epoch {}",
-                config.name,
-                config
-                    .parts
-                    .first()
-                    .map_or(self.epoch, |part| part.segment.epoch),
-            )));
+        let mut storages: Vec<Option<(StorageRecord, OwnedFd)>> = got
+            .storages
+            .into_iter()
+            .zip(descriptors)
+            .map(Some)
+            .collect();
+        let mut found = BTreeMap::new();
+        for tensor in &got.tensors {
+            let (record, descriptor) = storages
+                .get_mut(tensor.storage as usize)
+                .and_then(Option::take)
+                .ok_or_else(|| Error::Interface("a retained storage was named twice".into()))?;
+            let index = keys
+                .iter()
+                .position(|key| *key == tensor.key)
+                .ok_or_else(|| Error::Interface("an unasked segment was found".into()))?;
+
+            if record.bytes as usize != config.parts[index].length {
+                return Err(Error::Interface(
+                    "a retained segment has another length".into(),
+                ));
+            }
+            found.insert(tensor.key, descriptor);
         }
 
         let storage = Storage::segmented(config.device, &config.lengths(), config.access)?;
         let mut created = vec![false; keys.len()];
         for (index, key) in keys.iter().enumerate() {
-            let inherited = config.parts[index].inherited;
-
             match found.remove(key) {
-                Some(descriptor) if inherited => {
-                    storage.import_segment_read_only(index, &descriptor)?;
-                    state.inherited.push((*key, Arc::clone(&storage)));
-                }
                 Some(descriptor) => storage.import_segment(index, &descriptor)?,
-                // A part nobody holds stays unmapped for a standby, and for a part given back.
-                None if standby || !config.parts[index].create => continue,
+                // A part nobody holds stays unmapped when it was given back.
+                None if !config.parts[index].create => continue,
                 None => {
                     let descriptor = storage.create_segment(index)?;
                     Self::publish_segment(state, config, index, *key, gpu, &descriptor)?;
                     created[index] = true;
                 }
             }
-
             state.taken.insert(*key);
-            match &mut state.standby {
-                Some(standby) => standby.push(*key),
-                None if inherited => {}
-                None => {
-                    state.written.insert(*key);
-                }
-            }
-        }
-        if standby {
-            state.standby_storages.push(Arc::clone(&storage));
         }
 
         Ok((storage, created))
@@ -892,8 +626,6 @@ impl ExclusiveStorage for StorageClient {
 
             let key = self.part_key(config.name, &config.parts[index], &gpu);
             state.taken.remove(&key);
-            state.written.remove(&key);
-            state.inherited.retain(|(inherited, _)| *inherited != key);
             given.insert(key);
         }
 
@@ -916,7 +648,6 @@ impl ExclusiveStorage for StorageClient {
             Self::publish_segment(&mut state, config, index, key, gpu, &descriptor)?;
 
             state.taken.insert(key);
-            state.written.insert(key);
         }
         Ok(())
     }
@@ -952,27 +683,4 @@ fn segment_name(name: &str, part: &SegmentPart) -> String {
 /// A Storage Server failure while the rank was doing `what`.
 fn storage_error(what: &str, error: storage::Error) -> Error {
     Error::transport_source(what, error)
-}
-
-/// Blocks until `connection` has something to read, as the rank doing `what`.
-fn wait_readable(connection: BorrowedFd<'_>, what: &str) -> Result<()> {
-    let mut polled = libc::pollfd {
-        fd: connection.as_raw_fd(),
-        events: libc::POLLIN,
-        revents: 0,
-    };
-
-    loop {
-        // SAFETY: `poll` reads and writes the one `pollfd` this frame owns, over a descriptor
-        // the caller keeps open for the call.
-        let ready = unsafe { libc::poll(&mut polled, 1, -1) };
-        if ready >= 0 {
-            return Ok(());
-        }
-
-        let error = std::io::Error::last_os_error();
-        if error.kind() != std::io::ErrorKind::Interrupted {
-            return Err(Error::transport_source(what, error));
-        }
-    }
 }

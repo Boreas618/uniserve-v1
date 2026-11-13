@@ -273,12 +273,6 @@ impl ModelRunner {
     ) -> Result<(u32, Option<Vec<PlaneSegment>>)> {
         let granularity = granularity(device)?;
 
-        // A standby serves from the planes its predecessor laid out.
-        if let Some(table) = &self.adopted_cache {
-            let adopted = segments::adopted(table);
-            return Ok((segments::units(&adopted), Some(adopted)));
-        }
-
         // What the process holds beside its pools and the server's storages. The weight store
         // waits for each copy of the load before it returns, so the figure counts the load's
         // work. A communicator states no bytes NVML attributes to no process
@@ -323,8 +317,7 @@ impl ModelRunner {
         // Whole segments of whole granules, an eighth of the cache each at most: what a resize
         // across layouts, a sleep and a wake give back and create again.
         let units = segments::segmented_units(units, layout.plane_bytes, granularity);
-        let epoch = self.cache_epoch.unwrap_or(self.launch.epoch);
-        let made = segments::own(epoch, units, layout.plane_bytes, granularity);
+        let made = segments::own(self.launch.epoch, units, layout.plane_bytes, granularity);
         Ok((units, made))
     }
 }

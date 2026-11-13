@@ -1,11 +1,12 @@
-//! The host tier of the rank's KV cache: the host page pools its pages are copied through.
+//! The host tier of the rank's KV cache: the host regions its pages are copied through.
 //!
-//! Each cache group copies its pages through a page pool of the host's Storage Server: a memfd
-//! of equal pages shared by every rank of the host whose pages have the same shape. The rank
-//! maps each pool writable and registers it for device copies. The buffer pool names a host
-//! copy of a block as a run of the group's host region, whose unit `u` is page `u` of the pool;
-//! the copies a completion queues ([`HostPage`]) run on the rank's copy stream with the batch
-//! that takes them.
+//! Each cache group copies its pages through a host region of the buffer pool, the
+//! deployment's on the host: the Storage Server keeps one memfd per rank index, the rank's part
+//! of every unit, which every epoch that names the region maps. The rank maps its part of each
+//! group's region writable and registers it for device copies ([`HostPart`]). The buffer pool
+//! names a host copy of a block as a run of the group's host region, whose unit `u` is page `u`
+//! of the group on every rank, at unit `u` of the rank's part; the copies a completion queues
+//! ([`HostPage`]) run on the rank's copy stream with the batch that takes them.
 //!
 //! A host page is one page of one group on this rank, plane by plane: the key planes of every
 //! unit and column of the page, in unit then column order, the value planes in the same order,
@@ -26,7 +27,6 @@ use std::sync::Arc;
 
 use ::storage::Key;
 use ::storage::protocol::PageShape;
-use ipc::HostPoolInfo;
 use platform::{CopyBatch, DeviceId, Event, EventFlags, SourceOrder, Stream};
 use uniserve_tensor::DType;
 
@@ -34,7 +34,7 @@ use super::conversion::Conversion;
 use super::layout::{CacheLayout, GroupLayout};
 use super::planes::Planes;
 use crate::memory::client::StorageClient;
-use crate::memory::host_pages::{self, HostPages};
+use crate::memory::host_pages::{self, HostPart};
 use crate::{Error, Result};
 
 /// The version of the page encoding above: pages of another version are another content.
@@ -65,8 +65,8 @@ fn page_tokens(group: &GroupLayout) -> u64 {
 }
 
 /// The bytes one token of `layout`'s pages takes in the host tier over every cache group: each
-/// group's page bytes over the tokens a page stands for, rounded up, so the pools of `tokens`
-/// tokens take at most `tokens` times as many bytes.
+/// group's page bytes over the tokens a page stands for, rounded up, so host regions of
+/// `tokens` tokens take at most `tokens` times as many bytes.
 pub fn token_bytes(layout: &CacheLayout) -> u64 {
     layout
         .groups
@@ -75,9 +75,10 @@ pub fn token_bytes(layout: &CacheLayout) -> u64 {
         .sum()
 }
 
-/// The spelling of a stored element type inside a pool's layout digest. The digest names a
-/// page pool every rank of a host shares, whatever build of the engine it runs, so the
-/// spellings are fixed here and do not follow a library's.
+/// The spelling of a stored element type inside a page layout digest. The digest names the
+/// host region of a group's pages, which every epoch of the deployment on a host shares
+/// whatever build of the engine it runs, so the spellings are fixed here and do not follow a
+/// library's.
 fn stored_name(dtype: DType) -> &'static str {
     match dtype {
         DType::F16 => "float16",
@@ -121,7 +122,7 @@ fn state_of(digest: &mut ::storage::key::Digest, layout: &CacheLayout, group: &G
 }
 
 /// The digest of the byte layout of `group`'s host pages: the page encoding, the stored
-/// representation and the group's shape and logical layers. It names the group's page pool
+/// representation and the group's shape and logical layers. It names the group's host region
 /// (`PageShape::layout`).
 fn layout_digest(layout: &CacheLayout, group: &GroupLayout) -> [u8; 32] {
     let mut digest = ::storage::key::Digest::new(b"uniserve-page-layout");
@@ -203,7 +204,8 @@ pub fn class_digests(
 /// `|`-separated parts. The scheduler seeds the group's page keys at every tier from it
 /// (`storage::key::page_seed`), so a page computed by other weights or of another shape is
 /// another page. The representation is not part of it: the same page in another stored type has
-/// the same key, and the pools of each representation stay apart by their layout digest.
+/// the same key, and the host regions of each representation stay apart by their layout
+/// digest.
 pub fn page_identities(layout: &CacheLayout, fingerprint: &str) -> Vec<String> {
     layout
         .groups
@@ -216,82 +218,59 @@ pub fn page_identities(layout: &CacheLayout, fingerprint: &str) -> Vec<String> {
 }
 
 /// One page's copy between the host tier and the units of the pool: the cache group, the page
-/// of the group's host page pool (or of its converted-load source buffer), and the units of the
+/// of the group's host region (or of its converted-load source buffer), and the units of the
 /// block on the device.
 pub(crate) type HostPage = (u32, u64, Range<u32>);
 
-/// The rank's host page pools, by cache group, the stream its page copies run on, and the
-/// converted loads of a cache that admits them.
+/// The rank's parts of the cache groups' host regions, by cache group, the stream its page
+/// copies run on, and the converted loads of a cache that admits them.
 pub(crate) struct HostTier {
-    /// Each group's pool with the planes of one field a page of the group spans.
-    pools: BTreeMap<u32, (HostPages, u32)>,
+    /// Each group's part with the planes of one field a page of the group spans; a group whose
+    /// pages have no host copy has none.
+    parts: BTreeMap<u32, (HostPart, u32)>,
     /// The copy stream: page copies run on it beside the forwards on a batch's stream.
     stream: Stream,
     conversion: Option<Conversion>,
 }
 
 impl HostTier {
-    /// Maps a page pool for every cache group of `layout` at the rank's host's Storage Server,
-    /// registered with `device`, each holding the pages of `tokens` tokens: the count the
-    /// engine sizes every rank's host tier at. A pool the deployment already has for the same
-    /// pages, which an earlier epoch created, is shared at its size. The copies run on
-    /// `stream`, and `conversion` is the converted loads of a cache that admits them, opened
-    /// on the same stream. Returns the tier and what the rank reports of each pool, in group
-    /// order, without their conversions.
+    /// Maps the rank's part of the host region `regions` names for each cache group of
+    /// `layout` at the rank's host's Storage Server, registered with `device`: one page of the
+    /// group a unit. A group named `None` has no host copy. The copies run on `stream`, and
+    /// `conversion` is the converted loads of a cache that admits them, opened on the same
+    /// stream.
     ///
     /// # Errors
     ///
-    /// [`Error::Resource`] when `tokens` hold no page of a group; the server's refusal.
+    /// The server's refusal of a part, or a part of no page.
     pub(crate) fn map(
         client: &StorageClient,
-        layout: &Arc<CacheLayout>,
+        layout: &CacheLayout,
         device: DeviceId,
-        endpoint: Option<&str>,
-        tokens: u64,
+        regions: &[Option<&str>],
         stream: Stream,
         conversion: Option<Conversion>,
-    ) -> Result<(Self, Vec<HostPoolInfo>)> {
-        let mut pools = BTreeMap::new();
-        let mut reports = Vec::new();
-
-        // The pools lie on the host NUMA node closest to the device, so the copies between
-        // them cross no link between nodes.
+    ) -> Result<Self> {
+        // A part the device's rank index creates lies on the host NUMA node closest to the
+        // device, so the copies between them cross no link between nodes.
         let numa_node = host_pages::numa_node(device);
 
+        let mut parts = BTreeMap::new();
         for (index, group) in layout.groups.iter().enumerate() {
-            let shape = page_shape(layout, index)?;
-            let pages = tokens / page_tokens(group);
-            if pages == 0 {
-                return Err(Error::Resource(
-                    "the host KV tier holds no page of each cache group",
-                ));
-            }
+            let Some(Some(region)) = regions.get(index) else {
+                continue;
+            };
 
-            let pool = HostPages::map(
-                client,
-                device,
-                shape,
-                numa_node,
-                Some(pages * shape.page_bytes),
-                "a host KV tier pool",
-            )?;
-            reports.push(HostPoolInfo {
-                pool: pool.pool(),
-                shape: pool.shape(),
-                endpoint: endpoint.map(str::to_owned),
-                conversion: None,
-            });
-            pools.insert(index as u32, (pool, layout.page_planes(group) as u32));
+            let shape = page_shape(layout, index)?;
+            let part = HostPart::map(client, device, region, shape.page_bytes, numa_node)?;
+            parts.insert(index as u32, (part, layout.page_planes(group) as u32));
         }
 
-        Ok((
-            Self {
-                pools,
-                stream,
-                conversion,
-            },
-            reports,
-        ))
+        Ok(Self {
+            parts,
+            stream,
+            conversion,
+        })
     }
 
     /// The generation the converted loads launch from, from the next load on.
@@ -317,7 +296,7 @@ impl HostTier {
     ///
     /// # Errors
     ///
-    /// A page of a group that has no pool or of another shape than its group's, or a page of
+    /// A page of a group that has no host region or outside the rank's part of it, or a page of
     /// the conversion source on a cache that converts none; the driver's refusal.
     pub(crate) fn copy(
         &self,
@@ -373,10 +352,10 @@ impl HostTier {
         copy: &HostPage,
     ) -> Result<Vec<(u64, u64, usize)>> {
         let (group, page, units) = copy;
-        let (pool, page_planes) = self
-            .pools
+        let (part, page_planes) = self
+            .parts
             .get(group)
-            .ok_or_else(|| Error::Invalid(format!("cache group {group} has no host page pool")))?;
+            .ok_or_else(|| Error::Invalid(format!("cache group {group} has no host region")))?;
         let page_planes = *page_planes;
 
         let columns = layout.columns;
@@ -389,7 +368,7 @@ impl HostTier {
         }
 
         let plane = layout.plane_bytes;
-        let host = pool.address(*page)?;
+        let host = part.address(*page)?;
         let count = u64::from(page_planes);
         let unit = |index: u32| units.start + index / columns;
 

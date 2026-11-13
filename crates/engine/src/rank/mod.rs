@@ -134,12 +134,6 @@ pub(crate) struct ModelRunner {
     /// The worker group this rank serves in: a text rank's group of the deployment (its prefill or
     /// decode group, or one data-parallel replica).
     group: String,
-    /// The epoch whose cache planes this rank maps, on a standby: it serves from the planes its
-    /// predecessor serves from, whose segments that epoch created.
-    cache_epoch: Option<u64>,
-    /// The planes of the epoch `cache_epoch` names, as that epoch laid them out: what a standby
-    /// maps is the serving rank's cache, which only that rank sized.
-    adopted_cache: Option<ipc::CacheTable>,
     /// Ranks in this rank's worker group on every host.
     world_size: usize,
     /// This rank's part of the epoch's parallel shape, resolved with the model runner.
@@ -255,8 +249,6 @@ impl ModelRunner {
             buckets,
             rank: launch.rank,
             group: launch.group.clone(),
-            cache_epoch: None,
-            adopted_cache: None,
             world_size: launch.world_size as usize,
             mapping,
             union: None,
@@ -532,17 +524,6 @@ impl ModelRunner {
     /// `None` outside a union.
     pub(crate) fn union(&self) -> Option<(u32, u32)> {
         self.union.map(|members| (members, self.mapping.union_rank))
-    }
-
-    /// This model runner on the cache planes of `epoch`, when this rank stands by for that epoch's process.
-    pub(crate) fn sharing_cache_of(
-        mut self,
-        epoch: Option<u64>,
-        table: Option<ipc::CacheTable>,
-    ) -> Self {
-        self.cache_epoch = epoch;
-        self.adopted_cache = table;
-        self
     }
 
     /// This rank's ordinal among the deployment's ranks.
