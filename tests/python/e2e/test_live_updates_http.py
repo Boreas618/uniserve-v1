@@ -1878,41 +1878,108 @@ def _failed_requests(base_url: str) -> float:
 TRIAL_WINDOW_S = 5
 
 
-def _slower_engine(directory: Path) -> str:
-    """Installs an engine whose main process steps slower under the same stream.
+#: How many times the slower attention package (:func:`_slower_target`) runs
+#: trtllm-gen's decode attention per call.
+ATTENTION_RUNS = 12
 
-    The package wraps the tree's own engine: its executable runs that engine
-    walking each batch operator by operator (``UNISERVE_EAGER_REPLAY``) where
-    the deployment launches a captured graph: the same tokens, later, as a
-    release that lost a fast path would serve them, with no fault to report.
+
+def _slower_target(directory: Path) -> tuple[str, ...]:
+    """Installs what makes an epoch step slower under the same stream.
+
+    The target is a new revision of the tree's engine whose decode attention
+    is a package of its own: the tree's trtllm-gen paged attention package
+    (``crates/ops/kernels/paged_attention/trtllm``) under the backend name
+    ``trtllm_repeated``, whose entry runs the kernel ``ATTENTION_RUNS`` times
+    per call. Every run reads the same inputs and writes the same output, so
+    the target computes the same tokens, later, as a release that lost a fast
+    path would serve them, with no fault to report. On one GB200 serving this
+    file's deployment, twelve runs made a step of one count stream 69% longer
+    (15.2 and 15.3 ms of batch time against 8.9 to 9.1 ms for the tree's
+    package before and after, points of 2000 tokens each), about 0.57 ms per
+    run past the first. A key whose backend no deployment names takes the
+    package whose name sorts first among those of one priority, ``trtllm``,
+    and the engine revision is what makes the change an epoch (a package
+    selection alone is a generation update).
+
+    Both modules are built here, for the decode keys the serving deployment's
+    attention runs: an update's preparation then builds nothing, and a stream
+    started after this still runs when the switch comes.
 
     Returns:
-        The assignment that selects the package (``worker_config.engine``).
+        The assignments that select the target.
     """
     socket = build_server_socket()
-    engine = engine_executable(socket, install_engine(socket))
-    # The wrapper implements the engine interface of the engine it runs: the
-    # daemon refuses a package of another version than it speaks.
-    interface = tomllib.loads(
-        (Path.cwd() / "crates/engine/package.toml").read_text()
-    )["interface_version"]
-    package = directory / "slower-engine"
-    package.mkdir()
-    (package / "package.toml").write_text(
-        'op = "engine"\n'
-        'backend = "slower"\n'
-        f"interface_version = {interface}\n\n"
-        '[toolchain]\nkind = "none"\nversion = ""\n\n'
-        '[module]\nform = "executable"\n\n'
-        '[source]\nkind = "executable"\nfiles = ["uniserve-slower"]\n'
+    binary = str(require_uniserve_binary())
+    engine = install_engine(socket)
+    engine_executable(socket, engine)
+
+    package = directory / "trtllm-repeated"
+    shutil.copytree(
+        Path.cwd() / "crates/ops/kernels/paged_attention/trtllm", package
     )
-    script = package / "uniserve-slower"
-    script.write_text(
-        f'#!/bin/sh\nUNISERVE_EAGER_REPLAY=1 exec "{engine}" "$@"\n'
+    manifest = package / "package.toml"
+    manifest.write_text(
+        manifest.read_text().replace(
+            'backend = "trtllm"', 'backend = "trtllm_repeated"', 1
+        )
     )
-    script.chmod(0o755)
-    install_engine(socket, package)
-    return "worker_config.engine=slower"
+    entry = package / "src/entry.cpp"
+    launch = "    runner.run(params);\n"
+    source = entry.read_text()
+    assert source.count(launch) == 1, "the entry's launch moved"
+    entry.write_text(
+        source.replace(
+            launch,
+            f"    for (int run = 0; run < {ATTENTION_RUNS}; ++run) {{\n"
+            f"  {launch}"
+            "    }\n",
+        )
+    )
+    # A kernel package installs as an engine package does.
+    revision = install_engine(socket, package)
+
+    # `list` heads each package revision with `<op> <backend> revision <n>`
+    # and follows it with its modules, one `<target> <key> <form>` line each.
+    listed = subprocess.run(
+        [binary, "build-server", "list", "--socket", str(socket)],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout
+    decode: set[tuple[str, str]] = set()
+    package_of = None
+    for line in listed.splitlines():
+        if not line.startswith(" "):
+            package_of = line.split()[:2]
+        elif package_of == ["paged_attention", "trtllm"]:
+            target, key, _ = line.split()
+            if key.startswith("phase_decode_"):
+                decode.add((target, key))
+    assert decode, f"the deployment's attention built no decode key:\n{listed}"
+    for target, key in sorted(decode):
+        subprocess.run(
+            [
+                binary,
+                "build-server",
+                "resolve",
+                "--socket",
+                str(socket),
+                "--target",
+                target,
+                "--key",
+                key,
+                "paged_attention",
+                "trtllm_repeated",
+                str(revision),
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+    return (
+        f"worker_config.engine_revision={engine}",
+        "decode_attention_backend=trtllm_repeated",
+    )
 
 
 def _start_count(base_url: str, name: str) -> tuple[threading.Thread, dict]:
@@ -2073,27 +2140,36 @@ def test_a_regression_of_the_epoch_on_trial_rolls_it_back(
 ):
     """A target that steps slower past the threshold rolls back by itself.
 
-    The target's executable walks every batch instead of replaying a graph, so
-    the same stream steps slower on it with no fault. The stream crosses the
-    switch and the rollback whole, the update ends unavailable with the
-    threshold's reason, and applying it again needs ``force``. Forced without
-    the threshold, the same slower target stands its trial: the threshold, and
-    nothing else, rolled it back.
+    The target's decode attention runs its kernel several times per call
+    (:func:`_slower_target`), so the same stream steps slower on it with no
+    fault. The stream crosses the switch and the rollback whole, the update
+    ends unavailable with the threshold's reason, the status states the rates
+    that decided it, and applying it again needs ``force``. Forced without
+    the threshold, the same slower target stands its trial: the threshold,
+    and nothing else, rolled it back.
     """
     name = "qwen3-live-regression"
     log = tmp_path / "server.log"
-    # The walk costs a step about a fifth more than a replay, so a threshold of
-    # a fifth would read the machine and not the regression.
+    # The baseline is the previous epoch's steps up to the switch, which the
+    # target's loading and capture on the same GPU lengthen (to 1.16 times
+    # their length before the preparation, as the transfer control read them
+    # in one run): a fifth past such a baseline is still well short of the
+    # target's 69%.
+    regression = 0.2
     thresholds = (
-        "update_config.rollback.step_time_regression=0.05",
+        f"update_config.rollback.step_time_regression={regression}",
         f'update_config.rollback.window="{TRIAL_WINDOW_S}s"',
     )
     with _serve(runtime, log, name) as base_url:
         answer = _chat(base_url, name, RECOVERY_PROMPT, tokens=32)
-        slower = _slower_engine(tmp_path)
+        slower = _slower_target(tmp_path)
+        # The stream runs through the preparation, the switch, a whole window
+        # of the trial and the rollback's drain, which the count outlasts only
+        # when it starts with the update: it takes little more than half a
+        # minute at the deployment's steps. The preparation's own seconds give
+        # the baseline its window.
         streaming, streamed = _start_count(base_url, name)
-        time.sleep(TRIAL_WINDOW_S + 2)
-        result = _apply(base_url, slower, *thresholds)
+        result = _apply(base_url, *slower, *thresholds)
         assert result["change"] == "epoch", result
         wait_until(
             lambda: update_report(base_url).get("phase") == "rolled_back",
@@ -2103,11 +2179,11 @@ def test_a_regression_of_the_epoch_on_trial_rolls_it_back(
         update = update_report(base_url)
         assert update["failure"]["kind"] == "step_time_regression", update
         print("rolled back:", json.dumps(update))
+        # The status states the rates the decision read.
         (replica,) = update["trial"]["replicas"]
         assert replica["baseline"]["tokens_per_second"] > 0, update
-        assert replica["rates"]["step_us"] > replica["baseline"]["step_us"], (
-            update
-        )
+        baseline = replica["baseline"]["step_us"]
+        assert replica["rates"]["step_us"] > baseline * (1 + regression), update
         _assert_whole(streaming, streamed)
         after = _chat(base_url, name, RECOVERY_PROMPT, tokens=32)
         assert (
@@ -2115,13 +2191,13 @@ def test_a_regression_of_the_epoch_on_trial_rolls_it_back(
             == answer["choices"][0]["message"]["content"]
         )
 
-        again = apply_config(base_url, slower)
+        again = apply_config(base_url, *slower)
         assert again.status_code != 200, again.text
         assert "force" in again.text, again.text
 
         streaming, streamed = _start_count(base_url, name)
         time.sleep(TRIAL_WINDOW_S + 2)
-        forced = apply_config(base_url, slower, force=True)
+        forced = apply_config(base_url, *slower, force=True)
         assert forced.status_code == 200, forced.text
         _on_trial(base_url)
         time.sleep(2 * TRIAL_WINDOW_S)

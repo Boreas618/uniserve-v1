@@ -1770,16 +1770,17 @@ impl Replica {
     }
 
     /// Waits for the next thing an update's follower acts on: the update's
-    /// progress, its `deadline` (which rolls it back, once), or the next
-    /// reading of `trial`'s thresholds (a threshold passed rolls it back).
-    /// Returns update `number`'s phase afterwards; `None` once another
-    /// update, or none, is what the updater states.
+    /// progress, its `deadline` (which rolls it back, once), or, once its
+    /// trial began (`on_trial`), the next reading of the trial's thresholds
+    /// (a threshold passed rolls it back). Returns update `number`'s phase
+    /// afterwards; `None` once another update, or none, is what the updater
+    /// states.
     async fn next_phase(
         updater: &crate::updates::Updater,
         number: u64,
         phases: &mut watch::Receiver<Option<(u64, Phase)>>,
         deadline: &mut Option<Instant>,
-        trial: Option<&crate::updates::trial::Trial>,
+        on_trial: bool,
     ) -> Option<Phase> {
         let expiry = async {
             match *deadline {
@@ -1788,9 +1789,10 @@ impl Replica {
             }
         };
         let reading = async {
-            match trial {
-                Some(_) => tokio::time::sleep(crate::updates::trial::INTERVAL).await,
-                None => std::future::pending().await,
+            if on_trial {
+                tokio::time::sleep(crate::updates::trial::INTERVAL).await;
+            } else {
+                std::future::pending::<()>().await;
             }
         };
         tokio::select! {
@@ -1804,9 +1806,7 @@ impl Replica {
                 updater.expire(number);
             }
             () = reading => {
-                if let Some(failure) = trial.and_then(|trial| trial.breach(request_counts()))
-                    && updater.fail_trial(failure.clone())
-                {
+                if let Some(failure) = updater.read_trial(number, request_counts()) {
                     warn!(
                         number,
                         kind = %failure.kind,
@@ -1833,30 +1833,28 @@ impl Replica {
         modules: crate::epoch::ModuleSet,
     ) {
         let mut phases = updater.watch();
-        let mut trial: Option<Arc<crate::updates::trial::Trial>> = None;
+        let mut on_trial = false;
         let mut phase = updater.phase_of(number);
         loop {
             match phase {
-                Some(Phase::Trial) if trial.is_none() => {
+                Some(Phase::Trial) if !on_trial => {
                     // Serving and the update share an epoch, so the baseline
                     // ends where the switch began.
-                    let began = updater.switch_began().unwrap_or_else(Instant::now);
+                    let switch = updater.switch_began().unwrap_or_else(Instant::now);
                     let observed = self.hold.client().map(|client| {
                         crate::updates::trial::Baseline::new(
                             Arc::clone(&self.observer),
                             client.epoch(),
                             client.epoch(),
                             options.rollback.window,
-                            began,
+                            switch,
                         )
                     });
-                    let began = Arc::new(crate::updates::trial::Trial::begin(
+                    on_trial = updater.begin_trial(crate::updates::trial::Trial::begin(
                         options.rollback.clone(),
                         observed.into_iter().collect(),
                         request_counts(),
                     ));
-                    updater.begin_trial(Arc::clone(&began));
-                    trial = Some(began);
                 }
                 Some(Phase::Committed) => {
                     // The configuration and the module set are what the next
@@ -1876,14 +1874,7 @@ impl Replica {
                 Some(Phase::RolledBack | Phase::Abandoned) | None => return,
                 Some(Phase::Preparing | Phase::Switching | Phase::Trial) => {}
             }
-            phase = Self::next_phase(
-                updater,
-                number,
-                &mut phases,
-                &mut deadline,
-                trial.as_deref(),
-            )
-            .await;
+            phase = Self::next_phase(updater, number, &mut phases, &mut deadline, on_trial).await;
         }
     }
 
@@ -2005,7 +1996,7 @@ impl Replica {
                         return;
                     }
                 }
-                next = Self::next_phase(updater, number, &mut phases, &mut deadline, None) => {
+                next = Self::next_phase(updater, number, &mut phases, &mut deadline, false) => {
                     phase = next;
                 }
             }
@@ -2079,31 +2070,13 @@ impl Replica {
         );
 
         // The trial: the steps the previous epoch served before the switch
-        // are what the target's are read against, replica by replica.
-        let began = updater.switch_began().unwrap_or_else(Instant::now);
+        // are what the target's are read against, replica by replica, from
+        // when the switch ended.
         let previous_epoch = before
             .iter()
             .find_map(|(client, _)| client.as_ref())
             .map_or(0, |client| client.epoch());
-        let baselines = routed
-            .iter()
-            .take(previous.len())
-            .map(|replica| {
-                crate::updates::trial::Baseline::new(
-                    Arc::clone(&replica.observer),
-                    epoch,
-                    previous_epoch,
-                    options.rollback.window,
-                    began,
-                )
-            })
-            .collect();
-        let trial = Arc::new(crate::updates::trial::Trial::begin(
-            options.rollback.clone(),
-            baselines,
-            request_counts(),
-        ));
-        updater.begin_trial(Arc::clone(&trial));
+        let mut on_trial = false;
 
         // The previous engines' ends, when the trial stops them: their nodes
         // then keep the weights alone.
@@ -2123,6 +2096,30 @@ impl Replica {
         let mut returned = false;
         let mut phase = updater.phase_of(number);
         while phase.is_some_and(|phase| !phase.ended()) {
+            // The trial begins once every serving engine drained: the target's
+            // steps while both epochs stepped, its warm-up and the first steps
+            // of the requests migrated to it are not its trial's.
+            if phase == Some(Phase::Trial) && !on_trial {
+                let switch = updater.switch_began().unwrap_or_else(Instant::now);
+                let baselines = routed
+                    .iter()
+                    .take(previous.len())
+                    .map(|replica| {
+                        crate::updates::trial::Baseline::new(
+                            Arc::clone(&replica.observer),
+                            epoch,
+                            previous_epoch,
+                            options.rollback.window,
+                            switch,
+                        )
+                    })
+                    .collect();
+                on_trial = updater.begin_trial(crate::updates::trial::Trial::begin(
+                    options.rollback.clone(),
+                    baselines,
+                    request_counts(),
+                ));
+            }
             // A rollback of an epoch whose engines the trial stopped, or that
             // exited, starts them again on the weights they kept, a replica's
             // world at a time.
@@ -2212,7 +2209,7 @@ impl Replica {
                     number,
                     &mut phases,
                     &mut deadline,
-                    Some(trial.as_ref()),
+                    on_trial,
                 ) => phase = next,
             }
         }

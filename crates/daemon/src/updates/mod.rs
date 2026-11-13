@@ -89,8 +89,9 @@ pub(crate) struct Updater {
 struct State {
     processes: Processes,
     update: Option<Update>,
-    /// The thresholds the update on trial is read against.
-    trial: Option<Arc<Trial>>,
+    /// The thresholds the update on trial is read against, from when it
+    /// began its trial.
+    trial: Option<Trial>,
     /// The serving epoch's steps against their baseline while an epoch
     /// update's target prepares.
     transfers: Option<Arc<Mutex<StepTime>>>,
@@ -113,7 +114,7 @@ impl State {
     /// `report` with what the update's trial and transfers read.
     fn completed(&self, mut report: Value) -> Value {
         if let Some(trial) = &self.trial {
-            report["trial"] = trial.report(crate::leader::request_counts());
+            report["trial"] = trial.report();
         }
         if let Some(steps) = &self.transfers {
             report["transfers"] = serde_json::to_value(*service::lock(steps)).unwrap_or_default();
@@ -318,23 +319,27 @@ impl Updater {
         Some(report)
     }
 
-    /// The trial's `failure` rolls the update on trial back: `false` when no
-    /// update stands on trial, so a threshold read while the update ended
-    /// decides nothing.
-    pub(crate) fn fail_trial(&self, failure: Failure) -> bool {
+    /// Reads the thresholds of update `number` once, `counts` being the
+    /// requests counted now: a threshold passed rolls the update back, with
+    /// the threshold as its failure, which this returns. Nothing is read
+    /// unless the update stands on trial, so the status keeps the reading
+    /// that decided a rollback, and a reading cannot decide an update that a
+    /// commit or a rollback already ended.
+    pub(crate) fn read_trial(&self, number: u64, counts: (u64, u64)) -> Option<Failure> {
         let mut state = self.lock();
         let State {
-            processes, update, ..
+            processes,
+            update,
+            trial,
+            ..
         } = &mut *state;
-        let Some(update) = update.as_mut() else {
-            return false;
-        };
-        if update.phase() != Phase::Trial {
-            return false;
-        }
-        update.rollback(processes, failure);
+        let update = update
+            .as_mut()
+            .filter(|update| update.number() == number && update.phase() == Phase::Trial)?;
+        let failure = trial.as_mut()?.read(counts)?;
+        update.rollback(processes, failure.clone());
         self.settle(&mut state);
-        true
+        Some(failure)
     }
 
     /// Rolls update `number` back if its deadline passed.
@@ -351,9 +356,16 @@ impl Updater {
     }
 
     /// `trial` decides the update in flight from now on, and the status
-    /// reports it.
-    pub(crate) fn begin_trial(&self, trial: Arc<Trial>) {
-        self.lock().trial = Some(trial);
+    /// reports it. A trial begins when the switch ended (`specs/updates.md`
+    /// §3.7): `false`, and nothing begins, unless the update in flight stands
+    /// on trial.
+    pub(crate) fn begin_trial(&self, trial: Trial) -> bool {
+        let mut state = self.lock();
+        if state.update.as_ref().map(Update::phase) != Some(Phase::Trial) {
+            return false;
+        }
+        state.trial = Some(trial);
+        true
     }
 
     /// `steps` holds the serving epoch's steps against their baseline while

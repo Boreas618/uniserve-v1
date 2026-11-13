@@ -7,12 +7,15 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use proto::process::{self, command};
+use proto::report::SchedulerStats;
 use testkit::process::Refusals;
 
 use crate::epoch::{Epoch, EpochRecord, Epochs, Failure, PackageRevision, Status};
-use crate::options::{PreviousEpoch, ServerArgs, UpdateConfig};
+use crate::observe::Observer;
+use crate::options::{PreviousEpoch, RollbackConfig, ServerArgs, UpdateConfig};
 use crate::supervision::processes::Processes;
 use crate::test_support::Engines;
+use crate::updates::trial::{Baseline, Trial};
 use crate::updates::update::{EpochSwitch, Node, Phase, Update};
 use crate::updates::{Transition, Updater};
 
@@ -476,40 +479,6 @@ fn a_rollback_by_decision_returns_to_the_kept_generation() {
     );
     // Another target is not marked.
     assert_eq!(deployment.updater.unavailable(&deployment.serving), None);
-}
-
-/// A threshold decides only an update on trial, and rolls it back with the
-/// threshold as its failure.
-#[test]
-fn a_threshold_rolls_back_only_an_update_on_trial() {
-    let mut deployment = Deployment::new(Refusals::default());
-    let regression = Failure {
-        kind: "step_time_regression".to_owned(),
-        reason: "steps take 900 us against 600 us".to_owned(),
-        device: None,
-    };
-    assert!(
-        !deployment.updater.fail_trial(regression.clone()),
-        "no update is in flight"
-    );
-
-    let update = deployment.generation(1, 1, None);
-    deployment
-        .updater
-        .apply(update)
-        .expect("no update is in flight");
-    assert!(
-        !deployment.updater.fail_trial(regression.clone()),
-        "the update still prepares"
-    );
-    deployment.run();
-    assert!(deployment.updater.fail_trial(regression));
-    deployment.run();
-    assert_eq!(deployment.status()["phase"], "rolled_back");
-    assert_eq!(
-        deployment.status()["failure"]["kind"],
-        "step_time_regression"
-    );
 }
 
 /// A trial not committed by its deadline is rolled back by the daemon; one
@@ -985,6 +954,108 @@ fn a_rollback_on_trial_promotes_the_previous_epoch_before_the_target_drains() {
         .expect("the rollback's claim");
     assert_eq!((retiring.epoch, retiring.retire), (SERVING, vec![TARGET]));
     assert!(deployment.updater.unavailable(&deployment.target).is_some());
+}
+
+/// A report of `batches` batches of `step_us` each, one query token apiece.
+fn steps(step_us: u64, batches: u64) -> SchedulerStats {
+    SchedulerStats {
+        batch_roundtrip_us: step_us * batches,
+        batch_count: batches,
+        batch_tokens: batches,
+        ..Default::default()
+    }
+}
+
+/// A trial begins only once the switch ended, and a threshold decides only
+/// an update on trial. Over the steps of an exploratory run, a serving epoch
+/// at 10666 us whose target averaged 29744 us over its warm-up while both
+/// epochs stepped: the switch's steps are not the trial's, and the target,
+/// at 9829 us on trial, stands. Once its average passes the regression it
+/// rolls back with the threshold as its failure, and the status keeps the
+/// rates that decided it, whatever the target computes after the decision.
+#[test]
+fn a_threshold_reads_the_trial_from_the_switchs_end_and_the_status_keeps_its_inputs() {
+    let window = Duration::from_millis(40);
+    let thresholds = RollbackConfig {
+        step_time_regression: Some(0.05),
+        window: Some(window),
+        ..Default::default()
+    };
+    let observer = Arc::new(Observer::default());
+    let trial = |observer: &Arc<Observer>, switch: Instant| {
+        let replica = Baseline::new(
+            Arc::clone(observer),
+            TARGET,
+            SERVING,
+            thresholds.window,
+            switch,
+        );
+        Trial::begin(thresholds.clone(), vec![replica], (0, 0))
+    };
+    let mut deployment = Deployment::new(Refusals::default());
+    assert_eq!(deployment.updater.read_trial(1, (0, 0)), None, "no update");
+
+    observer.record(SERVING, 0, &steps(10_666, 400));
+    let update = deployment.epoch(1, PreviousEpoch::Parked, None);
+    deployment
+        .updater
+        .apply(update)
+        .expect("no update is in flight");
+    deployment.engines.start_spawned(BUILD);
+    deployment.engines.engine(SPAWNED).withhold();
+    deployment.run();
+    assert_eq!(deployment.updater.in_flight(), Some((1, Phase::Switching)));
+    let switch = deployment.updater.switch_began().expect("the switch began");
+
+    // The target's first batches, while the serving epoch still steps.
+    observer.record(TARGET, 0, &steps(29_744, 3));
+    assert!(
+        !deployment.updater.begin_trial(trial(&observer, switch)),
+        "the switch has not ended"
+    );
+    assert_eq!(deployment.updater.read_trial(1, (0, 0)), None);
+
+    deployment.release(SPAWNED);
+    assert_eq!(deployment.updater.in_flight(), Some((1, Phase::Trial)));
+    std::thread::sleep(Duration::from_millis(2));
+    assert!(deployment.updater.begin_trial(trial(&observer, switch)));
+    std::thread::sleep(window);
+    observer.record(TARGET, 0, &steps(9_829, 400));
+    assert_eq!(deployment.updater.read_trial(1, (0, 0)), None);
+    let replica = &deployment.status()["trial"]["replicas"][0];
+    assert_eq!(replica["rates"]["step_us"], 9_829.0);
+    assert_eq!(replica["baseline"]["step_us"], 10_666.0);
+
+    // Steps of 15,000 us bring the window's average past 5% over the
+    // baseline, whether or not it still holds the steps of 9829 us.
+    observer.record(TARGET, 0, &steps(15_000, 400));
+    let failure = deployment
+        .updater
+        .read_trial(1, (0, 0))
+        .expect("a regression past 5%");
+    assert_eq!(failure.kind, "step_time_regression");
+    let decided = deployment.status()["trial"]["replicas"][0]["rates"]["step_us"]
+        .as_f64()
+        .expect("the reading's step time");
+    assert!(decided > 10_666.0 * 1.05, "{decided}");
+    assert!(
+        failure
+            .reason
+            .contains(&format!("{decided:.0} us against 10666 us")),
+        "{failure:?}"
+    );
+
+    // The target drains beside the previous epoch, faster: what decided
+    // stays what the status states.
+    deployment.run();
+    observer.record(TARGET, 0, &steps(5_000, 4_000));
+    assert_eq!(deployment.updater.read_trial(1, (0, 0)), None);
+    let status = deployment.status();
+    assert_eq!(status["phase"], "rolled_back");
+    assert_eq!(status["failure"]["kind"], "step_time_regression");
+    let replica = &status["trial"]["replicas"][0];
+    assert_eq!(replica["rates"]["step_us"], decided);
+    assert_eq!(replica["baseline"]["step_us"], 10_666.0);
 }
 
 /// A target that faults on trial is stopped, not drained, and the previous
