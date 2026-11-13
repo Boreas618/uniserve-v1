@@ -51,7 +51,7 @@ use crossbeam_channel::Sender;
 use ipc::batch::{Batch, BatchId, BatchOutput};
 use proto::config::{SchedulerConfig, WorkerGroupConfig};
 use proto::report::SchedulerStats;
-use proto::request::{Event, FinishReason, MigrationCause, RequestId};
+use proto::request::{Event, FinishReason, GenerationLimits, MigrationCause, RequestId};
 use scheduling_guest::Parameters;
 use storage::runtime::{self, Cause, Completion, GroupId, OwnerId, Tier};
 use storage::{Key, QueuePair};
@@ -229,6 +229,13 @@ pub trait Executor: Send {
 )]
 pub struct Scheduler {
     config: SchedulerConfig,
+    /// The generation limits requests are checked against at their arrival: the model's sizing
+    /// facts lowered to what the groups' executors hold (SD §7.1), with the features the groups'
+    /// phases serve.
+    limits: GenerationLimits,
+    /// The engine epoch of the session, which names the private continuation of a token request
+    /// that arrives without one (`cache.resume`, SD §3.2).
+    epoch: u64,
     requests: HashMap<RequestId, Request>,
     waiting: VecDeque<RequestId>,
     running: Vec<RequestId>,
@@ -303,7 +310,9 @@ impl Scheduler {
     /// A scheduler of the session the engine opened with `layout` and that `opened` answered:
     /// the `scheduler`-th of `layout.schedulers`, which is its data-parallel rank, on its end of
     /// its queue pair. `groups` are its worker groups' configurations and the capacities their
-    /// executors stated, in the order `layout.schedulers` lists its groups.
+    /// executors stated, in the order `layout.schedulers` lists its groups. `limits` are the
+    /// generation limits the engine resolved for the deployment; their features are the ones the
+    /// groups' phases serve.
     ///
     /// # Errors
     ///
@@ -316,6 +325,7 @@ impl Scheduler {
     )]
     pub fn new(
         config: SchedulerConfig,
+        limits: GenerationLimits,
         layout: &runtime::Open,
         opened: &runtime::Opened,
         scheduler: usize,
@@ -373,8 +383,14 @@ impl Scheduler {
         // one session never draw the same owner; the buffer pool takes an owner number only
         // above every one it took, so neither counter starts at 0.
         let rank = u64::try_from(scheduler).unwrap_or(u64::MAX) & 0xffff;
+        let limits = GenerationLimits {
+            features: request::served_features(&workers),
+            ..limits
+        };
         Ok(Self {
             config,
+            limits,
+            epoch: layout.epoch,
             requests: HashMap::new(),
             waiting: VecDeque::new(),
             running: Vec::new(),

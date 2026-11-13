@@ -117,7 +117,7 @@ impl WorkerGroup {
         let stage = self.stage(phase);
         let takes = match stage {
             Phase::Denoise => phase == Phase::LatentPrepare,
-            _ => in_flight(request, phase) == 1,
+            _ => request.in_flight(phase) == 1,
         };
         if takes && let Some(occupied) = self.occupied.get_mut(stage.index()) {
             *occupied += 1;
@@ -135,7 +135,7 @@ impl WorkerGroup {
                 phase == Phase::Denoise
                     && request.completed[Phase::Denoise.index()] == self.capacity.denoise_steps
             }
-            _ => in_flight(request, phase) == 0,
+            _ => request.in_flight(phase) == 0,
         };
         if gives_up {
             self.release(stage);
@@ -184,7 +184,7 @@ impl WorkerGroup {
                 request.scheduled[Phase::LatentPrepare.index()] > 0
                     && request.completed[Phase::Denoise.index()] < self.capacity.denoise_steps
             }
-            _ => in_flight(request, phase) > 0,
+            _ => request.in_flight(phase) > 0,
         }
     }
 
@@ -192,18 +192,6 @@ impl WorkerGroup {
         if let Some(occupied) = self.occupied.get_mut(stage.index()) {
             *occupied = occupied.saturating_sub(1);
         }
-    }
-}
-
-/// The calls of `phase` of `request` handed to executors whose output has not been counted;
-/// 0 for a phase that names none.
-fn in_flight(request: &Request, phase: Phase) -> u32 {
-    match (
-        request.scheduled.get(phase.index()),
-        request.completed.get(phase.index()),
-    ) {
-        (Some(scheduled), Some(completed)) => scheduled.saturating_sub(*completed),
-        _ => 0,
     }
 }
 
@@ -545,6 +533,7 @@ mod tests {
         let (output, _) = crossbeam_channel::unbounded();
         let mut scheduler = Scheduler::new(
             SchedulerConfig::default(),
+            proto::request::GenerationLimits::default(),
             &layout,
             &opened,
             0,

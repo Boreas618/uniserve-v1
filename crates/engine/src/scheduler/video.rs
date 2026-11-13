@@ -1008,6 +1008,7 @@ mod tests {
         let (output, _) = crossbeam_channel::unbounded();
         Scheduler::new(
             SchedulerConfig::default(),
+            proto::request::GenerationLimits::default(),
             &layout,
             &opened,
             0,

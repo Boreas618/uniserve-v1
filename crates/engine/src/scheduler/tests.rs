@@ -8,7 +8,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use proto::config::{SchedulerConfig, WorkerGroupConfig};
-use proto::request::GenerationRequest;
+use proto::request::{GenerationLimits, GenerationRequest};
 use storage::runtime::{self, Class, Completion, GroupId, OwnerId, Region, Tier};
 use storage::{Key, QueuePair};
 
@@ -141,6 +141,7 @@ pub(super) fn bench(ring_bytes: usize) -> Bench {
     let (output, _) = crossbeam_channel::unbounded();
     let scheduler = Scheduler::new(
         SchedulerConfig::default(),
+        GenerationLimits::default(),
         &layout,
         &opened,
         0,
