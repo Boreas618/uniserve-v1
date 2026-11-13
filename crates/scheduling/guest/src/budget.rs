@@ -23,7 +23,7 @@
 
 use crate::decision::{Room, Work};
 use crate::ids::{PhaseId, RequestId};
-use crate::view::PhaseKind;
+use crate::view::Phase;
 
 /// The tokens and calls one step may still spend.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -158,9 +158,9 @@ pub fn prefill_chunk(
 /// next call ([`crate::RequestView::next_tokens`]: a verification's `1 +
 /// drafts`, a denoising step's `latent units x guidance branches`, one for
 /// decode).
-pub fn work_tokens(kind: PhaseKind, chunk: u32, next_tokens: u32) -> u32 {
+pub fn work_tokens(kind: Phase, chunk: u32, next_tokens: u32) -> u32 {
     match kind {
-        PhaseKind::Prefill | PhaseKind::Refill => chunk,
+        Phase::Prefill | Phase::Refill => chunk,
         _ => next_tokens.max(1),
     }
 }
@@ -194,7 +194,7 @@ impl Step {
     ///
     /// `writes_prefix` says the call's phase writes the prefix cache, which
     /// draws on the warm-up bound as well as on the step's tokens
-    /// ([`PhaseKind::writes_prefix_cache`]).
+    /// ([`Phase::writes_prefix_cache`]).
     pub fn add(
         &mut self,
         request: RequestId,
@@ -328,10 +328,10 @@ mod tests {
 
     #[test]
     fn a_chunk_states_its_tokens_and_another_phase_its_charge() {
-        assert_eq!(work_tokens(PhaseKind::Prefill, 7, 5), 7);
-        assert_eq!(work_tokens(PhaseKind::Refill, 7, 5), 7);
-        assert_eq!(work_tokens(PhaseKind::Decode, 7, 1), 1);
-        assert_eq!(work_tokens(PhaseKind::Verify, 7, 9), 9);
-        assert_eq!(work_tokens(PhaseKind::Denoise, 7, 32), 32);
+        assert_eq!(work_tokens(Phase::Prefill, 7, 5), 7);
+        assert_eq!(work_tokens(Phase::Refill, 7, 5), 7);
+        assert_eq!(work_tokens(Phase::Decode, 7, 1), 1);
+        assert_eq!(work_tokens(Phase::Verify, 7, 9), 9);
+        assert_eq!(work_tokens(Phase::Denoise, 7, 32), 32);
     }
 }

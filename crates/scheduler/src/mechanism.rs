@@ -31,7 +31,7 @@ use scheduling::guest::decision::{DispatchOutput, Room, Shortage, Storage, Victi
 use scheduling::guest::event::Event;
 use scheduling::guest::wire::Call;
 use scheduling::guest::{
-    CallView, EncodingId, EncodingView, Nanos, PageId, PageView, PhaseId, PhaseKind, PhaseView,
+    CallView, EncodingId, EncodingView, Nanos, PageId, PageView, Phase, PhaseId, PhaseView,
     RankView, ReplicaView, RequestId, RequestStatus, RequestView, Snapshot,
 };
 
@@ -193,11 +193,8 @@ fn invalid(call: Call, message: impl Into<String>) -> PolicyError {
 
 /// Whether a phase kind is a decode-stage call, which never lands on a replica
 /// that runs prefill only (today's `dispatch.rs`, prefill-only groups).
-fn decodes(kind: PhaseKind) -> bool {
-    matches!(
-        kind,
-        PhaseKind::Decode | PhaseKind::Verify | PhaseKind::TokenDenoise
-    )
+fn decodes(kind: Phase) -> bool {
+    matches!(kind, Phase::Decode | Phase::Verify)
 }
 
 /// Checks one step's output against the live state and the room it was offered
@@ -320,7 +317,7 @@ fn validate_work(output: &DispatchOutput, room: &Room, live: &Live<'_>) -> Resul
     let mut prefill_tokens = 0u64;
     // The tokens of each (stage, kind) group: a batch is one numerical call
     // on one stage, so the graph tier bounds the group, not the step.
-    let mut groups: Vec<((u32, PhaseKind), u64)> = Vec::new();
+    let mut groups: Vec<((u32, Phase), u64)> = Vec::new();
 
     // A request the output admits is running for the work the same output gives
     // it: the step applies admission before the work, which is what lets one
@@ -448,7 +445,7 @@ fn validate_work_entry(
         ));
     };
     match phase.kind {
-        PhaseKind::Refill => {
+        Phase::Refill => {
             return Err(invalid(
                 Call::Dispatch,
                 format!(
@@ -457,7 +454,7 @@ fn validate_work_entry(
                 ),
             ));
         }
-        PhaseKind::Prefill => {
+        Phase::Prefill => {
             // The mechanism states the charge of the call it will schedule: a
             // prompt chunk is sized by the policy against what is left, and a
             // structural write (a close cache, a feedback state, a block's
@@ -1235,7 +1232,7 @@ mod tests {
         }
     }
 
-    fn live(requests: Vec<RequestView>, kinds: &[(u32, PhaseKind)]) -> Live<'static> {
+    fn live(requests: Vec<RequestView>, kinds: &[(u32, Phase)]) -> Live<'static> {
         let mut live = Live {
             requests: std::borrow::Cow::Owned(requests.into_iter().map(|r| (r.id, r)).collect()),
             pages: std::borrow::Cow::Owned(BTreeMap::new()),
@@ -1339,7 +1336,7 @@ mod tests {
         prefilling.prefilled_tokens = 40;
         let live = live(
             vec![decoding, prefilling],
-            &[(0, PhaseKind::Prefill), (1, PhaseKind::Decode)],
+            &[(0, Phase::Prefill), (1, Phase::Decode)],
         );
 
         // The prefill may write what is left of the prompt and not a token more.
@@ -1399,7 +1396,7 @@ mod tests {
                     r
                 },
             ],
-            &[(0, PhaseKind::Prefill)],
+            &[(0, Phase::Prefill)],
         );
         let mut r = room();
         r.token_budget = 100;
@@ -1599,7 +1596,7 @@ mod tests {
         // tree that measures the chunk against the waiting view refuses this
         // output and fails here.
         let queued = request(1, RequestStatus::Waiting);
-        let live = live(vec![queued], &[(0, PhaseKind::Prefill)]);
+        let live = live(vec![queued], &[(0, Phase::Prefill)]);
         let work = Work {
             request: RequestId(1),
             phase: PhaseId(0),
@@ -1690,7 +1687,7 @@ mod tests {
             ReplicaView {
                 index: 0,
                 block: StageId(0),
-                kinds: vec![PhaseKind::Prefill],
+                kinds: vec![Phase::Prefill],
                 running_requests: 1,
                 capacity: 1,
                 holds_request: false,
@@ -1700,7 +1697,7 @@ mod tests {
             ReplicaView {
                 index: 1,
                 block: StageId(1),
-                kinds: vec![PhaseKind::Decode],
+                kinds: vec![Phase::Decode],
                 running_requests: 4,
                 capacity: 0,
                 holds_request: false,
@@ -1711,7 +1708,7 @@ mod tests {
         let call = CallView {
             request: RequestId(9),
             phase: PhaseId(1),
-            kind: PhaseKind::Decode,
+            kind: Phase::Decode,
         };
         validate_place(&call, &replicas, 1).expect("a full replica still runs the call");
         let error = validate_place(&call, &replicas, 0).expect_err("prefill only");
@@ -1719,7 +1716,7 @@ mod tests {
         let call = CallView {
             request: RequestId(9),
             phase: PhaseId(1),
-            kind: PhaseKind::Mux,
+            kind: Phase::Mux,
         };
         let error = validate_place(&call, &replicas, 1).expect_err("cannot run it");
         assert!(format!("{error}").contains("does not run"));
@@ -1847,7 +1844,7 @@ mod tests {
                 r.next_tokens = 1;
                 r
             }],
-            &[(0, PhaseKind::Prefill), (1, PhaseKind::Decode)],
+            &[(0, Phase::Prefill), (1, Phase::Decode)],
         );
         let mut output = output(vec![Work {
             request: RequestId(2),

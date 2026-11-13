@@ -36,8 +36,8 @@ use crate::lru::Lru;
 use crate::phases::Phases;
 use crate::policy::Policy;
 use crate::view::{
-    CallView, PhaseClass, PhaseKind, RankView, ReplicaView, RequestClass, RequestStatus,
-    RequestView, Snapshot,
+    CallView, Phase, PhaseClass, RankView, ReplicaView, RequestClass, RequestStatus, RequestView,
+    Snapshot,
 };
 use crate::waiting::{Order, Waiting};
 
@@ -52,9 +52,9 @@ pub const PREFILL_WINDOW_CREDITS: u32 = 2;
 /// and is assembled with the prefills (`batching.rs`: `refill_due` counts as
 /// prefill-ready and `prepare_refill` schedules a prefill call), so it belongs with
 /// the context work whatever class its phase kind carries.
-fn class_of(kind: PhaseKind) -> PhaseClass {
+fn class_of(kind: Phase) -> PhaseClass {
     match kind {
-        PhaseKind::Refill => PhaseClass::Context,
+        Phase::Refill => PhaseClass::Context,
         other => other.class(),
     }
 }
@@ -139,7 +139,7 @@ impl<K: Order> Arrival<K> {
     }
 
     /// The phase kind of a request's next call, if it has one ready.
-    fn next_kind(&self, view: &RequestView) -> Option<PhaseKind> {
+    fn next_kind(&self, view: &RequestView) -> Option<Phase> {
         view.phase.map(|phase| self.phases.kind(phase))
     }
 
@@ -188,7 +188,7 @@ impl<K: Order> Arrival<K> {
             .collect();
         order.sort_by_key(|id| {
             let view = &self.views[id];
-            let kind = self.next_kind(view).unwrap_or(PhaseKind::Other);
+            let kind = self.next_kind(view).unwrap_or(Phase::Other);
             let media = view.class == RequestClass::Media;
             // The path the policy did not prefer comes second.
             let path = u8::from(media != self.media_first);
@@ -635,7 +635,7 @@ impl<K: Order> Policy for Arrival<K> {
     fn place(&mut self, call: &CallView, replicas: &[ReplicaView]) -> usize {
         // A decode-stage call never lands on a replica that only prefills
         // (today's prefill groups).
-        let decode_stage = matches!(call.kind, PhaseKind::Decode | PhaseKind::Verify);
+        let decode_stage = matches!(call.kind, Phase::Decode | Phase::Verify);
         let mut candidates = replicas.iter().filter(|replica| {
             replica.kinds.contains(&call.kind) && !(decode_stage && replica.prefills_only)
         });
@@ -708,12 +708,12 @@ mod tests {
                 phases: vec![
                     PhaseView {
                         id: PhaseId(0),
-                        kind: PhaseKind::Prefill,
+                        kind: Phase::Prefill,
                         block: StageId(0),
                     },
                     PhaseView {
                         id: PhaseId(1),
-                        kind: PhaseKind::Decode,
+                        kind: Phase::Decode,
                         block: StageId(0),
                     },
                 ],
@@ -1138,13 +1138,13 @@ mod tests {
         let call = CallView {
             request: RequestId(1),
             phase: PhaseId(1),
-            kind: PhaseKind::Decode,
+            kind: Phase::Decode,
         };
         let replicas = [
             ReplicaView {
                 index: 0,
                 block: StageId(0),
-                kinds: vec![PhaseKind::Decode],
+                kinds: vec![Phase::Decode],
                 running_requests: 0,
                 capacity: 4,
                 holds_request: false,
@@ -1154,7 +1154,7 @@ mod tests {
             ReplicaView {
                 index: 1,
                 block: StageId(0),
-                kinds: vec![PhaseKind::Decode],
+                kinds: vec![Phase::Decode],
                 running_requests: 3,
                 capacity: 4,
                 holds_request: false,
@@ -1182,12 +1182,12 @@ mod tests {
                 phases: vec![
                     PhaseView {
                         id: PhaseId(0),
-                        kind: PhaseKind::Prefill,
+                        kind: Phase::Prefill,
                         block: StageId(0),
                     },
                     PhaseView {
                         id: PhaseId(1),
-                        kind: PhaseKind::Decode,
+                        kind: Phase::Decode,
                         block: StageId(0),
                     },
                 ],
@@ -1290,17 +1290,17 @@ mod tests {
                 phases: vec![
                     PhaseView {
                         id: PhaseId(0),
-                        kind: PhaseKind::Prefill,
+                        kind: Phase::Prefill,
                         block: StageId(0),
                     },
                     PhaseView {
                         id: PhaseId(1),
-                        kind: PhaseKind::Decode,
+                        kind: Phase::Decode,
                         block: StageId(0),
                     },
                     PhaseView {
                         id: PhaseId(2),
-                        kind: PhaseKind::Denoise,
+                        kind: Phase::Denoise,
                         block: StageId(1),
                     },
                 ],
@@ -1391,17 +1391,17 @@ mod tests {
                 phases: vec![
                     PhaseView {
                         id: PhaseId(0),
-                        kind: PhaseKind::Prefill,
+                        kind: Phase::Prefill,
                         block: StageId(0),
                     },
                     PhaseView {
                         id: PhaseId(1),
-                        kind: PhaseKind::Decode,
+                        kind: Phase::Decode,
                         block: StageId(0),
                     },
                     PhaseView {
                         id: PhaseId(2),
-                        kind: PhaseKind::Denoise,
+                        kind: Phase::Denoise,
                         block: StageId(1),
                     },
                 ],

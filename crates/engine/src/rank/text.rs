@@ -94,7 +94,7 @@ impl ModelRunner {
                 let images = model.vision().is_some();
                 let mut phases = served_phases(&self.buckets, drafts > 0);
                 if images {
-                    phases.push(super::buckets::phase(scheduler::PhaseKind::VisionEncoding));
+                    phases.push(super::buckets::phase(ipc::batch::Phase::VisionEncode));
                     phases.sort_by_key(|phase| phase.0);
                     phases.dedup();
                 }

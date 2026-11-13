@@ -214,7 +214,7 @@ impl ModelRunner {
         // A latent preparation opens the trajectory the denoiser steps, so the denoiser serves its
         // phase beside its steps.
         let mut denoise_phases = served_phases(&denoise_set, false);
-        denoise_phases.push(phase(scheduler::PhaseKind::LatentPrepare));
+        denoise_phases.push(phase(ipc::batch::Phase::LatentPrepare));
         let denoise = media_denoiser::DenoiserRunner::new(
             Binding {
                 id: RunnerId(1),

@@ -116,10 +116,7 @@ pub use proto::config::{
     DEFAULT_CHUNKED_PREFILL_SIZE, DEFAULT_MAX_BATCH, DEFAULT_MAX_NUM_BATCHED_TOKENS,
     DEFAULT_MAX_RUNNING_REQUESTS, SchedulerConfig,
 };
-/// The phases the scheduler schedules with, and the id each is numbered with: a rank's output, a policy's
-/// `DispatchOutput` and a batch's phase must all use this table, so it is exported from where the scheduler
-/// keeps it rather than restated by whoever needs a phase id.
-pub use scheduling::guest::view::{PhaseKind, RankView};
+pub use scheduling::guest::view::RankView;
 pub use stats::{
     DomainStats, EncoderStats, ExecutionDomainStats, GeneralStats, PrefixCacheUsage, PrefixStats,
     SchedulerStats, TimingStats, WorkerStats,

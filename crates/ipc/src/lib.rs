@@ -1,5 +1,8 @@
 //! Scheduler-to-main-process protocol and its rank transports.
 //!
+//! [`batch::Batch`] is the batch the scheduler hands to its executor and
+//! [`batch::BatchOutput`] what the batch produced: plain data that names a
+//! request's memory by positions in its tables, never by an address.
 //! [`NewRequest`] admits static state, [`execution::Batch`] is the batch the
 //! scheduler submits and the worker serves, and [`execution::BatchOutput`]
 //! returns its completions. [`MainProcessInfo`]
@@ -71,6 +74,8 @@ macro_rules! ensure_valid {
     };
 }
 
+/// The batch the scheduler hands to its executor, and what it produces.
+pub mod batch;
 pub mod channel;
 /// Failures at the channel boundary.
 pub mod error;
@@ -92,7 +97,6 @@ pub use launch::StorageLaunch;
 // Message types are split by concern and re-exported flat at the crate root;
 // each module takes the shared imports through `use super::*` and the
 // validation macros through textual scope.
-mod batch;
 mod cache;
 mod call;
 mod command;
@@ -111,10 +115,16 @@ mod tensor;
 /// The vocabulary of a generation update.
 pub mod update;
 
-pub use batch::*;
+// The parts of a call's completion both batches state, and the records of a call's memory that
+// only `execution::Batch` carries.
+pub use batch::{ArtifactHandle, DraftWork, ErrorCode, MediaOutput, TimingCounters};
 pub use cache::*;
 pub use call::*;
 pub use command::*;
+pub use execution::{
+    BlockTable, BufferAllocation, CacheUnitAllocation, DecodeRange, LatentOffload, LatentPageCopy,
+    LatentPoolRef, LatentRestore, LatentSource, PageCopy,
+};
 pub use identity::*;
 pub use info::*;
 pub use media::{SharedMedia, SharedMediaError};

@@ -2245,6 +2245,7 @@ dependencies = [
  "prost",
  "proto",
  "rmp-serde",
+ "scheduling-guest",
  "serde",
  "serde_json",
  "service",

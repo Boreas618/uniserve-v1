@@ -2,6 +2,7 @@
 //! with.
 
 use ipc::PhaseId;
+use ipc::batch::Phase;
 use ipc::execution::Variant;
 use worker::plan::Buckets;
 
@@ -118,31 +119,31 @@ pub(super) fn tier_refusal(
 /// device that did not state these three would refuse the first encode of every request.
 /// The one host call every rank serves: the encode of the units it decoded.
 pub(super) fn unit_phases() -> Vec<PhaseId> {
-    vec![phase(scheduler::PhaseKind::VideoEncode)]
+    vec![phase(Phase::VideoEncode)]
 }
 
 /// The phase id `kind` is planned as.
 ///
 /// # Panics
 ///
-/// For `PhaseKind::Other`, the policy-side placeholder numbered `u32::MAX`, which no rank plans.
+/// For `Phase::Other`, the policy-side placeholder numbered `u32::MAX`, which no rank plans.
 #[expect(
     clippy::expect_used,
     reason = "every kind a rank plans is numbered below 21; only the policy-side placeholder \
-              `PhaseKind::Other` is numbered past `u16`, and no rank plans it"
+              `Phase::Other` is numbered past `u16`, and no rank plans it"
 )]
-pub(super) fn phase(kind: scheduler::PhaseKind) -> PhaseId {
+pub(super) fn phase(kind: Phase) -> PhaseId {
     PhaseId(u16::try_from(scheduler::phase_id(kind).0).expect("a phase id fits"))
 }
 
 pub(super) fn host_phases() -> Vec<PhaseId> {
     [
-        scheduler::PhaseKind::VideoEncode,
-        scheduler::PhaseKind::AudioEncode,
-        scheduler::PhaseKind::Mux,
-        scheduler::PhaseKind::MediaRead,
-        scheduler::PhaseKind::VisionEncoding,
-        scheduler::PhaseKind::LatentEncoding,
+        Phase::VideoEncode,
+        Phase::AudioEncode,
+        Phase::Mux,
+        Phase::MediaRead,
+        Phase::VisionEncode,
+        Phase::LatentEncode,
     ]
     .into_iter()
     .map(phase)
@@ -150,48 +151,51 @@ pub(super) fn host_phases() -> Vec<PhaseId> {
 }
 
 pub(super) fn served_phases(buckets: &Buckets, verifies: bool) -> Vec<PhaseId> {
-    let mut kinds: Vec<scheduler::PhaseKind> = buckets
+    let mut kinds: Vec<Phase> = buckets
         .iter()
-        .map(|bucket| match bucket.variant {
-            Variant::PrefillWrite
-            | Variant::PrefillOutput
-            | Variant::PrefillGreedy
-            | Variant::PrefillScored => scheduler::PhaseKind::Prefill,
-            Variant::DecodeGreedy | Variant::DecodeSampled => scheduler::PhaseKind::Decode,
-            Variant::Encode => scheduler::PhaseKind::TextEncoding,
-            Variant::Denoise => scheduler::PhaseKind::Denoise,
-            // The scheduler plans a clip's decode as `VideoDecode` and a track's as `AudioDecode`
-            // (`call_phase`), so a device that advertised `ImageDecode` for either served no phase
-            // the scheduler ever planned - the same defect this function's doc records.
-            Variant::Decode => scheduler::PhaseKind::VideoDecode,
-            Variant::AudioDecode => scheduler::PhaseKind::AudioDecode,
-            // The artifact's three host calls are calls the mechanism submits and waits on, so the
-            // device states the phases they run in even though no graph serves them.
-            Variant::VideoEncode => scheduler::PhaseKind::VideoEncode,
-            Variant::AudioEncode => scheduler::PhaseKind::AudioEncode,
-            Variant::Mux => scheduler::PhaseKind::Mux,
-            Variant::LatentPrepare => scheduler::PhaseKind::LatentPrepare,
-            Variant::MediaRead => scheduler::PhaseKind::MediaRead,
-            // The two encoders whose work a later call computes are answered as they arrive, under
-            // the phase of either: a bucket of this variant names no one of them.
-            Variant::ConditionEncode => scheduler::PhaseKind::VisionEncoding,
-            // A join is no phase a scheduler plans: a peer opens the step, and the union wakes
-            // this rank for it.
-            Variant::ExpertJoin => scheduler::PhaseKind::Decode,
-            // A step of a diffusion language model over a block of tokens.
-            Variant::TokenDenoise => scheduler::PhaseKind::TokenDenoise,
+        .filter_map(|bucket| {
+            Some(match bucket.variant {
+                Variant::PrefillWrite
+                | Variant::PrefillOutput
+                | Variant::PrefillGreedy
+                | Variant::PrefillScored => Phase::Prefill,
+                Variant::DecodeGreedy | Variant::DecodeSampled => Phase::Decode,
+                Variant::Encode => Phase::TextEncode,
+                Variant::Denoise => Phase::Denoise,
+                // The scheduler plans a clip's decode as `VideoDecode` and a track's as
+                // `AudioDecode` (`call_phase`), so a device that advertised `ImageDecode` for
+                // either served no phase the scheduler ever planned - the same defect this
+                // function's doc records.
+                Variant::Decode => Phase::VideoDecode,
+                Variant::AudioDecode => Phase::AudioDecode,
+                // The artifact's three host calls are calls the mechanism submits and waits on, so
+                // the device states the phases they run in even though no graph serves them.
+                Variant::VideoEncode => Phase::VideoEncode,
+                Variant::AudioEncode => Phase::AudioEncode,
+                Variant::Mux => Phase::Mux,
+                Variant::LatentPrepare => Phase::LatentPrepare,
+                Variant::MediaRead => Phase::MediaRead,
+                // The two encoders whose work a later call computes are answered as they arrive,
+                // under the phase of either: a bucket of this variant names no one of them.
+                Variant::ConditionEncode => Phase::VisionEncode,
+                // A join is no phase a scheduler plans: a peer opens the step, and the union wakes
+                // this rank for it.
+                Variant::ExpertJoin => Phase::Decode,
+                // A step of a diffusion language model over a block of tokens is no phase.
+                Variant::TokenDenoise => return None,
+            })
         })
         .collect();
     // A refill chunk is a prefill-class chunk of a decoding request and runs wherever a prefill
     // chunk does, so the device that serves prefill states it as well: the scheduler may name a
     // refill and the batch then routes here.
-    if kinds.contains(&scheduler::PhaseKind::Prefill) {
-        kinds.push(scheduler::PhaseKind::Refill);
+    if kinds.contains(&Phase::Prefill) {
+        kinds.push(Phase::Refill);
     }
     // A speculating device's decoding requests verify: their calls run in the verification phase,
     // which an eager step serves and no bucket names.
-    if verifies && kinds.contains(&scheduler::PhaseKind::Decode) {
-        kinds.push(scheduler::PhaseKind::Verify);
+    if verifies && kinds.contains(&Phase::Decode) {
+        kinds.push(Phase::Verify);
     }
     kinds.sort_by_key(|kind| scheduler::phase_id(*kind).0);
     kinds.dedup();
@@ -217,19 +221,19 @@ mod tests {
         let id =
             |kind| PhaseId(u16::try_from(scheduler::phase_id(kind).0).expect("a phase id fits"));
         assert!(
-            phases.contains(&id(scheduler::PhaseKind::Prefill)),
+            phases.contains(&id(Phase::Prefill)),
             "a prefill batch routes to this node's device: {phases:?}"
         );
         assert!(
-            phases.contains(&id(scheduler::PhaseKind::Decode)),
+            phases.contains(&id(Phase::Decode)),
             "a decode batch routes to this node's device: {phases:?}"
         );
         assert!(
-            !phases.contains(&id(scheduler::PhaseKind::TextEncoding)),
+            !phases.contains(&id(Phase::TextEncode)),
             "this node encodes no request itself: {phases:?}"
         );
         assert!(
-            !phases.contains(&id(scheduler::PhaseKind::Denoise)),
+            !phases.contains(&id(Phase::Denoise)),
             "a batch this plan has no bucket for is not served: {phases:?}"
         );
     }

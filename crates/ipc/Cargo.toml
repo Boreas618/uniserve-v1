@@ -10,6 +10,8 @@ libc.workspace = true
 prost.workspace = true
 proto.workspace = true
 rmp-serde.workspace = true
+# The phase a batch computes: the one closed set the policy interface states.
+scheduling-guest.workspace = true
 serde = { workspace = true, features = ["rc"] }
 serde_json.workspace = true
 # The framing of every socket transport.

@@ -64,7 +64,7 @@ use scheduling::guest::event::{End, Event};
 use scheduling::guest::ids::{EncodingId, PageId, PhaseId, RequestId as ViewRequestId, StageId};
 use scheduling::guest::time::Nanos;
 use scheduling::guest::view::{
-    CallView, EncodingView, PageView, PhaseKind, PhaseView, ReplicaView, RequestClass,
+    CallView, EncodingView, PageView, Phase, PhaseView, ReplicaView, RequestClass,
     RequestStatus as Standing, RequestView, Snapshot,
 };
 
@@ -77,43 +77,26 @@ use crate::policy::TrialState;
 // The epoch's phases
 // ---------------------------------------------------------------------------
 
-/// Every phase kind the interface distinguishes, in the order the ids number
+/// Every phase the interface distinguishes, in the order the ids number
 /// them.
 ///
-/// A phase id is the kind's own (`PhaseKind::id`), so it means the same thing
-/// in every epoch: `PhaseKind` appends a kind and never renumbers one, and an
-/// id a removed kind numbered names no phase.
-const PHASES: [PhaseKind; 16] = [
-    PhaseKind::TextEncoding,
-    PhaseKind::VisionEncoding,
-    PhaseKind::LatentEncoding,
-    PhaseKind::Prefill,
-    PhaseKind::Decode,
-    PhaseKind::Verify,
-    PhaseKind::TokenDenoise,
-    PhaseKind::MediaRead,
-    PhaseKind::Denoise,
-    PhaseKind::VideoDecode,
-    PhaseKind::AudioDecode,
-    PhaseKind::VideoEncode,
-    PhaseKind::AudioEncode,
-    PhaseKind::Mux,
-    PhaseKind::LatentPrepare,
-    PhaseKind::Refill,
-];
+/// A phase id is the phase's own (`Phase::id`), so it means the same thing
+/// in every epoch: `Phase` appends a phase and never renumbers one, and an
+/// id a removed phase numbered names no phase.
+const PHASES: [Phase; Phase::COUNT] = Phase::ALL;
 
 /// The id of a phase kind.
 ///
-/// [`PhaseKind::Other`] is a policy-side placeholder for a kind a policy does
+/// [`Phase::Other`] is a policy-side placeholder for a kind a policy does
 /// not know; the mechanism never names a request's phase with it, and it has no
 /// id.
-pub const fn phase_id(kind: PhaseKind) -> PhaseId {
+pub const fn phase_id(kind: Phase) -> PhaseId {
     kind.id()
 }
 
 /// The phase kind an id names; `None` for an id this epoch has no phase for,
 /// which no `DispatchOutput` may name.
-pub(crate) fn phase_kind(id: PhaseId) -> Option<PhaseKind> {
+pub(crate) fn phase_kind(id: PhaseId) -> Option<Phase> {
     PHASES.iter().copied().find(|kind| phase_id(*kind) == id)
 }
 
@@ -122,23 +105,25 @@ pub(crate) fn phase_kind(id: PhaseId) -> Option<PhaseKind> {
 /// The call kinds are the phases' vocabulary: every `CallKind` is one phase,
 /// except that a refill chunk is prepared as a prefill call and named by its
 /// request's draft state instead ([`next_phase`]).
-pub(crate) fn call_phase(kind: CallKind) -> PhaseKind {
+pub(crate) fn call_phase(kind: CallKind) -> Phase {
     match kind {
-        CallKind::Forward(ForwardMode::Prefill) => PhaseKind::Prefill,
-        CallKind::Forward(ForwardMode::Decode) => PhaseKind::Decode,
-        CallKind::Forward(ForwardMode::Verify) => PhaseKind::Verify,
-        CallKind::Forward(ForwardMode::TokenDenoising) => PhaseKind::TokenDenoise,
-        CallKind::Media(MediaCall::TextEncoding) => PhaseKind::TextEncoding,
-        CallKind::Media(MediaCall::VisionEncoding) => PhaseKind::VisionEncoding,
-        CallKind::Media(MediaCall::LatentEncoding) => PhaseKind::LatentEncoding,
-        CallKind::Media(MediaCall::Denoising) => PhaseKind::Denoise,
-        CallKind::Media(MediaCall::VideoDecoding) => PhaseKind::VideoDecode,
-        CallKind::Media(MediaCall::AudioDecoding) => PhaseKind::AudioDecode,
-        CallKind::Media(MediaCall::VideoEncoding) => PhaseKind::VideoEncode,
-        CallKind::Media(MediaCall::AudioEncoding) => PhaseKind::AudioEncode,
-        CallKind::Media(MediaCall::MediaReading) => PhaseKind::MediaRead,
-        CallKind::Media(MediaCall::LatentPreparation) => PhaseKind::LatentPrepare,
-        CallKind::Media(MediaCall::Muxing) => PhaseKind::Mux,
+        CallKind::Forward(ForwardMode::Prefill) => Phase::Prefill,
+        CallKind::Forward(ForwardMode::Decode) => Phase::Decode,
+        CallKind::Forward(ForwardMode::Verify) => Phase::Verify,
+        // A step of a diffusion language model is no phase of the vocabulary, so no batch
+        // carries it (`wire_phase` numbers none).
+        CallKind::Forward(ForwardMode::TokenDenoising) => Phase::Other,
+        CallKind::Media(MediaCall::TextEncoding) => Phase::TextEncode,
+        CallKind::Media(MediaCall::VisionEncoding) => Phase::VisionEncode,
+        CallKind::Media(MediaCall::LatentEncoding) => Phase::LatentEncode,
+        CallKind::Media(MediaCall::Denoising) => Phase::Denoise,
+        CallKind::Media(MediaCall::VideoDecoding) => Phase::VideoDecode,
+        CallKind::Media(MediaCall::AudioDecoding) => Phase::AudioDecode,
+        CallKind::Media(MediaCall::VideoEncoding) => Phase::VideoEncode,
+        CallKind::Media(MediaCall::AudioEncoding) => Phase::AudioEncode,
+        CallKind::Media(MediaCall::MediaReading) => Phase::MediaRead,
+        CallKind::Media(MediaCall::LatentPreparation) => Phase::LatentPrepare,
+        CallKind::Media(MediaCall::Muxing) => Phase::Mux,
     }
 }
 
@@ -151,24 +136,23 @@ pub(crate) fn call_phase_id(kind: CallKind) -> PhaseId {
 ///
 /// A refill is a prefill call the mechanism schedules for a decoding request, so it
 /// returns `Forward(Prefill)`; `Other` runs nothing.
-pub(crate) fn phase_call(kind: PhaseKind) -> Option<CallKind> {
+pub(crate) fn phase_call(kind: Phase) -> Option<CallKind> {
     Some(match kind {
-        PhaseKind::TextEncoding => CallKind::Media(MediaCall::TextEncoding),
-        PhaseKind::VisionEncoding => CallKind::Media(MediaCall::VisionEncoding),
-        PhaseKind::LatentEncoding => CallKind::Media(MediaCall::LatentEncoding),
-        PhaseKind::Prefill | PhaseKind::Refill => CallKind::Forward(ForwardMode::Prefill),
-        PhaseKind::Decode => CallKind::Forward(ForwardMode::Decode),
-        PhaseKind::Verify => CallKind::Forward(ForwardMode::Verify),
-        PhaseKind::TokenDenoise => CallKind::Forward(ForwardMode::TokenDenoising),
-        PhaseKind::MediaRead => CallKind::Media(MediaCall::MediaReading),
-        PhaseKind::Denoise => CallKind::Media(MediaCall::Denoising),
-        PhaseKind::VideoDecode => CallKind::Media(MediaCall::VideoDecoding),
-        PhaseKind::AudioDecode => CallKind::Media(MediaCall::AudioDecoding),
-        PhaseKind::VideoEncode => CallKind::Media(MediaCall::VideoEncoding),
-        PhaseKind::AudioEncode => CallKind::Media(MediaCall::AudioEncoding),
-        PhaseKind::Mux => CallKind::Media(MediaCall::Muxing),
-        PhaseKind::LatentPrepare => CallKind::Media(MediaCall::LatentPreparation),
-        PhaseKind::Other => return None,
+        Phase::TextEncode => CallKind::Media(MediaCall::TextEncoding),
+        Phase::VisionEncode => CallKind::Media(MediaCall::VisionEncoding),
+        Phase::LatentEncode => CallKind::Media(MediaCall::LatentEncoding),
+        Phase::Prefill | Phase::Refill => CallKind::Forward(ForwardMode::Prefill),
+        Phase::Decode => CallKind::Forward(ForwardMode::Decode),
+        Phase::Verify => CallKind::Forward(ForwardMode::Verify),
+        Phase::MediaRead => CallKind::Media(MediaCall::MediaReading),
+        Phase::Denoise => CallKind::Media(MediaCall::Denoising),
+        Phase::VideoDecode => CallKind::Media(MediaCall::VideoDecoding),
+        Phase::AudioDecode => CallKind::Media(MediaCall::AudioDecoding),
+        Phase::VideoEncode => CallKind::Media(MediaCall::VideoEncoding),
+        Phase::AudioEncode => CallKind::Media(MediaCall::AudioEncoding),
+        Phase::Mux => CallKind::Media(MediaCall::Muxing),
+        Phase::LatentPrepare => CallKind::Media(MediaCall::LatentPreparation),
+        Phase::Other => return None,
     })
 }
 
@@ -204,7 +188,7 @@ pub(crate) fn epoch_blocks(epoch: &super::submission::Submissions) -> Vec<String
 
 /// The block that runs `kind` on this worker group: the stage the worker
 /// reports for its media call, or the protocol's default stage.
-fn block_of(table: &[String], info: &MainProcessInfo, kind: PhaseKind) -> StageId {
+fn block_of(table: &[String], info: &MainProcessInfo, kind: Phase) -> StageId {
     let name = match phase_call(kind) {
         Some(CallKind::Media(call)) => info
             .media_stages
@@ -466,7 +450,7 @@ fn next_phase(scheduler: &Scheduler, state: &TokenState, id: RequestId) -> Optio
         // A refill chunk is the policy's decision alone (`DispatchOutput::refill`), and
         // the mechanism builds its call: the request's phase is the serving
         // phase it needs next, and its draft gap appears in `refill_tokens`.
-        // `PhaseKind::Refill` stays in the phase table as the kind of the call
+        // `Phase::Refill` stays in the phase table as the kind of the call
         // the mechanism builds, not as a phase a request sits in.
         // Only a request whose context is fully ingested can be refilled:
         // before that, a prefill call is the chunk that writes the rest of
@@ -480,7 +464,7 @@ fn next_phase(scheduler: &Scheduler, state: &TokenState, id: RequestId) -> Optio
                         scheduled >= state.req.prompt_token_ids.len() as u32
                     }) =>
         {
-            PhaseKind::Decode
+            Phase::Decode
         }
         other => call_phase(other),
     };
@@ -922,8 +906,8 @@ fn holds_request(
 }
 
 /// The phase kinds a worker can run.
-fn worker_phases(info: &MainProcessInfo) -> Vec<PhaseKind> {
-    let mut kinds: Vec<PhaseKind> = info
+fn worker_phases(info: &MainProcessInfo) -> Vec<Phase> {
+    let mut kinds: Vec<Phase> = info
         .supported_calls
         .iter()
         .copied()
@@ -1269,7 +1253,7 @@ mod tests {
                 .windows(2)
                 .all(|pair| phase_id(pair[0]).0 < phase_id(pair[1]).0)
         );
-        assert_eq!(phase_id(PhaseKind::Other).0, u32::MAX);
+        assert_eq!(phase_id(Phase::Other).0, u32::MAX);
         // A reserved id and an id past the last kind name no phase.
         assert_eq!(phase_kind(PhaseId(7)), None);
         let last = phase_id(PHASES[PHASES.len() - 1]).0;
@@ -1279,12 +1263,12 @@ mod tests {
     #[test]
     fn a_refill_is_prefill_work_of_a_decoding_request() {
         assert_eq!(
-            phase_call(PhaseKind::Refill),
+            phase_call(Phase::Refill),
             Some(CallKind::Forward(ForwardMode::Prefill))
         );
-        assert!(PhaseKind::Refill.is_prefill());
-        assert!(PhaseKind::Refill.writes_prefix_cache());
-        assert_eq!(PhaseKind::Refill.class(), PhaseClass::Context);
+        assert!(Phase::Refill.is_prefill());
+        assert!(Phase::Refill.writes_prefix_cache());
+        assert_eq!(Phase::Refill.class(), PhaseClass::Context);
     }
 
     #[test]
@@ -1293,7 +1277,6 @@ mod tests {
             CallKind::Forward(ForwardMode::Prefill),
             CallKind::Forward(ForwardMode::Decode),
             CallKind::Forward(ForwardMode::Verify),
-            CallKind::Forward(ForwardMode::TokenDenoising),
             CallKind::Media(MediaCall::TextEncoding),
             CallKind::Media(MediaCall::VisionEncoding),
             CallKind::Media(MediaCall::LatentEncoding),
@@ -1308,7 +1291,7 @@ mod tests {
         ];
         for call in calls {
             let phase = call_phase(call);
-            assert_ne!(phase, PhaseKind::Other);
+            assert_ne!(phase, Phase::Other);
             assert_eq!(phase_call(phase), Some(call), "{call:?} -> {phase:?}");
             assert_eq!(call_phase_id(call), phase_id(phase));
         }
@@ -1329,14 +1312,14 @@ mod tests {
             .insert(MediaCall::Denoising, "denoiser".into());
 
         let phases = phases(&info);
-        let kinds: Vec<PhaseKind> = phases.iter().map(|phase| phase.kind).collect();
+        let kinds: Vec<Phase> = phases.iter().map(|phase| phase.kind).collect();
         // Prefill and decode are served, so a refill chunk of a decoding request
         // is served too; a kind no worker reports is absent.
-        assert!(kinds.contains(&PhaseKind::Prefill));
-        assert!(kinds.contains(&PhaseKind::Decode));
-        assert!(kinds.contains(&PhaseKind::Refill));
-        assert!(kinds.contains(&PhaseKind::Denoise));
-        assert!(!kinds.contains(&PhaseKind::VideoDecode));
+        assert!(kinds.contains(&Phase::Prefill));
+        assert!(kinds.contains(&Phase::Decode));
+        assert!(kinds.contains(&Phase::Refill));
+        assert!(kinds.contains(&Phase::Denoise));
+        assert!(!kinds.contains(&Phase::VideoDecode));
 
         // A phase's id is its kind's, and its block is the stage the worker
         // binds for that call.
@@ -1346,12 +1329,12 @@ mod tests {
         }
         let denoise = phases
             .iter()
-            .find(|phase| phase.kind == PhaseKind::Denoise)
+            .find(|phase| phase.kind == Phase::Denoise)
             .expect("the worker serves denoising");
         assert_eq!(Some(denoise.block), block_id(&blocks, "denoiser"));
         let prefill = phases
             .iter()
-            .find(|phase| phase.kind == PhaseKind::Prefill)
+            .find(|phase| phase.kind == Phase::Prefill)
             .expect("the worker serves prefill");
         assert_eq!(Some(prefill.block), block_id(&blocks, "model"));
     }
@@ -1375,7 +1358,7 @@ mod tests {
             .map(|index| ReplicaView {
                 index,
                 block: StageId(1),
-                kinds: vec![PhaseKind::Denoise],
+                kinds: vec![Phase::Denoise],
                 running_requests: index as u32,
                 capacity: 1,
                 holds_request: index == 1,

@@ -33,7 +33,7 @@ mod slots;
 use super::*;
 use crate::views;
 use ipc::{ForwardMode, MediaCall};
-use scheduling::guest::{DispatchOutput, PhaseId, PhaseKind};
+use scheduling::guest::{DispatchOutput, PhaseId};
 
 /// Forward rows a pass may still add to its numerical calls, within the rows
 /// a worker stages per call: block rows across its token-denoising calls,
@@ -64,7 +64,7 @@ impl Scheduler {
     /// does not fit waits for the next step, as a dispatch output over the free storage
     /// does.
     pub(super) fn assemble_output(&mut self, output: &DispatchOutput) -> Vec<ExecutionBatch> {
-        let refill = views::phase_id(PhaseKind::Refill);
+        let refill = views::phase_id(scheduling::guest::Phase::Refill);
         let mut work: Vec<(RequestId, PhaseId, Option<u32>)> = output
             .work
             .iter()
@@ -240,7 +240,7 @@ impl Scheduler {
             if budget == 0 && !matches!(kind, CallKind::Media(_)) {
                 break;
             }
-            let refill = views::phase_kind(phase) == Some(PhaseKind::Refill);
+            let refill = views::phase_kind(phase) == Some(scheduling::guest::Phase::Refill);
             if !self.can_schedule_next(id) {
                 continue;
             }

@@ -165,27 +165,33 @@ pub struct RequestView {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct PhaseView {
     pub id: PhaseId,
-    pub kind: PhaseKind,
+    pub kind: Phase,
     /// The block that runs it.
     pub block: StageId,
 }
 
-/// The kind of a phase, at the granularity scheduling distinguishes.
+/// What one call computes, at the granularity scheduling distinguishes: the one
+/// closed set the request, the batch, the worker group and the policy name a
+/// call's work by.
 ///
-/// This is the vocabulary today's `CallKind` and generation phases have, named
-/// once so a policy orders and charges work by it. Appended, never renumbered.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+/// A phase crosses the policy's wire by its tag (`{"kind": "prefill"}`), which
+/// never changes; the three encodings' tags are `text_encoding`,
+/// `vision_encoding` and `latent_encoding`. Appended, never renumbered
+/// ([`Phase::id`]).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
-pub enum PhaseKind {
+pub enum Phase {
     // Context ingestion: reads the request's inputs and writes the prefix cache.
-    TextEncoding,
-    VisionEncoding,
-    LatentEncoding,
+    #[serde(rename = "text_encoding")]
+    TextEncode,
+    #[serde(rename = "vision_encoding")]
+    VisionEncode,
+    #[serde(rename = "latent_encoding")]
+    LatentEncode,
     Prefill,
     // Token progress.
     Decode,
     Verify,
-    TokenDenoise,
     // Media work.
     MediaRead,
     Denoise,
@@ -199,7 +205,10 @@ pub enum PhaseKind {
     /// A draft-cache refill: a prefill-class chunk of a decoding request
     /// (design §4.4, `DispatchOutput::refill`).
     Refill,
-    /// A phase kind this policy does not know.
+    /// A phase the reader of a message does not know: a tag a later revision
+    /// appends, or one no phase carries any more. A policy reads it as
+    /// background work; the mechanism never names a request's or a batch's
+    /// phase with it.
     #[default]
     #[serde(other)]
     Other,
@@ -218,47 +227,97 @@ pub enum PhaseClass {
     Background,
 }
 
-impl PhaseKind {
-    /// The assembly class this phase kind belongs to: the three levels today's
+impl Phase {
+    /// The number of phases: the length of a table with one entry per phase,
+    /// such as `[u32; Phase::COUNT]`, which [`Phase::index`] indexes.
+    pub const COUNT: usize = 15;
+
+    /// Every phase, each at its [`Phase::index`]: the order of [`Phase::id`].
+    pub const ALL: [Phase; Phase::COUNT] = [
+        Self::TextEncode,
+        Self::VisionEncode,
+        Self::LatentEncode,
+        Self::Prefill,
+        Self::Decode,
+        Self::Verify,
+        Self::MediaRead,
+        Self::Denoise,
+        Self::VideoDecode,
+        Self::AudioDecode,
+        Self::VideoEncode,
+        Self::AudioEncode,
+        Self::Mux,
+        Self::LatentPrepare,
+        Self::Refill,
+    ];
+
+    /// The assembly class this phase belongs to: the three levels today's
     /// `assembly_priority` has, plus background.
     pub fn class(self) -> PhaseClass {
         match self {
-            PhaseKind::TextEncoding
-            | PhaseKind::VisionEncoding
-            | PhaseKind::LatentEncoding
-            | PhaseKind::Prefill
-            | PhaseKind::Refill => PhaseClass::Context,
-            PhaseKind::Decode | PhaseKind::Verify | PhaseKind::TokenDenoise => PhaseClass::Token,
-            PhaseKind::MediaRead
-            | PhaseKind::Denoise
-            | PhaseKind::VideoDecode
-            | PhaseKind::AudioDecode
-            | PhaseKind::VideoEncode
-            | PhaseKind::AudioEncode
-            | PhaseKind::Mux => PhaseClass::Media,
-            PhaseKind::LatentPrepare | PhaseKind::Other => PhaseClass::Background,
+            Phase::TextEncode
+            | Phase::VisionEncode
+            | Phase::LatentEncode
+            | Phase::Prefill
+            | Phase::Refill => PhaseClass::Context,
+            Phase::Decode | Phase::Verify => PhaseClass::Token,
+            Phase::MediaRead
+            | Phase::Denoise
+            | Phase::VideoDecode
+            | Phase::AudioDecode
+            | Phase::VideoEncode
+            | Phase::AudioEncode
+            | Phase::Mux => PhaseClass::Media,
+            Phase::LatentPrepare | Phase::Other => PhaseClass::Background,
         }
     }
 
-    /// The id this kind is numbered with, which "appended, never renumbered" protects: a new kind
-    /// takes the next unused id, and the id of a removed kind is never given to another. A rank's
-    /// output, a policy's `DispatchOutput` and a batch's phase are all numbered here, so this is the one table
-    /// they can agree on.
+    /// The phase's place in a table of [`Phase::COUNT`] entries: dense from
+    /// zero, in the order of [`Phase::id`], so it changes only when a phase is
+    /// appended (at the end) or removed. Unlike the id it is not a wire value:
+    /// tables indexed by it live in one process.
     ///
-    /// Ids 7, 8, 9, 18 and 19 are reserved: they numbered kinds that no longer exist (19 was the
-    /// cache export, superseded by the scheduler's device-direct transfer).
-    ///
-    /// [`PhaseKind::Other`] is a policy-side placeholder for a kind a policy does not know: it has
-    /// no phase of its own, so its id is `u32::MAX`.
-    pub const fn id(self) -> PhaseId {
-        PhaseId(match self {
-            Self::TextEncoding => 0,
-            Self::VisionEncoding => 1,
-            Self::LatentEncoding => 2,
+    /// [`Phase::Other`] names no phase and has no place: its index is `COUNT`,
+    /// past the end of every such table, so indexing one with it panics.
+    pub const fn index(self) -> usize {
+        match self {
+            Self::TextEncode => 0,
+            Self::VisionEncode => 1,
+            Self::LatentEncode => 2,
             Self::Prefill => 3,
             Self::Decode => 4,
             Self::Verify => 5,
-            Self::TokenDenoise => 6,
+            Self::MediaRead => 6,
+            Self::Denoise => 7,
+            Self::VideoDecode => 8,
+            Self::AudioDecode => 9,
+            Self::VideoEncode => 10,
+            Self::AudioEncode => 11,
+            Self::Mux => 12,
+            Self::LatentPrepare => 13,
+            Self::Refill => 14,
+            Self::Other => Self::COUNT,
+        }
+    }
+
+    /// The id this phase is numbered with, which "appended, never renumbered" protects: a new
+    /// phase takes the next unused id, and the id of a removed phase is never given to another. A
+    /// rank's output, a policy's `DispatchOutput` and a batch's phase are all numbered here, so
+    /// this is the one table they can agree on.
+    ///
+    /// Ids 6, 7, 8, 9, 18 and 19 are reserved: they numbered phases that no longer exist (19 was
+    /// the cache export, superseded by the scheduler's device-direct transfer).
+    ///
+    /// [`Phase::Other`] is a policy-side placeholder for a phase a policy does not know: it has
+    /// no phase of its own, so its id is `u32::MAX`.
+    pub const fn id(self) -> PhaseId {
+        PhaseId(match self {
+            Self::TextEncode => 0,
+            Self::VisionEncode => 1,
+            Self::LatentEncode => 2,
+            Self::Prefill => 3,
+            Self::Decode => 4,
+            Self::Verify => 5,
             Self::MediaRead => 10,
             Self::Denoise => 11,
             Self::VideoDecode => 12,
@@ -275,10 +334,10 @@ impl PhaseKind {
     /// Whether a chunk of this phase writes the prefix cache. Only such a
     /// chunk draws on the prefill budget a warming epoch bounds (design §4.4).
     pub fn writes_prefix_cache(self) -> bool {
-        matches!(self, PhaseKind::Prefill | PhaseKind::Refill)
+        matches!(self, Phase::Prefill | Phase::Refill)
     }
 
-    /// Whether work of this kind is prefill work for batching: a prefill or a
+    /// Whether work of this phase is prefill work for batching: a prefill or a
     /// refill chunk, the work a decode step must not starve.
     pub fn is_prefill(self) -> bool {
         self.writes_prefix_cache()
@@ -337,9 +396,9 @@ pub struct ReplicaView {
     pub index: usize,
     /// The block this replica runs.
     pub block: StageId,
-    /// Phase kinds this replica can execute.
+    /// Phases this replica can execute.
     #[serde(default)]
-    pub kinds: Vec<PhaseKind>,
+    pub kinds: Vec<Phase>,
     /// Distinct requests running on it.
     #[serde(default)]
     pub running_requests: u32,
@@ -368,5 +427,69 @@ pub struct CallView {
     #[serde(default)]
     pub phase: PhaseId,
     #[serde(default)]
-    pub kind: PhaseKind,
+    pub kind: Phase,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The phases with the ids and wire tags the policy interface numbers and names them by.
+    /// Both are the interface's: a policy built against an earlier revision reads the same.
+    const WIRE: [(Phase, u32, &str); Phase::COUNT] = [
+        (Phase::TextEncode, 0, "text_encoding"),
+        (Phase::VisionEncode, 1, "vision_encoding"),
+        (Phase::LatentEncode, 2, "latent_encoding"),
+        (Phase::Prefill, 3, "prefill"),
+        (Phase::Decode, 4, "decode"),
+        (Phase::Verify, 5, "verify"),
+        (Phase::MediaRead, 10, "media_read"),
+        (Phase::Denoise, 11, "denoise"),
+        (Phase::VideoDecode, 12, "video_decode"),
+        (Phase::AudioDecode, 13, "audio_decode"),
+        (Phase::VideoEncode, 14, "video_encode"),
+        (Phase::AudioEncode, 15, "audio_encode"),
+        (Phase::Mux, 16, "mux"),
+        (Phase::LatentPrepare, 17, "latent_prepare"),
+        (Phase::Refill, 20, "refill"),
+    ];
+
+    #[test]
+    fn a_phase_keeps_its_id_and_its_wire_tag() {
+        for (phase, id, tag) in WIRE {
+            assert_eq!(phase.id(), PhaseId(id), "{phase:?}");
+
+            let encoded = serde_json::to_string(&phase).unwrap();
+            assert_eq!(encoded, format!(r#"{{"kind":"{tag}"}}"#), "{phase:?}");
+            assert_eq!(serde_json::from_str::<Phase>(&encoded).unwrap(), phase);
+        }
+    }
+
+    /// A tag no phase carries, whether a later revision's or a removed phase's, is read as
+    /// [`Phase::Other`] rather than refused, and `Other` names no phase of its own.
+    #[test]
+    fn a_tag_no_phase_carries_reads_as_other() {
+        for tag in ["token_denoise", "a_later_phase"] {
+            let decoded: Phase = serde_json::from_str(&format!(r#"{{"kind":"{tag}"}}"#)).unwrap();
+            assert_eq!(decoded, Phase::Other, "{tag}");
+        }
+        assert_eq!(Phase::Other.id(), PhaseId(u32::MAX));
+        assert_eq!(Phase::Other.index(), Phase::COUNT);
+    }
+
+    /// The index numbers every phase densely from zero, in the order of its id, so a table of
+    /// `Phase::COUNT` entries holds one per phase; `Phase::ALL` lists them at their index.
+    #[test]
+    fn the_index_is_dense_and_follows_the_id() {
+        assert_eq!(Phase::ALL.len(), Phase::COUNT);
+        for (index, (phase, _, _)) in WIRE.into_iter().enumerate() {
+            assert_eq!(phase.index(), index, "{phase:?}");
+            assert_eq!(Phase::ALL[index], phase);
+        }
+        assert!(
+            Phase::ALL
+                .windows(2)
+                .all(|pair| pair[0].id().0 < pair[1].id().0)
+        );
+    }
 }

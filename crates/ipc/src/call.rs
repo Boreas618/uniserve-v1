@@ -211,31 +211,6 @@ pub struct VisionInput {
     pub positions: u32,
 }
 
-/// What a token call does for its request's draft cache, in a deployment
-/// that speculates with its model's drafter.
-///
-/// The draft cache entry at position `i` is the drafter's evaluation of the
-/// target's hidden state at `i` with the token at `i + 1`. A forward call
-/// writes the entries of its positions whose next token it knows: the
-/// tokens it evaluates, its own sampled token, or `lookahead`.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct DraftWork {
-    /// Draft tokens the call proposes after its last committed token, which
-    /// the request's next verification may verify; at most the deployment's
-    /// draft limit, and zero for none.
-    pub proposals: u32,
-    /// The token after the call's last input token, which the draft cache
-    /// entry of its last position reads; absent when the call samples that
-    /// token itself or knows none.
-    pub lookahead: Option<u32>,
-    /// The first position of a call that evaluates tokens its request's
-    /// cache already holds, its input tokens from there on, to fill the
-    /// request's draft cache: it starts from the state checkpoint at that
-    /// position (or from the beginning), writes no target K/V and leaves
-    /// its request slot's state as it was. Absent for every other call.
-    pub refill: Option<u32>,
-}
-
 /// One immutable call with its identity, data dependencies, and output limits.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Call {

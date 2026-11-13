@@ -10,14 +10,14 @@
 //! table indexed by id.
 
 use crate::ids::PhaseId;
-use crate::view::{PhaseClass, PhaseKind, PhaseView};
+use crate::view::{Phase, PhaseClass, PhaseView};
 
 /// The epoch's phases, so a policy can classify a request's next phase
 /// without asking the mechanism again.
 #[derive(Clone, Debug, Default)]
 pub struct Phases {
-    /// The kind of each phase, by id; a churned table responds [`PhaseKind::Other`].
-    kinds: Vec<PhaseKind>,
+    /// The kind of each phase, by id; a churned table responds [`Phase::Other`].
+    kinds: Vec<Phase>,
 }
 
 impl Phases {
@@ -31,21 +31,21 @@ impl Phases {
     }
 
     /// Records the kind of one phase, which is how a snapshot states it.
-    pub fn set(&mut self, phase: PhaseId, kind: PhaseKind) {
+    pub fn set(&mut self, phase: PhaseId, kind: Phase) {
         let at = phase.0 as usize;
         if self.kinds.len() <= at {
-            self.kinds.resize(at + 1, PhaseKind::Other);
+            self.kinds.resize(at + 1, Phase::Other);
         }
         self.kinds[at] = kind;
     }
 
-    /// The kind of a phase; [`PhaseKind::Other`] for one the table does not
+    /// The kind of a phase; [`Phase::Other`] for one the table does not
     /// know, which a policy treats as background work.
-    pub fn kind(&self, phase: PhaseId) -> PhaseKind {
+    pub fn kind(&self, phase: PhaseId) -> Phase {
         self.kinds
             .get(phase.0 as usize)
             .copied()
-            .unwrap_or(PhaseKind::Other)
+            .unwrap_or(Phase::Other)
     }
 
     /// The assembly class of a phase (design §4.4, today's
@@ -65,17 +65,17 @@ mod tests {
         let views = [
             PhaseView {
                 id: PhaseId(0),
-                kind: PhaseKind::Prefill,
+                kind: Phase::Prefill,
                 block: StageId(0),
             },
             PhaseView {
                 id: PhaseId(1),
-                kind: PhaseKind::Decode,
+                kind: Phase::Decode,
                 block: StageId(0),
             },
         ];
         let phases = Phases::new(&views);
-        assert_eq!(phases.kind(PhaseId(0)), PhaseKind::Prefill);
+        assert_eq!(phases.kind(PhaseId(0)), Phase::Prefill);
         assert_eq!(phases.class(PhaseId(1)), PhaseClass::Token);
         assert!(phases.kind(PhaseId(0)).is_prefill());
     }
@@ -83,7 +83,7 @@ mod tests {
     #[test]
     fn an_unknown_phase_is_background_work() {
         let phases = Phases::default();
-        assert_eq!(phases.kind(PhaseId(9)), PhaseKind::Other);
+        assert_eq!(phases.kind(PhaseId(9)), Phase::Other);
         assert_eq!(phases.class(PhaseId(9)), PhaseClass::Background);
     }
 }

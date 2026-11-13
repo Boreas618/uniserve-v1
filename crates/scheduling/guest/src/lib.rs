@@ -67,7 +67,7 @@ pub use phases::Phases;
 pub use policy::{Instantiation, Policy};
 pub use time::{Duration, Nanos};
 pub use view::{
-    CallView, EncodingView, PageView, PhaseClass, PhaseKind, PhaseView, RankView, ReplicaView,
+    CallView, EncodingView, PageView, Phase, PhaseClass, PhaseView, RankView, ReplicaView,
     RequestClass, RequestStatus, RequestView, Snapshot,
 };
 pub use waiting::{ArrivalOrder, Order, PriorityOrder, Waiting};
