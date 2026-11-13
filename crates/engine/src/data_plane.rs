@@ -1,42 +1,83 @@
-//! The data plane of a serving epoch: the updates that change what a
-//! rank holds at the Storage Server, inside the epoch and without going through the three update
-//! layers.
+//! The data plane of a serving epoch: the changes the engine makes to what its ranks hold on
+//! their devices, inside the epoch.
 //!
-//! Two kinds of work live here, and the difference is who may run them when:
+//! Every change reaches a device as a control operation of the rank's executor
+//! ([`Executor::control`]), which runs between the jobs submitted before and after it, once the
+//! device has passed everything the runners issued: nothing but the executor's thread issues on
+//! the device, and no job in flight shares a mapping change. An operation is handed to every
+//! rank before any is waited for, so the devices perform it at once, and it returns once every
+//! rank's has ended.
 //!
-//! - **Storage operations at a batch boundary** ([`DataPlane::operate`]): giving KV cache segments
-//!   back and creating them again, a sleep and a wake, putting loaded weights in place. A scheduler
-//!   calls them once its batches in flight completed, and each reaches the device through its
-//!   queue, so no running job shares a mapping change.
-//! - **Loads beside the serving batches** ([`DataPlane::plan`], [`DataPlane::load`]): a checkpoint
-//!   of the same model or another arrangement of its experts is published at the Storage Server
-//!   while requests go on. The batches read the old weights until the boundary at which each new
-//!   allocation is mapped at the address of the one it replaces.
+//! The work comes in three kinds, which differ in who may run them when:
+//!
+//! - **At a batch boundary**: putting loaded weights in place ([`DataPlane::update_weights`],
+//!   [`DataPlane::commit_experts`]), suspending and restoring the graph pools, releasing and
+//!   creating the KV planes' segments, and the kernels the cache and the state launch
+//!   ([`DataPlane::set_kernels`]). A control operation is ordered against its own executor's
+//!   jobs only, so the engine first pauses the schedulers whose batches read what changes: every
+//!   rank of a group then changes between the same two batches.
+//! - **Beside the serving batches**: a load of another checkpoint of the same model, or of
+//!   another arrangement of its experts ([`DataPlane::pair`], [`DataPlane::load`]), published at
+//!   the Storage Server while requests go on; LoRA adapters; profiling sessions, which each
+//!   rank's executor starts and ends between two of its batches.
+//! - **The quota**: what the process holds on each device beside its pools and the Storage
+//!   Server's storages, reserved in the GPU's quota ([`DataPlane::reserve_serving`]) with what a
+//!   profiling session's collectors hold.
 //!
 //! A weight is never written after it is published, by anyone. An update changes which published
-//! allocation an address maps: the graphs captured over that address stay valid, the mapping stays
-//! read-only, and the allocation is the one a relaunch on the new target finds under its own key.
+//! allocation an address maps: the graphs captured over that address stay valid, the mapping
+//! stays read-only, and the allocation is the one a relaunch on the new target finds under its
+//! own key.
+//!
+//! ## The KV planes' memory
+//!
+//! The buffer pool's tables say which units of a region's memory space a request holds; the
+//! memory behind the units is the ranks' segments of the KV planes, which each rank creates in
+//! its own context (`specs/buffer-pool.md` §14.1). Memory changes by whole segments, around the
+//! tables' changes, and the head of the epoch's session states each change to the Storage Server,
+//! since only the head knows when every rank that maps a region has made it. The data plane is
+//! the ranks' side of each sequence:
+//!
+//! 1. **Release from segment `k` on**, for a region of another layout to grow into the memory:
+//!    the schedulers `Resize` their regions below the first unit of segment `k`; the head sends
+//!    `Withdraw` for each segment from `k` on, which takes its units out of the space's free
+//!    ranges; then [`DataPlane::release_segments`]: every rank unmaps them and ends its
+//!    retention, and the GPU's quota usage drops with the last rank.
+//! 2. **Create given-back segments**, for a region to grow past the space's free ranges:
+//!    [`DataPlane::create_segments`]: every rank creates them again at their addresses and resets
+//!    their units; the head sends `Grant` for each segment the ranks hold now beyond those the
+//!    space held; then the schedulers `Resize` their regions into them.
+//! 3. **Sleep**: the schedulers detach every owner and `Resize` every device region to nothing,
+//!    having stored what the write policy keeps; the head withdraws every segment;
+//!    [`DataPlane::sleep`] releases them all and suspends the graph pools.
+//! 4. **Wake**: [`DataPlane::wake`] restores the graph pools and creates every segment again; the
+//!    head grants them; the schedulers grow their regions.
+//!
+//! Each returns every rank's segment table ([`ipc::CacheTable`]), whose segment `i` holds the
+//! units from the sum of the units of the segments before it. An epoch switch changes no
+//! plane: two epochs of one layout name the same regions and map the same segments, and nothing
+//! of the cache is handed over or adopted (`specs/updates.md` §3.4).
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Weak};
 
-use ipc::PhaseId;
-use ipc::execution::{
-    Batch, Batches, Computation, EpochOperation, Extent, Fault, HostPools, Inventory, Submission,
-};
-use ipc::memory;
-use worker::capacity::device::{DeviceBudget, DeviceReservation};
-use worker::device::Worker;
-use worker::memory::allocation::Backing as _;
-use worker::memory::prefix_cache::PrefixCache;
-use worker::memory::prefix_cache::planes::CachePlanes;
-use worker::memory::reload::{Matching, Reloading, Walk, WeightPair, paired};
-use worker::memory::retained::Retained;
-use worker::memory::weights::{LoadedWeight, WeightStore, retained_key};
+use ipc::CacheTable;
+use ipc::memory::WeightsUpdated;
+use nn::WeightKey;
+use platform::{DeviceId, Nvml, Stream};
+use storage::Item;
+use worker::completion::Outcome;
+use worker::memory::cache::KvCacheMemory;
+use worker::memory::client::{StorageClient, quota_limit};
+use worker::memory::division::process_bytes;
+use worker::memory::graph_pool::GraphPool;
+use worker::memory::reload::{MetaWeights, Reload, paired};
+use worker::memory::state::StateMemory;
+use worker::memory::weights::WeightStore;
 use worker::profiling::session::Change;
-use worker::{Error, Result, lock};
+use worker::{Error, Executor, Result, Runner, lock};
 
 /// What a load of the served model reads: which checkpoint, and which expert sits in which slot.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -49,9 +90,11 @@ pub struct Target {
 }
 
 /// How a rank loads its model: the model crates are the executable's, so this crate reaches them
-/// through what the executable hands it (§4.3).
+/// through what the executable hands it.
 pub trait ModelLoad: Send + Sync {
-    /// Runs the model's load of `target` through `weights`, which every weight goes through.
+    /// Runs the model's load of `target` through `weights`, which every weight goes through: the
+    /// rank's store, a store on the meta device that reads no payload, or a second load beside
+    /// the weights that serve.
     ///
     /// # Errors
     ///
@@ -59,7 +102,7 @@ pub trait ModelLoad: Send + Sync {
     fn load(
         &self,
         target: &Target,
-        weights: &mut dyn nn::RetainedWeights,
+        weights: &dyn nn::RetainedWeights,
     ) -> std::result::Result<(), String>;
 
     /// The routed expert layers this rank's model holds, by module path, each with the experts its
@@ -67,53 +110,72 @@ pub trait ModelLoad: Send + Sync {
     fn expert_layers(&self) -> BTreeMap<String, u32>;
 }
 
-/// What the data plane holds of one rank.
+/// What the data plane holds of one rank: the owners of its device's storage, which the rank's
+/// start opened, and the executor every change of them goes through.
 pub struct Rank {
     /// The rank's number in its epoch, as a profiling session's `workers` name it.
     pub rank: u32,
-    /// The rank's device worker: the queue a change of its mappings goes through. Weak, because
-    /// the epoch's close joins the device's thread and owns the last handle.
-    pub worker: std::sync::Weak<Worker>,
+    /// The rank's executor. Weak, because the epoch's close joins the executor's thread and owns
+    /// the last handle.
+    pub executor: Weak<Executor>,
     /// The rank's device.
-    pub device: platform::DeviceId,
+    pub device: DeviceId,
     /// The rank's Storage Server client.
-    pub storage: Arc<Retained>,
+    pub client: Arc<StorageClient>,
+    /// The weights the rank serves from, which a second load publishes beside.
+    pub weights: Arc<WeightStore>,
     /// The rank's KV cache, on a rank that keeps one.
-    pub cache: Option<Arc<Mutex<PrefixCache>>>,
+    pub cache: Option<Arc<Mutex<KvCacheMemory>>>,
+    /// The rank's recurrent state, for a model that keeps one.
+    pub state: Option<Arc<Mutex<StateMemory>>>,
+    /// The device's graph, scratch and resident pools.
+    pub graphs: Arc<Mutex<GraphPool>>,
+    /// A stream of the device that only the data plane's control operations issue on: the resets
+    /// of the units of segments created again.
+    pub stream: Stream,
+    /// The device bytes of the rank's communicators that NVML attributes to no process, as their
+    /// owner states them: what a measurement of the process adds to NVML's figure.
+    pub unattributed: u64,
     /// How the rank loads its model.
     pub model: Arc<dyn ModelLoad>,
-    /// The weights the rank serves, in its load's order.
-    pub serving: Vec<LoadedWeight>,
-    /// The host the rank runs on, as a transfer manifest names it.
-    pub host: String,
+    /// The weights the rank serves, in its load's order, each with whether the model writes it
+    /// after the load.
+    pub serving: Vec<(WeightKey, bool)>,
 }
 
 impl Rank {
-    fn worker(&self) -> Result<Arc<Worker>> {
-        self.worker
+    /// The rank's executor, until the epoch closed it.
+    fn executor(&self) -> Result<Arc<Executor>> {
+        self.executor
             .upgrade()
-            .ok_or(Error::State("the rank's device has closed"))
+            .ok_or(Error::State("the rank's executor has closed"))
     }
 }
 
-/// One rank's half of a load: what its model reads, and which weights move.
-struct RankLoad {
-    pairs: Vec<WeightPair>,
-    /// The target's load, in order: the serving log once the load is in place.
-    log: Vec<LoadedWeight>,
-    /// Device bytes the replacement takes beside the weights that serve.
+/// What a control operation computes on one rank: called on the rank's executor thread with its
+/// runners, once the device has passed everything they issued.
+type Work<T> = Box<dyn FnOnce(&mut [Box<dyn Runner>]) -> Result<T> + Send>;
+
+/// One rank's share of a replacement: which weights it moves, and what that takes.
+struct Share {
+    /// Each weight that serves with the weight that takes its place.
+    pairs: Vec<(WeightKey, WeightKey)>,
+    /// The target's load, in order: the rank's serving order once the replacement is in place.
+    order: Vec<(WeightKey, bool)>,
+    /// Device bytes the replacements take beside the weights that serve.
     bytes: u64,
 }
 
-/// A load the plan accepted, on every rank.
-pub struct Planned {
+/// A load of another target on every rank, from its pairing to the boundary that puts it in
+/// place, or to its discard.
+pub struct Replacement {
     target: Target,
-    ranks: Vec<RankLoad>,
+    ranks: Vec<Share>,
     /// Whether the new weights are published yet, so a discard knows what there is to release.
     loaded: bool,
 }
 
-impl Planned {
+impl Replacement {
     /// The most device bytes any rank needs beside what it serves.
     pub fn bytes(&self) -> u64 {
         self.ranks.iter().map(|rank| rank.bytes).max().unwrap_or(0)
@@ -138,22 +200,34 @@ impl Room {
     }
 }
 
-/// An expert redistribution between its plan and its commit.
-enum Experts {
-    /// The plan is made and the storage for its copies is being found.
-    Planned(Planned),
-    /// The copies run beside the serving batches.
-    Copying(std::thread::JoinHandle<Result<Planned>>),
-    /// The copies completed, and the new weights wait for the common boundary.
-    Ready(Planned),
+/// What one rank's process holds in its GPU's quota beside its pools and the Storage Server's
+/// storages, as `Item::Process`.
+struct Reservation {
+    /// The process as measured when the rank started to serve.
+    process: u64,
+    /// What the collectors of the profiling session that runs hold.
+    profiling: u64,
 }
 
-/// What a rank holds of a loaded LoRA adapter (§7.6): its tensors, published and mapped read-only.
+/// An expert redistribution between its pairing and its commit.
+enum Experts {
+    /// The weights are paired, and the copies wait to start.
+    Paired(Replacement),
+    /// The copies run beside the serving batches.
+    Copying(std::thread::JoinHandle<Result<Replacement>>),
+    /// The copies completed, and the new weights wait for the common boundary.
+    Ready(Replacement),
+}
+
+/// What a rank holds of a loaded LoRA adapter: its tensors, published and mapped read-only.
 struct Adapter {
-    keys: Vec<[u8; 32]>,
-    /// Each tensor's region, by its name in the adapter's file. Nothing reads them until a kernel
-    /// package of the epoch does; a slot's tensors are what such a package is handed.
-    regions: BTreeMap<String, nn::Backing>,
+    /// The store that maps the adapter's tensors, which lives as long as they are lent.
+    store: WeightStore,
+    /// The adapter's weights, which an unload ends the retention of.
+    keys: Vec<WeightKey>,
+    /// Each tensor by its name in the adapter's file. Nothing reads them until a kernel package
+    /// of the epoch does; a slot's tensors are what such a package is handed.
+    tensors: BTreeMap<String, nn::Tensor>,
 }
 
 /// The data plane of one process: every rank it holds.
@@ -162,63 +236,66 @@ pub struct DataPlane {
     /// What the ranks serve now.
     target: Mutex<Target>,
     /// A weight update's load, waiting for its boundary.
-    staged: Mutex<Option<Planned>>,
+    staged: Mutex<Option<Replacement>>,
     experts: Mutex<Option<Experts>>,
     /// Each rank's adapters, by the slot the daemon assigned.
     adapters: Mutex<BTreeMap<u32, Vec<Adapter>>>,
-    /// Whether the graph pools are suspended, which only a wake or a load's end reverses.
+    /// Whether the graph pools are suspended, which only a restore reverses.
     suspended: AtomicBool,
-    /// A mapping change failed part of the way: the rank's weights are no one checkpoint's, and the
-    /// epoch ends rather than computing with them.
+    /// The weights changed while the graph pools were suspended: what the runners derive from
+    /// them is computed in the pools, so the restore recomputes it.
+    derived_stale: AtomicBool,
+    /// A mapping change failed part of the way: the rank's weights are no one checkpoint's, and
+    /// the epoch ends rather than computing with them.
     poisoned: Mutex<Option<String>>,
     /// The share of each device the deployment may hold.
     fraction: f64,
-    /// What each rank reserves beside the storage the Storage Server retains, in rank order, once the
-    /// ranks serve: the graph pools and the process, and a session's storage.
-    reservations: Mutex<Vec<DeviceReservation>>,
+    /// What each rank's process reserves, in rank order, once the ranks serve.
+    reserved: Mutex<Vec<Reservation>>,
 }
 
 fn rejected(what: &str, error: impl std::fmt::Display) -> Error {
     Error::Invalid(format!("{what}: {error}"))
 }
 
-/// Waits for a storage command of `worker`'s queue.
-fn done(what: &str, submission: Submission) -> Result<()> {
-    match submission.wait() {
-        ipc::execution::Outcome::Success(_) => Ok(()),
-        ipc::execution::Outcome::Failed(error) => Err(Error::Interface(format!("{what}: {error}"))),
-        ipc::execution::Outcome::Cancelled => {
-            Err(Error::Interface(format!("{what} was cancelled")))
-        }
+/// The digest a set of weights is known by, from their load's order: what roots the prefix hash
+/// chains of the pages computed with them, so a page of another checkpoint never matches.
+pub fn identity_of(order: &[(WeightKey, bool)]) -> String {
+    let mut digest = ::storage::key::Digest::new(b"uniserve-weights-identity");
+    for (key, _) in order {
+        digest.text(&key.to_string());
     }
+    ::storage::Key(digest.finish()).hex()
 }
 
-/// What a rank's planes answer of the segments they hold; none for planes that are not split.
-fn held(planes: Option<&Arc<CachePlanes>>) -> Option<memory::Held> {
-    let planes = planes?;
-    planes.segments()?;
-    Some(memory::Held {
-        held: planes.held_segments(),
+/// What `cache`'s planes are made of and how many of their segments exist; none for planes that
+/// are not split.
+fn segment_table(cache: &KvCacheMemory) -> Option<CacheTable> {
+    cache.segments().map(|segments| CacheTable {
+        segments: segments.to_vec(),
+        held: cache.held_segments(),
     })
 }
 
-/// Answers each rank's `replies` to the memory operation `message` as the JSON texts
-/// [`Batches::operate`] returns; the message's type fixes the reply type the scheduler reads back.
-fn answer<O: memory::Operation + std::fmt::Debug>(
-    message: &O,
-    replies: Vec<O::Reply>,
-) -> Result<Vec<String>> {
-    memory::responses(&replies).map_err(|error| rejected(&format!("{message:?}"), error))
-}
+/// One rank's second load of `target` through `weights`, beside the weights of `serving`: it
+/// publishes what changed and returns the load's order. A load that fails leaves the store with
+/// no load in progress; what it published is the discard's to release.
+fn reload(
+    model: &dyn ModelLoad,
+    weights: &WeightStore,
+    serving: &[(WeightKey, bool)],
+    target: &Target,
+) -> Result<Vec<(WeightKey, bool)>> {
+    let load = Reload::new(weights, serving)?;
+    let loaded = match model.load(target, &load) {
+        Ok(()) => load.finish(),
+        Err(refusal) => Err(Error::Invalid(refusal)),
+    };
 
-/// The digest a set of weights is known by: what roots the prefix hash chains of the pages computed
-/// with them, so a page of another checkpoint never matches.
-pub fn identity_of(log: &[LoadedWeight]) -> String {
-    let mut digest = ::storage::key::Digest::new(b"uniserve-weights-identity");
-    for weight in log {
-        digest.text(&weight.key.to_string());
+    if loaded.is_err() {
+        weights.abandon();
     }
-    ::storage::Key(digest.finish()).hex()
+    loaded
 }
 
 impl DataPlane {
@@ -231,75 +308,154 @@ impl DataPlane {
             experts: Mutex::new(None),
             adapters: Mutex::new(BTreeMap::new()),
             suspended: AtomicBool::new(false),
+            derived_stale: AtomicBool::new(false),
             poisoned: Mutex::new(None),
             fraction,
-            reservations: Mutex::new(Vec::new()),
+            reserved: Mutex::new(Vec::new()),
         }
     }
 
-    /// Reserves what the ranks hold beside the retained storage in their devices' quotas, as they
-    /// start to serve (§7.6): each rank's graph pools, and what its process holds beside them. From
-    /// here on the quota binds the whole rank, so a storage that would take the deployment past it
-    /// is refused at the Storage Server and not found out by the device.
-    ///
-    /// Reserved once: a process that already reserved keeps its figures, and a standby reserves when it is
-    /// promoted, because until then the quota counts what it maps of its predecessor.
+    /// Runs the operation `work` makes for each rank, given its index, as a control operation
+    /// named `label` on the rank's executor, and returns each rank's value in rank order.
     ///
     /// # Errors
     ///
-    /// When a rank's storage does not fit its quota, or NVML cannot state the process's storage.
+    /// The first rank's failure, once every rank's operation has ended: a rank whose executor
+    /// closed, an operation that failed, or an executor that closed before it ran the operation.
+    fn each<T: Send + 'static>(
+        &self,
+        label: &str,
+        work: impl Fn(usize, &Rank) -> Work<T>,
+    ) -> Result<Vec<T>> {
+        // Every rank's operation is handed over before any is waited for.
+        let mut submitted = Vec::with_capacity(self.ranks.len());
+        for (index, rank) in self.ranks.iter().enumerate() {
+            let rank = lock(rank);
+            let work = work(index, &rank);
+            let (value, produced) = crossbeam_channel::bounded(1);
+
+            let submission = rank.executor().and_then(|executor| {
+                executor.control(
+                    format!("{label} on rank {}", rank.rank),
+                    Box::new(move |runners: &mut [Box<dyn Runner>]| {
+                        // A data plane that stopped waiting has nothing to be told.
+                        let _ = value.send(work(runners)?);
+                        Ok(())
+                    }),
+                )
+            });
+            submitted.push((submission, produced));
+        }
+
+        // A failure is reported once every operation has ended, so the caller acts on it with
+        // nothing of the change still running on any device.
+        let mut values = Vec::with_capacity(submitted.len());
+        let mut failure = None;
+        for (submission, produced) in submitted {
+            let ended = submission.and_then(|submission| match submission.wait() {
+                Outcome::Success(_) => produced
+                    .recv()
+                    .map_err(|_| Error::State("a control operation ended without its value")),
+                Outcome::Failed(fault) => Err(Error::Shared(fault)),
+                Outcome::Cancelled => Err(Error::State(
+                    "the rank's executor closed before it ran the operation",
+                )),
+            });
+
+            match ended {
+                Ok(value) => values.push(value),
+                Err(error) => {
+                    failure.get_or_insert(error);
+                }
+            }
+        }
+
+        match failure {
+            Some(error) => Err(error),
+            None => Ok(values),
+        }
+    }
+
+    /// Reserves what each rank's process holds beside its pools and the Storage Server's storages
+    /// in its device's quota, as the ranks start to serve: its CUDA context, its kernels and its
+    /// communicators, measured once the executor has passed every job before it. From here on the
+    /// quota binds the whole rank, so a storage that would take the deployment past it is
+    /// refused at the Storage Server and not found out by the device.
+    ///
+    /// Reserved once: a process that already reserved keeps its figures, and a standby reserves
+    /// when it is promoted, because until then the quota counts what it maps of its predecessor.
+    ///
+    /// # Errors
+    ///
+    /// When a rank's process does not fit its quota, or NVML cannot state the process's storage.
     pub fn reserve_serving(&self) -> Result<()> {
-        let mut reservations = lock(&self.reservations);
-        if !reservations.is_empty() {
+        let mut reserved = lock(&self.reserved);
+        if !reserved.is_empty() {
             return Ok(());
         }
-        let mut measured = Vec::with_capacity(self.ranks.len());
-        for rank in &self.ranks {
-            let rank = lock(rank);
-            let graph = rank.worker()?.memory().graph;
-            let budget = DeviceBudget::new(
-                // Nothing runs as a rank opens admission, so there is nothing to wait for.
-                Arc::new(|_| Ok(())),
-                Arc::clone(&rank.storage),
-                BTreeMap::new(),
-            )?;
-            let reservation = budget.reservation(rank.device, self.fraction, graph, 0)?;
-            reservation.submit(&rank.storage, !self.suspended.load(Ordering::Acquire))?;
-            measured.push(reservation);
+
+        let nvml = Arc::new(Nvml::init()?);
+        let measured = self.each("measuring the process's device storage", |_, rank| {
+            let nvml = Arc::clone(&nvml);
+            let graphs = Arc::clone(&rank.graphs);
+            let (device, unattributed) = (rank.device, rank.unattributed);
+
+            Box::new(move |_: &mut [Box<dyn Runner>]| {
+                let pools = lock(&graphs).mapped();
+                process_bytes(&nvml, device, pools, unattributed)
+            })
+        })?;
+
+        let reservations: Vec<Reservation> = measured
+            .into_iter()
+            .map(|process| Reservation {
+                process,
+                profiling: 0,
+            })
+            .collect();
+        for (rank, reservation) in self.ranks.iter().zip(&reservations) {
+            self.reserve(&lock(rank), reservation)?;
         }
-        *reservations = measured;
+
+        *reserved = reservations;
         Ok(())
     }
 
-    /// Reserves again what the ranks reserve, the graph pools as `graphs` says: a suspended pool holds no
-    /// storage, and the quota hands its bytes to what a sleep or a load wants them for.
-    fn rebook(&self, graphs: bool) -> Result<()> {
-        let reservations = lock(&self.reservations);
-        for (rank, reservation) in self.ranks.iter().zip(reservations.iter()) {
-            reservation.submit(&lock(rank).storage, graphs)?;
-        }
+    /// States `reservation` as `rank`'s process in its GPU's quota.
+    fn reserve(&self, rank: &Rank, reservation: &Reservation) -> Result<()> {
+        let total = rank.device.memory_info()?.total;
+        let bytes = reservation.process.saturating_add(reservation.profiling);
+
+        rank.client.reserve(
+            rank.device,
+            total,
+            quota_limit(total, self.fraction),
+            vec![(Item::Process, bytes)],
+        )?;
         Ok(())
     }
 
-    /// Reserves `bytes` of device storage a session's collectors hold on `rank`'s device with the
-    /// rank's process. Answers the quota's refusal; a process that reserves nothing yet, a standby,
-    /// has nothing to reserve it beside.
+    /// Reserves `bytes` of device storage a session's collectors hold on `index`'s device with
+    /// the rank's process. Returns the quota's refusal; a process that reserves nothing yet, a
+    /// standby, has nothing to reserve it beside.
     fn reserve_profiling(&self, index: usize, bytes: u64) -> Result<Option<String>> {
-        let mut reservations = lock(&self.reservations);
-        let Some(reservation) = reservations.get_mut(index) else {
+        let mut reserved = lock(&self.reserved);
+        let (Some(reservation), Some(rank)) = (reserved.get_mut(index), self.ranks.get(index))
+        else {
             return Ok(None);
         };
         if reservation.profiling == bytes {
             return Ok(None);
         }
-        let reserved = std::mem::replace(&mut reservation.profiling, bytes);
-        let graphs = !self.suspended.load(Ordering::Acquire);
-        match reservation.submit(&lock(&self.ranks[index]).storage, graphs) {
-            Ok(_) => Ok(None),
+
+        let held = std::mem::replace(&mut reservation.profiling, bytes);
+        match self.reserve(&lock(rank), reservation) {
+            Ok(()) => Ok(None),
             Err(error) => {
-                reservation.profiling = reserved;
+                reservation.profiling = held;
                 match error {
-                    // `Retained::reserve` answers the server's refusal of a reservation past the quota so.
+                    // `StorageClient::reserve` states the server's refusal of a reservation past
+                    // the quota so.
                     Error::Unsupported(refusal) => Ok(Some(refusal)),
                     error => Err(error),
                 }
@@ -308,8 +464,9 @@ impl DataPlane {
     }
 
     /// Starts the profiling session `payload` states on every rank (`docs/profiling.md`): each
-    /// reserves what its collectors hold, then starts at its next batch boundary. A rank whose quota
-    /// cannot fit the storage answers that it refused, and the daemon ends what the others started.
+    /// reserves what its collectors hold, then starts at its next batch boundary. A rank whose
+    /// quota cannot fit the storage responds that it refused, and the daemon ends what the others
+    /// started.
     ///
     /// # Errors
     ///
@@ -317,15 +474,17 @@ impl DataPlane {
     pub fn start_profile(&self, payload: &str) -> Result<Vec<String>> {
         let start: proto::profile::SessionStart =
             serde_json::from_str(payload).map_err(|error| rejected("profile_start", error))?;
-        let mut answers = Vec::with_capacity(self.ranks.len());
+
+        let mut responses = Vec::with_capacity(self.ranks.len());
         for (index, rank) in self.ranks.iter().enumerate() {
-            let (number, worker) = {
+            let (number, executor) = {
                 let rank = lock(rank);
-                (rank.rank, rank.worker()?)
+                (rank.rank, rank.executor()?)
             };
+
             let held = worker::profiling::session::device_storage(&start.request, number);
             if let Some(refusal) = self.reserve_profiling(index, held)? {
-                answers.push(
+                responses.push(
                     serde_json::json!({
                         "rank": number,
                         "selected": true,
@@ -339,24 +498,25 @@ impl DataPlane {
                 );
                 continue;
             }
-            let started = worker.profile(Change::Start {
+
+            let started = executor.profile(Change::Start {
                 start: Box::new(start.clone()),
                 rank: number,
             });
             match started {
-                Ok(answer) => answers.push(answer.to_string()),
+                Ok(response) => responses.push(response.to_string()),
                 Err(error) => {
                     self.release_profiling(index);
                     return Err(error);
                 }
             }
         }
-        Ok(answers)
+        Ok(responses)
     }
 
     /// The session's storage is no longer held on `index`'s device. A failure leaves the larger
-    /// reservation in the quota, which only overstates the rank's storage, so it is logged rather than
-    /// failing the session's end.
+    /// reservation in the quota, which only overstates the rank's storage, so it is logged rather
+    /// than failing the session's end.
     fn release_profiling(&self, index: usize) {
         let failure = match self.reserve_profiling(index, 0) {
             Ok(None) => return,
@@ -366,12 +526,12 @@ impl DataPlane {
         tracing::warn!("releasing the ended profiling session's device storage failed: {failure}");
     }
 
-    /// Ends the profiling session `payload` names on every rank: each writes what remains and closes
-    /// its file, and the quota gives back what the session held.
+    /// Ends the profiling session `payload` names on every rank: each writes what remains and
+    /// closes its file, and the quota gives back what the session held.
     ///
     /// # Errors
     ///
-    /// When the payload names no session, or a rank's device is gone.
+    /// When the payload names no session, or a rank's executor is gone.
     pub fn stop_profile(&self, payload: &str) -> Result<Vec<String>> {
         let value: serde_json::Value =
             serde_json::from_str(payload).map_err(|error| rejected("profile_stop", error))?;
@@ -379,28 +539,30 @@ impl DataPlane {
             .as_u64()
             .ok_or_else(|| Error::Invalid("profile_stop names no session".into()))?;
         let reason = value["reason"].as_str().unwrap_or("stopped").to_owned();
-        let mut answers = Vec::with_capacity(self.ranks.len());
+
+        let mut responses = Vec::with_capacity(self.ranks.len());
         for (index, rank) in self.ranks.iter().enumerate() {
-            let (number, worker) = {
+            let (number, executor) = {
                 let rank = lock(rank);
-                (rank.rank, rank.worker()?)
+                (rank.rank, rank.executor()?)
             };
-            let answer = worker.profile(Change::Stop {
+
+            let response = executor.profile(Change::Stop {
                 session,
                 reason: reason.clone(),
                 rank: number,
             })?;
             self.release_profiling(index);
-            answers.push(answer.to_string());
+            responses.push(response.to_string());
         }
-        Ok(answers)
+        Ok(responses)
     }
 
     /// Turns one collector of a session off on every rank, for the quality-of-service guard.
     ///
     /// # Errors
     ///
-    /// When the payload names no session or collector, or a rank's device is gone.
+    /// When the payload names no session or collector, or a rank's executor is gone.
     pub fn release_profile(&self, payload: &str) -> Result<Vec<String>> {
         let value: serde_json::Value =
             serde_json::from_str(payload).map_err(|error| rejected("profile_release", error))?;
@@ -411,21 +573,23 @@ impl DataPlane {
             serde_json::from_value(value["collector"].clone())
                 .map_err(|error| rejected("profile_release", error))?;
         let reason = value["reason"].as_str().unwrap_or("released").to_owned();
-        let mut answers = Vec::with_capacity(self.ranks.len());
+
+        let mut responses = Vec::with_capacity(self.ranks.len());
         for rank in &self.ranks {
-            let (number, worker) = {
+            let (number, executor) = {
                 let rank = lock(rank);
-                (rank.rank, rank.worker()?)
+                (rank.rank, rank.executor()?)
             };
-            let answer = worker.profile(Change::Release {
+
+            let response = executor.profile(Change::Release {
                 session,
                 collector,
                 reason: reason.clone(),
                 rank: number,
             })?;
-            answers.push(answer.to_string());
+            responses.push(response.to_string());
         }
-        Ok(answers)
+        Ok(responses)
     }
 
     /// Why this epoch must end, once a change of its mappings failed part of the way.
@@ -436,16 +600,6 @@ impl DataPlane {
     /// The target the ranks serve now.
     pub fn target(&self) -> Target {
         lock(&self.target).clone()
-    }
-
-    /// The page identity of each of `rank`'s cache groups for weights of `identity`
-    /// (`PrefixCacheInfo::identities`); none for a rank that keeps no paged cache.
-    fn page_identities(rank: &Rank, identity: &str) -> Vec<String> {
-        let Some(cache) = rank.cache.as_ref() else {
-            return Vec::new();
-        };
-        let plan = Arc::clone(lock(cache).planes());
-        worker::memory::prefix_cache::host::page_identities(plan.plan(), identity)
     }
 
     /// What the rank's pages are computed from, which keys them in the host KV cache: the identity
@@ -466,18 +620,12 @@ impl DataPlane {
     /// all of them: an expert union's rank computes each token's experts on its peers, so a page is
     /// another page once any rank's weights change, and every rank keys it alike.
     fn identity_of_ranks(&self) -> String {
-        let identities: Vec<LoadedWeight> = self
+        let order: Vec<(WeightKey, bool)> = self
             .ranks
             .iter()
             .flat_map(|rank| lock(rank).serving.clone())
             .collect();
-        identity_of(&identities)
-    }
-
-    fn planes_of(rank: &Rank) -> Option<Arc<CachePlanes>> {
-        rank.cache
-            .as_ref()
-            .map(|cache| Arc::clone(lock(cache).planes()))
+        identity_of(&order)
     }
 
     /// The room every device has for a load, in rank order.
@@ -490,9 +638,9 @@ impl DataPlane {
             .iter()
             .map(|rank| {
                 let rank = lock(rank);
-                let device = rank.device;
-                let (quota, _) = rank.storage.usage(device)?;
-                let free = device.memory_info()?.free;
+                let (quota, _) = rank.client.usage(rank.device)?;
+                let free = rank.device.memory_info()?.free;
+
                 Ok(Room {
                     quota: quota
                         .limit
@@ -503,249 +651,266 @@ impl DataPlane {
             .collect()
     }
 
-    /// The bytes of device storage the graph pools hold, on the device that holds the fewest.
+    /// The bytes of device storage the graph pools map, on the device that maps the fewest: what
+    /// a suspension of the pools gives back on every device.
     pub fn graph_bytes(&self) -> u64 {
         self.ranks
             .iter()
-            .filter_map(|rank| lock(rank).worker.upgrade())
-            .map(|worker| worker.memory().graph)
+            .map(|rank| Arc::clone(&lock(rank).graphs))
+            .map(|graphs| lock(&graphs).mapped())
             .min()
             .unwrap_or(0)
     }
 
-    /// Plans a load of `target` on every rank, moving no byte.
+    /// Pairs the weights of a load of `target` with the ones that serve, on every rank, moving no
+    /// byte: the model's load runs over storage on the meta device, which states the weights it
+    /// reaches without reading a payload. With `rearranged`, a stack may hold the same parts in
+    /// another order (an expert redistribution); without, each weight reads the same tensors (a
+    /// weight update).
     ///
     /// # Errors
     ///
     /// When the target cannot be the served model: the sentence names its first difference.
-    pub fn plan(&self, target: Target, matching: Matching) -> Result<Planned> {
+    pub fn pair(&self, target: Target, rearranged: bool) -> Result<Replacement> {
         let mut ranks = Vec::with_capacity(self.ranks.len());
         for rank in &self.ranks {
-            let (model, serving, storage, device) = {
+            let (model, weights, serving) = {
                 let rank = lock(rank);
                 (
                     Arc::clone(&rank.model),
+                    Arc::clone(&rank.weights),
                     rank.serving.clone(),
-                    Arc::clone(&rank.storage),
-                    rank.device,
                 )
             };
-            let mut walk = Walk::default();
-            model.load(&target, &mut walk).map_err(Error::Invalid)?;
-            let log = walk.into_log();
-            let pairs = paired(&serving, &log, matching).map_err(|difference| {
+
+            let meta = MetaWeights::new();
+            model.load(&target, &meta).map_err(Error::Invalid)?;
+            let order = meta.into_order();
+
+            let pairs = paired(&serving, &order, rearranged).map_err(|difference| {
                 Error::Invalid(format!(
                     "{} loads other tensors than the served model: {difference}",
                     target.checkpoint.display()
                 ))
             })?;
-            // A replacement of a weight of its own takes an allocation of its length, and one of a
-            // packed weight its share of a granule: the granules hold them back to back.
-            let mut bytes = 0;
-            for pair in &pairs {
-                let mapped = storage
-                    .mapped_weight(device, &retained_key(&pair.old))?
-                    .ok_or_else(|| {
-                        Error::Invariant(format!("the rank maps no weight {}", pair.old))
-                    })?;
-                bytes += if mapped.packed {
-                    mapped.length
-                } else {
-                    mapped.storage.bytes() as u64
-                };
+
+            // A replacement of a weight of its own takes an allocation of its length, and one of
+            // a packed weight its share of an allocation.
+            let mut bytes: u64 = 0;
+            for (serving, _) in &pairs {
+                bytes = bytes.saturating_add(weights.replacement_bytes(serving)?);
             }
-            ranks.push(RankLoad { pairs, log, bytes });
+            ranks.push(Share {
+                pairs,
+                order,
+                bytes,
+            });
         }
-        Ok(Planned {
+
+        Ok(Replacement {
             target,
             ranks,
             loaded: false,
         })
     }
 
-    /// Publishes what `planned` changes on every rank, each rank on a thread of its own: the
+    /// Publishes what `replacement` changes on every rank, each rank on a thread of its own: the
     /// batches go on reading the weights that serve.
     ///
     /// # Errors
     ///
     /// When a rank's load fails: everything this load published is released, and the ranks serve
     /// on as they did.
-    pub fn load(&self, mut planned: Planned) -> Result<Planned> {
-        let target = planned.target.clone();
-        // One rank's share of the load: its model, its storage, its device and the weights it
-        // serves now, copied out so no rank's lock is held while the loads run.
-        type RankLoad = (
-            Arc<dyn ModelLoad>,
-            Arc<Retained>,
-            platform::DeviceId,
-            Vec<LoadedWeight>,
-        );
-        let loads: Vec<RankLoad> = self
+    pub fn load(&self, mut replacement: Replacement) -> Result<Replacement> {
+        let target = replacement.target.clone();
+
+        // One rank's share of the load, copied out so no rank's lock is held while the loads run.
+        type Inputs = (Arc<dyn ModelLoad>, Arc<WeightStore>, Vec<(WeightKey, bool)>);
+        let inputs: Vec<Inputs> = self
             .ranks
             .iter()
             .map(|rank| {
                 let rank = lock(rank);
                 (
                     Arc::clone(&rank.model),
-                    Arc::clone(&rank.storage),
-                    rank.device,
+                    Arc::clone(&rank.weights),
                     rank.serving.clone(),
                 )
             })
             .collect();
-        planned.loaded = true;
-        let results: Vec<std::result::Result<Vec<LoadedWeight>, String>> = std::thread::scope(
-            |scope| {
-                let handles: Vec<_> = loads
-                    .iter()
-                    .map(|(model, storage, device, serving)| {
-                        let target = &target;
-                        scope.spawn(move || {
-                            let mut store =
-                                Reloading::new(Arc::clone(storage), *device, serving);
-                            model.load(target, &mut store)?;
-                            let (log, published, gathered) =
-                                store.finish().map_err(|error| error.to_string())?;
-                            tracing::info!(
-                                device = device.0,
-                                published,
-                                gathered,
-                                "a rank published what the load changes beside the weights that serve"
-                            );
-                            Ok(log)
-                        })
+        replacement.loaded = true;
+
+        let orders: Vec<Result<Vec<(WeightKey, bool)>>> = std::thread::scope(|scope| {
+            let handles: Vec<_> = inputs
+                .iter()
+                .map(|(model, weights, serving)| {
+                    let target = &target;
+                    scope.spawn(move || reload(model.as_ref(), weights, serving, target))
+                })
+                .collect();
+
+            handles
+                .into_iter()
+                .map(|handle| {
+                    handle.join().unwrap_or_else(|_| {
+                        Err(Error::Invariant("a rank's weight load panicked".into()))
                     })
-                    .collect();
-                handles
-                    .into_iter()
-                    .map(|handle| {
-                        handle
-                            .join()
-                            .unwrap_or_else(|_| Err("a rank's weight load panicked".to_owned()))
-                    })
-                    .collect()
-            },
-        );
+                })
+                .collect()
+        });
+
         let mut failure = None;
-        for (rank, result) in planned.ranks.iter().zip(results) {
-            match result {
-                // The walk and the load are one code path over one checkpoint, so a difference
+        for (share, order) in replacement.ranks.iter().zip(orders) {
+            match order {
+                // The pairing and the load are one code path over one checkpoint, so a difference
                 // here is a checkpoint that changed between them.
-                Ok(log) if log == rank.log => {}
+                Ok(order) if order == share.order => {}
                 Ok(_) => {
                     failure.get_or_insert_with(|| {
                         format!(
-                            "{} changed while it loaded: its weights are not the ones planned",
+                            "{} changed while it loaded: its weights are not the ones paired",
                             target.checkpoint.display()
                         )
                     });
                 }
                 Err(error) => {
-                    failure.get_or_insert(error);
+                    failure.get_or_insert(error.to_string());
                 }
             }
         }
+
         if let Some(failure) = failure {
-            self.discard(planned);
+            self.discard(replacement);
             return Err(Error::Invalid(format!(
                 "the weights of {} did not load: {failure}",
                 target.checkpoint.display()
             )));
         }
-        Ok(planned)
+        Ok(replacement)
     }
 
-    /// Ends a load that will not serve: what it published goes back, and the ranks serve on.
-    pub fn discard(&self, planned: Planned) {
-        if !planned.loaded {
+    /// Ends a replacement that will not serve: what its load published goes back, and the ranks
+    /// serve on.
+    pub fn discard(&self, replacement: Replacement) {
+        if !replacement.loaded {
             return;
         }
-        for (rank, load) in self.ranks.iter().zip(&planned.ranks) {
-            let rank = lock(rank);
-            let keys: Vec<[u8; 32]> = load
-                .pairs
-                .iter()
-                .map(|pair| retained_key(&pair.new))
-                .collect();
-            if let Err(error) = rank.storage.forget_weights(rank.device, &keys) {
+
+        for (rank, share) in self.ranks.iter().zip(&replacement.ranks) {
+            let weights = Arc::clone(&lock(rank).weights);
+            let published: Vec<WeightKey> =
+                share.pairs.iter().map(|(_, new)| new.clone()).collect();
+
+            if let Err(error) = weights.forget(&published) {
                 tracing::warn!(%error, "an abandoned weight load's storage was not released");
             }
         }
     }
 
-    /// Keeps a finished load for the boundary that puts it in place.
-    pub fn stage(&self, planned: Planned) {
-        if let Some(previous) = lock(&self.staged).replace(planned) {
+    /// Keeps a loaded replacement for the boundary that puts it in place
+    /// ([`Self::update_weights`]).
+    pub fn stage(&self, replacement: Replacement) {
+        if let Some(previous) = lock(&self.staged).replace(replacement) {
             self.discard(previous);
         }
     }
 
-    /// Ends a staged load that will not serve.
+    /// Ends a staged replacement that will not serve.
     pub fn discard_staged(&self) {
-        if let Some(planned) = lock(&self.staged).take() {
-            self.discard(planned);
+        if let Some(replacement) = lock(&self.staged).take() {
+            self.discard(replacement);
         }
     }
 
-    /// Maps `planned`'s weights at the addresses of the ones they replace, on every rank, at a
-    /// boundary where nothing runs, and answers each rank's report.
-    fn rebind(&self, planned: Planned) -> Result<Vec<memory::WeightsUpdated>> {
-        let Planned { target, ranks, .. } = planned;
-        let mut queued = Vec::with_capacity(ranks.len());
-        for (rank, load) in self.ranks.iter().zip(&ranks) {
-            let rank = lock(rank);
-            let device = rank.device;
-            let storage = Arc::clone(&rank.storage);
-            let pairs: Vec<([u8; 32], [u8; 32])> = load
-                .pairs
-                .iter()
-                .map(|pair| (retained_key(&pair.old), retained_key(&pair.new)))
-                .collect();
-            let work: Arc<dyn Fn() -> Result<()> + Send + Sync> = Arc::new(move || {
-                storage.rebind_weights(device, &pairs).map(|moved| {
-                    tracing::info!(device = device.0, moved, "rebound the rank's weights");
-                })
-            });
-            queued.push(rank.worker()?.rebind(work)?);
+    /// Puts the staged replacement in place on every rank and returns each rank's report.
+    ///
+    /// The caller has paused every scheduler whose batches read the ranks' weights, so every
+    /// rank of a group changes between the same two batches.
+    ///
+    /// # Errors
+    ///
+    /// When no replacement is staged, and as [`Self::commit_experts`].
+    pub fn update_weights(&self) -> Result<Vec<WeightsUpdated>> {
+        let replacement = lock(&self.staged).take().ok_or(Error::State(
+            "no weights are loaded for this update to put in place",
+        ))?;
+        self.rebind(replacement)
+    }
+
+    /// Maps `replacement`'s weights at the addresses of the ones they replace, on every rank's
+    /// executor between two of its jobs, has the runners recompute what they derive from them,
+    /// and returns each rank's report.
+    fn rebind(&self, replacement: Replacement) -> Result<Vec<WeightsUpdated>> {
+        let Replacement { target, ranks, .. } = replacement;
+
+        // What a runner derives from its weights is computed in its graph pool, which a suspended
+        // rank has unmapped: the restore recomputes it.
+        let suspended = self.suspended.load(Ordering::Acquire);
+        if suspended {
+            self.derived_stale.store(true, Ordering::Release);
         }
-        let mut failure = None;
-        for submission in queued {
-            if let Err(error) = done("putting the new weights in place", submission) {
-                failure.get_or_insert(error.to_string());
+
+        let moved = self.each("putting the new weights in place", |index, rank| {
+            let weights = Arc::clone(&rank.weights);
+            let pairs = ranks
+                .get(index)
+                .map(|share| share.pairs.clone())
+                .unwrap_or_default();
+
+            Box::new(move |runners: &mut [Box<dyn Runner>]| {
+                let moved = weights.rebind(&pairs)?;
+                // The graphs read the weights at the addresses that were mapped again.
+                worker::profiling::storage_remapped();
+
+                if !suspended {
+                    for runner in runners.iter_mut() {
+                        runner.weights_changed()?;
+                    }
+                }
+                Ok(moved)
+            })
+        });
+        let moved = match moved {
+            Ok(moved) => moved,
+            Err(error) => {
+                *lock(&self.poisoned) = Some(error.to_string());
+                return Err(error);
             }
+        };
+
+        for (rank, share) in self.ranks.iter().zip(ranks) {
+            lock(rank).serving = share.order;
         }
-        if let Some(failure) = failure {
-            *lock(&self.poisoned) = Some(failure.clone());
-            return Err(Error::Interface(failure));
-        }
-        let mut moved_weights = Vec::with_capacity(ranks.len());
-        for (rank, load) in self.ranks.iter().zip(ranks) {
-            let mut rank = lock(rank);
-            let identity = identity_of(&load.log);
-            moved_weights.push((identity, load.pairs.len()));
-            rank.serving = load.log;
-        }
+
         // The cached pages were computed from the weights this replaces, so later pages are keyed
         // by the new ones at every cache level: a prompt no longer finds the old.
-        let pages_identity = self.identity_of_ranks();
-        let mut reports = Vec::with_capacity(moved_weights.len());
-        for (rank, (identity, moved)) in self.ranks.iter().zip(moved_weights) {
+        let pages = self.identity_of_ranks();
+        let mut reports = Vec::with_capacity(moved.len());
+        for (rank, moved) in self.ranks.iter().zip(moved) {
             let rank = lock(rank);
-            let identities = Self::page_identities(&rank, &pages_identity);
-            reports.push(memory::WeightsUpdated {
-                group: Some(rank.storage.scope().group.clone()),
-                rank: Some(rank.storage.scope().rank),
-                identity: Some(identity),
+            let identities = rank
+                .cache
+                .as_ref()
+                .map(|cache| lock(cache).page_identities(&pages))
+                .unwrap_or_default();
+
+            reports.push(WeightsUpdated {
+                group: Some(rank.client.scope().group.clone()),
+                rank: Some(rank.client.scope().rank),
+                identity: Some(identity_of(&rank.serving)),
                 identities,
                 moved,
             });
         }
+
         *lock(&self.target) = target;
         Ok(reports)
     }
 
-    /// Suspends the graph pools of every rank, at a boundary where nothing runs: what a sleep gives
-    /// back beside the cache, and what `keep` gives up for a load the free storage does not hold.
+    /// Suspends the graph pools of every rank between two of its executor's jobs: what a sleep
+    /// gives back beside the cache, and what a load the free storage does not hold takes. The
+    /// pools' reservation in the quota drops with them. The caller has paused the schedulers,
+    /// since nothing may replay a graph until the restore.
     ///
     /// # Errors
     ///
@@ -754,188 +919,167 @@ impl DataPlane {
         if self.suspended.swap(true, Ordering::AcqRel) {
             return Ok(());
         }
-        for rank in &self.ranks {
-            let worker = lock(rank).worker()?;
-            done("suspending the graph pools", worker.suspend_graphs()?)?;
-        }
-        self.rebook(false)?;
+
+        self.each("suspending the graph pools", |_, rank| {
+            let graphs = Arc::clone(&rank.graphs);
+            Box::new(move |_: &mut [Box<dyn Runner>]| {
+                lock(&graphs).suspend()?;
+                worker::profiling::storage_remapped();
+                Ok(())
+            })
+        })?;
+
         tracing::info!("the graph pools gave their storage back at unchanged addresses");
         Ok(())
     }
 
-    /// Restores what [`Self::suspend_graphs`] gave back, at the addresses the graphs hold.
+    /// Restores what [`Self::suspend_graphs`] gave back, at the addresses the graphs hold, and
+    /// has the runners recompute what they derive from weights that changed meanwhile. The
+    /// executors renew every graph before its next replay.
     ///
     /// # Errors
     ///
-    /// When a device refuses, naming the pool; nothing executes on the rank then.
+    /// When a device or the quota refuses, naming the pool; the restore may be tried again, and
+    /// the schedulers stay paused until it succeeded.
     pub fn restore_graphs(&self) -> Result<()> {
-        if !self.suspended.swap(false, Ordering::AcqRel) {
+        if !self.suspended.load(Ordering::Acquire) {
             return Ok(());
         }
-        for rank in &self.ranks {
-            let worker = lock(rank).worker()?;
-            done("restoring the graph pools", worker.restore_graphs()?)?;
-        }
-        self.rebook(true)?;
+
+        let stale = self.derived_stale.load(Ordering::Acquire);
+        self.each("restoring the graph pools", |_, rank| {
+            let graphs = Arc::clone(&rank.graphs);
+            Box::new(move |runners: &mut [Box<dyn Runner>]| {
+                lock(&graphs).restore()?;
+                worker::profiling::storage_remapped();
+
+                if stale {
+                    for runner in runners.iter_mut() {
+                        runner.weights_changed()?;
+                    }
+                }
+                Ok(())
+            })
+        })?;
+
+        self.derived_stale.store(false, Ordering::Release);
+        self.suspended.store(false, Ordering::Release);
         tracing::info!("the graph pools took their storage back at the addresses the graphs hold");
         Ok(())
     }
 
-    /// What every rank reports of its cache's storage (`Scheduler::storage_reports` reads it).
-    fn cache_storage(&self) -> Result<Vec<memory::CacheStorageReport>> {
-        self.ranks
-            .iter()
-            .map(|rank| {
-                let rank = lock(rank);
-                let device = rank.device;
-                let planes = Self::planes_of(&rank);
-                let memory = device.memory_info()?;
-                let (quota, _) = rank.storage.usage(device)?;
-                Ok(memory::CacheStorageReport {
-                    segments: planes
-                        .as_ref()
-                        .and_then(|planes| planes.segments())
-                        .unwrap_or_default(),
-                    held: planes.as_ref().map_or(0, |planes| planes.held_segments()),
-                    unit_bytes: planes.as_ref().map_or(0, |planes| planes.unit_bytes()),
-                    free_bytes: memory.free,
-                    host: rank.host.clone(),
-                    scope: Some(rank.storage.scope().clone()),
-                    epoch: Some(rank.storage.epoch()),
-                    usage: Some(quota),
-                })
+    /// The ranks' side of a release from segment `first` on (module documentation): every rank
+    /// unmaps the segments of its KV planes from `first` on and ends its retention of them. The
+    /// head has withdrawn them, so no region holds a unit of them and no job addresses them.
+    /// Returns each rank's segment table; none for a rank that keeps no cache or whose planes
+    /// are not split, which has nothing to release.
+    ///
+    /// # Errors
+    ///
+    /// For segments a predecessor epoch writes, or when the Storage Server refuses.
+    pub fn release_segments(&self, first: u32) -> Result<Vec<Option<CacheTable>>> {
+        self.each("releasing the KV planes' segments", |_, rank| {
+            let cache = rank.cache.as_ref().map(Arc::clone);
+            let client = Arc::clone(&rank.client);
+
+            Box::new(move |_: &mut [Box<dyn Runner>]| {
+                let Some(cache) = cache else {
+                    return Ok(None);
+                };
+                let mut cache = lock(&cache);
+                if cache.segments().is_none() {
+                    return Ok(None);
+                }
+
+                cache.release_segments(first, &*client)?;
+                // The graphs address the planes, whose tail was unmapped.
+                worker::profiling::storage_remapped();
+                Ok(segment_table(&cache))
             })
-            .collect()
+        })
     }
 
-    /// Gives back the segments from `from` on, on every rank. No request holds a unit of them: the
-    /// scheduler withdrew them and waited.
-    fn release_cache(&self, from: u32) -> Result<Vec<Option<memory::Held>>> {
-        let mut answers = Vec::with_capacity(self.ranks.len());
-        for rank in &self.ranks {
-            let rank = lock(rank);
-            done(
-                "giving the cache's segments back",
-                rank.worker()?.release_cache(from)?,
-            )?;
-            answers.push(held(Self::planes_of(&rank).as_ref()));
-        }
-        Ok(answers)
-    }
-
-    /// Creates the first `limit` given-back segments again, or all of them, on every rank.
-    fn restore_cache(&self, limit: Option<u32>) -> Result<Vec<Option<memory::Held>>> {
-        let mut answers = Vec::with_capacity(self.ranks.len());
-        for rank in &self.ranks {
-            let rank = lock(rank);
-            done(
-                "creating the cache's segments again",
-                rank.worker()?.wake(limit)?,
-            )?;
-            answers.push(held(Self::planes_of(&rank).as_ref()));
-        }
-        Ok(answers)
-    }
-
-    /// Takes over the predecessor epoch's pages on every rank (`memory::AdoptCache`): the value
-    /// planes are the predecessor's segments, mapped whole, so its pages lie at their own units,
-    /// and what the rank copies is the flag and scale cells of `units` from the predecessor's
-    /// planes into its own, where they are other storages (a switch's target; a standby's are the
-    /// predecessor's).
+    /// The ranks' side of creating given-back segments (module documentation): every rank creates
+    /// the first `limit` segments of its KV planes it gave back, or all of them, at their
+    /// addresses, and resets their units. Returns each rank's segment table, from which the head
+    /// grants the segments held now; none for a rank that keeps no cache or whose planes are not
+    /// split.
     ///
     /// # Errors
     ///
-    /// When the predecessor lent segments, which planes that map its segments whole never
-    /// borrow, or a copy fails.
-    fn adopt_cache(&self, message: &memory::AdoptCache) -> Result<Vec<memory::CacheAdopted>> {
-        if !message.borrowed.is_empty() {
-            return Err(Error::Invalid(
-                "the ranks map the predecessor's cache segments whole: no segment is lent to them"
-                    .into(),
-            ));
-        }
-        let mut answers = Vec::with_capacity(self.ranks.len());
-        for rank in &self.ranks {
-            let rank = lock(rank);
-            let Some(planes) = Self::planes_of(&rank) else {
-                answers.push(memory::CacheAdopted::default());
-                continue;
-            };
-            let mut storages = vec![
-                ("prefix_cache.key.initialized", 1),
-                ("prefix_cache.value.initialized", 1),
-            ];
-            if planes.plan().quantized {
-                storages.push(("prefix_cache.key.scale", 4));
-                storages.push(("prefix_cache.value.scale", 4));
-            }
-            let inherited = rank.storage.copy_predecessor_cells(
-                rank.device,
-                &storages,
-                planes.columns(),
-                planes.num_units(),
-                &message.units,
-            )?;
-            answers.push(memory::CacheAdopted { inherited });
-        }
-        Ok(answers)
+    /// When the Storage Server or the device refuses; a rank's planes are then as they were.
+    pub fn create_segments(&self, limit: Option<u32>) -> Result<Vec<Option<CacheTable>>> {
+        self.each("creating the KV planes' segments", |_, rank| {
+            let cache = rank.cache.as_ref().map(Arc::clone);
+            let client = Arc::clone(&rank.client);
+            let stream = rank.stream.clone();
+
+            Box::new(move |_: &mut [Box<dyn Runner>]| {
+                let Some(cache) = cache else {
+                    return Ok(None);
+                };
+                let mut cache = lock(&cache);
+
+                cache.wake(&*client, &stream, limit)?;
+                worker::profiling::storage_remapped();
+                Ok(segment_table(&cache))
+            })
+        })
     }
 
-    /// Gives back every segment and the graph storage, on every rank.
-    fn sleep(&self) -> Result<Vec<()>> {
+    /// The ranks' side of a sleep (module documentation): the graph pools are suspended and every
+    /// segment of the KV planes is released. Returns each rank's segment table.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::suspend_graphs`] and [`Self::release_segments`]; a wake undoes what was done.
+    pub fn sleep(&self) -> Result<Vec<Option<CacheTable>>> {
         self.suspend_graphs()?;
-        let mut answers = Vec::with_capacity(self.ranks.len());
-        for rank in &self.ranks {
-            let rank = lock(rank);
-            done("the sleep's release", rank.worker()?.sleep()?)?;
-            answers.push(());
-        }
-        tracing::info!("the ranks sleep: their graph storage and cache are given back");
-        Ok(answers)
+        let tables = self.release_segments(0)?;
+
+        tracing::info!("the ranks sleep: their graph storage and KV planes are given back");
+        Ok(tables)
     }
 
-    /// Restores what [`Self::sleep`] gave back.
-    fn wake(&self) -> Result<Vec<Option<memory::Held>>> {
-        self.restore_graphs()?;
-        self.restore_cache(None)
-    }
-
-    /// Performs the storage `operation` on every rank, at a boundary where no batch runs, and
-    /// answers each rank's JSON result.
+    /// The ranks' side of a wake (module documentation): what [`Self::sleep`] gave back is mapped
+    /// again. Returns each rank's segment table, from which the head grants every segment.
     ///
     /// # Errors
     ///
-    /// When a rank cannot, and for an operation this process does not implement: the cache
-    /// manifest's publication and description, the steps of copy rounds into a target's own
-    /// units, which a target that shares the serving epoch's planes never runs.
-    pub fn operate(&self, operation: &EpochOperation) -> Result<Vec<String>> {
-        match operation {
-            EpochOperation::CacheStorage(message) => answer(message, self.cache_storage()?),
-            EpochOperation::ReleaseCache(message) => {
-                answer(message, self.release_cache(message.from)?)
-            }
-            EpochOperation::RestoreCache(message) => {
-                answer(message, self.restore_cache(message.segments)?)
-            }
-            EpochOperation::Sleep(message) => answer(message, self.sleep()?),
-            EpochOperation::Wake(message) => answer(message, self.wake()?),
-            EpochOperation::UpdateWeights(message) => {
-                let planned = lock(&self.staged).take().ok_or(Error::State(
-                    "no weights are loaded for this update to put in place",
-                ))?;
-                answer(message, self.rebind(planned)?)
-            }
-            EpochOperation::AdoptCache(message) => answer(message, self.adopt_cache(message)?),
-            EpochOperation::PublishCache(_) | EpochOperation::CacheManifest(_) => {
-                Err(Error::Interface(format!(
-                    "this process does not implement the storage operation {operation:?}"
-                )))
-            }
-        }
+    /// As [`Self::restore_graphs`] and [`Self::create_segments`].
+    pub fn wake(&self) -> Result<Vec<Option<CacheTable>>> {
+        self.restore_graphs()?;
+        self.create_segments(None)
     }
 
-    /// Plans a redistribution of the routed experts (§7.6): checks `orders`, states what each rank
-    /// needs, and holds the plan until its copies start.
+    /// Has the cache's and the state's own launches use `kernels`, the generation that serves,
+    /// from the rank's next job on: what the engine does on every rank after it switched, committed
+    /// or rolled back a generation, since no executor job sets it.
+    ///
+    /// # Errors
+    ///
+    /// When a rank's executor is gone.
+    pub fn set_kernels(&self, kernels: &Arc<ops::Generation>) -> Result<()> {
+        self.each("setting the cache's and the state's kernels", |_, rank| {
+            let cache = rank.cache.as_ref().map(Arc::clone);
+            let state = rank.state.as_ref().map(Arc::clone);
+            let kernels = Arc::clone(kernels);
+
+            Box::new(move |_: &mut [Box<dyn Runner>]| {
+                if let Some(cache) = cache {
+                    lock(&cache).set_kernels(Arc::clone(&kernels));
+                }
+                if let Some(state) = state {
+                    lock(&state).set_kernels(kernels);
+                }
+                Ok(())
+            })
+        })?;
+        Ok(())
+    }
+
+    /// Pairs a redistribution of the routed experts: checks `orders`, states what each rank needs,
+    /// and holds the replacement until its copies start.
     ///
     /// # Errors
     ///
@@ -946,6 +1090,7 @@ impl DataPlane {
         if experts.is_some() {
             return Err(Error::State("an expert redistribution is already prepared"));
         }
+
         let layers = {
             let rank = self
                 .ranks
@@ -969,22 +1114,25 @@ impl DataPlane {
                 )));
             }
         }
+
         let mut target = self.target();
         target.experts.extend(orders.clone());
-        let planned = self.plan(target, Matching::Rearranged)?;
+        let replacement = self.pair(target, true)?;
+
         let mut reports = Vec::with_capacity(self.ranks.len());
-        for (rank, load) in self.ranks.iter().zip(&planned.ranks) {
-            let rank = lock(rank);
+        for (rank, share) in self.ranks.iter().zip(&replacement.ranks) {
+            let device = lock(rank).device;
             reports.push(
                 serde_json::json!({
                     "orders": orders,
-                    "gpu": rank.device.uuid()?.0,
-                    "bytes": load.bytes,
+                    "gpu": device.uuid()?.0,
+                    "bytes": share.bytes,
                 })
                 .to_string(),
             );
         }
-        *experts = Some(Experts::Planned(planned));
+
+        *experts = Some(Experts::Paired(replacement));
         Ok(reports)
     }
 
@@ -995,23 +1143,25 @@ impl DataPlane {
     /// When no redistribution is prepared, or it started already.
     pub fn start_experts(self: &Arc<Self>) -> Result<Vec<String>> {
         let mut experts = lock(&self.experts);
-        let planned = match experts.take() {
-            Some(Experts::Planned(planned)) => planned,
+        let replacement = match experts.take() {
+            Some(Experts::Paired(replacement)) => replacement,
             other => {
                 *experts = other;
                 return Err(Error::State("no expert redistribution waits to start"));
             }
         };
+
         let plane = Arc::clone(self);
         let copying = std::thread::Builder::new()
             .name("expert-copies".into())
-            .spawn(move || plane.load(planned))
+            .spawn(move || plane.load(replacement))
             .map_err(|error| rejected("starting the expert copies", error))?;
+
         *experts = Some(Experts::Copying(copying));
         Ok(self.ranks.iter().map(|_| "null".to_owned()).collect())
     }
 
-    /// Whether the copies completed, as each rank answers it.
+    /// Whether the copies completed, as each rank responds.
     ///
     /// # Errors
     ///
@@ -1020,18 +1170,18 @@ impl DataPlane {
         let mut experts = lock(&self.experts);
         let ready = match experts.take() {
             Some(Experts::Copying(task)) if task.is_finished() => {
-                let planned = task
+                let replacement = task
                     .join()
                     .map_err(|_| Error::Invariant("the expert copies panicked".into()))??;
-                *experts = Some(Experts::Ready(planned));
+                *experts = Some(Experts::Ready(replacement));
                 true
             }
             Some(Experts::Copying(task)) => {
                 *experts = Some(Experts::Copying(task));
                 false
             }
-            Some(Experts::Ready(planned)) => {
-                *experts = Some(Experts::Ready(planned));
+            Some(Experts::Ready(replacement)) => {
+                *experts = Some(Experts::Ready(replacement));
                 true
             }
             other => {
@@ -1039,6 +1189,7 @@ impl DataPlane {
                 return Err(Error::State("no expert copies run"));
             }
         };
+
         Ok(self.ranks.iter().map(|_| ready.to_string()).collect())
     }
 
@@ -1051,48 +1202,58 @@ impl DataPlane {
     pub fn abort_experts(&self) -> Result<Vec<String>> {
         let state = lock(&self.experts).take();
         match state {
-            Some(Experts::Planned(planned) | Experts::Ready(planned)) => self.discard(planned),
+            Some(Experts::Paired(replacement) | Experts::Ready(replacement)) => {
+                self.discard(replacement);
+            }
             Some(Experts::Copying(task)) => {
                 // The copies own their allocations until they end, so they are waited for.
-                if let Ok(planned) = task
+                if let Ok(replacement) = task
                     .join()
                     .map_err(|_| Error::Invariant("the expert copies panicked".into()))?
                 {
-                    self.discard(planned);
+                    self.discard(replacement);
                 }
             }
             None => {}
         }
+
         Ok(self.ranks.iter().map(|_| "null".to_owned()).collect())
     }
 
-    /// Puts the finished redistribution in place, at the boundary every scheduler met at.
+    /// Puts the finished redistribution in place on every rank and returns each rank's report.
+    /// The caller has paused every scheduler, so the new order serves from one common boundary.
     ///
     /// # Errors
     ///
-    /// When its copies have not completed, or `order` is not the one they were made for.
-    pub fn commit_experts(&self, order: &BTreeMap<String, Vec<u32>>) -> Result<Vec<String>> {
-        let planned = match lock(&self.experts).take() {
-            Some(Experts::Ready(planned)) => planned,
+    /// When its copies have not completed, or `order` is not the one they were made for; when a
+    /// rank's mappings change part of the way, which poisons the epoch.
+    pub fn commit_experts(
+        &self,
+        order: &BTreeMap<String, Vec<u32>>,
+    ) -> Result<Vec<WeightsUpdated>> {
+        let state = lock(&self.experts).take();
+        let replacement = match state {
+            Some(Experts::Ready(replacement)) => replacement,
             other => {
                 *lock(&self.experts) = other;
                 return Err(Error::State("the expert copies have not completed"));
             }
         };
-        if planned.target.experts != *order {
-            let refusal = "the committed order is not the one the copies were made for";
-            self.discard(planned);
-            return Err(Error::Interface(refusal.into()));
+
+        if replacement.target.experts != *order {
+            self.discard(replacement);
+            return Err(Error::Interface(
+                "the committed order is not the one the copies were made for".into(),
+            ));
         }
-        let replies = self.rebind(planned)?;
-        memory::responses(&replies).map_err(|error| rejected("an expert redistribution", error))
+        self.rebind(replacement)
     }
 
-    /// Publishes the LoRA adapter `payload` names into its slot, on every rank (§7.6).
+    /// Publishes the LoRA adapter `payload` names into its slot, on every rank.
     ///
-    /// The adapter's tensors take the path every weight takes: the Storage Server retains them under
-    /// a key of their file and the rank maps them read-only, so a second engine of the deployment
-    /// loading the same file shares them, and an unload returns them.
+    /// The adapter's tensors take the path every weight takes: the Storage Server retains them
+    /// under a key of their file and the rank maps them read-only, so a second engine of the
+    /// deployment loading the same file shares them, and an unload returns them.
     ///
     /// # Errors
     ///
@@ -1108,75 +1269,122 @@ impl DataPlane {
             .as_str()
             .filter(|path| !path.is_empty())
             .ok_or_else(|| Error::Invalid("load_lora_adapter names no lora_path".into()))?;
+
         let checkpoint = nn::Checkpoint::open(std::path::Path::new(path))
             .map_err(|error| rejected("reading the adapter", error))?;
         if checkpoint.is_empty() {
             return Err(Error::Invalid(format!("{path} holds no adapter tensors")));
         }
         let names: Vec<String> = checkpoint.names().map(str::to_owned).collect();
+
         let mut adapters = Vec::with_capacity(self.ranks.len());
-        let mut results = Vec::with_capacity(self.ranks.len());
+        let mut responses = Vec::with_capacity(self.ranks.len());
         for rank in &self.ranks {
-            let (storage, device) = {
+            let (client, device) = {
                 let rank = lock(rank);
-                (Arc::clone(&rank.storage), rank.device)
+                (Arc::clone(&rank.client), rank.device)
             };
-            let mut store = WeightStore::new(Arc::clone(&storage), device);
-            let mut regions = BTreeMap::new();
-            let mut loading = || -> Result<()> {
-                let mut loader = nn::WeightLoader::new(&checkpoint, &mut store, None, None);
-                for name in &names {
-                    let shape = checkpoint
-                        .tensor(name)
-                        .ok_or_else(|| Error::Invariant(format!("no tensor {name}")))?
-                        .shape;
-                    let weight = loader
-                        .load(&nn::weights::WeightRequest::region(name, 0, shape))
-                        .map_err(|error| rejected("loading the adapter", error))?;
-                    regions.insert(name.clone(), weight.backing);
+
+            let loaded = WeightStore::new(client, device)
+                .and_then(|store| Self::load_adapter_on(&checkpoint, &names, store));
+            match loaded {
+                Ok(adapter) => {
+                    responses.push(
+                        serde_json::json!({ "adapter": slot, "tensors": adapter.tensors.len() })
+                            .to_string(),
+                    );
+                    adapters.push(adapter);
                 }
-                Ok(())
-            };
-            let loaded = loading();
-            // A load that failed publishes none of the granules it packed: their weights are
-            // forgotten below.
-            let log = match &loaded {
-                Ok(()) => store.finish(),
-                Err(_) => Ok(store.abandon()),
-            };
-            let (log, loaded) = match log {
-                Ok(log) => (log, loaded),
-                Err(error) => (store.abandon(), Err(error)),
-            };
-            let keys: Vec<[u8; 32]> = log.iter().map(|weight| retained_key(&weight.key)).collect();
-            if let Err(error) = loaded {
-                if let Err(cleanup) = storage.forget_weights(device, &keys) {
-                    tracing::warn!(%cleanup, "a partial adapter load's storage was not released");
+                Err(error) => {
+                    Self::unload(slot, adapters);
+                    return Err(error);
                 }
-                self.unload_slot(slot, &mut adapters);
-                return Err(error);
             }
-            results
-                .push(serde_json::json!({ "adapter": slot, "tensors": regions.len() }).to_string());
-            adapters.push(Adapter { keys, regions });
         }
+
         tracing::info!(
             slot,
             path,
             tensors = names.len(),
             "loaded an adapter's tensors"
         );
-        lock(&self.adapters).insert(slot, adapters);
-        Ok(results)
+        if let Some(replaced) = lock(&self.adapters).insert(slot, adapters) {
+            Self::unload(slot, replaced);
+        }
+        Ok(responses)
     }
 
-    fn unload_slot(&self, slot: u32, adapters: &mut Vec<Adapter>) {
-        for (rank, adapter) in self.ranks.iter().zip(adapters.drain(..)) {
-            let rank = lock(rank);
-            if let Err(error) = rank.storage.forget_weights(rank.device, &adapter.keys) {
+    /// Loads the tensors `names` of the adapter `checkpoint` through `store`, one rank's. A load
+    /// that fails releases what it published.
+    fn load_adapter_on(
+        checkpoint: &nn::Checkpoint,
+        names: &[String],
+        store: WeightStore,
+    ) -> Result<Adapter> {
+        let mut tensors = BTreeMap::new();
+        let loaded = (|| -> Result<()> {
+            let loader = nn::WeightLoader::new(checkpoint, &store, None, None);
+            for name in names {
+                let shape = checkpoint
+                    .tensor(name)
+                    .ok_or_else(|| Error::Invariant(format!("no tensor {name}")))?
+                    .shape
+                    .clone();
+                let source = nn::WeightSource::Region {
+                    tensor: name.clone(),
+                    start: 0,
+                    shape: shape.clone(),
+                };
+
+                let tensor = loader.load(
+                    name,
+                    &source,
+                    nn::WeightLayout::ROW_MAJOR,
+                    &shape,
+                    None,
+                    false,
+                )?;
+                tensors.insert(name.clone(), tensor);
+            }
+            Ok(())
+        })();
+
+        // A load that failed publishes none of the allocations it packed: its weights are
+        // forgotten.
+        let finished = loaded.and_then(|()| store.finish());
+        match finished {
+            Ok(order) => Ok(Adapter {
+                keys: order.into_iter().map(|(key, _)| key).collect(),
+                tensors,
+                store,
+            }),
+            Err(error) => {
+                drop(tensors);
+                let keys: Vec<WeightKey> =
+                    store.abandon().into_iter().map(|(key, _)| key).collect();
+                if let Err(cleanup) = store.forget(&keys) {
+                    tracing::warn!(%cleanup, "a partial adapter load's storage was not released");
+                }
+                Err(error)
+            }
+        }
+    }
+
+    /// Releases every rank's tensors of the adapter in `slot`.
+    fn unload(slot: u32, adapters: Vec<Adapter>) {
+        for adapter in adapters {
+            let Adapter {
+                store,
+                keys,
+                tensors,
+            } = adapter;
+
+            // Nothing reads the tensors once they are dropped, and the mappings they lie over go
+            // with the store.
+            drop(tensors);
+            if let Err(error) = store.forget(&keys) {
                 tracing::warn!(%error, slot, "an adapter's storage was not released");
             }
-            drop(adapter.regions);
         }
     }
 
@@ -1192,85 +1400,19 @@ impl DataPlane {
             .as_u64()
             .and_then(|slot| u32::try_from(slot).ok())
             .ok_or_else(|| Error::Invalid("unload_lora_adapter names no slot".into()))?;
-        // A slot with no adapter is a load that failed part of the way, which the daemon cleans up
-        // after: nothing is held, and nothing is owed.
-        if let Some(mut adapters) = lock(&self.adapters).remove(&slot) {
-            self.unload_slot(slot, &mut adapters);
+
+        // A slot with no adapter is a load that failed part of the way, which the daemon cleans
+        // up after: nothing is held, and nothing is owed.
+        let adapters = lock(&self.adapters).remove(&slot);
+        if let Some(adapters) = adapters {
+            Self::unload(slot, adapters);
         }
+
         Ok(self
             .ranks
             .iter()
             .map(|_| serde_json::json!({ "adapter": slot }).to_string())
             .collect())
-    }
-}
-
-/// A rank's batches as the scheduling mechanism reaches them: its devices serve the batches
-/// (`worker::batch::Workers`), and its data plane performs the storage operations and the expert
-/// commit at the batch boundaries the mechanism chooses.
-pub(crate) struct RankBatches {
-    /// The rank's devices.
-    pub(crate) workers: worker::batch::Workers,
-    /// What the storage operations reach on this rank.
-    pub(crate) data: Arc<DataPlane>,
-}
-
-impl Batches for RankBatches {
-    fn submit(&self, batch: Batch) -> std::result::Result<Submission, Box<Fault>> {
-        Batches::submit(&self.workers, batch)
-    }
-
-    fn shadow(&self, batch: Batch) -> std::result::Result<Submission, Box<Fault>> {
-        Batches::shadow(&self.workers, batch)
-    }
-
-    fn media(
-        &self,
-        phase: PhaseId,
-        computation: &Computation,
-    ) -> std::result::Result<Option<Extent>, Box<Fault>> {
-        Batches::media(&self.workers, phase, computation)
-    }
-
-    fn devices(&self, batch: &Batch) -> std::result::Result<Vec<usize>, Box<Fault>> {
-        Batches::devices(&self.workers, batch)
-    }
-
-    fn device_count(&self) -> usize {
-        self.workers.device_count()
-    }
-
-    fn inventory(&self) -> &[Inventory] {
-        self.workers.inventory()
-    }
-
-    fn operate(&self, operation: &EpochOperation) -> std::result::Result<Vec<String>, Box<Fault>> {
-        Ok(self.data.operate(operation)?)
-    }
-
-    fn commit_experts(
-        &self,
-        order: &BTreeMap<String, Vec<u32>>,
-    ) -> std::result::Result<Vec<String>, Box<Fault>> {
-        Ok(self.data.commit_experts(order)?)
-    }
-
-    fn map_host_cache(&self, tokens: u64) -> std::result::Result<HostPools, Box<Fault>> {
-        Batches::map_host_cache(&self.workers, tokens)
-    }
-
-    fn copy_pages(
-        &self,
-        offloads: Vec<ipc::PageCopy>,
-    ) -> std::result::Result<Submission, Box<Fault>> {
-        Batches::copy_pages(&self.workers, offloads)
-    }
-
-    fn offload_latents(
-        &self,
-        offloads: Vec<ipc::LatentOffload>,
-    ) -> std::result::Result<Submission, Box<Fault>> {
-        Batches::offload_latents(&self.workers, offloads)
     }
 }
 
@@ -1293,21 +1435,20 @@ mod tests {
 
     #[test]
     fn one_set_of_weights_has_one_identity_whatever_loads_it() {
-        let weight = |tensor: &str| LoadedWeight {
-            key: nn::WeightKey {
+        let weight = |tensor: &str| {
+            let key = WeightKey {
                 files: Vec::new(),
                 dtype: nn::DType::BF16,
                 layout: nn::WeightLayout::ROW_MAJOR,
-                region: nn::weights::WeightRegion {
-                    tensors: vec![tensor.to_owned()],
-                    start: 0,
-                    shape: nn::Shape::new(&[1]),
-                    stride: None,
-                },
+                tensors: vec![tensor.to_owned()],
+                start: 0,
+                shape: nn::Shape::from(vec![1]),
+                stride: None,
                 provenance: None,
-            },
-            writable: false,
+            };
+            (key, false)
         };
+
         let first = identity_of(&[weight("a"), weight("b")]);
         assert_eq!(first, identity_of(&[weight("a"), weight("b")]));
         assert_ne!(first, identity_of(&[weight("a"), weight("c")]));

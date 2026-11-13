@@ -11,6 +11,7 @@
 //! device has recorded the packages its runners launch, and serves nothing.
 
 mod catalogue;
+pub mod data_plane;
 pub mod executor;
 #[expect(
     dead_code,
