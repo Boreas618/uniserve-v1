@@ -94,8 +94,9 @@ pub(crate) enum Input {
     FrontClosed(usize),
     /// A command of the process interface; `None` once the daemon closed it.
     Command(Option<proto::process::Command>),
-    /// A peer link of the epoch was lost.
-    PeerLost(String),
+    /// A peer link of the epoch closed: it was lost, or the scheduler node closed this peer's
+    /// link in order, which ends the epoch.
+    LinkClosed(String),
     /// A job ended: what it produced, applied on the control thread.
     Done(Box<dyn FnOnce(&mut MainProcess) + Send>),
 }
@@ -170,7 +171,7 @@ pub fn run(launch_file: &Path, registry: &nn::family::Registry) -> Result<()> {
     };
 
     let main = MainProcess::new(requests, process, launch)?;
-    let lost = main.peer_lost();
+    let lost = main.link_closed();
     let registry = registry.clone();
     let start: Start = Box::new(move |launch| {
         // The module set's policy is resolved at the node's Build Server, which the ranks'
@@ -342,12 +343,12 @@ impl MainProcess {
         })
     }
 
-    /// What the start's peer links call once one is lost: it tells the control thread.
-    fn peer_lost(&self) -> crate::worker::completion::Waker {
+    /// What the start's peer links call once one closes: it tells the control thread.
+    fn link_closed(&self) -> crate::worker::completion::Waker {
         let inbox = self.inbox.0.clone();
         Arc::new(move || {
             let reason = "a peer link of this epoch closed".to_owned();
-            let _ = inbox.send(Input::PeerLost(reason));
+            let _ = inbox.send(Input::LinkClosed(reason));
         })
     }
 
@@ -441,11 +442,18 @@ impl MainProcess {
                 self.process = None;
                 self.end_when_unserved();
             }
-            Input::PeerLost(reason) => {
-                let reason = self
+            Input::LinkClosed(reason) => {
+                let liveness = self
                     .engine
                     .as_ref()
-                    .and_then(|engine| engine.liveness.as_ref())
+                    .and_then(|engine| engine.liveness.as_ref());
+                // The scheduler node's orderly end: this peer ends in order with it.
+                if liveness.is_some_and(|liveness| liveness.closed() && liveness.lost().is_none()) {
+                    tracing::warn!("the scheduler node ended the epoch: this peer ends with it");
+                    self.ending.get_or_insert(Ok(()));
+                    return;
+                }
+                let reason = liveness
                     .and_then(|liveness| liveness.lost())
                     .unwrap_or(reason);
                 let fault = lifecycle::fault("process_exit", reason.clone(), 0);
@@ -743,6 +751,7 @@ impl MainProcess {
 
         let shadows = engine.shadows();
         let workers = engine.workers.clone();
+        let binding = Arc::clone(&engine.binding);
         let ceilings = engine.ceilings;
         let serving = kernels_of(&self.serving);
         // A preparation whose shadow pass no running request reaches within twice the stall
@@ -752,13 +761,20 @@ impl MainProcess {
             let prepared = generation::kernels(&workers, &build, &named, &serving, generation)
                 .and_then(|kernels| {
                     let (module, parameters) = generation::policy(&build.0, &policy, &ceilings)?;
+                    // Every peer prepares the generation from its own daemon's command: no
+                    // shadow batch reaches its ranks before they hold it.
+                    let mut uncompared = binding.prepared(generation)?;
                     // Only an operator whose package changed has an old kernel to compare with.
                     let changed = changed_operators(&kernels, &serving);
-                    let uncompared = if changed.is_empty() {
-                        Vec::new()
-                    } else {
-                        generation::shadow(&shadows, &workers, generation, &changed, bound)?
-                    };
+                    if !changed.is_empty() {
+                        let shadowed =
+                            generation::shadow(&shadows, &workers, generation, &changed, bound)?;
+                        for entry in shadowed {
+                            if !uncompared.contains(&entry) {
+                                uncompared.push(entry);
+                            }
+                        }
+                    }
                     let mut packages = kernels;
                     packages.insert(policy_slot(), policy);
                     Ok(((packages, module, parameters), uncompared))
@@ -776,6 +792,19 @@ impl MainProcess {
         generation: u64,
         prepared: Result<((Packages, Arc<wasmtime::Module>, Parameters), Vec<String>)>,
     ) {
+        // A peer's preparation is what the scheduler node's waits for before its shadow pass.
+        if let Some(told) = self
+            .engine
+            .as_ref()
+            .and_then(|engine| engine.prepared.as_ref())
+        {
+            let outcome = match &prepared {
+                Ok((_, uncompared)) => Ok(uncompared.clone()),
+                Err(error) => Err(format!("{error:#}")),
+            };
+            let _ = told.send((generation, outcome));
+        }
+
         match prepared {
             Ok((prepared, uncompared)) => {
                 if !lifecycle::prepared(&mut self.update, generation) {
@@ -830,15 +859,20 @@ impl MainProcess {
             return self.report(lifecycle::prepare_failed(reason));
         };
 
+        // A peer's ranks switch between the scheduler node's batches, on its frame: its own
+        // daemon's command is acknowledged at once.
+        let policy = (module, parameters);
+        if engine.upstream.is_some() {
+            return self.switched(generation, packages, policy, Ok(()));
+        }
         let schedulers = engine.inboxes();
-        let workers = engine.workers.clone();
+        let route = engine.groups.clone();
         let binding = Arc::clone(&engine.binding);
         let served = Arc::clone(&engine.served);
-        let policy = (module, parameters);
         self.serial(Box::new(move || {
             let switched = generation::switch(
                 &schedulers,
-                &workers,
+                route.as_deref(),
                 &binding,
                 &served,
                 generation,
@@ -903,10 +937,14 @@ impl MainProcess {
         let Some(engine) = self.engine.as_ref() else {
             return;
         };
+        // A peer's ranks commit on the scheduler node's frame.
+        if engine.upstream.is_some() {
+            return self.committed(generation, Ok(()));
+        }
         let schedulers = engine.inboxes();
-        let workers = engine.workers.clone();
+        let route = engine.groups.clone();
         self.serial(Box::new(move || {
-            let committed = generation::commit(&schedulers, &workers, generation);
+            let committed = generation::commit(&schedulers, route.as_deref(), generation);
             done(move |main| main.committed(generation, committed))
         }));
     }
@@ -937,16 +975,26 @@ impl MainProcess {
         let Some(engine) = self.engine.as_ref() else {
             return;
         };
-        let schedulers = engine.inboxes();
-        let workers = engine.workers.clone();
-        let binding = Arc::clone(&engine.binding);
-        let served = Arc::clone(&engine.served);
         // The trial kept the generation before it: generations are numbered one past the one
         // that executed when each was prepared.
         let kept = generation - 1;
+        // A peer's ranks roll back between the scheduler node's batches, on its frame.
+        if engine.upstream.is_some() {
+            return self.rolled_back(kept, reason, Ok(()));
+        }
+        let schedulers = engine.inboxes();
+        let route = engine.groups.clone();
+        let binding = Arc::clone(&engine.binding);
+        let served = Arc::clone(&engine.served);
         self.serial(Box::new(move || {
-            let rolled =
-                generation::rollback(&schedulers, &workers, &binding, &served, generation, kept);
+            let rolled = generation::rollback(
+                &schedulers,
+                route.as_deref(),
+                &binding,
+                &served,
+                generation,
+                kept,
+            );
             done(move |main| main.rolled_back(kept, reason, rolled))
         }));
     }

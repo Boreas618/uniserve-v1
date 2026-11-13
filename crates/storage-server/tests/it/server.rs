@@ -69,7 +69,7 @@ impl Running {
 
     /// A server that leaves `host_reserve` bytes of the host's available
     /// storage to other processes.
-    fn reserving(host_reserve: u64) -> Self {
+    pub(crate) fn reserving(host_reserve: u64) -> Self {
         Self::serving(host_reserve, |_| {}, |_| None)
     }
 

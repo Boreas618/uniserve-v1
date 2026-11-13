@@ -54,7 +54,7 @@ use crate::executor::Route;
 use crate::executor::peers::Remote;
 use crate::memory::buffers::{BufferMemory, UNIT_BYTES};
 use crate::memory::cache::{CacheLayout, CacheRegions, KvCacheMemory, host};
-use crate::memory::client::StorageClient;
+use crate::memory::client::{StorageClient, unit_runs};
 use crate::memory::division;
 use crate::memory::encoders;
 use crate::memory::graph_pool::GraphPool;
@@ -76,9 +76,11 @@ use ops::Generation;
 use platform::{DeviceId, Stream};
 use proto::config::{EngineArgs, WorkerGroupConfig};
 use storage::QueuePair;
+use storage::protocol::UnitRun;
 use storage::runtime::{Class, Group, GroupId, Open, Opened, Region, Segments, Tier, VERSION};
 
 use self::rank::{Collective, ModelRunner, RankModel, Weights, media_tasks};
+use crate::process::binding::{self, Served};
 use crate::process::ranks::rank::memory::{
     Peaks, fewest_units, granularity, plane_segments, scratch_bytes,
 };
@@ -2223,16 +2225,33 @@ fn open_media_runners(
     Ok(())
 }
 
+/// Where one rank's part of a region's units lies, as it states it (`Place`): the region, the
+/// device memory, the part (the rank's index in its worker group) and the runs of its fields.
+pub(crate) type Place = (String, String, u32, Vec<UnitRun>);
+
 /// Binds each rank of `ranks` to the session `layout` opened and `opened` answered: a served rank
-/// states where its part of its scheduler's KV units lies in its group's memory (`Place`), and
-/// every rank's cache is told the numbers of the regions its copies name
-/// (`KvCacheMemory::set_regions`). A media rank keeps no cache, and its memory was opened over
-/// the answer's numbers.
+/// takes its part of each host region at its own host's Storage Server (`HostPart`), every rank's
+/// cache is told the numbers of the regions its copies name (`KvCacheMemory::set_regions`), and
+/// each served rank states where its part of its scheduler's KV units lies in its group's memory.
+/// A rank of the session's own host states it at its server itself (`Place`, with `place`); a
+/// peer's rank lies on another host than the session's buffer pool, whose head states it there
+/// for the rank (`PlaceRemote`). A media rank keeps no cache, and its memory was opened over the
+/// answer's numbers.
+///
+/// Returns where each served rank's part of its KV region's units lies, as `(region, device
+/// memory, part, runs)`, the part being the rank's index in its worker group: what a peer
+/// answers the session with (`Placed`).
 ///
 /// # Errors
 ///
 /// A rank whose group the session does not state, or the Storage Server's refusal.
-pub(crate) fn bind(ranks: &mut [LoadedRank], layout: &Open, opened: &Opened) -> Result<()> {
+pub(crate) fn bind(
+    ranks: &mut [LoadedRank],
+    layout: &Open,
+    opened: &Opened,
+    place: bool,
+) -> Result<Vec<Place>> {
+    let mut places = Vec::new();
     for rank in ranks.iter_mut() {
         let Loaded::Text(text) = &rank.loaded else {
             continue;
@@ -2250,14 +2269,19 @@ pub(crate) fn bind(ranks: &mut [LoadedRank], layout: &Open, opened: &Opened) -> 
         let mut copies = None;
         if let Some(client) = &rank.client {
             let region = &layout.regions[usize::from(kv)].name;
-            client
-                .place(region, &group.memory, &cache.info().plane_runs)
-                .with_context(|| {
-                    format!(
-                        "placing the rank's units of region {region} in {}",
-                        group.memory
-                    )
-                })?;
+            let runs = unit_runs(&cache.info().plane_runs);
+            let part = rank.model_runner.tensor_rank();
+            if place {
+                client
+                    .place(region, &group.memory, part, &runs)
+                    .with_context(|| {
+                        format!(
+                            "placing the rank's units of region {region} in {}",
+                            group.memory
+                        )
+                    })?;
+            }
+            places.push((region.clone(), group.memory.clone(), part, runs));
 
             // The stores and loads the buffer pool asks of this rank copy between its units and
             // its part of each group's host region, unit `u` of the region being page `u`.
@@ -2272,7 +2296,12 @@ pub(crate) fn bind(ranks: &mut [LoadedRank], layout: &Open, opened: &Opened) -> 
                 let stream = Stream::new(device)
                     .with_context(|| format!("creating device {}'s copy stream", device.0))?;
                 cache
-                    .map_host_parts(client, &names, stream.clone(), Arc::clone(&rank.kernels))
+                    .map_host_parts(
+                        client,
+                        (&names, rank.model_runner.tensor_rank()),
+                        stream.clone(),
+                        Arc::clone(&rank.kernels),
+                    )
                     .context("mapping the rank's parts of the host KV regions")?;
                 copies = Some(stream);
             }
@@ -2294,7 +2323,7 @@ pub(crate) fn bind(ranks: &mut [LoadedRank], layout: &Open, opened: &Opened) -> 
             rank.streams.push(("copy", stream));
         }
     }
-    Ok(())
+    Ok(places)
 }
 
 /// The session's statement of `rank`'s group, the index of its KV region, and per cache group the
@@ -2354,11 +2383,16 @@ fn session_group(rank: &LoadedRank, layout: &Open) -> Result<GroupId> {
 }
 
 /// Spawns one worker per rank of `ranks` over its runner (step 23), each a rank of its worker
-/// group with the group's device block tables over the session's regions and the copy budget,
-/// stating its ended sequence to the group's `completed` word in `pairs`, the session's queue
-/// pairs (`client` maps them again); sets the expert union's join targets (step 24); and routes
-/// the node's workers and `remotes`, the peer links with the groups each holds ranks of, by
-/// worker group (step 27).
+/// group with the group's device block tables over the regions of the session `layout` opened
+/// and `opened` answered, and the copy budget, stating its ended sequence to the group's
+/// `completed` word where `registers` puts it; sets the expert union's join targets (step 24);
+/// and routes the node's workers and `remotes`, the peer links with the groups each holds ranks
+/// of, by worker group (step 27).
+///
+/// `registers` gives, for a group the session's schedulers list, where its `completed` word lies
+/// in their queue pairs (`StorageClient::completed_registers`): the session's head maps them, and
+/// a peer, which holds no queue pair, states its ended sequences to the head over its link
+/// instead and maps none.
 ///
 /// A group's ranks report to its sequences in the order `Route` states: this process's
 /// workers of the group, then its peer links. The unit sizes the tables count a copy by are
@@ -2366,16 +2400,14 @@ fn session_group(rank: &LoadedRank, layout: &Open) -> Result<GroupId> {
 ///
 /// # Errors
 ///
-/// A session not open, a rank whose runner was taken, or a worker that cannot start.
+/// A rank whose runner was taken, registers that cannot be mapped, or a worker that cannot
+/// start.
 pub(crate) fn spawn(
     ranks: &mut [LoadedRank],
-    client: &crate::memory::client::StorageClient,
-    pairs: &[QueuePair],
+    (layout, opened): (&Open, &Opened),
+    registers: &dyn Fn(GroupId) -> Result<Vec<(QueuePair, usize)>>,
     remotes: Vec<(Vec<GroupId>, Arc<Remote>)>,
 ) -> Result<(Arc<Route>, Vec<Arc<Worker>>)> {
-    let (layout, opened) = client
-        .session()
-        .context("the session with the buffer pool is not open")?;
     let unit_bytes: Vec<(u8, u64)> = opened
         .regions
         .iter()
@@ -2401,7 +2433,7 @@ pub(crate) fn spawn(
         let local = placed.iter().filter(|(group, _)| group == id).count();
         let links = remotes.iter().filter(|(held, _)| held.contains(id)).count();
         let registers = if layout.groups.iter().any(|group| group.id == *id) {
-            client.completed_registers(*id, pairs)?
+            registers(*id)?
         } else {
             Vec::new()
         };
@@ -2487,14 +2519,17 @@ fn text_regions(layout: &Open, opened: &Opened, group: Option<&Group>) -> Vec<u8
         .collect()
 }
 
-/// What each worker group of `ranks` serves (`Capacity`), by the session's number of the group:
-/// the statements of its ranks, joined ([`join`]). The ranks of a text group state alike; a
-/// media group's ranks each state the phases of the blocks that hold them.
+/// What each worker group of `ranks`, this process's, and of the epoch's peers serves
+/// (`Capacity`), by the session's number of the group: the statements of its ranks, joined
+/// ([`join`]), with `stated_by_peers`, what each peer's ranks state per group, and `peers`, what
+/// every peer's rank serves, in rank order. The ranks of a text group state alike; a media
+/// group's ranks each state the phases of the blocks that hold them.
 ///
 /// A cache group's page seed is `storage::key::page_seed` of its page identity
-/// (`KvCacheMemory::page_identities`) for the identity of the weights this process's ranks serve,
-/// in rank order (`crate::process::binding::identity_of`): what the weight binding keys the ranks'
-/// pages by, so a block computed by other weights or in another layout is another block.
+/// (`KvCacheMemory::page_identities`) for the identity of the weights every rank of the deployment
+/// serves, in rank order (`crate::process::binding::page_identity`): what the weight binding keys
+/// the ranks' pages by, so a block computed by other weights or in another layout is another
+/// block.
 ///
 /// A group's encoder identity is, in the same way, the identity of the weights of its ranks that
 /// compute encoder outputs (a text encoding's conditioning, a chat image's features), in rank
@@ -2504,7 +2539,7 @@ fn text_regions(layout: &Open, opened: &Opened, group: Option<&Group>) -> Vec<u8
 /// encodes states none.
 ///
 /// A group that denoises states the latent seed of the identities of the weights of every rank
-/// of the process (`storage::key::latent_seed`), which keys the trajectories it stores
+/// of the deployment (`storage::key::latent_seed`), which keys the trajectories it stores
 /// (`storage::key::latent_content`): a trajectory follows from the denoiser's weights and from
 /// the encoders' that compute its conditioning. A weight update's `Flush` renews all three from
 /// the same weights (`crate::process::operations`).
@@ -2512,21 +2547,26 @@ fn text_regions(layout: &Open, opened: &Opened, group: Option<&Group>) -> Vec<u8
 /// # Errors
 ///
 /// A rank whose group the session does not state, or a capacity its config cannot state.
-pub(crate) fn capacities(ranks: &[LoadedRank], layout: &Open) -> Result<Vec<(GroupId, Capacity)>> {
-    let order: Vec<(WeightKey, bool)> = ranks
+pub(crate) fn capacities(
+    ranks: &[LoadedRank],
+    layout: &Open,
+    (peers, stated_by_peers): (&[Served], Vec<(GroupId, Capacity)>),
+) -> Result<Vec<(GroupId, Capacity)>> {
+    let mut served: Vec<Served> = Vec::with_capacity(ranks.len() + peers.len());
+    for rank in ranks {
+        let group = session_group(rank, layout)?;
+        served.push(binding::served(group, rank.encodes(), &rank.weights));
+    }
+    served.extend_from_slice(peers);
+
+    let identity = binding::page_identity(&served);
+    let identities: Vec<String> = served
         .iter()
-        .flat_map(|rank| rank.weights.iter().cloned())
-        .collect();
-    let identity = crate::process::binding::identity_of(&order);
-    let identities: Vec<String> = ranks
-        .iter()
-        .map(|rank| crate::process::binding::identity_of(&rank.weights))
+        .map(|(_, _, names)| binding::identity_of_names(names))
         .collect();
     let latent = storage::key::latent_seed(identities.iter().map(String::as_str));
 
     let mut stated: Vec<(GroupId, Capacity)> = Vec::new();
-    // Each rank that encodes, with its group, in rank order.
-    let mut encoding: Vec<(GroupId, &[(WeightKey, bool)])> = Vec::new();
     for rank in ranks {
         let id = session_group(rank, layout)?;
         let capacity = match &rank.loaded {
@@ -2543,17 +2583,34 @@ pub(crate) fn capacities(ranks: &[LoadedRank], layout: &Open) -> Result<Vec<(Gro
             Loaded::Video(video) => video.capacity.clone(),
         };
 
-        if rank.encodes() {
-            encoding.push((id, rank.weights.as_slice()));
-        }
         match stated.iter_mut().find(|(group, _)| *group == id) {
             Some((_, group)) => join(group, &capacity),
             None => stated.push((id, capacity)),
         }
     }
 
-    let encoders = crate::process::binding::encoder_identities(encoding);
+    // What the peers' ranks state, joined over every rank of each group. A peer keyed its ranks'
+    // pages by its own weights alone: every text rank lays its cache out alike, so a group's page
+    // seeds are those this process's ranks computed for the weights of every rank.
+    let seeds = stated
+        .iter()
+        .map(|(_, capacity)| &capacity.seeds)
+        .find(|seeds| !seeds.is_empty())
+        .cloned();
+    for (id, capacity) in stated_by_peers {
+        match stated.iter_mut().find(|(group, _)| *group == id) {
+            Some((_, group)) => join(group, &capacity),
+            None => stated.push((id, capacity)),
+        }
+    }
+
+    let encoders = binding::encoder_identities(&served);
     for (id, capacity) in &mut stated {
+        if let Some(seeds) = &seeds
+            && !capacity.seeds.is_empty()
+        {
+            capacity.seeds.clone_from(seeds);
+        }
         if let Some((_, identity)) = encoders.iter().find(|(group, _)| group == id) {
             capacity.encoder_identity.clone_from(identity);
         }

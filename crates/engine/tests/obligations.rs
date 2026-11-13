@@ -1274,30 +1274,14 @@ impl Group {
         let held = Sequences::new(GROUP, 1, Vec::new());
         let (far, far_ends) = worker(PEER, 0, &held, &watch, turns);
         let ranks = Route::new(vec![held], vec![far], Vec::new()).unwrap();
-        // The group's capacity, which the scheduler node never asks for here.
-        let capacity = engine::batch::Capacity {
-            phases: 0,
-            slots: 1,
-            kv_cache: None,
-            cache_groups: Vec::new(),
-            seeds: Vec::new(),
-            buckets: Vec::new(),
-            rows: [0; engine::batch::Phase::COUNT],
-            max_model_len: 0,
-            denoise_steps: 0,
-            bos_token_id: 0,
-            eos_token_ids: Vec::new(),
-            feature_bytes: 0,
-            encoder_identity: String::new(),
-            latent_seed: 0,
-            media_bytes: Vec::new(),
-            call_window: 1,
-        };
+        // The scheduler node runs no operation of the data plane here.
+        let operate: engine::executor::peers::Operate =
+            Box::new(|_| Err("this peer runs no operation".to_owned()));
         let upstream = Upstream::serve(
             dialling.join().unwrap(),
             Arc::new(ranks),
-            capacity,
             Arc::clone(&peers.liveness),
+            operate,
         )
         .unwrap();
 

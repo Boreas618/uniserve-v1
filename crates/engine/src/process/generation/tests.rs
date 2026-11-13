@@ -71,7 +71,7 @@ fn on_trial() -> Node {
     assert!(prepares(&node, 2));
     switch(
         &node.schedulers,
-        &node.workers,
+        Some(&node.route),
         &node.binding,
         &node.served,
         2,
@@ -95,7 +95,7 @@ fn a_switch_moves_the_schedulers_and_every_worker_to_the_generation() {
 fn a_commit_leaves_the_generation_on_trial_alone() {
     let node = on_trial();
 
-    commit(&node.schedulers, &node.workers, 2).unwrap();
+    commit(&node.schedulers, Some(&node.route), 2).unwrap();
     assert_eq!(node.served.load(Ordering::Acquire), 2);
     assert_eq!(serving(&node), [2]);
     assert!(holds_one(&node));
@@ -108,7 +108,7 @@ fn a_rollback_leaves_the_kept_generation_alone() {
 
     rollback(
         &node.schedulers,
-        &node.workers,
+        Some(&node.route),
         &node.binding,
         &node.served,
         2,
@@ -129,7 +129,7 @@ fn a_policy_a_scheduler_refuses_rolls_the_switch_back() {
     let refused = (toy("(unreachable)"), Parameters::default());
     let failed = switch(
         &node.schedulers,
-        &node.workers,
+        Some(&node.route),
         &node.binding,
         &node.served,
         2,

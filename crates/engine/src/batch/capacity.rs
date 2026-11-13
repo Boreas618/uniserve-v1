@@ -3,8 +3,8 @@
 //!
 //! A rank builds its group's statement from its runners, its buckets and its cache; the
 //! scheduler that drives the group schedules within it. The statement crosses processes when a
-//! group's first rank lies on another host: the peer link's `Info` response carries it
-//! (`MainProcessResponse::Info`).
+//! group has ranks on another host: the peer's answer to the session the scheduler node relays
+//! carries what its ranks state (`MainProcessResponse::Placed`).
 
 use proto::config::KvCacheConfig;
 use serde::{Deserialize, Serialize};

@@ -151,8 +151,14 @@ fn a_meta_rank_creates_its_region_s_segments_once_the_session_is_open_and_a_succ
         client.grant(region, segment, first, count).unwrap();
     }
 
-    bind(&mut ranks, &open, &opened).unwrap();
-    let (workers, spawned) = spawn(&mut ranks, &client, &pairs, Vec::new()).unwrap();
+    bind(&mut ranks, &open, &opened, true).unwrap();
+    let (workers, spawned) = spawn(
+        &mut ranks,
+        (&open, &opened),
+        &|group| client.completed_registers(group, &pairs),
+        Vec::new(),
+    )
+    .unwrap();
     assert_eq!(spawned.len(), 1);
 
     // The region grows into the granted segments: every unit past the padding unit.
@@ -200,7 +206,7 @@ fn a_meta_rank_creates_its_region_s_segments_once_the_session_is_open_and_a_succ
 
     // What the group's ranks state of it: prefill, refill and decode on every slot, over its one
     // full-attention cache group of 64-token pages.
-    let stated_capacities = capacities(&ranks, &open).unwrap();
+    let stated_capacities = capacities(&ranks, &open, (&[], Vec::new())).unwrap();
     assert_eq!(stated_capacities.len(), 1);
     let (id, capacity) = &stated_capacities[0];
     assert_eq!(*id, GroupId(0));
@@ -471,8 +477,14 @@ fn a_meta_media_rank_opens_its_media_memory_and_spawns_its_runners() {
     assert!(opened.segments.iter().all(Vec::is_empty));
     let created = open_ranks(&mut ranks, &open, &opened).unwrap();
     assert!(created.is_empty());
-    bind(&mut ranks, &open, &opened).unwrap();
-    let (workers, spawned) = spawn(&mut ranks, &client, &pairs, Vec::new()).unwrap();
+    bind(&mut ranks, &open, &opened, true).unwrap();
+    let (workers, spawned) = spawn(
+        &mut ranks,
+        (&open, &opened),
+        &|group| client.completed_registers(group, &pairs),
+        Vec::new(),
+    )
+    .unwrap();
     assert_eq!(spawned.len(), 1);
 
     // An owner attached to the group and the video latents allocated to it: one run in the rank's
@@ -509,7 +521,7 @@ fn a_meta_media_rank_opens_its_media_memory_and_spawns_its_runners() {
 
     // What the group states: every phase of a video request, one request a stage of the
     // denoiser and the decoders, the encode's slots, the model's steps, and its product sizes.
-    let stated = capacities(&ranks, &open).unwrap();
+    let stated = capacities(&ranks, &open, (&[], Vec::new())).unwrap();
     assert_eq!(stated.len(), 1);
     let (id, capacity) = &stated[0];
     assert_eq!(*id, GroupId(0));
@@ -616,7 +628,7 @@ fn a_media_group_holds_as_many_request_slots_as_its_ranks_shares_hold() {
 
     // The group serves as many requests as its slots hold and encodes at most that many prompts
     // in a batch, over the buckets of the deployment's running requests.
-    let stated = capacities(&ranks, &open).unwrap();
+    let stated = capacities(&ranks, &open, (&[], Vec::new())).unwrap();
     let capacity = &stated[0].1;
     assert_eq!(capacity.slots, 2);
     assert_eq!(capacity.rows[Phase::TextEncode.index()], 2);
@@ -778,7 +790,13 @@ fn the_conditioning_lies_with_the_text_encoder_and_the_denoising_group_reads_it(
     let mut pairs = client.open(open.clone()).unwrap();
     let opened = client.session().unwrap().1.clone();
     assert!(open_ranks(&mut ranks, &open, &opened).unwrap().is_empty());
-    let (workers, spawned) = spawn(&mut ranks, &client, &pairs, Vec::new()).unwrap();
+    let (workers, spawned) = spawn(
+        &mut ranks,
+        (&open, &opened),
+        &|group| client.completed_registers(group, &pairs),
+        Vec::new(),
+    )
+    .unwrap();
     assert_eq!(spawned.len(), 2);
 
     // A request's conditioning, allocated for its owner on the text group in the text rank's
@@ -905,7 +923,13 @@ fn a_device_holds_a_rank_of_the_text_group_and_one_of_a_flow_replica() {
     let mut pairs = client.open(open.clone()).unwrap();
     let opened = client.session().unwrap().1.clone();
     assert!(open_ranks(&mut ranks, &open, &opened).unwrap().is_empty());
-    let (workers, spawned) = spawn(&mut ranks, &client, &pairs, Vec::new()).unwrap();
+    let (workers, spawned) = spawn(
+        &mut ranks,
+        (&open, &opened),
+        &|group| client.completed_registers(group, &pairs),
+        Vec::new(),
+    )
+    .unwrap();
     assert_eq!(spawned.len(), 16);
 
     // A request's conditioning, allocated for its owner on the text group in text rank 0's
@@ -949,7 +973,7 @@ fn a_device_holds_a_rank_of_the_text_group_and_one_of_a_flow_replica() {
     }
 
     // What the groups state: the text group encodes prompts, and each replica every other phase.
-    let stated = capacities(&ranks, &open).unwrap();
+    let stated = capacities(&ranks, &open, (&[], Vec::new())).unwrap();
     assert_eq!(stated.len(), 9);
     for (id, capacity) in &stated {
         let text = *id == GroupId(0);

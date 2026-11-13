@@ -17,10 +17,15 @@
 //! - **Where units lie.** A rank states where its part of a device region's
 //!   units lies ([`Request::Place`]); the head states it for a rank of
 //!   another host, whose tensors that host's Storage Server retains
-//!   ([`Request::PlaceRemote`]). A host region is one memfd per rank index,
-//!   which the server creates on the host's huge pages when it has them,
-//!   admitted with the host's storage when a session first states the region
-//!   ([`Request::HostPart`]). With them a task's runs turn into the Transfer
+//!   ([`Request::PlaceRemote`]). A part is named by the rank's index in its
+//!   worker group: the ranks of one index, in every group and replica of a
+//!   deployment, hold the same share of every unit, so a task matches the
+//!   ranks of two memories by it. A host region is one memfd per part,
+//!   which the server creates on the host's huge pages when it has them and
+//!   admits with the host's storage part by part, as each rank of this host
+//!   takes its part ([`Request::HostPart`]): a region whose ranks lie on
+//!   several hosts holds on each host only that host's parts, so `Open`
+//!   admits nothing of it. With them a task's runs turn into the Transfer
 //!   Server's spans and the connector's pages.
 //! - **Segments.** The head grants a device region's memory space each
 //!   segment the engine's ranks created ([`Request::Grant`]), and withdraws
@@ -90,7 +95,7 @@ const BLOCK_TOKENS: u16 = 64;
 type PoolTask = (QueueId, RequestId);
 
 /// Where a rank states the units of a device region lie: its deployment, the
-/// region, the device memory and the rank index.
+/// region, the device memory and the part (the rank's index in its group).
 type Place = (String, String, String, u32);
 
 /// Where a rank's units lie: the endpoint of the Storage Server of its host
@@ -119,14 +124,15 @@ pub(crate) struct Sessions {
     /// limit of their numbering and their bytes of a unit, summed over the
     /// parts.
     hosts: BTreeMap<(String, String), (u32, u64)>,
-    /// The parts of the host regions, by deployment, region and rank index.
+    /// The parts of the host regions, by deployment, region and part (the
+    /// index in their groups of the ranks that share it).
     parts: BTreeMap<(String, String, u32), Part>,
     /// The pool number the connector maps the next part under. It passes
     /// every part's: a successor numbers its parts above those it takes
     /// over, and its connector, which starts afresh, maps them anew.
     next_pool: u64,
     /// Where the units of the device regions lie, by deployment, region,
-    /// device memory and rank index, as each rank stated it.
+    /// device memory and part, as each rank stated it.
     places: BTreeMap<Place, Placed>,
     /// The peers each session names, which a prefetch from the peers reads.
     peers: BTreeMap<Session, Vec<String>>,
@@ -261,28 +267,6 @@ impl Sessions {
             rolled: BTreeSet::new(),
             transfer_deadline: TRANSFER_DEADLINE,
         })
-    }
-
-    /// What the sessions' host regions have yet to allocate: the bytes a
-    /// session's regions were admitted with that no part holds yet.
-    pub(crate) fn unallocated(&self) -> u64 {
-        let admitted: u64 = self
-            .hosts
-            .values()
-            .map(|(limit, bytes)| u64::from(*limit) * bytes)
-            .sum();
-        let parts: u64 = self
-            .parts
-            .iter()
-            .map(|((deployment, region, _), part)| {
-                let limit = self
-                    .hosts
-                    .get(&(deployment.clone(), region.clone()))
-                    .map_or(0, |(limit, _)| *limit);
-                u64::from(limit) * part.bytes
-            })
-            .sum();
-        admitted.saturating_sub(parts)
     }
 
     /// Whether no pool task runs on a child and the buffer pool's thread
@@ -482,8 +466,8 @@ impl Server {
             ));
         }
 
-        // The host regions new to the deployment are admitted whole: the
-        // server creates their parts as the ranks ask.
+        // The host regions new to the deployment: the server creates and admits
+        // their parts as the ranks of this host ask ([`Self::host_part`]).
         let new: Vec<_> = open
             .regions
             .iter()
@@ -495,11 +479,6 @@ impl Server {
                     .contains_key(&(deployment.to_owned(), region.name.clone()))
             })
             .collect();
-        let bytes: u64 = new
-            .iter()
-            .map(|region| u64::from(region.limit).saturating_mul(region.unit_bytes))
-            .sum();
-        self.admit_host(bytes)?;
 
         let (named, layout) = (deployment.to_owned(), open.clone());
         let opened = self
@@ -638,8 +617,7 @@ impl Server {
     pub(crate) fn place(
         &mut self,
         holder: &Holder,
-        region: &str,
-        memory: &str,
+        (region, memory, part): (&str, &str, u32),
         runs: &[UnitRun],
     ) -> Result<Handling, (ErrorKind, String)> {
         if !self.current(holder) {
@@ -655,20 +633,20 @@ impl Server {
             holder.scope.deployment.clone(),
             region.to_owned(),
             memory.to_owned(),
-            holder.scope.rank,
+            part,
         );
         self.sessions.places.insert(place, (None, runs.to_vec()));
         Ok(Handling::Response(Response::Placed, Vec::new()))
     }
 
     /// See [`Request::PlaceRemote`], from the head `id` of `epoch` of
-    /// `deployment`: `rank` of `memory` lies on the host whose Storage
+    /// `deployment`: part `part` of `memory` lies on the host whose Storage
     /// Server listens at `endpoint`.
     pub(crate) fn place_remote(
         &mut self,
         id: ClientId,
         (deployment, epoch): (&str, u64),
-        (region, memory, rank): (&str, &str, u32),
+        (region, memory, part): (&str, &str, u32),
         endpoint: &str,
         runs: &[UnitRun],
     ) -> Result<Handling, (ErrorKind, String)> {
@@ -688,7 +666,7 @@ impl Server {
             deployment.to_owned(),
             region.to_owned(),
             memory.to_owned(),
-            rank,
+            part,
         );
         let placed = (Some(endpoint.to_owned()), runs.to_vec());
         self.sessions.places.insert(place, placed);
@@ -699,7 +677,7 @@ impl Server {
     pub(crate) fn host_part(
         &mut self,
         holder: &Holder,
-        region: &str,
+        (region, part): (&str, u32),
         bytes: u64,
         numa_node: Option<u32>,
     ) -> Result<Handling, (ErrorKind, String)> {
@@ -707,7 +685,6 @@ impl Server {
             return Err(crate::stale(holder));
         }
         let deployment = holder.scope.deployment.clone();
-        let rank = holder.scope.rank;
         let Some(&(limit, unit_bytes)) = self
             .sessions
             .hosts
@@ -717,17 +694,17 @@ impl Server {
                 "{region} is no host region a session of {deployment} stated"
             )));
         };
-        let key = (deployment.clone(), region.to_owned(), rank);
-        if let Some(part) = self.sessions.parts.get(&key) {
-            if part.bytes != bytes {
+        let key = (deployment.clone(), region.to_owned(), part);
+        if let Some(held) = self.sessions.parts.get(&key) {
+            if held.bytes != bytes {
                 return Err(invalid(&format!(
-                    "rank {rank}'s part of {region} holds {} bytes of a unit, not {bytes}",
-                    part.bytes
+                    "part {part} of {region} holds {} bytes of a unit, not {bytes}",
+                    held.bytes
                 )));
             }
             return Ok(Handling::Response(
                 Response::HostPart { units: limit },
-                vec![Attachment::Storage(part.storage)],
+                vec![Attachment::Storage(held.storage)],
             ));
         }
         let others: u64 = self
@@ -744,7 +721,11 @@ impl Server {
             )));
         }
 
+        // The part is admitted whole, the region's numbering of its bytes of
+        // a unit: the other parts lie on their ranks' hosts, or are admitted as
+        // their ranks here take them.
         let total = u64::from(limit) * bytes;
+        self.admit_host(total)?;
         let descriptor = crate::memory::shared_memory("uniserve-host-region", total, numa_node)
             .map_err(resource)?;
         let storage = self.next_storage;
@@ -779,9 +760,9 @@ impl Server {
         tracing::info!(
             deployment,
             region,
-            rank,
+            part,
             bytes = total,
-            "created a rank's part of a host region"
+            "created a part of a host region"
         );
         Ok(Handling::Response(
             Response::HostPart { units: limit },

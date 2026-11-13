@@ -51,7 +51,7 @@ use proto::request::StandbyStorage;
 use serde::{Deserialize, Serialize};
 use service::lock;
 use storage::protocol::{Access, ErrorKind, TensorListing, UnitRun};
-use storage::runtime::{GroupId, Open, Opened, Segments};
+use storage::runtime::{GroupId, Open, Opened, Segments, Tier};
 use storage::{
     Claim, Client, HostStorage, Item, Key, Location, Mode, QueuePair, Quota, Role, Scope, Segment,
     StorageRecord, TensorRecord,
@@ -756,36 +756,62 @@ impl StorageClient {
         }
     }
 
-    /// States where rank `rank` of the device memory `memory`, a rank of the host whose Storage
-    /// Server listens at `endpoint`, keeps its part of the units of the device region `region`:
-    /// `runs`, as that rank states them ([`Self::place`]).
+    /// States where part `part` of the units of the device region `region` lies in the device
+    /// memory `memory`, for its rank of the host whose Storage Server listens at `endpoint` (the
+    /// rank whose index in its worker group is `part`): `runs`, as that rank stated them for its
+    /// own server ([`unit_runs`]), each with the location of its storage there.
     ///
     /// # Errors
     ///
     /// The server's refusal.
-    // BP §15 (the head relays `PlaceRemote` for each rank of another host); the missing caller
-    // is the scheduler node's start over peers, whose ranks' placements no peer frame carries.
-    #[expect(dead_code, reason = "no start relays a peer rank's placement")]
     pub(crate) fn place_remote(
         &mut self,
         region: &str,
         memory: &str,
-        rank: u32,
+        part: u32,
         endpoint: &str,
-        runs: &[CachePlaneRun],
+        runs: &[UnitRun],
     ) -> anyhow::Result<()> {
         lock(&self.state)
             .client
             .place_remote(
                 region.to_owned(),
                 memory.to_owned(),
-                rank,
+                part,
                 endpoint.to_owned(),
-                unit_runs(runs),
+                runs.to_vec(),
             )
             .with_context(|| {
-                format!("placing rank {rank} of {endpoint} in region {region} of memory {memory}")
+                format!("placing part {part} of {endpoint} in region {region} of memory {memory}")
             })
+    }
+
+    /// Opens, on a peer's host, the session of the host regions of `layout`, the layout the
+    /// scheduler node opened its session with at its own host (`specs/buffer-pool.md` §15): the
+    /// host regions alone, with no class, group, scheduler or device region, so that this host's
+    /// Storage Server creates the parts of them its ranks take and follows the epoch's processes
+    /// for the session's close. Its buffer pool holds no table anyone reads: the scheduler node's
+    /// holds the regions' tables.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::open`].
+    pub(crate) fn open_hosts(&mut self, layout: &Open) -> anyhow::Result<()> {
+        let hosts = Open {
+            regions: layout
+                .regions
+                .iter()
+                .filter(|region| region.tier == Tier::Host)
+                .cloned()
+                .collect(),
+            classes: Vec::new(),
+            trajectory: 0,
+            groups: Vec::new(),
+            schedulers: Vec::new(),
+            peers: Vec::new(),
+            ..layout.clone()
+        };
+        self.open(hosts).map(drop)
     }
 }
 
@@ -799,17 +825,23 @@ impl StorageClient {
     /// # Errors
     ///
     /// The server's refusal or the connection's failure.
-    pub(crate) fn place(&self, region: &str, memory: &str, runs: &[CachePlaneRun]) -> Result<()> {
-        let runs = unit_runs(runs);
-
+    pub(crate) fn place(
+        &self,
+        region: &str,
+        memory: &str,
+        part: u32,
+        runs: &[UnitRun],
+    ) -> Result<()> {
         self.call("placing the rank's units", |client| {
-            client.place(region.to_owned(), memory.to_owned(), runs)
+            client.place(region.to_owned(), memory.to_owned(), part, runs.to_vec())
         })
     }
 
-    /// Takes the rank's part of the host region `region`: `bytes` of every unit, on `numa_node`
-    /// when the server creates it. Returns the part's units and its memfd, which the rank maps
-    /// and registers with its device; ranks of one rank index share a part.
+    /// Takes part `part` of the host region `region`: `bytes` of every unit, on `numa_node` when
+    /// the server creates it. Returns the part's units and its memfd, which the rank maps and
+    /// registers with its device. A part is named by the rank's index in its worker group: the
+    /// ranks of one index, in every group and replica, hold the same share of every unit and
+    /// share the part.
     ///
     /// # Errors
     ///
@@ -818,18 +850,21 @@ impl StorageClient {
     pub(crate) fn host_part(
         &self,
         region: &str,
+        part: u32,
         bytes: u64,
         numa_node: Option<u32>,
     ) -> Result<(u32, OwnedFd)> {
         self.call("taking the rank's part of a host region", |client| {
-            client.host_part(region.to_owned(), bytes, numa_node)
+            client.host_part(region.to_owned(), part, bytes, numa_node)
         })
     }
 }
 
 /// The buffer pool's statement of `runs`: each run of a field of the rank's units, with the GPU
-/// that holds its storage as the location.
-fn unit_runs(runs: &[CachePlaneRun]) -> Vec<UnitRun> {
+/// that holds its storage as the location. What a rank places at its own server
+/// ([`StorageClient::place`]) and a peer's rank has the scheduler node place for it
+/// ([`StorageClient::place_remote`]).
+pub(crate) fn unit_runs(runs: &[CachePlaneRun]) -> Vec<UnitRun> {
     runs.iter()
         .map(|run| UnitRun {
             field: run.field.clone(),

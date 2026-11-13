@@ -210,9 +210,10 @@ pub(crate) struct HostTier {
 }
 
 impl HostTier {
-    /// Maps the rank's part of the host region `regions` names for each cache group of
-    /// `layout` at the rank's host's Storage Server, registered with `device`: one page of the
-    /// group a unit. A group named `None` has no host copy. The copies run on `stream`, and
+    /// Maps part `part` (the rank's index in its worker group) of the host region `regions` names
+    /// for each cache group of `layout` at the rank's host's Storage Server, registered with
+    /// `device`: one page of the group a unit. A group named `None` has no host copy. The copies
+    /// run on `stream`, and
     /// `conversion` is the converted loads of a cache that admits them, opened on the same
     /// stream.
     ///
@@ -223,7 +224,7 @@ impl HostTier {
         client: &StorageClient,
         layout: &CacheLayout,
         device: DeviceId,
-        regions: &[Option<&str>],
+        (regions, part): (&[Option<&str>], u32),
         stream: Stream,
         conversion: Option<Conversion>,
     ) -> Result<Self> {
@@ -238,8 +239,8 @@ impl HostTier {
             };
 
             let shape = page_shape(layout, index)?;
-            let part = HostPart::map(client, device, region, shape.page_bytes, numa_node)?;
-            parts.insert(index as u32, (part, layout.page_planes(group) as u32));
+            let held = HostPart::map(client, device, region, part, shape.page_bytes, numa_node)?;
+            parts.insert(index as u32, (held, layout.page_planes(group) as u32));
         }
 
         Ok(Self {

@@ -535,9 +535,10 @@ impl KvCacheMemory {
         Ok(())
     }
 
-    /// Maps the cache's host tier: the rank's part of each cache group's host region at the
-    /// rank's host's Storage Server through `client`, whose copies run on `stream`, the rank's
-    /// copy stream. `regions` names, per cache group, the host region of its pages as the
+    /// Maps the cache's host tier: part `part` (the rank's index in its worker group) of each
+    /// cache group's host region at the rank's host's Storage Server through `client`, whose
+    /// copies run on `stream`, the rank's copy stream. `regions` names, per cache group, the host
+    /// region of its pages as the
     /// session's layout states it (unit `u` of the region is page `u` of the group), or `None`
     /// for a group whose pages have no host copy; the open session must state them. A cache
     /// that admits converted loads also takes its source buffers and conversion scratch, and
@@ -551,7 +552,7 @@ impl KvCacheMemory {
     pub(crate) fn map_host_parts(
         &mut self,
         client: &StorageClient,
-        regions: &[Option<&str>],
+        (regions, part): (&[Option<&str>], u32),
         stream: Stream,
         kernels: Arc<ops::Generation>,
     ) -> Result<Vec<PoolConversion>> {
@@ -579,7 +580,12 @@ impl KvCacheMemory {
         };
 
         self.host = Some(HostTier::map(
-            client, layout, device, regions, stream, conversion,
+            client,
+            layout,
+            device,
+            (regions, part),
+            stream,
+            conversion,
         )?);
         Ok(converted)
     }

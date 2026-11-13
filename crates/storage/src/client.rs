@@ -568,12 +568,20 @@ impl Client {
         }
     }
 
-    /// See [`Request::Place`]: where this rank's part of the units of the
-    /// device region `region` lies in the device memory `memory`.
-    pub fn place(&mut self, region: String, memory: String, runs: Vec<UnitRun>) -> Result<()> {
+    /// See [`Request::Place`]: where this rank's part `part` (its index in
+    /// its worker group) of the units of the device region `region` lies in
+    /// the device memory `memory`.
+    pub fn place(
+        &mut self,
+        region: String,
+        memory: String,
+        part: u32,
+        runs: Vec<UnitRun>,
+    ) -> Result<()> {
         let request = Request::Place {
             region,
             memory,
+            part,
             runs,
         };
         match self.request(&request, &[])?.0 {
@@ -582,22 +590,21 @@ impl Client {
         }
     }
 
-    /// See [`Request::PlaceRemote`]: where the part of the units of the
-    /// device region `region` lies for rank `rank` of the device memory
-    /// `memory`, a rank of the host whose Storage Server listens at
-    /// `endpoint`.
+    /// See [`Request::PlaceRemote`]: where part `part` of the units of the
+    /// device region `region` lies in the device memory `memory`, for its
+    /// rank of the host whose Storage Server listens at `endpoint`.
     pub fn place_remote(
         &mut self,
         region: String,
         memory: String,
-        rank: u32,
+        part: u32,
         endpoint: String,
         runs: Vec<UnitRun>,
     ) -> Result<()> {
         let request = Request::PlaceRemote {
             region,
             memory,
-            rank,
+            part,
             endpoint,
             runs,
         };
@@ -637,17 +644,19 @@ impl Client {
         }
     }
 
-    /// See [`Request::HostPart`]: this rank's part of the host region
-    /// `region`, `bytes` of every unit. Returns the part's units and its
-    /// memfd.
+    /// See [`Request::HostPart`]: part `part` (the rank's index in its
+    /// worker group) of the host region `region`, `bytes` of every unit.
+    /// Returns the part's units and its memfd.
     pub fn host_part(
         &mut self,
         region: String,
+        part: u32,
         bytes: u64,
         numa_node: Option<u32>,
     ) -> Result<(u32, OwnedFd)> {
         let request = Request::HostPart {
             region,
+            part,
             bytes,
             numa_node,
         };

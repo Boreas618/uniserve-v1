@@ -47,10 +47,10 @@ pub(crate) struct HostPart {
 }
 
 impl HostPart {
-    /// Takes the rank's part of the host region `region` at the rank's host's Storage Server,
-    /// `bytes` of every unit, and maps it registered with `device`. The server creates the part
-    /// on `numa_node` at the first request of the rank index, and returns the part it holds
-    /// otherwise, at its size.
+    /// Takes part `part` of the host region `region` at the rank's host's Storage Server, `bytes`
+    /// of every unit, and maps it registered with `device`: the part of the rank's index in its
+    /// worker group (`StorageClient::host_part`). The server creates the part on `numa_node` at
+    /// the first request of the index, and returns the part it holds otherwise, at its size.
     ///
     /// # Errors
     ///
@@ -61,10 +61,11 @@ impl HostPart {
         client: &StorageClient,
         device: DeviceId,
         region: &str,
+        part: u32,
         bytes: u64,
         numa_node: Option<u32>,
     ) -> Result<Self> {
-        let (units, descriptor) = client.host_part(region, bytes, numa_node)?;
+        let (units, descriptor) = client.host_part(region, part, bytes, numa_node)?;
         if units == 0 {
             return Err(Error::Resource(
                 "the rank's part of a host region holds no unit",

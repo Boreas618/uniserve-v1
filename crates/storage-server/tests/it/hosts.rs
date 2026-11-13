@@ -368,7 +368,7 @@ fn a_transfer_reaches_a_rank_of_another_host_through_that_host_s_transfer_server
         .put(vec![prefill_tensor], &[(host(144), prefill_planes.as_fd())])
         .unwrap();
     prefill_rank
-        .place("units".into(), "gpu0".into(), values(key(10)))
+        .place("units".into(), "gpu0".into(), 0, values(key(10)))
         .unwrap();
     let decode_planes = memfd(&[0; 144]);
     let there_claim = head(&there.socket)
@@ -477,7 +477,7 @@ fn a_transfer_past_the_server_s_deadline_fails_and_leaves_the_owner_where_it_was
             .put(vec![values_tensor], &[(host(144), planes.as_fd())])
             .unwrap();
         worker
-            .place("units".into(), memory.into(), values(key(name)))
+            .place("units".into(), memory.into(), 0, values(key(name)))
             .unwrap();
     }
 

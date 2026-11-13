@@ -17,14 +17,22 @@
 //! states each change of the KV planes' segments (`crate::process::binding`, "The KV planes'
 //! memory"). A `Resume` ends a drain as well as a pause, so no job that pauses the schedulers runs
 //! while the engine drains.
+//!
+//! Every operation acts on the ranks of the epoch's peers too, through the weight binding's
+//! links (`crate::process::binding`, "Ranks on other hosts"): a peer runs each that reaches it on
+//! its own binding ([`operator`]), and the scheduler node's pause orders a boundary operation
+//! against the batches of every rank, a peer's included.
 
 use std::collections::BTreeMap;
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use crate::process::binding::WeightsUpdated;
+use crate::executor::peers::Operate;
+use crate::executor::peers::messages::DataOperation;
+use crate::process::binding::{Replacement, WeightsUpdated};
 use anyhow::{Context as _, Result, anyhow, bail};
-use crossbeam_channel::Sender;
+use crossbeam_channel::{Receiver, Sender};
 use proto::config::SchedulerConfig;
 use proto::request::wire::WeightsInFlight;
 use service::lock;
@@ -150,12 +158,12 @@ pub(crate) fn update_weights(
         WeightsInFlight::Keep => {
             let bytes = replacement.bytes();
             let rooms = binding.room()?;
-            let graphs = binding.graph_bytes();
+            let graphs = binding.graph_bytes()?;
 
             if rooms.iter().all(|room| room.holds(bytes, 0)) {
                 let loaded = binding.load(replacement)?;
                 at_boundary(schedulers, || {
-                    binding.stage(loaded);
+                    binding.stage(loaded)?;
                     apply(schedulers, binding)
                 })
             } else if rooms.iter().all(|room| room.holds(bytes, graphs)) {
@@ -167,7 +175,7 @@ pub(crate) fn update_weights(
                         .load(replacement)
                         .map_err(anyhow::Error::from)
                         .and_then(|loaded| {
-                            binding.stage(loaded);
+                            binding.stage(loaded)?;
                             apply(schedulers, binding)
                         });
                     let restored = binding.restore_graphs();
@@ -198,7 +206,7 @@ pub(crate) fn update_weights(
             // is undone by the wake, which grants back what the head withdrew.
             let applied = sleep(schedulers, head, binding).and_then(|()| {
                 let loaded = binding.load(replacement)?;
-                binding.stage(loaded);
+                binding.stage(loaded)?;
                 apply(schedulers, binding)
             });
             let woken = wake(schedulers, head, binding);
@@ -225,6 +233,11 @@ pub(crate) fn update_weights(
 fn apply(schedulers: &[Sender<Message>], binding: &WeightBinding) -> Result<Vec<WeightsUpdated>> {
     let reports = binding.update_weights()?;
 
+    let encoders = if reports.is_empty() {
+        Vec::new()
+    } else {
+        binding.encoder_identities()?
+    };
     let seeds = reports.first().map(|report| {
         let pages: Vec<Key> = report
             .identities
@@ -236,7 +249,7 @@ fn apply(schedulers: &[Sender<Message>], binding: &WeightBinding) -> Result<Vec<
                 .iter()
                 .filter_map(|report| report.identity.as_deref()),
         );
-        (pages, latent, binding.encoder_identities())
+        (pages, latent, encoders)
     });
 
     let flushed = ask(schedulers, |reply| {
@@ -303,7 +316,7 @@ pub(crate) fn wake(
             .map(|index| (index, epoch::groups_of(open, index)))
             .collect();
         for (index, groups) in regions {
-            epoch::grant_held(&mut head, index, &binding.segment_tables(&groups))?;
+            epoch::grant_held(&mut head, index, &binding.segment_tables(&groups)?)?;
         }
     }
 
@@ -478,7 +491,145 @@ pub(crate) fn hook(binding: &Arc<WeightBinding>, name: &str, payload: &str) -> R
         "uniserve.fence_switch" => fence_switch(payload)?,
         other => bail!("this process has no operation named {other:?}"),
     };
+
+    // The epoch's peers run it on their own ranks, each as this process runs it on its own.
+    let mut results = results;
+    results.extend(binding.hook_peers(name, payload)?);
     Ok(results)
+}
+
+/// The end of a process's own preparation of a generation, as its control thread states it: the
+/// generation, and the operators its ranks have no comparison for, or the preparation's failure.
+pub(crate) type Preparation = (u64, std::result::Result<Vec<String>, String>);
+
+/// What a peer runs each operation of the scheduler node's data plane with
+/// (`crate::executor::peers::Upstream::serve`): [`operate`] on `binding`, this process's, keeping
+/// a weight load's replacement between the operations that pair, load, stage and discard it, and
+/// reading the ends of this process's own preparations from `preparations`, which it waits for
+/// at most `bound`.
+pub(crate) fn operator(
+    binding: Arc<WeightBinding>,
+    preparations: Receiver<Preparation>,
+    bound: Duration,
+) -> Operate {
+    let mut held: Option<Replacement> = None;
+    Box::new(move |operation| {
+        operate(&binding, &mut held, (&preparations, bound), operation)
+            .map_err(|error| format!("{error:#}"))
+    })
+}
+
+/// Runs `operation`, which the scheduler node relayed, on this peer's `binding`, and returns the
+/// JSON of its value, as the scheduler node's binding reads it. `held` is the weight load's
+/// replacement this process keeps from the pairing to the stage or discard that ends it.
+///
+/// # Errors
+///
+/// What the operation fails with; a load or a stage with nothing paired.
+fn operate(
+    binding: &Arc<WeightBinding>,
+    held: &mut Option<Replacement>,
+    preparations: (&Receiver<Preparation>, Duration),
+    operation: DataOperation,
+) -> Result<String> {
+    use DataOperation as Operation;
+
+    let reply = match operation {
+        Operation::ReleaseSegments { groups, from } => {
+            encoded(&binding.release_segments(&groups, from)?)
+        }
+        Operation::CreateSegments { groups, count } => {
+            encoded(&binding.create_segments(&groups, count)?)
+        }
+        Operation::SegmentTables { groups } => encoded(&binding.segment_tables(&groups)?),
+        Operation::FittingSegments { groups } => encoded(&binding.fitting_here(&groups)?),
+        Operation::DeviceRooms { groups } => encoded(&binding.device_rooms(&groups)?),
+        Operation::Room => encoded(&binding.room()?),
+        Operation::GraphBytes => encoded(&binding.graph_bytes_here()),
+        Operation::Sleep => encoded(&binding.sleep()?),
+        Operation::Wake => encoded(&binding.wake()?),
+        Operation::SuspendGraphs => encoded(&binding.suspend_graphs()?),
+        Operation::RestoreGraphs => encoded(&binding.restore_graphs()?),
+        Operation::SetKernels => encoded(&binding.set_kernels()?),
+        Operation::ReserveServing => encoded(&binding.reserve_serving()?),
+        Operation::Pair {
+            checkpoint,
+            experts,
+            rearranged,
+        } => {
+            let target = Target {
+                checkpoint: PathBuf::from(checkpoint),
+                experts,
+            };
+            let paired = binding.pair(target, rearranged)?;
+            let bytes = paired.bytes();
+            if let Some(previous) = held.replace(paired) {
+                binding.discard(previous);
+            }
+            encoded(&bytes)
+        }
+        Operation::Load => {
+            let paired = held.take().context("no weights are paired to load")?;
+            *held = Some(binding.load(paired)?);
+            encoded(&())
+        }
+        Operation::Stage => {
+            let loaded = held.take().context("no weights are loaded to stage")?;
+            binding.stage(loaded)?;
+            encoded(&())
+        }
+        Operation::Discard => {
+            if let Some(paired) = held.take() {
+                binding.discard(paired);
+            }
+            encoded(&())
+        }
+        Operation::UpdateWeights => encoded(&binding.update_weights()?),
+        Operation::CommitExperts { order } => encoded(&binding.commit_experts(&order)?),
+        Operation::ServingOrder => encoded(&binding.served_here()),
+        Operation::Prepared { generation } => {
+            let (preparations, bound) = preparations;
+            encoded(&prepared(preparations, generation, bound)?)
+        }
+        Operation::Hook { name, payload } => encoded(&hook(binding, &name, &payload)?),
+    };
+    reply.context("encoding the operation's value")
+}
+
+/// The JSON of an operation's value.
+fn encoded(value: &impl serde::Serialize) -> serde_json::Result<String> {
+    serde_json::to_string(value)
+}
+
+/// The end of this process's own preparation of generation `generation`, which its control
+/// thread states on `preparations` as each ends: the operators it has no comparison for. An
+/// earlier generation's end, whose preparation was abandoned, is passed over.
+///
+/// # Errors
+///
+/// A preparation that failed, or that did not end within `bound`.
+fn prepared(
+    preparations: &Receiver<Preparation>,
+    generation: u64,
+    bound: Duration,
+) -> Result<Vec<String>> {
+    let deadline = Instant::now() + bound;
+    loop {
+        match preparations.recv_deadline(deadline) {
+            Ok((ended, outcome)) if ended == generation => {
+                return outcome.map_err(|reason| {
+                    anyhow!(
+                        "this process's preparation of generation {generation} failed: {reason}"
+                    )
+                });
+            }
+            Ok(_) => {}
+            Err(_) => bail!(
+                "this process's preparation of generation {generation} did not end within {} s",
+                bound.as_secs()
+            ),
+        }
+    }
 }
 
 /// Writes the fence probes' device switch (`docs/profiling.md`): `{"enabled": bool, "off":

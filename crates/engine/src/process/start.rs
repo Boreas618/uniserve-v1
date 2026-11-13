@@ -17,6 +17,14 @@
 //! granted segments. A start is not an update (`specs/updates.md` §2): the generation it serves
 //! is [`FIRST_GENERATION`], with nothing kept beside it.
 //!
+//! An epoch whose worker groups have ranks on several hosts runs one main process per host. The
+//! scheduler node's opens the session at its host's Storage Server and relays it to every peer,
+//! whose ranks open over it while its own do; once every rank is warm, it grants the segments
+//! every rank of a region created, places each peer rank's units at its buffer pool
+//! (`PlaceRemote`), and schedules every group within what all of its ranks state. A peer opens the
+//! session's host regions at its own host's Storage Server, where its ranks take their parts, and
+//! serves the scheduler node's jobs and operations from then on (`specs/buffer-pool.md` §15).
+//!
 //! [`Engine::close`] ends the epoch in the order its parts depend on one another: the schedulers,
 //! then the workers, the peer links, the session, and the devices' contexts.
 
@@ -31,7 +39,8 @@ use std::time::Duration;
 use crate::batch::Capacity;
 use crate::batch::Phase;
 use crate::executor::Route;
-use crate::executor::peers::{Liveness, Remote, Upstream};
+use crate::executor::peers::messages::MainProcessResponse;
+use crate::executor::peers::{Answer, Liveness, Remote, Upstream};
 use crate::profiling::counters::Counters;
 use crate::worker::Worker;
 use crate::worker::completion::Outcome;
@@ -45,15 +54,15 @@ use proto::request::{GenerationFeatures, GenerationLimits};
 use scheduling::limits::{Limits, Parameters};
 use scheduling::view::{RankView, Snapshot};
 use storage::QueuePair;
-use storage::runtime::{GroupId, Open, Opened};
+use storage::runtime::{GroupId, Open, Opened, Segments};
 
-use super::epoch;
 use super::ranks::{
-    Backing, FIRST_GENERATION, LoadedRank, Meeting, bind, capacities, group_numbers, layout,
+    Backing, FIRST_GENERATION, LoadedRank, Meeting, Place, bind, capacities, group_numbers, layout,
     load_ranks, open_ranks, spawn,
 };
+use super::{epoch, operations};
 use crate::executor::{Executor, Shadow, WorkerExecutor};
-use crate::memory::client::StorageClient;
+use crate::memory::client::{StorageClient, StorageLaunch};
 use crate::modules::load;
 use crate::process::binding::{Target as LoadTarget, WeightBinding};
 use crate::process::ranks::rank::ModelRunner;
@@ -108,6 +117,10 @@ pub struct Engine {
     pub(crate) remotes: Vec<Arc<Remote>>,
     /// On a peer, its link to the scheduler node.
     pub(crate) upstream: Option<Upstream>,
+    /// On a peer, where the end of its own preparation of each generation is told, with the
+    /// operators it has no comparison for or its failure: the scheduler node's preparation waits
+    /// for it before its shadow pass reaches this process's ranks (`DataOperation::Prepared`).
+    pub(crate) prepared: Option<Sender<operations::Preparation>>,
     /// Whether every peer link still serves, which ends the process when one is lost.
     pub(crate) liveness: Option<Arc<Liveness>>,
     /// CUPTI's always-on counters of the ranks' streams and of the threads that wait for the
@@ -319,11 +332,16 @@ impl Engine {
             session,
             workers: Vec::new(),
             groups: None,
-            binding: Arc::new(WeightBinding::new(Vec::new(), LoadTarget::default())),
+            binding: Arc::new(WeightBinding::new(
+                Vec::new(),
+                LoadTarget::default(),
+                Vec::new(),
+            )),
             head: None,
             build: None,
             remotes: Vec::new(),
             upstream: None,
+            prepared: None,
             liveness: None,
             counters: None,
             video: Vec::new(),
@@ -337,7 +355,8 @@ impl Engine {
     ///    index, the events of those requests among them, and its thread is joined;
     /// 2. the workers' queues close, ending the job in flight and cancelling the rest, and
     ///    their threads are joined;
-    /// 3. the peer links close, which the epoch's other main processes read as this one's end;
+    /// 3. the peer links close, which the epoch's other main processes read as this one's end,
+    ///    and a peer's thread that runs the scheduler node's operations ends with its link;
     /// 4. the session ends ([`Engine::new`]'s `session`), the workers having stopped;
     /// 5. the devices' primary contexts are reset, which releases the driver state the process
     ///    created, when the engine's workers served on devices and nothing else holds the
@@ -363,6 +382,7 @@ impl Engine {
             liveness,
             session,
             counters,
+            prepared,
             ..
         } = self;
         let mut outcome: Result<()> = Ok(());
@@ -404,16 +424,17 @@ impl Engine {
                 ),
             }
         }
-        // The weight binding holds the owners of every rank's device storage.
-        let released = Arc::into_inner(binding).is_some();
-
         for remote in &remotes {
             remote.close();
         }
         if let Some(upstream) = &upstream {
             upstream.close();
         }
-        drop((remotes, upstream, liveness, build));
+        drop((remotes, upstream, liveness, build, prepared));
+
+        // The weight binding holds the owners of every rank's device storage; a peer's
+        // operations thread held it until its link closed.
+        let released = Arc::into_inner(binding).is_some();
 
         outcome = outcome.and(session().context("ending the session with the buffer pool"));
         drop(head);
@@ -448,9 +469,9 @@ impl Engine {
 /// # Errors
 ///
 /// What the family, a rank's load or opening, the session, a warm-up, a scheduler or the
-/// policy refuses; a rank on a device with no Build Server to resolve its kernels; and a peer
-/// main process, whose ranks map their memory from the session the scheduler node opens, which
-/// no peer frame carries to it.
+/// policy refuses; a rank on a device with no Build Server to resolve its kernels; a peer that
+/// failed its start or whose link was lost; and segments the ranks of one region created
+/// differently, here and on peers.
 pub(crate) fn start(
     launch: &EngineArgs,
     registry: &nn::family::Registry,
@@ -476,24 +497,17 @@ pub(crate) fn start(
     let config = &launch.engine_config.parallel;
     let (numbers, _) = group_numbers(&config.worker_groups, config.data_parallel_size.get())?;
     let (meeting, links) = meet(launch)?;
-    let remotes = match links {
-        Links::Alone => Vec::new(),
+    let (remotes, upstream) = match links {
+        Links::Alone => (Vec::new(), None),
         Links::Accepted(channels) => {
             let mut remotes = Vec::with_capacity(channels.len());
             for (rank, channel) in channels {
                 let held = held_groups(&config.worker_groups, &numbers, rank)?;
                 remotes.push((held, Remote::spawn(rank, channel, Arc::clone(&liveness))?));
             }
-            remotes
+            (remotes, None)
         }
-        Links::Registered(channel) => {
-            drop(channel);
-            bail!(
-                "this main process is a peer of its epoch's scheduler node, and its ranks map \
-                 their memory from the session the scheduler node opens, which no peer frame \
-                 carries"
-            )
-        }
+        Links::Registered(channel) => (Vec::new(), Some(channel)),
     };
 
     // Step 9 of each rank: the kernels its profile run names, selected for the devices'
@@ -530,6 +544,17 @@ pub(crate) fn start(
         }
     };
     let mut ranks = load_ranks(model_runner.ranks()?, backing, launch, meeting)?;
+    let build = build.map(|client| (client, targets));
+    if let Some(channel) = upstream {
+        return start_peer(
+            launch,
+            storage,
+            (&model_runner, ranks),
+            build,
+            channel,
+            liveness,
+        );
+    }
 
     // The session, opened before the ranks map memory: its device KV regions state no segment.
     // From the answer on, the layout states each region numbered as the buffer pool holds it: a
@@ -545,23 +570,43 @@ pub(crate) fn start(
         .map(|(open, opened)| (open.clone(), opened.clone()))
         .context("the session with the buffer pool is not open")?;
 
-    // Every rank maps the segments the answer states and creates the rest, which the head
-    // grants once every rank holds them.
-    let created = open_ranks(&mut ranks, &open, &opened)?;
+    // Every rank, here and on every peer, maps the segments the answer states and creates the
+    // rest, which the head grants once every rank holds them.
+    let answers = remotes
+        .iter()
+        .map(|(_, remote)| Ok((remote.rank(), remote.session(&open, &opened)?)))
+        .collect::<Result<Vec<(u32, Answer)>>>()?;
+    let mut created = open_ranks(&mut ranks, &open, &opened)?;
+    bind(&mut ranks, &open, &opened, true)?;
+    let registers = |group: GroupId| head.completed_registers(group, &pairs);
+    let (route, workers) = spawn(&mut ranks, (&open, &opened), &registers, remotes.clone())?;
+
+    // Range markers and PC sampling attach to what a graph captures, so they precede the
+    // captures of the warm-up. A peer's ranks warm up at once with these: the captures of a
+    // group's ranks reach its collectives together.
+    if !meta {
+        instrument(launch, model_runner.devices())?;
+    }
+    warm_up(&workers)?;
+
+    // What every peer's ranks hold, once they are warm: their segments are granted with these
+    // ranks', and where their units lie is stated at this host's buffer pool for them.
+    let mut stated_by_peers = Vec::new();
+    for (rank, answer) in answers {
+        let (endpoint, theirs, places, capacities) = placed(rank, &answer)?;
+        for (region, segments) in theirs {
+            agree(&mut created, region, segments)?;
+        }
+        for (region, memory, part, runs) in places {
+            head.place_remote(&region, &memory, part, &endpoint, &runs)?;
+        }
+        stated_by_peers.extend(capacities);
+    }
     for (region, segments) in &created {
         for &(segment, first, units) in segments {
             head.grant(region, segment, first, units)?;
         }
     }
-    bind(&mut ranks, &open, &opened)?;
-    let (route, workers) = spawn(&mut ranks, &head, &pairs, remotes.clone())?;
-
-    // Range markers and PC sampling attach to what a graph captures, so they precede the
-    // captures of the warm-up.
-    if !meta {
-        instrument(launch, model_runner.devices())?;
-    }
-    warm_up(&workers)?;
 
     // The always-on counters, once the ranks are warm: every stream a runner computes on is
     // `device`, and every one the copies of a rank's blocks move on is `copy`. A graph's launch
@@ -576,8 +621,9 @@ pub(crate) fn start(
         Counters::start(&streams, !launch.engine_config.profiling.graph_pc_sampling)
     };
 
-    let capacities = capacities(&ranks, &open)?;
-    let binding = weight_binding(launch, &model_runner, &ranks, &workers)?;
+    let binding = weight_binding(launch, &model_runner, &ranks, &workers, remotes.clone())?;
+    let peers = binding.served_by_peers()?;
+    let capacities = capacities(&ranks, &open, (&peers, stated_by_peers))?;
     let video = ranks
         .iter()
         .filter_map(|rank| rank.video().ok())
@@ -620,12 +666,177 @@ pub(crate) fn start(
     engine.counters = counters;
     engine.head = Some(head);
     engine.video = video;
-    engine.build = build.map(|client| (client, targets));
+    engine.build = build;
     if !remotes.is_empty() {
         engine.liveness = Some(liveness);
     }
     engine.remotes = remotes.into_iter().map(|(_, remote)| remote).collect();
     Ok(engine)
+}
+
+/// Where a peer's ranks placed their units, as its answer to the relayed session states it
+/// ([`MainProcessResponse::Placed`]).
+type Placed = (
+    String,
+    Vec<(String, Segments)>,
+    Vec<Place>,
+    Vec<(GroupId, Capacity)>,
+);
+
+/// The answer of the peer whose ranks start at `rank` to the relayed session: its Storage
+/// Server's endpoint, the segments its ranks created, where their units lie, and what they serve.
+///
+/// # Errors
+///
+/// When the peer does not answer within [`PEER_START`], fails its start, or its link is lost.
+fn placed(rank: u32, answer: &Answer) -> Result<Placed> {
+    let answered = answer
+        .recv_timeout(PEER_START)
+        .map_err(|_| anyhow::anyhow!("rank {rank}'s main process did not start in time"))?
+        .map_err(|reason| {
+            anyhow::anyhow!("rank {rank}'s main process failed to start: {reason}")
+        })?;
+    match answered {
+        MainProcessResponse::Placed {
+            endpoint,
+            created,
+            places,
+            capacities,
+            ..
+        } => Ok((endpoint, created, places, capacities)),
+        other => bail!(
+            "rank {rank}'s main process answered the session with {:?}",
+            other.kind()
+        ),
+    }
+}
+
+/// Adds `segments`, those the ranks of another process created of `region`, to `created`, those
+/// of every region by name: every rank that maps a region creates the same segments of it.
+///
+/// # Errors
+///
+/// Ranks of the region that created different segments.
+fn agree(created: &mut Vec<(String, Segments)>, region: String, segments: Segments) -> Result<()> {
+    match created.iter().find(|(name, _)| *name == region) {
+        Some((_, ours)) if *ours != segments => bail!(
+            "the ranks of region {region} created different segments here and on a peer: \
+             {ours:?} and {segments:?}"
+        ),
+        Some(_) => Ok(()),
+        None => {
+            created.push((region, segments));
+            Ok(())
+        }
+    }
+}
+
+/// Starts this process as a peer of its epoch's scheduler node, over `channel`, its registered
+/// connection, once its ranks (`ranks`, of `model_runner`) loaded (module documentation): it
+/// reads the session the scheduler node relays, opens the session's host regions at its own
+/// host's Storage Server (`storage`), opens, binds, spawns and warms its ranks over the relayed
+/// session, answers with what they hold, and serves the scheduler node's jobs and operations.
+///
+/// The engine of a peer holds no scheduler and no session head: the scheduler node's schedulers
+/// drive its ranks, and its `session` closes the host regions' session at its host.
+///
+/// # Errors
+///
+/// As [`start`]'s steps, or a session that does not arrive.
+fn start_peer(
+    launch: &EngineArgs,
+    storage: &StorageLaunch,
+    (model_runner, mut ranks): (&ModelRunner, Vec<LoadedRank>),
+    build: Option<(Arc<Mutex<build_server::Client>>, Vec<Target>)>,
+    mut channel: service::Connection,
+    liveness: Arc<Liveness>,
+) -> Result<Engine> {
+    let (id, open, opened) = crate::executor::peers::session(&mut channel, PEER_START)?;
+
+    // The parts of the session's host regions lie on this host, created by its Storage Server,
+    // which follows the epoch's processes for the session's close as for any session.
+    let mut hosts = StorageClient::connect_head(
+        Path::new(&storage.socket),
+        &launch.engine_config.deployment,
+        launch.epoch,
+    )?;
+    hosts.open_hosts(&open)?;
+
+    let created = open_ranks(&mut ranks, &open, &opened)?;
+    let places = bind(&mut ranks, &open, &opened, false)?;
+    // A peer holds no queue pair: its ended sequences reach the scheduler node over its link.
+    let (route, workers) = spawn(
+        &mut ranks,
+        (&open, &opened),
+        &|_| Ok(Vec::new()),
+        Vec::new(),
+    )?;
+
+    if launch.engine_config.device.device != META_DEVICE {
+        instrument(launch, model_runner.devices())?;
+    }
+    warm_up(&workers)?;
+
+    let streams: Vec<(&'static str, platform::Stream)> = ranks
+        .iter()
+        .flat_map(|rank| rank.streams.iter().cloned())
+        .collect();
+    let counters = if streams.is_empty() {
+        None
+    } else {
+        Counters::start(&streams, !launch.engine_config.profiling.graph_pc_sampling)
+    };
+
+    let capacities = capacities(&ranks, &open, (&[], Vec::new()))?;
+    let binding = weight_binding(launch, model_runner, &ranks, &workers, Vec::new())?;
+    drop(ranks);
+
+    let placed = MainProcessResponse::Placed {
+        message_id: Some(id),
+        endpoint: storage.tcp.clone().unwrap_or_default(),
+        created,
+        places,
+        capacities: capacities.clone(),
+    };
+    channel
+        .deliver(&placed)
+        .context("answering the scheduler node's session")?;
+
+    let (prepared, preparations) = crossbeam_channel::unbounded();
+    let timeout = launch
+        .watchdog_timeout()
+        .unwrap_or(launch.engine_config.worker.watchdog_timeout);
+    let bound = 2 * crate::worker::watchdog::stall_bound(timeout);
+    let operate = operations::operator(Arc::clone(&binding), preparations, bound);
+    let upstream = Upstream::serve(channel, Arc::clone(&route), Arc::clone(&liveness), operate)?;
+
+    let hosts = Mutex::new(hosts);
+    let session: Box<dyn FnOnce() -> Result<()> + Send> =
+        Box::new(move || service::lock(&hosts).close());
+    let ceilings = policy::ceilings(capacities.iter().map(|(_, capacity)| capacity));
+    Ok(Engine {
+        schedulers: Vec::new(),
+        route: None,
+        limits: launch.engine_config.model.generation_limits.clone(),
+        capacities,
+        ceilings,
+        // A peer runs no scheduler: the scheduler node serves the deployment's requests within
+        // its ranks' slots, and the peer states the launch's bound.
+        max_running_requests: launch.engine_config.max_running_requests.get(),
+        served: Arc::new(AtomicU64::new(FIRST_GENERATION)),
+        session,
+        workers,
+        groups: Some(route),
+        binding,
+        head: None,
+        build,
+        video: Vec::new(),
+        remotes: Vec::new(),
+        upstream: Some(upstream),
+        prepared: Some(prepared),
+        liveness: Some(liveness),
+        counters,
+    })
 }
 
 /// `configured`, the generation limits a launch states, lowered to what the worker groups of
@@ -704,13 +915,15 @@ fn warm_up(workers: &[Arc<Worker>]) -> Result<()> {
     Ok(())
 }
 
-/// The weight binding over `ranks`, each served by its worker of `workers`: what the engine
-/// changes of the ranks' storages, and how it loads the model the launch serves again.
+/// The weight binding over `ranks`, each served by its worker of `workers`, and the ranks of the
+/// peers behind `remotes`: what the engine changes of the ranks' storages, and how it loads the
+/// model the launch serves again.
 fn weight_binding(
     launch: &EngineArgs,
     model_runner: &ModelRunner,
     ranks: &[LoadedRank],
     workers: &[Arc<Worker>],
+    remotes: Vec<(Vec<GroupId>, Arc<Remote>)>,
 ) -> Result<Arc<WeightBinding>> {
     let mut served = Vec::with_capacity(ranks.len());
     for (rank, worker) in ranks.iter().zip(workers) {
@@ -723,7 +936,7 @@ fn weight_binding(
         checkpoint: PathBuf::from(&launch.engine_config.model.model),
         experts: model_runner.experts(),
     };
-    Ok(Arc::new(WeightBinding::new(served, target)))
+    Ok(Arc::new(WeightBinding::new(served, target, remotes)))
 }
 
 /// Installs what the deployment's always-on profiling captures into every graph of `devices`:

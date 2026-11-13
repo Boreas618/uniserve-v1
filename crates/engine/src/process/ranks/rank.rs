@@ -564,6 +564,13 @@ impl ModelRunner {
         self.launch.queue_depth as usize
     }
 
+    /// The rank's index in its worker group, which names its part of the units of the session's
+    /// regions at the Storage Server: the ranks of one index, in every group and replica, hold
+    /// the same share of every unit.
+    pub(crate) fn tensor_rank(&self) -> u32 {
+        self.mapping.tensor_rank
+    }
+
     /// The ranks of this rank's worker group on every host.
     pub(crate) fn world_size(&self) -> usize {
         self.world_size

@@ -10,8 +10,8 @@ use service::{Connection, Message};
 use crate::batch::cache::CacheGroupKind;
 use crate::batch::{self, Capacity, ErrorCode, TimingCounters};
 use crate::executor::peers::messages::{
-    MainProcessRequest, MainProcessResponse, MainProcessResponseError, ResponseKind, Stall,
-    decode_requests,
+    DataOperation, MainProcessRequest, MainProcessResponse, MainProcessResponseError, ResponseKind,
+    Stall, decode_requests,
 };
 
 /// Returns `message` as a receiver decodes it from the payload a sender encoded.
@@ -53,25 +53,6 @@ fn group_capacity() -> Capacity {
     }
 }
 
-/// A group's capacity reaches the scheduler node as the peer's first rank stated it, its
-/// phases, buckets, rows and cache groups included.
-#[test]
-fn a_group_s_capacity_round_trips_through_the_info_response() {
-    let capacity = group_capacity();
-
-    let decoded = round_trip(&MainProcessResponse::Info {
-        message_id: None,
-        capacity: capacity.clone(),
-    });
-    let MainProcessResponse::Info {
-        capacity: decoded, ..
-    } = decoded
-    else {
-        panic!("the decoded response is no info response: {decoded:?}");
-    };
-    assert_eq!(decoded, capacity);
-}
-
 /// A decode batch of two requests on worker group 2, as the scheduler hands it to its worker.
 fn group_batch() -> batch::Batch {
     batch::Batch {
@@ -111,7 +92,102 @@ fn stamped() -> Vec<storage::runtime::Request> {
     ]
 }
 
-/// One fixture per kind of request, the submit frame with and without a correlation identity.
+/// A session of one device region with one segment, as the scheduler node opened it.
+fn session() -> (storage::runtime::Open, storage::runtime::Opened) {
+    use storage::runtime::{Open, Opened, Region, Tier, VERSION};
+
+    let segment = storage::Segment {
+        epoch: 1,
+        ordinal: 0,
+    };
+    let open = Open {
+        version: VERSION,
+        epoch: 1,
+        trial: false,
+        regions: vec![Region {
+            name: "kv 0 0011".to_owned(),
+            tier: Tier::Device,
+            space: "kv 0 0011".to_owned(),
+            unit_bytes: 256,
+            part_bytes: 128,
+            reserved: 1,
+            units: 0,
+            limit: 129,
+            segments: vec![(segment, 0, 129)],
+        }],
+        classes: Vec::new(),
+        trajectory: 0,
+        groups: Vec::new(),
+        schedulers: vec![Vec::new()],
+        peers: vec!["10.0.0.3:7000".to_owned()],
+    };
+    let opened = Opened {
+        regions: vec![(0, 128)],
+        segments: vec![vec![(segment, 0, 129)]],
+        limits: vec![129],
+        registers: vec![storage::runtime::Registers {
+            completed: vec![0],
+            capacity: vec![(0, 1)],
+        }],
+    };
+    (open, opened)
+}
+
+/// Every operation of the data plane a peer runs.
+fn operations() -> Vec<DataOperation> {
+    use storage::runtime::GroupId;
+
+    let groups = vec![GroupId(0), GroupId(2)];
+    let order = std::collections::BTreeMap::from([("model.layers.0.mlp".to_owned(), vec![1, 0])]);
+    vec![
+        DataOperation::ReleaseSegments {
+            groups: groups.clone(),
+            from: 3,
+        },
+        DataOperation::CreateSegments {
+            groups: groups.clone(),
+            count: Some(2),
+        },
+        DataOperation::CreateSegments {
+            groups: groups.clone(),
+            count: None,
+        },
+        DataOperation::SegmentTables {
+            groups: groups.clone(),
+        },
+        DataOperation::FittingSegments {
+            groups: groups.clone(),
+        },
+        DataOperation::DeviceRooms { groups },
+        DataOperation::Room,
+        DataOperation::GraphBytes,
+        DataOperation::Sleep,
+        DataOperation::Wake,
+        DataOperation::SuspendGraphs,
+        DataOperation::RestoreGraphs,
+        DataOperation::SetKernels,
+        DataOperation::ReserveServing,
+        DataOperation::Pair {
+            checkpoint: "/models/next".to_owned(),
+            experts: order.clone(),
+            rearranged: true,
+        },
+        DataOperation::Load,
+        DataOperation::Stage,
+        DataOperation::Discard,
+        DataOperation::UpdateWeights,
+        DataOperation::CommitExperts { order },
+        DataOperation::ServingOrder,
+        DataOperation::Prepared { generation: 4 },
+        DataOperation::Hook {
+            name: "load_lora_adapter".to_owned(),
+            payload: r#"{"adapter": 1, "lora_path": "/adapters/a"}"#.to_owned(),
+        },
+    ]
+}
+
+/// One fixture per kind of request, the submit frame with and without a correlation identity,
+/// and a data frame of every operation.
 fn request_fixtures() -> Vec<MainProcessRequest> {
     use storage::runtime::{Completion, GroupId, OwnerId, Request};
 
@@ -128,8 +204,9 @@ fn request_fixtures() -> Vec<MainProcessRequest> {
         runs: vec![(0, 70, 1)],
         evicted: Vec::new(),
     };
-    vec![
-        MainProcessRequest::Info { message_id: None },
+    let (open, opened) = session();
+    let mut fixtures = vec![
+        MainProcessRequest::session(&open, &opened),
         submit,
         MainProcessRequest::submit(13, true, group_batch()),
         MainProcessRequest::shadow(14, group_batch()),
@@ -141,15 +218,42 @@ fn request_fixtures() -> Vec<MainProcessRequest> {
             &allocated,
         ),
         MainProcessRequest::stamp(GroupId(2), &stamped()),
+        MainProcessRequest::Switch {
+            message_id: Some(5),
+            generation: 2,
+        },
+        MainProcessRequest::Commit {
+            message_id: Some(6),
+            generation: 2,
+        },
+        MainProcessRequest::Rollback {
+            message_id: Some(7),
+            generation: 2,
+        },
         MainProcessRequest::close(),
-    ]
+    ];
+    fixtures.extend(operations().into_iter().map(MainProcessRequest::data));
+    fixtures
 }
 
 fn response_fixtures() -> Vec<MainProcessResponse> {
+    let (open, opened) = session();
+    let runs = vec![storage::protocol::UnitRun {
+        field: "prefix_cache.key.values/0".to_owned(),
+        key: storage::Key([3; 32]),
+        location: storage::Location::Device { gpu: [5; 16] },
+        first: 0,
+        count: 129,
+        offset: 4096,
+        bytes: 64,
+    }];
     vec![
-        MainProcessResponse::Info {
-            message_id: Some(17),
-            capacity: group_capacity(),
+        MainProcessResponse::Placed {
+            message_id: Some(16),
+            endpoint: "10.0.0.3:7000".to_owned(),
+            created: vec![(open.regions[0].name.clone(), opened.segments[0].clone())],
+            places: vec![(open.regions[0].name.clone(), "a/0,b/0".to_owned(), 1, runs)],
+            capacities: vec![(storage::runtime::GroupId(2), group_capacity())],
         },
         MainProcessResponse::Result {
             message_id: Some(17),
@@ -166,6 +270,10 @@ fn response_fixtures() -> Vec<MainProcessResponse> {
             ended: 12,
         },
         MainProcessResponse::result(batch::BatchOutput::default(), &stamped(), 14),
+        MainProcessResponse::Operated {
+            message_id: Some(18),
+            reply: "[3]".to_owned(),
+        },
         MainProcessResponse::Error {
             message_id: Some(17),
             error: MainProcessResponseError {
@@ -175,7 +283,10 @@ fn response_fixtures() -> Vec<MainProcessResponse> {
                 phase: Some("execute".into()),
                 route: Some("und.decode".into()),
             },
+            requests: Vec::new(),
+            ended: 0,
         },
+        MainProcessResponse::failed(19, "a device fault".into(), &stamped()[1..], 9),
         MainProcessResponse::Stalled {
             stall: Stall {
                 batch_id: Some(12),
@@ -198,8 +309,9 @@ fn every_request_kind_round_trips_through_ipc() {
 fn every_response_kind_round_trips_through_ipc() {
     let fixtures = response_fixtures();
     for kind in [
-        ResponseKind::Info,
+        ResponseKind::Placed,
         ResponseKind::Result,
+        ResponseKind::Operated,
         ResponseKind::Error,
         ResponseKind::Stalled,
     ] {
@@ -242,15 +354,29 @@ fn the_buffer_pool_s_requests_read_back_from_the_frames_that_carry_them() {
     assert_eq!(decode_requests(&requests).unwrap(), stamped());
     assert_eq!(ended, 14);
 
+    // A failure returns the `Finish` of the copies its batch started, readable as requests.
+    let response = round_trip(&MainProcessResponse::failed(
+        3,
+        "a device fault".into(),
+        &stamped()[1..],
+        9,
+    ));
+    let MainProcessResponse::Error {
+        requests, ended, ..
+    } = response
+    else {
+        panic!("an error frame reads back as an error frame");
+    };
+    assert_eq!(decode_requests(&requests).unwrap(), &stamped()[1..]);
+    assert_eq!(ended, 9);
+
     // A record that is not a request of the buffer pool's interface is an error to its reader.
     assert!(decode_requests(&[vec![0; 4]]).is_err());
 }
 
 #[test]
 fn a_message_decodes_only_as_the_message_it_is() {
-    let request = MainProcessRequest::Info { message_id: None }
-        .encode()
-        .unwrap();
+    let request = MainProcessRequest::close().encode().unwrap();
     let refused = MainProcessResponse::decode(&request).unwrap_err();
     assert_eq!(refused.kind(), std::io::ErrorKind::InvalidData);
 

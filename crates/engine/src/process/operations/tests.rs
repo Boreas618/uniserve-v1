@@ -114,6 +114,8 @@ pub(in crate::process) struct Node {
     pub(in crate::process) outputs: Receiver<Output>,
     /// The worker group's one rank.
     pub(in crate::process) workers: Vec<Arc<crate::worker::Worker>>,
+    /// The node's route over its rank.
+    pub(in crate::process) route: Arc<crate::executor::Route>,
     pub(in crate::process) binding: Arc<WeightBinding>,
     pub(in crate::process) head: Mutex<StorageClient>,
     /// The generation the scheduler's batches carry.
@@ -135,7 +137,9 @@ impl Node {
         let (output, outputs) = crossbeam_channel::unbounded();
         let served = Arc::new(AtomicU64::new(1));
 
-        let groups = WorkerExecutor::new(route, &[GROUP], inbox.clone(), Arc::default()).unwrap();
+        let groups =
+            WorkerExecutor::new(Arc::clone(&route), &[GROUP], inbox.clone(), Arc::default())
+                .unwrap();
         let config = WorkerGroupConfig::data_parallel(
             &["localhost".to_owned()],
             "cpu",
@@ -166,7 +170,12 @@ impl Node {
             schedulers: vec![inbox],
             outputs,
             workers,
-            binding: Arc::new(WeightBinding::new(Vec::new(), Target::default())),
+            route,
+            binding: Arc::new(WeightBinding::new(
+                Vec::new(),
+                Target::default(),
+                Vec::new(),
+            )),
             head: Mutex::new(head),
             served,
             threads: vec![thread],

@@ -792,7 +792,7 @@ impl Server {
                 Request::PlaceRemote {
                     region,
                     memory,
-                    rank,
+                    part,
                     endpoint,
                     runs,
                 },
@@ -800,7 +800,7 @@ impl Server {
             ) => self.place_remote(
                 id,
                 (&deployment, epoch),
-                (region, memory, *rank),
+                (region, memory, *part),
                 endpoint,
                 runs,
             ),
@@ -946,13 +946,15 @@ impl Server {
                     Request::Place {
                         region,
                         memory,
+                        part,
                         runs,
-                    } => self.place(&holder, region, memory, runs),
+                    } => self.place(&holder, (region, memory, *part), runs),
                     Request::HostPart {
                         region,
+                        part,
                         bytes,
                         numa_node,
-                    } => self.host_part(&holder, region, *bytes, *numa_node),
+                    } => self.host_part(&holder, (region, *part), *bytes, *numa_node),
                     _ => Err(invalid(&format!(
                         "{} is not a worker request",
                         request_name(request)
@@ -1232,17 +1234,18 @@ impl Server {
         Ok(HostStorage {
             available: available_storage()?,
             reserve: self.host_reserve,
-            unallocated: self.sessions.unallocated()
-                + self
-                    .storages
-                    .values()
-                    .filter(|storage| matches!(storage.record.location, Location::Host { .. }))
-                    .map(|storage| {
-                        let allocated = rustix::fs::fstat(&storage._descriptor)
-                            .map_or(0, |stat| (stat.st_blocks as u64).saturating_mul(512));
-                        storage.record.bytes.saturating_sub(allocated)
-                    })
-                    .sum::<u64>(),
+            // A host region's parts are storages of their own, admitted whole as each is
+            // created: what they have yet to allocate counts here.
+            unallocated: self
+                .storages
+                .values()
+                .filter(|storage| matches!(storage.record.location, Location::Host { .. }))
+                .map(|storage| {
+                    let allocated = rustix::fs::fstat(&storage._descriptor)
+                        .map_or(0, |stat| (stat.st_blocks as u64).saturating_mul(512));
+                    storage.record.bytes.saturating_sub(allocated)
+                })
+                .sum::<u64>(),
         })
     }
 

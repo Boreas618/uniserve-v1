@@ -353,13 +353,18 @@ pub(super) fn grant_held(
     Ok(count)
 }
 
-/// Resizes every device region each scheduler's queue pair uses to every unit the session numbers
-/// for it past its reserved ones, and returns each region's number with the units it reached: a
-/// grow takes what its space's free ranges hold, and may stop short. Every region is asked before
-/// any reply is waited for.
+/// Resizes the regions each scheduler's queue pair uses to what the session states of them, and
+/// returns each region's number with the units it reached: every device region to every unit
+/// the session numbers for it past its reserved ones, and every host region to the units the
+/// epoch's layout asks for, within the numbering the buffer pool holds for it. A grow takes what
+/// its space's free ranges hold and a shrink frees what its blocks let it; either may stop short.
+/// Every region is asked before any reply is waited for.
 ///
 /// The session asks for no unit of a region whose memory the ranks create once it is open, so
 /// this is how the start's regions, and a woken engine's, reach the segments the head granted.
+/// A host region an earlier epoch opened keeps that epoch's numbering and units at `Open`, so
+/// this is how the epoch's own statement of its host tier (`kv_cache_config.host_gib`) takes
+/// effect on it (`specs/buffer-pool.md` §14.1).
 ///
 /// # Errors
 ///
@@ -378,13 +383,16 @@ pub(super) fn grow_regions(
                 let stated = index_of(opened, number)
                     .ok()
                     .and_then(|index| open.regions.get(index));
-                if let Some(stated) = stated.filter(|stated| stated.tier == Tier::Device) {
-                    targets.push((
-                        scheduler,
-                        number,
-                        stated.limit.saturating_sub(stated.reserved),
-                    ));
-                }
+                let Some(stated) = stated else {
+                    continue;
+                };
+                let numbered = stated.limit.saturating_sub(stated.reserved);
+                let units = match stated.tier {
+                    Tier::Device => numbered,
+                    Tier::Host => stated.units.min(numbered),
+                    Tier::Remote => continue,
+                };
+                targets.push((scheduler, number, units));
             }
         }
         targets

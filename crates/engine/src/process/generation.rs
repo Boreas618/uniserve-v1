@@ -19,6 +19,11 @@
 //!
 //! The route instance of an engine of several schedulers switches, commits and rolls back on the
 //! control thread, which holds it.
+//!
+//! The ranks of the epoch's peers switch, commit and roll back with this process's, in the order
+//! of every group's jobs, through the node's route (`Route::switch`); each peer prepares from its
+//! own daemon's command and its own host's Build Server, and a shadow pass waits for every
+//! peer's preparation before its shadow batches reach them (`WeightBinding::prepared`).
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -37,7 +42,7 @@ use service::lock;
 use crate::worker::Worker;
 
 use super::operations::{ask, at_boundary, every, stopped};
-use crate::executor::Shadow;
+use crate::executor::{Route, Shadow};
 use crate::modules::load::{self, install, select};
 use crate::modules::select::{Routes, replaced_operators};
 use crate::process::binding::WeightBinding;
@@ -332,7 +337,7 @@ pub(crate) fn shadow(
 /// and state did not take the kernels, with the switch made.
 pub(crate) fn switch(
     schedulers: &[Sender<Message>],
-    workers: &[Arc<Worker>],
+    route: Option<&Route>,
     binding: &WeightBinding,
     served: &AtomicU64,
     generation: u64,
@@ -340,13 +345,7 @@ pub(crate) fn switch(
 ) -> Result<()> {
     at_boundary(schedulers, || {
         let what = format!("switching to generation {generation}");
-        let switched = ended(
-            workers
-                .iter()
-                .map(|worker| worker.switch(generation))
-                .collect(),
-            &what,
-        );
+        let switched = ended(on_ranks(route, |route| route.switch(generation)), &what);
 
         // The policy follows the devices; a scheduler that refuses it serves its own.
         let mut took = Vec::new();
@@ -373,10 +372,7 @@ pub(crate) fn switch(
             // A rollback returns a device that switched to the generation it kept, and gives
             // the prepared generation back on one that did not.
             let rolled = ended(
-                workers
-                    .iter()
-                    .map(|worker| worker.rollback(generation))
-                    .collect(),
+                on_ranks(route, |route| route.rollback(generation)),
                 &format!("rolling generation {generation} back"),
             );
             if let Err(error) = rolled {
@@ -402,14 +398,11 @@ pub(crate) fn switch(
 /// A device that did not commit, or a scheduler that stopped.
 pub(crate) fn commit(
     schedulers: &[Sender<Message>],
-    workers: &[Arc<Worker>],
+    route: Option<&Route>,
     generation: u64,
 ) -> Result<()> {
     ended(
-        workers
-            .iter()
-            .map(|worker| worker.commit(generation))
-            .collect(),
+        on_ranks(route, |route| route.commit(generation)),
         &format!("committing generation {generation}"),
     )?;
 
@@ -434,7 +427,7 @@ pub(crate) fn commit(
 /// policy faults again. Each part is done whatever another did.
 pub(crate) fn rollback(
     schedulers: &[Sender<Message>],
-    workers: &[Arc<Worker>],
+    route: Option<&Route>,
     binding: &WeightBinding,
     served: &AtomicU64,
     generation: u64,
@@ -442,10 +435,7 @@ pub(crate) fn rollback(
 ) -> Result<()> {
     at_boundary(schedulers, || {
         let devices = ended(
-            workers
-                .iter()
-                .map(|worker| worker.rollback(generation))
-                .collect(),
+            on_ranks(route, |route| route.rollback(generation)),
             &format!("rolling generation {generation} back"),
         );
         served.store(kept, Ordering::Release);
@@ -483,6 +473,15 @@ pub(crate) fn discard(
             .collect(),
         &format!("discarding generation {generation}"),
     )
+}
+
+/// The submission of `job` on every rank of `route`, this node's and its peers' (`Route::switch`);
+/// none for an engine of no rank.
+fn on_ranks(
+    route: Option<&Route>,
+    job: impl FnOnce(&Route) -> crate::worker::Result<Submission>,
+) -> Vec<crate::worker::Result<Submission>> {
+    route.map(job).into_iter().collect()
 }
 
 /// Waits for every submission, which the caller handed every worker before it waits for any,

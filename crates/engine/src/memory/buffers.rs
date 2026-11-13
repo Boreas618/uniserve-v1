@@ -334,7 +334,10 @@ impl BufferMemory {
         let device = *device;
         self.check_part(region, self.rank, bytes)?;
 
-        let (units, descriptor) = client.host_part(name, bytes, numa_node)?;
+        // A region of blocks held whole by one rank has one part, the region's part 0, which
+        // every epoch and replica on this host that names the region shares
+        // (`specs/buffer-pool.md` §15).
+        let (units, descriptor) = client.host_part(name, 0, bytes, numa_node)?;
         let length = u64::from(units)
             .checked_mul(bytes)
             .and_then(|length| usize::try_from(length).ok())

@@ -484,15 +484,19 @@ pub(crate) fn values(key: Key) -> Vec<UnitRun> {
 fn a_transfer_copies_an_owner_s_units_between_its_groups_ranks_through_the_transfer_server() {
     let server = serving(Gpus::Hidden);
     let claim = head(&server.socket)
-        .claim(0, vec![scope("prefill", 0), scope("decode", 0)], Vec::new())
+        .claim(0, vec![scope("prefill", 0), scope("decode", 1)], Vec::new())
         .unwrap();
 
     // Each group's rank holds the KV region's values in storage of its own,
-    // and states where the units lie in its group's memory.
+    // and states where the units lie in its group's memory. The deployment
+    // numbers the decode group's rank 1, after the prefill group's; in its
+    // group it is the first, which holds the share of a unit the prefill
+    // group's first rank holds: the two are matched by that index, their
+    // part.
     let planes = [memfd(&[0; 144]), memfd(&[0; 144])];
     let mut ranks = [
         rank(&server.socket, "prefill", 0, claim),
-        rank(&server.socket, "decode", 0, claim),
+        rank(&server.socket, "decode", 1, claim),
     ];
     for ((rank, planes), (name, memory)) in ranks
         .iter_mut()
@@ -502,7 +506,7 @@ fn a_transfer_copies_an_owner_s_units_between_its_groups_ranks_through_the_trans
         let values_tensor = tensor(key(name), "values", 0, 0, Access::Exclusive);
         rank.put(vec![values_tensor], &[(host(144), planes.as_fd())])
             .unwrap();
-        rank.place("units".into(), memory.into(), values(key(name)))
+        rank.place("units".into(), memory.into(), 0, values(key(name)))
             .unwrap();
     }
 
@@ -667,11 +671,116 @@ pub(crate) fn host_parts(socket: &Path, claim: Claim) -> Vec<OwnedFd> {
     (0..2)
         .map(|index| {
             let mut part = rank(socket, "prefill", index, claim);
-            let (units, descriptor) = part.host_part("host".into(), 16, None).unwrap();
+            let (units, descriptor) = part.host_part("host".into(), index, 16, None).unwrap();
             assert_eq!(units, 4);
             descriptor
         })
         .collect()
+}
+
+/// A host region's parts are named by the ranks' index in their worker
+/// groups: the prefill and the decode group's ranks of one index hold the
+/// same share of every unit and share one part, so a deployment of two
+/// groups fills each unit once, whatever the deployment numbers its ranks.
+#[test]
+fn the_ranks_of_one_index_in_two_groups_share_a_part_of_a_host_region() {
+    let server = Running::with_transfer(|_| None);
+    let scopes = vec![
+        scope("prefill", 0),
+        scope("prefill", 1),
+        scope("decode", 2),
+        scope("decode", 3),
+    ];
+    let claim = head(&server.socket).claim(0, scopes, Vec::new()).unwrap();
+    let mut engine = engine_head(&server.socket, 0);
+    engine.open_pool(layout(0)).unwrap();
+
+    // The prefill group's two ranks take the region's two parts of 16 bytes.
+    let parts = host_parts(&server.socket, claim);
+
+    // The decode group's ranks, the deployment's ranks 2 and 3, are its
+    // ranks 0 and 1: each takes the part of its index, and what one group
+    // writes there the other reads.
+    for (index, written) in parts.iter().enumerate() {
+        let index = u32::try_from(index).unwrap();
+        let mut decode = rank(&server.socket, "decode", 2 + index, claim);
+        let (units, descriptor) = decode.host_part("host".into(), index, 16, None).unwrap();
+        assert_eq!(units, 4);
+
+        let written = std::fs::File::from(written.try_clone().unwrap());
+        written.write_all_at(&[index as u8 + 1; 16], 16).unwrap();
+        let mut read = [0; 16];
+        std::fs::File::from(descriptor)
+            .read_exact_at(&mut read, 16)
+            .unwrap();
+        assert_eq!(read, [index as u8 + 1; 16]);
+    }
+
+    // A third part would hold more of a unit than the region's unit size.
+    let mut third = rank(&server.socket, "decode", 3, claim);
+    assert_eq!(
+        server_error(third.host_part("host".into(), 2, 16, None)),
+        ErrorKind::Invalid
+    );
+}
+
+/// A held host region keeps the numbering its parts were created with: an
+/// epoch that states it at another size opens over it, and its scheduler
+/// resizes it to the units it asks for within that numbering, as a device
+/// region is resized.
+#[test]
+fn an_epoch_that_states_a_held_host_region_at_another_size_resizes_it() {
+    let server = Running::with_transfer(|_| None);
+    let mut serving = engine_head(&server.socket, 0);
+    serving.open_pool(layout(0)).unwrap();
+
+    // The next epoch's host tier is half the size: two units of the four.
+    let mut smaller = layout(1);
+    smaller.regions[HOST].units = 2;
+    smaller.regions[HOST].limit = 2;
+    let mut target = engine_head(&server.socket, 1);
+    let (opened, descriptors) = target.open_pool(smaller).unwrap();
+    assert_eq!(opened.limits[HOST], 4);
+    let host = opened.regions[HOST].0;
+
+    let mut schedulers = Scheduler::all(&opened, descriptors);
+    let resize = |units| Request::Resize {
+        region: host,
+        units,
+    };
+    let resized = |units| Completion::Resized {
+        units,
+        evicted: Vec::new(),
+    };
+    assert_eq!(schedulers[0].ask(resize(2)), resized(2));
+    // A grow reaches the numbering and no further: the parts hold no more.
+    assert_eq!(schedulers[0].ask(resize(8)), resized(4));
+}
+
+/// A host region whose ranks lie on several hosts holds on each host only
+/// that host's parts: a session's `Open` admits nothing of it, and each part
+/// is admitted, whole, as a rank of this host takes it.
+#[test]
+fn a_host_region_is_admitted_part_by_part_as_its_ranks_take_them() {
+    for refused in [true, false] {
+        // A server that leaves the host's whole storage to other processes
+        // admits no new host storage.
+        let server = Running::reserving(if refused { u64::MAX } else { 0 });
+        let claim = head(&server.socket)
+            .claim(0, vec![scope("prefill", 0)], Vec::new())
+            .unwrap();
+        let mut engine = engine_head(&server.socket, 0);
+        engine.open_pool(layout(0)).unwrap();
+
+        let mut part = rank(&server.socket, "prefill", 0, claim);
+        let taken = part.host_part("host".into(), 0, 16, None);
+        if refused {
+            assert_eq!(server_error(taken), ErrorKind::Resource);
+        } else {
+            let (units, _descriptor) = taken.unwrap();
+            assert_eq!(units, 4);
+        }
+    }
 }
 
 #[test]

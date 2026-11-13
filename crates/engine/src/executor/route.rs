@@ -20,6 +20,10 @@
 //! - **One order.** A group's jobs are handed under one lock, so every rank's queue holds them in
 //!   the same order: the order their collectives need, and the order in which a completion
 //!   mapped before a batch is seen by that batch on every rank.
+//! - **Generations.** A generation's switch, commit and rollback reach every rank of every group,
+//!   this node's workers and once each peer link, under every group's lock: each rank takes them
+//!   between the same two jobs of each of its groups, and a peer's far end hands them to its
+//!   ranks in the order they arrived. They take no number: they address no device block table.
 //! - **A rank alone.** A batch whose rows name a rank ([`crate::batch::MediaRow::rank`], among this
 //!   node's workers of the group), such as an audio decode, needs no other rank: the named rank
 //!   runs it, and every other rank, here or on a peer, passes its number. A video decode round
@@ -242,7 +246,8 @@ impl Route {
         let mut parts = Vec::with_capacity(route.workers.len() + route.remotes.len());
         for (index, remote) in route.remotes.iter().enumerate() {
             let frame = MainProcessRequest::map(group, slot, id, &request, &completion);
-            parts.push(remote.send(frame, &route.sequences, route.workers.len() + index)?);
+            let reporting = (&route.sequences, route.workers.len() + index);
+            parts.push(remote.send(frame, Some(reporting))?);
         }
         for worker in &route.workers {
             parts.push(worker.map(slot, id, request.clone(), completion.clone())?);
@@ -274,12 +279,97 @@ impl Route {
         let mut parts = Vec::with_capacity(route.workers.len() + route.remotes.len());
         for (index, remote) in route.remotes.iter().enumerate() {
             let frame = MainProcessRequest::stamp(group, &requests);
-            parts.push(remote.send(frame, &route.sequences, route.workers.len() + index)?);
+            let reporting = (&route.sequences, route.workers.len() + index);
+            parts.push(remote.send(frame, Some(reporting))?);
         }
         for worker in &route.workers {
             parts.push(worker.stamp(requests.clone())?);
         }
 
+        joined(parts)
+    }
+
+    /// Switches every rank of every group, this node's workers and the peers', to the prepared
+    /// generation `generation`, between the jobs of each group handed before and after it: the
+    /// switch is handed under every group's lock, in the route's order of groups, to each of this
+    /// node's workers and once to each peer link, whose far end hands it to its ranks in the
+    /// order it arrived. It takes no number: it addresses no device block table. The submission
+    /// completes once every part did.
+    ///
+    /// # Errors
+    ///
+    /// A route of no rank, or what a queue or a peer link refuses.
+    pub(crate) fn switch(&self, generation: u64) -> Result<Submission> {
+        self.everywhere(
+            |worker| worker.switch(generation),
+            || MainProcessRequest::Switch {
+                message_id: None,
+                generation,
+            },
+        )
+    }
+
+    /// Commits the trial of generation `generation` on every rank, behind the jobs handed before
+    /// it, as [`Route::switch`] hands a switch.
+    ///
+    /// # Errors
+    ///
+    /// As [`Route::switch`].
+    pub(crate) fn commit(&self, generation: u64) -> Result<Submission> {
+        self.everywhere(
+            |worker| worker.commit(generation),
+            || MainProcessRequest::Commit {
+                message_id: None,
+                generation,
+            },
+        )
+    }
+
+    /// Rolls generation `generation` back on every rank, between the jobs handed before and
+    /// after it, as [`Route::switch`] hands a switch.
+    ///
+    /// # Errors
+    ///
+    /// As [`Route::switch`].
+    pub(crate) fn rollback(&self, generation: u64) -> Result<Submission> {
+        self.everywhere(
+            |worker| worker.rollback(generation),
+            || MainProcessRequest::Rollback {
+                message_id: None,
+                generation,
+            },
+        )
+    }
+
+    /// Hands a job of every rank to this node's workers (`local`) and once to each peer link
+    /// (`frame`), under every group's lock, and joins their submissions.
+    fn everywhere(
+        &self,
+        local: impl Fn(&Worker) -> Result<Submission>,
+        frame: impl Fn() -> MainProcessRequest,
+    ) -> Result<Submission> {
+        // Every group's order holds the job at one place: no job of any group is handed while
+        // it is handed.
+        let _order: Vec<_> = self.groups.iter().map(|group| lock(&group.next)).collect();
+
+        let mut links: Vec<&Arc<Remote>> = Vec::new();
+        for group in &self.groups {
+            for remote in &group.remotes {
+                if !links.iter().any(|link| Arc::ptr_eq(link, remote)) {
+                    links.push(remote);
+                }
+            }
+        }
+
+        let mut parts = Vec::new();
+        for link in links {
+            parts.push(link.send(frame(), None)?);
+        }
+        for group in &self.groups {
+            for worker in &group.workers {
+                parts.push(local(worker)?);
+            }
+        }
         joined(parts)
     }
 
@@ -370,7 +460,8 @@ impl Group {
             } else {
                 MainProcessRequest::submit(sequence, link_pass, batch.clone())
             };
-            let part = link.send(frame, &self.sequences, self.workers.len() + index)?;
+            let reporting = (&self.sequences, self.workers.len() + index);
+            let part = link.send(frame, Some(reporting))?;
 
             if link_pass {
                 passing.push(part);

@@ -1699,26 +1699,10 @@ fn a_group_s_ranks_on_another_host_take_its_jobs_and_state_what_they_ended() {
             let channel = register(&address, 0, 7, LONG).unwrap();
             let (ranks, _, _) = group(ranks(1, &log), Vec::new());
             let liveness = Liveness::new(Arc::new(|| {}), Duration::from_secs(3600));
-            // The group's capacity, which this test's scheduler node never asks for.
-            let capacity = crate::batch::Capacity {
-                phases: 0,
-                slots: 1,
-                kv_cache: None,
-                cache_groups: Vec::new(),
-                seeds: Vec::new(),
-                buckets: Vec::new(),
-                rows: [0; Phase::COUNT],
-                max_model_len: 0,
-                denoise_steps: 0,
-                bos_token_id: 0,
-                eos_token_ids: Vec::new(),
-                feature_bytes: 0,
-                encoder_identity: String::new(),
-                latent_seed: 0,
-                media_bytes: Vec::new(),
-                call_window: 1,
-            };
-            let upstream = Upstream::serve(channel, Arc::new(ranks), capacity, liveness).unwrap();
+            // This test's scheduler node runs no operation of the data plane.
+            let operate: crate::executor::peers::Operate =
+                Box::new(|_| Err("this peer runs no operation".to_owned()));
+            let upstream = Upstream::serve(channel, Arc::new(ranks), liveness, operate).unwrap();
 
             let _ = released.recv();
             upstream.close();

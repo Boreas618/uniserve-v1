@@ -1144,8 +1144,9 @@ pub enum Request {
     /// session is open (or its engine's processes have not left since it
     /// lost its connection), or when the layout does not fit the buffer
     /// pool: a region stated again with another tier, space, unit size or
-    /// numbering, more than eight device memories over the deployment's
-    /// sessions, or host regions the host's storage cannot hold.
+    /// numbering, or more than eight device memories over the deployment's
+    /// sessions. A host region's storage is admitted part by part, as each
+    /// rank of this host takes its part ([`Request::HostPart`]), not here.
     Open(Open),
     /// From the engine's main process that opened its epoch's session: its
     /// workers have stopped, and the session closes as the session of an
@@ -1155,27 +1156,31 @@ pub enum Request {
     /// From a worker: where its part of the units of the device region
     /// `region` of its deployment's buffer pool lies, in the device memory
     /// `memory` its group addresses (the memory a group of the layout
-    /// states), field by field. It replaces what the rank stated before for
-    /// the region and memory. The server turns a task's runs into copies
-    /// with it, matching the ranks of two memories by their rank index.
-    /// Responded with [`Response::Placed`].
+    /// states), field by field. `part` is the rank's index in its worker
+    /// group, which holds the same share of every unit in every group of
+    /// the layout. It replaces what was stated before for the region, memory
+    /// and part. The server turns a task's runs into copies with it,
+    /// matching the ranks of two memories by their part. Responded with
+    /// [`Response::Placed`].
     Place {
         region: String,
         memory: String,
+        part: u32,
         runs: Vec<UnitRun>,
     },
     /// From the head of an epoch whose session is open, on the host: where
-    /// the part of the units of the device region `region` lies for rank
-    /// `rank` of the device memory `memory`, a rank of another host, as
+    /// the part `part` of the units of the device region `region` lies in
+    /// the device memory `memory` for its rank of another host (the rank
+    /// whose index in its worker group is `part`, [`Request::Place`]), as
     /// that rank stated it to its engine. The runs name tensors retained at
     /// that host's Storage Server, listening at `endpoint`, whose Transfer
     /// Server reaches them: a task writing them runs there, and one reading
     /// them here READs them from there. It replaces what was stated before
-    /// for the rank, region and memory. Responded with [`Response::Placed`].
+    /// for the region, memory and part. Responded with [`Response::Placed`].
     PlaceRemote {
         region: String,
         memory: String,
-        rank: u32,
+        part: u32,
         endpoint: String,
         runs: Vec<UnitRun>,
     },
@@ -1206,16 +1211,22 @@ pub enum Request {
     /// region (a resize shrinks the regions first), or when the table holds
     /// no such segment.
     Withdraw { region: String, segment: Segment },
-    /// From a worker: its rank's part of the host region `region` of its
+    /// From a worker: part `part` of the host region `region` of its
     /// deployment's buffer pool, `bytes` of every unit, whose memfd the
     /// server creates at the first request (on `numa_node` when given) and
-    /// holds until the deployment is released. Ranks of one rank index
-    /// share the part. Responded with [`Response::HostPart`], whose memfd
-    /// travels with it; refused when the region is not a host region an
-    /// open session stated, or when the parts' bytes of a unit exceed the
-    /// region's unit size.
+    /// holds until the deployment is released. `part` is the rank's index in
+    /// its worker group: the ranks of one index, in every group and replica
+    /// of the deployment, hold the same share of every unit and share the
+    /// part. The part is admitted whole, the region's numbering of `bytes`
+    /// each, when it is created: a region whose ranks lie on several hosts
+    /// holds on each only that host's parts. Responded with
+    /// [`Response::HostPart`], whose memfd travels with it; refused when the
+    /// region is not a host region an open session stated, when the parts'
+    /// bytes of a unit exceed the region's unit size, or when the host's
+    /// storage cannot hold a new part.
     HostPart {
         region: String,
+        part: u32,
         bytes: u64,
         numa_node: Option<u32>,
     },
