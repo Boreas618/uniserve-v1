@@ -3404,28 +3404,40 @@ mod tests {
 
     use super::{EngineState, Leader, keeps_standby};
     use crate::test_support::{
-        SERVED_MODEL, STALL, configured_tokenizer, engine_of, fake_client, fake_core, leader_over,
-        letter_fake, post_json, router, send, send_streamed, serving_core, test_model,
+        SERVED_MODEL, STALL, configured_tokenizer, engine_of, fake_client, leader_over,
+        letter_fake, post_json, router, send, send_streamed, test_model, text_fake,
     };
+    use testkit::{FakeExecutor, Fixture};
 
     /// A Qwen3 engine over one scheduler, named `engine_model`, over the fake
-    /// `shape` makes of the default one ([`letter_fake`]).
+    /// `shape` makes of the one that samples `a` ([`letter_fake`]).
     ///
-    /// The scheduler's model name labels the process-wide request metrics,
+    /// The engine's model name labels the process-wide request metrics,
     /// so a test that reads them names its own engine.
     fn qwen3_engine(
         engine_model: &str,
-        shape: impl FnOnce(testkit::FakeBatches) -> testkit::FakeBatches,
+        shape: impl Fn(FakeExecutor) -> FakeExecutor + Send + 'static,
     ) -> Leader {
-        let args = testkit::args(engine_model);
-        let fake = Arc::new(shape(letter_fake(&args)));
-        engine_of(crate::test_support::CHAT, vec![fake_core(args, fake)])
+        engine_of(
+            crate::test_support::CHAT,
+            testkit::args(engine_model),
+            Fixture::new(move |fake| shape(letter_fake(fake))),
+        )
     }
 
     /// The default fake's shape: each request's text ends after
     /// `crate::test_support::TEXT_LEN` tokens.
-    fn ending(fake: testkit::FakeBatches) -> testkit::FakeBatches {
+    fn ending(fake: FakeExecutor) -> FakeExecutor {
         fake.with_text_len(crate::test_support::TEXT_LEN)
+    }
+
+    /// A client of an engine of one scheduler, named `engine_model`, over the
+    /// default fake.
+    fn client_of(engine_model: &str) -> Arc<crate::engine::client::EngineClient> {
+        Arc::new(fake_client(
+            testkit::args(engine_model),
+            Fixture::new(text_fake),
+        ))
     }
 
     /// Greedy chat request of at most `max_completion_tokens` tokens that may
@@ -3493,8 +3505,7 @@ mod tests {
     /// loss.
     #[tokio::test]
     async fn a_lost_engine_fails_later_requests() {
-        let core = serving_core("lost-engine-model");
-        let client = Arc::new(fake_client(vec![core]));
+        let client = client_of("lost-engine-model");
         let engine = leader_over(
             test_model(crate::test_support::CHAT),
             configured_tokenizer(),
@@ -3531,8 +3542,7 @@ mod tests {
         // responses the leader never gave.
         let mut clients = Vec::new();
         for _ in 0..2 {
-            let core = serving_core("sim-model");
-            clients.push(Arc::new(fake_client(vec![core])));
+            clients.push(client_of("sim-model"));
         }
         let engine = leader_over(
             test_model(crate::test_support::CHAT),
@@ -3624,19 +3634,16 @@ mod tests {
     /// that rejection as HTTP 400.
     #[tokio::test]
     async fn chat_admission_rejection_remains_a_bad_request() {
-        // Unit zero is the sentinel: two allocatable 64-token pages remain.
-        let args = testkit::args(SERVED_MODEL);
-        let mut pool = testkit::pool(&args.group);
-        for rank in &mut pool.ranks {
-            if let Some(cache) = rank.prefix_cache.as_mut() {
-                cache.num_units = 3;
-            }
-        }
-        let fake = testkit::FakeBatches::new(vec![pool])
-            .with_tokens(testkit::Tokens::Fixed(crate::test_support::LETTER))
-            .with_text_len(crate::test_support::TEXT_LEN);
-        let core = fake_core(args, Arc::new(fake));
-        let engine = Arc::new(engine_of(crate::test_support::CHAT, vec![core]));
+        // Unit zero is the padding unit: two allocatable 64-token blocks remain.
+        let fixture = Fixture {
+            units: 3,
+            ..Fixture::new(text_fake)
+        };
+        let engine = Arc::new(engine_of(
+            crate::test_support::CHAT,
+            testkit::args(SERVED_MODEL),
+            fixture,
+        ));
         let router = router(Arc::clone(&engine));
         let request = serde_json::json!({
             "model": SERVED_MODEL,
@@ -3736,14 +3743,11 @@ mod tests {
     #[tokio::test]
     async fn request_metrics_name_the_engine_core_that_served_each_request() {
         let engine_model = "core-metrics-model";
-        let cores = (0..2)
-            .map(|_| {
-                let args = testkit::args(engine_model);
-                let fake = crate::test_support::text_fake(&args);
-                fake_core(args, fake)
-            })
-            .collect();
-        let engine = Arc::new(engine_of(crate::test_support::CHAT, cores));
+        let engine = Arc::new(engine_of(
+            crate::test_support::CHAT,
+            testkit::launch(engine_model, 2),
+            Fixture::new(text_fake),
+        ));
         let router = router(Arc::clone(&engine));
 
         // Both requests are in flight together, so the second is routed

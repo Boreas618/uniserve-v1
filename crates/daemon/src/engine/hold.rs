@@ -290,7 +290,7 @@ mod tests {
     use proto::request::{Event, GenerationRequest, SamplingParams};
 
     use super::*;
-    use crate::test_support::{SERVED_MODEL, fake_client, serving_core};
+    use crate::test_support::{SERVED_MODEL, fake_client, text_fake};
 
     /// A text request that generates until the fake's end of text.
     fn request() -> Request {
@@ -313,7 +313,10 @@ mod tests {
 
     /// A client of one scheduler over the default fake.
     fn client() -> Arc<EngineClient> {
-        Arc::new(fake_client(vec![serving_core(SERVED_MODEL)]))
+        Arc::new(fake_client(
+            testkit::args(SERVED_MODEL),
+            testkit::Fixture::new(text_fake),
+        ))
     }
 
     /// A submission waits while no engine serves, and the engine that comes

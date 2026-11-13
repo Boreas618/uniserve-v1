@@ -1,13 +1,31 @@
-//! The pools a fake worker states, and what a handle over one is built with.
+//! What a fake engine is launched with and what its worker groups state.
 //!
-//! The mechanism builds its whole view of a worker from [`Inventory`]: its ranks, their call kinds
-//! and request rows, and the layout the deployment launched the pool with. A case states its pool
-//! here and the handle derives the rest exactly as it does for a launch.
+//! [`args`] and [`launch`] are a deployment's launch arguments on the CPU, as the daemon writes
+//! them; [`cache`] is the cache a fake engine's ranks hold and [`capacity`] what each of its
+//! worker groups serves, from which the engine's schedulers build their whole view of the groups
+//! (`engine::scheduler::Capacity`), as they do from a rank start's.
+//!
+//! [`rank`] and [`pool`] state the inventory of the batch-interface fake ([`crate::FakeBatches`]).
 
-use ipc::execution::{Batches, Inventory, PoolLayout};
-use ipc::{MainProcessEndpoint, MainProcessInfo};
-use proto::config::{BlockConfig, EngineArgs};
-use scheduler::SchedulerConfig;
+use std::num::NonZeroUsize;
+
+use ipc::batch::{Phase, Shape, Variant};
+use ipc::execution::{Inventory, PoolLayout};
+use ipc::{Capacity, MainProcessEndpoint, MainProcessInfo};
+use proto::config::{BlockConfig, EngineArgs, WorkerGroupConfig};
+use proto::request::{ModelDtype, PrefixCacheDtype};
+use worker::memory::cache::CacheLayout;
+
+/// The tokens of a block of [`cache`].
+pub const BLOCK_TOKENS: u32 = 64;
+
+/// The most calls of a batch the buckets of [`capacity`] hold, and the most tokens of a prefill
+/// batch.
+const BATCH_CALLS: u32 = 16;
+const BATCH_TOKENS: u32 = 512;
+
+/// The longest sequence a fake engine's groups serve, in tokens.
+const MAX_MODEL_LEN: u32 = 4096;
 
 /// One rank of a text pool on `host`: prefill and decode, eight request rows, the batch bounds a
 /// launch states, and the paged KV pool every token-serving rank advertises.
@@ -58,33 +76,51 @@ pub fn pool(group: &str) -> Inventory {
                 },
             )]),
         },
-        max_model_len: 4096,
+        max_model_len: MAX_MODEL_LEN,
     }
 }
 
-/// The launch arguments of a deployment named `name` on the CPU: one pool of one rank on this
-/// host, named as its worker group ([`proto::config::DEFAULT_BLOCK`]), generation limits without a
-/// model-imposed bound, the fake's end of text ([`crate::EOS`]), two batches in flight, and every
-/// other section's default. Pair them with a fake over [`pool`] of `args.group`.
+/// [`launch`] of one scheduler.
 pub fn args(name: &str) -> EngineArgs {
-    launch(name)
+    launch(name, 1)
 }
 
-fn launch(model: impl Into<String>) -> EngineArgs {
-    use std::num::NonZeroUsize;
+/// The launch arguments of a deployment of model `name` on the CPU with `schedulers`
+/// data-parallel schedulers, each over a worker group of one rank on a device of its own on this
+/// host: a text model's generation limits without a model-imposed bound, sequences of up to 4096
+/// tokens, the fake's end of text ([`crate::EOS`]), two batches in flight, the module set's `fcfs` policy, and
+/// every other section's default. The epoch is the first, and the process its daemon's first
+/// engine.
+///
+/// # Panics
+///
+/// For no scheduler.
+pub fn launch(name: &str, schedulers: usize) -> EngineArgs {
     #[expect(
         clippy::expect_used,
         reason = "DEFAULT_MAX_RUNNING_REQUESTS is a positive constant"
     )]
     let max_running_requests =
         NonZeroUsize::new(proto::config::DEFAULT_MAX_RUNNING_REQUESTS).expect("a positive default");
-    let group = proto::config::WorkerGroupConfig::placed(
+    #[expect(clippy::expect_used, reason = "a caller's count of schedulers")]
+    let data_parallel_size = NonZeroUsize::new(schedulers).expect("a deployment of a scheduler");
+
+    // Each group's rank names a device of its own, so the groups' memories are distinct, as on a
+    // host of one GPU per data-parallel scheduler.
+    let mut groups = WorkerGroupConfig::data_parallel(
         &["localhost".to_owned()],
         "cpu",
+        schedulers,
         1,
         2,
-        proto::config::WorkerGroupConfig::single_component(proto::config::DEFAULT_BLOCK, 1),
+        WorkerGroupConfig::single_component(proto::config::DEFAULT_BLOCK, 1),
     );
+    for (index, group) in groups.iter_mut().enumerate() {
+        for rank in &mut group.ranks {
+            rank.device = format!("cpu:{index}");
+        }
+    }
+
     // A fake runs no module: the set names the packages a launch file states.
     let package = |backend: &str| proto::module::PackageRevision {
         backend: backend.to_owned(),
@@ -99,20 +135,22 @@ fn launch(model: impl Into<String>) -> EngineArgs {
     let config = proto::config::EngineConfig {
         executable: proto::BUILD.to_owned(),
         model: proto::config::ModelConfig {
-            model: model.into(),
+            model: name.to_owned(),
             base: None,
             lora_path: None,
-            max_model_len: 0,
-            dtype: scheduler::ModelDtype::BFloat16,
+            max_model_len: MAX_MODEL_LEN,
+            dtype: ModelDtype::BFloat16,
             quantization: Default::default(),
+            // A text model's: it understands, and computes the candidates of every sampled
+            // token's log-probability that `max_logprobs` names.
             generation_limits: proto::request::GenerationLimits {
+                features: proto::request::GenerationFeatures::UNDERSTANDING,
                 max_vae_grid_tokens: u32::MAX,
                 max_vit_grid_tokens: u32::MAX,
                 max_latent_feature_bytes: 256 << 20,
                 max_vision_feature_bytes: 256 << 20,
                 encoder_cache_entries: 256,
                 max_logprobs: 20,
-                ..Default::default()
             },
             bos: 0,
             // The end of text a fake samples (`crate::EOS`), which the scheduler must
@@ -121,9 +159,9 @@ fn launch(model: impl Into<String>) -> EngineArgs {
         },
         parallel: proto::config::ParallelConfig {
             tensor_parallel_size: NonZeroUsize::MIN,
-            data_parallel_size: NonZeroUsize::MIN,
+            data_parallel_size,
             engine_host: "localhost".to_owned(),
-            worker_groups: vec![group.clone()],
+            worker_groups: groups.clone(),
         },
         deployment: format!("deployment-{}", uuid::Uuid::new_v4().simple()),
         max_running_requests,
@@ -133,7 +171,11 @@ fn launch(model: impl Into<String>) -> EngineArgs {
         prefill_attention_backend: None,
         decode_attention_backend: None,
         moe_runner_backend: None,
-        device: Default::default(),
+        // The ranks are no device's: the engine launches nothing on one, and warms nothing.
+        device: proto::config::DeviceConfig {
+            device: "cpu".to_owned(),
+            ..Default::default()
+        },
         scheduler: Default::default(),
         media: Default::default(),
         mem_fraction_static: 0.9,
@@ -149,31 +191,80 @@ fn launch(model: impl Into<String>) -> EngineArgs {
     let mut args = EngineArgs::new(config, modules);
     // A fake keeps no host tier: it has no Storage Server to keep one in.
     args.engine_config.kv_cache.host_tier = false;
+    args.epoch = 1;
+    args.engine = 1;
+    args.scheduler_node = true;
     args.host = "localhost".to_owned();
-    args.group = group.id.0.clone();
-    #[expect(
-        clippy::expect_used,
-        reason = "the group is placed with one rank, which a u32 holds"
-    )]
-    let world_size = u32::try_from(group.ranks.len()).expect("one rank");
-    args.world_size = world_size;
+    args.group = groups[0].id.0.clone();
+    args.world_size = 1;
     args.queue_depth = 2;
     args
 }
 
-/// The mechanism's limits for `batches`: as many running requests as its ranks hold request rows.
+/// The cache a fake engine's ranks hold: one dense attention group of [`BLOCK_TOKENS`]-token
+/// blocks over one layer of one head. Its unit sizes are an accounting figure: no rank holds the
+/// memory.
+pub fn cache() -> CacheLayout {
+    CacheLayout::dense(BLOCK_TOKENS, 1, 1, 64, PrefixCacheDtype::BFloat16)
+}
+
+/// What each worker group of a fake engine of `launch` serves over `cache`, as a rank start
+/// states it of a text model's ranks (`engine::scheduler::Capacity`): prefill and decode, the
+/// launch's request slots in each, the cache's groups seeded by the model's name as by the
+/// weights that compute their pages, the launch's sequences and control tokens, and buckets of up
+/// to 16 calls and of prefills of up to 512 tokens in every variant a token batch chooses among.
 ///
-/// `SchedulerHandle::over_batches` refuses a configuration that asks for more running requests
-/// than the ranks hold rows, so the count is read from the pool rather than restated per case.
-pub fn limits(batches: &dyn Batches) -> SchedulerConfig {
-    let rows: usize = batches
-        .inventory()
+/// # Panics
+///
+/// For a launch of more request slots than the protocol addresses, or of no batch in flight.
+pub fn capacity(launch: &EngineArgs, cache: &CacheLayout) -> Capacity {
+    let config = &launch.engine_config;
+    #[expect(clippy::expect_used, reason = "a fixture's launch states its slots")]
+    let slots = u32::try_from(config.max_running_requests.get()).expect("slots a u32 holds");
+
+    let served = [Phase::Prefill, Phase::Decode];
+    let mut rows = [0; Phase::COUNT];
+    let mut phases = 0;
+    for phase in served {
+        phases |= 1 << phase.index();
+        rows[phase.index()] = slots;
+    }
+
+    let prefills = ipc::capacity::variants(Phase::Prefill)
         .iter()
-        .flat_map(|inventory| &inventory.ranks)
-        .map(|rank| rank.request_slots as usize)
-        .sum();
-    SchedulerConfig {
-        max_running_requests: rows.max(1),
-        ..SchedulerConfig::default()
+        .map(|variant| Shape::prefill(BATCH_CALLS, BATCH_TOKENS, *variant));
+    let decodes = [Variant::DecodeGreedy, Variant::DecodeSampled]
+        .into_iter()
+        .map(|variant| Shape::decode(BATCH_CALLS, variant));
+    #[expect(
+        clippy::expect_used,
+        reason = "a fixture's launch has batches in flight"
+    )]
+    let window = worker::memory::division::call_window(
+        launch.queue_depth.max(1) as usize,
+        BATCH_CALLS as usize,
+    )
+    .expect("positive bounds");
+
+    let seed = storage::key::page_seed(&config.model.model);
+    Capacity {
+        phases,
+        slots,
+        kv_cache: Some(config.kv_cache.clone()),
+        cache_groups: cache
+            .groups
+            .iter()
+            .map(|group| (group.kind, group.block_size))
+            .collect(),
+        seeds: cache.groups.iter().map(|_| seed).collect(),
+        buckets: prefills.chain(decodes).collect(),
+        rows,
+        max_model_len: config.model.max_model_len,
+        denoise_steps: 0,
+        bos_token_id: config.model.bos,
+        eos_token_ids: config.model.eos.clone(),
+        feature_bytes: 0,
+        media_bytes: Vec::new(),
+        call_window: u32::try_from(window).unwrap_or(u32::MAX),
     }
 }

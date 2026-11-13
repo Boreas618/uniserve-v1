@@ -19,8 +19,8 @@
 //!
 //! A batch's output follows the rule of [`crate::FakeBatches`]: a call samples
 //! [`crate::draw_token`] of its last row's draw, and nothing when that row's logits are not
-//! wanted ([`output_of`]). A case varies where text ends, the whole output, which calls fail,
-//! which batches are held, and whether copies fail.
+//! wanted ([`output_of`]). A case varies where text ends, the one token every call samples, the
+//! whole output, which calls fail, which batches are held, and whether copies fail.
 //!
 //! What the fake records answers the scheduler's side of A1 to A4 (`specs/buffer-pool.md` §9,
 //! §17; SD §10, L5). Every breach found is a [`FakeExecutor::violations`] entry:
@@ -119,6 +119,8 @@ struct State {
     checkpoints: Option<u8>,
 
     end: Option<EndOfText>,
+    /// The one token every call samples in place of its draw's.
+    token: Option<u32>,
     /// The tokens each request's text holds, and the position of the first token sampled on each
     /// Philox stream.
     text_len: Option<u64>,
@@ -159,6 +161,7 @@ impl FakeExecutor {
             draft: None,
             checkpoints: None,
             end: None,
+            token: None,
             text_len: None,
             text_starts: HashMap::new(),
             output: None,
@@ -198,6 +201,15 @@ impl FakeExecutor {
     #[must_use]
     pub fn with_end(self, end: EndOfText) -> Self {
         self.lock().end = Some(end);
+        self
+    }
+
+    /// Every call samples `token` in place of its draw's, short of the end of text: a model whose
+    /// sampling a request restricted to one token (`allowed_token_ids`), which a case reads back
+    /// as text.
+    #[must_use]
+    pub fn with_token(self, token: u32) -> Self {
+        self.lock().token = Some(token);
         self
     }
 
@@ -387,9 +399,21 @@ impl State {
         let mut output = output_of(batch, self.end);
 
         for (index, call) in output.calls.iter_mut().enumerate() {
+            let draw = batch.columns.draws.get(sampling_row(batch, index));
+            // The fixed token takes the place of what the draw chose, short of the end of text.
+            let ended = draw
+                .zip(self.end)
+                .is_some_and(|(draw, end)| draw.position >= end.position);
+            if let Some(token) = self.token
+                && !call.tokens.is_empty()
+                && !ended
+            {
+                call.tokens = vec![token];
+                call.token_logprobs = vec![scored(token)];
+            }
             if let Some(tokens) = self.text_len
                 && !call.tokens.is_empty()
-                && let Some(draw) = batch.columns.draws.get(sampling_row(batch, index))
+                && let Some(draw) = draw
             {
                 let start = *self.text_starts.entry(draw.key).or_insert(draw.position);
                 if draw.position >= start.saturating_add(tokens) {
@@ -1364,6 +1388,22 @@ mod tests {
         let fake = fake.with_output(empty);
         fake.submit(batch(13, Phase::Decode, &[(1, 1, Vec::new(), 13)]));
         assert_eq!(output(&messages).1.unwrap(), BatchOutput::default());
+    }
+
+    #[test]
+    fn a_fixed_token_takes_the_draws_place_and_text_still_ends() {
+        let (fake, messages) = fake();
+        let fake = fake.with_token(97).with_text_len(2);
+        let mut tokens = Vec::new();
+        for position in 10..13 {
+            fake.submit(batch(
+                position,
+                Phase::Decode,
+                &[(1, 1, Vec::new(), position)],
+            ));
+            tokens.extend(output(&messages).1.unwrap().calls[0].tokens.clone());
+        }
+        assert_eq!(tokens, vec![97, 97, EOS]);
     }
 
     #[test]

@@ -1,30 +1,33 @@
 //! Fixtures shared by the crate's tests, one each: the byte
-//! tokenizer, in-storage tokenizer loading, the engine over schedulers whose
-//! worker is the batch-interface fake, the video service, and the server's
-//! router.
+//! tokenizer, in-storage tokenizer loading, the engine over fakes below its
+//! schedulers, the video service, and the server's router.
 //!
 //! Requests travel through the server's router (`http::router`) into a real
-//! `Leader`, whose client submits them over the request interface to
-//! production schedulers built over `testkit::FakeBatches` through the
-//! serving door (`SchedulerHandle::over_batches`); the schedulers
-//! serve the interface on a thread of this process (`testkit::serve_requests`),
-//! as an engine process serves it. The default fake serves text alone, so the
-//! engine refuses every video submission as an invalid request.
+//! `Leader`, whose client submits them over the request interface to the
+//! engine's own control thread and schedulers (`engine::serve`), run on a
+//! thread of this process over socket pairs; below the schedulers, the
+//! executors and the buffer pool are fakes (`testkit::engine`). The default
+//! fake serves text alone, so the engine refuses every video submission as an
+//! invalid request. The fake engine holds no rank: an operation on the ranks
+//! answers with no rank's result, and one on the KV cache's segments (sleep,
+//! wake, making room, a weight update) is refused, since the engine holds no
+//! session with a Storage Server whose segments it would change.
 
 use std::collections::{BTreeSet, HashMap};
-use std::os::unix::net::UnixStream;
 use std::sync::Arc;
+use std::time::Instant;
 
 use axum::Router;
 use axum::body::Body;
 use axum::extract::Request;
 use axum::http::{HeaderMap, StatusCode};
-use scheduler::SchedulerHandle;
-use testkit::FakeBatches;
+use proto::config::EngineArgs;
+use proto::request::wire;
+use testkit::{FakeExecutor, Fixture};
 use tokio_util::sync::CancellationToken;
 use tower::ServiceExt as _;
 
-use crate::engine::client::{EngineClient, EngineInfo};
+use crate::engine::client::EngineClient;
 use crate::leader::Leader;
 use crate::options::ChatTemplateContentFormat;
 use crate::options::{ImageFetchConfig, LoggingConfig, ServerArgs, ServerConfig, VideoJobConfig};
@@ -98,24 +101,19 @@ pub(crate) fn harness_router(engine: impl Into<Arc<Leader>>) -> Router {
     crate::http::admin::harness_router(admin_state(engine))
 }
 
-/// Builds an engine for a model of `family` over one default fake
-/// ([`text_fake`]).
+/// Builds an engine for a model of `family` over the default fake
+/// ([`text_fake`]) of one scheduler.
 ///
 /// The tokenizer is [`configured_tokenizer`], whose
 /// `<|im_end|>` (ID 2) is the end-of-sequence token, and the chat template
 /// renders only the first message's content. A MiniMax H3 model serves the
 /// API's longest duration capacity, as a default video deployment does.
 pub(crate) fn served_engine(family: processing::Family) -> Leader {
-    let model = test_model(family);
-    engine_over(
-        model,
-        configured_tokenizer(),
-        vec![serving_core(SERVED_MODEL)],
-    )
+    engine_of(family, testkit::args(SERVED_MODEL), Fixture::new(text_fake))
 }
 
 /// How many tokens a default fake's request generates before its end of text,
-/// wherever its prompt ends ([`FakeBatches::with_text_len`]).
+/// wherever its prompt ends ([`FakeExecutor::with_text_len`]).
 pub(crate) const TEXT_LEN: u64 = 8;
 
 /// The token every default fake samples: `a` of [`configured_tokenizer`], which
@@ -123,204 +121,182 @@ pub(crate) const TEXT_LEN: u64 = 8;
 /// back as text.
 pub(crate) const LETTER: u32 = b'a' as u32;
 
-/// The default fake of a deployment launched with `args`: one text pool of the
-/// launch's group sampling [`LETTER`], each request's text ending after
+/// The default fake: it samples [`LETTER`], and each request's text ends after
 /// [`TEXT_LEN`] tokens.
-pub(crate) fn text_fake(args: &proto::config::EngineArgs) -> Arc<FakeBatches> {
-    Arc::new(letter_fake(args).with_text_len(TEXT_LEN))
+pub(crate) fn text_fake(fake: FakeExecutor) -> FakeExecutor {
+    letter_fake(fake).with_text_len(TEXT_LEN)
 }
 
-/// A fake of the launch `args`'s group sampling [`LETTER`] whose text never
-/// ends: a request generates until its own limit.
-pub(crate) fn letter_fake(args: &proto::config::EngineArgs) -> FakeBatches {
-    FakeBatches::new(vec![testkit::pool(&args.group)]).with_tokens(testkit::Tokens::Fixed(LETTER))
+/// A fake sampling [`LETTER`] whose text never ends: a request generates until
+/// its own limit.
+pub(crate) fn letter_fake(fake: FakeExecutor) -> FakeExecutor {
+    fake.with_token(LETTER)
 }
-
-/// A scheduler of a deployment of model `name` over its default fake.
-pub(crate) fn serving_core(name: &str) -> SchedulerHandle {
-    let args = testkit::args(name);
-    let fake = text_fake(&args);
-    fake_core(args, fake)
-}
-
-/// Starts a scheduler of the launch `args` over `fake` through the serving
-/// door, as an engine process starts one per rank, with the epoch's policy
-/// installed ([`policy_on`]): a scheduler with no policy decides nothing, and a
-/// fixture's engine has no Build Server to give it one.
-pub(crate) fn fake_core(
-    args: proto::config::EngineArgs,
-    fake: Arc<FakeBatches>,
-) -> SchedulerHandle {
-    let limits = testkit::limits(fake.as_ref());
-    let core = SchedulerHandle::over_batches(
-        &args,
-        limits,
-        fake as Arc<dyn ipc::execution::Batches>,
-        scheduler::CommandWaker::noop(),
-    )
-    .expect("start a scheduler over the fake");
-    policy_on(&core);
-    core
-}
-
-/// Installs the tree's `fcfs` policy on `core` through the mechanism's own
-/// steps: the policy's preparation, then the switch at a batch
-/// boundary.
-///
-/// A deployed scheduler takes its policy from the Build Server while its
-/// epoch starts; a fixture's has none, so every fixture that submits a
-/// request needs this. The package is the real module this tree builds, with
-/// the arguments of `core`'s own batch capacity — the limits it declares fit
-/// the ceilings the mechanism checks them against, so the preparation
-/// succeeds rather than meeting a refusal that would hide behind a fixture.
-///
-/// Requires `SCHED_POLICY_WASM`; see [`testkit::packaged_policy`], whose panic
-/// states the command that builds the module.
-pub(crate) fn policy_on(core: &SchedulerHandle) {
-    let capacity = scheduler::BatchCapacity::of(core.info());
-    let (package, module) = packaged_policy(capacity);
-    let source: std::sync::Arc<dyn scheduler::PolicySource + Send + Sync> =
-        std::sync::Arc::new(scheduler::PolicyBytes::new(module));
-    core.prepare_policy(package, source)
-        .recv_timeout(POLICY_RESPONSE)
-        .expect("the policy's preparation responds within the bound")
-        .expect("the packaged policy's limits fit the scheduler's capacity");
-    core.switch_policy()
-        .recv_timeout(POLICY_RESPONSE)
-        .expect("the switch responds within the bound")
-        .expect("the switch applies at the next batch boundary");
-    // A scheduler that fatal-stops leaves its handle dead, and a dead handle is what
-    // an engine reports as "no live scheduler returned the state the route policy is
-    // instantiated on" - a sentence about the wrong subject. Its own reason is here,
-    // and standard error is where a test run carries it.
-    if let Some(reason) = core.failure() {
-        eprintln!("the scheduler stopped after its policy was installed: {reason}");
-    }
-}
-
-/// How long a fixture waits for a response it cannot proceed without.
-///
-/// A scheduler that does not respond must state that, not hang: an unbounded
-/// `recv` in a fixture is a suite that stops with no line saying which response it
-/// never got, which is exactly how a 53-second run became a 42-minute one.
-pub(crate) const POLICY_RESPONSE: std::time::Duration = std::time::Duration::from_secs(120);
 
 /// How long the packaged policy module may take to be built on first use.
 ///
 /// The build runs `cargo` inside the test process, so it can wait on a package
 /// cache another cargo holds. Its own name is what says so: without a bound the
 /// fixture looks like a deadlock in the daemon.
-pub(crate) const POLICY_BUILD: std::time::Duration = std::time::Duration::from_secs(600);
+const POLICY_BUILD: std::time::Duration = std::time::Duration::from_secs(600);
 
-/// [`testkit::packaged_policy`] under a bound, so a stalled build names itself.
+/// Builds the packaged policy module a test engine's schedulers instantiate
+/// ([`testkit::packaged_module`]) under a bound, so a stalled build names
+/// itself; the engines' starts then load it built.
 ///
 /// The build is blocking and its thread cannot be cancelled; the thread is left
 /// to finish rather than joined, which is what a test fixture can do and a
 /// service cannot.
-pub(crate) fn packaged_policy(
-    capacity: scheduler::BatchCapacity,
-) -> (scheduler::PolicyPackage, Vec<u8>) {
-    let (built, package) = std::sync::mpsc::channel();
+fn build_policy() {
+    let (built, module) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
-        let _ = built.send(testkit::packaged_policy(capacity));
+        let _ = built.send(testkit::packaged_module());
     });
-    package.recv_timeout(POLICY_BUILD).unwrap_or_else(|_| {
+    if module.recv_timeout(POLICY_BUILD).is_err() {
         panic!(
-            "the fcfs policy module was not built within {} s: a cargo build inside this              process is waiting on a package cache or a wasm32 toolchain another process holds.              Set SCHED_POLICY_WASM to a module built with `cargo build -p scheduling-policy-fcfs              --target wasm32-unknown-unknown --release` to run without the build.",
+            "the fcfs policy module was not built within {} s: a cargo build inside this \
+             process is waiting on a package cache or a wasm32 toolchain another process holds. \
+             Set SCHED_POLICY_WASM to a module built with `cargo build -p scheduling-policy-fcfs \
+             --target wasm32-unknown-unknown --release` to run without the build.",
             POLICY_BUILD.as_secs()
         )
-    })
+    }
 }
 
-/// Builds an engine for a model of `family` over started schedulers,
-/// one per data-parallel rank; see [`served_engine`].
-pub(crate) fn engine_of(family: processing::Family, cores: Vec<SchedulerHandle>) -> Leader {
-    engine_over(test_model(family), configured_tokenizer(), cores)
+/// Builds an engine for a model of `family` over the engine of `launch` and
+/// `fixture` ([`fake_engine`]); see [`served_engine`].
+pub(crate) fn engine_of(
+    family: processing::Family,
+    launch: EngineArgs,
+    fixture: Fixture,
+) -> Leader {
+    engine_over(test_model(family), configured_tokenizer(), launch, fixture)
 }
 
-/// A client of `cores`, which serve the request interface on a thread of
-/// this process over a socket pair, labelling their statistics with their
-/// model.
-pub(crate) fn fake_client(cores: Vec<SchedulerHandle>) -> EngineClient {
-    fake_engine(cores).0
+/// A client of the engine of `launch` over the fakes of `fixture`
+/// ([`fake_engine`]).
+pub(crate) fn fake_client(launch: EngineArgs, fixture: Fixture) -> EngineClient {
+    fake_engine(launch, fixture).0
 }
 
-/// [`fake_client`], with the fake engine's process link: the commands a test
-/// sends it as its daemon (`Drain`, `Promote`), and the reports it sends
-/// back.
+/// A client of the engine of `launch`, whose start builds it over the fakes of
+/// `fixture` (`testkit::fake_start`), with the engine's process link: the
+/// commands a test sends it as its daemon (`Drain`, `Promote`), and the reports
+/// it sends back. The engine runs its control thread on a thread of this
+/// process (`testkit::spawn`); the client welcomes it as this daemon's engine
+/// control does ([`crate::engine::control::welcome`]) and is made once its
+/// start ended, labelling its statistics with its model.
+///
+/// The engine ends once the client and the commands are dropped: its daemon
+/// closed both of its interfaces.
 pub(crate) fn fake_engine(
-    cores: Vec<SchedulerHandle>,
+    launch: EngineArgs,
+    fixture: Fixture,
 ) -> (
     EngineClient,
     std::sync::mpsc::Sender<proto::process::Command>,
     std::sync::mpsc::Receiver<proto::process::Report>,
 ) {
-    let state = if cores.iter().any(SchedulerHandle::starts_on_trial) {
-        crate::engine::client::EngineState::Parked
-    } else {
-        crate::engine::client::EngineState::Serving
-    };
-    let (commands, commanded) = std::sync::mpsc::channel();
-    let (reports, reported) = std::sync::mpsc::channel();
-    let link = testkit::ProcessLink {
-        commands: commanded,
-        reports,
-    };
-    let first = &cores[0];
-    let info = EngineInfo {
-        limits: first.generation_limits(),
-        video_denoiser: first
-            .info()
-            .video_denoiser
-            .as_ref()
-            .map(|denoiser| denoiser.description.clone())
-            .unwrap_or_default(),
-        latent_encoding_units: first
-            .media_units(ipc::MediaCall::LatentEncoding)
-            .unwrap_or(0),
-        schedulers: cores.len() as u32,
-        segments: Vec::new(),
-        prefix_seeds: Vec::new(),
-        capacity: None,
-        latent_seed: 0,
-    };
-    let model_name = first.model_name().to_owned();
-    // The control thread routes every submission by an instance of the same
-    // package the schedulers carry: `policy_on` installed it on each core, and
-    // the engine installs it here for the route. Without one the engine has no
-    // policy to route a request with and refuses every submission.
-    let policy = {
-        let (package, module) = packaged_policy(scheduler::BatchCapacity::of(first.info()));
-        testkit::EpochPolicy {
-            package,
-            module: std::sync::Arc::new(scheduler::PolicyBytes::new(module)),
+    build_policy();
+    let engine = launch.engine;
+    let model_name = launch.engine_config.model.model.clone();
+    let (mut reader, process, _) =
+        testkit::spawn(launch, testkit::fake_start(fixture)).expect("start the test's engine");
+
+    // The daemon's half of the handshake, then the state the start ends in.
+    let mut writer = reader.writer().expect("a write half of the request link");
+    let hello: wire::Hello = reader
+        .recv(STALL)
+        .expect("the request link reads")
+        .expect("the engine says hello in time");
+    crate::engine::control::welcome(&mut writer, &hello, engine).expect("the engine is welcome");
+    let deadline = Instant::now() + STALL;
+    let (info, state) = loop {
+        let left = deadline.saturating_duration_since(Instant::now());
+        assert!(
+            !left.is_zero(),
+            "the test's engine did not end its start within {} s",
+            STALL.as_secs()
+        );
+        let frame: Option<wire::FromEngine> = reader.recv(left).expect("the request link reads");
+        if let Some(wire::FromEngine {
+            kind: Some(wire::from_engine::Kind::State(state)),
+        }) = frame
+            && let Some(started) =
+                crate::engine::control::start_state(state).expect("the engine starts")
+        {
+            break started;
         }
     };
-    let (daemon, engine) = UnixStream::pair().expect("a socket pair");
-    std::thread::Builder::new()
-        .name("fake-engine".into())
-        .spawn(move || {
-            if let Err(error) = testkit::serve_engine(engine, cores, Some(policy), link) {
-                // An engine stand-in that ends is the whole of a test's failure and
-                // otherwise leaves no line: the client reports only that its process
-                // ended, and the reason - a frame the engine refused, a scheduler that
-                // did not respond - is lost with the thread. Standard error, so a test
-                // run with `--nocapture` carries it beside the assertion.
-                eprintln!("the engine stand-in ended: {error:#}");
-            }
-        })
-        .expect("start the engine stand-in");
+
+    let (commands, reports) = process_link(process);
     let client = EngineClient::new(
-        proto::Connection::from_unix(daemon.try_clone().expect("clone the request socket"))
-            .expect("a reader"),
-        proto::Connection::from_unix(daemon).expect("a writer"),
+        reader,
+        writer,
         info,
         state,
         crate::leader::stats_sink(model_name, std::sync::Arc::default(), 0),
         None,
     )
     .expect("a client");
-    (client, commands, reported)
+    (client, commands, reports)
+}
+
+/// The daemon's end of an engine's process interface `connection`, as a test
+/// plays it: each command sent on the returned sender is written as the
+/// daemon's `Command` event, and each report the engine writes is received on
+/// the returned receiver. The interface closes once the sender is dropped.
+fn process_link(
+    connection: proto::Connection,
+) -> (
+    std::sync::mpsc::Sender<proto::process::Command>,
+    std::sync::mpsc::Receiver<proto::process::Report>,
+) {
+    use proto::process::{Downstream, Event, Upstream, downstream, event, upstream};
+
+    let (commands, commanded) = std::sync::mpsc::channel::<proto::process::Command>();
+    let (reports, reported) = std::sync::mpsc::channel();
+    let mut writer = connection
+        .writer()
+        .expect("a write half of the process interface");
+    std::thread::Builder::new()
+        .name("process-commands".into())
+        .spawn(move || {
+            for command in commanded {
+                let sent = writer.send(&Downstream {
+                    kind: Some(downstream::Kind::Event(Event {
+                        kind: Some(event::Kind::Command(command)),
+                    })),
+                });
+                if sent.is_err() {
+                    break;
+                }
+            }
+            // The daemon closes the interface both ways, which ends the reader
+            // below as well as the engine's.
+            writer.close();
+        })
+        .expect("start the process interface's writer");
+
+    let mut reader = connection;
+    std::thread::Builder::new()
+        .name("process-reports".into())
+        .spawn(move || {
+            loop {
+                match reader.recv::<Upstream>(STALL) {
+                    Ok(Some(Upstream {
+                        kind: Some(upstream::Kind::Report(report)),
+                    })) => {
+                        // A test that let go of the reports reads none of them.
+                        let _ = reports.send(report);
+                    }
+                    Ok(_) => {}
+                    Err(_) => return,
+                }
+            }
+        })
+        .expect("start the process interface's reader");
+    (commands, reported)
 }
 
 /// The test model's facts.
@@ -334,16 +310,18 @@ pub(crate) fn test_model(family: processing::Family) -> ModelConfig {
     }
 }
 
-/// Serves `model` with `tokenizer` over `cores` without request or stats
-/// logging. A video model serves [`test_video_service`]; a chat model
-/// renders chat requests with a template of the first message's content.
+/// Serves `model` with `tokenizer` over the engine of `launch` and `fixture`
+/// ([`fake_engine`]) without request or stats logging. A video model serves
+/// [`test_video_service`]; a chat model renders chat requests with a template
+/// of the first message's content.
 pub(crate) fn engine_over(
     model: ModelConfig,
     tokenizer: DynTokenizer,
-    cores: Vec<SchedulerHandle>,
+    launch: EngineArgs,
+    fixture: Fixture,
 ) -> Leader {
-    let model_name = cores[0].model_name().to_owned();
-    let client = std::sync::Arc::new(fake_client(cores));
+    let model_name = launch.engine_config.model.model.clone();
+    let client = std::sync::Arc::new(fake_client(launch, fixture));
     leader_over(model, tokenizer, model_name, vec![client])
 }
 

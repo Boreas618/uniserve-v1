@@ -1080,8 +1080,7 @@ mod tests {
     /// GPUs; and an epoch whose engine is gone is unavailable.
     #[tokio::test(flavor = "multi_thread")]
     async fn the_status_reports_the_executing_engine_and_one_that_is_gone() {
-        let core = crate::test_support::serving_core(crate::test_support::SERVED_MODEL);
-        let leader = crate::test_support::engine_of(crate::test_support::CHAT, vec![core]);
+        let leader = crate::test_support::served_engine(crate::test_support::CHAT);
         let replica = Arc::clone(&leader.replicas()[0]);
         let client = replica.hold().client().expect("the replica serves");
         let epoch = client.epoch();

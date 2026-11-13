@@ -1,18 +1,22 @@
-//! The policy source a test epoch installs.
+//! The policy a test engine's schedulers instantiate.
 //!
-//! A deployed epoch takes its policy from the Build Server; a test epoch has none, and a
-//! scheduler with no policy decides nothing — no output, no admission, no batch — so an epoch that
-//! submits a request must be given a module. [`packaged_policy`] is that source: the real `fcfs`
-//! package this tree builds, with the arguments that make its declared limits fit the capacity the
-//! caller's epoch was built for. It installs through the same preparation and switch a deployment
-//! uses, so a caller's fixtures exercise the mechanism rather than a stand-in for it, and there is
-//! no second policy in the tree to keep honest.
+//! A deployed engine takes its policy from the Build Server; a test engine has none, and a
+//! scheduler with no policy decides nothing (no output, no admission, no batch), so an engine that
+//! serves a request must be given a module. [`packaged_policy`] is that module: the real `fcfs`
+//! package this tree builds, with the arguments that make its declared limits fit the ceilings of
+//! the groups the engine's schedulers serve (`engine::scheduler::ceilings`). Every scheduler
+//! instantiates it as it instantiates a deployment's, so a caller's fixtures exercise the
+//! mechanism rather than a stand-in for it, and there is no second policy in the tree to keep
+//! honest.
 
-use scheduler::{BatchCapacity, Limits, Parameters, PolicyPackage, ceilings_of};
+use std::sync::Arc;
 
-/// The arguments that state `limits` as a package's parameters: every limit a deployment can
+use anyhow::Result;
+use scheduling_guest::{Limits, Parameters};
+
+/// The arguments that state `limits` as the policy's parameters: every limit a deployment can
 /// state.
-fn parameters_of(limits: Limits) -> Parameters {
+fn parameters_of(limits: &Limits) -> Parameters {
     Parameters {
         chunked_prefill_size: Some(limits.chunked_prefill_size),
         max_queued_requests: limits.max_queued_requests,
@@ -24,25 +28,30 @@ fn parameters_of(limits: Limits) -> Parameters {
     }
 }
 
-/// The `fcfs` policy module this tree builds, and the package that names it: the source a caller
-/// installs through the real preparation and switch.
-///
-/// The package is [`packaged_revision`]`(capacity)`, so the limits it declares fit any fixture's
-/// build config and the mechanism's check of a policy's limits against the ceilings cannot refuse
-/// it. The module is [`packaged_module`].
-pub fn packaged_policy(capacity: BatchCapacity) -> (PolicyPackage, Vec<u8>) {
-    (packaged_revision(capacity), packaged_module())
+/// The arguments `fcfs` runs under in an engine whose groups' captured buckets bound it by
+/// `ceilings` (`engine::scheduler::ceilings`): they state the ceilings themselves, so the limits
+/// the module declares are the ones a scheduler checks a policy against and cannot be refused.
+pub fn packaged_arguments(ceilings: &Limits) -> Parameters {
+    parameters_of(ceilings)
 }
 
-/// The package `fcfs` revision one runs under for an epoch of `capacity`: arguments that state
-/// [`ceilings_of`]`(capacity)`, the ceilings the mechanism checks a policy's declaration against.
-pub fn packaged_revision(capacity: BatchCapacity) -> PolicyPackage {
-    PolicyPackage {
-        backend: "fcfs".to_owned(),
-        revision: 1,
-        arguments: parameters_of(ceilings_of(capacity)),
-        stated: std::collections::BTreeMap::new(),
-    }
+/// [`packaged_module`] loaded for a scheduler's policy engine, with [`packaged_arguments`] of
+/// `ceilings`: the policy `engine::Engine::new` instantiates on every scheduler and, with several,
+/// the route.
+///
+/// # Errors
+///
+/// When this host has no policy engine, or the module does not load.
+///
+/// # Panics
+///
+/// As [`packaged_module`].
+pub fn packaged_policy(ceilings: &Limits) -> Result<(Arc<wasmtime::Module>, Parameters)> {
+    let engine = scheduling::Engine::new().map_err(|error| anyhow::anyhow!("{error}"))?;
+    let module = engine
+        .load(&packaged_module())
+        .map_err(|error| anyhow::anyhow!("loading the fcfs policy module: {error}"))?;
+    Ok((Arc::new(module), packaged_arguments(ceilings)))
 }
 
 /// The `fcfs` module this tree builds for `wasm32-unknown-unknown`, precompiled for this host,
@@ -120,29 +129,24 @@ fn build_packaged_module() -> Vec<u8> {
 mod tests {
     use super::*;
 
-    /// The capacity of a pool the tests build their scheduler for.
-    fn capacity() -> BatchCapacity {
-        BatchCapacity {
-            max_batch: 8,
-            max_num_batched_tokens: 1024,
+    /// The ceilings of groups whose buckets hold `calls` calls and prefills of `tokens` tokens.
+    fn ceilings(calls: usize, tokens: u32) -> Limits {
+        Limits {
+            chunked_prefill_size: tokens,
+            max_batch: calls,
+            max_num_batched_tokens: tokens,
+            ..Limits::default()
         }
     }
 
     #[test]
-    fn the_packaged_package_states_limits_the_build_config_allows() {
-        let package = packaged_revision(capacity());
-        assert_eq!(package.backend, "fcfs", "the module is this tree's fcfs");
-        assert_eq!(package.revision, 1);
-        assert!(
-            package.stated.is_empty(),
-            "no argument is stated, so a Build Server resolves none for it"
-        );
+    fn the_packaged_arguments_state_limits_the_ceilings_allow() {
+        let ceilings = ceilings(8, 1024);
 
         // The arguments state the ceilings themselves, so the limits the module declares are the
-        // ones the mechanism checks a policy against and cannot be refused for an epoch of this
-        // capacity.
-        let limits = Limits::from_parameters(&package.arguments);
-        let ceilings = ceilings_of(capacity());
+        // ones the mechanism checks a policy against and cannot be refused for an engine of these
+        // ceilings.
+        let limits = Limits::from_parameters(&packaged_arguments(&ceilings));
         assert_eq!(limits.max_batch, ceilings.max_batch);
         assert_eq!(
             limits.max_num_batched_tokens,
@@ -154,19 +158,16 @@ mod tests {
     }
 
     #[test]
-    fn an_epoch_built_for_fewer_calls_states_fewer() {
-        // `fcfs`'s own default declares 128 calls, which a test epoch built for two would be
-        // refused for: the package's arguments are what make the declaration fit.
-        let small = packaged_revision(BatchCapacity {
-            max_batch: 2,
-            max_num_batched_tokens: 64,
-        });
-        assert_eq!(small.arguments.max_batch, Some(2));
-        assert_eq!(small.arguments.max_num_batched_tokens, Some(64));
+    fn an_engine_of_fewer_calls_states_fewer() {
+        // `fcfs`'s own default declares 128 calls, which an engine whose buckets hold two would
+        // be refused for: the arguments are what make the declaration fit.
+        let small = packaged_arguments(&ceilings(2, 64));
+        assert_eq!(small.max_batch, Some(2));
+        assert_eq!(small.max_num_batched_tokens, Some(64));
         assert_eq!(
-            Limits::from_parameters(&small.arguments).max_batch,
+            Limits::from_parameters(&small).max_batch,
             2,
-            "the module declares what this package states, not the package default"
+            "the module declares what the arguments state, not the package default"
         );
     }
 }

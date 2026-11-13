@@ -5,13 +5,12 @@ edition.workspace = true
 license.workspace = true
 publish = false
 
-# Test support shared by the scheduler's and the daemon's tests: the one test
-# double at the worker's batch interface (`ipc::execution::Batches`), the
-# pools it states, the stand-in of an engine's request interface the daemon's
-# tests serve over it, and the policy module a test epoch installs; for the
-# engine's scheduler (in the engine's library), the fake executor of its worker
-# groups and the Storage Server's buffer pool served in the test's process.
-# Never a dependency of a serving build.
+# Test support for the engine's scheduler and control thread and their callers: the fake
+# executor of the scheduler's worker groups and the Storage Server's buffer pool served in the
+# test's process, the fake engine that runs the engine's own control thread over them for the
+# daemon's tests, the policy module a test engine instantiates, the fake engine at the process
+# interface, and the batch-interface fake (`ipc::execution::Batches`) with the inventory it
+# states. Never a dependency of a serving build.
 [dependencies]
 anyhow.workspace = true
 crossbeam-channel.workspace = true
@@ -21,19 +20,19 @@ ipc.workspace = true
 libc.workspace = true
 storage.workspace = true
 storage-server.workspace = true
+# The policy engine a test engine's policy module is loaded with, and the policy's parameters
+# and limits.
 scheduling.workspace = true
-serde_json.workspace = true
-tokio.workspace = true
-tracing.workspace = true
+scheduling-guest.workspace = true
 uuid.workspace = true
 proto.workspace = true
 tempfile.workspace = true
-scheduler.workspace = true
+# The runtime of the policy module a test engine's schedulers instantiate.
+wasmtime.workspace = true
+# The cache layout a fake engine's session is laid out for.
+worker.workspace = true
 
 [dev-dependencies]
-# The scheduling policy's parameters and snapshot, which the scheduler's suite builds its policy
-# from.
-scheduling-guest.workspace = true
 # The policy modules the scheduler's suite states as WebAssembly text.
 wasmtime = { workspace = true, features = ["wat"] }
 

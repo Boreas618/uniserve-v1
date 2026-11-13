@@ -659,7 +659,7 @@ mod tests {
 
     use super::*;
     use crate::engine::client::EngineClient;
-    use crate::test_support::{SERVED_MODEL, fake_core, letter_fake};
+    use crate::test_support::{SERVED_MODEL, letter_fake};
 
     /// A text request of a four-token prompt that generates `max_tokens`
     /// tokens.
@@ -692,10 +692,10 @@ mod tests {
         Arc<EngineClient>,
         std::sync::mpsc::Sender<proto::process::Command>,
     ) {
-        let args = testkit::args(SERVED_MODEL);
-        let fake = Arc::new(letter_fake(&args));
-        let (client, commands, _reports) =
-            crate::test_support::fake_engine(vec![fake_core(args, fake)]);
+        let (client, commands, _reports) = crate::test_support::fake_engine(
+            testkit::args(SERVED_MODEL),
+            testkit::Fixture::new(letter_fake),
+        );
         (Arc::new(client), commands)
     }
 

@@ -856,17 +856,23 @@ mod tests {
         assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
     }
 
-    /// A sleeping deployment holds new requests and serves them once it
-    /// wakes, and its status says it sleeps. The engine's own worker hooks
-    /// run through their endpoints alone.
+    /// A sleep the engine does not take fails by name, and the deployment
+    /// holds new requests from the sleep on, as it does while the engine
+    /// sleeps; a wake the engine does not take fails the same way, and the
+    /// requests keep waiting. The test engine takes neither: it holds no
+    /// session with a Storage Server whose KV cache segments a sleep gives
+    /// back and a wake creates again.
     #[tokio::test]
-    async fn a_sleeping_deployment_serves_once_it_wakes() {
+    async fn a_sleep_the_engine_does_not_take_fails_and_holds_requests() {
         let app = daemon_routers(served_engine(crate::test_support::CHAT));
         let (status, _, body) = send(&app, post_json("/admin/sleep", &json!({}))).await;
         assert_eq!(
             (status, &body["state"]),
-            (StatusCode::OK, &json!("succeeded"))
+            (StatusCode::INTERNAL_SERVER_ERROR, &json!("failed")),
+            "{body}"
         );
+        let error = body["error"].as_str().unwrap_or_default();
+        assert!(error.contains("the engine did not sleep"), "{body}");
         let (_, _, body) = send(&app, get_request("/admin/status")).await;
         assert_eq!(
             (&body["deployment"]["asleep"], &body["deployment"]["paused"]),
@@ -886,25 +892,28 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(100)).await;
         assert!(
             !waiting.is_finished(),
-            "a sleeping deployment holds requests"
+            "a deployment put to sleep holds requests"
         );
         let (status, _, body) = send(&app, post_json("/admin/wake_up", &json!({}))).await;
         assert_eq!(
             (status, &body["state"]),
-            (StatusCode::OK, &json!("succeeded"))
+            (StatusCode::INTERNAL_SERVER_ERROR, &json!("failed")),
+            "{body}"
         );
-        let (status, _, _) = waiting.await.unwrap();
-        assert_eq!(status, StatusCode::OK);
-        let (_, _, body) = send(&app, get_request("/admin/status")).await;
-        assert_eq!(
-            (&body["deployment"]["asleep"], &body["deployment"]["paused"]),
-            (&json!(false), &json!(false))
+        let error = body["error"].as_str().unwrap_or_default();
+        assert!(error.contains("the engine did not wake"), "{body}");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(
+            !waiting.is_finished(),
+            "the requests wait while the engine did not wake"
         );
+        waiting.abort();
     }
 
     /// A profiling session runs on every worker until the operator ends it,
     /// one at a time; its status reports each worker's collectors and, once
-    /// it ended, why and each worker's file.
+    /// it ended, why and each worker's file. The test engine holds no rank:
+    /// no worker runs a collector or writes a file.
     #[tokio::test]
     async fn a_profiling_session_runs_until_the_operator_ends_it() {
         let app = daemon_routers(served_engine(crate::test_support::CHAT));
@@ -921,11 +930,7 @@ mod tests {
         assert_eq!(status, StatusCode::OK, "{body}");
         let session = &body["result"];
         assert_eq!(session["state"], json!("running"), "{body}");
-        // The simulated worker has no device: it runs no collector.
-        assert_eq!(
-            session["workers"][0]["collectors"]["timeline"],
-            json!("unavailable: the simulated worker has no device")
-        );
+        assert_eq!(session["workers"], json!([]));
         assert_eq!(session["collectors"], json!([]));
 
         // One session at a time.
@@ -942,7 +947,7 @@ mod tests {
             (&json!("ended"), &json!("operator")),
             "{body}"
         );
-        assert_eq!(ended["files"][0]["reason"], json!("operator"));
+        assert_eq!(ended["files"], json!([]));
         let (status, _, _) = send(&app, delete_request("/admin/profile")).await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
     }
@@ -982,16 +987,40 @@ mod tests {
         }
     }
 
-    /// A loaded LoRA adapter is listed and served under its name until it
-    /// is unloaded; a name is loaded once, and the served model's name is
-    /// no adapter's.
+    /// A LoRA adapter's checkpoint: one tensor in a safetensors file of a
+    /// directory of its own, its header padded to a multiple of eight bytes as
+    /// the format states.
+    fn adapter_checkpoint() -> tempfile::TempDir {
+        let directory = tempfile::tempdir().expect("an adapter directory");
+        let mut header =
+            r#"{"lora_A.weight":{"dtype":"F32","shape":[1],"data_offsets":[0,4]}}"#.to_owned();
+        header.push_str(&" ".repeat(header.len().next_multiple_of(8) - header.len()));
+
+        let mut file = (header.len() as u64).to_le_bytes().to_vec();
+        file.extend_from_slice(header.as_bytes());
+        file.extend_from_slice(&1.0_f32.to_le_bytes());
+        std::fs::write(directory.path().join("adapter.safetensors"), file)
+            .expect("an adapter checkpoint");
+        directory
+    }
+
+    /// A loaded LoRA adapter is listed under its name until it is unloaded; a
+    /// name is loaded once, and the served model's name is no adapter's. A
+    /// request that names a loaded adapter is refused rather than answered by
+    /// the base model, since no kernel package computes with an adapter
+    /// (`docs/admin.md`, "LoRA adapters"), and one that names an unloaded
+    /// adapter names no model. The test engine holds no rank, which loads it.
     #[tokio::test]
     async fn a_loaded_adapter_is_served_under_its_name_until_unloaded() {
         let app = daemon_routers(served_engine(crate::test_support::CHAT));
-        let adapter = json!({"lora_name": "tuned", "lora_path": "/adapters/tuned"});
+        let checkpoint = adapter_checkpoint();
+        let adapter = json!({"lora_name": "tuned", "lora_path": checkpoint.path()});
         let (status, _, body) = send(&app, post_json("/admin/load_lora_adapter", &adapter)).await;
-        assert_eq!(status, StatusCode::OK, "{body}");
-        assert_eq!(body["result"]["results"], json!([{"adapter": 1}]));
+        assert_eq!(
+            (status, &body["state"]),
+            (StatusCode::OK, &json!("succeeded")),
+            "{body}"
+        );
         let (status, _, _) = send(&app, post_json("/admin/load_lora_adapter", &adapter)).await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
         let (status, _, _) = send(
@@ -1015,8 +1044,12 @@ mod tests {
         let mut request = chat_body(2, false);
         request["model"] = json!("tuned");
         let (status, _, body) = send(&app, post_json("/v1/chat/completions", &request)).await;
-        assert_eq!(status, StatusCode::OK, "{body}");
-        assert_eq!(body["model"], json!("tuned"));
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert_eq!(
+            body["error"]["type"],
+            json!("invalid_request_error"),
+            "{body}"
+        );
 
         let (status, _, body) = send(
             &app,

@@ -27,6 +27,7 @@ pub mod storage_client;
 mod support;
 
 pub use catalogue::resolve;
+pub use process::ranks::text_layout;
 pub use process::record::{Recorded, record};
 pub use process::{Engine, Start, connect, run, serve};
 pub use scheduler::Error;

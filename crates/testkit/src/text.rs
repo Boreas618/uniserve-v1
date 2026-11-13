@@ -1,5 +1,4 @@
-//! What a fake's text model samples beyond its draws: an end of text, and the control tokens a
-//! scheduler over it names.
+//! What a fake's text model samples beyond its draws: an end of text.
 //!
 //! A device sampler's choice depends on the request's Philox stream and the sampled position
 //! alone ([`crate::draw_token`]). A text that ends is the same rule with one more fact: every
@@ -7,10 +6,8 @@
 //! where a request's text ends in the logical positions the mechanism writes, a prompt of `p`
 //! tokens sampling its `n`-th token at position `p + n`.
 
-use scheduler::SpecialTokenIds;
-
-/// The end-of-text token of [`special_tokens`]: the first EOS id, so a request whose text ends
-/// finishes with `Eos`.
+/// The end-of-text token a fake samples, which a fake engine's launch states as its model's end
+/// of sequence (`crate::args`), so a request whose text ends finishes with `Eos`.
 pub const EOS: u32 = 151_645;
 
 /// The raw log-probability the fake reports for every token it samples.
@@ -47,13 +44,5 @@ impl EndOfText {
     /// Text that ends with [`EOS`] after `tokens` sampled tokens of a prompt of `prompt` tokens.
     pub const fn after(prompt: u64, tokens: u64) -> Self {
         Self::at(prompt + tokens)
-    }
-}
-
-/// The control tokens of a deployment over the fake: [`EOS`] ends a request.
-pub fn special_tokens() -> SpecialTokenIds {
-    SpecialTokenIds {
-        bos: 151_644,
-        eos: vec![EOS, 151_643],
     }
 }

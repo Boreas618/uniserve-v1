@@ -897,7 +897,7 @@ pub(crate) fn layout(launch: &EngineArgs, ranks: &[LoadedRank]) -> Result<Open> 
 /// # Errors
 ///
 /// Worker groups no scheduler block holds, or a layout the regions' numbering cannot state.
-fn text_layout(
+pub fn text_layout(
     launch: &EngineArgs,
     cache: &CacheLayout,
     units: u32,

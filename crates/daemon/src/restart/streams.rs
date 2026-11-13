@@ -489,7 +489,7 @@ mod tests {
     use super::*;
     use crate::options::VideoJobConfig;
     use crate::test_support::{
-        configured_tokenizer, fake_client, leader_over, serving_core, test_model,
+        configured_tokenizer, fake_client, leader_over, test_model, text_fake,
     };
 
     /// A pause that ends without deciding its responses — the successor gave
@@ -546,8 +546,10 @@ mod tests {
         // The queue of taken-over responses is this process's, so the test
         // starts from what earlier tests left there.
         let _ = take_adopted();
-        let core = serving_core("refused-handoff");
-        let client = std::sync::Arc::new(fake_client(vec![core]));
+        let client = std::sync::Arc::new(fake_client(
+            testkit::args("refused-handoff"),
+            testkit::Fixture::new(text_fake),
+        ));
         let leader = std::sync::Arc::new(leader_over(
             test_model(crate::test_support::CHAT),
             configured_tokenizer(),
@@ -587,8 +589,10 @@ mod tests {
     #[tokio::test]
     async fn a_response_that_names_no_application_stays_with_the_predecessor() {
         let _ = take_adopted();
-        let core = serving_core("refused-handoff-2");
-        let client = std::sync::Arc::new(fake_client(vec![core]));
+        let client = std::sync::Arc::new(fake_client(
+            testkit::args("refused-handoff-2"),
+            testkit::Fixture::new(text_fake),
+        ));
         let leader = std::sync::Arc::new(leader_over(
             test_model(crate::test_support::CHAT),
             configured_tokenizer(),

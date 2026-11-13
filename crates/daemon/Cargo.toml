@@ -48,14 +48,10 @@ uuid.workspace = true
 [dev-dependencies]
 # The application crate's test fixtures, such as the byte tokenizer.
 frontend = { workspace = true, features = ["testing"] }
-# The schedulers a test engine runs, over the batch-interface fake.
-scheduler.workspace = true
-# The batch-interface fake, the engine's request-interface stand-in and the
-# packaged policy a test epoch installs.
+# The test engine: the engine's own control thread over a fake executor and
+# an in-process buffer pool; and the fake engine and node daemon at the
+# process interface an update's tests drive.
 testkit.workspace = true
-# Tests drive the request interface with in-process schedulers and build
-# their worker values.
-ipc.workspace = true
 # The supervisor's stand-in rank process creates an interprocess event on a
 # device, as a rank does.
 platform.workspace = true

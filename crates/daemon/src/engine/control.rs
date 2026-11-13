@@ -356,31 +356,14 @@ impl EngineControl {
         Ok((channel, store))
     }
 
-    /// Accepts engine `engine`'s request link and welcomes it, or refuses it when it speaks
-    /// another major version or states another number.
+    /// Accepts engine `engine`'s request link and welcomes it ([`welcome`]).
     fn welcome(
         &self,
         engine: u64,
         control: &mut Connection,
     ) -> anyhow::Result<(Connection, Connection)> {
         let (reader, mut writer, hello) = self.accept(engine, Some(control))?;
-        let refusal = if hello.major != proto::ENGINE_INTERFACE_VERSION {
-            format!(
-                "the engine speaks major version {} and this daemon {}",
-                hello.major,
-                proto::ENGINE_INTERFACE_VERSION
-            )
-        } else if hello.engine != engine {
-            format!("engine {} connected for engine {engine}", hello.engine)
-        } else {
-            String::new()
-        };
-        writer.send(&wire::Welcome {
-            major: proto::ENGINE_INTERFACE_VERSION,
-            build: proto::BUILD.to_owned(),
-            refusal: refusal.clone(),
-        })?;
-        anyhow::ensure!(refusal.is_empty(), "refused the engine process: {refusal}");
+        welcome(&mut writer, &hello, engine)?;
         tracing::info!(engine, build = %hello.build, "the engine process connected; awaiting its start");
         Ok((reader, writer))
     }
@@ -438,21 +421,7 @@ impl EngineControl {
     /// Joins the one target engine `engine` of [`Self::join_target`].
     fn join(&self, engine: u64, epoch: u64, stats: StatsSink) -> anyhow::Result<EngineClient> {
         let (mut reader, mut writer, hello) = self.accept(engine, None)?;
-        let refusal = if hello.major != proto::ENGINE_INTERFACE_VERSION {
-            format!(
-                "the engine speaks major version {} and this daemon {}",
-                hello.major,
-                proto::ENGINE_INTERFACE_VERSION
-            )
-        } else {
-            String::new()
-        };
-        writer.send(&wire::Welcome {
-            major: proto::ENGINE_INTERFACE_VERSION,
-            build: proto::BUILD.to_owned(),
-            refusal: refusal.clone(),
-        })?;
-        anyhow::ensure!(refusal.is_empty(), "refused the engine: {refusal}");
+        welcome(&mut writer, &hello, engine)?;
         let started = Instant::now();
         loop {
             let Some(message) = reader.recv::<wire::FromEngine>(TARGET_STATE_READ)? else {
@@ -466,17 +435,11 @@ impl EngineControl {
             let Some(wire::from_engine::Kind::State(state)) = message.kind else {
                 continue;
             };
-            let known = match wire::EngineState::try_from(state.state) {
-                Ok(wire::EngineState::Parked) => EngineState::Parked,
-                Ok(wire::EngineState::Serving) => EngineState::Serving,
-                Ok(wire::EngineState::Failed) => {
-                    anyhow::bail!("the target failed to start: {}", state.error)
-                }
-                _ => continue,
+            let Some((info, known)) = start_state(state)? else {
+                continue;
             };
-            let info = state.info.context("the engine reported no info")?;
             tracing::info!(engine, build = %hello.build, "the update's target joined this daemon");
-            return EngineClient::new(reader, writer, info.into(), known, stats, None)
+            return EngineClient::new(reader, writer, info, known, stats, None)
                 .map(|client| client.numbered(engine).in_epoch(epoch));
         }
     }
@@ -504,26 +467,7 @@ impl EngineControl {
     ) -> anyhow::Result<EngineClient> {
         self.next_engine.fetch_max(next_engine, Ordering::Relaxed);
         let (mut reader, mut writer, hello) = self.accept(engine, control.as_mut())?;
-        let refusal = if hello.major != proto::ENGINE_INTERFACE_VERSION {
-            format!(
-                "the engine speaks major version {} and this daemon {}",
-                hello.major,
-                proto::ENGINE_INTERFACE_VERSION
-            )
-        } else if hello.engine != engine {
-            format!(
-                "engine {} attached in place of engine {engine}",
-                hello.engine
-            )
-        } else {
-            String::new()
-        };
-        writer.send(&wire::Welcome {
-            major: proto::ENGINE_INTERFACE_VERSION,
-            build: proto::BUILD.to_owned(),
-            refusal: refusal.clone(),
-        })?;
-        anyhow::ensure!(refusal.is_empty(), "refused the engine: {refusal}");
+        welcome(&mut writer, &hello, engine)?;
         let deadline = Instant::now() + CONNECT_TIMEOUT;
         loop {
             let remaining = deadline.saturating_duration_since(Instant::now());
@@ -855,6 +799,60 @@ impl Drop for EngineControl {
     fn drop(&mut self) {
         let _ = std::fs::remove_file(&self.socket);
     }
+}
+
+/// Answers the hello `hello` that engine `engine` said on its request link with this daemon's
+/// welcome, written on `writer`, the link's write half: the daemon's half of the request
+/// interface's handshake, wherever the link was made (this control's request socket, or a pair a
+/// test made). An engine of another major version, or one that states another number, is
+/// refused in the welcome.
+///
+/// # Errors
+///
+/// When the welcome cannot be written, or the engine is refused.
+pub(crate) fn welcome(
+    writer: &mut Connection,
+    hello: &wire::Hello,
+    engine: u64,
+) -> anyhow::Result<()> {
+    let refusal = if hello.major != proto::ENGINE_INTERFACE_VERSION {
+        format!(
+            "the engine speaks major version {} and this daemon {}",
+            hello.major,
+            proto::ENGINE_INTERFACE_VERSION
+        )
+    } else if hello.engine != engine {
+        format!("engine {} connected for engine {engine}", hello.engine)
+    } else {
+        String::new()
+    };
+    writer.send(&wire::Welcome {
+        major: proto::ENGINE_INTERFACE_VERSION,
+        build: proto::BUILD.to_owned(),
+        refusal: refusal.clone(),
+    })?;
+    anyhow::ensure!(refusal.is_empty(), "refused the engine: {refusal}");
+    Ok(())
+}
+
+/// What the state `state` an engine states on its request link says of its start: the state the
+/// start ended in, parked or serving, with what the engine serves; `None` while it starts.
+///
+/// # Errors
+///
+/// When the start failed, with the engine's reason, or the engine states no info with the state
+/// its start ended in.
+pub(crate) fn start_state(state: wire::State) -> anyhow::Result<Option<(EngineInfo, EngineState)>> {
+    let ended = match wire::EngineState::try_from(state.state) {
+        Ok(wire::EngineState::Parked) => EngineState::Parked,
+        Ok(wire::EngineState::Serving) => EngineState::Serving,
+        Ok(wire::EngineState::Failed) => {
+            anyhow::bail!("the engine failed to start: {}", state.error)
+        }
+        _ => return Ok(None),
+    };
+    let info = state.info.context("the engine reported no info")?;
+    Ok(Some((info.into(), ended)))
 }
 
 /// Reads the reply `id` on a control connection, within the daemon's reply time.
