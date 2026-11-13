@@ -39,7 +39,7 @@ use ipc::philox::{DrawAddress, request_sampling_key};
 use proto::module::commit::{self, COMMIT_FIELDS};
 use proto::module::sampler::{PARAMETER_COLUMNS, TEMPERATURE};
 use proto::request::{
-    ConditionExtent, DiffusionRequest, GenerationRequest, ImageEncoder, RequestId, SamplingParams,
+    DiffusionRequest, GenerationRequest, ImageEncoder, RequestId, SamplingParams,
 };
 
 use super::group::variants;
@@ -435,7 +435,7 @@ impl Scheduler {
 
     /// Appends request `id`'s call of the media phase `phase` to `batch`: one media row from the
     /// request's input and counters, with the results its call reads and then those it writes
-    /// as positions in the request's product table ([`declared_results`]), and for a text
+    /// as positions in the request's product table (`Request::results`), and for a text
     /// encoding the request's prompt as the batch's columns. The call is the request's next of
     /// the phase, `Request::scheduled`, which the caller advances after this returns.
     ///
@@ -485,76 +485,23 @@ impl Scheduler {
         phase: Phase,
         slot: u32,
     ) -> Option<MediaRow> {
-        use ipc::product::{
-            AUDIO_LATENTS, AUDIO_SAMPLES, CONDITION_AUDIO_LATENTS, CONDITION_PIXELS,
-            CONDITION_SAMPLES, CONDITION_VIDEO_LATENTS, CONDITIONING, ENCODED_UNITS, VIDEO_LATENTS,
-            VIDEO_TAIL, VIDEO_UNITS, VISION_FEATURES, VISION_PIXELS,
-        };
-
         let index = request.scheduled[phase.index()];
-        let results = declared_results(input);
-        let at = |name: &str| {
-            let position = results.iter().position(|declared| *declared == name)?;
-            u32::try_from(position).ok()
-        };
+        // A video request's token-phase calls have no media row.
+        if matches!(
+            phase,
+            Phase::Prefill | Phase::Decode | Phase::Verify | Phase::Refill | Phase::Other
+        ) {
+            return None;
+        }
 
-        // The denoising steps are the denoiser group's; the last writes the final latents. A
-        // latent encoding's visual round encodes one condition unit; its audio round follows.
+        // What the call reads and writes, and the media units it covers, are the request's
+        // rounds (`video.rs`): a decode round writes the splice tail of each unit it decodes and
+        // a round after the first reads the tail of the unit before its own.
         let step = request.scheduled[Phase::Denoise.index()];
         let steps = request.placement[Phase::Denoise.index()]
             .and_then(|group| self.group(group))
             .map_or(0, |group| group.capacity.denoise_steps);
-        let visual_rounds: usize = input
-            .conditions
-            .iter()
-            .map(|condition| condition.latent_units.len())
-            .sum();
-        let visual = (index as usize) < visual_rounds;
-
-        let (reads, writes): (&[&str], &[&str]) = match phase {
-            Phase::MediaRead => (&[], &[CONDITION_PIXELS, CONDITION_SAMPLES, VISION_PIXELS]),
-            Phase::VisionEncode => (&[VISION_PIXELS], &[VISION_FEATURES]),
-            Phase::TextEncode => (&[VISION_FEATURES], &[CONDITIONING]),
-            Phase::LatentEncode if visual => (&[CONDITION_PIXELS], &[CONDITION_VIDEO_LATENTS]),
-            Phase::LatentEncode => (&[CONDITION_SAMPLES], &[CONDITION_AUDIO_LATENTS]),
-            Phase::LatentPrepare => (
-                &[
-                    CONDITIONING,
-                    CONDITION_VIDEO_LATENTS,
-                    CONDITION_AUDIO_LATENTS,
-                ],
-                &[],
-            ),
-            Phase::Denoise if step + 1 == steps => (&[], &[VIDEO_LATENTS, AUDIO_LATENTS]),
-            Phase::Denoise => (&[], &[]),
-            Phase::VideoDecode => (&[VIDEO_LATENTS], &[VIDEO_UNITS]),
-            Phase::AudioDecode => (&[AUDIO_LATENTS], &[AUDIO_SAMPLES]),
-            Phase::VideoEncode => (&[VIDEO_UNITS], &[ENCODED_UNITS]),
-            Phase::AudioEncode => (&[AUDIO_SAMPLES], &[]),
-            Phase::Mux => (&[ENCODED_UNITS], &[]),
-            _ => return None,
-        };
-
-        // The splice tail of each media unit is a result of its own: a decode round writes its
-        // own, and a round after the first reads the one its previous round wrote.
-        let tail = |unit: u32| {
-            at(VIDEO_TAIL)
-                .filter(|_| unit < input.sampling.video_units)
-                .map(|first| first + unit)
-        };
-        let (read_tail, write_tail) = match phase {
-            Phase::VideoDecode => (index.checked_sub(1).and_then(tail), tail(index)),
-            _ => (None, None),
-        };
-
-        // A result the request does not declare, such as a condition it lacks, is not named.
-        let mut named: Vec<u32> = reads
-            .iter()
-            .filter_map(|name| at(name))
-            .chain(read_tail)
-            .collect();
-        let read = u32::try_from(named.len()).ok()?;
-        named.extend(writes.iter().filter_map(|name| at(name)).chain(write_tail));
+        let (named, read) = request.results(phase, index, &self.groups);
 
         // A decode round runs on one rank of the decoder group, the ranks taking the rounds in
         // turn, and the encode of a round on the rank that decoded it.
@@ -567,11 +514,7 @@ impl Scheduler {
             .map(|ranks| index % ranks),
             _ => None,
         };
-        let unit = match phase {
-            Phase::VideoDecode | Phase::VideoEncode => index,
-            Phase::LatentEncode if visual => index,
-            _ => 0,
-        };
+        let unit = request.round_units(phase, index, &self.groups).start;
 
         // A muxing call hands over the encode round it follows; the last hands none.
         let mux_rounds =
@@ -685,47 +628,6 @@ impl Scheduler {
             extent,
         })
     }
-}
-
-/// The declared results of a video request, in the order its admission asks for their blocks:
-/// a result's index here is its position in the request's product table. A product the
-/// request's conditions do not call for is not declared, and the video tail is one result per
-/// media unit.
-pub(super) fn declared_results(input: &DiffusionRequest) -> Vec<&'static str> {
-    use ipc::product::{
-        AUDIO_LATENTS, AUDIO_SAMPLES, CONDITION_AUDIO_LATENTS, CONDITION_PIXELS, CONDITION_SAMPLES,
-        CONDITION_VIDEO_LATENTS, CONDITIONING, ENCODED_UNITS, VIDEO_LATENTS, VIDEO_TAIL,
-        VIDEO_UNITS, VISION_FEATURES, VISION_PIXELS,
-    };
-
-    // Whether any condition has an extent: what the media reader and the encoders produce.
-    let any = |extent: fn(&ConditionExtent) -> u64| {
-        input
-            .conditions
-            .iter()
-            .any(|condition| extent(condition) > 0)
-    };
-    let patches = any(|condition| condition.vision_patches);
-    let conditions = [
-        (CONDITION_PIXELS, any(|condition| condition.pixel_bytes)),
-        (CONDITION_SAMPLES, any(|condition| condition.audio_samples)),
-        (VISION_PIXELS, patches),
-        (VISION_FEATURES, patches),
-        (CONDITION_VIDEO_LATENTS, any(ConditionExtent::video_rows)),
-        (
-            CONDITION_AUDIO_LATENTS,
-            any(|condition| condition.audio_rows.into()),
-        ),
-    ];
-
-    let tails = iter::repeat_n(VIDEO_TAIL, input.sampling.video_units as usize);
-    conditions
-        .into_iter()
-        .filter_map(|(name, declared)| declared.then_some(name))
-        .chain([CONDITIONING, VIDEO_LATENTS, AUDIO_LATENTS, VIDEO_UNITS])
-        .chain(tails)
-        .chain([ENCODED_UNITS, AUDIO_SAMPLES])
-        .collect()
 }
 
 /// The tokens a request sampling with `sampling` may not sample after its `generated` tokens,
@@ -1048,7 +950,6 @@ mod tests {
         StateCopy, StateDirection, Variant, VisionRows,
     };
     use ipc::philox::{DrawAddress, request_sampling_key};
-    use ipc::product;
     use proto::module::commit::{self, COMMIT_FIELDS};
     use proto::request::{
         ConditionExtent, DiffusionRequest, DiffusionSamplingParams, GenerationRequest,
@@ -1059,7 +960,7 @@ mod tests {
 
     use super::super::tests::bench;
     use super::super::{Request, RequestStatus, Scheduler};
-    use super::{banned_tokens, declared_results};
+    use super::banned_tokens;
 
     const A: GroupId = GroupId(0);
     const BOS: u32 = 151;
@@ -1974,31 +1875,6 @@ mod tests {
         scheduler.groups[0].config.ranks.push(rank);
         scheduler.requests.insert(RequestId(1), video(1));
 
-        let proto::request::Request::Diffusion(input) = &scheduler.requests[&RequestId(1)].input
-        else {
-            unreachable!("a video request");
-        };
-        assert_eq!(
-            declared_results(input),
-            vec![
-                product::CONDITION_PIXELS,
-                product::CONDITION_SAMPLES,
-                product::VISION_PIXELS,
-                product::VISION_FEATURES,
-                product::CONDITION_VIDEO_LATENTS,
-                product::CONDITION_AUDIO_LATENTS,
-                product::CONDITIONING,
-                product::VIDEO_LATENTS,
-                product::AUDIO_LATENTS,
-                product::VIDEO_UNITS,
-                product::VIDEO_TAIL,
-                product::VIDEO_TAIL,
-                product::VIDEO_TAIL,
-                product::ENCODED_UNITS,
-                product::AUDIO_SAMPLES,
-            ]
-        );
-
         // The row of the call `scheduled` counts of `phase`, with the calls `completed` counts.
         let media = |scheduler: &mut Scheduler, phase: Phase, scheduled: u32| -> MediaRow {
             let request = scheduler.requests.get_mut(&RequestId(1)).unwrap();
@@ -2014,16 +1890,16 @@ mod tests {
             (vec![0, 1, 2], 0)
         );
         let visual = media(&mut scheduler, Phase::LatentEncode, 1);
-        assert_eq!((named(&visual), visual.unit), ((vec![0, 4], 1), 1));
+        assert_eq!((named(&visual), visual.unit), ((vec![0, 5], 1), 1));
         let audio = media(&mut scheduler, Phase::LatentEncode, 2);
-        assert_eq!((named(&audio), audio.unit), ((vec![1, 5], 1), 0));
+        assert_eq!((named(&audio), audio.unit), ((vec![1, 6], 1), 0));
         assert_eq!(
             named(&media(&mut scheduler, Phase::TextEncode, 0)),
-            (vec![3, 6], 1)
+            (vec![3, 4], 1)
         );
         assert_eq!(
             named(&media(&mut scheduler, Phase::LatentPrepare, 0)),
-            (vec![6, 4, 5], 3)
+            (vec![4, 5, 6], 3)
         );
 
         // The last of the four denoising steps writes the final latents.
@@ -2093,26 +1969,6 @@ mod tests {
                     condition_rows: 15,
                 },
             }
-        );
-
-        // A request without conditions declares the products of its generation alone.
-        let proto::request::Request::Diffusion(mut plain) = video(2).input else {
-            unreachable!("a video request");
-        };
-        plain.conditions.clear();
-        assert_eq!(
-            declared_results(&plain),
-            vec![
-                product::CONDITIONING,
-                product::VIDEO_LATENTS,
-                product::AUDIO_LATENTS,
-                product::VIDEO_UNITS,
-                product::VIDEO_TAIL,
-                product::VIDEO_TAIL,
-                product::VIDEO_TAIL,
-                product::ENCODED_UNITS,
-                product::AUDIO_SAMPLES,
-            ]
         );
     }
 
