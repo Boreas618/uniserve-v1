@@ -216,6 +216,7 @@ pub(crate) fn capacity() -> Capacity {
         bos_token_id: 0,
         eos_token_ids: Vec::new(),
         feature_bytes: 0,
+        encoder_identity: String::new(),
         media_bytes: Vec::new(),
         call_window: 2,
     }
@@ -878,6 +879,7 @@ fn the_snapshot_states_the_requests_the_cache_and_the_serving_groups() {
         groups: 1,
         pins,
         last_used: 5,
+        refused: None,
     };
     for block in [
         cached(1, KV, 0b001, 1),
@@ -953,8 +955,8 @@ fn a_scheduler_starts_by_listing_its_sessions_cached_blocks_and_orders_them() {
 
 /// The constructor refuses a deployment its executors cannot serve (SD §7.1): no group, a group
 /// of token sequences without a longest sequence, a KV cache with fewer slots than running
-/// requests, and a video decoder whose units no video encoder reads on the hosts that decoded
-/// them.
+/// requests, encoders of weights of different identities, whose outputs no one key finds (SD
+/// §4.3), and a video decoder whose units no video encoder reads on the hosts that decoded them.
 #[test]
 fn the_startup_checks_refuse_a_deployment_its_executors_cannot_serve() {
     let idle = || (idle_policy(), Parameters::default());
@@ -984,6 +986,21 @@ fn the_startup_checks_refuse_a_deployment_its_executors_cannot_serve() {
     };
     let groups = vec![(a.clone(), cached.clone()), (b.clone(), cached)];
     assert!(refusal(groups).contains("hold 32 request slots"));
+
+    let encoding = |identity: &str| Capacity {
+        encoder_identity: identity.to_owned(),
+        ..serving(Phase::VisionEncode)
+    };
+    let differing = vec![
+        (a.clone(), encoding("vision-weights-a")),
+        (b.clone(), encoding("vision-weights-b")),
+    ];
+    assert!(refusal(differing).contains("compute their encoder outputs"));
+    let alike = vec![
+        (a.clone(), encoding("vision-weights-a")),
+        (b.clone(), encoding("vision-weights-a")),
+    ];
+    assert!(built(1024, SchedulerConfig::default(), alike, idle()).is_ok());
 
     // Group A decodes one unit per round on its one rank, which lies on `localhost`; group B's
     // codec encodes it on its one rank, on `elsewhere` and then on `localhost`.
@@ -1099,6 +1116,7 @@ fn a_flush_evicts_every_cached_block_the_scheduler_knows_of() {
             groups: 0,
             pins: 0,
             last_used: 1,
+            refused: None,
         };
         bench.scheduler.cache.insert(Cached::id(&key), block);
     }

@@ -13,6 +13,7 @@
 use std::sync::{Arc, Mutex};
 
 use anyhow::{Context as _, Result};
+use ipc::batch::Phase;
 use nn::family::TextModel;
 use ops::Generation;
 use platform::Stream;
@@ -34,9 +35,10 @@ pub(crate) type Keys = std::collections::BTreeSet<(&'static str, String)>;
 
 impl ModelRunner {
     /// The config of the rank's runner of `model` over a cache of `layout` with `units` units
-    /// (step 7): the phases its buckets serve, the deployment's request slots, pages and longest
-    /// sequence, the candidates a scored row reports, the scratch page set of its paired
-    /// forwards, and a speculating deployment's drafts and draft pool.
+    /// (step 7): the phases its buckets serve (no refill for a model whose layers or drafter keep
+    /// a recurrent state), the deployment's request slots, pages and longest sequence, the
+    /// candidates a scored row reports, the scratch page set of its paired forwards, and a
+    /// speculating deployment's drafts and draft pool.
     ///
     /// The scratch page set is one set the rows of a paired forward share,
     /// `ceil(T / page) + R` pages for the `T` tokens and `R` rows of the largest bucket
@@ -66,8 +68,21 @@ impl ModelRunner {
             None
         };
 
+        // A refill evaluates positions behind its slot's own from a state of their own, which
+        // the runner has none of for a model whose layers or drafter keep a recurrent state, and
+        // refuses: such a rank serves no refill, and a request whose draft cache lags verifies
+        // without drafts.
+        let stateless = model.state_layers().is_empty()
+            && model
+                .drafter()
+                .is_none_or(|drafter| drafter.state().is_empty());
+        let phases = served_phases(&self.buckets)
+            .into_iter()
+            .filter(|phase| *phase != Phase::Refill || stateless)
+            .collect();
+
         Ok(CausalLmConfig {
-            phases: served_phases(&self.buckets),
+            phases,
             buckets: self.buckets.clone(),
             slots: self.slots()?,
             page_size: PAGE_TOKENS,

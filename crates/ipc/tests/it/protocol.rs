@@ -40,6 +40,7 @@ fn group_capacity() -> Capacity {
         bos_token_id: 1,
         eos_token_ids: vec![2, 3],
         feature_bytes: 0,
+        encoder_identity: String::new(),
         media_bytes: Vec::new(),
         call_window: 2,
     }

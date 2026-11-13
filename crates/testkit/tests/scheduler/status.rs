@@ -470,6 +470,28 @@ fn a_request_longer_than_the_whole_cache_is_rejected_at_admission() {
     assert_eq!(tokens.len(), 4);
 }
 
+/// A request is refused at its admission when, alone in the cache, its admission would hold more
+/// blocks than the cache has, and is admitted otherwise: a prompt of the region's eight blocks in
+/// one chunk needs the low watermark's block beyond them, and would wait for room that never
+/// comes; a prompt one block shorter runs (SD §3.5 `never_fits` and `fits`; §4.4 "The low
+/// watermark"; §7.2 "Admission to the cache").
+#[test]
+fn a_request_whose_admission_alone_exceeds_the_cache_is_rejected_and_one_within_it_runs() {
+    let mut harness = Deployment::tokens().kv_units(8).build();
+    let whole = harness.submit(token(1, 32, 2));
+    let within = harness.submit(token(2, 28, 2));
+    harness.settle(100);
+
+    let events = harness.events(whole);
+    let [Event::Rejected { kind, message }] = &events[..] else {
+        panic!("{events:?}");
+    };
+    assert_eq!(*kind, RejectionKind::Invalid);
+    assert_eq!(message, "request exceeds total KV capacity");
+    let (tokens, _) = lifecycle(&harness, within);
+    assert_eq!(tokens.len(), 2);
+}
+
 /// Requests cancelled at every point of their life (waiting, admitting, prefilling, decoding,
 /// with calls in flight) each end once with `Cancelled`, are sent nothing after it, and give
 /// back everything they held.

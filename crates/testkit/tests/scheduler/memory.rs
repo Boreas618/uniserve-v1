@@ -12,12 +12,12 @@
 //!   the peers when they deepen it enough; and its statistics per tier and per source.
 //! - The write policy: committed full-attention blocks stored to the host, sliding windows only
 //!   before aligned boundaries, each block once, and the host copies stored on to the remote
-//!   store.
+//!   store; a block whose store stored nothing offered again only once its answer could differ.
 //! - What the scheduler knows of the cache (SD §4.5): the eviction order of each region, least
 //!   recently used first, whose head it installs; what `Pinned`, `Refused` and the keys a
 //!   completion evicted correct.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 
 use engine::scheduler::Message;
@@ -897,6 +897,94 @@ fn host_copies_are_stored_on_to_the_remote_store() {
     for key in &keys {
         assert!(remote_stored.contains(key));
     }
+}
+
+/// The keys the buffer pool holds copies of on the host: those each `Copy` answering a `Store`
+/// to the host covered, once the `Finish` of that copy was answered `Stored`.
+fn on_the_host(harness: &Harness) -> HashSet<Key> {
+    let completions = harness.pool.completions();
+    let covered: HashMap<u64, &Vec<Key>> = completions
+        .iter()
+        .filter_map(|(_, number, completion)| match completion {
+            Completion::Copy { keys, .. } => Some((number.0, keys)),
+            _ => None,
+        })
+        .collect();
+    let finishes: HashMap<u64, u64> = harness
+        .pool
+        .requests()
+        .iter()
+        .filter_map(|(_, number, request)| match request {
+            Request::Finish { copy, ok: true, .. } => Some((number.0, copy.0)),
+            _ => None,
+        })
+        .collect();
+    let stored = completions
+        .iter()
+        .filter(|(_, _, completion)| matches!(completion, Completion::Stored { .. }))
+        .filter_map(|(_, number, _)| covered.get(finishes.get(&number.0)?));
+    stored.flat_map(|keys| keys.iter().copied()).collect()
+}
+
+/// Checks that every key of `keys` was named by exactly one `Store` to the host: the write
+/// policy's at its commit, the policy's `offload` naming it in vain since.
+fn offered_once(harness: &Harness, keys: &[Key]) {
+    let offered = host_stores(harness);
+    for key in keys {
+        let times = offered.iter().filter(|of| *of == key).count();
+        assert_eq!(times, 1, "{key:?} was offered to the host {times} times");
+    }
+}
+
+/// A block whose `Store` to the host found no room is not offered to the host again until the
+/// host region has room: while the region holds no unit, the policy's `offload`, which names each
+/// step every block no request holds that the host lacks, stores none of them again, and once the
+/// region grows they are stored (SD §4.4 "The write policy": a store that stored nothing backs
+/// off until something that could change its answer happens).
+#[test]
+fn a_block_the_host_had_no_room_for_is_offered_again_once_the_host_has_room() {
+    let mut harness = Deployment::tokens().host(64).build();
+    assert_eq!(harness.resize("host", 0), 0);
+    let id = harness.submit(token(1, 13, 2));
+    harness.settle(100);
+    let keys = harness.committed(harness.owner(id, A).unwrap());
+    assert_eq!(keys.len(), 3);
+
+    harness.run(30);
+    offered_once(&harness, &keys);
+    assert!(on_the_host(&harness).is_empty());
+
+    assert_eq!(harness.resize("host", 64), 64);
+    harness.run_until(30, |harness| {
+        let stored = on_the_host(harness);
+        keys.iter().all(|key| stored.contains(key))
+    });
+}
+
+/// A block whose copy to the host failed is not offered to the host again until a `Store` into
+/// the host region stores a block, which shows that the tier copies again: then it is stored (SD
+/// §4.4 "The write policy").
+#[test]
+fn a_block_whose_copy_to_the_host_failed_is_offered_again_once_the_host_stores_again() {
+    let mut harness = Deployment::tokens().host(64).build();
+    harness.fake.fail_copies(true);
+    let id = harness.submit(token(1, 13, 2));
+    harness.settle(100);
+    let keys = harness.committed(harness.owner(id, A).unwrap());
+    assert_eq!(keys.len(), 3);
+
+    harness.run(30);
+    offered_once(&harness, &keys);
+    assert!(on_the_host(&harness).is_empty());
+
+    // Another request's blocks are stored by the write policy, and the refused ones follow.
+    harness.fake.fail_copies(false);
+    harness.submit(token(2, 9, 2));
+    harness.settle(100);
+    harness.run_until(30, |harness| {
+        let stored = on_the_host(harness);
+        keys.iter().all(|key| stored.contains(key))
+    });
 }
 
 /// Runs token request `id` of a prompt of `tokens` tokens that may generate `max`, with stop

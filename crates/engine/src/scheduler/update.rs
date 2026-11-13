@@ -2415,6 +2415,7 @@ mod tests {
             groups: 1 << A.0,
             pins: 1,
             last_used: 1,
+            refused: None,
         };
         bench.scheduler.cache.insert(Cached::id(&key), cached);
         let request = bench.scheduler.requests.get_mut(&ID).unwrap();

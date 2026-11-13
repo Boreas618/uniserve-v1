@@ -50,6 +50,12 @@ pub struct Capacity {
     pub eos_token_ids: Vec<u32>,
     /// The bytes of one token of an encoder output the group computes; 0 when it encodes nothing.
     pub feature_bytes: u32,
+    /// The identity of the weights that compute the group's encoder outputs (a chat image's
+    /// features, a video's conditioning): `storage::key::encoder_output`'s `identity`, from the
+    /// weights of the group's ranks that encode, the encoder's and its vision tower's. It keys
+    /// those outputs as `seeds` root the group's KV blocks, so an output other weights computed
+    /// is another block. Empty for a group that encodes nothing.
+    pub encoder_identity: String,
     /// Per captured media shape of a group that denoises: the bytes of a slot's trajectory, and
     /// of each product kind's block in the order of the product classes.
     pub media_bytes: Vec<(Shape, u64, Vec<u64>)>,

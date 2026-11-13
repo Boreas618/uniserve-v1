@@ -347,9 +347,17 @@ pub struct Scheduler {
     /// every chain at the zero key, the seed of an empty identity. A weight update's `Flush`
     /// replaces it, so that no key reaches a block the previous weights computed.
     seeds: Vec<Key>,
+    /// The identity of the weights that compute the scheduler's encoder outputs, which keys them
+    /// (`encoder_output`, SD §4.3): what its encoding groups state (`Capacity::encoder_identity`),
+    /// empty when none does.
+    encoder_identity: String,
     /// The seed of the keys of stored trajectories (`latent_content`, SD §4.3), replaced with
     /// `seeds`; 0 until stated.
     latent_seed: u64,
+    /// Per region, the `Store`s to the host into it that stored a block (answered `Stored` after
+    /// their copy ran): a block whose own `Store` stored nothing waits for this count, among
+    /// others, to move before it is offered to the host again (`Cached::refused`, SD §4.4).
+    stores: Vec<u64>,
     /// Running requests whose next call waits for units of a region since their last shortage:
     /// per request, the region (by index) and the units its `available` must show before the
     /// request asks again (SD §3.6). A request listed here takes no further victims.
@@ -484,18 +492,19 @@ impl Scheduler {
 
         // The page seeds every group of the scheduler states for its cache groups, one per class
         // in class order: one key chain serves all of them, so groups that state seeds must state
-        // the same. A group without a KV cache states none.
-        let mut stated = workers
-            .iter()
-            .map(|worker| &worker.capacity.seeds)
-            .filter(|seeds| !seeds.is_empty());
-        let seeds = stated.next().cloned().unwrap_or_default();
-        if stated.any(|other| *other != seeds) {
-            return Err(Error::InvalidRequest(
-                "the scheduler's groups state different page seeds for their cache groups"
-                    .to_owned(),
-            ));
-        }
+        // the same. A group without a KV cache states none. Likewise the identity that keys its
+        // encoder outputs: a request's outputs are found under one key whichever of its groups
+        // computed them. A group that encodes nothing states none.
+        let stated = || workers.iter().map(|worker| &worker.capacity);
+        let differ = |what: &str| {
+            Error::InvalidRequest(format!("the scheduler's groups state different {what}"))
+        };
+        let seeds = agreed(stated().map(|capacity| &capacity.seeds))
+            .ok_or_else(|| differ("page seeds for their cache groups"))?;
+        let encoder_identity = agreed(stated().map(|capacity| &capacity.encoder_identity))
+            .ok_or_else(|| {
+                differ("identities of the weights that compute their encoder outputs")
+            })?;
 
         let regions: Vec<(u8, runtime::Region)> = opened
             .regions
@@ -542,11 +551,13 @@ impl Scheduler {
             owners: HashMap::new(),
             next_owner: (rank << 48) + 1,
             seeds,
+            encoder_identity,
             latent_seed: 0,
             short: HashMap::new(),
             copies: HashMap::new(),
             unmapped: HashMap::new(),
             detached: vec![false; count],
+            stores: vec![0; count],
             policy,
             executor,
             output,
@@ -655,6 +666,19 @@ fn resolved(mut config: SchedulerConfig, groups: &[WorkerGroup]) -> Result<Sched
         config.max_batch = config.max_batch.min(rows);
     }
     Ok(config)
+}
+
+/// The one value of `stated`, the statements of a scheduler's groups, that every group stating
+/// one (a value other than the empty default) states; the empty default when none does, `None`
+/// when two differ.
+fn agreed<'a, T>(stated: impl IntoIterator<Item = &'a T>) -> Option<T>
+where
+    T: Clone + Default + PartialEq + 'a,
+{
+    let empty = T::default();
+    let mut stated = stated.into_iter().filter(|value| **value != empty);
+    let first = stated.next().cloned().unwrap_or_default();
+    stated.all(|other| *other == first).then_some(first)
 }
 
 /// The requests `groups` hold slots for at once: per phase some group serves, the slots of the
@@ -941,7 +965,8 @@ impl Scheduler {
 
     /// `Flush` (SD §2.4, gap G13 of the work breakdown): the requests the scheduler holds continue
     /// as `in_flight` says, then every cached block the scheduler knows of is evicted, and with a
-    /// weight update's `seeds` the cache groups' page seeds and the latent seed are replaced.
+    /// weight update's `seeds` the cache groups' page seeds and the latent seed are replaced. The
+    /// encoder identity stays the one the groups stated: the message states none of its own.
     ///
     /// The requests are dealt with first, under the seeds their state was computed with:
     ///
@@ -1696,9 +1721,11 @@ impl Scheduler {
         }
     }
 
-    /// The `evictable` word of `region` (by index): the units of every shared block without a
-    /// pin there, in any eviction order or none.
-    fn evictable(&self, region: usize) -> u32 {
+    /// Word `at` of the capacity words of `region` (by index) in shared memory: 0 its
+    /// `available` units, 1 its `retiring` units, 2 its `evictable` units (every shared block
+    /// without a pin there, in any eviction order or none). 0 for a region this queue pair has no
+    /// words of.
+    fn capacity_word(&self, region: usize, at: usize) -> u32 {
         let Some(&(number, _)) = self.regions.get(region) else {
             return 0;
         };
@@ -1707,11 +1734,8 @@ impl Scheduler {
             .iter()
             .find(|(stated, _)| *stated == number)
             .map_or(0, |&(_, word)| {
-                self.word(
-                    usize::try_from(word)
-                        .unwrap_or(usize::MAX)
-                        .saturating_add(2),
-                )
+                let first = usize::try_from(word).unwrap_or(usize::MAX);
+                self.word(first.saturating_add(at))
             })
     }
 

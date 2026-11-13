@@ -192,6 +192,7 @@ fn capacity(phases: &[Phase], tokens: u32, feature_bytes: u32) -> Capacity {
         bos_token_id: 1,
         eos_token_ids: vec![2],
         feature_bytes,
+        encoder_identity: String::new(),
         media_bytes: Vec::new(),
         call_window: 2,
     }

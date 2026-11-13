@@ -197,11 +197,12 @@ impl WorkerGroup {
 
 /// Whether the video codec of `encoder` encodes every unit the video decoder of `decoder`
 /// decodes on the host that decoded it, where the encoder reads the decoded unit in place
-/// (`S/worker/codecs.rs:25`). A round deals its units to each block's ranks in order,
-/// `units_per_rank` consecutive positions each: position `p` is decoded by the decoder's rank
-/// `p / per_decoder` and encoded by the encoder's rank `p / per_encoder`. The pairing holds when
-/// the codec covers a whole round and those two ranks share a host at every position. Groups
-/// that state neither block run the two in one place, and pair.
+/// (`S/worker/codecs.rs:25`). A round deals its units to each block's ranks in order, the
+/// consecutive positions each rank takes (`BlockConfig::rank_units`, by which the decoder's
+/// round width is counted too): position `p` is decoded by the decoder's rank `p / per_decoder`
+/// and encoded by the encoder's rank `p / per_encoder`. The pairing holds when the codec covers
+/// a whole round and those two ranks share a host at every position. Groups that state neither
+/// block run the two in one place, and pair.
 pub(super) fn encodes_on_host(decoder: &WorkerGroupConfig, encoder: &WorkerGroupConfig) -> bool {
     let (Some(decoding), Some(encoding)) = (
         decoder.blocks.get(VIDEO_DECODER_BLOCK),
@@ -209,8 +210,8 @@ pub(super) fn encodes_on_host(decoder: &WorkerGroupConfig, encoder: &WorkerGroup
     ) else {
         return true;
     };
-    let per_decoder = decoding.units_per_rank.max(1);
-    let per_encoder = encoding.units_per_rank.max(1);
+    let per_decoder = decoding.rank_units();
+    let per_encoder = encoding.rank_units();
     let round = decoding.ranks.len() * per_decoder;
     if encoding.ranks.len() * per_encoder < round {
         return false;
@@ -366,6 +367,7 @@ mod tests {
             bos_token_id: 0,
             eos_token_ids: Vec::new(),
             feature_bytes: 0,
+            encoder_identity: String::new(),
             media_bytes: Vec::new(),
             call_window: 2,
         };

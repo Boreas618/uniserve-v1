@@ -28,14 +28,14 @@ const UNITS: u32 = 2;
 /// The class of encoder outputs in a deployment of one cache group: the class after it.
 const ENCODER_CLASS: u8 = 1;
 
-/// The key of the vision encoder output of an image of `digest` (SD §4.3): `encoder_output`
-/// over the image's digest and no posterior draw, under the identity the deployment states,
-/// which is none.
-fn output_key(digest: [u8; 32]) -> Key {
+/// The key of the vision encoder output of an image of `digest` computed by the weights of
+/// `identity` (SD §4.3): `encoder_output` over the image's digest and no posterior draw, under
+/// the identity the encoding group states (none unless the case states one).
+fn output_key(identity: &str, digest: [u8; 32]) -> Key {
     let mut inputs = Digest::new(b"image-encoding");
     inputs.bytes(&digest);
     inputs.number(0);
-    Key(encoder_output(VISION_FEATURES, "", &inputs.finish()))
+    Key(encoder_output(VISION_FEATURES, identity, &inputs.finish()))
 }
 
 /// Chat request `id` of a prompt of 12 tokens whose image is that of request `image`.
@@ -224,7 +224,7 @@ fn an_encode_waits_for_room_for_its_encoder_output() {
 fn a_cached_image_skips_its_encode() {
     let mut harness = Deployment::tokens().images().build();
     let first = chat_image(1, 12, ROWS, 2);
-    let key = output_key(digest(&first));
+    let key = output_key("", digest(&first));
     let first = harness.submit(first);
     harness.settle(100);
     let committed = of_outputs(&harness, 0);
@@ -278,7 +278,7 @@ fn a_cached_image_skips_its_encode() {
 fn an_encoder_output_the_buffer_pool_does_not_hold_is_computed_and_committed() {
     let mut harness = Deployment::tokens().images().build();
     let first = chat_image(1, 12, ROWS, 2);
-    let key = output_key(digest(&first));
+    let key = output_key("", digest(&first));
     harness.submit(first);
     harness.settle(100);
     let evicted = harness.elsewhere(&[Request::Evict { keys: vec![key] }]);
@@ -311,4 +311,31 @@ fn an_encoder_output_the_buffer_pool_does_not_hold_is_computed_and_committed() {
     });
     assert!(committed);
     assert_eq!(harness.tokens(second).len(), 2);
+}
+
+/// An encoder output is keyed with the identity of the weights that computed it, which the
+/// group that encodes states: the same image is committed under another key by other weights, so
+/// no request reads an output other weights computed (SD §4.3: `encoder_output(name, identity,
+/// inputs)`; §2.1 `Capacity`, its encoder identity).
+#[test]
+fn an_encoder_output_is_keyed_with_the_identity_of_the_weights_that_computed_it() {
+    let request = chat_image(1, 12, ROWS, 2);
+    let keys: Vec<Key> = ["vision-weights-a", "vision-weights-b"]
+        .into_iter()
+        .map(|identity| {
+            let mut harness = Deployment::tokens()
+                .images()
+                .encoder_identity(identity)
+                .build();
+            harness.submit(request.clone());
+            harness.settle(100);
+            let committed = of_outputs(&harness, 0);
+            let [.., Request::Commit { key, .. }] = &committed[..] else {
+                panic!("{committed:?}");
+            };
+            assert_eq!(*key, output_key(identity, digest(&request)));
+            *key
+        })
+        .collect();
+    assert_ne!(keys[0], keys[1]);
 }

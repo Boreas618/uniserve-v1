@@ -439,10 +439,10 @@ impl Request {
     }
 
     /// The media units one video decode round covers on the group that decodes the request's
-    /// video: the ranks of its video decoder block, each taking `units_per_rank` units when the
-    /// block deals units to its ranks and one otherwise (`S/execution/media.rs:564-572`); 1 when
-    /// the group states no such block. Every rank of the group decodes its share of a round in
-    /// one call, the round's units dealt to the ranks in order (SD §3.3).
+    /// video: the ranks of its video decoder block, each taking the units the block deals a rank
+    /// (`BlockConfig::rank_units`, `S/execution/media.rs:564-572`); 1 when the group states no
+    /// such block. Every rank of the group decodes its share of a round in one call, the round's
+    /// units dealt to the ranks in order (SD §3.3).
     fn width(&self, groups: &[WorkerGroup]) -> u32 {
         let Some(block) = self
             .serving(Phase::VideoDecode, groups)
@@ -450,12 +450,7 @@ impl Request {
         else {
             return 1;
         };
-        let per_rank = if block.distribution.is_some() {
-            block.units_per_rank.max(1)
-        } else {
-            1
-        };
-        let units = block.ranks.len().saturating_mul(per_rank);
+        let units = block.ranks.len().saturating_mul(block.rank_units());
         u32::try_from(units).unwrap_or(u32::MAX).max(1)
     }
 }
@@ -741,6 +736,7 @@ mod tests {
             bos_token_id: 0,
             eos_token_ids: Vec::new(),
             feature_bytes: 0,
+            encoder_identity: String::new(),
             media_bytes,
             call_window: 2,
             cache_groups: Vec::new(),

@@ -18,10 +18,14 @@
 use std::collections::HashSet;
 
 use ipc::batch::{MediaRow, Phase};
+use ipc::product;
+use proto::config::{BlockConfig, BlockDistribution, VIDEO_CODEC_BLOCK, VIDEO_DECODER_BLOCK};
 use proto::request::{
     ConditionExtent, DiffusionRequest, EncoderInputs, Event, FinishReason, MediaKind,
     RejectionKind, RequestId,
 };
+use storage::Key;
+use storage::key::encoder_output;
 use storage::runtime::{Completion, Request};
 
 use crate::harness::{A, B, Deployment, Harness, STEPS, VIDEO_PHASES, token, video};
@@ -393,13 +397,16 @@ fn the_artifact_reaches_a_consumer_that_took_nothing_before_the_terminal() {
 }
 
 /// A video request's conditioning is an encoder output keyed by the digest of what its text
-/// encoder reads (SD §3.3, §4.3): it is committed under that key once encoded, a repeated request
+/// encoder reads and the identity of the weights that compute it, which the text encoder's group
+/// states (SD §3.3, §4.3): it is committed under that key once encoded, a repeated request
 /// of the same inputs pins it at admission and makes no text encoding, its preparation reading
 /// the pinned block, while a request of other inputs encodes its own and one that names no
 /// digest keeps its own private.
 #[test]
 fn a_repeated_request_finds_its_conditioning_and_makes_no_text_encoding() {
-    let mut harness = Deployment::video(&[&VIDEO_PHASES]).build();
+    let mut harness = Deployment::video(&[&VIDEO_PHASES])
+        .encoder_identity("text-encoder")
+        .build();
     let first = digested(video(1, 1), 1);
     let id = harness.submit_video(first.clone());
     harness.settle(200);
@@ -412,6 +419,9 @@ fn a_repeated_request_finds_its_conditioning_and_makes_no_text_encoding() {
             _ => None,
         })
         .expect("the conditioning is committed under its key");
+    // Its key covers what computed it: the identity of the text encoder's weights (SD §4.3).
+    let expected = encoder_output(product::CONDITIONING, "text-encoder", &[1; 32]);
+    assert_eq!(committed, Key(expected));
 
     let repeated = harness.submit_video(DiffusionRequest {
         request_id: RequestId(2),
@@ -446,6 +456,78 @@ fn a_repeated_request_finds_its_conditioning_and_makes_no_text_encoding() {
         .filter(|request| matches!(request, Request::Commit { .. }))
         .count();
     assert_eq!(commits, 2, "a conditioning no digest keys is not committed");
+}
+
+/// A repeated request's admission takes no units for the conditioning its `Pin` will find: it is
+/// admitted beside the request that committed the conditioning and still holds it, when the
+/// buffers have room for its other products and not for the conditioning a second time (SD §3.5
+/// `fits`: the units the admission allocates; §4.4 "Pins, loads, clones and prefetches"; §7.2
+/// "Admission to the cache").
+#[test]
+fn a_conditioning_its_admission_will_pin_takes_no_units_of_the_buffers() {
+    let mut harness = Deployment::video(&[&VIDEO_PHASES]).build();
+    // A text request of one unit holds 49 units of the buffers, 4 of them its conditioning's
+    // (`a_video_request_holds_every_product_from_admission_and_asks_for_no_block_ahead`): room
+    // for one such request and the other products of a second.
+    assert_eq!(harness.resize("buffers", 49 + 45), 49 + 45);
+    let first = digested(video(1, 1), 1);
+    let id = harness.submit_video(first.clone());
+    harness.run_until(60, |harness| {
+        harness
+            .answers()
+            .into_iter()
+            .any(|answer| matches!(answer, (Request::Commit { .. }, Completion::Committed)))
+    });
+
+    // The first request stays on the device, holding its products and its conditioning.
+    harness.fake.hold();
+    let repeated = harness.submit_video(DiffusionRequest {
+        request_id: RequestId(2),
+        ..first
+    });
+    harness.run_until(20, |harness| {
+        let events = harness.events(repeated);
+        events
+            .iter()
+            .any(|event| matches!(event, Event::Scheduled { .. }))
+    });
+    assert!(harness.terminal(id).is_none());
+
+    harness.fake.resume();
+    harness.settle(300);
+    completed(&harness, id);
+    completed(&harness, repeated);
+    let found = calls(&harness, repeated);
+    assert!(of(&found, Phase::TextEncode).is_empty(), "no text encoding");
+}
+
+/// A decoder block that deals no units to its ranks decodes one unit per rank a round, whatever
+/// its `units_per_rank` states, and a codec beside it that covers such a round encodes every unit
+/// on the host that decoded it: the deployment is served, one unit a round (SD §3.3
+/// `VideoDecode`, the round width; §7.1 "Startup checks"; §7.3 "Occupancy").
+#[test]
+fn a_decoder_that_deals_no_units_decodes_one_a_rank_and_a_codec_covering_that_round_serves_it() {
+    let decoder = BlockConfig {
+        units_per_rank: 2,
+        ..BlockConfig::parallel(vec![0])
+    };
+    let codec = BlockConfig {
+        distribution: Some(BlockDistribution::TemporalUnits),
+        ..BlockConfig::parallel(vec![0])
+    };
+    let mut harness = Deployment::video(&[&VIDEO_PHASES])
+        .block(0, VIDEO_DECODER_BLOCK, decoder)
+        .block(0, VIDEO_CODEC_BLOCK, codec)
+        .build();
+    let id = harness.submit_video(video(1, 2));
+    harness.settle(300);
+    completed(&harness, id);
+
+    let calls = calls(&harness, id);
+    let decodes = of(&calls, Phase::VideoDecode);
+    let units: Vec<u32> = decodes.iter().map(|(_, row)| row.unit).collect();
+    assert_eq!(units, [0, 1], "one unit a round");
+    assert_eq!(of(&calls, Phase::VideoEncode).len(), 2);
 }
 
 /// A video request holds every product block from its admission, one `Allocate` per declared

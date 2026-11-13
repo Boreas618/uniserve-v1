@@ -1177,6 +1177,7 @@ impl Group {
             bos_token_id: 0,
             eos_token_ids: Vec::new(),
             feature_bytes: 0,
+            encoder_identity: String::new(),
             media_bytes: Vec::new(),
             call_window: 1,
         };

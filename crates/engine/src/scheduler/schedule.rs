@@ -647,7 +647,9 @@ impl Scheduler {
     /// The policy's `offload` (SD §3.4): one `Store` to the host per group whose memory holds
     /// the device copies of the blocks it names, with their keys in its order. A `PageId` that is
     /// not in `cache`, not on the device, already on the host or being stored there (a block is
-    /// offered to the host once, SD §4.4), or of a class without a host region is skipped.
+    /// offered to the host once, SD §4.4), whose last `Store` stored nothing while nothing that
+    /// could change that has happened since ([`Scheduler::store_refused`]), or of a class without
+    /// a host region is skipped.
     fn offload(&mut self, pages: &[PageId]) {
         // The keys a `Store` to the host held or outstanding names: until its answer, `cache`
         // does not show them on the host.
@@ -676,7 +678,11 @@ impl Scheduler {
                 .classes
                 .get(usize::from(row.class))
                 .is_some_and(|class| class.host.is_some());
-            if row.tiers & HOST != 0 || !hosted || storing.contains(&row.key) {
+            if row.tiers & HOST != 0
+                || !hosted
+                || storing.contains(&row.key)
+                || self.store_refused(row)
+            {
                 continue;
             }
             let Some(group) = self.holder(row) else {
@@ -788,7 +794,7 @@ impl Scheduler {
     ///
     /// A request is admitted only while the running requests and the admissions under way are
     /// fewer than `max_running_requests`. It is placed on a group for each phase it runs; one
-    /// whose least need exceeds a region's capacity is rejected; one whose need, with the hit
+    /// that would hold more than a region's capacity alone is rejected; one whose need, with the hit
     /// `cache` expects, does not fit what the regions have available beyond what the running
     /// requests still need is placed nowhere again and stops the queue. Otherwise one round
     /// starts, which the buffer pool takes in this order: an `Attach` with a new owner for every
@@ -911,7 +917,7 @@ impl Scheduler {
     }
 
     /// Whether `request`'s need fits what the regions have available now (SD §3.5, §7.2): in each
-    /// region, the units its admission takes with a prefix hit of `hit` tokens are at most the
+    /// region, the units its admission allocates with a prefix hit of `hit` tokens are at most the
     /// region's `available` less the units the running requests still need to reach their next
     /// call and low watermark.
     fn fits(&self, request: &Request, hit: u32) -> bool {
@@ -924,11 +930,13 @@ impl Scheduler {
         })
     }
 
-    /// Whether `request` can never fit (SD §3.5, §7.2): in some region, the fewest units its
-    /// admission can take exceed the region's capacity.
+    /// Whether `request` can never fit (SD §3.5, §7.2): in some region, the units its admission
+    /// holds when no other request holds any exceed the region's capacity. Below that, `fits`
+    /// holds once the requests ahead of it have ended and the units they held came back, so a
+    /// request this does not refuse is admitted.
     fn never_fits(&self, request: &Request) -> bool {
-        let least = self.units_minimum(request);
-        least
+        let alone = self.units_alone(request);
+        alone
             .iter()
             .enumerate()
             .any(|(region, &units)| units > self.capacity.get(region).copied().unwrap_or(0))
@@ -1831,6 +1839,7 @@ mod tests {
             groups: 1 << A.0,
             pins: 1,
             last_used: 1,
+            refused: None,
         };
         let page = PageId(super::super::Cached::id(&block.key));
         bench.scheduler.cache.insert(page.0, block);

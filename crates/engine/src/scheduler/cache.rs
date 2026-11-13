@@ -61,6 +61,11 @@ pub struct Cached {
     /// Its last use, in nanoseconds of the host's monotonic clock (`monotonic_nanos`): its rank
     /// in the eviction order.
     pub last_used: u64,
+    /// Where its host region stood when a `Store` of it to the host last stored nothing for it:
+    /// the region's count of `Store`s that stored a block (`Scheduler::stores`), and after a
+    /// `Full` the region's `available` word. It is offered to the host again only once one of
+    /// them has moved ([`Scheduler::store_refused`]); `None` when no `Store` of it failed.
+    pub refused: Option<(u64, Option<u32>)>,
 }
 
 impl Cached {
@@ -231,10 +236,53 @@ impl Scheduler {
                 Completion::Stored { .. },
                 Some(_),
             ) => {
+                // The keys of the copy are on the host, and the region takes copies again.
                 for key in keys {
                     self.change_row(key, None, |row| row.tiers |= HOST);
                 }
+                let region = keys.first().and_then(|key| self.host_region_of(key));
+                if let Some(stores) = region.and_then(|region| self.stores.get_mut(region)) {
+                    *stores = stores.saturating_add(1);
+                }
             }
+            // A `Store` to the host that stored nothing for some of its keys: the host region had
+            // no room for them, their copy failed or was given up, or the buffer pool found no
+            // valid device copy of them to store, or found them stored already. Each waits for
+            // what could change that answer before it is offered again (SD §4.4).
+            (
+                R::Store {
+                    keys,
+                    tier: Tier::Host,
+                    ..
+                },
+                Completion::Full { .. },
+                None,
+            ) => self.refuse(keys, true),
+            (
+                R::Store {
+                    keys,
+                    tier: Tier::Host,
+                    ..
+                },
+                Completion::Copy { keys: covered, .. },
+                None,
+            ) => {
+                let left: Vec<Key> = keys
+                    .iter()
+                    .filter(|key| !covered.contains(key))
+                    .copied()
+                    .collect();
+                self.refuse(&left, false);
+            }
+            (
+                R::Store {
+                    keys,
+                    tier: Tier::Host,
+                    ..
+                },
+                Completion::Stored { .. } | Completion::Done,
+                _,
+            ) => self.refuse(keys, false),
             (
                 R::Store {
                     tier: Tier::Remote, ..
@@ -291,6 +339,50 @@ impl Scheduler {
             }
             _ => {}
         }
+    }
+
+    /// Records that a `Store` to the host stored nothing for `keys`: with `full` it was answered
+    /// `Full`, and the block waits for its host region's `available` word to rise above what it
+    /// shows now as well as for a `Store` into the region that stores a block.
+    fn refuse(&mut self, keys: &[Key], full: bool) {
+        for key in keys {
+            let Some(region) = self.host_region_of(key) else {
+                continue;
+            };
+            let stores = self.stores.get(region).copied().unwrap_or(0);
+            let word = full.then(|| self.capacity_word(region, 0));
+            self.change_row(key, None, |row| row.refused = Some((stores, word)));
+        }
+    }
+
+    /// Whether `row`'s last `Store` to the host stored nothing for it and nothing has happened
+    /// since that could change the answer (SD §4.4 "The write policy"): no `Store` into its host
+    /// region stored a block, and after a `Full` the region's `available` word has not risen
+    /// above what it showed then. Such a block is not offered to the host.
+    pub(super) fn store_refused(&self, row: &Cached) -> bool {
+        let Some((stores, word)) = row.refused else {
+            return false;
+        };
+        let Some(region) = self.host_region(row.class) else {
+            return false;
+        };
+        let stored = self.stores.get(region).copied().unwrap_or(0);
+        stored == stores && word.is_none_or(|word| self.capacity_word(region, 0) <= word)
+    }
+
+    /// The host region (by index) of `class`, which its `Store`s to the host fill.
+    fn host_region(&self, class: u8) -> Option<usize> {
+        let (region, _) = self.classes.get(usize::from(class))?.host?;
+        Some(usize::from(region))
+    }
+
+    /// The host region of the class of the cached block of `key`.
+    fn host_region_of(&self, key: &Key) -> Option<usize> {
+        let row = self
+            .cache
+            .get(&Cached::id(key))
+            .filter(|row| row.key == *key)?;
+        self.host_region(row.class)
     }
 
     /// `key`'s block is on the device in `groups`, held by `pins` more requests and last used at
@@ -455,6 +547,7 @@ impl Scheduler {
                     groups: 0,
                     pins: 0,
                     last_used,
+                    refused: None,
                 }
             }
             _ => return,
@@ -687,7 +780,7 @@ impl Scheduler {
                 .saturating_add(self.pending_shared(region));
             self.classes_in(region)
                 .all(|class| self.classes[usize::from(class)].units > 0)
-                && self.evictable(region) > known
+                && self.capacity_word(region, 2) > known
         });
         let listing = |request: &runtime::Request| *request == runtime::Request::List;
         let asked = self.held.iter().any(listing)

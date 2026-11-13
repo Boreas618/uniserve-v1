@@ -2264,6 +2264,12 @@ fn text_regions(layout: &Open, opened: &Opened, group: Option<&Group>) -> Vec<u8
 /// serve, in rank order (`crate::data_plane::identity_of`): what the data plane keys the ranks'
 /// pages by, so a block computed by other weights or in another layout is another block.
 ///
+/// A group's encoder identity is, in the same way, the identity of the weights of its ranks that
+/// compute encoder outputs (a text encoding's conditioning, a chat image's features), in rank
+/// order: the encoder's and its vision tower's, with whatever else those ranks hold, which keys
+/// the outputs (`storage::key::encoder_output`) so that an output other weights computed is
+/// another block. A group none of whose ranks encodes states none.
+///
 /// # Errors
 ///
 /// A rank whose group the session does not state, or a capacity its config cannot state.
@@ -2275,6 +2281,8 @@ pub(crate) fn capacities(ranks: &[LoadedRank], layout: &Open) -> Result<Vec<(Gro
     let identity = crate::data_plane::identity_of(&order);
 
     let mut stated: Vec<(GroupId, Capacity)> = Vec::new();
+    // Per group, the weights of its ranks that encode, in rank order.
+    let mut encoding: Vec<(GroupId, Vec<(WeightKey, bool)>)> = Vec::new();
     for rank in ranks {
         let id = session_group(rank, layout)?;
         let capacity = match &rank.loaded {
@@ -2290,9 +2298,25 @@ pub(crate) fn capacities(ranks: &[LoadedRank], layout: &Open) -> Result<Vec<(Gro
             }
             Loaded::Video(video) => video.capacity.clone(),
         };
+
+        let encodes = [Phase::TextEncode, Phase::VisionEncode, Phase::LatentEncode]
+            .into_iter()
+            .any(|phase| capacity.serves(phase));
+        if encodes {
+            match encoding.iter_mut().find(|(group, _)| *group == id) {
+                Some((_, weights)) => weights.extend(rank.weights.iter().cloned()),
+                None => encoding.push((id, rank.weights.clone())),
+            }
+        }
         match stated.iter_mut().find(|(group, _)| *group == id) {
             Some((_, group)) => join(group, &capacity),
             None => stated.push((id, capacity)),
+        }
+    }
+
+    for (id, weights) in encoding {
+        if let Some((_, capacity)) = stated.iter_mut().find(|(group, _)| *group == id) {
+            capacity.encoder_identity = crate::data_plane::identity_of(&weights);
         }
     }
     Ok(stated)

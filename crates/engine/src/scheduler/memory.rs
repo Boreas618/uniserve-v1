@@ -59,12 +59,6 @@ use super::{Blocks, Request, RequestStatus, Scheduler, monotonic_nanos, span};
 /// The name of an image model's latent encoder output (SD §7.4).
 const LATENT_FEATURES: &str = "latent_features";
 
-/// The identity of what computes an encoder output (the weights' values and the identities of
-/// the encoder's modules), which its key covers (SD §4.3). No worker group states one yet, so
-/// every output is keyed with this empty identity; a weight update's `Flush` evicts the outputs
-/// the previous weights computed.
-const ENCODER_IDENTITY: &str = "";
-
 /// The pages of the largest block size between the aligned boundaries before which a sliding
 /// window is stored to the host, when the deployment states none (SD §4.4).
 const BOUNDARY_INTERVAL: u32 = 64;
@@ -401,21 +395,22 @@ impl Scheduler {
     }
 
     /// The key of each encoder output of a request, with no position held yet (SD §4.3),
-    /// `encoder_output(name, identity, inputs)`. A token request's outputs are its images', in
-    /// context order, each over the image's digest and, for an encoder that samples its
-    /// posterior, the input's draw among the request's latent encodings under a seed of 0
-    /// (`S/encodings.rs:35-72`); no group states an encoder that samples yet, so none has a draw.
+    /// `encoder_output(name, identity, inputs)`, `identity` being that of the weights that compute
+    /// the scheduler's encoder outputs (`Scheduler::encoder_identity`). A token request's outputs
+    /// are its images', in context order, each over the image's digest and, for an encoder that
+    /// samples its posterior, the input's draw among the request's latent encodings under a seed of
+    /// 0 (`S/encodings.rs:35-72`); no group states an encoder that samples yet, so none has a draw.
     /// A video request's one output is its conditioning, over the digest of what its text encoder
-    /// reads (`EncoderInputs::text`: its prompt and the conditions its vision blocks present,
-    /// which the daemon computes from the request's facts); a request that names no digests has
-    /// none, and its conditioning is neither found nor stored (`S/encoder_outputs.rs:14-21`).
+    /// reads (`EncoderInputs::text`: its prompt and the conditions its vision blocks present, which
+    /// the daemon computes from the request's facts); a request that names no digests has none, and
+    /// its conditioning is neither found nor stored (`S/encoder_outputs.rs:14-21`).
     pub(super) fn encodings_of(&self, request: &Request) -> Vec<(Key, Option<u32>)> {
         let input = match &request.input {
             proto::request::Request::Generation(input) => input,
             proto::request::Request::Diffusion(video) => {
                 let text = video.encoder_inputs.as_ref().map(|inputs| inputs.text);
-                let key =
-                    |text: [u8; 32]| Key(encoder_output(CONDITIONING, ENCODER_IDENTITY, &text));
+                let identity = &self.encoder_identity;
+                let key = |text: [u8; 32]| Key(encoder_output(CONDITIONING, identity, &text));
                 return text.into_iter().map(|text| (key(text), None)).collect();
             }
         };
@@ -439,7 +434,8 @@ impl Scheduler {
                 }
                 draws += u64::from(encoder.encoder == ImageEncoder::Latent);
                 let inputs = digest.finish();
-                keys.push((Key(encoder_output(name, ENCODER_IDENTITY, &inputs)), None));
+                let identity = &self.encoder_identity;
+                keys.push((Key(encoder_output(name, identity, &inputs)), None));
             }
         }
         keys
@@ -871,33 +867,47 @@ impl Scheduler {
 /// The blocks an admission needs (SD §7.2 "Admission to the cache").
 impl Scheduler {
     /// Per region, the units the admission of a request whose prefix hit holds `hit` tokens
-    /// takes (SD §7.2, `S/admission.rs:1051-1160`, `S/kv_cache/mod.rs:2101-2206`). Per cache
-    /// class but the draft cache, the most of the blocks its first call and the low watermark
-    /// take and the least of the blocks after the prefix and the fewest that must coexist to
-    /// compute the prompt in chunks; a request with context images every block of its context.
-    /// Then every encoder output, and a video request's declared results.
+    /// allocates (SD §7.2, `S/admission.rs:1051-1160`, `S/kv_cache/mod.rs:2101-2206`): what
+    /// `fits` compares with the units available. Per cache class but the draft cache, the most
+    /// of the blocks its first call and the low watermark take and the least of the blocks after
+    /// the prefix and the fewest that must coexist to compute the prompt in chunks; a request
+    /// with context images every block of its context. Then every encoder output and declared
+    /// result but those it holds and those whose `Pin` `cache` expects to find, which take no
+    /// units of the region (SD §4.4).
     pub(super) fn units_needed(&self, request: &Request, hit: u32) -> Vec<u32> {
         self.units(request, Some(hit))
     }
 
-    /// Per region, the fewest units a request's admission can take: the blocks that must
-    /// coexist to compute its prompt in chunks, every block of a context with images, and its
-    /// encoder outputs and declared results. A request whose need exceeds a region's capacity
-    /// never fits (SD §3.5 `never_fits`).
-    pub(super) fn units_minimum(&self, request: &Request) -> Vec<u32> {
+    /// Per region, the units a request's admission holds there when no other request holds any:
+    /// what `never_fits` compares with the region's capacity (SD §3.5, §7.2). Per cache class but
+    /// the draft cache, the most of the fewest blocks that must coexist to compute its prompt in
+    /// chunks and the blocks its first call and the low watermark take from its start, every
+    /// block of a context with images; and every encoder output and declared result, pinned or
+    /// allocated, since a pinned block lies in the region too. A request whose `never_fits`
+    /// passes is admitted once the requests ahead of it have ended: alone, it takes no more than
+    /// this.
+    pub(super) fn units_alone(&self, request: &Request) -> Vec<u32> {
         self.units(request, None)
     }
 
+    /// [`Scheduler::units_needed`] with a hit, [`Scheduler::units_alone`] without.
     fn units(&self, request: &Request, hit: Option<u32>) -> Vec<u32> {
         let mut units = vec![0; self.regions.len()];
+        let allocating = hit.is_some();
         if request.is_video() {
             let results = self.declared_results(request).unwrap_or_default();
-            for (phase, class, size) in results {
+            for (at, (phase, class, size)) in (0u32..).zip(results) {
                 let group = request.placement[phase.index()].or_else(|| {
                     let serving = self.groups.iter().find(|group| group.serves(phase));
                     serving.map(|group| group.id())
                 });
-                if let Some(group) = group {
+                let Some(group) = group else {
+                    continue;
+                };
+                // Its conditioning, found under its key, is pinned where it lies.
+                let found = Some(at) == request.conditioning_position()
+                    && self.encoding_found(request, 0, Some(group));
+                if !(allocating && found) {
                     self.charge_units(&mut units, group, class, 1, size);
                 }
             }
@@ -926,38 +936,62 @@ impl Scheduler {
                 _ => pages,
             };
             let reaches = |from: u32, to: u32| u32::from(to / block * block > from);
+            // The blocks the admission's first round or rounds hold before the request runs:
+            // its first chunk from the hit and the low watermark, the checkpoint the chunk keeps
+            // for a recurrent state (`settled`).
+            let first = if kind.is_state() {
+                reaches(cached, cached + chunk)
+            } else {
+                (cached + chunk).div_ceil(block) - cached / block + LOW_WATERMARK
+            };
             let blocks = if !keyed(request) && request.image_spans().next().is_some() {
                 if kind.is_state() {
                     u32::from(prompt >= block)
                 } else {
                     pages
                 }
-            } else if hit.is_none() {
+            } else if !allocating {
                 least
             } else if kind.is_state() {
-                reaches(cached, prompt)
-                    .min(least)
-                    .max(reaches(cached, cached + chunk))
+                reaches(cached, prompt).min(least)
             } else {
-                let after = pages.saturating_sub(cached / block);
-                let first = (cached + chunk).div_ceil(block) - cached / block + LOW_WATERMARK;
-                after.min(least).max(first)
+                pages.saturating_sub(cached / block).min(least)
             };
-            self.charge_units(&mut units, group, class, blocks, 0);
+            self.charge_units(&mut units, group, class, blocks.max(first), 0);
         }
 
         if let Some(class) = self.encoder_class(request) {
-            for (_, rows, _, input) in request.image_spans() {
+            let reads = request.generation().is_some_and(|input| input.cache.read);
+            for (index, (_, rows, _, input)) in request.image_spans().enumerate() {
                 let phase = match input.encoder {
                     ImageEncoder::Vision => Phase::VisionEncode,
                     ImageEncoder::Latent => Phase::LatentEncode,
                 };
                 let encoder = request.placement[phase.index()].unwrap_or(group);
+                let read = reads.then_some(encoder);
+                if allocating && self.encoding_found(request, index, read) {
+                    continue;
+                }
                 let size = self.encoding_units(encoder, class, rows);
                 self.charge_units(&mut units, encoder, class, 1, size);
             }
         }
         units
+    }
+
+    /// Whether the admission of `request` allocates nothing for its encoder output `index` (into
+    /// `Request::encodings`): the request holds it, or `cache` holds it on the device in `read`,
+    /// the group of its owner where the request reads cached outputs, so that its `Pin` finds it
+    /// there (SD §4.4). An output on the host alone is loaded into a block the `Load` allocates.
+    fn encoding_found(&self, request: &Request, index: usize, read: Option<GroupId>) -> bool {
+        request.encodings.get(index).is_some_and(|&(key, held)| {
+            held.is_some() || read.is_some_and(|group| self.on_device(key, group))
+        })
+    }
+
+    /// Whether `cache` holds the block of `key` on the device in `group`.
+    fn on_device(&self, key: Key, group: GroupId) -> bool {
+        self.expected_hit(&[key], group)[0] & DEVICE != 0
     }
 }
 
@@ -3482,7 +3516,7 @@ mod tests {
 
         // Without a hit: every block of the full class, and of the window what a chunk's window
         // and query span: 16 + min(16, ceil(640 / 64) + 1).
-        assert_eq!(session.scheduler.units_minimum(session.row(id))[0], 16 + 11);
+        assert_eq!(session.scheduler.units_alone(session.row(id))[0], 16 + 11);
         assert_eq!(
             session.scheduler.units_needed(session.row(id), 0)[0],
             16 + 11

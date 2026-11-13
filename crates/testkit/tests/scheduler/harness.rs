@@ -38,7 +38,7 @@ use ipc::batch::{
     Batch, BatchOutput, CallOutput, CallStatus, ErrorCode, Extent, MediaRow, Phase, Shape, Variant,
 };
 use proto::config::{
-    KvCacheConfig, MooncakeConfig, SchedulerConfig, WorkerGroupConfig, WorkerGroupId,
+    BlockConfig, KvCacheConfig, MooncakeConfig, SchedulerConfig, WorkerGroupConfig, WorkerGroupId,
     WorkerGroupRole, WorkerRank,
 };
 use proto::report::SchedulerStats;
@@ -139,6 +139,12 @@ pub(crate) struct Deployment {
     /// host copies a prefetch may read.
     remote: bool,
     peers: bool,
+    /// The identity of the weights the groups that encode state for their encoder outputs
+    /// (`Capacity::encoder_identity`); empty: none.
+    encoder_identity: String,
+    /// Blocks of the groups' configurations: per entry the group's index, the block's name and
+    /// the block.
+    blocks: Vec<(usize, String, BlockConfig)>,
 }
 
 impl Deployment {
@@ -162,6 +168,8 @@ impl Deployment {
             ring_bytes: 1 << 16,
             remote: false,
             peers: false,
+            encoder_identity: String::new(),
+            blocks: Vec::new(),
         }
     }
 
@@ -245,6 +253,19 @@ impl Deployment {
     pub(crate) fn encoder(mut self) -> Self {
         self.groups
             .push((WorkerGroupRole::Model, vec![Phase::VisionEncode]));
+        self
+    }
+
+    /// The identity of the weights that compute encoder outputs, which every group that encodes
+    /// (a chat image, a video's conditioning) states.
+    pub(crate) fn encoder_identity(mut self, identity: &str) -> Self {
+        self.encoder_identity = identity.to_owned();
+        self
+    }
+
+    /// Block `name` of group `index`'s configuration, over the group's one rank.
+    pub(crate) fn block(mut self, index: usize, name: &str, block: BlockConfig) -> Self {
+        self.blocks.push((index, name.to_owned(), block));
         self
     }
 
@@ -518,7 +539,8 @@ impl Deployment {
         u8::try_from(found).ok()
     }
 
-    /// Group `index`'s configuration: one rank on this host, with the deployment's queue depth.
+    /// Group `index`'s configuration: one rank on this host, with the deployment's queue depth and
+    /// the blocks stated for it ([`Deployment::block`]).
     fn config(&self, index: usize) -> WorkerGroupConfig {
         WorkerGroupConfig {
             id: WorkerGroupId(format!("group-{index}")),
@@ -528,7 +550,12 @@ impl Deployment {
                 host: "localhost".to_owned(),
                 device: "cpu".to_owned(),
             }],
-            blocks: Default::default(),
+            blocks: self
+                .blocks
+                .iter()
+                .filter(|(group, ..)| *group == index)
+                .map(|(_, name, block)| (name.clone(), block.clone()))
+                .collect(),
             queue_depth: self.queue_depth,
             mem_fraction_static: None,
         }
@@ -536,8 +563,9 @@ impl Deployment {
 
     /// What group `index`'s executors state: its phases, its slots (every stage holds that many
     /// requests), the model's cache groups for a group that runs token calls, a bucket of the
-    /// deployment's rows for each phase it serves (and its tokens for prefills), and for a group
-    /// that denoises the steps and the shapes of the harness's video requests.
+    /// deployment's rows for each phase it serves (and its tokens for prefills), for a group that
+    /// denoises the steps and the shapes of the harness's video requests, and for a group that
+    /// encodes the deployment's encoder identity.
     fn capacity(&self, index: usize) -> Capacity {
         let phases = &self.groups[index].1;
         let serves = |phase| phases.contains(&phase);
@@ -626,6 +654,14 @@ impl Deployment {
                 FEATURE_BYTES
             } else {
                 0
+            },
+            encoder_identity: if [Phase::TextEncode, Phase::VisionEncode, Phase::LatentEncode]
+                .into_iter()
+                .any(serves)
+            {
+                self.encoder_identity.clone()
+            } else {
+                String::new()
             },
             media_bytes,
             call_window: 2,

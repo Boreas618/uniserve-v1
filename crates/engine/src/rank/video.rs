@@ -415,11 +415,7 @@ impl ModelRunner {
             .map(|position| u32::try_from(firsts[at] + position))
             .collect::<Result<Vec<u32>, _>>()
             .context("a rank past what the protocol numbers")?;
-        let units = if block.distribution.is_some() {
-            block.units_per_rank.max(1)
-        } else {
-            1
-        };
+        let units = block.rank_units();
         Ok(RoundConfig {
             ranks,
             units: u32::try_from(units).context("more units per rank than a round numbers")?,
@@ -1106,6 +1102,9 @@ impl ModelRunner {
             bos_token_id: config.bos,
             eos_token_ids: config.eos.clone(),
             feature_bytes: 0,
+            // The group's encoder identity is stated from its encoding ranks' weights by the
+            // rank start (`crate::process::ranks::capacities`).
+            encoder_identity: String::new(),
             media_bytes,
             call_window: u32::try_from(window).unwrap_or(u32::MAX),
         })

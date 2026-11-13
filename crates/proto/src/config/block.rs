@@ -204,6 +204,16 @@ impl BlockConfig {
         }
     }
 
+    /// The consecutive units each rank of the block takes in one round of independent units,
+    /// which deals a round's units to `ranks` in order: `units_per_rank` under a `distribution`,
+    /// and one otherwise, `units_per_rank` stating nothing then. At least one.
+    pub fn rank_units(&self) -> usize {
+        match self.distribution {
+            Some(BlockDistribution::TemporalUnits) => self.units_per_rank.max(1),
+            None => 1,
+        }
+    }
+
     /// The rank count one model-parallel group of this block needs: the product
     /// of the tensor, pipeline, and sequence degrees.
     ///
