@@ -66,6 +66,7 @@ from tests.python.e2e.http_helpers import (
     install_engine,
     log_tail,
     metric,
+    modules_from,
     qwen3_checkpoint,
     require_uniserve_binary,
     runs,
@@ -125,10 +126,12 @@ def build_server(tmp_path_factory: pytest.TempPathFactory):
     """The host's Build Server, with the deployment's modules installed.
 
     Autouse and module-scoped because every deployment of this file needs it:
-    the daemon's leader resolves each epoch's modules at this server.
+    the daemon's leader resolves each epoch's modules at this server. It is
+    also the server the shared helpers install engine revisions at
+    (:func:`modules_from`, which :func:`engine_revision` reads).
     """
     global BUILD_SERVER
-    with running_build_server(tmp_path_factory) as socket:
+    with running_build_server(tmp_path_factory) as socket, modules_from(socket):
         BUILD_SERVER = socket
         try:
             yield socket
@@ -1360,9 +1363,10 @@ def test_a_target_that_finds_no_storage_leaves_the_serving_epoch_serving(
 
     A target prepares beside the serving epoch, which keeps its regions until
     it drains: the target starts with what the GPU's quota has free. With two
-    GiB left on the GPU it finds no room for its graph pool, so the update is
-    abandoned on its exit before any switch, and the stream goes on with the
-    serving epoch's regions as they were.
+    GiB left on the GPU it finds no room for its graph pool, so its start
+    fails, the update is abandoned before any switch (the apply answers
+    ``409`` with the abandoned update, ``docs/admin.md``), and the stream goes
+    on with the serving epoch's regions as they were.
     """  # noqa: E501
     name = "qwen3-live-pressure"
     log = tmp_path / "server.log"
@@ -1383,8 +1387,11 @@ def test_a_target_that_finds_no_storage_leaves_the_serving_epoch_serving(
         wait_until(lambda: len(read) >= 32, 300, "the count did not stream")
         with _ballast(device, leave_gib=2.0) as held:
             print(f"ballast holds {held / (1 << 30):.1f} GiB; GPU free 2 GiB")
-            result = _apply(base_url, CHANGE)
-            assert result["change"] == "epoch", result
+            # The apply waits until the update reached its trial or ended
+            # before it: abandoned, it answers 409 with the update.
+            response = apply_config(base_url, CHANGE)
+            assert response.status_code == 409, response.text
+            assert response.json()["result"]["change"] == "epoch", response.text
             wait_until(
                 lambda: update_report(base_url).get("phase") == "abandoned",
                 600,
@@ -1393,7 +1400,10 @@ def test_a_target_that_finds_no_storage_leaves_the_serving_epoch_serving(
             )
             report = update_report(base_url)
             print("epoch switch under pressure:", json.dumps(report))
-            assert report["failure"]["kind"] == "process_exit", report
+            # The target's start failed before it joined: a failed
+            # preparation, whose reason names the storage it did not find.
+            assert report["failure"]["kind"] == "prepare_failed", report
+            assert "graph pool" in report["failure"]["reason"], report
         streaming.join(timeout=1800)
         assert done.is_set(), "the count did not end"
         numbers = [int(word) for word in re.findall(r"\d+", "".join(read))]
@@ -1881,12 +1891,17 @@ def _slower_engine(directory: Path) -> str:
     """
     socket = build_server_socket()
     engine = engine_executable(socket, install_engine(socket))
+    # The wrapper implements the engine interface of the engine it runs: the
+    # daemon refuses a package of another version than it speaks.
+    interface = tomllib.loads(
+        (Path.cwd() / "crates/engine/package.toml").read_text()
+    )["interface_version"]
     package = directory / "slower-engine"
     package.mkdir()
     (package / "package.toml").write_text(
         'op = "engine"\n'
         'backend = "slower"\n'
-        "interface_version = 1\n\n"
+        f"interface_version = {interface}\n\n"
         '[toolchain]\nkind = "none"\nversion = ""\n\n'
         '[module]\nform = "executable"\n\n'
         '[source]\nkind = "executable"\nfiles = ["uniserve-slower"]\n'

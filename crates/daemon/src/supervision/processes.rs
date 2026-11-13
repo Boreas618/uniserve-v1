@@ -328,10 +328,11 @@ impl Processes {
         }
         let mut launch = launch.clone();
         launch.engine = generation;
-        // The node that starts the process writes its launch file (`Spawn::launch`).
+        // The node that starts the process writes its launch file (`Spawn::launch`) and runs the
+        // engine package's executable with `--launch` naming it, which is the whole command line
+        // of a main process: the spawn's own arguments are left as the caller stated them.
         spawn.launch = serde_json::to_vec(&launch)
             .map_err(|error| format!("encoding the launch of engine {generation}: {error}"))?;
-        spawn.arguments = vec!["engine".to_owned()];
         self.launches.insert(
             generation,
             Launch {

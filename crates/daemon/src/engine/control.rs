@@ -483,6 +483,9 @@ impl EngineControl {
                 );
                 let info = state.info.context("the engine reported no info")?;
                 tracing::info!(engine, build = %hello.build, "the engine attached");
+                // A daemon adopts the engine of its own node, which runs on this host: the
+                // updater names the processes it drains and commands by their host
+                // (`EngineClient::processes`), as it does for an engine this control started.
                 return EngineClient::new(
                     reader,
                     writer,
@@ -491,7 +494,7 @@ impl EngineControl {
                     stats,
                     control,
                 )
-                .map(|client| client.numbered(engine).in_epoch(epoch));
+                .map(|client| client.numbered(engine).in_epoch(epoch).on_host(&self.host));
             }
         }
     }

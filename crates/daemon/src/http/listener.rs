@@ -159,6 +159,11 @@ impl Listener {
     pub(crate) fn bind_over(path: &Path, mode: u32) -> Result<Self> {
         use std::os::unix::fs::PermissionsExt as _;
 
+        // The runtime directory may not exist yet: a node that serves no
+        // deployment has started no Storage Server, which would have made it.
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
         let beside = path.with_extension(format!("{}.binding", std::process::id()));
         let _ = std::fs::remove_file(&beside);
         let listener = std::os::unix::net::UnixListener::bind(&beside)?;
