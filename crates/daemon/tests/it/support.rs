@@ -50,6 +50,29 @@ impl Engine {
     /// Connects to the leader at `address`, saying hello as an engine whose
     /// build speaks `major`, and returns the leader's welcome.
     pub(crate) fn hello(address: &str, major: u32) -> (Self, Welcome) {
+        let mut engine = Self::dial(address, major);
+        let welcome = engine.welcome();
+        (engine, welcome)
+    }
+
+    /// Connects to the leader at `address` as an engine of this build that
+    /// sends its first request, `kind`, right behind its hello rather than
+    /// after the welcome, and returns the request's answer.
+    pub(crate) fn connect_asking(address: &str, kind: request::Kind) -> (Self, Reply) {
+        let mut engine = Self::dial(address, proto::ENGINE_INTERFACE_VERSION);
+        let id = engine.send(kind);
+        assert_eq!(
+            engine.welcome().refusal,
+            "",
+            "the leader refused this engine"
+        );
+        let reply = engine.reply(id);
+        (engine, reply)
+    }
+
+    /// Connects to the leader at `address` and says hello as an engine whose
+    /// build speaks `major`.
+    fn dial(address: &str, major: u32) -> Self {
         let deadline = Instant::now() + TIMEOUT;
         let mut connection = loop {
             match Connection::connect(address) {
@@ -77,20 +100,29 @@ impl Engine {
                 })),
             })
             .unwrap();
-        let welcome = connection
-            .recv::<Welcome>(TIMEOUT)
-            .unwrap()
-            .expect("the leader answers a hello");
-        let engine = Self {
+        Self {
             connection,
             next: 1,
             exits: VecDeque::new(),
-        };
-        (engine, welcome)
+        }
+    }
+
+    /// The leader's answer to the hello.
+    fn welcome(&mut self) -> Welcome {
+        self.connection
+            .recv::<Welcome>(TIMEOUT)
+            .unwrap()
+            .expect("the leader answers a hello")
     }
 
     /// Sends one request and returns its answer.
     pub(crate) fn request(&mut self, kind: request::Kind) -> Reply {
+        let id = self.send(kind);
+        self.reply(id)
+    }
+
+    /// Sends one request and returns its id.
+    fn send(&mut self, kind: request::Kind) -> u64 {
         let id = self.next;
         self.next += 1;
         self.connection
@@ -101,6 +133,11 @@ impl Engine {
                 })),
             })
             .unwrap();
+        id
+    }
+
+    /// The answer to request `id`, keeping the exits that arrive before it.
+    fn reply(&mut self, id: u64) -> Reply {
         loop {
             match self.receive() {
                 downstream::Kind::Reply(reply) => {

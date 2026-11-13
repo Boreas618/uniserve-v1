@@ -49,7 +49,7 @@ use tracing::{debug, trace, warn};
 
 use crate::http::handoff::{self, Admissions, Decision, FrozenStream};
 use crate::http::listener::Listener;
-use crate::http::stream::{Handed, HandedBody, Opened, Pause};
+use crate::http::stream::{Handed, HandedBody, Opened, Pause, failure_document};
 
 /// The accepted connection: a TCP stream on a serving address, a Unix stream
 /// on a socket address.
@@ -174,7 +174,7 @@ pub(crate) async fn adopt(
                 let error = crate::api::openai::error::ApiError::server_error(
                     "the response ended before it wrote its document".to_owned(),
                 );
-                let document = Connection::failure_document(&error);
+                let document = failure_document(&error);
                 connection
                     .write_failure(error, vec![document], !http.keep_alive)
                     .await?;
@@ -615,7 +615,7 @@ impl Connection {
                     let error = crate::api::openai::error::ApiError::server_error(
                         "the response's document was empty".to_owned(),
                     );
-                    let document = Self::failure_document(&error);
+                    let document = failure_document(&error);
                     return self.write_failure(error, vec![document], closing).await;
                 }
                 Some(Opened::Frame(frame)) => opening = Some(frame),
@@ -628,7 +628,7 @@ impl Connection {
                     let error = crate::api::openai::error::ApiError::server_error(
                         "the response ended before it wrote its document".to_owned(),
                     );
-                    let document = Self::failure_document(&error);
+                    let document = failure_document(&error);
                     return self.write_failure(error, vec![document], closing).await;
                 }
             }
@@ -690,14 +690,6 @@ impl Connection {
     ) -> anyhow::Result<()> {
         let head = head_bytes(parts, chunked, content_length, closing);
         self.write(&head, None).await.map(|_| ())
-    }
-
-    /// The document a failure answers with when the body produced none: the
-    /// error's own JSON, which is what a sink's `failed` writes for it.
-    fn failure_document(error: &crate::api::openai::error::ApiError) -> Bytes {
-        serde_json::to_vec(&error.to_error_response())
-            .map(Bytes::from)
-            .unwrap_or_default()
     }
 
     /// Answers a response that failed before its head was written: the status

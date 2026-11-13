@@ -43,6 +43,29 @@ fn exits_arrive_unasked_and_name_their_launch() {
     );
 }
 
+/// A launch asked for right behind the hello, before the welcome arrived, is
+/// the launch of the connection that asked: its exit comes back on it, as
+/// the exit of a launch asked for later does.
+#[test]
+fn a_launch_sent_with_the_hello_reports_its_exit_to_its_connection() {
+    let directory = tempfile::tempdir().unwrap();
+    let daemon = start(&directory, "node");
+    let (mut engine, reply) = Engine::connect_asking(
+        daemon.address().unwrap(),
+        request::Kind::Spawn(launch("node", "first", 0, 3, "/bin/false", &[])),
+    );
+    assert!(
+        matches!(reply.kind, Some(reply::Kind::Spawned(_))),
+        "{reply:?}"
+    );
+
+    let exit = engine.exit();
+    assert_eq!(
+        (exit.group.as_str(), exit.generation, exit.status.as_str()),
+        ("first", 3, "exit status: 1")
+    );
+}
+
 #[test]
 fn an_exit_goes_to_the_connection_that_asked_for_the_launch() {
     let directory = tempfile::tempdir().unwrap();

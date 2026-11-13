@@ -25,6 +25,7 @@ use tokio::sync::Semaphore;
 use uuid::Uuid;
 
 use crate::api::openai::{ApiError, RequestId};
+use crate::http::stream::HandedBody;
 
 const X_REQUEST_ID: HeaderName = HeaderName::from_static("x-request-id");
 
@@ -120,24 +121,39 @@ fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
     difference == 0
 }
 
-/// Bounds the time until the inner service returns a response head,
-/// answering `504 Gateway Timeout` when it expires.
+/// Bounds the time until the response head is sent, answering
+/// `504 Gateway Timeout` when it expires.
 ///
-/// The response body is not covered: a streamed chat completion and a video
-/// content download are bounded only until their headers are returned, not
-/// while their bodies are sent. Handlers that generate before responding,
-/// such as non-streaming chat completions and `/v1/videos/sync`, are bounded
-/// through generation. On expiry the handler future is dropped, which cancels
-/// its engine request.
+/// One deadline, `timeout` after the request arrives, bounds the inner
+/// service and then, for a response answered as one document (a non-streaming
+/// chat completion), the wait for that document: such a response returns from
+/// its handler with its head held while it generates, and the connection sends
+/// the head once the document exists (`HandedBody::bound_head`). A handler
+/// that generates before it responds, such as `/v1/videos/sync`, is bounded
+/// through generation by the first part. The response body is not covered: a
+/// streamed chat completion and a video content download are bounded only
+/// until their headers are returned, not while their bodies are sent. On
+/// expiry the handler future is dropped, or the held response's driver is told
+/// to end, which cancels its engine request.
 pub(crate) async fn enforce_timeout(timeout: Duration, request: Request, next: Next) -> Response {
-    match tokio::time::timeout(timeout, next.run(request)).await {
-        Ok(response) => response,
-        Err(_) => ApiError::timeout(format!(
-            "Request exceeded the {}s server timeout.",
-            timeout.as_secs()
-        ))
-        .into_response(),
+    let deadline = tokio::time::Instant::now() + timeout;
+    match tokio::time::timeout_at(deadline, next.run(request)).await {
+        Ok(response) => {
+            if let Some(body) = response.extensions().get::<HandedBody>() {
+                body.bound_head(deadline, timed_out(timeout));
+            }
+            response
+        }
+        Err(_) => timed_out(timeout).into_response(),
     }
+}
+
+/// The failure of a request whose head was not sent within `timeout`.
+fn timed_out(timeout: Duration) -> ApiError {
+    ApiError::timeout(format!(
+        "Request exceeded the {}s server timeout.",
+        timeout.as_secs()
+    ))
 }
 
 /// The in-flight limit shared by every generation route.

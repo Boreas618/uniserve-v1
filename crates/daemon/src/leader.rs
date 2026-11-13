@@ -3556,13 +3556,16 @@ mod tests {
         tokio::task::spawn_blocking(move || client.shutdown())
             .await
             .unwrap();
-        for _ in 0..100 {
-            if !engine.is_healthy() {
-                break;
-            }
+        // The leader learns of the loss from the engine's connection, a
+        // moment after the process ended.
+        let deadline = tokio::time::Instant::now() + STALL;
+        while engine.is_healthy() {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the leader still reports the lost engine healthy"
+            );
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
-        assert!(!engine.is_healthy());
 
         let error = engine.submit(text_request()).await.err();
         assert!(matches!(

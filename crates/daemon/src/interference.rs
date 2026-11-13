@@ -416,8 +416,16 @@ mod tests {
         // the change in progress reports.
         observer.record(1, 0, &report(15_000, 25, 32));
         assert_eq!(next(Duration::from_secs(10)), Some(true));
-        tokio::time::sleep(interval * 2).await;
-        let read = *service::lock(&steps);
+        // The control states the interval's reading once the halving it
+        // passed on returned.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let read = loop {
+            let read = *service::lock(&steps);
+            if read.halved || Instant::now() >= deadline {
+                break read;
+            }
+            tokio::time::sleep(interval).await;
+        };
         assert!(
             read.ratio.is_some_and(|ratio| (ratio - 1.5).abs() < 1e-9),
             "{read:?}"

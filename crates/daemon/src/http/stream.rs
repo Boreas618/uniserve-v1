@@ -46,6 +46,7 @@ use tokio::sync::{mpsc, oneshot};
 pub(crate) use crate::api::body::{Session, Step};
 pub(crate) use proto::handoff::stream::Application;
 
+use crate::api::openai::error::ApiError;
 use crate::http::handoff::Registration;
 
 /// How long a streamed response may wait for its next frame before the
@@ -73,6 +74,9 @@ enum Control {
     /// The successor owns the response: stop, releasing the request's engine
     /// stream to it (never cancelling the request).
     Adopted,
+    /// The connection answered the response without its body, because the
+    /// deadline of its held head passed: stop and cancel the request.
+    Abort,
 }
 
 /// What a connection's pause of one response found.
@@ -126,6 +130,10 @@ pub(crate) struct ResponseStream {
     /// Whether the response's head waits for the body's first output: one
     /// document, whose status is the outcome.
     head_held: bool,
+    /// When a held head must be decided by, and the failure the response
+    /// answers with once that passes first: the server's request timeout,
+    /// which bounds the time until the head is sent ([`Self::bound_head`]).
+    head_deadline: Option<(tokio::time::Instant, ApiError)>,
     control: mpsc::Sender<Control>,
     /// Whether to write an SSE comment while the body waits for its engine.
     keep_alive: bool,
@@ -158,6 +166,7 @@ impl ResponseStream {
             frames: produced,
             produced: std::collections::VecDeque::new(),
             head_held,
+            head_deadline: None,
             control,
             keep_alive,
         }
@@ -168,17 +177,55 @@ impl ResponseStream {
         self.head_held
     }
 
+    /// Bounds the wait for a held head: when the body has produced nothing by
+    /// `deadline`, [`Self::opened`] answers `error` in its place and the
+    /// request is cancelled. A head written at once has nothing to bound.
+    pub(crate) fn bound_head(&mut self, deadline: tokio::time::Instant, error: ApiError) {
+        if self.head_held {
+            self.head_deadline = Some((deadline, error));
+        }
+    }
+
     /// What the body produces first, for a connection whose head is not
     /// written yet.
+    ///
+    /// Cancel safe: the head's deadline is a point in time, so a call that
+    /// starts again after a cancelled one waits for the same deadline.
     pub(crate) async fn opened(&mut self) -> Opened {
         if let Some(frame) = self.produced.pop_front() {
             return Opened::Frame(frame);
         }
-        match self.frames.recv().await {
+        let produced = match &self.head_deadline {
+            // An output already produced wins over a deadline that passed
+            // meanwhile: the receive is polled first.
+            Some((deadline, error)) => {
+                match tokio::time::timeout_at(*deadline, self.frames.recv()).await {
+                    Ok(produced) => produced,
+                    Err(_) => {
+                        let error = error.clone();
+                        return self.expired(error);
+                    }
+                }
+            }
+            None => self.frames.recv().await,
+        };
+        match produced {
             Some(Produced::Frame(frame)) => Opened::Frame(frame),
             Some(Produced::Failed { error, frames }) => Opened::Failed(error, frames),
             None => Opened::Ended,
         }
+    }
+
+    /// The held head's deadline passed before the body produced anything:
+    /// the driver cancels the request, and the response answers `error` with
+    /// its document.
+    fn expired(&mut self, error: ApiError) -> Opened {
+        // Nothing else is queued on the control channel while a head is held
+        // (a pause ends the wait before it sends anything), so the message
+        // fits; a driver that already ended has no request left to cancel.
+        let _ = self.control.try_send(Control::Abort);
+        let document = failure_document(&error);
+        Opened::Failed(error, vec![document])
     }
 
     /// The next body frame; `None` once the body ended.
@@ -319,6 +366,22 @@ impl HandedBody {
     pub(crate) fn take(&self) -> Option<Handed> {
         service::lock(&self.0).take()
     }
+
+    /// Bounds the wait for the body's held head by `deadline`, past which
+    /// the response answers `error` ([`ResponseStream::bound_head`]).
+    pub(crate) fn bound_head(&self, deadline: tokio::time::Instant, error: ApiError) {
+        if let Some(handed) = service::lock(&self.0).as_mut() {
+            handed.stream.bound_head(deadline, error);
+        }
+    }
+}
+
+/// The document a failure answers with when the body produced none: the
+/// error's own JSON, which is what a sink's `failed` writes for it.
+pub(crate) fn failure_document(error: &ApiError) -> Bytes {
+    serde_json::to_vec(&error.to_error_response())
+        .map(Bytes::from)
+        .unwrap_or_default()
 }
 
 /// Attaches a handoffable body to `response`.
@@ -405,13 +468,19 @@ async fn drive(
                         // cannot be frozen again.
                         Some(Control::Pause(_)) => continue,
                         // The connection went away without a decision: the
-                        // client is gone, so the request ends with it.
-                        None => {
+                        // client is gone, so the request ends with it. An
+                        // abort ends it the same way.
+                        Some(Control::Abort) | None => {
                             session.abort();
                             return;
                         }
                     }
                 }
+            }
+            // The connection answered without the body: the request ends.
+            Driven::Message(Control::Abort) => {
+                session.abort();
+                return;
             }
             // A message while no pause is in flight carries nothing to do.
             Driven::Message(Control::Resume | Control::Adopted) => {}

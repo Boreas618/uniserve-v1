@@ -699,6 +699,10 @@ pub(crate) fn run_leader(
         // The request links that greeted this round, by the number they state:
         // filed beside the clients, because a command never goes down one.
         let mut request_links_new: Vec<(u64, u64)> = Vec::new();
+        // Whether a peer greeted this round and is filed under its key at its
+        // end: what it sent behind its hello is read at once, in the next
+        // round, rather than after a wait its socket would not end.
+        let mut refiled = false;
         // Engines: their hellos and requests; a closed engine takes its
         // processes on every node with it.
         for (&engine, peer) in &mut engines {
@@ -835,7 +839,18 @@ pub(crate) fn run_leader(
                             }
                             let _ = wake.send(());
                             peer.welcomed = true;
-                            continue;
+                            // Every peer but the frontend is filed under
+                            // another key at the end of this round, and a
+                            // request is served for the key it is read under:
+                            // the launches it asks for and their exits name
+                            // that key. A request that followed the hello
+                            // closely is therefore read next round, under the
+                            // key the peer keeps.
+                            if frontend {
+                                continue;
+                            }
+                            refiled = true;
+                            break;
                         }
                         Ok(None) => break,
                         Err(_) => {
@@ -1115,7 +1130,9 @@ pub(crate) fn run_leader(
         descriptors.extend(engines.values().map(|peer| peer.connection.as_raw_fd()));
         descriptors.extend(clients.values().map(|peer| peer.connection.as_raw_fd()));
         descriptors.extend(members.iter().map(|member| member.connection.as_raw_fd()));
-        wait(&descriptors, EXIT_POLL_INTERVAL);
+        if !refiled {
+            wait(&descriptors, EXIT_POLL_INTERVAL);
+        }
         stop.drain();
     }
 }

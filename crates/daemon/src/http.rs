@@ -594,8 +594,8 @@ mod tests {
 
     use super::*;
     use crate::test_support::{
-        SERVED_MODEL, admin_router, daemon_routers, harness_router, post_json, router, router_with,
-        send, served_engine,
+        SERVED_MODEL, admin_router, daemon_routers, engine_of, harness_router, post_json,
+        read_response, router, router_with, send, served_engine, text_fake,
     };
 
     /// A `GET` request to `path`.
@@ -1159,26 +1159,52 @@ mod tests {
         assert_eq!(body["data"][0]["id"], SERVED_MODEL);
     }
 
-    /// A request whose response head is not ready within the timeout gets
-    /// 504; a zero timeout expires before any generation can respond.
+    /// A request whose answer is not ready within the request timeout gets
+    /// 504 `request_timeout` once the timeout has passed. A chat completion
+    /// answered as one document returns from its handler with its head held
+    /// and generates afterwards, so the timeout bounds that generation too.
+    ///
+    /// The engine holds every batch it launches, so no answer exists until
+    /// the test releases it; the clock stands still from the handler's return
+    /// on and moves only when nothing else can run.
     #[tokio::test]
     async fn a_request_past_the_timeout_gets_504() {
+        let (executors, made) = std::sync::mpsc::channel();
+        let engine = engine_of(
+            crate::test_support::CHAT,
+            testkit::args(SERVED_MODEL),
+            testkit::Fixture::new(move |fake| {
+                let fake = text_fake(fake);
+                fake.hold();
+                let _ = executors.send(fake.clone());
+                fake
+            }),
+        );
+        // Shorter than a fixture's stall, so the timeout is the first wait
+        // the paused clock reaches.
+        let timeout = Duration::from_secs(10);
         let router = router_with(
-            served_engine(crate::test_support::CHAT),
+            engine,
             &ServerConfig {
-                request_timeout: Some(Duration::ZERO),
+                request_timeout: Some(timeout),
                 ..ServerConfig::default()
             },
         );
 
-        let (status, _, body) = send(
-            &router,
-            post_json("/v1/chat/completions", &chat_body(2, false)),
-        )
-        .await;
+        let sent = tokio::time::Instant::now();
+        let response = router
+            .oneshot(post_json("/v1/chat/completions", &chat_body(2, false)))
+            .await
+            .unwrap();
+        tokio::time::pause();
+        let (status, _, body) = read_response(response, "the chat completion").await;
 
-        assert_eq!(status, StatusCode::GATEWAY_TIMEOUT);
+        assert_eq!(status, StatusCode::GATEWAY_TIMEOUT, "{body}");
         assert_eq!(body["error"]["code"], "request_timeout");
+        assert!(tokio::time::Instant::now() >= sent + timeout);
+        for executor in made.try_iter() {
+            executor.resume();
+        }
     }
 
     /// At the in-flight limit, a generation request is shed with a retryable
@@ -1260,29 +1286,50 @@ mod tests {
         (listener, address)
     }
 
+    /// The serving options of a test server whose admin sockets are in
+    /// `directory`. The default places them in the host's runtime directory,
+    /// at a path every server of this process and a daemon on the host
+    /// share, and binding one there would take it from them.
+    fn serving_args(directory: &std::path::Path) -> ServerArgs {
+        let mut config = ServerArgs::default();
+        let socket = |name: &str| Some(directory.join(name).to_str().unwrap().to_owned());
+        config.admin_config.admin_uds = socket("admin.sock");
+        config.admin_config.harness_uds = socket("harness.sock");
+        config
+    }
+
+    /// Serves `engine` on `listener` under `config` until `shutdown` is
+    /// cancelled, as a daemon that cannot hand over does.
+    fn spawn_server(
+        engine: &Arc<Leader>,
+        listener: Listener,
+        config: ServerArgs,
+        shutdown: &CancellationToken,
+    ) -> tokio::task::JoinHandle<Result<()>> {
+        let engine = Arc::clone(engine);
+        let shutdown = shutdown.clone();
+        tokio::spawn(async move {
+            let admin = admin::Admin::new(shutdown.clone(), Arc::new(AtomicBool::new(false)));
+            let jobs = Arc::new(VideoJobs::new(
+                config.video_job_config.clone(),
+                shutdown.child_token(),
+            ));
+            serve_on(
+                &engine, &admin, listener, &config, &shutdown, &shutdown, jobs, None,
+            )
+            .await
+        })
+    }
+
     /// Shutdown lets a stream already in flight finish, stops accepting
     /// connections, and returns once drained.
     #[tokio::test]
     async fn shutdown_drains_requests_in_flight_and_refuses_new_connections() {
         let engine = Arc::new(served_engine(crate::test_support::CHAT));
         let (listener, address) = loopback().await;
+        let sockets = tempfile::tempdir().unwrap();
         let shutdown = CancellationToken::new();
-        let server = tokio::spawn({
-            let engine = Arc::clone(&engine);
-            let shutdown = shutdown.clone();
-            async move {
-                let admin = admin::Admin::new(shutdown.clone(), Arc::new(AtomicBool::new(false)));
-                let config = ServerArgs::default();
-                let jobs = Arc::new(VideoJobs::new(
-                    config.video_job_config.clone(),
-                    shutdown.child_token(),
-                ));
-                serve_on(
-                    &engine, &admin, listener, &config, &shutdown, &shutdown, jobs, None,
-                )
-                .await
-            }
-        });
+        let server = spawn_server(&engine, listener, serving_args(sockets.path()), &shutdown);
 
         let response = reqwest::Client::new()
             .post(format!("http://{address}/v1/chat/completions"))
@@ -1306,30 +1353,22 @@ mod tests {
     }
 
     /// A request that never completes holds the drain only until the
-    /// shutdown budget runs out.
-    #[tokio::test]
+    /// shutdown budget runs out: the server waits for it for the whole
+    /// budget, measured from the cancellation, and returns once the budget
+    /// has passed.
+    ///
+    /// The client withholds the request's body, so the request stays in
+    /// flight; the clock is paused and moves only when nothing else can run.
+    #[tokio::test(start_paused = true)]
     async fn shutdown_stops_waiting_when_its_budget_runs_out() {
         let engine = Arc::new(served_engine(crate::test_support::CHAT));
         let (listener, address) = loopback().await;
-        let budget = Duration::from_millis(200);
-        let mut config = ServerArgs::default();
+        let sockets = tempfile::tempdir().unwrap();
+        let budget = Duration::from_secs(30);
+        let mut config = serving_args(sockets.path());
         config.server_config.shutdown_timeout = budget;
         let shutdown = CancellationToken::new();
-        let server = tokio::spawn({
-            let engine = Arc::clone(&engine);
-            let shutdown = shutdown.clone();
-            async move {
-                let admin = admin::Admin::new(shutdown.clone(), Arc::new(AtomicBool::new(false)));
-                let jobs = Arc::new(VideoJobs::new(
-                    config.video_job_config.clone(),
-                    shutdown.child_token(),
-                ));
-                serve_on(
-                    &engine, &admin, listener, &config, &shutdown, &shutdown, jobs, None,
-                )
-                .await
-            }
-        });
+        let server = spawn_server(&engine, listener, config, &shutdown);
 
         // The server responds `100 Continue` once the handler waits for the
         // body, which this client never sends, so the request is in flight.
@@ -1346,14 +1385,19 @@ mod tests {
         connection.read_exact(&mut head).await.unwrap();
         assert!(head.starts_with(b"HTTP/1.1 100 Continue"));
 
-        let cancelled = Instant::now();
         shutdown.cancel();
-        tokio::time::timeout(Duration::from_secs(10), server)
+        let cancelled = tokio::time::Instant::now();
+        tokio::time::sleep(budget - Duration::from_millis(1)).await;
+        assert!(
+            !server.is_finished(),
+            "the server stopped waiting before its budget ran out"
+        );
+        tokio::time::timeout(budget, server)
             .await
-            .unwrap()
+            .expect("the server stops waiting once its budget ran out")
             .unwrap()
             .unwrap();
-        assert!(cancelled.elapsed() >= budget);
+        assert!(tokio::time::Instant::now() >= cancelled + budget);
         engine.shutdown().await.unwrap();
     }
 

@@ -73,6 +73,8 @@ winnow.workspace = true
 
 [dev-dependencies]
 criterion.workspace = true
+# The paused clock of the tests that wait on a deadline (`tokio::time::pause`).
+tokio = { workspace = true, features = ["test-util"] }
 expect-test.workspace = true
 # Builds the deterministic serving tokenizers of the test fixtures (`api::test_support`).
 tokenizers.workspace = true

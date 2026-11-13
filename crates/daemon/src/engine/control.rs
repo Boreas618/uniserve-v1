@@ -1697,11 +1697,18 @@ mod tests {
         let address = format!("unix:{}", path.display());
         let listener = Listener::bind(&address).unwrap();
         // The predecessor's client end, whose accepted side closed with its service.
-        let control = Connection::connect(&address).unwrap();
+        let mut control = Connection::connect(&address).unwrap();
         drop(listener.try_accept().expect("the accepted connection"));
         drop(listener);
 
-        let mut control = control;
+        // The close reaches this end once no process holds the accepted side's socket, and a
+        // child another thread of this process is spawning holds a copy until it starts its
+        // program: wait for the close, as the adopting daemon's polls do, rather than look once.
+        let closed = control.wait(Duration::from_secs(30));
+        assert_eq!(
+            closed.map_err(|error| error.kind()),
+            Err(std::io::ErrorKind::UnexpectedEof)
+        );
         assert!(
             !still_serving(&mut control).expect("a closed connection is not an engine exit"),
             "a closed control connection reports that the daemon's own client is gone"

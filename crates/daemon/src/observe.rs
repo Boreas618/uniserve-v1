@@ -52,8 +52,13 @@ impl Observer {
                 *profile.entry(key.clone()).or_default() += value;
             }
         }
-        let now = Instant::now();
+        // The sample is stamped under the lock, so the samples stand in the
+        // order of their stamps and a reader that reads up to an instant it
+        // took before locking misses none it will not read next time: a stamp
+        // taken before the lock could fall before that instant while the
+        // sample is pushed after the reader's pass.
         let mut samples = service::lock(&self.samples);
+        let now = Instant::now();
         samples.push_back(Sample {
             at: now,
             epoch,

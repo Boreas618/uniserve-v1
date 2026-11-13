@@ -389,6 +389,16 @@ pub(crate) async fn send(
         Ok(response) => response.unwrap(),
         Err(_) => panic!("{waited} got no response within {} s", STALL.as_secs()),
     };
+    read_response(response, &waited).await
+}
+
+/// The status, the headers, and the body parsed as JSON (`Null` for an empty
+/// body) that a connection writes for `response`, the router's answer to the
+/// request `waited` names.
+pub(crate) async fn read_response(
+    response: axum::response::Response,
+    waited: &str,
+) -> (StatusCode, HeaderMap, serde_json::Value) {
     // A response written as one document carries its body beside the response, and a connection
     // reads it from there: the status of a failure is the body's result, so it is read here too.
     let document = response
