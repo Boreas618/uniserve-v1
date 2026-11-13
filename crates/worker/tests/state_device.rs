@@ -82,6 +82,7 @@ fn config(trail: u32) -> StateConfig {
         rows: 2,
         trail,
         owned: 1,
+        drafter: Vec::new(),
     }
 }
 

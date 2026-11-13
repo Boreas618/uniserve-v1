@@ -110,7 +110,10 @@
 //! back: the batch's own, which for a verification samples every token, accepts the drafts
 //! its samples agree with and commits them, and the drafter's, which writes the draft cache
 //! and proposes each row's next drafts. Nothing is read back between them: what the second
-//! graph and the completion read of the first is kept in the runner's memory.
+//! graph and the completion read of the first is kept in the runner's memory. A drafter whose
+//! layers keep a state (`nn::Drafter::state`) is lent its live rows by each of its forwards,
+//! and every proposal is the argmax of the model's head over the drafter's own read of its
+//! output (`nn::Drafter::logits_rows`).
 
 mod columns;
 pub mod experts;
@@ -127,7 +130,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use ipc::batch::{Batch, BatchOutput, Phase, Shape as BatchShape, TimingCounters, Variant};
-use nn::family::{StateField, TextModel};
+use nn::family::{StateField, StateShape, TextModel};
 use nn::{KvCache, PhaseKind, RecurrentState, TokenBatch, VerifySlots};
 use platform::Stream;
 use proto::module::commit::COMMIT_FIELDS;
@@ -269,16 +272,16 @@ impl CausalLmRunner {
         Ok(stated(config)?.1.bytes())
     }
 
-    /// The bytes of device memory a runner that speculates keeps its target forwards' outputs
-    /// in, for a model of `hidden`-wide rows of `dtype`: each bucket's chosen tokens and
-    /// scores and the hidden rows of the largest, which the drafter's forward reads. Zero for
-    /// a config that states no drafts.
+    /// The bytes of device memory a runner of `model` that speculates under `config` keeps its
+    /// target forwards' outputs in: each bucket's chosen tokens and scores and the rows the
+    /// largest one's forward returns, `TextModel::stream_width` wide in the model's element
+    /// type, which the drafter's forward reads. Zero for a config that states no drafts.
     ///
     /// # Errors
     ///
     /// [`Error::Invalid`] for a config with no bucket, or one that states drafts and no draft
     /// pool.
-    pub fn kept_bytes(config: &CausalLmConfig, hidden: u32, dtype: DType) -> Result<u64> {
+    pub fn kept_bytes(config: &CausalLmConfig, model: &dyn TextModel) -> Result<u64> {
         if config.drafts == 0 {
             return Ok(0);
         }
@@ -288,8 +291,8 @@ impl CausalLmRunner {
             layout.rows(),
             layout.tokens(),
             config.candidates,
-            hidden,
-            dtype,
+            model.stream_width(),
+            model.dtype(),
         )
     }
 
@@ -410,12 +413,14 @@ impl CausalLmRunner {
                     slots.counts().clone(),
                     slots.bias().clone(),
                 )?;
+                // The drafter reads the rows the model's forward returns, which are its
+                // streams for a model that carries several.
                 let kept = Kept::new(
                     stream.as_ref(),
                     layout.rows(),
                     layout.tokens(),
                     config.candidates,
-                    model.hidden(),
+                    model.stream_width(),
                     model.dtype(),
                 )?;
 
@@ -426,6 +431,7 @@ impl CausalLmRunner {
                     verifier,
                     draft: None,
                     trail: None,
+                    state: None,
                 })
             }
             _ => None,
@@ -462,8 +468,8 @@ impl CausalLmRunner {
     }
 
     /// Lends a runner that speculates the draft cache its drafter's forwards compute over,
-    /// and the trail of the recurrent state when its model keeps one and its forwards lend no
-    /// verify slots.
+    /// the trail of the recurrent state when its model keeps one and its forwards lend no
+    /// verify slots, and the drafter's state when the drafter keeps one.
     ///
     /// - `draft` is the draft group as the rank's cache lends it: the drafter's planes, pages
     ///   of the draft pool's page size, and the workspace. Its `block_tables` is not read: a
@@ -472,16 +478,29 @@ impl CausalLmRunner {
     ///   `nn::RecurrentState::trail`, with a row for each token of the largest verification
     ///   bucket. A runner whose forwards lend verify slots keeps the state after each token in
     ///   its requests' slots, and is lent none.
+    /// - `drafter` is the live buffers of the drafter's state (`nn::Drafter::state`), in the
+    ///   layout of `nn::RecurrentState::live`, a home row per request slot of each field
+    ///   (`StateMemory::drafter`); `None` for a drafter that keeps no state. The drafter's
+    ///   forwards are lent them and advance them in place.
     ///
     /// The caller keeps their memory as it keeps the cache's and the state's.
     ///
     /// # Errors
     ///
     /// [`Error::Invalid`] for a runner that speculates nothing, a draft cache that is not the
-    /// drafter's layers over the draft pool's pages, or a trail that is not the model's
-    /// recurrent state over the tokens of a verification, or that the runner keeps none of.
-    pub fn set_draft_cache(&mut self, draft: KvCache, trail: Option<StateBuffers>) -> Result<()> {
-        let layers = self.model.drafter().map(|drafter| drafter.cache().layers);
+    /// drafter's layers over the draft pool's pages, a trail that is not the model's
+    /// recurrent state over the tokens of a verification, or that the runner keeps none of,
+    /// or a drafter's state that is not the drafter's fields over the config's request slots.
+    pub fn set_draft_cache(
+        &mut self,
+        draft: KvCache,
+        trail: Option<StateBuffers>,
+        drafter: Option<StateBuffers>,
+    ) -> Result<()> {
+        let (layers, drafter_runs) = match self.model.drafter() {
+            Some(drafter) => (Some(drafter.cache().layers), drafter.state()),
+            None => (None, Vec::new()),
+        };
         let Some(speculation) = self.speculation.as_mut() else {
             return Err(Error::Invalid(
                 "a draft cache lent to a runner whose config states no drafts".into(),
@@ -530,9 +549,11 @@ impl CausalLmRunner {
                  other verification is lent none"
             )));
         }
+        check_drafter_state(&drafter_runs, self.config.slots, drafter.as_ref())?;
 
         speculation.draft = Some(draft);
         speculation.trail = trail;
+        speculation.state = drafter;
         Ok(())
     }
 
@@ -700,11 +721,13 @@ impl CausalLmRunner {
         }
         let verify = match &self.speculation {
             Some(speculation) => {
+                // A refill evaluates positions behind its slot's own, and leaves the slot's
+                // state, the model's and the drafter's, as it was.
                 let refills = columns.drafts.iter().any(|work| work.refill.is_some());
-                if refills && self.state.is_some() {
+                if refills && (self.state.is_some() || speculation.state.is_some()) {
                     return Err(Error::Unsupported(format!(
-                        "batch {} refills the draft cache of a model that keeps a recurrent \
-                         state, which needs a scratch state for each refill row",
+                        "batch {} refills the draft cache of a model whose layers or drafter \
+                         keep a recurrent state, which needs a scratch state for each refill row",
                         batch.id.0
                     )));
                 }
@@ -896,6 +919,7 @@ impl CausalLmRunner {
             speculation::fill_drafter(
                 &self.layout,
                 &speculation.pool,
+                self.config.slots,
                 vocabulary,
                 &batch.columns,
                 &drafted,
@@ -1491,6 +1515,7 @@ impl Runner for CausalLmRunner {
             Some(speculation) if bucket.variant == Variant::Draft => speculation::fill_drafter(
                 &self.layout,
                 &speculation.pool,
+                self.config.slots,
                 vocabulary,
                 &idle,
                 &[],
@@ -1796,42 +1821,92 @@ fn check_state(
         }
     };
 
-    let layered = |buffers: &[Vec<Tensor>]| {
-        buffers.len() == layers.len()
-            && buffers
-                .iter()
-                .zip(&layers)
-                .all(|(layer, fields)| layer.len() == fields.len())
+    // The verify slots name every row a request owns of a stepwise field; a checkpoint keeps
+    // a home row per slot.
+    let slots = config.slots as usize;
+    check_buffers("live", live, &layers, |field| {
+        if field.stepwise {
+            slots * owned.unwrap_or(1) as usize
+        } else {
+            slots
+        }
+    })?;
+    check_buffers("checkpoint", checkpoint, &layers, |_| slots)
+}
+
+/// Refuses the live buffers of a drafter's state that are not those of `runs`, the drafter's
+/// (`nn::Drafter::state`), over `slots` request slots: a home row per slot of each field of
+/// every layer of the runs, and nothing for a drafter that keeps no state. A drafter's field
+/// keeps one slot per request, so a field that keeps one per verified token is refused.
+fn check_drafter_state(
+    runs: &[StateShape],
+    slots: u32,
+    state: Option<&StateBuffers>,
+) -> Result<()> {
+    let layers: Vec<&[StateField]> = layer_fields(runs).collect();
+
+    let live = match (layers.is_empty(), state) {
+        (true, None) => return Ok(()),
+        (false, Some(live)) => live,
+        (false, None) => {
+            return Err(Error::Invalid(
+                "the model's drafter keeps a state and the runner was lent none".into(),
+            ));
+        }
+        (true, Some(_)) => {
+            return Err(Error::Invalid(
+                "the runner was lent a drafter's state its model's drafter does not keep".into(),
+            ));
+        }
     };
-    if !layered(live) || !layered(checkpoint) {
+
+    if let Some(field) = layers
+        .iter()
+        .copied()
+        .flatten()
+        .find(|field| field.stepwise)
+    {
         return Err(Error::Invalid(format!(
-            "the recurrent state lends {} live and {} checkpoint layers, and the model keeps {} \
-             layers in {} runs, each of its run's fields",
-            live.len(),
-            checkpoint.len(),
-            layers.len(),
-            runs.len()
+            "the drafter's state field {} keeps a slot per verified token, and the drafter's \
+             forwards are lent one slot per request",
+            field.name
+        )));
+    }
+    check_buffers("drafter's live", live, &layers, |_| slots as usize)
+}
+
+/// Refuses `buffers`, the `what` buffers of a state, unless they hold a buffer per field of
+/// every layer of `layers`, in order, each of at least the rows `rows` states for its field: a
+/// forward addresses a row of a buffer by an index no kernel bounds.
+fn check_buffers(
+    what: &str,
+    buffers: &[Vec<Tensor>],
+    layers: &[&[StateField]],
+    rows: impl Fn(&StateField) -> usize,
+) -> Result<()> {
+    let layered = buffers.len() == layers.len()
+        && buffers
+            .iter()
+            .zip(layers)
+            .all(|(layer, fields)| layer.len() == fields.len());
+    if !layered {
+        return Err(Error::Invalid(format!(
+            "the state lends {} {what} layers, and {} layers keep a state, each its run's fields",
+            buffers.len(),
+            layers.len()
         )));
     }
 
-    // A forward addresses a row of a buffer by an index no kernel bounds: the verify slots
-    // name every row a request owns of a stepwise field.
-    for (buffers, fields) in live.iter().zip(&layers) {
+    for (buffers, fields) in buffers.iter().zip(layers) {
         for (buffer, field) in buffers.iter().zip(fields.iter()) {
-            let owned = if field.stepwise {
-                owned.unwrap_or(1)
-            } else {
-                1
-            };
-            let rows = config.slots as usize * owned as usize;
+            let rows = rows(field);
 
             if buffer.dims().first().is_none_or(|held| *held < rows) {
                 return Err(Error::Invalid(format!(
-                    "the live buffer of field {} is {:?}, and the runner's {} request slots \
+                    "the {what} buffer of field {} is {:?}, and the runner's request slots \
                      address {rows} rows of it",
                     field.name,
-                    buffer.dims(),
-                    config.slots
+                    buffer.dims()
                 )));
             }
         }

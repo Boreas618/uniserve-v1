@@ -21,6 +21,21 @@
 //! experts keep the checkpoint's order, because an expert redistribution names only the
 //! model's layers; an export's block-scaled FP8 experts are decoded to dense matrices at load.
 //!
+//! ## The drafter's state
+//!
+//! The layer's indexer keeps a ring of raw index keys and their rotary positions per request
+//! slot, as the model's attention layers do ([`IndexedAttention::state_fields`]), sized by the
+//! deployment's drafts. An entry's position is the position of the hidden state it reads, so
+//! the ring holds the drafter's own recent positions. It is the whole of the drafter's state
+//! ([`Drafter::state`]): one slot per request, kept in no checkpoint. A forward reads a ring
+//! row only to pool a group whose first tokens lie before its state row's first token, and a
+//! group is `compress_ratio` tokens, which divides the page; a forward that starts at a page
+//! boundary, as one resuming from a cached prefix does, reads no ring row from before it,
+//! since every group it pools starts at or after the boundary.
+//! The rows a verification's rejected entries and the chained steps leave past the accepted
+//! position are overwritten when those positions are computed again, as in the model's layers
+//! (`crate::attention`).
+//!
 //! The references run one multi-token-prediction layer per forward, and a forward here is not
 //! told its step, so a checkpoint of more than one layer is refused at load.
 
@@ -160,6 +175,7 @@ impl Drafter for Mtp {
         self.cache
     }
 
+    /// The layer's ring (module documentation): one run of one layer.
     fn state(&self) -> Vec<StateShape> {
         vec![self.state.clone()]
     }

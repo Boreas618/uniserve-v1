@@ -116,7 +116,7 @@ impl Tiny {
     /// The model with its drafter loaded.
     fn drafting(stateful: bool) -> Self {
         Self {
-            drafter: Some(TinyDrafter::new()),
+            drafter: Some(TinyDrafter::new(false)),
             ..Self::new(stateful)
         }
     }
@@ -128,10 +128,26 @@ struct TinyDrafter {
     gain: Tensor,
     key: Linear,
     value: Linear,
+    /// Whether the layer keeps a state of one layer, [`drafter_ring`]: its forward then asks
+    /// for that state, and its rows are read through its norm for their logits.
+    stateful: bool,
+}
+
+/// The state of a drafter that keeps one: a ring of four hidden rows a request slot.
+fn drafter_ring() -> StateShape {
+    StateShape {
+        layers: 1,
+        fields: vec![StateField {
+            name: "ring",
+            dtype: DType::BF16,
+            dims: vec![4, HIDDEN],
+            stepwise: false,
+        }],
+    }
 }
 
 impl TinyDrafter {
-    fn new() -> Self {
+    fn new(stateful: bool) -> Self {
         let linear = || {
             Linear::new(
                 meta((HEADS * DIM, HIDDEN), DType::BF16),
@@ -145,21 +161,12 @@ impl TinyDrafter {
             gain: meta(HIDDEN, DType::BF16),
             key: linear(),
             value: linear(),
-        }
-    }
-}
-
-impl Drafter for TinyDrafter {
-    fn cache(&self) -> CacheShape {
-        CacheShape {
-            index_keys: None,
-            layers: 1,
-            kv_heads: HEADS as u32,
-            head_dim: DIM as u32,
+            stateful,
         }
     }
 
-    fn forward(
+    /// The layer over the batch: the rows the drafter returns.
+    fn attend(
         &self,
         batch: &TokenBatch,
         cache: &KvCache,
@@ -195,6 +202,84 @@ impl Drafter for TinyDrafter {
             false,
             fused.dtype(),
         )
+    }
+}
+
+impl Drafter for TinyDrafter {
+    fn cache(&self) -> CacheShape {
+        CacheShape {
+            index_keys: None,
+            layers: 1,
+            kv_heads: HEADS as u32,
+            head_dim: DIM as u32,
+        }
+    }
+
+    fn state(&self) -> Vec<StateShape> {
+        if self.stateful {
+            vec![drafter_ring()]
+        } else {
+            Vec::new()
+        }
+    }
+
+    fn forward(
+        &self,
+        batch: &TokenBatch,
+        cache: &KvCache,
+        embedded: &Tensor,
+        hidden: &Tensor,
+    ) -> nn::Result<Tensor> {
+        if self.stateful {
+            return Err(nn::Error::Unsupported(
+                "the drafter keeps a state: it runs through forward_stateful".to_owned(),
+            ));
+        }
+        self.attend(batch, cache, embedded, hidden)
+    }
+
+    /// A drafter that keeps a state asks for its live rows alone, a state row per row of the
+    /// batch: no checkpoint, trail or verify slots, and no row kept.
+    fn forward_stateful(
+        &self,
+        batch: &TokenBatch,
+        cache: &KvCache,
+        state: Option<&RecurrentState>,
+        embedded: &Tensor,
+        hidden: &Tensor,
+    ) -> nn::Result<Tensor> {
+        if !self.stateful {
+            return self.forward(batch, cache, embedded, hidden);
+        }
+
+        let rows = batch.rows();
+        let lent = state.is_some_and(|state| {
+            let [layer] = state.live.as_slice() else {
+                return false;
+            };
+
+            matches!(layer.as_slice(), [ring] if ring.dims() == [SLOTS as usize, 4, HIDDEN])
+                && state.slots.dims() == [rows]
+                && state.checkpoints.dims() == [rows]
+                && state.query_offsets.dims() == [rows + 1]
+                && state.checkpoint.is_empty()
+                && state.trail.is_none()
+                && state.verify.is_none()
+        });
+        if !lent {
+            return Err(nn::Error::Unsupported(
+                "the drafter's state is not its live ring over the batch's rows".to_owned(),
+            ));
+        }
+        self.attend(batch, cache, embedded, hidden)
+    }
+
+    /// A drafter that keeps a state reads its rows through its own norm for their logits.
+    fn logits_rows(&self, hidden: &Tensor) -> nn::Result<Tensor> {
+        if !self.stateful {
+            return Ok(hidden.clone());
+        }
+        rms_norm(hidden, &self.gain, 1e-6, false, hidden.dtype())
     }
 }
 
@@ -2155,6 +2240,7 @@ fn a_runner_over_the_rank_s_cache_and_state_profiles_and_captures_every_bucket()
             rows: 4,
             trail: 0,
             owned: 1,
+            drafter: Vec::new(),
         },
         &config,
     )
@@ -2425,6 +2511,7 @@ fn a_state_checkpoint_is_read_and_written_at_the_run_its_position_names() {
             rows: 4,
             trail: 0,
             owned: 1,
+            drafter: Vec::new(),
         },
         &config,
     )
@@ -2593,7 +2680,7 @@ fn speculating(stateful: bool) -> CausalLmRunner {
     // The trail holds the state after each token of the largest verification: four rows of
     // a committed token and two drafts.
     runner
-        .set_draft_cache(draft_cache(), stateful.then(|| buffers(12)))
+        .set_draft_cache(draft_cache(), stateful.then(|| buffers(12)), None)
         .unwrap();
     runner
 }
@@ -2706,10 +2793,10 @@ fn a_speculating_runner_states_verification_and_drafter_buckets() {
 
     // The kept outputs and the input tensors are functions of the config.
     let config = speculating_config();
-    let kept = CausalLmRunner::kept_bytes(&config, HIDDEN as u32, DType::BF16).unwrap();
+    let kept = CausalLmRunner::kept_bytes(&config, &Tiny::drafting(false)).unwrap();
     assert!(kept >= (80 * HIDDEN * 2) as u64);
     assert_eq!(
-        CausalLmRunner::kept_bytes(&self::config(), HIDDEN as u32, DType::BF16).unwrap(),
+        CausalLmRunner::kept_bytes(&self::config(), &Tiny::drafting(false)).unwrap(),
         0
     );
     assert!(
@@ -2811,8 +2898,12 @@ fn a_verification_of_a_model_that_keeps_a_recurrent_state_settles_it_on_its_trai
     // A model that keeps a state verifies only with a trail of its largest verification.
     let mut unlent = speculating(true);
     let short = vec![vec![meta((11, HIDDEN), DType::BF16)]];
-    assert!(unlent.set_draft_cache(draft_cache(), Some(short)).is_err());
-    assert!(unlent.set_draft_cache(draft_cache(), None).is_err());
+    assert!(
+        unlent
+            .set_draft_cache(draft_cache(), Some(short), None)
+            .is_err()
+    );
+    assert!(unlent.set_draft_cache(draft_cache(), None, None).is_err());
 }
 
 #[test]
@@ -2948,6 +3039,7 @@ fn the_drafter_s_columns_follow_a_verification_and_a_prompt() {
     speculation::fill_drafter(
         &layout,
         &POOL,
+        SLOTS,
         VOCABULARY as u32,
         &batch.columns,
         &tables,
@@ -2976,9 +3068,11 @@ fn the_drafter_s_columns_follow_a_verification_and_a_prompt() {
         assert_eq!(u32s(Column::NoSlots, 12), [none; 12]);
         assert_eq!(u32s(Column::TokenCap, 12), [VOCABULARY as u32 - 1; 12]);
 
-        // A drafter row is a call's tokens, and reads the keys up to its last one.
+        // A drafter row is a call's tokens, and reads the keys up to its last one; it advances
+        // the drafter's state of its call's slot, which a slot without draft pages keeps too.
         assert_eq!(u32s(Column::StateOffsets, 5), [0, 3, 5, 5, 5]);
         assert_eq!(u32s(Column::DraftLens, 4), [13, 22, 0, 0]);
+        assert_eq!(u32s(Column::StateSlots, 4), [1, 3, none, none]);
 
         // A row's table names run `c` of the draft page in unit `u` as page `c · 16 + u`,
         // and the padding unit's pages where it holds none.
@@ -3036,6 +3130,7 @@ fn the_drafter_s_columns_follow_a_verification_and_a_prompt() {
     speculation::fill_drafter(
         &layout,
         &POOL,
+        SLOTS,
         VOCABULARY as u32,
         &batch.columns,
         &tables,
@@ -3061,6 +3156,7 @@ fn the_drafter_s_columns_follow_a_verification_and_a_prompt() {
         assert_eq!(u32s(Column::LastEntries, 4), [2, 4, 0, 0]);
         assert_eq!(u32s(Column::ProposalRows, 4), [none; 4]);
         assert_eq!(u32s(Column::DraftLens, 4), [3, 2, 0, 0]);
+        assert_eq!(u32s(Column::StateSlots, 4), [1, 3, none, none]);
 
         let positions = layout.read::<i32>(&block, Column::ChainPositions, 2 * stride);
         assert_eq!(positions[stride..][..4], [3, 2, 0, 0]);
@@ -3073,6 +3169,7 @@ fn the_drafter_s_columns_follow_a_verification_and_a_prompt() {
     speculation::fill_drafter(
         &layout,
         &POOL,
+        SLOTS,
         VOCABULARY as u32,
         &batch.columns,
         &tables,
@@ -3086,6 +3183,26 @@ fn the_drafter_s_columns_follow_a_verification_and_a_prompt() {
         [0, 0, 0, 0, 1, 1]
     );
     assert_eq!(layout.read::<u32>(&block, Column::LastEntries, 2), [2, 3]);
+
+    // A row with no entry, slot 4's one token, advances no drafter state.
+    let rows = &mut batch.columns.rows;
+    rows.query_offsets = vec![0, 3, 4];
+    rows.seq_lens = vec![3, 1];
+    rows.positions.truncate(4);
+    rows.cache_positions.truncate(4);
+    batch.columns.input_ids.truncate(4);
+    speculation::fill_drafter(
+        &layout,
+        &POOL,
+        SLOTS,
+        VOCABULARY as u32,
+        &batch.columns,
+        &tables,
+        &bucket,
+        &mut block,
+    )
+    .unwrap();
+    assert_eq!(layout.read::<u32>(&block, Column::StateSlots, 2), [1, none]);
 }
 
 #[test]
@@ -3329,7 +3446,11 @@ fn speculation_is_refused_where_the_runner_does_not_serve_it() {
     ));
 
     // A runner whose config states no drafts is lent no draft cache.
-    assert!(runner(false).set_draft_cache(draft_cache(), None).is_err());
+    assert!(
+        runner(false)
+            .set_draft_cache(draft_cache(), None, None)
+            .is_err()
+    );
 
     // Experts split across ranks.
     let groups = host_groups(2);
@@ -3340,7 +3461,14 @@ fn speculation_is_refused_where_the_runner_does_not_serve_it() {
     assert!(matches!(refused, Error::Unsupported(_)), "{refused}");
 
     // A refill of the draft cache of a model that keeps a recurrent state.
-    let mut stateful = speculating(true);
+    let refused = speculating(true)
+        .prepare_inputs(&refill(), &held(&[2, 4]))
+        .unwrap_err();
+    assert!(matches!(refused, Error::Unsupported(_)), "{refused}");
+}
+
+/// A prompt batch that refills slot 2's draft cache from its first position.
+fn refill() -> Batch {
     let mut refill = prefill(Variant::PrefillWrite);
     refill.columns.rows.logits_rows = vec![-1, -1];
     refill.columns.commit = commit(&[(2, mode::CACHE, -1), (4, mode::CACHE, -1)]);
@@ -3353,8 +3481,77 @@ fn speculation_is_refused_where_the_runner_does_not_serve_it() {
         },
         DraftWork::default(),
     ];
-    let refused = stateful
-        .prepare_inputs(&refill, &held(&[2, 4]))
+    refill
+}
+
+/// A speculating runner of [`Tiny`], which keeps no state, whose drafter keeps one, over graphs
+/// that hold no device and lent no draft cache yet.
+fn speculating_with_drafter_state() -> CausalLmRunner {
+    let config = speculating_config();
+    let graphs = Graphs::meta(
+        Arc::new(Generation::new(0, [])),
+        CausalLmRunner::input_bytes(&config).unwrap(),
+    );
+    let pooled = meta((SLOTS as usize + 1, TABLE_WIDTH), DType::U32);
+    let model = Tiny {
+        drafter: Some(TinyDrafter::new(true)),
+        ..Tiny::new(false)
+    };
+
+    CausalLmRunner::new(
+        Arc::new(model),
+        config,
+        graphs,
+        None,
+        vec![group(PAGES, pooled)],
+        None,
+    )
+    .unwrap()
+}
+
+#[test]
+fn a_drafter_that_keeps_a_state_is_lent_it_by_each_of_its_forwards() {
+    let ring = |slots: u32| vec![vec![meta((slots as usize, 4, HIDDEN), DType::BF16)]];
+
+    // The drafter refuses a forward that withholds its state or lends another: its entries
+    // and its chained steps are lent its live ring over their rows, and every bucket is
+    // profiled and captured.
+    let mut runner = speculating_with_drafter_state();
+    runner
+        .set_draft_cache(draft_cache(), None, Some(ring(SLOTS)))
+        .unwrap();
+    runner.graphs().profile_run(&runner).unwrap();
+    for bucket in runner.buckets() {
+        runner.graphs().capture(&runner, &bucket).unwrap();
+    }
+
+    // Each proposal is the argmax of the model's head over the drafter's own read of its rows,
+    // a norm the drafter that keeps no state does not make.
+    let plain = speculating(false);
+    plain.graphs().profile_run(&plain).unwrap();
+    let norm = <ops::norm::RmsNorm as ops::Op>::NAME;
+    let norms = |runner: &CausalLmRunner| count(&operators(runner, &Bucket::draft(4, 12)), norm);
+    assert_eq!(norms(&runner), norms(&plain) + DRAFTS as usize);
+
+    // The state is the drafter's own over every request slot, and a drafter that keeps none is
+    // lent none.
+    let mut unlent = speculating_with_drafter_state();
+    assert!(unlent.set_draft_cache(draft_cache(), None, None).is_err());
+    assert!(
+        unlent
+            .set_draft_cache(draft_cache(), None, Some(ring(SLOTS - 1)))
+            .is_err()
+    );
+    assert!(
+        speculating(false)
+            .set_draft_cache(draft_cache(), None, Some(ring(SLOTS)))
+            .is_err()
+    );
+
+    // A refill evaluates positions behind its slot's own, which would advance the slot's
+    // drafter state from there.
+    let refused = runner
+        .prepare_inputs(&refill(), &held(&[2, 4]))
         .unwrap_err();
     assert!(matches!(refused, Error::Unsupported(_)), "{refused}");
 }
@@ -3441,24 +3638,36 @@ fn a_speculating_runner_is_built_over_the_rank_s_draft_group_and_trail() {
                 rows: 4,
                 trail,
                 owned: 1,
+                drafter: Vec::new(),
             },
             &cache_config,
         )
         .unwrap()
     };
-    let over = |config: CausalLmConfig, state: &StateMemory| {
+    let over = |config: CausalLmConfig, state: &StateMemory, drafter: TinyDrafter| {
         let graphs = Graphs::meta(
             Arc::new(Generation::new(0, [])),
             CausalLmRunner::input_bytes(&config)?,
         );
-        let model = Arc::new(Tiny::drafting(true));
+        let model = Tiny {
+            drafter: Some(drafter),
+            ..Tiny::new(true)
+        };
 
-        CausalLmRunner::over(model, config, graphs, None, &lock(&cache), Some(state))
+        CausalLmRunner::over(
+            Arc::new(model),
+            config,
+            graphs,
+            None,
+            &lock(&cache),
+            Some(state),
+        )
     };
+    let plain = || TinyDrafter::new(false);
 
     // The runner is lent the draft group's planes and the state's trail, and captures its
     // verification and drafter buckets over them.
-    let mut runner = over(config.clone(), &state(12)).unwrap();
+    let mut runner = over(config.clone(), &state(12), plain()).unwrap();
     runner.graphs().profile_run(&runner).unwrap();
     for bucket in runner.buckets() {
         runner.graphs().capture(&runner, &bucket).unwrap();
@@ -3467,8 +3676,22 @@ fn a_speculating_runner_is_built_over_the_rank_s_draft_group_and_trail() {
 
     // A state opened with no trail, or with one shorter than a verification, verifies
     // nothing; neither does a config that states another draft pool than the cache's.
-    assert!(over(config.clone(), &state(0)).is_err());
-    assert!(over(config.clone(), &state(11)).is_err());
+    assert!(over(config.clone(), &state(0), plain()).is_err());
+    assert!(over(config.clone(), &state(11), plain()).is_err());
+
+    // A drafter that keeps a state is lent the one the rank's state keeps for it; a state that
+    // keeps none for it serves no such drafter.
+    let ringed = StateMemory::meta(
+        StateConfig {
+            drafter: vec![drafter_ring()],
+            ..state(12).config().clone()
+        },
+        &cache_config,
+    )
+    .unwrap();
+    let drafting = over(config.clone(), &ringed, TinyDrafter::new(true)).unwrap();
+    drafting.graphs().profile_run(&drafting).unwrap();
+    assert!(over(config.clone(), &state(12), TinyDrafter::new(true)).is_err());
     let moved = CausalLmConfig {
         draft_pool: Some(DraftPool {
             units: pool.units + 1,
@@ -3476,7 +3699,7 @@ fn a_speculating_runner_is_built_over_the_rank_s_draft_group_and_trail() {
         }),
         ..config
     };
-    assert!(over(moved, &state(12)).is_err());
+    assert!(over(moved, &state(12), plain()).is_err());
 
     // The drafter's rows read their slots' entries of the draft group's class: a batch whose
     // slot holds a draft page reaches the replay with its drafter's table stated.
@@ -3603,7 +3826,7 @@ fn a_model_that_reads_token_ids_is_lent_them_by_every_forward() {
         )
         .unwrap();
         if drafting {
-            runner.set_draft_cache(draft_cache(), None).unwrap();
+            runner.set_draft_cache(draft_cache(), None, None).unwrap();
         }
 
         runner.graphs().profile_run(&runner).unwrap();
@@ -3796,6 +4019,7 @@ fn a_runner_over_stepwise_state_lends_verify_slots_to_every_forward_and_keeps_no
                 rows: 4,
                 trail: 0,
                 owned,
+                drafter: Vec::new(),
             },
             &cache_config,
         )

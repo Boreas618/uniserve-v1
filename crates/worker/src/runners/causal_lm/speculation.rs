@@ -73,12 +73,26 @@
 //! entry and writes only the writable ones: an entry at a position it would write that is
 //! missing or read-only is not written.
 //!
+//! ## The drafter's state and its proposals
+//!
+//! A drafter whose layers keep a state (`nn::Drafter::state`) is run through
+//! `nn::Drafter::forward_stateful`, every other through `nn::Drafter::forward`. Its state is
+//! a live home row per request slot of each field (`StateMemory::drafter`), and its state rows
+//! are its batch's rows: a drafter row's entries, then each chained step's one token, on the
+//! row's request slot. A row with no entry names no slot, and so leaves its slot's state as it
+//! was. Every entry of a verification advances the state, its rejected ones included, and so
+//! does each chained step: the drafter states only fields that a later forward overwrites at
+//! those positions before it reads them. No checkpoint keeps the drafter's state.
+//!
+//! The drafter's output is the rows its next chained step reads; the model's head projects the
+//! drafter's own read of them (`nn::Drafter::logits_rows`), whose argmax is the proposal.
+//!
 //! ## What is refused
 //!
 //! A runner that speculates joins no expert union, serves no paired forward of a verification
 //! (its token rows share one request's pages, and the scratch set gives each row its own), and
-//! refuses a draft cache refill of a model that keeps a recurrent state, which would need a
-//! scratch state per refill row.
+//! refuses a draft cache refill of a model whose layers or drafter keep a recurrent state,
+//! which would need a scratch state per refill row.
 
 use std::sync::Arc;
 
@@ -419,6 +433,9 @@ pub(crate) struct Speculation {
     pub(crate) draft: Option<KvCache>,
     /// The trail buffers of the recurrent state, for a model that keeps one.
     pub(crate) trail: Option<StateBuffers>,
+    /// The live buffers of the drafter's state, for a drafter that keeps one (module
+    /// documentation, the drafter's state).
+    pub(crate) state: Option<StateBuffers>,
 }
 
 /// The agreed length of each verification and the token that ends its accepted prefix:
@@ -875,12 +892,24 @@ fn row_work(columns: &Columns, row: usize) -> DraftWork {
 /// drafter may write, `0` where it may not ([`DraftPool::table`]). A position whose page the
 /// drafter may not write writes no entry.
 ///
+/// A drafter row's state slot is the row of its request slot among the runner's `slots`, or
+/// [`NO_SLOT`] for a row on no slot or with no entry (module documentation, the drafter's
+/// state). A verification's sequences are its drafter rows, so the state offsets and slots
+/// written here are those [`fill_verification`] writes for them.
+///
 /// # Errors
 ///
-/// [`Error::Invalid`] for a batch the bucket does not hold or a position that is none.
+/// [`Error::Invalid`] for a batch the bucket does not hold, a position that is none, or a
+/// slot the runner does not hold.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the runner's shape, the draft pool, the batch, its draft pages, the bucket and the \
+              block"
+)]
 pub(crate) fn fill_drafter(
     layout: &Layout,
     pool: &DraftPool,
+    slots: u32,
     vocabulary: u32,
     columns: &Columns,
     tables: &[DraftTable],
@@ -925,6 +954,7 @@ pub(crate) fn fill_drafter(
     let mut draft_slots = vec![NO_SLOT; bucket_tokens];
 
     let mut state_offsets = vec![tokens as u32; bucket_rows + 1];
+    let mut state_slots = vec![NO_SLOT; bucket_rows];
     let mut lens = vec![0_u32; bucket_rows];
     let mut pages = Vec::with_capacity(bucket_rows * layout.pages());
 
@@ -995,6 +1025,11 @@ pub(crate) fn fill_drafter(
         last_entries[row] = base as u32;
         let start = position(base)?;
 
+        // A row with an entry advances its slot's drafter state.
+        if let Some(Ok(slot)) = columns.slots.get(row).copied().map(u32::try_from) {
+            state_slots[row] = slot_row(slot, slots)?;
+        }
+
         for cell in 0..2 * drafts - 1 {
             chain_slots[row * cells + cell] = pool.slot(*page, written, start + cell as u32 + 1);
         }
@@ -1031,6 +1066,7 @@ pub(crate) fn fill_drafter(
         &vec![vocabulary - 1; bucket_tokens],
     )?;
     layout.put(block, Column::StateOffsets, &state_offsets)?;
+    layout.put(block, Column::StateSlots, &state_slots)?;
     layout.put(block, Column::DraftLens, &lens)?;
     layout.put(block, Column::DraftTables, &pages)?;
     layout.put(block, Column::LastEntries, &last_entries)?;
@@ -1388,11 +1424,40 @@ impl CausalLmRunner {
         };
         batch.check()?;
 
+        // A drafter that keeps a state is lent its live rows, a state row per drafter row on
+        // the row's slot, and keeps no checkpoint (module documentation).
+        let lent = match &speculation.state {
+            Some(live) => {
+                let slots = self.column(Column::StateSlots, rows)?;
+                let keeps_none = slots.zeros_like()?;
+
+                Some((live, slots, keeps_none))
+            }
+            None => None,
+        };
+        let run = |batch: &TokenBatch, embedded: &Tensor, hidden: &Tensor| -> Result<Tensor> {
+            let Some((live, slots, keeps_none)) = &lent else {
+                return Ok(drafter.forward(batch, &cache, embedded, hidden)?);
+            };
+            let state = RecurrentState {
+                query_offsets: batch.query_offsets.clone(),
+                seq_lens: batch.seq_lens.clone(),
+                slots: slots.clone(),
+                checkpoints: keeps_none.clone(),
+                live: (*live).clone(),
+                checkpoint: Vec::new(),
+                trail: None,
+                verify: None,
+            };
+
+            Ok(drafter.forward_stateful(batch, &cache, Some(&state), embedded, hidden)?)
+        };
+
         let drafted = {
             let embedded = self.model.embed_input_ids(&next)?;
             let hidden = kept.tensor(HIDDEN).narrow(0, 0, tokens)?;
 
-            drafter.forward(&batch, &cache, &embedded, &hidden)?
+            run(&batch, &embedded, &hidden)?
         };
 
         // ---- The proposals: the first from each row's last entry, then the chained steps ----
@@ -1444,10 +1509,12 @@ impl CausalLmRunner {
                 let embedded = self
                     .model
                     .embed_input_ids(&previous.minimum(&cap.narrow(0, 0, rows)?)?)?;
-                current = drafter.forward(&batch, &cache, &embedded, &current)?;
+                current = run(&batch, &embedded, &current)?;
             }
 
-            proposals.push(functional::argmax(&self.model.compute_logits(&current)?)?);
+            // The model's head projects the drafter's own read of its rows.
+            let logits = self.model.compute_logits(&drafter.logits_rows(&current)?)?;
+            proposals.push(functional::argmax(&logits)?);
         }
         Ok(proposals)
     }

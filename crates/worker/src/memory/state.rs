@@ -18,6 +18,15 @@
 //! ([`StateMemory::row`]); a padding row of a batch states `nn::NO_SLOT` in the batch's state
 //! slot column and reads and writes no row.
 //!
+//! ## The drafter's state
+//!
+//! A deployment that speculates with a drafter whose layers keep a state (`nn::Drafter::state`)
+//! keeps it here too ([`StateConfig::drafter`], [`StateMemory::drafter`]): one **live** buffer
+//! per field of every drafter layer, a home row per request slot, which the drafter's forwards
+//! read and advance in place. It has no checkpoint, no trail and no verify slots, and no copy
+//! moves it: a drafter states only fields that a forward from a page boundary does not read
+//! from before it, so a request that resumes from a cached prefix needs none of its rows.
+//!
 //! ## Verify slots
 //!
 //! A field that keeps the state after each token of a decode-phase row in a slot of its own
@@ -104,6 +113,11 @@ pub struct StateConfig {
     /// the tokens a verification holds, `draft_tokens + 1`, for a deployment that speculates,
     /// and one for every other.
     pub owned: u32,
+    /// The runs of the drafter's layers that keep a state (`nn::Drafter::state`), in its order
+    /// of them: a live home row per request slot of each field, and nothing else (module
+    /// documentation, the drafter's state). Empty for a deployment that does not speculate or
+    /// whose drafter keeps none.
+    pub drafter: Vec<StateShape>,
 }
 
 /// Each recurrent layer's fields, in the order the state's buffers follow: the layers of the
@@ -117,16 +131,21 @@ impl StateConfig {
     /// The device bytes the state takes from the pool that lives as long as the rank serves,
     /// for a cache of `layout`: the live and checkpoint buffers of every field of every layer,
     /// each live buffer's rows ([`Self::live_rows`]), a checkpoint row per slot and the
-    /// trail's row per token, and the copies' index vectors. The snapshot is the scratch
-    /// pool's ([`CacheLayout::state_snapshot_bytes`]).
+    /// trail's row per token, the drafter's live row per slot of each of its fields, and the
+    /// copies' index vectors. The snapshot is the scratch pool's
+    /// ([`CacheLayout::state_snapshot_bytes`]).
     pub fn bytes(&self, layout: &CacheLayout) -> u64 {
         let (slots, trail) = (u64::from(self.slots), u64::from(self.trail));
         let buffers: u64 = layer_fields(&self.shapes)
             .flatten()
             .map(|field| (u64::from(self.live_rows(field)) + slots + trail) * field.bytes())
             .sum();
+        let drafter: u64 = layer_fields(&self.drafter)
+            .flatten()
+            .map(|field| slots * field.bytes())
+            .sum();
 
-        buffers + RING as u64 * self.index_bytes(layout)
+        buffers + drafter + RING as u64 * self.index_bytes(layout)
     }
 
     /// The rows of `field`'s live buffer: a home row per request slot, and the further slots
@@ -164,6 +183,9 @@ struct Buffers {
     checkpoint: Vec<Vec<Buffer>>,
     /// `[layer][field]` the trail buffers; empty in a deployment that does not speculate.
     trail: Vec<Vec<Buffer>>,
+    /// `[drafter layer][field]` the drafter's live buffers; empty for a drafter that keeps no
+    /// state.
+    drafter: Vec<Vec<Buffer>>,
     /// What one copy moves a state page through, `[page planes, plane_bytes]` bytes.
     snapshot: Buffer,
     /// The copies' index vectors, [`RING`] sets.
@@ -205,15 +227,30 @@ impl StateMemory {
     ///
     /// # Errors
     ///
-    /// A config of no slot, layer or field, or a cache whose layout holds no state group for
-    /// the checkpoints.
+    /// A config of no slot, layer or field, a drafter's field that keeps a slot per verified
+    /// token, or a cache whose layout holds no state group for the checkpoints.
     pub fn meta(config: StateConfig, cache: &KvCacheConfig) -> Result<Self> {
         let layers: Vec<&[StateField]> = layer_fields(&config.shapes).collect();
-        if config.slots == 0 || config.owned == 0 || layers.iter().any(|fields| fields.is_empty()) {
+        let fieldless = layer_fields(&config.shapes)
+            .chain(layer_fields(&config.drafter))
+            .any(|fields| fields.is_empty());
+        if config.slots == 0 || config.owned == 0 || fieldless {
             return Err(Error::Invalid(format!(
                 "a recurrent state of {} slots, of which a request owns {} of a stepwise field, \
                  whose every layer keeps a field",
                 config.slots, config.owned
+            )));
+        }
+
+        // The drafter's forwards are lent its live rows alone (module documentation).
+        if let Some(field) = layer_fields(&config.drafter)
+            .flatten()
+            .find(|field| field.stepwise)
+        {
+            return Err(Error::Invalid(format!(
+                "the drafter's state field {} keeps a slot per verified token, and a drafter's \
+                 state keeps one slot per request",
+                field.name
             )));
         }
         if layers.is_empty() {
@@ -298,27 +335,30 @@ impl StateMemory {
         let mut state = Self::meta(config, cache)?;
         let config = state.config.clone();
 
-        // One buffer per field of every layer, of the rows `rows` states for the field.
-        let mut take = |rows: &dyn Fn(&StateField) -> u32| -> Result<Vec<Vec<Buffer>>> {
-            layer_fields(&config.shapes)
-                .map(|fields| {
-                    fields
-                        .iter()
-                        .map(|field| {
-                            let bytes = u64::from(rows(field)) * field.bytes();
-                            Ok(allocator.allocate(PoolKind::Resident, bytes as usize)?)
-                        })
-                        .collect()
-                })
-                .collect()
-        };
-        let live = take(&|field| config.live_rows(field))?;
-        let checkpoint = take(&|_| config.slots)?;
+        // One buffer per field of every layer of `runs`, of the rows `rows` states for the
+        // field.
+        let mut take =
+            |runs: &[StateShape], rows: &dyn Fn(&StateField) -> u32| -> Result<Vec<Vec<Buffer>>> {
+                layer_fields(runs)
+                    .map(|fields| {
+                        fields
+                            .iter()
+                            .map(|field| {
+                                let bytes = u64::from(rows(field)) * field.bytes();
+                                Ok(allocator.allocate(PoolKind::Resident, bytes as usize)?)
+                            })
+                            .collect()
+                    })
+                    .collect()
+            };
+        let live = take(&config.shapes, &|field| config.live_rows(field))?;
+        let checkpoint = take(&config.shapes, &|_| config.slots)?;
         let trail = if config.trail > 0 {
-            take(&|_| config.trail)?
+            take(&config.shapes, &|_| config.trail)?
         } else {
             Vec::new()
         };
+        let drafter = take(&config.drafter, &|_| config.slots)?;
 
         let index_bytes = state.config.index_bytes(&cache.layout) as usize;
         let indices = (0..RING)
@@ -342,6 +382,7 @@ impl StateMemory {
             live,
             checkpoint,
             trail,
+            drafter,
             snapshot,
             indices,
             read: (0..RING).map(|_| None).collect(),
@@ -399,11 +440,12 @@ impl StateMemory {
         }
     }
 
-    /// The tensors of one kind of buffer, `[layer][field]`: each `[rows, …]` in its field's
-    /// element type and extents, or `[rows, bytes]` U8 when `raw`, as a copy moves it, `rows`
-    /// being what `rows` states for the field.
+    /// The tensors of one kind of buffer of the layers of `runs`, `[layer][field]`: each
+    /// `[rows, …]` in its field's element type and extents, or `[rows, bytes]` U8 when `raw`,
+    /// as a copy moves it, `rows` being what `rows` states for the field.
     fn tensors(
         &self,
+        runs: &[StateShape],
         rows: impl Fn(&StateField) -> u32,
         raw: bool,
         buffers: impl Fn(&Buffers) -> &Vec<Vec<Buffer>>,
@@ -418,7 +460,7 @@ impl StateMemory {
             dims
         };
 
-        layer_fields(&self.config.shapes)
+        layer_fields(runs)
             .enumerate()
             .map(|(layer, fields)| {
                 fields
@@ -443,6 +485,7 @@ impl StateMemory {
     /// slot, and the further slots of a stepwise field ([`StateConfig::live_rows`]).
     pub fn live(&self) -> Result<Vec<Vec<Tensor>>> {
         self.tensors(
+            &self.config.shapes,
             |field| self.config.live_rows(field),
             false,
             |buffers| &buffers.live,
@@ -452,7 +495,12 @@ impl StateMemory {
     /// The checkpoint buffers, in the same order and extents as [`Self::live`] but a row per
     /// slot of every field: a checkpoint keeps the state a home row holds.
     pub fn checkpoint(&self) -> Result<Vec<Vec<Tensor>>> {
-        self.tensors(|_| self.config.slots, false, |buffers| &buffers.checkpoint)
+        self.tensors(
+            &self.config.shapes,
+            |_| self.config.slots,
+            false,
+            |buffers| &buffers.checkpoint,
+        )
     }
 
     /// The trail buffers, in the same order, `[trail, …]`; `None` in a deployment that keeps
@@ -461,8 +509,30 @@ impl StateMemory {
         if self.config.trail == 0 {
             return Ok(None);
         }
-        self.tensors(|_| self.config.trail, false, |buffers| &buffers.trail)
-            .map(Some)
+        self.tensors(
+            &self.config.shapes,
+            |_| self.config.trail,
+            false,
+            |buffers| &buffers.trail,
+        )
+        .map(Some)
+    }
+
+    /// The drafter's live buffers (module documentation, the drafter's state): one entry per
+    /// layer of the drafter's runs ([`StateConfig::drafter`]), each the layer's fields,
+    /// `[slots, …]`, as `nn::RecurrentState::live` holds them for the drafter's forwards;
+    /// `None` for a drafter that keeps no state.
+    pub fn drafter(&self) -> Result<Option<Vec<Vec<Tensor>>>> {
+        if layer_fields(&self.config.drafter).next().is_none() {
+            return Ok(None);
+        }
+        self.tensors(
+            &self.config.drafter,
+            |_| self.config.slots,
+            false,
+            |buffers| &buffers.drafter,
+        )
+        .map(Some)
     }
 
     /// The state as a forward is lent it, for a batch whose state rows the four columns
@@ -788,10 +858,12 @@ impl StateMemory {
             return Ok(());
         };
         // A copy moves a slot's home row, which the first `slots` rows of every buffer hold.
-        let slots = |_: &StateField| self.config.slots;
+        let (model, slots) = (&self.config.shapes, |_: &StateField| self.config.slots);
         let buffers = match direction {
-            StateDirection::Restore => self.tensors(slots, true, |buffers| &buffers.live)?,
-            StateDirection::Keep => self.tensors(slots, true, |buffers| &buffers.checkpoint)?,
+            StateDirection::Restore => self.tensors(model, slots, true, |buffers| &buffers.live)?,
+            StateDirection::Keep => {
+                self.tensors(model, slots, true, |buffers| &buffers.checkpoint)?
+            }
         };
         let runs = cache.state_runs()?;
         let snapshot = |offset: u64, rows: usize, width: u64| {
@@ -937,6 +1009,7 @@ mod tests {
             rows: 2,
             trail,
             owned: 1,
+            drafter: Vec::new(),
         }
     }
 
@@ -1190,6 +1263,74 @@ mod tests {
 
         // A state of other runs than the ones its cache's state pages hold.
         assert!(StateMemory::meta(self::config(0), &cache).is_err());
+        Ok(())
+    }
+
+    /// A drafter's state of one layer: a ring of four 8-wide BF16 keys and their three I32
+    /// coordinates, 64 and 48 bytes a slot.
+    fn ring() -> StateShape {
+        StateShape {
+            layers: 1,
+            fields: vec![
+                StateField {
+                    name: "index_ring",
+                    dtype: DType::BF16,
+                    dims: vec![4, 8],
+                    stepwise: false,
+                },
+                StateField {
+                    name: "index_ring_positions",
+                    dtype: DType::I32,
+                    dims: vec![4, 3],
+                    stepwise: false,
+                },
+            ],
+        }
+    }
+
+    /// A drafter's state is a live home row per slot of each of its fields, beside the model's
+    /// state and outside its checkpoints: the model's buffers and the copies' kernels are what
+    /// they are without it. A drafter's field that keeps a slot per verified token is refused.
+    #[test]
+    fn a_drafters_state_is_one_live_row_per_slot() -> Result<()> {
+        let drafting = StateConfig {
+            drafter: vec![ring()],
+            ..config(0)
+        };
+        let state = StateMemory::meta(drafting.clone(), &cache())?;
+        let plain = StateMemory::meta(config(0), &cache())?;
+
+        let drafter = state.drafter()?.expect("the drafter's state");
+        assert_eq!(drafter.len(), 1);
+        assert_eq!(
+            (drafter[0][0].dims(), drafter[0][0].dtype()),
+            (&[3, 4, 8][..], DType::BF16)
+        );
+        assert_eq!(
+            (drafter[0][1].dims(), drafter[0][1].dtype()),
+            (&[3, 4, 3][..], DType::I32)
+        );
+        assert!(plain.drafter()?.is_none());
+
+        // Three slots of 112 bytes beside the model's state.
+        let layout = cache().layout;
+        assert_eq!(drafting.bytes(&layout), config(0).bytes(&layout) + 3 * 112);
+        assert_eq!(state.live()?.len(), plain.live()?.len());
+        assert_eq!(state.checkpoint()?.len(), plain.checkpoint()?.len());
+        assert_eq!(state.keys()?, plain.keys()?);
+
+        let mut stepwise = ring();
+        stepwise.fields[0].stepwise = true;
+        let refused = StateMemory::meta(
+            StateConfig {
+                drafter: vec![stepwise],
+                ..config(0)
+            },
+            &cache(),
+        )
+        .err()
+        .expect("a drafter's stepwise field");
+        assert!(refused.to_string().contains("index_ring"), "{refused}");
         Ok(())
     }
 }

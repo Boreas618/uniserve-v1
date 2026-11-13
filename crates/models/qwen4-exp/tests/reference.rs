@@ -11,6 +11,7 @@
 //! | attention layer | `qsa_moe_layer.ref_kernel` | the same, the new keys and values, the compressed keys, the ring |
 //! | read-out and head | `lm_head.ref_kernel` | the folded streams, the logits of shuffled rows |
 //! | drafter | `mtp_draft.fuse`, then the layer and head references | the drafter's streams and logits |
+//! | drafter over two rounds | the same, its step split in two forwards over the drafter's state | the streams, logits, caches and ring |
 //! | block-scaled FP8 | `mtp_draft.block_quantize`, `dequantize` | the matrix decoded at load, exactly |
 //! | indexer and attention functions | vLLM's `test_qsa_reference.py` | scores, the selected groups, the attended heads |
 //! | prefill against steps | the model itself | streams, keys and values, index keys, ring, windows, state |
@@ -847,6 +848,107 @@ fn the_drafter_is_the_references() {
         "draft logits",
         &logits,
         &vector(&vectors, "mtp.out.logits"),
+        0.05,
+    );
+    assert_attention_caches(&vectors, "mtp", &step);
+}
+
+/// The drafter's state carries its step across two forwards: the drafter over the first half
+/// of each request's tokens, then over the second half, which pools a group whose first tokens
+/// the first round left in the ring, computes the reference's streams, logits, caches and
+/// ring. The state is lent as execution lends a drafter's (`nn::Drafter::state`): the live
+/// ring alone, which no checkpoint keeps.
+#[test]
+fn the_drafter_over_two_rounds_is_the_references() {
+    let vectors = vectors();
+    let model = reference_model();
+    let drafter = model.drafter().expect("the drafter");
+
+    let step = attention_step(&vectors, "mtp");
+    let tokens = vector(&vectors, "mtp.tokens").to_dtype(DType::U32).unwrap();
+    let embedded = model.embed_input_ids(&tokens).expect("the embeddings");
+    let streams = vector(&vectors, "mtp.streams");
+    let start = u32s(&vector(&vectors, "mtp.start"));
+    let requests = start.len();
+    let half = STEP / 2;
+
+    // Request 0 completes group 5 (positions 20 to 23) in the second round.
+    assert_eq!(start[0] % 4, 0);
+
+    let (mut drafted, mut order) = (Vec::new(), Vec::new());
+    for round in [0..half, half..STEP] {
+        // The round's tokens of every request, each its own attention row as in the step, and
+        // one state row a request.
+        let picked: Vec<u32> = (0..requests)
+            .flat_map(|request| round.clone().map(move |row| (request * STEP + row) as u32))
+            .collect();
+        let pick = |tensor: &Tensor| rows_of(tensor, &picked);
+        let offsets: Vec<u32> = (0..=picked.len() as u32).collect();
+
+        let batch = support::batch(
+            PhaseKind::Decode,
+            [
+                pick(&step.batch.positions),
+                pick(&step.batch.slot_mapping),
+                pick(&step.batch.seq_lens),
+                column(&offsets),
+                column(&offsets[..picked.len()]),
+            ],
+            None,
+            PAGE,
+            step.batch.max_kv_len,
+        );
+        let cache = KvCache {
+            block_tables: pick(&step.cache.block_tables),
+            ..step.cache.clone()
+        };
+
+        let state_offsets: Vec<u32> = (0..=requests)
+            .map(|request| (request * round.len()) as u32)
+            .collect();
+        let seen: Vec<u32> = start.iter().map(|first| first + round.end as u32).collect();
+        let slots: Vec<u32> = (1..=requests as u32).collect();
+        let state = support::state(
+            [
+                column(&state_offsets),
+                column(&seen),
+                column(&slots),
+                column(&vec![0; requests]),
+            ],
+            &step.state.live,
+            &[],
+            None,
+        );
+
+        drafted.push(
+            drafter
+                .forward_stateful(
+                    &batch,
+                    &cache,
+                    Some(&state),
+                    &pick(&embedded),
+                    &pick(&streams),
+                )
+                .expect("a round of the drafter"),
+        );
+        order.extend(picked);
+    }
+    let drafted = Tensor::cat(&drafted, 0).unwrap();
+
+    // `mtp_draft/TASK.md`: hidden 5%, which the logits read.
+    assert_within(
+        "draft streams over two rounds",
+        &drafted,
+        &rows_of(&vector(&vectors, "mtp.out.streams"), &order),
+        0.05,
+    );
+    let logits = model
+        .compute_logits(&drafter.logits_rows(&drafted).expect("the read-out"))
+        .expect("the draft logits");
+    assert_within(
+        "draft logits over two rounds",
+        &logits,
+        &rows_of(&vector(&vectors, "mtp.out.logits"), &order),
         0.05,
     );
     assert_attention_caches(&vectors, "mtp", &step);

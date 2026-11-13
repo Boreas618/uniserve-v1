@@ -286,7 +286,7 @@ impl Bench {
         )?;
         if drafts > 0 {
             let unread = backend::retained(0x5_0000, &[4], DType::F32, &backend::meta())?;
-            profiled.set_draft_cache(draft(unread), None)?;
+            profiled.set_draft_cache(draft(unread), None, None)?;
         }
         profiled.graphs().profile_run(&profiled)?;
 
@@ -320,7 +320,7 @@ impl Bench {
         if drafts > 0 {
             let (unread_memory, unread) = support::weight(&stream, &[0.0; 4], &[4])?;
             memory.push(unread_memory);
-            runner.set_draft_cache(draft(unread), None)?;
+            runner.set_draft_cache(draft(unread), None, None)?;
         }
         runner.graphs().profile_run(&runner)?;
         for bucket in runner.buckets() {

@@ -356,7 +356,8 @@ pub struct RecurrentState {
     /// them as runs of layers ([`crate::family::TextModel::state_layers`]), and the entries
     /// follow the runs in order.
     pub live: Vec<Vec<Tensor>>,
-    /// The checkpoint buffers, in the same order and extents.
+    /// The checkpoint buffers, in the same order and extents. Empty for a drafter's state
+    /// ([`Drafter::state`]), which execution keeps live alone: its `checkpoints` are then zero.
     pub checkpoint: Vec<Vec<Tensor>>,
     /// The trail buffers of a batch that keeps one, in the same order: `[tokens, …]` per field,
     /// row `t` receiving the layer's state after the batch's token `t`. A speculative
@@ -1300,13 +1301,26 @@ pub trait Drafter: Send + Sync {
 
     /// The state its layers keep per request slot beside the draft cache, in the order
     /// [`Self::forward_stateful`] is lent their buffers; empty for a drafter that keeps none.
+    ///
+    /// Execution keeps one live row of each field per request slot and nothing else: no field
+    /// is stepwise ([`crate::family::StateField::stepwise`]), and the state is neither kept in
+    /// the prefix cache's checkpoints nor restored from them. A request that resumes from a
+    /// cached prefix, or starts on a slot, runs the drafter from that page boundary over rows
+    /// that hold whatever the slot last held, and every forward advances the state over all
+    /// its rows, the entries a verification rejects and the proposals past the accepted
+    /// position included. A drafter therefore states only fields of which a forward whose
+    /// state rows start at a page boundary reads no row from before it, and that a forward
+    /// overwrites at a position before any later forward reads them there, such as a ring of
+    /// the recent rows of an index group the page divides; a field that summarizes every
+    /// earlier token, as a recurrent layer's does, has no place here.
     fn state(&self) -> Vec<crate::family::StateShape> {
         Vec::new()
     }
 
     /// [`Self::forward`] for a drafter whose layers keep a state ([`Self::state`]): `state`
-    /// holds the buffers of its layers, advanced in place. `hidden` and the result are rows of
-    /// the model's [`crate::family::TextModel::stream_width`]. A drafter that keeps none
+    /// holds the live buffers of its layers, advanced in place, with no checkpoint buffer, no
+    /// trail and no verify slots; its rows are the batch's. `hidden` and the result are rows
+    /// of the model's [`crate::family::TextModel::stream_width`]. A drafter that keeps none
     /// ignores `state`.
     ///
     /// # Errors
