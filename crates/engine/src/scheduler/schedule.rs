@@ -1694,8 +1694,11 @@ mod tests {
         let refused = outputs.try_iter().any(|output| {
             matches!(
                 output,
-                Output::Event(RequestId(5), proto::request::Event::Rejected { message, .. })
-                    if message == "scheduler waiting queue is full"
+                Output::Events(events) if events.iter().any(|event| matches!(
+                    event,
+                    (RequestId(5), proto::request::Event::Rejected { message, .. })
+                        if message == "scheduler waiting queue is full"
+                ))
             )
         });
         assert!(refused);

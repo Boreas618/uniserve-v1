@@ -269,7 +269,7 @@ impl Scheduler {
         }
 
         // An engine that stopped listening takes no report; the scheduler goes on regardless.
-        let _ = self.output.send(Output::Stats(report));
+        self.emit(Output::Stats(report));
     }
 
     /// The device regions of the KV cache, each once, as indices into the session's regions: the

@@ -3352,10 +3352,11 @@ mod tests {
         session.scheduler.preempt(id, 0);
         let ended: Vec<Event> = outputs
             .try_iter()
-            .filter_map(|output| match output {
-                Output::Event(of, event) if of == id => Some(event),
-                _ => None,
+            .flat_map(|output| match output {
+                Output::Events(events) => events,
+                _ => Vec::new(),
             })
+            .filter_map(|(of, event)| (of == id).then_some(event))
             .collect();
         let [Event::Finished { reason, .. }] = &ended[..] else {
             panic!("{ended:?}");

@@ -13,7 +13,7 @@
 use std::time::{Duration, Instant};
 
 use engine::batch::Phase;
-use engine::scheduler::{Message, Output};
+use engine::scheduler::Message;
 use proto::request::{
     DiffusionRequest, Event, FinishReason, MigrationCause, RequestId, Trajectory,
 };
@@ -362,12 +362,8 @@ fn a_resumed_request_is_admitted_before_one_that_starts() {
     harness.settle(400);
 
     let scheduled: Vec<RequestId> = harness
-        .outputs()
-        .iter()
-        .filter_map(|output| match output {
-            Output::Event(id, Event::Scheduled { .. }) => Some(*id),
-            _ => None,
-        })
+        .sent()
+        .filter_map(|(id, event)| matches!(event, Event::Scheduled { .. }).then_some(*id))
         .collect();
     assert_eq!(scheduled, [running, resuming, starting]);
     for id in [running, resuming, starting] {

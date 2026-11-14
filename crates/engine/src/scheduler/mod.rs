@@ -206,8 +206,10 @@ pub type Seeds = (Vec<Key>, u64, Vec<(GroupId, String)>);
     reason = "a request's event and the statistics travel by value as the message itself"
 )]
 pub enum Output {
-    /// A request's event, to the daemon.
-    Event(RequestId, Event),
+    /// Requests' events, to the daemon, each request's in the order they happened: every event
+    /// one batch's output produced together, once all of its calls are applied ([`Scheduler`]'s
+    /// `update`), and any other event as it happens.
+    Events(Vec<(RequestId, Event)>),
     /// The statistics of the last second.
     Stats(SchedulerStats),
     /// The serving policy faulted, with this fault, and the policy it replaced serves again, or
@@ -356,6 +358,10 @@ pub struct Scheduler {
     policy: Policy,
     executor: Box<dyn Executor>,
     output: Sender<Output>,
+    /// While `update` applies a batch's output, the events it has produced, which leave together
+    /// as one `Output::Events` once it ends; `None` outside `update`, where each event leaves as
+    /// it happens. Every other output leaves after the events produced before it.
+    outbox: Option<Vec<(RequestId, Event)>>,
     stats: SchedulerStats,
     /// When `stats` started counting: the scheduler's start, then its last `Output::Stats`.
     published: Instant,
@@ -535,6 +541,7 @@ impl Scheduler {
             policy,
             executor,
             output,
+            outbox: None,
             stats: stats::empty(),
             published: Instant::now(),
             generation,
@@ -788,6 +795,7 @@ impl Scheduler {
         if self.stopped {
             return false;
         }
+        let _range = crate::profiling::ranges::range(c"uniserve.scheduler.step", None);
 
         // The running requests before the completions, of which the step's trace states the
         // admissions they end (`schedule::STEPS`).
@@ -1163,7 +1171,7 @@ impl Scheduler {
         }
 
         // An engine that no longer listens has stopped this scheduler's epoch already.
-        let _ = self.output.send(Output::Failed(error));
+        self.emit(Output::Failed(error));
     }
 
     /// `Shutdown`: every request the scheduler holds ends, aborted, at once, and the scheduler

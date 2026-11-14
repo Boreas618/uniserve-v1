@@ -9,7 +9,7 @@
 //! nothing more is sent for it.
 
 use engine::batch::{ErrorCode, Phase};
-use engine::scheduler::Message;
+use engine::scheduler::{Message, Output};
 use proto::request::{Event, FinishReason, RejectionKind, RequestId, StopReason};
 
 use crate::harness::{Deployment, EOS, Harness, VIDEO_PHASES, chat_image, token, video};
@@ -87,6 +87,57 @@ fn an_end_of_sequence_token_finishes_the_request_without_being_sent() {
     assert_eq!(
         format!("{terminal:?}"),
         finished(FinishReason::Eos, None, 10, 3)
+    );
+}
+
+/// The events one batch's output produces reach the engine together, as one `Output::Events`
+/// (SD §2.5): each request's last token with its end, and the ends of every request the batch
+/// finished, so the engine writes the streams one step ends to their daemon at once.
+#[test]
+fn the_events_of_one_batch_leave_together() {
+    let mut harness = Deployment::tokens().build();
+    let ids: Vec<RequestId> = (1..=3).map(|id| harness.submit(token(id, 10, 4))).collect();
+    harness.settle(100);
+
+    // The output each event left in, by its place among the scheduler's outputs.
+    let mut left = Vec::new();
+    for (at, output) in harness.outputs().iter().enumerate() {
+        if let Output::Events(events) = output {
+            left.extend(events.iter().map(|(id, event)| (at, *id, event.clone())));
+        }
+    }
+    let output_of = |id: RequestId, last: fn(&Event) -> bool| {
+        left.iter()
+            .rev()
+            .find(|(_, of, event)| *of == id && last(event))
+            .map(|(at, ..)| *at)
+            .unwrap()
+    };
+    let token = |event: &Event| matches!(event, Event::TextToken { .. });
+    let end = |event: &Event| matches!(event, Event::Finished { .. });
+
+    for &id in &ids {
+        assert_eq!(
+            output_of(id, token),
+            output_of(id, end),
+            "{}",
+            harness.summary()
+        );
+    }
+    // The requests one decode batch finished end in one output.
+    let last_batch = |id: RequestId| harness.batches_of(id).last().map(|batch| batch.id);
+    for &id in &ids[1..] {
+        if last_batch(id) == last_batch(ids[0]) {
+            assert_eq!(output_of(id, end), output_of(ids[0], end));
+        }
+    }
+    assert!(
+        ids.iter()
+            .filter(|id| last_batch(**id) == last_batch(ids[0]))
+            .count()
+            > 1,
+        "the requests finished in one batch: {}",
+        harness.summary()
     );
 }
 

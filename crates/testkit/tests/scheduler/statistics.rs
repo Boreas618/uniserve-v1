@@ -10,7 +10,7 @@
 //! counted like any other, and its events are dropped.
 
 use engine::batch::Phase;
-use engine::scheduler::{Output, WARMUP_REQUEST_IDS};
+use engine::scheduler::WARMUP_REQUEST_IDS;
 use proto::report::SchedulerStats;
 use proto::request::{CachePolicy, FinishReason, GenerationRequest, RequestId, SamplingParams};
 
@@ -155,11 +155,7 @@ fn a_warm_up_request_is_served_with_its_events_dropped() {
     });
     harness.run_until(30, |harness| harness.held() == 0);
 
-    let events = harness
-        .outputs()
-        .iter()
-        .filter(|output| matches!(output, Output::Event(of, _) if *of == id))
-        .count();
+    let events = harness.sent().filter(|(of, _)| *of == id).count();
     assert_eq!(events, 0, "no event of a warm-up request is sent");
     let batches = harness.batches_of(id).len();
     assert_eq!(

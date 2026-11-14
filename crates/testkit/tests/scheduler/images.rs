@@ -202,12 +202,12 @@ fn an_encode_waits_for_room_for_its_encoder_output() {
     );
 
     harness.settle(200);
-    let ended = harness.outputs().iter().position(|output| {
-        matches!(output, engine::scheduler::Output::Event(of, Event::Finished { .. }) if *of == first)
-    });
-    let scheduled = harness.outputs().iter().position(|output| {
-        matches!(output, engine::scheduler::Output::Event(of, Event::Scheduled { .. }) if *of == second)
-    });
+    let ended = harness
+        .sent()
+        .position(|(of, event)| *of == first && matches!(event, Event::Finished { .. }));
+    let scheduled = harness
+        .sent()
+        .position(|(of, event)| *of == second && matches!(event, Event::Scheduled { .. }));
     assert!(ended < scheduled, "it is admitted once the first has ended");
     assert_eq!(
         harness.batches_of_phase(second, Phase::VisionEncode).len(),

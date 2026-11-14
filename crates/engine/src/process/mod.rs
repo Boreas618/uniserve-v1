@@ -481,7 +481,7 @@ impl MainProcess {
     /// Applies one output of scheduler `scheduler`.
     fn output(&mut self, scheduler: usize, output: Output) {
         match output {
-            Output::Event(id, event) => self.event(id, event),
+            Output::Events(events) => self.events(events),
             Output::Stats(stats) => self.stats(scheduler, stats),
             Output::PolicyRolledBack(reason) => {
                 self.policy_rolled_back(Some(scheduler), reason, false);
@@ -552,6 +552,33 @@ impl MainProcess {
         }
     }
 
+    /// Queues one frame for front `front`, as [`Self::send`] writes it, writing what its socket
+    /// takes now; [`Self::flush_front`] writes the rest once the frames that go together are
+    /// queued.
+    fn queue(
+        &mut self,
+        front: usize,
+        kind: from_engine::Kind,
+        media: Option<&Arc<dyn ArtifactMedia>>,
+    ) {
+        let Some(Some(connection)) = self.fronts.get_mut(front) else {
+            return;
+        };
+        if let Err(error) = daemon::queue(connection, kind, media) {
+            tracing::warn!(%error, front, "writing to a daemon front failed");
+        }
+    }
+
+    /// Writes every frame queued for front `front`, waiting while its socket is full.
+    fn flush_front(&mut self, front: usize) {
+        let Some(Some(connection)) = self.fronts.get_mut(front) else {
+            return;
+        };
+        if let Err(error) = connection.flush() {
+            tracing::warn!(%error, front, "writing to a daemon front failed");
+        }
+    }
+
     /// Ends the control thread: in order after a shutdown or once no daemon serves it; without
     /// its orderly close after a failure, leaving the engine as it is, since a device or a
     /// collective may hold every rank.
@@ -570,8 +597,8 @@ impl MainProcess {
         // written before the engine states that it stopped.
         let closed = self.engine.take().map_or(Ok(()), |engine| {
             engine.close(|_, output| {
-                if let Output::Event(id, event) = output {
-                    self.event(id, event);
+                if let Output::Events(events) = output {
+                    self.events(events);
                 }
             })
         });

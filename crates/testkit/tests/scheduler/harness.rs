@@ -1125,13 +1125,18 @@ impl Harness {
         &self.record
     }
 
+    /// Every event the scheduler sent, with its request, in the order it sent them.
+    pub(crate) fn sent(&self) -> impl Iterator<Item = &(RequestId, Event)> {
+        self.record.iter().flat_map(|output| match output {
+            Output::Events(events) => events.as_slice(),
+            _ => &[],
+        })
+    }
+
     /// The events the scheduler sent request `id`, in order.
     pub(crate) fn events(&self, id: RequestId) -> Vec<Event> {
-        let of = |output: &Output| match output {
-            Output::Event(to, event) if *to == id => Some(event.clone()),
-            _ => None,
-        };
-        self.record.iter().filter_map(of).collect()
+        let of = |(to, event): &(RequestId, Event)| (*to == id).then(|| event.clone());
+        self.sent().filter_map(of).collect()
     }
 
     /// The tokens the scheduler sent request `id` (`Event::TextToken`), in order.

@@ -72,7 +72,26 @@ impl Scheduler {
     /// of the epoch end as migratable with the cause `Loss` (SD §7.6), and the error the engine is
     /// told names the batch. A call that computed non-finite logits fails its request, and the
     /// batch and those requests are reported as `Output::NumericalFault`.
+    ///
+    /// The events the output produces leave together once every call is applied, as one
+    /// `Output::Events` (vLLM's `EngineCoreOutputs`), so the engine writes a step's events to
+    /// their daemon at once: the streams one step advances or ends are written together, rather
+    /// than each a call's bookkeeping after the one before.
     pub(super) fn update(&mut self, batch: Batch, output: Result<BatchOutput, Error>) {
+        // A timeline lines the events a batch's output produces up with the batch.
+        let _range =
+            crate::profiling::ranges::range(c"uniserve.scheduler.update", Some(batch.id.0));
+        // Two events a call at most in the common case: a token and the request's end.
+        self.outbox = Some(Vec::with_capacity(2 * batch.requests.len()));
+        self.apply_calls(batch, output);
+        if let Some(events) = self.outbox.take().filter(|events| !events.is_empty()) {
+            // An engine that no longer listens has stopped this scheduler's epoch.
+            let _ = self.output.send(Output::Events(events));
+        }
+    }
+
+    /// Applies each call's output of `batch` to its request, in row order ([`Self::update`]).
+    fn apply_calls(&mut self, batch: Batch, output: Result<BatchOutput, Error>) {
         let group = self.group_index(batch.group);
         if let Some(group) = group {
             let group = &mut self.groups[group];
@@ -159,8 +178,7 @@ impl Scheduler {
         }
 
         if !faulted.is_empty() {
-            // An engine that no longer listens has stopped this scheduler's epoch.
-            let _ = self.output.send(Output::NumericalFault(batch.id, faulted));
+            self.emit(Output::NumericalFault(batch.id, faulted));
         }
     }
 
@@ -744,8 +762,9 @@ impl Scheduler {
         }
     }
 
-    /// Sends a request's event to the daemon, one event of its consumer's credit. The events of a
-    /// warm-up request are dropped (SD §3.2).
+    /// Sends a request's event to the daemon, one event of its consumer's credit: with the rest of
+    /// the batch output's events while `update` applies one, and at once otherwise. The events of
+    /// a warm-up request are dropped (SD §3.2).
     pub(super) fn send(&mut self, id: RequestId, event: Event) {
         if id.0 >= WARMUP_REQUEST_IDS {
             return;
@@ -753,8 +772,24 @@ impl Scheduler {
         if let Some(request) = self.requests.get_mut(&id) {
             request.event_credit = request.event_credit.saturating_sub(1);
         }
+        match &mut self.outbox {
+            Some(events) => events.push((id, event)),
+            // An engine that no longer listens has stopped this scheduler's epoch.
+            None => {
+                let _ = self.output.send(Output::Events(vec![(id, event)]));
+            }
+        }
+    }
+
+    /// Sends an output other than a request's event, after the events `update` has produced so
+    /// far: the engine reads the outputs in the order they happened.
+    pub(super) fn emit(&mut self, output: Output) {
+        if let Some(events) = self.outbox.as_mut().filter(|events| !events.is_empty()) {
+            let events = std::mem::take(events);
+            let _ = self.output.send(Output::Events(events));
+        }
         // An engine that no longer listens has stopped this scheduler's epoch.
-        let _ = self.output.send(Output::Event(id, event));
+        let _ = self.output.send(output);
     }
 
     /// The `Finished` event of request `id` for `reason` (SD §2.2 usage): its prompt as it was
@@ -1359,9 +1394,7 @@ impl Scheduler {
                 // A requester that stopped waiting needs no reply.
                 let _ = reply.send(units);
             }
-            None => {
-                let _ = self.output.send(Output::Shrunk(region, units));
-            }
+            None => self.emit(Output::Shrunk(region, units)),
         }
     }
 }
@@ -1733,10 +1766,11 @@ mod tests {
     fn events(outputs: &Receiver<Output>) -> Vec<Event> {
         outputs
             .try_iter()
-            .filter_map(|output| match output {
-                Output::Event(id, event) if id == ID => Some(event),
-                _ => None,
+            .flat_map(|output| match output {
+                Output::Events(events) => events,
+                _ => Vec::new(),
             })
+            .filter_map(|(id, event)| (id == ID).then_some(event))
             .collect()
     }
 
@@ -1978,30 +2012,40 @@ mod tests {
             outputs.try_iter().collect::<Vec<Output>>()
         };
 
+        // A batch's events leave as one output, ahead of what the batch reports besides.
         let rejected = fail(failed(ErrorCode::InputError, Some("bad image")));
         assert!(matches!(
             &rejected[..],
-            [Output::Event(ID, Event::Rejected { kind: RejectionKind::Invalid, message })]
-                if message == "bad image"
+            [Output::Events(events)] if matches!(
+                &events[..],
+                [(ID, Event::Rejected { kind: RejectionKind::Invalid, message })]
+                    if message == "bad image"
+            )
         ));
 
         let computed = fail(failed(ErrorCode::ComputeError, None));
         assert!(matches!(
             &computed[..],
-            [
-                Output::Event(ID, Event::Error { message }),
-                Output::Event(ID, Event::Finished { reason: FinishReason::Error, .. }),
-            ] if message == "worker status invalid: call_failed (call 7.0, Decode)"
+            [Output::Events(events)] if matches!(
+                &events[..],
+                [
+                    (ID, Event::Error { message }),
+                    (ID, Event::Finished { reason: FinishReason::Error, .. }),
+                ] if message == "worker status invalid: call_failed (call 7.0, Decode)"
+            )
         ));
 
         let faulted = fail(failed(ErrorCode::NumericalFault, None));
         assert!(matches!(
             &faulted[..],
-            [
-                Output::Event(ID, Event::Error { .. }),
-                Output::Event(ID, Event::Finished { reason: FinishReason::Error, .. }),
-                Output::NumericalFault(BatchId(7), requests),
-            ] if requests == &[ID]
+            [Output::Events(events), Output::NumericalFault(BatchId(7), requests)]
+                if requests == &[ID] && matches!(
+                    &events[..],
+                    [
+                        (ID, Event::Error { .. }),
+                        (ID, Event::Finished { reason: FinishReason::Error, .. }),
+                    ]
+                )
         ));
 
         let lost = fail(failed(ErrorCode::FatalWorkerFailure, None));

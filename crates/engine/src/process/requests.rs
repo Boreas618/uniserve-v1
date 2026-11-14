@@ -414,21 +414,40 @@ impl MainProcess {
         }
     }
 
-    /// An event of request `id` from its scheduler: written to its stream's front and kept for a
-    /// takeover. The terminal event ends the stream.
-    pub(super) fn event(&mut self, id: RequestId, event: Event) {
-        let terminal = event.is_terminal();
-        let Some(stream) = self.streams.get_mut(&id) else {
-            tracing::debug!(request = id.0, "an event of a request with no stream");
-            return;
-        };
-        let (event, media) = event.to_wire(id);
-        stream.record(event.clone(), media.clone());
-        let front = stream.front;
-        if terminal {
-            self.streams.remove(&id);
+    /// The events of one output of a scheduler (`Output::Events`), in order: each written to its
+    /// request's stream's front and kept for a takeover; a terminal event ends its stream. They
+    /// are written together, each front flushed once after the last, so the daemon reads the
+    /// events of one step at once.
+    pub(super) fn events(&mut self, events: Vec<(RequestId, Event)>) {
+        let mut written: Vec<usize> = Vec::new();
+        for (id, event) in events {
+            let terminal = event.is_terminal();
+            let Some(stream) = self.streams.get_mut(&id) else {
+                tracing::debug!(request = id.0, "an event of a request with no stream");
+                continue;
+            };
+            // A timeline shows when each event leaves for its daemon, with its request as the
+            // payload.
+            let name = if terminal {
+                c"uniserve.process.terminal"
+            } else {
+                c"uniserve.process.event"
+            };
+            let _range = crate::profiling::ranges::range(name, Some(id.0));
+            let (event, media) = event.to_wire(id);
+            stream.record(event.clone(), media.clone());
+            let front = stream.front;
+            if terminal {
+                self.streams.remove(&id);
+            }
+            self.queue(front, from_engine::Kind::Event(event), media.as_ref());
+            if !written.contains(&front) {
+                written.push(front);
+            }
         }
-        self.send(front, from_engine::Kind::Event(event), media.as_ref());
+        for front in written {
+            self.flush_front(front);
+        }
     }
 
     /// Ends every request this engine holds as migratable for the loss of what served it: each

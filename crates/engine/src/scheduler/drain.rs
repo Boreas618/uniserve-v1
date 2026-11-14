@@ -164,15 +164,16 @@ mod tests {
     fn migrated(outputs: &Receiver<Output>) -> Vec<RequestId> {
         outputs
             .try_iter()
-            .filter_map(|output| match output {
-                Output::Event(
-                    id,
-                    Event::Migratable {
-                        cause: MigrationCause::Drain,
-                        denoised_steps: 0,
-                        ..
-                    },
-                ) => Some(id),
+            .flat_map(|output| match output {
+                Output::Events(events) => events,
+                _ => Vec::new(),
+            })
+            .filter_map(|(id, event)| match event {
+                Event::Migratable {
+                    cause: MigrationCause::Drain,
+                    denoised_steps: 0,
+                    ..
+                } => Some(id),
                 _ => None,
             })
             .collect()

@@ -213,10 +213,9 @@ fn a_full_to_an_admission_returns_the_request_to_its_place_detached() {
     assert!(owners.len() >= 4, "request 2 was admitted again");
 
     let scheduled = |id: RequestId| {
-        let mut outputs = harness.outputs().iter();
-        outputs.position(|output| {
-            matches!(output, engine::scheduler::Output::Event(of, Event::Scheduled { .. }) if *of == id)
-        })
+        harness
+            .sent()
+            .position(|(of, event)| *of == id && matches!(event, Event::Scheduled { .. }))
     };
     assert!(scheduled(returned) < scheduled(later), "it keeps its place");
     assert!(harness.terminal(first).is_some());

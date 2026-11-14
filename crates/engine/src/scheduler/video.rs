@@ -2348,18 +2348,22 @@ mod tests {
 
         scheduler.crossing_answered(id, &replicate, &Completion::Failed);
         assert!(!scheduler.running.contains(&id));
-        let ended = outputs.try_iter().any(|output| {
-            matches!(
-                output,
-                Output::Event(
-                    of,
-                    Event::Migratable {
-                        cause: MigrationCause::Drain,
-                        ..
-                    }
-                ) if of == id
-            )
-        });
+        let ended = outputs
+            .try_iter()
+            .flat_map(|output| match output {
+                Output::Events(events) => events,
+                _ => Vec::new(),
+            })
+            .any(|(of, event)| {
+                of == id
+                    && matches!(
+                        event,
+                        Event::Migratable {
+                            cause: MigrationCause::Drain,
+                            ..
+                        }
+                    )
+            });
         assert!(ended);
     }
 

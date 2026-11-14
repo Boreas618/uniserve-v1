@@ -338,12 +338,7 @@ pub(crate) fn read_commands(
 }
 
 /// Sends one frame of the request interface on a front, with the artifact bytes it travels
-/// with.
-///
-/// A front on this host maps the artifact's shared memory, whose descriptor rides the frame
-/// itself. A front on another host, or bytes no descriptor names, takes bounded parts ahead of
-/// the frame, each stating the artifact's whole length, which the daemon writes into the
-/// artifact's storage.
+/// with, and waits until the socket took it ([`queue`], then the connection's flush).
 ///
 /// # Errors
 ///
@@ -353,17 +348,38 @@ pub(crate) fn send(
     kind: wire::from_engine::Kind,
     media: Option<&Arc<dyn ArtifactMedia>>,
 ) -> std::io::Result<()> {
+    queue(connection, kind, media)?;
+    connection.flush()
+}
+
+/// Queues one frame of the request interface on a front, with the artifact bytes it travels
+/// with, and writes what the socket takes now; the caller flushes the connection once it queued
+/// the frames that go together.
+///
+/// A front on this host maps the artifact's shared memory, whose descriptor rides the frame
+/// itself. A front on another host, or bytes no descriptor names, takes bounded parts ahead of
+/// the frame, each stating the artifact's whole length, which the daemon writes into the
+/// artifact's storage; each part is written whole before the next is encoded, so an artifact is
+/// never held twice.
+///
+/// # Errors
+///
+/// When the front closed or its socket failed.
+pub(crate) fn queue(
+    connection: &mut Connection,
+    kind: wire::from_engine::Kind,
+    media: Option<&Arc<dyn ArtifactMedia>>,
+) -> std::io::Result<()> {
     let frame = wire::FromEngine { kind: Some(kind) };
     let Some(media) = media else {
-        return connection.deliver(&frame);
+        return connection.send(&frame);
     };
 
     let descriptor = media
         .descriptor()
         .filter(|_| connection.peer_addr().is_none());
     if let Some(descriptor) = descriptor {
-        connection.send_with(&frame, &[descriptor])?;
-        return connection.flush();
+        return connection.send_with(&frame, &[descriptor]);
     }
     let bytes = media.bytes();
     for data in bytes.chunks(ARTIFACT_PART) {
@@ -374,7 +390,7 @@ pub(crate) fn send(
             })),
         })?;
     }
-    connection.deliver(&frame)
+    connection.send(&frame)
 }
 
 /// Sends one report on the process interface, which the daemon answers with nothing.

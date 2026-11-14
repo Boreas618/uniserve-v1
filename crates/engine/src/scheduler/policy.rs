@@ -972,10 +972,7 @@ impl Scheduler {
         if self.policy.recoverable() {
             let snapshot = self.snapshot();
             if self.policy.recover(snapshot).is_ok() {
-                // An engine that no longer listens has stopped this scheduler's epoch.
-                let _ = self
-                    .output
-                    .send(Output::PolicyRolledBack(fault.to_string()));
+                self.emit(Output::PolicyRolledBack(fault.to_string()));
                 return;
             }
         }
