@@ -1263,3 +1263,55 @@ fn a_request_resumed_from_another_epoch_reads_every_block_that_epoch_committed()
     assert_eq!(harness.tokens(id).len(), 8);
     assert_eq!(hits(&mut harness), (18, 0, 0));
 }
+
+/// A prompt's recurrent-state checkpoint cached without the attention blocks before it: request
+/// 1 commits both, then another epoch evicts its attention blocks, which this scheduler learns
+/// only from its own answers. Request 2 of the same prompt expects its 32 whole-block tokens as
+/// its hit, pins the checkpoint and finds no attention block, so its hit is 0 and its first chunk
+/// computes the prompt from its start, keeping the state at boundary 32, where its table holds
+/// the pinned checkpoint read-only. The chunk keeps into a private block allocated at that
+/// position once the read-only checkpoint is given up, never into the pinned block, which other
+/// requests read (SD §3.4 "Recurrent-state checkpoints", §4.4 "The hit"; BP §9 A4).
+#[test]
+fn a_chunk_from_the_start_keeps_its_checkpoint_in_a_private_block_where_a_pinned_one_lies() {
+    let mut harness = Deployment::tokens()
+        .cache(&[
+            (CacheGroupKind::Full, BLOCK),
+            (CacheGroupKind::State, BLOCK),
+        ])
+        .build();
+    let first = harness.submit(token(1, 34, 2));
+    harness.settle(200);
+    assert!(harness.finished_with(first, FinishReason::MaxTokens));
+
+    let attention: Vec<Key> = harness
+        .taken()
+        .into_iter()
+        .filter_map(|request| match request {
+            Request::Commit { class: 0, key, .. } => Some(key),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        !attention.is_empty(),
+        "request 1 committed its attention blocks"
+    );
+    harness.elsewhere(&[Request::Evict { keys: attention }]);
+
+    let second = harness.submit(sharing(2, 1, 34, 2));
+    harness.settle(200);
+    assert_eq!(harness.failure(), None, "the scheduler failed");
+    assert!(harness.finished_with(second, FinishReason::MaxTokens));
+
+    // Its first chunk computed the prompt from its start and kept the state at boundary 32,
+    // the end of the pinned checkpoint's block.
+    let prefill = harness.batches_of_phase(second, Phase::Prefill).remove(0);
+    let row = prefill
+        .requests
+        .iter()
+        .position(|id| *id == second)
+        .unwrap();
+    let first_token = prefill.columns.rows.query_offsets[row] as usize;
+    assert_eq!(prefill.columns.rows.cache_positions[first_token], 0);
+    assert_eq!(prefill.columns.checkpoints.get(row), Some(&32));
+}

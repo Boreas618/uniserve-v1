@@ -2073,8 +2073,14 @@ impl Scheduler {
                 let keep = base.filter(|base| Some(*base) == start && table.shared > *base);
                 let wanted = kept(Phase::Prefill, hit, end, block, interval)
                     .map(|boundary| boundary / block - 1);
+                // The first chunk keeps its checkpoint into a private block: a held one at that
+                // position serves only when private, and a read-only one there (a checkpoint the
+                // expected hit pinned beyond the hit that holds) is given up and allocated again.
+                let private = wanted.filter(|position| {
+                    [base, ahead].contains(&Some(*position)) && *position >= table.shared
+                });
                 for position in [base, ahead].into_iter().flatten() {
-                    if Some(position) != keep && Some(position) != wanted {
+                    if Some(position) != keep && Some(position) != private {
                         let range = position..position + 1;
                         self.give_up(request, owner, index, range, table.shared, asks, unpinned);
                     }
@@ -2082,7 +2088,7 @@ impl Scheduler {
                 // The base the hit restores, then the checkpoint the first chunk keeps.
                 *table = keep.map_or_else(Blocks::default, |base| run(base, base + 1, base + 1));
                 if let Some(position) = wanted {
-                    if [base, ahead].contains(&wanted) {
+                    if private.is_some() {
                         let first = keep.unwrap_or(position);
                         *table = run(first, table.shared.max(first), position + 1);
                     } else {
