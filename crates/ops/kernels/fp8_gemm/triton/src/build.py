@@ -5,14 +5,15 @@ argument signature in the order the operator launches them, the compile-time val
 gives, and the compilation options. The Build Server's Triton source drives
 ``uniserve_build_server.triton`` with it.
 
-The tile and the bias flag are baked in; the three extents, the activation's row stride and the
-two scales are launch words, so one module serves every projection of one activation type.
+The tile and the bias flag are baked in; the three extents and the activation's row stride are
+launch words and the product's factor a device word, so one module serves every projection of one
+output type.
 """
 
 import fp8_gemm as kernels
 from uniserve_build_server import triton as driver
 
-#: The 16-bit types an activation and its output may have, as Triton spells them in a signature.
+#: The 16-bit types an output and its bias may have, as Triton spells them in a signature.
 DTYPES = {"bf16": "bf16", "f16": "fp16"}
 
 
@@ -25,7 +26,7 @@ def spec(fields, parameters, target):
     return {
         "kernel": kernels._fp8_gemm_kernel,
         "signature": {
-            "x_ptr": dtype,
+            "x_ptr": "*fp8e4nv",
             "w_ptr": "*fp8e4nv",
             "bias_ptr": dtype,
             "out_ptr": dtype,
@@ -33,8 +34,7 @@ def spec(fields, parameters, target):
             "n": "i32",
             "k": "i32",
             "x_row_stride": "i32",
-            "inverse_scale": "fp32",
-            "alpha": "fp32",
+            "alpha_ptr": "*fp32",
             "BLOCK_M": "constexpr",
             "BLOCK_N": "constexpr",
             "BLOCK_K": "constexpr",
@@ -47,8 +47,11 @@ def spec(fields, parameters, target):
             "BIAS": fields["bias"] == "true",
         },
         "options": {"num_warps": 4 if block_m * block_n <= 64 * 64 else 8, "num_stages": 3},
-        # Every operand is an arena tensor or a weight, whose rows start on sixteen-byte bounds.
-        "aligned": ["x_ptr", "w_ptr", "out_ptr"],
+        # Every operand is an arena tensor or a weight, whose rows start on sixteen-byte bounds,
+        # and the operator refuses a contraction or an activation row stride that is not a
+        # multiple of sixteen: whole vectors of both operands' rows are loaded along the
+        # contraction (without the statement the product runs at a fortieth of its rate).
+        "aligned": ["x_ptr", "w_ptr", "out_ptr", "k", "x_row_stride"],
     }
 
 

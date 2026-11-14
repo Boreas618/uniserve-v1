@@ -3,6 +3,7 @@
 ```text
 sum      out[k] = sum of x[k, r]         over every index r of the reduced axes
 min      out[k] = the least x[k, r]      max likewise
+absmax   out[k] = the largest |x[k, r]|  of a floating input
 argmin   out[k] = the first r at which x[k, r] is least; argmax likewise
 ```
 
@@ -139,6 +140,10 @@ def _reduce_kernel(
             best = tl.minimum(best, tl.min(values, axis=1))
         elif FUNCTION == "max":
             best = tl.maximum(best, tl.max(values, axis=1))
+        elif FUNCTION == "absmax":
+            # A position that holds no element repeats the row's best magnitude, which is its
+            # own magnitude.
+            best = tl.maximum(best, tl.max(tl.abs(values), axis=1))
         elif FUNCTION == "argmin":
             lowest = tl.min(values, axis=1)
             taken = lowest < best

@@ -74,7 +74,7 @@ pub use embedding::{embedding, vocabulary_shard};
 pub use frame::frame_norm_pad;
 pub use indexed::{index_scores, indexed_attention};
 pub(crate) use linear::PRODUCT_SCALE_LAYOUT;
-pub use linear::{WeightOrder, linear, linear_fp8, linear_nvfp4};
+pub use linear::{WeightOrder, dynamic_scales, linear, linear_fp8, linear_nvfp4};
 pub use logits::{LOGITS, vocab_unpad};
 pub(crate) use moe::{DOWN_VALUE_LAYOUT, GATED_VALUE_LAYOUT, WEIGHT_SCALE_LAYOUT};
 pub use moe::{

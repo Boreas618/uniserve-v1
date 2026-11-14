@@ -490,7 +490,7 @@ fn a_bigvgan_generator_upsamples_through_its_stages() {
     let checkpoint = checkpoint(directory.path(), &bigvgan_tensors());
     let config = bigvgan_config();
 
-    let loader = WeightLoader::meta(&checkpoint, None, None);
+    let loader = WeightLoader::meta(&checkpoint, None);
     let generator = BigVgan::load(&config, loader.root().pp("decoder")).unwrap();
     assert_eq!(generator.samples(16), 32);
     let odd = BigVganConfig {
@@ -531,7 +531,7 @@ fn a_bigvgan_generator_upsamples_through_its_stages() {
     // On the CPU the generator is its modules in order: here one block, so the stage average
     // is the block's output.
     let store = CpuWeights::new();
-    let loader = WeightLoader::new(&checkpoint, &store, None, None);
+    let loader = WeightLoader::new(&checkpoint, &store, None);
     let generator = BigVgan::load(&config, loader.root().pp("decoder")).unwrap();
     let post = Activation1d::load(
         &Activation1dConfig {
@@ -577,7 +577,7 @@ fn a_dac_encoder_widens_and_strides_through_its_stages() {
         latent_channels: 8,
     };
 
-    let loader = WeightLoader::meta(&checkpoint, None, None);
+    let loader = WeightLoader::meta(&checkpoint, None);
     let encoder = DacEncoder::load(&config, loader.root().pp("enc")).unwrap();
     assert_eq!(encoder.hop(), 2);
     let no_stage = DacEncoderConfig {
@@ -602,7 +602,7 @@ fn a_dac_encoder_widens_and_strides_through_its_stages() {
 
     // On the CPU a track of whole hops becomes one frame per hop.
     let store = CpuWeights::new();
-    let loader = WeightLoader::new(&checkpoint, &store, None, None);
+    let loader = WeightLoader::new(&checkpoint, &store, None);
     let encoder = DacEncoder::load(&config, loader.root().pp("enc")).unwrap();
     let track = tensor(&sequence(12, 92), (1, 1, 12), DType::F32);
     let latent = encoder.forward(&track).unwrap();

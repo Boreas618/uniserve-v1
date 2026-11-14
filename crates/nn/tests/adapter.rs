@@ -136,7 +136,7 @@ fn an_adapter_is_fused_into_every_read_of_what_it_edits() {
     };
 
     let store = CpuWeights::new();
-    let loader = WeightLoader::new(transformer, &store, None, None);
+    let loader = WeightLoader::new(transformer, &store, None);
     let fused = load(&loader, &column, vec![2, 2], None);
     assert_eq!(values(&fused), [3.0, 4.5, 3.0, 3.0]);
     let untouched = load(&loader, &other, vec![2], None);
@@ -150,8 +150,7 @@ fn an_adapter_is_fused_into_every_read_of_what_it_edits() {
 
     // The base checkpoint's own columns, for comparison.
     let base_store = CpuWeights::new();
-    let base_loader =
-        WeightLoader::new(plain.stage("transformer").unwrap(), &base_store, None, None);
+    let base_loader = WeightLoader::new(plain.stage("transformer").unwrap(), &base_store, None);
     assert_eq!(
         values(&load(&base_loader, &column, vec![2, 2], None)),
         [2.0, 3.0, 5.0, 6.0]

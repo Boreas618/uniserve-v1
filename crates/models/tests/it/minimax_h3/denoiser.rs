@@ -227,7 +227,7 @@ fn stepped(
     write_checkpoint(directory.path());
     let checkpoint = Checkpoint::open(directory.path()).unwrap();
     let store = CpuWeights::new();
-    let loader = WeightLoader::new(&checkpoint, &store, None, None);
+    let loader = WeightLoader::new(&checkpoint, &store, None);
 
     let config = config(vsa);
     let denoiser =
@@ -371,7 +371,7 @@ fn a_request_of_a_task_the_network_does_not_serve_is_refused_by_name() {
     write_checkpoint(directory.path());
     let checkpoint = Checkpoint::open(directory.path()).unwrap();
     let store = CpuWeights::new();
-    let loader = WeightLoader::new(&checkpoint, &store, None, None);
+    let loader = WeightLoader::new(&checkpoint, &store, None);
     let denoiser = Denoiser::load(
         &config(None),
         (64, 64),

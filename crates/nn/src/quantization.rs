@@ -64,10 +64,15 @@
 //! A deployment states its precision as a policy (`quantization`: a mode and selections by
 //! module), which each family interprets against what its checkpoint declares when it opens
 //! it ([`crate::family`]). A family that states no mode and no selection serves the checkpoint's
-//! own representation and refuses any other policy ([`own_representation`]). No load in this
-//! library converts a dense weight into FP8 or NVFP4: both products read a calibrated
-//! activation scale ([`ops::fp8`], [`ops::fp4`]) that only a quantized export states, so a policy
-//! that narrows a dense checkpoint's module is refused by the family that interprets it.
+//! own representation and refuses any other policy ([`own_representation`]).
+//!
+//! A family that converts a dense checkpoint's modules states the projections it converts in
+//! the declaration of their stage ([`Declaration::converted`]): each named projection's weight is
+//! read as [`Scheme::DynamicFp8`] or [`Scheme::DynamicNvfp4`], encoded once at load from the
+//! checkpoint's own values under the whole tensor's largest magnitude ([`dynamic`]), and its
+//! product encodes each activation at a scale measured from that activation on every call
+//! ([`ops::dynamic_scale`]). Every other tensor of the stage, the projection's bias included,
+//! stays dense, and a module that reads a converted weight with no encoded form is refused.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -80,6 +85,7 @@ use crate::checkpoint::Checkpoint;
 use crate::config::Fields;
 use crate::error::{Error, Result};
 
+pub(crate) mod dynamic;
 mod modelopt;
 mod nvfp4;
 
@@ -111,6 +117,16 @@ pub enum Scheme {
     /// Read by every module as the dense matrix `e4m3(weight) · weight_scale_inv`, decoded once
     /// at load.
     Fp8Blocks,
+    /// A dense weight the deployment's policy converts at load into per-tensor FP8: the E4M3
+    /// values `e4m3(x · 448 / amax_w)` under the whole checkpoint tensor's largest magnitude
+    /// `amax_w`. Its product encodes each activation at a scale measured from that activation
+    /// on every call.
+    DynamicFp8,
+    /// A dense weight converted at load into NVFP4: packed E2M1 codes and an E4M3 scale per
+    /// sixteen elements under the tensor scale `amax_w / (6 · 448)`, as a calibrated export
+    /// stores them. Its product encodes each activation into NVFP4 at a scale measured from
+    /// that activation on every call.
+    DynamicNvfp4,
 }
 
 /// The scheme a checkpoint's key/value cache scales follow.
@@ -146,6 +162,9 @@ pub struct Declaration {
     /// when the export states its calibration in a manifest; `None` when each packed weight
     /// stores its activation scale beside it.
     activations: Option<BTreeMap<String, f32>>,
+    /// The projections of a dense checkpoint converted at load: a module pattern and the scheme
+    /// the module's `weight` takes, [`Scheme::DynamicFp8`] or [`Scheme::DynamicNvfp4`].
+    converted: Vec<(String, Scheme)>,
 }
 
 impl Declaration {
@@ -160,7 +179,36 @@ impl Declaration {
             blocks: None,
             names: Nvfp4Names::vllm(),
             activations: None,
+            converted: Vec::new(),
         }
+    }
+
+    /// A dense checkpoint whose projections `modules` names are converted at load.
+    ///
+    /// Each entry is a module pattern, in which `*` stands for any run of characters and which
+    /// matches a module's whole name, with the scheme the module's `weight` is read in:
+    /// [`Scheme::DynamicFp8`] or [`Scheme::DynamicNvfp4`]. A module no pattern names, and every
+    /// tensor of a named module but its `weight`, stays dense.
+    ///
+    /// # Errors
+    ///
+    /// When an entry states another scheme: the others are what a checkpoint's shards state, not
+    /// a conversion.
+    pub fn converted(modules: Vec<(String, Scheme)>) -> Result<Self> {
+        if let Some((module, scheme)) = modules
+            .iter()
+            .find(|(_, scheme)| !matches!(scheme, Scheme::DynamicFp8 | Scheme::DynamicNvfp4))
+        {
+            return Err(refuse(
+                module,
+                format!("{scheme:?} is a checkpoint's representation, not a conversion at load"),
+            ));
+        }
+
+        Ok(Self {
+            converted: modules,
+            ..Self::dense()
+        })
     }
 
     /// Read the declaration of `checkpoint`, from its `config.json` and its export's own file.
@@ -301,7 +349,7 @@ impl Declaration {
                 .map_or(Scheme::Dense, |(_, scheme)| *scheme);
         }
         if self.scheme == Scheme::Dense {
-            return Scheme::Dense;
+            return self.conversion(weight).unwrap_or(Scheme::Dense);
         }
         let packed = match &self.packed {
             Some(packed) => packed.contains(weight),
@@ -311,6 +359,17 @@ impl Declaration {
                 .any(|module| matches_module(module, weight)),
         };
         if packed { self.scheme } else { Scheme::Dense }
+    }
+
+    /// The scheme a dense checkpoint's `weight` is converted to at load, when a pattern of
+    /// [`Self::converted`] names the module whose `weight` it is.
+    fn conversion(&self, weight: &str) -> Option<Scheme> {
+        let module = weight.strip_suffix(".weight")?;
+
+        self.converted
+            .iter()
+            .find(|(pattern, _)| glob(pattern, module))
+            .map(|(_, scheme)| *scheme)
     }
 
     /// Whether any weight is declared packed: whether the encoded kernels are the ones that run.
@@ -639,6 +698,7 @@ fn declaration(
         blocks: None,
         names: Nvfp4Names::vllm(),
         activations: None,
+        converted: Vec::new(),
     })
 }
 
@@ -713,30 +773,31 @@ fn matches_module(entry: &str, weight: &str) -> bool {
     if module == entry || module.starts_with(&format!("{entry}.")) {
         return true;
     }
-    if !entry.contains('*') {
-        return false;
-    }
-    // A glob is matched by splitting on `*` and taking the pieces in order: the first piece anchors
-    // the front, the last anchors the back, and the middle pieces are found in sequence.
-    let pieces: Vec<&str> = entry.split('*').collect();
+    entry.contains('*') && glob(entry, module)
+}
+
+/// Whether `text` matches `pattern` whole, `*` in the pattern standing for any run of characters.
+///
+/// The pattern is split on `*` and its pieces taken in order: the first piece anchors the front,
+/// the last anchors the back, and the middle pieces are found in sequence. A pattern without `*`
+/// matches only itself.
+fn glob(pattern: &str, text: &str) -> bool {
+    let pieces: Vec<&str> = pattern.split('*').collect();
     let (first, rest) = (pieces[0], &pieces[1..]);
-    let Some(mut cursor) = module.strip_prefix(first) else {
+    let Some(mut cursor) = text.strip_prefix(first) else {
         return false;
     };
-    let last_index = rest.len().saturating_sub(1);
-    for (index, piece) in rest.iter().enumerate() {
-        if piece.is_empty() {
-            continue;
-        }
-        if index == last_index {
-            return cursor.ends_with(piece);
-        }
+    let Some((last, middle)) = rest.split_last() else {
+        return cursor.is_empty();
+    };
+
+    for piece in middle {
         match cursor.find(piece) {
             Some(at) => cursor = &cursor[at + piece.len()..],
             None => return false,
         }
     }
-    true
+    cursor.len() >= last.len() && cursor.ends_with(last)
 }
 
 #[cfg(test)]
@@ -820,6 +881,34 @@ mod tests {
                 .and_then(|(_, declaration)| declaration)
                 .is_err()
         );
+    }
+
+    /// A conversion names a projection's `weight` by its module's whole name; its bias, its
+    /// sub-modules and a module the pattern only begins or ends are dense, and a scheme that is
+    /// no conversion is refused.
+    #[test]
+    fn a_conversion_names_the_weight_of_each_module_its_pattern_matches_whole() {
+        let declaration = Declaration::converted(vec![
+            ("blocks.*.attn.to_q".to_owned(), Scheme::DynamicFp8),
+            ("blocks.*.ff.net.2".to_owned(), Scheme::DynamicNvfp4),
+        ])
+        .unwrap();
+
+        for (weight, scheme) in [
+            ("blocks.0.attn.to_q.weight", Scheme::DynamicFp8),
+            ("blocks.49.ff.net.2.weight", Scheme::DynamicNvfp4),
+            ("blocks.0.attn.to_q.bias", Scheme::Dense),
+            ("blocks.0.attn.to_q.lora.weight", Scheme::Dense),
+            ("refiner.blocks.0.attn.to_q.weight", Scheme::Dense),
+            ("blocks.0.ff.net.20.weight", Scheme::Dense),
+            ("blocks.0.attn.norm_q.weight", Scheme::Dense),
+        ] {
+            assert_eq!(declaration.scheme(weight), scheme, "{weight}");
+        }
+        assert!(!declaration.is_encoded());
+        assert_ne!(declaration, Declaration::dense());
+
+        assert!(Declaration::converted(vec![("proj".to_owned(), Scheme::Nvfp4)]).is_err());
     }
 
     #[test]

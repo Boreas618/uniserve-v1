@@ -290,7 +290,30 @@ A dense BF16 checkpoint states its precision with `quantization`. A mode gives f
 | `performance` | BF16 | FP8 | BF16 | NVFP4 |
 | `maximum` | BF16 | NVFP4 | FP8 | NVFP4 |
 
-This build serves `quality` alone: no load converts a dense checkpoint's weights into FP8 or NVFP4, whose products read a calibrated activation scale that only a quantized export states, and the video VAE decoder computes in FP16, the type its reference computes in. A policy that gives a module another representation (`balanced`, `performance`, `maximum`, an `fp8` or `nvfp4` selection, `video_vae = "bf16"`) is refused when the engine opens the checkpoint, naming each such module and its representation; a selection of another module, or of a representation its module does not take (`attention`, `mlp` and `text_encoder` take `bf16`, `fp8` or `nvfp4`; `video_vae` takes `fp16`, `bf16` or `nvfp4`), is refused by its path. NVFP4 is served by the packed NVFP4 checkpoints, which carry their own precision and take no `quantization`.
+Every mode is served: an FP8 or NVFP4 module's projections are converted from the dense checkpoint when the engine loads it, and their products encode each activation at a scale measured from it on every call (below). A selection of another module, or of a representation its module does not take (`attention`, `mlp` and `text_encoder` take `bf16`, `fp8` or `nvfp4`; `video_vae` takes `fp16`, `bf16` or `nvfp4`), is refused by its path. `video_vae = "bf16"` is refused when the engine opens the checkpoint: the decoder computes in FP16, the type its reference computes in, and its raster, splice and codec read FP16. The packed NVFP4 checkpoints carry their own precision and take no `quantization`.
+
+### What each module converts
+
+A module in FP8 or NVFP4 converts these projections of the dense checkpoint; everything else (norms, embeddings, the modulation, the refiner, the input and output heads, the vision tower, the condition encoders and the audio VAE) keeps the checkpoint's representation:
+
+| Module | Projections converted |
+| --- | --- |
+| `attention` | each block of every denoiser network the checkpoint holds: `attn.to_q`, `attn.to_k`, `attn.to_v`, `attn.to_gate_compress` (sparse students) and `attn.to_out.0` |
+| `mlp` | each block of every denoiser network: `ff.net.0.proj` (the value and gate halves, one product) and `ff.net.2` |
+| `text_encoder` | each retained language layer: `self_attn.{q,k,v,o}_proj` and `mlp.{gate,up,down}_proj` |
+| `video_vae` | each decoder block: `attn.to_q`, `attn.to_k`, `attn.to_v`, `attn.to_out.0`, `ff.net.0.proj` and `ff.net.2`, the projections the packed NVFP4 export calibrates; `post_quant_conv`, `proj_in` and `proj_out` stay FP16, and the decoder computes in FP16 as it does for the export |
+
+### Conversion at load
+
+The engine converts a projection once, on the host, as the weight loader reads it: the checkpoint's own values (BF16, or FP32 for the video VAE) are encoded with one tensor scale per checkpoint tensor, taken from the largest magnitude of the whole tensor, so a tensor-parallel rank's share is exactly the part of the one-device encoding it holds and every layout serves the same numbers. FP8 is E4M3 with the scale `amax / 448`, rounded to nearest even. NVFP4 is packed E2M1 codes, two a byte, with an E4M3 scale per block of sixteen elements relative to the tensor scale `amax / (6 · 448)`, as the packed export stores it. A column-parallel share is whole rows of the encoding and a row-parallel share whole sixteen-element blocks of every row, with its block scales laid out for the share. The encoded weight goes to retained storage under a key naming the checkpoint file, the encoded type and the share, beside the tensor's largest magnitude as one FP32 number, so a later epoch on the host finds both without reading or encoding again. The device holds only the encoded weight (one byte per element for FP8, nine sixteenths of one for NVFP4), never the dense matrix; the host holds one copy of a projection's tensor, its share's checkpoint bytes and the encoded share while it encodes it. An NVFP4 product compiles whole tiles of 256 output channels and 256 contraction elements, so a projection whose share is not whole tiles (an `attention` selection under an eight-way Ulysses split, whose head shares are 896 channels) is refused when it loads, naming the projection.
+
+### The activation's scale
+
+A converted projection encodes its activation at a scale measured from that activation on every call. On the device, within the forward and its captured graphs, the largest magnitude of each row is reduced, the rows' maxima are folded into the activation's largest magnitude `amax`, and from it and the weight's largest magnitude one launch writes the encoder's multiplier `R / amax` and the product's factor `(amax / R) · (amax_w / R)`, with `R = 448` for FP8 and `6 · 448` for NVFP4 (an `amax` below `1e-12` is taken as `1e-12`). The encode and the product read both from device memory, so nothing waits for the host. Each rank measures the activation it holds (its rows of a sequence split, its share of a row-parallel contraction), and each partial product is scaled by its own factor before the ranks' sums meet, so no collective is added.
+
+### Accuracy
+
+Each encoded element differs from its value by at most what its format's rounding allows: for FP8, `2⁻⁴ |x| + 2⁻¹⁰ s` with `s` the tensor scale (half a unit of E4M3's three-bit mantissa, and of its smallest subnormal step); for NVFP4, `(17/96) · b + 6 · 2⁻¹⁰ s` with `b` the largest magnitude of the element's block (half the widest step of E2M1, one block scale, times the block scale's own E4M3 rounding of at most `2⁻⁴`). A product therefore differs from the dense product of the same rows by at most `Σ_k (e_x |w| + |x| e_w + e_x e_w)` over its contraction, plus the FP32 accumulation and the one rounding into the output type; the library's tests hold every converted product to that bound against an exact reference. Frames are expected to differ from `quality`'s: the per-pixel tolerance the end-to-end suite compares two runs of one precision with does not hold between precisions. For FastH3 8-step on one B200 (1344x768, 124 frames, seed 1000), the video's PSNR against `quality` is 34.4 dB under `balanced`, whose soundtrack is identical; 14.5 dB under `performance`; and 11.9 dB under `maximum`, against 12.6 dB for the student's calibrated NVFP4 export. A feed-forward in FP8 or NVFP4 moves the eight-step trajectory to another rendering of the prompt, as the calibrated export does, rather than adding noise to the same one.
 
 ## Further guides
 
@@ -303,7 +326,8 @@ This build serves `quality` alone: no load converts a dense checkpoint's weights
 | A kernel package's compile error in the Build Server's log | Check CUDA 13 `nvcc`, `CUDA_HOME` and the C++ build tools, and run the Build Server's `uv sync` above again. |
 | `unsupported FastH3 checkpoint` | Use a checkpoint from the table above; the message names the `fastvideo_inference.json` field it cannot serve. |
 | `checkpoint format 'modelopt_nvfp4' owns its numerical configuration` | Drop `quantization` for a packed NVFP4 checkpoint. |
-| `a dense checkpoint is served in quality alone` | State `quality`, or no `quantization`; serve a packed NVFP4 checkpoint for NVFP4 products. |
+| `the video VAE decoder computes in fp16` | Select `video_vae = "fp16"` or `"nvfp4"`. |
+| `is not whole tiles of 256` naming a converted projection | Select `bf16` or `fp8` for that module, or serve a layout whose shares are whole tiles. |
 | `NVML reports no device storage for process` | Run the container in the host's process ID namespace (`--pid=host`). |
 | Startup refuses a static storage grant, or GPU out of memory | Raise `--mem-fraction-static`, serve fewer canvases, capacities or seconds, or shard the denoiser further. |
 | `invalid_request` naming a condition product's rows and its bound, or the packed condition rows and `video_config.max_condition_rows` | Serve with a larger `video_config.max_condition_rows`, or without it to provision the largest condition set, or send fewer or smaller references. |

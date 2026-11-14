@@ -199,6 +199,7 @@ impl ModeloptManifest {
             layers: None,
             names: Nvfp4Names::diffusers(),
             activations: Some(activations),
+            converted: Vec::new(),
         })
     }
 }

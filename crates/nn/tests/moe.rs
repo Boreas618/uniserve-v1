@@ -884,7 +884,7 @@ fn the_packed_products_multiply_the_encoded_rows_by_the_experts_decoded_weights(
     let directory = tempfile::tempdir().unwrap();
     let (checkpoint, fields) = packed_checkpoint(directory.path(), 2);
     let store = CpuWeights::new();
-    let mut loader = WeightLoader::new(&checkpoint, &store, None, None);
+    let mut loader = WeightLoader::new(&checkpoint, &store, None);
     loader
         .declare(&Declaration::read(&checkpoint).unwrap())
         .unwrap();
@@ -1055,7 +1055,7 @@ fn a_block_loads_its_experts_and_sums_each_token_s_routes() {
     let directory = tempfile::tempdir().unwrap();
     let checkpoint = dense_checkpoint(directory.path(), DType::F32);
     let store = CpuWeights::new();
-    let loader = WeightLoader::new(&checkpoint, &store, None, None);
+    let loader = WeightLoader::new(&checkpoint, &store, None);
 
     let block = MoE::load(&dense_config(), loader.root().pp("mlp")).unwrap();
     assert_eq!(
@@ -1110,7 +1110,7 @@ fn a_block_reads_stacked_experts_as_it_reads_one_module_each() {
     let modules = tempfile::tempdir().unwrap();
     let checkpoint = dense_checkpoint(modules.path(), DType::F32);
     let store = CpuWeights::new();
-    let loader = WeightLoader::new(&checkpoint, &store, None, None);
+    let loader = WeightLoader::new(&checkpoint, &store, None);
     let config = MoEConfig {
         order: vec![3, 1, 0, 2],
         stacked: Some(["gate_up_proj", "down_proj"]),
@@ -1155,7 +1155,7 @@ fn a_block_reads_stacked_experts_as_it_reads_one_module_each() {
     );
     let stacked_checkpoint = Checkpoint::open(stacked.path()).unwrap();
     let stacked_store = CpuWeights::new();
-    let stacked_loader = WeightLoader::new(&stacked_checkpoint, &stacked_store, None, None);
+    let stacked_loader = WeightLoader::new(&stacked_checkpoint, &stacked_store, None);
     let from_stacks = MoE::load(&config, stacked_loader.root().pp("mlp")).unwrap();
 
     let x = tensor(&sequence(5 * 8, 81), (5, 8), DType::F32);
@@ -1169,7 +1169,7 @@ fn a_block_reads_stacked_experts_as_it_reads_one_module_each() {
 fn a_block_refuses_a_routing_or_a_share_its_checkpoint_does_not_have() {
     let directory = tempfile::tempdir().unwrap();
     let checkpoint = dense_checkpoint(directory.path(), DType::F32);
-    let loader = WeightLoader::meta(&checkpoint, None, None);
+    let loader = WeightLoader::meta(&checkpoint, None);
     let refused = |config: MoEConfig| {
         MoE::load(&config, loader.root().pp("mlp"))
             .err()
@@ -1244,7 +1244,7 @@ fn a_block_split_over_a_tensor_group_holds_its_share_and_reduces_its_sum() {
     // The second rank holds rows 3..6 of every gate and up projection and columns 3..6 of every
     // down projection.
     let store = CpuWeights::new();
-    let loader = WeightLoader::new(&checkpoint, &store, None, None);
+    let loader = WeightLoader::new(&checkpoint, &store, None);
     MoE::load(&config, loader.root().pp("mlp")).unwrap();
     let keys: Vec<String> = store.keys().iter().map(ToString::to_string).collect();
     for piece in [
@@ -1261,7 +1261,7 @@ fn a_block_split_over_a_tensor_group_holds_its_share_and_reduces_its_sum() {
 
     // Its output is a partial sum: a forward with no group is refused, and one with a group
     // states the same kernels as a whole block over half the width.
-    let meta_loader = WeightLoader::meta(&checkpoint, None, None);
+    let meta_loader = WeightLoader::meta(&checkpoint, None);
     let block = MoE::load(&config, meta_loader.root().pp("mlp")).unwrap();
     let (alone, _) = recorded(|| block.forward(&meta((4, 8), DType::BF16), None, None));
     let message = alone.err().unwrap().to_string();
@@ -1300,7 +1300,7 @@ fn a_block_split_over_a_tensor_group_holds_its_share_and_reduces_its_sum() {
 fn a_dense_block_states_its_routing_its_products_and_its_combine() {
     let directory = tempfile::tempdir().unwrap();
     let checkpoint = dense_checkpoint(directory.path(), DType::BF16);
-    let loader = WeightLoader::meta(&checkpoint, None, None);
+    let loader = WeightLoader::meta(&checkpoint, None);
     let block = MoE::load(&dense_config(), loader.root().pp("mlp")).unwrap();
 
     let (output, launches) = recorded(|| {
@@ -1432,7 +1432,7 @@ fn a_calibrated_block_runs_the_packed_products_over_its_stacks() {
     let directory = tempfile::tempdir().unwrap();
     let (checkpoint, _) = packed_checkpoint(directory.path(), 2);
     let store = CpuWeights::new();
-    let mut loader = WeightLoader::new(&checkpoint, &store, None, None);
+    let mut loader = WeightLoader::new(&checkpoint, &store, None);
     loader
         .declare(&Declaration::read(&checkpoint).unwrap())
         .unwrap();
@@ -1509,7 +1509,7 @@ fn exchange_key(mode: &str) -> String {
 fn a_block_over_an_expert_group_exchanges_its_routes_around_its_own_experts() {
     let directory = tempfile::tempdir().unwrap();
     let checkpoint = dense_checkpoint(directory.path(), DType::BF16);
-    let loader = WeightLoader::meta(&checkpoint, None, None);
+    let loader = WeightLoader::meta(&checkpoint, None);
     let block = MoE::load(
         &MoEConfig {
             exchange: Split { size: 2, rank: 1 },
@@ -1617,7 +1617,7 @@ fn a_block_over_an_expert_group_exchanges_its_routes_around_its_own_experts() {
 fn a_calibrated_block_over_an_expert_group_runs_in_the_exchange_s_one_launch() {
     let directory = tempfile::tempdir().unwrap();
     let (checkpoint, _) = packed_checkpoint(directory.path(), 2);
-    let mut loader = WeightLoader::meta(&checkpoint, None, None);
+    let mut loader = WeightLoader::meta(&checkpoint, None);
     loader
         .declare(&Declaration::read(&checkpoint).unwrap())
         .unwrap();
@@ -1817,7 +1817,7 @@ fn a_shared_expert_adds_its_gated_mlp_into_the_routed_output() {
     };
 
     let store = CpuWeights::new();
-    let loader = WeightLoader::new(&checkpoint, &store, None, None);
+    let loader = WeightLoader::new(&checkpoint, &store, None);
     let shared = SharedExpert::load(&config, loader.root().pp("mlp")).unwrap();
 
     let (x, routed) = (sequence(rows * hidden, 96), sequence(rows * hidden, 97));
@@ -1848,7 +1848,7 @@ fn a_shared_expert_adds_its_gated_mlp_into_the_routed_output() {
     assert_eq!(values(&routed), values(&out));
 
     // Under a meta context: the MLP's products and gate, the gate's logit, and the gated add.
-    let meta_loader = WeightLoader::meta(&checkpoint, None, None);
+    let meta_loader = WeightLoader::meta(&checkpoint, None);
     let shared = SharedExpert::load(&config, meta_loader.root().pp("mlp")).unwrap();
     let (output, launches) = recorded(|| {
         shared.forward(

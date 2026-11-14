@@ -2221,7 +2221,7 @@ impl WeightBinding {
     ) -> Result<Adapter> {
         let mut tensors = BTreeMap::new();
         let loaded = (|| -> Result<()> {
-            let loader = nn::WeightLoader::new(checkpoint, &store, None, None);
+            let loader = nn::WeightLoader::new(checkpoint, &store, None);
             for name in names {
                 let shape = checkpoint
                     .tensor(name)

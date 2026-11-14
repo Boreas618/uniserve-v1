@@ -366,7 +366,7 @@ fn the_convolution_modules_load_the_filters_their_torch_arguments_state() {
         ],
     );
     let store = CpuWeights::new();
-    let loader = WeightLoader::new(&checkpoint, &store, None, None);
+    let loader = WeightLoader::new(&checkpoint, &store, None);
 
     let config = ConvConfig {
         padding: [1],
@@ -477,7 +477,7 @@ fn each_convolution_is_one_launch_keyed_by_its_element_types() {
             ("frame.weight", vec![8, 4, 2, 2, 2], sequence(8 * 4 * 8, 26)),
         ],
     );
-    let loader = WeightLoader::meta(&checkpoint, None, None);
+    let loader = WeightLoader::meta(&checkpoint, None);
 
     // A grouped, biased convolution is still one launch: the groups and the bias travel in it.
     let grouped = ConvConfig {

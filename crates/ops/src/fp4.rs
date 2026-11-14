@@ -69,6 +69,14 @@ pub fn packed_rows(rows: u32) -> Result<u32> {
 /// Elements one E4M3 block scale covers: NVFP4's sixteen-element block.
 pub const BLOCK_ELEMENTS: u32 = 16;
 
+/// The largest magnitude an E2M1 code states.
+pub const E2M1_MAX: f32 = 6.0;
+
+/// The output channels and the contraction elements the packed product's tile covers: its `n`
+/// and `k` are whole multiples of it (`nvfp4_gemm/cute_dsl` compiles 128x256 output tiles reducing
+/// over 256-element steps, and refuses another extent).
+pub const PRODUCT_TILE: u32 = 256;
+
 /// The padded row and scale-column granularity of the swizzled scale layout.
 pub const SWIZZLE_ROWS: u64 = 128;
 /// The scale columns the swizzled layout groups.
@@ -159,12 +167,12 @@ pub struct QuantizeArgs {
     pub values: Operand,
     /// The E4M3 block scales, in the descriptor's layout.
     pub scales: Operand,
-    /// `[1]` FP32: the encoder's global scale, the reciprocal of the checkpoint's activation tensor
-    /// scale.
+    /// `[1]` FP32: the encoder's global scale, the reciprocal of the activation's tensor scale.
     ///
-    /// A device operand rather than a launch scalar: the encoder is calibrated data of the tensor
-    /// it encodes, published beside the weights, and the product that consumes the encoding reads
-    /// it as each thread block starts — so a host value here would serialize the pair.
+    /// A device operand rather than a launch scalar: a calibrated export's scale is published
+    /// beside the weights, and a scale measured from the activation is written by the launch
+    /// before ([`crate::dynamic_scale`]); the product that consumes the encoding reads its factor
+    /// as each thread block starts, so a host value here would serialize the pair.
     pub global_scale: Operand,
     /// `[rows]` FP32: the row's **dequantization factor**, the number the product multiplies a
     /// block's E4M3 scale by.

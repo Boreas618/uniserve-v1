@@ -96,6 +96,6 @@ pub use proto::video::{ConditionRole, LatentShape, VisionGrid};
 pub use tensor::{D, DType, Device, IndexOp, Module, Shape, Tensor};
 pub use var_builder::VarBuilder;
 pub use weights::{
-    CpuWeights, PartBlock, Provenance, Quantization, RetainedWeights, WeightKey, WeightLayout,
-    WeightLoader, WeightSource,
+    CpuWeights, PartBlock, Provenance, RetainedWeights, WeightKey, WeightLayout, WeightLoader,
+    WeightSource,
 };

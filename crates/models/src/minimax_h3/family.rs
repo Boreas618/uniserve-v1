@@ -90,8 +90,8 @@ impl VideoFamily for MinimaxH3Family {
             )));
         }
 
-        let config = Config::open(checkpoint)?;
-        precision::check(quantization, &config)?;
+        let mut config = Config::open(checkpoint)?;
+        precision::apply(quantization, &mut config)?;
         Ok(Box::new(config))
     }
 

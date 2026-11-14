@@ -87,7 +87,7 @@ fn a_dense_projection_loads_its_module_and_projects() {
         ],
     );
     let store = CpuWeights::new();
-    let loader = WeightLoader::new(&checkpoint, &store, None, None);
+    let loader = WeightLoader::new(&checkpoint, &store, None);
 
     let linear = Linear::load(&WHOLE, loader.root().pp("block").pp("proj")).unwrap();
     assert_eq!((linear.k(), linear.n(), linear.is_packed()), (4, 6, false));
@@ -123,7 +123,7 @@ fn a_parallel_projection_loads_this_rank_s_block() {
         ],
     );
     let store = CpuWeights::new();
-    let loader = WeightLoader::new(&checkpoint, &store, None, None);
+    let loader = WeightLoader::new(&checkpoint, &store, None);
     let split = Split { size: 2, rank: 1 };
 
     // Column parallel: rank 1 holds output channels 3..6 and their bias.
@@ -187,7 +187,7 @@ fn a_row_parallel_projection_reduces_under_its_group() {
         DType::BF16,
         &[("proj.weight", vec![8, 32], sequence(8 * 32, 7))],
     );
-    let loader = WeightLoader::meta(&checkpoint, None, None);
+    let loader = WeightLoader::meta(&checkpoint, None);
     let row = Linear::load(
         &LinearConfig {
             inputs: 32,
@@ -224,7 +224,7 @@ fn several_modules_are_read_as_one_merged_projection() {
         ],
     );
     let store = CpuWeights::new();
-    let loader = WeightLoader::new(&checkpoint, &store, None, None);
+    let loader = WeightLoader::new(&checkpoint, &store, None);
 
     let merged =
         Linear::load_merged(loader.root().pp("heads"), &["a", "b"], 4, &[2, 3], true).unwrap();
@@ -262,8 +262,9 @@ fn declare(directory: &Path, quantization: &str) {
 #[test]
 fn a_per_tensor_fp8_projection_is_chosen_by_the_checkpoint_s_declaration() {
     let directory = tempfile::tempdir().unwrap();
-    // E4M3 values, so the stored weight is exact.
-    let weight = [0.5_f32, -1.25, 2.0, 0.375, 1.0, 1.5, -0.75, 3.0];
+    // E4M3 values, so the stored weight is exact: two rows of one vector of sixteen, the
+    // contraction an FP8 product's kernels load whole.
+    let weight: Vec<f32> = [0.5_f32, -1.25, 2.0, 0.375, 1.0, 1.5, -0.75, 3.0].repeat(4);
     shard(
         directory.path(),
         "model.safetensors",
@@ -271,7 +272,7 @@ fn a_per_tensor_fp8_projection_is_chosen_by_the_checkpoint_s_declaration() {
             (
                 "proj.weight",
                 DType::F8E4M3,
-                vec![2, 4],
+                vec![2, 16],
                 weight
                     .iter()
                     .map(|value| e4m3_byte(*value))
@@ -287,14 +288,14 @@ fn a_per_tensor_fp8_projection_is_chosen_by_the_checkpoint_s_declaration() {
     );
     let checkpoint = Checkpoint::open(directory.path()).unwrap();
     let config = LinearConfig {
-        inputs: 4,
+        inputs: 16,
         outputs: 2,
         bias: false,
         parallel: Parallel::None,
     };
 
     let store = CpuWeights::new();
-    let mut loader = WeightLoader::new(&checkpoint, &store, None, None);
+    let mut loader = WeightLoader::new(&checkpoint, &store, None);
     loader
         .declare(&Declaration::read(&checkpoint).unwrap())
         .unwrap();
@@ -303,26 +304,26 @@ fn a_per_tensor_fp8_projection_is_chosen_by_the_checkpoint_s_declaration() {
 
     // The module computes what the function computes over the fields it loaded: the activation
     // divided by its scale, and the product scaled by both.
-    let x = tensor(&sequence(3 * 4, 13), (3, 4), DType::BF16);
+    let x = tensor(&sequence(3 * 16, 13), (3, 16), DType::BF16);
     let expected = functional::linear_fp8(
         &x,
-        &tensor(&weight, (2, 4), DType::F8E4M3),
+        &tensor(&weight, (2, 16), DType::F8E4M3),
         None,
-        0.25,
-        0.25 * 0.5,
+        &tensor(&[1.0 / 0.25], 1, DType::F32),
+        &tensor(&[0.25 * 0.5], 1, DType::F32),
     )
     .unwrap();
     assert_eq!(values(&linear.forward(&x).unwrap()), values(&expected));
 
     // A meta load chooses the same representation, and its forward states the FP8 product.
-    let mut loader = WeightLoader::meta(&checkpoint, None, None);
+    let mut loader = WeightLoader::meta(&checkpoint, None);
     loader
         .declare(&Declaration::read(&checkpoint).unwrap())
         .unwrap();
     let linear = Linear::load(&config, loader.root().pp("proj")).unwrap();
-    let (output, launches) = recorded(|| linear.forward(&meta((3, 4), DType::BF16)));
+    let (output, launches) = recorded(|| linear.forward(&meta((3, 16), DType::BF16)));
     output.unwrap();
-    assert_eq!(operators(&launches), ["fp8_gemm"]);
+    assert_eq!(operators(&launches), ["fp8_quantize", "fp8_gemm"]);
 }
 
 /// The E4M3 byte of `value`, one of the format's own values: sign, four exponent bits biased by
@@ -403,7 +404,7 @@ fn a_calibrated_nvfp4_projection_loads_its_fields_in_the_product_s_layout() {
         nvfp4_checkpoint(directory.path());
 
     let store = CpuWeights::new();
-    let mut loader = WeightLoader::new(&checkpoint, &store, None, None);
+    let mut loader = WeightLoader::new(&checkpoint, &store, None);
     loader
         .declare(&Declaration::read(&checkpoint).unwrap())
         .unwrap();
@@ -468,7 +469,7 @@ fn a_meta_load_of_a_packed_projection_states_the_encoder_and_the_product() {
     let directory = tempfile::tempdir().unwrap();
     let (checkpoint, ..) = nvfp4_checkpoint(directory.path());
 
-    let mut loader = WeightLoader::meta(&checkpoint, None, None);
+    let mut loader = WeightLoader::meta(&checkpoint, None);
     loader
         .declare(&Declaration::read(&checkpoint).unwrap())
         .unwrap();
@@ -565,7 +566,7 @@ fn a_projection_an_adapter_edits_is_loaded_fused() {
         .unwrap();
 
     let store = CpuWeights::new();
-    let loader = WeightLoader::new(&adapted, &store, None, None);
+    let loader = WeightLoader::new(&adapted, &store, None);
     let linear = Linear::load(
         &LinearConfig {
             inputs: 3,
@@ -613,7 +614,7 @@ fn an_attention_s_projections_load_separately_or_as_windows_of_one_module() {
         ],
     );
     let store = CpuWeights::new();
-    let loader = WeightLoader::new(&checkpoint, &store, None, None);
+    let loader = WeightLoader::new(&checkpoint, &store, None);
     let config = QkvLinearConfig {
         hidden: hidden as u32,
         heads: 4,
@@ -676,7 +677,7 @@ fn an_embedding_gathers_its_table_s_rows() {
         &[("embed_tokens.weight", vec![8, 3], table.clone())],
     );
     let store = CpuWeights::new();
-    let loader = WeightLoader::new(&checkpoint, &store, None, None);
+    let loader = WeightLoader::new(&checkpoint, &store, None);
     let config = EmbeddingConfig {
         vocabulary: 8,
         hidden: 3,
@@ -713,7 +714,7 @@ fn a_sharded_embedding_states_its_shard_in_its_kernel() {
         DType::BF16,
         &[("embed_tokens.weight", vec![32, 8], sequence(32 * 8, 21))],
     );
-    let loader = WeightLoader::meta(&checkpoint, None, None);
+    let loader = WeightLoader::meta(&checkpoint, None);
     let shard = Embedding::load(
         &EmbeddingConfig {
             vocabulary: 32,
@@ -753,7 +754,7 @@ fn a_head_projects_onto_the_vocabulary_and_widens_the_logits() {
     let directory = tempfile::tempdir().unwrap();
     let checkpoint = head_checkpoint(directory.path(), 16);
     let store = CpuWeights::new();
-    let loader = WeightLoader::new(&checkpoint, &store, None, None);
+    let loader = WeightLoader::new(&checkpoint, &store, None);
     let head = LmHead::load(
         &LmHeadConfig {
             vocabulary: 16,
@@ -784,7 +785,7 @@ fn a_head_projects_onto_the_vocabulary_and_widens_the_logits() {
 fn a_split_head_gathers_the_shards_of_its_group() {
     let directory = tempfile::tempdir().unwrap();
     let checkpoint = head_checkpoint(directory.path(), 32);
-    let loader = WeightLoader::meta(&checkpoint, None, None);
+    let loader = WeightLoader::meta(&checkpoint, None);
 
     // Rank 1 holds rows 16..32, a whole number of the head's eight-row tiles.
     let head = LmHead::load(
@@ -824,7 +825,7 @@ fn a_split_head_gathers_the_shards_of_its_group() {
 fn a_whole_head_gathers_nothing_in_a_group_that_splits_something_else() {
     let directory = tempfile::tempdir().unwrap();
     let checkpoint = head_checkpoint(directory.path(), 32);
-    let loader = WeightLoader::meta(&checkpoint, None, None);
+    let loader = WeightLoader::meta(&checkpoint, None);
     let head = LmHead::load(
         &LmHeadConfig {
             vocabulary: 32,
@@ -853,7 +854,7 @@ fn a_whole_head_gathers_nothing_in_a_group_that_splits_something_else() {
 fn a_shard_of_a_partial_tile_is_refused_at_load() {
     let directory = tempfile::tempdir().unwrap();
     let checkpoint = head_checkpoint(directory.path(), 30);
-    let loader = WeightLoader::meta(&checkpoint, None, None);
+    let loader = WeightLoader::meta(&checkpoint, None);
 
     let refused = LmHead::load(
         &LmHeadConfig {
@@ -877,7 +878,7 @@ fn a_tied_head_projects_with_the_embedding_s_table() {
         &[("embed_tokens.weight", vec![8, 4], table.clone())],
     );
     let store = CpuWeights::new();
-    let loader = WeightLoader::new(&checkpoint, &store, None, None);
+    let loader = WeightLoader::new(&checkpoint, &store, None);
     let embedding = Embedding::load(
         &EmbeddingConfig {
             vocabulary: 8,
@@ -912,7 +913,7 @@ fn the_normalizations_load_their_vectors_and_normalize() {
         ],
     );
     let store = CpuWeights::new();
-    let loader = WeightLoader::new(&checkpoint, &store, None, None);
+    let loader = WeightLoader::new(&checkpoint, &store, None);
     let x = tensor(&sequence(2 * 6, 28), (2, 6), DType::F32);
     let weight_tensor = tensor(&weight, 6, DType::F32);
 
@@ -990,7 +991,7 @@ fn a_narrowing_normalization_states_the_narrowing_kernel_and_takes_no_residual()
         directory.path(),
         &[("norm.weight", vec![8], sequence(8, 30))],
     );
-    let loader = WeightLoader::meta(&checkpoint, None, None);
+    let loader = WeightLoader::meta(&checkpoint, None);
     let norm = RmsNorm::load(
         &RmsNormConfig {
             width: 8,
@@ -1068,7 +1069,7 @@ fn a_gated_mlp_projects_gates_and_projects_back() {
         ],
     );
     let store = CpuWeights::new();
-    let loader = WeightLoader::new(&checkpoint, &store, None, None);
+    let loader = WeightLoader::new(&checkpoint, &store, None);
 
     let x = sequence(3 * HIDDEN, 34);
     let gated: Vec<f32> = project(&x, &gate, None, HIDDEN)
@@ -1138,7 +1139,7 @@ fn a_gated_mlp_states_the_gate_its_rounding_names() {
             ),
         ],
     );
-    let loader = WeightLoader::meta(&checkpoint, None, None);
+    let loader = WeightLoader::meta(&checkpoint, None);
     let launched = |rounding, gate_up, module: &str, rows: usize| {
         let mlp = Mlp::load(&mlp_config(rounding, gate_up), loader.root().pp(module)).unwrap();
         let (output, launches) = recorded(|| {

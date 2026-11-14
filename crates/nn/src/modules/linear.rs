@@ -6,9 +6,12 @@
 //! [`Linear::load`] reads one module's `weight` (and `bias`) through its builder and chooses the
 //! representation from the checkpoint's quantization declaration: a dense weight is one `gemm`;
 //! a calibrated NVFP4 weight is an activation encoder and a packed product whose `alpha` is the
-//! weight's tensor scale times the activation's; a per-tensor FP8 weight is one `fp8_gemm`,
-//! which encodes the activation by its static scale as it loads it; a weight-only NVFP4 weight
-//! is the dense matrix its fields state, decoded at load. The caller names the module, its
+//! weight's tensor scale times the activation's; a per-tensor FP8 weight is an activation
+//! encoder at its static scale and an `fp8_gemm` over the codes; a weight-only NVFP4 weight
+//! is the dense matrix its fields state, decoded at load. A dense weight the declaration
+//! converts ([`Scheme::DynamicFp8`], [`Scheme::DynamicNvfp4`]) is encoded at load into the
+//! same FP8 or NVFP4 product, and its activation's factors are measured on every call
+//! ([`functional::dynamic_scales`]) instead of published. The caller names the module, its
 //! widths and its split, and never the representation. An adapter attached to the checkpoint is
 //! fused into the bytes the weight is read from ([`crate::adapter`]), so a projection it edits
 //! is loaded fused.
@@ -33,7 +36,8 @@
 //! split is wider than they are); [`Linear::load_merged`] reads several checkpoint matrices as
 //! one product.
 
-use ops::fp4::{BLOCK_ELEMENTS, ScaleLayout};
+use ops::dynamic_scale::{FP8_RANGE, NVFP4_RANGE};
+use ops::fp4::{BLOCK_ELEMENTS, PRODUCT_TILE, ScaleLayout};
 use tensor::{DType, Module, Shape, Tensor};
 
 use crate::collective::{self, Split};
@@ -83,33 +87,49 @@ pub struct LinearConfig {
 enum Weight {
     /// The checkpoint's own matrix, in `order`.
     Dense { weight: Tensor, order: WeightOrder },
-    /// A calibrated NVFP4 matrix and the tensors its encoder and product read.
+    /// An NVFP4 matrix and how its activation is scaled.
     Nvfp4 {
         /// `[n, k/2]` U8: two E2M1 codes a byte along the contraction.
         values: Tensor,
-        /// The block scales in [`PRODUCT_SCALE_LAYOUT`], in the checkpoint's one-byte scale
-        /// type.
+        /// The block scales in [`PRODUCT_SCALE_LAYOUT`], in a one-byte scale type.
         scales: Tensor,
-        /// `[1]` F32: the encoder's global scale, the reciprocal of the activation's tensor
-        /// scale.
-        input_scale: Tensor,
-        /// `[1]` F32: the product's alpha, the weight's tensor scale times the activation's.
-        alpha: Tensor,
+        scaling: Scaling,
     },
-    /// A per-tensor FP8 matrix, `[n, k]` E4M3, and its two static scales: the activation is
-    /// divided by `input_scale` before it is encoded, and the accumulator is multiplied by
-    /// `alpha`.
-    Fp8 {
-        weight: Tensor,
-        input_scale: f32,
-        alpha: f32,
-    },
+    /// A per-tensor FP8 matrix, `[n, k]` E4M3, and how its activation is scaled.
+    Fp8 { weight: Tensor, scaling: Scaling },
+}
+
+/// Where an encoded projection's two factors come from: the encoder's multiplier of the
+/// activation (the reciprocal of its scale) and the product's dequantization factor (the
+/// activation's scale times the weight's).
+enum Scaling {
+    /// A calibrated export's static activation scale: both factors `[1]` F32 constants
+    /// published at load.
+    Calibrated { encode: Tensor, alpha: Tensor },
+    /// A weight converted at load: both factors measured from each call's activation against
+    /// the weight's largest magnitude, a `[1]` F32 weight, in the format's range.
+    Measured { weight_amax: Tensor, range: f32 },
+}
+
+impl Scaling {
+    /// The `(encode, alpha)` the product over `x` reads.
+    fn factors(&self, x: &Tensor) -> Result<(Tensor, Tensor)> {
+        match self {
+            Self::Calibrated { encode, alpha } => Ok((encode.clone(), alpha.clone())),
+            Self::Measured { weight_amax, range } => {
+                functional::dynamic_scales(x, weight_amax, *range)
+            }
+        }
+    }
 }
 
 /// A linear projection in the representation its checkpoint stores.
 pub struct Linear {
     weight: Weight,
     bias: Option<Tensor>,
+    /// The element type of the rows the projection reads and writes, when its weight states it:
+    /// a dense weight's own, or a converted weight's as its dense load would hold it.
+    activation: Option<DType>,
     k: u32,
     n: u32,
     /// Ranks this projection's partial sums are reduced over: above one for a row-parallel
@@ -214,22 +234,43 @@ impl Linear {
                     ));
                 }
 
-                // One positive float each, the same for every rank's block.
+                // One positive float each, the same for every rank's block, published as the two
+                // factors the product reads from device memory.
                 let weight_scale = vb.tensor_scale("weight_scale")?;
                 let input_scale = vb.tensor_scale("input_scale")?;
+                let factor = |name: &str, value: f32| {
+                    vb.loader().constant(
+                        &vb.name(name),
+                        DType::F32,
+                        &Shape::from(1),
+                        &value.to_le_bytes(),
+                        PRODUCER,
+                    )
+                };
+                let scaling = Scaling::Calibrated {
+                    encode: factor("encode", 1.0 / input_scale)?,
+                    alpha: factor("alpha", input_scale * weight_scale)?,
+                };
                 let bias = load_bias(&vb, config.bias, local_out, parallel)?;
 
-                Self::build(
-                    Weight::Fp8 {
-                        weight,
-                        input_scale,
-                        alpha: input_scale * weight_scale,
-                    },
+                let mut linear = Self::build(
+                    Weight::Fp8 { weight, scaling },
                     bias,
                     local_in,
                     local_out,
                     reduce,
-                )
+                )?;
+                linear.activation = vb.dtype();
+                Ok(linear)
+            }
+
+            scheme @ (Scheme::DynamicFp8 | Scheme::DynamicNvfp4) => {
+                let source = weight_source(&name, inputs, local_out, local_in, parallel);
+                let mut linear = Self::load_converted(&vb, scheme, &source, local_in, local_out)?;
+
+                linear.bias = load_bias(&vb, config.bias, local_out, parallel)?;
+                linear.reduce = reduce;
+                Ok(linear)
             }
 
             Scheme::Nvfp4 => {
@@ -238,6 +279,7 @@ impl Linear {
                 // The bias is `local_out` elements by its read: the packed weight's rows.
                 linear.bias = load_bias(&vb, config.bias, local_out, parallel)?;
                 linear.reduce = reduce;
+                linear.activation = vb.dtype();
                 Ok(linear)
             }
         }
@@ -397,6 +439,64 @@ impl Linear {
         Self::nvfp4(&weight, alpha)
     }
 
+    /// This rank's share of the dense matrix `source` names, `[local_out, local_in]`, converted
+    /// at load into `scheme`'s product ([`crate::quantization::dynamic`]), its activation's
+    /// factors measured on every call.
+    ///
+    /// The rows it reads and writes have the type the dense load would hold the weight in: the
+    /// builder's pin, or the checkpoint's own.
+    fn load_converted(
+        vb: &VarBuilder<'_, '_>,
+        scheme: Scheme,
+        source: &WeightSource,
+        local_in: u64,
+        local_out: u64,
+    ) -> Result<Self> {
+        let name = vb.name("weight");
+        let shape = extents(&[local_out, local_in]);
+        let activation = match vb.dtype() {
+            Some(pinned) => pinned,
+            None => vb.loader().checkpoint().locate(&name)?.dtype,
+        };
+
+        let weight = if scheme == Scheme::DynamicNvfp4 {
+            // The packed product compiles whole tiles of output channels and of the contraction.
+            let tile = u64::from(PRODUCT_TILE);
+            if !local_out.is_multiple_of(tile) || !local_in.is_multiple_of(tile) {
+                return Err(Error::weight(
+                    &name,
+                    format!(
+                        "an NVFP4 share of {local_out} output channels over {local_in} elements is \
+                         not whole tiles of {tile}, which the packed product computes in"
+                    ),
+                ));
+            }
+
+            let (values, scales, weight_amax) = vb.loader().dynamic_nvfp4(source, &shape)?;
+            Weight::Nvfp4 {
+                values,
+                scales,
+                scaling: Scaling::Measured {
+                    weight_amax,
+                    range: NVFP4_RANGE,
+                },
+            }
+        } else {
+            let (weight, weight_amax) = vb.loader().dynamic_fp8(source, &shape)?;
+            Weight::Fp8 {
+                weight,
+                scaling: Scaling::Measured {
+                    weight_amax,
+                    range: FP8_RANGE,
+                },
+            }
+        };
+
+        let mut linear = Self::build(weight, None, local_in, local_out, 1)?;
+        linear.activation = Some(activation);
+        Ok(linear)
+    }
+
     /// A projection over a calibrated NVFP4 matrix and its product's `alpha`.
     ///
     /// `weight.packed` is `[n, k/2]` bytes and `weight.scales` its block scales in the product's
@@ -469,8 +569,10 @@ impl Linear {
             Weight::Nvfp4 {
                 values: weight.packed.clone(),
                 scales: weight.scales.clone(),
-                input_scale,
-                alpha,
+                scaling: Scaling::Calibrated {
+                    encode: input_scale,
+                    alpha,
+                },
             },
             None,
             k,
@@ -493,9 +595,15 @@ impl Linear {
             ));
         }
 
+        let activation = match &weight {
+            Weight::Dense { weight, .. } => Some(weight.dtype()),
+            Weight::Nvfp4 { .. } | Weight::Fp8 { .. } => None,
+        };
+
         Ok(Self {
             weight,
             bias,
+            activation,
             k: u32::try_from(k)
                 .map_err(|_| Error::shape("Linear", format!("a contraction of {k} elements")))?,
             n: u32::try_from(n)
@@ -522,10 +630,18 @@ impl Linear {
         }
     }
 
-    /// Whether the weight is a calibrated NVFP4 matrix, whose product is compiled per row class
+    /// Whether the weight is an NVFP4 matrix, whose product is compiled per row class
     /// ([`ops::fp4::packed_rows`]).
     pub const fn is_packed(&self) -> bool {
         matches!(self.weight, Weight::Nvfp4 { .. })
+    }
+
+    /// The element type of the rows the projection reads and writes, when its weight states it:
+    /// a dense weight's own type, or an encoded weight's builder pin or, for a weight converted
+    /// at load, the checkpoint's type its dense load would hold. `None` for a calibrated
+    /// encoded weight under a builder that pins no type, whose rows take the caller's.
+    pub const fn dtype(&self) -> Option<DType> {
+        self.activation
     }
 
     /// `x · weightᵀ + bias`, `[..., n]` in `x`'s element type, reduced over the forward's group
@@ -542,14 +658,15 @@ impl Linear {
             Weight::Nvfp4 {
                 values,
                 scales,
-                input_scale,
-                alpha,
-            } => functional::linear_nvfp4(x, values, scales, bias, input_scale, alpha)?,
-            Weight::Fp8 {
-                weight,
-                input_scale,
-                alpha,
-            } => functional::linear_fp8(x, weight, bias, *input_scale, *alpha)?,
+                scaling,
+            } => {
+                let (encode, alpha) = scaling.factors(x)?;
+                functional::linear_nvfp4(x, values, scales, bias, &encode, &alpha)?
+            }
+            Weight::Fp8 { weight, scaling } => {
+                let (encode, alpha) = scaling.factors(x)?;
+                functional::linear_fp8(x, weight, bias, &encode, &alpha)?
+            }
         };
 
         if self.reduce > 1 {

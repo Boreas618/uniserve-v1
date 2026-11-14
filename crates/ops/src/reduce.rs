@@ -3,6 +3,7 @@
 //! ```text
 //! sum      out[k] = Σ x[k, r]                over every index r of the reduced axes
 //! min      out[k] = min x[k, r]              max likewise
+//! absmax   out[k] = max |x[k, r]|            the largest magnitude, of a floating input
 //! argmin   out[k] = the first r at which x[k, r] is least, as u32; argmax likewise
 //! ```
 //!
@@ -27,12 +28,14 @@
 //! # Arithmetic
 //!
 //! A floating sum accumulates in FP32 (FP64 for an FP64 element) and rounds once into the element
-//! type; an integer sum wraps. A minimum or a maximum is one of the input's own values. The first
-//! of equal values wins an `argmin` or an `argmax`. A NaN's place in an order is unspecified: a
+//! type; an integer sum wraps. A minimum or a maximum is one of the input's own values, and a
+//! largest magnitude the magnitude of one. The first of equal values wins an `argmin` or an
+//! `argmax`. A NaN's place in an order is unspecified: a
 //! comparison with it is false whichever way a program makes it.
 //!
 //! A sum over an axis of no element is zero, and its output is launched like any other. A
-//! minimum, a maximum or an index over no element does not exist and is refused.
+//! minimum, a maximum, a largest magnitude or an index over no element does not exist and is
+//! refused.
 
 use std::fmt;
 
@@ -53,13 +56,22 @@ pub enum Function {
     Sum,
     Min,
     Max,
+    /// The largest magnitude: what a per-tensor quantization scale is measured from.
+    AbsMax,
     ArgMin,
     ArgMax,
 }
 
 impl Function {
     /// Every function, in the order the package declares them.
-    pub const ALL: [Self; 5] = [Self::Sum, Self::Min, Self::Max, Self::ArgMin, Self::ArgMax];
+    pub const ALL: [Self; 6] = [
+        Self::Sum,
+        Self::Min,
+        Self::Max,
+        Self::AbsMax,
+        Self::ArgMin,
+        Self::ArgMax,
+    ];
 
     /// Whether the function returns an index along its one axis rather than a value.
     pub const fn indexes(self) -> bool {
@@ -78,6 +90,7 @@ impl fmt::Display for Function {
             Self::Sum => "sum",
             Self::Min => "min",
             Self::Max => "max",
+            Self::AbsMax => "absmax",
             Self::ArgMin => "argmin",
             Self::ArgMax => "argmax",
         })
@@ -207,6 +220,15 @@ impl Op for Reduce {
                 ));
             }
         }
+        if descriptor.function == Function::AbsMax && !descriptor.dtype.is_float() {
+            return Err(Error::argument(
+                Self::NAME,
+                format!(
+                    "a largest magnitude is taken of floating elements, not of {}",
+                    abi::name(descriptor.dtype)
+                ),
+            ));
+        }
         if descriptor.function.indexes() && args.axes.len() != 1 {
             return Err(Error::argument(
                 Self::NAME,
@@ -318,7 +340,8 @@ impl Op for Reduce {
             );
         }
         // An integer sum wraps the same way in any order; a minimum or a maximum is one of the
-        // input's values, and an index that differs names another element.
+        // input's values and a largest magnitude the magnitude of one, and an index that differs
+        // names another element.
         Tolerance::exact()
     }
 }

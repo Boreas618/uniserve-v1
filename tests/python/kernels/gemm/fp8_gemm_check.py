@@ -1,12 +1,14 @@
 #!/usr/bin/env python3
-"""Run the fp8_gemm program on a GPU and check every output against FP64.
+"""Run the fp8_quantize and fp8_gemm programs on a GPU and check every output against torch and FP64.
 
     python fp8_gemm_check.py                 # bf16 activations, the model's projections
 
-The operator is ModelOpt's per-tensor FP8 product: the activation is encoded to E4M3 by its static
-scale (`x / s_x`, clamped to ±448, rounded to nearest even), multiplied by the E4M3 weight with an
-FP32 accumulator, and dequantized by `alpha = s_x · s_w`. The reference encodes the activation the
-same way in torch, so both sides multiply the same codes; it then sums their products in FP64.
+The operators are the per-tensor FP8 product: `fp8_quantize` encodes the activation to E4M3 by
+its scale (`x / s_x`, clamped to ±448, rounded to nearest even), and `fp8_gemm` multiplies the
+codes by the E4M3 weight with an FP32 accumulator and dequantizes by `alpha = s_x · s_w`. The
+programs read `1 / s_x` and `alpha` from FP32 device words, as a calibrated export's constants or
+a measured scale reach them. The codes are compared with torch's encoding of the same activation
+byte for byte; the product with the FP64 sum of the codes' products.
 
 The bound follows from that arithmetic: the codes are equal, so the two differ by the FP32
 accumulation of `k` products of exact values — at most `γ_k = k·u_f32/(1 − k·u_f32)` of the sum of
@@ -22,11 +24,12 @@ import sys
 KERNELS = (
     pathlib.Path(__file__).resolve().parents[4] / "crates" / "ops" / "kernels"
 )
-#: The package this check covers.
-PACKAGE = KERNELS / "fp8_gemm" / "triton"
-sys.path.insert(0, str(PACKAGE / "src"))
+#: The packages this check covers.
+sys.path.insert(0, str(KERNELS / "fp8_gemm" / "triton" / "src"))
+sys.path.insert(0, str(KERNELS / "fp8_quantize" / "triton" / "src"))
 
 import fp8_gemm as kernels  # noqa: E402
+import fp8_quantize as encoder  # noqa: E402
 import torch  # noqa: E402
 
 UNIT_ROUNDOFF = {torch.bfloat16: 2.0**-8, torch.float16: 2.0**-11}
@@ -54,19 +57,28 @@ def check(
     alpha = input_scale * weight_scale
     b = (torch.randn(n) * 0.1).to(dtype).cuda() if bias else None
     out = torch.empty(m, n, dtype=dtype, device="cuda")
+    # The two factors are device words of FP32, as the operator passes them.
+    encode = torch.tensor(
+        [1.0 / input_scale], dtype=torch.float32, device="cuda"
+    )
+    factor = torch.tensor([alpha], dtype=torch.float32, device="cuda")
+    # The encode: one row a grid row, blocks of 1024 elements across.
+    codes = torch.empty(m, k, dtype=torch.float8_e4m3fn, device="cuda")
+    encoder._fp8_quantize_kernel[(m, (k + 1023) // 1024)](
+        x, codes, k, x.stride(0), encode, BLOCK=1024, num_warps=4
+    )
     block_m, block_n, block_k = blocks
     grid = ((m + block_m - 1) // block_m, (n + block_n - 1) // block_n)
     kernels._fp8_gemm_kernel[grid](
-        x,
+        codes,
         weight,
         b if bias else out,
         out,
         m,
         n,
         k,
-        x.stride(0),
-        1.0 / input_scale,
-        alpha,
+        codes.stride(0),
+        factor,
         BLOCK_M=block_m,
         BLOCK_N=block_n,
         BLOCK_K=block_k,
@@ -75,14 +87,16 @@ def check(
         num_stages=3,
     )
     torch.cuda.synchronize()
-    inverse = torch.tensor(1.0 / input_scale, dtype=torch.float32)
-    codes = (
-        (x.float().cpu() * inverse)
-        .clamp(-448.0, 448.0)
-        .to(torch.float8_e4m3fn)
-        .double()
+    inverse = encode.cpu()[0]
+    wanted = (
+        (x.float().cpu() * inverse).clamp(-448.0, 448.0).to(torch.float8_e4m3fn)
     )
+    differing = int(
+        (codes.cpu().view(torch.uint8) != wanted.view(torch.uint8)).sum()
+    )
+    codes = wanted.double()
     products = codes @ weight.cpu().double().T
+    alpha = float(factor.cpu()[0])
     expected = products * alpha
     magnitudes = (codes.abs() @ weight.cpu().double().abs().T) * alpha
     if bias:
@@ -91,12 +105,12 @@ def check(
     gamma = k * F32_ROUNDOFF / (1 - k * F32_ROUNDOFF)
     bound = gamma * magnitudes + UNIT_ROUNDOFF[dtype] * expected.abs() + 1e-30
     error = (out.cpu().double() - expected).abs()
-    outside = int((error > bound).sum())
+    outside = int((error > bound).sum()) + differing
     relative = float((error / (magnitudes + 1e-30)).max())
     print(
         f"{'ok' if outside == 0 else 'FAIL'}: {label}, {m} x {n} x {k} in {blocks}"
         f"{' with a bias' if bias else ''} — max abs {float(error.max()):.3e}, max error over "
-        f"the products' magnitude {relative:.3e}, {outside} outside"
+        f"the products' magnitude {relative:.3e}, {differing} codes differ, {outside} outside"
     )
     return outside
 
@@ -114,7 +128,7 @@ def main():
         ("q_proj", 64, 8192, 2048),
         ("k_proj", 5, 512, 2048),
     ]:
-        outside += check(label, m, n, k, (64, 128, 128), False, m + n)
+        outside += check(label, m, n, k, (128, 128, 128), False, m + n)
     outside += check(
         "a masked tail and a bias", 19, 100, 96, (16, 32, 32), True, 7
     )

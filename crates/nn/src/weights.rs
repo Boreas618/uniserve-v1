@@ -107,40 +107,6 @@ impl fmt::Display for WeightLayout {
     }
 }
 
-/// An explicitly requested quantization method.
-///
-/// The names are SGLang's `quantization` values: an explicit value converts the checkpoint's
-/// weights once, at load; with none, the checkpoint's own representation is kept.
-#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
-pub enum Quantization {
-    /// FP8 E4M3 with per-tensor scales.
-    Fp8,
-    /// FP8 E4M3 with block scales.
-    Mxfp8,
-    /// NVFP4 E2M1 with block scales.
-    NvFp4,
-}
-
-impl Quantization {
-    /// The element type this policy's encoded weights are stored in.
-    pub const fn encoding(self) -> DType {
-        match self {
-            Self::Fp8 | Self::Mxfp8 => DType::F8E4M3,
-            Self::NvFp4 => DType::U8,
-        }
-    }
-}
-
-impl fmt::Display for Quantization {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str(match self {
-            Self::Fp8 => "fp8",
-            Self::Mxfp8 => "mxfp8",
-            Self::NvFp4 => "nvfp4",
-        })
-    }
-}
-
 /// Where a weight's bytes come from: one region of one checkpoint tensor, or whole tensors fused
 /// in order along their first axis.
 ///
@@ -478,7 +444,7 @@ enum Retention<'a> {
 /// A load computes its spans from the shard headers alone, so every bound a device load checks
 /// is checked by a meta load too, without a payload byte read; a device load then copies the
 /// spans in order.
-type Span<'c> = (&'c TensorLocation, std::ops::Range<usize>);
+pub(crate) type Span<'c> = (&'c TensorLocation, std::ops::Range<usize>);
 
 /// How many bytes the shard's header states `location` holds.
 ///
@@ -530,8 +496,9 @@ pub struct WeightLoader<'a> {
     checkpoint: &'a Checkpoint,
     /// Where the weights go: retained storage, or meta tensors.
     retention: Retention<'a>,
+    /// The element type every weight is read as unless the model pins another: the launch's
+    /// explicit choice, or `None` for the checkpoint's own.
     dtype: Option<DType>,
-    quantization: Option<Quantization>,
     /// What the checkpoint declares about its packed weights, resolved against its shards; dense
     /// until a model [`declares`](WeightLoader::declare) one.
     declaration: Declaration,
@@ -540,19 +507,18 @@ pub struct WeightLoader<'a> {
 impl<'a> WeightLoader<'a> {
     /// A loader over `checkpoint` publishing to `store`.
     ///
-    /// `dtype` and `quantization` are the launch's explicit precision choices; with neither, a
-    /// weight keeps the checkpoint's representation.
+    /// `dtype` is the launch's explicit element type; with none, a weight keeps the checkpoint's
+    /// representation. What a projection is converted to is its stage's declaration's
+    /// ([`Self::declare`], [`Declaration::converted`]).
     pub fn new(
         checkpoint: &'a Checkpoint,
         store: &'a dyn RetainedWeights,
         dtype: Option<DType>,
-        quantization: Option<Quantization>,
     ) -> Self {
         Self {
             checkpoint,
             retention: Retention::Store(store),
             dtype,
-            quantization,
             declaration: Declaration::dense(),
         }
     }
@@ -560,8 +526,7 @@ impl<'a> WeightLoader<'a> {
     /// A loader over `checkpoint` that reads no tensor payload and publishes nothing.
     ///
     /// Each weight's element type and extents come from the shard headers [`Checkpoint::open`]
-    /// already parsed, and `dtype` and `quantization` are the same precision choices
-    /// [`WeightLoader::new`] takes. Every method returns what the device load of the same
+    /// already parsed, and `dtype` is the same element type [`WeightLoader::new`] takes. Every method returns what the device load of the same
     /// arguments returns (the same element type, the same extents, the same representation, the
     /// block-scale type the checkpoint stores, the published layout) and the same refusals,
     /// because it runs the device load's own code up to the point where bytes would be read. The
@@ -573,16 +538,11 @@ impl<'a> WeightLoader<'a> {
     /// constant derived from a placeholder are not the device's. The caller is a model's load
     /// for a profile run, which launches nothing and reads no weight: the shapes and element
     /// types decide the kernels a model launches, and the values never enter a kernel key.
-    pub fn meta(
-        checkpoint: &'a Checkpoint,
-        dtype: Option<DType>,
-        quantization: Option<Quantization>,
-    ) -> Self {
+    pub fn meta(checkpoint: &'a Checkpoint, dtype: Option<DType>) -> Self {
         Self {
             checkpoint,
             retention: Retention::Meta(Rc::default()),
             dtype,
-            quantization,
             declaration: Declaration::dense(),
         }
     }
@@ -936,13 +896,6 @@ impl<'a> WeightLoader<'a> {
         pinned: Option<DType>,
         nonzero: bool,
     ) -> Result<Tensor> {
-        if let Some(quantization) = self.quantization {
-            return Err(Error::Unsupported(format!(
-                "quantization `{quantization}` is converted at load only for the FP8 and NVFP4 \
-                 step; the BF16 slice keeps each checkpoint's own representation"
-            )));
-        }
-
         let names = source_names(source);
         let (start, source_shape, stride) = source_region(source);
         if let WeightSource::Parts { shape: fused, .. } | WeightSource::Blocks { shape: fused, .. } =
@@ -1139,8 +1092,8 @@ impl<'a> WeightLoader<'a> {
         })
     }
 
-    /// This loader over another checkpoint: the same store, the same element-type and
-    /// quantization policy, a different shard set.
+    /// This loader over another checkpoint: the same store, the same element type, a different
+    /// shard set.
     ///
     /// A pipeline root holds one stage per subdirectory (`transformer/`, `vae/`,
     /// `text_encoder/`, …), each with its own index and its own file identities, so a model
@@ -1148,14 +1101,15 @@ impl<'a> WeightLoader<'a> {
     /// once for one stage is reused for another and never converted twice. A meta loader's
     /// reborrow is a meta loader over the same meta tensors.
     ///
-    /// The policy is the loader's, not the stage's, so a stage that its policy does not describe
-    /// is refused here: an FP8-policy loader over a BF16 stage, or a float policy over a stage
-    /// whose weights are an FP8 or NVFP4 encoding, would read weights as something they are not.
-    /// A model that needs two policies builds two loaders over the same store.
+    /// The element type is the loader's, not the stage's, so a stage it does not describe is
+    /// refused here: a stage whose weights are an FP8 or NVFP4 encoding is read by its
+    /// declaration ([`Self::declare`]), and an element type stated over it would read weights as
+    /// something they are not. A model that needs two element types builds two loaders over the
+    /// same store.
     ///
     /// # Errors
     ///
-    /// [`Error::Policy`] when the policy does not describe `checkpoint`.
+    /// [`Error::Policy`] when the element type does not describe `checkpoint`.
     pub fn reborrow<'b>(&'b self, checkpoint: &'b Checkpoint) -> Result<WeightLoader<'b>> {
         self.check_policy(checkpoint)?;
 
@@ -1167,38 +1121,21 @@ impl<'a> WeightLoader<'a> {
             checkpoint,
             retention,
             dtype: self.dtype,
-            quantization: self.quantization,
             declaration: self.declaration.clone(),
         })
     }
 
-    /// Whether this loader's policy describes `checkpoint`'s weights.
+    /// Whether this loader's element type describes `checkpoint`'s weights.
     fn check_policy(&self, checkpoint: &Checkpoint) -> Result<()> {
         let held = checkpoint.dtypes();
-        let listed = held
-            .iter()
-            .map(|dtype| ops::abi::name(*dtype))
-            .collect::<Vec<_>>()
-            .join(", ");
-
-        if let Some(quantization) = self.quantization {
-            let encoding = quantization.encoding();
-            if !held.contains(&encoding) {
-                return Err(Error::policy(format!(
-                    "a {quantization} policy encodes weights as {}, and this checkpoint holds \
-                     {listed}",
-                    ops::abi::name(encoding)
-                )));
-            }
-        }
 
         if let Some(dtype) = self.dtype {
             for encoded in [DType::F8E4M3, DType::F4] {
                 if held.contains(&encoded) {
                     return Err(Error::policy(format!(
                         "this checkpoint holds {} encoded weights, which a {} element type does \
-                         not describe; the quantization is the loader's policy, not its element \
-                         type",
+                         not describe; encoded weights are read by the stage's declaration, not \
+                         by an element type",
                         ops::abi::name(encoded),
                         ops::abi::name(dtype)
                     )));
@@ -1437,7 +1374,7 @@ impl<'a> WeightLoader<'a> {
     ///
     /// Every bound is checked against the length the header states for each tensor, which is the
     /// length of the payload slice a device load copies from.
-    fn spans(&self, source: &WeightSource, key: &WeightKey) -> Result<Vec<Span<'a>>> {
+    pub(crate) fn spans(&self, source: &WeightSource, key: &WeightKey) -> Result<Vec<Span<'a>>> {
         let checkpoint = self.checkpoint;
         spans_in(source, key, &|name| checkpoint.tensor(name))
     }
@@ -1446,7 +1383,7 @@ impl<'a> WeightLoader<'a> {
     ///
     /// Consecutive spans of one tensor are read in one [`Checkpoint::payload`] call, so a strided
     /// shard of an adapter-fused tensor, one span a row, reads the adapter's factors once.
-    fn gather(&self, spans: &[Span<'_>]) -> Result<Vec<u8>> {
+    pub(crate) fn gather(&self, spans: &[Span<'_>]) -> Result<Vec<u8>> {
         let total = spans.iter().map(|(_, range)| range.len()).sum();
         let mut gathered = Vec::with_capacity(total);
         let mut at = 0;
@@ -1538,7 +1475,7 @@ pub(crate) fn source_names(source: &WeightSource) -> Vec<String> {
 /// A block's start and stride key the region: two ranks' blocks of one expert stack have one
 /// fused shape and must not share retained storage, and two ranks' blocks of one stacked tensor
 /// begin at different rows.
-fn source_region(source: &WeightSource) -> (u64, Shape, Option<u64>) {
+pub(crate) fn source_region(source: &WeightSource) -> (u64, Shape, Option<u64>) {
     match source {
         WeightSource::Region { start, shape, .. } => (*start, shape.clone(), None),
         WeightSource::Strided {

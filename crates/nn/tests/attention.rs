@@ -954,7 +954,7 @@ fn an_attention_projects_turns_attends_and_projects_out() {
     let weights = attention_weights(false);
     let checkpoint = checkpoint(directory.path(), DType::F32, &weights);
     let store = CpuWeights::new();
-    let loader = WeightLoader::new(&checkpoint, &store, None, None);
+    let loader = WeightLoader::new(&checkpoint, &store, None);
 
     let attention = Attention::load(
         &attention_config(FUSED, false, false),
@@ -1031,7 +1031,7 @@ fn a_paged_forward_attends_what_it_wrote_into_the_cache() {
     let weights = attention_weights(false);
     let checkpoint = checkpoint(directory.path(), DType::F32, &weights);
     let store = CpuWeights::new();
-    let loader = WeightLoader::new(&checkpoint, &store, None, None);
+    let loader = WeightLoader::new(&checkpoint, &store, None);
 
     // Six tokens of one row, in pages 1 then 0.
     let tokens = 6;
@@ -1103,7 +1103,7 @@ fn a_gated_attention_scales_each_head_by_the_sigmoid_of_its_gate() {
     let weights = attention_weights(true);
     let checkpoint = checkpoint(directory.path(), DType::F32, &weights);
     let store = CpuWeights::new();
-    let loader = WeightLoader::new(&checkpoint, &store, None, None);
+    let loader = WeightLoader::new(&checkpoint, &store, None);
 
     let attention = Attention::load(
         &attention_config(QkNorm::None, true, true),
@@ -1157,7 +1157,7 @@ fn a_gated_attention_scales_each_head_by_the_sigmoid_of_its_gate() {
 fn each_qk_norm_form_launches_its_own_kernels() {
     let directory = tempfile::tempdir().unwrap();
     let checkpoint = checkpoint(directory.path(), DType::BF16, &attention_weights(false));
-    let loader = WeightLoader::meta(&checkpoint, None, None);
+    let loader = WeightLoader::meta(&checkpoint, None);
     let hidden = meta((6, HIDDEN), DType::BF16);
     let (cos, sin) = (
         meta((6, DIM / 2), DType::F32),
@@ -1212,7 +1212,7 @@ fn each_qk_norm_form_launches_its_own_kernels() {
     // A gated module packs its queries out of the projection and gates the attended heads.
     let gated_checkpoint = tempfile::tempdir().unwrap();
     let checkpoint = checkpoint_of_gated(gated_checkpoint.path());
-    let loader = WeightLoader::meta(&checkpoint, None, None);
+    let loader = WeightLoader::meta(&checkpoint, None);
     let attention = Attention::load(
         &attention_config(FUSED, true, true),
         loader.root().pp("attn"),
@@ -1247,7 +1247,7 @@ fn checkpoint_of_gated(directory: &Path) -> Checkpoint {
 fn a_paged_forward_writes_its_layers_planes_then_reads_them() {
     let directory = tempfile::tempdir().unwrap();
     let checkpoint = checkpoint(directory.path(), DType::BF16, &attention_weights(false));
-    let loader = WeightLoader::meta(&checkpoint, None, None);
+    let loader = WeightLoader::meta(&checkpoint, None);
 
     let tokens = 4;
     let hidden = meta((tokens, HIDDEN), DType::BF16);
@@ -1315,7 +1315,7 @@ fn a_paged_forward_writes_its_layers_planes_then_reads_them() {
 fn a_sequence_split_member_attends_its_heads_of_every_row_and_returns_its_own_rows() {
     let directory = tempfile::tempdir().unwrap();
     let checkpoint = checkpoint(directory.path(), DType::BF16, &attention_weights(false));
-    let loader = WeightLoader::meta(&checkpoint, None, None);
+    let loader = WeightLoader::meta(&checkpoint, None);
 
     let (tokens, share) = (5, 3);
     let hidden = meta((share, HIDDEN), DType::BF16);

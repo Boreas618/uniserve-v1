@@ -193,7 +193,7 @@ fn zeros(shape: Shape, dtype: DType) -> Tensor {
 fn model(name: &str, drafter: bool) -> (Arc<dyn TextModel>, Config) {
     let checkpoint = support::checkpoint(&data(name).join("model"));
     let store = CpuWeights::new();
-    let mut loader = WeightLoader::new(&checkpoint, &store, None, None);
+    let mut loader = WeightLoader::new(&checkpoint, &store, None);
 
     (
         support::load(&checkpoint, &mut loader, &support::whole(drafter)),
@@ -648,7 +648,7 @@ fn the_vl_encoder_computes_the_references_states() {
     let images = config.images.expect("the processor files");
 
     let store = CpuWeights::new();
-    let loader = WeightLoader::new(&checkpoint, &store, None, None);
+    let loader = WeightLoader::new(&checkpoint, &store, None);
     let load = |layers, final_norm| {
         Qwen3VlModel::load(
             &config,

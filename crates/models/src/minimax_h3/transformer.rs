@@ -65,9 +65,12 @@ const ROTARY_AXES: u32 = 3;
 const BLOCK_VECTORS: usize = 6;
 const TAGS: usize = 3;
 
-/// The input projections of a block's attention, in the order the attention reads them; the
-/// compression gate is a sparse block's alone.
-const INPUTS: [&str; 4] = ["to_q", "to_k", "to_v", "to_gate_compress"];
+/// The attention of a block, relative to the block: its module, the input projections in the
+/// order the attention reads them (the compression gate is a sparse block's alone), and the
+/// output projection.
+pub(crate) const ATTENTION: &str = "attn";
+pub(crate) const INPUTS: [&str; 4] = ["to_q", "to_k", "to_v", "to_gate_compress"];
+pub(crate) const ATTENTION_OUTPUT: &str = "to_out.0";
 
 /// The index of the compression gate among [`INPUTS`].
 const GATE: usize = 3;
@@ -166,7 +169,7 @@ impl Attention {
                 heads: transformer.num_attention_heads,
                 head_dim: transformer.head_dim,
                 inputs,
-                output: "to_out.0",
+                output: ATTENTION_OUTPUT,
                 split: split.ulysses.split,
                 projection: split.ulysses.projection,
                 tensor: split.tensor,
@@ -398,7 +401,7 @@ impl Block {
                 },
                 vb.clone(),
             )?,
-            attention: Attention::load(config, split, max_rows, vb.pp("attn"))?,
+            attention: Attention::load(config, split, max_rows, vb.pp(ATTENTION))?,
             tensor: split.tensor,
             path: vb.path().to_owned(),
         })

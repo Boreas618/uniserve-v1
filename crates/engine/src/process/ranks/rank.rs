@@ -69,8 +69,8 @@ impl<'a> Weights<'a> {
         'a: 'c,
     {
         match self {
-            Self::Retained(store) => nn::WeightLoader::new(checkpoint, store, None, None),
-            Self::Meta => nn::WeightLoader::meta(checkpoint, None, None),
+            Self::Retained(store) => nn::WeightLoader::new(checkpoint, store, None),
+            Self::Meta => nn::WeightLoader::meta(checkpoint, None),
         }
     }
 }

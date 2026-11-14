@@ -121,7 +121,7 @@ fn audio_config() -> AudioVaeConfig {
 fn the_encoders_residual_block_computes_the_references() {
     let checkpoint = fixture("resnet_block");
     let store = CpuWeights::new();
-    let loader = WeightLoader::new(&checkpoint, &store, None, None);
+    let loader = WeightLoader::new(&checkpoint, &store, None);
 
     let block = ResnetBlock3d::load(
         &ResnetBlock3dConfig {
@@ -152,7 +152,7 @@ fn the_encoders_residual_block_computes_the_references() {
 fn the_video_encoder_computes_the_references_moments() {
     let checkpoint = fixture("video_encoder");
     let store = CpuWeights::new();
-    let loader = WeightLoader::new(&checkpoint, &store, None, None);
+    let loader = WeightLoader::new(&checkpoint, &store, None);
     let encoder = VideoEncoder::load(&video_config(), loader.root()).unwrap();
 
     // Five frames of 32 by 32 pixels: two latent frames of two by two cells.
@@ -175,7 +175,7 @@ fn the_video_encoder_computes_the_references_moments() {
 fn a_condition_is_the_posteriors_seeded_sample_normalized() {
     let checkpoint = fixture("video_encoder");
     let store = CpuWeights::new();
-    let loader = WeightLoader::new(&checkpoint, &store, None, None);
+    let loader = WeightLoader::new(&checkpoint, &store, None);
     let config = video_config();
     let encoder = VideoEncoder::load(&config, loader.root()).unwrap();
 
@@ -237,7 +237,7 @@ fn a_condition_is_the_posteriors_seeded_sample_normalized() {
 fn a_decoder_block_computes_the_references() {
     let checkpoint = fixture("transformer_block");
     let store = CpuWeights::new();
-    let loader = WeightLoader::new(&checkpoint, &store, None, None);
+    let loader = WeightLoader::new(&checkpoint, &store, None);
     let block = TransformerBlock::load(&video_config(), loader.root().pp("block")).unwrap();
 
     // Two sequences of seventeen tokens, each reading the same positions.
@@ -281,7 +281,7 @@ fn a_decoder_block_computes_the_references() {
 fn the_decoders_rotary_tables_are_the_references() {
     let checkpoint = fixture("transformer_block");
     let store = CpuWeights::new();
-    let loader = WeightLoader::new(&checkpoint, &store, None, None);
+    let loader = WeightLoader::new(&checkpoint, &store, None);
 
     let pos_embed = Rotary::load(
         &video_vae::rotary_config(&video_config()),
@@ -407,7 +407,7 @@ fn a_tiled_decode_is_each_tiles_own_decode_outside_the_seam() {
     );
     let checkpoint = Checkpoint::open(directory.path()).unwrap();
     let store = CpuWeights::new();
-    let loader = WeightLoader::new(&checkpoint, &store, None, None);
+    let loader = WeightLoader::new(&checkpoint, &store, None);
     let decoder = VideoDecoder::load(&config, loader.root()).unwrap();
 
     assert_eq!(decoder.element_type(), DType::F16);
@@ -560,7 +560,7 @@ fn track_layout(frames: u32) -> Layout {
 fn the_audio_decoder_computes_the_references_waveform() {
     let checkpoint = fixture("audio_decoder");
     let store = CpuWeights::new();
-    let loader = WeightLoader::new(&checkpoint, &store, None, None);
+    let loader = WeightLoader::new(&checkpoint, &store, None);
     let decoder = AudioDecoder::load(&audio_config(), loader.root()).unwrap();
     assert_eq!(decoder.sampling_rate(), 32000);
     assert_eq!(decoder.element_type(), DType::F32);
@@ -613,7 +613,7 @@ fn the_audio_decoder_computes_the_references_waveform() {
 fn the_audio_encoder_computes_the_references_latent_rows() {
     let checkpoint = fixture("audio_encoder");
     let store = CpuWeights::new();
-    let loader = WeightLoader::new(&checkpoint, &store, None, None);
+    let loader = WeightLoader::new(&checkpoint, &store, None);
     let encoder = AudioEncoder::load(&audio_config(), loader.root()).unwrap();
     assert_eq!(encoder.hop(), 4);
 

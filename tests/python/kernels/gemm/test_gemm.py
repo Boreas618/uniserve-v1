@@ -1,8 +1,10 @@
 """The GEMM and NVFP4 quantization packages against their references.
 
 The NVFP4 checks have a host half that needs no module and no device. The FP8
-product is a Triton program, launched from its source on a device. Every other
-GEMM is a native module, checked with a built one
+encode and product and the measured factors (``dynamic_scale``) are Triton
+programs, launched from their source on a device; the factors also on the
+interpreter.
+Every other GEMM is a native module, checked with a built one
 (``UNISERVE_KERNEL_MODULES``) on a device.
 """
 
@@ -46,6 +48,15 @@ def test_the_nvfp4_quantization_feeds_the_nvfp4_gemm():
         "--gemm",
         module("nvfp4_gemm", "cute_dsl"),
     )
+
+
+def test_the_measured_factors_state_their_formula_on_the_interpreter():
+    interpreted(FAMILY / "dynamic_scale_check.py", "--cpu-only")
+
+
+@pytest.mark.gpu
+def test_a_measured_fp8_projection_is_within_its_formats_bound():
+    on_device(FAMILY / "dynamic_scale_check.py")
 
 
 @pytest.mark.gpu

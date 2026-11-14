@@ -26,10 +26,10 @@ use nn::family::{
     VideoServing,
 };
 use nn::{
-    Checkpoint, ConditionRole, ConditionShape, Conditioning, DType, Split, VideoRequest,
+    Checkpoint, Clip, ConditionRole, ConditionShape, Conditioning, DType, Split, VideoRequest,
     WeightLoader,
 };
-use proto::config::{PrecisionMode, Quantization};
+use proto::config::{PrecisionMode, Quantization, WeightFormat};
 use support::{Recording, meta, recorded, report};
 
 /// The released base checkpoint: dense attention, the 50-point uniform grid, both networks.
@@ -87,7 +87,7 @@ fn load_under(
         dtype: DType::BF16,
         serving: serving(),
     };
-    let mut loader = WeightLoader::meta(&checkpoint, None, None);
+    let mut loader = WeightLoader::meta(&checkpoint, None);
 
     opened.load(&checkpoint, &mut loader, &placement)
 }
@@ -370,51 +370,107 @@ fn small_step_operators(model: &dyn VideoModel) -> BTreeSet<&'static str> {
     launches.into_iter().map(|(operator, _)| operator).collect()
 }
 
-/// The precision policy, read against the released headers. The dense student serves
-/// `quality`, stated or not: its projections are dense products and no step encodes an
-/// activation. Every other mode narrows a module this build serves a dense checkpoint's only in
-/// its own representation, so it is refused when the family opens the checkpoint, naming the
-/// module. The NVFP4 export serves its packed feed-forward products without a policy, and
-/// refuses one.
+/// The operators one decode of the shortest clip at the smallest served size launches, on the
+/// video decoder `model` places.
+fn decode_operators(model: &dyn VideoModel) -> BTreeSet<&'static str> {
+    let decoder = model.video_decoder().unwrap();
+    let (width, height) = serving().sizes[0];
+    // One temporal unit: the clip's seven latent frames, decoded whole.
+    let clip = Clip {
+        frames: 7 * 4,
+        height,
+        width,
+    };
+    let layout = decoder.layout_of(clip).unwrap();
+    let rows = decoder.latent_rows(&layout).unwrap().unwrap().dims()[0];
+
+    let block = meta((rows, 24), DType::F32);
+    let raster = (3, clip.frames as usize, height as usize, width as usize);
+    let video = meta(raster, decoder.element_type());
+    let (decoded, (launches, _)) = recorded(|| decoder.decode(&layout, &block, Some(&video), None));
+    decoded.unwrap();
+
+    launches.into_iter().map(|(operator, _)| operator).collect()
+}
+
+/// The precision policy, read against the released headers of the eight-step student. Each
+/// mode loads: `quality` (stated or not) and `balanced` multiply the denoiser's projections
+/// densely, `performance` multiplies its feed-forward in FP8 and `maximum` in NVFP4, each
+/// measuring its activation's scale (`dynamic_scale`); every mode but `quality` decodes with the
+/// video decoder's blocks in NVFP4, and `maximum` loads the text encoder's language layers in
+/// FP8. An NVFP4 attention under an eight-way Ulysses split, whose head shares are not whole
+/// tiles of the packed product, is refused naming the projection. The NVFP4 export serves its
+/// packed feed-forward products without a policy, and refuses one.
 #[test]
-#[ignore = "requires the four-step FastH3 student and its NVFP4 export"]
+#[ignore = "requires the eight-step FastH3 student and the four-step student's NVFP4 export"]
 fn the_precision_policy_reads_against_the_released_headers() {
     let mode = |mode| Quantization {
         mode: Some(mode),
         modules: Default::default(),
     };
+    let fp8 = BTreeSet::from(["fp8_quantize", "fp8_gemm", "dynamic_scale"]);
+    let nvfp4 = BTreeSet::from(["nvfp4_quantize", "nvfp4_gemm", "dynamic_scale"]);
+    let none = BTreeSet::new();
 
-    for policy in [Quantization::default(), mode(PrecisionMode::Quality)] {
-        let model = load_under(
-            FAST_4_STEP,
-            Stage::Transformer,
-            DenoiserSplit::WHOLE,
-            &policy,
-        )
-        .unwrap_or_else(|error| panic!("{policy}: {error}"));
-        let operators = small_step_operators(model.as_ref());
-        assert!(operators.contains("gemm"), "{policy}: {operators:?}");
-        for encoded in ["nvfp4_quantize", "nvfp4_gemm", "fp8_gemm"] {
-            assert!(!operators.contains(encoded), "{policy}: {operators:?}");
-        }
-    }
-
-    for (narrowing, named) in [
-        (PrecisionMode::Balanced, "`video_vae` in nvfp4"),
-        (PrecisionMode::Performance, "`mlp` in fp8"),
-        (PrecisionMode::Maximum, "`text_encoder` in fp8"),
+    for (policy, network, decoder) in [
+        (Quantization::default(), &none, &none),
+        (mode(PrecisionMode::Quality), &none, &none),
+        (mode(PrecisionMode::Balanced), &none, &nvfp4),
+        (mode(PrecisionMode::Performance), &fp8, &nvfp4),
+        (mode(PrecisionMode::Maximum), &nvfp4, &nvfp4),
     ] {
-        let policy = mode(narrowing);
-        let error = load_under(
-            FAST_4_STEP,
-            Stage::Transformer,
-            DenoiserSplit::WHOLE,
-            &policy,
-        )
-        .err()
-        .unwrap_or_else(|| panic!("{policy} was served"));
-        assert!(error.to_string().contains(named), "{policy}: {error}");
+        let load = |stage| {
+            load_under(FAST_8_STEP, stage, DenoiserSplit::WHOLE, &policy)
+                .unwrap_or_else(|error| panic!("{policy}: {error}"))
+        };
+        let encoded = |operators: BTreeSet<&'static str>| -> BTreeSet<&'static str> {
+            let all = [
+                "fp8_quantize",
+                "fp8_gemm",
+                "nvfp4_quantize",
+                "nvfp4_gemm",
+                "dynamic_scale",
+            ];
+            operators
+                .into_iter()
+                .filter(|operator| all.contains(operator))
+                .collect()
+        };
+
+        let operators = small_step_operators(load(Stage::Transformer).as_ref());
+        assert!(operators.contains("gemm"), "{policy}: {operators:?}");
+        assert_eq!(&encoded(operators), network, "{policy}: the denoiser");
+
+        let operators = decode_operators(load(Stage::VideoDecoder).as_ref());
+        assert_eq!(&encoded(operators), decoder, "{policy}: the video decoder");
+
+        assert!(
+            load(Stage::TextEncoder).text_encoder().is_some(),
+            "{policy}"
+        );
     }
+
+    // Eight members' shares of 56 heads are 896 channels, and the packed product computes whole
+    // tiles of 256.
+    let policy = Quantization {
+        mode: None,
+        modules: [("attention".to_owned(), WeightFormat::Nvfp4)].into(),
+    };
+    let ulysses8 = DenoiserSplit {
+        ulysses: SequenceSplit {
+            split: Split { size: 8, rank: 3 },
+            projection: Projection::Exchange,
+        },
+        ..DenoiserSplit::WHOLE
+    };
+    let error = load_under(FAST_8_STEP, Stage::Transformer, ulysses8, &policy)
+        .err()
+        .unwrap_or_else(|| panic!("{policy} was served under eight members"));
+    let message = error.to_string();
+    assert!(
+        message.contains("attn.to_q.weight") && message.contains("not whole tiles of 256"),
+        "{message}"
+    );
 
     let packed = load_under(
         FAST_4_STEP_NVFP4,

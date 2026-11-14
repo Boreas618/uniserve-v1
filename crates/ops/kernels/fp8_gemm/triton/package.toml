@@ -4,15 +4,18 @@
 # architecture of `[kernel.architectures]`, built by `src/build.py` (the compile
 # driver the Build Server runs for one descriptor and target).
 #
-# One program computes one output tile of a per-tensor FP8 product: the 16-bit
-# activation tile is encoded to E4M3 by its static scale as it is loaded, the
-# E4M3 product accumulates in FP32, and the accumulator is dequantized by
-# `input_scale · weight_scale` before the one rounding into the output. The
-# extents, the activation's row stride and both scales are launch words.
+# One program computes one output tile of a per-tensor FP8 product: the E4M3
+# activation `fp8_quantize` encoded times the E4M3 weight, accumulated in FP32,
+# and the accumulator dequantized by `input_scale · weight_scale` before the one
+# rounding into the output. The extents and the activation's row stride are
+# launch words, the contraction and the stride multiples of sixteen; the
+# product's factor is an FP32 device word, so a scale measured
+# on the device by a launch before is read without the host (interface version
+# 2).
 
 op = "fp8_gemm"
 backend = "triton"
-interface_version = 1
+interface_version = 2
 
 [toolchain]
 kind = "triton"
@@ -32,7 +35,7 @@ script = "src/build.py"
 target = "arch"
 architectures = ["sm_100a", "sm_90a"]
 
-# `dtype_bf16_block_m_64_block_n_128_block_k_128_bias_false`.
+# `dtype_bf16_block_m_128_block_n_128_block_k_128_bias_false`.
 [kernel.descriptors]
 # The three tile extents are `tl.arange` extents and `tl.dot` operands, so
 # powers of two of at least sixteen.

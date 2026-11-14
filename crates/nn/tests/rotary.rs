@@ -673,7 +673,7 @@ fn a_rotary_publishes_its_spectrum_and_computes_a_batchs_factors() {
     let directory = tempfile::tempdir().unwrap();
     let checkpoint = checkpoint(directory.path());
     let store = CpuWeights::new();
-    let loader = WeightLoader::new(&checkpoint, &store, None, None);
+    let loader = WeightLoader::new(&checkpoint, &store, None);
 
     // Interleaved M-RoPE over sixteen channels: four, two and two frequencies.
     let sectioned = config(
@@ -708,7 +708,7 @@ fn a_rotary_publishes_its_spectrum_and_computes_a_batchs_factors() {
 fn a_rotary_reads_one_coordinate_per_axis_into_one_column_per_pair() {
     let directory = tempfile::tempdir().unwrap();
     let checkpoint = checkpoint(directory.path());
-    let loader = WeightLoader::meta(&checkpoint, None, None);
+    let loader = WeightLoader::meta(&checkpoint, None);
 
     // Sixteen pairs repeated over three axes of a 128-channel head.
     let repeated = config(10_000.0, 96, Spectrum::Repeated { axes: 3 }, Precision::F64);

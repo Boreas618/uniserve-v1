@@ -10,7 +10,8 @@
 //! A packed ModelOpt export states its calibration in a manifest at its root; it is read here
 //! into the quantization each stage's configuration declares ([`modelopt`]), which the stage's
 //! loader is given before any of its weights is read. The deployment's precision policy is
-//! checked against those declarations when the family opens the checkpoint ([`precision`]).
+//! applied to a dense checkpoint's declarations when the family opens the checkpoint, naming
+//! the projections each stage converts at load, and refused for a packed one ([`precision`]).
 //!
 //! The request-level values the family's request rules are parameterized by (the frame rule,
 //! the resolution rule, the durations and the audio clock) are request processing's

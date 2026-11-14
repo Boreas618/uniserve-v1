@@ -2,25 +2,38 @@
 //! stores a weight in.
 //!
 //! ```text
-//! linear        a dense weight: one `gemm`
-//! linear_fp8    a per-tensor FP8 weight: one `fp8_gemm`, which encodes the activation by its
-//!               static scale as it loads it
-//! linear_nvfp4  a calibrated NVFP4 weight: the activation encoded (`nvfp4_quantize`, the
-//!               encoding of [`super::nvfp4_quantize`]) and the packed product (`nvfp4_gemm`)
+//! linear          a dense weight: one `gemm`
+//! linear_fp8      a per-tensor FP8 weight: the activation encoded (`fp8_quantize`) and the
+//!                 product over the two encodings (`fp8_gemm`)
+//! linear_nvfp4    an NVFP4 weight: the activation encoded (`nvfp4_quantize`, the encoding of
+//!                 [`super::nvfp4_quantize`]) and the packed product (`nvfp4_gemm`)
+//! dynamic_scales  the two factors an encoded product reads, measured from its activation:
+//!                 each row's largest magnitude (`reduce`'s `absmax`) folded with the weight's
+//!                 (`dynamic_scale`)
 //! ```
+//!
+//! The encoded products read their activation's scale as two `[1]` F32 device words: the
+//! encoder's multiplier and the product's factor. A calibrated export publishes both at load;
+//! a weight converted at load has them measured on every call by [`dynamic_scales`], within the
+//! forward and its graphs, with no host read between.
 //!
 //! Every product accumulates in FP32 and rounds once into its input's element type; a bias
 //! joins the accumulator, except the packed product's, which joins the rounded product.
 
+use ops::dynamic_scale::{self, DynamicScale, FLOOR};
 use ops::fp4::{
     BLOCK_ELEMENTS, GemmArgs, GemmDescriptor, Nvfp4Gemm, PACKED_M_CLASSES, ScaleLayout,
 };
-use ops::fp8::{E4M3_MAX, Fp8Gemm, Fp8GemmArgs, Fp8GemmDescriptor};
+use ops::fp8::{
+    E4M3_MAX, Fp8Gemm, Fp8GemmArgs, Fp8GemmDescriptor, Fp8Quantize, Fp8QuantizeArgs,
+    Fp8QuantizeDescriptor,
+};
 use ops::gemm::{Args, Descriptor, Epilogue, Gemm};
-use tensor::{D, DType, Tensor};
+use ops::reduce::{self, Function, Reduce};
+use tensor::{D, DType, Device, Tensor};
 
 use super::nvfp4::{decoded, encoded, launch_quantize};
-use super::{ACCUMULATE, as_rows, columns, like_rows, on_cpu, vector};
+use super::{ACCUMULATE, PDL, as_rows, columns, like_rows, on_cpu, vector};
 use crate::error::{Error, Result};
 
 pub use ops::gemm::WeightOrder;
@@ -31,7 +44,18 @@ pub(crate) const PRODUCT_SCALE_LAYOUT: ScaleLayout = ScaleLayout::Swizzled128X4;
 
 /// The tile an `fp8_gemm` kernel covers, `(rows, output columns, contraction elements)`: one
 /// kernel set serves every projection.
-const FP8_TILE: (u32, u32, u32) = (64, 128, 128);
+const FP8_TILE: (u32, u32, u32) = (128, 128, 128);
+
+/// The elements of a row one `fp8_quantize` program encodes.
+const FP8_ENCODE_BLOCK: u32 = 1024;
+
+/// The block a row fold of [`dynamic_scales`] reads at a time, the tensor primitives' own, so a
+/// row's largest magnitude is folded by the module of the same key for every projection wider
+/// than the block.
+const ROW_FOLD_BLOCK: u32 = 1024;
+
+/// The partials the one program of `dynamic_scale` reads at a time.
+const SCALE_TILE: u32 = 1024;
 
 /// `x · weightᵀ + bias` over a dense weight: `[..., n]` in `x`'s element type for `x` of
 /// `[..., k]`.
@@ -103,27 +127,29 @@ pub fn linear(
     like_rows(out, x)
 }
 
-/// `x · weightᵀ + bias` over a per-tensor FP8 weight (ModelOpt's `FP8`):
+/// `x · weightᵀ + bias` over a per-tensor FP8 weight:
 ///
 /// ```text
-/// q   = e4m3(clamp(x · (1 / input_scale), ±448))      round to nearest even
+/// q   = e4m3(clamp(x · encode, ±448))                  round to nearest even
 /// out = (Σ_k q[·, k] · weight[·, k]) · alpha + bias    alpha = input_scale · weight_scale
 /// ```
 ///
-/// `weight` is `[n, k]` E4M3 and `x` a 16-bit activation of `[..., k]`; the encoding is fused
-/// into the product's load, so the activation is never stored in E4M3. The result is `[..., n]`
-/// in `x`'s element type.
+/// `weight` is `[n, k]` E4M3 and `x` a 16-bit activation of `[..., k]`; `encode`, the reciprocal
+/// of the activation's scale, and `alpha` are `[1]` F32 tensors: a calibrated export's static
+/// factors, or the ones [`dynamic_scales`] measured. The activation is encoded once into an
+/// E4M3 buffer of its rows, which the product reads as stored codes. The result is `[..., n]` in
+/// `x`'s element type.
 ///
 /// # Errors
 ///
-/// When the weight is not an E4M3 matrix over `x`'s rows, the bias is another width, the scales
-/// are not positive finite numbers, or the operator refuses its arguments.
+/// When the weight is not an E4M3 matrix over `x`'s rows, the bias is another width, a factor
+/// is not one FP32 number, or the operator refuses its arguments.
 pub fn linear_fp8(
     x: &Tensor,
     weight: &Tensor,
     bias: Option<&Tensor>,
-    input_scale: f32,
-    alpha: f32,
+    encode: &Tensor,
+    alpha: &Tensor,
 ) -> Result<Tensor> {
     const OWNER: &str = "linear_fp8";
 
@@ -148,33 +174,45 @@ pub fn linear_fp8(
     if let Some(bias) = bias {
         vector(OWNER, "bias", bias, n)?;
     }
-    if !(input_scale.is_finite() && input_scale > 0.0 && alpha.is_finite()) {
-        return Err(Error::shape(
-            OWNER,
-            format!("an input scale of {input_scale} and a factor of {alpha} dequantize nothing"),
-        ));
-    }
+    factor(OWNER, "encode", encode)?;
+    factor(OWNER, "alpha", alpha)?;
 
     let rows = as_rows(OWNER, x)?;
     if on_cpu(x) {
         let limit = f64::from(E4M3_MAX);
         let encoded = rows
             .to_dtype(ACCUMULATE)?
-            .affine(f64::from(1.0 / input_scale), 0.0)?
+            .broadcast_mul(&encode.reshape(())?)?
             .clamp(-limit, limit)?
             .to_dtype(DType::F8E4M3)?
             .to_dtype(ACCUMULATE)?;
 
         let mut product = encoded
             .matmul(&weight.to_dtype(ACCUMULATE)?.t()?)?
-            .affine(f64::from(alpha), 0.0)?;
+            .broadcast_mul(&alpha.reshape(())?)?;
         if let Some(bias) = bias {
             product = product.broadcast_add(&bias.to_dtype(ACCUMULATE)?)?;
         }
         return like_rows(product.to_dtype(x.dtype())?, x);
     }
 
-    let out = ops::empty((rows.dims()[0], n as usize), x.dtype())?;
+    // 1. The activation's codes, each row encoded under the one multiplier.
+    let (m, k) = (rows.dims()[0], rows.dims()[1]);
+    let codes = ops::empty((m, k), DType::F8E4M3)?;
+    ops::launch::<Fp8Quantize>(
+        &Fp8QuantizeDescriptor {
+            dtype: x.dtype(),
+            block: FP8_ENCODE_BLOCK,
+        },
+        Fp8QuantizeArgs {
+            input: ops::operand(&rows)?,
+            out: ops::operand(&codes)?,
+            encode: ops::operand(encode)?,
+        },
+    )?;
+
+    // 2. The product over the two encodings.
+    let out = ops::empty((m, n as usize), x.dtype())?;
     let (block_m, block_n, block_k) = FP8_TILE;
     ops::launch::<Fp8Gemm>(
         &Fp8GemmDescriptor {
@@ -185,19 +223,126 @@ pub fn linear_fp8(
             bias: bias.is_some(),
         },
         Fp8GemmArgs {
-            input: ops::operand(&rows)?,
+            input: ops::operand(&codes)?,
             weight: ops::operand(weight)?,
             bias: bias.map(ops::operand).transpose()?,
             out: ops::operand(&out)?,
-            input_scale,
-            alpha,
+            alpha: ops::operand(alpha)?,
         },
     )?;
     like_rows(out, x)
 }
 
-/// `x · weightᵀ + bias` over a calibrated NVFP4 weight: the activation is encoded into the
-/// weight's own representation and the product is taken over the two encodings.
+/// The two factors a product over `x` encoded at its own measured scale reads, against a weight
+/// whose largest magnitude is `weight_amax`: `(encode, alpha)`, `[1]` F32 each.
+///
+/// ```text
+/// amax   = max(max |x|, 1e-12)                          over every element of x
+/// encode = range / amax                                 the encoder's multiplier
+/// alpha  = (amax / range) · (weight_amax / range)       the product's factor
+/// ```
+///
+/// `range` is the format's ([`ops::dynamic_scale::FP8_RANGE`], [`NVFP4_RANGE`]); the divisions
+/// round to nearest. `x` is a BF16, FP16 or FP32 activation of `[..., k]`, read as its rows, and
+/// `weight_amax` one FP32 number. On a device, each row's largest magnitude is folded by
+/// `reduce` (`absmax`) and the rows' by `dynamic_scale`: two launches whose outputs come from the
+/// context's allocator and which read nothing back, so a captured forward replays them.
+///
+/// [`NVFP4_RANGE`]: ops::dynamic_scale::NVFP4_RANGE
+///
+/// # Errors
+///
+/// When `x` is not floating or has no element, `weight_amax` is not one FP32 number, or an
+/// operator refuses its arguments.
+pub fn dynamic_scales(x: &Tensor, weight_amax: &Tensor, range: f32) -> Result<(Tensor, Tensor)> {
+    const OWNER: &str = "dynamic_scales";
+
+    if !matches!(x.dtype(), DType::BF16 | DType::F16 | DType::F32) {
+        return Err(Error::shape(
+            OWNER,
+            format!(
+                "{} activations; a scale is measured from BF16, FP16 or FP32",
+                ops::abi::name(x.dtype())
+            ),
+        ));
+    }
+    factor(OWNER, "weight's largest magnitude", weight_amax)?;
+    let rows = as_rows(OWNER, x)?;
+    let count = rows.dims()[0];
+    if count == 0 {
+        return Err(Error::shape(
+            OWNER,
+            "an activation of no rows has no magnitude".to_owned(),
+        ));
+    }
+
+    if on_cpu(x) {
+        let amax = rows
+            .to_dtype(ACCUMULATE)?
+            .abs()?
+            .max_all()?
+            .to_scalar::<f32>()?
+            .max(FLOOR);
+        let weight = weight_amax
+            .to_dtype(ACCUMULATE)?
+            .flatten_all()?
+            .to_vec1::<f32>()?[0];
+
+        let encode = Tensor::new(&[range / amax], &Device::Cpu)?;
+        let alpha = Tensor::new(&[(amax / range) * (weight / range)], &Device::Cpu)?;
+        return Ok((encode, alpha));
+    }
+
+    // 1. Each row's largest magnitude, in the activation's own type: a magnitude is exact.
+    let partials = ops::empty((count, 1), x.dtype())?;
+    let fold = reduce::Args {
+        x: ops::operand(&rows)?,
+        out: ops::operand(&partials)?,
+        axes: &[1],
+    };
+    ops::launch::<Reduce>(
+        &reduce::Descriptor::of(Function::AbsMax, &fold, ROW_FOLD_BLOCK, PDL),
+        fold,
+    )?;
+
+    // 2. The rows' largest, and the two factors from it and the weight's.
+    let encode = ops::empty(1, DType::F32)?;
+    let alpha = ops::empty(1, DType::F32)?;
+    ops::launch::<DynamicScale>(
+        &dynamic_scale::Descriptor {
+            dtype: x.dtype(),
+            tile: SCALE_TILE,
+            pdl: PDL,
+        },
+        dynamic_scale::Args {
+            partials: ops::operand(&partials.flatten_all()?)?,
+            weight_amax: ops::operand(weight_amax)?,
+            encode: ops::operand(&encode)?,
+            alpha: ops::operand(&alpha)?,
+            range,
+            floor: FLOOR,
+        },
+    )?;
+    Ok((encode, alpha))
+}
+
+/// Refuses `tensor`, the factor `what` of an encoded product, unless it is one FP32 number.
+fn factor(owner: &'static str, what: &str, tensor: &Tensor) -> Result<()> {
+    if tensor.dtype() != DType::F32 || tensor.elem_count() != 1 {
+        return Err(Error::shape(
+            owner,
+            format!(
+                "the {what} is {} {:?}, and a product reads one FP32 number",
+                ops::abi::name(tensor.dtype()),
+                tensor.dims()
+            ),
+        ));
+    }
+    Ok(())
+}
+
+/// `x · weightᵀ + bias` over an NVFP4 weight: the activation is encoded into the weight's own
+/// representation and the product is taken over the two encodings.
 ///
 /// ```text
 /// encode   scale[row, block] = e4m3(amax(block) · input_scale / 6)
@@ -209,8 +354,9 @@ pub fn linear_fp8(
 /// `values` is the packed weight, `[n, k / 2]` U8 with two E2M1 codes a byte, the even element
 /// in the low nibble; `scales` its E4M3 block scales, one per sixteen elements of a row, in the
 /// swizzled 128x4 layout the product reads; `input_scale` the `[1]` FP32 reciprocal of the
-/// calibration's activation scale, the encoder's global scale; `alpha` the `[1]` FP32 product of
-/// the weight's tensor scale and the activation's. `x` is a BF16 or FP16 activation of
+/// activation's tensor scale, the encoder's global scale; `alpha` the `[1]` FP32 product of the
+/// weight's tensor scale and the activation's. Both are a calibrated export's constants, or the
+/// factors [`dynamic_scales`] measured from `x`. `x` is a BF16 or FP16 activation of
 /// `[..., k]`, and the result is `[..., n]` in its element type.
 ///
 /// The packed product has no bias epilogue, so `bias`, `[n]` when given, joins the product
@@ -277,15 +423,8 @@ pub fn linear_nvfp4(
             expected
         )));
     }
-    for (what, scalar) in [("input scale", input_scale), ("alpha", alpha)] {
-        if scalar.dtype() != DType::F32 || scalar.elem_count() != 1 {
-            return Err(refuse(format!(
-                "the {what} is {} {:?}, and the product reads one FP32 number",
-                ops::abi::name(scalar.dtype()),
-                scalar.dims()
-            )));
-        }
-    }
+    factor(OWNER, "input scale", input_scale)?;
+    factor(OWNER, "alpha", alpha)?;
 
     // The encoder reads the activation's own type, which NVFP4 encodes from BF16 or FP16.
     if !matches!(x.dtype(), DType::BF16 | DType::F16) {

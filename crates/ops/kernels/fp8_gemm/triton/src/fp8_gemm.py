@@ -1,10 +1,13 @@
 """Per-tensor FP8 product: the Triton source of the ``fp8_gemm`` operator.
 
-One program computes a ``BLOCK_M x BLOCK_N`` tile of ``out = (e4m3(x / s_x) @ w^T) * alpha``. The
-16-bit activation tile is loaded, scaled by the reciprocal of its static scale in FP32, clamped to
-the E4M3 range and rounded to nearest even into E4M3 as the reference's
-``static_scaled_fp8_quant`` does; the E4M3 product accumulates in FP32 and the accumulator is
-scaled once by ``alpha = s_x * s_w`` before the one rounding into the output type.
+One program computes a ``BLOCK_M x BLOCK_N`` tile of ``out = (q @ w^T) * alpha``: ``q`` is the
+activation ``fp8_quantize`` encoded (``e4m3(x / s_x)``, the reference's ``scaled_fp8_quant``) and
+``w`` the E4M3 weight, both loaded as stored codes, which the tensor-core product reads; the
+product accumulates in FP32 and the accumulator is scaled once by ``alpha = s_x * s_w`` before the
+one rounding into the output type.
+
+``alpha`` is one FP32 word in device memory: a calibrated export's constant, or the factor a
+launch before measured.
 
 The kernel body imports nothing but Triton: the launch-time wrapper, its operand checks and its
 torch types stay with the operator's Rust side.
@@ -13,11 +16,7 @@ torch types stay with the operator's Rust side.
 import triton
 import triton.language as tl
 
-#: The largest finite E4M3 magnitude.
-E4M3_MAX = tl.constexpr(448.0)
-
-
-@triton.jit(do_not_specialize=["m", "n", "k", "x_row_stride"])
+@triton.jit(do_not_specialize=["m", "n"])
 def _fp8_gemm_kernel(
     x_ptr,
     w_ptr,
@@ -27,8 +26,7 @@ def _fp8_gemm_kernel(
     n,
     k,
     x_row_stride,
-    inverse_scale,
-    alpha,
+    alpha_ptr,
     BLOCK_M: tl.constexpr,  # noqa: N803
     BLOCK_N: tl.constexpr,  # noqa: N803
     BLOCK_K: tl.constexpr,  # noqa: N803
@@ -36,9 +34,12 @@ def _fp8_gemm_kernel(
 ):
     """One output tile; grid ``(cdiv(m, BLOCK_M), cdiv(n, BLOCK_N))``.
 
-    ``x`` is ``[m, k]`` with rows ``x_row_stride`` apart, ``w`` is ``[n, k]`` E4M3 contiguous,
-    ``out`` is ``[m, n]`` contiguous and ``bias`` is ``[n]`` when ``BIAS``.
+    ``x`` is ``[m, k]`` E4M3 with rows ``x_row_stride`` apart, ``w`` is ``[n, k]`` E4M3
+    contiguous, ``out`` is ``[m, n]`` contiguous and ``bias`` is ``[n]`` when ``BIAS``.
+    ``alpha_ptr`` holds the product's factor.
     """
+    alpha = tl.load(alpha_ptr)
+
     rows = tl.program_id(0) * BLOCK_M + tl.arange(0, BLOCK_M)
     columns = tl.program_id(1) * BLOCK_N + tl.arange(0, BLOCK_N)
     depth = tl.arange(0, BLOCK_K)
@@ -53,16 +54,13 @@ def _fp8_gemm_kernel(
             x_ptr + rows[:, None] * x_row_stride + reach[None, :],
             mask=row_mask[:, None] & depth_mask[None, :],
             other=0.0,
-        ).to(tl.float32)
-        encoded = tl.clamp(x * inverse_scale, -E4M3_MAX, E4M3_MAX).to(
-            tl.float8e4nv, fp_downcast_rounding="rtne"
         )
         w = tl.load(
             w_ptr + columns[None, :] * k + reach[:, None],
             mask=column_mask[None, :] & depth_mask[:, None],
             other=0.0,
         )
-        accumulator = tl.dot(encoded, w, accumulator, out_dtype=tl.float32)
+        accumulator = tl.dot(x, w, accumulator, out_dtype=tl.float32)
 
     result = accumulator * alpha
     if BIAS:

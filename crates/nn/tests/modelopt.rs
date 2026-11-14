@@ -306,7 +306,7 @@ fn a_packed_export_computes_the_product_its_fields_and_its_manifest_state() {
     let checkpoint = export(directory.path(), &LISTED);
 
     let store = CpuWeights::new();
-    let mut loader = WeightLoader::new(&checkpoint, &store, None, None);
+    let mut loader = WeightLoader::new(&checkpoint, &store, None);
     loader.declare(&declaration(&checkpoint)).unwrap();
     let root = loader.root();
 
@@ -391,7 +391,7 @@ fn a_meta_load_of_a_packed_export_states_the_encoder_and_the_product() {
     let directory = tempfile::tempdir().unwrap();
     let checkpoint = export(directory.path(), &LISTED);
 
-    let mut loader = WeightLoader::meta(&checkpoint, None, None);
+    let mut loader = WeightLoader::meta(&checkpoint, None);
     loader.declare(&declaration(&checkpoint)).unwrap();
 
     let fused = Linear::load(&whole(32, 8, false), loader.root().pp(FUSED)).unwrap();
@@ -431,7 +431,7 @@ fn a_manifest_and_its_shards_that_disagree_are_refused_by_the_module() {
     // A packed projection the manifest does not calibrate has no scale to encode by.
     let directory = tempfile::tempdir().unwrap();
     let checkpoint = export(directory.path(), &LISTED[..3]);
-    let mut loader = WeightLoader::meta(&checkpoint, None, None);
+    let mut loader = WeightLoader::meta(&checkpoint, None);
     loader.declare(&declaration(&checkpoint)).unwrap();
 
     let error = Linear::load(&whole(32, 4, true), loader.root().pp(OUTPUT))
@@ -461,7 +461,7 @@ fn a_manifest_and_its_shards_that_disagree_are_refused_by_the_module() {
         })
         .unwrap();
 
-    let mut loader = WeightLoader::meta(&checkpoint, None, None);
+    let mut loader = WeightLoader::meta(&checkpoint, None);
     let error = loader.declare(&misplaced).unwrap_err();
     assert!(
         matches!(&error, Error::Weight { tensor, .. } if tensor == "blocks.0.proj.weight_packed"),

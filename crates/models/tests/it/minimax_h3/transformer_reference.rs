@@ -128,7 +128,7 @@ fn the_modulation_is_the_references_adaln_projection_of_each_level() {
     let expected = expected();
     let checkpoint = Checkpoint::open(&fixtures().join("transformer")).unwrap();
     let store = CpuWeights::new();
-    let loader = WeightLoader::new(&checkpoint, &store, None, None);
+    let loader = WeightLoader::new(&checkpoint, &store, None);
     let table = modulation_table(&loader, &expected["timesteps"]);
 
     // The sinusoidal embedding, two projections of the embedder and the modulation projection.
@@ -152,7 +152,7 @@ fn the_rotary_factors_are_the_references_table() {
     let expected = expected();
     let checkpoint = Checkpoint::open(&fixtures().join("transformer")).unwrap();
     let store = CpuWeights::new();
-    let loader = WeightLoader::new(&checkpoint, &store, None, None);
+    let loader = WeightLoader::new(&checkpoint, &store, None);
 
     let rotary = Rotary::load(
         &rotary_config(&config().transformer),
@@ -178,7 +178,7 @@ fn a_block_is_the_references_block() {
     let expected = expected();
     let checkpoint = Checkpoint::open(&fixtures().join("transformer")).unwrap();
     let store = CpuWeights::new();
-    let loader = WeightLoader::new(&checkpoint, &store, None, None);
+    let loader = WeightLoader::new(&checkpoint, &store, None);
     let config = config();
 
     let block = Block::load(
@@ -221,7 +221,7 @@ fn the_stack_and_its_heads_are_the_references() {
     let expected = expected();
     let checkpoint = Checkpoint::open(&fixtures().join("transformer")).unwrap();
     let store = CpuWeights::new();
-    let loader = WeightLoader::new(&checkpoint, &store, None, None);
+    let loader = WeightLoader::new(&checkpoint, &store, None);
     let config = config();
 
     let transformer =
@@ -262,7 +262,7 @@ fn the_refined_prompt_is_the_references() {
     let expected = expected();
     let checkpoint = Checkpoint::open(&fixtures().join("transformer")).unwrap();
     let store = CpuWeights::new();
-    let loader = WeightLoader::new(&checkpoint, &store, None, None);
+    let loader = WeightLoader::new(&checkpoint, &store, None);
 
     let features = &expected["features"];
     let rows = features.dims()[0] as u32;

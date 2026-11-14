@@ -37,6 +37,9 @@ def neutral(function, accumulator):
     """The value an output starts at: what the function leaves unchanged."""
     if function == "sum":
         return 0
+    if function == "absmax":
+        # A magnitude is never below zero, so zero leaves every largest magnitude unchanged.
+        return 0
     if function in ("min", "argmin"):
         return I64_MAX if accumulator == "i64" else float("inf")
     return I64_MIN if accumulator == "i64" else float("-inf")

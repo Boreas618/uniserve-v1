@@ -76,6 +76,8 @@ pub struct UlyssesAttention {
     /// in member order, each holding that member's head rows.
     inputs: Vec<Vec<Linear>>,
     output: Linear,
+    /// The element type of the rows the projections read and write: the stack's.
+    dtype: DType,
     config: UlyssesAttentionConfig,
 }
 
@@ -148,9 +150,23 @@ impl UlyssesAttention {
             vb.pp(config.output),
         )?;
 
+        // A dense or converted projection states the type its rows have; a calibrated encoded
+        // one only through its builder's pin.
+        let dtype = output.dtype().or(vb.dtype()).ok_or_else(|| {
+            Error::shape(
+                "UlyssesAttention",
+                format!(
+                    "the encoded output projection of {} states no element type for its rows, and \
+                     its builder pins none",
+                    vb.path()
+                ),
+            )
+        })?;
+
         Ok(Self {
             inputs,
             output,
+            dtype,
             config: *config,
         })
     }
@@ -185,9 +201,9 @@ impl UlyssesAttention {
         self.config.head_dim
     }
 
-    /// The element type of the projections' weights: the stack's.
-    pub fn dtype(&self) -> DType {
-        self.output.weight().dtype()
+    /// The element type of the rows the projections read and write: the stack's.
+    pub const fn dtype(&self) -> DType {
+        self.dtype
     }
 
     /// The width of this member's heads of one projection: `local heads · head_dim`.

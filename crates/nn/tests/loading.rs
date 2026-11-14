@@ -187,14 +187,14 @@ fn a_region_is_converted_once_and_reused_by_its_key() {
     let store = CpuWeights::new();
 
     // The launch states FP32, so the BF16 tensor is converted, once.
-    let loader = WeightLoader::new(&checkpoint, &store, Some(DType::F32), None);
+    let loader = WeightLoader::new(&checkpoint, &store, Some(DType::F32));
     let first = load(&loader, &region("weight", (2, 4)), (2, 4));
     assert_eq!((first.dtype(), first.dims()), (DType::F32, &[2, 4][..]));
     assert_eq!(values(&first), numbers);
     assert_eq!(store.keys().len(), 1);
 
     // The same weight is served from retained storage by another loader: no second publish.
-    let loader = WeightLoader::new(&checkpoint, &store, Some(DType::F32), None);
+    let loader = WeightLoader::new(&checkpoint, &store, Some(DType::F32));
     let second = load(&loader, &region("weight", (2, 4)), (2, 4));
     assert_eq!(values(&second), numbers);
     assert_eq!(store.keys().len(), 1);
@@ -232,7 +232,7 @@ fn fused_parts_are_joined_in_the_order_the_operator_reads() {
     );
     let checkpoint = Checkpoint::open(directory.path()).unwrap();
     let store = CpuWeights::new();
-    let loader = WeightLoader::new(&checkpoint, &store, Some(DType::F32), None);
+    let loader = WeightLoader::new(&checkpoint, &store, Some(DType::F32));
 
     // `up` before `gate`, as `WeightLayout::UP_GATE` declares.
     let parts = vec!["up".to_owned(), "gate".to_owned()];
@@ -306,7 +306,7 @@ fn a_strided_row_parallel_shard_gathers_its_columns() {
     bf16_shard(directory.path(), &[("o_proj.weight", vec![4, 6], numbers)]);
     let checkpoint = Checkpoint::open(directory.path()).unwrap();
     let store = CpuWeights::new();
-    let loader = WeightLoader::new(&checkpoint, &store, None, None);
+    let loader = WeightLoader::new(&checkpoint, &store, None);
 
     let columns = |first: u64| WeightSource::Strided {
         tensor: "o_proj.weight".to_owned(),
@@ -346,7 +346,7 @@ fn a_region_of_zeros_is_refused_when_the_load_asks_for_a_value() {
     );
     let checkpoint = Checkpoint::open(directory.path()).unwrap();
     let store = CpuWeights::new();
-    let loader = WeightLoader::new(&checkpoint, &store, None, None);
+    let loader = WeightLoader::new(&checkpoint, &store, None);
     let asked = |loader: &WeightLoader<'_>, tensor: &str, nonzero: bool| {
         loader.load(
             tensor,
@@ -372,7 +372,7 @@ fn a_region_of_zeros_is_refused_when_the_load_asks_for_a_value() {
     asked(&loader, "k_proj.weight", true).unwrap();
 
     // A meta loader reads no payload, so the zeros are not there for it to refuse.
-    let meta = WeightLoader::meta(&checkpoint, None, None);
+    let meta = WeightLoader::meta(&checkpoint, None);
     asked(&meta, "v_proj.weight", true).unwrap();
 }
 
@@ -392,7 +392,7 @@ fn a_weight_normalized_convolution_is_computed_once_at_load() {
     );
     let checkpoint = Checkpoint::open(directory.path()).unwrap();
     let store = CpuWeights::new();
-    let loader = WeightLoader::new(&checkpoint, &store, None, None);
+    let loader = WeightLoader::new(&checkpoint, &store, None);
 
     // v · g / ‖v‖ per channel: [3, 4] · 5/5 and [0, 1] · 10/1.
     let weight = loader.root().pp("conv").weight_norm("weight").unwrap();
@@ -424,7 +424,7 @@ fn a_computed_weight_is_named_by_its_provenance_and_not_by_its_label_alone() {
     bf16_shard(directory.path(), &[("weight", vec![1], vec![1.0])]);
     let checkpoint = Checkpoint::open(directory.path()).unwrap();
     let store = CpuWeights::new();
-    let loader = WeightLoader::new(&checkpoint, &store, None, None);
+    let loader = WeightLoader::new(&checkpoint, &store, None);
 
     let (name, shape) = ("denoiser.video.student_heads.weight", Shape::from(2));
     let (base, reference) = (f32_bytes(&[0.5, 0.25]), f32_bytes(&[1.0, 2.0]));
@@ -468,7 +468,7 @@ fn a_builder_names_its_constants_by_its_module_path_and_encodes_their_type() {
     bf16_shard(directory.path(), &[("weight", vec![1], vec![1.0])]);
     let checkpoint = Checkpoint::open(directory.path()).unwrap();
     let store = CpuWeights::new();
-    let loader = WeightLoader::new(&checkpoint, &store, None, None);
+    let loader = WeightLoader::new(&checkpoint, &store, None);
     let vb = loader.root().pp("model").pp("rotary_emb");
     assert_eq!(vb.path(), "model.rotary_emb");
     assert_eq!(vb.name("inv_freq"), "model.rotary_emb.inv_freq");
@@ -541,7 +541,7 @@ fn a_calibrated_nvfp4_matrix_is_loaded_as_its_fields() {
     );
     let checkpoint = Checkpoint::open(directory.path()).unwrap();
     let store = CpuWeights::new();
-    let loader = WeightLoader::new(&checkpoint, &store, None, None);
+    let loader = WeightLoader::new(&checkpoint, &store, None);
     let fields = |layouts| {
         loader.nvfp4(
             &region("w", (4, 32)),
@@ -614,7 +614,7 @@ fn a_calibrated_projection_is_read_in_the_spelling_its_export_wrote() {
     );
     let checkpoint = Checkpoint::open(directory.path()).unwrap();
     let store = CpuWeights::new();
-    let loader = WeightLoader::new(&checkpoint, &store, None, None);
+    let loader = WeightLoader::new(&checkpoint, &store, None);
     let fields = |names: Nvfp4Names| {
         loader.nvfp4(
             &region(&format!("proj.{}", names.values), (2, 8)),
@@ -680,7 +680,7 @@ fn a_calibrated_expert_stack_is_joined_expert_major_and_projection_by_projection
     let directory = tempfile::tempdir().unwrap();
     let (checkpoint, expected) = stack_checkpoint(directory.path(), 2, DType::U8);
     let store = CpuWeights::new();
-    let loader = WeightLoader::new(&checkpoint, &store, None, None);
+    let loader = WeightLoader::new(&checkpoint, &store, None);
     let stack = |loader: &WeightLoader<'_>| {
         loader
             .nvfp4_stack(
@@ -755,7 +755,7 @@ fn a_stack_keeps_its_scale_type_and_arranges_its_rows_at_load() {
     let directory = tempfile::tempdir().unwrap();
     let (checkpoint, _) = stack_checkpoint(directory.path(), 1, DType::F8E4M3);
     let store = CpuWeights::new();
-    let loader = WeightLoader::new(&checkpoint, &store, None, None);
+    let loader = WeightLoader::new(&checkpoint, &store, None);
     let stack = |values: ValueLayout| {
         loader.nvfp4_stack(
             "experts.up_gate",
@@ -835,7 +835,7 @@ fn a_stack_needs_every_expert_to_agree_on_its_extents() {
     );
     let checkpoint = Checkpoint::open(directory.path()).unwrap();
     let store = CpuWeights::new();
-    let loader = WeightLoader::new(&checkpoint, &store, None, None);
+    let loader = WeightLoader::new(&checkpoint, &store, None);
 
     let error = loader
         .nvfp4_stack(
@@ -869,7 +869,7 @@ fn a_loader_borrows_another_stage_s_checkpoint_and_keeps_the_store() {
     let transformer = Checkpoint::open(&transformer).unwrap();
     let vae = Checkpoint::open(&vae).unwrap();
     let store = CpuWeights::new();
-    let loader = WeightLoader::new(&transformer, &store, Some(DType::F32), None);
+    let loader = WeightLoader::new(&transformer, &store, Some(DType::F32));
 
     let first = load(&loader, &region("weight", 2), 2);
     let second = load(&loader.reborrow(&vae).unwrap(), &region("weight", 2), 2);
@@ -998,7 +998,7 @@ fn a_meta_load_returns_what_a_load_of_the_payload_returns() {
     let directory = tempfile::tempdir().unwrap();
     let checkpoint = dense_checkpoint(directory.path());
 
-    let meta = WeightLoader::meta(&checkpoint, None, None);
+    let meta = WeightLoader::meta(&checkpoint, None);
     let from_headers = dense_loads(&meta);
     assert_eq!(
         checkpoint.reading().0,
@@ -1007,7 +1007,7 @@ fn a_meta_load_returns_what_a_load_of_the_payload_returns() {
     );
 
     let store = CpuWeights::new();
-    let from_payload = dense_loads(&WeightLoader::new(&checkpoint, &store, None, None));
+    let from_payload = dense_loads(&WeightLoader::new(&checkpoint, &store, None));
     assert_eq!(from_headers, from_payload);
     assert_eq!(
         from_headers,
@@ -1050,8 +1050,8 @@ fn a_meta_load_refuses_what_the_header_contradicts() {
     let directory = tempfile::tempdir().unwrap();
     let checkpoint = dense_checkpoint(directory.path());
     let store = CpuWeights::new();
-    let payload = WeightLoader::new(&checkpoint, &store, None, None);
-    let meta = WeightLoader::meta(&checkpoint, None, None);
+    let payload = WeightLoader::new(&checkpoint, &store, None);
+    let meta = WeightLoader::meta(&checkpoint, None);
 
     let past = region("proj.weight", (8, 8));
     let tails = WeightSource::Parts {
@@ -1124,10 +1124,10 @@ fn a_meta_load_refuses_what_the_header_contradicts() {
             .to_string()
     };
     let store = CpuWeights::new();
-    let refused = stack(&WeightLoader::meta(&checkpoint, None, None));
+    let refused = stack(&WeightLoader::meta(&checkpoint, None));
     assert_eq!(
         refused,
-        stack(&WeightLoader::new(&checkpoint, &store, None, None))
+        stack(&WeightLoader::new(&checkpoint, &store, None))
     );
     assert!(refused.contains("linear"), "{refused}");
 }
@@ -1150,11 +1150,11 @@ fn a_meta_load_reads_no_value() {
     let checkpoint = Checkpoint::open(directory.path()).unwrap();
     let store = CpuWeights::new();
 
-    let meta = WeightLoader::meta(&checkpoint, None, None);
+    let meta = WeightLoader::meta(&checkpoint, None);
     assert_eq!(meta.tensor_scale("proj.weight_scale_2").unwrap(), 1.0);
     assert!(checkpoint.reading().0.is_empty(), "no tensor was read");
 
-    let refused = WeightLoader::new(&checkpoint, &store, None, None)
+    let refused = WeightLoader::new(&checkpoint, &store, None)
         .tensor_scale("proj.weight_scale_2")
         .unwrap_err();
     assert!(

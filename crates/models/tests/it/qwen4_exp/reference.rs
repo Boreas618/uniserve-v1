@@ -112,7 +112,7 @@ fn zeros(shape: Shape, dtype: DType) -> Tensor {
 fn with_fixture<T>(name: &str, check: impl FnOnce(&Config, VarBuilder<'_, '_>) -> T) -> T {
     let checkpoint = support::checkpoint(&data(name).join("model"));
     let store = CpuWeights::new();
-    let mut loader = WeightLoader::new(&checkpoint, &store, None, None);
+    let mut loader = WeightLoader::new(&checkpoint, &store, None);
     let config = Config::open(&checkpoint).expect("the configuration");
     loader
         .declare(&Declaration::read(&checkpoint).expect("the declaration"))
@@ -753,7 +753,7 @@ fn the_indexed_attention_layer_is_the_references() {
 fn reference_model() -> std::sync::Arc<dyn TextModel> {
     let checkpoint = support::checkpoint(&data("reference").join("model"));
     let store = CpuWeights::new();
-    let mut loader = WeightLoader::new(&checkpoint, &store, None, None);
+    let mut loader = WeightLoader::new(&checkpoint, &store, None);
 
     support::load(
         &checkpoint,
@@ -1283,7 +1283,7 @@ fn forward(
 fn a_prefill_and_verify_steps_compute_what_one_prefill_does() {
     let checkpoint = support::checkpoint(&data("consistency").join("model"));
     let store = CpuWeights::new();
-    let mut loader = WeightLoader::new(&checkpoint, &store, None, None);
+    let mut loader = WeightLoader::new(&checkpoint, &store, None);
     let config = Config::open(&checkpoint).expect("the configuration");
     let placement = nn::family::TextPlacement {
         drafter: false,

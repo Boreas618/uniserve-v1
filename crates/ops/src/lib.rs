@@ -68,6 +68,16 @@
 //! | [`norm::Softmax`] | `softmax` | [`norm`] |
 //! | [`embedding::Embedding`] | `embedding` | [`embedding`] |
 //!
+//! Encoded products and their factors:
+//!
+//! | Operator | `NAME` | Module |
+//! | --- | --- | --- |
+//! | [`fp8::Fp8Quantize`] | `fp8_quantize` | [`fp8`] |
+//! | [`fp8::Fp8Gemm`] | `fp8_gemm` | [`fp8`] |
+//! | [`fp4::Nvfp4Quantize`] | `nvfp4_quantize` | [`fp4`] |
+//! | [`fp4::Nvfp4Gemm`] | `nvfp4_gemm` | [`fp4`] |
+//! | [`dynamic_scale::DynamicScale`] | `dynamic_scale` | [`dynamic_scale`] |
+//!
 //! Position and cache:
 //!
 //! | Operator | `NAME` | Module |
@@ -156,6 +166,7 @@ pub mod copy_strided;
 pub mod cross_fade;
 pub mod descriptor;
 mod device;
+pub mod dynamic_scale;
 pub mod elementwise;
 pub mod embedding;
 pub mod error;

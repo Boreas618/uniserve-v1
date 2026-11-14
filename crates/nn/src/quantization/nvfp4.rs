@@ -312,7 +312,7 @@ impl Nvfp4Share {
 /// scales are contiguous: column groups of four stride 512, thirty-two-row groups stride 16,
 /// groups of 128 rows stride `128 · padded_columns`. The padding is zero, which is a scale of
 /// zero on a block that does not exist.
-fn swizzled_scales(linear: &[u8], rows: u64, blocks: u64) -> Vec<u8> {
+pub(super) fn swizzled_scales(linear: &[u8], rows: u64, blocks: u64) -> Vec<u8> {
     let padded_rows = rows.div_ceil(128) * 128;
     let padded_columns = blocks.div_ceil(4) * 4;
     let mut swizzled = vec![0_u8; (padded_rows * padded_columns) as usize];
@@ -448,7 +448,7 @@ fn projection_major(scales: &[f32], per: usize, experts: usize) -> Vec<u8> {
 }
 
 /// The layout name block scales in `layout` are filed under.
-fn scales_layout(layout: ScaleLayout) -> WeightLayout {
+pub(super) fn scales_layout(layout: ScaleLayout) -> WeightLayout {
     match layout {
         ScaleLayout::Linear => WeightLayout::NVFP4_SCALES_LINEAR,
         ScaleLayout::Swizzled128X4 => WeightLayout::NVFP4_SCALES_SWIZZLED,
@@ -477,7 +477,7 @@ fn computed_key(
 }
 
 /// The tensor `source` reads, when it reads one: a region or the strided rows of it.
-fn single(source: &WeightSource) -> Option<&str> {
+pub(super) fn single(source: &WeightSource) -> Option<&str> {
     match source {
         WeightSource::Region { tensor, .. } | WeightSource::Strided { tensor, .. } => Some(tensor),
         WeightSource::Parts { .. } | WeightSource::Blocks { .. } => None,

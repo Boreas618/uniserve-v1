@@ -61,7 +61,7 @@ fn load(name: &str, placement: &TextPlacement) -> Arc<dyn TextModel> {
     );
 
     let checkpoint = support::checkpoint(&root);
-    let mut loader = WeightLoader::meta(&checkpoint, None, None);
+    let mut loader = WeightLoader::meta(&checkpoint, None);
     support::load(&checkpoint, &mut loader, placement)
 }
 
@@ -650,7 +650,7 @@ fn qwen3_6_nvfp4_profiles_a_decode_and_a_prefill_bucket() {
         assert_operators(
             "a mixed-precision hybrid step",
             &keys,
-            &["fp8_gemm"],
+            &["fp8_quantize", "fp8_gemm"],
             &["nvfp4_quantize", "nvfp4_gemm"],
         );
         assert_operators(
@@ -692,7 +692,7 @@ fn the_vl_encoder_profiles_a_prompt_with_an_image() {
             .expect("the pixel normalization"),
     );
 
-    let loader = WeightLoader::meta(checkpoint, None, None);
+    let loader = WeightLoader::meta(checkpoint, None);
     let model = Qwen3VlModel::load(&config, loader.root(), images, Split::WHOLE, 50, false)
         .expect("the meta load");
     let vision = config.vision.as_ref().expect("a tower");

@@ -122,7 +122,7 @@ fn profile_decoder(name: &str, decoder: &VideoDecoder, config: &VideoVaeConfig) 
 #[ignore = "requires /workspace/models/MiniMax-H3"]
 fn the_video_decoder_profiles_one_clip_at_a_small_and_a_large_resolution() {
     let (checkpoint, config) = video_stage();
-    let loader = WeightLoader::meta(&checkpoint, None, None);
+    let loader = WeightLoader::meta(&checkpoint, None);
     let decoder = VideoDecoder::load(&config, loader.root()).unwrap();
 
     profile_decoder("MiniMax-H3", &decoder, &config);
@@ -144,7 +144,7 @@ fn the_nvfp4_export_s_video_decoder_profiles_one_clip_at_a_small_and_a_large_res
         .unwrap()
         .video_vae;
 
-    let mut loader = WeightLoader::meta(checkpoint.stage("vae").unwrap(), None, None);
+    let mut loader = WeightLoader::meta(checkpoint.stage("vae").unwrap(), None);
     loader.declare(&config.quantization).unwrap();
     let decoder = VideoDecoder::load(&config, loader.root()).unwrap();
 
@@ -155,7 +155,7 @@ fn the_nvfp4_export_s_video_decoder_profiles_one_clip_at_a_small_and_a_large_res
 #[ignore = "requires /workspace/models/MiniMax-H3"]
 fn the_video_encoder_profiles_a_still_and_a_clip() {
     let (checkpoint, config) = video_stage();
-    let loader = WeightLoader::meta(&checkpoint, None, None);
+    let loader = WeightLoader::meta(&checkpoint, None);
     let encoder = VideoEncoder::load(&config, loader.root()).unwrap();
     let [(small_width, small_height), (large_width, large_height)] = served_resolutions();
 
@@ -193,7 +193,7 @@ fn the_video_encoder_profiles_a_still_and_a_clip() {
 #[ignore = "requires /workspace/models/MiniMax-H3"]
 fn the_audio_decoder_profiles_the_shortest_and_the_longest_track() {
     let (checkpoint, config) = audio_stage();
-    let loader = WeightLoader::meta(&checkpoint, None, None);
+    let loader = WeightLoader::meta(&checkpoint, None);
     let decoder = AudioDecoder::load(&config, loader.root()).unwrap();
     assert_eq!(decoder.sampling_rate(), 32_000);
 
@@ -238,7 +238,7 @@ fn the_audio_decoder_profiles_the_shortest_and_the_longest_track() {
 #[ignore = "requires /workspace/models/MiniMax-H3"]
 fn the_audio_encoder_profiles_a_reference_track() {
     let (checkpoint, config) = audio_stage();
-    let loader = WeightLoader::meta(&checkpoint, None, None);
+    let loader = WeightLoader::meta(&checkpoint, None);
     let encoder = AudioEncoder::load(&config, loader.root()).unwrap();
     assert_eq!(encoder.hop(), 800);
 

@@ -261,14 +261,22 @@ impl<'l, 'a> VarBuilder<'l, 'a> {
         self.loader
     }
 
-    /// Refuses a dense read of a weight the checkpoint stores packed.
+    /// Refuses a dense read of a weight the checkpoint stores packed, or that the declaration
+    /// converts at load.
     fn refuse_packed(&self, names: &[String]) -> Result<()> {
         match names
             .iter()
-            .find(|name| self.loader.scheme(name) != Scheme::Dense)
+            .map(|name| (name, self.loader.scheme(name)))
+            .find(|(_, scheme)| *scheme != Scheme::Dense)
         {
             None => Ok(()),
-            Some(name) => Err(Error::weight(
+            Some((name, Scheme::DynamicFp8 | Scheme::DynamicNvfp4)) => Err(Error::weight(
+                name,
+                "the precision policy converts this weight at load, and the module reading it \
+                 has no encoded form: reading it as dense would serve another precision than the \
+                 policy states. Select the checkpoint's own representation for its module",
+            )),
+            Some((name, _)) => Err(Error::weight(
                 name,
                 "the checkpoint stores this weight packed, and the module reading it has no \
                  encoded form: reading it as dense would read packed E2M1 as a matrix. Load a \

@@ -240,6 +240,8 @@ pub mod operator {
     pub const NVFP4_QUANTIZE: &str = "nvfp4_quantize";
     pub const NVFP4_GEMM: &str = "nvfp4_gemm";
     pub const FP8_GEMM: &str = "fp8_gemm";
+    pub const FP8_QUANTIZE: &str = "fp8_quantize";
+    pub const DYNAMIC_SCALE: &str = "dynamic_scale";
     pub const SNAKE: &str = "snake";
     pub const CHANNEL_AFFINE: &str = "channel_affine";
     pub const GELU: &str = "gelu";
@@ -342,6 +344,8 @@ pub mod operator {
         NVFP4_QUANTIZE,
         NVFP4_GEMM,
         FP8_GEMM,
+        FP8_QUANTIZE,
+        DYNAMIC_SCALE,
         SNAKE,
         CHANNEL_AFFINE,
         GELU,
@@ -383,7 +387,11 @@ pub mod operator {
     /// An operator's interface is its descriptor and its argument layout. A change of either that
     /// is not an addition raises the operator's version here, and a package of the operator states
     /// the version it implements in its manifest (`interface_version`).
-    const VERSIONS: &[(&str, u32)] = &[];
+    const VERSIONS: &[(&str, u32)] = &[
+        // The product reads an activation `fp8_quantize` encoded, and its factor from device
+        // memory, where a measured scale is written by a launch before it.
+        (FP8_GEMM, 2),
+    ];
 
     /// The version of `operator`'s interface in this build: 1 unless [`VERSIONS`] states another.
     ///

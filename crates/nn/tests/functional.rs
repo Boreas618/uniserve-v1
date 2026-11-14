@@ -503,8 +503,8 @@ fn linear_fp8_encodes_the_activation_by_its_static_scale() {
         &tensor(&x, (2, 4), DType::BF16),
         &tensor(&weight, (3, 4), DType::F8E4M3),
         Some(&tensor(&bias, 3, DType::BF16)),
-        input_scale,
-        alpha,
+        &tensor(&[1.0 / input_scale], 1, DType::F32),
+        &tensor(&[alpha], 1, DType::F32),
     )
     .unwrap();
     assert_eq!((out.dims(), out.dtype()), (&[2, 3][..], DType::BF16));
@@ -525,8 +525,8 @@ fn linear_fp8_encodes_the_activation_by_its_static_scale() {
         &tensor(&[1000.0, 0.0, 0.0, 0.0], (1, 4), DType::BF16),
         &tensor(&[1.0, 0.0, 0.0, 0.0], (1, 4), DType::F8E4M3),
         None,
-        1.0,
-        1.0,
+        &tensor(&[1.0], 1, DType::F32),
+        &tensor(&[1.0], 1, DType::F32),
     )
     .unwrap();
     assert_eq!(values(&saturated), [448.0]);
@@ -866,7 +866,13 @@ fn the_dense_and_the_fp8_projections_state_their_kernels() {
             Some(&meta(8, DType::BF16)),
             WeightOrder::NxK,
         )?;
-        let fp8 = functional::linear_fp8(&x, &meta((8, 64), DType::F8E4M3), None, 0.5, 0.25)?;
+        let fp8 = functional::linear_fp8(
+            &x,
+            &meta((8, 64), DType::F8E4M3),
+            None,
+            &meta(1, DType::F32),
+            &meta(1, DType::F32),
+        )?;
 
         Ok([dense, fp8].map(|tensor| tensor.dims().to_vec()))
     });
@@ -879,9 +885,10 @@ fn the_dense_and_the_fp8_projections_state_their_kernels() {
                 "gemm",
                 "input_bf16_weight_bf16_accumulate_f32_output_bf16_order_nxk_epilogue_bias"
             ),
+            ("fp8_quantize", "dtype_bf16_block_1024"),
             (
                 "fp8_gemm",
-                "dtype_bf16_block_m_64_block_n_128_block_k_128_bias_false"
+                "dtype_bf16_block_m_128_block_n_128_block_k_128_bias_false"
             ),
         ]
         .map(|(operator, key)| (operator, key.to_owned()))

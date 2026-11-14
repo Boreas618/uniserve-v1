@@ -84,7 +84,7 @@ fn checkpoint(directory: &Path, rows: usize, first: f32) -> Checkpoint {
 /// Loads the fixture's two weights from `checkpoint` through `store`, as a model's modules do:
 /// the norm, then the embedding.
 fn load(checkpoint: &Checkpoint, store: &dyn RetainedWeights, rows: usize) -> (Tensor, Tensor) {
-    let loader = WeightLoader::new(checkpoint, store, None, None);
+    let loader = WeightLoader::new(checkpoint, store, None);
     let root = loader.root();
 
     let norm = root.pp("norm").get(NORM, "weight").unwrap();
@@ -116,7 +116,7 @@ fn a_load_over_the_meta_store_states_its_weights_in_order_and_holds_no_data() {
 
     let store = MetaWeights::new();
     let (norm, embed) = load(&checkpoint, &store, ROWS);
-    let table = WeightLoader::new(&checkpoint, &store, None, None)
+    let table = WeightLoader::new(&checkpoint, &store, None)
         .writable_constant(
             "frequencies",
             DType::F32,

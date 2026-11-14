@@ -21,6 +21,8 @@ What is covered:
   axes in two, two that are not adjacent, and all of them; an index along each single axis;
 - **every layout** of `operands.views` — rank 1 to 6, windows, steps, permutations, zero-stride
   broadcasts — reduced along its last axis, its first axis and all of its axes;
+- **the largest magnitude** of every floating element type, over the same lengths and layouts,
+  and of infinities of either sign;
 - **ties**: the first of equal values wins an index, within a tile and across two tiles;
 - **an integer sum that wraps**, and **a sum along an axis of no element**, which is zero.
 """
@@ -60,6 +62,8 @@ def expected_of(function, x, axes):
         return wide.min(axis=tuple(axes), keepdims=True)
     if function == "max":
         return wide.max(axis=tuple(axes), keepdims=True)
+    if function == "absmax":
+        return np.abs(wide).max(axis=tuple(axes), keepdims=True)
     (axis,) = axes
     # Numpy returns the first of equal values, as the operator does.
     found = (
@@ -142,6 +146,28 @@ def main():
             )
             checked += check(function, "shorter than a tile", short, [1])
             checked += check(function, "several tiles", long, [1])
+
+    # The largest magnitude, of floating elements only: a short reduction, several tiles, a
+    # wide block, every layout and infinities of either sign.
+    for seed, dtype in enumerate(operands.FLOATS):
+        short = operands.values(dtype, (37, 5), seed + 60)
+        long = operands.values(dtype, (3, 2 * operands.BLOCK + 22), seed + 70)
+        checked += check("absmax", "shorter than a tile", short, [1])
+        checked += check("absmax", "several tiles", long, [1])
+        checked += check(
+            "absmax",
+            "a wide block",
+            operands.values(dtype, (300, 3), seed + 80),
+            [1],
+            WIDE_BLOCK,
+        )
+        edges = operands.tensor(
+            [[float("-inf"), 1.0, 0.0, 2.0], [-3.0, 2.0, 1.0, -0.5]], dtype
+        )
+        checked += check("absmax", "infinities", edges, [1])
+    for name, view in operands.views("bf16", 31):
+        checked += check("absmax", name, view, [view.dim() - 1])
+        checked += check("absmax", name, view, list(range(view.dim())))
 
     # A program of several hundred outputs, each thread of it folding several: the outputs
     # adjacent in memory and the reduced elements a row apart, then the reduced elements adjacent.
@@ -239,7 +265,8 @@ def main():
         )
 
     print(
-        f"ok: {checked} outputs over {len(FUNCTIONS)} functions on {len(DTYPES)} element types, "
+        f"ok: {checked} outputs over {len(FUNCTIONS)} functions on {len(DTYPES)} element types "
+        f"and absmax on {len(operands.FLOATS)}, "
         f"blocks of {operands.BLOCK} and {WIDE_BLOCK} elements, "
         f"{len(choices)} choices of axes, {layouts} strided launches of rank 1 to 6, ties and empty "
         f"axes, on {operands.where()}: floating sums within dot(class), the rest exact"

@@ -579,7 +579,7 @@ fn a_resnet_block_adds_its_input_or_its_projection() {
 
     // On the CPU the block is the composition its documentation states.
     let store = CpuWeights::new();
-    let loader = WeightLoader::new(&checkpoint, &store, None, None);
+    let loader = WeightLoader::new(&checkpoint, &store, None);
     let wide = ResnetBlock3d::load(&RESNET, loader.root().pp("wide")).unwrap();
     let x = tensor(&sequence(4 * 3 * 4 * 4, 70), (1, 4, 3, 4, 4), DType::F32);
     let out = wide.forward(&x).unwrap();
@@ -632,7 +632,7 @@ fn a_resnet_block_adds_its_input_or_its_projection() {
 
     // On a device each normalization is two launches and each convolution one; a block that
     // keeps its width adds its input and launches no projection.
-    let loader = WeightLoader::meta(&checkpoint, None, None);
+    let loader = WeightLoader::meta(&checkpoint, None);
     let wide = ResnetBlock3d::load(&RESNET, loader.root().pp("wide")).unwrap();
     let same = ResnetBlock3d::load(&same_config, loader.root().pp("same")).unwrap();
 
@@ -728,7 +728,7 @@ fn an_adaln_block_modulates_both_inputs_and_gates_both_updates() {
     let directory = tempfile::tempdir().unwrap();
     let checkpoint = adaln_checkpoint(directory.path());
     let store = CpuWeights::new();
-    let loader = WeightLoader::new(&checkpoint, &store, None, None);
+    let loader = WeightLoader::new(&checkpoint, &store, None);
     let block = AdaLnBlock::load(&ADALN, loader.root().pp("block")).unwrap();
     assert_eq!(block.dtype(), DType::F32);
 
@@ -835,7 +835,7 @@ fn an_adaln_block_modulates_both_inputs_and_gates_both_updates() {
 fn an_adaln_block_states_two_modulated_norms_around_the_attention() {
     let directory = tempfile::tempdir().unwrap();
     let checkpoint = adaln_checkpoint(directory.path());
-    let loader = WeightLoader::meta(&checkpoint, None, None);
+    let loader = WeightLoader::meta(&checkpoint, None);
     let block = AdaLnBlock::load(&ADALN, loader.root().pp("block")).unwrap();
     let norm = AdaLnOut::load(
         &AdaLnOutConfig {
@@ -891,7 +891,7 @@ fn the_final_adaln_norm_modulates_by_shift_and_scale() {
     let directory = tempfile::tempdir().unwrap();
     let checkpoint = adaln_checkpoint(directory.path());
     let store = CpuWeights::new();
-    let loader = WeightLoader::new(&checkpoint, &store, None, None);
+    let loader = WeightLoader::new(&checkpoint, &store, None);
     let norm = AdaLnOut::load(
         &AdaLnOutConfig {
             hidden: HIDDEN as u32,

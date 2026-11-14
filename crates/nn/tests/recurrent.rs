@@ -790,7 +790,7 @@ fn a_gated_delta_net_mixes_its_rows_through_the_slots_state() {
         let weights = weights(&config);
         let checkpoint = checkpoint(directory.path(), DType::F32, &weights);
         let store = CpuWeights::new();
-        let loader = WeightLoader::new(&checkpoint, &store, None, None);
+        let loader = WeightLoader::new(&checkpoint, &store, None);
         let network = GatedDeltaNet::load(&config, loader.root().pp("mixer")).unwrap();
         assert_eq!(network.output().n(), 16);
 
@@ -913,7 +913,7 @@ fn a_gated_delta_net_states_its_fields_and_its_kernels() {
 
     let directory = tempfile::tempdir().unwrap();
     let checkpoint = checkpoint(directory.path(), DType::BF16, &weights(&config));
-    let loader = WeightLoader::meta(&checkpoint, None, None);
+    let loader = WeightLoader::meta(&checkpoint, None);
     let network = GatedDeltaNet::load(&config, loader.root().pp("mixer")).unwrap();
 
     // The heads of the convolved row are views of it, so the forward is the eight launches of
