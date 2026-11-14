@@ -1460,7 +1460,27 @@ impl BufferPool {
                 keys.push((*key, entry.class, entry.tokens, tiers, held, hosts));
             }
         }
-        keys.sort_unstable_by_key(|listed| listed.0);
+        // The blocks the schedulers would evict first come first, in their
+        // installed orders (least recently used first, a key at its earliest
+        // place in any of them), the others after them by key: a scheduler
+        // that starts beside a warm cache, as an epoch's target of the same
+        // layout does, has used none of the blocks it lists and takes their
+        // order from the listing, so that its allocations evict what the
+        // serving schedulers would evict rather than the blocks they read
+        // again.
+        let mut place: HashMap<&Key, usize> = HashMap::new();
+        for region in &self.regions {
+            for order in region.orders.values() {
+                for (index, key) in order.iter().enumerate() {
+                    let earliest = place.entry(key).or_insert(index);
+                    *earliest = (*earliest).min(index);
+                }
+            }
+        }
+        keys.sort_unstable_by_key(|listed| {
+            let at = place.get(&listed.0).copied().unwrap_or(usize::MAX);
+            (at, listed.0)
+        });
         Completion::Listing { keys }
     }
 

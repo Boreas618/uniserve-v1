@@ -307,6 +307,30 @@ fn an_owner_gets_the_lowest_slot_row_and_then_the_one_given_up_last() {
     assert_eq!(fixture.attach(5, DECODE), 1);
 }
 
+/// A `Listing` states first the keys an installed eviction order names, as
+/// that order names them (least recently used first), and the others after
+/// them by key: a scheduler that starts beside a warm cache, as an epoch's
+/// target of the same layout does, takes its eviction order from it.
+#[test]
+fn a_listing_states_the_installed_eviction_order_first() {
+    let mut fixture = Fixture::new();
+    for name in [1, 2, 3] {
+        fixture.cached(u64::from(name), name);
+    }
+    let order = Request::Victims {
+        region: UNITS,
+        keys: vec![key(3), key(1)],
+    };
+    assert_eq!(fixture.ask(order), Some(Completion::Done));
+
+    let listed: Vec<Key> = fixture
+        .listing()
+        .into_iter()
+        .map(|listed| listed.0)
+        .collect();
+    assert_eq!(listed, [key(3), key(1), key(2)]);
+}
+
 #[test]
 fn a_request_that_names_what_does_not_fit_is_refused_and_changes_nothing() {
     let mut fixture = Fixture::new();
@@ -1530,11 +1554,13 @@ fn a_prefetch_into_a_full_host_tier_evicts_in_the_order_and_names_what_it_evicte
             evicted: vec![key(2)]
         })
     );
-    let host: Vec<(Key, u8)> = fixture
+    // The listing states the installed order's key first; the tiers are read by key.
+    let mut host: Vec<(Key, u8)> = fixture
         .listing()
         .into_iter()
         .map(|(key, _, _, tiers, _, _)| (key, tiers & 0b010))
         .collect();
+    host.sort_unstable();
     assert_eq!(host, [(key(1), 0b010), (key(2), 0), (key(5), 0b010)]);
 }
 

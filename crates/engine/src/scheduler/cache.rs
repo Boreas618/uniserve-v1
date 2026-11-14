@@ -421,9 +421,13 @@ impl Scheduler {
         });
     }
 
-    /// A `Listing` states every cached key: a row it lists becomes what it states, keeping its
-    /// holders and last use (a key new to `cache` was never used here and is first in its
-    /// order); a row it does not list leaves `cache`.
+    /// A `Listing` states every cached key, those the schedulers would evict first first: a row
+    /// it lists becomes what it states, keeping its holders and last use; a key new to `cache`
+    /// was never used here, and takes its place in the listing as its last use, which puts it
+    /// before every block used here and keeps the listing's order among such keys, so that a
+    /// scheduler that starts beside a warm cache (an epoch's target of the same layout) evicts
+    /// first what the serving schedulers would evict first; a row it does not list leaves
+    /// `cache`.
     fn listed(&mut self, keys: &[(Key, u8, u16, u8, u8, u8)]) {
         let listed: HashSet<u64> = keys.iter().map(|(key, ..)| Cached::id(key)).collect();
         let gone: Vec<Key> = self
@@ -435,10 +439,10 @@ impl Scheduler {
         for key in &gone {
             self.change_row(key, None, |row| row.tiers = 0);
         }
-        for &(key, class, tokens, tiers, groups, _) in keys {
+        for (place, &(key, class, tokens, tiers, groups, _)) in (0u64..).zip(keys) {
             self.change_row(&key, Some((class, tokens)), |row| {
                 if row.tiers == 0 {
-                    row.last_used = 0;
+                    row.last_used = place;
                 }
                 *row = Cached {
                     class,
@@ -1459,6 +1463,23 @@ mod tests {
             victims.iter().all(|page| on_device.contains(page)),
             "{victims:?}"
         );
+    }
+
+    /// Blocks a scheduler never used enter its eviction order as its startup `Listing` orders
+    /// them (the blocks the serving schedulers would evict first first), not by their keys: a
+    /// scheduler that starts beside a warm cache installs a head that names them in the
+    /// listing's order.
+    #[test]
+    fn listed_blocks_enter_the_eviction_order_as_the_listing_orders_them() {
+        let mut bench = bench(4096);
+        // One step of 128 tokens takes two blocks of 64 tokens: the head covers two units.
+        bench.scheduler.config.max_num_batched_tokens = 128;
+        list(
+            &mut bench,
+            &[(key(3), DEVICE), (key(1), DEVICE), (key(2), DEVICE)],
+        );
+        bench.scheduler.install_victims();
+        assert_eq!(written(&mut bench), [victims(&[key(3), key(1)])]);
     }
 
     #[test]
