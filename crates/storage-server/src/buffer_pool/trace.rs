@@ -849,14 +849,16 @@ fn stated_request(request: &Request) -> String {
 }
 
 /// What a state in the model's terms leaves out and the model has no terms
-/// for: the class of each cached key, in lines that start with `#`, which
-/// `verification/buffer-pool/steps.py` reads and `agreement.py` never sees.
-/// The model has one class, so a key cached in another is outside its terms
-/// (a key names what its block holds, A6).
+/// for: the class of each key cached in a class other than 0, in lines that
+/// start with `#`, which `verification/buffer-pool/steps.py` reads and
+/// `agreement.py` never sees. The model has one class, so a key cached in
+/// another is outside its terms (a key names what its block holds, A6); a
+/// key with no such line is of the class 0.
 pub(crate) fn classes(pool: &BufferPool) -> String {
     let classes: BTreeMap<String, u8> = pool
         .cache
         .iter()
+        .filter(|(_, entry)| entry.class != 0)
         .map(|(key, entry)| (key_name(key), entry.class))
         .collect();
     let lines: Vec<String> = classes
@@ -920,9 +922,10 @@ pub(crate) fn layout(pool: &BufferPool) -> String {
 
 /// The pool's state in the terms of the design model, one line per fact, in
 /// order: the copies the workers were asked for (`copies`), each group's
-/// `completed` word, the free units, each owner of `owners` by the queue pair
-/// that attaches it (live with its group, slot and its table of the class 0
-/// by position, or gone, or new), each cached key with its copies, the
+/// `completed` word, the free units as runs (`region:first-last`), each owner
+/// of `owners` by the queue pair that attaches it (live with its group, slot
+/// and its table of the class 0 by position, or gone, or new), each cached
+/// key with its copies, the
 /// memories that hold each block an owner or the cache holds on the device
 /// and the host parts that hold each host copy, the copies in flight with
 /// their keys and the host parts a store or a save writes, what waits for a
@@ -930,8 +933,7 @@ pub(crate) fn layout(pool: &BufferPool) -> String {
 /// one `release` line per group and stamp a release waits for), and the
 /// tasks with their keys and the host parts a prefetch writes, a task of
 /// several keys as one per key. A block a waiting commit holds states its
-/// memories too. A unit is `region:unit`, a key its
-/// 32 bytes in hex. `verification/buffer-pool/agreement.py` writes the
+/// memories too. A unit is `region:unit`, a key its 32 bytes in hex. `verification/buffer-pool/agreement.py` writes the
 /// model's states in the same lines.
 pub(crate) fn stated(pool: &BufferPool, owners: &[(QueueId, OwnerId)], copies: u32) -> String {
     let unit = |block: &Rc<Block>| {
@@ -966,13 +968,33 @@ pub(crate) fn stated(pool: &BufferPool, owners: &[(QueueId, OwnerId)], copies: u
             }),
     );
 
-    let mut free = BTreeSet::new();
+    // The free units as runs, `region:first-last` or `region:unit` for one,
+    // each as long as it can be, by region and first unit: a state grows with
+    // what is held, not with the regions' size.
+    let mut free = Vec::new();
     for (id, region) in pool.regions.iter().enumerate() {
-        for (first, count) in region.free_runs() {
-            free.extend((first..first + count).map(|unit| format!("{id}:{unit}")));
+        let mut runs: Vec<(u32, u32)> = region
+            .free_runs()
+            .filter(|(_, count)| *count > 0)
+            .map(|(first, count)| (first, first + count - 1))
+            .collect();
+        runs.sort_unstable();
+        let mut joined: Vec<(u32, u32)> = Vec::with_capacity(runs.len());
+        for (first, last) in runs {
+            match joined.last_mut() {
+                Some(previous) if previous.1 + 1 == first => previous.1 = last,
+                _ => joined.push((first, last)),
+            }
         }
+        free.extend(joined.into_iter().map(|(first, last)| {
+            if first == last {
+                format!("{id}:{first}")
+            } else {
+                format!("{id}:{first}-{last}")
+            }
+        }));
     }
-    lines.push(format!("free {}", units(free)));
+    lines.push(format!("free {}", free.join(" ")));
 
     // An owner's number is taken once on its queue pair: a number at or
     // below the highest taken there that names no owner is of one that is

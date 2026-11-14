@@ -45,8 +45,9 @@ than 0; a prefetch from the peers; a load or a store of several keys (the
 model makes one per key; a prefetch of several is checked as one per key
 in order, and a state states a task of several keys as one per key); a
 state while no session or several are open, with units of a region the
-model lacks, or with a key cached in a class other than 0 (the model has
-one class; `# class` lines state them).
+model lacks held (another class's), or with a key cached in a class other
+than 0 (the model has one class; `# class` lines state them); a step that
+takes or frees units of a region the model lacks.
 
 Prints one verdict line: ok; FAIL with the first step no path follows,
 whose window is kept in WORK/failure.txt (with the first 50 such); or
@@ -55,6 +56,7 @@ INCONCLUSIVE when a TLC run stopped before its search was complete. With
 TLC's output; TLC's state files are kept under $TMPDIR (default /tmp).
 """
 import argparse
+import bisect
 import collections
 import multiprocessing
 import os
@@ -242,12 +244,84 @@ def record(line):
     return kind, units, owners, set() if key == "-" else {key}
 
 
+class Free:
+    """The free units of a state as the line states them: per region, runs
+    of units `(first, last)` in order. A region of tens of thousands of
+    units is a few runs, so nothing here walks every free unit."""
+
+    def __init__(self, text=""):
+        self.text = text
+        self.runs = collections.defaultdict(list)
+        for item in text.split():
+            region, _, span = item.partition(":")
+            first, _, last = span.partition("-")
+            self.runs[region].append((int(first), int(last or first)))
+        for runs in self.runs.values():
+            runs.sort()
+        self.starts = {region: [first for first, _ in runs] for region, runs in self.runs.items()}
+
+    def __contains__(self, unit):
+        region, _, number = unit.partition(":")
+        runs = self.runs.get(region)
+        if not runs:
+            return False
+        number = int(number)
+        at = bisect.bisect_right(self.starts[region], number) - 1
+        return at >= 0 and runs[at][1] >= number
+
+    def regions(self):
+        return set(self.runs)
+
+    def without(self, other):
+        """The units free here and not in `other`, one by one."""
+        found = []
+        for region, runs in self.runs.items():
+            theirs = other.runs.get(region, [])
+            at = 0
+            for first, last in runs:
+                while at < len(theirs) and theirs[at][1] < first:
+                    at += 1
+                position, scan = first, at
+                while position <= last:
+                    if scan < len(theirs) and theirs[scan][0] <= last:
+                        low, high = theirs[scan]
+                        found += [f"{region}:{unit}" for unit in range(position, min(low, last + 1))]
+                        position = max(position, high + 1)
+                        scan += 1
+                    else:
+                        found += [f"{region}:{unit}" for unit in range(position, last + 1)]
+                        break
+        return found
+
+    def changed(self, other):
+        """The units free in one state and not in the other."""
+        if self.text == other.text:
+            return []
+        return self.without(other) + other.without(self)
+
+    def first_common(self, other, region, held):
+        """The lowest unit of `region` free in both and not in `held`, or None."""
+        ours, theirs = self.runs.get(region, []), other.runs.get(region, [])
+        at = 0
+        for first, last in ours:
+            while at < len(theirs) and theirs[at][1] < first:
+                at += 1
+            scan = at
+            while scan < len(theirs) and theirs[scan][0] <= last:
+                low, high = max(first, theirs[scan][0]), min(last, theirs[scan][1])
+                for unit in range(low, high + 1):
+                    if f"{region}:{unit}" not in held:
+                        return f"{region}:{unit}"
+                scan += 1
+        return None
+
+
 class State:
     """A state's facts by what they name. `lines` holds every line but the
     free units, `ncopy` and `completed`."""
 
     def __init__(self):
-        self.free = set()
+        self.free = Free()
         self.ncopy = 0
         self.completed = ""
         self.owners = {}          # owner -> (is, group, slot, {position: (kind, unit)})
@@ -268,7 +342,7 @@ class State:
         elif word == "completed":
             self.completed = rest
         elif word == "free":
-            self.free = set(rest.split())
+            self.free = Free(rest)
         elif word == "#":
             parts = rest.split()
             if parts[0] == "class":
@@ -351,9 +425,6 @@ def outside_state(state, regions):
         for region, _ in UNIT.findall(line):
             if region not in regions:
                 return "units of a region the model lacks"
-    for unit in state.free:
-        if unit.split(":")[0] not in regions:
-            return "units of a region the model lacks"
     return None
 
 
@@ -405,7 +476,7 @@ def acts(text):
 def changes(before, after):
     """What a step changes: the facts of either state that differ."""
     changed = set()
-    changed |= {("u", unit) for unit in before.free ^ after.free}
+    changed |= {("u", unit) for unit in before.free.changed(after.free)}
     removed, added = before.lines - after.lines, after.lines - before.lines
     for line in removed | added:
         word, _, rest = line.partition(" ")
@@ -554,7 +625,7 @@ def projected(state, part, witnesses, rename):
     """The lines of `state` within `part`, renamed."""
     units = {fact[1] for fact in part if fact[0] == "u"} | witnesses
     full = {fact[1] for fact in part if fact[0] == "f"}
-    lines = [f"free {' '.join(sorted(rename(unit) for unit in state.free & units))}"]
+    lines = [f"free {' '.join(sorted(rename(unit) for unit in units if unit in state.free))}"]
     for owner in sorted({fact[1] for fact in part if fact[0] == "h"}):
         if owner not in state.owners:
             lines.append(f"owner {rename(owner, 'o')} new")
@@ -709,16 +780,12 @@ def witnesses_of(before, after, parts, layout):
     held = set()
     for part in parts:
         held |= {fact[1] for fact in part if fact[0] == "u"}
-    spare = (before.free & after.free) - held
-    by_region = collections.defaultdict(list)
-    for unit in spare:
-        region, _, number = unit.partition(":")
-        by_region[region].append(int(number))
     chosen = set()
     for _, (_, rows, kv, _) in layout[0]:
         for region in (kv[0], rows):
-            if by_region.get(region):
-                chosen.add(f"{region}:{min(by_region[region])}")
+            unit = before.free.first_common(after.free, region, held)
+            if unit:
+                chosen.add(unit)
     return chosen
 
 
@@ -741,6 +808,11 @@ def step_windows(step, before, after, layouts_of, text):
             reason = outside_state(state, regions)
             if reason:
                 raise Outside(reason)
+        # Free units of a region the model lacks (another class's) are none
+        # of its business while they stay free.
+        lacked = (before.free.regions() | after.free.regions()) - set(regions)
+        if any(before.free.runs.get(region) != after.free.runs.get(region) for region in lacked):
+            raise Outside("units of a region the model lacks taken or freed")
     except Outside as reason:
         return [], str(reason), None
     parts = windows_of(before, after, text)

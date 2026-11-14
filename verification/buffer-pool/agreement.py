@@ -6,7 +6,7 @@
 MODEL_DUMP is what TLC's -dump wrote for MC_Pool under the shape's
 configuration; RUST_STATES is what the crate's enumeration wrote for the
 shape. Both are projected onto the same facts, one line each: the units that
-are free, each owner's group, slot and table, each key's copies, the
+are free (as runs), each owner's group, slot and table, each key's copies, the
 memories in which each device block an owner, the cache or a waiting commit
 holds is valid and the host parts that hold each host copy, what waits for
 a stamp with the stamps it still waits for, the copies and the tasks in
@@ -19,6 +19,7 @@ states are then never stored.
 """
 import hashlib
 import multiprocessing
+import os
 import re
 import sys
 
@@ -110,6 +111,21 @@ READ = {"valid", "ogroup", "deferred", "hcache", "tasks", "free", "copies", "nco
         "remote", "oslot", "ostate", "cache"}
 
 
+def runs(found):
+    """Units as the Rust buffer pool states its free ones: runs as long as
+    they can be, `region:first-last` or `region:unit` for one, by region and
+    first unit."""
+    numbers = sorted(tuple(map(int, item.split(":"))) for item in found)
+    joined = []
+    for region, number in numbers:
+        if joined and joined[-1][0] == region and joined[-1][2] + 1 == number:
+            joined[-1][2] = number
+        else:
+            joined.append([region, number, number])
+    return " ".join(f"{region}:{first}" if first == last else f"{region}:{first}-{last}"
+                    for region, first, last in joined)
+
+
 def project(state, shape):
     """The lines of a model state, as the Rust enumeration writes its own."""
     names, memory, parts_of = NAMES[shape], MEMORIES[shape], GROUP_PARTS[shape]
@@ -121,7 +137,7 @@ def project(state, shape):
 
     launched = state["launched"]
     lines.append("completed " + " ".join(f"{group(name)}={launched[name]}" for name in sorted(launched)))
-    lines.append(f"free {units(state['free'])}".rstrip() + ("" if state["free"] else " "))
+    lines.append(f"free {runs(unit(name) for name in state['free'])}".rstrip())
 
     held, hosts = set(), set()
     for owner in sorted(state["ostate"]):
@@ -264,7 +280,8 @@ def chunks(path, shape, size=2000):
 def model_states(path, shape):
     """The digests of the projections of every state of the dump."""
     projections = set()
-    with multiprocessing.Pool() as workers:
+    # $AGREEMENT_JOBS processes project the dump (default: one per CPU).
+    with multiprocessing.Pool(int(os.environ.get("AGREEMENT_JOBS", os.cpu_count()))) as workers:
         for found in workers.imap_unordered(project_chunk, chunks(path, shape)):
             projections |= found
     return projections
