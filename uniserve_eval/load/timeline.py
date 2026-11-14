@@ -14,6 +14,12 @@ after the last one ended. When the deployment states an admin listener, its
 event log (``GET /admin/events``) is read throughout the load; a change that
 waits for an update's phase finds it there.
 
+A signal's process is found before the load starts and signalled at its
+time if it still runs the same command line; otherwise it is searched for
+then. Reading ``/proc`` takes milliseconds, which at the change's time would
+delay the signal (a 100 ms stop would last longer) and hold up the load's
+own clock readings.
+
 ``run_timeline`` fills a record the caller owns as the load proceeds, so a
 load that fails leaves what it observed. Times ending in ``_s`` are seconds
 from the load's start:
@@ -112,6 +118,13 @@ async def run_timeline(
     )
     if before_measure is not None:
         await before_measure()
+
+    # Before t = 0, so that the search is no part of the measured load.
+    targets = {
+        change.name: _armed_target(change, deployment)
+        for change in changes
+        if change.signal is not None and change.host is None
+    }
 
     start = time.perf_counter()
     offset = time.time() - start
@@ -232,7 +245,12 @@ async def run_timeline(
             if change.cancel is not None:
                 answer = await disconnect(change.cancel, change.cancel_order)
             else:
-                answer = await _act(change, deployment, load.request_timeout_s)
+                answer = await _act(
+                    change,
+                    deployment,
+                    load.request_timeout_s,
+                    targets.get(change.name),
+                )
             entry.update(answer)
         except Exception as error:  # noqa: BLE001 - recorded as the change's.
             entry["error"] = f"{type(error).__name__}: {error}"
@@ -309,12 +327,17 @@ async def run_timeline(
 
 
 async def _act(
-    change: Change, deployment: ManagedDeployment | None, timeout_s: float
+    change: Change,
+    deployment: ManagedDeployment | None,
+    timeout_s: float,
+    target: tuple[int, str] | None = None,
 ) -> dict[str, Any]:
     """Perform a change's action and return what answered it.
 
-    A failed action raises, or, when it was answered, returns its answer
-    with an ``error``.
+    ``target`` is a signal's process as ``_armed_target`` found it, the pid
+    and its command line, which is signalled while it still runs that
+    command line. A failed action raises, or, when it was answered, returns
+    its answer with an ``error``.
     """
     if change.host is not None:
         return await _signal_on_host(change, timeout_s)
@@ -345,24 +368,9 @@ async def _act(
         return answer
 
     if change.signal is not None:
-        assert change.process is not None
-        pattern = re.compile(change.process)
-        matches = []
-        for pid in deployment.pids():
-            try:
-                arguments = Path(f"/proc/{pid}/cmdline").read_bytes()
-            except OSError:
-                continue
-            joined = arguments.rstrip(b"\0").replace(b"\0", b" ")
-            line = joined.decode(errors="replace")
-            if pattern.search(line):
-                matches.append((pid, line))
-        if len(matches) != 1:
-            raise RuntimeError(
-                f"{len(matches)} processes of the deployment match "
-                f"{change.process!r}: {matches}"
-            )
-        pid, line = matches[0]
+        if target is None or _command_line(target[0]) != target[1]:
+            target = _signal_target(change, deployment)
+        pid, line = target
         os.kill(pid, Signals[change.signal])
         return {"pid": pid, "cmdline": line}
 
@@ -474,6 +482,54 @@ async def _communicate(
             process.kill()
             await process.wait()
     return output or b"", errors or b""
+
+
+def _command_line(pid: int) -> str | None:
+    """Return a process's arguments joined by spaces, if it still runs."""
+    try:
+        arguments = Path(f"/proc/{pid}/cmdline").read_bytes()
+    except OSError:
+        return None
+    return arguments.rstrip(b"\0").replace(b"\0", b" ").decode(errors="replace")
+
+
+def _signal_target(
+    change: Change, deployment: ManagedDeployment
+) -> tuple[int, str]:
+    """Return the one process of the deployment a signal's pattern matches.
+
+    Raises:
+        RuntimeError: If no process or several match.
+    """
+    assert change.process is not None
+    pattern = re.compile(change.process)
+    matches = []
+    for pid in deployment.pids():
+        line = _command_line(pid)
+        if line is not None and pattern.search(line):
+            matches.append((pid, line))
+    if len(matches) != 1:
+        raise RuntimeError(
+            f"{len(matches)} processes of the deployment match "
+            f"{change.process!r}: {matches}"
+        )
+    return matches[0]
+
+
+def _armed_target(
+    change: Change, deployment: ManagedDeployment | None
+) -> tuple[int, str] | None:
+    """Find a signal's process before the load starts, if one matches.
+
+    ``None`` leaves the search to the change's time: no deployment, or a
+    process that does not run yet or is not yet the only match.
+    """
+    if deployment is None:
+        return None
+    try:
+        return _signal_target(change, deployment)
+    except RuntimeError:
+        return None
 
 
 async def _read_events(

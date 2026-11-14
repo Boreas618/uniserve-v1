@@ -25,6 +25,9 @@ The bundle in the output directory contains:
 - `timeline.json`, for a timeline load (`load.duration_s`): the load's clock,
   the changes it applied with their answers and times, and the admin events
   it read (`uniserve_eval.load.timeline`).
+- `scrapes.jsonl`, for a timeline load: every replica's `/metrics`
+  exposition once a second from the load's start until its last stream
+  ended, each with its send and arrival times (`uniserve_eval.load.scrapes`).
 - `summary.json` and `summary.md`: the validated summary, written only on the
   completion path.
 
@@ -52,6 +55,7 @@ import numpy as np
 from ..artifacts import ArtifactWriter
 from ..datasets import load_examples
 from ..load import GpuStorageSampler, WarmupFailure, run_load, run_timeline
+from ..load.scrapes import Scraper
 from ..server import ManagedDeployment
 from ..server_metrics import scrape_metrics, window_summary
 from ..tasks import get_task
@@ -136,6 +140,7 @@ async def run_point(
     phase = "measured"
     metrics_before: dict[str, str | None] = {}
     timeline: dict[str, Any] = {}
+    scraper: Scraper | None = None
 
     # Empty streams and the preparing record make partial failures
     # inspectable with the same artifact names as completed points.
@@ -282,12 +287,19 @@ async def run_point(
                 records.append(record)
                 return record
 
+            # A timeline load also scrapes every replica each second, from
+            # its start until its last stream ended.
+            if point.load.duration_s is not None:
+                scraper = Scraper(session, router.base_urls)
+
             async def snapshot_metrics() -> None:
                 """Scrape every replica before the measured window."""
                 for origin in router.base_urls:
                     metrics_before[origin] = await scrape_metrics(
                         session, origin
                     )
+                if scraper is not None:
+                    scraper.start()
 
             # Sampling spans excluded requests and the measured window.
             sampler = GpuStorageSampler()
@@ -349,6 +361,8 @@ async def run_point(
                     )
             finally:
                 sampler.stop()
+                if scraper is not None:
+                    await scraper.stop()
 
             # Only measured outputs feed metrics; warmup records remain a
             # separate diagnostic stream. The completed load's outputs, in
@@ -439,6 +453,8 @@ async def run_point(
         )
         if point.load.duration_s is not None:
             writer.write_json("timeline.json", timeline)
+        if scraper is not None:
+            writer.write_jsonl("scrapes.jsonl", scraper.entries)
         writer.write_json("summary.json", summary)
         (output_path / "summary.md").write_text(
             render_markdown(summary), encoding="utf-8"
@@ -495,6 +511,8 @@ async def run_point(
             )
             if point.load.duration_s is not None:
                 writer.write_json("timeline.json", timeline)
+            if scraper is not None:
+                writer.write_jsonl("scrapes.jsonl", scraper.entries)
         except Exception as artifact_error:
             failure["artifact_error"] = {
                 "type": type(artifact_error).__name__,

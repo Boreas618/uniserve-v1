@@ -24,6 +24,7 @@ from .pipeline.setup import (
     host_lock,
     prepare_deployment,
 )
+from .pipeline.stops import COUNTER, render_stop_report, stop_report
 from .server import ManagedDeployment
 from .types import BenchmarkPoint
 
@@ -292,6 +293,33 @@ def check_faults(args: argparse.Namespace) -> None:
         raise SystemExit(2)
 
 
+def check_stop(args: argparse.Namespace) -> None:
+    """Check a timeline run that stopped a process against its control.
+
+    Writes `result.md` (into the run's bundle unless `--result` names
+    another path) and prints the report as one JSON line. Exits with status
+    0 when every item of E2's pass holds, 2 when one does not, and 1 when a
+    bundle or a given file cannot be read.
+    """
+    try:
+        report = stop_report(
+            args.run,
+            args.control,
+            headroom_tokens=args.headroom_tokens,
+            counter=args.counter,
+            listing=args.listing,
+            replay=args.replay,
+        )
+    except (OSError, ValueError, KeyError) as error:
+        print(f"uniserve-eval check-stop: {error}", file=sys.stderr)
+        raise SystemExit(1) from error
+    result = args.result or args.run / "result.md"
+    result.write_text(render_stop_report(report), encoding="utf-8")
+    print(json.dumps(report, sort_keys=True))
+    if not report["pass"]:
+        raise SystemExit(2)
+
+
 def _named_path(value: str) -> tuple[str, Path]:
     """Parse `NAME=PATH`, a configuration's control."""
     name, separator, path = value.partition("=")
@@ -378,6 +406,19 @@ def build_parser() -> argparse.ArgumentParser:
     command.add_argument("--replay", type=Path, required=True)
     command.add_argument("--result", type=Path)
     command.set_defaults(function=check_faults)
+
+    # `check-stop` reads two completed timeline bundles, a run that stopped
+    # and continued a process and its control; the listing and the replay
+    # output are reported beside its items.
+    command = subparsers.add_parser("check-stop")
+    command.add_argument("run", type=Path)
+    command.add_argument("--control", type=Path, required=True)
+    command.add_argument("--headroom-tokens", type=int, required=True)
+    command.add_argument("--counter", default=COUNTER)
+    command.add_argument("--listing", type=Path)
+    command.add_argument("--replay", type=Path)
+    command.add_argument("--result", type=Path)
+    command.set_defaults(function=check_stop)
     return parser
 
 

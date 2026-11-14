@@ -1130,6 +1130,9 @@ class RequestRecord:
                 else None
             ),
             "itl_count": len(self.itl),
+            # Each text-bearing event's arrival; on a text stream, `itl` is
+            # the differences of consecutive entries.
+            "text_times": list(self.text_times),
             "chunk_times": list(self.chunk_times),
             "token_ids": list(self.token_ids),
             "token_times": list(self.token_times),
