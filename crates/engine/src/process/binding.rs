@@ -47,7 +47,9 @@
 //!    the schedulers `Resize` their regions below the first unit of segment `k`; the head sends
 //!    `Withdraw` for each segment from `k` on, which takes its units out of the space's free
 //!    ranges; then [`WeightBinding::release_segments`]: every rank of the region unmaps them and
-//!    ends its retention, and the GPU's quota usage drops with the last rank.
+//!    ends its retention, and the GPU's quota usage drops with the last rank. A start whose ranks
+//!    are warm releases so the tail segments its quotas no longer hold beside the warm processes,
+//!    as many as [`WeightBinding::warm_segments`] leaves, before its regions hold any unit.
 //! 2. **Create given-back segments**, for a region to grow past the space's free ranges, as many
 //!    as [`WeightBinding::fitting_segments`] finds room for: [`WeightBinding::create_segments`]:
 //!    every rank of the region creates them again at their addresses and resets their units; the
@@ -476,6 +478,27 @@ fn room_of(rank: &Rank) -> Result<Room> {
     let free = rank.device.memory_info()?.free;
 
     Ok(Room::of(&quota, free, rank.client.epoch()))
+}
+
+/// The segments of `table` a warm rank keeps: those it holds from the first, less the fewest at
+/// the tail whose bytes (`unit_bytes` a unit) cover `excess`, the bytes by which its GPU's quota
+/// would pass its limit once the rank reserves its warm process (`division::excess`). Only the
+/// segments epoch `epoch` created are given back: a segment another epoch created and the rank
+/// maps stays that epoch's storage, and giving it back would free nothing of the quota.
+fn kept_beside(table: &CacheTable, unit_bytes: u64, epoch: u64, excess: u64) -> u32 {
+    let mut kept = table.held;
+    let mut freed: u64 = 0;
+    while freed < excess && kept > 0 {
+        let Some(segment) = table.segments.get(kept as usize - 1) else {
+            break;
+        };
+        if segment.epoch != epoch {
+            break;
+        }
+        freed = freed.saturating_add(u64::from(segment.units).saturating_mul(unit_bytes));
+        kept -= 1;
+    }
+    kept
 }
 
 /// What `cache`'s planes are made of and how many of their segments exist; none for planes that
@@ -1700,6 +1723,89 @@ impl WeightBinding {
         Ok(fitting)
     }
 
+    /// How many of the segments the ranks of the worker groups `groups` hold, counted from the
+    /// first, every such rank, the peers' included, holds beside its warm process in its GPU's
+    /// quota: what a start keeps, once its ranks are warm, of the segments it created before its
+    /// warm-up (`crate::process::epoch::keep_warm_segments`). None when no rank of the groups
+    /// splits its planes.
+    ///
+    /// # Errors
+    ///
+    /// When a rank's process, quota or segments cannot be read, here or on a peer's host.
+    pub(crate) fn warm_segments(&self, groups: &[GroupId]) -> Result<Option<u32>> {
+        let answers = self.ask_peers(Some(groups), || DataOperation::WarmSegments {
+            groups: groups.to_vec(),
+        })?;
+        let here = self.warm_here(groups);
+        let (here, peers) = both(here, answered::<Option<u32>>(answers))?;
+        Ok(peers.into_iter().chain([here]).flatten().min())
+    }
+
+    /// [`Self::warm_segments`] over this process's ranks of `groups`. Each rank measures its
+    /// process as [`Self::reserve_serving`] does, once its worker has passed every job before it,
+    /// and keeps the segments it holds as far as its quota holds them beside that process
+    /// ([`kept_beside`]). None when none of them splits its planes.
+    ///
+    /// # Errors
+    ///
+    /// When NVML cannot state a rank's process, or its quota cannot be read.
+    pub(crate) fn warm_here(&self, groups: &[GroupId]) -> Result<Option<u32>> {
+        // A process that holds no rank of the groups measures nothing.
+        if !self.ranks.iter().any(|rank| lock(rank).of(groups)) {
+            return Ok(None);
+        }
+        let nvml = Arc::new(Nvml::init()?);
+        let kept = self.each_of(
+            Some(groups),
+            "measuring the warm process beside the KV planes",
+            |_, rank| {
+                let nvml = Arc::clone(&nvml);
+                let graphs = Arc::clone(&rank.graphs);
+                let cache = rank.cache.as_ref().map(Arc::clone);
+                let client = Arc::clone(&rank.client);
+                let (device, unattributed) = (rank.device, rank.unattributed);
+
+                Box::new(move |_: &mut [Box<dyn Runner>]| {
+                    let Some(cache) = cache else {
+                        return Ok(None);
+                    };
+                    let (table, unit_bytes) = {
+                        let cache = lock(&cache);
+                        (segment_table(&cache), cache.unit_bytes())
+                    };
+                    let Some(table) = table else {
+                        return Ok(None);
+                    };
+
+                    // The process as its reservation will state it, and by how much the quota's
+                    // reservations would pass its limit with it.
+                    let pools = lock(&graphs).mapped();
+                    let process = process_bytes(&nvml, device, pools, unattributed)?;
+                    let (quota, _) = client.usage(device)?;
+                    let scope = client
+                        .scope()
+                        .ok_or(Error::State("the rank's client holds no quota of its GPU"))?;
+                    let epoch = client.epoch();
+                    let excess = division::excess(&quota, scope, epoch, process)?;
+
+                    let kept = kept_beside(&table, unit_bytes, epoch, excess);
+                    if kept < table.held {
+                        tracing::info!(
+                            device = device.0,
+                            process,
+                            excess,
+                            held = table.held,
+                            kept,
+                            "the warm process leaves the GPU's quota fewer of the cache's segments"
+                        );
+                    }
+                    Ok(Some(kept))
+                })
+            },
+        )?;
+        Ok(kept.into_iter().flatten().min())
+    }
+
     /// The room of the device of every rank of the worker groups `groups` whose KV planes are
     /// split, the peers' after this process's: its GPU's identity, its room, and the device bytes
     /// one unit of its planes takes, which a release of a unit gives back to the quota and the
@@ -2331,6 +2437,56 @@ mod tests {
             ..idle
         };
         assert_eq!(Room::of(&unlimited, 8 * GIB, 1).quota, 8 * GIB);
+    }
+
+    /// A warm rank keeps the segments its quota holds beside its warm process: it gives back the
+    /// fewest of its own at the tail whose bytes cover the excess, and never a segment another
+    /// epoch created, whose storage stays that epoch's and frees nothing of the quota.
+    #[test]
+    fn a_warm_rank_gives_back_the_fewest_tail_segments_that_cover_its_excess() {
+        const UNIT: u64 = 1 << 20;
+        let segment = 16 * UNIT;
+
+        // Nothing past the limit: every held segment stays.
+        assert_eq!(kept_beside(&table(3), UNIT, 1, 0), 3);
+        // A byte past the limit takes a whole segment back, and a segment's bytes exactly one.
+        assert_eq!(kept_beside(&table(3), UNIT, 1, 1), 2);
+        assert_eq!(kept_beside(&table(3), UNIT, 1, segment), 2);
+        assert_eq!(kept_beside(&table(3), UNIT, 1, segment + 1), 1);
+        // A segment given back already is not given back again.
+        assert_eq!(kept_beside(&table(2), UNIT, 1, segment + 1), 0);
+        // Segments another epoch created stay, whatever the excess.
+        assert_eq!(kept_beside(&table(3), UNIT, 2, 3 * segment), 3);
+    }
+
+    /// The ranks of a region keep, once warm, the fewest segments any of them, a peer's included,
+    /// holds beside its warm process; a peer whose ranks split no plane states none.
+    #[test]
+    fn a_warm_region_keeps_the_fewest_segments_any_rank_holds_beside_its_process() {
+        const PREFILL: GroupId = GroupId(0);
+        const DECODE: GroupId = GroupId(1);
+        let kept = |kept: Option<u32>| {
+            move |operation: &DataOperation| match operation {
+                DataOperation::WarmSegments { .. } => json(&kept),
+                other => panic!("the peer was sent {other:?}"),
+            }
+        };
+
+        let operated = over(
+            vec![
+                peer(1, vec![PREFILL], kept(None)),
+                peer(2, vec![PREFILL, DECODE], kept(Some(40))),
+                peer(3, vec![DECODE], kept(Some(38))),
+            ],
+            |binding| {
+                assert_eq!(binding.warm_segments(&[PREFILL]).unwrap(), Some(40));
+                assert_eq!(binding.warm_segments(&[DECODE]).unwrap(), Some(38));
+            },
+        );
+
+        // Each region asked only the peers that hold its ranks.
+        let asked: Vec<usize> = operated.iter().map(Vec::len).collect();
+        assert_eq!(asked, [1, 2, 1]);
     }
 
     #[test]

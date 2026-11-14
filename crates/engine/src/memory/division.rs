@@ -70,13 +70,15 @@
 //!
 //! The pools reserve what they map as [`storage::Item::GraphPool`] ([`super::graph_pool`]).
 //! The division measures the process before the warm-up, which adds instantiated graphs and the
-//! libraries' state to it, so what fills a share last is committed once the rank is warm, from
-//! [`process_bytes`] measured again: a media rank keeps the request slots whose storages fit
-//! beside its warm process ([`excess`]) and gives the storages of the rest back; the rank
-//! reserves [`storage::Item::Process`] at that figure, with whatever a profiling session's
-//! collectors hold, through [`StorageClient::reserve`](super::client::StorageClient::reserve);
-//! and only then does a text rank create the segments of its cache the quota holds beside it.
-//! The growth is measured, never estimated.
+//! libraries' state to it. A text rank creates its cache's segments the quota holds now before
+//! the warm-up, whose growth lies outside the quota meanwhile, and what fills a share last is
+//! settled once the rank is warm, from [`process_bytes`] measured again: a media rank keeps the
+//! request slots whose storages fit beside its warm process ([`excess`]) and gives the storages
+//! of the rest back; a text rank gives back the tail segments of its cache whose bytes cover the
+//! same excess; then the rank reserves [`storage::Item::Process`] at that figure, with whatever a
+//! profiling session's collectors hold, through
+//! [`StorageClient::reserve`](super::client::StorageClient::reserve). The growth is measured,
+//! never estimated.
 //!
 //! A region is sized by the profile run of the generation that serves. A generation whose
 //! forwards allocate more than the region holds is refused at its capture by the context's

@@ -260,6 +260,9 @@ pub enum DataOperation {
     FittingSegments { groups: Vec<GroupId> },
     /// Answers the room of the device of every rank of `groups` whose planes are split.
     DeviceRooms { groups: Vec<GroupId> },
+    /// Answers how many of the segments the ranks of `groups` hold every such rank holds beside
+    /// its warm process in its GPU's quota; none when no such rank splits its planes.
+    WarmSegments { groups: Vec<GroupId> },
     /// Answers the room every device has for a load.
     Room,
     /// Answers the bytes the graph pools map on the device that maps the fewest; none for a

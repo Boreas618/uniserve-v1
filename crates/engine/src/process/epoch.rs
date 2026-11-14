@@ -192,9 +192,10 @@ pub(crate) fn grow(
 
 /// The ranks' side of a grow ([`grow`]) and of a warm start: the ranks of each region of the KV
 /// planes create as many of the segments they gave back as their quotas and devices have room
-/// for, and the head grants them. A start creates its regions' first segments before its warm-up
-/// and the rest here once its ranks reserved their warm processes (`specs/engine-worker-port.md`
-/// §1, "The process a division counts").
+/// for, and the head grants them. A start creates its regions' segments before its warm-up, as
+/// far as its quotas held them then, and gives back once warm what no longer fits beside the warm
+/// processes ([`keep_warm_segments`]), so what it creates here is what a predecessor's drain
+/// freed meanwhile (`specs/engine-worker-port.md` §1, "The process a division counts").
 ///
 /// `capacity` is the tokens a deployment states its cache holds (`kv_cache_config.max_tokens`)
 /// when a start creates its regions: such a region is created whole, and refused, naming the
@@ -238,6 +239,66 @@ pub(crate) fn create_fitting(
             region = %name,
             granted,
             "the ranks created the segments their quotas hold and the head granted them"
+        );
+    }
+    Ok(())
+}
+
+/// Gives back, once a start's ranks are warm, the tail segments of each region of the KV planes
+/// that their GPUs' quotas no longer hold beside their warm processes
+/// (`specs/engine-worker-port.md` §1, "The process a division counts"). The start created, before
+/// its warm-up, every whole segment its quotas held then beside the processes measured before it;
+/// the warm-up's instantiated graphs and library state lay outside the quotas meanwhile. Each
+/// region keeps the segments from the first that every rank of it, the peers' included, holds
+/// beside its warm process (`WeightBinding::warm_segments`); the head withdraws the rest from the
+/// region's space, the last first, and the ranks give them back, so each rank's warm process then
+/// fits its quota and is reserved (`WeightBinding::reserve_serving`). A stated capacity that gave
+/// a segment back here is refused by name when the ranks create what fits ([`create_fitting`]).
+///
+/// The session's regions hold no unit yet (the schedulers resize them after), so no withdrawal is
+/// refused for a held block.
+///
+/// # Errors
+///
+/// A rank's failure to measure its process or to give segments back, or the Storage Server's
+/// refusal of a withdrawal.
+pub(crate) fn keep_warm_segments(head: &mut StorageClient, binding: &WeightBinding) -> Result<()> {
+    let (open, _) = session(head)?;
+    let regions: Vec<(usize, String, Vec<GroupId>)> = kv_regions(open)
+        .into_iter()
+        .map(|index| {
+            let name = open
+                .regions
+                .get(index)
+                .map(|region| region.name.clone())
+                .unwrap_or_default();
+            (index, name, groups_of(open, index))
+        })
+        .collect();
+
+    for (index, name, groups) in regions {
+        let Some(kept) = binding.warm_segments(&groups)? else {
+            continue;
+        };
+        let granted = session(head)?.1.segments.get(index).map_or(0, Vec::len);
+        let kept = usize::try_from(kept).unwrap_or(usize::MAX);
+        if kept >= granted {
+            continue;
+        }
+
+        let (from, withdrawn) = withdraw_from(head, index, kept);
+        withdrawn.with_context(|| {
+            format!(
+                "withdrawing the segments of KV region {name} the quotas no longer hold beside \
+                 the warm processes"
+            )
+        })?;
+        binding.release_segments(&groups, u32::try_from(from).unwrap_or(u32::MAX))?;
+        tracing::info!(
+            region = %name,
+            kept = from,
+            given_back = granted - from,
+            "the warm ranks gave back the segments their quotas no longer hold beside them"
         );
     }
     Ok(())

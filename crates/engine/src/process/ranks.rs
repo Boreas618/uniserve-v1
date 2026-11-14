@@ -12,19 +12,20 @@
 //!    session with it, and the answer numbers each region as the buffer pool holds it: a region
 //!    an earlier session named keeps that session's numbering, which the ranks then take.
 //! 3. [`open_ranks`] maps on every rank the segments the answer's table states for its region,
-//!    creates past them the first segments of the region's units, those that hold the fewest
-//!    units the warm-up reads, as far as the GPU's quota held them at the division, resolves into
-//!    the rank's generation the kernels its cache and recurrent state launch over the region's
-//!    numbering, and opens the graph pool, the cache over those segments, the recurrent state,
-//!    the scratch pages and the serving runner. It returns the segments it created, which the
-//!    head grants.
+//!    creates past them the whole segments of the region's units the GPU's quota held free at the
+//!    division (none on a standby), resolves into the rank's generation the kernels its cache and
+//!    recurrent state launch over the region's numbering, and opens the graph pool, the cache over
+//!    those segments, the recurrent state, the scratch pages and the serving runner. It returns
+//!    the segments it created, which the head grants.
 //! 4. [`bind`] binds every rank to the regions the answer numbered, [`spawn`] spawns the
-//!    workers over the ranks' runners, which warm up; [`keep_warm_slots`] keeps the request
-//!    slots of each media group whose storages fit beside its ranks' warm processes; once every
-//!    warm process is reserved, the ranks create the segments their quotas then hold, which the
-//!    head grants (`crate::process::epoch::create_fitting`), and the schedulers grow their
-//!    regions into them by `Resize`; [`capacities`] states what each worker group's ranks
-//!    serve.
+//!    workers over the ranks' runners, which warm up beside the storage created before them;
+//!    [`keep_warm_slots`] keeps the request slots of each media group whose storages fit beside
+//!    its ranks' warm processes; the ranks of each KV region give back the tail segments their
+//!    quotas no longer hold beside their warm processes
+//!    (`crate::process::epoch::keep_warm_segments`) and reserve those processes; a region beside
+//!    a draining predecessor creates what its quota then holds
+//!    (`crate::process::epoch::create_fitting`), and the schedulers grow their regions into the
+//!    granted segments by `Resize`; [`capacities`] states what each worker group's ranks serve.
 //!
 //! A rank that encodes images (`ModelRunner::encodes_images`) also profiles its vision runner at
 //! its load, and its division sizes the runner's region, its region of encoder outputs and its
@@ -106,6 +107,7 @@ use crate::process::ranks::rank::video::{
     MediaRank, VideoRank, boxed, group_phases, held_kinds, latent_pages, product_classes,
     product_kind, product_ranks, served_phases, slot_pages,
 };
+use crate::process::start::standby;
 
 /// The number of the generation a start serves: its kernels on a device, none on the meta device.
 /// A start is not an update (`specs/updates.md` §2): nothing is kept beside it.
@@ -198,10 +200,11 @@ pub(crate) struct TextRank {
     /// holds it, which an earlier epoch of the layout may have stated ([`open_ranks`]).
     pub(crate) units: u32,
     /// The units of `units` the rank's start creates segments for before its warm-up, which
-    /// every rank of its host group agreed: the first whole segments, those that hold the fewest
-    /// units the warm-up reads, as far as the GPU's quota held them at the division. The rest are
-    /// created once the rank is warm, as far as its quota then holds them beside its warm
-    /// process, and by a grow as an epoch the rank's succeeds gives its memory back.
+    /// every rank of its host group agreed: the whole segments from the first that the GPU's
+    /// quota held free at the division, beside the process measured before the warm-up. Once the
+    /// rank is warm it gives back those its quota no longer holds beside its warm process; the
+    /// rest of the numbering is created by a grow as an epoch the rank's succeeds gives its
+    /// memory back.
     pub(crate) first: u32,
     /// What the profile run states of the rank's runner, which its pools are sized by.
     pub(crate) peaks: Peaks,
@@ -2270,9 +2273,10 @@ fn product_buffer(layout: &Open, rank: &LoadedRank) -> Result<u8> {
 /// own (steps 16-22):
 ///
 /// - the segments of the rank's KV region: the table's, which the rank maps where their epoch
-///   created them, then those its epoch creates before the warm-up, the first segments of the
-///   region's units, which hold the fewest units the warm-up reads ([`plane_segments`],
-///   `ModelRunner::divide`); the rest stay given back until the rank is warm;
+///   created them, then those its epoch creates before the warm-up, the whole segments of the
+///   region's units the quota held free at the division ([`plane_segments`],
+///   `ModelRunner::divide`), none on a standby, which commits nothing at its start; the rest stay
+///   given back until a grow creates them;
 /// - the kernels its cache and its recurrent state launch over the region's numbering that the
 ///   generation it serves lacks, which `resolve` resolves into that generation, as the load
 ///   resolved its profile run's: a state copy's key carries the cache's units, which the profile
@@ -2452,16 +2456,21 @@ fn open_rank(
     // Step 16: the segments of the region the table states, mapped, and the rest, created as
     // far as the quota held them at the division. A segment's every part is whole granules of
     // the device's allocations; the meta device allocates nothing, and each unit is a whole
-    // granule of it.
+    // granule of it. A standby maps its epoch's table and commits nothing until it is promoted.
     let (segments, created) = match region {
         Some((_, table)) => {
             let granularity = match client {
                 Some(_) => granularity(device)?,
                 None => layout.plane_bytes,
             };
+            let held = if standby(model_runner.launch()) {
+                0
+            } else {
+                rank.first
+            };
             let (segments, created) = plane_segments(
                 model_runner.launch().epoch,
-                (units, rank.first),
+                (units, held),
                 &layout,
                 granularity,
                 table,

@@ -159,6 +159,9 @@ fn operations() -> Vec<DataOperation> {
         DataOperation::FittingSegments {
             groups: groups.clone(),
         },
+        DataOperation::WarmSegments {
+            groups: groups.clone(),
+        },
         DataOperation::DeviceRooms { groups },
         DataOperation::Room,
         DataOperation::GraphBytes,

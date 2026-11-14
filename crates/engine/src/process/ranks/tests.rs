@@ -1320,8 +1320,8 @@ fn checkpoint_bytes(directory: &str) -> u64 {
 /// run sizes its pools, and its division of a GB200's quota at 0.70 holds every reservation the
 /// Storage Server admits it with: the weights, the cache's 131072 tokens in whole segments, the
 /// graph pool, the scratch pool of the shadow region and the scratch page set, and the warm
-/// process with its 128 request slots. Its start creates the cache's first segment before its
-/// warm-up and the rest once its warm process is reserved.
+/// process with its 128 request slots. Its start creates the stated capacity whole before its
+/// warm-up.
 #[test]
 #[ignore = "reads the headers of the released Qwen3-30B-A3B checkpoint, which the repository does not hold"]
 fn the_e1_deployment_starts_within_its_gpu_s_quota_at_a_fraction_of_0_70() {
@@ -1392,18 +1392,16 @@ fn the_e1_deployment_starts_within_its_gpu_s_quota_at_a_fraction_of_0_70() {
     assert_eq!(slots, 128);
     assert!(units >= 2048, "the cache holds {units} units");
 
-    // The start creates the cache's first segment before its warm-up, which holds the fewest
-    // units the warm-up reads; the rest of the stated capacity is created once the rank is warm,
-    // beside the warm process the reservations below count.
+    // The start creates the stated capacity whole before its warm-up: the quota holds it beside
+    // the warm process the reservations below count.
     let (_, segment) =
         crate::memory::cache::segments::segment_layout(units, layout.plane_bytes, GB200_GRANULE)
             .unwrap();
-    assert_eq!(first, segment);
+    assert_eq!(first, units);
 
     // A segment is one granule of each column's allocation: 32 units of the 64 KiB pages of four
     // heads of 128 BF16 elements, so a region holds what the quota holds to within 32 units.
     assert_eq!(u64::from(segment) * layout.plane_bytes, GB200_GRANULE);
-    assert!(first >= crate::process::ranks::rank::memory::fewest_units(&layout));
 
     // Every reservation the Storage Server admits the rank with, and what the quota leaves. The
     // warm process holds the request slots' storages, which are counted a second time here, as

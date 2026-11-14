@@ -544,6 +544,7 @@ fn operate(
         Operation::SegmentTables { groups } => encoded(&binding.segment_tables(&groups)?),
         Operation::FittingSegments { groups } => encoded(&binding.fitting_here(&groups)?),
         Operation::DeviceRooms { groups } => encoded(&binding.device_rooms(&groups)?),
+        Operation::WarmSegments { groups } => encoded(&binding.warm_here(&groups)?),
         Operation::Room => encoded(&binding.room()?),
         Operation::GraphBytes => encoded(&binding.graph_bytes_here()),
         Operation::Sleep => encoded(&binding.sleep()?),

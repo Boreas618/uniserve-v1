@@ -15,16 +15,20 @@
 //! 1. the ranks load to the division of their GPUs' quotas, measuring their processes before any
 //!    warm-up, and resolve the kernels their profile runs name into the generation they serve;
 //! 2. the head opens the session stating each region's units with no segment;
-//! 3. every rank maps the segments the answer states and creates the first segments of its KV
-//!    region, those that hold the fewest units the warm-up reads, and its generation takes the
-//!    kernels its cache and recurrent state launch over the region's numbering;
-//! 4. the workers are spawned and warm, and the head grants the created segments;
-//! 5. what fills each share last is committed from the warm processes, measured, never estimated
+//! 3. every rank maps the segments the answer states and creates the segments of its KV region
+//!    its GPU's quota holds free now, beside its process measured before the warm-up, and its
+//!    generation takes the kernels its cache and recurrent state launch over the region's
+//!    numbering;
+//! 4. the workers are spawned and warm, their growth lying outside the quotas meanwhile, and the
+//!    head grants the created segments;
+//! 5. what fills each share last is settled from the warm processes, measured, never estimated
 //!    (`specs/engine-worker-port.md` §1, "The process a division counts"): each media group keeps
 //!    the request slots whose storages fit beside its ranks' warm processes and gives the rest
-//!    back, every rank reserves its warm process in its GPU's quota, and the ranks of each KV
-//!    region create the segments their quotas then hold, which the head grants; a stated
-//!    capacity (`kv_cache_config.max_tokens`) is created whole or refused by name;
+//!    back, the ranks of each KV region give back the tail segments their quotas no longer hold
+//!    beside their warm processes, every rank reserves its warm process in its GPU's quota, and a
+//!    region beside a draining predecessor creates what its quota then holds, which the head
+//!    grants; a stated capacity (`kv_cache_config.max_tokens`) is created whole before the
+//!    warm-up and refused by name when it does not fit beside the warm processes;
 //! 6. the schedulers are built over the workers, and each grows its KV regions into the granted
 //!    segments and resizes the regions of a media group to the slots it kept.
 //!
@@ -640,13 +644,15 @@ pub(crate) fn start(
         }
     }
 
-    // What fills each share last, committed from the warm processes: the slots a media group
-    // keeps, each rank's warm process in its GPU's quota, and the segments of each KV region the
-    // quotas then hold, here and on every peer. A standby commits nothing until it is promoted.
-    // A peer kept its media groups' slots before it answered.
+    // What fills each share last, settled from the warm processes: the slots a media group
+    // keeps, the segments of each KV region the quotas hold beside the warm processes, each
+    // rank's warm process in its GPU's quota, and what a predecessor's drain freed meanwhile,
+    // here and on every peer. A standby commits nothing until it is promoted. A peer kept its
+    // media groups' slots before it answered.
     let binding = weight_binding(launch, &model_runner, &ranks, &workers, remotes.clone())?;
     if !standby(launch) {
         keep_warm_slots(&mut ranks)?;
+        epoch::keep_warm_segments(&mut head, &binding)?;
         binding
             .reserve_serving()
             .context("reserving the warm processes in their GPUs' quotas")?;
@@ -995,7 +1001,7 @@ fn lowered(
 /// own epoch (a switch's target succeeds another epoch's), whose regions it maps and whose
 /// reservations in the GPUs' quotas the Storage Server keeps for the process that replaces it.
 /// It reserves its warm process and grows its regions once it is promoted.
-fn standby(launch: &EngineArgs) -> bool {
+pub(super) fn standby(launch: &EngineArgs) -> bool {
     launch
         .predecessor
         .as_ref()
@@ -1004,10 +1010,26 @@ fn standby(launch: &EngineArgs) -> bool {
 
 /// Captures every bucket of every worker's runners, all at once, and waits for each.
 ///
+/// The start creates its storage before the warm-up, as much of each GPU's quota as holds it, so
+/// what the warm-up adds to a process (instantiated graphs, the libraries' state) lies in the
+/// device's memory outside the quota until the start gives back what no longer fits beside the
+/// warm process (`epoch::keep_warm_segments`). Where other deployments' storage or other
+/// processes hold that memory, a warm-up allocation fails, and so does the start: the failure
+/// names the bytes the device had free as the warm-up began.
+///
 /// # Errors
 ///
 /// The first worker whose warm-up failed or was cancelled.
 fn warm_up(workers: &[Arc<Worker>]) -> Result<()> {
+    // What each worker's device has free as the warm-up begins: the room its growth has.
+    let free: Vec<Option<(i32, u64)>> = workers
+        .iter()
+        .map(|worker| {
+            let device = worker.device()?;
+            let free = device.memory_info().ok()?.free;
+            Some((device.0, free))
+        })
+        .collect();
     let submissions = workers
         .iter()
         .map(|worker| worker.warm_up())
@@ -1016,7 +1038,14 @@ fn warm_up(workers: &[Arc<Worker>]) -> Result<()> {
     for (index, submission) in submissions.into_iter().enumerate() {
         match submission.wait() {
             Outcome::Success(_) => {}
-            Outcome::Failed(fault) => bail!("rank {index}'s warm-up failed: {fault}"),
+            Outcome::Failed(fault) => match free.get(index).copied().flatten() {
+                Some((device, free)) => bail!(
+                    "rank {index}'s warm-up failed: {fault}; the warm-up grows the process beside \
+                     the storage the deployment's quota holds, into device {device}'s memory \
+                     outside the quota, of which {free} bytes were free as it began"
+                ),
+                None => bail!("rank {index}'s warm-up failed: {fault}"),
+            },
             Outcome::Cancelled => bail!("rank {index}'s warm-up was cancelled"),
         }
     }
