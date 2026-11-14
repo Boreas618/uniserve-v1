@@ -820,6 +820,7 @@ impl Scheduler {
         };
 
         if self.running.len() > 1 || !self.waiting.is_empty() {
+            self.trace_starved(id, now);
             let terminal = self.finished(id, FinishReason::Error, None);
             self.finish(id, terminal);
         } else {
@@ -829,6 +830,38 @@ impl Scheduler {
                 self.step
             )));
         }
+    }
+
+    /// States why the starvation bound ends running request `id` at `now`: how long it made no
+    /// progress, the call it waits to make, the blocks it asks for ahead of it and whether the
+    /// blocks it holds cover that call, the units of a region it waits to see since a shortage
+    /// with the region's `available` and `retiring` words, and its tables' counts. What the
+    /// request's end with `FinishReason::Error` states nothing more of.
+    fn trace_starved(&self, id: RequestId, now: Instant) {
+        let Some(request) = self.requests.get(&id) else {
+            return;
+        };
+        let call = self.next_call(request);
+        let holds = call.map(|(phase, start, end)| {
+            self.holds_blocks_for(request, phase, end.saturating_sub(start))
+        });
+        let short = self.short.get(&id).map(|&(region, units)| {
+            let available = self.available.get(region).copied().unwrap_or(0);
+            let retiring = self.retiring.get(region).copied().unwrap_or(0);
+            (region, units, available, retiring)
+        });
+        tracing::warn!(
+            request = id.0,
+            idle_ms = now.saturating_duration_since(request.last_progress).as_millis() as u64,
+            computed = request.num_computed_tokens,
+            drafts = request.num_draft_tokens,
+            ?call,
+            ?holds,
+            ahead = ?self.ahead(request),
+            ?short,
+            blocks = ?request.blocks,
+            "the starvation bound ends a running request that made no progress"
+        );
     }
 
     /// Traces the step that ran at `now` ([`STEPS`]), when it asked the policy, ended an
@@ -1284,9 +1317,10 @@ impl Scheduler {
     /// beyond the region's `available`, less the region's retiring units, which come back once
     /// the batches that may read them end, are relieved in this order until covered: draft
     /// tables of idle requests, admissions under way, the policy's victims (a running request
-    /// ends as migratable, an unpinned cached block or encoder output is evicted by key); and
-    /// when the policy named no request and every running token request is short, the latest of
-    /// the lowest priority is preempted. The request then waits for the region's `available`
+    /// ends as migratable, an unpinned cached block or encoder output that lies in the region is
+    /// evicted by key); and when the policy named no request and every running token request is
+    /// short, the latest of the lowest priority is preempted. A short state region, one
+    /// checkpoint a unit, is stated to the policy as `StateUnits`, which no page relieves. The request then waits for the region's `available`
     /// word to show the units it needs, and asks again; until its blocks arrive it is not
     /// scheduled.
     pub(super) fn preempt(&mut self, id: RequestId, region: u8) {
@@ -1318,8 +1352,14 @@ impl Scheduler {
             return self.wait_for_available(id, region);
         }
 
+        // A checkpoint held by a running request is freed only by that request's end.
+        let kind = if self.state_region(region) {
+            Storage::StateUnits
+        } else {
+            Storage::KvUnits
+        };
         let shortage = Shortage {
-            kind: Storage::KvUnits,
+            kind,
             need: u64::from(need),
         };
         let victims = match self.policy.preempt(&shortage) {
@@ -1343,10 +1383,12 @@ impl Scheduler {
                     }
                 }
                 // A cached block or encoder output no request of this scheduler holds, found by
-                // its id in `cache`; an id that names nothing is skipped.
+                // its id in `cache`, whose eviction frees units of the short region; an id that
+                // names nothing is skipped.
                 Victim::Page(PageId(page)) | Victim::Encoding(EncodingId(page)) => {
                     if self.cache_unpinned(page)
                         && let Some(row) = self.cache.get(&page)
+                        && self.class_lies_in(row.class, region)
                     {
                         evict.push(row.key);
                     }
@@ -1364,6 +1406,21 @@ impl Scheduler {
         if self.is_running(id) {
             self.wait_for_available(id, region);
         }
+    }
+
+    /// Whether `class`'s blocks lie in `region` (an index) on this scheduler's side.
+    fn class_lies_in(&self, class: u8, region: usize) -> bool {
+        self.classes_in(region).any(|held| held == class)
+    }
+
+    /// Whether `region` (an index) is a state region: the region of the recurrent-state class,
+    /// whose live state is in the slot and whose every unit is one checkpoint.
+    fn state_region(&self, region: usize) -> bool {
+        self.classes_in(region).any(|class| {
+            self.classes
+                .get(usize::from(class))
+                .is_some_and(|stated| stated.state_in_slot)
+        })
     }
 
     /// Whether running request `id` can never fit in `region`: the units it holds there and the

@@ -68,7 +68,7 @@ use crate::executor::Route;
 use crate::executor::peers::Remote;
 use crate::memory::allocation::Storage;
 use crate::memory::buffers::{BufferMemory, UNIT_BYTES};
-use crate::memory::cache::{CacheLayout, CacheRegions, KvCacheMemory, host};
+use crate::memory::cache::{CacheLayout, CacheRegions, GroupLayout, KvCacheMemory, host};
 use crate::memory::client::{StorageClient, unit_runs};
 use crate::memory::division;
 use crate::memory::encoders;
@@ -99,7 +99,7 @@ use storage::runtime::{Class, Group, GroupId, Open, Opened, Region, Segments, Ti
 use self::rank::{Collective, ModelRunner, RankModel, Weights, media_tasks, parallel_order};
 use crate::process::binding::{self, Served};
 use crate::process::ranks::rank::memory::{
-    Peaks, fewest_units, granularity, plane_segments, scratch_bytes,
+    Peaks, fewest_states, fewest_units, granularity, plane_segments, scratch_bytes,
 };
 use crate::process::ranks::rank::text::{
     Keys, encoder_class, encodes, feature_tensors, keys, profile, vision_runner,
@@ -207,6 +207,10 @@ pub(crate) struct TextRank {
     /// rest of the numbering is created by a grow as an epoch the rank's succeeds gives its
     /// memory back.
     pub(crate) first: u32,
+    /// For a model that keeps a recurrent state, the units of the rank's state region and those
+    /// of them its start creates before its warm-up, as `units` and `first` are the cache's
+    /// (`specs/engine-worker-port.md` §1.6); `(0, 0)` for a model that keeps none.
+    pub(crate) states: (u32, u32),
     /// What the profile run states of the rank's runner, which its pools are sized by.
     pub(crate) peaks: Peaks,
     /// What the profile run states of the rank's vision runner (`RunnerId(1)`), on a rank that
@@ -714,12 +718,14 @@ fn load_rank(
         Backing::Serving { storage, kernels } => (storage, kernels),
         Backing::Meta => {
             // The meta device allocates nothing, so each unit is a whole granule of it: its cache
-            // is the fewest units it serves with, each unit a segment.
+            // is the fewest units it serves with, each unit a segment, and its state region the
+            // fewest checkpoints.
             let units = crate::memory::cache::segments::segmented_units_above(
                 least,
                 layout.plane_bytes,
                 layout.plane_bytes,
             );
+            let states = fewest_states(&layout);
             return Ok(LoadedRank {
                 model_runner,
                 client: None,
@@ -733,6 +739,7 @@ fn load_rank(
                     model: meta,
                     units,
                     first: units,
+                    states: (states, states),
                     peaks,
                     vision,
                     group,
@@ -773,7 +780,7 @@ fn load_rank(
         let features = CausalLmRunner::image_bytes(&meta_config, model.as_ref())?;
         regions.push(("image features", features));
     }
-    let (slots, units, first) =
+    let (slots, (units, first), states) =
         model_runner.divide(&client, device, &host, model.as_ref(), &layout, &regions)?;
 
     // A rank whose share holds fewer slots than the deployment runs serves with those: the
@@ -793,6 +800,8 @@ fn load_rank(
         slots,
         units,
         first,
+        states = states.0,
+        first_states = states.1,
         storage = %storage.socket,
         "the rank loaded its model and divided its device's quota"
     );
@@ -809,6 +818,7 @@ fn load_rank(
             model,
             units,
             first,
+            states,
             peaks,
             vision,
             group,
@@ -849,6 +859,7 @@ fn meta_owners(
         Arc::clone(layout),
         least,
         None,
+        (fewest_states(layout), None),
     ))?));
     let state = match model_runner.state_config(model, model_runner.buckets()) {
         Some(state) => Some(Arc::new(Mutex::new(StateMemory::meta(
@@ -1270,7 +1281,10 @@ fn units_region(
 ) -> Result<String> {
     let mut digest = storage::key::Digest::new(b"uniserve.units-region");
     digest.text(&config.layout_hash());
-    for group in 0..layout.groups.len() {
+    for (group, _) in (0..)
+        .zip(&layout.groups)
+        .filter(|(_, group)| !group.state())
+    {
         let shape = host::page_shape(layout, group)?;
         digest.bytes(&shape.layout.0);
     }
@@ -1281,6 +1295,27 @@ fn units_region(
     ]);
     let digest = digest.finish();
     Ok(format!("kv {scheduler} {}", short(&digest)))
+}
+
+/// The name of the device region of scheduler `scheduler`'s state units of `layout` (one
+/// checkpoint each), for an epoch of `config`, by the rule of [`units_region`]: the epoch's layout
+/// and what lays a unit out (the state page's layout digest, which states its checkpoint planes,
+/// and the planes' bytes), never how many units there are (`specs/buffer-pool.md` §14.1). `None`
+/// for a layout without a state group.
+fn states_region(
+    scheduler: usize,
+    layout: &CacheLayout,
+    config: &proto::config::EngineConfig,
+) -> Result<Option<String>> {
+    let Some(group) = layout.state_group() else {
+        return Ok(None);
+    };
+    let mut digest = storage::key::Digest::new(b"uniserve.states-region");
+    digest.text(&config.layout_hash());
+    digest.bytes(&host::page_shape(layout, group)?.layout.0);
+    digest.numbers(&[layout.state_bytes(), layout.plane_bytes]);
+    let digest = digest.finish();
+    Ok(Some(format!("state {scheduler} {}", short(&digest))))
 }
 
 /// The leading eight bytes of `digest` in hex: what a region's name carries of the digest of
@@ -1319,7 +1354,7 @@ pub(crate) fn layout(launch: &EngineArgs, ranks: &[LoadedRank]) -> Result<Open> 
             text_layout(
                 launch,
                 &cache,
-                text.units,
+                (text.units, text.states.0),
                 tensor,
                 (slots, slot_bytes),
                 vision,
@@ -1331,7 +1366,8 @@ pub(crate) fn layout(launch: &EngineArgs, ranks: &[LoadedRank]) -> Result<Open> 
 
 /// The layout of a text deployment's session ([`layout`]), for ranks of the deployment's one
 /// configuration whose caches are laid out as `cache` with `units` units, the padding unit
-/// included, whose worker groups are `tensor` ranks wide, whose groups each hold `slots`
+/// included, and, for a model that keeps a recurrent state, `states` units of the state region
+/// (zero for one that keeps none), whose worker groups are `tensor` ranks wide, whose groups each hold `slots`
 /// request slots, each taking `slot_bytes` of one rank's device memory, and, when the engine
 /// admits images, whose model with a vision tower and the most rows of an image it encodes are
 /// `vision` (`ModelRunner::image_rows`; `None` otherwise):
@@ -1346,15 +1382,20 @@ pub(crate) fn layout(launch: &EngineArgs, ranks: &[LoadedRank]) -> Result<Open> 
 ///   1, the engine's own, named by its launch generation (a standby's are not the serving
 ///   engine's of the same epoch). A unit's bytes are summed over the ranks of the group that
 ///   hold a part of it: its tensor ranks, pipeline stages or sequence members, each a part of the
-///   same size (`specs/engine-worker-port.md` §7.4).
+///   same size (`specs/engine-worker-port.md` §7.4). For a model that keeps a recurrent state,
+///   per scheduler the device region of its state units beside its KV region, one checkpoint a
+///   unit, named by the layout alone (`states_region`) and numbered `states`, with no reserved
+///   unit, which asks for no unit at `Open` as the KV region does; and the host region of the
+///   state class, one checkpoint a unit (`specs/engine-worker-port.md` §1.6).
 /// - **Encoder outputs.** When a group encodes images (a group that prefills, of a model with a
 ///   vision tower, [`encodes`]): per such group, the region of its encoder outputs, the engine's
 ///   own memory of its ranks, the same units on every rank of it (the tower is whole on each,
 ///   and each holds every output whole), sized by `VisionRunner::region_units`; and the host
 ///   region of encoder outputs ([`host_encoders`]), numbered for the outputs of every request
 ///   slot of each such group, and as many again for requests that resume.
-/// - **Classes**, in the numbering the worker uses: cache group `g` is class `g`, then the class
-///   of encoder outputs when a group encodes images, sized per request, with its host copies in
+/// - **Classes**, in the numbering the worker uses: cache group `g` is class `g` (the state
+///   group's of one unit of the state region, every other's of its pages' units of the KV
+///   region), then the class of encoder outputs when a group encodes images, sized per request, with its host copies in
 ///   the host region of encoder outputs; then one class per product kind in the order of the
 ///   product classes (`crate::batch::product::KINDS`), then the class of stored trajectories. A
 ///   text deployment holds no product and no trajectory: those classes name no region.
@@ -1373,7 +1414,7 @@ pub(crate) fn layout(launch: &EngineArgs, ranks: &[LoadedRank]) -> Result<Open> 
 pub fn text_layout(
     launch: &EngineArgs,
     cache: &CacheLayout,
-    units: u32,
+    (units, states): (u32, u32),
     tensor: u32,
     (slots, slot_bytes): (u32, u64),
     vision: Option<(&dyn TextModel, u32)>,
@@ -1416,8 +1457,14 @@ pub fn text_layout(
     let host_tier = kv.host_tier && kv.prefix_caching;
     let mut host_regions: Vec<Option<u8>> = vec![None; cache.groups.len()];
     if host_tier {
-        let pages_of = |page_bytes: u64, units_per_page: u32| -> u32 {
-            let device_pages = u64::from(units.saturating_sub(1) / units_per_page.max(1));
+        // A group's host pages are `host_ratio` times its device pages: of the KV region's units
+        // past the padding unit, or of the state region's checkpoints.
+        let pages_of = |page_bytes: u64, group: &GroupLayout| -> u32 {
+            let device_pages = if group.state() {
+                u64::from(states)
+            } else {
+                u64::from(units.saturating_sub(1) / group.units_per_page.max(1))
+            };
             let pages = match kv.host_gib {
                 Some(gib) => (gib.get() << 30) / (page_bytes * tensor).max(1),
                 None => (device_pages as f64 * kv.host_ratio.unwrap_or(HOST_RATIO)) as u64,
@@ -1430,7 +1477,7 @@ pub fn text_layout(
                 continue;
             }
             let shape = host::page_shape(cache, index)?;
-            let pages = pages_of(shape.page_bytes, group.units_per_page);
+            let pages = pages_of(shape.page_bytes, group);
             let name = format!("host kv {index} {}", short(&shape.layout.0));
             host_regions[index] = Some(region_index(&regions)?);
             regions.push(Region {
@@ -1485,6 +1532,28 @@ pub fn text_layout(
             memory: String::new(),
         });
 
+        // The region of its state units, one checkpoint each, beside the KV region: no unit is
+        // reserved, since no table names a padding checkpoint.
+        let state_region = match states_region(scheduler, cache, config)? {
+            Some(name) => {
+                let index = region_index(&regions)?;
+                regions.push(Region {
+                    space: name.clone(),
+                    name,
+                    tier: Tier::Device,
+                    unit_bytes: cache.state_bytes() * tensor,
+                    part_bytes: cache.state_bytes(),
+                    reserved: 0,
+                    units: 0,
+                    limit: states,
+                    segments: Vec::new(),
+                    memory: String::new(),
+                });
+                Some(index)
+            }
+            None => None,
+        };
+
         for id in listed {
             let index = numbers
                 .iter()
@@ -1534,7 +1603,16 @@ pub fn text_layout(
             }
             parts.extend((0..=product::KINDS.len()).map(|_| Vec::new()));
 
-            let mut per_class: Vec<Vec<u8>> = vec![vec![kv_region]; cache.groups.len()];
+            // Every cache group's class takes its blocks from the KV region but the state group's,
+            // which takes them from the state region.
+            let mut per_class: Vec<Vec<u8>> = cache
+                .groups
+                .iter()
+                .map(|group| match state_region.filter(|_| group.state()) {
+                    Some(region) => vec![region],
+                    None => vec![kv_region],
+                })
+                .collect();
             if let Some((_, units, _)) = images {
                 let outputs = if encoding.contains(&index) {
                     let name = format!("encoders {} {}", session_engine(launch), id.0);
@@ -2412,7 +2490,8 @@ fn product_buffer(layout: &Open, rank: &LoadedRank) -> Result<u8> {
 ///   created them, then those its epoch creates before the warm-up, the whole segments of the
 ///   region's units the quota held free at the division ([`plane_segments`],
 ///   `ModelRunner::divide`), none on a standby, which commits nothing at its start; the rest stay
-///   given back until a grow creates them;
+///   given back until a grow creates them; and of its state region, for a model that keeps a
+///   recurrent state, alike;
 /// - the kernels its cache and its recurrent state launch over the region's numbering that the
 ///   generation it serves lacks, which `resolve` resolves into that generation, as the load
 ///   resolved its profile run's: a state copy's key carries the cache's units, which the profile
@@ -2434,9 +2513,9 @@ fn product_buffer(layout: &Open, rank: &LoadedRank) -> Result<u8> {
 /// On the meta device the owners hold no device and the segments no memory, so the cache, the
 /// state and the runner are made over the region's units again, as the profile run's were.
 ///
-/// Returns, per KV region by name, the segments its ranks created, as `(segment, first unit,
-/// units)`: the head grants each once every rank that maps the region holds it. The ranks of a
-/// media deployment are opened by [`open_video_ranks`] and create none.
+/// Returns, per device region by name (KV and state regions), the segments its ranks created, as
+/// `(segment, first unit, units)`: the head grants each once every rank that maps the region
+/// holds it. The ranks of a media deployment are opened by [`open_video_ranks`] and create none.
 ///
 /// # Errors
 ///
@@ -2456,20 +2535,25 @@ pub(crate) fn open_ranks(
         return Ok(Vec::new());
     }
     let tables = &opened.segments;
+    // A region's name, its numbering and its table.
+    let region_of = |index: u8| -> Result<(String, (u32, &Segments))> {
+        let table = tables
+            .get(usize::from(index))
+            .with_context(|| format!("the answer states no segment table of region {index}"))?;
+        let region = &layout.regions[usize::from(index)];
+        Ok((region.name.clone(), (region.limit, table)))
+    };
 
-    // Each rank's KV region, its numbering and its table, read before the ranks go to their
-    // threads; none for a rank of a group the session does not state.
+    // Each rank's KV region and state region, their numberings and their tables, read before the
+    // ranks go to their threads; none for a rank of a group the session does not state.
     let mut regions = Vec::with_capacity(ranks.len());
     for rank in ranks.iter() {
-        let Some((_, kv, _)) = stated_regions(rank, layout)? else {
+        let Some((_, (kv, states), _)) = stated_regions(rank, layout)? else {
             regions.push(None);
             continue;
         };
-        let table = tables
-            .get(usize::from(kv))
-            .with_context(|| format!("the answer states no segment table of region {kv}"))?;
-        let region = &layout.regions[usize::from(kv)];
-        regions.push(Some((region.name.clone(), (region.limit, table))));
+        let states = states.map(region_of).transpose()?;
+        regions.push(Some((region_of(kv)?, states)));
     }
 
     // The client of the process's first rank that encodes images, through which every rank that
@@ -2480,10 +2564,12 @@ pub(crate) fn open_ranks(
         .and_then(|rank| rank.client.clone());
     let session = (layout, opened);
 
-    let opened: Vec<Segments> = std::thread::scope(|scope| {
+    let opened: Vec<(Segments, Segments)> = std::thread::scope(|scope| {
         let mut handles = Vec::with_capacity(ranks.len());
         for (index, (rank, region)) in ranks.iter_mut().zip(&regions).enumerate() {
-            let region = region.as_ref().map(|(_, region)| *region);
+            let region = region
+                .as_ref()
+                .map(|((_, kv), states)| (*kv, states.as_ref().map(|(_, states)| *states)));
             let holder = holder.as_ref();
             let handle = std::thread::Builder::new()
                 .name(format!("rank-open-{index}"))
@@ -2505,38 +2591,47 @@ pub(crate) fn open_ranks(
 
     // Every rank that maps a region creates the same segments of it, which the head grants once.
     let mut created: Vec<(String, Segments)> = Vec::new();
-    for (region, segments) in regions.into_iter().zip(opened) {
-        let Some((name, _)) = region else {
+    for (region, (kv_segments, state_segments)) in regions.into_iter().zip(opened) {
+        let Some(((kv, _), states)) = region else {
             continue;
         };
-        match created.iter().find(|(region, _)| *region == name) {
-            Some((_, first)) if *first != segments => bail!(
-                "the ranks of region {name} created different segments: {first:?} and \
-                 {segments:?}"
-            ),
-            Some(_) => {}
-            None => created.push((name, segments)),
+        let made = std::iter::once((kv, kv_segments))
+            .chain(states.map(|(name, _)| (name, state_segments)));
+        for (name, segments) in made {
+            match created.iter().find(|(region, _)| *region == name) {
+                Some((_, first)) if *first != segments => bail!(
+                    "the ranks of region {name} created different segments: {first:?} and \
+                     {segments:?}"
+                ),
+                Some(_) => {}
+                None => created.push((name, segments)),
+            }
         }
     }
     Ok(created)
 }
 
 /// Opens one rank over `region`, its KV region of `units` units, the padding unit included, as
-/// the session numbers it, and the region's segment table `table` (steps 16-22, [`open_ranks`]),
+/// the session numbers it, and the region's segment table `table`, with its state region's
+/// numbering and table for a model that keeps a recurrent state (steps 16-22, [`open_ranks`]),
 /// in the session whose layout is `session` and whose answer is `opened`. The rank's cache takes
 /// the region's numbering, which is its own division's count unless an earlier epoch of the
 /// layout numbered the region otherwise. A rank that maps no region (`None`, a dedicated expert
 /// rank's) holds a cache of the fewest units a runner is built over, whose planes are not split.
 /// A rank that encodes images maps the part of the host region of encoder outputs through
-/// `holder` ([`encoder_memory`]). Returns the segments it created, as `(segment, first unit,
-/// units)`.
+/// `holder` ([`encoder_memory`]). Returns the segments it created of its KV region and of its
+/// state region, as `(segment, first unit, units)`.
+#[expect(
+    clippy::type_complexity,
+    reason = "a rank's two device regions, each its numbering and its table"
+)]
 fn open_rank(
     rank: &mut LoadedRank,
-    region: Option<(u32, &Segments)>,
+    region: Option<((u32, &Segments), Option<(u32, &Segments)>)>,
     (session, opened): (&Open, &Opened),
     holder: Option<&Arc<StorageClient>>,
     resolve: Option<&Resolve<'_>>,
-) -> Result<Segments> {
+) -> Result<(Segments, Segments)> {
     let device = rank.device()?;
     // The session's statement of the rank's group: none for a rank that maps no region, whose
     // group the session states nowhere and which encodes no image.
@@ -2559,8 +2654,12 @@ fn open_rank(
     };
     let layout = Arc::clone(service::lock(&rank.cache).layout());
     let units = match region {
-        Some((units, _)) => units,
+        Some(((units, _), _)) => units,
         None => fewest_units(&layout),
+    };
+    let states = match region {
+        Some((_, Some((states, _)))) => states,
+        _ => fewest_states(&layout),
     };
     if region.is_some() && units != rank.units {
         tracing::info!(
@@ -2571,6 +2670,7 @@ fn open_rank(
         );
     }
     rank.units = units;
+    rank.states.0 = states;
     let state_config = model_runner.state_config(rank.model.as_ref(), model_runner.buckets());
     let config = model_runner.causal_config(rank.model.as_ref(), &layout, units)?;
     let inputs = CausalLmRunner::input_bytes(&config)?;
@@ -2593,29 +2693,47 @@ fn open_rank(
     // far as the quota held them at the division. A segment's every part is whole granules of
     // the device's allocations; the meta device allocates nothing, and each unit is a whole
     // granule of it. A standby maps its epoch's table and commits nothing until it is promoted.
+    // The state region's segments alike, a unit of the meta device's being a whole granule of a
+    // checkpoint's bytes.
+    let epoch = model_runner.launch().epoch;
+    let standing_by = standby(model_runner.launch());
     let (segments, created) = match region {
-        Some((_, table)) => {
+        Some(((_, table), _)) => {
             let granularity = match client {
                 Some(_) => granularity(device)?,
                 None => layout.plane_bytes,
             };
-            let held = if standby(model_runner.launch()) {
-                0
-            } else {
-                rank.first
+            let held = if standing_by { 0 } else { rank.first };
+            let (segments, created) =
+                plane_segments(epoch, (units, held), layout.plane_bytes, granularity, table)?;
+            (Some(segments), created)
+        }
+        None => (None, Segments::new()),
+    };
+    let (state_segments, states_created) = match region {
+        Some((_, Some((_, table)))) => {
+            let granularity = match client {
+                Some(_) => granularity(device)?,
+                None => layout.state_bytes(),
             };
+            let held = if standing_by { 0 } else { rank.states.1 };
             let (segments, created) = plane_segments(
-                model_runner.launch().epoch,
-                (units, held),
-                &layout,
+                epoch,
+                (states, held),
+                layout.state_bytes(),
                 granularity,
                 table,
             )?;
             (Some(segments), created)
         }
-        None => (None, Segments::new()),
+        _ => (None, Segments::new()),
     };
-    let cache_config = model_runner.cache_config(Arc::clone(&layout), units, segments);
+    let cache_config = model_runner.cache_config(
+        Arc::clone(&layout),
+        units,
+        segments,
+        (states, state_segments),
+    );
 
     // The cache and the state over the region's numbering, holding no device: the kernels their
     // own work launches, which the generation the rank serves takes those of it lacks.
@@ -2698,7 +2816,7 @@ fn open_rank(
         rank.state = state;
         rank.runner = Some(runner);
         rank.vision_runner = vision;
-        return Ok(created);
+        return Ok((created, states_created));
     };
 
     // Step 17: the graph pool, with a region for each runner and the scratch and resident pools
@@ -2830,7 +2948,9 @@ fn open_rank(
         group = model_runner.group(),
         units,
         created = created.len(),
-        "the rank opened its memory over the session's region"
+        states,
+        states_created = states_created.len(),
+        "the rank opened its memory over the session's regions"
     );
     rank.config = config;
     rank.cache = cache;
@@ -2838,7 +2958,7 @@ fn open_rank(
     *rank_pool = Some(Arc::new(Mutex::new(pool)));
     rank.runner = Some(runner);
     rank.vision_runner = vision;
-    Ok(created)
+    Ok((created, states_created))
 }
 
 /// The media memory of rank index `rank` that encodes images, in its group `group` of the
@@ -3354,9 +3474,9 @@ pub(crate) fn bind(
     for (index, rank) in ranks.iter_mut().enumerate() {
         let Some(client) = rank.client.clone() else {
             if let Loaded::Text(_) = &rank.loaded
-                && let Some((_, kv, host)) = stated_regions(rank, layout)?
+                && let Some((_, devices, host)) = stated_regions(rank, layout)?
             {
-                set_regions(rank, (kv, host), opened, None)?;
+                set_regions(rank, (devices, host), opened, None)?;
             }
             continue;
         };
@@ -3390,15 +3510,23 @@ pub(crate) fn bind(
             }
             continue;
         };
-        let Some((group, kv, host_regions)) = stated_regions(rank, layout)? else {
+        let Some((group, (kv, states), host_regions)) = stated_regions(rank, layout)? else {
             continue;
         };
 
-        // The rank's part of its scheduler's KV units, in its group's memory.
+        // The rank's part of its scheduler's KV units, and of its state units, in its group's
+        // memory.
         let part = rank.model_runner.part();
         let region = layout.regions[usize::from(kv)].name.clone();
         let runs = unit_runs(&service::lock(&text.cache).info().plane_runs);
         stated((region, group.memory.clone(), part, runs))?;
+        if let Some(states) = states {
+            let region = layout.regions[usize::from(states)].name.clone();
+            let runs = unit_runs(service::lock(&text.cache).state_plane_runs());
+            if !runs.is_empty() {
+                stated((region, group.memory.clone(), part, runs))?;
+            }
+        }
 
         // The stores and loads the buffer pool asks of this rank copy between its units and its
         // part of each group's host region, unit `u` of the region being page `u`.
@@ -3424,13 +3552,14 @@ pub(crate) fn bind(
             }
             copies = Some(stream);
         }
-        set_regions(rank, (kv, host_regions), opened, copies)?;
+        set_regions(rank, ((kv, states), host_regions), opened, copies)?;
     }
     Ok(places)
 }
 
 /// Tells the cache of text rank `rank` the numbers of the regions its copies name, its KV region
-/// `kv` and per cache group its host region, by the session's answer `opened`, and keeps the
+/// `kv`, its state region `states` and per cache group its host region, by the session's answer
+/// `opened`, and keeps the
 /// stream its copies to and from its host parts run on (`copies`, `None` for a rank that maps
 /// none).
 ///
@@ -3439,7 +3568,7 @@ pub(crate) fn bind(
 /// A region the answer does not number, or a text rank's cache's refusal.
 fn set_regions(
     rank: &mut LoadedRank,
-    (kv, host): (u8, Vec<Option<u8>>),
+    ((kv, states), host): ((u8, Option<u8>), Vec<Option<u8>>),
     opened: &Opened,
     copies: Option<Stream>,
 ) -> Result<()> {
@@ -3458,6 +3587,7 @@ fn set_regions(
         .collect::<Result<Vec<_>>>()?;
     cache.set_regions(CacheRegions {
         units: number(kv)?,
+        states: states.map(number).transpose()?,
         host,
         sources: vec![None; groups],
     })?;
@@ -3509,9 +3639,10 @@ fn rank_host(rank: &LoadedRank) -> Result<String> {
     Ok(groups[index].ranks[position].host.clone())
 }
 
-/// The session's statement of `rank`'s group, the index of its KV region, and per cache group the
-/// index of its host region; `None` for a rank of a group the session does not state, a dedicated
-/// expert group's, which serves no request and maps no region ([`session_group`]).
+/// The session's statement of `rank`'s group, the index of its KV region and of its state region
+/// (`None` for a model that keeps no recurrent state), and per cache group the index of its host
+/// region; `None` for a rank of a group the session does not state, a dedicated expert group's,
+/// which serves no request and maps no region ([`session_group`]).
 #[expect(
     clippy::type_complexity,
     reason = "the session's statement of a rank's regions, as the layout's own types state it"
@@ -3519,7 +3650,7 @@ fn rank_host(rank: &LoadedRank) -> Result<String> {
 fn stated_regions<'a>(
     rank: &LoadedRank,
     layout: &'a Open,
-) -> Result<Option<(&'a Group, u8, Vec<Option<u8>>)>> {
+) -> Result<Option<(&'a Group, (u8, Option<u8>), Vec<Option<u8>>)>> {
     let id = session_group(rank, layout)?;
     let Some(group) = layout.groups.iter().find(|group| group.id == id) else {
         return Ok(None);
@@ -3530,14 +3661,29 @@ fn stated_regions<'a>(
         .and_then(|regions| regions.first())
         .copied()
         .context("the session states no KV region of the rank's group")?;
-    let groups = service::lock(&rank.text()?.cache).layout().groups.len();
+    let (groups, state) = {
+        let cache = service::lock(&rank.text()?.cache);
+        (cache.layout().groups.len(), cache.layout().state_group())
+    };
+    // The state group's class takes its blocks from the state region.
+    let states = match state {
+        Some(class) => Some(
+            group
+                .regions
+                .get(class)
+                .and_then(|regions| regions.first())
+                .copied()
+                .context("the session states no state region of the rank's group")?,
+        ),
+        None => None,
+    };
     let host = layout
         .classes
         .iter()
         .take(groups)
         .map(|class| class.host.map(|(region, _)| region))
         .collect();
-    Ok(Some((group, kv, host)))
+    Ok(Some((group, (kv, states), host)))
 }
 
 /// The session's statement of `rank`'s group.

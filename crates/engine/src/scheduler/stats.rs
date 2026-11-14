@@ -290,15 +290,16 @@ impl Scheduler {
     }
 
     /// The device regions of the KV cache, each once, as indices into the session's regions: the
-    /// regions the groups take the blocks of the cache groups' classes from. Those are the
-    /// classes of a fixed block size; encoder outputs, products and trajectories are sized per
-    /// request (SD §4.4).
+    /// regions the groups take the blocks of the cache groups' classes from, but the state
+    /// region of the recurrent-state class, whose units are checkpoints (`specs/buffer-pool.md`
+    /// §14.1). Those are the classes of a fixed block size; encoder outputs, products and
+    /// trajectories are sized per request (SD §4.4).
     pub(super) fn kv_regions(&self) -> Vec<usize> {
         let mut regions: Vec<usize> = self
             .classes
             .iter()
             .zip(0u8..)
-            .filter(|(class, _)| class.units > 0)
+            .filter(|(class, _)| class.units > 0 && !class.state_in_slot)
             .flat_map(|(_, class)| {
                 self.groups
                     .iter()

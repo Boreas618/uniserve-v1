@@ -15,7 +15,6 @@
 //! runner then computes over meta tensors, and the hook keeps the cache's host copy of the
 //! pooled tables and issues nothing.
 
-use std::ops::Range;
 use std::sync::{Arc, Mutex};
 
 use crate::batch::{Batch, StateDirection};
@@ -161,9 +160,10 @@ fn attention_groups(cache: &KvCacheMemory) -> impl Iterator<Item = usize> + '_ {
 /// - [`PageWork::Copies`]: the cache issues the copies of the blocks the batch takes; their
 ///   events are kept for [`PageWork::Ended`].
 /// - [`PageWork::BeforeReplay`]: the batch's state copies are resolved through the tables,
-///   each checkpoint's position to the run of units it holds in the slot's table of the state
-///   group's class (the class of cache group `g` is class `g`), and refused unless every one
-///   names an entry and every keep a writable one; then every restore is issued.
+///   each checkpoint's position to the one unit of the state region its entry holds in the
+///   slot's table of the state group's class (the class of cache group `g` is class `g`), and
+///   refused unless every one names an entry of one unit and every keep a writable one; then
+///   every restore is issued.
 /// - [`PageWork::AfterReplay`]: the keeps resolved before the replay are issued.
 /// - [`PageWork::Ended`]: the copies issued since the last end are waited for.
 /// - [`PageWork::Holds`]: the flag is set when the region is the cache's
@@ -255,19 +255,19 @@ pub(crate) fn page_work(
     })
 }
 
-/// State copies resolved through the device block table: each a request slot and the units of
-/// the state block its checkpoint's position names.
-pub(crate) type StateRuns = Vec<(u32, Range<u32>)>;
+/// State copies resolved through the device block table: each a request slot and the state unit
+/// of the block its checkpoint's position names.
+pub(crate) type StateRuns = Vec<(u32, u32)>;
 
 /// The state copies of `batch` resolved through `tables`: `(restores, keeps)`, each a request
-/// slot and the units of the state block its checkpoint's position names in the slot's table
-/// of the state group's class.
+/// slot and the state unit of the block its checkpoint's position names in the slot's table of
+/// the state group's class, one unit of the state region (`specs/engine-worker-port.md` §1.6).
 ///
 /// # Errors
 ///
 /// [`Error::Invalid`] for a batch that copies state over a cache without a state group, a
-/// checkpoint whose position holds no entry, and a keep into one a batch may not write: the
-/// batch is refused before anything of it is launched.
+/// checkpoint whose position holds no entry or an entry of other than one unit, and a keep into
+/// one a batch may not write: the batch is refused before anything of it is launched.
 pub(crate) fn state_copies(
     cache: &KvCacheMemory,
     batch: &Batch,
@@ -300,11 +300,19 @@ pub(crate) fn state_copies(
                     batch.id.0, copy.slot, copy.position
                 ))
             })?;
+        if units.len() != 1 {
+            return Err(Error::Invalid(format!(
+                "batch {} copies the state of slot {} at position {} of class {class}, whose \
+                 entry holds units {}..{}, and a checkpoint is one unit of the state region",
+                batch.id.0, copy.slot, copy.position, units.start, units.end
+            )));
+        }
+        let unit = units.start;
 
         match copy.direction {
-            StateDirection::Restore => restores.push((copy.slot, units)),
+            StateDirection::Restore => restores.push((copy.slot, unit)),
             StateDirection::Keep if tables.writable(copy.slot, class, copy.position) => {
-                keeps.push((copy.slot, units));
+                keeps.push((copy.slot, unit));
             }
             StateDirection::Keep => {
                 return Err(Error::Invalid(format!(

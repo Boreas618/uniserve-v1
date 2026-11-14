@@ -662,6 +662,8 @@ impl<K: Order> Policy for Arrival<K> {
     fn preempt(&mut self, shortage: &Shortage) -> Vec<Victim> {
         let mut victims = match shortage.kind {
             Storage::KvUnits => self.page_victims(false, shortage.need),
+            // No page holds a checkpoint unit: the shortage takes requests alone, below.
+            Storage::StateUnits => Vec::new(),
             Storage::HostPages => self.page_victims(true, shortage.need),
             Storage::EncoderEntries => {
                 let mut victims = Vec::new();
@@ -677,8 +679,9 @@ impl<K: Order> Policy for Arrival<K> {
         };
         // Units are what the pages above free one of each; when the device
         // cache has no more page no request continues from, the request itself
-        // is the victim, as today's recompute preemption has it.
-        if matches!(shortage.kind, Storage::KvUnits)
+        // is the victim, as today's recompute preemption has it. A shortage of
+        // checkpoint units is relieved by a request at once.
+        if matches!(shortage.kind, Storage::KvUnits | Storage::StateUnits)
             && (victims.len() as u64) < shortage.need
             && let Some(victim) = self.request_victim()
         {
@@ -1138,6 +1141,30 @@ mod tests {
             need: 1,
         });
         assert_eq!(victims, vec![Victim::Encoding(EncodingId(5))]);
+    }
+
+    /// A shortage of checkpoint units names no page, however many are evictable: no page holds
+    /// one. It takes the request the device shortage would.
+    #[test]
+    fn a_checkpoint_shortage_takes_a_request_and_no_page() {
+        let mut fcfs = policy();
+        fcfs.observe(&[Event::Cached {
+            page: PageView {
+                id: PageId(1),
+                tokens: 16,
+                last_used: Nanos(1),
+                on_host: false,
+                evictable: true,
+            },
+        }]);
+        admit(&mut fcfs, view(1, 0, 0));
+        admit(&mut fcfs, view(2, 5, 1));
+
+        let victims = fcfs.preempt(&Shortage {
+            kind: Storage::StateUnits,
+            need: 1,
+        });
+        assert_eq!(victims, vec![Victim::Request(RequestId(2))]);
     }
 
     #[test]

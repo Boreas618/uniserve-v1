@@ -677,26 +677,107 @@ fn requests_resumed_with_their_blocks_cached_all_end_at_their_length() {
     serve_to_their_length(&mut harness, 96, request, 128);
 }
 
-/// Requests of a hybrid model, whose recurrent-state checkpoint takes many units where a page of
-/// attention takes one, all end at their length under memory pressure: 64 requests over 48
-/// prompts beside a device region of 256 pages and 32 checkpoints, a host region of 192 units and
-/// 32 slots. Admissions that share a prompt load its blocks from the host, and a `Load` whose
-/// leading keys another admission brought to the device meanwhile is answered `Loaded` with
-/// nothing copied and no entry given (BP §11): its positions are missing, like those of a short
-/// pin, so the request neither restores a checkpoint nor releases a block it does not hold
-/// (SD §3.5 `answered`, §4.4 "The hit").
+/// Requests of a hybrid model all end at their length under memory pressure: 64 requests over 48
+/// prompts beside a KV region of 256 pages and a state region of 32 checkpoints, a host region of
+/// 192 units and 32 slots. Admissions that share a prompt load its blocks from the host, and a
+/// `Load` whose leading keys another admission brought to the device meanwhile is answered
+/// `Loaded` with nothing copied and no entry given (BP §11): its positions are missing, like
+/// those of a short pin, so the request neither restores a checkpoint nor releases a block it
+/// does not hold (SD §3.5 `answered`, §4.4 "The hit").
 #[test]
-fn hybrid_requests_whose_checkpoints_take_many_units_all_end_at_their_length() {
+fn hybrid_requests_under_memory_pressure_all_end_at_their_length() {
     let mut harness = Deployment::tokens()
         .cache(&[
             (CacheGroupKind::Full, BLOCK),
             (CacheGroupKind::State, BLOCK),
         ])
-        .block_units(&[1, 99])
-        .kv_units(256 + 32 * 99)
+        .kv_units(256)
+        .state_units(32)
         .host(192)
         .slots(32)
         .build();
     let request = |id: u64| crate::harness::sharing(id, 1000 + id % 48, 32, 64);
     serve_to_their_length(&mut harness, 64, request, 64);
+}
+
+/// Requests of a hybrid model that speculates all end at their length at the draft point's
+/// proportions (E7, `kv_cache_config.max_tokens` 16384): a KV region of 256 pages, which the
+/// attention and draft pages share, a state region of 128 checkpoints, one a slot as a rank
+/// sizes it beside a stated capacity (`specs/engine-worker-port.md` §1.6), 128 slots, 128
+/// requests over 96 prompts. A checkpoint is one unit of its own region, so a region with a unit
+/// free always places one: the attention and draft pages, which fragmented a region they shared
+/// with checkpoints of many units until a checkpoint's `Allocate` was answered `Full` while units
+/// were free and no batch formed, lie in the KV region alone.
+#[test]
+fn hybrid_speculating_requests_at_the_draft_points_proportions_all_end_at_their_length() {
+    let mut harness = Deployment::tokens()
+        .cache(&[
+            (CacheGroupKind::Full, BLOCK),
+            (CacheGroupKind::State, BLOCK),
+        ])
+        .speculative(1)
+        .verifying()
+        .batch(128, 1024)
+        .chunk(1024)
+        .kv_units(256)
+        .state_units(128)
+        .host(512)
+        .slots(128)
+        .build();
+    let request = |id: u64| crate::harness::sharing(id, 1000 + id % 96, 32, 64);
+    serve_to_their_length(&mut harness, 128, request, 64);
+}
+
+/// Requests of a hybrid model that speculates keep the checkpoints their decodes reach and all
+/// end at their length under memory pressure: the draft point's deployment with a checkpoint
+/// every 16 decoded tokens (`state_interval`), so that every request's verifications cross kept
+/// boundaries after the drafts of some were given up. A group of a model that keeps a recurrent
+/// state serves no refill, so no checkpoint is asked for a refill, whose place in the state table
+/// would leave a decode's kept boundary without the checkpoint it keeps (SD §4.4).
+#[test]
+fn hybrid_speculating_requests_keep_the_checkpoints_their_decodes_reach() {
+    let mut harness = Deployment::tokens()
+        .cache(&[
+            (CacheGroupKind::Full, BLOCK),
+            (CacheGroupKind::State, BLOCK),
+        ])
+        .speculative(1)
+        .verifying()
+        .state_interval(16)
+        .batch(128, 1024)
+        .chunk(1024)
+        .kv_units(256)
+        .state_units(128)
+        .host(512)
+        .slots(128)
+        .build();
+    let request = |id: u64| crate::harness::sharing(id, 1000 + id % 96, 32, 64);
+    serve_to_their_length(&mut harness, 128, request, 64);
+}
+
+/// Requests of a hybrid model whose state region holds fewer checkpoints than its slots' requests
+/// keep all end at their length: 32 requests over 16 prompts of 32 tokens, each keeping a
+/// checkpoint every 8 decoded tokens beside the one before (`state_interval`), 16 slots, a KV
+/// region that holds every block they take and a state region of 10 checkpoints. The state region
+/// is the only shortage, counted in its own units: admissions wait for them, and a running
+/// request short of a checkpoint takes a request through the policy (`StateUnits`, SD §3.6) or
+/// waits for the region's `available` word, and never a KV page, which frees no checkpoint.
+#[test]
+fn hybrid_requests_short_of_checkpoints_wait_or_preempt_and_all_end_at_their_length() {
+    let mut harness = Deployment::tokens()
+        .cache(&[
+            (CacheGroupKind::Full, BLOCK),
+            (CacheGroupKind::State, BLOCK),
+        ])
+        .state_interval(8)
+        .kv_units(1024)
+        .state_units(10)
+        .slots(16)
+        .build();
+    let request = |id: u64| crate::harness::sharing(id, 1000 + id % 16, 32, 64);
+    serve_to_their_length(&mut harness, 32, request, 64);
+    assert!(
+        !evicted(&harness),
+        "a shortage of checkpoints evicted KV pages"
+    );
 }

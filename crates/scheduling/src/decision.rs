@@ -120,6 +120,11 @@ pub struct Room {
 pub enum Storage {
     /// Device KV cache units.
     KvUnits,
+    /// Device units of recurrent-state checkpoints, one checkpoint a unit, in a region of their
+    /// own. The pages a policy is shown are KV pages, which free none of these units, and a
+    /// cached checkpoint no request holds is the mechanism's to evict: only a running request's
+    /// end frees the checkpoints it holds.
+    StateUnits,
     /// Host KV page pool.
     HostPages,
     /// Encoder cache.

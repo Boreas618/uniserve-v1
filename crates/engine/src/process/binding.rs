@@ -518,13 +518,11 @@ fn kept_beside(table: &CacheTable, unit_bytes: u64, epoch: u64, excess: u64) -> 
     kept
 }
 
-/// What `cache`'s planes are made of and how many of their segments exist; none for planes that
-/// are not split.
-fn segment_table(cache: &KvCacheMemory) -> Option<CacheTable> {
-    cache.segments().map(|segments| CacheTable {
-        segments: segments.to_vec(),
-        held: cache.held_segments(),
-    })
+/// What `cache`'s memory of the device region `region` is made of and how many of its segments
+/// exist: its KV planes or its state units (`KvCacheMemory::segment_table`); none for memory that
+/// is not split or a region that is none of the cache's.
+fn segment_table(cache: &KvCacheMemory, region: u8) -> Option<CacheTable> {
+    cache.segment_table(region).map(|(table, _)| table)
 }
 
 /// One rank's second load of `target` through `weights`, beside the weights of `serving`: it
@@ -1568,8 +1566,9 @@ impl WeightBinding {
     }
 
     /// The ranks' side of a release from segment `first` on (module documentation): every rank
-    /// of the worker groups `groups`, which state the region, unmaps the segments of its KV
-    /// planes from `first` on and ends its retention of them. The head has withdrawn them, so no
+    /// of the worker groups `groups`, which state the device region `region` (the buffer pool's
+    /// number of a KV region or a state region), unmaps the segments of its memory of the region
+    /// from `first` on and ends its retention of them. The head has withdrawn them, so no
     /// region holds a unit of them and no job addresses them. Segments given back already are
     /// not given back twice. Returns, for this process (`None`) and each peer that holds such
     /// ranks (by its first rank), the CUDA ordinals of the devices of its ranks that gave
@@ -1579,20 +1578,28 @@ impl WeightBinding {
     /// # Errors
     ///
     /// When the Storage Server refuses, here or on a peer's host.
-    pub(crate) fn release_segments(&self, groups: &[GroupId], first: u32) -> Result<Released> {
+    pub(crate) fn release_segments(
+        &self,
+        groups: &[GroupId],
+        region: u8,
+        first: u32,
+    ) -> Result<Released> {
         let answers = self.ask_peers(Some(groups), || DataOperation::ReleaseSegments {
             groups: groups.to_vec(),
+            region,
             from: first,
         })?;
         let peers: Vec<u32> = answers.iter().map(|(rank, _)| *rank).collect();
-        let here = self.release_of(Some(groups), first).map(|tables| {
-            // A rank whose planes are split gave segments back.
-            tables
-                .iter()
-                .zip(self.devices_of(groups))
-                .filter_map(|(table, device)| table.as_ref().and(device))
-                .collect::<Vec<u32>>()
-        });
+        let here = self
+            .release_of(Some(groups), Some(region), first)
+            .map(|tables| {
+                // A rank whose planes are split gave segments back.
+                tables
+                    .iter()
+                    .zip(self.devices_of(groups))
+                    .filter_map(|(table, device)| table.as_ref().and(device))
+                    .collect::<Vec<u32>>()
+            });
         let (here, theirs) = both(here, answered::<Vec<u32>>(answers))?;
 
         let mut released = vec![(None, here)];
@@ -1600,15 +1607,18 @@ impl WeightBinding {
         Ok(released)
     }
 
-    /// [`Self::release_segments`] on the ranks of `groups`, or on every rank for `None`: each
-    /// such rank's segment table; none for a rank that keeps no cache or whose planes are not
-    /// split, which has nothing to release.
+    /// [`Self::release_segments`] of device region `region` on the ranks of `groups`, or on
+    /// every rank for `None`, and of every split region of each rank's cache for `None` (a
+    /// sleep): each such rank's segment table of the region (of its KV region for every region);
+    /// none for a rank that keeps no cache or whose memory of the region is not split, which has
+    /// nothing to release.
     fn release_of(
         &self,
         groups: Option<&[GroupId]>,
+        region: Option<u8>,
         first: u32,
     ) -> Result<Vec<Option<CacheTable>>> {
-        self.each_of(groups, "releasing the KV planes' segments", |_, rank| {
+        self.each_of(groups, "releasing the cache's segments", |_, rank| {
             let cache = rank.cache.as_ref().map(Arc::clone);
             let client = Arc::clone(&rank.client);
 
@@ -1617,14 +1627,22 @@ impl WeightBinding {
                     return Ok(None);
                 };
                 let mut cache = lock(&cache);
-                if cache.segments().is_none() {
+                let split = cache.split_regions();
+                let Some(&reported) = split.first() else {
                     return Ok(None);
-                }
+                };
+                let released: Vec<u8> = match region {
+                    Some(region) if split.contains(&region) => vec![region],
+                    Some(_) => return Ok(None),
+                    None => split,
+                };
 
-                cache.release_segments(first, &*client)?;
+                for region in &released {
+                    cache.release_segments(*region, first, &*client)?;
+                }
                 // The graphs address the planes, whose tail was unmapped.
                 crate::profiling::storage_remapped();
-                Ok(segment_table(&cache))
+                Ok(segment_table(&cache, region.unwrap_or(reported)))
             })
         })
     }
@@ -1644,10 +1662,11 @@ impl WeightBinding {
     }
 
     /// The ranks' side of creating given-back segments (module documentation): every rank of the
-    /// worker groups `groups`, which state the region, creates the first `limit` segments of its
-    /// KV planes it gave back, or all of them, at their addresses, and resets their units.
-    /// Returns each such rank's segment table, from which the head grants the segments held now;
-    /// none for a rank that keeps no cache or whose planes are not split.
+    /// worker groups `groups`, which state the device region `region`, creates the first `limit`
+    /// segments of its memory of the region it gave back, or all of them, at their addresses, and
+    /// resets the KV planes' units. Returns each such rank's segment table of the region, from
+    /// which the head grants the segments held now; none for a rank that keeps no cache or whose
+    /// memory of the region is not split.
     ///
     /// # Errors
     ///
@@ -1656,13 +1675,15 @@ impl WeightBinding {
     pub(crate) fn create_segments(
         &self,
         groups: &[GroupId],
+        region: u8,
         limit: Option<u32>,
     ) -> Result<Vec<Option<CacheTable>>> {
         let answers = self.ask_peers(Some(groups), || DataOperation::CreateSegments {
             groups: groups.to_vec(),
+            region,
             count: limit,
         })?;
-        let here = self.create_of(Some(groups), limit);
+        let here = self.create_of(Some(groups), region, limit);
         let tables = joined_tables(here, answers)?;
         agreed(&tables)?;
         Ok(tables)
@@ -1672,9 +1693,10 @@ impl WeightBinding {
     fn create_of(
         &self,
         groups: Option<&[GroupId]>,
+        region: u8,
         limit: Option<u32>,
     ) -> Result<Vec<Option<CacheTable>>> {
-        self.each_of(groups, "creating the KV planes' segments", |_, rank| {
+        self.each_of(groups, "creating the cache's segments", |_, rank| {
             let cache = rank.cache.as_ref().map(Arc::clone);
             let client = Arc::clone(&rank.client);
             let stream = rank.stream.clone();
@@ -1685,55 +1707,65 @@ impl WeightBinding {
                 };
                 let mut cache = lock(&cache);
 
-                cache.wake(&*client, &stream, limit)?;
+                cache.wake(region, &*client, &stream, limit)?;
                 crate::profiling::storage_remapped();
-                Ok(segment_table(&cache))
+                Ok(segment_table(&cache, region))
             })
         })
     }
 
-    /// The segment table of the KV planes of every rank of the worker groups `groups`, the
-    /// peers' included, as the rank holds it now, in rank order; none for a rank that keeps no
-    /// cache or whose planes are not split. What the head grants after a wake, which creates
-    /// every rank's segments at once.
+    /// The segment table of device region `region` of every rank of the worker groups `groups`,
+    /// the peers' included, as the rank holds it now, in rank order; none for a rank that keeps no
+    /// cache or whose memory of the region is not split. What the head grants after a wake, which
+    /// creates every rank's segments at once.
     ///
     /// # Errors
     ///
     /// A peer's failure.
-    pub(crate) fn segment_tables(&self, groups: &[GroupId]) -> Result<Vec<Option<CacheTable>>> {
+    pub(crate) fn segment_tables(
+        &self,
+        groups: &[GroupId],
+        region: u8,
+    ) -> Result<Vec<Option<CacheTable>>> {
         let answers = self.ask_peers(Some(groups), || DataOperation::SegmentTables {
             groups: groups.to_vec(),
+            region,
         })?;
-        joined_tables(Ok(self.segment_tables_here(groups)), answers)
+        joined_tables(Ok(self.segment_tables_here(groups, region)), answers)
     }
 
     /// [`Self::segment_tables`] of this process's ranks.
-    pub(crate) fn segment_tables_here(&self, groups: &[GroupId]) -> Vec<Option<CacheTable>> {
+    pub(crate) fn segment_tables_here(
+        &self,
+        groups: &[GroupId],
+        region: u8,
+    ) -> Vec<Option<CacheTable>> {
         self.ranks
             .iter()
             .map(|rank| lock(rank))
             .filter(|rank| rank.of(groups))
             .map(|rank| {
                 let cache = rank.cache.as_ref()?;
-                segment_table(&lock(cache))
+                segment_table(&lock(cache), region)
             })
             .collect()
     }
 
-    /// How many of the segments the ranks of the worker groups `groups` gave back, counted from
-    /// the first of them, every such rank, the peers' included, has room for in its GPU's quota
-    /// and on its device: what a grow creates ([`Self::create_segments`]). Zero when a rank has
-    /// none given back or no room for the first, and when no rank of the groups splits its
-    /// planes.
+    /// How many of the segments of device region `region` the ranks of the worker groups
+    /// `groups` gave back, counted from the first of them, every such rank, the peers' included,
+    /// has room for in its GPU's quota and on its device: what a grow creates
+    /// ([`Self::create_segments`]). Zero when a rank has none given back or no room for the
+    /// first, and when no rank of the groups splits its memory of the region.
     ///
     /// # Errors
     ///
     /// When a rank's quota or device cannot be read, here or on a peer's host.
-    pub(crate) fn fitting_segments(&self, groups: &[GroupId]) -> Result<u32> {
+    pub(crate) fn fitting_segments(&self, groups: &[GroupId], region: u8) -> Result<u32> {
         let answers = self.ask_peers(Some(groups), || DataOperation::FittingSegments {
             groups: groups.to_vec(),
+            region,
         })?;
-        let here = self.fitting_here(groups);
+        let here = self.fitting_here(groups, region);
         let (here, peers) = both(here, answered::<Option<u32>>(answers))?;
         Ok(peers.into_iter().chain([here]).flatten().min().unwrap_or(0))
     }
@@ -1744,9 +1776,9 @@ impl WeightBinding {
     /// # Errors
     ///
     /// When a rank's quota or device cannot be read.
-    pub(crate) fn fitting_here(&self, groups: &[GroupId]) -> Result<Option<u32>> {
+    pub(crate) fn fitting_here(&self, groups: &[GroupId], region: u8) -> Result<Option<u32>> {
         let mut fitting: Option<u32> = None;
-        for (_, room, table, unit_bytes) in self.segment_facts(groups)? {
+        for (_, room, table, unit_bytes) in self.segment_facts(groups, region)? {
             // The bytes the next given-back segments take on this rank, the first of them first.
             let given_back = table.segments.iter().skip(table.held as usize);
             let mut bytes: u64 = 0;
@@ -1763,20 +1795,21 @@ impl WeightBinding {
         Ok(fitting)
     }
 
-    /// How many of the segments the ranks of the worker groups `groups` hold, counted from the
-    /// first, every such rank, the peers' included, holds beside its warm process in its GPU's
-    /// quota: what a start keeps, once its ranks are warm, of the segments it created before its
-    /// warm-up (`crate::process::epoch::keep_warm_segments`). None when no rank of the groups
-    /// splits its planes.
+    /// How many of the segments of device region `region` the ranks of the worker groups `groups`
+    /// hold, counted from the first, every such rank, the peers' included, holds beside its warm
+    /// process in its GPU's quota: what a start keeps, once its ranks are warm, of the segments
+    /// it created before its warm-up (`crate::process::epoch::keep_warm_segments`). None when no
+    /// rank of the groups splits its memory of the region.
     ///
     /// # Errors
     ///
     /// When a rank's process, quota or segments cannot be read, here or on a peer's host.
-    pub(crate) fn warm_segments(&self, groups: &[GroupId]) -> Result<Option<u32>> {
+    pub(crate) fn warm_segments(&self, groups: &[GroupId], region: u8) -> Result<Option<u32>> {
         let answers = self.ask_peers(Some(groups), || DataOperation::WarmSegments {
             groups: groups.to_vec(),
+            region,
         })?;
-        let here = self.warm_here(groups);
+        let here = self.warm_here(groups, region);
         let (here, peers) = both(here, answered::<Option<u32>>(answers))?;
         Ok(peers.into_iter().chain([here]).flatten().min())
     }
@@ -1789,7 +1822,7 @@ impl WeightBinding {
     /// # Errors
     ///
     /// When NVML cannot state a rank's process, or its quota cannot be read.
-    pub(crate) fn warm_here(&self, groups: &[GroupId]) -> Result<Option<u32>> {
+    pub(crate) fn warm_here(&self, groups: &[GroupId], region: u8) -> Result<Option<u32>> {
         // A process that holds no rank of the groups measures nothing.
         if !self.ranks.iter().any(|rank| lock(rank).of(groups)) {
             return Ok(None);
@@ -1810,11 +1843,7 @@ impl WeightBinding {
                     let Some(cache) = cache else {
                         return Ok(None);
                     };
-                    let (table, unit_bytes) = {
-                        let cache = lock(&cache);
-                        (segment_table(&cache), cache.unit_bytes())
-                    };
-                    let Some(table) = table else {
+                    let Some((table, unit_bytes)) = lock(&cache).segment_table(region) else {
                         return Ok(None);
                     };
 
@@ -1843,20 +1872,25 @@ impl WeightBinding {
         Ok(kept.into_iter().flatten().min())
     }
 
-    /// The room of the device of every rank of the worker groups `groups` whose KV planes are
-    /// split, the peers' after this process's: its GPU's identity, its room, and the device bytes
-    /// one unit of its planes takes, which a release of a unit gives back to the quota and the
-    /// device alike. What a release to make room for other storage decides from; a GPU's
+    /// The room of the device of every rank of the worker groups `groups` whose memory of device
+    /// region `region` is split, the peers' after this process's: its GPU's identity, its room,
+    /// and the device bytes one unit of that memory takes, which a release of a unit gives back to
+    /// the quota and the device alike. What a release to make room for other storage decides from; a GPU's
     /// identity names it on whichever host it is.
     ///
     /// # Errors
     ///
     /// When a rank's quota, device or identity cannot be read, here or on a peer's host.
-    pub(crate) fn device_rooms(&self, groups: &[GroupId]) -> Result<Vec<([u8; 16], Room, u64)>> {
+    pub(crate) fn device_rooms(
+        &self,
+        groups: &[GroupId],
+        region: u8,
+    ) -> Result<Vec<([u8; 16], Room, u64)>> {
         let answers = self.ask_peers(Some(groups), || DataOperation::DeviceRooms {
             groups: groups.to_vec(),
+            region,
         })?;
-        let here = self.device_rooms_here(groups);
+        let here = self.device_rooms_here(groups, region);
         let (mut rooms, peers) = both(here, answered::<Vec<([u8; 16], Room, u64)>>(answers))?;
         rooms.extend(peers.into_iter().flatten());
         Ok(rooms)
@@ -1870,17 +1904,18 @@ impl WeightBinding {
     pub(crate) fn device_rooms_here(
         &self,
         groups: &[GroupId],
+        region: u8,
     ) -> Result<Vec<([u8; 16], Room, u64)>> {
         Ok(self
-            .segment_facts(groups)?
+            .segment_facts(groups, region)?
             .into_iter()
             .map(|(gpu, room, _, unit_bytes)| (gpu, room, unit_bytes))
             .collect())
     }
 
-    /// What a segment decision reads of each rank of the worker groups `groups` whose KV planes
-    /// are split, in rank order.
-    fn segment_facts(&self, groups: &[GroupId]) -> Result<Vec<SegmentFacts>> {
+    /// What a segment decision reads of each rank of the worker groups `groups` whose memory of
+    /// device region `region` is split, in rank order.
+    fn segment_facts(&self, groups: &[GroupId], region: u8) -> Result<Vec<SegmentFacts>> {
         let mut facts = Vec::new();
         for rank in &self.ranks {
             let rank = lock(rank);
@@ -1890,11 +1925,7 @@ impl WeightBinding {
             let Some(cache) = rank.cache.as_ref() else {
                 continue;
             };
-            let (table, unit_bytes) = {
-                let cache = lock(cache);
-                (segment_table(&cache), cache.unit_bytes())
-            };
-            let Some(table) = table else {
+            let Some((table, unit_bytes)) = lock(cache).segment_table(region) else {
                 continue;
             };
 
@@ -1904,14 +1935,17 @@ impl WeightBinding {
     }
 
     /// The ranks' side of a sleep (module documentation): the graph pools are suspended and every
-    /// segment of every rank's KV planes is released. Returns each rank's segment table.
+    /// segment of every rank's KV planes and state units is released. Returns each rank's segment
+    /// table of its KV region.
     ///
     /// # Errors
     ///
     /// As [`Self::suspend_graphs`] and [`Self::release_segments`]; a wake undoes what was done.
     pub(crate) fn sleep(&self) -> Result<Vec<Option<CacheTable>>> {
         let answers = self.ask_peers(None, || DataOperation::Sleep)?;
-        let here = self.suspend_here().and_then(|()| self.release_of(None, 0));
+        let here = self
+            .suspend_here()
+            .and_then(|()| self.release_of(None, None, 0));
         let tables = joined_tables(here, answers)?;
 
         tracing::info!("the ranks sleep: their graph storage and KV planes are given back");
@@ -2516,8 +2550,8 @@ mod tests {
                 peer(3, vec![DECODE], kept(Some(38))),
             ],
             |binding| {
-                assert_eq!(binding.warm_segments(&[PREFILL]).unwrap(), Some(40));
-                assert_eq!(binding.warm_segments(&[DECODE]).unwrap(), Some(38));
+                assert_eq!(binding.warm_segments(&[PREFILL], 0).unwrap(), Some(40));
+                assert_eq!(binding.warm_segments(&[DECODE], 0).unwrap(), Some(38));
             },
         );
 
@@ -2546,8 +2580,8 @@ mod tests {
                 peer(3, vec![DECODE], fitting(Some(0))),
             ],
             |binding| {
-                assert_eq!(binding.fitting_segments(&[PREFILL]).unwrap(), 3);
-                assert_eq!(binding.fitting_segments(&[DECODE]).unwrap(), 0);
+                assert_eq!(binding.fitting_segments(&[PREFILL], 0).unwrap(), 3);
+                assert_eq!(binding.fitting_segments(&[DECODE], 0).unwrap(), 0);
             },
         );
 
@@ -2580,11 +2614,11 @@ mod tests {
             ],
             |binding| {
                 // Tables that agree are every rank's, in rank order.
-                let tables = binding.create_segments(&[GROUP], Some(2)).unwrap();
+                let tables = binding.create_segments(&[GROUP], 0, Some(2)).unwrap();
                 assert_eq!(tables, [Some(table(2)), Some(table(2))]);
 
                 // The head grants a segment only once every rank that maps the region holds it.
-                let refused = binding.create_segments(&[GROUP], Some(1)).unwrap_err();
+                let refused = binding.create_segments(&[GROUP], 0, Some(1)).unwrap_err();
                 assert!(
                     refused.to_string().contains("different segment tables"),
                     "{refused}"

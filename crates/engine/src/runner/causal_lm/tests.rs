@@ -702,6 +702,9 @@ fn filled(
 /// The region the test tables' runs lie in: the cache's units.
 const UNITS: u8 = 0;
 
+/// The region of the test cache's state units, one checkpoint each.
+const STATES: u8 = 1;
+
 /// The unit the test tables give the attention block at `position` of request slot `slot`:
 /// each slot's blocks apart from every other's, none of them the padding unit.
 fn unit(slot: u32, position: u32) -> u32 {
@@ -762,7 +765,7 @@ fn commit_entry(tables: &mut BlockTables, slot: u32, class: u8, at: u32) {
 /// The device block table of a rank on which each of `slots` is attached and holds a
 /// writable attention block at every position of a row, in [`unit`].
 fn held(slots: &[u32]) -> BlockTables {
-    let mut tables = BlockTables::new(GroupId(0), &[UNITS], &[]);
+    let mut tables = BlockTables::new(GroupId(0), &[UNITS, STATES], &[]);
     for &slot in slots {
         attach(&mut tables, slot);
         let runs: Vec<Run> = (0..TABLE_WIDTH as u32)
@@ -2366,8 +2369,8 @@ fn stepwise_shape() -> StateShape {
 }
 
 /// The rank's cache of the test model: one attention layer of the model's heads over
-/// [`PAGES`] units, a row of [`TABLE_WIDTH`] pages per request slot, and the state pages of a
-/// model that keeps a recurrent state.
+/// [`PAGES`] units, a row of [`TABLE_WIDTH`] pages per request slot, and a state region of 32
+/// checkpoints for a model that keeps a recurrent state.
 fn cache_config(stateful: bool) -> KvCacheConfig {
     let (heads, dim) = (HEADS as u32, DIM as u32);
     let dtype = proto::request::PrefixCacheDtype::BFloat16;
@@ -2384,6 +2387,7 @@ fn cache_config(stateful: bool) -> KvCacheConfig {
         width: TABLE_WIDTH as u32,
         segments: None,
         workspace_bytes: 1 << 16,
+        states: (if stateful { 32 } else { 0 }, None),
     }
 }
 
@@ -2438,13 +2442,14 @@ fn a_runner_over_the_rank_s_cache_and_state_profiles_and_captures_every_bucket()
     assert!(CausalLmRunner::over(model, self::config(), graphs, None, &fewer, None).is_err());
 }
 
-/// The regions a test cache's memory is numbered by: its units, and the host pages of each
-/// of its groups.
+/// The regions a test cache's memory is numbered by: its units, its state units when it keeps a
+/// state group, and the host pages of each of its groups.
 fn regions(cache: &KvCacheMemory) -> CacheRegions {
     let groups = cache.layout().groups.len();
 
     CacheRegions {
         units: UNITS,
+        states: cache.layout().state_group().map(|_| STATES),
         host: (0..groups).map(|group| Some(4 + group as u8)).collect(),
         sources: vec![None; groups],
     }
@@ -2683,7 +2688,6 @@ fn a_batch_with_no_rows_writes_the_tables_and_runs_the_copies_without_a_forward(
 fn a_state_checkpoint_is_read_and_written_at_the_run_its_position_names() {
     let config = cache_config(true);
     let state_class = config.layout.state_group().unwrap() as u8;
-    let span = config.layout.groups[state_class as usize].units_per_page;
     let cache = KvCacheMemory::meta(config.clone()).unwrap();
     let state = StateMemory::meta(
         StateConfig {
@@ -2701,10 +2705,10 @@ fn a_state_checkpoint_is_read_and_written_at_the_run_its_position_names() {
     let mut runner = wired(&cache, Some(&state));
 
     // Slot 1 holds a checkpoint at position 2 of its state table and slot 2 one at position
-    // 0, each a run of the units a state block spans.
+    // 0, each one unit of the state region.
     let mut tables = held(&[1, 2]);
-    allocate(&mut tables, 1, state_class, 2, &[(UNITS, 20, span)]);
-    allocate(&mut tables, 2, state_class, 0, &[(UNITS, 24, span)]);
+    allocate(&mut tables, 1, state_class, 2, &[(STATES, 20, 1)]);
+    allocate(&mut tables, 2, state_class, 0, &[(STATES, 24, 1)]);
     let copy = |slot, position, direction| StateCopy {
         slot,
         position,
@@ -2729,8 +2733,18 @@ fn a_state_checkpoint_is_read_and_written_at_the_run_its_position_names() {
     assert!(matches!(reached, Error::State(_)), "{reached}");
 
     let (restores, keeps) = wiring::state_copies(&lock(&cache), &batch, &tables).unwrap();
-    assert_eq!(restores, [(1, 20..20 + span)]);
-    assert_eq!(keeps, [(2, 24..24 + span)]);
+    assert_eq!(restores, [(1, 20)]);
+    assert_eq!(keeps, [(2, 24)]);
+
+    // An entry of more than one unit is no checkpoint: the batch is refused.
+    allocate(&mut tables, 1, state_class, 4, &[(STATES, 26, 2)]);
+    let mut wide = batch.clone();
+    wide.columns.state_copies[0].position = 4;
+    let message = runner.execute(&wide, &tables).unwrap_err().to_string();
+    assert!(
+        message.contains("one unit of the state region"),
+        "{message}"
+    );
 
     // A checkpoint at a position without an entry is refused before anything is launched.
     let mut missing = batch.clone();

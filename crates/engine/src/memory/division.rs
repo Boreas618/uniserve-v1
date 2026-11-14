@@ -408,6 +408,67 @@ pub(crate) fn cache_units(
         .map_err(|_| Error::Invalid("the cache exceeds the unit index range".into()))
 }
 
+/// The units of a rank's state region, each one checkpoint of `state_bytes` bytes on the rank,
+/// from `remainder`, the bytes its share leaves once its fixed regions and the storages of its
+/// `slots` request slots are taken out, for a model that keeps a recurrent state
+/// (`specs/engine-worker-port.md` §1.6):
+///
+/// - one checkpoint per request slot, the latest its running request keeps (the floor, which
+///   [`request_slots`] counted as part of a slot's cost);
+/// - and as many bytes again as the KV planes take: half of what the floor leaves of
+///   `remainder`, or, with `capacity` stated (the bytes of a stated token capacity's KV units),
+///   those bytes, as far as `remainder` holds them beside the capacity and the floor. SGLang sizes
+///   its Mamba pool at about the bytes of its KV pool (`mamba_full_memory_ratio`, 0.9 unless
+///   stated);
+/// - rounded down to whole segments of `segment` units, and up to at least the segments that hold
+///   the floor.
+///
+/// The KV planes take what the returned units leave of `remainder` ([`cache_units`]).
+///
+/// # Errors
+///
+/// [`Error::Invalid`] for a checkpoint of no bytes or a segment of no unit;
+/// [`Error::Unsupported`] with the shortfall when `remainder` does not hold the floor's segments.
+pub(crate) fn state_units(
+    remainder: u64,
+    state_bytes: u64,
+    slots: u32,
+    capacity: Option<u64>,
+    segment: u32,
+) -> Result<u32> {
+    if state_bytes == 0 || segment == 0 {
+        return Err(Error::Invalid(
+            "a state region's checkpoint bytes and its segment units must be positive".into(),
+        ));
+    }
+
+    let floor = u64::from(slots);
+    let segment = u64::from(segment);
+    let floor_bytes = floor.saturating_mul(state_bytes);
+    let left = remainder.saturating_sub(floor_bytes);
+    let more = match capacity {
+        None => left / 2 / state_bytes,
+        Some(bytes) => (bytes / state_bytes).min(left.saturating_sub(bytes) / state_bytes),
+    };
+
+    // Whole segments: the floor's rounded up, the rest's rounded down.
+    let least = floor.div_ceil(segment).max(1) * segment;
+    let units = (floor + more) / segment * segment;
+    let units = units.max(least);
+
+    let bytes = units.saturating_mul(state_bytes);
+    if bytes > remainder {
+        return Err(Error::Unsupported(format!(
+            "the GPU's quota cannot hold the rank's state region: {units} checkpoints of \
+             {state_bytes} bytes, the {slots} request slots' rounded up to whole segments of \
+             {segment}, take {bytes} bytes and {remainder} remain, {} short",
+            bytes - remainder
+        )));
+    }
+    u32::try_from(units)
+        .map_err(|_| Error::Invalid("the state region exceeds the unit index range".into()))
+}
+
 /// The calls of one request a rank holds unresolved at once: `depth` submitted batches of up
 /// to `calls` calls each, and never fewer than a producer and its consumer when one batch can
 /// hold both. What a rank reports as `crate::batch::Capacity::call_window`.
@@ -839,6 +900,47 @@ mod tests {
         });
 
         assert_eq!(counts, [25, 25, 25]);
+    }
+
+    /// A state region holds a checkpoint per request slot and, of what that floor leaves, as
+    /// many bytes again as the KV planes take, in whole segments, the floor's rounded up.
+    #[test]
+    fn a_state_region_holds_a_checkpoint_per_slot_and_the_bytes_of_the_kv_planes() {
+        // Checkpoints of 1 MiB in segments of four; 128 slots and 1 GiB left.
+        let (state, segment) = (MIB, 4);
+
+        // The floor takes 128 MiB; of the 896 left, half is 448 more checkpoints: 576 in all,
+        // whole segments already.
+        assert_eq!(state_units(GIB, state, 128, None, segment).unwrap(), 576);
+        // Two more MiB is one more checkpoint, which rounds down to the same segments.
+        assert_eq!(
+            state_units(GIB + 2 * MIB, state, 128, None, segment).unwrap(),
+            576
+        );
+
+        // A stated capacity whose KV units take 20 MiB adds 20 checkpoints beside the floor.
+        assert_eq!(
+            state_units(GIB, state, 128, Some(20 * MIB), segment).unwrap(),
+            148
+        );
+        // Of 130 slots the floor rounds up to 132, and a capacity of 1 MiB adds one, which
+        // rounds down to the floor's segments.
+        assert_eq!(
+            state_units(GIB, state, 130, Some(MIB), segment).unwrap(),
+            132
+        );
+        // A capacity beyond what the remainder holds beside it adds what is left: of 200 MiB,
+        // the floor's 100 and the capacity's 90 leave ten, 108 in whole segments.
+        assert_eq!(
+            state_units(200 * MIB, state, 100, Some(90 * MIB), segment).unwrap(),
+            108
+        );
+
+        // A remainder that holds not even the floor's segments is refused with the shortfall.
+        let short = state_units(130 * MIB, state, 130, None, segment).unwrap_err();
+        assert!(short.to_string().contains("2097152 short"), "{short}");
+        assert!(state_units(GIB, 0, 1, None, segment).is_err());
+        assert!(state_units(GIB, state, 1, None, 0).is_err());
     }
 
     #[test]

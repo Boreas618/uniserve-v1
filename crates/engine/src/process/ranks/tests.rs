@@ -1543,7 +1543,7 @@ fn the_e1_deployment_starts_within_its_gpu_s_quota_at_a_fraction_of_0_70() {
         GB200_GRANULE,
         &[peaks.graph],
         &[peaks.shadow],
-        layout.state_snapshot_bytes(),
+        layout.state_bytes(),
     );
 
     // The shadow region holds one paired call: the most one launch of a profiled forward carves,
@@ -1560,7 +1560,7 @@ fn the_e1_deployment_starts_within_its_gpu_s_quota_at_a_fraction_of_0_70() {
     assert_eq!(limit, 138_528_423_936);
     let unreserved = limit - RETAINED_WEIGHTS - WARM_PROCESS;
     let host = crate::parallel::host::HostGroup::single();
-    let (slots, units, first) = rank
+    let (slots, (units, first), states) = rank
         .model_runner
         .divide_unreserved(
             (unreserved, unreserved),
@@ -1574,6 +1574,8 @@ fn the_e1_deployment_starts_within_its_gpu_s_quota_at_a_fraction_of_0_70() {
         .unwrap();
     assert_eq!(slots, 128);
     assert!(units >= 2048, "the cache holds {units} units");
+    // A model that keeps no recurrent state has no state region.
+    assert_eq!(states, (0, 0));
 
     // The start creates the stated capacity whole before its warm-up: the quota holds it beside
     // the warm process the reservations below count.
@@ -1898,12 +1900,13 @@ fn a_host_numbers_its_text_ranks_by_their_places_in_the_deployment() {
     assert_eq!(numbered, vec![0, 1, 2, 3]);
 }
 
-/// A model that keeps a recurrent state copies it between its request slots and its cache's state
-/// pages with kernels whose keys carry the cache's units (a state plane's rows are the layout's
-/// columns times the units), which the load's profile run, over the fewest units, does not name.
-/// Once the session numbers the region, the rank's opening asks the Build Server, for the rank's
-/// device, for the kernels its cache launches over that numbering that its generation lacks, and
-/// the rank's kernels name them. A dense model's cache launches no such kernel and asks for none.
+/// A model that keeps a recurrent state copies it between its request slots and the units of its
+/// state region with kernels whose keys carry the region's units (the units' rows are the
+/// checkpoint planes times the units), which the load's profile run, over the fewest units, does
+/// not name. Once the session numbers the state region, the rank's opening asks the Build Server,
+/// for the rank's device, for the kernels its state launches over that numbering that its
+/// generation lacks, and the rank's kernels name them. A dense model's cache launches no such
+/// kernel and asks for none.
 #[test]
 fn a_rank_opening_resolves_the_kernels_of_its_cache_over_its_region_s_units() {
     let fixtures = [
@@ -1940,15 +1943,19 @@ fn a_rank_opening_resolves_the_kernels_of_its_cache_over_its_region_s_units() {
         )
         .unwrap();
 
-        // The region numbered for more units than the fewest, in whole segments, as a division
-        // of a device's quota numbers it.
-        let loaded = ranks[0].text().unwrap().units;
+        // The regions numbered for more units than the fewest, in whole segments, as a division
+        // of a device's quota numbers them.
+        let (loaded, loaded_states) = {
+            let text = ranks[0].text().unwrap();
+            (text.units, text.states.0)
+        };
         {
             let Loaded::Text(text) = &mut ranks[0].loaded else {
                 panic!("a text rank");
             };
             text.units = 40 * loaded;
             text.first = text.units;
+            text.states = (40 * loaded_states, 40 * loaded_states);
         }
         let (mut head, _pairs, open, opened) = opened_session(&server, &launch, &ranks);
 
@@ -1961,12 +1968,17 @@ fn a_rank_opening_resolves_the_kernels_of_its_cache_over_its_region_s_units() {
 
         let text = ranks[0].text().unwrap();
         let cache = service::lock(&text.cache);
-        let (units, layout) = (cache.config().units, cache.layout());
+        let (units, states, layout) = (
+            cache.config().units,
+            cache.config().states.0,
+            cache.layout(),
+        );
         assert_eq!(units, 40 * loaded);
+        assert_eq!(states, 40 * loaded_states);
         let shape = |units: u32| {
             format!(
                 "shape_{}x{}_",
-                u64::from(layout.columns) * u64::from(units),
+                u64::from(layout.checkpoint_planes()) * u64::from(units),
                 layout.plane_bytes
             )
         };
@@ -1988,10 +2000,10 @@ fn a_rank_opening_resolves_the_kernels_of_its_cache_over_its_region_s_units() {
         let (device, keys) = &asked[0];
         assert_eq!(*device, ranks[0].model_runner.devices()[0]);
         assert_eq!(
-            copies(keys, units),
+            copies(keys, states),
             ["cache_block_scatter", "cache_block_snapshot"]
         );
-        assert!(copies(keys, loaded).is_empty(), "{keys:?}");
+        assert!(copies(keys, loaded_states).is_empty(), "{keys:?}");
         assert!(keys.is_subset(&ranks[0].keys));
         drop(cache);
         head.close().unwrap();

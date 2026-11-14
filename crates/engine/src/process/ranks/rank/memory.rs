@@ -14,6 +14,13 @@
 //! memory of the buffer pool's region is the segments the ranks map or create once the session is
 //! open (`specs/buffer-pool.md` §14.1).
 //!
+//! A model that keeps a recurrent state per request keeps its checkpoints in the scheduler's
+//! state region beside the KV planes, one checkpoint a unit (`specs/engine-worker-port.md` §1.6):
+//! a request slot costs one checkpoint beside its storages, and the state region takes, beyond
+//! that floor, as many bytes as the KV planes (`division::state_units`). Its units are numbered,
+//! created and given back in whole segments of its own, as the KV region's are, its segments
+//! created before the KV region's.
+//!
 //! The region is numbered for what the quota holds as if the rank's epoch served the GPU alone,
 //! and the division counts the process as it is before the warm-up, whose instantiated graphs and
 //! library state the warm process adds (`specs/engine-worker-port.md` §1, "The process a
@@ -150,13 +157,15 @@ impl ModelRunner {
     }
 
     /// The cache of `layout` with `units` units, the padding unit included, made of `segments` on a
-    /// device (`None` for planes that are not split): the rank's request slots, and rows of the
-    /// pages a request of the model's length holds (step 6).
+    /// device (`None` for planes that are not split), and the state region's units with their
+    /// segments for a layout with a state group (`(0, None)` without): the rank's request slots,
+    /// and rows of the pages a request of the model's length holds (step 6).
     pub(crate) fn cache_config(
         &self,
         layout: Arc<CacheLayout>,
         units: u32,
         segments: Option<Vec<PlaneSegment>>,
+        states: (u32, Option<Vec<PlaneSegment>>),
     ) -> KvCacheConfig {
         let width = self
             .engine_config()
@@ -171,6 +180,7 @@ impl ModelRunner {
             width,
             segments,
             workspace_bytes: ATTENTION_WORKSPACE_BYTES,
+            states,
         }
     }
 
@@ -237,8 +247,8 @@ impl ModelRunner {
 
     /// The bytes the graph pool and the scratch pool of `device` map for runners of `peaks` over
     /// a cache of `layout` (step 13): each runner's region and shadow region (the causal runner's,
-    /// and a vision runner's), and the state snapshots of a model that keeps recurrent state, in
-    /// whole allocation granules.
+    /// and a vision runner's), and the state snapshot of a model that keeps recurrent state, one
+    /// state unit, in whole allocation granules.
     ///
     /// # Errors
     ///
@@ -256,7 +266,7 @@ impl ModelRunner {
             granularity(device)?,
             &regions,
             &shadows,
-            layout.state_snapshot_bytes(),
+            layout.state_bytes(),
         ))
     }
 
@@ -265,7 +275,8 @@ impl ModelRunner {
     /// slot's state and the outputs a speculating runner keeps (`CausalLmRunner::slot_bytes`,
     /// `CausalLmRunner::kept_bytes`), the cache's pooled page tables and the rest it keeps beside
     /// its planes (`KvCacheConfig::fixed_bytes`), and the recurrent state of a model that keeps
-    /// one (`StateConfig::bytes`).
+    /// one (`StateConfig::bytes`). The checkpoint a slot costs in the state region is not in it
+    /// ([`Self::divide_unreserved`]).
     ///
     /// # Errors
     ///
@@ -283,7 +294,12 @@ impl ModelRunner {
         let state = CausalLmRunner::slot_bytes(&config, model)?
             + CausalLmRunner::kept_bytes(&config, model)?;
         let tables = runner
-            .cache_config(Arc::clone(layout), least, None)
+            .cache_config(
+                Arc::clone(layout),
+                least,
+                None,
+                (fewest_states(layout), None),
+            )
             .fixed_bytes();
         let recurrent = runner
             .state_config(model, runner.buckets())
@@ -291,8 +307,9 @@ impl ModelRunner {
         Ok(state + tables + recurrent)
     }
 
-    /// The request slots, the units of the cache planes on `device` (steps 11-12 and 14-15) and
-    /// the units of them the rank's start creates: `(slots, units, first)`.
+    /// The request slots, the units of the cache planes on `device` (steps 11-12 and 14-15) with
+    /// the units of them the rank's start creates, and the same of the state region of a model
+    /// that keeps a recurrent state (zero without): `(slots, (units, first), (states, first))`.
     ///
     /// `regions` are the `(name, bytes)` of the rank's regions that do not grow with the request
     /// slots, made at its start: its graph and scratch pools ([`Self::pools`]) and, on a rank that
@@ -302,8 +319,15 @@ impl ModelRunner {
     /// The request slots are the deployment's running requests, or as many as what the GPU's
     /// quota holds now leaves once the weights are mapped and those regions and the cache's
     /// fewest units are taken out, when fewer fit ([`division::request_slots`]), each slot's
-    /// storages as [`Self::slot_storage`] states them; agreed over `host` as the fewest any of its
-    /// ranks holds, since the ranks of a group serve the same requests.
+    /// storages as [`Self::slot_storage`] states them and, for a model that keeps a recurrent
+    /// state, one checkpoint; agreed over `host` as the fewest any of its ranks holds, since the
+    /// ranks of a group serve the same requests.
+    ///
+    /// The state region's units are its floor of one checkpoint a slot and as many bytes again as
+    /// the KV planes take, in whole segments of its own (`division::state_units`), numbered and
+    /// agreed as the planes' units are; the planes take the rest. The start creates the state
+    /// region's segments first, as far as the quota holds them now, and the planes' from what is
+    /// left.
     ///
     /// The units are the region's numbering: what the GPU's quota leaves once the weights are
     /// mapped as if the epoch served the GPU alone, less those regions and the storages of the
@@ -322,6 +346,10 @@ impl ModelRunner {
     /// the bytes one needs), the region the quota cannot hold now, or a cache too small for one
     /// segment of whole granules: the memory of a device KV region is the segments its ranks
     /// create, and planes that do not split are none.
+    #[expect(
+        clippy::type_complexity,
+        reason = "the request slots, and the units and first units of each of the two regions"
+    )]
     pub(crate) fn divide(
         &self,
         client: &StorageClient,
@@ -330,7 +358,7 @@ impl ModelRunner {
         model: &dyn TextModel,
         layout: &Arc<CacheLayout>,
         regions: &[(&'static str, u64)],
-    ) -> Result<(u32, u32, u32)> {
+    ) -> Result<(u32, (u32, u32), (u32, u32))> {
         let granularity = granularity(device)?;
         let (share, _) = self.fractions()?;
         let unreserved = unreserved(client, device, share)?;
@@ -361,6 +389,10 @@ impl ModelRunner {
         reason = "the division's figures come from the quota, the device, the host group, the \
                   model, the layout, the pools and the expert union"
     )]
+    #[expect(
+        clippy::type_complexity,
+        reason = "the request slots, and the units and first units of each of the two regions"
+    )]
     pub(crate) fn divide_unreserved(
         &self,
         (now, alone): (u64, u64),
@@ -370,20 +402,24 @@ impl ModelRunner {
         layout: &Arc<CacheLayout>,
         regions: &[(&'static str, u64)],
         transport: u64,
-    ) -> Result<(u32, u32, u32)> {
+    ) -> Result<(u32, (u32, u32), (u32, u32))> {
         // The pools, the slots and the cache's tables are made at the start, so they fit what
-        // the quota holds now; the planes are numbered for what it holds the epoch alone.
+        // the quota holds now; the planes and the state region are numbered for what it holds
+        // the epoch alone.
         let mut pools = regions.to_vec();
         pools.push(("expert transport", transport));
         let least = fewest_units(layout);
+        let state_bytes = layout.state_bytes();
         let left = division::remainder(
             now,
             &pools,
             u64::from(least),
             &[("cache's fewest units", layout.unit_bytes)],
         )?;
+        // A slot of a model that keeps a recurrent state costs one checkpoint beside its storages.
         let slots = division::request_slots(self.slots(), left, |slots| {
-            self.slot_storage(model, layout, slots)
+            let checkpoints = u64::from(slots) * state_bytes;
+            Ok::<u64, anyhow::Error>(self.slot_storage(model, layout, slots)? + checkpoints)
         })?;
         let slots = host
             .all_reduce_min(&[i64::from(slots)])
@@ -402,9 +438,30 @@ impl ModelRunner {
             .engine_config()
             .kv_cache
             .max_tokens
-            .map(|tokens| layout.token_units(tokens.get(), u64::from(slots)));
-        let units =
-            division::cache_units(whole, layout.unit_bytes, u64::from(least), capacity, host)?;
+            .map(|tokens| layout.token_units(tokens.get()));
+
+        // The state region first: its floor and the KV planes' bytes again, agreed over the host
+        // group; the planes take what it leaves.
+        let states = if state_bytes > 0 {
+            let segment = segments::segment_units(state_bytes, granularity)
+                .context("a checkpoint of no bytes splits into no segment")?;
+            let kv_capacity = capacity.map(|units| units.saturating_mul(layout.unit_bytes));
+            let states = division::state_units(whole, state_bytes, slots, kv_capacity, segment)?;
+            let states = host
+                .all_reduce_min(&[i64::from(states)])
+                .context("agreeing the units of the ranks' state regions")?[0];
+            u32::try_from(states).context("a negative count of state units was agreed")?
+        } else {
+            0
+        };
+        let state_total = u64::from(states) * state_bytes;
+        let units = division::cache_units(
+            whole.saturating_sub(state_total),
+            layout.unit_bytes,
+            u64::from(least),
+            capacity,
+            host,
+        )?;
 
         // Whole segments, each the fewest units that fill whole granules of every column's
         // allocation: what a start, a grow and a wake create and a release gives back, so the
@@ -420,15 +477,24 @@ impl ModelRunner {
         }
 
         // Every rank of a region creates the same segments of it before its warm-up: every whole
-        // segment the quota holds now beside the process measured before the warm-up. The
-        // warm-up then grows the process outside the quota, and once warm the rank gives back
-        // the tail segments that no longer fit beside it (`epoch::keep_warm_segments`).
-        let first = first_units(units, layout, granularity, remainder);
-        let first = host
-            .all_reduce_min(&[i64::from(first)])
-            .context("agreeing the units the ranks create at their start")?[0];
-        let first = u32::try_from(first).context("a negative count of units was agreed")?;
-        Ok((slots, units, first))
+        // segment the quota holds now beside the process measured before the warm-up, the state
+        // region's first. The warm-up then grows the process outside the quota, and once warm
+        // the rank gives back the tail segments that no longer fit beside it
+        // (`epoch::keep_warm_segments`).
+        let first_states = first_states(states, state_bytes, granularity, remainder);
+        let first = first_units(
+            units,
+            layout,
+            granularity,
+            remainder.saturating_sub(u64::from(first_states) * state_bytes),
+        );
+        let agreed = host
+            .all_reduce_min(&[i64::from(first), i64::from(first_states)])
+            .context("agreeing the units the ranks create at their start")?;
+        let first = u32::try_from(agreed[0]).context("a negative count of units was agreed")?;
+        let first_states =
+            u32::try_from(agreed[1]).context("a negative count of state units was agreed")?;
+        Ok((slots, (units, first), (states, first_states)))
     }
 
     /// This rank's share of its GPU's storage, and the fraction of the GPU its epoch's quota of
@@ -482,6 +548,18 @@ pub(crate) fn first_units(
         .checked_sub(unsplit)
         .map_or(0, |left| left / segment);
     u32::try_from(fitting).unwrap_or(u32::MAX).min(count) * per_segment
+}
+
+/// The units of a state region of `states` units of `state_bytes` bytes, split into segments of
+/// whole `granularity`-byte granules, that `remainder` bytes hold now: as many whole segments
+/// from the first as it holds. Zero for a region of no unit or no byte.
+pub(crate) fn first_states(states: u32, state_bytes: u64, granularity: u64, remainder: u64) -> u32 {
+    let Some(per_segment) = segments::segment_units(state_bytes, granularity) else {
+        return 0;
+    };
+    let segment = (u64::from(per_segment) * state_bytes).max(1);
+    let fitting = u32::try_from(remainder / segment).unwrap_or(u32::MAX);
+    fitting.saturating_mul(per_segment).min(states)
 }
 
 /// The bytes of `device`'s quota a starting rank of `client`'s scope may divide (steps 11-12),
@@ -541,8 +619,9 @@ pub(crate) fn unreserved(
     Ok((now.min(own), alone.min(own)))
 }
 
-/// The segments of a cache of `units` units laid out in `layout` whose planes are allocated in
-/// granules of `granularity` bytes (step 16), given the region's segment table `table`
+/// The segments of a region of `units` units whose memory is allocated in granules of
+/// `granularity` bytes, a column of a unit taking `part_bytes` (a plane of the KV planes, or a
+/// whole state unit) (step 16), given the region's segment table `table`
 /// (`storage::runtime::Opened::segments`): the segments the table states, which the rank maps
 /// where their epoch created them (`segments::of_table`), then the segments `epoch` creates for
 /// the units past them up to `held`, the units the GPU's quota holds now
@@ -562,7 +641,7 @@ pub(crate) fn unreserved(
 pub(crate) fn plane_segments(
     epoch: u64,
     (units, held): (u32, u32),
-    layout: &CacheLayout,
+    part_bytes: u64,
     granularity: u64,
     table: &[(storage::Segment, u32, u32)],
 ) -> Result<(Vec<PlaneSegment>, Segments)> {
@@ -571,10 +650,9 @@ pub(crate) fn plane_segments(
     if covered > units {
         bail!("the region's segment table covers {covered} units of a cache of {units}");
     }
-    let plane_bytes = layout.plane_bytes;
-    let split = segments::own(epoch, units, plane_bytes, granularity).with_context(|| {
+    let split = segments::own(epoch, units, part_bytes, granularity).with_context(|| {
         format!(
-            "a cache of {units} units of {plane_bytes} plane bytes holds no segment of whole \
+            "a region of {units} units of {part_bytes} bytes a column holds no segment of whole \
              {granularity}-byte granules"
         )
     })?;
@@ -636,13 +714,21 @@ pub(crate) fn granularity(device: DeviceId) -> Result<u64> {
 }
 
 /// The fewest units a cache of `layout` serves with: the padding unit and one page of every cache
-/// group.
+/// group but the state group, whose pages lie in the state region.
 pub(crate) fn fewest_units(layout: &CacheLayout) -> u32 {
     1 + layout
         .groups
         .iter()
+        .filter(|group| !group.state())
         .map(|group| group.units_per_page)
         .sum::<u32>()
+}
+
+/// The fewest units of the state region a cache of `layout` is built over before its division (a
+/// profile run, a rank of no region): one checkpoint for a layout with a state group, none for
+/// one without. A divided rank's state region is whole segments of its own.
+pub(crate) fn fewest_states(layout: &CacheLayout) -> u32 {
+    u32::from(layout.state_group().is_some())
 }
 
 /// The element type the cache pool stores, from the deployment when it states one.
@@ -711,14 +797,13 @@ mod tests {
         assert_eq!(first_units(1024, &layout, GRANULE, unsplit - 1), 0);
     }
 
-    /// A hybrid cache's state planes are split with its key and value planes, a segment holding
-    /// the state planes of its units beside their keys and values: what the start makes for every
-    /// unit at once is a unit's flags alone, so a target of another layout creates its state as
-    /// the serving epoch drains, segment by segment, rather than whole at its start.
+    /// A hybrid cache keeps its checkpoints in the state region: a unit of the pool holds its
+    /// keys and values alone, and the state region's segments are whole checkpoints, created
+    /// first, as far as the quota holds them now.
     #[test]
-    fn a_hybrid_cache_creates_its_state_planes_with_its_segments() {
+    fn a_hybrid_cache_keeps_its_checkpoints_in_segments_of_their_own() {
         // Four attention layers and four recurrent ones, each of whose checkpoints fills one
-        // 32 KiB plane: four columns, and one state plane per column of a unit.
+        // 32 KiB plane: a checkpoint of four planes, 128 KiB, sixteen to a granule.
         let state = StateShape {
             layers: 4,
             fields: vec![StateField {
@@ -730,32 +815,31 @@ mod tests {
         };
         let layout =
             CacheLayout::hybrid(64, 4, 2, 128, PrefixCacheDtype::BFloat16, &[state]).unwrap();
-        assert_eq!((layout.columns, layout.state_fields()), (4, 1));
+        let state_bytes = layout.state_bytes();
+        assert_eq!(state_bytes, 4 * layout.plane_bytes);
+        assert_eq!(layout.split_bytes(), values(&layout));
+        assert_eq!(fewest_units(&layout), 2);
+        assert_eq!(fewest_states(&layout), 1);
 
-        // A unit's keys, values and state plane in every column split; its two flags a column
-        // do not.
-        let planes = 3 * u64::from(layout.columns) * layout.plane_bytes;
-        let flags = 2 * u64::from(layout.columns);
-        assert_eq!(layout.split_bytes(), planes);
-        assert_eq!(layout.unit_bytes, planes + flags);
+        // Sixteen checkpoints fill one granule: a segment of the state region.
+        assert_eq!(segments::segment_units(state_bytes, GRANULE), Some(16));
+        assert_eq!(first_states(64, state_bytes, GRANULE, 2 * GRANULE), 32);
+        assert_eq!(first_states(64, state_bytes, GRANULE, 2 * GRANULE - 1), 16);
+        assert_eq!(first_states(64, state_bytes, GRANULE, 10 * GRANULE), 64);
+        assert_eq!(first_states(64, 0, GRANULE, 10 * GRANULE), 0);
 
-        // 1024 units split into sixteen segments of 64: three of them and the flags of every unit
-        // fit, and a byte less leaves two.
-        let segment = 64 * planes;
-        assert_eq!(
-            first_units(1024, &layout, GRANULE, 1024 * flags + 3 * segment),
-            192
-        );
-        assert_eq!(
-            first_units(1024, &layout, GRANULE, 1024 * flags + 3 * segment - 1),
-            128
-        );
+        // The state region's segments are its own: a table of checkpoints is split by them.
+        let (segments, stated) = plane_segments(3, (64, 32), state_bytes, GRANULE, &[]).unwrap();
+        assert_eq!(segments.len(), 4);
+        assert_eq!(stated.len(), 2);
+        assert_eq!(stated[1].1, 16);
     }
 
     #[test]
     fn a_region_new_to_the_quota_creates_what_it_holds_and_leaves_the_rest_given_back() {
         let layout = layout();
-        let (segments, stated) = plane_segments(2, (1024, 192), &layout, GRANULE, &[]).unwrap();
+        let (segments, stated) =
+            plane_segments(2, (1024, 192), layout.plane_bytes, GRANULE, &[]).unwrap();
 
         // Every segment of the split is the cache's; the first three are created and granted,
         // the other thirteen left given back for a grow to create.
@@ -774,11 +858,11 @@ mod tests {
         );
 
         // The quota's figure is rounded down to whole segments, never up: 191 units hold two.
-        let (_, stated) = plane_segments(2, (1024, 191), &layout, GRANULE, &[]).unwrap();
+        let (_, stated) = plane_segments(2, (1024, 191), layout.plane_bytes, GRANULE, &[]).unwrap();
         assert_eq!(stated.len(), 2);
 
         // A region with no segment, which the quota holds none of, cannot open.
-        let error = plane_segments(2, (1024, 0), &layout, GRANULE, &[]).unwrap_err();
+        let error = plane_segments(2, (1024, 0), layout.plane_bytes, GRANULE, &[]).unwrap_err();
         assert!(format!("{error:#}").contains("holds none"), "{error:#}");
     }
 
@@ -789,7 +873,8 @@ mod tests {
         let table = [(first(0), 0, 64), (first(1), 64, 64)];
 
         // The two segments of the table are mapped; the third, which the quota holds, is created.
-        let (segments, stated) = plane_segments(2, (1024, 192), &layout, GRANULE, &table).unwrap();
+        let (segments, stated) =
+            plane_segments(2, (1024, 192), layout.plane_bytes, GRANULE, &table).unwrap();
         assert_eq!(segments.len(), 16);
         assert_eq!(segments[0].segment.epoch, 1);
         assert_eq!(
@@ -809,7 +894,8 @@ mod tests {
         let whole: Vec<_> = (0..16)
             .map(|ordinal| (first(ordinal), ordinal * 64, 64))
             .collect();
-        let (segments, stated) = plane_segments(2, (1024, 0), &layout, GRANULE, &whole).unwrap();
+        let (segments, stated) =
+            plane_segments(2, (1024, 0), layout.plane_bytes, GRANULE, &whole).unwrap();
         assert_eq!(segments.len(), 16);
         assert!(stated.is_empty());
     }

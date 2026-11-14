@@ -14,7 +14,10 @@
 //! - the **host tier** ([`host`]): the rank's parts of the host regions of the cache groups'
 //!   pages, which pages are loaded from and stored to on the rank's copy stream, with the
 //!   converted loads ([`conversion`]) of a cache that admits them;
-//! - the **scratch pages** ([`scratch`]) a shadow forward writes.
+//! - the **scratch pages** ([`scratch`]) a shadow forward writes;
+//! - for a model that keeps a recurrent state, the **state units** ([`states`]): the memory of
+//!   the scheduler's state region, one checkpoint a unit, which the state copies and the host
+//!   tier read and write.
 //!
 //! A model reads and writes none of this directly: the runner that holds the cache lends it for
 //! a forward as `nn::KvPlanes` and page-table tensors, external tensors over this memory.
@@ -43,13 +46,14 @@
 //!    the keeps.
 //!
 //! The class of cache group `g` is class `g` of the buffer pool, and the classes past the
-//! cache groups are no cache's.
+//! cache groups are no cache's. The state group's class takes its blocks from the state region,
+//! whose runs name state units; every other cache group's from the pool.
 //!
 //! ## Two epochs of one region
 //!
 //! Every storage of the planes is keyed by the region's memory, so a cache that another epoch
 //! opens from the region's segment table ([`segments::of_table`]) addresses the same cells:
-//! values, flags, scales, index keys and state planes. Nothing of the cache is copied or handed
+//! values, flags, scales and index keys; and the state units likewise by the state region's. Nothing of the cache is copied or handed
 //! over at an epoch switch (`specs/updates.md` §3.4): the buffer pool keeps the two epochs'
 //! blocks apart, and the units it gives an epoch are reset by that epoch's
 //! [`KvCacheMemory::apply`] before a batch writes them.
@@ -68,6 +72,7 @@ pub(crate) mod layout;
 mod planes;
 pub(crate) mod scratch;
 pub mod segments;
+mod states;
 mod tables;
 
 use std::collections::BTreeSet;
@@ -85,6 +90,7 @@ pub use self::layout::{CacheLayout, Checkpoint, GroupLayout};
 use self::planes::Planes;
 use self::scratch::ScratchPages;
 pub(crate) use self::segments::PlaneSegment;
+use self::states::StateUnits;
 use self::tables::PageTables;
 use crate::memory::allocation::Storage;
 use crate::memory::client::StorageClient;
@@ -109,11 +115,15 @@ pub struct KvCacheConfig {
     pub slots: u32,
     /// Pages per row of a pooled table: the pages a request of the model's length holds.
     pub width: u32,
-    /// The segments the value and state planes are made of on a device ([`segments`]), which hold
-    /// `units` units; `None` for planes that are not split.
+    /// The segments the value planes are made of on a device ([`segments`]), which hold `units`
+    /// units; `None` for planes that are not split.
     pub segments: Option<Vec<PlaneSegment>>,
     /// The bytes of the attention workspace a forward is lent.
     pub workspace_bytes: u64,
+    /// For a layout with a state group, the units of the state region (one checkpoint each) and
+    /// the segments they are made of on a device, `None` for units that are not split; zero
+    /// units and `None` for a layout without one.
+    pub states: (u32, Option<Vec<PlaneSegment>>),
 }
 
 impl KvCacheConfig {
@@ -125,11 +135,23 @@ impl KvCacheConfig {
             + conversion::device_bytes(&self.layout, self.width)
     }
 
-    /// Checks what the cache's tensors rely on: a workspace, and at least one attention group,
-    /// each of pages of one unit that fill a plane.
+    /// Checks what the cache's tensors rely on: a workspace, at least one attention group, each
+    /// of pages of one unit that fill a plane, and state units exactly when the layout keeps a
+    /// state group.
     fn check(&self) -> Result<()> {
         if self.layout.attention_groups() == 0 {
             return Err(Error::Invalid("a KV cache needs an attention group".into()));
+        }
+        if self.layout.state_group().is_some() != (self.states.0 > 0) {
+            return Err(Error::Invalid(format!(
+                "a cache {} a state group states {} state units",
+                if self.layout.state_group().is_some() {
+                    "with"
+                } else {
+                    "without"
+                },
+                self.states.0
+            )));
         }
         if self.workspace_bytes == 0 {
             return Err(Error::Invalid(
@@ -168,11 +190,14 @@ impl KvCacheConfig {
 
 /// The numbers the buffer pool gave the regions the cache's memory is (the answer to `Open`):
 /// what tells a run a completion states, `(region, first unit, count)`, as units of the pool,
-/// pages of the host tier or slots of a converted-load source buffer.
+/// state units, pages of the host tier or slots of a converted-load source buffer.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct CacheRegions {
     /// The region of the pool's units on the device: unit `u` of it is the pool's unit `u`.
     pub units: u8,
+    /// The state region, whose unit `u` is state unit `u`; `None` for a cache without a state
+    /// group.
+    pub states: Option<u8>,
     /// Per cache group, the host region of the group's pages: unit `u` of it is the group's host
     /// page `u`. `None` for a group whose pages have no host copy.
     pub host: Vec<Option<u8>>,
@@ -196,6 +221,8 @@ pub struct KvCacheMemory {
     host: Option<HostTier>,
     /// The scratch pages of shadow forwards, once opened ([`Self::open_scratch`]).
     scratch: Option<ScratchPages>,
+    /// The state units of a layout with a state group.
+    states: Option<StateUnits>,
 }
 
 impl KvCacheMemory {
@@ -209,6 +236,10 @@ impl KvCacheMemory {
     pub(crate) fn meta(config: KvCacheConfig) -> Result<Self> {
         config.check()?;
 
+        let states = match config.layout.state_group() {
+            Some(_) => Some(StateUnits::meta(&config.layout, config.states.0)?),
+            None => None,
+        };
         Ok(Self {
             planes: Planes::meta(Arc::clone(&config.layout), config.units)?,
             tables: PageTables::meta(
@@ -221,14 +252,15 @@ impl KvCacheMemory {
             regions: None,
             host: None,
             scratch: None,
+            states,
             config,
         })
     }
 
-    /// Opens the cache of `config` on `device`: takes its planes from `owner` (the rank's
-    /// Storage Server client, or storage local to the process), allocates its page tables and
-    /// workspace, and resets what was created for this rank on `stream`, which is synchronized
-    /// before returning.
+    /// Opens the cache of `config` on `device`: takes its planes and its state units from
+    /// `owner` (the rank's Storage Server client, or storage local to the process), allocates its
+    /// page tables and workspace, and resets what was created of the planes for this rank on
+    /// `stream`, which is synchronized before returning.
     ///
     /// # Errors
     ///
@@ -259,6 +291,16 @@ impl KvCacheMemory {
             stream,
         )?;
         let workspace = Storage::linear(device, config.workspace_bytes as usize)?;
+        let states = match config.layout.state_group() {
+            Some(_) => Some(StateUnits::open(
+                &config.layout,
+                config.states.0,
+                config.states.1.as_deref(),
+                device,
+                owner,
+            )?),
+            None => None,
+        };
 
         Ok(Self {
             config,
@@ -268,6 +310,7 @@ impl KvCacheMemory {
             regions: None,
             host: None,
             scratch: None,
+            states,
         })
     }
 
@@ -425,26 +468,86 @@ impl KvCacheMemory {
         }
     }
 
-    /// The segments the value and state planes are made of, in unit order; `None` for planes
-    /// that are not split.
+    /// The segments the value planes are made of, in unit order; `None` for planes that are not
+    /// split.
     pub fn segments(&self) -> Option<&[crate::memory::cache::info::CacheSegment]> {
         self.planes.segments()
     }
 
-    /// The segments the planes hold, `[0, held)`; zero for planes that are not split.
-    pub(crate) fn held_segments(&self) -> u32 {
-        self.planes.held_segments()
-    }
-
-    /// The device bytes one unit of the split planes holds over every column: both value planes
-    /// and its state planes (`CacheLayout::split_bytes`).
-    pub(crate) fn unit_bytes(&self) -> u64 {
-        self.planes.unit_bytes()
-    }
-
-    /// The bytes the planes map on the device; a sleeping rank's segments are not in it.
+    /// The bytes the planes and the state units map on the device; a sleeping rank's segments
+    /// are not in it.
     pub(crate) fn mapped_bytes(&self) -> u64 {
-        self.planes.mapped_bytes()
+        self.planes.mapped_bytes() + self.states.as_ref().map_or(0, StateUnits::mapped_bytes)
+    }
+
+    /// Whether `region` is the state region, as [`Self::set_regions`] stated it.
+    fn is_states(&self, region: u8) -> bool {
+        self.regions
+            .as_ref()
+            .is_some_and(|regions| regions.states == Some(region))
+    }
+
+    /// Whether `region` is the pool's region, as [`Self::set_regions`] stated it.
+    fn is_units(&self, region: u8) -> bool {
+        self.regions
+            .as_ref()
+            .is_some_and(|regions| regions.units == region)
+    }
+
+    /// The segment table of the device region `region` as this rank holds it, with the device
+    /// bytes one unit of its split memory takes, which a segment gives back per unit: the pool's
+    /// value planes (`CacheLayout::split_bytes`) or the state units (`CacheLayout::state_bytes`).
+    /// `None` for a region that is none of the cache's or whose memory is not split.
+    pub(crate) fn segment_table(
+        &self,
+        region: u8,
+    ) -> Option<(crate::memory::cache::info::CacheTable, u64)> {
+        let (segments, held, unit_bytes) = if self.is_units(region) {
+            (
+                self.planes.segments()?,
+                self.planes.held_segments(),
+                self.planes.unit_bytes(),
+            )
+        } else if self.is_states(region) {
+            let states = self.states.as_ref()?;
+            (
+                states.segments()?,
+                states.held_segments(),
+                states.unit_bytes(),
+            )
+        } else {
+            return None;
+        };
+        let table = crate::memory::cache::info::CacheTable {
+            segments: segments.to_vec(),
+            held,
+        };
+        Some((table, unit_bytes))
+    }
+
+    /// The device regions of the cache whose memory is split into segments, by number: the
+    /// pool's and the state region. Empty before [`Self::set_regions`].
+    pub(crate) fn split_regions(&self) -> Vec<u8> {
+        let Some(regions) = &self.regions else {
+            return Vec::new();
+        };
+        let mut split = Vec::new();
+        if self.planes.segments().is_some() {
+            split.push(regions.units);
+        }
+        if let (Some(states), Some(region)) = (&self.states, regions.states)
+            && states.segments().is_some()
+        {
+            split.push(region);
+        }
+        split
+    }
+
+    /// Where the Storage Server retains every state unit's bytes, run by run: what the rank
+    /// places for the state region (`storage::protocol::Request::Place`); empty for a cache
+    /// without a state group or whose units are local to its process.
+    pub(crate) fn state_plane_runs(&self) -> &[crate::memory::cache::info::CachePlaneRun] {
+        self.states.as_ref().map_or(&[], StateUnits::runs)
     }
 
     /// States the regions of the cache's memory, as the buffer pool numbered them in its
@@ -463,17 +566,33 @@ impl KvCacheMemory {
                 regions.sources.len()
             )));
         }
+        if regions.states.is_some() != self.states.is_some() {
+            return Err(Error::Invalid(format!(
+                "a state region is {} for a cache {} a state group",
+                if regions.states.is_some() {
+                    "stated"
+                } else {
+                    "not stated"
+                },
+                if self.states.is_some() {
+                    "with"
+                } else {
+                    "without"
+                }
+            )));
+        }
 
         self.regions = Some(regions);
         Ok(())
     }
 
     /// Whether `region` is memory of the cache, as [`Self::set_regions`] stated it: its units,
-    /// or a cache group's host pages or converted-load source buffer. A cache whose regions are
-    /// not stated holds none.
+    /// its state units, or a cache group's host pages or converted-load source buffer. A cache
+    /// whose regions are not stated holds none.
     pub(crate) fn holds(&self, region: u8) -> bool {
         self.regions.as_ref().is_some_and(|regions| {
             regions.units == region
+                || regions.states == Some(region)
                 || regions.host.contains(&Some(region))
                 || regions.sources.contains(&Some(region))
         })
@@ -484,8 +603,9 @@ impl KvCacheMemory {
     /// one that holds none: the units of each entry the buffer pool allocated since are reset
     /// (flags cleared, scales set to one, values left: a block is written before it is read),
     /// and the attention groups' pooled rows that changed are written. A change of a class
-    /// past the cache groups is no cache's and is skipped. Every change is checked before
-    /// anything is issued.
+    /// past the cache groups is no cache's and is skipped, and so is the reset of a state group's
+    /// entry, a unit of the state region, which a keep writes whole before a restore reads it.
+    /// Every change is checked before anything is issued.
     ///
     /// The order is the one a batch needs: the forward that follows on `stream` reads the
     /// pooled rows and writes the reset units.
@@ -502,12 +622,13 @@ impl KvCacheMemory {
         }
 
         let groups = self.config.layout.groups.len();
+        let state = self.config.layout.state_group();
         let mut resets = Vec::new();
         for change in changes {
             let Some((_, first, count)) = change.run.filter(|_| change.reset) else {
                 continue;
             };
-            if usize::from(change.class) >= groups {
+            if usize::from(change.class) >= groups || Some(usize::from(change.class)) == state {
                 continue;
             }
             if first == 0 || u64::from(first) + u64::from(count) > u64::from(self.config.units) {
@@ -616,7 +737,8 @@ impl KvCacheMemory {
     /// - units to units, a clone: every field of each unit is copied, in order, on `stream`
     ///   ([`Planes::copy_units`]);
     /// - a group's host page to units, a load, and units to a group's host page, a store: on
-    ///   the copy stream, through the host tier;
+    ///   the copy stream, through the host tier; the same for the state group's host page and a
+    ///   state unit, a checkpoint's load and store;
     /// - a slot of a group's converted-load source to units, a converted load: on the copy
     ///   stream.
     ///
@@ -630,8 +752,9 @@ impl KvCacheMemory {
     ///
     /// A cache whose regions are not stated; a copy between regions that are no cache memory,
     /// of runs of different units or a host run of more than one page; units outside the pool
-    /// or the padding unit; a host copy on a cache that maps no host tier; a stream stated for
-    /// a cache that holds no device, or the reverse; the driver's refusal.
+    /// or the padding unit, or a state unit outside the state region; a copy between state
+    /// units; a host copy on a cache that maps no host tier; a stream stated for a cache that
+    /// holds no device, or the reverse; the driver's refusal.
     pub(crate) fn copy(
         &self,
         copies: &[(Run, Run)],
@@ -666,10 +789,31 @@ impl KvCacheMemory {
             }
         };
 
+        // A device run is the pool's units or the state units; the state units copy only to and
+        // from the state group's host pages, since a clone of a checkpoint is refused (its live
+        // state is the slot's).
+        let device = |region: u8| region == regions.units || regions.states == Some(region);
+        let state_group = self
+            .config
+            .layout
+            .state_group()
+            .and_then(|group| u32::try_from(group).ok());
+        // A page of the state group copies to and from state units alone, and every other
+        // group's to and from the pool's units.
+        let matches = |group: u32, region: u8| {
+            (Some(group) == state_group) == (regions.states == Some(region))
+        };
         let (mut units, mut loads, mut converted, mut stores) =
             (Vec::new(), Vec::new(), Vec::new(), Vec::new());
         for &(from, to) in copies {
-            let (source, destination) = (from.0 == regions.units, to.0 == regions.units);
+            let (source, destination) = (device(from.0), device(to.0));
+            if source && destination && (from.0 != regions.units || to.0 != regions.units) {
+                return Err(Error::Invalid(format!(
+                    "a copy from region {} to region {} copies state units, which only a host \
+                     page loads and stores",
+                    from.0, to.0
+                )));
+            }
 
             match (source, destination) {
                 (true, true) if from.2 == to.2 => {
@@ -684,6 +828,13 @@ impl KvCacheMemory {
                 (false, true) => {
                     let block = to.1..to.1 + to.2;
                     if let Some(group) = group_of(&regions.host, from.0) {
+                        if !matches(group, to.0) {
+                            return Err(Error::Invalid(format!(
+                                "a load of cache group {group}'s page writes region {}, which \
+                                 holds no page of the group",
+                                to.0
+                            )));
+                        }
                         loads.push((group, page(from)?, block));
                     } else if let Some(group) = group_of(&regions.sources, from.0) {
                         converted.push((group, page(from)?, block));
@@ -703,6 +854,13 @@ impl KvCacheMemory {
                             to.0
                         ))
                     })?;
+                    if !matches(group, from.0) {
+                        return Err(Error::Invalid(format!(
+                            "a store of cache group {group}'s page reads region {}, which holds \
+                             no page of the group",
+                            from.0
+                        )));
+                    }
                     stores.push((group, page(to)?, from.1..from.1 + from.2));
                 }
                 (false, false) => {
@@ -714,11 +872,23 @@ impl KvCacheMemory {
             }
         }
 
-        // Every unit is checked before anything is issued.
+        // Every unit is checked before anything is issued: a page of the state group names state
+        // units, every other a block of the pool, which never holds the padding unit.
         self.planes.check_copies(&units)?;
+        let state = state_group;
         let paged: Vec<&HostPage> = loads.iter().chain(&converted).chain(&stores).collect();
-        for (_, _, block) in &paged {
-            if block.start == 0 || block.end > self.config.units {
+        for (group, _, block) in &paged {
+            if Some(*group) == state {
+                if block.len() != 1 || block.end > self.state_units() {
+                    return Err(Error::Invalid(format!(
+                        "a checkpoint's host copy names state units {}..{} of a state region of \
+                         units 0..{}, and a checkpoint is one unit",
+                        block.start,
+                        block.end,
+                        self.state_units()
+                    )));
+                }
+            } else if block.start == 0 || block.end > self.config.units {
                 return Err(Error::Invalid(format!(
                     "a host copy names units {}..{} of a pool of units 1..{}",
                     block.start, block.end, self.config.units
@@ -755,7 +925,7 @@ impl KvCacheMemory {
         if let Some(host) = host {
             match host.copy(
                 &self.config.layout,
-                &self.planes,
+                (&self.planes, self.states.as_ref()),
                 &loads,
                 &converted,
                 &stores,
@@ -795,39 +965,59 @@ impl KvCacheMemory {
         conversion::keys(&self.config.layout, self.config.units)
     }
 
-    /// Creates the segments given back again at their addresses, the first `limit` of them or
-    /// all, through `owner`, and resets their units on `stream`, which is synchronized before
-    /// returning. A wake of a cache that gave nothing back, or whose planes are not split,
-    /// does nothing.
+    /// Creates the segments of the device region `region` given back again at their addresses,
+    /// the first `limit` of them or all, through `owner`: the pool's value planes, whose units
+    /// are reset on `stream`, which is synchronized before returning, or the state units. A wake
+    /// of a region that gave nothing back, whose memory is not split or that is none of the
+    /// cache's, does nothing.
     ///
     /// # Errors
     ///
-    /// When `owner` or the stream fails; the cache is then as asleep as it was.
+    /// When `owner` or the stream fails; the region's memory is then as asleep as it was.
     pub(crate) fn wake(
         &mut self,
+        region: u8,
         owner: &dyn ExclusiveStorage,
         stream: &Stream,
         limit: Option<u32>,
     ) -> Result<()> {
-        if self.planes.segments().is_none() {
-            return Ok(());
+        if self.is_units(region) && self.planes.segments().is_some() {
+            return self.planes.restore_segments(owner, stream, limit);
         }
-        self.planes.restore_segments(owner, stream, limit)
+        if self.is_states(region)
+            && let Some(states) = self
+                .states
+                .as_mut()
+                .filter(|states| states.segments().is_some())
+        {
+            return states.restore_segments(owner, limit);
+        }
+        Ok(())
     }
 
-    /// Gives back the segments from `first` on, through `owner`: a region of another layout
-    /// needs their storage. The buffer pool withdrew their units and no device work addresses
-    /// them.
+    /// Gives back the segments of the device region `region` from `first` on, through `owner`:
+    /// the pool's value planes or the state units. The buffer pool withdrew their units and no
+    /// device work addresses them.
     ///
     /// # Errors
     ///
-    /// For planes that are not split, or when `owner` fails.
+    /// A region that is none of the cache's or whose memory is not split, or when `owner` fails.
     pub(crate) fn release_segments(
         &mut self,
+        region: u8,
         first: u32,
         owner: &dyn ExclusiveStorage,
     ) -> Result<()> {
-        self.planes.release_segments(first, owner)
+        if self.is_units(region) {
+            return self.planes.release_segments(first, owner);
+        }
+        let states = self.is_states(region);
+        match self.states.as_mut().filter(|_| states) {
+            Some(states) => states.release_segments(first, owner),
+            None => Err(Error::Invalid(format!(
+                "region {region} is none of the cache's device regions"
+            ))),
+        }
     }
 
     /// Opens the scratch page set of shadow forwards, `pages` pages, whose table rows are as
@@ -961,12 +1151,36 @@ impl KvCacheMemory {
         scratch.copy_history(&self.planes, layout, &history, stream)
     }
 
-    /// The state group's checkpoint planes, one tensor per field run of a state page:
-    /// `[columns · units, plane_bytes]` U8, plane `(column, unit)` at row
-    /// `column · units + unit`. The copies of recurrent state read and write state pages
-    /// through them. Empty for a cache without a state group.
-    pub(crate) fn state_runs(&self) -> Result<Vec<Tensor>> {
-        self.planes.state_runs()
+    /// The state units as `[units · checkpoint_planes, plane_bytes]` U8, plane `p` of unit `u`
+    /// at row `u · checkpoint_planes + p` ([`Self::state_rows`]): what the copies of recurrent
+    /// state gather from and scatter into.
+    ///
+    /// # Errors
+    ///
+    /// A cache without a state group.
+    pub(crate) fn state_tensor(&self) -> Result<Tensor> {
+        self.states()?.tensor()
+    }
+
+    /// The rows of [`Self::state_tensor`] state unit `unit`'s planes lie in, in plane order.
+    ///
+    /// # Errors
+    ///
+    /// A cache without a state group, or a unit outside the state region.
+    pub(crate) fn state_rows(&self, unit: u32) -> Result<std::ops::Range<i64>> {
+        self.states()?.rows(unit)
+    }
+
+    /// The units of the state region; zero for a cache without a state group.
+    pub(crate) fn state_units(&self) -> u32 {
+        self.states.as_ref().map_or(0, StateUnits::units)
+    }
+
+    /// The state units, or the refusal of a cache without a state group.
+    fn states(&self) -> Result<&StateUnits> {
+        self.states
+            .as_ref()
+            .ok_or_else(|| Error::Invalid("the cache keeps no state group".into()))
     }
 }
 
@@ -977,14 +1191,15 @@ mod tests {
 
     use super::*;
 
-    /// The regions the tests number the cache's memory by: its units, and the host pages of
-    /// each of up to three groups.
+    /// The regions the tests number the cache's memory by: its units, its state units, and the
+    /// host pages of each of up to three groups.
     const UNITS: u8 = 0;
+    const STATES: u8 = 1;
     const HOST: [u8; 3] = [4, 5, 6];
 
     /// A model of two attention layers of 4-token pages of one 4-wide head, a recurrent state
-    /// of two layers and a drafter of one layer, over sixteen units, two request slots and
-    /// rows of four pages.
+    /// of two layers and a drafter of one layer, over sixteen units, a state region of eight
+    /// checkpoints, two request slots and rows of four pages.
     fn config() -> KvCacheConfig {
         let state = StateShape {
             layers: 2,
@@ -1006,6 +1221,7 @@ mod tests {
             width: 4,
             segments: None,
             workspace_bytes: 1 << 10,
+            states: (8, None),
         }
     }
 
@@ -1025,6 +1241,7 @@ mod tests {
             width: 4,
             segments: None,
             workspace_bytes: 1 << 10,
+            states: (0, None),
         }
     }
 
@@ -1044,10 +1261,12 @@ mod tests {
             .collect()
     }
 
-    /// The regions of a cache of `groups` cache groups whose pages have host copies.
+    /// The regions of a cache of `groups` cache groups whose pages have host copies: the hybrid
+    /// layout of [`config`] for three, with its state region, and [`two_groups`] for two.
     fn regions(groups: usize) -> CacheRegions {
         CacheRegions {
             units: UNITS,
+            states: (groups == 3).then_some(STATES),
             host: HOST[..groups].iter().copied().map(Some).collect(),
             sources: vec![None; groups],
         }
@@ -1199,10 +1418,16 @@ mod tests {
         let mut cache = KvCacheMemory::meta(config())?;
         let clone = ((UNITS, 3, 1), (UNITS, 4, 1));
 
-        // Runs mean nothing before the regions are stated.
+        // Runs mean nothing before the regions are stated, which name a state region exactly
+        // for a cache with a state group.
         let unstated = cache.copy(&[clone], None).err().expect("no regions");
         assert!(matches!(unstated, Error::State(_)), "{unstated}");
         assert!(cache.set_regions(regions(2)).is_err());
+        let stateless = CacheRegions {
+            states: None,
+            ..regions(3)
+        };
+        assert!(cache.set_regions(stateless).is_err());
         cache.set_regions(regions(3))?;
 
         let refused = |copy: (Run, Run)| {
@@ -1221,12 +1446,20 @@ mod tests {
         assert!(refused(((HOST[0], 3, 1), (HOST[1], 6, 1))).contains("none of the cache's"));
         assert!(refused(((HOST[0], 3, 2), (UNITS, 6, 1))).contains("one page"));
 
-        // A clone of a state block moves its state planes with every other field.
+        // A clone moves blocks of the pool of any unit count; a checkpoint is never cloned, and a
+        // checkpoint's host page is one state unit, and no unit of the pool.
         cache.copy(&[clone, ((UNITS, 5, 2), (UNITS, 8, 2))], None)?;
+        assert!(refused(((STATES, 3, 1), (STATES, 4, 1))).contains("copies state units"));
+        assert!(refused(((UNITS, 3, 1), (STATES, 4, 1))).contains("copies state units"));
+        assert!(refused(((HOST[2], 0, 1), (UNITS, 6, 1))).contains("holds no page of the group"));
+        assert!(refused(((HOST[0], 0, 1), (STATES, 6, 1))).contains("holds no page of the group"));
+        assert!(refused(((STATES, 6, 1), (HOST[0], 0, 1))).contains("holds no page of the group"));
+        assert!(refused(((HOST[2], 0, 1), (STATES, 6, 2))).contains("one unit"));
+        assert!(refused(((HOST[2], 0, 1), (STATES, 8, 1))).contains("units 0..8"));
 
-        // A copy through the host tier needs one.
+        // A copy through the host tier needs one, the first checkpoint's included.
         let load = cache
-            .copy(&[((HOST[2], 0, 1), (UNITS, 6, 2))], None)
+            .copy(&[((HOST[2], 0, 1), (STATES, 0, 1))], None)
             .err()
             .expect("no host tier");
         assert!(load.to_string().contains("no host tier"), "{load}");
@@ -1242,7 +1475,7 @@ mod tests {
 
         assert_eq!(cache.mapped_bytes(), 0);
         assert!(cache.segments().is_none());
-        assert!(cache.release_segments(0, &local).is_err());
+        assert!(cache.release_segments(UNITS, 0, &local).is_err());
 
         cache.set_regions(regions(3))?;
         assert!(cache.copy(&[], None)?.is_empty());
@@ -1437,24 +1670,33 @@ mod tests {
             slots: 2,
             width: 4,
             workspace_bytes: 1 << 20,
+            states: (0, None),
         };
         let mut cache = KvCacheMemory::open(config, device, &local, &stream)?;
-        let held = cache.held_segments();
+        cache.set_regions(CacheRegions {
+            units: UNITS,
+            states: None,
+            host: vec![None],
+            sources: vec![None],
+        })?;
+        let held_of = |cache: &KvCacheMemory| {
+            cache
+                .segment_table(UNITS)
+                .map_or(0, |(table, _)| table.held)
+        };
+        let held = held_of(&cache);
         let mapped = cache.mapped_bytes();
         assert!(held > 0);
 
         // A sleep gives back every segment.
-        cache.release_segments(0, &local)?;
-        assert_eq!(cache.held_segments(), 0);
+        cache.release_segments(UNITS, 0, &local)?;
+        assert_eq!(held_of(&cache), 0);
         assert!(cache.mapped_bytes() < mapped);
 
-        cache.wake(&local, &stream, Some(1))?;
-        assert_eq!(cache.held_segments(), 1);
-        cache.wake(&local, &stream, None)?;
-        assert_eq!(
-            (cache.held_segments(), cache.mapped_bytes()),
-            (held, mapped)
-        );
+        cache.wake(UNITS, &local, &stream, Some(1))?;
+        assert_eq!(held_of(&cache), 1);
+        cache.wake(UNITS, &local, &stream, None)?;
+        assert_eq!((held_of(&cache), cache.mapped_bytes()), (held, mapped));
         Ok(())
     }
 }

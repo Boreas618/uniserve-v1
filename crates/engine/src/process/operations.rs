@@ -279,8 +279,9 @@ pub(crate) fn sleep(
         replied.recv().map_err(|_| stopped(index))?;
     }
 
-    // Every segment leaves its space's ledger before any rank releases it: a segment the ledger
-    // still held would be given to a region with no memory behind it.
+    // Every segment of every device region, the KV planes' and the state units', leaves its
+    // space's ledger before any rank releases it: a segment the ledger still held would be given
+    // to a region with no memory behind it.
     {
         let mut head = lock(head);
         let regions = epoch::kv_regions(epoch::session(&head)?.0);
@@ -326,7 +327,8 @@ pub(crate) fn wake(
 ///
 /// For each region of the KV planes, the segments released are the fewest from the tail whose
 /// release leaves every device of the region's ranks the room; segment 0 is kept. Every region
-/// is decided before any changes.
+/// is decided before any changes. A state region gives nothing back here: its checkpoints are
+/// the request slots' (`specs/engine-worker-port.md` §1.6).
 ///
 /// # Errors
 ///
@@ -349,6 +351,9 @@ pub(crate) fn make_room(
         let head = lock(head);
         let (open, opened) = epoch::session(&head)?;
         for index in epoch::kv_regions(open) {
+            if epoch::is_state_region(open, index) {
+                continue;
+            }
             let (Some(stated), Some(&(number, _)), Some(table)) = (
                 open.regions.get(index),
                 opened.regions.get(index),
@@ -356,7 +361,7 @@ pub(crate) fn make_room(
             ) else {
                 continue;
             };
-            let rooms = binding.device_rooms(&epoch::groups_of(open, index))?;
+            let rooms = binding.device_rooms(&epoch::groups_of(open, index), number)?;
 
             // The release from `first` on gives each device the bytes of the segments there.
             let leaves_room = |first: usize| {
@@ -413,7 +418,7 @@ pub(crate) fn make_room(
             )
         };
         // What the head withdrew is released whatever stopped the withdrawals.
-        binding.release_segments(&groups, u32::try_from(from).unwrap_or(u32::MAX))?;
+        binding.release_segments(&groups, number, u32::try_from(from).unwrap_or(u32::MAX))?;
         withdrawn.context("withdrawing the KV cache's tail segments")?;
     }
     Ok(())
@@ -530,21 +535,33 @@ fn operate(
     use DataOperation as Operation;
 
     let reply = match operation {
-        Operation::ReleaseSegments { groups, from } => {
-            let released = binding.release_segments(&groups, from)?;
+        Operation::ReleaseSegments {
+            groups,
+            region,
+            from,
+        } => {
+            let released = binding.release_segments(&groups, region, from)?;
             let devices: Vec<u32> = released
                 .into_iter()
                 .flat_map(|(_, devices)| devices)
                 .collect();
             encoded(&devices)
         }
-        Operation::CreateSegments { groups, count } => {
-            encoded(&binding.create_segments(&groups, count)?)
+        Operation::CreateSegments {
+            groups,
+            region,
+            count,
+        } => encoded(&binding.create_segments(&groups, region, count)?),
+        Operation::SegmentTables { groups, region } => {
+            encoded(&binding.segment_tables(&groups, region)?)
         }
-        Operation::SegmentTables { groups } => encoded(&binding.segment_tables(&groups)?),
-        Operation::FittingSegments { groups } => encoded(&binding.fitting_here(&groups)?),
-        Operation::DeviceRooms { groups } => encoded(&binding.device_rooms(&groups)?),
-        Operation::WarmSegments { groups } => encoded(&binding.warm_here(&groups)?),
+        Operation::FittingSegments { groups, region } => {
+            encoded(&binding.fitting_here(&groups, region)?)
+        }
+        Operation::DeviceRooms { groups, region } => {
+            encoded(&binding.device_rooms(&groups, region)?)
+        }
+        Operation::WarmSegments { groups, region } => encoded(&binding.warm_here(&groups, region)?),
         Operation::Room => encoded(&binding.room()?),
         Operation::GraphBytes => encoded(&binding.graph_bytes_here()),
         Operation::Sleep => encoded(&binding.sleep()?),

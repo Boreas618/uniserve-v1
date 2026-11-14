@@ -1,5 +1,5 @@
-//! Recurrent state on a device: a keep and a restore move a slot's state through a state page
-//! of the KV cache, and a settle takes a trail's entry as a slot's live state.
+//! Recurrent state on a device: a keep and a restore move a slot's state through a unit of the
+//! state region, and a settle takes a trail's entry as a slot's live state.
 //!
 //! Every case needs GPU 0; the case that launches the block-copy kernels also needs a running
 //! Build Server (`UNISERVE_BUILD_SERVER_SOCKET`). Run them on a GPU host:
@@ -61,7 +61,7 @@ fn shape() -> StateShape {
 }
 
 /// The cache of two attention layers of 4-token pages of one 8-wide BF16 head beside that
-/// state: a state page is two units.
+/// state, with a state region of eight checkpoints of four 64-byte planes each.
 fn cache() -> Outcome<KvCacheConfig> {
     let layout = CacheLayout::hybrid(4, 2, 1, 8, PrefixCacheDtype::BFloat16, &[shape()])?;
 
@@ -72,6 +72,7 @@ fn cache() -> Outcome<KvCacheConfig> {
         width: 4,
         segments: None,
         workspace_bytes: 1 << 20,
+        states: (8, None),
     })
 }
 
@@ -139,7 +140,7 @@ fn write_row(stream: &Stream, buffer: &Tensor, row: usize, values: &[f32]) -> Ou
 
 #[test]
 #[ignore = "requires a GPU and a Build Server"]
-fn a_keep_and_a_restore_move_a_checkpoint_through_a_state_page() -> Outcome {
+fn a_keep_and_a_restore_move_a_checkpoint_through_a_state_unit() -> Outcome {
     let stream = Stream::new(DEVICE)?;
     let cache_config = cache()?;
     let cache = KvCacheMemory::open(cache_config.clone(), DEVICE, &LocalStorage, &stream)?;
@@ -157,13 +158,13 @@ fn a_keep_and_a_restore_move_a_checkpoint_through_a_state_page() -> Outcome {
         kernels,
     )?;
 
-    // Slot 1's checkpoint row holds a pattern, which a keep moves into the page of units 5
-    // and 6 and a restore moves from there into slot 3's live row.
+    // Slot 1's checkpoint row holds a pattern, which a keep moves into state unit 5 and a
+    // restore moves from there into slot 3's live row.
     let pattern: Vec<f32> = (0..10).map(|value| value as f32).collect();
     write_row(&stream, &state.checkpoint()?[0][1], 0, &pattern)?;
 
-    state.copy(&cache, &[(1, 5..7)], StateDirection::Keep)?;
-    state.copy(&cache, &[(3, 5..7)], StateDirection::Restore)?;
+    state.copy(&cache, &[(1, 5)], StateDirection::Keep)?;
+    state.copy(&cache, &[(3, 5)], StateDirection::Restore)?;
 
     assert_eq!(read_row(&stream, &state.live()?[0][1], 2)?, pattern);
     Ok(())

@@ -20,9 +20,11 @@
 //! The session's layout, by region index: per group `g` its KV units (`kv-g`) and its slot rows
 //! (`slots-g`); the device buffers every group shares, which hold the sized classes (encoder
 //! outputs and media products); the host's KV pool when the deployment has a host tier; the host
-//! latent pool of stored trajectories. Its classes, in order: one per cache group of the model
-//! (class `c` is cache group `c`), the encoder outputs, one per media product kind, and the stored
-//! trajectories.
+//! latent pool of stored trajectories; and for a model that keeps a recurrent state, per group
+//! `g` its state units (`state-g`), one checkpoint each, as a rank states its state region
+//! (`specs/engine-worker-port.md` §1.6). Its classes, in order: one per cache group of the model
+//! (class `c` is cache group `c`), each block one unit of its region, the encoder outputs, one per
+//! media product kind, and the stored trajectories.
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::num::{NonZeroU32, NonZeroUsize};
@@ -110,6 +112,7 @@ const FEATURE_BYTES: u32 = 64;
 
 /// The bytes of a unit of each kind of region.
 const KV_UNIT: u64 = 4096;
+const STATE_UNIT: u64 = 1 << 20;
 const BUFFER_UNIT: u64 = 256;
 const LATENT_UNIT: u64 = 4096;
 
@@ -121,14 +124,17 @@ pub(crate) struct Deployment {
     groups: Vec<(WorkerGroupRole, Vec<Phase>)>,
     /// The model's cache groups, class `c` being cache group `c`: kind and block size in tokens.
     cache: Vec<(CacheGroupKind, u32)>,
-    /// The units one block of each cache group's class takes, by class; a class past the list
-    /// takes one.
-    block_units: Vec<u32>,
     /// The drafts a verification carries; 0 for a deployment that does not speculate.
     drafts: u32,
     /// The KV units of each group's region, and of the host's KV pool (0: no host tier).
     kv_units: u32,
     host_units: u32,
+    /// The checkpoints of each group's state region, for a model that keeps a recurrent state;
+    /// `None`: two per request slot, which no load of a case runs short of.
+    state_units: Option<u32>,
+    /// The decoded tokens between two checkpoints of a request's recurrent state
+    /// (`KvCacheConfig::state_interval`); `None`: the deployment's default.
+    state_interval: Option<NonZeroU32>,
     /// The units of the host latent pool, which holds stored trajectories.
     latent_units: u32,
     /// The request slots of each group.
@@ -169,10 +175,11 @@ impl Deployment {
         Self {
             groups: vec![(WorkerGroupRole::Model, vec![Phase::Prefill, Phase::Decode])],
             cache: vec![(CacheGroupKind::Full, BLOCK)],
-            block_units: Vec::new(),
             drafts: 0,
             kv_units: 256,
             host_units: 0,
+            state_units: None,
+            state_interval: None,
             latent_units: 1 << 12,
             slots: 8,
             rows: 8,
@@ -319,11 +326,16 @@ impl Deployment {
         self
     }
 
-    /// The units one block of each cache group's class takes, in class order (the draft cache
-    /// group, which [`Self::speculative`] appends, last): a recurrent-state checkpoint of a
-    /// hybrid model takes many units where a page of attention takes one.
-    pub(crate) fn block_units(mut self, units: &[u32]) -> Self {
-        self.block_units = units.to_vec();
+    /// The checkpoints of each group's state region, for a model that keeps a recurrent state:
+    /// a region of its own beside the KV region, one checkpoint a unit.
+    pub(crate) fn state_units(mut self, units: u32) -> Self {
+        self.state_units = Some(units);
+        self
+    }
+
+    /// The decoded tokens between two checkpoints of a request's recurrent state.
+    pub(crate) fn state_interval(mut self, tokens: u32) -> Self {
+        self.state_interval = NonZeroU32::new(tokens);
         self
     }
 
@@ -521,8 +533,28 @@ impl Deployment {
             self.latent_units,
         ));
 
-        // A KV block is one unit; a sized block states its units when it is asked for.
-        // A recurrent state's class holds its live state in the slot, as a rank states it.
+        // Per group, the state region of a model that keeps a recurrent state: no unit reserved,
+        // as a rank states it.
+        let state_class = self.class_of(|kind| kind.is_state());
+        let state_regions: Vec<u8> = match state_class {
+            Some(_) => (0..self.groups.len())
+                .map(|at| {
+                    regions.push(region(
+                        format!("state-{at}"),
+                        Tier::Device,
+                        STATE_UNIT,
+                        0,
+                        self.state_units.unwrap_or(2 * self.slots),
+                    ));
+                    index(regions.len() - 1)
+                })
+                .collect(),
+            None => Vec::new(),
+        };
+
+        // A KV block is one unit of its region, a checkpoint one of the state region; a sized
+        // block states its units when it is asked for. A recurrent state's class holds its live
+        // state in the slot, as a rank states it.
         let class = |units, host, state_in_slot| Class {
             units,
             host,
@@ -533,11 +565,7 @@ impl Deployment {
         let mut classes: Vec<Class> = self
             .cache
             .iter()
-            .enumerate()
-            .map(|(at, (kind, _))| {
-                let units = self.block_units.get(at).copied().unwrap_or(1);
-                class(units, host.map(|host| (host, 1)), kind.is_state())
-            })
+            .map(|(kind, _)| class(1, host.map(|host| (host, 1)), kind.is_state()))
             .collect();
         classes.extend((0..=PRODUCT_KINDS).map(|_| class(0, None, false)));
         classes.push(class(0, Some((latents, 0)), false));
@@ -547,7 +575,9 @@ impl Deployment {
             .map(|at| {
                 let kv = index(2 * at);
                 let per_class = (0..classes.len()).map(|class| {
-                    if class < self.cache.len() {
+                    if Some(class) == state_class.map(usize::from) {
+                        vec![state_regions[at]]
+                    } else if class < self.cache.len() {
                         vec![kv]
                     } else if class < usize::from(trajectory) {
                         vec![buffers]
@@ -628,9 +658,17 @@ impl Deployment {
     /// requests), the model's cache groups for a group that runs token calls, a bucket of the
     /// deployment's rows for each phase it serves (and its tokens for prefills), for a group that
     /// denoises the steps and the shapes of the harness's video requests, and for a group that
-    /// encodes the deployment's encoder identity.
+    /// encodes the deployment's encoder identity. A group of a model that keeps a recurrent state
+    /// serves no refill, as its ranks state none: a refill would evaluate positions behind its
+    /// slot's own from a state the runner has none of.
     fn capacity(&self, index: usize) -> Capacity {
-        let phases = &self.groups[index].1;
+        let stateful = self.class_of(|kind| kind.is_state()).is_some();
+        let phases: Vec<Phase> = self.groups[index]
+            .1
+            .iter()
+            .copied()
+            .filter(|phase| *phase != Phase::Refill || !stateful)
+            .collect();
         let serves = |phase| phases.contains(&phase);
         let tokens = [Phase::Prefill, Phase::Decode, Phase::Verify, Phase::Refill]
             .into_iter()
@@ -686,6 +724,7 @@ impl Deployment {
                     .max()
                     .and_then(NonZeroU32::new),
                 host_tier: self.host_units > 0,
+                state_interval: self.state_interval,
                 mooncake: self.remote.then(|| MooncakeConfig {
                     master: "localhost:50051".to_owned(),
                     metadata_server: "P2PHANDSHAKE".to_owned(),

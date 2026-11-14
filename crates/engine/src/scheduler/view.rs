@@ -10,8 +10,6 @@
 //! Time on the policy's wire is nanoseconds of the host's monotonic clock
 //! ([`super::monotonic_nanos`]); a policy only compares instants.
 
-use std::collections::BTreeSet;
-
 use crate::batch::Phase;
 use proto::config::WorkerGroupRole;
 use proto::request::RequestId;
@@ -299,7 +297,7 @@ impl Scheduler {
     /// - `inflight`: the batches submitted and not applied, and of them those that may carry
     ///   prefill work: per group, at most its prefill and refill calls in flight.
     pub(super) fn room(&self) -> Room {
-        let regions = self.cache_regions();
+        let regions = self.kv_regions();
         let kv_units = regions
             .iter()
             .map(|&region| u64::from(self.available.get(region).copied().unwrap_or(0)))
@@ -381,24 +379,6 @@ impl Scheduler {
             encodings,
             ..snapshot_of(&self.groups)
         }
-    }
-
-    /// The device regions the groups take blocks of a cache group from: the regions of the
-    /// classes of fixed-size blocks, as indices into the session's regions.
-    fn cache_regions(&self) -> BTreeSet<usize> {
-        let classes: Vec<u8> = self
-            .classes
-            .iter()
-            .enumerate()
-            .filter(|(_, class)| class.units > 0)
-            .filter_map(|(index, _)| u8::try_from(index).ok())
-            .collect();
-
-        self.groups
-            .iter()
-            .flat_map(|group| classes.iter().flat_map(|&class| group.regions(class)))
-            .map(|&region| usize::from(region))
-            .collect()
     }
 }
 

@@ -7,6 +7,12 @@
 //! attention reads the tokens an indexer selects keeps a third field beside them, the *index
 //! keys*: one plane per column of every unit, one key per `ratio` tokens of the column's page.
 //!
+//! A model that keeps a recurrent state per request keeps its checkpoints apart from the pool,
+//! in the scheduler's *state region* (`specs/engine-worker-port.md` §1.6): a state unit is one
+//! checkpoint of every recurrent layer, [`CacheLayout::checkpoint_planes`] planes of the pool's
+//! plane bytes back to back ([`CacheLayout::state_bytes`]), and the state group's page is one
+//! such unit. A unit of the pool holds no state.
+//!
 //! The model owns the shape of its cache layers, so the layout is derived from it
 //! ([`CacheLayout::dense`], [`CacheLayout::hybrid`], [`CacheLayout::with_index_keys`],
 //! [`CacheLayout::with_draft`]) and checked once ([`CacheLayout::validated`]). How many units
@@ -45,7 +51,8 @@ pub struct GroupLayout {
     pub kind: CacheGroupKind,
     /// Tokens of one page.
     pub block_size: u32,
-    /// Units one page occupies.
+    /// Units one page occupies: units of the pool for an attention or a draft group, units of
+    /// the state region for the state group, whose page is one checkpoint and one unit there.
     pub units_per_page: u32,
     /// This rank's layers in column order: layer `k` lies in column `k % columns` of a page's
     /// unit `k / columns`.
@@ -149,14 +156,14 @@ pub struct CacheLayout {
     pub plane_bytes: u64,
     /// Whether the planes store FP8 with one scale per plane.
     pub quantized: bool,
-    /// Device bytes one unit takes over every column: its planes, flags, scales, index keys
-    /// and state planes.
+    /// Device bytes one unit of the pool takes over every column: its planes, flags, scales and
+    /// index keys.
     pub unit_bytes: u64,
     /// The stored element type as the engine names it (`PrefixCacheInfo::dtype`).
     pub dtype: PrefixCacheDtype,
     /// The groups, attention groups first, then the draft group, the state group last.
     pub groups: Vec<GroupLayout>,
-    /// One checkpoint per recurrent layer, in the state page's plane order.
+    /// One checkpoint per recurrent layer, in the plane order of a unit of the state region.
     pub checkpoints: Vec<Checkpoint>,
     /// The dense representation whose pages the cache loads by converting them
     /// ([`Self::with_conversion`]); `None` for a cache that loads only pages of its own.
@@ -388,10 +395,11 @@ impl CacheLayout {
     /// # Errors
     ///
     /// When a group has no layers, a page of a group takes no unit or holds no token, a group
-    /// stores an element narrower than a byte, the groups' layer counts do not make the stated
-    /// columns, the state group is not the last group, the draft group does not lie over one
-    /// unit, a group's index keys are not whole groups of a cell's tokens that fill the
-    /// cache's index-key plane, or a unit is smaller than its planes.
+    /// stores an element narrower than a byte, the attention groups' layer counts do not make
+    /// the stated columns, the state group is not the last group or its page is not one unit of
+    /// the state region, the draft group does not lie over one unit, a group's index keys are
+    /// not whole groups of a cell's tokens that fill the cache's index-key plane, or a unit is
+    /// smaller than its planes.
     pub fn validated(self) -> Result<Self> {
         if self.groups.is_empty() {
             return Err(Error::Invalid(
@@ -442,13 +450,22 @@ impl CacheLayout {
                 last.layers
             )));
         }
+        if let Some(state) = self.groups.iter().find(|group| group.state())
+            && state.units_per_page != 1
+        {
+            return Err(Error::Invalid(format!(
+                "the state group's page is one unit of the state region, not {}",
+                state.units_per_page
+            )));
+        }
 
         // A draft group's layers lie over the columns of one unit instead of one cell each
-        // ([`Self::with_draft`]), so they bound no column count.
+        // ([`Self::with_draft`]), and the state group's pages lie in the state region, so neither
+        // bounds the column count.
         let columns = self
             .groups
             .iter()
-            .filter(|group| !group.draft())
+            .filter(|group| group.attention())
             .fold(0, |columns, group| gcd(columns, group.layers.len() as u32));
         if let Some(draft) = self.groups.iter().find(|group| group.draft())
             && (draft.layers.len() as u32 > self.columns || draft.units_per_page != 1)
@@ -516,44 +533,27 @@ impl CacheLayout {
         Ok(())
     }
 
-    /// The field runs a state page's checkpoints need; zero without a state group.
-    ///
-    /// One field run holds `units_per_page · columns` planes of the state group's page, and the
-    /// checkpoints' planes run across field runs in order, so the last checkpoint's last plane
-    /// decides how many runs the cache holds. A state plane never shares storage with a key or
-    /// value plane: every group indexes the same units, so the two at one (column, unit) are
-    /// different bytes.
-    pub fn state_fields(&self) -> u32 {
-        let Some(group) = self.groups.iter().find(|group| group.state()) else {
-            return 0;
-        };
-        let capacity = group.units_per_page.saturating_mul(self.columns);
-        if capacity == 0 {
-            return 0;
-        }
-        self.checkpoint_planes().div_ceil(capacity)
-    }
-
-    /// The device bytes one unit holds over every column in the planes a device cache splits
-    /// into segments: both value planes and each state field run's plane, which a segment's
-    /// release gives back and its creation takes (`crate::memory::cache::segments`). The flags,
-    /// scales and index keys of a unit are no part of it.
+    /// The device bytes one unit of the pool holds over every column in the planes a device
+    /// cache splits into segments: both value planes, which a segment's release gives back and
+    /// its creation takes (`crate::memory::cache::segments`). The flags, scales and index keys
+    /// of a unit are no part of it.
     pub fn split_bytes(&self) -> u64 {
-        (2 + u64::from(self.state_fields())) * u64::from(self.columns) * self.plane_bytes
+        2 * u64::from(self.columns) * self.plane_bytes
     }
 
-    /// The bytes of the snapshot a recurrent-state copy moves a state page through: every
-    /// checkpoint plane of the page. It is taken from the device's scratch pool once
-    /// ([`StateMemory`](crate::memory::state::StateMemory)); zero for a cache that keeps no
-    /// state checkpoints.
-    pub fn state_snapshot_bytes(&self) -> u64 {
+    /// The bytes of one unit of the state region on this rank: every recurrent layer's
+    /// checkpoint, [`Self::checkpoint_planes`] planes of [`Self::plane_bytes`] each. It is also
+    /// the snapshot a recurrent-state copy moves a unit through, which the device's scratch
+    /// pool holds once ([`StateMemory`](crate::memory::state::StateMemory)). Zero for a cache
+    /// that keeps no state group.
+    pub fn state_bytes(&self) -> u64 {
         if self.state_group().is_none() {
             return 0;
         }
         u64::from(self.checkpoint_planes()) * self.plane_bytes
     }
 
-    /// The planes of every checkpoint of a state page.
+    /// The planes of every checkpoint of a unit of the state region.
     pub fn checkpoint_planes(&self) -> u32 {
         self.checkpoints
             .iter()
@@ -562,9 +562,9 @@ impl CacheLayout {
             .unwrap_or(0)
     }
 
-    /// Where each field of recurrent layer `layer`'s checkpoint lies in a state page, in the
-    /// order of `fields`: the field's first plane among the page's planes and its bytes, which
-    /// fill whole planes from that one ([`Self::hybrid`]).
+    /// Where each field of recurrent layer `layer`'s checkpoint lies in a unit of the state
+    /// region, in the order of `fields`: the field's first plane among the unit's planes and its
+    /// bytes, which fill whole planes from that one ([`Self::hybrid`]).
     pub fn state_planes(&self, layer: u32, fields: &[StateField]) -> Vec<(u32, u64)> {
         let mut plane = self
             .checkpoints
@@ -612,26 +612,19 @@ impl CacheLayout {
         }
     }
 
-    /// The units a capacity of `tokens` tokens takes: the whole pages of those tokens in every
-    /// attention group, and one checkpoint of the state group per request slot of
-    /// `request_slots`, the latest each running request keeps. The draft group's pages take
-    /// units the capacity holds as far as they are free.
-    pub fn token_units(&self, tokens: u64, request_slots: u64) -> u64 {
+    /// The units of the pool a capacity of `tokens` tokens takes: the whole pages of those
+    /// tokens in every attention group. The draft group's pages take units the capacity holds as
+    /// far as they are free, and checkpoints lie in the state region.
+    pub fn token_units(&self, tokens: u64) -> u64 {
         self.groups
             .iter()
-            .filter(|group| !group.draft())
-            .map(|group| {
-                let pages = if group.state() {
-                    request_slots
-                } else {
-                    tokens / u64::from(group.block_size)
-                };
-                pages * u64::from(group.units_per_page)
-            })
+            .filter(|group| group.attention())
+            .map(|group| tokens / u64::from(group.block_size) * u64::from(group.units_per_page))
             .sum()
     }
 
-    /// Planes of one field one page of `group` spans: every column of every unit of the page.
+    /// Planes of one field one page of `group` spans in the pool: every column of every unit of
+    /// the page. A state page lies in the state region instead ([`Self::checkpoint_planes`]).
     pub(crate) fn page_planes(&self, group: &GroupLayout) -> u64 {
         u64::from(group.units_per_page) * u64::from(self.columns)
     }
@@ -639,15 +632,13 @@ impl CacheLayout {
     /// The cache of a model of `layers` attention layers and the recurrent state `runs`, the
     /// runs of recurrent layers that keep the same fields in the model's order of them
     /// (`nn::family::TextModel::state_layers`): one attention group as [`Self::dense`] lays it
-    /// out, and the state group after it, whose page holds every recurrent layer's checkpoint
-    /// in that order.
+    /// out, its units holding keys and values alone, and the state group after it, whose page is
+    /// one unit of the state region holding every recurrent layer's checkpoint in that order.
     ///
-    /// The columns are the common divisor of the attention layers and the recurrent layers of
-    /// every run. A checkpoint lays its layer's fields out in field order, each from a plane
-    /// boundary over the whole planes its bytes fill ([`Self::state_planes`]), and the
-    /// checkpoints follow each other; the state page spans as many units as those planes fill
-    /// in one field run, so a unit carries one state plane per column beside its key and value
-    /// planes. A checkpoint keeps one slot of every field, a stepwise one's included.
+    /// A checkpoint lays its layer's fields out in field order, each from a plane boundary over
+    /// the whole planes its bytes fill ([`Self::state_planes`]), and the checkpoints follow each
+    /// other, [`Self::checkpoint_planes`] planes in all ([`Self::state_bytes`]). A checkpoint
+    /// keeps one slot of every field, a stepwise one's included.
     ///
     /// # Errors
     ///
@@ -673,10 +664,6 @@ impl CacheLayout {
         }
 
         let mut layout = Self::dense(block_size, layers, kv_heads, head_dim, dtype);
-        let columns = gcd(layers, recurrent);
-        let per_column = layout.unit_bytes / u64::from(layout.columns);
-        layout.columns = columns;
-        layout.groups[0].units_per_page = layers / columns;
 
         // Every field starts at a plane boundary, so a copy moves whole planes, and every
         // layer's checkpoint starts where the one before it ends.
@@ -707,13 +694,11 @@ impl CacheLayout {
             planes += layer_planes;
         }
 
-        let units_per_page = u32::try_from(planes.div_ceil(u64::from(columns))).map_err(|_| {
-            Error::Invalid("a checkpoint fills more units than a page counts".into())
-        })?;
         layout.groups.push(GroupLayout {
             kind: CacheGroupKind::State,
             block_size,
-            units_per_page,
+            // One checkpoint is one unit of the state region.
+            units_per_page: 1,
             layers: (0..recurrent)
                 .map(|layer| format!("recurrent.{layer}"))
                 .collect(),
@@ -730,10 +715,6 @@ impl CacheLayout {
             index_keys: None,
         });
 
-        // A unit holds its key and value planes and flags per column, and one state plane per
-        // column of each field run its page's checkpoints span.
-        layout.unit_bytes = u64::from(columns) * per_column
-            + u64::from(layout.state_fields()) * u64::from(columns) * layout.plane_bytes;
         layout.validated()
     }
 
@@ -863,37 +844,9 @@ mod tests {
         }
     }
 
-    /// A state page's checkpoints need one field run per `units_per_page · columns` planes.
-    #[test]
-    fn a_state_page_asks_for_the_field_runs_its_checkpoints_span() {
-        let layout = |state: bool, checkpoints: Vec<(u32, u32)>| {
-            let mut layout = CacheLayout::dense(64, 2, 1, 8, PrefixCacheDtype::BFloat16);
-            if state {
-                layout.groups[0].kind = CacheGroupKind::State;
-            }
-            layout.checkpoints = checkpoints
-                .into_iter()
-                .map(|(first_plane, planes)| Checkpoint {
-                    first_plane,
-                    planes,
-                    fields: Vec::new(),
-                })
-                .collect();
-            layout
-        };
-
-        // Two columns and one unit per page: a field run holds two planes, so four need two.
-        assert_eq!(layout(true, vec![(0, 4)]).state_fields(), 2);
-        // A checkpoint that fills one field run exactly asks for one.
-        assert_eq!(layout(true, vec![(0, 2)]).state_fields(), 1);
-        // A cache with no state group asks for none.
-        assert_eq!(layout(false, vec![(0, 4)]).state_fields(), 0);
-        assert_eq!(layout(true, Vec::new()).state_fields(), 0);
-    }
-
     /// A hybrid cache of ten attention layers and thirty recurrent ones lays every recurrent
-    /// layer's checkpoint in whole planes of one field run, and a unit pays one state plane per
-    /// column beside its key and value planes.
+    /// layer's checkpoint in whole planes of one unit of the state region, and a unit of the pool
+    /// holds keys and values alone.
     #[test]
     fn a_hybrid_cache_lays_each_checkpoint_field_from_a_plane_boundary() -> Result<()> {
         let state = state();
@@ -914,21 +867,21 @@ mod tests {
         assert_eq!(layout.attention_groups(), 1);
 
         // 48 KiB of convolution window take one plane, 2 MiB of state thirty-two:
-        // thirty-three per layer, 990 for the page, which 99 units of ten columns hold in one
-        // field run.
+        // thirty-three per layer, 990 for the checkpoint, one unit of the state region of
+        // 990 planes, 61.9 MiB.
         assert_eq!(layout.checkpoint_planes(), 990);
-        assert_eq!(layout.groups[1].units_per_page, 99);
-        assert_eq!(layout.state_fields(), 1);
+        assert_eq!(layout.groups[1].units_per_page, 1);
+        assert_eq!(layout.state_bytes(), 990 * (64 << 10));
         assert_eq!(
             layout.state_planes(2, &state.fields),
             vec![(66, 48 << 10), (67, 2 << 20)]
         );
 
+        // A unit of the pool is a dense cache's: its keys and values.
         let dense = CacheLayout::dense(64, 10, 2, 256, PrefixCacheDtype::BFloat16);
-        assert_eq!(
-            layout.unit_bytes,
-            dense.unit_bytes + 10 * layout.plane_bytes
-        );
+        assert_eq!(layout.unit_bytes, dense.unit_bytes);
+        assert_eq!(layout.split_bytes(), 2 * 10 * layout.plane_bytes);
+        assert_eq!(dense.state_bytes(), 0);
         Ok(())
     }
 
@@ -1038,7 +991,8 @@ mod tests {
             keyed.state_planes(2, &state.fields),
             hybrid.state_planes(2, &state.fields)
         );
-        assert_eq!(keyed.token_units(640, 4), hybrid.token_units(640, 4));
+        assert_eq!(keyed.token_units(640), hybrid.token_units(640));
+        assert_eq!(keyed.state_bytes(), hybrid.state_bytes());
         Ok(())
     }
 
@@ -1131,15 +1085,26 @@ mod tests {
         Ok(())
     }
 
-    /// A token capacity takes whole pages of every attention group and one state page per
-    /// request slot.
+    /// A token capacity takes whole pages of every attention group, and nothing of the state
+    /// region or of the draft cache.
     #[test]
-    fn a_token_capacity_counts_pages_and_one_checkpoint_per_slot() -> Result<()> {
-        let layout = CacheLayout::hybrid(64, 10, 2, 256, PrefixCacheDtype::BFloat16, &[state()])?;
+    fn a_token_capacity_counts_the_attention_pages_alone() -> Result<()> {
+        let layout = CacheLayout::hybrid(64, 10, 2, 256, PrefixCacheDtype::BFloat16, &[state()])?
+            .with_draft(1, 2, 256)?;
 
-        // 640 tokens are ten attention pages of one unit; four slots keep four state pages of
-        // 99 units.
-        assert_eq!(layout.token_units(640, 4), 10 + 4 * 99);
+        // 640 tokens are ten attention pages of one unit; a partial page takes none.
+        assert_eq!(layout.token_units(640), 10);
+        assert_eq!(layout.token_units(700), 10);
+        Ok(())
+    }
+
+    /// A state group whose page spans more than one unit of the state region is refused.
+    #[test]
+    fn a_state_page_is_one_unit_of_the_state_region() -> Result<()> {
+        let mut layout =
+            CacheLayout::hybrid(64, 10, 2, 256, PrefixCacheDtype::BFloat16, &[state()])?;
+        layout.groups[1].units_per_page = 2;
+        assert!(layout.validated().is_err());
         Ok(())
     }
 }

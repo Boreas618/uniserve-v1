@@ -447,6 +447,7 @@ fn two_epochs_of_one_region_address_the_same_flags_and_scales() {
         width: 4,
         segments,
         workspace_bytes: 1 << 20,
+        states: (0, None),
     };
 
     // The serving epoch's rank creates the region's memory; the target's maps it from the

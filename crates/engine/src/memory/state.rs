@@ -1,5 +1,5 @@
 //! The recurrent state a causal language model keeps per request slot: its buffers, and the
-//! copies between them and the KV cache's state pages.
+//! copies between them and the units of the state region.
 //!
 //! A model whose layers keep a recurrent state states the fields each layer keeps, as runs of
 //! layers that keep the same ones (`nn::family::TextModel::state_layers`). [`StateMemory`]
@@ -43,19 +43,19 @@
 //!
 //! ## Copies
 //!
-//! Between forwards the state moves between the buffers and the cache's state pages through
-//! `cache_block_snapshot` and `cache_block_scatter` ([`StateMemory::copy`]): a keep gathers a
-//! slot's checkpoint row into the snapshot and scatters it into a page's planes after the
-//! forward, and a restore gathers a page's planes into the snapshot and scatters them into the
-//! slot's live home row before it. Which rows copy what is the scheduler's decision, stated in
-//! the batch by the checkpoint's position in the request's state table
-//! (`crate::batch::StateCopy`); the runner finds the page's run of units through the rank's
-//! device block table, and a keep writes only a block the table states writable.
+//! Between forwards the state moves between the buffers and the units of the state region, which
+//! the cache holds (`KvCacheMemory::state_tensor`), through `cache_block_snapshot` and
+//! `cache_block_scatter` ([`StateMemory::copy`]): a keep gathers a slot's checkpoint row into the
+//! snapshot and scatters it into a unit's planes after the forward, and a restore gathers a
+//! unit's planes into the snapshot and scatters them into the slot's live home row before it.
+//! Which rows copy what is the scheduler's decision, stated in the batch by the checkpoint's
+//! position in the request's state table (`crate::batch::StateCopy`); the runner finds the
+//! checkpoint's block, one run of one unit of the state region, through the rank's device block
+//! table, and a keep writes only a block the table states writable.
 //!
 //! A checkpoint lays each layer's fields out in field order from plane boundaries
-//! ([`CacheLayout::state_planes`]); plane `p` of a state page is column `q % columns` of the
-//! page's unit `q / columns` in field run `p / (units_per_page · columns)`, `q` being the
-//! plane's position in its run.
+//! ([`CacheLayout::state_planes`]); plane `p` of state unit `u` is row
+//! `u · checkpoint_planes + p` of the units (`KvCacheMemory::state_rows`).
 //!
 //! The two kernels name the rows they move by I64 index vectors on the device, the element type
 //! they read them in. A batch's vectors are written from the host as the copies are issued,
@@ -68,7 +68,6 @@
 //! tensors are meta tensors and its copies are checked and issue nothing.
 
 use std::collections::BTreeSet;
-use std::ops::Range;
 use std::sync::Arc;
 
 use crate::batch::StateDirection;
@@ -131,8 +130,7 @@ impl StateConfig {
     /// for a cache of `layout`: the live and checkpoint buffers of every field of every layer,
     /// each live buffer's rows ([`Self::live_rows`]), a checkpoint row per slot and the
     /// trail's row per token, the drafter's live row per slot of each of its fields, and the
-    /// copies' index vectors. The snapshot is the scratch pool's
-    /// ([`CacheLayout::state_snapshot_bytes`]).
+    /// copies' index vectors. The snapshot is the scratch pool's ([`CacheLayout::state_bytes`]).
     pub(crate) fn bytes(&self, layout: &CacheLayout) -> u64 {
         let (slots, trail) = (u64::from(self.slots), u64::from(self.trail));
         let buffers: u64 = layer_fields(&self.shapes)
@@ -166,7 +164,7 @@ impl StateConfig {
                 .any(|field| field.stepwise)
     }
 
-    /// The bytes of one set of index vectors: a slot row and a state page's planes for each of
+    /// The bytes of one set of index vectors: a slot row and a state unit's planes for each of
     /// the copies a batch may carry.
     fn index_bytes(&self, layout: &CacheLayout) -> u64 {
         2 * u64::from(self.rows) * (u64::from(layout.checkpoint_planes()) + 1) * 8
@@ -185,7 +183,7 @@ struct Buffers {
     /// `[drafter layer][field]` the drafter's live buffers; empty for a drafter that keeps no
     /// state.
     drafter: Vec<Vec<Buffer>>,
-    /// What one copy moves a state page through, `[page planes, plane_bytes]` bytes.
+    /// What one copy moves a state unit through, `[checkpoint planes, plane_bytes]` bytes.
     snapshot: Buffer,
     /// The copies' index vectors, [`RING`] sets.
     indices: Vec<Buffer>,
@@ -202,27 +200,21 @@ struct Buffers {
 /// The recurrent-state buffers of one rank and the copies that move them.
 pub struct StateMemory {
     config: StateConfig,
-    /// `[layer][field]` where each field lies in a state page: its first plane and its bytes.
+    /// `[layer][field]` where each field lies in a state unit: its first plane and its bytes.
     planes: Vec<Vec<(u32, u64)>>,
-    /// The planes of every checkpoint of a state page.
+    /// The planes of every checkpoint of a state unit.
     page_planes: u32,
     /// Bytes of one plane of the cache.
     plane_bytes: u64,
-    /// Columns of one unit of the cache.
-    columns: u32,
-    /// Units one state page spans.
-    units_per_page: u32,
-    /// Units of the cache's pool, the padding unit included.
+    /// Units of the state region.
     units: u32,
-    /// Field runs of a state page.
-    runs: u32,
     /// The memory on a device; `None` for a state that holds none.
     device: Option<Buffers>,
 }
 
 impl StateMemory {
-    /// The state of `config` over the state pages of a cache of `cache`, holding no device:
-    /// its tensors are meta tensors, and its copies are checked and issue nothing.
+    /// The state of `config` over the state units of a cache of `cache`, holding no device: its
+    /// tensors are meta tensors, and its copies are checked and issue nothing.
     ///
     /// # Errors
     ///
@@ -266,15 +258,14 @@ impl StateMemory {
         }
 
         let layout: &CacheLayout = &cache.layout;
-        let group = layout
-            .state_group()
-            .map(|group| &layout.groups[group])
-            .ok_or_else(|| {
-                Error::Invalid("a model that keeps a recurrent state needs a state group".into())
-            })?;
-        if layout.state_fields() == 0 || layout.checkpoints.len() != layers.len() {
+        if layout.state_group().is_none() {
+            return Err(Error::Invalid(
+                "a model that keeps a recurrent state needs a state group".into(),
+            ));
+        }
+        if layout.state_bytes() == 0 || layout.checkpoints.len() != layers.len() {
             return Err(Error::Invalid(format!(
-                "the cache's state pages hold the checkpoints of {} recurrent layers, and the \
+                "the cache's state units hold the checkpoints of {} recurrent layers, and the \
                  state keeps {}",
                 layout.checkpoints.len(),
                 layers.len()
@@ -307,15 +298,12 @@ impl StateMemory {
             planes,
             page_planes: layout.checkpoint_planes(),
             plane_bytes: layout.plane_bytes,
-            columns: layout.columns,
-            units_per_page: group.units_per_page,
-            units: cache.units,
-            runs: layout.state_fields(),
+            units: cache.states.0,
             device: None,
         })
     }
 
-    /// The state of `config` over the state pages of a cache of `cache`, on the device of
+    /// The state of `config` over the state units of a cache of `cache`, on the device of
     /// `allocator`: the buffers and index vectors are taken from its pool that lives as long
     /// as the rank serves, and the snapshot from its scratch pool. The copies are issued on
     /// `stream`, the stream of the runner that holds the state, and launch with `kernels`. The
@@ -363,13 +351,11 @@ impl StateMemory {
         let indices = (0..RING)
             .map(|_| allocator.allocate(PoolKind::Resident, index_bytes))
             .collect::<platform::Result<Vec<_>>>()?;
-        let snapshot = allocator.allocate(
-            PoolKind::Scratch,
-            cache.layout.state_snapshot_bytes() as usize,
-        )?;
+        let snapshot =
+            allocator.allocate(PoolKind::Scratch, cache.layout.state_bytes() as usize)?;
 
         // The context allocates nothing: every tensor of a copy is over the state's buffers,
-        // its snapshot, its index vectors or the cache's state planes.
+        // its snapshot, its index vectors or the cache's state units.
         let device = allocator.device();
         let ordinal = usize::try_from(device.0)
             .map_err(|_| Error::Invalid(format!("{device} names no GPU ordinal")))?;
@@ -529,38 +515,6 @@ impl StateMemory {
         .map(Some)
     }
 
-    /// The rows of the cache's state runs the planes of the state page in `units` lie in, in
-    /// plane order: each plane's field run and its row there, `column · units + unit`.
-    fn cells(&self, units: Range<u32>) -> Result<Vec<(usize, i64)>> {
-        if units.len() != self.units_per_page as usize {
-            return Err(Error::Invalid(format!(
-                "a state page of {} units, and the cache's state pages span {}",
-                units.len(),
-                self.units_per_page
-            )));
-        }
-        if units.start == 0 || units.end > self.units {
-            return Err(Error::Invalid(format!(
-                "a state page names units {}..{} of a pool of units 1..{}",
-                units.start, units.end, self.units
-            )));
-        }
-
-        let run = u64::from(self.units_per_page) * u64::from(self.columns);
-        Ok((0..u64::from(self.page_planes))
-            .map(|plane| {
-                let position = plane % run;
-                let column = position % u64::from(self.columns);
-                let unit = units.start + (position / u64::from(self.columns)) as u32;
-
-                (
-                    (plane / run) as usize,
-                    (column * u64::from(self.units) + u64::from(unit)) as i64,
-                )
-            })
-            .collect())
-    }
-
     /// The descriptor of a block copy over `field`, a `[blocks, width]` byte tensor.
     fn block_shape(field: &ops::Operand) -> BlockShape {
         BlockShape {
@@ -609,22 +563,15 @@ impl StateMemory {
 
     /// Launches one copy of `direction` by the context installed on this thread: between the
     /// row `slot` names of `buffers` (the raw live buffers of a restore, the raw checkpoint
-    /// buffers of a keep) and the planes `cells` names of the cache's state `runs`, through
-    /// the snapshot. `blocks(first, count)` is the I64 vector of entries
-    /// `first .. first + count` of the copy's cell rows, and `snapshot(offset, rows, width)`
-    /// the `[rows, width]` bytes `offset` bytes into the snapshot.
-    #[expect(
-        clippy::too_many_arguments,
-        reason = "one copy's direction, its two sides, its indices and where its tensors lie"
-    )]
+    /// buffers of a keep) and one unit's planes of the state units `units`, through the
+    /// snapshot. `planes` is the I64 vector of the unit's rows of `units`, and
+    /// `snapshot(offset, rows, width)` the `[rows, width]` bytes `offset` bytes into the
+    /// snapshot.
     fn launch_copy(
         &self,
         direction: StateDirection,
-        buffers: &[Vec<Tensor>],
-        runs: &[Tensor],
-        slot: &Tensor,
-        cells: &[(usize, i64)],
-        blocks: &dyn Fn(usize, usize) -> Result<Tensor>,
+        (buffers, slot): (&[Vec<Tensor>], &Tensor),
+        (units, planes): (&Tensor, &Tensor),
         snapshot: &dyn Fn(u64, usize, u64) -> Result<Tensor>,
     ) -> Result<()> {
         // One launch per field of every layer, between the slot's row and the field's planes
@@ -639,26 +586,11 @@ impl StateMemory {
             Ok(())
         };
 
-        // One launch per field run of the page, between the page's planes of the run and
-        // their planes of the snapshot.
+        // One launch between the unit's planes, which lie back to back in the units, and the
+        // whole snapshot.
         let page = |gather: bool| -> Result<()> {
-            let mut start = 0;
-            while start < cells.len() {
-                let run = cells[start].0;
-                let count = cells[start..]
-                    .iter()
-                    .take_while(|(other, _)| *other == run)
-                    .count();
-
-                let field = runs.get(run).ok_or_else(|| {
-                    Error::Invariant(format!("a state page reaches field run {run}"))
-                })?;
-                let part = snapshot(start as u64 * self.plane_bytes, count, self.plane_bytes)?;
-                Self::launch_move(gather, field, &blocks(start, count)?, &part)?;
-
-                start += count;
-            }
-            Ok(())
+            let part = snapshot(0, self.page_planes as usize, self.plane_bytes)?;
+            Self::launch_move(gather, units, planes, &part)
         };
 
         match direction {
@@ -684,10 +616,8 @@ impl StateMemory {
         // SAFETY: meta tensors have no data and their addresses are never read.
         let meta = |shape: &[usize], dtype| unsafe { lend(0, shape, dtype, None) };
 
-        let cells = self.columns as usize * self.units as usize;
-        let runs = (0..self.runs)
-            .map(|_| meta(&[cells, self.plane_bytes as usize], DType::U8))
-            .collect::<Result<Vec<_>>>()?;
+        let rows = self.units as usize * self.page_planes as usize;
+        let units = meta(&[rows, self.plane_bytes as usize], DType::U8)?;
         let buffers = layer_fields(&self.config.shapes)
             .map(|fields| {
                 fields
@@ -702,7 +632,7 @@ impl StateMemory {
             })
             .collect::<Result<Vec<_>>>()?;
 
-        let page = self.cells(1..1 + self.units_per_page)?;
+        let planes = meta(&[self.page_planes as usize], DType::I64)?;
 
         let context = ops::Context::meta(None);
         context.record_launches();
@@ -712,11 +642,8 @@ impl StateMemory {
             for direction in [StateDirection::Restore, StateDirection::Keep] {
                 self.launch_copy(
                     direction,
-                    &buffers,
-                    &runs,
-                    &meta(&[1], DType::I64)?,
-                    &page,
-                    &|_, count| meta(&[count], DType::I64),
+                    (&buffers, &meta(&[1], DType::I64)?),
+                    (&units, &planes),
                     &|_, rows, width| meta(&[rows, width as usize], DType::U8),
                 )?;
             }
@@ -737,28 +664,26 @@ impl StateMemory {
         }
     }
 
-    /// Issues a batch's copies of `direction` between the slots' buffers and the state pages
-    /// of `cache`, on the stream the state was opened on: every restore before the batch's
-    /// forward, every keep after it. Each copy is a request slot and the units of its state
-    /// page, the run the slot's checkpoint entry names. A restore moves a page's planes into
-    /// its slot's live row; a keep moves its slot's checkpoint row into a page's planes. Every
-    /// copy is checked before anything is issued, and a state that holds no device issues
-    /// nothing.
+    /// Issues a batch's copies of `direction` between the slots' buffers and the state units of
+    /// `cache`, on the stream the state was opened on: every restore before the batch's forward,
+    /// every keep after it. Each copy is a request slot and the state unit its checkpoint entry
+    /// names, the one unit of the entry's run. A restore moves a unit's planes into its slot's
+    /// live row; a keep moves its slot's checkpoint row into a unit's planes. Every copy is
+    /// checked before anything is issued, and a state that holds no device issues nothing.
     ///
     /// # Errors
     ///
-    /// More copies than the batch's rows allow, a slot outside the state's slots, a page of
-    /// another unit count than the cache's state pages span, a unit that is the padding unit
-    /// or outside the pool, or a launch's refusal.
+    /// More copies than the batch's rows allow, a slot outside the state's slots, a unit outside
+    /// the state region, or a launch's refusal.
     pub fn copy(
         &mut self,
         cache: &KvCacheMemory,
-        copies: &[(u32, Range<u32>)],
+        copies: &[(u32, u32)],
         direction: StateDirection,
     ) -> Result<()> {
         let mut pages = Vec::new();
-        for (slot, units) in copies {
-            pages.push((self.row(*slot)?, self.cells(units.clone())?));
+        for (slot, unit) in copies {
+            pages.push((self.row(*slot)?, cache.state_rows(*unit)?));
         }
         if pages.len() > 2 * self.config.rows as usize {
             return Err(Error::Invalid(format!(
@@ -781,12 +706,12 @@ impl StateMemory {
             read.synchronize()?;
         }
 
-        // Per copy: its slot's row, then the row of each of its page's planes.
+        // Per copy: its slot's row, then the row of each of its unit's planes.
         let stride = self.page_planes as usize + 1;
         let mut values: Vec<i64> = Vec::with_capacity(pages.len() * stride);
-        for (row, cells) in &pages {
+        for (row, planes) in &pages {
             values.push(i64::from(*row));
-            values.extend(cells.iter().map(|(_, cell)| *cell));
+            values.extend(planes.clone());
         }
         let mut write = CopyBatch::new(SourceOrder::DuringCall);
         write.push(
@@ -811,7 +736,7 @@ impl StateMemory {
                 self.tensors(model, slots, true, |buffers| &buffers.checkpoint)?
             }
         };
-        let runs = cache.state_runs()?;
+        let units = cache.state_tensor()?;
         let snapshot = |offset: u64, rows: usize, width: u64| {
             self.tensor(
                 |device| &device.snapshot,
@@ -824,7 +749,7 @@ impl StateMemory {
         {
             let _installed = device.context.enter();
 
-            for (index, (_, cells)) in pages.iter().enumerate() {
+            for index in 0..pages.len() {
                 let at = index * stride;
                 let entries = |first: usize, count: usize| {
                     self.tensor(
@@ -837,11 +762,8 @@ impl StateMemory {
 
                 self.launch_copy(
                     direction,
-                    &buffers,
-                    &runs,
-                    &entries(0, 1)?,
-                    cells,
-                    &|first, count| entries(1 + first, count),
+                    (&buffers, &entries(0, 1)?),
+                    (&units, &entries(1, self.page_planes as usize)?),
                     &snapshot,
                 )?;
             }
@@ -930,13 +852,13 @@ mod tests {
     }
 
     /// The cache of two attention layers of 4-token pages of one 8-wide BF16 head beside that
-    /// state: planes of 64 bytes, so a layer's checkpoint is two planes and a state page of
-    /// four planes is two units of two columns.
+    /// state: planes of 64 bytes, so a layer's checkpoint is two planes and a state unit four,
+    /// in a state region of eight units.
     fn cache() -> KvCacheConfig {
         let layout = CacheLayout::hybrid(4, 2, 1, 8, PrefixCacheDtype::BFloat16, &[shape()])
             .expect("a hybrid layout");
         assert_eq!(layout.plane_bytes, 64);
-        assert_eq!(layout.groups[1].units_per_page, 2);
+        assert_eq!(layout.groups[1].units_per_page, 1);
 
         KvCacheConfig {
             layout: Arc::new(layout),
@@ -945,6 +867,7 @@ mod tests {
             width: 4,
             segments: None,
             workspace_bytes: 64,
+            states: (8, None),
         }
     }
 
@@ -994,7 +917,7 @@ mod tests {
             config(5).bytes(&layout),
             (2 * 3 + 5) * 2 * 52 + 4 * (4 * 5 * 8)
         );
-        assert_eq!(layout.state_snapshot_bytes(), 4 * 64);
+        assert_eq!(layout.state_bytes(), 4 * 64);
         Ok(())
     }
 
@@ -1025,34 +948,33 @@ mod tests {
         Ok(())
     }
 
-    /// A copy is checked against the state's slots and the cache's state pages before it is
-    /// issued.
+    /// A copy is checked against the state's slots and the state region's units before it is
+    /// issued: every unit of the region, the first included, holds a checkpoint.
     #[test]
-    fn a_state_copy_names_a_slot_and_a_whole_state_page() -> Result<()> {
+    fn a_state_copy_names_a_slot_and_a_unit_of_the_state_region() -> Result<()> {
         let config_of_cache = cache();
         let cache = KvCacheMemory::meta(config_of_cache.clone())?;
         let mut state = StateMemory::meta(config(0), &config_of_cache)?;
         let mut restore =
-            |copies: &[(u32, Range<u32>)]| state.copy(&cache, copies, StateDirection::Restore);
+            |copies: &[(u32, u32)]| state.copy(&cache, copies, StateDirection::Restore);
 
-        restore(&[(2, 5..7)])?;
-        assert!(restore(&[(4, 5..7)]).is_err());
+        restore(&[(2, 5)])?;
+        restore(&[(1, 0)])?;
+        assert!(restore(&[(4, 5)]).is_err());
 
-        // A state page spans two units, none of them the padding unit or outside the pool.
-        let short = restore(&[(1, 5..6)]).expect_err("a page of one unit");
-        assert!(short.to_string().contains("span 2"), "{short}");
-        assert!(restore(&[(1, 0..2)]).is_err());
-        assert!(restore(&[(1, 15..17)]).is_err());
+        // The region's units are 0..8.
+        let outside = restore(&[(1, 8)]).expect_err("a unit past the region");
+        assert!(outside.to_string().contains("units 0..8"), "{outside}");
 
         // A batch of two rows carries at most a restore and a keep per row.
-        let many: Vec<(u32, Range<u32>)> = (0..5).map(|_| (1, 5..7)).collect();
+        let many: Vec<(u32, u32)> = (0..5).map(|_| (1, 5)).collect();
         let refused = restore(&many).expect_err("five copies of a batch of two rows");
         assert!(refused.to_string().contains("allow 4"), "{refused}");
         Ok(())
     }
 
     /// The copies state their kernels with no device: a snapshot and a scatter over each
-    /// buffer field and over the state planes.
+    /// buffer field and over the state units.
     #[test]
     fn the_copies_state_their_kernels_under_a_meta_context() -> Result<()> {
         let state = StateMemory::meta(config(0), &cache())?;
@@ -1060,7 +982,7 @@ mod tests {
         let keys = state.keys()?;
         let of = |operator: &str| keys.iter().filter(|(name, _)| *name == operator).count();
 
-        // Each operator over three shapes: the two fields' buffers and the state planes.
+        // Each operator over three shapes: the two fields' buffers and the state units.
         assert_eq!(of(CacheBlockSnapshot::NAME), 3, "{keys:?}");
         assert_eq!(of(CacheBlockScatter::NAME), 3, "{keys:?}");
         assert_eq!(keys.len(), 6);
@@ -1134,7 +1056,7 @@ mod tests {
         );
         assert_eq!(checkpoint[2][0].dims(), [3, 4]);
 
-        // Each layer's checkpoint lies in its own planes of the state page: two planes for a
+        // Each layer's checkpoint lies in its own planes of the state unit: two planes for a
         // layer of the first run and one for the last.
         let first: Vec<u32> = cache
             .layout
@@ -1143,7 +1065,7 @@ mod tests {
             .map(|checkpoint| checkpoint.first_plane)
             .collect();
         assert_eq!(first, [0, 2, 4]);
-        assert_eq!(cache.layout.groups[1].units_per_page, 2);
+        assert_eq!(cache.layout.checkpoint_planes(), 5);
 
         // Three slots of 52 bytes in each of two layers, live and checkpoint, nine live slots
         // and three checkpoints of 16 bytes, and four sets of index vectors of a slot row and
@@ -1159,7 +1081,7 @@ mod tests {
         assert!(StateMemory::meta(StateConfig { trail: 4, ..config }, &cache).is_err());
         assert!(!self::config(0).verifies());
 
-        // A state of other runs than the ones its cache's state pages hold.
+        // A state of other runs than the ones its cache's state units hold.
         assert!(StateMemory::meta(self::config(0), &cache).is_err());
         Ok(())
     }

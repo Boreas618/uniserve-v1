@@ -244,25 +244,33 @@ impl MainProcessRequest {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DataOperation {
-    /// Releases the KV planes' segments from segment `from` on, on every rank of `groups`.
-    /// Answers the CUDA ordinals of the devices of the ranks that gave segments back.
-    ReleaseSegments { groups: Vec<GroupId>, from: u32 },
-    /// Creates again the first `count` segments the ranks of `groups` gave back, or all of them.
-    /// Answers each such rank's segment table.
+    /// Releases the segments of device region `region` (the buffer pool's number: a KV region or
+    /// a state region) from segment `from` on, on every rank of `groups`. Answers the CUDA
+    /// ordinals of the devices of the ranks that gave segments back.
+    ReleaseSegments {
+        groups: Vec<GroupId>,
+        region: u8,
+        from: u32,
+    },
+    /// Creates again the first `count` segments of device region `region` the ranks of `groups`
+    /// gave back, or all of them. Answers each such rank's segment table of the region.
     CreateSegments {
         groups: Vec<GroupId>,
+        region: u8,
         count: Option<u32>,
     },
-    /// Answers the segment table of every rank of `groups`.
-    SegmentTables { groups: Vec<GroupId> },
-    /// Answers how many of the segments the ranks of `groups` gave back every such rank has room
-    /// for; none when no such rank splits its planes.
-    FittingSegments { groups: Vec<GroupId> },
-    /// Answers the room of the device of every rank of `groups` whose planes are split.
-    DeviceRooms { groups: Vec<GroupId> },
-    /// Answers how many of the segments the ranks of `groups` hold every such rank holds beside
-    /// its warm process in its GPU's quota; none when no such rank splits its planes.
-    WarmSegments { groups: Vec<GroupId> },
+    /// Answers the segment table of device region `region` of every rank of `groups`.
+    SegmentTables { groups: Vec<GroupId>, region: u8 },
+    /// Answers how many of the segments of device region `region` the ranks of `groups` gave
+    /// back every such rank has room for; none when no such rank splits its memory of it.
+    FittingSegments { groups: Vec<GroupId>, region: u8 },
+    /// Answers the room of the device of every rank of `groups` whose memory of device region
+    /// `region` is split.
+    DeviceRooms { groups: Vec<GroupId>, region: u8 },
+    /// Answers how many of the segments of device region `region` the ranks of `groups` hold
+    /// every such rank holds beside its warm process in its GPU's quota; none when no such rank
+    /// splits its memory of it.
+    WarmSegments { groups: Vec<GroupId>, region: u8 },
     /// Answers the room every device has for a load.
     Room,
     /// Answers the bytes the graph pools map on the device that maps the fewest; none for a

@@ -14,7 +14,11 @@
 //!
 //! The session's layout states which memory each region is: the head's view of it
 //! ([`StorageClient::session`]) is where these jobs read a region's name, its reserved units,
-//! its units, its segment table and the worker groups whose ranks map it.
+//! its units, its segment table and the worker groups whose ranks map it. A model that keeps a
+//! recurrent state has a state region beside each KV region, one checkpoint a unit
+//! (`specs/engine-worker-port.md` §1.6): every job names the region whose memory the ranks change,
+//! a growth creates a state region's segments before a KV region's, and a start's give-back once
+//! warm takes a KV region's tail first.
 
 use std::sync::Mutex;
 use std::time::Instant;
@@ -128,7 +132,8 @@ pub(crate) fn release(
         return Ok((Vec::new(), 0));
     }
 
-    let devices = binding.release_segments(&groups, u32::try_from(from).unwrap_or(u32::MAX))?;
+    let devices =
+        binding.release_segments(&groups, region, u32::try_from(from).unwrap_or(u32::MAX))?;
     Ok((devices, released.saturating_mul(part_bytes)))
 }
 
@@ -190,9 +195,10 @@ pub(crate) fn grow(
     grow_regions(schedulers, head)
 }
 
-/// The ranks' side of a grow ([`grow`]) and of a warm start: the ranks of each region of the KV
-/// planes create as many of the segments they gave back as their quotas and devices have room
-/// for, and the head grants them. A start creates its regions' segments before its warm-up, as
+/// The ranks' side of a grow ([`grow`]) and of a warm start: the ranks of each device region of
+/// the KV planes and of the state units create as many of the segments they gave back as their
+/// quotas and devices have room for, and the head grants them; the state regions first, since a
+/// request can run on few KV units but on no checkpoint. A start creates its regions' segments before its warm-up, as
 /// far as its quotas held them then, and gives back once warm what no longer fits beside the warm
 /// processes ([`keep_warm_segments`]), so what it creates here is what a predecessor's drain
 /// freed meanwhile (`specs/engine-worker-port.md` §1, "The process a division counts").
@@ -212,28 +218,18 @@ pub(crate) fn create_fitting(
     binding: &WeightBinding,
     capacity: Option<u64>,
 ) -> Result<()> {
-    let (open, _) = session(head)?;
-    let regions: Vec<(usize, String, Vec<GroupId>)> = kv_regions(open)
-        .into_iter()
-        .map(|index| {
-            let name = open
-                .regions
-                .get(index)
-                .map(|region| region.name.clone())
-                .unwrap_or_default();
-            (index, name, groups_of(open, index))
-        })
-        .collect();
+    let mut regions = device_regions(head)?;
+    regions.sort_by_key(|(.., state)| !*state);
 
-    for (index, name, groups) in regions {
+    for (index, number, name, groups, _) in regions {
         if let Some(tokens) = capacity {
-            whole(binding, &groups, (&name, tokens))?;
+            whole(binding, &groups, number, (&name, tokens))?;
         }
-        let fitting = binding.fitting_segments(&groups)?;
+        let fitting = binding.fitting_segments(&groups, number)?;
         if fitting == 0 {
             continue;
         }
-        let tables = binding.create_segments(&groups, Some(fitting))?;
+        let tables = binding.create_segments(&groups, number, Some(fitting))?;
         let granted = grant_held(head, index, &tables)?;
         tracing::info!(
             region = %name,
@@ -244,8 +240,10 @@ pub(crate) fn create_fitting(
     Ok(())
 }
 
-/// Gives back, once a start's ranks are warm, the tail segments of each region of the KV planes
-/// that their GPUs' quotas no longer hold beside their warm processes
+/// Gives back, once a start's ranks are warm, the tail segments of each device region that
+/// their GPUs' quotas no longer hold beside their warm processes, the KV regions first: each
+/// region's ranks measure their quotas after the region before gave back, so a state region's
+/// segments go back only when the KV regions' could not make the room
 /// (`specs/engine-worker-port.md` §1, "The process a division counts"). The start created, before
 /// its warm-up, every whole segment its quotas held then beside the processes measured before it;
 /// the warm-up's instantiated graphs and library state lay outside the quotas meanwhile. Each
@@ -263,21 +261,11 @@ pub(crate) fn create_fitting(
 /// A rank's failure to measure its process or to give segments back, or the Storage Server's
 /// refusal of a withdrawal.
 pub(crate) fn keep_warm_segments(head: &mut StorageClient, binding: &WeightBinding) -> Result<()> {
-    let (open, _) = session(head)?;
-    let regions: Vec<(usize, String, Vec<GroupId>)> = kv_regions(open)
-        .into_iter()
-        .map(|index| {
-            let name = open
-                .regions
-                .get(index)
-                .map(|region| region.name.clone())
-                .unwrap_or_default();
-            (index, name, groups_of(open, index))
-        })
-        .collect();
+    let mut regions = device_regions(head)?;
+    regions.sort_by_key(|(.., state)| *state);
 
-    for (index, name, groups) in regions {
-        let Some(kept) = binding.warm_segments(&groups)? else {
+    for (index, number, name, groups, _) in regions {
+        let Some(kept) = binding.warm_segments(&groups, number)? else {
             continue;
         };
         let granted = session(head)?.1.segments.get(index).map_or(0, Vec::len);
@@ -289,11 +277,11 @@ pub(crate) fn keep_warm_segments(head: &mut StorageClient, binding: &WeightBindi
         let (from, withdrawn) = withdraw_from(head, index, kept);
         withdrawn.with_context(|| {
             format!(
-                "withdrawing the segments of KV region {name} the quotas no longer hold beside \
-                 the warm processes"
+                "withdrawing the segments of region {name} the quotas no longer hold beside the \
+                 warm processes"
             )
         })?;
-        binding.release_segments(&groups, u32::try_from(from).unwrap_or(u32::MAX))?;
+        binding.release_segments(&groups, number, u32::try_from(from).unwrap_or(u32::MAX))?;
         tracing::info!(
             region = %name,
             kept = from,
@@ -304,8 +292,9 @@ pub(crate) fn keep_warm_segments(head: &mut StorageClient, binding: &WeightBindi
     Ok(())
 }
 
-/// Refuses a KV region `name` of a stated capacity of `tokens` tokens whose ranks, those of the
-/// worker groups `groups`, cannot hold every segment they gave back: what the deployment's quota
+/// Refuses a device region `name` (numbered `number`) of a deployment that states a capacity of
+/// `tokens` tokens whose ranks, those of the worker groups `groups`, cannot hold every segment
+/// they gave back: what the deployment's quota
 /// of a rank's GPU and its device have room for, with what other epochs of the deployment hold
 /// there, which returns as they drain ([`create_fitting`]).
 ///
@@ -314,11 +303,16 @@ pub(crate) fn keep_warm_segments(head: &mut StorageClient, binding: &WeightBindi
 /// The refusal, naming the capacity, the bytes the given-back segments take on the rank's GPU, its
 /// room, and the warm processes this process's ranks reserved; a rank's failure to state its
 /// segments or its room.
-fn whole(binding: &WeightBinding, groups: &[GroupId], (name, tokens): (&str, u64)) -> Result<()> {
+fn whole(
+    binding: &WeightBinding,
+    groups: &[GroupId],
+    number: u8,
+    (name, tokens): (&str, u64),
+) -> Result<()> {
     // Every rank of a region holds the same segments; the units given back are the most any
     // rank's table leaves uncreated.
     let given_back: u64 = binding
-        .segment_tables(groups)?
+        .segment_tables(groups, number)?
         .iter()
         .flatten()
         .map(|table| {
@@ -335,7 +329,7 @@ fn whole(binding: &WeightBinding, groups: &[GroupId], (name, tokens): (&str, u64
         return Ok(());
     }
 
-    for (gpu, room, unit_bytes) in binding.device_rooms(groups)? {
+    for (gpu, room, unit_bytes) in binding.device_rooms(groups, number)? {
         let needed = given_back.saturating_mul(unit_bytes);
         if room.holds(needed, room.elsewhere) {
             continue;
@@ -347,7 +341,7 @@ fn whole(binding: &WeightBinding, groups: &[GroupId], (name, tokens): (&str, u64
             .collect();
         let gpu: String = gpu.iter().map(|byte| format!("{byte:02x}")).collect();
         bail!(
-            "kv_cache_config.max_tokens = {tokens} does not fit beside the warm process: KV \
+            "kv_cache_config.max_tokens = {tokens} does not fit beside the warm process: \
              region {name} needs {needed} more bytes on GPU {gpu}, whose quota leaves {} and \
              whose device has {} free, with {} that other epochs hold; the warm processes of this \
              process's ranks hold {}",
@@ -404,9 +398,9 @@ fn index_of(opened: &Opened, number: u8) -> Result<usize> {
         .with_context(|| format!("the session states no region {number}"))
 }
 
-/// The regions of the session the ranks' KV planes back, by index: the device regions a class of
-/// blocks of a fixed size takes its blocks from. A class sized by each request (a product, a
-/// stored trajectory) takes its blocks from memory of the ranks' own processes.
+/// The regions of the session the ranks' KV planes and state units back, by index: the device
+/// regions a class of blocks of a fixed size takes its blocks from. A class sized by each request
+/// (a product, a stored trajectory) takes its blocks from memory of the ranks' own processes.
 pub(super) fn kv_regions(open: &Open) -> Vec<usize> {
     let mut regions: Vec<usize> = open
         .groups
@@ -424,6 +418,44 @@ pub(super) fn kv_regions(open: &Open) -> Vec<usize> {
     regions.sort_unstable();
     regions.dedup();
     regions
+}
+
+/// Whether the session's region at `index` is a state region: the device region of a class whose
+/// live state is in the slot, the recurrent-state class (`specs/engine-worker-port.md` §1.6).
+pub(super) fn is_state_region(open: &Open, index: usize) -> bool {
+    open.groups.iter().any(|group| {
+        group
+            .regions
+            .iter()
+            .zip(&open.classes)
+            .any(|(regions, class)| {
+                class.state_in_slot && regions.iter().any(|&region| usize::from(region) == index)
+            })
+    })
+}
+
+/// The session's device regions of the ranks' KV planes and state units ([`kv_regions`]), each
+/// with its index, its number, its name, the worker groups whose ranks map it and whether it is a
+/// state region ([`is_state_region`]).
+///
+/// # Errors
+///
+/// When the head opened no session.
+#[expect(
+    clippy::type_complexity,
+    reason = "what a region job reads of each device region, as the session states it"
+)]
+fn device_regions(head: &StorageClient) -> Result<Vec<(usize, u8, String, Vec<GroupId>, bool)>> {
+    let (open, opened) = session(head)?;
+    Ok(kv_regions(open)
+        .into_iter()
+        .filter_map(|index| {
+            let name = open.regions.get(index)?.name.clone();
+            let &(number, _) = opened.regions.get(index)?;
+            let state = is_state_region(open, index);
+            Some((index, number, name, groups_of(open, index), state))
+        })
+        .collect())
 }
 
 /// The worker groups whose ranks map the session's region at `index`: those that take a class's

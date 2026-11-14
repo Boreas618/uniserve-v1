@@ -18,8 +18,9 @@
 //! 3. for an FP8 cache, the scales `[2, layers]` as F32;
 //! 4. for a cache that keeps index keys, the index keys `[layers, block_size / ratio, width]`.
 //!
-//! The state group's page holds its layers' checkpoints in the cache's state planes: every
-//! plane of each field run, in unit then column order, and no key, value or scale.
+//! The state group's page is one unit of the state region: every recurrent layer's checkpoint,
+//! the unit's planes in their order (`CacheLayout::state_bytes`), copied in one piece, and no
+//! key, value or scale.
 
 use std::collections::BTreeMap;
 use std::ops::Range;
@@ -33,6 +34,7 @@ use tensor::DType;
 use super::conversion::Conversion;
 use super::layout::{CacheLayout, GroupLayout};
 use super::planes::Planes;
+use super::states::StateUnits;
 use crate::memory::client::StorageClient;
 use crate::memory::host_pages::{self, HostPart};
 use crate::worker::{Error, Result};
@@ -42,10 +44,10 @@ const PAGE_ENCODING: u32 = 1;
 
 /// The bytes of one host page of `group` of a cache of `layout`.
 fn page_bytes(layout: &CacheLayout, group: &GroupLayout) -> u64 {
-    let planes = layout.page_planes(group);
     if group.state() {
-        return u64::from(layout.state_fields()) * planes * layout.plane_bytes;
+        return layout.state_bytes();
     }
+    let planes = layout.page_planes(group);
 
     let scales = if layout.quantized { 2 * planes * 4 } else { 0 };
     2 * planes * layout.plane_bytes + scales + planes * layout.index_bytes()
@@ -88,12 +90,12 @@ fn content_of(digest: &mut ::storage::key::Digest, group: &GroupLayout) {
     }
 }
 
-/// Adds the shape of a state page to `digest`: the units and field runs its checkpoints fill.
+/// Adds the shape of a state page to `digest`: one unit of the state region, its checkpoint
+/// planes back to back.
 fn state_of(digest: &mut ::storage::key::Digest, layout: &CacheLayout, group: &GroupLayout) {
     if group.state() {
-        digest.text("state");
-        digest.number(u64::from(group.units_per_page));
-        digest.number(u64::from(layout.state_fields()));
+        digest.text("state-unit");
+        digest.number(u64::from(layout.checkpoint_planes()));
     }
 }
 
@@ -259,8 +261,9 @@ impl HostTier {
 
     /// Issues the copies a batch runs between the host tier and the units on the copy stream:
     /// `loads` from their host pages into their units, `converted` from the conversion
-    /// source's pages, and `stores` from their units into their host pages. Returns the event
-    /// recorded behind them, which the batch's end waits on; `None` when there is none.
+    /// source's pages, and `stores` from their units into their host pages; a page of the state
+    /// group is a unit of `states`. Returns the event recorded behind them, which the batch's end
+    /// waits on; `None` when there is none.
     ///
     /// No forward reads or writes what these copies write before they end: a loaded block
     /// becomes an entry of its owner's table only once the copy is reported done, and a stored
@@ -278,7 +281,7 @@ impl HostTier {
     pub(crate) fn copy(
         &self,
         layout: &CacheLayout,
-        planes: &Planes,
+        (planes, states): (&Planes, Option<&StateUnits>),
         loads: &[HostPage],
         converted: &[HostPage],
         stores: &[HostPage],
@@ -291,16 +294,17 @@ impl HostTier {
                 "a copy reads a page of a conversion source and the cache converts none".into(),
             ));
         }
+        let memory = (planes, states);
         for copy in loads.iter().chain(stores) {
-            self.runs(layout, planes, copy)?;
+            self.runs(layout, memory, copy)?;
         }
 
         let issued = || -> Result<Event> {
-            self.load(layout, planes, loads, &self.stream)?;
+            self.load(layout, memory, loads, &self.stream)?;
             if let Some(conversion) = &self.conversion {
                 conversion.load(planes, converted, &self.stream)?;
             }
-            self.store(layout, planes, stores, &self.stream)?;
+            self.store(layout, memory, stores, &self.stream)?;
 
             let copied = Event::new(EventFlags::default());
             copied.record(&self.stream)?;
@@ -321,11 +325,12 @@ impl HostTier {
     }
 
     /// One page's copies between its host page and its units, as `(device, host, bytes)`: every
-    /// field and plane, then every scale, then every index-key plane.
+    /// field and plane, then every scale, then every index-key plane; for the state group, the
+    /// one state unit whole.
     fn runs(
         &self,
         layout: &CacheLayout,
-        planes: &Planes,
+        (planes, states): (&Planes, Option<&StateUnits>),
         copy: &HostPage,
     ) -> Result<Vec<(u64, u64, usize)>> {
         let (group, page, units) = copy;
@@ -334,6 +339,29 @@ impl HostTier {
             .get(group)
             .ok_or_else(|| Error::Invalid(format!("cache group {group} has no host region")))?;
         let page_planes = *page_planes;
+
+        let state = layout
+            .groups
+            .get(*group as usize)
+            .is_some_and(GroupLayout::state);
+        if state {
+            // A state page is one unit of the state region, its planes back to back on both
+            // sides.
+            let states =
+                states.ok_or_else(|| Error::Invalid("the cache keeps no state units".into()))?;
+            if units.len() != 1 {
+                return Err(Error::Invalid(format!(
+                    "a checkpoint's page is one state unit, not units {}..{}",
+                    units.start, units.end
+                )));
+            }
+            let bytes = states.unit_bytes();
+            return Ok(vec![(
+                states.address(units.start)?,
+                part.address(*page)?,
+                bytes as usize,
+            )]);
+        }
 
         let columns = layout.columns;
         if units.len() as u32 * columns != page_planes {
@@ -348,25 +376,6 @@ impl HostTier {
         let host = part.address(*page)?;
         let count = u64::from(page_planes);
         let unit = |index: u32| units.start + index / columns;
-
-        let state = layout
-            .groups
-            .get(*group as usize)
-            .is_some_and(GroupLayout::state);
-        if state {
-            // A state page is its checkpoints' planes, field run by field run.
-            let field_runs = layout.state_fields() as usize;
-            let mut runs = Vec::with_capacity(field_runs * page_planes as usize);
-
-            for run in 0..field_runs {
-                for index in 0..page_planes {
-                    let device = planes.state_plane_address(run, index % columns, unit(index))?;
-                    let host = host + (run as u64 * count + u64::from(index)) * plane;
-                    runs.push((device, host, plane as usize));
-                }
-            }
-            return Ok(runs);
-        }
 
         let mut runs = Vec::with_capacity(4 * page_planes as usize);
         for field in 0..2 {
@@ -406,7 +415,7 @@ impl HostTier {
     pub(crate) fn load(
         &self,
         layout: &CacheLayout,
-        planes: &Planes,
+        memory: (&Planes, Option<&StateUnits>),
         loads: &[HostPage],
         stream: &Stream,
     ) -> Result<()> {
@@ -416,7 +425,7 @@ impl HostTier {
 
         let mut batch = CopyBatch::new(SourceOrder::Stream);
         for copy in loads {
-            for (device, host, bytes) in self.runs(layout, planes, copy)? {
+            for (device, host, bytes) in self.runs(layout, memory, copy)? {
                 batch.push(device, host, bytes);
             }
         }
@@ -431,12 +440,17 @@ impl HostTier {
         // until it is reported done, which is after the batch that runs it has ended.
         unsafe { batch.submit(stream) }?;
 
+        // The flags are the pool's: a state unit has none.
         if layout.quantized {
+            let state = layout
+                .state_group()
+                .and_then(|group| u32::try_from(group).ok());
             let units: Vec<u32> = loads
                 .iter()
+                .filter(|(group, _, _)| Some(*group) != state)
                 .flat_map(|(_, _, units)| units.clone())
                 .collect();
-            planes.mark_initialized(&units, stream)?;
+            memory.0.mark_initialized(&units, stream)?;
         }
         Ok(())
     }
@@ -445,7 +459,7 @@ impl HostTier {
     pub(crate) fn store(
         &self,
         layout: &CacheLayout,
-        planes: &Planes,
+        memory: (&Planes, Option<&StateUnits>),
         stores: &[HostPage],
         stream: &Stream,
     ) -> Result<()> {
@@ -455,7 +469,7 @@ impl HostTier {
 
         let mut batch = CopyBatch::new(SourceOrder::Stream);
         for copy in stores {
-            for (device, host, bytes) in self.runs(layout, planes, copy)? {
+            for (device, host, bytes) in self.runs(layout, memory, copy)? {
                 batch.push(host, device, bytes);
             }
         }

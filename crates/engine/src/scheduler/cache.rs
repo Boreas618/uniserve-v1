@@ -653,8 +653,9 @@ impl Scheduler {
         }
     }
 
-    /// Tells the policy how a row changed (SD §5.2). A KV block (of a class with a block size)
-    /// that the last request holding it gave up, and nothing else the policy sees changed, is one
+    /// Tells the policy how a row changed (SD §5.2). A KV block (of a class with a block size, in
+    /// the KV region: a checkpoint is none, [`Self::is_page`]) that the last request holding it
+    /// gave up, and nothing else the policy sees changed, is one
     /// page of a `Released`, which lists the pages of consecutive releases in the order they
     /// joined the eviction order; one that no request held and a request holds now, nothing else
     /// the policy sees changed, is one page of a `Held`, which lists the pages of consecutive
@@ -724,14 +725,23 @@ impl Scheduler {
         self.policy.events.push(event);
     }
 
+    /// Whether blocks of `class` are the policy's pages: KV blocks, of a class with a block size
+    /// that lies in the KV region. A recurrent-state checkpoint lies in the state region, whose
+    /// units no page of the policy's frees (`Storage::StateUnits`), and is no object of the
+    /// policy's: its shortage takes requests, and the buffer pool evicts cached checkpoints in the
+    /// order this scheduler installs.
     fn is_page(&self, class: u8) -> bool {
         self.classes
             .get(usize::from(class))
-            .is_some_and(|stated| stated.units > 0)
+            .is_some_and(|stated| stated.units > 0 && !stated.state_in_slot)
     }
 
+    /// Whether blocks of `class` are the policy's encoder outputs: of a class sized per block
+    /// that a group of the scheduler computes into device memory.
     fn is_encoding(&self, class: u8) -> bool {
-        !self.is_page(class)
+        self.classes
+            .get(usize::from(class))
+            .is_some_and(|stated| stated.units == 0)
             && self
                 .groups
                 .iter()
@@ -991,7 +1001,7 @@ impl Scheduler {
 
     /// The classes whose blocks `region` (by index) holds on this scheduler's side: as a device
     /// region of one of its groups, or as the class's host region.
-    fn classes_in(&self, region: usize) -> impl Iterator<Item = u8> + '_ {
+    pub(super) fn classes_in(&self, region: usize) -> impl Iterator<Item = u8> + '_ {
         let host = move |class: &runtime::Class| {
             class
                 .host

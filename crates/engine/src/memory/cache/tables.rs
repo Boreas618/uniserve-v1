@@ -255,8 +255,8 @@ mod tests {
     const UNITS: u8 = 0;
 
     /// Tables of two request slots and rows of four pages over sixteen units: a cache of two
-    /// attention layers of 4-token pages (class 0) and a recurrent state of two layers whose
-    /// pages span two units (class 1).
+    /// attention layers of 4-token pages (class 0) and a recurrent state of two layers, whose
+    /// checkpoints are units of the state region (class 1).
     fn tables() -> PageTables {
         let state = nn::family::StateShape {
             layers: 2,
@@ -269,7 +269,7 @@ mod tests {
         };
         let layout = CacheLayout::hybrid(4, 2, 1, 4, PrefixCacheDtype::BFloat16, &[state])
             .expect("a hybrid layout");
-        assert!(layout.groups[1].state() && layout.groups[1].units_per_page == 2);
+        assert!(layout.groups[1].state() && layout.groups[1].units_per_page == 1);
 
         PageTables::meta(Arc::new(layout), 2, 4, 16).expect("page tables")
     }
@@ -315,12 +315,13 @@ mod tests {
         Ok(())
     }
 
-    /// A state block spans two units and has no pooled table: its entries change no row.
+    /// A state block is a unit of the state region and has no pooled table: its entries change
+    /// no row.
     #[test]
     fn a_state_entry_has_no_pooled_row() -> Result<()> {
         let mut pooled = tables();
 
-        pooled.apply(&[change(1, 1, 1, Some((8, 2)))], None)?;
+        pooled.apply(&[change(1, 1, 1, Some((8, 1)))], None)?;
         assert!(pooled.host_table(0)?.iter().all(|unit| *unit == 0));
         assert!(pooled.table(1).is_err());
         Ok(())

@@ -143,26 +143,32 @@ fn operations() -> Vec<DataOperation> {
     vec![
         DataOperation::ReleaseSegments {
             groups: groups.clone(),
+            region: 4,
             from: 3,
         },
         DataOperation::CreateSegments {
             groups: groups.clone(),
+            region: 4,
             count: Some(2),
         },
         DataOperation::CreateSegments {
             groups: groups.clone(),
+            region: 5,
             count: None,
         },
         DataOperation::SegmentTables {
             groups: groups.clone(),
+            region: 4,
         },
         DataOperation::FittingSegments {
             groups: groups.clone(),
+            region: 5,
         },
         DataOperation::WarmSegments {
             groups: groups.clone(),
+            region: 4,
         },
-        DataOperation::DeviceRooms { groups },
+        DataOperation::DeviceRooms { groups, region: 5 },
         DataOperation::Room,
         DataOperation::GraphBytes,
         DataOperation::Sleep,

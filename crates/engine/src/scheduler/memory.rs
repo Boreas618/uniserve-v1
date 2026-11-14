@@ -662,7 +662,7 @@ impl Scheduler {
     /// else one decoded token. `None` once the prompt is scheduled and its calls in flight may
     /// sample the last token its limit allows: it may make no further call
     /// (`Request::reaches_limit`).
-    fn next_call(&self, request: &Request) -> Option<(Phase, u32, u32)> {
+    pub(super) fn next_call(&self, request: &Request) -> Option<(Phase, u32, u32)> {
         let start = request.num_computed_tokens;
         if start < request.num_prompt_tokens {
             let end = start.saturating_add(self.first_chunk(request, start));
@@ -689,8 +689,8 @@ impl Scheduler {
     /// grown from `asked`; a recurrent-state class asks for the checkpoint its next call or refill
     /// keeps, or a later decode keeps within the low watermark, one ahead at a time; the draft
     /// cache is grown over the target's next call while it covers the request's tokens, or over
-    /// its next refill chunk (the one after the refill in flight), and no call needs it. A
-    /// request with no next call asks for nothing.
+    /// its next refill chunk (the one after the refill in flight) when the request is placed for
+    /// refills, and no call needs it. A request with no next call asks for nothing.
     /// The caller asks only what the regions' `available` covers, and at most one `Allocate` per
     /// class outstanding; the request is short only when the blocks its next call writes are not
     /// covered (SD §3.6).
@@ -706,7 +706,14 @@ impl Scheduler {
             .state_shape(request)
             .map(|(class, block, _)| (class, block));
         let budget = self.policy.limits.max_num_batched_tokens;
+        // A refill is planned only for a request placed for one: no group of a model that keeps
+        // a recurrent state serves a refill, and a request split across prefill and decode groups
+        // never refills (SD §3.5 `place`). The checkpoint a refill that never runs keeps would
+        // hold the state table's place ahead, and the checkpoint the decode's next kept boundary
+        // needs would never be asked for.
+        let refills = request.placement[Phase::Refill.index()].is_some();
         let refill = (self.config.draft_tokens > 0
+            && refills
             && request.num_draft_tokens < request.refill_end())
         .then(|| {
             let from = request.refill_start(state);
@@ -2204,10 +2211,21 @@ impl Scheduler {
 /// "Commit", "The write policy", "Drafts first").
 impl Scheduler {
     /// The checkpoint position the call of `batch`'s row `row` kept the recurrent state at, from
-    /// the row's `checkpoints` column (`rows.rs`).
+    /// the row's `checkpoints` column (`rows.rs`), when the tokens the call committed reach its
+    /// boundary. A verification keeps the state after its tokens up to the boundary, its drafts
+    /// among them, before it learns which drafts are accepted: when it rejects a draft before the
+    /// boundary, the checkpoint holds the state of tokens the request does not have, so it is
+    /// neither committed nor counted as written, and the entry stays writable for the call that
+    /// next reaches the boundary, which keeps it again.
     fn kept_by(&self, request: &Request, batch: &Batch, row: usize) -> Option<u32> {
         let (_, block, _) = self.state_shape(request)?;
         let boundary = u32::try_from(*batch.columns.checkpoints.get(row)?).ok()?;
+        let committed = request
+            .num_computed_tokens
+            .saturating_sub(request.in_flight(Phase::Decode));
+        if boundary > committed {
+            return None;
+        }
         (boundary / block).checked_sub(1)
     }
 
@@ -3758,6 +3776,75 @@ mod tests {
             "four full blocks and the checkpoint: {committed:?}"
         );
         assert_eq!(committed[4], commit(OwnerId(1), 1, 3, state, 4));
+    }
+
+    /// A verification keeps its checkpoint before it learns which drafts are accepted. When it
+    /// rejects a draft before the boundary, the checkpoint holds the state of tokens the request
+    /// does not have: it is neither committed nor taken for written, so the base stays and the
+    /// next call that reaches the boundary finds the entry writable and keeps it again, which is
+    /// committed once the accepted tokens reach the boundary.
+    #[test]
+    fn a_verification_commits_its_checkpoint_once_its_accepted_tokens_reach_the_boundary() {
+        let kv = KvCacheConfig {
+            state_interval: std::num::NonZeroU32::new(8),
+            ..KvCacheConfig::default()
+        };
+        let mut session = serving(&[full(4), (CacheGroupKind::State, 4)], kv);
+        let id = session.request(1, (1..=6).collect());
+        let request = session.row_mut(id);
+        request.status = RequestStatus::Running;
+        request.placement[Phase::Verify.index()] = Some(A);
+        // The verification of token 7 and its draft at position 7 ran up to 8 and kept the state
+        // there; the draft was rejected, so 7 tokens are computed and the corrected token 9 is
+        // sampled. The full-attention table holds three blocks, the first committed; the state
+        // table its committed base at boundary 4 and the checkpoint at boundary 8 ahead of it.
+        request.token_ids.extend([7, 9]);
+        request.num_computed_tokens = 7;
+        let table = |shared, end| Blocks {
+            first: 0,
+            shared,
+            end,
+            asked: end,
+        };
+        request.blocks = vec![table(1, 3), table(1, 2)];
+
+        let verified = batch(Phase::Verify, 8);
+        session.scheduler.commit_filled(id, &verified, 0);
+        session.scheduler.give_up_behind(id, &verified, 0);
+        assert!(session.stamped().is_empty());
+        assert_eq!(session.row(id).blocks[1], table(1, 2));
+        assert!(
+            session
+                .scheduler
+                .holds_blocks_for(session.row(id), Phase::Verify, 1)
+        );
+
+        // The next verification reached 8 again and its draft was accepted: 9 tokens are
+        // computed. Its checkpoint is committed with the full block it filled, and the base is
+        // given up.
+        let request = session.row_mut(id);
+        request.token_ids.extend([10, 11]);
+        request.num_computed_tokens = 9;
+        session.scheduler.commit_filled(id, &verified, 0);
+        session.scheduler.give_up_behind(id, &verified, 0);
+        let keys = session.row(id).keys.clone();
+        assert_eq!(
+            session.stamped(),
+            [
+                commit(OwnerId(1), 0, 1, keys[0][1], 4),
+                commit(OwnerId(1), 1, 1, keys[1][1], 4),
+                release(1, 1, 0, 1),
+            ]
+        );
+        assert_eq!(
+            session.row(id).blocks[1],
+            Blocks {
+                first: 1,
+                shared: 2,
+                end: 2,
+                asked: 2
+            }
+        );
     }
 
     #[test]
