@@ -95,7 +95,8 @@ INTEGERS = ("u8", "u32", "i16", "i32", "i64")
 #: the element type in the key.
 MOVED = {"f8e4m3": torch.uint8}
 
-#: The unit round-off of each floating element type (``DType::unit_roundoff``).
+#: The unit round-off of each floating element type
+#: (``ops::tolerance::unit_roundoff``).
 UNIT = {"f16": 2.0**-11, "bf16": 2.0**-8, "f32": 2.0**-24, "f64": 2.0**-53}
 
 

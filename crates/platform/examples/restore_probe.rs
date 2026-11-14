@@ -7,7 +7,8 @@
 //! below what the three pools map, and the caller's run had the restore come
 //! back `Ok`. This probe walks the same sequence and prints, at each step, the
 //! bytes the driver rounded each block to and every total the budget was asked
-//! to accept, so the next run names the step that differs from the contract.
+//! to accept, so the next run names the step that differs from what the test
+//! expects.
 //!
 //!     cargo run -p platform --example restore_probe
 

@@ -1,6 +1,6 @@
 //! Media probing: what a condition's media is, read by the decoders that read
-//! it ([`crate::read`]), so the extent a request is planned with is the extent
-//! the reader produces.
+//! it ([`crate::read`]), so the extent a request's transform states is the
+//! extent the reader produces.
 //!
 //! - [`probe_image`]: an image's format and its displayed size, its EXIF
 //!   orientation applied by the `image` decoder [`crate::read::read_image`]
@@ -173,7 +173,7 @@ pub struct DecodedTrack {
 ///
 /// # Errors
 ///
-/// [`Error::Plan`] when the media has no audio stream or one with more than
+/// [`Error::Invalid`] when the media has no audio stream or one with more than
 /// two channels; [`Error::Codec`] when decoding fails.
 pub fn decoded_track(encoded: &[u8]) -> Result<DecodedTrack> {
     let decoded = ffi::decode_audio(encoded)?;

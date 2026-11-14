@@ -87,7 +87,7 @@ impl MediaRunner {
     ///
     /// # Errors
     ///
-    /// [`crate::Error::Plan`] when the request already has assembly, the
+    /// [`crate::Error::Invalid`] when the request already has assembly, the
     /// dimensions or rates are not positive, or the units cover no frames.
     pub fn open_mux(
         &self,
@@ -101,7 +101,7 @@ impl MediaRunner {
         let session = MuxSession::open(width, height, frame_rate, audio_rate, unit_frames)?;
         let mut sessions = self.lock_sessions();
         if sessions.contains_key(&request) {
-            return Err(crate::Error::plan(format!(
+            return Err(crate::Error::invalid(format!(
                 "request {request} already has a media assembly"
             )));
         }
@@ -113,7 +113,7 @@ impl MediaRunner {
     ///
     /// # Errors
     ///
-    /// [`crate::Error::Plan`] when the request has no assembly or the units
+    /// [`crate::Error::Invalid`] when the request has no assembly or the units
     /// exceed it; the muxer's own errors otherwise.
     pub fn append_units(&self, request: u64, units: &[Vec<u8>]) -> Result<()> {
         let session = self.session(request)?;
@@ -125,7 +125,7 @@ impl MediaRunner {
     ///
     /// # Errors
     ///
-    /// [`crate::Error::Plan`] when the request has no assembly or already has
+    /// [`crate::Error::Invalid`] when the request has no assembly or already has
     /// its audio.
     pub fn set_audio(&self, request: u64, audio: Vec<u8>) -> Result<()> {
         let session = self.session(request)?;
@@ -137,12 +137,12 @@ impl MediaRunner {
     ///
     /// # Errors
     ///
-    /// [`crate::Error::Plan`] when the request has no assembly, a unit or the
+    /// [`crate::Error::Invalid`] when the request has no assembly, a unit or the
     /// audio is missing; the muxer's own errors otherwise.
     pub fn finish_mux(&self, request: u64) -> Result<Vec<u8>> {
         let mut sessions = self.lock_sessions();
         let session = sessions.remove(&request).ok_or_else(|| {
-            crate::Error::plan(format!("request {request} has no media assembly"))
+            crate::Error::invalid(format!("request {request} has no media assembly"))
         })?;
         let mut session = session.lock().unwrap_or_else(|error| error.into_inner());
         session.finish()
@@ -176,10 +176,9 @@ impl MediaRunner {
     /// The assembly of `request`, shared so that its own calls serialize while
     /// other requests proceed.
     fn session(&self, request: u64) -> Result<Arc<Mutex<MuxSession>>> {
-        self.lock_sessions()
-            .get(&request)
-            .cloned()
-            .ok_or_else(|| crate::Error::plan(format!("request {request} has no media assembly")))
+        self.lock_sessions().get(&request).cloned().ok_or_else(|| {
+            crate::Error::invalid(format!("request {request} has no media assembly"))
+        })
     }
 
     /// The session map, surviving a panic of a previous holder: the map holds

@@ -156,14 +156,14 @@ def sinc_cases() -> None:
         "ratio": (2, 24000, 16000, 50),
     }
     for name, (channels, orig, new, length) in cases.items():
-        plan = []
+        channel_signals = []
         for channel in range(channels):
             frequency = 440.0 + 310.0 * channel
             times = np.arange(length, dtype=np.float64) / orig
             signal = np.sin(2.0 * np.pi * frequency * times)
             signal += 0.5 * np.sin(2.0 * np.pi * (frequency * 3.0) * times)
-            plan.append(signal.astype(np.float32))
-        source = torch.from_numpy(np.stack(plan))
+            channel_signals.append(signal.astype(np.float32))
+        source = torch.from_numpy(np.stack(channel_signals))
         expected = torchaudio.transforms.Resample(orig, new)(source)
         write_case(
             "sinc",

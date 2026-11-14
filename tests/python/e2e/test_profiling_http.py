@@ -99,8 +99,8 @@ def _chat(base_url: str, tokens: int = 32) -> None:
     response.raise_for_status()
 
 
-def _fence_count(base_url: str, stage: str, component: str) -> int:
-    """The steps the fence histogram counted for `stage` and `component`."""
+def _fence_count(base_url: str, stage: str, label: str) -> int:
+    """The steps the fence histogram counted for `stage` and `label`."""
     text = httpx.get(f"{base_url}/metrics", timeout=30).text
     pattern = re.compile(
         r"^uniserve:worker_fence_step_seconds_count\{([^}]*)\} (\S+)$",
@@ -108,7 +108,7 @@ def _fence_count(base_url: str, stage: str, component: str) -> int:
     )
     total = 0
     for labels, value in pattern.findall(text):
-        if f'stage="{stage}"' in labels and component in labels:
+        if f'stage="{stage}"' in labels and label in labels:
             total += int(float(value))
     return total
 

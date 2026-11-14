@@ -57,7 +57,7 @@ pub fn launch(name: &str, schedulers: usize) -> EngineArgs {
         schedulers,
         1,
         2,
-        WorkerGroupConfig::single_component(proto::config::DEFAULT_BLOCK, 1),
+        WorkerGroupConfig::single_block(proto::config::DEFAULT_BLOCK, 1),
     );
     for (index, group) in groups.iter_mut().enumerate() {
         for rank in &mut group.ranks {

@@ -128,7 +128,7 @@ Product& runner() {
       // gated BF16-output cubin in this artifact is `biasFp32M`, so a bias kernel can never match.
       // With `None` the runner skips the bias checks and accepts a null pointer (its own words:
       // "we can pass nullptr bias to get biasType::None for any bias kernel"), which is exactly
-      // this operator's contract.
+      // what this bias-free operator passes.
       /*biasType=*/batchedGemm::gemm::BiasType::None,
       // The artifact's FP4 kernels read the encoder's per-token factor beside the block scales.
       /*usePerTokenScaling=*/true,
@@ -225,20 +225,21 @@ int launch(uniserve_gather_gemm_nvfp4_call* call, void* stream) {
   }
   // The arming: the artifact's own requirement for the chosen tactic, plus the two
   // device words this entry owns (the padded route count). A buffer shorter than that
-  // is refused with both numbers -- the plan sizes it, and a step that grows one is a
-  // host allocation inside a captured graph.
+  // is refused with both numbers -- the caller sizes it from the bucket's route count
+  // (`nn::functional::moe`), and a step that grows one is a host allocation inside a
+  // captured graph.
   size_t const required = product.getWorkspaceSizeInBytes(top_k, hidden, intermediate, experts,
                                                           tokens, config);
   // The scratch the entry owns: the padded route count (one i32), then the tactic's own. The
-  // bias table this entry used to zero is gone with `BiasType::None`: a null pointer is the
-  // operator's contract, and a table nothing reads is a buffer a capture would size for nothing.
+  // bias table this entry used to zero is gone with `BiasType::None`: a null pointer is what the
+  // operator passes, and a table nothing reads is a buffer a capture would size for nothing.
   size_t const bias_at = 16;
   size_t const needed = bias_at + required;
   if (static_cast<size_t>(call->workspace_bytes) < needed) {
     char message[512];
     std::snprintf(message, sizeof(message),
                   "the product's tactic needs %zu bytes of scratch and the step provided %lld: the "
-                  "plan sizes this buffer, and the entry never grows one",
+                  "caller sizes this buffer, and the entry never grows one",
                   needed, static_cast<long long>(call->workspace_bytes));
     return refuse(call, message);
   }

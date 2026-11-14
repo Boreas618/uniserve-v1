@@ -470,14 +470,14 @@ impl Communicator {
     }
 
     /// Splits a subgroup out of this communicator (`ncclCommSplit`), which is
-    /// how a world plan becomes the TP, DP and expert groups the design's
-    /// blocks run on.
+    /// how a world communicator becomes the TP, DP and expert groups the
+    /// deployment's blocks run on.
     ///
     /// `ranks` are the parent ranks of the subgroup this rank belongs to, in
     /// the order their new ranks take; `rank` is this communicator's rank in
     /// the parent. The colour is derived from the subgroup itself — its
-    /// smallest parent rank — so one call serves a whole world plan: every
-    /// member passes the same list, and disjoint subgroups get distinct
+    /// smallest parent rank — so one call serves every subgroup of a world:
+    /// every member passes the same list, and disjoint subgroups get distinct
     /// colours. A rank that is not in `ranks` still calls this, because the
     /// split is collective over the parent; it passes `NCCL_SPLIT_NOCOLOR` and
     /// answers `None`, since NCCL hands it no communicator.
@@ -617,8 +617,8 @@ mod tests {
 
     /// `ncclUniqueId` is a 128-byte opaque token in `nccl.h`, and this crate
     /// passes it to NCCL by value and compares it between ranks, so its size is
-    /// the contract: a larger `UniqueId` would be a different rendezvous value
-    /// than the other ranks hold.
+    /// part of the interface: a larger `UniqueId` would be a different
+    /// rendezvous value than the other ranks hold.
     ///
     /// `ncclConfig_t` is laid out by `ffi::RawConfig` and compared by
     /// `the_nccl_config_is_laid_out_as_the_header`.

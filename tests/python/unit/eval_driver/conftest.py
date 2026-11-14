@@ -12,7 +12,7 @@ import pytest
 
 @pytest.fixture(scope="session")
 def media():
-    """Encoded fixture with the real H3 shape, audio and frame contract."""
+    """Encoded fixture with the real H3 shape, audio and frame count."""
     result = io.BytesIO()
     frames = 107  # 17 * 6 + 5, a frame count H3 generates.
     with av.open(result, "w", format="mp4") as container:

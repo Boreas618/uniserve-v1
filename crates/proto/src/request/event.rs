@@ -262,7 +262,7 @@ pub struct DiffusionRequest {
 /// encoding's and the audio encoding's.
 ///
 /// The daemon computes them from the request's facts (its presentation and
-/// the content and plan of each condition's media), so that requests whose
+/// the content and transform of each condition's media), so that requests whose
 /// encoders read the same inputs, the same request on another engine among
 /// them, find each other's outputs. An engine keys an encoder's output by
 /// these digests and the identity of what the encoder computes.

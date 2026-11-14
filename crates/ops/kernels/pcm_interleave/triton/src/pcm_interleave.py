@@ -16,7 +16,7 @@ too: ties go to the even neighbour, which is what ``numpy.rint`` and Rust's
 ``f32::round_ties_even`` do, so a program that rounds ties away from zero would
 differ on exactly the half samples and nowhere else. That is why the rounding is
 one PTX instruction (``cvt.rni.f32.f32``, round to nearest integer, ties to even)
-rather than an arithmetic trick: the formula is the contract, and the operator's
+rather than an arithmetic trick: the formula is the rule, and the operator's
 tolerance is exact.
 
 One program handles ``BLOCK`` samples: a sample's two outputs are written beside

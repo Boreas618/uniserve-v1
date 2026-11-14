@@ -18,6 +18,6 @@ The build script finds the runtime in `UNISERVE_FFMPEG_DIR` and stops when it is
 
 ## Tests
 
-`cargo test -p media` builds with `UNISERVE_FFMPEG_DIR` naming the runtime prefix, like every build of the crate, and runs every test that needs nothing more: the encoder, muxing and MP4 contract tests and the readers' refusals, which use the linked runtime's `bin/ffmpeg` and `bin/ffprobe` (`UNISERVE_FFMPEG` and `UNISERVE_FFPROBE` select others) and media the tests generate themselves.
+`cargo test -p media` builds with `UNISERVE_FFMPEG_DIR` naming the runtime prefix, like every build of the crate, and runs every test that needs nothing more: the encoder, muxing and MP4 output tests and the readers' refusals, which use the linked runtime's `bin/ffmpeg` and `bin/ffprobe` (`UNISERVE_FFMPEG` and `UNISERVE_FFPROBE` select others) and media the tests generate themselves.
 
 The comparisons with the reference implementations are ignored by default because they need `UNISERVE_REFERENCE_PYTHON` to name an interpreter with numpy, Pillow, torch, torchvision and torchaudio. The `generate.py` scripts under `tests/fixtures/` produce their fixtures in each test process. Run them with `UNISERVE_REFERENCE_PYTHON=<python> cargo test -p media -- --ignored`; without the variable they fail rather than pass.

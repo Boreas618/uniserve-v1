@@ -4,7 +4,7 @@ One program owns one page of an E4M3 cache. It derives the page's scale from the
 values this launch brings, re-encodes the page when that scale grows, stores the
 incoming rows at the new scale, and only then commits the scale and the flag.
 
-The five steps are the operator's contract and their order is part of it: a
+The five steps are the operator's rule and their order is part of it: a
 program that stores before committing the scale, or that grows the scale without
 re-encoding the page, leaves a cache whose shapes, keys and flags all agree and
 whose numbers do not.

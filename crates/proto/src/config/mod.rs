@@ -276,7 +276,7 @@ pub struct SchedulerConfig {
     #[serde(skip)]
     pub draft_tokens: usize,
     /// The captured graph sizes the ranks state, in tokens, ascending and without duplicates:
-    /// `Room.graph_tiers`, the bound a plan's batch must fit. Empty when they state none, and on a
+    /// `Room.graph_tiers`, the bound a scheduled batch must fit. Empty when they state none, and on a
     /// reconfigure, which carries no graph catalog: a worker then runs its own captured catalog or
     /// eagerly, and the tier bound is honest but vacuous.
     #[serde(skip)]
@@ -693,20 +693,20 @@ impl Default for MediaConfig {
 }
 
 /// The workers' always-on profiling (`profiling_config`): the fence
-/// probes at the entry and exit of the model's components, which export
-/// per-step component durations (`docs/profiling.md`).
+/// probes at the entry and exit of the model's modules, which export
+/// per-step durations by module class (`docs/profiling.md`).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct ProfilingConfig {
     /// Whether the probes record: the device switch every probe reads,
     /// changed in place, at the engine's next step boundary.
     pub fence_probes: bool,
-    /// Name patterns (`*` matches any run) of the components whose module
+    /// Name patterns (`*` matches any run) of the module classes whose
     /// instances carry probes in the CUDA graphs an epoch captures; a change
     /// takes a new epoch. Empty for no probe.
     pub fence_components: Vec<String>,
-    /// Name patterns (`*` matches any run) of the probed components whose
-    /// probes are off while `fence_probes` is on: the components whose
+    /// Name patterns (`*` matches any run) of the probed module classes whose
+    /// probes are off while `fence_probes` is on: the classes whose
     /// probes cost more than the always-on budget. Changed in place, at the
     /// engine's next step boundary, as `fence_probes` is.
     pub fence_probes_off: Vec<String>,
@@ -733,12 +733,14 @@ impl Default for ProfilingConfig {
     }
 }
 
-/// The components probed by default: each model's decoder stack (its
-/// `Transformer` component), one instance per step. Each probe costs a
-/// kernel launch in every replay, about a microsecond on GB200 even when
-/// switched off, so probing every layer exceeds the always-on budget
-/// (`docs/profiling.md`).
-pub const DEFAULT_FENCE_COMPONENTS: [&str; 1] = ["*.Transformer"];
+/// The module classes probed by default: each model's decoder or denoiser
+/// stack, one instance per step. Qwen3 names its stack's class
+/// `models.qwen3.transformer.Transformer` and MiniMax-H3 its denoiser's
+/// `Transformer`, so the pattern has no separator before the class name.
+/// Each probe costs a kernel launch in every replay, about a microsecond on
+/// GB200 even when switched off, so probing every layer exceeds the
+/// always-on budget (`docs/profiling.md`).
+pub const DEFAULT_FENCE_COMPONENTS: [&str; 1] = ["*Transformer"];
 
 /// The shape a chat template takes message `content` in.
 ///
@@ -859,7 +861,7 @@ pub struct ModelConfig {
     /// reads the checkpoint, and an engine opens the checkpoint and its base as one.
     pub base: Option<String>,
     /// The weight adapter fused into the checkpoint at load (`lora_path`): an adapter file, or a
-    /// directory holding one. The model family names the component it edits, and every request of
+    /// directory holding one. The model family names the module it edits, and every request of
     /// the deployment is served by the adapted weights; `None` serves the checkpoint as it is.
     pub lora_path: Option<String>,
     /// Longest sequence a request may reach, in tokens: the configured `max_model_len`, else

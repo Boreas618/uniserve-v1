@@ -123,12 +123,12 @@ def operands(
 
 
 def decoded(tensor, dtype=torch.float32):
-    """A page decoded once, in f32 — the one operation the contract fixes the order of."""
+    """A page decoded once, in f32 — the one operation the operator fixes the order of."""
     return tensor.to(dtype)
 
 
 def reference(operands_of, dtype=torch.float32):
-    """The contract's composition, in torch, over every key the row's length shows."""
+    """The operator's composition, in torch, over every key the row's length shows."""
     query = operands_of["query"].to(dtype)
     key = decoded(operands_of["key"], dtype)
     value = decoded(operands_of["value"], dtype)
@@ -238,7 +238,7 @@ def compare(
     expected = reference(operands_of).to(torch.float32)
     got = launch(kernel, operands_of).to(torch.float32)
     # `Tolerance::rounding(max_kv_len, F32, output)` — the reduction is the row's key count — and
-    # the contract's envelope term `(2γ + u) · VALUE_ENVELOPE` for the page scales' cancellation.
+    # the operator's envelope term `(2γ + u) · VALUE_ENVELOPE` for the page scales' cancellation.
     reduction = max(int(value) for value in rows)
     bound = 2.0 * gamma(reduction) * reduction**0.5 + output_roundoff
     envelope = (2.0 * gamma(reduction) + ACCUMULATION_ROUNDOFF) * 8.0

@@ -1,6 +1,6 @@
 """The pooled tile similarities VSA's selection ranks: the ``vsa_scores`` operator's Triton source.
 
-VSA pools each tile's per-head means, contracts them per head, and ranks the result to choose the
+VSA pools each tile's per-head means, multiplies them per head, and ranks the result to choose the
 tiles the sparse attention reads:
 
 ```text
@@ -24,7 +24,7 @@ the selection reads, which the operator requires and nothing else may be.
 import triton
 import triton.language as tl
 
-#: Key tiles one program contracts per step. It is a register tile, not a descriptor field: the
+#: Key tiles one program reduces per step. It is a register tile, not a descriptor field: the
 #: contraction is the descriptor's `width`, and how many keys a step holds changes no result.
 KEY_BLOCK = tl.constexpr(16)
 
@@ -54,7 +54,7 @@ def _vsa_scores_kernel(
     """Write ``QUERIES`` (head, query tile) rows of scores.
 
     ``WIDTH`` is the contraction and ``BLOCK`` the lanes it uses, both the descriptor's; ``KEY_TILES``
-    is the key tiles one step contracts and ``QUERIES`` the query tiles a program holds.
+    is the key tiles one step reduces and ``QUERIES`` the query tiles a program holds.
     ``query_tiles`` and ``key_tiles`` are the launch's words - the grid names the block of query tiles
     and the head - and ``pdl`` is a launching decision.
     """
@@ -78,7 +78,7 @@ def _vsa_scores_kernel(
     ).to(tl.float32)
     root = tl.sqrt(tl.full((QUERIES, KEY_TILES), WIDTH, tl.float32))
 
-    # One step contracts KEY_TILES key tiles against the query rows.
+    # One step multiplies KEY_TILES key tiles against the query rows.
     step = tl.arange(0, KEY_TILES).to(tl.int64)
     out_base = (head * query_tiles + rows) * key_tiles
     for start in range(0, key_tiles, KEY_TILES):

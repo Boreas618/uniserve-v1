@@ -9,7 +9,7 @@
 //! launch. The object's own launches are captured with the stream, so a
 //! native kernel is captured into a graph exactly like a cubin one.
 //!
-//! The entry point's C signature is the package's contract with `ops`
+//! The entry point's C signature is the package's interface with `ops`
 //! (`Kernel::Native { library, entry }`): this module only opens the object
 //! and resolves the symbol with the type the caller declares.
 //!
@@ -42,7 +42,7 @@ pub struct NativeLibrary {
 
 // SAFETY: the code of a loaded shared object is executable from any thread;
 // `dlclose` runs on the last owner's drop, and a call into the library is an
-// `unsafe` call whose thread contract is the package's.
+// `unsafe` call whose thread-safety rules are the package's.
 unsafe impl Send for NativeLibrary {}
 // SAFETY: as for `Send`; a shared reference is only used to resolve an entry
 // point, which does not mutate the library.

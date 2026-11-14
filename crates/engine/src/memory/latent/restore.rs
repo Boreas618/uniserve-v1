@@ -5,7 +5,7 @@
 //! request's latent samples, in pages of the units of its part of the host
 //! latent region: each modality's sample is a logical tensor of rows by
 //! channels, the rank holds some of its rows, and its values lie at an offset
-//! of the row's pages (`uniserve.worker.video.plan.SampleLayout.storage`).
+//! of the row's pages (`Stored::layout`).
 //! The worker declares this as one storage of the copy manifest library
 //! (`::storage::manifest`): the row's pages up to the last one holding a
 //! value, each page a chunk keyed by the part of the samples it holds and

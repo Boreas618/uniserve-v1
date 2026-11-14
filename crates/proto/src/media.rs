@@ -154,7 +154,7 @@ pub struct MappedMedia {
 }
 
 // SAFETY: the pointer refers to a `PROT_READ` mapping of an object its
-// publisher no longer writes (the request interface's contract for an
+// publisher no longer writes (the request interface's rule for an
 // artifact) and that stays mapped until this value drops, so moving it across
 // threads cannot race.
 unsafe impl Send for MappedMedia {}

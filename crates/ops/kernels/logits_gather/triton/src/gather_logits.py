@@ -3,7 +3,7 @@
 One program copies one block of one selected row of the hidden state into a
 dense ``[requests, width]`` matrix, which the vocabulary head's GEMM then
 multiplies. The gather is one launch, so a captured decode step compacts its
-rows on the device without a host plan.
+rows on the device without a host-side index list.
 """
 
 import triton

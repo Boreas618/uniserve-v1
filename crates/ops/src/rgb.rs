@@ -76,7 +76,7 @@ pub fn quantize(value: f32, mean: f32, std: f32) -> u8 {
 /// The last step alone: clamp into `[0, 255]` and round to the nearest byte, ties to even.
 ///
 /// Split from [`quantize`] so a test can name a tie exactly (`0.5`, `1.5`, `2.5`), which is what the
-/// rounding's contract is about.
+/// rounding's rule is about.
 pub fn quantize_scaled(scaled: f32) -> u8 {
     // A NaN has no byte; the reference's `.clamp(0, 1)` leaves it NaN and `round()` keeps it, and its
     // conversion to `uint8` is then implementation-defined, so a launch that produces one is a

@@ -19,7 +19,7 @@
 //! The bound between two implementations: the probabilities are a scale of positive terms, so the
 //! weights carry the `rounding` bound with the reduction length of the softmax, `experts`, and the
 //! FP32 accumulation and output; the expert ids are exact — the descending-then-ascending order is
-//! part of the contract, not an implementation detail, so two correct implementations name the same
+//! part of the operator's rule, not an implementation detail, so two correct implementations name the same
 //! experts in the same slots.
 
 use std::fmt;

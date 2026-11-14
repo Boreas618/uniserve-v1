@@ -18,9 +18,10 @@
 //   B = the input buffer:   [k, m] with ld = input_row_stride;
 //   C = D = the out buffer: [n, m] with ld = out_row_stride.
 //
-// Algorithm choice, workspace and the plan belong to the package's tuning
-// data (design 5.4): each shape is asked from cuBLASLt's heuristic once, and
-// the plan is then reused for every launch of that shape. Serving never times
+// Algorithm choice, workspace and the matmul descriptor belong to the
+// package's tuning data (design 5.4): each shape is asked from cuBLASLt's
+// heuristic once, and its matmul is then reused for every launch of that
+// shape. Serving never times
 // anything; an offline tuner records its choices by publishing a new revision
 // of the package, and the recorded algorithm arrives as that revision's code.
 //
@@ -66,9 +67,10 @@
 
 namespace {
 
-/// The largest workspace a plan may ask for. cuBLASLt's heuristic never needs
-/// more than a few tens of megabytes for these shapes; the cap keeps one
-/// program's plans from growing without bound on a host that runs many.
+/// The largest workspace a matmul may ask for. cuBLASLt's heuristic never
+/// needs more than a few tens of megabytes for these shapes; the cap keeps one
+/// program's matmul workspaces from growing without bound on a host that runs
+/// many.
 constexpr size_t kWorkspaceCap = 64u * 1024u * 1024u;
 
 /// Writes this entry's message into the call structure and returns the
@@ -104,9 +106,9 @@ const char* cublas_status(cublasStatus_t status) {
   }
 }
 
-/// The plan of one shape: the layouts, the algorithm cuBLASLt chose for it and
-/// the workspace that algorithm needs.
-struct Plan {
+/// The matmul of one shape: the operation descriptor, the layouts, the
+/// algorithm cuBLASLt chose for it and the workspace that algorithm needs.
+struct Matmul {
   cublasLtMatmulDesc_t operation = nullptr;
   cublasLtMatrixLayout_t a = nullptr;
   cublasLtMatrixLayout_t b = nullptr;
@@ -116,7 +118,7 @@ struct Plan {
   size_t workspace_bytes = 0;
   void* workspace = nullptr;
 
-  ~Plan() {
+  ~Matmul() {
     if (workspace != nullptr) {
       cudaFree(workspace);
     }
@@ -166,10 +168,10 @@ Handles& handles() {
   return instance;
 }
 
-/// The key of a plan: everything about a launch that changes cuBLASLt's
+/// The key of a matmul: everything about a launch that changes cuBLASLt's
 /// choice. The rows `m` is part of it because the heuristic's answer depends
 /// on it; a deployment asks for a bounded set of buckets (design 4.5).
-struct PlanKey {
+struct MatmulKey {
   int device;
   int64_t m;
   int64_t n;
@@ -178,7 +180,7 @@ struct PlanKey {
   int64_t weight_row_stride;
   int64_t out_row_stride;
 
-  bool operator==(const PlanKey& other) const {
+  bool operator==(const MatmulKey& other) const {
     return device == other.device && m == other.m && n == other.n && k == other.k &&
            input_row_stride == other.input_row_stride &&
            weight_row_stride == other.weight_row_stride &&
@@ -186,8 +188,8 @@ struct PlanKey {
   }
 };
 
-struct PlanKeyHash {
-  size_t operator()(const PlanKey& key) const {
+struct MatmulKeyHash {
+  size_t operator()(const MatmulKey& key) const {
     size_t hash = static_cast<size_t>(key.device);
     const int64_t values[] = {key.m,          key.n,   key.k, key.input_row_stride,
                               key.weight_row_stride, key.out_row_stride};
@@ -198,37 +200,37 @@ struct PlanKeyHash {
   }
 };
 
-/// The plan cache. A plan is built once per shape and device and then reused;
-/// `bias` is the only part that changes per launch, so it is set on the
-/// operation each call.
-class Plans {
+/// The matmul cache. A matmul is built once per shape and device and then
+/// reused; `bias` is the only part that changes per launch, so it is set on
+/// the operation each call.
+class MatmulCache {
  public:
-  /// Whether a plan for this shape exists, without building one.
-  bool contains(const PlanKey& key) {
+  /// Whether a matmul for this shape exists, without building one.
+  bool contains(const MatmulKey& key) {
     std::lock_guard<std::mutex> guard(mutex_);
-    return plans_.find(key) != plans_.end();
+    return matmuls_.find(key) != matmuls_.end();
   }
 
-  /// The plan for one shape, built when it is first asked for.
-  Plan* of(const PlanKey& key, cublasLtHandle_t handle, std::string* error) {
+  /// The matmul for one shape, built when it is first asked for.
+  Matmul* of(const MatmulKey& key, cublasLtHandle_t handle, std::string* error) {
     std::lock_guard<std::mutex> guard(mutex_);
-    auto found = plans_.find(key);
-    if (found != plans_.end()) {
+    auto found = matmuls_.find(key);
+    if (found != matmuls_.end()) {
       return found->second.get();
     }
-    auto plan = std::make_unique<Plan>();
-    if (!build(key, handle, plan.get(), error)) {
+    auto matmul = std::make_unique<Matmul>();
+    if (!build(key, handle, matmul.get(), error)) {
       return nullptr;
     }
-    Plan* built = plan.get();
-    plans_[key] = std::move(plan);
+    Matmul* built = matmul.get();
+    matmuls_[key] = std::move(matmul);
     return built;
   }
 
  private:
-  /// Builds one plan: the operation, the four layouts and the heuristic's
+  /// Builds one matmul: the operation, the four layouts and the heuristic's
   /// algorithm with the workspace it asks for.
-  static bool build(const PlanKey& key, cublasLtHandle_t handle, Plan* plan,
+  static bool build(const MatmulKey& key, cublasLtHandle_t handle, Matmul* matmul,
                     std::string* error) {
     const bool kxn = UNISERVE_WEIGHT_ORDER == 0;
     // cuBLASLt's view: A is [n, k] (kxn, transposed by the layout) or [k, n]
@@ -237,17 +239,17 @@ class Plans {
     const uint64_t a_columns = kxn ? static_cast<uint64_t>(key.k) : static_cast<uint64_t>(key.n);
     const cublasOperation_t operation_a = kxn ? CUBLAS_OP_N : CUBLAS_OP_T;
 
-    cublasStatus_t status = cublasLtMatmulDescCreate(&plan->operation, UNISERVE_ACCUMULATE_TYPE,
+    cublasStatus_t status = cublasLtMatmulDescCreate(&matmul->operation, UNISERVE_ACCUMULATE_TYPE,
                                                      CUDA_R_32F);
     if (status != CUBLAS_STATUS_SUCCESS) {
       *error = std::string("creating the matmul description: ") + cublas_status(status);
       return false;
     }
-    status = cublasLtMatmulDescSetAttribute(plan->operation, CUBLASLT_MATMUL_DESC_TRANSA,
+    status = cublasLtMatmulDescSetAttribute(matmul->operation, CUBLASLT_MATMUL_DESC_TRANSA,
                                             &operation_a, sizeof(operation_a));
     if (status == CUBLAS_STATUS_SUCCESS) {
       const cublasOperation_t operation_b = CUBLAS_OP_N;
-      status = cublasLtMatmulDescSetAttribute(plan->operation, CUBLASLT_MATMUL_DESC_TRANSB,
+      status = cublasLtMatmulDescSetAttribute(matmul->operation, CUBLASLT_MATMUL_DESC_TRANSB,
                                               &operation_b, sizeof(operation_b));
     }
     if (status != CUBLAS_STATUS_SUCCESS) {
@@ -257,10 +259,10 @@ class Plans {
     if (UNISERVE_EPILOGUE == 1) {
       const cublasLtEpilogue_t epilogue = CUBLASLT_EPILOGUE_BIAS;
       const cudaDataType_t bias_type = UNISERVE_OUTPUT_TYPE;
-      status = cublasLtMatmulDescSetAttribute(plan->operation, CUBLASLT_MATMUL_DESC_EPILOGUE,
+      status = cublasLtMatmulDescSetAttribute(matmul->operation, CUBLASLT_MATMUL_DESC_EPILOGUE,
                                               &epilogue, sizeof(epilogue));
       if (status == CUBLAS_STATUS_SUCCESS) {
-        status = cublasLtMatmulDescSetAttribute(plan->operation,
+        status = cublasLtMatmulDescSetAttribute(matmul->operation,
                                                 CUBLASLT_MATMUL_DESC_BIAS_DATA_TYPE, &bias_type,
                                                 sizeof(bias_type));
       }
@@ -270,20 +272,20 @@ class Plans {
       }
     }
 
-    status = cublasLtMatrixLayoutCreate(&plan->a, UNISERVE_WEIGHT_TYPE, a_rows, a_columns,
+    status = cublasLtMatrixLayoutCreate(&matmul->a, UNISERVE_WEIGHT_TYPE, a_rows, a_columns,
                                         key.weight_row_stride);
     if (status == CUBLAS_STATUS_SUCCESS) {
-      status = cublasLtMatrixLayoutCreate(&plan->b, UNISERVE_INPUT_TYPE,
+      status = cublasLtMatrixLayoutCreate(&matmul->b, UNISERVE_INPUT_TYPE,
                                           static_cast<uint64_t>(key.k),
                                           static_cast<uint64_t>(key.m), key.input_row_stride);
     }
     if (status == CUBLAS_STATUS_SUCCESS) {
-      status = cublasLtMatrixLayoutCreate(&plan->c, UNISERVE_OUTPUT_TYPE,
+      status = cublasLtMatrixLayoutCreate(&matmul->c, UNISERVE_OUTPUT_TYPE,
                                           static_cast<uint64_t>(key.n),
                                           static_cast<uint64_t>(key.m), key.out_row_stride);
     }
     if (status == CUBLAS_STATUS_SUCCESS) {
-      status = cublasLtMatrixLayoutCreate(&plan->d, UNISERVE_OUTPUT_TYPE,
+      status = cublasLtMatrixLayoutCreate(&matmul->d, UNISERVE_OUTPUT_TYPE,
                                           static_cast<uint64_t>(key.n),
                                           static_cast<uint64_t>(key.m), key.out_row_stride);
     }
@@ -306,8 +308,9 @@ class Plans {
     cublasLtMatmulHeuristicResult_t result{};
     int returned = 0;
     if (status == CUBLAS_STATUS_SUCCESS) {
-      status = cublasLtMatmulAlgoGetHeuristic(handle, plan->operation, plan->a, plan->b, plan->c,
-                                              plan->d, preference, 1, &result, &returned);
+      status = cublasLtMatmulAlgoGetHeuristic(handle, matmul->operation, matmul->a, matmul->b,
+                                              matmul->c, matmul->d, preference, 1, &result,
+                                              &returned);
     }
     cublasLtMatmulPreferenceDestroy(preference);
     if (status != CUBLAS_STATUS_SUCCESS || returned < 1) {
@@ -316,14 +319,14 @@ class Plans {
                                                 : cublas_status(status));
       return false;
     }
-    plan->algorithm = result.algo;
-    plan->workspace_bytes = result.workspaceSize;
-    if (plan->workspace_bytes > 0) {
-      cudaError_t allocated = cudaMalloc(&plan->workspace, plan->workspace_bytes);
+    matmul->algorithm = result.algo;
+    matmul->workspace_bytes = result.workspaceSize;
+    if (matmul->workspace_bytes > 0) {
+      cudaError_t allocated = cudaMalloc(&matmul->workspace, matmul->workspace_bytes);
       if (allocated != cudaSuccess) {
-        plan->workspace = nullptr;
-        plan->workspace_bytes = 0;
-        *error = std::string("allocating the plan's workspace: ") + cudaGetErrorString(allocated);
+        matmul->workspace = nullptr;
+        matmul->workspace_bytes = 0;
+        *error = std::string("allocating the matmul's workspace: ") + cudaGetErrorString(allocated);
         return false;
       }
     }
@@ -331,11 +334,11 @@ class Plans {
   }
 
   std::mutex mutex_;
-  std::unordered_map<PlanKey, std::unique_ptr<Plan>, PlanKeyHash> plans_;
+  std::unordered_map<MatmulKey, std::unique_ptr<Matmul>, MatmulKeyHash> matmuls_;
 };
 
-Plans& plans() {
-  static Plans instance;
+MatmulCache& matmuls() {
+  static MatmulCache instance;
   return instance;
 }
 
@@ -366,19 +369,19 @@ extern "C" int uniserve_gemm(UniserveGemmCall* call, void* stream) {
     return fail(call, "creating the cuBLASLt handle: %s", cublas_status(status));
   }
 
-  PlanKey key{device,      call->m,
-              call->n,     call->k,
-              call->input_row_stride, call->weight_row_stride,
-              call->out_row_stride};
-  // A plan is built on its first call and that build allocates the algorithm's workspace with
+  MatmulKey key{device,      call->m,
+                call->n,     call->k,
+                call->input_row_stride, call->weight_row_stride,
+                call->out_row_stride};
+  // A matmul is built on its first call and that build allocates the algorithm's workspace with
   // `cudaMalloc`, which a capture cannot carry: the allocation is not part of the graph, and the
   // kernel then reads a pointer the graph never recorded. The refusal names the shape and the
   // remedy rather than letting the fault surface as an illegal address at the kernel's first read.
   cudaStreamCaptureStatus capture = cudaStreamCaptureStatusNone;
   if (cudaStreamIsCapturing(reinterpret_cast<cudaStream_t>(stream), &capture) == cudaSuccess &&
-      capture != cudaStreamCaptureStatusNone && !plans().contains(key)) {
+      capture != cudaStreamCaptureStatusNone && !matmuls().contains(key)) {
     return fail(call,
-                "the plan for [%lld, %lld] over %lld has not been built yet and building it "
+                "the matmul for [%lld, %lld] over %lld has not been built yet and building it "
                 "allocates its workspace, which a capture cannot carry; this shape has to run "
                 "once outside the bucket that captures it",
                 static_cast<long long>(call->m), static_cast<long long>(call->n),
@@ -386,12 +389,12 @@ extern "C" int uniserve_gemm(UniserveGemmCall* call, void* stream) {
   }
 
   std::string error;
-  Plan* plan = plans().of(key, handle, &error);
-  if (plan == nullptr) {
+  Matmul* matmul = matmuls().of(key, handle, &error);
+  if (matmul == nullptr) {
     return fail(call, "%s", error.c_str());
   }
   if (UNISERVE_EPILOGUE == 1) {
-    status = cublasLtMatmulDescSetAttribute(plan->operation, CUBLASLT_MATMUL_DESC_BIAS_POINTER,
+    status = cublasLtMatmulDescSetAttribute(matmul->operation, CUBLASLT_MATMUL_DESC_BIAS_POINTER,
                                             &call->bias, sizeof(call->bias));
     if (status != CUBLAS_STATUS_SUCCESS) {
       return fail(call, "passing the bias to cuBLASLt: %s", cublas_status(status));
@@ -399,9 +402,9 @@ extern "C" int uniserve_gemm(UniserveGemmCall* call, void* stream) {
   }
 
   const float beta = 0.0f;
-  status = cublasLtMatmul(handle, plan->operation, &call->alpha, call->weight, plan->a,
-                          call->input, plan->b, &beta, call->out, plan->c, call->out, plan->d,
-                          &plan->algorithm, plan->workspace, plan->workspace_bytes,
+  status = cublasLtMatmul(handle, matmul->operation, &call->alpha, call->weight, matmul->a,
+                          call->input, matmul->b, &beta, call->out, matmul->c, call->out, matmul->d,
+                          &matmul->algorithm, matmul->workspace, matmul->workspace_bytes,
                           reinterpret_cast<cudaStream_t>(stream));
   if (status != CUBLAS_STATUS_SUCCESS) {
     return fail(call, "cuBLASLt refused [%lld, %lld] over %lld from [%lld, %lld] and [%lld, %lld]: %s",

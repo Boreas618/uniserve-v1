@@ -308,7 +308,7 @@ where
 /// for common Rust entrypoint and module filenames.
 ///
 /// - For `mod.rs`, keep the parent directory as `parent/mod.rs`.
-/// - For `src/lib.rs` and `src/main.rs`, keep one additional component as `crate/src/lib.rs` or
+/// - For `src/lib.rs` and `src/main.rs`, keep one additional directory as `crate/src/lib.rs` or
 ///   `crate/src/main.rs` when available.
 /// - Other files are displayed as just the basename.
 fn shorten_file_path(file: &str) -> &str {

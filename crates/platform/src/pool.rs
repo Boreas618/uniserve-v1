@@ -251,7 +251,7 @@ impl VirtualPool {
     /// ([`Self::suspend`], which keeps every address and every byte's contents
     /// for [`Self::restore`]) or dropped. There is no partial shrink — a caller
     /// that must give back part of a range while keeping its addresses needs a
-    /// new operation, with its own contract and its own test, not this one
+    /// new operation, with its own rules and its own test, not this one
     /// quietly unmapping a tail.
     pub fn free(&mut self, address: u64) {
         if let Some(chunk) = self

@@ -15,18 +15,19 @@
 //! holds one request's assembly: which units arrived, in which order, and the
 //! decode time of the next one.
 //!
-//! Condition media is read exactly as its plan states: an image is decoded
-//! with its EXIF orientation applied, resized with Pillow's LANCZOS filter and
-//! cropped to its planned window ([`read::read_image`]); an audio track is
-//! decoded to planar float at its native rate, trimmed, duplicated to stereo,
-//! and brought to the model's rate with torchaudio's bandlimited sinc
-//! interpolation ([`read::read_audio`]); a reference video is decoded by one
-//! external `ffmpeg` process ([`read::read_video`]). Every reader checks that
-//! it produced exactly the planned extent and fails with [`Error::Plan`]
-//! otherwise, so media that decodes differently from what the server probed
-//! fails the request instead of misaligning its rows. The server probes the
-//! media through the same decoders ([`probe`]), so a request is planned with
-//! the extent its readers produce.
+//! Condition media is read exactly as its transform states: an image is
+//! decoded with its EXIF orientation applied, resized with Pillow's LANCZOS
+//! filter and cropped to its transform's window ([`read::read_image`]); an
+//! audio track is decoded to planar float at its native rate, trimmed,
+//! duplicated to stereo, and brought to the model's rate with torchaudio's
+//! bandlimited sinc interpolation ([`read::read_audio`]); a reference video is
+//! decoded by one external `ffmpeg` process ([`read::read_video`]). Every
+//! reader checks that it produced exactly the extent its transform states and
+//! fails with [`Error::Invalid`] otherwise, so media that decodes differently
+//! from what the server probed fails the request instead of misaligning its
+//! rows. The server probes the media through the same decoders ([`probe`]),
+//! so the extent a request's transform states is the extent its readers
+//! produce.
 //!
 //! The three host resamplers reproduce the reference implementations'
 //! mathematics: Pillow's LANCZOS resize ([`resample::lanczos_resize`]),

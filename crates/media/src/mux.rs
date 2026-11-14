@@ -28,12 +28,12 @@ impl Container {
     ///
     /// # Errors
     ///
-    /// [`crate::Error::Plan`] when `first_unit` has no video stream, the frame
+    /// [`crate::Error::Invalid`] when `first_unit` has no video stream, the frame
     /// rate is not positive, or the audio rate is not positive;
     /// [`crate::Error::Codec`] when the muxer fails.
     pub fn open(first_unit: &[u8], frame_rate: u32, audio_rate: u32) -> Result<Self> {
         if frame_rate < 1 || audio_rate < 1 {
-            return Err(Error::plan(
+            return Err(Error::invalid(
                 "media mux dimensions and rates must be positive",
             ));
         }
@@ -41,7 +41,9 @@ impl Container {
         // computes it: half to even.
         let samples = (audio_rate as f64 / frame_rate as f64).round_ties_even() as usize;
         if samples < 1 {
-            return Err(Error::plan("audio track length and rate must be positive"));
+            return Err(Error::invalid(
+                "audio track length and rate must be positive",
+            ));
         }
         let silence = vec![0i16; samples * 2];
         let audio_template = codec::encode_audio_track(&silence, samples, audio_rate)?;
@@ -56,7 +58,7 @@ impl Container {
     ///
     /// # Errors
     ///
-    /// [`crate::Error::Plan`] when `unit` has no video stream;
+    /// [`crate::Error::Invalid`] when `unit` has no video stream;
     /// [`crate::Error::Codec`] when demuxing or muxing fails.
     pub fn append(&mut self, unit: &[u8], offset: i64) -> Result<i64> {
         self.muxer.append(unit, offset)
@@ -68,12 +70,12 @@ impl Container {
     ///
     /// # Errors
     ///
-    /// [`crate::Error::Plan`] when the track has no audio or the container
+    /// [`crate::Error::Invalid`] when the track has no audio or the container
     /// came out empty; [`crate::Error::Codec`] when demuxing or muxing fails.
     pub fn finish(self, audio: &[u8]) -> Result<Vec<u8>> {
         let bytes = self.muxer.finish(audio)?;
         if bytes.is_empty() {
-            return Err(Error::plan("media mux produced an empty container"));
+            return Err(Error::invalid("media mux produced an empty container"));
         }
         Ok(bytes)
     }
@@ -104,7 +106,7 @@ impl MuxSession {
     ///
     /// # Errors
     ///
-    /// [`crate::Error::Plan`] when a dimension or rate is not positive, or the
+    /// [`crate::Error::Invalid`] when a dimension or rate is not positive, or the
     /// units are empty or cover no frames.
     pub fn open(
         width: u32,
@@ -114,12 +116,14 @@ impl MuxSession {
         unit_frames: &[u32],
     ) -> Result<Self> {
         if width < 1 || height < 1 || frame_rate < 1 || audio_rate < 1 {
-            return Err(Error::plan(
+            return Err(Error::invalid(
                 "media mux dimensions and rates must be positive",
             ));
         }
         if unit_frames.is_empty() || unit_frames.contains(&0) {
-            return Err(Error::plan("media mux units must cover the output frames"));
+            return Err(Error::invalid(
+                "media mux units must cover the output frames",
+            ));
         }
         Ok(Self {
             frame_rate,
@@ -148,14 +152,14 @@ impl MuxSession {
     ///
     /// # Errors
     ///
-    /// [`crate::Error::Plan`] when more units arrive than the request has, or
+    /// [`crate::Error::Invalid`] when more units arrive than the request has, or
     /// the session is closed; [`crate::Error::Codec`] when muxing fails.
     pub fn append(&mut self, units: &[Vec<u8>]) -> Result<()> {
         if self.closed {
-            return Err(Error::plan("artifact assembly is closed"));
+            return Err(Error::invalid("artifact assembly is closed"));
         }
         if self.units + units.len() > self.unit_frames.len() {
-            return Err(Error::plan(
+            return Err(Error::invalid(
                 "artifact assembly received more media units than the request",
             ));
         }
@@ -171,7 +175,7 @@ impl MuxSession {
             let container = self
                 .container
                 .as_mut()
-                .ok_or_else(|| Error::plan("a media assembly lost its container"))?;
+                .ok_or_else(|| Error::invalid("a media assembly lost its container"))?;
             self.offset = container.append(unit, self.offset)?;
             self.units += 1;
         }
@@ -182,14 +186,14 @@ impl MuxSession {
     ///
     /// # Errors
     ///
-    /// [`crate::Error::Plan`] when the session is closed or received its audio
+    /// [`crate::Error::Invalid`] when the session is closed or received its audio
     /// twice.
     pub fn set_audio(&mut self, audio: Vec<u8>) -> Result<()> {
         if self.closed {
-            return Err(Error::plan("artifact assembly is closed"));
+            return Err(Error::invalid("artifact assembly is closed"));
         }
         if self.audio.is_some() {
-            return Err(Error::plan("artifact assembly received its audio twice"));
+            return Err(Error::invalid("artifact assembly received its audio twice"));
         }
         self.audio = Some(audio);
         Ok(())
@@ -199,25 +203,25 @@ impl MuxSession {
     ///
     /// # Errors
     ///
-    /// [`crate::Error::Plan`] when a unit or the audio is missing, or the
+    /// [`crate::Error::Invalid`] when a unit or the audio is missing, or the
     /// session is closed; [`crate::Error::Codec`] when muxing fails.
     pub fn finish(&mut self) -> Result<Vec<u8>> {
         if self.closed {
-            return Err(Error::plan("artifact assembly is closed"));
+            return Err(Error::invalid("artifact assembly is closed"));
         }
         if self.units != self.unit_frames.len() {
-            return Err(Error::plan(
+            return Err(Error::invalid(
                 "artifact assembly requires every media unit of the request",
             ));
         }
         let audio = self
             .audio
             .take()
-            .ok_or_else(|| Error::plan("artifact assembly has no encoded audio"))?;
+            .ok_or_else(|| Error::invalid("artifact assembly has no encoded audio"))?;
         let container = self
             .container
             .take()
-            .ok_or_else(|| Error::plan("a complete artifact assembly has no container"))?;
+            .ok_or_else(|| Error::invalid("a complete artifact assembly has no container"))?;
         self.closed = true;
         container.finish(&audio)
     }
@@ -239,27 +243,27 @@ mod tests {
     fn a_session_requires_positive_dimensions_and_units() {
         assert!(matches!(
             MuxSession::open(0, 8, 24, 24_000, &[1]),
-            Err(Error::Plan(_))
+            Err(Error::Invalid(_))
         ));
         assert!(matches!(
             MuxSession::open(8, 0, 24, 24_000, &[1]),
-            Err(Error::Plan(_))
+            Err(Error::Invalid(_))
         ));
         assert!(matches!(
             MuxSession::open(8, 8, 0, 24_000, &[1]),
-            Err(Error::Plan(_))
+            Err(Error::Invalid(_))
         ));
         assert!(matches!(
             MuxSession::open(8, 8, 24, 0, &[1]),
-            Err(Error::Plan(_))
+            Err(Error::Invalid(_))
         ));
         assert!(matches!(
             MuxSession::open(8, 8, 24, 24_000, &[]),
-            Err(Error::Plan(_))
+            Err(Error::Invalid(_))
         ));
         assert!(matches!(
             MuxSession::open(8, 8, 24, 24_000, &[10, 0, 10]),
-            Err(Error::Plan(_))
+            Err(Error::Invalid(_))
         ));
     }
 
@@ -279,32 +283,35 @@ mod tests {
         // The excess is refused before the container is opened, so no encoder
         // runs in this test.
         let units = vec![vec![0u8; 4], vec![0u8; 4]];
-        assert!(matches!(session.append(&units), Err(Error::Plan(_))));
+        assert!(matches!(session.append(&units), Err(Error::Invalid(_))));
         // A refused call leaves the session usable: the request may still be
         // assembled from the units that remain.
         assert!(session.append(&[]).is_ok());
-        assert!(matches!(session.finish(), Err(Error::Plan(_))));
+        assert!(matches!(session.finish(), Err(Error::Invalid(_))));
         assert!(session.set_audio(vec![0u8; 4]).is_ok());
         assert!(matches!(
             session.set_audio(vec![0u8; 4]),
-            Err(Error::Plan(_))
+            Err(Error::Invalid(_))
         ));
 
         session.close();
-        assert!(matches!(session.append(&[]), Err(Error::Plan(_))));
+        assert!(matches!(session.append(&[]), Err(Error::Invalid(_))));
         assert!(matches!(
             session.set_audio(vec![0u8; 4]),
-            Err(Error::Plan(_))
+            Err(Error::Invalid(_))
         ));
-        assert!(matches!(session.finish(), Err(Error::Plan(_))));
+        assert!(matches!(session.finish(), Err(Error::Invalid(_))));
     }
 
     #[test]
     fn a_container_needs_positive_rates() {
         assert!(matches!(
             Container::open(&[], 0, 24_000),
-            Err(Error::Plan(_))
+            Err(Error::Invalid(_))
         ));
-        assert!(matches!(Container::open(&[], 24, 0), Err(Error::Plan(_))));
+        assert!(matches!(
+            Container::open(&[], 24, 0),
+            Err(Error::Invalid(_))
+        ));
     }
 }

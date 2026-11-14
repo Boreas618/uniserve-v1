@@ -10,7 +10,7 @@
 #include <cstdint>
 
 // One dense product over packed E2M1 operands. The call struct is the operator's
-// argument order; `stream` is the CUstream of the device the executor drives.
+// argument order; `stream` is the CUstream of the device the worker drives.
 //
 // `input` is [m, k / 2] packed bytes, `weight` [n, k / 2] packed bytes, both with
 // unit stride on the contraction; `input_scales` and `weight_scales` E4M3 in the
@@ -32,7 +32,7 @@ struct uniserve_nvfp4_gemm_call {
   char error[512];
 };
 
-// The operator crate's `DType::as_i64()` numbering.
+// The operator crate's package ABI numbering (`ops::abi::code`).
 enum uniserve_dtype : int64_t {
   UNISERVE_DTYPE_U8 = 0,
   UNISERVE_DTYPE_I32 = 1,

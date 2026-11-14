@@ -7,9 +7,8 @@
 
 One script covers the chain because the chain is one path — the logits row is moved, padded,
 penalized, filtered, drawn from and reported — and because a defect in any step builds
-cleanly, produces fluent nonsense, and gets attributed to the model. The same file is kept
-in each operator's package, byte for byte, and a test in
-`crates/build-server/tests/it/packages.rs` holds the copies together.
+cleanly, produces fluent nonsense, and gets attributed to the model. The script is kept
+once, here under `tests/python/kernels`, for every operator of the chain.
 
 Operators, in the order the data meets them:
 
@@ -101,7 +100,7 @@ for _sibling in SIBLINGS:
     if _source.is_dir() and str(_source) not in sys.path:
         sys.path.insert(0, str(_source))
 
-#: The output types' unit roundoff, as `DType::unit_roundoff` gives it.
+#: The output types' unit roundoff, as `ops::tolerance::unit_roundoff` gives it.
 UNIT_ROUNDOFF = {"f16": 2.0**-11, "bf16": 2.0**-8, "f32": 2.0**-24, "i32": 0.0}
 
 TORCH_TYPES = {
@@ -533,7 +532,7 @@ def run_inverse_cdf(case):
     draws = torch.tensor(case["draws"][:rows], dtype=torch.float32)
     tokens = torch.full((rows,), -1, dtype=torch.int32)
 
-    # The operator's contract: the candidates arrive in ascending id order. Sort the row here, so
+    # The operator's precondition: the candidates arrive in ascending id order. Sort the row here, so
     # the buffer the kernel reads is the one its caller (`nn::Sampler`, after `candidate_order`)
     # builds rather than a row it would have to sort itself.
     order = torch.argsort(ids.long(), dim=1, stable=True)

@@ -9,8 +9,8 @@
 
 One script covers both operators because they are one row reduction with one difference —
 `add_rms_norm` sums `x + residual` first, writes that sum back out as the new residual, and
-normalizes the sum. The same file is kept in each operator's package, byte for byte, and a
-test in `crates/build-server/tests/it/packages.rs` holds them together.
+normalizes the sum. The script is kept once, here under `tests/python/kernels`, for both
+operators.
 
 The cases are what a masked row reduction can get wrong: the shapes the fixture's keys
 name, a width far below the tile where almost every lane is masked, a row whose values are
@@ -57,7 +57,7 @@ for _sibling in SIBLINGS:
     if _source.is_dir() and str(_source) not in sys.path:
         sys.path.insert(0, str(_source))
 
-#: The output types' unit roundoff, as `DType::unit_roundoff` gives it.
+#: The output types' unit roundoff, as `ops::tolerance::unit_roundoff` gives it.
 UNIT_ROUNDOFF = {"f16": 2.0**-11, "bf16": 2.0**-8, "f32": 2.0**-24}
 
 TORCH_TYPES = {

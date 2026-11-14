@@ -6,7 +6,7 @@
 # asserted). A module takes its direction from the call, so every descriptor of
 # this package compiles the same object.
 #
-# The transport is an execution resource: the executor creates it through this
+# The transport is an execution resource: the worker creates it through this
 # package's `create` entry, writes each step's agreed capacity through `step`,
 # suspends and restores it around a standby, and hands the operator a borrowed
 # handle, so the operator never allocates. The workspace is mapped through the

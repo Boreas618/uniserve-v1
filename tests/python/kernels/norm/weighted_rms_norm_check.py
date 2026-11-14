@@ -76,7 +76,7 @@ import torch
 
 DTYPES = {"bf16": torch.bfloat16, "f16": torch.float16, "f32": torch.float32}
 
-#: `DType::unit_roundoff`, per element type.
+#: `ops::tolerance::unit_roundoff`, per element type.
 UNIT_ROUNDOFF = {"f16": 2.0**-11, "bf16": 2.0**-8, "f32": 2.0**-24}
 
 

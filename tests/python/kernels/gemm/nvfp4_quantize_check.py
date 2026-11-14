@@ -11,8 +11,8 @@ Three stages, reported separately because they fail for different reasons:
    compares the decoded tile with the input. What can fail: the E2M1 rounding,
    the code order inside a byte, the E4M3 scale's own encoding (exponent bias 7,
    subnormals below 2^-6, saturation at 448) and the scale bytes' swizzle.
-2. **The consumer against the same bytes.** Torch contracts the module's packed
-   codes and scale bytes in FP64; ``nvfp4_gemm`` contracts them on the device.
+2. **The consumer against the same bytes.** Torch multiplies the module's packed
+   codes and scale bytes in FP64; ``nvfp4_gemm`` multiplies them on the device.
 3. **The two against each other.** If stage 1 passes and stage 3 fails, one
    field of the interface between the two modules is wrong; if stage 1 fails,
    the consumer was never the question.
@@ -442,7 +442,7 @@ def stage_consumer(
 
     The activation codes and their scales are the producer's own output buffers;
     the weight stack and its scale bytes are generated here, in the atom layout
-    the gemm's descriptor declares. The reference contracts the *decoded bytes* in
+    the gemm's descriptor declares. The reference multiplies the *decoded bytes* in
     FP64, so a wrong scale address shows up as a wrong number rather than as a
     different rounding.
     """
@@ -628,7 +628,7 @@ def main():
                 )
         gemm = GemmModule(arguments.gemm)
         # The producer's scale buffer is the consumer's activation scales, and
-        # the codes are the producer's own bytes: the consumer contracts what
+        # the codes are the producer's own bytes: the consumer multiplies what
         # the producer wrote, not a re-packing done here.
         failures += stage_consumer(
             gemm,

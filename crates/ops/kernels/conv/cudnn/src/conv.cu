@@ -10,7 +10,8 @@
 // proposals and fails naming the index when this cuDNN proposes none — design
 // section 5.4's tuning rule: never measure in service.
 //
-// The plan is built once per shape and device and reused, so service calls
+// The executable (the finalized `CUDNN_BACKEND_EXECUTION_PLAN_DESCRIPTOR`) is
+// built once per shape and device and reused, so service calls
 // `cudnnBackendExecute` and nothing else. The workspace comes from the stream's
 // pool, so a captured graph records it like any other work.
 //
@@ -107,7 +108,7 @@ constexpr int32_t kAttrConvolutionSpatialDims = 106;
 constexpr int32_t kAttrEngineHeurMode = 200;
 constexpr int32_t kAttrEngineHeurOperationGraph = 201;
 constexpr int32_t kAttrEngineHeurResults = 202;
-// `CUDNN_ATTR_ENGINEHEUR_SM_COUNT_TARGET` and `..._DEVICEPROP`: the device the plan is for. cuDNN
+// `CUDNN_ATTR_ENGINEHEUR_SM_COUNT_TARGET` and `..._DEVICEPROP`: the device the engine is for. cuDNN
 // treats both as optional, and **an engine that needs a device property the request does not name
 // is not proposed at all** - so a shape can have an engine and still come back with an empty list.
 constexpr int32_t kAttrEngineHeurSmCount = 203;
@@ -131,9 +132,9 @@ constexpr int32_t kAttrOperationBwdDataW = 709;
 constexpr int32_t kAttrOperationBwdDataDx = 710;
 constexpr int32_t kAttrOperationBwdDataDy = 711;
 constexpr int32_t kAttrOperationGraphOps = 801;
-// `CUDNN_ATTR_OPERATIONGRAPH_HANDLE`: the device the graph is planned for. Without one the library
+// `CUDNN_ATTR_OPERATIONGRAPH_HANDLE`: the device the graph is built for. Without one the library
 // reads a blank device, every engine that checks its grid or architecture against it declines, and
-// a graph that a channels-last engine happens not to check is the only kind that finds a plan.
+// a graph that a channels-last engine happens not to check is the only kind that finds an engine.
 constexpr int32_t kAttrOperationGraphHandle = 800;
 constexpr int32_t kAttrTensorDataType = 901;
 constexpr int32_t kAttrTensorDimensions = 902;
@@ -294,19 +295,20 @@ void* handle_of(int32_t device, char* error, int32_t* status) {
   return handle;
 }
 
-/// One shape's execution plan and the workspace it asks for.
-struct Plan {
-  void* plan = nullptr;
+/// One shape's executable: its finalized execution descriptor and the
+/// workspace it asks for.
+struct Executable {
+  void* descriptor = nullptr;
   size_t workspace = 0;
 };
 
-/// The plan of a shape, from the process's cache or from cuDNN's heuristic.
-Plan plan_of(const uniserve_conv_call& call, const std::string& key, void* handle, char* error,
-             int32_t* status) {
+/// The executable of a shape, from the process's cache or from cuDNN's heuristic.
+Executable executable_of(const uniserve_conv_call& call, const std::string& key, void* handle,
+                         char* error, int32_t* status) {
   static std::mutex mutex;
-  static std::map<std::string, Plan> plans;
+  static std::map<std::string, Executable> executables;
   const std::lock_guard<std::mutex> guard(mutex);
-  if (const auto found = plans.find(key); found != plans.end()) {
+  if (const auto found = executables.find(key); found != executables.end()) {
     return found->second;
   }
   const Api& library = api();
@@ -488,7 +490,7 @@ Plan plan_of(const uniserve_conv_call& call, const std::string& key, void* handl
 
   // The heuristic, asked once for this shape: the engine the tuning data names,
   // or the first proposal.
-  void* plan = nullptr;
+  void* executable = nullptr;
   if (built) {
     // **One heuristic descriptor per mode.** An attribute cannot be reset once a descriptor is
     // finalized, so re-asking a finalized heuristic for a wider list answers nothing - and
@@ -777,10 +779,10 @@ Plan plan_of(const uniserve_conv_call& call, const std::string& key, void* handl
       built = false;
     }
     if (built) {
-      built = make(kDescriptorExecutionPlan, &plan) &&
-              set(plan, kAttrExecutionPlanEngineConfig, kTypeBackendDescriptor, 1,
+      built = make(kDescriptorExecutionPlan, &executable) &&
+              set(executable, kAttrExecutionPlanEngineConfig, kTypeBackendDescriptor, 1,
                   &configs[take]) &&
-              finalize(plan, "the plan");
+              finalize(executable, "the executable");
     }
     for (void* config : configs) {
       library.backend_destroy(config);
@@ -800,18 +802,18 @@ Plan plan_of(const uniserve_conv_call& call, const std::string& key, void* handl
   library.backend_destroy(w);
   library.backend_destroy(x);
   if (!built) {
-    return Plan{};
+    return Executable{};
   }
 
-  Plan made;
-  made.plan = plan;
+  Executable made;
+  made.descriptor = executable;
   int64_t workspace = 0;
-  if (library.backend_get(plan, kAttrExecutionPlanWorkspaceSize, kTypeInt64, 1, nullptr,
+  if (library.backend_get(executable, kAttrExecutionPlanWorkspaceSize, kTypeInt64, 1, nullptr,
                           &workspace) == kSuccess &&
       workspace > 0) {
     made.workspace = static_cast<size_t>(workspace);
   }
-  plans.emplace(key, made);
+  executables.emplace(key, made);
   *status = 0;
   return made;
 }
@@ -857,10 +859,10 @@ void add_bias(void* y, const void* bias, int64_t elements, int64_t channels,
   }
 }
 
-/// The key of one shape's plan: the tensors, the geometry, the element types,
-/// the engine and the device, because a plan belongs to a device's cuDNN
-/// context.
-std::string plan_key(const uniserve_conv_call& call, int32_t device) {
+/// The key of one shape's executable: the tensors, the geometry, the element
+/// types, the engine and the device, because an executable belongs to a
+/// device's cuDNN context.
+std::string executable_key(const uniserve_conv_call& call, int32_t device) {
   std::string key;
   auto append = [&key](const char* name, const int64_t* values, int32_t count) {
     key += name;
@@ -891,10 +893,11 @@ std::string plan_key(const uniserve_conv_call& call, int32_t device) {
   key += std::to_string(UNISERVE_CONV_OUTPUT_DTYPE);
   key += '_';
   key += std::to_string(UNISERVE_CONV_ENGINE);
-  // The engine the plan holds depends on the call's TF32 permission...
+  // The engine the executable holds depends on the call's TF32 permission...
   key += call.tf32 != 0 ? "_tf32" : "_exact";
-  // ...and on the iteration order, because the two orders' tensor descriptors are different
-  // plans over one engine: a plan cached for one would give the other the wrong strides.
+  // ...and on the iteration order, because the two orders' tensor descriptors make different
+  // executables over one engine: one cached for one order would give the other the wrong
+  // strides.
   key += call.channels_last != 0 ? "_ndhwc" : "_ncdhw";
   key += "_device_";
   key += std::to_string(device);
@@ -976,13 +979,15 @@ extern "C" int32_t UNISERVE_CONV_ENTRY(const uniserve_conv_call* call, void* str
     return refuse(error, "cudnnSetStream failed");
   }
 
-  const Plan plan = plan_of(*call, plan_key(*call, device), handle, error, &status);
-  if (plan.plan == nullptr) {
-    return status != 0 ? status : refuse(error, "the convolution's plan could not be built");
+  const Executable executable =
+      executable_of(*call, executable_key(*call, device), handle, error, &status);
+  if (executable.descriptor == nullptr) {
+    return status != 0 ? status
+                       : refuse(error, "the convolution's executable could not be built");
   }
   void* workspace = nullptr;
-  if (plan.workspace > 0 &&
-      cudaMallocAsync(&workspace, plan.workspace, reinterpret_cast<cudaStream_t>(stream)) !=
+  if (executable.workspace > 0 &&
+      cudaMallocAsync(&workspace, executable.workspace, reinterpret_cast<cudaStream_t>(stream)) !=
           cudaSuccess) {
     return refuse(error, "a convolution's workspace could not be allocated");
   }
@@ -1012,7 +1017,7 @@ extern "C" int32_t UNISERVE_CONV_ENTRY(const uniserve_conv_call* call, void* str
     }
     return refuse(error, "a convolution's variant pack could not be built");
   }
-  const Status executed = library.backend_execute(handle, plan.plan, variant);
+  const Status executed = library.backend_execute(handle, executable.descriptor, variant);
   library.backend_destroy(variant);
   if (executed != kSuccess) {
     if (workspace != nullptr) {

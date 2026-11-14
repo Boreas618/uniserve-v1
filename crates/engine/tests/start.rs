@@ -431,7 +431,7 @@ fn two_host_launch(directory: &Path, build_server: &Path, host: &str, world: Wor
         "cuda",
         2,
         2,
-        WorkerGroupConfig::single_component(proto::config::DEFAULT_BLOCK, 2),
+        WorkerGroupConfig::single_block(proto::config::DEFAULT_BLOCK, 2),
     );
     let parallel = &mut launch.engine_config.parallel;
     parallel.tensor_parallel_size = std::num::NonZeroUsize::new(2).unwrap();

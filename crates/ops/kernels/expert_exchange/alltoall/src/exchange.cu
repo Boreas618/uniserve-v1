@@ -10,7 +10,7 @@
 // `source rank * step capacity + slot`. A combine reads each token's partial sum
 // back from those ranks and adds them in FP32, rounding once. This is the data
 // flow of FlashInfer's `MoeAlltoAll`, with one change: the step's capacity is a
-// device word the executor writes before a replay, so one captured graph serves
+// device word the worker writes before a replay, so one captured graph serves
 // every capacity the ranks agree on, and the agreement rounds nothing up.
 //
 // The ranks of a group run the same sequence of launches, so a phase number they
@@ -44,7 +44,7 @@ constexpr int kThreads = 256;
 /// so a block that waits for a flag never keeps out the block that sets it.
 constexpr int kMaxBlocks = 256;
 /// How long a block waits for a peer before it stops the device, in nanoseconds.
-/// A rank can lag by a module load or a first-use plan during warmup, so the bound
+/// A rank can lag by a module load or a first call's setup during warmup, so the bound
 /// is minutes; an unbounded wait would turn a lost peer into a silent hang.
 constexpr unsigned long long kPeerTimeoutNs = 600ull * 1000 * 1000 * 1000;
 
@@ -329,7 +329,7 @@ __device__ __forceinline__ uint32_t load_acquire(const uint32_t* flag) {
 }
 
 /// Waits until every rank's flag in `flags` reached `phase`, or stops the device
-/// when a peer never does: a trap is a failure the executor sees, a hang is not.
+/// when a peer never does: a trap is a failure the worker sees, a hang is not.
 __device__ void wait_for_peers(const uint32_t* flags, int ranks, uint32_t phase) {
   const unsigned long long start = [] {
     unsigned long long now;

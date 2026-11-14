@@ -1,6 +1,6 @@
 //! Dense matrix products.
 //!
-//! `gemm` is one operator with one shape contract and as many descriptors as there are dtype,
+//! `gemm` is one operator with one shape rule and as many descriptors as there are dtype,
 //! weight-layout and epilogue combinations:
 //!
 //! ```text
@@ -290,7 +290,7 @@ impl Op for Gemm {
             return Err(Error::argument(
                 Self::NAME,
                 format!(
-                    "the module contracts over {}, the input's last axis is {k}",
+                    "the module reduces over {}, the input's last axis is {k}",
                     descriptor.k
                 ),
             ));

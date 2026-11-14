@@ -38,7 +38,7 @@ const ROLLOFF: f64 = 0.99;
 ///
 /// # Errors
 ///
-/// Returns [`Error::Plan`] when a rate is zero, a channel count is zero, or
+/// Returns [`Error::Invalid`] when a rate is zero, a channel count is zero, or
 /// the input is not `channels * length` samples.
 pub(super) fn sinc_resample(
     input: &[f32],
@@ -48,17 +48,17 @@ pub(super) fn sinc_resample(
     new_freq: u32,
 ) -> Result<Vec<f32>> {
     if channels == 0 {
-        return Err(Error::Plan(
+        return Err(Error::Invalid(
             "a resampled waveform needs at least one channel".to_owned(),
         ));
     }
     if orig_freq == 0 || new_freq == 0 {
-        return Err(Error::Plan(
+        return Err(Error::Invalid(
             "audio resampling rates must be positive".to_owned(),
         ));
     }
     if input.len() != channels * length {
-        return Err(Error::Plan(format!(
+        return Err(Error::Invalid(format!(
             "a {channels}-channel waveform of {length} samples needs {}, {} were given",
             channels * length,
             input.len()
@@ -81,13 +81,13 @@ pub(super) fn sinc_resample(
     // space, which must fail the request rather than wrap.
     let target =
         usize::try_from((new as u128 * length as u128).div_ceil(orig as u128)).map_err(|_| {
-            Error::Plan(format!(
+            Error::Invalid(format!(
                 "a resampled waveform of {length} samples at {new_freq} Hz from {orig_freq} Hz \
                  exceeds the host's address space"
             ))
         })?;
     let samples = channels.checked_mul(target).ok_or_else(|| {
-        Error::Plan(format!(
+        Error::Invalid(format!(
             "a resampled waveform of {channels} channels and {target} samples \
              exceeds the host's address space"
         ))

@@ -16,12 +16,12 @@ use serde::{Deserialize, Serialize};
 pub enum Collector {
     /// CUPTI's activity records and runtime and driver API calls.
     Timeline,
-    /// Every fence probe record of the selected components.
+    /// Every fence probe record of the selected module classes.
     FenceTimeline,
     /// CUPTI's PM sampling: hardware counters at a fixed interval.
     PmSampling,
     /// CUPTI's range profiler: one-pass hardware counters per kernel or per
-    /// component range.
+    /// probed module range.
     RangeMetrics,
     /// CUPTI's continuous PC sampling: program counters and stall reasons.
     PcSampling,
@@ -113,8 +113,9 @@ pub enum MetricRanges {
     /// A range per kernel launch, a CUDA graph's launch being one.
     #[default]
     Kernel,
-    /// A range per probed component instance's call, around its entry and
-    /// exit, for calls that do not replay a CUDA graph.
+    /// A range per probed module instance's call, around its entry and
+    /// exit, for calls that do not replay a CUDA graph. Its wire name,
+    /// `component`, is the profile request's.
     Component,
 }
 
@@ -221,9 +222,10 @@ pub struct SessionRequest {
     pub stages: Vec<String>,
     /// The workers recorded, by rank; every worker when empty.
     pub workers: Vec<u32>,
-    /// The components whose fence records and component ranges are kept,
+    /// The module classes whose fence records and module ranges are kept,
     /// as patterns of their names (`*` matches any run); every probed
-    /// component when empty.
+    /// class when empty. The request's field, `components`, keeps its
+    /// wire name.
     pub components: Vec<String>,
     /// Where each worker writes its file; the directory is created.
     pub output_dir: PathBuf,

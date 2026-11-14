@@ -10,7 +10,7 @@
 #include <cstdint>
 
 // One combine launch. The call struct is the operator's, byte for byte; `stream`
-// is the CUstream of the device the executor drives.
+// is the CUstream of the device the worker drives.
 //
 // `routes` is [routes_rows, hidden] in the row convention `layout` names - permuted (found through
 // `expanded_to_permuted`, [tokens, top] i32, -1 skipping a route) or expanded (`token * top + route`)
@@ -61,7 +61,7 @@ static_assert(offsetof(uniserve_unpermute_call, error) == 96,
 static_assert(sizeof(uniserve_unpermute_call) == 608,
               "the call must be the size of the operator's layout");
 
-// The operator crate's `DType::as_i64()` numbering.
+// The operator crate's package ABI numbering (`ops::abi::code`).
 enum uniserve_dtype : int64_t {
   UNISERVE_DTYPE_U8 = 0,
   UNISERVE_DTYPE_I32 = 1,

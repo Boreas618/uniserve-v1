@@ -12,7 +12,7 @@
 
 // One paged attention launch: prefill or decode over the pages of the cache.
 // The call struct is the operator's, byte for byte; `stream` is the CUstream of
-// the device the executor drives.
+// the device the worker drives.
 //
 // `query` and `out` are [tokens, q_heads, head_dim]; `key` and `value`
 // [pages, page_size, kv_heads, head_dim] in the layout `kv_write` wrote;
@@ -58,7 +58,7 @@ struct uniserve_paged_attention_call {
   char error[512];
 };
 
-// The operator crate's `DType::as_i64()` numbering.
+// The operator crate's package ABI numbering (`ops::abi::code`).
 enum uniserve_dtype : int64_t {
   UNISERVE_DTYPE_U8 = 0,
   UNISERVE_DTYPE_I32 = 1,

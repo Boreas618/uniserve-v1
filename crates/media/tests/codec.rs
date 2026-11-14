@@ -4,10 +4,10 @@
 //! These tests drive the crate's public boundary only: media units are
 //! encoded on their own, several units are assembled with a soundtrack into a
 //! request's MP4, and the result is probed and decoded by the external
-//! `ffprobe`/`ffmpeg` binaries. They assert the media output contract:
-//! codec, canvas, frame count, frame
-//! rate, per-unit content, a stereo AAC track covering the video's duration,
-//! and the refusals of malformed assemblies.
+//! `ffprobe`/`ffmpeg` binaries. They assert what the media output must be:
+//! codec, canvas, frame count, frame rate, per-unit content, a stereo AAC
+//! track covering the video's duration, and the refusals of malformed
+//! assemblies.
 //!
 //! The tools are those of the installation the crate is built against (its
 //! build requires `UNISERVE_FFMPEG_DIR`, and the provisioned runtime ships
@@ -343,12 +343,12 @@ fn units_play_back_in_order_on_one_timeline() {
     let decoded = decoded_samples(file.path());
     assert!(
         (samples..samples + 2 * media::AUDIO_FRAME_SAMPLES).contains(&decoded),
-        "the soundtrack decoded to {decoded} samples, {samples} were planned"
+        "the soundtrack decoded to {decoded} samples, {samples} were encoded"
     );
 }
 
 #[test]
-fn the_soundtrack_is_aac_stereo_at_the_model_rate_and_planned_duration() {
+fn the_soundtrack_is_aac_stereo_at_the_model_rate_and_lasts_its_samples() {
     let samples = 52_000;
     let track =
         encode_audio_track(&noise(samples), samples, AUDIO_RATE).expect("a soundtrack encodes");
@@ -379,11 +379,11 @@ fn the_soundtrack_is_aac_stereo_at_the_model_rate_and_planned_duration() {
         .expect("ffprobe reports a duration")
         .parse()
         .expect("a numeric duration");
-    let planned = samples as f64 / f64::from(AUDIO_RATE);
+    let expected = samples as f64 / f64::from(AUDIO_RATE);
     assert!(
-        (duration - planned).abs()
+        (duration - expected).abs()
             <= 2.0 * media::AUDIO_FRAME_SAMPLES as f64 / f64::from(AUDIO_RATE),
-        "the soundtrack lasts {duration} s, {planned} s were planned"
+        "the soundtrack lasts {duration} s, its samples last {expected} s"
     );
     let decoded = decoded_samples(file.path());
     assert!((samples..samples + 2 * media::AUDIO_FRAME_SAMPLES).contains(&decoded));
@@ -425,7 +425,7 @@ fn a_session_assembles_a_complete_request_and_refuses_the_rest() {
     );
 
     // Finalization needs every unit and the audio.
-    assert!(matches!(session.finish(), Err(Error::Plan(_))));
+    assert!(matches!(session.finish(), Err(Error::Invalid(_))));
     session
         .append(std::slice::from_ref(&encoded))
         .expect("the first unit");
@@ -433,7 +433,7 @@ fn a_session_assembles_a_complete_request_and_refuses_the_rest() {
     // An audio-only file is not a video unit.
     assert!(matches!(
         session.append(std::slice::from_ref(&track)),
-        Err(Error::Plan(_))
+        Err(Error::Invalid(_))
     ));
 
     // A unit of another canvas is not this request's.
@@ -444,7 +444,7 @@ fn a_session_assembles_a_complete_request_and_refuses_the_rest() {
         .expect("the first unit");
     assert!(matches!(
         wrong_canvas.append(&[encode(96, 64, frames as usize, 90)]),
-        Err(Error::Plan(_))
+        Err(Error::Invalid(_))
     ));
 
     // More units than the request has are refused before any packet.
@@ -452,18 +452,18 @@ fn a_session_assembles_a_complete_request_and_refuses_the_rest() {
         MuxSession::open(64, 48, FRAME_RATE, AUDIO_RATE, &[frames]).expect("a valid session");
     assert!(matches!(
         excess.append(&[encoded.clone(), encoded.clone()]),
-        Err(Error::Plan(_))
+        Err(Error::Invalid(_))
     ));
 
     session
         .append(std::slice::from_ref(&encoded))
         .expect("the second unit");
     // The audio track arrives once, before finalization.
-    assert!(matches!(session.finish(), Err(Error::Plan(_))));
+    assert!(matches!(session.finish(), Err(Error::Invalid(_))));
     session.set_audio(track.clone()).expect("the soundtrack");
     assert!(matches!(
         session.set_audio(track.clone()),
-        Err(Error::Plan(_))
+        Err(Error::Invalid(_))
     ));
     let payload = session.finish().expect("the complete assembly");
     let file = Scratch::new("session", &payload);
@@ -476,32 +476,35 @@ fn a_session_assembles_a_complete_request_and_refuses_the_rest() {
     assert_eq!(audio.get("channels").map(String::as_str), Some("2"));
 
     // No call follows finalization.
-    assert!(matches!(session.append(&[]), Err(Error::Plan(_))));
+    assert!(matches!(session.append(&[]), Err(Error::Invalid(_))));
     assert!(matches!(
         session.set_audio(track.clone()),
-        Err(Error::Plan(_))
+        Err(Error::Invalid(_))
     ));
-    assert!(matches!(session.finish(), Err(Error::Plan(_))));
+    assert!(matches!(session.finish(), Err(Error::Invalid(_))));
 
     // A container is templated from a unit with a video stream.
     assert!(matches!(
         Container::open(&track, FRAME_RATE, AUDIO_RATE),
-        Err(Error::Plan(_))
+        Err(Error::Invalid(_))
     ));
 }
 
 #[test]
 fn a_runner_holds_the_assembly_of_a_named_request_only() {
     let runner = MediaRunner::new(MediaConfig::default());
-    assert!(matches!(runner.append_units(7, &[]), Err(Error::Plan(_))));
-    assert!(matches!(runner.finish_mux(7), Err(Error::Plan(_))));
+    assert!(matches!(
+        runner.append_units(7, &[]),
+        Err(Error::Invalid(_))
+    ));
+    assert!(matches!(runner.finish_mux(7), Err(Error::Invalid(_))));
     let frames = 3u32;
     runner
         .open_mux(7, 64, 48, FRAME_RATE, AUDIO_RATE, &[frames])
         .expect("a valid assembly");
     assert!(matches!(
         runner.open_mux(7, 64, 48, FRAME_RATE, AUDIO_RATE, &[frames]),
-        Err(Error::Plan(_))
+        Err(Error::Invalid(_))
     ));
     let encoded = encode(64, 48, frames as usize, 70);
     runner.append_units(7, &[encoded]).expect("the unit");
@@ -512,7 +515,7 @@ fn a_runner_holds_the_assembly_of_a_named_request_only() {
     let payload = runner.finish_mux(7).expect("the complete assembly");
     assert!(!payload.is_empty());
     // The assembly is gone after finalization.
-    assert!(matches!(runner.finish_mux(7), Err(Error::Plan(_))));
+    assert!(matches!(runner.finish_mux(7), Err(Error::Invalid(_))));
 }
 
 #[test]

@@ -181,11 +181,11 @@ output_throughput = "higher"
         text=True,
         stdout=subprocess.PIPE,
     )
-    plan = json.loads(result.stdout)[0]
+    resolved = json.loads(result.stdout)[0]
 
-    (command,) = plan["server_commands"]
+    (command,) = resolved["server_commands"]
     assert command[0] == str(tree / "target/release/uniserve")
-    assert plan["server_working_directory"] == str(tree)
+    assert resolved["server_working_directory"] == str(tree)
 
 
 def _text_profile(tmp_path: Path, sampling: str) -> Path:

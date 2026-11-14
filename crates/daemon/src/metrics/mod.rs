@@ -1,8 +1,7 @@
 //! Process-wide Prometheus registry and UniServe metric families.
 //!
 //! [`METRICS`] is the one registry the server exports. Each submodule defines
-//! one group of families, listed here with the server component that updates
-//! it:
+//! one group of families, listed here with the code that updates it:
 //!
 //! - `api_server`: the HTTP metrics middleware (`track_http_metrics`), when
 //!   each response body finishes or is dropped.

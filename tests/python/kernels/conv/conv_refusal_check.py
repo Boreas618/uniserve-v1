@@ -20,7 +20,7 @@ import ctypes
 import pathlib
 import sys
 
-#: The operator crate's `DType::as_i64()` numbering, by element type name.
+#: The operator crate's package ABI numbering (`ops::abi::code`), by element type name.
 DTYPES = {"f16": 3, "bf16": 4, "f32": 5}
 
 

@@ -343,9 +343,9 @@ impl TransportShape {
     /// but the process learns which backend it runs only when the epoch's programs arrive.
     const FIXED_BYTES: u64 = 2 << 30;
 
-    /// The device bytes a rank's transport holds at most, for the capacity plan.
+    /// The device bytes a rank's transport holds at most, for the capacity sizing.
     ///
-    /// The plan fits the cache before the process holds a program, so this cannot ask a package:
+    /// The sizing fits the cache before the process holds a program, so this cannot ask a package:
     /// it is a bound the worker compares with what the transport took when it is created. A
     /// backend whose experts run in the exchange (`fused`) holds its staged rows; any other holds
     /// the rows received and computed beside a window of the rows in flight.

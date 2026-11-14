@@ -17,7 +17,7 @@ the comparison is a range rather than a number.
 
     python3 tools/audit_parameters.py --fixture <key file>
 
-Rows whose package cannot be imported here (cutlass, cute and native packages, whose contract is a
+Rows whose package cannot be imported here (cutlass, cute and native packages, whose interface is a
 `#[repr(C)]` call structure) are reported as unchecked rather than as passing.
 """
 

@@ -41,7 +41,7 @@ TORCH_TYPES = {
     "f32": torch.float32,
 }
 
-#: `DType::unit_roundoff` for each element type, as `ops` states it.
+#: `ops::tolerance::unit_roundoff` for each element type, as `ops` states it.
 UNIT_ROUNDOFF = {
     "f16": 4.8828125e-04,
     "bf16": 3.90625e-03,

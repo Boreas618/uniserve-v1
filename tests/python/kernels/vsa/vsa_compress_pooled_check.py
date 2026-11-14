@@ -131,7 +131,7 @@ def gamma(reduction, unit=UNIT_ROUNDOFF):
 
 
 def declared_bound(reduction, output_roundoff):
-    """``Tolerance::dot(reduction, f32, output)``'s ``rtol``, as ``segments.rs`` declares it."""
+    """``VsaCompressPooled::tolerance``: ``Tolerance::dot(reduction, f32, output)``'s ``rtol``."""
     return 2.0 * gamma(reduction) * reduction**0.5 + output_roundoff
 
 

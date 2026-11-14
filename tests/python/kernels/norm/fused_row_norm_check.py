@@ -10,8 +10,8 @@ channel-scaled, optionally biased update into the residual, then normalize — t
 the row's root mean square and the layer form by its mean and variance, adding the learned
 bias afterwards. The RMS form also writes the updated residual back into `hidden`; the layer
 form leaves the residual unchanged, which its arguments say in as many words ("unchanged by
-the launch"). The same file is kept in both packages, byte for byte, and a test in
-`crates/build-server/tests/it/packages.rs` holds the copies together.
+the launch"). The script is kept once, here under `tests/python/kernels`, for both
+operators.
 
 Cases: the deployed geometry, the `update_bias` and `absmax` flags on, a residual that
 cancels the update exactly (the RMS of zero, and a layer output that is nothing but the bias —
@@ -68,7 +68,7 @@ for _sibling in SIBLINGS:
     if _source.is_dir() and str(_source) not in sys.path:
         sys.path.insert(0, str(_source))
 
-#: The output types' unit roundoff, as `DType::unit_roundoff` gives it.
+#: The output types' unit roundoff, as `ops::tolerance::unit_roundoff` gives it.
 UNIT_ROUNDOFF = {"f16": 2.0**-11, "bf16": 2.0**-8, "f32": 2.0**-24}
 
 TORCH_TYPES = {

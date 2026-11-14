@@ -145,16 +145,16 @@ fn last_error() -> String {
 /// Turns a shim return code into a result, reading the message it left.
 ///
 /// The shim reports a failure of the media itself (a unit without a video
-/// stream, a track without audio) with its own code, which is a plan
-/// violation here, as those failures were `ValueError` at the Python
-/// boundary this crate replaces.
+/// stream, a track without audio) with its own code, which is an invalid
+/// input here, as those failures were `ValueError` at the Python boundary
+/// this crate replaces.
 fn check(code: c_int) -> Result<()> {
-    const PLAN: c_int = -2;
+    const INVALID: c_int = -2;
     const MISSING_CODEC: c_int = -3;
     if code == 0 {
         Ok(())
-    } else if code == PLAN {
-        Err(Error::Plan(last_error()))
+    } else if code == INVALID {
+        Err(Error::Invalid(last_error()))
     } else if code == MISSING_CODEC {
         Err(Error::MissingCodec(last_error()))
     } else {

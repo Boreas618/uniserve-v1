@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Run the Triton paged attention's prefill kernel and compare what it wrote with the reference.
 
-The operator's contract is `ops::attention::PagedAttention`'s; the prefill program differs from
+The operator's interface is `ops::attention::PagedAttention`'s; the prefill program differs from
 the decode one in exactly two ways, and each is a case here:
 
 * **the causal mask** — a batch row's queries are the last of its keys, so its query `p` of `n`
@@ -14,7 +14,7 @@ the decode one in exactly two ways, and each is a case here:
   rows are the packed token count, so a shorter row's tiles past its length must leave the next
   row's tokens alone, and the tokens of a padded bucket that no row owns must read zero.
 
-The reference is the composition the contract states, written in torch:
+The reference is the composition the operator states, written in torch:
 
 ```text
 page_k = f32(byte) · key_scale[page]        once, in f32, before any product (a dense page: f32)
@@ -176,7 +176,7 @@ def operands(
 
 
 def reference(operands_of, dtype=torch.float32):
-    """The contract's composition, in torch, causally masked per row."""
+    """The operator's composition, in torch, causally masked per row."""
     query = operands_of["query"].to(dtype)
     key = operands_of["key"].to(dtype)
     value = operands_of["value"].to(dtype)

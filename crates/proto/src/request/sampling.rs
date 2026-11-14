@@ -152,7 +152,7 @@ impl SamplingParams {
         }
 
         // Bias values participate directly in logit arithmetic and follow the
-        // same finite-value contract as scalar processors.
+        // same finite-value rule as scalar processors.
         for &(_, bias) in &self.logit_bias {
             if !bias.is_finite() {
                 return Err(SamplingParamsError::NonFinite {

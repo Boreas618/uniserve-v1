@@ -47,10 +47,10 @@ import sys
 
 import torch
 
-#: The operator crate's `DType::as_i64()` numbering, by element type name.
+#: The operator crate's package ABI numbering (`ops::abi::code`), by element type name.
 DTYPES = {"f16": 3, "bf16": 4, "f32": 5}
 
-#: The unit round-off of each element type, as `DType::unit_roundoff` reports it.
+#: The unit round-off of each element type, as `ops::tolerance::unit_roundoff` reports it.
 UNIT_ROUNDOFF = {
     "f16": 4.8828125e-04,
     "bf16": 3.90625e-03,

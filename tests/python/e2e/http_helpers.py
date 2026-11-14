@@ -892,7 +892,7 @@ def written_deployment(directory: Path, groups: list[dict[str, Any]]) -> Path:
     """Write the deployment file a serve invocation is given.
 
     `--worker-groups` names a TOML file because a deployment states every
-    worker group's ranks and the components placed on them; a test states
+    worker group's ranks and the blocks placed on them; a test states
     one the same way a deployment does. Each entry of `groups` is one
     `[[worker_groups]]` table, such as `{"id": "model", "ranks":
     ["cuda:0-1"], "queue_depth": 2, "blocks": {"model":

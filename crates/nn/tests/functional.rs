@@ -418,7 +418,7 @@ fn project(x: &[f32], weight: &[f32], bias: Option<&[f32]>, k: usize) -> Vec<f32
 }
 
 #[test]
-fn linear_contracts_the_rows_with_the_weight_in_either_order() {
+fn linear_multiplies_the_rows_by_the_weight_in_either_order() {
     let (x, weight, bias) = (sequence(3 * 4, 22), sequence(5 * 4, 23), sequence(5, 24));
     let input = tensor(&x, (3, 4), DType::F32);
 

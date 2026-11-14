@@ -711,7 +711,7 @@ mod tests {
         assert_eq!(config.model(), "/models/file");
     }
 
-    /// Without a deployment file each scheduler's group runs one component
+    /// Without a deployment file each scheduler's group runs one block
     /// tensor-parallel over its workers; the rank layout shorthand is refused
     /// beside a file.
     #[test]

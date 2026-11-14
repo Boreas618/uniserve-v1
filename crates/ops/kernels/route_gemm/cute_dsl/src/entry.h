@@ -10,7 +10,7 @@
 #include <cstdint>
 
 // One FC2 launch. The call struct is the operator's, byte for byte; `stream` is
-// the CUstream of the device the executor drives.
+// the CUstream of the device the worker drives.
 //
 // `rows` is [permuted_rows, intermediate], `weights` [experts, hidden,
 // intermediate] and `out` [permuted_rows, hidden]: the product's row `p` is the
@@ -35,7 +35,7 @@ struct uniserve_route_call {
   char error[512];
 };
 
-// The operator crate's `DType::as_i64()` numbering.
+// The operator crate's package ABI numbering (`ops::abi::code`).
 enum uniserve_dtype : int64_t {
   UNISERVE_DTYPE_U8 = 0,
   UNISERVE_DTYPE_I32 = 1,

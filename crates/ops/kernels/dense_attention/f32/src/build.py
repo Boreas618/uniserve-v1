@@ -37,7 +37,7 @@ import tomllib
 #: The translation unit of the module.
 SOURCES = ["src/dense.cu"]
 
-#: The operator crate's `DType::as_i64()` numbering.
+#: The operator crate's package ABI numbering (`ops::abi::code`).
 ELEMENT_TYPES = {
     "u8": 0,
     "i32": 1,

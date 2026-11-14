@@ -715,8 +715,8 @@ pub struct GatherGemmNvfp4Args {
     /// `[routes, intermediate]` the gated product.
     pub out: Operand,
     /// `[bytes]` U8: scratch the program needs for its own bookkeeping. The size its tactic needs is
-    /// the artifact's plan, not something `ops` can restate; a view shorter than the plan is refused
-    /// by name at the point of use, never grown — a step that allocates is a host allocation inside a
+    /// the artifact's own requirement, not something `ops` can restate; a view shorter than that is
+    /// refused by name at the point of use, never grown — a step that allocates is a host allocation inside a
     /// captured graph, and the address the pool baked is the wrong one the moment the step grows.
     pub workspace: Operand,
 }
@@ -724,8 +724,9 @@ pub struct GatherGemmNvfp4Args {
 /// Check the scratch view both encoded products carry.
 ///
 /// A workspace is bytes the program uses for its own bookkeeping, and the size the tactic needs is the
-/// artifact's plan rather than anything `ops` can restate — so this checks only what is a property of
-/// the operand itself: plain bytes, and at least one of them. The floor is the *plan's*, checked at
+/// artifact's own requirement rather than anything `ops` can restate — so this checks only what is a
+/// property of the operand itself: plain bytes, and at least one of them. The floor is the
+/// *artifact's*, checked at
 /// the point of use by the entry, where a short buffer is a named refusal; it is never grown, because
 /// the step runs inside a captured graph and an allocation there lands at an address the pool did not
 /// bake into the capture.
@@ -743,7 +744,7 @@ fn check_workspace(operator: &'static str, workspace: &Operand) -> Result<()> {
     if workspace.numel() == 0 {
         return Err(Error::argument(
             operator,
-            "a workspace of no bytes: the plan's size is a caller's to provide",
+            "a workspace of no bytes: the size the tactic needs is the caller's to provide",
         ));
     }
     Ok(())
@@ -871,7 +872,7 @@ pub struct RouteNvfp4Call {
     pub num_non_exiting_tiles: *const i32,
     /// `[routes, hidden]`: the contracted rows.
     pub out: *mut c_void,
-    /// The scratch the program needs, sized by the plan; the entry refuses a short one and never
+    /// The scratch the program needs, sized by the caller; the entry refuses a short one and never
     /// grows it.
     pub workspace: *mut c_void,
     /// Bytes of `workspace`.
@@ -1172,7 +1173,7 @@ impl Op for GatherGemmNvfp4 {
     ///
     /// The packed operand is E2M1 codes plus one E4M3 scale per sixteen elements *along the
     /// contraction*; the program decodes a code (exact: E2M1 is a subset of FP32) and multiplies it
-    /// by its block's scale (exact: E4M3 into FP32), then contracts in FP32 — each product is the
+    /// by its block's scale (exact: E4M3 into FP32), then sums the products in FP32 — each product is the
     /// reference's own `w · s` product, so the sum has the same reduction length (`hidden`), the same
     /// accumulation dtype, and the same bound. The one per-expert tensor scale is a *factor*, applied
     /// once, and contributes one rounding that `rtol`'s `u` already covers.
@@ -1269,7 +1270,7 @@ mod nvfp4_tests {
 
     #[test]
     fn fc2_mirrors_fc1_without_an_activation() {
-        // FC1 applies the gated product inside its launch; FC2 only contracts, so the activation is
+        // FC1 applies the gated product inside its launch; FC2 only multiplies, so the activation is
         // not in its descriptor and the key says so by not naming one.
         let key = route_descriptor().to_string();
         assert!(key.starts_with("hidden_2048_intermediate_768_experts_128_top_8_dtype_bf16"));
@@ -1310,7 +1311,7 @@ mod nvfp4_tests {
 /// One compilation of `route_gemm_nvfp4`.
 ///
 /// FC2 of an encoded expert block: the same descriptor as `gather_gemm_nvfp4` less the activation,
-/// because FC1 applies the gated product and FC2 only contracts it. Its contraction is the expert
+/// because FC1 applies the gated product and FC2 only multiplies it. Its contraction is the expert
 /// width, so the packed weights are `[experts, hidden, intermediate/2]`.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub struct RouteGemmNvfp4Descriptor {
@@ -1386,8 +1387,8 @@ pub struct RouteGemmNvfp4Args {
     /// `[routes, hidden]` the contracted rows, one per route: the `top` repeats are combined by
     /// `moe_unpermute`, not here.
     pub out: Operand,
-    /// `[bytes]` U8: scratch for the program's own bookkeeping, as FC1's is: the plan's size or more,
-    /// refused at the point of use when it is short.
+    /// `[bytes]` U8: scratch for the program's own bookkeeping, as FC1's is: the artifact's size or
+    /// more, refused at the point of use when it is short.
     pub workspace: Operand,
 }
 
@@ -1585,7 +1586,7 @@ impl Op for RouteGemmNvfp4 {
         }
     }
 
-    /// `route_gemm`'s bound, and for the same reason as FC1's pair: decode, scale per block, contract
+    /// `route_gemm`'s bound, and for the same reason as FC1's pair: decode, scale per block, reduce
     /// in FP32 — never scale the accumulated row, which would add a rounding the dense bound does not
     /// allow. The contraction is `intermediate`, the accumulation FP32, and the `atol` is the gated
     /// activation's envelope, since this operator's input is one.

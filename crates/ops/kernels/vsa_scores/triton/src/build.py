@@ -44,7 +44,7 @@ def spec(fields, parameters, target):
             "PDL": "constexpr",
         },
         # `QUERIES` is the launch's grid divisor as well: `POOLED_QUERIES` in
-        # `crates/ops/src/segments.rs`.
+        # `crates/ops/src/vsa.rs`.
         "constexprs": {
             "WIDTH": int(fields["width"]),
             "BLOCK": block,

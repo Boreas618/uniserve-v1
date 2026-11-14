@@ -613,7 +613,7 @@ impl Capture {
         let driver = driver::driver()?;
         driver.check(
             // SAFETY: the stream is live and not capturing, by this type's
-            // contract.
+            // invariant.
             unsafe { (driver.stream_begin_capture)(stream.handle(), mode.raw()) },
             "cuStreamBeginCapture",
         )?;

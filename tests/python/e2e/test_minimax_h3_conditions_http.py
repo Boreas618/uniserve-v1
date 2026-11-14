@@ -308,7 +308,7 @@ OMNIREF_OPTIONS = [
 def _omniref() -> str:
     """The OmniRef export the environment names.
 
-    The export reads the components it omits from the Hugging Face cache at
+    The export reads the parts it omits from the Hugging Face cache at
     the base revision it pins.
     """
     return str(

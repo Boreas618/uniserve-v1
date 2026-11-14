@@ -7,9 +7,10 @@
 #
 # The algorithm choice and its workspace are the package's tuning data (design
 # 5.4): each shape asks cuBLASLt's heuristic once when it is first used, and the
-# plan is then reused for every call of that shape. Serving never times
-# anything. An offline tuner records its choices by publishing a new revision of
-# this package, which is why no plan is written outside the package.
+# matmul it builds is then reused for every call of that shape. Serving never
+# times anything. An offline tuner records its choices by publishing a new
+# revision of this package, which is why no algorithm choice is written outside
+# the package.
 
 op = "gemm"
 backend = "cublas_lt"

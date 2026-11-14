@@ -27,10 +27,10 @@ import sys
 
 import torch
 
-#: The operator crate's `DType::as_i64()` numbering, by element type name.
+#: The operator crate's package ABI numbering (`ops::abi::code`), by element type name.
 DTYPES = {"f16": 3, "bf16": 4, "f32": 5}
 
-#: `DType::unit_roundoff`, per element type.
+#: `ops::tolerance::unit_roundoff`, per element type.
 UNIT_ROUNDOFF = {
     "f16": 4.8828125e-04,
     "bf16": 3.90625e-03,
@@ -150,7 +150,7 @@ def main() -> int:
     )
 
     with torch.no_grad():
-        # `kxn` stores the weight `[k, n]` and contracts its rows; `nxk` stores it
+        # `kxn` stores the weight `[k, n]` and reduces over its rows; `nxk` stores it
         # `[n, k]`, so the reference takes the transposed product.
         stored = (
             weight.double() if arguments.order == "kxn" else weight.double().T

@@ -1465,7 +1465,7 @@ fn replicas_in_engines_of_their_own_name_regions_of_their_own() {
         2,
         1,
         2,
-        WorkerGroupConfig::single_component(proto::config::DEFAULT_BLOCK, 1),
+        WorkerGroupConfig::single_block(proto::config::DEFAULT_BLOCK, 1),
     );
     let replica = |index: usize| {
         let mut launch = launch();
@@ -1584,7 +1584,7 @@ fn a_dedicated_expert_rank_maps_no_kv_region() {
         role: Default::default(),
         replicas: 1,
         ranks: vec![rank("cuda:0")],
-        blocks: WorkerGroupConfig::single_component(proto::config::DEFAULT_BLOCK, 1),
+        blocks: WorkerGroupConfig::single_block(proto::config::DEFAULT_BLOCK, 1),
         queue_depth: 2,
         mem_fraction_static: None,
     };
@@ -1657,7 +1657,7 @@ fn a_host_numbers_its_text_ranks_by_their_places_in_the_deployment() {
         id: WorkerGroupId(id.to_owned()),
         role: Default::default(),
         replicas: 1,
-        blocks: WorkerGroupConfig::single_component(proto::config::DEFAULT_BLOCK, ranks.len()),
+        blocks: WorkerGroupConfig::single_block(proto::config::DEFAULT_BLOCK, ranks.len()),
         ranks,
         queue_depth: 2,
         mem_fraction_static: None,

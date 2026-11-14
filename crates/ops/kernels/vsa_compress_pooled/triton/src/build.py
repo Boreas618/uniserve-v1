@@ -23,7 +23,7 @@ DTYPES = {"bf16": "*bf16", "f16": "*fp16", "f32": "*fp32"}
 
 
 #: The query tiles a program holds and the key tiles one step reads. The first is the launch's grid
-#: divisor as well, which `crates/ops/src/segments.rs` states as `POOLED_QUERIES`.
+#: divisor as well, which `crates/ops/src/vsa.rs` states as `POOLED_QUERIES`.
 QUERIES = 16
 KEYS = 64
 

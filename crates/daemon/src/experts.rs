@@ -17,8 +17,10 @@ pub struct Rebalance {
     pub replica: Option<usize>,
 }
 
+/// One rank's prepared allocation for a new expert order: the orders it took, the GPU it
+/// allocated on and the bytes it reserves there (the `uniserve.prepare_experts` report).
 #[derive(Deserialize, Serialize)]
-struct Planned {
+struct Allocation {
     orders: BTreeMap<String, Vec<u32>>,
     gpu: storage::manifest::Gpu,
     bytes: u64,
@@ -63,8 +65,8 @@ async fn rebalance(
     let _replacing = replica.replacing.lock().await;
     let client = replica.hold.client().ok_or(UpdateError::NoEngine)?;
     let prepared = prepare(&client, orders).await;
-    let plans = match prepared {
-        Ok(plans) => plans,
+    let allocations = match prepared {
+        Ok(allocations) => allocations,
         Err(error) => {
             // A rank may have prepared before another rejected its order.
             // Abort releases only incoming allocations; live routing is intact.
@@ -122,28 +124,31 @@ async fn rebalance(
         "replica": replica.ordinal,
         "epoch": client.epoch(),
         "order": orders,
-        "allocations": plans,
+        "allocations": allocations,
     }))
 }
 
 async fn prepare(
     client: &EngineClient,
     orders: &BTreeMap<String, Vec<u32>>,
-) -> Result<Vec<Planned>, String> {
+) -> Result<Vec<Allocation>, String> {
     let payload = serde_json::to_string(orders).map_err(|error| error.to_string())?;
-    let plans = client
+    let allocations = client
         .hook("uniserve.prepare_experts", &payload)
         .await?
         .iter()
-        .map(|report| serde_json::from_str::<Planned>(report).map_err(|error| error.to_string()))
+        .map(|report| serde_json::from_str::<Allocation>(report).map_err(|error| error.to_string()))
         .collect::<Result<Vec<_>, _>>()?;
-    let names: BTreeSet<_> = plans.iter().flat_map(|plan| plan.orders.keys()).collect();
+    let names: BTreeSet<_> = allocations
+        .iter()
+        .flat_map(|allocation| allocation.orders.keys())
+        .collect();
     if let Some(unknown) = orders.keys().find(|name| !names.contains(name)) {
         return Err(format!("{unknown:?} is not a routed expert layer"));
     }
     let mut devices = BTreeMap::new();
-    for plan in &plans {
-        *devices.entry(plan.gpu).or_default() += plan.bytes;
+    for allocation in &allocations {
+        *devices.entry(allocation.gpu).or_default() += allocation.bytes;
     }
     client.reserve_storage(0, &devices).await?;
     client.hook("uniserve.start_experts", "{}").await?;
@@ -155,7 +160,7 @@ async fn prepare(
             .map(|report| serde_json::from_str::<bool>(report).map_err(|error| error.to_string()))
             .collect::<Result<Vec<_>, _>>()?;
         if ready.iter().all(|ready| *ready) {
-            return Ok(plans);
+            return Ok(allocations);
         }
         tokio::time::sleep(Duration::from_millis(10)).await;
     }

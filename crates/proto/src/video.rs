@@ -1,12 +1,12 @@
 //! The conditions of a video request, as they travel from request processing to the workers.
 //!
-//! A video model's request processing plans each condition of a request (`processing`): what its
+//! A video model's request processing prepares each condition of a request (`processing`): what its
 //! fetched bytes are ([`MediaLocator`]), what the media reader decodes them into
 //! ([`ConditionMedia`]), what the text encoder's vision tower reads of it ([`ConditionVision`])
 //! and the denoiser rows its latent encoders write. The engine carries a request's
 //! [`Conditions`] JSON-encoded beside the sizes it schedules by and never decodes them; the
 //! workers decode them and hand each stage its part. The vocabulary is the video pipeline's, not
-//! one model's: any video model whose request processing plans a condition states it in these
+//! one model's: any video model whose request processing prepares a condition states it in these
 //! terms.
 //!
 //! The latent [`Layout`] a denoiser prepares for one request is stated here too: the model states

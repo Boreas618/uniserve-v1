@@ -28,11 +28,12 @@ import subprocess
 import sys
 import tomllib
 
-#: The translation unit of the module: the entry, the plan cache and the bias.
+#: The translation unit of the module: the entry, the executable cache and the
+#: bias.
 SOURCES = ["src/conv.cu"]
 
-#: The operator crate's `DType::as_i64()` numbering: the value each descriptor
-#: token compiles to.
+#: The operator crate's package ABI numbering (`ops::abi::code`): the value
+#: each descriptor token compiles to.
 ELEMENT_TYPES = {
     "u8": 0,
     "i32": 1,

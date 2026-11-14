@@ -291,7 +291,7 @@ pub struct TopKArgs {
     /// `[rows, width]` the vocabulary ids of the kept logits.
     pub ids: Operand,
     /// The ordering's scratch, [`top_k_workspace`]'s shape: `[rows, 4 · width + 2 · TOP_K_BINS]`
-    /// i32. The plan reserves it; the program never grows one.
+    /// i32. The caller allocates it; the program never grows one.
     pub workspace: Operand,
 }
 

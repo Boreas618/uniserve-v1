@@ -62,7 +62,7 @@ SWIZZLE_GROUPS = 4
 SWIZZLE_ROWS_PER_GROUP = 32
 SWIZZLE_COLUMNS = 4
 
-#: Unit roundoff of the dtypes a call can name (``DType::unit_roundoff``).
+#: Unit roundoff of the dtypes a call can name (``ops::tolerance::unit_roundoff``).
 UNIT_ROUNDOFF = {"f16": 2.0**-11, "bf16": 2.0**-9, "f32": 2.0**-24}
 TORCH_TYPES = {
     "f16": torch.float16,

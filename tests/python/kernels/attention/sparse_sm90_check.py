@@ -24,7 +24,7 @@ import sys
 
 import torch
 
-# The operator's `DType::as_i64()` numbering.
+# The operator crate's package ABI numbering (`ops::abi::code`).
 BF16 = 4
 
 

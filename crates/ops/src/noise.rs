@@ -199,20 +199,20 @@ impl Op for PhiloxNoise {
         args: Self::Args<'_>,
         stream: &Stream,
     ) -> Result<()> {
-        let plan = plan(descriptor, &args)?;
+        let addressing = addressing(descriptor, &args)?;
 
         let mut arguments = Arguments::new();
         arguments
             .view(&args.out)
-            .pointer(DevicePtr::from_address(plan.keys))
-            .u64(plan.elements)
+            .pointer(DevicePtr::from_address(addressing.keys))
+            .u64(addressing.elements)
             .u32(args.stage)
             .u32(args.draw)
             // Last, so the per-row form's leading arguments are the ones it always had.
             .u64(args.key)
             // And the offset after it: an existing package that reads neither is correct at 0.
             .u64(args.offset);
-        kernel.launch(plan.grid, &mut arguments, stream)
+        kernel.launch(addressing.grid, &mut arguments, stream)
     }
 
     fn shadow<'a>(args: Self::Args<'a>, twins: &mut Twins) -> Self::Args<'a> {
@@ -248,7 +248,7 @@ pub const fn word_and_half(offset: u64, index: u64) -> (u64, u32) {
 }
 
 /// How one launch addresses the draw: where the keys are, how many elements it covers and the grid.
-struct Plan {
+struct Addressing {
     /// The `keys` view's address under [`KeySource::Rows`], zero under [`KeySource::Scalar`].
     keys: u64,
     /// The row length under [`KeySource::Rows`], the flattened element count under
@@ -295,12 +295,12 @@ fn keyed(descriptor: &NoiseDescriptor, args: &NoiseArgs) -> Result<()> {
 
 /// The addressing of one draw whose key form [`keyed`] accepted: a keys view is present exactly
 /// under [`KeySource::Rows`].
-fn plan(descriptor: &NoiseDescriptor, args: &NoiseArgs) -> Result<Plan> {
+fn addressing(descriptor: &NoiseDescriptor, args: &NoiseArgs) -> Result<Addressing> {
     let rows = args.out.dim(0);
     let row_elements = args.out.dim(1);
 
     match &args.keys {
-        Some(keys) => Ok(Plan {
+        Some(keys) => Ok(Addressing {
             keys: keys.ptr.address(),
             elements: row_elements,
             // One row per program column, the whole row in the other.
@@ -310,7 +310,7 @@ fn plan(descriptor: &NoiseDescriptor, args: &NoiseArgs) -> Result<Plan> {
             // One grid over the flattened buffer: the element index is the flat index, so a value
             // depends on the key and its own position and on nothing about the launch.
             let elements = rows * row_elements;
-            Ok(Plan {
+            Ok(Addressing {
                 keys: 0,
                 elements,
                 grid: LaunchGrid::new([elements.div_ceil(u64::from(descriptor.block)), 1, 1])?,
@@ -415,7 +415,7 @@ mod tests {
         // 4 rows of 4096 elements at a block of 1024: the per-row form is a 4 x 4 grid (one column
         // per row) and the scalar form is one row of 16 blocks, so an element's program does not
         // depend on which row it is in.
-        let rows_form = plan(
+        let rows_form = addressing(
             &descriptor(KeySource::Rows),
             &args(out(4, 4096), Some(keys(4)), 0),
         )
@@ -423,7 +423,7 @@ mod tests {
         assert_eq!(rows_form.grid.blocks, [4, 4, 1]);
         assert_eq!(rows_form.elements, 4096);
 
-        let scalar_form = plan(&descriptor(KeySource::Scalar), &args(out(4, 4096), None, 7))
+        let scalar_form = addressing(&descriptor(KeySource::Scalar), &args(out(4, 4096), None, 7))
             .expect("the scalar form with its key");
         assert_eq!(scalar_form.grid.blocks, [16, 1, 1]);
         assert_eq!(scalar_form.elements, 4 * 4096);

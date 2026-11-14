@@ -10,7 +10,7 @@
 //!
 //! The product and the sum are two FP32 roundings, as two tensor operations compute them, and never
 //! a fused multiply-add: the kernel issues each as one round-to-nearest instruction the compiler
-//! cannot contract, and the store rounds into the element type. That is why the tolerance is exact.
+//! cannot fuse, and the store rounds into the element type. That is why the tolerance is exact.
 //!
 //! The geometry is launch words; the key names the element type, the block and the PDL option.
 

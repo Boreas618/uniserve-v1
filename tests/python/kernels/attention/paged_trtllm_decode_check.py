@@ -46,7 +46,7 @@ KERNELS = (
 #: The package this check covers.
 PACKAGE = KERNELS / "paged_attention" / "trtllm"
 
-# The operator's `DType::as_i64()` numbering.
+# The operator crate's package ABI numbering (`ops::abi::code`).
 BF16 = 4
 # The operator's phase numbering.
 DECODE = 1

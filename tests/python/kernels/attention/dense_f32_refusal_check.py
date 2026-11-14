@@ -29,7 +29,7 @@ import ctypes
 import pathlib
 import sys
 
-#: `DType::as_i64()`: this backend serves FP32 only.
+#: `ops::abi::code`'s numbers: this backend serves FP32 only.
 F32 = 5
 F16 = 3
 

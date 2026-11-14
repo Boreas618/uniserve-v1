@@ -6,7 +6,7 @@ a page of `E4M3` bytes with **one f32 scale for the whole page** (`QUANTIZED`), 
 (BF16, F16 or F32) of another type than the queries, such as a BF16 model's FP16 cache, which
 has no scale and whose scale pointers are null and never read.
 
-The order is the contract's:
+The order is the operator's:
 
 1. per page the query row's table names, load the page's scalar `s = key_scale[page]` (and the value
    plane's own) when the page is quantized;

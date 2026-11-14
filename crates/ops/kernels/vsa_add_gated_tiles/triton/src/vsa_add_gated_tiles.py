@@ -3,7 +3,7 @@
 Programs add one tile's gated compression to its rows, ``out + compressed[tile] *
 gate``, with the product and the sum each rounded to the storage dtype as two
 eager element-wise operations round them; the two inline-assembly helpers pin that
-rounding so the compiler cannot contract the multiply with the sum.
+rounding so the compiler cannot fuse the multiply with the sum.
 
 The kernel body imports nothing but Triton: the launch-time wrapper, its operand
 checks and its torch types stay with the operator's Rust side.
@@ -15,7 +15,7 @@ import triton.language as tl
 
 @triton.jit
 def _add_rn(a, b):
-    # Round-to-nearest FP32 sum the compiler cannot contract with a neighbouring
+    # Round-to-nearest FP32 sum the compiler cannot fuse with a neighbouring
     # multiply.
     return tl.inline_asm_elementwise(
         "add.rn.f32 $0, $1, $2;",

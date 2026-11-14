@@ -1,21 +1,21 @@
 //! Conditional media reading: what a request's conditions decode to.
 //!
-//! The server fetches every condition's bytes and plans how each is prepared;
-//! the main process reads the bytes and calls these decoders with the plan's
-//! values. They apply the reference conditioning's operations in its order, so
+//! The server fetches every condition's bytes and decides how each is prepared
+//! (its image or audio transform, or its video clip); the main process reads
+//! the bytes and calls these decoders with those values. They apply the reference conditioning's operations in its order, so
 //! their results equal the reference's own:
 //!
 //! - [`read_image`]: decoding with the EXIF orientation applied and RGB
 //!   conversion (diffusers' `load_image`), then a LANCZOS resize and the
-//!   planned crop: a stretched keyframe, a cover-cropped one, or an image
-//!   reference at its planned raster.
+//!   transform's crop: a stretched keyframe, a cover-cropped one, or an image
+//!   reference at its transform's raster.
 //! - [`read_audio`]: decoding to planar float at the track's native rate and
-//!   channel layout, the planned native samples kept, a mono track duplicated
+//!   channel layout, the transform's native samples kept, a mono track duplicated
 //!   to stereo, and one torchaudio resample to the model's rate.
 //! - [`read_video`]: one external FFmpeg pass over a reference video.
 //!
-//! Every function checks that it produced exactly the planned extent and fails
-//! with [`crate::Error::Plan`] otherwise, so media that decodes differently
+//! Every function checks that it produced exactly the extent its transform or
+//! clip states and fails with [`crate::Error::Invalid`] otherwise, so media that decodes differently
 //! from what the server probed fails the request instead of misaligning its
 //! rows.
 //!
@@ -104,16 +104,16 @@ pub enum ConditionSource<'a> {
     File(&'a std::fs::File),
 }
 
-/// One condition's media and the plan its preparation follows.
+/// One condition's media and the transforms its preparation follows.
 #[derive(Debug)]
 pub struct ConditionRead<'a> {
     /// The condition's media.
     pub source: ConditionSource<'a>,
-    /// The image's fit plan when the condition is an image.
+    /// The image's fit transform when the condition is an image.
     pub image: Option<ImageTransform>,
-    /// The clip plan when the condition is a reference video.
+    /// The clip to decode when the condition is a reference video.
     pub video: Option<VideoClip>,
-    /// The track's plan when the condition carries audio.
+    /// The track's transform when the condition carries audio.
     pub audio: Option<AudioTransform>,
     /// The condition's rows of the `condition_pixels` product: RGB24 pixels,
     /// three bytes each.
@@ -141,25 +141,25 @@ struct Rgb24 {
 
 /// A clip's bytes per frame and in total, checked against the address space.
 ///
-/// A plan comes from a peer, so an extent the host cannot address must fail the
+/// A clip comes from a peer, so an extent the host cannot address must fail the
 /// request rather than overflow the arithmetic that sizes its buffers.
 fn clip_bytes(clip: &VideoClip) -> Result<(usize, usize)> {
     let frame = (clip.canvas.0 as usize)
         .checked_mul(clip.canvas.1 as usize)
         .and_then(|area| area.checked_mul(3))
         .ok_or_else(|| {
-            Error::Plan(format!(
-                "a reference video's plan of {}x{} frames exceeds the host's address space",
+            Error::Invalid(format!(
+                "a reference video's clip of {}x{} frames exceeds the host's address space",
                 clip.canvas.0, clip.canvas.1
             ))
         })?;
-    let planned = frame.checked_mul(clip.frames as usize).ok_or_else(|| {
-        Error::Plan(format!(
-            "a reference video's plan of {} frames of {}x{} exceeds the host's address space",
+    let total = frame.checked_mul(clip.frames as usize).ok_or_else(|| {
+        Error::Invalid(format!(
+            "a reference video's clip of {} frames of {}x{} exceeds the host's address space",
             clip.frames, clip.canvas.0, clip.canvas.1
         ))
     })?;
-    Ok((frame, planned))
+    Ok((frame, total))
 }
 
 /// Decodes an image to RGB24 with its EXIF orientation applied, as Pillow's
@@ -189,48 +189,49 @@ fn decode_rgb(encoded: &[u8]) -> Result<Rgb24> {
     })
 }
 
-/// Decodes an image and puts it on its planned raster.
+/// Decodes an image and puts it on its transform's raster.
 ///
 /// Writes `[height * width * 3]` uint8 RGB of the kept window into `out`.
 ///
 /// # Errors
 ///
-/// [`crate::Error::Plan`] when the plan's extent cannot be addressed, the
-/// image decodes to another raster than planned, or `out` has another length;
+/// [`crate::Error::Invalid`] when the transform's extent cannot be addressed,
+/// the image decodes to another raster than the transform states, or `out` has
+/// another length;
 /// [`crate::Error::Codec`] when decoding fails.
-pub fn read_image(encoded: &[u8], plan: &ImageTransform, out: &mut [u8]) -> Result<()> {
-    let (left, top, width, height) = plan.window;
+pub fn read_image(encoded: &[u8], transform: &ImageTransform, out: &mut [u8]) -> Result<()> {
+    let (left, top, width, height) = transform.window;
     let expected = (width as usize)
         .checked_mul(height as usize)
         .and_then(|pixels| pixels.checked_mul(3))
         .ok_or_else(|| {
-            Error::Plan(format!(
-                "a condition image's plan of {}x{} exceeds the host's address space",
+            Error::Invalid(format!(
+                "a condition image's window of {}x{} exceeds the host's address space",
                 width, height
             ))
         })?;
     if out.len() != expected {
-        return Err(Error::Plan(
-            "a condition image's rows disagree with its plan".to_owned(),
+        return Err(Error::Invalid(
+            "a condition image's rows disagree with its transform".to_owned(),
         ));
     }
 
     let decoded = decode_rgb(encoded)?;
     // Pillow's resize to the image's own size is a copy, so an image already
     // at its raster passes through unchanged.
-    let image = if (decoded.width, decoded.height) == plan.resized {
+    let image = if (decoded.width, decoded.height) == transform.resized {
         decoded
     } else {
         let pixels = crate::resample::lanczos_resize(
             &decoded.pixels,
             decoded.width,
             decoded.height,
-            plan.resized.0,
-            plan.resized.1,
+            transform.resized.0,
+            transform.resized.1,
         )?;
         Rgb24 {
-            width: plan.resized.0,
-            height: plan.resized.1,
+            width: transform.resized.0,
+            height: transform.resized.1,
             pixels,
         }
     };
@@ -243,14 +244,14 @@ pub fn read_image(encoded: &[u8], plan: &ImageTransform, out: &mut [u8]) -> Resu
             || right.is_none_or(|right| right > image.width)
             || bottom.is_none_or(|bottom| bottom > image.height)
         {
-            return Err(Error::Plan(
+            return Err(Error::Invalid(
                 "a condition image's window exceeds its raster".to_owned(),
             ));
         }
     }
     if width == image.width && height == image.height && left == 0 && top == 0 {
         if out.len() != image.pixels.len() {
-            return Err(Error::Plan(
+            return Err(Error::Invalid(
                 "a condition image decoded to another raster".to_owned(),
             ));
         }
@@ -271,80 +272,80 @@ pub fn read_image(encoded: &[u8], plan: &ImageTransform, out: &mut [u8]) -> Resu
 /// Decodes an audio track's kept samples at the model's rate.
 ///
 /// `source` holds the container's encoded bytes; its first audio stream is read
-/// at `plan.native_rate`. The `source_samples` native samples from `start` are
+/// at `transform.native_rate`. The `source_samples` native samples from `start` are
 /// kept, a mono track is duplicated to stereo, and one resample brings the
 /// track to `rate`. Writes `[samples, 2]` float32, sample-major.
 ///
 /// # Errors
 ///
-/// [`crate::Error::Plan`] when the plan's extent cannot be addressed, the track
-/// has no audio stream, another rate, too few samples, or resamples to another
-/// count; [`crate::Error::Codec`] when decoding fails.
-pub fn read_audio(source: &[u8], plan: &AudioTransform, out: &mut [f32]) -> Result<()> {
-    let out_samples = plan.samples.checked_mul(2).ok_or_else(|| {
-        Error::Plan(format!(
-            "a condition track's plan of {} samples exceeds the host's address space",
-            plan.samples
+/// [`crate::Error::Invalid`] when the transform's extent cannot be addressed, the
+/// track has no audio stream, another rate, too few samples, or resamples to
+/// another count; [`crate::Error::Codec`] when decoding fails.
+pub fn read_audio(source: &[u8], transform: &AudioTransform, out: &mut [f32]) -> Result<()> {
+    let out_samples = transform.samples.checked_mul(2).ok_or_else(|| {
+        Error::Invalid(format!(
+            "a condition track's transform of {} samples exceeds the host's address space",
+            transform.samples
         ))
     })?;
     if out.len() != out_samples {
-        return Err(Error::Plan(
-            "a condition track's rows disagree with its plan".to_owned(),
+        return Err(Error::Invalid(
+            "a condition track's rows disagree with its transform".to_owned(),
         ));
     }
-    let window_samples = plan.source_samples.checked_mul(2).ok_or_else(|| {
-        Error::Plan(format!(
-            "a condition track's plan of {} samples exceeds the host's address space",
-            plan.source_samples
+    let window_samples = transform.source_samples.checked_mul(2).ok_or_else(|| {
+        Error::Invalid(format!(
+            "a condition track's transform of {} samples exceeds the host's address space",
+            transform.source_samples
         ))
     })?;
 
     let decoded = ffi::decode_audio(source)?;
-    if decoded.rate != plan.native_rate {
-        return Err(Error::Plan(format!(
-            "an audio track decodes at {} Hz, {} Hz were planned",
-            decoded.rate, plan.native_rate
+    if decoded.rate != transform.native_rate {
+        return Err(Error::Invalid(format!(
+            "an audio track decodes at {} Hz, its transform states {} Hz",
+            decoded.rate, transform.native_rate
         )));
     }
-    let stop = plan.start.checked_add(plan.source_samples);
+    let stop = transform.start.checked_add(transform.source_samples);
     if stop.is_none_or(|stop| stop > decoded.samples) || !(1..=2).contains(&decoded.channels) {
-        return Err(Error::Plan(
-            "an audio track holds fewer samples than planned".to_owned(),
+        return Err(Error::Invalid(
+            "an audio track holds fewer samples than its transform keeps".to_owned(),
         ));
     }
 
-    // Keep the planned native window per channel; a mono track feeds both
+    // Keep the transform's native window per channel; a mono track feeds both
     // stereo channels.
     let mut planar = vec![0.0f32; window_samples];
     for channel in 0..2 {
         let source_channel = if decoded.channels == 1 { 0 } else { channel };
-        let from = source_channel * decoded.samples + plan.start;
-        let to = from + plan.source_samples;
-        planar[channel * plan.source_samples..][..plan.source_samples]
+        let from = source_channel * decoded.samples + transform.start;
+        let to = from + transform.source_samples;
+        planar[channel * transform.source_samples..][..transform.source_samples]
             .copy_from_slice(&decoded.planar[from..to]);
     }
 
-    let stereo = if plan.native_rate != plan.rate {
+    let stereo = if transform.native_rate != transform.rate {
         crate::resample::sinc_resample(
             &planar,
             2,
-            plan.source_samples,
-            plan.native_rate,
-            plan.rate,
+            transform.source_samples,
+            transform.native_rate,
+            transform.rate,
         )?
     } else {
         planar
     };
     if stereo.len() != out_samples {
-        return Err(Error::Plan(format!(
-            "an audio track resampled to {} samples, {} were planned",
+        return Err(Error::Invalid(format!(
+            "an audio track resampled to {} samples, its transform states {}",
             stereo.len() / 2,
-            plan.samples
+            transform.samples
         )));
     }
-    for sample in 0..plan.samples {
+    for sample in 0..transform.samples {
         out[sample * 2] = stereo[sample];
-        out[sample * 2 + 1] = stereo[plan.samples + sample];
+        out[sample * 2 + 1] = stereo[transform.samples + sample];
     }
     Ok(())
 }
@@ -360,7 +361,7 @@ pub fn read_audio(source: &[u8], plan: &AudioTransform, out: &mut [f32]) -> Resu
 /// # Errors
 ///
 /// [`crate::Error::ReferenceVideo`] when the process exits in failure;
-/// [`crate::Error::Plan`] when the clip's extent cannot be addressed or it
+/// [`crate::Error::Invalid`] when the clip's extent cannot be addressed or it
 /// decodes to another frame count; [`crate::Error::Io`] when the process
 /// cannot be started.
 pub fn read_video(
@@ -370,7 +371,7 @@ pub fn read_video(
     out: &mut [u8],
 ) -> Result<()> {
     let (width, height) = clip.canvas;
-    let (frame_bytes, planned) = clip_bytes(clip)?;
+    let (frame_bytes, expected) = clip_bytes(clip)?;
     let filters = format!(
         "fps={},trim=start_frame={},scale={width}:{height}:flags=lanczos,setsar=1",
         clip.frame_rate, clip.start_frame
@@ -419,23 +420,23 @@ pub fn read_video(
             message: String::from_utf8_lossy(&output.stderr).trim().to_owned(),
         });
     }
-    if output.stdout.len() != planned {
-        return Err(Error::Plan(format!(
-            "a reference video decoded to {} frames, {} were planned",
+    if output.stdout.len() != expected {
+        return Err(Error::Invalid(format!(
+            "a reference video decoded to {} frames, its clip states {}",
             output.stdout.len() / frame_bytes.max(1),
             clip.frames
         )));
     }
-    if out.len() != planned {
-        return Err(Error::Plan(
-            "a reference video's rows disagree with its plan".to_owned(),
+    if out.len() != expected {
+        return Err(Error::Invalid(
+            "a reference video's rows disagree with its clip".to_owned(),
         ));
     }
     out.copy_from_slice(&output.stdout);
     Ok(())
 }
 
-/// The rows one condition takes of each product, as its plan says.
+/// The rows one condition takes of each product, as its transforms state.
 fn extents(condition: &ConditionRead<'_>) -> (usize, usize) {
     let pixels = if let Some(image) = condition.image {
         image.window.2 as usize * image.window.3 as usize
@@ -478,7 +479,7 @@ fn check_ranges(ranges: &[Range<usize>], rows: usize, name: &str) -> Result<()> 
     let mut cursor = 0usize;
     for range in &ranges {
         if range.start < cursor || range.end > rows || range.start > range.end {
-            return Err(Error::Plan(format!(
+            return Err(Error::Invalid(format!(
                 "the request's conditions exceed their {name}"
             )));
         }
@@ -524,7 +525,7 @@ fn rows_of<'a, T>(
 ///
 /// # Errors
 ///
-/// [`crate::Error::Plan`] when the conditions exceed a product, leave it
+/// [`crate::Error::Invalid`] when the conditions exceed a product, leave it
 /// unfilled, decode to another extent, or a video's `vae_frames` exceeds its
 /// `frames`; the readers' own errors otherwise.
 pub fn read_conditions(
@@ -535,7 +536,7 @@ pub fn read_conditions(
     let pixels = products.pixels.as_deref_mut();
     let samples = products.samples.as_deref_mut();
 
-    // Every condition's rows must be what its plan decodes to, and together
+    // Every condition's rows must be what its transforms decode to, and together
     // the conditions must fill each product exactly (`Conditions.rows`).
     let mut pixel_rows = 0usize;
     let mut sample_rows = 0usize;
@@ -544,7 +545,7 @@ pub fn read_conditions(
     for condition in conditions {
         if let Some(clip) = condition.video {
             if clip.vae_frames > clip.frames {
-                return Err(Error::Plan(
+                return Err(Error::Invalid(
                     "a reference video's encoded frames exceed its decoded frames".to_owned(),
                 ));
             }
@@ -553,24 +554,24 @@ pub fn read_conditions(
         }
         let (wanted_pixels, wanted_samples) = extents(condition);
         if condition.pixels.len() != wanted_pixels {
-            return Err(Error::Plan(
-                "a condition's pixel rows disagree with its plan".to_owned(),
+            return Err(Error::Invalid(
+                "a condition's pixel rows disagree with its transform".to_owned(),
             ));
         }
         if condition.samples.len() != wanted_samples {
-            return Err(Error::Plan(
-                "a condition's sample rows disagree with its plan".to_owned(),
+            return Err(Error::Invalid(
+                "a condition's sample rows disagree with its transform".to_owned(),
             ));
         }
         pixel_rows = pixel_rows
             .checked_add(condition.pixels.len())
             .ok_or_else(|| {
-                Error::Plan("the request's conditions exceed their pixels".to_owned())
+                Error::Invalid("the request's conditions exceed their pixels".to_owned())
             })?;
         sample_rows = sample_rows
             .checked_add(condition.samples.len())
             .ok_or_else(|| {
-                Error::Plan("the request's conditions exceed their samples".to_owned())
+                Error::Invalid("the request's conditions exceed their samples".to_owned())
             })?;
         if !condition.pixels.is_empty() {
             declared_pixels.push(condition.pixels.clone());
@@ -584,20 +585,20 @@ pub fn read_conditions(
             // The product is bytes and the conditions' ranges are rows of
             // three bytes each, so the two are compared in rows.
             if product.len() % 3 != 0 {
-                return Err(Error::Plan(
+                return Err(Error::Invalid(
                     "the condition pixel product is not whole RGB24 rows".to_owned(),
                 ));
             }
             let rows = product.len() / 3;
             check_ranges(&declared_pixels, rows, "pixels")?;
             if pixel_rows != rows {
-                return Err(Error::Plan(
+                return Err(Error::Invalid(
                     "the request's conditions leave their pixels unfilled".to_owned(),
                 ));
             }
         }
         None if pixel_rows != 0 => {
-            return Err(Error::Plan(
+            return Err(Error::Invalid(
                 "a condition's pixels have no product".to_owned(),
             ));
         }
@@ -608,20 +609,20 @@ pub fn read_conditions(
             // The product is interleaved stereo samples and the conditions'
             // ranges are stereo rows, so the two are compared in rows.
             if product.len() % 2 != 0 {
-                return Err(Error::Plan(
+                return Err(Error::Invalid(
                     "the condition sample product is not whole stereo samples".to_owned(),
                 ));
             }
             let rows = product.len() / 2;
             check_ranges(&declared_samples, rows, "samples")?;
             if sample_rows != rows {
-                return Err(Error::Plan(
+                return Err(Error::Invalid(
                     "the request's conditions leave their samples unfilled".to_owned(),
                 ));
             }
         }
         None if sample_rows != 0 => {
-            return Err(Error::Plan(
+            return Err(Error::Invalid(
                 "a condition's samples have no product".to_owned(),
             ));
         }
@@ -635,13 +636,13 @@ pub fn read_conditions(
         for condition in conditions {
             if let Some(clip) = condition.video {
                 let ConditionSource::File(file) = condition.source else {
-                    return Err(Error::Plan(
+                    return Err(Error::Invalid(
                         "a reference video needs a seekable file".to_owned(),
                     ));
                 };
-                let planned = clip_bytes(&clip)?.1;
+                let total = clip_bytes(&clip)?.1;
                 videos.push(Some(scope.spawn(move || {
-                    let mut frames = vec![0u8; planned];
+                    let mut frames = vec![0u8; total];
                     read_video(ffmpeg, file, &clip, &mut frames)?;
                     Ok(frames)
                 })));
@@ -656,21 +657,21 @@ pub fn read_conditions(
         let mut samples = rows_of(samples, conditions.iter().map(|c| c.samples.clone()), 2);
         let mut decoders = Vec::with_capacity(conditions.len());
         for (index, condition) in conditions.iter().enumerate() {
-            if let Some(plan) = condition.image {
+            if let Some(transform) = condition.image {
                 let out = pixels[index].take().ok_or_else(|| {
-                    Error::Plan("a condition's pixels have no product".to_owned())
+                    Error::Invalid("a condition's pixels have no product".to_owned())
                 })?;
-                decoders.push(
-                    scope.spawn(move || read_image(&encoded_bytes(&condition.source)?, &plan, out)),
-                );
+                decoders.push(scope.spawn(move || {
+                    read_image(&encoded_bytes(&condition.source)?, &transform, out)
+                }));
             }
-            if let Some(plan) = condition.audio {
+            if let Some(transform) = condition.audio {
                 let out = samples[index].take().ok_or_else(|| {
-                    Error::Plan("a condition's samples have no product".to_owned())
+                    Error::Invalid("a condition's samples have no product".to_owned())
                 })?;
-                decoders.push(
-                    scope.spawn(move || read_audio(&encoded_bytes(&condition.source)?, &plan, out)),
-                );
+                decoders.push(scope.spawn(move || {
+                    read_audio(&encoded_bytes(&condition.source)?, &transform, out)
+                }));
             }
         }
         for decoder in decoders {
@@ -696,7 +697,7 @@ pub fn read_conditions(
                 .ok_or_else(|| Error::Codec("a video condition has no clip".to_owned()))?;
             let product = pixels[index]
                 .take()
-                .ok_or_else(|| Error::Plan("a condition's pixels have no product".to_owned()))?;
+                .ok_or_else(|| Error::Invalid("a condition's pixels have no product".to_owned()))?;
             product.copy_from_slice(&frames[..condition.pixels.len() * 3]);
             decoded.push(Some(DecodedVideo {
                 clip,

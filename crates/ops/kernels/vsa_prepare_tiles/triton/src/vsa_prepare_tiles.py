@@ -476,7 +476,7 @@ def _norm_rope_halves(
 
 @triton.jit
 def _add_rn(a, b):
-    # Round-to-nearest FP32 sum the compiler cannot contract with a
+    # Round-to-nearest FP32 sum the compiler cannot fuse with a
     # neighbouring multiply.
     return tl.inline_asm_elementwise(
         "add.rn.f32 $0, $1, $2;",

@@ -21,24 +21,24 @@ Both counters stay on while the process serves. On GB200, one request of Qwen3-3
 
 ## Fence probes
 
-Fence probes time the model's components on the device, inside CUDA graphs, at every step. A model runs each of its modules' forwards as a profiler range (`nn::profiler::range`), naming the module's class, such as `models.qwen3.transformer.TransformerLayer`, and its path. A capture puts a probe at the entry and one at the return of every module whose class matches `profiling_config.fence_components` (`docs/configuration.md`). A probe is a single-thread kernel launched on the forward's stream: a forward captured into a CUDA graph at warmup captures its probes, which each replay runs. A rank's device thread brackets each batch's execution with step markers of the same kernel on the runner's stream, which store the batch's id where the probes between them read it, so every record names its step. Qwen3 states `Transformer`, `TransformerLayer`, `Attention` and `MoE`, its drafter's `Drafter` and its vision tower's `VisionBlock`; MiniMax-H3 states its denoiser's `Transformer` and `TransformerBlock`, its VAEs' `VideoEncoder`, `VideoDecoder`, `AudioEncoder` and `AudioDecoder`, and its text encoder's `TransformerLayer`.
+Fence probes time the model's modules on the device, inside CUDA graphs, at every step. A model runs each of its modules' forwards as a profiler range (`nn::profiler::range`), naming the module's class, such as `models.qwen3.transformer.TransformerLayer`, and its path. A capture puts a probe at the entry and one at the return of every module whose class matches `profiling_config.fence_components` (`docs/configuration.md`). A probe is a single-thread kernel launched on the forward's stream: a forward captured into a CUDA graph at warmup captures its probes, which each replay runs. A rank's device thread brackets each batch's execution with step markers of the same kernel on the runner's stream, which store the batch's id where the probes between them read it, so every record names its step. Qwen3 states `Transformer`, `TransformerLayer`, `Attention` and `MoE`, its drafter's `Drafter` and its vision tower's `VisionBlock`; MiniMax-H3 states its denoiser's `Transformer` and `TransformerBlock`, its VAEs' `VideoEncoder`, `VideoDecoder`, `AudioEncoder` and `AudioDecoder`, and its text encoder's `TransformerLayer`.
 
-A probe first reads a device switch, a word per component and a master word in device storage; off, it returns at once. On, it reads `%globaltimer` and writes its time, its probe and its step into the next slot of a double buffer in pinned host storage the process allocated, 4096 records of 16 bytes a half; the probe that completes a half publishes it. Each device thread reads its device's complete halves after every batch, and the control thread with every metrics report, and at most once a second the half being filled, without any device synchronization; a record tags its half's fill, so one the device overwrote before the host read it is counted as lost (`uniserve:worker_fence_records_lost`). At each step's end marker the reader pairs each module instance's entry and exit in time order, sums the durations of a component's instances in the step, and counts the sum in the histogram of the step's stage and the component, beside the step's span between its markers (component `step`):
+A probe first reads a device switch, a word per module class and a master word in device storage; off, it returns at once. On, it reads `%globaltimer` and writes its time, its probe and its step into the next slot of a double buffer in pinned host storage the process allocated, 4096 records of 16 bytes a half; the probe that completes a half publishes it. Each device thread reads its device's complete halves after every batch, and the control thread with every metrics report, and at most once a second the half being filled, without any device synchronization; a record tags its half's fill, so one the device overwrote before the host read it is counted as lost (`uniserve:worker_fence_records_lost`). At each step's end marker the reader pairs each module instance's entry and exit in time order, sums the durations of a class's instances in the step, and counts the sum in the histogram of the step's stage and the class (the `component` label), beside the step's span between its markers (`component` `step`):
 
 | Metric | Labels | What it counts |
 | --- | --- | --- |
-| `uniserve:worker_fence_step_seconds` | `stage`, `component` | A histogram of per-step durations on the device: for each step of the stage (its call kind, such as `prefill` or `decode`), the summed time of the component's probed instances, or the step's span for `step`; buckets from 10 µs to 10 s |
+| `uniserve:worker_fence_step_seconds` | `stage`, `component` | A histogram of per-step durations on the device: for each step of the stage (its call kind, such as `prefill` or `decode`), the summed time of the probed instances of the module class `component` names, or the step's span for `step`; buckets from 10 µs to 10 s |
 | `uniserve:worker_fence_records_lost` | | Probe records overwritten before a reader read them |
 
 **Cost.** Every probe is a kernel launch in each replay of a captured graph, whether it records or not. The always-on budget is LMTracer's reported 0.58%. On GB200 with Qwen3-30B-A3B in bfloat16 (decode of 512 tokens per request, 60 s per point, probes switched off and on alternately in one server, four pairs per point), the step time measured:
 
-| Probed components | Probes per step | On against off, 1 request | On against off, 32 requests | Off against no probe |
+| Probed classes | Probes per step | On against off, 1 request | On against off, 32 requests | Off against no probe |
 | --- | --- | --- | --- | --- |
-| `*.Transformer` (the default) | 2 | −0.73%, −0.19% | −3.5%, +5.8% | within the ±5–10% spread between servers |
+| `*Transformer` (the default) | 2 | −0.73%, −0.19% | −3.5%, +5.8% | within the ±5–10% spread between servers |
 | `*.TransformerLayer` | 96 | +1.71% (+0.79 to +2.76%) | +1.15% (−3.54 to +3.32%) | within the spread between servers |
 | `*` | 2028 | +18.4% | +18.6% | +21% to +36% |
 
-Each probe thus costs about a microsecond of every step even when switched off, and about another microsecond when it records, so the default probes each model's decoder stack only; probing every layer costs 1–2% and every component 15–35%.
+Each probe thus costs about a microsecond of every step even when switched off, and about another microsecond when it records, so the default probes each model's decoder or denoiser stack only; probing every layer costs 1–2% and every module 15–35%.
 
 `profiling_config.fence_probes = false` switches every probe off in place: `PUT /admin/config` with that assignment has the process write its devices' switches, and the graphs keep their probes, each of which then returns at once. Changing `fence_components` changes which modules carry probes in the captured graphs, which is a new epoch (`docs/admin.md`).
 
@@ -63,7 +63,7 @@ curl -X DELETE http://127.0.0.1:8000/admin/profile   # end it now
 | `seconds` | Unbounded | How long the session lasts from its start |
 | `stages` | Every stage | The steps recorded, by call kind (`prefill`, `decode`, `verify`, `denoising`, ...) |
 | `workers` | Every worker | The workers recorded, by rank |
-| `components` | Every probed component | Name patterns (`*` matches any run) of the components whose fence records `fence_timeline` keeps |
+| `components` | Every probed class | Name patterns (`*` matches any run) of the module classes whose fence records `fence_timeline` keeps |
 | `output_dir` | Required | The directory each worker writes `profile-SESSION-epochEPOCH-rankRANK.sqlite` into; it is created |
 | `timeline`, `pm_sampling`, `range_metrics`, `pc_sampling` | Below | Each collector's options |
 | `max_slowdown` | Unguarded | The quality-of-service guard's bound, a fraction of the step time before the session |
@@ -75,7 +75,7 @@ The session starts at the engine's next step boundary: the workers prepare their
 | Collector | Mechanism | Options | What its file holds |
 | --- | --- | --- | --- |
 | `timeline` | CUPTI's activity records of kernels (`CONCURRENT_KERNEL`, which keeps kernels concurrent), copies, fills, NVTX marks and their data, storage allocations and the NVLink and PCIe topology, and the callbacks of every runtime and driver API call; a CUDA graph's launch is one record, or one per node | `graphs`: `whole` (default) or `nodes` | `kernel`, `copy`, `fill`, `graph`, `marker`, `marker_data`, `storage`, `nvlink`, `pcie`, `api` |
-| `fence_timeline` | Every fence probe record the worker reads, of the selected components and the step markers | | `fence`, with `fence_probe` |
+| `fence_timeline` | Every fence probe record the worker reads, of the selected classes and the step markers | | `fence`, with `fence_probe` |
 | `pm_sampling` | CUPTI's PM sampling: hardware counters of the whole device every interval of device time, in one pass | `metrics` (PM sampling metric names; default `gr__cycles_active.avg`, `sm__cycles_active.avg`, `dram__throughput.avg.pct_of_peak_sustained_elapsed`), `interval_ns` (default 100000, at least 20000) | `pm_sample` |
 | `range_metrics` | CUPTI's range profiler with metrics one pass collects, never replaying work | `metrics` (default `gpu__time_duration.sum`), `ranges`: `kernel` (a range per kernel launch, a CUDA graph's launch being one: the worker pushes a CUPTI user range as each launch's driver call enters and pops it as the call returns, and no other launch of the process, from any thread, is issued in between) or `component` (a range per probed module instance's call, which only calls outside a CUDA graph's replay push: a replay runs no host code), `pass_ranges` (the ranges one pass holds, at least 32; default 512) | `range_metric` |
 | `pc_sampling` | CUPTI's PC sampling in continuous mode, which samples warps without serializing kernels | `period`: each SM samples a warp every `2^period` cycles, from 12 to 31 (default 17) | `pc_sample`, `pc_take`, `pc_stall_reason` |
@@ -121,7 +121,7 @@ Every time is in nanoseconds of one of two clocks: CUPTI's (about `CLOCK_REALTIM
 .venv/bin/python -m uniserve_eval.profile perfetto /data/profiles/profile-1-*.sqlite -o trace.json
 ```
 
-`summary` states each file's session, worker, collectors and rows by table. `perfetto` writes one trace of a session's files in the Trace Event Format, which the Perfetto UI opens: a process per worker, with a track per CUDA stream, host thread and device's fence probes (each probed component instance's call a slice, nested as the calls nest), the steps, and counter tracks for PM samples, all on CUPTI's clock. `uniserve_eval.profile.ProfileFile` reads a file from Python.
+`summary` states each file's session, worker, collectors and rows by table. `perfetto` writes one trace of a session's files in the Trace Event Format, which the Perfetto UI opens: a process per worker, with a track per CUDA stream, host thread and device's fence probes (each probed module instance's call a slice, nested as the calls nest), the steps, and counter tracks for PM samples, all on CUPTI's clock. `uniserve_eval.profile.ProfileFile` reads a file from Python.
 
 ## Capture and inspect a CUDA timeline with Nsight Systems
 

@@ -4,7 +4,7 @@ The design confirms MiniMax-H3 by people watching generated results: a fixed
 set of requests covering every combination the service offers, each with a
 fixed seed, whose MP4s land in a fixed directory under ``artifacts/``. This
 test holds ``uniserve_eval/check_h3.toml`` and its frozen manifests to that
-contract: each cell exactly once, one measured row at seed 0 and one warmup
+rule: each cell exactly once, one measured row at seed 0 and one warmup
 row at seed 42 copied unchanged from the performance workloads, reference
 media and their anchors kept, and a fixed per-cell MP4 directory. The same six
 cells also run reversed, which is the candidate's obligation, and their MP4s

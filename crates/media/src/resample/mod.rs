@@ -21,7 +21,7 @@ use crate::Result;
 ///
 /// # Errors
 ///
-/// [`crate::Error::Plan`] when the dimensions are zero or `src` does not hold
+/// [`crate::Error::Invalid`] when the dimensions are zero or `src` does not hold
 /// `height * width * 3` bytes.
 pub fn lanczos_resize(
     src: &[u8],
@@ -44,7 +44,7 @@ pub fn lanczos_resize(
 ///
 /// # Errors
 ///
-/// [`crate::Error::Plan`] when a rate is zero or `input` is not `channels *
+/// [`crate::Error::Invalid`] when a rate is zero or `input` is not `channels *
 /// length` samples.
 pub fn sinc_resample(
     input: &[f32],
@@ -66,7 +66,7 @@ pub fn sinc_resample(
 ///
 /// # Errors
 ///
-/// [`crate::Error::Plan`] when the dimensions are zero or `src` does not hold
+/// [`crate::Error::Invalid`] when the dimensions are zero or `src` does not hold
 /// `channels * height * width` bytes.
 pub fn bicubic_antialias_u8(
     src: &[u8],
@@ -87,7 +87,7 @@ pub fn bicubic_antialias_u8(
 ///
 /// # Errors
 ///
-/// [`crate::Error::Plan`] when the dimensions are zero or `src` does not hold
+/// [`crate::Error::Invalid`] when the dimensions are zero or `src` does not hold
 /// `channels * height * width` samples.
 pub fn bicubic_antialias_f32(
     src: &[f32],

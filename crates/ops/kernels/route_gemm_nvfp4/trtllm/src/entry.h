@@ -63,15 +63,16 @@ static_assert(offsetof(uniserve_route_gemm_nvfp4_call, dtype) == 176);
 static_assert(offsetof(uniserve_route_gemm_nvfp4_call, error) == 184);
 static_assert(sizeof(uniserve_route_gemm_nvfp4_call) == 696);
 
-// The operator crate's `DType::as_i64()` numbering, for the types this entry names. The order is
-// `crates/ops/src/tensor.rs`'s declaration: U8 0, I32 1, I64 2, F16 3, BF16 4, F32 5, F8E4M3 6,
-// F4E2M1 7, I16 8. A hand copy of an enum drifts, which is why the entry's first act is to refuse a
-// `dtype` that is not the one it was compiled for - a drift then costs a run and names itself here
-// rather than producing a silently wrong product.
+// The operator crate's package ABI numbering (`ops::abi::code`), for the types this entry names.
+// The numbers are the table at the top of `crates/ops/src/abi.rs`: U8 0, I32 1, I64 2, F16 3,
+// BF16 4, F32 5, F8E4M3 6, F4 (E2M1) 7, I16 8, U32 9, F64 10. A hand copy of an enum drifts,
+// which is why the entry's first act is to refuse a `dtype` that is not the one it was compiled
+// for - a drift then costs a run and names itself here rather than producing a silently wrong
+// product.
 constexpr int64_t uniserve_dtype_bf16 = 4;
 constexpr int64_t uniserve_dtype_e2m1 = 7;
 
-// One launch. `stream` is the CUstream of the device the executor drives; the entry
+// One launch. `stream` is the CUstream of the device the worker drives; the entry
 // asks the device its own answers (its id, the tactic's scratch requirement) rather
 // than being handed them, so a call is a description of the problem and nothing else.
 extern "C" int uniserve_route_gemm_nvfp4(uniserve_route_gemm_nvfp4_call* call, void* stream);

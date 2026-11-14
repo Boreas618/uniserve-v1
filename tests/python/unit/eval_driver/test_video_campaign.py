@@ -127,7 +127,7 @@ def form_fields(request):
 
 
 def decoded(width=1344, height=768, frames=124, audio_samples=None):
-    """A decoded output with the H3 media contract at the given shape."""
+    """A decoded output with the H3 media format at the given shape."""
     return DecodedVideo(
         data=b"",
         sha256="",

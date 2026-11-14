@@ -6,7 +6,7 @@ step is scalar arithmetic per element, so it can be checked here:
 
     target ← β · target + α · source
 
-Two cases carry the operator's contract: with β = 0 and α = 1 it is a copy (bit-exact when the
+Two cases carry the operator's exact results: with β = 0 and α = 1 it is a copy (bit-exact when the
 element types agree), and with β = 1 and α = 0 it is the identity. A general pair of coefficients
 is compared in FP32 with the operator's tolerance, which is `2u(target) + u(source)` relative —
 the tolerance a narrowing store costs.

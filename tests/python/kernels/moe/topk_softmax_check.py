@@ -13,8 +13,8 @@ last is the expert map, which the operator passes null without one. A module bui
 descriptor is refused here, which is the observable form of the kernel's `__trap()`.
 
 The module's own descriptor key states what it was built for, so `--module` alone is enough:
-`experts`, `top`, the scores' storage and the renormalization flag are derived from the last path
-component and the flags stay as overrides. The run prints what it derived.
+`experts`, `top`, the scores' storage and the renormalization flag are derived from the module
+directory's name and the flags stay as overrides. The run prints what it derived.
 
 **The rule it pins.** The scores are a softmax over the vocabulary, and the picks are the top
 `top` of it, descending, **equal probabilities in ascending expert id** — the kernel compares
@@ -75,7 +75,7 @@ WARPS_PER_BLOCK = 4
 
 
 def derive(module):
-    """The descriptor a module directory names, from its last path component.
+    """The descriptor a module directory names, from the directory's own name.
 
     A store path ends in the descriptor's key —
     `scores_bf16_experts_128_top_8_renormalize_true_scale_none` — so the run takes the

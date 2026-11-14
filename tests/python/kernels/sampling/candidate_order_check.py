@@ -54,7 +54,7 @@ ROWS = 4
 
 
 def scenario(width, rows, seed, duplicate=False, outside=False):
-    """One scenario's inputs: values and ids, as the planning operator writes them."""
+    """One scenario's inputs: values and ids, as the top-k operator writes them."""
     generator = np.random.default_rng(seed)
     values = generator.random((rows, width), dtype=np.float32)
     ids = generator.permutation(np.arange(width, dtype=np.int32))
@@ -104,7 +104,7 @@ def difference(got_values, got_ids, want_values, want_ids):
                 np.sort(mine), np.sort(theirs), equal_nan=True
             ):
                 # Equal ids are indistinguishable to the draw, so the order of two copies of one id
-                # is not a contract; their values are compared as one group.
+                # is not specified; their values are compared as one group.
                 faults.append(f"row {row}: id {token} carries other values")
     return faults
 
@@ -159,7 +159,7 @@ def run_interpreter(package, key, seed):
         )
         got_ids = torch.full((ROWS, width), -1, dtype=torch.int32)
         # The id space is the row's width, so the `outside` id lies past it. The count plane is
-        # the program's scratch: its contents on entry are not part of the contract.
+        # the program's scratch: its contents on entry are not part of the interface.
         counts = torch.full((ROWS, width), 12345, dtype=torch.int32)
         kernels._candidate_order_kernel[(ROWS,)](
             torch.tensor(values),

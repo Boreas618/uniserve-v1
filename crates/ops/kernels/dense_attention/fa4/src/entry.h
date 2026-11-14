@@ -12,7 +12,7 @@
 
 // One dense attention launch over packed sequences: no cache and no page table, each
 // sequence's rows a contiguous run of the packed tensors. `stream` is the CUstream of
-// the device the executor drives.
+// the device the worker drives.
 //
 // `query` is [q_tokens, q_heads, head_dim], `key` and `value`
 // [kv_tokens, kv_heads, head_dim], `out` [q_tokens, q_heads, head_dim], and the two
@@ -47,7 +47,7 @@ struct uniserve_dense_attention_call {
   char error[512];
 };
 
-// The operator crate's `DType::as_i64()` numbering.
+// The operator crate's package ABI numbering (`ops::abi::code`).
 enum uniserve_dtype : int64_t {
   UNISERVE_DTYPE_U8 = 0,
   UNISERVE_DTYPE_I32 = 1,

@@ -76,7 +76,7 @@ def _candidate_order_kernel(
     #
     #    An id outside ``[0, vocabulary)`` is not a token, and the row's count plane has no slot for
     #    it: counting it would write outside this row's counts, into the next row's or past the
-    #    tensor, and the prefix sum would then rank every candidate after it wrongly. The planning
+    #    tensor, and the prefix sum would then rank every candidate after it wrongly. The top-k
     #    operator's ids are masked to the vocabulary, so such an id is a defect upstream - the
     #    column is skipped here rather than counted at an invented id, and step 5 leaves it out of
     #    the permutation, where the caller's own id check can name it.

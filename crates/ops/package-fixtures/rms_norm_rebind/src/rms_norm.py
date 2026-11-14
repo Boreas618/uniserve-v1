@@ -6,7 +6,7 @@ grid, but the mean square is scaled by the reciprocal of the row width instead
 of divided by it. The result therefore differs from the serving package's in
 its last rounding step and stays inside the operator's tolerance, which is what
 makes installing it a pure rebind: the graph's node is re-pointed at a new
-module and nothing about the plan, the grid or the descriptor changes.
+module and nothing about the launch, the grid or the descriptor changes.
 
 The body below is the serving package's with that one change.
 

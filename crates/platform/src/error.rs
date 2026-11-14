@@ -111,7 +111,7 @@ pub enum Error {
         source: Arc<std::io::Error>,
     },
 
-    /// A caller-supplied value violates the operation's contract.
+    /// A caller-supplied value violates the operation's preconditions.
     #[error("invalid argument: {0}")]
     InvalidArgument(String),
 

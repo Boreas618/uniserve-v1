@@ -10,7 +10,7 @@
 #include <cstdint>
 
 // One FC1 launch. The call struct is the operator's, byte for byte; `stream` is
-// the CUstream of the device the executor drives.
+// the CUstream of the device the worker drives.
 //
 // `hidden` is [tokens, hidden_size], `weights` [experts, 2*intermediate,
 // hidden_size] with each expert's intermediate up rows then its intermediate
@@ -69,7 +69,7 @@ static_assert(offsetof(uniserve_gather_call, error) == 112,
 static_assert(sizeof(uniserve_gather_call) == 624,
               "the call must be the size of the operator's layout");
 
-// The operator crate's `DType::as_i64()` numbering.
+// The operator crate's package ABI numbering (`ops::abi::code`).
 enum uniserve_dtype : int64_t {
   UNISERVE_DTYPE_U8 = 0,
   UNISERVE_DTYPE_I32 = 1,

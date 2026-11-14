@@ -5,7 +5,7 @@
 //! selects the same engine and the same workspace. The grid is the library's.
 //!
 //! An FP32 convolution may allow TF32; that is a descriptor value, because it changes the numerical
-//! contract of the module and therefore its key.
+//! result the module guarantees and therefore its key.
 //!
 //! ```text
 //! conv3d            input [n, c, d, h, w]  weight [k, c/groups, t, h, w]   out [n, k, od, oh, ow]
@@ -54,8 +54,8 @@ pub struct Descriptor {
     /// Whether the tensors are channels-last (NDHWC) rather than channels-first (NCDHW).
     ///
     /// The shapes in the call stay logical (`[n, c, d, h, w]`); the order is the strides the entry
-    /// derives and the plan it selects, not a different compiled module - so, like the filter's window
-    /// and `tf32`, it travels in the call and is not part of the key.
+    /// derives and the cuDNN engine it selects, not a different compiled module - so, like the
+    /// filter's window and `tf32`, it travels in the call and is not part of the key.
     pub channels_last: bool,
     /// The spatial rank: 3 for `conv3d`, 1 for the one-dimensional pair.
     pub rank: u32,

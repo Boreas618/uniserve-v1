@@ -1,12 +1,12 @@
 //! The condition readers against the reference implementations' outputs, and
-//! their refusals of plans the media cannot satisfy.
+//! their refusals of transforms the media cannot satisfy.
 //!
 //! The reference fixtures are generated once per test process by
 //! `tests/fixtures/read/generate.py` in the interpreter
 //! `UNISERVE_REFERENCE_PYTHON` names: the images and tracks as the reference
 //! stack decodes them (Pillow 12.3, PyAV/libavcodec 8.1.2, torchaudio 2.11)
 //! and the reference video as the external `ffmpeg` command decodes it. Each
-//! kind's `cases.txt` names its cases and their plans; every case's expected
+//! kind's `cases.txt` names its cases and their transforms; every case's expected
 //! bytes are beside its media. The comparisons are ignored by default and fail
 //! when requested without the interpreter.
 //!
@@ -32,20 +32,20 @@ fn fixtures() -> PathBuf {
         .to_path_buf()
 }
 
-/// One image case: its plan and the reference's RGB24 rows.
+/// One image case: its transform and the reference's RGB24 rows.
 struct ImageCase {
     name: String,
     media: Vec<u8>,
-    plan: ImageTransform,
+    transform: ImageTransform,
     tolerance: u8,
     expected: Vec<u8>,
 }
 
-/// One audio case: its plan and the reference's `[samples, 2]` floats.
+/// One audio case: its transform and the reference's `[samples, 2]` floats.
 struct AudioCase {
     name: String,
     media: Vec<u8>,
-    plan: AudioTransform,
+    transform: AudioTransform,
     expected: Vec<f32>,
 }
 
@@ -71,7 +71,7 @@ fn image_cases() -> Vec<ImageCase> {
             .collect();
         cases.push(ImageCase {
             media: std::fs::read(directory.join(fields[1])).unwrap(),
-            plan: ImageTransform {
+            transform: ImageTransform {
                 resized: (values[0], values[1]),
                 window: (values[2], values[3], values[4], values[5]),
             },
@@ -97,7 +97,7 @@ fn audio_cases() -> Vec<AudioCase> {
             .collect();
         cases.push(AudioCase {
             media: std::fs::read(directory.join(fields[1])).unwrap(),
-            plan: AudioTransform {
+            transform: AudioTransform {
                 native_rate: values[0] as u32,
                 start: values[1],
                 source_samples: values[2],
@@ -129,7 +129,7 @@ fn video_cases() -> Vec<VideoCase> {
                 frame_rate: values[0],
                 canvas: (values[1], values[2]),
                 frames: values[3],
-                // These clips' plans cover every frame they decode.
+                // These clips' pixel rows cover every frame they decode.
                 vae_frames: values[3],
                 start_frame: values[4],
             },
@@ -171,14 +171,14 @@ fn difference(actual: &[u8], expected: &[u8]) -> u8 {
 #[ignore = "requires UNISERVE_REFERENCE_PYTHON: an interpreter with numpy, Pillow, torch and torchaudio"]
 fn images_decode_and_fit_like_pillow() {
     for case in image_cases() {
-        let (left, top, width, height) = case.plan.window;
+        let (left, top, width, height) = case.transform.window;
         assert!(
-            (left + width, top + height) <= case.plan.resized,
+            (left + width, top + height) <= case.transform.resized,
             "image case {} keeps a window outside its raster",
             case.name
         );
         let mut actual = vec![0u8; width as usize * height as usize * 3];
-        read_image(&case.media, &case.plan, &mut actual)
+        read_image(&case.media, &case.transform, &mut actual)
             .unwrap_or_else(|error| panic!("image case {} failed: {error}", case.name));
         assert_eq!(
             actual.len(),
@@ -208,8 +208,8 @@ fn images_decode_and_fit_like_pillow() {
 #[ignore = "requires UNISERVE_REFERENCE_PYTHON: an interpreter with numpy, Pillow, torch and torchaudio"]
 fn audio_decodes_and_resamples_like_the_reference() {
     for case in audio_cases() {
-        let mut actual = vec![0.0f32; case.plan.samples * 2];
-        read_audio(&case.media, &case.plan, &mut actual)
+        let mut actual = vec![0.0f32; case.transform.samples * 2];
+        read_audio(&case.media, &case.transform, &mut actual)
             .unwrap_or_else(|error| panic!("audio case {} failed: {error}", case.name));
         assert_eq!(
             actual.len(),
@@ -256,14 +256,14 @@ fn reference_videos_decode_like_the_reference_command() {
 fn conditions_fill_both_products_from_an_image_and_a_track() {
     let image = &image_cases()[0];
     let audio = &audio_cases()[0];
-    let image_rows = image.plan.window.2 as usize * image.plan.window.3 as usize;
-    let audio_rows = audio.plan.samples;
+    let image_rows = image.transform.window.2 as usize * image.transform.window.3 as usize;
+    let audio_rows = audio.transform.samples;
     let mut pixels = vec![0u8; image_rows * 3];
     let mut samples = vec![0.0f32; audio_rows * 2];
     let conditions = [
         ConditionRead {
             source: ConditionSource::Bytes(&image.media),
-            image: Some(image.plan),
+            image: Some(image.transform),
             video: None,
             audio: None,
             pixels: 0..image_rows,
@@ -273,7 +273,7 @@ fn conditions_fill_both_products_from_an_image_and_a_track() {
             source: ConditionSource::Bytes(&audio.media),
             image: None,
             video: None,
-            audio: Some(audio.plan),
+            audio: Some(audio.transform),
             pixels: 0..0,
             samples: 0..audio_rows,
         },
@@ -308,7 +308,7 @@ fn conditions_take_a_reference_video_and_an_image_into_one_product() {
     let image = &image_cases()[1];
     let video_rows =
         video.clip.frames as usize * video.clip.canvas.0 as usize * video.clip.canvas.1 as usize;
-    let image_rows = image.plan.window.2 as usize * image.plan.window.3 as usize;
+    let image_rows = image.transform.window.2 as usize * image.transform.window.3 as usize;
     let file = std::fs::File::open(&video.file).unwrap();
     let mut pixels = vec![0u8; (video_rows + image_rows) * 3];
     let conditions = [
@@ -322,7 +322,7 @@ fn conditions_take_a_reference_video_and_an_image_into_one_product() {
         },
         ConditionRead {
             source: ConditionSource::Bytes(&image.media),
-            image: Some(image.plan),
+            image: Some(image.transform),
             video: None,
             audio: None,
             pixels: video_rows..video_rows + image_rows,
@@ -394,7 +394,7 @@ fn conditions_read_a_reference_videos_soundtrack_from_its_file() {
         .split_whitespace()
         .map(|value| value.parse().unwrap())
         .collect();
-    let plan = AudioTransform {
+    let transform = AudioTransform {
         native_rate: values[0] as u32,
         start: values[1],
         source_samples: values[2],
@@ -406,16 +406,16 @@ fn conditions_read_a_reference_videos_soundtrack_from_its_file() {
     let rows = case.clip.vae_frames as usize * area;
     let file = std::fs::File::open(&case.file).unwrap();
     let mut pixels = vec![0u8; rows * 3];
-    let mut samples = vec![0.0f32; plan.samples * 2];
+    let mut samples = vec![0.0f32; transform.samples * 2];
     let decoded = read_conditions(
         &ffmpeg(),
         &[ConditionRead {
             source: ConditionSource::File(&file),
             image: None,
             video: Some(case.clip),
-            audio: Some(plan),
+            audio: Some(transform),
             pixels: 0..rows,
-            samples: 0..plan.samples,
+            samples: 0..transform.samples,
         }],
         &mut ConditionProducts {
             pixels: Some(&mut pixels),
@@ -454,7 +454,7 @@ fn synthetic_png(width: u32, height: u32) -> Vec<u8> {
     encoded.into_inner()
 }
 
-/// The plan that reads [`synthetic_png`]`(16, 12)` at its own raster.
+/// The transform that reads [`synthetic_png`]`(16, 12)` at its own raster.
 const IMAGE: ImageTransform = ImageTransform {
     resized: (16, 12),
     window: (0, 0, 16, 12),
@@ -502,7 +502,7 @@ fn synthetic_wav(rate: u32, samples: usize) -> Vec<u8> {
     wav
 }
 
-/// The plan that keeps 800 samples of [`synthetic_wav`]`(44_100, 1_000)` from
+/// The transform that keeps 800 samples of [`synthetic_wav`]`(44_100, 1_000)` from
 /// sample 100 and brings them to 16 kHz: `ceil(16000 * 800 / 44100)` samples.
 const AUDIO: AudioTransform = AudioTransform {
     native_rate: 44_100,
@@ -551,12 +551,12 @@ fn clip_bytes(clip: &VideoClip) -> usize {
 fn images_refuse_a_product_of_another_extent() {
     let media = synthetic_png(16, 12);
     let mut full = vec![0u8; IMAGE_ROWS * 3];
-    read_image(&media, &IMAGE, &mut full).expect("the planned extent reads");
+    read_image(&media, &IMAGE, &mut full).expect("the transform's extent reads");
 
     let mut short = vec![0u8; IMAGE_ROWS * 3 - 1];
     assert!(matches!(
         read_image(&media, &IMAGE, &mut short),
-        Err(Error::Plan(_))
+        Err(Error::Invalid(_))
     ));
     // A truncated image fails in its decoder.
     assert!(matches!(
@@ -569,24 +569,24 @@ fn images_refuse_a_product_of_another_extent() {
 fn audio_refuses_a_track_at_another_rate_or_with_fewer_samples() {
     let media = synthetic_wav(44_100, 1_000);
     let mut out = vec![0.0f32; AUDIO.samples * 2];
-    read_audio(&media, &AUDIO, &mut out).expect("the planned track reads");
+    read_audio(&media, &AUDIO, &mut out).expect("the transform's track reads");
 
     let mut other_rate = AUDIO;
     other_rate.native_rate = 48_000;
     assert!(matches!(
         read_audio(&media, &other_rate, &mut out),
-        Err(Error::Plan(_))
+        Err(Error::Invalid(_))
     ));
     let mut too_long = AUDIO;
     too_long.start = 100_000;
     assert!(matches!(
         read_audio(&media, &too_long, &mut out),
-        Err(Error::Plan(_))
+        Err(Error::Invalid(_))
     ));
     let mut short = vec![0.0f32; AUDIO.samples * 2 - 1];
     assert!(matches!(
         read_audio(&media, &AUDIO, &mut short),
-        Err(Error::Plan(_))
+        Err(Error::Invalid(_))
     ));
 }
 
@@ -594,21 +594,21 @@ fn audio_refuses_a_track_at_another_rate_or_with_fewer_samples() {
 fn reference_videos_refuse_a_clip_the_video_does_not_hold() {
     let file = synthetic_video();
     let mut out = vec![0u8; clip_bytes(&VIDEO)];
-    read_video(&ffmpeg(), &file, &VIDEO, &mut out).expect("the planned clip decodes");
+    read_video(&ffmpeg(), &file, &VIDEO, &mut out).expect("the clip decodes");
 
     // The video holds fewer frames after the start than the clip asks for.
     let mut beyond = VIDEO;
     beyond.start_frame = 2;
     assert!(matches!(
         read_video(&ffmpeg(), &file, &beyond, &mut out),
-        Err(Error::Plan(_))
+        Err(Error::Invalid(_))
     ));
-    // A plan whose rows disagree with the decoded frames is refused.
+    // A clip whose rows disagree with the decoded frames is refused.
     let mut wider = VIDEO;
     wider.canvas = (VIDEO.canvas.0 + 1, VIDEO.canvas.1);
     assert!(matches!(
         read_video(&ffmpeg(), &file, &wider, &mut out),
-        Err(Error::Plan(_))
+        Err(Error::Invalid(_))
     ));
     // A source that is not a video fails through FFmpeg's own error.
     let mut bogus = tempfile::tempfile().expect("a scratch file");
@@ -644,13 +644,13 @@ fn conditions_refuse_an_encoded_prefix_longer_than_the_decoded_clip() {
                 samples: None,
             },
         ),
-        Err(Error::Plan(_))
+        Err(Error::Invalid(_))
     ));
 }
 
 #[test]
-fn readers_refuse_a_plan_the_host_cannot_address() {
-    // A plan comes from a peer: an extent whose byte count overflows must fail
+fn readers_refuse_a_transform_the_host_cannot_address() {
+    // A transform comes from a peer: an extent whose byte count overflows must fail
     // the request instead of panicking in the arithmetic that sizes buffers.
     let huge = ImageTransform {
         resized: (u32::MAX, u32::MAX),
@@ -659,19 +659,19 @@ fn readers_refuse_a_plan_the_host_cannot_address() {
     let mut empty = Vec::new();
     assert!(matches!(
         read_image(&synthetic_png(16, 12), &huge, &mut empty),
-        Err(Error::Plan(_))
+        Err(Error::Invalid(_))
     ));
 
-    let mut samples_plan = AUDIO;
-    samples_plan.samples = usize::MAX;
+    let mut samples_transform = AUDIO;
+    samples_transform.samples = usize::MAX;
     let mut no_samples = Vec::new();
     assert!(matches!(
         read_audio(
             &synthetic_wav(44_100, 1_000),
-            &samples_plan,
+            &samples_transform,
             &mut no_samples
         ),
-        Err(Error::Plan(_))
+        Err(Error::Invalid(_))
     ));
 
     let file = synthetic_video();
@@ -682,10 +682,10 @@ fn readers_refuse_a_plan_the_host_cannot_address() {
     let mut no_frames = Vec::new();
     assert!(matches!(
         read_video(&ffmpeg(), &file, &clip, &mut no_frames),
-        Err(Error::Plan(_))
+        Err(Error::Invalid(_))
     ));
 
-    // The same plan is refused before any buffer is sized for it, even when
+    // The same clip is refused before any buffer is sized for it, even when
     // the request holds no products.
     let rows = clip.vae_frames as usize;
     assert!(matches!(
@@ -704,7 +704,7 @@ fn readers_refuse_a_plan_the_host_cannot_address() {
                 samples: None,
             },
         ),
-        Err(Error::Plan(_))
+        Err(Error::Invalid(_))
     ));
 }
 
@@ -724,29 +724,29 @@ fn conditions_refuse_rows_that_do_not_fill_their_products() {
     };
     let conditions = [image_condition(&media, 0..rows)];
 
-    // The product the plan fills exactly is filled.
+    // The product the transform fills exactly is filled.
     let mut exact = vec![0u8; rows * 3];
-    read(&conditions, Some(&mut exact)).expect("the planned product fills");
+    read(&conditions, Some(&mut exact)).expect("the exactly sized product fills");
 
     // A product with one row too many is left unfilled.
     let mut wide = vec![0u8; (rows + 1) * 3];
     assert!(matches!(
         read(&conditions, Some(&mut wide)),
-        Err(Error::Plan(_))
+        Err(Error::Invalid(_))
     ));
     // A product without room for every row is exceeded.
     let mut narrow = vec![0u8; (rows - 1) * 3];
     assert!(matches!(
         read(&conditions, Some(&mut narrow)),
-        Err(Error::Plan(_))
+        Err(Error::Invalid(_))
     ));
     // A condition that needs a product the request does not hold.
-    assert!(matches!(read(&conditions, None), Err(Error::Plan(_))));
-    // Declared rows that disagree with the plan are refused before decoding.
+    assert!(matches!(read(&conditions, None), Err(Error::Invalid(_))));
+    // Declared rows that disagree with the transform are refused before decoding.
     let mut roomy = vec![0u8; (rows + 1) * 3];
     assert!(matches!(
         read(&[image_condition(&media, 0..rows + 1)], Some(&mut roomy)),
-        Err(Error::Plan(_))
+        Err(Error::Invalid(_))
     ));
     // Two conditions that claim the same rows cannot both own them.
     let overlapping = [
@@ -756,6 +756,6 @@ fn conditions_refuse_rows_that_do_not_fill_their_products() {
     let mut product = vec![0u8; 2 * rows * 3];
     assert!(matches!(
         read(&overlapping, Some(&mut product)),
-        Err(Error::Plan(_))
+        Err(Error::Invalid(_))
     ));
 }

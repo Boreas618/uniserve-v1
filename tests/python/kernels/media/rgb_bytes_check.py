@@ -18,7 +18,7 @@ element farther than a part in ten thousand from a half-integer must match
 operator's own `Tolerance::new(1.0, 0.0)`. The band and its count are printed,
 so a failure says which side it came from.
 
-Two layouts are checked, because the operator's contract allows both: the
+Two layouts are checked, because the operator's interface allows both: the
 packed raster, and a tile written into a sub-region of a larger, strided canvas
 with a strided read side, which is what the decoder does with each decoded
 tile.

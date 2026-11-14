@@ -208,8 +208,9 @@ int launch(uniserve_route_gemm_nvfp4_call* call, void* stream) {
     return refuse(call, "no compiled tactic serves this problem's shape");
   }
   // The arming: the artifact's own requirement for the chosen tactic, plus the device word
-  // this entry owns (the padded route count). A buffer shorter than that is refused with both numbers -- the plan sizes it, and a step
-  // that grows one is a host allocation inside a captured graph.
+  // this entry owns (the padded route count). A buffer shorter than that is refused with both
+  // numbers -- the caller sizes it from the bucket's route count (`nn::functional::moe`), and a
+  // step that grows one is a host allocation inside a captured graph.
   size_t const required = product.getWorkspaceSizeInBytes(top_k, hidden, intermediate, experts,
                                                           routes, config);
   // The scratch the entry owns: the padded route count (one i32), then the tactic's own. No
@@ -221,7 +222,7 @@ int launch(uniserve_route_gemm_nvfp4_call* call, void* stream) {
     char message[512];
     std::snprintf(message, sizeof(message),
                   "the product's tactic needs %zu bytes of scratch and the step provided %lld: the "
-                  "plan sizes this buffer, and the entry never grows one",
+                  "caller sizes this buffer, and the entry never grows one",
                   needed, static_cast<long long>(call->workspace_bytes));
     return refuse(call, message);
   }

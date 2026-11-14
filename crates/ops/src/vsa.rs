@@ -1045,7 +1045,7 @@ const POOLED_QUERIES: u64 = 16;
 /// The pooled (query tile, key tile) similarities VSA's selection ranks.
 ///
 /// This is the step between pooling and selection: `vsa_prepare_tiles` pools each tile's per-head
-/// means, `vsa_scores` contracts them per head, and `vsa_select_tiles` ranks the result. Without it
+/// means, `vsa_scores` multiplies them per head, and `vsa_select_tiles` ranks the result. Without it
 /// the sparse path has no scores, and nothing else fills the gap: `gemm` has no batch axis, and the
 /// contraction is per head.
 ///
@@ -1096,7 +1096,7 @@ impl Op for VsaScores {
         args.pooled_key.require_rank(Self::NAME, 3)?;
         // A tile's pooled row is `[heads, width]` and the tile is its leading axis, so both operands
         // carry the same two inner extents; a view whose planes are another head count or another
-        // width would contract against the wrong operands and produce plausible scores.
+        // width would be reduced against the wrong operands and produce plausible scores.
         for (name, view) in [("query", &args.pooled_query), ("key", &args.pooled_key)] {
             if view.dim(1) != heads || view.dim(2) != width {
                 return Err(Error::argument(

@@ -126,8 +126,8 @@ pub fn precompile(wasm: &[u8]) -> Result<Vec<u8>, PolicyError> {
 ///
 /// # Errors
 ///
-/// [`PolicyError::Load`] when the host has no policy engine, or the bytes are a component, an
-/// artifact of another engine or configuration, or no module at all.
+/// [`PolicyError::Load`] when the host has no policy engine, or the bytes are not a core wasm
+/// module: an artifact of another kind, engine or configuration, or no module at all.
 pub fn load(bytes: &[u8]) -> Result<Module, PolicyError> {
     let runtime = runtime()?;
     match wasmtime::Engine::detect_precompiled(bytes) {
@@ -220,7 +220,7 @@ pub(crate) struct Policy {
 /// instance.
 #[derive(Debug)]
 pub enum PolicyError {
-    /// The module's bytes were rejected: not a wasm32 module, a component, an artifact
+    /// The module's bytes were rejected: not a core wasm32 module, or an artifact
     /// precompiled for another engine or configuration; or this host has no engine to compile
     /// them with.
     Load(String),

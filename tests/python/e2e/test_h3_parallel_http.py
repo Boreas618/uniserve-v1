@@ -1,4 +1,4 @@
-"""Complete media and cancellation across statically assigned H3 components."""
+"""Complete media and cancellation across statically assigned H3 blocks."""
 
 from __future__ import annotations
 
@@ -112,7 +112,7 @@ FOUR_RANK_PARALLEL_CONFIGS = {
     "pipeline4": {"pipeline_parallel_size": 4},
 }
 
-# Eight-rank layouts place every numerical component on all eight devices,
+# Eight-rank layouts place every numerical block on all eight devices,
 # which is how an eight-device host, or two hosts of four, serve.
 EIGHT_RANK_PARALLEL_CONFIGS = {
     "ulysses8": {
@@ -170,7 +170,7 @@ CROSSING = re.compile(
 
 
 def _eight_rank_worker_config(parallel_kind: str) -> dict:
-    """Place an eight-rank layout's components on all eight devices."""
+    """Place an eight-rank layout's blocks on all eight devices."""
     ranks = list(range(8))
     return {
         "devices": ranks,
@@ -227,13 +227,13 @@ def _assert_refused_across_hosts(
             *EIGHT_RANK_PARALLEL_CONFIGS,
         )
     ]
-    # A worker group per component carries every product edge between
+    # A worker group per block carries every product edge between
     # groups. The Ulysses-4 deployment admits one request: the worker's two
     # state slots follow its queue depth, not the number of admitted
     # requests, so one admitted request still leaves two.
     + [("ulysses4", "split", 1), ("tensor2_ulysses4", "split", 2)],
 )
-def test_component_bindings_release_cancelled_requests(
+def test_block_bindings_release_cancelled_requests(
     tmp_path: Path,
     parallel_kind: str,
     grouping: str,
@@ -321,7 +321,7 @@ def test_component_bindings_release_cancelled_requests(
             return f"cuda:{device}"
         return f"rank-1/cuda:{device - local_devices}"
 
-    # The media components encode and assemble on the host inside the main
+    # The media blocks encode and assemble on the host inside the main
     # process, which serves CUDA devices only, so they are placed on CUDA
     # ranks as the deployment files of `configs/minimax_h3` place them: each
     # decoded unit's codec slot on its decoder's rank, and the muxer and the
@@ -344,7 +344,7 @@ def test_component_bindings_release_cancelled_requests(
             {rank for name in names for rank in worker_config[name]["ranks"]}
         )
         worker_id = names[0]
-        components = {
+        blocks = {
             name: {
                 "ranks": [
                     members.index(rank) for rank in worker_config[name]["ranks"]
@@ -358,7 +358,7 @@ def test_component_bindings_release_cancelled_requests(
                 "id": worker_id,
                 "ranks": [place(devices[rank]) for rank in members],
                 "queue_depth": 6,
-                "blocks": components,
+                "blocks": blocks,
             }
         )
     command = [
@@ -423,7 +423,7 @@ def test_component_bindings_release_cancelled_requests(
         )
         prompt = MiniMaxH3Dataset(case).load(tokenizer)[0].prompt
         payloads.append(t2va_request("MiniMax-H3", prompt, frames, 1000))
-    log = tmp_path / "h3-components.log"
+    log = tmp_path / "h3-blocks.log"
     environment = {
         "CUDA_VISIBLE_DEVICES": ",".join(
             leased[: min(visible_devices, local_devices)]
@@ -585,7 +585,7 @@ def test_video_jobs_retain_content_and_cancel_active_work(
     """Exercise async ownership and reuse through the HTTP interface.
 
     The exercise runs on the documented four-device deployment, whose
-    components, the media ones included, share one worker group.
+    blocks, the media ones included, share one worker group.
     """
     import time
 

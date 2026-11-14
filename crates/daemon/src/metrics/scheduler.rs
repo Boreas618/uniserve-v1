@@ -45,7 +45,7 @@ pub struct EngineModeLabels {
     pub mode: String,
 }
 
-/// Labels identifying one component of the fence probes' step durations.
+/// Labels identifying one module class of the fence probes' step durations.
 #[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
 pub struct EngineFenceLabels {
     /// Served model identity.
@@ -54,8 +54,9 @@ pub struct EngineFenceLabels {
     pub engine: u32,
     /// The steps' stage: their call kind, such as `prefill` or `decode`.
     pub stage: String,
-    /// The component (`<component>` of its declared function), or `step`
-    /// for the step's span between its markers.
+    /// The module class (the name its modules give their profiler range),
+    /// or `step` for the step's span between its markers. The label keeps
+    /// its exported name, `component`.
     pub component: String,
 }
 
@@ -213,7 +214,7 @@ pub struct SchedulerMetrics {
     pub worker_stream_us: Family<EngineStreamLabels, U64Counter>,
     /// Worker driver calls that waited for the device, by thread and call.
     pub worker_blocking_calls: Family<EngineBlockingLabels, U64Counter>,
-    /// Fence probe step durations by stage and component.
+    /// Fence probe step durations by stage and module class.
     pub worker_fence_step_seconds: Family<EngineFenceLabels, super::CountedHistogram>,
     /// Fence probe records the workers lost.
     pub worker_fence_records_lost: Family<EngineLabels, U64Counter>,
@@ -486,9 +487,9 @@ impl SchedulerMetrics {
             Default::default();
         registry.register(
             "uniserve:worker_fence_step_seconds",
-            "Per-step durations from the workers' fence probes, by stage and component: a \
-             step's summed durations of the component's probed module instances, or the step's \
-             span between its markers for component `step`, measured on the device.",
+            "Per-step durations from the workers' fence probes, by stage and module class \
+             (component): a step's summed durations of the class's probed module instances, or \
+             the step's span between its markers for component `step`, measured on the device.",
             worker_fence_step_seconds.clone(),
         );
         let worker_fence_records_lost: Family<EngineLabels, U64Counter> = Default::default();

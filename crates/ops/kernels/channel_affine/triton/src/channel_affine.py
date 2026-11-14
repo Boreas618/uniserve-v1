@@ -9,10 +9,10 @@ channel. A latent restore (``latents * std + mean``) is this map with the channe
 caller folds the axes before the channel into ``batch`` and the ones after it into ``positions``.
 
 **Two roundings, never one.** The reference multiplies and then adds as two tensor operations, so
-the product rounds to FP32 before the shift is added. Triton contracts ``a * b + c`` into a fused
+the product rounds to FP32 before the shift is added. Triton turns ``a * b + c`` into a fused
 multiply-add by default, which rounds once and differs in the last bit; the product and the sum
 here are each one ``mul.rn.f32`` and ``add.rn.f32`` through inline assembly, which the compiler
-cannot contract, and the store rounds once more into the output's element type.
+cannot fuse, and the store rounds once more into the output's element type.
 
 One element of ``out`` per thread; a flat index gives the element's channel.
 """

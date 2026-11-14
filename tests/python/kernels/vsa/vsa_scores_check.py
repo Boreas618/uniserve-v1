@@ -3,7 +3,7 @@
 
 The kernel is a per-head contraction, so its arithmetic is checkable without a device: Triton's
 interpreter executes the kernel body with numpy-backed tensors, one program at a time, and the
-result is compared with the operator's definition from ``crates/ops/src/segments.rs`` — one dot
+result is compared with the operator's definition (``VsaScores`` in ``crates/ops/src/vsa.rs``) — one dot
 product per (head, query tile, key tile) over the pooled rows, accumulated in FP32 and scaled, with
 no softmax, over operands in the layout the pooling writes:
 
@@ -53,7 +53,7 @@ def gamma(reduction, unit=UNIT_ROUNDOFF):
 
 
 def declared_bound(width):
-    """``Tolerance::dot(width, f32, f32)``'s ``rtol``, as ``segments.rs`` declares it."""
+    """``Tolerance::dot(width, f32, f32)``'s ``rtol``, as ``VsaScores::tolerance`` declares it."""
     return 2.0 * gamma(width) * width**0.5 + UNIT_ROUNDOFF
 
 
@@ -67,7 +67,7 @@ def load_kernel(package):
 
 
 def run(module, *, heads, width, block, query_tiles, key_tiles, seed=23):
-    """Contract one pair of pooled tilings and compare with the operator's product."""
+    """Multiply one pair of pooled tilings and compare with the operator's product."""
     torch.manual_seed(seed)
     # Both operands are FP32: that is the type `vsa_prepare_tiles` pools a tile's per-head means
     # in, and the operator refuses anything else, so there is no element type to vary here.

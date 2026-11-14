@@ -66,7 +66,7 @@ KEY_BUMP_0, KEY_BUMP_1 = 0x9E3779B9, 0xBB67AE85
 MASK32 = 0xFFFFFFFF
 UNIFORM_SCALE = np.float32(1.0 / 16_777_216.0)
 
-#: Unit roundoff of the dtypes the operator can name (``DType::unit_roundoff``).
+#: Unit roundoff of the dtypes the operator can name (``ops::tolerance::unit_roundoff``).
 UNIT_ROUNDOFF = {"f16": 2.0**-11, "bf16": 2.0**-9, "f32": 2.0**-24}
 
 

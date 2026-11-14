@@ -3,8 +3,12 @@
 
 A weight that is all zero does not fail: a projection built from it answers zeros for every
 activation, so the model runs and produces a row of zeros that reads like a kernel fault far from the
-loading boundary. The packed path refuses this at load already (`crates/nn/src/weights.rs`: "every
-packed E4M1 byte is zero"), and this script answers the same question about the *file*, for every
+loading boundary. The load refuses two such cases by name. A matrix that multiplies the hidden state
+is loaded asking for a value (`nonzero`, `crates/nn/src/weights.rs`), and a rank's region of it whose
+stored bytes are all zero, read before any conversion, is refused ("every stored byte of the region
+is zero"); a packed NVFP4 weight is refused when every packed E2M1 byte or every E4M3 block scale is
+zero (`crates/nn/src/quantization/nvfp4.rs`). Both compare bytes with zero, so a region of `-0.0`
+passes them. This script answers the same question about the *file*, for every tensor and
 representation, without a device - which is the half a load-time refusal cannot report: whether the
 zeros are in the checkpoint or were made by the loader.
 
@@ -23,7 +27,7 @@ to know (`safetensors` states it, and an unknown one is skipped by name rather t
 
 Bfloat16, float16, float32, float8 and integer tensors are all read as fixed-width unsigned words,
 one width per dtype, so nothing is converted. A `F4` (packed E2M1) tensor is a byte of two codes and
-is scanned as bytes, which answers "every byte zero" - the packed path's own test.
+is scanned as bytes, which answers "every byte zero" - the packed load's own test.
 
 `--values` answers the other question a zero count cannot: **what a tensor holds**. A calibration
 scalar is one element and is never zero, so the scan above passes it, while its magnitude is what

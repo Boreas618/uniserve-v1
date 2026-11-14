@@ -5,8 +5,8 @@ use std::path::Path;
 /// Every checked-in deployment file parses, places and validates, and places no rank on a CPU,
 /// which a node refuses: a main process serves CUDA devices.
 ///
-/// It also holds each file to the resolver's own rules - a component's membership equals its
-/// tensor, sequence and pipeline degrees, a distributed component's degrees are one, every
+/// It also holds each file to the resolver's own rules - a block's membership equals its
+/// tensor, sequence and pipeline degrees, a distributed block's degrees are one, every
 /// group's queue depth is positive - because a page that violates one of them parses and then
 /// fails on the node that reads it.
 #[test]

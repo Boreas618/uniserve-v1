@@ -467,11 +467,11 @@ pub struct NativeEntry {
 impl NativeEntry {
     /// Resolve `name` in `library` as an [`Entry`].
     ///
-    /// The entry's signature is the package's contract with `ops`: `int32_t entry(const void* call,
+    /// The entry's signature is the package's interface with `ops`: `int32_t entry(const void* call,
     /// void* stream)`, the call structure being the operator's own `#[repr(C)]` type.
     pub fn resolve(library: &NativeLibrary, name: &'static str) -> Result<Self> {
         // SAFETY: the convention every package follows is exactly `Entry`; a package that declares
-        // another signature for its entry name breaks this contract, which its header states.
+        // another signature for its entry name breaks this interface, which its header states.
         let function = unsafe { library.entry::<Entry>(name)? };
         Ok(Self { name, function })
     }

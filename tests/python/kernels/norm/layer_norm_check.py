@@ -47,7 +47,7 @@ sys.path.insert(0, str(PACKAGE / "src"))
 #: The relative bound's reduction length, from `norm.rs::tolerance`: two sums over the row.
 REDUCTIONS = 2
 
-#: The output types' unit roundoff, as `DType::unit_roundoff` gives it.
+#: The output types' unit roundoff, as `ops::tolerance::unit_roundoff` gives it.
 UNIT_ROUNDOFF = {"f16": 2.0**-11, "bf16": 2.0**-8, "f32": 2.0**-24}
 
 TORCH_TYPES = {

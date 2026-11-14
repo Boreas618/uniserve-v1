@@ -1,6 +1,6 @@
 //! What a rank states of its worker group once its workers are ready: the group's [`Capacity`]
-//! (`specs/scheduler-design.md` §2.1), which the scheduler that drives the group plans against
-//! (`specs/engine-worker-port.md` §1.2).
+//! (`specs/scheduler-design.md` §2.1), which the scheduler that drives the group sizes its
+//! batches by (`specs/engine-worker-port.md` §1.2).
 
 use crate::batch::Capacity;
 use crate::batch::Phase;

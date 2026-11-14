@@ -28,7 +28,7 @@
 """NVFP4 dense product: the CuTe DSL source of the ``nvfp4_gemm`` operator.
 
 The kernel is CUTLASS's block-scaled dense GEMM for Blackwell: one CTA computes a
-128x256 tile of the product over packed E2M1 operands, contracting whole 256
+128x256 tile of the product over packed E2M1 operands, reducing over whole 256
 element steps with the tensor-core FP4 instructions, and the epilogue applies the
 call's alpha (the product of the two tensor scales, a device value the kernel
 reads) in FP32 before the one rounding that writes the tile.

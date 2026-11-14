@@ -3,7 +3,7 @@
 // Expert routing: softmax over each token's router scores, the top-k experts,
 // optional renormalization and an optional per-expert scale.
 //
-// The operator `topk_softmax` documents the contract, and the numbers are the
+// The operator `topk_softmax` documents the arithmetic, and the numbers are the
 // ones UniServe's tensor composition defined. One warp owns one token and
 // reproduces that composition's FP32 arithmetic order:
 //

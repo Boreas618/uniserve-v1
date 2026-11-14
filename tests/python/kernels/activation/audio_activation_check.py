@@ -42,7 +42,7 @@ BETA_FLOOR = 1e-9
 
 
 def reference(values, alpha, beta, filter_up, filter_down, kernel, ratio):
-    """The five stages, unfused, as `crates/ops/src/audio_activation.rs` describes them."""
+    """The five stages, unfused, as `crates/ops/src/activation1d.rs` describes them."""
     channels, length = values.shape
     pad = kernel // ratio - 1
     crop = (3 * (kernel - ratio)) // 2

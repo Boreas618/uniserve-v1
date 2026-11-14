@@ -67,13 +67,13 @@ pub fn require_codecs() -> crate::Result<()> {
 ///
 /// # Errors
 ///
-/// [`crate::Error::Plan`] when the frames hold no frame, are not exactly
+/// [`crate::Error::Invalid`] when the frames hold no frame, are not exactly
 /// `height * width * 3` bytes per frame, or the frame rate is not positive;
 /// [`crate::Error::Codec`] when the encoder or muxer fails.
 pub fn encode_video_unit(frames: Rgb24Frames<'_>, frame_rate: u32) -> crate::Result<Vec<u8>> {
     let count = frames.frames();
     if frames.height == 0 || frames.width == 0 || count < 1 {
-        return Err(crate::Error::plan(
+        return Err(crate::Error::invalid(
             "video capture has invalid RGB24 dimensions",
         ));
     }
@@ -82,12 +82,12 @@ pub fn encode_video_unit(frames: Rgb24Frames<'_>, frame_rate: u32) -> crate::Res
         || frames.width > i32::MAX as u32
         || frames.height > i32::MAX as u32
     {
-        return Err(crate::Error::plan(
+        return Err(crate::Error::invalid(
             "video capture has invalid RGB24 dimensions",
         ));
     }
     if frame_rate < 1 || frame_rate > i32::MAX as u32 {
-        return Err(crate::Error::plan(
+        return Err(crate::Error::invalid(
             "video frame rate must be a positive integer",
         ));
     }
@@ -109,17 +109,17 @@ pub fn encode_video_unit(frames: Rgb24Frames<'_>, frame_rate: u32) -> crate::Res
 ///
 /// # Errors
 ///
-/// [`crate::Error::Plan`] when `pcm` is not a whole number of stereo pairs,
+/// [`crate::Error::Invalid`] when `pcm` is not a whole number of stereo pairs,
 /// `samples` or `rate` are not positive; [`crate::Error::Codec`] when the
 /// encoder or muxer fails.
 pub fn encode_audio_track(pcm: &[i16], samples: usize, rate: u32) -> crate::Result<Vec<u8>> {
     if !pcm.len().is_multiple_of(2) {
-        return Err(crate::Error::plan(
+        return Err(crate::Error::invalid(
             "audio capture has invalid stereo dimensions",
         ));
     }
     if samples < 1 || rate < 1 || samples > i32::MAX as usize || rate > i32::MAX as u32 {
-        return Err(crate::Error::plan(
+        return Err(crate::Error::invalid(
             "audio track length and rate must be positive",
         ));
     }
@@ -172,11 +172,11 @@ pub fn encoded_unit_bytes(frames: u32, height: u32, width: u32) -> usize {
 ///
 /// # Errors
 ///
-/// [`crate::Error::Plan`] when the payload does not fit the row.
+/// [`crate::Error::Invalid`] when the payload does not fit the row.
 pub fn frame_unit(payload: &[u8], row: &mut [u8]) -> crate::Result<usize> {
     let capacity = row.len().saturating_sub(size_of::<u64>());
     if row.len() < size_of::<u64>() || payload.len() > capacity {
-        return Err(crate::Error::plan(format!(
+        return Err(crate::Error::invalid(format!(
             "encoded media unit of {} bytes exceeds the {} bytes reserved for it",
             payload.len(),
             capacity
@@ -192,23 +192,23 @@ pub fn frame_unit(payload: &[u8], row: &mut [u8]) -> crate::Result<usize> {
 ///
 /// # Errors
 ///
-/// [`crate::Error::Plan`] when the row has no length prefix or names an
+/// [`crate::Error::Invalid`] when the row has no length prefix or names an
 /// invalid length.
 pub fn read_unit(row: &[u8]) -> crate::Result<&[u8]> {
     let prefix = row
         .get(..size_of::<u64>())
-        .ok_or_else(|| crate::Error::plan("encoded media unit has no length prefix"))?;
+        .ok_or_else(|| crate::Error::invalid("encoded media unit has no length prefix"))?;
     let Ok(prefix) = <[u8; size_of::<u64>()]>::try_from(prefix) else {
-        return Err(crate::Error::plan(
+        return Err(crate::Error::invalid(
             "encoded media unit has no length prefix",
         ));
     };
     let length = u64::from_ne_bytes(prefix);
     let length = usize::try_from(length)
-        .map_err(|_| crate::Error::plan("encoded media unit names an invalid length"))?;
+        .map_err(|_| crate::Error::invalid("encoded media unit names an invalid length"))?;
     let body = &row[size_of::<u64>()..];
     if length > body.len() {
-        return Err(crate::Error::plan(
+        return Err(crate::Error::invalid(
             "encoded media unit names an invalid length",
         ));
     }
@@ -284,19 +284,22 @@ mod tests {
         let mut row = vec![0u8; size_of::<u64>() + 4];
         assert!(matches!(
             frame_unit(&[0u8; 5], &mut row),
-            Err(Error::Plan(_))
+            Err(Error::Invalid(_))
         ));
         assert!(frame_unit(&[0u8; 4], &mut row).is_ok());
         let mut short = vec![0u8; size_of::<u64>() - 1];
-        assert!(matches!(frame_unit(&[], &mut short), Err(Error::Plan(_))));
+        assert!(matches!(
+            frame_unit(&[], &mut short),
+            Err(Error::Invalid(_))
+        ));
     }
 
     #[test]
     fn a_row_without_a_valid_length_is_refused() {
-        assert!(matches!(read_unit(&[0u8; 3]), Err(Error::Plan(_))));
+        assert!(matches!(read_unit(&[0u8; 3]), Err(Error::Invalid(_))));
         let mut row = 9u64.to_ne_bytes().to_vec();
         row.extend_from_slice(&[0u8; 4]);
-        assert!(matches!(read_unit(&row), Err(Error::Plan(_))));
+        assert!(matches!(read_unit(&row), Err(Error::Invalid(_))));
     }
 
     #[test]
@@ -319,7 +322,10 @@ mod tests {
             width: 8,
         };
         assert_eq!(empty.frames(), 0);
-        assert!(matches!(encode_video_unit(empty, 24), Err(Error::Plan(_))));
+        assert!(matches!(
+            encode_video_unit(empty, 24),
+            Err(Error::Invalid(_))
+        ));
 
         let partial = Rgb24Frames {
             pixels: &[0u8; 10],
@@ -328,7 +334,7 @@ mod tests {
         };
         assert!(matches!(
             encode_video_unit(partial, 24),
-            Err(Error::Plan(_))
+            Err(Error::Invalid(_))
         ));
 
         let frame = vec![0u8; 8 * 8 * 3];
@@ -338,19 +344,19 @@ mod tests {
             width: 8,
         };
         assert_eq!(unit.frames(), 1);
-        assert!(matches!(encode_video_unit(unit, 0), Err(Error::Plan(_))));
+        assert!(matches!(encode_video_unit(unit, 0), Err(Error::Invalid(_))));
 
         assert!(matches!(
             encode_audio_track(&[0i16; 3], 1, 32_000),
-            Err(Error::Plan(_))
+            Err(Error::Invalid(_))
         ));
         assert!(matches!(
             encode_audio_track(&[0i16; 2], 0, 32_000),
-            Err(Error::Plan(_))
+            Err(Error::Invalid(_))
         ));
         assert!(matches!(
             encode_audio_track(&[0i16; 2], 1, 0),
-            Err(Error::Plan(_))
+            Err(Error::Invalid(_))
         ));
     }
 }

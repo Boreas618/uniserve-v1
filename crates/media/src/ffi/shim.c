@@ -25,9 +25,9 @@
  * yuv420p conversion uses the dynamic swscale mode PyAV's VideoReformatter
  * uses: a context whose thread count is set before its first frame, driven
  * by `sws_scale_frame`. A nonzero failure code leaves a message in a
- * thread-local buffer that `usv_error` returns; `USV_PLAN` marks a failure of
- * the media rather than of the codec (a unit without video, a track without
- * audio).
+ * thread-local buffer that `usv_error` returns; `USV_INVALID` marks a failure
+ * of the media rather than of the codec (a unit without video, a track
+ * without audio).
  */
 
 #include <libavcodec/avcodec.h>
@@ -53,9 +53,9 @@
 #define USV_OK 0
 #define USV_ERROR (-1)
 /* A failure of the media itself rather than of the codec: a unit without a
- * video stream, a track without audio. Rust reports these as plan errors, the
- * same way the Python boundary raised ValueError for them. */
-#define USV_PLAN (-2)
+ * video stream, a track without audio. Rust reports these as invalid-input
+ * errors, the same way the Python boundary raised ValueError for them. */
+#define USV_INVALID (-2)
 /* A serving encoder the runtime does not provide; the message is its name. */
 #define USV_MISSING_CODEC (-3)
 
@@ -89,13 +89,13 @@ static int fail_missing_codec(const char *name) {
     return USV_MISSING_CODEC;
 }
 
-/* A failure of the media itself, which Rust reports as a plan error. */
-static int fail_plan(const char *format, ...) {
+/* A failure of the media itself, which Rust reports as an invalid input. */
+static int fail_invalid(const char *format, ...) {
     va_list args;
     va_start(args, format);
     vsnprintf(usv_error_message, sizeof(usv_error_message), format, args);
     va_end(args);
-    return USV_PLAN;
+    return USV_INVALID;
 }
 
 /* ---- growable byte buffer ------------------------------------------------ */
@@ -965,7 +965,7 @@ int usv_mux_open(const uint8_t *first_unit, size_t first_size,
     }
     int index = first_stream_of_type(unit, AVMEDIA_TYPE_VIDEO);
     if (index < 0) {
-        code = fail_plan("an encoded media unit has no video");
+        code = fail_invalid("an encoded media unit has no video");
         goto fail;
     }
     if (muxer_template_stream(muxer, unit, index, &muxer->video) != USV_OK) {
@@ -980,7 +980,7 @@ int usv_mux_open(const uint8_t *first_unit, size_t first_size,
     }
     index = first_stream_of_type(track, AVMEDIA_TYPE_AUDIO);
     if (index < 0) {
-        code = fail_plan("an encoded audio track has no audio");
+        code = fail_invalid("an encoded audio track has no audio");
         goto fail;
     }
     if (muxer_template_stream(muxer, track, index, &muxer->audio) != USV_OK) {
@@ -1074,7 +1074,7 @@ int usv_mux_append(UsvMuxer *muxer, const uint8_t *unit, size_t size,
     int index = first_stream_of_type(input, AVMEDIA_TYPE_VIDEO);
     if (index < 0) {
         close_input_memory(&input);
-        return fail_plan("an encoded media unit has no video");
+        return fail_invalid("an encoded media unit has no video");
     }
     /* Every unit of one request is encoded at the request's canvas; a unit of
      * another raster would either misalign the rows or change the stream's
@@ -1086,7 +1086,7 @@ int usv_mux_append(UsvMuxer *muxer, const uint8_t *unit, size_t size,
     int expected_height = muxer->video->codecpar->height;
     if (width != expected_width || height != expected_height) {
         close_input_memory(&input);
-        return fail_plan(
+        return fail_invalid(
             "an encoded media unit is %dx%d, the request's canvas is %dx%d",
             width, height, expected_width, expected_height);
     }
@@ -1106,7 +1106,7 @@ int usv_mux_finish(UsvMuxer *muxer, const uint8_t *audio, size_t size,
     int index = first_stream_of_type(input, AVMEDIA_TYPE_AUDIO);
     if (index < 0) {
         close_input_memory(&input);
-        return fail_plan("an encoded audio track has no audio");
+        return fail_invalid("an encoded audio track has no audio");
     }
     code = mux_stream(muxer, input, index, muxer->audio, 0, NULL);
     close_input_memory(&input);
@@ -1176,7 +1176,7 @@ int usv_decode_audio(const uint8_t *data, size_t size, int *rate, int *channels,
                                        input->streams[index]->codecpar->codec_id);
     if (index < 0 || !decoder) {
         close_input_memory(&input);
-        return fail_plan("an audio condition carries no audio stream");
+        return fail_invalid("an audio condition carries no audio stream");
     }
     AVCodecContext *context = avcodec_alloc_context3(decoder);
     AVFrame *frame = av_frame_alloc();
@@ -1215,12 +1215,12 @@ int usv_decode_audio(const uint8_t *data, size_t size, int *rate, int *channels,
     input_open = 1;
 
     /* The output parameters are the stream's declared ones, which is what
-     * PyAV's AudioResampler is created with and what read_audio planned. */
+     * PyAV's AudioResampler is created with and what read_audio expects. */
     out_rate = context->sample_rate;
     av_channel_layout_copy(&out_layout, &context->ch_layout);
     out_channels = out_layout.nb_channels;
     if (out_rate <= 0 || out_channels < 1 || out_channels > 2) {
-        code = fail_plan(
+        code = fail_invalid(
             "an audio condition's stream declares %d channels at %d Hz, "
             "which a condition track cannot carry",
             out_channels, out_rate);
@@ -1395,12 +1395,12 @@ int usv_decode_audio(const uint8_t *data, size_t size, int *rate, int *channels,
     }
 
     if (!input_open || out_channels < 1 || out_rate <= 0) {
-        code = fail_plan("an audio stream decoded to no samples");
+        code = fail_invalid("an audio stream decoded to no samples");
         goto done;
     }
     size_t plane_samples = channel_planes[0].size / sizeof(float);
     if (plane_samples == 0) {
-        code = fail_plan("an audio stream decoded to no samples");
+        code = fail_invalid("an audio stream decoded to no samples");
         goto done;
     }
     for (int channel = 1; channel < out_channels; channel++) {

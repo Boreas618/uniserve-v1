@@ -8,7 +8,7 @@ The executable serves two model families, Qwen3-MoE (chat) and MiniMax-H3 (video
 
 ## Requirements
 
-| Component | Requirement |
+| Item | Requirement |
 | --- | --- |
 | OS / architecture | Linux on x86-64 or aarch64 |
 | GPU | NVIDIA Hopper or Blackwell GPUs; H200, GB200 and RTX PRO 6000 Blackwell Server Edition have end-to-end validation |
@@ -66,7 +66,7 @@ curl --fail-with-body --max-time 600 \
 
 ## Deployments
 
-A deployment file passed to `--worker-groups` places FastH3's components on devices and hosts: TOML `[[worker_groups]]` groups, each with its ranks (`cuda:0-3`), replicas and components. `configs/minimax_h3/` holds them; the FastH3 deployments with published measurements are:
+A deployment file passed to `--worker-groups` places FastH3's blocks on devices and hosts: TOML `[[worker_groups]]` groups, each with its ranks (`cuda:0-3`), replicas and blocks. `configs/minimax_h3/` holds them; the FastH3 deployments with published measurements are:
 
 | File | GPUs | Layout |
 | --- | --- | --- |

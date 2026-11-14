@@ -51,7 +51,7 @@ import numpy as np
 import torch
 import torch.nn.functional as functional
 
-#: `DType::unit_roundoff` for FP32, the accumulate type.
+#: `ops::tolerance::unit_roundoff` for FP32, the accumulate type.
 FP32_ROUNDOFF = 5.960464477539063e-08
 
 # : (heads, width, output, rows, block): the shapes above, in the order they

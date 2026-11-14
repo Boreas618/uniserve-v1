@@ -128,7 +128,7 @@ const DOCS: &[(&str, &str)] = &[
     (
         "doc.fence",
         "fence.probe is the range marker that wrote the row: 2 * instance at a module \
-         instance's entry and 2 * instance + 1 at its exit (fence_probe, whose component is \
+         instance's entry and 2 * instance + 1 at its exit (fence_probe, whose column component is \
          the module's class), 1048574 at a step's begin and 1048575 at its end; fence.step is \
          the low 32 bits of the step's batch id (steps.step).",
     ),

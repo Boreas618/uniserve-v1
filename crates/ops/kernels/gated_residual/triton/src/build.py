@@ -48,7 +48,7 @@ def spec(fields, parameters, target):
         "options": {
             "num_warps": 4,
             # The gated update rounds to the activation dtype before the residual sum, so the two
-            # would otherwise contract into one rounding.
+            # must not fuse into one rounding.
             "enable_fp_fusion": False,
         },
     }

@@ -77,7 +77,7 @@ export UNISERVE_QWEN3_MOE_CUDA_VISIBLE_DEVICES=0
 # UNISERVE_QWEN3_FP8_ATTENTION_BACKEND selects the FP8 cell's provider.
 ```
 
-The commands run from the checkout with the environment of the installation instructions, including the `bench` extra for the Parquet split. The reference side is a **second checkout of the baseline tree** — `git worktree add "$HOME/gsm8k-reference" f1de185a2`, with its own `uv sync` — so the two implementations never share an environment; the block below is that side's, then the candidate's. The candidate needs the root package's release binary and an environment installed from this checkout, because the worker imports the `uniserve` package of the environment it runs in. Run the evaluator's GSM8K tests, the fixed-sample-set pre-flight and the reference plan and run, then build and run the candidate's three cells by name, then compare each cell with itself:
+The commands run from the checkout with the environment of the installation instructions, including the `bench` extra for the Parquet split. The reference side is a **second checkout of the baseline tree** — `git worktree add "$HOME/gsm8k-reference" f1de185a2`, with its own `uv sync` — so the two implementations never share an environment; the block below is that side's, then the candidate's. The candidate needs the root package's release binary and an environment installed from this checkout, because the worker imports the `uniserve` package of the environment it runs in. Run the evaluator's GSM8K tests, the fixed-sample-set pre-flight and the reference side's `plan` and `run`, then build and run the candidate's three cells by name, then compare each cell with itself:
 
 ```bash
 # The reference side, in its own worktree and its own environment.

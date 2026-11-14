@@ -39,8 +39,8 @@ def spec(fields, parameters, target):
             "WIDTH": int(fields["columns"]),
             "BLOCK": int(fields["block"]),
         },
-        # The contract rounds the gated product before the residual sum, so the two must not
-        # contract into one fused multiply-add.
+        # The operator rounds the gated product before the residual sum, so the two must not
+        # fuse into one multiply-add.
         "options": {"num_warps": 4, "enable_fp_fusion": False},
     }
 

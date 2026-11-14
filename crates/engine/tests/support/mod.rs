@@ -90,7 +90,7 @@ pub(crate) fn launch() -> EngineArgs {
         "cuda",
         1,
         2,
-        WorkerGroupConfig::single_component(proto::config::DEFAULT_BLOCK, 1),
+        WorkerGroupConfig::single_block(proto::config::DEFAULT_BLOCK, 1),
     );
     let package = |backend: &str, arguments: &str| proto::module::PackageRevision {
         backend: backend.to_owned(),

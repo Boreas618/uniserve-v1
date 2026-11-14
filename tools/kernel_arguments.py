@@ -197,7 +197,7 @@ def rust_launch(op: str) -> tuple[pathlib.Path, str] | None:
         found = needle.search(text)
         if found is None:
             continue
-        # The operator's own impl, not the file: `activation.rs` and `segments.rs` hold several, and
+        # The operator's own impl, not the file: `sampler.rs` and `vsa.rs` hold several, and
         # a search that ran past this one would attribute a neighbour's chain to this operator.
         following = next_impl.search(text, found.end())
         body = text[found.end() : following.start() if following else len(text)]

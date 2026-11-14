@@ -262,12 +262,12 @@ def video_cases() -> None:
     )
     # Five frames at the model's 10 fps hold half a second, 22050 native
     # samples, which resample to 8000 at the model's 16 kHz.
-    audio_plan = (44100, 0, 22050, 8000, 16000)
-    audio = reference_audio(soundtrack, *audio_plan)
+    audio_transform = (44100, 0, 22050, 8000, 16000)
+    audio = reference_audio(soundtrack, *audio_transform)
     with open(os.path.join(directory, "soundtrack.audio"), "wb") as file:
         file.write(audio)
     with open(os.path.join(directory, "soundtrack.audio.txt"), "w", encoding="ascii") as file:
-        file.write(" ".join(str(value) for value in audio_plan) + "\n")
+        file.write(" ".join(str(value) for value in audio_transform) + "\n")
 
     cases = [
         # (name, source, frame_rate, canvas, frames, start_frame)

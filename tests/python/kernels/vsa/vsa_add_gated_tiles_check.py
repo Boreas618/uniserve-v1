@@ -4,7 +4,7 @@
     crates/build-server/python/.venv/bin/python gated_check.py [--package DIR] [--device cuda]
 
 **This check needs a GPU**: the kernel pins its rounding with inline PTX (`mul.rn.f32`, `add.rn.f32`)
-so that the compiler cannot contract the multiply with the sum, and `tl.inline_asm_elementwise` does
+so that the compiler cannot fuse the multiply with the sum, and `tl.inline_asm_elementwise` does
 not execute under `TRITON_INTERPRET`. On a host without a device the script says that and stops.
 
 The operator adds one tile's gated compression to its rows as **two** eager steps:
@@ -18,8 +18,8 @@ steps in torch, and the comparison is **bit for bit**: with the product rounded 
 before the sum, there is nothing left for a bound to cover.
 
 The cases, and the one that matters most:
-- **a contraction trap**: values whose product is not representable in the storage dtype, chosen so
-  that contracting the multiply into the sum (what `enable_fp_fusion` would do, and what the inline
+- **a fusion trap**: values whose product is not representable in the storage dtype, chosen so
+  that fusing the multiply into the sum (what `enable_fp_fusion` would do, and what the inline
   assembly exists to prevent) gives a different answer. The check asserts the case can tell the two
   apart, so a passing run is evidence about this kernel rather than about the data;
 - **a strided output and gate** whose row stride is wider than `heads · width`, and a strided
@@ -74,7 +74,7 @@ def reference(tile_values, before, gate, element):
     return (before.to(torch.float32) + product).to(element)
 
 
-def contracted(tile_values, before, gate, element):
+def fused(tile_values, before, gate, element):
     """The same sum with the multiply left in FP32: what a fused compiler would produce."""
     return (
         before.to(torch.float32)
@@ -93,10 +93,10 @@ def run(
     block,
     row_stride=None,
     tile_stride=None,
-    contraction_trap=False,
+    fusion_trap=False,
     seed=31,
 ):
-    """One launch, the operator's reference, and the contracted variant for contrast."""
+    """One launch, the operator's reference, and the fused variant for contrast."""
     element = DTYPES[dtype]
     device = torch.device("cuda")
     stride_row = heads * width if row_stride is None else row_stride
@@ -104,7 +104,7 @@ def run(
     tiles = rows // tile
     torch.manual_seed(seed)
 
-    if contraction_trap:
+    if fusion_trap:
         # Values one BF16/F16 ulp apart in their product's tail: 1 + 2**-6 times 1 + 2**-6 is
         # representable in FP32 and not in 16 bits, so the narrowing decides the answer.
         before = torch.full(
@@ -179,10 +179,10 @@ def run(
 
     rows_of = per_row(compressed, rows, tile)
     expected = reference(rows_of, before, gate, element)
-    differing = contracted(rows_of, before, gate, element)
-    if contraction_trap and torch.equal(expected, differing):
+    differing = fused(rows_of, before, gate, element)
+    if fusion_trap and torch.equal(expected, differing):
         raise SystemExit(
-            "the contraction case cannot tell a fused multiply-add from the operator's two "
+            "the fusion case cannot tell a fused multiply-add from the operator's two "
             "roundings, so it would pass either way"
         )
     got = torch.as_strided(
@@ -258,7 +258,7 @@ def main():
         width=64,
         tile=64,
         block=16,
-        contraction_trap=True,
+        fusion_trap=True,
     )
     checked += run(
         module,
@@ -279,7 +279,7 @@ def main():
         width=32,
         tile=64,
         block=16,
-        contraction_trap=True,
+        fusion_trap=True,
         row_stride=96,
     )
     checked += run(

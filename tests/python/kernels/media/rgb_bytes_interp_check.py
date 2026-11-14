@@ -9,7 +9,7 @@ decomposition, the six strides, the clamp and the round-half-to-even. It is the
 CPU half of the check; the GPU script beside this one (`rgb_check.py`) runs the
 compiled program on a device.
 
-Four layouts, because the operator's contract allows all of them and the
+Four layouts, because the operator's interface allows all of them and the
 addressing is where this kernel can be wrong: the packed raster; a tile written
 into a sub-region of a larger canvas (three of the six strides longer than
 packed); a strided read side alone; and a one-frame, one-row strip, where the

@@ -17,9 +17,9 @@ n = x · rsqrt(mean(x²) + eps) · weight
 out = n · (1 + scale[i]) + shift[i]
 ```
 
-**The contract's constraint, and what the check is really for.** Every intermediate rounds to
+**The operator's constraint, and what the check is really for.** Every intermediate rounds to
 the activation dtype, so the packages compile with
-`enable_fp_fusion = False` — without it `value + gate · update` contracts into one fused
+`enable_fp_fusion = False` — without it `value + gate · update` fuses into one fused
 multiply-add and the gated product never rounds. The reference here takes each rounding
 explicitly, in order, through the activation dtype, so a module that fused any of them is a
 difference the check sees rather than a difference a bound absorbs.
@@ -73,7 +73,7 @@ for _sibling in SIBLINGS:
     if _source.is_dir() and str(_source) not in sys.path:
         sys.path.insert(0, str(_source))
 
-#: The activation types' unit roundoff, as `DType::unit_roundoff` gives it.
+#: The activation types' unit roundoff, as `ops::tolerance::unit_roundoff` gives it.
 UNIT_ROUNDOFF = {"f16": 2.0**-11, "bf16": 2.0**-8, "f32": 2.0**-24}
 
 #: E4M3's unit roundoff: three mantissa bits, and the format's largest finite magnitude.
@@ -251,7 +251,7 @@ def check(operator, case):
         RETAIN=case["retain"],
     )
 
-    # The reference, one rounding at a time, in the order the contract states.
+    # The reference, one rounding at a time, in the order the operator states.
     selected = indices.cpu().long()
     x = hidden_before
     if case["update"]:

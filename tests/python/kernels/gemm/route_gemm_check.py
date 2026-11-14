@@ -244,7 +244,7 @@ def main() -> int:
             "the module wrote into its inputs; FC2 scatters only into `out`"
         )
 
-    # The reference, tile by tile: each live tile's rows contracted with its expert's weights.
+    # The reference, tile by tile: each live tile's rows multiplied by its expert's weights.
     expected = torch.full(
         (expanded, hidden_size),
         float("nan"),

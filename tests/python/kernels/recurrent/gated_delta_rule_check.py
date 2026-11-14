@@ -16,7 +16,7 @@ The reference is the recurrence itself in FP64, token by token, from the same ro
 `Qwen3_5MoeGatedDeltaNet.forward`). Each output is compared against the largest magnitude of the
 reference output in its value head, because a head's outputs are dot products that cancel. The
 bound follows the arithmetic: the program's sums are FP32 (the dots at FP32 accuracy), a state
-element is a decayed sum of rank-one updates whose rounding is contracted by every later step
+element is a decayed sum of rank-one updates whose rounding no later step amplifies
 (`I − β k̂k̂ᵀ` has norm at most one and the decay at most one), and the output rounds once:
 
     |o − ô| ≤ 2 · (2 γ_dk √dk + u_out) · max|o|          (`ops::recurrent::GatedDeltaRule`'s bound)

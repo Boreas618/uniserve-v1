@@ -359,7 +359,7 @@ impl WorkerGroupConfig {
     /// Validates a group's rank list and its block membership.
     ///
     /// Ranks must be nonempty, name a host and a device, and not repeat a
-    /// `(host, device)` pair unless the device is `cpu`. Components must be
+    /// `(host, device)` pair unless the device is `cpu`. Blocks must be
     /// valid for their worker role; each needs a nonempty name, a nonempty list of distinct
     /// in-range rank indices, a `parallel_config` whose
     /// `BlockConfig::world_size` succeeds, and a positive `units_per_rank`.
@@ -397,7 +397,7 @@ impl WorkerGroupConfig {
 
     /// Validates unique group identities and every local rank layout.
     ///
-    /// Component names may repeat across groups. Repeated names are
+    /// Block names may repeat across groups. Repeated names are
     /// replicas of the same numerical block; the scheduler binds each
     /// request to one of them and keeps that affinity for the request lifetime.
     ///
@@ -542,7 +542,7 @@ impl WorkerGroupConfig {
     /// is given, and the default engine settings and the simulation use it. A
     /// deployment with several blocks, or with other partitions, writes
     /// its own configuration.
-    pub fn single_component(name: &str, rank_count: usize) -> BTreeMap<String, BlockConfig> {
+    pub fn single_block(name: &str, rank_count: usize) -> BTreeMap<String, BlockConfig> {
         BTreeMap::from([(
             name.into(),
             BlockConfig {
@@ -673,7 +673,7 @@ impl WorkerGroupConfig {
             data_parallel_size.max(1),
             tensor_parallel_size,
             device.queue_depth.get(),
-            Self::single_component(DEFAULT_BLOCK, tensor_parallel_size),
+            Self::single_block(DEFAULT_BLOCK, tensor_parallel_size),
         );
         if !device.devices.is_empty() {
             order_devices(&mut groups, &device.device, &device.devices)?;
@@ -974,7 +974,7 @@ mod tests {
             2,
             2,
             2,
-            WorkerGroupConfig::single_component(DEFAULT_BLOCK, 2),
+            WorkerGroupConfig::single_block(DEFAULT_BLOCK, 2),
         );
         assert_eq!(
             WorkerGroupConfig::scheduler_blocks(&shorthand, 2).unwrap(),

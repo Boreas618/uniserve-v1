@@ -213,7 +213,7 @@ fn clip8(sum: i64) -> u8 {
 ///
 /// # Errors
 ///
-/// Returns [`Error::Plan`] when a dimension is zero or the input is not
+/// Returns [`Error::Invalid`] when a dimension is zero or the input is not
 /// `width * height * 3` bytes.
 pub(super) fn lanczos_resize(
     source: &[u8],
@@ -229,10 +229,12 @@ pub(super) fn lanczos_resize(
         out_height as usize,
     );
     if width == 0 || height == 0 || out_width == 0 || out_height == 0 {
-        return Err(Error::Plan("an image raster must be positive".to_owned()));
+        return Err(Error::Invalid(
+            "an image raster must be positive".to_owned(),
+        ));
     }
     if source.len() != width * height * 3 {
-        return Err(Error::Plan(format!(
+        return Err(Error::Invalid(format!(
             "an RGB24 image of {width}x{height} needs {} bytes, {} were given",
             width * height * 3,
             source.len()

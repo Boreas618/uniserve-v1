@@ -48,7 +48,7 @@ KERNELS = (
 #: The package this check covers.
 PACKAGE = KERNELS / "moe_sort" / "trtllm"
 
-# The operator's `DType::as_i64()` numbering, for `scales_dtype`.
+# The operator crate's package ABI numbering (`ops::abi::code`), for `scales_dtype`.
 ELEMENT_TYPES = {
     "u8": 0,
     "i32": 1,

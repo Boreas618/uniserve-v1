@@ -141,7 +141,7 @@ impl Args {
     /// Whether this launch may run at all: the operands' shapes, their element types, the affine
     /// pair's presence against the compiled form, and the destination's row layout.
     ///
-    /// It is separate from `launch` so that the contract is reachable without a device: a kernel is
+    /// It is separate from `launch` so that these rules are checkable without a device: a kernel is
     /// only loadable on one, and a check that cannot be run is a check nobody has run.
     pub fn validate(&self, descriptor: &Descriptor) -> Result<()> {
         let channels = u64::from(self.channels);

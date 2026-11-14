@@ -5,11 +5,11 @@ use std::path::PathBuf;
 /// A media operation's failure.
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
-    /// The plan and the media disagree: a decoded extent, rate or sample
-    /// count is not the one the request was planned with, or a caller passed
-    /// data of the wrong shape.
+    /// The request's transform and the media disagree (a decoded extent,
+    /// rate or sample count is not the one the request's transform states),
+    /// or a caller passed data of the wrong shape or in the wrong state.
     #[error("{0}")]
-    Plan(String),
+    Invalid(String),
 
     /// A codec, the muxer or a decoder failed.
     #[error("{0}")]
@@ -41,9 +41,9 @@ pub enum Error {
 }
 
 impl Error {
-    /// A plan violation with a formatted reason.
-    pub(crate) fn plan(reason: impl Into<String>) -> Self {
-        Self::Plan(reason.into())
+    /// An invalid input or call with a formatted reason.
+    pub(crate) fn invalid(reason: impl Into<String>) -> Self {
+        Self::Invalid(reason.into())
     }
 
     /// An operating-system failure with its context.

@@ -131,7 +131,7 @@ def cases(flags):
         {
             **common,
             # The shard's offset, with ids on both sides of it: the zeros are as much a part of
-            # the contract as the copied rows.
+            # the operator's output as the copied rows.
             "label": "a shard's offset, and ids outside it",
             "tokens": flags.tokens,
             "rows": flags.rows,

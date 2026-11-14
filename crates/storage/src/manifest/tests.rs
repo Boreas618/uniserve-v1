@@ -1103,7 +1103,7 @@ fn remote_host_sources_use_the_measured_endpoint_bandwidth() {
 /// their own hosts: they compute from the storages both read, in the first
 /// reader's order and bindings, and each binds that epoch from its host.
 #[test]
-fn ranks_on_two_hosts_plan_from_the_sources_both_read() {
+fn ranks_on_two_hosts_compute_from_the_sources_both_read() {
     let page = |name: &str| storage(vec![field(name, 0, &[64], vec![whole(64)], vec![0])]);
     let remote = |mut storage: Storage, gpu: Gpu| {
         for chunk in &mut storage.chunks {
@@ -1140,7 +1140,7 @@ fn ranks_on_two_hosts_plan_from_the_sources_both_read() {
 }
 
 #[test]
-fn one_gpu_copy_plan_binds_to_each_submitting_host() {
+fn one_gpu_copy_manifest_binds_to_each_submitting_host() {
     let page = storage(vec![field("page", 0, &[64], vec![whole(64)], vec![0])]);
     let request = Request {
         source: epoch(vec![(Some(gpu(0)), vec![page.clone()])]),

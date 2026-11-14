@@ -16,7 +16,7 @@ import triton.language as tl
 
 @triton.jit
 def _add_rn(a, b):
-    # Round-to-nearest FP32 sum the compiler cannot contract with a neighbouring
+    # Round-to-nearest FP32 sum the compiler cannot fuse with a neighbouring
     # multiply.
     return tl.inline_asm_elementwise(
         "add.rn.f32 $0, $1, $2;",

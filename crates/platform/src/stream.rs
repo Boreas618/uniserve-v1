@@ -59,8 +59,8 @@ pub(crate) const CU_STREAM_WAIT_VALUE_AND: u32 = 0x2;
 ///
 /// Cloning a handle shares the stream: every clone submits to the same
 /// driver stream, and a stream this process created is destroyed when its
-/// last handle drops. A component that submits to a stream another
-/// component created therefore holds a clone, which keeps the stream and its
+/// last handle drops. A caller that submits to a stream another owner
+/// created therefore holds a clone, which keeps the stream and its
 /// context alive for as long as it is used.
 ///
 /// Created streams are non-blocking with respect to the legacy NULL stream
@@ -155,7 +155,7 @@ impl Stream {
 
     /// Creates an independent owned stream in this stream's context with the
     /// same priority. It retains whatever this stream retains; forking a
-    /// borrowed stream inherits the borrow's contract.
+    /// borrowed stream inherits the borrow's lifetime rule.
     pub fn fork(&self) -> Result<Self> {
         let priority = self.priority()?;
         let mut raw = std::ptr::null_mut();

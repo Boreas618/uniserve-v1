@@ -161,8 +161,8 @@ pub struct ServerArgs {
     /// Element type of parameters and activations.
     #[arg(skip = ServerArgs::default().dtype)]
     pub dtype: ModelDtype,
-    /// Precision policy, such as `mode = "balanced"` or per-component
-    /// selections under `components`; empty selects the model's default.
+    /// Precision policy, such as `mode = "balanced"` or selections by
+    /// module under `components`; empty selects the model's default.
     #[arg(skip)]
     pub quantization: serde_json::Map<String, Value>,
     /// Options of the model's multimodal processor; the processor refuses
@@ -223,7 +223,7 @@ pub struct ServerArgs {
     /// cores as equal consecutive blocks.
     #[arg(long, default_value_t = ServerArgs::default().data_parallel_size)]
     pub data_parallel_size: NonZeroUsize,
-    /// Deployment file placing worker groups and their components.
+    /// Deployment file placing worker groups and their blocks.
     #[arg(long, value_name = "FILE")]
     pub worker_groups: Option<PathBuf>,
     /// This node's host name; its daemon runs the ranks placed on this

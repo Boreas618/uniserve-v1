@@ -9,9 +9,8 @@ One script covers both because they are one operation over two layouts: `value �
 optionally with a bias on each half and optionally recording each program's largest output
 magnitude for a later quantization. `value_first_swiglu` reads a **packed projection** whose
 rows start with the value half and end with the gate half, one bias of `2 · width`; `swiglu`
-reads separate value and gate views, each with its own bias and its own row stride. The same
-file is kept in both packages, byte for byte, and a test in
-`crates/build-server/tests/it/packages.rs` holds the copies together.
+reads separate value and gate views, each with its own bias and its own row stride. The
+script is kept once, here under `tests/python/kernels`, for both operators.
 
 Cases. Random values; gates swept to ±80, where the sigmoid has saturated and `silu` of a very
 negative gate is already ~1e-35 while `exp(-gate)` is still finite in FP32; and a zeroed row,
@@ -63,7 +62,7 @@ for _sibling in SIBLINGS:
     if _source.is_dir() and str(_source) not in sys.path:
         sys.path.insert(0, str(_source))
 
-#: The output types' unit roundoff, as `DType::unit_roundoff` gives it.
+#: The output types' unit roundoff, as `ops::tolerance::unit_roundoff` gives it.
 UNIT_ROUNDOFF = {"f16": 2.0**-11, "bf16": 2.0**-8, "f32": 2.0**-24}
 
 TORCH_TYPES = {

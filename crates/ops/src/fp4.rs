@@ -463,7 +463,7 @@ impl Op for Nvfp4Gemm {
             return Err(Error::argument(
                 Self::NAME,
                 format!(
-                    "the module contracts over {} elements, the packed row holds {k} bytes",
+                    "the module reduces over {} elements, the packed row holds {k} bytes",
                     descriptor.k
                 ),
             ));

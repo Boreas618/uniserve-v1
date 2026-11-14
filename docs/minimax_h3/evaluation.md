@@ -1,6 +1,6 @@
 # Evaluation
 
-The evaluator runs fixed workloads against the deployments in the [guide](minimax_h3.md) and validates every MP4 against the shape its request states: size, frame count, frame rate and stereo soundtrack, and for UniServe also the shape the server reports generating. Each run writes its resolved commands, request data, per-request latencies, media validation and GPU storage observations under `artifacts/`. Resolve a plan before running it, and run points serially, one server and one harness at a time, from the checkout whose `.venv` holds the environment:
+The evaluator runs fixed workloads against the deployments in the [guide](minimax_h3.md) and validates every MP4 against the shape its request states: size, frame count, frame rate and stereo soundtrack, and for UniServe also the shape the server reports generating. Each run writes its resolved commands, request data, per-request latencies, media validation and GPU storage observations under `artifacts/`. Resolve a profile with `plan` before running it, and run points serially, one server and one harness at a time, from the checkout whose `.venv` holds the environment:
 
 ```bash
 uv sync --locked --python /usr/bin/python3.12 --extra gpu --extra bench

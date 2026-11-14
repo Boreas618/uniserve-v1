@@ -16,7 +16,7 @@
 #include <cstdint>
 
 // One sort launch. The call structure is the operator's, byte for byte;
-// `stream` is the CUstream of the device the executor drives.
+// `stream` is the CUstream of the device the worker drives.
 //
 // `ids` is [tokens, top] i32 route ids (the router's experts, in the whole
 // vocabulary), `scales` is [tokens, top] route weights in `scales_dtype` —
@@ -52,7 +52,7 @@ struct uniserve_moe_sort_call {
   int32_t* permuted_to_token;
 };
 
-// The operator crate's `DType::as_i64()` numbering.
+// The operator crate's package ABI numbering (`ops::abi::code`).
 enum uniserve_dtype : int64_t {
   UNISERVE_DTYPE_U8 = 0,
   UNISERVE_DTYPE_I32 = 1,

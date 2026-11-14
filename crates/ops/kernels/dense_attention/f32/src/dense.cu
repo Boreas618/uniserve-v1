@@ -103,11 +103,11 @@ constexpr int64_t kScoreBytes = 1024ll * 1024ll * 1024ll;
 /// Threads of the masking and copy kernels.
 constexpr int kThreads = 256;
 
-/// `DType::as_i64()`'s number for the element type this backend serves.
+/// `ops::abi::code`'s number for the element type this backend serves.
 constexpr int64_t kFloat32 = 5;
 
-/// The largest workspace one cuBLASLt plan may ask for; a cap keeps a host that
-/// serves many shapes from holding unbounded plan scratch.
+/// The largest workspace one cuBLASLt matmul may ask for; a cap keeps a host that
+/// serves many shapes from holding unbounded matmul scratch.
 constexpr size_t kWorkspaceCap = 64u * 1024u * 1024u;
 
 /// Writes this entry's message into the call structure and returns the failure
@@ -160,9 +160,9 @@ struct Matrix {
   int64_t batch_stride;
 };
 
-/// The plan of one product: the layouts, the algorithm cuBLASLt chose for them and
-/// the workspace that algorithm asks for.
-struct Plan {
+/// The matmul of one product: the operation descriptor, the layouts, the algorithm
+/// cuBLASLt chose for them and the workspace that algorithm asks for.
+struct Matmul {
   cublasLtMatmulDesc_t operation = nullptr;
   cublasLtMatrixLayout_t a = nullptr;
   cublasLtMatrixLayout_t b = nullptr;
@@ -171,7 +171,7 @@ struct Plan {
   cublasLtMatmulAlgo_t algorithm{};
   size_t workspace_bytes = 0;
 
-  ~Plan() {
+  ~Matmul() {
     if (operation != nullptr) {
       cublasLtMatmulDescDestroy(operation);
     }
@@ -183,10 +183,10 @@ struct Plan {
   }
 };
 
-/// The key of a plan: everything about a product that changes cuBLASLt's choice.
+/// The key of a matmul: everything about a product that changes cuBLASLt's choice.
 /// The rows are part of it because the heuristic's answer depends on them; a
 /// deployment asks for a bounded set of (tile, key extent, head width) triples.
-struct PlanKey {
+struct MatmulKey {
   int device;
   int transpose_a;
   int64_t k;
@@ -200,14 +200,14 @@ struct PlanKey {
            left.batch_stride == right.batch_stride;
   }
 
-  bool operator==(const PlanKey& other) const {
+  bool operator==(const MatmulKey& other) const {
     return device == other.device && transpose_a == other.transpose_a &&
            k == other.k && same(a, other.a) && same(b, other.b) && same(d, other.d);
   }
 };
 
-struct PlanKeyHash {
-  size_t operator()(const PlanKey& key) const {
+struct MatmulKeyHash {
+  size_t operator()(const MatmulKey& key) const {
     size_t hash = static_cast<size_t>(key.device);
     const int64_t values[] = {key.transpose_a,   key.k,
                               key.a.rows,        key.a.columns,
@@ -253,21 +253,21 @@ Handles& handles() {
   return instance;
 }
 
-/// The plan cache: one plan per shape and device, reused by every launch of it.
-class Plans {
+/// The matmul cache: one matmul per shape and device, reused by every launch of it.
+class MatmulCache {
  public:
-  Plan* of(const PlanKey& key, cublasLtHandle_t handle, std::string* error) {
+  Matmul* of(const MatmulKey& key, cublasLtHandle_t handle, std::string* error) {
     std::lock_guard<std::mutex> guard(mutex_);
-    auto found = plans_.find(key);
-    if (found != plans_.end()) {
+    auto found = matmuls_.find(key);
+    if (found != matmuls_.end()) {
       return found->second.get();
     }
-    auto plan = std::make_unique<Plan>();
-    if (!build(key, handle, plan.get(), error)) {
+    auto matmul = std::make_unique<Matmul>();
+    if (!build(key, handle, matmul.get(), error)) {
       return nullptr;
     }
-    Plan* built = plan.get();
-    plans_[key] = std::move(plan);
+    Matmul* built = matmul.get();
+    matmuls_[key] = std::move(matmul);
     return built;
   }
 
@@ -296,10 +296,10 @@ class Plans {
     return true;
   }
 
-  static bool build(const PlanKey& key, cublasLtHandle_t handle, Plan* plan,
+  static bool build(const MatmulKey& key, cublasLtHandle_t handle, Matmul* matmul,
                     std::string* error) {
     cublasStatus_t status = cublasLtMatmulDescCreate(
-        &plan->operation, CUBLAS_COMPUTE_32F, CUDA_R_32F);
+        &matmul->operation, CUBLAS_COMPUTE_32F, CUDA_R_32F);
     if (status != CUBLAS_STATUS_SUCCESS) {
       *error = std::string("creating the matmul description: ") +
                cublas_status(status);
@@ -308,11 +308,11 @@ class Plans {
     const cublasOperation_t operation_a =
         key.transpose_a == 1 ? CUBLAS_OP_T : CUBLAS_OP_N;
     const cublasOperation_t operation_b = CUBLAS_OP_N;
-    status = cublasLtMatmulDescSetAttribute(plan->operation,
+    status = cublasLtMatmulDescSetAttribute(matmul->operation,
                                             CUBLASLT_MATMUL_DESC_TRANSA,
                                             &operation_a, sizeof(operation_a));
     if (status == CUBLAS_STATUS_SUCCESS) {
-      status = cublasLtMatmulDescSetAttribute(plan->operation,
+      status = cublasLtMatmulDescSetAttribute(matmul->operation,
                                               CUBLASLT_MATMUL_DESC_TRANSB,
                                               &operation_b, sizeof(operation_b));
     }
@@ -320,8 +320,8 @@ class Plans {
       *error = std::string("describing the transpose: ") + cublas_status(status);
       return false;
     }
-    if (!layout(&plan->a, key.a, error) || !layout(&plan->b, key.b, error) ||
-        !layout(&plan->c, key.d, error) || !layout(&plan->d, key.d, error)) {
+    if (!layout(&matmul->a, key.a, error) || !layout(&matmul->b, key.b, error) ||
+        !layout(&matmul->c, key.d, error) || !layout(&matmul->d, key.d, error)) {
       return false;
     }
 
@@ -337,8 +337,8 @@ class Plans {
     cublasLtMatmulHeuristicResult_t result{};
     int returned = 0;
     if (status == CUBLAS_STATUS_SUCCESS) {
-      status = cublasLtMatmulAlgoGetHeuristic(handle, plan->operation, plan->a,
-                                              plan->b, plan->c, plan->d,
+      status = cublasLtMatmulAlgoGetHeuristic(handle, matmul->operation, matmul->a,
+                                              matmul->b, matmul->c, matmul->d,
                                               preference, 1, &result, &returned);
     }
     cublasLtMatmulPreferenceDestroy(preference);
@@ -348,17 +348,17 @@ class Plans {
                                                 : cublas_status(status));
       return false;
     }
-    plan->algorithm = result.algo;
-    plan->workspace_bytes = result.workspaceSize;
+    matmul->algorithm = result.algo;
+    matmul->workspace_bytes = result.workspaceSize;
     return true;
   }
 
   std::mutex mutex_;
-  std::unordered_map<PlanKey, std::unique_ptr<Plan>, PlanKeyHash> plans_;
+  std::unordered_map<MatmulKey, std::unique_ptr<Matmul>, MatmulKeyHash> matmuls_;
 };
 
-Plans& plans() {
-  static Plans instance;
+MatmulCache& matmuls() {
+  static MatmulCache instance;
   return instance;
 }
 
@@ -612,8 +612,8 @@ extern "C" int32_t UNISERVE_ENTRY(UniserveDenseAttentionCall* call, void* stream
   //   product: D = out^T = [head_dim, rows]  A = V stored [head_dim, keys]
   //                                          B = weights stored [keys, rows]
   struct Products {
-    Plan* score;
-    Plan* value;
+    Matmul* score;
+    Matmul* value;
   };
   std::string error;
   auto products_of = [&](int64_t rows, Products* into) -> int32_t {
@@ -625,14 +625,14 @@ extern "C" int32_t UNISERVE_ENTRY(UniserveDenseAttentionCall* call, void* stream
                             rows * call->kv_tokens};
     const Matrix out_of{call->head_dim, rows, call->o_stride_tokens, heads,
                         call->o_stride_heads};
-    into->score = plans().of(
-        PlanKey{device, 1, call->head_dim, keys_or_values, queries_of, weights_of}, handle,
+    into->score = matmuls().of(
+        MatmulKey{device, 1, call->head_dim, keys_or_values, queries_of, weights_of}, handle,
         &error);
     if (into->score == nullptr) {
       return fail(call, "the score product: %s", error.c_str());
     }
-    into->value = plans().of(
-        PlanKey{device, 0, call->kv_tokens, keys_or_values, weights_of, out_of}, handle,
+    into->value = matmuls().of(
+        MatmulKey{device, 0, call->kv_tokens, keys_or_values, weights_of, out_of}, handle,
         &error);
     if (into->value == nullptr) {
       return fail(call, "the value product: %s", error.c_str());
@@ -664,9 +664,9 @@ extern "C" int32_t UNISERVE_ENTRY(UniserveDenseAttentionCall* call, void* stream
   float* weights = scratch;
 
   size_t workspace_bytes = 0;
-  for (const Plan* plan : {whole.score, whole.value, last.score, last.value}) {
-    workspace_bytes = plan->workspace_bytes > workspace_bytes ? plan->workspace_bytes
-                                                              : workspace_bytes;
+  for (const Matmul* matmul : {whole.score, whole.value, last.score, last.value}) {
+    workspace_bytes = matmul->workspace_bytes > workspace_bytes ? matmul->workspace_bytes
+                                                                : workspace_bytes;
   }
   void* workspace = nullptr;
   if (workspace_bytes > 0) {
@@ -700,8 +700,8 @@ extern "C" int32_t UNISERVE_ENTRY(UniserveDenseAttentionCall* call, void* stream
       const float* value = values + key_head * call->kv_stride_heads;
       float* target =
           out + first_head * call->o_stride_heads + first_row * call->o_stride_tokens;
-      const Plan* score = products.score;
-      const Plan* product = products.value;
+      const Matmul* score = products.score;
+      const Matmul* product = products.value;
 
       status = cublasLtMatmul(handle, score->operation, &scale, key, score->a, query,
                               score->b, &zero, weights, score->c, weights,

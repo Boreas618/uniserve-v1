@@ -46,7 +46,7 @@ struct uniserve_sparse_attention_call {
   char error[512];
 };
 
-// The operator crate's `DType::as_i64()` numbering.
+// The operator crate's package ABI numbering (`ops::abi::code`).
 enum uniserve_sparse_dtype : int64_t {
   UNISERVE_SPARSE_U8 = 0,
   UNISERVE_SPARSE_I32 = 1,

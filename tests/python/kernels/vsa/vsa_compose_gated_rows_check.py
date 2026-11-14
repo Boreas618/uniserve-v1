@@ -4,7 +4,7 @@
     crates/build-server/python/.venv/bin/python compose_check.py [--package DIR] [--device cuda]
 
 **This check needs a GPU**: the kernel pins its rounding with inline PTX (`mul.rn.f32`,
-`add.rn.f32`), which exists so the compiler cannot contract the multiply into the sum, and
+`add.rn.f32`), which exists so the compiler cannot fuse the multiply into the sum, and
 `tl.inline_asm_elementwise` does not execute under `TRITON_INTERPRET`. Without a device the script
 says that and stops.
 
@@ -25,7 +25,7 @@ The two narrowings are the operator's, and the comparison is **bit for bit**. Th
   operator's stated invariant;
 - **strided `fine` and `gate`** whose row stride is wider than `heads · width`, and a **padded
   compression** whose tile stride is longer than `width`;
-- **a contraction trap**: data whose product is not representable in the storage dtype, so the
+- **a fusion trap**: data whose product is not representable in the storage dtype, so the
   narrowed product and a fused multiply-add give different answers — the check asserts the case can
   tell them apart;
 - **bf16, f16 and f32**.
@@ -86,7 +86,7 @@ def reference(
     return output
 
 
-def contracted(
+def fused(
     fine, compressed, gate, slots, owner_rows, start, count, tile, element
 ):
     """The same composition with the products left in FP32: what a fused compiler would produce."""
@@ -120,10 +120,10 @@ def run(
     slots=None,
     fine_stride=None,
     tile_stride=None,
-    contraction_trap=False,
+    fusion_trap=False,
     seed=37,
 ):
-    """One launch, the operator's reference, and the contracted variant for contrast."""
+    """One launch, the operator's reference, and the fused variant for contrast."""
     element = DTYPES[dtype]
     device = torch.device("cuda")
     slots = tuple(range(members)) if slots is None else slots
@@ -133,7 +133,7 @@ def run(
     tiles = fine_rows // tile
     torch.manual_seed(seed)
 
-    if contraction_trap:
+    if fusion_trap:
         fine = torch.full(
             (fine_rows, heads, width), 0.5, dtype=torch.float32, device=device
         )
@@ -233,8 +233,8 @@ def run(
         tile,
         element,
     )
-    if contraction_trap:
-        differing = contracted(
+    if fusion_trap:
+        differing = fused(
             fine,
             compressed,
             gate,
@@ -247,7 +247,7 @@ def run(
         )
         if torch.equal(expected, differing):
             raise SystemExit(
-                "the contraction case cannot tell a fused multiply-add from the operator's two "
+                "the fusion case cannot tell a fused multiply-add from the operator's two "
                 "roundings, so it would pass either way"
             )
     if not torch.equal(output, expected):
@@ -330,7 +330,7 @@ def main():
         width=64,
         tile=64,
         block=16,
-        contraction_trap=True,
+        fusion_trap=True,
         fine_stride=192,
     )
     checked += run(

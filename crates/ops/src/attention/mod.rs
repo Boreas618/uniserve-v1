@@ -15,7 +15,7 @@
 //! ```
 //!
 //! The cache is the layout `kv_write` produces (see [`crate::kv`]): `[pages, page_size, kv_heads,
-//! head_dim]`, read here through strides, so a plan that stores keys and values in one allocation at
+//! head_dim]`, read here through strides, so a cache that stores keys and values in one allocation at
 //! two offsets, or interleaves pages, needs no copy. Keys and values may address the same pages as
 //! one view of twice the extent.
 //!

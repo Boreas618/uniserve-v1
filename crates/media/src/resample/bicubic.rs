@@ -199,7 +199,7 @@ fn pass(
 ///
 /// # Errors
 ///
-/// Returns [`Error::Plan`] when a dimension or channel count is zero, or the
+/// Returns [`Error::Invalid`] when a dimension or channel count is zero, or the
 /// input is not `channels * width * height` bytes.
 pub(super) fn bicubic_antialias_u8(
     source: &[u8],
@@ -216,12 +216,12 @@ pub(super) fn bicubic_antialias_u8(
         out_width as usize,
     );
     if channels == 0 || width == 0 || height == 0 || out_width == 0 || out_height == 0 {
-        return Err(Error::Plan(
+        return Err(Error::Invalid(
             "an image raster and its channel count must be positive".to_owned(),
         ));
     }
     if source.len() != channels * width * height {
-        return Err(Error::Plan(format!(
+        return Err(Error::Invalid(format!(
             "a {channels}-channel image of {width}x{height} needs {} bytes, {} were given",
             channels * width * height,
             source.len()
@@ -407,7 +407,7 @@ fn pass32(
 ///
 /// # Errors
 ///
-/// Returns [`Error::Plan`] when a dimension or channel count is zero, or the
+/// Returns [`Error::Invalid`] when a dimension or channel count is zero, or the
 /// input is not `channels * width * height` samples.
 pub(super) fn bicubic_antialias_f32(
     source: &[f32],
@@ -424,12 +424,12 @@ pub(super) fn bicubic_antialias_f32(
         out_width as usize,
     );
     if channels == 0 || width == 0 || height == 0 || out_width == 0 || out_height == 0 {
-        return Err(Error::Plan(
+        return Err(Error::Invalid(
             "an image raster and its channel count must be positive".to_owned(),
         ));
     }
     if source.len() != channels * width * height {
-        return Err(Error::Plan(format!(
+        return Err(Error::Invalid(format!(
             "a {channels}-channel image of {width}x{height} needs {} samples, {} were given",
             channels * width * height,
             source.len()

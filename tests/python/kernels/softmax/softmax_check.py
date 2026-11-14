@@ -10,8 +10,7 @@ One script covers both because they are one row reduction with one difference: `
 stores the exponentials' share of their sum in the input's type, while `log_softmax` walks
 the row in `STEP`-wide tiles — so a tile larger than a program's registers costs more steps,
 not a bigger block — and stores the log-probability in FP32 whatever the input's type. The
-same file is kept in both packages, byte for byte, and a test in
-`crates/build-server/tests/it/packages.rs` holds them together.
+script is kept once, here under `tests/python/kernels`, for both operators.
 
 The cases are what a row reduction can get wrong: the shapes the fixture's keys name, a
 width far below the tile where almost every lane is masked, a width far above it - the row is
@@ -63,7 +62,7 @@ for _sibling in SIBLINGS:
     if _source.is_dir() and str(_source) not in sys.path:
         sys.path.insert(0, str(_source))
 
-#: The output types' unit roundoff, as `DType::unit_roundoff` gives it.
+#: The output types' unit roundoff, as `ops::tolerance::unit_roundoff` gives it.
 UNIT_ROUNDOFF = {"f16": 2.0**-11, "bf16": 2.0**-8, "f32": 2.0**-24}
 
 TORCH_TYPES = {

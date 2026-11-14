@@ -39,14 +39,14 @@ PACKAGE = KERNELS / "act_and_mul" / "triton"
 
 sys.path.insert(0, str(PACKAGE / "src"))
 
-#: The operator crate's `DType::as_i64()` numbering, by element type name.
+#: The operator crate's package ABI numbering (`ops::abi::code`), by element type name.
 DTYPES = {"f16": 3, "bf16": 4, "f32": 5}
 
 #: The relative bound's factor per activation, from `activation.rs::tolerance`.
 ROUNDINGS = {"silu": 3.0, "gelu": 4.0, "gelu_tanh": 4.0, "sigmoid": 3.0}
 
 #: `2**-8` for f16, `2**-8` for bf16 and `2**-24` for f32: the output type's unit roundoff,
-#: as `DType::unit_roundoff` gives it.
+#: as `ops::tolerance::unit_roundoff` gives it.
 UNIT_ROUNDOFF = {"f16": 2.0**-11, "bf16": 2.0**-8, "f32": 2.0**-24}
 
 TORCH_TYPES = {

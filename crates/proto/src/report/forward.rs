@@ -42,9 +42,9 @@ pub struct ForwardStats {
     /// device, keyed `{thread}/{call}` (`builder`, `control`). A serving
     /// call of the worker that made one failed.
     pub blocking_calls: BTreeMap<String, u64>,
-    /// Per-step durations from the fence probes, keyed `{stage}/{component}`:
-    /// a step's summed durations of the component's probed instances, or
-    /// the step's span between its markers for component `step`, of the
+    /// Per-step durations from the fence probes, keyed `{stage}/{class}`:
+    /// a step's summed durations of the module class's probed instances, or
+    /// the step's span between its markers for the class `step`, of the
     /// steps of that stage (a call kind, such as `decode`).
     #[serde(default)]
     pub fence_us: BTreeMap<String, FenceHistogram>,

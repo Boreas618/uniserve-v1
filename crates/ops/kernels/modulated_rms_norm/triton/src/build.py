@@ -81,7 +81,7 @@ def spec(fields, parameters, target):
         "options": {
             "num_warps": warps_of(width),
             # Every intermediate rounds to the activation dtype as the eager expression does, so a
-            # contracted multiply-add would round the wrong count of times.
+            # fused multiply-add would round the wrong count of times.
             "enable_fp_fusion": False,
         },
     }

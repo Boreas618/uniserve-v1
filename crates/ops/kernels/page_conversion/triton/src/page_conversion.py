@@ -2,19 +2,20 @@
 
 A rank that loads a page stored in another representation (another cache dtype, or FP8 with
 another head grouping of its scales) stages that page's bytes in its conversion scratch, in the
-host page encoding of the Storage Server's page pools. This program is the conversion's first
-launch: it decodes one field of the staged page into the workspace's FP32 block, from which
-`cache_copy_region` writes the destination's units with the destination's encoding. Between them,
-a loaded value rounds and scales exactly as a locally written one does.
+host page encoding of the buffer pool's host regions, which the Storage Server holds. This program
+is the conversion's first launch: it decodes one field of the staged page into the workspace's FP32
+block, from which `cache_copy_region` writes the destination's units with the destination's
+encoding. Between them, a loaded value rounds and scales exactly as a locally written one does.
 
 ## The source: the host page encoding
 
 A host K/V page is layer-major (`crates/engine/src/memory/cache/host.rs`): keys
 ``[layers, block_size, heads, head_dim]``, then values in the same shape, then, for an FP8 page,
-the scales ``[2, layers]`` as FP32, one per field and layer. A page staged from several source pools
-(another tensor-parallel split) carries one scale row per source pool's head range, so the scales
-generalise to ``[2, layers, groups]`` with ``groups = ceil(heads / scale_heads)``; a page of one
-source pool has ``groups = 1`` and is the host page's own ``[2, layers]``.
+the scales ``[2, layers]`` as FP32, one per field and layer. A page staged from several source parts
+(another tensor-parallel split, one host part per KV rank) carries one scale row per source part's
+head range, so the scales generalise to ``[2, layers, groups]`` with
+``groups = ceil(heads / scale_heads)``; a page of one source part has ``groups = 1`` and is the host
+page's own ``[2, layers]``.
 
 ## The scratch layout
 
