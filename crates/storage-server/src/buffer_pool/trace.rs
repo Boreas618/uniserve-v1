@@ -648,7 +648,7 @@ pub fn replay(inputs: &Path, mut states: Option<&mut dyn Write>) -> Result<u64, 
 
 /// An input to `pool` as `verification/buffer-pool/steps.py` reads it: its
 /// kind, and what it names in the terms of [`stated`] (owners and positions
-/// by number, groups as `g<n>`, keys by their first byte, stamps as
+/// by number, groups as `g<n>`, keys by their 32 bytes in hex, stamps as
 /// `g<n>:<sequence>`); a request is read in its session's version.
 pub(crate) fn stated_input(pool: &BufferPool, input: &Input) -> String {
     match input {
@@ -674,9 +674,21 @@ pub(crate) fn stated_input(pool: &BufferPool, input: &Input) -> String {
     }
 }
 
+/// A key as the stated inputs and states name it: its 32 bytes in hex, so
+/// that the keys of a serving deployment, which share leading bytes, are
+/// told apart.
+fn key_name(key: &Key) -> String {
+    key.0
+        .iter()
+        .fold(String::with_capacity(64), |mut name, byte| {
+            let _ = write!(name, "{byte:02x}");
+            name
+        })
+}
+
 fn stated_request(request: &Request) -> String {
     let keys = |keys: &[Key]| {
-        let named: Vec<String> = keys.iter().map(|key| format!("{:02x}", key.0[0])).collect();
+        let named: Vec<String> = keys.iter().map(key_name).collect();
         named.join(",")
     };
     let after = |stamps: &Stamps| {
@@ -842,14 +854,14 @@ fn stated_request(request: &Request) -> String {
 /// The model has one class, so a key cached in another is outside its terms
 /// (a key names what its block holds, A6).
 pub(crate) fn classes(pool: &BufferPool) -> String {
-    let classes: BTreeMap<u8, u8> = pool
+    let classes: BTreeMap<String, u8> = pool
         .cache
         .iter()
-        .map(|(key, entry)| (key.0[0], entry.class))
+        .map(|(key, entry)| (key_name(key), entry.class))
         .collect();
     let lines: Vec<String> = classes
         .into_iter()
-        .map(|(key, class)| format!("# class {key:02x} {class}"))
+        .map(|(key, class)| format!("# class {key} {class}"))
         .collect();
     lines.join("\n")
 }
@@ -912,9 +924,12 @@ pub(crate) fn layout(pool: &BufferPool) -> String {
 /// that attaches it (live with its group, slot and its table of the class 0
 /// by position, or gone, or new), each cached key with its copies, the
 /// memories that hold each block an owner or the cache holds on the device
-/// and the host parts that hold each host copy, the copies in flight, what
-/// waits for a stamp, and the tasks. A unit is `region:unit`, a key its
-/// first byte. `verification/buffer-pool/agreement.py` writes the
+/// and the host parts that hold each host copy, the copies in flight with
+/// their keys, what waits for a stamp with the stamps it still waits for
+/// (`after=g<n>:<sequence>,...`, one `release` line per group and stamp a
+/// release waits for), and the tasks with their keys. A block a waiting
+/// commit holds states its memories too. A unit is `region:unit`, a key its
+/// 32 bytes in hex. `verification/buffer-pool/agreement.py` writes the
 /// model's states in the same lines.
 pub(crate) fn stated(pool: &BufferPool, owners: &[(QueueId, OwnerId)], copies: u32) -> String {
     let unit = |block: &Rc<Block>| {
@@ -994,6 +1009,13 @@ pub(crate) fn stated(pool: &BufferPool, owners: &[(QueueId, OwnerId)], copies: u
             .flatten()
             .for_each(|(_, held)| note(held.block()));
     }
+    // A commit that waits holds its block, whose memories the commit's
+    // effect keeps when the owner is gone.
+    for (_, work) in pool.groups.values().flat_map(|group| &group.deferred) {
+        if let Deferred::Commit { block, .. } = work {
+            note(block);
+        }
+    }
     for (key, entry) in &pool.cache {
         entry.device.iter().for_each(|(block, _)| note(block));
         entry.host.iter().for_each(|(block, ..)| note(block));
@@ -1006,8 +1028,8 @@ pub(crate) fn stated(pool: &BufferPool, owners: &[(QueueId, OwnerId)], copies: u
             .as_ref()
             .map_or("-".to_owned(), |(block, ..)| unit(block));
         lines.push(format!(
-            "key {:02x} d={device} h={host} remote={}",
-            key.0[0],
+            "key {} d={device} h={host} remote={}",
+            key_name(key),
             u8::from(entry.remote)
         ));
     }
@@ -1018,6 +1040,12 @@ pub(crate) fn stated(pool: &BufferPool, owners: &[(QueueId, OwnerId)], copies: u
     );
 
     let copy_line = |copy: &Copy| {
+        // The key a copy caches its block under: a load's, a store's and a
+        // save's; a clone and a restore cache nothing.
+        let key = match &copy.to {
+            Target::Owner { key: Some(key), .. } | Target::Entry { key, .. } => key_name(key),
+            _ => "-".to_owned(),
+        };
         let (kind, owner, position, memory) = match copy.to {
             Target::Owner {
                 owner,
@@ -1049,54 +1077,103 @@ pub(crate) fn stated(pool: &BufferPool, owners: &[(QueueId, OwnerId)], copies: u
             format!("m{}", memory.trailing_zeros())
         };
         format!(
-            "kind={kind} o={owner} p={position} read={} write={} fill={} mem={memory}",
+            "kind={kind} o={owner} p={position} read={} write={} fill={} mem={memory} k={key}",
             unit(&copy.reads[0]),
             unit(&copy.write),
             u8::from(copy.fill)
         )
     };
 
-    let mut released = BTreeSet::new();
-    for (_, work) in pool.groups.values().flat_map(|group| &group.deferred) {
-        match work {
-            Deferred::Release { blocks } => released.extend(blocks.iter().map(&unit)),
-            Deferred::Commit {
-                owner, at, block, ..
-            } => {
-                lines.push(format!("commit o={} p={at} u={}", owner.0, unit(block)));
+    // The stamps work still waits for: the one it waits at and those of its
+    // `rest` that its group's `completed` word has not reached, by group.
+    let pending = |client: ClientId, at: (GroupId, u64), rest: &Stamps| {
+        let completed = |group: GroupId| {
+            pool.groups
+                .get(&(client, group))
+                .map_or(0, |found| found.completed)
+        };
+        let waits: BTreeMap<u8, u64> = std::iter::once(at)
+            .chain(rest.iter().copied())
+            .filter(|(group, stamp)| *stamp > completed(*group))
+            .map(|(group, stamp)| (group.0, stamp))
+            .collect();
+        let named: Vec<String> = waits
+            .into_iter()
+            .map(|(group, stamp)| format!("g{group}:{stamp}"))
+            .collect();
+        named.join(",")
+    };
+
+    for ((client, group), found) in &pool.groups {
+        for (stamp, work) in &found.deferred {
+            let at = (*group, *stamp);
+            match work {
+                Deferred::Release { blocks } => {
+                    let held: BTreeSet<String> = blocks.iter().map(&unit).collect();
+                    lines.push(format!(
+                        "release after={} {}",
+                        pending(*client, at, &Vec::new()),
+                        units(held)
+                    ));
+                }
+                Deferred::Commit {
+                    owner,
+                    at: position,
+                    block,
+                    key,
+                    rest,
+                    ..
+                } => lines.push(format!(
+                    "commit o={} p={position} u={} k={} after={}",
+                    owner.0,
+                    unit(block),
+                    key_name(key),
+                    pending(*client, at, rest)
+                )),
+                Deferred::Finish {
+                    queue,
+                    copy,
+                    ok,
+                    rest,
+                    ..
+                } => {
+                    let copies = pool
+                        .copies
+                        .get(&(*queue, *copy))
+                        .map_or(&[][..], Vec::as_slice);
+                    let after = pending(*client, at, rest);
+                    lines.extend(copies.iter().map(|copy| {
+                        format!(
+                            "finish ok={} after={after} {}",
+                            u8::from(*ok),
+                            copy_line(copy)
+                        )
+                    }));
+                }
+                Deferred::Transfer {
+                    owner, to, rest, ..
+                } => lines.push(format!(
+                    "transfer o={} to=g{} after={}",
+                    owner.0,
+                    to.0,
+                    pending(*client, at, rest)
+                )),
+                Deferred::Replicate {
+                    owner,
+                    at: position,
+                    block,
+                    to,
+                    rest,
+                    ..
+                } => lines.push(format!(
+                    "replicate o={} p={position} to=g{} u={} after={}",
+                    owner.0,
+                    to.0,
+                    unit(block),
+                    pending(*client, at, rest)
+                )),
             }
-            Deferred::Finish {
-                queue, copy, ok, ..
-            } => {
-                let copies = pool
-                    .copies
-                    .get(&(*queue, *copy))
-                    .map_or(&[][..], Vec::as_slice);
-                lines.extend(
-                    copies
-                        .iter()
-                        .map(|copy| format!("finish ok={} {}", u8::from(*ok), copy_line(copy))),
-                );
-            }
-            Deferred::Transfer { owner, to, .. } => {
-                lines.push(format!("transfer o={} to=g{}", owner.0, to.0))
-            }
-            Deferred::Replicate {
-                owner,
-                at,
-                block,
-                to,
-                ..
-            } => lines.push(format!(
-                "replicate o={} p={at} to=g{} u={}",
-                owner.0,
-                to.0,
-                unit(block)
-            )),
         }
-    }
-    if !released.is_empty() {
-        lines.push(format!("release {}", units(released)));
     }
 
     for (task, copies) in &pool.copies {
@@ -1134,11 +1211,12 @@ pub(crate) fn stated(pool: &BufferPool, owners: &[(QueueId, OwnerId)], copies: u
                 group.0,
                 unit(&copies[0].write)
             )),
-            Some(Target::Entry { remote, .. }) if copies[0].deadline.is_some() => {
+            Some(Target::Entry { key, remote }) if copies[0].deadline.is_some() => {
                 let kind = if *remote { "put" } else { "prefetch" };
                 lines.push(format!(
-                    "task {kind} h={} expired={expired}",
-                    unit(&copies[0].write)
+                    "task {kind} h={} expired={expired} k={}",
+                    unit(&copies[0].write),
+                    key_name(key)
                 ));
             }
             _ => lines.extend(
@@ -1148,7 +1226,10 @@ pub(crate) fn stated(pool: &BufferPool, owners: &[(QueueId, OwnerId)], copies: u
             ),
         }
     }
+    // A fact is stated once: two releases of the same blocks at the same
+    // stamp are one line, as they are one release of the model.
     lines.sort_unstable();
+    lines.dedup();
     lines.join("\n")
 }
 

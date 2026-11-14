@@ -106,3 +106,17 @@ rules = ["R2", "R10"]
 assumptions = []
 violated_by = "An evicted block's unit that the free list misses (hazard H12): one unit of the region is in none of the four states."
 status = "proved"
+
+[[property]]
+id = "P8"
+file = "KvP8.tla"
+name = "Placement"
+kind = "safety"
+statement = """A copy reads a block only in a memory that holds it: a device block in its group's \
+memory, a host block on host parts that hold it; a crossing reads its block where it is valid \
+once no batch in flight writes it; a copy fills only host parts that do not hold its block."""
+formulas = ["CopiesPlaced", "CrossingsPlaced"]
+rules = ["R3", "R5", "R11"]
+assumptions = ["A1", "A2", "A4", "A9"]
+violated_by = "A group on one host loads the host copy a group on another host stored, reading a host part that does not hold it (R11 left out): `CopiesPlaced`."
+status = "proved"

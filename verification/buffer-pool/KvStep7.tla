@@ -8,234 +8,6 @@ EXTENDS KvInductive, KvProof, KvFrame, TLAPS
 USE Sizes, Design
 
 -----------------------------------------------------------------------------
-(* A deferred item, and the copy it ends, retire: what they held is let go *)
-(* when nothing else holds it. A release that comes due covers no batch in *)
-(* flight, and no batch in flight runs the copy that ends.                 *)
-
-LEMMA Retire ==
-  ASSUME IndInv, NEW d \in deferred, NEW X, X \subseteq copies, NEW U,
-         d.kind \in {"release", "commit", "finish"},
-         U = d.units \cup UNION {{c.read, c.write} : c \in X},
-         \A c \in X : c.id = d.c /\ d.kind = "finish",
-         d.kind = "release" => \A b \in inflight : d.after[b.g] < b.seq,
-         \A c \in X : \A b \in inflight : ~(c.g = b.g /\ c.seq = b.seq),
-         deferred' = deferred \ {d}, copies' = copies \ X,
-         DropWith(U, table, oslot, cache, hcache, deferred', copies', tasks),
-         valid' \in [Units -> SUBSET Memories],
-         \A u \in Units : valid'[u] = valid[u] \/ (u \in U /\ ~Held(u)'),
-         UNCHANGED <<ostate, ogroup, oslot, table, cache, hcache, ncopy, tasks, trial, member, vis,
-                     dbt, launched, inflight, handoff, requests, remote, lost, bad>>
-  PROVE  IndInv'
-  <1>0. UnitTyped /\ OwnerTyped /\ PlaneTyped /\ WorkTyped /\ RequestTyped
-    BY UnitTypes, OwnerTypes, PlaneTypes, WorkTypes, RequestTypes
-  <1> DEFINE G == ReclaimedWith(U, table, oslot, cache, hcache, deferred', copies', tasks)
-  <1>1. /\ \A x : Held(x)' = HeldIn(x, table, oslot, cache, hcache, deferred', copies', tasks)
-        /\ G = {x \in U : ~Held(x)'}
-        /\ free' = free \cup G /\ alloc' = Reset(alloc, G) /\ sharedKey' = Reset(sharedKey, G)
-    BY DEF Held, DropWith, ReclaimedWith, On, AllRules
-  <1>2. /\ U \subseteq AllUnits
-        /\ \A x \in U : Held(x)
-    BY <1>0 DEF WorkTyped, Held, HeldIn
-  <1>3. /\ \A x \in AllUnits : Held(x)' => Held(x)
-        /\ \A x \in AllUnits : Held(x) => Held(x)' \/ x \in G
-        /\ \A x \in G : Held(x) /\ ~Held(x)'
-        /\ G \subseteq AllUnits
-    <2>1. \A x : HeldIn(x, table, oslot, cache, hcache, deferred', copies', tasks)
-                   => HeldIn(x, table, oslot, cache, hcache, deferred, copies, tasks)
-      BY DEF HeldIn
-    <2>2. \A x : HeldIn(x, table, oslot, cache, hcache, deferred, copies, tasks)
-                   => HeldIn(x, table, oslot, cache, hcache, deferred', copies', tasks) \/ x \in U
-      BY DEF HeldIn
-    <2> QED
-      BY <1>1, <1>2, <2>1, <2>2 DEF Held
-  <1>4. /\ \A v \in AllUnits : alloc'[v] = IF v \in G THEN NONE ELSE alloc[v]
-        /\ \A v \in AllUnits : sharedKey'[v] = IF v \in G THEN NONE ELSE sharedKey[v]
-        /\ \A v \in AllUnits : Held(v)' => alloc'[v] = alloc[v] /\ sharedKey'[v] = sharedKey[v]
-        /\ \A v \in Units : Held(v)' => valid'[v] = valid[v]
-    BY <1>1 DEF Reset
-  (* What stays held after the step.                                       *)
-  <1>5. /\ \A o \in Owners, p \in Positions : \A x \in AllUnits : table[o][p].u = x => Held(x)'
-        /\ \A o \in Owners : \A x \in AllUnits : oslot[o] = x => Held(x)'
-        /\ \A k \in Keys : \A x \in AllUnits : (cache[k] = x \/ hcache[k] = x) => Held(x)'
-        /\ \A e \in deferred' : \A x \in e.units : Held(x)'
-        /\ \A c \in copies' : Held(c.read)' /\ Held(c.write)'
-        /\ \A t \in tasks : t.held => \A x \in t.units \cup {t.slot, t.h} : Held(x)'
-    BY <1>1 DEF HeldIn
-  <1>6. /\ \A e \in deferred' : e \in deferred /\ e # d
-        /\ \A c \in copies' : c \in copies /\ c \notin X
-        /\ \A o \in Owners : Moving(o)' => Moving(o)
-    BY DEF Moving
-  <1>7. TypeInv'
-    <2>1. UnitTyped'
-      BY <1>0, <1>1, <1>3 DEF UnitTyped, Reset
-    <2>2. WorkTyped' /\ RequestTyped'
-      BY <1>0, <1>6 DEF WorkTyped, RequestTyped
-    <2> QED
-      BY <2>1, <2>2, OwnerTypes, PlaneTypes, OwnerTypedFrame, PlaneTypedFrame, TypeInvNext
-  <1>8. FreeClean' /\ NoLeak' /\ Outside' /\ Regions'
-    BY <1>0, <1>1, <1>3, <1>4, FreeReclaim DEF IndInv
-  <1>9. AllocOwner' /\ SharedIff' /\ SharedCached' /\ CacheShared'
-    <2>1. AllocOwner' /\ SharedIff'
-      BY <1>4 DEF IndInv, AllocOwner, SharedIff, NONE
-    <2>2. \A v \in AllUnits : alloc[v] = "shared" /\ v \notin G =>
-            cache[sharedKey[v]] = v \/ hcache[sharedKey[v]] = v
-      BY DEF IndInv, SharedCached
-    <2>3. SharedCached'
-      BY <1>4, <2>2 DEF SharedCached, NONE
-    <2>4. CacheShared'
-      BY <1>0, <1>4, <1>5 DEF IndInv, CacheShared, UnitTyped, AllUnits
-    <2> QED
-      BY <2>1, <2>3, <2>4
-  <1>10. Tables' /\ OwnersOk'
-    <2>1. \A o \in Owners, p \in Positions :
-            table[o][p].u # NONE =>
-              /\ table[o][p].u \in AllUnits
-              /\ alloc'[table[o][p].u] = alloc[table[o][p].u]
-              /\ valid'[table[o][p].u] = valid[table[o][p].u]
-      BY <1>0, <1>4, <1>5 DEF OwnerTyped, Empty, Private, Shared, AllUnits
-    <2>2. \A o \in Owners : oslot[o] # NONE => alloc'[oslot[o]] = alloc[oslot[o]]
-      BY <1>0, <1>4, <1>5 DEF OwnerTyped, AllUnits
-    <2> QED
-      BY <2>1, <2>2 DEF IndInv, Tables, OwnersOk, Live, Mem
-  <1>11. DeferredOk'
-    <2>1. SUFFICES ASSUME NEW e \in deferred' PROVE DeferOk(e)'
-      BY DeferredOkEach
-    <2>2. e \in deferred /\ e # d /\ DeferOk(e) /\ DeferOk(d)
-      BY <1>6, DeferredOkEach DEF IndInv
-    <2>3. e.kind = "commit" => \A u \in e.units : alloc'[u] = alloc[u]
-      BY <1>0, <1>4, <1>5 DEF WorkTyped
-    <2>4. e.kind = "finish" => \A c \in copies : c.id = e.c => c \in copies'
-      BY <2>2 DEF DeferOk
-    <2> QED
-      BY <1>6, <2>2, <2>3, <2>4 DEF DeferOk
-  <1>12. CopiesOk'
-    <2>1. SUFFICES ASSUME NEW c \in copies' PROVE CopyOk(c)'
-      BY CopiesOkEach
-    <2>2. c \in copies /\ CopyOk(c) /\ c.read \in AllUnits /\ c.write \in AllUnits
-      BY <1>0, <1>6, CopiesOkEach DEF IndInv, WorkTyped
-    <2>3. /\ alloc'[c.read] = alloc[c.read] /\ alloc'[c.write] = alloc[c.write]
-          /\ c.write \in Units => valid'[c.write] = valid[c.write]
-      BY <1>4, <1>5, <2>2 DEF AllUnits
-    <2>4. /\ c.id \in 1 .. ncopy'
-          /\ \A x \in copies' : x.id = c.id => x = c
-          /\ c.g \in Groups /\ GroupEpoch[c.g] \notin lost'
-          /\ c.seq <= launched'[c.g]
-          /\ c.done => c.seq > 0
-          /\ c.kind \in {"clone", "load", "store", "save", "restore"}
-          /\ IF c.kind = "save" THEN c.read \in Slots /\ alloc'[c.read] = c.o
-                                ELSE alloc'[c.read] = "shared"
-          /\ c.o \in Owners => OwnerEpoch[c.o] = GroupEpoch[c.g]
-      BY <1>6, <2>2, <2>3 DEF CopyOk
-    <2>5. ~c.fill =>
-            /\ c.kind \in {"clone", "load", "store", "save"}
-            /\ c.kind \in {"clone", "load"} => c.write \in Units /\ alloc'[c.write] = c.o
-            /\ c.kind \in {"clone", "load"} => \A t \in tasks' : c.write \notin t.units
-            /\ c.kind \in {"store", "save"} => c.write \in HostUnits /\ alloc'[c.write] = "copy"
-            /\ \A o \in Owners, p \in Positions : table'[o][p].u # c.write
-            /\ \A x \in copies' : x.write = c.write => x = c
-      BY <1>6, <2>2, <2>3 DEF CopyOk
-    <2>6. c.fill =>
-            \/ /\ c.kind = "load"
-               /\ cache'[c.k] = c.write
-               /\ Mem(c.g) \notin valid'[c.write]
-               /\ \A x \in copies' : (x.write = c.write /\ Mem(x.g) = Mem(c.g)) => x = c
-               /\ \A t \in tasks' :
-                    (t.kind = "transfer" /\ Mem(t.to) = Mem(c.g)) => c.write \notin t.writes
-            \/ c.kind = "restore" /\ c.write \in Slots /\ alloc'[c.write] = c.o
-      <3>1. c.fill /\ c.kind = "load" => c.write \in Units
-        BY <1>0, <2>2 DEF CopyOk, UnitTyped, WorkTyped, AllUnits
-      <3> QED
-        BY <1>6, <2>2, <2>3, <3>1 DEF CopyOk
-    <2>7. /\ c.kind \in {"clone", "load"} =>
-               /\ c.o \in Owners /\ c.p \in Positions
-               /\ table'[c.o][c.p] = Empty
-               /\ \A x \in copies' : (x.o = c.o /\ x.p = c.p) => x = c
-          /\ c.kind \in {"save", "restore"} => c.o \in Owners
-          /\ c.o \in Owners => ostate'[c.o] # "new"
-          /\ (c.o \in Owners /\ Live(c.o)') => ogroup'[c.o] = c.g /\ ~Moving(c.o)'
-      BY <1>6, <2>2 DEF CopyOk, Live
-    <2> QED
-      BY <2>4, <2>5, <2>6, <2>7 DEF CopyOk
-  <1>13. TasksOk'
-    <2>1. SUFFICES ASSUME NEW t \in tasks PROVE TaskOk(t)'
-      BY TasksOkEach
-    <2>2. TaskOk(t)
-      BY TasksOkEach DEF IndInv
-    <2>3. \A u \in t.units \cup {t.slot, t.h} : u # NONE =>
-            alloc'[u] = alloc[u] /\ (u \in Units => valid'[u] = valid[u])
-      BY <1>0, <1>4, <1>5, <2>2 DEF TaskOk, WorkTyped, AllUnits
-    <2>4. t.kind = "transfer" =>
-            /\ t.writes \subseteq t.units /\ t.slot # NONE /\ t.writes \subseteq Units
-            /\ (Live(t.o) => \A u \in TableUnits(t.o) : valid'[u] = valid[u])
-      <3>1. \A o \in Owners : \A u \in TableUnits(o) : u \in Units /\ Held(u)'
-        BY <1>0, <1>5 DEF TableUnits, OwnerTyped, Empty, Private, Shared, AllUnits
-      <3> QED
-        BY <1>4, <2>2, <3>1 DEF TaskOk
-    <2>5. t.kind = "prefetch" => t.h # NONE
-      BY <2>2 DEF TaskOk
-    <2> QED
-      BY <1>6, <2>2, <2>3, <2>4, <2>5 DEF TaskOk, Live, TableUnits, Mem
-  <1>14. /\ MovingUnmapped' /\ LostOk' /\ TablesMapped' /\ HandoffOk' /\ RequestsOk'
-         /\ TrialVisibility' /\ NoBad'
-    <2>1. MovingUnmapped' /\ TablesMapped' /\ HandoffOk'
-      BY <1>6 DEF IndInv, MovingUnmapped, TablesMapped, HandoffOk, Live, HoldsAt, Moving
-    <2>2. LostOk' /\ NoBad'
-      BY DEF IndInv, LostOk, NoBad
-    <2>3. RequestsOk' /\ TrialVisibility'
-      BY <1>6 DEF IndInv, RequestsOk, TrialVisibility, MadeBy
-    <2> QED
-      BY <2>1, <2>2, <2>3
-  <1>15. BatchesOk'
-    <2>1. SUFFICES ASSUME NEW b \in inflight PROVE BatchOk(b)'
-      BY BatchesOkEach
-    <2>2. BatchOk(b)
-      BY BatchesOkEach DEF IndInv
-    <2>3. ASSUME NEW o \in Owners, NEW u \in AllUnits, Covered(b, o, u)
-          PROVE  Covered(b, o, u)' /\ Held(u)'
-      <3>1. CASE /\ Live(o) /\ ogroup[o] = b.g
-                 /\ \E p \in Rows :
-                      /\ HoldsAt(o, p, u)
-                      /\ \A x \in requests :
-                           TakesRow(x, o, p) =>
-                               b.g \in x.sg /\ (b.g \in x.by => x.after[b.g] >= b.seq)
-                 /\ \A e \in deferred : (e.kind = "transfer" /\ e.o = o) => e.after[b.g] >= b.seq
-                 /\ ~\E t \in tasks : t.kind = "transfer" /\ t.o = o
-        <4>1. Covered(b, o, u)'
-          BY <1>6, <3>1 DEF Covered, Live, HoldsAt
-        <4>2. Held(u)'
-          BY <1>5, <3>1 DEF HoldsAt, Rows
-        <4> QED
-          BY <4>1, <4>2
-      <3>2. CASE \E e \in deferred : e.kind = "release" /\ u \in e.units /\ e.after[b.g] >= b.seq
-        <4>1. PICK e \in deferred : e.kind = "release" /\ u \in e.units /\ e.after[b.g] >= b.seq
-          BY <3>2
-        <4>2. e # d
-          <5>1. b.g \in Groups /\ b.seq \in Nat /\ e.after[b.g] \in Nat
-            BY <1>0, <2>2 DEF BatchOk, WorkTyped, Stamps
-          <5> QED
-            BY <4>1, <5>1
-        <4>3. e \in deferred'
-          BY <4>1, <4>2
-        <4> QED
-          BY <1>5, <4>1, <4>3 DEF Covered
-      <3> QED
-        BY <2>3, <3>1, <3>2 DEF Covered
-    <2>4. \A x \in b.reads : x[1] \in Owners /\ x[2] \in AllUnits /\ x[2] \notin free
-                             /\ Covered(b, x[1], x[2])
-      BY <1>0, <2>2 DEF BatchOk, RequestTyped
-    <2>5. \A x \in b.reads :
-            /\ Covered(b, x[1], x[2])' /\ x[2] \notin free' /\ alloc'[x[2]] = alloc[x[2]]
-            /\ x[2] \in Units => valid'[x[2]] = valid[x[2]]
-      BY <1>1, <1>4, <2>3, <2>4
-    <2>6. /\ \A x \in b.cw : \E c \in copies' : c.write = x /\ c.g = b.g /\ c.seq = b.seq
-          /\ \A x \in b.cr : \E c \in copies' : c.read = x /\ c.g = b.g /\ c.seq = b.seq
-      BY <2>2 DEF BatchOk
-    <2> QED
-      BY <1>6, <2>2, <2>5, <2>6 DEF BatchOk, Mem
-  <1> QED
-    BY <1>7, <1>8, <1>9, <1>10, <1>11, <1>12, <1>13, <1>14, <1>15 DEF IndInv
-
------------------------------------------------------------------------------
 (* ReleaseDue                                                              *)
 
 LEMMA ReleaseDue_Inv ==
@@ -253,8 +25,8 @@ LEMMA ReleaseDue_Inv ==
   <1>3. /\ d.units = d.units \cup UNION {{c.read, c.write} : c \in {}}
         /\ copies' = copies \ {}
     BY <1>1
-  <1>4. valid' \in [Units -> SUBSET Memories]
-    BY <1>1, UnitTypes DEF UnitTyped
+  <1>4. ValidTyped'
+    BY <1>1, UnitTypes DEF UnitTyped, ValidTyped
   <1> QED
     BY <1>1, <1>2, <1>3, <1>4, Retire
 
@@ -514,19 +286,29 @@ LEMMA CommitDue_Share ==
       BY <1>2 DEF Shared
     <2>4. \A x \in deferred' : x \in deferred /\ (x.kind = "commit" => u \notin x.units)
       BY <1>1
+    (* A reader's row reads validity and the owner's group, which stay.    *)
+    <2>7. \A g \in Groups, o \in Owners, p \in Rows : \A x, wr :
+            ReaderRow(g, o, p, x, wr)' = ReaderRow(g, o, p, x, wr)
+      BY DEF ReaderRow, ReadersOf, Mem
     <2>5. TablesMapped'
       <3> SUFFICES ASSUME NEW g \in Groups, NEW o \in Owners, NEW p \in Rows, dbt[g][o][p].u # NONE
-                   PROVE  (/\ Live(o) /\ ogroup[o] = g
-                           /\ HoldsAt(o, p, dbt[g][o][p].u)
-                           /\ (p \in Positions /\ dbt[g][o][p].w) =>
-                                /\ table[o][p].k = "private"
-                                /\ ~\E e \in deferred :
-                                      e.kind = "commit" /\ dbt[g][o][p].u \in e.units)'
+                   PROVE  /\ Live(o)'
+                          /\ \/ ogroup'[o] = g
+                             \/ ReaderRow(g, o, p, dbt[g][o][p].u, dbt[g][o][p].w)'
+                          /\ HoldsAt(o, p, dbt[g][o][p].u)'
+                          /\ (p \in Positions /\ dbt[g][o][p].w) =>
+                               /\ table'[o][p].k = "private"
+                               /\ ~\E e \in deferred' :
+                                     e.kind \in {"commit", "replicate"} /\ dbt[g][o][p].u \in e.units
+                               /\ ~\E t \in tasks' : t.kind = "replicate" /\ dbt[g][o][p].u \in t.units
         BY DEF TablesMapped
-      <3>1. /\ Live(o) /\ ogroup[o] = g /\ HoldsAt(o, p, dbt[g][o][p].u)
+      <3>1. /\ Live(o) /\ (ogroup[o] = g \/ ReaderRow(g, o, p, dbt[g][o][p].u, dbt[g][o][p].w))
+            /\ HoldsAt(o, p, dbt[g][o][p].u)
             /\ (p \in Positions /\ dbt[g][o][p].w) =>
                  /\ table[o][p].k = "private"
-                 /\ ~\E e \in deferred : e.kind = "commit" /\ dbt[g][o][p].u \in e.units
+                 /\ ~\E e \in deferred :
+                       e.kind \in {"commit", "replicate"} /\ dbt[g][o][p].u \in e.units
+                 /\ ~\E t \in tasks : t.kind = "replicate" /\ dbt[g][o][p].u \in t.units
         BY DEF IndInv, TablesMapped
       <3>2. (p \in Positions /\ dbt[g][o][p].w) => dbt[g][o][p].u # u
         BY <3>1
@@ -536,24 +318,28 @@ LEMMA CommitDue_Share ==
         <4> QED
           BY <1>2, <3>1, <4>1 DEF Private
       <3> QED
-        BY <2>2, <2>4, <3>1, <3>3 DEF Live
+        BY <2>2, <2>4, <2>7, <3>1, <3>3 DEF Live
     <2>6. HandoffOk'
       <3> SUFFICES ASSUME NEW h \in handoff
-                   PROVE  (/\ h.o \in Owners /\ h.g \in Groups /\ GroupEpoch[h.g] = OwnerEpoch[h.o]
-                           /\ (~\E r \in requests : Names(r, h)) =>
-                                /\ Live(h.o) /\ ogroup[h.o] = h.g
-                                /\ HoldsAt(h.o, h.p, h.u)
-                                /\ (h.p \in Positions /\ h.w) =>
-                                     /\ table[h.o][h.p].k = "private"
-                                     /\ ~\E e \in deferred : e.kind = "commit" /\ h.u \in e.units)'
+                   PROVE  /\ h.o \in Owners /\ h.g \in Groups /\ GroupEpoch[h.g] = OwnerEpoch[h.o]
+                          /\ (~\E r \in requests' : Names(r, h)') =>
+                               /\ Live(h.o)'
+                               /\ ogroup'[h.o] = h.g \/ ReaderRow(h.g, h.o, h.p, h.u, h.w)'
+                               /\ HoldsAt(h.o, h.p, h.u)'
+                               /\ (h.p \in Positions /\ h.w) =>
+                                    /\ table'[h.o][h.p].k = "private"
+                                    /\ ~\E e \in deferred' :
+                                          e.kind \in {"commit", "replicate"} /\ h.u \in e.units
+                                    /\ ~\E t \in tasks' : t.kind = "replicate" /\ h.u \in t.units
         BY DEF HandoffOk
       <3>1. /\ h.o \in Owners /\ h.g \in Groups /\ GroupEpoch[h.g] = OwnerEpoch[h.o]
             /\ (~\E r \in requests : Names(r, h)) =>
-                 /\ Live(h.o) /\ ogroup[h.o] = h.g
+                 /\ Live(h.o) /\ (ogroup[h.o] = h.g \/ ReaderRow(h.g, h.o, h.p, h.u, h.w))
                  /\ HoldsAt(h.o, h.p, h.u)
                  /\ (h.p \in Positions /\ h.w) =>
                       /\ table[h.o][h.p].k = "private"
-                      /\ ~\E e \in deferred : e.kind = "commit" /\ h.u \in e.units
+                      /\ ~\E e \in deferred : e.kind \in {"commit", "replicate"} /\ h.u \in e.units
+                      /\ ~\E t \in tasks : t.kind = "replicate" /\ h.u \in t.units
         BY DEF IndInv, HandoffOk
       <3>2. ((~\E r \in requests : Names(r, h)) /\ h.p \in Positions /\ h.w) =>
               table'[h.o][h.p].k = "private"
@@ -563,8 +349,10 @@ LEMMA CommitDue_Share ==
           BY <1>2, <3>1, <4>1 DEF HoldsAt, Private
       <3>3. h.p \in Rows
         BY <1>0 DEF RequestTyped
+      <3>4. (\E r \in requests' : Names(r, h)') <=> (\E r \in requests : Names(r, h))
+        BY DEF Names
       <3> QED
-        BY <2>2, <2>4, <3>1, <3>2, <3>3 DEF Live
+        BY <2>2, <2>4, <2>7, <3>1, <3>2, <3>3, <3>4 DEF Live
     <2> QED
       BY <2>1, <2>5, <2>6
   <1>12. TrialVisibility'
@@ -589,6 +377,14 @@ LEMMA CommitDue_Share ==
     <2>6. /\ cache'[d.k] = u
           /\ vis'[d.k].d = MadeBy(OwnerEpoch[d.o]) /\ vis'[d.k].h = vis[d.k].h
       BY <1>1, <1>2
+    (* A crossing of the block is its owner's: the block is private to it. *)
+    <2>9. \A t \in tasks : (t.kind = "replicate" /\ u \in t.units) => t.o = d.o
+      <3> SUFFICES ASSUME NEW t \in tasks, t.kind = "replicate", u \in t.units PROVE t.o = d.o
+        OBVIOUS
+      <3>1. CrossTaskOk(t)
+        BY CrossingsOkEach DEF IndInv
+      <3> QED
+        BY <3>1 DEF CrossTaskOk
     <2> SUFFICES ASSUME NEW k \in Keys
                  PROVE  /\ (cache'[k] # NONE /\ vis'[k].d # NONE) =>
                              /\ \A o \in Owners, p \in Positions :
@@ -599,9 +395,14 @@ LEMMA CommitDue_Share ==
                              /\ \A t \in tasks : t.kind = "put" => t.h # hcache[k]
                         /\ \A c \in copies :
                              (c.kind = "load" /\ c.fill /\ c.k = k) => vis'[k].d = MadeBy(GroupEpoch[c.g])
+                        /\ \A c \in copies :
+                             (c.kind = "store" /\ c.fill /\ c.k = k) => vis'[k].h = MadeBy(GroupEpoch[c.g])
+                        /\ \A t \in tasks :
+                             (t.kind = "replicate" /\ cache'[k] \in t.units) =>
+                                 vis'[k].d = MadeBy(OwnerEpoch[t.o])
       BY DEF TrialVisibility, MadeBy
     <2>7. CASE k = d.k
-      BY <1>1, <2>0, <2>2, <2>3, <2>4, <2>6, <2>7 DEF TrialVisibility
+      BY <1>1, <2>0, <2>2, <2>3, <2>4, <2>6, <2>7, <2>9 DEF TrialVisibility
     <2>8. CASE k # d.k
       <3>1. cache[k] # NONE => cache[k] \in Units
         BY <1>0 DEF UnitTyped
@@ -620,13 +421,59 @@ LEMMA CommitDue_Share ==
       <3>2. \A e \in deferred : e.kind \in {"release", "transfer"} => e \in deferred'
         OBVIOUS
       <3> QED
-        BY <3>1, <3>2 DEF Covered, Live
+        BY <3>1, <3>2 DEF Covered, Live, ReadersOf
     <2>4. \A x \in b.reads : x[2] \in AllUnits
       BY <1>0, <2>2 DEF RequestTyped
     <2> QED
       BY <1>1, <1>2, <2>2, <2>3, <2>4 DEF BatchOk, Mem
+  (* A crossing of the block is its owner's, and the commit makes the block *)
+  (* visible as that owner's epoch makes it.                               *)
+  <1>14. CrossingsOk'
+    <2>1. \A o \in Owners : Moving(o)' = Moving(o)
+      BY DEF Moving
+    <2>2. \A e \in deferred' : CrossWaitOk(e)'
+      <3> SUFFICES ASSUME NEW e \in deferred', e.kind = "replicate" PROVE CrossWaitOk(e)'
+        BY DEF CrossWaitOk
+      <3>1. e \in deferred /\ CrossWaitOk(e)
+        BY CrossingsOkEach DEF IndInv
+      <3>2. PICK v \in Units : e.units = {v} /\ (alloc[v] = e.o \/ alloc[v] = "shared")
+        BY <3>1 DEF CrossWaitOk
+      <3>3. v = u => e.o = d.o
+        BY <3>2
+      <3>4. alloc'[v] = e.o \/ alloc'[v] = "shared"
+        BY <1>2, <3>2 DEF AllUnits
+      <3>5. \A k \in Keys : cache'[k] \in e.units => vis'[k].d = MadeBy(OwnerEpoch[e.o])
+        <4> SUFFICES ASSUME NEW k \in Keys, cache'[k] \in e.units
+                     PROVE  vis'[k].d = MadeBy(OwnerEpoch[e.o])
+          OBVIOUS
+        <4>1. CASE k = d.k
+          BY <1>2, <3>2, <3>3, <4>1
+        <4>2. CASE k # d.k
+          BY <1>2, <3>1, <4>2 DEF CrossWaitOk
+        <4> QED
+          BY <4>1, <4>2
+      <3> QED
+        BY <2>1, <3>1, <3>2, <3>4, <3>5 DEF CrossWaitOk, ReadersOf, MadeBy
+    <2>3. \A t \in tasks' : CrossTaskOk(t)'
+      <3> SUFFICES ASSUME NEW t \in tasks, t.kind = "replicate" PROVE CrossTaskOk(t)'
+        BY DEF CrossTaskOk
+      <3>1. CrossTaskOk(t)
+        BY CrossingsOkEach DEF IndInv
+      <3>2. \A x \in t.writes : x \in AllUnits /\ (alloc'[x] = t.o \/ alloc'[x] = "shared")
+        <4> SUFFICES ASSUME NEW x \in t.writes PROVE x \in AllUnits /\ (alloc'[x] = t.o \/ alloc'[x] = "shared")
+          OBVIOUS
+        <4>1. x \in Units /\ (alloc[x] = t.o \/ alloc[x] = "shared")
+          BY <3>1 DEF CrossTaskOk
+        <4> QED
+          BY <1>2, <4>1 DEF AllUnits
+      <3> QED
+        BY <2>1, <3>1, <3>2 DEF CrossTaskOk, ReadersOf, Mem
+    <2> QED
+      BY <2>2, <2>3, CrossingsOkEach
+  <1>15. CopiesPlaced' /\ CrossingsPlaced'
+    BY TransfersFrame, CopiesPlacedFrame, CrossingsPlacedFrame DEF IndInv
   <1> QED
-    BY <1>4, <1>5, <1>6, <1>7, <1>8, <1>9, <1>10, <1>11, <1>12, <1>13 DEF IndInv
+    BY <1>4, <1>5, <1>6, <1>7, <1>8, <1>9, <1>10, <1>11, <1>12, <1>13, <1>14, <1>15 DEF IndInv
 
 LEMMA CommitDue_Inv ==
   ASSUME IndInv, NEW d \in deferred, CommitDue(d), UNCHANGED rare
@@ -653,10 +500,10 @@ LEMMA CommitDue_Inv ==
   <1>3. CASE cache[d.k] # NONE
     <2>1. /\ d.units = d.units \cup UNION {{c.read, c.write} : c \in {}}
           /\ copies' = copies \ {}
-          /\ valid' \in [Units -> SUBSET Memories]
+          /\ ValidTyped'
           /\ DropWith(d.units, table, oslot, cache, hcache, deferred', copies', tasks)
           /\ UNCHANGED <<table, cache, valid, vis>>
-      BY <1>1, <1>2, <1>3, UnitTypes DEF UnitTyped
+      BY <1>1, <1>2, <1>3, UnitTypes DEF UnitTyped, ValidTyped
     <2> QED
       BY <1>1, <2>1, Retire
   <1>4. CASE cache[d.k] = NONE
@@ -725,17 +572,22 @@ EndStep(d, c) ==
             [] d.ok /\ c.kind = "restore" ->
                  /\ Drop({c.read, c.write}, table, oslot, cache, hcache, deferred', copies')
                  /\ UNCHANGED <<table, cache, hcache, valid, dbt, handoff>>
-            [] d.ok /\ c.kind \in {"store", "save"} ->
+            [] d.ok /\ c.kind = "store" /\ c.fill ->
+                 /\ valid' = [valid EXCEPT ![c.write] = @ \cup c.parts]
+                 /\ Drop({c.read}, table, oslot, cache, hcache, deferred', copies')
+                 /\ UNCHANGED <<table, cache, hcache, dbt, handoff>>
+            [] d.ok /\ c.kind \in {"store", "save"} /\ ~c.fill ->
                  IF On("R4") /\ hcache[c.k] # NONE
                  THEN /\ Drop({c.read, c.write}, table, oslot, cache, hcache, deferred', copies')
                       /\ UNCHANGED <<table, cache, hcache, valid, dbt, handoff>>
                  ELSE /\ hcache' = [hcache EXCEPT ![c.k] = c.write]
+                      /\ valid' = [valid EXCEPT ![c.write] = GroupParts[c.g]]
                       /\ LET gone == ReclaimedWith({c.read}, table, oslot, cache, hcache',
                                                    deferred', copies', tasks)
                          IN /\ free' = free \cup gone
                             /\ alloc' = [Reset(alloc, gone) EXCEPT ![c.write] = "shared"]
                             /\ sharedKey' = [Reset(sharedKey, gone) EXCEPT ![c.write] = c.k]
-                      /\ UNCHANGED <<table, cache, valid, dbt, handoff>>
+                      /\ UNCHANGED <<table, cache, dbt, handoff>>
 
 Target(c) == c.o # NONE /\ ostate[c.o] = "live" /\ table[c.o][c.p] = Empty
 Entry(c, wr) == [g |-> c.g, o |-> c.o, p |-> c.p, u |-> c.write, w |-> wr]
@@ -819,7 +671,7 @@ LEMMA FinishDue_Facts ==
     <2>3. \A k \in Keys : cache[k] # c.write /\ hcache[k] # c.write
       BY <1>0, <2>1 DEF IndInv, CacheShared, SharedIff, UnitTyped, AllUnits
     <2>4. \A e \in deferred : c.write \notin e.units
-      BY <2>1 DEF IndInv, DeferredOk
+      BY <2>1 DEF IndInv, DeferredOk, CrossingsOk
     <2>5. \A x \in copies : x # c => x.read # c.write
       BY <2>1 DEF IndInv, CopiesOk
     <2>6. \A b \in inflight : \A x \in b.reads : x[2] # c.write
@@ -885,17 +737,60 @@ LEMMA EndUnits ==
 (* The control plane after deferred work and copies end and nothing else  *)
 (* it reads changes.                                                       *)
 LEMMA EndPlane ==
-  ASSUME MovingUnmapped, LostOk, TablesMapped, HandoffOk, RequestsOk, NoBad,
+  ASSUME TypeInv, MovingUnmapped, LostOk, TablesMapped, HandoffOk, RequestsOk, NoBad,
          deferred' \subseteq deferred, copies' \subseteq copies,
          UNCHANGED <<ostate, ogroup, oslot, table, tasks, dbt, launched, ncopy, inflight, handoff,
-                     requests, lost, bad>>
+                     requests, lost, bad>>,
+         \A u \in Units : (\E q \in Owners, r \in Positions : table[q][r].u = u) =>
+                           valid[u] \subseteq valid'[u]
   PROVE  MovingUnmapped' /\ LostOk' /\ TablesMapped' /\ HandoffOk' /\ RequestsOk' /\ NoBad'
   <1>1. MovingUnmapped'
     BY DEF MovingUnmapped
   <1>2. LostOk' /\ NoBad'
     BY DEF LostOk, NoBad
+  (* A reader's row names a block a table holds, which stays valid there.  *)
+  <1>5. \A o \in Owners, p \in Positions, g \in Groups : \A x, wr :
+          (x = table[o][p].u /\ x # NONE /\ ReaderRow(g, o, p, x, wr)) => ReaderRow(g, o, p, x, wr)'
+    <2> SUFFICES ASSUME NEW o \in Owners, NEW p \in Positions, NEW g \in Groups, NEW x, NEW wr,
+                        x = table[o][p].u, x # NONE, ReaderRow(g, o, p, x, wr)
+                 PROVE  ReaderRow(g, o, p, x, wr)'
+      OBVIOUS
+    <2>1. x \in Units
+      BY DEF TypeInv, TypeOK
+    <2>2. valid[x] \subseteq valid'[x]
+      BY <2>1
+    <2>3. ReadersOf(o)' = ReadersOf(o)
+      BY DEF ReadersOf
+    <2> QED
+      BY <2>2, <2>3 DEF ReaderRow, Mem
   <1>3. TablesMapped' /\ HandoffOk'
-    BY DEF TablesMapped, HandoffOk, Live, HoldsAt
+    <2>1. TablesMapped'
+      <3> SUFFICES ASSUME NEW g \in Groups, NEW o \in Owners, NEW p \in Rows, dbt[g][o][p].u # NONE
+                   PROVE  ReaderRow(g, o, p, dbt[g][o][p].u, dbt[g][o][p].w)
+                            => ReaderRow(g, o, p, dbt[g][o][p].u, dbt[g][o][p].w)'
+        BY DEF TablesMapped, Live, HoldsAt
+      <3> SUFFICES ASSUME ReaderRow(g, o, p, dbt[g][o][p].u, dbt[g][o][p].w)
+                   PROVE  ReaderRow(g, o, p, dbt[g][o][p].u, dbt[g][o][p].w)'
+        OBVIOUS
+      <3>1. p \in Positions /\ dbt[g][o][p].u = table[o][p].u
+        BY DEF TablesMapped, ReaderRow, HoldsAt
+      <3> QED
+        BY <1>5, <3>1 DEF ReaderRow, Mem
+    <2>2. HandoffOk'
+      <3> SUFFICES ASSUME NEW h \in handoff, ~\E r \in requests : Names(r, h)
+                   PROVE  ReaderRow(h.g, h.o, h.p, h.u, h.w) => ReaderRow(h.g, h.o, h.p, h.u, h.w)'
+        BY DEF HandoffOk, Live, HoldsAt
+      <3> SUFFICES ASSUME ReaderRow(h.g, h.o, h.p, h.u, h.w)
+                   PROVE  ReaderRow(h.g, h.o, h.p, h.u, h.w)'
+        OBVIOUS
+      <3>1. h.o \in Owners /\ h.g \in Groups /\ h.u \in AllUnits
+        BY DEF HandoffOk, TypeInv
+      <3>2. h.p \in Positions /\ h.u = table[h.o][h.p].u /\ h.u # NONE
+        BY <3>1 DEF HandoffOk, ReaderRow, HoldsAt, AllUnits
+      <3> QED
+        BY <1>5, <3>1, <3>2 DEF ReaderRow, Mem
+    <2> QED
+      BY <2>1, <2>2
   <1>4. RequestsOk'
     BY DEF RequestsOk
   <1> QED
@@ -907,6 +802,66 @@ LEMMA EndVisible ==
          UNCHANGED <<cache, hcache, vis, table, tasks, trial>>
   PROVE  TrialVisibility'
   BY DEF TrialVisibility, MadeBy
+
+(* The crossings after deferred work and copies end: the tasks and the     *)
+(* owners stay, no block a crossing holds changes its allocation or        *)
+(* becomes valid in the memory a crossing writes, and a key whose device   *)
+(* block or its visibility changes is cached under no block a waiting      *)
+(* crossing holds.                                                         *)
+LEMMA EndCrossings ==
+  ASSUME CrossingsOk, deferred' \subseteq deferred, copies' \subseteq copies,
+         UNCHANGED <<tasks, ostate, ogroup, lost, trial>>,
+         \A d \in deferred' : d.kind = "replicate" => \A u \in d.units : alloc'[u] = alloc[u],
+         \A t \in tasks : t.kind = "replicate" =>
+           \A u \in t.writes :
+             alloc'[u] = alloc[u] /\ (Mem(t.to) \notin valid[u] => Mem(t.to) \notin valid'[u]),
+         \A k \in Keys : ~(cache'[k] = cache[k] /\ vis'[k].d = vis[k].d) =>
+           \A d \in deferred' : d.kind = "replicate" => cache'[k] \notin d.units
+  PROVE  CrossingsOk'
+  <1>1. \A o \in Owners : Moving(o)' => Moving(o)
+    BY DEF Moving
+  <1>2. \A d \in deferred' : CrossWaitOk(d)'
+    <2> SUFFICES ASSUME NEW d \in deferred', d.kind = "replicate" PROVE CrossWaitOk(d)'
+      BY DEF CrossWaitOk
+    <2>1. d \in deferred /\ CrossWaitOk(d)
+      BY CrossingsOkEach
+    <2>2. \A k \in Keys : cache'[k] \in d.units => vis'[k].d = MadeBy(OwnerEpoch[d.o])'
+      <3> SUFFICES ASSUME NEW k \in Keys, cache'[k] \in d.units
+                   PROVE  vis'[k].d = MadeBy(OwnerEpoch[d.o])'
+        OBVIOUS
+      <3>1. cache'[k] = cache[k] /\ vis'[k].d = vis[k].d
+        OBVIOUS
+      <3> QED
+        BY <2>1, <3>1 DEF CrossWaitOk, MadeBy
+    <2> QED
+      BY <1>1, <2>1, <2>2 DEF CrossWaitOk, ReadersOf
+  <1>3. \A t \in tasks' : CrossTaskOk(t)'
+    <2> SUFFICES ASSUME NEW t \in tasks, t.kind = "replicate" PROVE CrossTaskOk(t)'
+      BY DEF CrossTaskOk
+    <2>1. CrossTaskOk(t)
+      BY CrossingsOkEach
+    <2> QED
+      BY <1>1, <2>1 DEF CrossTaskOk, ReadersOf, Mem
+  <1> QED
+    BY <1>2, <1>3, CrossingsOkEach
+
+(* Placement after copies end: a copy that stays reads a block that stays  *)
+(* valid where it was, and the host parts a fill writes keep their         *)
+(* validity; a crossing's block stays valid where it was.                  *)
+LEMMA EndPlaced ==
+  ASSUME CopiesPlaced, CrossingsPlaced, copies' \subseteq copies,
+         UNCHANGED <<tasks, ogroup, inflight>>,
+         \A c \in copies' :
+           /\ c.read \in Units \cup HostUnits => valid[c.read] \subseteq valid'[c.read]
+           /\ (c.fill /\ c.write \in HostUnits) => valid'[c.write] = valid[c.write],
+         \A t \in tasks : t.kind = "replicate" => \A u \in t.units : valid[u] \subseteq valid'[u]
+  PROVE  CopiesPlaced' /\ CrossingsPlaced'
+  <1>1. CopiesPlaced'
+    BY DEF CopiesPlaced, Mem
+  <1>2. CrossingsPlaced'
+    BY DEF CrossingsPlaced, Mem
+  <1> QED
+    BY <1>1, <1>2
 
 (* The tables after a step that fills at most one empty position, of a     *)
 (* live owner, with a block valid in the owner's memory, and keeps the     *)
@@ -1013,9 +968,12 @@ LEMMA FinishDue_Drop ==
     BY FinishDue_Facts
   <1>2. {c.read, c.write} = d.units \cup UNION {{x.read, x.write} : x \in {c}}
     BY <1>1
-  <1>3. valid' \in [Units -> SUBSET Memories]
-    BY <1>0, <1>1 DEF UnitTyped, Memories, Mem
-  <1>4. \A u \in Units : valid'[u] = valid[u] \/ (u \in {c.read, c.write} /\ ~Held(u)')
+  <1>3. ValidTyped'
+    <2>1. (~c.fill /\ c.kind \in {"clone", "load"}) => c.write \in Units
+      BY FinishDue_Facts
+    <2> QED
+      BY <1>0, <1>1, <2>1 DEF UnitTyped, ValidTyped, Memories, Mem
+  <1>4. \A u \in Units \cup HostUnits : valid'[u] = valid[u] \/ (u \in {c.read, c.write} /\ ~Held(u)')
     <2>1. CASE valid' = valid
       BY <2>1
     <2>2. CASE /\ ~c.fill /\ c.kind \in {"clone", "load"}
@@ -1075,6 +1033,7 @@ LEMMA FinishDue_Private ==
   <1>4. /\ \A q \in Owners, r \in Positions :
              table'[q][r] = IF q = o /\ r = p THEN Private(w) ELSE table[q][r]
         /\ \A u \in Units : valid'[u] = IF u = w THEN {Mem(c.g)} ELSE valid[u]
+        /\ \A u \in HostUnits : valid'[u] = valid[u]
     BY <1>0, <1>1 DEF OwnerTyped, UnitTyped
   <1>5. \A x \in AllUnits : Held(x)' = Held(x)
     <2>1. \A x \in AllUnits : (x # w /\ x # c.read) =>
@@ -1209,8 +1168,13 @@ LEMMA FinishDue_Private ==
       BY <1>4
     <2>4. table'[o][p].u = w
       BY <1>1, <1>4 DEF Private
+    <2>5. /\ wr => \A t \in tasks' : w \notin t.units
+          /\ \A t \in tasks' : t.kind \in {"transfer", "replicate"} => t \in tasks
+          /\ \A u \in Units : (\E q \in Owners, r \in Positions : table[q][r].u = u) =>
+                              valid[u] \subseteq valid'[u]
+      BY <1>1, <1>4
     <2> QED
-      BY <1>1, <2>1, <2>2, <2>3, <2>4, FillPlane DEF Live
+      BY <1>1, <2>1, <2>2, <2>3, <2>4, <2>5, FillPlane DEF Live
   <1>14. TrialVisibility' /\ NoBad'
     BY <1>1, <1>4 DEF IndInv, TrialVisibility, MadeBy, NoBad, Private, Shared
   <1>15. BatchesOk'
@@ -1222,7 +1186,7 @@ LEMMA FinishDue_Private ==
       <3>1. \A q \in Owners, r \in Rows : \A x \in AllUnits : HoldsAt(q, r, x) => HoldsAt(q, r, x)'
         BY <1>1, <1>4 DEF HoldsAt, Rows, Empty, AllUnits
       <3> QED
-        BY <3>1 DEF Covered, Live
+        BY <3>1 DEF Covered, Live, ReadersOf
     <2>4. \A y \in b.reads : y[1] \in Owners /\ y[2] \in AllUnits /\ y[2] # w
       BY <1>0, <1>1, <2>2 DEF BatchOk, RequestTyped
     <2>5. \A y \in b.writes, r \in Positions : table'[y[1]][r].u = y[2] => table[y[1]][r].u = y[2]
@@ -1232,9 +1196,41 @@ LEMMA FinishDue_Private ==
       BY <1>1, <2>2 DEF BatchOk
     <2> QED
       BY <1>4, <1>6, <2>2, <2>3, <2>4, <2>5, <2>6 DEF BatchOk, Mem
-
+  (* The new block is no crossing's, no copy's but this one's, and in no   *)
+  (* table: what the crossings and the placement read stays.               *)
+  <1>16. /\ \A t \in tasks : t.kind = "replicate" => w \notin t.writes
+         /\ \A x \in copies' : x.read # w /\ x.write # w
+    <2>1. \A t \in tasks : t.kind = "replicate" => t.writes = t.units
+      BY CrossingsOkEach DEF IndInv, CrossTaskOk
+    <2> QED
+      BY <1>1, <2>1
+  <1>17. CrossingsOk'
+    <2>1. \A d0 \in deferred' : d0.kind = "replicate" => \A u \in d0.units : alloc'[u] = alloc[u]
+      BY <1>6
+    <2>2. \A t \in tasks : t.kind = "replicate" =>
+            \A u \in t.writes :
+              alloc'[u] = alloc[u] /\ (Mem(t.to) \notin valid[u] => Mem(t.to) \notin valid'[u])
+      <3>1. \A t \in tasks : t.kind = "replicate" => t.writes \subseteq Units
+        BY DEF IndInv, CrossingsOk
+      <3> QED
+        BY <1>4, <1>6, <1>16, <3>1
+    <2>3. \A k \in Keys : cache'[k] = cache[k] /\ vis'[k].d = vis[k].d
+      OBVIOUS
+    <2> QED
+      BY <2>1, <2>2, <2>3, EndCrossings DEF IndInv
+  <1>18. CopiesPlaced' /\ CrossingsPlaced'
+    <2>1. \A t \in tasks : t.kind = "replicate" => \A u \in t.units : u \in Units /\ u # w
+      BY <1>1 DEF IndInv, CrossingsOk
+    <2>2. \A x \in copies' :
+            /\ x.read \in Units \cup HostUnits => valid[x.read] \subseteq valid'[x.read]
+            /\ (x.fill /\ x.write \in HostUnits) => valid'[x.write] = valid[x.write]
+      BY <1>4, <1>16
+    <2>3. \A t \in tasks : t.kind = "replicate" => \A u \in t.units : valid[u] \subseteq valid'[u]
+      BY <1>4, <2>1
+    <2> QED
+      BY <2>2, <2>3, EndPlaced DEF IndInv
   <1> QED
-    BY <1>7, <1>8, <1>9, <1>10, <1>11, <1>12, <1>13, <1>14, <1>15 DEF IndInv
+    BY <1>7, <1>8, <1>9, <1>10, <1>11, <1>12, <1>13, <1>14, <1>15, <1>17, <1>18 DEF IndInv
 
 (* A load that filled its group's memory of a shared block: the block is   *)
 (* valid there now, and pinned for the owner when it takes it.             *)
@@ -1288,7 +1284,9 @@ LEMMA FinishDue_Fill ==
       BY <2>1 DEF IndInv, TrialVisibility
     <2> QED
       BY <2>1, <2>2, <2>3, <2>4
-  <1>2. \A u \in Units : valid'[u] = IF u = w THEN valid[w] \cup {Mem(c.g)} ELSE valid[u]
+  <1>2. /\ \A u \in Units : valid'[u] = IF u = w THEN valid[w] \cup {Mem(c.g)} ELSE valid[u]
+        /\ \A u \in HostUnits : valid'[u] = valid[u]
+        /\ \A u \in Units \cup HostUnits : valid[u] \subseteq valid'[u]
     BY <1>0, <1>1 DEF UnitTyped
   <1>3. \A x \in AllUnits : Held(x)' = Held(x)
     <2>1. \E k \in Keys : cache[k] = c.read \/ hcache[k] = c.read
@@ -1347,6 +1345,37 @@ LEMMA FinishDue_Fill ==
       BY <2>5, <2>6 DEF Held, HeldIn
   <1>4. \A q \in Owners : Moving(q)' => Moving(q)
     BY DEF Moving
+  (* No crossing writes the block into the memory the load filled; the     *)
+  (* blocks crossings and copies read only gain validity.                  *)
+  <1>20. CrossingsOk'
+    <2>1. \A t \in tasks : t.kind = "replicate" =>
+            \A u \in t.writes :
+              alloc'[u] = alloc[u] /\ (Mem(t.to) \notin valid[u] => Mem(t.to) \notin valid'[u])
+      <3> SUFFICES ASSUME NEW t \in tasks, t.kind = "replicate", NEW u \in t.writes
+                   PROVE  Mem(t.to) \notin valid[u] => Mem(t.to) \notin valid'[u]
+        OBVIOUS
+      <3>1. CrossTaskOk(t)
+        BY CrossingsOkEach DEF IndInv
+      <3>2. u \in Units /\ (Mem(c.g) = Mem(t.to) => w \notin t.writes)
+        BY <1>1, <3>1 DEF CrossTaskOk
+      <3> QED
+        BY <1>2, <3>2
+    <2>2. \A k \in Keys : cache'[k] = cache[k] /\ vis'[k].d = vis[k].d
+      OBVIOUS
+    <2> QED
+      BY <2>1, <2>2, EndCrossings DEF IndInv
+  <1>21. CopiesPlaced' /\ CrossingsPlaced'
+    <2>1. \A x \in copies' :
+            /\ x.read \in Units \cup HostUnits => valid[x.read] \subseteq valid'[x.read]
+            /\ (x.fill /\ x.write \in HostUnits) => valid'[x.write] = valid[x.write]
+      BY <1>2
+    <2>2. \A t \in tasks : t.kind = "replicate" => \A u \in t.units : valid[u] \subseteq valid'[u]
+      <3>1. \A t \in tasks : t.kind = "replicate" => t.units \subseteq Units
+        BY DEF IndInv, CrossingsOk
+      <3> QED
+        BY <1>2, <3>1
+    <2> QED
+      BY <2>1, <2>2, EndPlaced DEF IndInv
   <1>5. CASE /\ Target(c) /\ table' = [table EXCEPT ![c.o][c.p] = Shared(c.write)]
              /\ Give(Entry(c, FALSE))
     <2>1. /\ o \in Owners /\ p \in Positions /\ Live(o) /\ table[o][p] = Empty
@@ -1463,8 +1492,12 @@ LEMMA FinishDue_Fill ==
         BY <2>2
       <3>3. table'[o][p].u = w
         BY <2>1, <2>2 DEF Shared
+      <3>4. /\ \A t \in tasks' : t.kind \in {"transfer", "replicate"} => t \in tasks
+            /\ \A u \in Units : (\E q \in Owners, r \in Positions : table[q][r].u = u) =>
+                                valid[u] \subseteq valid'[u]
+        BY <1>2
       <3> QED
-        BY <1>1, <1>5, <2>1, <3>1, <3>2, <3>3, FillPlane DEF Live
+        BY <1>1, <1>5, <2>1, <3>1, <3>2, <3>3, <3>4, FillPlane DEF Live
     <2>10. TrialVisibility' /\ NoBad'
       <3>1. vis[c.k].d # NONE => vis[c.k].d = OwnerEpoch[o]
         BY <1>1, <2>1 DEF MadeBy
@@ -1481,7 +1514,7 @@ LEMMA FinishDue_Fill ==
         <4>1. \A q \in Owners, r \in Rows : \A x \in AllUnits : HoldsAt(q, r, x) => HoldsAt(q, r, x)'
           BY <2>1, <2>2 DEF HoldsAt, Rows, Empty, AllUnits
         <4> QED
-          BY <4>1 DEF Covered, Live
+          BY <4>1 DEF Covered, Live, ReadersOf
       <3>4. \A y \in b.reads : y[1] \in Owners /\ y[2] \in AllUnits
         BY <1>0, <3>2 DEF BatchOk, RequestTyped
       <3>5. \A y \in b.writes, r \in Positions : table'[y[1]][r].u = y[2] => table[y[1]][r].u = y[2]
@@ -1489,7 +1522,7 @@ LEMMA FinishDue_Fill ==
       <3> QED
         BY <1>1, <1>2, <3>2, <3>3, <3>4, <3>5 DEF BatchOk, Mem
     <2> QED
-      BY <2>3, <2>4, <2>5, <2>6, <2>7, <2>8, <2>9, <2>10, <2>11 DEF IndInv
+      BY <1>20, <1>21, <2>3, <2>4, <2>5, <2>6, <2>7, <2>8, <2>9, <2>10, <2>11 DEF IndInv
   <1>6. CASE ~Target(c) /\ UNCHANGED <<table, dbt, handoff>>
     <2>1. TypeInv'
       <3>1. UnitTyped'
@@ -1552,18 +1585,18 @@ LEMMA FinishDue_Fill ==
         BY <1>2, <1>6, <3>2, <3>3, <3>4 DEF TaskOk, Live, Mem, TableUnits
     <2>7. /\ MovingUnmapped' /\ LostOk' /\ TablesMapped' /\ HandoffOk' /\ RequestsOk'
           /\ TrialVisibility' /\ NoBad'
-      BY <1>6, EndPlane, EndVisible DEF IndInv
+      BY <1>2, <1>6, EndPlane, EndVisible DEF IndInv
     <2>8. BatchesOk'
       <3>1. SUFFICES ASSUME NEW b \in inflight PROVE BatchOk(b)'
         BY BatchesOkEach
       <3>2. BatchOk(b)
         BY BatchesOkEach DEF IndInv
       <3>3. \A q \in Owners : \A x : Covered(b, q, x) => Covered(b, q, x)'
-        BY <1>6 DEF Covered, Live, HoldsAt
+        BY <1>6 DEF Covered, Live, HoldsAt, ReadersOf
       <3> QED
         BY <1>1, <1>2, <1>6, <3>2, <3>3 DEF BatchOk, Mem
     <2> QED
-      BY <2>1, <2>2, <2>3, <2>4, <2>5, <2>6, <2>7, <2>8 DEF IndInv
+      BY <1>20, <1>21, <2>1, <2>2, <2>3, <2>4, <2>5, <2>6, <2>7, <2>8 DEF IndInv
   <1> QED
     BY <1>5, <1>6
 
@@ -1649,6 +1682,7 @@ LEMMA FinishDue_Cache ==
         /\ \A v \in AllUnits : alloc'[v] = IF v = w THEN "shared" ELSE alloc[v]
         /\ \A v \in AllUnits : sharedKey'[v] = IF v = w THEN c.k ELSE sharedKey[v]
         /\ \A v \in Units : valid'[v] = IF v = w THEN {Mem(c.g)} ELSE valid[v]
+        /\ \A v \in HostUnits : valid'[v] = valid[v]
         /\ \A k \in Keys : vis'[k] = IF k = c.k THEN [d |-> MadeBy(GroupEpoch[c.g]), h |-> vis[k].h]
                                                 ELSE vis[k]
         /\ \A q \in Owners, r \in Positions :
@@ -1857,10 +1891,18 @@ LEMMA FinishDue_Cache ==
         BY <1>2
       <3>4. table'[o][p].u = w
         BY <1>1, <1>2, <2>1 DEF Shared
+      <3>5. /\ \A t \in tasks' : t.kind \in {"transfer", "replicate"} => t \in tasks
+            /\ \A u \in Units : (\E q \in Owners, r \in Positions : table[q][r].u = u) =>
+                                valid[u] \subseteq valid'[u]
+        BY <1>1, <1>2
       <3> QED
-        BY <1>1, <2>1, <3>1, <3>2, <3>3, <3>4, FillPlane DEF Live
+        BY <1>1, <2>1, <3>1, <3>2, <3>3, <3>4, <3>5, FillPlane DEF Live
     <2>2. CASE ~Target(c) /\ UNCHANGED <<table, dbt, handoff>>
-      BY <2>2, EndPlane DEF IndInv
+      <3>1. \A u \in Units : (\E q \in Owners, r \in Positions : table[q][r].u = u) =>
+                             valid[u] \subseteq valid'[u]
+        BY <1>1, <1>2
+      <3> QED
+        BY <2>2, <3>1, EndPlane DEF IndInv
     <2> QED
       BY <2>1, <2>2
   <1>12. TrialVisibility' /\ NoBad'
@@ -1891,6 +1933,12 @@ LEMMA FinishDue_Cache ==
                           /\ \A y \in copies' :
                                (y.kind = "load" /\ y.fill /\ y.k = k) =>
                                    vis'[k].d = MadeBy(GroupEpoch[y.g])
+                          /\ \A y \in copies' :
+                               (y.kind = "store" /\ y.fill /\ y.k = k) =>
+                                   vis'[k].h = MadeBy(GroupEpoch[y.g])
+                          /\ \A t \in tasks :
+                               (t.kind = "replicate" /\ cache'[k] \in t.units) =>
+                                   vis'[k].d = MadeBy(OwnerEpoch[t.o])
         BY DEF TrialVisibility, MadeBy
       <3>1. CASE k = c.k
         BY <1>1, <2>0, <2>1, <2>2, <2>4, <3>1 DEF TrialVisibility
@@ -1915,7 +1963,7 @@ LEMMA FinishDue_Cache ==
         <4> QED
           BY <1>2, <4>1 DEF HoldsAt, Rows, Empty, AllUnits
       <3> QED
-        BY <3>1 DEF Covered, Live
+        BY <3>1 DEF Covered, Live, ReadersOf
     <2>4. \A y \in b.reads : y[1] \in Owners /\ y[2] \in AllUnits /\ y[2] # w
       BY <1>0, <1>1, <2>2 DEF BatchOk, RequestTyped
     <2>5. \A y \in b.writes, r \in Positions : table'[y[1]][r].u = y[2] => table[y[1]][r].u = y[2]
@@ -1925,8 +1973,39 @@ LEMMA FinishDue_Cache ==
       BY <1>1, <2>2 DEF BatchOk
     <2> QED
       BY <1>1, <1>2, <2>2, <2>3, <2>4, <2>5, <2>6 DEF BatchOk, Mem
+  (* The new block is no crossing's and no other copy's.                   *)
+  <1>14. CrossingsOk'
+    <2>1. \A d0 \in deferred' : d0.kind = "replicate" => \A u \in d0.units : alloc'[u] = alloc[u]
+      <3>1. \A d0 \in deferred' : \A u \in d0.units : u \in AllUnits /\ u # w
+        BY <1>0, <1>1 DEF WorkTyped
+      <3> QED
+        BY <1>2, <3>1
+    <2>2. \A t \in tasks : t.kind = "replicate" =>
+            \A u \in t.writes :
+              alloc'[u] = alloc[u] /\ (Mem(t.to) \notin valid[u] => Mem(t.to) \notin valid'[u])
+      <3>1. \A t \in tasks : t.kind = "replicate" => t.writes = t.units /\ t.units \subseteq Units
+        BY DEF IndInv, CrossingsOk
+      <3> QED
+        BY <1>1, <1>2, <3>1 DEF AllUnits
+    <2>3. \A k \in Keys : ~(cache'[k] = cache[k] /\ vis'[k].d = vis[k].d) =>
+            \A d0 \in deferred' : d0.kind = "replicate" => cache'[k] \notin d0.units
+      BY <1>1, <1>2
+    <2> QED
+      BY <2>1, <2>2, <2>3, EndCrossings DEF IndInv
+  <1>15. CopiesPlaced' /\ CrossingsPlaced'
+    <2>1. \A x \in copies' :
+            /\ x.read \in Units \cup HostUnits => valid[x.read] \subseteq valid'[x.read]
+            /\ (x.fill /\ x.write \in HostUnits) => valid'[x.write] = valid[x.write]
+      BY <1>1, <1>2
+    <2>2. \A t \in tasks : t.kind = "replicate" => \A u \in t.units : valid[u] \subseteq valid'[u]
+      <3>1. \A t \in tasks : t.kind = "replicate" => t.units \subseteq Units
+        BY DEF IndInv, CrossingsOk
+      <3> QED
+        BY <1>1, <1>2, <3>1
+    <2> QED
+      BY <2>1, <2>2, EndPlaced DEF IndInv
   <1> QED
-    BY <1>5, <1>6, <1>7, <1>8, <1>9, <1>10, <1>11, <1>12, <1>13 DEF IndInv
+    BY <1>5, <1>6, <1>7, <1>8, <1>9, <1>10, <1>11, <1>12, <1>13, <1>14, <1>15 DEF IndInv
 
 (* A store or a save whose key has no host block: its new host block      *)
 (* becomes the key's host copy, and what it read is let go when nothing   *)
@@ -1934,8 +2013,9 @@ LEMMA FinishDue_Cache ==
 LEMMA FinishDue_Host ==
   ASSUME IndInv, NEW d \in deferred, d.kind = "finish", Reached(d.after),
          deferred' = deferred \ {d}, NEW c \in copies, c.id = d.c, copies' = copies \ {c},
-         c.kind \in {"store", "save"}, hcache[c.k] = NONE,
+         c.kind \in {"store", "save"}, ~c.fill, hcache[c.k] = NONE,
          hcache' = [hcache EXCEPT ![c.k] = c.write],
+         valid' = [valid EXCEPT ![c.write] = GroupParts[c.g]],
          vis' = [vis EXCEPT ![c.k].h = MadeBy(GroupEpoch[c.g])],
          free' = free \cup ReclaimedWith({c.read}, table, oslot, cache, hcache', deferred', copies',
                                          tasks),
@@ -1945,7 +2025,7 @@ LEMMA FinishDue_Host ==
          sharedKey' = [Reset(sharedKey, ReclaimedWith({c.read}, table, oslot, cache, hcache',
                                                       deferred', copies', tasks))
                          EXCEPT ![c.write] = c.k],
-         UNCHANGED <<table, cache, valid, dbt, handoff, ostate, ogroup, oslot, ncopy, tasks, trial,
+         UNCHANGED <<table, cache, dbt, handoff, ostate, ogroup, oslot, ncopy, tasks, trial,
                      member, launched, inflight, requests, remote, lost, bad>>
   PROVE  IndInv'
   <1>0. UnitTyped /\ OwnerTyped /\ PlaneTyped /\ WorkTyped /\ RequestTyped
@@ -1988,8 +2068,10 @@ LEMMA FinishDue_Host ==
         OBVIOUS
       <3>1. DeferOk(e)
         BY DeferredOkEach DEF IndInv
+      <3>2. CrossWaitOk(e)
+        BY CrossingsOkEach DEF IndInv
       <3> QED
-        BY <2>2, <3>1 DEF DeferOk
+        BY <2>1, <2>2, <3>1, <3>2 DEF DeferOk, CrossWaitOk
     <2>5. \A x \in copies : x # c => x.read # w
       <3> SUFFICES ASSUME NEW x \in copies, x # c, x.read = w PROVE FALSE
         OBVIOUS
@@ -2004,8 +2086,10 @@ LEMMA FinishDue_Host ==
         BY TasksOkEach DEF IndInv
       <3>2. t.kind = "put" => t.h = hcache[t.k] /\ t.k \in Keys
         BY <1>0, <3>1 DEF TaskOk, WorkTyped
+      <3>3. CrossTaskOk(t)
+        BY CrossingsOkEach DEF IndInv
       <3> QED
-        BY <1>0, <2>2, <2>3, <3>1, <3>2 DEF TaskOk, WorkTyped
+        BY <1>0, <2>2, <2>3, <3>1, <3>2, <3>3 DEF TaskOk, WorkTyped, CrossTaskOk
     <2>7. \A b \in inflight : \A x \in b.reads : x[2] # w
       <3> SUFFICES ASSUME NEW b \in inflight, NEW x \in b.reads, x[2] = w PROVE FALSE
         OBVIOUS
@@ -2037,6 +2121,8 @@ LEMMA FinishDue_Host ==
         /\ \A v \in AllUnits : sharedKey'[v] = IF v = w THEN c.k ELSE IF v \in G THEN NONE ELSE sharedKey[v]
         /\ \A k \in Keys : vis'[k] = IF k = c.k THEN [d |-> vis[k].d, h |-> MadeBy(GroupEpoch[c.g])]
                                                 ELSE vis[k]
+        /\ \A u \in Units : valid'[u] = valid[u]
+        /\ \A u \in HostUnits : valid'[u] = IF u = w THEN GroupParts[c.g] ELSE valid[u]
     BY <1>0, <1>1 DEF UnitTyped, PlaneTyped, Reset, AllUnits
   <1>4. /\ \A x \in AllUnits : Held(x)' => Held(x)
         /\ \A x \in AllUnits : Held(x) => Held(x)' \/ x \in G
@@ -2066,7 +2152,10 @@ LEMMA FinishDue_Host ==
       BY <1>1, <1>2, <2>2, <2>3, <2>4 DEF Held
   <1>5. TypeInv'
     <2>1. UnitTyped'
-      BY <1>0, <1>1, <1>2, <1>3 DEF UnitTyped, AllUnits, Reset
+      <3>1. GroupParts[c.g] \subseteq HostParts
+        BY <1>1
+      <3> QED
+        BY <1>0, <1>1, <1>2, <1>3, <3>1 DEF UnitTyped, AllUnits, Reset
     <2>2. PlaneTyped'
       <3>1. MadeBy(GroupEpoch[c.g]) \in Epochs \cup {NONE}
         BY <1>1 DEF MadeBy
@@ -2121,7 +2210,13 @@ LEMMA FinishDue_Host ==
     <2>2. \A q \in Owners : oslot[q] # NONE => alloc'[oslot[q]] = alloc[oslot[q]]
       BY <1>0, <1>1, <1>7, <1>8 DEF OwnerTyped, AllUnits
     <2>3. Tables'
-      BY <2>1, TablesKeep DEF IndInv
+      <3>1. \A q \in Owners, r \in Positions :
+              table[q][r].u # NONE =>
+                /\ alloc'[table[q][r].u] = alloc[table[q][r].u]
+                /\ valid[table[q][r].u] \subseteq valid'[table[q][r].u]
+        BY <1>0, <1>3, <2>1, TableTypes
+      <3> QED
+        BY <3>1, TablesKeep DEF IndInv
     <2>4. OwnersOk'
       <3>1. OwnersOk
         BY DEF IndInv
@@ -2149,8 +2244,21 @@ LEMMA FinishDue_Host ==
       BY <1>1, <1>7, <1>8, <2>2
     <2>4. \A q \in Owners : Moving(q)' => Moving(q)
       BY DEF Moving
+    (* A fill writes a key's host block, so its key is not the one stored.  *)
+    <2>5. (x.fill /\ x.kind = "store") => x.k # c.k
+      BY <2>2 DEF CopyOk
+    <2>6. (x.fill /\ x.kind = "load") => x.write \in Units /\ valid'[x.write] = valid[x.write]
+      <3>1. (x.fill /\ x.kind = "load") => x.write \in Units
+        BY <2>2, CopyFacts
+      <3> QED
+        BY <1>3, <3>1
+    <2>7. (x.fill /\ x.kind = "store") => hcache'[x.k] = hcache[x.k]
+      <3>1. x.k \in Keys
+        BY <2>2, CopyFacts
+      <3> QED
+        BY <1>3, <2>5, <3>1
     <2> QED
-      BY <2>2, <2>3, <2>4 DEF CopyOk, Live, Mem
+      BY <1>3, <2>2, <2>3, <2>4, <2>6, <2>7 DEF CopyOk, Live, Mem
   <1>12. TasksOk'
     <2>1. SUFFICES ASSUME NEW t \in tasks PROVE TaskOk(t)'
       BY TasksOkEach
@@ -2161,12 +2269,15 @@ LEMMA FinishDue_Host ==
     <2>4. t.kind = "put" => t.k # c.k /\ t.k \in Keys
       BY <1>0, <1>1, <2>2 DEF TaskOk, WorkTyped
     <2>5. /\ t.kind = "transfer" => t.writes \subseteq t.units /\ t.slot # NONE
+                                    /\ t.writes \subseteq Units
           /\ t.kind = "prefetch" => t.h # NONE
       BY <2>2 DEF TaskOk
+    <2>6. \A q \in Owners : TableUnits(q) \subseteq Units
+      BY <1>0, TableTypes
     <2> QED
-      BY <1>3, <2>2, <2>3, <2>4, <2>5 DEF TaskOk, Live, Mem, TableUnits
+      BY <1>3, <2>2, <2>3, <2>4, <2>5, <2>6 DEF TaskOk, Live, Mem, TableUnits
   <1>13. /\ MovingUnmapped' /\ LostOk' /\ TablesMapped' /\ HandoffOk' /\ RequestsOk' /\ NoBad'
-    BY EndPlane DEF IndInv
+    BY <1>3, EndPlane DEF IndInv
   <1>14. TrialVisibility'
     <2>0. TrialVisibility
       BY DEF IndInv
@@ -2187,9 +2298,23 @@ LEMMA FinishDue_Host ==
                         /\ \A y \in copies' :
                              (y.kind = "load" /\ y.fill /\ y.k = k) =>
                                  vis'[k].d = MadeBy(GroupEpoch[y.g])
+                        /\ \A y \in copies' :
+                             (y.kind = "store" /\ y.fill /\ y.k = k) =>
+                                 vis'[k].h = MadeBy(GroupEpoch[y.g])
+                        /\ \A t \in tasks :
+                             (t.kind = "replicate" /\ cache[k] \in t.units) =>
+                                 vis'[k].d = MadeBy(OwnerEpoch[t.o])
       BY DEF TrialVisibility, MadeBy
+    (* No fill writes a host block of the key that had none.               *)
+    <2>5. \A y \in copies : (y.kind = "store" /\ y.fill) => y.k # c.k
+      <3> SUFFICES ASSUME NEW y \in copies, y.kind = "store", y.fill PROVE y.k # c.k
+        OBVIOUS
+      <3>1. CopyOk(y) /\ y.write \in AllUnits
+        BY <1>0, CopiesOkEach DEF IndInv, WorkTyped
+      <3> QED
+        BY <3>1 DEF CopyOk, AllUnits
     <2>3. CASE k = c.k
-      BY <2>0, <2>2, <2>3 DEF TrialVisibility
+      BY <2>0, <2>2, <2>3, <2>5 DEF TrialVisibility
     <2>4. CASE k # c.k
       BY <2>0, <2>1, <2>4 DEF TrialVisibility
     <2> QED
@@ -2201,7 +2326,7 @@ LEMMA FinishDue_Host ==
       BY BatchesOkEach DEF IndInv
     <2>3. \A q \in Owners : \A x \in AllUnits : Covered(b, q, x) => Covered(b, q, x)' /\ Held(x)'
       <3>1. \A q \in Owners : \A x \in AllUnits : Covered(b, q, x) => Covered(b, q, x)'
-        BY DEF Covered, Live, HoldsAt
+        BY DEF Covered, Live, HoldsAt, ReadersOf
       <3>2. \A q \in Owners : \A x \in AllUnits : Covered(b, q, x) => Held(x)'
         BY <1>8 DEF Covered, HoldsAt, Rows
       <3> QED
@@ -2213,10 +2338,221 @@ LEMMA FinishDue_Host ==
     <2>6. /\ \A x \in b.cw : \E y \in copies' : y.write = x /\ y.g = b.g /\ y.seq = b.seq
           /\ \A x \in b.cr : \E y \in copies' : y.read = x /\ y.g = b.g /\ y.seq = b.seq
       BY <1>1, <2>2 DEF BatchOk
+    <2>7. \A y \in b.reads : y[2] \in Units => valid'[y[2]] = valid[y[2]]
+      BY <1>3
     <2> QED
-      BY <2>2, <2>5, <2>6 DEF BatchOk, Mem
+      BY <2>2, <2>5, <2>6, <2>7 DEF BatchOk, Mem
+  (* What a crossing holds stays held with its allocation; device validity  *)
+  (* and the device cache stay.                                           *)
+  <1>16. CrossingsOk'
+    <2>1. \A d0 \in deferred' : d0.kind = "replicate" => \A u \in d0.units : alloc'[u] = alloc[u]
+      <3>1. \A d0 \in deferred' : \A u \in d0.units : u \in AllUnits /\ u # w
+        BY <1>0, <1>1 DEF WorkTyped
+      <3> QED
+        BY <1>7, <1>8, <3>1
+    <2>2. \A t \in tasks : t.kind = "replicate" =>
+            \A u \in t.writes :
+              alloc'[u] = alloc[u] /\ (Mem(t.to) \notin valid[u] => Mem(t.to) \notin valid'[u])
+      <3>1. \A t \in tasks : t.kind = "replicate" =>
+              t.held /\ t.writes = t.units /\ t.units \subseteq Units
+        BY DEF IndInv, CrossingsOk, TasksOk
+      <3> QED
+        BY <1>1, <1>3, <1>7, <1>8, <3>1 DEF AllUnits
+    <2>3. \A k \in Keys : cache'[k] = cache[k] /\ vis'[k].d = vis[k].d
+      BY <1>3
+    <2> QED
+      BY <2>1, <2>2, <2>3, EndCrossings DEF IndInv
+  <1>17. CopiesPlaced' /\ CrossingsPlaced'
+    <2>1. \A x \in copies' :
+            /\ x.read \in Units \cup HostUnits => valid[x.read] \subseteq valid'[x.read]
+            /\ (x.fill /\ x.write \in HostUnits) => valid'[x.write] = valid[x.write]
+      BY <1>1, <1>3
+    <2>2. \A t \in tasks : t.kind = "replicate" => \A u \in t.units : valid[u] \subseteq valid'[u]
+      <3>1. \A t \in tasks : t.kind = "replicate" => t.units \subseteq Units
+        BY DEF IndInv, CrossingsOk
+      <3> QED
+        BY <1>3, <3>1
+    <2> QED
+      BY <2>1, <2>2, EndPlaced DEF IndInv
   <1> QED
-    BY <1>5, <1>6, <1>9, <1>10, <1>11, <1>12, <1>13, <1>14, <1>15 DEF IndInv
+    BY <1>5, <1>6, <1>9, <1>10, <1>11, <1>12, <1>13, <1>14, <1>15, <1>16, <1>17 DEF IndInv
+
+(* A store that filled host parts of its key's host block: the block is   *)
+(* valid on those parts now. Nothing is let go: the device cache holds     *)
+(* what the copy read and the host cache what it wrote.                    *)
+LEMMA FinishDue_HostFill ==
+  ASSUME IndInv, NEW d \in deferred, d.kind = "finish", Reached(d.after),
+         deferred' = deferred \ {d}, NEW c \in copies, c.id = d.c, copies' = copies \ {c},
+         c.kind = "store", c.fill,
+         valid' = [valid EXCEPT ![c.write] = @ \cup c.parts],
+         DropWith({c.read}, table, oslot, cache, hcache, deferred', copies', tasks),
+         UNCHANGED <<table, cache, hcache, dbt, handoff, vis, ostate, ogroup, oslot, ncopy, tasks,
+                     trial, member, launched, inflight, requests, remote, lost, bad>>
+  PROVE  IndInv'
+  <1>0. UnitTyped /\ OwnerTyped /\ PlaneTyped /\ WorkTyped /\ RequestTyped
+    BY UnitTypes, OwnerTypes, PlaneTypes, WorkTypes, RequestTypes
+  <1> DEFINE w == c.write
+  <1>1. /\ CopyOk(c) /\ c.g \in Groups /\ c.k \in Keys /\ c.parts \subseteq HostParts
+        /\ w \in HostUnits /\ hcache[c.k] = w
+        /\ \A x \in copies : x.write = w => x = c
+        /\ alloc[c.read] = "shared" /\ c.read \in AllUnits /\ d.units = {}
+        /\ \A b \in inflight : ~(c.g = b.g /\ c.seq = b.seq)
+        /\ \A x \in copies : x.id = c.id => x = c
+    <2>1. /\ CopyOk(c) /\ c.read \in AllUnits /\ c.k \in Keys /\ c.g \in Groups /\ d.units = {}
+          /\ \A b \in inflight : ~(c.g = b.g /\ c.seq = b.seq)
+          /\ \A x \in copies : x.id = c.id => x = c
+      BY FinishDue_Facts
+    <2>2. c.parts \subseteq HostParts
+      BY <1>0 DEF WorkTyped
+    <2> QED
+      BY <2>1, <2>2 DEF CopyOk
+  (* What the copy read is cached.                                         *)
+  <1>2. \E k \in Keys : cache[k] = c.read \/ hcache[k] = c.read
+    <2>1. SharedIff /\ SharedCached
+      BY DEF IndInv
+    <2>2. sharedKey[c.read] \in Keys
+      BY <1>0, <1>1, <2>1 DEF SharedIff, UnitTyped
+    <2> QED
+      BY <1>1, <2>1, <2>2 DEF SharedCached
+  <1>3. /\ \A u \in Units \cup HostUnits : valid'[u] = IF u = w THEN valid[w] \cup c.parts ELSE valid[u]
+        /\ \A u \in Units \cup HostUnits : valid[u] \subseteq valid'[u]
+        /\ \A u \in Units : valid'[u] = valid[u]
+    BY <1>0, <1>1 DEF UnitTyped
+  <1>4. \A x \in AllUnits : Held(x)' = Held(x)
+    <2>1. \A x \in AllUnits : (x # w /\ x # c.read) =>
+            /\ (\E e \in deferred' : x \in e.units) <=> (\E e \in deferred : x \in e.units)
+            /\ (\E y \in copies' : x = y.read \/ x = y.write)
+                 <=> (\E y \in copies : x = y.read \/ x = y.write)
+      BY <1>1
+    <2>2. /\ HeldIn(w, table, oslot, cache, hcache, deferred', copies', tasks)
+          /\ HeldIn(w, table, oslot, cache, hcache, deferred, copies, tasks)
+          /\ HeldIn(c.read, table, oslot, cache, hcache, deferred', copies', tasks)
+          /\ HeldIn(c.read, table, oslot, cache, hcache, deferred, copies, tasks)
+      BY <1>1, <1>2 DEF HeldIn
+    <2>3. \A x \in AllUnits :
+            HeldIn(x, table, oslot, cache, hcache, deferred', copies', tasks)
+              <=> HeldIn(x, table, oslot, cache, hcache, deferred, copies, tasks)
+      <3> SUFFICES ASSUME NEW x \in AllUnits
+                   PROVE  HeldIn(x, table, oslot, cache, hcache, deferred', copies', tasks)
+                            <=> HeldIn(x, table, oslot, cache, hcache, deferred, copies, tasks)
+        OBVIOUS
+      <3>1. CASE x = w \/ x = c.read
+        BY <2>2, <3>1
+      <3>2. CASE x # w /\ x # c.read
+        BY <2>1, <3>2 DEF HeldIn
+      <3> QED
+        BY <3>1, <3>2
+    <2>4. \A x : Held(x)' = HeldIn(x, table, oslot, cache, hcache, deferred', copies', tasks)
+      BY DEF Held
+    <2> QED
+      BY <2>3, <2>4 DEF Held, HeldIn
+  <1>5. UNCHANGED <<free, alloc, sharedKey>>
+    <2>1. ReclaimedWith({c.read}, table, oslot, cache, hcache, deferred', copies', tasks) = {}
+      BY <1>2 DEF ReclaimedWith, HeldIn, On, AllRules
+    <2> QED
+      BY <1>0, <2>1 DEF DropWith, Reset, UnitTyped
+  <1>6. \A q \in Owners : Moving(q)' => Moving(q)
+    BY DEF Moving
+  <1>7. TypeInv'
+    <2>1. UnitTyped'
+      BY <1>0, <1>1, <1>3, <1>5 DEF UnitTyped
+    <2>2. WorkTyped'
+      BY <1>0 DEF WorkTyped
+    <2>3. OwnerTyped' /\ PlaneTyped' /\ RequestTyped'
+      BY <1>0, OwnerTypedFrame, PlaneTypedFrame, RequestTypedFrame
+    <2> QED
+      BY <2>1, <2>2, <2>3, TypeInvNext
+  <1>8. /\ FreeClean' /\ NoLeak' /\ Outside' /\ Regions' /\ AllocOwner' /\ SharedIff'
+        /\ SharedCached' /\ CacheShared' /\ OwnersOk'
+    <2>1. /\ FreeClean' /\ NoLeak' /\ Outside' /\ Regions' /\ AllocOwner' /\ SharedIff'
+          /\ SharedCached' /\ CacheShared'
+      BY <1>0, <1>4, <1>5, EndUnits DEF IndInv
+    <2>2. OwnersOk'
+      BY <1>5, OwnersOkFrame DEF IndInv
+    <2> QED
+      BY <2>1, <2>2
+  <1>9. Tables'
+    <2>1. \A q \in Owners, r \in Positions :
+            table[q][r].u # NONE =>
+                /\ alloc'[table[q][r].u] = alloc[table[q][r].u]
+                /\ valid[table[q][r].u] \subseteq valid'[table[q][r].u]
+      <3>1. \A q \in Owners, r \in Positions : table[q][r].u # NONE => table[q][r].u \in Units
+        BY <1>0, TableTypes
+      <3> QED
+        BY <1>3, <1>5, <3>1
+    <2> QED
+      BY <2>1, TablesKeep DEF IndInv
+  <1>10. DeferredOk'
+    <2>1. SUFFICES ASSUME NEW e \in deferred' PROVE DeferOk(e)'
+      BY DeferredOkEach
+    <2>2. e \in deferred /\ e # d /\ DeferOk(e) /\ DeferOk(d)
+      BY DeferredOkEach DEF IndInv
+    <2>3. e.kind = "finish" => \A x \in copies : x.id = e.c => x \in copies'
+      BY <2>2 DEF DeferOk
+    <2> QED
+      BY <1>5, <2>2, <2>3 DEF DeferOk
+  <1>11. CopiesOk'
+    <2>1. SUFFICES ASSUME NEW x \in copies' PROVE CopyOk(x)'
+      BY CopiesOkEach
+    <2>2. /\ x \in copies /\ x # c /\ CopyOk(x)
+          /\ (x.fill /\ x.kind = "load") => x.write \in Units
+      BY CopyFacts
+    <2>3. (x.fill /\ x.kind = "load") => valid'[x.write] = valid[x.write]
+      BY <1>3, <2>2
+    <2> QED
+      BY <1>5, <1>6, <2>2, <2>3 DEF CopyOk, Live, Mem
+  <1>12. TasksOk'
+    <2>1. SUFFICES ASSUME NEW t \in tasks PROVE TaskOk(t)'
+      BY TasksOkEach
+    <2>2. TaskOk(t)
+      BY TasksOkEach DEF IndInv
+    <2>3. t.kind = "transfer" => t.writes \subseteq Units
+      BY <2>2 DEF TaskOk
+    <2>4. \A q \in Owners : TableUnits(q) \subseteq Units
+      BY <1>0, TableTypes
+    <2> QED
+      BY <1>3, <1>5, <2>2, <2>3, <2>4 DEF TaskOk, Live, Mem, TableUnits
+  <1>13. /\ MovingUnmapped' /\ LostOk' /\ TablesMapped' /\ HandoffOk' /\ RequestsOk'
+         /\ TrialVisibility' /\ NoBad'
+    BY <1>3, EndPlane, EndVisible DEF IndInv
+  <1>14. BatchesOk'
+    <2>1. SUFFICES ASSUME NEW b \in inflight PROVE BatchOk(b)'
+      BY BatchesOkEach
+    <2>2. BatchOk(b)
+      BY BatchesOkEach DEF IndInv
+    <2>3. \A q \in Owners : \A x : Covered(b, q, x) => Covered(b, q, x)'
+      BY DEF Covered, Live, HoldsAt, ReadersOf
+    <2>4. \A y \in b.reads : y[2] \in Units => valid'[y[2]] = valid[y[2]]
+      BY <1>3
+    <2>5. /\ \A x \in b.cw : \E y \in copies' : y.write = x /\ y.g = b.g /\ y.seq = b.seq
+          /\ \A x \in b.cr : \E y \in copies' : y.read = x /\ y.g = b.g /\ y.seq = b.seq
+      BY <1>1, <2>2 DEF BatchOk
+    <2> QED
+      BY <1>5, <2>2, <2>3, <2>4, <2>5 DEF BatchOk, Mem
+  <1>15. CrossingsOk'
+    <2>1. \A t \in tasks : t.kind = "replicate" =>
+            \A u \in t.writes :
+              alloc'[u] = alloc[u] /\ (Mem(t.to) \notin valid[u] => Mem(t.to) \notin valid'[u])
+      <3>1. \A t \in tasks : t.kind = "replicate" => t.writes \subseteq Units
+        BY DEF IndInv, CrossingsOk
+      <3> QED
+        BY <1>3, <1>5, <3>1
+    <2> QED
+      BY <1>5, <2>1, EndCrossings DEF IndInv
+  <1>16. CopiesPlaced' /\ CrossingsPlaced'
+    <2>1. \A x \in copies' :
+            /\ x.read \in Units \cup HostUnits => valid[x.read] \subseteq valid'[x.read]
+            /\ (x.fill /\ x.write \in HostUnits) => valid'[x.write] = valid[x.write]
+      BY <1>1, <1>3
+    <2>2. \A t \in tasks : t.kind = "replicate" => \A u \in t.units : valid[u] \subseteq valid'[u]
+      <3>1. \A t \in tasks : t.kind = "replicate" => t.units \subseteq Units
+        BY DEF IndInv, CrossingsOk
+      <3> QED
+        BY <1>3, <3>1
+    <2> QED
+      BY <2>1, <2>2, EndPlaced DEF IndInv
+  <1> QED
+    BY <1>7, <1>8, <1>9, <1>10, <1>11, <1>12, <1>13, <1>14, <1>15, <1>16 DEF IndInv
 
 LEMMA FinishDue_Inv ==
   ASSUME IndInv, NEW d \in deferred, FinishDue(d), UNCHANGED rare
@@ -2230,7 +2566,7 @@ LEMMA FinishDue_Inv ==
   <1>3. c.id = d.c /\ copies' = copies \ {c}
     BY <1>2 DEF EndStep
   <1>4. /\ c.kind \in {"clone", "load", "store", "save", "restore"}
-        /\ c.kind \in {"clone", "store", "save"} => ~c.fill
+        /\ c.kind \in {"clone", "save"} => ~c.fill
     BY <1>1, <1>3, FinishDue_Facts DEF CopyOk
   <1>5. CASE ~d.ok
     <2>1. /\ DropWith({c.read, c.write}, table, oslot, cache, hcache, deferred', copies', tasks)
@@ -2311,7 +2647,16 @@ LEMMA FinishDue_Inv ==
       BY <1>2, <1>9 DEF EndStep, Drop
     <2> QED
       BY <1>1, <1>3, <2>1, FinishDue_Drop
-  <1>10. CASE d.ok /\ c.kind \in {"store", "save"}
+  <1>11. CASE d.ok /\ c.kind = "store" /\ c.fill
+    <2>0. hcache[c.k] # NONE
+      BY <1>1, <1>3, <1>11, FinishDue_Facts DEF CopyOk
+    <2>1. /\ valid' = [valid EXCEPT ![c.write] = @ \cup c.parts]
+          /\ DropWith({c.read}, table, oslot, cache, hcache, deferred', copies', tasks)
+          /\ UNCHANGED <<table, cache, hcache, dbt, handoff, vis>>
+      BY <1>2, <1>11, <2>0 DEF EndStep, Drop, On, AllRules
+    <2> QED
+      BY <1>1, <1>3, <1>11, <2>1, FinishDue_HostFill
+  <1>10. CASE d.ok /\ c.kind \in {"store", "save"} /\ ~c.fill
     <2>1. CASE hcache[c.k] # NONE
       <3>1. /\ DropWith({c.read, c.write}, table, oslot, cache, hcache, deferred', copies', tasks)
             /\ UNCHANGED <<table, cache, hcache, valid, dbt, handoff, vis>>
@@ -2320,6 +2665,7 @@ LEMMA FinishDue_Inv ==
         BY <1>1, <1>3, <3>1, FinishDue_Drop
     <2>2. CASE hcache[c.k] = NONE
       <3>1. /\ hcache' = [hcache EXCEPT ![c.k] = c.write]
+            /\ valid' = [valid EXCEPT ![c.write] = GroupParts[c.g]]
             /\ vis' = [vis EXCEPT ![c.k].h = MadeBy(GroupEpoch[c.g])]
             /\ free' = free \cup ReclaimedWith({c.read}, table, oslot, cache, hcache', deferred',
                                                copies', tasks)
@@ -2329,14 +2675,14 @@ LEMMA FinishDue_Inv ==
             /\ sharedKey' = [Reset(sharedKey, ReclaimedWith({c.read}, table, oslot, cache, hcache',
                                                             deferred', copies', tasks))
                                EXCEPT ![c.write] = c.k]
-            /\ UNCHANGED <<table, cache, valid, dbt, handoff>>
+            /\ UNCHANGED <<table, cache, dbt, handoff>>
         BY <1>2, <1>10, <2>2 DEF EndStep, On, AllRules
       <3> QED
         BY <1>1, <1>3, <1>10, <2>2, <3>1, FinishDue_Host
     <2> QED
       BY <2>1, <2>2
   <1> QED
-    BY <1>4, <1>5, <1>6, <1>7, <1>8, <1>9, <1>10
+    BY <1>4, <1>5, <1>6, <1>7, <1>8, <1>9, <1>10, <1>11
 
 -----------------------------------------------------------------------------
 

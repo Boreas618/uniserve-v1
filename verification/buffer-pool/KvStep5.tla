@@ -27,20 +27,24 @@ LEMMA EndBatch_Inv ==
   <1>3. /\ FreeClean' /\ NoLeak' /\ Outside' /\ Regions' /\ AllocOwner' /\ SharedIff'
         /\ SharedCached' /\ CacheShared' /\ Tables' /\ OwnersOk' /\ DeferredOk' /\ CopiesOk'
         /\ TasksOk' /\ MovingUnmapped' /\ TablesMapped' /\ HandoffOk' /\ RequestsOk'
-        /\ TrialVisibility' /\ NoBad'
+        /\ TrialVisibility' /\ NoBad' /\ CrossingsOk' /\ CopiesPlaced'
     BY <1>1, FreeCleanFrame, NoLeakFrame, OutsideFrame, RegionsFrame, AllocOwnerFrame,
        SharedIffFrame, SharedCachedFrame, CacheSharedFrame, TablesFrame, OwnersOkFrame,
        DeferredOkFrame, CopiesOkFrame, TasksOkFrame, MovingUnmappedFrame, TablesMappedFrame,
-       HandoffOkFrame, RequestsOkFrame, TrialVisibilityFrame, NoBadFrame, TransfersFrame DEF IndInv
+       HandoffOkFrame, RequestsOkFrame, TrialVisibilityFrame, NoBadFrame, CrossingsOkFrame,
+       CopiesPlacedFrame, TransfersFrame DEF IndInv
   <1>4. LostOk'
     BY <1>1 DEF IndInv, LostOk
+  (* A batch that ends writes nothing any more.                            *)
+  <1>6. CrossingsPlaced'
+    BY <1>1 DEF IndInv, CrossingsPlaced
   <1>5. BatchesOk'
     <2>1. \A x, o, u : Covered(x, o, u)' = Covered(x, o, u)
       BY <1>1, CoveredFrame, TransfersFrame
     <2> QED
       BY <1>1, <2>1 DEF IndInv, BatchesOk, Mem
   <1> QED
-    BY <1>2, <1>3, <1>4, <1>5 DEF IndInv
+    BY <1>2, <1>3, <1>4, <1>5, <1>6 DEF IndInv
 
 -----------------------------------------------------------------------------
 (* Launch                                                                  *)
@@ -75,6 +79,7 @@ LEMMA Launch_Copies ==
            /\ Started(g, n, c).o = c.o /\ Started(g, n, c).p = c.p /\ Started(g, n, c).k = c.k
            /\ Started(g, n, c).g = c.g /\ Started(g, n, c).read = c.read
            /\ Started(g, n, c).write = c.write /\ Started(g, n, c).fill = c.fill
+           /\ Started(g, n, c).parts = c.parts
            /\ Started(g, n, c).done = c.done /\ Started(g, n, c).stopped = c.stopped
            /\ Started(g, n, c).seq = IF c.g = g /\ c.seq = 0 /\ ~c.stopped THEN n ELSE c.seq
   BY WorkTypes DEF WorkTyped, Started
@@ -115,8 +120,8 @@ LEMMA Launch_Typed ==
     <2>1. \A c \in copies :
             LET x == Started(g, launched[g] + 1, c) IN
               x = [id |-> x.id, kind |-> x.kind, o |-> x.o, p |-> x.p, k |-> x.k, g |-> x.g,
-                   read |-> x.read, write |-> x.write, fill |-> x.fill, seq |-> x.seq,
-                   done |-> x.done, stopped |-> x.stopped]
+                   read |-> x.read, write |-> x.write, fill |-> x.fill, parts |-> x.parts,
+                   seq |-> x.seq, done |-> x.done, stopped |-> x.stopped]
       BY WorkTypes DEF WorkTyped, Started
     <2> QED
       BY <2>1, Launch_Effect, Launch_Launched, Launch_Copies, WorkTypes DEF WorkTyped
@@ -179,7 +184,8 @@ LEMMA Launch_CopiesOk ==
   <1>6. /\ \A x \in copies' : \E c \in copies : SameCopy(x, c)
         /\ \A x \in copies' : x.seq <= launched'[x.g] /\ (x.done => x.seq > 0)
     BY <1>2, <1>3, <1>4 DEF SameCopy
-  <1>7. UNCHANGED <<ncopy, lost, alloc, cache, valid, tasks, table, ostate, ogroup, deferred>>
+  <1>7. UNCHANGED <<ncopy, lost, alloc, cache, hcache, valid, tasks, table, ostate, ogroup,
+                    deferred>>
     BY Launch_Effect DEF rare
   <1> QED
     BY <1>5, <1>6, <1>7, CopiesMap DEF IndInv
@@ -207,6 +213,95 @@ LEMMA Launch_RequestsOk ==
   <1> QED
     BY <1>1, <1>2, Launch_Effect DEF IndInv, RequestsOk
 
+(* What IndInv says of a row the new batch addresses: it is still its      *)
+(* owner's block, covered for the new batch; a row it writes is its owner's *)
+(* private block, which no commit or crossing waits for beyond the new      *)
+(* batch and no crossing copies.                                            *)
+LEMMA Launch_Rows ==
+  ASSUME IndInv, NEW g \in Groups, Launch(g), NEW o \in Owners, NEW p \in Rows,
+         dbt[g][o][p].u # NONE
+  PROVE  /\ dbt[g][o][p].u \notin free
+         /\ alloc[dbt[g][o][p].u] \in {o, "shared"}
+         /\ dbt[g][o][p].u \in Units => Mem(g) \in valid[dbt[g][o][p].u]
+         /\ Covered(NewBatch(g), o, dbt[g][o][p].u)
+         /\ dbt[g][o][p].w =>
+              /\ alloc[dbt[g][o][p].u] = o
+              /\ \A d \in deferred :
+                   (d.kind \in {"commit", "replicate"} /\ dbt[g][o][p].u \in d.units) =>
+                       d.after[g] >= NewBatch(g).seq
+              /\ \A r \in requests, q \in Positions :
+                   (FreezesRow(r, o, q) /\ table[o][q].u = dbt[g][o][p].u) =>
+                       g \in r.sg /\ (g \in r.by => r.after[g] >= NewBatch(g).seq)
+              /\ \A t \in tasks : t.kind = "replicate" => dbt[g][o][p].u \notin t.units
+  <1> DEFINE u == dbt[g][o][p].u
+             nb == NewBatch(g)
+  <1>1. nb.g = g /\ nb.seq = launched[g] + 1
+    BY DEF NewBatch
+  <1>2. /\ Live(o) /\ (ogroup[o] = g \/ ReaderRow(g, o, p, u, dbt[g][o][p].w))
+        /\ HoldsAt(o, p, u)
+        /\ (p \in Positions /\ dbt[g][o][p].w) =>
+             /\ table[o][p].k = "private"
+             /\ ~\E d \in deferred : d.kind \in {"commit", "replicate"} /\ u \in d.units
+             /\ ~\E t \in tasks : t.kind = "replicate" /\ u \in t.units
+    BY DEF IndInv, TablesMapped
+  <1>3. /\ ~\E d \in deferred : d.kind = "transfer" /\ d.o = o
+        /\ ~\E t \in tasks : t.kind = "transfer" /\ t.o = o
+    BY DEF IndInv, MovingUnmapped
+  <1>4. \A r \in requests : TakesRow(r, o, p) => g \in r.sg /\ g \notin r.by
+    BY DEF IndInv, RequestsOk, TakesRow, FreezesRow
+  (* A reader's row is of a position, read only, of a block valid in its   *)
+  (* group's memory.                                                       *)
+  <1>5. ogroup[o] # g =>
+          /\ g \in ReadersOf(o) /\ p \in Positions /\ ~dbt[g][o][p].w /\ Mem(g) \in valid[u]
+    BY <1>2 DEF ReaderRow
+  <1>6. Covered(nb, o, u)
+    <2>1. ogroup[o] = g \/ g \in ReadersOf(o)
+      BY <1>5
+    <2> QED
+      BY <1>1, <1>2, <1>3, <1>4, <2>1 DEF Covered
+  <1>7. Held(u) /\ u \notin free
+    BY <1>2 DEF HoldsAt, Held, HeldIn, Rows, IndInv, FreeClean
+  <1>8. CASE p = SLOT
+    <2>1. ogroup[o] = g
+      BY <1>5, <1>8
+    <2>2. u = oslot[o] /\ u \in Slots /\ alloc[u] = o
+      BY <1>2, <1>8, <2>1 DEF HoldsAt, IndInv, OwnersOk
+    <2>3. \A d \in deferred : d.kind \in {"commit", "replicate"} => u \notin d.units
+      <3>1. \A d \in deferred : d.kind = "commit" => d.units \subseteq Units
+        BY DEF IndInv, DeferredOk
+      <3>2. \A d \in deferred : d.kind = "replicate" => d.units \subseteq Units
+        BY CrossingsOkEach DEF IndInv, CrossWaitOk
+      <3> QED
+        BY <2>2, <3>1, <3>2
+    <2>4. \A q \in Positions : table[o][q].u # u
+      BY <2>2, OwnerTypes DEF OwnerTyped, Empty, Private, Shared
+    <2>5. \A t \in tasks : t.kind = "replicate" => u \notin t.units
+      <3>1. \A t \in tasks : t.kind = "replicate" => t.units \subseteq Units
+        BY CrossingsOkEach DEF IndInv, CrossTaskOk
+      <3> QED
+        BY <2>2, <3>1
+    <2> QED
+      BY <1>6, <1>7, <2>2, <2>3, <2>4, <2>5
+  <1>9. CASE p \in Positions
+    <2>1. /\ table[o][p].u = u /\ u \in Units
+          /\ table[o][p].k = "private" => alloc[u] = o
+          /\ table[o][p].k # "private" => alloc[u] = "shared"
+          /\ Mem(ogroup[o]) \in valid[u]
+      BY <1>2, <1>9, OwnerTypes DEF HoldsAt, IndInv, Tables, OwnerTyped, Empty, Private, Shared
+    <2>2. Mem(g) \in valid[u]
+      BY <1>5, <2>1
+    <2>3. ASSUME dbt[g][o][p].w, NEW r \in requests, NEW q \in Positions,
+                 FreezesRow(r, o, q), table[o][q].u = u
+          PROVE  g \in r.sg /\ (g \in r.by => r.after[g] >= nb.seq)
+      <3>1. q = p
+        BY <1>2, <1>9, <2>1, <2>3 DEF IndInv, Tables
+      <3> QED
+        BY <2>3, <3>1 DEF IndInv, RequestsOk, FreezesRow
+    <2> QED
+      BY <1>2, <1>6, <1>7, <1>9, <2>1, <2>2, <2>3
+  <1> QED
+    BY <1>8, <1>9 DEF Rows
+
 LEMMA Launch_BatchesOk ==
   ASSUME IndInv, NEW g \in Groups, Launch(g), UNCHANGED rare
   PROVE  BatchesOk'
@@ -233,52 +328,12 @@ LEMMA Launch_BatchesOk ==
                /\ dbt[g][o][p].w =>
                     /\ alloc[dbt[g][o][p].u] = o
                     /\ \A d \in deferred :
-                         (d.kind = "commit" /\ dbt[g][o][p].u \in d.units) => d.after[g] >= nb.seq
+                         (d.kind \in {"commit", "replicate"} /\ dbt[g][o][p].u \in d.units) =>
+                             d.after[g] >= nb.seq
                     /\ \A r \in requests, q \in Positions :
-                         (CommitsRow(r, o, q) /\ table[o][q].u = dbt[g][o][p].u) =>
+                         (FreezesRow(r, o, q) /\ table[o][q].u = dbt[g][o][p].u) =>
                              g \in r.sg /\ (g \in r.by => r.after[g] >= nb.seq)
-    <2> DEFINE u == dbt[g][o][p].u
-    <2>1. /\ Live(o) /\ ogroup[o] = g /\ HoldsAt(o, p, u)
-          /\ (p \in Positions /\ dbt[g][o][p].w) =>
-               /\ table[o][p].k = "private"
-               /\ ~\E d \in deferred : d.kind = "commit" /\ u \in d.units
-      BY <1>3 DEF IndInv, TablesMapped
-    <2>2. /\ ~\E d \in deferred : d.kind = "transfer" /\ d.o = o
-          /\ ~\E t \in tasks : t.kind = "transfer" /\ t.o = o
-      BY <1>3 DEF IndInv, MovingUnmapped
-    <2>3. \A r \in requests : TakesRow(r, o, p) => g \in r.sg /\ g \notin r.by
-      BY <1>3 DEF IndInv, RequestsOk, TakesRow, CommitsRow
-    <2>4. Covered(nb, o, u)
-      BY <1>1, <2>1, <2>2, <2>3 DEF Covered
-    <2>5. Held(u) /\ u \notin free
-      BY <2>1 DEF HoldsAt, Held, HeldIn, Rows, IndInv, FreeClean
-    <2>6. CASE p = SLOT
-      <3>1. u = oslot[o] /\ u \in Slots /\ alloc[u] = o
-        BY <2>1, <2>6 DEF HoldsAt, IndInv, OwnersOk
-      <3>2. \A d \in deferred : d.kind = "commit" => u \notin d.units
-        BY <3>1 DEF IndInv, DeferredOk
-      <3>3. \A q \in Positions : table[o][q].u # u
-        BY <3>1, OwnerTypes DEF OwnerTyped, Empty, Private, Shared
-      <3> QED
-        BY <2>4, <2>5, <3>1, <3>2, <3>3
-    <2>7. CASE p \in Positions
-      <3>1. /\ table[o][p].u = u /\ u \in Units
-            /\ table[o][p].k = "private" => alloc[u] = o
-            /\ table[o][p].k # "private" => alloc[u] = "shared"
-            /\ Mem(ogroup[o]) \in valid[u]
-        BY <1>3, <2>1, <2>7, OwnerTypes DEF HoldsAt, IndInv, Tables, OwnerTyped, Empty, Private,
-                                            Shared
-      <3>2. ASSUME dbt[g][o][p].w, NEW r \in requests, NEW q \in Positions,
-                   CommitsRow(r, o, q), table[o][q].u = u
-            PROVE  g \in r.sg /\ (g \in r.by => r.after[g] >= nb.seq)
-        <4>1. q = p
-          BY <2>1, <2>7, <3>1, <3>2 DEF IndInv, Tables
-        <4> QED
-          BY <1>3, <3>2, <4>1 DEF IndInv, RequestsOk, CommitsRow
-      <3> QED
-        BY <2>1, <2>4, <2>5, <2>7, <3>1, <3>2
-    <2> QED
-      BY <2>6, <2>7 DEF Rows
+    BY <1>0, <1>3, Launch_Rows
   <1>4. /\ \A x \in nb.reads :
              /\ x[1] \in Owners /\ x[2] \notin free' /\ alloc'[x[2]] \in {x[1], "shared"}
              /\ (x[2] \in Units => Mem(nb.g) \in valid'[x[2]])
@@ -286,9 +341,9 @@ LEMMA Launch_BatchesOk ==
         /\ \A x \in nb.writes :
              /\ alloc'[x[2]] = x[1]
              /\ \A d \in deferred' :
-                  (d.kind = "commit" /\ x[2] \in d.units) => d.after[nb.g] >= nb.seq
+                  (d.kind \in {"commit", "replicate"} /\ x[2] \in d.units) => d.after[nb.g] >= nb.seq
              /\ \A r \in requests', q \in Positions :
-                  (CommitsRow(r, x[1], q) /\ table'[x[1]][q].u = x[2]) =>
+                  (FreezesRow(r, x[1], q) /\ table'[x[1]][q].u = x[2]) =>
                       nb.g \in r.sg /\ (nb.g \in r.by => r.after[nb.g] >= nb.seq)
     BY <1>1, <1>2, <1>3, Launch_Held DEF LaunchRows
   <1>5. /\ \A u \in nb.cw : \E c \in copies' : c.write = u /\ c.g = nb.g /\ c.seq = nb.seq
@@ -316,11 +371,80 @@ LEMMA Launch_BatchesOk ==
   <1> QED
     BY <1>1, <1>2, <1>4, <1>5, <1>6, <1>7, Launch_Held DEF IndInv, BatchesOk
 
+(* The copies keep every field but seq, so the crossings and the copies    *)
+(* stay placed; the new batch writes no block a crossing copies.           *)
+LEMMA Launch_Cross ==
+  ASSUME IndInv, NEW g \in Groups, Launch(g), UNCHANGED rare
+  PROVE  CrossingsOk' /\ CopiesPlaced' /\ CrossingsPlaced'
+  <1>1. UNCHANGED <<free, ostate, ogroup, oslot, table, cache, hcache, deferred, ncopy, tasks,
+                    trial, member, valid, vis, dbt, handoff, requests, alloc, sharedKey,
+                    remote, lost, bad>>
+    BY Launch_Effect DEF rare
+  <1>2. /\ \A x \in copies' : \E c \in copies :
+             /\ x.kind = c.kind /\ x.g = c.g /\ x.read = c.read /\ x.write = c.write
+             /\ x.fill = c.fill /\ x.parts = c.parts
+    BY Launch_Effect, Launch_Copies
+  <1>3. \A o \in Owners : Moving(o)' = Moving(o)
+    BY <1>1 DEF Moving
+  <1>4. CrossingsOk'
+    <2>1. \A d \in deferred : CrossWaitOk(d)'
+      <3> SUFFICES ASSUME NEW d \in deferred, d.kind = "replicate" PROVE CrossWaitOk(d)'
+        BY DEF CrossWaitOk
+      <3>1. CrossWaitOk(d)
+        BY CrossingsOkEach DEF IndInv
+      <3>2. \A x \in copies' : ~x.fill => x.write \notin d.units
+        BY <1>2, <3>1 DEF CrossWaitOk
+      <3> QED
+        BY <1>1, <1>3, <3>1, <3>2 DEF CrossWaitOk, ReadersOf, MadeBy
+    <2>2. \A t \in tasks : CrossTaskOk(t)'
+      <3> SUFFICES ASSUME NEW t \in tasks, t.kind = "replicate" PROVE CrossTaskOk(t)'
+        BY DEF CrossTaskOk
+      <3>1. CrossTaskOk(t)
+        BY CrossingsOkEach DEF IndInv
+      <3>2. \A x \in copies' :
+              (x.fill /\ x.kind = "load" /\ Mem(x.g) = Mem(t.to)) => x.write \notin t.writes
+        BY <1>2, <3>1 DEF CrossTaskOk
+      <3> QED
+        BY <1>1, <1>3, <3>1, <3>2 DEF CrossTaskOk, ReadersOf, Mem
+    <2> QED
+      BY <1>1, <2>1, <2>2, CrossingsOkEach
+  <1>5. CopiesPlaced'
+    <2> SUFFICES ASSUME NEW x \in copies' PROVE CopyPlaced(x)'
+      BY PlacedEach
+    <2>1. PICK c \in copies :
+            /\ x.kind = c.kind /\ x.g = c.g /\ x.read = c.read /\ x.write = c.write
+            /\ x.fill = c.fill /\ x.parts = c.parts
+      BY <1>2
+    <2>2. CopyPlaced(c)
+      BY PlacedEach DEF IndInv
+    <2> QED
+      BY <1>1, <2>1, <2>2 DEF CopyPlaced, Mem
+  <1>6. CrossingsPlaced'
+    <2> SUFFICES ASSUME NEW t \in tasks, t.kind = "replicate", NEW u \in t.units
+                 PROVE  /\ Mem(ogroup[t.o]) \in valid[u]
+                        /\ \A b \in inflight' : \A w \in b.writes : w[2] # u
+      BY <1>1 DEF CrossingsPlaced, Mem
+    <2>1. /\ Mem(ogroup[t.o]) \in valid[u]
+          /\ \A b \in inflight : \A w \in b.writes : w[2] # u
+      BY DEF IndInv, CrossingsPlaced
+    <2>2. \A w \in NewBatch(g).writes : w[2] # u
+      <3> SUFFICES ASSUME NEW r \in LaunchRows(g), dbt[g][r[1]][r[2]].w
+                   PROVE  dbt[g][r[1]][r[2]].u # u
+        BY DEF NewBatch
+      <3>1. r[1] \in Owners /\ r[2] \in Rows /\ dbt[g][r[1]][r[2]].u # NONE
+        BY DEF LaunchRows
+      <3> QED
+        BY <3>1, Launch_Rows
+    <2> QED
+      BY <2>1, <2>2, Launch_Effect
+  <1> QED
+    BY <1>4, <1>5, <1>6
+
 LEMMA Launch_Inv ==
   ASSUME IndInv, NEW g \in Groups, Launch(g), UNCHANGED rare
   PROVE  IndInv'
   BY Launch_Typed, Launch_Frame, Launch_LostOk, Launch_DeferredOk, Launch_CopiesOk,
-     Launch_TasksOk, Launch_RequestsOk, Launch_BatchesOk DEF IndInv
+     Launch_TasksOk, Launch_RequestsOk, Launch_BatchesOk, Launch_Cross DEF IndInv
 
 -----------------------------------------------------------------------------
 (* ExecFinish                                                              *)
@@ -347,6 +471,7 @@ LEMMA ExecFinish_Values ==
          /\ Finished(c).o = c.o /\ Finished(c).p = c.p /\ Finished(c).k = c.k
          /\ Finished(c).g = c.g /\ Finished(c).read = c.read
          /\ Finished(c).write = c.write /\ Finished(c).fill = c.fill
+         /\ Finished(c).parts = c.parts
          /\ Finished(c).seq = c.seq /\ Finished(c).stopped = c.stopped
          /\ Finished(c).done = TRUE
          /\ FinishOf(c, ok).kind = "finish" /\ FinishOf(c, ok).e = GroupEpoch[c.g]
@@ -355,8 +480,8 @@ LEMMA ExecFinish_Values ==
          /\ FinishOf(c, ok).after = [x \in Groups |-> IF x = c.g THEN launched[c.g] ELSE 0]
          /\ FinishOf(c, ok).by = {c.g} /\ FinishOf(c, ok).sg = {c.g}
   <1>1. /\ c = [id |-> c.id, kind |-> c.kind, o |-> c.o, p |-> c.p, k |-> c.k, g |-> c.g,
-              read |-> c.read, write |-> c.write, fill |-> c.fill, seq |-> c.seq,
-              done |-> c.done, stopped |-> c.stopped]
+              read |-> c.read, write |-> c.write, fill |-> c.fill, parts |-> c.parts,
+              seq |-> c.seq, done |-> c.done, stopped |-> c.stopped]
         /\ c.g \in Groups
     BY WorkTypes DEF WorkTyped, IndInv, CopiesOk
   <1> QED
@@ -382,11 +507,17 @@ LEMMA ExecFinish_Held ==
   <1>2. UNCHANGED <<table, oslot, cache, hcache, deferred, tasks>>
     BY ExecFinish_Effect
   <1>5. \A u : Held(u)' = Held(u)
-    BY <1>1, <1>2, Zenon DEF Held, HeldIn
+    <2>1. \A u : Held(u)' = HeldIn(u, table, oslot, cache, hcache, deferred, copies', tasks)
+      BY <1>2 DEF Held
+    <2>2. \A u : HeldIn(u, table, oslot, cache, hcache, deferred, copies', tasks)
+                   = HeldIn(u, table, oslot, cache, hcache, deferred, copies, tasks)
+      BY <1>1 DEF HeldIn
+    <2> QED
+      BY <2>1, <2>2 DEF Held
   <1>3. \A o, p : ~TakesRow(FinishOf(c, ok), o, p)
     BY ExecFinish_Values DEF TakesRow
   <1>4. \A x, o, u : Covered(x, o, u)' = Covered(x, o, u)
-    BY <1>3, ExecFinish_Effect DEF Covered, Live, HoldsAt
+    BY <1>3, ExecFinish_Effect DEF Covered, Live, HoldsAt, ReadersOf
   <1> QED
     BY <1>5, <1>4
 
@@ -400,8 +531,8 @@ LEMMA ExecFinish_Typed ==
   <1>2. WorkTyped'
     <2>1. LET x == Finished(c) IN
             x = [id |-> x.id, kind |-> x.kind, o |-> x.o, p |-> x.p, k |-> x.k, g |-> x.g,
-                 read |-> x.read, write |-> x.write, fill |-> x.fill, seq |-> x.seq,
-                 done |-> x.done, stopped |-> x.stopped]
+                 read |-> x.read, write |-> x.write, fill |-> x.fill, parts |-> x.parts,
+                 seq |-> x.seq, done |-> x.done, stopped |-> x.stopped]
       BY WorkTypes DEF WorkTyped, Finished
     <2> QED
       BY <2>1, ExecFinish_Copies, ExecFinish_Values, ExecFinish_Effect, WorkTypes DEF WorkTyped
@@ -417,6 +548,7 @@ LEMMA ExecFinish_Typed ==
             /\ r.kind # "finish" => r.o \in Owners
             /\ r.kind = "commit" => r.p \in Positions /\ r.k \in Keys
             /\ r.kind = "transfer" => r.to \in Groups
+            /\ r.kind = "replicate" => r.p \in Positions /\ r.to \in Groups
             /\ r = [kind |-> r.kind, e |-> r.e, o |-> r.o, ps |-> r.ps, p |-> r.p, k |-> r.k,
                     c |-> r.c, ok |-> r.ok, to |-> r.to, after |-> r.after, by |-> r.by, sg |-> r.sg]
       BY <2>1, ExecFinish_Values DEF Stamps, FinishOf, Request, NoStamp
@@ -430,7 +562,7 @@ LEMMA ExecFinish_Frame ==
          UNCHANGED rare
   PROVE  /\ FreeClean' /\ NoLeak' /\ Outside' /\ Regions' /\ AllocOwner' /\ SharedIff'
          /\ SharedCached' /\ CacheShared' /\ Tables' /\ OwnersOk' /\ MovingUnmapped'
-         /\ TablesMapped' /\ NoBad'
+         /\ TablesMapped' /\ NoBad' /\ CrossingsPlaced'
   <1>1. UNCHANGED <<free, ostate, ogroup, oslot, table, cache, hcache, deferred, ncopy, tasks,
                     trial, member, valid, vis, dbt, launched, inflight, handoff, alloc, sharedKey,
                     remote, lost, bad>>
@@ -440,26 +572,28 @@ LEMMA ExecFinish_Frame ==
   <1> QED
     BY <1>1, <1>2, OutsideFrame, RegionsFrame, AllocOwnerFrame, SharedIffFrame, SharedCachedFrame,
        CacheSharedFrame, TablesFrame, OwnersOkFrame, MovingUnmappedFrame, TablesMappedFrame,
-       NoBadFrame, TransfersFrame DEF IndInv
+       NoBadFrame, CrossingsPlacedFrame, TransfersFrame DEF IndInv
 
 LEMMA ExecFinish_CopiesOk ==
   ASSUME IndInv, NEW c \in copies, NEW ok \in BOOLEAN, ExecFinish(c, ok),
          UNCHANGED rare
-  PROVE  CopiesOk' /\ DeferredOk' /\ TasksOk' /\ TrialVisibility'
+  PROVE  CopiesOk' /\ DeferredOk' /\ TasksOk' /\ TrialVisibility' /\ CrossingsOk' /\ CopiesPlaced'
   <1> DEFINE F(x) == IF x = c THEN Finished(c) ELSE x
   <1>1. copies' = {F(x) : x \in copies}
     BY ExecFinish_Copies
   <1>2. \A x \in copies :
           /\ F(x).id = x.id /\ F(x).kind = x.kind /\ F(x).o = x.o /\ F(x).p = x.p
           /\ F(x).k = x.k /\ F(x).g = x.g /\ F(x).read = x.read /\ F(x).write = x.write
-          /\ F(x).fill = x.fill /\ F(x).seq = x.seq /\ F(x).stopped = x.stopped
+          /\ F(x).fill = x.fill /\ F(x).parts = x.parts /\ F(x).seq = x.seq
+          /\ F(x).stopped = x.stopped
           /\ F(x).seq <= launched'[x.g]
           /\ F(x).done => F(x).seq > 0
     <2>1. \A x \in copies : x.seq <= launched[x.g] /\ (x.done => x.seq > 0)
       BY DEF IndInv, CopiesOk
     <2> QED
       BY <2>1, ExecFinish_Values, ExecFinish_Effect
-  <1>3. UNCHANGED <<ncopy, lost, alloc, cache, valid, tasks, table, ostate, ogroup, deferred>>
+  <1>3. UNCHANGED <<ncopy, lost, alloc, cache, hcache, valid, tasks, table, ostate, ogroup,
+                    deferred, vis, inflight>>
     BY ExecFinish_Effect DEF rare
   <1>4. CopiesOk'
     <2>1. /\ \A x \in copies' : \E y \in copies : SameCopy(x, y)
@@ -474,8 +608,40 @@ LEMMA ExecFinish_CopiesOk ==
   <1>6. TasksOk' /\ TrialVisibility'
     BY <1>1, <1>2, ExecFinish_Effect DEF IndInv, TasksOk, Live, TableUnits, Mem, TrialVisibility,
                                          MadeBy
+  (* The copies keep every field but done.                                 *)
+  <1>7. \A o \in Owners : Moving(o)' = Moving(o)
+    BY <1>3 DEF Moving
+  <1>8. CrossingsOk'
+    <2>1. \A d \in deferred : CrossWaitOk(d)'
+      <3> SUFFICES ASSUME NEW d \in deferred, d.kind = "replicate" PROVE CrossWaitOk(d)'
+        BY DEF CrossWaitOk
+      <3>1. CrossWaitOk(d)
+        BY CrossingsOkEach DEF IndInv
+      <3>2. \A x \in copies' : ~x.fill => x.write \notin d.units
+        BY <1>1, <1>2, <3>1 DEF CrossWaitOk
+      <3> QED
+        BY <1>3, <1>7, <3>1, <3>2, ExecFinish_Effect DEF CrossWaitOk, ReadersOf, MadeBy
+    <2>2. \A t \in tasks : CrossTaskOk(t)'
+      <3> SUFFICES ASSUME NEW t \in tasks, t.kind = "replicate" PROVE CrossTaskOk(t)'
+        BY DEF CrossTaskOk
+      <3>1. CrossTaskOk(t)
+        BY CrossingsOkEach DEF IndInv
+      <3>2. \A x \in copies' :
+              (x.fill /\ x.kind = "load" /\ Mem(x.g) = Mem(t.to)) => x.write \notin t.writes
+        BY <1>1, <1>2, <3>1 DEF CrossTaskOk
+      <3> QED
+        BY <1>3, <1>7, <3>1, <3>2, ExecFinish_Effect DEF CrossTaskOk, ReadersOf, Mem
+    <2> QED
+      BY <1>3, <2>1, <2>2, CrossingsOkEach
+  <1>9. CopiesPlaced'
+    <2> SUFFICES ASSUME NEW y \in copies PROVE CopyPlaced(F(y))'
+      BY <1>1, PlacedEach
+    <2>1. CopyPlaced(y)
+      BY PlacedEach DEF IndInv
+    <2> QED
+      BY <1>2, <1>3, <2>1 DEF CopyPlaced, Mem
   <1> QED
-    BY <1>4, <1>5, <1>6
+    BY <1>4, <1>5, <1>6, <1>8, <1>9
 
 LEMMA ExecFinish_Requests ==
   ASSUME IndInv, NEW c \in copies, NEW ok \in BOOLEAN, ExecFinish(c, ok),
@@ -489,8 +655,8 @@ LEMMA ExecFinish_Requests ==
         /\ GroupEpoch[c.g] \notin lost
         /\ \A x \in copies : x.id = c.id => x = c
     BY DEF IndInv, CopiesOk
-  <1>3. \A o, p : ~CommitsRow(FinishOf(c, ok), o, p) /\ ~TakesRow(FinishOf(c, ok), o, p)
-    BY ExecFinish_Values DEF CommitsRow, TakesRow
+  <1>3. \A o, p : ~FreezesRow(FinishOf(c, ok), o, p) /\ ~TakesRow(FinishOf(c, ok), o, p)
+    BY ExecFinish_Values DEF FreezesRow, TakesRow
   <1>4. \A x \in copies' : \E y \in copies :
           /\ x.id = y.id /\ x.g = y.g /\ x.seq = y.seq /\ x.stopped = y.stopped
           /\ x.read = y.read /\ x.write = y.write
@@ -504,7 +670,7 @@ LEMMA ExecFinish_Requests ==
             /\ r.by \subseteq r.sg /\ r.sg \subseteq Groups
             /\ \A x \in r.sg : GroupEpoch[x] = r.e
             /\ \A x \in Groups : r.after[x] <= launched[x] /\ (x \notin r.by => r.after[x] = 0)
-            /\ r.kind \in {"release", "detach", "commit", "transfer", "finish"}
+            /\ r.kind \in {"release", "detach", "commit", "transfer", "replicate", "finish"}
             /\ r.c \in 1 .. ncopy
             /\ \A x \in copies' :
                  (x.id = r.c /\ GroupEpoch[x.g] = r.e) =>
@@ -525,7 +691,7 @@ LEMMA ExecFinish_Requests ==
     <2> QED
       BY <1>1, <2>1, <2>2, ExecFinish_Effect, ExecFinish_Values DEF IndInv, RequestsOk
   <1>7. HandoffOk'
-    BY <1>1, ExecFinish_Effect DEF IndInv, HandoffOk, Live, HoldsAt
+    BY <1>1, ExecFinish_Effect DEF IndInv, HandoffOk, Live, HoldsAt, ReaderRow, ReadersOf, Mem
   <1>8. LostOk'
     BY <1>1, <1>2, ExecFinish_Effect, ExecFinish_Values DEF IndInv, LostOk
   <1>9. BatchesOk'

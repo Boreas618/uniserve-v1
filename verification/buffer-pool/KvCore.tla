@@ -13,7 +13,7 @@
 (* action, because the buffer pool is one value changed through one        *)
 (* thread; what is not atomic is three actions: taken, due, finished.      *)
 (*                                                                         *)
-(* Each rule R1 to R10 of §9 is one guard, in force when its name is in    *)
+(* Each rule R1 to R11 of §9 is one guard, in force when its name is in    *)
 (* `Rules`; a configuration that leaves one out is that rule's mutation.   *)
 (***************************************************************************)
 EXTENDS Naturals, FiniteSets
@@ -72,7 +72,14 @@ CONSTANTS
     \* @type: Bool;
     Eager,       \* whether a completion is handed to its executor when it is produced
     \* @type: Set(Str);
-    Rules        \* the rules in force, a subset of {"R1", ..., "R10"}
+    Rules,       \* the rules in force, a subset of {"R1", ..., "R11"}
+    \* @type: Set(Str);
+    HostParts,   \* the host parts: a part of the host region on one host
+    \* @type: Str -> Set(Str);
+    GroupParts,  \* [Groups -> SUBSET HostParts]: the host parts a group's ranks copy with
+    \* @type: Str -> Set(Str);
+    Readers      \* [Groups -> SUBSET Groups]: the groups that read the class an owner of
+                 \* the group holds, in a memory of their own
 
 VARIABLES
     \* The buffer pool.
@@ -92,14 +99,17 @@ VARIABLES
     hcache,      \* [Keys -> HostUnits \cup {NONE}]: the host block cached under a key
     \* @type: Set({kind: Str, units: Set(Str), after: Str -> Int, o: Str, p: Str, k: Str, c: Int, ok: Bool, g: Str, to: Str});
     deferred,    \* work that waits for stamps: releases, commits and the ends of copies
-    \* @type: Set({id: Int, kind: Str, o: Str, p: Str, k: Str, g: Str, read: Str, write: Str, fill: Bool, seq: Int, done: Bool, stopped: Bool});
+    \* @type: Set({id: Int, kind: Str, o: Str, p: Str, k: Str, g: Str, read: Str, write: Str, fill: Bool, parts: Set(Str), seq: Int, done: Bool, stopped: Bool});
     copies,      \* the copies in flight, each holding the block it reads and the one it writes
     \* @type: Int;
     ncopy,       \* the copies ever asked for
-    \* @type: Set({kind: Str, k: Str, h: Str, src: Str, ok: Bool, expired: Bool, o: Str, to: Str, slot: Str, held: Bool, units: Set(Str), writes: Set(Str)});
-    tasks,       \* the transfers in flight, each holding the blocks it copies
+    \* @type: Set({kind: Str, k: Str, h: Str, src: Str, ok: Bool, expired: Bool, p: Str, o: Str, to: Str, slot: Str, held: Bool, units: Set(Str), writes: Set(Str)});
+    tasks,       \* the transfers, crossings, prefetches and remote puts in flight, each
+                 \* holding the blocks it copies
     \* @type: Str -> Set(Str);
-    valid,       \* [Units -> SUBSET memories]: the memories that hold a block's content
+    valid,       \* [Units \cup HostUnits -> SUBSET (memories \cup HostParts)]: the memories
+                 \* that hold a device block's content, and the host parts that hold a
+                 \* cached host block's content ({} for a host unit no key caches)
     \* @type: Str -> {d: Str, h: Str};
     vis,         \* [Keys -> [d, h]]: per key, the epoch on trial its device copy and its host
                  \* copy are visible to alone, or NONE for a copy every epoch may use
@@ -141,8 +151,8 @@ vars == <<pool, plane, alloc, sharedKey, rare>>
 
 \* @typeAlias: req = {kind: Str, e: Str, o: Str, ps: Set(Str), p: Str, k: Str, c: Int, ok: Bool, to: Str, after: Str -> Int, by: Set(Str), sg: Set(Str)};
 \* @typeAlias: def = {kind: Str, units: Set(Str), after: Str -> Int, o: Str, p: Str, k: Str, c: Int, ok: Bool, g: Str, to: Str};
-\* @typeAlias: copy = {id: Int, kind: Str, o: Str, p: Str, k: Str, g: Str, read: Str, write: Str, fill: Bool, seq: Int, done: Bool, stopped: Bool};
-\* @typeAlias: task = {kind: Str, k: Str, h: Str, src: Str, ok: Bool, expired: Bool, o: Str, to: Str, slot: Str, held: Bool, units: Set(Str), writes: Set(Str)};
+\* @typeAlias: copy = {id: Int, kind: Str, o: Str, p: Str, k: Str, g: Str, read: Str, write: Str, fill: Bool, parts: Set(Str), seq: Int, done: Bool, stopped: Bool};
+\* @typeAlias: task = {kind: Str, k: Str, h: Str, src: Str, ok: Bool, expired: Bool, p: Str, o: Str, to: Str, slot: Str, held: Bool, units: Set(Str), writes: Set(Str)};
 \* @typeAlias: batch = {g: Str, seq: Int, reads: Set(<<Str, Str>>), writes: Set(<<Str, Str>>), cr: Set(Str), cw: Set(Str)};
 \* @typeAlias: hand = {g: Str, o: Str, p: Str, u: Str, w: Bool};
 KvAliases == TRUE
@@ -156,6 +166,17 @@ Mem(g) == GroupMemory[g]
 (* Storage Server does not check whose a slot is.                          *)
 OwnSession(o, e) == "H7" \in Hazards \/ OwnerEpoch[o] = e
 Memories == {GroupMemory[g] : g \in Groups}
+AllParts == [g \in Groups |-> HostParts]
+NoReaders == [g \in Groups |-> {}]
+(* Whether a configuration has groups that read in another memory: only    *)
+(* then does the control plane issue crossings.                            *)
+Crosses == \E g \in Groups : Readers[g] # {}
+(* The groups that read what owner o's group writes.                        *)
+ReadersOf(o) == IF ogroup[o] \in Groups THEN Readers[ogroup[o]] ELSE {}
+(* Whether owner o's crossing waits or runs.                               *)
+Replicating(o) ==
+    \/ \E t \in tasks : t.kind = "replicate" /\ t.o = o
+    \/ \E d \in deferred : d.kind = "replicate" /\ d.o = o
 
 Empty == [k |-> "none", u |-> NONE]
 Private(u) == [k |-> "private", u |-> u]
@@ -259,7 +280,7 @@ Names(r, h) ==
     /\ r.o = h.o
     /\ CASE r.kind = "release" -> h.p \in r.ps
          [] r.kind \in {"detach", "transfer"} -> TRUE
-         [] r.kind = "commit" -> h.p = r.p
+         [] r.kind \in {"commit", "replicate"} -> h.p = r.p
          [] OTHER -> FALSE
 
 (* A completion with runs leaves the buffer pool. The control plane hands  *)
@@ -340,8 +361,9 @@ EvictHost(k) ==
     /\ On("R2") => ~\E c \in copies : hcache[k] = c.read \/ hcache[k] = c.write
     /\ On("R2") => ~\E t \in tasks : t.held /\ hcache[k] = t.h
     /\ hcache' = [hcache EXCEPT ![k] = NONE]
+    /\ valid' = [valid EXCEPT ![hcache[k]] = {}]
     /\ Drop({hcache[k]}, table, oslot, cache, hcache', deferred, copies)
-    /\ UNCHANGED <<ostate, ogroup, oslot, table, cache, deferred, copies, ncopy, tasks, trial, member, valid, vis, plane>>
+    /\ UNCHANGED <<ostate, ogroup, oslot, table, cache, deferred, copies, ncopy, tasks, trial, member, vis, plane>>
 
 -----------------------------------------------------------------------------
 (* Copies the executor runs. The handler allocates the destination and the *)
@@ -353,6 +375,7 @@ Copy(kind, o, p, k, g, read, write) ==
     [id |-> ncopy + 1, kind |-> kind, o |-> o, p |-> p, k |-> k, g |-> g,
      read |-> read, write |-> write,
      fill |-> FALSE,      \* whether it fills a group's memory of a shared block
+     parts |-> {},        \* the host parts a fill of a key's host block writes
      seq |-> 0,           \* the batch it ran with; 0 before it starts
      done |-> FALSE,      \* whether its executor returned its `Finish`
      stopped |-> FALSE]   \* whether the scheduler gave it up
@@ -389,6 +412,7 @@ Load(o, p, k) ==
     /\ ostate[o] = "live"
     /\ hcache[k] # NONE
     /\ VisibleHost(k, o)
+    /\ On("R11") => GroupParts[ogroup[o]] \subseteq valid[hcache[k]]
     /\ On("R1") => table[o][p] = Empty /\ ~CopyFor(o, p) /\ ~Moving(o)
     /\ LET here == Mem(ogroup[o])
            \* The key's device block can be filled for this owner: it is not
@@ -403,7 +427,7 @@ Load(o, p, k) ==
           THEN \* Nothing else fills that memory: no other load, no transfer.
                /\ ~\E c \in copies : c.write = cache[k] /\ Mem(c.g) = here
                /\ ~\E t \in tasks :
-                    t.kind = "transfer" /\ Mem(t.to) = here /\ cache[k] \in t.writes
+                    t.kind \in {"transfer", "replicate"} /\ Mem(t.to) = here /\ cache[k] \in t.writes
                /\ copies' = copies \cup
                     {[Copy("load", o, p, k, ogroup[o], hcache[k], cache[k]) EXCEPT !.fill = TRUE]}
                /\ UNCHANGED <<free, cache, alloc, sharedKey>>
@@ -427,11 +451,23 @@ Store(g, k) ==
     /\ cache[k] # NONE
     /\ Mem(g) \in valid[cache[k]]
     /\ On("R8") => vis[k].d \in {NONE, GroupEpoch[g]}
-    /\ hcache[k] = NONE
-    /\ \E h \in free \cap HostUnits :
-         /\ free' = free \ {h}
-         /\ alloc' = [alloc EXCEPT ![h] = "copy"]
-         /\ copies' = copies \cup {Copy("store", NONE, NONE, k, g, cache[k], h)}
+    /\ IF hcache[k] = NONE
+       THEN /\ \E h \in free \cap HostUnits :
+                 /\ free' = free \ {h}
+                 /\ alloc' = [alloc EXCEPT ![h] = "copy"]
+                 /\ copies' = copies \cup {Copy("store", NONE, NONE, k, g, cache[k], h)}
+       ELSE \* The key's host block lacks some of the group's host parts: the
+            \* copy fills those (R5: only parts that do not hold the block).
+            /\ ~(GroupParts[g] \subseteq valid[hcache[k]])
+            /\ On("R8") => vis[k].h = MadeBy(GroupEpoch[g])
+            \* Nothing else fills that block.
+            /\ ~\E c \in copies : c.write = hcache[k]
+            /\ copies' = copies \cup
+                 {[Copy("store", NONE, NONE, k, g, cache[k], hcache[k])
+                     EXCEPT !.fill = TRUE,
+                            !.parts = IF On("R5") THEN GroupParts[g] \ valid[hcache[k]]
+                                      ELSE GroupParts[g]]}
+            /\ UNCHANGED <<free, alloc>>
     /\ ncopy' = ncopy + 1
     /\ UNCHANGED <<ostate, ogroup, oslot, table, cache, hcache, deferred, tasks, trial, member, valid, vis, plane,
                    sharedKey>>
@@ -457,6 +493,7 @@ Restore(o, k) ==
     /\ ostate[o] = "live"
     /\ hcache[k] # NONE
     /\ VisibleHost(k, o)
+    /\ On("R11") => GroupParts[ogroup[o]] \subseteq valid[hcache[k]]
     /\ On("R1") => ~Moving(o) /\ ~\E c \in copies : c.o = o /\ c.kind \in {"save", "restore"}
     /\ copies' = copies \cup
          {[Copy("restore", o, NONE, k, ogroup[o], hcache[k], oslot[o]) EXCEPT !.fill = TRUE]}
@@ -484,7 +521,7 @@ Issued(r) ==
                         /\ GroupEpoch[g] = r.e
                         /\ IF r.kind = "finish"
                            THEN \E c \in copies : c.id = r.c /\ c.g = g
-                           ELSE ogroup[r.o] = g}]
+                           ELSE ogroup[r.o] = g \/ g \in ReadersOf(r.o)}]
 
 Issue ==
     /\ Cardinality(requests) < MaxRequests
@@ -499,6 +536,11 @@ Issue ==
                    requests' = requests \cup
                      {Issued([Request("transfer", e, o, {}, NONE, NONE, 0, FALSE)
                                 EXCEPT !.to = g])}
+              \/ \E p \in Positions, g \in Groups :
+                   /\ Crosses
+                   /\ requests' = requests \cup
+                        {Issued([Request("replicate", e, o, {}, p, NONE, 0, FALSE)
+                                   EXCEPT !.to = g])}
          \* The scheduler gives a copy up.
          \* Hazard H13: nothing bounds how long a copy holds its blocks.
          \/ \E c \in 1 .. ncopy :
@@ -533,7 +575,8 @@ ExecStamp(g, r) ==
                         [p \in Rows |->
                            CASE r.kind = "release" /\ p \in r.ps -> NoEntry
                              [] r.kind \in {"detach", "transfer"} -> NoEntry
-                             [] r.kind = "commit" /\ p = r.p -> [u |-> dbt[g][r.o][p].u, w |-> FALSE]
+                             [] r.kind \in {"commit", "replicate"} /\ p = r.p ->
+                                  [u |-> dbt[g][r.o][p].u, w |-> FALSE]
                              [] OTHER -> dbt[g][r.o][p]]]
             /\ requests' = (requests \ {r}) \cup
                              {[r EXCEPT !.after[g] = launched[g], !.by = @ \cup {g}]}
@@ -655,11 +698,11 @@ TakeDetach(r) ==
             \* owner's task holds, the task's slot row included, which is the
             \* hazard H1 of the system as built. Hazard H5: the detach also
             \* lets go of what the owner's copies hold while they run.
-            LET mine == {t \in tasks : t.kind = "transfer" /\ t.o = r.o /\ t.held}
+            LET mine == {t \in tasks : t.kind \in {"transfer", "replicate"} /\ t.o = r.o /\ t.held}
                 keeps == On("R9") /\ "H1" \notin Hazards
                 tsk == IF keeps THEN tasks
                        ELSE {IF t \in mine THEN [t EXCEPT !.held = FALSE] ELSE t : t \in tasks}
-                extra == IF keeps THEN {} ELSE {t.slot : t \in mine}
+                extra == IF keeps THEN {} ELSE {t.slot : t \in mine} \ {NONE}
                 cps == IF "H5" \in Hazards THEN {c \in copies : c.o # r.o} ELSE copies
                 let == UNION {{c.read, c.write} : c \in copies \ cps}
             IN /\ tasks' = tsk
@@ -725,6 +768,7 @@ TakeTransfer(r) ==
                            /\ GroupEpoch[r.to] = r.e
                            /\ r.to # ogroup[r.o]
                            /\ ~Moving(r.o)
+                           /\ ~Replicating(r.o)
                            /\ ~\E c \in copies : c.o = r.o)
        THEN UNCHANGED deferred
        ELSE deferred' = deferred \cup
@@ -844,11 +888,17 @@ FinishDue(d) ==
                       \* The slot holds the stored trajectory.
                       /\ Drop({c.read, c.write}, table, oslot, cache, hcache, deferred', copies')
                       /\ UNCHANGED <<table, cache, hcache, valid, dbt, handoff>>
-                 [] d.ok /\ c.kind \in {"store", "save"} ->
+                 [] d.ok /\ c.kind = "store" /\ c.fill ->
+                      \* The host parts the copy filled hold the block's content.
+                      /\ valid' = [valid EXCEPT ![c.write] = @ \cup c.parts]
+                      /\ Drop({c.read}, table, oslot, cache, hcache, deferred', copies')
+                      /\ UNCHANGED <<table, cache, hcache, dbt, handoff>>
+                 [] d.ok /\ c.kind \in {"store", "save"} /\ ~c.fill ->
                       IF On("R4") /\ hcache[c.k] # NONE
                       THEN /\ Drop({c.read, c.write}, table, oslot, cache, hcache, deferred', copies')
                            /\ UNCHANGED <<table, cache, hcache, valid, dbt, handoff>>
                       ELSE /\ hcache' = [hcache EXCEPT ![c.k] = c.write]
+                           /\ valid' = [valid EXCEPT ![c.write] = GroupParts[c.g]]
                            \* The copy lets go of what it read: the cached device
                            \* block, or the slot of an owner that may be gone.
                            /\ LET gone == ReclaimedWith({c.read}, table, oslot, cache, hcache',
@@ -856,7 +906,7 @@ FinishDue(d) ==
                               IN /\ free' = free \cup gone
                                  /\ alloc' = [Reset(alloc, gone) EXCEPT ![c.write] = "shared"]
                                  /\ sharedKey' = [Reset(sharedKey, gone) EXCEPT ![c.write] = c.k]
-                           /\ UNCHANGED <<table, cache, valid, dbt, handoff>>
+                           /\ UNCHANGED <<table, cache, dbt, handoff>>
     /\ UNCHANGED <<ostate, ogroup, oslot, ncopy, tasks, trial, member, launched, inflight, requests>>
 
 (* A transfer comes due: a task starts that copies into the target group's *)
@@ -874,7 +924,7 @@ TransferDue(d) ==
           \* is valid there, or is copied by this transfer alone.
           /\ ~\E c \in copies : c.fill /\ Mem(c.g) = Mem(d.to) /\ c.write \in units
           /\ ~\E t \in tasks :
-               t.kind = "transfer" /\ Mem(t.to) = Mem(d.to) /\ t.writes \cap units # {}
+               t.kind \in {"transfer", "replicate"} /\ Mem(t.to) = Mem(d.to) /\ t.writes \cap units # {}
           /\ deferred' = deferred \ {d}
           /\ IF ostate[d.o] # "live" \/ rows = {}
              THEN UNCHANGED <<free, tasks, alloc>>
@@ -883,7 +933,7 @@ TransferDue(d) ==
                     /\ alloc' = [alloc EXCEPT ![s] = d.o]
                     /\ tasks' = tasks \cup
                          {[kind |-> "transfer", k |-> NONE, h |-> NONE, src |-> NONE,
-                           ok |-> TRUE, expired |-> FALSE,
+                           ok |-> TRUE, expired |-> FALSE, p |-> NONE,
                            o |-> d.o, to |-> d.to, slot |-> s, held |-> TRUE,
                            units |-> units \cup {oslot[d.o]},
                            writes |-> {u \in units : Mem(d.to) \notin valid[u]}]}
@@ -904,7 +954,7 @@ TransferEnd(t, ok) ==
             \* The target group's memory holds what the task copied. A private
             \* block that no commit froze is written there from now on, so the
             \* source group's memory of it is stale.
-            /\ valid' = [u \in Units |->
+            /\ valid' = [u \in DOMAIN valid |->
                            IF u \notin t.writes THEN valid[u]
                            ELSE IF alloc[u] = "shared"
                                    \/ \E d \in deferred : d.kind = "commit" /\ u \in d.units
@@ -936,24 +986,132 @@ TransferEnd(t, ok) ==
     /\ UNCHANGED <<ostate, table, cache, hcache, deferred, copies, ncopy, vis, trial, member, launched,
                    inflight, requests>>
 
+(* A crossing (`Replicate`): the block at an owner's position reaches the  *)
+(* memory of a group that reads the owner's class. It is taken holding the *)
+(* block (R1: an owner that does not move, a group that reads the class;   *)
+(* R8: an epoch on trial fills no memory of a block others may use), waits *)
+(* for its stamps (R3), runs as a task of the Transfer Server holding the  *)
+(* block (R9), and at its end the block is valid in that memory and the    *)
+(* reading group's executor is handed the entry (A1). R5: a crossing into  *)
+(* memory that holds the block already is answered at once, and the        *)
+(* reading group is handed the entry then.                                 *)
+\* @type: ($req) => Bool;
+TakeReplicate(r) ==
+    /\ r \in requests /\ r.kind = "replicate" /\ Submittable(r)
+    /\ requests' = requests \ {r}
+    /\ LET u == table[r.o][r.p].u
+           h == [g |-> r.to, o |-> r.o, p |-> r.p, u |-> u, w |-> FALSE]
+       IN IF ~(/\ ostate[r.o] = "live"
+               /\ table[r.o][r.p] # Empty
+               /\ On("R1") => /\ OwnSession(r.o, r.e)
+                              /\ ~Moving(r.o)
+                              /\ r.to \in ReadersOf(r.o)
+                              /\ GroupEpoch[r.to] = r.e
+               /\ (On("R8") /\ table[r.o][r.p].k = "shared") =>
+                    vis[sharedKey[u]].d = MadeBy(OwnerEpoch[r.o]))
+          THEN /\ handoff' = Kept(r)
+               /\ UNCHANGED <<deferred, dbt>>
+          ELSE IF On("R5") /\ Mem(r.to) \in valid[u]
+          THEN \* Answered at once: the entry is handed on as by Give, among
+               \* the requests that remain under way.
+               /\ UNCHANGED deferred
+               /\ IF Eager
+                  THEN /\ handoff' = Kept(r)
+                       /\ dbt' = IF \E x \in requests' : Names(x, h)
+                                 THEN dbt
+                                 ELSE [dbt EXCEPT ![r.to][r.o][r.p] = [u |-> u, w |-> FALSE]]
+                  ELSE /\ handoff' = Kept(r) \cup {h}
+                       /\ dbt' = dbt
+          ELSE /\ deferred' = deferred \cup
+                    {[kind |-> "replicate", units |-> {u}, after |-> r.after,
+                      o |-> r.o, p |-> r.p, k |-> NONE, c |-> 0, ok |-> FALSE,
+                      g |-> ogroup[r.o], to |-> r.to]}
+               /\ handoff' = Kept(r)
+               /\ UNCHANGED dbt
+    /\ UNCHANGED <<free, ostate, ogroup, oslot, table, cache, hcache, copies, ncopy, tasks, trial, member, valid, vis,
+                   launched, inflight, alloc, sharedKey>>
+
+(* The crossing comes due when `completed` of every stamping group reached  *)
+(* its stamp (R3). Its task starts while the owner still holds the block at *)
+(* its position and nothing else fills that memory of it. A block that    *)
+(* became valid in that memory meanwhile is not copied (R5): the            *)
+(* reading group is handed the entry at once. Otherwise the crossing lets  *)
+(* go of the block.                                                        *)
+\* @type: ($def) => Bool;
+ReplicateDue(d) ==
+    /\ d \in deferred /\ d.kind = "replicate"
+    /\ On("R3") => Reached(d.after)
+    /\ LET u == CHOOSE x \in d.units : TRUE
+           held == ostate[d.o] = "live" /\ table[d.o][d.p].u = u
+           there == On("R5") /\ Mem(d.to) \in valid[u]
+       IN /\ ~\E c \in copies : c.fill /\ c.write = u /\ Mem(c.g) = Mem(d.to)
+          /\ ~\E t \in tasks :
+               t.kind \in {"transfer", "replicate"} /\ Mem(t.to) = Mem(d.to) /\ u \in t.writes
+          /\ deferred' = deferred \ {d}
+          /\ IF held /\ ~there
+             THEN /\ tasks' = tasks \cup
+                       {[kind |-> "replicate", k |-> NONE, h |-> NONE, src |-> NONE,
+                         ok |-> TRUE, expired |-> FALSE, p |-> d.p,
+                         o |-> d.o, to |-> d.to, slot |-> NONE, held |-> TRUE,
+                         units |-> {u}, writes |-> {u}]}
+                  /\ UNCHANGED <<free, alloc, sharedKey, dbt, handoff>>
+             ELSE /\ Drop(d.units, table, oslot, cache, hcache, deferred', copies)
+                  /\ UNCHANGED tasks
+                  /\ IF held
+                     THEN Give([g |-> d.to, o |-> d.o, p |-> d.p, u |-> u, w |-> FALSE])
+                     ELSE UNCHANGED <<dbt, handoff>>
+    /\ UNCHANGED <<ostate, ogroup, oslot, table, cache, hcache, copies, ncopy, valid, vis, trial, member,
+                   launched, inflight, requests>>
+
+(* A5: the crossing's task ends after it stopped touching its block. On     *)
+(* success the block is valid in the reading group's memory, and that       *)
+(* group's executor is handed the entry while the owner holds it there.     *)
+\* @type: ($task, Bool) => Bool;
+ReplicateEnd(t, ok) ==
+    /\ t \in tasks /\ t.kind = "replicate"
+    /\ tasks' = tasks \ {t}
+    /\ LET u == CHOOSE x \in t.units : TRUE
+       IN IF ok
+          THEN /\ valid' = [valid EXCEPT ![u] = @ \cup {Mem(t.to)}]
+               /\ IF ostate[t.o] = "live" /\ table[t.o][t.p].u = u
+                  THEN Give([g |-> t.to, o |-> t.o, p |-> t.p, u |-> u, w |-> FALSE])
+                  ELSE UNCHANGED <<dbt, handoff>>
+          ELSE UNCHANGED <<valid, dbt, handoff>>
+    /\ DropWith(t.units, table, oslot, cache, hcache, deferred, copies, tasks')
+    /\ UNCHANGED <<ostate, ogroup, oslot, table, cache, hcache, deferred, copies, ncopy, vis, trial, member,
+                   launched, inflight, requests>>
+
+(* Hazard H14: a reading group in another memory is handed an entry when it *)
+(* is allocated, as a reader in the writer's process is, before any        *)
+(* crossing made it valid there.                                           *)
+MapEarly(g, o, p) ==
+    /\ "H14" \in Hazards
+    /\ ostate[o] = "live" /\ g \in ReadersOf(o)
+    /\ table[o][p].k = "private"
+    /\ dbt[g][o][p].u = NONE
+    /\ ~\E r \in requests : Names(r, [g |-> g, o |-> o, p |-> p, u |-> table[o][p].u, w |-> FALSE])
+    /\ dbt' = [dbt EXCEPT ![g][o][p] = [u |-> table[o][p].u, w |-> FALSE]]
+    /\ UNCHANGED <<pool, launched, inflight, handoff, requests, alloc, sharedKey>>
+
 (* The prefetches and remote stores in flight.                             *)
-TierTasks == {t \in tasks : t.kind # "transfer"}
+TierTasks == {t \in tasks : t.kind \in {"prefetch", "put"}}
 
 \* @type: (Str, Str, Str, Str) => $task;
 Task(kind, k, h, src) ==
-    [kind |-> kind, k |-> k, h |-> h, src |-> src, ok |-> TRUE, expired |-> FALSE,
+    [kind |-> kind, k |-> k, h |-> h, src |-> src, ok |-> TRUE, expired |-> FALSE, p |-> NONE,
      o |-> NONE, to |-> NONE, slot |-> NONE, held |-> TRUE, units |-> {}, writes |-> {}]
 
 (* `Prefetch`: a task brings a key into a new host block from the remote   *)
-(* store or from a peer, where the reader pins the block it reads.         *)
-Prefetch(k, src) ==
+(* store or from a peer, where the reader pins the block it reads, on the  *)
+(* host parts of the group whose admission asked for it (`g`).             *)
+Prefetch(k, src, g) ==
     /\ Cardinality(TierTasks) < MaxTasks
     /\ hcache[k] = NONE
     /\ ~\E t \in tasks : t.kind = "prefetch" /\ t.k = k
     /\ \E h \in free \cap HostUnits :
          /\ free' = free \ {h}
          /\ alloc' = [alloc EXCEPT ![h] = "task"]
-         /\ tasks' = tasks \cup {Task("prefetch", k, h, src)}
+         /\ tasks' = tasks \cup {[Task("prefetch", k, h, src) EXCEPT !.to = g]}
     /\ UNCHANGED <<ostate, ogroup, oslot, table, cache, hcache, deferred, copies, ncopy, trial,
                    member, valid, vis, plane, sharedKey, rare>>
 
@@ -1009,12 +1167,14 @@ PrefetchEnd(t, found) ==
             /\ bad' = IF t.ok THEN bad ELSE bad \cup {<<t.k, "host">>}
             \* What the remote store and the peers hold is what every epoch may use.
             /\ vis' = [vis EXCEPT ![t.k].h = NONE]
+            \* The connector wrote the asking group's host parts.
+            /\ valid' = [valid EXCEPT ![t.h] = GroupParts[t.to]]
        ELSE /\ IF t.held
                THEN DropWith({t.h}, table, oslot, cache, hcache, deferred, copies, tasks')
                ELSE UNCHANGED <<free, alloc, sharedKey>>
-            /\ UNCHANGED <<hcache, bad, vis>>
+            /\ UNCHANGED <<hcache, bad, vis, valid>>
     /\ UNCHANGED <<ostate, ogroup, oslot, table, cache, deferred, copies, ncopy, trial, member,
-                   valid, plane, remote, lost>>
+                   plane, remote, lost>>
 
 (* The connector's put ends: the remote store holds the key's copy. A put  *)
 (* whose host block was let go and reused wrote other content.             *)
@@ -1057,7 +1217,7 @@ Lose(e) ==
            cps == {c \in copies : ~mine(c.g)}
            dfr == {d \in deferred :
                      /\ ~(d.kind = "finish" /\ \E c \in copies \ cps : c.id = d.c)
-                     /\ ~(d.kind \in {"commit", "transfer"} /\ OwnerEpoch[d.o] = e)}
+                     /\ ~(d.kind \in {"commit", "transfer", "replicate"} /\ OwnerEpoch[d.o] = e)}
            tbl == [o \in Owners |-> IF o \in gone THEN [p \in Positions |-> Empty] ELSE table[o]]
            slt == [o \in Owners |-> IF o \in gone THEN NONE ELSE oslot[o]]
            dropped == (UNION {{table[o][p].u : p \in Positions} \cup {oslot[o]} : o \in gone})
@@ -1131,7 +1291,7 @@ Init ==
     /\ copies = {}
     /\ ncopy = 0
     /\ tasks = {}
-    /\ valid = [u \in Units |-> {}]
+    /\ valid = [u \in Units \cup HostUnits |-> {}]
     /\ vis = [k \in Keys |-> [d |-> NONE, h |-> NONE]]
     /\ trial = [e \in Epochs |-> IF e \in TrialEpochs THEN "yes" ELSE "no"]
     /\ dbt = [g \in Groups |-> [o \in Owners |-> [p \in Rows |-> NoEntry]]]
@@ -1161,14 +1321,18 @@ Serving ==
     \/ \E c \in copies, ok \in BOOLEAN : ExecFinish(c, ok)
     \/ \E r \in requests :
          TakeRelease(r) \/ TakeDetach(r) \/ TakeCommit(r) \/ TakeFinish(r) \/ TakeTransfer(r)
-    \/ \E d \in deferred : ReleaseDue(d) \/ CommitDue(d) \/ FinishDue(d) \/ TransferDue(d)
-    \/ \E t \in tasks, ok \in BOOLEAN : TransferEnd(t, ok)
+           \/ TakeReplicate(r)
+    \/ \E d \in deferred :
+         ReleaseDue(d) \/ CommitDue(d) \/ FinishDue(d) \/ TransferDue(d) \/ ReplicateDue(d)
+    \/ \E t \in tasks, ok \in BOOLEAN : TransferEnd(t, ok) \/ ReplicateEnd(t, ok)
+    \/ \E g \in Groups, o \in Owners, p \in Positions : MapEarly(g, o, p)
     \/ \E e \in Epochs : CommitUpdate(e) \/ Rollback(e)
     \/ \E u \in Units : Shrink(u) \/ Grow(u)
 
 Next ==
     \/ Serving /\ UNCHANGED rare
-    \/ \E k \in Keys : Prefetch(k, "remote") \/ Prefetch(k, "peer") \/ StoreRemote(k)
+    \/ \E k \in Keys, g \in Groups : Prefetch(k, "remote", g) \/ Prefetch(k, "peer", g)
+    \/ \E k \in Keys : StoreRemote(k)
     \/ \E t \in tasks : PeerLost(t) \/ Deadline(t)
     \/ \E t \in tasks, ok \in BOOLEAN : PrefetchEnd(t, ok) \/ PutEnd(t, ok)
     \/ \E e \in Epochs : Lose(e)
@@ -1201,7 +1365,9 @@ TypeOK ==
     /\ cache \in [Keys -> Units \cup {NONE}]
     /\ hcache \in [Keys -> HostUnits \cup {NONE}]
     /\ ncopy \in 0 .. MaxCopies
-    /\ valid \in [Units -> SUBSET Memories]
+    /\ valid \in [Units \cup HostUnits -> SUBSET (Memories \cup HostParts)]
+    /\ \A u \in Units : valid[u] \subseteq Memories
+    /\ \A h \in HostUnits : valid[h] \subseteq HostParts
     /\ \A k \in Keys : vis[k].d \in Epochs \cup {NONE} /\ vis[k].h \in Epochs \cup {NONE}
     /\ trial \in [Epochs -> {"no", "yes", "rolled"}]
     /\ launched \in [Groups -> 0 .. MaxBatch]

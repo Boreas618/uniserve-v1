@@ -4,10 +4,12 @@
 (* generated values, one step of Next is taken, and IndInv is checked.     *)
 EXTENDS KvInductive, Apalache
 
-AllRules == {"R1", "R2", "R3", "R4", "R5", "R6", "R7", "R8", "R9", "R10"}
+AllRules == {"R1", "R2", "R3", "R4", "R5", "R6", "R7", "R8", "R9", "R10", "R11"}
 
 (* Two epochs; the first has two groups over memories m1 and m2, the       *)
-(* second one group over m1; one KV region; one host unit.                 *)
+(* second one group over m1; one KV region; one host unit. g2 reads the   *)
+(* class owners of g1 hold, and copies host copies with both host parts,  *)
+(* the other groups with pa alone.                                         *)
 ConstInit ==
     /\ Units = {"u1", "u2"}
     /\ Slots = {"s1", "s2", "s3"}
@@ -36,6 +38,9 @@ ConstInit ==
     /\ Hazards = {}
     /\ Eager \in BOOLEAN
     /\ Rules = AllRules
+    /\ HostParts = {"pa", "pb"}
+    /\ GroupParts = [g \in {"g1", "g2", "g3"} |-> IF g = "g2" THEN {"pa", "pb"} ELSE {"pa"}]
+    /\ Readers = [g \in {"g1", "g2", "g3"} |-> IF g = "g1" THEN {"g2"} ELSE {}]
 
 (* Any state that satisfies IndInv, with collections of at most three      *)
 (* elements.                                                               *)
@@ -43,14 +48,14 @@ IndInit ==
     /\ free = Gen(6) /\ ostate = Gen(2) /\ ogroup = Gen(2) /\ oslot = Gen(2)
     /\ table = Gen(2) /\ cache = Gen(1) /\ hcache = Gen(1)
     /\ deferred = Gen(3) /\ copies = Gen(2) /\ ncopy = Gen(1) /\ tasks = Gen(2)
-    /\ valid = Gen(2) /\ vis = Gen(1) /\ member = Gen(2) /\ trial = Gen(2)
+    /\ valid = Gen(3) /\ vis = Gen(1) /\ member = Gen(2) /\ trial = Gen(2)
     /\ dbt = Gen(3) /\ launched = Gen(3) /\ inflight = Gen(3) /\ handoff = Gen(3)
     /\ requests = Gen(3)
     /\ alloc = Gen(6) /\ sharedKey = Gen(6) /\ remote = Gen(1) /\ lost = Gen(2)
     /\ bad = Gen(1)
     /\ IndInv
 
-(* The actions in ten groups, so that the inductive step is checked for    *)
+(* The actions in eleven groups, so that the inductive step is checked for *)
 (* each group by a process of its own: Next is their disjunction.          *)
 Next1 == /\ \/ \E o \in Owners, g \in Groups : Attach(o, g)
             \/ \E o \in Owners, p \in Positions : Allocate(o, p)
@@ -80,10 +85,15 @@ Next7 == /\ \E d \in deferred : ReleaseDue(d) \/ CommitDue(d) \/ FinishDue(d)
 Next8 == /\ \/ \E d \in deferred : TransferDue(d)
             \/ \E t \in tasks, ok \in BOOLEAN : TransferEnd(t, ok)
          /\ UNCHANGED rare
-Next9 == \/ \E k \in Keys : Prefetch(k, "remote") \/ Prefetch(k, "peer") \/ StoreRemote(k)
+Next9 == \/ \E k \in Keys, g \in Groups : Prefetch(k, "remote", g) \/ Prefetch(k, "peer", g)
+         \/ \E k \in Keys : StoreRemote(k)
          \/ \E t \in tasks : PeerLost(t) \/ Deadline(t)
          \/ \E t \in tasks, ok \in BOOLEAN : PrefetchEnd(t, ok) \/ PutEnd(t, ok)
 Next10 == \E e \in Epochs : Lose(e)
+Next11 == /\ \/ \E r \in requests : TakeReplicate(r)
+             \/ \E d \in deferred : ReplicateDue(d)
+             \/ \E t \in tasks, ok \in BOOLEAN : ReplicateEnd(t, ok)
+          /\ UNCHANGED rare
 
 (* Witnesses that IndInit is satisfiable by states that hold work: each is  *)
 (* an invariant Apalache must refute.                                      *)

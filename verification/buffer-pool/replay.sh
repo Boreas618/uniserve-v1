@@ -3,13 +3,15 @@
 # deployment's trace in TRACE_DIR (written with `storage-server serve
 # --buffer-pool-trace TRACE_DIR`) is replayed on a new Rust buffer pool, with
 # every completion checked against the run's and the pool's check() run after
-# every input (a difference or an inconsistency fails), and the states the pool passes
-# through are checked against the design model's steps in windows of at most
-# WINDOW steps, each from a recorded state (steps.py, KvTrace.tla). Prints one
-# verdict line and exits non-zero when either fails.
-#   replay.sh TRACE_DIR [WINDOW]
+# every input (a difference or an inconsistency fails), and every transition
+# between the states the pool passes through is checked against the design
+# model's steps from its recorded state, on the parts of the pool it touches
+# (steps.py, KvTrace.tla), $REPLAY_JOBS (default 32) scans and TLC runs at
+# once. Prints one verdict line and exits non-zero when either fails.
+#   replay.sh TRACE_DIR
 # The replay's states and TLC's runs are kept in $REPLAY_WORK (default: a
-# temporary directory).
+# temporary directory; the states of a serving run take gigabytes, so a local
+# disk), TLC's state files under $TMPDIR (default /tmp).
 set -u
 here=$(cd "$(dirname "$0")" && pwd)
 trace=$(cd "$1" && pwd)
@@ -28,7 +30,7 @@ status=0
 model=""
 for steps in "$work"/states/*.steps; do
     name=$(basename "$steps" .steps)
-    result=$(python3 "$here/steps.py" --chain "${2:-50}" "$steps" "$work/$name") || status=1
+    result=$(python3 "$here/steps.py" --jobs "${REPLAY_JOBS:-32}" "$steps" "$work/$name") || status=1
     model="$model $(echo "$result" | sed -E 's/^(ok|FAIL) +//')"
 done
 if [ $status = 0 ]; then verdict=ok; else verdict=FAIL; fi

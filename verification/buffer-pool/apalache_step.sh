@@ -1,13 +1,13 @@
 #!/bin/bash
 # The inductive step of IndInv under Apalache, one process per group of actions
-# (Next1 to Next10 of MC_Apalache). Prints one line per group: NoError, or the
+# (Next1 to Next11 of MC_Apalache). Prints one line per group: NoError, or the
 # violated invariant's number; the counterexamples are under OUT/<group>.
 #   apalache_step.sh OUT [GROUP...]
 T=${TLA_TOOLS:-/workspace/dev/tools/tla}
 export JAVA_HOME=$T/jdk-21.0.13+9 PATH=$T/jdk-21.0.13+9/bin:$PATH
 cd "$(dirname "$0")"
 out=$1; shift
-groups=${*:-1 2 3 4 5 6 7 8 9 10}
+groups=${*:-1 2 3 4 5 6 7 8 9 10 11}
 mkdir -p "$out"; : > "$out/result.txt"
 for n in $groups; do
     ( JVM_ARGS="-Xmx24g" "$T"/apalache/bin/apalache-mc check --init=IndInit --next=Next$n --inv=IndInv \

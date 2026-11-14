@@ -2,10 +2,12 @@
 (***************************************************************************)
 (* The inductive step of IndInv for the handlers that ask for a copy:      *)
 (* Clone, Load, Save, Restore and Store. Each adds one copy with a fresh   *)
-(* identifier, in one of three forms: a new private device block that the  *)
+(* identifier, in one of four forms: a new private device block that the   *)
 (* copy writes (Clone, and Load of a key with no device block for the      *)
-(* owner), a new host block (Store, Save), or no new block (Load that      *)
-(* fills a group's memory of a cached block, Restore).                     *)
+(* owner), a new host block (Store, Save), no new block (Load that fills a *)
+(* group's memory of a cached block, Restore), or the host parts a key's   *)
+(* host block lacks (Store of a key whose host block does not hold every  *)
+(* host part of the group).                                                *)
 (***************************************************************************)
 EXTENDS KvFrame
 
@@ -17,7 +19,7 @@ USE Sizes, Design DEF On, AllRules
 (* Copy c is a record of the fields of Copy alone.                         *)
 CopyRecord(c) ==
   c = [id |-> c.id, kind |-> c.kind, o |-> c.o, p |-> c.p, k |-> c.k, g |-> c.g,
-       read |-> c.read, write |-> c.write, fill |-> c.fill, seq |-> c.seq,
+       read |-> c.read, write |-> c.write, fill |-> c.fill, parts |-> c.parts, seq |-> c.seq,
        done |-> c.done, stopped |-> c.stopped]
 
 LEMMA CopiesAdded ==
@@ -31,6 +33,8 @@ LEMMA CopiesAdded ==
                              /\ cache'[c.k] = cache[c.k] /\ valid'[c.write] = valid[c.write]
                              /\ ~(c0.write = c.write /\ Mem(c0.g) = Mem(c.g)),
          \A c \in copies : ~c.fill => c0.write # c.write,
+         \A c \in copies : c.fill /\ c.kind = "store" =>
+                             hcache'[c.k] = hcache[c.k] /\ c0.write # c.write,
          \A c \in copies : c.kind \in {"clone", "load"} => ~(c0.o = c.o /\ c0.p = c.p)
   PROVE  CopiesOk'
   <1>1. \A q : Moving(q)' = Moving(q)
@@ -89,6 +93,57 @@ LEMMA TasksAdded ==
   <1> QED
     BY <1>1 DEF TaskOk, Live, TableUnits
 
+(* P8 after a copy c0 that reads where its block is valid is added.        *)
+LEMMA PlacedAdded ==
+  ASSUME CopiesPlaced, CrossingsPlaced, NEW c0, copies' = copies \cup {c0}, CopyPlaced(c0),
+         UNCHANGED <<valid, ogroup, inflight>>, Crossings' = Crossings
+  PROVE  CopiesPlaced' /\ CrossingsPlaced'
+  <1>1. CopiesPlaced'
+    <2> SUFFICES ASSUME NEW c \in copies' PROVE CopyPlaced(c)'
+      BY PlacedEach
+    <2>1. CopyPlaced(c)
+      BY PlacedEach
+    <2> QED
+      BY <2>1 DEF CopyPlaced, Mem
+  <1>2. CrossingsPlaced'
+    BY CrossingsPlacedFrame
+  <1> QED
+    BY <1>1, <1>2
+
+(* CrossingsOk after copy c0 is added, when no unit a crossing holds       *)
+(* changes its allocation or the device block cached under a key, c0 does *)
+(* not write such a unit as a new block, and c0 fills no memory a          *)
+(* crossing's task fills.                                                  *)
+LEMMA CrossingsAdded ==
+  ASSUME CrossingsOk, NEW c0, copies' = copies \cup {c0},
+         UNCHANGED <<deferred, tasks, ostate, ogroup, lost, valid, vis, trial>>,
+         \A d \in deferred : d.kind = "replicate" =>
+            /\ \A u \in d.units : alloc'[u] = alloc[u]
+            /\ ~c0.fill => c0.write \notin d.units
+            /\ \A j \in Keys : cache'[j] \in d.units => cache'[j] = cache[j],
+         \A t \in tasks : t.kind = "replicate" =>
+            /\ \A u \in t.writes : alloc'[u] = alloc[u]
+            /\ (c0.fill /\ c0.kind = "load" /\ Mem(c0.g) = Mem(t.to)) => c0.write \notin t.writes
+  PROVE  CrossingsOk'
+  <1>1. \A q \in Owners : Moving(q)' = Moving(q)
+    BY DEF Moving
+  <1>2. \A d \in deferred : CrossWaitOk(d)'
+    <2> SUFFICES ASSUME NEW d \in deferred PROVE CrossWaitOk(d)'
+      OBVIOUS
+    <2>1. CrossWaitOk(d)
+      BY CrossingsOkEach
+    <2> QED
+      BY <1>1, <2>1 DEF CrossWaitOk, ReadersOf, MadeBy
+  <1>3. \A t \in tasks : CrossTaskOk(t)'
+    <2> SUFFICES ASSUME NEW t \in tasks PROVE CrossTaskOk(t)'
+      OBVIOUS
+    <2>1. CrossTaskOk(t)
+      BY CrossingsOkEach
+    <2> QED
+      BY <1>1, <2>1 DEF CrossTaskOk, ReadersOf, Mem
+  <1> QED
+    BY <1>2, <1>3, CrossingsOkEach
+
 LEMMA BatchesAdded ==
   ASSUME BatchesOk, copies \subseteq copies',
          UNCHANGED <<inflight, launched, lost, valid, ostate, ogroup, oslot, table, requests,
@@ -115,8 +170,9 @@ NewBlockAt(o, p, w, c0) ==
   /\ ogroup[o] \in Groups /\ GroupEpoch[ogroup[o]] = OwnerEpoch[o] /\ OwnerEpoch[o] \notin lost
   /\ ncopy < MaxCopies
   /\ c0.kind \in {"clone", "load"} /\ c0.id = ncopy + 1 /\ c0.o = o /\ c0.p = p /\ c0.k \in Keys
-  /\ c0.g = ogroup[o] /\ c0.write = w /\ c0.seq = 0 /\ ~c0.done /\ ~c0.fill
+  /\ c0.g = ogroup[o] /\ c0.write = w /\ c0.seq = 0 /\ ~c0.done /\ ~c0.fill /\ c0.parts = {}
   /\ c0.read \in Units \cup HostUnits /\ c0.read # w /\ alloc[c0.read] = "shared"
+  /\ CopyPlaced(c0)
   /\ \E j \in Keys : cache[j] = c0.read \/ hcache[j] = c0.read
   /\ \A j \in Keys :
        /\ (cache[j] = c0.read /\ vis[j].d # NONE) => vis[j].d = OwnerEpoch[o]
@@ -164,8 +220,8 @@ LEMMA NewBlockInv ==
     <2>2. \A c \in copies' :
             /\ c.seq \in 0 .. MaxBatch /\ c.k \in Keys
             /\ c.o \in Owners \cup {NONE} /\ c.p \in Positions \cup {NONE}
-            /\ c.read \in AllUnits /\ c.write \in AllUnits
-      BY <1>3 DEF NewBlockAt, IndInv, TypeInv
+            /\ c.read \in AllUnits /\ c.write \in AllUnits /\ c.parts \subseteq HostParts
+      BY <1>3, WorkTypes DEF NewBlockAt, WorkTyped, AllUnits
     <2> QED
       BY <2>1, <2>2 DEF NewBlockAt, IndInv, TypeInv, Stamps, CopyRecord
   <1>8. FreeClean'
@@ -228,7 +284,7 @@ LEMMA NewBlockInv ==
     <2>1. \A d \in deferred : w \notin d.units
       BY DEF NewBlockAt, Unheld
     <2>2. \A d \in deferred : d.kind = "commit" => d.units \subseteq AllUnits
-      BY DEF IndInv, TypeInv
+      BY WorkTypes DEF WorkTyped
     <2> QED
       BY <1>2, <2>1, <2>2, DeferredAdded DEF NewBlockAt, IndInv
   <1>15. CopiesOk'
@@ -250,7 +306,7 @@ LEMMA NewBlockInv ==
     <2>2. \A c \in copies : c.read # w /\ c.write # w
       BY DEF NewBlockAt, Unheld
     <2>3. \A c \in copies : c.read \in AllUnits /\ c.write \in AllUnits
-      BY DEF IndInv, TypeInv
+      BY WorkTypes DEF WorkTyped
     <2>4. \A c \in copies : c.fill /\ c.kind = "load" =>
             /\ cache'[c.k] = cache[c.k] /\ valid'[c.write] = valid[c.write]
             /\ ~(c0.write = c.write /\ Mem(c0.g) = Mem(c.g))
@@ -264,8 +320,11 @@ LEMMA NewBlockInv ==
         BY <3>1, <2>2, <1>2 DEF NewBlockAt
     <2>5. \A c \in copies : c.kind \in {"clone", "load"} => ~(c0.o = c.o /\ c0.p = c.p)
       BY DEF NewBlockAt, CopyFor
+    <2>6. \A c \in copies : c.fill /\ c.kind = "store" =>
+            hcache'[c.k] = hcache[c.k] /\ c0.write # c.write
+      BY <2>2 DEF NewBlockAt
     <2> QED
-      BY <1>2, <1>4, <1>5, <2>1, <2>2, <2>3, <2>4, <2>5, CopiesAdded DEF NewBlockAt, IndInv
+      BY <1>2, <1>4, <1>5, <2>1, <2>2, <2>3, <2>4, <2>5, <2>6, CopiesAdded DEF NewBlockAt, IndInv
   <1>16. TasksOk'
     <2>1. \A t \in tasks : t.slot # w /\ t.h # w /\ w \notin t.units
       BY DEF NewBlockAt, Unheld
@@ -273,20 +332,20 @@ LEMMA NewBlockInv ==
             /\ t.o # o /\ t.slot \in Slots /\ t.writes \subseteq t.units
       BY DEF NewBlockAt, Moving, IndInv, TasksOk
     <2>3. \A t \in tasks : t.kind = "transfer" => t.units \subseteq AllUnits
-      BY DEF IndInv, TypeInv
+      BY WorkTypes DEF WorkTyped
     <2>4. \A t \in tasks : t.kind = "prefetch" => t.h \in HostUnits
       BY DEF IndInv, TasksOk
     <2> QED
       BY <1>2, <1>3, <2>1, <2>2, <2>3, <2>4, TasksAdded DEF NewBlockAt, IndInv, AllUnits
   <1>17. MovingUnmapped' /\ LostOk' /\ TablesMapped' /\ HandoffOk' /\ NoBad'
-    BY <1>5, MovingUnmappedFrame, LostOkFrame, TablesMappedFrame, HandoffOkFrame, NoBadFrame
-       DEF NewBlockAt, IndInv
+    BY <1>5, TransfersFrame, MovingUnmappedFrame, LostOkFrame, TablesMappedFrame, HandoffOkFrame,
+       NoBadFrame DEF NewBlockAt, IndInv
   <1>18. RequestsOk'
     BY <1>4, RequestsAdded DEF NewBlockAt, IndInv
   <1>19. BatchesOk'
     <2>1. \A b \in inflight : \A x \in b.reads : alloc'[x[2]] = alloc[x[2]]
       <3>1. \A b \in inflight : \A x \in b.reads : x[2] \in AllUnits
-        BY DEF IndInv, TypeInv
+        BY RequestTypes DEF RequestTyped
       <3> QED
         BY <3>1, <1>2 DEF NewBlockAt
     <2> QED
@@ -298,11 +357,32 @@ LEMMA NewBlockInv ==
       BY DEF NewBlockAt
     <2>3. \A j \in Keys : (hcache[j] = c0.read /\ vis[j].h # NONE) => GroupEpoch[c0.g] = vis[j].h
       BY DEF NewBlockAt
+    <2>4. \A t \in tasks : NONE \notin t.units
+      BY WorkTypes DEF WorkTyped, AllUnits
     <2> QED
-      BY <2>1, <2>2, <2>3 DEF NewBlockAt, IndInv, TrialVisibility, MadeBy
+      BY <2>1, <2>2, <2>3, <2>4 DEF NewBlockAt, IndInv, TrialVisibility, MadeBy
+  <1>21. CrossingsOk'
+    <2>1. \A d \in deferred : d.kind = "replicate" =>
+            /\ \A u \in d.units : alloc'[u] = alloc[u]
+            /\ ~c0.fill => c0.write \notin d.units
+            /\ \A j \in Keys : cache'[j] \in d.units => cache'[j] = cache[j]
+      <3>1. \A d \in deferred : d.units \subseteq AllUnits /\ w \notin d.units
+        BY WorkTypes DEF WorkTyped, NewBlockAt, Unheld
+      <3> QED
+        BY <1>2, <3>1 DEF NewBlockAt, AllUnits
+    <2>2. \A t \in tasks : t.kind = "replicate" => \A u \in t.writes : alloc'[u] = alloc[u]
+      <3>1. \A t \in tasks : t.kind = "replicate" =>
+              t.writes \subseteq t.units /\ t.units \subseteq AllUnits /\ w \notin t.units
+        BY WorkTypes, CrossingsOkEach DEF IndInv, CrossTaskOk, WorkTyped, NewBlockAt, Unheld
+      <3> QED
+        BY <1>2, <3>1
+    <2> QED
+      BY <2>1, <2>2, CrossingsAdded DEF NewBlockAt, IndInv
+  <1>22. CopiesPlaced' /\ CrossingsPlaced'
+    BY TransfersFrame, PlacedAdded DEF NewBlockAt, IndInv
   <1> QED
     BY <1>7, <1>8, <1>9, <1>10, <1>11, <1>12, <1>13, <1>14, <1>15, <1>16, <1>17, <1>18,
-       <1>19, <1>20 DEF IndInv
+       <1>19, <1>20, <1>21, <1>22 DEF IndInv
 
 -----------------------------------------------------------------------------
 (* A new host block h that copy c0 fills from a cached device block        *)
@@ -313,7 +393,8 @@ HostCopyAt(h, c0) ==
   /\ ncopy < MaxCopies
   /\ c0.kind \in {"store", "save"} /\ c0.id = ncopy + 1 /\ c0.k \in Keys /\ c0.p = NONE
   /\ c0.g \in Groups /\ GroupEpoch[c0.g] \notin lost
-  /\ c0.write = h /\ c0.seq = 0 /\ ~c0.done /\ ~c0.fill
+  /\ c0.write = h /\ c0.seq = 0 /\ ~c0.done /\ ~c0.fill /\ c0.parts = {}
+  /\ CopyPlaced(c0)
   /\ c0.kind = "store" =>
        /\ c0.o = NONE /\ c0.read \in Units /\ alloc[c0.read] = "shared"
        /\ \E j \in Keys : cache[j] = c0.read
@@ -381,8 +462,8 @@ LEMMA HostCopyInv ==
     <2>2. \A c \in copies' :
             /\ c.seq \in 0 .. MaxBatch /\ c.k \in Keys
             /\ c.o \in Owners \cup {NONE} /\ c.p \in Positions \cup {NONE}
-            /\ c.read \in AllUnits /\ c.write \in AllUnits
-      BY <1>3, <1>7 DEF HostCopyAt, IndInv, TypeInv
+            /\ c.read \in AllUnits /\ c.write \in AllUnits /\ c.parts \subseteq HostParts
+      BY <1>3, <1>7, WorkTypes DEF HostCopyAt, WorkTyped
     <2> QED
       BY <2>1, <2>2 DEF HostCopyAt, IndInv, TypeInv, Stamps, CopyRecord
   <1>10. FreeClean'
@@ -450,15 +531,18 @@ LEMMA HostCopyInv ==
     <2>2. \A c \in copies : c.read # h /\ c.write # h
       BY DEF HostCopyAt, Unheld
     <2>3. \A c \in copies : c.read \in AllUnits /\ c.write \in AllUnits
-      BY DEF IndInv, TypeInv
+      BY WorkTypes DEF WorkTyped
     <2>4. \A c \in copies : c.fill /\ c.kind = "load" =>
             /\ cache'[c.k] = cache[c.k] /\ valid'[c.write] = valid[c.write]
             /\ ~(c0.write = c.write /\ Mem(c0.g) = Mem(c.g))
       BY <2>2 DEF HostCopyAt
     <2>5. \A c \in copies : c.kind \in {"clone", "load"} => ~(c0.o = c.o /\ c0.p = c.p)
       BY DEF HostCopyAt, IndInv, CopiesOk
+    <2>6. \A c \in copies : c.fill /\ c.kind = "store" =>
+            hcache'[c.k] = hcache[c.k] /\ c0.write # c.write
+      BY <2>2 DEF HostCopyAt
     <2> QED
-      BY <1>2, <1>4, <1>5, <2>1, <2>2, <2>3, <2>4, <2>5, CopiesAdded DEF HostCopyAt, IndInv
+      BY <1>2, <1>4, <1>5, <2>1, <2>2, <2>3, <2>4, <2>5, <2>6, CopiesAdded DEF HostCopyAt, IndInv
   <1>16. TasksOk'
     <2>1. \A t \in tasks : t.slot # h /\ t.h # h /\ h \notin t.units
       BY DEF HostCopyAt, Unheld
@@ -467,7 +551,7 @@ LEMMA HostCopyInv ==
             /\ ostate[t.o] = "live" => ~\E c \in copies : c.o = t.o
       BY DEF IndInv, TasksOk, Live
     <2>3. \A t \in tasks : t.kind = "transfer" => t.units \subseteq AllUnits
-      BY DEF IndInv, TypeInv
+      BY WorkTypes DEF WorkTyped
     <2>4. \A t \in tasks : t.kind = "prefetch" => t.h \in HostUnits
       BY DEF IndInv, TasksOk
     <2>5. \A t \in tasks : t.kind = "transfer" => c0.read # t.slot
@@ -487,8 +571,8 @@ LEMMA HostCopyInv ==
     <2> QED
       BY <1>2, <2>1, <2>2, <2>3, <2>4, <2>5, <2>6, TasksAdded DEF HostCopyAt, IndInv, AllUnits
   <1>17. MovingUnmapped' /\ LostOk' /\ TablesMapped' /\ HandoffOk' /\ NoBad'
-    BY <1>5, MovingUnmappedFrame, LostOkFrame, TablesMappedFrame, HandoffOkFrame, NoBadFrame
-       DEF HostCopyAt, IndInv
+    BY <1>5, TransfersFrame, MovingUnmappedFrame, LostOkFrame, TablesMappedFrame, HandoffOkFrame,
+       NoBadFrame DEF HostCopyAt, IndInv
   <1>18. RequestsOk'
     BY <1>4, RequestsAdded DEF HostCopyAt, IndInv
   <1>19. BatchesOk'
@@ -501,9 +585,19 @@ LEMMA HostCopyInv ==
       BY <1>5, <2>1, BatchesAdded DEF HostCopyAt, IndInv
   <1>20. TrialVisibility'
     BY DEF HostCopyAt, IndInv, TrialVisibility, MadeBy
+  <1>21. CrossingsOk'
+    <2>1. \A d \in deferred : d.units \subseteq AllUnits /\ h \notin d.units
+      BY WorkTypes DEF WorkTyped, HostCopyAt, Unheld
+    <2>2. \A t \in tasks : t.kind = "replicate" =>
+            t.writes \subseteq t.units /\ t.units \subseteq AllUnits /\ h \notin t.units
+      BY WorkTypes, CrossingsOkEach DEF IndInv, CrossTaskOk, WorkTyped, HostCopyAt, Unheld
+    <2> QED
+      BY <1>2, <2>1, <2>2, CrossingsAdded DEF HostCopyAt, IndInv
+  <1>22. CopiesPlaced' /\ CrossingsPlaced'
+    BY TransfersFrame, PlacedAdded DEF HostCopyAt, IndInv
   <1> QED
-    BY <1>9, <1>10, <1>11, <1>12, <1>13, <1>14, <1>15, <1>16, <1>17, <1>18, <1>19, <1>20
-       DEF IndInv
+    BY <1>9, <1>10, <1>11, <1>12, <1>13, <1>14, <1>15, <1>16, <1>17, <1>18, <1>19, <1>20,
+       <1>21, <1>22 DEF IndInv
 
 -----------------------------------------------------------------------------
 (* A copy c0 that fills memory already held: the owner's group's memory of *)
@@ -515,8 +609,9 @@ FillCopyAt(o, c0) ==
   /\ ogroup[o] \in Groups /\ GroupEpoch[ogroup[o]] = OwnerEpoch[o] /\ OwnerEpoch[o] \notin lost
   /\ ncopy < MaxCopies
   /\ c0.kind \in {"load", "restore"} /\ c0.id = ncopy + 1 /\ c0.o = o /\ c0.k \in Keys
-  /\ c0.g = ogroup[o] /\ c0.seq = 0 /\ ~c0.done /\ c0.fill
+  /\ c0.g = ogroup[o] /\ c0.seq = 0 /\ ~c0.done /\ c0.fill /\ c0.parts = {}
   /\ c0.read = hcache[c0.k] /\ c0.read \in HostUnits /\ alloc[c0.read] = "shared"
+  /\ CopyPlaced(c0)
   /\ \A j \in Keys : (hcache[j] = c0.read /\ vis[j].h # NONE) => vis[j].h = OwnerEpoch[o]
   /\ c0.kind = "load" =>
        /\ c0.p \in Positions /\ table[o][c0.p] = Empty /\ ~CopyFor(o, c0.p)
@@ -524,7 +619,8 @@ FillCopyAt(o, c0) ==
        /\ Mem(c0.g) \notin valid[c0.write]
        /\ vis[c0.k].d = MadeBy(OwnerEpoch[o])
        /\ ~\E c \in copies : c.write = c0.write /\ Mem(c.g) = Mem(c0.g)
-       /\ ~\E t \in tasks : t.kind = "transfer" /\ Mem(t.to) = Mem(c0.g) /\ c0.write \in t.writes
+       /\ ~\E t \in tasks :
+             t.kind \in {"transfer", "replicate"} /\ Mem(t.to) = Mem(c0.g) /\ c0.write \in t.writes
   /\ c0.kind = "restore" => c0.p = NONE /\ c0.write = oslot[o]
   /\ copies' = copies \cup {c0}
   /\ ncopy' = ncopy + 1
@@ -564,8 +660,8 @@ LEMMA FillCopyInv ==
     <2>2. \A c \in copies' :
             /\ c.seq \in 0 .. MaxBatch /\ c.k \in Keys
             /\ c.o \in Owners \cup {NONE} /\ c.p \in Positions \cup {NONE}
-            /\ c.read \in AllUnits /\ c.write \in AllUnits
-      BY <1>4 DEF FillCopyAt, IndInv, TypeInv
+            /\ c.read \in AllUnits /\ c.write \in AllUnits /\ c.parts \subseteq HostParts
+      BY <1>4, WorkTypes DEF FillCopyAt, WorkTyped
     <2> QED
       BY <2>1, <2>2 DEF FillCopyAt, IndInv, TypeInv, Stamps, CopyRecord
   <1>8. /\ FreeClean' /\ NoLeak' /\ Outside' /\ Regions' /\ AllocOwner' /\ SharedIff'
@@ -576,9 +672,9 @@ LEMMA FillCopyInv ==
     <2>2. FreeClean' /\ NoLeak'
       BY <1>6, <2>1 DEF FillCopyAt, IndInv, FreeClean, NoLeak, InRegion
     <2> QED
-      BY <1>5, <2>2, OutsideFrame, RegionsFrame, AllocOwnerFrame, SharedIffFrame, SharedCachedFrame,
-         CacheSharedFrame, TablesFrame, OwnersOkFrame, MovingUnmappedFrame, LostOkFrame,
-         TablesMappedFrame, HandoffOkFrame, NoBadFrame DEF FillCopyAt, IndInv
+      BY <1>5, <2>2, TransfersFrame, OutsideFrame, RegionsFrame, AllocOwnerFrame, SharedIffFrame,
+         SharedCachedFrame, CacheSharedFrame, TablesFrame, OwnersOkFrame, MovingUnmappedFrame,
+         LostOkFrame, TablesMappedFrame, HandoffOkFrame, NoBadFrame DEF FillCopyAt, IndInv
   <1>9. DeferredOk'
     <2>1. \A d \in deferred : d.kind = "commit" => c0.write \notin d.units
       <3> SUFFICES ASSUME NEW d \in deferred, d.kind = "commit" PROVE c0.write \notin d.units
@@ -648,8 +744,18 @@ LEMMA FillCopyInv ==
         BY <3>1, <3>3 DEF FillCopyAt
       <3> QED
         BY <3>2, <3>3 DEF FillCopyAt
+    (* A store's fill writes a host block, which c0 does not write.        *)
+    <2>5. \A c \in copies : c.fill /\ c.kind = "store" =>
+            hcache'[c.k] = hcache[c.k] /\ c0.write # c.write
+      <3> SUFFICES ASSUME NEW c \in copies, c.fill, c.kind = "store"
+                   PROVE  c0.write # c.write
+        BY DEF FillCopyAt
+      <3>1. c.write \in HostUnits
+        BY DEF IndInv, CopiesOk
+      <3> QED
+        BY <3>1, <1>4
     <2> QED
-      BY <1>2, <1>5, <2>1, <2>2, <2>3, <2>4, CopiesAdded DEF FillCopyAt, IndInv
+      BY <1>2, <1>5, <2>1, <2>2, <2>3, <2>4, <2>5, CopiesAdded DEF FillCopyAt, IndInv
   <1>11. TasksOk'
     <2>1. \A t \in tasks : t.kind = "transfer" =>
             /\ t.o \in Owners /\ t.o # o /\ t.slot \in Slots
@@ -676,8 +782,150 @@ LEMMA FillCopyInv ==
       BY DEF FillCopyAt
     <2> QED
       BY <2>1, <2>2 DEF FillCopyAt, IndInv, TrialVisibility, MadeBy
+  <1>15. CrossingsOk'
+    <2>1. \A t \in tasks : t.kind = "replicate" =>
+            ((c0.fill /\ c0.kind = "load" /\ Mem(c0.g) = Mem(t.to)) => c0.write \notin t.writes)
+      BY DEF FillCopyAt
+    <2> QED
+      BY <2>1, CrossingsAdded DEF FillCopyAt, IndInv
+  <1>16. CopiesPlaced' /\ CrossingsPlaced'
+    BY TransfersFrame, PlacedAdded DEF FillCopyAt, IndInv
   <1> QED
-    BY <1>7, <1>8, <1>9, <1>10, <1>11, <1>12, <1>13, <1>14 DEF IndInv
+    BY <1>7, <1>8, <1>9, <1>10, <1>11, <1>12, <1>13, <1>14, <1>15, <1>16 DEF IndInv
+
+-----------------------------------------------------------------------------
+(* A copy c0 that fills the host parts of a key's host block that do not  *)
+(* hold it (Store): it reads the key's device block, valid in its group's *)
+(* memory, and writes the key's host block, both cached and both already  *)
+(* held; nothing else fills that host block.                               *)
+
+StoreFillAt(g, k, c0) ==
+  /\ CopyRecord(c0)
+  /\ ncopy < MaxCopies
+  /\ GroupEpoch[g] \notin lost
+  /\ c0.kind = "store" /\ c0.id = ncopy + 1 /\ c0.o = NONE /\ c0.p = NONE /\ c0.k = k
+  /\ c0.g = g /\ c0.seq = 0 /\ ~c0.done /\ ~c0.stopped /\ c0.fill
+  /\ c0.read = cache[k] /\ c0.write = hcache[k]
+  /\ c0.read \in Units /\ c0.write \in HostUnits
+  /\ alloc[c0.read] = "shared" /\ alloc[c0.write] = "shared"
+  /\ \A j \in Keys : cache[j] = c0.read => j = k
+  /\ c0.parts \subseteq HostParts
+  /\ CopyPlaced(c0)
+  /\ vis[k].d \in {NONE, GroupEpoch[g]}
+  /\ vis[k].h = MadeBy(GroupEpoch[g])
+  /\ ~\E c \in copies : c.write = c0.write
+  /\ copies' = copies \cup {c0}
+  /\ ncopy' = ncopy + 1
+  /\ UNCHANGED <<free, alloc, sharedKey, cache, ostate, ogroup, oslot, table, hcache, deferred,
+                 tasks, trial, member, valid, vis, dbt, launched, inflight, handoff, requests,
+                 remote, lost, bad>>
+
+LEMMA StoreFillInv ==
+  ASSUME IndInv, NEW g \in Groups, NEW k \in Keys, NEW c0, StoreFillAt(g, k, c0)
+  PROVE  IndInv'
+  <1>1. TypeOK
+    BY TypeFacts
+  <1>2. ncopy \in Nat /\ ncopy' \in 0 .. MaxCopies
+    BY <1>1 DEF StoreFillAt, TypeOK
+  <1>3. /\ c0.read \in AllUnits /\ c0.write \in AllUnits
+        /\ c0.read \notin Slots /\ c0.write \notin Slots
+        /\ c0.read \notin HostUnits /\ c0.write \notin Units
+    BY DEF StoreFillAt, AllUnits
+  <1>4. Transfers' = Transfers /\ Crossings' = Crossings /\ TaskUnits' \subseteq TaskUnits
+    BY TransfersFrame DEF StoreFillAt
+  <1>5. \A v \in AllUnits : Held(v)' <=> Held(v)
+    <2>1. Held(c0.read) /\ Held(c0.write)
+      BY DEF StoreFillAt, Held, HeldIn
+    <2> QED
+      BY <2>1 DEF StoreFillAt, Held, HeldIn
+  <1>6. TypeInv'
+    <2>1. TypeOK'
+      BY <1>1, <1>2 DEF StoreFillAt, TypeOK
+    <2>2. \A c \in copies' :
+            /\ c.seq \in 0 .. MaxBatch /\ c.k \in Keys
+            /\ c.o \in Owners \cup {NONE} /\ c.p \in Positions \cup {NONE}
+            /\ c.read \in AllUnits /\ c.write \in AllUnits /\ c.parts \subseteq HostParts
+      BY <1>3, WorkTypes DEF StoreFillAt, WorkTyped
+    <2> QED
+      BY <2>1, <2>2 DEF StoreFillAt, IndInv, TypeInv, Stamps, CopyRecord
+  <1>7. /\ FreeClean' /\ NoLeak' /\ Outside' /\ Regions' /\ AllocOwner' /\ SharedIff'
+        /\ SharedCached' /\ CacheShared' /\ Tables' /\ OwnersOk'
+        /\ MovingUnmapped' /\ LostOk' /\ TablesMapped' /\ HandoffOk' /\ NoBad'
+    <2>1. free \subseteq AllUnits
+      BY <1>1 DEF TypeOK
+    <2>2. FreeClean' /\ NoLeak'
+      BY <1>5, <2>1 DEF StoreFillAt, IndInv, FreeClean, NoLeak, InRegion
+    <2> QED
+      BY <1>4, <2>2, OutsideFrame, RegionsFrame, AllocOwnerFrame, SharedIffFrame,
+         SharedCachedFrame, CacheSharedFrame, TablesFrame, OwnersOkFrame, MovingUnmappedFrame,
+         LostOkFrame, TablesMappedFrame, HandoffOkFrame, NoBadFrame DEF StoreFillAt, IndInv
+  <1>8. DeferredOk'
+    <2>1. \A d \in deferred : d.kind = "commit" => c0.write \notin d.units
+      <3> SUFFICES ASSUME NEW d \in deferred, d.kind = "commit" PROVE c0.write \notin d.units
+        OBVIOUS
+      <3>1. \E u \in Units : d.units = {u}
+        BY DEF IndInv, DeferredOk
+      <3> QED
+        BY <3>1, <1>3
+    <2> QED
+      BY <2>1, DeferredAdded DEF StoreFillAt, IndInv
+  <1>9. CopiesOk'
+    <2>1. CopyOk(c0)'
+      <3>1. \A x \in copies : x.id \in 1 .. ncopy /\ x.write # c0.write
+        BY DEF IndInv, CopiesOk, StoreFillAt
+      <3>2. launched[g] \in 0 .. MaxBatch
+        BY <1>1 DEF StoreFillAt, TypeOK
+      <3>3. NONE \notin Owners
+        OBVIOUS
+      <3> QED
+        BY <1>2, <3>1, <3>2, <3>3 DEF StoreFillAt, CopyOk
+    <2>2. \A c \in copies : c.read \in AllUnits /\ c.write \in AllUnits
+      BY WorkTypes DEF WorkTyped
+    <2>3. \A c \in copies : c.fill /\ c.kind = "load" =>
+            /\ cache'[c.k] = cache[c.k] /\ valid'[c.write] = valid[c.write]
+            /\ ~(c0.write = c.write /\ Mem(c0.g) = Mem(c.g))
+      <3> SUFFICES ASSUME NEW c \in copies, c.fill, c.kind = "load"
+                   PROVE  ~(c0.write = c.write /\ Mem(c0.g) = Mem(c.g))
+        BY DEF StoreFillAt
+      <3>1. cache[c.k] = c.write /\ c.k \in Keys
+        BY DEF IndInv, CopiesOk, TypeInv
+      <3>2. c.write \in Units
+        BY <3>1, <1>1, WorkTypes DEF TypeOK, AllUnits, WorkTyped, IndInv
+      <3> QED
+        BY <3>2, <1>3
+    <2>4. \A c \in copies : ~c.fill => c0.write # c.write
+      BY DEF StoreFillAt
+    <2>5. \A c \in copies : c.fill /\ c.kind = "store" =>
+            hcache'[c.k] = hcache[c.k] /\ c0.write # c.write
+      BY DEF StoreFillAt
+    <2>6. \A c \in copies : c.kind \in {"clone", "load"} => ~(c0.o = c.o /\ c0.p = c.p)
+      BY DEF StoreFillAt, IndInv, CopiesOk
+    <2> QED
+      BY <1>2, <1>4, <2>1, <2>2, <2>3, <2>4, <2>5, <2>6, CopiesAdded DEF StoreFillAt, IndInv
+  <1>10. TasksOk'
+    <2>1. \A t \in tasks : t.kind = "transfer" => t.slot \in Slots /\ t.o \in Owners
+      BY DEF IndInv, TasksOk
+    <2> QED
+      BY <1>3, <2>1, TasksAdded DEF StoreFillAt, IndInv
+  <1>11. RequestsOk'
+    BY <1>2, RequestsAdded DEF StoreFillAt, IndInv
+  <1>12. BatchesOk'
+    BY <1>4, BatchesAdded DEF StoreFillAt, IndInv
+  <1>13. TrialVisibility'
+    <2>1. \A j \in Keys : hcache[j] # c0.read
+      BY <1>1, <1>3 DEF TypeOK, AllUnits
+    <2>2. \A j \in Keys : (cache[j] = c0.read /\ vis[j].d # NONE) => GroupEpoch[c0.g] = vis[j].d
+      BY DEF StoreFillAt
+    <2>3. vis[c0.k].h = MadeBy(GroupEpoch[c0.g])
+      BY DEF StoreFillAt
+    <2> QED
+      BY <2>1, <2>2, <2>3 DEF StoreFillAt, IndInv, TrialVisibility, MadeBy
+  <1>14. CrossingsOk'
+    BY CrossingsAdded DEF StoreFillAt, IndInv
+  <1>15. CopiesPlaced' /\ CrossingsPlaced'
+    BY <1>4, PlacedAdded DEF StoreFillAt, IndInv
+  <1> QED
+    BY <1>6, <1>7, <1>8, <1>9, <1>10, <1>11, <1>12, <1>13, <1>14, <1>15 DEF IndInv
 
 -----------------------------------------------------------------------------
 (* Clone                                                                   *)
@@ -687,6 +935,7 @@ LEMMA CloneInv ==
          UNCHANGED rare
   PROVE  IndInv'
   <1>1. /\ ncopy < MaxCopies /\ ostate[o] = "live" /\ cache[k] # NONE /\ VisibleDevice(k, o)
+        /\ Mem(ogroup[o]) \in valid[cache[k]]
         /\ table[o][p] = Empty /\ ~CopyFor(o, p) /\ ~Moving(o)
     BY DEF Clone
   <1>2. PICK w \in RegionUnits(o) \ {cache[k]} :
@@ -717,7 +966,7 @@ LEMMA CloneInv ==
     <2> QED
       BY <1>1, <1>5, <2>1 DEF VisibleDevice
   <1>8. NewBlockAt(o, p, w, Copy("clone", o, p, k, ogroup[o], cache[k], w))
-    BY <1>1, <1>2, <1>3, <1>4, <1>5, <1>6, <1>7 DEF NewBlockAt, Copy, CopyRecord
+    BY <1>1, <1>2, <1>3, <1>4, <1>5, <1>6, <1>7 DEF NewBlockAt, Copy, CopyRecord, CopyPlaced
   <1> QED
     BY <1>6, <1>8, NewBlockInv
 
@@ -729,6 +978,7 @@ LEMMA LoadInv ==
          UNCHANGED rare
   PROVE  IndInv'
   <1>1. /\ ncopy < MaxCopies /\ ostate[o] = "live" /\ hcache[k] # NONE /\ VisibleHost(k, o)
+        /\ GroupParts[ogroup[o]] \subseteq valid[hcache[k]]
         /\ table[o][p] = Empty /\ ~CopyFor(o, p) /\ ~Moving(o)
         /\ ncopy' = ncopy + 1
         /\ UNCHANGED <<ostate, ogroup, oslot, table, hcache, deferred, tasks, trial, member, valid,
@@ -752,14 +1002,15 @@ LEMMA LoadInv ==
     <2> DEFINE c0 == [Copy("load", o, p, k, ogroup[o], hcache[k], cache[k]) EXCEPT !.fill = TRUE]
     <2>1. /\ ~\E c \in copies : c.write = cache[k] /\ Mem(c.g) = Mem(ogroup[o])
           /\ ~\E t \in tasks :
-                t.kind = "transfer" /\ Mem(t.to) = Mem(ogroup[o]) /\ cache[k] \in t.writes
+                /\ t.kind \in {"transfer", "replicate"}
+                /\ Mem(t.to) = Mem(ogroup[o]) /\ cache[k] \in t.writes
           /\ copies' = copies \cup {c0}
           /\ UNCHANGED <<free, cache, alloc, sharedKey>>
       BY <1>6 DEF Load
     <2>2. cache[k] \in Units /\ alloc[cache[k]] = "shared"
       BY <1>6, DeviceCached
     <2>3. FillCopyAt(o, c0)
-      BY <1>1, <1>2, <1>3, <1>4, <1>6, <2>1, <2>2 DEF FillCopyAt, Copy, CopyRecord
+      BY <1>1, <1>2, <1>3, <1>4, <1>6, <2>1, <2>2 DEF FillCopyAt, Copy, CopyRecord, CopyPlaced
     <2> QED
       BY <2>3, FillCopyInv
   <1>7. CASE ~(/\ cache[k] # NONE
@@ -777,7 +1028,8 @@ LEMMA LoadInv ==
           /\ \A b \in inflight : \A x \in b.reads : x[2] # w
       BY <1>1, <2>1, ObtainFacts DEF Live
     <2>3. NewBlockAt(o, p, w, Copy("load", o, p, k, ogroup[o], hcache[k], w))
-      BY <1>1, <1>2, <1>3, <1>4, <1>5, <2>1, <2>2 DEF NewBlockAt, Copy, AllUnits, CopyRecord
+      BY <1>1, <1>2, <1>3, <1>4, <1>5, <2>1, <2>2 DEF NewBlockAt, Copy, AllUnits, CopyRecord,
+                                                    CopyPlaced
     <2> QED
       BY <2>2, <2>3, NewBlockInv
   <1> QED
@@ -813,7 +1065,7 @@ LEMMA SaveInv ==
     <2> QED
       BY <1>3, <2>1
   <1>7. HostCopyAt(h, Copy("save", o, NONE, k, ogroup[o], oslot[o], h))
-    BY <1>1, <1>2, <1>3, <1>4, <1>5, <1>6 DEF HostCopyAt, Copy, CopyRecord
+    BY <1>1, <1>2, <1>3, <1>4, <1>5, <1>6 DEF HostCopyAt, Copy, CopyRecord, CopyPlaced
   <1> QED
     BY <1>2, <1>7, HostCopyInv
 
@@ -821,33 +1073,51 @@ LEMMA StoreInv ==
   ASSUME IndInv, NEW g \in Groups, NEW k \in Keys, Store(g, k), UNCHANGED rare
   PROVE  IndInv'
   <1>1. /\ ncopy < MaxCopies /\ GroupEpoch[g] \notin lost /\ cache[k] # NONE
+        /\ Mem(g) \in valid[cache[k]]
         /\ vis[k].d \in {NONE, GroupEpoch[g]}
         /\ ncopy' = ncopy + 1
         /\ UNCHANGED <<ostate, ogroup, oslot, table, cache, hcache, deferred, tasks, trial, member,
                        valid, vis, dbt, launched, inflight, handoff, requests, sharedKey, remote,
                        lost, bad>>
     BY DEF Store, plane, rare
-  <1>2. PICK h \in free \cap HostUnits :
-          /\ free' = free \ {h}
-          /\ alloc' = [alloc EXCEPT ![h] = "copy"]
-          /\ copies' = copies \cup {Copy("store", NONE, NONE, k, g, cache[k], h)}
-    BY DEF Store
-  <1>3. /\ cache[k] \in Units /\ alloc[cache[k]] = "shared"
+  <1>2. /\ cache[k] \in Units /\ alloc[cache[k]] = "shared"
         /\ \A j \in Keys : cache[j] = cache[k] => j = k
     BY <1>1, DeviceCached
-  <1>4. alloc[h] = NONE /\ sharedKey[h] = NONE /\ ~Held(h)
-    BY <1>2 DEF IndInv, FreeClean
-  <1>5. Unheld(h) /\ \A j \in Keys : cache[j] # h
-    BY <1>4, TasksHeld DEF Held, HeldIn, Unheld
-  <1>6. \A j \in Keys : hcache[j] # cache[k]
-    <2>1. hcache \in [Keys -> HostUnits \cup {NONE}]
-      BY TypeFacts DEF TypeOK
+  <1>3. CASE hcache[k] = NONE
+    <2>1. PICK h \in free \cap HostUnits :
+            /\ free' = free \ {h}
+            /\ alloc' = [alloc EXCEPT ![h] = "copy"]
+            /\ copies' = copies \cup {Copy("store", NONE, NONE, k, g, cache[k], h)}
+      BY <1>3 DEF Store
+    <2>2. alloc[h] = NONE /\ sharedKey[h] = NONE /\ ~Held(h)
+      BY <2>1 DEF IndInv, FreeClean
+    <2>3. Unheld(h) /\ \A j \in Keys : cache[j] # h
+      BY <2>2, TasksHeld DEF Held, HeldIn, Unheld
+    <2>4. \A j \in Keys : hcache[j] # cache[k]
+      <3>1. hcache \in [Keys -> HostUnits \cup {NONE}]
+        BY TypeFacts DEF TypeOK
+      <3> QED
+        BY <1>2, <3>1
+    <2>5. HostCopyAt(h, Copy("store", NONE, NONE, k, g, cache[k], h))
+      BY <1>1, <1>2, <2>1, <2>2, <2>3, <2>4 DEF HostCopyAt, Copy, CopyRecord, CopyPlaced
     <2> QED
-      BY <1>3, <2>1
-  <1>7. HostCopyAt(h, Copy("store", NONE, NONE, k, g, cache[k], h))
-    BY <1>1, <1>2, <1>3, <1>4, <1>5, <1>6 DEF HostCopyAt, Copy, CopyRecord
+      BY <2>1, <2>5, HostCopyInv
+  <1>4. CASE hcache[k] # NONE
+    <2> DEFINE c0 == [Copy("store", NONE, NONE, k, g, cache[k], hcache[k])
+                        EXCEPT !.fill = TRUE, !.parts = GroupParts[g] \ valid[hcache[k]]]
+    <2>1. /\ vis[k].h = MadeBy(GroupEpoch[g])
+          /\ ~\E c \in copies : c.write = hcache[k]
+          /\ copies' = copies \cup {c0}
+          /\ UNCHANGED <<free, alloc>>
+      BY <1>4 DEF Store
+    <2>2. hcache[k] \in HostUnits /\ alloc[hcache[k]] = "shared"
+      BY <1>4, HostCached
+    <2>3. StoreFillAt(g, k, c0)
+      BY <1>1, <1>2, <2>1, <2>2 DEF StoreFillAt, Copy, CopyRecord, CopyPlaced
+    <2> QED
+      BY <2>3, StoreFillInv
   <1> QED
-    BY <1>2, <1>7, HostCopyInv
+    BY <1>3, <1>4
 
 -----------------------------------------------------------------------------
 (* Restore                                                                 *)
@@ -857,6 +1127,7 @@ LEMMA RestoreInv ==
   PROVE  IndInv'
   <1> DEFINE c0 == [Copy("restore", o, NONE, k, ogroup[o], hcache[k], oslot[o]) EXCEPT !.fill = TRUE]
   <1>1. /\ ncopy < MaxCopies /\ ostate[o] = "live" /\ hcache[k] # NONE /\ VisibleHost(k, o)
+        /\ GroupParts[ogroup[o]] \subseteq valid[hcache[k]]
         /\ ~Moving(o)
         /\ copies' = copies \cup {c0}
         /\ ncopy' = ncopy + 1
@@ -872,7 +1143,7 @@ LEMMA RestoreInv ==
   <1>4. \A j \in Keys : (hcache[j] = hcache[k] /\ vis[j].h # NONE) => vis[j].h = OwnerEpoch[o]
     BY <1>1, <1>3 DEF VisibleHost
   <1>5. FillCopyAt(o, c0)
-    BY <1>1, <1>2, <1>3, <1>4 DEF FillCopyAt, Copy, CopyRecord
+    BY <1>1, <1>2, <1>3, <1>4 DEF FillCopyAt, Copy, CopyRecord, CopyPlaced
   <1> QED
     BY <1>5, FillCopyInv
 

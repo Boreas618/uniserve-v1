@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """Mutation tests of the Rust buffer pool (L4): every deleted rule is caught.
 
-    mutations.py [RULE...]          (R1 to R10 by default)
+    mutations.py [RULE...]          (R1 to R11 by default)
 
-For each rule R1 to R10 of specs/buffer-pool.md §9, the guard that enforces
+For each rule R1 to R11 of specs/buffer-pool.md §9, the guard that enforces
 it in crates/storage-server/src/buffer_pool is replaced as stated below, the
 crate's buffer pool tests are run, and the source is restored. A rule is
 caught when the mutated crate compiles and at least one test fails. Prints
@@ -34,9 +34,9 @@ MUTATIONS = {
     "R2": ("runs return to their region while other holders remain", [(
         "mod.rs",
         """        if let Ok(block) = Rc::try_unwrap(block) {
-            for run in block.runs {""",
+            for run in block.runs.into_inner() {""",
         """        {
-            for run in block.runs.iter().map(Run::again) {""",
+            for run in block.runs.borrow().iter().map(Run::again) {""",
     ), (
         "region.rs",
         """    /// Splits off the first `count` units; the rest stays in `self`.""",
@@ -124,6 +124,11 @@ MUTATIONS = {
         "mod.rs",
         """                remove_range(quota, offset, bytes)""",
         """                remove_range(quota, offset, bytes) || true""",
+    )]),
+    "R11": ("a host copy is loaded and restored whatever host parts hold it", [(
+        "mod.rs",
+        """        host.valid.get() & parts == parts""",
+        """        true || host.valid.get() & parts == parts""",
     )]),
 }
 

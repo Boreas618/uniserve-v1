@@ -18,7 +18,7 @@ MCGroupRegion == [g \in Groups |-> IF g = ga THEN "A" ELSE "B"]
 MCUnitChunk == [u \in Units |-> IF u \in {a1, b1} THEN 1 ELSE 2]
 MCMovable == Units
 MCInitialUnits == {a1, a2}
-AllRules == {"R1", "R2", "R3", "R4", "R5", "R6", "R7", "R8", "R9", "R10"}
+AllRules == {"R1", "R2", "R3", "R4", "R5", "R6", "R7", "R8", "R9", "R10", "R11"}
 NoR10 == AllRules \ {"R10"}
 
 (* Witness: false in some reachable state, which shows that the search     *)

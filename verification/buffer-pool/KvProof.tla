@@ -7,7 +7,7 @@
 (***************************************************************************)
 EXTENDS KvInductive, FiniteSetTheorems, TLAPS
 
-AllRules == {"R1", "R2", "R3", "R4", "R5", "R6", "R7", "R8", "R9", "R10"}
+AllRules == {"R1", "R2", "R3", "R4", "R5", "R6", "R7", "R8", "R9", "R10", "R11"}
 
 ASSUME Design == Rules = AllRules /\ Hazards = {}
 
@@ -25,6 +25,12 @@ ASSUME Sizes ==
     /\ TrialEpochs \subseteq Epochs /\ Losable \subseteq Epochs
     /\ Eager \in BOOLEAN
     /\ \A u, v \in InitialUnits : u # v => UnitChunk[u] # UnitChunk[v]
+    /\ GroupParts \in [Groups -> SUBSET HostParts]
+    \* A memory is not a host part.
+    /\ \A g \in Groups : GroupMemory[g] \notin HostParts
+    \* A group reads the classes of owners of its own session.
+    /\ Readers \in [Groups -> SUBSET Groups]
+    /\ \A g \in Groups : \A x \in Readers[g] : GroupEpoch[x] = GroupEpoch[g]
 
 LEMMA RulesOn == \A rule \in AllRules : On(rule)
   BY Design DEF On, AllRules
@@ -49,7 +55,9 @@ THEOREM InitInv == Init => IndInv
       OBVIOUS
     <3>5. ncopy \in 0 .. MaxCopies /\ launched \in [Groups -> 0 .. MaxBatch]
       OBVIOUS
-    <3>6. valid \in [Units -> SUBSET Memories]
+    <3>6. /\ valid \in [Units \cup HostUnits -> SUBSET (Memories \cup HostParts)]
+          /\ \A u \in Units : valid[u] \subseteq Memories
+          /\ \A h \in HostUnits : valid[h] \subseteq HostParts
       OBVIOUS
     <3>7. \A k \in Keys : vis[k].d \in Epochs \cup {NONE} /\ vis[k].h \in Epochs \cup {NONE}
       OBVIOUS
@@ -90,8 +98,10 @@ THEOREM InitInv == Init => IndInv
   BY DEF TablesMapped, HandoffOk, RequestsOk, BatchesOk
 <1>7. TrialVisibility /\ NoBad
   BY DEF TrialVisibility, NoBad
+<1>8. CrossingsOk /\ CopiesPlaced /\ CrossingsPlaced
+  BY DEF CrossingsOk, CopiesPlaced, CrossingsPlaced
 <1> QED
-  BY <1>1, <1>2, <1>3, <1>4, <1>5, <1>6, <1>7 DEF IndInv
+  BY <1>1, <1>2, <1>3, <1>4, <1>5, <1>6, <1>7, <1>8 DEF IndInv
 
 THEOREM InvSafe == IndInv => Safety
 <1> SUFFICES ASSUME IndInv PROVE Safety
@@ -134,9 +144,31 @@ THEOREM InvSafe == IndInv => Safety
     <3> QED
       BY <3>1, <3>4, <3>5, <3>6
   <2>2. \A c, d \in CopyWriters(u) : c = d
-    BY DEF IndInv, CopiesOk, CopyWriters
+    <3> SUFFICES ASSUME NEW c \in CopyWriters(u), NEW d \in CopyWriters(u) PROVE c = d
+      OBVIOUS
+    <3>1. c \in copies /\ d \in copies /\ ~c.fill /\ c.write = u /\ d.write = u
+      BY DEF CopyWriters
+    <3>2. \A x \in copies : x.write = c.write => x = c
+      BY <3>1 DEF IndInv, CopiesOk
+    <3> QED
+      BY <3>1, <3>2
   <2>3. TableHolders(u) = {} \/ CopyWriters(u) = {}
-    BY DEF IndInv, Tables, OwnersOk, CopiesOk, TableHolders, CopyWriters, TypeInv, TypeOK
+    <3> SUFFICES ASSUME NEW x \in TableHolders(u), NEW c \in CopyWriters(u) PROVE FALSE
+      OBVIOUS
+    <3>1. c \in copies /\ ~c.fill /\ c.write = u
+      BY DEF CopyWriters
+    <3>2. /\ \A o \in Owners, p \in Positions : table[o][p].u # u
+          /\ u \in Units \cup HostUnits
+      BY <3>1 DEF IndInv, CopiesOk
+    <3>3. CASE x \in Owners \X Positions /\ table[x[1]][x[2]] = Private(u)
+      BY <3>2, <3>3 DEF Private
+    <3>4. CASE x \in Owners \X {SLOT} /\ oslot[x[1]] = u
+      <4>1. oslot[x[1]] \in Slots \cup {NONE}
+        BY <3>4 DEF IndInv, TypeInv, TypeOK
+      <4> QED
+        BY <3>2, <3>4, <4>1
+    <3> QED
+      BY <3>3, <3>4 DEF TableHolders
   <2>4. Cardinality(TableHolders(u)) + Cardinality(CopyWriters(u)) <= 1
     <3>1. \A S : (\A x, y \in S : x = y) => IsFiniteSet(S) /\ Cardinality(S) \in {0, 1}
       <4> SUFFICES ASSUME NEW S, \A x, y \in S : x = y
@@ -168,7 +200,8 @@ THEOREM InvSafe == IndInv => Safety
 <1>4. WriteIsolation /\ ReadIsolation /\ CopyIsolation
   BY DEF IndInv, BatchesOk, WriteIsolation, ReadIsolation, CopyIsolation
 <1>5. TaskIsolation
-  BY DEF IndInv, TasksOk, FreeClean, Held, HeldIn, TaskIsolation, CacheShared, SharedIff, TypeInv
+  BY DEF IndInv, TasksOk, CrossingsOk, FreeClean, Held, HeldIn, TaskIsolation, CacheShared,
+         SharedIff, TypeInv
 <1>6. KeyStable
   BY DEF IndInv, SharedIff, SharedCached, FreeClean, Tables, OwnersOk, CopiesOk, KeyStable,
          TableHolders, CopyWriters, TypeInv, TypeOK
@@ -191,7 +224,30 @@ THEOREM InvSafe == IndInv => Safety
   <2> QED
     BY <2>2, <2>3
 <1>9. SharedUnwritten /\ CopiesReadShared
-  BY DEF IndInv, BatchesOk, CopiesOk, SharedUnwritten, CopiesReadShared, TypeInv
+  <2>1. \A b \in inflight : \A u \in b.cw :
+          alloc[u] = "shared" => Mem(b.g) \notin valid[u]
+    <3> SUFFICES ASSUME NEW b \in inflight, NEW u \in b.cw, alloc[u] = "shared"
+                 PROVE  Mem(b.g) \notin valid[u]
+      OBVIOUS
+    <3>1. PICK c \in copies : c.write = u /\ c.g = b.g /\ c.seq = b.seq
+      BY DEF IndInv, BatchesOk
+    <3>2. c.fill
+      BY <3>1 DEF IndInv, CopiesOk
+    <3>3. CASE c.kind = "load"
+      BY <3>1, <3>2, <3>3 DEF IndInv, CopiesOk
+    <3>4. CASE c.kind = "restore"
+      BY <3>1, <3>2, <3>4 DEF IndInv, CopiesOk, OwnersOk, AllocOwner
+    <3>5. CASE c.kind = "store"
+      <4>1. u \in HostUnits /\ b.g \in Groups
+        BY <3>1, <3>2, <3>5 DEF IndInv, CopiesOk, BatchesOk
+      <4>2. valid[u] \subseteq HostParts
+        BY <4>1 DEF IndInv, TypeInv, TypeOK
+      <4> QED
+        BY <4>1, <4>2 DEF Mem
+    <3> QED
+      BY <3>1, <3>2, <3>3, <3>4, <3>5 DEF IndInv, CopiesOk
+  <2> QED
+    BY <2>1 DEF IndInv, BatchesOk, CopiesOk, SharedUnwritten, CopiesReadShared, TypeInv
 <1>10. SourcesHeld /\ Exactness
   BY DEF IndInv, NoBad, SourcesHeld, Exactness
 <1>11. NoLeak /\ OneRegion /\ TrialVisibility
@@ -212,7 +268,9 @@ THEOREM InvSafe == IndInv => Safety
     BY <2>1 DEF Pinned
   <2> QED
     BY <2>3, <2>4 DEF CacheKeys
+<1>13. P8
+  BY DEF IndInv, P8
 <1> QED
-  BY <1>1, <1>2, <1>3, <1>4, <1>5, <1>6, <1>7, <1>8, <1>9, <1>10, <1>11, <1>12
+  BY <1>1, <1>2, <1>3, <1>4, <1>5, <1>6, <1>7, <1>8, <1>9, <1>10, <1>11, <1>12, <1>13
      DEF Safety, P1, P2, P3, P5, P6
 =============================================================================

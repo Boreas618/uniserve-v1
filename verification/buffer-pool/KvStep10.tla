@@ -13,7 +13,7 @@ KeptCopies(e) == {c \in copies : ~Mine(e, c.g)}
 KeptDeferred(e) ==
     {d \in deferred :
        /\ ~(d.kind = "finish" /\ \E c \in copies \ KeptCopies(e) : c.id = d.c)
-       /\ ~(d.kind \in {"commit", "transfer"} /\ OwnerEpoch[d.o] = e)}
+       /\ ~(d.kind \in {"commit", "transfer", "replicate"} /\ OwnerEpoch[d.o] = e)}
 KeptTable(e) ==
     [o \in Owners |-> IF o \in GoneOwners(e) THEN [p \in Positions |-> Empty] ELSE table[o]]
 KeptSlot(e) == [o \in Owners |-> IF o \in GoneOwners(e) THEN NONE ELSE oslot[o]]
@@ -96,27 +96,79 @@ LEMMA Lose_Held ==
                                   KeptCopies(e), tasks)
     BY Lose_Effect DEF Held
   <1>2. \A u \in AllUnits : Held(u)' => Held(u)
-    <2>1. \A u \in AllUnits, o \in Owners, p \in Positions : KeptTable(e)[o][p].u = u => table[o][p].u = u
-      BY DEF KeptTable, Empty, AllUnits
-    <2>2. \A u \in AllUnits, o \in Owners : KeptSlot(e)[o] = u => oslot[o] = u
-      BY DEF KeptSlot, AllUnits
-    <2>3. KeptDeferred(e) \subseteq deferred /\ KeptCopies(e) \subseteq copies
-      BY DEF KeptDeferred, KeptCopies
+    <2> SUFFICES ASSUME NEW u \in AllUnits, Held(u)' PROVE Held(u)
+      OBVIOUS
+    <2>1. HeldIn(u, KeptTable(e), KeptSlot(e), cache, hcache, KeptDeferred(e), KeptCopies(e), tasks)
+      BY <1>1
+    <2>2. CASE \E o \in Owners, p \in Positions : KeptTable(e)[o][p].u = u
+      <3>1. PICK o \in Owners, p \in Positions : KeptTable(e)[o][p].u = u
+        BY <2>2
+      <3>2. table[o][p].u = u
+        BY <3>1 DEF KeptTable, Empty, AllUnits
+      <3> QED
+        BY <3>2 DEF Held, HeldIn
+    <2>3. CASE \E o \in Owners : KeptSlot(e)[o] = u
+      <3>1. PICK o \in Owners : KeptSlot(e)[o] = u
+        BY <2>3
+      <3>2. oslot[o] = u
+        BY <3>1 DEF KeptSlot, AllUnits
+      <3> QED
+        BY <3>2 DEF Held, HeldIn
+    <2>4. CASE \E d \in KeptDeferred(e) : u \in d.units
+      BY <2>4 DEF KeptDeferred, Held, HeldIn
+    <2>5. CASE \E c \in KeptCopies(e) : u = c.read \/ u = c.write
+      BY <2>5 DEF KeptCopies, Held, HeldIn
+    <2>6. CASE \/ \E k \in Keys : cache[k] = u \/ hcache[k] = u
+               \/ \E t \in tasks : t.held /\ (u \in t.units \/ u = t.slot \/ u = t.h)
+      BY <2>6 DEF Held, HeldIn
     <2> QED
-      BY <1>1, <2>1, <2>2, <2>3, Zenon DEF HeldIn, Held
+      BY <2>1, <2>2, <2>3, <2>4, <2>5, <2>6 DEF HeldIn
   <1>3. \A u \in AllUnits : Held(u) => Held(u)' \/ u \in Dropped(e)
-    <2>1. \A u \in AllUnits, o \in Owners, p \in Positions :
-            table[o][p].u = u => KeptTable(e)[o][p].u = u \/ u \in Dropped(e)
-      BY DEF KeptTable, Dropped
-    <2>2. \A u \in AllUnits, o \in Owners : oslot[o] = u => KeptSlot(e)[o] = u \/ u \in Dropped(e)
-      BY DEF KeptSlot, Dropped
-    <2>3. \A u \in AllUnits, d \in deferred : u \in d.units => d \in KeptDeferred(e) \/ u \in Dropped(e)
-      BY DEF Dropped
-    <2>4. \A u \in AllUnits, c \in copies :
-            (u = c.read \/ u = c.write) => c \in KeptCopies(e) \/ u \in Dropped(e)
-      BY DEF Dropped
+    <2> SUFFICES ASSUME NEW u \in AllUnits, Held(u), u \notin Dropped(e) PROVE Held(u)'
+      OBVIOUS
+    <2>1. Held(u)' = HeldIn(u, KeptTable(e), KeptSlot(e), cache, hcache, KeptDeferred(e),
+                            KeptCopies(e), tasks)
+      BY <1>1
+    <2>2. CASE \E o \in Owners, p \in Positions : table[o][p].u = u
+      <3>1. PICK o \in Owners, p \in Positions : table[o][p].u = u
+        BY <2>2
+      <3>2. o \notin GoneOwners(e)
+        <4> SUFFICES ASSUME o \in GoneOwners(e) PROVE FALSE
+          OBVIOUS
+        <4>1. u \in {table[o][q].u : q \in Positions} \cup {oslot[o]}
+          BY <3>1
+        <4> QED
+          BY <4>1 DEF Dropped
+      <3>3. KeptTable(e)[o][p].u = u
+        BY <3>1, <3>2 DEF KeptTable
+      <3> QED
+        BY <2>1, <3>3 DEF HeldIn
+    <2>3. CASE \E o \in Owners : oslot[o] = u
+      <3>1. PICK o \in Owners : oslot[o] = u
+        BY <2>3
+      <3>2. KeptSlot(e)[o] = u
+        BY <3>1 DEF KeptSlot, Dropped
+      <3> QED
+        BY <2>1, <3>2 DEF HeldIn
+    <2>4. CASE \E d \in deferred : u \in d.units
+      <3>1. PICK d \in deferred : u \in d.units
+        BY <2>4
+      <3>2. d \in KeptDeferred(e)
+        BY <3>1 DEF Dropped
+      <3> QED
+        BY <2>1, <3>1, <3>2 DEF HeldIn
+    <2>5. CASE \E c \in copies : u = c.read \/ u = c.write
+      <3>1. PICK c \in copies : u = c.read \/ u = c.write
+        BY <2>5
+      <3>2. c \in KeptCopies(e)
+        BY <3>1 DEF Dropped
+      <3> QED
+        BY <2>1, <3>1, <3>2 DEF HeldIn
+    <2>6. CASE \/ \E k \in Keys : cache[k] = u \/ hcache[k] = u
+               \/ \E t \in tasks : t.held /\ (u \in t.units \/ u = t.slot \/ u = t.h)
+      BY <2>1, <2>6 DEF HeldIn
     <2> QED
-      BY <1>1, <2>1, <2>2, <2>3, <2>4, Zenon DEF HeldIn, Held
+      BY <2>2, <2>3, <2>4, <2>5, <2>6 DEF Held, HeldIn
   <1>4. \A u \in Dropped(e) \ {NONE} : Held(u) /\ u \in AllUnits
     <2>1. \A u \in Dropped(e) :
             \/ \E o \in Owners, p \in Positions : table[o][p].u = u
@@ -270,7 +322,7 @@ LEMMA Lose_Deferred ==
     BY DeferredOkEach
   <1>2. d \in deferred /\ DeferOk(d)
     BY Lose_Effect, DeferredOkEach DEF KeptDeferred, IndInv
-  <1>3. /\ d.kind \in {"commit", "transfer"} => OwnerEpoch[d.o] # e
+  <1>3. /\ d.kind \in {"commit", "transfer", "replicate"} => OwnerEpoch[d.o] # e
         /\ d.kind = "finish" => \A c \in copies : c.id = d.c => c \in copies'
     BY Lose_Effect DEF KeptDeferred, KeptCopies
   <1>4. /\ \A x \in deferred' : x \in deferred
@@ -304,7 +356,7 @@ LEMMA Lose_Copies ==
     BY Lose_Effect, CopiesOkEach DEF KeptCopies, Mine, IndInv
   <1>3. /\ \A x \in copies' : x \in copies
         /\ lost' = lost \cup {e}
-        /\ UNCHANGED <<ncopy, launched, cache, valid, tasks, ogroup>>
+        /\ UNCHANGED <<ncopy, launched, cache, hcache, valid, tasks, ogroup>>
     BY Lose_Effect DEF KeptCopies
   <1>4. c.write \in AllUnits /\ c.read \in AllUnits
     BY <1>2, WorkTypes DEF WorkTyped
@@ -356,13 +408,29 @@ LEMMA Lose_Plane ==
   <1>3. LostOk'
     BY <1>1, Lose_Effect DEF IndInv, LostOk, Mine, NoEntry
   <1>4. TablesMapped'
+    (* An owner named in a table of a group of another epoch is of that     *)
+    (* group's epoch, attached to it or to a group it reads.                *)
     <2>1. \A g \in Groups, o \in Owners :
             ~Mine(e, g) /\ (\E p \in Rows : dbt[g][o][p].u # NONE) => o \notin GoneOwners(e)
-      BY Lose_Owners DEF IndInv, TablesMapped
+      <3> SUFFICES ASSUME NEW g \in Groups, NEW o \in Owners, ~Mine(e, g),
+                          NEW p \in Rows, dbt[g][o][p].u # NONE
+                   PROVE  o \notin GoneOwners(e)
+        OBVIOUS
+      <3>1. Live(o) /\ (ogroup[o] = g \/ g \in ReadersOf(o))
+        BY DEF IndInv, TablesMapped, ReaderRow
+      <3>2. ogroup[o] \in Groups /\ GroupEpoch[ogroup[o]] = OwnerEpoch[o]
+        BY <3>1 DEF IndInv, OwnersOk
+      <3>3. GroupEpoch[g] = OwnerEpoch[o]
+        BY <3>1, <3>2 DEF ReadersOf
+      <3> QED
+        BY <3>3 DEF Mine, GoneOwners
     <2>2. \A x \in deferred' : x \in deferred
       BY Lose_Effect DEF KeptDeferred
+    <2>3. UNCHANGED <<ogroup, valid, tasks>>
+      BY Lose_Effect
     <2> QED
-      BY <1>1, <2>1, <2>2, Lose_Owners, Lose_Effect DEF IndInv, TablesMapped, HoldsAt, NoEntry
+      BY <1>1, <2>1, <2>2, <2>3, Lose_Owners, Lose_Effect
+         DEF IndInv, TablesMapped, HoldsAt, NoEntry, ReaderRow, ReadersOf, Mem
   <1>5. HandoffOk'
     <2>1. \A h \in handoff' : h \in handoff /\ OwnerEpoch[h.o] # e
       BY Lose_Effect DEF IndInv, HandoffOk, Mine
@@ -370,8 +438,11 @@ LEMMA Lose_Plane ==
       BY <2>1, Lose_Effect DEF Names
     <2>3. \A x \in deferred' : x \in deferred
       BY Lose_Effect DEF KeptDeferred
+    <2>4. UNCHANGED <<ogroup, valid, tasks>>
+      BY Lose_Effect
     <2> QED
-      BY <2>1, <2>2, <2>3, Lose_Owners, Lose_Effect DEF IndInv, HandoffOk, HoldsAt
+      BY <2>1, <2>2, <2>3, <2>4, Lose_Owners, Lose_Effect
+         DEF IndInv, HandoffOk, HoldsAt, ReaderRow, ReadersOf, Mem
   <1>6. RequestsOk'
     <2>1. \A c \in copies' : c \in copies
       BY Lose_Effect DEF KeptCopies
@@ -404,15 +475,23 @@ LEMMA Lose_Batches ==
     BY Lose_Effect, BatchesOkEach DEF Mine, IndInv
   <1>3. ASSUME NEW o \in Owners, NEW u, Covered(b, o, u)
         PROVE  Covered(b, o, u)' /\ Held(u)'
-    <2>1. CASE /\ Live(o) /\ ogroup[o] = b.g
+    <2>1. CASE /\ Live(o) /\ (ogroup[o] = b.g \/ b.g \in ReadersOf(o))
                /\ \E p \in Rows :
                     /\ HoldsAt(o, p, u)
                     /\ \A r \in requests :
                          TakesRow(r, o, p) => b.g \in r.sg /\ (b.g \in r.by => r.after[b.g] >= b.seq)
                /\ \A d \in deferred : (d.kind = "transfer" /\ d.o = o) => d.after[b.g] >= b.seq
                /\ ~\E t \in tasks : t.kind = "transfer" /\ t.o = o
+      (* The batch's group is of the owner's epoch, which is not lost.     *)
+      <3>0. OwnerEpoch[o] # e
+        <4>1. ogroup[o] \in Groups /\ GroupEpoch[ogroup[o]] = OwnerEpoch[o]
+          BY <2>1 DEF IndInv, OwnersOk
+        <4>2. GroupEpoch[b.g] = OwnerEpoch[o]
+          BY <2>1, <4>1 DEF ReadersOf
+        <4> QED
+          BY <1>2, <4>2
       <3>1. o \notin GoneOwners(e) /\ Live(o)' /\ ogroup'[o] = ogroup[o]
-        BY <1>2, <2>1, Lose_Owners, Lose_Effect DEF Mine, Live
+        BY <3>0, <2>1, Lose_Owners, Lose_Effect DEF Live, GoneOwners
       <3>2. \A p \in Rows : HoldsAt(o, p, u)' = HoldsAt(o, p, u)
         BY <3>1, Lose_Owners DEF HoldsAt
       <3>3. /\ \A r \in requests' : r \in requests
@@ -420,7 +499,7 @@ LEMMA Lose_Batches ==
             /\ UNCHANGED tasks
         BY Lose_Effect DEF KeptDeferred
       <3>4. Covered(b, o, u)'
-        BY <2>1, <3>1, <3>2, <3>3 DEF Covered
+        BY <2>1, <3>1, <3>2, <3>3 DEF Covered, ReadersOf
       <3>5. Held(u)'
         BY <2>1, <3>1, Lose_Owners DEF HoldsAt, Held, HeldIn, Rows
       <3> QED
@@ -457,11 +536,55 @@ LEMMA Lose_Batches ==
   <1> QED
     BY <1>2, <1>5, <1>6, <1>7, <1>8 DEF BatchOk, Mem
 
+(* A crossing kept is of an epoch that is not lost and keeps what it      *)
+(* holds; the copies and batches kept and the tasks read as before.       *)
+LEMMA Lose_Crossings ==
+  ASSUME IndInv, NEW e \in Epochs, Lose(e)
+  PROVE  CrossingsOk' /\ CopiesPlaced' /\ CrossingsPlaced'
+  <1>1. /\ \A d \in deferred' : d \in deferred /\ (d.kind = "replicate" => OwnerEpoch[d.o] # e)
+        /\ \A c \in copies' : c \in copies
+        /\ \A x \in inflight' : x \in inflight
+        /\ lost' = lost \cup {e}
+        /\ UNCHANGED <<ogroup, cache, tasks, valid, vis, trial>>
+    BY Lose_Effect DEF KeptDeferred, KeptCopies
+  <1>2. \A o \in Owners : Moving(o)' => Moving(o)
+    BY <1>1 DEF Moving
+  <1>3. \A o \in Owners : ostate[o] # "new" => ostate'[o] # "new"
+    BY Lose_Owners
+  <1>4. \A d \in deferred' : CrossWaitOk(d)'
+    <2> SUFFICES ASSUME NEW d \in deferred', d.kind = "replicate" PROVE CrossWaitOk(d)'
+      BY DEF CrossWaitOk
+    <2>1. d \in deferred /\ CrossWaitOk(d) /\ OwnerEpoch[d.o] # e
+      BY <1>1, CrossingsOkEach DEF IndInv
+    <2>2. \A u \in d.units : alloc'[u] = alloc[u]
+      BY Lose_Kept
+    <2> QED
+      BY <1>1, <1>2, <1>3, <2>1, <2>2 DEF CrossWaitOk, ReadersOf, MadeBy
+  <1>5. \A t \in tasks' : CrossTaskOk(t)'
+    <2> SUFFICES ASSUME NEW t \in tasks', t.kind = "replicate" PROVE CrossTaskOk(t)'
+      BY DEF CrossTaskOk
+    <2>1. t \in tasks /\ CrossTaskOk(t)
+      BY <1>1, CrossingsOkEach DEF IndInv
+    <2>2. \A u \in t.units : u # NONE
+      BY <2>1 DEF CrossTaskOk
+    <2>3. \A u \in t.units : alloc'[u] = alloc[u]
+      BY <2>1, <2>2, Lose_Kept
+    <2> QED
+      BY <1>1, <1>2, <1>3, <2>1, <2>3 DEF CrossTaskOk, ReadersOf, Mem
+  <1>6. CrossingsOk'
+    BY <1>4, <1>5, CrossingsOkEach
+  <1>7. CopiesPlaced'
+    BY <1>1 DEF IndInv, CopiesPlaced, Mem
+  <1>8. CrossingsPlaced'
+    BY <1>1 DEF IndInv, CrossingsPlaced, Mem
+  <1> QED
+    BY <1>6, <1>7, <1>8
+
 LEMMA Lose_Inv ==
   ASSUME IndInv, NEW e \in Epochs, Lose(e)
   PROVE  IndInv'
   BY Lose_Typed, Lose_Free, Lose_Shared, Lose_Tables, Lose_Deferred, Lose_Copies, Lose_Tasks,
-     Lose_Plane, Lose_Visibility, Lose_Batches DEF IndInv
+     Lose_Plane, Lose_Visibility, Lose_Batches, Lose_Crossings DEF IndInv
 
 THEOREM Step10 == IndInv /\ (\E e \in Epochs : Lose(e)) => IndInv'
   BY Lose_Inv

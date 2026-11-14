@@ -11,8 +11,81 @@ USE Sizes, Design DEF On, AllRules
 (* Task t is a record of the fields of Task alone.                         *)
 TaskRecord(t) ==
   t = [kind |-> t.kind, k |-> t.k, h |-> t.h, src |-> t.src, ok |-> t.ok,
-       expired |-> t.expired, o |-> t.o, to |-> t.to, slot |-> t.slot, held |-> t.held,
-       units |-> t.units, writes |-> t.writes]
+       expired |-> t.expired, p |-> t.p, o |-> t.o, to |-> t.to, slot |-> t.slot,
+       held |-> t.held, units |-> t.units, writes |-> t.writes]
+
+(* The prefetch a group's admission asks for: a task that fills that       *)
+(* group's host parts.                                                     *)
+PrefetchTask(k, h, src, g) == [Task("prefetch", k, h, src) EXCEPT !.to = g]
+
+-----------------------------------------------------------------------------
+(* The crossings, and where copies and crossings read, across a step that  *)
+(* changes no deferred work, copy, owner or batch, no transfer or crossing *)
+(* task, and the allocation, validity and visibility of no device unit and *)
+(* of no host unit a copy touches.                                         *)
+LEMMA TierCrossings ==
+  ASSUME CrossingsOk, CrossingsPlaced, CopiesPlaced,
+         UNCHANGED <<deferred, copies, ostate, ogroup, lost, cache, inflight, trial>>,
+         Transfers' = Transfers, Crossings' = Crossings,
+         \A u \in Units : alloc'[u] = alloc[u] /\ valid'[u] = valid[u],
+         \A k \in Keys : vis'[k].d = vis[k].d,
+         \A c \in copies : /\ c.read \in HostUnits => valid'[c.read] = valid[c.read]
+                           /\ c.write \in HostUnits => valid'[c.write] = valid[c.write]
+  PROVE  CrossingsOk' /\ CrossingsPlaced' /\ CopiesPlaced'
+  <1>1. \A t : (t \in tasks' /\ t.kind = "replicate") <=> (t \in tasks /\ t.kind = "replicate")
+    BY DEF Crossings
+  <1>2. \A t : (t \in tasks' /\ t.kind = "transfer") <=> (t \in tasks /\ t.kind = "transfer")
+    BY DEF Transfers
+  <1>3. \A o : Moving(o)' = Moving(o)
+    BY <1>2 DEF Moving
+  <1>4. \A d \in deferred : CrossWaitOk(d) => CrossWaitOk(d)'
+    <2> SUFFICES ASSUME NEW d \in deferred, CrossWaitOk(d), d.kind = "replicate"
+                 PROVE  CrossWaitOk(d)'
+      BY DEF CrossWaitOk
+    <2>1. PICK u \in Units : d.units = {u} /\ (alloc[u] = d.o \/ alloc[u] = "shared")
+      BY DEF CrossWaitOk
+    <2> QED
+      BY <1>3, <2>1 DEF CrossWaitOk, ReadersOf, MadeBy
+  <1>5. \A t \in tasks : (t.kind = "replicate" /\ CrossTaskOk(t)) => CrossTaskOk(t)'
+    <2> SUFFICES ASSUME NEW t \in tasks, t.kind = "replicate", CrossTaskOk(t)
+                 PROVE  CrossTaskOk(t)'
+      OBVIOUS
+    <2>1. PICK u \in Units : t.units = {u} /\ t.writes = {u}
+      BY DEF CrossTaskOk
+    <2>2. \A x \in tasks' : x.kind \in {"transfer", "replicate"} => x \in tasks
+      BY <1>1, <1>2
+    <2> QED
+      BY <1>3, <2>1, <2>2 DEF CrossTaskOk, ReadersOf, Mem
+  <1>6. CrossingsOk'
+    <2>1. \A d \in deferred' : CrossWaitOk(d)'
+      BY <1>4, CrossingsOkEach
+    <2>2. \A t \in tasks' : CrossTaskOk(t)'
+      <3> SUFFICES ASSUME NEW t \in tasks', t.kind = "replicate" PROVE CrossTaskOk(t)'
+        BY DEF CrossTaskOk
+      <3>1. t \in tasks /\ CrossTaskOk(t)
+        BY <1>1, CrossingsOkEach
+      <3> QED
+        BY <3>1, <1>5
+    <2> QED
+      BY <2>1, <2>2, CrossingsOkEach
+  <1>7. CrossingsPlaced'
+    <2> SUFFICES ASSUME NEW t \in tasks', t.kind = "replicate" PROVE CrossingPlaced(t)'
+      BY PlacedEach DEF CrossingPlaced
+    <2>1. t \in tasks /\ CrossingPlaced(t)
+      BY <1>1, PlacedEach
+    <2>2. t.units \subseteq Units
+      BY <2>1, CrossingsOkEach DEF CrossTaskOk
+    <2> QED
+      BY <2>1, <2>2 DEF CrossingPlaced, Mem
+  <1>8. CopiesPlaced'
+    <2> SUFFICES ASSUME NEW c \in copies PROVE CopyPlaced(c)'
+      BY PlacedEach
+    <2>1. CopyPlaced(c)
+      BY PlacedEach
+    <2> QED
+      BY <2>1 DEF CopyPlaced, Mem
+  <1> QED
+    BY <1>6, <1>7, <1>8
 
 -----------------------------------------------------------------------------
 (* A step that changes only the prefetches and remote stores and leaves    *)
@@ -24,12 +97,12 @@ LEMMA TierFrame ==
          UNCHANGED <<free, ostate, ogroup, oslot, table, cache, hcache, deferred, copies, ncopy,
                      trial, member, valid, vis, dbt, launched, inflight, handoff, requests, alloc,
                      sharedKey, lost, bad>>,
-         Transfers' = Transfers, TaskUnits' \subseteq TaskUnits,
+         Transfers' = Transfers, Crossings' = Crossings, TaskUnits' \subseteq TaskUnits,
          \A v \in AllUnits : Held(v)' <=> Held(v)
   PROVE  /\ FreeClean' /\ NoLeak' /\ Outside' /\ Regions' /\ AllocOwner' /\ SharedIff'
          /\ SharedCached' /\ CacheShared' /\ Tables' /\ OwnersOk' /\ DeferredOk' /\ CopiesOk'
          /\ MovingUnmapped' /\ LostOk' /\ TablesMapped' /\ HandoffOk' /\ RequestsOk'
-         /\ BatchesOk' /\ NoBad'
+         /\ BatchesOk' /\ NoBad' /\ CrossingsOk' /\ CrossingsPlaced' /\ CopiesPlaced'
   <1>1. free \subseteq AllUnits
     BY DEF IndInv, TypeInv, TypeOK
   <1>2. FreeClean'
@@ -43,8 +116,10 @@ LEMMA TierFrame ==
        CacheSharedFrame, TablesFrame, OwnersOkFrame, DeferredOkFrame, CopiesOkFrame,
        MovingUnmappedFrame, LostOkFrame, TablesMappedFrame, HandoffOkFrame, RequestsOkFrame,
        BatchesOkFrame, NoBadFrame DEF IndInv
+  <1>5. CrossingsOk' /\ CrossingsPlaced' /\ CopiesPlaced'
+    BY TierCrossings DEF IndInv
   <1> QED
-    BY <1>2, <1>3, <1>4
+    BY <1>2, <1>3, <1>4, <1>5
 
 (* The types of every variable but the tasks and the remote store's keys,  *)
 (* after a step that changes only those.                                   *)
@@ -58,8 +133,9 @@ LEMMA TierTypes ==
            /\ t.units \subseteq AllUnits /\ t.writes \subseteq AllUnits
            /\ t.k \in Keys \cup {NONE} /\ t.h \in HostUnits \cup {NONE}
            /\ t.slot \in Slots \cup {NONE} /\ t.o \in Owners \cup {NONE} /\ t.to \in Groups \cup {NONE}
-           /\ t.src \in {NONE, "remote", "peer"}
-           /\ t.kind = "transfer" <=> t.k = NONE
+           /\ t.p \in Positions \cup {NONE} /\ t.src \in {NONE, "remote", "peer"}
+           /\ t.kind \in {"transfer", "replicate"} <=> t.k = NONE
+           /\ t.kind = "prefetch" => t.to \in Groups
            /\ TaskRecord(t)
   PROVE  TypeInv'
   BY DEF IndInv, TypeInv, TypeOK, Stamps, TaskRecord
@@ -67,26 +143,27 @@ LEMMA TierTypes ==
 -----------------------------------------------------------------------------
 (* Prefetch                                                                *)
 
-(* Prefetch(k, src) taking host unit h, which is free.                     *)
-PrefetchAt(k, src, h) ==
+(* Prefetch(k, src, g) taking host unit h, which is free.                  *)
+PrefetchAt(k, src, g, h) ==
   /\ hcache[k] = NONE
   /\ h \in free /\ alloc[h] = NONE /\ sharedKey[h] = NONE /\ Unheld(h)
   /\ \A j \in Keys : cache[j] # h
   /\ free' = free \ {h}
   /\ alloc' = [alloc EXCEPT ![h] = "task"]
-  /\ tasks' = tasks \cup {Task("prefetch", k, h, src)}
+  /\ tasks' = tasks \cup {PrefetchTask(k, h, src, g)}
   /\ UNCHANGED <<ostate, ogroup, oslot, table, cache, hcache, deferred, copies, ncopy, trial,
                  member, valid, vis, dbt, launched, inflight, handoff, requests, sharedKey, remote,
                  lost, bad>>
 
 LEMMA PrefetchPick ==
-  ASSUME IndInv, NEW k \in Keys, NEW src \in {"remote", "peer"}, Prefetch(k, src)
-  PROVE  \E h \in HostUnits : PrefetchAt(k, src, h)
+  ASSUME IndInv, NEW k \in Keys, NEW src \in {"remote", "peer"}, NEW g \in Groups,
+         Prefetch(k, src, g)
+  PROVE  \E h \in HostUnits : PrefetchAt(k, src, g, h)
   <1>1. PICK h \in free \cap HostUnits :
           /\ free' = free \ {h}
           /\ alloc' = [alloc EXCEPT ![h] = "task"]
-          /\ tasks' = tasks \cup {Task("prefetch", k, h, src)}
-    BY DEF Prefetch
+          /\ tasks' = tasks \cup {PrefetchTask(k, h, src, g)}
+    BY DEF Prefetch, PrefetchTask
   <1>2. /\ hcache[k] = NONE
         /\ UNCHANGED <<ostate, ogroup, oslot, table, cache, hcache, deferred, copies, ncopy, trial,
                        member, valid, vis, dbt, launched, inflight, handoff, requests, sharedKey,
@@ -100,23 +177,25 @@ LEMMA PrefetchPick ==
     BY <1>1, <1>2, <1>3, <1>4 DEF PrefetchAt
 
 LEMMA PrefetchInv ==
-  ASSUME IndInv, NEW k \in Keys, NEW src \in {"remote", "peer"}, NEW h \in HostUnits,
-         PrefetchAt(k, src, h)
+  ASSUME IndInv, NEW k \in Keys, NEW src \in {"remote", "peer"}, NEW g \in Groups,
+         NEW h \in HostUnits, PrefetchAt(k, src, g, h)
   PROVE  IndInv'
-  <1> DEFINE t0 == Task("prefetch", k, h, src)
+  <1> DEFINE t0 == PrefetchTask(k, h, src, g)
   <1>1. TypeOK
     BY TypeFacts
   <1>2. /\ t0.kind = "prefetch" /\ t0.k = k /\ t0.h = h /\ t0.src = src /\ t0.held
-        /\ t0.units = {} /\ t0.writes = {} /\ t0.slot = NONE /\ t0.o = NONE /\ t0.to = NONE
-    BY DEF Task
+        /\ t0.units = {} /\ t0.writes = {} /\ t0.slot = NONE /\ t0.o = NONE /\ t0.to = g
+        /\ t0.p = NONE
+        /\ TaskRecord(t0)
+    BY DEF PrefetchTask, Task, TaskRecord
   <1>3. h \in AllUnits /\ h \notin Units /\ h \notin Slots /\ h # NONE
     BY DEF AllUnits
   <1>4. \A v \in AllUnits : v # h => alloc'[v] = alloc[v]
     BY <1>1 DEF PrefetchAt, TypeOK
   <1>5. alloc'[h] = "task"
     BY <1>1, <1>3 DEF PrefetchAt, TypeOK
-  <1>6. Transfers' = Transfers
-    BY <1>2 DEF PrefetchAt, Transfers
+  <1>6. Transfers' = Transfers /\ Crossings' = Crossings
+    BY <1>2 DEF PrefetchAt, Transfers, Crossings
   <1>7. \A v \in AllUnits : Held(v)' <=> Held(v) \/ v = h
     BY <1>2, <1>3 DEF PrefetchAt, Held, HeldIn
   <1>8. TypeInv'
@@ -128,7 +207,7 @@ LEMMA PrefetchInv ==
       BY OwnerTypes, PlaneTypes, RequestTypes, OwnerTypedFrame, PlaneTypedFrame, RequestTypedFrame
          DEF PrefetchAt
     <2>4. WorkTyped'
-      BY <1>2, <1>3, WorkTypes DEF PrefetchAt, WorkTyped, Task
+      BY <1>2, <1>3, WorkTypes DEF PrefetchAt, WorkTyped, TaskRecord
     <2> QED
       BY <2>2, <2>3, <2>4, TypeInvNext
   <1>9. FreeClean'
@@ -202,7 +281,7 @@ LEMMA PrefetchInv ==
       BY <2>2, <2>3
   <1>15. MovingUnmapped' /\ LostOk' /\ TablesMapped' /\ HandoffOk' /\ RequestsOk' /\ NoBad'
     <2>1. UNCHANGED <<deferred, dbt, handoff, lost, inflight, requests, ostate, ogroup, oslot,
-                      table, launched, ncopy, copies, bad>>
+                      table, launched, ncopy, copies, bad, valid>>
       BY DEF PrefetchAt
     <2> QED
       BY <1>6, <2>1, MovingUnmappedFrame, LostOkFrame, TablesMappedFrame, HandoffOkFrame,
@@ -220,8 +299,13 @@ LEMMA PrefetchInv ==
       BY <1>4, <2>1, <2>2, <2>3, <2>4 DEF PrefetchAt, IndInv, BatchesOk, Mem
   <1>17. TrialVisibility'
     BY <1>2 DEF PrefetchAt, IndInv, TrialVisibility, MadeBy
+  <1>18. CrossingsOk' /\ CrossingsPlaced' /\ CopiesPlaced'
+    <2>1. \A u \in Units : alloc'[u] = alloc[u]
+      BY <1>3, <1>4 DEF AllUnits
+    <2> QED
+      BY <1>6, <2>1, TierCrossings DEF PrefetchAt, IndInv
   <1> QED
-    BY <1>8, <1>9, <1>10, <1>11, <1>12, <1>13, <1>14, <1>15, <1>16, <1>17 DEF IndInv
+    BY <1>8, <1>9, <1>10, <1>11, <1>12, <1>13, <1>14, <1>15, <1>16, <1>17, <1>18 DEF IndInv
 
 -----------------------------------------------------------------------------
 (* StoreRemote                                                             *)
@@ -258,14 +342,14 @@ LEMMA StoreRemoteInv ==
   <1>1. /\ t0.kind = "put" /\ t0.k = k /\ t0.h = hcache[k] /\ t0.src = "remote" /\ t0.held
         /\ t0.units = {} /\ t0.writes = {} /\ t0.slot = NONE /\ t0.o = NONE /\ t0.to = NONE
     BY DEF Task
-  <1>2. Transfers' = Transfers /\ TaskUnits' \subseteq TaskUnits
-    BY <1>1 DEF StoreRemoteAt, Transfers, TaskUnits
+  <1>2. Transfers' = Transfers /\ Crossings' = Crossings /\ TaskUnits' \subseteq TaskUnits
+    BY <1>1 DEF StoreRemoteAt, Transfers, Crossings, TaskUnits
   <1>3. \A v \in AllUnits : Held(v)' <=> Held(v)
     BY <1>1 DEF StoreRemoteAt, Held, HeldIn, AllUnits
   <1>4. /\ FreeClean' /\ NoLeak' /\ Outside' /\ Regions' /\ AllocOwner' /\ SharedIff'
         /\ SharedCached' /\ CacheShared' /\ Tables' /\ OwnersOk' /\ DeferredOk' /\ CopiesOk'
         /\ MovingUnmapped' /\ LostOk' /\ TablesMapped' /\ HandoffOk' /\ RequestsOk'
-        /\ BatchesOk' /\ NoBad'
+        /\ BatchesOk' /\ NoBad' /\ CrossingsOk' /\ CrossingsPlaced' /\ CopiesPlaced'
     BY <1>2, <1>3, TierFrame DEF StoreRemoteAt
   <1>5. TypeInv'
     <2>1. remote' \subseteq Keys
@@ -274,8 +358,9 @@ LEMMA StoreRemoteInv ==
             /\ t.units \subseteq AllUnits /\ t.writes \subseteq AllUnits
             /\ t.k \in Keys \cup {NONE} /\ t.h \in HostUnits \cup {NONE}
             /\ t.slot \in Slots \cup {NONE} /\ t.o \in Owners \cup {NONE} /\ t.to \in Groups \cup {NONE}
-            /\ t.src \in {NONE, "remote", "peer"}
-            /\ t.kind = "transfer" <=> t.k = NONE
+            /\ t.p \in Positions \cup {NONE} /\ t.src \in {NONE, "remote", "peer"}
+            /\ t.kind \in {"transfer", "replicate"} <=> t.k = NONE
+            /\ t.kind = "prefetch" => t.to \in Groups
             /\ TaskRecord(t)
       BY <1>1, WorkTypes DEF StoreRemoteAt, WorkTyped, Task, TaskRecord
     <2> QED
@@ -310,29 +395,30 @@ LEMMA StoreRemoteInv ==
 LEMMA RelabelInv ==
   ASSUME IndInv, NEW t \in tasks, t.kind \in {"prefetch", "put"}, NEW x,
          x.kind = t.kind, x.k = t.k, x.h = t.h, x.src = t.src, x.o = t.o, x.to = t.to,
-         x.slot = t.slot, x.held = t.held, x.units = t.units, x.writes = t.writes,
+         x.p = t.p, x.slot = t.slot, x.held = t.held, x.units = t.units, x.writes = t.writes,
          TaskRecord(x),
          tasks' = (tasks \ {t}) \cup {x},
          UNCHANGED <<free, ostate, ogroup, oslot, table, cache, hcache, deferred, copies, ncopy,
                      trial, member, valid, vis, dbt, launched, inflight, handoff, requests, alloc,
                      sharedKey, remote, lost, bad>>
   PROVE  IndInv'
-  <1>1. Transfers' = Transfers /\ TaskUnits' \subseteq TaskUnits
-    BY DEF Transfers, TaskUnits
+  <1>1. Transfers' = Transfers /\ Crossings' = Crossings /\ TaskUnits' \subseteq TaskUnits
+    BY DEF Transfers, Crossings, TaskUnits
   <1>2. \A v \in AllUnits : Held(v)' <=> Held(v)
     BY DEF Held, HeldIn
   <1>3. /\ FreeClean' /\ NoLeak' /\ Outside' /\ Regions' /\ AllocOwner' /\ SharedIff'
         /\ SharedCached' /\ CacheShared' /\ Tables' /\ OwnersOk' /\ DeferredOk' /\ CopiesOk'
         /\ MovingUnmapped' /\ LostOk' /\ TablesMapped' /\ HandoffOk' /\ RequestsOk'
-        /\ BatchesOk' /\ NoBad'
+        /\ BatchesOk' /\ NoBad' /\ CrossingsOk' /\ CrossingsPlaced' /\ CopiesPlaced'
     BY <1>1, <1>2, TierFrame
   <1>4. TypeInv'
     <2>1. \A y \in tasks' :
             /\ y.units \subseteq AllUnits /\ y.writes \subseteq AllUnits
             /\ y.k \in Keys \cup {NONE} /\ y.h \in HostUnits \cup {NONE}
             /\ y.slot \in Slots \cup {NONE} /\ y.o \in Owners \cup {NONE} /\ y.to \in Groups \cup {NONE}
-            /\ y.src \in {NONE, "remote", "peer"}
-            /\ y.kind = "transfer" <=> y.k = NONE
+            /\ y.p \in Positions \cup {NONE} /\ y.src \in {NONE, "remote", "peer"}
+            /\ y.kind \in {"transfer", "replicate"} <=> y.k = NONE
+            /\ y.kind = "prefetch" => y.to \in Groups
             /\ TaskRecord(y)
       BY DEF IndInv, TypeInv, TaskRecord
     <2>2. remote' \subseteq Keys
@@ -382,7 +468,8 @@ LEMMA PeerLostInv ==
   <1>2. TaskRecord(t)
     BY DEF IndInv, TypeInv, TaskRecord
   <1>3. /\ x.kind = t.kind /\ x.k = t.k /\ x.h = t.h /\ x.src = t.src /\ x.o = t.o /\ x.to = t.to
-        /\ x.slot = t.slot /\ x.held = t.held /\ x.units = t.units /\ x.writes = t.writes
+        /\ x.p = t.p /\ x.slot = t.slot /\ x.held = t.held /\ x.units = t.units
+        /\ x.writes = t.writes
         /\ TaskRecord(x)
     BY <1>2 DEF TaskRecord
   <1> QED
@@ -392,7 +479,7 @@ LEMMA DeadlineInv ==
   ASSUME IndInv, NEW t \in tasks, Deadline(t)
   PROVE  IndInv'
   <1> DEFINE x == [t EXCEPT !.expired = TRUE, !.held = On("R9")]
-  <1>1. /\ t.kind # "transfer"
+  <1>1. /\ t.kind \in {"prefetch", "put"}
         /\ tasks' = (tasks \ {t}) \cup {x}
         /\ UNCHANGED <<free, ostate, ogroup, oslot, table, cache, hcache, deferred, copies, ncopy,
                        trial, member, valid, vis, dbt, launched, inflight, handoff, requests, alloc,
@@ -403,7 +490,8 @@ LEMMA DeadlineInv ==
   <1>3. TaskRecord(t)
     BY DEF IndInv, TypeInv, TaskRecord
   <1>4. /\ x.kind = t.kind /\ x.k = t.k /\ x.h = t.h /\ x.src = t.src /\ x.o = t.o /\ x.to = t.to
-        /\ x.slot = t.slot /\ x.held = t.held /\ x.units = t.units /\ x.writes = t.writes
+        /\ x.p = t.p /\ x.slot = t.slot /\ x.held = t.held /\ x.units = t.units
+        /\ x.writes = t.writes
         /\ TaskRecord(x)
     BY <1>2, <1>3 DEF TaskRecord
   <1> QED
@@ -447,13 +535,15 @@ LEMMA PrefetchSole ==
   <1>6. \A d \in deferred : t.h \notin d.units
     <2> SUFFICES ASSUME NEW d \in deferred PROVE t.h \notin d.units
       OBVIOUS
-    <2>1. /\ d.kind \in {"release", "commit", "finish", "transfer"}
+    <2>1. /\ d.kind \in {"release", "commit", "finish", "transfer", "replicate"}
           /\ d.kind = "release" => d.units \subseteq Units \cup Slots
           /\ d.kind \in {"finish", "transfer"} => d.units = {}
           /\ d.kind = "commit" => d.units \subseteq Units
       BY DEF IndInv, DeferredOk
+    <2>2. d.kind = "replicate" => d.units \subseteq Units
+      BY DEF IndInv, CrossingsOk
     <2> QED
-      BY <2>1, <1>3
+      BY <2>1, <2>2, <1>3
   <1>7. \A c \in copies : c.read # t.h /\ c.write # t.h
     <2> SUFFICES ASSUME NEW c \in copies PROVE c.read # t.h /\ c.write # t.h
       OBVIOUS
@@ -465,25 +555,28 @@ LEMMA PrefetchSole ==
           /\ c.fill =>
                \/ c.kind = "load" /\ cache[c.k] = c.write
                \/ c.kind = "restore" /\ c.write \in Slots
+               \/ c.kind = "store" /\ hcache[c.k] = c.write
       BY DEF IndInv, CopiesOk
     <2>2. c.k \in Keys
       BY DEF IndInv, TypeInv
     <2>3. cache[c.k] \in Units \cup {NONE}
       BY <1>1, <2>2 DEF TypeOK
     <2> QED
-      BY <2>1, <2>3, <1>2, <1>3
+      BY <2>1, <2>2, <2>3, <1>2, <1>3, <1>5
   <1>8. \A x \in tasks : x # t => t.h \notin x.units /\ t.h # x.slot /\ t.h # x.h
     <2> SUFFICES ASSUME NEW x \in tasks, x # t PROVE t.h \notin x.units /\ t.h # x.slot /\ t.h # x.h
       OBVIOUS
-    <2>1. /\ x.kind \in {"transfer", "prefetch", "put"}
+    <2>1. /\ x.kind \in {"transfer", "prefetch", "put", "replicate"}
           /\ x.kind = "transfer" => x.units \subseteq Units \cup Slots /\ x.slot \in Slots /\ x.h = NONE
           /\ x.kind \in {"prefetch", "put"} => x.units = {} /\ x.slot = NONE
           /\ x.kind = "put" => hcache[x.k] = x.h
       BY DEF IndInv, TasksOk
     <2>2. x.kind = "put" => x.k \in Keys
       BY DEF IndInv, TypeInv
+    <2>3. x.kind = "replicate" => x.units \subseteq Units /\ x.slot = NONE /\ x.h = NONE
+      BY DEF IndInv, CrossingsOk
     <2> QED
-      BY <2>1, <2>2, <1>2, <1>3, <1>5
+      BY <2>1, <2>2, <2>3, <1>2, <1>3, <1>5
   <1>9. \A b \in inflight : \A y \in b.reads : y[2] # t.h
     <2> SUFFICES ASSUME NEW b \in inflight, NEW y \in b.reads PROVE y[2] # t.h
       OBVIOUS
@@ -504,7 +597,8 @@ LEMMA PrefetchSole ==
 LEMMA TasksWithout ==
   ASSUME IndInv, NEW t \in tasks, t.kind = "prefetch",
          tasks' = tasks \ {t},
-         UNCHANGED <<deferred, copies, oslot, ostate, table, valid>>,
+         UNCHANGED <<deferred, copies, oslot, ostate, table>>,
+         \A u \in Units : valid'[u] = valid[u],
          \A v \in AllUnits : v # t.h => alloc'[v] = alloc[v],
          \A j \in Keys : hcache[j] # NONE => hcache'[j] = hcache[j],
          \A j \in Keys : hcache[j] # NONE => vis'[j].h = vis[j].h
@@ -517,12 +611,19 @@ LEMMA TasksWithout ==
     BY TasksOkEach
   <1>3. y \in tasks /\ y # t
     OBVIOUS
-  <1>4. y.kind = "transfer" => y.slot \in AllUnits /\ y.writes \subseteq AllUnits
-    BY <1>3 DEF IndInv, TasksOk, AllUnits
+  <1>4. y.kind = "transfer" =>
+          /\ y.slot \in AllUnits /\ y.writes \subseteq AllUnits /\ y.writes \subseteq Units
+          /\ TableUnits(y.o) \subseteq Units
+    <2>1. \A q \in Owners, r \in Positions : table[q][r].u \in Units \cup {NONE}
+      BY OwnerTypes DEF OwnerTyped, Empty, Private, Shared
+    <2>2. y.kind = "transfer" => y.o \in Owners
+      BY <1>3 DEF IndInv, TasksOk
+    <2> QED
+      BY <1>3, <2>1, <2>2 DEF IndInv, TasksOk, AllUnits, TableUnits
   <1>5. y.kind = "prefetch" => y.h \in AllUnits
     BY <1>3 DEF IndInv, TasksOk, AllUnits
   <1>6. y.kind = "put" => y.k \in Keys /\ hcache[y.k] # NONE
-    <2>1. y.k \in Keys \cup {NONE} /\ (y.kind = "transfer" <=> y.k = NONE)
+    <2>1. y.k \in Keys \cup {NONE} /\ (y.kind \in {"transfer", "replicate"} <=> y.k = NONE)
       BY <1>3, WorkTypes DEF WorkTyped
     <2>2. y.kind = "put" => hcache[y.k] = y.h /\ y.h \in HostUnits
       BY <1>3 DEF IndInv, TasksOk
@@ -533,7 +634,8 @@ LEMMA TasksWithout ==
   <1> QED
     BY <1>1, <1>3, <1>4, <1>5, <1>6, <1>7 DEF TaskOk, Live, TableUnits, Mem
 
-(* PrefetchEnd(t, found) when it caches the host block.                    *)
+(* PrefetchEnd(t, found) when it caches the host block, valid on the host  *)
+(* parts of the group that asked for it.                                   *)
 LEMMA PrefetchCachedInv ==
   ASSUME IndInv, NEW t \in tasks, t.kind = "prefetch", hcache[t.k] = NONE,
          tasks' = tasks \ {t},
@@ -543,8 +645,9 @@ LEMMA PrefetchCachedInv ==
          sharedKey' = [sharedKey EXCEPT ![t.h] = t.k],
          bad' = bad,
          vis' = [vis EXCEPT ![t.k].h = NONE],
+         valid' = [valid EXCEPT ![t.h] = GroupParts[t.to]],
          UNCHANGED <<ostate, ogroup, oslot, table, cache, deferred, copies, ncopy, trial, member,
-                     valid, dbt, launched, inflight, handoff, requests, remote, lost>>
+                     dbt, launched, inflight, handoff, requests, remote, lost>>
   PROVE  IndInv'
   <1>1. TypeOK
     BY TypeFacts
@@ -574,8 +677,22 @@ LEMMA PrefetchCachedInv ==
       BY DEF IndInv, TypeInv
     <2> QED
       BY <2>1, <1>3
-  <1>7. Transfers' = Transfers /\ TaskUnits' \subseteq TaskUnits
-    BY DEF Transfers, TaskUnits
+  <1>7. Transfers' = Transfers /\ Crossings' = Crossings /\ TaskUnits' \subseteq TaskUnits
+    BY DEF Transfers, Crossings, TaskUnits
+  (* Validity changes on the prefetch's host block alone, which no copy    *)
+  (* touches.                                                              *)
+  <1>20. /\ t.to \in Groups /\ GroupParts[t.to] \subseteq HostParts
+         /\ \A v \in Units \cup HostUnits : v # t.h => valid'[v] = valid[v]
+         /\ \A v \in Units : valid'[v] = valid[v]
+         /\ valid'[t.h] = GroupParts[t.to]
+         /\ \A c \in copies : /\ c.read \in HostUnits => valid'[c.read] = valid[c.read]
+                              /\ c.write \in HostUnits => valid'[c.write] = valid[c.write]
+    <2>1. t.to \in Groups
+      BY WorkTypes DEF WorkTyped
+    <2>2. valid \in [Units \cup HostUnits -> SUBSET (Memories \cup HostParts)]
+      BY <1>1 DEF TypeOK
+    <2> QED
+      BY <1>2, <1>3, <2>1, <2>2
   <1>8. \A v \in AllUnits : Held(v)' <=> Held(v)
     <2>1. \A v \in AllUnits : v # t.h =>
             ((\E j \in Keys : cache'[j] = v \/ hcache'[j] = v) <=> (\E j \in Keys : cache[j] = v \/ hcache[j] = v))
@@ -596,8 +713,12 @@ LEMMA PrefetchCachedInv ==
       BY <1>1, <1>3 DEF TypeOK
     <2>3. \A j \in Keys : vis'[j].d \in Epochs \cup {NONE} /\ vis'[j].h \in Epochs \cup {NONE}
       BY <1>6
+    <2>5. /\ valid' \in [Units \cup HostUnits -> SUBSET (Memories \cup HostParts)]
+          /\ \A u \in Units : valid'[u] \subseteq Memories
+          /\ \A h \in HostUnits : valid'[h] \subseteq HostParts
+      BY <1>1, <1>2, <1>20 DEF TypeOK
     <2>4. TypeOK'
-      BY <1>1, <2>1, <2>2, <2>3 DEF TypeOK
+      BY <1>1, <2>1, <2>2, <2>3, <2>5 DEF TypeOK
     <2> QED
       BY <2>4, <1>6 DEF IndInv, TypeInv, Stamps
   <1>10. FreeClean' /\ NoLeak'
@@ -652,7 +773,7 @@ LEMMA PrefetchCachedInv ==
     <2>4. \A d \in deferred : d.kind = "commit" => d.units \subseteq Units
       BY DEF IndInv, DeferredOk
     <2> QED
-      BY <2>1, <2>2, <2>3, <2>4 DEF IndInv, Tables, OwnersOk, DeferredOk, Live, Mem
+      BY <2>1, <2>2, <2>3, <2>4, <1>20 DEF IndInv, Tables, OwnersOk, DeferredOk, Live, Mem
   <1>15. CopiesOk'
     <2>1. \A c \in copies : alloc'[c.read] = alloc[c.read] /\ alloc'[c.write] = alloc[c.write]
       <3>1. \A c \in copies : c.read \in AllUnits /\ c.write \in AllUnits
@@ -664,19 +785,38 @@ LEMMA PrefetchCachedInv ==
     <2>3. /\ \A c \in copies : c.kind \in {"clone", "load"} => table'[c.o][c.p] = table[c.o][c.p]
           /\ \A c \in copies : c.fill /\ c.kind = "load" =>
                cache'[c.k] = cache[c.k] /\ valid'[c.write] = valid[c.write]
-      OBVIOUS
+      <3>1. \A c \in copies : c.fill /\ c.kind = "load" => c.write \in Units
+        <4> SUFFICES ASSUME NEW c \in copies, c.fill, c.kind = "load" PROVE c.write \in Units
+          OBVIOUS
+        <4>1. cache[c.k] = c.write /\ c.write \in AllUnits /\ c.k \in Keys
+          BY DEF IndInv, CopiesOk, TypeInv
+        <4> QED
+          BY <4>1, <1>1 DEF TypeOK, AllUnits
+      <3> QED
+        BY <3>1, <1>20
+    (* A store fills the host block of a key that has one, not t.k.        *)
+    <2>4. \A c \in copies : c.fill /\ c.kind = "store" => hcache'[c.k] = hcache[c.k]
+      <3> SUFFICES ASSUME NEW c \in copies, c.fill, c.kind = "store"
+                   PROVE  hcache'[c.k] = hcache[c.k]
+        OBVIOUS
+      <3>1. hcache[c.k] = c.write /\ c.write \in HostUnits /\ c.k \in Keys
+        BY DEF IndInv, CopiesOk, TypeInv
+      <3>2. c.k # t.k
+        BY <3>1 DEF NONE
+      <3> QED
+        BY <3>1, <3>2, <1>5
     <2> QED
-      BY <1>7, <2>1, <2>2, <2>3, CopiesStay DEF IndInv
+      BY <1>7, <2>1, <2>2, <2>3, <2>4, CopiesStay DEF IndInv
   <1>16. TasksOk'
     <2>1. \A v \in AllUnits : v # t.h => alloc'[v] = alloc[v]
       BY <1>4
     <2>2. \A j \in Keys : hcache[j] # NONE => hcache'[j] = hcache[j] /\ vis'[j].h = vis[j].h
       BY <1>5, <1>6
     <2> QED
-      BY <2>1, <2>2, TasksWithout
+      BY <2>1, <2>2, <1>20, TasksWithout
   <1>17. MovingUnmapped' /\ LostOk' /\ TablesMapped' /\ HandoffOk' /\ RequestsOk' /\ NoBad'
-    BY <1>7, MovingUnmappedFrame, LostOkFrame, TablesMappedFrame, HandoffOkFrame, RequestsOkFrame,
-       NoBadFrame DEF IndInv
+    BY <1>7, <1>20, MovingUnmappedFrame, LostOkFrame, HostValidMapped, RequestsOkFrame, NoBadFrame
+       DEF IndInv
   <1>18. BatchesOk'
     <2>1. \A b, o, u : Covered(b, o, u)' = Covered(b, o, u)
       BY <1>7, CoveredFrame
@@ -685,16 +825,41 @@ LEMMA PrefetchCachedInv ==
     <2>3. \A b \in inflight : b.writes \subseteq b.reads
       BY DEF IndInv, BatchesOk
     <2> QED
-      BY <2>1, <2>2, <2>3, <1>4 DEF IndInv, BatchesOk, Mem
+      BY <2>1, <2>2, <2>3, <1>4, <1>20 DEF IndInv, BatchesOk, Mem
   <1>19. TrialVisibility'
     <2>1. \A j \in Keys : hcache'[j] # NONE /\ vis'[j].h # NONE => hcache'[j] = hcache[j] /\ vis'[j].h = vis[j].h
       BY <1>5, <1>6
     <2>2. \A j \in Keys : hcache[j] # t.h
       BY <1>2
+    <2>3. \A c \in copies : (c.kind = "store" /\ c.fill) => c.k # t.k
+      <3> SUFFICES ASSUME NEW c \in copies, c.kind = "store", c.fill PROVE c.k # t.k
+        OBVIOUS
+      <3>1. hcache[c.k] = c.write /\ c.write \in HostUnits
+        BY DEF IndInv, CopiesOk
+      <3> QED
+        BY <3>1 DEF NONE
+    <2>4. \A j \in Keys : j # t.k => vis'[j].h = vis[j].h
+      BY <1>6
     <2> QED
-      BY <2>1, <2>2, <1>6 DEF IndInv, TrialVisibility, MadeBy
+      BY <2>1, <2>2, <2>3, <2>4, <1>6 DEF IndInv, TrialVisibility, MadeBy
+  <1>21. CrossingsOk' /\ CrossingsPlaced' /\ CopiesPlaced'
+    <2>1. \A u \in Units : alloc'[u] = alloc[u] /\ valid'[u] = valid[u]
+      BY <1>3, <1>4, <1>20 DEF AllUnits
+    <2>2. \A j \in Keys : vis'[j].d = vis[j].d
+      BY <1>6
+    <2>3. \A c \in copies : /\ c.read \in HostUnits => valid'[c.read] = valid[c.read]
+                            /\ c.write \in HostUnits => valid'[c.write] = valid[c.write]
+      BY <1>20
+    <2>4. CrossingsOk /\ CrossingsPlaced /\ CopiesPlaced
+      BY DEF IndInv
+    <2>5. /\ Transfers' = Transfers /\ Crossings' = Crossings
+          /\ UNCHANGED <<deferred, copies, ostate, ogroup, lost, cache, inflight, trial>>
+      BY <1>7
+    <2> QED
+      BY ONLY <2>1, <2>2, <2>3, <2>4, <2>5, TierCrossings
   <1> QED
-    BY <1>9, <1>10, <1>11, <1>12, <1>13, <1>14, <1>15, <1>16, <1>17, <1>18, <1>19 DEF IndInv
+    BY <1>9, <1>10, <1>11, <1>12, <1>13, <1>14, <1>15, <1>16, <1>17, <1>18, <1>19, <1>21
+       DEF IndInv
 
 (* PrefetchEnd(t, found) when it lets go of the host block.                *)
 LEMMA PrefetchDroppedInv ==
@@ -724,8 +889,8 @@ LEMMA PrefetchDroppedInv ==
   <1>4. /\ \A v \in AllUnits : v # t.h => alloc'[v] = alloc[v] /\ sharedKey'[v] = sharedKey[v]
         /\ alloc'[t.h] = NONE /\ sharedKey'[t.h] = NONE
     BY <1>3
-  <1>5. Transfers' = Transfers /\ TaskUnits' \subseteq TaskUnits
-    BY DEF Transfers, TaskUnits
+  <1>5. Transfers' = Transfers /\ Crossings' = Crossings /\ TaskUnits' \subseteq TaskUnits
+    BY DEF Transfers, Crossings, TaskUnits
   <1>6. \A v \in AllUnits : Held(v)' <=> Held(v) /\ v # t.h
     BY <1>2 DEF Held, HeldIn, AllUnits
   <1>7. TypeInv'
@@ -804,15 +969,20 @@ LEMMA PrefetchDroppedInv ==
       BY <2>1, <2>2, <2>3, <1>4 DEF IndInv, BatchesOk, Mem
   <1>15. TrialVisibility'
     BY DEF IndInv, TrialVisibility, MadeBy
+  <1>16. CrossingsOk' /\ CrossingsPlaced' /\ CopiesPlaced'
+    <2>1. \A u \in Units : alloc'[u] = alloc[u]
+      BY <1>3, <1>4 DEF AllUnits
+    <2> QED
+      BY <1>5, <2>1, TierCrossings DEF IndInv
   <1> QED
-    BY <1>7, <1>8, <1>9, <1>10, <1>11, <1>12, <1>13, <1>14, <1>15 DEF IndInv
+    BY <1>7, <1>8, <1>9, <1>10, <1>11, <1>12, <1>13, <1>14, <1>15, <1>16 DEF IndInv
 
 LEMMA PrefetchEndInv ==
   ASSUME IndInv, NEW t \in tasks, NEW found \in BOOLEAN, PrefetchEnd(t, found)
   PROVE  IndInv'
   <1>1. /\ t.kind = "prefetch" /\ tasks' = tasks \ {t}
         /\ UNCHANGED <<ostate, ogroup, oslot, table, cache, deferred, copies, ncopy, trial, member,
-                       valid, dbt, launched, inflight, handoff, requests, remote, lost>>
+                       dbt, launched, inflight, handoff, requests, remote, lost>>
     BY DEF PrefetchEnd, plane
   <1>2. t.held /\ t.h \in HostUnits
     BY <1>1, PrefetchSole
@@ -823,12 +993,13 @@ LEMMA PrefetchEndInv ==
           /\ sharedKey' = [sharedKey EXCEPT ![t.h] = t.k]
           /\ bad' = bad
           /\ vis' = [vis EXCEPT ![t.k].h = NONE]
+          /\ valid' = [valid EXCEPT ![t.h] = GroupParts[t.to]]
       BY <1>3 DEF PrefetchEnd
     <2> QED
       BY <1>1, <1>3, <2>1, PrefetchCachedInv
   <1>4. CASE ~(found /\ ~t.expired /\ t.held /\ hcache[t.k] = NONE /\ t.ok)
     <2>1. /\ DropWith({t.h}, table, oslot, cache, hcache, deferred, copies, tasks')
-          /\ UNCHANGED <<hcache, bad, vis>>
+          /\ UNCHANGED <<hcache, bad, vis, valid>>
       BY <1>2, <1>4 DEF PrefetchEnd
     <2>2. ~HeldIn(t.h, table, oslot, cache, hcache, deferred, copies, tasks')
       BY <1>1, PrefetchSole DEF HeldIn
@@ -865,22 +1036,23 @@ LEMMA PutEndInv ==
       BY <2>2 DEF PutEnd, IndInv, TypeInv
     <2> QED
       BY <2>1, <2>2
-  <1>4. Transfers' = Transfers /\ TaskUnits' \subseteq TaskUnits
-    BY <1>1 DEF Transfers, TaskUnits
+  <1>4. Transfers' = Transfers /\ Crossings' = Crossings /\ TaskUnits' \subseteq TaskUnits
+    BY <1>1 DEF Transfers, Crossings, TaskUnits
   <1>5. \A v \in AllUnits : Held(v)' <=> Held(v)
     BY <1>1, <1>2 DEF Held, HeldIn, AllUnits
   <1>6. /\ FreeClean' /\ NoLeak' /\ Outside' /\ Regions' /\ AllocOwner' /\ SharedIff'
         /\ SharedCached' /\ CacheShared' /\ Tables' /\ OwnersOk' /\ DeferredOk' /\ CopiesOk'
         /\ MovingUnmapped' /\ LostOk' /\ TablesMapped' /\ HandoffOk' /\ RequestsOk'
-        /\ BatchesOk' /\ NoBad'
+        /\ BatchesOk' /\ NoBad' /\ CrossingsOk' /\ CrossingsPlaced' /\ CopiesPlaced'
     BY <1>1, <1>3, <1>4, <1>5, TierFrame
   <1>7. TypeInv'
     <2>1. \A y \in tasks' :
             /\ y.units \subseteq AllUnits /\ y.writes \subseteq AllUnits
             /\ y.k \in Keys \cup {NONE} /\ y.h \in HostUnits \cup {NONE}
             /\ y.slot \in Slots \cup {NONE} /\ y.o \in Owners \cup {NONE} /\ y.to \in Groups \cup {NONE}
-            /\ y.src \in {NONE, "remote", "peer"}
-            /\ y.kind = "transfer" <=> y.k = NONE
+            /\ y.p \in Positions \cup {NONE} /\ y.src \in {NONE, "remote", "peer"}
+            /\ y.kind \in {"transfer", "replicate"} <=> y.k = NONE
+            /\ y.kind = "prefetch" => y.to \in Groups
             /\ TaskRecord(y)
       BY <1>1 DEF IndInv, TypeInv, TaskRecord
     <2> QED
@@ -896,17 +1068,18 @@ LEMMA PutEndInv ==
 (* The group                                                               *)
 
 Next9 ==
-  \/ \E k \in Keys : Prefetch(k, "remote") \/ Prefetch(k, "peer") \/ StoreRemote(k)
+  \/ \E k \in Keys, g \in Groups : Prefetch(k, "remote", g) \/ Prefetch(k, "peer", g)
+  \/ \E k \in Keys : StoreRemote(k)
   \/ \E t \in tasks : PeerLost(t) \/ Deadline(t)
   \/ \E t \in tasks, ok \in BOOLEAN : PrefetchEnd(t, ok) \/ PutEnd(t, ok)
 
 THEOREM Step9 == IndInv /\ Next9 => IndInv'
   <1> SUFFICES ASSUME IndInv, Next9 PROVE IndInv'
     OBVIOUS
-  <1>1. CASE \E k \in Keys : Prefetch(k, "remote") \/ Prefetch(k, "peer")
-    <2>1. PICK k \in Keys, src \in {"remote", "peer"} : Prefetch(k, src)
+  <1>1. CASE \E k \in Keys, g \in Groups : Prefetch(k, "remote", g) \/ Prefetch(k, "peer", g)
+    <2>1. PICK k \in Keys, g \in Groups, src \in {"remote", "peer"} : Prefetch(k, src, g)
       BY <1>1
-    <2>2. PICK h \in HostUnits : PrefetchAt(k, src, h)
+    <2>2. PICK h \in HostUnits : PrefetchAt(k, src, g, h)
       BY <2>1, PrefetchPick
     <2> QED
       BY <2>2, PrefetchInv

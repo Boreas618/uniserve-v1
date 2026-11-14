@@ -7,111 +7,44 @@
 EXTENDS KvInductive, KvProof, KvFrame, TLAPS
 
 USE Sizes, Design
+(* A reader's row and the readers of an owner's class are read through.   *)
+USE DEF ReaderRow, ReadersOf
 
------------------------------------------------------------------------------
-(* What every action of the group shares: the request leaves the requests *)
-(* under way, and the completions it names leave those not handed on.     *)
-
-(* A stamp no batch in flight has passed is not reached.                   *)
-LEMMA NotReached ==
-  ASSUME IndInv, NEW after \in Stamps, NEW b \in inflight, after[b.g] >= b.seq
-  PROVE  ~Reached(after)
-  <1>1. b.g \in Groups /\ b.seq \in Nat /\ after[b.g] \in Nat
-    BY DEF IndInv, BatchesOk, Stamps
-  <1> QED
-    BY <1>1 DEF Reached
-
-(* What a submitted request says of the executors' tables: no group still *)
-(* holds a row it takes away, nor may write the row it commits.            *)
-LEMMA Submitted ==
-  ASSUME IndInv, NEW r \in requests, r.sg \subseteq r.by, r.kind # "finish"
-  PROVE  /\ r.o \in Owners
-         /\ \A g \in Groups, p \in Rows : TakesRow(r, r.o, p) => dbt[g][r.o][p].u = NONE
-         /\ \A g \in Groups, p \in Rows :
-              (CommitsRow(r, r.o, p) /\ dbt[g][r.o][p].u # NONE) => ~dbt[g][r.o][p].w
-         /\ \A b \in inflight : b.g \in r.sg => b.g \in r.by
-  <1>1. r.o \in Owners
-    BY RequestTypes DEF RequestTyped
-  <1>2. \A g \in Groups, p \in Rows :
-          (dbt[g][r.o][p].u # NONE /\ (TakesRow(r, r.o, p) \/ CommitsRow(r, r.o, p))) =>
-              /\ g \in r.sg
-              /\ g \in r.by => CommitsRow(r, r.o, p) /\ ~dbt[g][r.o][p].w
-    BY DEF IndInv, RequestsOk
-  <1>3. \A p : ~(TakesRow(r, r.o, p) /\ CommitsRow(r, r.o, p))
-    BY DEF TakesRow, CommitsRow
-  <1> QED
-    BY <1>1, <1>2, <1>3
-
-(* With r gone from the requests and the completions it names dropped,     *)
-(* RequestsOk and LostOk hold, a completion kept is named as before, and a *)
-(* batch's write stays covered by every commit request under way.          *)
-LEMMA TakeCommon ==
-  ASSUME IndInv, NEW r \in requests, requests' = requests \ {r},
-         handoff' \subseteq handoff, \A h \in handoff' : ~Names(r, h),
-         UNCHANGED <<dbt, launched, inflight, ncopy, copies, lost>>
-  PROVE  /\ RequestsOk' /\ LostOk'
-         /\ \A h \in handoff' : (\E x \in requests' : Names(x, h)) = (\E x \in requests : Names(x, h))
-         /\ \A b \in inflight, o \in Owners, p \in Positions :
-              (\A x \in requests :
-                 CommitsRow(x, o, p) => b.g \in x.sg /\ (b.g \in x.by => x.after[b.g] >= b.seq))
-              => \A x \in requests' :
-                   CommitsRow(x, o, p) => b.g \in x.sg /\ (b.g \in x.by => x.after[b.g] >= b.seq)
-  <1>1. RequestsOk'
-    BY DEF IndInv, RequestsOk
-  <1>2. LostOk'
-    BY DEF IndInv, LostOk
-  <1> QED
-    BY <1>1, <1>2
-
-(* The request is refused, or taken without effect on the buffer pool.    *)
-LEMMA TakeIdle ==
-  ASSUME IndInv, NEW r \in requests, requests' = requests \ {r},
-         handoff' \subseteq handoff, \A h \in handoff' : ~Names(r, h),
-         UNCHANGED <<pool, dbt, launched, inflight, alloc, sharedKey, rare>>
-  PROVE  IndInv'
-  <1>1. UNCHANGED <<free, ostate, ogroup, oslot, table, cache, hcache, deferred, copies, ncopy,
-                    tasks, valid, vis, trial, member, dbt, launched, inflight, alloc, sharedKey,
-                    remote, lost, bad>>
-    BY DEF pool, rare
-  <1>2. TypeInv'
-    <2>1. RequestTyped'
-      BY <1>1, RequestTypes DEF RequestTyped
+(* Taking a request keeps CrossingsOk when it adds no crossing, leaves the *)
+(* tasks, copies, groups, caches and validity alone, attaches no owner,     *)
+(* starts no transfer of an owner whose crossing waits or runs, and keeps  *)
+(* the allocation of what a crossing holds.                                *)
+LEMMA CrossingsTake ==
+  ASSUME CrossingsOk,
+         \A d \in deferred' : d.kind = "replicate" => d \in deferred,
+         UNCHANGED <<tasks, copies, ogroup, lost, cache, vis, valid, trial>>,
+         \A o \in Owners : ostate[o] # "new" => ostate'[o] # "new",
+         \A o \in Owners :
+           (\/ \E d \in deferred : d.kind = "replicate" /\ d.o = o
+            \/ \E t \in tasks : t.kind = "replicate" /\ t.o = o) => (Moving(o)' => Moving(o)),
+         \A d \in deferred : d.kind = "replicate" => \A u \in d.units : alloc'[u] = alloc[u],
+         \A t \in tasks : t.kind = "replicate" => \A u \in t.writes : alloc'[u] = alloc[u]
+  PROVE  CrossingsOk'
+  <1>1. \A d \in deferred' : CrossWaitOk(d)'
+    <2> SUFFICES ASSUME NEW d \in deferred', d.kind = "replicate" PROVE CrossWaitOk(d)'
+      BY DEF CrossWaitOk
+    <2>1. d \in deferred /\ CrossWaitOk(d)
+      BY CrossingsOkEach
+    <2>2. ~Moving(d.o)'
+      BY <2>1 DEF CrossWaitOk
     <2> QED
-      BY <1>1, <2>1, UnitTypes, OwnerTypes, PlaneTypes, WorkTypes, UnitTypedFrame,
-         OwnerTypedFrame, PlaneTypedFrame, WorkTypedFrame, TypeInvNext
-  <1>3. /\ FreeClean' /\ NoLeak' /\ Outside' /\ Regions' /\ AllocOwner' /\ SharedIff'
-        /\ SharedCached' /\ CacheShared' /\ Tables' /\ OwnersOk' /\ DeferredOk' /\ CopiesOk'
-        /\ TasksOk' /\ TrialVisibility' /\ NoBad' /\ TablesMapped'
-    BY <1>1, TransfersFrame, FreeCleanFrame, NoLeakFrame, OutsideFrame, RegionsFrame,
-       AllocOwnerFrame, SharedIffFrame, SharedCachedFrame, CacheSharedFrame, TablesFrame,
-       OwnersOkFrame, DeferredOkFrame, CopiesOkFrame, TasksOkFrame, TrialVisibilityFrame,
-       NoBadFrame, TablesMappedFrame DEF IndInv
-  <1>4. RequestsOk' /\ LostOk'
-    BY <1>1, TakeCommon
-  <1>5. MovingUnmapped'
-    BY <1>1 DEF IndInv, MovingUnmapped
-  <1>6. HandoffOk'
-    <2>1. \A h \in handoff' : (\E x \in requests' : Names(x, h)) = (\E x \in requests : Names(x, h))
-      BY <1>1, TakeCommon
+      BY <2>1, <2>2 DEF CrossWaitOk, MadeBy
+  <1>2. \A t \in tasks' : CrossTaskOk(t)'
+    <2> SUFFICES ASSUME NEW t \in tasks, t.kind = "replicate" PROVE CrossTaskOk(t)'
+      BY DEF CrossTaskOk
+    <2>1. CrossTaskOk(t)
+      BY CrossingsOkEach
+    <2>2. ~Moving(t.o)'
+      BY <2>1 DEF CrossTaskOk
     <2> QED
-      BY <1>1, <2>1 DEF IndInv, HandoffOk, Live, HoldsAt
-  <1>7. BatchesOk'
-    <2>1. SUFFICES ASSUME NEW b \in inflight PROVE BatchOk(b)'
-      BY <1>1, BatchesOkEach
-    <2>2. BatchOk(b)
-      BY BatchesOkEach DEF IndInv
-    <2>3. \A o \in Owners : \A u : Covered(b, o, u) => Covered(b, o, u)'
-      BY <1>1 DEF Covered, Live, HoldsAt
-    <2>4. \A o \in Owners, p \in Positions :
-            (\A x \in requests :
-               CommitsRow(x, o, p) => b.g \in x.sg /\ (b.g \in x.by => x.after[b.g] >= b.seq))
-            => \A x \in requests' :
-                 CommitsRow(x, o, p) => b.g \in x.sg /\ (b.g \in x.by => x.after[b.g] >= b.seq)
-      BY <1>1, TakeCommon
-    <2> QED
-      BY <1>1, <2>2, <2>3, <2>4 DEF BatchOk, Mem
+      BY <2>1, <2>2 DEF CrossTaskOk, Mem
   <1> QED
-    BY <1>2, <1>3, <1>4, <1>5, <1>6, <1>7 DEF IndInv
+    BY <1>1, <1>2, CrossingsOkEach
 
 -----------------------------------------------------------------------------
 (* TakeFinish                                                              *)
@@ -147,7 +80,10 @@ LEMMA TakeFinish_Inv ==
           /\ nd.o = NONE /\ nd.p = NONE /\ nd.k = NONE /\ nd.g = NONE /\ nd.to = NONE
       BY DEF FinishWait
     <2>2. \A u : Held(u)' = Held(u)
-      BY <1>1, <1>4, <2>1, Zenon DEF Held, HeldIn
+      <3>1. \A u : (\E d \in deferred' : u \in d.units) = (\E d \in deferred : u \in d.units)
+        BY <1>4, <2>1
+      <3> QED
+        BY <1>1, <3>1 DEF Held, HeldIn
     <2>3. \A o \in Owners : Moving(o)' = Moving(o)
       BY <1>1, <1>4, <2>1 DEF Moving
     <2>4. TypeInv'
@@ -203,6 +139,13 @@ LEMMA TakeFinish_Inv ==
           BY <1>1, <1>4, <2>1, <4>2 DEF TaskOk, Live, TableUnits, Mem
       <3> QED
         BY <3>1, <3>2
+    <2>11. CrossingsOk' /\ CopiesPlaced' /\ CrossingsPlaced'
+      <3>1. CrossingsOk'
+        BY <1>1, <1>4, <2>1, <2>3, CrossingsTake DEF IndInv
+      <3>2. CopiesPlaced' /\ CrossingsPlaced'
+        BY <1>1, TransfersFrame, CopiesPlacedFrame, CrossingsPlacedFrame DEF IndInv
+      <3> QED
+        BY <3>1, <3>2
     <2>9. MovingUnmapped' /\ TablesMapped' /\ HandoffOk'
       <3>1. \A h \in handoff : (\E x \in requests' : Names(x, h)) = (\E x \in requests : Names(x, h))
         BY <1>1, <1>2
@@ -221,14 +164,14 @@ LEMMA TakeFinish_Inv ==
         BY <1>1, <1>4, <2>1 DEF Covered, Live, HoldsAt
       <3>4. \A o \in Owners, p \in Positions :
               (\A x \in requests :
-                 CommitsRow(x, o, p) => b.g \in x.sg /\ (b.g \in x.by => x.after[b.g] >= b.seq))
+                 FreezesRow(x, o, p) => b.g \in x.sg /\ (b.g \in x.by => x.after[b.g] >= b.seq))
               => \A x \in requests' :
-                   CommitsRow(x, o, p) => b.g \in x.sg /\ (b.g \in x.by => x.after[b.g] >= b.seq)
+                   FreezesRow(x, o, p) => b.g \in x.sg /\ (b.g \in x.by => x.after[b.g] >= b.seq)
         BY <1>1, <1>2, TakeCommon
       <3> QED
         BY <1>1, <1>4, <2>1, <2>2, <3>2, <3>3, <3>4 DEF BatchOk, Mem, IndInv, FreeClean
     <2> QED
-      BY <2>4, <2>5, <2>6, <2>7, <2>8, <2>9, <2>10 DEF IndInv
+      BY <2>4, <2>5, <2>6, <2>7, <2>8, <2>9, <2>10, <2>11 DEF IndInv
   <1> QED
     BY <1>1, <1>3, <1>4
 
@@ -249,7 +192,7 @@ LEMMA TakeTransfer_Inv ==
         /\ handoff' = Kept(r)
         /\ \/ UNCHANGED deferred
            \/ /\ Live(r.o) /\ OwnerEpoch[r.o] = r.e /\ GroupEpoch[r.to] = r.e
-              /\ ~Moving(r.o) /\ ~\E c \in copies : c.o = r.o
+              /\ ~Moving(r.o) /\ ~Replicating(r.o) /\ ~\E c \in copies : c.o = r.o
               /\ deferred' = deferred \cup {TransferWait(r)}
         /\ UNCHANGED <<free, ostate, ogroup, oslot, table, cache, hcache, copies, ncopy, tasks,
                        trial, member, valid, vis, dbt, launched, inflight, alloc, sharedKey,
@@ -261,7 +204,7 @@ LEMMA TakeTransfer_Inv ==
   <1>3. CASE UNCHANGED deferred
     BY <1>1, <1>2, <1>3, TakeIdle DEF pool, rare
   <1>4. CASE /\ Live(r.o) /\ OwnerEpoch[r.o] = r.e /\ GroupEpoch[r.to] = r.e
-             /\ ~Moving(r.o) /\ ~\E c \in copies : c.o = r.o
+             /\ ~Moving(r.o) /\ ~Replicating(r.o) /\ ~\E c \in copies : c.o = r.o
              /\ deferred' = deferred \cup {TransferWait(r)}
     <2> DEFINE nd == TransferWait(r)
     <2>0. r.o \in Owners /\ r.to \in Groups /\ r.after \in Stamps
@@ -270,7 +213,10 @@ LEMMA TakeTransfer_Inv ==
           /\ nd.to = r.to /\ nd.p = NONE /\ nd.k = NONE /\ nd.c = 0 /\ nd.g = NONE
       BY DEF TransferWait
     <2>2. \A u : Held(u)' = Held(u)
-      BY <1>1, <1>4, <2>1, Zenon DEF Held, HeldIn
+      <3>1. \A u : (\E d \in deferred' : u \in d.units) = (\E d \in deferred : u \in d.units)
+        BY <1>4, <2>1
+      <3> QED
+        BY <1>1, <3>1 DEF Held, HeldIn
     <2>3. \A o \in Owners : Moving(o)' = (Moving(o) \/ o = r.o)
       BY <1>1, <1>4, <2>1 DEF Moving
     <2>4. /\ \A g \in Groups, p \in Rows : dbt[g][r.o][p].u = NONE
@@ -326,6 +272,17 @@ LEMMA TakeTransfer_Inv ==
           BY <1>1, <1>4, <2>1, <2>6, <4>2 DEF TaskOk, Live, TableUnits, Mem
       <3> QED
         BY <3>1, <3>2
+    <2>16. CrossingsOk' /\ CopiesPlaced' /\ CrossingsPlaced'
+      <3>1. \A o \in Owners :
+              (\/ \E d \in deferred : d.kind = "replicate" /\ d.o = o
+               \/ \E t \in tasks : t.kind = "replicate" /\ t.o = o) => o # r.o
+        BY <1>4 DEF Replicating
+      <3>2. CrossingsOk'
+        BY <1>1, <1>4, <2>1, <2>3, <3>1, CrossingsTake DEF IndInv
+      <3>3. CopiesPlaced' /\ CrossingsPlaced'
+        BY <1>1, TransfersFrame, CopiesPlacedFrame, CrossingsPlacedFrame DEF IndInv
+      <3> QED
+        BY <3>2, <3>3
     <2>13. MovingUnmapped'
       <3>1. \A x \in deferred : x.kind = "transfer" => x.o # r.o
         BY <1>4 DEF Moving
@@ -341,7 +298,7 @@ LEMMA TakeTransfer_Inv ==
       <3>3. \A o \in Owners : \A u : Covered(b, o, u) => Covered(b, o, u)'
         <4> SUFFICES ASSUME NEW o \in Owners, NEW u, Covered(b, o, u) PROVE Covered(b, o, u)'
           OBVIOUS
-        <4>1. CASE /\ Live(o) /\ ogroup[o] = b.g
+        <4>1. CASE /\ Live(o) /\ (ogroup[o] = b.g \/ b.g \in ReadersOf(o))
                    /\ \E p \in Rows :
                         /\ HoldsAt(o, p, u)
                         /\ \A x \in requests :
@@ -359,14 +316,14 @@ LEMMA TakeTransfer_Inv ==
           BY <4>1, <4>2 DEF Covered
       <3>4. \A o \in Owners, p \in Positions :
               (\A x \in requests :
-                 CommitsRow(x, o, p) => b.g \in x.sg /\ (b.g \in x.by => x.after[b.g] >= b.seq))
+                 FreezesRow(x, o, p) => b.g \in x.sg /\ (b.g \in x.by => x.after[b.g] >= b.seq))
               => \A x \in requests' :
-                   CommitsRow(x, o, p) => b.g \in x.sg /\ (b.g \in x.by => x.after[b.g] >= b.seq)
+                   FreezesRow(x, o, p) => b.g \in x.sg /\ (b.g \in x.by => x.after[b.g] >= b.seq)
         BY <1>1, <1>2, TakeCommon
       <3> QED
         BY <1>1, <1>4, <2>1, <2>2, <3>2, <3>3, <3>4 DEF BatchOk, Mem, IndInv, FreeClean
     <2> QED
-      BY <2>8, <2>9, <2>10, <2>11, <2>12, <2>13, <2>14, <2>15 DEF IndInv
+      BY <2>8, <2>9, <2>10, <2>11, <2>12, <2>13, <2>14, <2>15, <2>16 DEF IndInv
   <1> QED
     BY <1>1, <1>3, <1>4
 
@@ -453,8 +410,27 @@ LEMMA TakeCommit_Inv ==
     <2>5. \A x : Held(x)' = Held(x)
       <3>1. \A x : (\E d \in deferred' : x \in d.units) = ((\E d \in deferred : x \in d.units) \/ x = u)
         BY <1>4, <2>1, <2>3
+      <3>2. \A x : HeldIn(x, table, oslot, cache, hcache, deferred', copies, tasks)
+                     = (HeldIn(x, table, oslot, cache, hcache, deferred, copies, tasks) \/ x = u)
+        BY <3>1 DEF HeldIn
+      <3>3. HeldIn(u, table, oslot, cache, hcache, deferred, copies, tasks)
+        BY <2>2 DEF HeldIn
+      <3>4. \A x : Held(x)' = HeldIn(x, table, oslot, cache, hcache, deferred', copies, tasks)
+        BY <1>1 DEF Held
+      <3>5. \A x : Held(x) = HeldIn(x, table, oslot, cache, hcache, deferred, copies, tasks)
+        BY DEF Held
+      <3> SUFFICES ASSUME NEW x PROVE Held(x)' = Held(x)
+        OBVIOUS
+      <3>6. CASE x = u
+        BY <3>1, <3>3, <3>4, <3>5, <3>6 DEF HeldIn
+      <3>7. CASE x # u
+        <4>1. HeldIn(x, table, oslot, cache, hcache, deferred', copies, tasks)
+                = HeldIn(x, table, oslot, cache, hcache, deferred, copies, tasks)
+          BY <3>1, <3>7 DEF HeldIn
+        <4> QED
+          BY <3>4, <3>5, <4>1
       <3> QED
-        BY <1>1, <2>2, <3>1, Zenon DEF Held, HeldIn
+        BY <3>6, <3>7
     <2>6. \A o \in Owners : Moving(o)' = Moving(o)
       BY <1>1, <1>4, <2>1, <2>3 DEF Moving
     <2>7. \A h \in handoff' : (\E x \in requests' : Names(x, h)) = (\E x \in requests : Names(x, h))
@@ -511,6 +487,13 @@ LEMMA TakeCommit_Inv ==
         BY <3>1, <3>2
     <2>13. MovingUnmapped'
       BY <1>1, <1>2, <1>4, <2>1, <2>3 DEF IndInv, MovingUnmapped
+    <2>17. CrossingsOk' /\ CopiesPlaced' /\ CrossingsPlaced'
+      <3>1. CrossingsOk'
+        BY <1>1, <1>4, <2>1, <2>3, <2>6, CrossingsTake DEF IndInv
+      <3>2. CopiesPlaced' /\ CrossingsPlaced'
+        BY <1>1, TransfersFrame, CopiesPlacedFrame, CrossingsPlacedFrame DEF IndInv
+      <3> QED
+        BY <3>1, <3>2
     (* No executor may write the block and no completion kept gives the    *)
     (* right to: the request named every such row.                         *)
     <2>14. TablesMapped'
@@ -525,7 +508,7 @@ LEMMA TakeCommit_Inv ==
         <4>2. p = r.p
           BY <2>2, <2>4, <4>1
         <4> QED
-          BY <1>1, <1>4, <2>2, <2>4, <4>2, Submitted DEF CommitsRow
+          BY <1>1, <1>4, <2>2, <2>4, <4>2, Submitted DEF FreezesRow
       <3>2. \A g \in Groups, o \in Owners, p \in Rows :
               (dbt[g][o][p].u = u /\ dbt[g][o][p].u # NONE) => o = r.o
         BY <2>4, OwnerTypes DEF IndInv, TablesMapped, HoldsAt, Rows, OwnerTyped
@@ -555,9 +538,9 @@ LEMMA TakeCommit_Inv ==
         BY <1>1, <1>4, <2>1, <2>3 DEF Covered, Live, HoldsAt
       <3>4. \A o \in Owners, p \in Positions :
               (\A x \in requests :
-                 CommitsRow(x, o, p) => b.g \in x.sg /\ (b.g \in x.by => x.after[b.g] >= b.seq))
+                 FreezesRow(x, o, p) => b.g \in x.sg /\ (b.g \in x.by => x.after[b.g] >= b.seq))
               => \A x \in requests' :
-                   CommitsRow(x, o, p) => b.g \in x.sg /\ (b.g \in x.by => x.after[b.g] >= b.seq)
+                   FreezesRow(x, o, p) => b.g \in x.sg /\ (b.g \in x.by => x.after[b.g] >= b.seq)
         BY <1>1, <1>2, TakeCommon
       (* A batch that writes the block was covered by the request.         *)
       <3>5. \A y \in b.writes : y[2] = u => r.after[b.g] >= b.seq
@@ -565,15 +548,15 @@ LEMMA TakeCommit_Inv ==
           OBVIOUS
         <4>1. y[1] = r.o
           BY <2>4, <3>2 DEF BatchOk
-        <4>2. CommitsRow(r, y[1], r.p) /\ table[y[1]][r.p].u = y[2]
-          BY <1>1, <1>4, <4>1 DEF CommitsRow
+        <4>2. FreezesRow(r, y[1], r.p) /\ table[y[1]][r.p].u = y[2]
+          BY <1>1, <1>4, <4>1 DEF FreezesRow
         <4> QED
           BY <1>1, <2>2, <3>2, <4>2 DEF BatchOk
       <3> QED
         BY <1>1, <1>4, <2>1, <2>3, <2>5, <3>2, <3>3, <3>4, <3>5 DEF BatchOk, Mem, IndInv,
                                                                       FreeClean
     <2> QED
-      BY <2>8, <2>9, <2>10, <2>11, <2>12, <2>13, <2>14, <2>15, <2>16 DEF IndInv
+      BY <2>8, <2>9, <2>10, <2>11, <2>12, <2>13, <2>14, <2>15, <2>16, <2>17 DEF IndInv
   <1> QED
     BY <1>1, <1>3, <1>4
 
@@ -757,8 +740,21 @@ LEMMA TakeRelease_Taken ==
           BY <1>5, <3>1
         <4>2. \A x \in U : \E o \in Owners, p \in Positions : table[o][p].u = x
           BY <1>4, <1>6
+        <4>3. \A x \in AllUnits :
+                HeldIn(x, table', oslot, cache, hcache, deferred', copies, tasks)
+                  = HeldIn(x, table, oslot, cache, hcache, deferred, copies, tasks)
+          <5> SUFFICES ASSUME NEW x \in AllUnits
+                       PROVE  HeldIn(x, table', oslot, cache, hcache, deferred', copies, tasks)
+                                = HeldIn(x, table, oslot, cache, hcache, deferred, copies, tasks)
+            OBVIOUS
+          <5>1. CASE x \in U
+            BY <4>1, <4>2, <5>1 DEF HeldIn
+          <5>2. CASE x \notin U
+            BY <1>6, <4>1, <5>2 DEF HeldIn
+          <5> QED
+            BY <5>1, <5>2
         <4> QED
-          BY <1>6, <2>1, <4>1, <4>2, Zenon DEF Held, HeldIn
+          BY <2>1, <4>3 DEF Held
       <3>3. UnitTyped'
         BY <1>0, <2>2 DEF UnitTyped
       <3>4. WorkTyped'
@@ -782,8 +778,18 @@ LEMMA TakeRelease_Taken ==
             /\ G \subseteq AllUnits
         <4>1. \A x \in U : Held(x)
           BY <1>4, <1>6 DEF Held, HeldIn
+        <4>2. \A x \in AllUnits :
+                HeldIn(x, table', oslot, cache, hcache, deferred, copies, tasks)
+                  => HeldIn(x, table, oslot, cache, hcache, deferred, copies, tasks)
+          BY <1>6 DEF HeldIn
+        <4>3. \A x \in AllUnits :
+                HeldIn(x, table, oslot, cache, hcache, deferred, copies, tasks)
+                  => HeldIn(x, table', oslot, cache, hcache, deferred, copies, tasks) \/ x \in U
+          BY <1>6 DEF HeldIn
+        <4>4. U \subseteq AllUnits
+          BY <1>4 DEF AllUnits
         <4> QED
-          BY <1>4, <1>6, <2>1, <2>3, <3>1, <4>1, Zenon DEF Held, HeldIn, AllUnits
+          BY <2>1, <2>3, <3>1, <4>1, <4>2, <4>3, <4>4 DEF Held
       <3>3. /\ \A v \in AllUnits : alloc'[v] = IF v \in G THEN NONE ELSE alloc[v]
             /\ \A v \in AllUnits : sharedKey'[v] = IF v \in G THEN NONE ELSE sharedKey[v]
         BY <3>1 DEF Reset
@@ -911,6 +917,35 @@ LEMMA TakeRelease_Taken ==
       BY <2>4, <2>5, <2>6
   <1>15. TrialVisibility' /\ NoBad'
     BY <1>1, <1>4 DEF IndInv, TrialVisibility, MadeBy, NoBad, Empty, Shared
+  <1>17. CrossingsOk' /\ CopiesPlaced' /\ CrossingsPlaced'
+    <2>1. \A d \in deferred : d.kind = "replicate" => \A u \in d.units : alloc'[u] = alloc[u]
+      <3> SUFFICES ASSUME NEW d \in deferred, d.kind = "replicate", NEW u \in d.units
+                   PROVE  alloc'[u] = alloc[u]
+        OBVIOUS
+      <3>1. u \in AllUnits /\ d \in deferred'
+        BY <1>0, <1>7 DEF WorkTyped
+      <3>2. Held(u)'
+        BY <3>1 DEF Held, HeldIn
+      <3> QED
+        BY <1>7, <3>1, <3>2
+    <2>2. \A t \in tasks : t.kind = "replicate" => \A u \in t.writes : alloc'[u] = alloc[u]
+      <3> SUFFICES ASSUME NEW t \in tasks, t.kind = "replicate", NEW u \in t.writes
+                   PROVE  alloc'[u] = alloc[u]
+        OBVIOUS
+      <3>1. u \in t.units /\ u \in AllUnits /\ t.held
+        BY <1>0, TasksHeld DEF IndInv, CrossingsOk, WorkTyped
+      <3>2. Held(u)'
+        BY <3>1 DEF Held, HeldIn
+      <3> QED
+        BY <1>7, <3>1, <3>2
+    <2>3. \A o \in Owners : Moving(o)' => Moving(o)
+      BY <1>5, <1>7 DEF Moving
+    <2>4. CrossingsOk'
+      BY <1>1, <1>4, <1>5, <1>7, <2>1, <2>2, <2>3, CrossingsTake DEF IndInv
+    <2>5. CopiesPlaced' /\ CrossingsPlaced'
+      BY <1>1, TransfersFrame, CopiesPlacedFrame, CrossingsPlacedFrame DEF IndInv
+    <2> QED
+      BY <2>4, <2>5
   <1>16. BatchesOk'
     <2>1. SUFFICES ASSUME NEW b \in inflight PROVE BatchOk(b)'
       BY <1>1, BatchesOkEach
@@ -918,7 +953,7 @@ LEMMA TakeRelease_Taken ==
       BY BatchesOkEach DEF IndInv
     <2>3. ASSUME NEW o \in Owners, NEW u, Covered(b, o, u)
           PROVE  Covered(b, o, u)' /\ Held(u)'
-      <3>1. CASE /\ Live(o) /\ ogroup[o] = b.g
+      <3>1. CASE /\ Live(o) /\ (ogroup[o] = b.g \/ b.g \in ReadersOf(o))
                  /\ \E p \in Rows :
                       /\ HoldsAt(o, p, u)
                       /\ \A x \in requests :
@@ -965,16 +1000,16 @@ LEMMA TakeRelease_Taken ==
       BY <1>7, <2>3, <2>4
     <2>6. \A o \in Owners, p \in Positions :
             (\A x \in requests :
-               CommitsRow(x, o, p) => b.g \in x.sg /\ (b.g \in x.by => x.after[b.g] >= b.seq))
+               FreezesRow(x, o, p) => b.g \in x.sg /\ (b.g \in x.by => x.after[b.g] >= b.seq))
             => \A x \in requests' :
-                 CommitsRow(x, o, p) => b.g \in x.sg /\ (b.g \in x.by => x.after[b.g] >= b.seq)
+                 FreezesRow(x, o, p) => b.g \in x.sg /\ (b.g \in x.by => x.after[b.g] >= b.seq)
       BY <1>1, TakeCommon DEF Kept
     <2>7. \A y \in b.writes, p \in Positions : table'[y[1]][p].u = y[2] => table[y[1]][p].u = y[2]
       BY <1>4, <2>2, <2>4 DEF BatchOk, Empty, AllUnits
     <2> QED
       BY <1>1, <1>5, <1>7, <2>2, <2>5, <2>6, <2>7 DEF BatchOk, Mem
   <1> QED
-    BY <1>7, <1>9, <1>10, <1>11, <1>12, <1>13, <1>14, <1>15, <1>16 DEF IndInv
+    BY <1>7, <1>9, <1>10, <1>11, <1>12, <1>13, <1>14, <1>15, <1>16, <1>17 DEF IndInv
 
 LEMMA TakeRelease_Inv ==
   ASSUME IndInv, NEW r \in requests, TakeRelease(r), UNCHANGED rare
@@ -1370,13 +1405,79 @@ LEMMA TakeDetach_Taken ==
       BY <1>1, <1>5, <1>8 DEF IndInv, MovingUnmapped, Kept
     <2>4. TablesMapped'
       BY <1>1, <1>4, <1>5, <1>6, <1>8, <2>2 DEF IndInv, TablesMapped, Empty
+    (* A completion kept is of another owner, whose rows, validity and     *)
+    (* state the detach leaves alone.                                       *)
     <2>5. HandoffOk'
-      BY <1>0, <1>1, <1>4, <1>5, <1>6, <1>8, <2>1, <2>2 DEF IndInv, HandoffOk, Kept, Empty,
-                                                            RequestTyped
+      <3> SUFFICES ASSUME NEW y \in handoff'
+                   PROVE  /\ y.o \in Owners /\ y.g \in Groups /\ GroupEpoch[y.g] = OwnerEpoch[y.o]
+                          /\ (~\E x \in requests' : Names(x, y)) =>
+                               /\ ostate'[y.o] = "live"
+                               /\ ogroup'[y.o] = y.g \/ ReaderRow(y.g, y.o, y.p, y.u, y.w)'
+                               /\ HoldsAt(y.o, y.p, y.u)'
+                               /\ (y.p \in Positions /\ y.w) =>
+                                    /\ table'[y.o][y.p].k = "private"
+                                    /\ ~\E d \in deferred' :
+                                          d.kind \in {"commit", "replicate"} /\ y.u \in d.units
+                                    /\ ~\E t \in tasks' : t.kind = "replicate" /\ y.u \in t.units
+        BY DEF HandoffOk, Live
+      <3>1. y \in handoff /\ y.o # r.o /\ y.o \in Owners /\ y.p \in Rows
+        BY <1>0, <1>1, <1>4 DEF Kept, RequestTyped
+      <3>2. (\E x \in requests' : Names(x, y)) = (\E x \in requests : Names(x, y))
+        BY <2>1
+      <3>3. /\ y.o \in Owners /\ y.g \in Groups /\ GroupEpoch[y.g] = OwnerEpoch[y.o]
+            /\ (~\E x \in requests : Names(x, y)) =>
+                 /\ ostate[y.o] = "live"
+                 /\ ogroup[y.o] = y.g \/ ReaderRow(y.g, y.o, y.p, y.u, y.w)
+                 /\ HoldsAt(y.o, y.p, y.u)
+                 /\ (y.p \in Positions /\ y.w) =>
+                      /\ table[y.o][y.p].k = "private"
+                      /\ ~\E d \in deferred : d.kind \in {"commit", "replicate"} /\ y.u \in d.units
+                      /\ ~\E t \in tasks : t.kind = "replicate" /\ y.u \in t.units
+        BY <3>1 DEF IndInv, HandoffOk, Live
+      <3>4. /\ ostate'[y.o] = ostate[y.o]
+            /\ HoldsAt(y.o, y.p, y.u)' = HoldsAt(y.o, y.p, y.u)
+            /\ y.p \in Positions => table'[y.o][y.p] = table[y.o][y.p]
+            /\ ReaderRow(y.g, y.o, y.p, y.u, y.w)' = ReaderRow(y.g, y.o, y.p, y.u, y.w)
+        BY <1>4, <2>2, <3>1
+      <3>5. \A d \in deferred' : d.kind \in {"commit", "replicate"} => d \in deferred
+        BY <1>5, <1>8
+      <3> QED
+        BY <3>2, <3>3, <3>4, <3>5
     <2> QED
       BY <2>3, <2>4, <2>5
   <1>16. TrialVisibility' /\ NoBad'
     BY <1>1, <1>4 DEF IndInv, TrialVisibility, MadeBy, NoBad, Empty, Shared
+  <1>18. CrossingsOk' /\ CopiesPlaced' /\ CrossingsPlaced'
+    <2>1. \A d \in deferred : d.kind = "replicate" => \A u \in d.units : alloc'[u] = alloc[u]
+      <3> SUFFICES ASSUME NEW d \in deferred, d.kind = "replicate", NEW u \in d.units
+                   PROVE  alloc'[u] = alloc[u]
+        OBVIOUS
+      <3>1. u \in AllUnits /\ d \in deferred'
+        BY <1>0, <1>8 DEF WorkTyped
+      <3>2. Held(u)'
+        BY <3>1 DEF Held, HeldIn
+      <3> QED
+        BY <1>8, <3>1, <3>2
+    <2>2. \A t \in tasks : t.kind = "replicate" => \A u \in t.writes : alloc'[u] = alloc[u]
+      <3> SUFFICES ASSUME NEW t \in tasks, t.kind = "replicate", NEW u \in t.writes
+                   PROVE  alloc'[u] = alloc[u]
+        OBVIOUS
+      <3>1. u \in t.units /\ u \in AllUnits /\ t.held
+        BY <1>0, TasksHeld DEF IndInv, CrossingsOk, WorkTyped
+      <3>2. Held(u)'
+        BY <3>1 DEF Held, HeldIn
+      <3> QED
+        BY <1>8, <3>1, <3>2
+    <2>3. \A o \in Owners : Moving(o)' => Moving(o)
+      BY <1>5, <1>8 DEF Moving
+    <2>4. \A o \in Owners : ostate[o] # "new" => ostate'[o] # "new"
+      BY <1>6
+    <2>5. CrossingsOk'
+      BY <1>1, <1>5, <1>8, <2>1, <2>2, <2>3, <2>4, CrossingsTake DEF IndInv
+    <2>6. CopiesPlaced' /\ CrossingsPlaced'
+      BY <1>1, TransfersFrame, CopiesPlacedFrame, CrossingsPlacedFrame DEF IndInv
+    <2> QED
+      BY <2>5, <2>6
   <1>17. BatchesOk'
     <2>1. SUFFICES ASSUME NEW b \in inflight PROVE BatchOk(b)'
       BY <1>1, BatchesOkEach
@@ -1384,7 +1485,7 @@ LEMMA TakeDetach_Taken ==
       BY BatchesOkEach DEF IndInv
     <2>3. ASSUME NEW o \in Owners, NEW u \in AllUnits, Covered(b, o, u)
           PROVE  Covered(b, o, u)' /\ Held(u)'
-      <3>1. CASE /\ Live(o) /\ ogroup[o] = b.g
+      <3>1. CASE /\ Live(o) /\ (ogroup[o] = b.g \/ b.g \in ReadersOf(o))
                  /\ \E p \in Rows :
                       /\ HoldsAt(o, p, u)
                       /\ \A x \in requests :
@@ -1434,16 +1535,16 @@ LEMMA TakeDetach_Taken ==
       BY <1>8, <2>3, <2>4
     <2>6. \A o \in Owners, p \in Positions :
             (\A x \in requests :
-               CommitsRow(x, o, p) => b.g \in x.sg /\ (b.g \in x.by => x.after[b.g] >= b.seq))
+               FreezesRow(x, o, p) => b.g \in x.sg /\ (b.g \in x.by => x.after[b.g] >= b.seq))
             => \A x \in requests' :
-                 CommitsRow(x, o, p) => b.g \in x.sg /\ (b.g \in x.by => x.after[b.g] >= b.seq)
+                 FreezesRow(x, o, p) => b.g \in x.sg /\ (b.g \in x.by => x.after[b.g] >= b.seq)
       BY <1>1, TakeCommon DEF Kept
     <2>7. \A y \in b.writes, p \in Positions : table'[y[1]][p].u = y[2] => table[y[1]][p].u = y[2]
       BY <1>4, <2>2, <2>4 DEF BatchOk, Empty, AllUnits
     <2> QED
       BY <1>1, <1>5, <1>8, <2>2, <2>5, <2>6, <2>7 DEF BatchOk, Mem
   <1> QED
-    BY <1>8, <1>10, <1>11, <1>12, <1>13, <1>14, <1>15, <1>16, <1>17 DEF IndInv
+    BY <1>8, <1>10, <1>11, <1>12, <1>13, <1>14, <1>15, <1>16, <1>17, <1>18 DEF IndInv
 
 LEMMA TakeDetach_Inv ==
   ASSUME IndInv, NEW r \in requests, TakeDetach(r), UNCHANGED rare

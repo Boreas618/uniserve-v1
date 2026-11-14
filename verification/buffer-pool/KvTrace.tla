@@ -1,33 +1,48 @@
 ------------------------------ MODULE KvTrace ------------------------------
 (* Steps of the Rust buffer pool checked against the steps of the design   *)
 (* model's buffer pool (specs/buffer-pool.md §18). A window is a state the *)
-(* Rust buffer pool reached and the inputs and states that followed it, as *)
-(* the enumeration of L1 or the replay of a trace wrote them; TLC must     *)
-(* find, from the window's first state, a path of MC_Pool's steps through  *)
-(* each of its states in turn. A state is compared as the Rust buffer pool *)
-(* writes it in the model's terms (agreement.py's projection, here as      *)
-(* `Matches`); what that leaves out, the stamps and keys of deferred work  *)
-(* and the keys of copies and tasks, TLC chooses at the window's start.    *)
+(* Rust buffer pool reached, the input it took and the state that followed *)
+(* (or the part of each that the transition touches, steps.py), as the     *)
+(* enumeration of L1 or the replay of a trace wrote them; TLC must find,   *)
+(* from the first state, a path of MC_Pool's steps to the second. Each     *)
+(* initial state is one window's first state, with the window's input,    *)
+(* next state and bound in variables. A state is compared as the Rust      *)
+(* buffer pool writes it in the model's terms (agreement.py's projection,  *)
+(* here as `Matches`), which states every field of waiting work, copies    *)
+(* and tasks but the group of a store and of a prefetch and the owner of a *)
+(* save whose owner is gone; TLC chooses those at the window's start.      *)
 (*                                                                         *)
 (* Every step of a path is a step of `PoolNext`: each disjunct of `Step`   *)
-(* is one of its disjuncts with a guard that the input allows it, the      *)
-(* standard pruning of a trace's validation by its events. Pruning removes *)
-(* paths and never adds one, so it can make a window fail and never pass.  *)
-(* steps.py writes the windows and the constants of a run as MC_Trace.     *)
+(* is one of its disjuncts with a guard that the input allows it, or with  *)
+(* its choices narrowed to the ones the input names, the standard pruning  *)
+(* of a trace's validation by its events. Pruning removes paths and never  *)
+(* adds one, so it can make a window fail and never pass; so do a          *)
+(* window's start that fixes what no state states and `Toward`, which      *)
+(* keeps a step from undoing what the next state settles. steps.py writes  *)
+(* the windows and the constants of a run as MC_Trace.                     *)
 EXTENDS MC_Pool, Sequences
 
-CONSTANT Windows   \* <<[start |-> ..., steps |-> <<[input, state, bound], ...>>], ...>>
+CONSTANT Windows   \* <<[start |-> ..., input |-> ..., state |-> ..., bound |-> ...], ...>>
 
 VARIABLES window,  \* the window searched
-          matched, \* how many of its states were reached
-          walked   \* the model's steps since the last state reached
+          input,   \* its input
+          goal,    \* its next state
+          bound,   \* the steps a path to it may take
+          walked,  \* the model's steps taken
+          reached  \* whether `goal` was reached
 
-trace == <<window, matched, walked>>
+trace == <<window, input, goal, bound, walked, reached>>
+
+\* The function whose pairs are the set `S` of pairs: how steps.py writes one.
+FnOf(S) == [x \in {p[1] : p \in S} |-> (CHOOSE p \in S : p[1] = x)[2]]
 
 -----------------------------------------------------------------------------
 (* A state as the Rust buffer pool writes it.                              *)
 
 Shown(u) == IF u = NONE THEN "-" ELSE u
+
+\* The stamps work still waits for: those `completed` has not reached.
+Pending(a) == [g \in {x \in Groups : a[x] > launched[x]} |-> a[g]]
 
 \* A copy in flight, as a `copy` line states it.
 CopyLine(c) ==
@@ -37,16 +52,22 @@ CopyLine(c) ==
            THEN c.o ELSE "-",
      p |-> IF c.kind \in {"clone", "load"} THEN c.p ELSE "-",
      read |-> c.read, write |-> c.write,
-     fill |-> IF c.fill /\ c.kind = "load" THEN 1 ELSE 0,
-     mem |-> IF c.kind \in {"clone", "load"} THEN GroupMemory[c.g] ELSE "-"]
+     fill |-> IF c.fill /\ c.kind \in {"load", "store"} THEN 1 ELSE 0,
+     mem |-> IF c.kind \in {"clone", "load"} THEN GroupMemory[c.g] ELSE "-",
+     \* The key a copy caches its block under; a clone and a restore cache none.
+     k |-> IF c.kind \in {"load", "store", "save"} THEN c.k ELSE "-"]
 
 \* A task in flight, as a `task` line states it.
 TaskLine(t) ==
-    IF t.kind = "transfer"
-    THEN [kind |-> "transfer", o |-> t.o, to |-> t.to, slot |-> t.slot, units |-> t.units,
-          writes |-> t.writes, h |-> "-", expired |-> 0]
-    ELSE [kind |-> t.kind, o |-> "-", to |-> "-", slot |-> "-", units |-> {}, writes |-> {},
-          h |-> t.h, expired |-> IF t.expired THEN 1 ELSE 0]
+    CASE t.kind = "transfer" ->
+           [kind |-> "transfer", o |-> t.o, p |-> "-", to |-> t.to, slot |-> t.slot,
+            units |-> t.units, writes |-> t.writes, h |-> "-", expired |-> 0, k |-> "-"]
+      [] t.kind = "replicate" ->
+           [kind |-> "replicate", o |-> t.o, p |-> t.p, to |-> t.to, slot |-> "-",
+            units |-> t.units, writes |-> t.writes, h |-> "-", expired |-> 0, k |-> "-"]
+      [] OTHER ->
+           [kind |-> t.kind, o |-> "-", p |-> "-", to |-> "-", slot |-> "-", units |-> {},
+            writes |-> {}, h |-> t.h, expired |-> IF t.expired THEN 1 ELSE 0, k |-> t.k]
 
 Waiting(kind) == {d \in deferred : d.kind = kind}
 
@@ -69,28 +90,45 @@ Matches(st) ==
     /\ st.keys =
          {[k |-> y, d |-> Shown(cache[y]), h |-> Shown(hcache[y]), r |-> IF y \in remote THEN 1 ELSE 0] :
             y \in {x \in Keys : cache[x] # NONE \/ hcache[x] # NONE \/ x \in remote}}
+    \* The memories of every device block an owner, the cache or a waiting
+    \* commit holds, and the host parts of every cached host block.
     /\ LET live == {o \in Owners : ostate[o] = "live"}
-           blocks == ({table[o][q].u : o \in live, q \in Positions} \cup {cache[y] : y \in Keys})
+           blocks == ({table[o][q].u : o \in live, q \in Positions} \cup {cache[y] : y \in Keys}
+                        \cup {hcache[y] : y \in Keys} \cup UNION {d.units : d \in Waiting("commit")})
                        \ {NONE}
        IN st.valid = {<<b, valid[b]>> : b \in blocks}
     /\ st.copies = {CopyLine(c) : c \in copies}
-    /\ st.commits = {[o |-> d.o, p |-> d.p, u |-> CHOOSE b \in d.units : TRUE] : d \in Waiting("commit")}
-    /\ st.transfers = {[o |-> d.o, to |-> d.to] : d \in Waiting("transfer")}
+    /\ st.commits =
+         {[o |-> d.o, p |-> d.p, u |-> CHOOSE b \in d.units : TRUE, k |-> d.k, after |-> Pending(d.after)] :
+            d \in Waiting("commit")}
+    /\ st.transfers = {[o |-> d.o, to |-> d.to, after |-> Pending(d.after)] : d \in Waiting("transfer")}
+    /\ st.replicates =
+         {[o |-> d.o, p |-> d.p, to |-> d.to, u |-> CHOOSE b \in d.units : TRUE, after |-> Pending(d.after)] :
+            d \in Waiting("replicate")}
     /\ st.finishes =
-         UNION {{[ok |-> IF d.ok THEN 1 ELSE 0, copy |-> CopyLine(c)] : c \in {x \in copies : x.id = d.c}} :
+         UNION {{[ok |-> IF d.ok THEN 1 ELSE 0, after |-> Pending(d.after), copy |-> CopyLine(c)] :
+                    c \in {x \in copies : x.id = d.c}} :
                   d \in Waiting("finish")}
-    /\ st.released = UNION {d.units : d \in Waiting("release")}
+    \* A release waits once per group whose stamp it has not reached.
+    /\ st.releases =
+         UNION {{[after |-> [x \in {g} |-> d.after[g]], units |-> d.units] :
+                    g \in DOMAIN Pending(d.after)} :
+                  d \in Waiting("release")}
     /\ st.tasks = {TaskLine(t) : t \in tasks}
 
 -----------------------------------------------------------------------------
 (* A recorded state as a state of the model: `x.state` with what it leaves *)
-(* out chosen, among which the memories that hold a block only waiting    *)
-(* work, a copy or a task holds. `x.member` is the device units in their  *)
-(* region, `x.copies` the copies in flight in an order that numbers them, *)
-(* and `x.finishes` the waiting `Finish`es by the index of their copy.    *)
-
-\* The stamps of work that waits: some group's is not reached.
-Waits == {a \in [Groups -> 0 .. MaxBatch] : ~Reached(a)}
+(* out chosen. A stamp it states for the groups whose `completed` has not  *)
+(* reached it is 0 for the others; a release line is a release of its own; *)
+(* a device block only a release, a copy or a task holds, and a host block *)
+(* nothing caches, is valid nowhere (each is written before it is read, or *)
+(* is reclaimed); a clone's key is the one its source is cached under, and *)
+(* a restore's the one its host block is (the copy holds either, so the    *)
+(* cache keeps it, R2). TLC chooses a store's and a prefetch's group and   *)
+(* the owner of a save whose owner is gone. `x.member` is the device units *)
+(* in their region, `x.copies` the copies in flight in an order that       *)
+(* numbers them, and `x.finishes` the waiting `Finish`es by the index of   *)
+(* their copy.                                                             *)
 
 Start(x) ==
     LET st == x.state
@@ -100,13 +138,16 @@ Start(x) ==
         keyed(y) == {e \in st.keys : e.k = y}
         ident(j) == st.ncopy - n + j
         stated == {v[1] : v \in st.valid}
-        unstated == (({cm.u : cm \in st.commits} \cup st.released
-                      \cup {l.read : l \in st.copies} \cup {l.write : l \in st.copies}
-                      \cup UNION {tl.units \cup tl.writes : tl \in st.tasks}) \cap Units) \ stated
-        Copied(l, j, y, g, o) ==
+        Stamp(a) == [g \in Groups |-> IF g \in DOMAIN a THEN a[g] ELSE 0]
+        cachedAs(b) == {e.k : e \in {f \in st.keys : f.d = b \/ f.h = b}}
+        Copied(l, j, g, o) ==
             [id |-> ident(j), kind |-> l.kind, o |-> o, p |-> IF l.p = "-" THEN NONE ELSE l.p,
-             k |-> y, g |-> g, read |-> l.read, write |-> l.write,
-             fill |-> (l.kind = "load" /\ l.fill = 1) \/ l.kind = "restore",
+             k |-> IF l.k # "-" THEN l.k
+                   ELSE IF cachedAs(l.read) # {} THEN CHOOSE y \in cachedAs(l.read) : TRUE ELSE NONE,
+             g |-> g, read |-> l.read, write |-> l.write,
+             fill |-> (l.kind \in {"load", "store"} /\ l.fill = 1) \/ l.kind = "restore",
+             \* A store's fill writes the group's host parts its block lacks.
+             parts |-> IF l.kind = "store" /\ l.fill = 1 THEN GroupParts[g] \ valid[l.write] ELSE {},
              seq |-> 0, done |-> FALSE, stopped |-> FALSE]
     IN /\ free = st.free
        /\ member = x.member
@@ -123,56 +164,65 @@ Start(x) ==
                                    ELSE LET h == (CHOOSE e \in keyed(y) : TRUE).h
                                         IN IF h = "-" THEN NONE ELSE h]
        /\ remote = {e.k : e \in {f \in st.keys : f.r = 1}}
-       /\ \E vs \in [unstated -> SUBSET Memories] :
-            valid = [b \in Units |-> IF b \in stated THEN (CHOOSE v \in st.valid : v[1] = b)[2]
-                                    ELSE IF b \in unstated THEN vs[b] ELSE {}]
+       /\ valid = [b \in Units \cup HostUnits |->
+                     IF b \in stated THEN (CHOOSE v \in st.valid : v[1] = b)[2] ELSE {}]
        /\ ncopy = st.ncopy
        /\ launched = st.completed
        /\ inflight = {}
        /\ handoff = {}
        /\ requests = {}
-       \* A copy's key, and the group and owner its line does not state.
-       /\ \E ys \in [1 .. n -> Keys], gs \in [1 .. n -> Groups], os \in [1 .. n -> Owners \cup {NONE}] :
+       \* The group and owner a copy's line does not state.
+       /\ \E gs \in [1 .. n -> Groups], os \in [1 .. n -> Owners \cup {NONE}] :
             /\ \A j \in 1 .. n :
                  LET l == x.copies[j] IN
                  /\ IF l.o # "-" THEN os[j] = l.o ELSE (os[j] = NONE) = (l.kind = "store")
                  /\ l.mem # "-" => GroupMemory[gs[j]] = l.mem
                  /\ (l.o # "-" /\ live(l.o)) => gs[j] = st.owners[l.o].g
-            /\ copies = {Copied(x.copies[j], j, ys[j], gs[j], os[j]) : j \in 1 .. n}
-       \* The stamps and keys of what waits.
-       /\ \E ca \in [st.commits -> Waits], ck \in [st.commits -> Keys],
-             ta \in [st.transfers -> [Groups -> 0 .. MaxBatch]], fa \in [x.finishes -> Waits],
-             ra \in IF st.released = {} THEN {NoStamp} ELSE Waits :
-            deferred =
-              {[kind |-> "commit", units |-> {cm.u}, after |-> ca[cm], o |-> cm.o, p |-> cm.p,
-                k |-> ck[cm], c |-> 0, ok |-> FALSE, g |-> ogroup[cm.o], to |-> NONE] :
-                 cm \in st.commits}
-              \cup {[kind |-> "transfer", units |-> {}, after |-> ta[tr], o |-> tr.o, p |-> NONE,
-                     k |-> NONE, c |-> 0, ok |-> FALSE, g |-> NONE, to |-> tr.to] :
-                      tr \in st.transfers}
-              \cup {[kind |-> "finish", units |-> {}, after |-> fa[fi], o |-> NONE, p |-> NONE,
-                     k |-> NONE, c |-> ident(fi.at), ok |-> fi.ok = 1, g |-> NONE, to |-> NONE] :
-                      fi \in x.finishes}
-              \cup (IF st.released = {} THEN {}
-                    ELSE {[kind |-> "release", units |-> st.released, after |-> ra, o |-> NONE,
-                           p |-> NONE, k |-> NONE, c |-> 0, ok |-> FALSE, g |-> NONE, to |-> NONE]})
-       \* The key of a prefetch or a put.
-       /\ \E ks \in [st.tasks -> Keys] :
+            /\ copies = {Copied(x.copies[j], j, gs[j], os[j]) : j \in 1 .. n}
+       /\ deferred =
+            {[kind |-> "commit", units |-> {cm.u}, after |-> Stamp(cm.after), o |-> cm.o, p |-> cm.p,
+              k |-> cm.k, c |-> 0, ok |-> FALSE, g |-> ogroup[cm.o], to |-> NONE] :
+               cm \in st.commits}
+            \cup {[kind |-> "transfer", units |-> {}, after |-> Stamp(tr.after), o |-> tr.o, p |-> NONE,
+                   k |-> NONE, c |-> 0, ok |-> FALSE, g |-> NONE, to |-> tr.to] :
+                    tr \in st.transfers}
+            \cup {[kind |-> "replicate", units |-> {rp.u}, after |-> Stamp(rp.after), o |-> rp.o,
+                   p |-> rp.p, k |-> NONE, c |-> 0, ok |-> FALSE,
+                   g |-> IF live(rp.o) THEN st.owners[rp.o].g ELSE NONE, to |-> rp.to] :
+                    rp \in st.replicates}
+            \cup {[kind |-> "finish", units |-> {}, after |-> Stamp(fi.after), o |-> NONE, p |-> NONE,
+                   k |-> NONE, c |-> ident(fi.at), ok |-> fi.ok = 1, g |-> NONE, to |-> NONE] :
+                    fi \in x.finishes}
+            \cup {[kind |-> "release", units |-> rl.units, after |-> Stamp(rl.after), o |-> NONE,
+                   p |-> NONE, k |-> NONE, c |-> 0, ok |-> FALSE, g |-> NONE, to |-> NONE] :
+                    rl \in st.releases}
+       \* The group a prefetch fills the host parts of.
+       /\ \E tg \in [st.tasks -> Groups] :
             tasks =
-              {IF tl.kind = "transfer"
-               THEN [kind |-> "transfer", k |-> NONE, h |-> NONE, src |-> NONE, ok |-> TRUE,
-                     expired |-> FALSE, o |-> tl.o, to |-> tl.to, slot |-> tl.slot, held |-> TRUE,
-                     units |-> tl.units, writes |-> tl.writes]
-               ELSE [kind |-> tl.kind, k |-> ks[tl], h |-> tl.h, src |-> "remote", ok |-> TRUE,
-                     expired |-> tl.expired = 1, o |-> NONE, to |-> NONE, slot |-> NONE,
-                     held |-> TRUE, units |-> {}, writes |-> {}] :
+              {CASE tl.kind = "transfer" ->
+                      [kind |-> "transfer", k |-> NONE, h |-> NONE, src |-> NONE, ok |-> TRUE,
+                       expired |-> FALSE, p |-> NONE, o |-> tl.o, to |-> tl.to, slot |-> tl.slot,
+                       held |-> TRUE, units |-> tl.units, writes |-> tl.writes]
+                 [] tl.kind = "replicate" ->
+                      [kind |-> "replicate", k |-> NONE, h |-> NONE, src |-> NONE, ok |-> TRUE,
+                       expired |-> FALSE, p |-> tl.p, o |-> tl.o, to |-> tl.to, slot |-> NONE,
+                       held |-> TRUE, units |-> tl.units, writes |-> tl.writes]
+                 [] OTHER ->
+                      [kind |-> tl.kind, k |-> tl.k, h |-> tl.h, src |-> "remote", ok |-> TRUE,
+                       expired |-> tl.expired = 1, p |-> NONE, o |-> NONE,
+                       to |-> IF tl.kind = "prefetch" THEN tg[tl] ELSE NONE, slot |-> NONE,
+                       held |-> TRUE, units |-> {}, writes |-> {}] :
                  tl \in st.tasks}
        /\ vis = [y \in Keys |-> [d |-> NONE, h |-> NONE]]
        /\ trial = [e \in Epochs |-> "no"]
        /\ dbt = [g \in Groups |-> [o \in Owners |-> [q \in Rows |-> NoEntry]]]
        /\ alloc = [b \in AllUnits |-> IF \E y \in Keys : cache[y] = b \/ hcache[y] = b
                                       THEN "shared" ELSE NONE]
-       /\ sharedKey = [b \in AllUnits |-> NONE]
+       \* The key each cached block is shared under, which a crossing's R8 reads.
+       /\ sharedKey = [b \in AllUnits |->
+                        IF \E y \in Keys : cache[y] = b \/ hcache[y] = b
+                        THEN CHOOSE y \in Keys : cache[y] = b \/ hcache[y] = b
+                        ELSE NONE]
        /\ lost = {}
        /\ bad = {}
 
@@ -190,12 +240,53 @@ Asked(q) ==
         /\ r.kind = "release" => r.ps = q.ps
         /\ r.kind = "commit" => r.p = q.p /\ r.k = q.k
         /\ r.kind = "transfer" => r.to = q.to
+        /\ r.kind = "replicate" => r.p = q.p /\ r.to = q.to
         /\ r.kind = "finish" => r.ok = q.ok
+
+(* MC_Pool's `Arrive` with each of its choices narrowed to the one the     *)
+(* input names: every step of it is an `Arrive` step. TLC enumerates the   *)
+(* domain of a choice before `Asked` can reject it, and `Arrive` chooses a *)
+(* release's positions among all sets of positions. A `Finish` names its   *)
+(* copy by nothing a state states, so it may name any copy.                *)
+ArriveAs(q) ==
+    /\ requests = {}
+    /\ \E e \in Epochs \ lost,
+          after \in {a \in {q.after} : /\ a \in [Groups -> 0 .. MaxBatch]
+                                       /\ \A g \in Groups \ Stamping : a[g] = 0} :
+         \/ \E o \in Owners \cap {q.o} :
+              \/ \E ps \in {x \in {q.ps} : x \in (SUBSET Positions) \ {{}}} :
+                   requests' = {[Request("release", e, o, ps, NONE, NONE, 0, FALSE)
+                                   EXCEPT !.after = after]}
+              \/ requests' = {[Request("detach", e, o, {}, NONE, NONE, 0, FALSE)
+                                 EXCEPT !.after = after]}
+              \/ \E p \in Positions \cap {q.p}, k \in Keys \cap {q.k} :
+                   requests' = {[Request("commit", e, o, {}, p, k, 0, FALSE)
+                                   EXCEPT !.after = after]}
+              \/ \E g \in Groups \cap {q.to} :
+                   /\ Transfers
+                   /\ requests' = {[Request("transfer", e, o, {}, NONE, NONE, 0, FALSE)
+                                      EXCEPT !.after = after, !.to = g]}
+              \/ \E p \in Positions \cap {q.p}, g \in Groups \cap {q.to} :
+                   /\ Crosses
+                   /\ requests' = {[Request("replicate", e, o, {}, p, NONE, 0, FALSE)
+                                      EXCEPT !.after = after, !.to = g]}
+         \/ \E c \in 1 .. ncopy, ok \in BOOLEAN \cap {q.ok} :
+              requests' = {[Request("finish", e, NONE, {}, NONE, NONE, c, ok)
+                              EXCEPT !.after = after]}
+    /\ UNCHANGED <<pool, dbt, launched, inflight, handoff, alloc, sharedKey>>
 
 Step(in) ==
     \/ "Attach" \in in.acts /\ \E o \in in.os, g \in in.gs : Attach(o, g) /\ UNCHANGED rare
-    \/ "Allocate" \in in.acts /\ \E o \in in.os, q \in in.ps : Allocate(o, q) /\ UNCHANGED rare
-    \/ "Pin" \in in.acts /\ \E o \in in.os, q \in in.ps, y \in in.ks : Pin(o, q, y) /\ UNCHANGED rare
+    \* A request of several positions takes them in order (`in.order`), a
+    \* pin each with its key (`in.korder`), as the Rust buffer pool does.
+    \/ "Allocate" \in in.acts /\ \E o \in in.os, i \in 1 .. Len(in.order) :
+         /\ \A j \in 1 .. i - 1 : table[o][in.order[j]] # Empty
+         /\ Allocate(o, in.order[i])
+         /\ UNCHANGED rare
+    \/ "Pin" \in in.acts /\ \E o \in in.os, i \in 1 .. Len(in.order) :
+         /\ \A j \in 1 .. i - 1 : table[o][in.order[j]] # Empty
+         /\ Pin(o, in.order[i], in.korder[i])
+         /\ UNCHANGED rare
     \/ "Clone" \in in.acts /\ \E o \in in.os, q \in in.ps, y \in in.ks : Clone(o, q, y) /\ UNCHANGED rare
     \/ "Load" \in in.acts /\ \E o \in in.os, q \in in.ps, y \in in.ks : Load(o, q, y) /\ UNCHANGED rare
     \/ "Save" \in in.acts /\ \E o \in in.os, y \in in.ks : Save(o, y) /\ UNCHANGED rare
@@ -203,20 +294,24 @@ Step(in) ==
     \/ "Store" \in in.acts /\ \E g \in in.gs, y \in in.ks : Store(g, y) /\ UNCHANGED rare
     \/ "Evict" \in in.acts /\ \E y \in in.ks : Evict(y) /\ UNCHANGED rare
     \/ "EvictHost" \in in.acts /\ \E y \in Keys : EvictHost(y) /\ UNCHANGED rare
-    \/ "Arrive" \in in.acts /\ Arrive /\ Asked(in.req) /\ UNCHANGED rare
+    \/ "Arrive" \in in.acts /\ ArriveAs(in.req) /\ Asked(in.req) /\ UNCHANGED rare
     \/ "Advance" \in in.acts /\ \E g \in Groups : Advance(g) /\ launched'[g] <= in.completed[g]
                                                  /\ UNCHANGED rare
     \/ \E r \in requests :
-         (TakeRelease(r) \/ TakeDetach(r) \/ TakeCommit(r) \/ TakeFinish(r) \/ TakeTransfer(r))
+         (TakeRelease(r) \/ TakeDetach(r) \/ TakeCommit(r) \/ TakeFinish(r) \/ TakeTransfer(r)
+          \/ TakeReplicate(r))
          /\ UNCHANGED rare
     \/ \E d \in deferred :
-         (ReleaseDue(d) \/ CommitDue(d) \/ FinishDue(d) \/ TransferDue(d)) /\ UNCHANGED rare
+         (ReleaseDue(d) \/ CommitDue(d) \/ FinishDue(d) \/ TransferDue(d) \/ ReplicateDue(d))
+         /\ UNCHANGED rare
     \/ "TransferEnd" \in in.acts /\ \E t \in tasks, ok \in BOOLEAN : TransferEnd(t, ok) /\ UNCHANGED rare
+    \/ "ReplicateEnd" \in in.acts /\ \E t \in tasks, ok \in BOOLEAN : ReplicateEnd(t, ok)
+                                    /\ UNCHANGED rare
     \/ "CommitUpdate" \in in.acts /\ \E e \in Epochs : CommitUpdate(e) /\ UNCHANGED rare
     \/ "Rollback" \in in.acts /\ \E e \in Epochs : Rollback(e) /\ UNCHANGED rare
     \/ "Shrink" \in in.acts /\ \E u \in Units : Shrink(u) /\ UNCHANGED rare
     \/ "Grow" \in in.acts /\ \E u \in Units : Grow(u) /\ UNCHANGED rare
-    \/ "Prefetch" \in in.acts /\ \E y \in in.ks : Prefetch(y, "remote")
+    \/ "Prefetch" \in in.acts /\ \E y \in in.ks, g \in in.gs : Prefetch(y, "remote", g)
     \/ "StoreRemote" \in in.acts /\ \E y \in in.ks : StoreRemote(y)
     \/ "Deadline" \in in.acts /\ \E t \in tasks : Deadline(t)
     \/ "PrefetchEnd" \in in.acts /\ \E t \in tasks, ok \in BOOLEAN : PrefetchEnd(t, ok)
@@ -226,32 +321,59 @@ Step(in) ==
 
 TraceInit ==
     /\ window \in 1 .. Len(Windows)
-    /\ matched = 0
+    /\ input = Windows[window].input
+    /\ goal = Windows[window].state
+    /\ bound = Windows[window].bound
     /\ walked = 0
+    /\ reached = FALSE
     /\ Start(Windows[window].start)
 
-\* The window's next state is reached; steps.py reads the line printed.
+\* The window's next state is reached, with no request under way (the
+\* Rust buffer pool takes each request with the input it arrives in);
+\* steps.py reads the line printed.
 Reach ==
-    LET steps == Windows[window].steps
-    IN /\ matched < Len(steps)
-       /\ Matches(steps[matched + 1].state)
-       /\ PrintT(<<"reached", window, matched + 1>>)
-       /\ matched' = matched + 1
-       /\ walked' = 0
-       /\ UNCHANGED <<vars, window>>
+    /\ ~reached
+    /\ requests = {}
+    /\ Matches(goal)
+    /\ PrintT(<<"reached", window>>)
+    /\ reached' = TRUE
+    /\ UNCHANGED <<vars, window, input, goal, bound, walked>>
+
+(* A step changes what the next recorded state `st` settles only toward   *)
+(* it: it takes no unit that `st` has free (so the free units steps.py     *)
+(* keeps in a window as witnesses stay free), writes an owner's entry only *)
+(* as `st` has it or empties it, and caches a key's device or host block,  *)
+(* or lets it go, only as `st` does. The model chooses the unit an         *)
+(* allocation takes and the order of a request's positions; without this  *)
+(* a search tries every unit at every position. The Rust buffer pool sets *)
+(* each of these once in a step.                                           *)
+Toward(st) ==
+    LET keyed(y) == {e \in st.keys : e.k = y}
+        device(y) == IF keyed(y) = {} THEN "-" ELSE (CHOOSE e \in keyed(y) : TRUE).d
+        host(y) == IF keyed(y) = {} THEN "-" ELSE (CHOOSE e \in keyed(y) : TRUE).h
+    IN /\ \A u \in free \ free' : u \notin st.free
+       /\ \A o \in Owners, q \in Positions :
+            table'[o][q] # table[o][q] =>
+              \/ table'[o][q] = Empty
+              \/ st.owners[o].is = "live" /\ <<q, table'[o][q].k, table'[o][q].u>> \in st.owners[o].t
+       /\ \A y \in Keys :
+            /\ cache'[y] # cache[y] => Shown(cache'[y]) = device(y)
+            /\ hcache'[y] # hcache[y] => Shown(hcache'[y]) = host(y)
 
 \* A step of the model's buffer pool on the way to the window's next state.
 Walk ==
-    LET next == Windows[window].steps[matched + 1]
-    IN /\ matched < Len(Windows[window].steps)
-       /\ walked < next.bound
-       /\ Step(next.input)
-       /\ matched' = matched
-       /\ walked' = walked + 1
-       /\ UNCHANGED window
+    /\ ~reached
+    /\ walked < bound
+    /\ Step(input)
+    /\ Toward(goal)
+    /\ walked' = walked + 1
+    /\ UNCHANGED <<window, input, goal, bound, reached>>
 
 TraceNext == Reach \/ Walk
 
-\* What the search tells states apart by: MC_Pool's view and the window's progress.
-TraceView == <<View, trace>>
+\* What the search tells states apart by: MC_Pool's view, the window, and
+\* whether its next state was reached. Not the steps taken: the search is
+\* breadth first, so a state is first found by its shortest path, which
+\* leaves the most steps of the bound.
+TraceView == <<View, window, reached>>
 =============================================================================

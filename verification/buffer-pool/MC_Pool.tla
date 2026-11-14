@@ -22,7 +22,7 @@ MCUnitChunk == [u \in Units |-> u]
 MCGroupRegion == [g \in Groups |-> "kv"]
 MCMovable == {}
 MCInitialUnits == Units
-AllRules == {"R1", "R2", "R3", "R4", "R5", "R6", "R7", "R8", "R9", "R10"}
+AllRules == {"R1", "R2", "R3", "R4", "R5", "R6", "R7", "R8", "R9", "R10", "R11"}
 
 (* A stamped request arrives on a queue pair with any stamps: the buffer   *)
 (* pool cannot tell what its executors did.                                *)
@@ -42,6 +42,10 @@ Arrive ==
               \/ \E g \in Groups :
                    /\ Transfers
                    /\ requests' = {[Request("transfer", e, o, {}, NONE, NONE, 0, FALSE)
+                                      EXCEPT !.after = after, !.to = g]}
+              \/ \E p \in Positions, g \in Groups :
+                   /\ Crosses
+                   /\ requests' = {[Request("replicate", e, o, {}, p, NONE, 0, FALSE)
                                       EXCEPT !.after = after, !.to = g]}
          \/ \E c \in 1 .. ncopy, ok \in BOOLEAN :
               requests' = {[Request("finish", e, NONE, {}, NONE, NONE, c, ok)
@@ -65,14 +69,17 @@ PoolServing ==
     \/ \E g \in Groups : Advance(g)
     \/ \E r \in requests :
          TakeRelease(r) \/ TakeDetach(r) \/ TakeCommit(r) \/ TakeFinish(r) \/ TakeTransfer(r)
-    \/ \E d \in deferred : ReleaseDue(d) \/ CommitDue(d) \/ FinishDue(d) \/ TransferDue(d)
-    \/ \E t \in tasks, ok \in BOOLEAN : TransferEnd(t, ok)
+           \/ TakeReplicate(r)
+    \/ \E d \in deferred :
+         ReleaseDue(d) \/ CommitDue(d) \/ FinishDue(d) \/ TransferDue(d) \/ ReplicateDue(d)
+    \/ \E t \in tasks, ok \in BOOLEAN : TransferEnd(t, ok) \/ ReplicateEnd(t, ok)
     \/ \E e \in Epochs : CommitUpdate(e) \/ Rollback(e)
     \/ \E u \in Units : Shrink(u) \/ Grow(u)
 
 PoolNext ==
     \/ PoolServing /\ UNCHANGED rare
-    \/ \E k \in Keys : Prefetch(k, "remote") \/ StoreRemote(k)
+    \/ \E k \in Keys, g \in Groups : Prefetch(k, "remote", g)
+    \/ \E k \in Keys : StoreRemote(k)
     \/ \E t \in tasks : Deadline(t)
     \/ \E t \in tasks, ok \in BOOLEAN : PrefetchEnd(t, ok) \/ PutEnd(t, ok)
     \/ \E e \in Epochs : Lose(e)
@@ -83,6 +90,6 @@ PoolSpec == Init /\ [][PoolNext]_vars
 (* executors' tables and the history variables are written and never read  *)
 (* by this relation, and neither is the validity of a unit that is free.   *)
 View == <<free, ostate, ogroup, oslot, table, cache, hcache, deferred, copies, ncopy, tasks,
-          [u \in Units |-> IF u \in free THEN {} ELSE valid[u]],
+          [u \in Units \cup HostUnits |-> IF u \in free THEN {} ELSE valid[u]],
           vis, trial, member, launched, requests, remote, lost>>
 =============================================================================

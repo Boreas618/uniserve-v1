@@ -40,6 +40,12 @@ TaskIsolation ==
           [] t.kind = "prefetch" -> t.h \notin free /\ alloc[t.h] = "task"
           \* A remote put reads a host block that stays its key's copy.
           [] t.kind = "put" -> t.h \notin free /\ hcache[t.k] = t.h
+          \* A crossing writes only its owner's block, and of a shared block only
+          \* the reading group's memory while the block is not valid there.
+          [] t.kind = "replicate" ->
+               \A u \in t.writes :
+                  /\ u \notin free
+                  /\ alloc[u] = t.o \/ (alloc[u] = "shared" /\ Mem(t.to) \notin valid[u])
 
 P1 == FreeUnheld /\ Exclusive /\ WriteIsolation /\ ReadIsolation /\ CopyIsolation /\ TaskIsolation
 =============================================================================

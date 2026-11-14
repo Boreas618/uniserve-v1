@@ -16,6 +16,11 @@ TrialVisibility ==
         \* An epoch on trial fills no memory of a block others may use.
         /\ \A c \in copies :
              (c.kind = "load" /\ c.fill /\ c.k = k) => vis[k].d = MadeBy(GroupEpoch[c.g])
+        \* Nor host parts of one, nor the memory a crossing fills.
+        /\ \A c \in copies :
+             (c.kind = "store" /\ c.fill /\ c.k = k) => vis[k].h = MadeBy(GroupEpoch[c.g])
+        /\ \A t \in tasks :
+             (t.kind = "replicate" /\ cache[k] \in t.units) => vis[k].d = MadeBy(OwnerEpoch[t.o])
 
 P5 == TrialVisibility
 =============================================================================

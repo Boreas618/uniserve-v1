@@ -1,10 +1,10 @@
 #!/bin/bash
-# L1 of specs/buffer-pool.md §19: every request sequence of four small
+# L1 of specs/buffer-pool.md §19: every request sequence of six small
 # configurations is enumerated on the Rust buffer pool, no sequence breaks an
 # invariant, and every state reached is a state of the design model's buffer
 # pool (MC_Pool under the configuration of the same name). Prints one line per
 # configuration and exits non-zero when one fails.
-#   agreement.sh [core|copies|transfer|tiers]...      (all four by default)
+#   agreement.sh [core|copies|transfer|tiers|cross|parts]...      (all six by default)
 # The enumeration and the model's states are kept in $AGREEMENT_WORK (default:
 # a temporary directory); a configuration's model states pass through a named
 # pipe and are not stored.
@@ -21,10 +21,12 @@ fi
 grep -E "^[a-z]+: [0-9]+ states" "$work/enumeration.log" | sed 's/^/      Rust buffer pool, /'
 
 status=0
-for shape in ${*:-core copies transfer tiers}; do
+for shape in ${*:-core copies transfer tiers cross parts}; do
     config=MC_Pool$(echo "${shape:0:1}" | tr a-z A-Z)${shape:1}
+    # A configuration with constants of its own has a module of its own over MC_Pool.
+    module=MC_Pool; [ -f "$config.tla" ] && module=$config
     rm -f "$work/$shape.dump"; mkfifo "$work/$shape.dump"
-    TLC_LOGS="$work/logs" ./tlc.sh MC_Pool "$config" -- -dump "$work/$shape" > "$work/$shape.tlc" 2>&1 &
+    TLC_LOGS="$work/logs" ./tlc.sh "$module" "$config" -- -dump "$work/$shape" > "$work/$shape.tlc" 2>&1 &
     if result=$(python3 agreement.py "$shape" "$work/$shape.dump" "$work/rust/$shape.txt"); then
         verdict=ok
     else
