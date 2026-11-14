@@ -114,9 +114,19 @@ def test_base_text_to_video_at_every_768p_size(tmp_path: Path) -> None:
 
         for size in sizes:
             width, height = (int(side) for side in size.split("x"))
+            # Each size states a prompt of its own: a request whose prompt's
+            # encoder output is committed already pins it and runs no
+            # encoding call, so it reports no `preparing` phase, and every
+            # request below is to report every phase.
             response = client.post(
                 "/v1/videos/sync",
-                json=t2va_request("MiniMax-H3", prompt, 124, 42, size=size),
+                json=t2va_request(
+                    "MiniMax-H3",
+                    f"{prompt} The frame is {size}.",
+                    124,
+                    42,
+                    size=size,
+                ),
             )
             assert response.status_code == 200, (size, response.text)
             assert (
