@@ -45,15 +45,16 @@ than 0; a prefetch from the peers; a load or a store of several keys (the
 model makes one per key; a prefetch of several is checked as one per key
 in order, and a state states a task of several keys as one per key); a
 request of no open session; a state while no session is open, with units
-of a region the model lacks held (another class's), with a key cached in a
-class other than 0 (the model has one class; `# class` lines state them)
-or on the device in several regions (the model caches one device block
-per key; `# device` lines state them); a step that takes or frees units of
-a region the model lacks; a resize over KV regions of two unit sizes in
-one memory space, which the model's chunks cannot relate. Several open
-sessions are checked as the model's epochs: owners and groups are named
-under their session's epoch, and each epoch's trial, whether its session
-is closed, and each copy's visibility (R8) are stated.
+of a region the model lacks held (another class's), with units of a region
+it has held by an owner in a class other than 0 or a key cached in such a
+class (the model has one class; `# held` and `# class` lines state them),
+or with a key cached on the device in several regions (the model caches
+one device block per key; `# device` lines state them); a step that takes
+or frees units of a region the model lacks; a resize over KV regions of
+two unit sizes in one memory space, which the model's chunks cannot
+relate. Several open sessions are checked as the model's epochs: owners
+and groups are named under their session's epoch, and each epoch's trial,
+whether its session is closed, and each copy's visibility (R8) are stated.
 
 Prints one verdict line: ok; FAIL with the first step no path follows,
 whose window is kept in WORK/failure.txt (with the first 50 such); or
@@ -347,6 +348,7 @@ class State:
         self.records = {}         # line -> record(line)
         self.classes = {}         # key -> class
         self.devices = {}         # key -> its device copies, where more than one
+        self.foreign = set()      # the regions of the units owners hold in a class other than 0
         self.epochs = {}          # epoch -> (open or closed, trial)
         self.makers = {}          # key -> (the epochs its device and host copies are visible to alone)
         self.by_maker = collections.defaultdict(set)  # epoch -> {key}
@@ -369,6 +371,8 @@ class State:
                 self.classes[parts[1]] = parts[2]
             elif parts[0] == "device":
                 self.devices[parts[1]] = parts[2]
+            elif parts[0] == "held":
+                self.foreign.update(unit.split(":")[0] for unit in parts[3:])
         else:
             self.lines.add(line)
             if word == "owner":
@@ -456,6 +460,11 @@ def outside_state(state, regions):
         return "a key cached in a class other than 0"
     if state.devices:
         return "a key cached on the device in several regions"
+    # A unit of the model's region held in another class is neither free
+    # nor held in its terms (one class); another class's region is none of
+    # its business while no step takes or frees a unit of it.
+    if state.foreign & set(regions):
+        return "units of the model's region held in a class other than 0"
     for line in state.lines:
         for region, _ in UNIT.findall(line):
             if region not in regions:

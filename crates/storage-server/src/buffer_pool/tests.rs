@@ -1816,6 +1816,81 @@ fn a_state_names_each_owner_under_its_session_and_each_epoch_with_its_trial() {
     assert!(cached[0].ends_with(" vd=e2 vh=-"), "{state}");
 }
 
+/// A state in the model's terms states an owner's table of the class 0;
+/// the units it holds in another class, as a draft model's cache pages
+/// taken from the region of the class 0, are stated beside them (`# held`),
+/// so that no unit of that region is neither free nor held in the record.
+#[test]
+fn a_state_marks_the_units_an_owner_holds_in_another_class() {
+    let mut fixture = Fixture::new();
+    // A session whose class 1 takes its blocks from the KV region.
+    let class = |index: u8, units, host| Class {
+        units,
+        host,
+        state_in_slot: false,
+        tensors: [index + 1; 32],
+        encoding: [0; 32],
+    };
+    let classes = vec![
+        class(KV, 1, Some((HOST, 1))),
+        class(1, 1, None),
+        class(2, 0, Some((LATENTS, 0))),
+    ];
+    let regions = vec![vec![UNITS], vec![UNITS], Vec::new()];
+    fixture.pool.open(
+        2,
+        2,
+        false,
+        (classes, 2),
+        vec![(GroupId(0), group(0, 1, regions, PART))],
+    );
+    let queue = (2, 0);
+    fixture.submit(
+        queue,
+        Request::Attach {
+            owner: OwnerId(1),
+            group: GroupId(0),
+        },
+    );
+    let mut taken = Vec::new();
+    for class in [KV, 1] {
+        let id = fixture.submit(
+            queue,
+            Request::Allocate {
+                owner: OwnerId(1),
+                class,
+                at: 0,
+                count: 1,
+                units: 0,
+            },
+        );
+        let Some(Completion::Allocated { runs, .. }) = fixture.answer(id) else {
+            panic!("the allocation of the class {class} was refused");
+        };
+        taken.push(format!("{}:{}", runs[0].0, runs[0].1));
+    }
+
+    let state = super::trace::stated(&fixture.pool, &[(queue, OwnerId(1))], 0);
+    let marked = super::trace::classes(&fixture.pool);
+    let owner = state
+        .lines()
+        .find(|line| line.starts_with("owner e2.1 "))
+        .unwrap();
+    assert!(
+        owner.ends_with(&format!(" p0=private:{}", taken[0])),
+        "{state}"
+    );
+    assert!(!state.contains(&taken[1]), "{state}");
+    assert_eq!(
+        marked
+            .lines()
+            .filter(|line| line.starts_with("# held "))
+            .collect::<Vec<_>>(),
+        [format!("# held e2.1 class=1 {}", taken[1])],
+        "{marked}"
+    );
+}
+
 #[test]
 fn what_a_rolled_back_epoch_made_is_evicted() {
     let mut fixture = Fixture::new();

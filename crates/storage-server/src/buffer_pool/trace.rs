@@ -879,8 +879,13 @@ fn stated_request(request: &Request, session: &str) -> String {
 /// for, in lines that start with `#`, which `verification/buffer-pool/steps.py`
 /// reads and `agreement.py` never sees: the class of each key cached in a
 /// class other than 0 (the model has one class, so a key cached in another is
-/// outside its terms, A6; a key with no such line is of the class 0), and
-/// each key cached on the device in more than one region.
+/// outside its terms, A6; a key with no such line is of the class 0), each
+/// key cached on the device in more than one region, and the units each
+/// owner of an open session holds in each class other than 0, as runs
+/// (`# held e<epoch>.<owner> class=<class> <region:first-last>...`):
+/// [`stated`] states an owner's table of the class 0 alone, so a unit of the
+/// model's region that another class's block holds is neither free nor held
+/// in its terms, and such a state is outside them.
 pub(crate) fn classes(pool: &BufferPool) -> String {
     let classes: BTreeMap<String, u8> = pool
         .cache
@@ -902,6 +907,35 @@ pub(crate) fn classes(pool: &BufferPool) -> String {
         .collect();
     copies.sort_unstable();
     lines.extend(copies);
+    // The units of an owner's tables of the other classes, in any region:
+    // a draft model's cache pages, say, taken from the region of the class 0.
+    let mut held = Vec::new();
+    for ((client, number), owner) in &pool.owners {
+        if !pool.sessions.contains_key(client) {
+            continue;
+        }
+        for (class, table) in owner.tables.iter().enumerate().skip(1) {
+            // Each run of a block as `region:first-last`, or `region:unit`.
+            let units: Vec<String> = table
+                .values()
+                .flat_map(|entry| entry.block().stated())
+                .map(|(region, first, count)| match count {
+                    1 => format!("{region}:{first}"),
+                    _ => format!("{region}:{first}-{}", first + count - 1),
+                })
+                .collect();
+            if !units.is_empty() {
+                held.push(format!(
+                    "# held {}.{} class={class} {}",
+                    session(pool, *client),
+                    number.0,
+                    units.join(" ")
+                ));
+            }
+        }
+    }
+    held.sort_unstable();
+    lines.extend(held);
     lines.join("\n")
 }
 
