@@ -48,8 +48,11 @@ MEMORIES = {
 # `GroupParts`): the one part in all but `parts`.
 GROUP_PARTS = {shape: {"ga": ["hp"], "gb": ["hp"]} for shape in ("core", "copies", "transfer", "tiers", "cross")}
 GROUP_PARTS["parts"] = {"ga": ["pa"], "gb": ["pa", "pb"]}
-GROUPS = {"ga": 0, "gb": 1}
-OWNERS = {"o1": 1, "o2": 2}
+# The enumeration's one session is of the epoch 1 (the model's `e1`): its
+# groups and owners are named under it.
+GROUPS = {"ga": "e1.g0", "gb": "e1.g1"}
+MEMORY_BITS = {"ga": 0, "gb": 1}
+OWNERS = {"o1": "e1.1", "o2": "e1.2"}
 
 TOKEN = re.compile(r'\s*(<<|>>|\|->|:>|@@|[{}\[\](),]|"[^"]*"|[A-Za-z0-9_]+)')
 
@@ -108,7 +111,12 @@ KEY = "01" * 32
 
 # The variables of the model that the projection reads.
 READ = {"valid", "ogroup", "deferred", "hcache", "tasks", "free", "copies", "ncopy", "launched", "table",
-        "remote", "oslot", "ostate", "cache"}
+        "remote", "oslot", "ostate", "cache", "trial", "lost", "vis"}
+
+
+def epoch_of(name):
+    """The epoch a group belongs to: `e1` of `e1.g0`."""
+    return name.split(".")[0]
 
 
 def runs(found):
@@ -132,12 +140,15 @@ def project(state, shape):
     bits = lambda found: ",".join(sorted((memory[name] for name in found), key=lambda bit: int(bit[1:])))
     unit = lambda name: names[name]
     units = lambda found: " ".join(sorted(unit(name) for name in found))
-    group = lambda name: f"g{GROUPS[name]}"
+    group = lambda name: GROUPS[name]
     lines = [f"ncopy {state['ncopy']}"]
 
     launched = state["launched"]
     lines.append("completed " + " ".join(f"{group(name)}={launched[name]}" for name in sorted(launched)))
     lines.append(f"free {runs(unit(name) for name in state['free'])}".rstrip())
+    # Each epoch's trial and whether its session is closed.
+    for epoch in sorted(state["trial"]):
+        lines.append(f"epoch {epoch} {'closed' if epoch in state['lost'] else 'open'} trial={state['trial'][epoch]}")
 
     held, hosts = set(), set()
     for owner in sorted(state["ostate"]):
@@ -157,7 +168,10 @@ def project(state, shape):
         remote = int(key in state["remote"])
         if device != "none" or host != "none" or remote:
             shown = lambda name: "-" if name == "none" else unit(name)
-            lines.append(f"key {KEY} d={shown(device)} h={shown(host)} remote={remote}")
+            # The epoch on trial each copy is visible to alone (R8), or `-`.
+            made = state["vis"][key]
+            vd, vh = ("-" if made[tier] == "none" else made[tier] for tier in ("d", "h"))
+            lines.append(f"key {KEY} d={shown(device)} h={shown(host)} remote={remote} vd={vd} vh={vh}")
         if device != "none":
             held.add(device)
         if host != "none":
@@ -173,7 +187,7 @@ def project(state, shape):
         owner = position = memory = "-"
         if kind in ("clone", "load"):
             owner, position = str(OWNERS[copy["o"]]), "0"
-            memory = f"m{GROUPS[copy['g']]}"
+            memory = f"m{MEMORY_BITS[copy['g']]}"
         elif kind == "restore":
             owner = str(OWNERS[copy["o"]])
         elif kind == "save":
@@ -191,7 +205,8 @@ def project(state, shape):
         elif kind in ("store", "save"):
             parts = bits(parts_of[copy["g"]])
         return (f"kind={kind} o={owner} p={position} read={unit(copy['read'])} "
-                f"write={unit(copy['write'])} fill={fill} mem={memory} k={key} parts={parts}")
+                f"write={unit(copy['write'])} fill={fill} mem={memory} k={key} parts={parts} "
+                f"s={epoch_of(group(copy['g']))}")
 
     copies = state["copies"]
     lines.extend("copy " + copy_line(copy) for copy in copies)
@@ -199,7 +214,7 @@ def project(state, shape):
     def pending(after):
         """The stamps `completed` has not reached, by group."""
         waits = sorted((GROUPS[name], int(at)) for name, at in after.items() if int(at) > int(launched[name]))
-        return ",".join(f"g{group}:{at}" for group, at in waits)
+        return ",".join(f"{group}:{at}" for group, at in waits)
 
     for item in state["deferred"]:
         kind, after = item["kind"], pending(item["after"])
@@ -231,9 +246,13 @@ def project(state, shape):
             (block,) = task["units"]
             lines.append(f"task replicate o={OWNERS[task['o']]} p=0 to={group(task['to'])} u={unit(block)}")
         else:
-            # A prefetch writes the host parts of the group that asked for it.
-            parts = bits(parts_of[task["to"]]) if task["kind"] == "prefetch" else ""
-            lines.append(f"task {task['kind']} h={unit(task['h'])} expired={expired} k={KEY} parts={parts}")
+            # A prefetch writes the host parts of the group that asked for it,
+            # of its session.
+            prefetch = task["kind"] == "prefetch"
+            parts = bits(parts_of[task["to"]]) if prefetch else ""
+            asked = epoch_of(group(task["to"])) if prefetch else "-"
+            lines.append(f"task {task['kind']} h={unit(task['h'])} expired={expired} k={KEY} parts={parts} "
+                         f"s={asked}")
     return "\n".join(sorted({line.rstrip() for line in lines}))
 
 

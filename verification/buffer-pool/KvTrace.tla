@@ -57,21 +57,26 @@ CopyLine(c) ==
      \* The host parts a store or a save writes.
      parts |-> CASE c.kind = "store" -> IF c.fill THEN c.parts ELSE GroupParts[c.g]
                  [] c.kind = "save" -> GroupParts[c.g]
-                 [] OTHER -> {}]
+                 [] OTHER -> {},
+     \* The session whose request asked for the copy.
+     s |-> GroupEpoch[c.g]]
 
 \* A task in flight, as a `task` line states it.
 TaskLine(t) ==
     CASE t.kind = "transfer" ->
            [kind |-> "transfer", o |-> t.o, p |-> "-", to |-> t.to, slot |-> t.slot,
-            units |-> t.units, writes |-> t.writes, h |-> "-", expired |-> 0, k |-> "-", parts |-> {}]
+            units |-> t.units, writes |-> t.writes, h |-> "-", expired |-> 0, k |-> "-", parts |-> {},
+            s |-> "-"]
       [] t.kind = "replicate" ->
            [kind |-> "replicate", o |-> t.o, p |-> t.p, to |-> t.to, slot |-> "-",
-            units |-> t.units, writes |-> t.writes, h |-> "-", expired |-> 0, k |-> "-", parts |-> {}]
+            units |-> t.units, writes |-> t.writes, h |-> "-", expired |-> 0, k |-> "-", parts |-> {},
+            s |-> "-"]
       [] OTHER ->
            [kind |-> t.kind, o |-> "-", p |-> "-", to |-> "-", slot |-> "-", units |-> {},
             writes |-> {}, h |-> t.h, expired |-> IF t.expired THEN 1 ELSE 0, k |-> t.k,
-            \* The host parts of the group a prefetch writes for.
-            parts |-> IF t.kind = "prefetch" THEN GroupParts[t.to] ELSE {}]
+            \* The host parts of the group a prefetch writes for, and its session.
+            parts |-> IF t.kind = "prefetch" THEN GroupParts[t.to] ELSE {},
+            s |-> IF t.kind = "prefetch" THEN GroupEpoch[t.to] ELSE "-"]
 
 Waiting(kind) == {d \in deferred : d.kind = kind}
 
@@ -80,6 +85,8 @@ Matches(st) ==
     /\ ncopy = st.ncopy
     /\ launched = st.completed
     /\ free = st.free
+    \* Each epoch's trial, and whether its engine is gone (its session closed).
+    /\ \A e \in Epochs : trial[e] = st.epochs[e].trial /\ (e \in lost) = (st.epochs[e].is = "closed")
     /\ \A o \in Owners :
          IF ostate[o] = "live"
          THEN st.owners[o] =
@@ -91,8 +98,11 @@ Matches(st) ==
          \* not it was attached, and its state cannot tell which. A model
          \* owner never attached is such a number.
          ELSE st.owners[o].is \in {ostate[o], "gone"}
+    \* Each cached key with its copies, and the epoch on trial each copy is
+    \* visible to alone (R8).
     /\ st.keys =
-         {[k |-> y, d |-> Shown(cache[y]), h |-> Shown(hcache[y]), r |-> IF y \in remote THEN 1 ELSE 0] :
+         {[k |-> y, d |-> Shown(cache[y]), h |-> Shown(hcache[y]), r |-> IF y \in remote THEN 1 ELSE 0,
+           vd |-> Shown(vis[y].d), vh |-> Shown(vis[y].h)] :
             y \in {x \in Keys : cache[x] # NONE \/ hcache[x] # NONE \/ x \in remote}}
     \* The memories of every device block an owner, the cache or a waiting
     \* commit holds, and the host parts of every cached host block.
@@ -128,11 +138,14 @@ Matches(st) ==
 (* nothing caches, is valid nowhere (each is written before it is read, or *)
 (* is reclaimed); a clone's key is the one its source is cached under, and *)
 (* a restore's the one its host block is (the copy holds either, so the    *)
-(* cache keeps it, R2); a store's or a save's group is one that copies     *)
-(* with the host parts it writes, a prefetch's the one whose host parts it *)
-(* writes, and a restore's of a gone owner any (the groups of a window are *)
-(* of one epoch, and a copy reads no more of its group); the owner of a    *)
-(* save whose owner is gone is a gone owner. `x.member` is the device     *)
+(* cache keeps it, R2); a copy's group is one of the session its line     *)
+(* states: the owner's, the one whose memory a clone or a load writes, one *)
+(* that copies with the host parts a store or a save writes, any for a     *)
+(* restore of a gone owner (a copy reads no more of its group than these); *)
+(* a prefetch's the one of its session whose host parts it writes; the     *)
+(* owner of a save whose owner is gone a gone owner of its session. Each   *)
+(* epoch's trial and whether its session is closed, and each copy's        *)
+(* visibility (R8), are as the state states them. `x.member` is the device *)
 (* units in their region, `x.copies` the copies in flight in an order that *)
 (* numbers them, and `x.finishes` the waiting `Finish`es by the index of   *)
 (* their copy.                                                             *)
@@ -151,18 +164,20 @@ Start(x) ==
         \* A copy's group: the one whose memory a clone or a load writes, a
         \* live owner's, or one that copies with the host parts a store or a
         \* save writes (groups alike in these are alike to a copy).
+        ofSession(l) == {g \in Groups : GroupEpoch[g] = l.s}
         groupOf(l) ==
-            CASE l.mem # "-" -> CHOOSE g \in Groups : GroupMemory[g] = l.mem
-              [] l.o # "-" /\ live(l.o) -> st.owners[l.o].g
-              [] l.kind = "store" /\ l.fill = 1 -> CHOOSE g \in Groups : l.parts \subseteq GroupParts[g]
-              [] l.kind \in {"store", "save"} -> CHOOSE g \in Groups : GroupParts[g] = l.parts
-              [] OTHER -> CHOOSE g \in Groups : TRUE
+            CASE l.o # "-" /\ live(l.o) -> st.owners[l.o].g
+              [] l.mem # "-" -> CHOOSE g \in ofSession(l) : GroupMemory[g] = l.mem
+              [] l.kind = "store" /\ l.fill = 1 -> CHOOSE g \in ofSession(l) : l.parts \subseteq GroupParts[g]
+              [] l.kind \in {"store", "save"} -> CHOOSE g \in ofSession(l) : GroupParts[g] = l.parts
+              [] OTHER -> CHOOSE g \in ofSession(l) : TRUE
         \* A copy's owner: the one its line states; none for a store; for a
         \* save whose owner is gone, a gone owner, or none when the window has
         \* none (a save of none is one no request can name, as one of a gone owner).
         ownerOf(l) ==
             IF l.o # "-" THEN l.o
-            ELSE IF l.kind = "save" /\ gone # {} THEN CHOOSE o \in gone : TRUE
+            ELSE IF l.kind = "save" /\ \E o \in gone : OwnerEpoch[o] = l.s
+            THEN CHOOSE o \in gone : OwnerEpoch[o] = l.s
             ELSE NONE
         Copied(l, j) ==
             [id |-> ident(j), kind |-> l.kind, o |-> ownerOf(l), p |-> IF l.p = "-" THEN NONE ELSE l.p,
@@ -226,13 +241,17 @@ Start(x) ==
                       [kind |-> tl.kind, k |-> tl.k, h |-> tl.h, src |-> "remote", ok |-> TRUE,
                        expired |-> tl.expired = 1, p |-> NONE, o |-> NONE,
                        \* The group whose host parts a prefetch writes.
-                       to |-> IF tl.kind = "prefetch" THEN CHOOSE g \in Groups : GroupParts[g] = tl.parts
+                       to |-> IF tl.kind = "prefetch"
+                              THEN CHOOSE g \in Groups : GroupEpoch[g] = tl.s /\ GroupParts[g] = tl.parts
                               ELSE NONE,
                        slot |-> NONE,
                        held |-> TRUE, units |-> {}, writes |-> {}] :
                  tl \in st.tasks}
-       /\ vis = [y \in Keys |-> [d |-> NONE, h |-> NONE]]
-       /\ trial = [e \in Epochs |-> "no"]
+       /\ vis = [y \in Keys |-> IF keyed(y) = {} THEN [d |-> NONE, h |-> NONE]
+                                ELSE LET e == CHOOSE f \in keyed(y) : TRUE
+                                     IN [d |-> IF e.vd = "-" THEN NONE ELSE e.vd,
+                                         h |-> IF e.vh = "-" THEN NONE ELSE e.vh]]
+       /\ trial = [e \in Epochs |-> st.epochs[e].trial]
        /\ dbt = [g \in Groups |-> [o \in Owners |-> [q \in Rows |-> NoEntry]]]
        /\ alloc = [b \in AllUnits |-> IF \E y \in Keys : cache[y] = b \/ hcache[y] = b
                                       THEN "shared" ELSE NONE]
@@ -241,7 +260,7 @@ Start(x) ==
                         IF \E y \in Keys : cache[y] = b \/ hcache[y] = b
                         THEN CHOOSE y \in Keys : cache[y] = b \/ hcache[y] = b
                         ELSE NONE]
-       /\ lost = {}
+       /\ lost = {e \in Epochs : st.epochs[e].is = "closed"}
        /\ bad = {}
 
 -----------------------------------------------------------------------------
@@ -262,13 +281,14 @@ Asked(q) ==
         /\ r.kind = "finish" => r.ok = q.ok
 
 (* MC_Pool's `Arrive` with each of its choices narrowed to the one the     *)
-(* input names: every step of it is an `Arrive` step. TLC enumerates the   *)
-(* domain of a choice before `Asked` can reject it, and `Arrive` chooses a *)
-(* release's positions among all sets of positions. A `Finish` names its   *)
-(* copy by nothing a state states, so it may name any copy.                *)
+(* input names, the session of its queue pair among them: every step of it *)
+(* is an `Arrive` step. TLC enumerates the domain of a choice before       *)
+(* `Asked` can reject it, and `Arrive` chooses a release's positions among *)
+(* all sets of positions. A `Finish` names its copy by nothing a state     *)
+(* states, so it may name any copy.                                        *)
 ArriveAs(q) ==
     /\ requests = {}
-    /\ \E e \in Epochs \ lost,
+    /\ \E e \in (Epochs \ lost) \cap {q.e},
           after \in {a \in {q.after} : /\ a \in [Groups -> 0 .. MaxBatch]
                                        /\ \A g \in Groups \ Stamping : a[g] = 0} :
          \/ \E o \in Owners \cap {q.o} :

@@ -44,10 +44,16 @@ checked: an open, a close or a pool's image; a request of a class other
 than 0; a prefetch from the peers; a load or a store of several keys (the
 model makes one per key; a prefetch of several is checked as one per key
 in order, and a state states a task of several keys as one per key); a
-state while no session or several are open, with units of a region the
-model lacks held (another class's), or with a key cached in a class other
-than 0 (the model has one class; `# class` lines state them); a step that
-takes or frees units of a region the model lacks.
+request of no open session; a state while no session is open, with units
+of a region the model lacks held (another class's), with a key cached in a
+class other than 0 (the model has one class; `# class` lines state them)
+or on the device in several regions (the model caches one device block
+per key; `# device` lines state them); a step that takes or frees units of
+a region the model lacks; a resize over KV regions of two unit sizes in
+one memory space, which the model's chunks cannot relate. Several open
+sessions are checked as the model's epochs: owners and groups are named
+under their session's epoch, and each epoch's trial, whether its session
+is closed, and each copy's visibility (R8) are stated.
 
 Prints one verdict line: ok; FAIL with the first step no path follows,
 whose window is kept in WORK/failure.txt (with the first 50 such); or
@@ -135,12 +141,13 @@ class Outside(Exception):
 
 
 def parse_layout(block):
-    """Per group its memory, its slot rows' region, its KV regions and the host
-    parts it copies with; the host regions. None while no session or several
-    are open."""
+    """Per group, named by its session's epoch (`e<epoch>.g<group>`), its
+    memory, its slot rows' region, its KV regions and the host parts it
+    copies with; the host regions; per region its memory space and the bytes
+    of a unit. None while no session is open."""
     if block == ["layout none"]:
         return None
-    groups, hosts = {}, set()
+    groups, hosts, regions = {}, set(), {}
     for line in block:
         parts = line.split()
         if parts[1] == "group":
@@ -150,17 +157,26 @@ def parse_layout(block):
             groups[parts[2]] = (parts[4], parts[6], tuple(kv), copied)
         elif parts[1] == "host":
             hosts.add(parts[2])
-    return (tuple(sorted(groups.items())), tuple(sorted(hosts)))
+        elif parts[1] == "region":
+            regions[parts[2]] = (parts[4], parts[6])
+    return (tuple(sorted(groups.items())), tuple(sorted(hosts)), tuple(sorted(regions.items())))
+
+
+def epoch_of(name):
+    """The epoch an owner or a group belongs to: `e1` of `e1.5` and `e1.g0`."""
+    return name.split(".")[0]
 
 
 def kinds(layout):
     """What each region is to the model: the KV units, a group's slot rows, or host units."""
     if layout is None:
-        raise Outside("no session or several open")
+        raise Outside("no session open")
     regions = {}
     for group, (_, rows, kv, _) in layout[0]:
         if len(kv) != 1:
             raise Outside("a group with other than one KV region")
+        if regions.get(rows, ("rows", group)) != ("rows", group) or regions.get(kv[0], ("kv", None)) != ("kv", None):
+            raise Outside("a region of two kinds or of two groups' slot rows")
         regions[kv[0]] = ("kv", None)
         regions[rows] = ("rows", group)
     for region in layout[1]:
@@ -330,6 +346,10 @@ class State:
         self.valid = {}           # unit -> line
         self.records = {}         # line -> record(line)
         self.classes = {}         # key -> class
+        self.devices = {}         # key -> its device copies, where more than one
+        self.epochs = {}          # epoch -> (open or closed, trial)
+        self.makers = {}          # key -> (the epochs its device and host copies are visible to alone)
+        self.by_maker = collections.defaultdict(set)  # epoch -> {key}
         self.holders = collections.defaultdict(set)   # unit -> {fact}
         self.by_owner = collections.defaultdict(set)  # owner -> {record line}
         self.by_key = collections.defaultdict(set)    # key -> {task line}
@@ -347,6 +367,8 @@ class State:
             parts = rest.split()
             if parts[0] == "class":
                 self.classes[parts[1]] = parts[2]
+            elif parts[0] == "device":
+                self.devices[parts[1]] = parts[2]
         else:
             self.lines.add(line)
             if word == "owner":
@@ -372,6 +394,13 @@ class State:
                 for unit in (found["d"], found["h"]):
                     if unit != "-":
                         self.holders[unit].add(("k", key))
+                self.makers[key] = (found["vd"], found["vh"])
+                for epoch in self.makers[key]:
+                    if epoch != "-":
+                        self.by_maker[epoch].add(key)
+            elif word == "epoch":
+                parts = rest.split()
+                self.epochs[parts[0]] = (parts[1], parts[2][len("trial="):])
             elif word == "valid":
                 self.valid[rest.split()[0]] = line
             elif word in RECORDS:
@@ -404,6 +433,10 @@ class State:
             for unit in (d, h):
                 if unit != "-":
                     self.holders[unit].discard(("k", key))
+            for epoch in self.makers.pop(key):
+                self.by_maker[epoch].discard(key)
+        elif word == "epoch":
+            del self.epochs[rest.split()[0]]
         elif word == "valid":
             del self.valid[rest.split()[0]]
         elif word in RECORDS:
@@ -421,6 +454,8 @@ def outside_state(state, regions):
     """Why a state is outside the model's terms, or None."""
     if any(cls != "0" for cls in state.classes.values()):
         return "a key cached in a class other than 0"
+    if state.devices:
+        return "a key cached on the device in several regions"
     for line in state.lines:
         for region, _ in UNIT.findall(line):
             if region not in regions:
@@ -438,7 +473,7 @@ ACTS = {"attach": ["Attach"], "allocate": ["Allocate"], "pin": ["Pin"], "clone":
         "load": ["Load"], "save": ["Save", "EvictHost"], "restore": ["Restore"], "evict": ["Evict"],
         "completed": ["Advance"], "tick": ["Deadline"], "done": ["PrefetchEnd", "PutEnd"],
         "ended": ["TransferEnd", "ReplicateEnd", "PrefetchEnd", "PutEnd"], "publish": ["CommitUpdate"],
-        "roll-back": ["Rollback"], "resize": ["Evict", "Shrink", "Grow"]}
+        "roll-back": ["Rollback", "Evict", "EvictHost"], "resize": ["Evict", "Shrink", "Grow"]}
 
 
 def acts(text):
@@ -501,6 +536,8 @@ def changes(before, after):
                     changed |= {("u", unit) for unit in state.keys[key][:2] if unit != "-"}
         elif word == "valid":
             changed.add(("u", rest.split()[0]))
+        elif word == "epoch":
+            changed.add(("E", rest.split()[0]))
         else:
             changed.add(("l", line))
             changed |= {("u", unit) for unit in record(line)[1]}
@@ -522,13 +559,20 @@ def named(text):
     return facts
 
 
-def closure(fact, states):
-    """The facts a fact brings into its window, in either state."""
+def closure(fact, states, partners):
+    """The facts a fact brings into its window, in either state. `partners`
+    gives, per KV region, the KV regions of other layouts whose units of one
+    number occupy the same memory (R10)."""
     kind = fact[0]
     found = set()
+    if kind == "u":
+        region, _, number = fact[1].partition(":")
+        found |= {("u", f"{other}:{number}") for other in partners.get(region, ())}
     for state in states:
         if kind == "u":
             found |= state.holders.get(fact[1], set())
+        elif kind == "E":
+            found |= {("k", key) for key in state.by_maker.get(fact[1], set())}
         elif kind == "e":
             owner, position = fact[1], fact[2]
             found.add(("h", owner))
@@ -571,7 +615,7 @@ def closure(fact, states):
     return found
 
 
-def windows_of(before, after, text):
+def windows_of(before, after, text, partners):
     """The parts of the pool a step touches that share no changed fact:
     each a set of facts. A fact that does not change may be in several
     parts: no path changes it for good, since each part's path ends in the
@@ -589,7 +633,7 @@ def windows_of(before, after, text):
     def reach(start):
         seen, pending = set(start), collections.deque(start)
         while pending:
-            for other in closure(pending.popleft(), states):
+            for other in closure(pending.popleft(), states, partners):
                 if other not in seen:
                     seen.add(other)
                     pending.append(other)
@@ -614,6 +658,10 @@ def windows_of(before, after, text):
     parts = collections.defaultdict(set)
     for fact, found in reached:
         parts[find(fact)] |= found
+    # An epoch's trial is read by any step: a step that changes one (a commit
+    # or a rollback of an update) is one window.
+    if any(fact[0] == "E" for fact in changed) and len(parts) > 1:
+        return [set().union(*parts.values())]
     return list(parts.values())
 
 
@@ -622,10 +670,11 @@ def windows_of(before, after, text):
 
 
 def projected(state, part, witnesses, rename):
-    """The lines of `state` within `part`, renamed."""
+    """The lines of `state` within `part`, renamed, with every epoch."""
     units = {fact[1] for fact in part if fact[0] == "u"} | witnesses
     full = {fact[1] for fact in part if fact[0] == "f"}
     lines = [f"free {' '.join(sorted(rename(unit) for unit in units if unit in state.free))}"]
+    lines += [f"epoch {rename(epoch, 'e')} {is_} trial={trial}" for epoch, (is_, trial) in sorted(state.epochs.items())]
     for owner in sorted({fact[1] for fact in part if fact[0] == "h"}):
         if owner not in state.owners:
             lines.append(f"owner {rename(owner, 'o')} new")
@@ -637,11 +686,14 @@ def projected(state, part, witnesses, rename):
         kept = [f"p{rename(position, 'p')}={kind}:{rename(unit)}"
                 for position, (kind, unit) in sorted(entries.items())
                 if owner in full or ("e", owner, position) in part]
-        lines.append(" ".join([f"owner {rename(owner, 'o')} live {group} slot={rename(slot)}"] + kept))
+        lines.append(" ".join([f"owner {rename(owner, 'o')} live {rename(group, 'g')} slot={rename(slot)}"] + kept))
     for key in sorted({fact[1] for fact in part if fact[0] == "k"}):
         if key in state.keys:
             d, h, line = state.keys[key]
-            lines.append(f"key {rename(key, 'k')} d={rename(d)} h={rename(h)} " + line.split()[-1])
+            remote = fields(line)["remote"]
+            made = [rename(epoch, "e") for epoch in state.makers[key]]
+            lines.append(f"key {rename(key, 'k')} d={rename(d)} h={rename(h)} remote={remote} "
+                         f"vd={made[0]} vh={made[1]}")
     for unit in sorted(units):
         if unit in state.valid:
             lines.append(rename_units(state.valid[unit], rename))
@@ -655,18 +707,33 @@ def rename_units(text, rename):
     return UNIT.sub(lambda match: rename(match.group(0)), text)
 
 
+def rename_stamps(text, rename):
+    """Stamps `<group>:<sequence>,...` with their groups renamed."""
+    return ",".join(f"{rename(group, 'g')}:{at}" for group, _, at in (item.partition(":") for item in text.split(",")
+                                                                      if item))
+
+
 def rename_record(line, rename):
-    """A record line with its units, owners, positions and keys renamed."""
+    """A record line with its units, owners, groups, positions, keys and
+    sessions renamed."""
     def item(token):
         name, sep, value = token.partition("=")
         if not sep:
             return rename_units(token, rename)
-        if name == "o" and value != "-":
+        if value == "-":
+            return token
+        if name == "o":
             return f"o={rename(value, 'o')}"
-        if name == "p" and value != "-":
+        if name == "p":
             return f"p={rename(value, 'p')}"
-        if name == "k" and value != "-":
+        if name == "k":
             return f"k={rename(value, 'k')}"
+        if name == "to":
+            return f"to={rename(value, 'g')}"
+        if name == "s":
+            return f"s={rename(value, 'e')}"
+        if name == "after":
+            return f"after={rename_stamps(value, rename)}"
         return f"{name}={rename_units(value, rename)}"
     return " ".join(item(token) for token in line.split(" "))
 
@@ -677,6 +744,12 @@ def rename_input(text, rename):
     for name, value in found.items():
         if name == "o":
             value = rename(value, "o")
+        elif name in ("g", "to"):
+            value = rename(value, "g")
+        elif name == "e":
+            value = rename(value, "e")
+        elif name == "after":
+            value = rename_stamps(value, rename)
         elif name == "ps":
             value = ",".join(rename(position, "p") for position in value.split(",") if position)
         elif name == "ks":
@@ -687,9 +760,11 @@ def rename_input(text, rename):
 
 class Renaming:
     """Names in order, per region for units: what a window's model knows of
-    its units, owners, keys and positions."""
+    its units, owners, keys and positions; epochs in order, those with
+    groups in the layout first, and owners in order within their epoch
+    (`e1.o1`); a group keeps its number under its epoch's name."""
 
-    def __init__(self, units, owners, keys, positions):
+    def __init__(self, units, owners, keys, positions, epochs):
         self.names = {}
         by_region = collections.defaultdict(list)
         for unit in units:
@@ -698,20 +773,32 @@ class Renaming:
         for region, numbers in by_region.items():
             for index, number in enumerate(sorted(numbers)):
                 self.names[("u", f"{region}:{number}")] = f"{region}:{index + 1}"
-        for prefix, items in (("o", owners), ("k", keys), ("p", positions)):
+        for index, epoch in enumerate(epochs):
+            self.names[("e", epoch)] = f"e{index + 1}"
+        by_epoch = collections.defaultdict(list)
+        for owner in owners:
+            by_epoch[epoch_of(owner)].append(owner)
+        self.counts = {region: len(numbers) for region, numbers in by_region.items()}
+        for epoch, named in by_epoch.items():
+            for index, owner in enumerate(sorted(named, key=lambda item: int(item.split(".")[1]))):
+                self.names[("o", owner)] = f"{self.names[('e', epoch)]}.o{index + 1}"
+            self.counts[f"owners {self.names[('e', epoch)]}"] = len(named)
+        for prefix, items in (("k", keys), ("p", positions)):
             ordered = sorted(items, key=lambda item: (len(item), item))
             for index, item in enumerate(ordered):
                 self.names[(prefix, item)] = f"{prefix}{index + 1}" if prefix != "p" else str(index + 1)
-        self.counts = {region: len(numbers) for region, numbers in by_region.items()}
-        self.counts.update(owners=len(owners), keys=len(keys), positions=len(positions))
+        self.counts.update(keys=len(keys), positions=len(positions), epochs=len(epochs))
 
     def __call__(self, item, prefix="u"):
-        if prefix == "u" and item == "-":
-            return "-"
+        if item == "-" or (prefix == "e" and item == "none"):
+            return item
+        if prefix == "g":
+            epoch, _, group = item.partition(".")
+            return f"{self.names[('e', epoch)]}.{group}"
         return self.names[(prefix, item)]
 
 
-def window(step, before, after, text, part, witnesses):
+def window(step, before, after, text, part, witnesses, layout, chunks):
     """A window as plain data: its renamed states, input and witnesses, and
     its size."""
     units = {fact[1] for fact in part if fact[0] == "u"} | witnesses
@@ -732,8 +819,25 @@ def window(step, before, after, text, part, witnesses):
                 keys |= named_keys
                 for named_positions in named_owners.values():
                     positions |= named_positions
-    rename = Renaming(units, owners, keys, positions)
+    # Every epoch: those of the layout's groups in order, then the others.
+    sessions = sorted({epoch_of(group) for group, _ in layout[0]}, key=lambda epoch: int(epoch[1:]))
+    others = (set(before.epochs) | set(after.epochs)) - set(sessions)
+    epochs = sessions + sorted(others, key=lambda epoch: int(epoch[1:]))
+    rename = Renaming(units, owners, keys, positions, epochs)
     lines = [projected(state, part, witnesses, rename) for state in (before, after)]
+
+    # The memory each KV unit occupies, where units of two regions share one
+    # (another layout's region over the same memory): their chunk, named in
+    # order; no entry where a unit shares its memory with none of the window.
+    shared = collections.defaultdict(list)
+    for unit in units:
+        region, _, number = unit.partition(":")
+        if region in chunks:
+            shared[(chunks[region], number)].append(rename(unit))
+    occupied = {}
+    for index, (_, named) in enumerate(sorted((chunk, sorted(named)) for chunk, named in shared.items()
+                                                if len(named) > 1)):
+        occupied.update(dict.fromkeys(named, f"c{index + 1}"))
 
     # The copies of the window: those in flight in it are numbered first.
     def identity(line):
@@ -769,9 +873,18 @@ def window(step, before, after, text, part, witnesses):
             "korder": [rename(key, "k") for key in korder],
             "evict": dropped(0), "evicthost": dropped(1),
             "lines": lines, "ncopy": (len(copies[0]), len(copies[0]) + made), "made": made,
-            "completed": (before.completed, after.completed),
+            "completed": tuple(" ".join(f"{rename(group, 'g')}={at}" for group, _, at in
+                                        (entry.partition("=") for entry in state.completed.split()))
+                               for state in (before, after)),
             "witnesses": sorted(rename(unit) for unit in witnesses),
+            "layout": rename_layout(layout, rename), "chunks": occupied,
             "counts": rename.counts}
+
+
+def rename_layout(layout, rename):
+    """A layout with its groups named by the window's epochs."""
+    groups = tuple(sorted((rename(group, "g"), info) for group, info in layout[0]))
+    return (groups, layout[1], layout[2])
 
 
 def witnesses_of(before, after, parts, layout):
@@ -796,11 +909,38 @@ def state_of(body):
     return state
 
 
+def memory_of(layout):
+    """Per KV region whose memory space holds another KV region of units of
+    the same size, that space, and per such region the others: their unit of
+    one number is one chunk of memory (R10). And whether a space holds KV
+    regions of units of two sizes, whose memory the model's chunks cannot
+    relate."""
+    spaces = collections.defaultdict(list)
+    sizes = dict(layout[2])
+    for _, (_, _, kv, _) in layout[0]:
+        for region in kv:
+            if region in sizes and region not in spaces[sizes[region][0]]:
+                spaces[sizes[region][0]].append(region)
+    chunks, partners, mixed = {}, {}, False
+    for space, regions in spaces.items():
+        if len(regions) < 2:
+            continue
+        if len({sizes[region][1] for region in regions}) > 1:
+            mixed = True
+            continue
+        for region in regions:
+            chunks[region] = space
+            partners[region] = [other for other in regions if other != region]
+    return chunks, partners, mixed
+
+
 def step_windows(step, before, after, layouts_of, text):
     """A step's windows; or why it is outside the model; or none when it
     changes nothing; and a failure the windows cannot show."""
     try:
         acts(text)
+        if "e?" in text.split(".")[0] or any(value.startswith("e?") for value in fields(text).values()):
+            raise Outside("a request of no open session")
         if layouts_of[0] != layouts_of[1]:
             raise Outside("a change of layout")
         regions = kinds(layouts_of[0])
@@ -813,17 +953,18 @@ def step_windows(step, before, after, layouts_of, text):
         lacked = (before.free.regions() | after.free.regions()) - set(regions)
         if any(before.free.runs.get(region) != after.free.runs.get(region) for region in lacked):
             raise Outside("units of a region the model lacks taken or freed")
+        chunks, partners, mixed = memory_of(layouts_of[0])
+        if mixed and text.startswith("resize"):
+            raise Outside("a resize over KV regions of two unit sizes in one memory")
     except Outside as reason:
         return [], str(reason), None
-    parts = windows_of(before, after, text)
+    parts = windows_of(before, after, text, partners)
     if not parts and before.ncopy == after.ncopy and before.completed == after.completed:
         return [], None, None
     spare = witnesses_of(before, after, parts, layouts_of[0])
     # The `completed` words and the count of copies alone, when no fact
     # changes with them.
-    found = [window(step, before, after, text, part, spare) for part in (parts or [set()])]
-    for item in found:
-        item["layout"] = layouts_of[0]
+    found = [window(step, before, after, text, part, spare, layouts_of[0], chunks) for part in (parts or [set()])]
     made = sum(item["made"] for item in found)
     failure = None
     if made != after.ncopy - before.ncopy:
@@ -924,7 +1065,7 @@ def split(path, jobs):
 
 def parse_lines(lines, rank):
     """A window's lines as the record KvTrace's `Matches` compares."""
-    state = Rec(ncopy=0, completed=Fn(), free=Set(), owners=Fn(), keys=Set(), valid=Set(),
+    state = Rec(ncopy=0, completed=Fn(), free=Set(), epochs=Fn(), owners=Fn(), keys=Set(), valid=Set(),
                 copies=Set(), commits=Set(), transfers=Set(), replicates=Set(), finishes=Set(),
                 releases=Set(), tasks=Set())
     after = lambda text: Fn((group, rank[at]) for group, at in stamps(text).items())
@@ -932,6 +1073,9 @@ def parse_lines(lines, rank):
         word, _, rest = line.partition(" ")
         if word == "free":
             state["free"] = Set(rest.split())
+        elif word == "epoch":
+            parts = rest.split()
+            state["epochs"][parts[0]] = Rec(**{"is": parts[1]}, trial=parts[2][len("trial="):])
         elif word == "owner":
             parts = rest.split()
             owner = Rec(**{"is": parts[1]}, g="-", slot="-", t=Set())
@@ -945,7 +1089,8 @@ def parse_lines(lines, rank):
         elif word == "key":
             parts = rest.split()
             found = fields(rest)
-            state["keys"].append(Rec(k=parts[0], d=found["d"], h=found["h"], r=int(found["remote"])))
+            state["keys"].append(Rec(k=parts[0], d=found["d"], h=found["h"], r=int(found["remote"]),
+                                     vd=found["vd"], vh=found["vh"]))
         elif word == "valid":
             parts = rest.split()
             state["valid"].append((parts[0], Set(parts[1:])))
@@ -975,17 +1120,18 @@ def parse_lines(lines, rank):
                 match = re.match(r"o=(\S+) to=(\S+) slot=(\S+) units=(.*?) ?writes=(.*)$", rest)
                 o, to, slot, units, writes = match.groups()
                 state["tasks"].append(Rec(kind=kind, o=o, p="-", to=to, slot=slot, units=Set(units.split()),
-                                          writes=Set(writes.split()), h="-", expired=0, k="-", parts=Set()))
+                                          writes=Set(writes.split()), h="-", expired=0, k="-", parts=Set(),
+                                          s="-"))
             elif kind == "replicate":
                 found = fields(rest)
                 state["tasks"].append(Rec(kind=kind, o=found["o"], p=found["p"], to=found["to"], slot="-",
                                           units=Set([found["u"]]), writes=Set([found["u"]]), h="-",
-                                          expired=0, k="-", parts=Set()))
+                                          expired=0, k="-", parts=Set(), s="-"))
             else:
                 found = fields(rest)
                 state["tasks"].append(Rec(kind=kind, o="-", p="-", to="-", slot="-", units=Set(), writes=Set(),
                                           h=found["h"], expired=int(found["expired"]), k=found["k"],
-                                          parts=Set(filter(None, found["parts"].split(",")))))
+                                          parts=Set(filter(None, found["parts"].split(","))), s=found["s"]))
         else:
             raise ValueError(f"a line the model has no terms for: {line}")
     return state
@@ -995,7 +1141,7 @@ def copy_line(text):
     found = fields(text)
     return Rec(kind=found["kind"], o=found["o"], p=found["p"], read=found["read"],
                write=found["write"], fill=int(found["fill"]), mem=found["mem"], k=found["k"],
-               parts=Set(filter(None, found["parts"].split(","))))
+               parts=Set(filter(None, found["parts"].split(","))), s=found["s"])
 
 
 def values(item):
@@ -1029,9 +1175,11 @@ def check(job):
     units = {kind: [] for kind in ("kv", "rows", "host")}
     for region, (kind, _) in sorted(regions.items()):
         units[kind] += [f"{region}:{index + 1}" for index in range(universe.get(region, 0))]
-    owners = [f"o{index + 1}" for index in range(universe["owners"])]
     keys = [f"k{index + 1}" for index in range(universe["keys"])]
     positions = [str(index + 1) for index in range(universe["positions"])]
+    # Epochs and owners up to the most of the windows, an owner under its epoch.
+    epochs = [f"e{index + 1}" for index in range(universe["epochs"])]
+    owners = [f"{epoch}.o{index + 1}" for epoch in epochs for index in range(universe[f"owners {epoch}"])]
 
     names, definitions = {}, []
 
@@ -1053,9 +1201,12 @@ def check(job):
             state["ncopy"] = ncopy
             state["completed"] = Fn((group, rank[int(at)]) for group, at in
                                     (entry.split("=") for entry in completed.split()))
-            # Owners the window has no use for: never attached.
+            # Owners and epochs the window has no use for: owners never
+            # attached, epochs neither on trial nor closed.
             for owner in owners:
                 state["owners"].setdefault(owner, Rec(**{"is": "new"}, g="-", slot="-", t=Set()))
+            for epoch in epochs:
+                state["epochs"].setdefault(epoch, Rec(**{"is": "open"}, trial="no"))
             states.append(state)
             tasks = max(tasks, sum(1 for task in state["tasks"] if task["kind"] in ("prefetch", "put")))
             copies = max(copies, ncopy)
@@ -1091,10 +1242,15 @@ def check(job):
     memory = Fn((group, info[0]) for group, info in layout[0])
     kv_region = Fn((group, "r" + info[2][0]) for group, info in layout[0])
     # The host parts each group copies with, by their bits; a crossing may
-    # go to any other group, each stating the class's regions.
+    # go to any other group of its session, each stating the class's regions.
     group_parts = Fn((group, Set(info[3])) for group, info in layout[0])
     host_parts = Set(sorted({part for _, info in layout[0] for part in info[3]}))
-    readers = Fn((group, Set(other for other in groups if other != group)) for group in groups)
+    readers = Fn((group, Set(other for other in groups if other != group and epoch_of(other) == epoch_of(group)))
+                 for group in groups)
+    # The memory a KV unit occupies: its own, or the chunk it shares with a
+    # unit of another layout's region (the windows of a run share these).
+    chunk = {unit: unit for unit in units["kv"]}
+    chunk.update(batch[0]["chunks"])
     # Each constant is the name of a definition of its value: TLC evaluates a
     # definition that substitutes a constant (`<-`) at each use, and one it
     # names once, at the start.
@@ -1107,11 +1263,12 @@ def check(job):
         "TraceGroups": tla(Set(groups)),
         "TracePositions": tla(Set(positions)),
         "TraceSlotGroup": tla(slot_group),
-        "TraceGroupEpoch": "[g \\in TraceGroups |-> e1]",
-        "TraceOwnerEpoch": "[o \\in TraceOwners |-> e1]",
+        "TraceEpochs": tla(Set(epochs)),
+        "TraceGroupEpoch": tla(Fn((group, epoch_of(group)) for group in groups)),
+        "TraceOwnerEpoch": tla(Fn((owner, epoch_of(owner)) for owner in owners)),
         "TraceGroupMemory": tla(memory),
         "TraceUnitRegion": tla(Fn((unit, "r" + unit.split(":")[0]) for unit in units["kv"])),
-        "TraceUnitChunk": "[u \\in TraceUnits |-> u]",
+        "TraceUnitChunk": tla(Fn(chunk)),
         "TraceGroupRegion": tla(kv_region),
         "TraceHostParts": tla(host_parts),
         "TraceGroupParts": tla(group_parts),
@@ -1132,7 +1289,7 @@ def check(job):
     constants = {
         "Units": "<- TraceUnits", "Slots": "<- TraceSlots", "HostUnits": "<- TraceHostUnits",
         "Keys": "<- TraceKeys", "Owners": "<- TraceOwners", "Groups": "<- TraceGroups",
-        "Positions": "<- TracePositions", "Epochs": "= {e1}", "Transfers": "= TRUE",
+        "Positions": "<- TracePositions", "Epochs": "<- TraceEpochs", "Transfers": "= TRUE",
         "Stamping": "<- TraceGroups", "SlotGroup": "<- TraceSlotGroup",
         "GroupEpoch": "<- TraceGroupEpoch", "OwnerEpoch": "<- TraceOwnerEpoch",
         "GroupMemory": "<- TraceGroupMemory", "UnitRegion": "<- TraceUnitRegion",
@@ -1180,7 +1337,8 @@ def input_record(item, groups, owners, positions, keys, rank):
     listed = lambda name, every: Set(named_values[name].split(",")) if named_values.get(name) else Set(every)
     request = Rec(kind=kind if kind in ARRIVE else "none", o=named_values.get("o", "none"),
                   ps=listed("ps", []), p=named_values.get("ps", "none"), k=named_values.get("ks", "none"),
-                  to=named_values.get("to", "none"), ok=named_values.get("ok") == "1", after=after)
+                  to=named_values.get("to", "none"), ok=named_values.get("ok") == "1", after=after,
+                  e=named_values.get("e", "none"))
     completed = Fn((group, 0) for group in groups)
     if kind == "completed":
         completed[named_values["g"]] = rank[int(named_values["value"])]
@@ -1196,15 +1354,18 @@ def input_record(item, groups, owners, positions, keys, rank):
 def weight(item):
     """How large a window's states are: its units, keys and owners' entries."""
     counts = item["counts"]
-    units = sum(count for name, count in counts.items() if name not in ("owners", "keys", "positions"))
-    return units + counts["keys"] + counts["owners"] * (counts["positions"] + 1)
+    owners = sum(count for name, count in counts.items() if name.startswith("owners "))
+    units = sum(count for name, count in counts.items()
+                if not name.startswith("owners ") and name not in ("keys", "positions", "epochs"))
+    return units + counts["keys"] + owners * (counts["positions"] + 1)
 
 
 def batches_of(windows, limit):
-    """Windows of one layout and alike in size, at most `limit` per run."""
+    """Windows of one layout, of the same units sharing memory, and alike in
+    size, at most `limit` per run."""
     grouped = collections.defaultdict(list)
     for item in windows:
-        grouped[repr(item["layout"])].append(item)
+        grouped[(repr(item["layout"]), repr(sorted(item["chunks"].items())))].append(item)
     found = []
     for items in grouped.values():
         items.sort(key=weight)

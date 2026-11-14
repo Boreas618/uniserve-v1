@@ -1651,6 +1651,88 @@ fn a_copy_made_on_trial_is_visible_to_its_epoch_alone_until_the_update_is_commit
     );
 }
 
+/// The replay's state of the pool names each owner and group under its
+/// session's epoch, since sessions number their owners alike (an epoch's
+/// target numbers its owners from 1 as the serving epoch does), states the
+/// owners of open sessions alone, each epoch with its trial, and the epoch
+/// on trial a cached copy is visible to alone (R8).
+#[test]
+fn a_state_names_each_owner_under_its_session_and_each_epoch_with_its_trial() {
+    let mut fixture = Fixture::new();
+    fixture.attach(1, PREFILL);
+    let regions = vec![vec![UNITS], Vec::new(), vec![5, 6]];
+    fixture.pool.open(
+        2,
+        2,
+        true,
+        classes(),
+        vec![(GroupId(0), group(0, 1, regions, PART))],
+    );
+    let trial = (2, 0);
+    fixture.submit(
+        trial,
+        Request::Attach {
+            owner: OwnerId(1),
+            group: GroupId(0),
+        },
+    );
+    fixture.submit(
+        trial,
+        Request::Allocate {
+            owner: OwnerId(1),
+            class: KV,
+            at: 0,
+            count: 1,
+            units: 0,
+        },
+    );
+    let commit = Request::Commit {
+        owner: OwnerId(1),
+        class: KV,
+        at: 0,
+        key: key(7),
+        tokens: 64,
+        after: Vec::new(),
+    };
+    let id = fixture.submit(trial, commit);
+    assert_eq!(fixture.answer(id), Some(Completion::Committed));
+
+    // Owner 1 of each open session, and of a session not open.
+    let owners = [
+        (QUEUE, OwnerId(1)),
+        (trial, OwnerId(1)),
+        ((3, 0), OwnerId(1)),
+    ];
+    let state = super::trace::stated(&fixture.pool, &owners, 0);
+    let named: Vec<&str> = state
+        .lines()
+        .filter(|line| line.starts_with("owner "))
+        .collect();
+    assert_eq!(named.len(), 2, "{state}");
+    assert!(
+        named[0].starts_with("owner e1.1 live e1.g0 slot="),
+        "{state}"
+    );
+    assert!(
+        named[1].starts_with("owner e2.1 live e2.g0 slot="),
+        "{state}"
+    );
+    assert!(
+        state.lines().any(|line| line == "epoch e1 open trial=no"),
+        "{state}"
+    );
+    assert!(
+        state.lines().any(|line| line == "epoch e2 open trial=yes"),
+        "{state}"
+    );
+    let cached: Vec<&str> = state
+        .lines()
+        .filter(|line| line.starts_with("key "))
+        .collect();
+    assert_eq!(cached.len(), 1, "{state}");
+    assert!(cached[0].ends_with(" vd=e2 vh=-"), "{state}");
+}
+
 #[test]
 fn what_a_rolled_back_epoch_made_is_evicted() {
     let mut fixture = Fixture::new();

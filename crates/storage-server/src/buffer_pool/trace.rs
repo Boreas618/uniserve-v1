@@ -646,27 +646,41 @@ pub fn replay(inputs: &Path, mut states: Option<&mut dyn Write>) -> Result<u64, 
     Ok(replayed)
 }
 
+/// The name of a session's epoch in the terms of [`stated`], `e<epoch>`,
+/// which qualifies its owners and groups: `e<epoch>.<owner>`,
+/// `e<epoch>.g<group>`. `e?` for a client with no session open.
+fn session(pool: &BufferPool, client: ClientId) -> String {
+    pool.sessions
+        .get(&client)
+        .map_or("e?".to_owned(), |epoch| format!("e{epoch}"))
+}
+
 /// An input to `pool` as `verification/buffer-pool/steps.py` reads it: its
-/// kind, and what it names in the terms of [`stated`] (owners and positions
-/// by number, groups as `g<n>`, keys by their 32 bytes in hex, stamps as
-/// `g<n>:<sequence>`); a request is read in its session's version.
+/// kind, and what it names in the terms of [`stated`] (owners and groups
+/// qualified by their session's epoch, positions by number, keys by their
+/// 32 bytes in hex, stamps as `<group>:<sequence>`, a request's session as
+/// `e=`); a request is read in its session's version.
 pub(crate) fn stated_input(pool: &BufferPool, input: &Input) -> String {
     match input {
         Input::Image(_) => "image".into(),
         Input::Open(..) => "open".into(),
         Input::Close(_) => "close".into(),
         Input::Request(queue, record) => match Request::decode_as(record, version(pool, *queue)) {
-            Ok((_, request)) => stated_request(&request),
+            Ok((_, request)) => stated_request(&request, &session(pool, queue.0)),
             Err(_) => "unreadable".into(),
         },
-        Input::Completed(_, group, value) => format!("completed g=g{} value={value}", group.0),
+        Input::Completed(client, group, value) => format!(
+            "completed g={}.g{} value={value}",
+            session(pool, *client),
+            group.0
+        ),
         Input::Tick(_) => "tick".into(),
         Input::Start(_) => "start".into(),
         Input::Done(..) => "done".into(),
         Input::Ended(_, ok) => format!("ended ok={}", u8::from(*ok)),
         Input::Limits(_) => "limits".into(),
-        Input::Publish(_) => "publish".into(),
-        Input::RollBack(_) => "roll-back".into(),
+        Input::Publish(epoch) => format!("publish e=e{epoch}"),
+        Input::RollBack(epoch) => format!("roll-back e=e{epoch}"),
         Input::Hold(..) => "hold".into(),
         Input::ReleasePeer(_) => "release-peer".into(),
         Input::Grant(..) => "grant".into(),
@@ -686,7 +700,8 @@ fn key_name(key: &Key) -> String {
         })
 }
 
-fn stated_request(request: &Request) -> String {
+fn stated_request(request: &Request, session: &str) -> String {
+    let owned = |owner: &OwnerId| format!("{session}.{}", owner.0);
     let keys = |keys: &[Key]| {
         let named: Vec<String> = keys.iter().map(key_name).collect();
         named.join(",")
@@ -694,7 +709,7 @@ fn stated_request(request: &Request) -> String {
     let after = |stamps: &Stamps| {
         let named: Vec<String> = stamps
             .iter()
-            .map(|(group, at)| format!("g{}:{at}", group.0))
+            .map(|(group, at)| format!("{session}.g{}:{at}", group.0))
             .collect();
         named.join(",")
     };
@@ -704,12 +719,14 @@ fn stated_request(request: &Request) -> String {
             .collect();
         named.join(",")
     };
-    match request {
-        Request::Attach { owner, group } => format!("attach o={} g=g{}", owner.0, group.0),
+    let text = match request {
+        Request::Attach { owner, group } => {
+            format!("attach o={} g={session}.g{}", owned(owner), group.0)
+        }
         Request::Detach {
             owner,
             after: stamps,
-        } => format!("detach o={} after={}", owner.0, after(stamps)),
+        } => format!("detach o={} after={}", owned(owner), after(stamps)),
         Request::Allocate {
             owner,
             class,
@@ -719,7 +736,7 @@ fn stated_request(request: &Request) -> String {
         } => {
             format!(
                 "allocate o={} class={class} ps={}",
-                owner.0,
+                owned(owner),
                 span(*at, *count as usize)
             )
         }
@@ -730,7 +747,7 @@ fn stated_request(request: &Request) -> String {
             keys: named,
         } => format!(
             "pin o={} class={class} ps={} ks={}",
-            owner.0,
+            owned(owner),
             span(*at, named.len()),
             keys(named)
         ),
@@ -742,7 +759,7 @@ fn stated_request(request: &Request) -> String {
             after: stamps,
         } => format!(
             "release o={} class={class} ps={} after={}",
-            owner.0,
+            owned(owner),
             span(*at, *count as usize),
             after(stamps)
         ),
@@ -755,7 +772,7 @@ fn stated_request(request: &Request) -> String {
             ..
         } => format!(
             "commit o={} class={class} ps={at} ks={} after={}",
-            owner.0,
+            owned(owner),
             keys(&[*key]),
             after(stamps)
         ),
@@ -767,7 +784,7 @@ fn stated_request(request: &Request) -> String {
         } => {
             format!(
                 "clone o={} class={class} ps={at} ks={}",
-                owner.0,
+                owned(owner),
                 keys(&[*key])
             )
         }
@@ -777,8 +794,8 @@ fn stated_request(request: &Request) -> String {
             after: stamps,
         } => {
             format!(
-                "transfer o={} to=g{} after={}",
-                owner.0,
+                "transfer o={} to={session}.g{} after={}",
+                owned(owner),
                 group.0,
                 after(stamps)
             )
@@ -794,7 +811,7 @@ fn stated_request(request: &Request) -> String {
             keys: named,
         } => format!(
             "load o={} class={class} ps={} ks={}",
-            owner.0,
+            owned(owner),
             span(*at, named.len()),
             keys(named)
         ),
@@ -808,10 +825,16 @@ fn stated_request(request: &Request) -> String {
                 Tier::Host => "host",
                 Tier::Remote => "remote",
             };
-            format!("store g=g{} ks={} tier={tier}", group.0, keys(named))
+            format!(
+                "store g={session}.g{} ks={} tier={tier}",
+                group.0,
+                keys(named)
+            )
         }
-        Request::Save { owner, key, .. } => format!("save o={} ks={}", owner.0, keys(&[*key])),
-        Request::Restore { owner, key } => format!("restore o={} ks={}", owner.0, keys(&[*key])),
+        Request::Save { owner, key, .. } => format!("save o={} ks={}", owned(owner), keys(&[*key])),
+        Request::Restore { owner, key } => {
+            format!("restore o={} ks={}", owned(owner), keys(&[*key]))
+        }
         Request::Finish {
             ok, after: stamps, ..
         } => format!("finish ok={} after={}", u8::from(*ok), after(stamps)),
@@ -827,7 +850,7 @@ fn stated_request(request: &Request) -> String {
                 storage::runtime::Source::Peers => "peers",
             };
             format!(
-                "prefetch g=g{} class={class} ks={} source={source}",
+                "prefetch g={session}.g{} class={class} ks={} source={source}",
                 group.0,
                 keys(named)
             )
@@ -840,20 +863,21 @@ fn stated_request(request: &Request) -> String {
             after: stamps,
             ..
         } => format!(
-            "replicate o={} class={class} ps={at} to=g{} after={}",
-            owner.0,
+            "replicate o={} class={class} ps={at} to={session}.g{} after={}",
+            owned(owner),
             group.0,
             after(stamps)
         ),
-    }
+    };
+    format!("{text} e={session}")
 }
 
 /// What a state in the model's terms leaves out and the model has no terms
-/// for: the class of each key cached in a class other than 0, in lines that
-/// start with `#`, which `verification/buffer-pool/steps.py` reads and
-/// `agreement.py` never sees. The model has one class, so a key cached in
-/// another is outside its terms (a key names what its block holds, A6); a
-/// key with no such line is of the class 0.
+/// for, in lines that start with `#`, which `verification/buffer-pool/steps.py`
+/// reads and `agreement.py` never sees: the class of each key cached in a
+/// class other than 0 (the model has one class, so a key cached in another is
+/// outside its terms, A6; a key with no such line is of the class 0), and
+/// each key cached on the device in more than one region.
 pub(crate) fn classes(pool: &BufferPool) -> String {
     let classes: BTreeMap<String, u8> = pool
         .cache
@@ -861,36 +885,57 @@ pub(crate) fn classes(pool: &BufferPool) -> String {
         .filter(|(_, entry)| entry.class != 0)
         .map(|(key, entry)| (key_name(key), entry.class))
         .collect();
-    let lines: Vec<String> = classes
+    let mut lines: Vec<String> = classes
         .into_iter()
         .map(|(key, class)| format!("# class {key} {class}"))
         .collect();
+    // A key cached on the device in several regions (one per layout): the
+    // model caches a key in one device block.
+    let mut copies: Vec<String> = pool
+        .cache
+        .iter()
+        .filter(|(_, entry)| entry.device.len() > 1)
+        .map(|(key, entry)| format!("# device {} {}", key_name(key), entry.device.len()))
+        .collect();
+    copies.sort_unstable();
+    lines.extend(copies);
     lines.join("\n")
 }
 
-/// The layout of the pool's session in the terms of [`stated`], or
-/// `layout none` unless exactly one session is open: per group, the bit of
-/// its memory, the region of its slot rows, its regions of the class 0 and
-/// the bits of the host parts it copies that class with; per class, its
-/// host region.
+/// The layout of the pool's sessions in the terms of [`stated`], or `layout
+/// none` while no session is open or two open sessions are of one epoch:
+/// per group, qualified by its session's epoch, the bit of its memory, the
+/// region of its slot rows, its regions of the class 0 and the bits of the
+/// host parts it copies that class with; per class, its host region; per
+/// region a group names, its memory space and the bytes of a unit (the
+/// unit `i` of a region occupies the bytes from `i` units of its space,
+/// so regions of two layouts over one space share memory).
 pub(crate) fn layout(pool: &BufferPool) -> String {
-    if pool.sessions.len() != 1 {
+    let epochs: BTreeSet<u64> = pool.sessions.values().copied().collect();
+    if pool.sessions.is_empty() || epochs.len() != pool.sessions.len() {
         return "layout none\n".into();
     }
     let mut text = String::new();
-    let groups: BTreeMap<u8, _> = pool
+    let groups: BTreeMap<(u64, u8), _> = pool
         .groups
         .iter()
-        .map(|((_, group), found)| (group.0, found))
+        .filter_map(|((client, group), found)| {
+            let epoch = pool.sessions.get(client)?;
+            Some(((*epoch, group.0), found))
+        })
         .collect();
-    for (group, found) in groups {
-        let kv: Vec<String> = found
+    let mut named = BTreeSet::new();
+    for ((epoch, group), found) in groups {
+        let kv: Vec<u8> = found
             .regions
             .first()
             .into_iter()
             .flatten()
-            .map(u8::to_string)
+            .copied()
             .collect();
+        named.extend(kv.iter().copied());
+        named.insert(found.slots);
+        let kv: Vec<String> = kv.iter().map(u8::to_string).collect();
         let parts = found.parts.first().copied().unwrap_or(0);
         let parts: Vec<String> = (0..64)
             .filter(|bit| parts & (1 << bit) != 0)
@@ -898,7 +943,7 @@ pub(crate) fn layout(pool: &BufferPool) -> String {
             .collect();
         let _ = writeln!(
             text,
-            "layout group g{group} memory m{} rows {} kv {} parts {}",
+            "layout group e{epoch}.g{group} memory m{} rows {} kv {} parts {}",
             found.memory,
             found.slots,
             kv.join(","),
@@ -914,8 +959,17 @@ pub(crate) fn layout(pool: &BufferPool) -> String {
                 .filter_map(|class| class.host.map(|(region, _)| region))
         })
         .collect();
-    for region in hosts {
+    for region in &hosts {
         let _ = writeln!(text, "layout host {region}");
+    }
+    for region in named.iter().chain(&hosts) {
+        if let Some(found) = pool.regions.get(usize::from(*region)) {
+            let _ = writeln!(
+                text,
+                "layout region {region} space {} bytes {}",
+                found.space, found.unit_bytes
+            );
+        }
     }
     text
 }
@@ -955,18 +1009,52 @@ pub(crate) fn stated(pool: &BufferPool, owners: &[(QueueId, OwnerId)], copies: u
     };
     let mut lines = vec![format!("ncopy {copies}")];
 
-    let completed: BTreeMap<u8, u64> = pool
+    // Each group of an open session, qualified by its epoch.
+    let group_name =
+        |client: ClientId, group: GroupId| format!("{}.g{}", session(pool, client), group.0);
+    let owner_name =
+        |client: ClientId, owner: OwnerId| format!("{}.{}", session(pool, client), owner.0);
+    let completed: BTreeMap<String, u64> = pool
         .groups
         .iter()
-        .map(|((_, group), found)| (group.0, found.completed))
+        .filter(|((client, _), _)| pool.sessions.contains_key(client))
+        .map(|((client, group), found)| (group_name(*client, *group), found.completed))
         .collect();
     lines.push(
         completed
             .iter()
             .fold("completed".to_owned(), |line, (group, at)| {
-                format!("{line} g{group}={at}")
+                format!("{line} {group}={at}")
             }),
     );
+
+    // Each epoch the state names: an open session's, one still on trial, or
+    // one whose update was rolled back that made a copy still cached (R8).
+    let mut epochs: BTreeSet<u64> = pool.sessions.values().copied().collect();
+    epochs.extend(
+        pool.trial
+            .iter()
+            .filter(|(_, trial)| **trial)
+            .map(|(epoch, _)| *epoch),
+    );
+    epochs.extend(
+        pool.cache
+            .values()
+            .flat_map(|entry| entry.copies().filter_map(|(_, maker)| *maker)),
+    );
+    for epoch in epochs {
+        let open = if pool.sessions.values().any(|of| *of == epoch) {
+            "open"
+        } else {
+            "closed"
+        };
+        let trial = match pool.trial.get(&epoch) {
+            Some(true) => "yes",
+            Some(false) => "no",
+            None => "rolled",
+        };
+        lines.push(format!("epoch e{epoch} {open} trial={trial}"));
+    }
 
     // The free units as runs, `region:first-last` or `region:unit` for one,
     // each as long as it can be, by region and first unit: a state grows with
@@ -998,32 +1086,40 @@ pub(crate) fn stated(pool: &BufferPool, owners: &[(QueueId, OwnerId)], copies: u
 
     // An owner's number is taken once on its queue pair: a number at or
     // below the highest taken there that names no owner is of one that is
-    // gone.
+    // gone. The owners stated are those of `owners` and every live one (a
+    // pool's image hands over owners no input of the trace attaches), of
+    // the open sessions.
+    let mut stated_owners = BTreeMap::new();
     for (queue, number) in owners {
+        if !pool.sessions.contains_key(&queue.0) || pool.owners.contains_key(&(queue.0, *number)) {
+            continue;
+        }
         let taken = pool.numbers.get(queue).map_or(0, |numbers| numbers.0);
-        let line = match pool.owners.get(&(queue.0, *number)) {
-            Some(owner) => {
-                let mut line = format!(
-                    "owner {} live g{} slot={}",
-                    number.0,
-                    owner.group.0,
-                    unit(&owner.slot)
-                );
-                for (position, held) in owner.tables.first().into_iter().flatten() {
-                    let kind = if matches!(held, Held::Private(_)) {
-                        "private"
-                    } else {
-                        "shared"
-                    };
-                    let _ = write!(line, " p{position}={kind}:{}", unit(held.block()));
-                }
-                line
-            }
-            None if number.0 <= taken => format!("owner {} gone", number.0),
-            None => format!("owner {} new", number.0),
-        };
-        lines.push(line);
+        let is = if number.0 <= taken { "gone" } else { "new" };
+        let name = owner_name(queue.0, *number);
+        stated_owners.insert(name.clone(), format!("owner {name} {is}"));
     }
+    for ((client, number), owner) in &pool.owners {
+        if !pool.sessions.contains_key(client) {
+            continue;
+        }
+        let name = owner_name(*client, *number);
+        let mut line = format!(
+            "owner {name} live {} slot={}",
+            group_name(*client, owner.group),
+            unit(&owner.slot)
+        );
+        for (position, held) in owner.tables.first().into_iter().flatten() {
+            let kind = if matches!(held, Held::Private(_)) {
+                "private"
+            } else {
+                "shared"
+            };
+            let _ = write!(line, " p{position}={kind}:{}", unit(held.block()));
+        }
+        stated_owners.insert(name, line);
+    }
+    lines.extend(stated_owners.into_values());
 
     let mut valid = BTreeMap::new();
     let mut note = |block: &Rc<Block>| {
@@ -1059,8 +1155,18 @@ pub(crate) fn stated(pool: &BufferPool, owners: &[(QueueId, OwnerId)], copies: u
             .host
             .as_ref()
             .map_or("-".to_owned(), |(block, ..)| unit(block));
+        // The epoch on trial each copy is visible to alone (R8), or `-`.
+        let maker = |maker: Option<u64>| maker.map_or("-".to_owned(), |epoch| format!("e{epoch}"));
+        let made = entry
+            .device
+            .first()
+            .map_or("-".to_owned(), |(_, of)| maker(*of));
+        let host_made = entry
+            .host
+            .as_ref()
+            .map_or("-".to_owned(), |(_, of, _)| maker(*of));
         lines.push(format!(
-            "key {} d={device} h={host} remote={}",
+            "key {} d={device} h={host} remote={} vd={made} vh={host_made}",
             key_name(key),
             u8::from(entry.remote)
         ));
@@ -1071,7 +1177,7 @@ pub(crate) fn stated(pool: &BufferPool, owners: &[(QueueId, OwnerId)], copies: u
             .map(|(unit, memories)| format!("valid {unit} {memories}").trim_end().to_owned()),
     );
 
-    let copy_line = |copy: &Copy| {
+    let copy_line = |client: ClientId, copy: &Copy| {
         // The key a copy caches its block under: a load's, a store's and a
         // save's; a clone and a restore cache nothing.
         let key = match &copy.to {
@@ -1084,21 +1190,32 @@ pub(crate) fn stated(pool: &BufferPool, owners: &[(QueueId, OwnerId)], copies: u
                 at,
                 key: None,
                 ..
-            } => ("clone", owner.0.to_string(), at.to_string(), copy.memory),
+            } => (
+                "clone",
+                owner_name(client, owner),
+                at.to_string(),
+                copy.memory,
+            ),
             Target::Owner {
                 owner,
                 at,
                 key: Some(_),
                 ..
-            } => ("load", owner.0.to_string(), at.to_string(), copy.memory),
-            Target::Slot { owner } => ("restore", owner.0.to_string(), "-".to_owned(), 0),
+            } => (
+                "load",
+                owner_name(client, owner),
+                at.to_string(),
+                copy.memory,
+            ),
+            Target::Slot { owner } => ("restore", owner_name(client, owner), "-".to_owned(), 0),
             Target::Entry { .. } if copy.reads.first().is_some_and(|block| block.class == SLOT) => {
                 // A save reads its owner's slot, while that owner is there.
                 let owner = pool
                     .owners
                     .iter()
                     .find(|(_, owner)| Rc::ptr_eq(&owner.slot, &copy.reads[0]));
-                let owner = owner.map_or("-".to_owned(), |((_, owner), _)| owner.0.to_string());
+                let owner =
+                    owner.map_or("-".to_owned(), |((of, owner), _)| owner_name(*of, *owner));
                 ("save", owner, "-".to_owned(), 0)
             }
             _ => ("store", "-".to_owned(), "-".to_owned(), 0),
@@ -1115,11 +1232,13 @@ pub(crate) fn stated(pool: &BufferPool, owners: &[(QueueId, OwnerId)], copies: u
         } else {
             String::new()
         };
+        // The session whose request asked for the copy.
         format!(
-            "kind={kind} o={owner} p={position} read={} write={} fill={} mem={memory} k={key} parts={parts}",
+            "kind={kind} o={owner} p={position} read={} write={} fill={} mem={memory} k={key} parts={parts} s={}",
             unit(&copy.reads[0]),
             unit(&copy.write),
-            u8::from(copy.fill)
+            u8::from(copy.fill),
+            session(pool, client)
         )
     };
 
@@ -1131,14 +1250,14 @@ pub(crate) fn stated(pool: &BufferPool, owners: &[(QueueId, OwnerId)], copies: u
                 .get(&(client, group))
                 .map_or(0, |found| found.completed)
         };
-        let waits: BTreeMap<u8, u64> = std::iter::once(at)
+        let waits: BTreeMap<String, u64> = std::iter::once(at)
             .chain(rest.iter().copied())
             .filter(|(group, stamp)| *stamp > completed(*group))
-            .map(|(group, stamp)| (group.0, stamp))
+            .map(|(group, stamp)| (group_name(client, group), stamp))
             .collect();
         let named: Vec<String> = waits
             .into_iter()
-            .map(|(group, stamp)| format!("g{group}:{stamp}"))
+            .map(|(group, stamp)| format!("{group}:{stamp}"))
             .collect();
         named.join(",")
     };
@@ -1164,7 +1283,7 @@ pub(crate) fn stated(pool: &BufferPool, owners: &[(QueueId, OwnerId)], copies: u
                     ..
                 } => lines.push(format!(
                     "commit o={} p={position} u={} k={} after={}",
-                    owner.0,
+                    owner_name(*client, *owner),
                     unit(block),
                     key_name(key),
                     pending(*client, at, rest)
@@ -1185,16 +1304,16 @@ pub(crate) fn stated(pool: &BufferPool, owners: &[(QueueId, OwnerId)], copies: u
                         format!(
                             "finish ok={} after={after} {}",
                             u8::from(*ok),
-                            copy_line(copy)
+                            copy_line(queue.0, copy)
                         )
                     }));
                 }
                 Deferred::Transfer {
                     owner, to, rest, ..
                 } => lines.push(format!(
-                    "transfer o={} to=g{} after={}",
-                    owner.0,
-                    to.0,
+                    "transfer o={} to={} after={}",
+                    owner_name(*client, *owner),
+                    group_name(*client, *to),
                     pending(*client, at, rest)
                 )),
                 Deferred::Replicate {
@@ -1205,9 +1324,9 @@ pub(crate) fn stated(pool: &BufferPool, owners: &[(QueueId, OwnerId)], copies: u
                     rest,
                     ..
                 } => lines.push(format!(
-                    "replicate o={} p={position} to=g{} u={} after={}",
-                    owner.0,
-                    to.0,
+                    "replicate o={} p={position} to={} u={} after={}",
+                    owner_name(*client, *owner),
+                    group_name(*client, *to),
                     unit(block),
                     pending(*client, at, rest)
                 )),
@@ -1234,9 +1353,9 @@ pub(crate) fn stated(pool: &BufferPool, owners: &[(QueueId, OwnerId)], copies: u
                     .find(|copy| !copy.fill)
                     .map_or("-".to_owned(), |copy| unit(&copy.write));
                 let line = format!(
-                    "task transfer o={} to=g{} slot={slot} units={} writes={}",
-                    owner.0,
-                    to.0,
+                    "task transfer o={} to={} slot={slot} units={} writes={}",
+                    owner_name(task.0.0, *owner),
+                    group_name(task.0.0, *to),
                     units(held),
                     units(writes)
                 );
@@ -1245,9 +1364,9 @@ pub(crate) fn stated(pool: &BufferPool, owners: &[(QueueId, OwnerId)], copies: u
             Some(Target::Memory {
                 owner, at, group, ..
             }) => lines.push(format!(
-                "task replicate o={} p={at} to=g{} u={}",
-                owner.0,
-                group.0,
+                "task replicate o={} p={at} to={} u={}",
+                owner_name(task.0.0, *owner),
+                group_name(task.0.0, *group),
                 unit(&copies[0].write)
             )),
             Some(Target::Entry { remote, .. }) if copies[0].deadline.is_some() => {
@@ -1257,8 +1376,15 @@ pub(crate) fn stated(pool: &BufferPool, owners: &[(QueueId, OwnerId)], copies: u
                 let kind = if *remote { "put" } else { "prefetch" };
                 for copy in copies {
                     if let Target::Entry { key, .. } = &copy.to {
+                        // A prefetch's session, whose group's host parts it
+                        // writes; a put's is none of the model's.
+                        let asked = if *remote {
+                            "-".to_owned()
+                        } else {
+                            session(pool, task.0.0)
+                        };
                         lines.push(format!(
-                            "task {kind} h={} expired={expired} k={} parts={}",
+                            "task {kind} h={} expired={expired} k={} parts={} s={asked}",
                             unit(&copy.write),
                             key_name(key),
                             bits(copy.memory)
@@ -1269,7 +1395,7 @@ pub(crate) fn stated(pool: &BufferPool, owners: &[(QueueId, OwnerId)], copies: u
             _ => lines.extend(
                 copies
                     .iter()
-                    .map(|copy| format!("copy {}", copy_line(copy))),
+                    .map(|copy| format!("copy {}", copy_line(task.0.0, copy))),
             ),
         }
     }
