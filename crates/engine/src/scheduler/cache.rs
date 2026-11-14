@@ -134,6 +134,7 @@ impl Scheduler {
             .collect();
         taken.sort_unstable();
         taken.dedup();
+        self.count_evicted(taken.len() * evicted.len());
         for (region, key) in taken
             .into_iter()
             .flat_map(|region| evicted.iter().map(move |key| (region, key)))
@@ -145,6 +146,7 @@ impl Scheduler {
             (request, completion)
             && let Some((host, _)) = self.host_block(*class, *units)
         {
+            self.count_evicted(evicted.len());
             for key in evicted {
                 self.drop_copy(key, host);
             }
@@ -317,6 +319,7 @@ impl Scheduler {
                 }
             }
             (R::Evict { .. }, Completion::Evicted { keys }, None) => {
+                self.count_evicted(keys.len());
                 for key in keys {
                     self.invalidate(key, u8::MAX);
                 }

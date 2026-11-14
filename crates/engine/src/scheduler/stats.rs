@@ -203,6 +203,23 @@ impl Scheduler {
         add(&mut self.stats.calls_without_blocks, 1);
     }
 
+    /// Counts a running request preempted for room (SD §3.6): it ended as migratable for the
+    /// daemon to resubmit.
+    pub(super) fn count_preempted(&mut self) {
+        add(&mut self.stats.preempted_requests, 1);
+    }
+
+    /// Counts `blocks` cached blocks evicted from a region of this scheduler's.
+    pub(super) fn count_evicted(&mut self, blocks: usize) {
+        add(&mut self.stats.evicted_blocks, blocks as u64);
+    }
+
+    /// Counts `blocks` draft-cache blocks a running request gave up for room (SD §3.6 "Draft
+    /// release").
+    pub(super) fn count_given_up_drafts(&mut self, blocks: u32) {
+        add(&mut self.stats.given_up_draft_blocks, u64::from(blocks));
+    }
+
     /// Counts the answer to a transfer's `Transfer` (SD §3.5 "Prefill to decode transfer"):
     /// `Transferred` is one more transfer and the blocks its runs state, one per entry (a block
     /// of several runs, a product's, states each of them at its one position); `Failed` is one

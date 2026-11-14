@@ -11,7 +11,8 @@
 //! `Migratable { Drain }` with their blocks committed, tails included, and resume from them when
 //! the daemon resubmits them. A running request that makes no progress within the policy's
 //! timeout fails alone while other requests are served, and with nothing else to serve the
-//! scheduler fails.
+//! scheduler fails. The reports count what a shortage took (SD §7.5): the requests preempted,
+//! the cached blocks evicted and the draft blocks given up.
 //!
 //! The capacity words a case sets (`InProcessPool::set_capacity`) state what the buffer pool
 //! would state of a region under a load the case does not build: no unit available, or units
@@ -22,6 +23,7 @@ use std::time::Duration;
 
 use engine::batch::Phase;
 use engine::scheduler::{Message, policy};
+use proto::report::SchedulerStats;
 use proto::request::{Event, FinishReason, MigrationCause, RequestId};
 use scheduling::{Nanos, Parameters};
 use storage::runtime::Request;
@@ -45,6 +47,13 @@ fn evicted(harness: &Harness) -> bool {
         .taken()
         .iter()
         .any(|request| matches!(request, Request::Evict { .. }))
+}
+
+/// What the scheduler's reports counted of `field` over every report it sent, once its next
+/// report arrived (it reports once a second; SD §7.5).
+fn reported(harness: &mut Harness, field: fn(&SchedulerStats) -> u64) -> u64 {
+    harness.next_report();
+    harness.reports().into_iter().map(field).sum()
 }
 
 /// Steps until no step forms a batch for five steps in a row: every running request is left out
@@ -159,11 +168,15 @@ fn draft_blocks_are_given_up_first_by_the_idle_request_with_the_fewest_tokens_le
         })
     };
     harness.run_until(400, |harness| first_relief(harness).is_some());
-    let relief = first_relief(&harness).unwrap();
-    assert!(
-        matches!(relief, Request::Release { owner, class: 1, .. } if owner == fewest_owner),
-        "{relief:?}"
-    );
+    let released = match first_relief(&harness).unwrap() {
+        Request::Release {
+            owner,
+            class: 1,
+            count,
+            ..
+        } if owner == fewest_owner => count,
+        relief => panic!("{relief:?}"),
+    };
     for id in [fewest, more, growing] {
         assert!(harness.terminal(id).is_none(), "{:?}", harness.events(id));
     }
@@ -180,6 +193,13 @@ fn draft_blocks_are_given_up_first_by_the_idle_request_with_the_fewest_tokens_le
     });
     assert_eq!(harness.tokens(fewest).len(), 10);
     assert_eq!(harness.tokens(more).len(), 30);
+
+    // The draft table given up is counted in the reports.
+    let given_up = reported(&mut harness, |report| report.given_up_draft_blocks);
+    assert!(
+        released > 0 && given_up >= u64::from(released),
+        "{given_up} of {released}"
+    );
 }
 
 /// Under a shortage that no draft relieves, an admission under way returns to the waiting queue
@@ -290,6 +310,14 @@ fn the_policys_victim_blocks_are_evicted_by_key() {
     harness.settle(200);
     assert!(harness.finished_with(growing, FinishReason::MaxTokens));
     assert_eq!(harness.tokens(growing).len(), 30);
+
+    // Every victim the buffer pool evicted is counted, and no request was preempted.
+    let evicted = reported(&mut harness, |report| report.evicted_blocks);
+    assert!(evicted >= victims.len() as u64, "{evicted} of {victims:?}");
+    assert_eq!(
+        reported(&mut harness, |report| report.preempted_requests),
+        0
+    );
 }
 
 /// When no cached block is free, the policy's victim is a running request: the `fcfs` policy
@@ -370,6 +398,12 @@ fn the_policys_victim_request_ends_as_migratable_and_resumes_from_its_committed_
     assert!(harness.finished_with(victim, FinishReason::MaxTokens));
     assert_eq!(harness.tokens(newer).len(), 2);
     assert_eq!(harness.tokens(kept).len(), 30);
+
+    // The one preemption is counted.
+    assert_eq!(
+        reported(&mut harness, |report| report.preempted_requests),
+        1
+    );
 }
 
 /// When every running request is short at once, the one of the greatest priority value is
@@ -397,6 +431,10 @@ fn a_mutual_shortage_preempts_the_last_admitted_of_the_lowest_priority() {
     harness.settle(200);
     assert!(harness.finished_with(high, FinishReason::MaxTokens));
     assert_eq!(harness.tokens(high).len(), 30);
+    assert_eq!(
+        reported(&mut harness, |report| report.preempted_requests),
+        1
+    );
 }
 
 /// Serves the `fcfs` policy again with a starvation bound of `timeout`, the deployment's other

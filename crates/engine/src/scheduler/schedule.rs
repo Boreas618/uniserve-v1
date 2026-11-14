@@ -1337,6 +1337,7 @@ impl Scheduler {
                     });
                     if ends {
                         named = true;
+                        self.count_preempted();
                         self.finish(victim, migratable(MigrationCause::Drain));
                     }
                 }
@@ -1511,6 +1512,7 @@ impl Scheduler {
             .max_by_key(|request| (request.input.priority(), request.arrival))
             .map(|request| request.id);
         if let Some(victim) = victim {
+            self.count_preempted();
             self.finish(victim, migratable(MigrationCause::Drain));
         }
     }

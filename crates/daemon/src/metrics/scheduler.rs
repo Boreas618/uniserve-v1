@@ -179,6 +179,12 @@ pub struct SchedulerMetrics {
     pub request_transfer_blocks: Family<EngineLabels, U64Counter>,
     /// Calls a step left out because blocks they write had not arrived from the buffer pool.
     pub scheduler_calls_without_blocks: Family<EngineLabels, U64Counter>,
+    /// Running requests preempted for room, each ended as migratable for resubmission.
+    pub scheduler_preempted_requests: Family<EngineLabels, U64Counter>,
+    /// Cached blocks evicted from the scheduler's regions.
+    pub scheduler_evicted_blocks: Family<EngineLabels, U64Counter>,
+    /// Draft-cache blocks running requests gave up for room.
+    pub scheduler_given_up_draft_blocks: Family<EngineLabels, U64Counter>,
 
     // Worker-local forward/kernel counters.
     /// Attention kernel launches.
@@ -389,6 +395,29 @@ impl SchedulerMetrics {
             "Calls a scheduler step left out because blocks they write had not arrived from the \
              buffer pool: the request's allocation was still outstanding when the call was due.",
             scheduler_calls_without_blocks.clone(),
+        );
+        let scheduler_preempted_requests: Family<EngineLabels, U64Counter> = Default::default();
+        registry.register(
+            "uniserve:scheduler_preempted_requests",
+            "Running requests a scheduler preempted because a request's next call found no room: \
+             each ended as migratable (a video request with its trajectory stored) and was \
+             resubmitted.",
+            scheduler_preempted_requests.clone(),
+        );
+        let scheduler_evicted_blocks: Family<EngineLabels, U64Counter> = Default::default();
+        registry.register(
+            "uniserve:scheduler_evicted_blocks",
+            "Cached blocks evicted from a scheduler's device and host regions: the eviction \
+             order's head taken for an allocation, a copy, a prefetch or a shrink, once per \
+             region, and the policy's victims evicted by key.",
+            scheduler_evicted_blocks.clone(),
+        );
+        let scheduler_given_up_draft_blocks: Family<EngineLabels, U64Counter> = Default::default();
+        registry.register(
+            "uniserve:scheduler_given_up_draft_blocks",
+            "Draft-cache blocks running requests gave up so that another request's next call had \
+             room.",
+            scheduler_given_up_draft_blocks.clone(),
         );
         let worker_attention_launches: Family<EngineLabels, U64Counter> = Default::default();
         registry.register(
@@ -618,6 +647,9 @@ impl SchedulerMetrics {
             request_transfers_failed,
             request_transfer_blocks,
             scheduler_calls_without_blocks,
+            scheduler_preempted_requests,
+            scheduler_evicted_blocks,
+            scheduler_given_up_draft_blocks,
             worker_attention_launches,
             worker_attention_us,
             worker_attention_backend_counts,

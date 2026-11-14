@@ -2537,6 +2537,7 @@ impl Scheduler {
         if let Ok(class) = u8::try_from(index) {
             self.charge_units(&mut freed, group, class, table.end - table.first, 0);
         }
+        self.count_given_up_drafts(table.end.saturating_sub(table.first));
 
         if let Some(request) = self.requests.get_mut(&id) {
             request.blocks[index] = Blocks::default();

@@ -187,6 +187,22 @@ pub struct SchedulerStats {
     /// target group's memory held it already.
     #[serde(default)]
     pub transferred_blocks: u64,
+    /// Running requests the scheduler preempted in the interval because a request's next call
+    /// found no room: each ended as migratable (`Migratable { cause: Drain }`, a video request
+    /// with its trajectory stored) for the daemon to resubmit, whether its policy named it or it
+    /// was the last admitted of a shortage every running request shared.
+    #[serde(default)]
+    pub preempted_requests: u64,
+    /// Cached blocks that left the scheduler's regions in the interval: each key a completion
+    /// lists as evicted, once per region its request took blocks from (an allocation, a copy, a
+    /// prefetch or a shrink taking the eviction order's head), and each key an `Evict` of the
+    /// policy's victims removed.
+    #[serde(default)]
+    pub evicted_blocks: u64,
+    /// Draft-cache blocks running requests gave up in the interval so that another request's next
+    /// call had room, each request its whole draft table.
+    #[serde(default)]
+    pub given_up_draft_blocks: u64,
     /// The scheduler's steps since it started, each one decision of its policy (a lifetime
     /// value). The main process reports it as `Metrics::steps`, `step_counter` as
     /// `Metrics::batches` and the sum of `batch_tokens` as `Metrics::tokens`.

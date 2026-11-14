@@ -173,6 +173,21 @@ pub(crate) fn record_scheduler_stats(
         .get_or_create(&labels)
         .inc_by(stats.calls_without_blocks);
 
+    // What a shortage of room took: requests preempted, cached blocks evicted, draft blocks given
+    // up.
+    metrics
+        .scheduler_preempted_requests
+        .get_or_create(&labels)
+        .inc_by(stats.preempted_requests);
+    metrics
+        .scheduler_evicted_blocks
+        .get_or_create(&labels)
+        .inc_by(stats.evicted_blocks);
+    metrics
+        .scheduler_given_up_draft_blocks
+        .get_or_create(&labels)
+        .inc_by(stats.given_up_draft_blocks);
+
     // Worker-local forward/kernel counters. The reporter sends `None` when no
     // worker counter changed in the interval, and then none of these families
     // is touched.
@@ -726,6 +741,35 @@ mod tests {
             ("uniserve:scheduler_calls_without_blocks_total", 6),
         ] {
             let sample = format!("{name}{{model_name=\"model\",engine=\"0\"}} {value}");
+            assert!(
+                rendered.lines().any(|line| line == sample),
+                "{sample}: {rendered}"
+            );
+        }
+    }
+
+    // What a shortage of room took, the requests preempted, the blocks evicted and the draft
+    // blocks given up, reaches the exposition as counters that add each interval's counts.
+    #[test]
+    fn preemptions_evictions_and_given_up_drafts_reach_openmetrics_and_add_up_over_intervals() {
+        let metrics = Metrics::new();
+        let stats = SchedulerStats {
+            preempted_requests: 2,
+            evicted_blocks: 7,
+            given_up_draft_blocks: 3,
+            ..Default::default()
+        };
+
+        record_scheduler_stats(&metrics.scheduler, "model", 1, &stats);
+        record_scheduler_stats(&metrics.scheduler, "model", 1, &stats);
+        let rendered = metrics.render().expect("metrics render");
+
+        for (name, value) in [
+            ("uniserve:scheduler_preempted_requests_total", 4),
+            ("uniserve:scheduler_evicted_blocks_total", 14),
+            ("uniserve:scheduler_given_up_draft_blocks_total", 6),
+        ] {
+            let sample = format!("{name}{{model_name=\"model\",engine=\"1\"}} {value}");
             assert!(
                 rendered.lines().any(|line| line == sample),
                 "{sample}: {rendered}"
