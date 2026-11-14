@@ -803,6 +803,53 @@ fn a_switch_before_the_preparation_ended_switches_no_runner() {
     output_of(&worker.prepare(replacing(&kernels, 5, "rms_norm")).unwrap());
 }
 
+/// A preparation examines its buckets between batches, whatever the generation changes: one
+/// that keeps every graph (a policy's, which replaces no kernel) is still a profile run of each
+/// bucket, and a batch submitted after it began is executed before it ends, at the generation
+/// that serves.
+#[test]
+fn a_preparation_that_keeps_every_graph_runs_between_batches() {
+    let log = Log::default();
+    let (worker, kernels) = worker(&["a", "b"], &log);
+    output_of(&worker.warm_up().unwrap());
+    lock(&log).clear();
+
+    // The worker takes the preparation, then the batch, then an operation the test holds.
+    let (release, held) = hold(&worker);
+    let prepare = worker.prepare(Arc::new(kernels.replace(2, []))).unwrap();
+    let served = worker.submit(1, batch(1, Phase::Decode, 2)).unwrap();
+    let (entered, behind) = crossbeam_channel::bounded(1);
+    let (release_behind, released_behind) = crossbeam_channel::bounded::<()>(1);
+    let behind_batch = worker
+        .control(
+            "holding the worker behind the batch",
+            Box::new(move |_| {
+                entered.send(()).unwrap();
+                let _ = released_behind.recv();
+                Ok(())
+            }),
+        )
+        .unwrap();
+    drop(release);
+    output_of(&held);
+    behind
+        .recv_timeout(LONG)
+        .expect("the worker takes the operation");
+
+    // The batch was served while the preparation is under way.
+    assert!(matches!(served.outcome(), Some(Outcome::Success(_))));
+    assert!(prepare.outcome().is_none());
+    assert_eq!(entries(&log), ["a: execute 1 at generation 1"]);
+
+    // The preparation ends with every graph kept: it captured nothing, and it is switched to.
+    drop(release_behind);
+    output_of(&behind_batch);
+    output_of(&prepare);
+    output_of(&worker.switch(2).unwrap());
+    assert_eq!(generations(&worker), [2, 2]);
+    assert_eq!(entries(&log), ["a: execute 1 at generation 1"]);
+}
+
 #[test]
 fn a_failed_job_states_the_work_in_flight_and_the_jobs_behind_it_run() {
     let log = Log::default();

@@ -169,6 +169,7 @@ use crate::profiling;
 use crate::profiling::session::{Change, Session};
 use crate::runner::Runner;
 use crate::runner::buckets::Bucket;
+use crate::runner::graphs::Preparation;
 
 /// The copy budget per batch the engine gives its workers: the bytes, summed over a group's
 /// ranks, that the copies started with one batch may move together, 512 MiB.
@@ -237,8 +238,9 @@ pub(crate) enum Job {
     /// Capture every bucket the runners state and have no graph of, largest first: the warm-up.
     /// One bucket per queue turn.
     Capture,
-    /// Prepare a generation beside the serving one on every runner: the graphs it changes are
-    /// rebound or recaptured, one bucket per queue turn.
+    /// Prepare a generation beside the serving one on every runner: each bucket is examined, and
+    /// its graph rebound or recaptured where the generation changes it, one bucket per queue
+    /// turn.
     Prepare(Arc<Generation>),
     /// Switch every runner to the prepared generation of this number, which then serves on
     /// trial.
@@ -665,8 +667,12 @@ impl Worker {
         self.queue.submit(Job::Capture)
     }
 
-    /// Submits the preparation of generation `next` ([`Job::Prepare`]). A preparation that
-    /// fails leaves a generation to roll back ([`Worker::rollback`]).
+    /// Submits the preparation of generation `next` ([`Job::Prepare`]): its first turn begins it
+    /// on every runner, and each later turn examines one bucket and prepares its graph where it
+    /// needs one, so the batches submitted meanwhile are executed between two buckets. A
+    /// preparation that fails leaves nothing of the generation on this worker's runners; the
+    /// engine still rolls it back on every worker ([`Worker::rollback`]), which those that
+    /// prepared it give back.
     ///
     /// # Errors
     ///
@@ -1683,7 +1689,8 @@ impl Thread {
     }
 
     /// One turn of the preparation of `next`: the first begins it on every runner, and each
-    /// later one prepares one bucket's graph. Returns whether a bucket is left for a later turn.
+    /// later one examines one bucket, and prepares its graph where it needs one. Returns whether
+    /// a bucket is left for a later turn.
     fn prepare(&mut self, next: &Arc<Generation>) -> Result<bool> {
         let number = next.number();
         let began = self.kernels.contains_key(&number)
@@ -1699,15 +1706,34 @@ impl Thread {
                 ));
 
                 let runner = &self.runners[index];
-                let done = runner.graphs().prepare_bucket(&**runner, &bucket)?;
-                tracing::info!(
-                    device = ?self.device,
-                    runner = index,
-                    %bucket,
-                    generation = number,
-                    ?done,
-                    "a bucket's graph was prepared for a generation"
-                );
+                let done = match runner.graphs().prepare_bucket(&**runner, &bucket) {
+                    Ok(done) => done,
+                    Err(error) => {
+                        // A generation a bucket refuses, or whose graph fails, is given back on
+                        // every runner of the device, so nothing of it is left being prepared.
+                        if let Err(unwound) = self.rollback(number) {
+                            tracing::warn!(
+                                %unwound,
+                                generation = number,
+                                "a failed preparation was not given back"
+                            );
+                        }
+                        return Err(error);
+                    }
+                };
+
+                // A bucket that keeps its graph is most buckets of most generations, a turn of
+                // a few milliseconds that changes nothing: only a graph made is a line.
+                if done != Preparation::Keep {
+                    tracing::info!(
+                        device = ?self.device,
+                        runner = index,
+                        %bucket,
+                        generation = number,
+                        ?done,
+                        "a bucket's graph was prepared for a generation"
+                    );
+                }
             }
             return Ok(self.pending().is_some());
         }
@@ -1745,8 +1771,8 @@ impl Thread {
         // Checked for every runner before any switches, so the runners serve one generation.
         if let Some((index, bucket)) = self.pending() {
             return Err(Error::Invariant(format!(
-                "generation {number} is not prepared: bucket {bucket} of runner {index} has no \
-                 graph of it"
+                "generation {number} is not prepared: bucket {bucket} of runner {index} is still \
+                 to be examined"
             )));
         }
 
@@ -1805,18 +1831,13 @@ impl Thread {
         first
     }
 
-    /// The first bucket the generation being prepared still needs a graph of, with its runner:
-    /// the runners in their order and each runner's buckets largest first.
+    /// The next bucket the generation being prepared has yet to examine, with its runner: the
+    /// runners in their order and each runner's buckets largest first.
     fn pending(&self) -> Option<(usize, Bucket)> {
-        self.runners.iter().enumerate().find_map(|(index, runner)| {
-            let graphs = runner.graphs();
-
-            runner
-                .buckets()
-                .into_iter()
-                .find(|bucket| graphs.pending(bucket).is_some())
-                .map(|bucket| (index, bucket))
-        })
+        self.runners
+            .iter()
+            .enumerate()
+            .find_map(|(index, runner)| runner.graphs().pending().map(|bucket| (index, bucket)))
     }
 
     /// States what the update in flight has no comparison for, for [`Worker::uncompared`].

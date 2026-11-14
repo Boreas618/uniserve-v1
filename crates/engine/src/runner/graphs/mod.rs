@@ -33,8 +33,10 @@
 //! parameters on the changed launches), any other is recaptured, and a bucket none of whose
 //! kernels changed keeps its graph. A rebind reads the new parameters from a capture under the
 //! new kernels, and every capture, as at warm-up, follows one eager run of the forward with the
-//! kernels it captures. The switch takes effect between two batches; the replaced
-//! generation's graphs stay until the trial is committed, and serve again after a rollback.
+//! kernels it captures. The buckets are examined one at a time, each with a profile run of its
+//! forward, and the worker serves batches between two of them. The switch takes effect between
+//! two batches; the replaced generation's graphs stay until the trial is committed, and serve
+//! again after a rollback.
 //!
 //! Before the switch, each operator whose kernel changed runs a paired forward
 //! ([`Graphs::shadow`]): the new kernel beside the one it replaces on the same inputs, compared
@@ -186,11 +188,11 @@ impl Prepared {
 enum Update {
     /// One generation serves and no other is held.
     Steady,
-    /// `next` is prepared beside the serving generation; `pending` are the buckets whose graphs
-    /// it still needs, with what each needs.
+    /// `next` is prepared beside the serving generation; `pending` are the captured buckets it
+    /// has yet to examine and, where it needs, prepare, largest first ([`Graphs::prepare_bucket`]).
     Prepared {
         next: Arc<Generation>,
-        pending: Vec<(Bucket, Preparation)>,
+        pending: Vec<Bucket>,
     },
     /// The prepared generation serves on trial and `kept` is the one it replaced.
     Trial { kept: Arc<Generation> },
@@ -752,117 +754,124 @@ impl Graphs {
         Arc::clone(&self.state.borrow().serving)
     }
 
-    /// Begins preparing `next` beside the serving generation and returns the buckets whose
-    /// graphs it changes, largest first: each is prepared by [`Graphs::prepare_bucket`], between
-    /// serving batches. A bucket that is not returned keeps its graph.
-    ///
-    /// What a bucket needs follows from launch tables: the serving graph's against a profile
-    /// run of the same forward now. A table that differs is a recapture; an equal table with a
-    /// launch whose kernel is another in `next` is a rebind.
+    /// Begins preparing `next` beside the serving generation and returns the captured buckets it
+    /// examines, largest first. Each is examined, and prepared where it needs, by
+    /// [`Graphs::prepare_bucket`], one bucket per call, so that the worker serves batches
+    /// between two buckets: what a bucket needs takes a profile run of its forward, and a
+    /// runner's buckets are counted in thousands. Beginning runs no forward.
     ///
     /// # Errors
     ///
-    /// When an update is already in flight, `next` is the serving generation's number, a
-    /// profile run fails, or `next` holds no kernel for a launch the serving generation has one
-    /// for.
+    /// When an update is already in flight, or `next` is the serving generation's number.
     pub fn prepare(&self, runner: &dyn Runner, next: Arc<Generation>) -> Result<Vec<Bucket>> {
-        let serving = {
-            let state = self.state.borrow();
-            if !matches!(state.update, Update::Steady) {
-                return Err(Error::State(
-                    "a generation update is in flight: commit or roll it back first",
-                ));
-            }
-            if state.serving.number() == next.number() {
-                return Err(Error::Invariant(format!(
-                    "generation {} serves and cannot be prepared beside itself",
-                    next.number()
-                )));
-            }
-            Arc::clone(&state.serving)
-        };
-
-        let mut pending = Vec::new();
-        for bucket in runner.buckets() {
-            let Some(table) = self
-                .state
-                .borrow()
-                .served(&bucket)
-                .map(|(_, graph)| graph.table.clone())
-            else {
-                continue;
-            };
-
-            let (profiled, _, _) = self.meta_forward(&self.profile, runner, &bucket)?;
-            let needed = preparation(&table, &profiled, &serving, &next)?;
-            if needed != Preparation::Keep {
-                pending.push((bucket, needed));
-            }
+        let mut state = self.state.borrow_mut();
+        if !matches!(state.update, Update::Steady) {
+            return Err(Error::State(
+                "a generation update is in flight: commit or roll it back first",
+            ));
+        }
+        if state.serving.number() == next.number() {
+            return Err(Error::Invariant(format!(
+                "generation {} serves and cannot be prepared beside itself",
+                next.number()
+            )));
         }
 
-        let buckets = pending.iter().map(|(bucket, _)| *bucket).collect();
-        let mut state = self.state.borrow_mut();
+        let pending: Vec<Bucket> = runner
+            .buckets()
+            .into_iter()
+            .filter(|bucket| state.served(bucket).is_some())
+            .collect();
+
         state.uncompared.clear();
-        state.update = Update::Prepared { next, pending };
-        Ok(buckets)
+        state.update = Update::Prepared {
+            next,
+            pending: pending.clone(),
+        };
+        Ok(pending)
     }
 
-    /// What the generation being prepared still needs of `bucket`; `None` when it needs
-    /// nothing more, or no generation is being prepared.
-    pub(crate) fn pending(&self, bucket: &Bucket) -> Option<Preparation> {
+    /// The next bucket the generation being prepared has yet to examine, the largest left;
+    /// `None` when it examined every bucket, or no generation is being prepared.
+    pub(crate) fn pending(&self) -> Option<Bucket> {
         match &self.state.borrow().update {
-            Update::Prepared { pending, .. } => pending
-                .iter()
-                .find(|(held, _)| held == bucket)
-                .map(|(_, needed)| *needed),
+            Update::Prepared { pending, .. } => pending.first().copied(),
             _ => None,
         }
     }
 
-    /// Prepares `bucket`'s graph for the generation being prepared, and returns what was done:
-    /// a rebind, or a recapture when the launch table changed or when the capture under the new
-    /// kernels turned out to differ in structure from the serving graph.
+    /// Examines `bucket` for the generation being prepared and prepares its graph where it needs
+    /// one; returns what was done.
+    ///
+    /// What a bucket needs follows from launch tables: the serving graph's against a profile
+    /// run of the same forward now. A table that differs is a recapture; an equal table with a
+    /// launch whose kernel is another in the new generation is a rebind, which is done as a
+    /// recapture when the capture under the new kernels turns out to differ in structure from
+    /// the serving graph; an equal table none of whose kernels changed keeps its graph
+    /// ([`Preparation::Keep`]).
     ///
     /// The serving graph is untouched and keeps serving.
     ///
     /// # Errors
     ///
-    /// When no generation is being prepared or it needs nothing of `bucket`, or as
-    /// [`Graphs::capture`].
+    /// When no generation is being prepared or `bucket` is not left to examine, a profile run
+    /// fails, the new generation holds no kernel for a launch of the bucket the serving
+    /// generation has one for, or as [`Graphs::capture`]. The bucket is then still left to
+    /// examine, and the caller gives the generation back ([`Graphs::rollback`]).
     pub fn prepare_bucket(&self, runner: &dyn Runner, bucket: &Bucket) -> Result<Preparation> {
-        let (next, needed, serving) = {
+        let (next, serving, held) = {
             let state = self.state.borrow();
             let Update::Prepared { next, pending } = &state.update else {
                 return Err(Error::State("no generation is being prepared"));
             };
-            let needed = pending
-                .iter()
-                .find(|(held, _)| held == bucket)
-                .map(|(_, needed)| *needed)
-                .ok_or_else(|| {
-                    Error::Invariant(format!(
-                        "generation {} needs nothing of bucket {bucket}",
-                        next.number()
-                    ))
-                })?;
-            (Arc::clone(next), needed, Arc::clone(&state.serving))
+            let left = || {
+                Error::Invariant(format!(
+                    "generation {} has no bucket {bucket} left to examine",
+                    next.number()
+                ))
+            };
+            if !pending.contains(bucket) {
+                return Err(left());
+            }
+
+            // A bucket is left to examine only while its serving graph exists.
+            let held = state
+                .served(bucket)
+                .map(|(_, graph)| graph.table.clone())
+                .ok_or_else(left)?;
+            (Arc::clone(next), Arc::clone(&state.serving), held)
         };
+
+        let (profiled, _, _) = self.meta_forward(&self.profile, runner, bucket)?;
+        let needed = preparation(&held, &profiled, &serving, &next)?;
 
         // The capture under the new kernels, a rebind's as a recapture's, follows an eager run
         // of the forward with them: a kernel of a library the process loaded for this generation
         // has its first use there, where it does the host work of its first use that a capture
         // cannot record (a native entry may build its runner on first use, and refuses a capture
         // before it).
-        let fresh = self.captured(runner, bucket, &next)?;
-        let (graph, done) = match needed {
-            Preparation::Rebind => self.rebound(bucket, fresh, &serving, &next)?,
-            _ => (fresh, Preparation::Recapture),
+        let prepared = match needed {
+            Preparation::Keep => None,
+            Preparation::Rebind => {
+                let fresh = self.captured(runner, bucket, &next)?;
+                Some(self.rebound(bucket, fresh, &serving, &next)?)
+            }
+            Preparation::Recapture => Some((
+                self.captured(runner, bucket, &next)?,
+                Preparation::Recapture,
+            )),
         };
 
         let mut state = self.state.borrow_mut();
-        state.graphs.insert((*bucket, next.number()), graph);
+        let done = match prepared {
+            Some((graph, done)) => {
+                state.graphs.insert((*bucket, next.number()), graph);
+                done
+            }
+            None => Preparation::Keep,
+        };
         if let Update::Prepared { pending, .. } = &mut state.update {
-            pending.retain(|(held, _)| held != bucket);
+            pending.retain(|held| held != bucket);
         }
         Ok(done)
     }
@@ -968,15 +977,16 @@ impl Graphs {
     ///
     /// # Errors
     ///
-    /// When `number` is not the prepared generation, or a bucket it changes is not prepared.
+    /// When `number` is not the prepared generation, or a bucket is still to be examined for it.
     pub fn switch(&self, number: u64) -> Result<()> {
         let mut state = self.state.borrow_mut();
 
         let next = match &state.update {
             Update::Prepared { next, pending } if next.number() == number => {
-                if let Some((bucket, _)) = pending.first() {
+                if let Some(bucket) = pending.first() {
                     return Err(Error::Invariant(format!(
-                        "generation {number} is not prepared: bucket {bucket} has no graph of it"
+                        "generation {number} is not prepared: bucket {bucket} is still to be \
+                         examined"
                     )));
                 }
                 Arc::clone(next)

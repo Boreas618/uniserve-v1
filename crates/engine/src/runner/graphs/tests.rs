@@ -561,19 +561,17 @@ fn a_changed_kernel_under_an_unchanged_launch_table_is_a_rebind() {
     let next = replacing(&serving, 2, "rms_norm");
     let buckets = runner.buckets();
 
-    // Both buckets launch the normalization, largest first.
+    // Every captured bucket is examined, largest first; both launch the normalization.
     assert_eq!(runner.graphs.prepare(&runner, next).unwrap(), buckets);
-    for bucket in &buckets {
-        assert_eq!(runner.graphs.pending(bucket), Some(Preparation::Rebind));
-    }
 
-    // The switch waits for every bucket the generation changes.
+    // The switch waits for every bucket.
     assert!(runner.graphs.switch(2).is_err());
     for bucket in &buckets {
+        assert_eq!(runner.graphs.pending(), Some(*bucket));
         let done = runner.graphs.prepare_bucket(&runner, bucket).unwrap();
         assert_eq!(done, Preparation::Rebind);
-        assert_eq!(runner.graphs.pending(bucket), None);
     }
+    assert_eq!(runner.graphs.pending(), None);
 
     // The serving generation serves until the switch.
     assert_eq!(runner.graphs.generation(), 1);
@@ -599,7 +597,10 @@ fn a_generation_that_changes_no_launched_kernel_keeps_every_graph() {
         )],
     ));
 
-    assert!(runner.graphs.prepare(&runner, next).unwrap().is_empty());
+    for bucket in runner.graphs.prepare(&runner, next).unwrap() {
+        let done = runner.graphs.prepare_bucket(&runner, &bucket).unwrap();
+        assert_eq!(done, Preparation::Keep);
+    }
     runner.graphs.switch(2).unwrap();
     assert_eq!(runner.graphs.generation(), 2);
 
@@ -621,9 +622,7 @@ fn a_changed_launch_table_is_a_recapture() {
     runner.model.deep.set(true);
     let buckets = runner.graphs.prepare(&runner, next).unwrap();
     assert_eq!(buckets, runner.buckets());
-
     let bucket = buckets[0];
-    assert_eq!(runner.graphs.pending(&bucket), Some(Preparation::Recapture));
 
     // A recapture is checked against the profile run of its own forward.
     runner.graphs.profile_run(&runner).unwrap();
@@ -679,7 +678,7 @@ fn a_prepared_generation_is_rolled_back_without_touching_the_serving_one() {
 
     runner.graphs.rollback(2).unwrap();
     assert_eq!(runner.graphs.generation(), 1);
-    assert_eq!(runner.graphs.pending(&buckets[1]), None);
+    assert_eq!(runner.graphs.pending(), None);
     assert!(runner.graphs.switch(2).is_err());
 
     // The next update starts from the serving generation.
@@ -691,11 +690,17 @@ fn a_prepared_generation_is_rolled_back_without_touching_the_serving_one() {
 fn a_generation_missing_a_launched_kernel_is_refused() {
     let (runner, _) = captured();
 
-    let refused = runner
+    // The bucket it is examined at is refused, and the generation cannot be switched to.
+    let buckets = runner
         .graphs
         .prepare(&runner, Arc::new(Generation::new(2, [])))
+        .unwrap();
+    let refused = runner
+        .graphs
+        .prepare_bucket(&runner, &buckets[0])
         .unwrap_err();
     assert!(matches!(refused, Error::Interface(_)), "{refused}");
+    assert!(runner.graphs.switch(2).is_err());
 }
 
 #[test]
