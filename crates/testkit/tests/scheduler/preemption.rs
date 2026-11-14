@@ -520,13 +520,14 @@ fn a_starved_request_with_nothing_else_to_serve_fails_the_scheduler() {
 /// The daemon's part for request `id` between two steps: its consumer takes every event it was
 /// sent (`taken` counts those taken before), and a request that left as migratable since
 /// (`lives` counts its lives that did) is resubmitted with what it generated, as `request`.
+/// Returns the reason its life finished with, once it ended with `Finished`.
 fn serve(
     harness: &mut Harness,
     id: RequestId,
     request: impl Fn() -> proto::request::GenerationRequest,
     taken: &mut usize,
     lives: &mut usize,
-) {
+) -> Option<FinishReason> {
     let events = harness.events(id);
     harness.apply(Message::Consumed(id, (events.len() - *taken) as u32));
     *taken = events.len();
@@ -539,6 +540,10 @@ fn serve(
         let mut resumed = request();
         resumed.generated_token_ids = harness.tokens(id);
         harness.submit(resumed);
+    }
+    match events.last() {
+        Some(Event::Finished { reason, .. }) => Some(reason.clone()),
+        _ => None,
     }
 }
 
@@ -589,14 +594,54 @@ fn after_requests_that_outgrew_the_cache_a_request_alone_fills_every_unit() {
     assert!(harness.finished_with(alone, FinishReason::CacheCapacity));
 }
 
-/// Many more requests than the cache holds, served as the daemon serves them (every event taken,
-/// every request that left as migratable resubmitted with what it generated), all end at their
-/// length: 64 requests over 24 prompts, each of 24 blocks by its end, beside a device region of
-/// 64 units and a host region of 128, 32 slots. Preemptions return admissions under way to the
-/// queue while their reads are held, so their requests are written for an owner already detached,
-/// whose answers the scheduler cannot bound; a `Load` among them answered `Copy` keeps owing the
-/// whole completion ring until the answer to its copy's `Finish`, and that `Finish`, which takes no
-/// room of its own, is still written (SD §3.1, §3.6).
+/// Serves request ids `1..=count`, each built by `request` and generating `tokens` tokens, as the
+/// daemon serves them (every event taken, every request that left as migratable resubmitted with
+/// what it generated, [`serve`]), until each has ended at its length; the load preempts.
+///
+/// # Panics
+///
+/// When a step forms no batch for two thousand steps in a row while requests remain (every
+/// batch the load needs forms within a few thousand steps), or a request ends otherwise.
+fn serve_to_their_length(
+    harness: &mut Harness,
+    count: u64,
+    request: impl Fn(u64) -> proto::request::GenerationRequest,
+    tokens: usize,
+) {
+    let ids: Vec<RequestId> = (1..=count).map(|id| harness.submit(request(id))).collect();
+    let mut taken = vec![0; ids.len()];
+    let mut lives = vec![0; ids.len()];
+    let mut ended = vec![None; ids.len()];
+
+    let mut idle = 0;
+    while ended.iter().any(Option::is_none) {
+        idle = if harness.step() { 0 } else { idle + 1 };
+        for (index, &id) in ids.iter().enumerate() {
+            // A request that finished takes no further event.
+            if ended[index].is_none() {
+                let request = || request(id.0);
+                ended[index] = serve(harness, id, request, &mut taken[index], &mut lives[index]);
+            }
+        }
+        assert!(idle < 2_000, "no batch formed: {}", harness.summary());
+    }
+    assert!(
+        lives.iter().sum::<usize>() > 0,
+        "the load preempted no request"
+    );
+    for (&id, reason) in ids.iter().zip(ended) {
+        assert_eq!(reason, Some(FinishReason::MaxTokens), "request {}", id.0);
+        assert_eq!(harness.tokens(id).len(), tokens, "request {}", id.0);
+    }
+}
+
+/// Many more requests than the cache holds all end at their length: 64 requests over 24 prompts,
+/// each of 24 blocks by its end, beside a device region of 64 units and a host region of 128, 32
+/// slots. Preemptions return admissions under way to the queue while their reads are held, so
+/// their requests are written for an owner already detached, whose answers the scheduler cannot
+/// bound; a `Load` among them answered `Copy` keeps owing the whole completion ring until the
+/// answer to its copy's `Finish`, and that `Finish`, which takes no room of its own, is still
+/// written (SD §3.1, §3.6).
 #[test]
 fn requests_that_outgrow_the_cache_many_times_over_all_end_at_their_length() {
     let mut harness = Deployment::tokens()
@@ -605,34 +650,26 @@ fn requests_that_outgrow_the_cache_many_times_over_all_end_at_their_length() {
         .slots(32)
         .build();
     let request = |id: u64| crate::harness::sharing(id, 1000 + id % 24, 32, 64);
-    let ids: Vec<RequestId> = (1..=64).map(|id| harness.submit(request(id))).collect();
-    let mut taken = vec![0; ids.len()];
-    let mut lives = vec![0; ids.len()];
+    serve_to_their_length(&mut harness, 64, request, 64);
+}
 
-    // Every batch the load needs forms within a few thousand steps; a step that forms none for
-    // two thousand steps in a row while requests remain is a stall.
-    let mut idle = 0;
-    while !ids
-        .iter()
-        .all(|id| harness.finished_with(*id, FinishReason::MaxTokens))
-    {
-        idle = if harness.step() { 0 } else { idle + 1 };
-        for (index, &id) in ids.iter().enumerate() {
-            serve(
-                &mut harness,
-                id,
-                || request(id.0),
-                &mut taken[index],
-                &mut lives[index],
-            );
-        }
-        assert!(idle < 2_000, "no batch formed: {}", harness.summary());
-    }
-    assert!(
-        lives.iter().sum::<usize>() > 0,
-        "the load preempted no request"
-    );
-    for &id in &ids {
-        assert_eq!(harness.tokens(id).len(), 64);
-    }
+/// Requests resumed with many blocks cached all end at their length beside the requests that
+/// run short: 96 requests over 48 prompts, each of 40 blocks by its end, beside a device region of
+/// 96 units and a host region of 192, 64 slots. A preempted request comes back with a hit as large
+/// as what the region has left besides the running requests' blocks. Those blocks are held by no
+/// request, so the region's `available` counts them as evictable, but its admission's `Pin` takes
+/// them from every allocation, its own `Allocate` included: an admission is tried only once
+/// `available` covers its hit's unheld blocks as well as what it allocates, and a `Pin` not yet
+/// answered keeps them out of `available`. A running request short of a unit therefore gets one
+/// once `available` shows it, and is never answered `Full` step after step until its starvation
+/// bound ends it (SD §3.5 `fits`, §3.6, §4.5).
+#[test]
+fn requests_resumed_with_their_blocks_cached_all_end_at_their_length() {
+    let mut harness = Deployment::tokens()
+        .kv_units(96)
+        .host(192)
+        .slots(64)
+        .build();
+    let request = |id: u64| crate::harness::sharing(id, 1000 + id % 48, 32, 128);
+    serve_to_their_length(&mut harness, 96, request, 128);
 }

@@ -890,11 +890,13 @@ impl Scheduler {
     /// allocates (SD §7.2, `S/admission.rs:1051-1160`, `S/kv_cache/mod.rs:2101-2206`): what
     /// `fits` compares with the units available. Per cache class but the draft cache, the most
     /// of the blocks its first call and the low watermark take and the least of the blocks after
-    /// the prefix and the fewest that must coexist to compute the prompt in chunks, and the
-    /// blocks of the hit that `cache` holds on the host alone, which its `Load` allocates on the
-    /// device; a request with context images every block of its context. Then every encoder
-    /// output and declared result but those it holds and those whose `Pin` `cache` expects to
-    /// find, which take no units of the region (SD §4.4).
+    /// the prefix and the fewest that must coexist to compute the prompt in chunks, the blocks of
+    /// the hit that `cache` holds on the host alone, which its `Load` allocates on the device,
+    /// and the blocks of the hit its `Pin` takes out of the eviction order, which `available`
+    /// counts as evictable (`unheld`; `S/admission.rs`'s `cached_free_units`); a request with
+    /// context images every block of its context. Then every encoder output and declared result
+    /// but those it holds and those whose `Pin` `cache` expects to find, which take no units of
+    /// the region (SD §4.4).
     pub(super) fn units_needed(&self, request: &Request, hit: u32) -> Vec<u32> {
         self.units(request, Some(hit))
     }
@@ -991,12 +993,23 @@ impl Scheduler {
             } else {
                 pages.saturating_sub(cached / block).min(least)
             };
-            let loaded = tiers
+            let range = needed(kind, block, cached);
+            let (device, loaded) = tiers
                 .as_ref()
                 .and_then(|tiers| tiers.get(index))
-                .and_then(|tiers| usable(tiers, needed(kind, block, cached), host))
-                .map_or(0, |(_, loaded)| loaded);
-            let blocks = blocks.max(first).saturating_add(loaded);
+                .and_then(|tiers| usable(tiers, range.clone(), host))
+                .unwrap_or((0, 0));
+            // The hit's blocks on the device are pinned, and those no request holds leave the
+            // eviction order with the `Pin`: the units `available` counts of them are no
+            // allocation's, the admission's own included.
+            let pinned = request.keys.get(index).and_then(|keys| {
+                keys.get(range.start as usize..range.start.saturating_add(device) as usize)
+            });
+            let unheld = pinned.map_or(0, |keys| self.unheld(keys, group));
+            let blocks = blocks
+                .max(first)
+                .saturating_add(loaded)
+                .saturating_add(unheld);
             self.charge_units(&mut units, group, class, blocks, 0);
         }
 

@@ -1764,8 +1764,9 @@ impl Scheduler {
     /// `available` by the units of `order` beyond the installed head, which the buffer pool may
     /// evict once a later `Victims` names them, and lowers it by the units of the scheduler's
     /// `Allocate`s, `Load`s and `Clone`s held, being stamped or outstanding, which the buffer
-    /// pool's word may not show yet: a `Load` or a `Clone` answered `Copy` took its blocks then,
-    /// and the word shows them.
+    /// pool's word may not show yet (a `Load` or a `Clone` answered `Copy` took its blocks then,
+    /// and the word shows them), and by the units of `order` its `Pin`s held, being stamped or
+    /// outstanding name, which no allocation can evict once the buffer pool has taken them.
     fn read_capacity(&mut self) {
         let words: Vec<(usize, u32, u32)> = self
             .registers
@@ -2030,9 +2031,11 @@ impl Scheduler {
 
     /// Per region (by index), the units a request takes from the device regions of a class in
     /// its owner's group: an `Allocate` its blocks, a `Load` a block per key, which the copy
-    /// from the host fills, and a `Clone` the one block it copies into; a `Replicate` the runs
-    /// it takes in the receiving regions of the group it copies into; and from its class's host
-    /// region, a `Prefetch` a host block per key, which it brings the key into.
+    /// from the host fills, and a `Clone` the one block it copies into; a `Pin` the blocks it
+    /// names that the region's eviction order holds, which `available` counts as evictable until
+    /// its `Pinned` is read (`unheld`); a `Replicate` the runs it takes in the receiving regions
+    /// of the group it copies into; and from its class's host region, a `Prefetch` a host block
+    /// per key, which it brings the key into.
     fn taken(&self, request: &runtime::Request) -> Vec<(usize, u32)> {
         if let runtime::Request::Replicate {
             owner,
@@ -2075,6 +2078,17 @@ impl Scheduler {
                 0,
             ),
             runtime::Request::Clone { owner, class, .. } => (*owner, *class, 1, 0),
+            runtime::Request::Pin {
+                owner, class, keys, ..
+            } => {
+                let Some((group, _)) = self
+                    .request_of(*owner)
+                    .and_then(|row| row.attachment(*owner))
+                else {
+                    return Vec::new();
+                };
+                (*owner, *class, self.unheld(keys, group), 0)
+            }
             _ => return Vec::new(),
         };
         let Some(regions) = self.class_regions(owner, class) else {

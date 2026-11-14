@@ -96,6 +96,12 @@ impl Cached {
             last_used: Nanos(self.last_used),
         }
     }
+
+    /// Whether its device copy is in the eviction order of `group`'s regions of its class: valid
+    /// in the group's memory, and held by no request of this scheduler.
+    fn ordered_in(&self, group: GroupId) -> bool {
+        self.pins == 0 && self.tiers & DEVICE != 0 && self.groups & bit(group) != 0
+    }
 }
 
 impl Scheduler {
@@ -605,9 +611,10 @@ impl Scheduler {
     /// device block a request reads (BP §4); the host copy is no request's, and the buffer pool's
     /// `evictable` word of the host region counts it whether or not its device block is pinned.
     fn placed(&self, row: &Cached) -> Vec<(usize, u32)> {
-        let devices = self.groups.iter().filter(|group| {
-            row.pins == 0 && row.tiers & DEVICE != 0 && row.groups & bit(group.id()) != 0
-        });
+        let devices = self
+            .groups
+            .iter()
+            .filter(|group| row.ordered_in(group.id()));
         let class = self.classes.get(usize::from(row.class));
         let host = class
             .and_then(|class| class.host)
@@ -741,6 +748,21 @@ impl Scheduler {
             Some(row.tiers & (device | HOST | REMOTE))
         };
         keys.iter().map(|key| tiers(key).unwrap_or(0)).collect()
+    }
+
+    /// How many of `keys` name blocks in the eviction order of `group`'s regions: on the device
+    /// in `group`, held by no request of this scheduler. `available` counts their units as
+    /// evictable (the buffer pool's word those of the installed head, `beyond_head` the rest),
+    /// and a `Pin` of them for an owner on `group` takes those units from every allocation, the
+    /// pinning request's own included, from the moment the buffer pool takes it until its
+    /// `Pinned` is read and the request holds them in `cache` too (SD §3.5, §4.5).
+    pub(super) fn unheld(&self, keys: &[Key], group: GroupId) -> u32 {
+        let unheld = keys.iter().filter(|key| {
+            self.cache
+                .get(&Cached::id(key))
+                .is_some_and(|row| row.key == **key && row.ordered_in(group))
+        });
+        u32::try_from(unheld.count()).unwrap_or(u32::MAX)
     }
 
     /// Whether the block `id` names (a policy's `PageId` or `EncodingId`) is on the device with no
