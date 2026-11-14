@@ -238,21 +238,24 @@ impl MainProcess {
         })
     }
 
-    /// The epoch fails for `reason`: every request this engine holds ends as migratable, every
-    /// front is told why, the daemon receives `report`, and the process ends without its orderly
-    /// close. A failure after the first changes nothing more.
+    /// The epoch fails for `reason`: every front is told why, then every request this engine
+    /// holds ends as migratable, the daemon receives `report`, and the process ends without its
+    /// orderly close. A failure after the first changes nothing more.
     pub(super) fn fail(&mut self, reason: String, report: proto::process::Report) {
         if self.lifecycle == Lifecycle::Failed {
             return;
         }
         tracing::error!(%reason, "the epoch fails");
         self.lifecycle = Lifecycle::Failed;
-        self.lose();
+        // A front reads its frames in order: told first that this engine failed, a daemon holds
+        // the requests that then leave it until another engine serves. Told after, it would
+        // submit them again to this engine, which still reads as serving, and lose them with it.
         self.broadcast(&from_engine::Kind::State(wire::State {
             state: wire::EngineState::Failed as i32,
             info: None,
             error: reason.clone(),
         }));
+        self.lose();
         self.report(report);
         self.ending = Some(Err(anyhow::anyhow!(reason)));
     }
@@ -333,5 +336,60 @@ impl MainProcess {
         for front in 0..self.fronts.len() {
             self.send(front, kind.clone(), None);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::os::unix::net::UnixStream;
+    use std::time::Duration;
+
+    use proto::request::RequestId;
+    use proto::request::wire::{self, event, from_engine};
+    use service::Connection;
+
+    use super::super::MainProcess;
+    use super::super::lifecycle;
+    use super::super::requests::RequestStream;
+
+    /// An engine whose epoch fails tells its daemon front that it failed before any request it
+    /// holds leaves it as migratable: a daemon that read the migration first would submit the
+    /// request again to this engine, which it still read as serving, and lose it with the
+    /// process.
+    #[test]
+    fn a_failing_engine_tells_its_daemon_before_its_requests_leave_as_migratable() {
+        let (engine_requests, daemon_requests) = UnixStream::pair().unwrap();
+        let (engine_process, _daemon_process) = UnixStream::pair().unwrap();
+        let mut main = MainProcess::new(
+            Connection::new(engine_requests).unwrap(),
+            Connection::new(engine_process).unwrap(),
+            crate::support::launch(),
+        )
+        .unwrap();
+        main.streams.insert(RequestId(7), RequestStream::new(0, 0));
+
+        let reason = "a main process of this epoch was lost: rank 1's engine process".to_owned();
+        main.fail(reason.clone(), lifecycle::fault("process_exit", reason, 0));
+
+        let mut daemon = Connection::new(daemon_requests).unwrap();
+        let mut frames = Vec::new();
+        while let Some(frame) = daemon
+            .recv::<wire::FromEngine>(Duration::from_secs(1))
+            .unwrap()
+        {
+            frames.push(match frame.kind {
+                Some(from_engine::Kind::State(state))
+                    if state.state == wire::EngineState::Failed as i32 =>
+                {
+                    "failed"
+                }
+                Some(from_engine::Kind::Event(wire::Event {
+                    kind: Some(event::Kind::Migratable(_)),
+                    ..
+                })) => "migratable",
+                _ => "other",
+            });
+        }
+        assert_eq!(frames, ["failed", "migratable"]);
     }
 }

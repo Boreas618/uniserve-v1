@@ -2287,6 +2287,42 @@ mod tests {
 
     /// A transfer that failed leaves the owner on the prefill group with blocks no device block
     /// table holds: its `Detach` is written with no stamp and the request leaves as migratable.
+    /// A scheduler that fails tells the engine (`Output::Failed`) before it ends a running request
+    /// as migratable: the engine then tells its daemons that it failed before the request leaves
+    /// it, so no daemon submits the request to the failing engine again.
+    #[test]
+    fn a_failed_scheduler_tells_the_engine_before_its_requests_leave_as_migratable() {
+        let (mut bench, outputs) = scheduler();
+        running(&mut bench, &[Phase::Decode]);
+
+        bench.scheduler.fail(super::super::Error::Executor(
+            "a worker was lost".to_owned(),
+        ));
+
+        let order: Vec<&str> = outputs
+            .try_iter()
+            .flat_map(|output| match output {
+                Output::Failed(_) => vec!["failed"],
+                Output::Events(events) => events
+                    .into_iter()
+                    .filter(|(id, event)| {
+                        *id == ID
+                            && matches!(
+                                event,
+                                Event::Migratable {
+                                    cause: MigrationCause::Loss,
+                                    ..
+                                }
+                            )
+                    })
+                    .map(|_| "migratable")
+                    .collect(),
+                _ => Vec::new(),
+            })
+            .collect();
+        assert_eq!(order, ["failed", "migratable"]);
+    }
+
     #[test]
     fn a_failed_transfer_ends_the_request_as_migratable_and_detaches_it_unstamped() {
         let (mut bench, outputs) = scheduler();

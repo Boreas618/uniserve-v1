@@ -1140,13 +1140,15 @@ impl Scheduler {
         Ok(())
     }
 
-    /// Stops the scheduler on a fault it cannot recover from (SD §3.7). Every request whose
-    /// terminal has not been sent leaves as `Migratable { Loss }`, which the daemon resubmits; a
-    /// `Finished` held for the daemon's decoder is sent as it is, since that generation ended.
-    /// Each request gives up what it holds as far as the workers still take it.
-    /// `Output::Failed` tells the engine, and the loop ends. A failed executor cannot stamp its
-    /// group's `Detach`: the buffer pool detaches the epoch's owners when its session closes
-    /// (BP §12.4). Called once; later faults are dropped.
+    /// Stops the scheduler on a fault it cannot recover from (SD §3.7). A `Finished` held for the
+    /// daemon's decoder is sent as it is, since that generation ended; then `Output::Failed`
+    /// tells the engine; then every request whose terminal has not been sent leaves as
+    /// `Migratable { Loss }`, which the daemon resubmits to the engine that serves next: the
+    /// engine tells its daemons that it failed before any request leaves it, so that none is
+    /// submitted to it again. Each request gives up what it holds as far as the workers still
+    /// take it, and the loop ends. A failed executor cannot stamp its group's `Detach`: the
+    /// buffer pool detaches the epoch's owners when its session closes (BP §12.4). Called once;
+    /// later faults are dropped.
     pub(super) fn fail(&mut self, error: Error) {
         if self.stopped {
             return;
@@ -1154,6 +1156,7 @@ impl Scheduler {
         self.stopped = true;
 
         let ids: Vec<RequestId> = self.requests.keys().copied().collect();
+        let mut lost = Vec::new();
         for id in ids {
             let Some(request) = self.requests.get_mut(&id) else {
                 continue;
@@ -1164,7 +1167,7 @@ impl Scheduler {
 
             match held {
                 Some(finished @ Event::Finished { .. }) => self.send(id, finished),
-                _ if !sent => self.send(id, update::migratable(MigrationCause::Loss)),
+                _ if !sent => lost.push(id),
                 _ => {}
             }
             self.free(id);
@@ -1172,6 +1175,9 @@ impl Scheduler {
 
         // An engine that no longer listens has stopped this scheduler's epoch already.
         self.emit(Output::Failed(error));
+        for id in lost {
+            self.send(id, update::migratable(MigrationCause::Loss));
+        }
     }
 
     /// `Shutdown`: every request the scheduler holds ends, aborted, at once, and the scheduler
