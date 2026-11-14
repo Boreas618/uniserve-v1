@@ -33,6 +33,7 @@
 //! product. The blocks' MLPs take the checkpoint's `gelu_pytorch_tanh`, the mergers PyTorch's
 //! exact `nn.GELU()`.
 
+use nn::family::SequenceSplit;
 use nn::modules::{
     Attention, AttentionConfig, LayerNorm, LayerNormConfig, Linear, LinearConfig, Parallel,
     Precision, QkNorm, QkvBias, QkvLinearConfig, QkvNames, Rotary, RotaryConfig, Spectrum,
@@ -135,6 +136,7 @@ impl VisionBlock {
             window: None,
             // A block's key bound is its own grid's patches, which each forward states.
             max_kv_len: u32::MAX,
+            sequence: SequenceSplit::WHOLE,
         };
         let mlp = vb.pp("mlp");
 

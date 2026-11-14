@@ -88,6 +88,7 @@ use crate::worker::{COPY_BUDGET, Sequences, Worker};
 use anyhow::{Context as _, Result, bail};
 use nn::WeightKey;
 use nn::family::TextModel;
+use ops::collective::Meet;
 use ops::{Generation, KernelEntry};
 use platform::{DeviceId, Stream};
 use proto::config::{EngineArgs, WorkerGroupConfig};
@@ -95,7 +96,7 @@ use storage::QueuePair;
 use storage::protocol::UnitRun;
 use storage::runtime::{Class, Group, GroupId, Open, Opened, Region, Segments, Tier, VERSION};
 
-use self::rank::{Collective, ModelRunner, RankModel, Weights, media_tasks};
+use self::rank::{Collective, ModelRunner, RankModel, Weights, media_tasks, parallel_order};
 use crate::process::binding::{self, Served};
 use crate::process::ranks::rank::memory::{
     Peaks, fewest_units, granularity, plane_segments, scratch_bytes,
@@ -212,8 +213,9 @@ pub(crate) struct TextRank {
     /// encodes images (`ModelRunner::encodes_images`); `None` on any other. It computes no paired
     /// forward, so it states no shadow region.
     pub(crate) vision: Option<Peaks>,
-    /// The rank's tensor group's communicator; `None` for a group of one and on the meta device.
-    pub(crate) tensor: Option<Arc<ops::Group>>,
+    /// The communicator of the rank's worker group, over the group's one parallel axis (its
+    /// tensor, pipeline or sequence ranks); `None` for a group of one and on the meta device.
+    pub(crate) group: Option<Arc<ops::Group>>,
     /// The config of the rank's runner: the profiled runner's until the rank is opened, the
     /// serving runner's after.
     pub(crate) config: CausalLmConfig,
@@ -432,6 +434,7 @@ pub(crate) fn load_ranks(
     };
     // One join target list for the union, which `spawn` fills with its members' workers.
     let targets: Members = Arc::default();
+    let meetings = pipeline_meetings(&model_runners);
 
     let mut ranks = std::thread::scope(|scope| {
         let mut handles = Vec::with_capacity(count);
@@ -446,10 +449,21 @@ pub(crate) fn load_ranks(
                     Arc::clone(&targets),
                 )
             });
+            let meet = meetings
+                .iter()
+                .find(|(group, _)| group == model_runner.group())
+                .map(|(_, meet)| Arc::clone(meet));
             let handle = std::thread::Builder::new()
                 .name(format!("rank-load-{index}"))
                 .spawn_scoped(scope, move || {
-                    load_rank(model_runner, meeting, (member, members), union, backing)
+                    load_rank(
+                        model_runner,
+                        meeting,
+                        (member, members),
+                        union,
+                        meet,
+                        backing,
+                    )
                 })
                 .context("starting a rank's load")?;
             handles.push(handle);
@@ -538,12 +552,14 @@ fn loopback(what: &str) -> Result<(String, TcpListener)> {
 /// Loads one rank onto `backing` to its division: it joins the process's host group at
 /// `meeting` as `member` of `members` and, in an expert union, the union's host group, then runs
 /// steps 1-15 of the rank's start (module documentation); a rank of a media deployment runs
-/// [`load_video_rank`] once it joined the host group.
+/// [`load_video_rank`] once it joined the host group. `meet` is the host meeting of the rank's
+/// pipeline group ([`pipeline_meetings`]), `None` for a rank of no pipeline.
 fn load_rank(
     model_runner: ModelRunner,
     meeting: (String, Option<TcpListener>),
     (member, members): (usize, usize),
     union: Option<(String, Option<TcpListener>, Members)>,
+    meet: Option<Meet>,
     backing: Backing<'_>,
 ) -> Result<LoadedRank> {
     let device = *model_runner
@@ -596,13 +612,12 @@ fn load_rank(
         None => None,
     };
 
-    // Step 3: the tensor group's communicator, opened before any device measurement because
-    // NCCL keeps device buffers. A text rank's tensor group is its worker group's ranks, one span
-    // of the host group among the deployment's groups.
-    let tensor = model_runner.tensor_spans()?;
-    let tensor = match tensor {
-        Some(collective) => group_over(&host, device, &collective, client.is_some())
-            .context("forming the tensor group")?,
+    // Step 3: the worker group's communicator, opened before any device measurement because
+    // NCCL keeps device buffers. A text rank's parallel group is its worker group's ranks in their
+    // parallel order, members of the host group among the deployment's groups.
+    let group = match model_runner.parallel_groups()? {
+        Some(collective) => group_over(&host, device, &collective, client.is_some(), meet)
+            .context("forming the worker group's communicator")?,
         None => None,
     };
 
@@ -723,7 +738,7 @@ fn load_rank(
                     first: units,
                     peaks,
                     vision,
-                    tensor,
+                    group,
                     config: meta_config,
                     cache: meta_cache,
                     state: meta_state,
@@ -799,7 +814,7 @@ fn load_rank(
             first,
             peaks,
             vision,
-            tensor,
+            group,
             config: meta_config,
             cache: meta_cache,
             state: meta_state,
@@ -891,9 +906,9 @@ fn load_video_rank(
     // NCCL keeps device buffers. Every rank forms the three kinds, in this order.
     let [tensor, sequence, decoder] = model_runner.media_collectives()?;
     let communicates = client.is_some();
-    let tensor = group_over(&host, device, &tensor, communicates)
+    let tensor = group_over(&host, device, &tensor, communicates, None)
         .context("forming the text encoder's tensor group")?;
-    let sequence = group_over(&host, device, &sequence, communicates)
+    let sequence = group_over(&host, device, &sequence, communicates, None)
         .context("forming the denoiser's sequence group")?;
     let decoder = communicator_over(&host, device, &decoder, communicates)
         .context("forming the video decoder ranks' communicator")?;
@@ -986,17 +1001,49 @@ fn join_hook(targets: Members, place: usize) -> JoinHook {
 /// The group a runner's collectives of `collective` go through ([`communicator_over`]), absent
 /// for a group of one and for a start that `communicates` none. One that does not communicate
 /// states the split alone, which the runner's graphs take ([`Graphs::set_group`]).
+///
+/// `meet` is how the group's members meet on the host before a broadcast outside a capture
+/// (`ops::Group::with_meet`): a pipeline group's, whose later stages would otherwise wait on their
+/// devices for a stage still issuing an eager forward; `None` for every other group.
 fn group_over(
     host: &HostGroup,
     device: DeviceId,
     collective: &Collective,
     communicates: bool,
+    meet: Option<Meet>,
 ) -> Result<Option<Arc<ops::Group>>> {
     let communicator = communicator_over(host, device, collective, communicates)?;
 
     communicator
-        .map(|communicator| Ok(Arc::new(ops::Group::new(communicator)?)))
+        .map(|communicator| {
+            let group = ops::Group::new(communicator)?;
+            Ok(Arc::new(match meet {
+                Some(meet) => group.with_meet(meet),
+                None => group,
+            }))
+        })
         .transpose()
+}
+
+/// The host meeting of each pipeline group among `model_runners`, this process's ranks, by group:
+/// every rank of such a group is a thread of this process (`ModelRunner::ranks`), so its stages
+/// meet at a barrier of the group's ranks.
+fn pipeline_meetings(model_runners: &[ModelRunner]) -> Vec<(String, Meet)> {
+    let mut meetings: Vec<(String, Meet)> = Vec::new();
+    for model_runner in model_runners {
+        let group = model_runner.group();
+        if model_runner.pipeline_stages() <= 1 || meetings.iter().any(|(held, _)| held == group) {
+            continue;
+        }
+
+        let barrier = Arc::new(std::sync::Barrier::new(model_runner.world_size()));
+        let meet: Meet = Arc::new(move || {
+            barrier.wait();
+            Ok(())
+        });
+        meetings.push((group.to_owned(), meet));
+    }
+    meetings
 }
 
 /// The communicator of the collective group of `collective` this rank is a member of, absent for
@@ -1229,8 +1276,9 @@ pub(crate) fn layout(launch: &EngineArgs, ranks: &[LoadedRank]) -> Result<Open> 
 ///   states. Per class of a cache group, when the deployment keeps a host tier, the host region
 ///   of its pages, one page a unit. Per worker group, the region of its slot rows, numbered from
 ///   1, the engine's own, named by its launch generation (a standby's are not the serving
-///   engine's of the same epoch). A unit's bytes are summed over the tensor ranks that hold a
-///   part of it.
+///   engine's of the same epoch). A unit's bytes are summed over the ranks of the group that
+///   hold a part of it: its tensor ranks, pipeline stages or sequence members, each a part of the
+///   same size (`specs/engine-worker-port.md` §7.4).
 /// - **Encoder outputs.** When a group encodes images (a group that prefills, of a model with a
 ///   vision tower, [`encodes`]): per such group, the region of its encoder outputs, the engine's
 ///   own memory of its ranks, the same units on every rank of it (the tower is whole on each,
@@ -1391,11 +1439,12 @@ pub fn text_layout(
                 memory: String::new(),
             });
             // The host parts the group's ranks copy each class's host copies with: a KV page's
-            // share of rank `i` lies in part `i` on that rank's host; an encoder output, which
-            // every rank holds whole, in part 0 on each host of the group's ranks.
+            // share of the rank at position `i` of the group's parallel order lies in part `i` on
+            // that rank's host; an encoder output, which every rank holds whole, in part 0 on each
+            // host of the group's ranks.
             let ranks: Vec<(String, u32)> = (0..)
-                .zip(&group.ranks)
-                .map(|(part, rank)| (rank.host.clone(), part))
+                .zip(parallel_order(group))
+                .map(|(part, member)| (group.ranks[member].host.clone(), part))
                 .collect();
             let mut parts: Vec<Vec<(String, u32)>> = host_regions
                 .iter()
@@ -2654,7 +2703,7 @@ fn open_rank(
         Some(stream.clone()),
         &cache,
         state.as_ref(),
-        rank.tensor.clone(),
+        rank.group.clone(),
         member,
         kernels,
     )?;
@@ -3252,7 +3301,7 @@ pub(crate) fn bind(
         };
 
         // The rank's part of its scheduler's KV units, in its group's memory.
-        let part = rank.model_runner.tensor_rank();
+        let part = rank.model_runner.part();
         let region = layout.regions[usize::from(kv)].name.clone();
         let runs = unit_runs(&service::lock(&text.cache).info().plane_runs);
         stated((region, group.memory.clone(), part, runs))?;
@@ -3562,9 +3611,9 @@ pub(crate) fn spawn(
 /// the order of their hosts' names and then their part indices, by
 /// the number the answer gave the host region: what a copy's answer names the parts it writes by
 /// (`storage::runtime::Completion::Copy::parts`), `None` where they do not include it. A rank
-/// copies a region whose units it holds a share of with the part of its index in its group, its
-/// tensor rank, and a region of blocks one rank holds whole with part 0, each on its own host. A
-/// class whose group states no host part is not named.
+/// copies a region whose units it holds a share of with the part of its position in its group's
+/// parallel order, and a region of blocks one rank holds whole with part 0, each on its own host.
+/// A class whose group states no host part is not named.
 ///
 /// # Errors
 ///
@@ -3576,7 +3625,7 @@ fn host_part_bits(
 ) -> Result<Vec<(u8, Option<u32>)>> {
     let host = rank_host(rank)?;
     let share = match &rank.loaded {
-        Loaded::Text(_) => rank.model_runner.tensor_rank(),
+        Loaded::Text(_) => rank.model_runner.part(),
         Loaded::Video(_) => 0,
     };
 

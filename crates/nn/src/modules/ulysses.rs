@@ -401,9 +401,115 @@ impl UlyssesAttention {
     }
 }
 
+/// The rows of a member's share of a sequence of `tokens` rows split over `members`: the
+/// sequence padded to a whole number of rows per member, `⌈tokens / members⌉`.
+pub fn share_rows(tokens: usize, members: u32) -> usize {
+    tokens.div_ceil(members.max(1) as usize)
+}
+
+/// Member `split.rank`'s share of the sequence `rows` (`[tokens, width]`): rows `rank·r ..
+/// (rank + 1)·r` of the sequence padded with zero rows to `size·r`, where `r` is
+/// [`share_rows`]. A share past the sequence's last row is zero rows alone.
+///
+/// The members' shares, in member order, are the padded sequence: what [`gather`] restores.
+///
+/// # Errors
+///
+/// When `rows` is not a matrix or a tensor operation refuses it.
+pub fn share(rows: &Tensor, split: Split) -> Result<Tensor> {
+    let &[tokens, width] = rows.dims() else {
+        return Err(Error::shape(
+            "ulysses::share",
+            format!("a sequence is [rows, width], not {:?}", rows.dims()),
+        ));
+    };
+    let held = share_rows(tokens, split.size);
+    let first = split.rank as usize * held;
+
+    // The sequence's own rows of the share, then the zero rows that pad it.
+    let own = tokens.saturating_sub(first).min(held);
+    let padding = held - own;
+    if padding == 0 {
+        return Ok(rows.narrow(0, first, held)?.contiguous()?);
+    }
+
+    let zeros = Tensor::zeros((padding, width), rows.dtype(), rows.device())?;
+    if own == 0 {
+        return Ok(zeros);
+    }
+    Ok(Tensor::cat(&[&rows.narrow(0, first, own)?, &zeros], 0)?)
+}
+
+/// The sequence of `tokens` rows whose share this member holds in `share` ([`share`]): every
+/// member's share gathered in member order over the forward's group, the padding rows left out.
+/// Every member holds the same result.
+///
+/// # Errors
+///
+/// When the gather refuses its tensors, the forward has no group of `split`'s members, or the
+/// shares do not hold `tokens` rows.
+pub fn gather(share: &Tensor, split: Split, tokens: usize) -> Result<Tensor> {
+    if split.size <= 1 {
+        return Ok(share.clone());
+    }
+    let members = collective::split().map(|(_, members)| members);
+    if members != Some(u64::from(split.size)) {
+        return Err(Error::shape(
+            "ulysses::gather",
+            format!(
+                "a sequence split over {} members gathers in a forward whose group is {members:?}",
+                split.size
+            ),
+        ));
+    }
+
+    let gathered = collective::gathered(&share.contiguous()?)?;
+    if gathered.dims().first().is_none_or(|rows| *rows < tokens) {
+        return Err(Error::shape(
+            "ulysses::gather",
+            format!(
+                "shares of {:?} hold fewer than the sequence's {tokens} rows",
+                share.dims()
+            ),
+        ));
+    }
+    Ok(gathered.narrow(0, 0, tokens)?)
+}
+
 #[cfg(test)]
 mod tests {
-    use super::UlyssesAttention;
+    use tensor::{DType, Device, Tensor};
+
+    use super::{Split, UlyssesAttention, share, share_rows};
+
+    /// A sequence of five rows over two members: three rows a share, the second share holding
+    /// the sequence's last two rows and one zero row; over eight members, the shares past the
+    /// sequence hold zero rows alone.
+    #[test]
+    fn a_share_is_its_members_rows_of_the_sequence_padded_with_zero_rows() {
+        let values: Vec<f32> = (1..=10).map(|value| value as f32).collect();
+        let rows = Tensor::from_vec(values, (5, 2), &Device::Cpu).unwrap();
+        let rows_of = |split: Split| -> Vec<Vec<f32>> {
+            share(&rows, split)
+                .unwrap()
+                .to_dtype(DType::F32)
+                .unwrap()
+                .to_vec2()
+                .unwrap()
+        };
+
+        assert_eq!(share_rows(5, 2), 3);
+        assert_eq!(
+            rows_of(Split { size: 2, rank: 0 }),
+            [[1.0, 2.0], [3.0, 4.0], [5.0, 6.0]]
+        );
+        assert_eq!(
+            rows_of(Split { size: 2, rank: 1 }),
+            [[7.0, 8.0], [9.0, 10.0], [0.0, 0.0]]
+        );
+        assert_eq!(rows_of(Split { size: 8, rank: 6 }), [[0.0, 0.0]]);
+        assert_eq!(rows_of(Split::WHOLE).len(), 5);
+    }
 
     /// A member's rows return in four intervals of shares 1:2:2:1, each ending on a whole unit,
     /// and together they are every row once.

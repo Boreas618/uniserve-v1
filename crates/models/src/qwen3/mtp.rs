@@ -21,7 +21,7 @@
 //! `step mod layers` of a speculation's steps (`qwen3_5_mtp.py:172-173`). A forward here is
 //! not told its step, so a checkpoint of more than one layer is refused at load.
 
-use nn::family::CacheShape;
+use nn::family::{CacheShape, SequenceSplit};
 use nn::modules::{Linear, LinearConfig, Parallel, RmsNorm, Rotary};
 use nn::{D, Drafter, KvCache, Split, Tensor, TokenBatch, VarBuilder, functional};
 
@@ -98,6 +98,7 @@ impl Mtp {
                 false,
                 config.moe.is_some(),
                 splits,
+                SequenceSplit::WHOLE,
                 None,
             )?,
             norm: RmsNorm::load(&norm, vb.pp("norm"))?,

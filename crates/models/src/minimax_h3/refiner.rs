@@ -24,6 +24,7 @@
 //! rank of a sequence split refines the whole prompt with every head, as the reference's
 //! refiner skips the exchange (`minimax_h3_transformer.py:455-457`).
 
+use nn::family::SequenceSplit;
 use nn::modules::{
     Attention, AttentionConfig, Linear, LinearConfig, Mlp, Parallel, QkNorm, QkvBias,
     QkvLinearConfig, QkvNames, RmsNorm, RmsNormConfig,
@@ -76,6 +77,7 @@ impl RefinerBlock {
             causal: false,
             window: None,
             max_kv_len: rows,
+            sequence: SequenceSplit::WHOLE,
         };
 
         Ok(Self {

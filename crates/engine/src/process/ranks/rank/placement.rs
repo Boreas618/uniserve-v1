@@ -116,6 +116,14 @@ impl ModelRunner {
 pub(crate) struct Mapping {
     pub(super) tensor_parallel: u32,
     pub(super) tensor_rank: u32,
+    /// The stages of a text group's pipeline, and this rank's stage.
+    pub(super) pipeline_parallel: u32,
+    pub(super) pipeline_rank: u32,
+    /// A text group's Ulysses sequence split and this rank's member of it.
+    pub(super) sequence: SequenceSplit,
+    /// This rank's position in its worker group's parallel order (`parallel_order`): its place
+    /// along the group's one axis and its part of every unit of the session's regions.
+    pub(super) position: u32,
     pub(super) expert_parallel: u32,
     pub(super) expert_rank: u32,
     /// This rank's place in the expert union, attention ranks first.
@@ -144,9 +152,14 @@ impl Mapping {
         } else {
             1
         };
+        let tensor_rank = launch.rank % tensor_parallel;
         Ok(Self {
             tensor_parallel,
-            tensor_rank: launch.rank % tensor_parallel,
+            tensor_rank,
+            pipeline_parallel: 1,
+            pipeline_rank: 0,
+            sequence: SequenceSplit::WHOLE,
+            position: tensor_rank,
             expert_parallel,
             expert_rank: (launch.rank / tensor_parallel) % expert_parallel,
             union_rank: 0,

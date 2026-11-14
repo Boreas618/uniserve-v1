@@ -22,6 +22,7 @@
 //! positions, computed once per forward, and may hold more than one spectrum (a text batch and
 //! an image batch of a Qwen3.5 model turn by different spectra of the same rotary width).
 
+use nn::family::SequenceSplit;
 use nn::functional::Rounding;
 use nn::modules::{
     Attention, AttentionConfig, GateUp, GatedDeltaNet, GatedDeltaNetConfig, Mlp, MlpConfig, MoE,
@@ -95,7 +96,8 @@ pub struct DecoderLayer {
 
 impl DecoderLayer {
     /// The layer the module at `vb` (`<stack>.layers.<i>`) states, at `tensor`'s rank of the
-    /// tensor-parallel group.
+    /// tensor-parallel group, its attention exchanging its rows over `sequence`, the Ulysses
+    /// sequence split ([`SequenceSplit::WHOLE`] for none).
     ///
     /// `linear` loads a gated delta network as the mixer in place of attention. `routed` loads
     /// routed experts (and the shared expert the configuration states) in place of the dense
@@ -112,6 +114,7 @@ impl DecoderLayer {
         linear: bool,
         routed: bool,
         (tensor, experts): (Split, Split),
+        sequence: SequenceSplit,
         order: Option<&Vec<u32>>,
     ) -> Result<Self> {
         let text = &config.text;
@@ -158,6 +161,7 @@ impl DecoderLayer {
                 causal: true,
                 window: None,
                 max_kv_len: text.max_position_embeddings,
+                sequence,
             };
 
             (Some(Attention::load(&attention, vb.pp("self_attn"))?), None)

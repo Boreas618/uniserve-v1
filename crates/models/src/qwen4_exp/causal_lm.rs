@@ -224,8 +224,9 @@ impl Qwen4ExpForCausalLm {
     /// # Errors
     ///
     /// [`Error::Representation`] for a checkpoint whose decoder layers store their routed
-    /// experts as block-scaled FP8; a split the model does not divide; an order that names no
-    /// layer; a drafter the checkpoint does not carry; or a module the loader refuses.
+    /// experts as block-scaled FP8; a split the model does not divide; a pipeline or sequence
+    /// split, which this model's layers do not serve; an order that names no layer; a drafter
+    /// the checkpoint does not carry; or a module the loader refuses.
     pub fn load(
         config: &Config,
         vb: VarBuilder<'_, '_>,
@@ -234,6 +235,13 @@ impl Qwen4ExpForCausalLm {
     ) -> Result<Self> {
         let splits = (placement.tensor, placement.experts);
         config.check_splits(splits.0, splits.1)?;
+        if placement.pipeline.size > 1 || placement.sequence.split.size > 1 {
+            return Err(Error::Config(format!(
+                "a pipeline split over {} stages or a sequence split over {} members: this \
+                 model's layers are split over tensor and expert ranks alone",
+                placement.pipeline.size, placement.sequence.split.size
+            )));
+        }
 
         let routed = expert_layers(config);
         if let Some(stray) = order.keys().find(|module| !routed.contains_key(*module)) {

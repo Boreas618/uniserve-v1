@@ -21,7 +21,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use models::qwen3::{Config, Qwen3VlModel};
 use nn::config::Fields;
-use nn::family::{TextModel, TextPlacement};
+use nn::family::{Projection, SequenceSplit, TextModel, TextPlacement};
 use nn::{DType, Encoder, ExpertExchange, PhaseKind, Shape, Split, Tensor, WeightLoader};
 use processing::qwen_vl::ProcessorConfig;
 
@@ -278,6 +278,48 @@ fn qwen3_moe_profiles_a_decode_and_a_prefill_bucket() {
             &PACKED_EXPERTS,
         );
         assert_operators("a dense Qwen3-MoE step", &keys, &DENSE_EXPERTS, &[]);
+    }
+}
+
+/// Qwen3-30B-A3B over two pipeline stages and over two Ulysses members of either projection
+/// form: a stage holds 24 of the 48 layers with every key/value head and passes its rows over the
+/// group, a member holds every layer with two of the four key/value heads and attends its heads
+/// of every row of the batch. Each returns the whole batch's rows, also for a batch of one token,
+/// whose second member holds a padding row alone.
+#[test]
+#[ignore = "requires /workspace/models/Qwen3-30B-A3B"]
+fn qwen3_moe_profiles_pipeline_stages_and_sequence_members() {
+    for rank in 0..2 {
+        let placement = TextPlacement {
+            pipeline: Split { size: 2, rank },
+            ..support::whole(false)
+        };
+        let model = load("Qwen3-30B-A3B", &placement);
+        let shape = model.cache();
+        assert_eq!((shape.layers, shape.kv_heads), (24, 4));
+
+        let name = format!("Qwen3-30B-A3B pipeline stage {rank} of 2");
+        buckets(&name, &*model, Some((u64::from(rank), 2)), &no_exchange);
+    }
+
+    for projection in [Projection::Gather, Projection::Exchange] {
+        for rank in 0..2 {
+            let placement = TextPlacement {
+                sequence: SequenceSplit {
+                    split: Split { size: 2, rank },
+                    projection,
+                },
+                ..support::whole(false)
+            };
+            let model = load("Qwen3-30B-A3B", &placement);
+            let shape = model.cache();
+            assert_eq!((shape.layers, shape.kv_heads), (48, 2));
+
+            let group = Some((u64::from(rank), 2));
+            let name = format!("Qwen3-30B-A3B {projection:?} sequence member {rank} of 2");
+            buckets(&name, &*model, group, &no_exchange);
+            step(&*model, &batch(PhaseKind::Decode, 1, 1, 1), group, None);
+        }
     }
 }
 

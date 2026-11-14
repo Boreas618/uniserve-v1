@@ -22,7 +22,10 @@
 //! Every rotary spectrum is computed in FP32, as the references compute `inv_freq`
 //! (`torch.arange(..., dtype=torch.float)` in vLLM's and transformers' rotary embeddings).
 
+use std::ops::Range;
+
 use nn::config::Fields;
+use nn::family::TextPlacement;
 use nn::functional::Activation;
 use nn::modules::{GatedDeltaNetConfig, Precision, RotaryConfig, Spectrum};
 use nn::quantization::Declaration;
@@ -524,6 +527,94 @@ impl Config {
             )));
         }
         Ok(())
+    }
+
+    /// Checks a deployment's placement of the model and returns the decoder layers this rank's
+    /// pipeline stage holds: the tensor and expert splits as [`Self::check_splits`] checks them,
+    /// at most one of the tensor, pipeline and sequence splits above one rank (a forward runs
+    /// over one group), and the pipeline's and the sequence's own conditions.
+    ///
+    /// Stage `s` of `P` holds layers `s·L/P .. (s + 1)·L/P` of the stack's `L`. `P` divides `L`
+    /// and every stage holds as many attention layers as every other: every rank of a group
+    /// lays its cache unit out alike. A sequence split's members share the attention and the
+    /// key/value heads evenly; it serves neither a recurrent state, whose scan reads every row in
+    /// order, nor a drafter, whose attention is not split.
+    ///
+    /// # Errors
+    ///
+    /// A split the model does not divide, a rank outside its split, two splits above one rank,
+    /// or a sequence split of a model that keeps a recurrent state or of a placement that loads
+    /// the drafter.
+    pub fn check_placement(&self, placement: &TextPlacement) -> Result<Range<u32>> {
+        let (tensor, pipeline, sequence) = (
+            placement.tensor,
+            placement.pipeline,
+            placement.sequence.split,
+        );
+        self.check_splits(tensor, placement.experts)?;
+
+        let split = [tensor.size, pipeline.size, sequence.size];
+        if split.iter().filter(|size| **size > 1).count() > 1 {
+            return Err(Error::Config(format!(
+                "tensor, pipeline and sequence degrees {split:?}: a forward runs over one group, \
+                 so one of them splits the model"
+            )));
+        }
+        for (name, split) in [("pipeline", pipeline), ("sequence", sequence)] {
+            if split.size == 0 || split.rank >= split.size {
+                return Err(Error::Config(format!(
+                    "{name} rank {} of a group of {}",
+                    split.rank, split.size
+                )));
+            }
+        }
+
+        if sequence.size > 1 {
+            let text = &self.text;
+            let heads = [text.num_attention_heads, text.num_key_value_heads];
+            if heads
+                .iter()
+                .any(|heads| !heads.is_multiple_of(sequence.size))
+            {
+                return Err(Error::Config(format!(
+                    "a sequence split over {} members of {heads:?} attention and key/value \
+                     heads: the members share the heads evenly",
+                    sequence.size
+                )));
+            }
+            if self.linear_layers() > 0 || placement.drafter {
+                return Err(Error::Config(format!(
+                    "a sequence split over {} members of a model whose {} layers keep a \
+                     recurrent state or that loads its drafter: a recurrent scan reads every row \
+                     in order, and the drafter's attention is not split",
+                    sequence.size,
+                    self.linear_layers()
+                )));
+            }
+        }
+
+        let layers = self.text.num_hidden_layers;
+        let stages = pipeline.size;
+        let attention_in = |range: Range<u32>| -> usize {
+            range
+                .filter(|layer| !self.text.linear_layers[*layer as usize])
+                .count()
+        };
+        let per_stage = layers / stages;
+        let even = layers.is_multiple_of(stages)
+            && per_stage > 0
+            && (1..stages).all(|stage| {
+                attention_in(stage * per_stage..(stage + 1) * per_stage)
+                    == attention_in(0..per_stage)
+            });
+        if !even {
+            return Err(Error::Config(format!(
+                "a pipeline of {stages} stages over {layers} decoder layers: every stage holds \
+                 as many layers, and as many attention layers, as every other"
+            )));
+        }
+        let first = pipeline.rank * per_stage;
+        Ok(first..first + per_stage)
     }
 }
 
@@ -1132,6 +1223,82 @@ mod tests {
         assert!(config.text.local_heads(split(3, 0)).is_err());
         assert!(config.text.local_heads(split(4, 4)).is_err());
         assert!(config.check_splits(split(1, 0), split(3, 0)).is_err());
+    }
+
+    /// A pipeline stage holds its contiguous share of the decoder layers; a pipeline that does
+    /// not split the layers evenly, a sequence split that does not share the heads evenly, and
+    /// two splits of one placement are refused.
+    #[test]
+    fn a_placement_holds_one_split_that_divides_what_it_splits() {
+        let config = parse(&moe()).expect("parsed");
+        let layers = config.text.num_hidden_layers;
+        let split = |size, rank| Split { size, rank };
+        let placed = |tensor, pipeline, sequence| TextPlacement {
+            tensor,
+            pipeline,
+            sequence: nn::family::SequenceSplit {
+                split: sequence,
+                projection: nn::family::Projection::Gather,
+            },
+            experts: Split::WHOLE,
+            drafter: false,
+            draft_tokens: 0,
+        };
+        let whole = Split::WHOLE;
+
+        assert_eq!(
+            config
+                .check_placement(&placed(whole, whole, whole))
+                .expect("whole"),
+            0..layers
+        );
+        assert_eq!(
+            config
+                .check_placement(&placed(whole, split(2, 1), whole))
+                .expect("the second stage"),
+            layers / 2..layers
+        );
+        assert_eq!(
+            config
+                .check_placement(&placed(whole, whole, split(4, 3)))
+                .expect("a sequence member"),
+            0..layers
+        );
+
+        assert!(
+            config
+                .check_placement(&placed(whole, split(layers + 1, 0), whole))
+                .is_err()
+        );
+        assert!(
+            config
+                .check_placement(&placed(whole, whole, split(3, 0)))
+                .is_err()
+        );
+        assert!(
+            config
+                .check_placement(&placed(split(2, 0), split(2, 0), whole))
+                .is_err()
+        );
+        assert!(
+            config
+                .check_placement(&placed(whole, whole, split(2, 2)))
+                .is_err()
+        );
+
+        // A hybrid stack of three linear layers and one attention layer: two stages would hold
+        // zero and one attention layers, and its recurrent scan is not split over members.
+        let hybrid = parse(&hybrid()).expect("parsed");
+        assert!(
+            hybrid
+                .check_placement(&placed(whole, split(2, 0), whole))
+                .is_err()
+        );
+        assert!(
+            hybrid
+                .check_placement(&placed(whole, whole, split(2, 0)))
+                .is_err()
+        );
     }
 
     #[test]

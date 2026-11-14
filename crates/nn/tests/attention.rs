@@ -12,6 +12,7 @@ mod support;
 use std::path::Path;
 
 use nn::collective::Split;
+use nn::family::SequenceSplit;
 use nn::functional::{self, WeightOrder};
 use nn::modules::{Attention, AttentionConfig, QkNorm, QkvBias, QkvLinearConfig, QkvNames};
 use nn::{
@@ -924,6 +925,7 @@ fn attention_config(qk_norm: QkNorm, causal: bool, gated: bool) -> AttentionConf
         causal,
         window: None,
         max_kv_len: 1024,
+        sequence: SequenceSplit::WHOLE,
     }
 }
 
@@ -1300,4 +1302,78 @@ fn a_paged_forward_writes_its_layers_planes_then_reads_them() {
 
     let (alone, _) = recorded(forward);
     assert!(alone.unwrap_err().to_string().contains("no group"));
+}
+
+/// A member of a two-member sequence split, under either projection form, attends its share of
+/// the heads over every row of the batch: given its share of a five-token batch, three rows
+/// whose last pads the sequence, it writes and attends its two query heads over one key head of
+/// all five rows and returns its three rows of every head projected whole. Under the gather form
+/// it holds its heads' rows of the input projections; under the exchange form it holds them
+/// whole. A split attention runs in a forward whose group is its split, and over the paged
+/// forward alone; it is refused beside a tensor split.
+#[test]
+fn a_sequence_split_member_attends_its_heads_of_every_row_and_returns_its_own_rows() {
+    let directory = tempfile::tempdir().unwrap();
+    let checkpoint = checkpoint(directory.path(), DType::BF16, &attention_weights(false));
+    let loader = WeightLoader::meta(&checkpoint, None, None);
+
+    let (tokens, share) = (5, 3);
+    let hidden = meta((share, HIDDEN), DType::BF16);
+    let (cos, sin) = (
+        meta((tokens, DIM / 2), DType::F32),
+        meta((tokens, DIM / 2), DType::F32),
+    );
+    let batch = meta_batch(PhaseKind::Prefill, tokens);
+    let cache = meta_cache(DType::BF16, KV_HEADS / 2, DIM);
+
+    for (projection, held) in [
+        (nn::family::Projection::Gather, HEADS / 2),
+        (nn::family::Projection::Exchange, HEADS),
+    ] {
+        let config = AttentionConfig {
+            sequence: SequenceSplit {
+                split: Split { size: 2, rank: 1 },
+                projection,
+            },
+            ..attention_config(FUSED, true, false)
+        };
+        let attention = Attention::load(&config, loader.root().pp("attn")).unwrap();
+        assert_eq!(attention.query().n(), (held * DIM) as u32, "{projection:?}");
+
+        let forward = || attention.forward_paged(&hidden, Some((&cos, &sin)), &batch, &cache, 0);
+        let (out, launches) = recorded_split(Some((1, 2)), forward);
+        assert_eq!(out.unwrap().dims(), [share, HIDDEN], "{projection:?}");
+
+        let written = launches
+            .iter()
+            .find(|(operator, _)| *operator == "kv_write")
+            .unwrap();
+        assert!(written.1.contains("_heads_1_"), "{written:?}");
+        let attended = launches
+            .iter()
+            .find(|(operator, _)| *operator == "paged_attention")
+            .unwrap();
+        assert!(
+            attended.1.contains("_q_heads_2_kv_heads_1_"),
+            "{attended:?}"
+        );
+
+        // The member's rows are its share of the batch's, and its group is its split.
+        let (alone, _) = recorded(forward);
+        assert!(alone.is_err(), "{projection:?}");
+        let whole = meta((tokens, HIDDEN), DType::BF16);
+        let (unshared, _) = recorded_split(Some((1, 2)), || {
+            attention.forward_paged(&whole, Some((&cos, &sin)), &batch, &cache, 0)
+        });
+        assert!(unshared.is_err(), "{projection:?}");
+        let (dense, _) = recorded_split(Some((1, 2)), || {
+            attention.forward(&hidden, Some((&cos, &sin)))
+        });
+        assert!(dense.is_err(), "{projection:?}");
+    }
+
+    let mut both = attention_config(FUSED, true, false);
+    both.qkv.split = Split { size: 2, rank: 0 };
+    both.sequence.split = Split { size: 2, rank: 0 };
+    assert!(Attention::load(&both, loader.root().pp("attn")).is_err());
 }

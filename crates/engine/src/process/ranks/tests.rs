@@ -1695,7 +1695,7 @@ fn a_host_numbers_its_text_ranks_by_their_places_in_the_deployment() {
                 (
                     rank.rank(),
                     rank.group().to_owned(),
-                    rank.tensor_rank(),
+                    rank.part(),
                     rank.devices()[0].0,
                 )
             })
@@ -1863,4 +1863,247 @@ fn the_regions_of_a_media_group_serve_the_slots_it_kept() {
     let mut expected = vec![(slot_region, 1), (products, per_slot)];
     expected.sort_unstable();
     assert_eq!(kept, expected);
+}
+
+/// The launch of one main process serving the Qwen3-MoE fixture (two decoder layers of four
+/// query heads over two key/value heads) on one group of `devices` ranks listed in descending
+/// device order, whose `model` block lists them in descending order too and states its degrees
+/// as `degrees` sets them, as `tests/python/e2e/test_parallel_ranks_http.py` places its group.
+fn parallel_launch(devices: u32, degrees: impl FnOnce(&mut BlockConfig)) -> EngineArgs {
+    let mut launch = launch();
+    let ranks: Vec<WorkerRank> = (0..devices)
+        .rev()
+        .map(|device| WorkerRank {
+            host: "localhost".to_owned(),
+            device: format!("cuda:{device}"),
+        })
+        .collect();
+    let mut block = BlockConfig::parallel((0..devices as usize).rev().collect());
+    degrees(&mut block);
+    let group = WorkerGroupConfig {
+        id: WorkerGroupId("model".to_owned()),
+        role: Default::default(),
+        replicas: 1,
+        blocks: BTreeMap::from([(proto::config::DEFAULT_BLOCK.to_owned(), block)]),
+        ranks,
+        queue_depth: 2,
+        mem_fraction_static: None,
+    };
+
+    launch.engine_config.parallel.worker_groups = vec![group.clone()];
+    launch.group = group.id.0;
+    launch.devices = (0..devices).collect();
+    launch.world_size = devices;
+    launch
+}
+
+/// A group of two pipeline stages and a group of two Ulysses members start on the meta device as
+/// one group of the session (`specs/engine-worker-port.md` §7): each rank takes the position its
+/// `model` block lists it at, so the group's second rank, on `cuda:0`, is position 0; a stage
+/// holds one of the fixture's two layers with every key/value head, a member every layer with
+/// one of the two heads; both ranks lay their part of a unit out alike, and the session states
+/// one KV region whose unit is both parts, with a host part per position. The ranks' profile
+/// runs, over the group's split, pass their rows over the group, and the group states what one
+/// rank of it serves.
+#[test]
+fn a_pipeline_and_a_sequence_group_start_as_one_group_of_the_session() {
+    let ulysses = |projection| proto::config::SequenceParallel::Ulysses {
+        ulysses_degree: 2,
+        projection,
+        projection_rows: None,
+    };
+    let local = proto::config::SequenceParallel::Local;
+    let layouts = [
+        ("pipeline", 2, local, (1, 2)),
+        (
+            "gathered sequence",
+            1,
+            ulysses(proto::config::HeadProjection::Gather),
+            (2, 1),
+        ),
+        (
+            "exchanged sequence",
+            1,
+            ulysses(proto::config::HeadProjection::Exchange),
+            (2, 1),
+        ),
+    ];
+
+    for (axis, stages, sequence, held) in layouts {
+        let server = StorageServer::start();
+        let launch = parallel_launch(2, |block| {
+            block.pipeline_parallel_size = stages;
+            block.sequence_parallel = sequence;
+        });
+        let mut ranks = loaded(&launch);
+
+        let placed: Vec<(u32, u32, i32)> = ranks
+            .iter()
+            .map(|rank| {
+                let runner = &rank.model_runner;
+                (runner.rank(), runner.part(), runner.devices()[0].0)
+            })
+            .collect();
+        assert_eq!(placed, [(0, 1, 1), (1, 0, 0)], "{axis}");
+
+        let shapes: Vec<(u32, u32)> = ranks
+            .iter()
+            .map(|rank| {
+                let shape = rank.text().unwrap().model.cache();
+                (shape.layers, shape.kv_heads)
+            })
+            .collect();
+        assert_eq!(shapes, [held, held], "{axis}");
+
+        let units: Vec<u64> = ranks
+            .iter()
+            .map(|rank| {
+                service::lock(&rank.text().unwrap().cache)
+                    .layout()
+                    .unit_bytes
+            })
+            .collect();
+        assert_eq!(units[0], units[1], "{axis}");
+
+        // One KV region of the group's units, each the two ranks' parts; a host part per
+        // position, each on the host of the rank at that position.
+        let open = stated(&launch, &ranks);
+        assert_eq!(open.schedulers, vec![vec![GroupId(0)]], "{axis}");
+        let group = &open.groups[0];
+        let kv = usize::from(group.regions[0][0]);
+        assert_eq!(
+            (open.regions[kv].part_bytes, open.regions[kv].unit_bytes),
+            (units[0], 2 * units[0]),
+            "{axis}"
+        );
+        let localhost = |part| ("localhost".to_owned(), part);
+        assert_eq!(group.parts[0], [localhost(0), localhost(1)], "{axis}");
+
+        let mut head =
+            StorageClient::connect_head(&server.socket, DEPLOYMENT, launch.epoch, launch.engine)
+                .unwrap();
+        let pairs = head.open(open.clone()).unwrap();
+        let opened = head.session().unwrap().1.clone();
+        let created = open_ranks(&mut ranks, &open, &opened, None).unwrap();
+        for (region, segments) in &created {
+            for &(segment, first, count) in segments {
+                head.grant(region, segment, first, count).unwrap();
+            }
+        }
+        bind(&mut ranks, &open, &opened, true).unwrap();
+        let (workers, spawned) = spawn(
+            &mut ranks,
+            (&open, &opened),
+            &|group| head.completed_registers(group, &pairs),
+            Vec::new(),
+        )
+        .unwrap();
+        assert_eq!(spawned.len(), 2, "{axis}");
+
+        // The group serves a text group's phases on every slot, over its one cache group.
+        let stated_capacities = capacities(&ranks, &open, (&[], Vec::new())).unwrap();
+        assert_eq!(stated_capacities.len(), 1, "{axis}");
+        let (id, capacity) = &stated_capacities[0];
+        assert_eq!(*id, GroupId(0));
+        for phase in [Phase::Prefill, Phase::Decode] {
+            assert!(capacity.serves(phase), "{axis} {phase:?}");
+            assert_eq!(capacity.rows[phase.index()], SLOTS, "{axis} {phase:?}");
+        }
+        assert_eq!(capacity.cache_groups, vec![(CacheGroupKind::Full, 64)]);
+        assert_eq!(capacity.seeds.len(), 1);
+
+        drop(workers);
+        drop(spawned);
+        head.close().unwrap();
+    }
+}
+
+/// A text group splits its model along one axis, a Ulysses sequence's every row of a projection at
+/// once, a pipeline's stages on one host, and every serving group of a deployment alike: a block
+/// of two degrees above one, a sequence split of another kind, an overlapped projection step, a
+/// pipeline across hosts and two groups split otherwise are refused at start, each naming what it
+/// states.
+#[test]
+fn a_text_group_splits_its_model_along_one_axis_and_every_group_alike() {
+    let registry = nn::family::Registry::new([models::qwen3::family::FAMILY]).unwrap();
+    let refused = |launch: &EngineArgs| -> String {
+        let family = crate::process::catalogue::resolve(
+            &registry,
+            Path::new(&launch.engine_config.model.model),
+        )
+        .unwrap();
+        let ranks = ModelRunner::of(launch, family).unwrap().ranks();
+        format!("{:#}", ranks.err().expect("the deployment is refused"))
+    };
+
+    let two_axes = parallel_launch(4, |block| {
+        block.tensor_parallel_size = 2;
+        block.pipeline_parallel_size = 2;
+    });
+    assert!(refused(&two_axes).contains("one axis"));
+
+    let gathered = parallel_launch(2, |block| {
+        block.sequence_parallel = proto::config::SequenceParallel::Allgather {
+            allgather_degree: 2,
+        };
+    });
+    assert!(refused(&gathered).contains("Ulysses"));
+
+    let stepped = parallel_launch(2, |block| {
+        block.sequence_parallel = proto::config::SequenceParallel::Ulysses {
+            ulysses_degree: 2,
+            projection: proto::config::HeadProjection::Exchange,
+            projection_rows: Some(64),
+        };
+    });
+    assert!(refused(&stepped).contains("projection_rows"));
+
+    // The stages of a pipeline meet at a barrier of one process.
+    let mut spread = parallel_launch(2, |block| block.pipeline_parallel_size = 2);
+    spread.engine_config.parallel.worker_groups[0].ranks[0].host = "elsewhere".to_owned();
+    assert!(refused(&spread).contains("more than one host"));
+
+    // A prefill group of two pipeline stages beside a decode group of two tensor ranks.
+    let mut split = parallel_launch(4, |_| {});
+    let group = |id: &str, role, devices: [&str; 2], block: BlockConfig| WorkerGroupConfig {
+        id: WorkerGroupId(id.to_owned()),
+        role,
+        replicas: 1,
+        blocks: BTreeMap::from([(proto::config::DEFAULT_BLOCK.to_owned(), block)]),
+        ranks: devices
+            .iter()
+            .map(|device| WorkerRank {
+                host: "localhost".to_owned(),
+                device: (*device).to_owned(),
+            })
+            .collect(),
+        queue_depth: 2,
+        mem_fraction_static: None,
+    };
+    split.engine_config.parallel.worker_groups = vec![
+        group(
+            "prefill",
+            proto::config::WorkerGroupRole::Prefill,
+            ["cuda:0", "cuda:1"],
+            BlockConfig {
+                pipeline_parallel_size: 2,
+                ..BlockConfig::parallel(vec![0, 1])
+            },
+        ),
+        group(
+            "decode",
+            proto::config::WorkerGroupRole::Decode,
+            ["cuda:2", "cuda:3"],
+            BlockConfig {
+                tensor_parallel_size: 2,
+                ..BlockConfig::parallel(vec![0, 1])
+            },
+        ),
+    ];
+    split.group = "prefill".to_owned();
+    let refusal = refused(&split);
+    assert!(
+        refusal.contains("prefill") && refusal.contains("decode"),
+        "{refusal}"
+    );
 }

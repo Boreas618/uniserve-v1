@@ -26,7 +26,7 @@ pub use attention::{Attention, AttentionConfig, QkNorm};
 pub use embedding::{Embedding, EmbeddingConfig};
 pub use gated_delta_net::{GatedDeltaNet, GatedDeltaNetConfig};
 mod timestep;
-mod ulysses;
+pub mod ulysses;
 mod vocoder;
 mod vsa;
 pub use adaln::{AdaLnBlock, AdaLnBlockConfig, AdaLnOut, AdaLnOutConfig};

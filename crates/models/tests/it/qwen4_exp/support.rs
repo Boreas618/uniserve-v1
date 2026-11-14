@@ -49,6 +49,8 @@ pub(crate) fn checkpoint(root: &Path) -> Checkpoint {
 pub(crate) fn placement(tensor: Split, draft_tokens: u32) -> TextPlacement {
     TextPlacement {
         tensor,
+        pipeline: Split::WHOLE,
+        sequence: nn::family::SequenceSplit::WHOLE,
         experts: Split::WHOLE,
         drafter: draft_tokens > 0,
         draft_tokens,

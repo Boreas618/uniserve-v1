@@ -32,6 +32,10 @@ pub struct LmHead {
     /// This rank's shard of the vocabulary rows, `[rows, hidden]`.
     weight: Tensor,
     vocabulary: u32,
+    /// The ranks the vocabulary is split over, one for a whole head. The forward's group may
+    /// split something else (a pipeline's stages, a sequence's members), so the head gathers by
+    /// its own split and never by the group's.
+    shards: u32,
 }
 
 impl LmHead {
@@ -50,7 +54,7 @@ impl LmHead {
             first as usize,
         )?;
 
-        Self::over(weight, config.vocabulary)
+        Self::over(weight, config.vocabulary, config.split.size)
     }
 
     /// The head that shares `embedding`'s table: a checkpoint that ties its word embeddings.
@@ -59,11 +63,16 @@ impl LmHead {
     ///
     /// As [`Self::load`], for the embedding's shard.
     pub fn tied(embedding: &Embedding) -> Result<Self> {
-        Self::over(embedding.weight().clone(), embedding.vocabulary())
+        Self::over(
+            embedding.weight().clone(),
+            embedding.vocabulary(),
+            embedding.shards(),
+        )
     }
 
-    /// The head over `weight`, a shard of the rows of a `vocabulary`-row table.
-    fn over(weight: Tensor, vocabulary: u32) -> Result<Self> {
+    /// The head over `weight`, one shard of the rows of a `vocabulary`-row table split over
+    /// `shards` ranks.
+    fn over(weight: Tensor, vocabulary: u32, shards: u32) -> Result<Self> {
         let rows = weight.dims().first().copied().unwrap_or(0) as u32;
         let padded = rows.next_multiple_of(PADDING);
 
@@ -74,7 +83,11 @@ impl LmHead {
                  width is not loadable"
             )));
         }
-        Ok(Self { weight, vocabulary })
+        Ok(Self {
+            weight,
+            vocabulary,
+            shards: shards.max(1),
+        })
     }
 
     /// The width of this rank's shard: its vocabulary rows, a whole number of tiles.
@@ -86,15 +99,25 @@ impl LmHead {
     /// `[rows, vocabulary]` in FP32, the ranks' shards gathered.
     ///
     /// The projection is the same dense product as any other linear projection, with the
-    /// vocabulary shard as its output width; when the forward's group has more than one rank
-    /// the shards are all-gathered. Logits are FP32 because the sampler reads FP32: the unpad
-    /// widens the model's product once.
+    /// vocabulary shard as its output width; a head split over several ranks all-gathers the
+    /// shards over the forward's group, which is then the vocabulary's. Logits are FP32 because
+    /// the sampler reads FP32: the unpad widens the model's product once.
     ///
     /// # Errors
     ///
-    /// When `hidden` does not fit the head or an operator refuses.
+    /// When `hidden` does not fit the head, an operator refuses, or a split head runs in a
+    /// forward whose group is not its split.
     pub fn forward(&self, hidden: &Tensor) -> Result<Tensor> {
-        let ranks = collective::split().map_or(1, |(_, ranks)| ranks);
+        let ranks = u64::from(self.shards);
+        if ranks > 1 && collective::split().map(|(_, members)| members) != Some(ranks) {
+            return Err(Error::shape(
+                "LmHead",
+                format!(
+                    "a head split over {ranks} ranks runs in a forward whose group is {:?}",
+                    collective::split()
+                ),
+            ));
+        }
         let projected = functional::linear(hidden, &self.weight, None, WeightOrder::NxK)?;
 
         let gathered = if ranks > 1 {

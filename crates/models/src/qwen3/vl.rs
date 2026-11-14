@@ -24,6 +24,7 @@
 //! The language model is tensor parallel; the tower is replicated on every rank, since every
 //! rank needs its features.
 
+use nn::family::SequenceSplit;
 use nn::modules::{Embedding, EmbeddingConfig, RmsNorm, Rotary};
 use nn::{Encoder, EncoderLayout, PixelNorm, Split, Tensor, TokenBatch, VarBuilder};
 use processing::qwen_vl::ProcessorConfig;
@@ -84,6 +85,7 @@ impl Qwen3VlModel {
                     text.linear_layers[layer as usize],
                     config.routes(layer),
                     (split, Split::WHOLE),
+                    SequenceSplit::WHOLE,
                     None,
                 )
             })

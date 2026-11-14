@@ -7,7 +7,7 @@
 //! by, and every kernel the rank launches. Then over the device's owners, in the region of the
 //! graph pool the division mapped, as the runner the rank's worker serves with. Both runners
 //! are wired alike: the cache issues each batch's page work through the hook of
-//! `crate::runner::causal_lm::wiring::page_work`, the tensor group's split is set on the graphs,
+//! `crate::runner::causal_lm::wiring::page_work`, the worker group's split is set on the graphs,
 //! and a member of an expert union joins it before its buckets are profiled.
 //!
 //! A rank whose model has a vision tower and whose group prefills ([`encodes`]) also encodes the
@@ -111,8 +111,9 @@ impl ModelRunner {
     /// in `graphs`, which replay on `stream` (`None` for graphs that hold no device), profiled
     /// (steps 7 and 22).
     ///
-    /// The runner issues its page work through the cache, its forwards split over the tensor
-    /// group `group` at this rank's place, and `member` makes it the rank's member of the node's
+    /// The runner issues its page work through the cache, its forwards split over its worker
+    /// group's communicator `group` at this rank's position, and `member` makes it the rank's
+    /// member of the node's
     /// expert union: on a device its transport is created first, with `kernels`, on the stream
     /// the runner's worker issues on.
     ///
@@ -122,7 +123,7 @@ impl ModelRunner {
     #[expect(
         clippy::too_many_arguments,
         reason = "the runner is joined to six owners: the model, its graphs and stream, the cache, \
-                  the state, the tensor group and the expert union"
+                  the state, the worker group's communicator and the expert union"
     )]
     pub(crate) fn runner(
         &self,
@@ -155,11 +156,10 @@ impl ModelRunner {
             stream.clone(),
         ));
 
-        // The meta contexts take the split alone: a profile run issues no collective.
-        let (rank, ranks) = super::split(
-            self.mapping.tensor_rank as usize,
-            self.mapping.tensor_parallel as usize,
-        );
+        // The group's one axis is its whole width: a rank's split is its position among the
+        // group's ranks. The meta contexts take the split alone: a profile run issues no
+        // collective.
+        let (rank, ranks) = super::split(self.mapping.position as usize, self.world_size);
         crate::runner::Runner::graphs(&runner).set_group(group, rank, ranks)?;
 
         if let Some(mut member) = member {

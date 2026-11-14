@@ -2,9 +2,9 @@
 //!
 //! A module of a partitioned model computes one rank's share and calls a collective on its
 //! tensors: a sum over every rank's tensor ([`all_reduce`]), a gather of every rank's tensor in
-//! rank order ([`all_gather`]), or an exchange of equal blocks between every pair of ranks
-//! ([`all_to_all`]). Which communicator and stream carry it is the execution context's, which a
-//! model never names (`ops::collective`).
+//! rank order ([`all_gather`]), an exchange of equal blocks between every pair of ranks
+//! ([`all_to_all`]), or one rank's tensor on every rank ([`broadcast`]). Which communicator and
+//! stream carry it is the execution context's, which a model never names (`ops::collective`).
 //!
 //! A rank's place has two readers. At load, a module takes the [`Split`] its family was given and
 //! reads its share of each weight. In a forward, shape arithmetic over the partition reads
@@ -108,6 +108,17 @@ pub fn gathered(send: &Tensor) -> Result<Tensor> {
 /// one element type.
 pub fn all_to_all(send: &Tensor, recv: &Tensor) -> Result<()> {
     Ok(ops::collective::all_to_all(send, recv)?)
+}
+
+/// Rank `root`'s `x` on every rank of the forward's group: `x` itself on `root`, and on every
+/// other rank a new tensor of `x`'s shape and element type holding `root`'s elements. Every rank
+/// passes a tensor of the same shape and element type, which only `root` reads.
+///
+/// # Errors
+///
+/// As [`all_reduce`], and when `root` is no rank of the group.
+pub fn broadcast(x: &Tensor, root: u32) -> Result<Tensor> {
+    Ok(ops::collective::broadcast(x, u64::from(root))?)
 }
 
 /// Starts [`all_to_all`] beside the forward, which goes on computing at once.

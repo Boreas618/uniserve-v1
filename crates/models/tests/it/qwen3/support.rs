@@ -56,6 +56,8 @@ pub(crate) fn checkpoint(root: &Path) -> Checkpoint {
 pub(crate) fn whole(drafter: bool) -> TextPlacement {
     TextPlacement {
         tensor: nn::Split::WHOLE,
+        pipeline: nn::Split::WHOLE,
+        sequence: nn::family::SequenceSplit::WHOLE,
         experts: nn::Split::WHOLE,
         drafter,
         draft_tokens: 0,

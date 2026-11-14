@@ -24,12 +24,31 @@
 //!
 //! The routed experts of each layer are held in the slots an [`ExpertOrder`] states
 //! (`docs/admin.md`, Expert redistribution), by the module path [`expert_module`] names.
+//!
+//! ## Pipeline stages and sequence members
+//!
+//! A deployment splits the model along one axis ([`Config::check_placement`]). A **pipeline
+//! stage** holds its contiguous share of the decoder layers and, whole, the embedding, the final
+//! norm, the head, the drafter and the vision tower. Stage 0 starts from the embeddings; every
+//! later stage starts from the layer output and the residual stream the stage before it hands
+//! on, the two tensors a layer boundary of the whole stack carries, which that stage broadcasts
+//! over the group; the last stage normalizes and broadcasts the rows to every stage, so every
+//! stage's forward returns the whole model's rows.
+//! A **sequence member** holds every weight and takes its share of the batch's rows
+//! ([`ulysses::share`]); its attention reaches its heads of every row
+//! ([`nn::modules::Attention`]), and the rows are gathered after the final norm. Both pass
+//! their rows over the forward's group (`nn::collective`).
 
 use std::collections::BTreeMap;
+use std::ops::Range;
 
-use nn::family::{CacheShape, ExpertOrder, ExpertShape, StateShape, TextModel, TextPlacement};
+use nn::collective;
+use nn::family::{
+    CacheShape, ExpertOrder, ExpertShape, SequenceSplit, StateShape, TextModel, TextPlacement,
+};
 use nn::modules::{
     Embedding, EmbeddingConfig, LmHead, LmHeadConfig, RmsNorm, Rotary, RotaryConfig, Spectrum,
+    ulysses,
 };
 use nn::{
     CausalLm, DType, Drafter, ExpertExchange, KvCache, RecurrentState, Split, Tensor, TokenBatch,
@@ -49,6 +68,12 @@ const TRANSFORMER: &str = "models.qwen3.transformer.Transformer";
 pub struct Qwen3ForCausalLm {
     config: Config,
     tensor: Split,
+    /// This rank's pipeline stage.
+    pipeline: Split,
+    /// This rank's member of the sequence split.
+    sequence: SequenceSplit,
+    /// The decoder layers of the stack the stage holds, `layers` in order.
+    held: Range<u32>,
     embed_tokens: Embedding,
     /// The rotation of a batch of one position axis.
     rotary_emb: Rotary,
@@ -107,11 +132,15 @@ impl Qwen3ForCausalLm {
     /// drafter when the deployment speculates, and the vision tower when the configuration
     /// states the processor its images are sized by.
     ///
+    /// A pipeline stage loads its share of the decoder layers and every other module whole; a
+    /// sequence member loads every module, its attention exchanging its rows over the split
+    /// (module documentation).
+    ///
     /// # Errors
     ///
-    /// A split the model does not divide, an order that names no routed layer, a drafter the
-    /// checkpoint does not carry, a tower with DeepStack features (a causal LM's prefill adds
-    /// none), or a module the loader refuses.
+    /// A placement the model refuses ([`Config::check_placement`]), an order that names no
+    /// routed layer, a drafter the checkpoint does not carry, a tower with DeepStack features (a
+    /// causal LM's prefill adds none), or a module the loader refuses.
     pub fn load(
         config: &Config,
         vb: VarBuilder<'_, '_>,
@@ -119,7 +148,7 @@ impl Qwen3ForCausalLm {
         order: &ExpertOrder,
     ) -> Result<Self> {
         let splits = (placement.tensor, placement.experts);
-        config.check_splits(splits.0, splits.1)?;
+        let held = config.check_placement(placement)?;
 
         let routed = expert_layers(config);
         if let Some(stray) = order.keys().find(|module| !routed.contains_key(*module)) {
@@ -152,7 +181,8 @@ impl Qwen3ForCausalLm {
             )?
         };
 
-        let layers = (0..text.num_hidden_layers)
+        let layers = held
+            .clone()
             .map(|layer| {
                 DecoderLayer::load(
                     config,
@@ -160,6 +190,7 @@ impl Qwen3ForCausalLm {
                     text.linear_layers[layer as usize],
                     config.routes(layer),
                     splits,
+                    placement.sequence,
                     order.get(&expert_module(layer)),
                 )
             })
@@ -203,6 +234,9 @@ impl Qwen3ForCausalLm {
         Ok(Self {
             config: config.clone(),
             tensor: splits.0,
+            pipeline: placement.pipeline,
+            sequence: placement.sequence,
+            held,
             embed_tokens,
             rotary_emb: Rotary::load(&text_rotary(text.rope), rotary)?,
             mrope,
@@ -217,6 +251,78 @@ impl Qwen3ForCausalLm {
     /// The checkpoint configuration this model was built for.
     pub const fn config(&self) -> &Config {
         &self.config
+    }
+
+    /// The decoder layers this rank holds whose mixer is linear (`true`) or attention
+    /// (`false`).
+    fn held_layers(&self, linear: bool) -> u32 {
+        self.held
+            .clone()
+            .filter(|layer| self.config.text.linear_layers[*layer as usize] == linear)
+            .count() as u32
+    }
+
+    /// Refuses a forward whose group is not the split `split` of `axis`, which the model was
+    /// loaded for: its rows pass over that group.
+    fn require_group(axis: &str, split: Split) -> Result<()> {
+        let members = collective::split().map(|(_, members)| members);
+        if members != Some(u64::from(split.size)) {
+            return Err(Error::Config(format!(
+                "a {axis} split over {} ranks runs in a forward whose group is {members:?}",
+                split.size
+            )));
+        }
+        Ok(())
+    }
+
+    /// The handoff of stage `root` of the pipeline: the layer output and the residual stream
+    /// `rows` the stage's layers left, which every stage takes from it, the two tensors a layer
+    /// boundary of the whole stack carries. On `root` `rows` are its own and come back as they
+    /// are; on every other stage they state the shape and element type alone.
+    ///
+    /// Every stage takes part in every handoff, in stage order, so the stages call one sequence
+    /// of collectives over the group.
+    fn handoff(&self, root: u32, (output, stream): (&Tensor, &Tensor)) -> Result<(Tensor, Tensor)> {
+        Self::require_group("pipeline", self.pipeline)?;
+
+        let output = collective::broadcast(&output.contiguous()?, root)?;
+        let stream = collective::broadcast(&stream.contiguous()?, root)?;
+        Ok((output, stream))
+    }
+
+    /// The rows this stage's layers start from, `(hidden, residual)`: the batch's embeddings
+    /// `hidden`, which open the residual stream, on the first stage; on every later stage the
+    /// rows of the stage before it, taken from the handoffs of every earlier stage in order.
+    fn stage_input(&self, hidden: &Tensor) -> Result<(Tensor, Option<Tensor>)> {
+        let mut input = (hidden.clone(), None);
+        for root in 0..self.pipeline.rank {
+            let (output, stream) = self.handoff(root, (hidden, hidden))?;
+            input = (output, Some(stream));
+        }
+        Ok(input)
+    }
+
+    /// The model's rows after this stage's layers left `hidden` and `residual`: the stage hands
+    /// them to the later stages and takes part in their handoffs; the last stage adds them and
+    /// normalizes, and every stage of a pipeline ends with the last stage's rows, which it
+    /// broadcasts.
+    fn stage_output(&self, hidden: Tensor, residual: Tensor) -> Result<Tensor> {
+        let (stage, last) = (self.pipeline.rank, self.pipeline.size - 1);
+        if stage < last {
+            for root in stage..last {
+                self.handoff(root, (&hidden, &residual))?;
+            }
+
+            // The rows every stage ends with are the last stage's; this stage's output only
+            // states their shape and element type.
+            return Ok(collective::broadcast(&hidden.contiguous()?, last)?);
+        }
+
+        let (normalized, _) = self.norm.forward_residual(&hidden, &residual)?;
+        if last == 0 {
+            return Ok(normalized);
+        }
+        Ok(collective::broadcast(&normalized.contiguous()?, last)?)
     }
 }
 
@@ -255,6 +361,7 @@ impl CausalLm for Qwen3ForCausalLm {
                     ));
                 }
             };
+            // Every row's factors: a sequence member's attention turns every row of its heads.
             let (cos, sin) = rotary.forward(positions)?;
 
             // The model's attention layers share one cache group. Its workspace is execution's
@@ -265,10 +372,26 @@ impl CausalLm for Qwen3ForCausalLm {
                 functional::zero_arrival_counters_(&group.workspace)?;
             }
 
+            // A sequence member's layers run over its share of the rows. The batch's live
+            // count is the whole batch's, not the share's, so the member's experts route every
+            // row of its share.
+            let members = self.sequence.split;
+            let shared;
+            let (rows, batch) = if members.size > 1 {
+                Self::require_group("sequence", members)?;
+                shared = TokenBatch {
+                    live_tokens: None,
+                    ..batch.clone()
+                };
+                (ulysses::share(hidden, members)?, &shared)
+            } else {
+                (hidden.clone(), batch)
+            };
+
             // Each layer reads its own layer of the cache or of the state: its place among
-            // the layers of its mixer.
+            // the stage's layers of its mixer.
             let (mut attention, mut linear) = (0, 0);
-            let (mut hidden, mut residual) = (hidden.clone(), None);
+            let (mut hidden, mut residual) = self.stage_input(&rows)?;
             for layer in &self.layers {
                 let ordinal = if layer.is_linear() {
                     &mut linear
@@ -292,8 +415,11 @@ impl CausalLm for Qwen3ForCausalLm {
 
             let residual =
                 residual.ok_or_else(|| Error::Config("a decoder stack of no layers".to_owned()))?;
-            let (normalized, _) = self.norm.forward_residual(&hidden, &residual)?;
-            Ok(normalized)
+            let output = self.stage_output(hidden, residual)?;
+            if members.size > 1 {
+                return Ok(ulysses::gather(&output, members, tokens)?);
+            }
+            Ok(output)
         };
 
         Ok(nn::profiler::range(TRANSFORMER, "model", forward)?)
@@ -328,9 +454,10 @@ impl TextModel for Qwen3ForCausalLm {
         let text = &self.config.text;
 
         CacheShape {
-            layers: self.config.attention_layers(),
-            // The load checked that the split divides the heads.
-            kv_heads: text.num_key_value_heads / self.tensor.size,
+            layers: self.held_layers(false),
+            // The load checked that the split divides the heads; at most one of the two splits
+            // is above one.
+            kv_heads: text.num_key_value_heads / (self.tensor.size * self.sequence.split.size),
             head_dim: text.head_dim,
             index_keys: None,
         }
@@ -340,7 +467,7 @@ impl TextModel for Qwen3ForCausalLm {
         let network = self.config.text.gated_delta_net?;
 
         Some(StateShape {
-            layers: self.config.linear_layers(),
+            layers: self.held_layers(true),
             fields: network.state_fields(self.dtype()),
         })
     }
@@ -371,8 +498,10 @@ impl std::fmt::Debug for Qwen3ForCausalLm {
         formatter
             .debug_struct("Qwen3ForCausalLm")
             .field("class", &self.config.class)
-            .field("layers", &self.layers.len())
+            .field("layers", &self.held)
             .field("tensor", &self.tensor)
+            .field("pipeline", &self.pipeline)
+            .field("sequence", &self.sequence)
             .finish_non_exhaustive()
     }
 }

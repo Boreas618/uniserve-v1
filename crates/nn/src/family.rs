@@ -289,6 +289,12 @@ pub type ExpertOrder = BTreeMap<String, Vec<u32>>;
 pub struct TextPlacement {
     /// The tensor-parallel split of every layer.
     pub tensor: Split,
+    /// The pipeline split of the decoder stack: this rank's stage holds its share of the
+    /// layers, in order, and passes its rows to the next stage over the forward's group.
+    pub pipeline: Split,
+    /// The Ulysses sequence split of every layer's rows: this rank's member holds its share of
+    /// a batch's rows and attends its share of the heads of every row.
+    pub sequence: SequenceSplit,
     /// The expert-parallel split of the routed experts.
     pub experts: Split,
     /// Whether the deployment speculates with the checkpoint's own drafter, so its layers load

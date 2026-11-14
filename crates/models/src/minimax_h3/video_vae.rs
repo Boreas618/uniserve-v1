@@ -55,6 +55,7 @@
 
 use std::ops::Range;
 
+use nn::family::SequenceSplit;
 use nn::functional::{self, Activation, Padding, Rounding};
 use nn::modules::{
     Attention, AttentionConfig, Conv3d, ConvConfig, FrameNorm, FrameNormConfig, GateUp, Linear,
@@ -327,6 +328,7 @@ impl TransformerBlock {
                 // The keys a launch reduces over are the clip's rows, which each forward
                 // states from its layout; the module adds no bound of its own.
                 max_kv_len: u32::MAX,
+                sequence: SequenceSplit::WHOLE,
             },
             vb.pp(ATTENTION),
         )?;

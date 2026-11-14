@@ -43,9 +43,11 @@ use crate::runner::thread_pool::ThreadPool;
 use anyhow::{Context as _, Result, bail};
 use build_server::Target;
 use nn::Split;
-use nn::family::{ExpertOrder, Family, Model, TextModel, TextPlacement};
+use nn::family::{ExpertOrder, Family, Model, Projection, SequenceSplit, TextModel, TextPlacement};
 use platform::DeviceId;
-use proto::config::{EngineArgs, WorkerGroupConfig, WorkerGroupRole};
+use proto::config::{
+    BlockConfig, EngineArgs, HeadProjection, SequenceParallel, WorkerGroupConfig, WorkerGroupRole,
+};
 
 use buckets::tier_refusal;
 use placement::Mapping;
@@ -317,27 +319,25 @@ impl ModelRunner {
                  served together"
             );
         }
+        if text {
+            self.check_text_groups(union_ranks)?;
+        }
         // This process's ranks, each on the device that places it ([`placed_ranks`]).
         let placed = placed_ranks(self.launch())?;
         let count = placed.len();
         // Each rank is a rank of the deployment's worker group that places it: its prefill or
-        // decode group, a data-parallel replica, or the one group of a tensor-parallel deployment.
-        // A group's ranks split every layer of one model over the group's devices: each loads its
-        // block of every weight on its own device and joins the group's collectives, and every
-        // batch of the group is handed to all of them (`crate::executor::Route`), those of
-        // another host's process through its peer link.
+        // decode group, a data-parallel replica, or the one group of a parallel deployment. A
+        // group's ranks split one model over the group's devices along one axis: every layer's
+        // heads (tensor), the decoder stack's layers (pipeline) or every layer's rows (Ulysses
+        // sequence); each loads its part of the model on its own device and joins the group's
+        // collectives, and every batch of the group is handed to all of them
+        // (`crate::executor::Route`), those of another host's process through its peer link.
         if text && union_ranks == 1 {
             return placed
                 .into_iter()
                 .map(|(rank, _, _, device)| {
-                    let (group, position, tensor) = self.placed(rank)?;
-                    let mut rank_runner = self.clone();
+                    let mut rank_runner = self.placed(rank)?;
                     rank_runner.devices = vec![device];
-                    rank_runner.rank = rank;
-                    rank_runner.group = group;
-                    rank_runner.world_size = tensor as usize;
-                    rank_runner.mapping.tensor_parallel = tensor;
-                    rank_runner.mapping.tensor_rank = position;
                     Ok(rank_runner)
                 })
                 .collect();
@@ -379,38 +379,184 @@ impl ModelRunner {
             .collect()
     }
 
-    /// The worker group that places the deployment's rank `rank`, the rank's position in it and
-    /// the group's tensor-parallel degree, which its ranks number.
+    /// Refuses a text deployment whose serving groups do not split the model alike, or that
+    /// splits it over pipeline stages or sequence members beside an expert union of
+    /// `union_ranks` members (`specs/engine-worker-port.md` §7.1): the session states one KV unit
+    /// layout for every group, from the first rank's cache, and a prefill group's rank hands its
+    /// units to the decode group's rank of the same position.
     ///
     /// # Errors
     ///
-    /// Fails when no group places the rank, or when the group's ranks are not one tensor group of
-    /// its `model` block.
-    fn placed(&self, rank: u32) -> Result<(String, u32, u32)> {
+    /// Two serving groups whose `model` blocks state other degrees, or a pipeline or sequence
+    /// split in an expert union.
+    fn check_text_groups(&self, union_ranks: u32) -> Result<()> {
         let groups = &self.engine_config().parallel.worker_groups;
-        let (index, position) =
+        let degrees = |group: &WorkerGroupConfig| {
+            group
+                .blocks
+                .get(proto::config::DEFAULT_BLOCK)
+                .map(|block| {
+                    (
+                        block.tensor_parallel_size,
+                        block.pipeline_parallel_size,
+                        block.sequence_parallel.clone(),
+                    )
+                })
+                .unwrap_or((1, 1, SequenceParallel::Local))
+        };
+        let mut serving = groups.iter().filter(|group| group.role.serves_requests());
+        let Some(first) = serving.next() else {
+            return Ok(());
+        };
+        let stated = degrees(first);
+        if let Some(other) = serving.find(|group| degrees(group) != stated) {
+            bail!(
+                "worker groups {} and {} split the model as {:?} and {:?}: every group of a text \
+                 deployment splits it alike, since its ranks lay their cache units out alike",
+                first.id,
+                other.id,
+                stated,
+                degrees(other)
+            );
+        }
+        let (_, pipeline, sequence) = &stated;
+        if union_ranks > 1 && (*pipeline > 1 || *sequence != SequenceParallel::Local) {
+            bail!(
+                "a deployment that splits its model over {pipeline} pipeline stages or the \
+                 sequence split {sequence:?} and exchanges its experts over {union_ranks} ranks: \
+                 pipeline and sequence groups are not served in an expert union"
+            );
+        }
+        Ok(())
+    }
+
+    /// This model runner as the deployment's rank `rank` in the text group that places it: its
+    /// group, its position in the group's parallel order (`parallel_order`) and its split along
+    /// the group's one axis (`specs/engine-worker-port.md` §7.1). The group's `model` block
+    /// states its degrees, of which one is the group's rank count and the others one.
+    ///
+    /// # Errors
+    ///
+    /// When no group places the rank, its `model` block does not hold it, its degrees are not
+    /// one axis of the group's ranks, or it states a sequence split other than Ulysses or an
+    /// overlapped projection step.
+    fn placed(&self, rank: u32) -> Result<Self> {
+        let groups = &self.engine_config().parallel.worker_groups;
+        let (index, member) =
             WorkerGroupConfig::place_rank(groups, rank as usize).with_context(|| {
                 format!("the deployment's worker groups place no rank {rank} for this process")
             })?;
         let group = &groups[index];
-        let tensor = group
+        let ranks = group.ranks.len();
+        let whole = BlockConfig::parallel((0..ranks).collect());
+        let block = group
             .blocks
             .get(proto::config::DEFAULT_BLOCK)
-            .map_or(1, |block| block.tensor_parallel_size);
-        if tensor != group.ranks.len() {
+            .unwrap_or(&whole);
+
+        let (sequence, projection) = match &block.sequence_parallel {
+            SequenceParallel::Local => (1, Projection::Gather),
+            SequenceParallel::Ulysses {
+                ulysses_degree,
+                projection,
+                projection_rows,
+            } => {
+                if let Some(rows) = projection_rows {
+                    bail!(
+                        "worker group {} states `projection_rows = {rows}`, an overlapped \
+                         exchange step of the video denoiser's: a text group exchanges every row \
+                         of a projection at once",
+                        group.id
+                    );
+                }
+                let projection = match projection {
+                    HeadProjection::Gather => Projection::Gather,
+                    HeadProjection::Exchange => Projection::Exchange,
+                };
+                (*ulysses_degree, projection)
+            }
+            other => bail!(
+                "worker group {} states the sequence split {other:?}: a text group splits its \
+                 sequence over Ulysses members alone",
+                group.id
+            ),
+        };
+        let degrees = [
+            block.tensor_parallel_size,
+            block.pipeline_parallel_size,
+            sequence,
+        ];
+        let axes = degrees.iter().filter(|degree| **degree > 1).count();
+        if axes > 1 || degrees.iter().product::<usize>() != ranks {
             bail!(
-                "worker group {} places {} ranks and its `{}` block is {tensor}-way tensor \
-                 parallel: a text group's ranks are one tensor group",
+                "worker group {} places {ranks} ranks and its `{}` block states tensor, pipeline \
+                 and sequence degrees {degrees:?}: a text group's ranks are one parallel group \
+                 along one axis",
                 group.id,
-                group.ranks.len(),
                 proto::config::DEFAULT_BLOCK
             );
         }
-        Ok((
-            group.id.0.clone(),
-            u32::try_from(position).context("a group wider than the protocol addresses")?,
-            u32::try_from(tensor).context("a group wider than the protocol addresses")?,
-        ))
+        // The stages of a pipeline meet on the host before each handoff an eager forward makes
+        // (`crate::process::ranks`, `pipeline_meetings`), at a barrier of one process.
+        if block.pipeline_parallel_size > 1
+            && group
+                .ranks
+                .iter()
+                .any(|placed| placed.host != group.ranks[0].host)
+        {
+            bail!(
+                "worker group {} places its pipeline stages on more than one host: a pipeline \
+                 group's stages are ranks of one process, which meet on the host before each \
+                 handoff of an eager forward",
+                group.id
+            );
+        }
+        let position = parallel_order(group)
+            .iter()
+            .position(|held| *held == member)
+            .with_context(|| {
+                format!(
+                    "the `{}` block of worker group {} holds ranks {:?}, not its rank {member}",
+                    proto::config::DEFAULT_BLOCK,
+                    group.id,
+                    block.ranks
+                )
+            })?;
+        let position =
+            u32::try_from(position).context("a group wider than the protocol addresses")?;
+        let along = |degree: usize| -> Result<Split> {
+            let size =
+                u32::try_from(degree).context("a degree wider than the protocol addresses")?;
+            Ok(Split {
+                size,
+                rank: if size > 1 { position } else { 0 },
+            })
+        };
+        let (tensor, pipeline, sequence) = (
+            along(block.tensor_parallel_size)?,
+            along(block.pipeline_parallel_size)?,
+            along(sequence)?,
+        );
+
+        let mut placed = self.clone();
+        placed.rank = rank;
+        placed.group = group.id.0.clone();
+        placed.world_size = ranks;
+        placed.mapping.tensor_parallel = tensor.size;
+        placed.mapping.tensor_rank = tensor.rank;
+        placed.mapping.pipeline_parallel = pipeline.size;
+        placed.mapping.pipeline_rank = pipeline.rank;
+        placed.mapping.sequence = SequenceSplit {
+            split: sequence,
+            projection,
+        };
+        placed.mapping.position = position;
+        Ok(placed)
+    }
+
+    /// The stages of this rank's pipeline, one for a rank of no pipeline.
+    pub(crate) fn pipeline_stages(&self) -> u32 {
+        self.mapping.pipeline_parallel
     }
 
     /// The worker group this rank serves in.
@@ -418,35 +564,40 @@ impl ModelRunner {
         &self.group
     }
 
-    /// The tensor groups of a text deployment whose ranks are each one group's
+    /// The parallel groups of a text deployment whose ranks are each one group's
     /// ([`Self::ranks`]), with this rank's place among them: every worker group of more than one
-    /// rank, as consecutive members of the host group, whose members are the deployment's ranks.
-    /// `None` for a member of an expert union, whose tensor group is the parallel shape's over
-    /// the whole host group.
+    /// rank, its ranks as members of the host group, whose members are the deployment's ranks,
+    /// in the group's parallel order (`parallel_order`), so a rank's place in its communicator is
+    /// its position. `None` for a member of an expert union, whose tensor group is the parallel
+    /// shape's over the whole host group.
     ///
     /// # Errors
     ///
     /// As [`Self::placed`] fails for this rank.
-    pub(crate) fn tensor_spans(&self) -> Result<Option<Collective>> {
+    pub(crate) fn parallel_groups(&self) -> Result<Option<Collective>> {
         if !matches!(self.family.model, Model::Text(_)) || self.union.is_some() {
             return Ok(None);
         }
         let groups = &self.engine_config().parallel.worker_groups;
         let firsts = WorkerGroupConfig::first_ranks(groups);
-        // A worker group's tensor group is its ranks in their order.
         let members: Vec<Vec<usize>> = firsts
             .iter()
             .zip(groups)
-            .map(|(first, group)| (*first..*first + group.ranks.len()).collect())
+            .map(|(first, group)| {
+                parallel_order(group)
+                    .into_iter()
+                    .map(|member| first + member)
+                    .collect()
+            })
             .collect();
-        let (_, position, _) = self.placed(self.rank)?;
+        let placed = self.placed(self.rank)?;
         let (group, _) =
             WorkerGroupConfig::place_rank(groups, self.rank as usize).with_context(|| {
                 format!("the deployment's worker groups place no rank {}", self.rank)
             })?;
         Ok(Some(Collective {
             groups: members,
-            member: Some((group, position as usize)),
+            member: Some((group, placed.mapping.position as usize)),
         }))
     }
 
@@ -557,11 +708,11 @@ impl ModelRunner {
         self.launch.queue_depth as usize
     }
 
-    /// The rank's index in its worker group, which names its part of the units of the session's
-    /// regions at the Storage Server: the ranks of one index, in every group and replica, hold
-    /// the same share of every unit.
-    pub(crate) fn tensor_rank(&self) -> u32 {
-        self.mapping.tensor_rank
+    /// The rank's position in its worker group's parallel order, which names its part of the
+    /// units of the session's regions at the Storage Server: the ranks of one position, in every
+    /// group and replica, hold the same share of every unit.
+    pub(crate) fn part(&self) -> u32 {
+        self.mapping.position
     }
 
     /// The ranks of this rank's worker group on every host.
@@ -614,6 +765,11 @@ impl ModelRunner {
                 size: mapping.tensor_parallel,
                 rank: mapping.tensor_rank,
             },
+            pipeline: Split {
+                size: mapping.pipeline_parallel,
+                rank: mapping.pipeline_rank,
+            },
+            sequence: mapping.sequence,
             experts: Split {
                 size: mapping.expert_parallel,
                 rank: mapping.expert_rank,
@@ -703,6 +859,17 @@ pub(crate) fn placed_ranks(launch: &EngineArgs) -> Result<Vec<(u32, usize, usize
     }
     placed.sort_unstable_by_key(|(number, ..)| *number);
     Ok(placed)
+}
+
+/// The ranks of `group` in its parallel order, as indices into its rank list: the order its
+/// `model` block lists them in, which assigns each its position along the group's axis and its
+/// part of every unit (`docs/configuration.md`, the block table), or the group's own order for a
+/// group that places no `model` block.
+pub(crate) fn parallel_order(group: &WorkerGroupConfig) -> Vec<usize> {
+    match group.blocks.get(proto::config::DEFAULT_BLOCK) {
+        Some(block) if !block.ranks.is_empty() => block.ranks.clone(),
+        _ => (0..group.ranks.len()).collect(),
+    }
 }
 
 /// The split a runner's graphs state for this rank, member `rank` of a parallel group of `ranks`

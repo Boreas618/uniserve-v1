@@ -29,6 +29,8 @@ pub struct Embedding {
     /// The vocabulary id the shard opens at.
     first: u32,
     vocabulary: u32,
+    /// The ranks the table is split over, one for a whole table.
+    shards: u32,
 }
 
 impl Embedding {
@@ -53,6 +55,7 @@ impl Embedding {
             weight,
             first,
             vocabulary: config.vocabulary,
+            shards: config.split.size.max(1),
         })
     }
 
@@ -69,6 +72,11 @@ impl Embedding {
     /// The vocabulary the table spans.
     pub const fn vocabulary(&self) -> u32 {
         self.vocabulary
+    }
+
+    /// The ranks the table is split over, one for a whole table.
+    pub const fn shards(&self) -> u32 {
+        self.shards
     }
 
     /// Whether the table is sharded across ranks.

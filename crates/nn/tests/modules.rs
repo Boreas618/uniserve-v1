@@ -817,6 +817,36 @@ fn a_split_head_gathers_the_shards_of_its_group() {
     assert!(unsplit.is_err());
 }
 
+/// A whole head in a forward whose group splits something else, a pipeline's stages or a
+/// sequence's members, projects onto its whole vocabulary and gathers nothing: it launches what
+/// it launches outside any group.
+#[test]
+fn a_whole_head_gathers_nothing_in_a_group_that_splits_something_else() {
+    let directory = tempfile::tempdir().unwrap();
+    let checkpoint = head_checkpoint(directory.path(), 32);
+    let loader = WeightLoader::meta(&checkpoint, None, None);
+    let head = LmHead::load(
+        &LmHeadConfig {
+            vocabulary: 32,
+            hidden: 8,
+            split: Split::WHOLE,
+        },
+        loader.root().pp("lm_head"),
+    )
+    .unwrap();
+
+    let forward = || {
+        let logits = head.forward(&meta((3, 8), DType::BF16))?;
+        Ok((logits.dims().to_vec(), logits.dtype()))
+    };
+    let (grouped, in_group) = recorded_split(Some((1, 2)), forward);
+    let (alone, outside) = recorded_split(None, forward);
+
+    assert_eq!(grouped.unwrap(), (vec![3, 32], DType::F32));
+    assert_eq!(alone.unwrap(), (vec![3, 32], DType::F32));
+    assert_eq!(in_group, outside);
+}
+
 /// A shard that is not a whole number of tiles has no padded rows in the checkpoint to read:
 /// the next rank's rows follow it, so the head is refused at load.
 #[test]

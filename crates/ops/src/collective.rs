@@ -2,9 +2,16 @@
 //!
 //! A partitioned forward computes one rank's share and meets the other ranks through
 //! collectives: a sum over every rank's buffer, a gather of every rank's buffer in rank order,
-//! and an exchange of equal blocks between every pair of ranks. A module reads its place in the
-//! group with [`split`] and calls the collective on its tensors; which communicator and stream
-//! carry it is the context's.
+//! an exchange of equal blocks between every pair of ranks, and one rank's buffer copied to
+//! every rank ([`broadcast`]), as a pipeline stage hands its rows to the stages after it. A
+//! module reads its place in the group with [`split`] and calls the collective on its tensors;
+//! which communicator and stream carry it is the context's.
+//!
+//! A broadcast's other members wait on their devices until the root reaches it, which in a
+//! pipeline is a whole stage of layers later. Outside a capture, a group that states how its
+//! members meet on the host ([`Group::with_meet`]) meets before each broadcast, so no member's
+//! device waits on a root whose thread is still issuing an eager forward: a pipeline stage's
+//! eager forward stalled while the next stage's device waited for it.
 //!
 //! Under a context that launches, a collective is issued through the context's [`Group`] on the
 //! context's stream, and while that stream is being captured it becomes nodes of the graph.
@@ -65,7 +72,14 @@ pub struct Group {
     ends: Vec<Event>,
     /// The end event the next started collective takes, modulo [`ENDS`].
     next: AtomicUsize,
+    /// How the group's members meet on the host before a broadcast outside a capture
+    /// ([`Group::with_meet`]); `None` for a group whose members never wait on a root far
+    /// behind them.
+    meet: Option<Meet>,
 }
+
+/// A host rendezvous of every member of a group: it returns once each member called it.
+pub type Meet = Arc<dyn Fn() -> Result<()> + Send + Sync>;
 
 impl Group {
     /// The group of `communicator`.
@@ -84,7 +98,19 @@ impl Group {
                 .map(|_| Event::new(EventFlags::default()))
                 .collect(),
             next: AtomicUsize::new(0),
+            meet: None,
         })
+    }
+
+    /// The group whose members call `meet` together before each broadcast issued outside a
+    /// capture (module documentation). Every member calls the same broadcasts in the same order,
+    /// so the `n`-th meeting of every member is the same broadcast's.
+    #[must_use]
+    pub fn with_meet(self, meet: Meet) -> Self {
+        Self {
+            meet: Some(meet),
+            ..self
+        }
     }
 
     /// This rank's index in the communicator and the communicator's member count.
@@ -332,6 +358,56 @@ pub fn start_gather_rows(
     })
 }
 
+/// Rank `root`'s `x` on every rank of the group: on `root`, `x` itself, which the collective
+/// reads in place; on every other rank a new tensor of `x`'s shape and element type holding
+/// `root`'s elements. Every rank passes a tensor of the same shape and element type, which
+/// only `root` reads.
+///
+/// # Errors
+///
+/// As [`all_reduce`], and [`Error::Collective`] when `root` is no rank of the group.
+pub fn broadcast(x: &Tensor, root: u64) -> Result<Tensor> {
+    let (context, ranks) = member("broadcast")?;
+    let rank = context.state().split.map_or(0, |(rank, _)| rank);
+    if root >= ranks {
+        return Err(misuse(
+            "broadcast",
+            format!("rank {root} of a group of {ranks}"),
+        ));
+    }
+
+    // The root's tensor is the one every rank ends with, so it is the root's own output too.
+    let result = if rank == root {
+        x.clone()
+    } else {
+        crate::empty(x.shape(), x.dtype())?
+    };
+    let operand = buffer(&result, "broadcast")?;
+    let (count, dtype) = elements(&operand, &operand, "broadcast")?;
+
+    let Some(stream) = context.stream() else {
+        return Ok(result);
+    };
+    let group = group(&context, "broadcast")?;
+    let bytes = operand.dtype.size_in_bytes() * count;
+
+    if let Some(meet) = &group.meet
+        && stream.capture_status()? == CaptureStatus::None
+    {
+        meet()?;
+    }
+    group.communicator().broadcast(
+        stream,
+        range(&operand, bytes),
+        range(&operand, bytes),
+        count,
+        dtype,
+        nccl_rank(root),
+    )?;
+    wait_unless_captured(stream)?;
+    Ok(result)
+}
+
 /// Orders the context's stream after the started collective `started`: what it received is
 /// readable from here on.
 ///
@@ -427,6 +503,11 @@ fn member(name: &'static str) -> Result<(Arc<Context>, u64)> {
             "a collective runs over a group, and the context carries none",
         )),
     }
+}
+
+/// `rank`, a rank of a group whose member count NCCL reported as an `int`, as NCCL names it.
+fn nccl_rank(rank: u64) -> i32 {
+    i32::try_from(rank).unwrap_or(i32::MAX)
 }
 
 /// The group a launching context issues the collective `name` through.
@@ -595,7 +676,7 @@ mod tests {
     use crate::moe::exchange::{Descriptor, Mode};
 
     use super::{
-        all_gather, all_reduce, all_to_all, expert_exchange, finish, settle, split,
+        all_gather, all_reduce, all_to_all, broadcast, expert_exchange, finish, settle, split,
         start_all_to_all, start_gather_rows,
     };
     use crate::{Context, Error, meta, operand, retained};
@@ -677,6 +758,28 @@ mod tests {
 
         // NCCL has no 16-bit integer element.
         assert!(misused(all_reduce(&buffer(DType::I16, 8))));
+    }
+
+    #[test]
+    fn a_meta_context_broadcasts_the_root_s_tensor_to_every_rank() {
+        let context = Context::meta(None);
+        context.set_group(None, 1, 3).unwrap();
+        let _guard = context.enter();
+
+        // The root ends with its own tensor, every other rank with one of the root's shape.
+        let rows = buffer(DType::BF16, 12);
+        assert_eq!(
+            operand(&broadcast(&rows, 1).unwrap()).unwrap().ptr,
+            operand(&rows).unwrap().ptr
+        );
+        let received = broadcast(&rows, 2).unwrap();
+        assert_eq!(
+            (received.dims(), received.dtype()),
+            (rows.dims(), DType::BF16)
+        );
+
+        // A root is a rank of the group.
+        assert!(misused(broadcast(&rows, 3)));
     }
 
     #[test]
