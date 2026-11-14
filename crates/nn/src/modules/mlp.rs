@@ -104,7 +104,34 @@ impl Mlp {
                 gate: input(gate, config.intermediate)?,
                 up: input(up, config.intermediate)?,
             },
-            GateUp::ValueFirst(name) => Inputs::ValueFirst(input(name, 2 * config.intermediate)?),
+            GateUp::ValueFirst(name) if config.split.size == 1 => {
+                Inputs::ValueFirst(input(name, 2 * config.intermediate)?)
+            }
+            // A rank's share of the packed rows is not one block of them: its value rows lie in
+            // the value half and its gate rows in the gate half. The packed rows are twice the
+            // split's blocks of a share each, the value half's first, so a rank reads the block
+            // of its rank and the block a split's width after it, as two projections.
+            GateUp::ValueFirst(name) => {
+                let split = config.split;
+                let half = |rank: u32| {
+                    Linear::load(
+                        &LinearConfig {
+                            inputs: config.hidden,
+                            outputs: 2 * config.intermediate,
+                            bias: config.bias,
+                            parallel: Parallel::Column(Split {
+                                size: 2 * split.size,
+                                rank,
+                            }),
+                        },
+                        vb.pp(name),
+                    )
+                };
+                Inputs::Split {
+                    up: half(split.rank)?,
+                    gate: half(split.size + split.rank)?,
+                }
+            }
         };
         let down = Linear::load(
             &LinearConfig {

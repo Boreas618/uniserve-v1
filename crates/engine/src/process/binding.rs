@@ -480,6 +480,23 @@ fn room_of(rank: &Rank) -> Result<Room> {
     Ok(Room::of(&quota, free, rank.client.epoch()))
 }
 
+/// The pools of a process's ranks on one device, and the bytes of those ranks' communicators that
+/// NVML attributes to no process.
+type DevicePools = (Vec<Arc<Mutex<GraphPool>>>, u64);
+
+/// The bytes this process holds on `device` beside `pools`, those of every rank of the process
+/// there, and the Storage Server's storages, with `unattributed` added
+/// ([`process_bytes`]). Each pool is locked only while its mapped bytes are read.
+pub(crate) fn measure(
+    nvml: &Nvml,
+    device: DeviceId,
+    pools: &[Arc<Mutex<GraphPool>>],
+    unattributed: u64,
+) -> Result<u64> {
+    let mapped = pools.iter().map(|pool| lock(pool).mapped()).sum();
+    process_bytes(nvml, device, mapped, unattributed)
+}
+
 /// The segments of `table` a warm rank keeps: those it holds from the first, less the fewest at
 /// the tail whose bytes (`unit_bytes` a unit) cover `excess`, the bytes by which its GPU's quota
 /// would pass its limit once the rank reserves its warm process (`division::excess`). Only the
@@ -686,11 +703,27 @@ impl WeightBinding {
         both(here, answered::<()>(answers)).map(drop)
     }
 
-    /// Reserves what each rank's process holds beside its pools and the Storage Server's storages
-    /// in its device's quota, as the ranks start to serve: its CUDA context, its kernels and its
-    /// communicators, measured once the worker has passed every job before it. From here on the
-    /// quota binds the whole rank, so a storage that would take the deployment past it is
-    /// refused at the Storage Server and not found out by the device.
+    /// The pools of this process's ranks on each of their devices, with the bytes of those
+    /// ranks' communicators that NVML attributes to no process: what a measurement of the
+    /// process on the device takes out of NVML's figure and adds to it ([`measure`]).
+    fn device_pools(&self) -> BTreeMap<DeviceId, DevicePools> {
+        let mut devices: BTreeMap<DeviceId, DevicePools> = BTreeMap::new();
+        for rank in &self.ranks {
+            let rank = lock(rank);
+            let (pools, unattributed) = devices.entry(rank.device).or_default();
+            pools.push(Arc::clone(&rank.graphs));
+            *unattributed += rank.unattributed;
+        }
+        devices
+    }
+
+    /// Reserves what the process holds on each of its ranks' devices beside their pools and the
+    /// Storage Server's storages in the device's quota, as the ranks start to serve: its CUDA
+    /// context, its kernels and its communicators, measured once the worker has passed every job
+    /// before it. The process's first rank on a device reserves the figure and its other ranks
+    /// there none, since NVML states the process whole. From here on the quota binds the whole
+    /// rank, so a storage that would take the deployment past it is refused at the Storage Server
+    /// and not found out by the device.
     ///
     /// Reserved once: a process that already reserved keeps its figures, and a standby reserves
     /// when it is promoted, because until then the quota counts what it maps of its predecessor.
@@ -706,21 +739,28 @@ impl WeightBinding {
         }
 
         let nvml = Arc::new(Nvml::init()?);
+        let devices = self.device_pools();
         let measured = self.each("measuring the process's device storage", |_, rank| {
             let nvml = Arc::clone(&nvml);
-            let graphs = Arc::clone(&rank.graphs);
-            let (device, unattributed) = (rank.device, rank.unattributed);
+            let device = rank.device;
+            let (pools, unattributed) = devices.get(&device).cloned().unwrap_or_default();
 
-            Box::new(move |_: &mut [Box<dyn Runner>]| {
-                let pools = lock(&graphs).mapped();
-                process_bytes(&nvml, device, pools, unattributed)
-            })
+            Box::new(move |_: &mut [Box<dyn Runner>]| measure(&nvml, device, &pools, unattributed))
         })?;
 
-        let reservations: Vec<Reservation> = measured
-            .into_iter()
-            .map(|process| Reservation {
-                process,
+        // The figure is the process's whole on the device: the first of its ranks there reserves
+        // it, and the others none.
+        let mut counted = BTreeSet::new();
+        let reservations: Vec<Reservation> = self
+            .ranks
+            .iter()
+            .zip(measured)
+            .map(|(rank, process)| Reservation {
+                process: if counted.insert(lock(rank).device) {
+                    process
+                } else {
+                    0
+                },
                 profiling: 0,
             })
             .collect();
@@ -1755,15 +1795,16 @@ impl WeightBinding {
             return Ok(None);
         }
         let nvml = Arc::new(Nvml::init()?);
+        let devices = self.device_pools();
         let kept = self.each_of(
             Some(groups),
             "measuring the warm process beside the KV planes",
             |_, rank| {
                 let nvml = Arc::clone(&nvml);
-                let graphs = Arc::clone(&rank.graphs);
                 let cache = rank.cache.as_ref().map(Arc::clone);
                 let client = Arc::clone(&rank.client);
-                let (device, unattributed) = (rank.device, rank.unattributed);
+                let device = rank.device;
+                let (pools, unattributed) = devices.get(&device).cloned().unwrap_or_default();
 
                 Box::new(move |_: &mut [Box<dyn Runner>]| {
                     let Some(cache) = cache else {
@@ -1779,14 +1820,10 @@ impl WeightBinding {
 
                     // The process as its reservation will state it, and by how much the quota's
                     // reservations would pass its limit with it.
-                    let pools = lock(&graphs).mapped();
-                    let process = process_bytes(&nvml, device, pools, unattributed)?;
+                    let process = measure(&nvml, device, &pools, unattributed)?;
                     let (quota, _) = client.usage(device)?;
-                    let scope = client
-                        .scope()
-                        .ok_or(Error::State("the rank's client holds no quota of its GPU"))?;
                     let epoch = client.epoch();
-                    let excess = division::excess(&quota, scope, epoch, process)?;
+                    let excess = division::excess(&quota, epoch, process)?;
 
                     let kept = kept_beside(&table, unit_bytes, epoch, excess);
                     if kept < table.held {

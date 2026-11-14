@@ -318,8 +318,12 @@ fn a_profile_run_states_keys_the_region_and_the_input_copy_bytes() {
     let activations = (ROWS * HIDDEN * 2 + ROWS * VOCABULARY * 2) as u64;
     assert!(runner.graphs.peak() >= INPUTS + activations);
 
-    // One FP32 host value per token of the largest bucket.
-    assert_eq!(runner.graphs.input_peak(), 4 * ROWS as u64);
+    // One FP32 host value per token of the largest bucket, at whatever offset its alignment
+    // gives it.
+    assert_eq!(
+        runner.graphs.input_peak(),
+        4 * ROWS as u64 + ops::allocator::ALIGNMENT - 1
+    );
 }
 
 /// A runner whose forward writes outputs of known sizes with two operators: `norms`

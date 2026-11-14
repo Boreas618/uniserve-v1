@@ -57,6 +57,7 @@ use std::sync::Arc;
 
 use ops::Generation;
 use ops::breaks::{BREAK, HostWork};
+use ops::collective::Meet;
 use ops::moe::ExchangeTransport;
 use ops::{Context, ContextGuard, Group};
 use platform::{DeviceRange, Event, EventFlags, Stream};
@@ -136,6 +137,9 @@ struct State {
     /// The most one paired call of each profiled bucket's forward carves from a shadow region
     /// ([`shadowed`]).
     shadows: HashMap<Bucket, u64>,
+    /// The values area of a slot that holds the copies of each profiled bucket's forward at any
+    /// offsets ([`input_bound`]).
+    inputs: HashMap<Bucket, u64>,
     /// The graph of each captured bucket, by the generation it was captured or rebound for.
     graphs: HashMap<(Bucket, u64), Graph>,
     /// The input buffer; made at the first use for graphs that hold no device.
@@ -382,21 +386,32 @@ impl Graphs {
     ///
     /// As `ops::Context::set_group`.
     pub(crate) fn set_group(&self, group: Option<Arc<Group>>, rank: u64, ranks: u64) -> Result<()> {
-        self.profile.set_group(None, rank, ranks)?;
-        self.preparing.set_group(None, rank, ranks)?;
+        self.set_axes(vec![(group, rank, ranks)])
+    }
+
+    /// The axes of the runner's forwards partitioned along several: per axis, in the order the
+    /// model addresses them by (`nn::collective::along`), its group and this rank's place in it
+    /// as [`Graphs::set_group`] takes one. The meta contexts take the splits alone.
+    ///
+    /// # Errors
+    ///
+    /// As `ops::Context::set_axes`.
+    pub(crate) fn set_axes(&self, axes: Vec<(Option<Arc<Group>>, u64, u64)>) -> Result<()> {
+        let splits: Vec<(Option<Arc<Group>>, u64, u64)> = axes
+            .iter()
+            .map(|(_, rank, ranks)| (None, *rank, *ranks))
+            .collect();
+        self.profile.set_axes(splits.clone())?;
+        self.preparing.set_axes(splits)?;
 
         if let Some(cuda) = &self.device {
-            cuda.launching.set_group(group, rank, ranks)?;
+            cuda.launching.set_axes(axes)?;
         }
         Ok(())
     }
 
     /// The expert exchange of the runner's forwards (`ops::Context::set_exchange`).
-    pub(crate) fn set_exchange(
-        &self,
-        transport: Option<ExchangeTransport>,
-        meet: Option<Arc<dyn Fn() -> ops::Result<()> + Send + Sync>>,
-    ) {
+    pub(crate) fn set_exchange(&self, transport: Option<ExchangeTransport>, meet: Option<Meet>) {
         if let Some(cuda) = &self.device {
             cuda.launching.set_exchange(transport, meet);
         }
@@ -421,11 +436,12 @@ impl Graphs {
     /// Profiles `bucket`: its forward under the meta profile context, whose launch table and
     /// largest paired call ([`shadowed`]) these graphs keep.
     fn profile(&self, runner: &dyn Runner, bucket: &Bucket) -> Result<()> {
-        let (table, _, shadow) = self.meta_forward(&self.profile, runner, bucket)?;
+        let (table, copies, shadow) = self.meta_forward(&self.profile, runner, bucket)?;
 
         let mut state = self.state.borrow_mut();
         state.profiles.insert(*bucket, table);
         state.shadows.insert(*bucket, shadow);
+        state.inputs.insert(*bucket, input_bound(&copies));
         Ok(())
     }
 
@@ -474,10 +490,16 @@ impl Graphs {
         call + cache_writes
     }
 
-    /// The bytes of host values the largest profiled forward copies to the device: the values
-    /// area of one slot of the input buffer.
+    /// The bytes of the values area of one slot of the input buffer: what the host values of
+    /// any profiled forward take there, each copy at the most its alignment adds to it
+    /// ([`input_bound`]). A forward of no more copies and no more bytes than a profiled one
+    /// fits whatever its sizes, which is what bounds an eager forward over shapes no profile
+    /// ran: its runner profiles a forward that dominates it in both.
     pub fn input_peak(&self) -> u64 {
-        self.profile.input_peak()
+        let state = self.state.borrow();
+        let bound = state.inputs.values().copied().max().unwrap_or(0);
+
+        bound.max(self.profile.input_peak())
     }
 
     /// The launch table of `bucket`: its serving graph's when it is captured, otherwise its
@@ -1096,10 +1118,10 @@ impl Graphs {
     /// Runs `operation` on the input buffer, making the host ring of graphs that hold no device
     /// when it is first needed or has become too small for the profiled forwards.
     fn with_buffer<T>(&self, operation: impl FnOnce(&mut InputBuffer) -> Result<T>) -> Result<T> {
+        let values = self.input_peak();
         let mut state = self.state.borrow_mut();
 
         if self.device.is_none() {
-            let values = self.profile.input_peak();
             let stale = state
                 .buffer
                 .as_ref()
@@ -1379,6 +1401,7 @@ impl State {
             update: Update::Steady,
             profiles: HashMap::new(),
             shadows: HashMap::new(),
+            inputs: HashMap::new(),
             graphs: HashMap::new(),
             buffer,
             prepared: None,
@@ -1431,6 +1454,19 @@ fn served<'a>(
         .filter(|((held, generation), _)| held == bucket && *generation <= serving)
         .max_by_key(|((_, generation), _)| *generation)
         .map(|((_, generation), graph)| (*generation, graph))
+}
+
+/// The bytes a slot's values area needs to hold `copies`, a forward's input copies, at any
+/// offsets: each copy's bytes and the most its start's alignment can add to them.
+///
+/// A copy starts at the first aligned offset after the one before it ends (`ops::input`), so the
+/// copies of another forward of no more copies and no more bytes in all end within this, however
+/// their sizes fall against the alignment.
+fn input_bound(copies: &Copies) -> u64 {
+    copies
+        .iter()
+        .map(|(_, _, bytes)| bytes + (ALIGNMENT - 1))
+        .sum()
 }
 
 /// The launch table of the forward `recorded` states, and the most one of its launches carves

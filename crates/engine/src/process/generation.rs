@@ -178,15 +178,16 @@ pub(crate) fn kernels(
     }
     drop(client);
 
-    // One generation per device: a kernel belongs to the context that loaded it.
-    let submitted: Vec<crate::worker::Result<Submission>> = workers
+    // One generation per device: a kernel belongs to the context that loaded it. Preparing runs
+    // eager forwards, so the groups prepare in turn.
+    let next: Vec<Arc<ops::Generation>> = held
         .iter()
-        .zip(&held)
         .zip(installed)
-        .map(|((worker, kernels), entries)| {
-            worker.prepare(Arc::new(kernels.replace(generation, entries)))
-        })
+        .map(|(kernels, entries)| Arc::new(kernels.replace(generation, entries)))
         .collect();
+    let submitted = crate::worker::in_turn(workers, |index, worker| {
+        worker.prepare(Arc::clone(&next[index]))
+    });
     if let Err(failure) = ended(submitted, &format!("preparing generation {generation}")) {
         if let Err(error) = discard(&[], workers, generation) {
             tracing::warn!(%error, generation, "a preparation that failed was not given back");

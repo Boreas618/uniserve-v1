@@ -29,19 +29,22 @@
 //! network, so a sample crosses to the stack's type once after its input projection and back
 //! once before the output heads ([`crate::minimax_h3::transformer`]). A latent of another type is refused.
 //!
-//! ## Sequence parallelism
+//! ## Parallelism
 //!
-//! A rank of a sequence split computes one contiguous interval of the packed rows. Every rank
-//! holds the whole sample and draws the whole noise stream, projects the modality rows and
+//! A rank of a sequence split computes one contiguous interval of the packed rows; under an
+//! all-gather degree a tiled layout is padded to whole tiles in every all-gather interval. Every
+//! rank holds the whole sample and draws the whole noise stream, projects the modality rows and
 //! gathers its own interval of them; after the stack the ranks' velocity rows are gathered in
-//! rank order, so every rank advances the same latents.
+//! sequence order, so every rank advances the same latents. The ranks of a tensor split and the
+//! stages of a layer split hold the same rows and end the stack with the same rows
+//! ([`crate::minimax_h3::transformer`]), so they advance the same latents too.
 
 use nn::diffusion::{add_noise, euler_step, scale_noise};
-use nn::family::SequenceSplit;
+use nn::family::{DenoiserSplit, GATHER_AXIS, ULYSSES_AXIS};
 use nn::modules::{TimestepTable, TimestepTableConfig};
 use nn::{
-    ConditionPiece, Conditioning, DType, Device, MediaInput, Shape, Split, Step, Tensor,
-    VarBuilder, VideoRequest, functional,
+    ConditionPiece, Conditioning, DType, Device, MediaInput, Shape, Step, Tensor, VarBuilder,
+    VideoRequest, functional,
 };
 use proto::video::Layout;
 
@@ -96,8 +99,8 @@ pub struct Denoiser {
     /// The condition rows a layout holds at most; a request rides the rung of the condition
     /// ladder that holds its own.
     condition_rows: u32,
-    /// This rank's place in the sequence split.
-    sequence: Split,
+    /// This rank's place in the deployment's partition.
+    split: DenoiserSplit,
     /// The deployment's bound on the packed rows of a layout: the key bound the attention was
     /// loaded for.
     max_rows: u32,
@@ -113,22 +116,23 @@ pub struct Denoiser {
 
 impl Denoiser {
     /// The denoiser of `config` at `vb` (the network's checkpoint root), for layouts of
-    /// `capacity`'s `(text rows, condition rows)` at `sequence`'s rank, with the condition
+    /// `capacity`'s `(text rows, condition rows)` at `split`'s place, with the condition
     /// encoders when the deployment places them.
     ///
     /// # Errors
     ///
-    /// A network without heads, a sequence split that is not a rank of a power of two, a
-    /// capacity that is not whole capacity units, or a weight the loader refuses.
+    /// A network without heads, a Ulysses or all-gather place past its split, a sequence split
+    /// that is not a rank of a power of two, a capacity that is not whole capacity units, or a
+    /// weight the loader refuses.
     pub fn load(
         config: &DenoiserConfig,
         capacity: (u32, u32),
-        sequence: SequenceSplit,
+        split: DenoiserSplit,
         encoders: Option<(VideoEncoder, AudioEncoder)>,
         vb: VarBuilder<'_, '_>,
     ) -> Result<Self> {
         let transformer = &config.transformer;
-        let split = sequence.split;
+        let sequence = split.sequence();
         let (text_rows, condition_rows) = capacity;
 
         if transformer.head_dim == 0 || transformer.num_attention_heads == 0 {
@@ -136,10 +140,22 @@ impl Denoiser {
                 "a denoiser's transformer has attention heads".to_owned(),
             ));
         }
-        if split.size == 0 || !split.size.is_power_of_two() || split.rank >= split.size {
+        // The sequence split's places are the Ulysses split's inside the all-gather split's.
+        for (axis, place) in [
+            ("Ulysses", split.ulysses.split),
+            ("all-gather", split.gather),
+        ] {
+            if place.rank >= place.size {
+                return Err(Error::config(format!(
+                    "rank {} of a {axis} split of {} is no place of it",
+                    place.rank, place.size
+                )));
+            }
+        }
+        if !sequence.size.is_power_of_two() {
             return Err(Error::config(format!(
                 "rank {} of a sequence split of {} is not a rank of a power-of-two split",
-                split.rank, split.size
+                sequence.rank, sequence.size
             )));
         }
         let unit = config.capacity_unit();
@@ -171,7 +187,7 @@ impl Denoiser {
         )?;
 
         Ok(Self {
-            transformer: Transformer::load(config, sequence, max_rows, vb.clone())?,
+            transformer: Transformer::load(config, split, max_rows, vb.clone())?,
             refiner: TokenRefiner::load(transformer, text_rows, vb)?,
             modulation,
             table,
@@ -179,7 +195,7 @@ impl Denoiser {
             config: config.clone(),
             text_rows,
             condition_rows,
-            sequence: split,
+            split,
             max_rows,
         })
     }
@@ -395,7 +411,7 @@ impl Denoiser {
 /// The bound is taken over the checkpoint's resolutions and frame counts and not the
 /// deployment's sizes and longest output, so the kernels keyed by it are one set for every
 /// deployment of a checkpoint and capacity.
-fn max_rows(config: &DenoiserConfig, capacity: (u32, u32), sequence: Split) -> Result<u32> {
+fn max_rows(config: &DenoiserConfig, capacity: (u32, u32), split: DenoiserSplit) -> Result<u32> {
     let resolutions = processing::minimax_h3::named_canvases()
         .map_err(|error| Error::config(format!("the resolution rule: {error}")))?;
 
@@ -417,18 +433,23 @@ fn max_rows(config: &DenoiserConfig, capacity: (u32, u32), sequence: Split) -> R
             };
             let layout = packing::layout(&request, &config.transformer, capacity.0, capacity.1)?;
 
-            bound = bound.max(layout_rows(&layout, config.vsa.as_ref(), sequence));
+            bound = bound.max(layout_rows(&layout, config.vsa.as_ref(), split));
         }
     }
     Ok(bound as u32)
 }
 
-/// The rows of `layout`'s packed sequence: the tiled layout's under sparse attention, the
-/// dense layout's aligned to the sequence split otherwise.
-fn layout_rows(layout: &Layout, vsa: Option<&VsaConfig>, sequence: Split) -> usize {
+/// The rows of `layout`'s packed sequence on a partition of `split`: the tiled layout's under
+/// sparse attention, in whole tiles for every all-gather interval, and the dense layout's
+/// aligned to the sequence split otherwise.
+fn layout_rows(layout: &Layout, vsa: Option<&VsaConfig>, split: DenoiserSplit) -> usize {
     match vsa {
-        Some(vsa) => packing::tiled_len(layout, vsa),
-        None => packing::dense_len(layout, sequence.size),
+        Some(vsa) => {
+            let tile = vsa.tile_rows as usize;
+            let tiles = packing::tiled_len(layout, vsa) / tile;
+            tiles.next_multiple_of(split.gather.size as usize) * tile
+        }
+        None => packing::dense_len(layout, split.sequence().size),
     }
 }
 
@@ -692,12 +713,23 @@ impl Denoiser {
                         layout.text_rows, layout.condition_rows
                     )));
                 }
-                packing::tiled_rows(request, &layout, vsa)?
+                // Each all-gather interval holds whole tiles, the tiles past the layout's own
+                // padding.
+                let tiled = packing::tiled_rows(request, &layout, vsa)?;
+                let padded = layout_rows(&layout, Some(vsa), self.split);
+                match padded.saturating_sub(tiled.elem_count()) {
+                    0 => tiled,
+                    rows => {
+                        let document = packing::document_rows(request, &layout) as u32;
+                        let padding = Tensor::full(document, rows, &Device::Cpu)?;
+                        Tensor::cat(&[&tiled, &padding], 0)?
+                    }
+                }
             }
-            None => packing::dense_rows(request, &layout, self.sequence.size)?,
+            None => packing::dense_rows(request, &layout, self.split.sequence().size)?,
         };
         let tokens = rows.elem_count();
-        let ranks = self.sequence.size as usize;
+        let ranks = self.split.sequence().size as usize;
         if tokens > self.max_rows as usize || !tokens.is_multiple_of(ranks) {
             return Err(Error::request(format!(
                 "a layout of {tokens} packed rows on a denoiser loaded for {} rows over {ranks} \
@@ -706,7 +738,7 @@ impl Denoiser {
             )));
         }
         let own = tokens / ranks;
-        let first = self.sequence.rank as usize * own;
+        let first = self.split.sequence().rank as usize * own;
         let interval =
             |table: &Tensor| -> Result<Tensor> { on_device(&table.narrow(0, first, own)?, video) };
 
@@ -782,12 +814,18 @@ impl Denoiser {
                 .velocities(&self.table, &entries, &hidden, &groups, step.index)?;
 
         // Each modality's velocity rows, in its own order: every rank's interval gathered in
-        // rank order, and the modality's rows read out of the whole sequence.
+        // sequence order, the Ulysses group's consecutive intervals first and the groups' after,
+        // and the modality's rows read out of the whole sequence.
+        let (ulysses, gather) = (self.split.ulysses.split.size, self.split.gather.size);
         let collected = |velocity: Tensor, places: &Tensor| -> Result<Tensor> {
-            let sequence = match ranks {
-                1 => velocity,
-                _ => nn::collective::gathered(&velocity)?,
-            };
+            let mut sequence = velocity;
+            for (axis, size) in [(ULYSSES_AXIS, ulysses), (GATHER_AXIS, gather)] {
+                if size > 1 {
+                    sequence = nn::collective::along(axis, || {
+                        nn::collective::gathered(&sequence.contiguous()?)
+                    })?;
+                }
+            }
             Ok(sequence.index_select(&on_device(places, video)?, 0)?)
         };
 

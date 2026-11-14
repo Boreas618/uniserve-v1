@@ -30,7 +30,7 @@ use std::path::Path;
 use models::minimax_h3::config::{DenoiserConfig, ScheduleConfig, TransformerConfig, VsaConfig};
 use models::minimax_h3::denoiser::Denoiser;
 use models::minimax_h3::{VideoTask, packing};
-use nn::family::SequenceSplit;
+use nn::family::DenoiserSplit;
 use nn::{
     Checkpoint, ConditionRole, ConditionShape, Conditioning, CpuWeights, DType, Denoiser as _,
     Device, Tensor, VideoRequest, WeightLoader,
@@ -231,7 +231,7 @@ fn stepped(
 
     let config = config(vsa);
     let denoiser =
-        Denoiser::load(&config, capacity, SequenceSplit::WHOLE, None, loader.root()).unwrap();
+        Denoiser::load(&config, capacity, DenoiserSplit::WHOLE, None, loader.root()).unwrap();
     denoiser.initialize().unwrap();
 
     let layout = denoiser.layout(request).unwrap();
@@ -375,7 +375,7 @@ fn a_request_of_a_task_the_network_does_not_serve_is_refused_by_name() {
     let denoiser = Denoiser::load(
         &config(None),
         (64, 64),
-        SequenceSplit::WHOLE,
+        DenoiserSplit::WHOLE,
         None,
         loader.root(),
     )

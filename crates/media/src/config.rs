@@ -6,9 +6,9 @@ use std::path::{Path, PathBuf};
 ///
 /// The codecs are linked into the executable (through the crate's FFmpeg
 /// shim), so the only external program media work starts is the reference
-/// video decoder, which stays an external `ffmpeg` process by design. The main process takes its value from the build
-/// configuration; [`MediaConfig::default`] resolves it from the environment
-/// for tests and tools.
+/// video decoder, which stays an external `ffmpeg` process by design. The main process takes its
+/// value from `media_config.ffmpeg` when the deployment names one, else from
+/// [`MediaConfig::from_env`], as [`MediaConfig::default`] does for tests and tools.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct MediaConfig {
     /// The `ffmpeg` executable that decodes reference videos.

@@ -29,7 +29,7 @@ use models::minimax_h3::config::{DenoiserConfig, ScheduleConfig, TransformerConf
 use models::minimax_h3::modulation::{self, Modulation};
 use models::minimax_h3::refiner::TokenRefiner;
 use models::minimax_h3::transformer::{Block, Transformer, rotary_config};
-use nn::family::SequenceSplit;
+use nn::family::DenoiserSplit;
 use nn::modules::{Rotary, TimestepTable, TimestepTableConfig};
 use nn::{Checkpoint, CpuWeights, DType, Device, Tensor, WeightLoader};
 use support::{assert_close, values};
@@ -183,7 +183,7 @@ fn a_block_is_the_references_block() {
 
     let block = Block::load(
         &config,
-        SequenceSplit::WHOLE,
+        DenoiserSplit::WHOLE,
         ROWS,
         loader.root().pp("transformer_blocks").pp(0),
     )
@@ -225,7 +225,7 @@ fn the_stack_and_its_heads_are_the_references() {
     let config = config();
 
     let transformer =
-        Transformer::load(&config, SequenceSplit::WHOLE, ROWS, loader.root()).unwrap();
+        Transformer::load(&config, DenoiserSplit::WHOLE, ROWS, loader.root()).unwrap();
     transformer.initialize().unwrap();
     let table = modulation_table(&loader, &expected["timesteps"]);
     let entries = table.entries_of(0).unwrap();

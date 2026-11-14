@@ -46,7 +46,7 @@ use nn::Split;
 use nn::family::{ExpertOrder, Family, Model, Projection, SequenceSplit, TextModel, TextPlacement};
 use platform::DeviceId;
 use proto::config::{
-    BlockConfig, EngineArgs, HeadProjection, SequenceParallel, WorkerGroupConfig, WorkerGroupRole,
+    BlockConfig, EngineArgs, SequenceParallel, WorkerGroupConfig, WorkerGroupRole,
 };
 
 use buckets::tier_refusal;
@@ -155,30 +155,6 @@ pub(crate) struct ModelRunner {
     /// The members of the expert union of this node's ranks, on a deployment whose experts are
     /// split; `None` outside a union.
     union: Option<u32>,
-}
-
-/// A rank's places in its deployment's parallel groups.
-#[derive(Clone, Copy, Debug)]
-pub(crate) struct ParallelShape {
-    /// Members of the denoiser's sequence group.
-    pub(crate) sequence: usize,
-    /// This rank's place in it.
-    pub(crate) sequence_rank: usize,
-    /// Members of the text encoder's tensor group.
-    pub(crate) tensor: usize,
-    /// This rank's place in it.
-    pub(crate) tensor_rank: usize,
-}
-
-impl Default for ParallelShape {
-    fn default() -> Self {
-        Self {
-            sequence: 1,
-            sequence_rank: 0,
-            tensor: 1,
-            tensor_rank: 0,
-        }
-    }
 }
 
 /// The collective groups one kind of a deployment's parallel groups forms over the host group, and
@@ -469,11 +445,7 @@ impl ModelRunner {
                         group.id
                     );
                 }
-                let projection = match projection {
-                    HeadProjection::Gather => Projection::Gather,
-                    HeadProjection::Exchange => Projection::Exchange,
-                };
-                (*ulysses_degree, projection)
+                (*ulysses_degree, placement::head_projection(*projection))
             }
             other => bail!(
                 "worker group {} states the sequence split {other:?}: a text group splits its \

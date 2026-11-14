@@ -4,32 +4,24 @@ use std::path::PathBuf;
 
 use anyhow::{Context as _, Result, bail};
 use nn::Split;
-use nn::family::{Model, Projection, SequenceSplit, VideoCheckpoint};
-use proto::config::{EngineArgs, WorkerGroupConfig};
+use nn::family::{
+    DenoiserSplit, GATHER_AXIS, LAYER_AXIS, Model, Projection, SequenceSplit, TENSOR_AXIS,
+    ULYSSES_AXIS, VideoCheckpoint,
+};
+use proto::config::{BlockConfig, EngineArgs, HeadProjection, WorkerGroupConfig};
 
-use super::{ModelRunner, ParallelShape};
+use super::ModelRunner;
 
 impl ModelRunner {
-    /// The parallel groups this rank joins: `(sequence group's ranks, tensor group's ranks)` and its
-    /// place in each. A rank of a media deployment is in both; the text class joins neither here.
-    pub(crate) fn parallel_shape(&self) -> Result<ParallelShape> {
-        let Model::Video(_) = self.family.model else {
-            // The tensor group is the text model's only collective group: an expert union
-            // exchanges over its own transport (`union_member`).
-            return Ok(ParallelShape {
-                tensor: self.mapping.tensor_parallel as usize,
-                tensor_rank: self.mapping.tensor_rank as usize,
-                ..ParallelShape::default()
-            });
-        };
+    /// This rank's place in the denoiser's partition and the text encoder's tensor split, as
+    /// its group's blocks state them for its checkpoint ([`video_split`]).
+    ///
+    /// # Errors
+    ///
+    /// A checkpoint that does not open, or a split the deployment's groups do not state.
+    pub(crate) fn partition(&self) -> Result<(DenoiserSplit, Split)> {
         let opened = self.open_video_checkpoint()?;
-        let (sequence, tensor) = self.video_split(&*self.open_video_family(&opened)?)?;
-        Ok(ParallelShape {
-            sequence: sequence.split.size as usize,
-            sequence_rank: sequence.split.rank as usize,
-            tensor: tensor.size as usize,
-            tensor_rank: tensor.rank as usize,
-        })
+        self.video_split(&*self.open_video_family(&opened)?)
     }
 
     /// This rank's video checkpoint, opened over its roots: the checkpoint the launch names and the
@@ -69,13 +61,13 @@ impl ModelRunner {
         Ok(family.open(checkpoint, &self.engine_config().model.quantization)?)
     }
 
-    /// The denoiser's sequence split and the text encoder's tensor split of this rank, as the
+    /// The denoiser's partition and the text encoder's tensor split of this rank, as the
     /// deployment page states them for `checkpoint`'s blocks: its own group's, at its position
     /// there.
     pub(super) fn video_split(
         &self,
         checkpoint: &dyn VideoCheckpoint,
-    ) -> Result<(SequenceSplit, Split)> {
+    ) -> Result<(DenoiserSplit, Split)> {
         video_split(
             self.capability_groups(),
             &self.group,
@@ -168,19 +160,19 @@ impl Mapping {
     }
 }
 
-/// This rank's sequence split, and its place in it, as the deployment page states them.
+/// This rank's place in the denoiser's partition and the text encoder's tensor split, as the
+/// deployment page states them.
 ///
 /// **The page is the one statement of the parallel shape, and this reads it rather than a second
 /// copy.** A main process knows its own devices and its rank number, and the build config states the
-/// tensor-parallel width; the sequence degree and the head projection are the deployment file's,
+/// tensor-parallel width; the denoiser's degrees and the head projection are the deployment file's,
 /// written beside the block they split. So the group is found by the name the launch states, its
-/// one sequence-split block is read, and the rank's position inside that block is its
-/// sequence rank.
+/// denoiser block is read, and the rank's place in that block's order is its coordinate on each
+/// degree ([`DenoiserSplit`]: the Ulysses degree fastest, then the tensor degree, then the
+/// all-gather degree, the layer degree slowest).
 ///
-/// It refuses what would otherwise be assumed: a group with two sequence-split blocks is not one
-/// partition, a projection this stack does not implement is refused rather than served at degree
-/// one, and a mode that is not Ulysses is refused by name because the denoiser's sequence exchange
-/// is Ulysses' alone.
+/// It refuses what would otherwise be assumed: a sequence split on another block than the
+/// denoiser's, and a denoiser block whose ranks do not number its degrees' product.
 pub(super) fn video_split(
     groups: Option<&[WorkerGroupConfig]>,
     group: &str,
@@ -189,7 +181,7 @@ pub(super) fn video_split(
     world_size: usize,
     denoisers: &[&str],
     text_encoder: &str,
-) -> Result<(SequenceSplit, Split)> {
+) -> Result<(DenoiserSplit, Split)> {
     let tensor_parallel = tensor.size as usize;
     let tensor_rank = tensor.rank as usize;
     let rank = usize::try_from(rank).context("a rank number the process addresses")?;
@@ -204,7 +196,7 @@ pub(super) fn video_split(
     // other rank for a shape to disagree with, so the width the build config states is the whole of it.
     let Some(groups) = groups else {
         if world_size == 1 {
-            return Ok((SequenceSplit::WHOLE, Split::WHOLE));
+            return Ok((DenoiserSplit::WHOLE, Split::WHOLE));
         }
         bail!(
             "this deployment places the whole model on its groups and serves {world_size} ranks, so \
@@ -220,7 +212,7 @@ pub(super) fn video_split(
     // answer: **which group places this class's block?** A media rank serves the denoiser, and a
     // group that places no transformer is another engine's.
     let named = groups.iter().find(|candidate| candidate.id.0 == group);
-    let denoisers: Vec<&WorkerGroupConfig> = groups
+    let placing: Vec<&WorkerGroupConfig> = groups
         .iter()
         .filter(|candidate| {
             denoisers
@@ -231,7 +223,7 @@ pub(super) fn video_split(
     // Both sides as a pair in either refusal: the launch's name is the daemon's roster label and the
     // page's ids are the deployment's groups, and a reader who sees only one side cannot tell which
     // of the two statements to correct.
-    let placed = match (named, denoisers.as_slice()) {
+    let placed = match (named, placing.as_slice()) {
         (Some(named), _) => named,
         (None, [only]) => *only,
         (None, []) => {
@@ -275,65 +267,123 @@ pub(super) fn video_split(
         }
         _ => (tensor_parallel, tensor_rank),
     };
-    let mut splits = placed.blocks.iter().filter(|(_, block)| {
-        !matches!(
+    let text = split(tensor_parallel, tensor_rank)?;
+
+    // The one block a sequence splits is the denoiser's: a split stated on another would serve
+    // it at degree one on every member.
+    let network = placed
+        .blocks
+        .iter()
+        .find(|(name, _)| denoisers.contains(&name.as_str()));
+    let local = |block: &proto::config::BlockConfig| {
+        matches!(
             block.sequence_parallel,
             proto::config::SequenceParallel::Local
         )
-    });
-    let (_, block) = match (splits.next(), splits.next()) {
-        // No split: the sequence is this rank's own, and the tensor degree is the whole shape.
-        (None, _) => {
-            return Ok((
-                SequenceSplit {
-                    split: split(1, 0)?,
-                    projection: Projection::Exchange,
-                },
-                split(tensor_parallel, tensor_rank)?,
-            ));
-        }
-        (Some(one), None) => one,
-        (Some(first), Some(second)) => bail!(
-            "worker group {group:?} states a sequence split on two blocks ({:?} and {:?}) and \
-             one partition describes one split",
-            first.0,
-            second.0
-        ),
     };
-    // A block that states no member list holds every rank of its replica, so a rank's position
-    // in it is the rank's own ordinal.
-    let sequence_rank = if block.ranks.is_empty() {
-        rank
+    if let Some((other, _)) = placed
+        .blocks
+        .iter()
+        .find(|(name, block)| !local(block) && network.is_none_or(|(network, _)| network != *name))
+    {
+        bail!(
+            "worker group {group:?} states a sequence split on block {other:?}, and only the \
+             denoiser's block ({}) splits its sequence",
+            network.map_or(denoiser, |(name, _)| name.as_str())
+        );
+    }
+    let Some((name, block)) = network else {
+        return Ok((DenoiserSplit::WHOLE, text));
+    };
+
+    // A block that states no member list holds every rank of its replica, so a rank's place in it
+    // is the rank's own ordinal. A rank outside the block loads no part of the denoiser.
+    let place = if block.ranks.is_empty() {
+        Some(rank)
     } else {
-        block
-            .ranks
-            .iter()
-            .position(|member| *member == rank)
-            .with_context(|| {
-                format!(
-                    "this rank is {rank} and the group's sequence-split block holds ranks {:?}",
-                    block.ranks
-                )
-            })?
+        block.ranks.iter().position(|member| *member == rank)
     };
-    let sequence = match &block.sequence_parallel {
-        proto::config::SequenceParallel::Ulysses {
-            ulysses_degree,
-            projection,
-            ..
-        } => SequenceSplit {
-            split: split(*ulysses_degree, sequence_rank)?,
-            projection: match projection {
-                proto::config::HeadProjection::Exchange => Projection::Exchange,
-                proto::config::HeadProjection::Gather => Projection::Gather,
+    let Some(place) = place else {
+        return Ok((DenoiserSplit::WHOLE, text));
+    };
+
+    let (degrees, strides) = denoiser_axes(block);
+    let [ulysses, gather, tensor, layers] = degrees;
+    let projection = match &block.sequence_parallel {
+        proto::config::SequenceParallel::Ulysses { projection, .. } => head_projection(*projection),
+        // A hybrid split states no projection, and its Ulysses members gather, as an omitted
+        // mode does.
+        proto::config::SequenceParallel::Hybrid { .. } => Projection::Gather,
+        proto::config::SequenceParallel::Local
+        | proto::config::SequenceParallel::Allgather { .. } => Projection::Exchange,
+    };
+    let width = [ulysses, gather, tensor, layers]
+        .iter()
+        .try_fold(1_usize, |product, degree| product.checked_mul(*degree))
+        .filter(|width| *width > 0)
+        .context("the denoiser's degrees multiply past what a block numbers")?;
+    let members = if block.ranks.is_empty() {
+        placed.ranks.len()
+    } else {
+        block.ranks.len()
+    };
+    if members != width || place >= width {
+        bail!(
+            "block {name:?} of worker group {group:?} holds {members} ranks, and its degrees \
+             (Ulysses {ulysses}, all-gather {gather}, tensor {tensor}, layers {layers}) number \
+             {width}"
+        );
+    }
+
+    // The rank's coordinate on each axis.
+    let coordinate = |axis: usize| (place / strides[axis]) % degrees[axis];
+    Ok((
+        DenoiserSplit {
+            ulysses: SequenceSplit {
+                split: split(ulysses, coordinate(ULYSSES_AXIS))?,
+                projection,
             },
+            gather: split(gather, coordinate(GATHER_AXIS))?,
+            tensor: split(tensor, coordinate(TENSOR_AXIS))?,
+            layers: split(layers, coordinate(LAYER_AXIS))?,
         },
-        other => bail!(
-            "worker group {group:?} states the sequence split {other:?}, and a video denoiser \
-             exchanges its sequence over Ulysses ranks"
-        ),
+        text,
+    ))
+}
+
+/// A denoiser block's degree along each axis of its partition, in the order the denoiser
+/// addresses them (`nn::family::ULYSSES_AXIS` and after: Ulysses, all-gather, tensor, layers),
+/// and the distance in the block's order between two consecutive coordinates of each: the
+/// Ulysses degree varies fastest, then the tensor degree, then the all-gather degree, and the
+/// layer degree slowest ([`DenoiserSplit`]). A caller refuses a degree of zero.
+pub(super) fn denoiser_axes(block: &BlockConfig) -> ([usize; 4], [usize; 4]) {
+    let (ulysses, gather) = match block.sequence_parallel {
+        proto::config::SequenceParallel::Local => (1, 1),
+        proto::config::SequenceParallel::Ulysses { ulysses_degree, .. } => (ulysses_degree, 1),
+        proto::config::SequenceParallel::Allgather { allgather_degree } => (1, allgather_degree),
+        proto::config::SequenceParallel::Hybrid {
+            ulysses_degree,
+            allgather_degree,
+        } => (ulysses_degree, allgather_degree),
     };
-    Ok((sequence, split(tensor_parallel, tensor_rank)?))
+    let tensor = block.tensor_parallel_size;
+
+    let degrees = [ulysses, gather, tensor, block.pipeline_parallel_size];
+    let strides = [
+        1,
+        ulysses.saturating_mul(tensor),
+        ulysses,
+        ulysses.saturating_mul(tensor).saturating_mul(gather),
+    ];
+    (degrees, strides)
+}
+
+/// The head projection a deployment states for a Ulysses split, as a model takes it.
+pub(super) fn head_projection(stated: HeadProjection) -> Projection {
+    match stated {
+        HeadProjection::Gather => Projection::Gather,
+        HeadProjection::Exchange => Projection::Exchange,
+    }
 }
 
 #[cfg(test)]
@@ -349,7 +399,7 @@ mod tests {
         tensor_parallel: u32,
         tensor_rank: u32,
         world_size: usize,
-    ) -> Result<(SequenceSplit, Split)> {
+    ) -> Result<(DenoiserSplit, Split)> {
         video_split(
             groups,
             group,
@@ -393,10 +443,11 @@ mod tests {
             "the group that places the denoiser is this rank's, whatever the launch calls it",
         );
         assert_eq!(
-            sequence.split.size, 4,
+            sequence.sequence().size,
+            4,
             "its split is the one this rank serves"
         );
-        assert_eq!(sequence.split.rank, 1);
+        assert_eq!(sequence.sequence().rank, 1);
 
         let two = page(
             "[[worker_groups]]\nid = \"text\"\nranks = [\"cuda:0-3\"]\nqueue_depth = 2\n\
@@ -428,9 +479,9 @@ mod tests {
         );
         let (sequence, tensor) =
             split(Some(&placed), "model", 2, 4, 2, 4).expect("a four-way exchange partition");
-        assert_eq!(sequence.split.size, 4, "the page states the degree");
+        assert_eq!(sequence.sequence().size, 4, "the page states the degree");
         assert_eq!(
-            sequence.projection,
+            sequence.ulysses.projection,
             Projection::Exchange,
             "the page states the projection"
         );
@@ -440,7 +491,8 @@ mod tests {
             "the tensor place is the rank's"
         );
         assert_eq!(
-            sequence.split.rank, 2,
+            sequence.sequence().rank,
+            2,
             "a block of every rank places the rank at its ordinal"
         );
     }
@@ -463,7 +515,55 @@ mod tests {
         let (sequence, tensor) =
             split(Some(&placed), "model", 5, 1, 0, 8).expect("a denoising rank outside the block");
         assert_eq!(tensor, Split::WHOLE);
-        assert_eq!((sequence.split.size, sequence.split.rank), (8, 5));
+        assert_eq!((sequence.sequence().size, sequence.sequence().rank), (8, 5));
+    }
+
+    /// A denoiser block's order places each rank on its four degrees, the Ulysses degree
+    /// fastest and the layer degree slowest: a tensor two by Ulysses two block's Ulysses pairs
+    /// are its consecutive places, an all-gather degree or a hybrid one gives each place its
+    /// interval of the sequence, and a layer split one stage per place. A block whose ranks do
+    /// not number the product of its degrees is refused.
+    #[test]
+    fn a_denoiser_block_places_each_rank_on_its_degrees() {
+        let placed = |transformer: &str| {
+            page(&format!(
+                "[[worker_groups]]\nid = \"model\"\nranks = [\"cuda:0-3\"]\nqueue_depth = 2\n\
+                 [worker_groups.blocks.transformer]\nranks = [3, 1, 2, 0]\n{transformer}\n"
+            ))
+        };
+        let place = |groups: &[WorkerGroupConfig], rank: u32| {
+            let (denoiser, _) = split(Some(groups), "model", rank, 1, 0, 4).unwrap();
+            (
+                (denoiser.sequence().size, denoiser.sequence().rank),
+                denoiser.ulysses.split.size,
+                (denoiser.tensor.size, denoiser.tensor.rank),
+                (denoiser.layers.size, denoiser.layers.rank),
+            )
+        };
+
+        // Group rank 1 is the block's place 1, group rank 0 its place 3.
+        let mixed = placed(
+            "tensor_parallel_size = 2\nsequence_parallel = { kind = \"ulysses\", ulysses_degree = 2 }",
+        );
+        assert_eq!(place(&mixed, 1), ((2, 1), 2, (2, 0), (1, 0)));
+        assert_eq!(place(&mixed, 0), ((2, 1), 2, (2, 1), (1, 0)));
+
+        let gather = placed("sequence_parallel = { kind = \"allgather\", allgather_degree = 4 }");
+        assert_eq!(place(&gather, 2), ((4, 2), 1, (1, 0), (1, 0)));
+
+        let hybrid = placed(
+            "sequence_parallel = { kind = \"hybrid\", ulysses_degree = 2, allgather_degree = 2 }",
+        );
+        let (denoiser, _) = split(Some(&hybrid), "model", 0, 1, 0, 4).unwrap();
+        assert_eq!((denoiser.ulysses.split.rank, denoiser.gather.rank), (1, 1));
+        assert_eq!(denoiser.ulysses.projection, Projection::Gather);
+
+        let pipeline = placed("pipeline_parallel_size = 4");
+        assert_eq!(place(&pipeline, 3), ((1, 0), 1, (1, 0), (4, 0)));
+        assert_eq!(place(&pipeline, 0), ((1, 0), 1, (1, 0), (4, 3)));
+
+        let tensor = placed("tensor_parallel_size = 4");
+        assert_eq!(place(&tensor, 2).2, (4, 2));
     }
 
     /// A deployment that places the whole model serves one rank, and refuses to guess above one.
@@ -475,7 +575,7 @@ mod tests {
     #[test]
     fn a_deployment_without_a_file_serves_one_rank_or_refuses() {
         let (sequence, tensor) = split(None, "model", 0, 1, 0, 1).expect("one rank's sequence");
-        assert_eq!(sequence, SequenceSplit::WHOLE);
+        assert_eq!(sequence, DenoiserSplit::WHOLE);
         assert_eq!(tensor, Split::WHOLE);
         let error = split(None, "model", 2, 4, 2, 4).expect_err("four ranks need a file");
         assert!(
@@ -494,7 +594,7 @@ mod tests {
              [worker_groups.blocks.transformer]\n",
         );
         let (sequence, _) = split(Some(&placed), "model", 0, 1, 0, 1).expect("one rank's sequence");
-        assert_eq!(sequence.split, Split::WHOLE);
+        assert_eq!(sequence.sequence(), Split::WHOLE);
     }
 
     /// A page with two sequence-split blocks is refused by name: a partition describes one split,
@@ -510,7 +610,7 @@ mod tests {
             ));
             let (sequence, _) = split(Some(&placed), "model", 0, 1, 0, 2)
                 .unwrap_or_else(|error| panic!("the {projection} projection is served: {error:#}"));
-            assert_eq!(sequence.split.size, 2);
+            assert_eq!(sequence.sequence().size, 2);
         }
         let two = page(
             "[[worker_groups]]\nid = \"model\"\nranks = [\"cuda:0-1\"]\nqueue_depth = 2\n\

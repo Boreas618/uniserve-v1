@@ -25,7 +25,7 @@ use platform::{DeviceRange, Stream};
 
 use crate::allocator::{ALIGNMENT, Allocator};
 use crate::breaks::HostWork;
-use crate::collective::Group;
+use crate::collective::{Group, Meet};
 use crate::moe::ExchangeTransport;
 use crate::profiler::Profiler;
 use crate::{Error, Result};
@@ -55,18 +55,22 @@ pub(crate) struct State {
     pub(crate) kernels: Option<Arc<Generation>>,
     /// Where launches are offered first, when execution routes some of them itself.
     pub(crate) route: Option<Arc<dyn Route + Send + Sync>>,
-    /// The communicator collectives are issued through.
+    /// The communicator collectives are issued through: the group of the axis the forward
+    /// addresses ([`crate::collective::along`]), the first axis outside any.
     pub(crate) group: Option<Arc<Group>>,
-    /// This rank's index in the group and the group's member count, when the forward is
-    /// partitioned.
+    /// This rank's index in that group and the group's member count, when the forward is
+    /// partitioned along it.
     pub(crate) split: Option<(u64, u64)>,
+    /// Every axis of a forward partitioned along several ([`Context::set_axes`]), in the order
+    /// the forward addresses them by.
+    pub(crate) axes: Vec<Axis>,
     /// The transport the expert exchange of this context's forwards runs over: the package's
     /// handle for this device and expert group, borrowed from execution, which keeps it alive
     /// for as long as it is set.
     pub(crate) exchange: Option<ExchangeTransport>,
     /// What an eager forward calls before each exchange launch to meet the other ranks of the
     /// expert group on the host ([`Context::set_exchange`]).
-    pub(crate) meet: Option<Arc<dyn Fn() -> Result<()> + Send + Sync>>,
+    pub(crate) meet: Option<Meet>,
     /// What launches the range markers of the modules a forward enters.
     pub(crate) profiler: Option<Arc<dyn Profiler>>,
     /// What takes the graph breaks of a forward execution captures ([`Context::set_breaks`]).
@@ -89,6 +93,10 @@ pub(crate) struct State {
     /// host-to-device copies made while the stream was being captured, or under a meta context.
     pub(crate) input_copies: Vec<(u64, u64, u64)>,
 }
+
+/// One axis of a forward's partition: the group its collectives go through and this rank's place
+/// in it, `None` on an axis the forward is not partitioned along.
+pub(crate) type Axis = (Option<Arc<Group>>, Option<(u64, u64)>);
 
 /// Keeps a context installed on the thread that entered it; dropping it returns the context that
 /// was installed before.
@@ -236,6 +244,33 @@ impl Context {
     /// [`Error::Collective`] when `rank` is not below `ranks`, when `group` is not member `rank`
     /// of `ranks`, or when a context that launches is given a split without a group.
     pub fn set_group(&self, group: Option<Arc<Group>>, rank: u64, ranks: u64) -> Result<()> {
+        self.set_axes(vec![(group, rank, ranks)])
+    }
+
+    /// The axes of a forward partitioned along several: per axis, in the order the forward
+    /// addresses them by ([`crate::collective::along`]), its group and this rank's place in it,
+    /// as [`Context::set_group`] takes one. The forward's collectives go along the first axis
+    /// unless it addresses another.
+    ///
+    /// # Errors
+    ///
+    /// As [`Context::set_group`], for any axis.
+    pub fn set_axes(&self, axes: Vec<(Option<Arc<Group>>, u64, u64)>) -> Result<()> {
+        let mut checked = Vec::with_capacity(axes.len());
+        for (group, rank, ranks) in axes {
+            checked.push(self.axis(group, rank, ranks)?);
+        }
+
+        let mut state = self.state();
+        let (group, split) = checked.first().cloned().unwrap_or((None, None));
+        state.group = group;
+        state.split = split;
+        state.axes = checked;
+        Ok(())
+    }
+
+    /// One axis's group and this rank's place in it, checked as [`Context::set_group`] states.
+    fn axis(&self, group: Option<Arc<Group>>, rank: u64, ranks: u64) -> Result<Axis> {
         let refused = |problem: String| Error::Collective {
             collective: "set_group",
             problem,
@@ -245,10 +280,7 @@ impl Context {
             if group.is_some() {
                 return Err(refused("a group of no members".to_owned()));
             }
-            let mut state = self.state();
-            state.group = None;
-            state.split = None;
-            return Ok(());
+            return Ok((None, None));
         }
 
         if rank >= ranks {
@@ -277,11 +309,7 @@ impl Context {
             }
             None => {}
         }
-
-        let mut state = self.state();
-        state.group = group;
-        state.split = Some((rank, ranks));
-        Ok(())
+        Ok((group, Some((rank, ranks))))
     }
 
     /// The expert exchange of this context's forwards: `transport` is the package's transport for
@@ -289,20 +317,15 @@ impl Context {
     /// ([`crate::collective::expert_exchange`]), and `None` withdraws it.
     ///
     /// `meet`, when given, is called on the forward's thread before each exchange launch of a
-    /// context that launches, and returns once every rank of the expert group has called it. An
-    /// exchange launch waits on its device for the same launch of every rank, and the first use
-    /// of a kernel takes a lock of the whole process and waits for its device; the ranks of a
-    /// host are threads of one process, so execution gives a warm-up forward a `meet` that
-    /// keeps every rank out of the waiting launch until each has finished the first uses before
-    /// it, and gives none once every kernel is ready.
+    /// context that launches, and returns once every rank of the expert group has called it, as
+    /// a group's meeting does before its collectives ([`Group::with_meet`]): an exchange launch
+    /// waits on its device for the same launch of every rank, so execution gives a warm-up
+    /// forward a `meet` that keeps every rank out of the waiting launch until each has finished
+    /// the first uses before it, and gives none once every kernel is ready.
     ///
     /// A meta context launches nothing and needs neither. The transport is borrowed: execution
     /// keeps it valid, as the handle's constructor requires, for as long as it is set here.
-    pub fn set_exchange(
-        &self,
-        transport: Option<ExchangeTransport>,
-        meet: Option<Arc<dyn Fn() -> Result<()> + Send + Sync>>,
-    ) {
+    pub fn set_exchange(&self, transport: Option<ExchangeTransport>, meet: Option<Meet>) {
         let mut state = self.state();
         state.exchange = transport;
         state.meet = meet;
@@ -362,6 +385,7 @@ impl State {
             route: None,
             group: None,
             split: None,
+            axes: Vec::new(),
             exchange: None,
             meet: None,
             profiler: None,
@@ -420,7 +444,7 @@ mod tests {
 
     use super::Context;
     use crate::allocator::ALIGNMENT;
-    use crate::collective::{finish, split};
+    use crate::collective::{along, finish, split};
     use crate::{Error, Result};
 
     /// Whether `result` is the refusal of an operation that found no context installed.
@@ -458,6 +482,32 @@ mod tests {
 
         context.set_group(None, 1, 4).unwrap();
         assert_eq!(split(), Some((1, 4)));
+    }
+
+    /// A forward partitioned along several axes reads each axis's place while it addresses it,
+    /// and the first axis's outside, an operation that fails included; an axis the context does
+    /// not state is refused.
+    #[test]
+    fn a_forward_addresses_each_axis_and_returns_to_the_one_before() {
+        let context = Context::meta(None);
+        context
+            .set_axes(vec![(None, 1, 2), (None, 0, 0), (None, 3, 4)])
+            .unwrap();
+        let _guard = context.enter();
+        assert_eq!(split(), Some((1, 2)));
+
+        let nested = along(2, || {
+            assert_eq!(split(), Some((3, 4)));
+            along(1, split).unwrap()
+        });
+        assert_eq!(nested.unwrap(), None);
+        assert_eq!(split(), Some((1, 2)));
+
+        let failed: Result<Result<()>> = along(2, || Err(Error::NoContext { operation: "x" }));
+        assert!(failed.unwrap().is_err());
+        assert_eq!(split(), Some((1, 2)));
+
+        assert!(along(3, split).is_err());
     }
 
     #[test]

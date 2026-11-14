@@ -330,6 +330,7 @@ fn a_selection_keeps_the_dense_tiles_and_each_segment_s_highest_scores() {
         &sizes,
         &segments,
         &keep,
+        0,
     )
     .unwrap();
 
@@ -346,12 +347,43 @@ fn a_selection_keeps_the_dense_tiles_and_each_segment_s_highest_scores() {
     assert_eq!(entries(&indices), expected);
     assert_eq!(entries(&counts), [5, 4, 4, 0, 4, 4, 5, 4, 4, 0, 4, 4]);
 
-    // The segment table is signed and the others unsigned.
+    // A rank of an all-gather group ranks its own interval of query tiles, here tiles 2 to 4,
+    // over every key tile: its selection is the whole selection's rows of those tiles.
+    let interval: Vec<f32> = rows
+        .iter()
+        .flat_map(|row| std::iter::repeat_n(row, 3).flatten().copied())
+        .collect();
+    let (indices, counts) = functional::vsa_select_tiles(
+        &tensor(&interval, (2, 3, 6), DType::F32),
+        &sizes,
+        &segments,
+        &keep,
+        2,
+    )
+    .unwrap();
+    let expected: Vec<u32> = selected
+        .iter()
+        .flat_map(|kept| [*kept, empty, *kept])
+        .flatten()
+        .collect();
+    assert_eq!(entries(&indices), expected);
+    assert_eq!(entries(&counts), [4, 0, 4, 4, 0, 4]);
+
+    // An interval past the tiles, a signed size or an unsigned segment table is refused.
+    let past = functional::vsa_select_tiles(
+        &tensor(&interval, (2, 3, 6), DType::F32),
+        &sizes,
+        &segments,
+        &keep,
+        4,
+    );
+    assert!(past.is_err());
     let refused = functional::vsa_select_tiles(
         &tensor(&scores, (2, 6, 6), DType::F32),
         &sizes,
         &keep,
         &keep,
+        0,
     );
     assert!(refused.is_err());
 }
@@ -665,6 +697,7 @@ fn the_select_block_is_the_layout_s_tiles_rounded_up() {
                 &meta(tiles, DType::U32),
                 &meta(tiles, DType::I32),
                 &meta(tiles, DType::U32),
+                0,
             )
         });
         let (indices, counts) = selection.unwrap();
@@ -740,7 +773,7 @@ fn a_sparse_layer_on_the_cpu_is_its_operators_in_order() {
     .unwrap();
     let scores = functional::vsa_scores(&pooled.get(0).unwrap(), &pooled.get(1).unwrap()).unwrap();
     let (indices, counts) =
-        functional::vsa_select_tiles(&scores, &sizes, &segments, &keep).unwrap();
+        functional::vsa_select_tiles(&scores, &sizes, &segments, &keep, 0).unwrap();
     let attended = functional::sparse_attention(
         (&query, &key, &value),
         (&indices, &counts),
@@ -784,6 +817,57 @@ fn a_sparse_layer_on_the_cpu_is_its_operators_in_order() {
 
 // ---- Sequence parallelism ---------------------------------------------------------------------
 
+/// A member of an all-gather group attends its own interval of query tiles over the whole
+/// sequence's keys, which the group gathers: it prepares its interval, gathers the keys, the
+/// values and their means, and its outputs are its interval's. An interval past the sequence is
+/// refused.
+#[test]
+fn a_member_of_an_all_gather_group_attends_its_interval_over_every_tile() {
+    let directory = tempfile::tempdir().unwrap();
+    let checkpoint = checkpoint(
+        directory.path(),
+        &[
+            ("attn.norm_q.weight", vec![128], sequence(128, 21)),
+            ("attn.norm_k.weight", vec![128], sequence(128, 22)),
+        ],
+    );
+    let loader = WeightLoader::meta(&checkpoint, None, None);
+    let layer =
+        VsaAttention::load(&vsa_config(64, 4, 128, true, 96), loader.root().pp("attn")).unwrap();
+
+    // Member 1 of 2 holds tiles 2 and 3 of a sequence of four.
+    let attend = |first: usize| {
+        let projection = || meta((2 * 64, 4 * 128), DType::BF16);
+        let factors = (
+            meta((2 * 64, 48), DType::F32),
+            meta((2 * 64, 48), DType::F32),
+        );
+        let table = |dtype| meta(4, dtype);
+
+        layer.attend_gathered(
+            (projection(), projection(), projection()),
+            Some((&factors.0, &factors.1)),
+            (&table(DType::U32), &table(DType::I32), &table(DType::U32)),
+            first,
+        )
+    };
+    let (branches, launches) = recorded_split(Some((1, 2)), || attend(2));
+    let (fine, compressed) = branches.unwrap();
+    assert_eq!(fine.dims(), [2 * 64, 4 * 128]);
+    assert_eq!(
+        compressed.dims(),
+        [4, 2, 128],
+        "one row per head and own query tile"
+    );
+    let operators = operators(&launches);
+    for operator in ["vsa_prepare_tiles", "vsa_select_tiles", "sparse_attention"] {
+        assert!(operators.contains(&operator), "{operators:?}");
+    }
+
+    let (past, _) = recorded_split(Some((1, 2)), || attend(3));
+    assert!(past.is_err());
+}
+
 /// Member 1 of 2 of a four-head, sixteen-wide attention reaching its heads by `projection`.
 fn ulysses(checkpoint: &Checkpoint, projection: Projection) -> UlyssesAttention {
     let loader = WeightLoader::meta(checkpoint, None, None);
@@ -797,6 +881,8 @@ fn ulysses(checkpoint: &Checkpoint, projection: Projection) -> UlyssesAttention 
             output: "to_out",
             split: Split { size: 2, rank: 1 },
             projection,
+            tensor: Split::WHOLE,
+            axis: 0,
         },
         loader.root().pp("attn"),
     )
@@ -882,5 +968,69 @@ fn a_sequence_split_projects_heads_by_its_mode_and_returns_rows() {
     let text = refused.err().unwrap().to_string();
     assert!(text.contains("loaded for 2 members"), "{text}");
     let (refused, _) = recorded(|| exchange.project(0, &meta((4, 32), DType::BF16)));
+    assert!(refused.is_err());
+}
+
+/// Inside a tensor split a member holds its share of its tensor rank's heads, exchanges along
+/// the sequence axis its config names, and its output projection sums its share of the
+/// contraction along the axis the caller's forward addresses: the tensor group's.
+#[test]
+fn a_sequence_split_inside_a_tensor_split_holds_its_share_of_the_tensor_rank_s_heads() {
+    let directory = tempfile::tempdir().unwrap();
+    let checkpoint = checkpoint(
+        directory.path(),
+        &[
+            ("attn.to_q.weight", vec![64, 32], sequence(64 * 32, 30)),
+            ("attn.to_out.weight", vec![32, 64], sequence(32 * 64, 31)),
+        ],
+    );
+    let loader = WeightLoader::meta(&checkpoint, None, None);
+    let member = UlyssesAttention::load(
+        &UlyssesAttentionConfig {
+            hidden: 32,
+            heads: 4,
+            head_dim: 16,
+            inputs: &["to_q"],
+            output: "to_out",
+            split: Split { size: 2, rank: 1 },
+            projection: Projection::Exchange,
+            tensor: Split { size: 2, rank: 1 },
+            axis: 1,
+        },
+        loader.root().pp("attn"),
+    )
+    .unwrap();
+    assert_eq!(member.local_heads(), 1, "one head of the tensor rank's two");
+
+    // The tensor group is the first axis, the sequence group the second.
+    let context = ops::Context::meta(None);
+    context.set_axes(vec![(None, 0, 2), (None, 1, 2)]).unwrap();
+    context.record_launches();
+    let _guard = context.enter();
+
+    // Four own rows of a sequence of eight, one head of sixteen channels from each member.
+    let projected = member.project(0, &meta((4, 32), DType::BF16)).unwrap();
+    assert_eq!(projected.dims(), [8, 16]);
+
+    // The return: the exchange along the sequence axis, then the projection of the tensor
+    // rank's 32 channels, reduced along the tensor axis.
+    let returned = member.return_rows(&meta((8, 16), DType::BF16)).unwrap();
+    assert_eq!(returned.dims(), [4, 32]);
+
+    // Heads a tensor split and a sequence split do not divide are refused.
+    let refused = UlyssesAttention::load(
+        &UlyssesAttentionConfig {
+            hidden: 32,
+            heads: 4,
+            head_dim: 16,
+            inputs: &["to_q"],
+            output: "to_out",
+            split: Split { size: 4, rank: 0 },
+            projection: Projection::Exchange,
+            tensor: Split { size: 2, rank: 0 },
+            axis: 1,
+        },
+        loader.root().pp("attn"),
+    );
     assert!(refused.is_err());
 }

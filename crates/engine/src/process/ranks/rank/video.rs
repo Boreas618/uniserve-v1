@@ -21,9 +21,12 @@
 //!
 //! **Sizes.** A rank of the group that denoises states its group's captured request shapes with the
 //! bytes of a slot's trajectory and of a block of each product kind there (`Capacity::media_bytes`,
-//! in `crate::batch::product::KINDS` order), from its denoiser's shapes and its decoders, which
-//! that group therefore holds. The session sizes every rank's product buffer and its host regions
-//! from them (`crate::process::ranks::layout`).
+//! in `crate::batch::product::KINDS` order), from its denoiser's shapes and the decoders'
+//! declarations, and a decoding rank buckets by the denoiser's layouts of the served requests.
+//! Neither needs its share to hold the stage it reads: the meta load its profile run reads holds
+//! the deployment's denoiser and decoders beside its share ([`ModelRunner::load_profiled`]), and
+//! its device load its share alone. The session sizes every rank's product buffer and its host
+//! regions from them (`crate::process::ranks::layout`).
 
 use std::collections::BTreeSet;
 use std::sync::Arc;
@@ -135,10 +138,10 @@ pub(crate) fn boxed(
 pub(crate) struct VideoRank {
     /// The stages the rank's group places, split as its blocks state.
     pub(crate) model: Arc<dyn VideoModel>,
-    /// The text encoder's tensor group and the denoiser's sequence group; `None` for a group of
-    /// one and on the meta device.
+    /// The text encoder's tensor group, and the denoiser's group along each axis of its
+    /// partition ([`DENOISER_AXES`]); `None` for a group of one and on the meta device.
     pub(crate) tensor: Option<Arc<ops::Group>>,
-    pub(crate) sequence: Option<Arc<ops::Group>>,
+    pub(crate) denoiser: DenoiserGroups,
     /// The communicator of the ranks a video decode round is dealt to, over which they pass the
     /// splice tails between consecutive shares, from the rank's load until its video decoder
     /// takes it; `None` for a round of one rank, on a rank that decodes no video and on the meta
@@ -155,6 +158,11 @@ pub(crate) struct VideoRank {
     /// The units of the longest timeline the deployment serves: the splice tails a request
     /// declares. 0 on a rank that does not denoise.
     pub(crate) units: u32,
+    /// On a rank that denoises or decodes: the requests the deployment captures its denoiser
+    /// for, each with the denoiser's layout of it, as the profile's meta load states them
+    /// ([`ModelRunner::load_profiled`]); the rank's decoders bucket by them whether or not its
+    /// share holds the denoiser. Empty on any other rank.
+    pub(crate) laid: Vec<(VideoRequest, Layout)>,
     /// On a rank that denoises: the trajectory class's `tensors` and `encoding` digests, and the
     /// pages of its host latent region.
     pub(crate) trajectory: Option<([u8; 32], [u8; 32], BankPages)>,
@@ -274,14 +282,41 @@ impl ModelRunner {
     ///
     /// The checkpoint's or the family's refusal, or a split the deployment's groups do not state.
     pub(crate) fn load_video(&self, weights: Weights<'_>) -> Result<Arc<dyn VideoModel>> {
+        self.load_stages(weights, false)
+    }
+
+    /// The meta load a rank's profile run reads (steps 4-8): its share of the pipeline, and on a
+    /// rank that denoises or decodes the stages whose declarations size what it computes,
+    /// wherever the deployment places them ([`Self::profiled_stages`]). Nothing of a meta load
+    /// computes or takes device memory, and the rank's device load holds its share alone.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::load_video`].
+    pub(crate) fn load_profiled(&self) -> Result<Arc<dyn VideoModel>> {
+        self.load_stages(Weights::Meta, true)
+    }
+
+    /// The stages of the video pipeline `sized` names ([`Self::profiled_stages`] when it holds,
+    /// the rank's share otherwise), split as the group's blocks state, their weights reached
+    /// through `weights`.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::load_video`].
+    fn load_stages(&self, weights: Weights<'_>, sized: bool) -> Result<Arc<dyn VideoModel>> {
         let opened = self.open_video_checkpoint()?;
         let checkpoint = self.open_video_family(&opened)?;
-        let (sequence, tensor) = self.video_split(&*checkpoint)?;
+        let (denoiser, tensor) = self.video_split(&*checkpoint)?;
+        let stages = match sized {
+            true => self.profiled_stages(checkpoint.denoisers())?,
+            false => self.stages()?,
+        };
 
         let mut loader = weights.loader(&opened);
         let placement = VideoPlacement {
-            stages: self.stages()?,
-            sequence,
+            stages,
+            denoiser,
             tensor,
             dtype: self.dtype(),
             serving: self.video_serving()?,
@@ -289,10 +324,48 @@ impl ModelRunner {
         Ok(checkpoint.load(&opened, &mut loader, &placement)?)
     }
 
+    /// The stages a rank's profile run loads: those its group places on it ([`Self::stages`]),
+    /// and on a rank that denoises or decodes the stages whose declarations size what it
+    /// computes, wherever the deployment places them: the deployment's denoiser, one of
+    /// `denoisers`, whose layouts of the served requests a decoder's buckets follow, and the two
+    /// decoders, whose rasters, splices and waveforms a denoising rank sizes the decoded products
+    /// by (`Capacity::media_bytes`). `None` when the deployment places the whole pipeline.
+    ///
+    /// # Errors
+    ///
+    /// A rank its group does not place.
+    fn profiled_stages(&self, denoisers: &[&str]) -> Result<Option<BTreeSet<String>>> {
+        let Some(mut stages) = self.stages()? else {
+            return Ok(None);
+        };
+        let sizes = self.media_phases()?.iter().any(|phase| {
+            matches!(
+                phase,
+                Phase::Denoise | Phase::VideoDecode | Phase::AudioDecode
+            )
+        });
+        if !sizes {
+            return Ok(Some(stages));
+        }
+
+        let groups = &self.engine_config().parallel.worker_groups;
+        let network = denoisers
+            .iter()
+            .find(|name| groups.iter().any(|group| group.blocks.contains_key(**name)));
+        stages.extend(network.map(|name| (*name).to_owned()));
+        stages.extend([Stage::VideoDecoder.name(), Stage::AudioDecoder.name()].map(str::to_owned));
+        Ok(Some(stages))
+    }
+
     /// The stages this rank's group places on it: those of the group's blocks that hold the
     /// rank's position (a block that states no ranks holds every one); `None` when the deployment
     /// places the whole model. A rank outside a block, such as a denoising rank beside a text
     /// encoder split over fewer ranks, loads none of that block's stage.
+    ///
+    /// A denoising rank also holds the condition encoders whenever the deployment places them
+    /// (the latent encoder's block, in any group and on any ranks): its latent preparation
+    /// encodes its requests' conditions (`specs/engine-worker-port.md` §5, D1), whichever ranks
+    /// the block names.
     ///
     /// # Errors
     ///
@@ -306,7 +379,21 @@ impl ModelRunner {
             .blocks
             .iter()
             .filter(|(_, block)| block.ranks.is_empty() || block.ranks.contains(&position));
-        Ok(Some(held.map(|(name, _)| name.clone()).collect()))
+        let mut stages: BTreeSet<String> = held.map(|(name, _)| name.clone()).collect();
+
+        let denoises = [Stage::Transformer, Stage::TransformerRef]
+            .iter()
+            .any(|stage| stages.contains(stage.name()));
+        let encoder = Stage::LatentEncoder.name();
+        let groups = &self.engine_config().parallel.worker_groups;
+        if denoises
+            && groups
+                .iter()
+                .any(|group| group.blocks.contains_key(encoder))
+        {
+            stages.insert(encoder.to_owned());
+        }
+        Ok(Some(stages))
     }
 
     /// The deployment's configuration of this rank's worker group.
@@ -350,74 +437,67 @@ impl ModelRunner {
     }
 
     /// The parallel groups of the deployment's media groups over the process's host group, whose
-    /// members are the deployment's ranks: the text encoders' tensor groups, the denoisers'
-    /// sequence groups and the video decoders' ranks, which pass a round's splice tails between
-    /// them (`crate::runner::decoder`), each a block's ranks in the order the block states them
-    /// (any positions of its worker group, the block's rank `r` being its `r`-th), with this
-    /// rank's place among them. Every rank forms all three, in this order, so every member of the
-    /// host group takes part in every group's id broadcast.
+    /// members are the deployment's ranks: the text encoders' tensor groups; the denoisers'
+    /// groups along each axis of their partition ([`DENOISER_AXES`], `nn::family::ULYSSES_AXIS`
+    /// and after), each a fiber of the denoiser block's places along that degree
+    /// (`nn::family::DenoiserSplit` orders them); and the video decoders' ranks, which pass a
+    /// round's splice tails between them (`crate::runner::decoder`). A block's ranks are any
+    /// positions of its worker group, the block's rank `r` being its `r`-th, and a group lists
+    /// its members in the order of their coordinate. Each kind holds this rank's place among
+    /// its groups. Every rank forms all six kinds, in this order, so every member of the host
+    /// group takes part in every group's id broadcast.
     ///
     /// # Errors
     ///
-    /// A split block that states another number of ranks than its parallel size, or a rank twice.
-    pub(crate) fn media_collectives(&self) -> Result<[super::Collective; 3]> {
+    /// A split block that states another number of ranks than its parallel degrees' product, or
+    /// a rank twice.
+    pub(crate) fn media_collectives(&self) -> Result<[super::Collective; 6]> {
         let groups = &self.engine_config().parallel.worker_groups;
         let firsts = WorkerGroupConfig::first_ranks(groups);
         let text = Stage::TextEncoder.name();
+        let denoisers = [Stage::Transformer.name(), Stage::TransformerRef.name()];
+        let own = (|| Some((self.worker_group()?, self.position().ok()?)))();
 
-        let [mut tensor, mut sequence, mut decoder] = [(); 3].map(|()| super::Collective {
+        let mut kinds: [super::Collective; 6] = std::array::from_fn(|_| super::Collective {
             groups: Vec::new(),
             member: None,
         });
         for (first, group) in firsts.iter().zip(groups) {
             for (name, block) in &group.blocks {
-                let (collective, size) = if name == text {
-                    (&mut tensor, block.tensor_parallel_size)
+                // Each kind's members as places of the block: one list per group of the kind.
+                let (kind, fibers) = if name == text {
+                    let size = block.tensor_parallel_size;
+                    if size > 1 && block.ranks.len() != size {
+                        bail!(
+                            "block {name} of worker group {} splits over its ranks {:?}, which \
+                             are not {size} distinct ranks of the group",
+                            group.id,
+                            block.ranks
+                        );
+                    }
+                    (0, vec![(0..size).collect::<Vec<_>>()])
                 } else if name == VIDEO_DECODER_BLOCK {
                     // Every rank a decode round is dealt to (`ModelRunner::round`).
-                    (&mut decoder, block.ranks.len())
-                } else {
-                    let size = block.sequence_parallel.size().map_err(|refusal| {
-                        anyhow::anyhow!("block {name} of worker group {}: {}", group.id, refusal.0)
-                    })?;
-                    (&mut sequence, size)
-                };
-                if size <= 1 {
-                    continue;
-                }
-
-                // A block's ranks form its group in the order the block states them, whichever
-                // positions of the worker group they are.
-                if block.ranks.is_empty() {
-                    continue;
-                }
-                let distinct: BTreeSet<usize> = block.ranks.iter().copied().collect();
-                if distinct.len() != block.ranks.len() || block.ranks.len() != size {
-                    bail!(
-                        "block {name} of worker group {} splits over its ranks {:?}, which are not \
-                         {size} distinct ranks of the group",
-                        group.id,
-                        block.ranks
-                    );
-                }
-
-                let index = collective.groups.len();
-                collective.groups.push(
-                    block
-                        .ranks
-                        .iter()
-                        .map(|position| first + position)
-                        .collect(),
-                );
-                if group.id.0 == self.group {
-                    let position = self.position()?;
-                    if let Some(place) = block.ranks.iter().position(|held| *held == position) {
-                        collective.member = Some((index, place));
+                    (5, vec![(0..block.ranks.len()).collect()])
+                } else if denoisers.contains(&name.as_str()) {
+                    for (axis, fibers) in denoiser_fibers(block)
+                        .map_err(|refusal| {
+                            anyhow::anyhow!("block {name} of worker group {}: {refusal}", group.id)
+                        })?
+                        .into_iter()
+                        .enumerate()
+                    {
+                        let collective = &mut kinds[1 + axis];
+                        add_fibers(collective, (group, *first, block), fibers, own)?;
                     }
-                }
+                    continue;
+                } else {
+                    continue;
+                };
+                add_fibers(&mut kinds[kind], (group, *first, block), fibers, own)?;
             }
         }
-        Ok([tensor, sequence, decoder])
+        Ok(kinds)
     }
 
     /// How a video decode round is dealt to the ranks of the group that decodes this rank's
@@ -589,16 +669,18 @@ impl ModelRunner {
 
     /// The configs of the rank's video decoder and its track's decoder of `model`, each `None`
     /// when the rank serves no such decode: one clip bucket of the decoder's window per canvas
-    /// the deployment serves, with the timelines of the denoiser's layouts, dealt as the
-    /// deployment's rounds; one track bucket per timeline whose layout carries a track.
+    /// the deployment serves, with the timelines of `laid`, the served requests with the
+    /// denoiser's layouts of them ([`VideoRank::laid`]), dealt as the deployment's rounds; one
+    /// track bucket per timeline whose layout carries a track.
     ///
     /// # Errors
     ///
-    /// A layout the denoiser refuses, a deployment the pipeline serves no request of, or a
-    /// pipeline whose decoders read latents in another element type than the trajectory's.
+    /// A decoding rank given no layout, or a pipeline whose decoders read latents in another
+    /// element type than the trajectory's.
     pub(crate) fn decoder_configs(
         &self,
         model: &dyn VideoModel,
+        laid: &[(VideoRequest, Layout)],
         classes: &[u8; 10],
     ) -> Result<(Option<DecoderConfig>, Option<DecoderConfig>)> {
         let phases = self.media_phases()?;
@@ -609,13 +691,15 @@ impl ModelRunner {
         if !video && !audio {
             return Ok((None, None));
         }
+        if laid.is_empty() {
+            bail!("the rank decodes and holds no layout of the requests the deployment serves");
+        }
 
         check_latents(model)?;
-        let laid = laid_out(model, &self.video_serving()?)?;
         let window = model.decode_window();
         let (mut clips, mut timelines, mut tracks) = (Vec::new(), Vec::new(), Vec::new());
         let mut served: Vec<u32> = Vec::new();
-        for (request, layout) in &laid {
+        for (request, layout) in laid {
             let clip = Bucket::clip(window, request.height, request.width);
             if !clips.contains(&clip) {
                 clips.push(clip);
@@ -720,10 +804,10 @@ impl ModelRunner {
     /// The runners of this rank's device blocks over `memory`, the rank's media memory, each over
     /// the graphs and stream `graphs` gives it for its id and its input bytes: on the meta device
     /// graphs that hold none, on a device its region of the graph pool. The text encoder computes
-    /// over the tensor group `tensor`, the denoiser over the sequence group `sequence`, each at
-    /// this rank's place (meta graphs take the split alone), and the video decoder passes its
-    /// rounds' tails over the communicator `decoder`. The media host is
-    /// [`ModelRunner::media_host`]'s.
+    /// over the tensor group `tensor`, the denoiser over its groups `denoiser` along each axis of
+    /// its partition, each at this rank's place (meta graphs take the splits alone), and the
+    /// video decoder passes its rounds' tails over the communicator `decoder`; the decoders
+    /// bucket by `laid` ([`VideoRank::laid`]). The media host is [`ModelRunner::media_host`]'s.
     ///
     /// # Errors
     ///
@@ -733,15 +817,15 @@ impl ModelRunner {
         model: &Arc<dyn VideoModel>,
         memory: &Arc<BufferMemory>,
         mut graphs: impl FnMut(RunnerId, u64) -> Result<(Graphs, Option<Stream>)>,
-        (tensor, sequence, decoder): (
+        (tensor, denoiser, decoder): (
             Option<Arc<ops::Group>>,
-            Option<Arc<ops::Group>>,
+            DenoiserGroups,
             Option<Communicator>,
         ),
-        classes: &[u8; 10],
+        (laid, classes): (&[(VideoRequest, Layout)], &[u8; 10]),
     ) -> Result<DeviceRunners> {
         let phases = self.media_phases()?;
-        let shape = self.parallel_shape()?;
+        let (partition, text_split) = self.partition()?;
 
         let encoder = if phases.contains(&Phase::TextEncode) {
             let text = model.text_encoder().context(
@@ -749,7 +833,7 @@ impl ModelRunner {
             )?;
             let config = self.encoder_config(model.as_ref(), classes)?;
             let (graphs, stream) = graphs(ENCODER, EncoderRunner::input_bytes(&config))?;
-            let (rank, ranks) = super::split(shape.tensor_rank, shape.tensor);
+            let (rank, ranks) = super::split(text_split.rank as usize, text_split.size as usize);
             graphs.set_group(tensor, rank, ranks)?;
             let runner = EncoderRunner::new(text, config, graphs, stream, Arc::clone(memory))
                 .context("building the rank's text encoder")?;
@@ -764,8 +848,23 @@ impl ModelRunner {
                 .context("the rank denoises and its share of the checkpoint holds no denoiser")?;
             let config = self.denoiser_config(model.as_ref(), classes)?;
             let (graphs, stream) = graphs(DENOISER, 0)?;
-            let (rank, ranks) = super::split(shape.sequence_rank, shape.sequence);
-            graphs.set_group(sequence, rank, ranks)?;
+            // The axes in the order the model addresses them (`nn::family::ULYSSES_AXIS` and
+            // after).
+            let places = [
+                partition.ulysses.split,
+                partition.gather,
+                partition.tensor,
+                partition.layers,
+            ];
+            let axes = denoiser
+                .into_iter()
+                .zip(places)
+                .map(|(group, place)| {
+                    let (rank, ranks) = super::split(place.rank as usize, place.size as usize);
+                    (group, rank, ranks)
+                })
+                .collect();
+            graphs.set_axes(axes)?;
             let runner = DenoiserRunner::new(network, config, graphs, stream, Arc::clone(memory))
                 .context("building the rank's denoiser")?;
             Some(runner)
@@ -773,7 +872,7 @@ impl ModelRunner {
             None
         };
 
-        let (video, audio) = self.decoder_configs(model.as_ref(), classes)?;
+        let (video, audio) = self.decoder_configs(model.as_ref(), laid, classes)?;
         let video = match video {
             Some(config) => {
                 let network = model.video_decoder().context(
@@ -855,25 +954,38 @@ impl ModelRunner {
     }
 
     /// Profiles a media rank on the meta device (steps 7-8 of `specs/engine-worker-port.md`
-    /// §1.1): its runners over meta graphs and a media memory that holds no device, and each
-    /// runner's profile run. Returns the rank as its opening and its statement read it, with the
-    /// parallel groups `groups` it computes over: the runners' peaks and buffers, a slot's row,
-    /// on a denoising rank the trajectory class and its group's product sizes, and the rank's
-    /// capacity with the media pool's `pool_tasks`; and every kernel the runners launch.
+    /// §1.1) over `model`, the meta load of its profile ([`ModelRunner::load_profiled`]): its
+    /// runners over meta graphs and a media memory that holds no device, and each runner's
+    /// profile run. Returns the rank as its opening and its statement read it, with the parallel
+    /// groups `groups` it computes over: the runners' peaks and buffers, a slot's row, the
+    /// layouts its decoders bucket by, on a denoising rank the trajectory class and its group's
+    /// product sizes, and the rank's capacity with the media pool's `pool_tasks`; and every
+    /// kernel the runners launch.
     ///
     /// # Errors
     ///
-    /// What a runner or a forward of a profile run refuses, or a group that denoises and holds
-    /// no decoder of the products it sizes.
+    /// What a runner or a forward of a profile run refuses, or a deployment that places no
+    /// denoiser or decoder whose declarations the rank sizes by.
     pub(crate) fn profile_media(
         &self,
         model: Arc<dyn VideoModel>,
-        groups: (Option<Arc<ops::Group>>, Option<Arc<ops::Group>>),
+        groups: (Option<Arc<ops::Group>>, DenoiserGroups),
         pool_tasks: u32,
     ) -> Result<(VideoRank, Keys)> {
         let classes = product_classes(0);
         let slots = self.slots();
         let row = self.row_bytes(model.as_ref(), &classes)?;
+
+        // The served requests' layouts, which a decoding rank buckets by and a denoising rank
+        // sizes its products by.
+        let phases = self.media_phases()?;
+        let sizes = [Phase::Denoise, Phase::VideoDecode, Phase::AudioDecode]
+            .iter()
+            .any(|phase| phases.contains(phase));
+        let laid = match sizes {
+            true => laid_out(model.as_ref(), &self.video_serving()?)?,
+            false => Vec::new(),
+        };
 
         // The region numbers the profile's memory states are none of a forward's concern: the
         // session's answer numbers the rank's memory when it opens.
@@ -883,8 +995,8 @@ impl ModelRunner {
             &model,
             &memory,
             |_, inputs| Ok((Graphs::meta(Arc::clone(&unserved), inputs), None)),
-            (None, None, None),
-            &classes,
+            (None, Default::default(), None),
+            (&laid, &classes),
         )?;
 
         // What the runners hold beside their regions, and on a denoising rank the trajectory
@@ -903,7 +1015,7 @@ impl ModelRunner {
             let shapes = denoiser.media_shapes()?;
             let largest = shapes.iter().map(|(_, bytes, _)| *bytes).max().unwrap_or(0);
             trajectory = Some((tensors, encoding, latent_pages(largest, slots)?));
-            (media_bytes, units) = self.media_bytes(model.as_ref(), &shapes)?;
+            (media_bytes, units) = self.media_bytes(model.as_ref(), &shapes, &laid)?;
         }
 
         let runners = boxed((encoder, denoiser, video, audio));
@@ -929,18 +1041,19 @@ impl ModelRunner {
         }
 
         let capacity = self.media_capacity(model.as_ref(), &runners, media_bytes, pool_tasks)?;
-        let (tensor, sequence) = groups;
+        let (tensor, denoiser) = groups;
         let group_slots = vec![slots; self.engine_config().parallel.worker_groups.len()];
         Ok((
             VideoRank {
                 model,
                 tensor,
-                sequence,
+                denoiser,
                 decoder: None,
                 peaks,
                 buffers,
                 row,
                 units,
+                laid,
                 trajectory,
                 description,
                 capacity,
@@ -978,7 +1091,9 @@ impl ModelRunner {
     /// Per captured request shape of the rank's denoiser (`DenoiserRunner::media_shapes`): the
     /// shape, the bytes of a slot's trajectory, and the bytes of a block of each product kind in
     /// `crate::batch::product::KINDS` order (`Capacity::media_bytes`); and the most units a
-    /// timeline of the deployment has, the splice tails a request declares.
+    /// timeline of the deployment has, the splice tails a request declares. `model` is the
+    /// profile's meta load, which holds the decoders wherever the deployment places them
+    /// ([`ModelRunner::load_profiled`]), and `laid` the served requests with their layouts.
     ///
     /// - The condition pixels, samples and vision pixels of a shape with condition rows: the
     ///   bounds the model states of one request's conditions (`ConditionBounds`), as the media
@@ -996,9 +1111,9 @@ impl ModelRunner {
     ///
     /// # Errors
     ///
-    /// A denoising group that holds no video decoder, or no audio decoder for a layout with a
-    /// track; a pipeline whose decoders read latents in another element type than the
-    /// trajectory's; a shape no candidate of the deployment lays out.
+    /// A pipeline with no video decoder, or with no audio decoder for a layout with a track; a
+    /// pipeline whose decoders read latents in another element type than the trajectory's; a
+    /// shape no candidate of the deployment lays out.
     #[expect(
         clippy::type_complexity,
         reason = "`Capacity::media_bytes` as the scheduler reads it, and the tails a request declares"
@@ -1007,10 +1122,11 @@ impl ModelRunner {
         &self,
         model: &dyn VideoModel,
         shapes: &[(Shape, u64, [u64; 2])],
+        laid: &[(VideoRequest, Layout)],
     ) -> Result<(Vec<(Shape, u64, Vec<u64>)>, u32)> {
         let decoder = model.video_decoder().context(
-            "the group that denoises sizes the decoded products, and its share of the checkpoint \
-             holds no video decoder",
+            "the denoising rank sizes the decoded products, and the deployment places no video \
+             decoder",
         )?;
         check_latents(model)?;
         let track = model.audio_decoder();
@@ -1018,7 +1134,6 @@ impl ModelRunner {
         let bounds = model.condition_bounds();
         let format = model.format().ok();
         let splicer = model.splicer();
-        let laid = laid_out(model, &self.video_serving()?)?;
         let stack = element(self.dtype())?;
         let raster = element(decoder.element_type())?;
         let window = u64::from(model.decode_window());
@@ -1091,8 +1206,8 @@ impl ModelRunner {
                     samples * u64::from(channels) * 2
                 }
                 (Some(_), None) => bail!(
-                    "the denoiser's layouts carry a track and the group that denoises holds no \
-                     audio decoder"
+                    "the denoiser's layouts carry a track and the deployment places no audio \
+                     decoder"
                 ),
                 (None, _) => 0,
             };
@@ -1341,6 +1456,95 @@ pub(crate) fn served_phases(group: &WorkerGroupConfig, position: usize) -> Vec<P
     }
     phases.sort_by_key(|phase| phase.index());
     phases
+}
+
+/// The axes of a denoiser's partition whose groups a denoising rank's runner computes over, in
+/// the order `nn::family::DenoiserSplit` and the runner's graphs state them: the Ulysses group,
+/// the all-gather group, the tensor group and the stages of the layer split.
+pub(crate) const DENOISER_AXES: usize = 4;
+
+/// A denoising rank's group along each axis of its denoiser's partition ([`DENOISER_AXES`]),
+/// `None` on an axis of one rank and on the meta device.
+pub(crate) type DenoiserGroups = [Option<Arc<ops::Group>>; DENOISER_AXES];
+
+/// The groups of a denoiser block along each axis of its partition ([`DENOISER_AXES`]), as
+/// places of the block: per axis, one list per fiber along it, its members in the order of their
+/// coordinate in the block's order (`placement::denoiser_axes`).
+///
+/// # Errors
+///
+/// A degree of zero, or a block whose ranks do not number its degrees' product.
+fn denoiser_fibers(block: &proto::config::BlockConfig) -> Result<[Vec<Vec<usize>>; DENOISER_AXES]> {
+    // Each axis's degree and the distance between two consecutive coordinates of it.
+    let (degrees, strides) = super::placement::denoiser_axes(block);
+    let [ulysses, gather, tensor, layers] = degrees;
+    let width: usize = degrees.iter().product();
+    if degrees.contains(&0) || width != block.ranks.len() {
+        bail!(
+            "its {} ranks are not the product of its degrees (Ulysses {ulysses}, all-gather \
+             {gather}, tensor {tensor}, layers {layers})",
+            block.ranks.len()
+        );
+    }
+
+    Ok(std::array::from_fn(|axis| {
+        let (degree, stride) = (degrees[axis], strides[axis]);
+        if degree <= 1 {
+            return Vec::new();
+        }
+        // A fiber starts at every place whose coordinate on the axis is zero.
+        (0..width)
+            .filter(|place| (place / stride) % degree == 0)
+            .map(|start| (0..degree).map(|step| start + step * stride).collect())
+            .collect()
+    }))
+}
+
+/// Adds the groups `fibers` of `block` of worker group `group`, whose first rank is `first`, to
+/// `collective`: each fiber's members as places of the block, in its order, mapped to the
+/// deployment's ranks; and this rank's place when `own` (its group and its position there) is a
+/// member. A fiber of one member forms no group.
+///
+/// # Errors
+///
+/// A block whose ranks repeat, or a place past them.
+fn add_fibers(
+    collective: &mut super::Collective,
+    (group, first, block): (&WorkerGroupConfig, usize, &proto::config::BlockConfig),
+    fibers: Vec<Vec<usize>>,
+    own: Option<(&WorkerGroupConfig, usize)>,
+) -> Result<()> {
+    let distinct: BTreeSet<usize> = block.ranks.iter().copied().collect();
+    if distinct.len() != block.ranks.len() {
+        bail!(
+            "a block of worker group {} lists a rank twice: {:?}",
+            group.id,
+            block.ranks
+        );
+    }
+
+    for fiber in fibers {
+        if fiber.len() <= 1 {
+            continue;
+        }
+        let positions = fiber
+            .iter()
+            .map(|place| block.ranks.get(*place).copied())
+            .collect::<Option<Vec<usize>>>()
+            .with_context(|| format!("a place past the ranks {:?}", block.ranks))?;
+
+        let index = collective.groups.len();
+        collective
+            .groups
+            .push(positions.iter().map(|position| first + position).collect());
+        if let Some((own, position)) = own
+            && own.id == group.id
+            && let Some(place) = positions.iter().position(|held| *held == position)
+        {
+            collective.member = Some((index, place));
+        }
+    }
+    Ok(())
 }
 
 /// The product kinds the rank at `position` of `group` backs, as indices into

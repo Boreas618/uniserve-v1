@@ -20,10 +20,10 @@
 //! inputs of the bucket that holds the prompt.
 //!
 //! The runner states its eager buckets ([`Runner::eager_buckets`]): the extent of each one-row
-//! bucket that a prompt with vision blocks the deployment admits fits
-//! ([`EncoderConfig::warm`]), under [`Variant::ConditionEncode`]. A profile run of one encodes
-//! every such prompt that fits it, its ids padded to the bucket's tokens, over patch rows of its
-//! grids, so the runner's region holds the eager vision encodes and every generation resolves
+//! bucket that a prompt of [`EncoderConfig::warm`] fits, under [`Variant::ConditionEncode`]. A
+//! profile run of one encodes every such prompt that fits it, its ids padded to the bucket's
+//! tokens, over patch rows of its grids, so the runner's region and its input buffer hold the
+//! eager vision encodes of every prompt the deployment admits and every generation resolves
 //! their kernels.
 //!
 //! An encode reads no cache and samples no token: its batch's slot mapping writes nothing, and
@@ -86,9 +86,10 @@ pub(crate) struct EncoderConfig {
     pub holder: u32,
     /// The class of the vision pixels product, which a prompt with vision blocks reads.
     pub pixels: u8,
-    /// The prompts with vision blocks the deployment admits whose grids it fixes
-    /// (`nn::family::VideoModel::warm_prompts`): each prompt's grids and the token ids that
-    /// present them, which its eager encodes are profiled over. Empty for an encoder that takes
+    /// The prompts with vision blocks its eager encodes are profiled over
+    /// (`nn::family::VideoModel::warm_prompts`): those the deployment admits whose grids it
+    /// fixes, and those that bound the presentations whose grids follow the client's media;
+    /// each prompt's grids and the token ids that present them. Empty for an encoder that takes
     /// no image.
     pub warm: Vec<(Vec<[u32; 3]>, Vec<u32>)>,
 }
@@ -226,7 +227,7 @@ impl EncoderRunner {
         self.graphs.input(self.offsets[column], elements, dtype)
     }
 
-    /// The admitted prompts with vision blocks whose ids `bucket`'s tokens hold.
+    /// The prompts of the warm set whose ids `bucket`'s tokens hold.
     fn warm_fitting(&self, bucket: &Bucket) -> Vec<&(Vec<[u32; 3]>, Vec<u32>)> {
         self.config
             .warm
@@ -577,8 +578,8 @@ impl Runner for EncoderRunner {
         let ids = self.column(IDS, tokens, DType::U32)?;
         let images = self.images.borrow();
 
-        // A profile run of an eager bucket encodes every admitted prompt with vision blocks that
-        // fits it, over patch rows of its grids.
+        // A profile run of an eager bucket encodes every prompt of the warm set that fits it,
+        // over patch rows of its grids.
         if bucket.variant == Variant::ConditionEncode && images.is_empty() {
             let mut out = Vec::new();
             for (grids, warm) in self.warm_fitting(bucket) {

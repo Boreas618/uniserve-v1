@@ -59,7 +59,7 @@
 pub(crate) mod rank;
 
 use std::net::TcpListener;
-use std::sync::{Arc, Mutex, OnceLock, Weak};
+use std::sync::{Arc, Barrier, Mutex, OnceLock, Weak};
 
 use crate::batch::Capacity;
 use crate::batch::product;
@@ -105,8 +105,8 @@ use crate::process::ranks::rank::text::{
     Keys, encoder_class, encodes, feature_tensors, keys, profile, vision_runner,
 };
 use crate::process::ranks::rank::video::{
-    MediaRank, VideoRank, boxed, group_phases, held_kinds, latent_pages, product_classes,
-    product_kind, product_ranks, served_phases, slot_pages,
+    DenoiserGroups, MediaRank, VideoRank, boxed, group_phases, held_kinds, latent_pages,
+    product_classes, product_kind, product_ranks, served_phases, slot_pages,
 };
 use crate::process::start::standby;
 
@@ -434,11 +434,11 @@ pub(crate) fn load_ranks(
     };
     // One join target list for the union, which `spawn` fills with its members' workers.
     let targets: Members = Arc::default();
-    let meetings = pipeline_meetings(&model_runners);
+    let meetings = meetings(&model_runners)?;
 
     let mut ranks = std::thread::scope(|scope| {
         let mut handles = Vec::with_capacity(count);
-        for (index, model_runner) in model_runners.into_iter().enumerate() {
+        for (index, (model_runner, meets)) in model_runners.into_iter().zip(meetings).enumerate() {
             // Member 0 serves the rendezvous on the listener.
             let member = member(index, &model_runner);
             let meeting = (address.clone(), listener.take_if(|_| member == 0));
@@ -449,10 +449,6 @@ pub(crate) fn load_ranks(
                     Arc::clone(&targets),
                 )
             });
-            let meet = meetings
-                .iter()
-                .find(|(group, _)| group == model_runner.group())
-                .map(|(_, meet)| Arc::clone(meet));
             let handle = std::thread::Builder::new()
                 .name(format!("rank-load-{index}"))
                 .spawn_scoped(scope, move || {
@@ -461,7 +457,7 @@ pub(crate) fn load_ranks(
                         meeting,
                         (member, members),
                         union,
-                        meet,
+                        meets,
                         backing,
                     )
                 })
@@ -552,14 +548,14 @@ fn loopback(what: &str) -> Result<(String, TcpListener)> {
 /// Loads one rank onto `backing` to its division: it joins the process's host group at
 /// `meeting` as `member` of `members` and, in an expert union, the union's host group, then runs
 /// steps 1-15 of the rank's start (module documentation); a rank of a media deployment runs
-/// [`load_video_rank`] once it joined the host group. `meet` is the host meeting of the rank's
-/// pipeline group ([`pipeline_meetings`]), `None` for a rank of no pipeline.
+/// [`load_video_rank`] once it joined the host group. `meets` holds the host meeting of each of
+/// the rank's collective groups that meets ([`meetings`]).
 fn load_rank(
     model_runner: ModelRunner,
     meeting: (String, Option<TcpListener>),
     (member, members): (usize, usize),
     union: Option<(String, Option<TcpListener>, Members)>,
-    meet: Option<Meet>,
+    meets: Vec<Option<Meet>>,
     backing: Backing<'_>,
 ) -> Result<LoadedRank> {
     let device = *model_runner
@@ -592,7 +588,7 @@ fn load_rank(
     let host = HostGroup::connect(&address, listener, member, members, STARTUP_TIMEOUT)
         .context("joining this process's ranks")?;
     if model_runner.is_video() {
-        return load_video_rank(model_runner, device, client, host, backing);
+        return load_video_rank(model_runner, device, client, host, meets, backing);
     }
     let union = match union {
         Some((address, listener, targets)) => {
@@ -615,6 +611,7 @@ fn load_rank(
     // Step 3: the worker group's communicator, opened before any device measurement because
     // NCCL keeps device buffers. A text rank's parallel group is its worker group's ranks in their
     // parallel order, members of the host group among the deployment's groups.
+    let meet = meets.into_iter().next().flatten();
     let group = match model_runner.parallel_groups()? {
         Some(collective) => group_over(&host, device, &collective, client.is_some(), meet)
             .context("forming the worker group's communicator")?,
@@ -884,12 +881,14 @@ fn encoder_bytes(model: &dyn TextModel, rows: u32) -> Result<u64> {
 /// Loads a rank of a media deployment onto `backing` (steps 3-10), over `client`, its Storage
 /// Server client (`None` on the meta device), on `device`:
 ///
-/// - the text encoders' tensor groups, the denoisers' sequence groups and the communicators of
-///   the video decoders' ranks over the process's host group `host`, each a block's ranks
-///   (`ModelRunner::media_collectives`);
-/// - the meta load of the stages its group places and its runners' profile run
+/// - the text encoders' tensor groups, the denoisers' groups along each axis of their partition
+///   and the communicators of the video decoders' ranks over the process's host group `host`,
+///   each of a block's ranks (`ModelRunner::media_collectives`), the text encoder's and the
+///   denoiser's meeting this process's ranks of each on the host over `meets` ([`meetings`]);
+/// - the meta load of the stages its group places, beside those whose declarations size what it
+///   computes (`ModelRunner::load_profiled`), and its runners' profile run
 ///   (`ModelRunner::profile_media`), which states their peaks, buffers and kernels, a slot's
-///   row and on a denoising rank the products' sizes;
+///   row, the layouts its decoders bucket by and on a denoising rank the products' sizes;
 /// - on a device, the generation its kernels resolve to and its weights, retained.
 ///
 /// A media rank keeps no cache, so its division waits for its opening, where the session states
@@ -900,25 +899,38 @@ fn load_video_rank(
     device: DeviceId,
     client: Option<Arc<StorageClient>>,
     host: HostGroup,
+    meets: Vec<Option<Meet>>,
     backing: Backing<'_>,
 ) -> Result<LoadedRank> {
     // Step 3: the parallel groups' communicators, opened before any device measurement because
-    // NCCL keeps device buffers. Every rank forms the three kinds, in this order.
-    let [tensor, sequence, decoder] = model_runner.media_collectives()?;
+    // NCCL keeps device buffers. Every rank forms the six kinds, in this order.
+    let [tensor, ulysses, gather, network, layers, decoder] = model_runner.media_collectives()?;
     let communicates = client.is_some();
-    let tensor = group_over(&host, device, &tensor, communicates, None)
+    let meet = |kind: usize| meets.get(kind).cloned().flatten();
+    let tensor = group_over(&host, device, &tensor, communicates, meet(0))
         .context("forming the text encoder's tensor group")?;
-    let sequence = group_over(&host, device, &sequence, communicates, None)
-        .context("forming the denoiser's sequence group")?;
+    let mut denoiser: DenoiserGroups = Default::default();
+    for (axis, (collective, what)) in [
+        (ulysses, "Ulysses"),
+        (gather, "all-gather"),
+        (network, "tensor"),
+        (layers, "layer"),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        denoiser[axis] = group_over(&host, device, &collective, communicates, meet(1 + axis))
+            .with_context(|| format!("forming the denoiser's {what} group"))?;
+    }
     let decoder = communicator_over(&host, device, &decoder, communicates)
         .context("forming the video decoder ranks' communicator")?;
 
     // Steps 4-8: the meta load and the runners' profile run.
     let meta = model_runner
-        .load_video(Weights::Meta)
+        .load_profiled()
         .context("loading the epoch's pipeline from its checkpoint's headers")?;
     let tasks = u32::try_from(media_tasks()).unwrap_or(u32::MAX);
-    let (mut video, keys) = model_runner.profile_media(meta, (tensor, sequence), tasks)?;
+    let (mut video, keys) = model_runner.profile_media(meta, (tensor, denoiser), tasks)?;
     video.host = Some(host);
     video.decoder = decoder;
 
@@ -1002,9 +1014,8 @@ fn join_hook(targets: Members, place: usize) -> JoinHook {
 /// for a group of one and for a start that `communicates` none. One that does not communicate
 /// states the split alone, which the runner's graphs take ([`Graphs::set_group`]).
 ///
-/// `meet` is how the group's members meet on the host before a broadcast outside a capture
-/// (`ops::Group::with_meet`): a pipeline group's, whose later stages would otherwise wait on their
-/// devices for a stage still issuing an eager forward; `None` for every other group.
+/// `meet` is how the group's ranks in this process meet before each collective launch outside a
+/// capture (`ops::Group::with_meet`, [`meetings`]); `None` for a group that does not meet.
 fn group_over(
     host: &HostGroup,
     device: DeviceId,
@@ -1025,25 +1036,82 @@ fn group_over(
         .transpose()
 }
 
-/// The host meeting of each pipeline group among `model_runners`, this process's ranks, by group:
-/// every rank of such a group is a thread of this process (`ModelRunner::ranks`), so its stages
-/// meet at a barrier of the group's ranks.
-fn pipeline_meetings(model_runners: &[ModelRunner]) -> Vec<(String, Meet)> {
-    let mut meetings: Vec<(String, Meet)> = Vec::new();
-    for model_runner in model_runners {
-        let group = model_runner.group();
-        if model_runner.pipeline_stages() <= 1 || meetings.iter().any(|(held, _)| held == group) {
-            continue;
-        }
+/// Per rank of `model_runners`, this process's, in their order: the host meeting of each of its
+/// collective groups that meets, in the order of [`meeting_groups`], which the rank's group of
+/// that kind takes (`ops::Group::with_meet`). A meeting is a barrier of the group's ranks in this
+/// process, shared by them; a group with no other rank here meets no one (`None`).
+///
+/// A group meets when one of its ranks' threads can need the process while a peer's device
+/// waits in an eager collective launch (`ops::collective`): a pipeline's stages, whose thread
+/// issues a whole stage of layers before the handoff the next stage's device waits in, and the
+/// ranks of a media rank's text encoder and denoiser, which warm up and prepare generations in
+/// eager forwards whose kernels' first uses take a lock of the whole process.
+///
+/// # Errors
+///
+/// As [`meeting_groups`].
+fn meetings(model_runners: &[ModelRunner]) -> Result<Vec<Vec<Option<Meet>>>> {
+    let groups = model_runners
+        .iter()
+        .map(meeting_groups)
+        .collect::<Result<Vec<_>>>()?;
 
-        let barrier = Arc::new(std::sync::Barrier::new(model_runner.world_size()));
-        let meet: Meet = Arc::new(move || {
-            barrier.wait();
-            Ok(())
-        });
-        meetings.push((group.to_owned(), meet));
+    let mut meetings: Vec<Vec<Option<Meet>>> =
+        groups.iter().map(|own| vec![None; own.len()]).collect();
+    for (index, own) in groups.iter().enumerate() {
+        for (kind, group) in own.iter().enumerate() {
+            // A group whose meeting an earlier rank of it formed already, or of no kind here.
+            if group.is_none() || meetings[index][kind].is_some() {
+                continue;
+            }
+            let local: Vec<usize> = (0..groups.len())
+                .filter(|other| groups[*other].get(kind) == Some(group))
+                .collect();
+            if local.len() <= 1 {
+                continue;
+            }
+
+            let barrier = Arc::new(Barrier::new(local.len()));
+            let meet: Meet = Arc::new(move || {
+                barrier.wait();
+                Ok(())
+            });
+            for member in local {
+                meetings[member][kind] = Some(Arc::clone(&meet));
+            }
+        }
     }
-    meetings
+    Ok(meetings)
+}
+
+/// The collective groups of `model_runner`'s rank that meet on the host ([`meetings`]), in the
+/// order the rank forms them, each by its index among the deployment's groups of its kind:
+///
+/// - for a text rank, its worker group when it is a pipeline's (`ModelRunner::parallel_groups`),
+///   whose stages are ranks of one process (`ModelRunner::placed`);
+/// - for a media rank, its text encoder's tensor group and its denoiser's group along each axis
+///   of its partition, in the order of `ModelRunner::media_collectives`.
+///
+/// `None` for a kind the rank is in no group of, or whose group does not meet.
+///
+/// # Errors
+///
+/// A deployment whose groups the rank cannot place itself in.
+fn meeting_groups(model_runner: &ModelRunner) -> Result<Vec<Option<usize>>> {
+    if model_runner.is_video() {
+        let [tensor, ulysses, gather, network, layers, _] = model_runner.media_collectives()?;
+        return Ok([tensor, ulysses, gather, network, layers]
+            .map(|collective| collective.member.map(|(group, _)| group))
+            .to_vec());
+    }
+
+    let pipeline = match model_runner.pipeline_stages() > 1 {
+        true => model_runner.parallel_groups()?,
+        false => None,
+    };
+    Ok(vec![pipeline.and_then(|collective| {
+        collective.member.map(|(group, _)| group)
+    })])
 }
 
 /// The communicator of the collective group of `collective` this rank is a member of, absent for
@@ -2053,14 +2121,33 @@ pub(crate) fn fit_media_slots(
     Ok(())
 }
 
+/// The graph and scratch pools of every rank of `ranks` on `device`: what a measurement of the
+/// process there takes out of NVML's figure (`binding::measure`).
+///
+/// # Errors
+///
+/// A rank with a pool that serves no device.
+fn pools_on(ranks: &[LoadedRank], device: DeviceId) -> Result<Vec<Arc<Mutex<GraphPool>>>> {
+    let mut pools = Vec::new();
+    for rank in ranks {
+        if let Some(pool) = &rank.pool
+            && rank.device()? == device
+        {
+            pools.push(Arc::clone(pool));
+        }
+    }
+    Ok(pools)
+}
+
 /// Keeps, once the media ranks of `ranks`, this process's, are warm, the request slots of each
 /// of their groups whose storages fit beside its ranks' warm processes, and gives the storages of
 /// the rest back (`specs/engine-worker-port.md` §1, "The process a division counts"): a rank warms
 /// up with the slots its division bounds ([`fit_media_slots`]), measured before the warm-up, and
 /// the warm-up adds instantiated graphs and library state to its process.
 ///
-/// Each rank of a group measures its process beside its pools and the Storage Server's storages
-/// (`division::process_bytes`), as its reservation in its GPU's quota will state it, and finds by
+/// Each rank of a group measures the process on its device beside the pools of every rank there
+/// and the Storage Server's storages (`division::process_bytes`), as the process's reservation in
+/// the GPU's quota will state it, and finds by
 /// how much the quota's reservations with it would pass the limit (`division::excess`); it keeps
 /// its slots less as many as that takes, a slot's storages being its part of the product buffer
 /// and its trajectory row (`BufferMemory::slot_bytes`). The group keeps the fewest any of its
@@ -2103,7 +2190,7 @@ pub(crate) fn keep_warm_slots(ranks: &mut [LoadedRank]) -> Result<()> {
         let mut slots = 0;
         for &index in &members {
             let rank = &ranks[index];
-            let (Some(client), Some(pool)) = (&rank.client, &rank.pool) else {
+            let (Some(client), Some(_)) = (&rank.client, &rank.pool) else {
                 continue;
             };
             let device = rank.device()?;
@@ -2112,10 +2199,10 @@ pub(crate) fn keep_warm_slots(ranks: &mut [LoadedRank]) -> Result<()> {
                 .media
                 .as_ref()
                 .context("a warm media rank holds its media memory")?;
-            let process = division::process_bytes(&nvml, device, service::lock(pool).mapped(), 0)?;
+            // The process's whole on the device, beside the pools of all its ranks there.
+            let process = binding::measure(&nvml, device, &pools_on(ranks, device)?, 0)?;
             let (quota, _) = client.usage(device)?;
-            let scope = client.scope().context("a rank's client states its scope")?;
-            let over = division::excess(&quota, scope, client.epoch(), process)?;
+            let over = division::excess(&quota, client.epoch(), process)?;
 
             slots = memory.held_slots();
             let slot = memory.slot_bytes();
@@ -2857,9 +2944,16 @@ fn encoder_memory(
 fn open_video_ranks(ranks: &mut [LoadedRank], layout: &Open, opened: &Opened) -> Result<()> {
     let first = ranks.first().context("this process loaded no rank")?;
     let pool = Arc::new(first.model_runner.media_pool()?);
-    let media = Arc::new(media::MediaRunner::new(media::MediaConfig {
-        ffmpeg: first.model_runner.engine_config().media.ffmpeg.clone(),
-    }));
+    // A deployment that names no reference-video decoder takes the media crate's: the one the
+    // linked FFmpeg installation ships.
+    let media = Arc::new(media::MediaRunner::new(
+        match &first.model_runner.engine_config().media.ffmpeg {
+            Some(ffmpeg) => media::MediaConfig {
+                ffmpeg: ffmpeg.clone(),
+            },
+            None => media::MediaConfig::from_env(),
+        },
+    ));
     let numbers: Vec<u8> = opened.regions.iter().map(|(number, _)| *number).collect();
     // The rank that maps the host regions' parts: the process's first, which every epoch of
     // the deployment on this host holds.
@@ -3149,8 +3243,8 @@ fn open_media_runners(
             &model,
             &memory,
             |_, inputs| Ok((Graphs::meta(Arc::clone(kernels), inputs), None)),
-            (None, None, None),
-            &classes,
+            (None, Default::default(), None),
+            (&video.laid, &classes),
         )?),
         Some(pool) => {
             let mut pool = service::lock(pool);
@@ -3182,10 +3276,10 @@ fn open_media_runners(
                     },
                     (
                         video.tensor.clone(),
-                        video.sequence.clone(),
+                        video.denoiser.clone(),
                         video.decoder.take(),
                     ),
-                    &classes,
+                    (&video.laid, &classes),
                 )?
             };
             let runners = boxed(typed);
@@ -3569,7 +3663,10 @@ pub(crate) fn spawn(
                     .with_peers(peers)
                     .with_parts(&parts);
                 let runners = std::mem::take(&mut video.runners);
-                if runners.is_empty() {
+                // A rank whose group's blocks name no phase, such as a group that places the
+                // latent encoder alone (its work is the denoising ranks' latent preparation),
+                // builds no runner, and its worker serves nothing.
+                if runners.is_empty() && video.capacity.phases != 0 {
                     bail!("the rank's runners were spawned already, or the rank was never opened");
                 }
                 (tables, runners)

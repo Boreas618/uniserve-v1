@@ -84,7 +84,7 @@ impl RefinerBlock {
             norm1: RmsNorm::load(&norm, vb.pp("norm1"))?,
             norm2: RmsNorm::load(&norm, vb.pp("norm2"))?,
             attention: Attention::load(&attention, vb.pp("attn"))?,
-            mlp: Mlp::load(&mlp_config(config), vb.clone())?,
+            mlp: Mlp::load(&mlp_config(config, Split::WHOLE), vb.clone())?,
         })
     }
 

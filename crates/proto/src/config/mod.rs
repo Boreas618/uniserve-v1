@@ -676,8 +676,11 @@ pub struct MediaConfig {
     /// Condition media one request may carry in total.
     #[serde(with = "values::bytes")]
     pub max_request_bytes: u64,
-    /// Executable the media reader decodes reference videos with.
-    pub ffmpeg: PathBuf,
+    /// Executable the media reader decodes reference videos with; unset, the media crate's own
+    /// choice (`media::MediaConfig::from_env`): `UNISERVE_FFMPEG` of the engine's environment,
+    /// else the `bin/ffmpeg` of the FFmpeg installation the engine executable links, else
+    /// `ffmpeg` on the search path.
+    pub ffmpeg: Option<PathBuf>,
 }
 
 impl Default for MediaConfig {
@@ -687,7 +690,7 @@ impl Default for MediaConfig {
             allow_remote: true,
             // 256 MiB.
             max_request_bytes: 256 << 20,
-            ffmpeg: PathBuf::from("ffmpeg"),
+            ffmpeg: None,
         }
     }
 }

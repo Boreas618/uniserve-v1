@@ -15,7 +15,7 @@
 //!
 //! The interface is numerical. A family reads its checkpoint and states its mathematical facts
 //! (widths, cache shape, frame rule, the requests its graphs are captured for); it receives the
-//! deployment's mathematical partition ([`Split`], [`SequenceSplit`]) and the deployment's
+//! deployment's mathematical partition ([`Split`], [`SequenceSplit`], [`DenoiserSplit`]) and the
 //! serving bounds ([`VideoServing`]), and it holds no runtime object: execution owns the devices,
 //! streams, memory, graphs and scheduling.
 //!
@@ -520,8 +520,8 @@ pub struct VideoPlacement {
     /// The stages the deployment places on this rank's group; `None` places the whole
     /// pipeline.
     pub stages: Option<BTreeSet<String>>,
-    /// The denoiser's sequence split.
-    pub sequence: SequenceSplit,
+    /// The denoiser's partition and this rank's place in it.
+    pub denoiser: DenoiserSplit,
     /// The text encoder's tensor split.
     pub tensor: Split,
     /// The element type the deployment computes in.
@@ -546,10 +546,24 @@ pub struct VideoServing {
     pub condition_rows: Option<u32>,
 }
 
-/// A sequence split: the ranks a denoiser's sequence is exchanged over, and this rank's place.
+/// The collective axes of a partitioned denoiser's forward, in the order execution states their
+/// groups (`ops::Context::set_axes`) and the denoiser addresses them ([`crate::collective::along`]):
+/// the Ulysses group of a sequence split, its all-gather group, the tensor group and the stages
+/// of the layer split. An axis of one rank has no group, and nothing addresses it.
+pub const ULYSSES_AXIS: usize = 0;
+/// The all-gather group of a denoiser's sequence split ([`ULYSSES_AXIS`]).
+pub const GATHER_AXIS: usize = 1;
+/// The tensor group of a denoiser's blocks ([`ULYSSES_AXIS`]).
+pub const TENSOR_AXIS: usize = 2;
+/// The stages of a denoiser's layer split ([`ULYSSES_AXIS`]).
+pub const LAYER_AXIS: usize = 3;
+
+/// A Ulysses sequence split: the members that trade their shares of a sequence's rows for their
+/// shares of the heads of every row around each attention, this rank's place among them, and
+/// how a member's merged head projections reach it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SequenceSplit {
-    /// Ranks the sequence is split over, and this rank's position.
+    /// Members the sequence is split over, and this rank's position.
     pub split: Split,
     /// How a member's merged head projections reach it.
     pub projection: Projection,
@@ -561,6 +575,70 @@ impl SequenceSplit {
         split: Split::WHOLE,
         projection: Projection::Exchange,
     };
+}
+
+/// How a deployment partitions a denoiser over the ranks of its block, and this rank's place:
+/// one split per collective axis of its forward ([`ULYSSES_AXIS`] and after).
+///
+/// A block's ranks number the product of four degrees, and a rank's place in the block's order
+/// is its coordinate on each, the Ulysses degree varying fastest, then the tensor degree, then
+/// the all-gather degree, the layer degree slowest:
+///
+/// - the **sequence split** ([`Self::sequence`]) divides the packed rows into one contiguous
+///   interval per place: each all-gather place ([`Self::gather`]) holds an interval of the
+///   sequence, which its Ulysses group ([`Self::ulysses`]) splits further and trades for heads
+///   around each attention, and the groups gather each other's keys and values;
+/// - the **tensor split** ([`Self::tensor`]) divides every block's heads and feed-forward width;
+/// - the **layer split** ([`Self::layers`]) gives each stage consecutive blocks of the stack,
+///   the earlier stages one block more when the blocks do not divide evenly.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DenoiserSplit {
+    /// The Ulysses split of an all-gather place's rows, and its head projection.
+    pub ulysses: SequenceSplit,
+    /// The all-gather split: the intervals the sequence's rows are cut into, one per Ulysses
+    /// group, and the one this rank's group holds.
+    pub gather: Split,
+    /// The tensor split of every block's heads and feed-forward width.
+    pub tensor: Split,
+    /// The layer split: this rank's stage of the block stack.
+    pub layers: Split,
+}
+
+impl DenoiserSplit {
+    /// No partition: the whole denoiser on one rank.
+    pub const WHOLE: Self = Self {
+        ulysses: SequenceSplit::WHOLE,
+        gather: Split::WHOLE,
+        tensor: Split::WHOLE,
+        layers: Split::WHOLE,
+    };
+
+    /// The places of the sequence split (the Ulysses degree times the all-gather degree) and
+    /// this rank's, the Ulysses place varying fastest: the interval of the packed rows the rank
+    /// holds.
+    pub const fn sequence(&self) -> Split {
+        let (ulysses, gather) = (self.ulysses.split, self.gather);
+        Split {
+            size: ulysses.size * gather.size,
+            rank: gather.rank * ulysses.size + ulysses.rank,
+        }
+    }
+
+    /// The blocks of a stack of `blocks` this rank's stage holds, as `first..end`.
+    pub const fn stage_blocks(&self, blocks: u32) -> std::ops::Range<u32> {
+        let (stages, stage) = (
+            if self.layers.size == 0 {
+                1
+            } else {
+                self.layers.size
+            },
+            self.layers.rank,
+        );
+        let (share, extra) = (blocks / stages, blocks % stages);
+        let first = stage * share + if stage < extra { stage } else { extra };
+        let count = share + if stage < extra { 1 } else { 0 };
+        first..first + count
+    }
 }
 
 /// How the members of a sequence split reach their merged head projections, which decides the
@@ -650,8 +728,11 @@ pub trait VideoModel: Send + Sync {
     /// as the request presents them: a request's opening encodes its own conditions eagerly,
     /// outside any captured graph, so the profile run opens the layout once per set to measure
     /// that encode and state its kernels. They are not the request's own conditions, which it
-    /// states none of; the list is empty for a layout whose requests state no condition, or
-    /// whose conditions follow the client's media and nothing the deployment serves.
+    /// states none of: where the deployment fixes a condition's extents (a keyframe at the
+    /// generated canvas) a set presents them, and where they follow the client's media (a
+    /// reference) the sets bound them, no opening of the layout encoding a larger condition of
+    /// a kind than a set does. The list is empty for a layout whose requests state no
+    /// condition.
     ///
     /// # Errors
     ///
@@ -661,12 +742,17 @@ pub trait VideoModel: Send + Sync {
         serving: &VideoServing,
     ) -> Result<Vec<(VideoRequest, Vec<Vec<ConditionShape>>)>>;
 
-    /// The prompts with vision blocks a deployment serving `serving` admits whose grids the
-    /// deployment fixes: one per distinct set of grids, each as a request of a served resolution
-    /// presents it, as the patch grids (`[time, rows, columns]`) of its vision blocks in
-    /// presentation order and the token ids of a prompt that presents those blocks: each block's
-    /// placeholder tokens, one per merged row, and the tokens that delimit the blocks, as the
-    /// text encoder reads a prompt ([`Encoder::encode`]).
+    /// The prompts with vision blocks the text encoder's eager encodes are profiled over, for a
+    /// deployment serving `serving`: each as the patch grids (`[time, rows, columns]`) of its
+    /// vision blocks in presentation order and the token ids of a prompt that presents those
+    /// blocks: each block's placeholder tokens, one per merged row, and the tokens that delimit
+    /// the blocks, as the text encoder reads a prompt ([`Encoder::encode`]).
+    ///
+    /// Where the deployment fixes the grids a request presents, one prompt per distinct set of
+    /// grids, as a request of a served resolution presents it. Where the grids follow the
+    /// client's media, prompts that bound every presentation the deployment admits: an encode of
+    /// any admitted prompt takes no more of the region and no more host copies of no more bytes
+    /// than one of these of no fewer tokens.
     ///
     /// A prompt that presents vision blocks is encoded eagerly over its own layout and not by a
     /// captured graph, in the same stream region the captured encodes take their memory from,

@@ -230,7 +230,7 @@ impl VsaAttention {
         // The preparation stored zeros past each tile's valid size in all three projections,
         // so the fine attention reads the same zeroed rows without a second pass.
         let scores = functional::vsa_scores(&pooled.get(0)?, &pooled.get(1)?)?;
-        let selection = functional::vsa_select_tiles(&scores, sizes, segments, keep)?;
+        let selection = functional::vsa_select_tiles(&scores, sizes, segments, keep, 0)?;
         let attended = functional::sparse_attention(
             (&query, &key, &value),
             (&selection.0, &selection.1),
@@ -248,6 +248,116 @@ impl VsaAttention {
         let compressed = functional::vsa_compress_pooled(
             &scores,
             &pooled.get(2)?,
+            sizes,
+            config.max_tiles,
+            config.output,
+        )?;
+
+        Ok((fine.flatten_from(1)?, compressed))
+    }
+
+    /// [`Self::attend`] on a rank of an all-gather group, which holds one interval of the
+    /// sequence's tiles: its queries attend the whole sequence's keys, which the group gathers.
+    ///
+    /// `query`, `key` and `value` are the interval's projections, each `[tiles · tile_rows,
+    /// heads · head_dim]`, its first tile the sequence's tile `first`, and `factors` the
+    /// interval's rotary tables. The tables are the whole sequence's ([`Self::attend`]). The
+    /// rank prepares its interval, gathers every member's prepared keys and values and their
+    /// pooled means in member order along the axis the caller's forward addresses (the
+    /// all-gather group, whose members hold consecutive intervals of equal tiles), selects its
+    /// query tiles' key tiles among every tile and attends them. Returns the interval's `(fine,
+    /// compressed)`: `[rows, heads · head_dim]` and `[heads, interval tiles, head_dim]`.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::attend`], and gathered tiles that are not the tables' sequence.
+    pub fn attend_gathered(
+        &self,
+        (query, key, value): (Tensor, Tensor, Tensor),
+        factors: Option<(&Tensor, &Tensor)>,
+        (sizes, segments, keep): (&Tensor, &Tensor, &Tensor),
+        first: usize,
+    ) -> Result<(Tensor, Tensor)> {
+        const OWNER: &str = "VsaAttention";
+        let config = &self.config;
+
+        let rows = query.dims().first().copied().unwrap_or(0);
+        let tile = config.tile_rows as usize;
+        let tiles = sizes.dims().first().copied().unwrap_or(0);
+        let own = rows / tile;
+        if !rows.is_multiple_of(tile) || first + own > tiles {
+            return Err(Error::shape(
+                OWNER,
+                format!(
+                    "{rows} rows from tile {first} are not whole {tile}-row tiles of a sequence of \
+                     {tiles}"
+                ),
+            ));
+        }
+        if tiles > config.max_tiles as usize {
+            return Err(Error::shape(
+                OWNER,
+                format!(
+                    "a request ranks {tiles} key tiles, past the deployment's bound of {}",
+                    config.max_tiles
+                ),
+            ));
+        }
+        if factors.is_some() != (config.rotated > 0) {
+            return Err(Error::shape(
+                OWNER,
+                "the factor tables are present exactly when the layer rotates".to_owned(),
+            ));
+        }
+
+        // The interval is prepared as a sequence of its own tiles.
+        let own_sizes = sizes.narrow(0, first, own)?;
+        let projections = [
+            self.headed(&query)?,
+            self.headed(&key)?,
+            self.headed(&value)?,
+        ];
+        let ([query, key, value], pooled) = functional::vsa_prepare_tiles_(
+            projections,
+            self.gains.as_ref().map(|(query, key)| (query, key)),
+            factors,
+            &own_sizes,
+            config.tile_rows,
+            config.rotated,
+            config.eps,
+        )?;
+
+        // Every member's prepared keys and values and their means, in sequence order.
+        let gathered = |part: &Tensor| -> Result<Tensor> {
+            let part = part.contiguous()?;
+            crate::collective::gathered(&part)
+        };
+        let (keys, values) = (gathered(&key)?, gathered(&value)?);
+        let (pooled_keys, pooled_values) = (gathered(&pooled.get(1)?)?, gathered(&pooled.get(2)?)?);
+        if pooled_keys.dims().first() != Some(&tiles) {
+            return Err(Error::shape(
+                OWNER,
+                format!(
+                    "the group gathers {:?} key tiles of a sequence of {tiles}",
+                    pooled_keys.dims()
+                ),
+            ));
+        }
+
+        let scores = functional::vsa_scores(&pooled.get(0)?, &pooled_keys)?;
+        let selection = functional::vsa_select_tiles(&scores, sizes, segments, keep, first)?;
+        let attended = functional::sparse_attention(
+            (&query, &keys, &values),
+            (&selection.0, &selection.1),
+            sizes,
+            config.tile_rows,
+            config.max_keys,
+            config.output,
+        )?;
+        let fine = functional::vsa_zero_padding_(attended, &own_sizes, config.tile_rows)?;
+        let compressed = functional::vsa_compress_pooled(
+            &scores,
+            &pooled_values,
             sizes,
             config.max_tiles,
             config.output,

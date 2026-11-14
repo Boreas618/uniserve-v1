@@ -398,7 +398,7 @@ The [FastH3 guide](minimax_h3/minimax_h3.md#startup-and-capacity) explains how t
 | `directory` | Unset | Directory `file://` condition media resolves under; `file://` is refused when unset |
 | `allow_remote` | `true` | Fetch `http(s)://` condition media |
 | `max_request_bytes` | `"256MiB"` | Condition media one request may carry in total; the video routes' body limit follows it |
-| `ffmpeg` | `"ffmpeg"` | Executable that decodes reference videos |
+| `ffmpeg` | unset | Executable that decodes reference videos; unset, `UNISERVE_FFMPEG` of the engine's environment, else the `bin/ffmpeg` of the FFmpeg installation the engine executable links, else `ffmpeg` on the search path |
 
 ### `video_job_config`
 
@@ -508,7 +508,7 @@ A block table takes:
 
 | Key | Default | Meaning |
 | --- | --- | --- |
-| `ranks` | Every rank of the replica | Indices into one replica's ranks; their order assigns each rank its position in the parallel degrees or the unit schedule |
+| `ranks` | Every rank of the replica | Indices into one replica's ranks; their order assigns each rank its position in the parallel degrees or the unit schedule. A denoiser block's positions run over the Ulysses degree fastest, then the tensor degree, then the all-gather degree, and the pipeline degree slowest: in a block of `tensor_parallel_size = 2` and Ulysses degree 2, positions 0 and 1 are one Ulysses group and positions 0 and 2 one tensor group |
 | `tensor_parallel_size`, `pipeline_parallel_size` | `1` | Model-parallel degrees |
 | `sequence_parallel` | `{ kind = "local" }` | `{ kind = "ulysses", ulysses_degree = N }` with optional `projection` and `projection_rows`, `{ kind = "allgather", allgather_degree = N }`, or `{ kind = "hybrid", ulysses_degree = N, allgather_degree = M }` |
 | `distribution` | Unset | `temporal_units` runs its own copy of the block on every rank and deals independent media units among them; the video decoder and codec always take it |

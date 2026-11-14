@@ -7,11 +7,15 @@
 //! module reads its place in the group with [`split`] and calls the collective on its tensors;
 //! which communicator and stream carry it is the context's.
 //!
-//! A broadcast's other members wait on their devices until the root reaches it, which in a
-//! pipeline is a whole stage of layers later. Outside a capture, a group that states how its
-//! members meet on the host ([`Group::with_meet`]) meets before each broadcast, so no member's
-//! device waits on a root whose thread is still issuing an eager forward: a pipeline stage's
-//! eager forward stalled while the next stage's device waited for it.
+//! A collective launch holds its device until every member of the group reached it. The members
+//! of a host are threads of one process, and a member's thread can need its process while a
+//! peer's device waits in such a launch: the first use of a kernel takes a lock of the whole
+//! process and waits for the work in flight to drain, and a pipeline stage's thread issues a
+//! whole stage of layers while the next stage's device waits in their broadcast (an eager
+//! pipeline forward stalled there). A group that states how its members on the host meet
+//! ([`Group::with_meet`]) therefore meets before each such launch issued outside a capture, so
+//! no member's device waits on a member whose thread has not reached the launch. A captured
+//! launch holds no device, and a replay finds every kernel ready.
 //!
 //! Under a context that launches, a collective is issued through the context's [`Group`] on the
 //! context's stream, and while that stream is being captured it becomes nodes of the graph.
@@ -72,13 +76,13 @@ pub struct Group {
     ends: Vec<Event>,
     /// The end event the next started collective takes, modulo [`ENDS`].
     next: AtomicUsize,
-    /// How the group's members meet on the host before a broadcast outside a capture
-    /// ([`Group::with_meet`]); `None` for a group whose members never wait on a root far
-    /// behind them.
+    /// How the group's members on this host meet before each collective launch outside a
+    /// capture ([`Group::with_meet`]); `None` for a group whose members need not.
     meet: Option<Meet>,
 }
 
-/// A host rendezvous of every member of a group: it returns once each member called it.
+/// A host rendezvous of the members of a group on one host: it returns once each of them called
+/// it.
 pub type Meet = Arc<dyn Fn() -> Result<()> + Send + Sync>;
 
 impl Group {
@@ -102,9 +106,11 @@ impl Group {
         })
     }
 
-    /// The group whose members call `meet` together before each broadcast issued outside a
-    /// capture (module documentation). Every member calls the same broadcasts in the same order,
-    /// so the `n`-th meeting of every member is the same broadcast's.
+    /// The group whose members on this host call `meet` together before each collective launch
+    /// issued outside a capture that waits on its device for the other members (module
+    /// documentation): every launch of a group but a finish. Every member issues the group's
+    /// collectives in the same order and captures the same ones, so the `n`-th meeting of every
+    /// member is the same launch's.
     #[must_use]
     pub fn with_meet(self, meet: Meet) -> Self {
         Self {
@@ -202,6 +208,43 @@ pub fn split() -> Option<(u64, u64)> {
     context::installed()?.state().split
 }
 
+/// Runs `operation` with the forward's collectives and [`split`] along axis `axis` of the
+/// context ([`Context::set_axes`]), and the axis addressed before it again once `operation`
+/// returns, whatever it returns.
+///
+/// A forward partitioned along several axes (a sequence split inside a tensor split) addresses
+/// each collective's axis this way; outside any, its collectives go along the first. A
+/// collective started along an axis is finished along it.
+///
+/// # Errors
+///
+/// [`Error::NoContext`], or [`Error::Collective`] when the context states no axis `axis`.
+pub fn along<T>(axis: usize, operation: impl FnOnce() -> T) -> Result<T> {
+    let context = context::current("a collective")?;
+    let previous = {
+        let mut state = context.state();
+        let (group, split) = state.axes.get(axis).cloned().ok_or_else(|| {
+            misuse(
+                "along",
+                format!(
+                    "axis {axis} of a forward partitioned along {} axes",
+                    state.axes.len()
+                ),
+            )
+        })?;
+        (
+            std::mem::replace(&mut state.group, group),
+            std::mem::replace(&mut state.split, split),
+        )
+    };
+
+    let result = operation();
+
+    let mut state = context.state();
+    (state.group, state.split) = previous;
+    Ok(result)
+}
+
 /// Sums every rank's `x` into every rank's `x`, in place.
 ///
 /// `x` has the same shape and element type on every rank. Like every buffer of a collective it
@@ -221,6 +264,7 @@ pub fn all_reduce(x: &Tensor) -> Result<()> {
         return Ok(());
     };
     let group = group(&context, "all_reduce")?;
+    meet(&group, stream)?;
     let bytes = x.dtype.size_in_bytes() * count;
 
     group.communicator().all_reduce(
@@ -249,6 +293,7 @@ pub fn all_gather(send: &Tensor, recv: &Tensor) -> Result<()> {
         return Ok(());
     };
     let group = group(&context, "all_gather")?;
+    meet(&group, stream)?;
     let bytes = send.dtype.size_in_bytes();
 
     group.communicator().all_gather(
@@ -276,7 +321,9 @@ pub fn all_to_all(send: &Tensor, recv: &Tensor) -> Result<()> {
     let Some(stream) = context.stream() else {
         return Ok(());
     };
-    group(&context, "all_to_all")?.all_to_all(&send, &recv, exchange, stream)
+    let group = group(&context, "all_to_all")?;
+    meet(&group, stream)?;
+    group.all_to_all(&send, &recv, exchange, stream)
 }
 
 /// Starts [`all_to_all`] beside the context's stream, which goes on at once.
@@ -297,6 +344,7 @@ pub fn start_all_to_all(send: &Tensor, recv: &Tensor) -> Result<usize> {
         return Ok(0);
     };
     let group = group(&context, "all_to_all")?;
+    meet(&group, stream)?;
 
     group.start(stream, |side| {
         group.all_to_all(&send, &recv, exchange, side)
@@ -343,6 +391,7 @@ pub fn start_gather_rows(
         return Ok(0);
     };
     let group = group(&context, "gather_rows")?;
+    meet(&group, stream)?;
 
     // One rank's rows of the interval; every rank's lie at the same offset of its own block.
     let elements = usize::try_from(count * width)
@@ -389,13 +438,9 @@ pub fn broadcast(x: &Tensor, root: u64) -> Result<Tensor> {
         return Ok(result);
     };
     let group = group(&context, "broadcast")?;
+    meet(&group, stream)?;
     let bytes = operand.dtype.size_in_bytes() * count;
 
-    if let Some(meet) = &group.meet
-        && stream.capture_status()? == CaptureStatus::None
-    {
-        meet()?;
-    }
     group.communicator().broadcast(
         stream,
         range(&operand, bytes),
@@ -489,6 +534,15 @@ pub fn expert_exchange(descriptor: &ExchangeDescriptor, args: ExchangeArgs) -> R
 
     launch::<ExpertExchange>(descriptor, ExchangeArgs { transport, ..args })?;
     settle()
+}
+
+/// Meets the other members of `group` on the host before a collective launch on `stream`, when
+/// the group states a meeting ([`Group::with_meet`]) and `stream` is not being captured.
+fn meet(group: &Group, stream: &Stream) -> Result<()> {
+    match &group.meet {
+        Some(meet) if stream.capture_status()? == CaptureStatus::None => meet(),
+        _ => Ok(()),
+    }
 }
 
 /// The thread's context and its group's member count, for the collective `name`.

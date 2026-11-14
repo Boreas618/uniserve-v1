@@ -51,6 +51,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use crate::batch::{Batch, BatchId, Columns, Phase, Shape as BatchShape, Variant};
 use nn::ExpertExchange;
 use ops::Generation;
+use ops::collective::Meet;
 use ops::moe::ExchangeTransport;
 use ops::moe::exchange::{Descriptor, Mode, Transport, TransportShape};
 use platform::Stream;
@@ -282,7 +283,7 @@ impl Member {
     /// once every member has called it, so no member waits on its device for a launch another
     /// has not reached; while serving it returns at once, the agreement having met the
     /// members.
-    pub(crate) fn meet(&self) -> Arc<dyn Fn() -> ops::Result<()> + Send + Sync> {
+    pub(crate) fn meet(&self) -> Meet {
         let group = Arc::clone(&self.group);
         let warming = Arc::clone(&self.warming);
 

@@ -693,7 +693,7 @@ fn a_parallel_group_takes_its_block_s_ranks_in_their_stated_order() {
     let runners = ModelRunner::of(&launch, family).unwrap().ranks().unwrap();
     assert_eq!(runners.len(), 4);
     for runner in &runners {
-        let [_, sequence, decoder] = runner.media_collectives().unwrap();
+        let [_, sequence, _, _, _, decoder] = runner.media_collectives().unwrap();
         assert_eq!(sequence.groups, [vec![3, 1, 2, 0]]);
         let place = [3, 1, 2, 0]
             .iter()
@@ -705,6 +705,140 @@ fn a_parallel_group_takes_its_block_s_ranks_in_their_stated_order() {
             .iter()
             .position(|rank| *rank == runner.rank() as usize);
         assert_eq!(decoder.member, place.map(|place| (0, place)));
+    }
+}
+
+/// A denoiser block of a tensor split two by Ulysses two over the group's ranks `[3, 1, 2, 0]`
+/// forms its Ulysses groups of its consecutive places and its tensor groups of the places a
+/// Ulysses degree apart, each listing its members in the order of their coordinate; a hybrid
+/// of Ulysses two by all-gather two forms its all-gather groups the same way, and neither forms
+/// a group of an axis of one rank.
+#[test]
+#[ignore = "reads the headers of a released FastH3 checkpoint, which the repository does not hold"]
+fn a_denoiser_block_forms_a_group_along_each_axis_of_its_partition() {
+    assert!(
+        Path::new(FAST_H3).is_dir(),
+        "the media rank loads the headers of {FAST_H3}, which is missing"
+    );
+    let groups_of = |tensor: usize, sequence: proto::config::SequenceParallel| {
+        let mut launch = video_launch();
+        let mut group = launch.engine_config.parallel.worker_groups[0].clone();
+        group.ranks = (0..4)
+            .map(|device| WorkerRank {
+                host: "localhost".to_owned(),
+                device: format!("cuda:{device}"),
+            })
+            .collect();
+        let transformer = group.blocks.get_mut("transformer").unwrap();
+        transformer.ranks = vec![3, 1, 2, 0];
+        transformer.tensor_parallel_size = tensor;
+        transformer.sequence_parallel = sequence;
+        launch.engine_config.parallel.worker_groups = vec![group];
+        launch.devices = vec![0, 1, 2, 3];
+        launch.world_size = 4;
+
+        let registry = nn::family::Registry::new([models::minimax_h3::family::FAMILY]).unwrap();
+        let family = crate::process::catalogue::resolve(&registry, Path::new(FAST_H3)).unwrap();
+        let runners = ModelRunner::of(&launch, family).unwrap().ranks().unwrap();
+        runners
+            .iter()
+            .map(|runner| (runner.rank(), runner.media_collectives().unwrap()))
+            .collect::<Vec<_>>()
+    };
+
+    let mixed = groups_of(
+        2,
+        proto::config::SequenceParallel::Ulysses {
+            ulysses_degree: 2,
+            projection: Default::default(),
+            projection_rows: None,
+        },
+    );
+    for (rank, [_, ulysses, gather, tensor, layers, _]) in &mixed {
+        assert_eq!(ulysses.groups, [vec![3, 1], vec![2, 0]]);
+        assert_eq!(tensor.groups, [vec![3, 2], vec![1, 0]]);
+        assert!(gather.groups.is_empty() && layers.groups.is_empty());
+
+        // Group rank 0 is the block's place 3: the second of its Ulysses pair and of its tensor
+        // pair.
+        if *rank == 0 {
+            assert_eq!(
+                (ulysses.member, tensor.member),
+                (Some((1, 1)), Some((1, 1)))
+            );
+        }
+    }
+
+    let hybrid = groups_of(
+        1,
+        proto::config::SequenceParallel::Hybrid {
+            ulysses_degree: 2,
+            allgather_degree: 2,
+        },
+    );
+    for (_, [_, ulysses, gather, tensor, _, _]) in &hybrid {
+        assert_eq!(ulysses.groups, [vec![3, 1], vec![2, 0]]);
+        assert_eq!(gather.groups, [vec![3, 2], vec![1, 0]]);
+        assert!(tensor.groups.is_empty());
+    }
+}
+
+/// A denoising rank holds the condition encoders whenever the deployment places them, whichever
+/// ranks their block names: in a group whose Ulysses-2 denoiser spans both ranks and whose latent
+/// encoder names rank 1 alone, both denoising ranks profile the keyframe openings their latent
+/// preparation encodes, and size the condition products a keyframe request reads.
+#[test]
+#[ignore = "reads the headers of a released FastH3 checkpoint, which the repository does not hold"]
+fn every_denoising_rank_encodes_the_conditions_of_its_requests() {
+    assert!(
+        Path::new(FAST_H3).is_dir(),
+        "the media rank loads the headers of {FAST_H3}, which is missing"
+    );
+    let mut launch = video_launch();
+    let mut group = launch.engine_config.parallel.worker_groups[0].clone();
+    group.ranks = (0..2)
+        .map(|device| WorkerRank {
+            host: "localhost".to_owned(),
+            device: format!("cuda:{device}"),
+        })
+        .collect();
+    let transformer = group.blocks.get_mut("transformer").unwrap();
+    transformer.ranks = vec![1, 0];
+    transformer.sequence_parallel = proto::config::SequenceParallel::Ulysses {
+        ulysses_degree: 2,
+        projection: Default::default(),
+        projection_rows: None,
+    };
+    group.blocks.get_mut("latent_encoder").unwrap().ranks = vec![1];
+    launch.engine_config.parallel.worker_groups = vec![group];
+    launch.devices = vec![0, 1];
+    launch.world_size = 2;
+
+    let registry = nn::family::Registry::new([models::minimax_h3::family::FAMILY]).unwrap();
+    let family = crate::process::catalogue::resolve(&registry, Path::new(FAST_H3)).unwrap();
+    let model_runner = ModelRunner::of(&launch, family).unwrap();
+    let ranks = load_ranks(
+        model_runner.ranks().unwrap(),
+        Backing::Meta,
+        &launch,
+        Meeting::Local,
+    )
+    .unwrap();
+
+    let pixels = crate::batch::product::kind(crate::batch::product::CONDITION_PIXELS).unwrap();
+    for rank in &ranks {
+        let video = rank.video().unwrap();
+        let largest = video
+            .capacity
+            .media_bytes
+            .iter()
+            .map(|(_, _, bytes)| bytes[pixels])
+            .max();
+        assert!(
+            largest > Some(0),
+            "rank {} sizes no condition pixels",
+            rank.model_runner.rank()
+        );
     }
 }
 
@@ -752,6 +886,55 @@ fn split_launch() -> EngineArgs {
     launch.devices = vec![0, 1];
     launch.world_size = 2;
     launch
+}
+
+/// A group that places the latent encoder alone names no phase, since the denoising ranks'
+/// latent preparation computes its work: its rank opens and its worker serves nothing, beside
+/// the groups that serve every phase.
+#[test]
+#[ignore = "reads the headers of a released FastH3 checkpoint, which the repository does not hold"]
+fn a_group_of_no_phase_spawns_a_worker_that_serves_nothing() {
+    assert!(Path::new(FAST_H3).is_dir(), "{FAST_H3} is missing");
+    let server = StorageServer::start();
+    let mut launch = split_launch();
+    let mut encoder = launch.engine_config.parallel.worker_groups[0].clone();
+    encoder.id = WorkerGroupId("latent_encoder".to_owned());
+    encoder.ranks[0].device = "cuda:2".to_owned();
+    encoder.blocks =
+        BTreeMap::from([("latent_encoder".to_owned(), BlockConfig::parallel(vec![0]))]);
+    launch.engine_config.parallel.worker_groups.push(encoder);
+    launch.devices = vec![0, 1, 2];
+    launch.world_size = 3;
+
+    let registry = nn::family::Registry::new([models::minimax_h3::family::FAMILY]).unwrap();
+    let family = crate::process::catalogue::resolve(&registry, Path::new(FAST_H3)).unwrap();
+    let model_runner = ModelRunner::of(&launch, family).unwrap();
+    let mut ranks = load_ranks(
+        model_runner.ranks().unwrap(),
+        Backing::Meta,
+        &launch,
+        Meeting::Local,
+    )
+    .unwrap();
+    assert_eq!(ranks[2].video().unwrap().capacity.phases, 0);
+
+    let open = layout(&launch, &ranks).unwrap();
+    let mut client =
+        StorageClient::connect_head(&server.socket, DEPLOYMENT, launch.epoch, launch.engine)
+            .unwrap();
+    let pairs = client.open(open.clone()).unwrap();
+    let opened = client.session().unwrap().1.clone();
+    open_ranks(&mut ranks, &open, &opened, None).unwrap();
+    let (_, spawned) = spawn(
+        &mut ranks,
+        (&open, &opened),
+        &|group| client.completed_registers(group, &pairs),
+        Vec::new(),
+    )
+    .unwrap();
+    assert_eq!(spawned.len(), 3);
+    drop(spawned);
+    client.close().unwrap();
 }
 
 #[test]

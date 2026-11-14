@@ -414,8 +414,10 @@ fn order_key(score: f32) -> u32 {
 /// each part in ascending order, and `counts` is `[heads, query tiles]` `U32`, how many are
 /// kept.
 ///
-/// `scores` is `[heads, query tiles, tiles]` FP32, query tile `q` being sequence tile `q`.
-/// `sizes` is `[tiles]` `U32`, each tile's valid rows; `segments` is `[tiles]` `I32`, the
+/// `scores` is `[heads, query tiles, tiles]` FP32, query tile `q` being sequence tile
+/// `query_offset + q`: a rank of an all-gather group ranks its own interval of query tiles over
+/// every key tile. `sizes` is `[tiles]` `U32`, each tile's valid rows; `segments` is `[tiles]`
+/// `I32`, the
 /// segment each tile belongs to, negative for a tile of none; `keep` is `[tiles]` `U32`, read by
 /// segment: how many tiles of each segment a query keeps.
 ///
@@ -425,13 +427,15 @@ fn order_key(score: f32) -> u32 {
 ///
 /// # Errors
 ///
-/// When the scores are not `[heads, query tiles, tiles]` FP32 with no more query tiles than
-/// tiles, a table is not one entry per tile, or the operator refuses its arguments.
+/// When the scores are not `[heads, query tiles, tiles]` FP32 whose query tiles from
+/// `query_offset` lie among the tiles, a table is not one entry per tile, or the operator refuses
+/// its arguments.
 pub fn vsa_select_tiles(
     scores: &Tensor,
     sizes: &Tensor,
     segments: &Tensor,
     keep: &Tensor,
+    query_offset: usize,
 ) -> Result<(Tensor, Tensor)> {
     const OWNER: &str = "vsa_select_tiles";
 
@@ -444,11 +448,12 @@ pub fn vsa_select_tiles(
             ),
         ));
     };
-    if scores.dtype() != DType::F32 || query_tiles > tiles {
+    if scores.dtype() != DType::F32 || query_offset + query_tiles > tiles {
         return Err(Error::shape(
             OWNER,
             format!(
-                "{} scores of {query_tiles} query tiles over {tiles} tiles",
+                "{} scores of {query_tiles} query tiles from tile {query_offset} over {tiles} \
+                 tiles",
                 ops::abi::name(scores.dtype())
             ),
         ));
@@ -473,7 +478,7 @@ pub fn vsa_select_tiles(
         let mut indices = Vec::with_capacity(values.len());
         let mut counts = Vec::with_capacity(heads * query_tiles);
         for row in values.chunks(tiles) {
-            let query = counts.len() % query_tiles;
+            let query = query_offset + counts.len() % query_tiles;
             let query_live = sizes[query] > 0;
 
             let mut kept: Vec<bool> = sizes.iter().map(|size| query_live && *size > 0).collect();
@@ -525,7 +530,7 @@ pub fn vsa_select_tiles(
             keep: ops::operand(keep)?,
             indices: ops::operand(&indices)?,
             counts: ops::operand(&counts)?,
-            query_offset: 0,
+            query_offset: query_offset as u64,
         },
     )?;
     Ok((indices, counts))

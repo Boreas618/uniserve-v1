@@ -873,10 +873,14 @@ fn a_profile_run_states_the_launches_of_every_bucket_and_the_runner_s_memory() {
     assert!(keys.iter().all(|(_, key)| !key.is_empty()));
 
     // The region holds the input tensors and the largest forward's activations, and the
-    // model's one host value is an FP32 per token of the largest bucket.
+    // model's one host value is an FP32 per token of the largest bucket, at whatever offset its
+    // alignment gives it.
     let inputs = CausalLmRunner::input_bytes(&config()).unwrap();
     assert!(runner.graphs().peak() > inputs + (80 * HIDDEN * 2) as u64);
-    assert_eq!(runner.graphs().input_peak(), 4 * 80);
+    assert_eq!(
+        runner.graphs().input_peak(),
+        4 * 80 + ops::allocator::ALIGNMENT - 1
+    );
 }
 
 #[test]

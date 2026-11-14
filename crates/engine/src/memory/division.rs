@@ -75,8 +75,9 @@
 //! settled once the rank is warm, from [`process_bytes`] measured again: a media rank keeps the
 //! request slots whose storages fit beside its warm process ([`excess`]) and gives the storages
 //! of the rest back; a text rank gives back the tail segments of its cache whose bytes cover the
-//! same excess; then the rank reserves [`storage::Item::Process`] at that figure, with whatever a
-//! profiling session's collectors hold, through
+//! same excess; then the process's first rank on each device reserves [`storage::Item::Process`]
+//! at that figure, the process's whole there, and its other ranks on the device reserve none, each
+//! with whatever a profiling session's collectors hold, through
 //! [`StorageClient::reserve`](super::client::StorageClient::reserve). The growth is measured,
 //! never estimated.
 //!
@@ -101,9 +102,11 @@ pub(crate) fn granules(bytes: u64, granularity: u64) -> u64 {
 ///
 /// The figure is NVML's usage of the process, less the segments the process created for the
 /// server and keeps the creating handles of (`platform::created_bytes`), which NVML counts
-/// with the process, and less the `pools` bytes its graph and scratch pools map
-/// ([`GraphPool::mapped`](super::graph_pool::GraphPool::mapped)). `unattributed` is the bytes
-/// of communication buffers NVML attributes to no process, as their owner states them.
+/// with the process, and less the `pools` bytes the graph and scratch pools of every rank of the
+/// process on the device map ([`GraphPool::mapped`](super::graph_pool::GraphPool::mapped)), which
+/// the quota holds as theirs. `unattributed` is the bytes of communication buffers NVML
+/// attributes to no process, as their owners state them. The figure is the process's whole on
+/// the device, however many ranks it holds there.
 ///
 /// The caller measures after everything the process maps outside its pools exists, and waits
 /// for its streams first, so the figure counts the work it issued.
@@ -196,25 +199,26 @@ pub(crate) fn unheld_context(quota: &Quota) -> u64 {
     if held { 0 } else { quota.transfer_context }
 }
 
-/// The bytes by which the reservations of `quota` would pass its limit once a rank of `scope` and
-/// `epoch` reserves its warm process of `process` bytes ([`process_bytes`], measured after the
-/// warm-up): the quota's usage, with the Transfer Server's context, which the quota counts
-/// whether or not the server holds it now, and `process` in place of any process the rank's
-/// scope reserved before. Zero when they fit.
+/// The bytes by which the reservations of `quota` would pass its limit once the process of
+/// `epoch` reserves its warm process of `process` bytes on the GPU ([`process_bytes`], measured
+/// after the warm-up): the quota's usage, with the Transfer Server's context, which the quota
+/// counts whether or not the server holds it now, and `process` in place of any process a rank
+/// of the epoch reserved there before. Zero when they fit.
+///
+/// The ranks an epoch places on one GPU are threads of one main process, which NVML states
+/// whole, so the figure is the process's on the GPU and its reservations there, whichever of
+/// its ranks' scopes they are stated under, are the ones it replaces.
 ///
 /// # Errors
 ///
 /// [`Error::State`] when no epoch stated the GPU's limit.
-pub(crate) fn excess(quota: &Quota, scope: &Scope, epoch: u64, process: u64) -> Result<u64> {
+pub(crate) fn excess(quota: &Quota, epoch: u64, process: u64) -> Result<u64> {
     let limit = quota.limit.ok_or(Error::State(
         "the GPU's quota states no limit: the epoch states its fraction first",
     ))?;
 
-    let reserved = quota.bytes(|reservation| {
-        reservation.item == Item::Process
-            && reservation.scope.as_ref() == Some(scope)
-            && reservation.epochs == [epoch]
-    });
+    let reserved = quota
+        .bytes(|reservation| reservation.item == Item::Process && reservation.epochs == [epoch]);
     let transfers = unheld_context(quota);
 
     Ok(quota
@@ -546,9 +550,9 @@ mod tests {
         assert_eq!(pool_bytes(GRANULE, &[GRANULE], &[0], 0), (GRANULE, 0));
     }
 
-    /// Once warm, a rank's process is reserved beside what its quota holds: the excess is what
-    /// its reservations would pass the limit by, its own earlier process being replaced and the
-    /// Transfer Server's context counted whether or not the server holds it.
+    /// Once warm, a process is reserved beside what its GPU's quota holds: the excess is what the
+    /// reservations would pass the limit by, the process its epoch reserved there before being
+    /// replaced and the Transfer Server's context counted whether or not the server holds it.
     #[test]
     fn a_warm_process_passes_its_quota_by_what_it_adds_past_the_limit() {
         let rank = scope(0);
@@ -561,22 +565,22 @@ mod tests {
         );
 
         // A process of five GiB fits the six left; one of seven passes the limit by one.
-        assert_eq!(excess(&quota, &rank, 1, 5 * GIB).unwrap(), 0);
-        assert_eq!(excess(&quota, &rank, 1, 7 * GIB).unwrap(), GIB);
+        assert_eq!(excess(&quota, 1, 5 * GIB).unwrap(), 0);
+        assert_eq!(excess(&quota, 1, 7 * GIB).unwrap(), GIB);
 
-        // The process the rank reserved before is replaced, and another scope's is not.
-        quota.reservations.push(reservation(
-            Item::Process,
-            Some(rank.clone()),
-            &[1],
-            3 * GIB,
-        ));
-        assert_eq!(excess(&quota, &rank, 1, 7 * GIB).unwrap(), GIB);
-        assert_eq!(excess(&quota, &scope(1), 1, 7 * GIB).unwrap(), 4 * GIB);
+        // The process the epoch reserved before is replaced, under whichever of its ranks'
+        // scopes it was stated: its ranks on the GPU share the one process.
+        quota
+            .reservations
+            .push(reservation(Item::Process, Some(scope(1)), &[1], 3 * GIB));
+        assert_eq!(excess(&quota, 1, 7 * GIB).unwrap(), GIB);
+
+        // Another epoch's process is another process, which stays.
+        assert_eq!(excess(&quota, 2, 7 * GIB).unwrap(), 4 * GIB);
 
         // The Transfer Server's context counts before the server holds it.
         quota.transfer_context = GIB;
-        assert_eq!(excess(&quota, &rank, 1, 7 * GIB).unwrap(), 2 * GIB);
+        assert_eq!(excess(&quota, 1, 7 * GIB).unwrap(), 2 * GIB);
     }
 
     #[test]

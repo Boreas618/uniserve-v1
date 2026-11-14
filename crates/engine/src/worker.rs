@@ -831,6 +831,62 @@ impl Worker {
     }
 }
 
+/// Submits a job that runs eager forwards (a warm-up, a generation's preparation) to each of
+/// `workers`, through `submit` of each worker's index and worker: the workers of one group at
+/// once and the groups one after another in the order of their ids, each once every earlier
+/// group's workers ended their jobs. Returns each worker's submission, in the workers' order.
+/// Once an earlier group's job failed, no later group is submitted, and the entries of their
+/// workers are refusals.
+///
+/// An eager forward uses kernels for the first time, and a kernel's first use takes a lock of
+/// the whole process and waits for the work in flight to drain (`ops::collective`). The ranks of
+/// a host are threads of one process: a rank of one group making a first use would wait on
+/// another group's collective spinning on a device until its peers arrive, while those peers
+/// queue on the same lock. Within a group that meets, the ranks meet before each collective of
+/// an eager forward (`ops::Group::with_meet`); the groups take turns. Every host takes the
+/// groups in the same order, so a group whose ranks span hosts waits on no group after it, and
+/// on no host's copy of itself.
+pub(crate) fn in_turn(
+    workers: &[Arc<Worker>],
+    mut submit: impl FnMut(usize, &Worker) -> Result<Submission>,
+) -> Vec<Result<Submission>> {
+    let mut groups: Vec<GroupId> = workers.iter().map(|worker| worker.group).collect();
+    groups.sort_unstable();
+    groups.dedup();
+
+    let mut submitted: Vec<Option<Result<Submission>>> = workers.iter().map(|_| None).collect();
+    let mut failed = false;
+    for group in groups {
+        // Every worker of the earlier groups: a collective of a group ends on one device only
+        // once the group's ranks on the others reached it.
+        for entry in submitted.iter().flatten() {
+            let ended = match entry {
+                Ok(submission) => matches!(submission.wait(), Outcome::Success(_)),
+                Err(_) => false,
+            };
+            failed |= !ended;
+        }
+
+        for (index, worker) in workers.iter().enumerate() {
+            if worker.group != group {
+                continue;
+            }
+            submitted[index] = Some(if failed {
+                Err(Error::State(
+                    "an earlier group's job failed, so this group's was not submitted",
+                ))
+            } else {
+                submit(index, worker)
+            });
+        }
+    }
+
+    submitted
+        .into_iter()
+        .map(|entry| entry.unwrap_or(Err(Error::State("the worker belongs to no group"))))
+        .collect()
+}
+
 impl Drop for Worker {
     fn drop(&mut self) {
         if self.join_thread().is_err() {

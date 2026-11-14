@@ -22,7 +22,8 @@ use std::path::Path;
 use std::sync::Arc;
 
 use nn::family::{
-    Model, Projection, SequenceSplit, Stage, VideoModel, VideoPlacement, VideoServing,
+    DenoiserSplit, Model, Projection, SequenceSplit, Stage, VideoModel, VideoPlacement,
+    VideoServing,
 };
 use nn::{
     Checkpoint, ConditionRole, ConditionShape, Conditioning, DType, Split, VideoRequest,
@@ -57,7 +58,7 @@ fn serving() -> VideoServing {
 
 /// The pipeline of the checkpoint at `root` as a group that places `network` at `sequence`'s
 /// rank holds it, loaded from the shard headers, in the checkpoint's own representation.
-fn load(root: &str, network: Stage, sequence: SequenceSplit) -> nn::Result<Arc<dyn VideoModel>> {
+fn load(root: &str, network: Stage, sequence: DenoiserSplit) -> nn::Result<Arc<dyn VideoModel>> {
     load_under(root, network, sequence, &Quantization::default())
 }
 
@@ -65,7 +66,7 @@ fn load(root: &str, network: Stage, sequence: SequenceSplit) -> nn::Result<Arc<d
 fn load_under(
     root: &str,
     network: Stage,
-    sequence: SequenceSplit,
+    sequence: DenoiserSplit,
     quantization: &Quantization,
 ) -> nn::Result<Arc<dyn VideoModel>> {
     assert!(
@@ -81,7 +82,7 @@ fn load_under(
     let stages: BTreeSet<String> = [network.name().to_owned()].into();
     let placement = VideoPlacement {
         stages: Some(stages),
-        sequence,
+        denoiser: sequence,
         tensor: Split::WHOLE,
         dtype: DType::BF16,
         serving: serving(),
@@ -91,23 +92,28 @@ fn load_under(
     opened.load(&checkpoint, &mut loader, &placement)
 }
 
-/// [`recorded`], with the context stating this rank's place in `sequence`'s group.
+/// [`recorded`], with the context stating this rank's place on each axis of `sequence`'s
+/// partition, in the order the denoiser addresses them (`nn::family::ULYSSES_AXIS` and after).
 fn recorded_at<T>(
-    sequence: SequenceSplit,
+    sequence: DenoiserSplit,
     forward: impl FnOnce() -> nn::Result<T>,
 ) -> (nn::Result<T>, Recording) {
-    if sequence.split.size == 1 {
+    if sequence == DenoiserSplit::WHOLE {
         return recorded(forward);
     }
 
     let context = ops::Context::meta(None);
-    context
-        .set_group(
-            None,
-            u64::from(sequence.split.rank),
-            u64::from(sequence.split.size),
-        )
-        .unwrap();
+    let axes = [
+        sequence.ulysses.split,
+        sequence.gather,
+        sequence.tensor,
+        sequence.layers,
+    ]
+    .map(|place| match place.size {
+        1 => (None, 0, 0),
+        size => (None, u64::from(place.rank), u64::from(size)),
+    });
+    context.set_axes(axes.to_vec()).unwrap();
     context.record_launches();
 
     let output = {
@@ -132,7 +138,7 @@ fn candidates(model: &dyn VideoModel) -> Vec<(VideoRequest, Vec<Vec<ConditionSha
 ///
 /// The latents and the conditioning are meta tensors of the layout's shapes: the FP32 video
 /// and audio latents, and the stack-typed conditioning rows.
-fn step(model: &dyn VideoModel, sequence: SequenceSplit, request: &VideoRequest) -> Recording {
+fn step(model: &dyn VideoModel, sequence: DenoiserSplit, request: &VideoRequest) -> Recording {
     let denoiser = model.denoiser().unwrap();
     let layout = denoiser.layout(request).unwrap();
     let schedule = denoiser.schedule(request).unwrap();
@@ -176,16 +182,13 @@ fn step(model: &dyn VideoModel, sequence: SequenceSplit, request: &VideoRequest)
 /// load leaves to fill, a prompt's conditioning, and a step of the smallest and of the largest
 /// layout the deployment captures, the largest one with every keyframe when the network takes
 /// them.
-fn profile(root: &str, network: Stage, sequence: SequenceSplit) {
+fn profile(root: &str, network: Stage, sequence: DenoiserSplit) {
     let model = load(root, network, sequence).unwrap();
     let denoiser = model.denoiser().unwrap();
     let name = format!(
-        "{} {} rank {} of {} ({:?})",
+        "{} {} {sequence:?}",
         Path::new(root).file_name().unwrap().to_string_lossy(),
         model.denoiser_stage(),
-        sequence.split.rank,
-        sequence.split.size,
-        sequence.projection
     );
 
     let (result, recording) = recorded_at(sequence, || denoiser.initialize());
@@ -266,20 +269,20 @@ fn profile(root: &str, network: Stage, sequence: SequenceSplit) {
 #[test]
 #[ignore = "requires /workspace/models/MiniMax-H3"]
 fn the_base_networks_profile_a_small_and_a_large_layout() {
-    profile(BASE, Stage::Transformer, SequenceSplit::WHOLE);
-    profile(BASE, Stage::TransformerRef, SequenceSplit::WHOLE);
+    profile(BASE, Stage::Transformer, DenoiserSplit::WHOLE);
+    profile(BASE, Stage::TransformerRef, DenoiserSplit::WHOLE);
 }
 
 #[test]
 #[ignore = "requires /workspace/models/FastVideo-FastH3-8-Step-V2"]
 fn the_eight_step_student_profiles_a_small_and_a_large_layout() {
-    profile(FAST_8_STEP, Stage::Transformer, SequenceSplit::WHOLE);
+    profile(FAST_8_STEP, Stage::Transformer, DenoiserSplit::WHOLE);
 }
 
 #[test]
 #[ignore = "requires /workspace/models/FastVideo-FastH3-4-step-Preview-v1-VSA-DataFree"]
 fn the_four_step_student_profiles_a_small_and_a_large_layout() {
-    profile(FAST_4_STEP, Stage::Transformer, SequenceSplit::WHOLE);
+    profile(FAST_4_STEP, Stage::Transformer, DenoiserSplit::WHOLE);
 }
 
 /// A rank of a sequence split of four, under each projection: the dense network returns its
@@ -289,13 +292,59 @@ fn the_four_step_student_profiles_a_small_and_a_large_layout() {
 #[ignore = "requires /workspace/models/MiniMax-H3 and the four-step FastH3 student"]
 fn a_rank_of_a_sequence_split_profiles_under_each_projection() {
     for projection in [Projection::Gather, Projection::Exchange] {
-        let sequence = SequenceSplit {
-            split: Split { size: 4, rank: 1 },
-            projection,
+        let sequence = DenoiserSplit {
+            ulysses: SequenceSplit {
+                split: Split { size: 4, rank: 1 },
+                projection,
+            },
+            ..DenoiserSplit::WHOLE
         };
 
         profile(BASE, Stage::Transformer, sequence);
         profile(FAST_4_STEP, Stage::Transformer, sequence);
+    }
+}
+
+/// A rank of each four-rank partition the deployment page offers beside Ulysses alone: the
+/// tensor split, the all-gather split, the hybrid of both sequence splits, the tensor split of a
+/// Ulysses split and the layer split, for the dense network and the sparse one; each rank loads
+/// its share and profiles its step over its own rows.
+#[test]
+#[ignore = "requires /workspace/models/MiniMax-H3 and the eight-step FastH3 student"]
+fn a_rank_of_each_four_rank_partition_profiles_its_share() {
+    let partitions = [
+        DenoiserSplit {
+            tensor: Split { size: 4, rank: 2 },
+            ..DenoiserSplit::WHOLE
+        },
+        DenoiserSplit {
+            gather: Split { size: 4, rank: 1 },
+            ..DenoiserSplit::WHOLE
+        },
+        DenoiserSplit {
+            ulysses: SequenceSplit {
+                split: Split { size: 2, rank: 1 },
+                projection: Projection::Gather,
+            },
+            gather: Split { size: 2, rank: 1 },
+            ..DenoiserSplit::WHOLE
+        },
+        DenoiserSplit {
+            ulysses: SequenceSplit {
+                split: Split { size: 2, rank: 1 },
+                projection: Projection::Exchange,
+            },
+            tensor: Split { size: 2, rank: 1 },
+            ..DenoiserSplit::WHOLE
+        },
+        DenoiserSplit {
+            layers: Split { size: 4, rank: 1 },
+            ..DenoiserSplit::WHOLE
+        },
+    ];
+    for partition in partitions {
+        profile(FAST_8_STEP, Stage::Transformer, partition);
+        profile(BASE, Stage::Transformer, partition);
     }
 }
 
@@ -306,9 +355,9 @@ fn a_rank_of_a_sequence_split_profiles_under_each_projection() {
 #[test]
 #[ignore = "requires /workspace/models/FastVideo-FastH3-4-step-Preview-v1-VSA-DataFree-NVFP4"]
 fn the_nvfp4_export_profiles_a_small_and_a_large_layout() {
-    profile(FAST_4_STEP_NVFP4, Stage::Transformer, SequenceSplit::WHOLE);
+    profile(FAST_4_STEP_NVFP4, Stage::Transformer, DenoiserSplit::WHOLE);
 
-    let encoder = load(FAST_4_STEP_NVFP4, Stage::TextEncoder, SequenceSplit::WHOLE).unwrap();
+    let encoder = load(FAST_4_STEP_NVFP4, Stage::TextEncoder, DenoiserSplit::WHOLE).unwrap();
     assert!(encoder.text_encoder().is_some());
 }
 
@@ -316,7 +365,7 @@ fn the_nvfp4_export_profiles_a_small_and_a_large_layout() {
 fn small_step_operators(model: &dyn VideoModel) -> BTreeSet<&'static str> {
     let requests = candidates(model);
     let (small, _) = requests.first().unwrap();
-    let (launches, _) = step(model, SequenceSplit::WHOLE, small);
+    let (launches, _) = step(model, DenoiserSplit::WHOLE, small);
 
     launches.into_iter().map(|(operator, _)| operator).collect()
 }
@@ -339,7 +388,7 @@ fn the_precision_policy_reads_against_the_released_headers() {
         let model = load_under(
             FAST_4_STEP,
             Stage::Transformer,
-            SequenceSplit::WHOLE,
+            DenoiserSplit::WHOLE,
             &policy,
         )
         .unwrap_or_else(|error| panic!("{policy}: {error}"));
@@ -359,7 +408,7 @@ fn the_precision_policy_reads_against_the_released_headers() {
         let error = load_under(
             FAST_4_STEP,
             Stage::Transformer,
-            SequenceSplit::WHOLE,
+            DenoiserSplit::WHOLE,
             &policy,
         )
         .err()
@@ -370,7 +419,7 @@ fn the_precision_policy_reads_against_the_released_headers() {
     let packed = load_under(
         FAST_4_STEP_NVFP4,
         Stage::Transformer,
-        SequenceSplit::WHOLE,
+        DenoiserSplit::WHOLE,
         &Quantization::default(),
     )
     .unwrap();
@@ -384,7 +433,7 @@ fn the_precision_policy_reads_against_the_released_headers() {
     let error = load_under(
         FAST_4_STEP_NVFP4,
         Stage::Transformer,
-        SequenceSplit::WHOLE,
+        DenoiserSplit::WHOLE,
         &policy,
     )
     .err()

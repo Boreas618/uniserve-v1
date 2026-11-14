@@ -21,16 +21,27 @@
 //! the stack's type once after its input projection and back once before the output heads, and
 //! both products are FP32 on both sides.
 //!
-//! ## Sequence parallelism
+//! ## Parallelism
 //!
-//! A rank of a sequence split holds a contiguous interval of the packed rows and every head;
-//! [`UlyssesAttention`] trades the interval for this rank's heads of the whole sequence around
-//! the attention and back. A sparse block returns its attended rows interval by interval, so an
-//! interval's output projection and feed-forward run while the later intervals travel, and
-//! under the gather projection the next block's normalized rows of a finished interval start
-//! travelling beside the rest of the block ([`Block::forward_exchanged`]).
+//! A rank holds its place in the deployment's partition ([`DenoiserSplit`]):
+//!
+//! - **Sequence.** A rank holds a contiguous interval of the packed rows. [`UlyssesAttention`]
+//!   trades a Ulysses group's intervals for its members' heads of the group's rows around the
+//!   attention and back. Under an all-gather degree each group holds one interval of the
+//!   sequence: its queries attend the whole sequence's keys and values, which the groups gather
+//!   ([`VsaAttention::attend_gathered`]). A sparse block of a Ulysses split alone returns its
+//!   attended rows interval by interval, so an interval's output projection and feed-forward run
+//!   while the later intervals travel, and under the gather projection the next block's
+//!   normalized rows of a finished interval start travelling beside the rest of the block
+//!   ([`Block::forward_exchanged`]).
+//! - **Tensor.** Every block's heads and feed-forward width are split; the output projection and
+//!   the feed-forward's down projection reduce over the tensor group.
+//! - **Layers.** A stage holds consecutive blocks; its output is broadcast to every stage, the
+//!   next stage's input and, from the last stage, every stage's rows, which each reads the heads
+//!   over.
 
-use nn::family::{Projection, SequenceSplit};
+use nn::collective;
+use nn::family::{DenoiserSplit, GATHER_AXIS, LAYER_AXIS, Projection, TENSOR_AXIS, ULYSSES_AXIS};
 use nn::functional::{self, Activation, Rounding, WeightOrder};
 use nn::modules::{
     AdaLnBlock, AdaLnBlockConfig, AdaLnOut, AdaLnOutConfig, GateUp, Linear, LinearConfig,
@@ -68,10 +79,10 @@ pub(crate) const BLOCKS: &str = "transformer_blocks";
 /// the value half and the gate half, and the one back to the hidden width.
 pub(crate) const FEED_FORWARD: [&str; 2] = ["ff.net.0.proj", "ff.net.2"];
 
-/// The value-first SwiGLU of a block: the checkpoint fuses the feed-forward's value half first
-/// and its gate half second, and `silu(gate)` and the product each round once, as the
-/// reference's activation rounds.
-pub(crate) fn mlp_config(config: &TransformerConfig) -> MlpConfig {
+/// The value-first SwiGLU of a block, its gated width split by `tensor`: the checkpoint fuses
+/// the feed-forward's value half first and its gate half second, and `silu(gate)` and the
+/// product each round once, as the reference's activation rounds.
+pub(crate) fn mlp_config(config: &TransformerConfig, tensor: Split) -> MlpConfig {
     let [gate_up, down] = FEED_FORWARD;
 
     MlpConfig {
@@ -82,7 +93,7 @@ pub(crate) fn mlp_config(config: &TransformerConfig) -> MlpConfig {
         gate_up: GateUp::ValueFirst(gate_up),
         down,
         bias: false,
-        split: Split::WHOLE,
+        split: tensor,
     }
 }
 
@@ -101,8 +112,8 @@ pub fn rotary_config(config: &TransformerConfig) -> RotaryConfig {
     }
 }
 
-/// One block's attention over this rank's heads of the whole sequence, inside the
-/// sequence-parallel projections.
+/// One block's attention over this rank's heads of its Ulysses group's rows, inside the
+/// sequence-parallel projections; under an all-gather degree over the whole sequence's keys.
 ///
 /// The queries and keys of every head are normalized by the block's gains and their leading
 /// channels rotated; H3 rotates 96 of a head's 128 channels over the three coordinates. The
@@ -111,6 +122,9 @@ pub fn rotary_config(config: &TransformerConfig) -> RotaryConfig {
 /// projection ([`VsaAttention`]).
 pub struct Attention {
     ulysses: UlyssesAttention,
+    /// This rank's place in its all-gather group: which interval of the sequence its Ulysses
+    /// group's rows are.
+    gather: Split,
     /// The `[head_dim]` gains of the queries' and of the keys' normalization.
     query_gain: Tensor,
     key_gain: Tensor,
@@ -124,21 +138,22 @@ pub struct Attention {
 }
 
 impl Attention {
-    /// The attention the module at `vb` states (`transformer_blocks.<i>.attn`), at `sequence`'s
-    /// rank. `max_rows` is the deployment's bound on the packed rows of a layout.
+    /// The attention the module at `vb` states (`transformer_blocks.<i>.attn`), at `split`'s
+    /// place. `max_rows` is the deployment's bound on the packed rows of a layout.
     ///
     /// # Errors
     ///
-    /// A sequence split that does not divide the heads, or a weight the loader refuses.
+    /// A tensor and Ulysses split that do not divide the heads, or a weight the loader refuses.
     pub fn load(
         config: &DenoiserConfig,
-        sequence: SequenceSplit,
+        split: DenoiserSplit,
         max_rows: u32,
         vb: VarBuilder<'_, '_>,
     ) -> Result<Self> {
         let transformer = &config.transformer;
         let head_dim = transformer.head_dim as usize;
-        let local_heads = transformer.num_attention_heads / sequence.split.size.max(1);
+        let shares = split.ulysses.split.size * split.tensor.size;
+        let local_heads = transformer.num_attention_heads / shares.max(1);
         let rotary = rotary_config(transformer);
 
         let inputs: &'static [&'static str] = match config.vsa {
@@ -152,8 +167,10 @@ impl Attention {
                 head_dim: transformer.head_dim,
                 inputs,
                 output: "to_out.0",
-                split: sequence.split,
-                projection: sequence.projection,
+                split: split.ulysses.split,
+                projection: split.ulysses.projection,
+                tensor: split.tensor,
+                axis: ULYSSES_AXIS,
             },
             vb.clone(),
         )?;
@@ -182,6 +199,7 @@ impl Attention {
             query_gain: vb.pp("norm_q").get(head_dim, "weight")?,
             key_gain: vb.pp("norm_k").get(head_dim, "weight")?,
             ulysses,
+            gather: split.gather,
             vsa,
             head_dim,
             eps: transformer.qk_norm_eps,
@@ -195,9 +213,23 @@ impl Attention {
         self.ulysses.dtype()
     }
 
-    /// Whether the rows cross ranks, so a sparse block returns them interval by interval.
-    fn exchanges(&self) -> bool {
-        self.ulysses.exchanges()
+    /// The first row and the rows of this rank's Ulysses group's interval of a sequence of
+    /// `rows` packed rows: the whole sequence without an all-gather degree.
+    fn interval(&self, rows: usize) -> (usize, usize) {
+        let own = rows / self.gather.size.max(1) as usize;
+        (self.gather.rank as usize * own, own)
+    }
+
+    /// The rotary tables `factors` of the whole sequence narrowed to the interval of `rows`
+    /// rows from `first`.
+    fn narrowed(
+        factors: (&Tensor, &Tensor),
+        (first, rows): (usize, usize),
+    ) -> Result<(Tensor, Tensor)> {
+        Ok((
+            factors.0.narrow(0, first, rows)?.contiguous()?,
+            factors.1.narrow(0, first, rows)?.contiguous()?,
+        ))
     }
 
     /// `rows`, `[rows, local heads · head_dim]`, as `[rows, local heads, head_dim]`.
@@ -216,6 +248,10 @@ impl Attention {
     /// sparse one each tile's valid rows, its segment and each segment's kept tiles
     /// ([`crate::minimax_h3::packing::tile_table`]).
     ///
+    /// Under an all-gather degree the projections hold this rank's Ulysses group's interval of
+    /// the sequence: its queries attend the whole sequence's keys and values, gathered along the
+    /// all-gather group, and the dense query offsets are the interval's own.
+    ///
     /// # Errors
     ///
     /// Another number of tables than the attention reads, or what a module refuses.
@@ -227,6 +263,7 @@ impl Attention {
     ) -> Result<Tensor> {
         let ulysses = &self.ulysses;
         let rows = ulysses.rows(normalized)?;
+        let gathers = self.gather.size > 1;
 
         let Some(vsa) = &self.vsa else {
             let [queries, keys] = tables else {
@@ -238,20 +275,46 @@ impl Attention {
             let key = self.headed(&ulysses.project(1, &rows)?)?;
             let value = self.headed(&ulysses.project(2, &rows)?)?;
 
+            // The interval's own rows of the sequence, whose rotation they take.
+            let sequence = factors.0.dims()[0];
+            let interval = self.interval(sequence);
+            let narrowed = match gathers {
+                true => Some(Self::narrowed(factors, interval)?),
+                false => None,
+            };
+            let (cos, sin) = narrowed.as_ref().map_or(factors, |(cos, sin)| (cos, sin));
+
             let (query, key) = functional::qk_norm_rope(
                 &query,
                 &key,
                 Some((&self.query_gain, &self.key_gain)),
-                factors.0,
-                factors.1,
+                cos,
+                sin,
                 self.eps,
                 false,
             )?;
+
+            // Every interval's keys and values in sequence order, and the interval's own rows as
+            // the one sequence of queries.
+            let (key, value, queries) = match gathers {
+                true => {
+                    let (key, value) = collective::along(GATHER_AXIS, || {
+                        Ok((
+                            collective::gathered(&key.contiguous()?)?,
+                            collective::gathered(&value.contiguous()?)?,
+                        ))
+                    })?;
+                    let offsets = Tensor::new(&[0_u32, interval.1 as u32], &Device::Cpu)?
+                        .to_device(query.device())?;
+                    (key, value, offsets)
+                }
+                false => (key, value, queries.clone()),
+            };
             let attended = functional::dense_attention_varlen(
                 &query,
                 &key,
                 &value,
-                queries,
+                &queries,
                 keys,
                 None,
                 self.max_rows,
@@ -268,7 +331,19 @@ impl Attention {
         let value = ulysses.project(2, &rows)?;
         let gate = ulysses.project(GATE, &rows)?;
 
-        let (fine, compressed) = vsa.attend((query, key, value), Some(factors), tiles(tables)?)?;
+        let (fine, compressed) = match gathers {
+            false => vsa.attend((query, key, value), Some(factors), tiles(tables)?)?,
+            true => {
+                let interval = self.interval(factors.0.dims()[0]);
+                let (cos, sin) = Self::narrowed(factors, interval)?;
+                let first = interval.0 / vsa.tile_rows() as usize;
+
+                let tables = tiles(tables)?;
+                collective::along(GATHER_AXIS, || {
+                    vsa.attend_gathered((query, key, value), Some((&cos, &sin)), tables, first)
+                })?
+            }
+        };
         let folded = vsa.add_gated_(fine, &compressed, &gate)?;
 
         Ok(ulysses.return_rows(&folded)?)
@@ -292,6 +367,8 @@ pub struct Block {
     /// The modulated norms and the value-first SwiGLU.
     adaln: AdaLnBlock,
     attention: Attention,
+    /// The tensor split of the block's heads and feed-forward width.
+    tensor: Split,
     /// The block's path in the checkpoint, which names its profiler range.
     path: String,
 }
@@ -304,7 +381,7 @@ impl Block {
     /// A weight the loader refuses.
     pub fn load(
         config: &DenoiserConfig,
-        sequence: SequenceSplit,
+        split: DenoiserSplit,
         max_rows: u32,
         vb: VarBuilder<'_, '_>,
     ) -> Result<Self> {
@@ -317,11 +394,12 @@ impl Block {
                     eps: transformer.norm_eps,
                     norm1: "norm1",
                     norm2: "norm2",
-                    mlp: mlp_config(transformer),
+                    mlp: mlp_config(transformer, split.tensor),
                 },
                 vb.clone(),
             )?,
-            attention: Attention::load(config, sequence, max_rows, vb.pp("attn"))?,
+            attention: Attention::load(config, split, max_rows, vb.pp("attn"))?,
+            tensor: split.tensor,
             path: vb.path().to_owned(),
         })
     }
@@ -340,9 +418,17 @@ impl Block {
         factors: (&Tensor, &Tensor),
         tables: &[Tensor],
     ) -> Result<Tensor> {
-        Ok(self.adaln.forward(table, rows, hidden, |normalized| {
-            Ok(self.attention.forward(normalized, factors, tables)?)
-        })?)
+        // The output projection and the feed-forward's down projection reduce their partial
+        // sums along the tensor group.
+        let forward = || {
+            self.adaln.forward(table, rows, hidden, |normalized| {
+                Ok(self.attention.forward(normalized, factors, tables)?)
+            })
+        };
+        match self.tensor.size {
+            1 => Ok(forward()?),
+            _ => Ok(collective::along(TENSOR_AXIS, forward)?),
+        }
     }
 
     /// A sparse block across ranks: the attended rows return to their owners interval by
@@ -600,6 +686,10 @@ impl OutputHead {
 }
 
 /// One network of the checkpoint: the input projections, the stack and the output heads.
+///
+/// A stage of a layer split holds its consecutive blocks of the stack alone, and every stage
+/// the end projections and heads, which are small beside a block: every stage projects the
+/// latents and reads the velocities, and only the first stage's projected rows enter the stack.
 pub struct Transformer {
     /// The projection of a video patch row into the hidden width, FP32.
     proj_in: Linear,
@@ -607,7 +697,14 @@ pub struct Transformer {
     audio_proj_in: Linear,
     /// The stack's one rotary embedding, whose factors every block turns by.
     rotary: Rotary,
+    /// This stage's blocks of the stack, the first of them the stack's block `first_block`.
     blocks: Vec<Block>,
+    first_block: usize,
+    /// The layer split: this rank's stage among the stack's.
+    layers: Split,
+    /// Whether the stack runs its blocks across a Ulysses split alone, returning a sparse
+    /// block's rows interval by interval ([`Self::forward_exchanged`]).
+    overlapped: bool,
     norm_out: AdaLnOut,
     video_out: OutputHead,
     audio_out: OutputHead,
@@ -615,15 +712,16 @@ pub struct Transformer {
 }
 
 impl Transformer {
-    /// The network the checkpoint at `vb` states, at `sequence`'s rank. `max_rows` is the
-    /// deployment's bound on the packed rows of a layout.
+    /// The network the checkpoint at `vb` states, at `split`'s place: this stage's blocks of
+    /// the stack. `max_rows` is the deployment's bound on the packed rows of a layout.
     ///
     /// # Errors
     ///
-    /// A weight the loader refuses, or a schedule whose head weights do not fit the heads.
+    /// A weight the loader refuses, a schedule whose head weights do not fit the heads, or a
+    /// layer split of more stages than blocks.
     pub fn load(
         config: &DenoiserConfig,
-        sequence: SequenceSplit,
+        split: DenoiserSplit,
         max_rows: u32,
         vb: VarBuilder<'_, '_>,
     ) -> Result<Self> {
@@ -650,15 +748,31 @@ impl Transformer {
             OutputHead::load(transformer, out, weights.as_deref(), vb.pp(name))
         };
 
-        let blocks = (0..transformer.num_hidden_layers)
-            .map(|index| Block::load(config, sequence, max_rows, vb.pp(BLOCKS).pp(index)))
+        if split.layers.size == 0 || split.layers.size > transformer.num_hidden_layers {
+            return Err(Error::config(format!(
+                "a layer split of {} stages over a stack of {} blocks",
+                split.layers.size, transformer.num_hidden_layers
+            )));
+        }
+        let stage = split.stage_blocks(transformer.num_hidden_layers);
+        let blocks = stage
+            .clone()
+            .map(|index| Block::load(config, split, max_rows, vb.pp(BLOCKS).pp(index)))
             .collect::<Result<Vec<_>>>()?;
+        let overlapped = config.vsa.is_some()
+            && split.ulysses.split.size > 1
+            && split.gather.size == 1
+            && split.tensor.size == 1
+            && split.layers.size == 1;
 
         Ok(Self {
             proj_in: project_in("proj_in", transformer.patch_width())?,
             audio_proj_in: project_in("audio_proj_in", transformer.audio_channels)?,
             rotary: Rotary::load(&rotary_config(transformer), vb.pp("rotary_emb"))?,
             blocks,
+            first_block: stage.start as usize,
+            layers: split.layers,
+            overlapped,
             norm_out: AdaLnOut::load(
                 &AdaLnOutConfig {
                     hidden,
@@ -775,14 +889,15 @@ impl Transformer {
         Ok(self.audio_proj_in.forward(&rows.to_dtype(DType::F32)?)?)
     }
 
-    /// Block `index`'s modulation at `entries`: the gathered `[groups, 18 · hidden]` rows read
-    /// as `[3 · groups, 6 · hidden]`, group `g`'s row holding its three tags' six vectors each
+    /// The modulation of this stage's block `index` at `entries`: the stack block's gathered
+    /// `[groups, 18 · hidden]` rows read as `[3 · groups, 6 · hidden]`, group `g`'s row holding
+    /// its three tags' six vectors each
     /// (`refs/vllm-omni/…/minimax_h3/minimax_h3_blocks.py:736-745`).
     fn modulation(&self, table: &TimestepTable, index: usize, entries: &Tensor) -> Result<Tensor> {
         let groups = entries.elem_count();
 
         Ok(table
-            .layer(index, entries)?
+            .layer(self.first_block + index, entries)?
             .reshape((groups * TAGS, BLOCK_VECTORS * self.hidden))?)
     }
 
@@ -807,23 +922,41 @@ impl Transformer {
         tables: &[Tensor],
     ) -> Result<Tensor> {
         nn::profiler::range(TRANSFORMER, "transformer", || {
-            let exchanged = self
-                .blocks
-                .first()
-                .is_some_and(|block| block.attention.vsa.is_some() && block.attention.exchanges());
-            if !exchanged {
-                return self.blocks.iter().enumerate().try_fold(
-                    hidden.clone(),
-                    |hidden, (index, block)| {
+            if self.overlapped {
+                return self.forward_exchanged(table, entries, hidden, rows, factors, tables);
+            }
+
+            let blocks = |hidden: Tensor| -> Result<Tensor> {
+                self.blocks
+                    .iter()
+                    .enumerate()
+                    .try_fold(hidden, |hidden, (index, block)| {
                         nn::profiler::range(TRANSFORMER_BLOCK, &block.path, || {
                             let modulation = self.modulation(table, index, entries)?;
                             block.forward(&modulation, rows, &hidden, factors, tables)
                         })
-                    },
-                );
+                    })
+            };
+            let (stages, stage) = (self.layers.size, self.layers.rank);
+            if stages == 1 {
+                return blocks(hidden.clone());
             }
 
-            self.forward_exchanged(table, entries, hidden, rows, factors, tables)
+            // The stages pass the rows on as one collective of every stage per stage, in stage
+            // order: each stage's output is broadcast from it, so a stage holds its input once
+            // the stage before broadcast, and every stage the last stage's output at the end.
+            // Every stage posts the same collectives in the same order, as a sequence split's
+            // exchanges are, and none waits for a pair of its own.
+            let mut held = hidden.clone();
+            for root in 0..stages {
+                if root == stage {
+                    held = blocks(held)?;
+                }
+                held = collective::along(LAYER_AXIS, || {
+                    collective::broadcast(&held.contiguous()?, root)
+                })?;
+            }
+            Ok(held)
         })
     }
 

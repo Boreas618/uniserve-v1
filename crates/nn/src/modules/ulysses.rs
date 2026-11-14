@@ -18,9 +18,13 @@
 //! [`UlyssesAttention::receive`]), so an interval's output projection runs while the later
 //! intervals travel.
 //!
+//! Inside a tensor split the module holds its tensor rank's heads alone: each member's share is
+//! a share of those, and the output projection reduces its partial sums over the tensor group,
+//! the axis the caller's forward addresses.
+//!
 //! The module holds the projections around the attention and the split, never a communicator:
-//! the collectives are the forward's group's ([`crate::collective`]). The attention between
-//! the projections is the model's own.
+//! its exchanges and gathers go along the axis its config names of the forward's partition
+//! ([`crate::collective::along`]), and the attention between the projections is the model's own.
 
 use std::ops::Range;
 
@@ -57,6 +61,12 @@ pub struct UlyssesAttentionConfig {
     pub split: Split,
     /// How a member reaches its heads of every row.
     pub projection: Projection,
+    /// The tensor split of the heads: the module holds its tensor rank's share of them, and its
+    /// output projection sums its share of the contraction over the tensor group.
+    pub tensor: Split,
+    /// The axis of the forward's partition its exchanges and gathers go along
+    /// ([`crate::collective::along`]).
+    pub axis: usize,
 }
 
 /// Sequence-parallel attention: the head-split projections around a model's attention.
@@ -77,23 +87,28 @@ impl UlyssesAttention {
     ///
     /// A group whose size does not divide the heads, or a projection the loader refuses.
     pub fn load(config: &UlyssesAttentionConfig, vb: VarBuilder<'_, '_>) -> Result<Self> {
-        let split = config.split;
-        if split.size == 0 || !config.heads.is_multiple_of(split.size) {
+        let (split, tensor) = (config.split, config.tensor);
+        let shares = split.size.saturating_mul(tensor.size);
+        if shares == 0 || !config.heads.is_multiple_of(shares) || tensor.rank >= tensor.size {
             return Err(Error::shape(
                 "UlyssesAttention",
-                format!("{} heads over a group of {}", config.heads, split.size),
+                format!(
+                    "{} heads over a group of {} inside a tensor split of {}",
+                    config.heads, split.size, tensor.size
+                ),
             ));
         }
         let inner_width = config.heads * config.head_dim;
 
-        // One member's head rows of the input projection `name`.
+        // One member's head rows of the input projection `name`: its share of its tensor rank's
+        // heads, which lie together.
         let member = |name: &str, rank: u32| -> Result<Linear> {
-            let parallel = if split.size == 1 {
+            let parallel = if shares == 1 {
                 Parallel::None
             } else {
                 Parallel::Column(Split {
-                    size: split.size,
-                    rank,
+                    size: shares,
+                    rank: tensor.rank * split.size + rank,
                 })
             };
 
@@ -124,7 +139,11 @@ impl UlyssesAttention {
                 inputs: inner_width,
                 outputs: config.hidden,
                 bias: false,
-                parallel: Parallel::None,
+                parallel: if tensor.size == 1 {
+                    Parallel::None
+                } else {
+                    Parallel::Row(tensor)
+                },
             },
             vb.pp(config.output),
         )?;
@@ -156,9 +175,9 @@ impl UlyssesAttention {
         self.config.heads
     }
 
-    /// The heads this member attends.
+    /// The heads this member attends: its share of its tensor rank's.
     pub const fn local_heads(&self) -> u32 {
-        self.config.heads / self.config.split.size
+        self.config.heads / (self.config.split.size * self.config.tensor.size)
     }
 
     /// Channels of one head.
@@ -204,7 +223,9 @@ impl UlyssesAttention {
         };
         let gathered = ops::empty((rows * self.members(), hidden), normalized.dtype())?;
 
-        collective::all_gather(normalized, &gathered)?;
+        collective::along(self.config.axis, || {
+            collective::all_gather(normalized, &gathered)
+        })?;
         Ok(gathered)
     }
 
@@ -264,7 +285,9 @@ impl UlyssesAttention {
         self.require_split()?;
 
         let received = ops::empty(send.shape(), send.dtype())?;
-        let started = collective::start_all_to_all(send, &received)?;
+        let started = collective::along(self.config.axis, || {
+            collective::start_all_to_all(send, &received)
+        })?;
         Ok((received, started))
     }
 
@@ -276,7 +299,7 @@ impl UlyssesAttention {
     /// When the forward has no group.
     pub fn finish(&self, started: usize) -> Result<()> {
         self.require_split()?;
-        collective::finish(started)
+        collective::along(self.config.axis, || collective::finish(started))
     }
 
     /// Starts delivering rows `rows` of this member's `own` rows to every member, and theirs
@@ -289,7 +312,14 @@ impl UlyssesAttention {
     pub fn start_gather(&self, gathered: &Tensor, own: usize, rows: Range<usize>) -> Result<usize> {
         self.require_split()?;
 
-        collective::start_gather_rows(gathered, own as u64, rows.start as u64, rows.len() as u64)
+        collective::along(self.config.axis, || {
+            collective::start_gather_rows(
+                gathered,
+                own as u64,
+                rows.start as u64,
+                rows.len() as u64,
+            )
+        })
     }
 
     /// `attended`, `[sequence rows, local heads · head_dim]`, returned to each member's rows,
@@ -349,7 +379,7 @@ impl UlyssesAttention {
         self.require_split()?;
 
         let received = ops::empty(send.shape(), send.dtype())?;
-        collective::all_to_all(send, &received)?;
+        collective::along(self.config.axis, || collective::all_to_all(send, &received))?;
         Ok(received)
     }
 
@@ -379,9 +409,10 @@ impl UlyssesAttention {
         Ok(())
     }
 
-    /// Refuses a forward that is not split over this module's group.
+    /// Refuses a forward that is not split over this module's group along its axis.
     fn require_split(&self) -> Result<()> {
-        let Some((_, ranks)) = collective::split() else {
+        let Some((_, ranks)) = collective::along(self.config.axis, || Ok(collective::split()))?
+        else {
             return Err(Error::Unsupported(
                 "UlyssesAttention: a sequence-parallel exchange needs the group it runs over"
                     .to_owned(),

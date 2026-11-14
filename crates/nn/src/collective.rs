@@ -38,6 +38,21 @@ pub fn split() -> Option<(u64, u64)> {
     ops::collective::split()
 }
 
+/// Runs `operation` with the forward's collectives and [`split`] along axis `axis` of its
+/// partition, and the axis addressed before again once it returns.
+///
+/// A module partitioned along several axes (a sequence split inside a tensor split) addresses
+/// each collective's axis this way; outside any, the collectives go along the first. Which axis
+/// is which is the family's statement, which execution follows when it states the axes'
+/// groups. A collective started along an axis is finished along it.
+///
+/// # Errors
+///
+/// When no context is installed or it states no such axis, or what `operation` returns.
+pub fn along<T>(axis: usize, operation: impl FnOnce() -> Result<T>) -> Result<T> {
+    ops::collective::along(axis, operation)?
+}
+
 /// Sums every rank's `x` into every rank's `x`, in place.
 ///
 /// `x` has the same shape and element type on every rank.
