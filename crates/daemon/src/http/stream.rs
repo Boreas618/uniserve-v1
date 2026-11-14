@@ -20,7 +20,10 @@
 //!   response is adopted (`Adopted`);
 //! - a migration of the request's engine stream is performed outside the
 //!   cancellation of the control poll, so an engine that moves the request
-//!   never leaves the pipeline half-migrated.
+//!   never leaves the pipeline half-migrated;
+//! - a connection that drops its handle without a decision (its client left,
+//!   or it failed) ends the session at once and cancels the request, whatever
+//!   the session waits for.
 //!
 //! The connection translates each frame a body yields into HTTP/1.1 framing,
 //! so a frame always ends in the socket or in the predecessor's unwritten
@@ -75,7 +78,8 @@ enum Control {
     /// stream to it (never cancelling the request).
     Adopted,
     /// The connection answered the response without its body, because the
-    /// deadline of its held head passed: stop and cancel the request.
+    /// deadline of its held head passed: stop and cancel the request. A
+    /// connection that drops its handle ends the response the same way.
     Abort,
 }
 
@@ -404,8 +408,14 @@ async fn drive(
         let step = std::future::poll_fn(|cx| {
             // A message takes precedence, so a pause stops at the boundary
             // just reached rather than after the next event.
-            if let Poll::Ready(Some(message)) = control.poll_recv(cx) {
-                return Poll::Ready(Driven::Message(message));
+            match control.poll_recv(cx) {
+                Poll::Ready(Some(message)) => return Poll::Ready(Driven::Message(message)),
+                // The connection dropped its handle without a decision: its
+                // client left, or it failed, and nothing writes this body any
+                // more. The request ends now, as an abort ends it, rather
+                // than when its next output finds no reader.
+                Poll::Ready(None) => return Poll::Ready(Driven::Message(Control::Abort)),
+                Poll::Pending => {}
             }
             session.poll_step(cx).map(Driven::Step)
         })

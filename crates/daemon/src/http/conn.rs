@@ -21,6 +21,15 @@
 //! [`Decision::Adopt`] ends the connection without writing another byte, the
 //! successor owning the socket from then on.
 //!
+//! While a request is served, the connection watches its client
+//! ([`Connection::closed`]): a client that closes or resets the connection
+//! ends its request at once, whatever the request waits for. A handler still
+//! running is dropped, and a response body waiting for its engine's first or
+//! next output is dropped; either drops the request's engine events, which
+//! cancels the request on the engine. The disconnect is not left for the
+//! response's next write to find, which for a request still being admitted
+//! comes only after its prefill.
+//!
 //! Only HTTP/1.1 is served, as the design requires: HTTP/2's connection state
 //! (the HPACK table, flow-control windows, stream numbering) cannot be
 //! exported, while HTTP/1.1's is exactly the framing position and the two byte
@@ -149,8 +158,20 @@ pub(crate) async fn adopt(
     // the bytes in `unwritten` are provisional, so the body's first output
     // decides the head here, exactly as it does on the process that held it.
     let mut started = Some(started);
+    // The connection watches the client while the body waits, as the process
+    // that held the response did. Every route whose response a successor adopts
+    // reads its request's body to its end before it answers, so the socket's
+    // next bytes are the client's next request or its end of stream.
+    let body_ended = true;
     if http.head_held && http.written == 0 {
-        match body.opened().await {
+        let opened = tokio::select! {
+            opened = body.opened() => opened,
+            // Dropping the body on the way out cancels the request.
+            () = connection.closed(body_ended) => {
+                anyhow::bail!("the client left before the adopted response's document existed")
+            }
+        };
+        match opened {
             Opened::Frame(frame) => {
                 connection.write(&http.unwritten, None).await?;
                 if let Some(started) = started.take() {
@@ -191,7 +212,16 @@ pub(crate) async fn adopt(
     // The predecessor's bytes are out and the next frame is this process's own:
     // §7.5.1's pause ends here. A body with nothing left is at its end, so it
     // reports the same moment before the terminator rather than not at all.
-    while let Some(frame) = body.next_frame().await {
+    loop {
+        let frame = tokio::select! {
+            frame = body.next_frame() => frame,
+            () = connection.closed(body_ended) => {
+                anyhow::bail!("the client left during the adopted response")
+            }
+        };
+        let Some(frame) = frame else {
+            break;
+        };
         if let Some(started) = started.take() {
             started();
         }
@@ -282,7 +312,8 @@ struct Connection {
     /// head and body, or bytes of the request in flight its reader has not
     /// asked for yet.
     buffer: BytesMut,
-    /// Whether the peer closed its writing side.
+    /// Whether the peer closed its writing side, or the connection failed
+    /// under a read.
     peer_closed: bool,
     /// Response bytes queued for the socket that the kernel has not accepted
     /// yet. A pause freezes the response with exactly these bytes, so a slow
@@ -413,6 +444,11 @@ impl Connection {
                     };
                 }
                 () = body.wanted.notified() => {}
+                // The client left while the handler ran: dropping the handler
+                // drops what it holds, so a request it submitted is cancelled
+                // (a route that generates before it responds holds its
+                // request's engine events here).
+                () = self.closed(body.complete()) => return Ok(None),
             }
         }
     }
@@ -473,6 +509,52 @@ impl Connection {
                 }
                 Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
                 Err(error) => return Err(error).context("reading from a connection"),
+            }
+        }
+    }
+
+    /// Resolves once the client is gone: it closed the connection or its
+    /// writing side, or a read failed. Never resolves while the client stays.
+    ///
+    /// The connection selects this against each wait a request's engine can
+    /// hold up (its handler, a held head, a handed body's next frame), so that
+    /// a client that leaves ends its request at once. `body_ended` states
+    /// whether the request's body was read to its end: before that, the
+    /// socket's bytes are the body's and nothing is read here. After it, the
+    /// socket's next bytes are the client's next request or its end of
+    /// stream. The first read that brings bytes keeps them in
+    /// [`Self::buffer`] for that request, and nothing more is read until it
+    /// is served, so a client that pipelines is read at most one read ahead.
+    /// This is how hyper's HTTP/1 server watches a connection in the middle
+    /// of a message, and like its default it takes a client that shuts its
+    /// writing side for one that left.
+    ///
+    /// Cancel safe: a read that completes has moved its bytes into the buffer
+    /// before the future can be dropped.
+    async fn closed(&mut self, body_ended: bool) {
+        loop {
+            if self.peer_closed {
+                return;
+            }
+            if !body_ended || !self.buffer.is_empty() {
+                return std::future::pending().await;
+            }
+            // Room for one read as large as a connection of the workspace
+            // reads at a time.
+            self.buffer.reserve(service::READ_CHUNK);
+            match self.io.read_buf(&mut self.buffer).await {
+                Ok(0) => {
+                    debug!("a client closed its connection while its request was served");
+                    self.peer_closed = true;
+                    return;
+                }
+                Ok(_) => {}
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+                Err(error) => {
+                    debug!(%error, "a connection failed while its request was served");
+                    self.peer_closed = true;
+                    return;
+                }
             }
         }
     }
@@ -597,6 +679,10 @@ impl Connection {
                             break Some(handed.stream.opened().await);
                         }
                     }
+                    // The client left before its document existed: nothing of
+                    // the response is written, and dropping its body cancels
+                    // the request.
+                    () = self.closed(body.complete()) => return Ok(Outcome::Close),
                 }
             };
             match opened {
@@ -811,6 +897,10 @@ impl Connection {
                     let _ = changed;
                     None
                 }
+                // The client left while the body waited for its engine: the
+                // body cannot be framed to its end, and dropping it cancels
+                // the request.
+                () = self.closed(body.complete()) => return Ok(HandedOutcome::Ended),
             };
             match next {
                 None => continue,
@@ -1080,7 +1170,8 @@ enum Frozen {
 enum HandedOutcome {
     /// The body ended at its own last frame.
     Complete,
-    /// The body cannot be framed to its end.
+    /// The body cannot be framed to its end: it cannot be handed over, or its
+    /// client left.
     Ended,
     /// The successor owns the socket.
     Adopted,
@@ -2835,5 +2926,149 @@ mod tests {
         assert_eq!(response.body, String::from_utf8_lossy(&document));
         drop(client);
         let _ = adopted.await;
+    }
+
+    /// A chat completion's body over a stand-in engine whose events arrive on
+    /// `events`: server-sent events when `streamed`, one document otherwise.
+    fn chat_session(
+        events: mpsc::UnboundedReceiver<proto::request::Event>,
+        streamed: bool,
+    ) -> Box<dyn Session> {
+        use crate::api::openai::chat_completions::ChatStreamEmitter;
+        use crate::api::openai::run::{ChatBodySink, GenerationRun};
+        use crate::api::test_support::{ChannelEvents, Unrecorded, configured_tokenizer};
+
+        let response = proto::handoff::ChatResponseOptions {
+            request_id: "chatcmpl-r".to_owned(),
+            response_model: "model".to_owned(),
+            ..Default::default()
+        };
+        let lowering = proto::handoff::Lowering {
+            prompt_token_ids: vec![u32::from(b'p')],
+            decode_options: Some(proto::handoff::TextDecode {
+                skip_special_tokens: true,
+                ..Default::default()
+            }),
+            parser: Some(proto::handoff::Parser::default()),
+            response: Some(response.clone()),
+            ..Default::default()
+        };
+        let output = crate::api::output::OutputProcessor::new(
+            configured_tokenizer(),
+            lowering,
+            Box::new(Unrecorded(std::time::Instant::now())),
+        )
+        .expect("an output processor");
+
+        let events = Box::new(ChannelEvents::new(events));
+        if streamed {
+            Box::new(GenerationRun::new(
+                events,
+                output,
+                ChatStreamEmitter::new(&response),
+            ))
+        } else {
+            Box::new(GenerationRun::new(
+                events,
+                output,
+                ChatBodySink::new(&response),
+            ))
+        }
+    }
+
+    /// Routes that serve one request over an engine that never answers, whose
+    /// events would arrive on `events`, each waiting where a request waits
+    /// for its engine: `/stream` answers server-sent events, its head written
+    /// at once; `/document` answers one document, its head held for it;
+    /// `/handler` waits inside its handler with the request's events, as a
+    /// route that generates before it responds does. `submitted` is notified
+    /// once the request holds its events.
+    fn silent_engine(
+        events: mpsc::UnboundedReceiver<proto::request::Event>,
+        submitted: Arc<Notify>,
+    ) -> Router {
+        let events = Arc::new(std::sync::Mutex::new(Some(events)));
+        let submit = move || {
+            let events = events
+                .lock()
+                .expect("the engine's events")
+                .take()
+                .expect("one request per engine");
+            submitted.notify_one();
+            events
+        };
+        let registration = Handoff::new().register();
+        let held = Arc::clone(&registration);
+        let (stream, document, handler) = (submit.clone(), submit.clone(), submit);
+
+        Router::new()
+            .route(
+                "/stream",
+                post(move || {
+                    let session = chat_session(stream(), true);
+                    let registration = Arc::clone(&registration);
+                    async move { handed_response(session, registration, "r") }
+                }),
+            )
+            .route(
+                "/document",
+                post(move || {
+                    let session = chat_session(document(), false);
+                    let registration = Arc::clone(&held);
+                    async move { held_response(session, registration, "r") }
+                }),
+            )
+            .route(
+                "/handler",
+                post(move || {
+                    let events = crate::api::test_support::ChannelEvents::new(handler());
+                    async move {
+                        // The handler never returns; the events go with it.
+                        std::future::pending::<()>().await;
+                        drop(events);
+                    }
+                }),
+            )
+    }
+
+    /// A client that leaves while its request waits for an engine that never
+    /// answers cancels the request within a bound, before any output exists:
+    /// while its handler runs, while a one-document response holds its head,
+    /// and while a streamed response waits for its first event. Nothing is
+    /// written to the client in any of them, so the cancel can come only
+    /// from the connection noticing that its client left.
+    #[tokio::test]
+    async fn a_client_that_leaves_cancels_its_request_before_any_output() {
+        // Far below a streamed response's 15 s keep-alive comment, the first
+        // write that could otherwise reveal that the client left.
+        const BOUND: std::time::Duration = std::time::Duration::from_secs(2);
+
+        for route in ["/handler", "/document", "/stream"] {
+            let (engine, events) = mpsc::unbounded_channel();
+            let submitted = Arc::new(Notify::new());
+            let mut client = serve_on_pair(silent_engine(events, Arc::clone(&submitted)));
+            let request = head(&format!("POST {route} HTTP/1.1"), "Content-Length: 0\r\n");
+            client.send(request.as_bytes()).await;
+            tokio::time::timeout(std::time::Duration::from_secs(5), submitted.notified())
+                .await
+                .unwrap_or_else(|_| panic!("{route}: the request was not submitted"));
+            if route == "/stream" {
+                // The head goes out at once; the body then waits for the
+                // engine's first event.
+                let head = client.read_head().await;
+                assert!(head.starts_with("HTTP/1.1 200"), "{route}: {head}");
+            }
+            assert!(
+                !engine.is_closed(),
+                "{route}: the request is in flight before its client leaves"
+            );
+
+            drop(client);
+            tokio::time::timeout(BOUND, engine.closed())
+                .await
+                .unwrap_or_else(|_| {
+                    panic!("{route}: no cancel within {BOUND:?} of the client leaving")
+                });
+        }
     }
 }
