@@ -553,7 +553,7 @@ def _write_records(
                     record.request_id
                 ).name != record.request_id or record.request_id in {".", ".."}:
                     raise ValueError(
-                        "media request ID must be a filename component"
+                        "media request ID must be a single file name"
                     )
                 path = Path(media_dir) / f"{record.request_id}.mp4"
             else:

@@ -1,4 +1,4 @@
-"""Defines the common dataset loading and configuration contract."""
+"""Defines the dataset adapters' common loading and configuration."""
 
 from __future__ import annotations
 

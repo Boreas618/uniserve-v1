@@ -37,7 +37,7 @@ use processing::Serving;
 
 pub use args::{Stated, overridden, printed, resolve_text};
 pub use proto::config::{
-    ChatConfig, ChatTemplateContentFormat, CudaGraphConfig, DEFAULT_FENCE_COMPONENTS, DeviceConfig,
+    ChatConfig, ChatTemplateContentFormat, CudaGraphConfig, DEFAULT_FENCE_MODULES, DeviceConfig,
     FlashInferConfig, ImageFetchConfig, ImageSize, KvCacheConfig, LoadConfig, LoggingConfig,
     MediaConfig, MigrationConfig, MoeConfig, MooncakeConfig, ProfilingConfig, ReasoningParser,
     SchedulerConfig, ServerConfig, SpeculativeConfig, VideoConfig, VideoJobConfig, WorkerConfig,
@@ -162,7 +162,7 @@ pub struct ServerArgs {
     #[arg(skip = ServerArgs::default().dtype)]
     pub dtype: ModelDtype,
     /// Precision policy, such as `mode = "balanced"` or selections by
-    /// module under `components`; empty selects the model's default.
+    /// module under `modules`; empty selects the model's default.
     #[arg(skip)]
     pub quantization: serde_json::Map<String, Value>,
     /// Options of the model's multimodal processor; the processor refuses

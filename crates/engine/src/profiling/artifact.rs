@@ -5,7 +5,7 @@
 //! every file of a later one. The file states its version and its own schema (`schema_version`,
 //! and SQLite's `sqlite_schema`). Its table and column names are the file format
 //! `uniserve_eval.profile` reads: the range markers' stamps are the table `fence`, the markers
-//! `fence_probe`, and a module's class the column `component`.
+//! `fence_probe`, and a module's class the column `module`.
 //!
 //! Every raw record kind has a table of its own, beside the tables that describe them: `metadata`
 //! (the session, the epoch, the rank, its device, the CUPTI version, the request, the clocks and
@@ -36,12 +36,12 @@ use super::markers::Stamp;
 use crate::worker::{Error, Result};
 
 /// The schema's version.
-pub(crate) const SCHEMA_VERSION: i64 = 1;
+pub(crate) const SCHEMA_VERSION: i64 = 2;
 
 /// How often the writer commits what it received.
 const COMMIT_PERIOD: Duration = Duration::from_millis(200);
 
-/// The schema of version 1.
+/// The schema of version 2.
 const SCHEMA: &str = "
 CREATE TABLE schema_version (version INTEGER NOT NULL);
 CREATE TABLE metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL);
@@ -89,7 +89,7 @@ CREATE TABLE api (start INTEGER NOT NULL, end INTEGER NOT NULL, domain INTEGER N
     cbid INTEGER NOT NULL, name INTEGER NOT NULL, thread INTEGER NOT NULL,
     correlation INTEGER NOT NULL, result INTEGER NOT NULL);
 CREATE TABLE fence_probe (probe INTEGER PRIMARY KEY, instance INTEGER NOT NULL,
-    site TEXT NOT NULL, path TEXT NOT NULL, component TEXT NOT NULL);
+    site TEXT NOT NULL, path TEXT NOT NULL, module TEXT NOT NULL);
 CREATE TABLE fence (device INTEGER NOT NULL, time INTEGER NOT NULL, probe INTEGER NOT NULL,
     step INTEGER NOT NULL);
 CREATE TABLE pm_sample (sample INTEGER NOT NULL, start INTEGER NOT NULL, end INTEGER NOT NULL,
@@ -128,7 +128,7 @@ const DOCS: &[(&str, &str)] = &[
     (
         "doc.fence",
         "fence.probe is the range marker that wrote the row: 2 * instance at a module \
-         instance's entry and 2 * instance + 1 at its exit (fence_probe, whose column component is \
+         instance's entry and 2 * instance + 1 at its exit (fence_probe, whose column module is \
          the module's class), 1048574 at a step's begin and 1048575 at its end; fence.step is \
          the low 32 bits of the step's batch id (steps.step).",
     ),
@@ -905,7 +905,7 @@ mod tests {
         // The stamp of marker 1 is the exit of instance 0, which the file names.
         let exited: (String, String, String) = connection
             .query_row(
-                "SELECT site, path, component FROM fence JOIN fence_probe USING (probe)",
+                "SELECT site, path, module FROM fence JOIN fence_probe USING (probe)",
                 [],
                 |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
             )

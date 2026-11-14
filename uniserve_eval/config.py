@@ -557,7 +557,8 @@ def _benchmark_point(
     if revision is not None and not isinstance(revision, str):
         raise ValueError(f"benchmarks.{name}.dataset_revision must be a string")
 
-    # Construct only after every referenced component has accepted the point.
+    # Construct only after the server, task and dataset adapter it names
+    # have accepted the point.
     task.check_image(image, f"benchmarks.{name}")
     task.check_video(video, f"benchmarks.{name}.video")
     return BenchmarkPoint(

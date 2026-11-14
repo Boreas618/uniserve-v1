@@ -41,9 +41,8 @@ pub use api_server::{ApiServerMetrics, HttpHandlerLabels, HttpRequestLabels};
 pub use memory::{DeviceLabels, MemoryMetrics, PoolLabels};
 pub use request::{FinishedReasonLabels, RequestMetrics};
 pub use scheduler::{
-    EngineBackendLabels, EngineBlockingLabels, EngineComponentLabels, EngineDomainKindLabels,
-    EngineDomainLabels, EngineLabels, EngineModeLabels, EnginePathLabels, EngineStreamLabels,
-    SchedulerMetrics,
+    EngineBackendLabels, EngineBlockingLabels, EngineDomainKindLabels, EngineDomainLabels,
+    EngineLabels, EngineModeLabels, EnginePathLabels, EngineStreamLabels, SchedulerMetrics,
 };
 
 /// Unsigned Prometheus counter used by metric families.

@@ -1,4 +1,4 @@
-"""The BigVGAN decoder's activation block, fused: the ``audio_activation`` operator's Triton source.
+"""The BigVGAN decoder's activation block, fused: the ``activation1d`` operator's Triton source.
 
 Five stages that must not materialise the upsampled signal, which is ``ratio`` times the audio and
 the decoder's largest allocation by far:
@@ -34,7 +34,7 @@ def _snake_beta(value, alpha, beta, beta_floor):
 
 
 @triton.jit
-def _audio_activation_kernel(
+def _activation1d_kernel(
     values_ptr,
     alpha_ptr,
     beta_ptr,

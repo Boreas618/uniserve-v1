@@ -106,7 +106,7 @@ def metric_value(
     """Resolve a finite numeric value from a dotted metric definition.
 
     Returns:
-        The value as a float, or None when a path component is missing or
+        The value as a float, or None when a key of the path is missing or
         traverses a non-mapping, or when the leaf is a bool, is not an int or
         float, or is not finite.
     """

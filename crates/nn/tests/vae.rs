@@ -510,7 +510,7 @@ fn a_bigvgan_generator_upsamples_through_its_stages() {
 
     // Two dilation steps of two activations each, then the post activation, each once per
     // batch row; the block's four convolutions between the pre- and post-convolutions.
-    assert_eq!(count("audio_activation"), 2 * (2 * 2 + 1));
+    assert_eq!(count("activation1d"), 2 * (2 * 2 + 1));
     assert_eq!(count("conv1d"), 1 + 4 + 1);
     assert_eq!(count("conv_transpose1d"), 1);
     assert_eq!(
@@ -520,7 +520,7 @@ fn a_bigvgan_generator_upsamples_through_its_stages() {
     assert_eq!(
         launches
             .iter()
-            .find(|(operator, _)| *operator == "audio_activation")
+            .find(|(operator, _)| *operator == "activation1d")
             .unwrap()
             .1,
         "dtype_f32_channels_4_kernel_12_ratio_2_block_256_pdl_false"

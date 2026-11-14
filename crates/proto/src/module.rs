@@ -247,7 +247,7 @@ pub mod operator {
     pub const ADAPTIVE_POOL: &str = "adaptive_pool";
     pub const ROWS: &str = "rows";
     pub const POSITION_INTERPOLATE: &str = "position_interpolate";
-    pub const AUDIO_ACTIVATION: &str = "audio_activation";
+    pub const ACTIVATION1D: &str = "activation1d";
     pub const PATCH: &str = "patch";
     pub const UNPATCHIFY_VIDEO: &str = "unpatchify_video";
     pub const COPY_BLOCK: &str = "copy_block";
@@ -349,7 +349,7 @@ pub mod operator {
         ADAPTIVE_POOL,
         ROWS,
         POSITION_INTERPOLATE,
-        AUDIO_ACTIVATION,
+        ACTIVATION1D,
         PATCH,
         UNPATCHIFY_VIDEO,
         COPY_BLOCK,

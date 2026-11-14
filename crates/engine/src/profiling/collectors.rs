@@ -416,7 +416,7 @@ impl Collectors {
                 },
                 Prepared::PmSampling(sampler) => sampler.start(),
                 Prepared::RangeMetrics { profiler, ranges } => profiler.start().map(|()| {
-                    if *ranges == MetricRanges::Component
+                    if *ranges == MetricRanges::Module
                         && let (Some(markers), Some(device)) = (Markers::installed(), self.device)
                     {
                         publish_module_ranges(
@@ -764,11 +764,11 @@ fn prepare(
         }
         Collector::FenceTimeline => {
             let markers = Markers::installed().ok_or_else(|| {
-                "the process has no range markers (profiling_config.fence_components)".to_owned()
+                "the process has no range markers (profiling_config.fence_modules)".to_owned()
             })?;
             Ok(Prepared::RangeTimeline {
                 markers: Arc::clone(markers),
-                classes: request.components.clone(),
+                classes: request.modules.clone(),
             })
         }
         Collector::PmSampling => {
@@ -801,10 +801,10 @@ fn prepare(
             let options = &request.range_metrics;
             let ranges = match options.ranges {
                 MetricRanges::Kernel => Ranges::Launches,
-                MetricRanges::Component => {
+                MetricRanges::Module => {
                     if Markers::installed().is_none() {
                         return Err("module ranges need the rank's range markers \
-                             (profiling_config.fence_components)"
+                             (profiling_config.fence_modules)"
                             .to_owned());
                     }
                     Ranges::User

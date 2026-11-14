@@ -68,7 +68,7 @@ _STATED_FIELDS = ("size", "fps", "audio_sample_rate", "audio_channels")
 
 
 class VideoTask(BenchmarkTask):
-    """Builds video requests and validates the stated media contract."""
+    """Builds video requests and validates the media each one states."""
 
     name: ClassVar[TaskName] = TaskName.VIDEO
     allowed_endpoints: ClassVar[tuple[str, ...]] = (VIDEOS_SYNC, "/v1/videos")

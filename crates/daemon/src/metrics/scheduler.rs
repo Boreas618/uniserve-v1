@@ -55,9 +55,8 @@ pub struct EngineFenceLabels {
     /// The steps' stage: their call kind, such as `prefill` or `decode`.
     pub stage: String,
     /// The module class (the name its modules give their profiler range),
-    /// or `step` for the step's span between its markers. The label keeps
-    /// its exported name, `component`.
-    pub component: String,
+    /// or `step` for the step's span between its markers.
+    pub module: String,
 }
 
 /// Labels identifying one state of a worker stream's device time.
@@ -88,17 +87,6 @@ pub struct EngineBlockingLabels {
     pub thread: String,
     /// Driver call.
     pub call: String,
-}
-
-/// Labels identifying an instrumented engine component.
-#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
-pub struct EngineComponentLabels {
-    /// Served model identity.
-    pub model_name: String,
-    /// Scheduler index.
-    pub engine: u32,
-    /// Instrumented worker component.
-    pub component: String,
 }
 
 /// Labels identifying a scheduler execution domain.
@@ -208,8 +196,6 @@ pub struct SchedulerMetrics {
     pub worker_forward_mode_tokens: Family<EngineModeLabels, U64Counter>,
     /// Forward wall time grouped by runtime mode.
     pub worker_forward_mode_us: Family<EngineModeLabels, U64Counter>,
-    /// Forward wall time grouped by worker component.
-    pub worker_forward_component_us: Family<EngineComponentLabels, U64Counter>,
     /// Worker stream device time grouped by stream and state.
     pub worker_stream_us: Family<EngineStreamLabels, U64Counter>,
     /// Worker driver calls that waited for the device, by thread and call.
@@ -238,18 +224,6 @@ pub struct SchedulerMetrics {
     pub worker_text_decode_position_relay_hits: Family<EngineLabels, U64Counter>,
     /// Decode position relay misses.
     pub worker_text_decode_position_relay_misses: Family<EngineLabels, U64Counter>,
-    /// FlashInfer decode plan constructions.
-    pub worker_flashinfer_decode_plan_calls: Family<EngineLabels, U64Counter>,
-    /// FlashInfer decode plan reuses.
-    pub worker_flashinfer_decode_plan_reuses: Family<EngineLabels, U64Counter>,
-    /// Rows represented by FlashInfer decode plans.
-    pub worker_flashinfer_decode_plan_rows: Family<EngineLabels, U64Counter>,
-    /// Page indices represented by FlashInfer decode plans.
-    pub worker_flashinfer_decode_plan_indices: Family<EngineLabels, U64Counter>,
-    /// FlashInfer graph-decode plan constructions.
-    pub worker_flashinfer_decode_graph_plan_calls: Family<EngineLabels, U64Counter>,
-    /// FlashInfer graph-decode plan reuses.
-    pub worker_flashinfer_decode_graph_plan_reuses: Family<EngineLabels, U64Counter>,
     /// Rows processed by speculative verification.
     pub worker_spec_verify_rows: Family<EngineLabels, U64Counter>,
     /// Draft tokens presented for speculative verification.
@@ -460,13 +434,6 @@ impl SchedulerMetrics {
             "Worker forward wall time by forward mode in microseconds.",
             worker_forward_mode_us.clone(),
         );
-        let worker_forward_component_us: Family<EngineComponentLabels, U64Counter> =
-            Default::default();
-        registry.register(
-            "uniserve:worker_forward_component_us",
-            "Worker forward wall time by component in microseconds.",
-            worker_forward_component_us.clone(),
-        );
         let worker_stream_us: Family<EngineStreamLabels, U64Counter> = Default::default();
         registry.register(
             "uniserve:worker_stream_us",
@@ -488,8 +455,8 @@ impl SchedulerMetrics {
         registry.register(
             "uniserve:worker_fence_step_seconds",
             "Per-step durations from the workers' fence probes, by stage and module class \
-             (component): a step's summed durations of the class's probed module instances, or \
-             the step's span between its markers for component `step`, measured on the device.",
+             (module): a step's summed durations of the class's probed module instances, or the \
+             step's span between its markers for module `step`, measured on the device.",
             worker_fence_step_seconds.clone(),
         );
         let worker_fence_records_lost: Family<EngineLabels, U64Counter> = Default::default();
@@ -562,48 +529,6 @@ impl SchedulerMetrics {
             "uniserve:worker_text_decode_position_relay_misses",
             "Worker decode position relay misses.",
             worker_text_decode_position_relay_misses.clone(),
-        );
-        let worker_flashinfer_decode_plan_calls: Family<EngineLabels, U64Counter> =
-            Default::default();
-        registry.register(
-            "uniserve:worker_flashinfer_decode_plan_calls",
-            "Worker FlashInfer decode plan calls.",
-            worker_flashinfer_decode_plan_calls.clone(),
-        );
-        let worker_flashinfer_decode_plan_reuses: Family<EngineLabels, U64Counter> =
-            Default::default();
-        registry.register(
-            "uniserve:worker_flashinfer_decode_plan_reuses",
-            "Worker FlashInfer decode plan reuses.",
-            worker_flashinfer_decode_plan_reuses.clone(),
-        );
-        let worker_flashinfer_decode_plan_rows: Family<EngineLabels, U64Counter> =
-            Default::default();
-        registry.register(
-            "uniserve:worker_flashinfer_decode_plan_rows",
-            "Worker FlashInfer decode planned rows.",
-            worker_flashinfer_decode_plan_rows.clone(),
-        );
-        let worker_flashinfer_decode_plan_indices: Family<EngineLabels, U64Counter> =
-            Default::default();
-        registry.register(
-            "uniserve:worker_flashinfer_decode_plan_indices",
-            "Worker FlashInfer decode planned page indices.",
-            worker_flashinfer_decode_plan_indices.clone(),
-        );
-        let worker_flashinfer_decode_graph_plan_calls: Family<EngineLabels, U64Counter> =
-            Default::default();
-        registry.register(
-            "uniserve:worker_flashinfer_decode_graph_plan_calls",
-            "Worker FlashInfer CUDA-graph decode plan calls.",
-            worker_flashinfer_decode_graph_plan_calls.clone(),
-        );
-        let worker_flashinfer_decode_graph_plan_reuses: Family<EngineLabels, U64Counter> =
-            Default::default();
-        registry.register(
-            "uniserve:worker_flashinfer_decode_graph_plan_reuses",
-            "Worker FlashInfer CUDA-graph decode plan reuses.",
-            worker_flashinfer_decode_graph_plan_reuses.clone(),
         );
         let worker_spec_verify_rows: Family<EngineLabels, U64Counter> = Default::default();
         registry.register(
@@ -700,7 +625,6 @@ impl SchedulerMetrics {
             worker_forward_mode_counts,
             worker_forward_mode_tokens,
             worker_forward_mode_us,
-            worker_forward_component_us,
             worker_stream_us,
             worker_blocking_calls,
             worker_fence_step_seconds,
@@ -715,12 +639,6 @@ impl SchedulerMetrics {
             worker_text_decode_token_relay_misses,
             worker_text_decode_position_relay_hits,
             worker_text_decode_position_relay_misses,
-            worker_flashinfer_decode_plan_calls,
-            worker_flashinfer_decode_plan_reuses,
-            worker_flashinfer_decode_plan_rows,
-            worker_flashinfer_decode_plan_indices,
-            worker_flashinfer_decode_graph_plan_calls,
-            worker_flashinfer_decode_graph_plan_reuses,
             worker_spec_verify_rows,
             worker_spec_verify_draft_tokens,
             spec_decode_accepted_length,

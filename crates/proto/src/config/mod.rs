@@ -704,7 +704,7 @@ pub struct ProfilingConfig {
     /// Name patterns (`*` matches any run) of the module classes whose
     /// instances carry probes in the CUDA graphs an epoch captures; a change
     /// takes a new epoch. Empty for no probe.
-    pub fence_components: Vec<String>,
+    pub fence_modules: Vec<String>,
     /// Name patterns (`*` matches any run) of the probed module classes whose
     /// probes are off while `fence_probes` is on: the classes whose
     /// probes cost more than the always-on budget. Changed in place, at the
@@ -723,7 +723,7 @@ impl Default for ProfilingConfig {
     fn default() -> Self {
         Self {
             fence_probes: true,
-            fence_components: DEFAULT_FENCE_COMPONENTS
+            fence_modules: DEFAULT_FENCE_MODULES
                 .iter()
                 .map(|&pattern| pattern.to_owned())
                 .collect(),
@@ -740,7 +740,7 @@ impl Default for ProfilingConfig {
 /// Each probe costs a kernel launch in every replay, about a microsecond on
 /// GB200 even when switched off, so probing every layer exceeds the
 /// always-on budget (`docs/profiling.md`).
-pub const DEFAULT_FENCE_COMPONENTS: [&str; 1] = ["*Transformer"];
+pub const DEFAULT_FENCE_MODULES: [&str; 1] = ["*Transformer"];
 
 /// The shape a chat template takes message `content` in.
 ///

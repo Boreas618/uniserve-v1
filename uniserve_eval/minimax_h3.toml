@@ -15,7 +15,7 @@
 # - UNISERVE_MINIMAX_H3_OMNIREF names FastVideo/FastH3-OmniRef-DMPDD8-step1900;
 #   the Hugging Face cache holds the MiniMax-H3 revision it pins
 #   (9bfb6693f2cf6de171db46d1aa586f67d773a1da), from which UniServe reads the
-#   components the export omits.
+#   models the export omits.
 # - UNISERVE_MINIMAX_H3_FFMPEG names the bin directory of the FFmpeg 8.1.2
 #   build whose ffmpeg decodes reference videos for UniServe.
 # - UNISERVE_MINIMAX_H3_SHARED_SCRATCH names the directory the SGLang servers
@@ -240,7 +240,7 @@ videos_per_second = "higher"
 "video_latency_ms.p95" = "lower"
 
 # FastH3 OmniRef on the same deployment file: the export's reference DiT
-# with the other components of its pinned base. Its segment-sparse attention
+# with the other models of its pinned base. Its segment-sparse attention
 # packs each condition into whole 128-row tiles, so W5 takes 47,104
 # condition rows there; the capacity is 49,152.
 [servers.gb200-4-omniref]
@@ -1858,7 +1858,7 @@ videos_per_second = "higher"
 # vLLM 0.30.0) and FastVideo at 8c94e4e (feat/fasth3-omniref-pdd-inference).
 # SGLang and vLLM-Omni load the checkpoint's native FL2VA or Ref2VA partition
 # of the same revision, the release's own layout of the model UniServe loads
-# from the root diffusers components, and hold only that denoiser.
+# from the root diffusers pipeline, and hold only that denoiser.
 #
 # Their requests carry the same work as UniServe's: the prompt, the
 # reference media files, the size, the frame count, the schedule (vLLM-Omni
@@ -1886,7 +1886,7 @@ videos_per_second = "higher"
 # - Readiness: vLLM-Omni compiles its DiT regions on the first request, which
 #   the warmup row covers, so its startup time excludes compilation.
 
-# SGLang follows its cookbook's GB200 recipe: Ulysses 4 with every component
+# SGLang follows its cookbook's GB200 recipe: Ulysses 4 with every model
 # resident (performance mode speed), the Qwen3-VL text encoder folded across
 # the four ranks, platform attention (cuDNN SDPA for the dense packed
 # attention) and eager execution. Its cross-request conditioning cache, which
@@ -2307,7 +2307,7 @@ videos_per_second = "higher"
 # FastVideo's OmniRef example does. FastVideo presents references in type
 # order (images, videos, audio), which W4 and W5 already follow; it rejects a
 # reference start offset, which neither uses. Its HTTP route serves one
-# generation at a time. HF_HUB_OFFLINE keeps every component local, and the
+# generation at a time. HF_HUB_OFFLINE keeps every model local, and the
 # environment's bin directory provides the ffmpeg its MP4 encoder pipes to.
 [servers.fastvideo-gb200-4-omniref]
 host = "127.0.0.1"
@@ -2422,7 +2422,7 @@ videos_per_second = "higher"
 
 # SGLang across rank-0 and rank-1: its cookbook's GB200 2x4 recipe, Ulysses 4
 # within a host and ring attention of degree 2 across the hosts, resident
-# components, the text encoder replicated across the nodes; ring attention
+# models, the text encoder replicated across the nodes; ring attention
 # selects FlashAttention. The evaluator starts node rank 0 on rank-0, whose
 # address UNISERVE_MINIMAX_H3_HEAD_ADDRESS names; start node rank 1 on
 # rank-1 with the same command and --node-rank 1 for each server start, and

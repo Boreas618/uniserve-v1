@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Execute the audio_activation kernel on the CPU and check the five stages it fuses.
+"""Execute the activation1d kernel on the CPU and check the five stages it fuses.
 
 Triton's interpreter runs the kernel body with numpy-backed tensors, one program at a time. The
 operator is a chain — replicate pad, transposed convolution, crop, SnakeBeta, low-pass — so the
@@ -14,7 +14,7 @@ The fused form computes the upsampled values a low-pass tap needs from the input
 comparison is against the unfused chain: same arithmetic, same order inside each sum, one rounding
 at the end. That is what the operator's tolerance states.
 
-    TRITON_INTERPRET=1 python activation_arithmetic.py
+    TRITON_INTERPRET=1 python activation1d_check.py
 """
 
 import os
@@ -26,7 +26,7 @@ KERNELS = (
     pathlib.Path(__file__).resolve().parents[4] / "crates" / "ops" / "kernels"
 )
 #: The package this check covers.
-PACKAGE = KERNELS / "audio_activation" / "triton"
+PACKAGE = KERNELS / "activation1d" / "triton"
 
 os.environ.setdefault("TRITON_INTERPRET", "1")
 
@@ -35,7 +35,7 @@ import torch.nn.functional as F  # noqa: E402
 
 sys.path.insert(0, str(PACKAGE / "src"))  # noqa: E402
 
-import audio_activation as kernels  # noqa: E402
+import activation1d as kernels  # noqa: E402
 
 #: The reciprocal gain's floor, as the operator writes it.
 BETA_FLOOR = 1e-9
@@ -81,7 +81,7 @@ def one(channels, length, kernel, ratio, block):
     out_length = (length * ratio - 1) // ratio + 1
     out = torch.full((channels, out_length), float("nan"))
     grid = (channels, (length + block - 1) // block, 1)
-    kernels._audio_activation_kernel[grid](
+    kernels._activation1d_kernel[grid](
         values,
         alpha,
         beta,

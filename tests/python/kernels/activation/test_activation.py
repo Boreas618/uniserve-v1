@@ -18,7 +18,7 @@ FAMILY = pathlib.Path(__file__).resolve().parent
 #: The checks that run whole on Triton's interpreter.
 INTERPRETED = (
     "act_and_mul_check.py",
-    "audio_activation_check.py",
+    "activation1d_check.py",
     "gelu_check.py",
     "silu_check.py",
     "snake_check.py",

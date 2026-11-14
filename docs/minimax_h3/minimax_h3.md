@@ -290,7 +290,7 @@ A dense BF16 checkpoint selects its precision with `quantization`:
 | `performance` | FP8 | BF16 | NVFP4 |
 | `maximum` | NVFP4 | FP8 | NVFP4 |
 
-Denoiser attention stays BF16. `components` overrides parts of a mode by the names `attention`, `mlp`, `text_encoder` and `video_vae`, as in `--set 'quantization={ mode = "performance", components = { video_vae = "bf16" } }'`. NVFP4 needs Blackwell; on Hopper, use `quality`, optionally with `{"components":{"mlp":"fp8"}}`. The packed NVFP4 checkpoints carry their own precision and take no `quantization`. The presets other than `quality` change the generated media; establish quality for the intended workload before choosing one.
+Denoiser attention stays BF16. `modules` overrides parts of a mode by the names `attention`, `mlp`, `text_encoder` and `video_vae`, as in `--set 'quantization={ mode = "performance", modules = { video_vae = "bf16" } }'`. NVFP4 needs Blackwell; on Hopper, use `quality`, optionally with `{"modules":{"mlp":"fp8"}}`. The packed NVFP4 checkpoints carry their own precision and take no `quantization`. The presets other than `quality` change the generated media; establish quality for the intended workload before choosing one.
 
 ## Further guides
 

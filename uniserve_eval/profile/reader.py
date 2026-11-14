@@ -26,7 +26,7 @@ from typing import Any
 
 # The schema version this reader was written for; files of later versions
 # only add tables and columns.
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 # The probe ids of a fence step's markers.
 STEP_BEGIN = 0xF_FFFE
@@ -164,8 +164,8 @@ class ProfileFile:
         return None if offset is None else time + offset.nanoseconds
 
     def fence_intervals(self) -> Iterator[dict[str, Any]]:
-        """Every probed component instance's call, from the fence records:
-        its device, step, instance path and component, and its start and
+        """Every probed module instance's call, from the fence records:
+        its device, step, instance path and module class, and its start and
         end in ``%globaltimer`` nanoseconds. A step's entries and exits
         pair per instance in time order; an unpaired one is left out.
         """  # noqa: D205
@@ -189,7 +189,7 @@ class ProfileFile:
                 "step": key[1],
                 "instance": key[2],
                 "path": described.get("path", ""),
-                "component": described.get("component", ""),
+                "module": described.get("module", ""),
                 "start": start,
                 "end": int(row["time"]),
             }

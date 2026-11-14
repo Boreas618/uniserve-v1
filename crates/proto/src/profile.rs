@@ -114,9 +114,8 @@ pub enum MetricRanges {
     #[default]
     Kernel,
     /// A range per probed module instance's call, around its entry and
-    /// exit, for calls that do not replay a CUDA graph. Its wire name,
-    /// `component`, is the profile request's.
-    Component,
+    /// exit, for calls that do not replay a CUDA graph.
+    Module,
 }
 
 /// The shortest `pm_sampling` interval, nanoseconds: on GB200 a worker's
@@ -224,9 +223,8 @@ pub struct SessionRequest {
     pub workers: Vec<u32>,
     /// The module classes whose fence records and module ranges are kept,
     /// as patterns of their names (`*` matches any run); every probed
-    /// class when empty. The request's field, `components`, keeps its
-    /// wire name.
-    pub components: Vec<String>,
+    /// class when empty.
+    pub modules: Vec<String>,
     /// Where each worker writes its file; the directory is created.
     pub output_dir: PathBuf,
     pub timeline: TimelineOptions,

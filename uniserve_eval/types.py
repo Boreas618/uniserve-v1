@@ -26,7 +26,7 @@ MetricDirection = Literal["higher", "lower"]
 
 
 class TaskName(StrEnum):
-    """Identifies the request and validation contract for a benchmark point."""
+    """Identifies what a benchmark point requests and how it validates it."""
 
     TEXT = "text"
     GSM8K = "gsm8k"
@@ -306,8 +306,8 @@ VIDEO_SCHEDULE_FIELDS = (
 # Schedule fields each backend receives. A baseline runs whatever schedule it
 # is sent, so a point measuring one must state each of these. FastVideo takes
 # the sigma point count alone; its shifts come from the checkpoint's inference
-# contract and cannot be sent. UniServe's checkpoint fixes its schedule, so a
-# UniServe point states none.
+# configuration and cannot be sent. UniServe's checkpoint fixes its schedule,
+# so a UniServe point states none.
 _SCHEDULE_FIELDS = {
     "uniserve": frozenset(),
     "sglang": frozenset(VIDEO_SCHEDULE_FIELDS),
@@ -1148,7 +1148,7 @@ class RequestRecord:
 
 @dataclass(frozen=True)
 class BenchmarkPoint:
-    """Defines one fully resolved workload, task, server, and metric contract."""  # noqa: E501
+    """Defines one fully resolved workload, task, server, and metric set."""
 
     name: str
     server: str

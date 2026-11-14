@@ -79,10 +79,9 @@ override-dependencies = [
 packages = []
 
 # The one executable of every UniServe process, installed onto PATH as
-# `uniserve`: `serve` (a node's daemon), `frontend` (the deployment's
-# application process), `engine` (a node's main process), `storage` (a host's
-# Storage Server) and `rules` (the model-family request rules a plan asks
-# for), plus the `build-server` entry a Build Server starts with. It is a
+# `uniserve`: `serve` (a node's daemon), `keys` (the kernel modules a
+# deployment launches), `storage-server` (a host's Storage Server) and
+# `build-server` (a host's Build Server). It is a
 # binary rather than a Python extension module, and serving runs it, so it
 # builds with Cargo's release profile even for an editable install, where
 # setuptools-rust would otherwise choose a debug build.

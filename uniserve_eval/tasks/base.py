@@ -35,7 +35,7 @@ class ImageCountRule(StrEnum):
 
 
 class BenchmarkTask:
-    """Defines the endpoint, request, and validation contract for a task.
+    """Defines a task's endpoint, its requests, and how it validates them.
 
     `config` reads these attributes and runs the `check_*` class methods
     while parsing a profile; request building does not recheck them.
@@ -142,7 +142,7 @@ class BenchmarkTask:
 
     @classmethod
     def check_image(cls, image: ImageConfig, context: str) -> None:
-        """Validate explicit image-count settings against the task contract."""
+        """Validate explicit image-count settings against the task's rule."""
         if (
             cls.image_count is ImageCountRule.REQUIRED
             and image.image_count is None
@@ -158,7 +158,7 @@ class BenchmarkTask:
 
     @classmethod
     def check_video(cls, video: VideoConfig, context: str) -> None:
-        """Validate video settings against the task's request contract.
+        """Validate video settings against the requests the task builds.
 
         Tasks that build no video requests accept any settings.
         """

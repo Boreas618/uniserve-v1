@@ -13,7 +13,7 @@ from uniserve_eval.profile.reader import STEP_BEGIN, STEP_END
 
 pytestmark = pytest.mark.unit
 
-# The tables of schema version 1 this test writes (`crates/engine/src/
+# The tables of schema version 2 this test writes (`crates/engine/src/
 # profiling/artifact.rs` states the whole schema).
 _TABLES = """
 CREATE TABLE schema_version (version INTEGER NOT NULL);
@@ -33,13 +33,13 @@ CREATE TABLE api (start INTEGER NOT NULL, end INTEGER NOT NULL,
     domain INTEGER, cbid INTEGER, name INTEGER, thread INTEGER,
     correlation INTEGER, result INTEGER);
 CREATE TABLE fence_probe (probe INTEGER PRIMARY KEY, instance INTEGER,
-    site TEXT, path TEXT, component TEXT);
+    site TEXT, path TEXT, module TEXT);
 CREATE TABLE fence (device INTEGER, time INTEGER, probe INTEGER,
     step INTEGER);
 """
 
 
-def _file(path: Path, version: int = 1) -> Path:
+def _file(path: Path, version: int = 2) -> Path:
     db = sqlite3.connect(path)
     db.executescript(_TABLES)
     db.execute("INSERT INTO schema_version VALUES (?)", (version,))
@@ -93,7 +93,7 @@ def test_a_file_names_its_session_and_pairs_its_fence_records(tmp_path):
     with ProfileFile(_file(tmp_path / "rank2.sqlite")) as profile:
         assert (profile.session, profile.rank) == (3, 2)
         intervals = sorted(
-            (item["component"], item["start"], item["end"])
+            (item["module"], item["start"], item["end"])
             for item in profile.fence_intervals()
         )
         assert intervals == [
@@ -107,9 +107,9 @@ def test_a_file_names_its_session_and_pairs_its_fence_records(tmp_path):
         assert summary["collectors"][0]["name"] == "timeline"
 
 
-def test_a_file_of_an_unknown_version_or_none_is_refused(tmp_path):
+def test_a_file_of_an_earlier_version_or_none_is_refused(tmp_path):
     with pytest.raises(ProfileError):
-        ProfileFile(_file(tmp_path / "old.sqlite", version=0))
+        ProfileFile(_file(tmp_path / "old.sqlite", version=1))
     other = tmp_path / "other.sqlite"
     sqlite3.connect(other).execute("CREATE TABLE t (x)").connection.close()
     with pytest.raises(ProfileError):

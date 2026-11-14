@@ -288,7 +288,7 @@ struct Instances {
 /// The range markers of this process's devices and what they measure.
 pub(crate) struct Markers {
     devices: Vec<DeviceMarkers>,
-    /// The deployment's class patterns (`profiling_config.fence_components`).
+    /// The deployment's class patterns (`profiling_config.fence_modules`).
     patterns: Vec<String>,
     instances: Mutex<Instances>,
     /// The switch as last stated: the master word and the patterns switched off.

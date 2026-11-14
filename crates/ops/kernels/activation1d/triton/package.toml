@@ -1,4 +1,4 @@
-# The audio_activation operator's Triton backend: design 5.2's package.
+# The activation1d operator's Triton backend: design 5.2's package.
 #
 # One cubin per descriptor: the BigVGAN decoder's activation block as one program — the
 # replicate pad, the transposed convolution that upsamples, the crop, SnakeBeta and the
@@ -8,7 +8,7 @@
 # unrolls both convolutions from them; the channel count and both lengths are launch words,
 # since an audio length follows the request's duration.
 
-op = "audio_activation"
+op = "activation1d"
 backend = "triton"
 interface_version = 1
 
@@ -23,7 +23,7 @@ metadata = "metadata.json"
 
 [source]
 kind = "triton"
-files = ["src/audio_activation.py", "src/build.py"]
+files = ["src/activation1d.py", "src/build.py"]
 script = "src/build.py"
 
 [kernel]

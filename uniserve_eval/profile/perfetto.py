@@ -7,7 +7,7 @@ process named by its rank; its records become tracks of that process:
 - each CUDA stream's kernels, copies, fills and whole-graph launches;
 - each host thread's runtime and driver API calls and its NVTX ranges;
 - the worker's steps, and each device's fence probe intervals (one slice
-  per probed component instance's call, nested as the calls nest);
+  per probed module instance's call, nested as the calls nest);
 - PM samples as counter tracks.
 
 Every time is placed on CUPTI's clock through the file's ``clocks``
@@ -208,7 +208,7 @@ def _file_events(profile: ProfileFile) -> list[dict[str, Any]]:
             _slice(
                 pid,
                 _FENCE + device,
-                interval["component"],
+                interval["module"],
                 interval["start"] + offset.nanoseconds,
                 interval["end"] + offset.nanoseconds,
                 path=interval["path"],

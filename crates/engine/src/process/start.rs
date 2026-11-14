@@ -1077,7 +1077,7 @@ fn weight_binding(
 }
 
 /// Installs what the deployment's always-on profiling captures into every graph of `devices`:
-/// the range markers of the classes `profiling_config.fence_components` names, and PC sampling
+/// the range markers of the classes `profiling_config.fence_modules` names, and PC sampling
 /// when `graph_pc_sampling` keeps it on, which CUPTI attributes to a graph only when enabled
 /// before its capture.
 ///
@@ -1086,10 +1086,10 @@ fn weight_binding(
 /// When a device cannot load the markers' kernels or enable sampling.
 fn instrument(launch: &EngineArgs, devices: &[DeviceId]) -> Result<()> {
     let profiling = &launch.engine_config.profiling;
-    if !profiling.fence_components.is_empty() {
+    if !profiling.fence_modules.is_empty() {
         crate::profiling::markers::Markers::install(
             devices,
-            profiling.fence_components.clone(),
+            profiling.fence_modules.clone(),
             profiling.fence_probes,
             &profiling.fence_probes_off,
         )

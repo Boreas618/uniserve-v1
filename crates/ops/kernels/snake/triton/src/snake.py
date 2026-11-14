@@ -1,4 +1,5 @@
-"""The H3 audio decoder's periodic activation: the Triton source of the ``snake`` operator.
+"""Snake, a periodic activation with one linear parameter per channel: the Triton source of the
+``snake`` operator.
 
 ```text
 out = x + sin²(α · x) / (α + 1e-9)
@@ -8,7 +9,7 @@ over a row-major ``[rows, channels, width]`` signal with one linear frequency ``
 element of ``out`` per thread; the channel comes from the linear index, so each thread reads one
 ``α``.
 
-The formula is the audio decoder's Snake activation:
+In tensor operations the formula is
 ``values + (alpha + 1e-9).reciprocal() * sin(alpha * values).pow(2)``. The epsilon keeps the
 reciprocal finite for a zero frequency and is part of the formula, not a guard. The arithmetic is
 FP32 and the stored value rounds once into the output dtype, which the operator's tolerance covers
@@ -18,8 +19,7 @@ along with one unit of the sine's own last place.
 import triton
 import triton.language as tl
 
-#: The reciprocal's offset, as the decoder's activation evaluates it, instantiated so a
-#: kernel may read it.
+#: The reciprocal's offset, as the formula states it, instantiated so a kernel may read it.
 _EPSILON = tl.constexpr(1e-9)
 
 

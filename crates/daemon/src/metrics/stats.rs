@@ -17,9 +17,9 @@ use std::task::{Context, Poll, ready};
 use std::time::Instant;
 
 use crate::metrics::{
-    EngineBackendLabels, EngineBlockingLabels, EngineComponentLabels, EngineDomainKindLabels,
-    EngineDomainLabels, EngineLabels, EngineModeLabels, EnginePathLabels, EngineStreamLabels,
-    FinishedReasonLabels, METRICS, RequestMetrics, SchedulerMetrics,
+    EngineBackendLabels, EngineBlockingLabels, EngineDomainKindLabels, EngineDomainLabels,
+    EngineLabels, EngineModeLabels, EnginePathLabels, EngineStreamLabels, FinishedReasonLabels,
+    METRICS, RequestMetrics, SchedulerMetrics,
 };
 use futures::{Stream, StreamExt as _};
 use tracing::info;
@@ -207,16 +207,6 @@ pub(crate) fn record_scheduler_stats(
                 })
                 .inc_by(*us);
         }
-        for (component, us) in &worker_stats.component_us {
-            metrics
-                .worker_forward_component_us
-                .get_or_create(&EngineComponentLabels {
-                    model_name: model_name.clone(),
-                    engine,
-                    component: component.clone(),
-                })
-                .inc_by(*us);
-        }
         for (key, us) in &worker_stats.stream_us {
             // Keys are `{stream}/{state}` (`ForwardStats::stream_us`).
             let (stream, state) = key.rsplit_once('/').unwrap_or((key.as_str(), ""));
@@ -252,7 +242,7 @@ pub(crate) fn record_scheduler_stats(
                     model_name: model_name.clone(),
                     engine,
                     stage: stage.to_owned(),
-                    component: class.to_owned(),
+                    module: class.to_owned(),
                 })
                 .add(histogram);
         }
@@ -330,30 +320,6 @@ pub(crate) fn record_scheduler_stats(
             .worker_text_decode_position_relay_misses
             .get_or_create(&labels)
             .inc_by(worker_stats.text_decode_position_relay_misses);
-        metrics
-            .worker_flashinfer_decode_plan_calls
-            .get_or_create(&labels)
-            .inc_by(worker_stats.flashinfer_decode_plan_calls);
-        metrics
-            .worker_flashinfer_decode_plan_reuses
-            .get_or_create(&labels)
-            .inc_by(worker_stats.flashinfer_decode_plan_reuses);
-        metrics
-            .worker_flashinfer_decode_plan_rows
-            .get_or_create(&labels)
-            .inc_by(worker_stats.flashinfer_decode_plan_rows);
-        metrics
-            .worker_flashinfer_decode_plan_indices
-            .get_or_create(&labels)
-            .inc_by(worker_stats.flashinfer_decode_plan_indices);
-        metrics
-            .worker_flashinfer_decode_graph_plan_calls
-            .get_or_create(&labels)
-            .inc_by(worker_stats.flashinfer_decode_graph_plan_calls);
-        metrics
-            .worker_flashinfer_decode_graph_plan_reuses
-            .get_or_create(&labels)
-            .inc_by(worker_stats.flashinfer_decode_graph_plan_reuses);
         metrics
             .worker_spec_verify_rows
             .get_or_create(&labels)

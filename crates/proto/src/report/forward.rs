@@ -26,8 +26,6 @@ pub struct ForwardStats {
     pub mode_tokens: BTreeMap<String, u64>,
     /// Forward time in microseconds by runtime mode.
     pub mode_us: BTreeMap<String, u64>,
-    /// Component execution time in microseconds.
-    pub component_us: BTreeMap<String, u64>,
     /// Device time of the rank's primary and copy streams in microseconds,
     /// keyed `{stream}/{state}`, where `stream` is `device` (the primary
     /// stream) or `copy` (the stream of page copies through the host KV
@@ -85,18 +83,6 @@ pub struct ForwardStats {
     pub text_decode_position_relay_hits: u64,
     /// Decode position relay misses.
     pub text_decode_position_relay_misses: u64,
-    /// FlashInfer decode plan construction count.
-    pub flashinfer_decode_plan_calls: u64,
-    /// FlashInfer decode plan reuse count.
-    pub flashinfer_decode_plan_reuses: u64,
-    /// Rows represented by FlashInfer decode plans.
-    pub flashinfer_decode_plan_rows: u64,
-    /// Indices represented by FlashInfer decode plans.
-    pub flashinfer_decode_plan_indices: u64,
-    /// FlashInfer graph-decode plan construction count.
-    pub flashinfer_decode_graph_plan_calls: u64,
-    /// FlashInfer graph-decode plan reuse count.
-    pub flashinfer_decode_graph_plan_reuses: u64,
     /// Rows processed by speculative verification.
     pub spec_verify_rows: u64,
     /// Draft tokens presented for speculative verification.
@@ -119,7 +105,6 @@ impl ForwardStats {
             (&mut self.mode_counts, &other.mode_counts),
             (&mut self.mode_tokens, &other.mode_tokens),
             (&mut self.mode_us, &other.mode_us),
-            (&mut self.component_us, &other.component_us),
             (&mut self.stream_us, &other.stream_us),
             (&mut self.blocking_calls, &other.blocking_calls),
             (
@@ -179,30 +164,6 @@ impl ForwardStats {
                 &mut self.text_decode_position_relay_misses,
                 other.text_decode_position_relay_misses,
             ),
-            (
-                &mut self.flashinfer_decode_plan_calls,
-                other.flashinfer_decode_plan_calls,
-            ),
-            (
-                &mut self.flashinfer_decode_plan_reuses,
-                other.flashinfer_decode_plan_reuses,
-            ),
-            (
-                &mut self.flashinfer_decode_plan_rows,
-                other.flashinfer_decode_plan_rows,
-            ),
-            (
-                &mut self.flashinfer_decode_plan_indices,
-                other.flashinfer_decode_plan_indices,
-            ),
-            (
-                &mut self.flashinfer_decode_graph_plan_calls,
-                other.flashinfer_decode_graph_plan_calls,
-            ),
-            (
-                &mut self.flashinfer_decode_graph_plan_reuses,
-                other.flashinfer_decode_graph_plan_reuses,
-            ),
             (&mut self.fence_records_lost, other.fence_records_lost),
             (&mut self.spec_verify_rows, other.spec_verify_rows),
             (
@@ -235,7 +196,6 @@ impl ForwardStats {
         self.mode_counts.is_empty()
             && self.mode_tokens.is_empty()
             && self.mode_us.is_empty()
-            && self.component_us.is_empty()
             && self.stream_us.is_empty()
             && self.blocking_calls.is_empty()
             && self.fence_us.is_empty()
@@ -255,12 +215,6 @@ impl ForwardStats {
             && self.text_decode_token_relay_misses == 0
             && self.text_decode_position_relay_hits == 0
             && self.text_decode_position_relay_misses == 0
-            && self.flashinfer_decode_plan_calls == 0
-            && self.flashinfer_decode_plan_reuses == 0
-            && self.flashinfer_decode_plan_rows == 0
-            && self.flashinfer_decode_plan_indices == 0
-            && self.flashinfer_decode_graph_plan_calls == 0
-            && self.flashinfer_decode_graph_plan_reuses == 0
             && self.spec_verify_rows == 0
             && self.spec_verify_draft_tokens == 0
             && self.spec_verify_accepted_tokens == 0

@@ -1,4 +1,4 @@
-"""The audio_activation package's compile script: one descriptor -> one module.
+"""The activation1d package's compile script: one descriptor -> one module.
 
 ``spec`` states what this package's kernel needs for one descriptor: the kernel function, its
 argument signature in the order the operator launches them, the compile-time values the descriptor
@@ -10,7 +10,7 @@ lane count are unrolled from them; the channel count and both lengths are launch
 audio length follows the request's duration.
 """
 
-import audio_activation as kernels
+import activation1d as kernels
 from uniserve_build_server import triton as driver
 
 #: The element types the signal, the two filters and the output may have.
@@ -23,11 +23,11 @@ def warps_of(block):
 
 
 def spec(fields, parameters, target):
-    """The compilation of one audio_activation descriptor."""
+    """The compilation of one activation1d descriptor."""
     block = int(fields["block"])
     dtype = "*" + DTYPES[fields["dtype"]]
     return {
-        "kernel": kernels._audio_activation_kernel,
+        "kernel": kernels._activation1d_kernel,
         "signature": {
             "values_ptr": dtype,
             "alpha_ptr": "*fp32",

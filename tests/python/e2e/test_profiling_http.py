@@ -67,7 +67,7 @@ OPTIONS = (
     "chat_config.reasoning_parser=none",
     "cuda_graph_config.prefill_token_sizes=[512]",
     "cuda_graph_config.decode_batch_sizes=[1, 2, 4, 8]",
-    'profiling_config.fence_components=["*.TransformerLayer"]',
+    'profiling_config.fence_modules=["*.TransformerLayer"]',
 )
 
 
@@ -139,7 +139,7 @@ def _forwards_reported(base_url: str) -> None:
 
 def test_fence_probes_report_steps_and_switch_in_place(served: str):
     def steps() -> int:
-        return _fence_count(served, "decode", 'component="step"')
+        return _fence_count(served, "decode", 'module="step"')
 
     _chat(served)
     with _Load(served, streams=1):
@@ -206,7 +206,7 @@ def test_a_session_records_its_collectors_into_its_file(
         "stages": ["decode"],
         "start_step": 5,
         "steps": 40,
-        "components": ["*.TransformerLayer"],
+        "modules": ["*.TransformerLayer"],
         "output_dir": str(output),
     }
     # Two collectors of the performance monitors are refused together.
@@ -255,7 +255,7 @@ def test_a_session_records_its_collectors_into_its_file(
         if "fence_timeline" in collectors:
             intervals = list(profile.fence_intervals())
             assert intervals
-            assert {item["component"] for item in intervals} == {
+            assert {item["module"] for item in intervals} == {
                 "models.qwen3.transformer.TransformerLayer"
             }
     if "fence_timeline" in collectors:

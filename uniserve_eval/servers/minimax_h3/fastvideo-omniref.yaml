@@ -2,10 +2,10 @@
 # one four-GPU GB200 host, the OmniRef baseline of uniserve_eval/minimax_h3.toml.
 # The evaluator profile names the model directory (--generator.model_path), a
 # composition of the export's transformer_ref, schedulers and inference
-# contract with the text encoder, processor, tokenizer and VAEs of its pinned
+# configuration with the text encoder, processor, tokenizer and VAEs of its pinned
 # MiniMax-H3 base revision, as FastVideo's OmniRef example composes them.
 #
-# Engine: Ulysses sequence parallelism over the four GPUs with every component
+# Engine: Ulysses sequence parallelism over the four GPUs with every model
 # resident: the DiT replicated rather than FSDP-sharded, no text encoder, image
 # encoder or VAE offload, and the VAE decode split across the ranks and
 # gathered. FastVideo's documented four-GPU OmniRef run

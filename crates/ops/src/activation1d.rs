@@ -1,4 +1,4 @@
-//! `Activation1d`: BigVGAN's anti-aliased activation, as one program (operator `audio_activation`).
+//! `Activation1d`: BigVGAN's anti-aliased activation, as one program (operator `activation1d`).
 //!
 //! An anti-aliased residual block of a BigVGAN-style vocoder ends in `Activation1d(SnakeBeta(C))`:
 //! the activation evaluated at `ratio` times the signal's rate, between a Kaiser-windowed sinc
@@ -53,7 +53,7 @@ use crate::{Error, Op, Result, Twins};
 /// The reciprocal gain's floor, as the reference writes it: `exp(beta) + 1e-9`.
 pub const BETA_FLOOR: f32 = 1e-9;
 
-/// One compilation of `audio_activation`.
+/// One compilation of `activation1d`.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub struct Descriptor {
     /// Element type of the signal, the filters and the output: FP32, the block's own precision.
@@ -131,7 +131,7 @@ pub fn lowpass_length(width: u64, kernel: u64, ratio: u64) -> Result<u64> {
     let padded = width + kernel - 1;
     if padded < kernel {
         return Err(Error::argument(
-            "audio_activation",
+            "activation1d",
             format!(
                 "a {width}-sample signal padded to {padded} is shorter than the {kernel}-tap \
                  filter, so the low-pass has nothing to convolve"
@@ -165,7 +165,7 @@ pub struct Args {
 pub struct Activation1d;
 
 impl Op for Activation1d {
-    const NAME: &'static str = proto::module::operator::AUDIO_ACTIVATION;
+    const NAME: &'static str = proto::module::operator::ACTIVATION1D;
 
     type Descriptor = Descriptor;
     type Args<'a> = Args;

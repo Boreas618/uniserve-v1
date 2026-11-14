@@ -13,7 +13,7 @@
 //!
 //! This activation is **not** SnakeBeta: BigVGAN-style blocks store a
 //! frequency and a gain separately, in log space (`x + sin²(exp(α)·x)/(exp(β) + 1e-9)`, which
-//! `audio_activation` applies inside its resample),
+//! `activation1d` applies inside its resample),
 //! while this one stores one linear parameter that serves as both. The two have different
 //! parameters, so folding them behind a flag would make one operator read a weight the other's
 //! checkpoint does not have.
