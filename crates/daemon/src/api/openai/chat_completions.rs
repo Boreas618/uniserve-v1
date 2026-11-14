@@ -234,7 +234,11 @@ pub fn chat_response(
     } else {
         None
     };
-    let usage = Usage::new(usage.prompt_tokens, usage.output_tokens);
+    let usage = Usage::new(
+        usage.prompt_tokens,
+        usage.output_tokens,
+        usage.cached_tokens,
+    );
 
     Ok(ChatCompletionResponse {
         id: options.request_id.clone(),
@@ -370,6 +374,7 @@ impl ChatCollector {
             usage: self.finished.as_ref().map(|(_, _, usage)| handoff::Usage {
                 prompt_tokens: usage.prompt_tokens,
                 output_tokens: usage.output_tokens,
+                cached_tokens: usage.cached_tokens,
             }),
             stop_reason: None,
         }
@@ -627,7 +632,11 @@ impl ChatStreamEmitter {
                         &self.response.request_id,
                         &self.response.response_model,
                         self.response.created,
-                        Usage::new(usage.prompt_tokens, usage.output_tokens),
+                        Usage::new(
+                            usage.prompt_tokens,
+                            usage.output_tokens,
+                            usage.cached_tokens,
+                        ),
                     ));
                 }
                 self.done = true;

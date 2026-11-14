@@ -147,9 +147,11 @@ pub(super) async fn media_output(
     let mut clock = StreamClock::new(started, compile_us);
     while let Some(event) = events.recv().await {
         let output = match event {
+            // A diffusion request reads no prefix of cached tokens.
             Event::Scheduled {
                 queued_at,
                 scheduled_at,
+                ..
             } => {
                 clock.scheduled(queued_at, scheduled_at);
                 RequestOutput::Scheduled {

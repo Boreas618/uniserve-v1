@@ -61,6 +61,9 @@ pub struct RequestUsage {
     /// Generated tokens, as the engine counts its completion tokens:
     /// visible text and the tokens of internal sections alike.
     pub output_tokens: u32,
+    /// Of `prompt_tokens`, those the request's first admission found cached
+    /// in any tier and did not compute; 0 for a diffusion request.
+    pub cached_tokens: u32,
     /// Phase durations.
     pub timings: RuntimeTimings,
 }

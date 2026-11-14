@@ -438,9 +438,11 @@ impl Event {
             Self::Scheduled {
                 queued_at,
                 scheduled_at,
+                cached_tokens,
             } => Kind::Scheduled(wire::Scheduled {
                 queued_at: *queued_at,
                 scheduled_at: *scheduled_at,
+                cached_tokens: *cached_tokens as u64,
             }),
             Self::TextToken { id, logprob } => Kind::TextToken(wire::TextToken {
                 id: *id,
@@ -548,6 +550,7 @@ impl Event {
             Kind::Scheduled(scheduled) => Self::Scheduled {
                 queued_at: scheduled.queued_at,
                 scheduled_at: scheduled.scheduled_at,
+                cached_tokens: count(scheduled.cached_tokens, "cached tokens")?,
             },
             Kind::TextToken(token) => Self::TextToken {
                 id: token.id,

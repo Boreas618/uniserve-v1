@@ -27,6 +27,7 @@ fn lifecycle(harness: &Harness, id: RequestId) -> (Vec<u32>, Event) {
         Event::Scheduled {
             queued_at,
             scheduled_at,
+            ..
         },
         rest,
     )) = events.split_first()

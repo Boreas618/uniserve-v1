@@ -3777,6 +3777,74 @@ mod tests {
         engine.shutdown().await.unwrap();
     }
 
+    /// A request reports, as its usage's `prompt_tokens_details.cached_tokens`, the prompt
+    /// tokens its admission found cached: none for the first request of a prompt, and for the
+    /// same prompt again the reuse limit, its whole blocks short of its last token, which is
+    /// computed (`(prompt_tokens - 1)` rounded down to the block). A stream that asks for usage
+    /// reports the same in its usage chunk.
+    #[tokio::test]
+    async fn a_repeated_prompt_reports_its_cached_tokens() {
+        let engine = Arc::new(qwen3_engine("cached-tokens-model", ending));
+        let router = router(Arc::clone(&engine));
+        let body = |stream: bool| {
+            let mut body = serde_json::json!({
+                "model": SERVED_MODEL,
+                "messages": [{"role": "user", "content": "b".repeat(200)}],
+                "max_completion_tokens": 4,
+                "temperature": 0.0,
+                "allowed_token_ids": [u32::from(b'a')],
+                "stream": stream,
+            });
+            if stream {
+                body["stream_options"] = serde_json::json!({"include_usage": true});
+            }
+            body
+        };
+        let cached =
+            |usage: &serde_json::Value| usage["prompt_tokens_details"]["cached_tokens"].as_u64();
+
+        let (status, first) = chat(&router, &body(false)).await;
+        assert_eq!(status, axum::http::StatusCode::OK, "{first}");
+        assert_eq!(cached(&first["usage"]), Some(0), "{first}");
+
+        let (status, second) = chat(&router, &body(false)).await;
+        assert_eq!(status, axum::http::StatusCode::OK, "{second}");
+        let prompt = second["usage"]["prompt_tokens"].as_u64().unwrap();
+        let block = u64::from(testkit::BLOCK_TOKENS);
+        let reused = (prompt - 1) / block * block;
+        assert!(
+            reused > 0,
+            "a prompt of {prompt} tokens holds a whole block"
+        );
+        assert_eq!(cached(&second["usage"]), Some(reused), "{second}");
+
+        let mut stream =
+            send_streamed(&router, post_json("/v1/chat/completions", &body(true))).await;
+        let mut text = String::new();
+        while let Some(frame) = tokio::time::timeout(STALL, stream.next_frame())
+            .await
+            .expect("the stream writes")
+        {
+            text.push_str(std::str::from_utf8(&frame).unwrap());
+        }
+        let usage: Vec<serde_json::Value> = text
+            .split("\n\n")
+            .filter_map(|event| event.strip_prefix("data: "))
+            .filter(|payload| *payload != "[DONE]")
+            .filter_map(|payload| {
+                serde_json::from_str::<serde_json::Value>(payload)
+                    .unwrap()
+                    .get("usage")
+                    .cloned()
+            })
+            .collect();
+        let [usage] = &usage[..] else {
+            panic!("one usage chunk: {text}");
+        };
+        assert_eq!(cached(usage), Some(reused), "{text}");
+        engine.shutdown().await.unwrap();
+    }
+
     /// Each request is recorded under the scheduler that served it.
     #[tokio::test]
     async fn request_metrics_name_the_engine_core_that_served_each_request() {

@@ -811,6 +811,7 @@ mod tests {
         let scheduling = || Event::Scheduled {
             queued_at: 1.0,
             scheduled_at: 2.0,
+            cached_tokens: 0,
         };
         assert!(
             !events.skips(&scheduling()),

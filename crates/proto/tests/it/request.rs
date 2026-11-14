@@ -167,6 +167,7 @@ fn events_come_back_from_their_messages_unchanged() {
         Event::Scheduled {
             queued_at: 1.5,
             scheduled_at: 2.5,
+            cached_tokens: 496,
         },
         Event::TextToken {
             id: 3,

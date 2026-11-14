@@ -1048,6 +1048,8 @@ impl Scheduler {
             "an admission ended: the request runs"
         );
         let queued_at = unix_secs(request.arrival);
+        // The hit is final here: every answer of the admission arrived.
+        let cached_tokens = request.num_cached_tokens as usize;
         self.waiting.retain(|waiting| *waiting != id);
         self.running.push(id);
 
@@ -1057,6 +1059,7 @@ impl Scheduler {
             Event::Scheduled {
                 queued_at,
                 scheduled_at: unix_secs(now),
+                cached_tokens,
             },
         );
         self.policy.events.push(Change::Admitted {
@@ -2208,8 +2211,8 @@ mod tests {
         assert_eq!(bench.stamps(), [(A, detach(OWNER_A))]);
     }
 
-    /// An admitted request runs from its hit, which it is told it was scheduled with, and leaves
-    /// the waiting queue.
+    /// An admitted request runs from its hit, which its scheduling event reports as its cached
+    /// tokens, and leaves the waiting queue.
     #[test]
     fn an_admitted_request_runs_from_its_hit() {
         let (mut bench, outputs) = scheduler();
@@ -2230,12 +2233,14 @@ mod tests {
             Event::Scheduled {
                 queued_at,
                 scheduled_at,
+                cached_tokens,
             },
         ] = sent[..]
         else {
             panic!("{sent:?}");
         };
         assert!(0.0 < queued_at && queued_at <= scheduled_at);
+        assert_eq!(cached_tokens, 2);
     }
 
     /// A request a prefill group served moves to a decode group once its prompt is computed: its

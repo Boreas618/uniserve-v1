@@ -71,6 +71,9 @@ pub enum DecodedTextEvent {
         /// it never published as text; the decoder's own count when a stop
         /// string ends the stream.
         output_tokens: usize,
+        /// Of `prompt_tokens`, those the request's first admission found
+        /// cached (`DecodeStream::cached_tokens`).
+        cached_tokens: usize,
     },
     /// The engine refused the request before executing it.
     Rejected {
@@ -113,6 +116,11 @@ pub struct DecodeStream {
     pending_token: Option<u32>,
     /// Generated text tokens consumed by the decoder.
     output_tokens: usize,
+    /// The prompt tokens the request's first admission found cached, from
+    /// its first scheduling event. A request preempted and admitted again,
+    /// on this engine or on the one a migration resubmits it to, keeps this
+    /// count, as vLLM's `num_cached_tokens` keeps its first scheduling's.
+    cached_tokens: usize,
 }
 
 impl DecodeStream {
@@ -150,6 +158,7 @@ impl DecodeStream {
             started: false,
             pending_token: None,
             output_tokens: 0,
+            cached_tokens: 0,
         })
     }
 
@@ -224,7 +233,11 @@ impl DecodeStream {
             Event::Scheduled {
                 queued_at,
                 scheduled_at,
+                cached_tokens,
             } => {
+                if self.scheduled.is_none() {
+                    self.cached_tokens = cached_tokens;
+                }
                 self.scheduled = Some((queued_at, scheduled_at));
                 if let Some(start) = self.start_event(&prompt_token_ids)? {
                     events.push(start);
@@ -336,6 +349,7 @@ impl DecodeStream {
                     stop_reason,
                     prompt_tokens,
                     output_tokens: completion_tokens,
+                    cached_tokens: self.cached_tokens,
                 });
                 return Ok(events);
             }
@@ -445,6 +459,7 @@ impl DecodeStream {
                 stop_reason: Some(StopReason::String(stop_string)),
                 prompt_tokens: prompt_token_ids.len(),
                 output_tokens: self.output_tokens,
+                cached_tokens: self.cached_tokens,
             });
             return Ok(true);
         }
@@ -483,6 +498,7 @@ impl DecodeStream {
             started: self.started,
             pending_token: self.pending_token,
             output_tokens: self.output_tokens as u64,
+            cached_tokens: self.cached_tokens as u64,
         }
     }
 
@@ -543,6 +559,7 @@ impl DecodeStream {
             started: state.started,
             pending_token: state.pending_token,
             output_tokens: state.output_tokens as usize,
+            cached_tokens: state.cached_tokens as usize,
         })
     }
 }

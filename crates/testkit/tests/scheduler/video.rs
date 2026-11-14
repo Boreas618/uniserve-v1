@@ -332,6 +332,7 @@ fn a_video_request_is_scheduled_before_its_progress_which_follows_every_applied_
     let Some(Event::Scheduled {
         queued_at,
         scheduled_at,
+        ..
     }) = events.first()
     else {
         panic!("{events:?}");

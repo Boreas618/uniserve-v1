@@ -632,12 +632,20 @@ mod tests {
         }
     }
 
-    /// An engine stream of `events` after the request's scheduling.
+    /// An engine stream of `events` after the request's scheduling, which
+    /// found nothing cached.
     fn engine_events(events: impl IntoIterator<Item = Event>) -> Box<dyn Events> {
+        admitted(0, events)
+    }
+
+    /// An engine stream of `events` after the request's scheduling, whose
+    /// admission found `cached_tokens` of its prompt cached.
+    fn admitted(cached_tokens: usize, events: impl IntoIterator<Item = Event>) -> Box<dyn Events> {
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         tx.send(Event::Scheduled {
             queued_at: 1.0,
             scheduled_at: 2.0,
+            cached_tokens,
         })
         .unwrap();
         for event in events {
@@ -695,6 +703,57 @@ mod tests {
         assert_eq!(token["logprob"], -0.25);
         assert_eq!(document["choices"][0]["finish_reason"], "length");
         assert_eq!(document["usage"]["completion_tokens"], 1);
+    }
+
+    /// The prompt tokens the request's first admission found cached are its
+    /// usage's `prompt_tokens_details.cached_tokens`, in a document and in
+    /// the usage chunk of a stream that asks for usage; a later admission of
+    /// the request (after a preemption) does not replace them.
+    #[tokio::test]
+    async fn usage_reports_the_cached_tokens_of_the_first_admission() {
+        let events = || {
+            admitted(
+                3,
+                [
+                    text_token(b'a'),
+                    Event::Scheduled {
+                        queued_at: 3.0,
+                        scheduled_at: 4.0,
+                        cached_tokens: 7,
+                    },
+                    text_token(b'b'),
+                    finished(proto::request::FinishReason::MaxTokens, 2),
+                ],
+            )
+        };
+        let document = document(handoff::Parser::default(), decode(), false, events())
+            .await
+            .unwrap();
+        assert_eq!(document["usage"]["prompt_tokens"], 1);
+        assert_eq!(
+            document["usage"]["prompt_tokens_details"]["cached_tokens"],
+            3
+        );
+
+        let mut options = response(false);
+        options.include_usage = true;
+        let sink = ChatStreamEmitter::new(&options);
+        let mut body = run(handoff::Parser::default(), decode(), false, events(), sink);
+        let (bytes, failed) = responded(&mut body).await;
+        assert!(failed.is_none());
+        let text = String::from_utf8(bytes).unwrap();
+        let usage: Vec<Value> = text
+            .split("\n\n")
+            .filter_map(|event| event.strip_prefix("data: "))
+            .filter(|payload| *payload != "[DONE]")
+            .map(|payload| serde_json::from_str::<Value>(payload).unwrap())
+            .filter_map(|chunk| chunk.get("usage").cloned())
+            .collect();
+        let [usage] = &usage[..] else {
+            panic!("one usage chunk: {text}");
+        };
+        assert_eq!(usage["completion_tokens"], 2);
+        assert_eq!(usage["prompt_tokens_details"]["cached_tokens"], 3);
     }
 
     /// A request that finishes without publishing a text token (the engine

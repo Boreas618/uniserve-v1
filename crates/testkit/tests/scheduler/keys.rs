@@ -228,8 +228,8 @@ fn an_isolation_key_roots_a_chain_only_its_own_requests_reach() {
 
 /// An admission pins the blocks of its hit from position 0, at most the reuse limit
 /// `(prompt_len - 1) / step * step`, so that its prefill computes at least its last prompt
-/// token, and its prefill starts at the hit (SD §4.3 "Reading"; §4.4 "The hit"; §7.4 "Reuse
-/// limit and step").
+/// token, and its prefill starts at the hit, which its scheduling event reports as its cached
+/// tokens (SD §4.3 "Reading"; §4.4 "The hit"; §7.4 "Reuse limit and step").
 #[test]
 fn an_admission_pins_its_hit_within_the_reuse_limit_and_its_prefill_starts_there() {
     let mut harness = Deployment::tokens().build();
@@ -264,6 +264,7 @@ fn an_admission_pins_its_hit_within_the_reuse_limit_and_its_prefill_starts_there
     };
     assert_eq!((*class, *at, &pinned[..]), (0, 0, &keys[..2]));
     assert_eq!(first_written(&harness, same, skip.0), 8);
+    assert_eq!((cached(&harness, first), cached(&harness, same)), (0, 8));
 
     // A prompt that continues it: all three blocks.
     let skip = (harness.batches().len(), harness.taken().len());
@@ -284,6 +285,17 @@ fn an_admission_pins_its_hit_within_the_reuse_limit_and_its_prefill_starts_there
     assert_eq!((*class, *at, pinned), (0, 0, &keys));
     assert_eq!(first_written(&harness, longer, skip.0), 12);
     assert_eq!(harness.tokens(longer).len(), 1);
+    assert_eq!(cached(&harness, longer), 12);
+}
+
+/// The cached tokens the scheduling event of request `id` reports: the prompt tokens its
+/// admission found cached.
+fn cached(harness: &Harness, id: RequestId) -> usize {
+    let events = harness.events(id);
+    let Some(Event::Scheduled { cached_tokens, .. }) = events.first() else {
+        panic!("request {} was not scheduled first: {events:?}", id.0);
+    };
+    *cached_tokens
 }
 
 /// An admission whose hit lies partly on the device and partly on the host alone pins the

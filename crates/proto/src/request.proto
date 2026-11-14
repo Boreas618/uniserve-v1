@@ -728,6 +728,9 @@ enum MigrationCause {
 message Scheduled {
   double queued_at = 1;
   double scheduled_at = 2;
+  // The prompt tokens the admission's prefix hit found cached, over every
+  // tier: the scheduler's `num_cached_tokens` once the hit is final.
+  uint64 cached_tokens = 3;
 }
 
 message TextToken {

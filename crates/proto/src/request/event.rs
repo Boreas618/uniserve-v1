@@ -56,12 +56,19 @@ pub struct PositionLogprobs {
 /// Typed event stream the engine emits for each request, of either kind.
 #[derive(Debug, Clone)]
 pub enum Event {
-    /// Reports scheduler admission timing.
+    /// Reports the request's admission: its timing and its prefix hit. The
+    /// engine sends one at each admission, so a request preempted and
+    /// admitted again reports a second.
     Scheduled {
         /// Time the request entered the queue, in seconds since the Unix epoch.
         queued_at: f64,
         /// Time the request was admitted, in seconds since the Unix epoch.
         scheduled_at: f64,
+        /// Prompt tokens the admission found cached in any tier (device,
+        /// host, peer, remote store) and does not compute again: the
+        /// scheduler's `num_cached_tokens` once the hit is final. Always
+        /// less than the prompt's length, whose last token is computed.
+        cached_tokens: usize,
     },
     /// Publishes one generated text token.
     TextToken {

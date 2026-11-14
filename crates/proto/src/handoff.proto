@@ -256,6 +256,9 @@ message Decode {
   optional uint32 pending_token = 7;
   // Generated text tokens the decoder consumed.
   uint64 output_tokens = 8;
+  // The prompt tokens the request's first admission found cached, from its
+  // first scheduling event.
+  uint64 cached_tokens = 9;
 }
 
 // The incremental detokenizer's window and the text it published but no
@@ -469,6 +472,8 @@ message Usage {
   uint32 output_tokens = 2;
   reserved 3, 4, 5;
   reserved "image_count", "image_steps", "image_steps_per_image";
+  // Of `prompt_tokens`, those the request's first admission found cached.
+  uint32 cached_tokens = 6;
 }
 
 // Candidate tokens of one scored position, as the engine reported them.

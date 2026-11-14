@@ -238,6 +238,7 @@ impl OutputProcessor {
                     stop_reason,
                     prompt_tokens,
                     output_tokens,
+                    cached_tokens,
                 } => {
                     // Release the text the parsers hold back and close the open block
                     // before the terminal output.
@@ -254,6 +255,7 @@ impl OutputProcessor {
                         usage: RequestUsage {
                             prompt_tokens: saturate(prompt_tokens),
                             output_tokens: saturate(output_tokens),
+                            cached_tokens: saturate(cached_tokens),
                             timings: self.clock.timings(),
                         },
                     });
