@@ -1088,8 +1088,9 @@ impl Scheduler {
 
     /// Whether `request` can never fit (SD §3.5, §7.2): in some region, the units its admission
     /// holds when no other request holds any exceed the region's capacity. Below that, `fits`
-    /// holds once the requests ahead of it have ended and the units they held came back, so a
-    /// request this does not refuse is admitted.
+    /// holds once the requests ahead of it have ended and the units they held came back, since
+    /// its hit is one its admission holds alone (SD §4.4 "The hit"), so a request this does not
+    /// refuse is admitted.
     fn never_fits(&self, request: &Request) -> bool {
         let alone = self.units_alone(request);
         alone

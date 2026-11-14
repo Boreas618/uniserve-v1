@@ -478,6 +478,25 @@ impl Scheduler {
         u32::try_from(bytes.div_ceil(unit).max(1)).unwrap_or(u32::MAX)
     }
 
+    /// The units of the encoder output `request` holds at position `at` of `class`, as its owner
+    /// on `group` allocates it (SD §4.4 "Classes"): a video request's conditioning its declared
+    /// result's size, a chat image's output its rows of features ([`Scheduler::encoding_units`]).
+    /// `None` for any other block, and for a conditioning whose result cannot be sized.
+    pub(super) fn encoding_size(
+        &self,
+        request: &Request,
+        class: u8,
+        at: u32,
+        group: GroupId,
+    ) -> Option<u32> {
+        let (_, rows) = self.encoding_at(request, class, at)?;
+        if request.is_video() {
+            let results = self.declared_results(request)?;
+            return results.get(at as usize).map(|&(_, _, units)| units);
+        }
+        Some(self.encoding_units(group, class, rows))
+    }
+
     /// Which of a request's encoder outputs position `at` of `class` holds, as an index into
     /// `Request::encodings`, and its rows (SD §4.2, §4.3): for a token request, encoder input
     /// `at`'s output in the encoder-output class, of its block's rows; for a video request, its
@@ -895,10 +914,10 @@ impl Scheduler {
     /// and the blocks of the hit its `Pin` takes out of the eviction order, which `available`
     /// counts as evictable (`unheld`; `S/admission.rs`'s `cached_free_units`); a request with
     /// context images every block of its context. Then every encoder output and declared result
-    /// but those it holds and those whose `Pin` `cache` expects to find, which take no units of
-    /// the region (SD §4.4).
+    /// but those it holds, an encoder output whose `Pin` `cache` expects to find taking only what
+    /// `available` counts of it as evictable ([`Scheduler::charge_encoding`]; SD §3.5, §4.4).
     pub(super) fn units_needed(&self, request: &Request, hit: u32) -> Vec<u32> {
-        self.units(request, Some(hit))
+        self.units(request, Some(hit), false)
     }
 
     /// Per region, the units a request's admission holds there when no other request holds any:
@@ -907,16 +926,34 @@ impl Scheduler {
     /// chunks and the blocks its first call and the low watermark take from its start, every
     /// block of a context with images; and every encoder output and declared result, pinned or
     /// allocated, since a pinned block lies in the region too. A request whose `never_fits`
-    /// passes is admitted once the requests ahead of it have ended: alone, it takes no more than
-    /// this.
+    /// passes is admitted once the requests ahead of it have ended: alone, and with no hit, it
+    /// takes no more than this, and its hit is one it holds alone ([`Scheduler::holds_alone`]).
     pub(super) fn units_alone(&self, request: &Request) -> Vec<u32> {
-        self.units(request, None)
+        self.units(request, None, true)
     }
 
-    /// [`Scheduler::units_needed`] with a hit, [`Scheduler::units_alone`] without.
-    fn units(&self, request: &Request, hit: Option<u32>) -> Vec<u32> {
+    /// Whether the admission of a token request with a prefix hit of `hit` tokens holds no more
+    /// than each region's capacity when no other request holds any (SD §4.4 "The hit"): per
+    /// cache class the blocks of the hit it reads, pinned or loaded, beside what
+    /// [`Scheduler::units_needed`] counts from the hit on, and every encoder output. From a hit
+    /// the first chunk may reach further than from position 0, the low watermark beyond it, so a
+    /// hit can hold more than [`Scheduler::units_alone`] counts. With a hit that holds no more
+    /// than the capacity, `fits` holds once every other request has left the regions, so no
+    /// admission is tried with a deeper one: it would wait at the head of the queue for good.
+    fn holds_alone(&self, request: &Request, hit: u32) -> bool {
+        let units = self.units(request, Some(hit), true);
+        units
+            .iter()
+            .enumerate()
+            .all(|(region, &units)| units <= self.capacity.get(region).copied().unwrap_or(0))
+    }
+
+    /// [`Scheduler::units_needed`] with a hit. With `alone`, what the admission holds when no
+    /// other request holds any: [`Scheduler::units_alone`] without a hit; with one, what
+    /// [`Scheduler::holds_alone`] compares with the capacity, every block of the hit the request
+    /// reads and every encoder output and declared result counted.
+    fn units(&self, request: &Request, hit: Option<u32>, alone: bool) -> Vec<u32> {
         let mut units = vec![0; self.regions.len()];
-        let allocating = hit.is_some();
         if request.is_video() {
             let results = self.declared_results(request).unwrap_or_default();
             for (at, (phase, class, size)) in (0u32..).zip(results) {
@@ -927,10 +964,10 @@ impl Scheduler {
                 let Some(group) = group else {
                     continue;
                 };
-                // Its conditioning, found under its key, is pinned where it lies.
-                let found = Some(at) == request.conditioning_position()
-                    && self.encoding_found(request, 0, Some(group));
-                if !(allocating && found) {
+                // Its conditioning is its encoder output, pinned where `cache` holds it.
+                if !alone && Some(at) == request.conditioning_position() {
+                    self.charge_encoding(&mut units, request, 0, group, class, size);
+                } else {
                     self.charge_units(&mut units, group, class, 1, size);
                 }
             }
@@ -954,7 +991,8 @@ impl Scheduler {
         let chunk = self.first_chunk(request, cached);
         // The tiers `cache` expects of the prompt's blocks: a hit's blocks on the host alone are
         // loaded into blocks the `Load` allocates on the device, those on the device are pinned.
-        let tiers = allocating.then(|| self.tiers(request, group));
+        // A request alone in the regions holds every block of its hit, whatever its tier.
+        let tiers = (hit.is_some() && !alone).then(|| self.tiers(request, group));
         let host = reads_host(request);
         for (index, &(kind, block)) in self.shapes(request).iter().enumerate() {
             let Ok(class) = u8::try_from(index) else {
@@ -986,7 +1024,7 @@ impl Scheduler {
                 } else {
                     pages
                 }
-            } else if !allocating {
+            } else if hit.is_none() {
                 least
             } else if kind.is_state() {
                 reaches(cached, prompt).min(least)
@@ -994,52 +1032,79 @@ impl Scheduler {
                 pages.saturating_sub(cached / block).min(least)
             };
             let range = needed(kind, block, cached);
-            let (device, loaded) = tiers
-                .as_ref()
-                .and_then(|tiers| tiers.get(index))
-                .and_then(|tiers| usable(tiers, range.clone(), host))
-                .unwrap_or((0, 0));
-            // The hit's blocks on the device are pinned, and those no request holds leave the
-            // eviction order with the `Pin`: the units `available` counts of them are no
-            // allocation's, the admission's own included.
-            let pinned = request.keys.get(index).and_then(|keys| {
-                keys.get(range.start as usize..range.start.saturating_add(device) as usize)
-            });
-            let unheld = pinned.map_or(0, |keys| self.unheld(keys, group));
-            let blocks = blocks
-                .max(first)
-                .saturating_add(loaded)
-                .saturating_add(unheld);
+            let read = if alone {
+                range.end.saturating_sub(range.start)
+            } else {
+                let (device, loaded) = tiers
+                    .as_ref()
+                    .and_then(|tiers| tiers.get(index))
+                    .and_then(|tiers| usable(tiers, range.clone(), host))
+                    .unwrap_or((0, 0));
+                // The hit's blocks on the device are pinned, and those no request holds leave
+                // the eviction order with the `Pin`: the units `available` counts of them are no
+                // allocation's, the admission's own included.
+                let pinned = request.keys.get(index).and_then(|keys| {
+                    keys.get(range.start as usize..range.start.saturating_add(device) as usize)
+                });
+                let unheld = pinned.map_or(0, |keys| self.unheld(keys, group));
+                loaded.saturating_add(unheld)
+            };
+            let blocks = blocks.max(first).saturating_add(read);
             self.charge_units(&mut units, group, class, blocks, 0);
         }
 
         if let Some(class) = self.encoder_class(request) {
-            let reads = request.generation().is_some_and(|input| input.cache.read);
             for (index, (_, rows, _, input)) in request.image_spans().enumerate() {
                 let phase = match input.encoder {
                     ImageEncoder::Vision => Phase::VisionEncode,
                     ImageEncoder::Latent => Phase::LatentEncode,
                 };
                 let encoder = request.placement[phase.index()].unwrap_or(group);
-                let read = reads.then_some(encoder);
-                if allocating && self.encoding_found(request, index, read) {
-                    continue;
-                }
                 let size = self.encoding_units(encoder, class, rows);
-                self.charge_units(&mut units, encoder, class, 1, size);
+                if alone {
+                    self.charge_units(&mut units, encoder, class, 1, size);
+                } else {
+                    self.charge_encoding(&mut units, request, index, encoder, class, size);
+                }
             }
         }
         units
     }
 
-    /// Whether the admission of `request` allocates nothing for its encoder output `index` (into
-    /// `Request::encodings`): the request holds it, or `cache` holds it on the device in `read`,
-    /// the group of its owner where the request reads cached outputs, so that its `Pin` finds it
-    /// there (SD §4.4). An output on the host alone is loaded into a block the `Load` allocates.
-    fn encoding_found(&self, request: &Request, index: usize, read: Option<GroupId>) -> bool {
-        request.encodings.get(index).is_some_and(|&(key, held)| {
-            held.is_some() || read.is_some_and(|group| self.on_device(key, group))
-        })
+    /// Charges `units` with what the admission of `request` takes for its encoder output `index`
+    /// (into `Request::encodings`), a block of `size` units of `class` for its owner on `group`
+    /// (SD §3.5 `fits`, §4.4): nothing when the request holds it. When the request reads cached
+    /// outputs (a video request's conditioning always) and `cache` holds this one on the device in
+    /// `group`, its `Pin` takes what `available` counts of it as evictable
+    /// ([`Scheduler::evictable`]): nothing while another request holds it, and its size while it
+    /// lies in the head of the order this queue pair installed, which the buffer pool's word
+    /// counts. Otherwise its `Allocate`, or the `Load` of its host copy, takes a block of `size`.
+    fn charge_encoding(
+        &self,
+        units: &mut [u32],
+        request: &Request,
+        index: usize,
+        group: GroupId,
+        class: u8,
+        size: u32,
+    ) {
+        let entry = request.encodings.get(index);
+        if entry.is_some_and(|(_, held)| held.is_some()) {
+            return;
+        }
+        let reads = request.generation().is_none_or(|input| input.cache.read);
+        let pinned = entry
+            .map(|&(key, _)| key)
+            .filter(|&key| reads && self.on_device(key, group));
+        let Some(key) = pinned else {
+            self.charge_units(units, group, class, 1, size);
+            return;
+        };
+        for (region, taken) in self.evictable(&key, group, size) {
+            if let Some(total) = units.get_mut(region) {
+                *total = total.saturating_add(taken);
+            }
+        }
     }
 
     /// Whether `cache` holds the block of `key` on the device in `group`.
@@ -1083,9 +1148,11 @@ impl Scheduler {
 
     /// What `cache` expects of a token request's prefix on `group` (SD §4.4 "The hit"): the
     /// deepest multiple of the step, at most the reuse limit, that every cache class but the
-    /// draft cache accepts, a rejected boundary not ending the search; with `tails`, extended
-    /// to the longest end short of the next multiple at which every such class holds a partial
-    /// last block on the device under its tail key, which a recurrent state never does. Per
+    /// draft cache accepts and with which the admission holds no more than the regions' capacity
+    /// alone ([`Scheduler::holds_alone`]), a rejected boundary not ending the search; with
+    /// `tails`, extended to the longest end short of the next multiple at which every such class
+    /// holds a partial last block on the device under its tail key, which a recurrent state never
+    /// does, and with which the admission holds no more than that alone either. Per
     /// class, the table the hit fills when the answers bear `cache` out: read-only from `first`
     /// to `shared`, the hit's blocks on the device and then on the host alone (never for a
     /// request that continues another epoch's state), and to `end` the clone of its partial last
@@ -1106,10 +1173,11 @@ impl Scheduler {
             .collect();
 
         let accepts = |boundary: u32| {
-            required.iter().all(|&class| {
+            let read = required.iter().all(|&class| {
                 let (kind, block) = shapes[class];
                 usable(&tiers[class], needed(kind, block, boundary), host).is_some()
-            })
+            });
+            read && self.holds_alone(request, boundary)
         };
         let mut hit = (1..=limit / step)
             .rev()
@@ -1132,7 +1200,7 @@ impl Scheduler {
                         .tail_key(request, class, end)
                         .is_some_and(|key| self.expected_hit(&[key], group)[0] & DEVICE != 0)
             });
-            if held {
+            if held && self.holds_alone(request, end) {
                 hit = end;
                 break;
             }
@@ -1177,9 +1245,10 @@ impl Scheduler {
     /// store when the blocks `cache` says it holds deepen the hit by at least the policy's
     /// `prefetch_min_tokens`, else from the peers when the deployment has some and the reuse
     /// limit lies that far beyond the hit; with `forced`, the policy named the request and any
-    /// deepening is asked for. One per cache class but the draft cache, with the class's keys
-    /// beyond what the device and the host hold, and a deadline of [`prefetch_wait`] of the
-    /// deepening from now.
+    /// deepening is asked for. Either deepens it only to a boundary with which the admission
+    /// holds no more than the regions' capacity alone ([`Scheduler::holds_alone`]). One per
+    /// cache class but the draft cache, with the class's keys beyond what the device and the
+    /// host hold, and a deadline of [`prefetch_wait`] of the deepening from now.
     pub(super) fn prefetch_requests(
         &self,
         request: &Request,
@@ -1225,18 +1294,27 @@ impl Scheduler {
                         })
             })
         };
-        let remote = (1..=limit / step)
-            .rev()
-            .map(|boundary| boundary * step)
-            .find(|&boundary| present(boundary))
-            .unwrap_or(0);
+        // A prefetch deepens the hit only to a boundary the admission holds alone, as `lookup`
+        // reads it (SD §4.4 "The hit").
+        let deepest = |accepts: &dyn Fn(u32) -> bool| {
+            (1..=limit / step)
+                .rev()
+                .map(|boundary| boundary * step)
+                .find(|&boundary| accepts(boundary) && self.holds_alone(request, boundary))
+                .unwrap_or(0)
+        };
+        let remote = deepest(&present);
         let peers = self
             .kv_config(request)
             .is_some_and(|kv| !kv.peers.is_empty());
+        let reach = || deepest(&|_| true);
         let (target, source) = if remote >= hit.saturating_add(least) {
             (remote, Source::Remote)
-        } else if peers && limit >= hit.saturating_add(least) {
-            (limit, Source::Peers)
+        } else if let Some(reach) = peers
+            .then(reach)
+            .filter(|&reach| reach >= hit.saturating_add(least))
+        {
+            (reach, Source::Peers)
         } else {
             return Vec::new();
         };
@@ -1641,18 +1719,13 @@ impl Scheduler {
         // allocated, of its declared result's size for a video request's conditioning and of its
         // rows of features for a chat image's. A video request's conditioning a `Pin` found is
         // read from the cached block's one run when it crosses to another process.
-        if let Some((index, rows)) = self.encoding_at(request, class, at) {
+        if let Some((index, _)) = self.encoding_at(request, class, at) {
             let pinned = match completion {
                 Completion::Pinned { runs, .. } => runs.first().map(|run| run.0),
                 _ => None,
             };
             if held == 0 {
-                let units = if request.is_video() {
-                    let results = self.declared_results(request).unwrap_or_default();
-                    results.get(at as usize).map_or(1, |&(_, _, units)| units)
-                } else {
-                    self.encoding_units(group, class, rows)
-                };
+                let units = self.encoding_size(request, class, at, group).unwrap_or(1);
                 follow.push(allocate(owner, class, at, 1, units));
             } else if let Some(request) = self.requests.get_mut(&id) {
                 if let Some(entry) = request.encodings.get_mut(index) {
@@ -1906,7 +1979,7 @@ impl Scheduler {
             self.first_call_asks(request, owner, hit, &mut blocks, &mut asks);
             hit
         } else {
-            let hit = self.supported(&shapes, &blocks, expected, step);
+            let hit = self.supported(request, &blocks, expected, step);
             self.finalize(
                 request,
                 owner,
@@ -1928,18 +2001,14 @@ impl Scheduler {
         asks
     }
 
-    /// The deepest hit, at most `expected`, whose blocks the read-only entries of `blocks` hold
-    /// in every cache class but the draft cache: `expected` itself when it ends in a partial
-    /// block every class cloned, else a multiple of `step`.
-    fn supported(
-        &self,
-        shapes: &[(CacheGroupKind, u32)],
-        blocks: &[Blocks],
-        expected: u32,
-        step: u32,
-    ) -> u32 {
+    /// The deepest hit of `request`, at most `expected`, whose blocks the read-only entries of
+    /// `blocks` hold in every cache class but the draft cache and with which its admission holds
+    /// no more than the regions' capacity alone ([`Scheduler::holds_alone`]): `expected` itself
+    /// when it ends in a partial block every class cloned, else a multiple of `step`.
+    fn supported(&self, request: &Request, blocks: &[Blocks], expected: u32, step: u32) -> u32 {
+        let shapes = self.shapes(request);
         let holds = |boundary: u32, tail: bool| {
-            shapes.iter().zip(blocks).all(|(&(kind, block), table)| {
+            let read = shapes.iter().zip(blocks).all(|(&(kind, block), table)| {
                 let range = needed(kind, block, boundary);
                 let read =
                     range.is_empty() || (table.first <= range.start && range.end <= table.shared);
@@ -1947,7 +2016,8 @@ impl Scheduler {
                     || boundary.is_multiple_of(block)
                     || (table.shared == boundary / block && table.end > boundary / block);
                 kind.is_draft() || (read && clone)
-            })
+            });
+            read && self.holds_alone(request, boundary)
         };
         if !expected.is_multiple_of(step) && holds(expected, true) {
             return expected;

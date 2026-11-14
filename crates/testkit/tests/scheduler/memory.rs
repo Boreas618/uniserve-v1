@@ -1162,6 +1162,34 @@ fn host_hits_beyond_what_the_device_has_free_are_admitted_in_turn_and_all_end() 
     assert!(!refused, "no admission counted as fitting found no room");
 }
 
+/// A hit is read only as deep as the admission holds it alone in the region: a hit near the end
+/// of a chunked prompt lets the first call reach the prompt's end, and with the low watermark
+/// beyond it the admission would hold every block of the prompt and one more, though computed in
+/// chunks from position 0 the prompt takes only its own blocks. In a region of exactly those
+/// blocks, the request reads the deepest boundary with which its blocks of the hit, its first
+/// call and the low watermark fit the region's units, and neither it nor the request behind it
+/// waits for good at the head of the queue (SD §3.5 `never_fits`, `fits`; §4.4 "The hit", "The
+/// low watermark").
+#[test]
+fn a_hit_is_read_only_as_deep_as_the_admission_holds_it_alone_in_the_region() {
+    // A prompt of eight blocks in a region of eight units, computed in chunks of four blocks.
+    let mut harness = Deployment::tokens().kv_units(8).chunk(16).build();
+    let first = harness.submit(token(1, 32, 1));
+    harness.settle(100);
+    assert!(harness.finished_with(first, FinishReason::MaxTokens));
+
+    let reader = harness.submit(sharing(2, 1, 32, 1));
+    let behind = harness.submit(token(3, 8, 1));
+    harness.settle(200);
+    // At the reuse limit, 28 tokens, and at every boundary from 16 on, the hit's blocks and the
+    // first call's with the low watermark are nine; at 12 tokens they are the hit's three, the
+    // chunk's four up to token 28 and one more.
+    assert_eq!(harness.first_written(reader, 0), Some(12));
+    for id in [reader, behind] {
+        assert!(harness.finished_with(id, FinishReason::MaxTokens), "{id:?}");
+    }
+}
+
 /// A request resumed on the engine of a later epoch of the same layout reads every block its
 /// previous life committed there, its partial last block by its tail key, though those commits
 /// came through the earlier epoch's queue pair after this scheduler listed the cache: its

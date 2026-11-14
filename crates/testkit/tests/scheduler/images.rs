@@ -272,6 +272,65 @@ fn a_cached_image_skips_its_encode() {
     assert_eq!(harness.tokens(second).len(), 2);
 }
 
+/// A cached encoder output no request holds lies in the head of the device buffers' eviction
+/// order, whose units the buffer pool's `available` counts, and a request that pins it takes it
+/// out of that count. A request showing that image and a new one, while a running request holds
+/// the rest of the buffers, therefore waits in the queue until the running request has ended, and
+/// the buffer pool is asked for no admission it answers `Full` (SD §3.5 `fits`: an encoder output
+/// whose `Pin` `cache` expects to find and that no request holds takes its size while it lies in
+/// the installed head; §4.5 "Installing the order").
+#[test]
+fn a_cached_encoder_output_no_request_holds_takes_its_units_from_the_admission_that_pins_it() {
+    let mut harness = Deployment::tokens().images().build();
+    assert_eq!(harness.resize("buffers", 2 * UNITS), 2 * UNITS);
+    let first = harness.submit(chat_image(1, 12, ROWS, 1));
+    harness.settle(100);
+    assert_eq!(harness.tokens(first).len(), 1);
+
+    let running = harness.submit(chat_image(3, 12, ROWS, 24));
+    harness.run_until(50, |harness| !harness.tokens(running).is_empty());
+    // The image of the first request, cached, and a new one after it.
+    let mut request = showing(2, 1, 2);
+    let mut new = chat_image(4, 12, ROWS, 1)
+        .multimodal_inputs
+        .images
+        .remove(0);
+    new.position = 9;
+    request.multimodal_inputs.images.push(new);
+    let both = harness.submit(request);
+    harness.settle(300);
+
+    let full = harness.answers().into_iter().any(|answer| {
+        matches!(
+            answer,
+            (
+                Request::Allocate {
+                    class: ENCODER_CLASS,
+                    ..
+                },
+                Completion::Full { .. }
+            )
+        )
+    });
+    assert!(
+        !full,
+        "no admission the scheduler counted as fitting found no room"
+    );
+    let ended = harness
+        .sent()
+        .position(|(of, event)| *of == running && matches!(event, Event::Finished { .. }));
+    let scheduled = harness
+        .sent()
+        .position(|(of, event)| *of == both && matches!(event, Event::Scheduled { .. }));
+    assert!(
+        ended < scheduled,
+        "it is admitted once the running request has ended"
+    );
+    assert_eq!(harness.batches_of_phase(both, Phase::VisionEncode).len(), 1);
+    assert_eq!(harness.tokens(running).len(), 24);
+    assert_eq!(harness.tokens(both).len(), 2);
+}
+
 /// An encoder output the scheduler believes held but the buffer pool no longer holds (another
 /// epoch evicted it) is computed again: the admission's `Pin` finds nothing, the output is
 /// allocated, the image encoded, and the output committed under its key (SD §4.5: a wrong belief

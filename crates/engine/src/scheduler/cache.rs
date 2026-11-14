@@ -765,6 +765,40 @@ impl Scheduler {
         u32::try_from(unheld.count()).unwrap_or(u32::MAX)
     }
 
+    /// Per region of its class in `group` (by index), the units of the block of `key` that
+    /// `available` counts as evictable, and that a `Pin` of it for an owner on `group` takes from
+    /// every allocation (SD §3.5 `fits`, §4.5): none while a request of this scheduler holds it or
+    /// its device copy is not valid in `group`. A block of a class with a block size counts its
+    /// units wherever it lies in the order: the buffer pool's word counts the installed head,
+    /// `beyond_head` the rest. A block of a sized class states its own size, which `order` does
+    /// not carry, so it counts `size`, its size as the pinning request computes it, only where the
+    /// head this queue pair installed names it, which the buffer pool's word counts, and nothing
+    /// beyond the head.
+    pub(super) fn evictable(&self, key: &Key, group: GroupId, size: u32) -> Vec<(usize, u32)> {
+        let id = Cached::id(key);
+        let Some(row) = self
+            .cache
+            .get(&id)
+            .filter(|row| row.key == *key && row.ordered_in(group))
+        else {
+            return Vec::new();
+        };
+        let Some(holder) = self.group(group) else {
+            return Vec::new();
+        };
+        let regions = holder.regions(row.class).iter().map(|&r| usize::from(r));
+        regions
+            .filter_map(|region| match self.class_units(row.class, region) {
+                0 => {
+                    let installed = self.installed.get(region);
+                    let head = installed.is_some_and(|head| head.contains(&id));
+                    head.then_some((region, size))
+                }
+                units => Some((region, units)),
+            })
+            .collect()
+    }
+
     /// Whether the block `id` names (a policy's `PageId` or `EncodingId`) is on the device with no
     /// request of this scheduler holding it: a victim the policy may name (SD §3.6).
     pub(super) fn cache_unpinned(&self, id: u64) -> bool {
