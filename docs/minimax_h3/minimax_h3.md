@@ -281,16 +281,16 @@ Every request generates one video.
 
 ## Precision
 
-A dense BF16 checkpoint selects its precision with `quantization`:
+A dense BF16 checkpoint states its precision with `quantization`. A mode gives four modules a representation each, and `modules` overrides parts of a mode by the names `attention`, `mlp`, `text_encoder` and `video_vae`, as in `--set 'quantization={ mode = "quality", modules = { video_vae = "fp16" } }'`:
 
-| Mode | Denoiser MLP | Text encoder | Video VAE |
-| --- | --- | --- | --- |
-| `quality` (default) | BF16 | BF16 | FP16 |
-| `balanced` | BF16 | BF16 | NVFP4 |
-| `performance` | FP8 | BF16 | NVFP4 |
-| `maximum` | NVFP4 | FP8 | NVFP4 |
+| Mode | Denoiser attention | Denoiser MLP | Text encoder | Video VAE |
+| --- | --- | --- | --- | --- |
+| `quality` (default) | BF16 | BF16 | BF16 | FP16 |
+| `balanced` | BF16 | BF16 | BF16 | NVFP4 |
+| `performance` | BF16 | FP8 | BF16 | NVFP4 |
+| `maximum` | BF16 | NVFP4 | FP8 | NVFP4 |
 
-Denoiser attention stays BF16. `modules` overrides parts of a mode by the names `attention`, `mlp`, `text_encoder` and `video_vae`, as in `--set 'quantization={ mode = "performance", modules = { video_vae = "bf16" } }'`. NVFP4 needs Blackwell; on Hopper, use `quality`, optionally with `{"modules":{"mlp":"fp8"}}`. The packed NVFP4 checkpoints carry their own precision and take no `quantization`. The presets other than `quality` change the generated media; establish quality for the intended workload before choosing one.
+This build serves `quality` alone: no load converts a dense checkpoint's weights into FP8 or NVFP4, whose products read a calibrated activation scale that only a quantized export states, and the video VAE decoder computes in FP16, the type its reference computes in. A policy that gives a module another representation (`balanced`, `performance`, `maximum`, an `fp8` or `nvfp4` selection, `video_vae = "bf16"`) is refused when the engine opens the checkpoint, naming each such module and its representation; a selection of another module, or of a representation its module does not take (`attention`, `mlp` and `text_encoder` take `bf16`, `fp8` or `nvfp4`; `video_vae` takes `fp16`, `bf16` or `nvfp4`), is refused by its path. NVFP4 is served by the packed NVFP4 checkpoints, which carry their own precision and take no `quantization`.
 
 ## Further guides
 
@@ -303,7 +303,7 @@ Denoiser attention stays BF16. `modules` overrides parts of a mode by the names 
 | A kernel package's compile error in the Build Server's log | Check CUDA 13 `nvcc`, `CUDA_HOME` and the C++ build tools, and run the Build Server's `uv sync` above again. |
 | `unsupported FastH3 checkpoint` | Use a checkpoint from the table above; the message names the `fastvideo_inference.json` field it cannot serve. |
 | `checkpoint format 'modelopt_nvfp4' owns its numerical configuration` | Drop `quantization` for a packed NVFP4 checkpoint. |
-| `nvfp4 conversion requires an SM100-class CUDA device` | Use `quality` or FP8 overrides on Hopper. |
+| `a dense checkpoint is served in quality alone` | State `quality`, or no `quantization`; serve a packed NVFP4 checkpoint for NVFP4 products. |
 | `NVML reports no device storage for process` | Run the container in the host's process ID namespace (`--pid=host`). |
 | Startup refuses a static storage grant, or GPU out of memory | Raise `--mem-fraction-static`, serve fewer canvases, capacities or seconds, or shard the denoiser further. |
 | `invalid_request` naming a condition product's rows and its bound, or the packed condition rows and `video_config.max_condition_rows` | Serve with a larger `video_config.max_condition_rows`, or without it to provision the largest condition set, or send fewer or smaller references. |

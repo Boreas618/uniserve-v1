@@ -17,7 +17,7 @@ uniserve serve "$H3_MODEL" --worker-groups configs/minimax_h3/ulysses4.toml \
   --max-running-requests 2 --max-model-len 10240 \
   --set video_config.text_capacities=1024
 
-uniserve serve --config fasth3.toml --set quantization.mode=performance
+uniserve serve --config fasth3.toml --set video_config.max_seconds=10
 ```
 
 | Flag | Path |
@@ -36,7 +36,7 @@ uniserve serve --config fasth3.toml --set quantization.mode=performance
 
 `--log-level` and `--log-level-http` set the log levels of the `uniserve` process; every subcommand takes them, before or after its name.
 
-A `--set` value is a TOML value (`2`, `true`, `"text"`, `[1024, 4096]`, `{ mode = "balanced" }`) or JSON, and otherwise the text itself, so `--set quantization.mode=balanced` and `--set server_config.host=0.0.0.0` need no quotes. A list may be comma-separated text (`--set video_config.sizes=1344x768,768x1344`); quoting is safer than brackets, which the shell may expand. One invocation may set a path several times, the last winning, but not both a table and an option inside it.
+A `--set` value is a TOML value (`2`, `true`, `"text"`, `[1024, 4096]`, `{ mode = "quality" }`) or JSON, and otherwise the text itself, so `--set quantization.mode=quality` and `--set server_config.host=0.0.0.0` need no quotes. A list may be comma-separated text (`--set video_config.sizes=1344x768,768x1344`); quoting is safer than brackets, which the shell may expand. One invocation may set a path several times, the last winning, but not both a table and an option inside it.
 
 Every option is checked by its type wherever it is stated, and an error names its path: an unknown option, a value its option does not take, or zero for a positive count. A duration is whole seconds or a value with units (`500ms`, `30s`, `5m`, `1h`). A byte size is whole bytes or an integer with a decimal (`20MB`) or binary (`512MiB`) unit. Paths in options resolve against the server's working directory.
 
@@ -105,7 +105,7 @@ Three backend-name fields are read with `attention_backend` (`modules_of`, `crat
 | `max_model_len` | The checkpoint's `max_position_embeddings`, 8192 when it declares none; a media pipeline (MiniMax-H3) has none and its deployment must state it | Longest sequence a request may reach, in tokens; for a media pipeline the longest prompt presentation it admits |
 | `lora_path` | Unset | A weight adapter fused into the checkpoint's weights at load and serving every request: an adapter file, or a directory holding `adapter_model.safetensors`; video families only, and the family must recognize it ([FastH3 adapters](minimax_h3/minimax_h3.md#fasth3-adapters)) |
 | `dtype` | `"bfloat16"` | Element type of parameters and activations: `bfloat16`, `float16` or `float32` |
-| `quantization` | `{}` | Precision policy: `mode` (`quality`, `balanced`, `performance`, `maximum`) and selections by module under `modules`; empty selects the checkpoint's own quantization |
+| `quantization` | `{}` | Precision policy: `mode` (`quality`, `balanced`, `performance`, `maximum`) and representations selected by module under `modules` (`bf16`, `fp16`, `fp8`, `nvfp4`); empty selects the checkpoint's own quantization. The model family interprets it when the engine opens the checkpoint and refuses a policy it does not serve, naming each module: MiniMax-H3 serves a dense checkpoint in `quality` only ([FastH3 precision](minimax_h3/minimax_h3.md#precision)); the chat families state no mode and no module, and a checkpoint that declares its own quantization takes no policy |
 | `mm_processor_kwargs` | `{}` | Options of the model's multimodal processor; MiniMax-H3 takes `reference_image_short_edge` and `enlarge_references` ([FastH3 guide](minimax_h3/minimax_h3.md#startup-and-capacity)) |
 | `attention_backend` | `"auto"` | Attention package: `auto` has the Build Server select, for each attention descriptor key the deployment launches, the installed package that covers it by manifest priority; a package's backend name (`trtllm`, `triton`) serves every key it covers, and the others are selected as for `auto` |
 | `max_running_requests` | `128` | Concurrently resident requests, clamped to what the workers hold: each worker group holds this many request slots, or as many as its ranks' shares of their GPUs hold beside the weights, the graph pools and the fewest KV units when fewer fit (a slot holds a token request's slot state, or a video request's trajectory and its products on the rank), and a start whose share holds no slot fails, naming the bytes one slot needs |

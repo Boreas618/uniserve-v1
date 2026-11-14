@@ -111,8 +111,9 @@ impl crate::process::binding::ModelLoad for RankModel {
         let Model::Text(family) = self.model_runner.family.model else {
             return BTreeMap::new();
         };
+        let quantization = &self.model_runner.engine_config().model.quantization;
         nn::Checkpoint::open(self.model_runner.checkpoint())
-            .and_then(|checkpoint| family.open(&checkpoint))
+            .and_then(|checkpoint| family.open(&checkpoint, quantization))
             .map(|checkpoint| checkpoint.expert_layers())
             .unwrap_or_default()
     }
@@ -605,7 +606,7 @@ impl ModelRunner {
             );
         };
         let opened = nn::Checkpoint::open(self.checkpoint())?;
-        let checkpoint = family.open(&opened)?;
+        let checkpoint = family.open(&opened, &self.engine_config().model.quantization)?;
         let mut loader = weights.loader(&opened);
         let drafts = self.engine_config().speculative.num_draft_tokens;
         let placement = TextPlacement {

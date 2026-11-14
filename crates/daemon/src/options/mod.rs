@@ -161,10 +161,12 @@ pub struct ServerArgs {
     /// Element type of parameters and activations.
     #[arg(skip = ServerArgs::default().dtype)]
     pub dtype: ModelDtype,
-    /// Precision policy, such as `mode = "balanced"` or selections by
-    /// module under `modules`; empty selects the model's default.
+    /// Precision policy: a `mode` and representations selected by module
+    /// under `modules`, which the model family interprets and refuses when
+    /// it does not serve them; empty selects the checkpoint's own
+    /// quantization.
     #[arg(skip)]
-    pub quantization: serde_json::Map<String, Value>,
+    pub quantization: proto::config::Quantization,
     /// Options of the model's multimodal processor; the processor refuses
     /// one it does not take.
     #[arg(skip)]
@@ -331,7 +333,7 @@ impl Default for ServerArgs {
             max_model_len: None,
             lora_path: None,
             dtype: ModelDtype::BFloat16,
-            quantization: serde_json::Map::new(),
+            quantization: proto::config::Quantization::default(),
             mm_processor_kwargs: serde_json::Map::new(),
             attention_backend: "auto".to_owned(),
             prefill_attention_backend: None,

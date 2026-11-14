@@ -57,7 +57,8 @@ impl ModelRunner {
             .with_context(|| format!("fusing the adapter {path}"))
     }
 
-    /// The video family's reading of `checkpoint`, which [`Self::open_video_checkpoint`] opened.
+    /// The video family's reading of `checkpoint`, which [`Self::open_video_checkpoint`] opened,
+    /// under the epoch's precision policy.
     pub(super) fn open_video_family(
         &self,
         checkpoint: &nn::Checkpoint,
@@ -65,7 +66,7 @@ impl ModelRunner {
         let Model::Video(family) = self.family.model else {
             bail!("a causal language model holds no video pipeline");
         };
-        Ok(family.open(checkpoint)?)
+        Ok(family.open(checkpoint, &self.engine_config().model.quantization)?)
     }
 
     /// The denoiser's sequence split and the text encoder's tensor split of this rank, as the

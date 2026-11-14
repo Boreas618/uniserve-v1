@@ -34,11 +34,12 @@ use processing::minimax_h3::{
     CANVAS_RULE, ConditionPacking, DenoiserInfo, MIN_SECONDS, PreparedCondition, REFERENCE_LIMITS,
     ReferenceLimits, ServedCanvas, named_canvases,
 };
+use proto::config::Quantization;
 
 use crate::minimax_h3::audio_vae::{AudioDecoder, AudioEncoder};
 use crate::minimax_h3::config::{
     AUDIO_CHANNELS, AUDIO_HOP, AUDIO_SAMPLE_RATE, FPS, FRAMES, NETWORKS, RETAINED_LAYERS,
-    VIDEO_VAE, network,
+    VIDEO_VAE, network, precision,
 };
 use crate::minimax_h3::denoiser::{Denoiser, SAMPLE_DTYPE};
 use crate::minimax_h3::splice::VideoPostprocessor;
@@ -75,7 +76,11 @@ fn fasth3_adapter(metadata: &std::collections::BTreeMap<String, String>) -> bool
 }
 
 impl VideoFamily for MinimaxH3Family {
-    fn open(&self, checkpoint: &Checkpoint) -> nn::Result<Box<dyn VideoCheckpoint>> {
+    fn open(
+        &self,
+        checkpoint: &Checkpoint,
+        quantization: &Quantization,
+    ) -> nn::Result<Box<dyn VideoCheckpoint>> {
         // A checkpoint is one directory, or an export and the base release it continues.
         if checkpoint.roots().len() > 2 {
             return Err(nn::Error::Unsupported(format!(
@@ -84,7 +89,10 @@ impl VideoFamily for MinimaxH3Family {
                 checkpoint.roots().len()
             )));
         }
-        Ok(Box::new(Config::open(checkpoint)?))
+
+        let config = Config::open(checkpoint)?;
+        precision::check(quantization, &config)?;
+        Ok(Box::new(config))
     }
 
     /// A FastH3 adapter edits the base release's `transformer`, the network its student was

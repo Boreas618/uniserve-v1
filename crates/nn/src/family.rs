@@ -23,8 +23,10 @@
 //!
 //! Execution opens a [`Checkpoint`] and gives it to the family: `open` reads and normalizes the
 //! configuration once, from the checkpoint's own sidecars, into the opened checkpoint value that
-//! holds it; `load` builds the deployment's share from that configuration, the same checkpoint
-//! and a loader, and takes no path. Nothing between the two reads a configuration file again.
+//! holds it, and interprets the deployment's precision policy (`quantization`) against it, so a
+//! policy the family does not serve for that checkpoint is refused before any weight is read;
+//! `load` builds the deployment's share from that configuration, the same checkpoint and a
+//! loader, and takes no path. Nothing between the two reads a configuration file again.
 //! The loader decides what a load is: over a store of a device it loads the model execution
 //! serves, over [`CpuWeights`](crate::CpuWeights) the model a host check computes, and a meta
 //! loader the model of a profile run, by the same `load`.
@@ -32,6 +34,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
+use proto::config::Quantization;
 use tensor::DType;
 
 use crate::capability::{
@@ -235,12 +238,18 @@ impl FromIterator<Stage> for Stages {
 
 /// A causal language model family.
 pub trait TextFamily: Send + Sync {
-    /// Reads and normalizes `checkpoint`'s configuration, once, from its sidecars.
+    /// Reads and normalizes `checkpoint`'s configuration, once, from its sidecars, and
+    /// interprets the deployment's precision policy `quantization` against it.
     ///
     /// # Errors
     ///
-    /// Fails when the configuration cannot be read or states a model this family cannot build.
-    fn open(&self, checkpoint: &Checkpoint) -> Result<Box<dyn TextCheckpoint>>;
+    /// Fails when the configuration cannot be read or states a model this family cannot build,
+    /// or when the policy is one the family does not serve for this checkpoint.
+    fn open(
+        &self,
+        checkpoint: &Checkpoint,
+        quantization: &Quantization,
+    ) -> Result<Box<dyn TextCheckpoint>>;
 }
 
 /// A causal language model checkpoint, read but not loaded.
@@ -437,12 +446,18 @@ pub trait VideoFamily: Send + Sync {
     ///
     /// `checkpoint` may span several roots, an export first and the base release it continues
     /// after it ([`Checkpoint::open_roots`]); each sidecar is read from the first root that holds
-    /// it.
+    /// it. The deployment's precision policy `quantization` is interpreted against what the
+    /// checkpoint declares.
     ///
     /// # Errors
     ///
-    /// Fails when the configuration cannot be read or states a pipeline this family cannot build.
-    fn open(&self, checkpoint: &Checkpoint) -> Result<Box<dyn VideoCheckpoint>>;
+    /// Fails when the configuration cannot be read or states a pipeline this family cannot build,
+    /// or when the policy is one the family does not serve for this checkpoint.
+    fn open(
+        &self,
+        checkpoint: &Checkpoint,
+        quantization: &Quantization,
+    ) -> Result<Box<dyn VideoCheckpoint>>;
 
     /// The stage of `checkpoint` whose tensors `adapter` edits, or `None` for a flat
     /// checkpoint's own shard set: where the loading boundary fuses it
@@ -709,7 +724,7 @@ mod tests {
     struct Unopened;
 
     impl TextFamily for Unopened {
-        fn open(&self, _: &Checkpoint) -> Result<Box<dyn TextCheckpoint>> {
+        fn open(&self, _: &Checkpoint, _: &Quantization) -> Result<Box<dyn TextCheckpoint>> {
             Err(crate::Error::Unsupported("no checkpoint".to_owned()))
         }
     }

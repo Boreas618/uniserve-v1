@@ -9,6 +9,7 @@ use nn::{
     Checkpoint, DType, KvCache, KvPlanes, PhaseKind, RecurrentState, Shape, Split, Tensor,
     TokenBatch, VerifySlots, WeightLoader,
 };
+use proto::config::Quantization;
 
 /// The causal language model of `checkpoint`, opened and loaded as execution does: the
 /// checkpoint's declared class names its family, the family opens it, and the opened
@@ -34,7 +35,7 @@ pub(crate) fn load(
         panic!("{class} is a text family");
     };
 
-    let opened = family.open(checkpoint)?;
+    let opened = family.open(checkpoint, &Quantization::default())?;
     opened.load(checkpoint, loader, placement, &ExpertOrder::new())
 }
 

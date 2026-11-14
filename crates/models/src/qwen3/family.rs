@@ -19,6 +19,7 @@ use nn::family::{
     ExpertOrder, Family, Model, TextCheckpoint, TextFamily, TextModel, TextPlacement,
 };
 use nn::{Checkpoint, WeightLoader};
+use proto::config::Quantization;
 
 use crate::qwen3::Qwen3ForCausalLm;
 use crate::qwen3::causal_lm::expert_layers;
@@ -40,7 +41,14 @@ pub const HYBRID_FAMILY: Family = Family {
 struct Qwen3;
 
 impl TextFamily for Qwen3 {
-    fn open(&self, checkpoint: &Checkpoint) -> nn::Result<Box<dyn TextCheckpoint>> {
+    fn open(
+        &self,
+        checkpoint: &Checkpoint,
+        quantization: &Quantization,
+    ) -> nn::Result<Box<dyn TextCheckpoint>> {
+        // The family serves each checkpoint as its export declares it, BF16 or quantized.
+        nn::quantization::own_representation("qwen3", quantization)?;
+
         Ok(Box::new(Config::open(checkpoint)?))
     }
 }

@@ -124,9 +124,20 @@ impl ServerArgs {
     }
 }
 
-/// A TOML tree of options as `T`; a key no option takes is refused by the option types, by its
-/// path.
+/// Options stated under a name they no longer have, each with the name to state instead: a
+/// retired name is refused with its successor, rather than as an option no one knows.
+const RETIRED: [(&str, &str); 1] = [("quantization_config", "quantization")];
+
+/// A TOML tree of options as `T`; a retired name is refused with the name to state instead, and
+/// any other key no option takes is refused by the option types, by its path.
 fn deserialize_options<T: serde::de::DeserializeOwned>(tree: Table) -> anyhow::Result<T> {
+    if let Some((retired, current)) = RETIRED
+        .iter()
+        .find(|(retired, _)| tree.contains_key(*retired))
+    {
+        anyhow::bail!("invalid option `{retired}`: the option is retired; state it as `{current}`");
+    }
+
     serde_path_to_error::deserialize(Value::Table(tree)).map_err(|error| {
         let path = error.path().to_string();
         let cause = error.into_inner();
@@ -313,6 +324,7 @@ mod tests {
     use std::time::Duration;
 
     use clap::{FromArgMatches, Parser};
+    use proto::config::{PrecisionMode, WeightFormat};
     use proto::request::{ExpertExchange, SchedulingPolicy};
 
     use super::*;
@@ -383,7 +395,7 @@ mod tests {
             "--set",
             "video_config.sizes=[\"1344x768\"]",
             "--set",
-            "quantization={\"mode\":\"balanced\"}",
+            "quantization={\"mode\":\"balanced\",\"modules\":{\"video_vae\":\"bf16\"}}",
             "--set",
             "moe_config={ expert_parallel = true, exchange = \"deepep\" }",
             "--set",
@@ -402,7 +414,11 @@ mod tests {
             Some(vec![1024, 10240])
         );
         assert_eq!(config.video_config.sizes, ["1344x768"]);
-        assert_eq!(config.quantization["mode"], "balanced");
+        assert_eq!(config.quantization.mode, Some(PrecisionMode::Balanced));
+        assert_eq!(
+            config.quantization.modules,
+            [("video_vae".to_owned(), WeightFormat::Bf16)].into()
+        );
         assert!(config.moe_config.expert_parallel);
         assert_eq!(config.moe_config.exchange, ExpertExchange::DeepEp);
         assert_eq!(
@@ -442,6 +458,18 @@ mod tests {
                 ],
                 "moe_config",
             ),
+            (
+                vec!["--set", "quantization.mode=fastest"],
+                "quantization.mode",
+            ),
+            (
+                vec!["--set", "quantization.modules.mlp=int4"],
+                "quantization.modules.mlp",
+            ),
+            (
+                vec!["--set", "quantization.components={ mlp = \"fp8\" }"],
+                "quantization.components",
+            ),
             (vec!["--set", "no_value"], "PATH=VALUE"),
             (
                 vec!["--set", "video_config..max_seconds=5"],
@@ -450,6 +478,33 @@ mod tests {
         ] {
             let error = resolved(&args).unwrap_err();
             assert!(format!("{error:#}").contains(named), "{args:?}: {error:#}");
+        }
+    }
+
+    /// The retired spelling of the precision policy is refused with the
+    /// name to state instead, whether a file, a `--set` assignment or an
+    /// update's assignment states it.
+    #[test]
+    fn the_retired_policy_spelling_is_refused_with_its_successor() {
+        let file = written(
+            "retired",
+            "model = \"m\"\n[quantization_config]\nmode = \"quality\"\n",
+        );
+        let from_file = resolved(&["--config", file.to_str().unwrap()]).unwrap_err();
+        let from_set = resolved(&["m", "--set", "quantization_config.mode=quality"]).unwrap_err();
+        let (config, _) = resolved(&["m"]).unwrap();
+        let from_update = overridden(
+            &config,
+            &["quantization_config={ mode = \"quality\" }".to_owned()],
+        )
+        .unwrap_err();
+
+        for error in [from_file, from_set, from_update] {
+            let message = format!("{error:#}");
+            assert!(
+                message.contains("`quantization_config`") && message.contains("as `quantization`"),
+                "{message}"
+            );
         }
     }
 
@@ -506,6 +561,8 @@ mod tests {
             "0",
             "--dist-init-addr",
             "rank-0:5000",
+            "--set",
+            "quantization={ mode = \"quality\", modules = { mlp = \"bf16\" } }",
         ])
         .unwrap();
         for path in [
@@ -841,7 +898,13 @@ mod tests {
             "scheduler_config.chunked_prefill_size=512",
         ])
         .unwrap();
-        assert_eq!(engine.model.quantization["mode"], "performance");
+        assert_eq!(
+            engine.model.quantization,
+            proto::config::Quantization {
+                mode: Some(PrecisionMode::Performance),
+                modules: Default::default(),
+            }
+        );
         assert!(engine.moe.expert_parallel);
         assert_eq!(engine.moe.exchange, ExpertExchange::Dwdp);
         assert!(!engine.kv_cache.prefix_caching);

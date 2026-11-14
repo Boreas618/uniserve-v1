@@ -9,7 +9,8 @@
 //!
 //! A packed ModelOpt export states its calibration in a manifest at its root; it is read here
 //! into the quantization each stage's configuration declares ([`modelopt`]), which the stage's
-//! loader is given before any of its weights is read.
+//! loader is given before any of its weights is read. The deployment's precision policy is
+//! checked against those declarations when the family opens the checkpoint ([`precision`]).
 //!
 //! The request-level values the family's request rules are parameterized by (the frame rule,
 //! the resolution rule, the durations and the audio clock) are request processing's
@@ -19,6 +20,7 @@
 mod audio_vae;
 mod denoiser;
 mod modelopt;
+pub(crate) mod precision;
 mod text;
 mod video_vae;
 

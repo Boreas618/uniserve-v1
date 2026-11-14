@@ -28,6 +28,7 @@ use nn::{
     Checkpoint, ConditionRole, ConditionShape, Conditioning, DType, Split, VideoRequest,
     WeightLoader,
 };
+use proto::config::{PrecisionMode, Quantization};
 use support::{Recording, meta, recorded, report};
 
 /// The released base checkpoint: dense attention, the 50-point uniform grid, both networks.
@@ -55,8 +56,18 @@ fn serving() -> VideoServing {
 }
 
 /// The pipeline of the checkpoint at `root` as a group that places `network` at `sequence`'s
-/// rank holds it, loaded from the shard headers.
+/// rank holds it, loaded from the shard headers, in the checkpoint's own representation.
 fn load(root: &str, network: Stage, sequence: SequenceSplit) -> nn::Result<Arc<dyn VideoModel>> {
+    load_under(root, network, sequence, &Quantization::default())
+}
+
+/// [`load`] under the deployment's precision policy `quantization`.
+fn load_under(
+    root: &str,
+    network: Stage,
+    sequence: SequenceSplit,
+    quantization: &Quantization,
+) -> nn::Result<Arc<dyn VideoModel>> {
     assert!(
         Path::new(root).is_dir(),
         "the profile runs read the headers of {root}, which is missing"
@@ -65,7 +76,7 @@ fn load(root: &str, network: Stage, sequence: SequenceSplit) -> nn::Result<Arc<d
     let Model::Video(family) = models::minimax_h3::FAMILY.model else {
         panic!("MiniMax-H3 is a video family");
     };
-    let opened = family.open(&checkpoint)?;
+    let opened = family.open(&checkpoint, quantization)?;
 
     let stages: BTreeSet<String> = [network.name().to_owned()].into();
     let placement = VideoPlacement {
@@ -299,4 +310,89 @@ fn the_nvfp4_export_profiles_a_small_and_a_large_layout() {
 
     let encoder = load(FAST_4_STEP_NVFP4, Stage::TextEncoder, SequenceSplit::WHOLE).unwrap();
     assert!(encoder.text_encoder().is_some());
+}
+
+/// The operators a step of the smallest layout the deployment captures launches.
+fn small_step_operators(model: &dyn VideoModel) -> BTreeSet<&'static str> {
+    let requests = candidates(model);
+    let (small, _) = requests.first().unwrap();
+    let (launches, _) = step(model, SequenceSplit::WHOLE, small);
+
+    launches.into_iter().map(|(operator, _)| operator).collect()
+}
+
+/// The precision policy, read against the released headers. The dense student serves
+/// `quality`, stated or not: its projections are dense products and no step encodes an
+/// activation. Every other mode narrows a module this build serves a dense checkpoint's only in
+/// its own representation, so it is refused when the family opens the checkpoint, naming the
+/// module. The NVFP4 export serves its packed feed-forward products without a policy, and
+/// refuses one.
+#[test]
+#[ignore = "requires the four-step FastH3 student and its NVFP4 export"]
+fn the_precision_policy_reads_against_the_released_headers() {
+    let mode = |mode| Quantization {
+        mode: Some(mode),
+        modules: Default::default(),
+    };
+
+    for policy in [Quantization::default(), mode(PrecisionMode::Quality)] {
+        let model = load_under(
+            FAST_4_STEP,
+            Stage::Transformer,
+            SequenceSplit::WHOLE,
+            &policy,
+        )
+        .unwrap_or_else(|error| panic!("{policy}: {error}"));
+        let operators = small_step_operators(model.as_ref());
+        assert!(operators.contains("gemm"), "{policy}: {operators:?}");
+        for encoded in ["nvfp4_quantize", "nvfp4_gemm", "fp8_gemm"] {
+            assert!(!operators.contains(encoded), "{policy}: {operators:?}");
+        }
+    }
+
+    for (narrowing, named) in [
+        (PrecisionMode::Balanced, "`video_vae` in nvfp4"),
+        (PrecisionMode::Performance, "`mlp` in fp8"),
+        (PrecisionMode::Maximum, "`text_encoder` in fp8"),
+    ] {
+        let policy = mode(narrowing);
+        let error = load_under(
+            FAST_4_STEP,
+            Stage::Transformer,
+            SequenceSplit::WHOLE,
+            &policy,
+        )
+        .err()
+        .unwrap_or_else(|| panic!("{policy} was served"));
+        assert!(error.to_string().contains(named), "{policy}: {error}");
+    }
+
+    let packed = load_under(
+        FAST_4_STEP_NVFP4,
+        Stage::Transformer,
+        SequenceSplit::WHOLE,
+        &Quantization::default(),
+    )
+    .unwrap();
+    let operators = small_step_operators(packed.as_ref());
+    assert!(
+        operators.contains("nvfp4_quantize") && operators.contains("nvfp4_gemm"),
+        "{operators:?}"
+    );
+
+    let policy = mode(PrecisionMode::Quality);
+    let error = load_under(
+        FAST_4_STEP_NVFP4,
+        Stage::Transformer,
+        SequenceSplit::WHOLE,
+        &policy,
+    )
+    .err()
+    .unwrap_or_else(|| panic!("the NVFP4 export took {policy}"));
+    assert!(
+        error
+            .to_string()
+            .contains("checkpoint format 'modelopt_nvfp4' owns its numerical configuration"),
+        "{error}"
+    );
 }

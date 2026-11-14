@@ -361,6 +361,50 @@ fn qwen3_moe_profiles_tensor_and_expert_parallel_ranks() {
     }
 }
 
+/// The Qwen3 family states no precision mode and no module selection: the BF16 checkpoint and
+/// its NVFP4 export each open in their own representation under an empty policy, and a stated
+/// policy is refused by name for either, even one that names their own representation.
+#[test]
+#[ignore = "requires /workspace/models/Qwen3-30B-A3B and Qwen3-30B-A3B-NVFP4"]
+fn qwen3_moe_takes_no_precision_policy() {
+    use nn::family::Model;
+    use proto::config::{PrecisionMode, Quantization, WeightFormat};
+
+    let Model::Text(family) = models::qwen3::family::FAMILY.model else {
+        panic!("Qwen3-MoE is a text family");
+    };
+    let stated = [
+        Quantization {
+            mode: Some(PrecisionMode::Quality),
+            modules: Default::default(),
+        },
+        Quantization {
+            mode: None,
+            modules: [("mlp".to_owned(), WeightFormat::Bf16)].into(),
+        },
+    ];
+
+    for name in ["Qwen3-30B-A3B", "Qwen3-30B-A3B-NVFP4"] {
+        let checkpoint = support::checkpoint(&Path::new(MODELS).join(name));
+        assert!(
+            family.open(&checkpoint, &Quantization::default()).is_ok(),
+            "{name}"
+        );
+        for policy in &stated {
+            let error = family
+                .open(&checkpoint, policy)
+                .err()
+                .unwrap_or_else(|| panic!("{name} took {policy}"));
+            assert!(
+                error
+                    .to_string()
+                    .contains("the qwen3 family states no precision mode"),
+                "{name}: {error}"
+            );
+        }
+    }
+}
+
 /// Qwen3-30B-A3B in calibrated NVFP4: packed projections and packed experts, activations
 /// encoded before each packed product.
 #[test]

@@ -58,11 +58,22 @@
 //! activation scale is the manifest's. A declaration holds both facts, and every module that
 //! reads packed fields reads them by the declaration its loader was given
 //! ([`Declaration::names`], [`Declaration::activation_scale`]).
+//!
+//! ## The deployment's policy
+//!
+//! A deployment states its precision as a policy (`quantization`: a mode and selections by
+//! module), which each family interprets against what its checkpoint declares when it opens
+//! it ([`crate::family`]). A family that states no mode and no selection serves the checkpoint's
+//! own representation and refuses any other policy ([`own_representation`]). No load in this
+//! library converts a dense weight into FP8 or NVFP4: both products read a calibrated
+//! activation scale ([`ops::fp8`], [`ops::fp4`]) that only a quantized export states, so a policy
+//! that narrows a dense checkpoint's module is refused by the family that interprets it.
 
 use std::collections::{BTreeMap, BTreeSet};
 
 use float8::F8E4M3;
 use half::bf16;
+use proto::config::Quantization;
 use serde_json::Value;
 
 use crate::checkpoint::Checkpoint;
@@ -345,6 +356,30 @@ impl Declaration {
             )
         })
     }
+}
+
+/// Refuses a precision policy for `family`, a family that states no precision mode and no
+/// module selection, naming the family and the policy.
+///
+/// Such a family serves every checkpoint in the representation the checkpoint states: its own
+/// element type, or the quantization its export declares ([`Declaration::read`]). An empty
+/// policy selects exactly that and is accepted; any other would be ignored by the load, so it is
+/// refused instead.
+///
+/// # Errors
+///
+/// [`Error::Unsupported`] when `policy` states a mode or a module selection.
+pub fn own_representation(family: &str, policy: &Quantization) -> Result<()> {
+    if policy.is_empty() {
+        return Ok(());
+    }
+
+    Err(Error::Unsupported(format!(
+        "`quantization = {policy}`: the {family} family states no precision mode and no module \
+         selection; it serves each checkpoint in the checkpoint's own representation (an NVFP4 \
+         or FP8 export as its quantization declaration states), so leave `quantization` empty \
+         and serve the export of the precision wanted"
+    )))
 }
 
 /// The E2M1 values of the eight unsigned codes, the sign in the code's fourth bit.

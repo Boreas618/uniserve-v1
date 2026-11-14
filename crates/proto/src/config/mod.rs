@@ -870,8 +870,9 @@ pub struct ModelConfig {
     pub max_model_len: u32,
     /// Element type of parameters and activations.
     pub dtype: crate::request::ModelDtype,
-    /// The checkpoint's quantization (`quantization`, SGLang's precision policy).
-    pub quantization: serde_json::Map<String, Value>,
+    /// The precision policy (`quantization`), which the model family interprets when it reads
+    /// the checkpoint; empty serves the checkpoint's own representation.
+    pub quantization: Quantization,
     /// The model's generation requirements, which the engine intersects with its workers'
     /// capacities. The rest of the fields below are read from the checkpoint as well: they keep
     /// their defaults until the leader, and then the engine process, read it.
@@ -889,6 +890,125 @@ impl ModelConfig {
             && self.bos == other.bos
             && self.eos == other.eos
             && self.max_model_len == other.max_model_len
+    }
+}
+
+/// The precision policy (`quantization`): a mode, and representations selected by module that
+/// override what the mode gives those modules.
+///
+/// Empty selects the checkpoint's own representation. The model family interprets the policy
+/// where it reads the checkpoint: it names the modules a selection may state, gives each mode's
+/// representation of them, and refuses a policy it does not serve, naming the module, so no
+/// statement of the policy is ignored. A checkpoint that declares its own quantization takes
+/// none.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct Quantization {
+    /// The mode every module takes that `modules` does not select.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mode: Option<PrecisionMode>,
+    /// Representations selected by module, under the names the model family gives its modules
+    /// (MiniMax-H3: `attention`, `mlp`, `text_encoder`, `video_vae`).
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub modules: BTreeMap<String, WeightFormat>,
+}
+
+impl Quantization {
+    /// Whether the policy states nothing, so the checkpoint's own representation is served.
+    pub fn is_empty(&self) -> bool {
+        self.mode.is_none() && self.modules.is_empty()
+    }
+}
+
+impl fmt::Display for Quantization {
+    /// The policy as the TOML inline table `--set quantization=…` states it, such as
+    /// `{ mode = "performance", modules = { video_vae = "bf16" } }`.
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let mut fields = Vec::new();
+        if let Some(mode) = self.mode {
+            fields.push(format!("mode = \"{mode}\""));
+        }
+        if !self.modules.is_empty() {
+            let modules = self
+                .modules
+                .iter()
+                .map(|(module, format)| format!("{module} = \"{format}\""))
+                .collect::<Vec<_>>()
+                .join(", ");
+            fields.push(format!("modules = {{ {modules} }}"));
+        }
+
+        if fields.is_empty() {
+            formatter.write_str("{}")
+        } else {
+            write!(formatter, "{{ {} }}", fields.join(", "))
+        }
+    }
+}
+
+/// A precision mode: what a model family gives each of its modules, from the representation the
+/// reference computes in (`quality`) to the narrowest it serves (`maximum`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum PrecisionMode {
+    /// The representation the reference computes in; the default of a dense checkpoint.
+    Quality,
+    /// The modules whose narrowing changes the output least narrowed.
+    Balanced,
+    /// More modules narrowed than `balanced`.
+    Performance,
+    /// The narrowest representation the family states for each module.
+    Maximum,
+}
+
+impl PrecisionMode {
+    /// The mode as the configuration names it.
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Quality => "quality",
+            Self::Balanced => "balanced",
+            Self::Performance => "performance",
+            Self::Maximum => "maximum",
+        }
+    }
+}
+
+impl fmt::Display for PrecisionMode {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.name())
+    }
+}
+
+/// The representation a precision policy gives a module's weights, and with them its products.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum WeightFormat {
+    /// BF16 weights, BF16 products.
+    Bf16,
+    /// FP16 weights, FP16 products.
+    Fp16,
+    /// E4M3 weights, with activations encoded to E4M3 for the product.
+    Fp8,
+    /// NVFP4 weights (E2M1 values, E4M3 scales per sixteen elements, one tensor scale), with
+    /// activations encoded to NVFP4 for the product.
+    Nvfp4,
+}
+
+impl WeightFormat {
+    /// The representation as the configuration names it.
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Bf16 => "bf16",
+            Self::Fp16 => "fp16",
+            Self::Fp8 => "fp8",
+            Self::Nvfp4 => "nvfp4",
+        }
+    }
+}
+
+impl fmt::Display for WeightFormat {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.name())
     }
 }
 
