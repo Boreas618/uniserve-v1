@@ -8,40 +8,70 @@ visible content.
 
 from __future__ import annotations
 
-from collections.abc import Sequence
 from typing import Any
+
+
+class StreamOutcome:
+    """Classifies a streamed response from its events, observed as they arrive.
+
+    The streaming chat transport folds each event into its record as it
+    completes and keeps no event, so the facts the classification needs are
+    gathered here one event at a time: how many events arrived, whether any
+    was not a JSON object or was a ``parse_error`` marker, whether any
+    carried an error object, whether the stream terminated, and whether any
+    carried output.
+    """
+
+    def __init__(self) -> None:
+        """Start with no event observed."""
+        self.events = 0
+        self.invalid = False
+        self.error = False
+        self.terminal = False
+        self.output = False
+
+    def observe(self, event: Any) -> None:
+        """Take one decoded event into account."""
+        self.events += 1
+        if not isinstance(event, dict) or event.get("type") == "parse_error":
+            self.invalid = True
+            return
+        if isinstance(event.get("error"), dict):
+            self.error = True
+        # The `sse_done` event type is synthesized by `SseParser` for the
+        # `[DONE]` sentinel, and `parse_error` for malformed JSON under the
+        # `record` parse-error policy that `_send_chat_stream` passes;
+        # neither is a server event. A stream terminates with either
+        # `[DONE]` or any choice carrying a `finish_reason`.
+        if not self.terminal:
+            self.terminal = event.get(
+                "type"
+            ) == "sse_done" or OpenAIChat._has_finish_reason(event)
+        if not self.output:
+            self.output = bool(
+                OpenAIChat.delta_text(event) or OpenAIChat.delta_images(event)
+            )
+
+    def classify(self) -> tuple[bool, str]:
+        """Classify the stream by structure, terminal state, and output.
+
+        Checks run in precedence order and the first failure wins.
+        """
+        if self.events == 0:
+            return False, "response_empty_response"
+        if self.invalid:
+            return False, "response_invalid_event"
+        if self.error:
+            return False, "model_error"
+        if not self.terminal:
+            return False, "response_missing_terminal"
+        if not self.output:
+            return False, "response_empty_output"
+        return True, "ok"
 
 
 class OpenAIChat:
     """Normalizes OpenAI-compatible chat messages and streamed events."""
-
-    @staticmethod
-    def classify_events(events: Sequence[Any]) -> tuple[bool, str]:
-        """Classify a streamed response by structure, terminal state, and output."""  # noqa: E501
-        # Checks run in precedence order and the first failure wins. The
-        # `sse_done` event type is synthesized by `SseParser` for the `[DONE]`
-        # sentinel, and `parse_error` for malformed JSON under the `record`
-        # parse-error policy that `_send_chat_stream` passes; neither is a
-        # server event. A stream terminates with either `[DONE]` or any
-        # choice carrying a `finish_reason`.
-        if not events:
-            return False, "response_empty_response"
-        if any(not isinstance(event, dict) for event in events):
-            return False, "response_invalid_event"
-        if any(event.get("type") == "parse_error" for event in events):
-            return False, "response_invalid_event"
-        if any(isinstance(event.get("error"), dict) for event in events):
-            return False, "model_error"
-        if not any(
-            event.get("type") == "sse_done" for event in events
-        ) and not any(OpenAIChat._has_finish_reason(event) for event in events):
-            return False, "response_missing_terminal"
-        if not any(
-            OpenAIChat.delta_text(event) or OpenAIChat.delta_images(event)
-            for event in events
-        ):
-            return False, "response_empty_output"
-        return True, "ok"
 
     @staticmethod
     def message_text(message: dict[str, Any] | None) -> str:

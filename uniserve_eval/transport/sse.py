@@ -10,15 +10,15 @@ With ``stamp_time`` enabled, decoded dict events carry a ``_client_t`` key
 holding the ``time.perf_counter()`` reading at which the event completed. The
 streaming chat transport in ``uniserve_eval.transport.client`` derives TTFT,
 inter-token latency, image arrival latency, and request close time from these
-stamps, and ``OpenAIChat.classify_events`` interprets the ``sse_done`` and
-``parse_error`` marker events produced here.
+stamps, and ``StreamOutcome`` in ``uniserve_eval.transport.openai``
+interprets the ``sse_done`` and ``parse_error`` marker events produced here.
 """
 
 from __future__ import annotations
 
 import json
 import time
-from collections.abc import AsyncIterable, Iterable, Iterator
+from collections.abc import AsyncIterable, AsyncIterator, Iterable, Iterator
 from json import JSONDecodeError
 from typing import Any, Literal
 
@@ -162,20 +162,18 @@ async def aiter_sse_events(
     *,
     stamp_time: bool = False,
     on_parse_error: ParseErrorPolicy = "raise",
-) -> list[Any]:
-    """Collect decoded events from an asynchronous line iterable.
+) -> AsyncIterator[Any]:
+    """Yield decoded events from an asynchronous line iterable as they complete.
 
-    Events are returned as a list, but each ``_client_t`` stamp is taken as
-    its line is read from ``lines``, not when the list is returned. Flush
-    and parse-error behavior match ``iter_sse_events``.
+    Each ``_client_t`` stamp is taken as its event's dispatching line is
+    read from ``lines``. Flush and parse-error behavior match
+    ``iter_sse_events``.
     """
     parser = SseParser(stamp_time=stamp_time, on_parse_error=on_parse_error)
-    events: list[Any] = []
     async for line in lines:
         event = parser.feed(line)
         if event is not None:
-            events.append(event)
+            yield event
     event = parser.finish()
     if event is not None:
-        events.append(event)
-    return events
+        yield event

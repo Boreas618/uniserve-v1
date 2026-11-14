@@ -7,11 +7,12 @@ import json
 import math
 import re
 import time
+from collections.abc import Sequence
 from dataclasses import asdict, dataclass, field
 from enum import StrEnum
 from pathlib import Path
 from signal import Signals
-from typing import Any, Literal, TypeGuard
+from typing import Any, Literal, TypeGuard, TypeVar
 
 # Endpoint paths. `send_request` in `uniserve_eval.transport.client` sends a
 # request carrying video settings to one of the video endpoints, selects the
@@ -802,6 +803,17 @@ class RequestRecord:
     ``text_times`` holds the absolute arrival time of every stamped
     text-bearing event, including one that follows an image, so it keeps
     the timeline that ``itl`` omits across images.
+
+    The per-token sequences (``itl``, ``text_times``, ``chunk_times``,
+    ``token_ids``, ``token_times``, ``top_logprobs``) are lists while the
+    stream is read and tuples once the record closes (``close_now``,
+    ``close_at``): the stream adds nothing after its record closed. A load
+    keeps every record until it ends, hundreds of thousands of tokens of
+    five candidates each. A tuple of atoms (numbers, strings, ``None``, or
+    such tuples) is one that CPython's cyclic collector stops tracking at
+    its first pass, so no full collection visits a closed record's values;
+    in lists, every full collection would visit each of them, pausing the
+    event loop that stamps every stream's arrival times for up to seconds.
     """
 
     request_id: str
@@ -821,17 +833,20 @@ class RequestRecord:
     final_event_time: float | None = None
     latency: float = 0.0
     ttft: float = 0.0
-    itl: list[float] = field(default_factory=list)
-    text_times: list[float] = field(default_factory=list)
+    itl: Sequence[float] = field(default_factory=list)
+    text_times: Sequence[float] = field(default_factory=list)
     # The arrival time of every chunk of a stream, whether it carries a
-    # token or not.
-    chunk_times: list[float] = field(default_factory=list)
+    # token or not (`add_chunk`).
+    chunk_times: Sequence[float] = field(default_factory=list)
     # Per generated token in stream order (`add_tokens`): its id, the
     # arrival time of the chunk that carried it, and its logprob entry's
-    # candidates as `[id, logprob]` pairs.
-    token_ids: list[int | str] = field(default_factory=list)
-    token_times: list[float | None] = field(default_factory=list)
-    top_logprobs: list[list[list[Any]]] = field(default_factory=list)
+    # candidates as a tuple of `(id, logprob)` pairs, which `record_dict`
+    # writes as `[id, logprob]` arrays.
+    token_ids: Sequence[int | str] = field(default_factory=list)
+    token_times: Sequence[float | None] = field(default_factory=list)
+    top_logprobs: Sequence[tuple[tuple[Any, Any], ...]] = field(
+        default_factory=list
+    )
     token_timing_available: bool = False
     prompt_len: int = 0
     output_len: int = 0
@@ -887,15 +902,32 @@ class RequestRecord:
         self.status_code = status_code
 
     def close_now(self) -> None:
-        """Close the request at the current monotonic time."""
+        """Close the request at the current monotonic time.
+
+        Its per-token sequences become tuples and take no more values.
+        """
         now = time.perf_counter()
         self.latency = now - self.start_time
         self.final_event_time = now
+        self._freeze()
 
     def close_at(self, timestamp: float) -> None:
-        """Close the request at a supplied monotonic event timestamp."""
+        """Close the request at a supplied monotonic event timestamp.
+
+        Its per-token sequences become tuples and take no more values.
+        """
         self.final_event_time = timestamp
         self.latency = timestamp - self.start_time
+        self._freeze()
+
+    def _freeze(self) -> None:
+        """Keep the per-token sequences as tuples (see the class's notes)."""
+        self.itl = tuple(self.itl)
+        self.text_times = tuple(self.text_times)
+        self.chunk_times = tuple(self.chunk_times)
+        self.token_ids = tuple(self.token_ids)
+        self.token_times = tuple(self.token_times)
+        self.top_logprobs = tuple(self.top_logprobs)
 
     def mark_failure(self, classifier: str, error: str | None = None) -> None:
         """Mark the request unsuccessful with a stable classifier.
@@ -999,17 +1031,24 @@ class RequestRecord:
                 inter-token interval. The streaming chat transport passes
                 false after an image event so image generation time does not
                 enter ``itl``; the event still enters ``text_times``.
+
+        Raises:
+            RuntimeError: When the record closed already.
         """
         self.token_timing_available = True
         self.generated_text += content
         if timestamp is None:
             return
-        self.text_times.append(timestamp)
+        _growing(self.text_times).append(timestamp)
         if last_text_time is None:
             self.ttft = timestamp - self.start_time
             self.first_text_time = timestamp
         elif count_itl:
-            self.itl.append(timestamp - last_text_time)
+            _growing(self.itl).append(timestamp - last_text_time)
+
+    def add_chunk(self, timestamp: float) -> None:
+        """Append the arrival time of one stream chunk to ``chunk_times``."""
+        _growing(self.chunk_times).append(timestamp)
 
     def add_tokens(
         self, choice: dict[str, Any], timestamp: float | None
@@ -1022,6 +1061,10 @@ class RequestRecord:
         The ids come from ``token_ids``, else from the logprob entries; a
         token's candidates are its entry's ``top_logprobs``, in the form
         ``_token_identity`` gives, and a token without an entry has none.
+        Candidates are kept as tuples (``top_logprobs``).
+
+        Raises:
+            RuntimeError: When the record closed already.
         """
         logprobs = choice.get("logprobs")
         content = logprobs.get("content") if isinstance(logprobs, dict) else []
@@ -1034,19 +1077,22 @@ class RequestRecord:
         if not isinstance(ids, list):
             ids = [_token_identity(entry.get("token")) for entry in entries]
 
+        token_ids = _growing(self.token_ids)
+        token_times = _growing(self.token_times)
+        top_logprobs = _growing(self.top_logprobs)
         for index, token in enumerate(ids):
             entry = entries[index] if index < len(entries) else {}
             candidates = entry.get("top_logprobs")
-            self.token_ids.append(token)
-            self.token_times.append(timestamp)
-            self.top_logprobs.append(
-                [
-                    [_token_identity(item.get("token")), item.get("logprob")]
+            token_ids.append(token)
+            token_times.append(timestamp)
+            top_logprobs.append(
+                tuple(
+                    (_token_identity(item.get("token")), item.get("logprob"))
                     for item in candidates
                     if isinstance(item, dict)
-                ]
+                )
                 if isinstance(candidates, list)
-                else []
+                else ()
             )
 
     def add_image_arrival(self, count: int, timestamp: float | None) -> None:
@@ -1315,6 +1361,21 @@ class RunResult:
 
     summary: dict[str, Any]
     output_dir: Path
+
+
+_T = TypeVar("_T")
+
+
+def _growing(values: Sequence[_T]) -> list[_T]:
+    """The list one of a record's per-token sequences grows in while open.
+
+    Raises:
+        RuntimeError: When the record closed, which made the sequence a
+            tuple that takes no more values.
+    """
+    if not isinstance(values, list):
+        raise RuntimeError("a closed record takes no more stream values")
+    return values
 
 
 def _token_identity(token: Any) -> int | str:

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import gc
 import json
 
 import aiohttp
@@ -211,3 +212,55 @@ def test_stream_rejects_non_object_events() -> None:
     assert record.success is False
     assert record.classifier == "response_invalid_event"
     assert record.token_timing_available is False
+
+
+def test_a_closed_stream_record_keeps_its_tokens_out_of_the_collector() -> None:
+    # Two token events with their top candidates, as UniServe streams them
+    # under `logprobs`, `top_logprobs` and `return_token_ids`. A load keeps
+    # every record to its end, so a full collection that visited each
+    # token's values would pause the loop that stamps every stream.
+    def event(token: int) -> str:
+        top = [
+            {"token": f"token_id:{token + rank}", "logprob": -float(rank)}
+            for rank in range(5)
+        ]
+        choice = {
+            "delta": {"content": f"t{token}"},
+            "token_ids": [token],
+            "logprobs": {"content": [{**top[0], "top_logprobs": top}]},
+        }
+        return "data: " + json.dumps({"choices": [choice]}) + "\n\n"
+
+    body = (
+        event(10)
+        + event(20)
+        + 'data: {"choices":[{"delta":{},"finish_reason":"length"}]}\n\n'
+        + "data: [DONE]\n\n"
+    )
+    record = _send(
+        _event_stream(body),
+        TaskRequest(CHAT_COMPLETIONS, {"model": "m"}, stream=True),
+        task="text",
+    )
+    # The collector stops tracking a tuple at a pass that finds each of its
+    # items untracked, so each pass may reach one more level of nesting: a
+    # candidate pair, a token's candidates, the record's sequence of them.
+    for _ in range(3):
+        gc.collect()
+
+    # The record as the run writes it to `requests.jsonl`.
+    written = json.loads(json.dumps(record.record_dict()))
+    assert record.success is True
+    assert written["token_ids"] == [10, 20]
+    assert written["top_logprobs"][1] == [
+        [20 + rank, -float(rank)] for rank in range(5)
+    ]
+    for values in (
+        record.itl,
+        record.text_times,
+        record.chunk_times,
+        record.token_ids,
+        record.token_times,
+        record.top_logprobs,
+    ):
+        assert not gc.is_tracked(values)

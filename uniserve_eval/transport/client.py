@@ -31,7 +31,7 @@ from ..types import (
 from .http import post_json, response_lines
 from .images import ImageOutputError, decode_openai_image_parts
 from .native_video import receive_video
-from .openai import OpenAIChat
+from .openai import OpenAIChat, StreamOutcome
 from .sse import aiter_sse_events
 
 
@@ -220,9 +220,13 @@ async def _send_chat_stream(
 ) -> None:
     """Execute an SSE chat request and record event-level output timing.
 
-    The whole stream is collected before any event is interpreted, so
-    latency, TTFT, ITL, and image latencies derive from per-event receipt
-    stamps rather than from when this function processes them.
+    Latency, TTFT, ITL, and image latencies derive from per-event receipt
+    stamps, taken as each event's line is read. Each event is folded into
+    the record as it completes and is not kept: a load holds dozens of
+    streams of hundreds of events, and holding their decoded events until
+    each stream ends would make them outlive young collections, so that
+    CPython's full collections, which pause the event loop that stamps
+    every stream, would come more often and take longer.
     """
     async with session.post(url, json=payload) as response:
         # Reject transport or framing mismatches before interpreting event data.
@@ -246,71 +250,83 @@ async def _send_chat_stream(
                 "stream request received a JSON response",
             )
             return
+        # Fallback token counts are written first; `apply_usage` overwrites
+        # them and their provenance when the stream reports usage. Token
+        # timing becomes available only once `add_text` observes a text delta.
+        record.prompt_len = prompt_len
+        record.output_len = output_len_fallback
+        record.token_timing_available = False
+
         # Malformed event JSON becomes a `parse_error` event, which
-        # `OpenAIChat.classify_events` rejects, instead of raising into the
-        # generic transport failure. The body is read until the server closes
-        # it; latency closes at the last event stamp.
-        events = await aiter_sse_events(
+        # `StreamOutcome` rejects, instead of raising into the generic
+        # transport failure. The body is read until the server closes it;
+        # latency closes at the last event stamp. A stream whose transport
+        # fails keeps what it folded before the failure.
+        outcome = StreamOutcome()
+        last_event_time: float | None = None
+        last_text_time: float | None = None
+        image_since_last_text = False
+        image_parts: list[dict[str, Any]] = []
+        async for event in aiter_sse_events(
             response_lines(response.content),
             stamp_time=True,
             on_parse_error="record",
-        )
+        ):
+            outcome.observe(event)
+            # An event that is not a JSON object fails the stream and holds
+            # nothing to fold.
+            if not isinstance(event, dict):
+                continue
 
-    # Classify the complete stream before folding its content and timing
-    # fields. A failed stream still folds its partial output below unless it
-    # contains non-object events.
-    record.close_at(_last_event_time(events))
-    ok, classifier = OpenAIChat.classify_events(events)
+            # Fold deltas in arrival order. A text gap that spans an image
+            # event is excluded from ITL, and each image part records the
+            # latency of the event that delivered it. Tokens keep the arrival
+            # of their chunk.
+            timestamp = event.get("_client_t")
+            timestamp_f = float(timestamp) if timestamp is not None else None
+            if timestamp_f is not None:
+                last_event_time = (
+                    timestamp_f
+                    if last_event_time is None
+                    else max(last_event_time, timestamp_f)
+                )
+                if event.get("type") != "sse_done":
+                    record.add_chunk(timestamp_f)
+            choices = event.get("choices")
+            if isinstance(choices, list):
+                for choice in choices:
+                    if isinstance(choice, dict):
+                        record.apply_choice_metadata(choice)
+                        record.add_tokens(choice, timestamp_f)
+            usage = event.get("usage")
+            if isinstance(usage, dict):
+                record.apply_usage(usage)
+            record.apply_cached_prompt_tokens(event)
+            content = OpenAIChat.delta_text(event)
+            images = OpenAIChat.delta_images(event)
+            if content:
+                record.add_text(
+                    content,
+                    timestamp_f,
+                    last_text_time=last_text_time,
+                    count_itl=not image_since_last_text,
+                )
+                if timestamp_f is not None:
+                    last_text_time = timestamp_f
+                    image_since_last_text = False
+            if images:
+                image_parts.extend(images)
+                image_since_last_text = True
+                record.add_image_arrival(len(images), timestamp_f)
+
+    record.close_at(
+        last_event_time if last_event_time is not None else time.perf_counter()
+    )
+    ok, classifier = outcome.classify()
     if ok:
         record.mark_success()
     else:
         record.mark_failure(classifier)
-    # Fallback token counts are written first; `apply_usage` overwrites them
-    # and their provenance when the stream reports usage. Token timing becomes
-    # available only once `add_text` observes a text delta.
-    record.prompt_len = prompt_len
-    record.output_len = output_len_fallback
-    record.token_timing_available = False
-    if any(not isinstance(event, dict) for event in events):
-        return
-
-    # Fold deltas in arrival order. A text gap that spans an image event is
-    # excluded from ITL, and each image part records the latency of the
-    # event that delivered it. Tokens keep the arrival of their chunk.
-    last_text_time: float | None = None
-    image_since_last_text = False
-    image_parts: list[dict[str, Any]] = []
-    for event in events:
-        timestamp = event.get("_client_t")
-        timestamp_f = float(timestamp) if timestamp is not None else None
-        if timestamp_f is not None and event.get("type") != "sse_done":
-            record.chunk_times.append(timestamp_f)
-        choices = event.get("choices")
-        if isinstance(choices, list):
-            for choice in choices:
-                if isinstance(choice, dict):
-                    record.apply_choice_metadata(choice)
-                    record.add_tokens(choice, timestamp_f)
-        usage = event.get("usage")
-        if isinstance(usage, dict):
-            record.apply_usage(usage)
-        record.apply_cached_prompt_tokens(event)
-        content = OpenAIChat.delta_text(event)
-        images = OpenAIChat.delta_images(event)
-        if content:
-            record.add_text(
-                content,
-                timestamp_f,
-                last_text_time=last_text_time,
-                count_itl=not image_since_last_text,
-            )
-            if timestamp_f is not None:
-                last_text_time = timestamp_f
-                image_since_last_text = False
-        if images:
-            image_parts.extend(images)
-            image_since_last_text = True
-            record.add_image_arrival(len(images), timestamp_f)
 
     # Images decode after timing is folded; a decode failure replaces the
     # stream's classification.
@@ -356,13 +372,3 @@ def _is_json_content_type(content_type: str) -> bool:
     """Report whether a response media type denotes JSON."""
     media_type = content_type.partition(";")[0].strip().lower()
     return media_type == "application/json" or media_type.endswith("+json")
-
-
-def _last_event_time(events: list[Any]) -> float:
-    """Return the latest stamped event time or the current monotonic time."""
-    times = [
-        float(event["_client_t"])
-        for event in events
-        if isinstance(event, dict) and event.get("_client_t") is not None
-    ]
-    return max(times) if times else time.perf_counter()
