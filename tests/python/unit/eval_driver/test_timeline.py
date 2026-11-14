@@ -66,6 +66,21 @@ storage = subprocess.Popen(
 )
 with open("storage-server.pid", "w") as handle:
     handle.write(str(storage.pid))
+# An engine, as the daemon starts one: the leader of a process group of its
+# own, which ends when the server does.
+engine = subprocess.Popen(
+    [
+        sys.executable, "-c",
+        "import os, time\n"
+        "parent = os.getppid()\n"
+        "while os.getppid() == parent:\n"
+        "    time.sleep(0.1)\n",
+        "uniserve-engine", "--launch", mark,
+    ],
+    process_group=0,
+)
+with open("engine.pid", "w") as handle:
+    handle.write(str(engine.pid))
 
 events, faults, switching = [], {}, False
 configuration, switched, seen = "A", False, set()
@@ -315,6 +330,16 @@ process = "stand-in {mark}"
 host = "standin-host"
 """
 
+# The engine, in a process group of its own, continued by a signal found by
+# its command line among the deployment's processes.
+_ENGINE = """
+[[benchmarks.{name}.changes]]
+name = "continue"
+at_s = 0.1
+signal = "SIGCONT"
+process = "uniserve-engine --launch {mark}"
+"""
+
 # Each point's fault and changes, in run order. The control applies no
 # change; `alone` serves each row once with nothing else running, the
 # reference of case E6; `control_b` is the control of configuration B.
@@ -333,6 +358,7 @@ _POINTS: dict[str, tuple[str | None, str]] = {
     "moved": (None, _MOVE),
     "cancel": ("slow", _UPDATE + _CANCEL),
     "remote": (None, _REMOTE),
+    "engine": (None, _ENGINE),
     "uncached": ("uncached", _UPDATE),
 }
 
@@ -690,6 +716,27 @@ def test_a_signal_reaches_a_process_on_another_host(runs: Path) -> None:
     assert resume["issued_s"] >= stop["ended_s"] + 0.05
     hosts = (runs / "ssh.log").read_text().split()
     assert hosts == ["standin-host", "standin-host"]
+
+
+def test_a_signal_reaches_a_process_a_server_started_in_its_own_group(
+    runs: Path,
+) -> None:
+    """A signal finds a server's descendant outside the server's group.
+
+    The daemon starts each engine as the leader of a process group of its
+    own; the deployment's processes include it, so a signal found by its
+    command line reaches it.
+    """
+    timeline = json.loads(
+        (runs / "results" / "engine" / "timeline.json").read_text()
+    )
+    changes = {change["name"]: change for change in timeline["changes"]}
+    engine = int((runs / "engine.pid").read_text())
+
+    resume = changes["continue"]
+    assert "error" not in resume
+    assert resume["pid"] == engine
+    assert f"uniserve-engine --launch {_MARK}" in resume["cmdline"]
 
 
 def test_check_change_compares_a_request_with_its_configurations_control(

@@ -318,14 +318,18 @@ class ManagedDeployment:
         """Return the processes of this deployment, in increasing order.
 
         They are the members of each server's process group, which its
-        workers inherit, and the host services serving inside its runtime
-        directory (`_service_pids`), which run in sessions of their own.
+        workers inherit; every descendant of a server's process, which
+        includes the processes a server starts in process groups of their
+        own (the daemon starts each engine as the leader of its own group);
+        and the host services serving inside its runtime directory
+        (`_service_pids`), which run in sessions of their own.
         """
-        groups = {
+        roots = {
             server.process.pid
             for server in self.servers
             if server.process is not None
         }
+        parents: dict[int, int] = {}
         pids = set()
         for entry in Path("/proc").iterdir():
             if not entry.name.isdigit():
@@ -335,8 +339,27 @@ class ManagedDeployment:
             except OSError:
                 continue
             # After the parenthesized command name: state, parent, group.
-            if int(stat.rpartition(")")[2].split()[2]) in groups:
-                pids.add(int(entry.name))
+            fields = stat.rpartition(")")[2].split()
+            pid, parent, group = int(entry.name), int(fields[1]), int(fields[2])
+            parents[pid] = parent
+            if group in roots:
+                pids.add(pid)
+
+        # A process belongs to the deployment when a server's process is
+        # among its ancestors; the walk stops at the first known answer.
+        known = dict.fromkeys(roots, True)
+        for pid in parents:
+            chain = []
+            current = pid
+            while current not in known and current in parents:
+                chain.append(current)
+                current = parents[current]
+            belongs = known.get(current, False)
+            for member in chain:
+                known[member] = belongs
+            if belongs:
+                pids.add(pid)
+
         if self.runtime is not None:
             pids.update(_service_pids(self.runtime / "uniserve"))
         return sorted(pids)
