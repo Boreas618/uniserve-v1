@@ -5,7 +5,9 @@
 //! The process subscribes to CUPTI as it starts ([`subscribe`]), before it loads a module or
 //! captures a graph, so that collectors observe their CUDA resources' lifetimes. The counters
 //! start once the process's ranks serve ([`Counters::start`]) and stay on: they share the
-//! subscription with the session collectors. A profiler that holds CUPTI's one subscription
+//! subscription with the session collectors. Their record of each graph launch as a whole is
+//! held from before the warm-up's captures ([`record_whole_graphs`]), so that the executables are
+//! instantiated in the mode they serve in. A profiler that holds CUPTI's one subscription
 //! (Nsight Systems) leaves the process without them.
 
 use std::collections::BTreeMap;
@@ -48,6 +50,32 @@ pub(crate) fn subscribe() {
     }
 }
 
+/// Has CUPTI record each graph launch as one record from here on, as the counters do for as long
+/// as the process serves ([`Counters::start`] with `whole_graphs`), before the process
+/// instantiates its first graph executable.
+///
+/// An executable replays in the tracing mode it was instantiated in, and a change of the mode
+/// declares every executable stale ([`super::graph_renewals`]): each worker instantiates all of
+/// its runners' executables again before its next batch. Changed only once the warm-up captured
+/// every bucket, the mode would have the deployment's first batch wait for that, tens of seconds
+/// on one GPU. So the rank start calls this before its workers start, since a worker takes at its
+/// start the renewal count its executables are current at, and before the warm-up captures.
+///
+/// Does nothing in a process CUPTI did not subscribe. A refusal of the record is logged; the
+/// counters' start then asks for it again, and a mode it changes renews the executables.
+pub(crate) fn record_whole_graphs() {
+    if !platform::cupti::subscriber::subscribed() {
+        return;
+    }
+
+    match platform::cupti::activity::hold_graph_trace(true) {
+        Ok(()) => super::trace_whole_graphs(),
+        Err(error) => {
+            tracing::warn!("graph launches are not recorded whole from the start: {error}");
+        }
+    }
+}
+
 /// The process's counters. The activity record drops before the watch.
 pub(crate) struct Counters {
     /// `None` when CUPTI refused the activity records.
@@ -58,7 +86,8 @@ pub(crate) struct Counters {
 impl Counters {
     /// Start the counters, recording the device time of `streams` by name (`device`, `copy`), a
     /// graph's launch as one record unless the deployment keeps PC sampling enabled, which refuses
-    /// that record; `None` when the process is not subscribed.
+    /// that record; `None` when the process is not subscribed. When [`record_whole_graphs`] held
+    /// that record already, no executable's tracing mode changes here.
     pub(crate) fn start(streams: &[(&'static str, Stream)], whole_graphs: bool) -> Option<Self> {
         if !platform::cupti::subscriber::subscribed() {
             return None;

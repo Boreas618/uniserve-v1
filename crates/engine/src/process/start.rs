@@ -614,15 +614,18 @@ pub(crate) fn start(
     let mut created = open_ranks(&mut ranks, &open, &opened, resolved)?;
     let kernels = served();
     bind(&mut ranks, &open, &opened, true)?;
-    let registers = |group: GroupId| head.completed_registers(group, &pairs);
-    let (route, workers) = spawn(&mut ranks, (&open, &opened), &registers, remotes.clone())?;
 
-    // Range markers and PC sampling attach to what a graph captures, so they precede the
-    // captures of the warm-up. A peer's ranks warm up at once with these: the captures of a
-    // group's ranks reach its collectives together.
+    // Range markers, PC sampling and the tracing mode of a graph's launch attach to what a graph
+    // captures and instantiates, so they precede the workers, which take the tracing mode's
+    // renewal count their executables are current at, and the captures of the warm-up.
     if !meta {
         instrument(launch, model_runner.devices())?;
     }
+    let registers = |group: GroupId| head.completed_registers(group, &pairs);
+    let (route, workers) = spawn(&mut ranks, (&open, &opened), &registers, remotes.clone())?;
+
+    // A peer's ranks warm up at once with these: the captures of a group's ranks reach its
+    // collectives together.
     warm_up(&workers)?;
 
     // What every peer's ranks hold, once they are warm: their segments are granted with these
@@ -842,6 +845,11 @@ fn start_peer(
 
     let created = open_ranks(&mut ranks, &open, &opened, resolve)?;
     let places = bind(&mut ranks, &open, &opened, false)?;
+
+    // What attaches to the graphs precedes the workers and the warm-up, as on the scheduler node.
+    if launch.engine_config.device.device != META_DEVICE {
+        instrument(launch, model_runner.devices())?;
+    }
     // A peer holds no queue pair: its ended sequences reach the scheduler node over its link.
     let (route, workers) = spawn(
         &mut ranks,
@@ -849,10 +857,6 @@ fn start_peer(
         &|_| Ok(Vec::new()),
         Vec::new(),
     )?;
-
-    if launch.engine_config.device.device != META_DEVICE {
-        instrument(launch, model_runner.devices())?;
-    }
     warm_up(&workers)?;
 
     // The slots its media groups keep beside their warm processes, which its answer states; the
@@ -1077,7 +1081,10 @@ fn weight_binding(
 /// Installs what the deployment's always-on profiling captures into every graph of `devices`:
 /// the range markers of the classes `profiling_config.fence_modules` names, and PC sampling
 /// when `graph_pc_sampling` keeps it on, which CUPTI attributes to a graph only when enabled
-/// before its capture.
+/// before its capture; otherwise the counters' record of each graph launch as a whole, in which
+/// the executables are then instantiated ([`crate::profiling::counters::record_whole_graphs`]).
+///
+/// Called before the ranks' workers start and capture the warm-up's graphs.
 ///
 /// # Errors
 ///
@@ -1100,6 +1107,8 @@ fn instrument(launch: &EngineArgs, devices: &[DeviceId]) -> Result<()> {
             crate::profiling::pc_sampling::enable(&context)
                 .context("enabling PC sampling for this rank's graphs")?;
         }
+    } else {
+        crate::profiling::counters::record_whole_graphs();
     }
     Ok(())
 }
