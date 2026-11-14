@@ -22,6 +22,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use engine::batch::Phase;
+use engine::batch::cache::CacheGroupKind;
 use engine::scheduler::{Message, policy};
 use proto::report::SchedulerStats;
 use proto::request::{Event, FinishReason, MigrationCause, RequestId};
@@ -600,8 +601,9 @@ fn after_requests_that_outgrew_the_cache_a_request_alone_fills_every_unit() {
 ///
 /// # Panics
 ///
-/// When a step forms no batch for two thousand steps in a row while requests remain (every
-/// batch the load needs forms within a few thousand steps), or a request ends otherwise.
+/// When the scheduler fails, when a step forms no batch for two thousand steps in a row while
+/// requests remain (every batch the load needs forms within a few thousand steps), or when a
+/// request ends otherwise.
 fn serve_to_their_length(
     harness: &mut Harness,
     count: u64,
@@ -623,6 +625,7 @@ fn serve_to_their_length(
                 ended[index] = serve(harness, id, request, &mut taken[index], &mut lives[index]);
             }
         }
+        assert_eq!(harness.failure(), None, "the scheduler failed");
         assert!(idle < 2_000, "no batch formed: {}", harness.summary());
     }
     assert!(
@@ -672,4 +675,28 @@ fn requests_resumed_with_their_blocks_cached_all_end_at_their_length() {
         .build();
     let request = |id: u64| crate::harness::sharing(id, 1000 + id % 48, 32, 128);
     serve_to_their_length(&mut harness, 96, request, 128);
+}
+
+/// Requests of a hybrid model, whose recurrent-state checkpoint takes many units where a page of
+/// attention takes one, all end at their length under memory pressure: 64 requests over 48
+/// prompts beside a device region of 256 pages and 32 checkpoints, a host region of 192 units and
+/// 32 slots. Admissions that share a prompt load its blocks from the host, and a `Load` whose
+/// leading keys another admission brought to the device meanwhile is answered `Loaded` with
+/// nothing copied and no entry given (BP §11): its positions are missing, like those of a short
+/// pin, so the request neither restores a checkpoint nor releases a block it does not hold
+/// (SD §3.5 `answered`, §4.4 "The hit").
+#[test]
+fn hybrid_requests_whose_checkpoints_take_many_units_all_end_at_their_length() {
+    let mut harness = Deployment::tokens()
+        .cache(&[
+            (CacheGroupKind::Full, BLOCK),
+            (CacheGroupKind::State, BLOCK),
+        ])
+        .block_units(&[1, 99])
+        .kv_units(256 + 32 * 99)
+        .host(192)
+        .slots(32)
+        .build();
+    let request = |id: u64| crate::harness::sharing(id, 1000 + id % 48, 32, 64);
+    serve_to_their_length(&mut harness, 64, request, 64);
 }

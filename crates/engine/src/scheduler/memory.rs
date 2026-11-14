@@ -1612,12 +1612,14 @@ impl Scheduler {
     /// like the admission's. `Allocated` and `Cloned` hold private entries; `Pinned`, and the
     /// `Loaded` or `Duplicate` that answers a `Load`'s copy, hold read-only ones, which extend
     /// `shared` only where they continue it: entries beyond a position the hit lost are given up
-    /// at once. An encoder output the answer did not hold is allocated at once, so that its
-    /// encode computes it; one it holds has its position. A peers' `Prefetched` counts the
-    /// tokens it brought. A `Loaded` that copied nothing holds the keys `cache` does not show on
-    /// the device of the owner's group. A pin that falls short of what `cache` expected, and the
-    /// prefetch it calls for, read the positions it lost from the lower tiers
-    /// ([`Scheduler::reread`]).
+    /// at once; a `Commit` answered `Duplicate` states nothing of them, its block staying private
+    /// and held as it was (BP §11). An encoder output the answer did not hold is allocated at
+    /// once, so that its encode computes it; one it holds has its position. A peers'
+    /// `Prefetched` counts the tokens it brought. A `Loaded` that copied nothing holds no entry:
+    /// its `Load` comes narrowed to no key ([`cache::covered`]), and the positions it named are
+    /// missing like those a short pin leaves, for the admission's last round to allocate. A pin
+    /// that falls short of what `cache` expected, and the prefetch it calls for, read the
+    /// positions it lost from the lower tiers ([`Scheduler::reread`]).
     pub(super) fn filled(
         &mut self,
         id: RequestId,
@@ -1704,7 +1706,10 @@ impl Scheduler {
                     .map_or(1, |group| group.regions(class).len());
                 runs.len() / regions.max(1)
             }
-            (_, Completion::Duplicate) => keys.len(),
+            // A load's copy that found its keys cached meanwhile holds them all the same,
+            // read-only; a `Commit` answered `Duplicate` leaves its block private, held as it was,
+            // and states nothing more of the tables.
+            (runtime::Request::Load { .. }, Completion::Duplicate) => keys.len(),
             (_, Completion::Loaded) => self
                 .expected_hit(keys, group)
                 .iter()

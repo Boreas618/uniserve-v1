@@ -121,6 +121,9 @@ pub(crate) struct Deployment {
     groups: Vec<(WorkerGroupRole, Vec<Phase>)>,
     /// The model's cache groups, class `c` being cache group `c`: kind and block size in tokens.
     cache: Vec<(CacheGroupKind, u32)>,
+    /// The units one block of each cache group's class takes, by class; a class past the list
+    /// takes one.
+    block_units: Vec<u32>,
     /// The drafts a verification carries; 0 for a deployment that does not speculate.
     drafts: u32,
     /// The KV units of each group's region, and of the host's KV pool (0: no host tier).
@@ -166,6 +169,7 @@ impl Deployment {
         Self {
             groups: vec![(WorkerGroupRole::Model, vec![Phase::Prefill, Phase::Decode])],
             cache: vec![(CacheGroupKind::Full, BLOCK)],
+            block_units: Vec::new(),
             drafts: 0,
             kv_units: 256,
             host_units: 0,
@@ -312,6 +316,14 @@ impl Deployment {
     /// A host tier of `units` KV units: committed full-attention blocks are stored there.
     pub(crate) fn host(mut self, units: u32) -> Self {
         self.host_units = units;
+        self
+    }
+
+    /// The units one block of each cache group's class takes, in class order (the draft cache
+    /// group, which [`Self::speculative`] appends, last): a recurrent-state checkpoint of a
+    /// hybrid model takes many units where a page of attention takes one.
+    pub(crate) fn block_units(mut self, units: &[u32]) -> Self {
+        self.block_units = units.to_vec();
         self
     }
 
@@ -510,20 +522,25 @@ impl Deployment {
         ));
 
         // A KV block is one unit; a sized block states its units when it is asked for.
-        let class = |units, host| Class {
+        // A recurrent state's class holds its live state in the slot, as a rank states it.
+        let class = |units, host, state_in_slot| Class {
             units,
             host,
-            state_in_slot: false,
+            state_in_slot,
             tensors: [0; 32],
             encoding: [0; 32],
         };
         let mut classes: Vec<Class> = self
             .cache
             .iter()
-            .map(|_| class(1, host.map(|host| (host, 1))))
+            .enumerate()
+            .map(|(at, (kind, _))| {
+                let units = self.block_units.get(at).copied().unwrap_or(1);
+                class(units, host.map(|host| (host, 1)), kind.is_state())
+            })
             .collect();
-        classes.extend((0..=PRODUCT_KINDS).map(|_| class(0, None)));
-        classes.push(class(0, Some((latents, 0))));
+        classes.extend((0..=PRODUCT_KINDS).map(|_| class(0, None, false)));
+        classes.push(class(0, Some((latents, 0)), false));
         let trajectory = index(classes.len() - 1);
 
         let groups = (0..self.groups.len())

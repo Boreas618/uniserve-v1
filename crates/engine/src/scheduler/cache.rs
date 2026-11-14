@@ -1050,17 +1050,20 @@ fn stamped_groups(after: &runtime::Stamps) -> u8 {
 /// `request` as the scheduler applies its answer `completion`: a `Load` or a `Store` answered
 /// `Copy` narrowed to the keys the copy covers, which are the leading keys of a `Load` that have
 /// a host copy and the keys of a `Store` whose device copy is valid in its group (BP §11), and
-/// for which the answer to its `Finish` speaks; any other request as it was written. The
-/// executor is handed the request as it was written, which its completion answers (SD §2.1
+/// for which the answer to its `Finish` speaks; a `Load` answered `Loaded` itself narrowed to no
+/// key, since no leading key had a host copy the owner could not pin instead, so nothing was
+/// copied and no entry was given (BP §11); any other request as it was written. The executor is
+/// handed the request as it was written, which its completion answers (SD §2.1
 /// `Executor::map`).
 pub(super) fn covered(request: &runtime::Request, completion: &Completion) -> runtime::Request {
     let mut narrowed = request.clone();
-    if let (
-        runtime::Request::Load { keys, .. } | runtime::Request::Store { keys, .. },
-        Completion::Copy { keys: copied, .. },
-    ) = (&mut narrowed, completion)
-    {
-        keys.retain(|key| copied.contains(key));
+    match (&mut narrowed, completion) {
+        (
+            runtime::Request::Load { keys, .. } | runtime::Request::Store { keys, .. },
+            Completion::Copy { keys: copied, .. },
+        ) => keys.retain(|key| copied.contains(key)),
+        (runtime::Request::Load { keys, .. }, Completion::Loaded) => keys.clear(),
+        _ => {}
     }
     narrowed
 }

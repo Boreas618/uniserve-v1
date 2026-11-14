@@ -475,7 +475,9 @@ impl State {
     }
 
     /// The breaches of A4 in `batch`: a token row writing a cache position, or keeping a
-    /// checkpoint, in a block its slot does not hold writable.
+    /// checkpoint, in a block its slot does not hold writable, or restoring a checkpoint its slot
+    /// holds no entry for, which a rank refuses before it launches the batch
+    /// (`engine::runner::causal_lm::wiring::state_copies`).
     fn unwritable(&self, batch: &Batch) -> Vec<String> {
         let Some(tables) = self.groups.get(&batch.group) else {
             return Vec::new();
@@ -516,15 +518,26 @@ impl State {
             }
         }
         if let Some(class) = self.checkpoints {
-            let kept = batch.columns.state_copies.iter();
-            for copy in kept.filter(|copy| copy.direction == StateDirection::Keep) {
-                if !writable(copy.slot, class, copy.position) {
-                    breaches.push(format!(
-                        "batch {} keeps a checkpoint at position {} of slot {}, which the slot \
-                         does not hold writable",
-                        batch.id.0, copy.position, copy.slot
-                    ));
-                }
+            for copy in &batch.columns.state_copies {
+                let held = tables
+                    .entries
+                    .contains_key(&(copy.slot, class, copy.position));
+                let breach = match copy.direction {
+                    StateDirection::Keep if !writable(copy.slot, class, copy.position) => {
+                        "keeps a checkpoint at"
+                    }
+                    StateDirection::Restore if !held => "restores the checkpoint of",
+                    _ => continue,
+                };
+                let held_as = match copy.direction {
+                    StateDirection::Keep => " writable",
+                    StateDirection::Restore => "",
+                };
+                breaches.push(format!(
+                    "batch {} {breach} position {} of slot {}, which the slot does not \
+                     hold{held_as}",
+                    batch.id.0, copy.position, copy.slot
+                ));
             }
         }
         breaches

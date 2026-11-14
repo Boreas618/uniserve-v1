@@ -459,6 +459,44 @@ fn a_repeated_request_finds_its_conditioning_and_makes_no_text_encoding() {
     assert_eq!(commits, 2, "a conditioning no digest keys is not committed");
 }
 
+/// Requests of the same inputs admitted together each encode their own conditioning, since none
+/// is cached when they are admitted: the first commit caches it under its key and a later one is
+/// answered `Duplicate`, which leaves that request's block private to it and gives it no other
+/// (BP §11 `Commit`), so its request holds the conditioning it encoded, allocates nothing more,
+/// and every request completes (SD §3.5 `answered`, §4.3).
+#[test]
+fn requests_of_the_same_inputs_admitted_together_each_complete_with_their_own_conditioning() {
+    let mut harness = Deployment::video(&[&VIDEO_PHASES])
+        .encoder_identity("text-encoder")
+        .build();
+    let first = digested(video(1, 1), 1);
+    let ids: Vec<RequestId> = (1..=3)
+        .map(|id| {
+            harness.submit_video(DiffusionRequest {
+                request_id: RequestId(id),
+                ..first.clone()
+            })
+        })
+        .collect();
+    harness.run_until(400, |harness| {
+        harness.failure().is_some() || ids.iter().all(|id| harness.terminal(*id).is_some())
+    });
+
+    assert_eq!(harness.failure(), None, "the scheduler failed");
+    for id in ids {
+        completed(&harness, id);
+    }
+    let duplicates = harness
+        .answers()
+        .into_iter()
+        .filter(|answer| matches!(answer, (Request::Commit { .. }, Completion::Duplicate)))
+        .count();
+    assert!(
+        duplicates > 0,
+        "a later commit of the same key is answered Duplicate"
+    );
+}
+
 /// A repeated request's admission takes no units for the conditioning its `Pin` will find: it is
 /// admitted beside the request that committed the conditioning and still holds it, when the
 /// buffers have room for its other products and not for the conditioning a second time (SD §3.5
