@@ -70,6 +70,12 @@ const PRESENCE: usize = 6;
 /// chunk of the row, so a candidate width may be the whole vocabulary.
 const CANDIDATE_TILE: u32 = 8192;
 
+/// Columns one program of `logits_shape` shapes: one register tile of its kernel, so a row is
+/// shaped by `ceil(vocabulary / SHAPE_TILE)` programs side by side. The shaping is one element
+/// at a time, so the tile changes no value; a program per row would leave a decode step's few
+/// rows to as few programs, each walking a vocabulary-wide row alone.
+const SHAPE_TILE: u32 = 4096;
+
 /// Columns one pass of `top_k` reads: the only size its key names, since the vocabulary and
 /// the kept count are launch values.
 const TOP_TILE: u32 = 2048;
@@ -414,7 +420,7 @@ pub fn logits_shape(
         &ShapeDescriptor {
             dtype: logits.dtype(),
             vocabulary,
-            block: row_tile(vocabulary),
+            block: SHAPE_TILE.min(row_tile(vocabulary)),
             extras: extent(OWNER, "extra tokens", extra_columns)?,
             divide: true,
             pdl: PDL,
