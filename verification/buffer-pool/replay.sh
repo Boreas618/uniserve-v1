@@ -2,7 +2,8 @@
 # The trace of a run of the Storage Server (specs/buffer-pool.md §18): each
 # deployment's trace in TRACE_DIR (written with `storage-server serve
 # --buffer-pool-trace TRACE_DIR`) is replayed on a new Rust buffer pool, with
-# every completion checked against the run's, and the states the pool passes
+# every completion checked against the run's and the pool's check() run after
+# every input (a difference or an inconsistency fails), and the states the pool passes
 # through are checked against the design model's steps in windows of at most
 # WINDOW steps, each from a recorded state (steps.py, KvTrace.tla). Prints one
 # verdict line and exits non-zero when either fails.

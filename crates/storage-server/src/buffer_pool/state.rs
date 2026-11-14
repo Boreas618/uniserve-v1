@@ -319,18 +319,21 @@ impl BufferPool {
     }
 
     /// The capacity words of every region and queue pair, by a scan of
-    /// every holder: what the counts must equal. Per region: its free
-    /// units, evictable and retiring units, and per queue pair with an
-    /// order there its installed units.
-    fn scanned_words(&self) -> Vec<(u32, u32, u32, BTreeMap<QueueId, u32>)> {
-        let blocks = self.blocks();
+    /// every holder (`blocks`, as [`Self::blocks`] finds them): what the
+    /// counts must equal. Per region: its free units, evictable and
+    /// retiring units, and per queue pair with an order there its installed
+    /// units.
+    fn scanned_words(
+        &self,
+        blocks: &[(&Rc<Block>, BlockState, usize)],
+    ) -> Vec<(u32, u32, u32, BTreeMap<QueueId, u32>)> {
         let mut words: Vec<_> = self
             .regions
             .iter()
             .map(|region| (region.free_scanned(), 0, 0, BTreeMap::new()))
             .collect();
         let mut evictable: HashSet<*const Block> = HashSet::new();
-        for (block, observed, _) in &blocks {
+        for (block, observed, _) in blocks {
             let only_entry = *observed == BlockState::Shared && Rc::strong_count(block) == 1;
             if only_entry {
                 evictable.insert(Rc::as_ptr(block));
@@ -359,36 +362,41 @@ impl BufferPool {
         words
     }
 
-    /// Checks the counts the capacity words are made of against a scan:
-    /// what each block records against its holders, and each region's
-    /// counts against its blocks and orders. Returns the first difference.
-    fn check_counts(&self) -> Result<(), String> {
+    /// Checks the counts the capacity words are made of against a scan of
+    /// `blocks` (as [`Self::blocks`] finds them): what each block records
+    /// against its holders, and each region's counts against its blocks and
+    /// orders. Returns the first difference.
+    fn check_counts(&self, blocks: &[(&Rc<Block>, BlockState, usize)]) -> Result<(), String> {
         if !self.touched.borrow().is_empty() {
             return Err("a handler left blocks it touched uncounted".into());
         }
         let (cached, owned) = self.holders();
-        for (block, _, references) in self.blocks() {
+        for &(block, _, references) in blocks {
             let at = Rc::as_ptr(block);
             let recorded = (block.cached.get(), block.owned.get());
             let held = (
                 cached.get(&at).copied(),
                 owned.get(&at).copied().unwrap_or(0),
             );
-            let first = block.stated().first().copied();
+            // A block is named only in the inconsistency it is found in.
+            let first = || block.stated().first().copied();
             if recorded != held {
                 return Err(format!(
-                    "block {first:?} records {recorded:?} of cache and owners, its holders {held:?}"
+                    "block {:?} records {recorded:?} of cache and owners, its holders {held:?}",
+                    first()
                 ));
             }
             if block.counted.get() != counted(block, references) {
                 return Err(format!(
-                    "block {first:?} counts as {:?}, its holders make it {:?}",
+                    "block {:?} counts as {:?}, its holders make it {:?}",
+                    first(),
                     block.counted.get(),
                     counted(block, references)
                 ));
             }
         }
-        for (id, (region, words)) in self.regions.iter().zip(self.scanned_words()).enumerate() {
+        let scanned = self.scanned_words(blocks);
+        for (id, (region, words)) in self.regions.iter().zip(scanned).enumerate() {
             let (free, evictable, retiring, installed) = words;
             let counts = (region.free_units(), region.evictable, region.retiring);
             if counts != (free, evictable, retiring) {
@@ -424,18 +432,33 @@ impl BufferPool {
     /// table is valid in the owner's group; no two regions hold the same
     /// bytes; the counts the capacity words are made of are those a scan
     /// finds. Returns the first inconsistency.
+    ///
+    /// With `--buffer-pool-check` it runs after every input, on the path of
+    /// the answers a scheduler's steps wait for, so its work is kept linear
+    /// in the blocks, entries and runs: the holders are found once, and so
+    /// are the runs of each region and the cached blocks the checks below
+    /// look up.
     pub fn check(&self) -> Result<(), String> {
         let blocks = self.blocks();
 
-        // P3 and P1: the units of each region, each in exactly one place.
-        for (id, region) in self.regions.iter().enumerate() {
-            let mut runs: Vec<(u32, u32)> =
-                region.free_runs().chain(region.outside_runs()).collect();
-            for (block, _, _) in &blocks {
-                let held = block.runs.borrow();
-                let here = held.iter().filter(|run| usize::from(run.region()) == id);
-                runs.extend(here.map(|run| (run.first(), run.count())));
+        // The runs the blocks hold, by region (`Run::region` indexes
+        // `regions`), for the checks of the regions' units and of their bytes.
+        let mut held: Vec<Vec<(u32, u32)>> = vec![Vec::new(); self.regions.len()];
+        for (block, _, _) in &blocks {
+            for run in block.runs.borrow().iter() {
+                if let Some(runs) = held.get_mut(usize::from(run.region())) {
+                    runs.push((run.first(), run.count()));
+                }
             }
+        }
+
+        // P3 and P1: the units of each region, each in exactly one place.
+        for (id, (region, held)) in self.regions.iter().zip(&held).enumerate() {
+            let mut runs: Vec<(u32, u32)> = region
+                .free_runs()
+                .chain(region.outside_runs())
+                .chain(held.iter().copied())
+                .collect();
             runs.sort_unstable();
 
             let (mut next, limit) = region.span();
@@ -487,11 +510,16 @@ impl BufferPool {
         for block in owned.chain(written.map(|copy| &copy.write)) {
             *private.entry(Rc::as_ptr(block)).or_default() += 1;
         }
-        let cached = |block: &Rc<Block>| {
-            blocks.iter().any(|(other, observed, _)| {
-                Rc::ptr_eq(other, block) && *observed == BlockState::Shared
-            })
-        };
+        // The blocks an entry of the cache holds, found once: every pin and
+        // private block below is looked up in it, so the check stays linear
+        // in the blocks and entries (it runs after every input with
+        // `--buffer-pool-check`, on the path of the answers a step waits for).
+        let shared: HashSet<*const Block> = blocks
+            .iter()
+            .filter(|(_, observed, _)| *observed == BlockState::Shared)
+            .map(|(block, _, _)| Rc::as_ptr(block))
+            .collect();
+        let cached = |block: &Rc<Block>| shared.contains(&Rc::as_ptr(block));
         for (block, _, _) in &blocks {
             let places = private.get(&Rc::as_ptr(block)).copied().unwrap_or(0);
             if places > 1 || places == 1 && cached(block) {
@@ -559,20 +587,13 @@ impl BufferPool {
                 .iter()
                 .map(|(offset, bytes)| (*offset, *bytes))
                 .collect();
-            for region in self
+            for (region, held) in self
                 .regions
                 .iter()
-                .filter(|region| usize::from(region.space) == space)
+                .zip(&held)
+                .filter(|(region, _)| usize::from(region.space) == space)
             {
-                let mut held: Vec<(u32, u32)> = Vec::new();
-                for (block, _, _) in &blocks {
-                    let runs = block.runs.borrow();
-                    let here = runs.iter().filter(|run| {
-                        std::ptr::eq(&self.regions[usize::from(run.region())], region)
-                    });
-                    held.extend(here.map(|run| (run.first(), run.count())));
-                }
-                let inside = region.free_runs().chain(held);
+                let inside = region.free_runs().chain(held.iter().copied());
                 ranges.extend(inside.map(|(first, count)| {
                     (
                         u64::from(first) * region.unit_bytes,
@@ -590,6 +611,6 @@ impl BufferPool {
                 }
             }
         }
-        self.check_counts()
+        self.check_counts(&blocks)
     }
 }

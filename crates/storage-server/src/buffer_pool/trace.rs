@@ -1242,7 +1242,9 @@ mod tests {
                 .map(|states| BufWriter::new(File::create(path(states)).unwrap()));
             let replayed = replay(&inputs, written.as_mut().map(|file| file as &mut dyn Write));
             match replayed {
-                Ok(count) => println!("replayed {name}: {count} inputs, every completion equal"),
+                Ok(count) => println!(
+                    "replayed {name}: {count} inputs, every completion equal and every check clean"
+                ),
                 Err(difference) => panic!("{name}: {difference}"),
             }
         }

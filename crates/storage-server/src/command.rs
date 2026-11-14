@@ -85,9 +85,13 @@ pub enum Command {
         /// pool.
         #[arg(long, value_name = "DIRECTORY")]
         buffer_pool_trace: Option<PathBuf>,
-        /// Check every buffer pool's tables after each input it acts on: an
-        /// inconsistency is logged when the pool turns inconsistent and
-        /// counted in its listing (`check_failures`), and the pool goes on.
+        /// Check every buffer pool's tables after an input it acts on,
+        /// whenever its thread has run at least nine times the previous
+        /// check's duration since that check ended, so that checking takes
+        /// at most a tenth of the thread that answers the steps (the replay
+        /// of the trace checks after every input): an inconsistency is
+        /// logged when the pool turns inconsistent and counted in its
+        /// listing (`check_failures`), and the pool goes on.
         #[arg(long)]
         buffer_pool_check: bool,
         /// The descriptor of the handoff socket to the server this one

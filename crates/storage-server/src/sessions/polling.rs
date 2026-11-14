@@ -59,7 +59,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, mpsc};
 use std::thread::JoinHandle;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 use storage::QueuePair;
@@ -392,13 +392,25 @@ struct QueueHandoff {
 /// What sees one pool's inputs: its trace, and its check.
 struct Watch {
     trace: Option<Trace>,
-    /// Whether the pool's check runs after every input.
+    /// Whether the pool's check runs (`--buffer-pool-check`).
     check: bool,
     /// The checks that found the pool inconsistent, and whether the last
     /// one did: a failure is logged when the pool turns inconsistent.
     failures: u64,
     failing: bool,
+    /// When the last check ended and how long it took. The check costs time
+    /// in proportion to the pool's blocks and owners, on the thread whose
+    /// answers the schedulers' steps wait for, so it runs after an input
+    /// only once the thread has run at least [`CHECK_SPACING`] times that
+    /// long since: checking takes at most a tenth of the thread
+    /// (`specs/buffer-pool.md` §18). The replay of the trace checks after
+    /// every input.
+    checked: Option<(Instant, Duration)>,
 }
+
+/// The time the thread runs between two checks, in multiples of the
+/// previous check's duration.
+const CHECK_SPACING: u32 = 9;
 
 impl Watch {
     /// The watch of the pool of `deployment`: a trace in `trace`, from the
@@ -417,11 +429,13 @@ impl Watch {
             check,
             failures: 0,
             failing: false,
+            checked: None,
         }
     }
 
     /// The pool acted on an input: the trace records it, and the check
-    /// runs. `input` is made only when either is on.
+    /// runs when it is due ([`Watch::checked`]). `input` is made only when
+    /// either is on.
     fn acted(&mut self, deployment: &str, pool: &BufferPool, input: impl FnOnce() -> Input) {
         if self.trace.is_none() && !self.check {
             return;
@@ -439,7 +453,16 @@ impl Watch {
         if !self.check {
             return;
         }
-        match pool.check() {
+        if let Some((ended, took)) = self.checked
+            && ended.elapsed() < took * CHECK_SPACING
+        {
+            return;
+        }
+        let started = Instant::now();
+        let found = pool.check();
+        let ended = Instant::now();
+        self.checked = Some((ended, ended - started));
+        match found {
             Ok(()) => self.failing = false,
             Err(inconsistency) => {
                 self.failures += 1;
@@ -1261,8 +1284,10 @@ impl Pools {
 mod tests {
     use std::collections::BTreeMap;
     use std::sync::{Arc, mpsc};
+    use std::time::{Duration, Instant};
 
     use storage::QueuePair;
+    use storage::protocol::Key;
     use storage::runtime::{
         Class, Completion, Group, GroupId, Open, OwnerId, Region, Request, RequestId, Tier, VERSION,
     };
@@ -1273,6 +1298,11 @@ mod tests {
     /// layout of one group over four KV units and two slot rows, and the
     /// engine's end of its queue pair.
     fn served() -> (Pools, QueuePair) {
+        served_with(4, true)
+    }
+
+    /// As [`served`], with `units` KV units, and the check on when `check`.
+    fn served_with(units: u32, check: bool) -> (Pools, QueuePair) {
         let (_, wake) = rustix::pipe::pipe().unwrap();
         let notifier = Notifier {
             notices: mpsc::channel().0,
@@ -1284,7 +1314,7 @@ mod tests {
             limits: (1_000, 1_000),
             notifier,
             trace: None,
-            check: true,
+            check,
             flushed: 0,
         };
         let region = |name: &str, units| Region {
@@ -1303,7 +1333,7 @@ mod tests {
             version: VERSION,
             epoch: 0,
             trial: false,
-            regions: vec![region("units", 4), region("rows", 2)],
+            regions: vec![region("units", units), region("rows", 2)],
             classes: vec![Class {
                 units: 1,
                 host: None,
@@ -1339,9 +1369,9 @@ mod tests {
     }
 
     /// With the check on, a pool whose tables a fault made inconsistent is
-    /// reported after the next input it acts on, and goes on serving.
+    /// reported by the first check after an input, and goes on serving.
     #[test]
-    fn a_pool_made_inconsistent_is_reported_after_the_next_input_and_goes_on() {
+    fn a_pool_made_inconsistent_is_reported_by_the_next_check_and_goes_on() {
         let (mut pools, mut engine) = served();
         let attach = Request::Attach {
             owner: OwnerId(1),
@@ -1359,6 +1389,10 @@ mod tests {
         pools.turn();
         assert_eq!(failures(&pools), 0);
 
+        // The check of four units takes microseconds, so after a pause the
+        // thread has run far longer than nine checks since the last one and
+        // the next input is checked.
+        std::thread::sleep(Duration::from_millis(5));
         let allocate = Request::Allocate {
             owner: OwnerId(1),
             class: 0,
@@ -1381,6 +1415,124 @@ mod tests {
                 [Completion::Attached { .. }, Completion::Allocated { .. }]
             ),
             "{answers:?}"
+        );
+    }
+
+    /// Serves `requests` in turns of at most 64, numbering them on from
+    /// `number` (a queue pair's numbers rise), and returns the time the
+    /// turns took and the completions, in order.
+    fn serve(
+        pools: &mut Pools,
+        engine: &mut QueuePair,
+        number: &mut u64,
+        requests: &[Request],
+    ) -> (Duration, Vec<Completion>) {
+        let mut took = Duration::ZERO;
+        let mut answers = Vec::new();
+        let mut record = Vec::new();
+        for chunk in requests.chunks(64) {
+            for request in chunk {
+                *number += 1;
+                submit(engine, *number, request);
+            }
+            let started = Instant::now();
+            pools.turn();
+            took += started.elapsed();
+            while engine.next_completion(&mut record).unwrap() {
+                answers.push(Completion::decode(&record).unwrap().1);
+            }
+        }
+        (took, answers)
+    }
+
+    /// The live check costs time in proportion to the pool's blocks, on the
+    /// thread whose answers the steps wait for, and takes at most a tenth of
+    /// that thread: a pool of 3000 cached blocks, whose check takes
+    /// hundreds of times as long as an allocation, serves allocations with
+    /// the check on in about the time it takes with the check off (checked
+    /// after every input, it would take tens of times as long).
+    #[test]
+    fn the_live_check_takes_at_most_a_tenth_of_the_thread() {
+        const BLOCKS: u32 = 3000;
+        let named = |index: u32| {
+            let mut bytes = [0; 32];
+            bytes[..4].copy_from_slice(&index.to_le_bytes());
+            Key(bytes)
+        };
+
+        // One owner commits 3000 blocks; one unit stays free, which the
+        // timed requests allocate and release in turn.
+        let mut filling = vec![
+            Request::Attach {
+                owner: OwnerId(1),
+                group: GroupId(0),
+            },
+            Request::Allocate {
+                owner: OwnerId(1),
+                class: 0,
+                at: 0,
+                count: BLOCKS,
+                units: 0,
+            },
+        ];
+        filling.extend((0..BLOCKS).map(|at| Request::Commit {
+            owner: OwnerId(1),
+            class: 0,
+            at,
+            key: named(at),
+            tokens: 64,
+            after: Vec::new(),
+        }));
+        let cycles: Vec<Request> = (0..20_000)
+            .flat_map(|_| {
+                [
+                    Request::Allocate {
+                        owner: OwnerId(1),
+                        class: 0,
+                        at: BLOCKS,
+                        count: 1,
+                        units: 0,
+                    },
+                    Request::Release {
+                        owner: OwnerId(1),
+                        class: 0,
+                        at: BLOCKS,
+                        count: 1,
+                        after: Vec::new(),
+                    },
+                ]
+            })
+            .collect();
+
+        let mut times = [Duration::MAX; 2];
+        for _ in 0..3 {
+            for (check, time) in [false, true].into_iter().zip(&mut times) {
+                let (mut pools, mut engine) = served_with(BLOCKS + 1, check);
+                let mut number = 0;
+                let (_, filled) = serve(&mut pools, &mut engine, &mut number, &filling);
+                let committed = filled
+                    .iter()
+                    .filter(|answer| matches!(answer, Completion::Committed))
+                    .count();
+                assert_eq!(committed, BLOCKS as usize, "{:?}", &filled[..2]);
+
+                let (took, served) = serve(&mut pools, &mut engine, &mut number, &cycles);
+                assert!(
+                    served
+                        .iter()
+                        .step_by(2)
+                        .all(|answer| matches!(answer, Completion::Allocated { .. })),
+                    "{:?}",
+                    &served[..2]
+                );
+                *time = (*time).min(took);
+                assert_eq!(failures(&pools), 0);
+            }
+        }
+        let [off, on] = times;
+        assert!(
+            on < off * 3 / 2,
+            "40000 allocations and releases took {off:?} without the check and {on:?} with it"
         );
     }
 }

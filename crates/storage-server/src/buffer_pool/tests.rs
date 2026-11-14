@@ -97,12 +97,21 @@ impl Fixture {
     /// As [`Self::new`], the prefill group copying with the host parts
     /// `prefill` and the decode group with `decode`.
     fn with_parts(prefill: u64, decode: u64) -> Self {
+        Self::built(prefill, decode, 4)
+    }
+
+    /// As [`Self::new`], with `units` KV units (1 to `units`).
+    fn with_units(units: u32) -> Self {
+        Self::built(PART, PART, units)
+    }
+
+    fn built(prefill: u64, decode: u64, units: u32) -> Self {
         let mut pool = BufferPool::new((1_000, 1_000));
         for space in 0..8 {
             pool.grant(space, 0, 1 << 20);
         }
         assert_eq!(
-            pool.open_region("units", Tier::Device, 0, (64, 64), 1, 4, 5),
+            pool.open_region("units", Tier::Device, 0, (64, 64), 1, units, units + 1),
             UNITS
         );
         pool.open_region("prefill rows", Tier::Device, 1, (8, 8), 1, 2, 3);
@@ -2396,4 +2405,79 @@ fn a_pool_made_again_from_its_image_carries_a_waiting_crossing() {
     fixture.checked();
     assert_eq!(fixture.answer(crossing), Some(Completion::Failed));
     assert_eq!(fixture.free(UNITS), 4);
+}
+
+/// With `--buffer-pool-check` the check runs after every input, on the path of the answers a
+/// scheduler's steps wait for, so its time grows in proportion to the blocks and pins the pool
+/// holds, not with their product: four times the cached blocks, each also pinned by a second
+/// owner, take about four times as long to check, far from the sixteen times that looking up
+/// each pin among all the blocks takes.
+#[test]
+fn the_check_takes_time_in_proportion_to_the_blocks_and_pins() {
+    let checked_in = |blocks: u32| {
+        let mut fixture = Fixture::with_units(blocks);
+        fixture.attach(1, PREFILL);
+        fixture.attach(2, PREFILL);
+        let named = |index: u32| {
+            let mut bytes = [0; 32];
+            bytes[..4].copy_from_slice(&index.to_le_bytes());
+            Key(bytes)
+        };
+
+        // The pool is filled without a check after each request: only the full pool's check is
+        // timed.
+        let take = |fixture: &mut Fixture, request| {
+            fixture.number += 1;
+            let id = RequestId(fixture.number);
+            fixture.pool.take(QUEUE, id, request);
+            fixture.answer(id)
+        };
+        let allocate = Request::Allocate {
+            owner: OwnerId(1),
+            class: KV,
+            at: 0,
+            count: blocks,
+            units: 0,
+        };
+        assert!(matches!(
+            take(&mut fixture, allocate),
+            Some(Completion::Allocated { .. })
+        ));
+        for at in 0..blocks {
+            let commit = Request::Commit {
+                owner: OwnerId(1),
+                class: KV,
+                at,
+                key: named(at),
+                tokens: 64,
+                after: Vec::new(),
+            };
+            assert_eq!(take(&mut fixture, commit), Some(Completion::Committed));
+        }
+        let pin = Request::Pin {
+            owner: OwnerId(2),
+            class: KV,
+            at: 0,
+            keys: (0..blocks).map(named).collect(),
+        };
+        assert!(matches!(
+            take(&mut fixture, pin),
+            Some(Completion::Pinned { .. })
+        ));
+
+        (0..5)
+            .map(|_| {
+                let started = std::time::Instant::now();
+                fixture.checked();
+                started.elapsed()
+            })
+            .min()
+            .unwrap()
+    };
+
+    let (small, large) = (checked_in(1_000), checked_in(4_000));
+    assert!(
+        large < small * 8,
+        "checking 1000 pinned blocks took {small:?} and 4000 took {large:?}"
+    );
 }
