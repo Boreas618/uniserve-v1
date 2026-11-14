@@ -948,6 +948,13 @@ impl BufferMemory {
         })
     }
 
+    /// Whether rank index `rank` is a media rank of this memory's process: this rank, or one
+    /// whose product buffer it reaches ([`BufferMemory::connect`]). A rank of another process
+    /// holds runs this memory cannot address.
+    pub(crate) fn reaches(&self, rank: u32) -> bool {
+        rank == self.rank || self.peers.iter().any(|peer| peer.1 == rank)
+    }
+
     /// Issues `moved` on `stream`: see [`BufferMemory::copy`].
     fn issue(&self, moved: &[ByteCopy], stream: Option<&Stream>) -> Result<()> {
         let stream = match (&self.device, stream) {

@@ -10,8 +10,10 @@
 //! - **Every job goes to every rank.** A batch, a shadow batch, a completion to map and requests
 //!   to stamp are handed to each of the group's workers on this node and to each peer link that
 //!   holds its other ranks, and their submissions are joined into one that completes when every
-//!   rank's did ([`Submission::joined`]): a stamp is the largest over the ranks, and a copy's
-//!   `Finish` failed when it failed on any rank.
+//!   rank's did ([`Submission::joined`]): a stamp is the largest over the ranks, a copy's
+//!   `Finish` failed when it failed on any rank, and a call failed when any rank that ran it
+//!   answered it as failed. A rank, or a peer's process, none of whose runners serves a batch's
+//!   phase passes its number.
 //! - **Numbers.** A batch and a shadow batch read and write the group's device block tables, so
 //!   the group numbers them, from 1, in the order it hands them to its ranks. The number is the
 //!   group's for every rank; a peer's ranks take the number the scheduler node sent. Each rank
@@ -30,14 +32,17 @@
 //!   names none: every rank of the group that serves its phase runs it and decodes its share of
 //!   the round's units (`runners::decoder`). A rank whose runners do not serve the batch's phase
 //!   passes it too.
-//! - **Host work once.** A batch of a host phase (a media request's reading, encoding and
-//!   muxing, [`crate::batch::Variant::host`]) is work of the host, not of a rank's device, and
-//!   runs once: a batch whose rows name no rank is named the first of this node's workers of
-//!   the group that serves its phase, as if its rows named that rank, and every other rank
-//!   passes its number. Its rows then start no copy, as no batch one rank runs alone does; a
-//!   host batch with no rows is every rank's and runs the copies. A group none of whose
-//!   workers here serves the phase hands the batch to its first peer link to run, and the
-//!   others pass it.
+//! - **Host work where its blocks lie.** A batch of a host phase (a media request's reading,
+//!   encoding and muxing, [`crate::batch::Variant::host`]) is work of the host, not of a rank's
+//!   device. A batch whose rows name no rank runs on one rank of each process that runs it, the
+//!   first of the process's workers of the group that serves its phase, as if its rows named
+//!   that rank, and every other rank passes its number. A video encode round runs in every
+//!   process that holds ranks of the group ([`crate::batch::Variant::dealt`]): each encodes the
+//!   units its own ranks decoded, which no other process reaches, into their encoded blocks
+//!   there; a process none of whose workers serves the phase passes it. Every other host batch
+//!   runs once: here when a worker of this node serves its phase, otherwise on the group's
+//!   first peer link, the other links passing it. Its rows then start no copy, as no batch one
+//!   rank runs alone does; a host batch with no rows is every rank's and runs the copies.
 
 use std::sync::{Arc, Mutex};
 
@@ -189,11 +194,8 @@ impl Route {
 
     /// Numbers `batch` for its group and hands it to the group's ranks, as a shadow batch when
     /// `shadow` is set.
-    fn numbered(&self, mut batch: Batch, shadow: bool) -> Result<Submission> {
+    fn numbered(&self, batch: Batch, shadow: bool) -> Result<Submission> {
         let group = self.group(batch.group)?;
-        if !shadow {
-            group.name_host(&mut batch)?;
-        }
         let mut next = lock(&group.next);
 
         // A batch refused before any rank took it takes no number.
@@ -205,17 +207,28 @@ impl Route {
     /// Hands `batch`, which the scheduler node numbered `sequence`, to this process's ranks of
     /// its group, as a peer link's far end does: each runs it, or only takes its number when
     /// `pass` is set or its runners do not serve the batch's phase.
+    ///
+    /// A process none of whose workers serves the batch's phase passes it: the group's ranks of
+    /// other processes serve it, as the scheduler placed the phase on the group by what all of
+    /// its ranks serve (a text encoding on a group whose text encoder lies on another host, a
+    /// video encode round whose units no rank here decoded). Host work the scheduler node
+    /// handed this process to run once is refused when nothing here serves it.
     pub(super) fn run(
         &self,
         sequence: u64,
-        mut batch: Batch,
+        batch: Batch,
         pass: bool,
         shadow: bool,
     ) -> Result<Submission> {
         let group = self.group(batch.group)?;
-        if !pass && !shadow {
-            group.name_host(&mut batch)?;
-        }
+        let once = group
+            .host_work(&batch, pass, shadow)?
+            .is_some_and(|(dealt, _)| !dealt);
+        let serving = group
+            .workers
+            .iter()
+            .any(|worker| worker.serves(batch.phase));
+        let pass = pass || (!serving && !once);
         let mut next = lock(&group.next);
 
         group.check(&batch, pass, shadow)?;
@@ -385,27 +398,32 @@ impl Route {
 }
 
 impl Group {
-    /// Names the rank that runs `batch` in its rows when it is a batch of a host phase with rows
-    /// that name none: the first of this node's workers of the group that serves its phase. A
-    /// group none of whose workers here serves the phase leaves it unnamed for its peers.
-    fn name_host(&self, batch: &mut Batch) -> Result<()> {
-        if !batch.shape.variant.host() || batch.media.is_empty() || alone(batch)?.is_some() {
-            return Ok(());
+    /// Whether `batch`, handed with `pass` and `shadow`, is host work its rows leave to no rank
+    /// (module documentation): `None` for any other job; otherwise whether every process runs
+    /// it ([`crate::batch::Variant::dealt`]) and the rank of this node that runs it, the first
+    /// of this node's workers of the group that serves its phase, `None` when none here does.
+    fn host_work(
+        &self,
+        batch: &Batch,
+        pass: bool,
+        shadow: bool,
+    ) -> Result<Option<(bool, Option<u32>)>> {
+        let variant = batch.shape.variant;
+        if pass || shadow || !variant.host() || batch.media.is_empty() || alone(batch)?.is_some() {
+            return Ok(None);
         }
-        let Some(place) = self
+
+        let place = self
             .workers
             .iter()
-            .position(|worker| worker.serves(batch.phase))
-        else {
-            return Ok(());
-        };
-
-        let rank = u32::try_from(place)
-            .map_err(|_| Error::Invalid(format!("rank {place} of a group overflows a u32")))?;
-        for row in &mut batch.media {
-            row.rank = Some(rank);
-        }
-        Ok(())
+            .position(|worker| worker.serves(batch.phase));
+        let rank = place
+            .map(|place| {
+                u32::try_from(place)
+                    .map_err(|_| Error::Invalid(format!("rank {place} of a group overflows a u32")))
+            })
+            .transpose()?;
+        Ok(Some((variant.dealt(), rank)))
     }
 
     /// Whether the group's ranks can take `batch`: a rank it names is one of this node's
@@ -441,11 +459,30 @@ impl Group {
     /// in the batch's forward.
     fn hand(&self, sequence: u64, batch: Batch, pass: bool, shadow: bool) -> Result<Submission> {
         let named = if pass || shadow { None } else { alone(&batch)? };
-        let peers_pass = pass || named.is_some();
+        let host = self.host_work(&batch, pass, shadow)?;
 
-        // Host work left unnamed is no worker's here (`Group::name_host`): it runs once, on the
-        // first peer link.
-        let host = !peers_pass && !shadow && batch.shape.variant.host() && !batch.media.is_empty();
+        // Which peer links run the batch: none for a batch one rank here runs alone; for host
+        // work, every link when each process runs its own part, otherwise the first link and
+        // only when no worker here runs it; every link for any other batch.
+        let link_runs = |index: usize| match host {
+            _ if pass || named.is_some() => false,
+            Some((true, _)) => true,
+            Some((false, here)) => here.is_none() && index == 0,
+            None => true,
+        };
+
+        // Host work this node runs is named in its rows as the rank that runs it; the links take
+        // the batch as the scheduler formed it and name their own.
+        let here = host.and_then(|(_, rank)| rank);
+        let renamed = here.map(|rank| {
+            let mut own = batch.clone();
+            for row in &mut own.media {
+                row.rank = Some(rank);
+            }
+            own
+        });
+        let own = renamed.as_ref().unwrap_or(&batch);
+        let named = named.or(here);
 
         // The parts whose output counts come first, this node's before the peers': the joined
         // submission's output is its first part's.
@@ -454,7 +491,7 @@ impl Group {
         let mut passing = Vec::new();
 
         for (index, link) in self.remotes.iter().enumerate() {
-            let link_pass = peers_pass || (host && index > 0);
+            let link_pass = !link_runs(index);
             let frame = if shadow {
                 MainProcessRequest::shadow(sequence, batch.clone())
             } else {
@@ -476,8 +513,8 @@ impl Group {
                 && worker.serves(batch.phase);
 
             match (runs, shadow) {
-                (true, true) => running.push(worker.shadow(sequence, batch.clone())?),
-                (true, false) => running.push(worker.submit(sequence, batch.clone())?),
+                (true, true) => running.push(worker.shadow(sequence, own.clone())?),
+                (true, false) => running.push(worker.submit(sequence, own.clone())?),
                 (false, _) => passing.push(worker.pass(sequence)?),
             }
         }

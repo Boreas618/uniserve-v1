@@ -623,6 +623,16 @@ impl Variant {
         )
     }
 
+    /// Whether a batch of this host variant is the work of every process that holds ranks of its
+    /// group, each doing the part of it whose blocks its own ranks hold: a video encode round
+    /// reads each of its units in the run of the rank that decoded it (the decode rounds' deal,
+    /// `runner::decoder::RoundConfig`), and the process that holds that rank encodes the unit
+    /// into the unit's own encoded block there. A batch of any other host variant reads blocks
+    /// one process holds, and runs once (`crate::executor::Route`).
+    pub const fn dealt(self) -> bool {
+        matches!(self, Self::VideoEncode)
+    }
+
     /// Whether a bucket of this variant picks each row's token by taking the largest candidate
     /// rather than by drawing one.
     ///
@@ -881,8 +891,8 @@ pub struct MediaRow {
     /// The rank of the batch's worker group that runs this row when the call is that one rank's
     /// alone. `None` when every rank of the group runs its share: a video decode round, whose
     /// units are dealt to the ranks of the decoder group, in order in an even round and in reverse
-    /// in an odd one, each decoding its own, and the encode of a round, which reads its units
-    /// wherever they lie in the process.
+    /// in an odd one, each decoding its own, and the encode of a round, which each process runs
+    /// over the units its ranks decoded ([`Variant::dealt`]).
     pub rank: Option<u32>,
     /// A chat image's encoded bytes, base64, for the vision or latent encoding of a token
     /// request's image; `None` for every other row.

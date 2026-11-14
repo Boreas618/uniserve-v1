@@ -14,7 +14,7 @@
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
-use crate::batch::BatchOutput;
+use crate::batch::{BatchOutput, CallStatus};
 use storage::runtime::{GroupId, Request};
 
 use crate::worker::Error;
@@ -236,12 +236,14 @@ impl Submission {
     /// This submission and the same job's on `peers`, the other ranks of its group, as one.
     ///
     /// The ranks of a group run one job together, so it has ended when every one of them ended.
-    /// The joined outcome is this submission's, with two exceptions: a peer's failure replaces it,
-    /// because a rank that failed leaves the others' output without its part; and the requests
-    /// the ranks return are joined, one per request, each with its stamps joined (the largest
-    /// stamp each group states, the group's stamp being the largest over its ranks) and, for a
-    /// `Finish`, the copy failed when it failed on any rank. Ranks that return different
-    /// requests fail the joined outcome.
+    /// The joined outcome is this submission's, with three exceptions: a peer's failure replaces
+    /// it, because a rank that failed leaves the others' output without its part; a call a peer
+    /// that ran the batch answered as failed fails, because the rows a call advances may be
+    /// shared among the ranks that run it (a decode round's shares, a video encode's units in
+    /// each process); and the requests the ranks return are joined, one per request, each with
+    /// its stamps joined (the largest stamp each group states, the group's stamp being the
+    /// largest over its ranks) and, for a `Finish`, the copy failed when it failed on any rank.
+    /// Ranks that return different requests fail the joined outcome.
     #[must_use]
     pub(crate) fn joined(mut self, peers: Vec<Submission>) -> Self {
         self.peers = peers;
@@ -300,22 +302,38 @@ fn joined_outcome(
     own: Outcome<(BatchOutput, Vec<Request>), Fault>,
     peers: Vec<Outcome<(BatchOutput, Vec<Request>), Fault>>,
 ) -> Outcome<(BatchOutput, Vec<Request>), Fault> {
-    let Outcome::Success((output, mut requests)) = own else {
+    let Outcome::Success((mut output, mut requests)) = own else {
         return own;
     };
 
     for peer in peers {
         match peer {
-            Outcome::Success((_, returned)) => {
+            Outcome::Success((theirs, returned)) => {
                 if let Err(error) = join_requests(&mut requests, returned) {
                     let fault: Arc<Fault> = Arc::new(error);
                     return Outcome::Failed(fault);
                 }
+                join_calls(&mut output, theirs);
             }
             failed => return failed,
         }
     }
     Outcome::Success((output, requests))
+}
+
+/// Joins `other`, another rank's output of the same batch, into `output`: each call `other`
+/// answered as failed where `output` answered it as performed takes `other`'s answer. A rank
+/// that passed the batch answers no call, and leaves `output` as it is.
+fn join_calls(output: &mut BatchOutput, other: BatchOutput) {
+    if other.calls.len() != output.calls.len() {
+        return;
+    }
+
+    for (call, theirs) in output.calls.iter_mut().zip(other.calls) {
+        if call.status == CallStatus::Ok && theirs.status == CallStatus::Error {
+            *call = theirs;
+        }
+    }
 }
 
 /// Joins `other`, the requests another rank of the group returned for the same job, into

@@ -498,12 +498,29 @@ impl ModelRunner {
             Some(_) => model.warm_prompts(&serving)?,
             None => Vec::new(),
         };
+
+        // The group's first text encoder rank, by the deployment's numbering of ranks, whose
+        // product buffer holds the conditioning (`backed_kinds`): the group's first rank is
+        // this rank less its position.
+        let group = self.worker_group().with_context(|| {
+            format!("the deployment's worker groups place no rank {}", self.rank)
+        })?;
+        let position = self.position()?;
+        let first = (0..group.ranks.len())
+            .find(|&at| served_phases(group, at).contains(&Phase::TextEncode))
+            .unwrap_or(position);
+        let holder = (self.rank as usize)
+            .checked_sub(position)
+            .and_then(|start| u32::try_from(start + first).ok())
+            .context("a text encoder rank past what the protocol numbers")?;
+
         Ok(EncoderConfig {
             buckets: Buckets::new(buckets),
             width: model.text_width(),
             dtype: self.dtype(),
             patches,
             conditioning: classes[product_kind(product::CONDITIONING)?],
+            holder,
             pixels: classes[product_kind(product::VISION_PIXELS)?],
             warm,
         })
@@ -661,24 +678,27 @@ impl ModelRunner {
     /// product class, the timelines the deployment serves with their units, the decode rounds'
     /// deal, and the model's rates and media format.
     ///
+    /// The timelines are every legal timeline from the shortest to the longest the deployment
+    /// serves, which the model's clip schedule states whatever the rank places: a muxer or a
+    /// media reader in a group of its own places no denoiser, and serves the timelines the
+    /// denoising ranks serve.
+    ///
     /// # Errors
     ///
-    /// A deployment the pipeline serves no request of, or a model that states no media format.
+    /// A duration the pipeline serves no timeline of, or a model that states no media format.
     pub(crate) fn host_config(
         &self,
         model: &dyn VideoModel,
         classes: &[u8; 10],
         phases: Vec<Phase>,
     ) -> Result<HostConfig> {
-        let mut timelines: Vec<(u32, Vec<u32>)> = Vec::new();
-        for (request, _) in model.candidates(&self.video_serving()?)? {
-            if timelines
-                .iter()
-                .all(|(frames, _)| *frames != request.frames)
-            {
-                timelines.push((request.frames, model.video_units(request.frames)?));
-            }
-        }
+        // The shortest timeline is the least that lasts one frame. A frame count between the
+        // two that is no legal timeline is one `video_units` refuses.
+        let shortest = model.timeline(1.0 / f64::from(model.frame_rate().max(1)))?;
+        let longest = model.timeline(self.video_serving()?.max_seconds)?;
+        let timelines: Vec<(u32, Vec<u32>)> = (shortest..=longest)
+            .filter_map(|frames| Some((frames, model.video_units(frames).ok()?)))
+            .collect();
 
         Ok(HostConfig {
             phases,

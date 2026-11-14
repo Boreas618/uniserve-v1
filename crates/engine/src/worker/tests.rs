@@ -1763,8 +1763,11 @@ fn a_group_s_ranks_on_another_host_take_its_jobs_and_state_what_they_ended() {
         refused.contains("the runner refuses this batch"),
         "{refused}"
     );
-    let refused = failure_of(&node.submit(batch(3, UNSERVED, 2)).unwrap());
-    assert!(refused.contains("Denoise"), "{refused}");
+
+    // A batch of a phase the peer's ranks do not serve, which the group's ranks of another
+    // process would, takes its number there and answers no call.
+    let passed = output_of(&node.submit(batch(3, UNSERVED, 2)).unwrap());
+    assert!(passed.calls.is_empty());
 
     // A close the scheduler node asked for is not the loss of its peer.
     remote.close();

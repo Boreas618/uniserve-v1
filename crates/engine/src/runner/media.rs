@@ -18,9 +18,11 @@
 //!    blocks it writes that the process maps, so each backing rank of the process holds it,
 //!    waits for the copies, and answers each row.
 //!
-//! A host batch is run by one rank of its group (`crate::executor::Route`), and only its writes
-//! reach the other ranks' runs: a block a call writes is written in every run of it the process
-//! maps, and no other block is touched.
+//! A host batch is run by one rank of its group in each process that runs it
+//! (`crate::executor::Route`): a video encode in every process that holds ranks of its group,
+//! each encoding the units its own ranks decoded, and every other host batch once. Only its
+//! writes reach the other ranks' runs: a block a call writes is written in every run of it the
+//! process maps, and no other block is touched.
 //!
 //! Every block is found and checked in the first turn: a position the tables hold no entry for,
 //! a write to a read-only entry, or bytes past a block refuse the batch before any work starts.
@@ -35,7 +37,7 @@
 //! | Phase | Reads | Writes |
 //! | --- | --- | --- |
 //! | `MediaRead` | the request's condition media, published in shared memory | condition pixels, condition samples and vision pixels, those the request's conditions call for, in that order |
-//! | `VideoEncode` | the frames of its round's units, from the video units block's run on the rank that decoded each | each unit's encoding into its own encoded units block |
+//! | `VideoEncode` | the frames of the units of its round that its process's ranks decoded, from the video units block's run on the rank that decoded each | each such unit's encoding into its own encoded units block, in the runs of that block the process maps |
 //! | `AudioEncode` | the video's duration of the decoded track | nothing: the encoded track joins the request's assembly |
 //! | `Mux`, handing rounds over | the encoded units blocks of the next rounds' units, as far as each framed unit reaches | nothing: the units join the assembly |
 //! | `Mux`, final | nothing | nothing: the call's output carries the artifact |
@@ -43,7 +45,9 @@
 //! A round is the width of [`HostConfig::round`] in units of the timeline: a video encode covers
 //! the round from its row's `unit`, and a muxing call hands over its row's `rounds` rounds after
 //! the units the assembly holds. The decoder group's ranks decode a round's units by that deal,
-//! each into its own run of the video units block, so the encode reads each unit's frames there.
+//! each into its own run of the video units block, so the encode of each process reads the
+//! frames of the units its ranks decoded there, and a unit's encoded block is written in the
+//! process that decoded it, from which a crossing carries it to the muxer's when the two differ.
 //!
 //! ## What the blocks hold
 //!
@@ -333,8 +337,12 @@ impl MediaHost {
 
             Phase::VideoEncode => {
                 let units = self.units(row.frames)?;
-                let width = self.config.round.width();
-                let frames = units[self.round(units, row.unit, width)?].to_vec();
+                let round = self.round(units, row.unit, self.config.round.width())?;
+                let frames: Vec<u32> = self
+                    .decoded_here(round)
+                    .into_iter()
+                    .map(|unit| units[unit])
+                    .collect();
                 let (height, width, rate) = (row.height, row.width, self.config.frame_rate);
 
                 Box::new(move || Ok((encode_units(&input, &frames, height, width, rate)?, None)))
@@ -457,13 +465,15 @@ impl MediaHost {
                     return Err(mismatched());
                 }
 
-                // Each unit's frames from the run of the rank that decoded them, one after
-                // another: the round's frames in timeline order.
+                // The units this process's ranks decoded, each unit's frames from the run of the
+                // rank that decoded them, one after another in timeline order; the units of the
+                // round another process decoded are that process's to encode.
                 let frame = u64::from(height) * u64::from(width) * 3;
                 let decoded = tables.runs(row.slot, class(&self.config, VIDEO_UNITS)?, *frames_at);
-                let read = round
-                    .clone()
-                    .map(|unit| {
+                let here = self.decoded_here(round.clone());
+                let read = here
+                    .iter()
+                    .map(|&unit| {
                         let rank = u32::try_from(unit)
                             .ok()
                             .and_then(|unit| self.config.round.rank_of(unit));
@@ -481,9 +491,11 @@ impl MediaHost {
                     })
                     .collect::<Result<Vec<_>>>()?;
 
-                let rows = round
-                    .zip(writes)
-                    .map(|(unit, &encoded_at)| {
+                // Each unit encoded here into its own block's runs in this process.
+                let rows = here
+                    .iter()
+                    .map(|&unit| {
+                        let encoded_at = writes[unit - round.start];
                         let runs = self.written(tables, row.slot, ENCODED_UNITS, encoded_at)?;
                         self.spans(&runs, 0, encoded(units, unit..unit + 1, height, width))
                     })
@@ -609,6 +621,21 @@ impl MediaHost {
         }
 
         Ok(first..first.saturating_add(count as usize).min(units.len()))
+    }
+
+    /// The units of `round`, a video encode's, that ranks of this process decoded, in timeline
+    /// order: those the decode rounds' deal gives to a rank whose product buffer the rank's
+    /// memory reaches. The process encodes them, and each other process the units its own ranks
+    /// decoded ([`crate::batch::Variant::dealt`]).
+    fn decoded_here(&self, round: Range<usize>) -> Vec<usize> {
+        round
+            .filter(|&unit| {
+                let rank = u32::try_from(unit)
+                    .ok()
+                    .and_then(|unit| self.config.round.rank_of(unit));
+                rank.is_some_and(|rank| self.memory.reaches(rank))
+            })
+            .collect()
     }
 
     /// The units a muxing call of `row` hands over: its rounds after the units the request's
@@ -1631,9 +1658,9 @@ mod tests {
     }
 
     /// The completions that attach the request in `SLOT` and give it its video units, encoded
-    /// units and audio samples blocks one after another from unit 0 of the product buffer of
-    /// each of `ranks` ranks, with the requests they answer.
-    fn admission(ranks: usize) -> Vec<(u32, Request, Completion)> {
+    /// units and audio samples blocks one after another from unit 0 of each of `regions`, the
+    /// product buffers of the ranks of a process, with the requests they answer.
+    fn admission(regions: &[u8]) -> Vec<(u32, Request, Completion)> {
         let attach = Request::Attach {
             owner: OWNER,
             group: GROUP,
@@ -1656,7 +1683,7 @@ mod tests {
                 units,
             };
             let allocated = Completion::Allocated {
-                runs: PRODUCTS[..ranks]
+                runs: regions
                     .iter()
                     .map(|&region| (region, first, units))
                     .collect(),
@@ -1732,7 +1759,7 @@ mod tests {
             &media,
         );
         let mut tables = tables(0).with_peers(&PRODUCTS);
-        for (slot, request, completion) in admission(2) {
+        for (slot, request, completion) in admission(&PRODUCTS) {
             tables
                 .map(slot, runtime::RequestId(1), &request, &completion)
                 .unwrap();
@@ -1834,7 +1861,7 @@ mod tests {
         };
         let host = MediaHost::new(config, kernels(), Arc::new(own), None, pool, media).unwrap();
         let mut tables = tables(0).with_peers(&PRODUCTS);
-        for (slot, request, completion) in admission(2) {
+        for (slot, request, completion) in admission(&PRODUCTS) {
             tables
                 .map(slot, runtime::RequestId(1), &request, &completion)
                 .unwrap();
@@ -1853,6 +1880,73 @@ mod tests {
             transfers[0].0,
             [(PRODUCTS[0], 0, first), (PRODUCTS[1], first, second)]
         );
+    }
+
+    #[test]
+    fn a_video_encode_in_each_process_encodes_the_units_its_ranks_decoded_into_their_blocks() {
+        let (pool, media) = (pool(), runner());
+        let [video, encoded, _] = blocks();
+        let units = held();
+
+        // The round's two units are dealt to rank 0, of one process, and rank 1, of another:
+        // each process maps the runs of its own rank alone.
+        let mut config = config(&[Phase::VideoEncode]);
+        config.round = RoundConfig {
+            ranks: vec![0, 1],
+            units: 1,
+        };
+        let encode = batch(
+            1,
+            Phase::VideoEncode,
+            vec![row(vec![VIDEO_AT, ENCODED_AT[0], ENCODED_AT[1]], 1)],
+        );
+        let buffer = vec![0_u8; (u64::from(units) * UNIT_BYTES) as usize];
+        let frame = u64::from(SIDE * SIDE * 3);
+        let rows = [0, 1].map(|unit| (u64::from(video + unit * encoded) * UNIT_BYTES) as usize);
+
+        for rank in 0..2 {
+            let memory = Arc::new(memory(rank, units));
+            let (pool, media) = (Arc::clone(&pool), Arc::clone(&media));
+            let mut host =
+                MediaHost::new(config.clone(), kernels(), memory, None, pool, media).unwrap();
+            let mut tables = tables(rank);
+            for (slot, request, completion) in admission(&PRODUCTS[rank..=rank]) {
+                tables
+                    .map(slot, runtime::RequestId(1), &request, &completion)
+                    .unwrap();
+            }
+
+            // The process's rank decoded its unit into its own run, after the earlier units'
+            // frames.
+            let mut mirrors: HashMap<u8, Vec<u8>> = [(PRODUCTS[rank], buffer.clone())].into();
+            let before = frames(&UNITS[..rank]) * frame;
+            let bytes = u64::from(UNITS[rank]) * frame;
+            let decoded = mirrors.get_mut(&PRODUCTS[rank]).unwrap();
+            decoded[before as usize..(before + bytes) as usize].fill(0x40);
+
+            // It reads that unit's frames alone, and writes that unit's block alone.
+            let transfers = host.transfers(&encode, &tables).unwrap();
+            assert_eq!(transfers[0].0, [(PRODUCTS[rank], before, bytes)]);
+            let produced = perform(&mut host, &tables, &mut mirrors, &encode);
+            assert_eq!(
+                produced[0].0.len(),
+                1,
+                "rank {rank}'s process encodes one unit"
+            );
+
+            let mirror = &mirrors[&PRODUCTS[rank]];
+            let length = |at: usize| u64::from_ne_bytes(mirror[at..at + 8].try_into().unwrap());
+            assert!(
+                length(rows[rank]) > 0,
+                "unit {rank}'s block holds its encoding"
+            );
+            assert_eq!(
+                length(rows[1 - rank]),
+                0,
+                "unit {} is the other process's to encode",
+                1 - rank
+            );
+        }
     }
 
     /// A runner of the device phase `Decode`, which answers each request of a batch.
@@ -1936,7 +2030,7 @@ mod tests {
             .collect();
 
         let route = Route::new(vec![sequences], workers, Vec::new()).unwrap();
-        for (slot, request, completion) in admission(ranks) {
+        for (slot, request, completion) in admission(&PRODUCTS[..ranks]) {
             returned(
                 route
                     .map(GROUP, slot, runtime::RequestId(1), request, completion)

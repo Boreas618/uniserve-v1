@@ -18,8 +18,8 @@
 # The gb200-8 deployments span two four-GPU hosts, rank-0 and rank-1: the
 # throughput servers place one Ulysses4 replica on each host
 # (fasth3-ulysses4x2-two-host.toml), and the latency servers one Ulysses8
-# replica across both (ulysses8-two-host.toml), which is refused at startup
-# because its products would pass between the hosts (docs/minimax_h3/minimax_h3.md, Two hosts).
+# replica across both (ulysses8-two-host.toml), whose products the hosts'
+# Storage Servers copy between them (docs/minimax_h3/minimax_h3.md, Two hosts).
 # The evaluator starts the leader on rank-0, which waits for rank-1's daemon
 # at UNISERVE_DIST_INIT_ADDR (rank-0's address and a free port, HOST:PORT);
 # start `$UNISERVE_EXECUTABLE serve --nnodes 2 --node-rank 1 --dist-init-addr
@@ -308,8 +308,7 @@ videos_per_second = "higher"
 "video_latency_ms.p50" = "lower"
 "video_latency_ms.p95" = "lower"
 
-# One Ulysses8 replica across both hosts: refused at startup, since its
-# products would pass between the hosts (docs/minimax_h3/minimax_h3.md, Two hosts).
+# One Ulysses8 replica across both hosts.
 [servers.gb200-8-bf16-latency]
 host = "127.0.0.1"
 port = 18083
@@ -481,8 +480,7 @@ videos_per_second = "higher"
 "video_latency_ms.p50" = "lower"
 "video_latency_ms.p95" = "lower"
 
-# One Ulysses8 replica across both hosts: refused at startup, since its
-# products would pass between the hosts (docs/minimax_h3/minimax_h3.md, Two hosts).
+# One Ulysses8 replica across both hosts.
 [servers.gb200-8-nvfp4-latency]
 host = "127.0.0.1"
 port = 18083

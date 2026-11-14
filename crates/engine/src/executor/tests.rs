@@ -199,6 +199,44 @@ fn decode(id: u64, rows: u32) -> Batch {
     }
 }
 
+/// Host batch `id` of `phase`, launched as `variant`, on `group`: one row of one request, which
+/// names no rank and reads one result and writes another.
+pub(crate) fn host_batch(id: u64, group: GroupId, phase: Phase, variant: Variant) -> Batch {
+    let row = crate::batch::MediaRow {
+        request: RequestId(9),
+        slot: 1,
+        conditioning: Vec::new(),
+        step: 0,
+        steps: 1,
+        seed: 0,
+        width: 16,
+        height: 16,
+        frames: 17,
+        rounds: 0,
+        unit: 0,
+        rank: None,
+        image: None,
+        results: vec![0, 1],
+        reads: 1,
+    };
+    Batch {
+        id: BatchId(id),
+        group,
+        phase,
+        generation: 1,
+        shape: Shape {
+            rows: 1,
+            tokens: 0,
+            variant,
+            extent: crate::batch::Extent::None,
+        },
+        requests: vec![row.request],
+        columns: Columns::default(),
+        media: vec![row],
+        new_slots: Vec::new(),
+    }
+}
+
 /// Holds `rank` inside a control operation until the returned sender is dropped; returns once
 /// the operation is in flight.
 fn hold(rank: &crate::worker::Worker) -> Sender<()> {
@@ -441,4 +479,23 @@ fn a_shadow_pass_shadows_each_shape_once_and_answers_once_its_shadow_batches_end
         .collect();
     assert_eq!(outputs, [1, 2, 3, 4, 5]);
     assert_eq!(*lock(&shadowed), [1, 3]);
+}
+
+/// A peer's process none of whose ranks serves a video encode round takes the round's number
+/// and passes it: ranks of other processes decoded its units. Host work the scheduler node
+/// handed it to run once is refused, as nothing here runs it.
+#[test]
+fn a_peer_passes_a_video_encode_its_ranks_do_not_serve_and_refuses_host_work_it_must_run() {
+    let (route, _) = node(1, &Arc::default());
+
+    let encode = host_batch(1, GROUP, Phase::VideoEncode, Variant::VideoEncode);
+    let submission = route.run(1, encode, false, false).unwrap();
+    let Some(Outcome::Success((output, _))) = submission.wait_timeout(LONG) else {
+        panic!("the encode was not passed");
+    };
+    assert!(output.calls.is_empty());
+    assert_eq!(route.completed(GROUP).unwrap(), 1);
+
+    let track = host_batch(2, GROUP, Phase::AudioEncode, Variant::AudioEncode);
+    assert!(route.run(2, track, false, false).is_err());
 }

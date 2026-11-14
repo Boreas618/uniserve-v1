@@ -5,7 +5,10 @@
 //! media row per request naming its results as positions in the request's product table: the
 //! products the call reads, then the conditioning it writes. Once the encode has run, each
 //! prompt's rows of its `[tokens, width]` output are copied into the conditioning block the
-//! rank's tables hold at that position, of the conditioning's class.
+//! rank's tables hold at that position, of the conditioning's class. The block's one run lies in
+//! the product buffer of the group's first text encoder rank ([`EncoderConfig::holder`]): every
+//! rank of that rank's process writes the same rows there, and a rank of another process, which
+//! holds no entry of the block, writes none.
 //!
 //! ## Captured and eager encodes
 //!
@@ -75,6 +78,12 @@ pub(crate) struct EncoderConfig {
     pub patches: Option<PatchFormat>,
     /// The class of the conditioning product, which a row writes.
     pub conditioning: u8,
+    /// The rank index (the deployment's rank, as the rank's media memory numbers ranks) of the
+    /// group's first text encoder rank, whose product buffer holds an encode's conditioning in
+    /// one run. Every text encoder rank of its process computes the same rows and writes them
+    /// there; a rank of another process writes none, and a crossing brings the block to its
+    /// process once the encode's output was applied.
+    pub holder: u32,
     /// The class of the vision pixels product, which a prompt with vision blocks reads.
     pub pixels: u8,
     /// The prompts with vision blocks the deployment admits whose grids it fixes
@@ -322,6 +331,7 @@ impl EncoderRunner {
         let row_bytes = width as u64 * element_bytes(dtype)?;
         let mut copies = Vec::with_capacity(batch.media.len());
         let mut images = Vec::new();
+        let writes = self.memory.reaches(self.config.holder);
 
         for (index, row) in batch.media.iter().enumerate() {
             let reads = row.reads as usize;
@@ -340,19 +350,21 @@ impl EncoderRunner {
             };
 
             let tokens = end.saturating_sub(first) as usize;
-            let block = self.memory.lend(
-                tables,
-                (row.slot, self.config.conditioning, written),
-                true,
-                0,
-                &[tokens, width],
-                dtype,
-            )?;
-            copies.push((
-                u64::from(first) * row_bytes,
-                address(&block)?,
-                tokens as u64 * row_bytes,
-            ));
+            if writes {
+                let block = self.memory.lend(
+                    tables,
+                    (row.slot, self.config.conditioning, written),
+                    true,
+                    0,
+                    &[tokens, width],
+                    dtype,
+                )?;
+                copies.push((
+                    u64::from(first) * row_bytes,
+                    address(&block)?,
+                    tokens as u64 * row_bytes,
+                ));
+            }
 
             // A prompt that presents vision blocks reads their patch rows first.
             let grids = vision_grids(&row.conditioning)?;
@@ -710,9 +722,10 @@ mod tests {
         }
     }
 
-    /// A runner over graphs that hold no device with an encode bucket of one row of eight
-    /// tokens and one of two rows of sixteen, both captured.
-    fn runner() -> EncoderRunner {
+    /// A runner of rank 0 over graphs that hold no device with an encode bucket of one row of
+    /// eight tokens and one of two rows of sixteen, both captured, writing conditionings in the
+    /// product buffer of rank `holder`.
+    fn runner(holder: u32) -> EncoderRunner {
         let config = EncoderConfig {
             buckets: Buckets::new([
                 Bucket::prefill(1, 8, Variant::Encode),
@@ -722,6 +735,7 @@ mod tests {
             dtype: DType::BF16,
             patches: None,
             conditioning: CONDITIONING,
+            holder,
             pixels: PIXELS,
             warm: Vec::new(),
         };
@@ -846,7 +860,7 @@ mod tests {
 
     #[test]
     fn a_batch_s_prompts_are_encoded_into_the_conditioning_blocks_its_rows_name() {
-        let mut runner = runner();
+        let mut runner = runner(0);
         let (tables, batch) = (tables(false), encoding(3));
 
         // The two prompts ride the two-row bucket, captured.
@@ -873,6 +887,29 @@ mod tests {
         // the batch.
         assert!(runner.place(&encoding(4), &tables).is_err());
         assert!(runner.place(&batch, &self::tables(true)).is_err());
+    }
+
+    /// A text encoder rank of another process than the group's first, whose product buffer holds
+    /// the conditioning, takes part in the encode and writes no conditioning: its tables hold no
+    /// entry of the block, which a crossing brings to its process afterwards.
+    #[test]
+    fn a_rank_of_another_process_than_the_conditioning_s_encodes_and_writes_none() {
+        let runner = runner(4);
+        let mut tables =
+            BlockTables::new(GROUP, &[SLOTS, PRODUCTS], &[(SLOTS, 256), (PRODUCTS, 256)]);
+        for slot in [1, 2] {
+            let attach = Request::Attach {
+                owner: OwnerId(u64::from(slot)),
+                group: GROUP,
+            };
+            let attached = Completion::Attached { slot };
+            let id = storage::runtime::RequestId(0);
+            tables.map(slot, id, &attach, &attached).unwrap();
+        }
+
+        let (bucket, copies) = runner.place(&encoding(3), &tables).unwrap();
+        assert_eq!(bucket, Bucket::prefill(2, 16, Variant::Encode));
+        assert!(copies.is_empty());
     }
 
     /// An encoder that records the grids and the prompt length of each encode it is given.
@@ -939,6 +976,7 @@ mod tests {
             dtype: DType::BF16,
             patches: Some(patches),
             conditioning: CONDITIONING,
+            holder: 0,
             pixels: PIXELS,
             warm,
         };
@@ -993,6 +1031,6 @@ mod tests {
         }
 
         // An encoder that takes no image states no eager bucket.
-        assert!(self::runner().eager_buckets().is_empty());
+        assert!(self::runner(0).eager_buckets().is_empty());
     }
 }

@@ -1067,6 +1067,7 @@ fn mapped(
 mod tests {
     use super::*;
     use crate::batch::{Batch, BatchId, BatchOutput, Capacity, Columns, Phase, Shape, Variant};
+    use crate::executor::tests::host_batch;
     use storage::protocol::{Location, Segment, UnitRun};
     use storage::runtime::{Region, RequestId, Tier, VERSION};
 
@@ -1377,6 +1378,85 @@ mod tests {
 
         remote.close();
         peer.join().expect("the peer");
+    }
+
+    /// A video encode round is the work of every process that holds ranks of its group, each
+    /// encoding the units its ranks decoded: a node that holds none of the group's ranks hands
+    /// it to both peers to run, its rows naming no rank, and a row one peer failed fails. Any
+    /// other host batch runs once, on the first peer, and the second passes it.
+    #[test]
+    fn a_video_encode_runs_in_every_process_and_another_host_batch_in_the_first_alone() {
+        let (liveness, _called) = liveness();
+
+        // Each peer runs or passes each batch as the node hands it; the second fails its part of
+        // every row it runs.
+        let peer = |failing: bool, expected: [(u64, bool); 2]| {
+            move |mut channel: Connection| {
+                for (sequence, pass) in expected {
+                    let MainProcessRequest::Submit {
+                        message_id,
+                        sequence: handed,
+                        pass: passed,
+                        batch,
+                    } = next_request(&mut channel)
+                    else {
+                        panic!("the scheduler node sent no batch");
+                    };
+                    assert_eq!((handed, passed), (sequence, pass));
+                    assert!(batch.media.iter().all(|row| row.rank.is_none()));
+
+                    let mut call = crate::runner::performed();
+                    if failing {
+                        call.status = crate::batch::CallStatus::Error;
+                        call.error_code = Some(crate::batch::ErrorCode::ComputeError);
+                    }
+                    let calls = if pass { Vec::new() } else { vec![call] };
+                    let output = BatchOutput {
+                        calls,
+                        ..BatchOutput::default()
+                    };
+                    let ended = MainProcessResponse::result(output, &[], sequence);
+                    answer(&mut channel, message_id, ended);
+                }
+                assert!(matches!(
+                    next_request(&mut channel),
+                    MainProcessRequest::Close { .. }
+                ));
+            }
+        };
+        let (first, first_peer) = linked(
+            1,
+            3,
+            Arc::clone(&liveness),
+            peer(false, [(1, false), (2, false)]),
+        );
+        let (second, second_peer) = linked(2, 3, liveness, peer(true, [(1, false), (2, true)]));
+        let sequences = Sequences::new(GROUP, 2, Vec::new());
+        let links = vec![
+            (vec![GROUP], Arc::clone(&first)),
+            (vec![GROUP], Arc::clone(&second)),
+        ];
+        let route = Route::new(vec![Arc::clone(&sequences)], Vec::new(), links).expect("the route");
+
+        let encode = host_batch(1, GROUP, Phase::VideoEncode, Variant::VideoEncode);
+        let Outcome::Success((encoded, _)) = route.submit(encode).expect("handed").wait() else {
+            panic!("the encode failed");
+        };
+        assert_eq!(encoded.calls.len(), 1);
+        assert_eq!(encoded.calls[0].status, crate::batch::CallStatus::Error);
+
+        let track = host_batch(2, GROUP, Phase::AudioEncode, Variant::AudioEncode);
+        let Outcome::Success((muxed, _)) = route.submit(track).expect("handed").wait() else {
+            panic!("the audio encode failed");
+        };
+        assert_eq!(muxed.calls.len(), 1);
+        assert_eq!(muxed.calls[0].status, crate::batch::CallStatus::Ok);
+        assert_eq!(sequences.completed(), 2);
+
+        first.close();
+        second.close();
+        first_peer.join().expect("the first peer");
+        second_peer.join().expect("the second peer");
     }
 
     #[test]

@@ -575,6 +575,42 @@ fn a_decode_waits_for_the_last_step_s_output_where_a_decoder_rank_does_not_denoi
     }
 }
 
+/// A latent preparation follows the text encoding on its group once the encoding is scheduled
+/// only when every rank that prepares latents encodes text too: its worker runs the encode ahead
+/// of the preparation, and every text encoder rank of the conditioning's process writes the same
+/// rows into the conditioning's one run, so the preparation reads after its own rank's write. A
+/// rank that prepares latents and encodes no text passes the encode's batch, and nothing orders
+/// the first text encoder rank's write before its read, so the preparation then waits for the
+/// encode's output (SD §3.3). While the encode is held on the device, a group whose two ranks
+/// both encode text prepares, and one whose second rank only denoises does not.
+#[test]
+fn a_latent_preparation_waits_for_the_encode_s_output_where_a_denoising_rank_encodes_no_text() {
+    // The blocks as a deployment names them (`nn::family::Stage::{Transformer, TextEncoder}`).
+    const DENOISER_BLOCK: &str = "transformer";
+    const TEXT_BLOCK: &str = "text_encoder";
+    for (encoders, follows) in [(vec![0, 1], true), (vec![0], false)] {
+        let mut harness = Deployment::video(&[&VIDEO_PHASES])
+            .ranks(0, 2)
+            .block(0, DENOISER_BLOCK, BlockConfig::parallel(vec![0, 1]))
+            .block(0, TEXT_BLOCK, BlockConfig::parallel(encoders))
+            .build();
+        let id = harness.submit_video(video(1, 1));
+
+        // The encode is submitted and stays on the device.
+        harness.fake.hold();
+        harness.run_until(20, |harness| {
+            !harness.media_rows(id, Phase::TextEncode).is_empty()
+        });
+        harness.run(5);
+        let prepared = !harness.media_rows(id, Phase::LatentPrepare).is_empty();
+        assert_eq!(prepared, follows, "follows: {follows}");
+
+        harness.fake.resume();
+        harness.settle(200);
+        completed(&harness, id);
+    }
+}
+
 /// A video request holds every product block from its admission, one `Allocate` per declared
 /// result at its position for its owner, sized from the bytes its captured shape states for the
 /// product's kind, and asks for no block after it: the low watermark of SD §4.4 is a token

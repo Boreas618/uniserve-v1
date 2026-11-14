@@ -6,10 +6,12 @@
 //! with a launch of the Qwen3-MoE fixture on one rank of one group, `device = "meta"`: the
 //! engine says hello and `Starting`, claims the node's Storage Server, starts its rank, opens
 //! its session, resolves its policy and serves; it takes a request, states its metrics, and
-//! exits with status 0 once shut down, its session closed. Two more start an epoch of two
+//! exits with status 0 once shut down, its session closed. The others start an epoch of two
 //! processes of this host standing for two hosts, each with a Storage Server of its own: a text
-//! group with a rank on each, and a released FastH3 checkpoint (which the repository does not
-//! hold, so that case is ignored by default) with a replica on each.
+//! group with a rank on each; and released media checkpoints (which the repository does not
+//! hold, so those cases are ignored by default) as the two-host files of `configs/minimax_h3/`
+//! place them, a replica on each host, and one replica across both whose products cross between
+//! the two processes.
 //!
 //! No GPU is touched. The Build Server builds the `fcfs` module from its installed snapshot and
 //! precompiles it with the engine executable under test (`uniserve-engine precompile`).
@@ -449,21 +451,27 @@ fn two_host_launch(directory: &Path, build_server: &Path, host: &str, world: Wor
 /// The released FastH3 checkpoint a media launch serves, loaded from its shard headers alone.
 const FAST_H3: &str = "/workspace/models/FastVideo-FastH3-8-Step-V2";
 
-/// The launch of the main process of host `host` in an epoch that serves [`FAST_H3`] as
-/// `configs/minimax_h3/fasth3-ulysses4x2-two-host.toml` places it: on each of hosts `rank-0` and
-/// `rank-1`, four devices that hold a text encoder replica and a denoising replica. The meta
-/// device, one scheduler, square videos of the shortest timeline and prompts of up to 256 tokens;
-/// engine 1 (the scheduler node, `rank-0`) or 2 (its peer, `rank-1`), each serving from the first
-/// rank its host holds. Both hosts are this one, each process with sockets of its own in
-/// `directory` and a Storage Server of its own.
+/// The base MiniMax-H3 release, loaded from its shard headers alone: its dense denoiser takes an
+/// eight-way Ulysses split of the shortest timeline, which the sparse attention of the FastH3
+/// exports refuses in the profile run, as it composes rows in blocks the split does not leave
+/// whole.
+const MINIMAX_H3: &str = "/workspace/models/MiniMax-H3";
+
+/// The launch of the main process of host `host` in an epoch that serves `checkpoint` as `file`,
+/// a deployment file of `configs/minimax_h3/`, places it on hosts `rank-0` and `rank-1`, four
+/// devices each. The meta device, one scheduler, square videos of the shortest timeline and
+/// prompts of up to 256 tokens; engine 1 (the scheduler node, `rank-0`) or 2 (its peer,
+/// `rank-1`), each serving from the first rank its host holds. Both hosts are this one, each
+/// process with sockets of its own in `directory` and a Storage Server of its own.
 fn media_two_host_launch(
     directory: &Path,
     build_server: &Path,
+    (file, checkpoint): (&str, &str),
     host: &str,
     world: World,
 ) -> EngineArgs {
     let mut launch = launch(directory, build_server);
-    let file = workspace().join("configs/minimax_h3/fasth3-ulysses4x2-two-host.toml");
+    let file = workspace().join("configs/minimax_h3").join(file);
     let text = std::fs::read_to_string(file).unwrap();
     let groups = WorkerGroupConfig::parse_file(&text, "rank-0").unwrap();
     let hosts: Vec<&str> = groups
@@ -475,7 +483,7 @@ fn media_two_host_launch(
     launch.rank = u32::try_from(hosts.iter().position(|held| *held == host).unwrap()).unwrap();
 
     let config = &mut launch.engine_config;
-    config.model.model = FAST_H3.to_owned();
+    config.model.model = checkpoint.to_owned();
     config.model.max_model_len = 256;
     config.parallel.engine_host = "rank-0".to_owned();
     config.parallel.worker_groups = groups;
@@ -658,14 +666,14 @@ fn an_epoch_of_two_processes_of_one_host_standing_for_two_hosts_serves_and_shuts
     both_shut_down(&mut a, &mut b, storage, head.epoch);
 }
 
-/// A media epoch whose two replicas each lie on one of two hosts, as
-/// `configs/minimax_h3/fasth3-ulysses4x2-two-host.toml` places them, passes no product between
-/// its two processes: the scheduler node and its peer each start their own host's ranks, and
-/// both serve.
-#[test]
-#[ignore = "reads the headers of a released FastH3 checkpoint, which the repository does not hold"]
-fn a_media_epoch_whose_replicas_lie_on_two_hosts_serves_and_shuts_down() {
-    assert!(Path::new(FAST_H3).is_dir(), "{FAST_H3} is missing");
+/// Starts an epoch of two processes of this host standing for hosts `rank-0` and `rank-1` that
+/// serves `deployment`, a deployment file of `configs/minimax_h3/` and the checkpoint it places,
+/// the scheduler node serving from rank 0 and its peer from `peer_rank`, the first rank of
+/// `rank-1`; reads both to `Serving`, each holding its session on its own host's Storage Server,
+/// and shuts the epoch down in order.
+fn media_epoch_serves_and_shuts_down(deployment: (&str, &str), peer_rank: u32) {
+    let checkpoint = deployment.1;
+    assert!(Path::new(checkpoint).is_dir(), "{checkpoint} is missing");
     let directory = tempfile::tempdir().unwrap();
     let (here, there) = (directory.path().join("a"), directory.path().join("b"));
     std::fs::create_dir_all(&here).unwrap();
@@ -675,14 +683,11 @@ fn a_media_epoch_whose_replicas_lie_on_two_hosts_serves_and_shuts_down() {
 
     let reserved = Reserved::new();
     let inherited = reserved.inherited();
-    let head = media_two_host_launch(
-        &here,
-        &build_server,
-        "rank-0",
-        reserved.world(Some(inherited)),
-    );
-    let peer = media_two_host_launch(&there, &build_server, "rank-1", reserved.world(None));
-    assert_eq!((head.rank, peer.rank), (0, 4));
+    let world = reserved.world(Some(inherited));
+    let head = media_two_host_launch(&here, &build_server, deployment, "rank-0", world);
+    let world = reserved.world(None);
+    let peer = media_two_host_launch(&there, &build_server, deployment, "rank-1", world);
+    assert_eq!((head.rank, peer.rank), (0, peer_rank));
 
     let mut a = started(
         &here,
@@ -697,4 +702,34 @@ fn a_media_epoch_whose_replicas_lie_on_two_hosts_serves_and_shuts_down() {
 
     let storage = [(&storage_a, head.engine), (&storage_b, peer.engine)];
     both_shut_down(&mut a, &mut b, storage, head.epoch);
+}
+
+/// A media epoch whose two replicas each lie on one of two hosts, as
+/// `configs/minimax_h3/fasth3-ulysses4x2-two-host.toml` places them, passes no product between
+/// its two processes: the scheduler node and its peer each start their own host's ranks, and
+/// both serve.
+#[test]
+#[ignore = "reads the headers of a released FastH3 checkpoint, which the repository does not hold"]
+fn a_media_epoch_whose_replicas_lie_on_two_hosts_serves_and_shuts_down() {
+    media_epoch_serves_and_shuts_down(("fasth3-ulysses4x2-two-host.toml", FAST_H3), 4);
+}
+
+/// A media epoch whose one Ulysses8 replica spans two hosts, as
+/// `configs/minimax_h3/ulysses8-two-host.toml` places it, carries the products one host's ranks
+/// write and the other's read between its processes: the scheduler node, which holds ranks 0 to
+/// 3 of the `model` group and the `muxer` and `reader` groups, and its peer, which holds ranks 4
+/// to 7, both start and serve.
+#[test]
+#[ignore = "reads the headers of the released MiniMax-H3 checkpoint, which the repository does not hold"]
+fn a_media_epoch_whose_replica_spans_two_hosts_serves_and_shuts_down() {
+    media_epoch_serves_and_shuts_down(("ulysses8-two-host.toml", MINIMAX_H3), 4);
+}
+
+/// The two-host reference deployment, `configs/minimax_h3/ulysses8-reference-two-host.toml`,
+/// whose text encoder lies on `rank-0`'s four devices and whose latent encoder deals condition
+/// units to `rank-1`'s first: both processes start and serve.
+#[test]
+#[ignore = "reads the headers of the released MiniMax-H3 checkpoint, which the repository does not hold"]
+fn the_two_host_reference_epoch_serves_and_shuts_down() {
+    media_epoch_serves_and_shuts_down(("ulysses8-reference-two-host.toml", MINIMAX_H3), 4);
 }
