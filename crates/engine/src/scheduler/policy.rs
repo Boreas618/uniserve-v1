@@ -7,7 +7,7 @@
 //! allocated, packed as `ptr << 32 | len` (`0` for none), or for `route` and `place` the chosen
 //! index itself (`scheduling::wire`). Every export the host enters, the two buffer exports
 //! included, starts with a fuel budget of its own, so a policy that loops ends its call instead
-//! of the step; `init`'s grows with the snapshot it decodes.
+//! of the step; a call's budget grows with the message it decodes.
 //!
 //! The policy holds the view, and the scheduler tells it what changed as events (§5.2); the host
 //! keeps the view of each request the policy holds as those events leave it, so that a request
@@ -157,15 +157,19 @@ pub fn load(bytes: &[u8]) -> Result<Module, PolicyError> {
 /// bound on one that never returns.
 pub(super) const DEFAULT_CALL_FUEL: u64 = 10_000_000;
 
-/// The fuel `init` is given beyond [`DEFAULT_CALL_FUEL`] for every byte of its message.
+/// The fuel a call is given beyond [`DEFAULT_CALL_FUEL`] for every byte of its message.
 ///
-/// The snapshot states every request and every cached block, so decoding it grows with the cache:
-/// typed JSON decoding in a wasm32 module costs 50 to 100 fuel a byte, and the packaged `fcfs`
-/// spends about 70 a byte of cached blocks on its whole `init`. Twice the decoding's dearest leaves
-/// a policy as much again for its own state, so a policy instantiates on a warm cache of any size,
-/// and the bound still ends an `init` that never returns. No other call grows with the state: the
-/// events of a step cost what the step changed.
-const INIT_FUEL_PER_BYTE: u64 = 200;
+/// A message can state every cached block: `init`'s snapshot states every request and every
+/// cached block, and the events of the step after the scheduler's startup `Listing` state each
+/// block it lists as a `Cached` page, which a scheduler that starts beside a warm cache (an
+/// epoch's target of the same layout maps the serving epoch's regions) learns after its policy
+/// was instantiated. Decoding such a message grows with the cache: typed JSON decoding in a
+/// wasm32 module costs 50 to 100 fuel a byte, and the packaged `fcfs` spends about 70 a byte of
+/// cached blocks on its whole `init`. Twice the decoding's dearest leaves a policy as much again
+/// for its own state, so a policy instantiates on, and observes, a warm cache of any size, and
+/// the bound still ends a call that never returns. A step's other events cost what the step
+/// changed, and its other messages are small, so their budget stays near [`DEFAULT_CALL_FUEL`].
+const MESSAGE_FUEL_PER_BYTE: u64 = 200;
 
 /// The longest starvation bound a policy may declare (`limits().timeout`), as `sched_ext` caps
 /// `timeout_ms` at 30 seconds.
@@ -638,7 +642,7 @@ impl Instance {
             .map_err(|error| malformed(call, format!("cannot write the message: {error}")))?;
 
         let buffer = (ptr, len);
-        let budget = budget(call, len);
+        let budget = budget(len);
         let store = &mut self.store;
         let result = match call {
             Call::Init => enter(store, call, &self.init, buffer, budget, fuel)?,
@@ -769,15 +773,10 @@ fn start(
     Ok((instance, limits))
 }
 
-/// The fuel the export of `call` is entered with for a message of `len` bytes:
-/// [`DEFAULT_CALL_FUEL`], and for `init` [`INIT_FUEL_PER_BYTE`] more for each byte of its snapshot.
-fn budget(call: Call, len: u32) -> u64 {
-    match call {
-        Call::Init => {
-            DEFAULT_CALL_FUEL.saturating_add(INIT_FUEL_PER_BYTE.saturating_mul(u64::from(len)))
-        }
-        _ => DEFAULT_CALL_FUEL,
-    }
+/// The fuel an export is entered with for a message of `len` bytes: [`DEFAULT_CALL_FUEL`], and
+/// [`MESSAGE_FUEL_PER_BYTE`] more for each byte of the message.
+fn budget(len: u32) -> u64 {
+    DEFAULT_CALL_FUEL.saturating_add(MESSAGE_FUEL_PER_BYTE.saturating_mul(u64::from(len)))
 }
 
 /// Enters one export with a fresh fuel budget of `budget`, adds what it consumed to `fuel`, and

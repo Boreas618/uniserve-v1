@@ -1387,6 +1387,80 @@ mod tests {
         );
     }
 
+    /// A scheduler that starts beside a warm cache, as an epoch's target of the same layout does
+    /// (its regions are the serving epoch's), learns every block from its startup `Listing` after
+    /// its policy was instantiated on an empty cache, and tells the policy each of them as a
+    /// `Cached` page in the next step's `observe`. With the cache of E1's deployment after a few
+    /// minutes of load (2,048 blocks of 64 tokens with a device copy, 4,094 more on the host
+    /// alone), `fcfs` takes that step without a fault, and has seen the pages: a shortage of
+    /// device units names listed pages, none of them on the host alone.
+    #[test]
+    fn a_policy_observes_a_warm_cache_listed_at_the_start_without_a_fault() {
+        use std::collections::HashSet;
+
+        use scheduling::decision::{Room, Shortage, Storage};
+        use scheduling::limits::Parameters;
+
+        use crate::scheduler::packaged;
+        use crate::scheduler::policy::{self, Policy};
+
+        const ON_DEVICE: u64 = 2048;
+        const ON_HOST: u64 = 4094;
+        let numbered = |number: u64| {
+            let mut bytes = [0; 32];
+            bytes[..8].copy_from_slice(&(number + 1).to_be_bytes());
+            Key(bytes)
+        };
+
+        let mut bench = bench(1 << 22);
+        let ceilings = policy::ceilings([]);
+        let empty = bench.scheduler.snapshot();
+        bench.scheduler.policy =
+            Policy::new(packaged("fcfs"), Parameters::default(), empty, &ceilings).unwrap();
+
+        let listed: Vec<(Key, u8)> = (0..ON_DEVICE)
+            .map(|number| (numbered(number), DEVICE | HOST))
+            .chain((ON_DEVICE..ON_DEVICE + ON_HOST).map(|number| (numbered(number), HOST)))
+            .collect();
+        list(&mut bench, &listed);
+
+        let scheduler = &mut bench.scheduler;
+        let room = Room {
+            token_budget: 8192,
+            call_budget: 128,
+            page_tokens: 64,
+            ..Room::default()
+        };
+        if let Err(fault) =
+            scheduler
+                .policy
+                .dispatch(&room, &mut scheduler.requests, &scheduler.groups)
+        {
+            panic!("the step after the listing faults the policy: {fault}");
+        }
+
+        let shortage = Shortage {
+            kind: Storage::KvUnits,
+            need: 16,
+        };
+        let victims: Vec<u64> = scheduler
+            .policy
+            .preempt(&shortage)
+            .unwrap()
+            .into_iter()
+            .filter_map(|victim| victim.page().map(|page| page.0))
+            .collect();
+        let on_device: HashSet<u64> = listed[..ON_DEVICE as usize]
+            .iter()
+            .map(|(key, _)| Cached::id(key))
+            .collect();
+        assert!(!victims.is_empty(), "the policy names no listed page");
+        assert!(
+            victims.iter().all(|page| on_device.contains(page)),
+            "{victims:?}"
+        );
+    }
+
     #[test]
     fn the_order_is_least_recently_used_first_and_available_counts_what_lies_beyond_its_head() {
         let mut bench = bench(4096);
