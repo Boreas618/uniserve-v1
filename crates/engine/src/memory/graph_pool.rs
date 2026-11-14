@@ -27,8 +27,8 @@
 //!
 //! [`GraphPool::suspend`] gives the pools' storage back to the device, keeping its contents on the
 //! host and its addresses reserved, and the reservation in the quota drops with it.
-//! [`GraphPool::restore`] maps storage at the same addresses again. The worker then renews every
-//! runner's graphs ([`Graphs::renew`](crate::runner::graphs::Graphs::renew)) before it replays one.
+//! [`GraphPool::restore`] maps storage at the same addresses again. Each graph's executable is then
+//! instantiated again before its next replay (`Executable::refresh` in `runner::graphs`).
 
 use std::sync::{Arc, Mutex};
 
@@ -169,7 +169,7 @@ impl GraphPool {
     /// drops.
     ///
     /// The graphs made over the region are dropped before the pool is, and replay nothing
-    /// between [`GraphPool::suspend`] and the renewal that follows [`GraphPool::restore`].
+    /// between [`GraphPool::suspend`] and [`GraphPool::restore`].
     ///
     /// # Errors
     ///
@@ -251,9 +251,8 @@ impl GraphPool {
     /// Maps storage at every region's address again, with the bytes it held, and reserves the
     /// pools in the quota again. Restoring pools that are not suspended does nothing.
     ///
-    /// The worker renews every runner's graphs afterwards
-    /// ([`Graphs::renew`](crate::runner::graphs::Graphs::renew)): a replay needs its executables
-    /// instantiated again once its region was mapped again.
+    /// A replay needs its executable instantiated again once its region was mapped again: each
+    /// graph's is, before its next replay (`Executable::refresh` in `runner::graphs`).
     ///
     /// # Errors
     ///

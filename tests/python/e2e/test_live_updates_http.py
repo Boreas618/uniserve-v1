@@ -2519,6 +2519,77 @@ def test_a_weight_update_leaves_the_blocks_of_the_old_weights_unread(
         assert new_weights > 0, new_weights
 
 
+def test_a_weight_update_keeps_the_stream_in_flight_going(
+    tmp_path: Path, runtime: Path
+):
+    """A weight update never holds the stream in flight as long as it takes.
+
+    With ``in_flight = keep`` the batches go on while the new checkpoint loads
+    beside the KV cache, and the weights are put in place at one batch boundary
+    (``docs/admin.md``, the KV cache's storage and the weights), so the
+    stream's longest silence from its last token before the update to its end
+    stays below the update's duration, and the stream is whole.
+
+    The weights put in place are mapped at the addresses the captured graphs
+    read, which a process subscribed to CUPTI follows by instantiating each
+    graph's executable again (``profiling::storage_remapped``); that renewal
+    belongs to each graph's next replay and never holds a batch for every
+    bucket the runner captured. The case states its measures whatever the
+    process's CUPTI, and guards the renewal where the deployment's environment
+    gives it one (``VIRTUAL_ENV`` naming the project's environment, whose
+    ``nvidia-cuda-cupti`` the engine subscribes with).
+    """
+    other = str(
+        host_asset("UNISERVE_QWEN3_UPDATED_MODEL", QWEN3_UPDATED_CHECKPOINT)
+    )
+    name = "qwen3-live-weights-stream"
+    log = tmp_path / "server.log"
+    with _serve(runtime, log, name) as base_url:
+        read: list[str] = []
+        done = threading.Event()
+        errors: list[BaseException] = []
+        arrivals: list[float] = []
+        reasons: list[str] = []
+        streaming = threading.Thread(
+            target=_stream_count,
+            args=(base_url, name, read, done),
+            kwargs={"reasons": reasons, "errors": errors, "arrivals": arrivals},
+        )
+        streaming.start()
+        wait_until(
+            lambda: len(_numbers(read)) >= 8,
+            300,
+            "the count did not stream",
+            STREAM_POLL_S,
+        )
+
+        started = time.monotonic()
+        updated = admin(base_url, "update_weights", {"model_path": other})
+        took = time.monotonic() - started
+        assert updated.status_code == 200, updated.text
+        streaming.join(timeout=1800)
+
+    # The stream's silences from its last token before the update on, each
+    # token's arrival its own reading.
+    spans = [moment for moment in arrivals if moment < started][-1:] + [
+        moment for moment in arrivals if moment >= started
+    ]
+    longest = max(
+        (later - earlier for earlier, later in zip(spans, spans[1:])),
+        default=0.0,
+    )
+    print(f"update {took:.3f} s, the stream's longest silence {longest:.3f} s")
+    assert done.is_set(), "the count did not end"
+    assert not errors, f"the count failed: {errors[0]!r}"
+    numbers = _numbers(read)
+    assert numbers == list(range(1, len(numbers) + 1)), numbers[-40:]
+    assert len(spans) > 1, "the count ended before the update"
+    assert longest < took, (
+        f"the stream in flight waited {longest:.3f} s, longer than the update "
+        f"took ({took:.3f} s)"
+    )
+
+
 def test_a_previous_epoch_in_host_storage_moves_its_weights_and_returns(
     tmp_path: Path, runtime: Path
 ):

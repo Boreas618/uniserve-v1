@@ -111,7 +111,7 @@ struct Segment {
     /// The nodes each launch of the segment added, in launch order.
     nodes: Vec<Vec<WalkedNode>>,
     /// The kernel parameters a rebind set on the executable, which a new executable of the
-    /// template needs again ([`Executable::renew`]).
+    /// template needs again ([`Executable::refresh`]).
     rebound: Vec<(GraphNode, OwnedKernelNodeParams)>,
     /// The host work of the graph break that ends the segment; `None` for the last segment.
     then: Option<HostWork>,
@@ -128,6 +128,10 @@ pub(crate) struct Executable {
     /// The kernel nodes one replay launches, over every segment: what a replay adds to the
     /// device's count of kernel launches. A rebind's executable has its template's.
     kernel_nodes: u64,
+    /// The process's count of graph renewals ([`crate::profiling::graph_renewals`]) read before
+    /// the segments were last instantiated: the executable is current while the count still
+    /// reads this ([`Executable::refresh`]).
+    renewals: u64,
 }
 
 impl Executable {
@@ -178,6 +182,9 @@ impl Executable {
         };
         let output = output?;
 
+        // Read before the segments are instantiated, so that a renewal declared meanwhile
+        // leaves the executable stale rather than counted current.
+        let renewals = crate::profiling::graph_renewals();
         let last = session
             .capture
             .take()
@@ -195,6 +202,7 @@ impl Executable {
             segments,
             kernels: Vec::new(),
             kernel_nodes,
+            renewals,
         };
         Ok((executable, output))
     }
@@ -222,13 +230,25 @@ impl Executable {
     }
 
     /// Instantiates every segment's executable again from its template, with the parameters a
-    /// rebind set: what a replay needs after the process's CUPTI recording changed how graphs
-    /// are traced, or the storage the graph addresses was mapped again.
+    /// rebind set, when the process declared every executable stale since this one was
+    /// instantiated ([`crate::profiling::graph_renewals`]): what a replay needs after the
+    /// process's CUPTI recording changed how graphs are traced, or the storage the graph
+    /// addresses was mapped again. A current executable is left as it is.
+    ///
+    /// Each executable is renewed before its own next replay, so a renewal costs the
+    /// instantiation of the buckets that run, one at a time as each first runs again, and never
+    /// holds a batch for the instantiation of every bucket the runner captured.
     ///
     /// # Errors
     ///
-    /// When the driver refuses an instantiation or a node's parameters.
-    pub(crate) fn renew(&mut self) -> Result<()> {
+    /// When the driver refuses an instantiation or a node's parameters; the executable then
+    /// stays stale, and the next replay instantiates it again.
+    pub(crate) fn refresh(&mut self) -> Result<()> {
+        let renewals = crate::profiling::graph_renewals();
+        if renewals == self.renewals {
+            return Ok(());
+        }
+
         for segment in &mut self.segments {
             let exec = segment.template.instantiate()?;
             for (node, params) in &segment.rebound {
@@ -238,6 +258,7 @@ impl Executable {
             // An executable still in flight is released by the driver when it completes.
             segment.exec = exec;
         }
+        self.renewals = renewals;
         Ok(())
     }
 
@@ -283,6 +304,7 @@ impl Executable {
             return Ok(None);
         }
 
+        let renewals = crate::profiling::graph_renewals();
         let mut segments = Vec::with_capacity(self.segments.len());
         let mut first = 0;
 
@@ -333,6 +355,7 @@ impl Executable {
             segments,
             kernels,
             kernel_nodes: self.kernel_nodes,
+            renewals,
         }))
     }
 

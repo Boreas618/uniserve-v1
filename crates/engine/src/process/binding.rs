@@ -1524,8 +1524,8 @@ impl WeightBinding {
     }
 
     /// Restores what [`Self::suspend_graphs`] gave back, at the addresses the graphs hold, and
-    /// has the runners recompute what they derive from weights that changed meanwhile. The
-    /// workers renew every graph before its next replay.
+    /// has the runners recompute what they derive from weights that changed meanwhile. Each
+    /// graph's executable is instantiated again before its next replay.
     ///
     /// # Errors
     ///

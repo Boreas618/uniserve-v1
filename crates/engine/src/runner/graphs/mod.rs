@@ -642,12 +642,17 @@ impl Graphs {
             replays,
             ..
         } = &mut *state;
-        let (_, graph) = served(graphs, serving, bucket).ok_or_else(|| {
-            Error::Invariant(format!("bucket {bucket} has no captured graph to replay"))
-        })?;
-        let (Some(executable), Some(buffer)) = (&graph.executable, buffer.as_mut()) else {
+        let missing =
+            || Error::Invariant(format!("bucket {bucket} has no captured graph to replay"));
+        let (generation, _) = served(graphs, serving, bucket).ok_or_else(missing)?;
+        let graph = graphs.get_mut(&(*bucket, generation)).ok_or_else(missing)?;
+        let (Some(executable), Some(buffer)) = (graph.executable.as_mut(), buffer.as_mut()) else {
             return Err(Error::State("the graph holds no executable to replay"));
         };
+        // An executable the process declared stale since its instantiation (a remapping of the
+        // storage it addresses, a change of how CUPTI traces graphs) is instantiated again before
+        // this launch, and no other bucket's with it.
+        executable.refresh()?;
 
         buffer.issue(slot, &cuda.stream, cuda.inputs, self.inputs, &graph.copies)?;
         buffer.release(slot, &cuda.stream)?;
@@ -720,24 +725,6 @@ impl Graphs {
     pub(crate) fn forwards(&self) -> (u64, u64) {
         let state = self.state.borrow();
         (state.replays, state.eager)
-    }
-
-    /// Instantiates every graph's executables again: what replays need after the process's
-    /// CUPTI recording changed how graphs are traced, or after the region was mapped again at
-    /// its address.
-    ///
-    /// # Errors
-    ///
-    /// When the driver refuses an instantiation.
-    pub(crate) fn renew(&self) -> Result<()> {
-        let mut state = self.state.borrow_mut();
-
-        for graph in state.graphs.values_mut() {
-            if let Some(executable) = graph.executable.as_mut() {
-                executable.renew()?;
-            }
-        }
-        Ok(())
     }
 
     // ---- Generations ----

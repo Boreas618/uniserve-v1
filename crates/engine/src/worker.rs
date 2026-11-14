@@ -503,7 +503,6 @@ impl Worker {
             session: None,
             blocking: Calls::default(),
             forwards: (0, 0),
-            renewals: profiling::graph_renewals(),
             tables,
             copy_budget,
             sequences,
@@ -950,8 +949,6 @@ struct Thread {
     /// The runners' serving forwards, graphs replayed and forwards run eagerly, summed over the
     /// runners, when its last batch output left ([`Thread::forwards`]).
     forwards: (u64, u64),
-    /// The process's count of graph renewals the runners' executables were instantiated at.
-    renewals: u64,
     /// The rank's device block tables.
     tables: BlockTables,
     /// The bytes, summed over the group's ranks, that the copies started with one batch may
@@ -1282,8 +1279,6 @@ impl Thread {
         {
             self.apply_session()?;
         }
-        self.renew()?;
-
         self.write_tables()?;
         let copies = if sequence.is_some() && alone(&batch)?.is_none() {
             self.start_copies(index)
@@ -1869,23 +1864,6 @@ impl Thread {
         if let Some(session) = self.session.as_mut() {
             session.apply();
         }
-        Ok(())
-    }
-
-    /// Instantiates the runners' graph executables again when the process declared them stale
-    /// since they were instantiated: CUPTI changed how it records a graph's launch, or storage
-    /// the graphs address was mapped again.
-    fn renew(&mut self) -> Result<()> {
-        let renewals = profiling::graph_renewals();
-        if renewals == self.renewals {
-            return Ok(());
-        }
-
-        self.settle()?;
-        for runner in &self.runners {
-            runner.graphs().renew()?;
-        }
-        self.renewals = renewals;
         Ok(())
     }
 

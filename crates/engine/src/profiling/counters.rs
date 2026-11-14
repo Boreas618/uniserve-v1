@@ -55,11 +55,10 @@ pub(crate) fn subscribe() {
 /// instantiates its first graph executable.
 ///
 /// An executable replays in the tracing mode it was instantiated in, and a change of the mode
-/// declares every executable stale ([`super::graph_renewals`]): each worker instantiates all of
-/// its runners' executables again before its next batch. Changed only once the warm-up captured
-/// every bucket, the mode would have the deployment's first batch wait for that, tens of seconds
-/// on one GPU. So the rank start calls this before its workers start, since a worker takes at its
-/// start the renewal count its executables are current at, and before the warm-up captures.
+/// declares every executable stale ([`super::graph_renewals`]): each is instantiated again before
+/// its next replay. Changed only once the warm-up captured every bucket, the mode would have each
+/// bucket's first replay instantiate it again. So the rank start calls this before the warm-up
+/// captures, whose executables are current at the renewal count of their instantiation.
 ///
 /// Does nothing in a process CUPTI did not subscribe. A refusal of the record is logged; the
 /// counters' start then asks for it again, and a mode it changes renews the executables.

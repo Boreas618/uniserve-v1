@@ -616,8 +616,8 @@ pub(crate) fn start(
     bind(&mut ranks, &open, &opened, true)?;
 
     // Range markers, PC sampling and the tracing mode of a graph's launch attach to what a graph
-    // captures and instantiates, so they precede the workers, which take the tracing mode's
-    // renewal count their executables are current at, and the captures of the warm-up.
+    // captures and instantiates, so they precede the warm-up's captures, whose executables are
+    // current at the tracing mode's renewal count of their instantiation.
     if !meta {
         instrument(launch, model_runner.devices())?;
     }
