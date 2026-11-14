@@ -6,7 +6,7 @@ UniServe serves the MiniMax-H3 video-and-audio models: the base MiniMax-H3 check
 
 - Linux, CUDA 13, Python 3.12, a stable Rust toolchain, and NVIDIA Hopper or Blackwell GPUs. Four local GPUs are the standard setup. FastH3 is validated on H200, GB200 and RTX PRO 6000 Blackwell Server Edition; the base checkpoint and OmniRef on four GB200. OmniRef's 128-row sparse-attention tiles have kernels on data-center Blackwell (SM100), Hopper (SM90) and SM120 GPUs, and the server refuses OmniRef on any other GPU at startup.
 - FFmpeg for keyframe and reference requests: the server probes condition media through the linked FFmpeg runtime's libraries, and the worker decodes reference videos with `ffmpeg` from `PATH` unless `media_config.ffprobe` and `media_config.ffmpeg` name them.
-- Shared storage and pinned-storage access for worker IPC, as the container command below provisions.
+- Shared memory and pinned host storage for the deployment's processes, as the container command below provisions.
 
 ## Install
 
@@ -193,7 +193,7 @@ Each host's main process holds the products of a request its ranks write: the co
 | `media_config.allow_remote` | Whether `http(s)://` condition URIs are fetched; on by default, and `--set media_config.allow_remote=false` refuses them. |
 | `mm_processor_kwargs` | Options of the video processor, as a JSON object; an option it does not take is refused at startup. Two size `ref2va` references. `reference_image_short_edge` is the short edge, in pixels, an image reference is encoded at, at most: a multiple of 32 up to the edge the served checkpoint declares, which is the default (2048 for MiniMax-H3 and OmniRef). A reference is only ever reduced: an image with a longer short edge scales down to it and a video with more pixels than the canvas of its aspect scales down to that canvas, while smaller references keep their own size on the 32-pixel grid. `"enlarge_references": true` also enlarges smaller ones to those sizes, as the released pipeline does. |
 | `media_config.max_request_bytes` | Largest request body and fetched media in total, such as `512MiB`; 256 MiB by default. |
-| `--mem-fraction-static` | Device storage each worker process may hold for weights and KV cache; 0.70 by default. |
+| `--mem-fraction-static` | Device storage each worker may hold for weights and KV cache; 0.70 by default. |
 
 Startup prepares, and with graphs captures, every layout a request reaches: each frame count up to `video_config.max_seconds` at each canvas, and for a task with conditions each rung of the condition ladder. A layout's condition rows are real rows of every denoising step, so a request runs in the smallest rung that holds its conditions and its steps cost its own rows, not the deployment's capacity. The server derives the ladder from the condition capacity, and it takes no option: 1,024 rows, doubling, with a rung halfway between two doublings from 4,096 rows up, and the capacity last. A rung is one more captured graph per frame count and canvas, about a second of startup each at five seconds, and the rungs share one arena. Fewer canvases, capacities and seconds start faster and hold less storage. The first startup also compiles kernels. Serving every FastH3 size needs fewer text capacities, such as `--set video_config.text_capacities=1024,10240`. 1536x672 needs more request storage than the other sizes. A deployment that does not fit fails before it reports ready and logs what each component holds.
 

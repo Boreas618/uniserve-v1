@@ -9,7 +9,7 @@ a loaded value rounds and scales exactly as a locally written one does.
 
 ## The source: the host page encoding
 
-A host K/V page is layer-major (`crates/worker/src/memory/prefix_cache/host.rs`): keys
+A host K/V page is layer-major (`crates/engine/src/memory/cache/host.rs`): keys
 ``[layers, block_size, heads, head_dim]``, then values in the same shape, then, for an FP8 page,
 the scales ``[2, layers]`` as FP32, one per field and layer. A page staged from several source pools
 (another tensor-parallel split) carries one scale row per source pool's head range, so the scales

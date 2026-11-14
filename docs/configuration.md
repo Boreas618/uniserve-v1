@@ -84,7 +84,7 @@ retention = "30m"
 
 Each option's destination follows what its value is used for: a value that builds the main process is **build config**; one that selects an implementation is a **module selection**; one that only steers a decision is a **package parameter**; what the daemon reads stays in the **host layer**. An option a section does not name separately has the destination stated under that section's heading; the sections whose options split state it per field below.
 
-Three backend-name fields are read with `attention_backend` (`ModuleSet::of`, `crates/daemon/src/epoch.rs`): `prefill_attention_backend` and `decode_attention_backend` each override it for their phase, and `moe_runner_backend` selects the grouped expert GEMM. A backend name selects the package of that name at the Build Server for every descriptor key it covers; a key it does not cover, and every key of an operator whose backend is unset or `auto`, takes the installed package that covers it with the highest manifest `priority` (`architecture.md`, the Build Server). A named backend no installed package has is refused when the epoch's modules are prepared.
+Three backend-name fields are read with `attention_backend` (`modules_of`, `crates/daemon/src/epoch.rs`): `prefill_attention_backend` and `decode_attention_backend` each override it for their phase, and `moe_runner_backend` selects the grouped expert GEMM. A backend name selects the package of that name at the Build Server for every descriptor key it covers; a key it does not cover, and every key of an operator whose backend is unset or `auto`, takes the installed package that covers it with the highest manifest `priority` (`architecture.md`, the Build Server). A named backend no installed package has is refused when the epoch's modules are prepared.
 
 ### Top level
 
@@ -272,7 +272,7 @@ Each entry is the median over the point's reports of the step time over its run'
 
 **Destination, per field:** `expert_parallel` and `microbatches` are build config; `exchange` is a module selection (expert exchange).
 
-**Read at:** `exchange` in `ModuleSet::of` (`crates/daemon/src/epoch.rs`), where it becomes the expert-exchange operator's backend name for a deployment with `expert_parallel`; `moe_runner_backend` beside it.
+**Read at:** `exchange` in `modules_of` (`crates/daemon/src/epoch.rs`), where it becomes the expert-exchange operator's backend name for a deployment with `expert_parallel`; `moe_runner_backend` beside it.
 
 
 [Expert parallelism](expert_parallelism.md) describes each exchange.
@@ -516,37 +516,3 @@ A component table takes:
 | `weights` | `device` | `host` keeps the dense projection weights of the component's repeated layer stack in page-locked host storage and serves it without CUDA graphs |
 
 Without a distribution, a component's ranks number the product of its degrees. `configs/` holds the published deployments, and the [FastH3 guide](minimax_h3/minimax_h3.md#deployments) lists the FastH3 files.
-
-## Renamed names
-
-The Program Server is the Build Server, and what it builds is named by the module vocabulary: an interface, a package and its revisions, a module, a module set, a generation. The names an operator, a configuration file or a script states changed as follows.
-
-| Was | Is |
-| --- | --- |
-| `uniserve program-server` (`serve`, `install`, `list`, `build`) | `uniserve build-server`, with `resolve` and `fields` added and `build --package DIR` |
-| `uniserve programs` | `uniserve keys` |
-| `uniserve engine --launch FILE` (a command of the one executable) | `uniserve-engine --launch FILE` (the engine package's executable) |
-| `program_config` | `build_config`, with `read_only_stores` added |
-| `worker_config.executable`, `--worker-executable` | `worker_config.engine`, `worker_config.engine_revision` |
-| The socket `program-server.sock` | `build-server.sock` |
-| The data directory `uniserve/programs/{packages,modules}` | `uniserve/build-server/{packages,modules}` |
-| The cache directory `~/.cache/uniserve/program-server` (pinned third-party sources) | `~/.cache/uniserve/build-server`, which also holds cargo's target directory (`cargo`) |
-| The Python package `uniserve_program_server`, the project `crates/program-server/python` | `uniserve_build_server`, `crates/build-server/python` |
-| `UNISERVE_PROGRAM_SERVER_PYTHON`, `UNISERVE_PROGRAM_SERVER_SOCKET` | `UNISERVE_BUILD_SERVER_PYTHON`, `UNISERVE_BUILD_SERVER_SOCKET` |
-| `UNISERVE_PROGRAM_TARGET`, `UNISERVE_PROGRAM_STORE` | `UNISERVE_MODULE_TARGET`, `UNISERVE_MODULE_STORE` |
-| `UNISERVE_PROGRAM_REBIND_PACKAGE`, `UNISERVE_PROGRAM_RECAPTURE_PACKAGE`, `UNISERVE_PROGRAM_POLICY_PACKAGE`, `UNISERVE_PROGRAM_WRONG_PACKAGE` | `UNISERVE_REBIND_PACKAGE`, `UNISERVE_RECAPTURE_PACKAGE`, `UNISERVE_POLICY_PACKAGE`, `UNISERVE_WRONG_PACKAGE` |
-| `UNISERVE_WORKER_EXECUTABLE` (test suites) | `UNISERVE_ENGINE`, `UNISERVE_ENGINE_PACKAGE` |
-| `PUT /admin/config` answering `"change": "program"` with the report under `"program"` | `"change": "generation"`, the report under `"generation"` |
-| `GET /admin/config` records' `programs`, each entry's `program` | `modules`, each entry's `package` |
-| A package manifest without an interface version | `interface_version` in every `package.toml`: the version of the interface its modules are built against (3 for a scheduling policy, whose events include `Released` and `Held`, whose `Emitted` keeps a request's generated and remaining tokens, so that a view is restated only when something else of it moved, and whose `offload` names each block once; 1 for a kernel package) |
-
-The Storage Server's accounting of a GPU's storage is a quota: the deployment's limit on the GPU and the reservations against it. A copy its Transfer Server runs is a task. The names a script or an operator reads changed as follows.
-
-| Was | Is |
-| --- | --- |
-| `GET /admin/config` `ledgers`, each host's `ledgers` and `transfers` | `quotas`, each host's `quotas` and `tasks` |
-| A ledger's `quota` and `entries` | A quota's `limit` and `reservations` |
-| `uniserve storage-server list` printing `N bytes booked of a quota of Q` | `N bytes reserved of a limit of Q` |
-| The storage protocol's `Book`, `Ledger`, `Transfer`, `OpenTransfer`, `CloseTransfer` and `PublishEpochs` requests, and its `Transferred` and `TransferProgress` events | `Quota`, `Usage`, `Submit`, `OpenSession`, `CloseSession` and `Publish`; `TaskEnded` and `TaskProgress` |
-| The process interface's `LedgerQuery` and `LedgerReport` | `UsageQuery` and `UsageReport` |
-| The storage protocol's version stated only at a Storage Server's hello | Also carried in the engine interface's version, which a package manifest states as `interface_version` |

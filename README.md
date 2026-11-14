@@ -130,7 +130,7 @@ uniserve serve "$H3_MODEL" --worker-groups configs/minimax_h3/ulysses4.toml \
 | `server_config` | HTTP listener, API key, timeouts and HTTP admission |
 | `load_config`, `kv_cache_config`, `scheduler_config` | Checkpoint loading, the KV cache, and admission and batching |
 | `device_config`, `moe_config` | Parallel configuration without a deployment file, and product transport; expert parallelism |
-| `cuda_graph_config`, `flashinfer_config`, `worker_config` | CUDA graph capture, the FlashInfer provider, and the worker processes |
+| `cuda_graph_config`, `flashinfer_config`, `worker_config` | CUDA graph capture, the FlashInfer provider, and the main processes and their workers |
 | `logging_config` | Request and statistics logs |
 | `chat_config`, `image_fetch_config` | Chat models: chat template, reasoning parser and image URL fetching |
 | `video_config`, `media_config`, `video_job_config` | Video models: output sizes, durations, prompt capacities, condition media and asynchronous jobs |
@@ -195,20 +195,23 @@ The [architecture guide](docs/architecture.md) describes how the daemons, the en
 src/                    The root package, `uniserve`: the command line, logging, the `serve` and `keys` commands, and `main.rs`, which dispatches every command; the base executable holds the daemon, the Storage Server and the Build Server, and links no engine or model
 crates/engine/          The main process of a node and epoch: its control thread, one scheduler per data-parallel rank, the executor each scheduler hands its batches to, the batch vocabulary, the peer link, one worker thread per device with its runners, graphs and memory owners, the client of the Storage Server, and the catalogue that resolves a checkpoint to its model family
 crates/proto/           The interfaces across builds: the request interface and the process interface (Protobuf), and the video condition vocabulary
-crates/scheduling/      The scheduling interface between the scheduler's mechanism and its policy
+crates/scheduling/      The scheduling interface between the scheduler's mechanism and its policy, and the policies under `policies/` (`fcfs`, `priority`, `fixture`), each a package compiled to WebAssembly
 crates/storage/         The Storage Server's protocol and client
 crates/storage-server/  The Storage Server, its Mooncake connector and its Transfer Server (with NIXL, loaded at runtime)
 crates/platform/        The CUDA boundary: driver, virtual memory, device memory and allocator, streams, events, graphs, kernels and NCCL
-crates/ops/             The interface between Rust and kernel packages: operators, their descriptors and descriptor keys, launch code and every kernel, one package per operator and backend under `kernels/`
-crates/nn/              The shared computation library: tensor views, the borrowed forward, numerical layers and blocks, diffusion, tiling and vocoder computation, weight loading, the capability traits models implement and the model family contract execution loads models through
-crates/processing/      The request side of a model family: its chat profile (the reasoning and tool-call formats its checkpoints write) or its video processor, which checks and processes model-agnostic video requests, and the family-neutral frame, canvas, cover-crop and resampling rules
-crates/models/          The concrete models, each a crate that implements both contracts
-  qwen3/                The Qwen3 family: configurations, the decoder layer and stack, `Qwen3MoeForCausalLM`, the Qwen3-VL model, vision tower and processor, and the Qwen3 chat profile
-  minimax-h3/           MiniMax-H3 and FastH3: checkpoint configuration, mathematical partition, components and request processing (`src/processing/`)
+crates/tensor/          The tensor library: `Tensor`, element types, shapes and layouts, devices and storage, the CPU backend and the interface every other device backend implements; it knows nothing of UniServe
+crates/ops/             The device side of the tensor library and the interface between Rust and kernel packages: operators, their descriptors and descriptor keys, launch code and every kernel, one package per operator and backend under `kernels/`, and the CUDA and meta backends of `tensor` with the allocator of their memory
+crates/nn/              The neural-network library: modules and fused operators (each with its CPU formula), weight loading and quantized formats, diffusion schedules and solver formulas, tiled VAE computation, profiler ranges, the capability traits execution calls on a model and the family traits it loads a model through
+crates/processing/      The request side of a model family: its chat profile (the reasoning and tool-call formats its checkpoints write) or its video processor, which checks and processes model-agnostic video requests, and the family-neutral frame, canvas, cover-crop and resampling rules; a family's own request rules are a module each (`qwen`, `qwen_vl`, `minimax_h3`)
+crates/models/          The model families, one crate with a module per family, on `nn` and the tensor library
+  src/qwen3/            The Qwen3 family: configurations, the decoder layer, `Qwen3MoeForCausalLM` and the Qwen3.5-MoE language model with its drafter, and the Qwen3-VL encoder and vision tower
+  src/qwen4_exp/        Qwen3.8 Flash Next (`Qwen4ExpForConditionalGeneration`), on the vision tower and configuration readers of `qwen3`
+  src/minimax_h3/       MiniMax-H3 and FastH3: checkpoint configuration, the diffusion transformer and its denoiser, the video and audio VAEs and the packed sequence; their request processing is `crates/processing/src/minimax_h3/`
 crates/daemon/          The node's daemon: process supervision and the Storage Server claim; on the leader, serving options, the HTTP server and its connections, metrics, the served model, the engine's client, and the API server: the OpenAI-compatible API, input processing (templates, tokenization, media) and output processing (detokenization, parsers, response bodies)
 crates/service/         Host services: the per-user socket, its owner lock, a detached start and the start of an absent service; the one connection every process interface runs on
 crates/media/           H.264/AAC output encoding and MP4 muxing, conditional media reading and host resamplers
 crates/build-server/  The Build Server: builds packages into modules, keeps them and hands them out; one host service per host and user
+crates/testkit/         Test doubles at the engine's seams: the executor of a worker group (`FakeExecutor`), the Storage Server's buffer pool in process (`InProcessPool`) and a fake engine over both; never in a serving build
 crates/manager/         `uniserve-manager`: an optional multi-node manager, a client of each node's `/admin`
 uniserve_eval/          Serving evaluator, profiles, and request workloads
 configs/                Deployment files: H3 (`minimax_h3/`) and dedicated experts (`afd/`)
