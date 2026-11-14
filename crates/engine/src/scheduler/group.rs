@@ -333,18 +333,30 @@ impl Scheduler {
     }
 
     /// The group, among `candidates` (as [`Scheduler::candidates`] lists them), that a phase of
-    /// `request` is placed on: a candidate the request is placed on already; else, for a request
-    /// placed nowhere yet, the policy's choice `named`, an index into `candidates` (one that is
-    /// not is passed over); else the candidate with the fewest placed requests, then the most free
-    /// slots, then the first configured. `None` when there is no candidate.
+    /// `request` is placed on: a candidate the request is placed on already, the first configured
+    /// when it is placed on several; else, for a request placed nowhere yet, the policy's choice
+    /// `named`, an index into `candidates` (one that is not is passed over); else the candidate
+    /// with the fewest placed requests, then the most free slots, then the first configured.
+    /// `None` when there is no candidate.
     pub(super) fn choose(
         &self,
         request: &Request,
         candidates: &[GroupId],
         named: Option<usize>,
     ) -> Option<GroupId> {
-        let placed = |id: &GroupId| request.placement.contains(&Some(*id));
-        if let Some(&held) = candidates.iter().find(|id| placed(id)) {
+        // The held candidate is the least position among the groups the request is placed on,
+        // so the placement is read once and each of its groups is looked up in the candidates.
+        // Scanning the placement once per candidate instead puts its `Phase::COUNT` entries,
+        // unrolled, in the loop over the candidates, and LLVM at opt-level 3 unswitches that
+        // loop on each entry's test of whether it names a group: the copies, and the time to
+        // optimize them, grow exponentially with the entries, to tens of minutes.
+        let held = request
+            .placement
+            .iter()
+            .flatten()
+            .filter_map(|id| candidates.iter().position(|candidate| candidate == id))
+            .min();
+        if let Some(&held) = held.and_then(|index| candidates.get(index)) {
             return Some(held);
         }
 
@@ -772,6 +784,17 @@ mod tests {
         assert_eq!(
             scheduler.choose(&placed, &candidates, Some(0)),
             Some(GroupId(1))
+        );
+
+        // Placed on both, by an earlier phase on the later configured, it stays on the first
+        // configured.
+        placed.placement[Phase::TextEncode.index()] = Some(GroupId(1));
+        placed.placement[Phase::Prefill.index()] = Some(GroupId(0));
+        let candidates = scheduler.candidates(&placed, Phase::Decode);
+        assert_eq!(candidates, [GroupId(0), GroupId(1)]);
+        assert_eq!(
+            scheduler.choose(&placed, &candidates, None),
+            Some(GroupId(0))
         );
     }
 
