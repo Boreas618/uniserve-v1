@@ -1,8 +1,9 @@
 //! `DecoderRunner` without a device: where a decode round's copies read and write in the rank's
-//! product buffer, the tail one round leaves for the next, a round dealt to two ranks of one
-//! process with the tail handed between them after the successor's rank decoded, the refusals
-//! of a row, and the profile run and capture of a clip's, a splice's and a track's buckets, over
-//! decoders whose forwards launch only the runner's own conversions.
+//! product buffer, the tail one round leaves for the next, the deal of rounds to the ranks in
+//! order and in reverse alternately, a round dealt to the ranks of one process with the tails
+//! they exchange over the decoder ranks' communicator, the refusals of a row, and the profile run
+//! and capture of a clip's, a splice's and a track's buckets, over decoders whose forwards launch
+//! only the runner's own conversions.
 
 use std::sync::Arc;
 
@@ -18,21 +19,21 @@ use storage::Key;
 use storage::runtime::{self, Completion, GroupId, OwnerId, Request, Run};
 use tensor::{DType, Tensor};
 
-use super::{DecoderConfig, DecoderRunner, RoundConfig};
+use super::{DecoderConfig, DecoderRunner, RoundConfig, Unit};
 use crate::memory::buffers::{BufferMemory, UNIT_BYTES};
 use crate::memory::tables::BlockTables;
 use crate::runner::Runner;
 use crate::runner::buckets::{Bucket, Buckets};
 use crate::runner::graphs::Graphs;
-use crate::worker::Error;
 
 const GROUP: GroupId = GroupId(0);
 
-/// The slot rows, the rank's product buffer and another rank's of its process, and the slot the
-/// request runs on.
+/// The slot rows, the rank's product buffer and the other ranks' of its process, and the slot
+/// the request runs on.
 const SLOTS: u8 = 0;
 const PRODUCTS: u8 = 2;
 const OTHER: u8 = 3;
+const THIRD: u8 = 7;
 const SLOT: u32 = 1;
 
 /// The classes of the latents, of the decoded media and of the splice tails.
@@ -205,7 +206,7 @@ fn decoder(
             round,
         },
         Graphs::meta(Arc::new(Generation::new(0, [])), 0),
-        None,
+        (None, None),
         memory,
     )
     .unwrap()
@@ -421,57 +422,75 @@ fn the_tail_a_round_leaves_is_the_one_the_next_round_fades_against() {
 const LONG: u32 = 26;
 const LONG_TRAJECTORY: u32 = 7;
 
-/// The first unit of each rank's products in its product buffer: rank 0's at 0, rank 1's at 64.
-const BASES: [u32; 2] = [0, 64];
+/// The product buffer of each rank of the process, and the first unit of each rank's products in
+/// it.
+const BUFFERS: [u8; 3] = [PRODUCTS, OTHER, THIRD];
+const BASES: [u32; 3] = [0, 64, 128];
 
-/// The decoders of ranks 0 and 1 of one process, over memories joined to each other, dealing
-/// rounds of two units to each, and each rank's tables with the request's products of the long
-/// timeline on both: its latents at unit 0 of each rank's products, its units' frames from unit
-/// 2, and its six tails of three units each from unit 22, at positions 0, 1 and 2 to 7.
-fn two_ranks() -> [(DecoderRunner, BlockTables); 2] {
-    let mut memories = [(0, PRODUCTS), (1, OTHER)]
-        .map(|(rank, region)| BufferMemory::meta(rank, (region, 128), (SLOTS, 4), 0, &[]).unwrap());
+/// The bytes of a tail of two frames of three channels of an 8 by 8 raster of FP16.
+const TAIL: u64 = 768;
+
+/// The decoders of ranks 0 to `count - 1` of one process, over memories joined to each other,
+/// dealing rounds of `units` units to each, and each rank's tables with the request's products of
+/// the long timeline on every rank: its latents at unit 0 of each rank's products, its units'
+/// frames from unit 2, and its six tails of three units each from unit 22, at positions 0, 1 and
+/// 2 to 7.
+fn dealt_ranks(count: usize, units: u32) -> Vec<(DecoderRunner, BlockTables)> {
+    let ranks: Vec<u32> = (0..count as u32).collect();
+    let mut memories: Vec<BufferMemory> = ranks
+        .iter()
+        .map(|&rank| {
+            let products = (BUFFERS[rank as usize], 256);
+            BufferMemory::meta(rank, products, (SLOTS, 4), 0, &[]).unwrap()
+        })
+        .collect();
     BufferMemory::connect(&mut memories).unwrap();
 
     let runs = |first: u32, units: u32| -> Vec<Run> {
-        vec![
-            (PRODUCTS, BASES[0] + first, units),
-            (OTHER, BASES[1] + first, units),
-        ]
+        let at = |rank: u32| (BUFFERS[rank as usize], BASES[rank as usize] + first, units);
+        ranks.iter().map(|&rank| at(rank)).collect()
     };
     let latents = runs(0, 2);
     let frames = runs(2, 20);
     let tails: Vec<Vec<Run>> = (0..6).map(|tail| runs(22 + 3 * tail, 3)).collect();
+    let sizes: Vec<(u8, u64)> = BUFFERS[..count]
+        .iter()
+        .map(|&region| (region, UNIT_BYTES))
+        .collect();
 
-    let mut ranks = memories
+    memories
         .into_iter()
-        .zip([(PRODUCTS, OTHER), (OTHER, PRODUCTS)]);
-    [(); 2].map(|()| {
-        let (memory, (own, other)) = ranks.next().unwrap();
-        let round = RoundConfig {
-            ranks: vec![0, 1],
-            units: 2,
-        };
-        let runner = decoder(
-            vec![Bucket::clip(8, 8, 8)],
-            true,
-            (Arc::new(memory), round),
-            (LONG, LONG_TRAJECTORY),
-        );
+        .map(|memory| {
+            let own = BUFFERS[memory.rank() as usize];
+            let others: Vec<u8> = BUFFERS[..count]
+                .iter()
+                .copied()
+                .filter(|&region| region != own)
+                .collect();
+            let round = RoundConfig {
+                ranks: ranks.clone(),
+                units,
+            };
+            let runner = decoder(
+                vec![Bucket::clip(8, 8, 8)],
+                true,
+                (Arc::new(memory), round),
+                (LONG, LONG_TRAJECTORY),
+            );
 
-        let sizes = [(PRODUCTS, UNIT_BYTES), (OTHER, UNIT_BYTES)];
-        let tables = BlockTables::new(GROUP, &[SLOTS, own], &sizes).with_peers(&[other]);
-        let mut blocks: Vec<(u8, u32, &[Run], bool)> = vec![
-            (CLASSES[0], 0, &latents, false),
-            (CLASSES[1], 1, &frames, false),
-        ];
-        blocks.extend(
-            (2..)
-                .zip(&tails)
-                .map(|(at, runs)| (CLASSES[2], at, runs.as_slice(), false)),
-        );
-        (runner, filled(tables, &blocks, 2))
-    })
+            let tables = BlockTables::new(GROUP, &[SLOTS, own], &sizes).with_peers(&others);
+            let mut blocks: Vec<(u8, u32, &[Run], bool)> = vec![
+                (CLASSES[0], 0, &latents, false),
+                (CLASSES[1], 1, &frames, false),
+            ];
+            blocks.extend(
+                (2..)
+                    .zip(&tails)
+                    .map(|(at, runs)| (CLASSES[2], at, runs.as_slice(), false)),
+            );
+            (runner, filled(tables, &blocks, count as u32))
+        })
+        .collect()
 }
 
 /// A decode round of the long timeline from `unit` whose row names no rank.
@@ -490,73 +509,158 @@ fn long_round(unit: u32, results: Vec<u32>, reads: u32) -> Batch {
     batch
 }
 
+/// The address of unit `unit` of rank `rank`'s products, and of the tail block `index` there.
+fn at(rank: usize, unit: u32) -> u64 {
+    u64::from(BASES[rank] + unit) * UNIT
+}
+
+fn tail(rank: usize, index: u32) -> u64 {
+    at(rank, 22 + 3 * index)
+}
+
+/// The window each of `units` reads its latents from.
+fn windows(units: &[Unit]) -> Vec<u64> {
+    units.iter().map(|unit| unit.0.copies()[0].source).collect()
+}
+
+/// What each of `units` exchanges with other ranks: the member it sends its tail to with the
+/// tail's bytes, then the member it receives its predecessor's tail from with that tail's bytes.
+fn exchanged(units: &[Unit]) -> Vec<[Option<(u32, u64)>; 2]> {
+    units
+        .iter()
+        .map(|unit| [unit.1.1.map(|(_, to, bytes)| (to, bytes)), unit.2.0])
+        .collect()
+}
+
 #[test]
-fn a_round_that_names_no_rank_is_dealt_to_the_ranks_and_hands_a_tail_between_them() {
-    let [(first, first_tables), (second, second_tables)] = two_ranks();
-    let at = |rank: usize, unit: u32| u64::from(BASES[rank] + unit) * UNIT;
-    let tail = |rank: usize, index: u32| at(rank, 22 + 3 * index);
+fn rounds_are_dealt_to_the_ranks_in_order_and_in_reverse_alternately() {
+    let round = RoundConfig {
+        ranks: vec![5, 7, 9],
+        units: 2,
+    };
+
+    // Round 0 deals its shares of two units in the order of the ranks, round 1 in reverse, round
+    // 2 in order again.
+    let dealt: Vec<u32> = (0..14).map(|unit| round.rank_of(unit).unwrap()).collect();
+    assert_eq!(dealt, [5, 5, 7, 7, 9, 9, 9, 9, 7, 7, 5, 5, 5, 5]);
+
+    // So every round's first unit falls to the rank that decoded the last unit before it.
+    for first in [6, 12, 18, 24] {
+        assert_eq!(
+            round.rank_of(first),
+            round.rank_of(first - 1),
+            "unit {first}"
+        );
+    }
+
+    // A rank's member index is its place among the ranks; a deal of no unit deals nothing.
+    assert_eq!(
+        (round.member(5), round.member(9), round.member(6)),
+        (Some(0), Some(2), None)
+    );
+    let empty = RoundConfig {
+        ranks: Vec::new(),
+        units: 2,
+    };
+    assert_eq!(empty.rank_of(0), None);
+}
+
+#[test]
+fn a_round_that_names_no_rank_is_dealt_to_the_ranks_and_exchanges_a_tail_between_them() {
+    let ranks = dealt_ranks(2, 2);
+    let [(first, first_tables), (second, second_tables)] = ranks.as_slice() else {
+        panic!("two ranks");
+    };
 
     // Four units on two ranks: rank 0 decodes units 0 and 1 from its own latents, rank 1 units 2
     // and 3 from its own.
     let call = long_round(0, vec![0, 1, 2, 3, 4, 5], 1);
-    let (_, ours) = first.units(&call, &first_tables).unwrap();
-    let (_, theirs) = second.units(&call, &second_tables).unwrap();
-    let windows = |units: &[super::Unit]| -> Vec<u64> {
-        units.iter().map(|unit| unit.0.copies()[0].source).collect()
-    };
+    let (_, ours) = first.units(&call, first_tables).unwrap();
+    let (_, theirs) = second.units(&call, second_tables).unwrap();
     assert_eq!(windows(&ours), [at(0, 0), at(0, 0) + 16]);
     assert_eq!(windows(&theirs), [at(1, 0) + 32, at(1, 0) + 48]);
 
-    // Unit 1 leaves its tail in rank 0's run and hands it, 768 bytes, to rank 1, which decodes
-    // unit 2; unit 2 takes that hand-off and fades against the tail in rank 1's own run.
+    // Unit 1 leaves its tail in rank 0's run and sends it from there to member 1, which decodes
+    // unit 2; unit 2 receives those bytes from member 0 into its tail buffer, which no copy
+    // fills.
     assert_eq!(ours[1].1.0.copies()[0].destination, tail(0, 1));
-    assert_eq!(ours[1].1.1, Some((tail(0, 1), 1, 3, 768)));
-    assert_eq!((theirs[0].1.1, theirs[0].2.0), (None, Some(3)));
-    assert_eq!(theirs[0].2.1.copies()[0].source, tail(1, 1));
+    assert_eq!(ours[1].1.1, Some((tail(0, 1), 1, TAIL)));
+    assert_eq!((theirs[0].1.1, theirs[0].2.0), (None, Some((0, TAIL))));
+    assert!(theirs[0].2.1.is_empty());
 
-    // Unit 3 fades against unit 2's tail on its own rank and hands its own to nobody: the next
+    // Unit 3 fades against unit 2's tail on its own rank and sends its own to nobody: the next
     // round reads it once this one completed.
     assert_eq!(theirs[1].2.1.copies()[0].source, tail(1, 2));
     assert_eq!(theirs[1].1.0.copies()[0].destination, tail(1, 3));
-    assert_eq!((theirs[1].1.1, theirs[1].2.0), (None, None));
+    assert_eq!(exchanged(&theirs[1..]), [[None, None]]);
+    assert_eq!(exchanged(&ours[..1]), [[None, None]]);
 
     // Each unit reads and writes in its rank's run what rank 0 alone does in its own when it
-    // decodes the whole round: the products hold the single rank's bytes where it writes them.
+    // decodes the whole round, and fades against the same tail: unit 2's is the one unit 1 sent
+    // from where it left it.
     let mut alone = long_round(0, vec![0, 1, 2, 3, 4, 5], 1);
     alone.media[0].rank = Some(0);
-    let (_, single) = first.units(&alone, &first_tables).unwrap();
-    let dealt = (ours.iter().map(|unit| relative(unit, at(0, 0))))
-        .chain(theirs.iter().map(|unit| relative(unit, at(1, 0))));
+    let (_, single) = first.units(&alone, first_tables).unwrap();
+    let mut dealt: Vec<_> = (ours.iter().map(|unit| relative(unit, at(0, 0))))
+        .chain(theirs.iter().map(|unit| relative(unit, at(1, 0))))
+        .collect();
+    dealt[2].2 = ours[1].1.1.map(|(sent, ..)| sent - at(0, 0));
     let single: Vec<_> = single.iter().map(|unit| relative(unit, at(0, 0))).collect();
-    assert_eq!(dealt.collect::<Vec<_>>(), single);
+    assert_eq!(dealt, single);
 
-    // The hand-off rank 0 makes is the one rank 1 takes for unit 2.
-    first.hand(&first_tables, SLOT, ours[1].1.1).unwrap();
-    second.take(&second_tables, SLOT, theirs[0].2.0).unwrap();
-
-    // The next round's units are rank 0's, and unit 4 reads unit 3's tail where rank 1 left it,
-    // with no hand-off; rank 1 decodes nothing of it.
+    // The next round is dealt in reverse: its units are rank 1's, and unit 4 fades against unit
+    // 3's tail where rank 1 left it, exchanging nothing; rank 0 decodes nothing of it.
     let next = long_round(4, vec![0, 5, 1, 6, 7], 2);
-    let (_, ours) = first.units(&next, &first_tables).unwrap();
-    let (_, theirs) = second.units(&next, &second_tables).unwrap();
-    assert_eq!(windows(&ours), [at(0, 0) + 64, at(0, 0) + 80]);
-    assert_eq!(ours[0].2.1.copies()[0].source, tail(1, 3));
-    assert_eq!((ours[0].1.1, ours[0].2.0), (None, None));
-    assert!(theirs.is_empty());
+    let (_, ours) = first.units(&next, first_tables).unwrap();
+    let (_, theirs) = second.units(&next, second_tables).unwrap();
+    assert!(ours.is_empty());
+    assert_eq!(windows(&theirs), [at(1, 0) + 64, at(1, 0) + 80]);
+    assert_eq!(theirs[0].2.1.copies()[0].source, tail(1, 3));
+    assert_eq!(exchanged(&theirs), [[None, None]; 2]);
 
     // A row that names no rank covers one round from its first unit.
     assert!(
         first
-            .units(&long_round(2, vec![0, 3, 1, 4, 5], 2), &first_tables)
+            .units(&long_round(2, vec![0, 3, 1, 4, 5], 2), first_tables)
             .is_err()
     );
     let wide = long_round(0, vec![0, 1, 2, 3, 4, 5, 6], 1);
-    assert!(first.units(&wide, &first_tables).is_err());
+    assert!(first.units(&wide, first_tables).is_err());
+}
+
+#[test]
+fn a_share_of_one_unit_receives_its_predecessor_s_tail_and_sends_its_own() {
+    let ranks = dealt_ranks(3, 1);
+    let units = |call: &Batch| -> Vec<Vec<Unit>> {
+        ranks
+            .iter()
+            .map(|(runner, tables)| runner.units(call, tables).unwrap().1)
+            .collect()
+    };
+
+    // Round 0 deals units 0, 1 and 2 to members 0, 1 and 2: each but the first receives its
+    // predecessor's tail from the member before it, and each but the last sends its own to the
+    // member after it, a share of one unit doing both at once.
+    let round = units(&long_round(0, vec![0, 1, 2, 3, 4], 1));
+    assert_eq!(exchanged(&round[0]), [[Some((1, TAIL)), None]]);
+    assert_eq!(exchanged(&round[1]), [[Some((2, TAIL)), Some((0, TAIL))]]);
+    assert_eq!(exchanged(&round[2]), [[None, Some((1, TAIL))]]);
+
+    // Round 1 deals units 3, 4 and 5 to members 2, 1 and 0: unit 3 fades against unit 2's tail
+    // in member 2's own run, and the tails pass the other way; unit 5 ends the timeline and
+    // leaves none.
+    let round = units(&long_round(3, vec![0, 4, 1, 5, 6, 7], 2));
+    assert_eq!(windows(&round[2]), [at(2, 0) + 48]);
+    assert_eq!(round[2][0].2.1.copies()[0].source, tail(2, 2));
+    assert_eq!(exchanged(&round[2]), [[Some((1, TAIL)), None]]);
+    assert_eq!(exchanged(&round[1]), [[Some((0, TAIL)), Some((2, TAIL))]]);
+    assert_eq!(exchanged(&round[0]), [[None, Some((1, TAIL))]]);
+    assert!(round[0][0].1.0.is_empty());
 }
 
 /// What `unit` reads and writes, from `base`, the first byte of its rank's products: its
 /// window, the tail it leaves, the tail it fades against, its splice and its bytes.
-fn relative(unit: &super::Unit, base: u64) -> (u64, Option<u64>, Option<u64>, Option<Splice>, u64) {
+fn relative(unit: &Unit, base: u64) -> (u64, Option<u64>, Option<u64>, Option<Splice>, u64) {
     let (before, (left, _), (_, fade, splice), kept) = unit;
     let first = |copies: &PitchedBatch| copies.copies().first().copied();
 
@@ -567,23 +671,6 @@ fn relative(unit: &super::Unit, base: u64) -> (u64, Option<u64>, Option<u64>, Op
         *splice,
         kept - base,
     )
-}
-
-#[test]
-fn a_rank_decodes_its_unit_before_the_rank_of_the_predecessor_hands_it_the_tail() {
-    let [(first, first_tables), (mut second, second_tables)] = two_ranks();
-    let call = long_round(0, vec![0, 1, 2, 3, 4, 5], 1);
-
-    // Rank 1 issues unit 2's decode while rank 0 has handed it no tail: graphs that hold no
-    // device refuse that replay, where a rank that waited for the tail first would still wait.
-    let refused = second.execute(&call, &second_tables).unwrap_err();
-    assert!(matches!(refused, Error::State(_)), "{refused}");
-
-    // Only then does rank 0 hand unit 1's tail, which rank 1's splice of unit 2 takes.
-    let (_, ours) = first.units(&call, &first_tables).unwrap();
-    let (_, theirs) = second.units(&call, &second_tables).unwrap();
-    first.hand(&first_tables, SLOT, ours[1].1.1).unwrap();
-    second.take(&second_tables, SLOT, theirs[0].2.0).unwrap();
 }
 
 #[test]

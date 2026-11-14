@@ -880,8 +880,9 @@ pub struct MediaRow {
     pub unit: u32,
     /// The rank of the batch's worker group that runs this row when the call is that one rank's
     /// alone. `None` when every rank of the group runs its share: a video decode round, whose
-    /// units are dealt in order to the ranks of the decoder group, each decoding its own, and the
-    /// encode of a round, which reads its units wherever they lie in the process.
+    /// units are dealt to the ranks of the decoder group, in order in an even round and in reverse
+    /// in an odd one, each decoding its own, and the encode of a round, which reads its units
+    /// wherever they lie in the process.
     pub rank: Option<u32>,
     /// A chat image's encoded bytes, base64, for the vision or latent encoding of a token
     /// request's image; `None` for every other row.

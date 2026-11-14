@@ -128,7 +128,8 @@ fn checked_product(degrees: &[usize]) -> Result<usize, BlockConfigError> {
 pub enum BlockDistribution {
     /// Every member rank runs its own local copy, and independent media
     /// units are dealt to the ranks in `ranks` order, `units_per_rank`
-    /// consecutive units each.
+    /// consecutive units each; a video decoder deals every other round of
+    /// its timeline in the reverse order.
     TemporalUnits,
 }
 

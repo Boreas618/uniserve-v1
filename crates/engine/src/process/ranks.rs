@@ -866,8 +866,9 @@ fn encoder_bytes(model: &dyn TextModel, rows: u32) -> Result<u64> {
 /// Loads a rank of a media deployment onto `backing` (steps 3-10), over `client`, its Storage
 /// Server client (`None` on the meta device), on `device`:
 ///
-/// - the text encoders' tensor groups and the denoisers' sequence groups over the process's host
-///   group `host`, each a block's ranks (`ModelRunner::media_collectives`);
+/// - the text encoders' tensor groups, the denoisers' sequence groups and the communicators of
+///   the video decoders' ranks over the process's host group `host`, each a block's ranks
+///   (`ModelRunner::media_collectives`);
 /// - the meta load of the stages its group places and its runners' profile run
 ///   (`ModelRunner::profile_media`), which states their peaks, buffers and kernels, a slot's
 ///   row and on a denoising rank the products' sizes;
@@ -884,13 +885,15 @@ fn load_video_rank(
     backing: Backing<'_>,
 ) -> Result<LoadedRank> {
     // Step 3: the parallel groups' communicators, opened before any device measurement because
-    // NCCL keeps device buffers. Every rank forms both kinds, in this order.
-    let (tensor, sequence) = model_runner.media_collectives()?;
+    // NCCL keeps device buffers. Every rank forms the three kinds, in this order.
+    let [tensor, sequence, decoder] = model_runner.media_collectives()?;
     let communicates = client.is_some();
     let tensor = group_over(&host, device, &tensor, communicates)
         .context("forming the text encoder's tensor group")?;
     let sequence = group_over(&host, device, &sequence, communicates)
         .context("forming the denoiser's sequence group")?;
+    let decoder = communicator_over(&host, device, &decoder, communicates)
+        .context("forming the video decoder ranks' communicator")?;
 
     // Steps 4-8: the meta load and the runners' profile run.
     let meta = model_runner
@@ -899,6 +902,7 @@ fn load_video_rank(
     let tasks = u32::try_from(media_tasks()).unwrap_or(u32::MAX);
     let (mut video, keys) = model_runner.profile_media(meta, (tensor, sequence), tasks)?;
     video.host = Some(host);
+    video.decoder = decoder;
 
     let (storage, resolve) = match backing {
         Backing::Serving { storage, kernels } => (storage, kernels),
@@ -976,21 +980,35 @@ fn join_hook(targets: Members, place: usize) -> JoinHook {
     })
 }
 
-/// The communicator of the collective group of `collective` this rank is a member of, absent for
-/// a group of one and for a start that `communicates` none.
-///
-/// A group that communicates forms its NCCL communicator: each group's first member draws the
-/// group's id and the host group carries it, one broadcast per group of more than one member,
-/// which every member of the host group takes part in, in the order the groups are stated;
-/// `Communicator::init` then blocks until every member of the rank's own group joined. One that
-/// does not states the split alone, which the runner's graphs take
-/// ([`Graphs::set_group`]).
+/// The group a runner's collectives of `collective` go through ([`communicator_over`]), absent
+/// for a group of one and for a start that `communicates` none. One that does not communicate
+/// states the split alone, which the runner's graphs take ([`Graphs::set_group`]).
 fn group_over(
     host: &HostGroup,
     device: DeviceId,
     collective: &Collective,
     communicates: bool,
 ) -> Result<Option<Arc<ops::Group>>> {
+    let communicator = communicator_over(host, device, collective, communicates)?;
+
+    communicator
+        .map(|communicator| Ok(Arc::new(ops::Group::new(communicator)?)))
+        .transpose()
+}
+
+/// The communicator of the collective group of `collective` this rank is a member of, absent for
+/// a group of one and for a start that `communicates` none.
+///
+/// A group that communicates forms its NCCL communicator: each group's first member draws the
+/// group's id and the host group carries it, one broadcast per group of more than one member,
+/// which every member of the host group takes part in, in the order the groups are stated;
+/// `Communicator::init` then blocks until every member of the rank's own group joined.
+fn communicator_over(
+    host: &HostGroup,
+    device: DeviceId,
+    collective: &Collective,
+    communicates: bool,
+) -> Result<Option<platform::Communicator>> {
     let members = host.size();
     for group in &collective.groups {
         if group.len() > 1 && group.iter().any(|member| *member >= members) {
@@ -1037,7 +1055,7 @@ fn group_over(
     let member = i32::try_from(rank).context("a rank past what NCCL addresses")?;
     let communicator = platform::Communicator::init(device, size, member, &id)
         .context("joining a communicator")?;
-    Ok(Some(Arc::new(ops::Group::new(communicator)?)))
+    Ok(Some(communicator))
 }
 
 /// The session's numbers of the deployment's worker groups `groups` and each scheduler's groups,
@@ -3070,7 +3088,7 @@ fn open_media_runners(
             &model,
             &memory,
             |_, inputs| Ok((Graphs::meta(Arc::clone(kernels), inputs), None)),
-            (None, None),
+            (None, None, None),
             &classes,
         )?),
         Some(pool) => {
@@ -3101,7 +3119,11 @@ fn open_media_runners(
                         streams.push(("device", stream.clone()));
                         Ok((graphs, Some(stream)))
                     },
-                    (video.tensor.clone(), video.sequence.clone()),
+                    (
+                        video.tensor.clone(),
+                        video.sequence.clone(),
+                        video.decoder.take(),
+                    ),
                     &classes,
                 )?
             };

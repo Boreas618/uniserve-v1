@@ -19,17 +19,20 @@
 //!    window of the trajectory, the latent frames from `Decoder::clip_start`, or the whole track)
 //!    and its bucket's graph replays: the window gathered and decoded into the runner's raster
 //!    buffer, or the track decoded and interleaved into 16-bit PCM. A clip that a successor fades
-//!    against then copies the raster's last frames into its tail block.
+//!    against then copies the raster's last frames into its tail block, and exchanges tails with
+//!    the ranks that decode its neighbours in the call ("The tail a unit fades against").
 //! 2. **The splice** of a clip a splicer places. A clip whose splice fades against its
-//!    predecessor has the predecessor's tail copied into the runner's tail buffer, and the splice
-//!    runs eagerly: the raster placed under the unit's splice and packed into bytes.
+//!    predecessor has the predecessor's tail in the runner's tail buffer, copied from this rank's
+//!    run or received from another rank, and the splice runs eagerly: the raster placed under the
+//!    unit's splice and packed into bytes.
 //! 3. The unit's output is copied into its product: the bytes of its splice into the video units
 //!    block from the splice's first frame, the raster of a clip no splicer places, or the PCM into
 //!    the audio samples block.
 //!
 //! Every address is computed and every block checked before anything is issued: a position the
 //! tables hold no entry for, a write to a read-only entry, or bytes past a block refuse the
-//! batch. The copies are the driver's, so the forwards' launches are the only kernels of a call.
+//! batch. The copies are the driver's, so the forwards' launches and the tails' exchanges are the
+//! only kernels of a call.
 //!
 //! ## Why a clip's splice runs eagerly
 //!
@@ -53,6 +56,15 @@
 //! | Audio latents | The track's elements in `Decoder::latent_type` |
 //! | Audio samples | `[samples, 2]` interleaved `i16` |
 //!
+//! ## The deal
+//!
+//! A round whose row names no rank is dealt in shares of [`RoundConfig::units`] consecutive
+//! units, the round's `i`-th share to the `i`-th of [`RoundConfig::ranks`] when the round's index
+//! in the timeline is even and to the `i`-th from the last when it is odd
+//! ([`RoundConfig::rank_of`]). Every round but the last is whole, so the rank that decodes the
+//! last unit of a round decodes the first unit of the round after it. The media host finds each
+//! unit it encodes by the same deal, in the run of the rank that decoded it.
+//!
 //! ## The tail a unit fades against
 //!
 //! Each rank writes the tail of a unit it decodes into its own run of the unit's tail block. The
@@ -60,32 +72,35 @@
 //!
 //! - **The same rank, the same call.** The unit after it on the rank's stream reads the run the
 //!   stream wrote.
-//! - **Another rank, the same call.** A round's units are dealt to the ranks in order, so the
-//!   first unit of a rank's share follows the last of the share before it. The rank that decodes
-//!   the predecessor copies its tail into the successor's rank's run of the tail block behind its
-//!   own tail copy, which follows the decode alone, and hands that rank an event recorded behind
-//!   it ([`BufferMemory::hand_off`]) before it waits for any tail itself. The successor's rank
-//!   decodes its unit first, then waits on the host for the hand-off, which is the other rank's
-//!   issue and not its completion, and its stream waits for the event before the splice's copies
-//!   ([`BufferMemory::take_hand_off`]). This is the only wait between workers
-//!   (`specs/engine-worker-port.md` §2.2): the ranks of a round decode at once, and a splice
-//!   waits for its predecessor's decode, never for another splice.
+//! - **Another rank, the same call.** The first unit of a rank's share follows the last of the
+//!   share dealt before it, which another rank decodes. That rank sends the tail from its run of
+//!   the tail block, behind the tail's copy, which follows the decode alone, and this rank
+//!   receives it into its tail buffer behind its own unit's decode: one point-to-point exchange
+//!   over the decoder ranks' communicator per pair of consecutive shares, the same between two
+//!   ranks of one process as between two hosts. A unit that both receives a tail and sends one
+//!   (a share of one unit) does both in one exchange. The receiving stream waits on the device
+//!   for the sent tail, and each rank's host waits for its stream once it issued an exchange, as
+//!   after any collective outside a capture (`DecoderRunner::exchange`): the ranks of a round
+//!   decode their first units at once, and a splice waits for its predecessor's tail, which
+//!   follows that unit's decode on its rank's stream.
 //! - **An earlier call.** The first unit of a round reads the tail of the round before it, which
 //!   the scheduler gives it only once that round completed, and `execute` returns only once its
-//!   stream passed every copy: the write is ordered before the read by completion, and the read
-//!   finds the tail where it lies, in the run of the rank that decoded the round's last unit,
-//!   which the device reaches by peer access. A row that names a rank reads it from that rank's
-//!   own run, where its earlier rounds wrote it.
+//!   stream passed every copy: the write is ordered before the read by completion. The deal puts
+//!   that tail in the rank's own run, where the round before it left it, and a row that names a
+//!   rank reads it from that rank's own run too: no call reads another rank's run of a tail.
 
 use std::cell::Cell;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use crate::batch::{Batch, BatchOutput, Extent, MediaRow, Phase, TimingCounters};
 use nn::{Clip, Decoder, Splice, Splicer};
 use ops::pcm::{self, PcmInterleave};
 use ops::rgb::{self, RgbBytes};
-use platform::{Event, EventFlags, Pitched, PitchedBatch, SourceOrder, Stream};
+use platform::{
+    Communicator, DevicePtr, DeviceRange, Event, EventFlags, Pitched, PitchedBatch, SourceOrder,
+    Stream,
+};
 use proto::video::Layout;
 use tensor::{DType, Device, Shape, Tensor};
 
@@ -105,25 +120,26 @@ const CHANNELS: u64 = rgb::CHANNELS as u64;
 /// The channels of the interleaved PCM.
 const PCM_CHANNELS: u32 = 2;
 
-/// How long a unit's rank waits for the tail another rank hands it before it names the rank that
-/// never handed one: the other rank's issue of one round's units, behind whatever batch it still
-/// runs.
-const TAIL_WAIT: Duration = Duration::from_secs(120);
+/// The `ncclDataType_t` code a tail travels as between the decoder ranks: `ncclUint8`, so its
+/// element count is its bytes whatever the decoder's element type.
+const TAIL_ELEMENT: i32 = 1;
 
 /// What one unit of a call issues, in the order `serve` issues it (module documentation):
 ///
 /// - the copies before its decode: the clip's window or the track into the latent buffer;
 /// - the tail it leaves its successor: the copy of the raster's last frames into its tail block
 ///   behind the decode, and, when another rank decodes the successor in this call, the tail's
-///   address, the rank it is handed to, the tail block's position and its bytes;
-/// - its splice: the position of the tail block whose hand-off it takes first, the copy of the
-///   predecessor's tail into the tail buffer, and the splice it places, `None` for a unit whose
+///   address in that block, the member of the decoder ranks' communicator it is sent to, and its
+///   bytes;
+/// - its splice: when another rank decoded its predecessor in this call, the member that sends
+///   the predecessor's tail into the tail buffer and its bytes; otherwise the copy of the
+///   predecessor's tail into the tail buffer; and the splice it places, `None` for a unit whose
 ///   decode is its output;
 /// - the address in the product buffer its output lands at.
 type Unit = (
     PitchedBatch,
-    (PitchedBatch, Option<(u64, u32, u32, u64)>),
-    (Option<u32>, PitchedBatch, Option<Splice>),
+    (PitchedBatch, Option<(u64, u32, u64)>),
+    (Option<(u32, u64)>, PitchedBatch, Option<Splice>),
     u64,
 );
 
@@ -151,12 +167,14 @@ pub(crate) struct DecoderConfig {
 /// How the units of a video's decode rounds are dealt to the ranks of the decoder group: the
 /// deployment's video decoder block, its ranks in order and the units each decodes in a round.
 /// The scheduler cuts a timeline into rounds of [`RoundConfig::width`] units from unit 0; the
-/// decoders deal each round's units in order, and the media host finds each unit it encodes in
-/// the run of the rank that decoded it. Immutable once a runner is built.
+/// decoders deal each round's shares to the ranks in order or in reverse order, alternately
+/// (module documentation), and the media host finds each unit it encodes in the run of the rank
+/// that decoded it. Immutable once a runner is built.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct RoundConfig {
-    /// The ranks a round's units are dealt to, in order, each by its rank index in the process's
-    /// media memory (`BufferMemory::rank`).
+    /// The ranks a round's units are dealt to, in the order of an even round, each by its rank
+    /// index in the process's media memory (`BufferMemory::rank`). A rank's place here is its
+    /// member index in the decoder ranks' communicator.
     pub ranks: Vec<u32>,
     /// The consecutive units each rank decodes in a round.
     pub units: u32,
@@ -170,12 +188,28 @@ impl RoundConfig {
         ranks.saturating_mul(self.units)
     }
 
-    /// The rank that decodes unit `unit` of a timeline: the rank of `ranks` whose share of its
-    /// round holds it. `None` for a deal of no unit.
+    /// The rank that decodes unit `unit` of a timeline: the rank its round deals the share that
+    /// holds it, round `k`'s `i`-th share going to the `i`-th of `ranks` for an even `k` and to
+    /// the `i`-th from the last for an odd one. So the first unit of round `k + 1` falls to the
+    /// rank of the last unit of round `k`, whole as every round but the last is. `None` for a
+    /// deal of no unit.
     pub(crate) fn rank_of(&self, unit: u32) -> Option<u32> {
-        let position = unit.checked_rem(self.width())?.checked_div(self.units)?;
+        let round = unit.checked_div(self.width())?;
+        let share = unit.checked_rem(self.width())?.checked_div(self.units)? as usize;
+        let place = match round % 2 {
+            0 => share,
+            _ => self.ranks.len().checked_sub(share + 1)?,
+        };
 
-        self.ranks.get(position as usize).copied()
+        self.ranks.get(place).copied()
+    }
+
+    /// The place of rank `rank` among `ranks`: its member index in the decoder ranks'
+    /// communicator. `None` for a rank no round is dealt to.
+    pub(crate) fn member(&self, rank: u32) -> Option<u32> {
+        let place = self.ranks.iter().position(|&dealt| dealt == rank)?;
+
+        u32::try_from(place).ok()
     }
 
     /// Whether the configuration deals a round: at least one unit to each rank, and each rank
@@ -198,6 +232,11 @@ pub(crate) struct DecoderRunner {
     memory: Arc<BufferMemory>,
     /// The stream the graphs replay on; `None` for graphs that hold no device.
     stream: Option<Stream>,
+    /// A video decoder's communicator with the other ranks its rounds are dealt to, its member
+    /// index the rank's place among them ([`RoundConfig::member`]), over which a round's tails
+    /// pass between consecutive shares on `stream`; `None` for graphs that hold no device and
+    /// for a round of one rank. The runner alone issues on it, from its worker's thread.
+    communicator: Option<Communicator>,
     /// Recorded behind a batch's last copy: what `execute` waits for.
     done: Option<Event>,
     /// Each bucket's latent layout: the model's map of a clip, or a track's own.
@@ -220,6 +259,9 @@ impl DecoderRunner {
     /// - `graphs` are made for no input tensors: a decode's host values are its forward's.
     /// - `stream` is the stream `graphs` replay on, on which the runner issues its copies; `None`
     ///   for graphs that hold no device, whose runner computes over meta tensors.
+    /// - `communicator` is the decoder ranks' communicator a video decoder on a device whose
+    ///   rounds are dealt to more than one rank exchanges its tails over; `None` for any other
+    ///   runner, which exchanges none.
     ///
     /// # Errors
     ///
@@ -227,15 +269,16 @@ impl DecoderRunner {
     /// that states a request (a splice's, [`Runner::eager_buckets`]), a video
     /// decoder serving no timeline or with a round that deals no unit to its memory's rank, a
     /// splicer of another element type, a track that is not stereo, a stream without a device or
-    /// the reverse; what the model or the splicer refuses:
-    /// a canvas the model lays out no clip of, a timeline the splicer has no splices of; the
-    /// driver's refusal of the buffers.
+    /// the reverse; a communicator a runner on a device whose rounds pass tails between ranks
+    /// lacks, or one another runner holds or whose members are not the round's ranks with this
+    /// rank at its place; what the model or the splicer refuses: a canvas the model lays out no
+    /// clip of, a timeline the splicer has no splices of; the driver's refusal of the buffers.
     pub(crate) fn new(
         model: Arc<dyn Decoder + Send + Sync>,
         splicer: Option<Arc<dyn Splicer + Send + Sync>>,
         config: DecoderConfig,
         graphs: Graphs,
-        stream: Option<Stream>,
+        (stream, communicator): (Option<Stream>, Option<Communicator>),
         memory: Arc<BufferMemory>,
     ) -> Result<Self> {
         if graphs.enter().is_ok() != stream.is_some() || config.buckets.is_empty() {
@@ -244,6 +287,36 @@ impl DecoderRunner {
                  that hold no device"
                     .into(),
             ));
+        }
+
+        // A clip decoder on a device whose rounds go to several ranks passes tails between them
+        // over a communicator of exactly those ranks, at this rank's place; no other runner
+        // holds one.
+        let clips = config
+            .buckets
+            .iter()
+            .any(|bucket| matches!(bucket.extent, Extent::Clip { .. }));
+        let exchanges = clips && stream.is_some() && config.round.ranks.len() > 1;
+        let joined = communicator.as_ref().map(|communicator| {
+            let members = usize::try_from(communicator.size()).ok();
+            let place = u32::try_from(communicator.rank()).ok();
+            members == Some(config.round.ranks.len()) && place == config.round.member(memory.rank())
+        });
+        if joined != exchanges.then_some(true) {
+            return Err(Error::Invalid(format!(
+                "the decoder of rank {} deals its rounds as {:?}, {} a device, and holds {}: a \
+                 clip decoder on a device whose rounds go to several ranks passes its tails over \
+                 a communicator of exactly those ranks at this rank's place, and no other \
+                 decoder holds one",
+                memory.rank(),
+                config.round,
+                if stream.is_some() { "on" } else { "on no" },
+                match joined {
+                    Some(true) => "such a communicator",
+                    Some(false) => "a communicator of other members or another place",
+                    None => "no communicator",
+                },
+            )));
         }
         if let Some(splicer) = &splicer
             && splicer.element_type() != model.element_type()
@@ -359,6 +432,7 @@ impl DecoderRunner {
             graphs,
             memory,
             stream,
+            communicator,
             layouts,
             staged: Cell::new(None),
             buffers,
@@ -426,28 +500,6 @@ impl DecoderRunner {
             DType::U8,
         )?;
         address(&block)
-    }
-
-    /// The address of the first `bytes` bytes of the run on rank `rank` of the process of the
-    /// block `row`'s slot holds at `position` of `class`, which the call reads.
-    fn read_on(
-        &self,
-        tables: &BlockTables,
-        row: &MediaRow,
-        (class, position): (u8, u32),
-        rank: u32,
-        bytes: u64,
-    ) -> Result<u64> {
-        let runs = tables.runs(row.slot, class, position);
-        let run = self.memory.run_on(runs, rank).ok_or_else(|| {
-            Error::Invalid(format!(
-                "the block of slot {} at position {position} of class {class} has no run on rank \
-                 {rank} of this process",
-                row.slot
-            ))
-        })?;
-
-        self.memory.address(run, 0, bytes)
     }
 
     /// Checks `batch` and states its call: the bucket that holds it and the units it decodes.
@@ -530,6 +582,15 @@ impl DecoderRunner {
             Some(_) => Some(own),
             None => round.rank_of(unit),
         };
+        // The member of the decoder ranks' communicator another rank of the deal is.
+        let member = |rank: u32| {
+            round.member(rank).ok_or_else(|| {
+                Error::Invariant(format!(
+                    "rank {rank} is none of the ranks {:?} a round is dealt to",
+                    round.ranks
+                ))
+            })
+        };
 
         // A latent frame's bytes of one channel, and a decoded frame's in the raster and packed.
         let video = self.layout(bucket)?.video;
@@ -597,8 +658,10 @@ impl DecoderRunner {
             }
 
             // The tail it fades against: the round's own before it, or the one before the round,
-            // found as the module documentation states by the rank that decodes its predecessor.
-            let (mut taken, mut fade) = (None, copies());
+            // read where the module documentation states by the rank that decodes its
+            // predecessor: from this rank's run of its block, or received from another rank of
+            // this call straight into the tail buffer.
+            let (mut received, mut fade) = (None, copies());
             if splice.overlap > 0 {
                 let previous = match index {
                     0 => row.results.get(1),
@@ -612,21 +675,24 @@ impl DecoderRunner {
                     )));
                 };
                 let bytes = CHANNELS * u64::from(splice.overlap) * raster;
-                let read = (tail_class, previous);
-                let source = match before_rank {
-                    rank if rank == own => self.place(tables, row, read, false, (0, bytes))?,
-                    _ if index > 0 => {
-                        taken = Some(previous);
-                        self.read_on(tables, row, read, own, bytes)?
-                    }
-                    rank => self.read_on(tables, row, read, rank, bytes)?,
-                };
-                fade.push(pitched(
-                    (base + self.tail, bytes),
-                    (source, bytes),
-                    bytes,
-                    1,
-                )?)?;
+                if before_rank == own {
+                    let read = (tail_class, previous);
+                    let source = self.place(tables, row, read, false, (0, bytes))?;
+                    fade.push(pitched(
+                        (base + self.tail, bytes),
+                        (source, bytes),
+                        bytes,
+                        1,
+                    )?)?;
+                } else if index > 0 {
+                    received = Some((member(before_rank)?, bytes));
+                } else {
+                    return Err(Error::Invariant(format!(
+                        "rank {before_rank} decoded the unit before the round from unit {unit}, \
+                         which the deal gives rank {own}: a round's first unit falls to the \
+                         rank of the last unit of the round before it"
+                    )));
+                }
             }
 
             // The bytes of its own splice, from the splice's first frame of the timeline.
@@ -637,9 +703,10 @@ impl DecoderRunner {
             let kept = self.place(tables, row, (media_class, media), true, at)?;
 
             // The tail it leaves its successor: the end of each channel's frames of the raster,
-            // `[3, frames, rows, columns]`, handed to the successor's rank when another rank
-            // decodes it in this call; one the next round reads stays where it lies.
-            let (mut left, mut handed) = (copies(), None);
+            // `[3, frames, rows, columns]`, packed into its tail block, from which it is sent to
+            // the successor's rank when another rank decodes it in this call; one the next round
+            // reads stays where it lies, which the deal makes that round's first rank's run.
+            let (mut left, mut sent) = (copies(), None);
             if successor > 0 {
                 // A channel's last frames and its whole frames, then the tail's bytes.
                 let (end, length) = (u64::from(successor) * raster, u64::from(frames) * raster);
@@ -654,13 +721,11 @@ impl DecoderRunner {
 
                 let reader = decoder(unit + 1).filter(|&rank| rank != own);
                 if let Some(reader) = reader.filter(|_| index + 1 < tails.len()) {
-                    // The reader backs the tail block: checked before anything is issued.
-                    self.read_on(tables, row, (tail_class, position), reader, bytes)?;
-                    handed = Some((at, reader, position, bytes));
+                    sent = Some((at, member(reader)?, bytes));
                 }
             }
             let splice = Some(Splice { first: 0, ..splice });
-            units.push((before, (left, handed), (taken, fade, splice), kept));
+            units.push((before, (left, sent), (received, fade, splice), kept));
         }
         Ok(units)
     }
@@ -694,43 +759,72 @@ impl DecoderRunner {
         Ok((before, (copies(), None), (None, copies(), None), kept))
     }
 
-    /// Waits for the tail another rank hands this one into its run of the tail block `slot`
-    /// holds at `taken`, when the unit takes one, and orders the runner's stream after its copy.
-    fn take(&self, tables: &BlockTables, slot: u32, taken: Option<u32>) -> Result<()> {
-        let Some(position) = taken else {
-            return Ok(());
-        };
-        let entry = (slot, self.config.classes[2], position);
-
-        self.memory
-            .take_hand_off(tables, entry, self.stream.as_ref(), TAIL_WAIT)
-    }
-
-    /// Hands the tail a unit left in this rank's run at the address `handed` names to the rank it
-    /// names, which decodes the unit's successor in the same call: copied into that rank's run of
-    /// the tail block on the runner's stream, behind the unit's own tail copy.
-    fn hand(
+    /// Exchanges a unit's tails with the ranks that decode its neighbours in the call, on the
+    /// runner's stream over the decoder ranks' communicator (module documentation): `sent`, the
+    /// address of the tail the unit left in this rank's run of its tail block, the member that
+    /// decodes its successor and the tail's bytes; `received`, the member that decoded its
+    /// predecessor and the bytes of the tail that member sends into the tail buffer. Both go in
+    /// one NCCL group, so a rank that does both waits for neither peer before the other.
+    ///
+    /// A send and a receive wait on the device for their peer. A first launch of a kernel takes
+    /// a lock of the whole process and waits for its device to drain, and the decoder ranks of a
+    /// host are threads of one process, so a rank that went on to its splice's eager launches
+    /// could hold that lock while its peer, waiting for it, queues on the lock in front of its
+    /// own send (`ops::collective::settle`): the stream is therefore waited for here. A runner
+    /// whose graphs hold no device states the exchange and issues nothing.
+    ///
+    /// # Safety
+    ///
+    /// For a runner on a device, `sent`'s `bytes` from its address lie in device memory that
+    /// stays unwritten until the stream has passed the exchange.
+    unsafe fn exchange(
         &self,
-        tables: &BlockTables,
-        slot: u32,
-        handed: Option<(u64, u32, u32, u64)>,
+        sent: Option<(u64, u32, u64)>,
+        received: Option<(u32, u64)>,
     ) -> Result<()> {
-        let Some((at, reader, position, bytes)) = handed else {
+        if sent.is_none() && received.is_none() {
+            return Ok(());
+        }
+        let Some(stream) = &self.stream else {
             return Ok(());
         };
-        let entry = (slot, self.config.classes[2], position);
+        let communicator = self.communicator.as_ref().ok_or_else(|| {
+            Error::Invariant(
+                "a decoder that passes tails between ranks holds no communicator".into(),
+            )
+        })?;
+        // Each side's range, its bytes and its peer, as NCCL takes them: the sent tail from its
+        // block, the received one into the tail buffer, which holds the largest tail of the
+        // deployment's splices (`new`).
+        let tail = self.buffers.as_ref().map_or(0, |storage| storage.address()) + self.tail;
+        let side = |address: u64, member: u32, bytes: u64| -> Result<(DeviceRange, usize, i32)> {
+            let length = usize::try_from(bytes)
+                .map_err(|_| Error::Invalid("a tail exceeds memory".into()))?;
+            let peer = i32::try_from(member)
+                .map_err(|_| Error::Invalid(format!("member {member} is past NCCL's ranks")))?;
+            let range = DeviceRange::new(DevicePtr::from_address(address), length);
+            Ok((range, length, peer))
+        };
+        let sent = sent
+            .map(|(at, to, bytes)| side(at, to, bytes))
+            .transpose()?;
+        let received = received
+            .map(|(from, bytes)| side(tail, from, bytes))
+            .transpose()?;
 
-        // SAFETY: `at` is the first byte of this rank's run of the tail block, which the unit's
-        // copies wrote on this stream before and nothing writes again until the batch ended: the
-        // block is the request's, and its next write is a later call's.
-        unsafe {
-            self.memory
-                .hand_off(tables, entry, (at, bytes), reader, self.stream.as_ref())
-        }?;
-        Ok(())
+        platform::nccl::group(|| {
+            if let Some((range, count, peer)) = sent {
+                communicator.send(stream, range, count, TAIL_ELEMENT, peer)?;
+            }
+            if let Some((range, count, peer)) = received {
+                communicator.recv(stream, range, count, TAIL_ELEMENT, peer)?;
+            }
+            Ok(())
+        })?;
+        Ok(stream.synchronize()?)
     }
 
-    /// Serves `batch`: every unit's decode, tail and splice on the stream, with the hand-offs of
+    /// Serves `batch`: every unit's decode, tail and splice on the stream, with the exchanges of
     /// the tails between the ranks (module documentation). Returns when the units were issued,
     /// for a batch that names a call. A runner whose graphs hold no device issues no copy, and
     /// its graphs refuse the first replay.
@@ -740,20 +834,17 @@ impl DecoderRunner {
             return Ok(None);
         }
         let (bucket, units) = self.units(batch, tables)?;
-        let (slot, frames) = batch
-            .media
-            .first()
-            .map_or((0, 0), |row| (row.slot, row.frames));
+        let frames = batch.media.first().map_or(0, |row| row.frames);
 
-        // Every copy below is safe for one reason: each range lies in a block the tables give
-        // this call or in the runner's buffers (`units`), which stay mapped until the batch
-        // ends, and a forward's outputs stay until the next forward. The stream orders each
-        // copy after the forward before it, and a buffer's next write after the forward that
-        // read it.
+        // Every copy and exchange below is safe for one reason: each range lies in a block the
+        // tables give this call or in the runner's buffers (`units`), which stay mapped until
+        // the batch ends, and a forward's outputs stay until the next forward. The stream orders
+        // each copy and exchange after the forward before it, and a buffer's next write after
+        // the forward that read it; a tail block this call wrote is written by no later call.
         let launched = Instant::now();
-        for (before, (left, handed), (taken, fade, splice), kept) in &units {
-            // The decode reads the unit's latents alone, so it waits for no other rank; the tail
-            // it leaves is handed on before this rank waits for one.
+        for (before, (left, sent), (received, fade, splice), kept) in &units {
+            // The decode reads the unit's latents alone, so it waits for no other rank; the
+            // exchange follows the tail it leaves.
             self.graphs.prepare_inputs(self, &bucket, |_| Ok(()))?;
             // SAFETY: as stated above the loop.
             unsafe { self.submit(before) }?;
@@ -761,11 +852,12 @@ impl DecoderRunner {
 
             // SAFETY: as stated above the loop.
             unsafe { self.submit(left) }?;
-            self.hand(tables, slot, *handed)?;
+            // SAFETY: as stated above the loop.
+            unsafe { self.exchange(*sent, *received) }?;
 
-            // The splice fades against its predecessor's tail, behind that tail's hand-off.
+            // The splice fades against its predecessor's tail, in the tail buffer once the
+            // exchange received it or the copy brought it from this rank's run.
             if let Some(splice) = *splice {
-                self.take(tables, slot, *taken)?;
                 // SAFETY: as stated above the loop.
                 unsafe { self.submit(fade) }?;
                 outputs = self.splice(&bucket, frames, splice)?;

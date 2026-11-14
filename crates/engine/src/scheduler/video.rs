@@ -441,8 +441,8 @@ impl Request {
     /// The media units one video decode round covers on the group that decodes the request's
     /// video: the ranks of its video decoder block, each taking the units the block deals a rank
     /// (`BlockConfig::rank_units`, `S/execution/media.rs:564-572`); 1 when the group states no
-    /// such block. Every rank of the group decodes its share of a round in one call, the round's
-    /// units dealt to the ranks in order (SD §3.3).
+    /// such block. Every rank of the group decodes its share of a round in one call, the rounds'
+    /// shares dealt to the ranks in order and in reverse alternately (SD §3.3).
     fn width(&self, groups: &[WorkerGroup]) -> u32 {
         let Some(block) = self
             .serving(Phase::VideoDecode, groups)

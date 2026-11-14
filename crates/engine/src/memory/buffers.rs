@@ -96,13 +96,9 @@
 //! output keeps one byte layout under every parallel configuration, its rows in order held whole
 //! by one rank, so its class states one encoding everywhere and its copies never need a manifest.
 //!
-//! Two more copies move a product between the ranks of a process, outside the buffer pool's:
-//!
-//! - [`BufferMemory::share`]: the rank that runs a call copies each output it wrote into its own
-//!   run to the runs of the backing ranks of its process that do not run the call.
-//! - [`BufferMemory::hand_off`] and [`BufferMemory::take_hand_off`]: the decode of a unit copies
-//!   its tail into the run the rank that decodes the next unit reads, and hands that rank an
-//!   event recorded behind the copy, which its stream waits for before its splice.
+//! One more copy moves a product between the ranks of a process, outside the buffer pool's:
+//! [`BufferMemory::share`], by which the rank that runs a call copies each output it wrote into
+//! its own run to the runs of the backing ranks of its process that do not run the call.
 //!
 //! ## Ordering
 //!
@@ -110,22 +106,20 @@
 //! that batch's forward, and the batch's end covers it. A block a batch writes is read by a later
 //! batch, which the scheduler forms only once the writer's output arrived, so every read is
 //! ordered after its write by completion, on whichever runner's stream either was issued, and a
-//! shared output reaches the other backing ranks before the runner returns its output. The one
-//! order inside a call is a tail's: its reader waits on the host for the hand-off, which is the
-//! writer's issue and not its completion, and its stream waits for the event.
+//! shared output reaches the other backing ranks before the runner returns its output. Nothing
+//! passes between two ranks' memories inside a call: the splice tail a decode round passes from
+//! one rank to the next travels over the decoder ranks' communicator (`runner::decoder`).
 //!
 //! ## Without a device
 //!
 //! [`BufferMemory::meta`] holds no memory: its tensors are meta tensors, its addresses are the
-//! byte offsets of each memory from 0, its copies are checked and issue nothing, and a hand-off
-//! hands no event. Its [`BufferMemory::byte_copies`] are the copies a memory on a device issues.
+//! byte offsets of each memory from 0, and its copies are checked and issue nothing. Its
+//! [`BufferMemory::byte_copies`] are the copies a memory on a device issues.
 
-use std::collections::HashMap;
 use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::{Arc, Condvar, Mutex};
-use std::time::{Duration, Instant};
+use std::sync::{Arc, Mutex};
 
-use platform::{Allocator, Buffer, DeviceId, Event, EventFlags, PoolKind, Stream};
+use platform::{Allocator, Buffer, DeviceId, PoolKind, Stream};
 use storage::protocol::UnitRun;
 use storage::runtime::{RequestId, Run};
 use tensor::{DType, Tensor};
@@ -155,11 +149,6 @@ pub(crate) type ByteCopy = (Place, Place, u64);
 /// A product buffer the Storage Server retains (`StorageClient::region_storage`): its storage,
 /// its parts segments back to back, and where the units of each part lie, a run per part.
 pub(crate) type Retained = (Arc<Storage>, Vec<UnitRun>);
-
-/// The hand-offs between the ranks of one process: by the run a tail is copied into, its region
-/// and first unit, the event recorded behind the copy (`None` for memory that holds no device),
-/// until the rank that reads the run takes it; and the condition its reader waits on.
-type Handoffs = (Mutex<HashMap<(u8, u32), Option<Event>>>, Condvar);
 
 /// A part of a host region a rank reaches: the region, the rank index whose part it is, the
 /// bytes of every unit of the part, its units, and its mapping (`None` for memory that holds no
@@ -209,9 +198,6 @@ pub(crate) struct BufferMemory {
     /// (`None` for memory that holds no device). Their memory lives as long as this rank's: the
     /// ranks of a process serve and retire together.
     peers: Vec<(u8, u32, u32, Option<u64>)>,
-    /// The hand-offs of the process's ranks, shared by every memory [`BufferMemory::connect`]
-    /// joined.
-    handoffs: Arc<Handoffs>,
 }
 
 /// The bytes of `shape` elements of `dtype`.
@@ -328,7 +314,6 @@ impl BufferMemory {
             row,
             parts: Vec::new(),
             peers: Vec::new(),
-            handoffs: Arc::new((Mutex::new(HashMap::new()), Condvar::new())),
         };
         for &(region, bytes, units) in parts {
             memory.check_part(region, rank, bytes)?;
@@ -574,8 +559,8 @@ impl BufferMemory {
 
     /// Joins the media memories of the ranks of one process, after each mapped its parts: each
     /// reaches every other's product buffer, by peer access or on its own device, and every
-    /// other's parts of host regions, and they share one table of hand-offs. A memory joined
-    /// before is joined again with the memories given.
+    /// other's parts of host regions. A memory joined before is joined again with the memories
+    /// given.
     ///
     /// The memories are keyed by their rank index: several of them may lie on one device, the
     /// ranks of several worker groups that the deployment places on it, each with its own product
@@ -638,7 +623,6 @@ impl BufferMemory {
             }
         }
 
-        let handoffs = memories.first().map(|memory| Arc::clone(&memory.handoffs));
         for memory in memories.iter_mut() {
             for part in &owned {
                 let held = memory
@@ -653,9 +637,6 @@ impl BufferMemory {
                 if buffer.1 != memory.rank && !memory.peers.contains(buffer) {
                     memory.peers.push(*buffer);
                 }
-            }
-            if let Some(handoffs) = &handoffs {
-                memory.handoffs = Arc::clone(handoffs);
             }
         }
         Ok(())
@@ -965,160 +946,6 @@ impl BufferMemory {
             let own = run.0 == self.products.0 && rank == self.rank;
             own || self.peer(run.0).is_some_and(|peer| peer.1 == rank)
         })
-    }
-
-    /// Copies `bytes` from the device address `source`, the decode's tail in its runner's
-    /// memory, into the first bytes of the run that the block `slot` holds at `position` of
-    /// `class` has on rank `reader`, another rank of this process, on `stream`, and hands that
-    /// rank an event recorded behind the copy, which [`BufferMemory::take_hand_off`] gives it.
-    /// Returns the places written; with `None` for memory that holds no device nothing is
-    /// issued and an empty hand-off is handed.
-    ///
-    /// # Safety
-    ///
-    /// For memory on a device, `source` is the first of `bytes` bytes of device memory that stay
-    /// unwritten until the copy issued on `stream` has run.
-    ///
-    /// # Errors
-    ///
-    /// A block with no run on rank `reader` of the process other than this one, bytes past the
-    /// run, a hand-off into a run whose last one was not taken, or as [`BufferMemory::copy`].
-    pub(crate) unsafe fn hand_off(
-        &self,
-        tables: &BlockTables,
-        (slot, class, position): (u32, u8, u32),
-        (source, bytes): (u64, u64),
-        reader: u32,
-        stream: Option<&Stream>,
-    ) -> Result<Vec<Place>> {
-        let runs: Vec<Run> = tables
-            .runs(slot, class, position)
-            .iter()
-            .copied()
-            .filter(|run| self.peer(run.0).is_some_and(|peer| peer.1 == reader))
-            .collect();
-        if runs.is_empty() {
-            return Err(Error::Invalid(format!(
-                "the block of slot {slot} at position {position} of class {class} has no run on \
-                 rank {reader}, another rank of this process, to hand off to"
-            )));
-        }
-        let places = runs
-            .iter()
-            .map(|&run| self.window(run, 0, bytes))
-            .collect::<Result<Vec<_>>>()?;
-        let (handed, ready) = &*self.handoffs;
-        if runs
-            .iter()
-            .any(|run| lock(handed).contains_key(&(run.0, run.1)))
-        {
-            return Err(Error::Invalid(format!(
-                "a tail is handed off into the block of slot {slot} at position {position} of \
-                 class {class} before its reader took the last one"
-            )));
-        }
-
-        let issued = match (&self.device, stream) {
-            (None, None) => None,
-            (Some(_), Some(stream)) => {
-                let length = usize::try_from(bytes)
-                    .map_err(|_| Error::Resource("a copy exceeds the address space"))?;
-                for &place in &places {
-                    let destination = self.at(place)?;
-                    // SAFETY: the destination lies inside another rank's product buffer, which
-                    // this rank reaches for as long as it serves (`Self::connect`), and no batch
-                    // reads it before its reader took the hand-off; the source is the caller's.
-                    unsafe { platform::memcpy_async(destination, source, length, stream) }?;
-                }
-                Some(stream)
-            }
-            _ => {
-                return Err(Error::Invalid(
-                    "a rank's media copies are issued on a stream exactly when its memory is on \
-                     a device"
-                        .into(),
-                ));
-            }
-        };
-
-        // Each reader takes an event of its own, recorded behind every copy.
-        let mut records = Vec::with_capacity(runs.len());
-        for run in &runs {
-            let record = match issued {
-                Some(stream) => {
-                    let event = Event::new(EventFlags::default());
-                    event.record(stream)?;
-                    Some(event)
-                }
-                None => None,
-            };
-            records.push(((run.0, run.1), record));
-        }
-        lock(handed).extend(records);
-        ready.notify_all();
-        Ok(places)
-    }
-
-    /// Waits on the host, at most `timeout`, until the rank that decodes the previous unit has
-    /// handed off its tail into this rank's run of the block that `slot` holds at `position` of
-    /// `class`, then orders `stream` after the copy and drops the hand-off. A reader whose
-    /// predecessor ran in an earlier call finds the tail ordered by completion and takes none.
-    ///
-    /// # Errors
-    ///
-    /// A block with no run in this rank's product buffer; no hand-off within `timeout`; a stream
-    /// stated for memory that holds no device, or the reverse; the driver's refusal.
-    pub(crate) fn take_hand_off(
-        &self,
-        tables: &BlockTables,
-        (slot, class, position): (u32, u8, u32),
-        stream: Option<&Stream>,
-        timeout: Duration,
-    ) -> Result<()> {
-        let Some(run) = tables
-            .runs(slot, class, position)
-            .iter()
-            .find(|run| run.0 == self.products.0)
-            .copied()
-        else {
-            return Err(Error::Invalid(format!(
-                "the block of slot {slot} at position {position} of class {class} has no run in \
-                 this rank's product buffer to be handed"
-            )));
-        };
-        if self.device.is_some() != stream.is_some() {
-            return Err(Error::Invalid(
-                "a rank's media copies are issued on a stream exactly when its memory is on a \
-                 device"
-                    .into(),
-            ));
-        }
-
-        let (handed, ready) = &*self.handoffs;
-        let deadline = Instant::now() + timeout;
-        let mut waiting = lock(handed);
-        let event = loop {
-            if let Some(event) = waiting.remove(&(run.0, run.1)) {
-                break event;
-            }
-            let left = deadline.saturating_duration_since(Instant::now());
-            if left.is_zero() {
-                return Err(Error::Invalid(format!(
-                    "no tail was handed off into the block of slot {slot} at position \
-                     {position} of class {class} within {timeout:?}"
-                )));
-            }
-            waiting = ready
-                .wait_timeout(waiting, left)
-                .map_err(|_| Error::State("a rank's hand-offs were poisoned"))?
-                .0;
-        };
-        drop(waiting);
-
-        match (event, stream) {
-            (Some(event), Some(stream)) => Ok(stream.wait_event(&event)?),
-            _ => Ok(()),
-        }
     }
 
     /// Issues `moved` on `stream`: see [`BufferMemory::copy`].
@@ -1681,69 +1508,6 @@ mod tests {
         attach(&mut reader, 1, 1);
         product(&mut reader, 1, 0, &[(PRODUCTS, 4, 2)]);
         assert!(memories[1].share(&reader, (1, PRODUCT, 0), None).is_err());
-    }
-
-    #[test]
-    fn a_tail_is_handed_to_the_rank_that_decodes_the_next_unit() {
-        let memories = process(0);
-        // The tail the next unit's decode reads lies in the other rank's buffer alone.
-        let tail = [(OTHER_PRODUCTS, 4, 1)];
-        let mut writer =
-            BlockTables::new(GROUP, &[SLOTS, PRODUCTS], &UNIT_SIZES).with_peers(&[OTHER_PRODUCTS]);
-        let mut reader =
-            BlockTables::new(GROUP, &[SLOTS, OTHER_PRODUCTS], &UNIT_SIZES).with_peers(&[PRODUCTS]);
-        for tables in [&mut writer, &mut reader] {
-            attach(tables, 1, 1);
-            product(tables, 1, 0, &tail);
-        }
-        let entry = (1, PRODUCT, 0);
-        let soon = Duration::from_millis(10);
-
-        // The reader waits on the host for the writer's issue, and takes it once.
-        std::thread::scope(|scope| {
-            let taken = scope
-                .spawn(|| memories[1].take_hand_off(&reader, entry, None, Duration::from_secs(30)));
-            // SAFETY: memory that holds no device reads no source.
-            let written = unsafe { memories[0].hand_off(&writer, entry, (0, 96), OTHER, None) };
-            assert_eq!(written.unwrap(), [(OTHER_PRODUCTS, OTHER, 4 * UNIT_BYTES)]);
-            assert!(taken.join().unwrap().is_ok());
-        });
-        assert!(
-            memories[1]
-                .take_hand_off(&reader, entry, None, soon)
-                .is_err()
-        );
-
-        // A second tail waits until the first is taken, none passes the run, and none goes to a
-        // rank that holds no run of the block.
-        // SAFETY: as above.
-        unsafe {
-            assert!(
-                memories[0]
-                    .hand_off(&writer, entry, (0, 96), OTHER, None)
-                    .is_ok()
-            );
-            assert!(
-                memories[0]
-                    .hand_off(&writer, entry, (0, 96), OTHER, None)
-                    .is_err()
-            );
-            assert!(
-                memories[0]
-                    .hand_off(&writer, entry, (0, 257), OTHER, None)
-                    .is_err()
-            );
-            assert!(
-                memories[0]
-                    .hand_off(&writer, entry, (0, 96), RANK, None)
-                    .is_err()
-            );
-        }
-        assert!(
-            memories[1]
-                .take_hand_off(&reader, entry, None, soon)
-                .is_ok()
-        );
     }
 
     #[test]

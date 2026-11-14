@@ -658,10 +658,12 @@ fn a_media_group_holds_as_many_request_slots_as_its_ranks_shares_hold() {
 
 /// A block's ranks are any positions of its worker group, in the order the block states them:
 /// the denoiser's sequence group of a group whose transformer block holds ranks `[3, 1, 2, 0]`
-/// has the group's fourth rank as its rank 0, and each rank joins it at its place in the block.
+/// has the group's fourth rank as its rank 0, and each rank joins it at its place in the block;
+/// the video decoder's ranks `[2, 0]` form the decoder ranks' communicator the same way, which
+/// the ranks outside the block do not join.
 #[test]
 #[ignore = "reads the headers of a released FastH3 checkpoint, which the repository does not hold"]
-fn a_sequence_group_takes_its_block_s_ranks_in_their_stated_order() {
+fn a_parallel_group_takes_its_block_s_ranks_in_their_stated_order() {
     assert!(
         Path::new(FAST_H3).is_dir(),
         "the media rank loads the headers of {FAST_H3}, which is missing"
@@ -681,6 +683,7 @@ fn a_sequence_group_takes_its_block_s_ranks_in_their_stated_order() {
         projection: Default::default(),
         projection_rows: None,
     };
+    group.blocks.get_mut("video_decoder").unwrap().ranks = vec![2, 0];
     launch.engine_config.parallel.worker_groups = vec![group];
     launch.devices = vec![0, 1, 2, 3];
     launch.world_size = 4;
@@ -690,12 +693,18 @@ fn a_sequence_group_takes_its_block_s_ranks_in_their_stated_order() {
     let runners = ModelRunner::of(&launch, family).unwrap().ranks().unwrap();
     assert_eq!(runners.len(), 4);
     for runner in &runners {
-        let (_, sequence) = runner.media_collectives().unwrap();
+        let [_, sequence, decoder] = runner.media_collectives().unwrap();
         assert_eq!(sequence.groups, [vec![3, 1, 2, 0]]);
         let place = [3, 1, 2, 0]
             .iter()
             .position(|rank| *rank == runner.rank() as usize);
         assert_eq!(sequence.member, Some((0, place.unwrap())));
+
+        assert_eq!(decoder.groups, [vec![2, 0]]);
+        let place = [2, 0]
+            .iter()
+            .position(|rank| *rank == runner.rank() as usize);
+        assert_eq!(decoder.member, place.map(|place| (0, place)));
     }
 }
 

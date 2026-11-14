@@ -50,7 +50,7 @@ use anyhow::{Context as _, Result, bail};
 use nn::VideoRequest;
 use nn::family::{Stage, VideoModel, VideoPlacement, VideoServing};
 use ops::Generation;
-use platform::{DeviceId, Stream};
+use platform::{Communicator, DeviceId, Stream};
 use proto::config::{
     DEFAULT_BLOCK, VIDEO_CODEC_BLOCK, VIDEO_DECODER_BLOCK, WorkerGroupConfig, WorkerGroupRole,
 };
@@ -139,6 +139,11 @@ pub(crate) struct VideoRank {
     /// one and on the meta device.
     pub(crate) tensor: Option<Arc<ops::Group>>,
     pub(crate) sequence: Option<Arc<ops::Group>>,
+    /// The communicator of the ranks a video decode round is dealt to, over which they pass the
+    /// splice tails between consecutive shares, from the rank's load until its video decoder
+    /// takes it; `None` for a round of one rank, on a rank that decodes no video and on the meta
+    /// device.
+    pub(crate) decoder: Option<Communicator>,
     /// What the profile run states of each runner that replays in the graph pool.
     pub(crate) peaks: Vec<(RunnerId, Peaks)>,
     /// The device bytes the runners hold beside their regions of the graph pool: the denoiser's
@@ -345,32 +350,32 @@ impl ModelRunner {
     }
 
     /// The parallel groups of the deployment's media groups over the process's host group, whose
-    /// members are the deployment's ranks: the text encoders' tensor groups and the denoisers'
-    /// sequence groups, each a block's ranks in the order the block states them (any positions of
-    /// its worker group, the block's rank `r` being its `r`-th), with this rank's place among
-    /// them. Every rank forms both, in this order, so every member of the host group takes part
-    /// in every group's id broadcast.
+    /// members are the deployment's ranks: the text encoders' tensor groups, the denoisers'
+    /// sequence groups and the video decoders' ranks, which pass a round's splice tails between
+    /// them (`crate::runner::decoder`), each a block's ranks in the order the block states them
+    /// (any positions of its worker group, the block's rank `r` being its `r`-th), with this
+    /// rank's place among them. Every rank forms all three, in this order, so every member of the
+    /// host group takes part in every group's id broadcast.
     ///
     /// # Errors
     ///
     /// A split block that states another number of ranks than its parallel size, or a rank twice.
-    pub(crate) fn media_collectives(&self) -> Result<(super::Collective, super::Collective)> {
+    pub(crate) fn media_collectives(&self) -> Result<[super::Collective; 3]> {
         let groups = &self.engine_config().parallel.worker_groups;
         let firsts = WorkerGroupConfig::first_ranks(groups);
         let text = Stage::TextEncoder.name();
 
-        let mut tensor = super::Collective {
+        let [mut tensor, mut sequence, mut decoder] = [(); 3].map(|()| super::Collective {
             groups: Vec::new(),
             member: None,
-        };
-        let mut sequence = super::Collective {
-            groups: Vec::new(),
-            member: None,
-        };
+        });
         for (first, group) in firsts.iter().zip(groups) {
             for (name, block) in &group.blocks {
                 let (collective, size) = if name == text {
                     (&mut tensor, block.tensor_parallel_size)
+                } else if name == VIDEO_DECODER_BLOCK {
+                    // Every rank a decode round is dealt to (`ModelRunner::round`).
+                    (&mut decoder, block.ranks.len())
                 } else {
                     let size = block.sequence_parallel.size().map_err(|refusal| {
                         anyhow::anyhow!("block {name} of worker group {}: {}", group.id, refusal.0)
@@ -412,14 +417,15 @@ impl ModelRunner {
                 }
             }
         }
-        Ok((tensor, sequence))
+        Ok([tensor, sequence, decoder])
     }
 
     /// How a video decode round is dealt to the ranks of the group that decodes this rank's
     /// requests: its video decoder block's ranks in order, by their rank index in the process's
     /// media memory (the deployment's rank), each decoding the block's units per rank when it
-    /// deals units and one otherwise. Its width is the scheduler's (`crate::scheduler::video`).
-    /// A group that places no video decoder block decodes a round of one unit on its own rank.
+    /// deals units and one otherwise, the rounds alternately in that order and in reverse
+    /// (`RoundConfig::rank_of`). Its width is the scheduler's (`crate::scheduler::video`). A group
+    /// that places no video decoder block decodes a round of one unit on its own rank.
     ///
     /// # Errors
     ///
@@ -695,7 +701,8 @@ impl ModelRunner {
     /// the graphs and stream `graphs` gives it for its id and its input bytes: on the meta device
     /// graphs that hold none, on a device its region of the graph pool. The text encoder computes
     /// over the tensor group `tensor`, the denoiser over the sequence group `sequence`, each at
-    /// this rank's place (meta graphs take the split alone). The media host is
+    /// this rank's place (meta graphs take the split alone), and the video decoder passes its
+    /// rounds' tails over the communicator `decoder`. The media host is
     /// [`ModelRunner::media_host`]'s.
     ///
     /// # Errors
@@ -706,7 +713,11 @@ impl ModelRunner {
         model: &Arc<dyn VideoModel>,
         memory: &Arc<BufferMemory>,
         mut graphs: impl FnMut(RunnerId, u64) -> Result<(Graphs, Option<Stream>)>,
-        (tensor, sequence): (Option<Arc<ops::Group>>, Option<Arc<ops::Group>>),
+        (tensor, sequence, decoder): (
+            Option<Arc<ops::Group>>,
+            Option<Arc<ops::Group>>,
+            Option<Communicator>,
+        ),
         classes: &[u8; 10],
     ) -> Result<DeviceRunners> {
         let phases = self.media_phases()?;
@@ -745,17 +756,17 @@ impl ModelRunner {
         let (video, audio) = self.decoder_configs(model.as_ref(), classes)?;
         let video = match video {
             Some(config) => {
-                let decoder = model.video_decoder().context(
+                let network = model.video_decoder().context(
                     "the rank decodes video and its share of the checkpoint holds no video decoder",
                 )?;
                 let (graphs, stream) = graphs(VIDEO_DECODER, 0)?;
                 let splicer = model.splicer();
                 let runner = DecoderRunner::new(
-                    decoder,
+                    network,
                     splicer,
                     config,
                     graphs,
-                    stream,
+                    (stream, decoder),
                     Arc::clone(memory),
                 )
                 .context("building the rank's video decoder")?;
@@ -765,14 +776,20 @@ impl ModelRunner {
         };
         let audio = match audio {
             Some(config) => {
-                let decoder = model.audio_decoder().context(
+                let network = model.audio_decoder().context(
                     "the denoiser's layouts carry a track and the rank's share of the checkpoint \
                      holds no audio decoder",
                 )?;
                 let (graphs, stream) = graphs(AUDIO_DECODER, 0)?;
-                let runner =
-                    DecoderRunner::new(decoder, None, config, graphs, stream, Arc::clone(memory))
-                        .context("building the rank's track decoder")?;
+                let runner = DecoderRunner::new(
+                    network,
+                    None,
+                    config,
+                    graphs,
+                    (stream, None),
+                    Arc::clone(memory),
+                )
+                .context("building the rank's track decoder")?;
                 Some(runner)
             }
             None => None,
@@ -846,7 +863,7 @@ impl ModelRunner {
             &model,
             &memory,
             |_, inputs| Ok((Graphs::meta(Arc::clone(&unserved), inputs), None)),
-            (None, None),
+            (None, None, None),
             &classes,
         )?;
 
@@ -899,6 +916,7 @@ impl ModelRunner {
                 model,
                 tensor,
                 sequence,
+                decoder: None,
                 peaks,
                 buffers,
                 row,
