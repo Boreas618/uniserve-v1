@@ -1442,11 +1442,13 @@ impl Scheduler {
     /// not written stays held for the next pass, in order; nothing waits.
     ///
     /// A request the completion queue has no room for stays held, and every request behind it
-    /// with it, but a `Finish`, which is written as soon as it fits itself. The room is made by
-    /// the answers outstanding, and an answer may wait for a copy to end: a request answered
-    /// `Copy` owes until the answer to its `Finish`, and a transfer waits for a load that fills
-    /// its target group's memory (BP §11). A `Finish` held behind a request that waits for room
-    /// (a `List`, which owes the whole ring, waits for every answer) would hold back the very
+    /// with it, but a `Finish`, which is written as soon as the submission queue takes it: it
+    /// takes no room of its own, since its answer is paid for by its copy's request
+    /// (`answer_bytes`). The room is made by the answers outstanding, and an answer may wait for
+    /// a copy to end: a request answered `Copy` owes until the answer to its `Finish`, and a
+    /// transfer waits for a load that fills its target group's memory (BP §11). A `Finish` held
+    /// behind a request that waits for room (a `List`, which owes the whole ring, waits for every
+    /// answer), or beside a copy whose request owes the whole ring, would hold back the very
     /// answers that make it.
     ///
     /// # Errors
@@ -2125,8 +2127,20 @@ impl Scheduler {
     /// whole ring. An answer's lists are bounded by what the request names: a run per block and
     /// region, and an evicted key per unit the request takes, since every evicted block frees at
     /// least one. A `Listing`, and an answer whose lists the scheduler cannot bound, may take the
-    /// whole ring.
+    /// whole ring. A `Finish` takes nothing beyond what its copy's request owes: that request
+    /// stays outstanding, owing its bound, until the answer to the `Finish` is read, and its
+    /// bound is at least that answer (a `Copy` record is larger than any answer to a `Finish`).
     fn answer_bytes(&self, request: &runtime::Request) -> usize {
+        // A `Finish` must fit whatever its copy's request owes, even the whole ring (a request
+        // of an owner detached before it was written, whose answer has no bound): its answer is
+        // what releases that debt, so reserving room beside it would hold the `Finish`, and
+        // every request behind it, for good.
+        if let runtime::Request::Finish { copy, .. } = request
+            && self.outstanding.contains_key(&copy.0)
+        {
+            return 0;
+        }
+
         // The fields of the records (`storage::runtime`): a key, a run, a list's length.
         const KEY: usize = 32;
         const RUN: usize = 9;

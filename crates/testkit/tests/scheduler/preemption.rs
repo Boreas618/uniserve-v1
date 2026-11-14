@@ -588,3 +588,51 @@ fn after_requests_that_outgrew_the_cache_a_request_alone_fills_every_unit() {
     assert_eq!(written, Some((UNITS * BLOCK) as i32 - 1));
     assert!(harness.finished_with(alone, FinishReason::CacheCapacity));
 }
+
+/// Many more requests than the cache holds, served as the daemon serves them (every event taken,
+/// every request that left as migratable resubmitted with what it generated), all end at their
+/// length: 64 requests over 24 prompts, each of 24 blocks by its end, beside a device region of
+/// 64 units and a host region of 128, 32 slots. Preemptions return admissions under way to the
+/// queue while their reads are held, so their requests are written for an owner already detached,
+/// whose answers the scheduler cannot bound; a `Load` among them answered `Copy` keeps owing the
+/// whole completion ring until the answer to its copy's `Finish`, and that `Finish`, which takes no
+/// room of its own, is still written (SD §3.1, §3.6).
+#[test]
+fn requests_that_outgrow_the_cache_many_times_over_all_end_at_their_length() {
+    let mut harness = Deployment::tokens()
+        .kv_units(64)
+        .host(128)
+        .slots(32)
+        .build();
+    let request = |id: u64| crate::harness::sharing(id, 1000 + id % 24, 32, 64);
+    let ids: Vec<RequestId> = (1..=64).map(|id| harness.submit(request(id))).collect();
+    let mut taken = vec![0; ids.len()];
+    let mut lives = vec![0; ids.len()];
+
+    // Every batch the load needs forms within a few thousand steps; a step that forms none for
+    // two thousand steps in a row while requests remain is a stall.
+    let mut idle = 0;
+    while !ids
+        .iter()
+        .all(|id| harness.finished_with(*id, FinishReason::MaxTokens))
+    {
+        idle = if harness.step() { 0 } else { idle + 1 };
+        for (index, &id) in ids.iter().enumerate() {
+            serve(
+                &mut harness,
+                id,
+                || request(id.0),
+                &mut taken[index],
+                &mut lives[index],
+            );
+        }
+        assert!(idle < 2_000, "no batch formed: {}", harness.summary());
+    }
+    assert!(
+        lives.iter().sum::<usize>() > 0,
+        "the load preempted no request"
+    );
+    for &id in &ids {
+        assert_eq!(harness.tokens(id).len(), 64);
+    }
+}
