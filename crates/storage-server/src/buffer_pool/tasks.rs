@@ -651,7 +651,11 @@ impl BufferPool {
     /// the group copies the class with, the leading keys that are not on the
     /// host. A key whose host copy holds those parts counts as found; one
     /// whose host copy lies on other parts ends the leading keys, since a
-    /// prefetch writes only a new host block.
+    /// prefetch writes only a new host block. The new blocks are taken as a
+    /// `Store` to the host takes them, from the free units and then by
+    /// evicting in the queue pair's order of the host region, for as many of
+    /// the keys to bring as fit; the host copies of the keys found are not
+    /// evicted for them. The answer lists the keys evicted.
     #[allow(clippy::too_many_arguments)]
     pub(super) fn prefetch(
         &mut self,
@@ -674,7 +678,10 @@ impl BufferPool {
         };
         let parts = self.parts(queue.0, group, class);
 
-        let (mut found, mut copies) = (Vec::new(), Vec::new());
+        // The leading keys: those found on the host, then those to bring. The
+        // found keys' host copies are held while room is made, so that no
+        // eviction takes them (R2).
+        let (mut found, mut held, mut wanted) = (Vec::new(), Vec::new(), Vec::new());
         for key in keys {
             match self.cache.get(key) {
                 Some(entry) if entry.class != class => break,
@@ -683,47 +690,74 @@ impl BufferPool {
                     ..
                 }) => {
                     let holds = self.loadable(queue.0, group, class, host);
-                    if !copies.is_empty() || !self.visible(*maker, queue.0) || !holds {
+                    if !wanted.is_empty() || !self.visible(*maker, queue.0) || !holds {
                         break;
                     }
                     found.push(*key);
+                    held.push(Rc::clone(host));
                     continue;
                 }
                 _ => {}
             }
-            // One prefetch brings a key at a time, into a free host block:
-            // a prefetch evicts nothing.
+            // One prefetch at a time brings a key.
             if self.fetching(key) {
                 break;
             }
-            let Some(run) = self.regions[usize::from(region)].take(size) else {
+            wanted.push(*key);
+        }
+
+        // As many of the keys to bring as the free units and the order make
+        // room for.
+        let mut evicted = Vec::new();
+        while !wanted.is_empty() {
+            let count = u32::try_from(wanted.len()).unwrap_or(u32::MAX);
+            if let Some(keys) = self.room(queue, region, count, size) {
+                evicted = keys;
                 break;
-            };
-            // Valid on the group's parts once the connector wrote them.
-            let write = Rc::new(Block::new(class, vec![run], 0, 0));
-            let to = Target::Entry {
-                key: *key,
-                remote: false,
-            };
-            copies.push(Copy {
+            }
+            wanted.pop();
+        }
+        drop(held);
+        let count = u32::try_from(wanted.len()).unwrap_or(u32::MAX);
+        let blocks = self.obtain(region, class, count, size, &evicted, 0);
+
+        // Each block is valid on the group's parts once the connector wrote it.
+        let copies: Vec<Copy> = wanted
+            .iter()
+            .zip(blocks)
+            .map(|(key, write)| Copy {
                 memory: parts,
                 reads: Vec::new(),
                 write,
-                to,
+                to: Target::Entry {
+                    key: *key,
+                    remote: false,
+                },
                 fill: false,
                 deadline: Some(deadline),
-            });
-        }
+            })
+            .collect();
         if copies.is_empty() {
             return Ok(Some(Completion::Prefetched {
                 found: found.len() as u32,
+                evicted,
             }));
         }
 
         self.hold_copies((queue, id), copies);
         self.answers.insert((queue, id), found);
+        self.evictions.insert((queue, id), evicted);
         self.started.push((queue, id));
         Ok(None)
+    }
+
+    /// The answer to the prefetch `task`, which found `found` leading keys:
+    /// with the keys it evicted for its blocks.
+    fn prefetched(&mut self, task: (QueueId, RequestId), found: u32) -> Completion {
+        Completion::Prefetched {
+            found,
+            evicted: self.evictions.remove(&task).unwrap_or_default(),
+        }
     }
 
     /// `Store` to the remote store: the connector's task reads the host
@@ -862,9 +896,7 @@ impl BufferPool {
                 let completion = if remote {
                     Completion::Stored { keys }
                 } else {
-                    Completion::Prefetched {
-                        found: keys.len() as u32,
-                    }
+                    self.prefetched(task, keys.len() as u32)
                 };
                 self.complete(task.0, task.1, completion);
             }
@@ -903,9 +935,7 @@ impl BufferPool {
                 answer.map(|keys| Completion::Stored { keys })
             }
             Some(Target::Entry { remote: false, .. }) => {
-                answer.map(|keys| Completion::Prefetched {
-                    found: keys.len() as u32,
-                })
+                answer.map(|keys| self.prefetched(task, keys.len() as u32))
             }
             _ => None,
         };
@@ -949,7 +979,8 @@ impl BufferPool {
             for copy in copies.iter_mut() {
                 copy.deadline = Some(STOPPING);
             }
-            let completion = match copies.first().map(|copy| &copy.to) {
+            let target = copies.first().map(|copy| copy.to);
+            let completion = match target {
                 Some(Target::Entry { remote: true, .. }) => self
                     .answers
                     .remove(&task)
@@ -959,13 +990,10 @@ impl BufferPool {
                 Some(Target::Memory { .. }) => {
                     self.answers.remove(&task).map(|_| Completion::Failed)
                 }
-                Some(Target::Entry { remote: false, .. }) => {
-                    self.answers
-                        .remove(&task)
-                        .map(|keys| Completion::Prefetched {
-                            found: keys.len() as u32,
-                        })
-                }
+                Some(Target::Entry { remote: false, .. }) => self
+                    .answers
+                    .remove(&task)
+                    .map(|keys| self.prefetched(task, keys.len() as u32)),
                 _ => None,
             };
             self.stopped.push(task);

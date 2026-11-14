@@ -70,7 +70,7 @@ use storage::runtime::{
 
 use crate::Server;
 use crate::buffer_pool::trace::{Input, Trace, stated_input};
-use crate::buffer_pool::{BufferPool, ClientId, FORMAT, QueueId, format1, format2};
+use crate::buffer_pool::{BufferPool, ClientId, FORMAT, QueueId, format1, format2, format3};
 
 /// How long the thread sleeps when every queue is empty and nothing is
 /// deferred: the longest a request of an idle engine waits to be taken.
@@ -1189,7 +1189,7 @@ impl Pools {
     }
 
     /// The pools a predecessor handed over in the image format `format`,
-    /// this build's, format 2 or format 1, each checked, with their queue
+    /// this build's, format 3, format 2 or format 1, each checked, with their queue
     /// pairs, which go on from the indices the predecessor published.
     fn resume(
         bytes: &[u8],
@@ -1199,14 +1199,16 @@ impl Pools {
     ) -> io::Result<BTreeMap<String, Hosted>> {
         let handed: Handed<BufferPool> = match format {
             FORMAT => rmp_serde::from_slice(bytes).map_err(io::Error::other)?,
+            format3::FORMAT => converted::<format3::Image>(bytes, format)?,
             format2::FORMAT => converted::<format2::Image>(bytes, format)?,
             format1::FORMAT => converted::<format1::Image>(bytes, format)?,
             other => {
                 return Err(io::Error::other(format!(
                     "the buffer pools are handed over in image format {other}; this build reads \
-                     formats {}, {} and {FORMAT}",
+                     formats {}, {}, {} and {FORMAT}",
                     format1::FORMAT,
-                    format2::FORMAT
+                    format2::FORMAT,
+                    format3::FORMAT
                 )));
             }
         };

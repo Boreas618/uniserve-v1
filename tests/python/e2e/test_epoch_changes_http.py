@@ -870,13 +870,15 @@ LONG_CACHED_PROMPT = "Describe the sea in one sentence. " * 160
 
 def _mooncake_options() -> tuple[str, ...]:
     """Mooncake behind the host tier. The deployment's Storage Server gives
-    Mooncake a segment of 4 GiB, which holds every block.
+    Mooncake a segment of 8 GiB, which holds every block: the evicting case's
+    blocks, about 620 of 6 MiB, fill less than half of it, below the 90% at
+    which Mooncake's master evicts the oldest objects.
     """  # noqa: D205
     return (
         "--set",
         f'kv_cache_config.mooncake.master="{MOONCAKE_MASTER}"',
         "--set",
-        "kv_cache_config.mooncake.global_segment_gib=4",
+        "kv_cache_config.mooncake.global_segment_gib=8",
         "--set",
         f'kv_cache_config.mooncake.library="{MOONCAKE_LIBRARY}"',
     )

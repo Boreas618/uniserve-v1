@@ -24,7 +24,13 @@
 //! every version from [`OLDEST`] to that one, so that a server restarted in
 //! place into the next build goes on serving every session the builds before
 //! it opened, and reads and writes each session's records in its version
-//! ([`Request::decode_as`], [`Completion::encode_as`]). What version 4 lacks:
+//! ([`Request::decode_as`], [`Completion::encode_as`]). What version 5 lacks:
+//!
+//! - a [`Completion::Prefetched`] of version 5 lists no evicted keys: the
+//!   host copies a prefetch evicted for its blocks are learned from a later
+//!   [`Completion::Listing`].
+//!
+//! What version 4 lacks besides:
 //!
 //! - a [`Completion::Replicated`] of version 4 names no keys evicted for the
 //!   runs its crossing took: the scheduler learns of them from a later
@@ -53,12 +59,13 @@ use serde::{Deserialize, Serialize};
 use crate::{Error, Key, Result, Segment};
 
 /// The version of this interface that this build's engine speaks.
-pub const VERSION: u32 = 5;
+pub const VERSION: u32 = 6;
 
 /// The earliest version a Storage Server of this build serves, which the
 /// engines of the builds before it speak: version 2, before crossings,
-/// version 3, before a copy's host parts, and version 4, before a
-/// crossing's evicted keys. An `Open` of an earlier version is refused.
+/// version 3, before a copy's host parts, version 4, before a crossing's
+/// evicted keys, and version 5, before a prefetch's evicted keys. An `Open`
+/// of an earlier version is refused.
 pub const OLDEST: u32 = 2;
 
 /// A request's number on its queue pair, drawn by the scheduler from a
@@ -538,9 +545,11 @@ pub enum Completion {
     Evicted {
         keys: Vec<Key>,
     },
-    /// How many of the leading keys the source held.
+    /// How many of the leading keys the source held, and the keys whose host
+    /// copies were evicted for the blocks the prefetch brought them into.
     Prefetched {
         found: u32,
+        evicted: Vec<Key>,
     },
     /// Each cached key: its class, its tokens, the tiers that hold it (bit 0
     /// device, bit 1 host, bit 2 remote), the groups whose memory holds its
@@ -753,6 +762,10 @@ const COPIED_PARTS: u32 = 4;
 /// The version that added the keys a crossing evicted
 /// ([`Completion::Replicated`]): a record of an earlier version names none.
 const CROSSING_EVICTIONS: u32 = 5;
+
+/// The version that added the keys a prefetch evicted
+/// ([`Completion::Prefetched`]): a record of an earlier version lists none.
+const PREFETCH_EVICTIONS: u32 = 6;
 
 /// Whether this build reads and writes records of `version`.
 ///
@@ -1121,11 +1134,10 @@ impl Completion {
     /// in `version`, one of [`OLDEST`] to [`VERSION`]: a field the version
     /// lacks is left out (a listing's host groups before version 3, a copy's
     /// host parts before version 4, a crossing's evicted keys before version
-    /// 5). A
-    /// completion the version lacks is written as this build writes it,
-    /// which a reader of that version refuses; the buffer pool answers no
-    /// request of a session with one, since the session's version has no
-    /// request it answers.
+    /// 5, a prefetch's before version 6). A completion the version lacks is
+    /// written as this build writes it, which a reader of that version
+    /// refuses; the buffer pool answers no request of a session with one,
+    /// since the session's version has no request it answers.
     pub fn encode_as(&self, version: u32, id: RequestId, record: &mut Vec<u8>) {
         let mut writer = Writer(record);
         writer.long(id.0);
@@ -1207,9 +1219,12 @@ impl Completion {
                 writer.byte(16);
                 writer.keys(keys);
             }
-            Self::Prefetched { found } => {
+            Self::Prefetched { found, evicted } => {
                 writer.byte(17);
                 writer.word(*found);
+                if version >= PREFETCH_EVICTIONS {
+                    writer.keys(evicted);
+                }
             }
             Self::Listing { keys } => {
                 writer.byte(18);
@@ -1252,8 +1267,9 @@ impl Completion {
 
     /// Reads a completion and the number of the request it answers from a
     /// record of `version`: a listing of version 2 states no host groups, a
-    /// copy before version 4 no host parts, and a crossing's answer before
-    /// version 5 no evicted keys.
+    /// copy before version 4 no host parts, a crossing's answer before
+    /// version 5 no evicted keys, and a prefetch's answer before version 6
+    /// none.
     ///
     /// # Errors
     ///
@@ -1342,6 +1358,11 @@ impl Completion {
             },
             17 => Self::Prefetched {
                 found: reader.word()?,
+                evicted: if version >= PREFETCH_EVICTIONS {
+                    reader.keys()?
+                } else {
+                    Vec::new()
+                },
             },
             18 => Self::Listing {
                 keys: (0..reader.length(if crossings { 38 } else { 37 })?)
@@ -1552,7 +1573,10 @@ mod tests {
             },
             Completion::Failed,
             Completion::Evicted { keys: vec![key(5)] },
-            Completion::Prefetched { found: 2 },
+            Completion::Prefetched {
+                found: 2,
+                evicted: vec![key(8)],
+            },
             Completion::Listing {
                 keys: vec![(key(6), 0, 64, 0b011, 0b01, 0b10)],
             },
@@ -1730,6 +1754,26 @@ mod tests {
             (RequestId(4), copy(vec![0b10]))
         );
         assert!(Completion::decode_as(&current, 3).is_err());
+    }
+
+    /// Version 5's prefetches list no evicted keys: those a version-6 answer
+    /// names are left out of its record.
+    #[test]
+    fn a_prefetch_answer_of_version_5_lists_no_evicted_keys() {
+        let prefetched = |evicted| Completion::Prefetched { found: 3, evicted };
+        let mut earlier = Vec::new();
+        prefetched(vec![key(5)]).encode_as(5, RequestId(6), &mut earlier);
+        assert_eq!(
+            Completion::decode_as(&earlier, 5).unwrap(),
+            (RequestId(6), prefetched(Vec::new()))
+        );
+        let mut current = Vec::new();
+        prefetched(vec![key(5)]).encode(RequestId(6), &mut current);
+        assert_eq!(
+            Completion::decode(&current).unwrap(),
+            (RequestId(6), prefetched(vec![key(5)]))
+        );
+        assert!(Completion::decode_as(&current, 5).is_err());
     }
 
     #[test]

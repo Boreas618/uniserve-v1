@@ -53,9 +53,16 @@ const POLL_INTERVAL: Duration = Duration::from_millis(50);
 ///   used, which can deadlock against a collective another stream is waiting in for a peer.
 /// - `NCCL_RUNTIME_CONNECT=0`: deferred peer handshakes would allocate connection buffers after the
 ///   process reserved its device storage.
-const RUNTIME_DEFAULTS: [(&str, &str); 2] = [
+/// - `NCCL_GRAPH_REGISTER=0`: a collective captured in a graph registers its buffers, which lie in
+///   the rank's graph pool, with its peers, which map that storage themselves. A sleep, and a
+///   standby that parks with its storage suspended, give the graph pool's storage back and map
+///   new storage at the same addresses when they wake, which the peers' mappings do not follow:
+///   every collective after the wake would move data through storage no rank reads. Unregistered,
+///   a captured collective copies through NCCL's own buffers, which stay mapped.
+const RUNTIME_DEFAULTS: [(&str, &str); 3] = [
     ("CUDA_MODULE_LOADING", "EAGER"),
     ("NCCL_RUNTIME_CONNECT", "0"),
+    ("NCCL_GRAPH_REGISTER", "0"),
 ];
 
 /// The environment an engine is started under: stated on its command, so it precedes any CUDA

@@ -31,7 +31,9 @@
 //! A new generation of kernels is prepared beside the serving graphs: a bucket whose launch
 //! table is unchanged is rebound (a second executable of the serving graph with the new kernels'
 //! parameters on the changed launches), any other is recaptured, and a bucket none of whose
-//! kernels changed keeps its graph. The switch takes effect between two batches; the replaced
+//! kernels changed keeps its graph. A rebind reads the new parameters from a capture under the
+//! new kernels, and every capture, as at warm-up, follows one eager run of the forward with the
+//! kernels it captures. The switch takes effect between two batches; the replaced
 //! generation's graphs stay until the trial is committed, and serve again after a rollback.
 //!
 //! Before the switch, each operator whose kernel changed runs a paired forward
@@ -152,6 +154,10 @@ struct State {
     /// The kernels the serving forwards launched since the graphs were made: a replay's
     /// captured kernel nodes, an eager forward's launches ([`Graphs::launches`]).
     launches: u64,
+    /// The serving forwards since the graphs were made, by how they ran: graphs replayed, and
+    /// forwards run eagerly ([`Graphs::forwards`]).
+    replays: u64,
+    eager: u64,
 }
 
 /// The step prepared for a bucket ([`Graphs::prepare_inputs`], [`Graphs::unpaired`]).
@@ -507,7 +513,7 @@ impl Graphs {
     /// input copies read them.
     pub fn capture(&self, runner: &dyn Runner, bucket: &Bucket) -> Result<()> {
         let serving = Arc::clone(&self.state.borrow().serving);
-        let graph = self.captured(runner, bucket, &serving, true)?;
+        let graph = self.captured(runner, bucket, &serving)?;
 
         self.state
             .borrow_mut()
@@ -609,6 +615,7 @@ impl Graphs {
             buffer,
             step,
             launches,
+            replays,
             ..
         } = &mut *state;
         let (_, graph) = served(graphs, serving, bucket).ok_or_else(|| {
@@ -627,6 +634,7 @@ impl Graphs {
         end_step(&cuda.stream, step)?;
         cuda.done.record(&cuda.stream)?;
         *launches += executable.kernel_nodes();
+        *replays += 1;
 
         Ok(graph.outputs.clone())
     }
@@ -670,6 +678,7 @@ impl Graphs {
                     .count() as u64
             });
             state.launches += launched;
+            state.eager += 1;
         }
         outputs
     }
@@ -679,6 +688,14 @@ impl Graphs {
     /// forwards and captures are not serving forwards; graphs that hold no device launch none.
     pub(crate) fn launches(&self) -> u64 {
         self.state.borrow().launches
+    }
+
+    /// The serving forwards of these graphs since they were made, by how they ran: the graphs
+    /// [`Graphs::replay`] launched, then the forwards [`Graphs::eager`] ran to the end. Paired
+    /// forwards and captures are not serving forwards; graphs that hold no device run none.
+    pub(crate) fn forwards(&self) -> (u64, u64) {
+        let state = self.state.borrow();
+        (state.replays, state.eager)
     }
 
     /// Instantiates every graph's executables again: what replays need after the process's
@@ -809,9 +826,12 @@ impl Graphs {
             (Arc::clone(next), needed, Arc::clone(&state.serving))
         };
 
-        // A recapture runs the forward eagerly first: an operator the serving graphs never
-        // launched has its first use there.
-        let fresh = self.captured(runner, bucket, &next, needed == Preparation::Recapture)?;
+        // The capture under the new kernels, a rebind's as a recapture's, follows an eager run
+        // of the forward with them: a kernel of a library the process loaded for this generation
+        // has its first use there, where it does the host work of its first use that a capture
+        // cannot record (a native entry may build its runner on first use, and refuses a capture
+        // before it).
+        let fresh = self.captured(runner, bucket, &next)?;
         let (graph, done) = match needed {
             Preparation::Rebind => self.rebound(bucket, fresh, &serving, &next)?,
             _ => (fresh, Preparation::Recapture),
@@ -1142,8 +1162,8 @@ impl Graphs {
         }
     }
 
-    /// Captures `bucket`'s forward with `generation`'s kernels, after one eager run of it when
-    /// `warm`, and checks the capture against the profile run and against the forward of
+    /// Captures `bucket`'s forward with `generation`'s kernels, after one eager run of it with
+    /// them, and checks the capture against the profile run and against the forward of
     /// `prepare_inputs`.
     ///
     /// Graphs that hold no device record the launch table and the input copies of a meta
@@ -1153,7 +1173,6 @@ impl Graphs {
         runner: &dyn Runner,
         bucket: &Bucket,
         generation: &Arc<Generation>,
-        warm: bool,
     ) -> Result<Graph> {
         // A bucket captured without a profile run is profiled here: its keys and peaks are
         // then known, and the capture is checked against them like any other.
@@ -1180,7 +1199,7 @@ impl Graphs {
         cuda.launching.set_kernels(Arc::clone(generation));
         self.lend_values(&cuda.launching, slot)?;
 
-        let captured = self.capture_on(cuda, runner, bucket, slot, warm);
+        let captured = self.capture_on(cuda, runner, bucket, slot);
 
         // Eager forwards between captures launch the serving generation's kernels.
         cuda.launching.set_route(None);
@@ -1234,30 +1253,27 @@ impl Graphs {
         Ok(graph)
     }
 
-    /// The device steps of one capture: the eager run when `warm`, then the capture itself. The
-    /// graph's executable holds no kernel yet.
+    /// The device steps of one capture: the eager run, then the capture itself. The graph's
+    /// executable holds no kernel yet.
     fn capture_on(
         &self,
         cuda: &Cuda,
         runner: &dyn Runner,
         bucket: &Bucket,
         slot: usize,
-        warm: bool,
     ) -> Result<Graph> {
         // The idle inputs reach the input tensors before either forward reads them.
         self.with_buffer(|buffer| buffer.issue(slot, &cuda.stream, cuda.inputs, self.inputs, &[]))?;
 
-        if warm {
-            cuda.launching.reset();
-            let outputs = {
-                let _guard = cuda.launching.enter();
-                runner.forward(bucket)
-            };
-            outputs?;
+        cuda.launching.reset();
+        let outputs = {
+            let _guard = cuda.launching.enter();
+            runner.forward(bucket)
+        };
+        outputs?;
 
-            // The eager run's copies read the slot's values, which the capture writes again.
-            cuda.stream.synchronize()?;
-        }
+        // The eager run's copies read the slot's values, which the capture writes again.
+        cuda.stream.synchronize()?;
 
         cuda.launching.reset();
         cuda.launching.record_launches();
@@ -1370,6 +1386,8 @@ impl State {
             shadow: None,
             uncompared: Vec::new(),
             launches: 0,
+            replays: 0,
+            eager: 0,
         }
     }
 

@@ -92,9 +92,21 @@ pub(crate) fn graph_renewals() -> u64 {
     GRAPH_RENEWALS.load(Ordering::Acquire)
 }
 
+/// The runtime mode of a forward that replayed a captured graph, as the forward counts name it
+/// (`ForwardStats::mode_counts`, `cuda_graph_runtime_mode_counts`).
+const GRAPH_REPLAY: &str = "graph_replay";
+
+/// The runtime mode of a forward run eagerly, with no graph.
+const EAGER: &str = "eager";
+
 /// What the rank of `device` observed since its last batch result, for the result that leaves
 /// now, or `None` when it observed nothing:
 ///
+/// - the forwards of the batch, `forwards` being the graphs it replayed and the forwards it ran
+///   eagerly: each counted under its runtime mode (`mode_counts`), a replay also as a graph
+///   dispatch (`cuda_graph_runtime_mode_counts`, `cuda_graph_replays`), and the step's time,
+///   `step_us`, under the batch's mode (`mode_us`): a replay's when it replayed a graph, the
+///   eager mode's when it ran its forwards eagerly only;
 /// - the driver calls that made a serving thread wait for the device (`blocking_calls`): the
 ///   calling worker's since `blocking`, its count when its last result left, which is advanced
 ///   to now, and what other threads added ([`counters::add_blocking`]);
@@ -109,8 +121,27 @@ pub(crate) fn forward_stats(
     device: DeviceId,
     session: Option<&mut session::Session>,
     blocking: &mut Calls,
+    forwards: (u64, u64),
+    step_us: u64,
 ) -> Option<proto::report::ForwardStats> {
     let mut stats = proto::report::ForwardStats::default();
+
+    let (replays, eager) = forwards;
+    for (mode, count) in [(GRAPH_REPLAY, replays), (EAGER, eager)] {
+        if count > 0 {
+            stats.mode_counts.insert(mode.to_owned(), count);
+        }
+    }
+    if replays > 0 {
+        stats
+            .cuda_graph_runtime_mode_counts
+            .insert(GRAPH_REPLAY.to_owned(), replays);
+        stats.cuda_graph_replays = replays;
+    }
+    if replays > 0 || eager > 0 {
+        let mode = if replays > 0 { GRAPH_REPLAY } else { EAGER };
+        stats.mode_us.insert(mode.to_owned(), step_us);
+    }
 
     let current = Calls::current();
     counters::add_blocking("device", &current.since(blocking));
@@ -147,10 +178,50 @@ pub(crate) fn forward_stats(
         stats.profile = session.progress();
     }
 
-    let observed = !stats.blocking_calls.is_empty()
+    let observed = !stats.mode_counts.is_empty()
+        || !stats.blocking_calls.is_empty()
         || !stats.stream_us.is_empty()
         || !stats.fence_us.is_empty()
         || stats.fence_records_lost > 0
         || !stats.profile.is_empty();
     observed.then_some(stats)
+}
+
+#[cfg(test)]
+mod tests {
+    use platform::DeviceId;
+    use platform::cupti::blocking::Calls;
+
+    use super::forward_stats;
+
+    /// The modes and time of a batch's forwards as one result reports them.
+    fn modes(forwards: (u64, u64), step_us: u64) -> Option<proto::report::ForwardStats> {
+        forward_stats(DeviceId(0), None, &mut Calls::default(), forwards, step_us)
+    }
+
+    #[test]
+    fn a_batch_s_forwards_are_counted_by_how_they_ran() {
+        // Three graphs replayed and one forward run eagerly: the step is a replayed one.
+        let stats = modes((3, 1), 500).unwrap();
+        let counts: Vec<(&str, u64)> = stats
+            .mode_counts
+            .iter()
+            .map(|(mode, count)| (mode.as_str(), *count))
+            .collect();
+        assert_eq!(counts, [("eager", 1), ("graph_replay", 3)]);
+        assert_eq!(
+            stats.cuda_graph_runtime_mode_counts.get("graph_replay"),
+            Some(&3)
+        );
+        assert_eq!(stats.cuda_graph_replays, 3);
+        assert_eq!(stats.mode_us.get("graph_replay"), Some(&500));
+        assert_eq!(stats.mode_us.get("eager"), None);
+
+        // Forwards run eagerly only: no graph dispatch, and the step's time is the eager mode's.
+        let stats = modes((0, 2), 70).unwrap();
+        assert_eq!(stats.mode_counts.get("eager"), Some(&2));
+        assert!(stats.cuda_graph_runtime_mode_counts.is_empty());
+        assert_eq!(stats.cuda_graph_replays, 0);
+        assert_eq!(stats.mode_us.get("eager"), Some(&70));
+    }
 }

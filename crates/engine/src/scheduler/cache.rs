@@ -140,6 +140,15 @@ impl Scheduler {
         {
             self.drop_copy(key, region);
         }
+        // A prefetch took its blocks from its class's host region, by the session's index.
+        if let (R::Prefetch { class, units, .. }, Completion::Prefetched { evicted, .. }) =
+            (request, completion)
+            && let Some((host, _)) = self.host_block(*class, *units)
+        {
+            for key in evicted {
+                self.drop_copy(key, host);
+            }
+        }
 
         // The answer to a `Finish` is the result of its copy, with the copy's group as its stamp.
         let copied;
@@ -299,7 +308,7 @@ impl Scheduler {
                     self.change_row(key, None, |row| row.tiers |= REMOTE);
                 }
             }
-            (R::Prefetch { class, keys, .. }, Completion::Prefetched { found }, None) => {
+            (R::Prefetch { class, keys, .. }, Completion::Prefetched { found, .. }, None) => {
                 for key in keys
                     .iter()
                     .take(usize::try_from(*found).unwrap_or(usize::MAX))
@@ -620,7 +629,7 @@ impl Scheduler {
 
     /// The units a block of `class` takes in `region` (by index): a host copy's configured
     /// size, else the class's block size; 0 for a sized class, whose blocks state their own.
-    fn class_units(&self, class: u8, region: usize) -> u32 {
+    pub(super) fn class_units(&self, class: u8, region: usize) -> u32 {
         let Some(stated) = self.classes.get(usize::from(class)) else {
             return 0;
         };
@@ -1614,7 +1623,14 @@ mod tests {
             source: Source::Remote,
             deadline: 0,
         };
-        exchange(&mut bench, prefetch, &Completion::Prefetched { found: 2 });
+        exchange(
+            &mut bench,
+            prefetch,
+            &Completion::Prefetched {
+                found: 2,
+                evicted: Vec::new(),
+            },
+        );
         assert_eq!(
             bench.scheduler.expected_hit(&lookup(6), A),
             [DEVICE | REMOTE, DEVICE, 0, HOST, HOST, 0]

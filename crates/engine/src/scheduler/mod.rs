@@ -2020,8 +2020,9 @@ impl Scheduler {
 
     /// Per region (by index), the units a request takes from the device regions of a class in
     /// its owner's group: an `Allocate` its blocks, a `Load` a block per key, which the copy
-    /// from the host fills, and a `Clone` the one block it copies into; and a `Replicate` the
-    /// runs it takes in the receiving regions of the group it copies into.
+    /// from the host fills, and a `Clone` the one block it copies into; a `Replicate` the runs
+    /// it takes in the receiving regions of the group it copies into; and from its class's host
+    /// region, a `Prefetch` a host block per key, which it brings the key into.
     fn taken(&self, request: &runtime::Request) -> Vec<(usize, u32)> {
         if let runtime::Request::Replicate {
             owner,
@@ -2035,6 +2036,17 @@ impl Scheduler {
                 .request_of(owner)
                 .map(|row| self.receiving(row, (at, group, from)))
                 .unwrap_or_default();
+        }
+        if let runtime::Request::Prefetch {
+            class, units, keys, ..
+        } = request
+        {
+            let count = u32::try_from(keys.len()).unwrap_or(u32::MAX);
+            return self
+                .host_block(*class, *units)
+                .map_or_else(Vec::new, |(region, each)| {
+                    vec![(region, count.saturating_mul(each))]
+                });
         }
         let (owner, class, count, units) = match request {
             runtime::Request::Allocate {
@@ -2072,6 +2084,19 @@ impl Scheduler {
         let (group, _) = self.request_of(owner)?.attachment(owner)?;
         let regions = self.group(group)?.regions(class);
         Some(regions.iter().map(|&region| usize::from(region)).collect())
+    }
+
+    /// The host region (by index) of `class`, and the units one host copy of its blocks takes
+    /// there: the size the class states for its host copies, else its block size, or `units`
+    /// for a sized class. `None` for a class with no host region.
+    fn host_block(&self, class: u8, units: u32) -> Option<(usize, u32)> {
+        let (region, _) = self.classes.get(usize::from(class))?.host?;
+        let region = usize::from(region);
+        let each = match self.class_units(class, region) {
+            0 => units,
+            each => each,
+        };
+        Some((region, each))
     }
 
     /// The units of one block of `class`: the class's block size, or `units` for a sized class.
@@ -2115,7 +2140,14 @@ impl Scheduler {
             | runtime::Request::Release { .. }
             | runtime::Request::Commit { .. }
             | runtime::Request::Victims { .. } => Some(0),
-            runtime::Request::Attach { .. } | runtime::Request::Prefetch { .. } => Some(4),
+            runtime::Request::Attach { .. } => Some(4),
+            // Its count, and an evicted key per host unit the blocks of its keys take.
+            runtime::Request::Prefetch {
+                class, units, keys, ..
+            } => {
+                let each = self.host_block(*class, *units).map_or(0, |(_, each)| each);
+                Some(4 + LIST + KEY.saturating_mul(keys.len().saturating_mul(each as usize)))
+            }
             // The answers to a `Finish`: the largest is a `Stored` with its empty list.
             runtime::Request::Finish { .. } => Some(LIST),
             runtime::Request::Allocate {

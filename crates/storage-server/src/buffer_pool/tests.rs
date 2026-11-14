@@ -1445,7 +1445,10 @@ fn a_prefetch_brings_the_leading_keys_into_the_host_tier_by_its_deadline() {
     fixture.pool.tick(50);
     assert_eq!(
         fixture.answer(id),
-        Some(Completion::Prefetched { found: 1 })
+        Some(Completion::Prefetched {
+            found: 1,
+            evicted: Vec::new()
+        })
     );
     assert_eq!(fixture.pool.stopped(), [(QUEUE, id)]);
     assert_eq!(fixture.free(HOST), 0);
@@ -1464,8 +1467,66 @@ fn a_prefetch_brings_the_leading_keys_into_the_host_tier_by_its_deadline() {
     };
     assert_eq!(
         fixture.ask(again),
-        Some(Completion::Prefetched { found: 1 })
+        Some(Completion::Prefetched {
+            found: 1,
+            evicted: Vec::new()
+        })
     );
+}
+
+#[test]
+fn a_prefetch_into_a_full_host_tier_evicts_in_the_order_and_names_what_it_evicted() {
+    let mut fixture = Fixture::new();
+    fixture.cached(1, 1);
+    fixture.cached(2, 2);
+    let store = fixture.submit(
+        QUEUE,
+        Request::Store {
+            group: PREFILL,
+            keys: vec![key(1), key(2)],
+            tier: Tier::Host,
+        },
+    );
+    assert_eq!(
+        fixture.finish(store, true),
+        Some(Completion::Stored { keys: Vec::new() })
+    );
+    assert_eq!(fixture.free(HOST), 0);
+
+    // The host pool's two units hold the two copies; the queue pair's order
+    // there names one of them.
+    fixture.ask(Request::Victims {
+        region: HOST,
+        keys: vec![key(2)],
+    });
+    let prefetch = Request::Prefetch {
+        group: PREFILL,
+        class: KV,
+        units: 0,
+        keys: vec![key(5), key(6)],
+        source: Source::Remote,
+        deadline: 50,
+    };
+    let id = fixture.submit(QUEUE, prefetch);
+
+    // The order makes room for the first key only.
+    assert_eq!(fixture.pool.started(), [(QUEUE, id)]);
+    assert_eq!(fixture.pool.work((QUEUE, id)).len(), 1);
+    fixture.pool.done((QUEUE, id), 64);
+    fixture.checked();
+    assert_eq!(
+        fixture.answer(id),
+        Some(Completion::Prefetched {
+            found: 1,
+            evicted: vec![key(2)]
+        })
+    );
+    let host: Vec<(Key, u8)> = fixture
+        .listing()
+        .into_iter()
+        .map(|(key, _, _, tiers, _, _)| (key, tiers & 0b010))
+        .collect();
+    assert_eq!(host, [(key(1), 0b010), (key(2), 0), (key(5), 0b010)]);
 }
 
 #[test]

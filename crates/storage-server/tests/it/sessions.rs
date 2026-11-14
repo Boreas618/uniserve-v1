@@ -525,7 +525,10 @@ fn a_session_of_the_version_before_is_served_in_its_records_beside_one_of_this_v
     };
     assert_eq!(
         schedulers[1].ask(prefetch.clone()),
-        Completion::Prefetched { found: 1 }
+        Completion::Prefetched {
+            found: 1,
+            evicted: Vec::new()
+        }
     );
 
     // A listing of version 2 states no host groups: the scheduler reads it
@@ -560,7 +563,10 @@ fn a_session_of_the_version_before_is_served_in_its_records_beside_one_of_this_v
     assert_eq!(keys.len(), 1);
     assert_eq!(
         schedulers[0].ask(prefetch),
-        Completion::Prefetched { found: 1 }
+        Completion::Prefetched {
+            found: 1,
+            evicted: Vec::new()
+        }
     );
 }
 
@@ -1049,7 +1055,13 @@ fn a_put_and_a_prefetch_move_host_copies_through_the_connector_part_by_part() {
     }
     assert_eq!(
         prefill.next(),
-        (prefetch, Completion::Prefetched { found: 1 })
+        (
+            prefetch,
+            Completion::Prefetched {
+                found: 1,
+                evicted: Vec::new()
+            }
+        )
     );
     let pool = listed(&server.socket);
     let host_blocks: u32 = pool
@@ -1070,7 +1082,13 @@ fn a_put_and_a_prefetch_move_host_copies_through_the_connector_part_by_part() {
         source: Source::Peers,
         deadline: u64::MAX / 2,
     };
-    assert_eq!(prefill.ask(peers), Completion::Prefetched { found: 0 });
+    assert_eq!(
+        prefill.ask(peers),
+        Completion::Prefetched {
+            found: 0,
+            evicted: Vec::new()
+        }
+    );
 }
 
 /// Answers the connector's next task, an upload when `upload` and a
@@ -1137,7 +1155,13 @@ fn a_put_and_a_prefetch_move_each_part_through_the_connector_of_its_host() {
     run_pages(&mut connectors[1], false, &pages, vec![true, false]);
     assert_eq!(
         prefill.next(),
-        (prefetch, Completion::Prefetched { found: 1 })
+        (
+            prefetch,
+            Completion::Prefetched {
+                found: 1,
+                evicted: Vec::new()
+            }
+        )
     );
 
     // A put the other host's connector fails stores nothing.
@@ -1240,7 +1264,10 @@ fn host_parts_of_one_index_on_two_hosts_are_kept_apart() {
                 vec![true],
             );
         }
-        let found = Completion::Prefetched { found: 1 };
+        let found = Completion::Prefetched {
+            found: 1,
+            evicted: Vec::new(),
+        };
         assert_eq!(schedulers[scheduler].next(), (prefetch, found));
     }
     let listed = Completion::Listing {

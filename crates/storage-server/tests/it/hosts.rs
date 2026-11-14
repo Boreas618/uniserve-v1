@@ -291,7 +291,10 @@ fn a_prefetch_from_the_peers_reads_the_host_copies_a_peer_held_throughout() {
     // is held by no peer.
     assert_eq!(
         prefill.ask(from_peers()),
-        Completion::Prefetched { found: 1 }
+        Completion::Prefetched {
+            found: 1,
+            evicted: Vec::new()
+        }
     );
     for (part, bytes) in parts.iter().zip(&written) {
         assert_eq!(read(part, 0, 16), *bytes);
@@ -347,7 +350,10 @@ fn a_prefetch_from_the_peers_reads_each_part_on_the_host_it_lies_on() {
     // by that host's Transfer Server; key 9 is held by no peer.
     assert_eq!(
         prefill.ask(from_peers()),
-        Completion::Prefetched { found: 1 }
+        Completion::Prefetched {
+            found: 1,
+            evicted: Vec::new()
+        }
     );
     for (part, bytes) in parts.iter().zip(&written) {
         assert_eq!(read(part, 0, 16), *bytes);
@@ -400,7 +406,13 @@ fn a_prefetch_from_a_peer_lost_during_the_read_caches_nothing() {
 
     assert_eq!(
         prefill.next(),
-        (prefetch, Completion::Prefetched { found: 0 })
+        (
+            prefetch,
+            Completion::Prefetched {
+                found: 0,
+                evicted: Vec::new()
+            }
+        )
     );
     let listed = Completion::Listing { keys: Vec::new() };
     assert_eq!(prefill.ask(Request::List), listed);

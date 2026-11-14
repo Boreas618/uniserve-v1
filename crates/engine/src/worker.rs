@@ -500,6 +500,7 @@ impl Worker {
             sticky: None,
             session: None,
             blocking: Calls::default(),
+            forwards: (0, 0),
             renewals: profiling::graph_renewals(),
             tables,
             copy_budget,
@@ -884,6 +885,9 @@ struct Thread {
     session: Option<Session>,
     /// This thread's driver calls that waited for the device, when its last batch output left.
     blocking: Calls,
+    /// The runners' serving forwards, graphs replayed and forwards run eagerly, summed over the
+    /// runners, when its last batch output left ([`Thread::forwards`]).
+    forwards: (u64, u64),
     /// The process's count of graph renewals the runners' executables were instantiated at.
     renewals: u64,
     /// The rank's device block tables.
@@ -908,6 +912,19 @@ impl Thread {
             .iter()
             .map(|runner| runner.graphs().launches())
             .sum()
+    }
+
+    /// The runners' serving forwards so far, summed over the runners: the graphs they replayed
+    /// and the forwards they ran eagerly ([`Graphs::forwards`]).
+    ///
+    /// [`Graphs::forwards`]: crate::runner::graphs::Graphs::forwards
+    fn forwards(&self) -> (u64, u64) {
+        self.runners
+            .iter()
+            .map(|runner| runner.graphs().forwards())
+            .fold((0, 0), |(replays, eager), (more, run)| {
+                (replays.saturating_add(more), eager.saturating_add(run))
+            })
     }
 
     /// Performs the queue's jobs until it closes.
@@ -1297,9 +1314,27 @@ impl Thread {
         // The runner states the step's device and host time; the wait in the queue is the
         // worker's to state.
         output.timing.queued_us = u64::try_from(queued.as_micros()).unwrap_or(u64::MAX);
+
+        // The forwards the runners ran since the last output are this batch's, with the step's
+        // device and host time.
+        let (replays, eager) = self.forwards();
+        let ran = (
+            replays.saturating_sub(self.forwards.0),
+            eager.saturating_sub(self.forwards.1),
+        );
+        self.forwards = (replays, eager);
         if let Some(device) = self.device {
-            output.forward_stats =
-                profiling::forward_stats(device, self.session.as_mut(), &mut self.blocking);
+            let step_us = output
+                .timing
+                .device_us
+                .saturating_add(output.timing.host_us);
+            output.forward_stats = profiling::forward_stats(
+                device,
+                self.session.as_mut(),
+                &mut self.blocking,
+                ran,
+                step_us,
+            );
         }
         self.counters.steps.fetch_add(1, Ordering::Relaxed);
 

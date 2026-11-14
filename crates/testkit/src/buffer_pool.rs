@@ -910,7 +910,16 @@ mod tests {
         };
         assert!(bench.submit(&prefetch));
         bench.pool.turn().unwrap();
-        assert_eq!(bench.read(), vec![(1, Completion::Prefetched { found: 2 })]);
+        assert_eq!(
+            bench.read(),
+            vec![(
+                1,
+                Completion::Prefetched {
+                    found: 2,
+                    evicted: Vec::new()
+                }
+            )]
+        );
     }
 
     #[test]

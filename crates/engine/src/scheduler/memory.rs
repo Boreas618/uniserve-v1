@@ -1524,7 +1524,9 @@ impl Scheduler {
     /// at once. An encoder output the answer did not hold is allocated at once, so that its
     /// encode computes it; one it holds has its position. A peers' `Prefetched` counts the
     /// tokens it brought. A `Loaded` that copied nothing holds the keys `cache` does not show on
-    /// the device of the owner's group.
+    /// the device of the owner's group. A pin that falls short of what `cache` expected, and the
+    /// prefetch it calls for, read the positions it lost from the lower tiers
+    /// ([`Scheduler::reread`]).
     pub(super) fn filled(
         &mut self,
         id: RequestId,
@@ -1545,17 +1547,45 @@ impl Scheduler {
                 .map_or(0, |&(_, b)| b)
         };
         let Some((owner, Some(class), positions)) = span(asked) else {
-            if let (
+            let (
                 runtime::Request::Prefetch {
                     class,
-                    source: Source::Peers,
+                    keys,
+                    source,
                     ..
                 },
-                Completion::Prefetched { found },
+                Completion::Prefetched { found, .. },
             ) = (asked, completion)
-                && first_required == Some(usize::from(*class))
+            else {
+                return follow;
+            };
+            let block = block(*class);
+
+            // A prefetch from the remote store of positions within the expected hit is one a
+            // short pin called for ([`Scheduler::reread`]): what it found is loaded at those
+            // positions now. One that deepens the hit is loaded by the admission's next round
+            // (`missing_requests`).
+            let at = request.keys.get(usize::from(*class)).and_then(|chain| {
+                let first = keys.first()?;
+                chain.iter().position(|key| key == first).map(count)
+            });
+            if *source == Source::Remote
+                && let (Some(owner), Some(at)) = (self.kv_owner(request), at)
+                && (at + 1).saturating_mul(block) <= request.num_cached_tokens
             {
-                let tokens = found.saturating_mul(block(*class));
+                let found = keys.get(..*found as usize).unwrap_or(keys);
+                if !found.is_empty() {
+                    follow.push(runtime::Request::Load {
+                        owner,
+                        class: *class,
+                        at,
+                        keys: found.to_vec(),
+                    });
+                }
+            }
+
+            if *source == Source::Peers && first_required == Some(usize::from(*class)) {
+                let tokens = found.saturating_mul(block);
                 if let Some(request) = self.requests.get_mut(&id) {
                     request.num_peer_tokens = request.num_peer_tokens.saturating_add(tokens);
                 }
@@ -1637,7 +1667,8 @@ impl Scheduler {
         let Some(blocks) = request.blocks.get_mut(usize::from(class)) else {
             return follow;
         };
-        if at == blocks.shared {
+        let continued = at == blocks.shared;
+        if continued {
             blocks.shared = at.saturating_add(held);
             blocks.end = blocks.end.max(blocks.shared);
             // A recurrent-state base not found leaves the table its checkpoint ahead, or nothing.
@@ -1664,7 +1695,78 @@ impl Scheduler {
             let released = keys.get(..held as usize).unwrap_or_default().to_vec();
             self.unpin(id, &released);
         }
+
+        if let Completion::Pinned { host, .. } = completion
+            && continued
+            && held < read
+        {
+            let lost = keys.get(held as usize..).unwrap_or_default();
+            follow.extend(self.reread(id, owner, class, at.saturating_add(held), lost, *host));
+        }
         follow
+    }
+
+    /// The requests that read again the positions from `at` on of class `class` of request
+    /// `id`'s admission, whose `keys` a pin did not find valid in the owner's group (SD §4.4
+    /// "Pins, loads, clones and prefetches", BP §12.1): a `Load` of the leading `host` of them,
+    /// which the pin's answer found on the host; when it found none there, a `Prefetch` from the
+    /// remote store of the leading ones `cache` holds there, when they are at least the policy's
+    /// `prefetch_min_tokens`, whose answer loads what it found ([`Scheduler::filled`]). The
+    /// positions they do not fill are allocated by the admission's last round, from the hit the
+    /// answers support. Nothing for a recurrent state or the draft cache, or for a request that
+    /// is not an admission.
+    fn reread(
+        &self,
+        id: RequestId,
+        owner: OwnerId,
+        class: u8,
+        at: u32,
+        keys: &[Key],
+        host: u32,
+    ) -> Vec<runtime::Request> {
+        let Some(request) = self.requests.get(&id) else {
+            return Vec::new();
+        };
+        let admitting = request.queued && request.status == RequestStatus::WaitingForRemoteKvs;
+        let (Some(&(kind, block)), Some(group)) = (
+            self.shapes(request).get(usize::from(class)),
+            self.kv_group(request),
+        ) else {
+            return Vec::new();
+        };
+        if !admitting || keys.is_empty() || kind.is_state() || kind.is_draft() {
+            return Vec::new();
+        }
+
+        if host > 0 {
+            let keys = keys.get(..host as usize).unwrap_or(keys);
+            return vec![runtime::Request::Load {
+                owner,
+                class,
+                at,
+                keys: keys.to_vec(),
+            }];
+        }
+        let stored = self
+            .expected_hit(keys, group)
+            .iter()
+            .take_while(|tier| **tier & REMOTE != 0)
+            .count();
+        let tokens = count(stored).saturating_mul(block);
+        if stored == 0 || tokens < self.policy.limits.prefetch_min_tokens.max(1) {
+            return Vec::new();
+        }
+        let wait = prefetch_wait(tokens).as_nanos();
+        let deadline =
+            monotonic_nanos(Instant::now()).saturating_add(u64::try_from(wait).unwrap_or(u64::MAX));
+        vec![runtime::Request::Prefetch {
+            group,
+            class,
+            units: 0,
+            keys: keys[..stored].to_vec(),
+            source: Source::Remote,
+            deadline,
+        }]
     }
 
     fn raise_end(&mut self, id: RequestId, class: u8, end: u32) {
@@ -2974,6 +3076,84 @@ mod tests {
                 end: 6,
                 asked: 6
             }
+        );
+    }
+
+    #[test]
+    fn a_pin_that_falls_short_reads_what_it_lost_from_the_host_or_the_remote_store() {
+        let load = |at, keys: &[Key]| runtime::Request::Load {
+            owner: OwnerId(1),
+            class: 0,
+            at,
+            keys: keys.to_vec(),
+        };
+        // `cache` believes the first ten blocks are on the device, and stored in the remote store;
+        // block 12 is on the host.
+        let admission = |session: &mut Session| {
+            let id = session.request(1, (1..=1000).collect());
+            let keys = session.row(id).keys[0].clone();
+            let mut listed: Vec<(Key, u8, u8)> = keys[..10]
+                .iter()
+                .map(|key| (*key, 0, DEVICE | REMOTE))
+                .collect();
+            listed.push((keys[12], 0, HOST));
+            session.list(&listed);
+            let asks = session.scheduler.admission_requests(id);
+            assert_eq!(asks, [pin(1, 0, 0, &keys[..10]), allocate(1, 0, 10, 2)]);
+            session.row_mut(id).status = RequestStatus::WaitingForRemoteKvs;
+            (id, keys, asks)
+        };
+        let held = |blocks: u32, host: u32| Completion::Pinned {
+            runs: (0..blocks).map(|unit| (4, unit + 1, 1)).collect(),
+            host,
+        };
+
+        // Eight of the blocks left the device, and the host holds three of them: those three are
+        // loaded at the positions the pin lost.
+        let mut session = serving(&[full(64)], KvCacheConfig::default());
+        let (_, keys, asks) = admission(&mut session);
+        let follow = session.answer(&asks, &[held(2, 3), allocated(2)]);
+        assert_eq!(follow, [load(2, &keys[2..5])]);
+
+        // None of them is on the host: the remote store, which holds all eight, is asked for
+        // them, and what it found is loaded at the positions the pin lost.
+        let mut session = serving(&[full(64)], KvCacheConfig::default());
+        let (id, keys, asks) = admission(&mut session);
+        let follow = session.answer(&asks, &[held(2, 0), allocated(2)]);
+        let [
+            runtime::Request::Prefetch {
+                class: 0,
+                keys: wanted,
+                source: runtime::Source::Remote,
+                ..
+            },
+        ] = &follow[..]
+        else {
+            panic!("one prefetch from the remote store, not {follow:?}");
+        };
+        assert_eq!(wanted, &keys[2..10]);
+        // It found six, on the host now, in blocks for which it evicted block 12's host copy.
+        let found = Completion::Prefetched {
+            found: 6,
+            evicted: vec![keys[12]],
+        };
+        session.answer(&follow, std::slice::from_ref(&found));
+        assert_eq!(
+            session.scheduler.expected_hit(&keys[2..13], A),
+            [&[HOST | REMOTE; 6][..], &[REMOTE, REMOTE, 0, 0, 0]].concat()
+        );
+        assert_eq!(
+            session.scheduler.filled(id, &follow[0], &found),
+            [load(2, &keys[2..8])]
+        );
+
+        // Three blocks lost, 192 tokens, are short of the policy's 256: they are computed.
+        let mut session = serving(&[full(64)], KvCacheConfig::default());
+        let (_, _, asks) = admission(&mut session);
+        assert!(
+            session
+                .answer(&asks, &[held(7, 0), allocated(2)])
+                .is_empty()
         );
     }
 

@@ -792,6 +792,7 @@ impl BufferPool {
             if run_by_worker {
                 self.finished(task.0, task.1, false);
             } else if self.answers.remove(&task).is_some() {
+                self.evictions.remove(&task);
                 self.stopped.push(task);
             }
         }
