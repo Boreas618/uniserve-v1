@@ -889,12 +889,14 @@ impl Scheduler {
 }
 
 /// The generation features the groups serve (SD §7.2, the features of the workers,
-/// `S/run.rs:22-45`): understanding where prefill and decode are served, and each image encoder
-/// whose encoding is.
+/// `S/run.rs:22-45`): understanding where prefill and token progress are served, and each image
+/// encoder whose encoding is. Token progress is a decode, or a verification on a deployment that
+/// speculates: a speculating rank captures verification buckets in place of decode buckets, and a
+/// request's calls after its prefill are then verifications, with or without drafts.
 pub(super) fn served_features(groups: &[WorkerGroup]) -> GenerationFeatures {
     let serves = |phase: Phase| groups.iter().any(|group| group.serves(phase));
     let mut features = GenerationFeatures::empty();
-    if serves(Phase::Prefill) && serves(Phase::Decode) {
+    if serves(Phase::Prefill) && (serves(Phase::Decode) || serves(Phase::Verify)) {
         features |= GenerationFeatures::UNDERSTANDING;
     }
     if serves(Phase::VisionEncode) {

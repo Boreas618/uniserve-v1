@@ -16,7 +16,7 @@ use std::sync::Arc;
 use engine::batch::philox::DrawAddress;
 use engine::batch::{Batch, Phase};
 use engine::scheduler::{Message, policy};
-use proto::request::RequestId;
+use proto::request::{Event, RequestId};
 use scheduling::limits::Parameters;
 use storage::runtime::Request;
 use testkit::executor::output_of;
@@ -198,6 +198,27 @@ fn a_verification_commits_the_drafts_its_samples_confirm_and_the_token_after_the
     );
     rolled_back(&verifications, 2);
     assert!(verifications.len() < 19, "drafts save calls");
+}
+
+/// A deployment whose token groups verify in place of decoding, as a speculating rank states
+/// them, serves token requests: the workers serve understanding when they serve a prefill and
+/// token progress, and a verification is a speculating deployment's token progress (SD §7.2, the
+/// features of the workers). A request is admitted, verifies its way to its length and finishes.
+#[test]
+fn a_deployment_that_verifies_in_place_of_decoding_serves_token_requests() {
+    let mut harness = Deployment::tokens().speculative(DRAFTS).verifying().build();
+    drafter(&harness, 2);
+    let id = harness.submit(token(1, 6, 20));
+    harness.settle(200);
+
+    assert!(
+        matches!(harness.terminal(id), Some(Event::Finished { .. })),
+        "{:?}",
+        harness.events(id)
+    );
+    let key = stream(&harness, id);
+    assert_eq!(harness.tokens(id), model(key, 6, 20));
+    assert!(!verifications(&harness, id).is_empty());
 }
 
 /// The drafts a verification rejects were not computed: its request's computed tokens roll back

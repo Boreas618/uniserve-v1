@@ -250,6 +250,15 @@ impl Deployment {
         self
     }
 
+    /// A speculating deployment's token groups as a speculating rank states them: verifications
+    /// in place of decodes, since the rank captures verification buckets and no decode bucket.
+    pub(crate) fn verifying(mut self) -> Self {
+        for (_, phases) in &mut self.groups {
+            phases.retain(|phase| *phase != Phase::Decode);
+        }
+        self
+    }
+
     /// Chat images: the groups that prefill also encode images ([`chat_image`]), each token of an
     /// encoder output taking [`FEATURE_BYTES`].
     pub(crate) fn images(mut self) -> Self {
