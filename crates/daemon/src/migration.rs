@@ -48,13 +48,6 @@ use tokio::sync::mpsc;
 use crate::engine::client::{EventStream, StreamCancelCause, SubmitError};
 use crate::engine::hold::{Kept, RequestHold};
 
-/// How long a migration waits for an engine to serve the request it carries.
-///
-/// The wait itself has no other bound — a deployment between engines is the
-/// ordinary case a successor daemon covers — so this is the point at which a
-/// request that no engine takes is answered instead of staying open.
-const MIGRATION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
-
 /// Submits the leader's requests and moves its token requests between
 /// engines.
 pub struct Migrator {
@@ -542,18 +535,14 @@ impl RequestEvents {
             .flatten();
         // Admission resolves the current owner first. After a daemon handoff
         // that owner supplies both the engine and the continuation's state.
-        // A migration that finds no engine must say so: the wait for one has no
-        // other bound (a deployment between engines is the ordinary case a
-        // successor daemon covers), so a request that finds none is answered
-        // with its own deadline rather than left open on the engine that went.
-        let (client, kept) = tokio::time::timeout(MIGRATION_TIMEOUT, hold.ready(previous_epoch))
+        // The request waits as every held submission does (`RequestHold`): until
+        // an engine serves, however long the deployment takes to start one (a
+        // relaunch captures every graph again), or until the hold closes because
+        // no engine will serve, which fails it with the reason. Its client bounds
+        // the wait too: a disconnect drops these events and cancels it.
+        let (client, kept) = hold
+            .ready(previous_epoch)
             .await
-            .map_err(|_| {
-                failed(format!(
-                    "the request could not migrate: no engine served it within {} s",
-                    MIGRATION_TIMEOUT.as_secs()
-                ))
-            })?
             .map_err(|error| failed(format!("the request could not migrate: {error}")))?;
         let mut continuation = request.continuation(&migration, kept);
         if let Request::Generation(generation) = &mut continuation {
@@ -821,6 +810,65 @@ mod tests {
         assert!(
             events.skips(&scheduling()),
             "a second scheduling is the repeat a migration removes"
+        );
+    }
+
+    /// A request whose engine was lost waits in the hold for as long as the
+    /// deployment takes to put another engine in front of it — a relaunch
+    /// captures every graph again, which takes minutes — and then continues on
+    /// that engine to its last token: a held request is bounded by its client
+    /// and by the hold closing, never by a clock of its own.
+    #[tokio::test]
+    async fn a_lost_engines_request_waits_through_a_slow_relaunch() {
+        let hold = Arc::new(RequestHold::new());
+        let (tx, rx) = mpsc::unbounded_channel();
+        tx.send(Event::Migratable {
+            cause: MigrationCause::Loss,
+            denoised_steps: 0,
+            stored_layout: Vec::new(),
+        })
+        .unwrap();
+        let mut events = resumable(rx, Arc::clone(&hold), 3);
+
+        // Ten minutes pass on the paused clock with no engine serving: longer
+        // than any engine's start.
+        tokio::time::pause();
+        let waiting = tokio::spawn(async move {
+            let first = events.recv().await;
+            (first, events)
+        });
+        tokio::time::sleep(Duration::from_secs(600)).await;
+        assert!(
+            !waiting.is_finished(),
+            "the request stopped waiting while the deployment had no engine"
+        );
+
+        tokio::time::resume();
+        hold.serve(client());
+        let (first, mut events) = tokio::time::timeout(Duration::from_secs(10), waiting)
+            .await
+            .expect("the request continues once an engine serves")
+            .unwrap();
+        let mut tokens = usize::from(matches!(first, Some(Event::TextToken { .. })));
+        let finished = loop {
+            match next(&mut events).await {
+                Some(Event::TextToken { .. }) => tokens += 1,
+                Some(event @ Event::Finished { .. }) => break event,
+                Some(event) if event.is_terminal() => panic!("{event:?}"),
+                Some(_) => {}
+                None => panic!("the request ended without a finish"),
+            }
+        };
+        assert_eq!(tokens, 8);
+        assert!(
+            matches!(
+                finished,
+                Event::Finished {
+                    completion_tokens: 8,
+                    ..
+                }
+            ),
+            "{finished:?}"
         );
     }
 

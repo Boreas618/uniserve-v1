@@ -1491,9 +1491,10 @@ def test_a_sleeping_deployment_gives_back_its_cache_and_graph_storage(
 
 
 #: How long a lost main process has to put an engine back in front of requests
-#: before the test calls it a stall. The design states no recovery time, so
-#: this is the daemon's own migration bound (``MIGRATION_TIMEOUT``): what a case
-#: measures is recorded, and the bound is only ever a stall bound.
+#: before the test calls it a stall. The design states no recovery time, and a
+#: migrating request waits in the hold until an engine serves; the test's
+#: deployment captures few graphs, so its relaunch ends well inside this bound:
+#: what a case measures is recorded, and the bound is only ever a stall bound.
 RECOVERY_BOUND_S = 120.0
 
 #: The count a recovery case streams across its kill: long enough that the kill
