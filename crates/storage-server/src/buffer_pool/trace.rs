@@ -925,10 +925,12 @@ pub(crate) fn layout(pool: &BufferPool) -> String {
 /// by position, or gone, or new), each cached key with its copies, the
 /// memories that hold each block an owner or the cache holds on the device
 /// and the host parts that hold each host copy, the copies in flight with
-/// their keys, what waits for a stamp with the stamps it still waits for
-/// (`after=g<n>:<sequence>,...`, one `release` line per group and stamp a
-/// release waits for), and the tasks with their keys. A block a waiting
-/// commit holds states its memories too. A unit is `region:unit`, a key its
+/// their keys and the host parts a store or a save writes, what waits for a
+/// stamp with the stamps it still waits for (`after=g<n>:<sequence>,...`,
+/// one `release` line per group and stamp a release waits for), and the
+/// tasks with their keys and the host parts a prefetch writes, a task of
+/// several keys as one per key. A block a waiting commit holds states its
+/// memories too. A unit is `region:unit`, a key its
 /// 32 bytes in hex. `verification/buffer-pool/agreement.py` writes the
 /// model's states in the same lines.
 pub(crate) fn stated(pool: &BufferPool, owners: &[(QueueId, OwnerId)], copies: u32) -> String {
@@ -941,6 +943,14 @@ pub(crate) fn stated(pool: &BufferPool, owners: &[(QueueId, OwnerId)], copies: u
         runs.join("+")
     };
     let units = |blocks: BTreeSet<String>| blocks.into_iter().collect::<Vec<_>>().join(" ");
+    // Memories as the bits of a block's validity they are: `m2,m3`.
+    let bits = |mask: u64| {
+        let named: Vec<String> = (0..64)
+            .filter(|bit| mask & (1 << bit) != 0)
+            .map(|bit| format!("m{bit}"))
+            .collect();
+        named.join(",")
+    };
     let mut lines = vec![format!("ncopy {copies}")];
 
     let completed: BTreeMap<u8, u64> = pool
@@ -1076,8 +1086,15 @@ pub(crate) fn stated(pool: &BufferPool, owners: &[(QueueId, OwnerId)], copies: u
         } else {
             format!("m{}", memory.trailing_zeros())
         };
+        // The host parts a store or a save writes: a store's fill those its
+        // host block lacks, otherwise those of its group.
+        let parts = if matches!(kind, "store" | "save") {
+            bits(copy.memory)
+        } else {
+            String::new()
+        };
         format!(
-            "kind={kind} o={owner} p={position} read={} write={} fill={} mem={memory} k={key}",
+            "kind={kind} o={owner} p={position} read={} write={} fill={} mem={memory} k={key} parts={parts}",
             unit(&copy.reads[0]),
             unit(&copy.write),
             u8::from(copy.fill)
@@ -1211,13 +1228,21 @@ pub(crate) fn stated(pool: &BufferPool, owners: &[(QueueId, OwnerId)], copies: u
                 group.0,
                 unit(&copies[0].write)
             )),
-            Some(Target::Entry { key, remote }) if copies[0].deadline.is_some() => {
+            Some(Target::Entry { remote, .. }) if copies[0].deadline.is_some() => {
+                // A task of several keys is a task per key to the model,
+                // which makes one per key. A prefetch writes the host parts
+                // of the group that asked for it; a put writes none.
                 let kind = if *remote { "put" } else { "prefetch" };
-                lines.push(format!(
-                    "task {kind} h={} expired={expired} k={}",
-                    unit(&copies[0].write),
-                    key_name(key)
-                ));
+                for copy in copies {
+                    if let Target::Entry { key, .. } = &copy.to {
+                        lines.push(format!(
+                            "task {kind} h={} expired={expired} k={} parts={}",
+                            unit(&copy.write),
+                            key_name(key),
+                            bits(copy.memory)
+                        ));
+                    }
+                }
             }
             _ => lines.extend(
                 copies

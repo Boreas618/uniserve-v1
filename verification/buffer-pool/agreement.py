@@ -43,6 +43,10 @@ MEMORIES = {
     "cross": {"ga": "m0", "gb": "m1", "hp": "m2"},
     "parts": {"ga": "m0", "gb": "m1", "pa": "m2", "pb": "m3"},
 }
+# The host parts each group's ranks copy with in each shape (the model's
+# `GroupParts`): the one part in all but `parts`.
+GROUP_PARTS = {shape: {"ga": ["hp"], "gb": ["hp"]} for shape in ("core", "copies", "transfer", "tiers", "cross")}
+GROUP_PARTS["parts"] = {"ga": ["pa"], "gb": ["pa", "pb"]}
 GROUPS = {"ga": 0, "gb": 1}
 OWNERS = {"o1": 1, "o2": 2}
 
@@ -108,7 +112,8 @@ READ = {"valid", "ogroup", "deferred", "hcache", "tasks", "free", "copies", "nco
 
 def project(state, shape):
     """The lines of a model state, as the Rust enumeration writes its own."""
-    names, memory = NAMES[shape], MEMORIES[shape]
+    names, memory, parts_of = NAMES[shape], MEMORIES[shape], GROUP_PARTS[shape]
+    bits = lambda found: ",".join(sorted((memory[name] for name in found), key=lambda bit: int(bit[1:])))
     unit = lambda name: names[name]
     units = lambda found: " ".join(sorted(unit(name) for name in found))
     group = lambda name: f"g{GROUPS[name]}"
@@ -162,8 +167,15 @@ def project(state, shape):
         fill = int(copy["fill"] == "TRUE" and kind in ("load", "store"))
         # The key a copy caches its block under; a clone and a restore cache none.
         key = KEY if kind in ("load", "store", "save") else "-"
+        # The host parts a store or a save writes: a store's fill those its
+        # host block lacks, otherwise those of its group.
+        parts = ""
+        if kind == "store" and copy["fill"] == "TRUE":
+            parts = bits(copy["parts"])
+        elif kind in ("store", "save"):
+            parts = bits(parts_of[copy["g"]])
         return (f"kind={kind} o={owner} p={position} read={unit(copy['read'])} "
-                f"write={unit(copy['write'])} fill={fill} mem={memory} k={key}")
+                f"write={unit(copy['write'])} fill={fill} mem={memory} k={key} parts={parts}")
 
     copies = state["copies"]
     lines.extend("copy " + copy_line(copy) for copy in copies)
@@ -203,7 +215,9 @@ def project(state, shape):
             (block,) = task["units"]
             lines.append(f"task replicate o={OWNERS[task['o']]} p=0 to={group(task['to'])} u={unit(block)}")
         else:
-            lines.append(f"task {task['kind']} h={unit(task['h'])} expired={expired} k={KEY}")
+            # A prefetch writes the host parts of the group that asked for it.
+            parts = bits(parts_of[task["to"]]) if task["kind"] == "prefetch" else ""
+            lines.append(f"task {task['kind']} h={unit(task['h'])} expired={expired} k={KEY} parts={parts}")
     return "\n".join(sorted({line.rstrip() for line in lines}))
 
 

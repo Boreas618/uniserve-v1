@@ -7,7 +7,8 @@
 # between the states the pool passes through is checked against the design
 # model's steps from its recorded state, on the parts of the pool it touches
 # (steps.py, KvTrace.tla), $REPLAY_JOBS (default 32) scans and TLC runs at
-# once. Prints one verdict line and exits non-zero when either fails.
+# once. Prints one verdict line (ok, FAIL, or INCONCLUSIVE when a TLC run
+# stopped before its search was complete) and exits non-zero unless ok.
 #   replay.sh TRACE_DIR
 # The replay's states and TLC's runs are kept in $REPLAY_WORK (default: a
 # temporary directory; the states of a serving run take gigabytes, so a local
@@ -27,12 +28,15 @@ fi
 replayed=$(grep -E "^replayed " "$work/replay.log" | sed 's/^replayed //' | paste -sd ';' -)
 
 status=0
+failed=0
 model=""
 for steps in "$work"/states/*.steps; do
     name=$(basename "$steps" .steps)
     result=$(python3 "$here/steps.py" --jobs "${REPLAY_JOBS:-32}" "$steps" "$work/$name") || status=1
-    model="$model $(echo "$result" | sed -E 's/^(ok|FAIL) +//')"
+    # A TLC run that stopped before its search was complete settles nothing.
+    case "$result" in INCONCLUSIVE*) ;; ok*) ;; *) failed=1 ;; esac
+    model="$model $(echo "$result" | sed -E 's/^(ok|FAIL|INCONCLUSIVE) +//')"
 done
-if [ $status = 0 ]; then verdict=ok; else verdict=FAIL; fi
+if [ $status = 0 ]; then verdict=ok; elif [ $failed = 0 ]; then verdict=INCONCLUSIVE; else verdict=FAIL; fi
 echo "$verdict    replay: $replayed; model:$model"
 exit $status

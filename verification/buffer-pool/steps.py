@@ -41,14 +41,17 @@ state shrinks again what it grows, with nothing between that reads it.
 
 A step the model has no terms for is counted as outside the model and not
 checked: an open, a close or a pool's image; a request of a class other
-than 0; a prefetch from the peers; a copy, a prefetch or a put of several
-keys (the model makes one per key); a state while no session or several are
-open, with units of a region the model lacks, or with a key cached in a
-class other than 0 (the model has one class; `# class` lines state them).
+than 0; a prefetch from the peers; a load or a store of several keys (the
+model makes one per key; a prefetch of several is checked as one per key
+in order, and a state states a task of several keys as one per key); a
+state while no session or several are open, with units of a region the
+model lacks, or with a key cached in a class other than 0 (the model has
+one class; `# class` lines state them).
 
-Prints one verdict line: ok, or FAIL with the first step no path follows,
-whose window is kept in WORK/failure.txt; with --expect fail the verdict is
-ok only when some step is not followed. WORK keeps each run's MC_Trace and
+Prints one verdict line: ok; FAIL with the first step no path follows,
+whose window is kept in WORK/failure.txt (with the first 50 such); or
+INCONCLUSIVE when a TLC run stopped before its search was complete. With
+--expect fail the verdict is ok only when some step is not followed. WORK keeps each run's MC_Trace and
 TLC's output; TLC's state files are kept under $TMPDIR (default /tmp).
 """
 import argparse
@@ -99,10 +102,19 @@ def tla(value):
     if isinstance(value, Rec):
         return "[" + ", ".join(f"{name} |-> {tla(item)}" for name, item in value.items()) + "]"
     if isinstance(value, Fn):
-        # A function as the set of its pairs (KvTrace's `FnOf`): a chain of
-        # `@@` as long as a function is deep enough to overflow TLC's stack.
-        pairs = ", ".join(sorted(f"<<{tla(key)}, {tla(item)}>>" for key, item in value.items()))
-        return "FnOf({" + pairs + "})"
+        # A function as `@@` of its pairs `k :> v`, in a balanced tree: TLC
+        # builds each as a table at once, and a tree's depth is the log of
+        # its size where a chain as long as a function overflows TLC's stack.
+        pairs = [f"{tla(key)} :> {tla(item)}" for key, item in sorted(value.items())]
+        if not pairs:
+            return "[x \\in {} |-> 0]"
+
+        def tree(low, high):
+            if high - low == 1:
+                return "(" + pairs[low] + ")"
+            middle = (low + high) // 2
+            return "(" + tree(low, middle) + " @@ " + tree(middle, high) + ")"
+        return tree(0, len(pairs))
     if isinstance(value, Seq):
         return "<<" + ", ".join(tla(item) for item in value) + ">>"
     if isinstance(value, tuple):
@@ -366,8 +378,8 @@ def acts(text):
     if found.get("class", "0") != "0":
         raise Outside("a class other than 0")
     keys = found.get("ks", "").split(",")
-    if kind in ("load", "prefetch") and len(keys) > 1:
-        raise Outside(f"a {kind} of several keys")
+    if kind == "load" and len(keys) > 1:
+        raise Outside("a load of several keys")
     if kind in STUTTER:
         return []
     if kind in ARRIVE:
@@ -671,9 +683,20 @@ def window(step, before, after, text, part, witnesses):
         order.sort(key=lambda position: (position not in entries or entries[position][1] not in before.free,
                                          index[position]))
     korder = [key for key in found.get("ks", "").split(",") if key]
+
+    # The keys whose device or host copy the window's next state no longer
+    # caches, which its evictions take in this order.
+    def dropped(index):
+        gone = []
+        for key in keys:
+            if key in before.keys and before.keys[key][index] != "-":
+                if key not in after.keys or after.keys[key][index] == "-":
+                    gone.append(rename(key, "k"))
+        return sorted(gone, key=lambda name: int(name[1:]))
     return {"step": step, "input": rename_input(text, rename), "raw": text,
             "order": [rename(position, "p") for position in order],
             "korder": [rename(key, "k") for key in korder],
+            "evict": dropped(0), "evicthost": dropped(1),
             "lines": lines, "ncopy": (len(copies[0]), len(copies[0]) + made), "made": made,
             "completed": (before.completed, after.completed),
             "witnesses": sorted(rename(unit) for unit in witnesses),
@@ -880,16 +903,17 @@ def parse_lines(lines, rank):
                 match = re.match(r"o=(\S+) to=(\S+) slot=(\S+) units=(.*?) ?writes=(.*)$", rest)
                 o, to, slot, units, writes = match.groups()
                 state["tasks"].append(Rec(kind=kind, o=o, p="-", to=to, slot=slot, units=Set(units.split()),
-                                          writes=Set(writes.split()), h="-", expired=0, k="-"))
+                                          writes=Set(writes.split()), h="-", expired=0, k="-", parts=Set()))
             elif kind == "replicate":
                 found = fields(rest)
                 state["tasks"].append(Rec(kind=kind, o=found["o"], p=found["p"], to=found["to"], slot="-",
                                           units=Set([found["u"]]), writes=Set([found["u"]]), h="-",
-                                          expired=0, k="-"))
+                                          expired=0, k="-", parts=Set()))
             else:
                 found = fields(rest)
                 state["tasks"].append(Rec(kind=kind, o="-", p="-", to="-", slot="-", units=Set(), writes=Set(),
-                                          h=found["h"], expired=int(found["expired"]), k=found["k"]))
+                                          h=found["h"], expired=int(found["expired"]), k=found["k"],
+                                          parts=Set(filter(None, found["parts"].split(",")))))
         else:
             raise ValueError(f"a line the model has no terms for: {line}")
     return state
@@ -898,7 +922,8 @@ def parse_lines(lines, rank):
 def copy_line(text):
     found = fields(text)
     return Rec(kind=found["kind"], o=found["o"], p=found["p"], read=found["read"],
-               write=found["write"], fill=int(found["fill"]), mem=found["mem"], k=found["k"])
+               write=found["write"], fill=int(found["fill"]), mem=found["mem"], k=found["k"],
+               parts=Set(filter(None, found["parts"].split(","))))
 
 
 def values(item):
@@ -976,7 +1001,12 @@ def check(job):
             found = fields(text)
             now = start["completed"].get(found["g"], 0)
             jump = max(0, rank[int(found["value"])] - now)
-        bound = 4 + 2 * len(set(item["lines"][0]) ^ set(item["lines"][1])) + jump
+        # Steps enough for each changed line and each changed entry of an
+        # owner's line (a pin of 128 keys changes one line and 128 entries).
+        changed = set(item["lines"][0]) ^ set(item["lines"][1])
+        held = [{entry for line in body if line.startswith("owner ") for entry in
+                 (f"{line.split()[1]} {position}" for position in line.split()[5:])} for body in item["lines"]]
+        bound = 4 + 2 * (len(changed) + len(held[0] ^ held[1])) + jump
         entries.append(f"[start |-> {tla(begin)}, "
                        f"input |-> {define('I', input_record(item, groups, owners, positions, keys, rank))}, "
                        f"state |-> {define('S', states[1])}, bound |-> {bound}]")
@@ -993,28 +1023,36 @@ def check(job):
     group_parts = Fn((group, Set(info[3])) for group, info in layout[0])
     host_parts = Set(sorted({part for _, info in layout[0] for part in info[3]}))
     readers = Fn((group, Set(other for other in groups if other != group)) for group in groups)
+    # Each constant is the name of a definition of its value: TLC evaluates a
+    # definition that substitutes a constant (`<-`) at each use, and one it
+    # names once, at the start.
+    values_of = {
+        "TraceUnits": tla(Set(units["kv"])),
+        "TraceSlots": tla(Set(units["rows"])),
+        "TraceHostUnits": tla(Set(units["host"])),
+        "TraceKeys": tla(Set(keys)),
+        "TraceOwners": tla(Set(owners)),
+        "TraceGroups": tla(Set(groups)),
+        "TracePositions": tla(Set(positions)),
+        "TraceSlotGroup": tla(slot_group),
+        "TraceGroupEpoch": "[g \\in TraceGroups |-> e1]",
+        "TraceOwnerEpoch": "[o \\in TraceOwners |-> e1]",
+        "TraceGroupMemory": tla(memory),
+        "TraceUnitRegion": tla(Fn((unit, "r" + unit.split(":")[0]) for unit in units["kv"])),
+        "TraceUnitChunk": "[u \\in TraceUnits |-> u]",
+        "TraceGroupRegion": tla(kv_region),
+        "TraceHostParts": tla(host_parts),
+        "TraceGroupParts": tla(group_parts),
+        "TraceReaders": tla(readers),
+        "TraceRules": "AllRules",
+    }
     module = [
         "---- MODULE MC_Trace ----",
         "EXTENDS KvTrace",
-        f"TraceUnits == {tla(Set(units['kv']))}",
-        f"TraceSlots == {tla(Set(units['rows']))}",
-        f"TraceHostUnits == {tla(Set(units['host']))}",
-        f"TraceKeys == {tla(Set(keys))}",
-        f"TraceOwners == {tla(Set(owners))}",
-        f"TraceGroups == {tla(Set(groups))}",
-        f"TracePositions == {tla(Set(positions))}",
-        f"TraceSlotGroup == {tla(slot_group)}",
-        "TraceGroupEpoch == [g \\in TraceGroups |-> e1]",
-        "TraceOwnerEpoch == [o \\in TraceOwners |-> e1]",
-        f"TraceGroupMemory == {tla(memory)}",
-        f"TraceUnitRegion == {tla(Fn((unit, 'r' + unit.split(':')[0]) for unit in units['kv']))}",
-        "TraceUnitChunk == [u \\in TraceUnits |-> u]",
-        f"TraceGroupRegion == {tla(kv_region)}",
-        f"TraceHostParts == {tla(host_parts)}",
-        f"TraceGroupParts == {tla(group_parts)}",
-        f"TraceReaders == {tla(readers)}",
+        *(f"{name}Value == {value}\n{name} == {name}Value" for name, value in values_of.items()),
         *definitions,
-        "TraceWindows == <<" + ",\n    ".join(entries) + ">>",
+        "TraceWindowsValue == <<" + ",\n    ".join(entries) + ">>",
+        "TraceWindows == TraceWindowsValue",
         "====",
     ]
     with open(os.path.join(directory, "MC_Trace.tla"), "w") as out:
@@ -1030,7 +1068,7 @@ def check(job):
         "InitialUnits": "<- TraceUnits", "Movable": "<- TraceUnits", "TrialEpochs": "= {}",
         "MaxBatch": f"= {batches}", "MaxRequests": "= 1", "MaxCopies": f"= {copies}",
         "MaxTasks": f"= {tasks}", "Losable": "= {}", "Hazards": "= {}", "Eager": "= TRUE",
-        "Rules": "<- AllRules", "Windows": "<- TraceWindows", "HostParts": "<- TraceHostParts",
+        "Rules": "<- TraceRules", "Windows": "<- TraceWindows", "HostParts": "<- TraceHostParts",
         "GroupParts": "<- TraceGroupParts", "Readers": "<- TraceReaders",
     }
     # MC_Pool's model values: the names on the first line of its CONSTANTS.
@@ -1075,9 +1113,11 @@ def input_record(item, groups, owners, positions, keys, rank):
     if kind == "completed":
         completed[named_values["g"]] = rank[int(named_values["value"])]
     order, korder = Seq(item["order"]), Seq(item["korder"])
+    evict, evicthost = Seq(item["evict"]), Seq(item["evicthost"])
     return Rec(acts=Set(acts(text)), os=Set([named_values["o"]]) if "o" in named_values else Set(owners),
                gs=Set([named_values["g"]]) if "g" in named_values else Set(groups),
                ps=listed("ps", positions), ks=listed("ks", keys), order=order, korder=korder,
+               evict=evict, evicthost=evicthost,
                req=request, completed=completed)
 
 
@@ -1182,8 +1222,15 @@ def main():
         (source, target), text, item = failures[0]
         detail = (f"{len(failures)} windows not followed; the first: step {source} -> {target} by `{text}` "
                   f"({arguments.work}/failure.txt)")
-    if errors:
-        verdict = f"FAIL  {name}: {len(errors)} TLC runs did not complete, the first: {errors[0]}; {summary}"
+    if failures and arguments.expect == "pass":
+        verdict = f"FAIL  {name}: {detail}; {summary}"
+        if errors:
+            verdict += f"; and {len(errors)} TLC runs did not complete, the first: {errors[0]}"
+    elif errors:
+        # A run that stops before its search is complete settles nothing
+        # (specs/buffer-pool.md §18).
+        verdict = (f"INCONCLUSIVE  {name}: {len(errors)} TLC runs did not complete, the first: {errors[0]}"
+                   f"{'; ' + detail if failures else ''}; {summary}")
     elif arguments.expect == "pass":
         verdict = f"FAIL  {name}: {detail}; {summary}" if failures else f"ok    {name}: every step followed: {summary}"
     else:

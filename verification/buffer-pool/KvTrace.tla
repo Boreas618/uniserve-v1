@@ -9,8 +9,9 @@
 (* next state and bound in variables. A state is compared as the Rust      *)
 (* buffer pool writes it in the model's terms (agreement.py's projection,  *)
 (* here as `Matches`), which states every field of waiting work, copies    *)
-(* and tasks but the group of a store and of a prefetch and the owner of a *)
-(* save whose owner is gone; TLC chooses those at the window's start.      *)
+(* and tasks a step reads, so a window's start is one state of the model   *)
+(* (`Start`): TLC enumerates no choice there, however many copies are in   *)
+(* flight.                                                                 *)
 (*                                                                         *)
 (* Every step of a path is a step of `PoolNext`: each disjunct of `Step`   *)
 (* is one of its disjuncts with a guard that the input allows it, or with  *)
@@ -33,9 +34,6 @@ VARIABLES window,  \* the window searched
 
 trace == <<window, input, goal, bound, walked, reached>>
 
-\* The function whose pairs are the set `S` of pairs: how steps.py writes one.
-FnOf(S) == [x \in {p[1] : p \in S} |-> (CHOOSE p \in S : p[1] = x)[2]]
-
 -----------------------------------------------------------------------------
 (* A state as the Rust buffer pool writes it.                              *)
 
@@ -48,26 +46,32 @@ Pending(a) == [g \in {x \in Groups : a[x] > launched[x]} |-> a[g]]
 CopyLine(c) ==
     [kind |-> c.kind,
      o |-> IF \/ c.kind \in {"clone", "load", "restore"}
-              \/ c.kind = "save" /\ ostate[c.o] = "live" /\ oslot[c.o] = c.read
+              \/ c.kind = "save" /\ c.o \in Owners /\ ostate[c.o] = "live" /\ oslot[c.o] = c.read
            THEN c.o ELSE "-",
      p |-> IF c.kind \in {"clone", "load"} THEN c.p ELSE "-",
      read |-> c.read, write |-> c.write,
      fill |-> IF c.fill /\ c.kind \in {"load", "store"} THEN 1 ELSE 0,
      mem |-> IF c.kind \in {"clone", "load"} THEN GroupMemory[c.g] ELSE "-",
      \* The key a copy caches its block under; a clone and a restore cache none.
-     k |-> IF c.kind \in {"load", "store", "save"} THEN c.k ELSE "-"]
+     k |-> IF c.kind \in {"load", "store", "save"} THEN c.k ELSE "-",
+     \* The host parts a store or a save writes.
+     parts |-> CASE c.kind = "store" -> IF c.fill THEN c.parts ELSE GroupParts[c.g]
+                 [] c.kind = "save" -> GroupParts[c.g]
+                 [] OTHER -> {}]
 
 \* A task in flight, as a `task` line states it.
 TaskLine(t) ==
     CASE t.kind = "transfer" ->
            [kind |-> "transfer", o |-> t.o, p |-> "-", to |-> t.to, slot |-> t.slot,
-            units |-> t.units, writes |-> t.writes, h |-> "-", expired |-> 0, k |-> "-"]
+            units |-> t.units, writes |-> t.writes, h |-> "-", expired |-> 0, k |-> "-", parts |-> {}]
       [] t.kind = "replicate" ->
            [kind |-> "replicate", o |-> t.o, p |-> t.p, to |-> t.to, slot |-> "-",
-            units |-> t.units, writes |-> t.writes, h |-> "-", expired |-> 0, k |-> "-"]
+            units |-> t.units, writes |-> t.writes, h |-> "-", expired |-> 0, k |-> "-", parts |-> {}]
       [] OTHER ->
            [kind |-> t.kind, o |-> "-", p |-> "-", to |-> "-", slot |-> "-", units |-> {},
-            writes |-> {}, h |-> t.h, expired |-> IF t.expired THEN 1 ELSE 0, k |-> t.k]
+            writes |-> {}, h |-> t.h, expired |-> IF t.expired THEN 1 ELSE 0, k |-> t.k,
+            \* The host parts of the group a prefetch writes for.
+            parts |-> IF t.kind = "prefetch" THEN GroupParts[t.to] ELSE {}]
 
 Waiting(kind) == {d \in deferred : d.kind = kind}
 
@@ -124,9 +128,12 @@ Matches(st) ==
 (* nothing caches, is valid nowhere (each is written before it is read, or *)
 (* is reclaimed); a clone's key is the one its source is cached under, and *)
 (* a restore's the one its host block is (the copy holds either, so the    *)
-(* cache keeps it, R2). TLC chooses a store's and a prefetch's group and   *)
-(* the owner of a save whose owner is gone. `x.member` is the device units *)
-(* in their region, `x.copies` the copies in flight in an order that       *)
+(* cache keeps it, R2); a store's or a save's group is one that copies     *)
+(* with the host parts it writes, a prefetch's the one whose host parts it *)
+(* writes, and a restore's of a gone owner any (the groups of a window are *)
+(* of one epoch, and a copy reads no more of its group); the owner of a    *)
+(* save whose owner is gone is a gone owner. `x.member` is the device     *)
+(* units in their region, `x.copies` the copies in flight in an order that *)
 (* numbers them, and `x.finishes` the waiting `Finish`es by the index of   *)
 (* their copy.                                                             *)
 
@@ -140,14 +147,31 @@ Start(x) ==
         stated == {v[1] : v \in st.valid}
         Stamp(a) == [g \in Groups |-> IF g \in DOMAIN a THEN a[g] ELSE 0]
         cachedAs(b) == {e.k : e \in {f \in st.keys : f.d = b \/ f.h = b}}
-        Copied(l, j, g, o) ==
-            [id |-> ident(j), kind |-> l.kind, o |-> o, p |-> IF l.p = "-" THEN NONE ELSE l.p,
+        gone == {o \in Owners : st.owners[o].is = "gone"}
+        \* A copy's group: the one whose memory a clone or a load writes, a
+        \* live owner's, or one that copies with the host parts a store or a
+        \* save writes (groups alike in these are alike to a copy).
+        groupOf(l) ==
+            CASE l.mem # "-" -> CHOOSE g \in Groups : GroupMemory[g] = l.mem
+              [] l.o # "-" /\ live(l.o) -> st.owners[l.o].g
+              [] l.kind = "store" /\ l.fill = 1 -> CHOOSE g \in Groups : l.parts \subseteq GroupParts[g]
+              [] l.kind \in {"store", "save"} -> CHOOSE g \in Groups : GroupParts[g] = l.parts
+              [] OTHER -> CHOOSE g \in Groups : TRUE
+        \* A copy's owner: the one its line states; none for a store; for a
+        \* save whose owner is gone, a gone owner, or none when the window has
+        \* none (a save of none is one no request can name, as one of a gone owner).
+        ownerOf(l) ==
+            IF l.o # "-" THEN l.o
+            ELSE IF l.kind = "save" /\ gone # {} THEN CHOOSE o \in gone : TRUE
+            ELSE NONE
+        Copied(l, j) ==
+            [id |-> ident(j), kind |-> l.kind, o |-> ownerOf(l), p |-> IF l.p = "-" THEN NONE ELSE l.p,
              k |-> IF l.k # "-" THEN l.k
                    ELSE IF cachedAs(l.read) # {} THEN CHOOSE y \in cachedAs(l.read) : TRUE ELSE NONE,
-             g |-> g, read |-> l.read, write |-> l.write,
+             g |-> groupOf(l), read |-> l.read, write |-> l.write,
              fill |-> (l.kind \in {"load", "store"} /\ l.fill = 1) \/ l.kind = "restore",
-             \* A store's fill writes the group's host parts its block lacks.
-             parts |-> IF l.kind = "store" /\ l.fill = 1 THEN GroupParts[g] \ valid[l.write] ELSE {},
+             \* A store's fill writes the host parts its block lacks.
+             parts |-> IF l.kind = "store" /\ l.fill = 1 THEN l.parts ELSE {},
              seq |-> 0, done |-> FALSE, stopped |-> FALSE]
     IN /\ free = st.free
        /\ member = x.member
@@ -171,14 +195,7 @@ Start(x) ==
        /\ inflight = {}
        /\ handoff = {}
        /\ requests = {}
-       \* The group and owner a copy's line does not state.
-       /\ \E gs \in [1 .. n -> Groups], os \in [1 .. n -> Owners \cup {NONE}] :
-            /\ \A j \in 1 .. n :
-                 LET l == x.copies[j] IN
-                 /\ IF l.o # "-" THEN os[j] = l.o ELSE (os[j] = NONE) = (l.kind = "store")
-                 /\ l.mem # "-" => GroupMemory[gs[j]] = l.mem
-                 /\ (l.o # "-" /\ live(l.o)) => gs[j] = st.owners[l.o].g
-            /\ copies = {Copied(x.copies[j], j, gs[j], os[j]) : j \in 1 .. n}
+       /\ copies = {Copied(x.copies[j], j) : j \in 1 .. n}
        /\ deferred =
             {[kind |-> "commit", units |-> {cm.u}, after |-> Stamp(cm.after), o |-> cm.o, p |-> cm.p,
               k |-> cm.k, c |-> 0, ok |-> FALSE, g |-> ogroup[cm.o], to |-> NONE] :
@@ -196,9 +213,7 @@ Start(x) ==
             \cup {[kind |-> "release", units |-> rl.units, after |-> Stamp(rl.after), o |-> NONE,
                    p |-> NONE, k |-> NONE, c |-> 0, ok |-> FALSE, g |-> NONE, to |-> NONE] :
                     rl \in st.releases}
-       \* The group a prefetch fills the host parts of.
-       /\ \E tg \in [st.tasks -> Groups] :
-            tasks =
+       /\ tasks =
               {CASE tl.kind = "transfer" ->
                       [kind |-> "transfer", k |-> NONE, h |-> NONE, src |-> NONE, ok |-> TRUE,
                        expired |-> FALSE, p |-> NONE, o |-> tl.o, to |-> tl.to, slot |-> tl.slot,
@@ -210,7 +225,10 @@ Start(x) ==
                  [] OTHER ->
                       [kind |-> tl.kind, k |-> tl.k, h |-> tl.h, src |-> "remote", ok |-> TRUE,
                        expired |-> tl.expired = 1, p |-> NONE, o |-> NONE,
-                       to |-> IF tl.kind = "prefetch" THEN tg[tl] ELSE NONE, slot |-> NONE,
+                       \* The group whose host parts a prefetch writes.
+                       to |-> IF tl.kind = "prefetch" THEN CHOOSE g \in Groups : GroupParts[g] = tl.parts
+                              ELSE NONE,
+                       slot |-> NONE,
                        held |-> TRUE, units |-> {}, writes |-> {}] :
                  tl \in st.tasks}
        /\ vis = [y \in Keys |-> [d |-> NONE, h |-> NONE]]
@@ -275,25 +293,59 @@ ArriveAs(q) ==
                               EXCEPT !.after = after]}
     /\ UNCHANGED <<pool, dbt, launched, inflight, handoff, alloc, sharedKey>>
 
+\* The index of the first position from the `i`-th of `order` that owner
+\* o's table has empty, or 0: one pass over a request's positions, which
+\* may be hundreds.
+RECURSIVE FirstEmpty(_, _, _)
+FirstEmpty(o, order, i) ==
+    IF i > Len(order) THEN 0
+    ELSE IF table[o][order[i]] = Empty THEN i
+    ELSE FirstEmpty(o, order, i + 1)
+
+\* The index of the first key from the `i`-th of `keys` that no host block
+\* and no prefetch holds, or 0: the next key a prefetch of several brings.
+RECURSIVE FirstToFetch(_, _)
+FirstToFetch(keys, i) ==
+    IF i > Len(keys) THEN 0
+    ELSE IF hcache[keys[i]] = NONE /\ ~\E t \in tasks : t.kind = "prefetch" /\ t.k = keys[i] THEN i
+    ELSE FirstToFetch(keys, i + 1)
+
+\* The index of the first key from the `i`-th of `keys` whose device copy
+\* (`f` = cache) or host copy (`f` = hcache) is cached, or 0.
+RECURSIVE FirstCached(_, _, _)
+FirstCached(f, keys, i) ==
+    IF i > Len(keys) THEN 0
+    ELSE IF f[keys[i]] # NONE THEN i
+    ELSE FirstCached(f, keys, i + 1)
+
 Step(in) ==
     \/ "Attach" \in in.acts /\ \E o \in in.os, g \in in.gs : Attach(o, g) /\ UNCHANGED rare
     \* A request of several positions takes them in order (`in.order`), a
-    \* pin each with its key (`in.korder`), as the Rust buffer pool does.
-    \/ "Allocate" \in in.acts /\ \E o \in in.os, i \in 1 .. Len(in.order) :
-         /\ \A j \in 1 .. i - 1 : table[o][in.order[j]] # Empty
-         /\ Allocate(o, in.order[i])
-         /\ UNCHANGED rare
-    \/ "Pin" \in in.acts /\ \E o \in in.os, i \in 1 .. Len(in.order) :
-         /\ \A j \in 1 .. i - 1 : table[o][in.order[j]] # Empty
-         /\ Pin(o, in.order[i], in.korder[i])
-         /\ UNCHANGED rare
+    \* pin each with its key (`in.korder`), as the Rust buffer pool does:
+    \* the first position of the order that the owner's table has empty.
+    \/ "Allocate" \in in.acts /\ \E o \in in.os :
+         LET i == FirstEmpty(o, in.order, 1)
+         IN /\ i > 0
+            /\ Allocate(o, in.order[i])
+            /\ UNCHANGED rare
+    \/ "Pin" \in in.acts /\ \E o \in in.os :
+         LET i == FirstEmpty(o, in.order, 1)
+         IN /\ i > 0
+            /\ Pin(o, in.order[i], in.korder[i])
+            /\ UNCHANGED rare
     \/ "Clone" \in in.acts /\ \E o \in in.os, q \in in.ps, y \in in.ks : Clone(o, q, y) /\ UNCHANGED rare
     \/ "Load" \in in.acts /\ \E o \in in.os, q \in in.ps, y \in in.ks : Load(o, q, y) /\ UNCHANGED rare
     \/ "Save" \in in.acts /\ \E o \in in.os, y \in in.ks : Save(o, y) /\ UNCHANGED rare
     \/ "Restore" \in in.acts /\ \E o \in in.os, y \in in.ks : Restore(o, y) /\ UNCHANGED rare
     \/ "Store" \in in.acts /\ \E g \in in.gs, y \in in.ks : Store(g, y) /\ UNCHANGED rare
-    \/ "Evict" \in in.acts /\ \E y \in in.ks : Evict(y) /\ UNCHANGED rare
-    \/ "EvictHost" \in in.acts /\ \E y \in Keys : EvictHost(y) /\ UNCHANGED rare
+    \* Evictions in the order of `in.evict` and `in.evicthost`, the keys whose
+    \* device or host copy the next state no longer caches (`Toward` lets no
+    \* other go): evictions of different keys commute, and in every order a
+    \* search would try each set of them.
+    \/ "Evict" \in in.acts /\ LET i == FirstCached(cache, in.evict, 1)
+                               IN i > 0 /\ Evict(in.evict[i]) /\ UNCHANGED rare
+    \/ "EvictHost" \in in.acts /\ LET i == FirstCached(hcache, in.evicthost, 1)
+                                   IN i > 0 /\ EvictHost(in.evicthost[i]) /\ UNCHANGED rare
     \/ "Arrive" \in in.acts /\ ArriveAs(in.req) /\ Asked(in.req) /\ UNCHANGED rare
     \/ "Advance" \in in.acts /\ \E g \in Groups : Advance(g) /\ launched'[g] <= in.completed[g]
                                                  /\ UNCHANGED rare
@@ -311,7 +363,11 @@ Step(in) ==
     \/ "Rollback" \in in.acts /\ \E e \in Epochs : Rollback(e) /\ UNCHANGED rare
     \/ "Shrink" \in in.acts /\ \E u \in Units : Shrink(u) /\ UNCHANGED rare
     \/ "Grow" \in in.acts /\ \E u \in Units : Grow(u) /\ UNCHANGED rare
-    \/ "Prefetch" \in in.acts /\ \E y \in in.ks, g \in in.gs : Prefetch(y, "remote", g)
+    \* A prefetch of several keys brings them in order, as the Rust buffer
+    \* pool's task does.
+    \/ "Prefetch" \in in.acts /\ \E g \in in.gs :
+         LET i == FirstToFetch(in.korder, 1)
+         IN i > 0 /\ Prefetch(in.korder[i], "remote", g)
     \/ "StoreRemote" \in in.acts /\ \E y \in in.ks : StoreRemote(y)
     \/ "Deadline" \in in.acts /\ \E t \in tasks : Deadline(t)
     \/ "PrefetchEnd" \in in.acts /\ \E t \in tasks, ok \in BOOLEAN : PrefetchEnd(t, ok)
@@ -342,11 +398,11 @@ Reach ==
 (* A step changes what the next recorded state `st` settles only toward   *)
 (* it: it takes no unit that `st` has free (so the free units steps.py     *)
 (* keeps in a window as witnesses stay free), writes an owner's entry only *)
-(* as `st` has it or empties it, and caches a key's device or host block,  *)
-(* or lets it go, only as `st` does. The model chooses the unit an         *)
-(* allocation takes and the order of a request's positions; without this  *)
-(* a search tries every unit at every position. The Rust buffer pool sets *)
-(* each of these once in a step.                                           *)
+(* as `st` has it or empties it, caches a key's device or host block, or   *)
+(* lets it go, only as `st` does, and starts a copy or a task only as `st` *)
+(* has it in flight. The model chooses the unit an allocation, a copy or a *)
+(* task takes; without this a search tries every unit for each. The Rust   *)
+(* buffer pool sets each of these once in a step.                          *)
 Toward(st) ==
     LET keyed(y) == {e \in st.keys : e.k = y}
         device(y) == IF keyed(y) = {} THEN "-" ELSE (CHOOSE e \in keyed(y) : TRUE).d
@@ -359,6 +415,8 @@ Toward(st) ==
        /\ \A y \in Keys :
             /\ cache'[y] # cache[y] => Shown(cache'[y]) = device(y)
             /\ hcache'[y] # hcache[y] => Shown(hcache'[y]) = host(y)
+       /\ \A c \in copies' \ copies : CopyLine(c)' \in st.copies
+       /\ \A t \in tasks' \ tasks : TaskLine(t)' \in st.tasks
 
 \* A step of the model's buffer pool on the way to the window's next state.
 Walk ==
