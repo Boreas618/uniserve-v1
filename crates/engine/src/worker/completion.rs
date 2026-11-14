@@ -369,6 +369,7 @@ fn stamps(request: &Request) -> Option<&storage::runtime::Stamps> {
         | Request::Release { after, .. }
         | Request::Commit { after, .. }
         | Request::Transfer { after, .. }
+        | Request::Replicate { after, .. }
         | Request::Finish { after, .. } => Some(after),
         _ => None,
     }
@@ -395,6 +396,7 @@ fn stamps_mut(request: &mut Request) -> Option<&mut storage::runtime::Stamps> {
         | Request::Release { after, .. }
         | Request::Commit { after, .. }
         | Request::Transfer { after, .. }
+        | Request::Replicate { after, .. }
         | Request::Finish { after, .. } => Some(after),
         _ => None,
     }

@@ -246,6 +246,7 @@ fn copied(id: u64, from: Run, to: Run) -> Completion {
         to: vec![to],
         evicted: Vec::new(),
         encodings: None,
+        parts: Vec::new(),
     }
 }
 

@@ -1262,6 +1262,7 @@ fn a_copy_runs_once_with_the_next_batch_and_its_finish_carries_that_batch_s_stam
         to: vec![(HOST, 3, 1)],
         evicted: Vec::new(),
         encodings: None,
+        parts: Vec::new(),
     };
     map(&route, 0, 10, store, copy);
 
@@ -1311,6 +1312,7 @@ fn a_copy_given_up_before_a_batch_started_it_never_runs_and_returns_no_finish() 
         to: vec![(DEVICE, 12, 1)],
         evicted: Vec::new(),
         encodings: None,
+        parts: Vec::new(),
     };
     map(&route, 2, 20, load, copy);
 
@@ -1359,6 +1361,7 @@ fn store(route: &Route, id: u64, from: u8, units: u32) {
         to: vec![(HOST, first, units)],
         evicted: Vec::new(),
         encodings: None,
+        parts: Vec::new(),
     };
     map(route, 0, id, store, copy);
 }

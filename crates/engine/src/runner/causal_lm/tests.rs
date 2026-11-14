@@ -2639,6 +2639,7 @@ fn a_batch_with_no_rows_writes_the_tables_and_runs_the_copies_without_a_forward(
         to: vec![(UNITS, 9, 1)],
         evicted: vec![],
         encodings: None,
+        parts: Vec::new(),
     };
     map(3, clone, copy);
 

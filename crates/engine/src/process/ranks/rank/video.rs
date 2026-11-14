@@ -10,7 +10,7 @@
 //! and steps, the video decoder's its decode rounds, the audio decoder's first rank the request's
 //! track, and the host blocks ([`MEDIA_READER`], [`VIDEO_CODEC_BLOCK`], [`MUXER`]) its host work.
 //! A group that places the whole model ([`DEFAULT_BLOCK`]) serves every phase on its one rank.
-//! The rank loads every stage its group places, split as the group's blocks state
+//! The rank loads the stages of its group's blocks that hold it, split as those blocks state
 //! ([`ModelRunner::video_split`]).
 //!
 //! **Runners.** One per block the rank serves, each on a stream of its own: [`EncoderRunner`],
@@ -164,9 +164,9 @@ pub(crate) struct VideoRank {
     /// (`BufferMemory::slot_units`). [`crate::memory::buffers::UNIT_BYTES`] on the meta device.
     pub(crate) granule: u64,
     /// The units of the rank's product buffer one request slot's part takes: the blocks one
-    /// request holds of each product kind the rank backs, in whole granules
-    /// (`crate::process::ranks::fit_media_slots`); 0 for a rank that backs no kind, whose
-    /// product buffer is one unit its slots take none of.
+    /// request holds of each product kind the rank backs or receives ([`held_kinds`]), in whole
+    /// granules (`crate::process::ranks::fit_media_slots`); 0 for a rank that holds no kind,
+    /// whose product buffer is one unit its slots take none of.
     pub(crate) slot_units: u64,
     /// The request slots of each of the deployment's worker groups, in the order the deployment
     /// states them: its running requests until the ranks of every host agree the fewest each
@@ -229,8 +229,9 @@ impl ModelRunner {
     /// deployment numbers it and on the device the deployment places it on, which this process
     /// serves. A device that holds ranks of several groups serves each as a rank of its own. The
     /// ranks of other hosts are their own main processes' (`docs/architecture.md`, The channel);
-    /// whether a product would pass between two processes is the session's layout's to refuse
-    /// (`crate::process::ranks::layout`).
+    /// a product read in another process than the one that wrote it reaches the reader's process
+    /// by a crossing into the receiving regions the session's layout states
+    /// (`crate::process::ranks::layout`, [`product_ranks`]).
     ///
     /// # Errors
     ///
@@ -261,8 +262,8 @@ impl ModelRunner {
         Ok(ranks)
     }
 
-    /// The share of the video pipeline this rank's checkpoint holds that its group places, split
-    /// as the group's blocks state, its weights reached through `weights`.
+    /// The share of the video pipeline this rank's checkpoint holds that its group places on it,
+    /// split as the group's blocks state, its weights reached through `weights`.
     ///
     /// # Errors
     ///
@@ -274,7 +275,7 @@ impl ModelRunner {
 
         let mut loader = weights.loader(&opened);
         let placement = VideoPlacement {
-            stages: self.stages(),
+            stages: self.stages()?,
             sequence,
             tensor,
             dtype: self.dtype(),
@@ -283,11 +284,24 @@ impl ModelRunner {
         Ok(checkpoint.load(&opened, &mut loader, &placement)?)
     }
 
-    /// The stages this rank's group places; `None` when the deployment places the whole model.
-    fn stages(&self) -> Option<BTreeSet<String>> {
-        self.capability_groups()?;
-        let group = self.worker_group()?;
-        Some(group.blocks.keys().cloned().collect())
+    /// The stages this rank's group places on it: those of the group's blocks that hold the
+    /// rank's position (a block that states no ranks holds every one); `None` when the deployment
+    /// places the whole model. A rank outside a block, such as a denoising rank beside a text
+    /// encoder split over fewer ranks, loads none of that block's stage.
+    ///
+    /// # Errors
+    ///
+    /// A rank its group does not place.
+    fn stages(&self) -> Result<Option<BTreeSet<String>>> {
+        let Some(group) = self.capability_groups().and(self.worker_group()) else {
+            return Ok(None);
+        };
+        let position = self.position()?;
+        let held = group
+            .blocks
+            .iter()
+            .filter(|(_, block)| block.ranks.is_empty() || block.ranks.contains(&position));
+        Ok(Some(held.map(|(name, _)| name.clone()).collect()))
     }
 
     /// The deployment's configuration of this rank's worker group.
@@ -491,8 +505,10 @@ impl ModelRunner {
 
     /// The config of the rank's denoiser of `model`: the requests the deployment serves, the
     /// classes it reads and writes, the ranks of its group's denoiser block, and the host latent
-    /// region's page bytes. The first rank of the block shares the latents its last step writes
-    /// with the process's other backing ranks and writes a saved trajectory's host copy.
+    /// region's page bytes. The block's first rank in each main process shares the latents its
+    /// last step writes with that process's other backing ranks and writes a saved trajectory's
+    /// host copy into the part 0 its process copies with: a block whose ranks lie on two hosts
+    /// saves on both, and its ranks on each host restore through their own host's part.
     ///
     /// # Errors
     ///
@@ -507,13 +523,17 @@ impl ModelRunner {
             bail!("this deployment serves no request layout, so a denoiser would capture nothing");
         }
 
-        let (ranks, first) = match self.denoiser_block() {
-            Some(block) => {
+        let (ranks, first) = match (self.denoiser_block(), self.worker_group()) {
+            (Some(block), Some(group)) => {
                 let position = self.position()?;
                 let ranks = u32::try_from(block.ranks.len()).context("a block wider than u32")?;
-                (ranks, block.ranks.first() == Some(&position))
+                // The block's first rank on this rank's host, which its main process serves.
+                let host = |at: usize| group.ranks.get(at).map(|rank| rank.host.as_str());
+                let here = host(position);
+                let first = block.ranks.iter().find(|at| host(**at) == here);
+                (ranks, first == Some(&position))
             }
-            None => (1, true),
+            _ => (1, true),
         };
         let pick = |name: &str| -> Result<u8> { Ok(classes[product_kind(name)?]) };
         Ok(DenoiserConfig {
@@ -1305,34 +1325,125 @@ pub(crate) fn backed_kinds(group: &WorkerGroupConfig, position: usize) -> Result
         .collect())
 }
 
-/// The hosts of the ranks of `group` that hold product kind `kind` (an index into
-/// `crate::batch::product::KINDS`) on the side `writes` names: the ranks that back the kind
-/// ([`backed_kinds`]) and those whose phases write it, or those whose phases read it. A block
-/// reaches the ranks of the one process that holds its runs (`BufferMemory::connect`), so a
-/// product passes from a writing group to a reading one when the two sides lie on one host.
+/// A rank of a media deployment: the index of its worker group in the deployment and its
+/// position in that group.
+pub(crate) type MediaRank = (usize, usize);
+
+/// Where one worker group finds the blocks of one product kind: the ranks whose product buffers
+/// its blocks of the kind lie in (`storage::runtime::Group::regions`), then the ranks whose
+/// product buffers receive them in the other memories it reads the kind in
+/// (`storage::runtime::Group::receives`).
+pub(crate) type KindRanks = (Vec<MediaRank>, Vec<MediaRank>);
+
+/// Where the blocks of each product kind lie for each worker group of the media deployment whose
+/// groups are `groups` and whose `data_parallel` schedulers each serve a block of them
+/// (`WorkerGroupConfig::scheduler_blocks`): per group, in `crate::batch::product::KINDS` order,
+/// its [`KindRanks`].
+///
+/// A block's units exist once, in the product buffers of the ranks that back its kind, and each
+/// main process's ranks reach the product buffers of that process alone
+/// (`BufferMemory::connect`): a memory is the process of one host.
+///
+/// - A group whose phases write the kind takes its blocks from the product buffers of its ranks
+///   that back it ([`backed_kinds`]).
+/// - A group that reads the kind and does not write it reads the blocks of the groups of its
+///   scheduler that write it, in the product buffers of their backing ranks on the hosts of its
+///   own ranks that serve the kind's reading phase.
+/// - In each other host where its ranks read the kind, and only when a group of its scheduler
+///   writes it, a group receives the blocks in the product buffer of its first rank on that
+///   host, where a crossing writes them (`storage::runtime::Request::Replicate`).
+///
+/// A rank that receives a kind holds a request's blocks of it in its product buffer as a rank
+/// that backs it does ([`held_kinds`]).
 ///
 /// # Errors
 ///
-/// A session that numbers no conditioning kind.
-pub(crate) fn product_hosts(
-    group: &WorkerGroupConfig,
-    kind: usize,
-    writes: bool,
-) -> Result<BTreeSet<&str>> {
-    let (_, writer, reader) = product::KINDS[kind];
-    let mut hosts = BTreeSet::new();
-    for (position, rank) in group.ranks.iter().enumerate() {
-        let phases = served_phases(group, position);
-        let holds = if writes {
-            phases.contains(&writer) || backed_kinds(group, position)?.contains(&kind)
-        } else {
-            phases.contains(&reader)
-        };
-        if holds {
-            hosts.insert(rank.host.as_str());
+/// Serving groups that do not form `data_parallel` equal blocks, or a session that numbers no
+/// conditioning kind.
+pub(crate) fn product_ranks(
+    groups: &[WorkerGroupConfig],
+    data_parallel: usize,
+) -> Result<Vec<Vec<KindRanks>>> {
+    let kinds = product::KINDS.len();
+    let schedulers = WorkerGroupConfig::scheduler_blocks(groups, data_parallel)?;
+
+    // Per group, the phases its ranks serve and the ranks that back each kind.
+    let phases: Vec<Vec<Phase>> = groups.iter().map(group_phases).collect();
+    let mut backing: Vec<Vec<Vec<MediaRank>>> = Vec::with_capacity(groups.len());
+    for (index, group) in groups.iter().enumerate() {
+        let mut backs = vec![Vec::new(); kinds];
+        for position in 0..group.ranks.len() {
+            for kind in backed_kinds(group, position)? {
+                backs[kind].push((index, position));
+            }
+        }
+        backing.push(backs);
+    }
+    let host = |(index, position): MediaRank| groups[index].ranks[position].host.as_str();
+
+    let mut places: Vec<Vec<KindRanks>> = vec![vec![(Vec::new(), Vec::new()); kinds]; groups.len()];
+    for scheduler in &schedulers {
+        for &index in scheduler {
+            let group = &groups[index];
+            for (kind, (_, writer, reader)) in product::KINDS.iter().enumerate() {
+                // The hosts of the group's ranks that serve the kind's reading phase, in the
+                // order of their first such rank.
+                let mut reading: Vec<&str> = Vec::new();
+                for position in 0..group.ranks.len() {
+                    let on = host((index, position));
+                    if served_phases(group, position).contains(reader) && !reading.contains(&on) {
+                        reading.push(on);
+                    }
+                }
+
+                let writers: Vec<usize> = scheduler
+                    .iter()
+                    .copied()
+                    .filter(|other| phases[*other].contains(writer))
+                    .collect();
+                let regions: Vec<MediaRank> = if phases[index].contains(writer) {
+                    backing[index][kind].clone()
+                } else {
+                    writers
+                        .iter()
+                        .flat_map(|other| backing[*other][kind].iter().copied())
+                        .filter(|rank| reading.contains(&host(*rank)))
+                        .collect()
+                };
+
+                // Each host the group reads the kind on where none of its regions lies receives
+                // it in its first rank's product buffer there.
+                let mut receives = Vec::new();
+                if !writers.is_empty() {
+                    for on in &reading {
+                        if regions.iter().any(|rank| host(*rank) == *on) {
+                            continue;
+                        }
+                        let first = (0..group.ranks.len()).find(|at| host((index, *at)) == *on);
+                        receives.extend(first.map(|position| (index, position)));
+                    }
+                }
+                places[index][kind] = (regions, receives);
+            }
         }
     }
-    Ok(hosts)
+    Ok(places)
+}
+
+/// The product kinds whose blocks rank `rank` holds in its product buffer, as indices into
+/// `crate::batch::product::KINDS`, by the places of every group's kinds `places`
+/// ([`product_ranks`]): those it backs, and those it receives for a group that reads them on its
+/// host.
+pub(crate) fn held_kinds(places: &[Vec<KindRanks>], rank: MediaRank) -> Vec<usize> {
+    (0..product::KINDS.len())
+        .filter(|kind| {
+            places.iter().any(|group| {
+                group.get(*kind).is_some_and(|(regions, receives)| {
+                    regions.contains(&rank) || receives.contains(&rank)
+                })
+            })
+        })
+        .collect()
 }
 
 /// The phases any rank of `group` serves.

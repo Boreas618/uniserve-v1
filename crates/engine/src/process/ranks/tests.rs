@@ -1111,6 +1111,9 @@ fn a_two_host_media_session_states_both_hosts_replicas_when_none_passes_a_produc
     assert_eq!(groups[0].memory, groups[2].memory);
     assert_eq!(groups[1].memory, groups[3].memory);
     assert_ne!(groups[0].memory, groups[1].memory);
+    for group in groups {
+        assert!(group.receives.iter().all(Vec::is_empty), "{}", group.id.0);
+    }
 }
 
 /// The base MiniMax-H3 release, whose dense denoiser any Ulysses degree splits: the sparse
@@ -1118,22 +1121,136 @@ fn a_two_host_media_session_states_both_hosts_replicas_when_none_passes_a_produc
 /// one timeline does not leave whole, and refuses it in the profile run.
 const MINIMAX_H3: &str = "/workspace/models/MiniMax-H3";
 
-/// `configs/minimax_h3/ulysses8-two-host.toml` places one group over both hosts, beside a muxer
-/// and a media reader on `rank-0`: its products would pass between the two processes, and the
-/// session is refused at the scheduler node's rank start, naming them.
+/// The layout the scheduler node states for a Ulysses8 two-host file of `configs/minimax_h3/`,
+/// which places the `model` group's ranks 0-3 on `rank-0` and 4-7 on `rank-1`, beside a muxer
+/// (rank 8) and a media reader (rank 9) on `rank-0`, each its own group of one scheduler. `wide`
+/// states whether the text encoder holds all eight ranks (`ulysses8-two-host.toml`) or the first
+/// four (`ulysses8-reference-two-host.toml`).
+///
+/// Nothing is refused, and every product a group reads in the other host's process is received
+/// there (`p4-design.md` §1.1): the conditioning rank 0 wrote, the condition media the reader
+/// wrote and, where the text encoder spans both hosts, the vision pixels, each in the product
+/// buffer of rank 4, the group's first rank on `rank-1`, which holds a slot's blocks of them too;
+/// the products every rank of the group backs need no crossing, nor does what the muxer reads on
+/// its own host. Each product buffer lies in its host's memory. The conditioning's host copies
+/// lie in part 0 on rank 0's host, and a saved trajectory's in part 0 on each host.
+fn a_ulysses8_two_host_layout_receives_what_crosses(file: &str, wide: bool) {
+    use crate::batch::product::{
+        AUDIO_LATENTS, AUDIO_SAMPLES, CONDITION_PIXELS, CONDITION_SAMPLES, CONDITIONING,
+        ENCODED_UNITS, VIDEO_LATENTS, VIDEO_TAIL, VIDEO_UNITS, VISION_PIXELS, kind,
+    };
+
+    let (launch, ranks) = two_host_ranks(file, MINIMAX_H3);
+    let held: Vec<u32> = ranks.iter().map(|rank| rank.model_runner.rank()).collect();
+    assert_eq!(held, [0, 1, 2, 3, 8, 9]);
+
+    let open = layout(&launch, &ranks).unwrap();
+    assert_eq!(
+        open.schedulers,
+        vec![(0..3).map(GroupId).collect::<Vec<_>>()]
+    );
+    let region = |rank: usize| {
+        let name = format!("products 1 {rank}");
+        let index = open.regions.iter().position(|region| region.name == name);
+        u8::try_from(index.unwrap_or_else(|| panic!("no region {name}"))).unwrap()
+    };
+    let buffers = |ranks: std::ops::Range<usize>| -> Vec<u8> { ranks.map(region).collect() };
+
+    // Each product buffer in the memory of its host's process.
+    let devices = |host: &str| -> String {
+        (0..4)
+            .map(|device| format!("{host}/cuda:{device}"))
+            .collect::<Vec<_>>()
+            .join(",")
+    };
+    let (first, second) = (devices("rank-0"), devices("rank-1"));
+    for rank in 0..10 {
+        let memory = if (4..8).contains(&rank) {
+            &second
+        } else {
+            &first
+        };
+        assert_eq!(
+            &open.regions[usize::from(region(rank))].memory,
+            memory,
+            "rank {rank}"
+        );
+    }
+    let (model, muxer, reader) = (&open.groups[0], &open.groups[1], &open.groups[2]);
+    for group in [model, muxer, reader] {
+        assert_eq!(group.memory, first, "group {}", group.id.0);
+    }
+
+    // Where the model group finds each product, and what rank 4 receives.
+    let at = |name: &str| kind(name).unwrap();
+    let crossing = vec![region(4)];
+    let vision = if wide { crossing.clone() } else { Vec::new() };
+    for (name, lies, received) in [
+        (CONDITION_PIXELS, vec![region(9)], crossing.clone()),
+        (CONDITION_SAMPLES, vec![region(9)], crossing.clone()),
+        (VISION_PIXELS, vec![region(9)], vision),
+        (CONDITIONING, vec![region(0)], crossing.clone()),
+        (VIDEO_LATENTS, buffers(0..8), Vec::new()),
+        (AUDIO_LATENTS, buffers(0..8), Vec::new()),
+        (VIDEO_UNITS, buffers(0..8), Vec::new()),
+        (VIDEO_TAIL, buffers(0..8), Vec::new()),
+        (ENCODED_UNITS, buffers(0..8), Vec::new()),
+        (AUDIO_SAMPLES, buffers(0..8), Vec::new()),
+    ] {
+        assert_eq!(model.regions[at(name)], lies, "{name} on the model group");
+        assert_eq!(
+            model.receives[at(name)],
+            received,
+            "{name} on the model group"
+        );
+    }
+
+    // The muxer reads the encoded units and the track on its own host; the reader writes the
+    // condition media in its rank's buffer.
+    for (index, (name, ..)) in KINDS.iter().enumerate() {
+        let muxed = [ENCODED_UNITS, AUDIO_SAMPLES].contains(name);
+        let read = [CONDITION_PIXELS, CONDITION_SAMPLES, VISION_PIXELS].contains(name);
+        let muxes = if muxed { buffers(0..4) } else { Vec::new() };
+        let reads = if read { vec![region(9)] } else { Vec::new() };
+        assert_eq!(muxer.regions[index], muxes, "{name} on the muxer");
+        assert_eq!(reader.regions[index], reads, "{name} on the reader");
+        assert!(muxer.receives[index].is_empty() && reader.receives[index].is_empty());
+    }
+
+    // Rank 4 holds a slot's blocks of what it receives beside what it backs.
+    let units = |rank: usize| open.regions[usize::from(region(rank))].units;
+    assert!(units(4) > units(5), "{} and {}", units(4), units(5));
+
+    // Host parts: the conditioning's where rank 0 stores it, a trajectory's on both hosts.
+    let trajectory = usize::from(open.trajectory);
+    let part = |host: &str| (host.to_owned(), 0);
+    assert_eq!(model.parts[at(CONDITIONING)], vec![part("rank-0")]);
+    assert_eq!(
+        model.parts[trajectory],
+        vec![part("rank-0"), part("rank-1")]
+    );
+    for group in [muxer, reader] {
+        assert!(
+            group.parts.iter().all(Vec::is_empty),
+            "group {}",
+            group.id.0
+        );
+    }
+}
+
+/// `configs/minimax_h3/ulysses8-two-host.toml`: the text encoder over all eight ranks.
 #[test]
 #[ignore = "reads the headers of the released MiniMax-H3 checkpoint, which the repository does not hold"]
-fn a_two_host_media_session_is_refused_by_the_products_that_would_pass_across() {
-    let (launch, ranks) = two_host_ranks("ulysses8-two-host.toml", MINIMAX_H3);
+fn the_ulysses8_two_host_layout_receives_what_crosses_the_hosts() {
+    a_ulysses8_two_host_layout_receives_what_crosses("ulysses8-two-host.toml", true);
+}
 
-    let refusal = format!("{:#}", layout(&launch, &ranks).unwrap_err());
-    for product in [
-        crate::batch::product::AUDIO_SAMPLES,
-        crate::batch::product::ENCODED_UNITS,
-        crate::batch::product::VIDEO_TAIL,
-    ] {
-        assert!(refusal.contains(product), "{product}: {refusal}");
-    }
+/// `configs/minimax_h3/ulysses8-reference-two-host.toml`: the text encoder over ranks 0-3, on
+/// `rank-0`, whose `rank-1` ranks load no part of it.
+#[test]
+#[ignore = "reads the headers of the released MiniMax-H3 checkpoint, which the repository does not hold"]
+fn the_ulysses8_reference_two_host_layout_receives_what_crosses_the_hosts() {
+    a_ulysses8_two_host_layout_receives_what_crosses("ulysses8-reference-two-host.toml", false);
 }
 
 /// The released checkpoint deliverable E1 serves (`artifacts/buffer-pool/e1/protocol.md`).

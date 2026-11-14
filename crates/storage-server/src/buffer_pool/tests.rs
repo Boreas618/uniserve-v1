@@ -647,6 +647,7 @@ fn a_clone_is_a_new_private_block_filled_by_the_worker() {
         to,
         evicted,
         encodings,
+        ..
     }) = fixture.answer(id)
     else {
         panic!("no copy")
@@ -2158,24 +2159,27 @@ fn a_store_fills_the_host_parts_a_host_copy_lacks() {
         keys: vec![key(7)],
         tier: Tier::Host,
     };
-    let copy = |group| Completion::Copy {
+    // The parts each copy writes, a bit per part of the storing group in the order it states
+    // them.
+    let copy = |group, parts| Completion::Copy {
         group,
         keys: vec![key(7)],
         from: vec![(UNITS, unit, 1)],
         to: vec![(HOST, 0, 1)],
         evicted: Vec::new(),
         encodings: None,
+        parts: vec![parts],
     };
     let stored = fixture.submit(QUEUE, store(PREFILL));
-    assert_eq!(fixture.answer(stored), Some(copy(PREFILL)));
+    assert_eq!(fixture.answer(stored), Some(copy(PREFILL, 0b1)));
     fixture.finish(stored, true);
     // The host copy holds the prefill group's part alone: the decode group cannot load it.
     assert_eq!(fixture.listing(), [(key(7), KV, 64, 0b011, 0b11, 0b01)]);
 
-    // The decode group's store fills the part the copy lacks, in the same host block; one copy
-    // fills a host block at a time.
+    // The decode group's store fills the part the copy lacks, in the same host block, and its
+    // rank whose part holds the copy writes nothing; one copy fills a host block at a time.
     let filled = fixture.submit(QUEUE, store(DECODE));
-    assert_eq!(fixture.answer(filled), Some(copy(DECODE)));
+    assert_eq!(fixture.answer(filled), Some(copy(DECODE, 0b10)));
     assert_eq!(fixture.free(HOST), 1);
     let nothing = Some(Completion::Stored { keys: Vec::new() });
     assert_eq!(fixture.ask(store(DECODE)), nothing);

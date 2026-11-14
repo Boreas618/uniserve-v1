@@ -1250,6 +1250,7 @@ mod tests {
             to: vec![(0, 8, 1), (0, 9, 1)],
             evicted: Vec::new(),
             encodings: None,
+            parts: Vec::new(),
         };
         mapped(&fake, 10, load, copy);
         assert!(
@@ -1291,6 +1292,7 @@ mod tests {
             to: vec![(0, 8, 1)],
             evicted: Vec::new(),
             encodings: None,
+            parts: Vec::new(),
         };
         mapped(&fake, 10, clone, copy);
 
@@ -1443,6 +1445,7 @@ mod tests {
                 to: vec![(0, 8, 1)],
                 evicted: Vec::new(),
                 encodings: None,
+                parts: Vec::new(),
             };
             mapped(&fake, id, request, copy);
         };

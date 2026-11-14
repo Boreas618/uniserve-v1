@@ -2025,6 +2025,7 @@ mod tests {
             to: vec![(ENCODERS, 1, 1)],
             evicted: Vec::new(),
             encodings: None,
+            parts: Vec::new(),
         };
         returned(
             route

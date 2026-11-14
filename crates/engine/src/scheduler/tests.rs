@@ -639,6 +639,7 @@ fn a_completion_for_a_forgotten_owner_is_dropped_and_its_copy_given_up() {
         to: vec![(4, 2, 1)],
         evicted: Vec::new(),
         encodings: None,
+        parts: Vec::new(),
     };
     bench.complete(taken[1].0, &copy);
 
@@ -683,6 +684,7 @@ fn the_answer_to_a_copys_finish_is_mapped_and_applied_as_the_copys_result() {
         to: vec![(4, 2, 1)],
         evicted: Vec::new(),
         encodings: None,
+        parts: Vec::new(),
     };
     bench.complete(id, &copy);
     assert_eq!(
@@ -743,6 +745,7 @@ fn a_finish_is_written_past_requests_that_wait_for_room() {
         to: vec![(4, 2, 1)],
         evicted: Vec::new(),
         encodings: None,
+        parts: Vec::new(),
     };
     bench.complete(id, &copy);
     assert_eq!(bench.answers().len(), 1);

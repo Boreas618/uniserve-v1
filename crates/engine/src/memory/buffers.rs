@@ -16,8 +16,12 @@
 //!
 //! What a rank's memory holds:
 //!
-//! - **The product buffer.** One region of [`UNIT_BYTES`]-byte units, taken from the device's
-//!   resident pool (`GraphPool::allocator`) for as long as the rank serves. A media product has
+//! - **The product buffer.** One region of [`UNIT_BYTES`]-byte units, held for as long as the
+//!   rank serves. A media rank's is storage the Storage Server retains, its parts segments back
+//!   to back (`StorageClient::region_storage`), which the rank places, so the Transfer Server
+//!   copies a block into another process's product buffer for a crossing; a text rank's encoder
+//!   outputs, which no other process reads, are taken from the device's resident pool
+//!   (`GraphPool::allocator`). A media product has
 //!   one contiguous run in the product buffer of every rank that backs it, and an encoder output
 //!   one run; [`BufferMemory::lend`] lends the bytes of the block an entry of the tables names as
 //!   a tensor, and [`BufferMemory::address`] states where a run's bytes lie for a copy. A media
@@ -40,8 +44,8 @@
 //!   block's run is the same units in every part, so its bytes in one part are one contiguous
 //!   range of it.
 //! - **The process's other ranks.** The ranks of one process reach each other's product buffers
-//!   by peer access (the resident pool grants it to every device that can take it; two ranks of
-//!   one device address each other's memory directly) and each other's parts through their host
+//!   by peer access (the storage grants it to every device of the process that can take it; two
+//!   ranks of one device address each other's memory directly) and each other's parts through their host
 //!   mappings, which every device of the process may address ([`BufferMemory::connect`]). A rank
 //!   lends a block from its own run, and from another rank's when it backs none of the block.
 //!
@@ -52,15 +56,19 @@
 //! - A block whose units exist on every rank of its region, a KV block, moves each rank's share
 //!   of every unit to that rank's own part: the KV cache's host tier, one page per unit
 //!   (`crate::memory::cache`).
-//! - A block that one rank holds whole has one host copy, in one part. An encoder output in the
-//!   rank's product buffer is one: the buffer pool sizes its host copy by the bytes one part holds
-//!   of a unit (`storage::runtime::Region::part_bytes`). A trajectory is one too: every rank of a
-//!   denoising group holds the whole samples in its own row, so one of them writes the host copy
-//!   and every one of them reads it back. The part is the one the rank copies with
-//!   ([`BufferMemory::part_holder`]): its own when it maps one, otherwise the one part of the
-//!   region another rank of its process maps. A media deployment maps one part of each of its
-//!   host regions, on the first rank of its process, so a host copy one group wrote is where every
-//!   group of every epoch that names the region reads it.
+//! - A block that one rank holds whole has one host copy on each host that wrote it, in part 0
+//!   there. An encoder output in the rank's product buffer is one: the buffer pool sizes its host
+//!   copy by the bytes one part holds of a unit (`storage::runtime::Region::part_bytes`), and
+//!   the rank that holds it writes it. A trajectory is one too: every rank of a denoising group
+//!   holds the whole samples in its own row, so the group's first rank in each process writes the
+//!   host copy into its process's part and every rank of the process reads it back from there.
+//!   The part is the one the rank copies with ([`BufferMemory::part_holder`]): its own when it
+//!   maps one, otherwise the one part of the region another rank of its process maps. A media
+//!   deployment maps part 0 of each of its host regions on the first rank of each process, so a
+//!   host copy one group wrote on a host is where every group of every epoch that names the region
+//!   reads it on that host; the buffer pool offers a group a host copy only when it lies on every
+//!   host part the group copies with (`storage::runtime::Group::parts`), so a copy written on
+//!   another host is a miss, never other bytes.
 //!
 //! ## Copies
 //!
@@ -69,9 +77,10 @@
 //! ([`Runner::maps`](crate::runner::Runner::maps)). Every media runner of a rank shares one
 //! [`BufferMemory`] and maps its product buffer and the parts of host regions it copies with
 //! ([`BufferMemory::holds`]); the trajectory rows are the denoiser's alone
-//! ([`BufferMemory::rows`]), so it issues every `Save` and `Restore`, a `Save` on the first rank of
-//! its group alone. A runner issues its copies through [`BufferMemory::copy`], and the denoiser a
-//! restore of a trajectory written in another encoding through [`BufferMemory::restore`]:
+//! ([`BufferMemory::rows`]), so it issues every `Save` and `Restore`, a `Save` on its group's
+//! first rank in each process alone. A runner issues its copies through [`BufferMemory::copy`],
+//! and the denoiser a restore of a trajectory written in another encoding through
+//! [`BufferMemory::restore`]:
 //!
 //! | From | To | Request | Bytes copied |
 //! | --- | --- | --- | --- |
@@ -117,6 +126,7 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 use platform::{Allocator, Buffer, DeviceId, Event, EventFlags, PoolKind, Stream};
+use storage::protocol::UnitRun;
 use storage::runtime::{RequestId, Run};
 use tensor::{DType, Tensor};
 
@@ -142,6 +152,10 @@ pub(crate) type Place = (u8, u32, u64);
 /// One copy of bytes: where it reads, where it writes, and how many bytes.
 pub(crate) type ByteCopy = (Place, Place, u64);
 
+/// A product buffer the Storage Server retains (`StorageClient::region_storage`): its storage,
+/// its parts segments back to back, and where the units of each part lie, a run per part.
+pub(crate) type Retained = (Arc<Storage>, Vec<UnitRun>);
+
 /// The hand-offs between the ranks of one process: by the run a tail is copied into, its region
 /// and first unit, the event recorded behind the copy (`None` for memory that holds no device),
 /// until the rank that reads the run takes it; and the condition its reader waits on.
@@ -162,8 +176,15 @@ pub(crate) struct BufferMemory {
     device: Option<(DeviceId, Option<u64>, Option<u64>)>,
     /// The parts the product buffer and the trajectory rows are mapped in, back to back from
     /// their first bytes: the storage a device memory holds, which [`BufferMemory::give_back`]
-    /// releases the tail of. Empty for memory that holds no device.
+    /// releases the tail of. Empty for memory that holds no device; no part of a product buffer
+    /// the Storage Server retains.
     held: Mutex<(Vec<Buffer>, Vec<Buffer>)>,
+    /// The product buffer's storage when the Storage Server retains it, a media rank's, whose
+    /// units a crossing between processes reads and writes: its parts as segments back to back,
+    /// with where the units of each part it holds lie, which the rank places, a run per part in
+    /// order. `None` for a product buffer the resident pool holds, a text rank's encoder outputs,
+    /// which no other process reads.
+    retained: Option<(Arc<Storage>, Mutex<Vec<UnitRun>>)>,
     /// The product buffer's region and its units.
     products: (u8, u32),
     /// The parts the product buffer is made of: one, or one per slot, whose units are the
@@ -234,10 +255,12 @@ fn stored(request: RequestId, (block, host): (u64, u64), load: bool) -> Result<u
 }
 
 impl BufferMemory {
-    /// The device bytes the media memory of a rank takes from the device's resident pool, whose
-    /// allocations are whole granules of `granule` bytes: a product buffer of `units` units and
-    /// the rows of `slots` slots for trajectories of `trajectory` bytes, each row a part of its
-    /// own. The pool is reserved with them when the device's `GraphPool` opens.
+    /// The device bytes the media memory of a rank takes, in allocations of whole granules of
+    /// `granule` bytes: a product buffer of `units` units and the rows of `slots` slots for
+    /// trajectories of `trajectory` bytes, each row a part of its own. The rows, and a text rank's
+    /// encoder outputs, are the device's resident pool's, which is reserved with them when the
+    /// device's `GraphPool` opens; a media rank's product buffer is storage the Storage Server
+    /// retains.
     pub(crate) fn device_bytes(units: u32, slots: u32, trajectory: u64, granule: u64) -> u64 {
         let rows = row_bytes(trajectory)
             .map(|row| match row {
@@ -296,6 +319,7 @@ impl BufferMemory {
             rank,
             device: None,
             held: Mutex::new((Vec::new(), Vec::new())),
+            retained: None,
             products,
             product_parts: 1,
             slots,
@@ -314,9 +338,11 @@ impl BufferMemory {
     }
 
     /// The media memory of rank index `rank` on the device of `allocator`, as
-    /// [`BufferMemory::meta`] states it with no host part: the product buffer and the trajectory
-    /// rows are taken from the resident pool, at addresses that stay fixed for as long as the
-    /// memory lives, and the host parts are mapped afterwards ([`BufferMemory::map_part`]).
+    /// [`BufferMemory::meta`] states it with no host part: the trajectory rows are taken from the
+    /// resident pool, and the product buffer is `retained`, the storage the Storage Server
+    /// retains with where the units of its parts lie (`StorageClient::region_storage`), or taken
+    /// from the resident pool when it is `None`; both at addresses that stay fixed for as long as
+    /// the memory lives. The host parts are mapped afterwards ([`BufferMemory::map_part`]).
     /// Their contents are unspecified: a block is written before a batch reads it, and a
     /// trajectory row by its request's latent preparation or by a `Restore`.
     ///
@@ -329,11 +355,12 @@ impl BufferMemory {
     /// # Errors
     ///
     /// As [`BufferMemory::meta`]; a product buffer that does not split into `parts` parts of
-    /// whole granules; and when the resident pool cannot hold the memory.
+    /// whole granules, or a retained one of another number of parts or too short; and when the
+    /// resident pool cannot hold the memory.
     pub(crate) fn open(
         allocator: &mut Allocator,
         rank: u32,
-        products: (u8, u32),
+        (products, retained): ((u8, u32), Option<Retained>),
         slots: (u8, u32),
         trajectory: u64,
         parts: u32,
@@ -357,7 +384,25 @@ impl BufferMemory {
             Ok(allocator.allocate_parts(PoolKind::Resident, bytes, count as usize)?)
         };
         let part = u64::from(products.1 / parts) * UNIT_BYTES;
-        let buffer = take(part, parts)?;
+        let buffer = match &retained {
+            Some((storage, runs)) => {
+                // Parts rounded past their units would leave a gap between the units of two
+                // slots, and each part's run states its units.
+                let whole = storage.bytes() as u64 == part * u64::from(parts)
+                    || parts == 1 && storage.bytes() as u64 >= part;
+                if runs.len() != parts as usize || !whole {
+                    return Err(Error::Invalid(format!(
+                        "a retained product buffer of {} bytes in {} parts does not lie as {} \
+                         units in {parts} parts of {part} bytes",
+                        storage.bytes(),
+                        runs.len(),
+                        products.1
+                    )));
+                }
+                Vec::new()
+            }
+            None => take(part, parts)?,
+        };
         // Parts rounded past their units would leave a gap between the units of two slots.
         if parts > 1 && buffer.iter().any(|held| held.len() as u64 != part) {
             return Err(Error::Invalid(format!(
@@ -371,14 +416,26 @@ impl BufferMemory {
             memory.row = first.len() as u64;
         }
 
-        memory.device = Some((
-            allocator.device(),
-            buffer.first().map(Buffer::address),
-            rows.first().map(Buffer::address),
-        ));
+        let first = match &retained {
+            Some((storage, _)) => Some(storage.address()),
+            None => buffer.first().map(Buffer::address),
+        };
+        memory.device = Some((allocator.device(), first, rows.first().map(Buffer::address)));
         memory.held = Mutex::new((buffer, rows));
+        memory.retained = retained.map(|(storage, runs)| (storage, Mutex::new(runs)));
         memory.product_parts = parts;
         Ok(memory)
+    }
+
+    /// Where the units of the parts of a product buffer the Storage Server retains lie, a run per
+    /// part the memory holds: what the rank places for the buffer's region in its process's
+    /// memory (`Place`), which a crossing reads and writes. Empty for a product buffer the
+    /// resident pool holds.
+    pub(crate) fn placed(&self) -> Vec<UnitRun> {
+        self.retained
+            .as_ref()
+            .map(|(_, runs)| lock(runs).clone())
+            .unwrap_or_default()
     }
 
     /// The device bytes one slot's storages take in this memory: its part of a product buffer
@@ -399,18 +456,24 @@ impl BufferMemory {
         self.kept.load(Ordering::Acquire)
     }
 
-    /// Gives the storages of the slots past the first `kept` back to `allocator`, the device's
-    /// allocator they were taken from: their trajectory rows and, of a product buffer split per
-    /// slot, their parts of it, the last first. The pool's reservation in the GPU's quota drops by
-    /// them, and a run of those slots or of their product units is refused from here on. The
-    /// rank's tables name none of them: the scheduler's regions are resized to the slots kept
-    /// before they serve. Returns the bytes given back.
+    /// Gives the storages of the slots past the first `kept` back: their trajectory rows to
+    /// `allocator`, the device's allocator they were taken from, and of a product buffer split
+    /// per slot their parts of it, to the resident pool or, for a buffer the Storage Server
+    /// retains, to the server through `client`; the last first. The GPU's quota drops by them,
+    /// and a run of those slots or of their product units is refused from here on. The rank's
+    /// tables name none of them: the scheduler's regions are resized to the slots kept before
+    /// they serve. Returns the bytes given back.
     ///
     /// # Errors
     ///
-    /// Keeping no slot, or the driver's refusal of a release, after which the memory holds what
-    /// it did not release yet.
-    pub(crate) fn give_back(&self, allocator: &mut Allocator, kept: u32) -> Result<u64> {
+    /// Keeping no slot, a retained product buffer and no client, or the driver's or the server's
+    /// refusal of a release, after which the memory holds what it did not release yet.
+    pub(crate) fn give_back(
+        &self,
+        allocator: &mut Allocator,
+        client: Option<&StorageClient>,
+        kept: u32,
+    ) -> Result<u64> {
         if kept >= self.held_slots() {
             return Ok(0);
         }
@@ -437,6 +500,25 @@ impl BufferMemory {
                 released += part.len() as u64;
                 allocator.release(part)?;
             }
+        }
+
+        // A retained buffer's parts past the slots kept, by their index in its storage.
+        if let Some((storage, runs)) = self.retained.as_ref().filter(|_| self.product_parts > 1) {
+            let client = client.ok_or(Error::Invalid(
+                "a product buffer the Storage Server retains is given back through its client"
+                    .into(),
+            ))?;
+            let mut runs = lock(runs);
+            let held = runs.len();
+            let past = runs.split_off((kept as usize).min(held));
+            let indexed: Vec<(usize, &UnitRun)> = past
+                .iter()
+                .enumerate()
+                .map(|(index, run)| (kept as usize + index, run))
+                .rev()
+                .collect();
+            client.release_region_storage(storage, &indexed)?;
+            released += storage.bytes() as u64 / u64::from(self.product_parts) * past.len() as u64;
         }
         Ok(released)
     }
@@ -1377,6 +1459,7 @@ mod tests {
             to: vec![to],
             evicted: vec![],
             encodings,
+            parts: Vec::new(),
         };
         tables.map(0, RequestId(id), request, &copy).unwrap();
 

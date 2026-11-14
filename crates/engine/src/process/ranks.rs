@@ -43,10 +43,11 @@
 //! each group's request slots are decided ([`fit_media_slots`]); the layout states every rank's
 //! product buffer, the slot rows of each group with a trajectory's row, the host regions of encoder
 //! outputs and stored trajectories, and the product classes with the regions each group's blocks
-//! write and read; its opening takes its media memory from its graph pool's resident pool, the
-//! process's first rank maps the one part of each host region, the process's memories are
-//! connected, and the serving runners are built over them. It creates no segment. A device that
-//! holds ranks of several groups opens one graph pool and one media memory per rank.
+//! write and read; its opening takes its trajectory rows from its graph pool's resident pool and
+//! its product buffer as storage the Storage Server retains, which it places so that a crossing
+//! reaches it, the process's first rank maps the one part of each host region, the process's
+//! memories are connected, and the serving runners are built over them. It creates no segment. A
+//! device that holds ranks of several groups opens one graph pool and one media memory per rank.
 //!
 //! A start that is backed by nothing outside the process ([`Backing::Meta`]) takes the same
 //! steps over owners that hold no device: its loads stop after the profile run, its "segments"
@@ -56,7 +57,6 @@
 
 pub(crate) mod rank;
 
-use std::collections::BTreeSet;
 use std::net::TcpListener;
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 
@@ -65,6 +65,7 @@ use crate::batch::product;
 use crate::batch::{Batch, Phase};
 use crate::executor::Route;
 use crate::executor::peers::Remote;
+use crate::memory::allocation::Storage;
 use crate::memory::buffers::{BufferMemory, UNIT_BYTES};
 use crate::memory::cache::{CacheLayout, CacheRegions, KvCacheMemory, host};
 use crate::memory::client::{StorageClient, unit_runs};
@@ -102,8 +103,8 @@ use crate::process::ranks::rank::text::{
     Keys, encoder_class, encodes, feature_tensors, keys, profile, vision_runner,
 };
 use crate::process::ranks::rank::video::{
-    VideoRank, backed_kinds, boxed, group_phases, latent_pages, product_classes, product_hosts,
-    product_kind, served_phases, slot_pages,
+    MediaRank, VideoRank, boxed, group_phases, held_kinds, latent_pages, product_classes,
+    product_kind, product_ranks, served_phases, slot_pages,
 };
 
 /// The number of the generation a start serves: its kernels on a device, none on the meta device.
@@ -1092,20 +1093,20 @@ fn memory(group: &WorkerGroupConfig) -> String {
         .join(",")
 }
 
-/// The device memory the ranks of `group`, a group of the media deployment's `groups`, address:
-/// every product buffer and the host parts of the process of each host its ranks lie on, which
-/// each rank of that process reaches (`BufferMemory::connect`), named by the devices of the
-/// deployment's serving ranks on those hosts. Every group of every layout over one host's devices
-/// states this one memory, however many groups a layout places on them, and the groups of
-/// another host another: the buffer pool numbers a deployment's memories with a bit each, so a
-/// block valid in one process's memory is not taken as valid in another's.
-fn media_memory(groups: &[WorkerGroupConfig], group: &WorkerGroupConfig) -> String {
-    let hosts: BTreeSet<&str> = group.ranks.iter().map(|rank| rank.host.as_str()).collect();
+/// The memory of the main process of host `host` of the media deployment whose groups are
+/// `groups`: every product buffer of that process, which each of its ranks reaches
+/// (`BufferMemory::connect`), named by the devices of the deployment's serving ranks on the host.
+/// Every layout over one host's devices states this one memory, however many groups it places on
+/// them, and another host's process another: the buffer pool numbers a deployment's memories
+/// with a bit each, so a block valid in one process's memory is not taken as valid in another's,
+/// and a product a group reads in another process reaches it by a crossing
+/// (`storage::runtime::Request::Replicate`).
+fn media_memory(groups: &[WorkerGroupConfig], host: &str) -> String {
     let mut devices: Vec<String> = groups
         .iter()
         .filter(|group| group.role.serves_requests())
         .flat_map(|group| group.ranks.iter())
-        .filter(|rank| hosts.contains(rank.host.as_str()))
+        .filter(|rank| rank.host == host)
         .map(|rank| format!("{}/{}", rank.host, rank.device))
         .collect();
     devices.sort_unstable();
@@ -1221,8 +1222,10 @@ pub(crate) fn layout(launch: &EngineArgs, ranks: &[LoadedRank]) -> Result<Open> 
 ///   product classes (`crate::batch::product::KINDS`), then the class of stored trajectories. A
 ///   text deployment holds no product and no trajectory: those classes name no region.
 /// - **Groups**, numbered for the session ([`group_numbers`]), each with its memory, its slot
-///   region and per class its device regions; **per scheduler** its groups; and the
-///   deployment's peers.
+///   region, per class its device regions, and per class with a host region the host parts its
+///   ranks copy with: part `i` on the host of its rank `i` for a cache group's pages, of which
+///   each rank holds its share, and part 0 on each host of its ranks for encoder outputs, which
+///   each rank holds whole; **per scheduler** its groups; and the deployment's peers.
 ///
 /// The epoch states no trial: the launch states none.
 ///
@@ -1366,6 +1369,33 @@ pub fn text_layout(
                 segments: Vec::new(),
                 memory: String::new(),
             });
+            // The host parts the group's ranks copy each class's host copies with: a KV page's
+            // share of rank `i` lies in part `i` on that rank's host; an encoder output, which
+            // every rank holds whole, in part 0 on each host of the group's ranks.
+            let ranks: Vec<(String, u32)> = (0..)
+                .zip(&group.ranks)
+                .map(|(part, rank)| (rank.host.clone(), part))
+                .collect();
+            let mut parts: Vec<Vec<(String, u32)>> = host_regions
+                .iter()
+                .map(|region| match region {
+                    Some(_) => ranks.clone(),
+                    None => Vec::new(),
+                })
+                .collect();
+            if images.is_some() {
+                let mut hosts: Vec<(String, u32)> = Vec::new();
+                if encoding.contains(&index) {
+                    for (host, _) in &ranks {
+                        if !hosts.iter().any(|(held, _)| held == host) {
+                            hosts.push((host.clone(), 0));
+                        }
+                    }
+                }
+                parts.push(hosts);
+            }
+            parts.extend((0..=product::KINDS.len()).map(|_| Vec::new()));
+
             let mut per_class: Vec<Vec<u8>> = vec![vec![kv_region]; cache.groups.len()];
             if let Some((_, units, _)) = images {
                 let outputs = if encoding.contains(&index) {
@@ -1396,7 +1426,7 @@ pub fn text_layout(
                 slots: slot_region,
                 regions: per_class,
                 receives: Vec::new(),
-                parts: Vec::new(),
+                parts,
             });
         }
     }
@@ -1468,38 +1498,39 @@ pub fn text_layout(
 ///   and its numbering, not by the ranks of a layout, so another epoch of any parallel
 ///   configuration that numbers it alike finds what this one stored; the buffer pool keeps a
 ///   region's numbering under its name. Per group, the product buffer of each of its ranks, the
-///   engine's own, of [`UNIT_BYTES`] units, holding the blocks of every request slot of each
-///   product kind the rank backs at the largest size the denoising group states, a slot's units
-///   whole granules of the devices ([`slot_units`]); then the region of its slot rows, a unit the
-///   trajectory row of each of its denoising ranks.
+///   engine's own, of [`UNIT_BYTES`] units, lying in the memory of its host's process
+///   ([`media_memory`]), holding the blocks of every request slot of each product kind the rank
+///   backs or receives ([`held_kinds`]) at the largest size the denoising group states, a slot's
+///   units whole granules of the devices ([`slot_units`]); then the region of its slot rows, a
+///   unit the trajectory row of each of its denoising ranks.
 /// - **Classes.** One per product kind in `crate::batch::product::KINDS` order, sized per request:
 ///   the conditioning with its host copies in the host encoder region and the digests its encoding
 ///   states, the others with none; then the class of stored trajectories, with its host copies in
 ///   the host latent region and the digests the denoiser states (`trajectory_digests`).
-/// - **Groups.** Each with the media memory of its host's process ([`media_memory`]) and its slot
-///   rows, and per product class the regions its blocks lie in: for a group whose phase writes
-///   the product, the product buffers of its ranks, or for the conditioning its first text
-///   encoder rank's alone, an encoder output being one rank's; for a group whose phase reads it,
-///   the regions of the groups of its scheduler that write it on the reader's host, so the
-///   scheduler maps the writer's completions into the reader's tables and places a request's
-///   phases on groups that pass its products within one process. **Per scheduler** its groups,
-///   and the deployment's peers.
+/// - **Groups.** Each with the memory its cached blocks lie in, which its loads and clones fill
+///   (the process of its first text encoder rank's host, or of its first rank's for a group that
+///   encodes no prompt), and its slot rows; per product class the regions its blocks lie in and
+///   the regions it receives them in
+///   ([`product_ranks`]): for a group whose phase writes the product, the product buffers of its
+///   ranks, or for the conditioning its first text encoder rank's alone, an encoder output being
+///   one rank's; for a group whose phase reads it, the regions of the groups of its scheduler
+///   that write it on the hosts where its reading ranks lie, so the scheduler maps the writer's
+///   completions into the reader's tables; and on each other host where its ranks read the
+///   product, the product buffer of its first rank there, into which a crossing copies the block
+///   (`storage::runtime::Request::Replicate`). Per class with a host region, the host parts its
+///   ranks copy the class's host copies with: for the conditioning of a group that encodes
+///   prompts, part 0 on the host of its first text encoder rank, which alone stores and loads
+///   it; for the stored trajectories of a group that denoises, part 0 on each host of its
+///   denoising ranks, whose first rank in each process saves there. **Per scheduler** its
+///   groups, and the deployment's peers.
 ///
 /// A rank backs the products its group writes. The sizes come from a rank of the group that
 /// denoises, which states them for every product kind (`Capacity::media_bytes`).
 ///
-/// A product block reaches the ranks of the process that holds its runs and no other
-/// (`BufferMemory::connect`), so a product passes from a writing group to a reading one only
-/// where both sides of it lie on one host ([`product_hosts`]): `specs/engine-worker-port.md` §5
-/// D2's rule of fact. A product kind a group reads that no group of its scheduler can pass it
-/// that way, or that one group both writes and reads across hosts, is refused, naming the
-/// product, its writer and its reader.
-///
 /// # Errors
 ///
 /// No denoising rank in the process, worker groups no scheduler block holds, a group's agreed
-/// slots that are not stated, a product that would pass between the processes of two hosts, or
-/// a layout the regions' numbering cannot state.
+/// slots that are not stated, or a layout the regions' numbering cannot state.
 fn media_layout(launch: &EngineArgs, ranks: &[LoadedRank]) -> Result<Open> {
     let config = &launch.engine_config;
     let groups = &config.parallel.worker_groups;
@@ -1515,15 +1546,13 @@ fn media_layout(launch: &EngineArgs, ranks: &[LoadedRank]) -> Result<Open> {
     let request_units = request_units(sizing)?;
 
     // The serving groups by their index in the deployment, each with the phases its ranks serve.
-    let mut listed: Vec<(usize, GroupId, usize)> = Vec::new();
-    for (scheduler, ids) in schedulers.iter().enumerate() {
-        for id in ids {
-            let index = numbers
-                .iter()
-                .position(|number| number == id)
-                .context("a listed group is numbered")?;
-            listed.push((scheduler, *id, index));
-        }
+    let mut listed: Vec<(GroupId, usize)> = Vec::new();
+    for id in schedulers.iter().flatten() {
+        let index = numbers
+            .iter()
+            .position(|number| number == id)
+            .context("a listed group is numbered")?;
+        listed.push((*id, index));
     }
     let phases: Vec<Vec<Phase>> = groups.iter().map(group_phases).collect();
     let serves = |index: usize, phase: Phase| phases[index].contains(&phase);
@@ -1541,8 +1570,8 @@ fn media_layout(launch: &EngineArgs, ranks: &[LoadedRank]) -> Result<Open> {
     let serving = |phase: Phase| -> Result<Vec<u32>> {
         listed
             .iter()
-            .filter(|(_, _, index)| serves(*index, phase))
-            .map(|(_, _, index)| slots_of(*index))
+            .filter(|(_, index)| serves(*index, phase))
+            .map(|(_, index)| slots_of(*index))
             .collect()
     };
 
@@ -1551,7 +1580,7 @@ fn media_layout(launch: &EngineArgs, ranks: &[LoadedRank]) -> Result<Open> {
         u8::try_from(regions.len()).context("more regions than a session numbers")
     };
     // A host region's one part per unit: a block of it lies whole in one rank's memory, and its
-    // one host copy in the part the process's first rank maps.
+    // host copy on each host in the part 0 the first rank of that host's process maps.
     let host_region = |name: String, part_bytes: u64, units: u64| -> Result<Region> {
         let units = u32::try_from(units.max(1)).context("a host region of more units than u32")?;
         Ok(Region {
@@ -1605,20 +1634,23 @@ fn media_layout(launch: &EngineArgs, ranks: &[LoadedRank]) -> Result<Open> {
         Some(index)
     };
 
-    // Per group, the product buffer of each rank and the kinds each backs, then its slot rows.
-    let mut backing: Vec<(usize, [Vec<u8>; 10], u8)> = Vec::with_capacity(listed.len());
-    for &(_, id, index) in &listed {
+    // Where each group's blocks of each product kind lie and where it receives them, by rank.
+    let places = product_ranks(groups, config.parallel.data_parallel_size.get())?;
+
+    // Per group, the product buffer of each rank, each in its host's memory, then its slot rows.
+    let mut buffers: Vec<Vec<u8>> = vec![Vec::new(); groups.len()];
+    let mut slot_regions: Vec<u8> = Vec::with_capacity(listed.len());
+    for &(id, index) in &listed {
         let group = &groups[index];
         let slots = slots_of(index)?;
-        let mut kinds: [Vec<u8>; 10] = Default::default();
-        for position in 0..group.ranks.len() {
-            let backs = backed_kinds(group, position)?;
+        for (position, rank) in group.ranks.iter().enumerate() {
             // The deployment's devices take allocations of the denoising rank's granules.
-            let per_slot = slot_units(&request_units, group, position, sizing.granule)?;
+            let held = held_kinds(&places, (index, position));
+            let per_slot = slot_units(&request_units, &held, sizing.granule);
             let units = buffer_units(per_slot, slots)?;
 
             let name = products_region(session_engine(launch), firsts[index] + position);
-            let region = region_index(&regions)?;
+            buffers[index].push(region_index(&regions)?);
             regions.push(Region {
                 space: name.clone(),
                 name,
@@ -1629,11 +1661,8 @@ fn media_layout(launch: &EngineArgs, ranks: &[LoadedRank]) -> Result<Open> {
                 units,
                 limit: units,
                 segments: Vec::new(),
-                memory: String::new(),
+                memory: media_memory(groups, &rank.host),
             });
-            for kind in backs {
-                kinds[kind].push(region);
-            }
         }
 
         // A slot's row on each denoising rank holds a trajectory; an accounting figure, since the
@@ -1646,7 +1675,7 @@ fn media_layout(launch: &EngineArgs, ranks: &[LoadedRank]) -> Result<Open> {
         let row = if holders > 0 { sizing.row } else { 0 };
         let row = row.next_multiple_of(UNIT_BYTES).max(1);
         let name = format!("slots {} {}", session_engine(launch), id.0);
-        let slot_region = region_index(&regions)?;
+        slot_regions.push(region_index(&regions)?);
         regions.push(Region {
             space: name.clone(),
             name,
@@ -1659,7 +1688,6 @@ fn media_layout(launch: &EngineArgs, ranks: &[LoadedRank]) -> Result<Open> {
             segments: Vec::new(),
             memory: String::new(),
         });
-        backing.push((index, kinds, slot_region));
     }
 
     // The product classes and the class of stored trajectories.
@@ -1686,86 +1714,57 @@ fn media_layout(launch: &EngineArgs, ranks: &[LoadedRank]) -> Result<Open> {
     let trajectory =
         u8::try_from(classes.len() - 1).context("more classes than a session numbers")?;
 
-    // Whether product kind `kind` passes from the group at `writer` to the group at `reader`
-    // within one process: both sides of it lie on one host.
-    let passes = |kind: usize, writer: usize, reader: usize| -> Result<bool> {
-        let mut hosts = product_hosts(&groups[writer], kind, true)?;
-        hosts.extend(product_hosts(&groups[reader], kind, false)?);
-        Ok(hosts.len() <= 1)
-    };
-
-    // Each group's regions per class: those it writes, or those the groups of its scheduler that
-    // write what it reads write on its host; the memory of its host's process; and each product
-    // that would pass between two processes, with its writer and its reader.
-    let mut crossings: Vec<(&str, &WorkerGroupConfig, &WorkerGroupConfig)> = Vec::new();
+    // Each group with its memory, its slot rows, and per class the regions its blocks lie in,
+    // those it receives them in and the host parts it copies with.
+    let region_of = |(index, position): MediaRank| buffers[index][position];
     let mut stated: Vec<Group> = Vec::with_capacity(listed.len());
-    for (&(scheduler, id, index), (_, kinds, slot_region)) in listed.iter().zip(&backing) {
+    for (&(id, index), slot_region) in listed.iter().zip(&slot_regions) {
+        let group = &groups[index];
+        let host = |position: usize| group.ranks[position].host.clone();
+        let encoder = (0..group.ranks.len())
+            .find(|at| served_phases(group, *at).contains(&Phase::TextEncode));
+
+        // A group's memory is where its cached blocks lie, which its loads and clones fill: the
+        // process of its first text encoder rank, which holds its conditioning, or of its first
+        // rank for a group that encodes none.
+        let first = encoder.unwrap_or(0);
+        if first >= group.ranks.len() {
+            bail!("worker group {} holds no rank", group.id);
+        }
+
         let mut per_class: Vec<Vec<u8>> = Vec::with_capacity(classes.len());
-        for (kind, (name, writer, reader)) in product::KINDS.iter().enumerate() {
-            let regions = if serves(index, *writer) {
-                if serves(index, *reader) && !passes(kind, index, index)? {
-                    crossings.push((name, &groups[index], &groups[index]));
-                }
-                kinds[kind].clone()
-            } else if serves(index, *reader) {
-                let writers: Vec<&(usize, [Vec<u8>; 10], u8)> = listed
-                    .iter()
-                    .zip(&backing)
-                    .filter(|((held, _, other), _)| *held == scheduler && serves(*other, *writer))
-                    .map(|(_, written)| written)
-                    .collect();
-                let mut regions = Vec::new();
-                for (other, written, _) in &writers {
-                    if passes(kind, *other, index)? {
-                        regions.extend_from_slice(&written[kind]);
-                    }
-                }
-                if let Some((other, ..)) = writers.first()
-                    && regions.is_empty()
-                {
-                    crossings.push((name, &groups[*other], &groups[index]));
-                }
-                regions
-            } else {
-                Vec::new()
-            };
-            per_class.push(regions);
+        let mut receives: Vec<Vec<u8>> = Vec::with_capacity(classes.len());
+        for (lies, received) in &places[index] {
+            per_class.push(lies.iter().copied().map(region_of).collect());
+            receives.push(received.iter().copied().map(region_of).collect());
         }
         per_class.push(Vec::new());
+        receives.push(Vec::new());
+
+        // The conditioning's host copies are its first text encoder rank's, which holds it
+        // whole; a saved trajectory's are written on every host of the group's denoising ranks.
+        let mut parts: Vec<Vec<(String, u32)>> = vec![Vec::new(); classes.len()];
+        if encoders_region.is_some() {
+            parts[conditioning].extend(encoder.map(|at| (host(at), 0)));
+        }
+        if latents_region.is_some() {
+            for position in 0..group.ranks.len() {
+                let part = (host(position), 0);
+                let denoises = served_phases(group, position).contains(&Phase::Denoise);
+                if denoises && !parts[usize::from(trajectory)].contains(&part) {
+                    parts[usize::from(trajectory)].push(part);
+                }
+            }
+        }
+
         stated.push(Group {
             id,
-            memory: media_memory(groups, &groups[index]),
+            memory: media_memory(groups, &host(first)),
             slots: *slot_region,
             regions: per_class,
-            receives: Vec::new(),
-            parts: Vec::new(),
+            receives,
+            parts,
         });
-    }
-
-    if !crossings.is_empty() {
-        let hosts = |group: &WorkerGroupConfig| {
-            let hosts: BTreeSet<&str> = group.ranks.iter().map(|rank| rank.host.as_str()).collect();
-            hosts.into_iter().collect::<Vec<_>>().join(", ")
-        };
-        let named: Vec<String> = crossings
-            .iter()
-            .map(|(name, writer, reader)| {
-                format!(
-                    "{name}, written by worker group {} (hosts {}) and read by worker group {} \
-                     (hosts {})",
-                    writer.id,
-                    hosts(writer),
-                    reader.id,
-                    hosts(reader)
-                )
-            })
-            .collect();
-        bail!(
-            "these products of a video request would pass between the main processes of two \
-             hosts, and a product block is reached only by the ranks of the process that holds \
-             it: {}",
-            named.join("; ")
-        );
     }
 
     Ok(Open {
@@ -1836,29 +1835,17 @@ fn request_units(sizing: &VideoRank) -> Result<Vec<u64>> {
         .collect())
 }
 
-/// The units of the product buffer of the rank at `position` of media group `group` that one
-/// request slot's part takes: the units one request's blocks take of each product kind the rank
-/// backs ([`request_units`], `request_units` in `crate::batch::product::KINDS` order), in whole
-/// allocation granules of `granule` bytes (`BufferMemory::slot_units`); 0 for a rank that backs
-/// no kind.
-///
-/// # Errors
-///
-/// A position the group's blocks do not place.
-fn slot_units(
-    request_units: &[u64],
-    group: &WorkerGroupConfig,
-    position: usize,
-    granule: u64,
-) -> Result<u64> {
-    let request: u64 = backed_kinds(group, position)?
-        .iter()
-        .map(|kind| request_units[*kind])
-        .sum();
-    Ok(match request {
+/// The units of a rank's product buffer that one request slot's part takes, for a rank that
+/// holds the blocks of the product kinds `held` ([`held_kinds`], indices into
+/// `crate::batch::product::KINDS`): the units one request's blocks take of each
+/// ([`request_units`], `request_units` in that order), in whole allocation granules of `granule`
+/// bytes (`BufferMemory::slot_units`); 0 for a rank that holds no kind.
+fn slot_units(request_units: &[u64], held: &[usize], granule: u64) -> u64 {
+    let request: u64 = held.iter().map(|kind| request_units[*kind]).sum();
+    match request {
         0 => 0,
         request => BufferMemory::slot_units(request, granule),
-    })
+    }
 }
 
 /// The units of a product buffer of `slots` request slots whose slots' parts take `slot_units`
@@ -1883,7 +1870,7 @@ pub(crate) fn buffer_units(slot_units: u64, slots: u32) -> Result<u32> {
 /// (`ModelRunner::media_left`), `None` for a rank backed by nothing, which holds the stated
 /// slots. A rank's slot holds what one request holds on it: its trajectory row
 /// (`DenoiserRunner::row_bytes`) on a denoising rank, and on any rank the blocks one request
-/// takes of each product kind it backs, at the largest sizes the denoising rank states
+/// takes of each product kind it backs or receives, at the largest sizes the denoising rank states
 /// ([`request_units`]), in whole granules of its device ([`slot_units`], which this states of
 /// every rank): its media memory of that many slots (`BufferMemory::device_bytes`).
 ///
@@ -1914,6 +1901,7 @@ pub(crate) fn fit_media_slots(
         .context("more request slots than the protocol addresses")?;
     let groups = &config.parallel.worker_groups;
     let request_units = request_units(sizing(ranks)?.1)?;
+    let places = product_ranks(groups, config.parallel.data_parallel_size.get())?;
 
     // Each rank's group, by its index in the deployment.
     let indices = ranks
@@ -1930,13 +1918,14 @@ pub(crate) fn fit_media_slots(
         .collect::<Result<Vec<usize>>>()?;
 
     // Each rank's part of its product buffer per slot: the units one request's products take of
-    // the kinds it backs, in whole granules of its device.
+    // the kinds it backs or receives, in whole granules of its device.
     for (rank, &index) in ranks.iter_mut().zip(&indices) {
         let position = rank.model_runner.position()?;
         let Loaded::Video(video) = &mut rank.loaded else {
             bail!("rank {} is a text rank", rank.model_runner.rank());
         };
-        video.slot_units = slot_units(&request_units, &groups[index], position, video.granule)?;
+        let held = held_kinds(&places, (index, position));
+        video.slot_units = slot_units(&request_units, &held, video.granule);
     }
 
     // Per group, the fewest slots any of its ranks here holds.
@@ -2091,7 +2080,8 @@ pub(crate) fn keep_warm_slots(ranks: &mut [LoadedRank]) -> Result<()> {
         for &index in &members {
             let rank = &mut ranks[index];
             if let (Some(pool), Some(memory)) = (&rank.pool, &rank.video()?.media) {
-                let released = memory.give_back(service::lock(pool).allocator(), kept)?;
+                let client = rank.client.as_deref();
+                let released = memory.give_back(service::lock(pool).allocator(), client, kept)?;
                 tracing::info!(
                     rank = rank.model_runner.rank(),
                     kept,
@@ -2132,6 +2122,7 @@ pub(crate) fn kept_regions(
     let firsts = WorkerGroupConfig::first_ranks(groups);
     let (_, sizing) = sizing(ranks)?;
     let request_units = request_units(sizing)?;
+    let places = product_ranks(groups, config.parallel.data_parallel_size.get())?;
     let region_of = |name: &str| -> Result<usize> {
         layout
             .regions
@@ -2162,7 +2153,8 @@ pub(crate) fn kept_regions(
         kept.push((slot_region, capacity.slots));
         for position in 0..group.ranks.len() {
             let name = products_region(session_engine(launch), firsts[index] + position);
-            let per_slot = slot_units(&request_units, group, position, sizing.granule)?;
+            let held = held_kinds(&places, (index, position));
+            let per_slot = slot_units(&request_units, &held, sizing.granule);
             kept.push((region_of(&name)?, buffer_units(per_slot, capacity.slots)?));
         }
     }
@@ -2752,7 +2744,7 @@ fn encoder_memory(
     };
 
     // The region of encoder outputs is the group's whole, not a part per slot.
-    let mut memory = BufferMemory::open(allocator, rank, products, slot_rows, 0, 1)
+    let mut memory = BufferMemory::open(allocator, rank, (products, None), slot_rows, 0, 1)
         .context("opening the rank's memory of encoder outputs")?;
     if let Some(region) = host {
         let name = &session.regions[usize::from(region)].name;
@@ -2764,8 +2756,9 @@ fn encoder_memory(
 /// Opens the ranks of a media deployment over the session `layout` opened and `opened`
 /// answered (steps 11-22 for a rank that keeps no cache):
 ///
-/// 1. each rank, on a thread of its own, checks that its regions fit its GPU's quota and opens
-///    its graph pool with its runners' regions and its media memory in the resident pool; the
+/// 1. each rank, on a thread of its own, checks that its regions fit its GPU's quota, opens
+///    its graph pool with its runners' regions and its trajectory rows in the resident pool, and
+///    takes its product buffer as storage the Storage Server retains, a part per slot; the
 ///    process's first rank maps the one part of every host region the session states, which
 ///    every rank copies with ([`open_media_memory`]). Two ranks on one device each open their
 ///    own;
@@ -2882,8 +2875,9 @@ fn each_rank(
 }
 
 /// Opens a media rank's memory over the session `layout` states, its regions by the answer's
-/// `numbers` ([`open_video_ranks`], step 1): its product buffer, its group's slot rows with a
-/// slot's trajectory row, and on the rank `holder`, the process's first, the one part of every
+/// `numbers` ([`open_video_ranks`], step 1): its product buffer, retained by the Storage Server
+/// (`StorageClient::region_storage`) on a device, its group's slot rows with a slot's trajectory
+/// row, and on the rank `holder`, the process's first, the one part of every
 /// host region the session states; and the regions its device block tables map (the host
 /// regions it copies to among them, the encoder outputs' when its product buffer holds its
 /// group's conditioning, the stored trajectories' when it denoises) and, of `buffers`, the
@@ -2916,6 +2910,7 @@ fn open_media_memory(
 
     // The rank's product buffer and its group's slot rows, as the session states them.
     let units = layout.regions[usize::from(products)].units;
+    let name = layout.regions[usize::from(products)].name.clone();
     let slots = model_runner.slots();
 
     // The host regions the session states, and those the rank copies to: the encoder outputs'
@@ -2974,13 +2969,14 @@ fn open_media_memory(
     };
 
     // Steps 11-14 and 17: the regions fit what the quota leaves, and the graph pool opens with
-    // each runner's region, their shadow regions and the media memory in its resident pool.
+    // each runner's region, their shadow regions and the trajectory rows in its resident pool.
     let granularity = crate::process::ranks::rank::memory::granularity(device)?;
     let graphs: Vec<u64> = video.peaks.iter().map(|(_, peaks)| peaks.graph).collect();
     let shadows: Vec<u64> = video.peaks.iter().map(|(_, peaks)| peaks.shadow).collect();
     let pools = division::pool_bytes(granularity, &graphs, &shadows, 0);
-    let resident = BufferMemory::device_bytes(units, slots, video.row, video.granule);
-    model_runner.media_division(client, device, pools, resident, video.buffers)?;
+    let media = BufferMemory::device_bytes(units, slots, video.row, video.granule);
+    model_runner.media_division(client, device, pools, media, video.buffers)?;
+    let resident = BufferMemory::device_bytes(0, slots, video.row, video.granule);
     let regions: Vec<(RunnerId, u64)> = video
         .peaks
         .iter()
@@ -2996,13 +2992,31 @@ fn open_media_memory(
         resident,
     )?;
 
+    // The product buffer, which the Storage Server retains so that a crossing reaches it: a part
+    // per slot of whole granules, or for a rank that holds no product kind one unit in a part
+    // of one granule; addressed by every device of the process by peer access.
+    let parts = video.product_parts(slots);
+    let part_units = products.1 / parts.max(1);
+    let length = (u64::from(part_units) * UNIT_BYTES).next_multiple_of(granularity.max(1));
+    let length =
+        usize::try_from(length).context("a product buffer's part past the address space")?;
+    let access = Storage::peers(device)?;
+    let retained = client
+        .region_storage(
+            &name,
+            device,
+            (parts, part_units, UNIT_BYTES, length),
+            &access,
+        )
+        .context("taking the rank's product buffer")?;
+
     let mut memory = BufferMemory::open(
         graph_pool.allocator(),
         rank_index,
-        products,
+        (products, Some(retained)),
         slot_rows,
         video.row,
-        video.product_parts(slots),
+        parts,
     )
     .context("opening the rank's media memory")?;
     if let Some(region) = encoders.filter(|_| holds_parts) {
@@ -3131,15 +3145,18 @@ pub(crate) type Place = (String, String, u32, Vec<UnitRun>);
 /// Binds each rank of `ranks` to the session `layout` opened and `opened` answered: a served rank
 /// takes its part of each host region at its own host's Storage Server (`HostPart`), every rank's
 /// cache is told the numbers of the regions its copies name (`KvCacheMemory::set_regions`), and
-/// each served rank states where its part of its scheduler's KV units lies in its group's memory.
-/// A rank of the session's own host states it at its server itself (`Place`, with `place`); a
-/// peer's rank lies on another host than the session's buffer pool, whose head states it there
-/// for the rank (`PlaceRemote`). A media rank keeps no cache, and its memory was opened over the
-/// answer's numbers; a dedicated expert rank maps no region and its cache is its own.
+/// each served rank states where its units lie: its part of its scheduler's KV units in its
+/// group's memory, a media rank's product buffer in its process's memory (`Region::memory`,
+/// part 0), and each host part a rank of this process took, under the host it lies on, as the
+/// layout's host parts name it (`storage::runtime::Group::parts`), with no run. A rank of the
+/// session's own host states it at its server itself (`Place`, with `place`); a peer's rank lies
+/// on another host than the session's buffer pool, whose head states it there for the rank
+/// (`PlaceRemote`). A media rank keeps no cache, and its memory was opened over the answer's
+/// numbers; a dedicated expert rank maps no region and its cache is its own.
 ///
-/// Returns where each served rank's part of its KV region's units lies, as `(region, device
-/// memory, part, runs)`, the part being the rank's index in its worker group: what a peer
-/// answers the session with (`Placed`).
+/// Returns every place the served ranks stated, as `(region, device memory or host, part,
+/// runs)`, the part being the rank's index in its worker group, or 0 for a region whose units
+/// one rank holds whole: what a peer answers the session with (`Placed`).
 ///
 /// # Errors
 ///
@@ -3151,80 +3168,168 @@ pub(crate) fn bind(
     place: bool,
 ) -> Result<Vec<Place>> {
     let mut places = Vec::new();
-    for rank in ranks.iter_mut() {
-        let Loaded::Text(text) = &rank.loaded else {
+    // The rank whose client took the one part of each host region of whole blocks this process
+    // copies with: a media process's first rank, or its first text rank that encodes images.
+    let holder = ranks.iter().position(|rank| match &rank.loaded {
+        Loaded::Video(_) => true,
+        Loaded::Text(text) => text.vision.is_some(),
+    });
+    for (index, rank) in ranks.iter_mut().enumerate() {
+        let Some(client) = rank.client.clone() else {
+            if let Loaded::Text(_) = &rank.loaded
+                && let Some((_, kv, host)) = stated_regions(rank, layout)?
+            {
+                set_regions(rank, (kv, host), opened, None)?;
+            }
             continue;
         };
-        let Some((group, kv, host)) = stated_regions(rank, layout)? else {
-            continue;
-        };
-        let number = |index: u8| -> Result<u8> {
-            opened
-                .regions
-                .get(usize::from(index))
-                .map(|(number, _)| *number)
-                .with_context(|| format!("the answer numbers no region {index}"))
-        };
-
-        let mut cache = service::lock(&text.cache);
-        let mut copies = None;
-        if let Some(client) = &rank.client {
-            let region = &layout.regions[usize::from(kv)].name;
-            let runs = unit_runs(&cache.info().plane_runs);
-            let part = rank.model_runner.tensor_rank();
+        let host = rank_host(rank)?;
+        let mut stated = |stated: Place| -> Result<()> {
             if place {
+                let (region, memory, part, runs) = &stated;
                 client
-                    .place(region, &group.memory, part, &runs)
-                    .with_context(|| {
-                        format!(
-                            "placing the rank's units of region {region} in {}",
-                            group.memory
-                        )
-                    })?;
+                    .place(region, memory, *part, runs)
+                    .with_context(|| format!("placing the rank's units of region {region}"))?;
             }
-            places.push((region.clone(), group.memory.clone(), part, runs));
+            places.push(stated);
+            Ok(())
+        };
 
-            // The stores and loads the buffer pool asks of this rank copy between its units and
-            // its part of each group's host region, unit `u` of the region being page `u`.
-            if host.iter().any(Option::is_some) {
-                let names: Vec<Option<&str>> = host
-                    .iter()
-                    .map(|region| {
-                        region.map(|index| layout.regions[usize::from(index)].name.as_str())
-                    })
-                    .collect();
-                let device = rank.device()?;
-                let stream = Stream::new(device)
-                    .with_context(|| format!("creating device {}'s copy stream", device.0))?;
-                cache
-                    .map_host_parts(
-                        client,
-                        (&names, rank.model_runner.tensor_rank()),
-                        stream.clone(),
-                        Arc::clone(&rank.kernels),
-                    )
-                    .context("mapping the rank's parts of the host KV regions")?;
-                copies = Some(stream);
+        // The parts of the host regions of whole blocks, which the holder took for its process.
+        if Some(index) == holder {
+            for region in whole_host_regions(rank, layout)? {
+                stated((region, host.clone(), 0, Vec::new()))?;
             }
         }
 
-        let groups = cache.layout().groups.len();
-        let host = host
-            .into_iter()
-            .map(|region| region.map(number).transpose())
-            .collect::<Result<Vec<_>>>()?;
-        cache.set_regions(CacheRegions {
-            units: number(kv)?,
-            host,
-            sources: vec![None; groups],
-        })?;
-        drop(cache);
+        let Loaded::Text(text) = &rank.loaded else {
+            // A media rank's product buffer, in its process's memory.
+            let products = product_buffer(layout, rank)?;
+            let region = &layout.regions[usize::from(products)];
+            let memory = rank.video()?.media.as_ref();
+            let runs = memory.map(|memory| memory.placed()).unwrap_or_default();
+            if !runs.is_empty() {
+                stated((region.name.clone(), region.memory.clone(), 0, runs))?;
+            }
+            continue;
+        };
+        let Some((group, kv, host_regions)) = stated_regions(rank, layout)? else {
+            continue;
+        };
 
-        if let Some(stream) = copies {
-            rank.streams.push(("copy", stream));
+        // The rank's part of its scheduler's KV units, in its group's memory.
+        let part = rank.model_runner.tensor_rank();
+        let region = layout.regions[usize::from(kv)].name.clone();
+        let runs = unit_runs(&service::lock(&text.cache).info().plane_runs);
+        stated((region, group.memory.clone(), part, runs))?;
+
+        // The stores and loads the buffer pool asks of this rank copy between its units and its
+        // part of each group's host region, unit `u` of the region being page `u`.
+        let mut copies = None;
+        if host_regions.iter().any(Option::is_some) {
+            let names: Vec<Option<&str>> = host_regions
+                .iter()
+                .map(|region| region.map(|index| layout.regions[usize::from(index)].name.as_str()))
+                .collect();
+            let device = rank.device()?;
+            let stream = Stream::new(device)
+                .with_context(|| format!("creating device {}'s copy stream", device.0))?;
+            service::lock(&text.cache)
+                .map_host_parts(
+                    &client,
+                    (&names, part),
+                    stream.clone(),
+                    Arc::clone(&rank.kernels),
+                )
+                .context("mapping the rank's parts of the host KV regions")?;
+            for name in names.into_iter().flatten() {
+                stated((name.to_owned(), host.clone(), part, Vec::new()))?;
+            }
+            copies = Some(stream);
         }
+        set_regions(rank, (kv, host_regions), opened, copies)?;
     }
     Ok(places)
+}
+
+/// Tells the cache of text rank `rank` the numbers of the regions its copies name, its KV region
+/// `kv` and per cache group its host region, by the session's answer `opened`, and keeps the
+/// stream its copies to and from its host parts run on (`copies`, `None` for a rank that maps
+/// none).
+///
+/// # Errors
+///
+/// A region the answer does not number, or a text rank's cache's refusal.
+fn set_regions(
+    rank: &mut LoadedRank,
+    (kv, host): (u8, Vec<Option<u8>>),
+    opened: &Opened,
+    copies: Option<Stream>,
+) -> Result<()> {
+    let number = |index: u8| -> Result<u8> {
+        opened
+            .regions
+            .get(usize::from(index))
+            .map(|(number, _)| *number)
+            .with_context(|| format!("the answer numbers no region {index}"))
+    };
+    let mut cache = service::lock(&rank.text()?.cache);
+    let groups = cache.layout().groups.len();
+    let host = host
+        .into_iter()
+        .map(|region| region.map(number).transpose())
+        .collect::<Result<Vec<_>>>()?;
+    cache.set_regions(CacheRegions {
+        units: number(kv)?,
+        host,
+        sources: vec![None; groups],
+    })?;
+    drop(cache);
+
+    if let Some(stream) = copies {
+        rank.streams.push(("copy", stream));
+    }
+    Ok(())
+}
+
+/// The host regions of blocks one rank holds whole that the session `layout` states and the
+/// process of `rank` copies with, by name: one part of each, part 0, which the process's first
+/// media rank, or its first text rank that encodes images, takes ([`open_media_memory`],
+/// [`encoder_memory`]). A text deployment's host regions of KV pages are each rank's own.
+///
+/// # Errors
+///
+/// A text rank whose cache states no layout.
+fn whole_host_regions(rank: &LoadedRank, layout: &Open) -> Result<Vec<String>> {
+    // A text rank's classes with host regions of whole blocks follow its cache groups.
+    let first = match &rank.loaded {
+        Loaded::Video(_) => 0,
+        Loaded::Text(text) => service::lock(&text.cache).layout().groups.len(),
+    };
+    let mut names: Vec<String> = Vec::new();
+    for class in layout.classes.iter().skip(first) {
+        if let Some((region, _)) = class.host {
+            let name = &layout.regions[usize::from(region)].name;
+            if !names.contains(name) {
+                names.push(name.clone());
+            }
+        }
+    }
+    Ok(names)
+}
+
+/// The host the deployment places `rank` on, as its worker groups name it: the name the layout's
+/// host parts (`storage::runtime::Group::parts`) and media memories give it.
+///
+/// # Errors
+///
+/// A rank the deployment's worker groups do not place.
+fn rank_host(rank: &LoadedRank) -> Result<String> {
+    let groups = &rank.model_runner.engine_config().parallel.worker_groups;
+    let number = rank.model_runner.rank() as usize;
+    let (index, position) = WorkerGroupConfig::place_rank(groups, number)
+        .with_context(|| format!("the deployment's worker groups place no rank {number}"))?;
+    Ok(groups[index].ranks[position].host.clone())
 }
 
 /// The session's statement of `rank`'s group, the index of its KV region, and per cache group the
@@ -3355,6 +3460,10 @@ pub(crate) fn spawn(
     for (rank, (id, place)) in ranks.iter_mut().zip(&placed) {
         let device = rank.pool.as_ref().map(|_| rank.model_runner.devices()[0]);
         let group = layout.groups.iter().find(|group| group.id == *id);
+        let parts = match group {
+            Some(group) => host_part_bits(rank, (layout, opened), group)?,
+            None => Vec::new(),
+        };
         let (tables, runners) = match &mut rank.loaded {
             Loaded::Text(text) => {
                 let mapped = text_regions(layout, opened, group);
@@ -3366,13 +3475,16 @@ pub(crate) fn spawn(
                 if let Some(vision) = text.vision_runner.take() {
                     runners.push(Box::new(vision));
                 }
-                (BlockTables::new(*id, &mapped, &unit_bytes), runners)
+                let tables = BlockTables::new(*id, &mapped, &unit_bytes).with_parts(&parts);
+                (tables, runners)
             }
             // A media rank's tables keep the runs of a block in the other ranks' product buffers
             // too, which its device reaches.
             Loaded::Video(video) => {
                 let (mapped, peers) = &video.regions;
-                let tables = BlockTables::new(*id, mapped, &unit_bytes).with_peers(peers);
+                let tables = BlockTables::new(*id, mapped, &unit_bytes)
+                    .with_peers(peers)
+                    .with_parts(&parts);
                 let runners = std::mem::take(&mut video.runners);
                 if runners.is_empty() {
                     bail!("the rank's runners were spawned already, or the rank was never opened");
@@ -3409,6 +3521,64 @@ pub(crate) fn spawn(
 
     let route = Route::new(sequences, workers.clone(), remotes)?;
     Ok((Arc::new(route), workers))
+}
+
+/// The place of each host part `rank` copies with among the host parts its session's group
+/// `group` states for the class its region holds copies of (`storage::runtime::Group::parts`), in
+/// the order of their hosts' names and then their part indices, by
+/// the number the answer gave the host region: what a copy's answer names the parts it writes by
+/// (`storage::runtime::Completion::Copy::parts`), `None` where they do not include it. A rank
+/// copies a region whose units it holds a share of with the part of its index in its group, its
+/// tensor rank, and a region of blocks one rank holds whole with part 0, each on its own host. A
+/// class whose group states no host part is not named.
+///
+/// # Errors
+///
+/// A rank the deployment does not place, or a region the answer does not number.
+fn host_part_bits(
+    rank: &LoadedRank,
+    (layout, opened): (&Open, &Opened),
+    group: &Group,
+) -> Result<Vec<(u8, Option<u32>)>> {
+    let host = rank_host(rank)?;
+    let share = match &rank.loaded {
+        Loaded::Text(_) => rank.model_runner.tensor_rank(),
+        Loaded::Video(_) => 0,
+    };
+
+    let mut bits = Vec::new();
+    for (class, stated) in layout.classes.iter().enumerate() {
+        let (Some((region, _)), Some(parts)) = (stated.host, group.parts.get(class)) else {
+            continue;
+        };
+        if parts.is_empty() {
+            continue;
+        }
+        let held = &layout.regions[usize::from(region)];
+        let part = if held.unit_bytes > held.part_bytes {
+            share
+        } else {
+            0
+        };
+        // A copy's answer names the parts in the order of their hosts' names and indices.
+        let mut ordered: Vec<(&str, u32)> =
+            parts.iter().map(|(on, at)| (on.as_str(), *at)).collect();
+        ordered.sort_unstable();
+        ordered.dedup();
+        let bit = ordered
+            .iter()
+            .position(|stated| *stated == (host.as_str(), part))
+            .map(u32::try_from)
+            .transpose()
+            .context("more host parts than a copy names")?;
+        let number = opened
+            .regions
+            .get(usize::from(region))
+            .map(|(number, _)| *number)
+            .with_context(|| format!("the answer numbers no region {region}"))?;
+        bits.push((number, bit));
+    }
+    Ok(bits)
 }
 
 /// The regions a text rank of the session's group `group` maps, by the answer's numbers: the

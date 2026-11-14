@@ -244,23 +244,20 @@ pub(super) fn video_split(
         }
     };
     // The page states the text encoder's degree beside it, so the group's width is the page's and
-    // the rank's place in it is the rank's place in the block.
+    // the rank's place in it is the rank's place in the block. A rank the block does not hold, a
+    // denoising rank beside a text encoder split over fewer ranks, loads no part of the encoder
+    // (`ModelRunner::stages`): its split is the whole, which nothing it loads reads.
     let (tensor_parallel, tensor_rank) = match placed.blocks.get(text_encoder) {
         Some(text) if text.tensor_parallel_size > 1 => {
             let position = if text.ranks.is_empty() {
-                rank
+                Some(rank)
             } else {
-                text.ranks
-                    .iter()
-                    .position(|member| *member == rank)
-                    .with_context(|| {
-                        format!(
-                            "this rank is {rank} and the group's text encoder holds ranks {:?}",
-                            text.ranks
-                        )
-                    })?
+                text.ranks.iter().position(|member| *member == rank)
             };
-            (text.tensor_parallel_size, position)
+            match position {
+                Some(position) => (text.tensor_parallel_size, position),
+                None => (1, 0),
+            }
         }
         _ => (tensor_parallel, tensor_rank),
     };
@@ -432,6 +429,27 @@ mod tests {
             sequence.split.rank, 2,
             "a block of every rank places the rank at its ordinal"
         );
+    }
+
+    /// A text encoder split over some of a group's ranks, as
+    /// `configs/minimax_h3/ulysses8-reference-two-host.toml` splits it over the first four of
+    /// eight: its members take their places in the block, and a rank outside it takes the whole
+    /// split, since it loads no part of the encoder, while its sequence place is its own.
+    #[test]
+    fn a_rank_outside_the_text_encoder_s_block_holds_no_part_of_it() {
+        let placed = page(
+            "[[worker_groups]]\nid = \"model\"\nranks = [\"cuda:0-7\"]\nqueue_depth = 2\n\
+             [worker_groups.blocks.transformer_ref]\nsequence_parallel = { kind = \"ulysses\", \
+             ulysses_degree = 8, projection = \"exchange\" }\n\
+             [worker_groups.blocks.text_encoder]\nranks = [0, 1, 2, 3]\ntensor_parallel_size = 4\n",
+        );
+        let (_, tensor) = split(Some(&placed), "model", 2, 1, 0, 8).expect("a member's split");
+        assert_eq!((tensor.size, tensor.rank), (4, 2));
+
+        let (sequence, tensor) =
+            split(Some(&placed), "model", 5, 1, 0, 8).expect("a denoising rank outside the block");
+        assert_eq!(tensor, Split::WHOLE);
+        assert_eq!((sequence.split.size, sequence.split.rank), (8, 5));
     }
 
     /// A deployment that places the whole model serves one rank, and refuses to guess above one.

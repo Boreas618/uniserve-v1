@@ -37,7 +37,7 @@
 //!   before the replay and the latents back after it, on the runner's stream. The last step also
 //!   copies the latents into the video latents and audio latents blocks its row names, which the
 //!   decoders read as `[channels, frames · rows · columns]` and as the track's elements in the
-//!   sample type, their `latent_type`. The first rank of the denoising group
+//!   sample type, their `latent_type`. The denoising group's first rank in each main process
 //!   ([`DenoiserConfig::first`]) copies them on to the backing ranks of its process
 //!   ([`BufferMemory::share`]).
 //!
@@ -56,10 +56,11 @@
 //!
 //! [`Runner::copy`] issues the copies of a batch through the rank's [`BufferMemory`]. Every rank
 //! of every parallel configuration holds a request's whole samples in its slot's row, laid out by
-//! the request's layout alone, so a saved trajectory has one host copy: a `Save` copies the
-//! row of the group's first rank ([`DenoiserConfig::first`]) into the part of the host latent
-//! region the rank copies with ([`BufferMemory::part_holder`]), and a `Restore` copies it back
-//! into the row of every rank of the restoring group, whichever group and layout saved it. The
+//! the request's layout alone, so a saved trajectory has one host copy per host: a `Save`
+//! copies the row of the group's first rank in each main process ([`DenoiserConfig::first`])
+//! into the part of the host latent region its process copies with
+//! ([`BufferMemory::part_holder`]), and a `Restore` copies it back into the row of every rank of
+//! the restoring group from its own process's part, whichever group and layout saved it. The
 //! class of stored trajectories states its tensors and its encoding over [`trajectory_layout`]
 //! of the largest layout, once ([`DenoiserRunner::trajectory_digests`]). A `Restore` whose copy
 //! names another encoding of the same tensors was saved by a deployment whose largest layout is
@@ -159,9 +160,10 @@ pub(crate) struct DenoiserConfig {
     pub ranks: u32,
     /// The bytes of a unit of a part of the host latent region (`BankPages::page_bytes`).
     pub page_bytes: u64,
-    /// Whether this rank is the first of its denoising group: it copies the latents the last
-    /// step wrote to the backing ranks of its process, and it alone writes a saved trajectory's
-    /// host copy, which every rank of the group holds whole.
+    /// Whether this rank is the first of its denoising group in its main process: it copies the
+    /// latents the last step wrote to the backing ranks of its process, and it alone there writes
+    /// a saved trajectory's host copy, which every rank of the group holds whole, into the part
+    /// its process copies with.
     pub first: bool,
 }
 
@@ -934,7 +936,8 @@ impl Runner for DenoiserRunner {
     /// Issues `copies` through the rank's media memory on the runner's stream, ahead of the
     /// batch whose end covers them: a restore of a trajectory saved in another encoding through
     /// the copy manifest, every other copy as its bytes are. A `Save` is the group's first
-    /// rank's alone, since it writes the one host copy every rank of the group holds.
+    /// rank's in each process alone, since it writes the host copy every rank of the group on its
+    /// host restores.
     fn copy(&mut self, copies: &[BlockCopy]) -> Result<()> {
         let stream = self.stream.as_ref();
         let plain: Vec<BlockCopy> = copies

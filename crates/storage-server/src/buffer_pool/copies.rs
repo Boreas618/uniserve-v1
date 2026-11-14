@@ -161,6 +161,7 @@ impl BufferPool {
             to,
             evicted,
             encodings: None,
+            parts: Vec::new(),
         }))
     }
 
@@ -305,6 +306,7 @@ impl BufferPool {
             to,
             evicted,
             encodings,
+            parts: Vec::new(),
         }))
     }
 
@@ -396,6 +398,7 @@ impl BufferPool {
             .into_iter();
 
         let (mut from, mut to, mut copies) = (Vec::new(), Vec::new(), Vec::new());
+        let mut written = Vec::new();
         let stated: Vec<Key> = sources.iter().map(|source| source.0).collect();
         for (key, device, _, _, host) in sources {
             let (write, memory, fill) = match host {
@@ -405,6 +408,9 @@ impl BufferPool {
                     None => break,
                 },
             };
+            // The group's ranks write only the parts the copy fills: a rank whose part holds
+            // the key's host copy already leaves it as it is.
+            written.push(self.stated_parts(client, group, class, memory));
             from.extend(device.stated());
             to.extend(write.stated());
             let target = Target::Entry { key, remote: false };
@@ -425,6 +431,7 @@ impl BufferPool {
             to,
             evicted,
             encodings: None,
+            parts: written,
         }))
     }
 
@@ -483,6 +490,7 @@ impl BufferPool {
             to,
             evicted,
             encodings: None,
+            parts: vec![self.stated_parts(client, group, trajectory, parts)],
         }))
     }
 
@@ -537,6 +545,7 @@ impl BufferPool {
             to,
             evicted: Vec::new(),
             encodings,
+            parts: Vec::new(),
         }))
     }
 

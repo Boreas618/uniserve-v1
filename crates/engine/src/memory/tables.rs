@@ -16,6 +16,10 @@
 //! Every entry belongs to the owner whose request gave it. A slot holds the entries of the owner
 //! attached to the group there and, in a group that reads a class another group writes, the
 //! entries of that class's owner too; a request that takes entries away takes only its owner's.
+//! A group whose ranks lie in several processes reads a product in each process's memory: where
+//! its writer wrote it, from the writer's allocation, and elsewhere from the crossing that copied
+//! it there (`Replicate`), so a rank holds an entry only once its process's memory holds the
+//! block.
 //!
 //! ## What feeds the table
 //!
@@ -26,14 +30,17 @@
 //!   for a group that reads a class it does not write (a decoder reading a media product), the
 //!   slot of the request's own owner there. `(Attach, Attached)` and `(Transfer, Transferred)`
 //!   attach an owner to the group in the slot they state. `(Allocate, Allocated)`, `(Pin,
-//!   Pinned)` and `(Transfer, Transferred)` put runs at the positions the request named. A `Copy`
-//!   that answers a `Load`, `Clone`, `Store`, `Save` or `Restore` queues the copies the rank must
-//!   run. The answer of a `Finish` to a `Load` or a `Clone` (`Loaded`, `Duplicate`, `Cloned`)
-//!   puts the destination runs at the positions the `Load` or the `Clone` named. Any other pair
-//!   gives the table nothing.
-//! - [`BlockTables::apply`]: a `Release`, `Detach`, `Commit`, `Transfer` or `Finish` on its way
-//!   to the submission queue, before the worker stamps it. Every `Finish` passes through it,
-//!   the worker's own that reports a copy run as well as the scheduler's give-up.
+//!   Pinned)` and `(Transfer, Transferred)` put runs at the positions the request named.
+//!   `(Replicate, Replicated)` puts, read-only, the runs the crossing made valid at the position
+//!   it named, those the process maps; a rank whose process held the block already keeps its
+//!   entry. A `Copy` that answers a `Load`, `Clone`, `Store`, `Save` or `Restore` queues the
+//!   copies the rank must run. The answer of a `Finish` to a `Load` or a `Clone` (`Loaded`,
+//!   `Duplicate`, `Cloned`) puts the destination runs at the positions the `Load` or the `Clone`
+//!   named. Any other pair gives the table nothing.
+//! - [`BlockTables::apply`]: a `Release`, `Detach`, `Commit`, `Transfer`, `Replicate` or
+//!   `Finish` on its way to the submission queue, before the worker stamps it. Every `Finish`
+//!   passes through it, the worker's own that reports a copy run as well as the scheduler's
+//!   give-up.
 //!
 //! ## The obligations of the control plane each method serves
 //!
@@ -43,7 +50,7 @@
 //! | Method | Obligation |
 //! | --- | --- |
 //! | [`BlockTables::map`] | 1: an entry exists only as a run a completion gave, at the position its request named. 4: an entry is writable only when it came from `Allocated`, from a `Clone` answered `Cloned` or as a private block of `Transferred`; the destination of a load or a clone is no entry until the `Finish` of its copy is answered, so only the copy writes it |
-//! | [`BlockTables::apply`] | 2, the part before the stamp: the entries of a `Release`, a `Detach` or a `Transfer` leave, the entry of a `Commit` becomes read-only, a given-up copy that no batch has started is dropped and its destinations are no longer awaited. The stamp itself, the sequence of the last batch launched, is the worker's |
+//! | [`BlockTables::apply`] | 2, the part before the stamp: the entries of a `Release`, a `Detach` or a `Transfer` leave, the entry of a `Commit` or a `Replicate` becomes read-only, a given-up copy that no batch has started is dropped and its destinations are no longer awaited. The stamp itself, the sequence of the last batch launched, is the worker's |
 //! | [`BlockTables::run`], [`BlockTables::runs`], [`BlockTables::units`], [`BlockTables::entries`] | 1: the only source of a kernel's addresses and of a media copy's |
 //! | [`BlockTables::writable`] | 4: whether a batch may write a position |
 //! | [`BlockTables::take_changes`] | 1: what the runner writes into the device block table, each change once. A run is stated for reset only while its entry is in the table, so the units of a block that left are never touched. 4: and only while a batch may write it, so a block a `Commit` marked before the next batch is never reset |
@@ -123,6 +130,12 @@ pub struct BlockTables {
     /// The product buffers of the process's other ranks, which the rank's device reaches by
     /// peer access.
     peers: Vec<u8>,
+    /// By host region number, the bit of the rank's host part in a copy's statement of the parts
+    /// it writes (`storage::runtime::Completion::Copy::parts`): its place among the host parts its
+    /// group copies the region's class with, in the order of their hosts' names and part indices,
+    /// `None` where they do not include it. A region not
+    /// named is one whose group states no host part, whose every rank writes its own.
+    parts: HashMap<u8, Option<u32>>,
     /// By region number, the bytes of a unit summed over the ranks that hold a part of it, for
     /// every region a copy of the group may name.
     unit_bytes: HashMap<u8, u64>,
@@ -209,6 +222,7 @@ impl BlockTables {
             group,
             regions: regions.to_vec(),
             peers: Vec::new(),
+            parts: HashMap::new(),
             unit_bytes: unit_bytes.iter().copied().collect(),
             slots: HashMap::new(),
             entries: BTreeMap::new(),
@@ -228,6 +242,17 @@ impl BlockTables {
             .copied()
             .filter(|region| !self.regions.contains(region))
             .collect();
+        self
+    }
+
+    /// The table of a rank whose group states the host parts it copies with: `parts` states, per
+    /// host region by the number the answer to `Open` gave it, the place of the rank's own host
+    /// part among the group's host parts of the class the region holds copies of
+    /// (`storage::runtime::Group::parts`), `None` where they do not include it. A copy to the
+    /// host is the rank's to run only where its answer names the rank's part among those it
+    /// writes. Called before the table is fed.
+    pub(crate) fn with_parts(mut self, parts: &[(u8, Option<u32>)]) -> Self {
+        self.parts = parts.iter().copied().collect();
         self
     }
 
@@ -273,7 +298,7 @@ impl BlockTables {
 
     /// Whether a batch may write the block that `slot` holds at `position` of `class`: the
     /// entry came from `Allocated`, from `Cloned` or as a private block of `Transferred`, and
-    /// no `Commit` has named it. A position without an entry is not writable.
+    /// no `Commit` or `Replicate` has named it. A position without an entry is not writable.
     pub fn writable(&self, slot: u32, class: u8, position: u32) -> bool {
         self.entries
             .get(&(slot, class, position))
@@ -347,8 +372,9 @@ impl BlockTables {
     /// was given up or whose owner left since is such a pair. A `Copy` of a `Load` or a `Clone`
     /// whose owner left the group before it arrived queues the copies, which must run and end,
     /// and fills nothing: the owner is not held again. The caller hands a pair only
-    /// before any `Release`, `Detach`, `Commit` or `Transfer` that names its entries is
-    /// applied.
+    /// before any `Release`, `Detach`, `Commit`, `Transfer` or `Replicate` that names its
+    /// entries is applied, and hands a group that reads a product in a process its writer did
+    /// not write it in the product's runs there only by the `Replicated` that made them valid.
     ///
     /// # Errors
     ///
@@ -356,8 +382,9 @@ impl BlockTables {
     /// copies and does not answer a request of its kind; a group that is not the table's; slot
     /// 0, which addresses nothing, or a slot other than the one the completion states or the
     /// owner's entries are kept under; an owner attached twice; a slot another owner attached
-    /// to the group holds; a position that holds an entry already; runs that do not divide into
-    /// the request's blocks, or a block with two runs in the rank's regions; a load or a clone
+    /// to the group holds; a position that holds an entry already, other than the entry a
+    /// `Replicated` names again; runs that do not divide into the request's blocks, a
+    /// `Replicated` of no run, or a block with two runs in the rank's regions; a load or a clone
     /// whose destination the rank maps and whose source it does not; a copy that names a region
     /// whose unit size the table was not given.
     pub(crate) fn map(
@@ -501,12 +528,13 @@ impl BlockTables {
                     from,
                     to,
                     encodings,
+                    parts,
                     ..
                 },
             ) => self.queue(
                 id,
                 (*group, keys.len()),
-                (from, to, *encodings),
+                (from, to, *encodings, parts),
                 Some((*owner, slot, *class, *at, false)),
             ),
 
@@ -520,12 +548,13 @@ impl BlockTables {
                     from,
                     to,
                     encodings,
+                    parts,
                     ..
                 },
             ) => self.queue(
                 id,
                 (*group, keys.len()),
-                (from, to, *encodings),
+                (from, to, *encodings, parts),
                 Some((*owner, slot, *class, *at, true)),
             ),
 
@@ -537,9 +566,55 @@ impl BlockTables {
                     from,
                     to,
                     encodings,
+                    parts,
                     ..
                 },
-            ) => self.queue(id, (*group, keys.len()), (from, to, *encodings), None),
+            ) => self.queue(
+                id,
+                (*group, keys.len()),
+                (from, to, *encodings, parts),
+                None,
+            ),
+
+            (
+                Request::Replicate {
+                    owner,
+                    class,
+                    at,
+                    group,
+                    ..
+                },
+                Completion::Replicated { runs },
+            ) => {
+                self.check_group(*group)?;
+                if runs.is_empty() {
+                    return Err(Error::Invalid(format!(
+                        "`Replicated` states no run for position {at} of class {class}"
+                    )));
+                }
+                let reached = self.reached(runs)?;
+                self.check_held(*owner, slot)?;
+
+                // A block its allocation already gave this process stays the entry it is: the
+                // crossing wrote other memory.
+                if let Some((held, _, holder)) = self.entries.get(&(slot, *class, *at))
+                    && holder == owner
+                    && *held == reached
+                {
+                    return Ok(());
+                }
+                let entries = if reached.is_empty() {
+                    Vec::new()
+                } else {
+                    vec![(*class, *at, reached, false)]
+                };
+                self.check_vacant(slot, &entries)?;
+
+                // The crossing wrote the block's content into the run here: nothing is reset,
+                // and no batch writes a copy another memory's readers hold too.
+                self.put(*owner, slot, entries, false);
+                Ok(())
+            }
 
             (
                 Request::Finish { copy, ok: true, .. },
@@ -553,7 +628,8 @@ impl BlockTables {
                 | Completion::Pinned { .. }
                 | Completion::Transferred { .. }
                 | Completion::Copy { .. }
-                | Completion::Cloned,
+                | Completion::Cloned
+                | Completion::Replicated { .. },
             ) => Err(Error::Invalid(format!(
                 "{completion:?} does not answer {request:?}"
             ))),
@@ -571,7 +647,9 @@ impl BlockTables {
     ///   copies that no batch has started stay queued until their `Finish`: the buffer pool
     ///   holds what a copy reads and writes until then. An owner whose transfer fails holds no
     ///   entry here and takes only its `Detach`;
-    /// - `Commit`: the entry it names becomes read-only, and stays so whatever the answer;
+    /// - `Commit`, `Replicate`: the entry it names becomes read-only, and stays so whatever the
+    ///   answer: a crossing reads the block once no batch in flight writes it, and none launched
+    ///   after the stamp does;
     /// - `Finish` that reports a copy run: the copy is offered to no further batch, which it
     ///   already is once started;
     /// - `Finish` that gives a copy up: a copy that no batch has started is dropped and never
@@ -610,7 +688,12 @@ impl BlockTables {
                 Ok(())
             }
 
+            // A crossing reads the block in the memory its writer wrote it in, so no later batch
+            // writes it, as no later batch writes a block a commit shares.
             Request::Commit {
+                owner, class, at, ..
+            }
+            | Request::Replicate {
                 owner, class, at, ..
             } => {
                 let entry = self
@@ -671,6 +754,17 @@ impl BlockTables {
     fn own(&self, run: Run) -> Result<bool> {
         check_run(run)?;
         Ok(self.regions.contains(&run.0))
+    }
+
+    /// Whether a copy into host region `region` that writes the host parts `parts` (a bit per
+    /// host part of the group, `storage::runtime::Completion::Copy::parts`) writes the rank's
+    /// own: always where the group states no host part of the region's class.
+    fn writes_part(&self, region: u8, parts: u64) -> bool {
+        match self.parts.get(&region) {
+            None => true,
+            Some(None) => false,
+            Some(Some(bit)) => parts & 1u64.checked_shl(*bit).unwrap_or(0) != 0,
+        }
     }
 
     /// Whether the process maps `region`: the rank's own memory, or another rank's product
@@ -828,7 +922,8 @@ impl BlockTables {
 
     /// Queues the copies of request `id`, which its completion states for `keys` keys of
     /// `group`: for each key, from the run of `from` to the run of `to`, in `encodings` when the
-    /// source's is not the destination's, with the bytes they move over the group.
+    /// source's is not the destination's, writing the host parts `parts` names for a copy to the
+    /// host (none named for any other), with the bytes they move over the group.
     /// `destination` is the owner, the slot its entries are kept under, the class, the first
     /// position and whether the request is a clone, for a request whose copies fill positions.
     ///
@@ -839,15 +934,17 @@ impl BlockTables {
         &mut self,
         id: RequestId,
         (group, keys): (GroupId, usize),
-        (from, to, encodings): (&[Run], &[Run], Option<Encodings>),
+        (from, to, encodings, parts): (&[Run], &[Run], Option<Encodings>, &[u64]),
         destination: Option<(OwnerId, u32, u8, u32, bool)>,
     ) -> Result<()> {
         self.check_group(group)?;
-        if from.len() != keys || to.len() != keys {
+        if from.len() != keys || to.len() != keys || !(parts.is_empty() || parts.len() == keys) {
             return Err(Error::Invalid(format!(
-                "`Copy` states {} sources and {} destinations for {keys} keys",
+                "`Copy` states {} sources, {} destinations and the host parts of {} for {keys} \
+                 keys",
                 from.len(),
-                to.len()
+                to.len(),
+                parts.len()
             )));
         }
 
@@ -876,7 +973,12 @@ impl BlockTables {
                     target.0, source.0
                 )));
             }
-            if reads && writes {
+            // A copy to the host writes only the host parts its answer names: a rank whose part
+            // holds the key's host copy already leaves it as it is.
+            let named = parts
+                .get(index)
+                .is_none_or(|parts| self.writes_part(target.0, *parts));
+            if reads && writes && named {
                 runs.push((source, target));
             }
 
@@ -1027,6 +1129,7 @@ mod tests {
             to: to.to_vec(),
             evicted: vec![],
             encodings: None,
+            parts: Vec::new(),
         };
 
         let slot = slot_of(tables, owner);
@@ -1280,6 +1383,155 @@ mod tests {
         assert!(!tables.writable(1, 0, 0));
     }
 
+    /// A product its writer wrote in one process and its group reads in two, as the denoising
+    /// group of a deployment over two hosts reads the conditioning its first text rank wrote: the
+    /// crossing freezes the entry it reads, and its answer gives each rank the runs its own
+    /// process maps, the reading process an entry it never had and the writing process none new.
+    #[test]
+    fn a_crossing_freezes_its_entry_and_maps_only_the_runs_of_each_process() {
+        // The product buffer of the first rank of the group on the other host.
+        const RECEIVING: u8 = 7;
+        let mut writing = tables();
+        let mut reading = BlockTables::new(GROUP, &[DEVICE, HOST, RECEIVING], &UNIT_BYTES);
+        for tables in [&mut writing, &mut reading] {
+            attach(tables, 1, 2);
+            allocate(tables, 1, 5, 0, &[(PRODUCTS, 0, 3)]).unwrap();
+        }
+        assert!(writing.writable(2, 5, 0));
+        assert_eq!(reading.runs(2, 5, 0), []);
+
+        // Stamped by every rank of the group: the entry a batch wrote is frozen, and a rank
+        // that holds none is left as it was.
+        let replicate = Request::Replicate {
+            owner: OwnerId(1),
+            class: 5,
+            at: 0,
+            from: PRODUCTS,
+            group: GROUP,
+            after: vec![],
+        };
+        for tables in [&mut writing, &mut reading] {
+            tables.apply(&replicate).unwrap();
+            tables.take_changes();
+        }
+        assert!(!writing.writable(2, 5, 0));
+
+        // The block's runs in the group's regions and its receiving region: each rank keeps
+        // those of its own process, read-only, and resets nothing.
+        let replicated = Completion::Replicated {
+            runs: vec![(PRODUCTS, 0, 3), (RECEIVING, 9, 3)],
+        };
+        for tables in [&mut writing, &mut reading] {
+            tables
+                .map(2, RequestId(2), &replicate, &replicated)
+                .unwrap();
+        }
+        assert_eq!(writing.runs(2, 5, 0), [(PRODUCTS, 0, 3)]);
+        assert!(!writing.writable(2, 5, 0));
+        assert_eq!(writing.take_changes(), []);
+        assert_eq!(reading.runs(2, 5, 0), [(RECEIVING, 9, 3)]);
+        assert!(!reading.writable(2, 5, 0));
+        assert_eq!(
+            reading.take_changes(),
+            [Change {
+                slot: 2,
+                class: 5,
+                position: 0,
+                run: Some((RECEIVING, 9, 3)),
+                reset: false
+            }]
+        );
+
+        // An answer for another group, of no run, to another request, or giving a position
+        // runs other than those its entry holds, changes nothing.
+        let elsewhere = Request::Replicate {
+            owner: OwnerId(1),
+            class: 5,
+            at: 0,
+            from: PRODUCTS,
+            group: GroupId(1),
+            after: vec![],
+        };
+        let none = Completion::Replicated { runs: vec![] };
+        let other = Completion::Replicated {
+            runs: vec![(RECEIVING, 12, 3)],
+        };
+        let unanswered = Request::Release {
+            owner: OwnerId(1),
+            class: 5,
+            at: 0,
+            count: 1,
+            after: vec![],
+        };
+        for (request, completion) in [
+            (&elsewhere, &replicated),
+            (&replicate, &none),
+            (&unanswered, &replicated),
+            (&replicate, &other),
+        ] {
+            assert!(reading.map(2, RequestId(3), request, completion).is_err());
+        }
+        assert_eq!(reading.runs(2, 5, 0), [(RECEIVING, 9, 3)]);
+
+        // The owner's release takes the crossed entry away with the others.
+        reading.apply(&unanswered).unwrap();
+        assert_eq!(reading.runs(2, 5, 0), []);
+    }
+
+    /// A group whose ranks lie on two hosts copies a class with a host part on each, this rank's
+    /// the second the group states: a store writes on the parts its answer names, so a rank whose
+    /// part holds the host copy already leaves it as it is, and a group that states no host parts
+    /// writes every rank's.
+    #[test]
+    fn a_copy_to_the_host_runs_only_on_the_host_parts_its_answer_names() {
+        let mut stating = tables().with_parts(&[(HOST, Some(1))]);
+        let store = Request::Store {
+            group: GROUP,
+            keys: keys(3),
+            tier: Tier::Host,
+        };
+        // The second key's copy fills the other host's part alone.
+        let stored = Completion::Copy {
+            group: GROUP,
+            keys: keys(3),
+            from: vec![(DEVICE, 1, 1), (DEVICE, 2, 1), (DEVICE, 3, 1)],
+            to: vec![(HOST, 4, 1), (HOST, 5, 1), (HOST, 6, 1)],
+            evicted: vec![],
+            encodings: None,
+            parts: vec![0b11, 0b01, 0b10],
+        };
+        stating.map(0, RequestId(1), &store, &stored).unwrap();
+        let copy = stating.start_copy().unwrap();
+        assert_eq!(
+            copy.runs,
+            [
+                ((DEVICE, 1, 1), (HOST, 4, 1)),
+                ((DEVICE, 3, 1), (HOST, 6, 1))
+            ]
+        );
+
+        // Parts stated for some keys and not others say nothing a rank can follow.
+        let short = Completion::Copy {
+            group: GROUP,
+            keys: keys(3),
+            from: vec![(DEVICE, 1, 1), (DEVICE, 2, 1), (DEVICE, 3, 1)],
+            to: vec![(HOST, 4, 1), (HOST, 5, 1), (HOST, 6, 1)],
+            evicted: vec![],
+            encodings: None,
+            parts: vec![0b11],
+        };
+        assert!(stating.map(0, RequestId(2), &store, &short).is_err());
+
+        // A rank whose host part is none of the group's writes none; a group that states no host
+        // part has every rank write its own.
+        let mut outside = tables().with_parts(&[(HOST, None)]);
+        outside.map(0, RequestId(3), &store, &stored).unwrap();
+        assert_eq!(outside.start_copy().unwrap().runs, []);
+        let mut unstated = tables();
+        unstated.map(0, RequestId(4), &store, &stored).unwrap();
+        assert_eq!(unstated.start_copy().unwrap().runs.len(), 3);
+    }
+
     #[test]
     fn pinned_and_loaded_entries_are_never_writable() {
         let mut tables = tables();
@@ -1341,6 +1593,7 @@ mod tests {
             to: vec![(DEVICE, 31, 1)],
             evicted: vec![],
             encodings: None,
+            parts: Vec::new(),
         };
         tables.map(1, RequestId(5), &clone, &copy).unwrap();
 
@@ -1378,6 +1631,7 @@ mod tests {
             to: vec![(HOST, 0, 1), (HOST, 1, 1)],
             evicted: vec![],
             encodings: None,
+            parts: Vec::new(),
         };
         tables.map(0, RequestId(10), &store, &copy).unwrap();
         load(&mut tables, 11, 1, 0, &[(HOST, 2, 1)], &[(DEVICE, 7, 1)]).unwrap();
@@ -1390,6 +1644,7 @@ mod tests {
             to: vec![(HOST, 5, 1)],
             evicted: vec![],
             encodings: None,
+            parts: Vec::new(),
         };
         assert!(tables.map(0, RequestId(12), &store, &unstated).is_err());
 
@@ -1568,6 +1823,7 @@ mod tests {
             to: vec![(DEVICE, 7, 1)],
             evicted: vec![],
             encodings: None,
+            parts: Vec::new(),
         };
         tables.map(1, RequestId(5), &request, &completion).unwrap();
         assert_eq!(tables.slot(OwnerId(1)), None);
@@ -1675,6 +1931,7 @@ mod tests {
             to: vec![(OTHER_PRODUCTS, 20, 3)],
             evicted: vec![],
             encodings: None,
+            parts: Vec::new(),
         };
         tables.map(1, RequestId(3), &encoded, &loaded).unwrap();
         let store = Request::Store {
@@ -1689,6 +1946,7 @@ mod tests {
             to: vec![(HOST, 3, 3)],
             evicted: vec![],
             encodings: None,
+            parts: Vec::new(),
         };
         tables.map(0, RequestId(4), &store, &stored).unwrap();
 
@@ -1785,6 +2043,7 @@ mod tests {
             to: vec![(OTHER_PRODUCTS, 0, 3)],
             evicted: vec![],
             encodings: Some(([1; 32], [2; 32])),
+            parts: Vec::new(),
         };
         tables.map(1, RequestId(3), &load, &copy).unwrap();
         assert_eq!(

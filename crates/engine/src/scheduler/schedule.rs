@@ -1946,6 +1946,7 @@ mod tests {
             to: vec![(4, 1, 1)],
             evicted: Vec::new(),
             encodings: None,
+            parts: Vec::new(),
         };
         bench.complete(load, &copied);
         assert_eq!(bench.answers().len(), 1);

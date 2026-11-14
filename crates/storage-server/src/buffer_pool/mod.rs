@@ -757,6 +757,21 @@ impl BufferPool {
         parts.unwrap_or(0)
     }
 
+    /// The host parts `written`, bits of a block's validity, as a copy's
+    /// answer names them (`Completion::Copy::parts`): a bit for each host
+    /// part the group copies the class with, in the order of their hosts'
+    /// names and then their part indices, set where `written` holds it.
+    fn stated_parts(&self, client: ClientId, group: GroupId, class: u8, written: u64) -> u64 {
+        let parts = self.parts(client, group, class);
+        let mut bits: Vec<u32> = (0..u64::BITS).filter(|bit| parts & 1 << bit != 0).collect();
+        // A bit no session named (a pool opened without a layout) orders by its number.
+        bits.sort_by_key(|bit| (self.memories.get(*bit as usize), *bit));
+        (0..)
+            .zip(bits)
+            .filter(|(_, bit)| written & 1 << bit != 0)
+            .fold(0, |all, (index, _)| all | 1 << index)
+    }
+
     /// R11: whether a group's owners may load or restore a host copy: it
     /// holds every host part the group copies the class with.
     fn loadable(&self, client: ClientId, group: GroupId, class: u8, host: &Block) -> bool {

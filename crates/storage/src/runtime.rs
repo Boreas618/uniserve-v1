@@ -21,10 +21,16 @@
 //! session keeps its version for its life, and a new request or completion
 //! is a new version, which an engine adopts at its next epoch. An engine
 //! speaks the version of its build, [`VERSION`]; a Storage Server speaks
-//! that one and the one before, [`OLDEST`], so that a server restarted in
-//! place into the next build goes on serving every session the previous one
-//! opened, and reads and writes each session's records in its version
-//! ([`Request::decode_as`], [`Completion::encode_as`]). What version 2 lacks:
+//! every version from [`OLDEST`] to that one, so that a server restarted in
+//! place into the next build goes on serving every session the builds before
+//! it opened, and reads and writes each session's records in its version
+//! ([`Request::decode_as`], [`Completion::encode_as`]). What version 3 lacks:
+//!
+//! - a [`Completion::Copy`] of version 3 names no host parts a copy writes:
+//!   every rank of the group writes its own part, also one that holds the
+//!   copy already.
+//!
+//! What version 2 lacks besides:
 //!
 //! - an [`Open`] of version 2 states no memory of a region, no receiving
 //!   region and no host part of a group: its regions' units exist in every
@@ -41,11 +47,13 @@ use serde::{Deserialize, Serialize};
 use crate::{Error, Key, Result, Segment};
 
 /// The version of this interface that this build's engine speaks.
-pub const VERSION: u32 = 3;
+pub const VERSION: u32 = 4;
 
-/// The earliest version a Storage Server of this build serves: the one
-/// before [`VERSION`]. An `Open` of an earlier version is refused.
-pub const OLDEST: u32 = VERSION - 1;
+/// The earliest version a Storage Server of this build serves, which the
+/// engines of the builds before it speak: version 2, before crossings, and
+/// version 3, before a copy's host parts. An `Open` of an earlier version is
+/// refused.
+pub const OLDEST: u32 = 2;
 
 /// A request's number on its queue pair, drawn by the scheduler from a
 /// counter and never reused.
@@ -485,6 +493,17 @@ pub enum Completion {
     /// the class's, and the copies go through the copy manifest of the two.
     /// A host run states the same units in every rank's part, so each rank
     /// reaches every part of the source the manifest has it read.
+    ///
+    /// `parts` states, for a copy to the host (a `Store` or a `Save`), per
+    /// key, the host parts it writes: a bit for each of the group's host
+    /// parts of the key's class ([`Group::parts`]), in the order of their
+    /// hosts' names and then of their part indices, whatever order the
+    /// layout states them in. A rank whose host part's bit is clear does not
+    /// write it: a store that
+    /// fills a host copy writes only the parts that do not hold it. It is
+    /// empty for a copy that writes no host part, and a bit stands for no
+    /// part of a group that states none of the class, whose ranks each write
+    /// their own.
     Copy {
         group: GroupId,
         keys: Vec<Key>,
@@ -492,6 +511,7 @@ pub enum Completion {
         to: Vec<Run>,
         evicted: Vec<Key>,
         encodings: Option<([u8; 32], [u8; 32])>,
+        parts: Vec<u64>,
     },
     Cloned,
     Loaded,
@@ -716,6 +736,10 @@ pub fn number(record: &[u8]) -> Option<RequestId> {
 /// [`Completion::Replicated`]), the group of a prefetch and the host groups
 /// of a listing: a record of an earlier version has none of them.
 const CROSSINGS: u32 = 3;
+
+/// The version that added the host parts a copy writes
+/// ([`Completion::Copy`]): a record of an earlier version names none.
+const COPIED_PARTS: u32 = 4;
 
 /// Whether this build reads and writes records of `version`.
 ///
@@ -1082,7 +1106,8 @@ impl Completion {
 
     /// Appends the record of this completion of request `id` to `record`,
     /// in `version`, one of [`OLDEST`] to [`VERSION`]: a field the version
-    /// lacks is left out (a listing's host groups before version 3). A
+    /// lacks is left out (a listing's host groups before version 3, a copy's
+    /// host parts before version 4). A
     /// completion the version lacks is written as this build writes it,
     /// which a reader of that version refuses; the buffer pool answers no
     /// request of a session with one, since the session's version has no
@@ -1123,6 +1148,7 @@ impl Completion {
                 to,
                 evicted,
                 encodings,
+                parts,
             } => {
                 writer.byte(8);
                 writer.byte(group.0);
@@ -1135,6 +1161,12 @@ impl Completion {
                 if let Some((source, destination)) = encodings {
                     writer.digest(source);
                     writer.digest(destination);
+                }
+                if version >= COPIED_PARTS {
+                    writer.word(parts.len() as u32);
+                    for written in parts {
+                        writer.long(*written);
+                    }
                 }
             }
             Self::Cloned => writer.byte(9),
@@ -1202,7 +1234,8 @@ impl Completion {
     }
 
     /// Reads a completion and the number of the request it answers from a
-    /// record of `version`: a listing of version 2 states no host groups.
+    /// record of `version`: a listing of version 2 states no host groups, and
+    /// a copy before version 4 no host parts.
     ///
     /// # Errors
     ///
@@ -1256,6 +1289,13 @@ impl Completion {
                     Some((reader.digest()?, reader.digest()?))
                 } else {
                     None
+                },
+                parts: if version >= COPIED_PARTS {
+                    (0..reader.length(8)?)
+                        .map(|_| reader.long())
+                        .collect::<Result<_>>()?
+                } else {
+                    Vec::new()
                 },
             },
             9 => Self::Cloned,
@@ -1465,6 +1505,7 @@ mod tests {
                 to: vec![(0, 3, 1)],
                 evicted: vec![],
                 encodings: None,
+                parts: vec![],
             },
             Completion::Copy {
                 group: GroupId(0),
@@ -1473,6 +1514,7 @@ mod tests {
                 to: vec![(1, 2, 1)],
                 evicted: vec![key(4)],
                 encodings: Some(([5; 32], [6; 32])),
+                parts: vec![0b10],
             },
             Completion::Cloned,
             Completion::Loaded,
@@ -1594,7 +1636,7 @@ mod tests {
         listing.encode(RequestId(8), &mut current);
         assert!(Completion::decode_as(&current, 2).is_err());
 
-        // A crossing and its answer are of version 3 only.
+        // A crossing and its answer are of version 3 on.
         let mut crossing = Vec::new();
         Request::Replicate {
             owner: OwnerId(1),
@@ -1609,6 +1651,34 @@ mod tests {
         let mut answer = Vec::new();
         Completion::Replicated { runs: vec![] }.encode(RequestId(9), &mut answer);
         assert!(Completion::decode_as(&answer, 2).is_err());
+    }
+
+    /// Version 3's copies name no host parts: a copy read in it writes every rank's part, and
+    /// the parts a version-4 copy names are left out of its record.
+    #[test]
+    fn a_copy_of_version_3_names_no_host_parts() {
+        let copy = |parts| Completion::Copy {
+            group: GroupId(1),
+            keys: vec![key(2)],
+            from: vec![(4, 0, 1)],
+            to: vec![(0, 3, 1)],
+            evicted: vec![],
+            encodings: None,
+            parts,
+        };
+        let mut earlier = Vec::new();
+        copy(vec![0b10]).encode_as(3, RequestId(4), &mut earlier);
+        assert_eq!(
+            Completion::decode_as(&earlier, 3).unwrap(),
+            (RequestId(4), copy(Vec::new()))
+        );
+        let mut current = Vec::new();
+        copy(vec![0b10]).encode(RequestId(4), &mut current);
+        assert_eq!(
+            Completion::decode(&current).unwrap(),
+            (RequestId(4), copy(vec![0b10]))
+        );
+        assert!(Completion::decode_as(&current, 3).is_err());
     }
 
     #[test]

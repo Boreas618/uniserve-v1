@@ -216,6 +216,7 @@ fn started(
         to: vec![to],
         evicted: vec![],
         encodings,
+        parts: Vec::new(),
     };
     tables
         .map(0, runtime::RequestId(id), request, &copy)

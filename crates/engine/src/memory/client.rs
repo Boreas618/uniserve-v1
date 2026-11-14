@@ -904,6 +904,135 @@ impl StorageClient {
             client.host_part(region.to_owned(), part, bytes, numa_node)
         })
     }
+
+    /// The storage of the device region `region` whose units exist once, in this rank's memory
+    /// (a media rank's product buffer, `storage::runtime::Region::memory`): `parts` parts of
+    /// `units` units of `unit_bytes` each, back to back on `device` and addressed by `access`
+    /// too, each a segment of `length` bytes, whole allocation granules that hold its units.
+    /// The Storage Server retains each part as an exclusive storage of the rank's scope and
+    /// epoch, so its Transfer Server reads and writes the region's units for a crossing between
+    /// two processes (`storage::runtime::Request::Replicate`); its quota counts them as the
+    /// rank's exclusive storage. A part a restart of the epoch left is mapped again. Returns the
+    /// storage and where its units lie, a run per part in order: what the rank places
+    /// ([`Self::place`]).
+    ///
+    /// # Errors
+    ///
+    /// A part too short for its units, the driver's refusal, or the server's (the GPU's quota
+    /// cannot hold the parts) or the connection's failure; nothing stays retained.
+    pub(crate) fn region_storage(
+        &self,
+        region: &str,
+        device: DeviceId,
+        (parts, units, unit_bytes, length): (u32, u32, u64, usize),
+        access: &[DeviceId],
+    ) -> Result<(Arc<Storage>, Vec<UnitRun>)> {
+        if u64::from(units).saturating_mul(unit_bytes) > length as u64 {
+            return Err(Error::Invalid(format!(
+                "a part of region {region} of {length} bytes holds no {units} units of \
+                 {unit_bytes}"
+            )));
+        }
+        let scope = self.rank_scope()?;
+        let mut state = lock(&self.state);
+        let state = &mut *state;
+        let gpu = state.gpu(device)?;
+
+        // Each part an exclusive storage named by the region and its index, of the rank's epoch.
+        let names: Vec<String> = (0..parts).map(|part| format!("{region}#{part}")).collect();
+        let keys: Vec<Key> = names
+            .iter()
+            .map(|name| storage::key::exclusive(scope, name, length as u64, &gpu, self.epoch))
+            .collect();
+        let (got, descriptors) = state
+            .client
+            .get(keys.clone(), Mode::Region, Vec::new())
+            .map_err(|error| storage_error("taking a region's storage", error))?;
+        let mut found: BTreeMap<Key, OwnedFd> = BTreeMap::new();
+        let mut held: Vec<Option<OwnedFd>> = descriptors.into_iter().map(Some).collect();
+        for tensor in &got.tensors {
+            let descriptor = held
+                .get_mut(tensor.storage as usize)
+                .and_then(Option::take)
+                .ok_or_else(|| Error::Interface("a retained storage was named twice".into()))?;
+            found.insert(tensor.key, descriptor);
+        }
+
+        let storage = Storage::segmented(device, &vec![length; keys.len()], access)?;
+        let mut tensors = Vec::new();
+        let mut made = Vec::new();
+        for (index, (key, name)) in keys.iter().zip(&names).enumerate() {
+            match found.remove(key) {
+                Some(descriptor) => storage.import_segment(index, &descriptor)?,
+                None => {
+                    let mut tensor =
+                        byte_tensor(*key, name.clone(), 0, length as u64, Access::Exclusive);
+                    // Each tensor lies in the storage of the same position in the request.
+                    tensor.storage = u32::try_from(made.len())
+                        .map_err(|_| Error::Invalid("a region has too many parts".into()))?;
+                    tensors.push(tensor);
+                    made.push(storage.create_segment(index)?);
+                }
+            }
+        }
+
+        // The parts created here are published together, as storage of no cache segment; until
+        // then they are this storage's alone, which drops them if the server refuses.
+        if !made.is_empty() {
+            let record = StorageRecord {
+                location: Location::Device { gpu },
+                bytes: length as u64,
+                segment: None,
+                fabric: None,
+            };
+            let storages: Vec<_> = made
+                .iter()
+                .map(|descriptor| (record, descriptor.as_fd()))
+                .collect();
+            state
+                .client
+                .put(tensors, &storages)
+                .map_err(|error| storage_error("publishing a region's storage", error))?;
+        }
+        state.taken.extend(keys.iter().copied());
+
+        let runs = keys
+            .iter()
+            .zip(0..)
+            .map(|(key, part)| UnitRun {
+                field: region.to_owned(),
+                key: *key,
+                location: Location::Device { gpu },
+                first: part * units,
+                count: units,
+                offset: 0,
+                bytes: unit_bytes,
+            })
+            .collect();
+        Ok((storage, runs))
+    }
+
+    /// Gives back the parts of a storage [`Self::region_storage`] took whose runs are `runs`,
+    /// each with its index in the storage: they are unmapped here at once, and their storage is
+    /// freed once no other process maps it. The caller has retired every device access to them.
+    ///
+    /// # Errors
+    ///
+    /// The driver's refusal, or the server's or the connection's failure.
+    pub(crate) fn release_region_storage(
+        &self,
+        storage: &Storage,
+        runs: &[(usize, &UnitRun)],
+    ) -> Result<()> {
+        let mut state = lock(&self.state);
+        let mut given = BTreeSet::new();
+        for (index, run) in runs {
+            storage.release_segment(*index)?;
+            state.taken.remove(&run.key);
+            given.insert(run.key);
+        }
+        self.release_keys(&mut state, &given, "giving back a region's storage")
+    }
 }
 
 /// The buffer pool's statement of `runs`: each run of a field of the rank's units, with the GPU

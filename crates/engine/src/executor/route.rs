@@ -259,8 +259,8 @@ impl Route {
     /// Applies `requests` to the device block tables of every rank of `group` and stamps them:
     /// the submission completes with the requests, each with the group's stamp, the largest over
     /// its ranks of the number of the last job each had launched when it applied them. The
-    /// requests are those the workers stamp: `Release`, `Detach`, `Commit`, `Transfer`, and the
-    /// `Finish { ok: false }` that gives a copy up.
+    /// requests are those the workers stamp: `Release`, `Detach`, `Commit`, `Transfer`,
+    /// `Replicate`, and the `Finish { ok: false }` that gives a copy up.
     ///
     /// # Errors
     ///
@@ -510,6 +510,7 @@ fn stamped(request: &Request) -> bool {
             | Request::Detach { .. }
             | Request::Commit { .. }
             | Request::Transfer { .. }
+            | Request::Replicate { .. }
             | Request::Finish { ok: false, .. }
     )
 }
