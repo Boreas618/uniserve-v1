@@ -148,9 +148,22 @@ class Change:
       which succeeds on a 2xx answer;
     - ``signal`` (a name such as ``SIGSTOP``) to the one process of the
       deployment whose command line, its arguments joined by spaces,
-      ``process`` matches (``re.search``);
+      ``process`` matches (``re.search``); with ``host``, to the one process
+      of this user on that host whose command line matches, found and
+      signalled there over ``ssh``;
     - ``command``, run in the deployment's environment and working
-      directory, which succeeds on exit status 0.
+      directory, which succeeds on exit status 0;
+    - ``cancel``, that many of a closed loop's streams in flight
+      disconnected by the client at once: the earliest issued, or with
+      ``cancel_order = "newest"`` the latest issued. Their requests are
+      recorded as ``CANCELLED`` and the streams go on with their next
+      requests.
+
+    ``configuration`` names the configuration the deployment serves once
+    the change ended, when the change moves it to another: an epoch's
+    switch names its target, a rollback the configuration it returns to.
+    ``check-change`` compares a request with the control of a configuration
+    it may have ended on.
     """
 
     name: str
@@ -163,7 +176,11 @@ class Change:
     body: dict[str, Any] | None = None
     signal: str | None = None
     process: str | None = None
+    host: str | None = None
     command: tuple[str, ...] = ()
+    cancel: int | None = None
+    cancel_order: str = "oldest"
+    configuration: str | None = None
 
     def __post_init__(self) -> None:
         """Validate the change's time and its one action."""
@@ -180,10 +197,16 @@ class Change:
         if self.after is None and (self.phase is not None or self.delay_s):
             raise ValueError("phase and delay_s count from the change after")
 
-        actions = (self.path is not None, self.signal is not None)
-        if sum(actions) + bool(self.command) != 1:
+        actions = (
+            self.path is not None,
+            self.signal is not None,
+            bool(self.command),
+            self.cancel is not None,
+        )
+        if sum(actions) != 1:
             raise ValueError(
-                "a change states exactly one of path, signal and command"
+                "a change states exactly one of path, signal, command and "
+                "cancel"
             )
         if self.path is not None and not self.path.startswith("/"):
             raise ValueError("path must be an absolute URL path")
@@ -200,6 +223,25 @@ class Change:
                 re.compile(self.process)
             except re.error as error:
                 raise ValueError(f"process is not a pattern: {error}") from None
+        # A host is an ssh destination; one that starts with "-" would be
+        # read as an option.
+        if self.host is not None and (
+            self.signal is None or not self.host or self.host.startswith("-")
+        ):
+            raise ValueError("host names the host of a signal's process")
+
+        if self.cancel is not None and (
+            isinstance(self.cancel, bool)
+            or not isinstance(self.cancel, int)
+            or self.cancel < 1
+        ):
+            raise ValueError("cancel must be a positive number of streams")
+        if self.cancel_order not in {"oldest", "newest"}:
+            raise ValueError('cancel_order must be "oldest" or "newest"')
+        if self.cancel_order != "oldest" and self.cancel is None:
+            raise ValueError("cancel_order applies only with cancel")
+        if self.configuration is not None and not self.configuration:
+            raise ValueError("configuration must be a non-empty name")
 
     @property
     def calls_admin(self) -> bool:
@@ -728,6 +770,12 @@ class DecodedVideo:
         }
 
 
+# The classifier of a request a timeline load's `cancel` change disconnected:
+# the change's doing, which a point leaves out of its metrics and validation
+# and `check-change` out of its items.
+CANCELLED = "cancelled"
+
+
 @dataclass
 class RequestRecord:
     """Accumulates transport, timing, usage, and decoded-output observations.
@@ -863,6 +911,11 @@ class RequestRecord:
         """Mark the request successful."""
         self.success = True
         self.classifier = "ok"
+
+    def mark_cancelled(self) -> None:
+        """Close the request now as one its client disconnected on purpose."""
+        self.close_now()
+        self.mark_failure(CANCELLED, "the client disconnected the stream")
 
     def mark_transport_exception(self, error: BaseException) -> None:
         """Close and classify an exception raised by the transport path."""

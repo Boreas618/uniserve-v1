@@ -23,8 +23,10 @@ from the load's start:
 - ``issue_end_s``: when issuing stopped;
 - ``changes``: per change, its declaration, ``issued_s`` and ``ended_s``,
   and what answered it: an HTTP ``status`` and ``answer``, the signalled
-  ``pid`` and its ``cmdline``, or a command's ``returncode`` and
-  ``output``; ``error`` when it failed;
+  ``pid`` and its ``cmdline`` (on the declared ``host`` for a remote
+  signal), a command's ``returncode`` and ``output``, or the issue indices
+  of the requests a cancel disconnected, ``cancelled``; ``error`` when it
+  failed;
 - ``events``: each admin event as served, with ``received_s`` and its own
   ``time`` as ``at_s``; a failed read of the log leaves its ``error``.
 """
@@ -37,6 +39,7 @@ import json
 import math
 import os
 import re
+import shlex
 import time
 from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import asdict
@@ -69,6 +72,7 @@ async def run_timeline(
     load: LoadConfig,
     changes: Sequence[Change],
     submit: Submit[T],
+    cancelled: Callable[[Example, float], T],
     deployment: ManagedDeployment | None,
     record: dict[str, Any],
     warmup_requests: int,
@@ -79,7 +83,10 @@ async def run_timeline(
     """Run excluded warmup, then the timeline load and its changes.
 
     Warmup is ``run_load``'s. ``deployment`` is what the changes act on and
-    whose admin events are read; without one, a change fails.
+    whose admin events are read; without one, a change other than a cancel
+    fails. ``cancelled`` makes the output of a request a cancel change
+    disconnected, from its row and its submission time; it takes that
+    request's place among the outputs.
 
     Returns:
         Warmup and measured outputs, the latter in issue order, and the
@@ -174,6 +181,46 @@ async def run_timeline(
             reached = await phase_reached(change.phase, reference["issued_s"])
         return reached + change.delay_s
 
+    # A closed loop's requests in flight, by issue index, each a task of its
+    # own; and the indices a cancel change disconnected.
+    flight: dict[int, asyncio.Task[T]] = {}
+    disconnected: set[int] = set()
+
+    async def disconnect(count: int, order: str) -> dict[str, Any]:
+        """Cancel `count` requests in flight at once, by issue `order`.
+
+        Cancelling a request's task closes its connection mid-stream, as a
+        client that goes away does. The change ends once every one of them
+        has ended.
+        """
+        live = sorted(
+            index for index, task in flight.items() if not task.done()
+        )
+        if len(live) < count:
+            raise RuntimeError(
+                f"{len(live)} streams are in flight, fewer than {count}"
+            )
+        chosen = live[:count] if order == "oldest" else live[-count:]
+        tasks = [flight[index] for index in chosen]
+        disconnected.update(chosen)
+        for task in tasks:
+            task.cancel()
+        await asyncio.wait(tasks)
+
+        answer: dict[str, Any] = {
+            "cancelled": [
+                index
+                for index, task in zip(chosen, tasks, strict=True)
+                if task.cancelled()
+            ]
+        }
+        if len(answer["cancelled"]) != count:
+            answer["error"] = (
+                f"{count - len(answer['cancelled'])} requests ended before "
+                "their cancellation"
+            )
+        return answer
+
     async def apply(change: Change) -> None:
         """Wait for the change's time, act, and record its answer."""
         nonlocal pending, last_end
@@ -182,7 +229,11 @@ async def run_timeline(
             at = await time_of(change)
             await asyncio.sleep(max(0.0, at - since()))
             entry["issued_s"] = since()
-            entry.update(await _act(change, deployment, load.request_timeout_s))
+            if change.cancel is not None:
+                answer = await disconnect(change.cancel, change.cancel_order)
+            else:
+                answer = await _act(change, deployment, load.request_timeout_s)
+            entry.update(answer)
         except Exception as error:  # noqa: BLE001 - recorded as the change's.
             entry["error"] = f"{type(error).__name__}: {error}"
         finally:
@@ -195,11 +246,29 @@ async def run_timeline(
     counter = itertools.count()
 
     async def stream() -> None:
-        """Issue one closed-loop stream's requests, one after another."""
+        """Issue one closed-loop stream's requests, one after another.
+
+        A request a cancel change disconnected ends with its `cancelled`
+        output and the stream goes on. Cancelling the stream itself cancels
+        the request it awaits.
+        """
         while issuing():
             index = next(counter)
             row = rows[index % len(rows)]
-            outputs[index] = await submit(row, time.perf_counter())
+            submitted = time.perf_counter()
+            request = asyncio.create_task(submit(row, submitted))
+            flight[index] = request
+            try:
+                outputs[index] = await request
+            except asyncio.CancelledError:
+                current = asyncio.current_task()
+                if index not in disconnected or (
+                    current is not None and current.cancelling()
+                ):
+                    raise
+                outputs[index] = cancelled(row, submitted)
+            finally:
+                del flight[index]
 
     async def arrive(index: int, scheduled: float) -> None:
         outputs[index] = await limited(rows[index % len(rows)], scheduled)
@@ -247,6 +316,8 @@ async def _act(
     A failed action raises, or, when it was answered, returns its answer
     with an ``error``.
     """
+    if change.host is not None:
+        return await _signal_on_host(change, timeout_s)
     if deployment is None:
         raise RuntimeError("no deployment to change")
     if change.path is not None:
@@ -305,15 +376,7 @@ async def _act(
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.STDOUT,
     )
-    try:
-        async with asyncio.timeout(timeout_s):
-            output, _ = await process.communicate()
-    finally:
-        # A command that outlives its change, timed out or cancelled, ends
-        # with it.
-        if process.returncode is None:
-            process.kill()
-            await process.wait()
+    output, _ = await _communicate(process, None, timeout_s)
     answer = {
         "returncode": process.returncode,
         "output": output.decode(errors="replace"),
@@ -321,6 +384,96 @@ async def _act(
     if process.returncode != 0:
         answer["error"] = f"exit status {process.returncode}"
     return answer
+
+
+# Run by `python3` on the host a remote signal names: signals the one process
+# of this user, other than itself and its parent, whose command line (its
+# arguments joined by spaces) the pattern matches, and prints every match as
+# JSON. The pattern and the signal arrive on standard input, so no command
+# line on that host carries the pattern.
+_SIGNAL_ON_HOST = """
+import json, os, re, signal, sys
+
+request = json.load(sys.stdin)
+pattern = re.compile(request["process"])
+matches = []
+for name in os.listdir("/proc"):
+    if not name.isdigit() or int(name) in (os.getpid(), os.getppid()):
+        continue
+    try:
+        if os.stat(f"/proc/{name}").st_uid != os.getuid():
+            continue
+        with open(f"/proc/{name}/cmdline", "rb") as handle:
+            arguments = handle.read()
+    except OSError:
+        continue
+    joined = arguments.rstrip(b"\\0").replace(b"\\0", b" ")
+    line = joined.decode(errors="replace")
+    if line and pattern.search(line):
+        matches.append([int(name), line])
+if len(matches) == 1:
+    os.kill(matches[0][0], signal.Signals[request["signal"]])
+json.dump(matches, sys.stdout)
+"""
+
+
+async def _signal_on_host(change: Change, timeout_s: float) -> dict[str, Any]:
+    """Signal the one process on ``change.host`` that its pattern matches.
+
+    The search and the signal run on that host over ``ssh`` in batch mode,
+    which never prompts: the host must accept this user's key.
+    """
+    assert change.host is not None and change.signal is not None
+    remote = shlex.join(["python3", "-c", _SIGNAL_ON_HOST])
+    process = await asyncio.create_subprocess_exec(
+        "ssh",
+        "-o",
+        "BatchMode=yes",
+        change.host,
+        remote,
+        stdin=asyncio.subprocess.PIPE,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    request = json.dumps({"process": change.process, "signal": change.signal})
+    output, errors = await _communicate(process, request.encode(), timeout_s)
+    if process.returncode != 0:
+        raise RuntimeError(
+            f"ssh {change.host} exited with status {process.returncode}: "
+            f"{errors.decode(errors='replace').strip()}"
+        )
+
+    matches = json.loads(output)
+    if len(matches) != 1:
+        raise RuntimeError(
+            f"{len(matches)} processes on {change.host} match "
+            f"{change.process!r}: {matches}"
+        )
+    pid, line = matches[0]
+    return {"host": change.host, "pid": pid, "cmdline": line}
+
+
+async def _communicate(
+    process: asyncio.subprocess.Process, data: bytes | None, timeout_s: float
+) -> tuple[bytes, bytes]:
+    """Feed ``data`` to a child, read its output to its exit, and return it.
+
+    Returns:
+        Its standard output and standard error; either is empty when it was
+        not piped.
+
+    Raises:
+        TimeoutError: The child outlived ``timeout_s``. A child that times
+            out, or whose change is cancelled, is killed and reaped first.
+    """
+    try:
+        async with asyncio.timeout(timeout_s):
+            output, errors = await process.communicate(data)
+    finally:
+        if process.returncode is None:
+            process.kill()
+            await process.wait()
+    return output or b"", errors or b""
 
 
 async def _read_events(

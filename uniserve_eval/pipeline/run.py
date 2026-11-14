@@ -58,6 +58,7 @@ from ..tasks import get_task
 from ..tasks.video import VideoTask
 from ..transport import send_request
 from ..types import (
+    CANCELLED,
     BenchmarkPoint,
     Example,
     RequestRecord,
@@ -94,7 +95,9 @@ async def run_point(
         The summary and bundle directory. A point whose validation fails
         still returns normally, with `validation.valid` false. A point with
         changes is valid only if every change was applied
-        (`changes_applied`).
+        (`changes_applied`); the requests a cancel change disconnected
+        (classified `CANCELLED`) stay in `requests.jsonl`, are left out of
+        its metrics and validation, and are counted as `cancelled_count`.
 
     Raises:
         FileExistsError: If `output_dir` or the point's `video.media_dir`
@@ -207,6 +210,19 @@ async def run_point(
             timeout=aiohttp.ClientTimeout(total=timeout_s),
         ) as session:
 
+            def requested_output_len(example: Example) -> int:
+                """The output length a request of `example` asks for.
+
+                It becomes the record's `requested_output_len`, and is 0
+                when neither the row nor `sampling.max_tokens` declares an
+                output limit.
+                """
+                return int(
+                    example.output_len
+                    if example.output_len is not None
+                    else point.sampling.max_tokens or 0
+                )
+
             async def submit(
                 example: Example, scheduled: float | None
             ) -> RequestRecord:
@@ -219,14 +235,6 @@ async def run_point(
                 if request is None:
                     request = task.build_request(example)
 
-                # The fallback becomes the record's `requested_output_len`;
-                # it is 0 when neither the row nor `sampling.max_tokens`
-                # declares an output limit.
-                output_len_fallback = int(
-                    example.output_len
-                    if example.output_len is not None
-                    else point.sampling.max_tokens or 0
-                )
                 # Routing happens inside the submission slot, so a request
                 # waits on its chosen replica like on any queueing server.
                 with router.route() as base_url:
@@ -237,7 +245,7 @@ async def run_point(
                         request_id=example.id,
                         task=point.task.value,
                         prompt_len=int(example.prompt_len or 0),
-                        output_len_fallback=output_len_fallback,
+                        output_len_fallback=requested_output_len(example),
                         scheduled_time=scheduled,
                         timeout_s=timeout_s,
                     )
@@ -253,6 +261,25 @@ async def run_point(
                     priming_records.append(record)
                 else:
                     records.append(record)
+                return record
+
+            def cancelled(example: Example, submitted: float) -> RequestRecord:
+                """The record of a request a timeline's cancel disconnected.
+
+                It holds the request's row and times; what the stream had
+                received before the cancel is not kept.
+                """
+                record = RequestRecord(
+                    request_id=example.id,
+                    task=point.task.value,
+                    endpoint=point.endpoint,
+                    scheduled_time=submitted,
+                    start_time=submitted,
+                    requested_output_len=requested_output_len(example),
+                )
+                record.mark_cancelled()
+                record.example = examples[id(example)]
+                records.append(record)
                 return record
 
             async def snapshot_metrics() -> None:
@@ -301,6 +328,7 @@ async def run_point(
                         load=point.load,
                         changes=point.changes,
                         submit=submit,
+                        cancelled=cancelled,
                         deployment=deployment,
                         record=timeline,
                         warmup_requests=warmup_requests,
@@ -342,10 +370,16 @@ async def run_point(
                 session, router.base_urls[0]
             )
 
+        # A request a cancel change disconnected is the change's doing, not
+        # a failure of the point: it is counted apart and left out of the
+        # metrics and the validation.
+        served = [
+            record for record in records if record.classifier != CANCELLED
+        ]
         summary = build_summary(
             point,
             router.base_urls,
-            records,
+            served,
             duration,
             task=task,
             selected_rows=selection,
@@ -353,6 +387,8 @@ async def run_point(
             server_version=server_version,
             launch=launch_record,
         )
+        if point.changes:
+            summary["cancelled_count"] = len(records) - len(served)
         checks = summary["validation"]["checks"]
         if priming_records:
             checks["priming_valid"] = all(

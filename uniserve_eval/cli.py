@@ -10,7 +10,12 @@ from pathlib import Path
 
 from .artifacts import supersede
 from .config import DEFAULT_CONFIG, load_config, server_launch
-from .pipeline.check import change_report, render_change_report
+from .pipeline.check import (
+    change_report,
+    fault_report,
+    render_change_report,
+    render_fault_report,
+)
 from .pipeline.compare import compare_runs
 from .pipeline.run import run_point
 from .pipeline.setup import (
@@ -243,11 +248,17 @@ def check_change(args: argparse.Namespace) -> None:
     and 1 when a bundle or the verdict file cannot be read.
     """
     try:
+        configurations = dict(args.control_of)
+        if len(configurations) != len(args.control_of):
+            raise ValueError("a configuration has one control")
         report = change_report(
             args.run,
             args.control,
             check_metric=args.check_metric,
             replay=args.replay,
+            configurations=configurations,
+            switch=args.switch,
+            block_size=args.block_size,
         )
     except (OSError, ValueError, KeyError) as error:
         print(f"uniserve-eval check-change: {error}", file=sys.stderr)
@@ -257,6 +268,36 @@ def check_change(args: argparse.Namespace) -> None:
     print(json.dumps(report, sort_keys=True))
     if not report["pass"]:
         raise SystemExit(2)
+
+
+def check_faults(args: argparse.Namespace) -> None:
+    """Check a timeline run of faults against its rows served alone.
+
+    Writes and prints as `check_change` does, with the same exit statuses.
+    """
+    try:
+        report = fault_report(
+            args.run,
+            args.reference,
+            check_metric=args.check_metric,
+            replay=args.replay,
+        )
+    except (OSError, ValueError, KeyError) as error:
+        print(f"uniserve-eval check-faults: {error}", file=sys.stderr)
+        raise SystemExit(1) from error
+    result = args.result or args.run / "result.md"
+    result.write_text(render_fault_report(report), encoding="utf-8")
+    print(json.dumps(report, sort_keys=True))
+    if not report["pass"]:
+        raise SystemExit(2)
+
+
+def _named_path(value: str) -> tuple[str, Path]:
+    """Parse `NAME=PATH`, a configuration's control."""
+    name, separator, path = value.partition("=")
+    if not separator or not name or not path:
+        raise argparse.ArgumentTypeError(f"{value!r} is not NAME=PATH")
+    return name, Path(path)
 
 
 def _log_path(
@@ -312,13 +353,31 @@ def build_parser() -> argparse.ArgumentParser:
 
     # `check-change` reads two completed timeline bundles, a run of changes
     # and its control, and the evidence of the buffer pool's invariants.
+    # Each `--control-of NAME=PATH` is the control of a configuration the
+    # run's changes move to; `--switch NAME` with `--block-size` adds case
+    # E4's item.
     command = subparsers.add_parser("check-change")
     command.add_argument("run", type=Path)
     command.add_argument("--control", type=Path, required=True)
+    command.add_argument(
+        "--control-of", type=_named_path, action="append", default=[]
+    )
+    command.add_argument("--switch")
+    command.add_argument("--block-size", type=int)
     command.add_argument("--check-metric", required=True)
     command.add_argument("--replay", type=Path, required=True)
     command.add_argument("--result", type=Path)
     command.set_defaults(function=check_change)
+
+    # `check-faults` reads a timeline bundle of faults, the bundle of its
+    # rows served alone, and the evidence of the buffer pool's invariants.
+    command = subparsers.add_parser("check-faults")
+    command.add_argument("run", type=Path)
+    command.add_argument("--reference", type=Path, required=True)
+    command.add_argument("--check-metric", required=True)
+    command.add_argument("--replay", type=Path, required=True)
+    command.add_argument("--result", type=Path)
+    command.set_defaults(function=check_faults)
     return parser
 
 

@@ -26,6 +26,7 @@ directory.
 
 from __future__ import annotations
 
+import math
 import os
 import re
 import tomllib
@@ -717,7 +718,8 @@ def _changes(
     Names are unique and an `after` names a change declared before it, so
     the references form no cycle. A change that calls the admin listener
     or waits for its events requires the point's server to state
-    `admin_socket`.
+    `admin_socket`. A `cancel` disconnects streams of a closed loop
+    (`request_rate = inf`), at most as many as it runs.
     """
     if raw is None:
         return ()
@@ -758,6 +760,14 @@ def _changes(
             raise ValueError(
                 f"{where} uses the admin listener, and servers."
                 f"{server.name} states no admin_socket"
+            )
+        if change.cancel is not None and (
+            not math.isinf(load.request_rate)
+            or change.cancel > (load.max_concurrency or 0)
+        ):
+            raise ValueError(
+                f"{where}.cancel disconnects at most the max_concurrency "
+                "streams of a closed loop (request_rate = inf)"
             )
         changes.append(change)
     return tuple(changes)
