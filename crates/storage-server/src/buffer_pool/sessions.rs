@@ -779,12 +779,15 @@ impl BufferPool {
     /// committed stays cached, and what its tasks hold stays held until
     /// they end (R9).
     pub fn close(&mut self, client: ClientId) {
-        let mine: Vec<_> = self
+        let mut mine: Vec<_> = self
             .copies
             .keys()
             .filter(|(queue, _)| queue.0 == client)
             .copied()
             .collect();
+        // In the order of their requests, not of the hash table: what the
+        // pool frees and stops follows its inputs alone (§18).
+        mine.sort_unstable();
         for task in mine {
             let run_by_worker = self.copies[&task]
                 .iter()

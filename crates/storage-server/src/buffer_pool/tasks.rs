@@ -956,23 +956,28 @@ impl BufferPool {
     /// brought, a transfer when its task has ended. R9: the blocks a task
     /// holds stay held until its end. Returns whether a task passed its
     /// deadline.
+    ///
+    /// The tasks that pass their deadlines at one tick are stopped and
+    /// answered in the order of their deadlines, then of their requests: the
+    /// pool is deterministic in its inputs (`specs/buffer-pool.md` §18), so
+    /// nothing it produces may follow the order of a hash table.
     pub fn tick(&mut self, now: u64) -> bool {
         self.now = now;
         let late = |copies: &Vec<Copy>| {
             copies
                 .first()
                 .and_then(|copy| copy.deadline)
-                .is_some_and(|deadline| deadline <= now)
+                .filter(|deadline| *deadline <= now)
         };
-        let due: Vec<(QueueId, RequestId)> = self
+        let mut due: Vec<(u64, (QueueId, RequestId))> = self
             .copies
             .iter()
-            .filter(|(_, copies)| late(copies))
-            .map(|(task, _)| *task)
+            .filter_map(|(task, copies)| late(copies).map(|deadline| (deadline, *task)))
             .collect();
+        due.sort_unstable();
         let passed = !due.is_empty();
 
-        for task in due {
+        for (_, task) in due {
             let Some(copies) = self.copies.get_mut(&task) else {
                 continue;
             };

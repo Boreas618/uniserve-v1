@@ -97,15 +97,20 @@ impl Fixture {
     /// As [`Self::new`], the prefill group copying with the host parts
     /// `prefill` and the decode group with `decode`.
     fn with_parts(prefill: u64, decode: u64) -> Self {
-        Self::built(prefill, decode, 4)
+        Self::built(prefill, decode, 4, 2)
     }
 
     /// As [`Self::new`], with `units` KV units (1 to `units`).
     fn with_units(units: u32) -> Self {
-        Self::built(PART, PART, units)
+        Self::built(PART, PART, units, 2)
     }
 
-    fn built(prefill: u64, decode: u64, units: u32) -> Self {
+    /// As [`Self::new`], with `host` host KV units.
+    fn with_host_units(host: u32) -> Self {
+        Self::built(PART, PART, 4, host)
+    }
+
+    fn built(prefill: u64, decode: u64, units: u32, host: u32) -> Self {
         let mut pool = BufferPool::new((1_000, 1_000));
         for space in 0..8 {
             pool.grant(space, 0, 1 << 20);
@@ -117,7 +122,7 @@ impl Fixture {
         pool.open_region("prefill rows", Tier::Device, 1, (8, 8), 1, 2, 3);
         pool.open_region("decode rows", Tier::Device, 2, (8, 8), 1, 2, 3);
         assert_eq!(
-            pool.open_region("host", Tier::Host, 3, (64, 64), 0, 2, 2),
+            pool.open_region("host", Tier::Host, 3, (64, 64), 0, host, host),
             HOST
         );
         assert_eq!(
@@ -1505,6 +1510,58 @@ fn a_prefetch_brings_the_leading_keys_into_the_host_tier_by_its_deadline() {
             evicted: Vec::new()
         })
     );
+}
+
+#[test]
+fn tasks_past_their_deadlines_at_one_tick_are_answered_in_the_order_of_their_deadlines() {
+    // Eight prefetches of one key each, the later submitted with the earlier
+    // deadline, all past their deadlines at one tick: the pool answers and
+    // stops them in the order of their deadlines, whatever order its tables
+    // keep them in, so a replay of its inputs produces the same completions.
+    let mut fixture = Fixture::with_host_units(8);
+    let ids: Vec<RequestId> = (0..8u64)
+        .map(|index| {
+            fixture.submit(
+                QUEUE,
+                Request::Prefetch {
+                    group: PREFILL,
+                    class: KV,
+                    units: 0,
+                    keys: vec![key(10 + index as u8)],
+                    source: Source::Peers,
+                    deadline: 80 - 10 * index,
+                },
+            )
+        })
+        .collect();
+    assert_eq!(fixture.pool.started().len(), 8);
+
+    fixture.pool.tick(100);
+    fixture.checked();
+    let answered: Vec<RequestId> = fixture
+        .pool
+        .completions()
+        .into_iter()
+        .map(|(_, request, completion)| {
+            assert_eq!(
+                completion,
+                Completion::Prefetched {
+                    found: 0,
+                    evicted: Vec::new()
+                }
+            );
+            request
+        })
+        .collect();
+    let by_deadline: Vec<RequestId> = ids.iter().rev().copied().collect();
+    assert_eq!(answered, by_deadline);
+    let stopped: Vec<RequestId> = fixture
+        .pool
+        .stopped()
+        .into_iter()
+        .map(|(_, request)| request)
+        .collect();
+    assert_eq!(stopped, by_deadline);
 }
 
 #[test]
