@@ -468,12 +468,16 @@ def outside_state(state, regions):
 
 ARRIVE = {"release", "detach", "commit", "finish", "transfer", "replicate"}
 STUTTER = {"victims", "list", "unreadable", "limits", "hold", "release-peer", "grant", "withdraw"}
-OUTSIDE = {"open", "close", "image"}
+OUTSIDE = {"open", "image"}
 ACTS = {"attach": ["Attach"], "allocate": ["Allocate"], "pin": ["Pin"], "clone": ["Clone"],
         "load": ["Load"], "save": ["Save", "EvictHost"], "restore": ["Restore"], "evict": ["Evict"],
         "completed": ["Advance"], "tick": ["Deadline"], "done": ["PrefetchEnd", "PutEnd"],
         "ended": ["TransferEnd", "ReplicateEnd", "PrefetchEnd", "PutEnd"], "publish": ["CommitUpdate"],
-        "roll-back": ["Rollback", "Evict", "EvictHost"], "resize": ["Evict", "Shrink", "Grow"]}
+        "roll-back": ["Rollback", "Evict", "EvictHost"],
+        # A session's end: its engine is lost (every stamp of its groups
+        # counts as reached, as `Advance`s of their words), and the device
+        # regions no other session names close, their cached blocks evicted.
+        "close": ["Lose", "Advance", "Evict", "Shrink"], "resize": ["Evict", "Shrink", "Grow"]}
 
 
 def acts(text):
@@ -675,9 +679,15 @@ def projected(state, part, witnesses, rename):
     full = {fact[1] for fact in part if fact[0] == "f"}
     lines = [f"free {' '.join(sorted(rename(unit) for unit in units if unit in state.free))}"]
     lines += [f"epoch {rename(epoch, 'e')} {is_} trial={trial}" for epoch, (is_, trial) in sorted(state.epochs.items())]
+    # An epoch the window knows that the state does not state: its session
+    # is closed, and its update was committed or rolled back.
+    lines += [f"epoch {rename(epoch, 'e')} closed trial=unstated" for epoch in rename.epochs
+              if epoch not in state.epochs]
     for owner in sorted({fact[1] for fact in part if fact[0] == "h"}):
         if owner not in state.owners:
-            lines.append(f"owner {rename(owner, 'o')} new")
+            # The owners of a closed session are not stated: gone, or never attached.
+            is_ = "new" if state.epochs.get(epoch_of(owner), ("closed",))[0] == "open" else "gone"
+            lines.append(f"owner {rename(owner, 'o')} {is_}")
             continue
         is_, group, slot, entries = state.owners[owner]
         if is_ != "live":
@@ -773,6 +783,7 @@ class Renaming:
         for region, numbers in by_region.items():
             for index, number in enumerate(sorted(numbers)):
                 self.names[("u", f"{region}:{number}")] = f"{region}:{index + 1}"
+        self.epochs = list(epochs)
         for index, epoch in enumerate(epochs):
             self.names[("e", epoch)] = f"e{index + 1}"
         by_epoch = collections.defaultdict(list)
@@ -1295,8 +1306,9 @@ def check(job):
         "GroupMemory": "<- TraceGroupMemory", "UnitRegion": "<- TraceUnitRegion",
         "UnitChunk": "<- TraceUnitChunk", "GroupRegion": "<- TraceGroupRegion",
         "InitialUnits": "<- TraceUnits", "Movable": "<- TraceUnits", "TrialEpochs": "= {}",
+        "Losable": "<- TraceEpochs",
         "MaxBatch": f"= {batches}", "MaxRequests": "= 1", "MaxCopies": f"= {copies}",
-        "MaxTasks": f"= {tasks}", "Losable": "= {}", "Hazards": "= {}", "Eager": "= TRUE",
+        "MaxTasks": f"= {tasks}", "Hazards": "= {}", "Eager": "= TRUE",
         "Rules": "<- TraceRules", "Windows": "<- TraceWindows", "HostParts": "<- TraceHostParts",
         "GroupParts": "<- TraceGroupParts", "Readers": "<- TraceReaders",
     }
@@ -1342,6 +1354,11 @@ def input_record(item, groups, owners, positions, keys, rank):
     completed = Fn((group, 0) for group in groups)
     if kind == "completed":
         completed[named_values["g"]] = rank[int(named_values["value"])]
+    if kind == "close":
+        # The groups of the session that ends: every stamp of theirs reached.
+        for group in groups:
+            if epoch_of(group) == named_values["e"]:
+                completed[group] = max(rank.values())
     order, korder = Seq(item["order"]), Seq(item["korder"])
     evict, evicthost = Seq(item["evict"]), Seq(item["evicthost"])
     return Rec(acts=Set(acts(text)), os=Set([named_values["o"]]) if "o" in named_values else Set(owners),

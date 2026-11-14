@@ -7,7 +7,7 @@
 # (the enumeration's forged.steps: a commit that takes effect before its
 # stamp) is reported. Prints one line per check and exits non-zero when one
 # fails. agreement.sh compares the sets of states; this compares the steps.
-#   agreement_steps.sh [core|copies|transfer|tiers|cross|parts]...
+#   agreement_steps.sh [core|copies|transfer|tiers|cross|parts|trial]...
 # The enumeration and TLC's runs are kept in $AGREEMENT_WORK (default: a
 # temporary directory).
 set -u

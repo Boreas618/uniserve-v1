@@ -81,12 +81,21 @@ TaskLine(t) ==
 Waiting(kind) == {d \in deferred : d.kind = kind}
 
 \* Whether the model's state is the recorded state `st`.
+\* The groups of the epochs whose engine is gone, and their slot rows: a
+\* session that ends takes its groups and closes the regions of its slot rows.
+GoneGroups == {g \in Groups : GroupEpoch[g] \in lost}
+
 Matches(st) ==
     /\ ncopy = st.ncopy
-    /\ launched = st.completed
-    /\ free = st.free
-    \* Each epoch's trial, and whether its engine is gone (its session closed).
-    /\ \A e \in Epochs : trial[e] = st.epochs[e].trial /\ (e \in lost) = (st.epochs[e].is = "closed")
+    /\ [g \in Groups \ GoneGroups |-> launched[g]] = st.completed
+    /\ free \ {s \in Slots : SlotGroup[s] \in GoneGroups} = st.free
+    \* Each epoch's trial, and whether its engine is gone (its session
+    \* closed). An epoch a state does not state is gone, its update committed
+    \* or rolled back.
+    /\ \A e \in Epochs :
+         IF st.epochs[e].trial = "unstated"
+         THEN e \in lost /\ trial[e] \in {"no", "rolled"}
+         ELSE trial[e] = st.epochs[e].trial /\ (e \in lost) = (st.epochs[e].is = "closed")
     /\ \A o \in Owners :
          IF ostate[o] = "live"
          THEN st.owners[o] =
@@ -102,7 +111,8 @@ Matches(st) ==
     \* visible to alone (R8).
     /\ st.keys =
          {[k |-> y, d |-> Shown(cache[y]), h |-> Shown(hcache[y]), r |-> IF y \in remote THEN 1 ELSE 0,
-           vd |-> Shown(vis[y].d), vh |-> Shown(vis[y].h)] :
+           vd |-> IF cache[y] = NONE THEN "-" ELSE Shown(vis[y].d),
+           vh |-> IF hcache[y] = NONE THEN "-" ELSE Shown(vis[y].h)] :
             y \in {x \in Keys : cache[x] # NONE \/ hcache[x] # NONE \/ x \in remote}}
     \* The memories of every device block an owner, the cache or a waiting
     \* commit holds, and the host parts of every cached host block.
@@ -206,7 +216,7 @@ Start(x) ==
        /\ valid = [b \in Units \cup HostUnits |->
                      IF b \in stated THEN (CHOOSE v \in st.valid : v[1] = b)[2] ELSE {}]
        /\ ncopy = st.ncopy
-       /\ launched = st.completed
+       /\ launched = [g \in Groups |-> IF g \in DOMAIN st.completed THEN st.completed[g] ELSE 0]
        /\ inflight = {}
        /\ handoff = {}
        /\ requests = {}
@@ -251,7 +261,7 @@ Start(x) ==
                                 ELSE LET e == CHOOSE f \in keyed(y) : TRUE
                                      IN [d |-> IF e.vd = "-" THEN NONE ELSE e.vd,
                                          h |-> IF e.vh = "-" THEN NONE ELSE e.vh]]
-       /\ trial = [e \in Epochs |-> st.epochs[e].trial]
+       /\ trial = [e \in Epochs |-> IF st.epochs[e].trial = "unstated" THEN "no" ELSE st.epochs[e].trial]
        /\ dbt = [g \in Groups |-> [o \in Owners |-> [q \in Rows |-> NoEntry]]]
        /\ alloc = [b \in AllUnits |-> IF \E y \in Keys : cache[y] = b \/ hcache[y] = b
                                       THEN "shared" ELSE NONE]
@@ -385,6 +395,8 @@ Step(in) ==
     \/ "Grow" \in in.acts /\ \E u \in Units : Grow(u) /\ UNCHANGED rare
     \* A prefetch of several keys brings them in order, as the Rust buffer
     \* pool's task does.
+    \* A session's end: its engine is lost (A7).
+    \/ "Lose" \in in.acts /\ \E e \in Epochs \cap {in.req.e} : Lose(e)
     \/ "Prefetch" \in in.acts /\ \E g \in in.gs :
          LET i == FirstToFetch(in.korder, 1)
          IN i > 0 /\ Prefetch(in.korder[i], "remote", g)

@@ -9,9 +9,11 @@
 //! The configurations are those of `MC_Pool` there, one per [`Shape`]: one
 //! key and one position, one or two owners, a prefill group and for
 //! transfers, crossings and host parts a decode group, with a memory each
-//! and the host parts the shape states. The bounds are the model's:
-//! `completed` goes up to 1, a sequence makes as many copies as the shape
-//! states, and one prefetch or put is in flight at a time.
+//! and the host parts the shape states; or, for an update, two sessions of
+//! two layouts, the second on trial, each with a group and a region of its
+//! own over one device memory. The bounds are the model's: `completed` goes
+//! up to 1, a sequence makes as many copies as the shape states, and one
+//! prefetch or put is in flight at a time.
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fmt::Write as _;
@@ -27,6 +29,15 @@ const TRAJECTORY: u8 = 1;
 const UNITS: u8 = 0;
 const SESSION: u32 = 1;
 const QUEUE: (u32, u16) = (SESSION, 0);
+/// The second session of the shape `trial`: the target of an update, of
+/// another layout, on trial, with its region over the first's memory.
+const TARGET: u32 = 2;
+const TARGET_QUEUE: (u32, u16) = (TARGET, 0);
+/// The regions of the shape `trial`: the serving session's KV units and
+/// slot rows, the target's KV units over the same memory space and with
+/// units of the same size (unit `i` of either occupies the same bytes) and
+/// its slot rows, and the host units.
+const TARGET_UNITS: u8 = 2;
 
 /// The model's bound `MaxBatch`.
 const MAX_COMPLETED: u64 = 1;
@@ -53,9 +64,15 @@ struct Shape {
     /// The host parts each group copies with, as bits of a block's validity
     /// after the groups' memories (the model's `GroupParts`).
     parts: [u64; 2],
+    /// Whether the shape is an update's: owner 1 of the serving session's
+    /// group and owner 1 of a target session of another layout, on trial,
+    /// whose update is committed, or whose engine is lost and whose update
+    /// is rolled back, and memory that moves between the two layouts'
+    /// regions by `Resize` (the model's `MC_PoolTrial`).
+    trial: bool,
 }
 
-const SHAPES: [Shape; 6] = [
+const SHAPES: [Shape; 7] = [
     Shape {
         name: "core",
         owners: 2,
@@ -68,6 +85,7 @@ const SHAPES: [Shape; 6] = [
         tiers: false,
         crossings: false,
         parts: [1 << 1, 0],
+        trial: false,
     },
     Shape {
         name: "copies",
@@ -81,6 +99,7 @@ const SHAPES: [Shape; 6] = [
         tiers: false,
         crossings: false,
         parts: [1 << 1, 0],
+        trial: false,
     },
     Shape {
         name: "transfer",
@@ -94,6 +113,7 @@ const SHAPES: [Shape; 6] = [
         tiers: false,
         crossings: false,
         parts: [1 << 2, 1 << 2],
+        trial: false,
     },
     Shape {
         name: "tiers",
@@ -107,6 +127,7 @@ const SHAPES: [Shape; 6] = [
         tiers: true,
         crossings: false,
         parts: [1 << 1, 0],
+        trial: false,
     },
     // Two memories, the decode group's reading what owners of the prefill
     // group hold: crossings, with the transfers, commits and detaches they
@@ -124,6 +145,7 @@ const SHAPES: [Shape; 6] = [
         tiers: false,
         crossings: true,
         parts: [1 << 2, 1 << 2],
+        trial: false,
     },
     // Two host parts: the prefill group's ranks on one host, the decode
     // group's on that host and another. One owner and one unit, so that
@@ -140,6 +162,27 @@ const SHAPES: [Shape; 6] = [
         tiers: false,
         crossings: false,
         parts: [1 << 2, 1 << 2 | 1 << 3],
+        trial: false,
+    },
+    // An update: the serving session's group and a target session's, of
+    // another layout and on trial, each with an owner and a region of its
+    // own over one device memory: one unit of memory, in the serving
+    // session's region at first, that either region can hold. The target's
+    // update is committed, or its engine is lost and its update rolled back;
+    // the memory moves between the regions by `Resize`.
+    Shape {
+        name: "trial",
+        owners: 2,
+        groups: 1,
+        rows: 1,
+        units: 1,
+        host_units: 0,
+        copies: 0,
+        transfers: false,
+        tiers: false,
+        crossings: false,
+        parts: [1 << 2, 1 << 2],
+        trial: true,
     },
 ];
 
@@ -164,7 +207,15 @@ enum Step {
     Replicate(u64, u8),
     /// The `Finish` of the n-th copy a worker runs, with its result.
     Finish(usize, bool, u8),
-    Advance(u8),
+    /// The `completed` word of a session's group.
+    Advance(u32, u8),
+    /// A region resized to so many units.
+    Resize(u8, u32),
+    /// The target's update committed; its session ended (its engine lost);
+    /// its update rolled back.
+    Publish,
+    Close,
+    RollBack,
     Prefetch,
     Put,
     Deadline,
@@ -196,6 +247,9 @@ impl Driver {
     /// The regions are the KV units, then each group's slot rows, then the
     /// host units; units and rows are numbered from 1, host units from 0.
     fn new(shape: Shape) -> Self {
+        if shape.trial {
+            return Self::update(shape);
+        }
         let host = shape.groups + 1;
         let classes = vec![
             Class {
@@ -276,6 +330,131 @@ impl Driver {
         driver
     }
 
+    /// The shape `trial`: the serving session (epoch 1) with its group in
+    /// region 0 of the shape's units and slot rows in region 1, and the
+    /// target (epoch 2, on trial) of another layout, its group addressing
+    /// memory of its own, with region 2 over region 0's memory space and
+    /// units of the same size, its one unit over region 0's last unit and
+    /// empty at first, and slot rows in region 3; host region 4.
+    fn update(shape: Shape) -> Self {
+        let host = 4;
+        let classes = || {
+            vec![
+                Class {
+                    units: 1,
+                    host: Some((host, 1)),
+                    state_in_slot: false,
+                    tensors: [0; 32],
+                    encoding: [0; 32],
+                },
+                Class {
+                    units: 0,
+                    host: Some((host, 0)),
+                    state_in_slot: false,
+                    tensors: [1; 32],
+                    encoding: [0; 32],
+                },
+            ]
+        };
+        let mut pool = BufferPool::new((1_000, 1_000));
+        for space in 0..=3 {
+            pool.grant(space, 0, 1 << 16);
+        }
+        pool.open_region(
+            "units a",
+            Tier::Device,
+            0,
+            (64, 64),
+            1,
+            shape.units,
+            shape.units + 1,
+        );
+        pool.open_region(
+            "rows a",
+            Tier::Device,
+            1,
+            (8, 8),
+            1,
+            shape.rows,
+            shape.rows + 1,
+        );
+        // The target's one unit, numbered as the serving region's last and
+        // over its bytes.
+        pool.open_region(
+            "units b",
+            Tier::Device,
+            0,
+            (64, 64),
+            shape.units,
+            0,
+            shape.units + 1,
+        );
+        pool.open_region(
+            "rows b",
+            Tier::Device,
+            2,
+            (8, 8),
+            1,
+            shape.rows,
+            shape.rows + 1,
+        );
+        pool.open_region("host", Tier::Host, 3, (64, 64), 0, 0, 0);
+        let group = |memory: u8, slots: u8, units: u8| {
+            let parts = shape.parts[usize::from(memory)];
+            Group {
+                parts: vec![parts, parts],
+                ..Group::new(memory, slots, vec![vec![units], Vec::new()])
+            }
+        };
+        pool.open(
+            SESSION,
+            1,
+            false,
+            (classes(), TRAJECTORY),
+            vec![(GroupId(0), group(0, 1, UNITS))],
+        );
+        pool.open(
+            TARGET,
+            2,
+            true,
+            (classes(), TRAJECTORY),
+            vec![(GroupId(0), group(1, 3, TARGET_UNITS))],
+        );
+
+        let mut driver = Self {
+            shape,
+            pool,
+            number: 0,
+            copies: 0,
+        };
+        for (queue, region) in [(QUEUE, UNITS), (TARGET_QUEUE, TARGET_UNITS)] {
+            let victims = driver.request_on(
+                queue,
+                Request::Victims {
+                    region,
+                    keys: vec![key()],
+                },
+            );
+            driver.act(&victims);
+        }
+        driver
+    }
+
+    /// Whether the target's session is open.
+    fn target_open(&self) -> bool {
+        self.shape.trial && self.pool.sessions.contains_key(&TARGET)
+    }
+
+    /// The queue pair an owner of the shape's numbering takes requests on,
+    /// and its number there: the target's owner is its session's owner 1.
+    fn queue_of(&self, owner: u64) -> ((u32, u16), OwnerId) {
+        if self.shape.trial && owner == 2 {
+            (TARGET_QUEUE, OwnerId(1))
+        } else {
+            (QUEUE, OwnerId(owner))
+        }
+    }
+
     /// A second driver in the same state: the enumeration branches from a
     /// state without replaying the steps that led to it, by making the
     /// pool again from its image.
@@ -292,10 +471,15 @@ impl Driver {
     /// A request on the queue pair, under the next number, as the buffer
     /// pool's thread takes it.
     fn request(&mut self, request: Request) -> Input {
+        self.request_on(QUEUE, request)
+    }
+
+    /// A request on `queue`, under the next number.
+    fn request_on(&mut self, queue: (u32, u16), request: Request) -> Input {
         self.number += 1;
         let mut record = Vec::new();
         request.encode(RequestId(self.number), &mut record);
-        Input::Request(QUEUE, record)
+        Input::Request(queue, record)
     }
 
     /// Acts on an input as the buffer pool's thread does, and counts the
@@ -351,6 +535,9 @@ impl Driver {
         let mut steps = vec![Step::Evict];
         let room = self.copies < shape.copies;
         for owner in 1..=shape.owners {
+            if shape.trial && owner == 2 && !self.target_open() {
+                continue;
+            }
             steps.extend((0..shape.groups).map(|group| Step::Attach(owner, group)));
             steps.extend([Step::Allocate(owner), Step::Pin(owner)]);
             if room {
@@ -379,8 +566,37 @@ impl Driver {
             if room {
                 steps.push(Step::Store(group));
             }
-            if self.pool.groups[&(SESSION, GroupId(group))].completed < MAX_COMPLETED {
-                steps.push(Step::Advance(group));
+            for client in [SESSION, TARGET] {
+                let found = self.pool.groups.get(&(client, GroupId(group)));
+                if found.is_some_and(|found| found.completed < MAX_COMPLETED) {
+                    steps.push(Step::Advance(client, group));
+                }
+            }
+        }
+        if shape.trial {
+            // Memory moves by a unit at a time between the two regions.
+            for region in [UNITS, TARGET_UNITS] {
+                if region == TARGET_UNITS && !self.target_open() {
+                    continue;
+                }
+                let now = self.pool.regions[usize::from(region)].units();
+                if now > 0 {
+                    steps.push(Step::Resize(region, now - 1));
+                }
+                let room = if region == TARGET_UNITS {
+                    1
+                } else {
+                    shape.units
+                };
+                if now < room {
+                    steps.push(Step::Resize(region, now + 1));
+                }
+            }
+            match self.pool.trial.get(&2) {
+                Some(true) if self.target_open() => steps.extend([Step::Publish, Step::Close]),
+                Some(true) => steps.push(Step::RollBack),
+                _ if self.target_open() => steps.push(Step::Close),
+                _ => {}
             }
         }
         for copy in 0..self.in_flight(false).len() {
@@ -410,7 +626,29 @@ impl Driver {
     /// Takes a step: the input it is in this state, acted on as the buffer
     /// pool's thread acts on it. Returns the input.
     fn apply(&mut self, step: Step) -> Input {
-        let owner = OwnerId;
+        // An owner's request goes on its session's queue pair, under its
+        // number there.
+        let named = match step {
+            Step::Attach(o, _)
+            | Step::Allocate(o)
+            | Step::Pin(o)
+            | Step::Clone(o)
+            | Step::Load(o)
+            | Step::Save(o)
+            | Step::Restore(o)
+            | Step::Release(o, _)
+            | Step::Detach(o, _)
+            | Step::Commit(o, _)
+            | Step::Transfer(o, _, _)
+            | Step::Replicate(o, _) => Some(self.queue_of(o)),
+            _ => None,
+        };
+        let queue = match step {
+            Step::Resize(TARGET_UNITS, _) => TARGET_QUEUE,
+            Step::Finish(copy, ..) => self.in_flight(false)[copy].0,
+            _ => named.map_or(QUEUE, |(queue, _)| queue),
+        };
+        let owner = |_: u64| named.map_or(OwnerId(0), |(_, owner)| owner);
         let request = match step {
             Step::Attach(o, group) => Request::Attach {
                 owner: owner(o),
@@ -506,17 +744,21 @@ impl Driver {
                 keys: vec![key()],
                 tier: Tier::Remote,
             },
-            Step::Advance(group) => {
-                let completed = self.pool.groups[&(SESSION, GroupId(group))].completed;
-                return self.acted(Input::Completed(SESSION, GroupId(group), completed + 1));
+            Step::Advance(client, group) => {
+                let completed = self.pool.groups[&(client, GroupId(group))].completed;
+                return self.acted(Input::Completed(client, GroupId(group), completed + 1));
             }
+            Step::Resize(region, units) => Request::Resize { region, units },
+            Step::Publish => return self.acted(Input::Publish(2)),
+            Step::Close => return self.acted(Input::Close(TARGET)),
+            Step::RollBack => return self.acted(Input::RollBack(2)),
             Step::Deadline => return self.acted(Input::Tick(u64::MAX - 1)),
             Step::Done(task) => return self.acted(Input::Done(self.in_flight(true)[task], 64)),
             Step::Ended(task, ok) => {
                 return self.acted(Input::Ended(self.in_flight(true)[task], ok));
             }
         };
-        let input = self.request(request);
+        let input = self.request_on(queue, request);
         self.acted(input)
     }
 
@@ -528,7 +770,7 @@ impl Driver {
     /// The state in the terms of the design model, one line per fact.
     fn state(&self) -> String {
         let owners: Vec<_> = (1..=self.shape.owners)
-            .map(|number| (QUEUE, OwnerId(number)))
+            .map(|number| self.queue_of(number))
             .collect();
         stated(&self.pool, &owners, self.copies)
     }

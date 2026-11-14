@@ -594,6 +594,9 @@ pub fn replay(inputs: &Path, mut states: Option<&mut dyn Write>) -> Result<u64, 
                 }
             }
         }
+        // The input as the pool it acts on names it: a closing session's
+        // epoch is named before it closes.
+        let text = stated_input(&pool, input);
         apply(&mut pool, input).map_err(|error| format!("{}: {error}", named(&pool)))?;
         if let Input::Image(_) = input {
             // The tasks a pool started and the run did not record are gone with it.
@@ -627,7 +630,7 @@ pub fn replay(inputs: &Path, mut states: Option<&mut dyn Write>) -> Result<u64, 
         write(format!(
             "step {} {replayed} {}\n{}state {replayed}\n{}\n{}\n\n",
             replayed - 1,
-            stated_input(&pool, input),
+            text,
             if changes_layout {
                 layout(&pool)
             } else {
@@ -664,7 +667,7 @@ pub(crate) fn stated_input(pool: &BufferPool, input: &Input) -> String {
     match input {
         Input::Image(_) => "image".into(),
         Input::Open(..) => "open".into(),
-        Input::Close(_) => "close".into(),
+        Input::Close(client) => format!("close e={}", session(pool, *client)),
         Input::Request(queue, record) => match Request::decode_as(record, version(pool, *queue)) {
             Ok((_, request)) => stated_request(&request, &session(pool, queue.0)),
             Err(_) => "unreadable".into(),

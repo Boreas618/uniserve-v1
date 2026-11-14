@@ -33,6 +33,9 @@ NAMES = {
     "tiers": {"u1": "0:1", "sa": "1:1", "h1": "2:0"},
     "cross": {"u1": "0:1", "sa": "1:1", "sc": "2:1"},
     "parts": {"u1": "0:1", "sa": "1:1", "sc": "2:1", "h1": "3:0"},
+    # The serving session's KV unit (region 0) and slot row (region 1), the
+    # target's KV unit over the same memory (region 2) and its slot row (3).
+    "trial": {"a1": "0:1", "b1": "2:1", "sa": "1:1", "sc": "3:1"},
 }
 # The bits of a block's validity in the Rust configuration of each shape: each
 # group's memory (the model's `GroupMemory[g] = g`), then the host parts.
@@ -43,16 +46,23 @@ MEMORIES = {
     "tiers": {"ga": "m0", "hp": "m1"},
     "cross": {"ga": "m0", "gb": "m1", "hp": "m2"},
     "parts": {"ga": "m0", "gb": "m1", "pa": "m2", "pb": "m3"},
+    "trial": {"ga": "m0", "gb": "m1", "hp": "m2"},
 }
 # The host parts each group's ranks copy with in each shape (the model's
 # `GroupParts`): the one part in all but `parts`.
-GROUP_PARTS = {shape: {"ga": ["hp"], "gb": ["hp"]} for shape in ("core", "copies", "transfer", "tiers", "cross")}
+GROUP_PARTS = {shape: {"ga": ["hp"], "gb": ["hp"]}
+               for shape in ("core", "copies", "transfer", "tiers", "cross", "trial")}
 GROUP_PARTS["parts"] = {"ga": ["pa"], "gb": ["pa", "pb"]}
-# The enumeration's one session is of the epoch 1 (the model's `e1`): its
-# groups and owners are named under it.
-GROUPS = {"ga": "e1.g0", "gb": "e1.g1"}
+# The enumeration's session is of the epoch 1 (the model's `e1`), its groups
+# and owners named under it; in `trial` the target's session is of the epoch
+# 2, with the decode group gb as its group and o2 as its owner 1.
+GROUPS = {shape: {"ga": "e1.g0", "gb": "e1.g1"} for shape in NAMES}
+GROUPS["trial"] = {"ga": "e1.g0", "gb": "e2.g0"}
+OWNERS = {shape: {"o1": "e1.1", "o2": "e1.2"} for shape in NAMES}
+OWNERS["trial"] = {"o1": "e1.1", "o2": "e2.1"}
 MEMORY_BITS = {"ga": 0, "gb": 1}
-OWNERS = {"o1": "e1.1", "o2": "e1.2"}
+# The model's slot rows and their groups (`MCSlotGroup` of MC_Pool).
+SLOT_GROUPS = {"sa": "ga", "sb": "ga", "sc": "gb", "sd": "gb"}
 
 TOKEN = re.compile(r'\s*(<<|>>|\|->|:>|@@|[{}\[\](),]|"[^"]*"|[A-Za-z0-9_]+)')
 
@@ -140,19 +150,34 @@ def project(state, shape):
     bits = lambda found: ",".join(sorted((memory[name] for name in found), key=lambda bit: int(bit[1:])))
     unit = lambda name: names[name]
     units = lambda found: " ".join(sorted(unit(name) for name in found))
-    group = lambda name: GROUPS[name]
+    groups_of, owners_of = GROUPS[shape], OWNERS[shape]
+    group = lambda name: groups_of[name]
+    # A lost epoch's session has ended: its groups, their slot rows and its
+    # owners are no longer stated.
+    lost = set(state["lost"])
+    gone = lambda name: epoch_of(name) in lost
     lines = [f"ncopy {state['ncopy']}"]
 
     launched = state["launched"]
-    lines.append("completed " + " ".join(f"{group(name)}={launched[name]}" for name in sorted(launched)))
-    lines.append(f"free {runs(unit(name) for name in state['free'])}".rstrip())
-    # Each epoch's trial and whether its session is closed.
+    lines.append("completed " + " ".join(f"{group(name)}={launched[name]}" for name in sorted(launched)
+                                         if not gone(group(name))))
+    free = [name for name in state["free"] if name not in SLOT_GROUPS or not gone(group(SLOT_GROUPS[name]))]
+    lines.append(f"free {runs(unit(name) for name in free)}".rstrip())
+    # Each epoch stated: an open session's, one still on trial, or one that
+    # made a copy still cached (R8); with its trial and whether its session
+    # is closed.
+    made = {state["vis"][key]["d"] for key in state["cache"] if state["cache"][key] != "none"}
+    made |= {state["vis"][key]["h"] for key in state["hcache"] if state["hcache"][key] != "none"}
     for epoch in sorted(state["trial"]):
-        lines.append(f"epoch {epoch} {'closed' if epoch in state['lost'] else 'open'} trial={state['trial'][epoch]}")
+        if epoch in lost and state["trial"][epoch] != "yes" and epoch not in made:
+            continue
+        lines.append(f"epoch {epoch} {'closed' if epoch in lost else 'open'} trial={state['trial'][epoch]}")
 
     held, hosts = set(), set()
     for owner in sorted(state["ostate"]):
-        number = OWNERS[owner]
+        number = owners_of[owner]
+        if gone(number):
+            continue
         if state["ostate"][owner] != "live":
             lines.append(f"owner {number} {state['ostate'][owner]}")
             continue
@@ -169,8 +194,10 @@ def project(state, shape):
         if device != "none" or host != "none" or remote:
             shown = lambda name: "-" if name == "none" else unit(name)
             # The epoch on trial each copy is visible to alone (R8), or `-`.
-            made = state["vis"][key]
-            vd, vh = ("-" if made[tier] == "none" else made[tier] for tier in ("d", "h"))
+            # A copy that is not there is visible to no one in particular.
+            maker = state["vis"][key]
+            vd = "-" if device == "none" or maker["d"] == "none" else maker["d"]
+            vh = "-" if host == "none" or maker["h"] == "none" else maker["h"]
             lines.append(f"key {KEY} d={shown(device)} h={shown(host)} remote={remote} vd={vd} vh={vh}")
         if device != "none":
             held.add(device)
@@ -186,14 +213,14 @@ def project(state, shape):
         kind = copy["kind"]
         owner = position = memory = "-"
         if kind in ("clone", "load"):
-            owner, position = str(OWNERS[copy["o"]]), "0"
+            owner, position = str(owners_of[copy["o"]]), "0"
             memory = f"m{MEMORY_BITS[copy['g']]}"
         elif kind == "restore":
-            owner = str(OWNERS[copy["o"]])
+            owner = str(owners_of[copy["o"]])
         elif kind == "save":
             # The owner whose slot it reads, while that owner is there.
             live = state["ostate"][copy["o"]] == "live" and state["oslot"][copy["o"]] == copy["read"]
-            owner = str(OWNERS[copy["o"]]) if live else "-"
+            owner = str(owners_of[copy["o"]]) if live else "-"
         fill = int(copy["fill"] == "TRUE" and kind in ("load", "store"))
         # The key a copy caches its block under; a clone and a restore cache none.
         key = KEY if kind in ("load", "store", "save") else "-"
@@ -213,7 +240,7 @@ def project(state, shape):
 
     def pending(after):
         """The stamps `completed` has not reached, by group."""
-        waits = sorted((GROUPS[name], int(at)) for name, at in after.items() if int(at) > int(launched[name]))
+        waits = sorted((group(name), int(at)) for name, at in after.items() if int(at) > int(launched[name]))
         return ",".join(f"{group}:{at}" for group, at in waits)
 
     for item in state["deferred"]:
@@ -224,12 +251,12 @@ def project(state, shape):
                 lines.append(f"release after={stamp} {units(item['units'])}")
         elif kind == "commit":
             (block,) = item["units"]
-            lines.append(f"commit o={OWNERS[item['o']]} p=0 u={unit(block)} k={KEY} after={after}")
+            lines.append(f"commit o={owners_of[item['o']]} p=0 u={unit(block)} k={KEY} after={after}")
         elif kind == "transfer":
-            lines.append(f"transfer o={OWNERS[item['o']]} to={group(item['to'])} after={after}")
+            lines.append(f"transfer o={owners_of[item['o']]} to={group(item['to'])} after={after}")
         elif kind == "replicate":
             (block,) = item["units"]
-            lines.append(f"replicate o={OWNERS[item['o']]} p=0 to={group(item['to'])} u={unit(block)} "
+            lines.append(f"replicate o={owners_of[item['o']]} p=0 to={group(item['to'])} u={unit(block)} "
                          f"after={after}")
         elif kind == "finish":
             ok = int(item["ok"] == "TRUE")
@@ -239,12 +266,12 @@ def project(state, shape):
     for task in state["tasks"]:
         expired = int(task["expired"] == "TRUE")
         if task["kind"] == "transfer":
-            line = (f"task transfer o={OWNERS[task['o']]} to={group(task['to'])} slot={unit(task['slot'])} "
+            line = (f"task transfer o={owners_of[task['o']]} to={group(task['to'])} slot={unit(task['slot'])} "
                     f"units={units(task['units'])} writes={units(task['writes'])}")
             lines.append(line.rstrip())
         elif task["kind"] == "replicate":
             (block,) = task["units"]
-            lines.append(f"task replicate o={OWNERS[task['o']]} p=0 to={group(task['to'])} u={unit(block)}")
+            lines.append(f"task replicate o={owners_of[task['o']]} p=0 to={group(task['to'])} u={unit(block)}")
         else:
             # A prefetch writes the host parts of the group that asked for it,
             # of its session.

@@ -1,10 +1,10 @@
 #!/bin/bash
-# L1 of specs/buffer-pool.md §19: every request sequence of six small
+# L1 of specs/buffer-pool.md §19: every request sequence of seven small
 # configurations is enumerated on the Rust buffer pool, no sequence breaks an
 # invariant, and every state reached is a state of the design model's buffer
 # pool (MC_Pool under the configuration of the same name). Prints one line per
 # configuration and exits non-zero when one fails.
-#   agreement.sh [core|copies|transfer|tiers|cross|parts]...      (all six by default)
+#   agreement.sh [core|copies|transfer|tiers|cross|parts|trial]...      (all seven by default)
 # The enumeration and the model's states are kept in $AGREEMENT_WORK (default:
 # a temporary directory); a configuration's model states pass through a named
 # pipe and are not stored.
@@ -21,7 +21,7 @@ fi
 grep -E "^[a-z]+: [0-9]+ states" "$work/enumeration.log" | sed 's/^/      Rust buffer pool, /'
 
 status=0
-for shape in ${*:-core copies transfer tiers cross parts}; do
+for shape in ${*:-core copies transfer tiers cross parts trial}; do
     config=MC_Pool$(echo "${shape:0:1}" | tr a-z A-Z)${shape:1}
     # A configuration with constants of its own has a module of its own over MC_Pool.
     module=MC_Pool; [ -f "$config.tla" ] && module=$config
