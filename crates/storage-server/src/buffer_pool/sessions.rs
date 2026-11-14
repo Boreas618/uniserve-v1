@@ -815,7 +815,15 @@ impl BufferPool {
                         block.disown();
                         self.reclaim(block);
                     }
-                    Deferred::Replicate { block, .. } => self.reclaim(block),
+                    Deferred::Replicate {
+                        queue,
+                        request,
+                        block,
+                        ..
+                    } => {
+                        self.answers.remove(&(queue, request));
+                        self.reclaim(block);
+                    }
                     Deferred::Transfer { .. } | Deferred::Finish { .. } => {}
                 }
             }

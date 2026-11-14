@@ -12,10 +12,11 @@
 //!   returns, stamped, in a [`Message::Submit`] ahead of the output.
 //! - `map` writes the entries a completion gives into the group's tables at the positions its
 //!   request named, under the slot it is handed, or queues the copies of a `Copy`. The entries
-//!   of a `Load` or a `Clone` appear with the answer to its `Finish`.
-//! - `stamp` applies a `Release`, `Detach`, `Commit`, `Transfer` or give-up `Finish` to the
-//!   group's tables, stamps it with the sequence of the group's last batch, and returns it in a
-//!   [`Message::Submit`].
+//!   of a `Load` or a `Clone` appear with the answer to its `Finish`; a crossing's `Replicated`
+//!   gives the group its block read-only, or leaves the entry its owner holds there already.
+//! - `stamp` applies a `Release`, `Detach`, `Commit`, `Transfer`, `Replicate` or give-up `Finish`
+//!   to the group's tables, stamps it with the sequence of the group's last batch, and returns it
+//!   in a [`Message::Submit`].
 //!
 //! A batch's output follows one rule: a call samples [`crate::draw_token`] of its last row's
 //! draw, and nothing when that row's logits are not wanted ([`output_of`]). A case varies where text ends, the one token every call samples, the
@@ -30,9 +31,9 @@
 //!   request the buffer pool took before a `Release`, `Detach`, `Commit` or `Transfer` that names
 //!   the entry and that the group has applied;
 //! - a `Release`, `Detach` or `Transfer` reaches the submission queue only once no group holds
-//!   its entries, a `Commit` once no group holds its entry writable, and each with the stamp of
-//!   every group that applied it; a `Finish` with the stamp of the group that ran or gave up its
-//!   copy;
+//!   its entries, a `Commit` or a `Replicate` once no group holds its entry writable, and each
+//!   with the stamp of every group that applied it; a `Finish` with the stamp of the group that
+//!   ran or gave up its copy;
 //! - a token row writes cache positions, and a checkpoint row keeps state, only in blocks its
 //!   slot holds writable.
 
@@ -345,9 +346,9 @@ impl FakeExecutor {
         // Its entries left every table (a commit's became read-only) before it was submitted.
         let mut breaches = Vec::new();
         for (group, tables) in &state.groups {
+            let freezes = matches!(request, Request::Commit { .. } | Request::Replicate { .. });
             let holds = tables.entries.iter().any(|(place, entry)| {
-                names(request, entry.owner, place.1, place.2)
-                    && (entry.writable || !matches!(request, Request::Commit { .. }))
+                names(request, entry.owner, place.1, place.2) && (entry.writable || !freezes)
             });
             if holds {
                 breaches.push(format!(
@@ -571,6 +572,13 @@ impl State {
                 let entries = entries.map(|(run, at)| (*class, at, vec![*run], false));
                 Some((*owner, id, entries.collect()))
             }
+            // The crossing's runs, read-only: the block is valid in the group's memories.
+            (
+                Request::Replicate {
+                    owner, class, at, ..
+                },
+                Completion::Replicated { runs, .. },
+            ) => Some((*owner, id, vec![(*class, *at, runs.clone(), false)])),
             (Request::Transfer { owner, .. }, Completion::Transferred { runs, .. }) => {
                 let mut blocks: BTreeMap<(u8, u32), (Vec<Run>, bool)> = BTreeMap::new();
                 for &(class, at, run, private) in runs {
@@ -710,6 +718,15 @@ impl Executor for FakeExecutor {
                     ));
                 }
                 let place = (slot, class, position);
+                // A crossing into a memory of a group that holds the entry already leaves it.
+                let crossed = matches!(completion, Completion::Replicated { .. })
+                    && tables
+                        .entries
+                        .get(&place)
+                        .is_some_and(|held| held.owner == owner);
+                if crossed {
+                    continue;
+                }
                 if tables.entries.contains_key(&place) {
                     breaches.push(format!(
                         "group {} is given position {position} of class {class} in slot {slot}, \
@@ -747,7 +764,7 @@ impl Executor for FakeExecutor {
                     };
                     tables.entries.retain(|place, entry| !named(place, entry));
                 }
-                Request::Commit { .. } => {
+                Request::Commit { .. } | Request::Replicate { .. } => {
                     for (place, entry) in &mut tables.entries {
                         if names(&request, entry.owner, place.1, place.2) {
                             entry.writable = false;
@@ -934,7 +951,8 @@ fn offset(rows: &Rows, row: u32) -> usize {
 }
 
 /// Whether `request` names the entry of `owner` at `position` of `class`: a `Release` its
-/// positions, a `Commit` its one, a `Detach` and a `Transfer` every entry of the owner.
+/// positions, a `Commit` and a `Replicate` its one, a `Detach` and a `Transfer` every entry of
+/// the owner.
 fn names(request: &Request, owner: OwnerId, class: u8, position: u32) -> bool {
     match *request {
         Request::Release {
@@ -945,6 +963,12 @@ fn names(request: &Request, owner: OwnerId, class: u8, position: u32) -> bool {
             ..
         } => named == owner && of == class && position.checked_sub(at).is_some_and(|n| n < count),
         Request::Commit {
+            owner: named,
+            class: of,
+            at,
+            ..
+        }
+        | Request::Replicate {
             owner: named,
             class: of,
             at,
@@ -964,7 +988,8 @@ fn stamps(request: &mut Request) -> Option<&mut Stamps> {
         | Request::Release { after, .. }
         | Request::Commit { after, .. }
         | Request::Transfer { after, .. }
-        | Request::Finish { after, .. } => Some(after),
+        | Request::Finish { after, .. }
+        | Request::Replicate { after, .. } => Some(after),
         _ => None,
     }
 }

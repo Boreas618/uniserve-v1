@@ -962,6 +962,11 @@ impl Scheduler {
             skip_held_encodings(row);
         }
 
+        // A crossing's answer is the reading calls' to wait for, whatever the request is doing.
+        if let runtime::Request::Replicate { .. } = request {
+            return self.crossing_answered(id, &request, &completion);
+        }
+
         let Some(row) = self.requests.get(&id) else {
             return;
         };
@@ -1452,13 +1457,15 @@ fn end_of(terminal: &Event) -> End {
 }
 
 /// Whether a refusal is a miss the request goes on from (SD §3.5 `Refused`): a key `cache`
-/// believed held that the buffer pool does not hold, for a `Clone` or a `Restore`; a host copy of
-/// another layout, for a `Load` or a `Restore`; and a `List` whose listing exceeds what one
+/// believed held that the buffer pool does not hold, for a `Clone` or a `Restore`; a cached block
+/// an epoch on trial may not copy into another memory, for a `Replicate` (BP §9, R8); a host copy
+/// of another layout, for a `Load` or a `Restore`; and a `List` whose listing exceeds what one
 /// completion holds, after which the scheduler knows the cache as it did.
 fn refusal_is_miss(request: &runtime::Request, cause: Cause) -> bool {
     matches!(
         (request, cause),
         (runtime::Request::Clone { .. }, Cause::Key)
+            | (runtime::Request::Replicate { .. }, Cause::Key)
             | (runtime::Request::Restore { .. }, Cause::Key | Cause::Class)
             | (runtime::Request::Load { .. }, Cause::Class)
             | (runtime::Request::List, Cause::Request)

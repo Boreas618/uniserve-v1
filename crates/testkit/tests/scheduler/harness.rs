@@ -153,6 +153,9 @@ pub(crate) struct Deployment {
     /// Blocks of the groups' configurations: per entry the group's index, the block's name and
     /// the block.
     blocks: Vec<(usize, String, BlockConfig)>,
+    /// The ranks of the groups that have more than one: per entry the group's index and its
+    /// ranks, all on this host.
+    ranks: Vec<(usize, usize)>,
 }
 
 impl Deployment {
@@ -179,6 +182,7 @@ impl Deployment {
             peers: false,
             encoder_identity: String::new(),
             blocks: Vec::new(),
+            ranks: Vec::new(),
         }
     }
 
@@ -272,9 +276,15 @@ impl Deployment {
         self
     }
 
-    /// Block `name` of group `index`'s configuration, over the group's one rank.
+    /// Block `name` of group `index`'s configuration, over the group's ranks.
     pub(crate) fn block(mut self, index: usize, name: &str, block: BlockConfig) -> Self {
         self.blocks.push((index, name.to_owned(), block));
+        self
+    }
+
+    /// `count` ranks of group `index`, all on this host; a group has one otherwise.
+    pub(crate) fn ranks(mut self, index: usize, count: usize) -> Self {
+        self.ranks.push((index, count));
         self
     }
 
@@ -558,17 +568,25 @@ impl Deployment {
         u8::try_from(found).ok()
     }
 
-    /// Group `index`'s configuration: one rank on this host, with the deployment's queue depth and
-    /// the blocks stated for it ([`Deployment::block`]).
+    /// Group `index`'s configuration: its ranks on this host, one unless stated
+    /// ([`Deployment::ranks`]), with the deployment's queue depth and the blocks stated for it
+    /// ([`Deployment::block`]).
     fn config(&self, index: usize) -> WorkerGroupConfig {
+        let ranks = self
+            .ranks
+            .iter()
+            .rev()
+            .find(|(group, _)| *group == index)
+            .map_or(1, |&(_, count)| count);
+        let rank = WorkerRank {
+            host: "localhost".to_owned(),
+            device: "cpu".to_owned(),
+        };
         WorkerGroupConfig {
             id: WorkerGroupId(format!("group-{index}")),
             role: self.groups[index].0,
             replicas: 1,
-            ranks: vec![WorkerRank {
-                host: "localhost".to_owned(),
-                device: "cpu".to_owned(),
-            }],
+            ranks: vec![rank; ranks],
             blocks: self
                 .blocks
                 .iter()

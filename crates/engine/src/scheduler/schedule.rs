@@ -134,6 +134,10 @@ impl Scheduler {
     /// Nothing is formed while every group's queue is full, and nothing once the scheduler has
     /// failed (a starved request alone, or a batch the step could not seal).
     pub(crate) fn schedule(&mut self) -> Vec<Batch> {
+        // The crossings whose products their writers' calls wrote are asked whatever the step
+        // forms: no batch waits for them, and the calls that read them wait for their answers.
+        self.cross();
+
         // No group has room in its queue: nothing can be formed, and the policy is not asked.
         if self.groups.iter().all(|group| !queue_open(group)) {
             return Vec::new();
@@ -1389,15 +1393,23 @@ impl Scheduler {
 
     /// The units of `region` (an index) request `id`'s next call needs beyond the blocks it asked
     /// for: the blocks that call writes (SD §3.6, §4.4), neither those of the low watermark nor
-    /// those of its draft cache, which take only the units the regions have free.
+    /// those of its draft cache, which take only the units the regions have free; for a video
+    /// request, the runs its crossings not asked yet take there.
     fn units_short(&self, id: RequestId, region: usize) -> u32 {
         let Some(request) = self.requests.get(&id) else {
             return 0;
         };
+        let crossings = request
+            .crossings
+            .iter()
+            .filter(|(.., state)| state.is_none())
+            .flat_map(|&(at, group, from, _)| self.receiving(request, (at, group, from)))
+            .filter(|&(taken, _)| taken == region)
+            .fold(0u32, |units, (_, taken)| units.saturating_add(taken));
         let Some(owner) = self.kv_owner(request) else {
-            return 0;
+            return crossings;
         };
-        let mut short = 0u32;
+        let mut short = crossings;
         for (class, _, _, needed) in self.ahead(request) {
             let there = self
                 .class_regions(owner, class)

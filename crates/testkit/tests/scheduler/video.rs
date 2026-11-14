@@ -530,6 +530,51 @@ fn a_decoder_that_deals_no_units_decodes_one_a_rank_and_a_codec_covering_that_ro
     assert_eq!(of(&calls, Phase::VideoEncode).len(), 2);
 }
 
+/// A decode follows the last denoising step on its group once that step is scheduled only when
+/// every rank that decodes denoises too: its worker runs the step ahead of the decode, and the
+/// decode reads the latents its own step wrote. A rank that decodes and does not denoise passes
+/// the step's batch and receives its latents from another rank's step, so the decode then waits
+/// for the last step's output (SD §3.3). While the last step is held on the device, a group whose
+/// two ranks both denoise decodes, and one whose second rank only decodes does not.
+#[test]
+fn a_decode_waits_for_the_last_step_s_output_where_a_decoder_rank_does_not_denoise() {
+    // The denoiser's block as a deployment names it (`nn::family::Stage::Transformer`).
+    const DENOISER_BLOCK: &str = "transformer";
+    let decoder = BlockConfig {
+        distribution: Some(BlockDistribution::TemporalUnits),
+        ..BlockConfig::parallel(vec![0, 1])
+    };
+    for (denoisers, follows) in [(vec![0, 1], true), (vec![0], false)] {
+        let mut harness = Deployment::video(&[&VIDEO_PHASES])
+            .ranks(0, 2)
+            .block(0, VIDEO_DECODER_BLOCK, decoder.clone())
+            .block(0, DENOISER_BLOCK, BlockConfig::parallel(denoisers))
+            .build();
+        let id = harness.submit_video(video(1, 2));
+
+        // Every batch runs until the last step is submitted, which stays on the device.
+        harness.fake.hold();
+        let last = |harness: &mut Harness| {
+            let submitted = harness.media_rows(id, Phase::Denoise).len() == STEPS as usize;
+            if !submitted {
+                harness.fake.release(usize::MAX);
+            }
+            submitted
+        };
+        harness.run_until(200, last);
+        harness.run(5);
+        let decoded = !harness.media_rows(id, Phase::VideoDecode).is_empty();
+        assert_eq!(decoded, follows, "follows: {follows}");
+
+        harness.fake.resume();
+        harness.settle(300);
+        completed(&harness, id);
+        let calls = calls(&harness, id);
+        let (step, _) = *of(&calls, Phase::Denoise).last().unwrap();
+        assert!(of(&calls, Phase::VideoDecode)[0].0 > step);
+    }
+}
+
 /// A video request holds every product block from its admission, one `Allocate` per declared
 /// result at its position for its owner, sized from the bytes its captured shape states for the
 /// product's kind, and asks for no block after it: the low watermark of SD §4.4 is a token

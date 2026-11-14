@@ -24,7 +24,13 @@
 //! every version from [`OLDEST`] to that one, so that a server restarted in
 //! place into the next build goes on serving every session the builds before
 //! it opened, and reads and writes each session's records in its version
-//! ([`Request::decode_as`], [`Completion::encode_as`]). What version 3 lacks:
+//! ([`Request::decode_as`], [`Completion::encode_as`]). What version 4 lacks:
+//!
+//! - a [`Completion::Replicated`] of version 4 names no keys evicted for the
+//!   runs its crossing took: the scheduler learns of them from a later
+//!   listing.
+//!
+//! What version 3 lacks besides:
 //!
 //! - a [`Completion::Copy`] of version 3 names no host parts a copy writes:
 //!   every rank of the group writes its own part, also one that holds the
@@ -47,12 +53,12 @@ use serde::{Deserialize, Serialize};
 use crate::{Error, Key, Result, Segment};
 
 /// The version of this interface that this build's engine speaks.
-pub const VERSION: u32 = 4;
+pub const VERSION: u32 = 5;
 
 /// The earliest version a Storage Server of this build serves, which the
-/// engines of the builds before it speak: version 2, before crossings, and
-/// version 3, before a copy's host parts. An `Open` of an earlier version is
-/// refused.
+/// engines of the builds before it speak: version 2, before crossings,
+/// version 3, before a copy's host parts, and version 4, before a
+/// crossing's evicted keys. An `Open` of an earlier version is refused.
 pub const OLDEST: u32 = 2;
 
 /// A request's number on its queue pair, drawn by the scheduler from a
@@ -550,9 +556,12 @@ pub enum Completion {
     },
     /// The block a `Replicate` named is valid in every memory the group
     /// reads its class in: its runs in the group's regions and receiving
-    /// regions of the class, in the order the block holds them.
+    /// regions of the class, in the order the block holds them; and the
+    /// keys evicted for the runs the crossing took in receiving regions,
+    /// when it took them.
     Replicated {
         runs: Vec<Run>,
+        evicted: Vec<Key>,
     },
 }
 
@@ -740,6 +749,10 @@ const CROSSINGS: u32 = 3;
 /// The version that added the host parts a copy writes
 /// ([`Completion::Copy`]): a record of an earlier version names none.
 const COPIED_PARTS: u32 = 4;
+
+/// The version that added the keys a crossing evicted
+/// ([`Completion::Replicated`]): a record of an earlier version names none.
+const CROSSING_EVICTIONS: u32 = 5;
 
 /// Whether this build reads and writes records of `version`.
 ///
@@ -1107,7 +1120,8 @@ impl Completion {
     /// Appends the record of this completion of request `id` to `record`,
     /// in `version`, one of [`OLDEST`] to [`VERSION`]: a field the version
     /// lacks is left out (a listing's host groups before version 3, a copy's
-    /// host parts before version 4). A
+    /// host parts before version 4, a crossing's evicted keys before version
+    /// 5). A
     /// completion the version lacks is written as this build writes it,
     /// which a reader of that version refuses; the buffer pool answers no
     /// request of a session with one, since the session's version has no
@@ -1216,9 +1230,12 @@ impl Completion {
                 writer.word(*units);
                 writer.keys(evicted);
             }
-            Self::Replicated { runs } => {
+            Self::Replicated { runs, evicted } => {
                 writer.byte(20);
                 writer.runs(runs);
+                if version >= CROSSING_EVICTIONS {
+                    writer.keys(evicted);
+                }
             }
         }
     }
@@ -1234,8 +1251,9 @@ impl Completion {
     }
 
     /// Reads a completion and the number of the request it answers from a
-    /// record of `version`: a listing of version 2 states no host groups, and
-    /// a copy before version 4 no host parts.
+    /// record of `version`: a listing of version 2 states no host groups, a
+    /// copy before version 4 no host parts, and a crossing's answer before
+    /// version 5 no evicted keys.
     ///
     /// # Errors
     ///
@@ -1345,6 +1363,11 @@ impl Completion {
             },
             20 if crossings => Self::Replicated {
                 runs: reader.runs()?,
+                evicted: if version >= CROSSING_EVICTIONS {
+                    reader.keys()?
+                } else {
+                    Vec::new()
+                },
             },
             other => {
                 return Err(Error::Protocol(format!(
@@ -1539,6 +1562,7 @@ mod tests {
             },
             Completion::Replicated {
                 runs: vec![(5, 0, 2), (9, 4, 2)],
+                evicted: vec![key(8)],
             },
         ];
 
@@ -1649,8 +1673,35 @@ mod tests {
         .encode(RequestId(9), &mut crossing);
         assert!(Request::decode_as(&crossing, 2).is_err());
         let mut answer = Vec::new();
-        Completion::Replicated { runs: vec![] }.encode(RequestId(9), &mut answer);
+        Completion::Replicated {
+            runs: vec![],
+            evicted: vec![],
+        }
+        .encode(RequestId(9), &mut answer);
         assert!(Completion::decode_as(&answer, 2).is_err());
+    }
+
+    /// Version 4's crossings name no evicted keys: an answer read in it evicted none, and the
+    /// keys a version-5 answer names are left out of its record.
+    #[test]
+    fn a_crossing_of_version_4_names_no_evicted_keys() {
+        let replicated = |evicted| Completion::Replicated {
+            runs: vec![(5, 0, 2)],
+            evicted,
+        };
+        let mut earlier = Vec::new();
+        replicated(vec![key(3)]).encode_as(4, RequestId(6), &mut earlier);
+        assert_eq!(
+            Completion::decode_as(&earlier, 4).unwrap(),
+            (RequestId(6), replicated(Vec::new()))
+        );
+        let mut current = Vec::new();
+        replicated(vec![key(3)]).encode(RequestId(6), &mut current);
+        assert_eq!(
+            Completion::decode(&current).unwrap(),
+            (RequestId(6), replicated(vec![key(3)]))
+        );
+        assert!(Completion::decode_as(&current, 4).is_err());
     }
 
     /// Version 3's copies name no host parts: a copy read in it writes every rank's part, and

@@ -19,8 +19,8 @@
 //!    waits for the copies, and answers each row.
 //!
 //! A host batch is run by one rank of its group (`crate::executor::Route`), and only its writes
-//! reach the other ranks' runs: a block one call writes in part, the rows of the encoded units, is
-//! written there in part too, and no rank's other parts are overwritten.
+//! reach the other ranks' runs: a block a call writes is written in every run of it the process
+//! maps, and no other block is touched.
 //!
 //! Every block is found and checked in the first turn: a position the tables hold no entry for,
 //! a write to a read-only entry, or bytes past a block refuse the batch before any work starts.
@@ -35,9 +35,9 @@
 //! | Phase | Reads | Writes |
 //! | --- | --- | --- |
 //! | `MediaRead` | the request's condition media, published in shared memory | condition pixels, condition samples and vision pixels, those the request's conditions call for, in that order |
-//! | `VideoEncode` | the frames of its round's units, from the video units block's run on the rank that decoded each | each unit's encoding into its row of the encoded units block |
+//! | `VideoEncode` | the frames of its round's units, from the video units block's run on the rank that decoded each | each unit's encoding into its own encoded units block |
 //! | `AudioEncode` | the video's duration of the decoded track | nothing: the encoded track joins the request's assembly |
-//! | `Mux`, handing rounds over | the rows of the next rounds' units, as far as each framed unit reaches | nothing: the units join the assembly |
+//! | `Mux`, handing rounds over | the encoded units blocks of the next rounds' units, as far as each framed unit reaches | nothing: the units join the assembly |
 //! | `Mux`, final | nothing | nothing: the call's output carries the artifact |
 //!
 //! A round is the width of [`HostConfig::round`] in units of the timeline: a video encode covers
@@ -53,7 +53,7 @@
 //! | Condition samples | every audio track as `[2, 1, samples]` FP32 padded to whole latent hops, one after another |
 //! | Vision pixels | every vision block's patch rows in the tower's element type, one after another |
 //! | Video units | the timeline's frames, `[frames, rows, columns, 3]` bytes, unit `u`'s after those of every earlier unit (the splicer's placement, `runners::decoder`) |
-//! | Encoded units | one row per unit, unit `u`'s after those of every earlier unit, of `media::encoded_unit_bytes` bytes ([`MediaHost::encoded_bytes`]): the unit's encoding behind its length ([`media::frame_unit`]) |
+//! | Encoded units | one block per unit, of the longest unit's `media::encoded_unit_bytes` bytes ([`MediaHost::encoded_bytes`]): the unit's encoding behind its length ([`media::frame_unit`]) from the first byte, so that each is written in the process that decoded its unit |
 //! | Audio samples | `[samples, 2]` interleaved `i16` from the first byte |
 //!
 //! ## The assembly
@@ -262,10 +262,13 @@ impl MediaHost {
     }
 
     /// The bytes of an encoded units block for a timeline whose units keep `units` frames at
-    /// `height` by `width`: one row per unit (module documentation). The scheduler sizes the
-    /// block by it.
+    /// `height` by `width`: one unit's row, of the longest unit (module documentation). The
+    /// scheduler sizes each unit's block by it.
     pub(crate) fn encoded_bytes(units: &[u32], height: u32, width: u32) -> u64 {
-        encoded(units, 0..units.len(), height, width)
+        (0..units.len())
+            .map(|unit| encoded(units, unit..unit + 1, height, width))
+            .max()
+            .unwrap_or(0)
     }
 
     /// What each row of `batch` reads and writes, in row order, as the batch's first turn finds
@@ -443,12 +446,16 @@ impl MediaHost {
             }
 
             Phase::VideoEncode => {
-                let ([frames_at], [encoded_at]) = (reads, writes) else {
+                let [frames_at] = reads else {
                     return Err(mismatched());
                 };
                 let units = self.units(row.frames)?;
                 let round = self.round(units, row.unit, self.config.round.width())?;
                 let (height, width) = (row.height, row.width);
+                // One encoded units block per unit of the round, in unit order.
+                if writes.len() != round.len() {
+                    return Err(mismatched());
+                }
 
                 // Each unit's frames from the run of the rank that decoded them, one after
                 // another: the round's frames in timeline order.
@@ -474,11 +481,11 @@ impl MediaHost {
                     })
                     .collect::<Result<Vec<_>>>()?;
 
-                let runs = self.written(tables, row.slot, ENCODED_UNITS, *encoded_at)?;
                 let rows = round
-                    .map(|unit| {
-                        let offset = encoded(units, 0..unit, height, width);
-                        self.spans(&runs, offset, encoded(units, unit..unit + 1, height, width))
+                    .zip(writes)
+                    .map(|(unit, &encoded_at)| {
+                        let runs = self.written(tables, row.slot, ENCODED_UNITS, encoded_at)?;
+                        self.spans(&runs, 0, encoded(units, unit..unit + 1, height, width))
                     })
                     .collect::<Result<Vec<_>>>()?;
                 Ok((read, rows))
@@ -499,25 +506,25 @@ impl MediaHost {
 
             Phase::Mux => {
                 // Every muxing call may name the encoded units it reads; only one that hands
-                // rounds over reads them.
-                if reads.len() > 1 || !writes.is_empty() {
+                // rounds over reads them, the block of each unit it hands over in unit order.
+                if !writes.is_empty() {
                     return Err(mismatched());
                 }
                 if row.rounds == 0 {
                     return Ok((Vec::new(), Vec::new()));
                 }
-                let [encoded_at] = reads else {
+                let handed = self.handed(row)?;
+                if reads.len() != handed.len() {
                     return Err(mismatched());
-                };
+                }
 
                 let units = self.units(row.frames)?;
-                let run = self.read(tables, row.slot, ENCODED_UNITS, *encoded_at)?;
                 let (height, width) = (row.height, row.width);
-                let rows = self
-                    .handed(row)?
-                    .map(|unit| {
-                        let offset = encoded(units, 0..unit, height, width);
-                        self.span(run, offset, encoded(units, unit..unit + 1, height, width))
+                let rows = handed
+                    .zip(reads)
+                    .map(|(unit, &encoded_at)| {
+                        let run = self.read(tables, row.slot, ENCODED_UNITS, encoded_at)?;
+                        self.span(run, 0, encoded(units, unit..unit + 1, height, width))
                     })
                     .collect::<Result<Vec<_>>>()?;
                 Ok((rows, Vec::new()))
@@ -1454,7 +1461,8 @@ mod tests {
     ];
 
     /// The classes of the product kinds, and the positions of the request's video units, encoded
-    /// units and audio samples in its product table: those of a request without conditions.
+    /// units (one block per unit) and audio samples in its product table: those of a request of
+    /// two units without conditions.
     const CLASSES: [(&str, u8); 6] = [
         (CONDITION_PIXELS, 5),
         (CONDITION_SAMPLES, 6),
@@ -1464,8 +1472,8 @@ mod tests {
         (AUDIO_SAMPLES, 10),
     ];
     const VIDEO_AT: u32 = 3;
-    const ENCODED_AT: u32 = 6;
-    const AUDIO_AT: u32 = 7;
+    const ENCODED_AT: [u32; 2] = [6, 7];
+    const AUDIO_AT: u32 = 8;
 
     /// The request's timeline: 39 frames in units of 17 and 22, at 16 by 16, a round a unit.
     const FRAMES: u32 = 39;
@@ -1602,8 +1610,8 @@ mod tests {
         }
     }
 
-    /// The bytes of the request's video units, encoded units and audio samples blocks, in
-    /// product buffer units.
+    /// The bytes of the request's video units block, of each of its encoded units blocks and of
+    /// its audio samples block, in product buffer units.
     fn blocks() -> [u32; 3] {
         let frame = u64::from(SIDE * SIDE * 3);
         let samples = media::audio_samples(FRAMES as usize, 24, 32_000) as u64;
@@ -1614,6 +1622,12 @@ mod tests {
             samples * STEREO,
         ]
         .map(|bytes| u32::try_from(bytes.div_ceil(UNIT_BYTES)).unwrap())
+    }
+
+    /// The product buffer units the request's blocks take on a rank, one after another.
+    fn held() -> u32 {
+        let [video, encoded, audio] = blocks();
+        video + 2 * encoded + audio
     }
 
     /// The completions that attach the request in `SLOT` and give it its video units, encoded
@@ -1627,14 +1641,13 @@ mod tests {
         let mut answers = vec![(SLOT, attach, Completion::Attached { slot: SLOT })];
 
         let mut first = 0;
+        let [video, encoded, audio] = blocks();
         for ((kind, at), units) in [
-            (VIDEO_UNITS, VIDEO_AT),
-            (ENCODED_UNITS, ENCODED_AT),
-            (AUDIO_SAMPLES, AUDIO_AT),
-        ]
-        .into_iter()
-        .zip(blocks())
-        {
+            ((VIDEO_UNITS, VIDEO_AT), video),
+            ((ENCODED_UNITS, ENCODED_AT[0]), encoded),
+            ((ENCODED_UNITS, ENCODED_AT[1]), encoded),
+            ((AUDIO_SAMPLES, AUDIO_AT), audio),
+        ] {
             let allocate = Request::Allocate {
                 owner: OWNER,
                 class: CLASSES.iter().find(|(name, _)| *name == kind).unwrap().1,
@@ -1705,8 +1718,8 @@ mod tests {
     #[test]
     fn a_mux_batch_reads_the_encoded_units_its_rows_name_and_assembles_the_artifact() {
         let (pool, media) = (pool(), runner());
-        let [video, encoded, audio] = blocks();
-        let units = video + encoded + audio;
+        let [video, encoded, _] = blocks();
+        let units = held();
 
         // Rank 0 of a process of two ranks, each backing the request's products.
         let mut memories = [memory(0, units), memory(1, units)];
@@ -1734,15 +1747,11 @@ mod tests {
         decoded[..UNITS[0] as usize * frame].fill(0x40);
         decoded[UNITS[0] as usize * frame..FRAMES as usize * frame].fill(0xa0);
 
-        // Each round's encode writes its unit's row into the run of each rank: the first at the
-        // encoded units block's first byte, the second behind the first's row.
-        let encoded_at = u64::from(video) * UNIT_BYTES;
-        let rows = [
-            encoded_at,
-            encoded_at + media::encoded_unit_bytes(UNITS[0], SIDE, SIDE) as u64,
-        ];
+        // Each round's encode writes its unit's encoding into the run of each rank of the unit's
+        // own encoded units block, from its first byte.
+        let rows = [0, 1].map(|unit| u64::from(video + unit * encoded) * UNIT_BYTES);
         for unit in 0..2 {
-            let mut encode = row(vec![VIDEO_AT, ENCODED_AT], 1);
+            let mut encode = row(vec![VIDEO_AT, ENCODED_AT[unit as usize]], 1);
             encode.unit = unit;
             perform(
                 &mut host,
@@ -1762,7 +1771,7 @@ mod tests {
             );
         }
 
-        // The silent track, then a muxing call per round, each reading its unit's row.
+        // The silent track, then a muxing call per round, each reading its unit's block.
         perform(
             &mut host,
             &tables,
@@ -1770,7 +1779,7 @@ mod tests {
             &batch(2, Phase::AudioEncode, vec![row(vec![AUDIO_AT], 1)]),
         );
         for (round, at) in rows.into_iter().enumerate() {
-            let mut hand = row(vec![ENCODED_AT], 1);
+            let mut hand = row(vec![ENCODED_AT[round]], 1);
             hand.rounds = 1;
             let handing = batch(3, Phase::Mux, vec![hand]);
 
@@ -1785,7 +1794,7 @@ mod tests {
         }
 
         // The final call reads nothing and answers with the request's MP4.
-        let last = batch(4, Phase::Mux, vec![row(vec![ENCODED_AT], 1)]);
+        let last = batch(4, Phase::Mux, vec![row(Vec::new(), 0)]);
         assert_eq!(
             host.transfers(&last, &tables).unwrap(),
             [(Vec::new(), Vec::new())]
@@ -1803,7 +1812,7 @@ mod tests {
         }
 
         // A round past the timeline's units is refused by name.
-        let mut past = row(vec![VIDEO_AT, ENCODED_AT], 1);
+        let mut past = row(vec![VIDEO_AT, ENCODED_AT[0]], 1);
         past.unit = 2;
         let refused = host.transfers(&batch(5, Phase::VideoEncode, vec![past]), &tables);
         assert!(refused.unwrap_err().to_string().contains("2 units"));
@@ -1812,11 +1821,10 @@ mod tests {
     #[test]
     fn a_video_encode_reads_each_unit_from_the_run_of_the_rank_that_decoded_it() {
         let (pool, media) = (pool(), runner());
-        let [video, encoded, audio] = blocks();
 
         // The timeline's two units are one round, dealt to ranks 0 and 1 of the process, each
         // of which decoded its unit into its own run of the video units block.
-        let mut memories = [0, 1].map(|rank| memory(rank, video + encoded + audio));
+        let mut memories = [0, 1].map(|rank| memory(rank, held()));
         BufferMemory::connect(&mut memories).unwrap();
         let [own, _] = memories;
         let mut config = config(&[Phase::VideoEncode]);
@@ -1836,7 +1844,7 @@ mod tests {
         let encode = batch(
             1,
             Phase::VideoEncode,
-            vec![row(vec![VIDEO_AT, ENCODED_AT], 1)],
+            vec![row(vec![VIDEO_AT, ENCODED_AT[0], ENCODED_AT[1]], 1)],
         );
         let transfers = host.transfers(&encode, &tables).unwrap();
         let frame = u64::from(SIDE * SIDE * 3);
@@ -1965,7 +1973,7 @@ mod tests {
     #[test]
     fn a_host_batch_takes_its_number_in_order_and_holds_it_while_device_batches_run() {
         let (pool, media) = (pool(), runner());
-        let units = blocks().iter().sum();
+        let units = held();
         let device_runner = Device {
             graphs: Graphs::meta(kernels(), 0),
         };
@@ -2049,7 +2057,7 @@ mod tests {
     #[test]
     fn a_host_batch_whose_rows_name_no_rank_runs_once_on_the_first_rank_serving_its_phase() {
         let pool = pool();
-        let units = blocks().iter().sum();
+        let units = held();
         let assemblies = [runner(), runner()];
         let runners = (0..2)
             .map(|rank| {

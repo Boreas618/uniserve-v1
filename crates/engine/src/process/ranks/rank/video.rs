@@ -970,7 +970,8 @@ impl ModelRunner {
     ///   without a splicer, each unit's raster in the decoder's element type.
     /// - A splice tail: the most frames a unit of the timeline fades against, in the decoder's
     ///   element type; none without a splicer.
-    /// - The encoded units: the media host's rows of the timeline's units.
+    /// - An encoded unit: the media host's row of the timeline's longest unit, one block per
+    ///   unit.
     /// - The audio samples: the track's PCM window, stereo `i16`; none without a track.
     ///
     /// # Errors

@@ -112,9 +112,11 @@ impl Scheduler {
             _ => None,
         };
 
-        // The keys a completion lists as evicted left the regions its request took blocks from.
+        // The keys a completion lists as evicted left the regions its request took blocks from,
+        // a crossing's the regions of the runs it states.
         let (taken, evicted) = match (request, completion) {
             (_, Completion::Allocated { runs, evicted })
+            | (_, Completion::Replicated { runs, evicted })
             | (
                 _,
                 Completion::Copy {

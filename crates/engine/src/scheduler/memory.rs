@@ -802,10 +802,21 @@ impl Scheduler {
     /// Per region (an index into the session's regions), the units the running requests still
     /// need to reach their next call and the low watermark (SD §4.4 "The admission reserve"),
     /// which an admission leaves available: every class but the draft cache, which takes only
-    /// the units the regions have free.
+    /// the units the regions have free; and the runs a video request's crossings not asked yet
+    /// take in their receiving regions.
     pub(super) fn admission_reserve(&self) -> Vec<u32> {
-        let mut reserve = vec![0; self.regions.len()];
+        let mut reserve: Vec<u32> = vec![0; self.regions.len()];
         for request in self.running.iter().filter_map(|id| self.requests.get(id)) {
+            for &(at, group, from, state) in &request.crossings {
+                if state.is_some() || !request.reads_result(at, &self.groups) {
+                    continue;
+                }
+                for (region, units) in self.receiving(request, (at, group, from)) {
+                    if let Some(reserved) = reserve.get_mut(region) {
+                        *reserved = reserved.saturating_add(units);
+                    }
+                }
+            }
             let Some(group) = self.kv_group(request) else {
                 continue;
             };
@@ -919,6 +930,15 @@ impl Scheduler {
                     && self.encoding_found(request, 0, Some(group));
                 if !(allocating && found) {
                     self.charge_units(&mut units, group, class, 1, size);
+                }
+            }
+            // Each crossing takes a run of its result in every memory its reading group reads
+            // it in where the block has none.
+            for (at, group, from, _) in self.crossings_of(request) {
+                for (region, taken) in self.receiving(request, (at, group, from)) {
+                    if let Some(units) = units.get_mut(region) {
+                        *units = units.saturating_add(taken);
+                    }
                 }
             }
             return units;
@@ -1274,6 +1294,11 @@ impl Scheduler {
             if let (Some(owner), Some(key)) = (request.owner_on(Phase::Denoise), key) {
                 asks.push(runtime::Request::Restore { owner, key });
             }
+            // The crossings its calls wait for follow its placement.
+            let crossings = self.crossings_of(request);
+            if let Some(request) = self.requests.get_mut(&id) {
+                request.crossings = crossings;
+            }
         } else if let (Some(owner), Some(group)) = (self.kv_owner(request), self.kv_group(request))
         {
             let outlooks;
@@ -1571,8 +1596,13 @@ impl Scheduler {
 
         // An encoder output is one block at its position. One the answer did not hold is
         // allocated, of its declared result's size for a video request's conditioning and of its
-        // rows of features for a chat image's.
+        // rows of features for a chat image's. A video request's conditioning a `Pin` found is
+        // read from the cached block's one run when it crosses to another process.
         if let Some((index, rows)) = self.encoding_at(request, class, at) {
+            let pinned = match completion {
+                Completion::Pinned { runs, .. } => runs.first().map(|run| run.0),
+                _ => None,
+            };
             if held == 0 {
                 let units = if request.is_video() {
                     let results = self.declared_results(request).unwrap_or_default();
@@ -1584,6 +1614,10 @@ impl Scheduler {
             } else if let Some(request) = self.requests.get_mut(&id) {
                 if let Some(entry) = request.encodings.get_mut(index) {
                     entry.1 = Some(at);
+                }
+                let crossings = request.crossings.iter_mut();
+                for crossing in crossings.filter(|(position, ..)| *position == at) {
+                    crossing.2 = pinned.unwrap_or(crossing.2);
                 }
                 self.raise_end(id, class, at.saturating_add(1));
             }

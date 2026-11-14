@@ -1059,6 +1059,7 @@ mod tests {
             num_encoded_inputs: 0,
             encodings: Vec::new(),
             unpinned: Vec::new(),
+            crossings: Vec::new(),
             num_acknowledged_tokens: 0,
             terminal: None,
             event_credit: 64,
@@ -1866,7 +1867,7 @@ mod tests {
     /// A video request's media rows name the results their call reads, then those it writes, by
     /// their positions in its product table, in the order its admission declared them (SD §2.3,
     /// §3.3): the condition media, the vision pixels, the conditioning, both latents, the video
-    /// units, one splice tail per unit, the encoded units and the audio samples. No row names a
+    /// units, one splice tail and one encoded unit per unit, and the audio samples. No row names a
     /// rank: a decode round covers a unit for each rank of the decoder group.
     #[test]
     fn a_video_requests_media_rows_name_what_they_read_then_write() {
@@ -1930,25 +1931,34 @@ mod tests {
             (named(&second), second.unit, second.rank),
             ((vec![4, 8, 6, 9], 2), 2, None)
         );
+        // An encode round writes the encoded unit of each unit of its round.
+        let encode = media(&mut scheduler, Phase::VideoEncode, 0);
+        assert_eq!(
+            (named(&encode), encode.unit, encode.rank),
+            ((vec![6, 10, 11], 1), 0, None)
+        );
         let encode = media(&mut scheduler, Phase::VideoEncode, 1);
         assert_eq!(
             (named(&encode), encode.unit, encode.rank),
-            ((vec![6, 10], 1), 2, None)
+            ((vec![6, 12], 1), 2, None)
         );
         assert_eq!(
             named(&media(&mut scheduler, Phase::AudioDecode, 0)),
-            (vec![5, 11], 1)
+            (vec![5, 13], 1)
         );
         assert_eq!(
             named(&media(&mut scheduler, Phase::AudioEncode, 0)),
-            (vec![11], 1)
+            (vec![13], 1)
         );
 
-        // A muxing call hands over the encode round it follows; the last hands none.
+        // A muxing call hands over the encoded units of the encode round it follows; the last
+        // hands none and reads nothing.
         scheduler.requests.get_mut(&RequestId(1)).unwrap().completed[Phase::VideoEncode.index()] =
             2;
-        assert_eq!(media(&mut scheduler, Phase::Mux, 1).rounds, 1);
-        assert_eq!(media(&mut scheduler, Phase::Mux, 2).rounds, 0);
+        let handing = media(&mut scheduler, Phase::Mux, 1);
+        assert_eq!((handing.rounds, named(&handing)), (1, (vec![12], 1)));
+        let last = media(&mut scheduler, Phase::Mux, 2);
+        assert_eq!((last.rounds, named(&last)), (0, (Vec::new(), 0)));
 
         // A text encoding reads its prompt as one row of token columns.
         let mut text = batch(Phase::TextEncode);

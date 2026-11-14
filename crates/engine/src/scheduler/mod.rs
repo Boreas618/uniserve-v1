@@ -23,11 +23,11 @@
 //! queue pair runs in poll mode, and no wake-up crosses from the buffer pool.
 //!
 //! - `submit` takes a request for the buffer pool. A request the workers first apply to their
-//!   device block tables (`Release`, `Detach`, `Commit`, `Transfer`, and the `Finish` that gives a
-//!   copy up) waits in `stamping` until every group whose tables may hold its entries stamped it
-//!   (BP §9, obligation 2); a request that names positions such a `Release` frees waits behind
-//!   it; every other request is held in order. A further `Allocate` of an owner and class whose
-//!   `Allocate` is still held raises that one's count (BP §10, F5).
+//!   device block tables (`Release`, `Detach`, `Commit`, `Transfer`, `Replicate`, and the
+//!   `Finish` that gives a copy up) waits in `stamping` until every group whose tables may hold
+//!   its entries stamped it (BP §9, obligation 2); a request that names positions such a
+//!   `Release` frees waits behind it; every other request is held in order. A further `Allocate`
+//!   of an owner and class whose `Allocate` is still held raises that one's count (BP §10, F5).
 //! - `post` writes the held requests in order while the submission queue has room and the
 //!   completion queue has room for a completion of every request outstanding. A request's number
 //!   is drawn as it is written, so the numbers rise in the order the buffer pool takes the
@@ -1190,12 +1190,15 @@ impl Scheduler {
     /// Takes a request for the buffer pool; a later [`Scheduler::post`] writes it into the
     /// submission queue. Nothing here touches the queue pair or waits.
     ///
-    /// - An `Allocate` that continues a held `Allocate` of the same owner, class and block size
-    ///   at the position after it raises that one's count instead.
-    /// - A `Release`, a `Commit`, a `Detach` or a `Transfer` is handed to `Executor::stamp` of
-    ///   every group whose device block tables may hold the entries it names: the group of the
-    ///   owner's attachment, and every other group the request is attached to that reads the
-    ///   class (one that states a region of the class that the owner's group states too). The
+    /// - An `Allocate` of blocks of the class's size that continues a held `Allocate` of the same
+    ///   owner and class at the position after it raises that one's count instead. A sized block
+    ///   (a declared result, an encoder output) is asked by an `Allocate` of its own, whose answer
+    ///   goes to the groups that read it where its writer writes it (`Scheduler::mapped`).
+    /// - A `Release`, a `Commit`, a `Detach`, a `Transfer` or a `Replicate` is handed to
+    ///   `Executor::stamp` of every group whose device block tables may hold the entries it
+    ///   names: the group of the owner's attachment, and every other group the request is
+    ///   attached to that reads the class (one that states a region of the class that the
+    ///   owner's group states too), and for a `Replicate` the group it copies into. The
     ///   groups are found from the request's `attachments`, so an owner's `Detach` is submitted
     ///   before its attachment is cleared, and an owner whose entries no table holds (a failed
     ///   `Transfer`) has its attachment cleared first. A `Finish { ok: false }` that gives a copy
@@ -1222,6 +1225,20 @@ impl Scheduler {
         let groups = match &request {
             runtime::Request::Release { owner, class, .. }
             | runtime::Request::Commit { owner, class, .. } => self.holders(*owner, Some(*class)),
+            // A crossing reads its block once no batch of a group that may write it is in flight
+            // (BP §9, A2): the groups that hold the entry, and the group it copies into.
+            runtime::Request::Replicate {
+                owner,
+                class,
+                group,
+                ..
+            } => {
+                let mut groups = self.holders(*owner, Some(*class));
+                if !groups.contains(group) {
+                    groups.push(*group);
+                }
+                groups
+            }
             runtime::Request::Detach { owner, .. } | runtime::Request::Transfer { owner, .. } => {
                 self.holders(*owner, None)
             }
@@ -1282,7 +1299,8 @@ impl Scheduler {
     }
 
     /// Raises the count of a held or waiting `Allocate` that `request` continues: the same
-    /// owner, class and block size, at the position after its last. True when it did.
+    /// owner and class, blocks of the class's size, at the position after its last. True when it
+    /// did.
     fn merge(&mut self, request: &runtime::Request) -> bool {
         let runtime::Request::Allocate {
             owner,
@@ -1294,6 +1312,11 @@ impl Scheduler {
         else {
             return false;
         };
+        // A sized block is a declared result or an encoder output, whose answer may go to other
+        // groups than its neighbour's: it keeps an `Allocate` of its own.
+        if units > 0 {
+            return false;
+        }
 
         let continues = |held: &runtime::Request| {
             matches!(
@@ -1579,6 +1602,7 @@ impl Scheduler {
                 | Completion::Pinned { .. }
                 | Completion::Transferred { .. }
                 | Completion::Copy { .. }
+                | Completion::Replicated { .. }
         );
         // A commit outlives its owner's `Detach` (BP §9, R6): its block is shared under its key
         // all the same, and the write policy may store it.
@@ -1874,7 +1898,8 @@ impl Scheduler {
 
     /// The groups whose device block tables may hold entries of `owner`, of `class` or of any
     /// class: the group of the owner's attachment, and every other group its request is attached
-    /// to that states a region of the class that the owner's group states too.
+    /// to that states a region of the class that the owner's group states too, or receives the
+    /// class, holding the entries a crossing brought it.
     fn holders(&self, owner: OwnerId, class: Option<u8>) -> Vec<GroupId> {
         let Some(request) = self.request_of(owner) else {
             return Vec::new();
@@ -1899,10 +1924,12 @@ impl Scheduler {
                 continue;
             };
             let reads = classes.clone().any(|class| {
+                let receives = reader.layout.receives.get(usize::from(class));
                 reader
                     .regions(class)
                     .iter()
                     .any(|region| writer.regions(class).contains(region))
+                    || receives.is_some_and(|regions| !regions.is_empty())
             });
             if reads {
                 groups.push(group);
@@ -1928,7 +1955,10 @@ impl Scheduler {
     }
 
     /// The groups, each with its slot as [`Scheduler::slot_of`] states it, that a completion of
-    /// `request` is handed to by `map`: none for a completion that gives no entries.
+    /// `request` is handed to by `map`: none for a completion that gives no entries. A block's
+    /// allocation or pin goes to the groups that may hold its entry and read it in a memory its
+    /// writer writes it in, and a crossing's `Replicated` to the group it copied into, which
+    /// reads it in the memories the crossing made it valid in (BP §9, obligation 1).
     fn mapped(
         &self,
         owner: Option<OwnerId>,
@@ -1942,22 +1972,30 @@ impl Scheduler {
             }
             (_, Completion::Copy { group, .. }) => vec![(*group, self.slot_of(owner, *group))],
             (
-                runtime::Request::Allocate { owner, class, .. }
-                | runtime::Request::Pin { owner, class, .. },
+                runtime::Request::Allocate {
+                    owner, class, at, ..
+                }
+                | runtime::Request::Pin {
+                    owner, class, at, ..
+                },
                 Completion::Allocated { .. } | Completion::Pinned { .. },
             ) => self
                 .holders(*owner, Some(*class))
                 .into_iter()
+                .filter(|group| self.reads_where_written(*owner, (*class, *at), *group))
                 .map(|group| (group, self.slot_of(Some(*owner), group)))
                 .collect(),
+            (runtime::Request::Replicate { owner, group, .. }, Completion::Replicated { .. }) => {
+                vec![(*group, self.slot_of(Some(*owner), *group))]
+            }
             _ => Vec::new(),
         }
     }
 
-    /// Whether a `Release`, a `Commit` or a `Transfer` naming entries `request` gives was handed
-    /// to the executor after `request`, numbered `number`, was submitted: it is being stamped,
-    /// held, or outstanding under a later number. A request submitted after such a `Release`
-    /// waited behind it, so it was written after it.
+    /// Whether a `Release`, a `Commit`, a `Transfer` or a `Replicate` naming entries `request`
+    /// gives was handed to the executor after `request`, numbered `number`, was submitted: it is
+    /// being stamped, held, or outstanding under a later number. A request submitted after such
+    /// a `Release` waited behind it, so it was written after it.
     fn superseded(&self, number: u64, owner: Option<OwnerId>, request: &runtime::Request) -> bool {
         if owner.is_none() {
             return false;
@@ -1968,6 +2006,7 @@ impl Scheduler {
                 runtime::Request::Release { .. }
                     | runtime::Request::Commit { .. }
                     | runtime::Request::Transfer { .. }
+                    | runtime::Request::Replicate { .. }
             ) && overlap(request, other)
         };
 
@@ -1981,8 +2020,22 @@ impl Scheduler {
 
     /// Per region (by index), the units a request takes from the device regions of a class in
     /// its owner's group: an `Allocate` its blocks, a `Load` a block per key, which the copy
-    /// from the host fills, and a `Clone` the one block it copies into.
+    /// from the host fills, and a `Clone` the one block it copies into; and a `Replicate` the
+    /// runs it takes in the receiving regions of the group it copies into.
     fn taken(&self, request: &runtime::Request) -> Vec<(usize, u32)> {
+        if let runtime::Request::Replicate {
+            owner,
+            at,
+            from,
+            group,
+            ..
+        } = *request
+        {
+            return self
+                .request_of(owner)
+                .map(|row| self.receiving(row, (at, group, from)))
+                .unwrap_or_default();
+        }
         let (owner, class, count, units) = match request {
             runtime::Request::Allocate {
                 owner,
@@ -2108,7 +2161,25 @@ impl Scheduler {
                 .region_index(*region)
                 .and_then(|index| self.capacity.get(index))
                 .map(|capacity| 4 + LIST + KEY * capacity.saturating_sub(*units) as usize),
-            runtime::Request::List | runtime::Request::Replicate { .. } => None,
+            // The block's runs in the group's regions and receiving regions of the class, and a
+            // key evicted per unit its receiving runs take.
+            runtime::Request::Replicate {
+                owner,
+                class,
+                at,
+                from,
+                group,
+                ..
+            } => self
+                .request_of(*owner)
+                .zip(self.group(*group))
+                .map(|(row, reader)| {
+                    let receiving = self.receiving(row, (*at, *group, *from));
+                    let runs = reader.regions(*class).len() + receiving.len();
+                    let evicted = receiving.iter().map(|(_, units)| *units as usize).sum();
+                    LIST + RUN.saturating_mul(runs) + LIST + KEY.saturating_mul(evicted)
+                }),
+            runtime::Request::List => None,
         };
 
         // The number, the variant, and at least the one byte of a `Refused` or a `Full`.
@@ -2230,7 +2301,8 @@ fn owner_of(request: &runtime::Request) -> Option<OwnerId> {
         | runtime::Request::Transfer { owner, .. }
         | runtime::Request::Load { owner, .. }
         | runtime::Request::Save { owner, .. }
-        | runtime::Request::Restore { owner, .. } => Some(*owner),
+        | runtime::Request::Restore { owner, .. }
+        | runtime::Request::Replicate { owner, .. } => Some(*owner),
         _ => None,
     }
 }
@@ -2288,6 +2360,9 @@ fn span(request: &runtime::Request) -> Option<(OwnerId, Option<u8>, Range<u32>)>
         }
         | runtime::Request::Clone {
             owner, class, at, ..
+        }
+        | runtime::Request::Replicate {
+            owner, class, at, ..
         } => Some((*owner, Some(*class), positions(*at, 1))),
         runtime::Request::Transfer { owner, .. } | runtime::Request::Detach { owner, .. } => {
             Some((*owner, None, 0..u32::MAX))
@@ -2303,7 +2378,8 @@ fn stamps_of(request: &mut runtime::Request) -> Option<&mut runtime::Stamps> {
         | runtime::Request::Release { after, .. }
         | runtime::Request::Commit { after, .. }
         | runtime::Request::Transfer { after, .. }
-        | runtime::Request::Finish { after, .. } => Some(after),
+        | runtime::Request::Finish { after, .. }
+        | runtime::Request::Replicate { after, .. } => Some(after),
         _ => None,
     }
 }

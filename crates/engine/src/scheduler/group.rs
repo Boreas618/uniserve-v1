@@ -21,9 +21,11 @@
 //! - **Buckets.** A batch is formed only while it fits a bucket the workers captured.
 //! - **Placement.** The candidates of a request's phase are the groups that serve it, have a
 //!   free slot or hold the request already, and share a region of every product class they state
-//!   with each group the request is placed on, so its products pass between them; among them the
-//!   request's own group, then the policy's choice for a request placed nowhere, then the least
-//!   loaded group (SD §3.5, §7.3).
+//!   with each group the request is placed on, so its products pass between them in place; only
+//!   when no group does, those a crossing brings the products to, which receive the classes they
+//!   share no region of (`storage::runtime::Request::Replicate`); among them the request's own
+//!   group, then the policy's choice for a request placed nowhere, then the least loaded group
+//!   (SD §3.5, §7.3; `artifacts/buffer-pool/p4-design.md` decision 4).
 
 use std::cmp::Reverse;
 
@@ -243,10 +245,11 @@ pub(super) fn encodes_on_host(decoder: &WorkerGroupConfig, encoder: &WorkerGroup
 impl Scheduler {
     /// The groups that can run `phase` of `request`, in the order they are configured: those that
     /// serve it ([`WorkerGroup::serves`]), that the request is placed on already or whose slot
-    /// region has a free slot, and that pass products with every group the request is placed on
-    /// ([`Scheduler::passes_products`]). A video encode is offered only the groups whose codec
-    /// encodes on the hosts of the request's decoder ([`encodes_on_host`]). Empty when nothing
-    /// can place it now.
+    /// region has a free slot, and that pass products in place with every group the request is
+    /// placed on ([`Scheduler::passes_products`]); when no group does, those that pass them with
+    /// each such group in place or by a crossing. A video encode is offered only the groups whose
+    /// codec encodes on the hosts of the request's decoder ([`encodes_on_host`]). Empty when
+    /// nothing can place it now.
     pub(super) fn candidates(&self, request: &Request, phase: Phase) -> Vec<GroupId> {
         let decoder = (phase == Phase::VideoEncode)
             .then(|| request.placement[Phase::VideoDecode.index()])
@@ -259,7 +262,8 @@ impl Scheduler {
             .filter_map(|id| self.group(*id))
             .collect();
 
-        self.groups
+        let serving: Vec<&WorkerGroup> = self
+            .groups
             .iter()
             .filter(|group| group.serves(phase))
             .filter(|group| {
@@ -268,27 +272,49 @@ impl Scheduler {
             .filter(|group| {
                 decoder.is_none_or(|decoder| encodes_on_host(&decoder.config, &group.config))
             })
-            .filter(|group| {
+            .collect();
+        let passing = |crossing: bool| -> Vec<GroupId> {
+            let passes = |group: &WorkerGroup| {
                 placed
                     .iter()
-                    .all(|other| self.passes_products(group, other))
-            })
-            .map(WorkerGroup::id)
-            .collect()
+                    .all(|other| self.passes_products(group, other, crossing))
+            };
+            serving
+                .iter()
+                .filter(|group| passes(group))
+                .map(|group| group.id())
+                .collect()
+        };
+
+        let in_place = passing(false);
+        if in_place.is_empty() {
+            passing(true)
+        } else {
+            in_place
+        }
     }
 
     /// Whether a request's products pass between groups `one` and `other`: of every product
     /// class (`super::video::PRODUCTS`, the classes just before the class of stored trajectories)
-    /// both state regions of, they share one. A group that reads a product states the regions of
-    /// the groups of its scheduler whose blocks of it its ranks reach, so a writer and a reader
-    /// that share none lie in two processes, which no product passes between
-    /// (`crate::process::ranks::layout`). The blocks of a KV class move between groups by a
-    /// transfer instead, and are not asked to.
-    fn passes_products(&self, one: &WorkerGroup, other: &WorkerGroup) -> bool {
+    /// both state regions of, they share one, or, with `crossing`, one of them states receiving
+    /// regions of it, where a crossing brings the other's blocks
+    /// (`storage::runtime::Request::Replicate`). A group that reads a product states the regions
+    /// of the groups of its scheduler whose blocks of it its ranks reach, so a writer and a reader
+    /// that share none lie in two processes, between which a product passes only by a crossing
+    /// into the reader's receiving region (`crate::process::ranks::layout`). The blocks of a KV
+    /// class move between groups by a transfer instead, and are not asked to.
+    fn passes_products(&self, one: &WorkerGroup, other: &WorkerGroup, crossing: bool) -> bool {
         // A session whose classes do not number the product kinds states no product class.
         let last = usize::from(self.trajectory);
         let Some(first) = last.checked_sub(PRODUCTS.len()) else {
             return true;
+        };
+        let receives = |group: &WorkerGroup, class: usize| {
+            group
+                .layout
+                .receives
+                .get(class)
+                .is_some_and(|regions| !regions.is_empty())
         };
         (first..last).all(|class| {
             match (
@@ -299,6 +325,7 @@ impl Scheduler {
                     ours.is_empty()
                         || theirs.is_empty()
                         || ours.iter().any(|region| theirs.contains(region))
+                        || (crossing && (receives(one, class) || receives(other, class)))
                 }
                 _ => true,
             }
@@ -551,6 +578,7 @@ mod tests {
             num_encoded_inputs: 0,
             encodings: Vec::new(),
             unpinned: Vec::new(),
+            crossings: Vec::new(),
             num_acknowledged_tokens: 0,
             terminal: None,
             event_credit: 64,
@@ -941,5 +969,48 @@ mod tests {
             scheduler.candidates(&video, Phase::TextEncode),
             [GroupId(0)]
         );
+    }
+
+    #[test]
+    fn a_phase_is_placed_where_its_products_pass_in_place_before_where_a_crossing_brings_them() {
+        // A text encoder on host `a` writes the conditioning in region 10; one denoiser reads it
+        // there, another on host `b` reads its own host's in region 11 and receives others' in
+        // region 12, where a crossing brings them.
+        let text = (
+            config("text", WorkerGroupRole::Model, &["a"]),
+            capacity(&[Phase::TextEncode], 1),
+        );
+        let flow = |id: &str, host: &str| {
+            (
+                config(id, WorkerGroupRole::Model, &[host]),
+                capacity(&[Phase::LatentPrepare, Phase::Denoise], 1),
+            )
+        };
+        let mut scheduler = scheduler(
+            vec![text, flow("flow-a", "a"), flow("flow-b", "b")],
+            &[4, 4, 4],
+        );
+        scheduler.trajectory = u8::try_from(PRODUCTS.len()).unwrap();
+        let conditioning = PRODUCTS
+            .iter()
+            .position(|(name, _)| *name == crate::batch::product::CONDITIONING)
+            .unwrap();
+        for (index, region, received) in [(0, 10, None), (1, 10, None), (2, 11, Some(12))] {
+            let mut regions = vec![Vec::new(); PRODUCTS.len() + 1];
+            regions[conditioning] = vec![region];
+            let mut receives = vec![Vec::new(); PRODUCTS.len() + 1];
+            receives[conditioning].extend(received);
+            let layout = &mut scheduler.groups[index].layout;
+            layout.regions = regions;
+            layout.receives = receives;
+        }
+
+        // Encoded on `a`, the request denoises where it reads the conditioning in place; with no
+        // slot there, where a crossing brings it.
+        let mut video = request(1);
+        video.placement[Phase::TextEncode.index()] = Some(GroupId(0));
+        assert_eq!(scheduler.candidates(&video, Phase::Denoise), [GroupId(1)]);
+        scheduler.available[1] = 0;
+        assert_eq!(scheduler.candidates(&video, Phase::Denoise), [GroupId(2)]);
     }
 }

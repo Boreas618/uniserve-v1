@@ -123,6 +123,13 @@ pub(crate) struct Request {
     /// holders of: a block answered `Duplicate`, which stays private to it (BP §9, R4), and an
     /// encoder output it computed and did not commit. Giving up its pins passes over them.
     pub unpinned: Vec<Key>,
+    /// The crossings a video request's calls wait for (SD §3.3, BP §15 "A product read in
+    /// another process"): per declared result that a group of its placement reads in a memory
+    /// its writer does not write it in, the result's position, that group, the region (by its
+    /// number) of the run its writer writes it in, and where the crossing is: `None` until it is
+    /// asked, `Some(false)` while it is asked and not answered, `Some(true)` once it was answered
+    /// `Replicated`. Set by its admission.
+    pub crossings: Vec<(u32, GroupId, u8, Option<bool>)>,
     /// Output tokens the daemon's decoder has passed.
     pub num_acknowledged_tokens: u32,
 
@@ -250,6 +257,7 @@ impl Request {
             num_encoded_inputs: 0,
             encodings: Vec::new(),
             unpinned: Vec::new(),
+            crossings: Vec::new(),
             num_acknowledged_tokens: 0,
             terminal: None,
             event_credit: u32::try_from(EVENT_WINDOW).unwrap_or(u32::MAX),

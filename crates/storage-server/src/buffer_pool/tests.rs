@@ -1845,7 +1845,10 @@ fn a_crossing_waits_for_its_stamps_and_its_task_and_makes_the_block_valid_where_
     assert_eq!(fixture.ask(transfer), refused);
     fixture.pool.ended((QUEUE, crossing), true);
     fixture.checked();
-    let replicated = Some(Completion::Replicated { runs: run.clone() });
+    let replicated = Some(Completion::Replicated {
+        runs: run.clone(),
+        evicted: Vec::new(),
+    });
     assert_eq!(fixture.answer(crossing), replicated);
 
     // R5: a crossing into memory that holds the block is answered at once.
@@ -2088,9 +2091,10 @@ fn a_crossing_takes_a_run_in_the_receiving_region_of_a_memory_where_the_block_ha
     fixture.pool.ended((QUEUE, crossing), true);
     fixture.checked();
     let runs = vec![(4, 0, 3)];
+    let evicted = Vec::new();
     assert_eq!(
         fixture.answer(crossing),
-        Some(Completion::Replicated { runs })
+        Some(Completion::Replicated { runs, evicted })
     );
 
     // The runs leave with the block.
@@ -2103,6 +2107,62 @@ fn a_crossing_takes_a_run_in_the_receiving_region_of_a_memory_where_the_block_ha
     };
     assert_eq!(fixture.ask(release), Some(Completion::Done));
     assert_eq!((fixture.free(3), fixture.free(4)), (4, 4));
+}
+
+#[test]
+fn a_crossing_names_the_keys_taking_its_receiving_run_evicted() {
+    // The writer backs products in process a; the reader receives them in process b's buffer,
+    // which a third group's committed block, given up and first in the queue pair's order, fills.
+    let writer = stated(0, "process a", 1, vec![vec![0], vec![3]]);
+    let reader = storage::runtime::Group {
+        receives: vec![Vec::new(), vec![4]],
+        ..stated(1, "process b", 2, vec![vec![0], Vec::new()])
+    };
+    let cacher = stated(2, "process b", 2, vec![vec![0], vec![4]]);
+    let mut fixture = Fixture {
+        pool: processes(vec![writer, reader, cacher]),
+        number: 0,
+    };
+    let product = |owner, units| Request::Allocate {
+        owner: OwnerId(owner),
+        class: 1,
+        at: 0,
+        count: 1,
+        units,
+    };
+    fixture.attach(1, GroupId(2));
+    fixture.ask(product(1, 4));
+    let commit = Request::Commit {
+        owner: OwnerId(1),
+        class: 1,
+        at: 0,
+        key: key(9),
+        tokens: 1,
+        after: Vec::new(),
+    };
+    assert_eq!(fixture.ask(commit), Some(Completion::Committed));
+    assert_eq!(fixture.detach(1, Vec::new()), Some(Completion::Done));
+    let victims = Request::Victims {
+        region: 4,
+        keys: vec![key(9)],
+    };
+    assert_eq!(fixture.ask(victims), Some(Completion::Done));
+    assert_eq!(fixture.free(4), 0);
+
+    // The receiving run evicts the cached block, and the crossing's answer names its key, once
+    // its task ended.
+    fixture.attach(2, GroupId(0));
+    fixture.ask(product(2, 3));
+    let crossing = fixture.submit(QUEUE, replicate(2, 1, 0, 3, GroupId(1), Vec::new()));
+    assert_eq!(fixture.answer(crossing), None);
+    assert!(fixture.listing().is_empty());
+    fixture.pool.ended((QUEUE, crossing), true);
+    fixture.checked();
+    let replicated = Completion::Replicated {
+        runs: vec![(4, 0, 3)],
+        evicted: vec![key(9)],
+    };
+    assert_eq!(fixture.answer(crossing), Some(replicated));
 }
 
 #[test]
@@ -2135,6 +2195,7 @@ fn a_product_backed_in_two_processes_is_valid_where_the_crossing_names_its_writt
     fixture.checked();
     let replicated = Some(Completion::Replicated {
         runs: vec![(3, 0, 2)],
+        evicted: Vec::new(),
     });
     assert_eq!(fixture.answer(crossing), replicated);
 

@@ -48,7 +48,7 @@ use serde::{Deserialize, Serialize};
 use storage::protocol::Key;
 use storage::runtime::{Cause, Completion, GroupId, OwnerId, Request, RequestId, Segments, Stamps};
 
-pub(crate) use image::{FORMAT, format1};
+pub(crate) use image::{FORMAT, format1, format2};
 use region::{Region, Run};
 /// A kind of block, as a session states it in its layout; the pool keeps
 /// its host region by the pool's number of that region.
@@ -436,7 +436,9 @@ pub struct BufferPool {
     groups: HashMap<(ClientId, GroupId), Group>,
     /// By the request that started each.
     copies: HashMap<(QueueId, RequestId), Vec<Copy>>,
-    /// The tasks whose request is not answered yet, with the keys done so far.
+    /// The tasks whose request is not answered yet, with the keys done so far;
+    /// for a crossing, from when it is taken, the keys taking its runs
+    /// evicted, which its `Replicated` names.
     answers: HashMap<(QueueId, RequestId), Vec<Key>>,
     /// The epoch of each session.
     sessions: HashMap<ClientId, u64>,

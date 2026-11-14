@@ -454,6 +454,7 @@ pub(super) mod tests {
             num_encoded_inputs: 0,
             encodings: Vec::new(),
             unpinned: Vec::new(),
+            crossings: Vec::new(),
             num_acknowledged_tokens: 0,
             terminal: None,
             event_credit: 64,

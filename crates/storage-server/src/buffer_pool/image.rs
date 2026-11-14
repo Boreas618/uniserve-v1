@@ -13,9 +13,9 @@
 //!
 //! An image is in the format of the build that wrote it ([`FORMAT`]), which
 //! a restart in place states beside it. A successor reads its own build's
-//! format and the one before ([`format1`]): the server it succeeds may be of
-//! the previous build, and its sessions go on in the versions of the
-//! interface they were opened with.
+//! format and those before ([`format2`], [`format1`]): the server it
+//! succeeds may be of an earlier build, and its sessions go on in the
+//! versions of the interface they were opened with.
 
 use std::collections::{BTreeMap, HashMap};
 use std::rc::Rc;
@@ -32,8 +32,9 @@ use super::{
 
 /// The format of the images this build writes: with what version 3 of the
 /// runtime interface added and the version each session speaks, both of
-/// which format 1 lacks.
-pub(crate) const FORMAT: u32 = 2;
+/// which format 1 lacks, and with its completions not yet written as records
+/// of this build's version ([`VERSION`]), which format 2 wrote in version 4.
+pub(crate) const FORMAT: u32 = 3;
 
 /// The image of a pool, over the regions `R` and the blocks `B`: borrowed
 /// from a pool to write it, owned to make a pool of it. Maps keyed by more
@@ -493,6 +494,38 @@ pub(super) mod owner_id {
         deserializer: D,
     ) -> Result<OwnerId, D::Error> {
         u64::deserialize(deserializer).map(OwnerId)
+    }
+}
+
+/// Format 2: this build's image as the builds of version 4 of the runtime
+/// interface wrote it, whose completions not yet written are records of
+/// version 4: a crossing's answer names no evicted keys.
+pub(crate) mod format2 {
+    use serde::Deserialize;
+
+    use super::super::{Block, BufferPool, Region};
+    use super::Image as Current;
+
+    /// This format's number.
+    pub(crate) const FORMAT: u32 = 2;
+
+    /// The version of the runtime interface the completions of format 2 are
+    /// records of.
+    const VERSION: u32 = 4;
+
+    /// An image of format 2: this build's fields.
+    #[derive(Deserialize)]
+    #[serde(transparent)]
+    pub(crate) struct Image(Current<Vec<Region>, Vec<Block>>);
+
+    impl TryFrom<Image> for BufferPool {
+        type Error = String;
+
+        /// The pool an image of format 2 states, its completions read as
+        /// records of version 4.
+        fn try_from(image: Image) -> Result<Self, String> {
+            Self::assemble(image.0, VERSION)
+        }
     }
 }
 

@@ -50,7 +50,7 @@ use ::storage::runtime;
 use serde::{Deserialize, Serialize};
 use service::{Connection, Handed};
 
-use crate::buffer_pool::{FORMAT, format1};
+use crate::buffer_pool::{FORMAT, format1, format2};
 use crate::kv_storage::KvStorage;
 use crate::quota::Quotas;
 use crate::sessions::{Sessions, SessionsHandoff};
@@ -193,10 +193,12 @@ fn speaks(protocol: &[u32], sessions: &[u32], image: u32) -> Result<(), String> 
             runtime::VERSION
         ));
     }
-    if image != FORMAT && image != format1::FORMAT {
+    if ![format1::FORMAT, format2::FORMAT, FORMAT].contains(&image) {
         return Err(format!(
-            "the buffer pools' image is of format {image}; the successor reads {} and {FORMAT}",
-            format1::FORMAT
+            "the buffer pools' image is of format {image}; the successor reads {}, {} and \
+             {FORMAT}",
+            format1::FORMAT,
+            format2::FORMAT
         ));
     }
     Ok(())

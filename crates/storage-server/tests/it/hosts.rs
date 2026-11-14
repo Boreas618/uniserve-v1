@@ -695,6 +695,7 @@ fn a_crossing_copies_a_product_into_a_main_process_of_another_host_through_that_
     };
     let replicated = Completion::Replicated {
         runs: vec![(receiving, 0, 2)],
+        evicted: Vec::new(),
     };
     assert_eq!(writer.ask(crossing), replicated);
     assert_eq!(read(&buffers[1], 0, 512), product);

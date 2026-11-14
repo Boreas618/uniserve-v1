@@ -584,7 +584,7 @@ impl BlockTables {
                     group,
                     ..
                 },
-                Completion::Replicated { runs },
+                Completion::Replicated { runs, .. },
             ) => {
                 self.check_group(*group)?;
                 if runs.is_empty() {
@@ -1420,6 +1420,7 @@ mod tests {
         // those of its own process, read-only, and resets nothing.
         let replicated = Completion::Replicated {
             runs: vec![(PRODUCTS, 0, 3), (RECEIVING, 9, 3)],
+            evicted: vec![],
         };
         for tables in [&mut writing, &mut reading] {
             tables
@@ -1452,9 +1453,13 @@ mod tests {
             group: GroupId(1),
             after: vec![],
         };
-        let none = Completion::Replicated { runs: vec![] };
+        let none = Completion::Replicated {
+            runs: vec![],
+            evicted: vec![],
+        };
         let other = Completion::Replicated {
             runs: vec![(RECEIVING, 12, 3)],
+            evicted: vec![],
         };
         let unanswered = Request::Release {
             owner: OwnerId(1),

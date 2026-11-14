@@ -467,13 +467,17 @@ impl BufferPool {
         }
 
         block.valid.set(valid);
+        // The keys evicted for the runs taken, which the answer names (SD §4.5): the
+        // crossing owes them until it is answered.
+        let mut evicted = Vec::new();
         if !taken.is_empty() {
             // The block's units are counted again with its new runs.
             self.uncount(&block);
-            for (region, size, evicted) in taken {
-                for key in &evicted {
+            for (region, size, keys) in taken {
+                for key in &keys {
                     self.evict_in(key, region);
                 }
+                evicted.extend(keys);
                 let run = self.regions[usize::from(region)].take(size);
                 block.runs.borrow_mut().extend(run);
             }
@@ -481,8 +485,9 @@ impl BufferPool {
         }
         if targets == 0 {
             let runs = self.read_runs(client, group, class, &block);
-            return Ok(Some(Completion::Replicated { runs }));
+            return Ok(Some(Completion::Replicated { runs, evicted }));
         }
+        self.answers.insert((queue, id), evicted);
 
         // The crossing holds the block while it waits, as a release does.
         self.touch(&block);
@@ -509,6 +514,7 @@ impl BufferPool {
     /// group reads the class in holds the block, `Replicated` (R5);
     /// otherwise a task of the Transfer Server starts that copies the block
     /// into each memory that lacks it, holding the block until it ends (R9).
+    /// The keys its take evicted (`answers`) are named by its `Replicated`.
     /// Returns the crossing when it must wait.
     pub(super) fn cross(&mut self, work: Deferred) -> Option<Deferred> {
         let Deferred::Replicate {
@@ -551,9 +557,11 @@ impl BufferPool {
             .is_some_and(|held| Rc::ptr_eq(held.block(), &block));
         let targets = reading & !block.valid.get();
         if !held || targets == 0 {
+            let evicted = self.answers.remove(&(queue, request)).unwrap_or_default();
             let completion = if held {
                 Completion::Replicated {
                     runs: self.read_runs(client, to, class, &block),
+                    evicted,
                 }
             } else {
                 Completion::Failed
@@ -584,23 +592,25 @@ impl BufferPool {
             })
             .collect();
         self.hold_copies((queue, request), copies);
-        // The task's copies hold the block from now on.
+        // The task's copies hold the block from now on, and the task owes the keys its take
+        // evicted.
         self.reclaim(block);
-        self.answers.insert((queue, request), Vec::new());
+        self.answers.entry((queue, request)).or_default();
         self.started.push((queue, request));
         None
     }
 
     /// A crossing's task ended (A5). When it copied everything, every memory
     /// it wrote holds the block, whatever became of its owner; the answer is
-    /// the block's runs the group reads the class in while the owner still
-    /// holds the block at its position, and `Failed` otherwise.
+    /// the block's runs the group reads the class in, with `evicted`, the
+    /// keys its take evicted, while the owner still holds the block at its
+    /// position, and `Failed` otherwise.
     fn replicated(
         &mut self,
         client: ClientId,
         copies: &[Copy],
         (owner, class, at): (OwnerId, u8, u32),
-        group: GroupId,
+        (group, evicted): (GroupId, Vec<Key>),
         ok: bool,
     ) -> Completion {
         let Some(block) = copies.first().map(|copy| Rc::clone(&copy.write)) else {
@@ -619,6 +629,7 @@ impl BufferPool {
         let completion = if ok && held {
             Completion::Replicated {
                 runs: self.read_runs(client, group, class, &block),
+                evicted,
             }
         } else {
             Completion::Failed
@@ -881,7 +892,11 @@ impl BufferPool {
                 group,
                 ..
             }) => {
-                let completion = self.replicated(task.0.0, &copies, (owner, class, at), group, ok);
+                // A crossing answered at its deadline still makes valid what it copied.
+                let evicted = answer.clone().unwrap_or_default();
+                let replicated = (owner, class, at);
+                let completion =
+                    self.replicated(task.0.0, &copies, replicated, (group, evicted), ok);
                 answer.map(|_| completion)
             }
             Some(Target::Entry { remote: true, .. }) => {

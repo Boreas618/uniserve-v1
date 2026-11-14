@@ -70,7 +70,7 @@ use storage::runtime::{
 
 use crate::Server;
 use crate::buffer_pool::trace::{Input, Trace, stated_input};
-use crate::buffer_pool::{BufferPool, ClientId, FORMAT, QueueId, format1};
+use crate::buffer_pool::{BufferPool, ClientId, FORMAT, QueueId, format1, format2};
 
 /// How long the thread sleeps when every queue is empty and nothing is
 /// deferred: the longest a request of an idle engine waits to be taken.
@@ -352,6 +352,31 @@ struct Queue {
 #[derive(Serialize, Deserialize)]
 struct Handed<P> {
     deployments: Vec<(String, P, ClientId, Vec<QueueHandoff>)>,
+}
+
+/// The pools of a handoff in the earlier image format `format`, whose
+/// image of a pool is an `I`, each made as this build holds it.
+///
+/// # Errors
+///
+/// A handoff that is not one of that format, or a pool its image does not
+/// state.
+fn converted<I>(bytes: &[u8], format: u32) -> io::Result<Handed<BufferPool>>
+where
+    I: for<'de> Deserialize<'de>,
+    BufferPool: TryFrom<I, Error = String>,
+{
+    let handed: Handed<I> = rmp_serde::from_slice(bytes).map_err(io::Error::other)?;
+    let mut deployments = Vec::with_capacity(handed.deployments.len());
+    for (deployment, image, next, queues) in handed.deployments {
+        let pool = BufferPool::try_from(image).map_err(|error| {
+            io::Error::other(format!(
+                "the buffer pool of {deployment} handed over in format {format}: {error}"
+            ))
+        })?;
+        deployments.push((deployment, pool, next, queues));
+    }
+    Ok(Handed { deployments })
 }
 
 /// A queue pair's state as a restart in place hands it over.
@@ -1164,8 +1189,8 @@ impl Pools {
     }
 
     /// The pools a predecessor handed over in the image format `format`,
-    /// this build's or format 1, each checked, with their queue pairs, which
-    /// go on from the indices the predecessor published.
+    /// this build's, format 2 or format 1, each checked, with their queue
+    /// pairs, which go on from the indices the predecessor published.
     fn resume(
         bytes: &[u8],
         format: u32,
@@ -1174,25 +1199,14 @@ impl Pools {
     ) -> io::Result<BTreeMap<String, Hosted>> {
         let handed: Handed<BufferPool> = match format {
             FORMAT => rmp_serde::from_slice(bytes).map_err(io::Error::other)?,
-            format1::FORMAT => {
-                let handed: Handed<format1::Image> =
-                    rmp_serde::from_slice(bytes).map_err(io::Error::other)?;
-                let mut deployments = Vec::with_capacity(handed.deployments.len());
-                for (deployment, image, next, queues) in handed.deployments {
-                    let pool = BufferPool::try_from(image).map_err(|error| {
-                        io::Error::other(format!(
-                            "the buffer pool of {deployment} handed over in format 1: {error}"
-                        ))
-                    })?;
-                    deployments.push((deployment, pool, next, queues));
-                }
-                Handed { deployments }
-            }
+            format2::FORMAT => converted::<format2::Image>(bytes, format)?,
+            format1::FORMAT => converted::<format1::Image>(bytes, format)?,
             other => {
                 return Err(io::Error::other(format!(
                     "the buffer pools are handed over in image format {other}; this build reads \
-                     formats {} and {FORMAT}",
-                    format1::FORMAT
+                     formats {}, {} and {FORMAT}",
+                    format1::FORMAT,
+                    format2::FORMAT
                 )));
             }
         };

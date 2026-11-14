@@ -33,12 +33,16 @@ use std::ops::Range;
 
 use crate::batch::product;
 use crate::batch::{Extent, Phase, Shape};
+use crate::process::ranks::rank::video::served_phases;
+use crate::runner::decoder::RoundConfig;
 use proto::config::VIDEO_DECODER_BLOCK;
-use proto::request::{ConditionExtent, DiffusionRequest, Event, MigrationCause};
+use proto::request::{ConditionExtent, DiffusionRequest, Event, MigrationCause, RequestId};
 use storage::Key;
 use storage::key::latent_content;
+use storage::runtime::{self, Cause, Completion, GroupId, OwnerId};
 
-use super::{Request, Scheduler, WorkerGroup};
+use super::update::migratable;
+use super::{Request, RequestStatus, Scheduler, WorkerGroup};
 
 /// Denoising steps one request keeps in flight: the step its denoiser runs and the next, queued
 /// behind it, so that the denoiser never waits for the host between steps and a preemption meets
@@ -120,7 +124,8 @@ impl Request {
 
     /// Whether a video request may be given one more call of `phase` now (SD §3.3, with the rules
     /// of `S/execution/media.rs:269-403` and the splice tail of gap G11). It has calls of the
-    /// phase left, and:
+    /// phase left, every crossing of a product the call reads into its group was answered
+    /// `Replicated` (BP §15 "A product read in another process"), and:
     ///
     /// - every call but the media read waits until the read completed: the text encoding reads
     ///   the vision pixels it wrote and the latent preparation the condition pixels and samples,
@@ -136,8 +141,11 @@ impl Request {
     ///   call at a time; the final one waits for every encode round and the audio encode.
     ///
     /// A predecessor is handed over once its calls are scheduled when it runs on the same group
-    /// as `phase`, whose workers run them in submission order, and once they completed
-    /// otherwise, since nothing else orders another group's write before the read.
+    /// as `phase` and every rank of that group that runs `phase` runs it too ([`ordered`]): each
+    /// such rank's worker runs the two in submission order. It is handed over once its calls
+    /// completed otherwise: nothing orders another group's write before the read, nor the write
+    /// of a rank whose own worker passes the read (a decoder rank that does not denoise receives
+    /// its latents from its process's first denoising rank, `BufferMemory::share`).
     pub(super) fn video_ready(&self, phase: Phase, groups: &[WorkerGroup]) -> bool {
         if self.video().is_none() || phase.index() >= Phase::COUNT {
             return false;
@@ -149,7 +157,11 @@ impl Request {
         let done = |phase: Phase| completed(phase) >= needed(phase);
         let handed = |before: Phase| {
             let group = self.placement[before.index()];
-            let along = group.is_some() && group == self.placement[phase.index()];
+            let along = group.is_some()
+                && group == self.placement[phase.index()]
+                && self
+                    .serving(phase, groups)
+                    .is_some_and(|group| ordered(group, before, phase));
             let count = if along {
                 scheduled(before)
             } else {
@@ -162,6 +174,9 @@ impl Request {
             return false;
         }
         if phase != Phase::MediaRead && !done(Phase::MediaRead) {
+            return false;
+        }
+        if !self.crossed(phase, groups) {
             return false;
         }
         match phase {
@@ -223,13 +238,15 @@ impl Request {
     /// The text encoding reads the vision pixels of the conditions' vision blocks, whose features
     /// it computes inside the call. The latent preparation reads the conditioning, the condition
     /// pixels and the condition samples, in the order the denoiser tells them apart by class, and
-    /// encodes the condition latents inside the call. The video units and the encoded units are
-    /// one block each, reserved whole at admission, of which each round writes the slice of its
-    /// units (from its row's `unit`). A video decode round after the first reads the splice tail
-    /// of the unit before its own, which the round before it wrote, and every round writes the
-    /// tail of each unit it decodes, one block per unit. Only the last denoising step writes the
-    /// latents the decoders read; the steps before it keep the trajectory in the slot. A muxing
-    /// call hands over the encode round it follows, and the final one reads nothing.
+    /// encodes the condition latents inside the call. The video units are one block, reserved
+    /// whole at admission, of which each round writes the slice of its units (from its row's
+    /// `unit`). A video decode round after the first reads the splice tail of the unit before its
+    /// own, which the round before it wrote, and every round writes the tail of each unit it
+    /// decodes, one block per unit. An encode round writes the encoded unit of each unit of its
+    /// round, one block per unit, which the process that decoded the unit encodes, so that each
+    /// block is written in one process. Only the last denoising step writes the latents the
+    /// decoders read; the steps before it keep the trajectory in the slot. A muxing call hands
+    /// over the encoded units of the round it follows, and the final one reads nothing.
     pub(super) fn results(
         &self,
         phase: Phase,
@@ -247,9 +264,8 @@ impl Request {
             Phase::Denoise if last => (&[], &[VIDEO_LATENTS, AUDIO_LATENTS]),
             Phase::VideoDecode => (&[VIDEO_LATENTS], &[VIDEO_UNITS]),
             Phase::AudioDecode => (&[AUDIO_LATENTS], &[AUDIO_SAMPLES]),
-            Phase::VideoEncode => (&[VIDEO_UNITS], &[ENCODED_UNITS]),
+            Phase::VideoEncode => (&[VIDEO_UNITS], &[]),
             Phase::AudioEncode => (&[AUDIO_SAMPLES], &[]),
-            Phase::Mux if call < rounds => (&[ENCODED_UNITS], &[]),
             _ => (&[], &[]),
         };
 
@@ -261,11 +277,23 @@ impl Request {
                 .collect()
         };
         let (mut reads, mut writes) = (declared(reads), declared(writes));
-        if phase == Phase::VideoDecode {
-            let units = self.round_units(phase, call, groups);
-            let before = units.start.checked_sub(1);
-            reads.extend(before.and_then(|unit| self.result(VIDEO_TAIL, unit)));
-            writes.extend(units.filter_map(|unit| self.result(VIDEO_TAIL, unit)));
+        let encoded = |units: Range<u32>| -> Vec<u32> {
+            units
+                .filter_map(|unit| self.result(ENCODED_UNITS, unit))
+                .collect()
+        };
+        match phase {
+            Phase::VideoDecode => {
+                let units = self.round_units(phase, call, groups);
+                let before = units.start.checked_sub(1);
+                reads.extend(before.and_then(|unit| self.result(VIDEO_TAIL, unit)));
+                writes.extend(units.filter_map(|unit| self.result(VIDEO_TAIL, unit)));
+            }
+            Phase::VideoEncode => writes.extend(encoded(self.round_units(phase, call, groups))),
+            Phase::Mux if call < rounds => {
+                reads.extend(encoded(self.round_units(Phase::VideoEncode, call, groups)));
+            }
+            _ => {}
         }
 
         let count = u32::try_from(reads.len()).unwrap_or(u32::MAX);
@@ -413,8 +441,8 @@ impl Request {
     }
 
     /// How many results of product `name` a video request declares (`S/graph.rs:140-242`): a
-    /// condition product when its conditions have what it holds, one splice tail per media unit
-    /// (commit `e69a91146`), and one of every other product.
+    /// condition product when its conditions have what it holds, one splice tail (commit
+    /// `e69a91146`) and one encoded unit per media unit, and one of every other product.
     fn declares(&self, name: &str) -> u32 {
         let Some(video) = self.video() else {
             return 0;
@@ -424,7 +452,7 @@ impl Request {
             product::CONDITION_PIXELS => has(|condition| condition.pixel_bytes / 3),
             product::CONDITION_SAMPLES => has(|condition| condition.audio_samples),
             product::VISION_PIXELS => has(|condition| condition.vision_patches),
-            product::VIDEO_TAIL => video.sampling.video_units,
+            product::VIDEO_TAIL | product::ENCODED_UNITS => video.sampling.video_units,
             _ => 1,
         }
     }
@@ -453,6 +481,66 @@ impl Request {
         let units = block.ranks.len().saturating_mul(block.rank_units());
         u32::try_from(units).unwrap_or(u32::MAX).max(1)
     }
+
+    /// Whether every crossing of a product the next call of `phase` reads into the call's group
+    /// was answered `Replicated` (`Request::crossings`): the call then reads the product in each
+    /// memory its group reads it in. True for a call that reads nothing another process wrote.
+    fn crossed(&self, phase: Phase, groups: &[WorkerGroup]) -> bool {
+        let group = self.placement[phase.index()];
+        if group.is_none() || self.crossings.is_empty() {
+            return true;
+        }
+        let call = self.scheduled[phase.index()];
+        let (results, reads) = self.results(phase, call, groups);
+        let read = &results[..(reads as usize).min(results.len())];
+        self.crossings
+            .iter()
+            .filter(|(at, into, ..)| Some(*into) == group && read.contains(at))
+            .all(|(.., state)| *state == Some(true))
+    }
+
+    /// Whether a call reads declared result `at`: the request makes calls of the phase that reads
+    /// its kind. A request whose admission found its conditioning reads no vision pixels.
+    pub(super) fn reads_result(&self, at: u32, groups: &[WorkerGroup]) -> bool {
+        self.declared().get(at as usize).is_some_and(|&(_, kind)| {
+            let (_, _, reader) = product::KINDS[kind];
+            self.video_needed(reader, groups) > 0
+        })
+    }
+
+    /// Whether the call that writes declared result `at` was applied: the call of the result's
+    /// phase that writes it (the round of an encoded unit's unit, the last call of any other
+    /// phase), counted in order or ahead of an earlier call. A conditioning the admission's `Pin`
+    /// found was written before the request arrived.
+    fn written(&self, at: u32, groups: &[WorkerGroup]) -> bool {
+        let Some(&(phase, kind)) = self.declared().get(at as usize) else {
+            return false;
+        };
+        if Some(at) == self.conditioning_position() && self.found_conditioning() {
+            return true;
+        }
+        let call = match self.result(product::ENCODED_UNITS, 0) {
+            Some(first) if PRODUCTS[kind].0 == product::ENCODED_UNITS => {
+                self.round_of(at.saturating_sub(first), groups)
+            }
+            _ => self.video_needed(phase, groups).saturating_sub(1),
+        };
+        self.completed[phase.index()] > call || self.early.contains(&(phase, call))
+    }
+}
+
+/// Whether every rank of `group` that runs calls of `phase` runs calls of `before` too, by the
+/// blocks the deployment places on its ranks (`served_phases`), so that each such rank's worker
+/// runs a call of `before` ahead of the call of `phase` submitted after it: a decoder rank that
+/// denoises reads the latents its own last step wrote into its run. A rank that does not run
+/// `before` passes its batch, and nothing orders its call of `phase` after the writes of `before`
+/// on other ranks. A group whose configuration places no block runs every phase it serves on
+/// every rank.
+fn ordered(group: &WorkerGroup, before: Phase, phase: Phase) -> bool {
+    (0..group.config.ranks.len()).all(|position| {
+        let phases = served_phases(&group.config, position);
+        !phases.contains(&phase) || phases.contains(&before)
+    })
 }
 
 /// A video request against the deployment, and the sizes of its blocks.
@@ -601,6 +689,389 @@ impl Scheduler {
     }
 }
 
+/// A video request's crossings (SD §3.3, §4.1; BP §15 "A product read in another process"): a
+/// product block lies in the product buffers of the ranks that back it, each main process's ranks
+/// reach those of their process alone, and a group that reads a block in a process its writer did
+/// not write it in receives it by a `Replicate`, which a Transfer Server runs between the two
+/// processes' memories. The scheduler asks for it once the writing call's output is applied,
+/// stamped by the executors of the groups that may hold the block's entry, and offers the reading
+/// call only once it was answered `Replicated`.
+impl Scheduler {
+    /// The crossings the calls of `request`, as it is placed, wait for, none of them asked
+    /// (`Request::crossings`): per declared result its writer writes in one memory
+    /// ([`Scheduler::writer_region`]), the group placed for the phase that reads its kind
+    /// (`crate::batch::product::KINDS`), when that group reads the class in another memory too.
+    pub(super) fn crossings_of(&self, request: &Request) -> Vec<(u32, GroupId, u8, Option<bool>)> {
+        let mut crossings = Vec::new();
+        for (at, (_, kind)) in (0u32..).zip(request.declared()) {
+            let reader = product::KINDS[kind].2;
+            let reading = request.placement[reader.index()].and_then(|id| self.group(id));
+            let (Some(class), Some(group)) = (self.product_class(kind), reading) else {
+                continue;
+            };
+            let Some(from) = self.writer_region(request, at, kind) else {
+                continue;
+            };
+            let (Some(written), Some(&(number, _))) = (
+                self.region_memory(from),
+                self.regions.get(usize::from(from)),
+            ) else {
+                continue;
+            };
+            let elsewhere = self.reading_memories(group, class);
+            if elsewhere.iter().any(|memory| *memory != written) {
+                crossings.push((at, group.id(), number, None));
+            }
+        }
+        crossings
+    }
+
+    /// The region (an index into the session's regions) of the run the writer of `request`'s
+    /// declared result `at`, of product kind `kind`, writes it in, where it writes it in one
+    /// memory (SD §3.3): an encoded unit in the process of the rank that decodes its unit, whose
+    /// host work encodes it there; the conditioning in its one run, its group's first text
+    /// encoder rank's; the condition media, the vision pixels and the audio samples in the run of
+    /// the writing group's first rank that serves the writing phase, where its call runs. `None`
+    /// for the latents, the video units and the splice tails, each read in the process whose
+    /// ranks wrote it (by the decoders of each denoising process, by the encode of the process
+    /// that decoded each unit, inside the decode call), and where the layout does not tell the
+    /// run.
+    fn writer_region(&self, request: &Request, at: u32, kind: usize) -> Option<u8> {
+        let (name, phase, _) = product::KINDS[kind];
+        let class = self.product_class(kind)?;
+        let writer = self.group(request.placement[phase.index()]?)?;
+        let regions = writer.regions(class);
+        match name {
+            product::VIDEO_LATENTS
+            | product::AUDIO_LATENTS
+            | product::VIDEO_UNITS
+            | product::VIDEO_TAIL => None,
+            product::ENCODED_UNITS => {
+                let unit = at.checked_sub(request.result(product::ENCODED_UNITS, 0)?)?;
+                let decoder = self.group(request.placement[Phase::VideoDecode.index()]?)?;
+                let block = decoder.config.blocks.get(VIDEO_DECODER_BLOCK)?;
+                // The rounds' deal, by the ranks' positions in the decoder group.
+                let ranks = block.ranks.iter().map(|&rank| u32::try_from(rank));
+                let round = RoundConfig {
+                    ranks: ranks.collect::<Result<_, _>>().ok()?,
+                    units: u32::try_from(block.rank_units()).ok()?,
+                };
+                let rank = usize::try_from(round.rank_of(unit)?).ok()?;
+                let memory = self.rank_memory(decoder, rank)?;
+                regions
+                    .iter()
+                    .copied()
+                    .find(|&region| self.region_memory(region) == Some(memory))
+            }
+            _ if regions.len() == 1 => regions.first().copied(),
+            _ => {
+                // A group's regions of a class it writes on every rank are its ranks' product
+                // buffers, in rank order.
+                let ranks = writer.config.ranks.len();
+                let serving = (0..ranks)
+                    .find(|&position| served_phases(&writer.config, position).contains(&phase));
+                let position = serving.filter(|_| regions.len() == ranks).unwrap_or(0);
+                regions.get(position).copied()
+            }
+        }
+    }
+
+    /// The memory of the product buffer of the rank at `position` of `group`: its region among
+    /// the group's regions of a product class its phases write on every rank, one per rank in
+    /// rank order (`crate::process::ranks::layout`). `None` when it writes no such class or the
+    /// region lies in every memory that maps it.
+    fn rank_memory(&self, group: &WorkerGroup, position: usize) -> Option<&str> {
+        let ranks = group.config.ranks.len();
+        let regions = (0..PRODUCTS.len())
+            .filter(|&kind| group.serves(PRODUCTS[kind].1))
+            .filter_map(|kind| self.product_class(kind))
+            .map(|class| group.regions(class))
+            .find(|regions| regions.len() == ranks)?;
+        self.region_memory(*regions.get(position)?)
+    }
+
+    /// The memory region `region` (an index into the session's regions) lies in, a rank's
+    /// product buffer's main process; `None` for a region whose units exist in every memory that
+    /// maps it.
+    fn region_memory(&self, region: u8) -> Option<&str> {
+        let (_, stated) = self.regions.get(usize::from(region))?;
+        (!stated.memory.is_empty()).then_some(stated.memory.as_str())
+    }
+
+    /// The memories `group` reads blocks of `class` in: those of its regions and its receiving
+    /// regions of the class.
+    fn reading_memories(&self, group: &WorkerGroup, class: u8) -> Vec<&str> {
+        let receives = group.layout.receives.get(usize::from(class));
+        let receives = receives.map_or(&[][..], Vec::as_slice);
+        let mut memories: Vec<&str> = group
+            .regions(class)
+            .iter()
+            .chain(receives)
+            .filter_map(|&region| self.region_memory(region))
+            .collect();
+        memories.sort_unstable();
+        memories.dedup();
+        memories
+    }
+
+    /// Per receiving region (an index into the session's regions), the units the crossing of
+    /// `request`'s declared result `at` into `group`, read from the run in region `from` (by its
+    /// number), takes there (BP §11 `Replicate`): in each memory the group reads the class in
+    /// where the block has no run, a run of the block's bytes in the group's receiving region
+    /// there. The block's runs lie in its writer group's regions of the class and in `from`.
+    pub(super) fn receiving(
+        &self,
+        request: &Request,
+        (at, group, from): (u32, GroupId, u8),
+    ) -> Vec<(usize, u32)> {
+        let mut taken = Vec::new();
+        let Some(&(phase, kind)) = request.declared().get(at as usize) else {
+            return taken;
+        };
+        let writer = request.placement[phase.index()].and_then(|id| self.group(id));
+        let (Some(class), Some(reader), Some(writer)) =
+            (self.product_class(kind), self.group(group), writer)
+        else {
+            return taken;
+        };
+        let from = self
+            .region_index(from)
+            .and_then(|index| u8::try_from(index).ok());
+        let Some((from, written)) = from.and_then(|from| Some((from, self.region_memory(from)?)))
+        else {
+            return taken;
+        };
+
+        // The block's bytes: its units of its writer's region, as its admission sized it.
+        let results = self.declared_results(request).unwrap_or_default();
+        let Some(&(_, _, units)) = results.get(at as usize) else {
+            return taken;
+        };
+        let unit_bytes = |region: u8| {
+            self.regions
+                .get(usize::from(region))
+                .map_or(1, |(_, stated)| stated.unit_bytes.max(1))
+        };
+        let bytes = u64::from(units).saturating_mul(unit_bytes(from));
+
+        let receives = reader.layout.receives.get(usize::from(class));
+        let receives = receives.map_or(&[][..], Vec::as_slice);
+        let mut held: Vec<&str> = writer
+            .regions(class)
+            .iter()
+            .filter_map(|&region| self.region_memory(region))
+            .collect();
+        held.push(written);
+        for memory in self.reading_memories(reader, class) {
+            if held.contains(&memory) {
+                continue;
+            }
+            let receive = receives
+                .iter()
+                .copied()
+                .find(|&region| self.region_memory(region) == Some(memory));
+            if let Some(receive) = receive {
+                let units = bytes.div_ceil(unit_bytes(receive));
+                taken.push((
+                    usize::from(receive),
+                    u32::try_from(units).unwrap_or(u32::MAX),
+                ));
+            }
+        }
+        taken
+    }
+
+    /// Whether `group` reads the block that `owner` holds at position `at` of `class` in a
+    /// memory its writer writes it in, so that its allocation or its pin is handed to the group's
+    /// executor (BP §9, obligation 1): a group a crossing brings the block to reads it only by
+    /// the crossing's `Replicated` where it reads it in no such memory. True for the owner's own
+    /// group, which writes the block, and for a block no crossing brings to the group.
+    pub(super) fn reads_where_written(
+        &self,
+        owner: OwnerId,
+        (class, at): (u8, u32),
+        group: GroupId,
+    ) -> bool {
+        let Some(request) = self.request_of(owner) else {
+            return true;
+        };
+        if request
+            .attachment(owner)
+            .is_some_and(|(home, _)| home == group)
+        {
+            return true;
+        }
+        let crossing = request
+            .crossings
+            .iter()
+            .find(|(position, into, ..)| *position == at && *into == group);
+        let (Some(&(_, _, from, _)), Some(reader)) = (crossing, self.group(group)) else {
+            return true;
+        };
+        let from = self
+            .region_index(from)
+            .and_then(|index| u8::try_from(index).ok());
+        let written = from.and_then(|from| self.region_memory(from));
+        written.is_none_or(|written| self.reading_memories(reader, class).contains(&written))
+    }
+
+    /// Asks for each crossing of a running video request whose product its writer's call wrote
+    /// and which is not asked yet ([`Request::written`]), once per pass of the loop: a `Replicate`
+    /// for the result's owner on its writing group, read from the run its writer wrote, into the
+    /// group that reads it (SD §4.1). It is stamped by the executors of the groups that may hold
+    /// the result's entry (`Scheduler::submit`), after the `Commit` of a conditioning its text
+    /// encoding computed, which its output's application submitted. A request waiting for units
+    /// since a shortage asks once they show (`allocate_ahead`).
+    pub(super) fn cross(&mut self) {
+        let mut asks = Vec::new();
+        for id in &self.running {
+            let Some(request) = self.requests.get(id) else {
+                continue;
+            };
+            if request.status != RequestStatus::Running || self.short.contains_key(id) {
+                continue;
+            }
+            for (index, &(at, group, from, state)) in request.crossings.iter().enumerate() {
+                let due =
+                    request.reads_result(at, &self.groups) && request.written(at, &self.groups);
+                if state.is_some() || !due {
+                    continue;
+                }
+                let Some(&(phase, kind)) = request.declared().get(at as usize) else {
+                    continue;
+                };
+                let (Some(owner), Some(class)) =
+                    (request.owner_on(phase), self.product_class(kind))
+                else {
+                    continue;
+                };
+                let replicate = runtime::Request::Replicate {
+                    owner,
+                    class,
+                    at,
+                    from,
+                    group,
+                    after: Vec::new(),
+                };
+                asks.push((*id, index, replicate));
+            }
+        }
+
+        for (id, index, replicate) in asks {
+            // The runs it takes are not available to the step's later requests.
+            for (region, units) in self.taken(&replicate) {
+                if let Some(available) = self.available.get_mut(region) {
+                    *available = available.saturating_sub(units);
+                }
+            }
+            let crossing = self
+                .requests
+                .get_mut(&id)
+                .and_then(|row| row.crossings.get_mut(index));
+            if let Some(crossing) = crossing {
+                crossing.3 = Some(false);
+            }
+            self.submit(replicate);
+        }
+    }
+
+    /// Applies the answer to a crossing of request `id` (SD §3.5): `Replicated`, the calls that
+    /// read the result in the group go on; `Full`, it is asked again once the receiving region's
+    /// `available` shows the units, the request short there meanwhile (SD §3.6); `Failed`, the
+    /// request ends as migratable, its trajectory saved where it completed a step, and the
+    /// daemon resubmits it (SD §3.6); `Refused` with the cause `key`, its conditioning is a
+    /// cached block an epoch on trial may not copy into another memory (BP §9, R8), which it
+    /// gives up to encode its own.
+    pub(super) fn crossing_answered(
+        &mut self,
+        id: RequestId,
+        request: &runtime::Request,
+        completion: &Completion,
+    ) {
+        let runtime::Request::Replicate {
+            owner,
+            class,
+            at,
+            group,
+            ..
+        } = *request
+        else {
+            return;
+        };
+        let replicated = matches!(completion, Completion::Replicated { .. });
+        let crossing = self.requests.get_mut(&id).and_then(|row| {
+            row.crossings
+                .iter_mut()
+                .find(|(position, into, ..)| *position == at && *into == group)
+        });
+        if let Some(crossing) = crossing {
+            crossing.3 = replicated.then_some(true);
+        }
+
+        match completion {
+            Completion::Replicated { .. } => self.mark(id),
+            Completion::Full { region } => {
+                let index = self
+                    .region_index(*region)
+                    .and_then(|index| u8::try_from(index).ok());
+                if let (true, Some(index)) = (self.is_running(id), index) {
+                    self.preempt(id, index);
+                }
+            }
+            Completion::Failed => self.finish(id, migratable(MigrationCause::Drain)),
+            Completion::Refused { cause: Cause::Key } => self.encode_again(id, owner, class, at),
+            _ => {}
+        }
+    }
+
+    /// Gives up request `id`'s cached conditioning, which `owner` holds at position `at` of
+    /// `class`, by a `Release` through the executors, and asks for a block of its own at that
+    /// position, which waits behind the `Release`: its text encoding computes it and its crossing
+    /// then copies it from its text encoder rank's run (BP §9, R8).
+    fn encode_again(&mut self, id: RequestId, owner: OwnerId, class: u8, at: u32) {
+        let Some(request) = self.requests.get(&id) else {
+            return;
+        };
+        let kind = request.declared().get(at as usize).map(|&(_, kind)| kind);
+        let from = kind.and_then(|kind| self.writer_region(request, at, kind));
+        let from = from.and_then(|from| self.regions.get(usize::from(from)));
+        let results = self.declared_results(request).unwrap_or_default();
+        let (Some(&(number, _)), Some(&(_, _, units)), Some(&(key, _))) =
+            (from, results.get(at as usize), request.encodings.first())
+        else {
+            return;
+        };
+
+        if let Some(row) = self.requests.get_mut(&id) {
+            if let Some(encoding) = row.encodings.first_mut() {
+                encoding.1 = None;
+            }
+            let crossing = row
+                .crossings
+                .iter_mut()
+                .find(|(position, ..)| *position == at);
+            if let Some(crossing) = crossing {
+                crossing.2 = number;
+            }
+        }
+        self.unpin(id, &[key]);
+        self.submit(runtime::Request::Release {
+            owner,
+            class,
+            at,
+            count: 1,
+            after: Vec::new(),
+        });
+        self.submit(runtime::Request::Allocate {
+            owner,
+            class,
+            at,
+            count: 1,
+            units,
+        });
+    }
+}
+
 /// A sum over a video request's conditions.
 fn total(video: &DiffusionRequest, extent: impl Fn(&ConditionExtent) -> u64) -> u64 {
     video
@@ -672,7 +1143,12 @@ mod tests {
     use storage::runtime::{self, Class, Completion, GroupId, OwnerId, Region, Tier};
     use storage::{Key, QueuePair};
 
+    use crossbeam_channel::Receiver;
+    use nn::family::Stage;
+
     use super::{PRODUCTS, VIDEO_PHASES};
+    use crate::process::ranks::rank::video::MUXER;
+    use crate::scheduler::Output;
     use crate::scheduler::cache::DEVICE;
     use crate::scheduler::{Capacity, Executor, Request, RequestStatus, Scheduler, WorkerGroup};
 
@@ -745,7 +1221,8 @@ mod tests {
         }
     }
 
-    /// A group of two ranks whose video decoder deals units to both, one unit each in a round.
+    /// A group of two ranks that both encode prompts and denoise, whose video decoder deals units
+    /// to both, one unit each in a round.
     fn config(id: GroupId) -> WorkerGroupConfig {
         let mut blocks = BTreeMap::new();
         blocks.insert(
@@ -755,6 +1232,9 @@ mod tests {
                 ..BlockConfig::parallel(vec![0, 1])
             },
         );
+        for stage in [Stage::TextEncoder, Stage::Transformer] {
+            blocks.insert(stage.name().to_owned(), BlockConfig::parallel(vec![0, 1]));
+        }
         let rank = WorkerRank {
             host: "localhost".to_owned(),
             device: "cpu".to_owned(),
@@ -872,6 +1352,7 @@ mod tests {
             num_encoded_inputs: 0,
             encodings: Vec::new(),
             unpinned: Vec::new(),
+            crossings: Vec::new(),
             num_acknowledged_tokens: 0,
             terminal: None,
             event_credit: 64,
@@ -901,8 +1382,9 @@ mod tests {
         request.completed[phase.index()] += calls;
     }
 
-    /// An executor that runs nothing and records what it is handed to stamp.
-    struct Stamps(Arc<Mutex<Vec<runtime::Request>>>);
+    /// An executor that runs nothing and records what it is handed to stamp, by the group whose
+    /// workers stamp it.
+    struct Stamps(Arc<Mutex<Vec<(GroupId, runtime::Request)>>>);
 
     impl Executor for Stamps {
         fn submit(&self, _: Batch) {}
@@ -917,10 +1399,14 @@ mod tests {
         ) {
         }
 
-        fn stamp(&self, _: GroupId, requests: Vec<runtime::Request>) {
-            self.0.lock().unwrap().extend(requests);
+        fn stamp(&self, group: GroupId, requests: Vec<runtime::Request>) {
+            let stamped = requests.into_iter().map(|request| (group, request));
+            self.0.lock().unwrap().extend(stamped);
         }
     }
+
+    /// What a [`Stamps`] executor records.
+    type Stamped = Arc<Mutex<Vec<(GroupId, runtime::Request)>>>;
 
     /// A scheduler over `served`, in a session whose regions are the product buffer (units of 256
     /// bytes), the slot rows and the host latent pool (units of 4 096 bytes).
@@ -929,7 +1415,7 @@ mod tests {
     }
 
     /// A [`scheduler`] over `served`, with what its executor was handed to stamp.
-    fn stamping(served: &[(GroupId, &[Phase])]) -> (Scheduler, Arc<Mutex<Vec<runtime::Request>>>) {
+    fn stamping(served: &[(GroupId, &[Phase])]) -> (Scheduler, Stamped) {
         let region = |name: &str, tier, unit_bytes| Region {
             name: name.to_owned(),
             tier,
@@ -1202,7 +1688,7 @@ mod tests {
             tokens: 40,
             after: Vec::new(),
         };
-        assert_eq!(*stamped.lock().unwrap(), [commit]);
+        assert_eq!(*stamped.lock().unwrap(), [(A, commit)]);
         let groups = &scheduler.groups;
         assert_eq!(
             scheduler.requests[&id].video_needed(Phase::TextEncode, groups),
@@ -1300,18 +1786,20 @@ mod tests {
         assert_eq!(reads, 0);
         assert!(latents.contains(&first[0]) && first[0] == second[0]);
 
-        // The encode round reads the video units, a muxing call the encoded round, and the final
-        // muxing call nothing.
-        let (encode, _) = results(Phase::VideoEncode, 0);
-        assert_eq!(encode[0], first[1]);
-        assert_eq!(results(Phase::Mux, 1), (vec![encode[1]], 1));
+        // An encode round reads the video units and writes an encoded unit per unit of its
+        // round, a muxing call reads the encoded units of its round, and the final muxing call
+        // nothing.
+        let (encode, reads) = results(Phase::VideoEncode, 0);
+        assert_eq!((encode.len(), reads, encode[0]), (3, 1, first[1]));
+        let (last, _) = results(Phase::VideoEncode, 1);
+        assert_eq!(results(Phase::Mux, 0), (encode[1..].to_vec(), 2));
+        assert_eq!(results(Phase::Mux, 1), (last[1..].to_vec(), 1));
         assert_eq!(results(Phase::Mux, 2), (Vec::new(), 0));
     }
 
     /// Every result a call writes is a declared result of the call's phase, and each is written
-    /// once, but the video units and the encoded units, of which each round writes its slice;
-    /// each block is sized in its product class, rounded up to units of the product region
-    /// (SD §4.4 "Products").
+    /// once, but the video units, of which each round writes its slice; each block is sized in
+    /// its product class, rounded up to units of the product region (SD §4.4 "Products").
     #[test]
     fn declared_results_are_written_by_their_phase_and_sized_in_their_class() {
         let scheduler = scheduler(&[(A, &VIDEO_PHASES)]);
@@ -1331,17 +1819,15 @@ mod tests {
                     }
                 }
             }
-            // The rounds of each sliced block: the decode rounds and their encodes.
+            // The video units are written by every decode round.
             let rounds = request.video_needed(Phase::VideoDecode, groups);
-            let sliced = [
-                (request.results(Phase::VideoDecode, 0, groups).0[1], rounds),
-                (request.results(Phase::VideoEncode, 0, groups).0[1], rounds),
-            ];
+            let sliced = request.results(Phase::VideoDecode, 0, groups).0[1];
             for (position, count) in written.into_iter().enumerate() {
-                let expected = sliced
-                    .iter()
-                    .find(|&&(sliced, _)| sliced as usize == position)
-                    .map_or(1, |&(_, rounds)| rounds);
+                let expected = if position == sliced as usize {
+                    rounds
+                } else {
+                    1
+                };
                 assert_eq!(count, expected, "result {position}");
             }
 
@@ -1354,13 +1840,13 @@ mod tests {
         }
 
         // A text request of three units declares the conditioning, both latents, the video
-        // units, one tail per unit, the encoded units and the audio; a conditioned request of two
-        // the condition pixels and samples and the vision pixels besides, and no encoded
+        // units, one tail and one encoded unit per unit, and the audio; a conditioned request of
+        // two the condition pixels and samples and the vision pixels besides, and no encoded
         // condition of its own.
         let text = request(video(3, 40, Vec::new()), &on(A));
-        assert_eq!(scheduler.declared_results(&text).unwrap().len(), 9);
+        assert_eq!(scheduler.declared_results(&text).unwrap().len(), 11);
         let conditioned = request(video(2, 40, reference()), &on(A));
-        assert_eq!(scheduler.declared_results(&conditioned).unwrap().len(), 11);
+        assert_eq!(scheduler.declared_results(&conditioned).unwrap().len(), 12);
     }
 
     /// A trajectory is sized from the smallest captured shape that holds its request, in units of
@@ -1477,6 +1963,404 @@ mod tests {
         assert_eq!(resumed(2, Some(9)), Some(Key(latent_content(9, 77, 2))));
         assert_eq!(resumed(0, None), None);
         assert_eq!(resumed(STEPS, None), None);
+    }
+
+    /// A decode is offered once the last denoising step is scheduled on its group only when each
+    /// rank that decodes denoises too, reading the latents its own last step wrote; where a rank
+    /// decodes that does not denoise, which receives its latents from another rank's step, once
+    /// the last step's output is applied (SD §3.3).
+    #[test]
+    fn a_decode_waits_for_the_last_step_s_output_where_a_decoder_rank_does_not_denoise() {
+        let decoding = |denoisers: Vec<usize>| {
+            let mut groups = groups(&[(A, &VIDEO_PHASES)]);
+            let blocks = &mut groups[0].config.blocks;
+            blocks.insert(
+                Stage::Transformer.name().to_owned(),
+                BlockConfig::parallel(denoisers),
+            );
+            blocks.insert(
+                Stage::AudioDecoder.name().to_owned(),
+                BlockConfig::parallel(vec![1]),
+            );
+            let mut request = request(video(2, 40, Vec::new()), &on(A));
+            for phase in [Phase::TextEncode, Phase::LatentPrepare] {
+                schedule(&mut request, phase, 1);
+                complete(&mut request, phase, 1);
+            }
+            schedule(&mut request, Phase::Denoise, STEPS);
+            complete(&mut request, Phase::Denoise, STEPS - 1);
+            let early = ready(&request, &groups);
+            complete(&mut request, Phase::Denoise, 1);
+            (early, ready(&request, &groups))
+        };
+        let decodes = [Phase::VideoDecode, Phase::AudioDecode];
+
+        // Both ranks denoise: both decodes follow the scheduled last step.
+        assert_eq!(decoding(vec![0, 1]), (decodes.to_vec(), decodes.to_vec()));
+
+        // Rank 1 decodes the video's second unit and the track, and does not denoise: both wait
+        // for the last step's output.
+        assert_eq!(decoding(vec![0]), (Vec::new(), decodes.to_vec()));
+    }
+
+    /// The two processes of the crossing fixture, by the memory their product buffers lie in.
+    const FIRST: &str = "process a";
+    const SECOND: &str = "process b";
+
+    /// The session regions of the crossing fixture, by their index, and the numbers completions
+    /// name them by: each rank's product buffer, then the two groups' slot rows and the host
+    /// latent pool.
+    const PRODUCTS_FIRST: u8 = 0;
+    const PRODUCTS_SECOND: u8 = 1;
+    const NUMBERS: [u8; 5] = [4, 5, 6, 7, 8];
+
+    /// A scheduler over a model group [`A`] of two ranks, rank 0 in the first process and rank 1
+    /// in the second, which encodes prompts (rank 0 holding the conditioning), denoises and
+    /// decodes video on both ranks, decodes the track on rank 0 and encodes the video; and a
+    /// muxer group [`B`] of one rank in the first process. The layout is the engine's for it
+    /// (`crate::process::ranks::layout`): the model group's blocks lie in both ranks' product
+    /// buffers, its conditioning in rank 0's alone, which it receives in rank 1's; the muxer reads
+    /// the encoded units and the track in the first process. With what its executor was handed to
+    /// stamp, and what the scheduler reports.
+    fn two_processes() -> (Scheduler, Stamped, Receiver<Output>) {
+        let region = |name: &str, tier, unit_bytes, memory: &str| Region {
+            name: name.to_owned(),
+            tier,
+            space: name.to_owned(),
+            unit_bytes,
+            part_bytes: unit_bytes,
+            reserved: 0,
+            units: 1 << 20,
+            limit: 1 << 20,
+            segments: Vec::new(),
+            memory: memory.to_owned(),
+        };
+        let class = |units, host| Class {
+            units,
+            host,
+            state_in_slot: false,
+            tensors: [0; 32],
+            encoding: [0; 32],
+        };
+        let mut classes = vec![class(1, None)];
+        classes.extend(PRODUCTS.iter().map(|_| class(0, None)));
+        classes.push(class(0, Some((4, 0))));
+
+        // Per class, the regions of each group and those it receives in.
+        let kind = |name: &str| PRODUCTS.iter().position(|(kind, _)| *kind == name).unwrap() + 1;
+        let mut model = vec![Vec::new(); classes.len()];
+        let mut receives = vec![Vec::new(); classes.len()];
+        let mut muxer = vec![Vec::new(); classes.len()];
+        model[kind(product::CONDITIONING)] = vec![PRODUCTS_FIRST];
+        receives[kind(product::CONDITIONING)] = vec![PRODUCTS_SECOND];
+        for name in [
+            product::VIDEO_LATENTS,
+            product::AUDIO_LATENTS,
+            product::VIDEO_UNITS,
+            product::VIDEO_TAIL,
+            product::ENCODED_UNITS,
+            product::AUDIO_SAMPLES,
+        ] {
+            model[kind(name)] = vec![PRODUCTS_FIRST, PRODUCTS_SECOND];
+        }
+        for name in [product::ENCODED_UNITS, product::AUDIO_SAMPLES] {
+            muxer[kind(name)] = vec![PRODUCTS_FIRST];
+        }
+        let group = |id, slots, regions, receives| runtime::Group {
+            id,
+            memory: FIRST.to_owned(),
+            slots,
+            regions,
+            receives,
+            parts: Vec::new(),
+        };
+
+        let layout = runtime::Open {
+            version: runtime::VERSION,
+            epoch: 1,
+            trial: false,
+            regions: vec![
+                region("products a", Tier::Device, 256, FIRST),
+                region("products b", Tier::Device, 256, SECOND),
+                region("slots model", Tier::Device, 1, ""),
+                region("slots muxer", Tier::Device, 1, ""),
+                region("latents", Tier::Host, 4096, ""),
+            ],
+            classes,
+            trajectory: TRAJECTORY,
+            peers: Vec::new(),
+            groups: vec![
+                group(A, 2, model, receives),
+                group(B, 3, muxer, vec![Vec::new(); TRAJECTORY as usize + 1]),
+            ],
+            schedulers: vec![vec![A, B]],
+        };
+        let opened = runtime::Opened {
+            regions: NUMBERS.iter().map(|&number| (number, 1 << 20)).collect(),
+            segments: Vec::new(),
+            limits: Vec::new(),
+            registers: vec![runtime::Registers {
+                completed: vec![0, 1],
+                capacity: NUMBERS
+                    .iter()
+                    .zip((2..).step_by(3))
+                    .map(|(&number, word)| (number, word))
+                    .collect(),
+            }],
+        };
+
+        let rank = |host: &str| WorkerRank {
+            host: host.to_owned(),
+            device: "cpu".to_owned(),
+        };
+        let mut model = config(A);
+        model.ranks = vec![rank("a"), rank("b")];
+        model.blocks.insert(
+            Stage::AudioDecoder.name().to_owned(),
+            BlockConfig::parallel(vec![0, 1]),
+        );
+        model.blocks.insert(
+            proto::config::VIDEO_CODEC_BLOCK.to_owned(),
+            BlockConfig::parallel(vec![0, 1]),
+        );
+        let mut muxer = config(B);
+        muxer.ranks = vec![rank("a")];
+        muxer.blocks = BTreeMap::new();
+        muxer
+            .blocks
+            .insert(MUXER.to_owned(), BlockConfig::parallel(vec![0]));
+        let modelled = [
+            Phase::TextEncode,
+            Phase::LatentPrepare,
+            Phase::Denoise,
+            Phase::VideoDecode,
+            Phase::AudioDecode,
+            Phase::VideoEncode,
+        ];
+        let configs = vec![
+            (model, capacity(&modelled)),
+            (muxer, capacity(&[Phase::AudioEncode, Phase::Mux])),
+        ];
+
+        let (output, outputs) = crossbeam_channel::unbounded();
+        let stamped = Arc::new(Mutex::new(Vec::new()));
+        let scheduler = Scheduler::new(
+            SchedulerConfig::default(),
+            proto::request::GenerationLimits::default(),
+            &layout,
+            &opened,
+            0,
+            QueuePair::create(1 << 12, 16).unwrap(),
+            configs,
+            crate::scheduler::tests::idle_policy(),
+            scheduling::Parameters::default(),
+            Box::new(Stamps(Arc::clone(&stamped))),
+            output,
+            Arc::new(AtomicU64::new(0)),
+        )
+        .unwrap();
+        (scheduler, stamped, outputs)
+    }
+
+    /// A text request of two units running on [`two_processes`], whose conditioning is keyed by
+    /// what its text encoder reads: its media phases on the model group but the audio encode and
+    /// the muxing calls, on the muxer, with its crossings. Its owners are 10 on the model group and
+    /// 11 on the muxer.
+    fn crossing(scheduler: &mut Scheduler) -> RequestId {
+        let mut placement = on(A);
+        for entry in &mut placement {
+            if matches!(entry.0, Phase::AudioEncode | Phase::Mux) {
+                entry.1 = B;
+            }
+        }
+        let mut input = video(2, 40, Vec::new());
+        input.encoder_inputs = Some(Box::new(EncoderInputs {
+            text: [3; 32],
+            vision: None,
+            video_units: Vec::new(),
+            audio: None,
+        }));
+        let mut row = request(input, &placement);
+        row.encodings = scheduler.encodings_of(&row);
+        row.crossings = scheduler.crossings_of(&row);
+        let id = row.id;
+        scheduler.owners.insert(OwnerId(10), id);
+        scheduler.owners.insert(OwnerId(11), id);
+        scheduler.requests.insert(id, row);
+        scheduler.running.push(id);
+        id
+    }
+
+    /// The calls of `phase` request `id` was scheduled, and applied.
+    fn ran(scheduler: &mut Scheduler, id: RequestId, phase: Phase, calls: u32) {
+        let request = scheduler.requests.get_mut(&id).unwrap();
+        schedule(request, phase, calls);
+        complete(request, phase, calls);
+    }
+
+    /// A product a group reads in another process than its writer's crosses once the writing
+    /// call's output is applied, by a `Replicate` from the run its writer wrote, stamped by the
+    /// executors of the groups that may hold its entry; the reading call waits for the answer
+    /// (SD §3.3, §4.1). The conditioning, written by the first text encoder rank, crosses into
+    /// the model group's memory in the second process, where its latent preparation reads it
+    /// too, after its `Commit`, which the buffer pool takes while the block has its one run; of
+    /// the encoded units, one block each, the one the second process's rank decoded crosses
+    /// into the muxer's process, and the muxer is handed only the allocation of the one decoded
+    /// where it reads (BP §9, obligation 1).
+    #[test]
+    fn a_product_read_in_another_process_crosses_once_written_and_its_reader_waits_for_it() {
+        let (mut scheduler, stamped, _) = two_processes();
+        let id = crossing(&mut scheduler);
+        let row = &scheduler.requests[&id];
+        let conditioning = row.conditioning_position().unwrap();
+        let units: Vec<u32> = (0..2)
+            .map(|unit| row.result(product::ENCODED_UNITS, unit).unwrap())
+            .collect();
+        let [first, second] = [NUMBERS[0], NUMBERS[1]];
+        assert_eq!(
+            row.crossings,
+            [(conditioning, A, first, None), (units[1], B, second, None)]
+        );
+        let ready = |scheduler: &Scheduler, phase: Phase| {
+            scheduler.requests[&id].video_ready(phase, &scheduler.groups)
+        };
+        let asked = |stamped: &Stamped| stamped.lock().unwrap().drain(..).collect::<Vec<_>>();
+
+        // Nothing crosses before its writer's output, and the latent preparation that follows the
+        // text encoding on its group waits for the conditioning in the second process.
+        let mut encoded = Batch {
+            id: BatchId(1),
+            group: A,
+            phase: Phase::TextEncode,
+            generation: 0,
+            shape: Shape::decode(1, Variant::Encode),
+            requests: Vec::new(),
+            columns: Columns::default(),
+            media: Vec::new(),
+            new_slots: Vec::new(),
+        };
+        assert!(scheduler.push_media_row(&mut encoded, id, Phase::TextEncode));
+        let request = scheduler.requests.get_mut(&id).unwrap();
+        schedule(request, Phase::TextEncode, 1);
+        scheduler.cross();
+        assert!(asked(&stamped).is_empty());
+        assert!(!ready(&scheduler, Phase::LatentPrepare));
+
+        // Its output applied, the conditioning is committed under its key and crosses from rank
+        // 0's run into the model group's memories, once.
+        let request = scheduler.requests.get_mut(&id).unwrap();
+        complete(request, Phase::TextEncode, 1);
+        scheduler.commit_encoding(id, &encoded, 0);
+        scheduler.cross();
+        scheduler.cross();
+        let class = scheduler.conditioning_class().unwrap();
+        let commit = runtime::Request::Commit {
+            owner: OwnerId(10),
+            class,
+            at: conditioning,
+            key: Key(encoder_output(product::CONDITIONING, "", &[3; 32])),
+            tokens: 40,
+            after: Vec::new(),
+        };
+        let replicate = runtime::Request::Replicate {
+            owner: OwnerId(10),
+            class,
+            at: conditioning,
+            from: first,
+            group: A,
+            after: Vec::new(),
+        };
+        assert_eq!(asked(&stamped), [(A, commit), (A, replicate.clone())]);
+        assert!(!ready(&scheduler, Phase::LatentPrepare));
+        let replicated = Completion::Replicated {
+            runs: vec![(first, 0, 1), (second, 0, 1)],
+            evicted: Vec::new(),
+        };
+        scheduler.crossing_answered(id, &replicate, &replicated);
+        assert!(ready(&scheduler, Phase::LatentPrepare));
+
+        // The round's encode writes unit 0 in the first process and unit 1 in the second: the
+        // second crosses into the muxer's, stamped by the model group and the muxer, which reads
+        // it; its muxing call waits for it.
+        for (phase, calls) in [
+            (Phase::LatentPrepare, 1),
+            (Phase::Denoise, STEPS),
+            (Phase::VideoDecode, 1),
+            (Phase::VideoEncode, 1),
+        ] {
+            ran(&mut scheduler, id, phase, calls);
+        }
+        scheduler.cross();
+        let class = PRODUCTS
+            .iter()
+            .position(|(name, _)| *name == product::ENCODED_UNITS)
+            .and_then(|kind| scheduler.product_class(kind))
+            .unwrap();
+        let replicate = runtime::Request::Replicate {
+            owner: OwnerId(10),
+            class,
+            at: units[1],
+            from: second,
+            group: B,
+            after: Vec::new(),
+        };
+        assert_eq!(
+            asked(&stamped),
+            [(A, replicate.clone()), (B, replicate.clone())]
+        );
+        assert!(!ready(&scheduler, Phase::Mux));
+        let replicated = Completion::Replicated {
+            runs: vec![(first, 0, 1)],
+            evicted: Vec::new(),
+        };
+        scheduler.crossing_answered(id, &replicate, &replicated);
+        assert!(ready(&scheduler, Phase::Mux));
+
+        // The muxer is handed the allocation of the unit decoded where it reads it, and the other
+        // one only by its crossing.
+        let handed = |at| scheduler.reads_where_written(OwnerId(10), (class, at), B);
+        assert_eq!((handed(units[0]), handed(units[1])), (true, false));
+        assert!(scheduler.reads_where_written(OwnerId(10), (class, units[1]), A));
+    }
+
+    /// A crossing that fails ends its request as migratable, which the daemon resubmits, with no
+    /// retry inside the engine (SD §3.6); one the receiving region had no room for is asked again
+    /// once the request is no longer short there.
+    #[test]
+    fn a_failed_crossing_ends_its_request_as_migratable_and_a_full_one_is_asked_again() {
+        let (mut scheduler, stamped, outputs) = two_processes();
+        let id = crossing(&mut scheduler);
+        ran(&mut scheduler, id, Phase::TextEncode, 1);
+        scheduler.cross();
+        let replicate = stamped.lock().unwrap().remove(0).1;
+
+        let region = NUMBERS[usize::from(PRODUCTS_SECOND)];
+        scheduler.crossing_answered(id, &replicate, &Completion::Full { region });
+        scheduler.short.remove(&id);
+        scheduler.cross();
+        let asked: Vec<runtime::Request> = stamped
+            .lock()
+            .unwrap()
+            .drain(..)
+            .map(|(_, request)| request)
+            .collect();
+        assert_eq!(asked, std::slice::from_ref(&replicate));
+
+        scheduler.crossing_answered(id, &replicate, &Completion::Failed);
+        assert!(!scheduler.running.contains(&id));
+        let ended = outputs.try_iter().any(|output| {
+            matches!(
+                output,
+                Output::Event(
+                    of,
+                    Event::Migratable {
+                        cause: MigrationCause::Drain,
+                        ..
+                    }
+                ) if of == id
+            )
+        });
+        assert!(ended);
     }
 
     /// Progress names what the request is doing and the steps its trajectory completed

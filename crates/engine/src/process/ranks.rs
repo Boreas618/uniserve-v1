@@ -1833,17 +1833,20 @@ fn largest_block(sizing: &VideoRank, kind: usize) -> u64 {
 
 /// The product buffer units one request's blocks of each kind take, in
 /// `crate::batch::product::KINDS` order, at the sizes the denoising rank `sizing` states: a block
-/// at the largest size, as many blocks as the request declares (one splice tail per unit of the
-/// longest timeline).
+/// at the largest size, as many blocks as the request declares (one splice tail and one encoded
+/// unit per unit of the longest timeline).
 ///
 /// # Errors
 ///
-/// A session that numbers no splice tail kind.
+/// A session that numbers no splice tail or encoded units kind.
 fn request_units(sizing: &VideoRank) -> Result<Vec<u64>> {
-    let tail = product_kind(product::VIDEO_TAIL)?;
+    let per_unit = [
+        product_kind(product::VIDEO_TAIL)?,
+        product_kind(product::ENCODED_UNITS)?,
+    ];
     Ok((0..product::KINDS.len())
         .map(|kind| {
-            let blocks = if kind == tail {
+            let blocks = if per_unit.contains(&kind) {
                 u64::from(sizing.units)
             } else {
                 1
