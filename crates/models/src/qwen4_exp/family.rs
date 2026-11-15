@@ -1,72 +1,64 @@
 //! The family as execution loads it and request processing serves it ([`nn::family`]).
 //!
 //! A checkpoint opens to its [`Config`], which holds what its sidecars state (its
-//! configuration, its quantization declaration and, when it holds the vision tower and the
-//! processor files its images are sized by, its processor rules), and a load builds
-//! [`Qwen4ExpForCausalLm`] from it.
+//! configuration and its quantization declaration), and a load builds [`Qwen4ExpForCausalLm`]
+//! from it, through the scaffolding every causal language model family shares
+//! ([`nn::causal_lm`]).
 //!
 //! Request processing serves `Qwen4ExpForConditionalGeneration` as
 //! [`processing::qwen::QWEN4_EXP`]: reasoning between `<think>` and `</think>`, tool calls as
 //! `<function=…>` and `<parameter=…>` tags between `<tool_call>` and `</tool_call>`, and
 //! images through the Qwen-VL processor.
 
-use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use nn::family::{
-    ExpertOrder, Family, Model, TextCheckpoint, TextFamily, TextModel, TextPlacement,
-};
-use nn::{Checkpoint, WeightLoader};
-use proto::config::Quantization;
+use nn::causal_lm::{CausalLmConfig, CausalLmFamily, MoeConfig};
+use nn::family::{ExpertOrder, Family, Model, TextModel, TextPlacement};
+use nn::quantization::Declaration;
+use nn::{Checkpoint, ModelId, Result, VarBuilder};
 
 use crate::qwen4_exp::Qwen4ExpForCausalLm;
-use crate::qwen4_exp::causal_lm::expert_layers;
 use crate::qwen4_exp::config::Config;
 
 /// The `Qwen4ExpForConditionalGeneration` registration.
 pub const FAMILY: Family = Family {
     request: processing::qwen::QWEN4_EXP,
-    model: Model::Text(&Qwen4Exp),
+    model: Model::Text(&CAUSAL_LM),
     step_stack: crate::qwen4_exp::causal_lm::TRANSFORMER,
 };
 
-/// The family: how a checkpoint opens.
-struct Qwen4Exp;
+/// The family value the registration loads through.
+const CAUSAL_LM: CausalLmFamily<Config> = CausalLmFamily::new();
 
-impl TextFamily for Qwen4Exp {
-    fn open(
-        &self,
-        checkpoint: &Checkpoint,
-        quantization: &Quantization,
-    ) -> nn::Result<Box<dyn TextCheckpoint>> {
-        // The family serves each checkpoint as its export declares it, BF16 or quantized.
-        nn::quantization::own_representation("qwen4_exp", quantization)?;
+impl CausalLmConfig for Config {
+    const ID: ModelId = crate::qwen4_exp::ID;
 
-        Ok(Box::new(Config::open(checkpoint)?))
-    }
-}
-
-impl TextCheckpoint for Config {
-    fn expert_layers(&self) -> BTreeMap<String, u32> {
-        expert_layers(self)
+    fn open(checkpoint: &Checkpoint) -> Result<Self> {
+        Config::open(checkpoint)
     }
 
-    fn load(
+    fn quantization(&self) -> &Declaration {
+        &self.quantization
+    }
+
+    fn layers(&self) -> u32 {
+        self.text.num_hidden_layers
+    }
+
+    /// Every layer routes.
+    fn experts(&self) -> Option<&MoeConfig> {
+        Some(&self.moe)
+    }
+
+    fn build(
         &self,
         checkpoint: &Checkpoint,
-        loader: &mut WeightLoader<'_>,
+        vb: VarBuilder<'_, '_>,
         placement: &TextPlacement,
-        experts: &ExpertOrder,
-    ) -> nn::Result<Arc<dyn TextModel>> {
-        // Every later weight is read as the export declares it stored.
-        loader.declare(&self.quantization)?;
-
+        order: &ExpertOrder,
+    ) -> Result<Arc<dyn TextModel>> {
         Ok(Arc::new(Qwen4ExpForCausalLm::load(
-            self,
-            checkpoint,
-            loader.root(),
-            placement,
-            experts,
+            self, checkpoint, vb, placement, order,
         )?))
     }
 }

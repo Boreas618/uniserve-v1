@@ -24,10 +24,11 @@
 
 use std::ops::Range;
 
+use nn::causal_lm::{FUSED_EXPERTS, MoeConfig};
 use nn::config::Fields;
 use nn::family::TextPlacement;
 use nn::functional::Activation;
-use nn::modules::{GatedDeltaNetConfig, Precision, RotaryConfig, Spectrum};
+use nn::modules::{ExpertLayout, GatedDeltaNetConfig, Precision, RotaryConfig, Spectrum};
 use nn::quantization::Declaration;
 use nn::{PixelNorm, Result, Split};
 use processing::qwen_vl::ProcessorConfig;
@@ -84,35 +85,6 @@ pub struct TextConfig {
     /// The gated delta network of the linear layers, before any split; `None` for a stack
     /// whose every layer attends.
     pub gated_delta_net: Option<GatedDeltaNetConfig>,
-}
-
-/// The routed experts of a mixture-of-experts stack (Qwen3-MoE's `Qwen3MoeSparseMoeBlock`,
-/// Qwen3.5-MoE's `Qwen3_5MoeSparseMoeBlock`).
-#[derive(Clone, PartialEq, Debug)]
-pub struct MoeConfig {
-    /// Experts per routed layer.
-    pub num_experts: u32,
-    /// Experts each token is routed to.
-    pub num_experts_per_tok: u32,
-    /// Width of one expert's intermediate projection.
-    pub moe_intermediate_size: u32,
-    /// Whether the selected experts' weights renormalize to one.
-    pub norm_topk_prob: bool,
-    /// Every `decoder_sparse_step`-th layer routes when `mlp_only_layers` does not name it.
-    pub decoder_sparse_step: u32,
-    /// Layers that keep the dense MLP.
-    pub mlp_only_layers: Vec<u32>,
-    /// Width of the gated shared expert every token also passes through, when the block has
-    /// one.
-    pub shared_expert_intermediate_size: Option<u32>,
-}
-
-impl MoeConfig {
-    /// Whether `layer` routes its tokens to experts.
-    pub fn routes(&self, layer: u32) -> bool {
-        !self.mlp_only_layers.contains(&layer)
-            && (layer + 1).is_multiple_of(self.decoder_sparse_step)
-    }
 }
 
 /// The Qwen3-VL vision tower and the placeholder tokens its rows replace.
@@ -237,24 +209,10 @@ impl Config {
     /// feature that is not served (sliding windows, layer scales, a recurrent state other than
     /// FP32, a drafter with its own embedding).
     pub fn parse(fields: &Fields<'_>) -> Result<Self> {
-        let architectures = fields
-            .optional_texts("architectures")?
-            .ok_or_else(|| ID.config("checkpoint declares no architectures".to_owned()))?;
-        let [class] = architectures.as_slice() else {
-            return Err(ID.config(format!(
-                "expected one architecture, found {architectures:?}"
-            )));
-        };
-
-        let config = match *class {
+        let config = match fields.class(&CLASSES)? {
             QWEN3_MOE => Self::qwen3_moe(fields)?,
             QWEN3_5_MOE => Self::qwen3_5_moe(fields)?,
-            QWEN3_VL => Self::qwen3_vl(fields)?,
-            other => {
-                return Err(ID.config(format!(
-                    "{other} is not a Qwen3 class this crate builds ({CLASSES:?})"
-                )));
-            }
+            _ => Self::qwen3_vl(fields)?,
         };
         config.check()?;
         Ok(config)
@@ -284,6 +242,8 @@ impl Config {
                 .optional_indices("mlp_only_layers")?
                 .unwrap_or_default(),
             shared_expert_intermediate_size: None,
+            // The class stores one module per expert.
+            layout: ExpertLayout::Modules,
         };
 
         Ok(Self::of(QWEN3_MOE, text, Some(moe), None, 0))
@@ -373,6 +333,8 @@ impl Config {
             decoder_sparse_step: 1,
             mlp_only_layers: Vec::new(),
             shared_expert_intermediate_size: Some(values.count("shared_expert_intermediate_size")?),
+            // The class stores its experts fused (`Qwen3_5MoeExperts`).
+            layout: FUSED_EXPERTS,
         };
 
         Ok(Self::of(
@@ -454,11 +416,6 @@ impl Config {
             }
         }
         Ok(())
-    }
-
-    /// Whether `layer` routes its tokens to experts.
-    pub fn routes(&self, layer: u32) -> bool {
-        self.moe.as_ref().is_some_and(|moe| moe.routes(layer))
     }
 
     /// The layers whose mixer is attention: the layers the key/value cache holds.
@@ -939,6 +896,10 @@ pub(crate) mod fixtures {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
+
+    use nn::causal_lm::CausalLmConfig;
+
     use super::fixtures::{hybrid, moe, vl};
     use super::*;
 
@@ -985,6 +946,24 @@ mod tests {
         let config = parse(&value).expect("parsed");
         let routed: Vec<u32> = (0..4).filter(|layer| config.routes(*layer)).collect();
         assert_eq!(routed, [1]);
+
+        // An expert order names the routed layer alone.
+        let order = |module: &str| BTreeMap::from([(module.to_owned(), vec![0])]);
+        assert!(config.check_order(&order("layers.1.mlp.experts")).is_ok());
+        let error = config
+            .check_order(&order("layers.3.mlp.experts"))
+            .expect_err("a layer that keeps the dense MLP")
+            .to_string();
+        assert!(error.contains("layers.3.mlp.experts"), "{error}");
+    }
+
+    /// Each class declares the layout its dense experts are stored in.
+    #[test]
+    fn a_class_declares_its_experts_layout() {
+        let layout = |value| parse(&value).expect("parsed").moe.expect("experts").layout;
+
+        assert_eq!(layout(moe()), ExpertLayout::Modules);
+        assert_eq!(layout(hybrid()), FUSED_EXPERTS);
     }
 
     #[test]

@@ -320,6 +320,29 @@ impl<'a> Fields<'a> {
             .collect()
     }
 
+    /// The model class a transformers checkpoint declares, its one `architectures` entry, which
+    /// must be one of `classes`.
+    ///
+    /// # Errors
+    ///
+    /// When the field is absent, does not hold exactly one class, or holds another class.
+    pub fn class(&self, classes: &[&'static str]) -> Result<&'static str> {
+        const KEY: &str = "architectures";
+
+        let declared = self
+            .optional_texts(KEY)?
+            .ok_or_else(|| self.refuse(KEY, "is required: the checkpoint declares no class"))?;
+        let [class] = declared.as_slice() else {
+            return Err(self.refuse(KEY, format!("must hold one class, not {declared:?}")));
+        };
+
+        classes
+            .iter()
+            .copied()
+            .find(|known| known == class)
+            .ok_or_else(|| self.refuse(KEY, format!("states {class}, not one of {classes:?}")))
+    }
+
     /// An optional list of strings, which may be empty.
     ///
     /// # Errors

@@ -63,10 +63,12 @@
 //! | [`diffusion`] | Flow-matching schedules, the solver formulas and the sinusoidal time embedding |
 //! | [`vae`] | The tiles of a raster, their blend and stitch, the tiled encode and the temporal clips |
 //! | [`family`] | The family traits, the registry and the shapes execution sizes a model by |
+//! | [`causal_lm`] | What causal language model families share: how a checkpoint opens and loads, and the routed experts of their decoder layers |
 //! | [`collective`], [`profiler`] | The model-facing forms of the device side's collectives and profiler ranges |
 
 pub mod adapter;
 pub mod capability;
+pub mod causal_lm;
 pub mod checkpoint;
 pub mod collective;
 pub mod config;

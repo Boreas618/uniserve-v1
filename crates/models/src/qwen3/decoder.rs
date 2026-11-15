@@ -26,7 +26,7 @@ use nn::family::TextPlacement;
 use nn::functional::Rounding;
 use nn::modules::{
     Attention, AttentionConfig, GateUp, GatedDeltaNet, GatedDeltaNetConfig, Mlp, MlpConfig, MoE,
-    MoEConfig, QkNorm, QkvBias, QkvLinearConfig, QkvNames, RmsNorm, RmsNormConfig, SharedExpert,
+    QkNorm, QkvBias, QkvLinearConfig, QkvNames, RmsNorm, RmsNormConfig, SharedExpert,
     SharedExpertConfig,
 };
 use nn::{ExpertExchange, KvCache, RecurrentState, Result, Split, Tensor, TokenBatch, VarBuilder};
@@ -173,28 +173,7 @@ impl DecoderLayer {
                 .moe
                 .as_ref()
                 .ok_or_else(|| refuse("routed experts"))?;
-            let block = MoEConfig {
-                hidden: text.hidden_size,
-                intermediate: moe.moe_intermediate_size,
-                experts: moe.num_experts,
-                top: moe.num_experts_per_tok,
-                activation: text.hidden_act,
-                renormalize: moe.norm_topk_prob,
-                router: "gate",
-                list: "experts",
-                up: "up_proj",
-                gate: "gate_proj",
-                down: "down_proj",
-                // Released Qwen3.5 BF16 checkpoints stack the experts; Qwen3-MoE and every
-                // calibrated export store one module per expert.
-                stacked: Some(["gate_up_proj", "down_proj"]),
-                order: order
-                    .cloned()
-                    .unwrap_or_else(|| (0..moe.num_experts).collect()),
-                split: tensor,
-                tensor_experts: placement.tensor_experts,
-                exchange: placement.experts,
-            };
+            let block = moe.block(text.hidden_size, text.hidden_act, placement, order);
             let shared = match moe.shared_expert_intermediate_size {
                 Some(intermediate) => Some(SharedExpert::load(
                     &SharedExpertConfig {
@@ -274,20 +253,20 @@ impl DecoderLayer {
 
             let mixed = match (&self.self_attn, &self.linear_attn) {
                 (Some(attention), _) => {
-                    let cache = cache.ok_or_else(|| self.lent_no("key/value cache"))?;
+                    let cache = cache.ok_or_else(|| ID.unlent(&self.path, "key/value cache"))?;
 
                     nn::profiler::range(ATTENTION, &format!("{}.self_attn", self.path), || {
                         attention.forward_paged(&normalized, Some(rope), batch, cache, ordinal)
                     })?
                 }
                 (None, Some(network)) => {
-                    let state = state.ok_or_else(|| self.lent_no("recurrent state"))?;
+                    let state = state.ok_or_else(|| ID.unlent(&self.path, "recurrent state"))?;
 
                     nn::profiler::range(ATTENTION, &format!("{}.linear_attn", self.path), || {
                         network.forward(&normalized, batch, state, ordinal)
                     })?
                 }
-                (None, None) => return Err(self.lent_no("token mixer")),
+                (None, None) => return Err(ID.unlent(&self.path, "token mixer")),
             };
 
             self.feed_forward(&mixed, &residual, batch.live_tokens.as_ref(), exchange)
@@ -318,7 +297,7 @@ impl DecoderLayer {
             let attention = self
                 .self_attn
                 .as_ref()
-                .ok_or_else(|| self.lent_no("attention over its own rows"))?;
+                .ok_or_else(|| ID.unlent(&self.path, "attention over its own rows"))?;
             let mixed =
                 nn::profiler::range(ATTENTION, &format!("{}.self_attn", self.path), || {
                     attention.forward_varlen(
@@ -333,11 +312,6 @@ impl DecoderLayer {
 
             self.feed_forward(&mixed, &residual, None, None)
         })
-    }
-
-    /// The refusal of a forward that needs `what` and has none.
-    fn lent_no(&self, what: &str) -> nn::Error {
-        ID.config(format!("{} has no {what}", self.path))
     }
 
     /// The input norm: `(normalized, residual)`, the rows the mixer reads and the stream,

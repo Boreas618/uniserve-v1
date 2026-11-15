@@ -24,6 +24,7 @@
 //! The language model is tensor parallel; the tower is replicated on every rank, since every
 //! rank needs its features.
 
+use nn::causal_lm::CausalLmConfig;
 use nn::family::TextPlacement;
 use nn::modules::{Embedding, EmbeddingConfig, RmsNorm, Rotary};
 use nn::{Encoder, EncoderLayout, PixelNorm, Result, Split, Tensor, TokenBatch, VarBuilder};

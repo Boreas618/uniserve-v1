@@ -23,7 +23,8 @@
 //! ## Experts
 //!
 //! The routed experts of each layer are held in the slots an [`ExpertOrder`] states
-//! (`docs/admin.md`, Expert redistribution), by the module path [`expert_module`] names.
+//! (`docs/admin.md`, Expert redistribution), by the module path
+//! [`nn::causal_lm::expert_module`] names.
 //!
 //! ## Pipeline stages and sequence members
 //!
@@ -39,9 +40,9 @@
 //! ([`nn::modules::Attention`]), and the rows are gathered after the final norm. Both pass
 //! their rows over the forward's group (`nn::collective`).
 
-use std::collections::BTreeMap;
 use std::ops::Range;
 
+use nn::causal_lm::{CausalLmConfig, expert_module};
 use nn::family::{
     CacheShape, ExpertOrder, ExpertShape, SequenceSplit, StateShape, TextModel, TextPlacement,
     TokenHistory,
@@ -109,24 +110,6 @@ pub(crate) fn text_rotary(rope: RotaryConfig) -> RotaryConfig {
     }
 }
 
-/// The path an [`ExpertOrder`] names the routed experts of decoder layer `layer` by.
-pub fn expert_module(layer: u32) -> String {
-    format!("layers.{layer}.mlp.experts")
-}
-
-/// The routed experts of every layer of `config` by module path, each with its expert count:
-/// what an expert redistribution may order.
-pub fn expert_layers(config: &Config) -> BTreeMap<String, u32> {
-    let Some(moe) = &config.moe else {
-        return BTreeMap::new();
-    };
-
-    (0..config.text.num_hidden_layers)
-        .filter(|layer| config.routes(*layer))
-        .map(|layer| (expert_module(layer), moe.num_experts))
-        .collect()
-}
-
 impl Qwen3ForCausalLm {
     /// The model `config` describes, the configuration of `checkpoint`, its modules read under
     /// `vb` (the checkpoint's root), at the ranks `placement` states, with the routed experts in
@@ -140,10 +123,9 @@ impl Qwen3ForCausalLm {
     ///
     /// # Errors
     ///
-    /// A placement the model refuses ([`Config::check_placement`]), an order that names no
-    /// routed layer, a drafter the checkpoint does not carry, a served tower the checkpoint
-    /// does not hold or the model does not serve ([`VisionTower::served`]), or a module the
-    /// loader refuses.
+    /// A placement the model refuses ([`Config::check_placement`]), a drafter the checkpoint
+    /// does not carry, a served tower the checkpoint does not hold or the model does not serve
+    /// ([`VisionTower::served`]), or a module the loader refuses.
     pub fn load(
         config: &Config,
         checkpoint: &Checkpoint,
@@ -152,13 +134,6 @@ impl Qwen3ForCausalLm {
         order: &ExpertOrder,
     ) -> Result<Self> {
         let held = config.check_placement(placement)?;
-
-        let routed = expert_layers(config);
-        if let Some(stray) = order.keys().find(|module| !routed.contains_key(*module)) {
-            return Err(ID.config(format!(
-                "{stray} is not a routed expert layer of this model"
-            )));
-        }
 
         let text = &config.text;
         let model = vb.pp(language_model(config));
@@ -414,10 +389,10 @@ impl CausalLm for Qwen3ForCausalLm {
     }
 
     fn join_expert_step(&self, exchange: &ExpertExchange) -> nn::Result<()> {
-        for experts in self.layers.iter().filter_map(DecoderLayer::experts) {
-            experts.join_expert_step(exchange)?;
-        }
-        Ok(())
+        nn::causal_lm::join_expert_step(
+            self.layers.iter().filter_map(DecoderLayer::experts),
+            exchange,
+        )
     }
 }
 
@@ -531,7 +506,7 @@ mod tests {
         let config =
             Config::parse(&Fields::of("config.json", &config).expect("an object")).expect("parsed");
 
-        let layers = expert_layers(&config);
+        let layers = config.expert_layers();
         assert_eq!(layers.len(), 4);
         assert_eq!(layers.get("layers.2.mlp.experts"), Some(&128));
     }

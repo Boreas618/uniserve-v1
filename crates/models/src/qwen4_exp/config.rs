@@ -14,7 +14,7 @@
 //! | hyper-connections | [`HyperConnectionConfig`] |
 //! | the attention layers' indexer | [`IndexerConfig`] |
 //! | n-gram hash embedding and its PLE layers | [`NgramEmbeddingConfig`] |
-//! | routed experts | [`crate::qwen3::MoeConfig`] |
+//! | routed experts | [`nn::causal_lm::MoeConfig`] |
 //! | vision tower | [`crate::qwen3::VisionConfig`] |
 //!
 //! [`Config::open`] also reads what the checkpoint's other sidecars state of the same modules:
@@ -23,13 +23,14 @@
 //! What a deployment chooses (the tokens a step drafts, the element type of the key/value
 //! cache, the tensor-parallel split) is no part of a configuration: a load is given it.
 
+use nn::causal_lm::{FUSED_EXPERTS, MoeConfig};
 use nn::config::Fields;
 use nn::functional::{Activation, StateAxes};
 use nn::modules::{GatedDeltaNetConfig, Precision, RotaryConfig};
 use nn::quantization::Declaration;
 use nn::{Result, Split};
 
-use crate::qwen3::{MoeConfig, VisionConfig};
+use crate::qwen3::VisionConfig;
 use crate::qwen4_exp::ID;
 
 /// The model class this family builds, as request processing claims it.
@@ -287,14 +288,7 @@ impl Config {
     /// than the sigmoid, a drafter with its own embedding, an indexer of several key heads, a
     /// tower with DeepStack features.
     pub fn parse(fields: &Fields<'_>) -> Result<Self> {
-        let architectures = fields
-            .optional_texts("architectures")?
-            .ok_or_else(|| ID.config("checkpoint declares no architectures".to_owned()))?;
-        if architectures.as_slice() != [CLASS] {
-            return Err(ID.config(format!(
-                "{architectures:?} is not the class this crate builds ({CLASS})"
-            )));
-        }
+        fields.class(&[CLASS])?;
         if fields
             .optional_flag("tie_word_embeddings")?
             .unwrap_or(false)
@@ -327,6 +321,8 @@ impl Config {
             decoder_sparse_step: 1,
             mlp_only_layers: Vec::new(),
             shared_expert_intermediate_size: Some(values.count("shared_expert_intermediate_size")?),
+            // The class stores its dense experts fused, as Qwen3.5's does.
+            layout: FUSED_EXPERTS,
         };
 
         let vision = VisionConfig::read(fields)?;

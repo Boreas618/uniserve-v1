@@ -12,7 +12,9 @@ use std::path::Path;
 
 use nn::collective::Split;
 use nn::functional::{self, Activation, Rounding};
-use nn::modules::{GateUp, MlpConfig, MoE, MoEConfig, SharedExpert, SharedExpertConfig};
+use nn::modules::{
+    ExpertLayout, GateUp, MlpConfig, MoE, MoEConfig, SharedExpert, SharedExpertConfig,
+};
 use nn::quantization::{Declaration, Nvfp4Stack, UNIFIED_EXPORT};
 use nn::{
     Checkpoint, CpuWeights, DType, Device, ExpertExchange, MetaWeights, Tensor, WeightLoader,
@@ -969,7 +971,7 @@ fn dense_config() -> MoEConfig {
         up: "up_proj",
         gate: "gate_proj",
         down: "down_proj",
-        stacked: None,
+        layout: ExpertLayout::Modules,
         order: vec![0, 1, 2, 3],
         split: Split::WHOLE,
         tensor_experts: false,
@@ -1090,6 +1092,8 @@ fn a_block_loads_its_experts_and_sums_each_token_s_routes() {
     assert!(live[3 * 8..].iter().all(|value| *value == 0.0));
 }
 
+/// The two layouts an architecture declares its dense experts in are read by their own
+/// mappings into the same block.
 #[test]
 fn a_block_reads_stacked_experts_as_it_reads_one_module_each() {
     let modules = tempfile::tempdir().unwrap();
@@ -1098,7 +1102,6 @@ fn a_block_reads_stacked_experts_as_it_reads_one_module_each() {
     let loader = WeightLoader::new(&checkpoint, &store, None);
     let config = MoEConfig {
         order: vec![3, 1, 0, 2],
-        stacked: Some(["gate_up_proj", "down_proj"]),
         ..dense_config()
     };
     let block = MoE::load(&config, loader.root().pp("mlp")).unwrap();
@@ -1140,7 +1143,14 @@ fn a_block_reads_stacked_experts_as_it_reads_one_module_each() {
     let stacked_checkpoint = Checkpoint::open(stacked.path()).unwrap();
     let stacked_store = CpuWeights::new();
     let stacked_loader = WeightLoader::new(&stacked_checkpoint, &stacked_store, None);
-    let from_stacks = MoE::load(&config, stacked_loader.root().pp("mlp")).unwrap();
+    let stacked_config = MoEConfig {
+        layout: ExpertLayout::Stacked {
+            gate_up: "gate_up_proj",
+            down: "down_proj",
+        },
+        ..config
+    };
+    let from_stacks = MoE::load(&stacked_config, stacked_loader.root().pp("mlp")).unwrap();
 
     let x = tensor(&sequence(5 * 8, 81), (5, 8), DType::F32);
     assert_eq!(

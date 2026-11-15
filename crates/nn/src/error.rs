@@ -215,6 +215,12 @@ impl ModelId {
     pub fn unsupported(self, problem: impl Into<String>) -> Error {
         self.refuse(Refusal::Unsupported, problem)
     }
+
+    /// A forward of the module at `module` that reads `input` and was lent none
+    /// ([`Refusal::Config`]): the caller's lending does not describe the loaded model.
+    pub fn unlent(self, module: &str, input: &str) -> Error {
+        self.config(format!("{module} has no {input}"))
+    }
 }
 
 impl std::fmt::Display for ModelId {

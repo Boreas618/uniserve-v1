@@ -18,7 +18,7 @@
 use nn::family::TextPlacement;
 use nn::functional::Rounding;
 use nn::modules::{
-    GateUp, GatedDeltaNet, GatedDeltaNetConfig, MlpConfig, MoE, MoEConfig, Rotary, SharedExpert,
+    GateUp, GatedDeltaNet, GatedDeltaNetConfig, MlpConfig, MoE, Rotary, SharedExpert,
     SharedExpertConfig,
 };
 use nn::{DType, ExpertExchange, KvCache, RecurrentState, Result, Tensor, TokenBatch, VarBuilder};
@@ -100,28 +100,7 @@ impl DecoderLayer {
             )
         };
 
-        let block = MoEConfig {
-            hidden: text.hidden_size,
-            intermediate: moe.moe_intermediate_size,
-            experts: moe.num_experts,
-            top: moe.num_experts_per_tok,
-            activation: text.hidden_act,
-            renormalize: moe.norm_topk_prob,
-            router: "gate",
-            list: "experts",
-            up: "up_proj",
-            gate: "gate_proj",
-            down: "down_proj",
-            // The RadixArk export stacks the drafter's experts; every other module list holds
-            // one module per expert.
-            stacked: Some(["gate_up_proj", "down_proj"]),
-            order: order
-                .cloned()
-                .unwrap_or_else(|| (0..moe.num_experts).collect()),
-            split: tensor,
-            tensor_experts: placement.tensor_experts,
-            exchange: placement.experts,
-        };
+        let block = moe.block(text.hidden_size, text.hidden_act, placement, order);
         let shared = SharedExpertConfig {
             mlp: MlpConfig {
                 hidden: text.hidden_size,
@@ -238,7 +217,7 @@ impl DecoderLayer {
                         }
                         None => streams.clone(),
                     };
-                    let context = context.ok_or_else(|| self.lent_no("n-gram context"))?;
+                    let context = context.ok_or_else(|| ID.unlent(&self.path, "n-gram context"))?;
                     let added = ple.forward(&folded, context, batch, state, ple_state)?;
 
                     let sum = folded
@@ -250,7 +229,7 @@ impl DecoderLayer {
             };
 
             let (streams, input, logits) = self.attn_hyper_connection.forward(&streams, pending)?;
-            let logits = logits.ok_or_else(|| self.lent_no("combine logits"))?;
+            let logits = logits.ok_or_else(|| ID.unlent(&self.path, "combine logits"))?;
 
             let mixed = match (&self.linear_attn, &self.self_attn) {
                 (Some(network), _) => {
@@ -259,7 +238,7 @@ impl DecoderLayer {
                     })?
                 }
                 (None, Some(attention)) => {
-                    let cache = cache.ok_or_else(|| self.lent_no("key/value cache"))?;
+                    let cache = cache.ok_or_else(|| ID.unlent(&self.path, "key/value cache"))?;
 
                     nn::profiler::range(ATTENTION, &format!("{}.self_attn", self.path), || {
                         attention.forward(
@@ -276,13 +255,13 @@ impl DecoderLayer {
                         )
                     })?
                 }
-                (None, None) => return Err(self.lent_no("token mixer")),
+                (None, None) => return Err(ID.unlent(&self.path, "token mixer")),
             };
 
             let (streams, input, logits) = self
                 .mlp_hyper_connection
                 .forward(&streams, Some((&mixed, &logits)))?;
-            let logits = logits.ok_or_else(|| self.lent_no("combine logits"))?;
+            let logits = logits.ok_or_else(|| ID.unlent(&self.path, "combine logits"))?;
 
             let output = nn::profiler::range(MLP, &format!("{}.mlp", self.path), || {
                 let routed = self
@@ -294,10 +273,5 @@ impl DecoderLayer {
 
             Ok((streams, output, logits))
         })
-    }
-
-    /// The refusal of a forward that needs `what` and has none.
-    fn lent_no(&self, what: &str) -> nn::Error {
-        ID.config(format!("{} has no {what}", self.path))
     }
 }

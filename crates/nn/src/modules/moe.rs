@@ -14,12 +14,14 @@
 //!
 //! ## Loading
 //!
-//! A checkpoint stores a block's experts as one module per expert
-//! (`<list>.<e>.<up|gate|down>.weight`) or as two stacked tensors, and either way the block
-//! reads them as two stacks in the arrangement its products read: `[experts, 2 · intermediate,
-//! hidden]` with each expert's up rows before its gate rows, and `[experts, hidden,
-//! intermediate]`. A calibrated NVFP4 checkpoint's experts are read as packed stacks, which the
-//! declaration the model's loader was given decides from the first held expert's weight.
+//! A checkpoint's architecture stores a block's dense experts in one layout ([`ExpertLayout`]):
+//! one module per expert (`<list>.<e>.<up|gate|down>.weight`) or two stacked tensors. Each
+//! layout has its one mapping, and either reads them as two stacks in the arrangement the
+//! products read: `[experts, 2 · intermediate, hidden]` with each expert's up rows before its
+//! gate rows, and `[experts, hidden, intermediate]`. A calibrated NVFP4 checkpoint's experts
+//! are read as packed stacks, which the representation the model's loader resolved decides
+//! from the first held expert's weight; a calibrated export stores every packed expert as its
+//! own module (ModelOpt's unified export), which is the one layout packed experts are read in.
 //!
 //! ## Where the experts sit
 //!
@@ -96,12 +98,8 @@ pub struct MoEConfig {
     pub gate: &'static str,
     /// An expert's down projection's module name.
     pub down: &'static str,
-    /// The stacked tensors a checkpoint of this family may hold its experts in instead,
-    /// `[gate_up, down]` under the module list (Hugging Face transformers' fused experts):
-    /// `gate_up` is `[experts, 2 · intermediate, hidden]` with each expert's gate rows before
-    /// its up rows, and `down` is `[experts, hidden, intermediate]`. They are read when the
-    /// checkpoint holds them.
-    pub stacked: Option<[&'static str; 2]>,
+    /// How the checkpoint's architecture stores the dense experts.
+    pub layout: ExpertLayout,
     /// The expert each slot holds: a permutation of the experts, in which the stacks are laid
     /// out and by which an expert group's ranks divide them. The experts' own order when a
     /// deployment has not redistributed them.
@@ -117,6 +115,22 @@ pub struct MoEConfig {
     pub tensor_experts: bool,
     /// The expert group's split of the slots: this rank holds one contiguous window of them.
     pub exchange: Split,
+}
+
+/// How a checkpoint's architecture stores a block's dense experts, as its schema declares it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ExpertLayout {
+    /// One module per expert under the module list: `<list>.<e>.<up|gate|down>`.
+    Modules,
+    /// Two stacked tensors under the module list (transformers' fused experts): `gate_up` is
+    /// `[experts, 2 · intermediate, hidden]` with each expert's gate rows before its up rows,
+    /// and `down` is `[experts, hidden, intermediate]`.
+    Stacked {
+        /// The stacked first projection's tensor name.
+        gate_up: &'static str,
+        /// The stacked down projection's tensor name.
+        down: &'static str,
+    },
 }
 
 /// The representation a block's expert stacks are held in.
@@ -311,8 +325,8 @@ impl MoE {
     }
 
     /// The dense stacks of the experts `window` names, this rank's block `split` of each
-    /// expert's width: from the checkpoint's stacked tensors when it holds them, and from one
-    /// module per expert otherwise.
+    /// expert's width, by the mapping of the layout the architecture declares
+    /// ([`MoEConfig::layout`]).
     fn load_dense(
         config: &MoEConfig,
         vb: &VarBuilder<'_, '_>,
@@ -344,9 +358,8 @@ impl MoE {
             row_stride: intermediate,
         };
 
-        let stacked = config.stacked.filter(|[gate_up, _]| list.contains(gate_up));
-        let (up_gate_name, up_gate, down_name, down) = match stacked {
-            Some([gate_up, down]) => {
+        let (up_gate_name, up_gate, down_name, down) = match config.layout {
+            ExpertLayout::Stacked { gate_up, down } => {
                 let (gate_up, down) = (list.name(gate_up), list.name(down));
 
                 // One expert's slab of the stacked first projection is its gate rows, then its
@@ -378,7 +391,7 @@ impl MoE {
                 )
             }
 
-            None => {
+            ExpertLayout::Modules => {
                 let weight = |expert: u32, module: &str| list.pp(expert).pp(module).name("weight");
                 let up_gate_parts = window
                     .iter()

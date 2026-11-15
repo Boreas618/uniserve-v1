@@ -28,8 +28,7 @@
 //! one position per token, read on every axis, and a batch that holds image rows states three
 //! ([`TokenBatch::rope_positions`]).
 
-use std::collections::BTreeMap;
-
+use nn::causal_lm::expert_module;
 use nn::family::{
     CacheShape, ExpertOrder, ExpertShape, IndexKeys, StateShape, TextModel, TextPlacement,
     TokenHistory,
@@ -207,19 +206,6 @@ pub struct Qwen4ExpForCausalLm {
     visual: Option<VisionTower>,
 }
 
-/// The path an [`ExpertOrder`] names the routed experts of decoder layer `layer` by.
-pub fn expert_module(layer: u32) -> String {
-    format!("layers.{layer}.mlp.experts")
-}
-
-/// The routed experts of every layer of `config` by module path, each with its expert count:
-/// what an expert redistribution may order.
-pub fn expert_layers(config: &Config) -> BTreeMap<String, u32> {
-    (0..config.text.num_hidden_layers)
-        .map(|layer| (expert_module(layer), config.moe.num_experts))
-        .collect()
-}
-
 impl Qwen4ExpForCausalLm {
     /// The model `config` describes, the configuration of `checkpoint`, its modules read under
     /// `vb` (the checkpoint's root), at the ranks `placement` states, with the routed experts in
@@ -262,13 +248,6 @@ impl Qwen4ExpForCausalLm {
                  model's layers are split over tensor and expert ranks alone",
                 placement.pipeline.size(),
                 placement.sequence.split.size()
-            )));
-        }
-
-        let routed = expert_layers(config);
-        if let Some(stray) = order.keys().find(|module| !routed.contains_key(*module)) {
-            return Err(ID.config(format!(
-                "{stray} is not a routed expert layer of this model"
             )));
         }
 
@@ -449,10 +428,7 @@ impl CausalLm for Qwen4ExpForCausalLm {
     }
 
     fn join_expert_step(&self, exchange: &ExpertExchange) -> nn::Result<()> {
-        for layer in &self.layers {
-            layer.experts().join_expert_step(exchange)?;
-        }
-        Ok(())
+        nn::causal_lm::join_expert_step(self.layers.iter().map(DecoderLayer::experts), exchange)
     }
 }
 
@@ -563,6 +539,7 @@ impl std::fmt::Debug for Qwen4ExpForCausalLm {
 
 #[cfg(test)]
 mod tests {
+    use nn::causal_lm::CausalLmConfig;
     use nn::config::Fields;
 
     use super::*;
@@ -573,7 +550,7 @@ mod tests {
         let config =
             Config::parse(&Fields::of("config.json", &config).expect("an object")).expect("parsed");
 
-        let layers = expert_layers(&config);
+        let layers = config.expert_layers();
         assert_eq!(layers.len(), 8);
         assert_eq!(layers.get("layers.7.mlp.experts"), Some(&512));
     }

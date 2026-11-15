@@ -33,7 +33,7 @@ pub mod vision;
 pub mod vl;
 
 pub use causal_lm::Qwen3ForCausalLm;
-pub use config::{Config, MoeConfig, TextConfig, VisionConfig};
+pub use config::{Config, TextConfig, VisionConfig};
 pub use decoder::DecoderLayer;
 pub use mtp::Mtp;
 pub use vision::VisionTower;
