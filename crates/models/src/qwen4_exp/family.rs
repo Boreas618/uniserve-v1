@@ -51,12 +51,6 @@ impl TextCheckpoint for Config {
         expert_layers(self)
     }
 
-    fn end_of_text(&self) -> Option<&'static str> {
-        // The vocabulary states no beginning-of-sequence token: the end of text begins a
-        // sequence, and a completion that emits it stops.
-        Some("<|endoftext|>")
-    }
-
     fn load(
         &self,
         _checkpoint: &Checkpoint,

@@ -263,12 +263,6 @@ pub trait TextCheckpoint: Send + Sync {
     /// model. An expert redistribution orders these layers' experts ([`ExpertOrder`]).
     fn expert_layers(&self) -> BTreeMap<String, u32>;
 
-    /// The special token whose text ends a document in this family's vocabulary, such as
-    /// `<|endoftext|>`, when the family has one: execution reads its id from the checkpoint's
-    /// tokenizer, begins sequences with it when the checkpoint states no beginning token, and
-    /// stops generation on it.
-    fn end_of_text(&self) -> Option<&'static str>;
-
     /// Loads the model's share of `checkpoint`, the checkpoint [`TextFamily::open`] read, for
     /// `placement`, its weights reached through `loader` (whose root builder the model's modules
     /// load from), its routed experts in the slots `experts` states.
