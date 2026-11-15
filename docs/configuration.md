@@ -398,6 +398,7 @@ The [FastH3 guide](minimax_h3/minimax_h3.md#startup-and-capacity) explains how t
 | `sizes` | The model family's sizes (`["1344x768", "768x1344"]` for MiniMax-H3) | Output sizes startup prepares and requests may name, each `WxH` in pixels; the served model refuses at startup a size its checkpoint does not generate |
 | `text_capacities` | `1024`, then steps of 2048, below `max_model_len` | Prompt capacities startup captures, strictly increasing and none above `max_model_len`; `max_model_len` itself completes them as the largest, so every admitted prompt runs in the smallest capacity that holds it |
 | `max_condition_rows` | Largest condition set | Denoiser rows one request's conditions may take |
+| `latent_page_bytes` | `1048576` (one MiB) | Bytes of one page of a denoising rank's host latent region, where a preempted request's trajectory is saved; a whole number of float32 samples. A saved trajectory takes whole pages |
 
 ### `media_config`
 

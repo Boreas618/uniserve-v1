@@ -355,8 +355,7 @@ pub(crate) fn video_launch() -> EngineArgs {
     config.video = proto::config::VideoConfig {
         max_seconds: Some(4.0),
         sizes: Some(vec!["768x768".to_owned()]),
-        text_capacities: None,
-        max_condition_rows: None,
+        ..proto::config::VideoConfig::default()
     };
     launch.group = group.id.0;
     launch

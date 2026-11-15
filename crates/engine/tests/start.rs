@@ -523,8 +523,7 @@ fn media_two_host_launch(
     config.video = proto::config::VideoConfig {
         max_seconds: Some(4.0),
         sizes: Some(vec!["768x768".to_owned()]),
-        text_capacities: None,
-        max_condition_rows: None,
+        ..proto::config::VideoConfig::default()
     };
 
     let scheduler_node = host == "rank-0";

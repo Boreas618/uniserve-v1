@@ -939,6 +939,22 @@ impl Default for ImageFetchConfig {
     }
 }
 
+/// The smallest prompt capacity, in tokens, a media deployment captures when
+/// `video_config.text_capacities` is unset: a short prompt encodes in a graph of at most this
+/// many tokens.
+pub const DEFAULT_FIRST_TEXT_CAPACITY: u32 = 1024;
+
+/// The tokens between two consecutive prompt capacities a media deployment captures when
+/// `video_config.text_capacities` is unset: a prompt pads to at most this many tokens past its
+/// own, and each capacity costs one captured encode per request count.
+pub const DEFAULT_TEXT_CAPACITY_STEP: u32 = 2048;
+
+/// The bytes of one page of a denoising rank's host latent region, where a preempted request's
+/// trajectory is saved, when `video_config.latent_page_bytes` is unset: a mebibyte, a whole
+/// number of float32 samples. A saved trajectory takes whole pages, so a page bounds what a save
+/// copies past the trajectory, and the region's pages are what its numbering counts.
+pub const DEFAULT_LATENT_PAGE_BYTES: u32 = 1 << 20;
+
 /// Video generation (`video_config`).
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -951,12 +967,39 @@ pub struct VideoConfig {
     /// states once it reads the checkpoint; none for a model that generates no video.
     pub sizes: Option<Vec<String>>,
     /// Prompt capacities startup captures, strictly increasing and none above
-    /// `max_model_len`, which completes them as the largest; 1024, then steps
-    /// of 2048 below `max_model_len`, when unset.
+    /// `max_model_len`, which completes them as the largest;
+    /// [`DEFAULT_FIRST_TEXT_CAPACITY`], then steps of [`DEFAULT_TEXT_CAPACITY_STEP`] below
+    /// `max_model_len`, when unset.
     pub text_capacities: Option<Vec<NonZeroU32>>,
     /// Denoiser rows one request's conditions may take; the largest
     /// condition set the denoiser admits when unset.
     pub max_condition_rows: Option<u32>,
+    /// The bytes of one page of a denoising rank's host latent region, a whole number of
+    /// float32 samples; [`DEFAULT_LATENT_PAGE_BYTES`] when unset.
+    pub latent_page_bytes: Option<NonZeroU32>,
+}
+
+impl VideoConfig {
+    /// The prompt capacities the configuration states, or when it states none the default
+    /// ladder below `longest`: [`DEFAULT_FIRST_TEXT_CAPACITY`], then steps of
+    /// [`DEFAULT_TEXT_CAPACITY_STEP`]. Neither is completed with `longest` here.
+    pub fn stated_text_capacities(&self, longest: u32) -> Vec<u32> {
+        match &self.text_capacities {
+            Some(capacities) => capacities.iter().map(|value| value.get()).collect(),
+            None => std::iter::successors(Some(DEFAULT_FIRST_TEXT_CAPACITY), |capacity| {
+                capacity.checked_add(DEFAULT_TEXT_CAPACITY_STEP)
+            })
+            .take_while(|capacity| *capacity < longest)
+            .collect(),
+        }
+    }
+
+    /// The bytes of one page of the host latent region: the stated ones, or
+    /// [`DEFAULT_LATENT_PAGE_BYTES`].
+    pub fn latent_page_bytes(&self) -> u32 {
+        self.latent_page_bytes
+            .map_or(DEFAULT_LATENT_PAGE_BYTES, NonZeroU32::get)
+    }
 }
 
 /// Condition media of video requests (`media_config`).

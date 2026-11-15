@@ -93,9 +93,6 @@ const HOST_PHASES: [Phase; 4] = [
     Phase::Mux,
 ];
 
-/// The values of one page of the host latent region: a mebibyte of float32 samples.
-const LATENT_PAGE_VALUES: u32 = 1 << 18;
-
 /// The runners of a media rank that compute on the device, by the region of the graph pool
 /// each replays in. The media host computes nothing there.
 pub(crate) const ENCODER: RunnerId = RunnerId(0);
@@ -653,7 +650,7 @@ impl ModelRunner {
                 pick(product::AUDIO_LATENTS)?,
             ],
             ranks: ranks.max(1),
-            page_bytes: latent_pages(0, 0)?.page_bytes()?,
+            page_bytes: latent_pages(&self.engine_config().video, 0, 0)?.page_bytes()?,
             first,
         })
     }
@@ -1015,7 +1012,8 @@ impl ModelRunner {
             let (tensors, encoding) = denoiser.trajectory_digests();
             let shapes = denoiser.media_shapes()?;
             let largest = shapes.iter().map(|(_, bytes, _)| *bytes).max().unwrap_or(0);
-            trajectory = Some((tensors, encoding, latent_pages(largest, slots)?));
+            let video = &self.engine_config().video;
+            trajectory = Some((tensors, encoding, latent_pages(video, largest, slots)?));
             (media_bytes, units) = self.media_bytes(model.as_ref(), &shapes, &laid)?;
         }
 
@@ -1773,16 +1771,35 @@ fn laid_out(model: &dyn VideoModel, serving: &VideoServing) -> Result<Vec<(Video
         .collect()
 }
 
-/// The pages of a rank's host latent region for trajectories of at most `trajectory` bytes and
-/// `slots` request slots: a mebibyte of float32 samples a page, every slot's trajectory pages.
+/// The pages of a rank's host latent region of `video`'s pages
+/// (`proto::config::VideoConfig::latent_page_bytes`) for trajectories of at most `trajectory`
+/// bytes and `slots` request slots: float32 samples, every slot's trajectory pages.
 ///
 /// # Errors
 ///
-/// A trajectory of more pages than a `u32` counts.
-pub(crate) fn latent_pages(trajectory: u64, slots: u32) -> Result<BankPages> {
+/// A page that is no whole number of float32 samples, or a trajectory of more pages than a
+/// `u32` counts.
+pub(crate) fn latent_pages(
+    video: &proto::config::VideoConfig,
+    trajectory: u64,
+    slots: u32,
+) -> Result<BankPages> {
+    let dtype = DType::F32;
+    let bytes = video.latent_page_bytes();
+    let sample = dtype
+        .size_in_bytes()
+        .context("a latent sample is a whole number of bytes")?;
+    let sample = u32::try_from(sample).context("a sample wider than a u32")?;
+    if !bytes.is_multiple_of(sample) {
+        bail!(
+            "video_config.latent_page_bytes is {bytes}, which holds no whole number of {} \
+             samples",
+            ops::abi::name(dtype)
+        );
+    }
     let pages = BankPages {
-        dtype: DType::F32,
-        page_values: LATENT_PAGE_VALUES,
+        dtype,
+        page_values: bytes / sample,
         trajectory_pages: 0,
         pages: 0,
     };
@@ -1824,7 +1841,8 @@ fn phase_rows(phase: Phase, slots: u32, pool_tasks: u32) -> u32 {
 /// capacity is `longest` itself. The deployment's `text_capacities`, when stated, must be strictly
 /// increasing and none above `longest` - a capacity above it would capture an encoder graph no
 /// request can fill; a statement whose largest is below `longest` is completed with it. The
-/// default ladder is `1024`, then steps of `2048`, below `longest`, completed the same way.
+/// default ladder is the schema's (`proto::config::VideoConfig::stated_text_capacities`),
+/// completed the same way.
 pub(super) fn prompt_capacities(
     video: &proto::config::VideoConfig,
     longest: u32,
@@ -1832,18 +1850,7 @@ pub(super) fn prompt_capacities(
     if longest == 0 {
         bail!("this media deployment states no prompt length (`max_model_len`) to capture");
     }
-    let mut stated: Vec<u32> = match &video.text_capacities {
-        Some(capacities) => capacities.iter().map(|value| value.get()).collect(),
-        None => {
-            let mut ladder = Vec::new();
-            let mut capacity = 1024;
-            while capacity < longest {
-                ladder.push(capacity);
-                capacity += 2048;
-            }
-            ladder
-        }
-    };
+    let mut stated = video.stated_text_capacities(longest);
     for pair in stated.windows(2) {
         if pair[0] >= pair[1] {
             bail!(

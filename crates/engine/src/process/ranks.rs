@@ -3215,7 +3215,7 @@ fn open_media_memory(
     let latents = layout.classes[usize::from(layout.trajectory)]
         .host
         .map(|(region, _)| region);
-    let pages = latent_pages(0, 0)?;
+    let pages = latent_pages(&model_runner.engine_config().video, 0, 0)?;
 
     // The holder's parts, one of each host region, which every rank of the process copies with.
     let holds_parts = model_runner.rank() == holder;
