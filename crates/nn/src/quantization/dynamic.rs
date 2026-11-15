@@ -32,6 +32,7 @@ use float8::F8E4M3;
 use half::f16;
 use ops::dynamic_scale::{FP8_RANGE, NVFP4_RANGE};
 use ops::fp4::{BLOCK_ELEMENTS, ScaleLayout};
+use tensor::cpu_backend::CpuExecutor;
 use tensor::{DType, Shape, Tensor};
 
 use super::Scheme;
@@ -46,10 +47,6 @@ const ABSMAX: WeightLayout = WeightLayout::named("absmax");
 
 /// The arrangement the packed product reads a converted weight's block scales in.
 const PRODUCT_SCALE_LAYOUT: ScaleLayout = crate::functional::PRODUCT_SCALE_LAYOUT;
-
-/// The most host threads one encoding runs over: a projection is encoded in row bands, each band
-/// on a thread of its own.
-const THREADS: usize = 16;
 
 /// The FP32 value of element `index` of `bytes`, which hold `dtype` elements: BF16, FP16 or
 /// FP32, each widened exactly.
@@ -69,10 +66,25 @@ fn widened(dtype: DType, bytes: &[u8], index: usize) -> f32 {
     }
 }
 
-/// `rows` split into at most [`THREADS`] contiguous bands of whole rows, the first ones a row
+/// `rows` split into contiguous bands of whole rows, one per thread of the host's CPU budget,
+/// the first ones a row longer when the count does not divide.
+///
+/// The budget is the thread count the process's CPU executor runs with
+/// ([`CpuExecutor`]), which its owner configures: an encoding computes on the CPUs the CPU
+/// backend computes on, and never on more threads than they hold.
+///
+/// # Errors
+///
+/// When the process's CPU executor cannot be started.
+fn bands(rows: usize) -> Result<Vec<Range<usize>>> {
+    let threads = CpuExecutor::current()?.config().threads;
+    Ok(split(rows, threads))
+}
+
+/// `rows` split into at most `threads` contiguous bands of whole rows, the first ones a row
 /// longer when the count does not divide.
-fn bands(rows: usize) -> Vec<Range<usize>> {
-    let count = rows.clamp(1, THREADS);
+fn split(rows: usize, threads: usize) -> Vec<Range<usize>> {
+    let count = rows.clamp(1, threads.max(1));
     let (each, extra) = (rows / count, rows % count);
 
     let mut start = 0;
@@ -87,13 +99,22 @@ fn bands(rows: usize) -> Vec<Range<usize>> {
 }
 
 /// The largest magnitude of the `dtype` elements `bytes` holds, folded in bands on host threads.
-fn largest_magnitude(dtype: DType, bytes: &[u8]) -> f32 {
-    // The sources are BF16, FP16 or FP32 (`widened`); an element narrower than a byte is none,
-    // and gives no element to read.
-    let elements = dtype.size_in_bytes().map_or(0, |width| bytes.len() / width);
+///
+/// # Errors
+///
+/// When the process's CPU executor cannot be started, or `dtype` has no whole-byte element.
+fn largest_magnitude(dtype: DType, bytes: &[u8]) -> Result<f32> {
+    // The sources are BF16, FP16 or FP32 (`widened`), each a whole number of bytes.
+    let width = dtype.size_in_bytes().ok_or_else(|| {
+        Error::shape(
+            "largest_magnitude",
+            format!("{} has no whole-byte element", ops::abi::name(dtype)),
+        )
+    })?;
+    let bands = bands(bytes.len() / width)?;
 
-    std::thread::scope(|scope| {
-        let workers: Vec<_> = bands(elements)
+    Ok(std::thread::scope(|scope| {
+        let workers: Vec<_> = bands
             .into_iter()
             .map(|band| {
                 scope.spawn(move || {
@@ -103,12 +124,16 @@ fn largest_magnitude(dtype: DType, bytes: &[u8]) -> f32 {
             })
             .collect();
 
-        // A band's fold cannot panic, so a worker that does not join is not a value to keep.
+        // A worker's panic is the encoding's: it is resumed here, never folded away.
         workers
             .into_iter()
-            .filter_map(|worker| worker.join().ok())
+            .map(|worker| {
+                worker
+                    .join()
+                    .unwrap_or_else(|panic| std::panic::resume_unwind(panic))
+            })
             .fold(0.0_f32, f32::max)
-    })
+    }))
 }
 
 /// The E2M1 code of `value`, rounded to nearest with ties to the even code and saturating at
@@ -140,12 +165,22 @@ fn e2m1_code(value: f32) -> u8 {
 
 /// `rows` rows of `columns` `dtype` elements in `bytes`, encoded as per-tensor E4M3 under the
 /// multiplier `encode`: one byte per element, row-major.
-fn encode_fp8(dtype: DType, bytes: &[u8], (rows, columns): (usize, usize), encode: f32) -> Vec<u8> {
+///
+/// # Errors
+///
+/// When the process's CPU executor cannot be started.
+fn encode_fp8(
+    dtype: DType,
+    bytes: &[u8],
+    (rows, columns): (usize, usize),
+    encode: f32,
+) -> Result<Vec<u8>> {
     let mut values = vec![0_u8; rows * columns];
+    let bands = bands(rows)?;
 
     std::thread::scope(|scope| {
         let mut rest = values.as_mut_slice();
-        for band in bands(rows) {
+        for band in bands {
             let (mine, after) = rest.split_at_mut(band.len() * columns);
             rest = after;
 
@@ -157,18 +192,22 @@ fn encode_fp8(dtype: DType, bytes: &[u8], (rows, columns): (usize, usize), encod
             });
         }
     });
-    values
+    Ok(values)
 }
 
 /// `rows` rows of `columns` `dtype` elements in `bytes`, encoded as NVFP4 under the global scale
 /// `global` (module formula): `(values, scales)`, the packed codes `[rows, columns / 2]` and the
 /// E4M3 block scales `[rows, columns / 16]` in the linear layout.
+///
+/// # Errors
+///
+/// When the process's CPU executor cannot be started.
 fn encode_nvfp4(
     dtype: DType,
     bytes: &[u8],
     (rows, columns): (usize, usize),
     global: f32,
-) -> (Vec<u8>, Vec<u8>) {
+) -> Result<(Vec<u8>, Vec<u8>)> {
     let block = BLOCK_ELEMENTS as usize;
     let blocks = columns / block;
     let mut values = vec![0_u8; rows * columns / 2];
@@ -177,9 +216,10 @@ fn encode_nvfp4(
     // The factor the encoder divides a block's scale by: the reciprocal of the global scale.
     let tensor_scale = 1.0 / global;
 
+    let bands = bands(rows)?;
     std::thread::scope(|scope| {
         let (mut rest_values, mut rest_scales) = (values.as_mut_slice(), scales.as_mut_slice());
-        for band in bands(rows) {
+        for band in bands {
             let (my_values, after) = rest_values.split_at_mut(band.len() * columns / 2);
             rest_values = after;
             let (my_scales, after) = rest_scales.split_at_mut(band.len() * blocks);
@@ -211,7 +251,7 @@ fn encode_nvfp4(
             });
         }
     });
-    (values, scales)
+    Ok((values, scales))
 }
 
 /// The share a converted projection reads: its checkpoint tensor, which is a dense matrix of
@@ -251,7 +291,7 @@ impl WeightLoader<'_> {
                 &bytes,
                 (share.rows as usize, share.columns as usize),
                 encode,
-            )))
+            )?))
         })?;
         Ok((weight, weight_amax))
     }
@@ -281,7 +321,7 @@ impl WeightLoader<'_> {
         let encode = |loader: &Self| -> Result<(Vec<u8>, Vec<u8>)> {
             let bytes = loader.share_bytes(source, share.dtype)?;
             let global = NVFP4_RANGE / loader.tensor_amax(&share, &amax)?;
-            let (values, linear) = encode_nvfp4(share.dtype, &bytes, (rows, columns), global);
+            let (values, linear) = encode_nvfp4(share.dtype, &bytes, (rows, columns), global)?;
 
             let blocks = share.columns / u64::from(BLOCK_ELEMENTS);
             Ok((values, swizzled_scales(&linear, share.rows, blocks)))
@@ -433,7 +473,7 @@ impl WeightLoader<'_> {
         }
 
         let bytes = self.checkpoint().read(share.tensor)?;
-        let value = largest_magnitude(share.dtype, &bytes);
+        let value = largest_magnitude(share.dtype, &bytes)?;
         if !(value.is_finite() && value > 0.0) {
             return Err(Error::weight(
                 share.tensor,
@@ -476,9 +516,9 @@ mod tests {
 
     #[test]
     fn bands_cover_every_row_once_in_order() {
-        for rows in [1, 7, 16, 17, 1000] {
-            let bands = bands(rows);
-            assert!(bands.len() <= THREADS);
+        for (rows, threads) in [(1, 16), (7, 16), (16, 16), (17, 16), (1000, 16), (1000, 3)] {
+            let bands = split(rows, threads);
+            assert!(bands.len() <= threads);
             assert_eq!(bands.first().map(|band| band.start), Some(0));
             assert_eq!(bands.last().map(|band| band.end), Some(rows));
             assert!(bands.windows(2).all(|pair| pair[0].end == pair[1].start));
