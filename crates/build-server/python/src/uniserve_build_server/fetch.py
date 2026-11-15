@@ -44,7 +44,7 @@ import time
 import urllib.error
 import urllib.request
 import zipfile
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from pathlib import Path
 
 #: Where NVIDIA publishes the trtllm-gen kernel libraries' generic artifacts.
@@ -341,11 +341,40 @@ def _verified(path: Path, digest: str, where: str) -> None:
         )
 
 
+def _place(
+    path: Path, write: Callable[[Path], None], digest: str, where: str
+) -> None:
+    """Writes one cached file through ``write``, verified before it is visible.
+
+    ``write`` fills a file of its own beside ``path``; that file is verified
+    against ``digest`` and renamed onto ``path`` only when it matches. Builds
+    that fetch the same pin at once (a Build Server builds its modules
+    concurrently, and a cold cache is fetched by each of them) therefore never
+    read, verify or remove another's partly written file: each renames a
+    complete, verified copy, and a later rename replaces equal contents.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.NamedTemporaryFile(
+        dir=path.parent, prefix=f".{path.name}.", delete=False
+    ) as temporary:
+        staged = Path(temporary.name)
+    try:
+        write(staged)
+        _verified(staged, digest, where)
+        staged.replace(path)
+    finally:
+        staged.unlink(missing_ok=True)
+
+
 def _from_files(source: Pin, origin: Files, wanted: dict[str, str]) -> None:
     def one(name: str, digest: str) -> None:
-        path = directory(source) / name
-        _download(origin.base + name, path)
-        _verified(path, digest, origin.base + name)
+        url = origin.base + name
+        _place(
+            directory(source) / name,
+            lambda staged: _download(url, staged),
+            digest,
+            url,
+        )
 
     failures: list[str] = []
     with concurrent.futures.ThreadPoolExecutor(max_workers=WORKERS) as pool:
@@ -373,16 +402,18 @@ def _from_archive(source: Pin, origin: Archive, wanted: dict[str, str]) -> None:
         _verified(archive, origin.sha256, origin.url)
         with zipfile.ZipFile(archive) as members:
             for name, digest in wanted.items():
-                path = directory(source) / name
-                path.parent.mkdir(parents=True, exist_ok=True)
                 try:
                     data = members.read(name)
                 except KeyError:
                     raise FetchError(
                         f"{origin.url} has no member {name}"
                     ) from None
-                path.write_bytes(data)
-                _verified(path, digest, f"{origin.url}!{name}")
+                _place(
+                    directory(source) / name,
+                    lambda staged, data=data: staged.write_bytes(data),
+                    digest,
+                    f"{origin.url}!{name}",
+                )
 
 
 def _from_distribution(
@@ -402,12 +433,14 @@ def _from_distribution(
         )
     root = Path(installed.locate_file(""))
     for name, digest in wanted.items():
-        path = directory(source) / name
-        path.parent.mkdir(parents=True, exist_ok=True)
         if not (root / name).is_file():
             raise FetchError(f"{origin.name} {origin.version} has no {name}")
-        shutil.copyfile(root / name, path)
-        _verified(path, digest, f"{origin.name} {origin.version}: {name}")
+        _place(
+            directory(source) / name,
+            lambda staged, name=name: shutil.copyfile(root / name, staged),
+            digest,
+            f"{origin.name} {origin.version}: {name}",
+        )
 
 
 def fetch(
