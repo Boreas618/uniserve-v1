@@ -44,6 +44,18 @@ def source_module(package: Path, name: str) -> ModuleType:
     return module
 
 
+def compile_time(value: Any) -> Any:
+    """A compile-time value as a launch passes it.
+
+    A tuple a launch table states (a derived stride pair, a slot table)
+    crosses the command's JSON as an array, and Triton takes a compile-time
+    sequence as a tuple only, so every array becomes a tuple again.
+    """
+    if isinstance(value, list):
+        return tuple(compile_time(item) for item in value)
+    return value
+
+
 class RefusedLaunchError(LookupError):
     """A package states no launch for a descriptor key: its dimensions do not
     declare the key, or its launch table or derivation refuses it. The message
@@ -131,7 +143,10 @@ class Launches:
         stated = StatedLaunch(
             kernel=getattr(self._source(op), launch["kernel"]),
             signature=launch["signature"],
-            constexprs=launch["constexprs"],
+            constexprs={
+                name: compile_time(value)
+                for name, value in launch["constexprs"].items()
+            },
             options=launch["options"],
         )
         self._stated[(op, key, target)] = stated

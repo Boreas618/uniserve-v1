@@ -26,8 +26,8 @@ lint: fmt clippy
     {{python}} -m ruff format --check uniserve_eval tests
     {{python}} -m mypy
 
-# Fast Python tests (CPU only); the kernel checks run on Triton's interpreter. The tensor
-# primitives' checks state a descriptor key's launch with the base executable (`uniserve
+# Fast Python tests (CPU only); the kernel checks run on Triton's interpreter. A kernel check that
+# launches what a package states for a descriptor key asks the base executable (`uniserve
 # build-server launch`, which runs the Build Server's environment program `uniserve-build-server`
 # from the search path); it is built here unless `UNISERVE_BINARY` names one.
 test-python-fast:
