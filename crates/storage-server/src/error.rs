@@ -17,6 +17,10 @@ pub enum Error {
     /// The connector's settings name no usable store.
     #[error("{0}")]
     Settings(String),
+    /// The host's transfer calibration cannot be read, does not hold together, or names a GPU
+    /// the driver does not show (`transfer::calibration`).
+    #[error("the transfer calibration {0}")]
+    Calibration(String),
     /// NIXL's C API library cannot be used: it is not installed where the loader's default search
     /// finds it, or it lacks an entry point the bindings of `release` call.
     #[error("NIXL's C API ({library}, of NIXL {release}) cannot be used: {reason}")]

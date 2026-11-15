@@ -2,38 +2,41 @@
 //! queue of pieces by priority, and its link's byte budget.
 //!
 //! A task's moves become pieces, each queued on the copy thread of its link and of
-//! the GPU whose copy engine runs it (or the CPU, between host buffers). A
-//! copy thread repeatedly takes one chunk off the front piece of its highest
-//! priority that has one, waits until its link's budget covers the chunk,
-//! and copies it:
+//! the GPU whose copy engine runs it (or the CPU, between host buffers, or the
+//! NIXL agent, for a READ from another host). A copy thread repeatedly takes one
+//! chunk off the front piece of its highest priority that has one, waits until its
+//! link's budget covers the chunk, and copies it. Every runner copies through one
+//! loop ([`Copier`]): it submits a chunk, keeps its link's chunks in flight, and
+//! counts a chunk copied once the host saw it complete.
 //!
 //! - **Chunks.** A chunk lasts the configured chunk time at the link's
-//!   bandwidth, so that a copy engine is never held by one copy much longer
-//!   than that, far below a scheduler step of the epoch executing beside
-//!   the transfers; a task of a higher priority starts on the next chunk.
-//! - **Budgets.** A link may move its budget's share of its bandwidth: a
-//!   token bucket refilled at that rate, holding at most [`DEPTH`] chunks,
-//!   and charged before each chunk. The share starts whole; a head halves
-//!   it down to [`FLOOR_SHARE`] while its scheduler steps slow down, and
-//!   after its restoration it grows back by [`RESTORE_PER_SECOND`] of the
-//!   bandwidth per second, so the head's statistics, once a second, see
-//!   each step of the recovery.
-//! - **Completion.** A GPU copy thread keeps [`DEPTH`] chunks submitted on its own
-//!   stream, so its copy engine never waits for the host, and counts a
-//!   chunk copied only once the event recorded after it completed, as the
-//!   host observes. A network copy thread keeps [`DEPTH`] NIXL READs posted and
-//!   counts a chunk copied once its READ completed, as the host polls it:
-//!   a READ passes through no CUDA stream. A task ends when its last chunk
-//!   completed: complete, cancelled or failed. A cancelled or failed task's
-//!   queued pieces leave at once, and it ends once its submitted chunks
-//!   completed, since only then are its regions free of copies.
-//! - **Links from other hosts.** Nobody measured them when the process
-//!   started: a network copy thread (a READ's link) or a GPU copy thread (a link from
-//!   another host's GPU of the NVLink fabric) times its contiguous chunks
-//!   of [`MEASURE_BYTES`], one at a time, until [`MEASURE_SAMPLES`] of them
-//!   took the link's bandwidth, and reports it; until then its chunks are
-//!   of that size and wait for no budget. A bandwidth a copy thread measures is
-//!   kept for the next thread of its link and runner.
+//!   bandwidth, as the host's calibration states it, and at least the link's
+//!   fixed cost of one copy, in whole pages ([`Sizing`]): a copy engine is never
+//!   held by one copy much longer than that, far below a scheduler step of the
+//!   epoch executing beside the transfers, and a task of a higher priority starts
+//!   on the next chunk.
+//! - **Budgets.** A link may move its budget's share of its bandwidth: a token
+//!   bucket refilled at that rate, holding at most the chunks the thread keeps in
+//!   flight, and charged before each chunk. The share follows [`Throttle`]'s
+//!   policy: whole at first, halved by a head down to [`Throttle::FLOOR`] while its
+//!   scheduler steps slow down, and grown back by [`Throttle::RESTORE_PER_SECOND`]
+//!   of the bandwidth per second after its restoration. A chunk waits for its
+//!   budget on a timed wait that a throttle change cuts short, since the change
+//!   alters the refill rate, and so does the end of its task, which abandons it.
+//! - **Completion.** A GPU copy thread keeps its link's chunks in flight on its
+//!   own stream, so its copy engine never waits for the host, and counts a chunk
+//!   copied once the blocking event recorded after it completed. A network copy
+//!   thread keeps its link's NIXL READs posted and counts a chunk copied once its
+//!   READ completed, as the host observes it: a READ passes through no CUDA
+//!   stream. A task ends when its last chunk completed: complete, cancelled or
+//!   failed. A cancelled or failed task's queued pieces leave at once, and it
+//!   ends once its submitted chunks completed, since only then are its regions
+//!   free of copies.
+//! - **Links from other hosts.** The calibration states the rate of copies from
+//!   another host into each end of this host, over the NVLink fabric and by READ;
+//!   the first copy thread of such a link reports the link at that rate, so the
+//!   listing names the links tasks copied over. A link the calibration does not
+//!   state fails the chunks queued for it.
 //! - **Threads and contexts.** A copy thread runs while its queue has
 //!   chunks queued or in flight, and ends when it has none; the next piece
 //!   queued for its link and runner starts another. A GPU copy thread holds its GPU
@@ -49,7 +52,7 @@
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::os::fd::OwnedFd;
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 use ::storage::protocol::{
@@ -59,48 +62,12 @@ use platform::{
     DeviceId, Event, EventFlags, Pitched, PitchedBatch, SourceOrder, Stream, memcpy_async,
 };
 
+use super::calibration::{Calibration, Cost, RemotePath, Sizing};
 use super::contexts::{Contexts, Hold};
 use super::network::{Network, Source};
 use super::nixl;
 use super::storage::{Fabric, Mapping};
-
-/// How often a running task reports its progress, at most.
-const PROGRESS_INTERVAL: Duration = Duration::from_millis(100);
-
-/// The smallest chunk, so that submitting a chunk stays cheap next to
-/// copying it.
-const MIN_CHUNK: u64 = 256 << 10;
-
-/// Chunks are whole multiples of this.
-const CHUNK_ALIGN: u64 = 64 << 10;
-
-/// The chunk a copy thread times to learn the bandwidth of a link from another
-/// host: as long as a measured copy when the process starts
-/// (`devices::SAMPLE_BYTES`), so that the fixed cost of submitting a copy
-/// or posting a READ and seeing it complete is a few percent of its time
-/// at the line rate of the NVLink fabric or the host's network adapters.
-/// Smaller retained chunks accumulate into the same byte window; their
-/// measured throughput includes the cost of submitting each copy.
-const MEASURE_BYTES: u64 = 64 << 20;
-
-/// The timed chunks of [`MEASURE_BYTES`] whose fastest gives a link from
-/// another host its bandwidth: the first READ over a new connection also
-/// sets the connection up, and the first copy from an imported allocation
-/// maps its pages on the GPU.
-const MEASURE_SAMPLES: usize = 2;
-
-/// The chunks a GPU or network copy thread keeps in flight: one copying while the host
-/// waits for the other.
-const DEPTH: usize = 2;
-
-/// The least share of its bandwidth a halved link keeps.
-const FLOOR_SHARE: f64 = 1.0 / 64.0;
-
-/// How fast a restored link's share grows back, per second.
-const RESTORE_PER_SECOND: f64 = 1.0 / 8.0;
-
-/// How long a GPU copy thread sleeps between checks of its oldest chunk.
-const POLL: Duration = Duration::from_micros(20);
+use super::storage_name;
 
 /// What runs a copy thread's copies.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -114,11 +81,14 @@ pub(super) enum Runner {
     Network,
 }
 
-/// A copy thread: the link it moves bytes over and what runs its copies.
+/// A copy thread: the link it moves bytes over, what runs its copies, and,
+/// for a link from or to another host's storage, the path its copies take.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub(super) struct ThreadKey {
     pub(super) link: Link,
     pub(super) runner: Runner,
+    /// `None` for a link within the host.
+    pub(super) path: Option<RemotePath>,
 }
 
 /// One end of a piece: an allocation the server gave, another host's
@@ -203,7 +173,7 @@ impl Piece {
 struct TaskState {
     /// Pieces queued and not taken whole.
     pieces: usize,
-    /// Chunks submitted and not completed.
+    /// Chunks submitted, or waiting for their budget, and not completed.
     running: usize,
     copied: u64,
     /// How the task ends, once a cancellation or a failure decided it.
@@ -241,9 +211,9 @@ impl Budget {
 
     fn share(&self, now: Instant) -> f64 {
         match self.restoring {
-            Some((since, from)) => {
-                (from + RESTORE_PER_SECOND * now.duration_since(since).as_secs_f64()).min(1.0)
-            }
+            Some((since, from)) => (from
+                + Throttle::RESTORE_PER_SECOND * now.duration_since(since).as_secs_f64())
+            .min(1.0),
             None => self.share,
         }
     }
@@ -252,7 +222,7 @@ impl Budget {
         let share = self.share(now);
         match throttle {
             Throttle::Halve => {
-                self.share = (share / 2.0).max(FLOOR_SHARE);
+                self.share = (share / 2.0).max(Throttle::FLOOR);
                 self.restoring = None;
             }
             Throttle::Restore => {
@@ -264,18 +234,35 @@ impl Budget {
         }
     }
 
-    /// Charge `bytes` of a link of `bandwidth` bytes per second, whose
-    /// bucket holds `capacity` bytes; returns how long the chunk waits.
-    fn charge(&mut self, bytes: u64, bandwidth: f64, capacity: f64, now: Instant) -> Duration {
+    /// Add the tokens the link earned since the last refill, at its share of
+    /// `bandwidth` bytes per second, up to `capacity` bytes.
+    fn refill(&mut self, bandwidth: f64, capacity: f64, now: Instant) {
         let rate = self.share(now) * bandwidth;
         let elapsed = now.duration_since(self.refilled).as_secs_f64();
         self.refilled = now;
-        self.tokens = (self.tokens + rate * elapsed).min(capacity) - bytes as f64;
+        self.tokens = (self.tokens + rate * elapsed).min(capacity);
+    }
+
+    /// Charge `bytes` of a link of `bandwidth`, whose bucket holds `capacity` bytes.
+    fn charge(&mut self, bytes: u64, bandwidth: f64, capacity: f64, now: Instant) {
+        self.refill(bandwidth, capacity, now);
+        self.tokens -= bytes as f64;
+    }
+
+    /// How long until the bytes charged are covered, at the link's share now.
+    fn delay(&mut self, bandwidth: f64, capacity: f64, now: Instant) -> Duration {
+        self.refill(bandwidth, capacity, now);
+        let rate = self.share(now) * bandwidth;
         if self.tokens >= 0.0 || rate <= 0.0 {
             Duration::ZERO
         } else {
             Duration::from_secs_f64(-self.tokens / rate)
         }
+    }
+
+    /// Give back `bytes` a chunk charged and did not copy.
+    fn refund(&mut self, bytes: u64) {
+        self.tokens += bytes as f64;
     }
 }
 
@@ -292,14 +279,14 @@ struct State {
     /// The copy threads whose thread runs.
     running: HashSet<ThreadKey>,
     budgets: HashMap<Link, Budget>,
-    /// Each link's bandwidth in bytes per second: measured when the process
-    /// started, or by a copy thread since.
-    bandwidths: HashMap<Link, f64>,
     /// Each report: the task, the bytes it copied, and its end once it
     /// ended.
     reports: Vec<(u64, u64, Option<TaskStatus>)>,
-    /// Links from other hosts that copy threads measured, not reported yet.
-    measured: Vec<LinkBandwidth>,
+    /// Links from other hosts copy threads started on, at their calibrated
+    /// bandwidths, not reported yet.
+    remote_links: Vec<LinkBandwidth>,
+    /// Links from other hosts reported so far.
+    reported_links: HashSet<Link>,
 }
 
 /// What a copy thread does next.
@@ -369,10 +356,18 @@ impl State {
         purged
     }
 
+    /// Whether `task` ended or its end is decided: a chunk of it waiting for
+    /// its budget is not copied.
+    fn ended(&self, task: u64) -> bool {
+        self.tasks
+            .get(&task)
+            .is_none_or(|state| state.end.is_some())
+    }
+
     /// Report `task` ended when nothing of it is queued or running, or its
-    /// progress when it last reported long enough ago. Returns whether a
-    /// report was made.
-    fn report(&mut self, task: u64, now: Instant) -> bool {
+    /// progress when it last reported at least `progress` ago. Returns
+    /// whether a report was made.
+    fn report(&mut self, task: u64, now: Instant, progress: Duration) -> bool {
         let Some(state) = self.tasks.get_mut(&task) else {
             return false;
         };
@@ -390,7 +385,7 @@ impl State {
             self.reports.push((task, copied, Some(end)));
             return true;
         }
-        if now.duration_since(state.reported) >= PROGRESS_INTERVAL {
+        if now.duration_since(state.reported) >= progress {
             state.reported = now;
             self.reports.push((task, state.copied, None));
             return true;
@@ -406,6 +401,7 @@ impl State {
         bytes: u64,
         failure: Option<String>,
         now: Instant,
+        progress: Duration,
     ) -> (bool, Vec<Piece>) {
         let Some(state) = self.tasks.get_mut(&task) else {
             return (false, Vec::new());
@@ -426,16 +422,38 @@ impl State {
                 self.purge(task)
             }
         };
-        (self.report(task, now), purged)
+        (self.report(task, now, progress), purged)
+    }
+
+    /// A chunk of `task` that waited for its budget is not copied: its task
+    /// ended meanwhile. Returns whether a report was made.
+    fn abandon(&mut self, task: u64, now: Instant, progress: Duration) -> bool {
+        if let Some(state) = self.tasks.get_mut(&task) {
+            state.running -= 1;
+        }
+        self.report(task, now, progress)
     }
 }
 
-/// The state behind its lock, and the main thread's wake-up.
+/// The state behind its lock, the main thread's wake-up, and what every copy
+/// thread sizes its chunks by.
 struct Shared {
     state: Mutex<State>,
+    /// Signalled when a budget's rate changes or a task's end is decided, which
+    /// a chunk waiting for its budget takes up at once.
+    paced: Condvar,
     /// The write end of the main thread's wake pipe, written when a report
     /// is made.
     wake: OwnedFd,
+    calibration: Arc<Calibration>,
+    /// Each GPU's UUID, by the device that runs its copy threads.
+    gpus: HashMap<DeviceId, [u8; 16]>,
+    /// The time a chunk lasts at its link's bandwidth.
+    chunk: Duration,
+    /// How often a running task reports its progress at most.
+    progress: Duration,
+    /// The host's page size, which chunks are whole multiples of.
+    page: u64,
 }
 
 impl Shared {
@@ -445,6 +463,61 @@ impl Shared {
 
     fn wake_main(&self) {
         let _ = rustix::io::write(&self.wake, b"x");
+    }
+
+    /// The cost of `thread`'s link, as the host's calibration states it: a
+    /// link within the host; or copies from another host along the thread's
+    /// path, into the link's destination for a READ and through the runner's
+    /// GPU over the fabric, which is reported the first time a thread starts
+    /// on it.
+    fn cost(&self, thread: &ThreadKey) -> Result<Cost, String> {
+        let link = &thread.link;
+        let Some(path) = thread.path else {
+            return self.calibration.link(link).ok_or_else(|| {
+                format!(
+                    "the host's calibration states no link from {} to {}",
+                    storage_name(&link.source),
+                    storage_name(&link.destination)
+                )
+            });
+        };
+        let end = match (path, thread.runner) {
+            (RemotePath::Read, _) => link.destination.clone(),
+            (RemotePath::Fabric, Runner::Device(device)) => {
+                let gpu = self
+                    .gpus
+                    .get(&device)
+                    .ok_or_else(|| format!("{device} is not calibrated"))?;
+                LinkEnd::Device { gpu: *gpu }
+            }
+            (RemotePath::Fabric, Runner::Host | Runner::Network) => {
+                return Err(
+                    "a GPU of this host copies another host's storage of the fabric".into(),
+                );
+            }
+        };
+        let cost = self.calibration.remote(path, &end).ok_or_else(|| {
+            format!(
+                "the host's calibration states no rate of copies from another host ({path:?}) \
+                 into {}",
+                storage_name(&end)
+            )
+        })?;
+        let mut state = self.lock();
+        if state.reported_links.insert(link.clone()) {
+            tracing::info!(
+                ?link,
+                gigabytes_per_second = cost.bytes_per_second as f64 / 1e9,
+                "copies over a link from another host start"
+            );
+            state.remote_links.push(LinkBandwidth {
+                link: link.clone(),
+                bytes_per_second: cost.bytes_per_second,
+            });
+            drop(state);
+            self.wake_main();
+        }
+        Ok(cost)
     }
 
     /// What the copy thread `thread` does next: copy a chunk of at most
@@ -463,49 +536,64 @@ impl Shared {
         Next::Idle
     }
 
-    /// Wait until `link`'s budget covers `bytes`.
-    fn pace(&self, link: &Link, bytes: u64, bandwidth: f64, capacity: f64) {
-        let delay = {
+    /// Charge `piece`, a chunk, to `link`'s budget and wait until the budget
+    /// covers it. The wait is cut short by a change of the budget's rate (a
+    /// throttle) and by the end of the piece's task, which abandons the chunk
+    /// and refunds its bytes. Returns whether the chunk is to be copied.
+    fn pace(&self, link: &Link, piece: &Piece, sizing: &Sizing) -> bool {
+        let bytes = piece.copied();
+        let capacity = (sizing.depth as u64 * sizing.bytes) as f64;
+        let mut state = self.lock();
+        let charged = Instant::now();
+        state
+            .budgets
+            .entry(link.clone())
+            .or_insert_with(|| Budget::new(charged))
+            .charge(bytes, sizing.bandwidth, capacity, charged);
+        loop {
             let now = Instant::now();
-            let mut state = self.lock();
-            state
+            if state.ended(piece.task) {
+                if let Some(budget) = state.budgets.get_mut(link) {
+                    budget.refund(bytes);
+                }
+                let reported = state.abandon(piece.task, now, self.progress);
+                drop(state);
+                if reported {
+                    self.wake_main();
+                }
+                return false;
+            }
+            let delay = state
                 .budgets
-                .entry(link.clone())
-                .or_insert_with(|| Budget::new(now))
-                .charge(bytes, bandwidth, capacity, now)
-        };
-        if !delay.is_zero() {
-            std::thread::sleep(delay);
+                .get_mut(link)
+                .map_or(Duration::ZERO, |budget| {
+                    budget.delay(sizing.bandwidth, capacity, now)
+                });
+            if delay.is_zero() {
+                return true;
+            }
+            state = ::service::wait_timeout(&self.paced, state, delay).0;
         }
     }
 
     /// `piece`, a chunk, completed or failed; the caller drops it after.
     fn complete(&self, piece: &Piece, failure: Option<String>) {
-        let (reported, purged) =
-            self.lock()
-                .complete(piece.task, piece.copied(), failure, Instant::now());
+        let failed = failure.is_some();
+        let (reported, purged) = self.lock().complete(
+            piece.task,
+            piece.copied(),
+            failure,
+            Instant::now(),
+            self.progress,
+        );
         drop(purged);
+        if failed {
+            // The task's chunks waiting for their budget are abandoned.
+            self.paced.notify_all();
+        }
         if reported {
             self.wake_main();
         }
-    }
-
-    /// A copy thread measured `link`, from another host, at `bandwidth` bytes per
-    /// second: it is kept, and reported to the server.
-    fn measured(&self, link: &Link, bandwidth: f64) {
-        tracing::info!(
-            ?link,
-            gigabytes_per_second = bandwidth / 1e9,
-            "measured a link from another host"
-        );
-        let mut state = self.lock();
-        state.bandwidths.insert(link.clone(), bandwidth);
-        state.measured.push(LinkBandwidth {
-            link: link.clone(),
-            bytes_per_second: bandwidth as u64,
-        });
-        drop(state);
-        self.wake_main();
     }
 
     /// Fail every chunk queued for `thread` with `message`, until nothing is
@@ -517,11 +605,17 @@ impl Shared {
     }
 }
 
+/// How copies are cut and reported: the Transfer Server's options.
+pub(super) struct Policy {
+    /// The time a chunk lasts at its link's bandwidth.
+    pub(super) chunk: Duration,
+    /// How often a running task reports its progress at most.
+    pub(super) progress: Duration,
+}
+
 /// The copy threads and their shared state, as the main thread drives them.
 pub(super) struct CopyThreads {
     shared: Arc<Shared>,
-    /// The time a chunk lasts at its link's bandwidth.
-    chunk: Duration,
     /// The NIXL agent network copy threads post their READs with.
     network: Arc<Network>,
     /// The GPUs' contexts, which GPU copy threads hold while their threads run.
@@ -529,12 +623,13 @@ pub(super) struct CopyThreads {
 }
 
 impl CopyThreads {
-    /// CopyThreads with each link's bandwidth as measured when the process
-    /// started.
+    /// Copy threads that cut and report copies by `policy` at the rates of
+    /// `calibration` on `gpus` (each one's device and UUID), and wake the main
+    /// thread through `wake`.
     pub(super) fn new(
         wake: OwnedFd,
-        chunk: Duration,
-        bandwidths: HashMap<Link, f64>,
+        policy: &Policy,
+        (calibration, gpus): (Arc<Calibration>, HashMap<DeviceId, [u8; 16]>),
         network: Arc<Network>,
         contexts: Arc<Contexts>,
     ) -> Self {
@@ -545,13 +640,18 @@ impl CopyThreads {
                     queues: HashMap::new(),
                     running: HashSet::new(),
                     budgets: HashMap::new(),
-                    bandwidths,
                     reports: Vec::new(),
-                    measured: Vec::new(),
+                    remote_links: Vec::new(),
+                    reported_links: HashSet::new(),
                 }),
+                paced: Condvar::new(),
                 wake,
+                calibration,
+                gpus,
+                chunk: policy.chunk,
+                progress: policy.progress,
+                page: rustix::param::page_size() as u64,
             }),
-            chunk,
             network,
             contexts,
         }
@@ -567,6 +667,7 @@ impl CopyThreads {
     ) {
         let mut started = Vec::new();
         let mut state = self.shared.lock();
+        let now = Instant::now();
         state.tasks.insert(
             task,
             TaskState {
@@ -574,8 +675,8 @@ impl CopyThreads {
                 running: 0,
                 copied: 0,
                 end: None,
-                reported: Instant::now(),
-                queued: Instant::now(),
+                reported: now,
+                queued: now,
                 queued_pieces: pieces.len(),
                 links: pieces
                     .iter()
@@ -585,14 +686,13 @@ impl CopyThreads {
         );
         for (thread, piece) in pieces {
             if state.running.insert(thread.clone()) {
-                let bandwidth = state.bandwidths.get(&thread.link).copied();
-                started.push((thread.clone(), bandwidth));
+                started.push(thread.clone());
             }
             state.queues.entry(thread).or_default().levels[priority.rank()].push_back(piece);
         }
         drop(state);
-        for (thread, bandwidth) in started {
-            self.spawn(thread, bandwidth);
+        for thread in started {
+            self.spawn(thread);
         }
     }
 
@@ -603,8 +703,9 @@ impl CopyThreads {
         self.shared.wake_main();
     }
 
-    /// Cancel task `task`: its queued pieces leave, and it ends once its
-    /// submitted chunks completed.
+    /// Cancel task `task`: its queued pieces leave, its chunks waiting for
+    /// their budget are abandoned, and it ends once its submitted chunks
+    /// completed.
     pub(super) fn cancel(&mut self, task: u64) {
         let mut state = self.shared.lock();
         let Some(entry) = state.tasks.get_mut(&task) else {
@@ -614,9 +715,10 @@ impl CopyThreads {
             entry.end = Some(TaskStatus::Cancelled);
         }
         let purged = state.purge(task);
-        let reported = state.report(task, Instant::now());
+        let reported = state.report(task, Instant::now(), self.shared.progress);
         drop(state);
         drop(purged);
+        self.shared.paced.notify_all();
         if reported {
             self.shared.wake_main();
         }
@@ -649,6 +751,9 @@ impl CopyThreads {
                 .or_insert_with(|| Budget::new(now))
                 .change(throttle, now);
         }
+        drop(state);
+        // Chunks waiting for their budget wait by the new rate.
+        self.shared.paced.notify_all();
     }
 
     /// The reports made since the last call.
@@ -656,86 +761,123 @@ impl CopyThreads {
         std::mem::take(&mut self.shared.lock().reports)
     }
 
-    /// The links from other hosts measured since the last call.
-    pub(super) fn measured(&mut self) -> Vec<LinkBandwidth> {
-        std::mem::take(&mut self.shared.lock().measured)
+    /// The links from other hosts copy threads started on since the last
+    /// call, at their calibrated bandwidths.
+    pub(super) fn remote_links(&mut self) -> Vec<LinkBandwidth> {
+        std::mem::take(&mut self.shared.lock().remote_links)
     }
 
-    /// Start a thread for `copy thread`, whose link's bandwidth is `bandwidth`
-    /// when known.
-    fn spawn(&self, thread: ThreadKey, bandwidth: Option<f64>) {
+    /// Start a thread for the copy thread `thread`.
+    fn spawn(&self, thread: ThreadKey) {
         let shared = Arc::clone(&self.shared);
         let network = Arc::clone(&self.network);
         let contexts = Arc::clone(&self.contexts);
-        let chunk = self.chunk;
         let spawned = std::thread::Builder::new()
             .name("uniserve-transfer-thread".into())
-            .spawn(move || match thread.runner {
-                Runner::Device(device) => {
-                    device_thread(&shared, &thread, &contexts, device, bandwidth, chunk);
+            .spawn(move || {
+                let cost = match shared.cost(&thread) {
+                    Ok(cost) => cost,
+                    Err(message) => {
+                        tracing::warn!(message, "a copy thread cannot copy");
+                        shared.refuse(&thread, &message);
+                        return;
+                    }
+                };
+                match thread.runner {
+                    Runner::Device(device) => {
+                        device_thread(&shared, &thread, &contexts, device, cost);
+                    }
+                    Runner::Host => run(&shared, &thread, &mut HostCopier, cost),
+                    Runner::Network => {
+                        let mut copier = NetworkCopier {
+                            network: &network,
+                            bandwidth: cost.bytes_per_second as f64,
+                            due: Instant::now(),
+                        };
+                        run(&shared, &thread, &mut copier, cost);
+                    }
                 }
-                Runner::Host => host_thread(&shared, &thread, bandwidth, chunk),
-                Runner::Network => network_thread(&shared, &thread, &network, bandwidth, chunk),
             });
         if let Err(error) = spawned {
-            fatal("starting a thread's thread", &error);
+            fatal("starting a copy thread", &error);
         }
     }
 }
 
-/// The bytes of a chunk that lasts `chunk` at `bandwidth` bytes per
-/// second; [`MEASURE_BYTES`] on a link nobody measured.
-fn chunk_bytes(bandwidth: Option<f64>, chunk: Duration) -> u64 {
-    let Some(bandwidth) = bandwidth else {
-        return MEASURE_BYTES;
-    };
-    let bytes = (bandwidth * chunk.as_secs_f64()) as u64;
-    (bytes / CHUNK_ALIGN * CHUNK_ALIGN).max(MIN_CHUNK)
+/// What runs one copy thread's chunks: it submits a chunk's copy, and later
+/// waits until the copy completed, as the host observes it.
+trait Copier {
+    /// A submitted chunk's copy, until it is waited for.
+    type Flight;
+
+    /// Whether a submitted copy runs on after [`Copier::submit`] returns
+    /// (copy engines, READs), so that the thread keeps several in flight; the
+    /// CPU's copies end within it.
+    const ASYNCHRONOUS: bool;
+
+    /// Submit `piece`'s copy; an error fails the piece's task, and no copy
+    /// runs.
+    fn submit(&mut self, piece: &Piece) -> Result<Self::Flight, String>;
+
+    /// Wait until `flight` completed; returns why it failed.
+    fn complete(&mut self, flight: Self::Flight) -> Option<String>;
 }
 
-/// Timed contiguous copies accumulate into equal byte windows. Small retained
-/// chunks can therefore measure a link without an artificial minimum model
-/// size; their submission costs remain part of the measured throughput.
-#[derive(Default)]
-struct Samples {
-    bytes: u64,
-    seconds: f64,
-    completed: usize,
-    fastest: f64,
-}
-
-fn sample(samples: &mut Samples, piece: &Piece, seconds: f64) -> Option<f64> {
-    if piece.rows == 1 {
-        samples.bytes += piece.bytes;
-        samples.seconds += seconds;
-        if samples.bytes >= MEASURE_BYTES {
-            let bandwidth = samples.bytes as f64 / samples.seconds.max(1e-6);
-            samples.fastest = samples.fastest.max(bandwidth);
-            samples.completed += 1;
-            samples.bytes = 0;
-            samples.seconds = 0.0;
+/// Run `thread`'s chunks with `copier`, sized by the link's `cost`, until
+/// nothing is queued or in flight.
+fn run<C: Copier>(shared: &Shared, thread: &ThreadKey, copier: &mut C, cost: Cost) {
+    let sizing = Sizing::of(cost, shared.chunk, shared.page, C::ASYNCHRONOUS);
+    let mut flight: VecDeque<(Piece, C::Flight)> = VecDeque::with_capacity(sizing.depth);
+    loop {
+        let piece = match shared.next(thread, sizing.bytes, !flight.is_empty()) {
+            Next::Chunk(piece) => piece,
+            Next::Busy => {
+                // Nothing is queued: the oldest chunk in flight completes
+                // first.
+                if let Some((piece, submitted)) = flight.pop_front() {
+                    let failure = copier.complete(submitted);
+                    shared.complete(&piece, failure);
+                }
+                continue;
+            }
+            Next::Idle => return,
+        };
+        if !shared.pace(&thread.link, &piece, &sizing) {
+            continue;
+        }
+        match copier.submit(&piece) {
+            Ok(submitted) => flight.push_back((piece, submitted)),
+            Err(message) => {
+                shared.complete(&piece, Some(message));
+                continue;
+            }
+        }
+        if flight.len() >= sizing.depth
+            && let Some((piece, submitted)) = flight.pop_front()
+        {
+            let failure = copier.complete(submitted);
+            shared.complete(&piece, failure);
         }
     }
-    (samples.completed >= MEASURE_SAMPLES).then_some(samples.fastest)
 }
 
-/// Run `copy thread`'s chunks on the copy engines of `device`, until nothing is
+/// Run `thread`'s chunks on the copy engines of `device`, until nothing is
 /// queued or in flight.
 ///
 /// The thread holds the GPU and makes its stream in the GPU's context. A
 /// context it cannot retain, or a stream it cannot make (the GPU has no
-/// storage left for them), fails the copy thread's chunks, not the process: no copy
-/// ran in the context.
+/// storage left for them), fails the copy thread's chunks, not the process:
+/// no copy ran in the context.
 fn device_thread(
     shared: &Shared,
     thread: &ThreadKey,
     contexts: &Contexts,
     device: DeviceId,
-    mut bandwidth: Option<f64>,
-    chunk: Duration,
+    cost: Cost,
 ) {
-    // Locals drop in reverse order: the chunks in flight, the stream, then
-    // the hold, which may release the context.
+    // Locals drop in reverse order: the copier's stream, then the hold, which
+    // may release the context. Every chunk in flight completed when `run`
+    // returns.
     let started = contexts.hold(device).and_then(|hold| {
         hold.session()?;
         let stream = Stream::new(device)
@@ -750,43 +892,28 @@ fn device_thread(
             return;
         }
     };
-    let mut flight: VecDeque<(Piece, Event)> = VecDeque::with_capacity(DEPTH);
-    let mut samples = Samples::default();
-    loop {
-        let bytes = chunk_bytes(bandwidth, chunk);
-        let piece = match shared.next(thread, bytes, !flight.is_empty()) {
-            Next::Chunk(piece) => piece,
-            Next::Busy => {
-                // Nothing is queued: the oldest chunk in flight completes
-                // first.
-                if let Some((piece, event)) = flight.pop_front() {
-                    wait(&event);
-                    shared.complete(&piece, None);
-                }
-                continue;
-            }
-            Next::Idle => return,
-        };
-        if let Some(bandwidth) = bandwidth {
-            shared.pace(
-                &thread.link,
-                piece.copied(),
-                bandwidth,
-                (DEPTH as u64 * bytes) as f64,
-            );
-        }
-        let addresses = piece
-            .destination
-            .address(thread.runner)
-            .and_then(|destination| Ok((destination, piece.source.address(thread.runner)?)));
-        let (destination, source) = match addresses {
-            Ok(addresses) => addresses,
-            Err(message) => {
-                shared.complete(&piece, Some(message));
-                continue;
-            }
-        };
-        let started = Instant::now();
+    let mut copier = DeviceCopier {
+        stream,
+        runner: thread.runner,
+    };
+    run(shared, thread, &mut copier, cost);
+}
+
+/// The copy engines of one GPU, on a stream of the copy thread's.
+struct DeviceCopier {
+    stream: Stream,
+    runner: Runner,
+}
+
+impl Copier for DeviceCopier {
+    /// The blocking event recorded after the chunk's copy.
+    type Flight = Event;
+
+    const ASYNCHRONOUS: bool = true;
+
+    fn submit(&mut self, piece: &Piece) -> Result<Event, String> {
+        let destination = piece.destination.address(self.runner)?;
+        let source = piece.source.address(self.runner)?;
         // SAFETY: both ranges lie within allocations the piece holds
         // mapped (the server checked every span against its allocation),
         // and the piece is held until the event after the copy completed.
@@ -808,154 +935,104 @@ fn device_thread(
                         height: piece.rows as usize,
                         depth: 1,
                     })
-                    .and_then(|()| batch.submit(&stream))
+                    .and_then(|()| batch.submit(&self.stream))
             } else {
                 memcpy_async(
                     destination + piece.destination_offset,
                     source + piece.source_offset,
                     piece.bytes as usize,
-                    &stream,
+                    &self.stream,
                 )
             }
         };
         if let Err(error) = submitted {
             fatal("submitting a copy", &error);
         }
-        let event = Event::new(EventFlags::default());
-        if let Err(error) = event.record(&stream) {
+        // The thread blocks on the event when it waits for the copy, holding
+        // no core meanwhile.
+        let completion = Event::new(EventFlags {
+            blocking: true,
+            ..EventFlags::default()
+        });
+        if let Err(error) = completion.record(&self.stream) {
             fatal("recording a copy's completion", &error);
         }
-        if bandwidth.is_none() {
-            // A link nobody measured: its chunks run one at a time, timed.
-            wait(&event);
-            if let Some(measured) = sample(&mut samples, &piece, started.elapsed().as_secs_f64()) {
-                bandwidth = Some(measured);
-                shared.measured(&thread.link, measured);
-            }
-            shared.complete(&piece, None);
-            continue;
+        Ok(completion)
+    }
+
+    fn complete(&mut self, completion: Event) -> Option<String> {
+        if let Err(error) = completion.synchronize() {
+            fatal("waiting for a copy", &error);
         }
-        flight.push_back((piece, event));
-        if flight.len() >= DEPTH
-            && let Some((piece, event)) = flight.pop_front()
-        {
-            wait(&event);
-            shared.complete(&piece, None);
-        }
+        None
     }
 }
 
-/// Run `copy thread`'s chunks, between host buffers, on the CPU, until nothing is
-/// queued.
-fn host_thread(shared: &Shared, thread: &ThreadKey, bandwidth: Option<f64>, chunk: Duration) {
-    loop {
-        let bytes = chunk_bytes(bandwidth, chunk);
-        let Next::Chunk(piece) = shared.next(thread, bytes, false) else {
-            return;
-        };
-        if let Some(bandwidth) = bandwidth {
-            shared.pace(
-                &thread.link,
-                piece.copied(),
-                bandwidth,
-                (DEPTH as u64 * bytes) as f64,
-            );
-        }
-        let addresses = piece
-            .destination
-            .address(Runner::Host)
-            .and_then(|destination| Ok((destination, piece.source.address(Runner::Host)?)));
-        match addresses {
-            Ok((destination, source)) => {
-                for row in 0..piece.rows {
-                    // SAFETY: every row lies within mappings the piece holds
-                    // (the server checked each span's rows against its
-                    // allocation). `copy` allows the two to overlap within
-                    // one allocation.
-                    unsafe {
-                        std::ptr::copy(
-                            (source + piece.source_offset + row * piece.source_pitch) as *const u8,
-                            (destination + piece.destination_offset + row * piece.destination_pitch)
-                                as *mut u8,
-                            piece.bytes as usize,
-                        );
-                    }
-                }
-                shared.complete(&piece, None);
+/// The CPU, between host buffers.
+struct HostCopier;
+
+impl Copier for HostCopier {
+    type Flight = ();
+
+    const ASYNCHRONOUS: bool = false;
+
+    fn submit(&mut self, piece: &Piece) -> Result<(), String> {
+        let destination = piece.destination.address(Runner::Host)?;
+        let source = piece.source.address(Runner::Host)?;
+        for row in 0..piece.rows {
+            // SAFETY: every row lies within mappings the piece holds (the
+            // server checked each span's rows against its allocation). `copy`
+            // allows the two to overlap within one allocation.
+            unsafe {
+                std::ptr::copy(
+                    (source + piece.source_offset + row * piece.source_pitch) as *const u8,
+                    (destination + piece.destination_offset + row * piece.destination_pitch)
+                        as *mut u8,
+                    piece.bytes as usize,
+                );
             }
-            Err(message) => shared.complete(&piece, Some(message)),
         }
+        Ok(())
+    }
+
+    fn complete(&mut self, (): ()) -> Option<String> {
+        None
     }
 }
 
-/// Run `copy thread`'s chunks, from another host's storage into this host's, as
-/// NIXL READs this process's agent posts, until nothing is queued or in
-/// flight.
-///
-/// While the link is unmeasured its chunks are [`MEASURE_BYTES`] long and
-/// run one at a time, each timed from its post to its completion; the
-/// fastest of the first [`MEASURE_SAMPLES`] byte windows becomes the link's
-/// bandwidth. Contiguous smaller chunks accumulate bytes and elapsed time
-/// into each window.
-fn network_thread(
-    shared: &Shared,
-    thread: &ThreadKey,
-    network: &Network,
-    mut bandwidth: Option<f64>,
-    chunk: Duration,
-) {
-    let mut flight: VecDeque<(Piece, nixl::Transfer)> = VecDeque::with_capacity(DEPTH);
-    let mut samples = Samples::default();
-    loop {
-        let bytes = chunk_bytes(bandwidth, chunk);
-        let piece = match shared.next(thread, bytes, !flight.is_empty()) {
-            Next::Chunk(piece) => piece,
-            Next::Busy => {
-                // Nothing is queued: the oldest READ in flight completes
-                // first.
-                if let Some((piece, transfer)) = flight.pop_front() {
-                    let failure = finish(transfer);
-                    shared.complete(&piece, failure);
-                }
-                continue;
-            }
-            Next::Idle => return,
-        };
-        if let Some(bandwidth) = bandwidth {
-            shared.pace(
-                &thread.link,
-                piece.copied(),
-                bandwidth,
-                (DEPTH as u64 * bytes) as f64,
-            );
-        }
-        let started = Instant::now();
-        let transfer = match post(network, &piece) {
-            Ok(transfer) => transfer,
-            Err(message) => {
-                shared.complete(&piece, Some(message));
-                continue;
-            }
-        };
-        if bandwidth.is_none() {
-            let failure = finish(transfer);
-            if failure.is_none()
-                && let Some(measured) =
-                    sample(&mut samples, &piece, started.elapsed().as_secs_f64())
-            {
-                bandwidth = Some(measured);
-                shared.measured(&thread.link, measured);
-            }
-            shared.complete(&piece, failure);
-            continue;
-        }
-        flight.push_back((piece, transfer));
-        if flight.len() >= DEPTH
-            && let Some((piece, transfer)) = flight.pop_front()
-        {
-            let failure = finish(transfer);
-            shared.complete(&piece, failure);
-        }
+/// This process's NIXL agent, with READs from another host's storage into
+/// this host's.
+struct NetworkCopier<'a> {
+    network: &'a Network,
+    /// The rate of the link's READs, in bytes per second.
+    bandwidth: f64,
+    /// When the bytes of the READs posted so far are due at that rate.
+    due: Instant,
+}
+
+impl Copier for NetworkCopier<'_> {
+    /// The READ, and when its bytes are due.
+    type Flight = (nixl::Transfer, Instant);
+
+    const ASYNCHRONOUS: bool = true;
+
+    fn submit(&mut self, piece: &Piece) -> Result<Self::Flight, String> {
+        let transfer = post(self.network, piece)?;
+        // Its bytes follow those of the READs posted before it.
+        let seconds = piece.copied() as f64 / self.bandwidth;
+        self.due = self.due.max(Instant::now()) + Duration::from_secs_f64(seconds);
+        Ok((transfer, self.due))
+    }
+
+    fn complete(&mut self, (transfer, due): Self::Flight) -> Option<String> {
+        // A READ that failed (another host or the network failed) fails its
+        // task, not the process: no CUDA context took part in it.
+        let failure = transfer
+            .wait(due)
+            .err()
+            .map(|error| format!("a READ from another host failed: {error}"));
+        tracing::debug!(failure, "a READ ended");
+        failure
     }
 }
 
@@ -1002,29 +1079,6 @@ fn post(network: &Network, piece: &Piece) -> Result<nixl::Transfer, String> {
         "posted a READ"
     );
     Ok(transfer)
-}
-
-/// Wait until `transfer` completed, as the host observes it; returns why it
-/// failed when it did. A READ that failed (another host or the network
-/// failed) fails its task, not the process: no CUDA context took part in it.
-fn finish(transfer: nixl::Transfer) -> Option<String> {
-    let failure = transfer
-        .wait(Instant::now())
-        .err()
-        .map(|error| format!("a READ from another host failed: {error}"));
-    tracing::debug!(failure, "a READ ended");
-    failure
-}
-
-/// Wait until `event` completed, as the host observes it.
-fn wait(event: &Event) {
-    loop {
-        match event.query() {
-            Ok(true) => return,
-            Ok(false) => std::thread::sleep(POLL),
-            Err(error) => fatal("waiting for a copy", &error),
-        }
-    }
 }
 
 /// End the process after a device fault: its CUDA contexts are no longer

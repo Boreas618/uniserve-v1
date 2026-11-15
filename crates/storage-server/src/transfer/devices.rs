@@ -1,42 +1,12 @@
-//! The GPUs the Transfer Server copies on, and what it measures of them
-//! when it starts: every link's bandwidth and the device storage its CUDA
-//! context takes on each GPU.
+//! The GPUs the Transfer Server copies on, as this process numbers them: the GPUs its host's
+//! calibration states ([`super::calibration`]), found among those the driver shows by their
+//! UUIDs, or every GPU the driver shows when the calibration step measures them.
 //!
-//! A link's bandwidth is measured on the path its copies take, with storage
-//! of the kinds they copy: CUDA VMM allocations that every GPU able to
-//! address them is granted access to, and memfds registered with CUDA,
-//! bound to the GPU's closest host NUMA node as host regions' parts are. Each link
-//! runs one untimed copy of [`SAMPLE_BYTES`], then [`SAMPLES`] timed ones
-//! back to back on the stream of the GPU that runs its copies (the
-//! destination's when it is a GPU), timed by CUDA events; the host-to-host
-//! link is timed on the host around the CPU's copies.
-//!
-//! The context's device storage is what NVML attributes to the process once
-//! the measurement's storage is released: the contexts, their streams and
-//! the copy paths the measurement brought up. The storage the Transfer
-//! Server maps later belongs to its owners (NVML attributes an imported
-//! allocation to no importer). The measurement then releases the contexts:
-//! the Transfer Server holds a GPU's context only while it has work on the
-//! GPU ([`super::contexts`]), and the measured bytes are what each holding
-//! takes.
+//! Discovery creates no CUDA context: it reads each GPU's identity, its closest host NUMA node,
+//! the GPUs whose copy engines can address its storage, and whether it registers host storage for
+//! reads alone.
 
-use std::os::fd::OwnedFd;
-use std::time::Instant;
-
-use ::storage::protocol::{ContextBytes, Link, LinkBandwidth, LinkEnd};
-use platform::{
-    DeviceAllocation, DeviceAttribute, DeviceId, Event, EventFlags, HostRegistration, Nvml,
-    PrimaryContext, Stream, memcpy_async,
-};
-
-use super::storage::HostMap;
-use super::{Error, storage_name};
-
-/// The bytes of one measured copy.
-const SAMPLE_BYTES: usize = 64 << 20;
-
-/// The timed copies of each link, after one untimed copy.
-const SAMPLES: usize = 8;
+use platform::{DeviceAttribute, DeviceId, HostRegistration};
 
 /// One GPU, as this process numbers it.
 pub(super) struct Gpu {
@@ -46,33 +16,60 @@ pub(super) struct Gpu {
     pub(super) numa_node: Option<u32>,
     /// The GPUs whose copy engines can address its storage, itself first.
     pub(super) readers: Vec<DeviceId>,
+    /// Whether it registers host storage for reads alone
+    /// (`CU_DEVICE_ATTRIBUTE_READ_ONLY_HOST_REGISTER_SUPPORTED`).
+    pub(super) read_only_registration: bool,
 }
 
-/// The GPUs this process sees.
+/// The GPUs this process copies on.
 pub(super) struct Gpus {
     gpus: Vec<Gpu>,
 }
 
 impl Gpus {
-    /// The GPUs the driver shows this process when the Transfer Server copies on GPUs (`use_gpus`),
-    /// and none otherwise, without loading the driver: its Transfer Server copies between host
-    /// storage only. A driver that shows no GPU is a count of none, not a failure. Discovery
-    /// creates no CUDA context.
+    /// The GPUs of `uuids`, among those the driver shows; none without loading the driver when
+    /// `uuids` is empty, so a Transfer Server calibrated without GPUs copies host storage alone.
     ///
     /// # Errors
     ///
-    /// Fails when GPUs are to be used and the driver cannot be loaded, or a GPU's identity or
-    /// peers cannot be read.
-    pub(super) fn discover(use_gpus: bool) -> Result<Self, platform::Error> {
-        let count = if use_gpus { DeviceId::count()? } else { 0 };
-        if count == 0 {
-            tracing::info!("no GPU to copy on: the Transfer Server copies host storage only");
+    /// Fails when the driver cannot be loaded, does not show a GPU of `uuids`, or a GPU's
+    /// identity or peers cannot be read.
+    pub(super) fn of(uuids: &[[u8; 16]]) -> Result<Self, crate::Error> {
+        if uuids.is_empty() {
+            tracing::info!("no GPU is calibrated: the Transfer Server copies host storage alone");
+            return Ok(Self { gpus: Vec::new() });
         }
-        let devices: Vec<DeviceId> = (0..count).map(DeviceId).collect();
+        let shown = Self::shown()?;
+        let mut devices = Vec::with_capacity(uuids.len());
+        for uuid in uuids {
+            let found = shown.iter().find(|gpu| gpu.uuid == *uuid).ok_or_else(|| {
+                crate::Error::Calibration(format!(
+                    "names GPU {}, which the driver does not show",
+                    platform::DeviceUuid(*uuid)
+                ))
+            })?;
+            devices.push(found.device);
+        }
+        Ok(Self::describe(&devices)?)
+    }
+
+    /// Every GPU the driver shows.
+    ///
+    /// # Errors
+    ///
+    /// Fails when the driver cannot be loaded or a GPU's identity or peers cannot be read.
+    pub(super) fn shown() -> Result<Self, platform::Error> {
+        let devices: Vec<DeviceId> = (0..DeviceId::count()?).map(DeviceId).collect();
+        Self::describe(&devices)
+    }
+
+    /// `devices`, each with its identity, NUMA node, readers among `devices`, and registration
+    /// capability.
+    fn describe(devices: &[DeviceId]) -> Result<Self, platform::Error> {
         let mut gpus = Vec::with_capacity(devices.len());
-        for &device in &devices {
+        for &device in devices {
             let mut readers = vec![device];
-            for &peer in &devices {
+            for &peer in devices {
                 if peer != device && peer.can_access_peer(device)? {
                     readers.push(peer);
                 }
@@ -85,6 +82,7 @@ impl Gpus {
                     .ok()
                     .and_then(|node| u32::try_from(node).ok()),
                 readers,
+                read_only_registration: HostRegistration::read_only_supported(device)?,
             });
         }
         Ok(Self { gpus })
@@ -98,225 +96,12 @@ impl Gpus {
         self.gpus.iter().find(|gpu| gpu.device == device)
     }
 
-    /// The GPU that runs the copies no GPU of their own runs: those between
-    /// host storage and another host's GPU.
-    pub(super) fn first(&self) -> Option<&Gpu> {
-        self.gpus.first()
+    /// Every GPU.
+    pub(super) fn iter(&self) -> impl Iterator<Item = &Gpu> + '_ {
+        self.gpus.iter()
     }
 
-    /// Every GPU, as (device, UUID).
-    pub(super) fn identities(&self) -> impl Iterator<Item = (DeviceId, [u8; 16])> + '_ {
-        self.gpus.iter().map(|gpu| (gpu.device, gpu.uuid))
+    pub(super) fn is_empty(&self) -> bool {
+        self.gpus.is_empty()
     }
-}
-
-/// The measurement's storage on one GPU: two device allocations, a host
-/// buffer on the GPU's NUMA node, and the stream the GPU's copies run on.
-struct Scratch {
-    stream: Stream,
-    source: DeviceAllocation,
-    destination: DeviceAllocation,
-    // The registration is undone before the buffer is unmapped.
-    registration: HostRegistration,
-    _host: HostMap,
-}
-
-impl Scratch {
-    fn new(gpu: &Gpu) -> Result<Self, Error> {
-        let stream = Stream::new(gpu.device)?;
-        let source = DeviceAllocation::exportable(gpu.device, SAMPLE_BYTES, &gpu.readers)?;
-        let destination = DeviceAllocation::exportable(gpu.device, SAMPLE_BYTES, &gpu.readers)?;
-        let host = HostMap::new(&host_buffer(gpu.numa_node)?, SAMPLE_BYTES, true)?;
-        // SAFETY: `_host` maps the range until after the registration drops.
-        let registration =
-            unsafe { HostRegistration::new(gpu.device, host.address() as *mut u8, SAMPLE_BYTES) }?;
-        Ok(Self {
-            stream,
-            source,
-            destination,
-            registration,
-            _host: host,
-        })
-    }
-}
-
-/// Measure every link of `gpus` and the device storage of each GPU's
-/// context, then release the contexts: the process holds none when this
-/// returns.
-pub(super) fn measure(gpus: &Gpus) -> Result<(Vec<LinkBandwidth>, Vec<ContextBytes>), Error> {
-    // The contexts are held through the measurement and until their storage
-    // is measured, whatever objects of the measurement live in them.
-    let mut held = Vec::with_capacity(gpus.gpus.len());
-    for gpu in &gpus.gpus {
-        let started = Instant::now();
-        held.push(PrimaryContext::retain(gpu.device)?);
-        tracing::info!(
-            gpu = %storage_name(&LinkEnd::Device { gpu: gpu.uuid }),
-            milliseconds = started.elapsed().as_secs_f64() * 1e3,
-            "created the GPU's CUDA context to measure its links"
-        );
-    }
-    let mut links = Vec::new();
-    links.push(LinkBandwidth {
-        link: Link {
-            source: LinkEnd::Host,
-            destination: LinkEnd::Host,
-        },
-        bytes_per_second: host_to_host()?,
-    });
-    {
-        let scratch: Vec<Scratch> = gpus
-            .gpus
-            .iter()
-            .map(Scratch::new)
-            .collect::<Result<_, _>>()?;
-        let device = |gpu: &Gpu| LinkEnd::Device { gpu: gpu.uuid };
-        for (gpu, own) in gpus.gpus.iter().zip(&scratch) {
-            let mut measured = |source: LinkEnd, destination: LinkEnd, to: u64, from: u64| {
-                // SAFETY: both ranges are measurement storage of
-                // `SAMPLE_BYTES` that lives until the stream drained.
-                let bytes_per_second = unsafe { time_copies(&own.stream, to, from) }?;
-                links.push(LinkBandwidth {
-                    link: Link {
-                        source,
-                        destination,
-                    },
-                    bytes_per_second,
-                });
-                Ok::<(), Error>(())
-            };
-            measured(
-                device(gpu),
-                device(gpu),
-                own.destination.address(),
-                own.source.address(),
-            )?;
-            measured(
-                LinkEnd::Host,
-                device(gpu),
-                own.destination.address(),
-                own.registration.address(),
-            )?;
-            measured(
-                device(gpu),
-                LinkEnd::Host,
-                own.registration.address(),
-                own.source.address(),
-            )?;
-            // Peer links into this GPU, on its stream: the destination's
-            // copy engine reads the source's storage over the GPUs' link.
-            for (peer, theirs) in gpus.gpus.iter().zip(&scratch) {
-                if peer.device != gpu.device && peer.readers.contains(&gpu.device) {
-                    measured(
-                        device(peer),
-                        device(gpu),
-                        own.destination.address(),
-                        theirs.source.address(),
-                    )?;
-                }
-            }
-        }
-    }
-    // The measurement's storage is released before the context is measured.
-    platform::reclaim::flush()?;
-    let contexts = if gpus.gpus.is_empty() {
-        Vec::new()
-    } else {
-        let nvml = Nvml::init()?;
-        gpus.gpus
-            .iter()
-            .map(|gpu| {
-                Ok(ContextBytes {
-                    gpu: gpu.uuid,
-                    bytes: nvml.process_storage(gpu.device)?,
-                })
-            })
-            .collect::<Result<_, platform::Error>>()?
-    };
-    drop(held);
-    platform::reclaim::flush()?;
-    for measured in &links {
-        tracing::info!(
-            source = %storage_name(&measured.link.source),
-            destination = %storage_name(&measured.link.destination),
-            gigabytes_per_second = measured.bytes_per_second as f64 / 1e9,
-            "measured a link"
-        );
-    }
-    Ok((links, contexts))
-}
-
-/// Copies `SAMPLE_BYTES` from `source` to `destination` on `stream` once,
-/// then `SAMPLES` times between two timing events, and returns the rate.
-///
-/// # Safety
-///
-/// Both ranges hold `SAMPLE_BYTES` and stay valid until the call returns,
-/// which drains the stream.
-unsafe fn time_copies(stream: &Stream, destination: u64, source: u64) -> Result<u64, Error> {
-    let timing = EventFlags {
-        timing: true,
-        ..EventFlags::default()
-    };
-    let (start, end) = (Event::new(timing), Event::new(timing));
-    // SAFETY: forwarded from the caller.
-    unsafe { memcpy_async(destination, source, SAMPLE_BYTES, stream) }?;
-    start.record(stream)?;
-    for _ in 0..SAMPLES {
-        // SAFETY: forwarded from the caller.
-        unsafe { memcpy_async(destination, source, SAMPLE_BYTES, stream) }?;
-    }
-    end.record(stream)?;
-    end.synchronize()?;
-    let seconds = f64::from(start.elapsed_ms(&end)?) / 1e3;
-    Ok(rate(SAMPLES * SAMPLE_BYTES, seconds))
-}
-
-/// The rate of the CPU's copies between two host buffers.
-fn host_to_host() -> Result<u64, Error> {
-    let source = HostMap::new(&host_buffer(None)?, SAMPLE_BYTES, true)?;
-    let destination = HostMap::new(&host_buffer(None)?, SAMPLE_BYTES, true)?;
-    let copy = || {
-        // SAFETY: two distinct mappings of `SAMPLE_BYTES` this function
-        // holds.
-        unsafe {
-            std::ptr::copy_nonoverlapping(
-                source.address() as *const u8,
-                destination.address() as *mut u8,
-                SAMPLE_BYTES,
-            );
-        }
-    };
-    // The untimed copy faults both buffers' pages in.
-    copy();
-    let started = Instant::now();
-    for _ in 0..SAMPLES {
-        copy();
-    }
-    Ok(rate(
-        SAMPLES * SAMPLE_BYTES,
-        started.elapsed().as_secs_f64(),
-    ))
-}
-
-/// A memfd of `SAMPLE_BYTES`, its pages preferring `numa_node`.
-fn host_buffer(numa_node: Option<u32>) -> Result<OwnedFd, Error> {
-    let descriptor = rustix::fs::memfd_create(
-        c"uniserve-transfer-measure",
-        rustix::fs::MemfdFlags::CLOEXEC,
-    )
-    .map_err(std::io::Error::from)?;
-    rustix::fs::ftruncate(&descriptor, SAMPLE_BYTES as u64).map_err(std::io::Error::from)?;
-    if let Some(node) = numa_node {
-        crate::memory::prefer_node(&descriptor, SAMPLE_BYTES as u64, node)?;
-    }
-    Ok(descriptor)
-}
-
-/// Bytes per second of `bytes` in `seconds`.
-fn rate(bytes: usize, seconds: f64) -> u64 {
-    if seconds <= 0.0 {
-        return u64::MAX;
-    }
-    (bytes as f64 / seconds) as u64
 }

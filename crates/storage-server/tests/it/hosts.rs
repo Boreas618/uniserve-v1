@@ -27,12 +27,16 @@ use crate::sessions::{
     DECODE, HOST, KV, PREFILL, Scheduler, UNITS, host_copy, host_parts, layout, rank,
     split_host_region, store_on_host, values,
 };
-use crate::transfer::{pattern, read, transfer_pid};
+use crate::transfer::{Paths, calibration, pattern, read, transfer_pid};
 
 /// A server whose Transfer Server copies on no GPU and reads other hosts'
-/// regions through NIXL.
+/// regions through NIXL, at the rate its calibration states.
 fn network_server() -> Running {
-    let server = Running::with_children(Some(transfer_child(false)));
+    let paths = Paths {
+        reads: true,
+        ..Paths::HOST
+    };
+    let server = Running::with_children(Some(transfer_child(calibration(paths))));
     transfer_pid(&server.socket, None);
     server
 }

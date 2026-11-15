@@ -350,7 +350,7 @@ fn serve_on(
     };
     service::raise_descriptor_limit().context("raising the descriptor limit")?;
     let (wake, stop) = service::stop_signals().context("installing the stop signals")?;
-    let children = Children::of(program, &settings);
+    let children = Children::of(program, &settings)?;
     let mut server = Server::new(listener, settings.clone(), Some(children))?;
     let peer = match &settings.server.tcp {
         Some(endpoint) => {

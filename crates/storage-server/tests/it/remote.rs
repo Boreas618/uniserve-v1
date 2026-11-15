@@ -11,10 +11,11 @@
 //! The failure test needs no GPU and no NIXL: every failure happens before
 //! a READ. The READ tests need a CUDA device, a usable RDMA port and the NIXL
 //! package (`docs/nixl.md`): their Transfer Servers copy on this process's
-//! GPUs, and their agents take RDMA alone (`nixl_transports = "rdma"`: `rc`
-//! between processes, `cuda_copy` within one), so the bytes cross the network
-//! adapter as they do between hosts, not CUDA IPC or shared memory. Run them
-//! with `cargo test -p storage-server --test it remote -- --ignored`.
+//! GPUs, calibrated with READs from another host, and their agents take RDMA
+//! alone (`nixl_transports = "rdma"`: `rc` between processes, `cuda_copy`
+//! within one), so the bytes cross the network adapter as they do between
+//! hosts, not CUDA IPC or shared memory. Run them with
+//! `cargo test -p storage-server --test it remote -- --ignored`.
 
 use std::os::fd::AsFd;
 use std::path::Path;
@@ -22,20 +23,33 @@ use std::path::Path;
 use ::storage::protocol::{ErrorKind, Priority, TaskFailure, TaskStatus};
 use ::storage::settings::Transports;
 use ::storage::{Access, Claimant, Client, Role};
+use storage_server::Children;
 
-use crate::server::{Running, head, host, key, memfd, scope, tensor, transfer_child, worker};
+use crate::server::{Running, head, helper, host, key, memfd, scope, tensor, worker};
 use crate::transfer::{
-    Gpus, end_of, read, remote_region, serving, span, tensor_region, transfer_pid,
+    Gpus, Paths, calibration, end_of, pattern, read, remote_region, serving, span, tensor_region,
+    transfer_pid,
 };
 
-/// A server whose Transfer Server sees this process's GPUs and READs from
-/// another server through the network adapters only.
-fn rdma_host() -> Running {
-    let mut children = transfer_child(true);
-    if let Some(options) = &mut children.transfer {
-        options.transports = Transports::Rdma;
-    }
-    let server = Running::with_children(Some(children));
+/// A server whose Transfer Server copies on this process's GPUs, calibrated with READs from
+/// another host (and copies over the fabric when `fabric`), and READs from another server
+/// through the network adapters only.
+fn rdma_host(fabric: bool) -> Running {
+    let paths = Paths {
+        gpus: true,
+        reads: true,
+        fabric,
+    };
+    let settings = ::storage::ServerSettings {
+        nixl_transports: Transports::Rdma,
+        ..::storage::ServerSettings::default()
+    };
+    let options = storage_server::transfer::Options::of(&settings, calibration(paths));
+    let server = Running::with_children(Some(Children {
+        program: helper(),
+        connector: None,
+        transfer: Some(options),
+    }));
     transfer_pid(&server.socket, None);
     server
 }
@@ -47,14 +61,6 @@ fn endpoint(socket: &Path) -> String {
         Some(peer) => peer.to_string(),
         None => panic!("the server names no endpoint"),
     }
-}
-
-/// `bytes` bytes without short periods, so that bytes read from a wrong
-/// offset, even one a multiple of 256 away, differ from the expected ones.
-fn sequence(bytes: usize, seed: u64) -> Vec<u8> {
-    (0..bytes as u64)
-        .map(|index| (((index + seed) * 2_654_435_761) >> 16) as u8)
-        .collect()
 }
 
 /// The first byte at which `actual` differs from `expected`.
@@ -101,7 +107,7 @@ fn a_read_from_another_host_fails_when_that_host_cannot_expose_its_source() {
         .claim(Claimant::Head, 0, vec![scope("text", 0)], Vec::new())
         .unwrap();
     let mut bare_worker = crate::server::worker(&bare.socket, scope("text", 0), 1, bare_claim);
-    let source = memfd(&sequence(64, 1));
+    let source = memfd(&pattern(64, 1));
     bare_worker
         .put(
             vec![tensor(key(1), "weights", 0, 0, Access::ReadOnly)],
@@ -162,22 +168,23 @@ mod device {
     use ::storage::{Access, Claimant, Client};
     use platform::{DeviceAllocation, DeviceId, HandleType, ShareableHandle};
 
-    use super::{endpoint, first_difference, rdma_host, sequence};
+    use super::{endpoint, first_difference, rdma_host};
     use crate::server::{head, host, key, memfd, scope, tensor, worker};
-    use crate::transfer::device::{device_bytes, device_storage, record};
-    use crate::transfer::{end_of, remote_region, span, tensor_region, transfer_pid};
+    use crate::transfer::device::{device_bytes, device_storage, gpus, record};
+    use crate::transfer::{end_of, pattern, remote_region, span, tensor_region, transfer_pid};
 
-    /// The bytes each span of the READ test moves: long enough for the
-    /// link's first timed chunks (64 MiB each) to measure it.
+    /// The bytes each span of the READ test moves: many chunks of a READ.
     const BYTES: usize = 256 << 20;
 
     #[test]
     #[ignore = "requires a CUDA device, a usable RDMA port and NIXL"]
     fn a_read_from_another_host_moves_device_and_host_storage_into_device_storage() {
-        let source_host = rdma_host();
-        let destination_host = rdma_host();
-        let first = DeviceId(0);
-        let last = DeviceId(DeviceId::count().unwrap() - 1);
+        let source_host = rdma_host(false);
+        let destination_host = rdma_host(false);
+        // One GPU holds both hosts' storage: the source's on `first`, the destination's on
+        // `last`.
+        let [first] = gpus::<1>();
+        let last = first;
         let granularity = DeviceAllocation::granularity(first).unwrap();
 
         // The source host: read-only weights on the first GPU, 4 KiB into
@@ -188,10 +195,10 @@ mod device {
             .unwrap();
         let mut source_worker = worker(&source_host.socket, scope("text", 0), 1, claim);
         let device_len = BYTES + granularity;
-        let device_source = sequence(device_len, 5);
+        let device_source = pattern(device_len, 5);
         let (_device_source, device_fd) = device_storage(first, &device_source);
         let host_len = BYTES + 4096;
-        let host_source = sequence(host_len, 9);
+        let host_source = pattern(host_len, 9);
         let host_fd = memfd(&host_source);
         source_worker
             .put(
@@ -269,7 +276,7 @@ mod device {
         };
 
         // The first task starts both agents, has the source host register
-        // its regions and measures both links; the second finds them
+        // its regions and reports both links; the second finds them
         // registered and swaps the two destinations, so that every byte it
         // writes differs from the first task's.
         let ranges = [64, BYTES + 8192];
@@ -284,7 +291,7 @@ mod device {
         }
 
         // The destination host lists both links from the source host, which
-        // the READs measured.
+        // the READs reported at their calibrated rate.
         let transfer = destination_head.list().unwrap().transfer.unwrap();
         let gpu = |device: DeviceId| device.uuid().unwrap().0;
         for source_storage in [Some(gpu(first)), None] {
@@ -299,7 +306,7 @@ mod device {
                 .links
                 .iter()
                 .find(|measured| measured.link == link)
-                .unwrap_or_else(|| panic!("{link:?} was not measured"));
+                .unwrap_or_else(|| panic!("{link:?} is not listed"));
             assert!(measured.bytes_per_second > 0);
             eprintln!(
                 "{:?} -> {:?}: {:.1} GB/s",
@@ -333,10 +340,12 @@ mod device {
     #[test]
     #[ignore = "requires a CUDA device, a usable RDMA port and NIXL"]
     fn a_source_host_whose_transfer_server_restarted_is_read_again() {
-        let source_host = rdma_host();
-        let destination_host = rdma_host();
-        let first = DeviceId(0);
-        let last = DeviceId(DeviceId::count().unwrap() - 1);
+        let source_host = rdma_host(false);
+        let destination_host = rdma_host(false);
+        // One GPU holds both hosts' storage: the source's on `first`, the destination's on
+        // `last`.
+        let [first] = gpus::<1>();
+        let last = first;
         let granularity = DeviceAllocation::granularity(first).unwrap();
 
         let mut source_head = head(&source_host.socket);
@@ -344,7 +353,7 @@ mod device {
             .claim(Claimant::Head, 0, vec![scope("text", 0)], Vec::new())
             .unwrap();
         let mut source_worker = worker(&source_host.socket, scope("text", 0), 1, claim);
-        let source_bytes = sequence(granularity, 3);
+        let source_bytes = pattern(granularity, 3);
         let (_source, source_fd) = device_storage(first, &source_bytes);
         source_worker
             .put(
@@ -412,16 +421,18 @@ mod device {
     /// handle, with the allocation's length and the exposed range's offset
     /// in it. A source whose handle imports on the destination's GPU is
     /// copied over the NVLink fabric, so no link from the source host is
-    /// measured; a source whose handle does not import (here one that names
-    /// no allocation) is READ through NIXL, which measures that link. Both
+    /// reported; a source whose handle does not import (here one that names
+    /// no allocation) is READ through NIXL, which reports that link. Both
     /// arrive whole.
     #[test]
     #[ignore = "requires a CUDA device whose allocations export fabric handles (IMEX), a usable RDMA port and NIXL"]
     fn a_source_is_copied_over_the_fabric_when_its_recorded_handle_imports_and_read_otherwise() {
-        let source_host = rdma_host();
-        let destination_host = rdma_host();
-        let first = DeviceId(0);
-        let last = DeviceId(DeviceId::count().unwrap() - 1);
+        let source_host = rdma_host(true);
+        let destination_host = rdma_host(true);
+        // One GPU holds both hosts' storage: the source's on `first`, the destination's on
+        // `last`.
+        let [first] = gpus::<1>();
+        let last = first;
         assert_eq!(HandleType::probe(first).unwrap(), HandleType::Fabric);
         let granularity = DeviceAllocation::granularity(first).unwrap();
         // Each source is as long as the two 64 MiB chunks a network copy thread
@@ -441,7 +452,7 @@ mod device {
             .claim(Claimant::Head, 0, vec![scope("text", 0)], Vec::new())
             .unwrap();
         let mut source_worker = worker(&source_host.socket, scope("text", 0), 1, claim);
-        let fabric_bytes = sequence(bytes, 11);
+        let fabric_bytes = pattern(bytes, 11);
         let (fabric_source, fabric_fd) = device_storage(first, &fabric_bytes);
         let Some(ShareableHandle::Fabric(exported)) = fabric_source.export().unwrap() else {
             panic!("the allocation exports no fabric handle");
@@ -450,7 +461,7 @@ mod device {
         let unknown = FabricHandle([0; 64]);
         let mut fabric_record = record(first, bytes);
         fabric_record.fabric = Some(handle);
-        let nixl_bytes = sequence(bytes, 13);
+        let nixl_bytes = pattern(bytes, 13);
         let (_nixl_source, nixl_fd) = device_storage(first, &nixl_bytes);
         let mut nixl_record = record(first, bytes);
         nixl_record.fabric = Some(unknown);
@@ -518,8 +529,8 @@ mod device {
                 .unwrap();
             end_of(worker, task)
         };
-        // The links from the source host the destination measured, which
-        // only a READ measures.
+        // The links from the source host the destination reported, which
+        // only a READ reports.
         let remote_links = |head: &mut Client| {
             head.list()
                 .unwrap()
@@ -557,10 +568,12 @@ mod device {
     #[test]
     #[ignore = "requires a CUDA device whose allocations export fabric handles (IMEX), a usable RDMA port and NIXL"]
     fn a_strided_span_from_another_host_copies_each_row_to_its_pitch() {
-        let source_host = rdma_host();
-        let destination_host = rdma_host();
-        let first = DeviceId(0);
-        let last = DeviceId(DeviceId::count().unwrap() - 1);
+        let source_host = rdma_host(true);
+        let destination_host = rdma_host(true);
+        // One GPU holds both hosts' storage: the source's on `first`, the destination's on
+        // `last`.
+        let [first] = gpus::<1>();
+        let last = first;
         let granularity = DeviceAllocation::granularity(first).unwrap();
 
         // Rows of an odd length at pitches of their own on each side, from
@@ -579,16 +592,16 @@ mod device {
             .claim(Claimant::Head, 0, vec![scope("text", 0)], Vec::new())
             .unwrap();
         let mut source_worker = worker(&source_host.socket, scope("text", 0), 1, claim);
-        let host_source = sequence(granularity, 17);
+        let host_source = pattern(granularity, 17);
         let host_fd = memfd(&host_source);
-        let fabric_source = sequence(granularity, 19);
+        let fabric_source = pattern(granularity, 19);
         let (fabric_storage, fabric_fd) = device_storage(first, &fabric_source);
         let Some(ShareableHandle::Fabric(exported)) = fabric_storage.export().unwrap() else {
             panic!("the allocation exports no fabric handle");
         };
         let mut fabric_record = record(first, granularity);
         fabric_record.fabric = Some(FabricHandle(exported));
-        let nixl_source = sequence(granularity, 23);
+        let nixl_source = pattern(granularity, 23);
         let (_nixl_storage, nixl_fd) = device_storage(first, &nixl_source);
         let mut nixl_record = record(first, granularity);
         nixl_record.fabric = Some(FabricHandle([0; 64]));

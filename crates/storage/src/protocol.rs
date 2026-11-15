@@ -250,8 +250,8 @@ pub enum Role {
     Connector,
     /// The Transfer Server the server runs, which copies bytes between the
     /// storage the server holds. Every quota of a GPU it uses reserves its CUDA
-    /// context there, as it measured it ([`Request::Measured`]), and any
-    /// staging it reserves ([`Request::Quota`]).
+    /// context there, at the bytes its host's calibration states
+    /// ([`Request::Measured`]), and any staging it reserves ([`Request::Quota`]).
     Transfer,
     /// A process of another host, connected to the server's TCP endpoint:
     /// that host's Transfer Server, which READs storage of this host through
@@ -415,7 +415,7 @@ pub enum Item {
     /// process.
     Staging,
     /// The device storage of the Transfer Server's CUDA context, at the
-    /// bytes it measured when it started ([`Request::Measured`]). Reserved by
+    /// bytes its host's calibration states ([`Request::Measured`]). Reserved by
     /// the Transfer Server before it retains the context on the GPU, which
     /// it holds only while it has work there, and ended when it released
     /// it.
@@ -791,10 +791,10 @@ pub enum LinkEnd {
 }
 
 /// The path a copy takes, from the storage it reads to the storage it writes.
-/// The Transfer Server measures each link within its host when it starts,
-/// and a link from another host by its first copy long enough to time; it
-/// cuts copies into chunks by the bandwidth, and keeps a byte budget per
-/// link.
+/// The Transfer Server copies by its host's calibration, which states each
+/// link within the host and the rate of copies from another host into each
+/// end here; it cuts copies into chunks by the bandwidth, and keeps a byte
+/// budget per link.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct Link {
     pub source: LinkEnd,
@@ -803,14 +803,39 @@ pub struct Link {
 
 /// A change of links' byte budgets, which the head of the executing epoch
 /// makes when its scheduler steps slow down while transfers run.
+///
+/// A link's budget is a share of its bandwidth, whole at first. The policy is part of this
+/// interface, so the Transfer Server that applies it and every client that plans around it read
+/// one definition: a halving divides the share by two down to [`Throttle::FLOOR`], and a
+/// restoration grows it back by [`Throttle::RESTORE_PER_SECOND`] of the bandwidth per second
+/// until it is whole, so a head's once-a-second statistics see each step of the recovery.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Throttle {
-    /// Halve each link's budget, down to a floor; a restoration under way
-    /// stops.
+    /// Halve each link's budget, down to [`Throttle::FLOOR`]; a restoration under way stops.
     Halve,
-    /// Raise each link's budget back to its bandwidth, gradually.
+    /// Raise each link's budget back to its bandwidth, by [`Throttle::RESTORE_PER_SECOND`] of it
+    /// per second.
     Restore,
+}
+
+impl Throttle {
+    /// The least share of its bandwidth a halved link keeps.
+    pub const FLOOR: f64 = 1.0 / 64.0;
+
+    /// The share of its bandwidth a restored link's budget regains per second.
+    pub const RESTORE_PER_SECOND: f64 = 1.0 / 8.0;
+
+    /// The halvings that take a whole budget to [`Throttle::FLOOR`].
+    pub fn halvings_to_floor() -> u32 {
+        // The floor is a power of two: its exponent is exact.
+        (1.0 / Self::FLOOR).log2().ceil() as u32
+    }
+
+    /// The longest restoration: from [`Throttle::FLOOR`] back to the whole bandwidth.
+    pub fn restoration() -> Duration {
+        Duration::from_secs_f64((1.0 - Self::FLOOR) / Self::RESTORE_PER_SECOND)
+    }
 }
 
 /// How a transfer task ended.
@@ -889,8 +914,9 @@ pub struct Move {
     pub destination_pitch: u64,
 }
 
-/// A link's bandwidth as the Transfer Server measured it: when it started,
-/// or by the first copy long enough to time, for a link from another host.
+/// A link's bandwidth as its host's calibration states it: a link within the
+/// host, or a link from another host's storage, which the Transfer Server
+/// reports once a task first copies over it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LinkBandwidth {
     pub link: Link,
@@ -1189,10 +1215,10 @@ pub enum Request {
         throttle: Throttle,
     },
     /// From the Transfer Server: each link's bandwidth and the device
-    /// storage its CUDA context takes on each GPU, once after it connected,
-    /// for every link within its host, and again for a link from another
-    /// host once a copy timed it. The server keeps the latest report of
-    /// each link and each GPU.
+    /// storage its CUDA context takes on each GPU, as its host's calibration
+    /// states them: once after it connected, for every link within its host,
+    /// and again for a link from another host once a task first copies over
+    /// it. The server keeps the latest report of each link and each GPU.
     Measured {
         links: Vec<LinkBandwidth>,
         contexts: Vec<ContextBytes>,
@@ -1674,7 +1700,8 @@ pub struct CopyListing {
 pub struct TransferListing {
     /// Its process id.
     pub pid: i32,
-    /// The links it measured when it started; empty until it reported them.
+    /// The links its host's calibration states, and those from other hosts a task copied over;
+    /// empty until it reported them.
     pub links: Vec<LinkBandwidth>,
     /// The device storage its CUDA context takes on each GPU it uses.
     pub contexts: Vec<ContextBytes>,

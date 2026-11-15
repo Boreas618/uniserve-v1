@@ -47,15 +47,20 @@ pub struct ServerSettings {
     /// storage less this reserve cannot hold is refused (SGLang's host KV cache keeps 10 GiB the
     /// same way). Default 10.
     pub host_reserve_gib: u64,
+    /// The host's transfer calibration (JSON), which `storage-server calibrate` writes: the
+    /// GPUs the Transfer Server copies on, each link's bandwidth and per-copy cost, the device
+    /// storage its CUDA context takes on each GPU, and the rate of copies from other hosts. The
+    /// server reads it when it starts and refuses to start on a calibration it cannot read. No
+    /// Transfer Server runs when unset, and transfers are refused as unavailable.
+    pub transfer_calibration: Option<PathBuf>,
     /// How long one chunk of the Transfer Server's copies lasts at its link's bandwidth, in
     /// microseconds: a copy engine turns to the executing epoch's own copies, and to transfers of
     /// a higher priority, between chunks, so a chunk is kept far below one scheduler step.
     /// Default 1000.
     pub transfer_chunk_us: u64,
-    /// Whether the Transfer Server copies on this host's GPUs: it then requires the CUDA driver
-    /// and copies on every GPU the driver shows; otherwise it copies host storage alone and loads
-    /// no driver. Default true.
-    pub transfer_gpus: bool,
+    /// How often a running transfer task reports its progress at most, in milliseconds: the
+    /// bytes it copied, which its submitter's events and the server's listing state. Default 100.
+    pub transfer_progress_ms: u64,
     /// The transports the Transfer Server's NIXL agent takes for READs between hosts, over the
     /// host's usable RDMA ports. Default `selected`.
     pub nixl_transports: Transports,
@@ -89,8 +94,9 @@ impl Default for ServerSettings {
         Self {
             tcp: None,
             host_reserve_gib: 10,
+            transfer_calibration: None,
             transfer_chunk_us: 1000,
-            transfer_gpus: true,
+            transfer_progress_ms: 100,
             nixl_transports: Transports::Selected,
             transfer_deadline_s: 60,
             put_deadline_s: 60,
@@ -111,6 +117,11 @@ impl ServerSettings {
     /// How long one chunk of the Transfer Server's copies lasts.
     pub fn transfer_chunk(&self) -> Duration {
         Duration::from_micros(self.transfer_chunk_us)
+    }
+
+    /// How often a running transfer task reports its progress at most.
+    pub fn transfer_progress(&self) -> Duration {
+        Duration::from_millis(self.transfer_progress_ms)
     }
 
     /// How long a buffer pool's transfer between worker groups may take.

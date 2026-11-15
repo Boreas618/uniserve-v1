@@ -278,18 +278,31 @@ pub struct Children {
 
 impl Children {
     /// The children of a server serving with `settings`, run from `program`: the connector the
-    /// settings state, and the Transfer Server.
-    pub fn of(program: Program, settings: &::storage::Settings) -> Self {
-        Self {
+    /// settings state, and the Transfer Server, by the host's calibration the settings name
+    /// (none without one, so transfers are refused as unavailable).
+    ///
+    /// # Errors
+    ///
+    /// Fails when the calibration the settings name cannot be read or does not hold together.
+    pub fn of(program: Program, settings: &::storage::Settings) -> Result<Self, crate::Error> {
+        let transfer = match &settings.server.transfer_calibration {
+            Some(path) => {
+                let calibration = crate::transfer::Calibration::read(path)?;
+                Some(crate::transfer::Options::of(&settings.server, calibration))
+            }
+            None => {
+                tracing::warn!(
+                    "no transfer calibration is set (`transfer_calibration`): the server runs no \
+                     Transfer Server, and refuses transfers as unavailable"
+                );
+                None
+            }
+        };
+        Ok(Self {
             program,
             connector: settings.connector.clone(),
-            transfer: Some(crate::transfer::Options {
-                chunk: settings.server.transfer_chunk(),
-                serves_peers: settings.server.tcp.is_some(),
-                transports: settings.server.nixl_transports,
-                gpus: settings.server.transfer_gpus,
-            }),
-        }
+            transfer,
+        })
     }
 }
 

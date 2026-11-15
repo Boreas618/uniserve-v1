@@ -4,22 +4,28 @@
 //!
 //! The server runs on a thread of the test process; its Transfer Server is
 //! the real one, which the server runs as its child from the tests' helper
-//! executable (`crate::server::transfer_child`). The host tests have it copy
-//! on no GPU, so it copies host storage with the CPU and no GPU is touched.
-//! The device tests need a CUDA device and have it copy on the GPUs the
-//! driver shows; run them with `cargo test -p storage-server --test it
-//! transfer -- --ignored`.
+//! executable (`crate::server::transfer_child`), by a calibration of this host
+//! the helper's calibration step wrote (`storage-server calibrate`,
+//! [`calibration`]). The host tests calibrate host storage alone, so the
+//! Transfer Server copies host storage with the CPU and no GPU is touched. The
+//! device tests need the CUDA devices each states ([`device::gpus`]) and
+//! calibrate the GPUs the driver shows; run them with `cargo test -p
+//! storage-server --test it transfer -- --ignored`.
 
+use std::collections::HashMap;
 use std::os::fd::AsFd;
 use std::os::unix::fs::FileExt;
 use std::path::Path;
+use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
+use ::storage::client::Waited;
 use ::storage::protocol::{
     ErrorKind, Event, Link, LinkEnd, Priority, Region, Span, TaskFailure, TaskStatus, TaskTotal,
     Throttle,
 };
 use ::storage::{Access, Claimant, Client, Role};
+use storage_server::transfer::Calibration;
 
 use crate::server::{
     Running, head, host, key, memfd, scope, server_error, tensor, transfer_child, worker,
@@ -34,14 +40,69 @@ pub(crate) enum Gpus {
     Visible,
 }
 
-/// A server whose Transfer Server is connected and measured.
+/// The paths a test host's calibration times: its links (on the GPUs the driver shows when
+/// `gpus`, else host storage alone), and copies from another host by READ and over the fabric.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(crate) struct Paths {
+    pub(crate) gpus: bool,
+    pub(crate) reads: bool,
+    pub(crate) fabric: bool,
+}
+
+impl Paths {
+    /// Host storage alone.
+    pub(crate) const HOST: Self = Self {
+        gpus: false,
+        reads: false,
+        fabric: false,
+    };
+}
+
+/// This host's calibration of `paths`, which the tests' helper's calibration step writes once
+/// per test process and the server reads as it reads its settings' calibration.
+pub(crate) fn calibration(paths: Paths) -> Calibration {
+    static CALIBRATED: Mutex<Option<HashMap<Paths, Calibration>>> = Mutex::new(None);
+
+    // One calibration runs at a time, so no other copy disturbs its timing.
+    let mut calibrated = CALIBRATED.lock().unwrap();
+    let calibrated = calibrated.get_or_insert_with(HashMap::new);
+    if let Some(calibration) = calibrated.get(&paths) {
+        return calibration.clone();
+    }
+    let directory = tempfile::tempdir().unwrap();
+    let output = directory.path().join("transfer.json");
+    let mut command = std::process::Command::new(env!("CARGO_BIN_EXE_storage-server-helper"));
+    command
+        .args(["--log-level", "warn", "calibrate", "--output"])
+        .arg(&output);
+    if !paths.gpus {
+        command.arg("--host-only");
+    }
+    if paths.reads {
+        command.arg("--reads");
+    }
+    if paths.fabric {
+        command.arg("--fabric");
+    }
+    let status = command.status().unwrap();
+    assert!(status.success(), "the calibration step failed: {status}");
+    let calibration = Calibration::read(&output).unwrap();
+    calibrated.insert(paths, calibration.clone());
+    calibration
+}
+
+/// A server whose Transfer Server is connected and reported its links.
 pub(crate) fn serving(gpus: Gpus) -> Running {
-    let server = Running::with_children(Some(transfer_child(matches!(gpus, Gpus::Visible))));
+    let paths = Paths {
+        gpus: matches!(gpus, Gpus::Visible),
+        ..Paths::HOST
+    };
+    let server = Running::with_children(Some(transfer_child(calibration(paths))));
     transfer_pid(&server.socket, None);
     server
 }
 
-/// The pid of the server's measured Transfer Server, once one other than
+/// The pid of the server's Transfer Server, once one other than
 /// `not` is.
 pub(crate) fn transfer_pid(socket: &Path, not: Option<i32>) -> i32 {
     let mut operator = Client::connect(socket, Role::Operator).unwrap();
@@ -64,13 +125,9 @@ pub(crate) fn transfer_pid(socket: &Path, not: Option<i32>) -> i32 {
 /// The next transfer event `client` receives, within a minute.
 pub(crate) fn transfer_event(client: &mut Client) -> Event {
     let deadline = Instant::now() + Duration::from_secs(60);
-    loop {
-        client.pump().unwrap();
-        if let Some((event, _)) = client.next_event() {
-            return event;
-        }
-        assert!(Instant::now() < deadline, "no transfer event arrived");
-        std::thread::sleep(Duration::from_millis(1));
+    match client.wait_next_event(None, Some(deadline)).unwrap() {
+        Waited::Done((event, _)) => event,
+        other => panic!("no transfer event arrived: {other:?}"),
     }
 }
 
@@ -89,10 +146,11 @@ pub(crate) fn end_of(client: &mut Client, task: u64) -> (u64, TaskStatus) {
     }
 }
 
-/// Bytes of a pattern that differs at every position of a span.
+/// `bytes` bytes without short periods, so that bytes read from a wrong offset, even one a
+/// multiple of 256 away, differ from the expected ones; `seed` starts it elsewhere.
 pub(crate) fn pattern(bytes: usize, seed: u8) -> Vec<u8> {
-    (0..bytes)
-        .map(|index| (index as u8).wrapping_mul(31).wrapping_add(seed))
+    (0..bytes as u64)
+        .map(|index| (((index + u64::from(seed)) * 2_654_435_761) >> 16) as u8)
         .collect()
 }
 
@@ -221,7 +279,7 @@ fn a_transfer_copies_host_regions_and_ends_complete() {
     // The source is read-only content, which no copy changes.
     assert_eq!(read(&source, 0, 64), source_bytes);
 
-    // The listing names the host link the Transfer Server measured, and no
+    // The listing names the host link the Transfer Server reported, and no
     // GPU context, since it sees no GPU.
     let listing = head.list().unwrap();
     let transfer = listing.transfer.expect("the Transfer Server is listed");
@@ -514,7 +572,7 @@ fn a_transfer_is_refused_whole_unless_every_span_fits_storage_of_its_deployment(
 
 /// A head, a worker, and a source and a destination tensor of `bytes`
 /// each, for transfers slow enough to observe: the host link is halved to
-/// its floor.
+/// its floor ([`Throttle::FLOOR`]).
 pub(crate) struct Slow {
     pub(crate) head: Client,
     pub(crate) worker: Client,
@@ -547,7 +605,7 @@ pub(crate) fn slow(server: &Running, bytes: u64) -> Slow {
         source: LinkEnd::Host,
         destination: LinkEnd::Host,
     };
-    for _ in 0..8 {
+    for _ in 0..Throttle::halvings_to_floor() {
         head.throttle(vec![link.clone()], Throttle::Halve).unwrap();
     }
     Slow {
@@ -604,11 +662,23 @@ fn a_promotion_transfer_overtakes_background_transfers_on_its_link() {
     assert_eq!(read(&destination, bytes - 4096, 4096), pattern(4096, 3));
 }
 
+/// The host link's bandwidth as the Transfer Server of the server `head` reaches reports it.
+fn host_bandwidth(head: &mut Client) -> f64 {
+    let host = Link {
+        source: LinkEnd::Host,
+        destination: LinkEnd::Host,
+    };
+    let transfer = head.list().unwrap().transfer.unwrap();
+    let measured = transfer.links.iter().find(|measured| measured.link == host);
+    measured.unwrap().bytes_per_second as f64
+}
+
 /// A head that names no link halves the links its deployment's tasks copy
-/// over: a task of 256 MiB over the host link, at its whole budget a matter
-/// of milliseconds, still runs after 200 ms. A restoration that names no
-/// link restores every link a halving reduced: once its budget grew back,
-/// the next task over the link ends within 200 ms again.
+/// over: a task that lasts a second at the floor's share of the host link, a
+/// sixty-fourth of that at its whole budget, still runs half a second after
+/// the halvings. A restoration that names no link restores every link a
+/// halving reduced: once its budget grew back ([`Throttle::restoration`]), the
+/// next such task ends within that half second.
 #[test]
 fn a_throttle_without_links_takes_the_deployments_tasks_links() {
     let server = serving(Gpus::Hidden);
@@ -617,7 +687,8 @@ fn a_throttle_without_links_takes_the_deployments_tasks_links() {
         .claim(Claimant::Head, 0, vec![scope("text", 0)], Vec::new())
         .unwrap();
     let mut worker = worker(&server.socket, scope("text", 0), 1, claim);
-    let bytes: u64 = 256 << 20;
+    // A second at the floor.
+    let bytes = (host_bandwidth(&mut head) * Throttle::FLOOR) as u64;
     let source = memfd(&pattern(bytes as usize, 3));
     let destination = memfd(&vec![0; bytes as usize]);
     worker
@@ -641,19 +712,20 @@ fn a_throttle_without_links_takes_the_deployments_tasks_links() {
             )
             .unwrap()
     };
+    let window = Duration::from_millis(500);
 
     let task = copy(&mut worker, 1);
-    for _ in 0..6 {
+    for _ in 0..Throttle::halvings_to_floor() {
         head.throttle(Vec::new(), Throttle::Halve).unwrap();
     }
-    let started = Instant::now();
-    while started.elapsed() < Duration::from_millis(200) {
-        worker.pump().unwrap();
-        if let Some((Event::TaskEnded { status: end, .. }, _)) = worker.next_event() {
-            panic!("a task over a halved link ended within 200 ms: {end:?}");
-        }
-        std::thread::sleep(Duration::from_millis(1));
-    }
+    let halved = worker
+        .wait_task(task, None, Some(Instant::now() + window))
+        .unwrap();
+    assert_eq!(
+        halved,
+        Waited::TimedOut,
+        "a task over a halved link ended within {window:?}"
+    );
     head.throttle(Vec::new(), Throttle::Restore).unwrap();
     assert_eq!(end_of(&mut worker, task), (bytes, TaskStatus::Complete));
     assert_eq!(
@@ -661,13 +733,13 @@ fn a_throttle_without_links_takes_the_deployments_tasks_links() {
         read(&source, 0, bytes as usize)
     );
 
-    // A share of 1/64 grows back by 1/8 of the bandwidth per second.
-    std::thread::sleep(Duration::from_secs(9));
+    // The budget grows back by its policy's rate; no event marks it whole.
+    std::thread::sleep(Throttle::restoration());
     let started = Instant::now();
     let task = copy(&mut worker, 2);
     assert_eq!(end_of(&mut worker, task), (bytes, TaskStatus::Complete));
     assert!(
-        started.elapsed() < Duration::from_millis(200),
+        started.elapsed() < window,
         "a task over a restored link took {:?}",
         started.elapsed()
     );
@@ -705,11 +777,18 @@ fn a_cancelled_transfer_ends_cancelled_and_stops_copying() {
     assert_eq!(end, TaskStatus::Cancelled);
     assert!(copied < bytes);
 
-    // Once it ended, no byte past what it reported is written.
-    let tail = read(&destination, bytes - 4096, 4096);
-    std::thread::sleep(Duration::from_millis(200));
-    assert_eq!(read(&destination, bytes - 4096, 4096), tail);
-    assert_eq!(tail, [0; 4096]);
+    // Once it ended, it writes nothing: a task queued on its link after its
+    // end, at its priority, ends after any chunk the link still ran, and its
+    // last bytes are still unwritten then.
+    let after = worker
+        .copy(
+            vec![span(tensor_region(1), 0, tensor_region(2), 0, 4096)],
+            Priority::Warming,
+            8,
+        )
+        .unwrap();
+    assert_eq!(end_of(&mut worker, after), (4096, TaskStatus::Complete));
+    assert_eq!(read(&destination, bytes - 4096, 4096), [0; 4096]);
     assert!(
         head.list()
             .unwrap()
@@ -816,7 +895,6 @@ fn an_offload_the_host_cannot_hold_is_refused_and_moves_nothing() {
 /// server, as a worker does.
 pub(crate) mod device {
     use std::os::fd::{AsFd, OwnedFd};
-
     use std::time::{Duration, Instant};
 
     use ::storage::protocol::{
@@ -829,8 +907,20 @@ pub(crate) mod device {
         SourceOrder, Stream,
     };
 
-    use super::{Gpus, end_of, pattern, read, serving, span, tensor_region};
-    use crate::server::{epoch_worker, head, host, key, memfd, scope, tensor, worker};
+    use super::{Gpus, Paths, calibration, end_of, pattern, read, serving, span, tensor_region};
+    use crate::server::{
+        Running, epoch_worker, head, host, key, memfd, scope, tensor, transfer_child, worker,
+    };
+
+    /// The first `N` GPUs the driver shows, which the case states it requires.
+    pub(crate) fn gpus<const N: usize>() -> [DeviceId; N] {
+        let count = DeviceId::count().unwrap();
+        assert!(
+            usize::try_from(count).unwrap() >= N,
+            "the case requires {N} CUDA devices; the driver shows {count}"
+        );
+        std::array::from_fn(|index| DeviceId(i32::try_from(index).unwrap()))
+    }
 
     /// A retained device allocation of `bytes` on `device` holding
     /// `contents`, with its descriptor.
@@ -886,7 +976,7 @@ pub(crate) mod device {
         };
 
         let server = serving(Gpus::Visible);
-        let device = DeviceId(0);
+        let [device] = gpus::<1>();
         let gpu = device.uuid().unwrap().0;
         let granularity = DeviceAllocation::granularity(device).unwrap();
         let contents = pattern(granularity, 7);
@@ -999,7 +1089,7 @@ pub(crate) mod device {
     }
 
     /// The context bytes the Transfer Server of the server on `socket`
-    /// measured on `gpu` when it started.
+    /// states on `gpu`, as its host's calibration states them.
     fn measured_context(socket: &std::path::Path, gpu: [u8; 16]) -> u64 {
         let mut operator = ::storage::Client::connect(socket, ::storage::Role::Operator).unwrap();
         operator
@@ -1013,7 +1103,7 @@ pub(crate) mod device {
                     .find(|context| context.gpu == gpu)
                     .map(|context| context.bytes)
             })
-            .expect("the Transfer Server measured its context on the GPU")
+            .expect("the Transfer Server states its context on the GPU")
     }
 
     /// The Transfer Server's context as the deployment's quota of `gpu`
@@ -1051,7 +1141,7 @@ pub(crate) mod device {
     /// The Transfer Server holds a GPU's CUDA context only while a task
     /// needs the GPU: none once it started; while a task copies into the
     /// GPU, the context, reserved in the deployment's quota of the GPU at the
-    /// bytes it measured; once the task ended, neither the context (NVML
+    /// bytes its calibration states; once the task ended, neither the context (NVML
     /// lists the process on the GPU no more) nor its reservation. A following
     /// task on the GPU retains it again. Explicit sessions keep it between
     /// tasks until their last owner closes or disconnects.
@@ -1061,7 +1151,7 @@ pub(crate) mod device {
         let server = serving(Gpus::Visible);
         let pid = super::transfer_pid(&server.socket, None);
         let nvml = Nvml::init().unwrap();
-        let first = DeviceId(0);
+        let [first] = gpus::<1>();
         let gpu = first.uuid().unwrap().0;
         let context = measured_context(&server.socket, gpu);
         assert!(context > 0);
@@ -1090,7 +1180,7 @@ pub(crate) mod device {
             .unwrap();
         assert_eq!(reserved_context(&mut head, gpu), None);
         // The quota states the bandwidth from host storage to the GPU the
-        // Transfer Server measured.
+        // Transfer Server reported.
         let quotas = head.usage(vec![gpu]).unwrap().quotas;
         assert!(!quotas.is_empty());
         assert!(
@@ -1106,7 +1196,7 @@ pub(crate) mod device {
             source: LinkEnd::Host,
             destination: LinkEnd::Device { gpu },
         };
-        for _ in 0..8 {
+        for _ in 0..Throttle::halvings_to_floor() {
             head.throttle(vec![link.clone()], Throttle::Halve).unwrap();
         }
         let task = worker
@@ -1178,7 +1268,7 @@ pub(crate) mod device {
         let server = serving(Gpus::Visible);
         let pid = super::transfer_pid(&server.socket, None);
         let nvml = Nvml::init().unwrap();
-        let first = DeviceId(0);
+        let [first] = gpus::<1>();
         let gpu = first.uuid().unwrap().0;
         let context = measured_context(&server.socket, gpu);
 
@@ -1270,7 +1360,7 @@ pub(crate) mod device {
     #[ignore = "requires a CUDA device"]
     fn a_epochs_own_weights_move_to_host_storage_and_back() {
         let server = serving(Gpus::Visible);
-        let first = DeviceId(0);
+        let [first] = gpus::<1>();
         let gpu = first.uuid().unwrap().0;
         let granularity = DeviceAllocation::granularity(first).unwrap();
         let size = granularity as u64;
@@ -1354,9 +1444,17 @@ pub(crate) mod device {
         assert_eq!(own_weights(&mut successor), own_bytes);
     }
 
+    /// Whether `transfer`'s listing names `link` with a bandwidth.
+    fn lists(transfer: &::storage::protocol::TransferListing, link: &Link) -> bool {
+        transfer
+            .links
+            .iter()
+            .any(|measured| measured.link == *link && measured.bytes_per_second > 0)
+    }
+
     #[test]
     #[ignore = "requires a CUDA device"]
-    fn a_transfer_copies_within_a_gpu_between_gpus_and_with_the_host() {
+    fn a_transfer_copies_within_a_gpu_and_with_the_host() {
         let server = serving(Gpus::Visible);
         let mut head = head(&server.socket);
         let claim = head
@@ -1364,7 +1462,7 @@ pub(crate) mod device {
             .unwrap();
         let mut worker = worker(&server.socket, scope("text", 0), 1, claim);
 
-        let first = DeviceId(0);
+        let [first] = gpus::<1>();
         let granularity = DeviceAllocation::granularity(first).unwrap();
         let half = granularity / 2;
         let source_bytes = pattern(granularity, 11);
@@ -1389,7 +1487,7 @@ pub(crate) mod device {
                 ],
             )
             .unwrap();
-        let mut spans = vec![
+        let spans = vec![
             // Within the GPU, host to GPU, and GPU to host.
             span(
                 tensor_region(1),
@@ -1407,25 +1505,6 @@ pub(crate) mod device {
                 half as u64,
             ),
         ];
-        // Between two GPUs, when the process sees two.
-        let peer = (DeviceId::count().unwrap() > 1).then(|| {
-            let second = DeviceId(1);
-            let (peer, peer_fd) = device_storage(second, &vec![0; granularity]);
-            worker
-                .put(
-                    vec![tensor(key(5), "peer", 0, 0, Access::Exclusive)],
-                    &[(record(second, granularity), peer_fd.as_fd())],
-                )
-                .unwrap();
-            spans.push(span(
-                tensor_region(1),
-                0,
-                tensor_region(5),
-                0,
-                granularity as u64,
-            ));
-            peer
-        });
         let bytes: u64 = spans.iter().map(|span| span.bytes).sum();
         let task = worker.copy(spans, Priority::Promotion, 1).unwrap();
         assert_eq!(end_of(&mut worker, task), (bytes, TaskStatus::Complete));
@@ -1434,61 +1513,32 @@ pub(crate) mod device {
         assert_eq!(&copied[..half], &host_source_bytes[..]);
         assert_eq!(&copied[half..], &source_bytes[..half]);
         assert_eq!(read(&host_destination, 0, half), &source_bytes[half..]);
-        if let Some(peer) = &peer {
-            assert_eq!(device_bytes(peer), source_bytes);
-        }
 
-        // The listing names every measured link and the device storage of
-        // the Transfer Server's context on each GPU.
+        // The listing names the GPU's calibrated links and the device storage
+        // of the Transfer Server's context on each GPU.
         let transfer = head.list().unwrap().transfer.unwrap();
-        let gpu = |device: DeviceId| LinkEnd::Device {
-            gpu: device.uuid().unwrap().0,
+        let gpu = LinkEnd::Device {
+            gpu: first.uuid().unwrap().0,
         };
-        let mut expected = vec![
-            (gpu(first), gpu(first)),
-            (LinkEnd::Host, gpu(first)),
-            (gpu(first), LinkEnd::Host),
-        ];
-        if peer.is_some() {
-            expected.push((gpu(first), gpu(DeviceId(1))));
-        }
-        for (source, destination) in expected {
+        for (source, destination) in [
+            (gpu.clone(), gpu.clone()),
+            (LinkEnd::Host, gpu.clone()),
+            (gpu.clone(), LinkEnd::Host),
+        ] {
             let link = Link {
                 source,
                 destination,
             };
-            assert!(
-                transfer
-                    .links
-                    .iter()
-                    .any(|measured| measured.link == link && measured.bytes_per_second > 0),
-                "{link:?} was not measured"
-            );
+            assert!(lists(&transfer, &link), "{link:?} is not listed");
         }
-        for measured in &transfer.links {
-            eprintln!(
-                "{:?} -> {:?}: {:.1} GB/s",
-                measured.link.source,
-                measured.link.destination,
-                measured.bytes_per_second as f64 / 1e9
-            );
-        }
-        assert_eq!(transfer.contexts.len(), DeviceId::count().unwrap() as usize);
-        for context in &transfer.contexts {
-            eprintln!(
-                "context on {}: {} MiB",
-                platform::DeviceUuid(context.gpu),
-                context.bytes >> 20
-            );
-            assert!(context.bytes > 0);
-        }
+        let shown = usize::try_from(DeviceId::count().unwrap()).unwrap();
+        assert_eq!(transfer.contexts.len(), shown);
+        assert!(transfer.contexts.iter().all(|context| context.bytes > 0));
     }
 
     #[test]
-    #[ignore = "requires a CUDA device whose allocations export fabric handles (IMEX)"]
-    fn a_fabric_region_is_copied_by_the_handle_its_creator_exported() {
-        let first = DeviceId(0);
-        assert_eq!(HandleType::probe(first).unwrap(), HandleType::Fabric);
+    #[ignore = "requires two CUDA devices whose copy engines address each other"]
+    fn a_transfer_copies_between_gpus() {
         let server = serving(Gpus::Visible);
         let mut head = head(&server.socket);
         let claim = head
@@ -1496,10 +1546,74 @@ pub(crate) mod device {
             .unwrap();
         let mut worker = worker(&server.socket, scope("text", 0), 1, claim);
 
-        // The destination lies on the last GPU this process sees, which
-        // imports the handle: a GPU other than the source's when there are
-        // two, as a GPU of another host of the fabric would.
-        let last = DeviceId(DeviceId::count().unwrap() - 1);
+        let [first, second] = gpus::<2>();
+        let granularity = DeviceAllocation::granularity(first).unwrap();
+        let source_bytes = pattern(granularity, 11);
+        let (_source, source_fd) = device_storage(first, &source_bytes);
+        let (peer, peer_fd) = device_storage(second, &vec![0; granularity]);
+        worker
+            .put(
+                vec![
+                    tensor(key(1), "weights", 0, 0, Access::ReadOnly),
+                    tensor(key(5), "peer", 1, 0, Access::Exclusive),
+                ],
+                &[
+                    (record(first, granularity), source_fd.as_fd()),
+                    (record(second, granularity), peer_fd.as_fd()),
+                ],
+            )
+            .unwrap();
+        let task = worker
+            .copy(
+                vec![span(
+                    tensor_region(1),
+                    0,
+                    tensor_region(5),
+                    0,
+                    granularity as u64,
+                )],
+                Priority::Promotion,
+                1,
+            )
+            .unwrap();
+        assert_eq!(
+            end_of(&mut worker, task),
+            (granularity as u64, TaskStatus::Complete)
+        );
+        assert_eq!(device_bytes(&peer), source_bytes);
+
+        let transfer = head.list().unwrap().transfer.unwrap();
+        let link = Link {
+            source: LinkEnd::Device {
+                gpu: first.uuid().unwrap().0,
+            },
+            destination: LinkEnd::Device {
+                gpu: second.uuid().unwrap().0,
+            },
+        };
+        assert!(lists(&transfer, &link), "{link:?} is not listed");
+    }
+
+    #[test]
+    #[ignore = "requires two CUDA devices whose allocations export fabric handles (IMEX)"]
+    fn a_fabric_region_is_copied_by_the_handle_its_creator_exported() {
+        let [first, last] = gpus::<2>();
+        assert_eq!(HandleType::probe(first).unwrap(), HandleType::Fabric);
+        let paths = Paths {
+            gpus: true,
+            fabric: true,
+            ..Paths::HOST
+        };
+        let server = Running::with_children(Some(transfer_child(calibration(paths))));
+        super::transfer_pid(&server.socket, None);
+        let mut head = head(&server.socket);
+        let claim = head
+            .claim(Claimant::Head, 0, vec![scope("text", 0)], Vec::new())
+            .unwrap();
+        let mut worker = worker(&server.socket, scope("text", 0), 1, claim);
+
+        // The destination lies on a GPU other than the source's, which
+        // imports the handle, as a GPU of another host of the fabric would.
         let granularity = DeviceAllocation::granularity(first).unwrap();
         let (destination, destination_fd) = device_storage(last, &vec![0; granularity]);
         worker

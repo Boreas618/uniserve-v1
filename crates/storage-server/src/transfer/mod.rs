@@ -9,23 +9,26 @@
 //! pools) and copies between them: it knows nothing of models,
 //! configurations, requests or byte encodings.
 //!
-//! When it starts it measures the bandwidth of every link (each GPU's own
-//! storage, each pair of GPUs, each GPU to and from host storage, and host
-//! storage to itself) and the device storage its context takes on each GPU
-//! ([`devices`]), then releases its contexts, connects as
-//! [`Role::Transfer`] and reports both ([`Request::Measured`]). It holds a
-//! GPU's context again only while it has work on the GPU, reserved in the
-//! GPU's quotas at the measured bytes meanwhile ([`contexts`]). It
-//! then runs the server's tasks
-//! ([`Event::Task`]): every move goes to the copy thread of its link and of
-//! what runs its copies ([`copy threads`]), by path:
+//! It copies by its host's calibration ([`calibration`]), which the
+//! calibration step measured and the server gives it: the GPUs it copies on,
+//! the bandwidth and per-copy cost of every link (each GPU's own storage, each
+//! pair of GPUs, each GPU to and from host storage, and host storage to
+//! itself), the device storage its context takes on each GPU, and the rate of
+//! copies from other hosts. When it starts it finds the calibrated GPUs among
+//! those the driver shows ([`devices`]), connects as [`Role::Transfer`] and
+//! reports the links and the contexts ([`Request::Measured`]); it creates no
+//! context to start. It holds a GPU's context only while it has work on the
+//! GPU, reserved in the GPU's quotas at the calibrated bytes meanwhile
+//! ([`contexts`]). It runs the server's tasks ([`Event::Task`]): every move
+//! goes to the copy thread of its link and of what runs its copies ([`copy
+//! threads`]), by path:
 //!
 //! | Source → destination | Runs on |
 //! | --- | --- |
 //! | one GPU's storage → the same GPU | that GPU's copy engines |
 //! | GPU → another GPU of the host | the destination's copy engines, reading over the GPUs' link |
 //! | host → GPU, GPU → host | the GPU's copy engines, with the host storage registered |
-//! | another host's GPU of the NVLink fabric ↔ this host | the local GPU's copy engines (the first GPU's for host storage), with the fabric handle imported |
+//! | another host's GPU of the NVLink fabric ↔ this host | the local GPU's copy engines (for host storage, those of the GPU nearest the storage's NUMA node with the fastest calibrated link to it), with the fabric handle imported |
 //! | host → host | the CPU |
 //! | another host's GPU or host storage → this host | NIXL READs this host's agent posts, through the network adapters ([`network`]) |
 //!
@@ -33,9 +36,9 @@
 //! only, so the epoch executing beside them keeps its compute units. A
 //! same-GPU read-only mapping instead of a copy is the worker's own (it
 //! maps the storage from the server). A link from another host has a copy thread
-//! of its own, measured by its first copies long enough to time and then
-//! reported ([`Request::Measured`]), with the chunks, priorities and
-//! budget of every copy thread.
+//! of its own at the calibrated rate of copies from another host into its
+//! destination, reported when it first copies ([`Request::Measured`]), with
+//! the chunks, priorities and budget of every copy thread.
 //!
 //! The same agent serves other hosts' READs of this host's storage: the
 //! server has it register the allocations a peer asks to expose
@@ -56,10 +59,11 @@
 //! descriptor keeps the storage, and the server gives it back for the copy.
 //!
 //! It reports each task's progress and end ([`Request::Copied`]) only
-//! after the host saw the copies complete (an event its copy thread queried, or a
+//! after the host saw the copies complete (an event its copy thread waited for, or a
 //! READ it polled), so no CUDA event crosses a process. It ends when the
 //! server closes its connection.
 
+pub mod calibration;
 mod contexts;
 mod devices;
 mod network;
@@ -75,18 +79,19 @@ use std::time::Duration;
 
 use ::storage::client::Client;
 use ::storage::protocol::{
-    Allocation, ContextBytes, Event, Item, Link, LinkEnd, Move, Priority, Registration, Request,
-    Response, Role, TaskFailure, TaskStatus,
+    Allocation, Event, Item, Link, LinkEnd, Move, Priority, Registration, Request, Response, Role,
+    TaskFailure, TaskStatus,
 };
 use ::storage::settings::Transports;
 use platform::DeviceId;
 use rustix::event::{PollFd, PollFlags, poll};
 
+pub use calibration::Calibration;
 use contexts::{Contexts, GpuContext, Hold, Reservation, Reservations};
 use devices::Gpus;
 use network::{Exposed, Inbound, Lease, Network, Sources};
 use storage::{Fabric, Mapping};
-use threads::{CopyThreads, End, Piece, Runner, ThreadKey};
+use threads::{CopyThreads, End, Piece, Policy, Runner, ThreadKey};
 
 /// How the Transfer Server copies: what its server tells it when it starts it.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -96,34 +101,44 @@ pub struct Options {
     /// copies, so a copy engine turns to that epoch's copies, and to
     /// higher-priority tasks, between chunks.
     pub chunk: Duration,
+    /// How often a running task reports its progress at most.
+    pub progress: Duration,
     /// Whether the server serves other hosts (it accepts them on a TCP endpoint), whose READs
     /// of this host need the NIXL agent from the start.
     pub serves_peers: bool,
     /// The transports the NIXL agent takes between hosts.
     pub transports: Transports,
-    /// Whether to copy on the host's GPUs: the CUDA driver must load then, and every GPU it
-    /// shows is used (none when it shows none); otherwise only host storage is copied, and no
-    /// driver is loaded.
-    pub gpus: bool,
+    /// The host's calibration: the GPUs to copy on (the CUDA driver loads only when it states
+    /// one), and the cost of every path.
+    pub calibration: Calibration,
+}
+
+impl Options {
+    /// The options of a server serving with `settings` and the host's `calibration`.
+    pub fn of(settings: &::storage::ServerSettings, calibration: Calibration) -> Self {
+        Self {
+            chunk: settings.transfer_chunk(),
+            progress: settings.transfer_progress(),
+            serves_peers: settings.tcp.is_some(),
+            transports: settings.nixl_transports,
+            calibration,
+        }
+    }
 }
 
 use crate::Error;
 
-/// Measure this host's links, say hello on `channel`, the connection its Storage Server made
+/// Find the calibrated GPUs, say hello on `channel`, the connection its Storage Server made
 /// for it, and run the server's tasks until it closes the connection.
 ///
 /// # Errors
 ///
-/// Fails when a GPU cannot be measured (it has no storage for the context
-/// or the measurement) or the server cannot be reached.
+/// Fails when the driver does not show a calibrated GPU or the server cannot be reached.
 pub fn run(channel: service::Connection, options: &Options) -> Result<(), Error> {
-    let gpus = Gpus::discover(options.gpus)?;
-    let (links, context_bytes) = devices::measure(&gpus)?;
-    let bandwidths = links
-        .iter()
-        .map(|measured| (measured.link.clone(), measured.bytes_per_second as f64))
-        .collect();
-    let reserved = reserved(&gpus, &context_bytes)?;
+    let calibration = Arc::new(options.calibration.clone());
+    let uuids: Vec<[u8; 16]> = calibration.gpus.iter().map(|context| context.gpu).collect();
+    let gpus = Gpus::of(&uuids)?;
+    let reserved = reserved(&gpus, &calibration)?;
 
     let mut client = Client::on_connection(channel, Role::Transfer)?;
     let (wake_reader, wake_writer) = rustix::pipe::pipe_with(
@@ -138,7 +153,7 @@ pub fn run(channel: service::Connection, options: &Options) -> Result<(), Error>
             sender: reservation_sender,
             wake: Arc::clone(&wake),
         },
-    ));
+    )?);
     let network = Arc::new(Network::new(options.transports));
     // A server that serves other hosts starts its agent now, beside the first tasks, so the first
     // READ from or of this host does not wait for UCX to come up (several seconds) inside a
@@ -155,15 +170,21 @@ pub fn run(channel: service::Connection, options: &Options) -> Result<(), Error>
             })?;
     }
     let (sender, finished) = mpsc::channel();
+    let policy = Policy {
+        chunk: options.chunk,
+        progress: options.progress,
+    };
+    let devices = gpus.iter().map(|gpu| (gpu.device, gpu.uuid)).collect();
     let mut server = TransferServer {
         gpus,
+        calibration: Arc::clone(&calibration),
         contexts: Arc::clone(&contexts),
         allocations: HashMap::new(),
         helpers: Helpers { sender, wake },
         threads: CopyThreads::new(
             wake_writer,
-            options.chunk,
-            bandwidths,
+            &policy,
+            (Arc::clone(&calibration), devices),
             Arc::clone(&network),
             contexts,
         ),
@@ -178,8 +199,8 @@ pub fn run(channel: service::Connection, options: &Options) -> Result<(), Error>
         replies: Vec::new(),
     };
     let measured = Request::Measured {
-        links,
-        contexts: context_bytes,
+        links: calibration.bandwidths(),
+        contexts: calibration.gpus.clone(),
     };
     server.send(&mut client, &measured)?;
     tracing::info!("the Transfer Server serves");
@@ -218,12 +239,12 @@ pub fn run(channel: service::Connection, options: &Options) -> Result<(), Error>
         while let Ok(reservation) = server.reservations.try_recv() {
             server.reserve(&mut client, reservation)?;
         }
-        // A copy thread reports a link it measured before the chunk that measured
-        // it completes, so the links taken after the reports include every
-        // link a reported task measured, and reach the server first: once
+        // A copy thread reports a link from another host when it starts, before
+        // any chunk of it completes, so the links taken after the reports include
+        // every link a reported task copied over, and reach the server first: once
         // a task's submitter learns it ended, the listing has its links.
         let reports = server.threads.reports();
-        let links = server.threads.measured();
+        let links = server.threads.remote_links();
         if !links.is_empty() {
             let measured = Request::Measured {
                 links,
@@ -246,25 +267,29 @@ pub fn run(channel: service::Connection, options: &Options) -> Result<(), Error>
     }
 }
 
-/// Each GPU as its context is reserved: the context's bytes as measured, and
-/// the GPU's total storage as NVML reports it.
-fn reserved(gpus: &Gpus, measured: &[ContextBytes]) -> Result<Vec<GpuContext>, Error> {
-    let identities: Vec<(DeviceId, [u8; 16])> = gpus.identities().collect();
-    if identities.is_empty() {
+/// Each GPU as its context is reserved: the context's bytes as `calibration`
+/// states them, and the GPU's total storage as NVML reports it.
+fn reserved(gpus: &Gpus, calibration: &Calibration) -> Result<Vec<GpuContext>, Error> {
+    if gpus.is_empty() {
         return Ok(Vec::new());
     }
     let nvml = platform::Nvml::init()?;
-    identities
-        .into_iter()
-        .map(|(device, uuid)| {
+    calibration
+        .gpus
+        .iter()
+        .map(|context| {
+            let gpu = gpus.by_uuid(context.gpu).ok_or_else(|| {
+                Error::Calibration(format!(
+                    "names GPU {}, which the Transfer Server does not copy on",
+                    platform::DeviceUuid(context.gpu)
+                ))
+            })?;
             Ok(GpuContext {
-                device,
-                uuid,
-                total: nvml.memory_info(device)?.total,
-                context: measured
-                    .iter()
-                    .find(|context| context.gpu == uuid)
-                    .map_or(0, |context| context.bytes),
+                device: gpu.device,
+                uuid: gpu.uuid,
+                total: nvml.memory_info(gpu.device)?.total,
+                context: context.bytes,
+                read_only_registration: gpu.read_only_registration,
             })
         })
         .collect()
@@ -333,6 +358,8 @@ type TaskHolds = HashMap<DeviceId, Hold>;
 /// The Transfer Server's state on its main thread.
 struct TransferServer {
     gpus: Gpus,
+    /// The host's calibration, which ranks the GPUs that may run a copy.
+    calibration: Arc<Calibration>,
     /// The GPUs' contexts, held while work needs them.
     contexts: Arc<Contexts>,
     /// The allocations the server gave, until it takes them back.
@@ -463,10 +490,7 @@ impl TransferServer {
             Event::Session { session, gpus } => {
                 if gpus.is_empty() {
                     if let Some(holds) = self.sessions.remove(&session) {
-                        self.helpers.spawn(move || {
-                            drop(holds);
-                            None
-                        });
+                        self.contexts.release(holds);
                     }
                 } else {
                     #[expect(
@@ -518,12 +542,7 @@ impl TransferServer {
             } => self.allocate(request, gpu, bytes),
             Event::Deregister { request } => {
                 if let Some(holds) = self.exposures.remove(&request) {
-                    // The last hold of a GPU releases its context, which
-                    // waits for the driver: on a helper.
-                    self.helpers.spawn(move || {
-                        drop(holds);
-                        None
-                    });
+                    self.contexts.release(holds);
                 }
             }
             Event::TaskProgress { .. }
@@ -745,10 +764,7 @@ impl TransferServer {
                     }
                     Err(message) => {
                         tracing::warn!(message, "registering storage for another host failed");
-                        self.helpers.spawn(move || {
-                            drop(holds);
-                            None
-                        });
+                        self.contexts.release(holds);
                         Request::Registered {
                             request,
                             metadata: Vec::new(),
@@ -789,6 +805,11 @@ impl TransferServer {
             destination: destination.end(),
         };
         let runner = self.runner(&source, &destination)?;
+        // Another host's GPU of the fabric is copied over the fabric.
+        let path = [&source, &destination]
+            .into_iter()
+            .any(|side| matches!(side, Side::Fabric { .. }))
+            .then_some(calibration::RemotePath::Fabric);
         let piece = Piece {
             task,
             source: self.end(&source, runner, imports, holds)?,
@@ -800,7 +821,7 @@ impl TransferServer {
             source_pitch: copy.source_pitch,
             destination_pitch: copy.destination_pitch,
         };
-        Ok((ThreadKey { link, runner }, piece))
+        Ok((ThreadKey { link, runner, path }, piece))
     }
 
     /// A piece's end on `runner`, holding the GPU whose context reaches it:
@@ -872,8 +893,9 @@ impl TransferServer {
 
     /// What runs a copy from `source` to `destination`: the copy engines of
     /// the destination's GPU, else of the source's, else (between host
-    /// storage and another host's GPU) of this host's first GPU; the CPU
-    /// between host buffers. The runner's copy engines must address both.
+    /// storage and another host's GPU) of this host's GPU nearest the host
+    /// storage ([`TransferServer::nearest`]); the CPU between host buffers.
+    /// The runner's copy engines must address both.
     fn runner(&self, source: &Side, destination: &Side) -> Result<Runner, String> {
         let local = |side: &Side| match side {
             Side::Given(mapped) if matches!(mapped.end, LinkEnd::Device { .. }) => {
@@ -884,12 +906,7 @@ impl TransferServer {
         let runner = match (local(destination)?, local(source)?) {
             (Some(device), _) | (None, Some(device)) => Runner::Device(device),
             (None, None) if source.is_host() && destination.is_host() => Runner::Host,
-            (None, None) => Runner::Device(
-                self.gpus
-                    .first()
-                    .ok_or("this host has no GPU to import another host's storage on")?
-                    .device,
-            ),
+            (None, None) => Runner::Device(self.nearest(source, destination)?),
         };
         if let Runner::Device(device) = runner {
             for side in [source, destination] {
@@ -909,6 +926,59 @@ impl TransferServer {
             }
         }
         Ok(runner)
+    }
+}
+
+impl TransferServer {
+    /// The GPU that copies between host storage and another host's GPU of the
+    /// fabric (one of `source` and `destination` each): of the GPUs on the host
+    /// storage's NUMA node, or of every GPU when none is, the one whose
+    /// calibrated link with host storage, in the copy's direction, is fastest.
+    fn nearest(&self, source: &Side, destination: &Side) -> Result<DeviceId, String> {
+        // Whether the bytes flow from host storage into the GPU, or from the GPU into it.
+        let (host, from_host) = match (source, destination) {
+            (Side::Given(mapped), Side::Fabric { .. }) => (mapped, true),
+            (Side::Fabric { .. }, Side::Given(mapped)) => (mapped, false),
+            _ => {
+                return Err("a copy between host storage and another host's GPU names both".into());
+            }
+        };
+        let node = host.numa_node()?;
+        let rank = |gpu: &devices::Gpu| {
+            let device = LinkEnd::Device { gpu: gpu.uuid };
+            let link = if from_host {
+                Link {
+                    source: LinkEnd::Host,
+                    destination: device,
+                }
+            } else {
+                Link {
+                    source: device,
+                    destination: LinkEnd::Host,
+                }
+            };
+            let cost = self.calibration.link(&link).ok_or_else(|| {
+                format!(
+                    "the host's calibration states no link from {} to {}",
+                    storage_name(&link.source),
+                    storage_name(&link.destination)
+                )
+            })?;
+            Ok((
+                (gpu.numa_node == Some(node), cost.bytes_per_second),
+                gpu.device,
+            ))
+        };
+        let ranked = self
+            .gpus
+            .iter()
+            .map(rank)
+            .collect::<Result<Vec<_>, String>>()?;
+        ranked
+            .into_iter()
+            .max_by_key(|(rank, _)| *rank)
+            .map(|(_, device)| device)
+            .ok_or_else(|| "this host has no GPU to import another host's storage on".into())
     }
 }
 

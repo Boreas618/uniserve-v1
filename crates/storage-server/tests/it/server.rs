@@ -12,7 +12,6 @@ use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Duration;
 
 use ::storage::protocol::{ClientMessage, ErrorKind, Hello, Item, ServerMessage, Welcome};
 use ::storage::{
@@ -28,18 +27,17 @@ pub(crate) fn helper() -> Program {
     Program::open(path, vec!["--log-level".into(), "warn".into()]).unwrap()
 }
 
-/// The Transfer Server a test's server runs from the helper: chunks of a millisecond, on the
-/// host's GPUs when `gpus` is set and on host storage alone otherwise.
-pub(crate) fn transfer_child(gpus: bool) -> Children {
+/// The Transfer Server a test's server runs from the helper, with the default settings' options
+/// and `calibration`, which states the GPUs it copies on.
+pub(crate) fn transfer_child(calibration: storage_server::transfer::Calibration) -> Children {
+    let settings = ::storage::ServerSettings::default();
     Children {
         program: helper(),
         connector: None,
-        transfer: Some(storage_server::transfer::Options {
-            chunk: Duration::from_millis(1),
-            serves_peers: false,
-            transports: ::storage::ServerSettings::default().nixl_transports,
-            gpus,
-        }),
+        transfer: Some(storage_server::transfer::Options::of(
+            &settings,
+            calibration,
+        )),
     }
 }
 

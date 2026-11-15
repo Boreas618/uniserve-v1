@@ -12,9 +12,14 @@
 //! names a descriptor the record is written to instead. The server runs its
 //! children from this executable's image (`crate::child`): with a connector in
 //! its settings the Mooncake connector, which keeps the pages of the buffer
-//! pools' host regions in Mooncake (L3), and always its Transfer Server, which
-//! copies between the storage it holds. Each is this command's hidden `child`
-//! entry, which reads which child it is from the channel the server made.
+//! pools' host regions in Mooncake (L3), and with a transfer calibration in its
+//! settings its Transfer Server, which copies between the storage it holds.
+//! Each is this command's hidden `child` entry, which reads which child it is
+//! from the channel the server made.
+//!
+//! `calibrate` times this host's copy paths and writes the calibration the
+//! Transfer Server copies by (`crate::transfer::calibration`), which the
+//! settings name (`transfer_calibration`).
 //!
 //! `status` prints the running server's readiness record (its endpoints and
 //! settings), `stop` stops it and returns once it ended, `list` prints what it
@@ -82,6 +87,8 @@ pub enum Command {
         #[arg(long = CHANNEL_OPTION, value_name = "FD")]
         channel: RawFd,
     },
+    /// Time this host's copy paths and write the calibration the Transfer Server copies by.
+    Calibrate(crate::transfer::calibration::measure::Arguments),
     /// Print the running server's readiness record: its endpoints and the
     /// settings it serves with, one JSON line.
     Status {
@@ -211,6 +218,7 @@ pub fn run(args: Args, levels: &service::logging::Levels) -> anyhow::Result<()> 
             let channel = unsafe { OwnedFd::from_raw_fd(channel) };
             crate::child::run(channel, levels)
         }
+        Command::Calibrate(arguments) => crate::transfer::calibration::measure::run(&arguments),
         Command::Status { socket } => {
             let socket = socket_or_default(socket)?;
             let readiness = ::storage::Client::connect(&socket, ::storage::Role::Operator)

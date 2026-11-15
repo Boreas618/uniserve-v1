@@ -69,6 +69,9 @@ pub(super) struct Mapping {
     /// registers is unmapped: fields drop in declaration order.
     nixl: Once<nixl::Registration>,
     host: Once<HostMap>,
+    /// The host NUMA node a host allocation's first page lies on, found at
+    /// its first use.
+    node: Once<u32>,
     /// The allocation's POSIX handle or memfd. Declared last: every
     /// mapping holds its own reference, so the descriptor only needs to
     /// outlive their creation.
@@ -99,6 +102,7 @@ impl Mapping {
             contexts,
             nixl: OnceLock::new(),
             host: OnceLock::new(),
+            node: OnceLock::new(),
             descriptor,
         }
     }
@@ -152,6 +156,48 @@ impl Mapping {
                 .map_err(|error| format!("mapping host storage: {error}"))
         });
         host.as_ref().map(HostMap::address).map_err(Clone::clone)
+    }
+
+    /// The host NUMA node a host allocation lies on: the node of its first
+    /// page, as the kernel places it under the allocation's memory policy. The
+    /// page is touched first, so a page no copy wrote yet is placed now.
+    pub(super) fn numa_node(&self) -> Result<u32, String> {
+        let address = self.host_address()?;
+        let node = self.node.get_or_init(|| {
+            let page = address as *mut std::ffi::c_void;
+            // SAFETY: the mapping holds at least one readable byte at its
+            // first address; reading it faults the page in.
+            let _ = unsafe { std::ptr::read_volatile(page.cast::<u8>()) };
+            let mut status: libc::c_int = 0;
+            let pages = [page];
+            // SAFETY: `move_pages` of this process (pid 0) with no target
+            // nodes moves nothing and writes the node of each of the one
+            // page into `status`.
+            let queried = unsafe {
+                libc::syscall(
+                    libc::SYS_move_pages,
+                    0,
+                    1_u64,
+                    pages.as_ptr(),
+                    std::ptr::null::<libc::c_int>(),
+                    &mut status,
+                    0,
+                )
+            };
+            if queried != 0 {
+                return Err(format!(
+                    "finding the NUMA node of host storage: {}",
+                    io::Error::last_os_error()
+                ));
+            }
+            u32::try_from(status).map_err(|_| {
+                format!(
+                    "finding the NUMA node of host storage: {}",
+                    io::Error::from_raw_os_error(-status)
+                )
+            })
+        });
+        node.clone()
     }
 
     /// A host allocation as NIXL names it, registered with `agent` at the

@@ -320,8 +320,8 @@ pub struct Request {
     /// The GPUs the target epoch's ranks may take, at least one per rank.
     pub gpus: Vec<Gpu>,
     /// The bandwidth of every physical storage link, as the host's Transfer
-    /// Server measured it (the listing's `transfer.links`): when it started
-    /// for the links within its host, at their first use for the links from
+    /// Server reports it from its host's calibration (the listing's `transfer.links`): from
+    /// its start for the links within its host, from their first use for the links from
     /// another host's device or host storage (over the NVLink fabric, or READ). A copy within
     /// one GPU takes the link from it to itself, and every link a block may
     /// take must be measured.

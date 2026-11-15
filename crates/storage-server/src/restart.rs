@@ -733,7 +733,10 @@ impl Server {
         for (pid, index, gpus) in handoff.followed {
             shootdowns.follow(pid, pidfd(index)?, gpus);
         }
-        let children = program.map(|program| crate::Children::of(program, &handoff.settings));
+        let children = program
+            .map(|program| crate::Children::of(program, &handoff.settings))
+            .transpose()
+            .map_err(io::Error::other)?;
         let (program, connector, transfer) =
             crate::child::supervisors(children, &handoff.settings.server)?;
         let mut server = Self {

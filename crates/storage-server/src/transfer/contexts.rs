@@ -2,9 +2,9 @@
 //! the GPU, and reserved in the GPU's quotas only while held.
 //!
 //! A primary context takes device storage whether or not anything runs in it
-//! (hundreds of MiB on a GB200), and the Transfer Server runs on every host
-//! with a Storage Server, so it holds a context only for the work that needs
-//! one, as an update's preparation does:
+//! (the host's calibration states how much on each GPU), and the Transfer
+//! Server runs on every host with a Storage Server, so it holds a context only
+//! for the work that needs one, as an update's preparation does:
 //!
 //! - A [`Hold`] is a claim on one GPU, counted per GPU, and taking or
 //!   dropping one waits for no CUDA call and no quota. Every piece of a
@@ -29,7 +29,9 @@
 //!   the process waits for the driver calls it deferred (`platform::reclaim`),
 //!   so that the driver destroyed the context and NVML lists the process on
 //!   the GPU no more, and then the reservation ends. The next hold that uses the
-//!   GPU starts a new session.
+//!   GPU starts a new session. A release waits for the driver, so the main
+//!   thread hands the holds it ends to the contexts' release thread
+//!   ([`Contexts::release`]), which drops them in turn.
 //!
 //! The main thread, which holds the connection to the server, places the
 //! reservations ([`Reservations`]); a session starts on the thread that first uses
@@ -52,14 +54,15 @@ use super::storage::{HostMap, Mapping};
 /// A value made once, or why it could not be made.
 type Once<T> = OnceLock<Result<T, String>>;
 
-/// One GPU as its context is reserved: its device, UUID and total storage, and
-/// the bytes its context takes, as the Transfer Server measured them when
-/// it started.
+/// One GPU as its context is reserved: its device, UUID and total storage, the
+/// bytes its context takes, as the host's calibration states them, and whether
+/// it registers host storage for reads alone.
 pub(super) struct GpuContext {
     pub(super) device: DeviceId,
     pub(super) uuid: [u8; 16],
     pub(super) total: u64,
     pub(super) context: u64,
+    pub(super) read_only_registration: bool,
 }
 
 /// A change of a GPU's reservation the main thread places in the server's
@@ -91,17 +94,34 @@ impl Reservations {
     }
 }
 
-/// The GPUs' contexts, one slot per GPU the process sees.
+/// The GPUs' contexts, one slot per GPU the process copies on.
 pub(super) struct Contexts {
     slots: Vec<Arc<Slot>>,
+    /// The queue of the release thread, which drops the holds the main thread
+    /// ends.
+    releases: mpsc::Sender<Vec<Hold>>,
 }
 
 impl Contexts {
     /// A slot for each of `gpus`, with no context held, reservation through
-    /// `reservations`.
-    pub(super) fn new(gpus: Vec<GpuContext>, reservations: Reservations) -> Self {
+    /// `reservations`, and the release thread.
+    ///
+    /// # Errors
+    ///
+    /// Fails when the release thread cannot start.
+    pub(super) fn new(gpus: Vec<GpuContext>, reservations: Reservations) -> std::io::Result<Self> {
         let reservations = Arc::new(reservations);
-        Self {
+        let (releases, released) = mpsc::channel::<Vec<Hold>>();
+        // The thread ends when the contexts, and with them the queue's sender, drop.
+        std::thread::Builder::new()
+            .name("uniserve-transfer-release".into())
+            .spawn(move || {
+                for holds in released {
+                    drop(holds);
+                }
+            })?;
+        Ok(Self {
+            releases,
             slots: gpus
                 .into_iter()
                 .map(|gpu| {
@@ -117,6 +137,17 @@ impl Contexts {
                     })
                 })
                 .collect(),
+        })
+    }
+
+    /// End `holds` on the release thread: the last hold of a GPU releases its
+    /// context, which waits for the driver, and the thread that ends them
+    /// waits for no release.
+    pub(super) fn release(&self, holds: Vec<Hold>) {
+        if let Err(mpsc::SendError(holds)) = self.releases.send(holds) {
+            // The release thread ends only with the contexts, which `self`
+            // still holds.
+            drop(holds);
         }
     }
 
@@ -239,6 +270,7 @@ impl Slot {
         );
         Ok(Arc::new(Session {
             device: self.gpu.device,
+            read_only_registration: self.gpu.read_only_registration,
             live: Mutex::new(Some(Live {
                 nixl: HashMap::new(),
                 host: HashMap::new(),
@@ -324,6 +356,8 @@ impl Hold {
 /// it, by the id of the allocation it was made for.
 pub(super) struct Session {
     device: DeviceId,
+    /// Whether the GPU registers host storage for reads alone.
+    read_only_registration: bool,
     /// `None` once the session closed.
     live: Mutex<Option<Live>>,
 }
@@ -398,12 +432,12 @@ impl Session {
     /// The address of byte 0 of `mapped`, host storage, in this GPU's own
     /// mapping of it, registered so that the GPU's copy engines reach it.
     ///
-    /// A read-only allocation registers for reads alone where the device
-    /// supports it. A device that does not (GB200 reports
-    /// `ReadOnlyHostRegisterSupported` 0 and refuses the flag) registers its
-    /// read-only mapping as a plain registration. Either way the Transfer
-    /// Server only reads a read-only allocation: the server refuses it as a
-    /// destination.
+    /// A read-only allocation registers for reads alone on a GPU that
+    /// supports it, and as a plain registration of its read-only mapping on
+    /// one that does not, which refuses the read-only flag
+    /// ([`super::devices::Gpu::read_only_registration`]). Either way the
+    /// Transfer Server only reads a read-only allocation: the server refuses
+    /// it as a destination.
     pub(super) fn host_address(&self, mapped: &Mapping) -> Result<u64, String> {
         let entry = self.entry(
             |live| &mut live.host,
@@ -413,9 +447,7 @@ impl Session {
                 let map = HostMap::new(mapped.descriptor(), length, mapped.writable())
                     .map_err(|error| format!("mapping host storage: {error}"))?;
                 let pointer = map.address() as *mut u8;
-                let read_only = !mapped.writable()
-                    && HostRegistration::read_only_supported(self.device)
-                        .map_err(|error| format!("querying host registration: {error}"))?;
+                let read_only = !mapped.writable() && self.read_only_registration;
                 // SAFETY: `map` maps the whole range and is kept beside the
                 // registration, which is undone first.
                 let registered = unsafe {

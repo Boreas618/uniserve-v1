@@ -57,6 +57,7 @@ use ::storage::protocol::{FabricExport, Link, LinkEnd, Region, Registration, Tas
 use ::storage::settings::Transports;
 use platform::DeviceId;
 
+use super::calibration::RemotePath;
 use super::contexts::Hold;
 use super::nixl;
 use super::storage::{Fabric, Mapping};
@@ -330,6 +331,7 @@ impl Network {
                 ThreadKey {
                     link,
                     runner: Runner::Network,
+                    path: Some(RemotePath::Read),
                 },
                 read,
             ));
@@ -490,6 +492,7 @@ fn over_fabric(
                 destination: destination.end.clone(),
             },
             runner: Runner::Device(device),
+            path: Some(RemotePath::Fabric),
         },
         End::Fabric {
             import,
@@ -550,7 +553,7 @@ fn source_region(range: &Registration) -> Result<nixl::Region, String> {
 
 /// A name no other agent takes, on any host or across restarts: 128 bits from the kernel's
 /// random source.
-fn agent_name() -> std::io::Result<String> {
+pub(super) fn agent_name() -> std::io::Result<String> {
     let mut identity = [0_u8; 16];
     let filled = rustix::rand::getrandom(&mut identity, rustix::rand::GetRandomFlags::empty())?;
     if filled != identity.len() {

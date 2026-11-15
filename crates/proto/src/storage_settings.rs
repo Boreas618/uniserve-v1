@@ -18,19 +18,20 @@ impl From<&storage::Settings> for StorageSettings {
                 .map(ToString::to_string)
                 .unwrap_or_default(),
             host_reserve_gib: server.host_reserve_gib,
+            transfer_calibration: path(&server.transfer_calibration),
             transfer_chunk_us: server.transfer_chunk_us,
-            transfer_deadline_s: server.transfer_deadline_s,
-            put_deadline_s: server.put_deadline_s,
-            buffer_pool_trace: path(&server.buffer_pool_trace),
-            child_restart_s: server.child_restart_s,
-            child_restart_max_s: server.child_restart_max_s,
-            transfer_gpus: server.transfer_gpus,
-            shoot_down_s: server.shoot_down_s,
+            transfer_progress_ms: server.transfer_progress_ms,
             nixl_transports: match server.nixl_transports {
                 storage::settings::Transports::Selected => NixlTransports::Selected,
                 storage::settings::Transports::Rdma => NixlTransports::Rdma,
             }
             .into(),
+            transfer_deadline_s: server.transfer_deadline_s,
+            put_deadline_s: server.put_deadline_s,
+            buffer_pool_trace: path(&server.buffer_pool_trace),
+            child_restart_s: server.child_restart_s,
+            child_restart_max_s: server.child_restart_max_s,
+            shoot_down_s: server.shoot_down_s,
             connector: settings
                 .connector
                 .as_ref()
@@ -100,15 +101,16 @@ impl TryFrom<&StorageSettings> for storage::Settings {
             server: storage::ServerSettings {
                 tcp,
                 host_reserve_gib: message.host_reserve_gib,
+                transfer_calibration: path(&message.transfer_calibration),
                 transfer_chunk_us: message.transfer_chunk_us,
+                transfer_progress_ms: message.transfer_progress_ms,
+                nixl_transports,
                 transfer_deadline_s: message.transfer_deadline_s,
                 put_deadline_s: message.put_deadline_s,
                 buffer_pool_trace: path(&message.buffer_pool_trace),
                 child_restart_s: message.child_restart_s,
                 child_restart_max_s: message.child_restart_max_s,
-                transfer_gpus: message.transfer_gpus,
                 shoot_down_s: message.shoot_down_s,
-                nixl_transports,
             },
             connector,
         })
@@ -125,6 +127,7 @@ mod tests {
         let settings = storage::Settings {
             server: storage::ServerSettings {
                 tcp: Some("0.0.0.0:0".parse().unwrap()),
+                transfer_calibration: Some("transfer.json".into()),
                 nixl_transports: storage::settings::Transports::Rdma,
                 ..storage::ServerSettings::default()
             },

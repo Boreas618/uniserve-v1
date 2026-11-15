@@ -352,7 +352,10 @@ message StorageSettings {
   MooncakeConnector connector = 9;
   uint64 child_restart_s = 10;
   uint64 child_restart_max_s = 11;
-  bool transfer_gpus = 12;
+  reserved 12;
+  // The host's transfer calibration file; empty for none (no Transfer Server).
+  string transfer_calibration = 13;
+  uint64 transfer_progress_ms = 14;
   NixlTransports nixl_transports = 15;
   uint64 shoot_down_s = 16;
 }
