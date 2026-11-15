@@ -15,7 +15,6 @@
 //! names a key is answered from the buffer pool's own cache.
 
 use std::collections::HashSet;
-use std::num::NonZeroU32;
 use std::time::Instant;
 
 use proto::request::RequestId;
@@ -33,9 +32,6 @@ pub(super) const REMOTE: u8 = 4;
 /// The low watermark: blocks of each class a running request holds beyond its next call (SD
 /// §4.4).
 pub(super) const LOW_WATERMARK: u32 = 1;
-
-/// The tokens of a KV block when no group states the deployment's block size (BP §10).
-const BLOCK_TOKENS: u32 = 64;
 
 /// The bytes of a `Victims` record besides its keys (`storage::runtime`).
 const VICTIMS_RECORD: usize = 14;
@@ -975,14 +971,11 @@ impl Scheduler {
     /// taken from it, the blocks of `max_num_batched_tokens` tokens of the class's own block size
     /// and [`LOW_WATERMARK`] blocks per running request. A cache group's class (class `c` is
     /// cache group `c`) holds the block size its groups state for it; a sized class, whose blocks
-    /// hold no tokens, is counted in blocks of the deployment's block size.
+    /// hold no tokens, is counted in blocks of the deployment's block size
+    /// (`SchedulerConfig::block_tokens`).
     fn reserve(&self, region: usize) -> u32 {
         let tokens = u32::try_from(self.config.max_num_batched_tokens).unwrap_or(u32::MAX);
-        let stated = self
-            .groups
-            .iter()
-            .find_map(|group| group.capacity.kv_cache.as_ref()?.block_size);
-        let deployment = stated.map_or(BLOCK_TOKENS, NonZeroU32::get);
+        let deployment = self.config.block_tokens;
         let running = u32::try_from(self.running.len()).unwrap_or(u32::MAX);
 
         let reserve = self.classes_in(region).map(|class| {

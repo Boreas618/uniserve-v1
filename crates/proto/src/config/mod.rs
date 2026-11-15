@@ -83,6 +83,32 @@ pub struct LoadConfig {
     pub weights: Option<String>,
 }
 
+/// Tokens per KV page when a deployment states no `kv_cache_config.block_size`: the largest page
+/// the paged-attention packages read, which keeps a request's page table narrowest. A block of the
+/// buffer pool's KV classes is one page (`specs/buffer-pool.md` §6).
+pub const DEFAULT_BLOCK_SIZE: u32 = 64;
+
+/// The host KV cache's tokens per device KV cache token when a deployment states neither
+/// `kv_cache_config.host_ratio` nor `host_gib`: a ratio, SGLang's `--hicache-ratio` default, so
+/// a prefix the device cache evicted is found on the host for as long again as the device held
+/// it.
+pub const DEFAULT_HOST_RATIO: f64 = 2.0;
+
+/// The bytes of a recurrent state region beyond its per-slot floor per byte of the KV planes when
+/// a deployment states no `kv_cache_config.state_ratio`: one, an equal division, near SGLang's
+/// Mamba pool at its `mamba_full_memory_ratio` of 0.9, so neither a long prompt's pages nor the
+/// checkpoints its prefix reuse needs run out first.
+pub const DEFAULT_STATE_RATIO: f64 = 1.0;
+
+/// The host storage of one cache group's converted-load source buffer per rank, in MiB, when a
+/// deployment states no `kv_cache_config.conversion_buffer_mib`: a GiB, which holds a long
+/// prompt's dense pages of the widest row for the models served while keeping the host storage
+/// a group pins on every rank within a GiB.
+pub const DEFAULT_CONVERSION_BUFFER_MIB: NonZeroU64 = match NonZeroU64::new(1024) {
+    Some(mib) => mib,
+    None => NonZeroU64::MIN,
+};
+
 /// The KV cache (`kv_cache_config`).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -90,8 +116,8 @@ pub struct KvCacheConfig {
     /// Capacity in tokens; sized from storage when unset.
     pub max_tokens: Option<NonZeroU64>,
     /// Tokens per page of the cache group with the widest token rows, a
-    /// power of two; the largest size up to 64 the attention kernels read
-    /// when unset.
+    /// power of two the attention kernels read; [`DEFAULT_BLOCK_SIZE`] when
+    /// unset ([`KvCacheConfig::block_tokens`]).
     pub block_size: Option<NonZeroU32>,
     /// Element type (`float16`, `bfloat16`, `float32` or `float8_e4m3fn`);
     /// each layer's compute type when unset.
@@ -107,9 +133,9 @@ pub struct KvCacheConfig {
     /// The host KV cache's token count over the device KV cache's, the
     /// same on every rank of an epoch (as SGLang's `--hicache-ratio`); each
     /// host's Storage Server lowers it for the whole epoch to what four
-    /// fifths of its available storage hold. The engine's default (2.0)
-    /// when unset.
-    pub host_ratio: Option<f64>,
+    /// fifths of its available storage hold. [`DEFAULT_HOST_RATIO`] unless
+    /// stated.
+    pub host_ratio: f64,
     /// The deployment's host KV cache on each host, in GiB, over the ranks
     /// there, in place of `host_ratio` (as SGLang's `--hicache-size`).
     pub host_gib: Option<NonZeroU64>,
@@ -125,6 +151,11 @@ pub struct KvCacheConfig {
     /// keeps per request slot (a recurrent state); the engine's default
     /// when unset.
     pub state_interval: Option<NonZeroU32>,
+    /// For a model that keeps a recurrent state, the bytes of its state
+    /// region beyond one checkpoint per request slot over the bytes of the
+    /// KV planes, which divide what a rank's share leaves between them;
+    /// positive. [`DEFAULT_STATE_RATIO`] unless stated.
+    pub state_ratio: f64,
     /// The Storage Server endpoints (`host:port`) of other hosts serving the
     /// same model under the same served name, whose published host KV cache
     /// pages admission reads when they deepen a prompt's hit: the pages are
@@ -133,6 +164,14 @@ pub struct KvCacheConfig {
     /// the hosts rely on the isolation of their network. Applies with
     /// `host_tier`; none when empty.
     pub peers: Vec<String>,
+    /// The most host storage, in MiB, one cache group's converted-load
+    /// source buffer takes on each rank: the buffer a peer's pages of
+    /// another representation are read into before a load converts them
+    /// (an FP8 cache reading peers' dense pages). It holds one request's
+    /// pages of the widest row within this bound; a page it finds no slot
+    /// for is computed instead. [`DEFAULT_CONVERSION_BUFFER_MIB`] unless
+    /// stated.
+    pub conversion_buffer_mib: NonZeroU64,
 }
 
 impl Default for KvCacheConfig {
@@ -143,13 +182,22 @@ impl Default for KvCacheConfig {
             dtype: None,
             prefix_caching: true,
             host_tier: true,
-            host_ratio: None,
+            host_ratio: DEFAULT_HOST_RATIO,
             host_gib: None,
             mooncake: None,
             boundary_interval: None,
             state_interval: None,
+            state_ratio: DEFAULT_STATE_RATIO,
             peers: Vec::new(),
+            conversion_buffer_mib: DEFAULT_CONVERSION_BUFFER_MIB,
         }
+    }
+}
+
+impl KvCacheConfig {
+    /// The tokens one KV page holds: the stated `block_size`, or [`DEFAULT_BLOCK_SIZE`].
+    pub fn block_tokens(&self) -> u32 {
+        self.block_size.map_or(DEFAULT_BLOCK_SIZE, NonZeroU32::get)
     }
 }
 
@@ -215,6 +263,11 @@ pub struct SchedulerConfig {
     /// What the scheduling policy module runs within: the fuel of each call into it, and the
     /// bounds of the starvation timeout and the prefetch threshold its limits may declare.
     pub policy_budget: PolicyBudget,
+    /// The tokens of the deployment's KV page, resolved from `kv_cache_config.block_size`
+    /// ([`KvCacheConfig::block_tokens`]): the block a class whose blocks hold no tokens is counted
+    /// in.
+    #[serde(skip)]
+    pub block_tokens: u32,
 }
 
 /// The budget a scheduling policy module runs under (`scheduler_config.policy_budget`): the
@@ -290,6 +343,7 @@ impl Default for SchedulerConfig {
             draft_tokens: 0,
             graph_tiers: Vec::new(),
             policy_budget: PolicyBudget::default(),
+            block_tokens: DEFAULT_BLOCK_SIZE,
         }
     }
 }
@@ -323,6 +377,7 @@ impl SchedulerConfig {
             draft_tokens: engine.speculative.num_draft_tokens as usize,
             graph_tiers,
             policy_budget: engine.scheduler.policy_budget,
+            block_tokens: engine.kv_cache.block_tokens(),
         }
     }
 

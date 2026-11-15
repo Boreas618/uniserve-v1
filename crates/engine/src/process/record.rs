@@ -1,5 +1,5 @@
 //! A recorded start: the kernels a deployment's main process launches, read from the start a
-//! serving process makes, with nothing served (`uniserve packages`).
+//! serving process makes, with nothing served (`uniserve keys`).
 //!
 //! [`record`] takes the launch a serving main process is started with and runs the first half of
 //! each of its ranks' starts, to the runner's profile run, on the meta device

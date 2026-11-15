@@ -1516,12 +1516,13 @@ fn the_e1_deployment_starts_within_its_gpu_s_quota_at_a_fraction_of_0_70() {
     let scratch_set = crate::process::ranks::rank::memory::scratch_bytes(
         &text.config,
         service::lock(&text.cache).config(),
+        GB200_GRANULE,
     );
-    let shadow = peaks.shadow - scratch_set;
+    let shadow = peaks.shadow;
     let (graph, scratch) = crate::memory::division::pool_bytes(
         GB200_GRANULE,
         &[peaks.graph],
-        &[peaks.shadow],
+        &[peaks.shadow + scratch_set],
         layout.state_bytes(),
     );
 
@@ -2467,7 +2468,8 @@ fn an_fp8_cache_with_peers_states_the_source_region_of_the_dense_pages_it_conver
     let page_bytes = host::page_shape(&bf16, 0).unwrap().page_bytes;
     assert_eq!(source.tier, Tier::Host);
     assert_eq!(source.part_bytes, page_bytes);
-    assert_eq!(source.units, conversion::source_slots(page_bytes, 1));
+    let bound = proto::config::DEFAULT_CONVERSION_BUFFER_MIB.get() << 20;
+    assert_eq!(source.units, conversion::source_slots(page_bytes, 1, bound));
     let own = &converting.regions[usize::from(host)];
     assert_eq!(
         own.part_bytes,

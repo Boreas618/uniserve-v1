@@ -46,15 +46,13 @@ use crate::memory::host_pages::{self, HostPart};
 use crate::memory::lend;
 use crate::worker::{Error, Result};
 
-/// The most host bytes one group's source buffer holds.
-const SOURCE_BYTES: u64 = 1 << 30;
-
 /// The source pages of `page_bytes` one group's source buffer holds for a cache whose widest row
-/// holds `width` pages: one request's pages of that row, at most [`SOURCE_BYTES`] of them. The
-/// session states them as the units of the group's converted-load source region, whose parts
-/// are the ranks' buffers; a page the buffer pool finds no slot for is computed instead.
-pub(crate) fn source_slots(page_bytes: u64, width: u32) -> u32 {
-    (SOURCE_BYTES / page_bytes.max(1)).clamp(1, u64::from(width.max(1))) as u32
+/// holds `width` pages: one request's pages of that row, within `bound` bytes of host storage
+/// (`kv_cache_config.conversion_buffer_mib`), and at least one. The session states them as the
+/// units of the group's converted-load source region, whose parts are the ranks' buffers; a page
+/// the buffer pool finds no slot for is computed instead.
+pub(crate) fn source_slots(page_bytes: u64, width: u32, bound: u64) -> u32 {
+    (bound / page_bytes.max(1)).clamp(1, u64::from(width.max(1))) as u32
 }
 
 /// The two fields a page holds, in the page encoding's order.

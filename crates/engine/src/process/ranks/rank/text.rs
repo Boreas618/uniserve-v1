@@ -41,7 +41,6 @@ use proto::config::WorkerGroupRole;
 
 use super::ModelRunner;
 use super::buckets::served_phases;
-use super::memory::PAGE_TOKENS;
 
 /// The kernels a rank's runner and owners launch, as `(operator, key)`: what the engine resolves
 /// the rank's serving generation for.
@@ -71,7 +70,7 @@ impl ModelRunner {
     ) -> Result<CausalLmConfig> {
         let drafts = self.engine_config().speculative.num_draft_tokens;
         let scratch_pages = if model.state_layers().is_empty() {
-            CausalLmRunner::scratch_pages(&self.buckets, PAGE_TOKENS)
+            CausalLmRunner::scratch_pages(&self.buckets, self.page_tokens())
         } else {
             0
         };
@@ -98,7 +97,7 @@ impl ModelRunner {
             phases,
             buckets: self.buckets.clone(),
             slots: self.slots(),
-            page_size: PAGE_TOKENS,
+            page_size: self.page_tokens(),
             max_kv_len: self.engine_config().model.max_model_len,
             candidates: self.engine_config().max_logprobs,
             scratch_pages,

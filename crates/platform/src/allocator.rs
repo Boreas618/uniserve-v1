@@ -48,7 +48,11 @@ pub enum PoolKind {
 }
 
 impl PoolKind {
-    pub(crate) fn index(self) -> usize {
+    /// Every pool kind, each at its [`Self::index`].
+    pub const ALL: [Self; POOLS] = [Self::Graph, Self::Scratch, Self::Resident];
+
+    /// The kind's place in [`Self::ALL`], by which a table of one entry per pool is indexed.
+    pub const fn index(self) -> usize {
         match self {
             Self::Graph => 0,
             Self::Scratch => 1,
@@ -56,20 +60,19 @@ impl PoolKind {
         }
     }
 
-    /// The pool at `index` of [`Self::index`], for the allocator's fixed-size
-    /// table of pools.
-    pub(crate) fn from_index(index: usize) -> Option<Self> {
-        [Self::Graph, Self::Scratch, Self::Resident]
-            .get(index)
-            .copied()
-    }
-
-    pub(crate) fn name(self) -> &'static str {
+    /// The kind's name, as a usage report and an error name the pool.
+    pub const fn name(self) -> &'static str {
         match self {
             Self::Graph => "graph",
             Self::Scratch => "scratch",
             Self::Resident => "resident",
         }
+    }
+}
+
+impl fmt::Display for PoolKind {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.name())
     }
 }
 
@@ -358,6 +361,18 @@ impl Allocator {
         self.device.id()
     }
 
+    /// The extent in which every pool of an allocator of `device` maps a block, and to which it
+    /// rounds each allocation up: the recommended granularity of the descriptor handles its
+    /// blocks are exported by ([`Self::reserve`]). What a pool maps for a set of allocations is
+    /// known from it before the pool exists.
+    ///
+    /// # Errors
+    ///
+    /// When the driver states no granularity for the device.
+    pub fn granularity(device: DeviceId) -> Result<usize> {
+        VirtualPool::granularity(device, HandleType::Descriptor)
+    }
+
     /// Reserves `bytes` of virtual addresses for `pool`, rounded up to the
     /// allocation granularity; nothing is mapped and nothing is booked until
     /// the first allocation from the pool. Reserving a pool that already has a
@@ -541,7 +556,7 @@ impl Allocator {
     /// left partially promoted.
     pub fn restore(&mut self) -> Result<()> {
         let mut restored = [false; POOLS];
-        for index in 0..POOLS {
+        for (index, kind) in PoolKind::ALL.into_iter().enumerate() {
             // Only a pool that was parked can be a rollback candidate: a pool
             // that was live all along must not be parked by another pool's
             // failure.
@@ -554,7 +569,6 @@ impl Allocator {
             };
             let (was_parked, result) = outcome;
             if let Err(error) = result {
-                let kind = PoolKind::from_index(index).unwrap_or(PoolKind::Graph);
                 let mut rollback = Ok(());
                 for (other, was_restored) in restored.iter().enumerate() {
                     if !*was_restored {

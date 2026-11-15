@@ -103,21 +103,12 @@ impl VirtualPool {
         Self::with_handle_type(device, bytes, handle_type, Some(Booking { kind, budget }))
     }
 
-    fn with_handle_type(
-        device: DeviceId,
-        bytes: usize,
-        handle_type: HandleType,
-        booking: Option<Booking>,
-    ) -> Result<Self> {
+    /// The extent in which a pool of `handle_type` blocks on `device` maps each block: the
+    /// driver's recommended allocation granularity for those handles.
+    pub(crate) fn granularity(device: DeviceId, handle_type: HandleType) -> Result<usize> {
         let context = PrimaryContext::retain(device)?;
         let ordinal = device.handle()?;
-        let mut access = vec![ordinal];
-        for peer in (0..DeviceId::count()?).map(DeviceId) {
-            if peer != device && peer.can_access_peer(device)? {
-                access.push(peer.handle()?);
-            }
-        }
-        let (address, reserved, granularity) = in_context(context.raw(), |driver| {
+        in_context(context.raw(), |driver| {
             let properties = sys::CUmemAllocationProp::device(ordinal, handle_type.raw());
             let mut granularity = 0;
             driver.check(
@@ -132,10 +123,29 @@ impl VirtualPool {
                 },
                 "cuMemGetAllocationGranularity",
             )?;
-            let granularity = granularity.max(1);
+            Ok(granularity.max(1))
+        })
+    }
+
+    fn with_handle_type(
+        device: DeviceId,
+        bytes: usize,
+        handle_type: HandleType,
+        booking: Option<Booking>,
+    ) -> Result<Self> {
+        let context = PrimaryContext::retain(device)?;
+        let ordinal = device.handle()?;
+        let mut access = vec![ordinal];
+        for peer in (0..DeviceId::count()?).map(DeviceId) {
+            if peer != device && peer.can_access_peer(device)? {
+                access.push(peer.handle()?);
+            }
+        }
+        let granularity = Self::granularity(device, handle_type)?;
+        let (address, reserved) = in_context(context.raw(), |driver| {
             let reserved = bytes.max(1).next_multiple_of(granularity);
             let address = reserve_addresses(driver, reserved, granularity)?;
-            Ok((address, reserved, granularity))
+            Ok((address, reserved))
         })?;
         Ok(Self {
             context,

@@ -21,27 +21,21 @@ use platform::{Buffer, CopyBatch, DeviceId, PoolKind, SourceOrder, Stream, memse
 use tensor::{DType, Tensor};
 
 use super::layout::{CacheLayout, GroupLayout};
-use super::planes::Planes;
+use super::planes::{Planes, UNIT_SCALE};
 use crate::memory::lend;
 use crate::worker::{Error, Result};
-
-/// The smallest extent the device's pools map, which every allocation of a set rounds up to.
-const SCRATCH_GRANULARITY: u64 = 2 << 20;
-
-/// The bit pattern of `1.0f32`, the neutral FP8 scale.
-const UNIT_SCALE: u32 = 0x3F80_0000;
 
 /// The bytes of the scratch pool a set of `pages` pages takes for a cache of `layout` whose
 /// pooled tables are `width` pages wide: both value planes, the flags of each field, the scales
 /// of each for an FP8 cache and the index keys of a cache that keeps them, over every column,
-/// and the set's page table, each allocation rounded up to the pool's granularity. Zero for a
-/// set of no pages.
-pub(crate) fn bytes(layout: &CacheLayout, pages: u32, width: u32) -> u64 {
+/// and the set's page table, each allocation rounded up to `granularity`, the extent the
+/// device's pools map (`platform::Allocator::granularity`). Zero for a set of no pages.
+pub(crate) fn bytes(layout: &CacheLayout, pages: u32, width: u32, granularity: u64) -> u64 {
     if pages == 0 {
         return 0;
     }
     let cells = u64::from(pages) * u64::from(layout.columns.max(1));
-    let taken = |bytes: u64| bytes.next_multiple_of(SCRATCH_GRANULARITY);
+    let taken = |bytes: u64| bytes.next_multiple_of(granularity.max(1));
 
     let mut total = 2 * taken(cells * layout.plane_bytes) + 2 * taken(cells);
     if layout.quantized {
@@ -466,13 +460,18 @@ mod tests {
     fn a_set_takes_its_pages_over_every_column_and_its_table() {
         let layout = CacheLayout::dense(64, 48, 4, 128, PrefixCacheDtype::BFloat16);
         let cells = 384 * 48;
-        let granules = |bytes: u64| bytes.next_multiple_of(SCRATCH_GRANULARITY);
+        // The extent the pools of a device map in, which a test states.
+        let granularity = 2 << 20;
+        let granules = |bytes: u64| bytes.next_multiple_of(granularity);
 
         let values = 2 * granules(cells * 65_536);
         let flags = 2 * granules(cells);
         let table = granules(384 * 384 * 4);
-        assert_eq!(bytes(&layout, 384, 640), values + flags + table);
-        assert_eq!(bytes(&layout, 0, 640), 0);
+        assert_eq!(
+            bytes(&layout, 384, 640, granularity),
+            values + flags + table
+        );
+        assert_eq!(bytes(&layout, 0, 640, granularity), 0);
 
         // Index keys of 128 elements per four tokens add sixteen BF16 keys to every cell, in
         // an allocation of their own; a pooled table narrower than the set narrows its table.
@@ -484,7 +483,10 @@ mod tests {
             .expect("index keys a page holds");
         let keys = granules(cells * 16 * 128 * 2);
         let table = granules(384 * 256 * 4);
-        assert_eq!(bytes(&keyed, 384, 256), values + flags + keys + table);
+        assert_eq!(
+            bytes(&keyed, 384, 256, granularity),
+            values + flags + keys + table
+        );
     }
 
     /// A set's planes have the cache's page shape and element type over the set's pages, so a

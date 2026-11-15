@@ -60,8 +60,9 @@ const SCALES: [&str; 2] = ["prefix_cache.key.scale", "prefix_cache.value.scale"]
 /// The index-key storage's name.
 const INDEX_KEYS: &str = "prefix_cache.index_key.values";
 
-/// The bit pattern of `1.0f32`, the neutral FP8 scale.
-const UNIT_SCALE: u32 = 0x3F80_0000;
+/// The neutral FP8 scale, `1.0f32`, as the bits a 32-bit fill writes: what every scale of a new
+/// unit of the planes and of a scratch page set holds.
+pub(super) const UNIT_SCALE: u32 = 1.0_f32.to_bits();
 
 /// The consecutive runs of `units`, as `(first, count)` in ascending order, each unit once.
 pub(crate) fn unit_runs(units: &[u32]) -> Vec<(u32, u32)> {

@@ -100,7 +100,7 @@ use storage::runtime::{Class, Group, GroupId, Open, Opened, Region, Segments, Ti
 use self::rank::{Collective, ModelRunner, RankModel, Weights, media_tasks, parallel_order};
 use crate::process::binding::{self, Served};
 use crate::process::ranks::rank::memory::{
-    PAGE_TOKENS, Peaks, fewest_states, fewest_units, granularity, plane_segments, scratch_bytes,
+    Peaks, fewest_states, fewest_units, granularity, plane_segments,
 };
 use crate::process::ranks::rank::text::{
     Keys, encoder_class, encodes, feature_tensors, keys, profile, vision_runner,
@@ -126,10 +126,6 @@ pub(crate) type Resolve<'a> = dyn Fn(DeviceId, &Keys) -> Result<Vec<KernelEntry>
 /// spawned: what each member's join hook submits join batches to. Weak, because each member's
 /// runner holds its hook and its worker holds its runner: the epoch's close owns the workers.
 type Members = Arc<OnceLock<Vec<Weak<Worker>>>>;
-
-/// The host KV cache's token count over the device KV cache's when `kv_cache_config.host_ratio`
-/// is unset (SGLang's `--hicache-ratio` default).
-const HOST_RATIO: f64 = 2.0;
 
 /// What the layout states of a sample a trajectory holds on a rank of a denoising group: the
 /// whole video and audio latents on every rank, since a step gathers the velocity to every rank
@@ -637,8 +633,7 @@ fn load_rank(
     let graphs = crate::runner::Runner::graphs(&profiled);
     let peaks = Peaks {
         graph: graphs.peak(),
-        shadow: graphs.shadow_peak(CausalLmRunner::cache_writes(&meta_config, &layout))
-            + scratch_bytes(&meta_config, service::lock(&meta_cache).config()),
+        shadow: graphs.shadow_peak(CausalLmRunner::cache_writes(&meta_config, &layout)),
         inputs: graphs.input_peak(),
     };
     drop(profiled);
@@ -729,7 +724,11 @@ fn load_rank(
     // Steps 11-15: the division of the GPU's quota into the pools, the request slots and the
     // cache's units; on a rank that encodes images, also its vision runner's region, its region
     // of encoder outputs and its causal runner's feature buffer.
-    let (graph, scratch) = model_runner.pools(device, &layout, &runner_peaks(peaks, vision))?;
+    let (graph, scratch) = model_runner.pools(
+        device,
+        (&meta_config, service::lock(&meta_cache).config()),
+        &runner_peaks(peaks, vision),
+    )?;
     let mut regions = vec![("graph pool", graph), ("scratch pool", scratch)];
     if vision.is_some() {
         regions.push(("buffer pool", encoder_bytes(model.as_ref(), images)?));
@@ -1427,7 +1426,7 @@ pub fn text_layout(
             };
             let pages = match kv.host_gib {
                 Some(gib) => (gib.get() << 30) / (page_bytes * tensor).max(1),
-                None => (device_pages as f64 * kv.host_ratio.unwrap_or(HOST_RATIO)) as u64,
+                None => (device_pages as f64 * kv.host_ratio) as u64,
             };
             u32::try_from(pages.max(1)).unwrap_or(u32::MAX)
         };
@@ -1464,13 +1463,17 @@ pub fn text_layout(
     let ranks_per_unit = u32::try_from(tensor).unwrap_or(u32::MAX);
     let mut source_regions: Vec<Option<(u8, [u8; 32])>> = vec![None; cache.groups.len()];
     if let Some(source) = cache.source().filter(|_| host_tier) {
-        let width = config.model.max_model_len.div_ceil(PAGE_TOKENS);
+        let width = config
+            .model
+            .max_model_len
+            .div_ceil(config.kv_cache.block_tokens());
         for (index, held) in source_regions.iter_mut().enumerate() {
             if host_regions[index].is_none() {
                 continue;
             }
             let shape = host::page_shape(&source, index)?;
-            let slots = conversion::source_slots(shape.page_bytes, width);
+            let bound = config.kv_cache.conversion_buffer_mib.get() << 20;
+            let slots = conversion::source_slots(shape.page_bytes, width, bound);
             let (_, encoding) = host::class_digests(&source, index, ranks_per_unit)?;
             let name = format!("source kv {index} {}", short(&shape.layout.0));
             *held = Some((region_index(&regions)?, encoding));
@@ -2820,7 +2823,7 @@ fn open_rank(
     // it reserves; the resident pool holds the recurrent state and, on a rank that encodes
     // images, its region of encoder outputs.
     let peaks = runner_peaks(rank.peaks, rank.vision);
-    let (_, scratch) = model_runner.pools(device, &layout, &peaks)?;
+    let (_, scratch) = model_runner.pools(device, (&config, &cache_config), &peaks)?;
     let outputs = match rank.vision {
         Some(_) => encoder_bytes(rank.model.as_ref(), images)?,
         None => 0,
@@ -2846,7 +2849,6 @@ fn open_rank(
     // Step 18: the cache, whose segments the rank maps or creates at the Storage Server.
     let stream =
         Stream::new(device).with_context(|| format!("creating device {}'s stream", device.0))?;
-    let scratch_bytes = scratch_bytes(&config, &cache_config);
     let mut cache = KvCacheMemory::open(cache_config, device, &*client, &stream)
         .context("opening the rank's KV cache")?;
 
@@ -2912,8 +2914,7 @@ fn open_rank(
     if let Some(memory) = &media {
         runner.set_features(Arc::clone(memory), class)?;
     }
-    let shadow = rank.peaks.shadow.saturating_sub(scratch_bytes);
-    crate::runner::Runner::graphs(&runner).set_shadow(pool.shadow(shadow)?)?;
+    crate::runner::Runner::graphs(&runner).set_shadow(pool.shadow(rank.peaks.shadow)?)?;
     profile(&runner)?;
     streams.push(("device", stream));
 

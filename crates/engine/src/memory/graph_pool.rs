@@ -41,13 +41,6 @@ use crate::runner::RunnerId;
 use crate::worker::{Error, Result};
 use service::lock;
 
-/// The pool kinds of a device's allocator with the names the usage report gives them.
-const POOLS: [(PoolKind, &str); 3] = [
-    (PoolKind::Graph, "graph"),
-    (PoolKind::Scratch, "scratch"),
-    (PoolKind::Resident, "resident"),
-];
-
 /// The reservation of a device's pools in its GPU's quota at the Storage Server.
 ///
 /// The allocator states one pool's mapped bytes at a time; the quota holds one item for the
@@ -58,8 +51,8 @@ struct Reservation {
     /// The GPU's total bytes and the epoch's limit of them, which every reservation restates.
     total: u64,
     limit: u64,
-    /// The bytes each pool last stated, in the order of [`POOLS`].
-    mapped: Mutex<[u64; POOLS.len()]>,
+    /// The bytes each pool last stated, at its `PoolKind::index`.
+    mapped: Mutex<[u64; PoolKind::ALL.len()]>,
 }
 
 impl Budget for Reservation {
@@ -67,11 +60,7 @@ impl Budget for Reservation {
         let mut mapped = lock(&self.mapped);
 
         let mut stated = *mapped;
-        for ((kind, _), held) in POOLS.iter().zip(stated.iter_mut()) {
-            if *kind == pool {
-                *held = bytes;
-            }
-        }
+        stated[pool.index()] = bytes;
 
         // A refused reservation leaves the quota and the kept bytes as they were: the
         // allocator then maps nothing.
@@ -125,7 +114,7 @@ impl GraphPool {
             client,
             total,
             limit,
-            mapped: Mutex::new([0; POOLS.len()]),
+            mapped: Mutex::new([0; PoolKind::ALL.len()]),
         };
         let mut allocator = Allocator::new(&platform::Device::new(device)?, Arc::new(reservation))?;
 
@@ -211,9 +200,9 @@ impl GraphPool {
     /// measurement of the process leaves out
     /// ([`process_bytes`](super::division::process_bytes)).
     pub fn mapped(&self) -> u64 {
-        POOLS
-            .iter()
-            .map(|(pool, _)| self.allocator.mapped_bytes(*pool) as u64)
+        PoolKind::ALL
+            .into_iter()
+            .map(|pool| self.allocator.mapped_bytes(pool) as u64)
             .sum()
     }
 
@@ -223,11 +212,11 @@ impl GraphPool {
         DeviceMemory {
             device: self.allocator.device().0 as u32,
             budget: self.limit,
-            pools: POOLS
-                .iter()
-                .map(|(pool, name)| PoolMemory {
-                    pool: (*name).to_owned(),
-                    mapped: self.allocator.mapped_bytes(*pool) as u64,
+            pools: PoolKind::ALL
+                .into_iter()
+                .map(|pool| PoolMemory {
+                    pool: pool.name().to_owned(),
+                    mapped: self.allocator.mapped_bytes(pool) as u64,
                 })
                 .collect(),
         }

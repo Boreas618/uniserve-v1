@@ -415,11 +415,11 @@ pub(crate) fn cache_units(
 ///
 /// - one checkpoint per request slot, the latest its running request keeps (the floor, which
 ///   [`request_slots`] counted as part of a slot's cost);
-/// - and as many bytes again as the KV planes take: half of what the floor leaves of
-///   `remainder`, or, with `capacity` stated (the bytes of a stated token capacity's KV units),
-///   those bytes, as far as `remainder` holds them beside the capacity and the floor. SGLang sizes
-///   its Mamba pool at about the bytes of its KV pool (`mamba_full_memory_ratio`, 0.9 unless
-///   stated);
+/// - and `ratio` times the bytes the KV planes take (`kv_cache_config.state_ratio`): of what the
+///   floor leaves of `remainder`, the share `ratio / (1 + ratio)`, or, with `capacity` stated
+///   (the bytes of a stated token capacity's KV units), `ratio` times those bytes, as far as
+///   `remainder` holds them beside the capacity and the floor. SGLang sizes its Mamba pool the
+///   same way against its KV pool (`mamba_full_memory_ratio`);
 /// - rounded down to whole segments of `segment` units, and up to at least the segments that hold
 ///   the floor.
 ///
@@ -427,13 +427,14 @@ pub(crate) fn cache_units(
 ///
 /// # Errors
 ///
-/// [`Error::Invalid`] for a checkpoint of no bytes or a segment of no unit;
-/// [`Error::Unsupported`] with the shortfall when `remainder` does not hold the floor's segments.
+/// [`Error::Invalid`] for a checkpoint of no bytes, a segment of no unit or a ratio that is not
+/// positive and finite; [`Error::Unsupported`] with the shortfall when `remainder` does not hold
+/// the floor's segments.
 pub(crate) fn state_units(
     remainder: u64,
     state_bytes: u64,
     slots: u32,
-    capacity: Option<u64>,
+    (capacity, ratio): (Option<u64>, f64),
     segment: u32,
 ) -> Result<u32> {
     if state_bytes == 0 || segment == 0 {
@@ -441,14 +442,21 @@ pub(crate) fn state_units(
             "a state region's checkpoint bytes and its segment units must be positive".into(),
         ));
     }
+    if !(ratio.is_finite() && ratio > 0.0) {
+        return Err(Error::Invalid(format!(
+            "a state region's ratio to the KV planes must be positive and finite, not {ratio}"
+        )));
+    }
 
     let floor = u64::from(slots);
     let segment = u64::from(segment);
     let floor_bytes = floor.saturating_mul(state_bytes);
     let left = remainder.saturating_sub(floor_bytes);
+    // Byte counts below 2^53 convert to f64 exactly, so an equal ratio divides as halving does.
     let more = match capacity {
-        None => left / 2 / state_bytes,
-        Some(bytes) => (bytes / state_bytes).min(left.saturating_sub(bytes) / state_bytes),
+        None => (left as f64 * ratio / (1.0 + ratio)) as u64 / state_bytes,
+        Some(bytes) => ((bytes as f64 * ratio) as u64 / state_bytes)
+            .min(left.saturating_sub(bytes) / state_bytes),
     };
 
     // Whole segments: the floor's rounded up, the rest's rounded down.
@@ -907,36 +915,63 @@ mod tests {
 
         // The floor takes 128 MiB; of the 896 left, half is 448 more checkpoints: 576 in all,
         // whole segments already.
-        assert_eq!(state_units(GIB, state, 128, None, segment).unwrap(), 576);
+        assert_eq!(
+            state_units(GIB, state, 128, (None, 1.0), segment).unwrap(),
+            576
+        );
         // Two more MiB is one more checkpoint, which rounds down to the same segments.
         assert_eq!(
-            state_units(GIB + 2 * MIB, state, 128, None, segment).unwrap(),
+            state_units(GIB + 2 * MIB, state, 128, (None, 1.0), segment).unwrap(),
             576
         );
 
         // A stated capacity whose KV units take 20 MiB adds 20 checkpoints beside the floor.
         assert_eq!(
-            state_units(GIB, state, 128, Some(20 * MIB), segment).unwrap(),
+            state_units(GIB, state, 128, (Some(20 * MIB), 1.0), segment).unwrap(),
             148
         );
         // Of 130 slots the floor rounds up to 132, and a capacity of 1 MiB adds one, which
         // rounds down to the floor's segments.
         assert_eq!(
-            state_units(GIB, state, 130, Some(MIB), segment).unwrap(),
+            state_units(GIB, state, 130, (Some(MIB), 1.0), segment).unwrap(),
             132
         );
         // A capacity beyond what the remainder holds beside it adds what is left: of 200 MiB,
         // the floor's 100 and the capacity's 90 leave ten, 108 in whole segments.
         assert_eq!(
-            state_units(200 * MIB, state, 100, Some(90 * MIB), segment).unwrap(),
+            state_units(200 * MIB, state, 100, (Some(90 * MIB), 1.0), segment).unwrap(),
             108
         );
 
         // A remainder that holds not even the floor's segments is refused with the shortfall.
-        let short = state_units(130 * MIB, state, 130, None, segment).unwrap_err();
+        let short = state_units(130 * MIB, state, 130, (None, 1.0), segment).unwrap_err();
         assert!(short.to_string().contains("2097152 short"), "{short}");
-        assert!(state_units(GIB, 0, 1, None, segment).is_err());
-        assert!(state_units(GIB, state, 1, None, 0).is_err());
+        assert!(state_units(GIB, 0, 1, (None, 1.0), segment).is_err());
+        assert!(state_units(GIB, state, 1, (None, 1.0), 0).is_err());
+    }
+
+    /// The state region takes `ratio` times the KV planes' bytes beside its floor: of what the
+    /// floor leaves, the share `ratio / (1 + ratio)`, or `ratio` times a stated capacity's bytes;
+    /// a ratio that is not positive and finite is refused.
+    #[test]
+    fn a_state_region_takes_its_ratio_of_the_kv_planes_bytes() {
+        let (state, segment) = (MIB, 4);
+
+        // Half the planes' bytes: of the 896 MiB the floor of 128 leaves, a third, 298 more
+        // checkpoints, 426 in all and 424 in whole segments.
+        assert_eq!(
+            state_units(GIB, state, 128, (None, 0.5), segment).unwrap(),
+            424
+        );
+        // Three times a stated capacity of 20 MiB is 60 checkpoints beside the floor.
+        assert_eq!(
+            state_units(GIB, state, 128, (Some(20 * MIB), 3.0), segment).unwrap(),
+            188
+        );
+
+        for refused in [0.0, -1.0, f64::NAN, f64::INFINITY] {
+            assert!(state_units(GIB, state, 128, (None, refused), segment).is_err());
+        }
     }
 
     #[test]

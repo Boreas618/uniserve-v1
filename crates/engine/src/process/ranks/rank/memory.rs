@@ -53,19 +53,15 @@ use tensor::DType;
 
 use super::ModelRunner;
 
-/// Tokens one page of a causal language model's paged cache holds: the largest page the attention
-/// packages read. The model reads it from the cache it is handed (`nn::KvGroup::page_size`), and a
-/// block of the buffer pool's KV classes is one page (`specs/buffer-pool.md` §6).
-pub(crate) const PAGE_TOKENS: u32 = 64;
-
 /// What a profile run states of a rank's runner, which the division sizes the rank's pools by.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct Peaks {
     /// The runner's region of the graph pool: its input tensors and its forwards' peak
     /// (`Graphs::peak`).
     pub(crate) graph: u64,
-    /// The runner's shadow region (`Graphs::shadow_peak`), with the scratch pages of its paired
-    /// forwards.
+    /// The runner's shadow region (`Graphs::shadow_peak`). The scratch pages of its paired
+    /// forwards lie beside it in the scratch pool, in the extents of the device's pools
+    /// ([`ModelRunner::pools`]).
     pub(crate) shadow: u64,
     /// The bytes of host values one replay copies (`Graphs::input_peak`).
     pub(crate) inputs: u64,
@@ -76,6 +72,14 @@ impl ModelRunner {
     /// fewer the division of the rank's share of its GPU decided ([`ModelRunner::with_slots`]).
     pub(crate) fn slots(&self) -> u32 {
         self.slots
+    }
+
+    /// Tokens one page of a causal language model's paged cache holds: the deployment's KV block
+    /// size (`proto::config::KvCacheConfig::block_tokens`). The model reads it from the cache it is
+    /// handed (`nn::KvGroup::page_size`), and a block of the buffer pool's KV classes is one page
+    /// (`specs/buffer-pool.md` §6).
+    pub(crate) fn page_tokens(&self) -> u32 {
+        self.engine_config().kv_cache.block_tokens()
     }
 
     /// The layout of the rank's cache for `model` (step 5): one attention group of the model's
@@ -97,7 +101,7 @@ impl ModelRunner {
         let runs = model.state_layers();
         let layout = if runs.is_empty() {
             CacheLayout::dense(
-                PAGE_TOKENS,
+                self.page_tokens(),
                 shape.layers,
                 shape.kv_heads,
                 shape.head_dim,
@@ -105,7 +109,7 @@ impl ModelRunner {
             )
         } else {
             CacheLayout::hybrid(
-                PAGE_TOKENS,
+                self.page_tokens(),
                 shape.layers,
                 shape.kv_heads,
                 shape.head_dim,
@@ -171,7 +175,7 @@ impl ModelRunner {
             .engine_config()
             .model
             .max_model_len
-            .div_ceil(PAGE_TOKENS);
+            .div_ceil(self.page_tokens());
 
         KvCacheConfig {
             layout,
@@ -247,26 +251,31 @@ impl ModelRunner {
 
     /// The bytes the graph pool and the scratch pool of `device` map for runners of `peaks` over
     /// a cache of `layout` (step 13): each runner's region and shadow region (the causal runner's,
-    /// and a vision runner's), and the state snapshot of a model that keeps recurrent state, one
-    /// state unit, in whole allocation granules.
+    /// the first, beside the scratch page set of `config` over `cache`, and a vision runner's),
+    /// and the state snapshot of a model that keeps recurrent state, one state unit, in the whole
+    /// extents the device's pools map.
     ///
     /// # Errors
     ///
-    /// When the device states no allocation granularity.
+    /// When the device states no pool granularity.
     pub(crate) fn pools(
         &self,
         device: DeviceId,
-        layout: &CacheLayout,
+        (config, cache): (&CausalLmConfig, &KvCacheConfig),
         peaks: &[Peaks],
     ) -> Result<(u64, u64)> {
+        let granularity = pool_granularity(device)?;
         let regions: Vec<u64> = peaks.iter().map(|peaks| peaks.graph).collect();
-        let shadows: Vec<u64> = peaks.iter().map(|peaks| peaks.shadow).collect();
+        let mut shadows: Vec<u64> = peaks.iter().map(|peaks| peaks.shadow).collect();
+        if let Some(causal) = shadows.first_mut() {
+            *causal += scratch_bytes(config, cache, granularity);
+        }
 
         Ok(division::pool_bytes(
-            granularity(device)?,
+            granularity,
             &regions,
             &shadows,
-            layout.state_bytes(),
+            cache.layout.state_bytes(),
         ))
     }
 
@@ -440,13 +449,15 @@ impl ModelRunner {
             .max_tokens
             .map(|tokens| layout.token_units(tokens.get()));
 
-        // The state region first: its floor and the KV planes' bytes again, agreed over the host
+        // The state region first: its floor and its ratio of the KV planes' bytes, agreed over the host
         // group; the planes take what it leaves.
         let states = if state_bytes > 0 {
             let segment = segments::segment_units(state_bytes, granularity)
                 .context("a checkpoint of no bytes splits into no segment")?;
             let kv_capacity = capacity.map(|units| units.saturating_mul(layout.unit_bytes));
-            let states = division::state_units(whole, state_bytes, slots, kv_capacity, segment)?;
+            let ratio = self.engine_config().kv_cache.state_ratio;
+            let states =
+                division::state_units(whole, state_bytes, slots, (kv_capacity, ratio), segment)?;
             let states = host
                 .all_reduce_min(&[i64::from(states)])
                 .context("agreeing the units of the ranks' state regions")?[0];
@@ -698,11 +709,29 @@ pub(crate) fn plane_segments(
 }
 
 /// The bytes of the scratch page set a runner of `config` writes its paired forwards' keys and
-/// values into, over a cache of `cache` (step 13): its `scratch_pages` pages, which the rows of
-/// a batch share (`CausalLmRunner::scratch_pages`), and their page table, which the scratch pool
-/// holds beside the runner's shadow region. Zero for a runner that computes no paired forward.
-pub(crate) fn scratch_bytes(config: &CausalLmConfig, cache: &KvCacheConfig) -> u64 {
-    crate::memory::cache::scratch::bytes(&cache.layout, config.scratch_pages, cache.width)
+/// values into, over a cache of `cache` (step 13), on a device whose pools map in extents of
+/// `granularity` bytes: its `scratch_pages` pages, which the rows of a batch share
+/// (`CausalLmRunner::scratch_pages`), and their page table, which the scratch pool holds beside
+/// the runner's shadow region. Zero for a runner that computes no paired forward.
+pub(crate) fn scratch_bytes(
+    config: &CausalLmConfig,
+    cache: &KvCacheConfig,
+    granularity: u64,
+) -> u64 {
+    crate::memory::cache::scratch::bytes(
+        &cache.layout,
+        config.scratch_pages,
+        cache.width,
+        granularity,
+    )
+}
+
+/// The extent in which the pools of `device`'s allocator map their storage, which every
+/// allocation of the graph and scratch pools takes whole (`platform::Allocator::granularity`).
+pub(crate) fn pool_granularity(device: DeviceId) -> Result<u64> {
+    let granularity = platform::Allocator::granularity(device)
+        .with_context(|| format!("reading device {}'s pool granularity", device.0))?;
+    Ok(granularity as u64)
 }
 
 /// The size and alignment unit of the exportable allocations of `device`, which a pool's mapping

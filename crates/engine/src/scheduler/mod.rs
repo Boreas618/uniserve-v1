@@ -1209,6 +1209,7 @@ impl Scheduler {
             max_running_requests: config.max_running_requests.max(1),
             draft_tokens: self.config.draft_tokens,
             graph_tiers: std::mem::take(&mut self.config.graph_tiers),
+            block_tokens: self.config.block_tokens,
             ..config
         };
         Ok(())
