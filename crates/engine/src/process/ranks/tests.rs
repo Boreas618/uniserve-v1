@@ -19,7 +19,6 @@
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
-use std::time::{Duration, Instant};
 
 use crate::batch::cache::CacheGroupKind;
 use crate::batch::{Phase, Variant};
@@ -29,8 +28,8 @@ use crate::worker::completion::{Outcome, Submission};
 use proto::config::{
     BlockConfig, BlockDistribution, EngineArgs, WorkerGroupConfig, WorkerGroupId, WorkerRank,
 };
-use storage::QueuePair;
 use storage::runtime::{Completion, GroupId, OwnerId, Request, RequestId, Tier};
+use storage::{Interest, QueuePair};
 
 use super::{
     Backing, Loaded, LoadedRank, Meeting, bind, capacities, layout, load_ranks, open_ranks, spawn,
@@ -39,10 +38,11 @@ use crate::batch::product::KINDS;
 use crate::memory::client::StorageClient;
 use crate::process::ranks::rank::ModelRunner;
 use crate::process::ranks::rank::text::Keys;
+use testkit::LONG;
 use testkit::serving::{DEPLOYMENT, SLOTS, StorageServer, launch};
 
 /// Submits `request` under `number` on the scheduler's end `pair` and returns its completion, the
-/// next to arrive, within ten seconds.
+/// next to arrive, waiting on the end's doorbell for the buffer pool's records.
 fn ask(pair: &mut QueuePair, number: u64, request: &Request) -> Completion {
     let mut record = Vec::new();
     request.encode(RequestId(number), &mut record);
@@ -51,9 +51,10 @@ fn ask(pair: &mut QueuePair, number: u64, request: &Request) -> Completion {
         "the submission queue is full"
     );
 
-    let deadline = Instant::now() + Duration::from_secs(10);
     let mut record = Vec::new();
     loop {
+        // The counts are taken before the look, so a record written after it rings.
+        let seen = pair.signals();
         if pair.next_completion(&mut record).unwrap() {
             let (answered, completion) = Completion::decode(&record).unwrap();
             assert_eq!(
@@ -63,8 +64,10 @@ fn ask(pair: &mut QueuePair, number: u64, request: &Request) -> Completion {
             );
             return completion;
         }
-        assert!(Instant::now() < deadline, "no completion arrived");
-        std::thread::sleep(Duration::from_micros(100));
+        assert!(
+            pair.wait(Interest::RECORDS, seen, Some(LONG)).unwrap(),
+            "no completion arrived"
+        );
     }
 }
 

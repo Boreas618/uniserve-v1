@@ -82,6 +82,8 @@ wasmtime.workspace = true
 testkit.workspace = true
 # The tiny checkpoints of the `models` crate a rank's tests load (`models::fixtures`).
 models = { workspace = true, features = ["fixtures"] }
+# The pidfd the start test waits on for the engine process's exit.
+rustix = { workspace = true, features = ["process"] }
 # The checkpoint shards the weight store's tests write.
 safetensors.workspace = true
 # A toy policy module in a test is written as `wat`.

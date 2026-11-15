@@ -18,7 +18,7 @@
 #![cfg(test)]
 
 use std::net::TcpListener;
-use std::os::fd::{AsRawFd as _, RawFd};
+use std::os::fd::{AsFd as _, AsRawFd as _, BorrowedFd, OwnedFd, RawFd};
 use std::os::unix::process::CommandExt as _;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus};
@@ -28,6 +28,8 @@ use std::time::{Duration, Instant};
 use proto::config::{EngineArgs, Inherited, WorkerGroupConfig, World};
 use proto::process::{downstream, report, upstream};
 use proto::request::wire::{self, from_engine};
+use rustix::event::{PollFd, PollFlags, Timespec};
+use rustix::process::{Pid, PidfdFlags, pidfd_open};
 use service::{Connection, Listener};
 use testkit::serving::{DEPLOYMENT, StorageServer};
 
@@ -96,45 +98,66 @@ fn launch(directory: &Path, build_server: &Path) -> EngineArgs {
     launch
 }
 
-/// The engine process, killed when the test ends before it exited.
-struct Engine(Child);
+/// The engine process, killed when the test ends before it exited, with its pidfd, which is
+/// readable once the process exited.
+struct Engine {
+    child: Child,
+    exit: OwnedFd,
+}
 
 impl Engine {
+    /// Starts `command` as the engine process.
+    fn spawn(command: &mut Command) -> Self {
+        let child = command.spawn().unwrap();
+        let exit = pidfd_open(Pid::from_child(&child), PidfdFlags::empty()).unwrap();
+        Self { child, exit }
+    }
+
     /// The process's exit status, once it exited within `bound`.
     fn exited(&mut self, bound: Duration) -> ExitStatus {
-        let deadline = Instant::now() + bound;
-        loop {
-            if let Some(status) = self.0.try_wait().unwrap() {
-                return status;
-            }
-            assert!(Instant::now() < deadline, "the engine did not exit");
-            std::thread::sleep(Duration::from_millis(50));
-        }
+        let [exited] = readable([self.exit.as_fd()], bound);
+        assert!(exited, "the engine did not exit");
+        self.child.wait().unwrap()
     }
 }
 
 impl Drop for Engine {
     fn drop(&mut self) {
-        if self.0.try_wait().ok().flatten().is_none() {
-            let _ = self.0.kill();
-            let _ = self.0.wait();
+        if self.child.try_wait().ok().flatten().is_none() {
+            let _ = self.child.kill();
+            let _ = self.child.wait();
         }
     }
 }
 
-/// The first connection to `listener` within `bound`.
-fn accept(listener: &Listener, engine: &mut Engine, bound: Duration) -> Connection {
-    let deadline = Instant::now() + bound;
-    loop {
-        if let Some(connection) = listener.try_accept().unwrap() {
-            return connection;
-        }
-        if let Some(status) = engine.0.try_wait().unwrap() {
-            panic!("the engine exited with {status} before it connected");
-        }
-        assert!(Instant::now() < deadline, "the engine did not connect");
-        std::thread::sleep(Duration::from_millis(10));
+/// Which of `descriptors` became readable within `bound`, waiting until one does.
+fn readable<const N: usize>(descriptors: [BorrowedFd<'_>; N], bound: Duration) -> [bool; N] {
+    let mut polled =
+        descriptors.map(|descriptor| PollFd::from_borrowed_fd(descriptor, PollFlags::IN));
+    let timeout = Timespec::try_from(bound).unwrap();
+    // A signal that interrupts the wait ends it early; the callers' assertions report what is
+    // still not readable.
+    match rustix::event::poll(&mut polled, Some(&timeout)) {
+        Ok(_) | Err(rustix::io::Errno::INTR) => {}
+        Err(error) => panic!("polling the engine's descriptors: {error}"),
     }
+    polled.map(|descriptor| !descriptor.revents().is_empty())
+}
+
+/// The first connection to `listener` within `bound`, which the engine makes unless it exits.
+fn accept(listener: &Listener, engine: &mut Engine, bound: Duration) -> Connection {
+    // SAFETY: the listener's descriptor stays open for the borrow, which ends with the poll.
+    let socket = unsafe { BorrowedFd::borrow_raw(listener.as_raw_fd()) };
+    let [connected, exited] = readable([socket, engine.exit.as_fd()], bound);
+    if let Some(connection) = listener.try_accept().unwrap() {
+        return connection;
+    }
+    assert!(
+        !exited,
+        "the engine exited with {} before it connected",
+        engine.child.wait().unwrap()
+    );
+    panic!("the engine did not connect (a connection waits: {connected})");
 }
 
 /// The next frame of the request interface the engine sends within `bound`.
@@ -215,7 +238,7 @@ fn started(
             Ok(())
         });
     }
-    let mut engine = Engine(command.spawn().unwrap());
+    let mut engine = Engine::spawn(&mut command);
     drop(launch_file);
 
     // The request interface: hello, welcome, `Starting`.

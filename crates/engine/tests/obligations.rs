@@ -85,7 +85,7 @@ use engine::worker::{Error, Result};
 use ops::Generation;
 use service::lock;
 use storage::runtime::{Completion, GroupId, OwnerId, Request, RequestId, Run, Stamps, Tier};
-use storage::{Key, QueuePair};
+use storage::{Interest, Key, QueuePair};
 use tensor::Tensor;
 use testkit::LONG;
 
@@ -952,6 +952,9 @@ struct Watch {
     sequences: Arc<Sequences>,
     /// The buffer pool's end of the queue pair whose register 0 holds the group's word.
     pool: Mutex<QueuePair>,
+    /// A second handle of the buffer pool's end, whose doorbell the test sleeps on until the
+    /// group raises its word: the ranks' threads read the word through `pool` meanwhile.
+    waiter: Mutex<QueuePair>,
     violations: Mutex<Vec<String>>,
 }
 
@@ -1258,10 +1261,12 @@ impl Group {
     fn start(peers: &Peers, turns: Turns) -> Self {
         let pool = QueuePair::create(4096, 1).unwrap();
         let engine = QueuePair::open(pool.duplicate().unwrap(), true).unwrap();
+        let waiter = QueuePair::open(pool.duplicate().unwrap(), false).unwrap();
         let sequences = Sequences::new(GROUP, RANKS, vec![(engine, 0)]);
         let watch = Arc::new(Watch {
             sequences: Arc::clone(&sequences),
             pool: Mutex::new(pool),
+            waiter: Mutex::new(waiter),
             violations: Mutex::default(),
         });
 
@@ -1552,11 +1557,17 @@ impl<'a> Replay<'a> {
 
     /// Waits until the group's `completed` and the buffer pool's word reach the last batch every
     /// rank ended, and fails when either passes it or stays below it.
+    ///
+    /// The group raises its `completed` before it writes the word and rings the buffer pool's
+    /// doorbell, so the test sleeps on that doorbell between looks.
     fn converge(&self) -> std::result::Result<(), String> {
         let ended = self.ended.iter().copied().min().unwrap_or_default();
         let deadline = Instant::now() + LONG;
+        let waiter = lock(&self.group.watch.waiter);
 
         loop {
+            // The counts before the look: a word raised after it rings the doorbell.
+            let seen = waiter.signals();
             let completed = self.group.route.completed(GROUP).unwrap();
             let word = self.group.watch.word();
             if completed > ended || word > ended {
@@ -1568,13 +1579,16 @@ impl<'a> Replay<'a> {
             if completed == ended && word == ended {
                 return Ok(());
             }
-            if Instant::now() > deadline {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if !waiter
+                .wait(Interest::REGISTERS, seen, Some(remaining))
+                .unwrap()
+            {
                 return Err(format!(
                     "obligation 3: the group's completed stays at {completed} and the buffer pool \
                      reads {word} once every rank ended batch {ended}"
                 ));
             }
-            std::thread::sleep(Duration::from_micros(50));
         }
     }
 }
