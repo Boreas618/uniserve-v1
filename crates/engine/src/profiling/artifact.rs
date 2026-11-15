@@ -1,11 +1,11 @@
 //! A session's file: one SQLite database per rank, in UniServe's own schema.
 //!
-//! The schema is versioned ([`SCHEMA_VERSION`]) and changes only by additions: a later version
-//! adds tables or columns, never removes or redefines one, so a reader of an earlier version reads
-//! every file of a later one. The file states its version and its own schema (`schema_version`,
-//! and SQLite's `sqlite_schema`). Its table and column names are the file format
-//! `uniserve_eval.profile` reads: the range markers' stamps are the table `fence`, the markers
-//! `fence_probe`, and a module's class the column `module`.
+//! The schema is the crate's file `schema.sql`, which states every table and the version of the
+//! file format, and which the writer applies to each file it creates. A file states its version
+//! and its own schema (`schema_version`, and SQLite's `sqlite_schema`); a reader reads the files
+//! of the version it was written for, and a release writes one version. Its table and column
+//! names are the file format `uniserve_eval.profile` reads: the range markers' stamps are the
+//! table `fence`, the markers `fence_probe`, and a module's class the column `module`.
 //!
 //! Every raw record kind has a table of its own, beside the tables that describe them: `metadata`
 //! (the session, the epoch, the rank, its device, the CUPTI version, the request, the clocks and
@@ -15,8 +15,9 @@
 //! each table.
 //!
 //! The writer is a thread of its own: collectors send it rows over a channel ([`Writer::rows`],
-//! [`send`]) and never wait for the file. It commits a transaction per [`COMMIT_PERIOD`] and
-//! checkpoints the write-ahead log into the file when the session ends, leaving one file.
+//! [`send`]) and never wait for the file. It waits for rows, writes what arrives in a transaction
+//! of at most [`COMMIT_PERIOD`], and checkpoints the write-ahead log into the file when the
+//! session ends, leaving one file.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -25,85 +26,22 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
-use crossbeam_channel::{Receiver, RecvTimeoutError, Sender};
+use crossbeam_channel::{Receiver, Sender};
 use platform::cupti::pc_sampling::Taken;
 use platform::cupti::pm_sampling::Sample;
 use platform::cupti::range_profiler::Range;
 use platform::cupti::records::Record;
-use rusqlite::{Connection, params};
+use rusqlite::Connection;
 
 use super::markers::Stamp;
 use crate::worker::{Error, Result};
 
-/// The schema's version.
-pub(crate) const SCHEMA_VERSION: i64 = 2;
-
-/// How often the writer commits what it received.
+/// How long one transaction takes what keeps arriving before it commits: what a writer that
+/// fails loses at most, and what a busy session's file grows by between two commits.
 const COMMIT_PERIOD: Duration = Duration::from_millis(200);
 
-/// The schema of version 2.
-const SCHEMA: &str = "
-CREATE TABLE schema_version (version INTEGER NOT NULL);
-CREATE TABLE metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL);
-CREATE TABLE strings (id INTEGER PRIMARY KEY, text TEXT NOT NULL);
-CREATE TABLE collectors (name TEXT NOT NULL, state TEXT NOT NULL, time INTEGER NOT NULL,
-    detail TEXT NOT NULL);
-CREATE TABLE clocks (source TEXT NOT NULL, device INTEGER, gpu INTEGER, realtime INTEGER NOT NULL,
-    cupti INTEGER, monotonic INTEGER, uncertainty INTEGER NOT NULL);
-CREATE TABLE steps (step INTEGER NOT NULL, stage TEXT NOT NULL, selected INTEGER NOT NULL,
-    begin INTEGER NOT NULL, end INTEGER);
-CREATE TABLE kernel (start INTEGER NOT NULL, end INTEGER NOT NULL, queued INTEGER,
-    submitted INTEGER, device INTEGER NOT NULL, context INTEGER NOT NULL, stream INTEGER NOT NULL,
-    correlation INTEGER NOT NULL, grid_x INTEGER, grid_y INTEGER, grid_z INTEGER, block_x INTEGER,
-    block_y INTEGER, block_z INTEGER, registers INTEGER, static_shared INTEGER,
-    dynamic_shared INTEGER, name INTEGER NOT NULL, graph INTEGER, graph_node INTEGER,
-    launch_type INTEGER, channel INTEGER);
-CREATE TABLE copy (start INTEGER NOT NULL, end INTEGER NOT NULL, device INTEGER NOT NULL,
-    context INTEGER NOT NULL, stream INTEGER NOT NULL, correlation INTEGER NOT NULL,
-    copy_kind INTEGER NOT NULL, source_kind INTEGER, destination_kind INTEGER,
-    bytes INTEGER NOT NULL, graph INTEGER, graph_node INTEGER, source_device INTEGER,
-    destination_device INTEGER);
-CREATE TABLE fill (start INTEGER NOT NULL, end INTEGER NOT NULL, device INTEGER NOT NULL,
-    context INTEGER NOT NULL, stream INTEGER NOT NULL, correlation INTEGER NOT NULL,
-    value INTEGER NOT NULL, bytes INTEGER NOT NULL, memory_kind INTEGER, graph INTEGER,
-    graph_node INTEGER);
-CREATE TABLE memory (time INTEGER NOT NULL, operation INTEGER NOT NULL,
-    memory_kind INTEGER NOT NULL, correlation INTEGER NOT NULL, address INTEGER NOT NULL,
-    bytes INTEGER NOT NULL, process INTEGER, device INTEGER, context INTEGER, stream INTEGER,
-    asynchronous INTEGER NOT NULL);
-CREATE TABLE marker (time INTEGER NOT NULL, flags INTEGER NOT NULL, id INTEGER NOT NULL,
-    object_kind INTEGER NOT NULL, object_0 INTEGER, object_1 INTEGER, object_2 INTEGER,
-    name INTEGER NOT NULL, domain INTEGER NOT NULL);
-CREATE TABLE marker_data (id INTEGER NOT NULL, flags INTEGER NOT NULL,
-    payload_kind INTEGER NOT NULL, payload INTEGER, color INTEGER, category INTEGER);
-CREATE TABLE graph (start INTEGER NOT NULL, end INTEGER NOT NULL, device INTEGER NOT NULL,
-    context INTEGER NOT NULL, stream INTEGER NOT NULL, correlation INTEGER NOT NULL,
-    graph INTEGER NOT NULL);
-CREATE TABLE nvlink (version INTEGER NOT NULL, type_0 INTEGER NOT NULL, type_1 INTEGER NOT NULL,
-    end_0 BLOB NOT NULL, end_1 BLOB NOT NULL, flag INTEGER NOT NULL, links INTEGER NOT NULL,
-    bandwidth INTEGER NOT NULL, nvswitch INTEGER NOT NULL);
-CREATE TABLE pcie (device_type INTEGER NOT NULL, id INTEGER NOT NULL, domain INTEGER NOT NULL,
-    generation INTEGER NOT NULL, link_rate INTEGER NOT NULL, link_width INTEGER NOT NULL,
-    upstream_bus INTEGER NOT NULL);
-CREATE TABLE api (start INTEGER NOT NULL, end INTEGER NOT NULL, domain INTEGER NOT NULL,
-    cbid INTEGER NOT NULL, name INTEGER NOT NULL, thread INTEGER NOT NULL,
-    correlation INTEGER NOT NULL, result INTEGER NOT NULL);
-CREATE TABLE fence_probe (probe INTEGER PRIMARY KEY, instance INTEGER NOT NULL,
-    site TEXT NOT NULL, path TEXT NOT NULL, module TEXT NOT NULL);
-CREATE TABLE fence (device INTEGER NOT NULL, time INTEGER NOT NULL, probe INTEGER NOT NULL,
-    step INTEGER NOT NULL);
-CREATE TABLE pm_sample (sample INTEGER NOT NULL, start INTEGER NOT NULL, end INTEGER NOT NULL,
-    metric TEXT NOT NULL, value REAL NOT NULL);
-CREATE TABLE range_metric (pass INTEGER NOT NULL, range INTEGER NOT NULL, name TEXT NOT NULL,
-    metric TEXT NOT NULL, value REAL NOT NULL);
-CREATE TABLE pc_stall_reason (reason INTEGER PRIMARY KEY, name TEXT NOT NULL);
-CREATE TABLE pc_sample (take INTEGER NOT NULL, function TEXT NOT NULL,
-    function_index INTEGER NOT NULL, cubin_crc INTEGER NOT NULL, offset INTEGER NOT NULL,
-    correlation INTEGER NOT NULL, reason INTEGER NOT NULL, samples INTEGER NOT NULL);
-CREATE TABLE pc_take (take INTEGER PRIMARY KEY, time INTEGER NOT NULL,
-    total_samples INTEGER NOT NULL, dropped_samples INTEGER NOT NULL,
-    non_user_samples INTEGER NOT NULL, hardware_buffer_full INTEGER NOT NULL);
-";
+/// The file format: every table, and the version a file states (`schema.sql`).
+const SCHEMA: &str = include_str!("schema.sql");
 
 /// What the meaning of each table's identifiers and clocks is, written into `metadata` under
 /// `doc.<table>`.
@@ -230,35 +168,33 @@ impl Writer {
             return Err(Error::Invalid(format!("{} exists", path.display())));
         }
         let connection = Connection::open(&path).map_err(|error| sqlite(&path, &error))?;
+        // A write-ahead log, synchronized at its checkpoints: the writer's transactions do not
+        // wait for the disk, and a crash loses at most the log's last transactions.
         connection
-            .execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL;")
-            .map_err(|error| sqlite(&path, &error))?;
-        connection
-            .execute_batch(SCHEMA)
-            .map_err(|error| sqlite(&path, &error))?;
-        connection
-            .execute(
-                "INSERT INTO schema_version VALUES (?1)",
-                params![SCHEMA_VERSION],
-            )
+            .pragma_update(None, "journal_mode", "WAL")
+            .and_then(|()| connection.pragma_update(None, "synchronous", "NORMAL"))
+            .and_then(|()| connection.execute_batch(SCHEMA))
             .map_err(|error| sqlite(&path, &error))?;
         let mut file = File {
             connection,
-            path,
-            rows: BTreeMap::new(),
-            pm_samples: 0,
-            range_passes: 0,
-            pc_takes: 0,
+            tables: Tables {
+                path,
+                rows: BTreeMap::new(),
+                pm_samples: 0,
+                range_passes: 0,
+                pc_takes: 0,
+            },
         };
         let docs = DOCS
             .iter()
             .map(|&(key, value)| (key.to_owned(), value.to_owned()));
-        file.write(Message::Metadata(
-            metadata.into_iter().chain(docs).collect(),
-        ))?;
+        file.tables.write(
+            &file.connection,
+            Message::Metadata(metadata.into_iter().chain(docs).collect()),
+        )?;
 
         let (sender, receiver) = crossbeam_channel::unbounded();
-        let bytes = Arc::new(AtomicU64::new(size(&file.path)));
+        let bytes = Arc::new(AtomicU64::new(size(&file.tables.path)));
         let thread = std::thread::Builder::new()
             .name("profile-writer".into())
             .spawn({
@@ -303,6 +239,12 @@ impl Writer {
 /// The open file, on the writer's thread.
 struct File {
     connection: Connection,
+    tables: Tables,
+}
+
+/// What the writer keeps of the file's tables: the file's path, the rows written by table, and
+/// the numbers the next PM sample, range pass and PC take are written under.
+struct Tables {
     path: PathBuf,
     rows: BTreeMap<String, u64>,
     pm_samples: u64,
@@ -334,39 +276,31 @@ impl File {
         bytes: &AtomicU64,
     ) -> Result<proto::profile::FileReport> {
         let mut failed: Option<Error> = None;
-        loop {
-            let first = match receiver.recv_timeout(COMMIT_PERIOD) {
-                Ok(message) => message,
-                Err(RecvTimeoutError::Timeout) => continue,
-                Err(RecvTimeoutError::Disconnected) => break,
-            };
+        // Each wait ends with a row or with the last sender gone.
+        while let Ok(first) = receiver.recv() {
             if failed.is_some() {
                 continue;
             }
             let deadline = Instant::now() + COMMIT_PERIOD;
-            let written = self.transaction(|file| {
-                file.write(first)?;
-                while Instant::now() < deadline {
-                    match receiver.try_recv() {
-                        Ok(message) => file.write(message)?,
-                        Err(_) => break,
-                    }
-                }
-                Ok(())
-            });
-            if let Err(error) = written {
+            if let Err(error) = self.commit(first, receiver, deadline) {
                 tracing::error!("the profile file stops being written: {error}");
                 failed = Some(error);
             }
-            bytes.store(size(&self.path), Ordering::Release);
+            bytes.store(size(&self.tables.path), Ordering::Release);
         }
         if let Some(error) = failed {
             return Err(error);
         }
+
+        // The log's transactions move into the file, which then keeps no log beside it.
+        let path = self.tables.path.clone();
         self.connection
-            .execute_batch("PRAGMA wal_checkpoint(TRUNCATE); PRAGMA journal_mode=DELETE;")
-            .map_err(|error| sqlite(&self.path, &error))?;
-        let path = self.path.clone();
+            .pragma_update(None, "wal_checkpoint", "TRUNCATE")
+            .and_then(|()| {
+                self.connection
+                    .pragma_update(None, "journal_mode", "DELETE")
+            })
+            .map_err(|error| sqlite(&path, &error))?;
         self.connection
             .close()
             .map_err(|(_, error)| sqlite(&path, &error))?;
@@ -375,33 +309,43 @@ impl File {
         Ok(proto::profile::FileReport::Written {
             path,
             bytes: bytes_now,
-            rows: self.rows.clone(),
+            rows: self.tables.rows,
         })
     }
 
-    fn transaction(&mut self, write: impl FnOnce(&mut Self) -> Result<()>) -> Result<()> {
-        self.connection
-            .execute_batch("BEGIN")
-            .map_err(|error| sqlite(&self.path, &error))?;
-        let written = write(self);
-        let end = if written.is_ok() {
-            "COMMIT"
-        } else {
-            "ROLLBACK"
-        };
-        self.connection
-            .execute_batch(end)
-            .map_err(|error| sqlite(&self.path, &error))?;
-        written
+    /// Writes `first` and what else arrives on `receiver` before `deadline` in one transaction,
+    /// which a failed write rolls back.
+    fn commit(
+        &mut self,
+        first: Message,
+        receiver: &Receiver<Message>,
+        deadline: Instant,
+    ) -> Result<()> {
+        let open = self
+            .connection
+            .transaction()
+            .map_err(|error| sqlite(&self.tables.path, &error))?;
+        self.tables.write(&open, first)?;
+        while Instant::now() < deadline {
+            match receiver.try_recv() {
+                Ok(message) => self.tables.write(&open, message)?,
+                Err(_) => break,
+            }
+        }
+        open.commit()
+            .map_err(|error| sqlite(&self.tables.path, &error))
     }
+}
 
+impl Tables {
     fn count(&mut self, table: &str, rows: u64) {
         *self.rows.entry(table.to_owned()).or_default() += rows;
     }
 
-    /// Inserts `rows` into `table` with the statement `sql`.
+    /// Inserts `rows` into `table` of `connection`'s file with the statement `sql`.
     fn insert<P: rusqlite::Params>(
         &mut self,
+        connection: &Connection,
         table: &str,
         sql: &str,
         rows: impl IntoIterator<Item = P>,
@@ -409,8 +353,7 @@ impl File {
         let path = self.path.clone();
         let mut count = 0;
         {
-            let mut statement = self
-                .connection
+            let mut statement = connection
                 .prepare_cached(sql)
                 .map_err(|error| sqlite(&path, &error))?;
             for row in rows {
@@ -424,9 +367,11 @@ impl File {
         Ok(())
     }
 
-    fn write(&mut self, message: Message) -> Result<()> {
+    /// Writes `message`'s rows into `connection`'s file.
+    fn write(&mut self, connection: &Connection, message: Message) -> Result<()> {
         match message {
             Message::Metadata(entries) => self.insert(
+                connection,
                 "metadata",
                 "INSERT OR REPLACE INTO metadata VALUES (?1, ?2)",
                 entries,
@@ -436,6 +381,7 @@ impl File {
                 state,
                 detail,
             } => self.insert(
+                connection,
                 "collectors",
                 "INSERT INTO collectors VALUES (?1, ?2, ?3, ?4)",
                 [(
@@ -446,6 +392,7 @@ impl File {
                 )],
             ),
             Message::Clock(clock) => self.insert(
+                connection,
                 "clocks",
                 "INSERT INTO clocks VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
                 [(
@@ -465,6 +412,7 @@ impl File {
                 begin,
                 end,
             } => self.insert(
+                connection,
                 "steps",
                 "INSERT INTO steps VALUES (?1, ?2, ?3, ?4, ?5)",
                 [(
@@ -477,17 +425,19 @@ impl File {
             ),
             Message::Timeline { records, names } => {
                 self.insert(
+                    connection,
                     "strings",
                     "INSERT OR REPLACE INTO strings VALUES (?1, ?2)",
                     names,
                 )?;
                 for record in records {
-                    self.timeline(record)?;
+                    self.timeline(connection, record)?;
                 }
                 Ok(())
             }
             // An instance's entry marker is twice its number and its exit marker the next id.
             Message::Instances(instances) => self.insert(
+                connection,
                 "fence_probe",
                 "INSERT INTO fence_probe VALUES (?1, ?2, ?3, ?4, ?5)",
                 instances
@@ -507,6 +457,7 @@ impl File {
                     .collect::<Vec<_>>(),
             ),
             Message::Stamps { device, stamps } => self.insert(
+                connection,
                 "fence",
                 "INSERT INTO fence VALUES (?1, ?2, ?3, ?4)",
                 stamps.into_iter().map(|stamp| {
@@ -542,6 +493,7 @@ impl File {
                     })
                     .collect();
                 self.insert(
+                    connection,
                     "pm_sample",
                     "INSERT INTO pm_sample VALUES (?1, ?2, ?3, ?4, ?5)",
                     rows,
@@ -570,12 +522,14 @@ impl File {
                     })
                     .collect();
                 self.insert(
+                    connection,
                     "range_metric",
                     "INSERT INTO range_metric VALUES (?1, ?2, ?3, ?4, ?5)",
                     rows,
                 )
             }
             Message::PcReasons(reasons) => self.insert(
+                connection,
                 "pc_stall_reason",
                 "INSERT OR REPLACE INTO pc_stall_reason VALUES (?1, ?2)",
                 reasons
@@ -586,6 +540,7 @@ impl File {
                 let take = self.pc_takes as i64;
                 self.pc_takes += 1;
                 self.insert(
+                    connection,
                     "pc_take",
                     "INSERT INTO pc_take VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
                     [(
@@ -619,6 +574,7 @@ impl File {
                     })
                     .collect();
                 self.insert(
+                    connection,
                     "pc_sample",
                     "INSERT INTO pc_sample VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
                     rows,
@@ -627,10 +583,11 @@ impl File {
         }
     }
 
-    /// Inserts one CUPTI record into its kind's table.
-    fn timeline(&mut self, record: Record) -> Result<()> {
+    /// Inserts one CUPTI record into its kind's table of `connection`'s file.
+    fn timeline(&mut self, connection: &Connection, record: Record) -> Result<()> {
         match record {
             Record::Kernel(kernel) => self.insert(
+                connection,
                 "kernel",
                 "INSERT INTO kernel VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, \
                  ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22)",
@@ -660,6 +617,7 @@ impl File {
                 ])],
             ),
             Record::Copy(copy) => self.insert(
+                connection,
                 "copy",
                 "INSERT INTO copy VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, \
                  ?13, ?14)",
@@ -687,6 +645,7 @@ impl File {
                 ])],
             ),
             Record::Fill(fill) => self.insert(
+                connection,
                 "fill",
                 "INSERT INTO fill VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
                 [rusqlite::params_from_iter([
@@ -704,6 +663,7 @@ impl File {
                 ])],
             ),
             Record::Memory(memory) => self.insert(
+                connection,
                 "memory",
                 "INSERT INTO memory VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
                 [rusqlite::params_from_iter([
@@ -721,6 +681,7 @@ impl File {
                 ])],
             ),
             Record::Marker(marker) => self.insert(
+                connection,
                 "marker",
                 "INSERT INTO marker VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
                 [(
@@ -736,6 +697,7 @@ impl File {
                 )],
             ),
             Record::MarkerData(data) => self.insert(
+                connection,
                 "marker_data",
                 "INSERT INTO marker_data VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
                 [(
@@ -748,6 +710,7 @@ impl File {
                 )],
             ),
             Record::Graph(graph) => self.insert(
+                connection,
                 "graph",
                 "INSERT INTO graph VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
                 [(
@@ -761,6 +724,7 @@ impl File {
                 )],
             ),
             Record::NvLink(link) => self.insert(
+                connection,
                 "nvlink",
                 "INSERT INTO nvlink VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
                 [(
@@ -776,6 +740,7 @@ impl File {
                 )],
             ),
             Record::Pcie(pcie) => self.insert(
+                connection,
                 "pcie",
                 "INSERT INTO pcie VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
                 [(
@@ -789,6 +754,7 @@ impl File {
                 )],
             ),
             Record::Api(api) => self.insert(
+                connection,
                 "api",
                 "INSERT INTO api VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
                 [(
@@ -888,10 +854,15 @@ mod tests {
         assert!(!directory.path().join("rank0.sqlite-wal").exists());
 
         let connection = Connection::open(&path).unwrap();
-        let version: i64 = connection
-            .query_row("SELECT version FROM schema_version", [], |row| row.get(0))
+        // The file states the version of the format it was written in, which its readers check.
+        let versions: Vec<i64> = connection
+            .prepare("SELECT version FROM schema_version")
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
             .unwrap();
-        assert_eq!(version, SCHEMA_VERSION);
+        assert_eq!(versions, [2]);
         let joined: (String, String) = connection
             .query_row(
                 "SELECT k.text, a.text FROM kernel JOIN api USING (correlation) \
