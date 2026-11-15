@@ -42,14 +42,14 @@
 
 use std::ops::Range;
 
-use nn::{ConditionRole, ConditionShape, DType, Device, LatentShape, Tensor, VideoRequest};
+use nn::{ConditionRole, ConditionShape, DType, Device, LatentShape, Result, Tensor, VideoRequest};
 use proto::video::Layout;
 
+use crate::minimax_h3::ID;
 use crate::minimax_h3::config::{
     AUDIO_CHANNELS, AUDIO_HOP, AUDIO_LATENTS_PER_SECOND, FPS, FRAMES, LATENT_COMPRESSION,
     PATCH_PIXELS, PATCH_SIDE, TransformerConfig, VsaConfig,
 };
-use crate::minimax_h3::{Error, Result};
 
 /// The tag of a generated or condition video row, and of a padding row.
 pub const TAG_VIDEO: u32 = 0;
@@ -166,7 +166,7 @@ pub fn condition_order(request: &VideoRequest) -> Vec<usize> {
 /// reference with a soundtrack, conditions beyond the capacity, or a span outside the prompt.
 pub fn check(request: &VideoRequest, layout: &Layout) -> Result<()> {
     if request.text_tokens < 1 || request.text_tokens > layout.text_rows {
-        return Err(Error::request(format!(
+        return Err(ID.request(format!(
             "a prompt of {} row(s) does not fit the {} text rows of the layout",
             request.text_tokens, layout.text_rows
         )));
@@ -179,7 +179,7 @@ pub fn check(request: &VideoRequest, layout: &Layout) -> Result<()> {
                 || !condition.height.is_multiple_of(PATCH_PIXELS)
                 || condition.frames == 0)
         {
-            return Err(Error::request(format!(
+            return Err(ID.request(format!(
                 "a condition of {} frame(s) at {}x{} is not whole {PATCH_PIXELS}-pixel patches \
                  of at least one frame",
                 condition.frames, condition.width, condition.height
@@ -194,14 +194,12 @@ pub fn check(request: &VideoRequest, layout: &Layout) -> Result<()> {
                     (layout.video.width / PATCH_SIDE) as usize,
                 )
         {
-            return Err(Error::request(
+            return Err(ID.request(
                 "an H3 keyframe carries one frame at the generated video's resolution".to_owned(),
             ));
         }
         if !is_keyframe(condition) && frames == 1 && condition.audio_samples > 0 {
-            return Err(Error::request(
-                "an H3 image reference carries no audio".to_owned(),
-            ));
+            return Err(ID.request("an H3 image reference carries no audio".to_owned()));
         }
     }
 
@@ -214,7 +212,7 @@ pub fn check(request: &VideoRequest, layout: &Layout) -> Result<()> {
         })
         .sum();
     if taken > layout.condition_rows as usize {
-        return Err(Error::request(format!(
+        return Err(ID.request(format!(
             "the request's conditions take {taken} row(s) and the layout reserves {}",
             layout.condition_rows
         )));
@@ -226,9 +224,7 @@ pub fn check(request: &VideoRequest, layout: &Layout) -> Result<()> {
         .iter()
         .any(|(first, rows)| *rows == 0 || first + rows > prompt)
     {
-        return Err(Error::request(
-            "vision spans must lie within the prompt".to_owned(),
-        ));
+        return Err(ID.request("vision spans must lie within the prompt".to_owned()));
     }
     Ok(())
 }
@@ -251,7 +247,7 @@ pub fn layout(
     condition_rows: u32,
 ) -> Result<Layout> {
     if request.width == 0 || request.height == 0 {
-        return Err(Error::request(format!(
+        return Err(ID.request(format!(
             "a {}x{} request has no resolution",
             request.width, request.height
         )));
@@ -364,9 +360,7 @@ fn axis_ends(axis: &Tensor) -> Result<(f64, f64)> {
 
     match (points.first(), points.last()) {
         (Some(first), Some(last)) => Ok((*first, *last)),
-        _ => Err(Error::request(
-            "a raster of no patch has no spatial axis".to_owned(),
-        )),
+        _ => Err(ID.request("a raster of no patch has no spatial axis".to_owned())),
     }
 }
 

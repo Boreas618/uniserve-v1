@@ -21,13 +21,13 @@ use nn::modules::{
     GateUp, GatedDeltaNet, GatedDeltaNetConfig, MlpConfig, MoE, MoEConfig, Rotary, SharedExpert,
     SharedExpertConfig,
 };
-use nn::{DType, ExpertExchange, KvCache, RecurrentState, Tensor, TokenBatch, VarBuilder};
+use nn::{DType, ExpertExchange, KvCache, RecurrentState, Result, Tensor, TokenBatch, VarBuilder};
 
+use crate::qwen4_exp::ID;
 use crate::qwen4_exp::attention::IndexedAttention;
 use crate::qwen4_exp::config::Config;
 use crate::qwen4_exp::hyper_connection::HyperConnection;
 use crate::qwen4_exp::ngram::PleLayer;
-use crate::qwen4_exp::{Error, Result};
 
 /// The profiler class of one decoder layer, at path `<stack>.layers.<i>`, which a deployment's
 /// range patterns select (`docs/profiling.md`).
@@ -297,7 +297,7 @@ impl DecoderLayer {
     }
 
     /// The refusal of a forward that needs `what` and has none.
-    fn lent_no(&self, what: &str) -> Error {
-        Error::Config(format!("{} has no {what}", self.path))
+    fn lent_no(&self, what: &str) -> nn::Error {
+        ID.config(format!("{} has no {what}", self.path))
     }
 }

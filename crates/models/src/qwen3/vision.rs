@@ -38,11 +38,11 @@ use nn::modules::{
     Attention, AttentionConfig, LayerNorm, LayerNormConfig, Linear, LinearConfig, Parallel,
     Precision, QkNorm, QkvBias, QkvLinearConfig, QkvNames, Rotary, RotaryConfig, Spectrum,
 };
-use nn::{DType, PatchFormat, PixelNorm, Split, Tensor, VarBuilder, Vision, functional};
+use nn::{DType, PatchFormat, PixelNorm, Result, Split, Tensor, VarBuilder, Vision, functional};
 use processing::qwen_vl::ProcessorConfig;
 
 use crate::qwen3::config::{POSITION_AXES, VisionConfig};
-use crate::qwen3::{Error, Result, positions};
+use crate::qwen3::{ID, positions};
 
 /// Every normalization's variance floor (`partial(nn.LayerNorm, eps=1e-6)` in the reference).
 const LAYER_NORM_EPS: f32 = 1e-6;
@@ -81,7 +81,7 @@ fn linear(vb: VarBuilder<'_, '_>, inputs: u32, outputs: u32) -> Result<Linear> {
         parallel: Parallel::None,
     };
 
-    Ok(Linear::load(&config, vb)?)
+    Linear::load(&config, vb)
 }
 
 /// A layer normalization with a bias over rows of `width` at `vb`.
@@ -92,7 +92,7 @@ fn layer_norm(vb: VarBuilder<'_, '_>, width: u32) -> Result<LayerNorm> {
         bias: true,
     };
 
-    Ok(LayerNorm::load(&config, vb)?)
+    LayerNorm::load(&config, vb)
 }
 
 /// One pre-norm block of the tower: attention and an ungated MLP, each added to the stream
@@ -240,7 +240,7 @@ impl PatchMerger {
         };
 
         let activated = functional::gelu(&self.linear_fc1.forward(&normalized)?)?;
-        Ok(self.linear_fc2.forward(&activated)?)
+        self.linear_fc2.forward(&activated)
     }
 }
 
@@ -281,7 +281,7 @@ impl VisionTower {
             config.temporal_patch_size,
             config.spatial_merge_size,
         ) {
-            return Err(Error::Config(format!(
+            return Err(ID.config(format!(
                 "the processor patches {} over {} frames merging {}, the tower {} over {} \
                  merging {}",
                 processor.patch_size,
@@ -344,7 +344,7 @@ impl VisionTower {
         let [time, height, width] = grid;
 
         time.checked_mul(height * width)
-            .ok_or_else(|| Error::Config(format!("a grid of {grid:?} patches")))
+            .ok_or_else(|| ID.config(format!("a grid of {grid:?} patches")))
     }
 
     /// The learned position of every patch of `grid`: `[patches, hidden]` in the table's
@@ -386,10 +386,7 @@ impl VisionTower {
     pub fn forward(&self, grid: [u32; 3], pixels: &Tensor) -> Result<Tensor> {
         let patches = self.patches(grid)?;
         if pixels.dims() != [patches as usize, self.config.tubelet() as usize] {
-            return Err(Error::Config(format!(
-                "pixels of {:?} for a {grid:?} grid",
-                pixels.dims()
-            )));
+            return Err(ID.config(format!("pixels of {:?} for a {grid:?} grid", pixels.dims())));
         }
         let [_, height, width] = grid;
         let device = pixels.device();
@@ -425,7 +422,7 @@ impl Vision for VisionTower {
         let grid = self
             .processor
             .image_grid(height, width)
-            .map_err(|error| Error::Config(error.to_string()))?;
+            .map_err(|error| ID.config(error.to_string()))?;
 
         Ok([grid.t, grid.h, grid.w])
     }
@@ -436,9 +433,7 @@ impl Vision for VisionTower {
 
     fn image_rows(&self, grid: [u32; 3]) -> nn::Result<u32> {
         if grid[0] != 1 {
-            return Err(
-                Error::Config(format!("an image is one time step, not the grid {grid:?}")).into(),
-            );
+            return Err(ID.config(format!("an image is one time step, not the grid {grid:?}")));
         }
         let merge = self.config.spatial_merge_size;
 
@@ -454,7 +449,7 @@ impl Vision for VisionTower {
             .find(|side| rows.is_multiple_of(*side));
         match short {
             Some(short) => Ok([1, short * merge, rows / short * merge]),
-            None => Err(Error::Config(format!("no image grid encodes to {rows} rows")).into()),
+            None => Err(ID.config(format!("no image grid encodes to {rows} rows"))),
         }
     }
 
@@ -473,27 +468,22 @@ impl Vision for VisionTower {
     fn image_positions(&self, grid: [u32; 3], start: u32) -> nn::Result<Tensor> {
         self.image_rows(grid)?;
 
-        Ok(positions::vision_block(
-            grid,
-            self.config.spatial_merge_size,
-            start,
-        )?)
+        positions::vision_block(grid, self.config.spatial_merge_size, start)
     }
 
     fn encode_image(&self, grid: [u32; 3], pixels: &Tensor, out: &Tensor) -> nn::Result<()> {
         let rows = self.image_rows(grid)? as usize;
         let width = self.config.out_hidden_size as usize;
         if out.dims() != [rows, width] {
-            return Err(Error::Config(format!(
+            return Err(ID.config(format!(
                 "an image of {rows} rows of {width} written into {:?}",
                 out.dims()
-            ))
-            .into());
+            )));
         }
 
         // A causal language model's tower states no DeepStack block, so the features are the
         // merged rows alone.
-        let features = self.forward(grid, pixels).map_err(nn::Error::from)?;
+        let features = self.forward(grid, pixels)?;
         Ok(out.slice_set(&features.narrow(1, 0, width)?.contiguous()?, 0, 0)?)
     }
 }

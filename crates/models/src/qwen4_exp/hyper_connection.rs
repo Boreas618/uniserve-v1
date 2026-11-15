@@ -29,10 +29,10 @@
 //! order.
 
 use nn::modules::{Linear, LinearConfig, Parallel};
-use nn::{DType, Tensor, VarBuilder, functional};
+use nn::{DType, Result, Tensor, VarBuilder, functional};
 
+use crate::qwen4_exp::ID;
 use crate::qwen4_exp::config::Config;
-use crate::qwen4_exp::{Error, Result};
 
 /// A gated hyper-connection, its modules named as the checkpoint names them.
 pub struct HyperConnection {
@@ -108,7 +108,7 @@ impl HyperConnection {
         let (tokens, width) = streams.dims2()?;
         let hidden = width / count.max(1);
         if count == 0 || hidden * count != width || output.dims() != [tokens, hidden] {
-            return Err(Error::Config(format!(
+            return Err(ID.config(format!(
                 "streams of {:?} and a block output of {:?} are not {count} streams of one \
                  width",
                 streams.dims(),
@@ -149,7 +149,7 @@ impl HyperConnection {
     pub fn norm(&self, streams: &Tensor) -> Result<Tensor> {
         let (tokens, width) = streams.dims2()?;
         if width != self.streams * self.hidden {
-            return Err(Error::Config(format!(
+            return Err(ID.config(format!(
                 "streams of {width} elements against {} streams of {}",
                 self.streams, self.hidden
             )));
@@ -234,7 +234,7 @@ impl HyperConnection {
 
 /// The projection `module` under `vb`, `[outputs, inputs]` without a bias, whole on the rank.
 fn projection(vb: &VarBuilder<'_, '_>, module: &str, inputs: u32, outputs: u32) -> Result<Linear> {
-    Ok(Linear::load(
+    Linear::load(
         &LinearConfig {
             inputs,
             outputs,
@@ -242,7 +242,7 @@ fn projection(vb: &VarBuilder<'_, '_>, module: &str, inputs: u32, outputs: u32) 
             parallel: Parallel::None,
         },
         vb.pp(module),
-    )?)
+    )
 }
 
 impl std::fmt::Debug for HyperConnection {

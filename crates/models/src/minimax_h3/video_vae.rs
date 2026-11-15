@@ -63,11 +63,13 @@ use nn::modules::{
     ResnetBlock3d, ResnetBlock3dConfig, Rotary, RotaryConfig, Spectrum,
 };
 use nn::vae::{self, TemporalClips};
-use nn::{Clip, DType, Decoder, Device, LatentShape, PixelNorm, Splice, Split, Tensor, VarBuilder};
+use nn::{
+    Clip, DType, Decoder, Device, LatentShape, PixelNorm, Result, Splice, Split, Tensor, VarBuilder,
+};
 use processing::minimax_h3::{FRAMES, LATENT_COMPRESSION};
 use proto::video::Layout;
 
-use crate::minimax_h3::{Error, Result, VideoVaeConfig};
+use crate::minimax_h3::{ID, VideoVaeConfig};
 
 /// The ImageNet constants a video raster is normalized by, in red, green, blue order: the
 /// decoder's output and the encoder's condition pixels alike (the reference's
@@ -146,12 +148,12 @@ pub fn temporal_clips(config: &VideoVaeConfig) -> TemporalClips {
 /// A frame count the frame rule does not generate.
 pub fn splices(clips: &TemporalClips, frames: u32) -> Result<Vec<Splice>> {
     if !FRAMES.is_legal(frames) {
-        return Err(Error::request(format!(
+        return Err(ID.request(format!(
             "a timeline is a frame count of the frame rule {FRAMES:?}, and {frames} is not"
         )));
     }
 
-    Ok(clips.splices(FRAMES.units(frames))?)
+    clips.splices(FRAMES.units(frames))
 }
 
 /// The rotary embedding of the decoder's attention.
@@ -360,7 +362,7 @@ impl TransformerBlock {
         let activation = match vb.dtype() {
             Some(pinned) => pinned,
             None if query.is_packed() => {
-                return Err(Error::config(format!(
+                return Err(ID.config(format!(
                     "the packed projections of {} encode rows of the element type their builder \
                      pins, and it pins none",
                     vb.path()
@@ -404,7 +406,7 @@ impl TransformerBlock {
         max_seqlen: u32,
     ) -> Result<(Tensor, Tensor)> {
         let rows = u32::try_from(hidden.dims().first().copied().unwrap_or(0))
-            .map_err(|_| Error::request("a stream of more rows than a launch addresses"))?;
+            .map_err(|_| ID.request("a stream of more rows than a launch addresses"))?;
 
         // The rows the projections read are normalized into the projections' own type.
         let (normalized, hidden) = match pending {
@@ -490,12 +492,12 @@ impl VideoDecoder {
     pub fn load(config: &VideoVaeConfig, vb: VarBuilder<'_, '_>) -> Result<Self> {
         let channels = config.latent_channels;
         if config.decoder_num_layers == 0 {
-            return Err(Error::config("the video decoder has no transformer block"));
+            return Err(ID.config("the video decoder has no transformer block"));
         }
         if config.latents_mean.len() != channels as usize
             || config.latents_std.len() != channels as usize
         {
-            return Err(Error::config(format!(
+            return Err(ID.config(format!(
                 "the video latent statistics hold {} means and {} deviations for {channels} \
                  channels",
                 config.latents_mean.len(),
@@ -589,7 +591,7 @@ impl VideoDecoder {
         let sequence = voxels + suffix;
 
         if latents.dims() != [tiles * voxels, channels] || latents.dtype() != STREAM {
-            return Err(Error::request(format!(
+            return Err(ID.request(format!(
                 "the decoder reads a clip's latents as {STREAM:?} [{}, {channels}], {tiles} \
                  tile(s) of {voxels} voxels, not {:?} {:?}",
                 tiles * voxels,
@@ -604,7 +606,7 @@ impl VideoDecoder {
             width as usize * spatial,
         ];
         if video.dims() != raster || video.dtype() != ACTIVATION {
-            return Err(Error::request(format!(
+            return Err(ID.request(format!(
                 "the clip's raster is {ACTIVATION:?} {raster:?}, not {:?} {:?}",
                 video.dtype(),
                 video.dims()
@@ -679,7 +681,7 @@ impl VideoDecoder {
             pending = Some((update, &block.scale2));
         }
         let Some((update, scale)) = pending else {
-            return Err(Error::config("the video decoder has no transformer block"));
+            return Err(ID.config("the video decoder has no transformer block"));
         };
         let normalized = functional::scaled_residual_layer_norm(
             &hidden,
@@ -738,19 +740,18 @@ impl Decoder for VideoDecoder {
             || trajectory.dtype() != STREAM
             || block.dtype() != STREAM
         {
-            return Err(Error::request(format!(
+            return Err(ID.request(format!(
                 "the decoder gathers {STREAM:?} latents of {channels} channels, and the \
                  trajectory is {:?} {:?} and the block {:?}",
                 trajectory.dtype(),
                 trajectory.dims(),
                 block.dtype()
-            ))
-            .into());
+            )));
         }
 
         // The clip's voxels follow the `first` latent frames before it in the trajectory.
         let Some(rows) = self.latent_rows(layout)? else {
-            return Err(Error::request("the video decoder lists its tiles' voxels").into());
+            return Err(ID.request("the video decoder lists its tiles' voxels"));
         };
         let frame = layout.video.height * layout.video.width;
         let voxels = rows
@@ -804,12 +805,11 @@ impl Decoder for VideoDecoder {
             || !whole(clip.height, spatial)
             || !whole(clip.width, spatial)
         {
-            return Err(Error::request(format!(
+            return Err(ID.request(format!(
                 "a {}x{} raster of {} frame(s) is not whole latent cells of {spatial} pixels and \
                  {temporal} frames",
                 clip.width, clip.height, clip.frames
-            ))
-            .into());
+            )));
         }
 
         Ok(Layout {
@@ -839,11 +839,11 @@ impl Decoder for VideoDecoder {
         audio: Option<&Tensor>,
     ) -> nn::Result<()> {
         let (Some(video), None) = (video, audio) else {
-            return Err(Error::request("a video decode writes a raster and no waveform").into());
+            return Err(ID.request("a video decode writes a raster and no waveform"));
         };
 
         nn::profiler::range("VideoDecoder", &self.path, || {
-            Ok(self.decode_clip(layout, latents, video)?)
+            self.decode_clip(layout, latents, video)
         })
     }
 }
@@ -918,7 +918,7 @@ fn check_stages(config: &VideoVaeConfig) -> Result<()> {
         || config.layers_per_block == 0
         || config.latent_channels == 0
     {
-        return Err(Error::config(format!(
+        return Err(ID.config(format!(
             "the video encoder has {stages} stage(s) of {} block(s) and {} latent channel(s), \
              with {} spatial and {} temporal strides",
             config.layers_per_block,
@@ -933,7 +933,7 @@ fn check_stages(config: &VideoVaeConfig) -> Result<()> {
         .iter()
         .chain(&config.temporal_downsample_factors);
     if strides.clone().any(|stride| *stride == 0) {
-        return Err(Error::config("a stride of the video encoder is zero"));
+        return Err(ID.config("a stride of the video encoder is zero"));
     }
 
     let compression = config
@@ -941,14 +941,14 @@ fn check_stages(config: &VideoVaeConfig) -> Result<()> {
         .iter()
         .try_fold(1_u32, |product, stride| product.checked_mul(*stride));
     if compression != Some(LATENT_COMPRESSION) {
-        return Err(Error::config(format!(
+        return Err(ID.config(format!(
             "the video encoder compresses space {compression:?}-fold, and the latent space is \
              {LATENT_COMPRESSION}-fold"
         )));
     }
 
     if !config.norm_eps.is_finite() || config.norm_eps <= 0.0 {
-        return Err(Error::config(format!(
+        return Err(ID.config(format!(
             "the video encoder's normalization epsilon is {}",
             config.norm_eps
         )));
@@ -1083,7 +1083,7 @@ impl VideoEncoder {
             hidden = block.forward(&hidden)?;
         }
 
-        Ok(self.conv_out.forward(&self.norm_out.forward(&hidden)?)?)
+        self.conv_out.forward(&self.norm_out.forward(&hidden)?)
     }
 
     /// A condition's normalized latent: `pixels`, `[in_channels, frames, height, width]` in
@@ -1112,7 +1112,7 @@ impl VideoEncoder {
     fn encode_condition(&self, pixels: &Tensor) -> Result<Tensor> {
         let (spatial, channels) = (self.spatial, self.latent_channels);
         let &[_, frames, height, width] = pixels.dims() else {
-            return Err(Error::request(format!(
+            return Err(ID.request(format!(
                 "a condition's pixels are [channels, frames, height, width], not {:?}",
                 pixels.dims()
             )));
@@ -1123,7 +1123,7 @@ impl VideoEncoder {
             || !height.is_multiple_of(spatial)
             || !width.is_multiple_of(spatial)
         {
-            return Err(Error::request(format!(
+            return Err(ID.request(format!(
                 "the video encoder reads FP32 pixels of {} channels over whole {spatial}-pixel \
                  latent cells, not {:?} {:?}",
                 self.in_channels,
@@ -1142,7 +1142,7 @@ impl VideoEncoder {
             // frame counts the rule generates, and for a still.
             let encoded = (span.frames as usize).div_ceil(self.temporal);
             if encoded != span.latents as usize {
-                return Err(Error::request(format!(
+                return Err(ID.request(format!(
                     "a condition of {frames} frames ends in a clip of {} that encodes to \
                      {encoded} latent frames, of which the frame rule keeps {}",
                     span.frames, span.latents

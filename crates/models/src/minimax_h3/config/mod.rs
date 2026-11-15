@@ -32,7 +32,7 @@ use std::collections::BTreeMap;
 use nn::config::Fields;
 use nn::family::Stage;
 use nn::quantization::ModeloptManifest;
-use nn::{PipelineIndex, PixelNorm};
+use nn::{PipelineIndex, PixelNorm, Result};
 use processing::qwen_vl::ProcessorConfig;
 use serde_json::Value;
 
@@ -46,7 +46,7 @@ pub use processing::minimax_h3::{
 pub use text::RETAINED_LAYERS;
 pub use video_vae::VideoVaeConfig;
 
-use crate::minimax_h3::{Error, Result, VideoTask};
+use crate::minimax_h3::{ID, VideoTask};
 
 /// The video VAE's temporal compression: one latent frame covers this many video frames.
 pub const TEMPORAL_COMPRESSION: u32 = 4;
@@ -149,7 +149,7 @@ impl Component {
         Self::ALL
             .into_iter()
             .find(|component| component.network() == Some(stage))
-            .ok_or_else(|| Error::config(format!("{} places no MiniMax-H3 network", stage.name())))
+            .ok_or_else(|| ID.config(format!("{} places no MiniMax-H3 network", stage.name())))
     }
 
     /// The checkpoint-relative path of `file` in the component's directory.
@@ -179,9 +179,7 @@ pub fn released_networks(index: &PipelineIndex) -> Result<Vec<Stage>> {
         .filter_map(Component::network)
         .collect();
     if networks.is_empty() {
-        return Err(Error::checkpoint(
-            "the pipeline index declares no MiniMax-H3 network".to_owned(),
-        ));
+        return Err(ID.checkpoint("the pipeline index declares no MiniMax-H3 network".to_owned()));
     }
     Ok(networks)
 }
@@ -226,11 +224,7 @@ impl Config {
     pub fn open(checkpoint: &nn::Checkpoint, networks: &Networks) -> Result<Self> {
         let root = checkpoint.root().display().to_string();
 
-        Self::read(
-            |relative| Ok(checkpoint.sidecar(relative)?),
-            networks,
-            &root,
-        )
+        Self::read(|relative| checkpoint.sidecar(relative), networks, &root)
     }
 
     /// The configuration of the sidecars `sidecar` returns by checkpoint-relative path, for the
@@ -246,7 +240,7 @@ impl Config {
     ) -> Result<Self> {
         let require = |relative: &str| -> Result<Value> {
             sidecar(relative)?.ok_or_else(|| {
-                Error::checkpoint(format!("the checkpoint at {root} holds no {relative}"))
+                ID.checkpoint(format!("the checkpoint at {root} holds no {relative}"))
             })
         };
 
@@ -268,7 +262,7 @@ impl Config {
         let processor = sidecar(&Component::Processor.file("video_preprocessor_config.json"))?
             .map(|video| ProcessorConfig::from_values(&image_processor, &video))
             .transpose()
-            .map_err(|error| Error::config(format!("the checkpoint's processor: {error}")))?;
+            .map_err(|error| ID.config(format!("the checkpoint's processor: {error}")))?;
 
         let mut video_vae = VideoVaeConfig::parse(&require(&Component::Vae.file("config.json"))?)?;
         video_vae.quantization = declared(Component::Vae.name())?;
@@ -332,7 +326,7 @@ impl Config {
     /// A configuration built without one, which the reader refuses.
     pub fn vision(&self) -> Result<&crate::qwen3::VisionConfig> {
         self.text_encoder.vision.as_ref().ok_or_else(|| {
-            Error::config("H3's text encoder is a Qwen3-VL model with a vision tower".to_owned())
+            ID.config("H3's text encoder is a Qwen3-VL model with a vision tower".to_owned())
         })
     }
 
@@ -364,7 +358,7 @@ impl Config {
             TEMPORAL_COMPRESSION,
         );
         if stated != served {
-            return Err(Error::config(format!(
+            return Err(ID.config(format!(
                 "the MiniMax-H3 video_vae must encode {}-frame clips to {} latent frames, \
                  keeping {} of them in the final clip, at {LATENT_COMPRESSION}x spatial and \
                  {TEMPORAL_COMPRESSION}x temporal compression; this checkpoint states {} frames \
@@ -377,14 +371,14 @@ impl Config {
         // run at it and hop the rule's latent step.
         let audio = &self.audio_vae;
         if audio.sampling_rate != AUDIO_SAMPLE_RATE {
-            return Err(Error::config(format!(
+            return Err(ID.config(format!(
                 "the MiniMax-H3 audio_vae samples at {} Hz; the request rule's audio runs at \
                  {AUDIO_SAMPLE_RATE} Hz",
                 audio.sampling_rate
             )));
         }
         if audio.hop() != AUDIO_HOP || audio.decoder_hop() != AUDIO_HOP {
-            return Err(Error::config(format!(
+            return Err(ID.config(format!(
                 "the MiniMax-H3 audio_vae must hop {AUDIO_HOP} samples per latent; this \
                  checkpoint encodes {} and decodes {}",
                 audio.hop(),
@@ -398,7 +392,7 @@ impl Config {
             let transformer = &denoiser.transformer;
 
             if self.text_encoder.text.hidden_size != transformer.text_dim {
-                return Err(Error::config(format!(
+                return Err(ID.config(format!(
                     "H3 text features are {} wide and the {} network conditions on {}",
                     self.text_encoder.text.hidden_size,
                     stage.name(),
@@ -406,7 +400,7 @@ impl Config {
                 )));
             }
             if video.latent_channels != transformer.video_channels {
-                return Err(Error::config(format!(
+                return Err(ID.config(format!(
                     "H3 video latents have {} channels and the {} network reads {}",
                     video.latent_channels,
                     stage.name(),
@@ -414,7 +408,7 @@ impl Config {
                 )));
             }
             if audio.latent_channels != transformer.audio_channels {
-                return Err(Error::config(format!(
+                return Err(ID.config(format!(
                     "H3 audio latents have {} channels and the {} network reads {}",
                     audio.latent_channels,
                     stage.name(),
@@ -444,7 +438,7 @@ fn student_denoising(
         if let Some(stated) = stated
             && stated as f32 != shift
         {
-            return Err(Error::config(format!(
+            return Err(ID.config(format!(
                 "{}.{key} is {stated}, which disagrees with the scheduler sidecar's shift of \
                  {shift}",
                 Contract::FILE
@@ -697,7 +691,7 @@ pub(crate) mod tests_support {
             (None, Some(contract)) => Networks::Student(Contract::parse(contract)?),
             (None, None) => {
                 let index = files.get("model_index.json").ok_or_else(|| {
-                    Error::checkpoint("the fixture states no model_index.json".to_owned())
+                    ID.checkpoint("the fixture states no model_index.json".to_owned())
                 })?;
                 let index = PipelineIndex::parse(std::path::Path::new("model_index.json"), index)?;
                 Networks::Released(released_networks(&index)?)
@@ -858,7 +852,7 @@ mod tests {
         encoder["vision_config"]["out_hidden_size"] = json("4096");
         let error = read(&widths, None).unwrap_err();
         assert!(
-            matches!(error, Error::Config(ref problem) if problem.contains("conditions on")),
+            matches!(error, nn::Error::Model { refusal: nn::Refusal::Config, ref problem, .. } if problem.contains("conditions on")),
             "{error}"
         );
 
@@ -870,7 +864,7 @@ mod tests {
         vae["latents_std"] = statistics(1.0);
         let error = read(&channels, None).unwrap_err();
         assert!(
-            matches!(error, Error::Config(ref problem) if problem.contains("channels")),
+            matches!(error, nn::Error::Model { refusal: nn::Refusal::Config, ref problem, .. } if problem.contains("channels")),
             "{error}"
         );
     }
@@ -882,7 +876,7 @@ mod tests {
             json("[1, 2, 1, 1, 1, 1]");
         let error = read(&compression, None).unwrap_err();
         assert!(
-            matches!(error, Error::Config(ref problem) if problem.contains("temporal")),
+            matches!(error, nn::Error::Model { refusal: nn::Refusal::Config, ref problem, .. } if problem.contains("temporal")),
             "{error}"
         );
 
@@ -890,7 +884,7 @@ mod tests {
         clock.get_mut("audio_vae/config.json").unwrap()["sampling_rate"] = json("44100");
         let error = read(&clock, None).unwrap_err();
         assert!(
-            matches!(error, Error::Config(ref problem)
+            matches!(error, nn::Error::Model { refusal: nn::Refusal::Config, ref problem, .. }
                 if problem.contains("44100") && problem.contains("32000 Hz")),
             "{error}"
         );
@@ -921,7 +915,7 @@ mod tests {
         );
         let error = read(&files, None).unwrap_err();
         assert!(
-            matches!(error, Error::Config(ref problem) if problem.contains("disagree")),
+            matches!(error, nn::Error::Model { refusal: nn::Refusal::Config, ref problem, .. } if problem.contains("disagree")),
             "{error}"
         );
     }
@@ -1014,7 +1008,7 @@ mod tests {
         files.insert(ModeloptManifest::FILE.to_owned(), unplaced);
         let error = read(&files, None).unwrap_err();
         assert!(
-            matches!(error, Error::Config(ref problem) if problem.contains(listed)),
+            matches!(error, nn::Error::Model { refusal: nn::Refusal::Config, ref problem, .. } if problem.contains(listed)),
             "{error}"
         );
 
@@ -1023,7 +1017,7 @@ mod tests {
         files.insert(ModeloptManifest::FILE.to_owned(), inconsistent);
         let error = read(&files, None).unwrap_err();
         assert!(
-            matches!(error, Error::Nn(nn::Error::Config { ref field, .. }) if field == "modules"),
+            matches!(error, nn::Error::Config { ref field, .. } if field == "modules"),
             "{error}"
         );
     }

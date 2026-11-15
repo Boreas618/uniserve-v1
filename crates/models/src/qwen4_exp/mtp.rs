@@ -41,14 +41,14 @@
 
 use nn::family::{CacheShape, StateShape, TextPlacement};
 use nn::modules::{Linear, LinearConfig, Parallel, RmsNorm, RmsNormConfig, Rotary};
-use nn::{DType, Drafter, KvCache, RecurrentState, Tensor, TokenBatch, VarBuilder};
+use nn::{DType, Drafter, KvCache, RecurrentState, Result, Tensor, TokenBatch, VarBuilder};
 
+use crate::qwen4_exp::ID;
 use crate::qwen4_exp::attention::IndexedAttention;
 use crate::qwen4_exp::causal_lm::{cache_shape, coordinates, token_columns};
 use crate::qwen4_exp::config::Config;
 use crate::qwen4_exp::decoder::DecoderLayer;
 use crate::qwen4_exp::hyper_connection::HyperConnection;
-use crate::qwen4_exp::{Error, Result};
 
 /// The profiler class of the drafter's whole forward, at path `mtp`.
 const DRAFTER: &str = "models.qwen4_exp.transformer.Drafter";
@@ -91,14 +91,14 @@ impl Mtp {
         match config.mtp_num_hidden_layers {
             1 => {}
             0 => {
-                return Err(Error::Config(
+                return Err(ID.config(
                     "the deployment speculates and the checkpoint carries no \
                      multi-token-prediction layer"
                         .to_owned(),
                 ));
             }
             layers => {
-                return Err(Error::Config(format!(
+                return Err(ID.config(format!(
                     "a drafter of {layers} layers runs one layer per speculative step, which \
                      a draft forward is not told; one layer is served"
                 )));
@@ -186,12 +186,11 @@ impl Drafter for Mtp {
         _embedded: &Tensor,
         _hidden: &Tensor,
     ) -> nn::Result<Tensor> {
-        Err(Error::Config(
+        Err(ID.config(
             "the drafter's layer keeps a ring of index keys per request: it runs through \
              forward_stateful with that state"
                 .to_owned(),
-        )
-        .into())
+        ))
     }
 
     /// The drafter over `batch`: `embedded [tokens, H]` holds the embedding of each entry's
@@ -207,21 +206,18 @@ impl Drafter for Mtp {
     ) -> nn::Result<Tensor> {
         let (tokens, width) = (batch.tokens(), self.hidden * self.streams);
         if embedded.dims() != [tokens, self.hidden] || hidden.dims() != [tokens, width] {
-            return Err(Error::Config(format!(
+            return Err(ID.config(format!(
                 "the drafter's embeddings are {:?} and its streams {:?}; [{tokens}, {}] and \
                  [{tokens}, {width}] expected",
                 embedded.dims(),
                 hidden.dims(),
                 self.hidden
-            ))
-            .into());
+            )));
         }
 
         let forward = || -> Result<Tensor> {
             let state = state.ok_or_else(|| {
-                Error::Config(
-                    "the drafter's ring is a state, and the forward was lent none".to_owned(),
-                )
+                ID.config("the drafter's ring is a state, and the forward was lent none".to_owned())
             })?;
             let dtype = hidden.dtype();
 
@@ -264,7 +260,7 @@ impl Drafter for Mtp {
             HyperConnection::combine(&streams, &output, Some(&logits), self.streams)
         };
 
-        Ok(nn::profiler::range(DRAFTER, &self.path, forward)?)
+        nn::profiler::range(DRAFTER, &self.path, forward)
     }
 
     /// The rows the model's head projects of the drafter's streams: normalized and mixed by

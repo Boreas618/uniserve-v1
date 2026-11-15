@@ -45,44 +45,5 @@ pub use hyper_connection::HyperConnection;
 pub use mtp::Mtp;
 pub use ngram::{NgramEmbedding, PleLayer};
 
-/// What this family can fail with.
-#[derive(Debug, thiserror::Error)]
-pub enum Error {
-    /// The checkpoint's configuration is not a configuration this family builds, a deployment's
-    /// split does not divide what it shards, or a call's inputs do not describe the model.
-    #[error("qwen4_exp: {0}")]
-    Config(String),
-    /// A module, a function or the weight loader refused the call.
-    #[error(transparent)]
-    Nn(#[from] nn::Error),
-}
-
-impl From<tensor::Error> for Error {
-    fn from(error: tensor::Error) -> Self {
-        Self::Nn(error.into())
-    }
-}
-
-impl From<crate::qwen3::Error> for Error {
-    /// A refusal of the shared readers and modules is this family's.
-    fn from(error: crate::qwen3::Error) -> Self {
-        match error {
-            crate::qwen3::Error::Nn(error) => Self::Nn(error),
-            crate::qwen3::Error::Config(problem) => Self::Config(problem),
-        }
-    }
-}
-
-/// The family's result type.
-pub type Result<T> = std::result::Result<T, Error>;
-
-impl From<Error> for nn::Error {
-    /// A failure of the shared library passes through unchanged; a refusal of this family's own
-    /// is [`nn::Error::Model`] naming the family.
-    fn from(error: Error) -> Self {
-        match error {
-            Error::Nn(error) => error,
-            other => nn::Error::model("qwen4_exp", other),
-        }
-    }
-}
+/// The id this family's refusals name it by ([`nn::Error::Model`]): its registration's.
+pub(crate) const ID: nn::ModelId = nn::ModelId(processing::qwen::QWEN4_EXP.id);

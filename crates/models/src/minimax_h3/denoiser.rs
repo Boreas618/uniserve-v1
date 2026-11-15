@@ -44,8 +44,8 @@ use nn::diffusion::{add_noise, euler_step, scale_noise};
 use nn::family::{DenoiserSplit, GATHER_AXIS, ULYSSES_AXIS};
 use nn::modules::{TimestepTable, TimestepTableConfig};
 use nn::{
-    ConditionPiece, Conditioning, DType, Device, MediaInput, Shape, Step, Tensor, VarBuilder,
-    VideoRequest, functional,
+    ConditionPiece, Conditioning, DType, Device, MediaInput, Result, Shape, Step, Tensor,
+    VarBuilder, VideoRequest, functional,
 };
 use proto::video::Layout;
 
@@ -57,7 +57,7 @@ use crate::minimax_h3::modulation::{self, Modulation, VISUAL_CONDITION_TIME};
 use crate::minimax_h3::refiner::TokenRefiner;
 use crate::minimax_h3::transformer::Transformer;
 use crate::minimax_h3::video_vae::VideoEncoder;
-use crate::minimax_h3::{Error, Result, VideoTask, packing};
+use crate::minimax_h3::{ID, VideoTask, packing};
 
 /// The element type of the sample a trajectory accumulates, and of its noise.
 pub const SAMPLE_DTYPE: DType = DType::F32;
@@ -137,9 +137,7 @@ impl Denoiser {
         let (text_rows, condition_rows) = capacity;
 
         if transformer.head_dim == 0 || transformer.num_attention_heads == 0 {
-            return Err(Error::config(
-                "a denoiser's transformer has attention heads".to_owned(),
-            ));
+            return Err(ID.config("a denoiser's transformer has attention heads".to_owned()));
         }
         // The sequence split's places are the Ulysses split's inside the all-gather split's.
         for (axis, place) in [
@@ -147,14 +145,14 @@ impl Denoiser {
             ("all-gather", split.gather),
         ] {
             if place.rank >= place.size {
-                return Err(Error::config(format!(
+                return Err(ID.config(format!(
                     "rank {} of a {axis} split of {} is no place of it",
                     place.rank, place.size
                 )));
             }
         }
         if !sequence.size.is_power_of_two() {
-            return Err(Error::config(format!(
+            return Err(ID.config(format!(
                 "rank {} of a sequence split of {} is not a rank of a power-of-two split",
                 sequence.rank, sequence.size
             )));
@@ -162,7 +160,7 @@ impl Denoiser {
         let unit = config.capacity_unit();
         for (name, rows) in [("text", text_rows), ("condition", condition_rows)] {
             if rows == 0 || !rows.is_multiple_of(unit) {
-                return Err(Error::config(format!(
+                return Err(ID.config(format!(
                     "a {name} capacity of {rows} rows is not a multiple of the {unit}-row unit"
                 )));
             }
@@ -259,7 +257,7 @@ impl Denoiser {
 
         // The text capacity, the condition rows and the row of zeros are the whole tensor.
         if total < text_rows + taken + 1 {
-            return Err(Error::request(format!(
+            return Err(ID.request(format!(
                 "the request's conditions take {taken} rows and a conditioning of {total} rows \
                  holds {text_rows} text rows and the row of zeros"
             )));
@@ -274,7 +272,7 @@ impl Denoiser {
     /// before its visual rows, and checks the encoders against the counts.
     fn encode_media(&self, media: &[MediaInput], text: &Tensor) -> Result<()> {
         let Some((video_encoder, audio_encoder)) = &self.encoders else {
-            return Err(Error::request(
+            return Err(ID.request(
                 "a request carries conditions and this deployment places no condition encoder"
                     .to_owned(),
             ));
@@ -285,7 +283,7 @@ impl Denoiser {
         for piece in media {
             if piece.audio_rows > 0 {
                 let Some(samples) = &piece.audio else {
-                    return Err(Error::request(format!(
+                    return Err(ID.request(format!(
                         "condition {:?} states {} audio rows and no samples",
                         piece.role, piece.audio_rows
                     )));
@@ -296,7 +294,7 @@ impl Denoiser {
                 // projection reads; the one rounding is the store into the conditioning.
                 let encoded = audio_encoder.encode(samples)?;
                 if encoded.dims() != [rows, transformer.audio_channels as usize] {
-                    return Err(Error::request(format!(
+                    return Err(ID.request(format!(
                         "condition {:?} states {rows} audio rows and its track encodes to {:?}",
                         piece.role,
                         encoded.dims()
@@ -327,13 +325,13 @@ impl Denoiser {
     /// projection reads the anchored rows.
     fn encode_visual(&self, piece: &MediaInput, encoder: &VideoEncoder) -> Result<Tensor> {
         let (Some(pixels), Some(draw)) = (&piece.pixels, &piece.noise) else {
-            return Err(Error::request(format!(
+            return Err(ID.request(format!(
                 "condition {:?} states {} visual rows without its pixels and its draw",
                 piece.role, piece.rows
             )));
         };
         if pixels.dtype() != DType::F32 || draw.dtype() != SAMPLE_DTYPE {
-            return Err(Error::request(format!(
+            return Err(ID.request(format!(
                 "condition {:?} is encoded in FP32: its pixels are {:?} and its draw {:?}",
                 piece.role,
                 pixels.dtype(),
@@ -345,7 +343,7 @@ impl Denoiser {
         let clean = Transformer::patchify(&latent)?;
         let anchor = Transformer::patchify(draw)?;
         if clean.dims()[0] != piece.rows as usize || anchor.dims() != clean.dims() {
-            return Err(Error::request(format!(
+            return Err(ID.request(format!(
                 "condition {:?} states {} visual rows, encodes to {:?} and draws {:?}",
                 piece.role,
                 piece.rows,
@@ -369,7 +367,7 @@ impl Denoiser {
                 sigma_next: *sigma_next,
                 ..step
             }),
-            _ => Err(Error::request(format!(
+            _ => Err(ID.request(format!(
                 "evaluation {index} is outside the {} the schedule has",
                 self.config.schedule.num_steps()
             ))),
@@ -414,7 +412,7 @@ impl Denoiser {
 /// deployment of a checkpoint and capacity.
 fn max_rows(config: &DenoiserConfig, capacity: (u32, u32), split: DenoiserSplit) -> Result<u32> {
     let resolutions = processing::minimax_h3::named_canvases()
-        .map_err(|error| Error::config(format!("the resolution rule: {error}")))?;
+        .map_err(|error| ID.config(format!("the resolution rule: {error}")))?;
 
     let mut bound = 0;
     for resolution in &resolutions {
@@ -480,12 +478,12 @@ impl nn::Denoiser for Denoiser {
             _ => request.condition_rows.unwrap_or(self.condition_rows),
         };
 
-        Ok(packing::layout(
+        packing::layout(
             request,
             &self.config.transformer,
             self.text_rows,
             condition_rows,
-        )?)
+        )
     }
 
     /// The steps of the checkpoint's schedule, for a task the network serves.
@@ -495,11 +493,10 @@ impl nn::Denoiser for Denoiser {
     fn schedule(&self, request: &VideoRequest) -> nn::Result<Vec<Step>> {
         let task = task_of(request);
         if !self.config.tasks.contains(&task) {
-            return Err(Error::request(format!(
+            return Err(ID.request(format!(
                 "this checkpoint serves {:?} and not {task:?}",
                 self.config.tasks
-            ))
-            .into());
+            )));
         }
         Ok(self.config.schedule.steps())
     }
@@ -523,21 +520,19 @@ impl nn::Denoiser for Denoiser {
         let shape = layout.video;
         let dims = [shape.channels, shape.frames, shape.height, shape.width].map(|d| d as usize);
         if video.dims() != dims || video.dtype() != SAMPLE_DTYPE {
-            return Err(Error::request(format!(
+            return Err(ID.request(format!(
                 "the video latents are {:?} {:?} and this layout draws FP32 {dims:?}",
                 video.dtype(),
                 video.dims()
-            ))
-            .into());
+            )));
         }
         if layout.audio.is_some() != audio.is_some()
             || audio.is_some_and(|audio| audio.dtype() != SAMPLE_DTYPE)
         {
-            return Err(Error::request(
+            return Err(ID.request(
                 "a layout's audio stream is drawn into FP32 audio latents, and only into them"
                     .to_owned(),
-            )
-            .into());
+            ));
         }
 
         let video_offset = u64::from(layout.condition_elements);
@@ -555,7 +550,7 @@ impl nn::Denoiser for Denoiser {
     /// request's stream in packed order; an audio reference draws none.
     fn condition_pieces(&self, request: &VideoRequest) -> nn::Result<Vec<ConditionPiece>> {
         let layout = self.layout(request)?;
-        packing::check(request, &layout).map_err(nn::Error::from)?;
+        packing::check(request, &layout)?;
         let channels = self.config.transformer.video_channels;
 
         let mut offset = 0_u64;
@@ -567,15 +562,13 @@ impl nn::Denoiser for Denoiser {
 
             let track = if condition.audio_samples > 0 {
                 let Some((_, encoder)) = &self.encoders else {
-                    return Err(Error::request(
+                    return Err(ID.request(
                         "a request carries a soundtrack and this deployment places no condition \
                          encoder"
                             .to_owned(),
-                    )
-                    .into());
+                    ));
                 };
-                let padded = padded_samples(u64::from(condition.audio_samples), encoder.hop())
-                    .map_err(nn::Error::from)?;
+                let padded = padded_samples(u64::from(condition.audio_samples), encoder.hop())?;
 
                 Some(Shape::from((AUDIO_CHANNELS as usize, 1, padded as usize)))
             } else {
@@ -647,10 +640,7 @@ impl nn::Denoiser for Denoiser {
         if let Some(source) = &cond.source {
             let rows = self.text_rows as usize;
             let features = source.narrow(0, 0, rows)?.to_dtype(self.refiner.dtype())?;
-            let refined = self
-                .refiner
-                .forward(&features, request.text_tokens)
-                .map_err(nn::Error::from)?;
+            let refined = self.refiner.forward(&features, request.text_tokens)?;
 
             cond.text
                 .slice_set(&refined.to_dtype(cond.text.dtype())?, 0, 0)?;
@@ -659,7 +649,7 @@ impl nn::Denoiser for Denoiser {
         if cond.media.is_empty() {
             return Ok(());
         }
-        Ok(self.encode_media(&cond.media, &cond.text)?)
+        self.encode_media(&cond.media, &cond.text)
     }
 
     fn forward(
@@ -670,13 +660,13 @@ impl nn::Denoiser for Denoiser {
         audio: Option<&Tensor>,
         cond: &Conditioning,
     ) -> nn::Result<()> {
-        Ok(self.step(step, request, video, audio, cond)?)
+        self.step(step, request, video, audio, cond)
     }
 
     /// Fills the modulation tables from the schedule's levels, and a student's fused heads.
     fn initialize(&self) -> nn::Result<()> {
         self.modulation.fill(&self.table)?;
-        Ok(self.transformer.initialize()?)
+        self.transformer.initialize()
     }
 }
 
@@ -696,12 +686,12 @@ impl Denoiser {
         let transformer = &self.config.transformer;
 
         let Some(audio) = audio else {
-            return Err(Error::request(
+            return Err(ID.request(
                 "an H3 layout has an audio stream and no audio latents were lent".to_owned(),
             ));
         };
         if video.dtype() != SAMPLE_DTYPE || audio.dtype() != SAMPLE_DTYPE {
-            return Err(Error::request(format!(
+            return Err(ID.request(format!(
                 "the latents are {:?} and {:?}, and a trajectory is FP32",
                 video.dtype(),
                 audio.dtype()
@@ -709,7 +699,7 @@ impl Denoiser {
         }
         let text = &cond.text;
         if text.dims()[0] != nn::capability::prefix_rows(&layout) as usize {
-            return Err(Error::request(format!(
+            return Err(ID.request(format!(
                 "a conditioning of {} rows for a layout that gathers {}",
                 text.dims()[0],
                 nn::capability::prefix_rows(&layout)
@@ -723,7 +713,7 @@ impl Denoiser {
                 if !layout.text_rows.is_multiple_of(tile)
                     || !layout.condition_rows.is_multiple_of(tile)
                 {
-                    return Err(Error::request(format!(
+                    return Err(ID.request(format!(
                         "a tiled layout's capacities are whole {tile}-row tiles, not {} text \
                          rows and {} condition rows",
                         layout.text_rows, layout.condition_rows
@@ -747,7 +737,7 @@ impl Denoiser {
         let tokens = rows.elem_count();
         let ranks = self.split.sequence().size as usize;
         if tokens > self.max_rows as usize || !tokens.is_multiple_of(ranks) {
-            return Err(Error::request(format!(
+            return Err(ID.request(format!(
                 "a layout of {tokens} packed rows on a denoiser loaded for {} rows over {ranks} \
                  rank(s)",
                 self.max_rows

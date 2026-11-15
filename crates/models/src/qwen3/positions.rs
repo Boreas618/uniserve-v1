@@ -20,10 +20,10 @@
 //! qwen3_vl.py`); the expressions follow them operation for operation: positions as integers,
 //! and the learned table's sample coordinates on an FP32 `torch.linspace`.
 
-use nn::{DType, Device, Tensor, VisionGrid};
+use nn::{DType, Device, Result, Tensor, VisionGrid};
 use processing::qwen_vl::position_span;
 
-use crate::qwen3::{Error, Result};
+use crate::qwen3::ID;
 
 /// The run of a prompt a token belongs to: text.
 const TEXT: u8 = 0;
@@ -37,7 +37,7 @@ const VIDEO: u8 = 2;
 /// `value` as an I32 coordinate.
 fn coordinate(value: u32) -> Result<i32> {
     i32::try_from(value)
-        .map_err(|_| Error::Config(format!("a position of {value} is wider than an i32")))
+        .map_err(|_| ID.config(format!("a position of {value} is wider than an i32")))
 }
 
 /// Refuses a grid that is not whole `merge × merge` blocks of at least one time step.
@@ -51,7 +51,7 @@ pub(crate) fn check_grid(grid: [u32; 3], merge: u32) -> Result<()> {
         || !height.is_multiple_of(merge)
         || !width.is_multiple_of(merge)
     {
-        return Err(Error::Config(format!(
+        return Err(ID.config(format!(
             "the vision grid {grid:?} is not whole {merge}x{merge} merge blocks"
         )));
     }
@@ -109,8 +109,7 @@ pub fn rope_index(
             segments.push(positions.unsqueeze(0)?.repeat((3, 1))?);
             origin += length;
         } else {
-            let missing =
-                || Error::Config(format!("the placeholder run at token {token} has no grid"));
+            let missing = || ID.config(format!("the placeholder run at token {token} has no grid"));
             let grid = if kind(run[0]) == IMAGE {
                 grids.next().ok_or_else(missing)?
             } else {
@@ -125,7 +124,7 @@ pub fn rope_index(
 
             let block = vision_block(grid, merge, origin)?;
             if block.dim(1)? != run.len() {
-                return Err(Error::Config(format!(
+                return Err(ID.config(format!(
                     "the placeholder run at token {token} holds {length} tokens, and the grid \
                      {grid:?} merges to {}",
                     block.dim(1)?
@@ -140,9 +139,7 @@ pub fn rope_index(
     }
 
     if grids.next().is_some() || steps != 0 {
-        return Err(Error::Config(
-            "a vision grid has no placeholder run".to_owned(),
-        ));
+        return Err(ID.config("a vision grid has no placeholder run".to_owned()));
     }
     if segments.is_empty() {
         return Ok(Tensor::zeros((3, 0), DType::I32, &Device::Cpu)?);
@@ -293,9 +290,7 @@ fn ceil(floor: &Tensor, side: u32) -> Result<Tensor> {
 /// Refuses a learned table of no row.
 fn check_side(side: u32) -> Result<()> {
     if side == 0 {
-        return Err(Error::Config(
-            "the position table needs at least one row".to_owned(),
-        ));
+        return Err(ID.config("the position table needs at least one row".to_owned()));
     }
     Ok(())
 }
@@ -392,7 +387,7 @@ pub fn frame_offsets(grid: [u32; 3]) -> Result<Tensor> {
     let patches = height
         .checked_mul(width)
         .filter(|frame| *frame > 0 && frame.checked_mul(time).is_some_and(|all| all < u32::MAX))
-        .ok_or_else(|| Error::Config(format!("a {grid:?} grid packs no countable patches")))?;
+        .ok_or_else(|| ID.config(format!("a {grid:?} grid packs no countable patches")))?;
 
     Ok(Tensor::arange_step(
         0_u32,

@@ -29,11 +29,11 @@ use nn::modules::{
     Attention, AttentionConfig, Linear, LinearConfig, Mlp, Parallel, QkNorm, QkvBias,
     QkvLinearConfig, QkvNames, RmsNorm, RmsNormConfig,
 };
-use nn::{DType, Device, Split, Tensor, VarBuilder};
+use nn::{DType, Device, Result, Split, Tensor, VarBuilder};
 
+use crate::minimax_h3::ID;
 use crate::minimax_h3::config::TransformerConfig;
 use crate::minimax_h3::transformer::mlp_config;
-use crate::minimax_h3::{Error, Result};
 
 /// One refiner block: a pre-norm block over dense attention with per-head query and key norms
 /// and a value-first SwiGLU.
@@ -124,9 +124,9 @@ impl TokenRefiner {
     /// A checkpoint that states no refiner block, or a weight the loader refuses.
     pub fn load(config: &TransformerConfig, rows: u32, vb: VarBuilder<'_, '_>) -> Result<Self> {
         if config.num_refiner_layers == 0 {
-            return Err(Error::config(
-                "an H3 denoiser's token refiner has at least one block".to_owned(),
-            ));
+            return Err(
+                ID.config("an H3 denoiser's token refiner has at least one block".to_owned())
+            );
         }
         let refiner = vb.pp("token_refiner");
 
@@ -174,7 +174,7 @@ impl TokenRefiner {
     pub fn forward(&self, features: &Tensor, prompt: u32) -> Result<Tensor> {
         let rows = self.rows;
         if features.dims() != [rows as usize, self.text_dim] || prompt > rows {
-            return Err(Error::request(format!(
+            return Err(ID.request(format!(
                 "the refiner reads [{rows}, {}] features of a prompt of at most {rows} rows, not \
                  {:?} of a prompt of {prompt}",
                 self.text_dim,
@@ -192,6 +192,6 @@ impl TokenRefiner {
         for block in &self.blocks {
             x = block.forward(&x, &queries, &keys, rows)?;
         }
-        Ok(self.norm.forward(&x)?)
+        self.norm.forward(&x)
     }
 }

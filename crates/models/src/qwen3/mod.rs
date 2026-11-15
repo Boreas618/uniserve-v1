@@ -39,35 +39,5 @@ pub use mtp::Mtp;
 pub use vision::VisionTower;
 pub use vl::Qwen3VlModel;
 
-/// What this family can fail with.
-#[derive(Debug, thiserror::Error)]
-pub enum Error {
-    /// The checkpoint's configuration is not a Qwen3 configuration this family builds, a
-    /// deployment's split does not divide what it shards, or a call's inputs do not describe
-    /// the model.
-    #[error("qwen3: {0}")]
-    Config(String),
-    /// A module, a function or the weight loader refused the call.
-    #[error(transparent)]
-    Nn(#[from] nn::Error),
-}
-
-impl From<tensor::Error> for Error {
-    fn from(error: tensor::Error) -> Self {
-        Self::Nn(error.into())
-    }
-}
-
-/// The family's result type.
-pub type Result<T> = std::result::Result<T, Error>;
-
-impl From<Error> for nn::Error {
-    /// A failure of the shared library passes through unchanged; a refusal of this family's own
-    /// is [`nn::Error::Model`] naming the family.
-    fn from(error: Error) -> Self {
-        match error {
-            Error::Nn(error) => error,
-            other => nn::Error::model("qwen3", other),
-        }
-    }
-}
+/// The id this family's refusals name it by ([`nn::Error::Model`]): its registration's.
+pub(crate) const ID: nn::ModelId = nn::ModelId(processing::qwen::QWEN3.id);

@@ -35,18 +35,18 @@ use nn::family::{
 };
 use nn::modules::{Embedding, EmbeddingConfig, LmHead, LmHeadConfig, Rotary};
 use nn::{
-    CausalLm, DType, Device, Drafter, ExpertExchange, KvCache, RecurrentState, Split, Tensor,
-    TokenBatch, VarBuilder, Vision,
+    CausalLm, DType, Device, Drafter, ExpertExchange, KvCache, RecurrentState, Result, Split,
+    Tensor, TokenBatch, VarBuilder, Vision,
 };
 
 use crate::qwen3::VisionTower;
+use crate::qwen4_exp::ID;
 use crate::qwen4_exp::attention::IndexedAttention;
 use crate::qwen4_exp::config::Config;
 use crate::qwen4_exp::decoder::DecoderLayer;
 use crate::qwen4_exp::hyper_connection::HyperConnection;
 use crate::qwen4_exp::mtp::Mtp;
 use crate::qwen4_exp::ngram::{PleLayer, int};
-use crate::qwen4_exp::{Error, Result};
 
 /// The profiler class of the whole decoder stack, at path `model`.
 pub(crate) const TRANSFORMER: &str = "models.qwen4_exp.transformer.Transformer";
@@ -137,7 +137,7 @@ pub fn token_columns(batch: &TokenBatch, state: &RecurrentState) -> Result<Vec<T
 /// A batch that states no token ids.
 pub fn ngram_context(batch: &TokenBatch, columns: &[Tensor]) -> Result<Tensor> {
     let (Some(ids), Some(before)) = (&batch.token_ids, &batch.ngram_context) else {
-        return Err(Error::Config(
+        return Err(ID.config(
             "the n-gram embedding hashes token ids, and the batch states none \
              (token_ids, ngram_context)"
                 .to_owned(),
@@ -239,14 +239,14 @@ impl Qwen4ExpForCausalLm {
             && (placement.experts.size > 1
                 || !config.moe.num_experts.is_multiple_of(placement.tensor.size))
         {
-            return Err(Error::Config(format!(
+            return Err(ID.config(format!(
                 "a tensor group of {} holding whole experts beside an expert group of {}: the \
                  tensor group alone divides the {} experts",
                 placement.tensor.size, placement.experts.size, config.moe.num_experts
             )));
         }
         if placement.pipeline.size > 1 || placement.sequence.split.size > 1 {
-            return Err(Error::Config(format!(
+            return Err(ID.config(format!(
                 "a pipeline split over {} stages or a sequence split over {} members: this \
                  model's layers are split over tensor and expert ranks alone",
                 placement.pipeline.size, placement.sequence.split.size
@@ -255,7 +255,7 @@ impl Qwen4ExpForCausalLm {
 
         let routed = expert_layers(config);
         if let Some(stray) = order.keys().find(|module| !routed.contains_key(*module)) {
-            return Err(Error::Config(format!(
+            return Err(ID.config(format!(
                 "{stray} is not a routed expert layer of this model"
             )));
         }
@@ -350,16 +350,15 @@ impl CausalLm for Qwen4ExpForCausalLm {
     ) -> nn::Result<Tensor> {
         let (tokens, width) = (batch.tokens(), self.config.text.hidden_size as usize);
         if hidden.dims() != [tokens, width] {
-            return Err(Error::Config(format!(
+            return Err(ID.config(format!(
                 "hidden is {:?}, [{tokens}, {width}] expected",
                 hidden.dims()
-            ))
-            .into());
+            )));
         }
 
         let forward = || -> Result<Tensor> {
             let state = state.ok_or_else(|| {
-                Error::Config(
+                ID.config(
                     "the model's layers keep a state, and the forward was lent none".to_owned(),
                 )
             })?;
@@ -427,7 +426,7 @@ impl CausalLm for Qwen4ExpForCausalLm {
             }
         };
 
-        Ok(nn::profiler::range(TRANSFORMER, "model", forward)?)
+        nn::profiler::range(TRANSFORMER, "model", forward)
     }
 
     /// The logits of `hidden`: rows of the streams, `[rows, C · H]`, which are normalized and

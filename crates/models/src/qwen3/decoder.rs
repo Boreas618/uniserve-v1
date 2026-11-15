@@ -29,10 +29,10 @@ use nn::modules::{
     MoEConfig, QkNorm, QkvBias, QkvLinearConfig, QkvNames, RmsNorm, RmsNormConfig, SharedExpert,
     SharedExpertConfig,
 };
-use nn::{ExpertExchange, KvCache, RecurrentState, Split, Tensor, TokenBatch, VarBuilder};
+use nn::{ExpertExchange, KvCache, RecurrentState, Result, Split, Tensor, TokenBatch, VarBuilder};
 
+use crate::qwen3::ID;
 use crate::qwen3::config::{Config, TextConfig};
-use crate::qwen3::{Error, Result};
 
 /// The profiler class of one decoder layer, at path `<stack>.layers.<i>`, which a deployment's
 /// range patterns select (`docs/profiling.md`).
@@ -120,7 +120,7 @@ impl DecoderLayer {
         let (tensor, sequence) = (placement.tensor, placement.sequence);
         let text = &config.text;
         let norm = stream_norm(text);
-        let refuse = |missing: &str| Error::Config(format!("{} states no {missing}", vb.path()));
+        let refuse = |missing: &str| ID.config(format!("{} states no {missing}", vb.path()));
 
         let (self_attn, linear_attn) = if linear {
             let network = text
@@ -336,8 +336,8 @@ impl DecoderLayer {
     }
 
     /// The refusal of a forward that needs `what` and has none.
-    fn lent_no(&self, what: &str) -> Error {
-        Error::Config(format!("{} has no {what}", self.path))
+    fn lent_no(&self, what: &str) -> nn::Error {
+        ID.config(format!("{} has no {what}", self.path))
     }
 
     /// The input norm: `(normalized, residual)`, the rows the mixer reads and the stream,

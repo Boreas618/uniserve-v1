@@ -26,13 +26,13 @@
 
 use nn::family::TextPlacement;
 use nn::modules::{Embedding, EmbeddingConfig, RmsNorm, Rotary};
-use nn::{Encoder, EncoderLayout, PixelNorm, Split, Tensor, TokenBatch, VarBuilder};
+use nn::{Encoder, EncoderLayout, PixelNorm, Result, Split, Tensor, TokenBatch, VarBuilder};
 use processing::qwen_vl::ProcessorConfig;
 
 use crate::qwen3::config::Config;
 use crate::qwen3::decoder::{self, DecoderLayer};
 use crate::qwen3::vision::VisionTower;
-use crate::qwen3::{Error, Result, positions};
+use crate::qwen3::{ID, positions};
 
 /// The Qwen3-VL model: the language model's embedding, a prefix of its decoder layers, the
 /// vision tower, and the final norm when the consumer reads normalized states.
@@ -67,9 +67,9 @@ impl Qwen3VlModel {
         let vision = config
             .vision
             .as_ref()
-            .ok_or_else(|| Error::Config("a Qwen3-VL model states no vision tower".to_owned()))?;
+            .ok_or_else(|| ID.config("a Qwen3-VL model states no vision tower".to_owned()))?;
         if layers == 0 || layers > text.num_hidden_layers {
-            return Err(Error::Config(format!(
+            return Err(ID.config(format!(
                 "decoder layers 0..{layers} of a {}-layer stack",
                 text.num_hidden_layers
             )));
@@ -164,7 +164,7 @@ impl Qwen3VlModel {
             || out.dims() != [tokens, hidden]
             || images.len() != layout.images.len()
         {
-            return Err(Error::Config(format!(
+            return Err(ID.config(format!(
                 "an encode of {} rows for {} tokens: {} batch tokens, {} prompt ids, {} device \
                  ids, an output of {:?}, {} images for {} grids",
                 layout.rows,
@@ -198,7 +198,7 @@ impl Qwen3VlModel {
         let features = self.vision_features(images, layout)?;
         let merged = features.as_ref().map_or(0, |features| features.dims()[0]);
         if merged != rows.elem_count() {
-            return Err(Error::Config(format!(
+            return Err(ID.config(format!(
                 "the images merge to {merged} rows and the prompt holds {} placeholders",
                 rows.elem_count()
             )));
@@ -242,7 +242,7 @@ impl Qwen3VlModel {
             (output, residual) = (hidden_states, Some(stream));
         }
         let residual =
-            residual.ok_or_else(|| Error::Config("a decoder stack of no layers".to_owned()))?;
+            residual.ok_or_else(|| ID.config("a decoder stack of no layers".to_owned()))?;
 
         // The last output joins the stream: added and normalized, or, for a consumer that
         // reads the state before the final norm, added alone.
@@ -273,6 +273,6 @@ impl Encoder for Qwen3VlModel {
         layout: &EncoderLayout,
         out: &Tensor,
     ) -> nn::Result<()> {
-        Ok(self.forward(prompt, ids, batch, images, layout, out)?)
+        self.forward(prompt, ids, batch, images, layout, out)
     }
 }

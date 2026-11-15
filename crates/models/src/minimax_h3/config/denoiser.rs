@@ -24,12 +24,12 @@
 //! the block's normalized integration weights ([`ScheduleConfig::head_weights`],
 //! `pdd.py:32-39`).
 
-use nn::Step;
 use nn::config::Fields;
 use nn::diffusion::{ladder_sigmas, linspace, steps, uniform_sigmas};
 use nn::quantization::Declaration;
+use nn::{Result, Step};
 
-use crate::minimax_h3::{Error, Result, VideoTask};
+use crate::minimax_h3::{ID, VideoTask};
 
 /// The rows of one text or condition capacity unit of a dense layout: the reference's packed
 /// row alignment (`refs/vllm-omni/…/minimax_h3/packed_sequence.py:45`).
@@ -95,7 +95,7 @@ impl TransformerConfig {
         let output_heads = match values.optional_index("pdd_steps")? {
             None => 1,
             Some(heads) if heads < 2 => {
-                return Err(Error::config(format!(
+                return Err(ID.config(format!(
                     "{owner}.pdd_steps is the interval count of a parallel-decoding student and \
                      states more than one interval, got {heads}"
                 )));
@@ -107,16 +107,14 @@ impl TransformerConfig {
         // of one latent frame.
         let patch = values.counts("patch_size")?;
         if patch != [1, 2, 2] {
-            return Err(Error::config(format!(
+            return Err(ID.config(format!(
                 "{owner}.patch_size must be [1, 2, 2], got {patch:?}"
             )));
         }
 
         let norm_eps = values.positive("norm_eps")?;
         if values.positive("final_norm_eps")? != norm_eps {
-            return Err(Error::config(format!(
-                "{owner}.final_norm_eps must equal norm_eps"
-            )));
+            return Err(ID.config(format!("{owner}.final_norm_eps must equal norm_eps")));
         }
 
         let config = Self {
@@ -144,7 +142,7 @@ impl TransformerConfig {
         if !config.rope_frequency_dim.is_multiple_of(2)
             || config.rope_frequency_dim * 6 > config.head_dim
         {
-            return Err(Error::config(format!(
+            return Err(ID.config(format!(
                 "{owner}.rope_freq_dim must be even and rotate at most a head's width, got {} \
                  of {}",
                 config.rope_frequency_dim, config.head_dim
@@ -188,19 +186,19 @@ impl VsaConfig {
     /// `(0, 1]`.
     pub fn new(tile_rows: u32, sparsity: f64, reference_keep: Option<f64>) -> Result<Self> {
         if !TILE_SHAPES.iter().any(|(rows, _)| *rows == tile_rows) {
-            return Err(Error::config(format!(
+            return Err(ID.config(format!(
                 "an H3 sparse attention tile holds 64 or 128 rows, got {tile_rows}"
             )));
         }
         if !sparsity.is_finite() || !(0.0..1.0).contains(&sparsity) {
-            return Err(Error::config(format!(
+            return Err(ID.config(format!(
                 "the VSA sparsity must lie in [0, 1), got {sparsity}"
             )));
         }
         if let Some(keep) = reference_keep
             && (!keep.is_finite() || !(0.0 < keep && keep <= 1.0))
         {
-            return Err(Error::config(format!(
+            return Err(ID.config(format!(
                 "the VSA reference keep rate must lie in (0, 1], got {keep}"
             )));
         }
@@ -272,7 +270,7 @@ impl ScheduleConfig {
     /// Fewer than two points, or two modalities whose deduplicated grids differ in length.
     pub fn uniform(points: u32, video_shift: f32, audio_shift: f32) -> Result<Self> {
         if points < 2 {
-            return Err(Error::config(format!(
+            return Err(ID.config(format!(
                 "an H3 uniform grid needs at least two sigma points, got {points}"
             )));
         }
@@ -302,12 +300,10 @@ impl ScheduleConfig {
         audio_shift: f32,
     ) -> Result<Self> {
         if rungs.is_empty() {
-            return Err(Error::config(
-                "an H3 DMD ladder needs at least one rung".to_owned(),
-            ));
+            return Err(ID.config("an H3 DMD ladder needs at least one rung".to_owned()));
         }
         if !train_steps.is_finite() || train_steps <= 0.0 {
-            return Err(Error::config(format!(
+            return Err(ID.config(format!(
                 "an H3 DMD training schedule must be finite and positive, got {train_steps}"
             )));
         }
@@ -315,14 +311,12 @@ impl ScheduleConfig {
             .iter()
             .any(|rung| *rung == 0 || *rung as f32 > train_steps)
         {
-            return Err(Error::config(format!(
+            return Err(ID.config(format!(
                 "H3 DMD rungs must lie within the {train_steps}-step training schedule"
             )));
         }
         if rungs.windows(2).any(|pair| pair[0] <= pair[1]) {
-            return Err(Error::config(
-                "H3 DMD rungs must strictly decrease".to_owned(),
-            ));
+            return Err(ID.config("H3 DMD rungs must strictly decrease".to_owned()));
         }
         let train_steps = f64::from(train_steps);
 
@@ -352,22 +346,20 @@ impl ScheduleConfig {
         audio_shift: f32,
     ) -> Result<Self> {
         if intervals < 2 {
-            return Err(Error::config(format!(
+            return Err(ID.config(format!(
                 "an H3 parallel-decoding grid needs at least two intervals, got {intervals}"
             )));
         }
         if nodes.len() < 2 || nodes[0] != 0 || nodes.last() != Some(&intervals) {
-            return Err(Error::config(format!(
+            return Err(ID.config(format!(
                 "H3 parallel-decoding nodes must run from 0 to the {intervals} intervals"
             )));
         }
         if nodes.windows(2).any(|pair| pair[0] >= pair[1]) {
-            return Err(Error::config(
-                "H3 parallel-decoding nodes must strictly increase".to_owned(),
-            ));
+            return Err(ID.config("H3 parallel-decoding nodes must strictly increase".to_owned()));
         }
         if !max_t.is_finite() || max_t <= 0.0 || max_t > 1.0 {
-            return Err(Error::config(format!(
+            return Err(ID.config(format!(
                 "H3 parallel-decoding grid_max_t must lie in (0, 1], got {max_t}"
             )));
         }
@@ -402,7 +394,7 @@ impl ScheduleConfig {
     /// latents with one step counter.
     fn aligned(self) -> Result<Self> {
         if self.video_sigmas.len() != self.audio_sigmas.len() {
-            return Err(Error::checkpoint(format!(
+            return Err(ID.checkpoint(format!(
                 "the H3 video and audio schedules must align: {} video sigma points against {} \
                  audio sigma points",
                 self.video_sigmas.len(),
@@ -453,7 +445,7 @@ impl ScheduleConfig {
     /// A schedule with one head per evaluation, or a block whose increments sum to zero.
     pub fn head_weights(&self, shift: f32) -> Result<Vec<f32>> {
         let Some(intervals) = self.nodes.last().copied() else {
-            return Err(Error::checkpoint(
+            return Err(ID.checkpoint(
                 "an H3 schedule with one output head per evaluation fuses no heads".to_owned(),
             ));
         };
@@ -476,7 +468,7 @@ impl ScheduleConfig {
             let (start, end) = (span[0] as usize, span[1] as usize);
             let total: f64 = increments[start..end].iter().sum();
             if !total.is_finite() || total == 0.0 {
-                return Err(Error::checkpoint(format!(
+                return Err(ID.checkpoint(format!(
                     "the integration weights of H3 parallel-decoding block {block} sum to {total}"
                 )));
             }
@@ -523,23 +515,19 @@ impl DenoiserConfig {
         tasks: Vec<VideoTask>,
     ) -> Result<Self> {
         if tasks.is_empty() {
-            return Err(Error::config(
-                "an H3 denoiser serves at least one task".to_owned(),
-            ));
+            return Err(ID.config("an H3 denoiser serves at least one task".to_owned()));
         }
         if tasks
             .iter()
             .enumerate()
             .any(|(index, task)| tasks[..index].contains(task))
         {
-            return Err(Error::config(
-                "an H3 denoiser's tasks must be distinct".to_owned(),
-            ));
+            return Err(ID.config("an H3 denoiser's tasks must be distinct".to_owned()));
         }
 
         let intervals = schedule.nodes.last().copied();
         if intervals != (transformer.output_heads > 1).then_some(transformer.output_heads) {
-            return Err(Error::config(format!(
+            return Err(ID.config(format!(
                 "H3 output heads must equal the parallel-decoding interval count, and only a \
                  parallel-decoding student has more than one: {} heads, {intervals:?} intervals",
                 transformer.output_heads
@@ -624,7 +612,7 @@ mod tests {
         norm.insert("final_norm_eps".into(), serde_json::json!(1e-6));
         let error = parse(&norm).unwrap_err();
         assert!(
-            matches!(error, Error::Config(ref problem) if problem.contains("final_norm_eps")),
+            matches!(error, nn::Error::Model { refusal: nn::Refusal::Config, ref problem, .. } if problem.contains("final_norm_eps")),
             "{error}"
         );
     }
@@ -796,7 +784,9 @@ mod tests {
             vec![VideoTask::TextToVideoAudio, VideoTask::TextToVideoAudio],
         )
         .unwrap_err();
-        assert!(matches!(error, Error::Config(ref problem) if problem.contains("distinct")));
+        assert!(
+            matches!(error, nn::Error::Model { refusal: nn::Refusal::Config, ref problem, .. } if problem.contains("distinct"))
+        );
 
         // A parallel-decoding grid without the student's stacked heads is refused.
         let error = DenoiserConfig::new(
@@ -806,7 +796,9 @@ mod tests {
             vec![VideoTask::ReferenceToVideoAudio],
         )
         .unwrap_err();
-        assert!(matches!(error, Error::Config(ref problem) if problem.contains("output heads")));
+        assert!(
+            matches!(error, nn::Error::Model { refusal: nn::Refusal::Config, ref problem, .. } if problem.contains("output heads"))
+        );
     }
 
     #[test]

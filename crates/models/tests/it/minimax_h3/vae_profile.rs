@@ -160,7 +160,7 @@ fn the_video_encoder_profiles_a_still_and_a_clip() {
             (3, frames as usize, height as usize, width as usize),
             DType::F32,
         );
-        let (latent, recording) = record(&[], || Ok(encoder.encode(&pixels)?));
+        let (latent, recording) = record(&[], || encoder.encode(&pixels));
         let latent = latent.unwrap();
 
         assert_eq!(
@@ -242,7 +242,7 @@ fn the_audio_encoder_profiles_a_reference_track() {
     assert_eq!(frames, 161);
 
     let samples = meta((2, 1, length as usize), DType::F32);
-    let (rows, recording) = record(&[], || Ok(encoder.encode(&samples)?));
+    let (rows, recording) = record(&[], || encoder.encode(&samples));
     let rows = rows.unwrap();
 
     assert_eq!(rows.dims(), [2 * frames, 32]);

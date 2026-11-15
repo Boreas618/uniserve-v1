@@ -24,13 +24,13 @@
 //! `vsa_sparsity` and an optional `vsa_ref_keep_rate`) and may state the shifts their schedule is
 //! taken at (`video_scheduler_shift`, `audio_scheduler_shift`).
 
-use nn::Source;
 use nn::config::Fields;
 use nn::family::Stage;
+use nn::{Result, Source};
 use serde_json::Value;
 
 use super::{Component, VsaConfig, network};
-use crate::minimax_h3::{Error, Result, VideoTask};
+use crate::minimax_h3::{ID, VideoTask};
 
 /// What a FastH3 student's contract states.
 #[derive(Clone, Debug, PartialEq)]
@@ -102,7 +102,7 @@ impl Contract {
 
         let schema = fields.text("schema_version")?;
         if schema != Self::SCHEMA {
-            return Err(Error::checkpoint(format!(
+            return Err(ID.checkpoint(format!(
                 "{} states the schema {schema:?}; this family reads {}",
                 Self::FILE,
                 Self::SCHEMA
@@ -115,13 +115,13 @@ impl Contract {
         ) {
             (Some(task), None) | (None, Some(task)) => task,
             (Some(_), Some(_)) => {
-                return Err(Error::checkpoint(format!(
+                return Err(ID.checkpoint(format!(
                     "{} states its task twice, as `task` and as `model_type`",
                     Self::FILE
                 )));
             }
             (None, None) => {
-                return Err(Error::checkpoint(format!(
+                return Err(ID.checkpoint(format!(
                     "{} states no task: a {} contract states it as `task` or as `model_type`",
                     Self::FILE,
                     Self::SCHEMA
@@ -132,7 +132,7 @@ impl Contract {
             "t2av" => network(VideoTask::TextToVideoAudio),
             "ref2va" => network(VideoTask::ReferenceToVideoAudio),
             other => {
-                return Err(Error::checkpoint(format!(
+                return Err(ID.checkpoint(format!(
                     "unsupported FastH3 checkpoint: its task must be t2av or ref2va, got {other:?}"
                 )));
             }
@@ -140,7 +140,7 @@ impl Contract {
         if let Some(component) = fields.optional_text("transformer_component")?
             && Component::named(component).and_then(Component::network) != Some(network)
         {
-            return Err(Error::checkpoint(format!(
+            return Err(ID.checkpoint(format!(
                 "{} names the network `{component}`, and its task {task} is served by `{}`",
                 Self::FILE,
                 network.name()
@@ -162,13 +162,13 @@ impl Contract {
                 grid_max_t: fields.number("grid_max_t")?,
             },
             (Some(_), Some(_)) => {
-                return Err(Error::checkpoint(format!(
+                return Err(ID.checkpoint(format!(
                     "{} states both dmd_denoising_steps and pdd_step_indices",
                     Self::FILE
                 )));
             }
             (None, None) => {
-                return Err(Error::checkpoint(format!(
+                return Err(ID.checkpoint(format!(
                     "unsupported FastH3 checkpoint: {} states neither dmd_denoising_steps nor \
                      pdd_step_indices",
                     Self::FILE
@@ -184,7 +184,7 @@ impl Contract {
                 fields.optional_number("vsa_ref_keep_rate")?,
             )?),
             other => {
-                return Err(Error::checkpoint(format!(
+                return Err(ID.checkpoint(format!(
                     "{} states the attention backend {other:?}, which this build does not \
                      serve: it serves DENSE and VIDEO_SPARSE_ATTN_H3",
                     Self::FILE
@@ -213,7 +213,7 @@ impl BaseRevision {
     /// When `pinned` is not of that form with an `<owner>/<name>` repository and a revision.
     pub fn parse(pinned: &str) -> Result<Self> {
         let malformed = || {
-            Error::checkpoint(format!(
+            ID.checkpoint(format!(
                 "{}'s base_model_revision must be hf://<owner>/<name>@<revision>, got {pinned:?}",
                 Contract::FILE
             ))

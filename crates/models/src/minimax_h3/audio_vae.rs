@@ -33,11 +33,11 @@ use nn::modules::{
     LayerNormConfig, Linear, LinearConfig, Mlp, MlpConfig, Parallel, QkvBias, QkvLinear,
     QkvLinearConfig, QkvNames,
 };
-use nn::{DType, Decoder, LatentShape, Split, Tensor, VarBuilder};
+use nn::{DType, Decoder, LatentShape, Result, Split, Tensor, VarBuilder};
 use processing::minimax_h3::AUDIO_CHANNELS;
 use proto::video::Layout;
 
-use crate::minimax_h3::{AudioVaeConfig, Error, Result};
+use crate::minimax_h3::{AudioVaeConfig, ID};
 
 /// The up- and down-sampling ratio of BigVGAN's alias-free activations, which the config does
 /// not state (`refs/sglang/python/sglang/multimodal_gen/runtime/models/vaes/alias_free.py:154-166`).
@@ -55,7 +55,7 @@ const LAYER_NORM_EPS: f32 = 1e-5;
 /// A track of no sample, which encodes to no latent frame, or a hop of no sample.
 pub fn padded_samples(samples: u64, hop: u64) -> Result<u64> {
     if samples == 0 || hop == 0 {
-        return Err(Error::request(format!(
+        return Err(ID.request(format!(
             "an audio track of {samples} samples in {hop}-sample latent frames encodes to \
              nothing"
         )));
@@ -73,7 +73,7 @@ fn statistics(
 ) -> Result<(Tensor, Tensor)> {
     let channels = config.latent_channels as usize;
     if config.latents_mean.len() != channels || config.latents_std.len() != channels {
-        return Err(Error::config(format!(
+        return Err(ID.config(format!(
             "the audio latent statistics hold {} means and {} deviations for {channels} channels",
             config.latents_mean.len(),
             config.latents_std.len()
@@ -151,7 +151,7 @@ impl AudioDecoder {
     fn decode_track(&self, frames: usize, latents: &Tensor, audio: &Tensor) -> Result<()> {
         let (stereo, channels) = (AUDIO_CHANNELS as usize, self.latent_channels);
         if latents.elem_count() != stereo * frames * channels || latents.dtype() != DType::F32 {
-            return Err(Error::request(format!(
+            return Err(ID.request(format!(
                 "a track of {frames} latent frames is {stereo} · {frames} FP32 rows of \
                  {channels} channels, not {:?} {:?}",
                 latents.dtype(),
@@ -160,7 +160,7 @@ impl AudioDecoder {
         }
         let samples = self.decoder.samples(frames);
         if audio.dims() != [stereo, samples] || audio.dtype() != DType::F32 {
-            return Err(Error::request(format!(
+            return Err(ID.request(format!(
                 "the waveform of {frames} latent frames is FP32 [{stereo}, {samples}], not \
                  {:?} {:?}",
                 audio.dtype(),
@@ -213,14 +213,13 @@ impl Decoder for AudioDecoder {
         audio: Option<&Tensor>,
     ) -> nn::Result<()> {
         let (Some(track), Some(audio), None) = (layout.audio, audio, video) else {
-            return Err(Error::request(
-                "an audio decode writes the waveform of a layout's track and no raster",
-            )
-            .into());
+            return Err(
+                ID.request("an audio decode writes the waveform of a layout's track and no raster")
+            );
         };
 
         nn::profiler::range("AudioDecoder", &self.path, || {
-            Ok(self.decode_track(track.frames as usize, latents, audio)?)
+            self.decode_track(track.frames as usize, latents, audio)
         })
     }
 }
@@ -272,7 +271,7 @@ impl AttnProjection {
             || heads == 0
             || !wide.is_multiple_of(heads)
         {
-            return Err(Error::config(format!(
+            return Err(ID.config(format!(
                 "the audio encoder projects {wide} features to {channels} latent channels over \
                  {heads} heads: the channels and the heads each divide the features, which are \
                  wider than the channels"
@@ -470,7 +469,7 @@ impl AudioEncoder {
                 length / hop
             }
             dims => {
-                return Err(Error::request(format!(
+                return Err(ID.request(format!(
                     "the audio encoder reads the stereo pair as FP32 [{stereo}, 1, samples] of \
                      whole {hop}-sample latent frames, a mono track expanded to two identical \
                      channels and a short one right-padded with zeros, not {:?} {dims:?}",

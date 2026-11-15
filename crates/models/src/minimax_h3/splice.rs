@@ -9,10 +9,10 @@
 //! in the raster's element type.
 
 use nn::vae::{self, TemporalClips};
-use nn::{DType, PixelNorm, Splice, Splicer, Tensor};
+use nn::{DType, PixelNorm, Result, Splice, Splicer, Tensor};
 
+use crate::minimax_h3::ID;
 use crate::minimax_h3::video_vae::{self, PIXEL_NORM};
-use crate::minimax_h3::{Error, Result};
 
 /// The channels of a decoded raster: red, green and blue.
 const RGB_CHANNELS: usize = 3;
@@ -36,7 +36,7 @@ impl VideoPostprocessor {
     /// Clips with no body, or with a tail longer than the body it fades into.
     pub fn new(dtype: DType, clips: TemporalClips) -> Result<Self> {
         if clips.body == 0 || clips.overlap > clips.body || clips.temporal == 0 {
-            return Err(Error::config(format!(
+            return Err(ID.config(format!(
                 "{clips:?} are not clips whose tail fades into the next clip's body"
             )));
         }
@@ -59,13 +59,13 @@ impl VideoPostprocessor {
         );
 
         let &[RGB_CHANNELS, decoded, height, width] = clip.dims() else {
-            return Err(Error::request(format!(
+            return Err(ID.request(format!(
                 "a decoded clip is [{RGB_CHANNELS}, frames, rows, columns], not {:?}",
                 clip.dims()
             )));
         };
         if decoded < native || clip.dtype() != self.dtype {
-            return Err(Error::request(format!(
+            return Err(ID.request(format!(
                 "a decoded clip holds at least {native} frames of {:?}, not {decoded} of {:?}",
                 self.dtype,
                 clip.dtype()
@@ -76,7 +76,7 @@ impl VideoPostprocessor {
         // body alone.
         let last = splice.keep == clips.body + clips.overlap;
         if splice.overlap > clips.overlap || !(last || splice.keep == clips.body) {
-            return Err(Error::request(format!(
+            return Err(ID.request(format!(
                 "{splice:?} keeps and fades other frames than a clip of {clips:?} has"
             )));
         }
@@ -93,7 +93,7 @@ impl VideoPostprocessor {
                 if previous.dims() != [RGB_CHANNELS, overlap, height, width]
                     || previous.dtype() != self.dtype
                 {
-                    return Err(Error::request(format!(
+                    return Err(ID.request(format!(
                         "a predecessor's tail is {:?} [{RGB_CHANNELS}, {overlap}, {height}, \
                          {width}], not {:?} {:?}",
                         self.dtype,
@@ -132,7 +132,7 @@ impl Splicer for VideoPostprocessor {
 
     /// One splice per clip of the frame rule ([`video_vae::splices`]).
     fn splices(&self, frames: u32) -> nn::Result<Vec<Splice>> {
-        Ok(video_vae::splices(&self.clips, frames)?)
+        video_vae::splices(&self.clips, frames)
     }
 
     /// Places one clip's kept frames, fading its first frames against `previous` when it has a
@@ -149,7 +149,7 @@ impl Splicer for VideoPostprocessor {
         clip: &Tensor,
         splice: Splice,
     ) -> nn::Result<Vec<(Tensor, u32)>> {
-        Ok(self.runs(previous, clip, splice)?)
+        self.runs(previous, clip, splice)
     }
 }
 

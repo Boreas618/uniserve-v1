@@ -97,17 +97,20 @@ pub enum Error {
         problem: String,
     },
 
-    /// A model family's own failure: its configuration, its partition or its load.
+    /// A model family's own refusal: a configuration, checkpoint, request or capability it
+    /// does not serve.
     ///
-    /// Each model crate converts its error into this variant through `From`, so a refusal reaches
-    /// execution with the family that raised it and the family's own description as the source.
-    #[error("{model}: {source}")]
+    /// Every family raises its refusals as this one value, naming itself by its registered id
+    /// ([`ModelId`]), and a failure of the shared library it calls passes through as the variant
+    /// it was raised as.
+    #[error("{model}: {refusal}: {problem}")]
     Model {
-        /// The family that raised the failure, as its crate names itself.
-        model: &'static str,
-        /// The family's own error.
-        #[source]
-        source: Box<dyn std::error::Error + Send + Sync>,
+        /// The family that refused.
+        model: ModelId,
+        /// What it refused.
+        refusal: Refusal,
+        /// What was asked of it and why it cannot serve it, naming the field, file or extent.
+        problem: String,
     },
 }
 
@@ -117,17 +120,6 @@ impl Error {
         Self::Shape {
             owner,
             problem: problem.into(),
-        }
-    }
-
-    /// A model family's failure, with the family's own error as the source.
-    pub fn model(
-        model: &'static str,
-        source: impl Into<Box<dyn std::error::Error + Send + Sync>>,
-    ) -> Self {
-        Self::Model {
-            model,
-            source: source.into(),
         }
     }
 
@@ -157,6 +149,77 @@ impl Error {
             tensor: tensor.to_owned(),
             problem: problem.into(),
         }
+    }
+}
+
+/// What a model family refuses ([`Error::Model`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Refusal {
+    /// A checkpoint configuration the family does not build, a deployment split that does not
+    /// divide what it shards, or a call whose inputs do not describe the loaded model.
+    Config,
+    /// A checkpoint whose layout or files the family cannot open: a missing sidecar, a stage
+    /// that holds no shard set.
+    Checkpoint,
+    /// A request, a layout or a tensor a module of the family was not loaded for.
+    Request,
+    /// A capability of the family's design that it does not implement, named precisely.
+    Unsupported,
+}
+
+impl std::fmt::Display for Refusal {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::Config => "configuration",
+            Self::Checkpoint => "checkpoint",
+            Self::Request => "request",
+            Self::Unsupported => "unsupported",
+        })
+    }
+}
+
+/// A model family as its own refusals name it: the identifier the family registers
+/// ([`crate::family::Family::id`]).
+///
+/// A family's code raises a refusal through its id, so every family shares one error type and
+/// a family that composes another's modules propagates that family's refusals unchanged.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ModelId(pub &'static str);
+
+impl ModelId {
+    /// The refusal `refusal` of this family, stating `problem`.
+    pub fn refuse(self, refusal: Refusal, problem: impl Into<String>) -> Error {
+        Error::Model {
+            model: self,
+            refusal,
+            problem: problem.into(),
+        }
+    }
+
+    /// A configuration, split or call this family does not serve ([`Refusal::Config`]).
+    pub fn config(self, problem: impl Into<String>) -> Error {
+        self.refuse(Refusal::Config, problem)
+    }
+
+    /// A checkpoint whose layout or files this family cannot open ([`Refusal::Checkpoint`]).
+    pub fn checkpoint(self, problem: impl Into<String>) -> Error {
+        self.refuse(Refusal::Checkpoint, problem)
+    }
+
+    /// A request, layout or tensor a module was not loaded for ([`Refusal::Request`]).
+    pub fn request(self, problem: impl Into<String>) -> Error {
+        self.refuse(Refusal::Request, problem)
+    }
+
+    /// A capability this family does not implement ([`Refusal::Unsupported`]).
+    pub fn unsupported(self, problem: impl Into<String>) -> Error {
+        self.refuse(Refusal::Unsupported, problem)
+    }
+}
+
+impl std::fmt::Display for ModelId {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.0)
     }
 }
 

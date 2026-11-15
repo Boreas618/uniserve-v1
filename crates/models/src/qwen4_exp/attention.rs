@@ -44,13 +44,14 @@ use nn::modules::{
     Linear, LinearConfig, Parallel, QkvBias, QkvLinear, QkvLinearConfig, QkvNames, Rotary,
 };
 use nn::{
-    DType, Device, KvCache, RecurrentState, Split, Tensor, TokenBatch, VarBuilder, functional,
+    DType, Device, KvCache, RecurrentState, Result, Split, Tensor, TokenBatch, VarBuilder,
+    functional,
 };
 
+use crate::qwen4_exp::ID;
 use crate::qwen4_exp::causal_lm::{LEADING, POSITION, ROW, SLOT, TRAILING};
 use crate::qwen4_exp::config::{Config, IndexerConfig};
 use crate::qwen4_exp::ngram::int;
-use crate::qwen4_exp::{Error, Result};
 
 /// An attention layer with its indexer, its modules named as the checkpoint names them.
 pub struct IndexedAttention {
@@ -255,9 +256,8 @@ impl IndexedAttention {
             Activation::Sigmoid,
             false,
         )?;
-        Ok(self
-            .o_proj
-            .forward(&gated.reshape((tokens, heads * head_dim))?)?)
+        self.o_proj
+            .forward(&gated.reshape((tokens, heads * head_dim))?)
     }
 
     /// The indexer: stores the compressed key of every group this forward's rows complete,
@@ -291,18 +291,18 @@ impl IndexedAttention {
             .layer(layer)?
             .index_keys
             .as_ref()
-            .ok_or_else(|| Error::Config(format!("cache layer {layer} holds no index keys")))?;
+            .ok_or_else(|| ID.config(format!("cache layer {layer} holds no index keys")))?;
         let (&[pages, groups, key_width], &[_, max_pages]) =
             (plane.dims(), cache.block_tables.dims())
         else {
-            return Err(Error::Config(format!(
+            return Err(ID.config(format!(
                 "index keys of {:?} under a page table of {:?}",
                 plane.dims(),
                 cache.block_tables.dims()
             )));
         };
         if key_width != width || groups * ratio != cache.page_size as usize {
-            return Err(Error::Config(format!(
+            return Err(ID.config(format!(
                 "index keys of {:?} for pages of {} tokens in groups of {ratio} keys of {width}",
                 plane.dims(),
                 cache.page_size
@@ -310,13 +310,13 @@ impl IndexedAttention {
         }
         let fields = state.live.get(ring).map_or(&[][..], Vec::as_slice);
         let [ring_keys, ring_positions] = fields else {
-            return Err(Error::Config(format!(
+            return Err(ID.config(format!(
                 "recurrent layer {ring} holds {} fields, a ring's two expected",
                 fields.len()
             )));
         };
         let (&[slots, capacity, _], axes) = (ring_keys.dims(), coordinates.dims()[0]) else {
-            return Err(Error::Config(format!(
+            return Err(ID.config(format!(
                 "a ring of {:?} is not [slots, capacity, width]",
                 ring_keys.dims()
             )));

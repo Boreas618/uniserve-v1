@@ -6,13 +6,14 @@
 //! `spatial_compression × spatial_compression` pixels. The encoder serves the conditioned
 //! tasks, which encode a request's keyframes and reference media. Both read this one config.
 
+use nn::Result;
 use nn::config::Fields;
 use nn::functional::Padding;
 use nn::quantization::Declaration;
 use serde_json::Value;
 
 use super::statistics;
-use crate::minimax_h3::{Error, Result};
+use crate::minimax_h3::ID;
 
 /// What `vae/config.json` states of the video VAE (diffusers' `AutoencoderKLMiniMaxH3`).
 #[derive(Clone, PartialEq, Debug)]
@@ -79,7 +80,7 @@ impl VideoVaeConfig {
             // A constant border is the convolution's own zero padding, which the causal pad's
             // kernel does not fill: it mirrors or repeats the edge.
             other => {
-                return Err(Error::config(format!(
+                return Err(ID.config(format!(
                     "unsupported H3 video spatial padding mode {other:?}"
                 )));
             }
@@ -123,7 +124,7 @@ impl VideoVaeConfig {
         if self.block_out_channels.len() != self.spatial_downsample_factors.len()
             || self.block_out_channels.len() != self.temporal_downsample_factors.len()
         {
-            return Err(Error::config(format!(
+            return Err(ID.config(format!(
                 "{owner}: encoder stages must have matching widths and strides: {} widths, \
                  {} spatial, {} temporal",
                 self.block_out_channels.len(),
@@ -132,15 +133,13 @@ impl VideoVaeConfig {
             )));
         }
         if self.token_drop >= self.clip_latents() {
-            return Err(Error::config(format!(
+            return Err(ID.config(format!(
                 "{owner}.token_drop {} must leave latent frames of a {}-frame clip",
                 self.token_drop, self.clip_length
             )));
         }
         if self.latents_std.iter().any(|value| *value <= 0.0) {
-            return Err(Error::config(format!(
-                "{owner}.latents_std must be positive"
-            )));
+            return Err(ID.config(format!("{owner}.latents_std must be positive")));
         }
 
         // The rotary width splits evenly across the three axes (time, height, width), and each
@@ -152,7 +151,7 @@ impl VideoVaeConfig {
             || (rotary_width - rounded).abs() > f64::EPSILON
             || !(rounded as u32).is_multiple_of(6)
         {
-            return Err(Error::config(format!(
+            return Err(ID.config(format!(
                 "{owner}: the decoder rotary width {rotary_width} must divide into three even axes"
             )));
         }

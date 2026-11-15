@@ -23,12 +23,12 @@
 
 use nn::family::{CacheShape, SequenceSplit, TextPlacement};
 use nn::modules::{Linear, LinearConfig, Parallel, RmsNorm, Rotary};
-use nn::{D, Drafter, KvCache, Tensor, TokenBatch, VarBuilder, functional};
+use nn::{D, Drafter, KvCache, Result, Tensor, TokenBatch, VarBuilder, functional};
 
+use crate::qwen3::ID;
 use crate::qwen3::causal_lm::text_rotary;
 use crate::qwen3::config::Config;
 use crate::qwen3::decoder::{self, DecoderLayer};
-use crate::qwen3::{Error, Result};
 
 /// The profiler class of the drafter's whole forward, at path `mtp`.
 const DRAFTER: &str = "models.qwen3.transformer.Drafter";
@@ -66,14 +66,14 @@ impl Mtp {
         match config.mtp_num_hidden_layers {
             1 => {}
             0 => {
-                return Err(Error::Config(
+                return Err(ID.config(
                     "the deployment speculates and the checkpoint carries no \
                      multi-token-prediction layer"
                         .to_owned(),
                 ));
             }
             layers => {
-                return Err(Error::Config(format!(
+                return Err(ID.config(format!(
                     "a drafter of {layers} layers runs one layer per speculative step, which \
                      a draft forward is not told; one layer is served"
                 )));
@@ -138,12 +138,11 @@ impl Drafter for Mtp {
         let tokens = batch.tokens();
         for (name, rows) in [("embedded", embedded), ("hidden", hidden)] {
             if rows.dims() != [tokens, self.hidden] {
-                return Err(Error::Config(format!(
+                return Err(ID.config(format!(
                     "the drafter's {name} is {:?}, [{tokens}, {}] expected",
                     rows.dims(),
                     self.hidden
-                ))
-                .into());
+                )));
             }
         }
 
@@ -179,7 +178,7 @@ impl Drafter for Mtp {
             Ok(normalized)
         };
 
-        Ok(nn::profiler::range(DRAFTER, &self.path, forward)?)
+        nn::profiler::range(DRAFTER, &self.path, forward)
     }
 }
 

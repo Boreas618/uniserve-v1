@@ -47,7 +47,7 @@ use nn::family::{
 use nn::pipeline::{Block, Extent, Phase, Pipeline, Product, ProductSpec};
 use nn::{
     Adapter, Checkpoint, ConditionRole, ConditionShape, DType, Decoder, Encoder, MediaFormat,
-    PipelineIndex, Source, Sources, Splicer, VideoRequest, WeightLoader,
+    PipelineIndex, Result, Source, Sources, Splicer, VideoRequest, WeightLoader,
 };
 use processing::minimax_h3::{
     CANVAS_RULE, ConditionPacking, DenoiserInfo, MIN_SECONDS, PIPELINE_CLASS, PreparedCondition,
@@ -64,7 +64,7 @@ use crate::minimax_h3::config::{
 use crate::minimax_h3::denoiser::{Denoiser, SAMPLE_DTYPE};
 use crate::minimax_h3::splice::VideoPostprocessor;
 use crate::minimax_h3::video_vae::{self, VideoDecoder, VideoEncoder};
-use crate::minimax_h3::{Config, Error, Result, VideoTask, packing};
+use crate::minimax_h3::{Config, ID, VideoTask, packing};
 use crate::qwen3::Qwen3VlModel;
 
 /// The MiniMax-H3 family: a diffusers modular pipeline, which request processing serves
@@ -123,7 +123,7 @@ pub fn compose(sources: &Sources) -> Result<(Checkpoint, Networks)> {
     // The networks the checkpoint serves, and the base release its other components come from.
     let (networks, base) = match (export, &adapter) {
         (Some(_), Some(_)) => {
-            return Err(Error::checkpoint(format!(
+            return Err(ID.checkpoint(format!(
                 "{} is a FastH3 student export (it states {}), and an adapter is fused into \
                  the base release",
                 checkpoint.directory().display(),
@@ -137,14 +137,14 @@ pub fn compose(sources: &Sources) -> Result<(Checkpoint, Networks)> {
                     Some(base)
                 }
                 (Some(revision), None) => {
-                    return Err(Error::checkpoint(format!(
+                    return Err(ID.checkpoint(format!(
                         "{} continues the base release {revision}, and the deployment states \
                          no snapshot of it (`base`)",
                         checkpoint.directory().display()
                     )));
                 }
                 (None, Some(base)) => {
-                    return Err(Error::checkpoint(format!(
+                    return Err(ID.checkpoint(format!(
                         "the deployment states the base {}, and {} continues none: its {} \
                          states no base_model_revision",
                         base.directory().display(),
@@ -158,7 +158,7 @@ pub fn compose(sources: &Sources) -> Result<(Checkpoint, Networks)> {
         }
         (None, adapter) => {
             if let Some(base) = &sources.base {
-                return Err(Error::checkpoint(format!(
+                return Err(ID.checkpoint(format!(
                     "{} is a base release, which continues none, and the deployment states \
                      the base {}",
                     checkpoint.directory().display(),
@@ -197,7 +197,7 @@ pub fn compose(sources: &Sources) -> Result<(Checkpoint, Networks)> {
                 // An export that also holds what its contract takes from the base would be
                 // served half from files it does not name.
                 if index.place(name, checkpoint)?.directory().exists() {
-                    return Err(Error::checkpoint(format!(
+                    return Err(ID.checkpoint(format!(
                         "{} holds `{name}`, which its {} takes from the base release it \
                          continues",
                         checkpoint.directory().display(),
@@ -221,7 +221,7 @@ pub fn compose(sources: &Sources) -> Result<(Checkpoint, Networks)> {
     if let Some((contract, adapter)) = adapter {
         let name = Component::holding(contract.network)?.name();
         let network = stages.remove(name).ok_or_else(|| {
-            Error::checkpoint(format!("the adapter edits `{name}`, which is not composed"))
+            ID.checkpoint(format!("the adapter edits `{name}`, which is not composed"))
         })?;
         stages.insert(name.to_owned(), network.attach(adapter)?);
     }
@@ -234,7 +234,7 @@ pub fn compose(sources: &Sources) -> Result<(Checkpoint, Networks)> {
 fn pipeline_index(source: &Source) -> Result<PipelineIndex> {
     let index = PipelineIndex::read(source, FAMILY.request.root)?;
     if index.class() != PIPELINE_CLASS {
-        return Err(Error::checkpoint(format!(
+        return Err(ID.checkpoint(format!(
             "{} declares a {} pipeline, and this family serves {PIPELINE_CLASS}",
             source.directory().display(),
             index.class()
@@ -246,7 +246,7 @@ fn pipeline_index(source: &Source) -> Result<PipelineIndex> {
 /// The adapter the directory `directory` holds and the contract of the student it is.
 fn open_adapter(directory: &Source) -> Result<(Contract, Adapter)> {
     let contract = Contract::read(directory)?.ok_or_else(|| {
-        Error::checkpoint(format!(
+        ID.checkpoint(format!(
             "the adapter directory {} holds no {}: an adapter states the student it is (its \
              task, schedule and attention) in the contract its release publishes",
             directory.directory().display(),
@@ -264,7 +264,7 @@ fn continues(revision: &BaseRevision, source: &Source) -> Result<()> {
         return Ok(());
     };
     if snapshot.repository() != revision.repository || snapshot.revision() != revision.revision {
-        return Err(Error::checkpoint(format!(
+        return Err(ID.checkpoint(format!(
             "the student continues {revision}, and the deployment's snapshot is {}@{}",
             snapshot.repository(),
             snapshot.revision()
@@ -407,7 +407,7 @@ impl MinimaxH3 {
             let heads = denoiser.transformer.num_attention_heads;
             let shares = split.ulysses.split.size * split.tensor.size;
             if shares == 0 || !heads.is_multiple_of(shares) {
-                return Err(Error::config(format!(
+                return Err(ID.config(format!(
                     "a Ulysses degree of {} in a tensor split of {} does not divide the {heads} \
                      attention heads of {}",
                     split.ulysses.split.size,
@@ -420,7 +420,7 @@ impl MinimaxH3 {
         // The text capacity is the deployment's longest prompt; the condition capacity is the
         // deployment's when it states one, and otherwise the widest its tasks ask for.
         let text_rows = *serving.text_capacities.last().ok_or_else(|| {
-            Error::config(
+            ID.config(
                 "this deployment states no prompt capacity, so no layout could hold a prompt"
                     .to_owned(),
             )
@@ -449,7 +449,7 @@ impl MinimaxH3 {
 
         if stages.contains(Stage::TextEncoder) {
             let processor = config.processor.ok_or_else(|| {
-                Error::checkpoint(
+                ID.checkpoint(
                     "the checkpoint states no processor/video_preprocessor_config.json, so the \
                      text encoder's vision tower cannot size an image"
                         .to_owned(),
@@ -473,7 +473,7 @@ impl MinimaxH3 {
                 continue;
             }
             let denoiser = config.denoisers.get(&stage).ok_or_else(|| {
-                Error::checkpoint(format!("the checkpoint holds no {} network", stage.name()))
+                ID.checkpoint(format!("the checkpoint holds no {} network", stage.name()))
             })?;
 
             // The two condition encoders are the denoiser's conditioning half.
@@ -552,7 +552,7 @@ impl MinimaxH3 {
 
         match denoiser.config().vsa {
             Some(vsa) => ConditionPacking::tiled(capacity, vsa.tile_rows, vsa.tile_shape())
-                .ok_or_else(|| Error::config("a sparse attention tile is empty".to_owned())),
+                .ok_or_else(|| ID.config("a sparse attention tile is empty".to_owned())),
             None => Ok(ConditionPacking::dense(capacity)),
         }
     }
@@ -636,7 +636,7 @@ impl VideoModel for MinimaxH3 {
     }
 
     fn timeline(&self, seconds: f64) -> nn::Result<u32> {
-        Ok(timeline(seconds)?)
+        timeline(seconds)
     }
 
     fn video_units(&self, frames: u32) -> nn::Result<Vec<u32>> {
@@ -679,16 +679,16 @@ impl VideoModel for MinimaxH3 {
         serving: &VideoServing,
     ) -> nn::Result<Vec<(VideoRequest, Vec<Vec<ConditionShape>>)>> {
         let denoiser = self.network().ok_or_else(|| {
-            Error::config("this rank places no denoiser, so no denoising step could run".to_owned())
+            ID.config("this rank places no denoiser, so no denoising step could run".to_owned())
         })?;
 
-        Ok(candidates(
+        candidates(
             &self.tasks,
             serving,
             &denoiser.condition_ladder(),
             &self.condition_packing(denoiser)?,
             self.config.processor.as_ref(),
-        )?)
+        )
     }
 
     fn warm_prompts(&self, serving: &VideoServing) -> nn::Result<Vec<(Vec<[u32; 3]>, Vec<u32>)>> {
@@ -698,11 +698,11 @@ impl VideoModel for MinimaxH3 {
             .vision
             .as_ref()
             .map(|vision| vision.image_token_id);
-        Ok(warm_prompts(
+        warm_prompts(
             &self.tasks,
             serving,
             (self.config.processor.as_ref(), placeholder),
-        )?)
+        )
     }
 
     /// What the placed denoiser serves under `serving`: the tasks of the placed network, its
@@ -710,7 +710,7 @@ impl VideoModel for MinimaxH3 {
     /// condition packing.
     fn description(&self, serving: &VideoServing) -> nn::Result<Description> {
         let denoiser = self.network().ok_or_else(|| {
-            Error::config("this rank places no denoiser, so it serves no task".to_owned())
+            ID.config("this rank places no denoiser, so it serves no task".to_owned())
         })?;
         let tasks: Vec<VideoTask> = VideoTask::ALL
             .into_iter()
@@ -733,7 +733,7 @@ impl VideoModel for MinimaxH3 {
             condition_packing: self.condition_packing(denoiser)?,
         };
         info.validate()
-            .map_err(|reason| Error::config(format!("the denoiser's description: {reason}")))?;
+            .map_err(|reason| ID.config(format!("the denoiser's description: {reason}")))?;
 
         Ok(Description {
             takes_conditions: tasks.iter().any(|task| task.conditioned()),
@@ -756,9 +756,7 @@ fn stages(
     placed: Option<&BTreeSet<String>>,
 ) -> Result<Stages> {
     if tasks.is_empty() {
-        return Err(Error::config(
-            "a deployment serves at least one task".to_owned(),
-        ));
+        return Err(ID.config("a deployment serves at least one task".to_owned()));
     }
     let stated = config.tasks();
 
@@ -770,7 +768,7 @@ fn stages(
     ]);
     for task in tasks {
         if !stated.contains(task) {
-            return Err(Error::config(format!(
+            return Err(ID.config(format!(
                 "this checkpoint states {stated:?} and not {task:?}"
             )));
         }
@@ -792,7 +790,7 @@ fn stages(
         .filter(|stage| placed.is_none_or(|names| places(names, *stage)))
         .collect();
     if stages.contains(Stage::Transformer) && stages.contains(Stage::TransformerRef) {
-        return Err(Error::config(
+        return Err(ID.config(
             "a rank cannot hold both the base and the reference network: they are one stage"
                 .to_owned(),
         ));
@@ -813,7 +811,7 @@ fn served_tasks(
     checkpoint: &Path,
 ) -> Result<Vec<VideoTask>> {
     if stated.is_empty() {
-        return Err(Error::config(format!(
+        return Err(ID.config(format!(
             "the checkpoint {} states no task, so no network can be sized for one",
             checkpoint.display()
         )));
@@ -825,7 +823,7 @@ fn served_tasks(
             return Ok(stated.to_vec());
         }
 
-        return Err(Error::config(format!(
+        return Err(ID.config(format!(
             "the checkpoint {} holds two networks and this deployment places the whole \
              pipeline: a deployment file that places one of them chooses it",
             checkpoint.display()
@@ -842,7 +840,7 @@ fn served_tasks(
         .filter(|task| stages.contains(network(*task).name()))
         .collect();
     if served.is_empty() {
-        return Err(Error::config(format!(
+        return Err(ID.config(format!(
             "the checkpoint {} states {stated:?} and the deployment places no network of them",
             checkpoint.display()
         )));
@@ -867,9 +865,10 @@ fn keyframe(role: ConditionRole, resolution: &ServedCanvas) -> ConditionShape {
 /// one unit.
 fn condition_capacity(config: &Config, task: VideoTask) -> Result<u32> {
     let stage = network(task);
-    let denoiser = config.denoisers.get(&stage).ok_or_else(|| {
-        Error::config(format!("the checkpoint holds no {} network", stage.name()))
-    })?;
+    let denoiser = config
+        .denoisers
+        .get(&stage)
+        .ok_or_else(|| ID.config(format!("the checkpoint holds no {} network", stage.name())))?;
 
     let mut rows = 0;
     for resolution in resolutions()? {
@@ -907,7 +906,7 @@ fn condition_capacity(config: &Config, task: VideoTask) -> Result<u32> {
 fn timeline(seconds: f64) -> Result<u32> {
     let frames = processing::requested_frames(seconds, FPS);
     if !seconds.is_finite() || frames == 0 || frames > u32::MAX - FRAMES.clip_frames {
-        return Err(Error::config(format!(
+        return Err(ID.config(format!(
             "{seconds} seconds is not a positive number of frames at {FPS} frames per second"
         )));
     }
@@ -917,16 +916,16 @@ fn timeline(seconds: f64) -> Result<u32> {
 /// The resolutions every H3 checkpoint generates: the resolution rule's of each named aspect
 /// ratio.
 fn resolutions() -> Result<Vec<ServedCanvas>> {
-    named_canvases().map_err(|error| Error::config(format!("the resolution rule: {error}")))
+    named_canvases().map_err(|error| ID.config(format!("the resolution rule: {error}")))
 }
 
 /// The resolutions of the sizes a deployment serves, each with the aspect ratio that names it,
 /// in the deployment's order.
 fn served_resolutions(sizes: &[(u32, u32)]) -> Result<Vec<ServedCanvas>> {
     if sizes.is_empty() {
-        return Err(Error::config(
-            "this deployment serves no size, so no raster could be decoded".to_owned(),
-        ));
+        return Err(
+            ID.config("this deployment serves no size, so no raster could be decoded".to_owned())
+        );
     }
     let generated = resolutions()?;
 
@@ -938,7 +937,7 @@ fn served_resolutions(sizes: &[(u32, u32)]) -> Result<Vec<ServedCanvas>> {
                 .find(|served| served.canvas.width == width && served.canvas.height == height)
                 .cloned()
                 .ok_or_else(|| {
-                    Error::config(format!(
+                    ID.config(format!(
                         "this deployment serves {width}x{height}, which the checkpoint does not \
                          generate: it generates {}",
                         generated
@@ -1038,7 +1037,7 @@ fn keyframe_openings(
     processor: Option<&processing::qwen_vl::ProcessorConfig>,
 ) -> Result<Vec<(u32, Vec<ConditionShape>)>> {
     let processor = processor.ok_or_else(|| {
-        Error::checkpoint(
+        ID.checkpoint(
             "the deployment serves fl2va and the checkpoint states no \
              processor/video_preprocessor_config.json, so a keyframe cannot be prepared"
                 .to_owned(),
@@ -1074,7 +1073,7 @@ fn keyframe_openings(
                 )
             })
             .collect::<std::result::Result<Vec<_>, String>>()
-            .map_err(|error| Error::config(format!("a keyframe of {width}x{height}: {error}")))?;
+            .map_err(|error| ID.config(format!("a keyframe of {width}x{height}: {error}")))?;
 
         let rows = processing::minimax_h3::condition_rows(&prepared, resolution.canvas, packing);
         let Some(rung) = ladder.iter().copied().find(|rung| *rung >= rows) else {
@@ -1228,7 +1227,7 @@ fn warm_prompts(
         return Ok(Vec::new());
     }
     let processor = processor.ok_or_else(|| {
-        Error::checkpoint(
+        ID.checkpoint(
             "the deployment serves vision blocks and the checkpoint states no \
              processor/video_preprocessor_config.json, so the vision grid a block presents \
              cannot be sized"
@@ -1236,7 +1235,7 @@ fn warm_prompts(
         )
     })?;
     let placeholder = placeholder.ok_or_else(|| {
-        Error::checkpoint(
+        ID.checkpoint(
             "the deployment serves vision blocks and the text encoder states no vision tower, \
              so no prompt presents one"
                 .to_owned(),
@@ -1247,9 +1246,9 @@ fn warm_prompts(
     if keyframes {
         for resolution in served_resolutions(&serving.sizes)? {
             let (width, height) = (resolution.canvas.width, resolution.canvas.height);
-            let grid = processor.image_grid(height, width).map_err(|error| {
-                Error::config(format!("a keyframe of {width}x{height}: {error}"))
-            })?;
+            let grid = processor
+                .image_grid(height, width)
+                .map_err(|error| ID.config(format!("a keyframe of {width}x{height}: {error}")))?;
 
             // Each temporal step of a block presents one run of merged tokens.
             let tokens = grid.t * processor.block_tokens(grid);

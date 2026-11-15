@@ -40,10 +40,11 @@
 //! splice and its codec are FP16. A packed ModelOpt export states each module's representation in
 //! its manifest and takes no policy.
 
+use nn::Result;
 use nn::quantization::{Declaration, Scheme};
 use proto::config::{PrecisionMode, Quantization, WeightFormat};
 
-use crate::minimax_h3::{Config, Error, Result, transformer, video_vae};
+use crate::minimax_h3::{Config, ID, transformer, video_vae};
 
 /// The modules a policy selects, in the order of every table below.
 const MODULES: [&str; 4] = ["attention", "mlp", "text_encoder", "video_vae"];
@@ -131,7 +132,7 @@ pub(crate) fn apply(policy: &Quantization, config: &mut Config) -> Result<()> {
         ])
         .any(|declaration| *declaration != dense);
     if declared {
-        return Err(Error::Unsupported(format!(
+        return Err(ID.unsupported(format!(
             "`quantization = {policy}`: checkpoint format 'modelopt_nvfp4' owns its numerical \
              configuration (its `{}` states each module's representation); drop `quantization`",
             nn::quantization::ModeloptManifest::FILE
@@ -140,14 +141,14 @@ pub(crate) fn apply(policy: &Quantization, config: &mut Config) -> Result<()> {
 
     for (module, format) in &policy.modules {
         let Some(index) = MODULES.iter().position(|name| name == module) else {
-            return Err(Error::Unsupported(format!(
+            return Err(ID.unsupported(format!(
                 "`quantization.modules.{module}`: MiniMax-H3 selects the representation of {}, \
                  not of `{module}`",
                 listed(MODULES.iter().map(|name| format!("`{name}`")))
             )));
         };
         if !SELECTABLE[index].contains(format) {
-            return Err(Error::Unsupported(format!(
+            return Err(ID.unsupported(format!(
                 "`quantization.modules.{module} = \"{format}\"`: `{module}` takes {}",
                 listed(SELECTABLE[index].iter().map(|format| format!("`{format}`")))
             )));
@@ -163,7 +164,7 @@ pub(crate) fn apply(policy: &Quantization, config: &mut Config) -> Result<()> {
     }
 
     if resolved[VIDEO_VAE] == WeightFormat::Bf16 {
-        return Err(Error::Unsupported(format!(
+        return Err(ID.unsupported(format!(
             "`quantization = {policy}` gives `video_vae` in bf16, and the video VAE decoder \
              computes in fp16, the type its reference computes in: its raster, splice and codec \
              read fp16; select `video_vae` in fp16 or nvfp4"

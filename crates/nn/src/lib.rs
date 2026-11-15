@@ -94,7 +94,7 @@ pub use checkpoint::{
     TensorLocation,
 };
 pub use collective::Split;
-pub use error::{Error, Result};
+pub use error::{Error, ModelId, Refusal, Result};
 pub use proto::module::Phase;
 pub use proto::video::{ConditionRole, LatentShape, VisionGrid};
 pub use tensor::{D, DType, Device, IndexOp, Module, Shape, Tensor};

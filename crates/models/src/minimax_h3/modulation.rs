@@ -28,10 +28,10 @@
 use nn::modules::{
     Linear, LinearConfig, Parallel, TimestepEmbedding, TimestepEmbeddingConfig, TimestepTable,
 };
-use nn::{DType, Device, Tensor, VarBuilder, functional};
+use nn::{DType, Device, Result, Tensor, VarBuilder, functional};
 
+use crate::minimax_h3::ID;
 use crate::minimax_h3::config::{ScheduleConfig, TransformerConfig};
-use crate::minimax_h3::{Error, Result};
 
 /// The level a visual condition is anchored at, `t · clean + (1 − t) · noise`, and the level
 /// its timestep group sits at until the generated video is cleaner than it
@@ -153,7 +153,7 @@ impl Modulation {
     pub fn fill(&self, table: &TimestepTable) -> Result<()> {
         let dtype = self.dtype();
         if table.output_table().dtype() != dtype {
-            return Err(Error::config(format!(
+            return Err(ID.config(format!(
                 "the modulation tables are {:?} and the projections' weights {dtype:?}",
                 table.output_table().dtype()
             )));

@@ -6,11 +6,12 @@
 //! which the decoder's rates invert), and a video's timeline counts audio latents in those hops
 //! (`docs/minimax_h3/minimax_h3.md`).
 
+use nn::Result;
 use nn::config::Fields;
 use serde_json::Value;
 
 use super::statistics;
-use crate::minimax_h3::{Error, Result};
+use crate::minimax_h3::ID;
 
 /// What `audio_vae/config.json` states of the audio VAE.
 #[derive(Clone, PartialEq, Debug)]
@@ -74,29 +75,27 @@ impl AudioVaeConfig {
         let owner = "H3 audio_vae";
 
         if self.decoder_rates.len() != self.decoder_kernel_sizes.len() {
-            return Err(Error::config(format!(
+            return Err(ID.config(format!(
                 "{owner}: {} decoder stages and {} kernels",
                 self.decoder_rates.len(),
                 self.decoder_kernel_sizes.len()
             )));
         }
         if self.resblock_dilation_sizes.len() != self.resblock_kernel_sizes.len() {
-            return Err(Error::config(format!(
+            return Err(ID.config(format!(
                 "{owner}: {} residual kernels and {} dilation rows",
                 self.resblock_kernel_sizes.len(),
                 self.resblock_dilation_sizes.len()
             )));
         }
         if !self.latent_dim.is_multiple_of(self.num_attention_heads) {
-            return Err(Error::config(format!(
+            return Err(ID.config(format!(
                 "{owner}: latent width {} is not divisible by {} attention heads",
                 self.latent_dim, self.num_attention_heads
             )));
         }
         if self.latents_std.iter().any(|value| *value <= 0.0) {
-            return Err(Error::config(format!(
-                "{owner}.latents_std must be positive"
-            )));
+            return Err(ID.config(format!("{owner}.latents_std must be positive")));
         }
         Ok(())
     }

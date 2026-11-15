@@ -29,10 +29,10 @@ use nn::family::TextPlacement;
 use nn::functional::Activation;
 use nn::modules::{GatedDeltaNetConfig, Precision, RotaryConfig, Spectrum};
 use nn::quantization::Declaration;
-use nn::{PixelNorm, Split};
+use nn::{PixelNorm, Result, Split};
 use processing::qwen_vl::ProcessorConfig;
 
-use crate::qwen3::{Error, Result};
+use crate::qwen3::ID;
 
 /// The precision every Qwen3 rotary spectrum is evaluated in.
 const PRECISION: Precision = Precision::F32;
@@ -224,7 +224,7 @@ impl Config {
     /// serve, or processor files that are not a Qwen-VL processor's.
     pub fn open(checkpoint: &nn::Checkpoint) -> Result<Self> {
         let value = checkpoint.sidecar("config.json")?.ok_or_else(|| {
-            Error::Config(format!(
+            ID.config(format!(
                 "{} holds no config.json",
                 checkpoint.root().display()
             ))
@@ -250,9 +250,9 @@ impl Config {
     pub fn parse(fields: &Fields<'_>) -> Result<Self> {
         let architectures = fields
             .optional_texts("architectures")?
-            .ok_or_else(|| Error::Config("checkpoint declares no architectures".to_owned()))?;
+            .ok_or_else(|| ID.config("checkpoint declares no architectures".to_owned()))?;
         let [class] = architectures.as_slice() else {
-            return Err(Error::Config(format!(
+            return Err(ID.config(format!(
                 "expected one architecture, found {architectures:?}"
             )));
         };
@@ -262,7 +262,7 @@ impl Config {
             QWEN3_5_MOE => Self::qwen3_5_moe(fields)?,
             QWEN3_VL => Self::qwen3_vl(fields)?,
             other => {
-                return Err(Error::Config(format!(
+                return Err(ID.config(format!(
                     "{other} is not a Qwen3 class this crate builds ({CLASSES:?})"
                 )));
             }
@@ -276,9 +276,9 @@ impl Config {
         if let Some(kinds) = fields.optional_texts("layer_types")?
             && kinds.iter().any(|kind| *kind != "full_attention")
         {
-            return Err(Error::Config(
-                "layer_types other than full_attention are not served".to_owned(),
-            ));
+            return Err(
+                ID.config("layer_types other than full_attention are not served".to_owned())
+            );
         }
 
         let text = TextConfig::read(fields, fields.count("intermediate_size")?, Some(1.0))?;
@@ -329,7 +329,7 @@ impl Config {
         if let Some(dtype) = values.optional_text("mamba_ssm_dtype")?
             && dtype != "float32"
         {
-            return Err(Error::Config(format!(
+            return Err(ID.config(format!(
                 "a recurrent state of {dtype} is not served; the state is float32"
             )));
         }
@@ -350,15 +350,15 @@ impl Config {
             split: Split::WHOLE,
         };
         if !linear.value_heads.is_multiple_of(linear.key_heads) {
-            return Err(Error::Config(format!(
+            return Err(ID.config(format!(
                 "{} linear value heads do not group over {} key heads",
                 linear.value_heads, linear.key_heads
             )));
         }
         if linear.conv_width < 2 {
-            return Err(Error::Config(
-                "a short convolution of fewer than two taps keeps no state".to_owned(),
-            ));
+            return Err(
+                ID.config("a short convolution of fewer than two taps keeps no state".to_owned())
+            );
         }
         text.linear_layers = values.linear_attention(text.num_hidden_layers)?;
         text.gated_delta_net = Some(linear);
@@ -367,7 +367,7 @@ impl Config {
             .optional_flag("mtp_use_dedicated_embeddings")?
             .unwrap_or(false)
         {
-            return Err(Error::Config(
+            return Err(ID.config(
                 "the drafter embeds with a table of its own (mtp_use_dedicated_embeddings), \
                  which is not served"
                     .to_owned(),
@@ -419,38 +419,34 @@ impl Config {
     /// of the vocabulary.
     fn check(&self) -> Result<()> {
         if self.moe.is_some() && self.text.hidden_act == Activation::Gelu {
-            return Err(Error::Config(
-                "experts gate with silu or gelu_pytorch_tanh, not exact gelu".to_owned(),
-            ));
+            return Err(
+                ID.config("experts gate with silu or gelu_pytorch_tanh, not exact gelu".to_owned())
+            );
         }
 
         if let Some(moe) = &self.moe {
             if moe.num_experts_per_tok > moe.num_experts {
-                return Err(Error::Config(
-                    "num_experts_per_tok exceeds num_experts".to_owned(),
-                ));
+                return Err(ID.config("num_experts_per_tok exceeds num_experts".to_owned()));
             }
             if moe
                 .mlp_only_layers
                 .iter()
                 .any(|layer| *layer >= self.text.num_hidden_layers)
             {
-                return Err(Error::Config(
-                    "mlp_only_layers names a layer outside the stack".to_owned(),
-                ));
+                return Err(ID.config("mlp_only_layers names a layer outside the stack".to_owned()));
             }
         }
 
         if let Some(vision) = &self.vision {
             if vision.out_hidden_size != self.text.hidden_size {
-                return Err(Error::Config(format!(
+                return Err(ID.config(format!(
                     "vision tokens are {} wide and the language model {}",
                     vision.out_hidden_size, self.text.hidden_size
                 )));
             }
             for token in [vision.image_token_id, vision.video_token_id] {
                 if token >= self.text.vocab_size {
-                    return Err(Error::Config(format!(
+                    return Err(ID.config(format!(
                         "vision placeholder {token} is outside the {}-entry vocabulary",
                         self.text.vocab_size
                     )));
@@ -462,7 +458,7 @@ impl Config {
                 _ => 0,
             };
             if axes != POSITION_AXES {
-                return Err(Error::Config(format!(
+                return Err(ID.config(format!(
                     "a language model with vision rotates by interleaved M-RoPE over \
                      {POSITION_AXES} axes, not {:?}",
                     self.text.rope.spectrum
@@ -513,7 +509,7 @@ impl Config {
         self.text.local_heads(tensor)?;
 
         if experts.size == 0 || experts.rank >= experts.size {
-            return Err(Error::Config(format!(
+            return Err(ID.config(format!(
                 "expert rank {} of a group of {}",
                 experts.rank, experts.size
             )));
@@ -521,7 +517,7 @@ impl Config {
         if let Some(moe) = &self.moe
             && !moe.num_experts.is_multiple_of(experts.size)
         {
-            return Err(Error::Config(format!(
+            return Err(ID.config(format!(
                 "expert parallel degree {} does not divide {} experts",
                 experts.size, moe.num_experts
             )));
@@ -559,7 +555,7 @@ impl Config {
             && let Some(moe) = &self.moe
             && (placement.experts.size > 1 || !moe.num_experts.is_multiple_of(tensor.size))
         {
-            return Err(Error::Config(format!(
+            return Err(ID.config(format!(
                 "a tensor group of {} holding whole experts beside an expert group of {}: the \
                  tensor group alone divides the {} experts",
                 tensor.size, placement.experts.size, moe.num_experts
@@ -568,14 +564,14 @@ impl Config {
 
         let split = [tensor.size, pipeline.size, sequence.size];
         if split.iter().filter(|size| **size > 1).count() > 1 {
-            return Err(Error::Config(format!(
+            return Err(ID.config(format!(
                 "tensor, pipeline and sequence degrees {split:?}: a forward runs over one group, \
                  so one of them splits the model"
             )));
         }
         for (name, split) in [("pipeline", pipeline), ("sequence", sequence)] {
             if split.size == 0 || split.rank >= split.size {
-                return Err(Error::Config(format!(
+                return Err(ID.config(format!(
                     "{name} rank {} of a group of {}",
                     split.rank, split.size
                 )));
@@ -589,14 +585,14 @@ impl Config {
                 .iter()
                 .any(|heads| !heads.is_multiple_of(sequence.size))
             {
-                return Err(Error::Config(format!(
+                return Err(ID.config(format!(
                     "a sequence split over {} members of {heads:?} attention and key/value \
                      heads: the members share the heads evenly",
                     sequence.size
                 )));
             }
             if self.linear_layers() > 0 || placement.drafter {
-                return Err(Error::Config(format!(
+                return Err(ID.config(format!(
                     "a sequence split over {} members of a model whose {} layers keep a \
                      recurrent state or that loads its drafter: a recurrent scan reads every row \
                      in order, and the drafter's attention is not split",
@@ -621,7 +617,7 @@ impl Config {
                     == attention_in(0..per_stage)
             });
         if !even {
-            return Err(Error::Config(format!(
+            return Err(ID.config(format!(
                 "a pipeline of {stages} stages over {layers} decoder layers: every stage holds \
                  as many layers, and as many attention layers, as every other"
             )));
@@ -642,17 +638,15 @@ impl TextConfig {
         partial_rotary_factor: Option<f64>,
     ) -> Result<Self> {
         if fields.optional_flag("use_sliding_window")?.unwrap_or(false) {
-            return Err(Error::Config(
-                "sliding-window attention is not served".to_owned(),
-            ));
+            return Err(ID.config("sliding-window attention is not served".to_owned()));
         }
         // The references multiply each block's output by a learned scale under this flag
         // (`refs/vllm/vllm/model_executor/models/qwen3_next.py:612`); no served checkpoint
         // sets it, and a stack that ignored it would compute another model.
         if fields.optional_flag("layer_scale")?.unwrap_or(false) {
-            return Err(Error::Config(
-                "per-layer output scales (layer_scale) are not served".to_owned(),
-            ));
+            return Err(
+                ID.config("per-layer output scales (layer_scale) are not served".to_owned())
+            );
         }
 
         let hidden_size = fields.count("hidden_size")?;
@@ -665,7 +659,7 @@ impl TextConfig {
                 hidden_size / num_attention_heads
             }
             None => {
-                return Err(Error::Config(
+                return Err(ID.config(
                     "hidden_size must be divisible by num_attention_heads when head_dim is absent"
                         .to_owned(),
                 ));
@@ -673,12 +667,12 @@ impl TextConfig {
         };
         let num_key_value_heads = fields.count("num_key_value_heads")?;
         if !num_attention_heads.is_multiple_of(num_key_value_heads) {
-            return Err(Error::Config(
+            return Err(ID.config(
                 "num_attention_heads must be divisible by num_key_value_heads".to_owned(),
             ));
         }
         if !head_dim.is_multiple_of(2) {
-            return Err(Error::Config("head_dim must be even".to_owned()));
+            return Err(ID.config("head_dim must be even".to_owned()));
         }
 
         let max_position_embeddings = fields
@@ -726,7 +720,7 @@ impl TextConfig {
     /// A split that does not divide both head counts, or a rank outside it.
     pub fn local_heads(&self, split: Split) -> Result<(u32, u32)> {
         if split.size == 0 || split.rank >= split.size {
-            return Err(Error::Config(format!(
+            return Err(ID.config(format!(
                 "tensor-parallel rank {} of a group of {}",
                 split.rank, split.size
             )));
@@ -736,7 +730,7 @@ impl TextConfig {
             ("key/value", self.num_key_value_heads),
         ] {
             if !heads.is_multiple_of(split.size) {
-                return Err(Error::Config(format!(
+                return Err(ID.config(format!(
                     "tensor parallel degree {} does not divide {heads} {name} heads",
                     split.size
                 )));
@@ -764,7 +758,7 @@ impl VisionConfig {
 
         let hidden_act = values.activation("hidden_act")?;
         if hidden_act != Activation::GeluTanh {
-            return Err(Error::Config(format!(
+            return Err(ID.config(format!(
                 "{owner}.hidden_act must be gelu_pytorch_tanh, got {hidden_act}"
             )));
         }
@@ -778,7 +772,7 @@ impl VisionConfig {
             .any(|pair| pair[0] >= pair[1])
             || deepstack_visual_indexes.iter().any(|index| *index >= depth)
         {
-            return Err(Error::Config(format!(
+            return Err(ID.config(format!(
                 "{owner}.deepstack_visual_indexes {deepstack_visual_indexes:?} must increase \
                  strictly inside the {depth}-block tower"
             )));
@@ -805,16 +799,14 @@ impl VisionConfig {
         if !config.hidden_size.is_multiple_of(config.num_heads)
             || !config.head_dim().is_multiple_of(4)
         {
-            return Err(Error::Config(format!(
+            return Err(ID.config(format!(
                 "{} vision heads must split the {} wide tower into heads of a multiple of four",
                 config.num_heads, config.hidden_size
             )));
         }
         let side = config.position_side();
         if side * side != config.num_position_embeddings {
-            return Err(Error::Config(
-                "the vision position table must be a square grid".to_owned(),
-            ));
+            return Err(ID.config("the vision position table must be a square grid".to_owned()));
         }
         Ok(config)
     }
@@ -832,7 +824,8 @@ pub fn processor(checkpoint: &nn::Checkpoint) -> Result<Option<(ProcessorConfig,
     };
 
     let norm = Fields::of(image_file, &image)?.pixel_norm()?;
-    let processor = ProcessorConfig::from_values(&image, &video).map_err(Error::Config)?;
+    let processor =
+        ProcessorConfig::from_values(&image, &video).map_err(|problem| ID.config(problem))?;
     Ok(Some((processor, norm)))
 }
 
@@ -841,9 +834,7 @@ pub fn processor(checkpoint: &nn::Checkpoint) -> Result<Option<(ProcessorConfig,
 fn routed_experts(fields: &Fields<'_>) -> Result<(u32, u32)> {
     let experts = fields.index("num_experts")?;
     if experts == 0 {
-        return Err(Error::Config(
-            "a mixture of experts declares no experts".to_owned(),
-        ));
+        return Err(ID.config("a mixture of experts declares no experts".to_owned()));
     }
 
     Ok((

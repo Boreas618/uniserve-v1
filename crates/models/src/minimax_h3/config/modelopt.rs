@@ -29,7 +29,9 @@
 use nn::quantization::{Declaration, ModeloptManifest};
 
 use super::Component;
-use crate::minimax_h3::{Error, Result, transformer, video_vae};
+use nn::Result;
+
+use crate::minimax_h3::{ID, transformer, video_vae};
 
 /// The stored projection of a gated feed-forward the exporter lists as `listed`, its path
 /// below the feed-forward: `gate_up` for either fused half, `down` for the projection back.
@@ -115,7 +117,7 @@ pub(super) fn check(manifest: &ModeloptManifest) -> Result<()> {
         .find(|listed| stored_module(listed).is_none())
     {
         None => Ok(()),
-        Some(listed) => Err(Error::config(format!(
+        Some(listed) => Err(ID.config(format!(
             "{} calibrates `{listed}`, which names no projection a MiniMax-H3 stage stores \
              packed: the feed-forward projections of a network's blocks and the attention and \
              feed-forward projections of the video decoder's blocks",
@@ -138,11 +140,11 @@ pub(super) fn declaration(
         return Ok(Declaration::dense());
     };
 
-    Ok(manifest.declaration(|listed| {
+    manifest.declaration(|listed| {
         stored_module(listed)
             .filter(|(stage, _)| *stage == directory)
             .map(|(_, module)| module)
-    })?)
+    })
 }
 
 #[cfg(test)]

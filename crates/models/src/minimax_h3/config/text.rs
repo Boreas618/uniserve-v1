@@ -5,10 +5,11 @@
 //! [`RETAINED_LAYERS`] decoder layers of a deeper checkpoint, a depth the checkpoint's
 //! configuration does not state, and adds DeepStack feature `j` after retained layer `j`.
 
+use nn::Result;
 use nn::config::Fields;
 use serde_json::Value;
 
-use crate::minimax_h3::{Error, Result};
+use crate::minimax_h3::ID;
 
 /// The decoder layers of the text encoder H3 conditions on: the hidden state after this many
 /// layers is the prompt's features, with no final norm.
@@ -24,18 +25,18 @@ pub(super) fn text_encoder(metadata: &Value) -> Result<crate::qwen3::Config> {
     let config = crate::qwen3::Config::parse(&Fields::of("text_encoder/config.json", metadata)?)?;
 
     if RETAINED_LAYERS > config.text.num_hidden_layers {
-        return Err(Error::config(format!(
+        return Err(ID.config(format!(
             "H3 keeps {RETAINED_LAYERS} of the text encoder's {} layers",
             config.text.num_hidden_layers
         )));
     }
     let vision = config.vision.as_ref().ok_or_else(|| {
-        Error::config("H3's text encoder is a Qwen3-VL model with a vision tower".to_owned())
+        ID.config("H3's text encoder is a Qwen3-VL model with a vision tower".to_owned())
     })?;
 
     let features = vision.deepstack_visual_indexes.len();
     if features > RETAINED_LAYERS as usize {
-        return Err(Error::config(format!(
+        return Err(ID.config(format!(
             "{features} DeepStack features, but H3 retains {RETAINED_LAYERS} layers"
         )));
     }
@@ -56,7 +57,7 @@ mod tests {
         shallow["text_config"]["num_hidden_layers"] = serde_json::json!(RETAINED_LAYERS - 1);
         let error = text_encoder(&shallow).unwrap_err();
         assert!(
-            matches!(error, Error::Config(ref problem) if problem.contains("keeps")),
+            matches!(error, nn::Error::Model { refusal: nn::Refusal::Config, ref problem, .. } if problem.contains("keeps")),
             "{error}"
         );
     }

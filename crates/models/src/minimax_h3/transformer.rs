@@ -40,7 +40,6 @@
 //!   next stage's input and, from the last stage, every stage's rows, which each reads the heads
 //!   over.
 
-use nn::collective;
 use nn::family::{DenoiserSplit, GATHER_AXIS, LAYER_AXIS, Projection, TENSOR_AXIS, ULYSSES_AXIS};
 use nn::functional::{self, Activation, Rounding, WeightOrder};
 use nn::modules::{
@@ -49,9 +48,10 @@ use nn::modules::{
     UlyssesAttention, UlyssesAttentionConfig, VsaAttention, VsaAttentionConfig,
 };
 use nn::{DType, Device, Split, Tensor, VarBuilder};
+use nn::{Result, collective};
 
+use crate::minimax_h3::ID;
 use crate::minimax_h3::config::{DenoiserConfig, TransformerConfig};
-use crate::minimax_h3::{Error, Result};
 
 /// The profiler classes of the stack and of one of its blocks.
 pub(crate) const TRANSFORMER: &str = "Transformer";
@@ -270,9 +270,9 @@ impl Attention {
 
         let Some(vsa) = &self.vsa else {
             let [queries, keys] = tables else {
-                return Err(Error::request(
-                    "a dense attention reads the query and the key offsets".to_owned(),
-                ));
+                return Err(
+                    ID.request("a dense attention reads the query and the key offsets".to_owned())
+                );
             };
             let query = self.headed(&ulysses.project(0, &rows)?)?;
             let key = self.headed(&ulysses.project(1, &rows)?)?;
@@ -326,7 +326,7 @@ impl Attention {
                 None,
             )?;
 
-            return Ok(ulysses.return_rows(&attended.flatten_from(1)?)?);
+            return ulysses.return_rows(&attended.flatten_from(1)?);
         };
 
         let query = ulysses.project(0, &rows)?;
@@ -349,7 +349,7 @@ impl Attention {
         };
         let folded = vsa.add_gated_(fine, &compressed, &gate)?;
 
-        Ok(ulysses.return_rows(&folded)?)
+        ulysses.return_rows(&folded)
     }
 }
 
@@ -358,7 +358,7 @@ impl Attention {
 fn tiles(tables: &[Tensor]) -> Result<(&Tensor, &Tensor, &Tensor)> {
     match tables {
         [sizes, segments, keep] => Ok((sizes, segments, keep)),
-        _ => Err(Error::request(
+        _ => Err(ID.request(
             "a sparse attention reads the tiles' sizes, their segments and the kept tiles"
                 .to_owned(),
         )),
@@ -425,7 +425,7 @@ impl Block {
         // sums along the tensor group.
         let forward = || {
             self.adaln.forward(table, rows, hidden, |normalized| {
-                Ok(self.attention.forward(normalized, factors, tables)?)
+                self.attention.forward(normalized, factors, tables)
             })
         };
         match self.tensor.size {
@@ -463,9 +463,7 @@ impl Block {
         let attention = &self.attention;
         let ulysses = &attention.ulysses;
         let Some(vsa) = &attention.vsa else {
-            return Err(Error::Unsupported(
-                "a dense block returns its rows in one exchange".to_owned(),
-            ));
+            return Err(ID.unsupported("a dense block returns its rows in one exchange".to_owned()));
         };
         let own = hidden.dims()[0];
         let split = ulysses.split();
@@ -505,7 +503,7 @@ impl Block {
         }
         let [query, key, value, gate]: [Tensor; 4] = projections
             .try_into()
-            .map_err(|_| Error::Unsupported("a sparse block projects four inputs".to_owned()))?;
+            .map_err(|_| ID.unsupported("a sparse block projects four inputs".to_owned()))?;
 
         let (fine, compressed) = vsa.attend((query, key, value), Some(factors), tiles(tables)?)?;
         if let Some(started) = travelling {
@@ -610,7 +608,7 @@ impl OutputHead {
         };
 
         if weights.is_empty() || !weights.len().is_multiple_of(heads) {
-            return Err(Error::checkpoint(format!(
+            return Err(ID.checkpoint(format!(
                 "{} fusion weights for {heads} stacked heads",
                 weights.len()
             )));
@@ -657,17 +655,12 @@ impl OutputHead {
     /// An evaluation past a student's blocks, or what the projection refuses.
     pub fn forward(&self, hidden: &Tensor, step: u32) -> Result<Tensor> {
         if self.stacked.is_none() {
-            return Ok(functional::linear(
-                hidden,
-                &self.weight,
-                Some(&self.bias),
-                WeightOrder::NxK,
-            )?);
+            return functional::linear(hidden, &self.weight, Some(&self.bias), WeightOrder::NxK);
         }
 
         let blocks = self.weight.dims()[0];
         if step as usize >= blocks {
-            return Err(Error::request(format!(
+            return Err(ID.request(format!(
                 "evaluation {step} is past the {blocks} fused heads of the student"
             )));
         }
@@ -681,12 +674,7 @@ impl OutputHead {
             .reshape((self.out, self.hidden))?;
         let bias = self.bias.index_select(&index, 0)?.reshape(self.out)?;
 
-        Ok(functional::linear(
-            hidden,
-            &weight,
-            Some(&bias),
-            WeightOrder::NxK,
-        )?)
+        functional::linear(hidden, &weight, Some(&bias), WeightOrder::NxK)
     }
 }
 
@@ -754,7 +742,7 @@ impl Transformer {
         };
 
         if split.layers.size == 0 || split.layers.size > transformer.num_hidden_layers {
-            return Err(Error::config(format!(
+            return Err(ID.config(format!(
                 "a layer split of {} stages over a stack of {} blocks",
                 split.layers.size, transformer.num_hidden_layers
             )));
@@ -826,7 +814,7 @@ impl Transformer {
     ///
     /// Positions that are not one coordinate per axis and row.
     pub fn rotary_factors(&self, positions: &Tensor) -> Result<(Tensor, Tensor)> {
-        Ok(self.rotary.forward(positions)?)
+        self.rotary.forward(positions)
     }
 
     /// A video latent `[channels, frames, height, width]` as the network's `1 x 2 x 2` patch
@@ -838,13 +826,13 @@ impl Transformer {
     /// A latent that is not whole patches.
     pub fn patchify(latent: &Tensor) -> Result<Tensor> {
         let &[channels, frames, height, width] = latent.dims() else {
-            return Err(Error::request(format!(
+            return Err(ID.request(format!(
                 "a video latent is [channels, frames, height, width], not {:?}",
                 latent.dims()
             )));
         };
         if !height.is_multiple_of(2) || !width.is_multiple_of(2) {
-            return Err(Error::request(format!(
+            return Err(ID.request(format!(
                 "a {height} by {width} latent is not whole 2 x 2 patches"
             )));
         }
@@ -864,7 +852,7 @@ impl Transformer {
     /// Rows that are not `dims`' patches.
     pub fn unpatchify(rows: &Tensor, dims: &[usize]) -> Result<Tensor> {
         let &[channels, frames, height, width] = dims else {
-            return Err(Error::request(format!(
+            return Err(ID.request(format!(
                 "a video latent is [channels, frames, height, width], not {dims:?}"
             )));
         };
@@ -882,7 +870,7 @@ impl Transformer {
     ///
     /// Rows the projection refuses.
     pub fn project_video(&self, rows: &Tensor) -> Result<Tensor> {
-        Ok(self.proj_in.forward(&rows.to_dtype(DType::F32)?)?)
+        self.proj_in.forward(&rows.to_dtype(DType::F32)?)
     }
 
     /// Audio latent rows projected into the hidden width, in FP32.
@@ -891,7 +879,7 @@ impl Transformer {
     ///
     /// Rows the projection refuses.
     pub fn project_audio(&self, rows: &Tensor) -> Result<Tensor> {
-        Ok(self.audio_proj_in.forward(&rows.to_dtype(DType::F32)?)?)
+        self.audio_proj_in.forward(&rows.to_dtype(DType::F32)?)
     }
 
     /// The modulation of this stage's block `index` at `entries`: the stack block's gathered

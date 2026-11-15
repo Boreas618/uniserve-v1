@@ -42,7 +42,6 @@
 use std::collections::BTreeMap;
 use std::ops::Range;
 
-use nn::collective;
 use nn::family::{
     CacheShape, ExpertOrder, ExpertShape, SequenceSplit, StateShape, TextModel, TextPlacement,
 };
@@ -54,12 +53,13 @@ use nn::{
     CausalLm, DType, Drafter, ExpertExchange, KvCache, RecurrentState, Split, Tensor, TokenBatch,
     VarBuilder, Vision, functional,
 };
+use nn::{Result, collective};
 
+use crate::qwen3::ID;
 use crate::qwen3::config::{Config, QWEN3_MOE};
 use crate::qwen3::decoder::{self, DecoderLayer};
 use crate::qwen3::mtp::Mtp;
 use crate::qwen3::vision::VisionTower;
-use crate::qwen3::{Error, Result};
 
 /// The profiler class of the whole decoder stack, at path `model`.
 pub(crate) const TRANSFORMER: &str = "models.qwen3.transformer.Transformer";
@@ -151,7 +151,7 @@ impl Qwen3ForCausalLm {
 
         let routed = expert_layers(config);
         if let Some(stray) = order.keys().find(|module| !routed.contains_key(*module)) {
-            return Err(Error::Config(format!(
+            return Err(ID.config(format!(
                 "{stray} is not a routed expert layer of this model"
             )));
         }
@@ -204,13 +204,13 @@ impl Qwen3ForCausalLm {
         let (visual, mrope) = match (config.images, &config.vision) {
             (None, _) => (None, None),
             (Some(_), None) => {
-                return Err(Error::Config(
-                    "the checkpoint states processor files and no tower".to_owned(),
-                ));
+                return Err(
+                    ID.config("the checkpoint states processor files and no tower".to_owned())
+                );
             }
             (Some((processor, pixels)), Some(vision)) => {
                 if !vision.deepstack_visual_indexes.is_empty() {
-                    return Err(Error::Config(
+                    return Err(ID.config(
                         "a causal language model's prefill adds no DeepStack features, but the \
                          tower states some"
                             .to_owned(),
@@ -265,7 +265,7 @@ impl Qwen3ForCausalLm {
     fn require_group(axis: &str, split: Split) -> Result<()> {
         let members = collective::split().map(|(_, members)| members);
         if members != Some(u64::from(split.size)) {
-            return Err(Error::Config(format!(
+            return Err(ID.config(format!(
                 "a {axis} split over {} ranks runs in a forward whose group is {members:?}",
                 split.size
             )));
@@ -313,14 +313,14 @@ impl Qwen3ForCausalLm {
 
             // The rows every stage ends with are the last stage's; this stage's output only
             // states their shape and element type.
-            return Ok(collective::broadcast(&hidden.contiguous()?, last)?);
+            return collective::broadcast(&hidden.contiguous()?, last);
         }
 
         let (normalized, _) = self.norm.forward_residual(&hidden, &residual)?;
         if last == 0 {
             return Ok(normalized);
         }
-        Ok(collective::broadcast(&normalized.contiguous()?, last)?)
+        collective::broadcast(&normalized.contiguous()?, last)
     }
 }
 
@@ -341,11 +341,10 @@ impl CausalLm for Qwen3ForCausalLm {
     ) -> nn::Result<Tensor> {
         let (tokens, width) = (batch.tokens(), self.config.text.hidden_size as usize);
         if hidden.dims() != [tokens, width] {
-            return Err(Error::Config(format!(
+            return Err(ID.config(format!(
                 "hidden is {:?}, [{tokens}, {width}] expected",
                 hidden.dims()
-            ))
-            .into());
+            )));
         }
 
         let forward = || -> Result<Tensor> {
@@ -353,7 +352,7 @@ impl CausalLm for Qwen3ForCausalLm {
                 (None, _) => (&self.rotary_emb, &batch.positions),
                 (Some(coordinates), Some(mrope)) => (mrope, coordinates),
                 (Some(_), None) => {
-                    return Err(Error::Config(
+                    return Err(ID.config(
                         "a batch states image coordinates for a model without vision input"
                             .to_owned(),
                     ));
@@ -416,15 +415,15 @@ impl CausalLm for Qwen3ForCausalLm {
             }
 
             let residual =
-                residual.ok_or_else(|| Error::Config("a decoder stack of no layers".to_owned()))?;
+                residual.ok_or_else(|| ID.config("a decoder stack of no layers".to_owned()))?;
             let output = self.stage_output(hidden, residual)?;
             if members.size > 1 {
-                return Ok(ulysses::gather(&output, members, tokens)?);
+                return ulysses::gather(&output, members, tokens);
             }
             Ok(output)
         };
 
-        Ok(nn::profiler::range(TRANSFORMER, "model", forward)?)
+        nn::profiler::range(TRANSFORMER, "model", forward)
     }
 
     fn compute_logits(&self, hidden: &Tensor) -> nn::Result<Tensor> {

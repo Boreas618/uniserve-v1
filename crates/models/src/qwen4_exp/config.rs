@@ -27,11 +27,11 @@ use nn::config::Fields;
 use nn::functional::{Activation, StateAxes};
 use nn::modules::{GatedDeltaNetConfig, Precision, RotaryConfig};
 use nn::quantization::Declaration;
-use nn::{PixelNorm, Split};
+use nn::{PixelNorm, Result, Split};
 use processing::qwen_vl::ProcessorConfig;
 
 use crate::qwen3::{MoeConfig, VisionConfig};
-use crate::qwen4_exp::{Error, Result};
+use crate::qwen4_exp::ID;
 
 /// The model class this family builds, as request processing claims it.
 pub const CLASS: &str = "Qwen4ExpForConditionalGeneration";
@@ -271,7 +271,7 @@ impl Config {
     /// serve, or processor files that are not a Qwen-VL processor's.
     pub fn open(checkpoint: &nn::Checkpoint) -> Result<Self> {
         let value = checkpoint.sidecar("config.json")?.ok_or_else(|| {
-            Error::Config(format!(
+            ID.config(format!(
                 "{} holds no config.json",
                 checkpoint.root().display()
             ))
@@ -298,9 +298,9 @@ impl Config {
     pub fn parse(fields: &Fields<'_>) -> Result<Self> {
         let architectures = fields
             .optional_texts("architectures")?
-            .ok_or_else(|| Error::Config("checkpoint declares no architectures".to_owned()))?;
+            .ok_or_else(|| ID.config("checkpoint declares no architectures".to_owned()))?;
         if architectures.as_slice() != [CLASS] {
-            return Err(Error::Config(format!(
+            return Err(ID.config(format!(
                 "{architectures:?} is not the class this crate builds ({CLASS})"
             )));
         }
@@ -308,7 +308,7 @@ impl Config {
             .optional_flag("tie_word_embeddings")?
             .unwrap_or(false)
         {
-            return Err(Error::Config(
+            return Err(ID.config(
                 "the vocabulary head is its own tensor; a tied head is not served".to_owned(),
             ));
         }
@@ -321,7 +321,7 @@ impl Config {
             rank: values.count("hc_lowrank")?,
         };
         if hyper_connection.streams < 2 {
-            return Err(Error::Config(
+            return Err(ID.config(
                 "a hyper-connected residual has more than one stream (hc_count)".to_owned(),
             ));
         }
@@ -340,7 +340,7 @@ impl Config {
 
         let vision = VisionConfig::read(fields)?;
         if !vision.deepstack_visual_indexes.is_empty() {
-            return Err(Error::Config(
+            return Err(ID.config(
                 "a causal language model's prefill adds no DeepStack features, but the tower \
                  states some"
                     .to_owned(),
@@ -367,13 +367,13 @@ impl Config {
         let (text, moe) = (&self.text, &self.moe);
 
         if moe.num_experts == 0 || moe.num_experts_per_tok > moe.num_experts {
-            return Err(Error::Config(format!(
+            return Err(ID.config(format!(
                 "{} experts per token of {} experts",
                 moe.num_experts_per_tok, moe.num_experts
             )));
         }
         if self.vision.out_hidden_size != text.hidden_size {
-            return Err(Error::Config(format!(
+            return Err(ID.config(format!(
                 "vision tokens are {} wide and the language model {}",
                 self.vision.out_hidden_size, text.hidden_size
             )));
@@ -384,7 +384,7 @@ impl Config {
             text.eos_token_id,
         ] {
             if token >= text.vocab_size {
-                return Err(Error::Config(format!(
+                return Err(ID.config(format!(
                     "token {token} is outside the {}-entry vocabulary",
                     text.vocab_size
                 )));
@@ -436,7 +436,7 @@ impl Config {
     pub fn check_splits(&self, tensor: Split, experts: Split) -> Result<()> {
         for (name, split) in [("tensor", tensor), ("expert", experts)] {
             if split.size == 0 || split.rank >= split.size {
-                return Err(Error::Config(format!(
+                return Err(ID.config(format!(
                     "{name}-parallel rank {} of a group of {}",
                     split.rank, split.size
                 )));
@@ -454,14 +454,14 @@ impl Config {
             ("n-gram table shards", self.ngram.parts),
         ] {
             if !extent.is_multiple_of(tensor.size) {
-                return Err(Error::Config(format!(
+                return Err(ID.config(format!(
                     "tensor parallel degree {} does not divide {extent} {name}",
                     tensor.size
                 )));
             }
         }
         if !self.moe.num_experts.is_multiple_of(experts.size) {
-            return Err(Error::Config(format!(
+            return Err(ID.config(format!(
                 "expert parallel degree {} does not divide {} experts",
                 experts.size, self.moe.num_experts
             )));
@@ -479,15 +479,13 @@ impl TextConfig {
         let num_key_value_heads = values.count("num_key_value_heads")?;
         let head_dim = values.count("head_dim")?;
         if !num_attention_heads.is_multiple_of(num_key_value_heads) || !head_dim.is_multiple_of(2) {
-            return Err(Error::Config(format!(
+            return Err(ID.config(format!(
                 "{num_attention_heads} attention heads of {head_dim} over {num_key_value_heads} \
                  key/value heads"
             )));
         }
         if values.optional_flag("attention_bias")?.unwrap_or(false) {
-            return Err(Error::Config(
-                "attention projections with a bias are not served".to_owned(),
-            ));
+            return Err(ID.config("attention projections with a bias are not served".to_owned()));
         }
 
         // The state is FP32 in vLLM, which takes the checkpoint's `mamba_ssm_dtype`
@@ -495,7 +493,7 @@ impl TextConfig {
         if let Some(dtype) = values.optional_text("mamba_ssm_dtype")?
             && dtype != "float32"
         {
-            return Err(Error::Config(format!(
+            return Err(ID.config(format!(
                 "a recurrent state of {dtype} is not served; the state is float32"
             )));
         }
@@ -506,7 +504,7 @@ impl TextConfig {
             "sigmoid" => true,
             "silu" => false,
             other => {
-                return Err(Error::Config(format!(
+                return Err(ID.config(format!(
                     "an output gate of {other} is neither sigmoid nor silu"
                 )));
             }
@@ -531,7 +529,7 @@ impl TextConfig {
             split: Split::WHOLE,
         };
         if !network.value_heads.is_multiple_of(network.key_heads.max(1)) || network.conv_width < 2 {
-            return Err(Error::Config(format!(
+            return Err(ID.config(format!(
                 "{} linear value heads over {} key heads with a convolution of {} taps",
                 network.value_heads, network.key_heads, network.conv_width
             )));
@@ -579,9 +577,7 @@ impl IndexerConfig {
         };
 
         if values.optional_count("indexer_kv_heads")?.unwrap_or(1) != 1 {
-            return Err(Error::Config(
-                "an indexer has one key head (indexer_kv_heads)".to_owned(),
-            ));
+            return Err(ID.config("an indexer has one key head (indexer_kv_heads)".to_owned()));
         }
         // The index heads rotate by the layer's rotary embedding, so its rotated channels fit
         // an index head; a group is at least two tokens and the budget whole groups
@@ -590,7 +586,7 @@ impl IndexerConfig {
             || !config.budget.is_multiple_of(config.compress_ratio)
             || config.head_dim < text.rope.dim
         {
-            return Err(Error::Config(format!(
+            return Err(ID.config(format!(
                 "an indexer of {}-element heads selecting {} tokens in groups of {}, under a \
                  rotary embedding of {} channels",
                 config.head_dim, config.budget, config.compress_ratio, text.rope.dim
@@ -611,7 +607,7 @@ impl NgramEmbeddingConfig {
             .unwrap_or_default()
         {
             if id == 0 || id > text.num_hidden_layers {
-                return Err(Error::Config(format!(
+                return Err(ID.config(format!(
                     "ple_layer_ids names layer {id} of a stack of {} (counted from one)",
                     text.num_hidden_layers
                 )));
@@ -643,7 +639,7 @@ impl NgramEmbeddingConfig {
         // The hash reads the token and the two before it, which is what a batch states of a
         // row's history ([`nn::TokenBatch::ngram_context`]).
         if config.ngram_size != 3 {
-            return Err(Error::Config(format!(
+            return Err(ID.config(format!(
                 "an n-gram size of {} is not served: the hash reads a token and the two before it",
                 config.ngram_size
             )));
@@ -653,7 +649,7 @@ impl NgramEmbeddingConfig {
             || !config.embed_dim.is_multiple_of(config.heads())
             || !config.table_rows().is_multiple_of(u64::from(config.parts))
         {
-            return Err(Error::Config(format!(
+            return Err(ID.config(format!(
                 "an n-gram embedding of {} elements over {} heads in {} shards of a table of {} \
                  rows, convolved by {} taps",
                 config.embed_dim,
@@ -666,7 +662,7 @@ impl NgramEmbeddingConfig {
         if let Some(dtype) = values.optional_text("ple_embedding_dtype")?
             && dtype != "float8_e4m3fn"
         {
-            return Err(Error::Config(format!(
+            return Err(ID.config(format!(
                 "an n-gram table of {dtype} is not served; the table is float8_e4m3fn"
             )));
         }
@@ -680,7 +676,7 @@ fn mtp_layers(values: &Fields<'_>) -> Result<u32> {
         .optional_flag("mtp_use_dedicated_embeddings")?
         .unwrap_or(false)
     {
-        return Err(Error::Config(
+        return Err(ID.config(
             "the drafter embeds with a table of its own (mtp_use_dedicated_embeddings), which \
              is not served"
                 .to_owned(),
@@ -692,7 +688,7 @@ fn mtp_layers(values: &Fields<'_>) -> Result<u32> {
         && let Some(kinds) = mtp.optional_texts("layer_types")?
         && kinds.iter().any(|kind| *kind != "full_attention")
     {
-        return Err(Error::Config(format!(
+        return Err(ID.config(format!(
             "a drafter of layer types {kinds:?} is not served: its layers attend"
         )));
     }

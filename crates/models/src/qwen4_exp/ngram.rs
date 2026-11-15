@@ -42,12 +42,12 @@
 use nn::family::StateField;
 use nn::modules::Linear;
 use nn::{
-    DType, Device, RecurrentState, Shape, Split, Tensor, TokenBatch, VarBuilder, WeightLayout,
-    WeightSource, functional,
+    DType, Device, RecurrentState, Result, Shape, Split, Tensor, TokenBatch, VarBuilder,
+    WeightLayout, WeightSource, functional,
 };
 
+use crate::qwen4_exp::ID;
 use crate::qwen4_exp::config::Config;
-use crate::qwen4_exp::{Error, Result};
 
 /// The checkpoint tensor `name` of `vb`'s module, in the element type `dtype` its shard
 /// stores it in: an integer table or an E4M3 table is read as its own elements, whatever the
@@ -60,14 +60,14 @@ fn stored(vb: &VarBuilder<'_, '_>, name: &str, shape: Shape, dtype: DType) -> Re
         shape: shape.clone(),
     };
 
-    Ok(vb.loader().load(
+    vb.loader().load(
         &tensor,
         &source,
         WeightLayout::ROW_MAJOR,
         &shape,
         Some(dtype),
         false,
-    )?)
+    )
 }
 
 /// The n-gram hash embedding of one PLE layer.
@@ -112,7 +112,7 @@ impl NgramEmbedding {
         let ngram = &config.ngram;
         let (heads, head_dim) = (ngram.heads() as usize, ngram.head_dim() as usize);
         if split.size == 0 || split.rank >= split.size || !ngram.parts.is_multiple_of(split.size) {
-            return Err(Error::Config(format!(
+            return Err(ID.config(format!(
                 "rank {} of a tensor group of {} does not hold whole shards of {}",
                 split.rank, split.size, ngram.parts
             )));
@@ -190,7 +190,7 @@ impl NgramEmbedding {
     /// A context of another shape.
     pub fn ids(&self, context: &Tensor) -> Result<Tensor> {
         let &[tokens, 3] = context.dims() else {
-            return Err(Error::Config(format!(
+            return Err(ID.config(format!(
                 "an n-gram context of {:?} is not [tokens, 3]",
                 context.dims()
             )));
@@ -274,7 +274,7 @@ impl NgramEmbedding {
             .reshape((tokens, heads * self.head_dim))?
             .contiguous()?;
         if nn::collective::split().is_none() {
-            return Err(Error::Config(
+            return Err(ID.config(
                 "an n-gram table split over a tensor group needs the group its ranks sum over"
                     .to_owned(),
             ));
@@ -392,7 +392,7 @@ impl PleLayer {
         let (tokens, width) = streams.dims2()?;
         let (count, hidden) = (self.streams, self.hidden);
         if width != count * hidden {
-            return Err(Error::Config(format!(
+            return Err(ID.config(format!(
                 "streams of {width} elements against {count} streams of {hidden}"
             )));
         }
