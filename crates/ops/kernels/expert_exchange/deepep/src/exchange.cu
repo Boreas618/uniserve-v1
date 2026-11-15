@@ -87,6 +87,14 @@ static_assert(kSMs <= kFullSMs, "the exchange runs on the device's multiprocesso
 // `worker_config.watchdog_timeout`, which fails the rank's group, and the group is replaced;
 // `crates/engine/src/worker/watchdog.rs`). The largest count is one no wait reaches.
 constexpr int64_t kTimeoutCycles = std::numeric_limits<int64_t>::max();
+
+// What follows is DeepEP's derivation of its launches from the values above, which its host code
+// at the pinned commit makes at run time and the pin does not hold:
+// `csrc/kernels/elastic/dispatch.hpp` (four notify warps; dispatch warps within the shared
+// memory, the 32 warps of a block and 512 warps over the dispatch's multiprocessors; a cluster of
+// two blocks on an even count, to overlap clustered computation kernels; the copy epilogue's warps
+// within the shared memory), `combine.hpp` (the combine's and the reduce epilogue's warps alike)
+// and `barrier.hpp` (512 threads).
 constexpr int kNotifyWarps = 4;
 constexpr int kHiddenBytes = kHidden * 2;
 
@@ -157,18 +165,23 @@ struct Transport {
   int32_t* live;
 };
 
-int32_t refuse(char* error, const char* message) {
-  std::snprintf(error, 512, "%s", message);
+/// The message buffer every call structure of the header ends with.
+using Message = decltype(uniserve_exchange_lifecycle::error);
+
+int32_t refuse(Message& error, const char* message) {
+  std::snprintf(error, sizeof(Message), "%s", message);
   return 1;
 }
 
-int32_t nccl_refusal(char* error, const char* what, ncclResult_t status) {
-  std::snprintf(error, 512, "expert_exchange: %s failed: %s", what, ncclGetErrorString(status));
+int32_t nccl_refusal(Message& error, const char* what, ncclResult_t status) {
+  std::snprintf(error, sizeof(Message), "expert_exchange: %s failed: %s", what,
+                ncclGetErrorString(status));
   return 1;
 }
 
-int32_t cuda_refusal(char* error, const char* what, cudaError_t status) {
-  std::snprintf(error, 512, "expert_exchange: %s failed: %s", what, cudaGetErrorString(status));
+int32_t cuda_refusal(Message& error, const char* what, cudaError_t status) {
+  std::snprintf(error, sizeof(Message), "expert_exchange: %s failed: %s", what,
+                cudaGetErrorString(status));
   return 1;
 }
 
@@ -226,8 +239,9 @@ template <typename Kernel, typename... Arguments>
 cudaError_t launch(Kernel kernel, int blocks, int threads, int shared, int cluster,
                    bool cooperative, bool programmatic, cudaStream_t stream,
                    Arguments... arguments) {
-  // The first launch of a kernel on a device raises its shared-memory limit. A warm
-  // walk reaches every launch before a capture does, so a capture sets nothing.
+  // Each launch raises the kernel's dynamic shared-memory limit to what it takes. The limit is
+  // an attribute of the function, not work on a stream, so a launch being captured sets it as
+  // an eager one does.
   if (shared > 0) {
     const cudaError_t raised = cudaFuncSetAttribute(
         reinterpret_cast<const void*>(kernel), cudaFuncAttributeMaxDynamicSharedMemorySize, shared);
@@ -263,6 +277,17 @@ cudaError_t launch(Kernel kernel, int blocks, int threads, int shared, int clust
   return cudaLaunchKernelExC(&config, reinterpret_cast<const void*>(kernel), parameters);
 }
 
+/// The threads of a block of this file's own kernels, which walk their elements by the grid's
+/// stride.
+constexpr int kStrideThreads = 256;
+
+/// The grid of one of this file's own kernels over at most `elements` elements: blocks of
+/// `kStrideThreads` threads, at most one per multiprocessor of the device.
+constexpr int stride_blocks(int64_t elements) {
+  const int64_t blocks = (elements + kStrideThreads - 1) / kStrideThreads;
+  return static_cast<int>(std::min<int64_t>(blocks, kFullSMs));
+}
+
 /// This rank's routes as DeepEP reads them.
 __global__ void route_kernel(topk_idx_t* routes, const int32_t* ids, const int32_t* live,
                              int32_t tokens, int32_t offset) {
@@ -290,7 +315,7 @@ __global__ void received_kernel(int32_t* ids, const topk_idx_t* routes, const in
   }
 }
 
-int32_t open(Transport& transport, const uniserve_exchange_lifecycle* call, char* error) {
+int32_t open(Transport& transport, const uniserve_exchange_lifecycle* call, Message& error) {
   const UniserveGroup* group = call->group;
   transport.rank = static_cast<int32_t>(call->rank);
   transport.device = call->device;
@@ -523,7 +548,7 @@ extern "C" int32_t uniserve_expert_exchange_launch(uniserve_exchange_call* call,
   cudaError_t status = cudaSuccess;
   if (call->mode == UNISERVE_EXCHANGE_DISPATCH) {
     if (tokens > 0) {
-      route_kernel<<<std::min(64, (tokens * kTop + 255) / 256), 256, 0, raw>>>(
+      route_kernel<<<stride_blocks(static_cast<int64_t>(tokens) * kTop), kStrideThreads, 0, raw>>>(
           transport->routes, call->ids, call->live, tokens, kAttentionRanks * kLocalExperts);
     }
     void* no_scales = nullptr;
@@ -542,9 +567,10 @@ extern "C" int32_t uniserve_expert_exchange_launch(uniserve_exchange_call* call,
                       transport->weights, transport->metadata, static_cast<int*>(nullptr),
                       kReceived, 0, 0, 0, rank);
     }
-    received_kernel<<<64, 256, 0, raw>>>(transport->ids, transport->received,
-                                         transport->rank_sums, transport->live,
-                                         (rank - kAttentionRanks) * kLocalExperts, kExperts);
+    // The rows that arrived are counted on the device, at most every row a rank receives.
+    received_kernel<<<stride_blocks(static_cast<int64_t>(kReceived) * kTop), kStrideThreads, 0,
+                      raw>>>(transport->ids, transport->received, transport->rank_sums,
+                             transport->live, (rank - kAttentionRanks) * kLocalExperts, kExperts);
   } else if (call->mode == UNISERVE_EXCHANGE_COMBINE) {
     status = launch(UNISERVE_COMBINE, kSMs, kCombineWarps * 32, kSharedBytes, kCluster, true,
                     false, raw, static_cast<nv_bfloat16*>(transport->combined),
