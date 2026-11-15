@@ -493,7 +493,12 @@ pub(crate) fn harness_router(state: AdminState) -> Router {
     Router::new()
         .route("/admin/status", get(status))
         .route("/admin/events", get(events))
-        .route("/admin/config", get(config).put(harness_apply_config))
+        .route(
+            "/admin/config",
+            get(config).put(|State(state): State<AdminState>, body| {
+                apply_config(Caller::Harness, state, body)
+            }),
+        )
         .route("/admin/config/commit", post(commit))
         .route("/admin/config/rollback", post(rollback))
         .with_state(state)
@@ -504,7 +509,12 @@ pub(crate) fn router(state: AdminState) -> Router {
     Router::new()
         .route("/admin/status", get(status))
         .route("/admin/events", get(events))
-        .route("/admin/config", get(config).put(apply_config))
+        .route(
+            "/admin/config",
+            get(config).put(|State(state): State<AdminState>, body| {
+                apply_config(Caller::Operator, state, body)
+            }),
+        )
         .route("/admin/config/commit", post(commit))
         .route("/admin/config/rollback", post(rollback))
         .route("/admin/pause_generation", post(pause_generation))
@@ -650,14 +660,23 @@ async fn config(State(state): State<AdminState>) -> Json<serde_json::Value> {
     Json(body)
 }
 
-/// `PUT /admin/config`: changes the deployment to a configuration
+/// Who calls an admin route: the operator on its socket, which serves every route and option,
+/// or a harness on the harness socket, which may set the package selections and the options
+/// `admin_config.harness_options` lists.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Caller {
+    Operator,
+    Harness,
+}
+
+/// `PUT /admin/config` for `caller`: changes the deployment to a configuration
 /// (`Leader::apply`), in place, by a hot restart of the daemon, or as an
-/// update on trial.
+/// update on trial. An empty body applies the current configuration and waits.
 ///
 /// The `config` operation ends once the change is applied or its update
 /// started, so a commit or a rollback can follow at once. With `wait`, the
 /// response comes when the update reached its trial or ended before it.
-async fn apply_config(State(state): State<AdminState>, body: axum::body::Bytes) -> Response {
+async fn apply_config(caller: Caller, state: AdminState, body: axum::body::Bytes) -> Response {
     let body = if body.is_empty() {
         ConfigBody {
             wait: true,
@@ -669,32 +688,11 @@ async fn apply_config(State(state): State<AdminState>, body: axum::body::Bytes) 
             Err(error) => return ApiError::json_parse_error(error.to_string()).into_response(),
         }
     };
-    apply(&state, body, true).await
+    apply(&state, body, caller).await
 }
 
-/// `PUT /admin/config` on the harness listener: as [`apply_config`], for the
-/// package selections and the options a harness may set.
-async fn harness_apply_config(
-    State(state): State<AdminState>,
-    body: axum::body::Bytes,
-) -> Response {
-    let body = if body.is_empty() {
-        ConfigBody {
-            wait: true,
-            ..ConfigBody::default()
-        }
-    } else {
-        match serde_json::from_slice::<ConfigBody>(&body) {
-            Ok(body) => body,
-            Err(error) => return ApiError::json_parse_error(error.to_string()).into_response(),
-        }
-    };
-    apply(&state, body, false).await
-}
-
-/// Applies `body` for a caller that may state every option (`operator`), or
-/// only the ones the operator lists for a harness.
-async fn apply(state: &AdminState, body: ConfigBody, operator: bool) -> Response {
+/// Applies `body` for `caller`.
+async fn apply(state: &AdminState, body: ConfigBody, caller: Caller) -> Response {
     let leader = Arc::clone(&state.leader);
     let admin = Arc::clone(&state.admin);
     let jobs = Arc::clone(&state.jobs);
@@ -709,7 +707,9 @@ async fn apply(state: &AdminState, body: ConfigBody, operator: bool) -> Response
         force: body.force,
         deadline_s: body.deadline_s,
     };
-    if !operator && let Err(refusal) = leader.harness_may_apply(&request) {
+    if caller == Caller::Harness
+        && let Err(refusal) = leader.harness_may_apply(&request)
+    {
         return (
             StatusCode::FORBIDDEN,
             Json(json!({ "error": { "message": refusal, "type": "forbidden" } })),
@@ -801,7 +801,10 @@ async fn apply(state: &AdminState, body: ConfigBody, operator: bool) -> Response
         }
     }
     let update = leader.updates.status().unwrap_or_default();
-    let status = if matches!(update["phase"].as_str(), Some("trial" | "committed")) {
+    let status = if matches!(
+        leader.updates.phase_of(number),
+        Some(Phase::Trial | Phase::Committed)
+    ) {
         StatusCode::OK
     } else {
         StatusCode::CONFLICT
