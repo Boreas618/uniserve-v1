@@ -8,7 +8,6 @@ uploaded parts, and FastVideo their local paths.
 
 from __future__ import annotations
 
-import asyncio
 import json
 from dataclasses import replace
 from email.parser import BytesParser
@@ -19,8 +18,8 @@ import aiohttp
 import pytest
 from aiohttp import web
 from PIL import Image
+from pytest_aiohttp import AiohttpRawServer
 
-from tests.python.fixtures.http_stub import stub_server
 from uniserve_eval.metrics import summarize
 from uniserve_eval.tasks.video import VideoTask
 from uniserve_eval.transport.client import send_request
@@ -127,28 +126,24 @@ def row(references, **fields):
     )
 
 
-def send(request):
-    """Send one request to a recording server and return what it received."""
+async def send(serve: AiohttpRawServer, request):
+    """Send one request to a recording server and return what it received.
+
+    `serve` is the `aiohttp_raw_server` fixture, which closes the server at
+    the test's teardown.
+    """
     sent = []
 
-    async def exercise():
-        async def handler(received):
-            sent.append((received.headers, await received.read()))
-            return web.Response(
-                body=b"mp4", headers={"content-type": "video/mp4"}
-            )
+    async def handler(received: web.BaseRequest) -> web.Response:
+        sent.append((received.headers, await received.read()))
+        return web.Response(body=b"mp4", headers={"content-type": "video/mp4"})
 
-        async with (
-            stub_server(handler) as base_url,
-            aiohttp.ClientSession() as client,
-        ):
-            record = await send_request(
-                client, base_url, request, "row", task="video"
-            )
-        assert record.success
-        return record
-
-    record = asyncio.run(exercise())
+    server = await serve(handler)
+    async with aiohttp.ClientSession() as client:
+        record = await send_request(
+            client, str(server.make_url("")), request, "row", task="video"
+        )
+    assert record.success
     return sent[0], record
 
 
@@ -179,9 +174,12 @@ def multipart(request):
 
 
 @WORKLOADS
-def test_uniserve_receives_references_by_file_url(inputs, task, references):
+@pytest.mark.asyncio
+async def test_uniserve_receives_references_by_file_url(
+    aiohttp_raw_server, inputs, task, references
+):
     request = VideoTask(point(inputs)).build_request(row(references))
-    received, record = send(request)
+    received, record = await send(aiohttp_raw_server, request)
 
     expected = []
     for reference in references:
@@ -206,11 +204,12 @@ def test_uniserve_receives_references_by_file_url(inputs, task, references):
 
 
 @WORKLOADS
-def test_sglang_receives_the_same_files_as_native_conditions(
-    inputs, task, references
+@pytest.mark.asyncio
+async def test_sglang_receives_the_same_files_as_native_conditions(
+    aiohttp_raw_server, inputs, task, references
 ):
     request = VideoTask(point(inputs, "sglang")).build_request(row(references))
-    received, _ = send(request)
+    received, _ = await send(aiohttp_raw_server, request)
 
     body = json.loads(received[1])
     assert body["task"] == task
@@ -242,13 +241,14 @@ def test_sglang_receives_the_same_files_as_native_conditions(
     ],
     ids=["first-frame", "image-audio", "video-audio"],
 )
-def test_vllm_omni_receives_the_same_files_as_uploaded_references(
-    inputs, task, references, kinds
+@pytest.mark.asyncio
+async def test_vllm_omni_receives_the_same_files_as_uploaded_references(
+    aiohttp_raw_server, inputs, task, references, kinds
 ):
     request = VideoTask(point(inputs, "vllm-omni")).build_request(
         row(references)
     )
-    received, _ = send(request)
+    received, _ = await send(aiohttp_raw_server, request)
 
     fields, files = multipart(received)
     assert [(name, kind) for name, _, kind, _ in files] == [
@@ -287,8 +287,9 @@ def test_vllm_omni_receives_the_same_files_as_uploaded_references(
     ],
     ids=["image-audio", "video-audio"],
 )
-def test_fastvideo_receives_reference_paths_and_its_block_count(
-    inputs, references, typed
+@pytest.mark.asyncio
+async def test_fastvideo_receives_reference_paths_and_its_block_count(
+    aiohttp_raw_server, inputs, references, typed
 ):
     config = point(
         inputs,
@@ -297,7 +298,7 @@ def test_fastvideo_receives_reference_paths_and_its_block_count(
         parallel_decoding=True,
     )
     request = VideoTask(config).build_request(row(references))
-    received, _ = send(request)
+    received, _ = await send(aiohttp_raw_server, request)
 
     body = json.loads(received[1])
     for field, entries in typed.items():
@@ -397,53 +398,50 @@ def test_fastvideo_refuses_a_reference_start_offset_it_cannot_take(inputs):
 
 
 @pytest.mark.parametrize("endpoint", [VIDEOS_SYNC, "/v1/videos"])
-def test_server_reported_timings_are_recorded_and_summarized(inputs, endpoint):
+@pytest.mark.asyncio
+async def test_server_reported_timings_are_recorded_and_summarized(
+    aiohttp_raw_server, inputs, endpoint
+):
     """Timings come from sync headers or from the completed job."""
     stages = {"denoising_stage": 30.5, "video_decoding_stage": 2.25}
 
-    async def exercise():
-        async def handler(request):
-            if request.method == "POST" and endpoint == "/v1/videos":
-                return web.json_response({"id": "job", "status": "queued"})
-            if request.method == "GET" and not request.path.endswith(
-                "/content"
-            ):
-                return web.json_response(
-                    {
-                        "id": "job",
-                        "status": "completed",
-                        "inference_time_s": 33.0,
-                        "stage_durations": stages,
-                        "peak_storage_mb": 91000.5,
-                    },
-                )
-            headers = {"content-type": "video/mp4"}
-            if endpoint == VIDEOS_SYNC:
-                headers |= {
-                    "x-inference-time-s": "33.0",
-                    "x-stage-durations": json.dumps(stages),
-                    "x-peak-memory-mb": "91000.5",
-                }
-            return web.Response(body=b"mp4", headers=headers)
-
-        config = point(
-            inputs,
-            "fastvideo",
-            num_inference_steps=OMNIREF_POINTS,
-            parallel_decoding=True,
-            poll_interval_s=0.001,
-        )
-        config = replace(config, endpoint=endpoint)
-        request = VideoTask(config).build_request(row(IMAGE_AUDIO))
-        async with (
-            stub_server(handler) as base_url,
-            aiohttp.ClientSession() as client,
-        ):
-            return await send_request(
-                client, base_url, request, "row", task="video"
+    async def handler(request: web.BaseRequest) -> web.Response:
+        if request.method == "POST" and endpoint == "/v1/videos":
+            return web.json_response({"id": "job", "status": "queued"})
+        if request.method == "GET" and not request.path.endswith("/content"):
+            return web.json_response(
+                {
+                    "id": "job",
+                    "status": "completed",
+                    "inference_time_s": 33.0,
+                    "stage_durations": stages,
+                    "peak_storage_mb": 91000.5,
+                },
             )
+        headers = {"content-type": "video/mp4"}
+        if endpoint == VIDEOS_SYNC:
+            headers |= {
+                "x-inference-time-s": "33.0",
+                "x-stage-durations": json.dumps(stages),
+                "x-peak-memory-mb": "91000.5",
+            }
+        return web.Response(body=b"mp4", headers=headers)
 
-    record = asyncio.run(exercise())
+    config = point(
+        inputs,
+        "fastvideo",
+        num_inference_steps=OMNIREF_POINTS,
+        parallel_decoding=True,
+        poll_interval_s=0.001,
+    )
+    config = replace(config, endpoint=endpoint)
+    request = VideoTask(config).build_request(row(IMAGE_AUDIO))
+    server = await aiohttp_raw_server(handler)
+    async with aiohttp.ClientSession() as client:
+        record = await send_request(
+            client, str(server.make_url("")), request, "row", task="video"
+        )
+
     assert record.server_inference_s == 33.0
     assert record.server_stage_s == stages
     assert record.server_peak_storage_mib == 91000.5
@@ -474,44 +472,37 @@ def test_server_reported_timings_are_recorded_and_summarized(inputs, endpoint):
 
 
 @pytest.mark.parametrize("endpoint", [VIDEOS_SYNC, "/v1/videos"])
-def test_stage_durations_alone_are_recorded_for_a_uniserve_request(
-    inputs, endpoint
+@pytest.mark.asyncio
+async def test_stage_durations_alone_are_recorded_for_a_uniserve_request(
+    aiohttp_raw_server, inputs, endpoint
 ):
     """A server may report its stage durations without the other timings."""
     stages = {"encoding": 4.5, "denoising": 30.0, "decoding": 2.0}
 
-    async def exercise():
-        async def handler(request):
-            if request.method == "POST" and endpoint == "/v1/videos":
-                return web.json_response({"id": "job", "status": "queued"})
-            if request.method == "GET" and not request.path.endswith(
-                "/content"
-            ):
-                return web.json_response(
-                    {
-                        "id": "job",
-                        "status": "completed",
-                        "stage_durations": stages,
-                    },
-                )
-            headers = {"content-type": "video/mp4"}
-            if endpoint == VIDEOS_SYNC:
-                headers["x-stage-durations"] = json.dumps(stages)
-            return web.Response(body=b"mp4", headers=headers)
-
-        config = replace(
-            point(inputs, poll_interval_s=0.001), endpoint=endpoint
-        )
-        request = VideoTask(config).build_request(row(VIDEO_AUDIO))
-        async with (
-            stub_server(handler) as base_url,
-            aiohttp.ClientSession() as client,
-        ):
-            return await send_request(
-                client, base_url, request, "row", task="video"
+    async def handler(request: web.BaseRequest) -> web.Response:
+        if request.method == "POST" and endpoint == "/v1/videos":
+            return web.json_response({"id": "job", "status": "queued"})
+        if request.method == "GET" and not request.path.endswith("/content"):
+            return web.json_response(
+                {
+                    "id": "job",
+                    "status": "completed",
+                    "stage_durations": stages,
+                },
             )
+        headers = {"content-type": "video/mp4"}
+        if endpoint == VIDEOS_SYNC:
+            headers["x-stage-durations"] = json.dumps(stages)
+        return web.Response(body=b"mp4", headers=headers)
 
-    record = asyncio.run(exercise())
+    config = replace(point(inputs, poll_interval_s=0.001), endpoint=endpoint)
+    request = VideoTask(config).build_request(row(VIDEO_AUDIO))
+    server = await aiohttp_raw_server(handler)
+    async with aiohttp.ClientSession() as client:
+        record = await send_request(
+            client, str(server.make_url("")), request, "row", task="video"
+        )
+
     assert record.server_stage_s == stages
     assert record.server_inference_s is None
     assert record.server_peak_storage_mib is None

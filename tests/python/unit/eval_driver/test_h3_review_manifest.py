@@ -9,10 +9,12 @@ say only that a video plays.
 from __future__ import annotations
 
 import json
+from collections.abc import Callable
 from pathlib import Path
 
 import pytest
 
+from uniserve_eval.config import load_config
 from uniserve_eval.h3_review_manifest import manifest, reference_media
 
 
@@ -90,31 +92,21 @@ def test_every_cell_has_a_task_a_checkpoint_a_seed_and_its_inputs(
     assert "audio: `media/ref.mp3`" in text
 
 
-def test_the_shipped_profile_names_the_three_checkpoints(
-    tmp_path: Path,
+def test_the_shipped_profile_names_each_cells_checkpoint(
+    tmp_path: Path, shipped_profile: Callable[[str], Path]
 ) -> None:
     """The page names checkpoints, not the deployment that served them."""
-    shipped = (
-        Path(__file__).resolve().parents[4] / "uniserve_eval" / "check_h3.toml"
-    )
+    shipped = shipped_profile("check_h3.toml")
+    cells = load_config(shipped).selected_points("check-h3")
     baseline = tmp_path / "run"
-    for cell in (
-        "check-base-ref2va",
-        "check-fasth3-dmd-t2va",
-        "check-fasth3-dmd-fl2va",
-        "check-fasth3-omniref-ref2va",
-        "check-base-t2va",
-        "check-base-fl2va",
-    ):
-        write_cell(baseline, cell, f"{cell}.mp4")
+    for cell in cells:
+        write_cell(baseline, cell.name, f"{cell.name}.mp4")
 
     text = manifest(shipped, baseline, None)
 
-    assert "`MiniMaxAI/MiniMax-H3`" in text
-    assert "`FastVideo/FastVideo-FastH3-8-Step-V2`" in text
-    assert "`FastVideo/FastVideo-FastH3-Omni-8-Step-V1`" in text
-    for server in ("base-reference", "base-transformer", "fasth3-dmd"):
-        assert f"| `{server}` |" not in text
+    for cell in cells:
+        assert f"`{cell.provenance['checkpoint']}`" in text
+        assert f"| `{cell.server}` |" not in text
 
 
 def test_the_candidate_column_is_empty_until_a_candidate_has_run(

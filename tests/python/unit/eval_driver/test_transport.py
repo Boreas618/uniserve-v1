@@ -1,14 +1,14 @@
 from __future__ import annotations
 
-import asyncio
 import gc
 import json
+from collections.abc import Awaitable, Callable
 
 import aiohttp
 import pytest
 from aiohttp import web
+from pytest_aiohttp import AiohttpRawServer
 
-from tests.python.fixtures.http_stub import Handler, stub_server
 from uniserve_eval.transport.client import send_request
 from uniserve_eval.types import (
     CHAT_COMPLETIONS,
@@ -19,41 +19,48 @@ from uniserve_eval.types import (
 
 pytestmark = pytest.mark.unit
 
+# Answers every request the loopback server receives, whatever its path.
+Handler = Callable[[web.BaseRequest], Awaitable[web.StreamResponse]]
 
-def _send(
+
+async def _send(
+    serve: AiohttpRawServer,
     handler: Handler,
     request: TaskRequest,
     *,
     task: str,
     output_len_fallback: int = 0,
 ) -> RequestRecord:
-    """Send one request to a loopback server that answers with `handler`."""
+    """Send one request to a loopback server that answers with `handler`.
 
-    async def run() -> RequestRecord:
-        async with stub_server(handler) as base_url:
-            async with aiohttp.ClientSession() as session:
-                return await send_request(
-                    session,
-                    base_url,
-                    request,
-                    "req-1",
-                    task=task,
-                    output_len_fallback=output_len_fallback,
-                )
-
-    return asyncio.run(run())
+    `serve` is the `aiohttp_raw_server` fixture, which closes the server at
+    the test's teardown.
+    """
+    server = await serve(handler)
+    async with aiohttp.ClientSession() as session:
+        return await send_request(
+            session,
+            str(server.make_url("")),
+            request,
+            "req-1",
+            task=task,
+            output_len_fallback=output_len_fallback,
+        )
 
 
 def _event_stream(body: str) -> Handler:
-    async def handler(request: web.Request) -> web.Response:
+    async def handler(request: web.BaseRequest) -> web.Response:
         return web.Response(text=body, content_type="text/event-stream")
 
     return handler
 
 
-def test_image_generation_error_body_is_classified_by_status() -> None:
+@pytest.mark.asyncio
+async def test_image_generation_error_body_is_classified_by_status(
+    aiohttp_raw_server: AiohttpRawServer,
+) -> None:
     # UniServe's OpenAI-compatible error body for a failed request.
-    async def handler(request: web.Request) -> web.Response:
+    async def handler(request: web.BaseRequest) -> web.Response:
         return web.json_response(
             {
                 "error": {
@@ -66,7 +73,8 @@ def test_image_generation_error_body_is_classified_by_status() -> None:
             status=500,
         )
 
-    record = _send(
+    record = await _send(
+        aiohttp_raw_server,
         handler,
         TaskRequest(IMAGES_GENERATIONS, {"model": "m"}, stream=False),
         task="t2i",
@@ -78,11 +86,15 @@ def test_image_generation_error_body_is_classified_by_status() -> None:
     assert record.images == 0
 
 
-def test_stream_request_rejects_a_json_response() -> None:
-    async def handler(request: web.Request) -> web.Response:
+@pytest.mark.asyncio
+async def test_stream_request_rejects_a_json_response(
+    aiohttp_raw_server: AiohttpRawServer,
+) -> None:
+    async def handler(request: web.BaseRequest) -> web.Response:
         return web.json_response({"choices": [{"message": {"content": "ok"}}]})
 
-    record = _send(
+    record = await _send(
+        aiohttp_raw_server,
         handler,
         TaskRequest(CHAT_COMPLETIONS, {"model": "m"}, stream=True),
         task="text",
@@ -92,8 +104,11 @@ def test_stream_request_rejects_a_json_response() -> None:
     assert record.classifier == "response_expected_sse"
 
 
-def test_chat_json_records_visible_text_and_server_usage() -> None:
-    async def handler(request: web.Request) -> web.Response:
+@pytest.mark.asyncio
+async def test_chat_json_records_visible_text_and_server_usage(
+    aiohttp_raw_server: AiohttpRawServer,
+) -> None:
+    async def handler(request: web.BaseRequest) -> web.Response:
         return web.json_response(
             {
                 "choices": [
@@ -106,7 +121,8 @@ def test_chat_json_records_visible_text_and_server_usage() -> None:
             }
         )
 
-    record = _send(
+    record = await _send(
+        aiohttp_raw_server,
         handler,
         TaskRequest(CHAT_COMPLETIONS, {"model": "m"}, stream=False),
         task="i2t",
@@ -120,7 +136,10 @@ def test_chat_json_records_visible_text_and_server_usage() -> None:
     assert record.token_timing_available is False
 
 
-def test_stream_records_reasoning_content_as_public_text() -> None:
+@pytest.mark.asyncio
+async def test_stream_records_reasoning_content_as_public_text(
+    aiohttp_raw_server: AiohttpRawServer,
+) -> None:
     body = "".join(
         (
             'data: {"choices":[{"delta":{"reasoning_content":"reason"},'
@@ -132,7 +151,8 @@ def test_stream_records_reasoning_content_as_public_text() -> None:
         )
     )
 
-    record = _send(
+    record = await _send(
+        aiohttp_raw_server,
         _event_stream(body),
         TaskRequest(CHAT_COMPLETIONS, {"model": "m"}, stream=True),
         task="text",
@@ -148,7 +168,10 @@ def test_stream_records_reasoning_content_as_public_text() -> None:
     assert record.output_len_source == "server_usage"
 
 
-def test_stream_event_longer_than_any_line_buffer_is_read_whole() -> None:
+@pytest.mark.asyncio
+async def test_stream_event_longer_than_any_line_buffer_is_read_whole(
+    aiohttp_raw_server: AiohttpRawServer,
+) -> None:
     # One committed 256-token canvas, or an encoded image, arrives as a single
     # data line; CRLF framing is accepted as well.
     block = "x" * 300_000
@@ -161,7 +184,8 @@ def test_stream_event_longer_than_any_line_buffer_is_read_whole() -> None:
         + "data: [DONE]\r\n\r\n"
     )
 
-    record = _send(
+    record = await _send(
+        aiohttp_raw_server,
         _event_stream(body),
         TaskRequest(CHAT_COMPLETIONS, {"model": "m"}, stream=True),
         task="text",
@@ -174,8 +198,11 @@ def test_stream_event_longer_than_any_line_buffer_is_read_whole() -> None:
     assert record.finish_reason == "length"
 
 
-def test_chat_json_records_reasoning_content_as_public_text() -> None:
-    async def handler(request: web.Request) -> web.Response:
+@pytest.mark.asyncio
+async def test_chat_json_records_reasoning_content_as_public_text(
+    aiohttp_raw_server: AiohttpRawServer,
+) -> None:
+    async def handler(request: web.BaseRequest) -> web.Response:
         return web.json_response(
             {
                 "choices": [
@@ -191,7 +218,8 @@ def test_chat_json_records_reasoning_content_as_public_text() -> None:
             }
         )
 
-    record = _send(
+    record = await _send(
+        aiohttp_raw_server,
         handler,
         TaskRequest(CHAT_COMPLETIONS, {"model": "m"}, stream=False),
         task="i2t",
@@ -202,8 +230,12 @@ def test_chat_json_records_reasoning_content_as_public_text() -> None:
     assert record.token_timing_available is False
 
 
-def test_stream_rejects_non_object_events() -> None:
-    record = _send(
+@pytest.mark.asyncio
+async def test_stream_rejects_non_object_events(
+    aiohttp_raw_server: AiohttpRawServer,
+) -> None:
+    record = await _send(
+        aiohttp_raw_server,
         _event_stream('data: ["invalid"]\n\ndata: [DONE]\n\n'),
         TaskRequest(CHAT_COMPLETIONS, {"model": "m"}, stream=True),
         task="text",
@@ -214,7 +246,10 @@ def test_stream_rejects_non_object_events() -> None:
     assert record.token_timing_available is False
 
 
-def test_stream_records_the_error_event_it_carries() -> None:
+@pytest.mark.asyncio
+async def test_stream_records_the_error_event_it_carries(
+    aiohttp_raw_server: AiohttpRawServer,
+) -> None:
     # A request the engine refused after the stream began: UniServe writes the
     # error event of the OpenAI error body, then the sentinel.
     error = {
@@ -223,7 +258,8 @@ def test_stream_records_the_error_event_it_carries() -> None:
         "code": "invalid_request_error",
     }
     body = f"data: {json.dumps({'error': error})}\n\ndata: [DONE]\n\n"
-    record = _send(
+    record = await _send(
+        aiohttp_raw_server,
         _event_stream(body),
         TaskRequest(CHAT_COMPLETIONS, {"model": "m"}, stream=True),
         task="text",
@@ -236,7 +272,10 @@ def test_stream_records_the_error_event_it_carries() -> None:
     )
 
 
-def test_a_closed_stream_record_keeps_its_tokens_out_of_the_collector() -> None:
+@pytest.mark.asyncio
+async def test_a_closed_stream_record_keeps_its_tokens_out_of_the_collector(
+    aiohttp_raw_server: AiohttpRawServer,
+) -> None:
     # Two token events with their top candidates, as UniServe streams them
     # under `logprobs`, `top_logprobs` and `return_token_ids`. A load keeps
     # every record to its end, so a full collection that visited each
@@ -259,7 +298,8 @@ def test_a_closed_stream_record_keeps_its_tokens_out_of_the_collector() -> None:
         + 'data: {"choices":[{"delta":{},"finish_reason":"length"}]}\n\n'
         + "data: [DONE]\n\n"
     )
-    record = _send(
+    record = await _send(
+        aiohttp_raw_server,
         _event_stream(body),
         TaskRequest(CHAT_COMPLETIONS, {"model": "m"}, stream=True),
         task="text",

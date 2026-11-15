@@ -17,7 +17,6 @@ import av
 import pytest
 from aiohttp import web
 
-from tests.python.fixtures.http_stub import stub_server
 from uniserve_eval.config import load_config
 from uniserve_eval.pipeline.run import run_point
 from uniserve_eval.tasks.video import VideoTask
@@ -276,51 +275,49 @@ def test_a_baseline_output_is_not_held_to_a_reported_shape():
 
 
 @pytest.mark.parametrize("endpoint", [VIDEOS_SYNC, "/v1/videos"])
-def test_the_reported_shape_is_read_from_headers_or_the_job(endpoint):
+@pytest.mark.asyncio
+async def test_the_reported_shape_is_read_from_headers_or_the_job(
+    aiohttp_raw_server, endpoint
+):
     """The sync route reports it in headers, a job in its record."""
 
-    async def exercise():
-        async def handler(request):
-            if request.method == "POST" and endpoint == "/v1/videos":
-                return web.json_response({"id": "job", "status": "queued"})
-            if request.method == "GET" and not request.path.endswith(
-                "/content"
-            ):
-                return web.json_response(
-                    {
-                        "id": "job",
-                        "object": "video",
-                        "status": "completed",
-                        "size": "1344x768",
-                        "seconds": "10.125",
-                        "num_frames": 243,
-                        "fps": 24,
-                    }
-                )
-            headers = {}
-            if endpoint == VIDEOS_SYNC:
-                headers = {
-                    "x-video-size": "1344x768",
-                    "x-video-num-frames": "243",
-                    "x-video-fps": "24",
+    async def handler(request: web.BaseRequest) -> web.Response:
+        if request.method == "POST" and endpoint == "/v1/videos":
+            return web.json_response({"id": "job", "status": "queued"})
+        if request.method == "GET" and not request.path.endswith("/content"):
+            return web.json_response(
+                {
+                    "id": "job",
+                    "object": "video",
+                    "status": "completed",
+                    "size": "1344x768",
+                    "seconds": "10.125",
+                    "num_frames": 243,
+                    "fps": 24,
                 }
-            return mp4_response(headers)
-
-        config = replace(
-            point(video_config(poll_interval_s=0.001)), endpoint=endpoint
-        )
-        request = VideoTask(config).build_request(
-            Example("row", "scene", num_frames=243)
-        )
-        async with (
-            stub_server(handler) as base_url,
-            aiohttp.ClientSession() as client,
-        ):
-            return await send_request(
-                client, base_url, request, "row", task="video"
             )
+        headers = {}
+        if endpoint == VIDEOS_SYNC:
+            headers = {
+                "x-video-size": "1344x768",
+                "x-video-num-frames": "243",
+                "x-video-fps": "24",
+            }
+        return mp4_response(headers)
 
-    record = asyncio.run(exercise())
+    config = replace(
+        point(video_config(poll_interval_s=0.001)), endpoint=endpoint
+    )
+    request = VideoTask(config).build_request(
+        Example("row", "scene", num_frames=243)
+    )
+    server = await aiohttp_raw_server(handler)
+    base_url = str(server.make_url(""))
+    async with aiohttp.ClientSession() as client:
+        record = await send_request(
+            client, base_url, request, "row", task="video"
+        )
+
     assert record.success
     assert record.served_shape == VideoShape(1344, 768, 243, 24)
     assert record.record_dict()["served_shape"] == {
@@ -337,42 +334,40 @@ def test_the_reported_shape_is_read_from_headers_or_the_job(endpoint):
 @pytest.mark.parametrize("size", ["1344x768", "768x1344"])
 @pytest.mark.parametrize("schedule", [BASE_SCHEDULE, FAST_H3_SCHEDULE])
 @pytest.mark.parametrize("seconds,frames", [(5.0, 124), (7.3, 175)])
-def test_each_backend_receives_the_shape_and_schedule_in_its_own_fields(
-    backend, size, schedule, seconds, frames
+@pytest.mark.asyncio
+async def test_each_backend_receives_the_shape_and_schedule_in_its_own_fields(
+    aiohttp_raw_server, backend, size, schedule, seconds, frames
 ):
     """The stated work reaches every backend as the same generated work."""
     sent = []
     aspect_ratio = "16:9" if size == "1344x768" else "9:16"
 
-    async def exercise():
-        async def handler(request):
-            sent.append((request.headers, await request.read()))
-            return mp4_response()
+    async def handler(request: web.BaseRequest) -> web.Response:
+        sent.append((request.headers, await request.read()))
+        return mp4_response()
 
-        config = point(
-            video_config(
-                backend,
-                size=size,
-                **stated_schedule(backend, schedule),
-                **stated_target(backend, aspect_ratio, seconds),
-            )
+    config = point(
+        video_config(
+            backend,
+            size=size,
+            **stated_schedule(backend, schedule),
+            **stated_target(backend, aspect_ratio, seconds),
         )
-        request = VideoTask(config).build_request(
-            Example("row", "precise prompt", num_frames=frames, seed=11)
+    )
+    request = VideoTask(config).build_request(
+        Example("row", "precise prompt", num_frames=frames, seed=11)
+    )
+    server = await aiohttp_raw_server(handler)
+    base_url = str(server.make_url(""))
+    async with aiohttp.ClientSession() as client:
+        record = await send_request(
+            client, base_url, request, "row", task="video"
         )
-        async with (
-            stub_server(handler) as base_url,
-            aiohttp.ClientSession() as client,
-        ):
-            record = await send_request(
-                client, base_url, request, "row", task="video"
-            )
-        assert record.success
-        assert record.video_shape == VideoShape(
-            *(int(side) for side in size.split("x")), frames, 24
-        )
+    assert record.success
+    assert record.video_shape == VideoShape(
+        *(int(side) for side in size.split("x")), frames, 24
+    )
 
-    asyncio.run(exercise())
     width, height = (int(side) for side in size.split("x"))
     points = schedule["num_inference_steps"]
     if backend == "uniserve":
@@ -444,151 +439,144 @@ def test_each_backend_receives_the_shape_and_schedule_in_its_own_fields(
         ("sglang", "/v1/videos"),
     ],
 )
-def test_native_transport_waits_for_media_and_enforces_logical_deadline(
-    backend, endpoint
+@pytest.mark.asyncio
+async def test_native_transport_waits_for_media_and_enforces_logical_deadline(
+    aiohttp_raw_server, backend, endpoint
 ):
-    async def exercise():
-        async def handler(request):
-            if request.method == "POST" and endpoint == "/v1/videos":
-                return web.json_response({"id": "job", "status": "queued"})
-            if request.method == "GET" and not request.path.endswith(
-                "/content"
-            ):
-                return web.json_response({"id": "job", "status": "completed"})
-            await asyncio.sleep(0.03)
-            return web.Response(
-                body=b"original bytes",
-                headers={"content-type": "video/mp4"},
-            )
-
-        config = replace(
-            point(video_config(backend, poll_interval_s=0.001)),
-            endpoint=endpoint,
+    async def handler(request: web.BaseRequest) -> web.Response:
+        if request.method == "POST" and endpoint == "/v1/videos":
+            return web.json_response({"id": "job", "status": "queued"})
+        if request.method == "GET" and not request.path.endswith("/content"):
+            return web.json_response({"id": "job", "status": "completed"})
+        await asyncio.sleep(0.03)
+        return web.Response(
+            body=b"original bytes",
+            headers={"content-type": "video/mp4"},
         )
-        request = VideoTask(config).build_request(
-            Example("row", "precise prompt", num_frames=124, seed=11)
+
+    config = replace(
+        point(video_config(backend, poll_interval_s=0.001)),
+        endpoint=endpoint,
+    )
+    request = VideoTask(config).build_request(
+        Example("row", "precise prompt", num_frames=124, seed=11)
+    )
+    server = await aiohttp_raw_server(handler)
+    base_url = str(server.make_url(""))
+    async with aiohttp.ClientSession() as client:
+        record = await send_request(
+            client,
+            base_url,
+            request,
+            "row",
+            task="video",
+            prompt_len=1000,
+            timeout_s=1,
         )
-        async with (
-            stub_server(handler) as base_url,
-            aiohttp.ClientSession() as client,
-        ):
-            record = await send_request(
-                client,
-                base_url,
-                request,
-                "row",
-                task="video",
-                prompt_len=1000,
-                timeout_s=1,
+        assert record.success and record.video_body == b"original bytes"
+        assert record.prompt_len == 1000
+        assert record.latency >= 0.03
+        expired = await send_request(
+            client,
+            base_url,
+            request,
+            "row",
+            task="video",
+            timeout_s=0.01,
+        )
+        assert not expired.success
+        assert expired.classifier == "request_deadline"
+        assert expired.latency == pytest.approx(0.01)
+
+
+@pytest.mark.asyncio
+async def test_vllm_omni_request_carries_configured_extra_params(
+    aiohttp_raw_server,
+):
+    sent = {}
+
+    async def handler(request: web.BaseRequest) -> web.Response:
+        sent.update(
+            json.loads(
+                form_fields((request.headers, await request.read()))[
+                    "extra_params"
+                ]
             )
-            assert record.success and record.video_body == b"original bytes"
-            assert record.prompt_len == 1000
-            assert record.latency >= 0.03
-            expired = await send_request(
-                client,
-                base_url,
-                request,
-                "row",
-                task="video",
-                timeout_s=0.01,
-            )
-            assert not expired.success
-            assert expired.classifier == "request_deadline"
-            assert expired.latency == pytest.approx(0.01)
+        )
+        return web.Response(
+            body=b"original bytes",
+            headers={"content-type": "video/mp4"},
+        )
 
-    asyncio.run(exercise())
+    config = point(
+        video_config(
+            "vllm-omni",
+            extra_params={"preencode_mp4": True},
+            duration_seconds=10.0,
+        )
+    )
+    request = VideoTask(config).build_request(
+        Example("row", "precise prompt", num_frames=243, seed=11)
+    )
+    server = await aiohttp_raw_server(handler)
+    base_url = str(server.make_url(""))
+    async with aiohttp.ClientSession() as client:
+        record = await send_request(
+            client, base_url, request, "row", task="video"
+        )
+    assert record.success
+    # The configured option joins the fields that fix the work.
+    assert sent == {
+        "task": "t2va",
+        "duration": 10.0,
+        "audio_flow_shift": 3.0,
+        "preencode_mp4": True,
+    }
 
 
-def test_vllm_omni_request_carries_configured_extra_params():
-    async def exercise():
-        sent = {}
+@pytest.mark.asyncio
+async def test_sglang_request_carries_configured_extra_params(
+    aiohttp_raw_server,
+):
+    sent = {}
 
-        async def handler(request):
-            sent.update(
-                json.loads(
-                    form_fields((request.headers, await request.read()))[
-                        "extra_params"
-                    ]
-                )
-            )
-            return web.Response(
-                body=b"original bytes",
-                headers={"content-type": "video/mp4"},
-            )
+    async def handler(request: web.BaseRequest) -> web.Response:
+        if request.method == "POST":
+            sent.update(await request.json())
+            return web.json_response({"id": "job", "status": "completed"})
+        return web.Response(
+            body=b"original bytes",
+            headers={"content-type": "video/mp4"},
+        )
 
-        config = point(
+    config = replace(
+        point(
             video_config(
-                "vllm-omni",
-                extra_params={"preencode_mp4": True},
+                "sglang",
+                extra_params={
+                    "x264_preset": "ultrafast",
+                    "output_compression": 53,
+                },
                 duration_seconds=10.0,
             )
+        ),
+        endpoint="/v1/videos",
+    )
+    request = VideoTask(config).build_request(
+        Example("row", "precise prompt", num_frames=243, seed=11)
+    )
+    server = await aiohttp_raw_server(handler)
+    base_url = str(server.make_url(""))
+    async with aiohttp.ClientSession() as client:
+        record = await send_request(
+            client, base_url, request, "row", task="video"
         )
-        request = VideoTask(config).build_request(
-            Example("row", "precise prompt", num_frames=243, seed=11)
-        )
-        async with (
-            stub_server(handler) as base_url,
-            aiohttp.ClientSession() as client,
-        ):
-            record = await send_request(
-                client, base_url, request, "row", task="video"
-            )
-        assert record.success
-        # The configured option joins the fields that fix the work.
-        assert sent == {
-            "task": "t2va",
-            "duration": 10.0,
-            "audio_flow_shift": 3.0,
-            "preencode_mp4": True,
-        }
-
-    asyncio.run(exercise())
-
-
-def test_sglang_request_carries_configured_extra_params():
-    async def exercise():
-        sent = {}
-
-        async def handler(request):
-            if request.method == "POST":
-                sent.update(await request.json())
-                return web.json_response({"id": "job", "status": "completed"})
-            return web.Response(
-                body=b"original bytes",
-                headers={"content-type": "video/mp4"},
-            )
-
-        config = replace(
-            point(
-                video_config(
-                    "sglang",
-                    extra_params={
-                        "x264_preset": "ultrafast",
-                        "output_compression": 53,
-                    },
-                    duration_seconds=10.0,
-                )
-            ),
-            endpoint="/v1/videos",
-        )
-        request = VideoTask(config).build_request(
-            Example("row", "precise prompt", num_frames=243, seed=11)
-        )
-        async with (
-            stub_server(handler) as base_url,
-            aiohttp.ClientSession() as client,
-        ):
-            record = await send_request(
-                client, base_url, request, "row", task="video"
-            )
-        assert record.success
-        # The configured options join the native fields that fix the work.
-        assert sent["x264_preset"] == "ultrafast"
-        assert sent["output_compression"] == 53
-        assert sent["task"] == "t2va"
-        assert sent["target"]["duration_seconds"] == 10
-
-    asyncio.run(exercise())
+    assert record.success
+    # The configured options join the native fields that fix the work.
+    assert sent["x264_preset"] == "ultrafast"
+    assert sent["output_compression"] == 53
+    assert sent["task"] == "t2va"
+    assert sent["target"]["duration_seconds"] == 10
 
 
 @pytest.mark.parametrize(
@@ -709,56 +697,55 @@ videos_per_second = "higher"
 
 
 @pytest.mark.parametrize("failed", [False, True])
-def test_async_job_failure_or_published_media_url_is_terminal(failed):
-    async def exercise():
-        async def handler(request):
-            if request.method == "POST":
-                return web.json_response({"id": "job", "status": "queued"})
-            if request.path == "/v1/videos/job":
-                return web.json_response(
-                    {
-                        "id": "job",
-                        "status": "failed" if failed else "completed",
-                        "error": "decoder failed",
-                        "url": "/published/output.mp4",
-                    },
-                )
-            if request.path == "/published/output.mp4":
-                await asyncio.sleep(0.02)
-                return web.Response(
-                    body=b"published media",
-                    headers={"content-type": "video/mp4"},
-                )
-            return web.Response(status=404)
-
-        task = VideoTask(
-            replace(
-                point(video_config("sglang", poll_interval_s=0.001)),
-                endpoint="/v1/videos",
+@pytest.mark.asyncio
+async def test_async_job_failure_or_published_media_url_is_terminal(
+    aiohttp_raw_server, failed
+):
+    async def handler(request: web.BaseRequest) -> web.Response:
+        if request.method == "POST":
+            return web.json_response({"id": "job", "status": "queued"})
+        if request.path == "/v1/videos/job":
+            return web.json_response(
+                {
+                    "id": "job",
+                    "status": "failed" if failed else "completed",
+                    "error": "decoder failed",
+                    "url": "/published/output.mp4",
+                },
             )
+        if request.path == "/published/output.mp4":
+            await asyncio.sleep(0.02)
+            return web.Response(
+                body=b"published media",
+                headers={"content-type": "video/mp4"},
+            )
+        return web.Response(status=404)
+
+    task = VideoTask(
+        replace(
+            point(video_config("sglang", poll_interval_s=0.001)),
+            endpoint="/v1/videos",
         )
-        async with (
-            stub_server(handler) as base_url,
-            aiohttp.ClientSession() as client,
-        ):
-            record = await send_request(
-                client,
-                base_url,
-                task.build_request(Example("row", "scene", num_frames=124)),
-                "row",
-                task="video",
-            )
-        assert record.final_event_time >= record.start_time
-        if failed:
-            assert not record.success
-            assert record.classifier == "video_job_failed"
-            assert "decoder failed" in record.error
-        else:
-            assert record.success
-            assert record.video_body == b"published media"
-            assert record.latency >= 0.02
-
-    asyncio.run(exercise())
+    )
+    server = await aiohttp_raw_server(handler)
+    base_url = str(server.make_url(""))
+    async with aiohttp.ClientSession() as client:
+        record = await send_request(
+            client,
+            base_url,
+            task.build_request(Example("row", "scene", num_frames=124)),
+            "row",
+            task="video",
+        )
+    assert record.final_event_time >= record.start_time
+    if failed:
+        assert not record.success
+        assert record.classifier == "video_job_failed"
+        assert "decoder failed" in record.error
+    else:
+        assert record.success
+        assert record.video_body == b"published media"
+        assert record.latency >= 0.02
 
 
 def test_run_releases_slots_before_inspection_and_retains_invalid_media(

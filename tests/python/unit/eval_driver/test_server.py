@@ -1,13 +1,22 @@
-"""ManagedServer releases every resource it acquires for a launch."""
+"""ManagedServer releases every resource it acquires for a launch.
+
+The servers are :mod:`uniserve_testing.standins.reporter` processes, which
+take a load time to start and then report their start to a listener of the
+test's own, on a port the kernel chose. That listener is the address each
+server's profile names: it accepts connections from the moment the test opens
+it and answers its readiness path with 503 until its server reports, then
+with 200.
+"""
 
 from __future__ import annotations
 
 import os
 import signal
-import socket
 import sys
-import time
+import threading
+from collections.abc import Callable, Iterator
 from contextlib import suppress
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 import pytest
@@ -17,59 +26,97 @@ from uniserve_eval.server import ManagedDeployment, ManagedServer
 
 pytestmark = pytest.mark.unit
 
-# A stand-in server: it optionally starts a worker that stays in its process
-# group, records the worker's pid, then listens until it is killed. The
-# arguments are the pid file, the port, and "1" to start the worker.
-_SERVER = """
-import socket, subprocess, sys, time
-
-pid_path, port, start_worker = sys.argv[1], int(sys.argv[2]), sys.argv[3]
-if start_worker == "1":
-    sleeper = "import time; time.sleep(300)"
-    worker = subprocess.Popen([sys.executable, "-c", sleeper])
-    with open(pid_path, "w") as handle:
-        handle.write(str(worker.pid))
-listener = socket.socket()
-listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-listener.bind(("127.0.0.1", port))
-listener.listen()
-time.sleep(300)
-"""
+# The path of a profile's readiness probe; the listener answers any path.
+_READY_PATH = "/ready"
 
 
-# A stand-in server that loads for a while before it listens. The arguments
-# are the port and the load time in seconds.
-_LATE_SERVER = """
-import socket, sys, time
+class _Listener(ThreadingHTTPServer):
+    """The address a stand-in server's profile names, and its report's sink.
 
-port, load_s = int(sys.argv[1]), float(sys.argv[2])
-time.sleep(load_s)
-listener = socket.socket()
-listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-listener.bind(("127.0.0.1", port))
-listener.listen()
-time.sleep(300)
-"""
+    It answers every ``GET`` with 503 until a report arrives and with 200
+    after it; the report is a ``POST`` whose body ``report`` keeps.
+    """
+
+    def __init__(self) -> None:
+        """Bind a loopback port the kernel chooses and listen on it."""
+        super().__init__(("127.0.0.1", 0), _ListenerHandler)
+        self.reported = threading.Event()
+        self.report = b""
+
+    @property
+    def report_url(self) -> str:
+        """The URL a stand-in reports its start to."""
+        return f"http://127.0.0.1:{self.server_port}/report"
+
+    def profile(
+        self, name: str, command: tuple[str, ...], ready_path: str | None
+    ) -> ServerProfile:
+        """A profile whose readiness this listener answers."""
+        return ServerProfile(
+            name,
+            command,
+            "127.0.0.1",
+            self.server_port,
+            {},
+            ready_path=ready_path,
+        )
 
 
-def _free_port() -> int:
-    with socket.socket() as probe:
-        probe.bind(("127.0.0.1", 0))
-        return probe.getsockname()[1]
+class _ListenerHandler(BaseHTTPRequestHandler):
+    """Answers readiness probes and takes a stand-in's report."""
+
+    server: _Listener
+
+    def do_GET(self) -> None:  # noqa: N802 - stdlib handler method name.
+        """Answer a readiness probe: 200 once the report arrived."""
+        self.send_response(200 if self.server.reported.is_set() else 503)
+        self.send_header("content-length", "0")
+        self.end_headers()
+
+    def do_POST(self) -> None:  # noqa: N802 - stdlib handler method name.
+        """Keep the report's body and mark the server started."""
+        length = int(self.headers.get("content-length", "0"))
+        self.server.report = self.rfile.read(length)
+        self.server.reported.set()
+        self.send_response(204)
+        self.end_headers()
+
+    def log_message(self, _format: str, *_args: object) -> None:
+        """Keep the probes out of the test's output."""
 
 
-def _running(pid: int) -> bool:
-    """Report whether a process exists and has not exited (zombie)."""
-    try:
-        stat = Path(f"/proc/{pid}/stat").read_text()
-    except FileNotFoundError:
-        return False
-    # The state letter follows the parenthesized command name.
-    return stat.rpartition(")")[2].split()[0] != "Z"
+@pytest.fixture
+def listener() -> Iterator[Callable[[], _Listener]]:
+    """Open listeners on demand; close each at the test's end."""
+    opened: list[_Listener] = []
+
+    def open_listener() -> _Listener:
+        server = _Listener()
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        opened.append(server)
+        return server
+
+    yield open_listener
+
+    for server in opened:
+        server.shutdown()
+        server.server_close()
+
+
+def _reporter(listener: _Listener, *options: str) -> tuple[str, ...]:
+    """The command of a stand-in server that reports to ``listener``."""
+    return (
+        sys.executable,
+        "-m",
+        "uniserve_testing.standins.reporter",
+        "--report",
+        listener.report_url,
+        *options,
+    )
 
 
 def _open_descriptors(path: Path) -> list[str]:
-    """Return this process's file descriptors that refer to `path`."""
+    """Return this process's file descriptors that refer to ``path``."""
     descriptors = []
     for descriptor in os.listdir("/proc/self/fd"):
         try:
@@ -101,20 +148,15 @@ def test_failed_launch_closes_the_server_log(tmp_path: Path) -> None:
 
 @pytest.mark.parametrize("start_worker", [True, False], ids=["worker", "alone"])
 def test_stop_terminates_the_group_after_the_server_was_killed(
-    tmp_path: Path, start_worker: bool
+    tmp_path: Path,
+    listener: Callable[[], _Listener],
+    wait_exit: Callable[[int, float], bool],
+    start_worker: bool,
 ) -> None:
-    port = _free_port()
-    pid_path = tmp_path / "worker.pid"
-    command = (
-        sys.executable,
-        "-c",
-        _SERVER,
-        str(pid_path),
-        str(port),
-        "1" if start_worker else "0",
-    )
+    address = listener()
+    command = _reporter(address, *(["--worker"] if start_worker else []))
     server = ManagedServer(
-        ServerProfile("local", command, "127.0.0.1", port, {}),
+        address.profile("local", command, _READY_PATH),
         ServerLaunch(command, tmp_path, {}),
         tmp_path / "server.log",
         timeout_s=30.0,
@@ -123,8 +165,9 @@ def test_stop_terminates_the_group_after_the_server_was_killed(
     worker: int | None = None
     try:
         with server:
+            # The server is ready once it reported, with its worker's pid.
             if start_worker:
-                worker = int(pid_path.read_text())
+                worker = int(address.report)
             # An abrupt server exit, such as SIGKILL or an OOM kill, skips
             # the server's own worker cleanup.
             assert server.process is not None
@@ -134,37 +177,26 @@ def test_stop_terminates_the_group_after_the_server_was_killed(
         # Exiting the context signals the group; a group left with no
         # member must not make it raise.
         if worker is not None:
-            deadline = time.monotonic() + 5.0
-            while _running(worker) and time.monotonic() < deadline:
-                time.sleep(0.05)
-            assert not _running(worker)
+            assert wait_exit(worker, 5.0)
     finally:
         if worker is not None:
             with suppress(ProcessLookupError):
                 os.kill(worker, signal.SIGKILL)
 
 
-def test_startup_time_runs_from_launch_to_the_first_accepted_connection(
-    tmp_path: Path,
+def test_startup_time_runs_from_launch_until_the_process_is_ready(
+    tmp_path: Path, listener: Callable[[], _Listener]
 ) -> None:
-    """A deployment reports how long its slowest process took to listen."""
-    ports = [_free_port(), _free_port()]
-    # Each stand-in loads for its delay before it binds its listener.
+    """A deployment reports how long its slowest process took to be ready."""
+    # Each stand-in loads for its delay before it reports its start.
     delays = (0.2, 0.6)
     processes = []
-    for index, (port, delay) in enumerate(zip(ports, delays, strict=True)):
-        command = (
-            sys.executable,
-            "-c",
-            _LATE_SERVER,
-            str(port),
-            str(delay),
-        )
+    for index, delay in enumerate(delays):
+        address = listener()
+        command = _reporter(address, "--load-s", str(delay))
         processes.append(
             (
-                ServerProfile(
-                    f"replica-{index}", command, "127.0.0.1", port, {}
-                ),
+                address.profile(f"replica-{index}", command, _READY_PATH),
                 ServerLaunch(command, tmp_path, {}),
                 tmp_path / f"{index}.log",
             )
@@ -179,41 +211,16 @@ def test_startup_time_runs_from_launch_to_the_first_accepted_connection(
     assert startup == max(server.startup_s for server in deployment.servers)
 
 
-# A stand-in server that listens at once and answers its health path with
-# 503 while it warms up, then 200. The arguments are the port and the warmup
-# time in seconds.
-_WARMING_SERVER = """
-import sys, time
-from http.server import BaseHTTPRequestHandler, HTTPServer
-
-port, warmup_s = int(sys.argv[1]), float(sys.argv[2])
-started = time.monotonic()
-
-class Handler(BaseHTTPRequestHandler):
-    def do_GET(self):
-        warm = time.monotonic() - started >= warmup_s
-        self.send_response(200 if warm and self.path == "/health" else 503)
-        self.end_headers()
-
-    def log_message(self, *args):
-        pass
-
-HTTPServer(("127.0.0.1", port), Handler).serve_forever()
-"""
-
-
-@pytest.mark.parametrize("ready_path", [None, "/health"])
+@pytest.mark.parametrize("ready_path", [None, _READY_PATH])
 def test_a_readiness_path_holds_startup_until_the_server_reports_ready(
-    tmp_path: Path, ready_path: str | None
+    tmp_path: Path, listener: Callable[[], _Listener], ready_path: str | None
 ) -> None:
-    """A server that warms up behind its listener is ready only when warm."""
-    port = _free_port()
-    warmup_s = 1.0
-    command = (sys.executable, "-c", _WARMING_SERVER, str(port), str(warmup_s))
+    """A server that listens before it has started is ready only then."""
+    address = listener()
+    load_s = 1.0
+    command = _reporter(address, "--load-s", str(load_s))
     server = ManagedServer(
-        ServerProfile(
-            "local", command, "127.0.0.1", port, {}, ready_path=ready_path
-        ),
+        address.profile("local", command, ready_path),
         ServerLaunch(command, tmp_path, {}),
         tmp_path / "server.log",
         timeout_s=30.0,
@@ -224,7 +231,7 @@ def test_a_readiness_path_holds_startup_until_the_server_reports_ready(
 
     assert startup is not None
     if ready_path is None:
-        # The listener alone accepts long before the warmup ends.
-        assert startup < warmup_s
+        # The listener alone accepts long before the load ends.
+        assert startup < load_s
     else:
-        assert startup >= warmup_s
+        assert startup >= load_s

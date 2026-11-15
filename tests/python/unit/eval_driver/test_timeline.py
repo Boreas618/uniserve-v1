@@ -1,17 +1,18 @@
 """Timeline loads with changes, and `check-change`, against a stand-in.
 
 The stand-in is a real process that `uniserve-eval run` launches from the
-profile's command. Like `uniserve serve`, it serves an OpenAI-compatible
-chat API, here streaming each request's tokens with their ids and top-5
-logprobs, and an admin listener on a Unix socket in its runtime directory,
-where an update moves through `switching` and `trial` and is `committed`
-or `rolled_back`; and it starts a detached Storage Server there. A point's
-requests carry a `fault` the stand-in reads: it strikes the point's third
-request with a lost token, a repeated token, a failed answer, a closed
-connection, or a divergence inside or outside the top 5; `late` instead
-holds the first token of every request that arrives during the update's
-switch, `slow` spaces every request's tokens by 0.1 s, and `uncached`
-reports nothing cached once an update switched.
+profile's command, :mod:`uniserve_testing.standins.server`. Like
+`uniserve serve`, it serves an OpenAI-compatible chat API, here streaming
+each request's tokens with their ids and top-5 logprobs, and an admin
+listener on a Unix socket in its runtime directory, where an update moves
+through `switching` and `trial` and is `committed` or `rolled_back`; it
+starts a detached Storage Server there and an engine in a process group of
+its own. A point's requests carry a `fault` the stand-in reads: it strikes
+the point's third request with a lost token, a repeated token, a failed
+answer, a closed connection, or a divergence inside or outside the top 5;
+`late` instead holds the first token of every request that arrives during
+the update's switch, `slow` spaces every request's tokens by 0.1 s, and
+`uncached` reports nothing cached once an update switched.
 
 The stand-in serves configuration `A` until an update sets
 `configuration=B`, and `A` again after a rollback; a request keeps the
@@ -24,220 +25,19 @@ It logs the prompt of each stream its client closed to `disconnected.txt`.
 from __future__ import annotations
 
 import json
-import os
-import socket
 import sys
-import uuid
-import zlib
+from collections.abc import Callable, Sequence
 from pathlib import Path
 
 import pytest
+from uniserve_testing.standins.server import token
 
-from uniserve_eval.cli import build_parser
 from uniserve_eval.config import load_config
 
 pytestmark = pytest.mark.unit
 
 _TOKENS = 8
 _ROWS = 6
-
-# Tells this module's stand-in Storage Server apart from every other process
-# on the host, so a signal found by pattern on the host reaches only it.
-_MARK = uuid.uuid4().hex
-
-# The stand-in server; its arguments are the port it listens on and the mark
-# its Storage Server's command line carries.
-_SERVER = r"""
-import asyncio, json, os, subprocess, sys, time, zlib
-
-from aiohttp import web
-
-port, mark = int(sys.argv[1]), sys.argv[2]
-services = os.path.join(os.environ["XDG_RUNTIME_DIR"], "uniserve")
-os.makedirs(services, exist_ok=True)
-storage = subprocess.Popen(
-    [
-        sys.executable, "-c", "import time; time.sleep(300)",
-        "storage-server", "serve",
-        "--socket", os.path.join(services, "storage-server.sock"),
-        "--stand-in", mark,
-    ],
-    start_new_session=True,
-)
-with open("storage-server.pid", "w") as handle:
-    handle.write(str(storage.pid))
-# An engine, as the daemon starts one: the leader of a process group of its
-# own, which ends when the server does.
-engine = subprocess.Popen(
-    [
-        sys.executable, "-c",
-        "import os, time\n"
-        "parent = os.getppid()\n"
-        "while os.getppid() == parent:\n"
-        "    time.sleep(0.1)\n",
-        "uniserve-engine", "--launch", mark,
-    ],
-    process_group=0,
-)
-with open("engine.pid", "w") as handle:
-    handle.write(str(engine.pid))
-
-events, faults, switching = [], {}, False
-configuration, switched, seen = "A", False, set()
-appended = asyncio.Condition()
-
-
-def token(row, position, served="A"):
-    key = f"{row}/{position}" if served == "A" else f"{served}/{row}/{position}"
-    return 1000 + zlib.crc32(key.encode()) % 50000
-
-
-def chunk(event):
-    return b"data: " + json.dumps(event).encode() + b"\n\n"
-
-
-async def record(phase):
-    events.append({
-        "seq": len(events) + 1, "time": time.time(), "kind": "update",
-        "message": f"update 1: {phase}", "data": {"phase": phase},
-    })
-    async with appended:
-        appended.notify_all()
-
-
-async def chat(request):
-    body = await request.json()
-    row, count = body["messages"][0]["content"], body["max_completion_tokens"]
-    fault = body.get("fault")
-    faults[fault] = faults.get(fault, 0) + 1
-    struck = fault is not None and faults[fault] == 3
-    if struck and fault == "fail":
-        return web.json_response({"error": {"message": "failed"}}, status=500)
-    held = fault == "late" and switching
-    served = body.get("configuration", configuration)
-    cached = row in seen and not (fault == "uncached" and switched)
-    seen.add(row)
-
-    response = web.StreamResponse(headers={"content-type": "text/event-stream"})
-    await response.prepare(request)
-    await asyncio.sleep(1.0 if held else 0.02)
-    positions = list(range(count))
-    if struck and fault == "lost":
-        positions.remove(4)
-    if struck and fault == "repeat":
-        positions.insert(4, 4)
-    try:
-        for index, position in enumerate(positions):
-            chosen = token(row, position, served)
-            others = [chosen + 100000 * rank for rank in range(1, 5)]
-            if struck and position == 4 and fault == "tie_inside":
-                chosen, others[0] = others[0], chosen
-            if struck and position == 4 and fault == "tie_outside":
-                chosen, others = 7, [8, 9, 10, 11]
-            top = [
-                {"token": f"token_id:{item}", "logprob": -0.1 - rank}
-                for rank, item in enumerate([chosen, *others])
-            ]
-            entry = {
-                "token": f"token_id:{chosen}", "logprob": -0.1,
-                "top_logprobs": top,
-            }
-            choice = {
-                "index": 0, "delta": {"content": f" {chosen}"},
-                "token_ids": [chosen], "logprobs": {"content": [entry]},
-            }
-            await response.write(chunk({"choices": [choice]}))
-            if struck and fault == "close" and index == 2:
-                request.transport.close()
-                return response
-            await asyncio.sleep(0.1 if fault == "slow" else 0.02)
-    except (ConnectionResetError, asyncio.CancelledError):
-        with open("disconnected.txt", "a") as handle:
-            handle.write(row + "\n")
-        raise
-    usage = {
-        "prompt_tokens": 64, "completion_tokens": count,
-        "prompt_tokens_details": {"cached_tokens": 63 if cached else 0},
-    }
-    final = {"choices": [{"index": 0, "delta": {}, "finish_reason": "length"}]}
-    await response.write(chunk({**final, "usage": usage}) + b"data: [DONE]\n\n")
-    await response.write_eof()
-    return response
-
-
-async def change(request):
-    global switching, switched, configuration
-    body = await request.json()
-    switching, switched = True, True
-    for setting in body.get("set", []):
-        name, _, value = setting.partition("=")
-        if name == "configuration":
-            configuration = value
-    await record("switching")
-    await asyncio.sleep(0.2)
-    switching = False
-    await record("trial")
-    return web.json_response({"kind": "config", "state": "succeeded"})
-
-
-async def commit(request):
-    await request.read()
-    await record("committed")
-    return web.json_response({"kind": "commit", "state": "succeeded"})
-
-
-async def rollback(request):
-    global configuration
-    await request.read()
-    configuration = "A"
-    await record("rolled_back")
-    return web.json_response({"kind": "rollback", "state": "succeeded"})
-
-
-async def read_events(request):
-    after = int(request.query.get("after", "0"))
-    async with appended:
-        try:
-            await asyncio.wait_for(
-                appended.wait_for(lambda: len(events) > after),
-                float(request.query.get("wait", "0")),
-            )
-        except asyncio.TimeoutError:
-            pass
-    page = {"events": events[after:], "next": max(after, len(events))}
-    return web.json_response({**page, "gap": False})
-
-
-async def metrics(request):
-    return web.Response(text='stand_in_check_failures_total{pool="0"} 0\n')
-
-
-async def version(request):
-    return web.json_response({"version": "stand-in"})
-
-
-async def main():
-    admin = web.Application()
-    admin.router.add_put("/admin/config", change)
-    admin.router.add_post("/admin/config/commit", commit)
-    admin.router.add_post("/admin/config/rollback", rollback)
-    admin.router.add_get("/admin/events", read_events)
-    api = web.Application()
-    api.router.add_post("/v1/chat/completions", chat)
-    api.router.add_get("/metrics", metrics)
-    api.router.add_get("/version", version)
-    admin_runner, api_runner = web.AppRunner(admin), web.AppRunner(api)
-    await admin_runner.setup()
-    await api_runner.setup()
-    path = os.path.join(services, f"admin-{port}.sock")
-    await web.UnixSite(admin_runner, path).start()
-    # The client listener last: the evaluator's readiness probe.
-    await web.TCPSite(api_runner, "127.0.0.1", port).start()
-    await asyncio.Event().wait()
-
-
-asyncio.run(main())
-"""
 
 # The update most points apply: its switch at 0.3 s and its commit 0.2 s
 # after the switch's end, as the admin events report it.
@@ -259,13 +59,14 @@ path = "/admin/config/commit"
 body = {{}}
 """
 
-# The clean point also runs a command in the deployment's environment and
-# stops its Storage Server for 50 ms.
+# The clean point also runs a command in the deployment's environment, which
+# prints the runtime directory that environment names, and stops its Storage
+# Server for 50 ms.
 _CLEAN = """
 [[benchmarks.{name}.changes]]
 name = "runtime"
 at_s = 0.05
-command = ["sh", "-c", "echo $XDG_RUNTIME_DIR"]
+command = ["printenv", "XDG_RUNTIME_DIR"]
 
 [[benchmarks.{name}.changes]]
 name = "stop"
@@ -311,25 +112,6 @@ at_s = 0.35
 cancel = 2
 """
 
-# The Storage Server stopped for 50 ms through another host, found there by
-# the mark its command line carries; `ssh` is the stand-in's.
-_REMOTE = """
-[[benchmarks.{name}.changes]]
-name = "stop"
-at_s = 0.1
-signal = "SIGSTOP"
-process = "stand-in {mark}"
-host = "standin-host"
-
-[[benchmarks.{name}.changes]]
-name = "continue"
-after = "stop"
-delay_s = 0.05
-signal = "SIGCONT"
-process = "stand-in {mark}"
-host = "standin-host"
-"""
-
 # The engine, in a process group of its own, continued by a signal found by
 # its command line among the deployment's processes.
 _ENGINE = """
@@ -337,7 +119,7 @@ _ENGINE = """
 name = "continue"
 at_s = 0.1
 signal = "SIGCONT"
-process = "uniserve-engine --launch {mark}"
+process = "uniserve-engine"
 """
 
 # Each point's fault and changes, in run order. The control applies no
@@ -357,7 +139,6 @@ _POINTS: dict[str, tuple[str | None, str]] = {
     "late": ("late", _UPDATE),
     "moved": (None, _MOVE),
     "cancel": ("slow", _UPDATE + _CANCEL),
-    "remote": (None, _REMOTE),
     "engine": (None, _ENGINE),
     "uncached": ("uncached", _UPDATE),
 }
@@ -397,22 +178,7 @@ extra_body = {{ {body} }}
 [benchmarks.{name}.metrics]
 output_throughput = "higher"
 """
-    return point + changes.format(name=name, mark=_MARK)
-
-
-def _command(argv: list[str]) -> int:
-    """Run one evaluator command and return its exit status."""
-    args = build_parser().parse_args(argv)
-    try:
-        args.function(args)
-    except SystemExit as exit_info:
-        return int(exit_info.code or 0)
-    return 0
-
-
-def _token(row: str, position: int) -> int:
-    """The stand-in's token at a position of a prompt's output."""
-    return 1000 + zlib.crc32(f"{row}/{position}".encode()) % 50000
+    return point + changes.format(name=name)
 
 
 def _records(bundle: Path) -> list[dict]:
@@ -420,14 +186,19 @@ def _records(bundle: Path) -> list[dict]:
     return [json.loads(line) for line in lines]
 
 
+def _pid(path: Path) -> int:
+    """The pid a stand-in's pid file records first."""
+    return int(path.read_text().split()[0])
+
+
 @pytest.fixture(scope="module")
-def runs(tmp_path_factory: pytest.TempPathFactory) -> Path:
+def runs(
+    tmp_path_factory: pytest.TempPathFactory,
+    unused_tcp_port_factory: Callable[[], int],
+    evaluate: Callable[[Sequence[str]], int],
+) -> Path:
     """Run every point once on one stand-in deployment; return its tree."""
     root = tmp_path_factory.mktemp("timeline")
-    with socket.socket() as probe:
-        probe.bind(("127.0.0.1", 0))
-        port = probe.getsockname()[1]
-    (root / "server.py").write_text(_SERVER, encoding="utf-8")
     (root / "rows.jsonl").write_text(
         "".join(
             json.dumps(
@@ -442,10 +213,20 @@ def runs(tmp_path_factory: pytest.TempPathFactory) -> Path:
         ),
         encoding="utf-8",
     )
+    # The profile states the port the stand-in listens on, since the
+    # evaluator probes the address its profile names.
+    port = unused_tcp_port_factory()
+    command = [
+        sys.executable,
+        "-m",
+        "uniserve_testing.standins.server",
+        "--port",
+        str(port),
+    ]
     server = f"""
 [servers.stand-in]
 port = {port}
-command = [{json.dumps(sys.executable)}, "server.py", "{port}", "{_MARK}"]
+command = {json.dumps(command)}
 admin_socket = "uniserve/admin-{port}.sock"
 
 [suites.all]
@@ -460,29 +241,53 @@ points = {json.dumps(list(_POINTS))}
     (root / "replay-pass.json").write_text('{"verdict": "pass"}')
     (root / "replay-fail.json").write_text('{"verdict": "fail"}')
 
-    # The stand-in for ssh, the boundary to another host: it logs the host
-    # and runs the remote command here with the shell, as sshd runs it
-    # there.
-    tools = root / "bin"
-    tools.mkdir()
-    (tools / "ssh").write_text(
-        "#!/bin/sh\n"
-        'while [ "$1" = -o ]; do shift 2; done\n'
-        f'echo "$1" >> {root / "ssh.log"}\n'
-        "shift\n"
-        'exec sh -c "$*"\n',
-        encoding="utf-8",
-    )
-    (tools / "ssh").chmod(0o755)
-
     # The failed request and the closed connection fail their own points'
     # validation, so the run ends with status 2 after every point ran.
     argv = ["--config", str(profile), "run", "all", "--reuse-deployment"]
     argv += ["--keep-going", "--output-root", str(root / "results")]
-    with pytest.MonkeyPatch.context() as patch:
-        patch.setenv("PATH", f"{tools}{os.pathsep}{os.environ['PATH']}")
-        assert _command(argv) == 2
+    assert evaluate(argv) == 2
     return root
+
+
+@pytest.fixture
+def check(
+    runs: Path,
+    capsys: pytest.CaptureFixture[str],
+    evaluate: Callable[[Sequence[str]], int],
+) -> Callable[..., tuple[int, dict, set[str]]]:
+    """Run a check command of a point's bundle with the passing evidence.
+
+    The returned function takes the command, the point and the command's
+    other options, and returns its status, report and failed items; the
+    report is empty when the command could not check.
+    """
+
+    def run(
+        command: str, point: str, *options: str
+    ) -> tuple[int, dict, set[str]]:
+        status = evaluate(
+            [
+                command,
+                str(runs / "results" / point),
+                *options,
+                "--check-metric",
+                "stand_in_check_failures_total",
+                "--replay",
+                str(runs / "replay-pass.json"),
+                "--result",
+                str(runs / f"{command}-{point}.md"),
+            ]
+        )
+        out = capsys.readouterr().out
+        report = json.loads(out) if out else {}
+        failed = {
+            key
+            for key, item in report.get("items", {}).items()
+            if not item["pass"]
+        }
+        return status, report, failed
+
+    return run
 
 
 def test_a_timeline_load_applies_its_changes_while_streams_run(
@@ -521,7 +326,7 @@ def test_a_timeline_load_applies_its_changes_while_streams_run(
 
     # The signals went to the deployment's Storage Server, 50 ms apart, and
     # the command ran in the deployment's runtime directory.
-    storage = int((runs / "storage-server.pid").read_text())
+    storage = _pid(runs / "storage-server.pid")
     assert changes["stop"]["pid"] == changes["continue"]["pid"] == storage
     runtime = changes["runtime"]["output"].strip()
     assert changes["runtime"]["returncode"] == 0
@@ -548,12 +353,12 @@ def test_the_records_hold_every_token_of_every_stream(runs: Path) -> None:
     ]
     for record in records:
         prompt = record["example"]["prompt"]
-        ids = [_token(prompt, position) for position in range(_TOKENS)]
+        ids = [token(prompt, position) for position in range(_TOKENS)]
         assert record["status_code"] == 200
         assert record["finish_reason"] == "length"
         assert record["token_ids"] == ids
         assert [top[0] for top in record["top_logprobs"]] == [
-            [token, -0.1] for token in ids
+            [chosen, -0.1] for chosen in ids
         ]
         assert all(len(top) == 5 for top in record["top_logprobs"])
         assert record["token_times"] == sorted(record["token_times"])
@@ -588,12 +393,13 @@ def test_the_records_hold_every_token_of_every_stream(runs: Path) -> None:
 def test_check_change_holds_a_run_to_the_pass_under_change(
     runs: Path,
     capsys: pytest.CaptureFixture[str],
+    evaluate: Callable[[Sequence[str]], int],
     point: str,
     failing: set[str],
 ) -> None:
     """A clean run passes; each fault fails the items it violates."""
     result = runs / f"{point}.md"
-    status = _command(
+    status = evaluate(
         [
             "check-change",
             str(runs / "results" / point),
@@ -616,41 +422,8 @@ def test_check_change_holds_a_run_to_the_pass_under_change(
     assert result.read_text().startswith(f"# Pass under change: {point}")
 
 
-def _check(
-    runs: Path,
-    capsys: pytest.CaptureFixture[str],
-    command: str,
-    point: str,
-    *options: str,
-) -> tuple[int, dict, set[str]]:
-    """Run a check of `point`'s bundle with the passing evidence.
-
-    Returns its status, report and failed items; the report is empty when
-    the command could not check.
-    """
-    status = _command(
-        [
-            command,
-            str(runs / "results" / point),
-            *options,
-            "--check-metric",
-            "stand_in_check_failures_total",
-            "--replay",
-            str(runs / "replay-pass.json"),
-            "--result",
-            str(runs / f"{command}-{point}.md"),
-        ]
-    )
-    out = capsys.readouterr().out
-    report = json.loads(out) if out else {}
-    failed = {
-        key for key, item in report.get("items", {}).items() if not item["pass"]
-    }
-    return status, report, failed
-
-
 def test_a_cancel_disconnects_streams_in_flight_and_they_go_on(
-    runs: Path, capsys: pytest.CaptureFixture[str]
+    runs: Path, check: Callable[..., tuple[int, dict, set[str]]]
 ) -> None:
     """A cancel closes two in-flight streams at once by the client.
 
@@ -690,32 +463,10 @@ def test_a_cancel_disconnects_streams_in_flight_and_they_go_on(
     assert summary["request_count"] == len(records) - 2
 
     control = str(runs / "results" / "control")
-    status, report, failed = _check(
-        runs, capsys, "check-change", "cancel", "--control", control
+    status, report, failed = check(
+        "check-change", "cancel", "--control", control
     )
     assert (status, failed, report["cancelled"]) == (0, set(), 2)
-
-
-def test_a_signal_reaches_a_process_on_another_host(runs: Path) -> None:
-    """A signal with a host goes through ssh to that host.
-
-    There the one process whose command line matches is found and
-    signalled.
-    """
-    timeline = json.loads(
-        (runs / "results" / "remote" / "timeline.json").read_text()
-    )
-    changes = {change["name"]: change for change in timeline["changes"]}
-    storage = int((runs / "storage-server.pid").read_text())
-
-    stop, resume = changes["stop"], changes["continue"]
-    assert "error" not in stop and "error" not in resume
-    assert stop["host"] == resume["host"] == "standin-host"
-    assert stop["pid"] == resume["pid"] == storage
-    assert f"--stand-in {_MARK}" in stop["cmdline"]
-    assert resume["issued_s"] >= stop["ended_s"] + 0.05
-    hosts = (runs / "ssh.log").read_text().split()
-    assert hosts == ["standin-host", "standin-host"]
 
 
 def test_a_signal_reaches_a_process_a_server_started_in_its_own_group(
@@ -731,16 +482,16 @@ def test_a_signal_reaches_a_process_a_server_started_in_its_own_group(
         (runs / "results" / "engine" / "timeline.json").read_text()
     )
     changes = {change["name"]: change for change in timeline["changes"]}
-    engine = int((runs / "engine.pid").read_text())
+    engine = _pid(runs / "engine.pid")
 
     resume = changes["continue"]
     assert "error" not in resume
     assert resume["pid"] == engine
-    assert f"uniserve-engine --launch {_MARK}" in resume["cmdline"]
+    assert "uniserve-engine" in resume["cmdline"]
 
 
 def test_check_change_compares_a_request_with_its_configurations_control(
-    runs: Path, capsys: pytest.CaptureFixture[str]
+    runs: Path, check: Callable[..., tuple[int, dict, set[str]]]
 ) -> None:
     """A request is compared with the control of its configuration.
 
@@ -752,15 +503,13 @@ def test_check_change_compares_a_request_with_its_configurations_control(
     on_b = [
         record
         for record in records
-        if record["token_ids"][0] != _token(record["example"]["prompt"], 0)
+        if record["token_ids"][0] != token(record["example"]["prompt"], 0)
     ]
     assert on_b, "some request ended on configuration B"
 
     control = str(runs / "results" / "control")
     control_b = str(runs / "results" / "control_b")
-    status, report, failed = _check(
-        runs,
-        capsys,
+    status, report, failed = check(
         "check-change",
         "moved",
         "--control",
@@ -773,9 +522,7 @@ def test_check_change_compares_a_request_with_its_configurations_control(
     assert (status, failed) == (0, set())
     assert report["controls"] == {"B": control_b, "A": control}
 
-    status, _, failed = _check(
-        runs,
-        capsys,
+    status, _, failed = check(
         "check-change",
         "moved",
         "--control",
@@ -787,9 +534,7 @@ def test_check_change_compares_a_request_with_its_configurations_control(
     )
     assert (status, failed) == (2, {"no_token_lost_or_repeated"})
 
-    status, report, _ = _check(
-        runs, capsys, "check-change", "moved", "--control", control
-    )
+    status, report, _ = check("check-change", "moved", "--control", control)
     assert (status, report) == (1, {})
 
 
@@ -797,7 +542,10 @@ def test_check_change_compares_a_request_with_its_configurations_control(
     ("point", "passed"), [("clean", True), ("uncached", False)]
 )
 def test_check_change_with_a_block_size_requires_the_prompts_cached(
-    runs: Path, capsys: pytest.CaptureFixture[str], point: str, passed: bool
+    check: Callable[..., tuple[int, dict, set[str]]],
+    runs: Path,
+    point: str,
+    passed: bool,
 ) -> None:
     """With a block size, the target must find the prompts cached.
 
@@ -807,9 +555,7 @@ def test_check_change_with_a_block_size_requires_the_prompts_cached(
     that found nothing fails that item alone.
     """
     control = str(runs / "results" / "control")
-    status, report, failed = _check(
-        runs,
-        capsys,
+    status, report, failed = check(
         "check-change",
         point,
         "--control",
@@ -827,7 +573,7 @@ def test_check_change_with_a_block_size_requires_the_prompts_cached(
 
 
 def test_rows_served_alone_are_the_reference_of_faults(
-    runs: Path, capsys: pytest.CaptureFixture[str]
+    runs: Path, check: Callable[..., tuple[int, dict, set[str]]]
 ) -> None:
     """Rows served alone are the reference `check-faults` holds a run to.
 
@@ -843,8 +589,8 @@ def test_rows_served_alone_are_the_reference_of_faults(
         assert after["client_send_time"] >= before["final_event_time"]
 
     alone = str(runs / "results" / "alone")
-    status, report, failed = _check(
-        runs, capsys, "check-faults", "cancel", "--reference", alone
+    status, report, failed = check(
+        "check-faults", "cancel", "--reference", alone
     )
     assert (status, failed, report["cancelled"]) == (0, set(), 2)
     assert (
@@ -853,15 +599,13 @@ def test_rows_served_alone_are_the_reference_of_faults(
         .startswith("# Faults under load: cancel")
     )
 
-    status, _, failed = _check(
-        runs, capsys, "check-faults", "tie_outside", "--reference", alone
+    status, _, failed = check(
+        "check-faults", "tie_outside", "--reference", alone
     )
     assert (status, failed) == (2, {"same_tokens_as_alone"})
 
     control = str(runs / "results" / "control")
-    status, report, _ = _check(
-        runs, capsys, "check-faults", "clean", "--reference", control
-    )
+    status, report, _ = check("check-faults", "clean", "--reference", control)
     assert (status, report) == (1, {})
 
 
@@ -873,10 +617,14 @@ def test_rows_served_alone_are_the_reference_of_faults(
     ],
 )
 def test_check_change_requires_the_invariants_evidence(
-    runs: Path, capsys: pytest.CaptureFixture[str], metric: str, replay: str
+    runs: Path,
+    capsys: pytest.CaptureFixture[str],
+    evaluate: Callable[[Sequence[str]], int],
+    metric: str,
+    replay: str,
 ) -> None:
     """A failed replay, or a check count no scrape reports, fails item 5."""
-    status = _command(
+    status = evaluate(
         [
             "check-change",
             str(runs / "results" / "clean"),

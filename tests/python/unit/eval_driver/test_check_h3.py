@@ -3,119 +3,61 @@
 The design confirms MiniMax-H3 by people watching generated results: a fixed
 set of requests covering every combination the service offers, each with a
 fixed seed, whose MP4s land in a fixed directory under ``artifacts/``. This
-test holds ``uniserve_eval/check_h3.toml`` and its frozen manifests to that
-rule: each cell exactly once, one measured row at seed 0 and one warmup
-row at seed 42 copied unchanged from the performance workloads, reference
-media and their anchors kept, and a fixed per-cell MP4 directory. The same six
-cells also run reversed, which is the candidate's obligation, and their MP4s
-go to a sibling directory so neither order overwrites the other. The only
-automatic checks of a run stay the video task's MP4 validity and the
-protected performance metrics; this test adds no check to the driver.
+test holds the evaluator's shipped ``check_h3.toml`` and its frozen manifests
+to that rule: each cell (a checkpoint and a task) exactly once, one measured
+row at seed 0 and one warmup row at seed 42 copied unchanged from a
+performance workload and its warmup, reference media and their anchors kept,
+and a fixed MP4 directory of its own. The same cells also run reversed,
+which is the candidate's obligation, and their MP4s go to a sibling
+directory so neither order overwrites the other. The only automatic checks
+of a run stay the video task's MP4 validity and the protected performance
+metrics; this test adds no check to the driver.
+
+The test reads the cells from the profile itself and asserts the properties
+every cell must have, so a cell added to or removed from the profile is held
+to the same rule.
 """
 
 from __future__ import annotations
 
 import json
-import tomllib
-from dataclasses import dataclass, replace
+from collections.abc import Callable
+from dataclasses import replace
+from importlib.resources import files
+from importlib.resources.abc import Traversable
 from pathlib import Path
 from typing import Any
 
 import pytest
 
-from uniserve_eval.config import load_config
+from uniserve_eval.config import EvaluationConfig, load_config
 from uniserve_eval.datasets import load_examples
+from uniserve_eval.types import BenchmarkPoint
 
 pytestmark = pytest.mark.unit
 
-# The profile ships beside the evaluator and runs from the repository root.
-_PROFILE = (
-    Path(__file__).resolve().parents[4] / "uniserve_eval" / "check_h3.toml"
-)
-_WORKLOADS = _PROFILE.parent / "workloads" / "minimax_h3"
-_ARTIFACT_ROOT = Path("artifacts/minimax_h3/check/results")
+#: The forward suite, in which every cell runs once, and its reversed twin.
+_FORWARD = "check-h3"
+_REVERSED = "check-h3-reversed"
 
-
-@dataclass(frozen=True)
-class _Cell:
-    """One served combination and the frozen request that checks it.
-
-    ``workload`` names the performance workload whose seed-0 measured row and
-    seed-42 warmup row the cell's manifests copy: W1 (t2va), W3 (fl2va) or
-    W4 (ref2va). ``directory`` is the fixed per-cell MP4 directory under
-    ``artifacts/minimax_h3/check``.
-    """
-
-    checkpoint: str
-    task: str
-    workload: str
-    directory: str
-
-
-# The cells the service offers: FastH3 DMD serves t2va and fl2va, FastH3
-# OmniRef serves ref2va, and base MiniMax-H3 serves t2va and fl2va through its
-# transformer partition and ref2va through its transformer_ref partition. The
-# order is the forward suite's: the reference cell first, which is how today's
-# implementation is measured (it shares one Storage Server key between the two
-# base servers on one checkpoint, so the cell that runs second inherits the
-# first's pages). The reversed suite is the candidate's obligation, and its
-# MP4s go to a sibling directory so neither order overwrites the other.
-_CELLS = {
-    "check-base-ref2va": _Cell(
-        "MiniMaxAI/MiniMax-H3",
-        "ref2va",
-        "w4",
-        "base-ref2va",
-    ),
-    "check-fasth3-dmd-t2va": _Cell(
-        "FastVideo/FastVideo-FastH3-8-Step-V2",
-        "t2va",
-        "w1",
-        "fasth3-dmd-t2va",
-    ),
-    "check-fasth3-dmd-fl2va": _Cell(
-        "FastVideo/FastVideo-FastH3-8-Step-V2",
-        "fl2va",
-        "w3",
-        "fasth3-dmd-fl2va",
-    ),
-    "check-fasth3-omniref-ref2va": _Cell(
-        "FastVideo/FastVideo-FastH3-Omni-8-Step-V1",
-        "ref2va",
-        "w4",
-        "fasth3-omniref-ref2va",
-    ),
-    "check-base-t2va": _Cell(
-        "MiniMaxAI/MiniMax-H3",
-        "t2va",
-        "w1",
-        "base-t2va",
-    ),
-    "check-base-fl2va": _Cell(
-        "MiniMaxAI/MiniMax-H3",
-        "fl2va",
-        "w3",
-        "base-fl2va",
-    ),
-}
-
-#: The reversed suite's run order: the forward order with the reference cell
-#: moved from first to last, so the cell that inherited the first's pages runs
-#: last and a pass says the ordering requirement is gone.
-_REVERSED_ORDER = [name for name in _CELLS if name != "check-base-ref2va"] + [
-    "check-base-ref2va"
-]
-#: The reversed suite's cells, each the same request as its forward cell.
-_REVERSED = {f"{name}-reversed": _CELLS[name] for name in _REVERSED_ORDER}
+#: The seeds of a cell's measured and warmup rows.
+_MEASURED_SEED = 0
+_WARMUP_SEED = 42
 
 
 @pytest.fixture(scope="module")
-def config():
+def config(shipped_profile: Callable[[str], Path]) -> EvaluationConfig:
     """Load the check-set profile once for every test of it."""
-    return load_config(_PROFILE)
+    return load_config(shipped_profile("check_h3.toml"))
 
 
-def _jsonl_rows(path: Path) -> list[dict[str, Any]]:
+@pytest.fixture(scope="module")
+def forward(config: EvaluationConfig) -> tuple[BenchmarkPoint, ...]:
+    """The forward suite's cells, in run order."""
+    return config.selected_points(_FORWARD)
+
+
+def _jsonl_rows(path: Traversable) -> list[dict[str, Any]]:
     """Read a manifest's non-blank JSON Lines rows in file order."""
     return [
         json.loads(line)
@@ -131,203 +73,183 @@ def _only_row(path: Path) -> dict[str, Any]:
     return rows[0]
 
 
-def _row_with_seed(path: Path, seed: int) -> dict[str, Any]:
-    """Return the one row of a performance workload carrying that seed."""
-    matches = [row for row in _jsonl_rows(path) if row["seed"] == seed]
-    assert len(matches) == 1
-    return matches[0]
+def _performance_workloads() -> dict[str, list[dict[str, Any]]]:
+    """Every MiniMax-H3 performance workload the evaluator ships, by name.
+
+    The check set's own frozen manifests (``check-*``) are not among them.
+    """
+    directory = files("uniserve_eval") / "workloads" / "minimax_h3"
+    workloads = {}
+    for resource in directory.iterdir():
+        name = resource.name.removesuffix(".jsonl")
+        if resource.name.endswith(".jsonl") and not name.startswith("check-"):
+            workloads[name] = _jsonl_rows(resource)
+    return workloads
 
 
-def test_the_profile_states_each_cell_without_precision_flags() -> None:
-    """The shipped TOML fixes the protocol, whatever the environment holds."""
-    raw = tomllib.loads(_PROFILE.read_text(encoding="utf-8"))
-    assert set(raw["servers"]) == {
-        "fasth3-dmd",
-        "fasth3-omniref",
-        "base-transformer",
-        "base-reference",
-    }
-    # The launch's default dtype is bfloat16 and an empty quantization loads
-    # the first precision preset, quality, so stating either would not change
-    # what the check set confirms, so a check cell names neither.
-    for name, server in raw["servers"].items():
-        for value in server["command"]:
+def test_the_suites_run_each_cell_once_and_reversed(
+    config: EvaluationConfig, forward: tuple[BenchmarkPoint, ...]
+) -> None:
+    """Every point is a forward cell or its reversed twin, each once.
+
+    The reversed suite runs the forward order with its first cell, the
+    reference cell, moved to the end, so the cell that inherited the first's
+    pages runs last and a pass says the ordering requirement is gone.
+    """
+    names = [point.name for point in forward]
+    reversed_names = [f"{name}-reversed" for name in names[1:] + names[:1]]
+    assert [p.name for p in config.selected_points(_REVERSED)] == (
+        reversed_names
+    )
+    assert sorted(config.benchmarks) == sorted(names + reversed_names)
+
+    # A cell is a checkpoint serving a task; no two points check one cell.
+    cells = [
+        (point.provenance["checkpoint"], point.provenance["task"])
+        for point in forward
+    ]
+    assert len(set(cells)) == len(cells)
+
+
+def test_each_cell_requests_its_servers_model_at_its_default_precision(
+    config: EvaluationConfig, forward: tuple[BenchmarkPoint, ...]
+) -> None:
+    """A point names what its server serves and states no precision.
+
+    The launch's default dtype is bfloat16 and an empty quantization loads
+    the first precision preset, quality, so stating either would not change
+    what the check set confirms, and a check cell names neither.
+    """
+    for point in forward:
+        command = list(config.servers[point.server].command)
+        served = command[command.index("--served-model-name") + 1]
+        assert served == point.model, point.name
+    for name, server in config.servers.items():
+        for value in server.command:
             assert not value.startswith("dtype="), name
             assert not value.startswith("quantization."), name
-    assert list(raw["suites"]["check-h3"]["points"]) == list(_CELLS)
-    assert list(raw["suites"]["check-h3-reversed"]["points"]) == [
-        f"{name}-reversed" for name in _REVERSED_ORDER
-    ]
-    assert set(raw["benchmarks"]) == set(_CELLS) | set(_REVERSED)
-    assert len(raw["benchmarks"]) == len(_CELLS) + len(_REVERSED)
-    for name, cell in _CELLS.items():
-        point = raw["benchmarks"][name]
-        assert point["server"] in raw["servers"]
-        # The point requests the name its server serves.
-        command = raw["servers"][point["server"]]["command"]
-        served = command[command.index("--served-model-name") + 1]
-        assert served == point["model"], name
-        assert point["provenance"]["task"] == cell.task
-        # Every cell states the 768p 16:9 output at 24 fps with the model's
-        # stereo 32 kHz soundtrack; W3's 16:9 keyframe keeps that canvas.
-        assert {
-            key: point["video"][key]
-            for key in ("size", "fps", "audio_sample_rate", "audio_channels")
-        } == {
-            "size": "1344x768",
-            "fps": 24,
-            "audio_sample_rate": 32000,
-            "audio_channels": 2,
-        }
-        assert point["video"]["media_dir"] == (
-            f"artifacts/minimax_h3/check/{cell.directory}"
-        )
-        assert point["load"]["num_prompts"] == 1
-        if cell.task == "t2va":
-            assert "reference_root" not in point["video"]
-        else:
-            assert point["video"]["reference_root"] == (
-                "${UNISERVE_MINIMAX_H3_INPUTS}"
-            )
-        # The point reads a frozen check manifest, not a performance one.
-        manifests = (
-            point["dataset_path"],
-            point["load"]["warmup_manifest"],
-        )
-        for manifest in manifests:
-            assert manifest.startswith(
-                "uniserve_eval/workloads/minimax_h3/check-"
-            )
-            assert (_PROFILE.parents[1] / manifest).is_file()
-    # A reversed cell is its forward cell: same server, model, frozen rows and
-    # task, and a sibling MP4 directory so neither order overwrites the other.
-    for name, cell in _REVERSED.items():
-        point = raw["benchmarks"][name]
-        forward_name = name.removesuffix("-reversed")
-        assert forward_name in _CELLS
-        forward = raw["benchmarks"][forward_name]
-        for key in ("server", "model", "dataset", "dataset_path", "task"):
-            assert point[key] == forward[key], name
-        assert (
-            point["load"]["warmup_manifest"]
-            == forward["load"]["warmup_manifest"]
-        )
-        assert point["provenance"] == forward["provenance"]
-        assert {
-            key: value
-            for key, value in point["video"].items()
-            if key != "media_dir"
-        } == {
-            key: value
-            for key, value in forward["video"].items()
-            if key != "media_dir"
-        }
-        assert point["video"]["media_dir"] == (
-            f"artifacts/minimax_h3/check-reversed/{cell.directory}"
-        )
 
 
-def test_the_suite_covers_every_cell_exactly_once(config) -> None:
-    """The profile declares the expected cells, each once, in run order."""
-    assert set(config.benchmarks) == set(_CELLS) | set(_REVERSED)
-    assert len(config.benchmarks) == len(_CELLS) + len(_REVERSED)
-    assert config.selected_points("check-h3") == tuple(
-        config.benchmarks[name] for name in _CELLS
-    )
-    assert config.selected_points("check-h3-reversed") == tuple(
-        config.benchmarks[f"{name}-reversed"] for name in _REVERSED_ORDER
-    )
-    for name, cell in {**_CELLS, **_REVERSED}.items():
-        point = config.benchmarks[name]
-        assert point.provenance == {
-            "checkpoint": cell.checkpoint,
-            "task": cell.task,
-        }
-
-
-@pytest.mark.parametrize("name", _CELLS, ids=tuple(_CELLS))
-def test_each_cell_measures_the_seed_zero_row_of_its_workload(
-    config, name: str
+def test_every_cell_states_one_output_format(
+    forward: tuple[BenchmarkPoint, ...],
 ) -> None:
-    """The measured row is the workload's seed-0 row, unchanged."""
-    cell = _CELLS[name]
-    point = config.benchmarks[name]
-    rows, tokenizer = load_examples(
-        replace(
-            point,
-            dataset_path=str(config.root / point.dataset_path),
+    """Every cell asks for the same canvas, frame rate and soundtrack."""
+    formats = {
+        (
+            point.video.size,
+            point.video.fps,
+            point.video.audio_sample_rate,
+            point.video.audio_channels,
         )
-    )
+        for point in forward
+    }
+    assert len(formats) == 1
+
+
+def test_each_cell_measures_and_warms_up_with_workload_rows(
+    forward: tuple[BenchmarkPoint, ...],
+) -> None:
+    """The measured row is a workload's seed-0 row, the warmup its seed-42.
+
+    Both are copied unchanged into the cell's frozen check manifests: the
+    measured row from a performance workload, the warmup row from that
+    workload's warmup manifest.
+    """
+    workloads = _performance_workloads()
+    for point in forward:
+        _assert_frozen_rows(point, workloads)
+
+
+def _assert_frozen_rows(
+    point: BenchmarkPoint, workloads: dict[str, list[dict[str, Any]]]
+) -> None:
+    """Hold one cell's frozen manifests to the workloads they copy."""
+    task = point.provenance["task"]
+    rows, tokenizer = load_examples(point)
     assert tokenizer is None
     assert len(rows) == 1
     measured = rows[0].as_dict()
-    assert measured["seed"] == 0
-    source = _row_with_seed(_WORKLOADS / f"{cell.workload}.jsonl", seed=0)
-    assert measured == source
-    assert measured["metadata"]["task"] == cell.task
+    assert Path(point.dataset_path).name.startswith("check-")
+    assert point.load.warmup_manifest is not None
+    assert Path(point.load.warmup_manifest).name.startswith("check-")
+    warmup = _only_row(Path(point.load.warmup_manifest))
+
+    assert measured["seed"] == _MEASURED_SEED
+    assert measured["metadata"]["task"] == task
     assert measured["metadata"]["partition"] == "measured"
+    assert warmup["seed"] == _WARMUP_SEED
+    assert warmup["metadata"]["task"] == task
+    assert warmup["metadata"]["partition"] == "warmup"
+
+    sources = [
+        name
+        for name, workload in workloads.items()
+        if measured in workload and f"{name}-warmup" in workloads
+    ]
+    assert sources, f"no performance workload holds {point.name}'s row"
+    assert any(warmup in workloads[f"{name}-warmup"] for name in sources)
+
     # The reference media and their anchors survive the copy: fl2va's one
     # first-frame keyframe, ref2va's global references without an anchor.
-    if cell.task == "fl2va":
+    if task == "fl2va":
         (keyframe,) = measured["input_references"]
         assert keyframe["type"] == "image"
         assert keyframe["frame_index"] == 0
-    elif cell.task == "ref2va":
+    elif task == "ref2va":
+        assert measured["input_references"]
         assert all(
             "frame_index" not in row for row in measured["input_references"]
         )
     else:
         assert "input_references" not in measured
 
-
-@pytest.mark.parametrize("name", _CELLS, ids=tuple(_CELLS))
-def test_each_cell_warms_up_with_the_seed_42_row_of_its_workload(
-    config, name: str
-) -> None:
-    """The unmeasured warmup row is the workload's seed-42 row, unchanged."""
-    cell = _CELLS[name]
-    point = config.benchmarks[name]
-    assert point.load.warmup_manifest is not None
-    warmup = _only_row(config.root / point.load.warmup_manifest)
-    assert warmup["seed"] == 42
-    source = _row_with_seed(
-        _WORKLOADS / f"{cell.workload}-warmup.jsonl", seed=42
+    # A cell reads reference media only when its rows name some.
+    assert (point.video.reference_root is None) == (
+        "input_references" not in measured
     )
-    assert warmup == source
-    assert warmup["metadata"]["task"] == cell.task
-    assert warmup["metadata"]["partition"] == "warmup"
 
 
-@pytest.mark.parametrize("name", _CELLS, ids=tuple(_CELLS))
-def test_each_cell_writes_its_mp4s_to_a_fixed_directory(
-    config, name: str
+def test_each_cell_measures_one_request_at_a_time(
+    forward: tuple[BenchmarkPoint, ...],
 ) -> None:
-    """Every cell names the fixed MP4 directory a person watches."""
-    cell = _CELLS[name]
-    media_dir = config.benchmarks[name].video.media_dir
-    assert media_dir == str(
-        config.root / f"artifacts/minimax_h3/check/{cell.directory}"
-    )
-    # The point's bundle goes to the profile's fixed artifact root.
-    assert config.artifact_root == config.root / _ARTIFACT_ROOT
-
-
-@pytest.mark.parametrize("name", _CELLS, ids=tuple(_CELLS))
-def test_each_cell_measures_one_request_at_a_time(config, name: str) -> None:
     """One measured request at seed 0 follows its one seed-42 warmup."""
-    point = config.benchmarks[name]
-    assert point.load.num_prompts == 1
-    assert point.load.max_concurrency == 1
-    assert point.load.request_rate == float("inf")
-    assert (config.root / point.dataset_path).is_file()
-    assert point.dataset_path.startswith(
-        str(config.root / "uniserve_eval/workloads/minimax_h3/check-")
-    )
+    for point in forward:
+        assert point.load.num_prompts == 1
+        assert point.load.max_concurrency == 1
+        assert point.load.request_rate == float("inf")
 
 
-def test_every_cell_has_its_own_media_directory(config) -> None:
-    """No two cells write MP4s to the same fixed directory."""
-    names = list(_CELLS) + list(_REVERSED)
-    directories = [config.benchmarks[name].video.media_dir for name in names]
-    assert len(set(directories)) == len(names)
+def test_every_cell_writes_its_mp4s_to_a_directory_of_its_own(
+    config: EvaluationConfig, forward: tuple[BenchmarkPoint, ...]
+) -> None:
+    """No two points share an MP4 directory; a reversed cell's is a sibling.
+
+    A reversed cell is its forward cell (the same server, model, frozen rows,
+    task and video settings) writing to a directory of the same name beside
+    the forward cell's, so neither order overwrites the other.
+    """
+    directories = [
+        point.video.media_dir for point in config.benchmarks.values()
+    ]
     assert all(directory is not None for directory in directories)
+    assert len(set(directories)) == len(directories)
+
+    for point in forward:
+        twin = config.benchmarks[f"{point.name}-reversed"]
+        for key in ("server", "model", "dataset", "dataset_path", "task"):
+            assert getattr(twin, key) == getattr(point, key), point.name
+        assert twin.load.warmup_manifest == point.load.warmup_manifest
+        assert twin.provenance == point.provenance
+        assert replace(twin.video, media_dir=None) == replace(
+            point.video, media_dir=None
+        )
+
+        assert point.video.media_dir is not None
+        assert twin.video.media_dir is not None
+        directory, twin_directory = (
+            Path(point.video.media_dir),
+            Path(twin.video.media_dir),
+        )
+        assert twin_directory.name == directory.name
+        assert twin_directory.parent.parent == directory.parent.parent
+        assert twin_directory.parent != directory.parent

@@ -6,6 +6,7 @@ import argparse
 import asyncio
 import json
 import sys
+from collections.abc import Sequence
 from pathlib import Path
 
 from .artifacts import supersede
@@ -422,9 +423,17 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def main() -> None:
-    """Parse command-line arguments and dispatch the selected command."""
-    args = build_parser().parse_args()
+def main(argv: Sequence[str] | None = None) -> None:
+    """Parse command-line arguments and dispatch the selected command.
+
+    Args:
+        argv: The arguments after the program name; the process's own
+            (`sys.argv[1:]`) when `None`, as the console script calls it.
+
+    Raises:
+        SystemExit: With the command's exit status when it is not 0.
+    """
+    args = build_parser().parse_args(argv)
     args.function(args)
 
 

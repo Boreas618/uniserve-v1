@@ -13,6 +13,8 @@ version = "2.0.0"
 description = "The pytest plugin and helpers of UniServe's Python tests"
 requires-python = ">=3.12"
 dependencies = [
+    # The stand-in server the evaluator's tests start (`standins.server`).
+    "aiohttp",
     "httpx",
     "huggingface-hub",
     "nvidia-ml-py",
@@ -20,6 +22,8 @@ dependencies = [
     "prometheus-client",
     "pytest>=8.1",
     "tomli-w",
+    # The tokenizer of a checkpoint a case serves, by its repository.
+    "transformers",
     # The evaluator's reader of streamed answers, which the cases share.
     "uniserve-eval",
 ]

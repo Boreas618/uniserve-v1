@@ -1,34 +1,35 @@
 from __future__ import annotations
 
 import json
-import subprocess
-import sys
 import tomllib
+from collections.abc import Callable, Sequence
+from importlib.resources import files
 from pathlib import Path
 
 import pytest
 
-import uniserve_eval
 from uniserve_eval.config import load_config
 from uniserve_eval.datasets import load_examples
 
 pytestmark = pytest.mark.unit
 
 
-# Profiles shipped beside the evaluator; each runs from the repository root.
+# The profiles the evaluator ships as package data: every TOML file of the
+# package but the distribution's own metadata, which its directory also
+# holds.
 _SHIPPED = sorted(
-    path
-    for path in Path(uniserve_eval.__file__).parent.glob("*.toml")
-    if path.name != "pyproject.toml"
+    resource.name
+    for resource in files("uniserve_eval").iterdir()
+    if resource.name.endswith(".toml") and resource.name != "pyproject.toml"
 )
 
 
-@pytest.mark.parametrize("profile", _SHIPPED, ids=lambda path: path.name)
+@pytest.mark.parametrize("profile", _SHIPPED)
 def test_shipped_profiles_name_deployments_and_workloads_that_exist(
-    profile: Path,
+    shipped_profile: Callable[[str], Path], profile: str
 ) -> None:
     """Every deployment and request manifest a shipped point uses exists."""
-    config = load_config(profile)
+    config = load_config(shipped_profile(profile))
 
     for name, server in config.servers.items():
         # A UniServe server's deployment layout is a configuration file
@@ -138,6 +139,8 @@ output_throughput = "higher"
 
 def test_a_profile_resolves_its_paths_against_the_root_it_states(
     tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    evaluate: Callable[[Sequence[str]], int],
 ) -> None:
     """A profile means the same thing wherever the driver is installed.
 
@@ -153,7 +156,7 @@ root = ".."
 
 [servers.local]
 port = 8000
-command = ["target/release/uniserve", "serve", "model"]
+command = ["bin/server", "serve", "model"]
 
 [benchmarks.point]
 server = "local"
@@ -172,24 +175,11 @@ output_throughput = "higher"
         encoding="utf-8",
     )
 
-    result = subprocess.run(
-        [
-            sys.executable,
-            "-m",
-            "uniserve_eval.cli",
-            "--config",
-            str(config_path),
-            "plan",
-            "point",
-        ],
-        check=True,
-        text=True,
-        stdout=subprocess.PIPE,
-    )
-    resolved = json.loads(result.stdout)[0]
+    assert evaluate(["--config", str(config_path), "plan", "point"]) == 0
+    resolved = json.loads(capsys.readouterr().out)[0]
 
     (command,) = resolved["server_commands"]
-    assert command[0] == str(tree / "target/release/uniserve")
+    assert command[0] == str(tree / "bin/server")
     assert resolved["server_working_directory"] == str(tree)
 
 

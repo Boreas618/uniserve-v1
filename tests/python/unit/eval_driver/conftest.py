@@ -3,11 +3,81 @@
 from __future__ import annotations
 
 import io
+import os
+import select
+from collections.abc import Callable, Iterator, Sequence
+from contextlib import ExitStack
 from fractions import Fraction
+from importlib.resources import as_file, files
+from pathlib import Path
 
 import av
 import numpy as np
 import pytest
+
+from uniserve_eval.cli import main
+
+
+@pytest.fixture(scope="session")
+def shipped_profile() -> Iterator[Callable[[str], Path]]:
+    """Locate a profile the evaluator ships, by its file name.
+
+    The profiles are package data of ``uniserve_eval``, read through
+    ``importlib.resources``. The returned function gives each as a file for
+    the rest of the session, since a profile states its ``root`` relative to
+    its own file.
+    """
+    with ExitStack() as on_disk:
+
+        def locate(name: str) -> Path:
+            resource = files("uniserve_eval") / name
+            return on_disk.enter_context(as_file(resource))
+
+        yield locate
+
+
+@pytest.fixture(scope="session")
+def evaluate() -> Callable[[Sequence[str]], int]:
+    """Run one ``uniserve-eval`` command line in this process.
+
+    The returned function takes the arguments after the program name and
+    returns the command's exit status, as the console script would exit with
+    it: 0 when the command returns, else the status of its ``SystemExit``.
+    """
+
+    def run(argv: Sequence[str]) -> int:
+        try:
+            main(argv)
+        except SystemExit as exited:
+            return int(exited.code or 0)
+        return 0
+
+    return run
+
+
+@pytest.fixture(scope="session")
+def wait_exit() -> Callable[[int, float], bool]:
+    """Wait for a process to exit, by its process descriptor.
+
+    The returned function takes a process id and a timeout in seconds and
+    returns whether the process has exited by then. Any process can be
+    waited on, not only a child of the test: its descriptor
+    (``pidfd_open``) becomes readable when it exits, and a process that no
+    longer exists at all has exited.
+    """
+
+    def wait(pid: int, timeout_s: float) -> bool:
+        try:
+            descriptor = os.pidfd_open(pid)
+        except ProcessLookupError:
+            return True
+        try:
+            readable, _, _ = select.select([descriptor], [], [], timeout_s)
+        finally:
+            os.close(descriptor)
+        return bool(readable)
+
+    return wait
 
 
 @pytest.fixture(scope="session")

@@ -8,15 +8,14 @@ rule, accuracy over every measured row, and the three cells' settings.
 from __future__ import annotations
 
 import json
-from argparse import Namespace
+from collections.abc import Callable, Sequence
+from dataclasses import dataclass
 from decimal import Decimal
 from pathlib import Path
 
 import pytest
 
-import uniserve_eval
-from uniserve_eval import cli
-from uniserve_eval.config import load_config
+from uniserve_eval.config import EvaluationConfig, load_config
 from uniserve_eval.datasets import load_examples
 from uniserve_eval.datasets.gsm8k import (
     GSM8K_FILENAME,
@@ -43,32 +42,52 @@ from uniserve_eval.types import (
 
 pytestmark = pytest.mark.unit
 
-# The profile the confirmation runs, beside the package.
-PROFILE = Path(uniserve_eval.__file__).parent / "qwen3_moe.toml"
-
-# The three confirmation cells, in the profile's suite order.
-CELLS = (
-    "qwen3-moe-gsm8k-bf16",
-    "qwen3-moe-gsm8k-nvfp4",
-    "qwen3-moe-gsm8k-bf16-fp8-kv",
-)
+# The profile the confirmation runs, which the evaluator ships, and the
+# suite of its cells: BF16, NVFP4, and BF16 with an FP8 KV cache, in that
+# order.
+PROFILE = "qwen3_moe.toml"
+SUITE = "qwen3-moe-gsm8k"
 
 # The split's row count: the denominator of every reported accuracy.
 SPLIT_ROWS = 1319
 
 
-@pytest.fixture(autouse=True)
-def confirmation_environment(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Set the binary and checkpoint variables a confirmation run documents."""
-    monkeypatch.setenv(
-        "UNISERVE_QWEN3_MOE_MODEL", "/workspace/models/Qwen3-30B-A3B"
+@dataclass(frozen=True)
+class _Host:
+    """The executable and checkpoints a confirmation host names."""
+
+    executable: Path
+    model: Path
+    nvfp4_model: Path
+
+
+@pytest.fixture
+def host(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> _Host:
+    """Name the executable and checkpoints as a confirmation run does.
+
+    The profile reads them from the variables its header documents; the
+    FP8 cell's attention provider is the profile's own unless a host
+    overrides it, so no override is set.
+    """
+    host = _Host(
+        executable=tmp_path / "bin" / "uniserve",
+        model=tmp_path / "Qwen3-30B-A3B",
+        nvfp4_model=tmp_path / "Qwen3-30B-A3B-NVFP4",
     )
-    monkeypatch.setenv(
-        "UNISERVE_QWEN3_MOE_NVFP4_MODEL",
-        "/workspace/models/Qwen3-30B-A3B-NVFP4",
-    )
-    monkeypatch.setenv("UNISERVE_EXECUTABLE", "/srv/uniserve/bin/uniserve")
+    monkeypatch.setenv("UNISERVE_EXECUTABLE", str(host.executable))
+    monkeypatch.setenv("UNISERVE_QWEN3_MOE_MODEL", str(host.model))
+    monkeypatch.setenv("UNISERVE_QWEN3_MOE_NVFP4_MODEL", str(host.nvfp4_model))
     monkeypatch.delenv("UNISERVE_QWEN3_FP8_ATTENTION_BACKEND", raising=False)
+    monkeypatch.delenv("UNISERVE_GSM8K_DATASET", raising=False)
+    return host
+
+
+@pytest.fixture
+def confirmation(
+    host: _Host, shipped_profile: Callable[[str], Path]
+) -> EvaluationConfig:
+    """The confirmation profile as the host's variables resolve it."""
+    return load_config(shipped_profile(PROFILE))
 
 
 def _point(
@@ -475,17 +494,21 @@ def test_a_gold_answer_that_does_not_parse_fails_validation() -> None:
     assert task.validate([record]).checks["gold_answers"] is False
 
 
-def _configured_cell(name: str) -> tuple[BenchmarkPoint, list[str]]:
-    """Return one cell's point and its server command."""
-    config = load_config(PROFILE)
-    point = config.benchmarks[name]
-    return point, list(config.servers[point.server].command)
+def _commands(config: EvaluationConfig) -> list[list[str]]:
+    """Return each cell's server command, in the suite's order."""
+    return [
+        list(config.servers[point.server].command)
+        for point in config.selected_points(SUITE)
+    ]
 
 
-def test_each_cell_states_the_fixed_sample_set_and_sampling() -> None:
+def test_each_cell_states_the_fixed_sample_set_and_sampling(
+    confirmation: EvaluationConfig,
+) -> None:
     """All three cells run the same rows with the same sampling settings."""
-    for name in CELLS:
-        point, _ = _configured_cell(name)
+    cells = confirmation.selected_points(SUITE)
+    assert len(cells) == 3
+    for point in cells:
         assert point.task is TaskName.GSM8K
         assert point.dataset == "gsm8k"
         assert point.load.num_prompts == SPLIT_ROWS
@@ -494,11 +517,13 @@ def test_each_cell_states_the_fixed_sample_set_and_sampling() -> None:
             {"path": "accuracy", "direction": "higher"}
         ]
 
-    provenances = {str(_configured_cell(name)[0].provenance) for name in CELLS}
-    assert len(provenances) == len(CELLS)
+    provenances = {str(point.provenance) for point in cells}
+    assert len(provenances) == len(cells)
 
 
-def test_only_the_checkpoint_and_kv_cache_dtype_differ_between_cells() -> None:
+def test_only_the_checkpoint_and_kv_cache_dtype_differ_between_cells(
+    confirmation: EvaluationConfig, host: _Host
+) -> None:
     """One change separates the cells, so a comparison isolates it."""
 
     def normalized(command: list[str]) -> list[str]:
@@ -520,7 +545,7 @@ def test_only_the_checkpoint_and_kv_cache_dtype_differ_between_cells() -> None:
             for value in values
         ]
 
-    commands = [_configured_cell(name)[1] for name in CELLS]
+    commands = _commands(confirmation)
     assert normalized(commands[0]) == normalized(commands[1])
     assert normalized(commands[0]) == normalized(commands[2])
 
@@ -528,9 +553,9 @@ def test_only_the_checkpoint_and_kv_cache_dtype_differ_between_cells() -> None:
         """Return the checkpoint path a server command serves."""
         return command[command.index("--model-dir") + 1]
 
-    assert model(commands[0]) == "/workspace/models/Qwen3-30B-A3B"
-    assert model(commands[2]) == "/workspace/models/Qwen3-30B-A3B"
-    assert model(commands[1]) == "/workspace/models/Qwen3-30B-A3B-NVFP4"
+    assert model(commands[0]) == str(host.model)
+    assert model(commands[2]) == str(host.model)
+    assert model(commands[1]) == str(host.nvfp4_model)
     assert 'kv_cache_config.dtype="float8_e4m3fn"' in commands[2]
     # Today's `auto` selection refuses per-block FP8 pages, so the FP8 cell
     # names the one provider that reads them; the other cells leave the
@@ -549,31 +574,38 @@ def test_only_the_checkpoint_and_kv_cache_dtype_differ_between_cells() -> None:
 
 
 def test_a_host_may_point_the_cells_at_a_local_split(
+    host: _Host,
+    shipped_profile: Callable[[str], Path],
+    tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """An unset path downloads; a set one names the same split locally."""
-    for name in CELLS:
-        assert _configured_cell(name)[0].dataset_path == ""
+    profile = shipped_profile(PROFILE)
+    for point in load_config(profile).selected_points(SUITE):
+        assert point.dataset_path == ""
 
-    monkeypatch.setenv("UNISERVE_GSM8K_DATASET", "/data/gsm8k/test.parquet")
+    split = tmp_path / "gsm8k" / "test.parquet"
+    monkeypatch.setenv("UNISERVE_GSM8K_DATASET", str(split))
 
-    for name in CELLS:
-        assert (
-            _configured_cell(name)[0].dataset_path == "/data/gsm8k/test.parquet"
-        )
+    for point in load_config(profile).selected_points(SUITE):
+        assert point.dataset_path == str(split)
 
 
 def test_the_profile_renders_every_point(
+    host: _Host,
+    shipped_profile: Callable[[str], Path],
     capsys: pytest.CaptureFixture[str],
+    evaluate: Callable[[Sequence[str]], int],
 ) -> None:
     """`plan` resolves each cell's server command and workload."""
-    cli.plan(
-        Namespace(config=PROFILE, selection="qwen3-moe-gsm8k", executable=None)
-    )
+    profile = shipped_profile(PROFILE)
+    assert evaluate(["--config", str(profile), "plan", SUITE]) == 0
     rendered = capsys.readouterr().out
 
     points = json.loads(rendered)
-    assert [point["benchmark"] for point in points] == list(CELLS)
+    assert [point["benchmark"] for point in points] == [
+        point.name for point in load_config(profile).selected_points(SUITE)
+    ]
     for point in points:
         assert point["task"] == "gsm8k"
         assert point["num_prompts"] == SPLIT_ROWS

@@ -1438,6 +1438,7 @@ name = "uniserve-testing"
 version = "2.0.0"
 source = { editable = "tests/support" }
 dependencies = [
+    { name = "aiohttp" },
     { name = "httpx" },
     { name = "huggingface-hub" },
     { name = "nvidia-ml-py" },
@@ -1445,6 +1446,7 @@ dependencies = [
     { name = "prometheus-client" },
     { name = "pytest" },
     { name = "tomli-w" },
+    { name = "transformers" },
     { name = "uniserve-eval" },
 ]
 
@@ -1457,6 +1459,7 @@ kernels = [
 
 [package.metadata]
 requires-dist = [
+    { name = "aiohttp" },
     { name = "httpx" },
     { name = "huggingface-hub" },
     { name = "numpy", marker = "extra == 'kernels'" },
@@ -1466,6 +1469,7 @@ requires-dist = [
     { name = "pytest", specifier = ">=8.1" },
     { name = "tomli-w" },
     { name = "torch", marker = "extra == 'kernels'" },
+    { name = "transformers" },
     { name = "uniserve-eval", editable = "uniserve_eval" },
     { name = "uniserve-kernels", marker = "extra == 'kernels'", editable = "crates/ops/python" },
 ]

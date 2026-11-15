@@ -11,14 +11,13 @@ from __future__ import annotations
 
 import json
 import math
-import sys
+from collections.abc import Callable, Sequence
 from pathlib import Path
 from statistics import NormalDist
 
 import pytest
 
 from uniserve_eval.accuracy import Proportion, difference_interval
-from uniserve_eval.cli import main
 from uniserve_eval.pipeline.compare import compare_runs, read_bundle
 
 pytestmark = pytest.mark.unit
@@ -393,21 +392,9 @@ def test_read_bundle_reports_missing_records(tmp_path: Path) -> None:
         read_bundle(tmp_path / "absent")
 
 
-def _run_compare(argv: list[str]) -> int:
-    """Invoke the command-line entry point and return its exit status."""
-    previous = sys.argv
-    sys.argv = ["uniserve-eval", *argv]
-    try:
-        try:
-            main()
-        except SystemExit as exit_info:
-            return int(exit_info.code or 0)
-    finally:
-        sys.argv = previous
-    return 0
-
-
-def test_command_exit_status_reports_the_verdict(tmp_path: Path) -> None:
+def test_command_exit_status_reports_the_verdict(
+    tmp_path: Path, evaluate: Callable[[Sequence[str]], int]
+) -> None:
     """Accepted exits 0, rejected 2 and an unusable bundle 1."""
     reference = _BundleWriter(tmp_path / "reference").write(correct=1186)
     accepted = _BundleWriter(tmp_path / "accepted").write(correct=1190)
@@ -419,9 +406,7 @@ def test_command_exit_status_reports_the_verdict(tmp_path: Path) -> None:
         failed_count=1,
     )
 
-    assert _run_compare(["compare", str(reference), str(accepted)]) == 0
-    assert _run_compare(["compare", str(reference), str(rejected)]) == 2
-    assert _run_compare(["compare", str(reference), str(failed)]) == 2
-    assert (
-        _run_compare(["compare", str(reference), str(tmp_path / "absent")]) == 1
-    )
+    assert evaluate(["compare", str(reference), str(accepted)]) == 0
+    assert evaluate(["compare", str(reference), str(rejected)]) == 2
+    assert evaluate(["compare", str(reference), str(failed)]) == 2
+    assert evaluate(["compare", str(reference), str(tmp_path / "absent")]) == 1

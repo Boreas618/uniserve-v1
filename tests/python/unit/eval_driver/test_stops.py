@@ -17,88 +17,34 @@ thing the protocol forbids.
 from __future__ import annotations
 
 import json
-import socket
 import sys
+from collections.abc import Callable, Sequence
 from pathlib import Path
 
 import pytest
-
-from uniserve_eval.cli import build_parser
+from prometheus_client.parser import text_string_to_metric_families
 
 pytestmark = pytest.mark.unit
 
 _COUNTER = "uniserve:scheduler_calls_without_blocks_total"
 
-# The stand-in; its argument is the port it listens on.
-_SERVER = r"""
-import asyncio, json, sys
 
-from aiohttp import web
-
-port = int(sys.argv[1])
-scrapes = 0
-
-
-async def chat(request):
-    body = await request.json()
-    count = body["max_completion_tokens"]
-    response = web.StreamResponse(headers={"content-type": "text/event-stream"})
-    await response.prepare(request)
-    for position in range(count):
-        await asyncio.sleep(0.05)
-        choice = {"index": 0, "delta": {"content": f" t{position}"}}
-        await response.write(
-            b"data: " + json.dumps({"choices": [choice]}).encode() + b"\n\n"
-        )
-    final = {
-        "choices": [{"index": 0, "delta": {}, "finish_reason": "length"}],
-        "usage": {"prompt_tokens": 2, "completion_tokens": count},
-    }
-    await response.write(
-        b"data: " + json.dumps(final).encode() + b"\n\ndata: [DONE]\n\n"
-    )
-    await response.write_eof()
-    return response
-
-
-async def metrics(request):
-    global scrapes
-    scrapes += 1
-    return web.Response(text=f"stand_in_scrapes_total {scrapes}\n")
-
-
-async def main():
-    api = web.Application()
-    api.router.add_post("/v1/chat/completions", chat)
-    api.router.add_get("/metrics", metrics)
-    runner = web.AppRunner(api)
-    await runner.setup()
-    await web.TCPSite(runner, "127.0.0.1", port).start()
-    await asyncio.Event().wait()
-
-
-asyncio.run(main())
-"""
-
-
-def _command(argv: list[str]) -> int:
-    """Run one evaluator command and return its exit status."""
-    args = build_parser().parse_args(argv)
-    try:
-        args.function(args)
-    except SystemExit as exit_info:
-        return int(exit_info.code or 0)
-    return 0
+def _sample(exposition: str, name: str) -> float:
+    """The value of the unlabelled sample ``name`` in an exposition."""
+    for family in text_string_to_metric_families(exposition):
+        for sample in family.samples:
+            if sample.name == name and not sample.labels:
+                return sample.value
+    raise AssertionError(f"the exposition holds no {name}: {exposition!r}")
 
 
 def test_a_timeline_load_scrapes_its_server_every_second(
     tmp_path: Path,
+    unused_tcp_port: int,
+    evaluate: Callable[[Sequence[str]], int],
 ) -> None:
     """The bundle holds one scrape per second from the load's start."""
-    with socket.socket() as probe:
-        probe.bind(("127.0.0.1", 0))
-        port = probe.getsockname()[1]
-    (tmp_path / "server.py").write_text(_SERVER, encoding="utf-8")
+    port = unused_tcp_port
     (tmp_path / "rows.jsonl").write_text(
         "".join(
             json.dumps({"id": f"row-{i}", "prompt": f"p {i}", "output_len": 10})
@@ -107,12 +53,21 @@ def test_a_timeline_load_scrapes_its_server_every_second(
         ),
         encoding="utf-8",
     )
+    # The profile states the port the stand-in listens on, since the
+    # evaluator probes the address its profile names.
+    command = [
+        sys.executable,
+        "-m",
+        "uniserve_testing.standins.server",
+        "--port",
+        str(port),
+    ]
     profile = tmp_path / "profile.toml"
     profile.write_text(
         f"""
 [servers.stand-in]
 port = {port}
-command = [{json.dumps(sys.executable)}, "server.py", "{port}"]
+command = {json.dumps(command)}
 
 [benchmarks.scraped]
 server = "stand-in"
@@ -134,7 +89,7 @@ output_throughput = "higher"
     )
 
     argv = ["--config", str(profile), "run", "scraped"]
-    assert _command([*argv, "--output-root", str(tmp_path / "out")]) == 0
+    assert evaluate([*argv, "--output-root", str(tmp_path / "out")]) == 0
 
     bundle = tmp_path / "out" / "scraped"
     timeline = json.loads((bundle / "timeline.json").read_text())
@@ -162,9 +117,10 @@ output_throughput = "higher"
     assert scrapes[-1]["sent"] > last_end - 1.0
     assert len(scrapes) >= 3
 
-    # Each scrape keeps the exposition the server answered, in order.
+    # Each scrape keeps the exposition the server answered, in order: the
+    # stand-in's count of the scrapes it answered rises by each.
     counts = [
-        float(scrape["text"].split()[-1])
+        _sample(scrape["text"], "stand_in_scrapes_total")
         for scrape in sorted(scrapes, key=lambda item: item["received"])
     ]
     assert counts == sorted(counts) and len(set(counts)) == len(counts)
@@ -351,6 +307,7 @@ def bundles(tmp_path_factory: pytest.TempPathFactory) -> Path:
 def test_check_stop_holds_a_run_to_e2s_pass(
     bundles: Path,
     capsys: pytest.CaptureFixture[str],
+    evaluate: Callable[[Sequence[str]], int],
     kind: str,
     failing: set[str],
 ) -> None:
@@ -362,7 +319,7 @@ def test_check_stop_holds_a_run_to_e2s_pass(
     stop's end.
     """
     result = bundles / f"{kind}.md"
-    status = _command(
+    status = evaluate(
         [
             "check-stop",
             str(bundles / kind),
@@ -390,10 +347,12 @@ def test_check_stop_holds_a_run_to_e2s_pass(
 
 
 def test_check_stop_measures_the_window_as_the_client_saw_it(
-    bundles: Path, capsys: pytest.CaptureFixture[str]
+    bundles: Path,
+    capsys: pytest.CaptureFixture[str],
+    evaluate: Callable[[Sequence[str]], int],
 ) -> None:
     """The clean run's window: its steps, left-out streams and their wait."""
-    _command(
+    evaluate(
         [
             "check-stop",
             str(bundles / "clean"),

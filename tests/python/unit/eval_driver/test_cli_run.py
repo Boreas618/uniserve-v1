@@ -1,24 +1,24 @@
 """`uniserve-eval run` against a stand-in server, through the command line.
 
 The stand-in is a real process that the driver launches from the profile's
-command: an OpenAI-compatible chat server that streams one token per
-request with its usage. Like `uniserve serve`, it first starts a Storage
-Server in its runtime directory as a detached process of its own session,
-which outlives the server, and records that process's pid beside itself.
+command, :mod:`uniserve_testing.standins.server`: an OpenAI-compatible chat
+server that prints ``completion`` for each request it answers. Like
+`uniserve serve`, it first starts a Storage Server in its runtime directory as
+a detached process of its own session, which outlives the server, and records
+that process's pid beside itself.
 """
 
 from __future__ import annotations
 
 import asyncio
 import json
-import socket
 import sys
+from collections.abc import Callable, Sequence
 from pathlib import Path
 
 import pytest
 
 from uniserve_eval.artifacts import supersede
-from uniserve_eval.cli import main
 from uniserve_eval.config import load_config
 from uniserve_eval.pipeline.run import run_point
 from uniserve_eval.types import (
@@ -31,76 +31,24 @@ from uniserve_eval.types import (
 
 pytestmark = pytest.mark.unit
 
-# The stand-in server. Its argument is the port it listens on.
-_SERVER = """
-import json, os, subprocess, sys, time
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-services = os.path.join(os.environ["XDG_RUNTIME_DIR"], "uniserve")
-os.makedirs(services, exist_ok=True)
-storage_log = open(os.path.join(services, "storage-server.log"), "a")
-storage = subprocess.Popen(
-    [
-        sys.executable, "-c",
-        "import time; print('storage server up', flush=True); time.sleep(300)",
-        "storage-server", "serve",
-        "--socket", os.path.join(services, "storage-server.sock"),
-    ],
-    stdout=storage_log,
-    start_new_session=True,
-)
-with open("storage-server.pid", "a") as handle:
-    handle.write(f"{storage.pid} {services}\\n")
+def _profile(tmp_path: Path, port: int) -> Path:
+    """Write a one-point text profile served by the stand-in on ``port``.
 
-class Handler(BaseHTTPRequestHandler):
-    def do_GET(self):
-        body = json.dumps({"version": "stand-in"}).encode()
-        status = 200 if self.path == "/version" else 404
-        self.send_response(status)
-        self.send_header("content-type", "application/json")
-        self.send_header("content-length", str(len(body)))
-        self.end_headers()
-        self.wfile.write(body)
-
-    def do_POST(self):
-        self.rfile.read(int(self.headers.get("content-length", "0")))
-        print("completion", flush=True)
-        token = {"choices": [{"index": 0, "delta": {"content": "hi"}}]}
-        final = {
-            "choices": [{"index": 0, "delta": {}, "finish_reason": "length"}],
-            "usage": {"prompt_tokens": 1, "completion_tokens": 1},
-        }
-        body = b"".join(
-            b"data: " + json.dumps(event).encode() + b"\\n\\n"
-            for event in (token, final)
-        ) + b"data: [DONE]\\n\\n"
-        self.send_response(200)
-        self.send_header("content-type", "text/event-stream")
-        self.send_header("content-length", str(len(body)))
-        self.end_headers()
-        self.wfile.write(body)
-
-    def log_message(self, *args):
-        pass
-
-ThreadingHTTPServer(("127.0.0.1", int(sys.argv[1])), Handler).serve_forever()
-"""
-
-
-def _free_port() -> int:
-    with socket.socket() as probe:
-        probe.bind(("127.0.0.1", 0))
-        return probe.getsockname()[1]
-
-
-def _profile(tmp_path: Path, server: str = _SERVER) -> Path:
-    """Write a one-point text profile served by `server`."""
-    (tmp_path / "server.py").write_text(server, encoding="utf-8")
+    The profile states the port the stand-in listens on, since the evaluator
+    probes the address its profile names.
+    """
     (tmp_path / "rows.jsonl").write_text(
         json.dumps({"id": "row", "prompt": "hello", "output_len": 1}) + "\n",
         encoding="utf-8",
     )
-    port = _free_port()
+    command = [
+        sys.executable,
+        "-m",
+        "uniserve_testing.standins.server",
+        "--port",
+        str(port),
+    ]
     profile = tmp_path / "profile.toml"
     profile.write_text(
         f"""
@@ -108,7 +56,7 @@ artifact_root = "results"
 
 [servers.local]
 port = {port}
-command = [{json.dumps(sys.executable)}, "server.py", "{port}"]
+command = {json.dumps(command)}
 
 [benchmarks.point]
 server = "local"
@@ -130,30 +78,18 @@ output_throughput = "higher"
     return profile
 
 
-def _run(argv: list[str]) -> int:
-    """Invoke the command-line entry point and return its exit status."""
-    previous = sys.argv
-    sys.argv = ["uniserve-eval", *argv]
-    try:
-        try:
-            main()
-        except SystemExit as exit_info:
-            return int(exit_info.code or 0)
-    finally:
-        sys.argv = previous
-    return 0
-
-
 def test_a_rerun_keeps_the_earlier_run_outside_the_canonical_paths(
     tmp_path: Path,
+    unused_tcp_port: int,
+    evaluate: Callable[[Sequence[str]], int],
 ) -> None:
     """The second run owns the canonical bundle; the first is archived."""
-    profile = _profile(tmp_path)
+    profile = _profile(tmp_path, unused_tcp_port)
     results = tmp_path / "results"
 
-    assert _run(["--config", str(profile), "run", "point"]) == 0
+    assert evaluate(["--config", str(profile), "run", "point"]) == 0
     first = json.loads((results / "point" / "run.json").read_text())
-    assert _run(["--config", str(profile), "run", "point"]) == 0
+    assert evaluate(["--config", str(profile), "run", "point"]) == 0
     second = json.loads((results / "point" / "run.json").read_text())
 
     # The canonical bundle and server log are the second run's alone.
@@ -270,28 +206,25 @@ videos_per_second = "higher"
         load_config(profile)
 
 
-def _running(pid: int) -> bool:
-    """Report whether a process exists and has not exited."""
-    try:
-        stat = Path(f"/proc/{pid}/stat").read_text()
-    except FileNotFoundError:
-        return False
-    return stat.rpartition(")")[2].split()[0] != "Z"
-
-
 def test_a_point_ends_with_the_storage_server_it_started_stopped(
     tmp_path: Path,
+    unused_tcp_port: int,
+    evaluate: Callable[[Sequence[str]], int],
+    wait_exit: Callable[[int, float], bool],
 ) -> None:
     """No Storage Server, and so no storage, outlives its point."""
-    profile = _profile(tmp_path)
+    profile = _profile(tmp_path, unused_tcp_port)
     results = tmp_path / "results"
 
-    assert _run(["--config", str(profile), "run", "point"]) == 0
+    assert evaluate(["--config", str(profile), "run", "point"]) == 0
 
     pid, services = (tmp_path / "storage-server.pid").read_text().split()
-    assert not _running(int(pid))
-    # The service's log is kept with the deployment's.
+    # The point's end waits for its services, so the server has exited by
+    # the time the command returns.
+    assert wait_exit(int(pid), 0.0)
+    # The service's log, in which it announced its pid, is kept with the
+    # deployment's.
     kept = results / "server-logs" / "point.storage-server.log"
-    assert kept.read_text() == "storage server up\n"
+    assert kept.read_text() == f"{pid}\n"
     # The deployment's runtime directory is gone with its services.
     assert not Path(services).exists()

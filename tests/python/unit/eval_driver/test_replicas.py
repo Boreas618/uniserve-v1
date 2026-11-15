@@ -5,7 +5,6 @@ from __future__ import annotations
 import asyncio
 import json
 import threading
-import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import pytest
@@ -105,15 +104,18 @@ def test_replica_declarations_reject_ambiguous_deployments(
 
 def test_requests_go_to_the_replica_with_the_fewest_in_flight(tmp_path, media):
     """An idle deployment rotates; a busy replica is skipped for an idle one."""
+    # The slow request holds its replica until the last request has been
+    # answered, so the last arrives while that replica is busy.
+    last_answered = threading.Event()
 
-    def replica(delay_for_slow: float):
+    def replica():
         class Handler(BaseHTTPRequestHandler):
             def do_POST(self):  # noqa: N802
                 request = json.loads(
                     self.rfile.read(int(self.headers["content-length"]))
                 )
                 if request["prompt"] == "slow":
-                    time.sleep(delay_for_slow)
+                    last_answered.wait()
                 self.send_response(200)
                 self.send_header("content-type", "video/mp4")
                 # The fixture's shape, which the server reports generating.
@@ -123,6 +125,8 @@ def test_requests_go_to_the_replica_with_the_fewest_in_flight(tmp_path, media):
                 self.send_header("content-length", str(len(media)))
                 self.end_headers()
                 self.wfile.write(media)
+                if request["prompt"] == "fast-2":
+                    last_answered.set()
 
             def log_message(self, *_args):
                 pass
@@ -132,7 +136,7 @@ def test_requests_go_to_the_replica_with_the_fewest_in_flight(tmp_path, media):
         thread.start()
         return server, thread
 
-    servers = [replica(1.0), replica(0.0)]
+    servers = [replica(), replica()]
     urls = [f"http://127.0.0.1:{server.server_port}" for server, _ in servers]
     manifest = tmp_path / "rows.jsonl"
     manifest.write_text(

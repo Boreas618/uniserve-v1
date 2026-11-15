@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+from collections.abc import Callable
 from pathlib import Path
 
 import pytest
@@ -13,36 +14,41 @@ from uniserve_eval.profile.reader import STEP_BEGIN, STEP_END
 
 pytestmark = pytest.mark.unit
 
-# The tables of schema version 2 this test writes (`crates/engine/src/
-# profiling/artifact.rs` states the whole schema).
-_TABLES = """
-CREATE TABLE schema_version (version INTEGER NOT NULL);
-CREATE TABLE metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL);
-CREATE TABLE strings (id INTEGER PRIMARY KEY, text TEXT NOT NULL);
-CREATE TABLE collectors (name TEXT NOT NULL, state TEXT NOT NULL,
-    time INTEGER NOT NULL, detail TEXT NOT NULL);
-CREATE TABLE clocks (source TEXT NOT NULL, device INTEGER, gpu INTEGER,
-    realtime INTEGER NOT NULL, cupti INTEGER, monotonic INTEGER,
-    uncertainty INTEGER NOT NULL);
-CREATE TABLE kernel (start INTEGER NOT NULL, end INTEGER NOT NULL,
-    device INTEGER, context INTEGER, stream INTEGER, correlation INTEGER,
-    grid_x INTEGER, grid_y INTEGER, grid_z INTEGER, block_x INTEGER,
-    block_y INTEGER, block_z INTEGER, name INTEGER, graph INTEGER,
-    graph_node INTEGER);
-CREATE TABLE api (start INTEGER NOT NULL, end INTEGER NOT NULL,
-    domain INTEGER, cbid INTEGER, name INTEGER, thread INTEGER,
-    correlation INTEGER, result INTEGER);
-CREATE TABLE fence_probe (probe INTEGER PRIMARY KEY, instance INTEGER,
-    site TEXT, path TEXT, module TEXT);
-CREATE TABLE fence (device INTEGER, time INTEGER, probe INTEGER,
-    step INTEGER);
-"""
+
+@pytest.fixture(scope="module")
+def schema(repository: Path) -> str:
+    """The schema the engine creates every profiling file with.
+
+    The engine crate owns it, and its writer (``artifact.rs``) builds it into
+    the engine; the file states the version of the files it creates.
+    """
+    path = repository / "crates" / "engine" / "src" / "profiling" / "schema.sql"
+    return path.read_text(encoding="utf-8")
 
 
-def _file(path: Path, version: int = 2) -> Path:
-    db = sqlite3.connect(path)
-    db.executescript(_TABLES)
-    db.execute("INSERT INTO schema_version VALUES (?)", (version,))
+@pytest.fixture
+def write_file(schema: str) -> Callable[..., Path]:
+    """Write a profiling file of one step, as the engine writes one.
+
+    The returned function takes the file's path and, to stand for a file of
+    another version, the version it states instead of the schema's own.
+    """
+
+    def write(path: Path, version: int | None = None) -> Path:
+        db = sqlite3.connect(path)
+        db.executescript(schema)
+        if version is not None:
+            db.execute("UPDATE schema_version SET version = ?", (version,))
+        _fill(db)
+        db.commit()
+        db.close()
+        return path
+
+    return write
+
+
+def _fill(db: sqlite3.Connection) -> None:
+    """Record one kernel, its launch, and step 5's probes around a layer."""
     db.executemany(
         "INSERT INTO metadata VALUES (?, ?)",
         [("session", "3"), ("epoch", "1"), ("rank", "2"), ("device", "0")],
@@ -59,10 +65,15 @@ def _file(path: Path, version: int = 2) -> Path:
         [(5_000, 6_000, 40), (5_000, 9_000, 4_000)],
     )
     db.execute(
-        "INSERT INTO kernel VALUES (11000, 12000, 0, 1, 7, 9, 1, 1, 1, "
+        "INSERT INTO kernel (start, end, device, context, stream, "
+        "correlation, grid_x, grid_y, grid_z, block_x, block_y, block_z, "
+        "name, graph, graph_node) VALUES (11000, 12000, 0, 1, 7, 9, 1, 1, 1, "
         "128, 1, 1, 1, 0, 0)"
     )
-    db.execute("INSERT INTO api VALUES (10500, 10600, 1, 307, 2, 42, 9, 0)")
+    db.execute(
+        "INSERT INTO api (start, end, domain, cbid, name, thread, "
+        "correlation, result) VALUES (10500, 10600, 1, 307, 2, 42, 9, 0)"
+    )
     db.executemany(
         "INSERT INTO fence_probe VALUES (?, ?, ?, ?, ?)",
         [
@@ -84,13 +95,12 @@ def _file(path: Path, version: int = 2) -> Path:
             (11_100, STEP_END),
         ],
     )
-    db.commit()
-    db.close()
-    return path
 
 
-def test_a_file_names_its_session_and_pairs_its_fence_records(tmp_path):
-    with ProfileFile(_file(tmp_path / "rank2.sqlite")) as profile:
+def test_a_file_names_its_session_and_pairs_its_fence_records(
+    tmp_path, write_file
+):
+    with ProfileFile(write_file(tmp_path / "rank2.sqlite")) as profile:
         assert (profile.session, profile.rank) == (3, 2)
         intervals = sorted(
             (item["module"], item["start"], item["end"])
@@ -107,17 +117,17 @@ def test_a_file_names_its_session_and_pairs_its_fence_records(tmp_path):
         assert summary["collectors"][0]["name"] == "timeline"
 
 
-def test_a_file_of_an_earlier_version_or_none_is_refused(tmp_path):
+def test_a_file_of_an_earlier_version_or_none_is_refused(tmp_path, write_file):
     with pytest.raises(ProfileError):
-        ProfileFile(_file(tmp_path / "old.sqlite", version=1))
+        ProfileFile(write_file(tmp_path / "old.sqlite", version=1))
     other = tmp_path / "other.sqlite"
     sqlite3.connect(other).execute("CREATE TABLE t (x)").connection.close()
     with pytest.raises(ProfileError):
         ProfileFile(other)
 
 
-def test_the_trace_lines_up_device_and_probe_records(tmp_path):
-    trace = convert([_file(tmp_path / "rank2.sqlite")])
+def test_the_trace_lines_up_device_and_probe_records(tmp_path, write_file):
+    trace = convert([write_file(tmp_path / "rank2.sqlite")])
     json.dumps(trace)
     slices = {
         event["name"]: event
