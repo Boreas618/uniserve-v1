@@ -565,6 +565,7 @@ pub fn replay(inputs: &Path, mut states: Option<&mut dyn Write>) -> Result<u64, 
     }
 
     let mut pool = BufferPool::new((0, 0));
+    let mut names = SessionNames::default();
     let mut started = VecDeque::new();
     let (mut copies, mut replayed) = (0, 0);
     let mut write = |text: String| match states.as_mut() {
@@ -575,19 +576,23 @@ pub fn replay(inputs: &Path, mut states: Option<&mut dyn Write>) -> Result<u64, 
     };
     write(format!(
         "{}state 0\n{}\n\n",
-        layout(&pool),
-        stated(&pool, &owners, 0)
+        layout(&pool, &names),
+        stated(&pool, &names, &owners, 0)
     ))?;
     for (at, input) in &records {
-        let named =
-            |pool: &BufferPool| format!("the input at byte {at} ({})", stated_input(pool, input));
+        let named = |pool: &BufferPool, names: &SessionNames| {
+            format!(
+                "the input at byte {at} ({})",
+                stated_input(pool, names, input)
+            )
+        };
         if let Input::Start(task) = input {
             match started.pop_front() {
                 Some(found) if found == *task => continue,
                 found => {
                     return Err(format!(
                         "{}: the run started the task of request {}, the replay {:?}",
-                        named(&pool),
+                        named(&pool, &names),
                         task.1.0,
                         found.map(|(_, request): Task| request.0)
                     ));
@@ -596,8 +601,9 @@ pub fn replay(inputs: &Path, mut states: Option<&mut dyn Write>) -> Result<u64, 
         }
         // The input as the pool it acts on names it: a closing session's
         // epoch is named before it closes.
-        let text = stated_input(&pool, input);
-        apply(&mut pool, input).map_err(|error| format!("{}: {error}", named(&pool)))?;
+        let text = stated_input(&pool, &names, input);
+        apply(&mut pool, input).map_err(|error| format!("{}: {error}", named(&pool, &names)))?;
+        names.update(&pool);
         if let Input::Image(_) = input {
             // The tasks a pool started and the run did not record are gone with it.
             started.clear();
@@ -613,7 +619,7 @@ pub fn replay(inputs: &Path, mut states: Option<&mut dyn Write>) -> Result<u64, 
                 Some((_, ran, ran_record)) => {
                     return Err(format!(
                         "after {}: the run completed {} on queue pair {ran:?}, the replay {completion:?} for request {} on {queue:?}",
-                        named(&pool),
+                        named(&pool, &names),
                         shown(&ran_record, version(&pool, ran)),
                         request.0
                     ));
@@ -624,7 +630,7 @@ pub fn replay(inputs: &Path, mut states: Option<&mut dyn Write>) -> Result<u64, 
         started.extend(pool.started());
         pool.stopped();
         pool.check()
-            .map_err(|inconsistency| format!("after {}: {inconsistency}", named(&pool)))?;
+            .map_err(|inconsistency| format!("after {}: {inconsistency}", named(&pool, &names)))?;
 
         let changes_layout = matches!(input, Input::Image(_) | Input::Open(..) | Input::Close(_));
         write(format!(
@@ -632,12 +638,12 @@ pub fn replay(inputs: &Path, mut states: Option<&mut dyn Write>) -> Result<u64, 
             replayed - 1,
             text,
             if changes_layout {
-                layout(&pool)
+                layout(&pool, &names)
             } else {
                 String::new()
             },
-            stated(&pool, &owners, copies),
-            classes(&pool)
+            stated(&pool, &names, &owners, copies),
+            classes(&pool, &names)
         ))?;
     }
     if let Some((at, queue, record)) = recorded.pop_front() {
@@ -649,32 +655,81 @@ pub fn replay(inputs: &Path, mut states: Option<&mut dyn Write>) -> Result<u64, 
     Ok(replayed)
 }
 
-/// The name of a session's epoch in the terms of [`stated`], `e<epoch>`,
-/// which qualifies its owners and groups: `e<epoch>.<owner>`,
-/// `e<epoch>.g<group>`. `e?` for a client with no session open.
-fn session(pool: &BufferPool, client: ClientId) -> String {
-    pool.sessions
-        .get(&client)
-        .map_or("e?".to_owned(), |epoch| format!("e{epoch}"))
+/// The names of the sessions in the terms of [`stated`], which qualify
+/// their owners and groups (`<session>.<owner>`, `<session>.g<group>`). A
+/// session is one of the model's epochs (`KvCore`'s `Epochs`: the clients,
+/// one session each), named after its engine epoch: `e<epoch>`, or
+/// `e<epoch>-<n>` for the n-th session of an epoch that had others, as an
+/// engine with a parked standby has (a session per engine). A session is
+/// named when it opens and keeps its name until it closes, so a standby's
+/// session keeps its name when the serving engine's session closes and the
+/// standby takes over. A session never named, as the enumeration's, is
+/// `e<epoch>`.
+#[derive(Default)]
+pub(crate) struct SessionNames {
+    names: BTreeMap<ClientId, String>,
+    /// Per engine epoch, the sessions of it named so far.
+    opened: BTreeMap<u64, u32>,
+}
+
+impl SessionNames {
+    /// Names the sessions `pool` has open that have no name yet, in the
+    /// order of their clients, and forgets those of closed sessions.
+    pub(crate) fn update(&mut self, pool: &BufferPool) {
+        self.names
+            .retain(|client, _| pool.sessions.contains_key(client));
+        let mut open: Vec<(ClientId, u64)> = pool
+            .sessions
+            .iter()
+            .map(|(client, epoch)| (*client, *epoch))
+            .collect();
+        open.sort_unstable();
+        for (client, epoch) in open {
+            if self.names.contains_key(&client) {
+                continue;
+            }
+            let count = self.opened.entry(epoch).or_insert(0);
+            *count += 1;
+            let name = match *count {
+                1 => format!("e{epoch}"),
+                n => format!("e{epoch}-{n}"),
+            };
+            self.names.insert(client, name);
+        }
+    }
+
+    /// The name of a client's session; `e?` for a client with no session open.
+    fn of(&self, pool: &BufferPool, client: ClientId) -> String {
+        match pool.sessions.get(&client) {
+            None => "e?".to_owned(),
+            Some(epoch) => self
+                .names
+                .get(&client)
+                .cloned()
+                .unwrap_or_else(|| format!("e{epoch}")),
+        }
+    }
 }
 
 /// An input to `pool` as `verification/buffer-pool/steps.py` reads it: its
 /// kind, and what it names in the terms of [`stated`] (owners and groups
-/// qualified by their session's epoch, positions by number, keys by their
+/// qualified by their session's name, positions by number, keys by their
 /// 32 bytes in hex, stamps as `<group>:<sequence>`, a request's session as
-/// `e=`); a request is read in its session's version.
-pub(crate) fn stated_input(pool: &BufferPool, input: &Input) -> String {
+/// `e=`; an update's commit and rollback name the engine epoch, `e<epoch>`);
+/// a request is read in its session's version.
+pub(crate) fn stated_input(pool: &BufferPool, names: &SessionNames, input: &Input) -> String {
+    let session = |client: ClientId| names.of(pool, client);
     match input {
         Input::Image(_) => "image".into(),
         Input::Open(..) => "open".into(),
-        Input::Close(client) => format!("close e={}", session(pool, *client)),
+        Input::Close(client) => format!("close e={}", session(*client)),
         Input::Request(queue, record) => match Request::decode_as(record, version(pool, *queue)) {
-            Ok((_, request)) => stated_request(&request, &session(pool, queue.0)),
+            Ok((_, request)) => stated_request(&request, &session(queue.0)),
             Err(_) => "unreadable".into(),
         },
         Input::Completed(client, group, value) => format!(
             "completed g={}.g{} value={value}",
-            session(pool, *client),
+            session(*client),
             group.0
         ),
         Input::Tick(_) => "tick".into(),
@@ -886,7 +941,7 @@ fn stated_request(request: &Request, session: &str) -> String {
 /// [`stated`] states an owner's table of the class 0 alone, so a unit of the
 /// model's region that another class's block holds is neither free nor held
 /// in its terms, and such a state is outside them.
-pub(crate) fn classes(pool: &BufferPool) -> String {
+pub(crate) fn classes(pool: &BufferPool, names: &SessionNames) -> String {
     let classes: BTreeMap<String, u8> = pool
         .cache
         .iter()
@@ -927,7 +982,7 @@ pub(crate) fn classes(pool: &BufferPool) -> String {
             if !units.is_empty() {
                 held.push(format!(
                     "# held {}.{} class={class} {}",
-                    session(pool, *client),
+                    names.of(pool, *client),
                     number.0,
                     units.join(" ")
                 ));
@@ -940,29 +995,31 @@ pub(crate) fn classes(pool: &BufferPool) -> String {
 }
 
 /// The layout of the pool's sessions in the terms of [`stated`], or `layout
-/// none` while no session is open or two open sessions are of one epoch:
-/// per group, qualified by its session's epoch, the bit of its memory, the
-/// region of its slot rows, its regions of the class 0 and the bits of the
-/// host parts it copies that class with; per class, its host region; per
-/// region a group names, its memory space and the bytes of a unit (the
-/// unit `i` of a region occupies the bytes from `i` units of its space,
-/// so regions of two layouts over one space share memory).
-pub(crate) fn layout(pool: &BufferPool) -> String {
-    let epochs: BTreeSet<u64> = pool.sessions.values().copied().collect();
-    if pool.sessions.is_empty() || epochs.len() != pool.sessions.len() {
+/// none` while no session is open: per group, qualified by its session's
+/// name ([`SessionNames`]), the bit of its memory, the region of its slot
+/// rows, its regions of the class 0 and the bits of the host parts it copies
+/// that class with; each open session by its name, with groups on this
+/// server or none (a deployment over several hosts opens a session on each
+/// host's server); per class, its host region; per region a group names,
+/// its memory space and the bytes of a unit (the unit `i` of a region
+/// occupies the bytes from `i` units of its space, so regions of two layouts
+/// over one space share memory).
+pub(crate) fn layout(pool: &BufferPool, names: &SessionNames) -> String {
+    if pool.sessions.is_empty() {
         return "layout none\n".into();
     }
     let mut text = String::new();
-    let groups: BTreeMap<(u64, u8), _> = pool
+    // By epoch, session and group.
+    let groups: BTreeMap<(u64, ClientId, u8), _> = pool
         .groups
         .iter()
         .filter_map(|((client, group), found)| {
             let epoch = pool.sessions.get(client)?;
-            Some(((*epoch, group.0), found))
+            Some(((*epoch, *client, group.0), found))
         })
         .collect();
     let mut named = BTreeSet::new();
-    for ((epoch, group), found) in groups {
+    for ((_, client, group), found) in groups {
         let kv: Vec<u8> = found
             .regions
             .first()
@@ -980,12 +1037,22 @@ pub(crate) fn layout(pool: &BufferPool) -> String {
             .collect();
         let _ = writeln!(
             text,
-            "layout group e{epoch}.g{group} memory m{} rows {} kv {} parts {}",
+            "layout group {}.g{group} memory m{} rows {} kv {} parts {}",
+            names.of(pool, client),
             found.memory,
             found.slots,
             kv.join(","),
             parts.join(",")
         );
+    }
+    let mut sessions: Vec<(u64, ClientId)> = pool
+        .sessions
+        .iter()
+        .map(|(client, epoch)| (*epoch, *client))
+        .collect();
+    sessions.sort_unstable();
+    for (_, client) in sessions {
+        let _ = writeln!(text, "layout session {}", names.of(pool, client));
     }
     let hosts: BTreeSet<u8> = pool
         .classes
@@ -1026,7 +1093,12 @@ pub(crate) fn layout(pool: &BufferPool) -> String {
 /// several keys as one per key. A block a waiting commit holds states its
 /// memories too. A unit is `region:unit`, a key its 32 bytes in hex. `verification/buffer-pool/agreement.py` writes the
 /// model's states in the same lines.
-pub(crate) fn stated(pool: &BufferPool, owners: &[(QueueId, OwnerId)], copies: u32) -> String {
+pub(crate) fn stated(
+    pool: &BufferPool,
+    names: &SessionNames,
+    owners: &[(QueueId, OwnerId)],
+    copies: u32,
+) -> String {
     let unit = |block: &Rc<Block>| {
         let runs: Vec<String> = block
             .stated()
@@ -1048,9 +1120,9 @@ pub(crate) fn stated(pool: &BufferPool, owners: &[(QueueId, OwnerId)], copies: u
 
     // Each group of an open session, qualified by its epoch.
     let group_name =
-        |client: ClientId, group: GroupId| format!("{}.g{}", session(pool, client), group.0);
+        |client: ClientId, group: GroupId| format!("{}.g{}", names.of(pool, client), group.0);
     let owner_name =
-        |client: ClientId, owner: OwnerId| format!("{}.{}", session(pool, client), owner.0);
+        |client: ClientId, owner: OwnerId| format!("{}.{}", names.of(pool, client), owner.0);
     let completed: BTreeMap<String, u64> = pool
         .groups
         .iter()
@@ -1065,32 +1137,34 @@ pub(crate) fn stated(pool: &BufferPool, owners: &[(QueueId, OwnerId)], copies: u
             }),
     );
 
-    // Each epoch the state names: an open session's, one still on trial, or
-    // one whose update was rolled back that made a copy still cached (R8).
-    let mut epochs: BTreeSet<u64> = pool.sessions.values().copied().collect();
-    epochs.extend(
-        pool.trial
-            .iter()
-            .filter(|(_, trial)| **trial)
-            .map(|(epoch, _)| *epoch),
-    );
-    epochs.extend(
+    // Each of the model's epochs the state names: an open session, with its
+    // engine epoch's trial; and an engine epoch with no session open that is
+    // still on trial, or whose update was rolled back and that made a copy
+    // still cached (R8), as `e<epoch>`.
+    let trial = |epoch: u64| match pool.trial.get(&epoch) {
+        Some(true) => "yes",
+        Some(false) => "no",
+        None => "rolled",
+    };
+    for (client, epoch) in &pool.sessions {
+        let name = names.of(pool, *client);
+        lines.push(format!("epoch {name} open trial={}", trial(*epoch)));
+    }
+    let mut closed: BTreeSet<u64> = pool
+        .trial
+        .iter()
+        .filter(|(_, trial)| **trial)
+        .map(|(epoch, _)| *epoch)
+        .collect();
+    closed.extend(
         pool.cache
             .values()
             .flat_map(|entry| entry.copies().filter_map(|(_, maker)| *maker)),
     );
-    for epoch in epochs {
-        let open = if pool.sessions.values().any(|of| *of == epoch) {
-            "open"
-        } else {
-            "closed"
-        };
-        let trial = match pool.trial.get(&epoch) {
-            Some(true) => "yes",
-            Some(false) => "no",
-            None => "rolled",
-        };
-        lines.push(format!("epoch e{epoch} {open} trial={trial}"));
+    for epoch in closed {
+        if !pool.sessions.values().any(|of| *of == epoch) {
+            lines.push(format!("epoch e{epoch} closed trial={}", trial(epoch)));
+        }
     }
 
     // The free units as runs, `region:first-last` or `region:unit` for one,
@@ -1275,7 +1349,7 @@ pub(crate) fn stated(pool: &BufferPool, owners: &[(QueueId, OwnerId)], copies: u
             unit(&copy.reads[0]),
             unit(&copy.write),
             u8::from(copy.fill),
-            session(pool, client)
+            names.of(pool, client)
         )
     };
 
@@ -1418,7 +1492,7 @@ pub(crate) fn stated(pool: &BufferPool, owners: &[(QueueId, OwnerId)], copies: u
                         let asked = if *remote {
                             "-".to_owned()
                         } else {
-                            session(pool, task.0.0)
+                            names.of(pool, task.0.0)
                         };
                         lines.push(format!(
                             "task {kind} h={} expired={expired} k={} parts={} s={asked}",

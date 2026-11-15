@@ -1786,7 +1786,9 @@ fn a_state_names_each_owner_under_its_session_and_each_epoch_with_its_trial() {
         (trial, OwnerId(1)),
         ((3, 0), OwnerId(1)),
     ];
-    let state = super::trace::stated(&fixture.pool, &owners, 0);
+    let mut names = super::trace::SessionNames::default();
+    names.update(&fixture.pool);
+    let state = super::trace::stated(&fixture.pool, &names, &owners, 0);
     let named: Vec<&str> = state
         .lines()
         .filter(|line| line.starts_with("owner "))
@@ -1870,8 +1872,10 @@ fn a_state_marks_the_units_an_owner_holds_in_another_class() {
         taken.push(format!("{}:{}", runs[0].0, runs[0].1));
     }
 
-    let state = super::trace::stated(&fixture.pool, &[(queue, OwnerId(1))], 0);
-    let marked = super::trace::classes(&fixture.pool);
+    let mut names = super::trace::SessionNames::default();
+    names.update(&fixture.pool);
+    let state = super::trace::stated(&fixture.pool, &names, &[(queue, OwnerId(1))], 0);
+    let marked = super::trace::classes(&fixture.pool, &names);
     let owner = state
         .lines()
         .find(|line| line.starts_with("owner e2.1 "))
@@ -1889,6 +1893,69 @@ fn a_state_marks_the_units_an_owner_holds_in_another_class() {
         [format!("# held e2.1 class=1 {}", taken[1])],
         "{marked}"
     );
+}
+
+/// Two sessions of one engine epoch, as an engine and its parked standby
+/// open, are two of the model's epochs: the second is named `e<epoch>-2`,
+/// with its groups and owners under that name, and keeps the name when the
+/// first closes, so that the standby's takeover reads as the end of the
+/// first session alone.
+#[test]
+fn a_standby_session_of_one_epoch_keeps_a_name_of_its_own() {
+    let mut fixture = Fixture::new();
+    let mut names = super::trace::SessionNames::default();
+    names.update(&fixture.pool);
+    // The standby: the serving session's epoch, one group over the same
+    // memory and KV region, with the decode group's slot rows.
+    let regions = vec![vec![UNITS], Vec::new(), vec![5, 6], vec![5]];
+    fixture.pool.open(
+        2,
+        1,
+        false,
+        classes(),
+        vec![(GroupId(0), group(0, 2, regions, PART))],
+    );
+    names.update(&fixture.pool);
+    let standby = (2, 0);
+    fixture.submit(
+        standby,
+        Request::Attach {
+            owner: OwnerId(1),
+            group: GroupId(0),
+        },
+    );
+    let owners = [(QUEUE, OwnerId(1)), (standby, OwnerId(1))];
+
+    let layout = super::trace::layout(&fixture.pool, &names);
+    assert!(layout.contains("layout group e1.g0 "), "{layout}");
+    assert!(layout.contains("layout group e1-2.g0 "), "{layout}");
+    let state = super::trace::stated(&fixture.pool, &names, &owners, 0);
+    let standby_owner = |state: &str| {
+        state
+            .lines()
+            .any(|line| line.starts_with("owner e1-2.1 live e1-2.g0 slot="))
+    };
+    assert!(standby_owner(&state), "{state}");
+    assert!(
+        state.lines().any(|line| line == "epoch e1 open trial=no"),
+        "{state}"
+    );
+    assert!(
+        state.lines().any(|line| line == "epoch e1-2 open trial=no"),
+        "{state}"
+    );
+
+    // The serving engine's session ends; the standby's keeps its name.
+    fixture.pool.end(SERVING);
+    fixture.checked();
+    names.update(&fixture.pool);
+    let state = super::trace::stated(&fixture.pool, &names, &owners, 0);
+    assert!(standby_owner(&state), "{state}");
+    let epochs: Vec<&str> = state
+        .lines()
+        .filter(|line| line.starts_with("epoch "))
+        .collect();
+    assert_eq!(epochs, ["epoch e1-2 open trial=no"], "{state}");
 }
 
 #[test]

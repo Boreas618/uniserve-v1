@@ -69,7 +69,7 @@ use storage::runtime::{
 };
 
 use crate::Server;
-use crate::buffer_pool::trace::{Input, Trace, stated_input};
+use crate::buffer_pool::trace::{Input, SessionNames, Trace, stated_input};
 use crate::buffer_pool::{BufferPool, ClientId, FORMAT, QueueId, format1, format2, format3};
 
 /// How long the thread sleeps when every queue is empty and nothing is
@@ -467,9 +467,11 @@ impl Watch {
             Err(inconsistency) => {
                 self.failures += 1;
                 if !self.failing {
+                    // The input named as a state's sessions are named
+                    // before any of them is (`e<epoch>`).
                     tracing::error!(
                         deployment,
-                        input = %stated_input(pool, &input),
+                        input = %stated_input(pool, &SessionNames::default(), &input),
                         position = ?position,
                         %inconsistency,
                         "the buffer pool is inconsistent after an input; it goes on"

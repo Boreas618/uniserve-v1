@@ -21,7 +21,9 @@ use std::fmt::Write as _;
 use storage::protocol::Key;
 use storage::runtime::{GroupId, OwnerId, Request, RequestId, Source, Stamps, Tier};
 
-use super::trace::{Input, apply, classes, copies_asked, layout, stated, stated_input};
+use super::trace::{
+    Input, SessionNames, apply, classes, copies_asked, layout, stated, stated_input,
+};
 use super::{BufferPool, Class, Copy, Group, Target};
 
 const KV: u8 = 0;
@@ -772,7 +774,7 @@ impl Driver {
         let owners: Vec<_> = (1..=self.shape.owners)
             .map(|number| self.queue_of(number))
             .collect();
-        stated(&self.pool, &owners, self.copies)
+        stated(&self.pool, &SessionNames::default(), &owners, self.copies)
     }
 }
 
@@ -784,7 +786,11 @@ impl Driver {
     /// any row; the buffer pool keeps a key's class and the order in which
     /// rows were given back.
     fn identity(&self) -> String {
-        let mut identity = format!("{}\n{}", self.state(), classes(&self.pool));
+        let mut identity = format!(
+            "{}\n{}",
+            self.state(),
+            classes(&self.pool, &SessionNames::default())
+        );
         for (id, region) in self.pool.regions.iter().enumerate() {
             let _ = write!(identity, "\n# rows {id} {:?}", region.returned());
         }
@@ -812,9 +818,9 @@ fn forged() -> String {
     driver.pool.completions();
     format!(
         "{}state 0\n{before}\n\nstate 1\n{}\n\nstep 0 1 {}\n",
-        layout(&driver.pool),
+        layout(&driver.pool, &SessionNames::default()),
         driver.state(),
-        stated_input(&driver.pool, &commit)
+        stated_input(&driver.pool, &SessionNames::default(), &commit)
     )
 }
 
@@ -825,12 +831,12 @@ fn forged() -> String {
 /// and the layout for the comparison with the model's steps
 /// (`<shape>.steps`, and the transition of [`forged`] as `forged.steps`).
 #[test]
-#[ignore = "enumerates every request sequence of six small configurations; run by verification/buffer-pool/agreement.sh"]
+#[ignore = "enumerates every request sequence of seven small configurations; run by verification/buffer-pool/agreement.sh"]
 fn every_request_sequence_keeps_the_invariants() {
     let directory = std::env::var("UNISERVE_POOL_STATES").ok();
     for shape in SHAPES {
         let start = Driver::new(shape);
-        let layout = layout(&start.pool);
+        let layout = layout(&start.pool, &SessionNames::default());
         let mut index = BTreeMap::from([(start.identity(), 0usize)]);
         let mut frontier = VecDeque::from([(0usize, start)]);
         let mut transitions = BTreeSet::new();
@@ -855,7 +861,11 @@ fn every_request_sequence_keeps_the_invariants() {
                 }
                 if target != source {
                     transitions.insert((source, target));
-                    steps.insert((source, target, stated_input(&from.pool, &input)));
+                    steps.insert((
+                        source,
+                        target,
+                        stated_input(&from.pool, &SessionNames::default(), &input),
+                    ));
                 }
             }
         }

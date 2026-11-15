@@ -40,7 +40,10 @@ step but a resize's grow and shrink touches them, and a path to the next
 state shrinks again what it grows, with nothing between that reads it.
 
 A step the model has no terms for is counted as outside the model and not
-checked: an open, a close or a pool's image; a request of a class other
+checked: an open, a pool's image, a close that closes a KV region (its
+evictions and shrinks, one step to the pool, are as many to the model,
+in every order), or one that changes the layout otherwise than by its
+session's groups and slot rows leaving it; a request of a class other
 than 0; a prefetch from the peers; a load or a store of several keys (the
 model makes one per key; a prefetch of several is checked as one per key
 in order, and a state states a task of several keys as one per key); a
@@ -52,9 +55,15 @@ or with a key cached on the device in several regions (the model caches
 one device block per key; `# device` lines state them); a step that takes
 or frees units of a region the model lacks; a resize over KV regions of
 two unit sizes in one memory space, which the model's chunks cannot
-relate. Several open sessions are checked as the model's epochs: owners
-and groups are named under their session's epoch, and each epoch's trial,
-whether its session is closed, and each copy's visibility (R8) are stated.
+relate; a state with an update on trial of an engine epoch that has several
+sessions (the model commits and rolls back per session). Several open
+sessions are checked as the model's epochs, one per session (KvCore's
+`Epochs`): owners and groups are named under their session (`e<epoch>`,
+or `e<epoch>-<n>` for an engine epoch's n-th session, as an engine with a
+parked standby has one per engine), and each epoch's trial, whether its
+session is closed, and each copy's visibility (R8) are stated; a session's
+end is the model's `Lose` of its epoch, checked in the layout it ends, so
+a standby's session that takes over is followed.
 
 Prints one verdict line: ok; FAIL with the first step no path follows,
 whose window is kept in WORK/failure.txt (with the first 50 such); or
@@ -142,13 +151,13 @@ class Outside(Exception):
 
 
 def parse_layout(block):
-    """Per group, named by its session's epoch (`e<epoch>.g<group>`), its
-    memory, its slot rows' region, its KV regions and the host parts it
-    copies with; the host regions; per region its memory space and the bytes
-    of a unit. None while no session is open."""
+    """Per group, named by its session (`e<epoch>.g<group>`), its memory, its
+    slot rows' region, its KV regions and the host parts it copies with; the
+    host regions; per region its memory space and the bytes of a unit; the
+    open sessions, with groups or none. None while no session is open."""
     if block == ["layout none"]:
         return None
-    groups, hosts, regions = {}, set(), {}
+    groups, hosts, regions, sessions = {}, set(), {}, set()
     for line in block:
         parts = line.split()
         if parts[1] == "group":
@@ -160,12 +169,51 @@ def parse_layout(block):
             hosts.add(parts[2])
         elif parts[1] == "region":
             regions[parts[2]] = (parts[4], parts[6])
-    return (tuple(sorted(groups.items())), tuple(sorted(hosts)), tuple(sorted(regions.items())))
+        elif parts[1] == "session":
+            sessions.add(parts[2])
+    return (tuple(sorted(groups.items())), tuple(sorted(hosts)), tuple(sorted(regions.items())),
+            tuple(sorted(sessions, key=epoch_key)))
 
 
 def epoch_of(name):
-    """The epoch an owner or a group belongs to: `e1` of `e1.5` and `e1.g0`."""
+    """The epoch an owner or a group belongs to: `e1` of `e1.5` and `e1.g0`,
+    `e1-2` of `e1-2.g0`."""
     return name.split(".")[0]
+
+
+def epoch_key(name):
+    """The order of the model's epochs: by engine epoch, then by session
+    (`e1`, `e1-2`, `e2`; an engine with a parked standby has a session per
+    engine, each one of the model's epochs)."""
+    number, _, nth = name[1:].partition("-")
+    return int(number), int(nth or 1)
+
+
+def ended(before, after, text):
+    """Why a change of layout is outside the model, or None when it is a
+    session's end beside the sessions that stay (the model's `Lose` of its
+    epoch): the closing session's groups leave the layout, the others stay
+    as they were, no region appears, and every KV region stays, named by a
+    session that stays (an engine's standby shares its KV region), so that
+    only the closing session's slot rows close with it; or the last
+    session's end where it named no KV region. A close that closes
+    a KV region evicts every block cached in it and shrinks each of its
+    units, one step to the pool and as many to the model, in every order."""
+    kv = lambda layout: {region for _, (_, _, regions, _) in layout[0] for region in regions}
+    closing = fields(text).get("e")
+    if before is None or not text.startswith("close ") or closing not in before[3]:
+        return "a change of layout"
+    if after is None:
+        # The last session's close closes every region it named.
+        return "a close that closes a KV region" if kv(before) else None
+    kept = tuple(item for item in before[0] if epoch_of(item[0]) != closing)
+    if after[3] != tuple(name for name in before[3] if name != closing) or after[0] != kept:
+        return "a change of layout"
+    if not set(after[1]) <= set(before[1]) or not set(after[2]) <= set(before[2]):
+        return "a change of layout"
+    if kv(after) != kv(before):
+        return "a close that closes a KV region"
+    return None
 
 
 def kinds(layout):
@@ -460,6 +508,11 @@ def outside_state(state, regions):
         return "a key cached in a class other than 0"
     if state.devices:
         return "a key cached on the device in several regions"
+    # The model commits or rolls back an update per epoch, which is a
+    # session to it; an engine epoch with a standby has several.
+    for epoch, (_, trial) in state.epochs.items():
+        if "-" in epoch and trial != "no":
+            return "an update on trial of an engine epoch with several sessions"
     # A unit of the model's region held in another class is neither free
     # nor held in its terms (one class); another class's region is none of
     # its business while no step takes or frees a unit of it.
@@ -840,9 +893,9 @@ def window(step, before, after, text, part, witnesses, layout, chunks):
                 for named_positions in named_owners.values():
                     positions |= named_positions
     # Every epoch: those of the layout's groups in order, then the others.
-    sessions = sorted({epoch_of(group) for group, _ in layout[0]}, key=lambda epoch: int(epoch[1:]))
+    sessions = sorted({epoch_of(group) for group, _ in layout[0]}, key=epoch_key)
     others = (set(before.epochs) | set(after.epochs)) - set(sessions)
-    epochs = sessions + sorted(others, key=lambda epoch: int(epoch[1:]))
+    epochs = sessions + sorted(others, key=epoch_key)
     rename = Renaming(units, owners, keys, positions, epochs)
     lines = [projected(state, part, witnesses, rename) for state in (before, after)]
 
@@ -961,8 +1014,12 @@ def step_windows(step, before, after, layouts_of, text):
         acts(text)
         if "e?" in text.split(".")[0] or any(value.startswith("e?") for value in fields(text).values()):
             raise Outside("a request of no open session")
+        # A session's end is checked in the layout it ends: its groups are
+        # then those of a lost epoch, which the next state no longer states.
         if layouts_of[0] != layouts_of[1]:
-            raise Outside("a change of layout")
+            reason = ended(layouts_of[0], layouts_of[1], text)
+            if reason:
+                raise Outside(reason)
         regions = kinds(layouts_of[0])
         for state in (before, after):
             reason = outside_state(state, regions)
