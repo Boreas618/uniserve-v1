@@ -1,36 +1,45 @@
-"""The trtllm-gen packages' shared build.
+"""The shared build of the packages that compile FlashInfer's TensorRT-LLM code.
 
-FlashInfer's launch code is compiled against a pinned trtllm-gen kernel
-library.
+FlashInfer's distribution carries TensorRT-LLM's launch code: the runners that
+select and launch trtllm-gen's kernels, and kernels of its own (the MoE
+combine). trtllm-gen's kernels ship as cubins plus a generated header carrying
+their table (the `trtllm-gen-fmha` and `trtllm-gen-bmm` pins of
+:mod:`uniserve_build_server.fetch`). A package compiles the launch code it
+needs with its own C entry into ``module.so``, and a package launching
+trtllm-gen kernels publishes the cubins its descriptor can select beside the
+module under ``cubins/``.
 
-trtllm-gen's kernels ship as cubins plus a generated header carrying their table
-(the `trtllm-gen-fmha` and `trtllm-gen-bmm` pins of
-:mod:`uniserve_build_server.fetch`); FlashInfer's distribution carries the
-launch code that selects and launches them. A package that launches them
-compiles that launch code with its own C entry into ``module.so`` and publishes
-the cubins its descriptor can select beside the module under ``cubins/``.
+This module is the one statement of what those packages share:
 
-This module holds what those packages share: the distribution's data tree,
-staging the pinned library, and the batched-GEMM build of the routed NVFP4
-products (`gather_gemm_nvfp4`'s first matrix and `route_gemm_nvfp4`'s second),
-which differ only in their entry and in the options their manifests select. The
-attention package's kernel selection is its own.
+- the FlashInfer distribution: its data tree (:func:`data_tree`, found through
+  the locked distribution's metadata) and the include directories in it
+  (:data:`INCLUDES`);
+- the vendor's compile definitions (:data:`TENSORRT_LLM`,
+  :data:`FLASHINFER_TYPES`, :data:`BATCHED_GEMM`) and the translation units of
+  each part of the launch code, with the definitions it is compiled with
+  (:class:`LaunchCode`: :data:`COMBINE`, :data:`FMHA`, :data:`ROUTED_GEMM`);
+- the one build routine (:func:`build`): a package's entry unit and the launch
+  code's units as the CUDA driver's units, compiled and linked into
+  ``module.so`` by :func:`uniserve_build_server.cuda.native`;
+- staging a pinned trtllm-gen library (:func:`stage`), and the whole build of
+  the routed NVFP4 products (`gather_gemm_nvfp4`'s first matrix and
+  `route_gemm_nvfp4`'s second), which differ only in their entry and in the
+  options their manifests select.
 """
 
 from __future__ import annotations
 
+import dataclasses
 import importlib.metadata
 import json
 import pathlib
 import re
 import shutil
-import subprocess
 import sys
-import tempfile
-from collections.abc import Callable, Iterable
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from typing import Any
 
-from uniserve_build_server import fetch
+from uniserve_build_server import cuda, fetch
 from uniserve_build_server.request import Request, Target
 
 #: The distribution whose data tree holds the launch code.
@@ -59,6 +68,116 @@ def data_tree() -> pathlib.Path:
     return pathlib.Path(installed.locate_file("flashinfer/data"))
 
 
+#: The include directories of the data tree, relative to it: FlashInfer's own
+#: headers and sources, TensorRT-LLM's (``csrc/nv_internal``), CUTLASS, and
+#: the CCCL FlashInfer is written against, which is searched before the
+#: toolkit's own copy as FlashInfer's build searches it.
+INCLUDES = (
+    "include",
+    "csrc",
+    "csrc/nv_internal",
+    "csrc/nv_internal/include",
+    "cutlass/include",
+    "cutlass/tools/util/include",
+    "cccl/libcudacxx/include",
+    "cccl/cub",
+    "cccl/thrust",
+)
+
+#: The definitions TensorRT-LLM's sources are compiled with in FlashInfer's
+#: own build: the export interface (the trtllm-gen headers include each other
+#: relative to themselves), the BF16, FP8 and FP4 element types, and no
+#: assertions.
+TENSORRT_LLM: Mapping[str, cuda.Definition] = {
+    "TLLM_GEN_EXPORT_INTERFACE": None,
+    "ENABLE_BF16": None,
+    "ENABLE_FP8": None,
+    "ENABLE_FP4": None,
+    "NDEBUG": None,
+}
+
+#: The element types FlashInfer's own headers instantiate their code for.
+FLASHINFER_TYPES: Mapping[str, cuda.Definition] = {
+    "FLASHINFER_ENABLE_F16": None,
+    "FLASHINFER_ENABLE_BF16": None,
+    "FLASHINFER_ENABLE_FP8_E4M3": None,
+    "FLASHINFER_ENABLE_FP8_E5M2": None,
+    "FLASHINFER_ENABLE_FP8_E8M0": None,
+    "FLASHINFER_ENABLE_FP4_E2M1": None,
+}
+
+#: The batched-GEMM library's FlashInfer export: its kernels are loaded from
+#: cubins through ``getCubin`` rather than linked in. The library's
+#: `KernelParamsSetup` -- the function that turns an options record into the
+#: pointers and launch geometry a cubin takes -- is inside
+#: ``#ifdef TLLM_ENABLE_CUDA``, so a build that leaves that macro off sees an
+#: empty namespace and fails on the runner's own call into it.
+BATCHED_GEMM: Mapping[str, cuda.Definition] = {
+    "TLLM_GEN_EXPORT_FLASHINFER": None,
+    "TLLM_ENABLE_CUDA": None,
+}
+
+#: TensorRT-LLM's commons -- the exception class, the logger, the string
+#: formatting and the environment flags -- which its runners and checks call.
+#: They are sources of the distribution, not a library the host is assumed to
+#: have: compiled in, the module has no unresolved reference; left out, it
+#: builds, publishes and then cannot be loaded.
+COMMONS = (
+    "csrc/nv_internal/cpp/common/tllmException.cpp",
+    "csrc/nv_internal/cpp/common/stringUtils.cpp",
+    "csrc/nv_internal/cpp/common/logger.cpp",
+    "csrc/nv_internal/cpp/common/envUtils.cpp",
+)
+
+
+@dataclasses.dataclass(frozen=True)
+class LaunchCode:
+    """One part of the distribution's launch code a module compiles.
+
+    ``units`` are its translation units, relative to the data tree, and
+    ``definitions`` the definitions every unit of a module compiling it
+    reads, the package's entry unit included. ``library`` is the pinned
+    trtllm-gen library whose kernels it launches, for launch code that
+    launches them.
+    """
+
+    units: tuple[str, ...]
+    definitions: Mapping[str, cuda.Definition]
+    library: str | None = None
+
+
+#: trtllm-gen's MoE combine (`moeUnpermute`) and the commons its checks call.
+COMBINE = LaunchCode(
+    units=(
+        "csrc/nv_internal/tensorrt_llm/kernels/cuteDslKernels/moeUtils.cu",
+        *COMMONS,
+    ),
+    definitions=TENSORRT_LLM,
+)
+
+#: The FMHA launch code: `TllmGenFmhaRunner` is headers the entry includes,
+#: and its reduction (`tensorrt_llm::kernels::runFmhaReduction`) the one unit
+#: it calls into.
+FMHA = LaunchCode(
+    units=("csrc/fmhaReduction.cu",),
+    definitions={**TENSORRT_LLM, **FLASHINFER_TYPES},
+    library="trtllm-gen-fmha",
+)
+
+#: The routed MoE products' runners (`PermuteGemm1::Runner`,
+#: `Gemm2::Runner`) with the kernel table they select, the batched-GEMM
+#: runner they hold, and the commons both call.
+ROUTED_GEMM = LaunchCode(
+    units=(
+        "csrc/trtllm_fused_moe_runner.cu",
+        "csrc/trtllm_batched_gemm_runner.cu",
+        *COMMONS,
+    ),
+    definitions={**TENSORRT_LLM, **BATCHED_GEMM},
+    library="trtllm-gen-bmm",
+)
+
+
 def stage(
     request: Request, library: str, staged: pathlib.Path, names: Iterable[str]
 ) -> None:
@@ -78,11 +197,57 @@ def stage(
         ) from error
 
 
-def run(command: list[str], what: str) -> None:
-    """Run one compiler process; its whole output is the build's log."""
-    print(" ".join(command), file=sys.stderr, flush=True)
-    if subprocess.run(command, check=False).returncode != 0:
-        raise SystemExit(f"{what} failed")
+def build(
+    request: Request,
+    code: LaunchCode,
+    includes: Sequence[pathlib.Path] = (),
+    definitions: Mapping[str, cuda.Definition] | None = None,
+    entry_definitions: Mapping[str, cuda.Definition] | None = None,
+) -> None:
+    """Compiles the package's entry unit and ``code`` into ``module.so``.
+
+    The entry unit is the manifest's ``[source] unit``. Every unit reads the
+    launch code's definitions and ``definitions``; the entry unit also reads
+    ``entry_definitions``, the descriptor's values it is compiled for. The
+    include path is ``includes`` (a staged library's headers, searched
+    first) and then the data tree's :data:`INCLUDES`. Every unit is C++17 in
+    the language its file names, as FlashInfer's own build compiles it, and
+    lets device code call constexpr host functions, as CUTLASS's headers
+    need.
+
+    The module links the driver API beside the CUDA runtime: trtllm-gen's
+    launcher calls `cuModuleLoadData`, `cuModuleGetFunction` and
+    `cuLaunchKernelEx` directly.
+    """
+    if request.unit is None:
+        raise SystemExit(
+            f"{request.op}/{request.backend} names its entry unit in "
+            "[source] unit"
+        )
+    data = data_tree()
+    search = [*includes, *(data / one for one in INCLUDES)]
+    shared = {**code.definitions, **(definitions or {})}
+    sources = [
+        (
+            request.package / request.unit,
+            {**shared, **(entry_definitions or {})},
+        ),
+        *((data / unit, shared) for unit in code.units),
+    ]
+    units = []
+    for source, unit_definitions in sources:
+        if not source.is_file():
+            raise SystemExit(f"{request.op}/{request.backend} has no {source}")
+        units.append(
+            cuda.Unit(
+                source=source,
+                standard="c++17",
+                definitions=unit_definitions,
+                includes=search,
+                relaxed_constexpr=True,
+            )
+        )
+    cuda.native(request, units, libraries=["cuda"])
 
 
 # The batched-GEMM library's routed NVFP4 products.
@@ -101,41 +266,6 @@ BIAS_TYPES = {"none": 0, "m": 1, "n": 2, "mn": 3}
 #: weight side in either the plain or the 8x4 form; these packages serve the
 #: plain one, which is what a ModelOpt shard stores.
 SF_LAYOUTS = {"linear": 0, "8x4": 1, "8x16": 2, "swizzled_128x4": 3}
-
-#: The compile defines the artifact's own build uses.
-DEFINES = [
-    "TLLM_GEN_EXPORT_INTERFACE",
-    "TLLM_GEN_EXPORT_FLASHINFER",
-    # The artifact's `KernelParamsSetup` -- the function that turns an options
-    # record into the pointers and launch geometry a cubin takes -- is inside
-    # `#ifdef TLLM_ENABLE_CUDA`, so a build that leaves the macro off sees an
-    # empty namespace and fails on the runner's own call into it.
-    "TLLM_ENABLE_CUDA",
-    "ENABLE_BF16",
-    "ENABLE_FP8",
-    "ENABLE_FP4",
-    "NDEBUG",
-]
-
-#: The vendor units the entry's runner resolves against, and the runtime they
-#: reference. The routed products' runners (`PermuteGemm1::Runner`,
-#: `Gemm2::Runner`) and the kernel table they select live in the first; the
-#: batched-GEMM runner they hold in the second.
-#:
-#: A runner unit calls into TensorRT-LLM's commons - the exception class, the
-#: logger, the string formatting and the two NVFP4 environment flags - and those
-#: are sources in this distribution, not a library the host is assumed to have.
-#: Compiled here, the module has no unresolved reference; omitted, it builds,
-#: publishes and then cannot be loaded, and the failure arrives at the first
-#: launch naming no symbol at all.
-SOURCES = [
-    "csrc/trtllm_fused_moe_runner.cu",
-    "csrc/trtllm_batched_gemm_runner.cu",
-    "csrc/nv_internal/cpp/common/tllmException.cpp",
-    "csrc/nv_internal/cpp/common/stringUtils.cpp",
-    "csrc/nv_internal/cpp/common/logger.cpp",
-    "csrc/nv_internal/cpp/common/envUtils.cpp",
-]
 
 #: The export headers of the batched-GEMM library the launch code includes.
 EXPORT_HEADERS = [
@@ -341,8 +471,8 @@ def cubin_name(name: str) -> str:
     return name[0].upper() + name[1:] + ".cubin"
 
 
-def headers(artifact: pathlib.Path, data: pathlib.Path) -> list[pathlib.Path]:
-    """The include paths, the artifact's exported headers first."""
+def artifact_includes(artifact: pathlib.Path) -> list[pathlib.Path]:
+    """The staged artifact's include paths, its filtered table first."""
     # The vendor's launch code includes the artifact's headers under the
     # distribution's own path, so the export tree is linked where it looks for
     # it: the artifact is the build's input, not the module's, and never enters
@@ -355,70 +485,29 @@ def headers(artifact: pathlib.Path, data: pathlib.Path) -> list[pathlib.Path]:
             (artifact / "include/trtllmGen_bmm_export").resolve(),
             target_is_directory=True,
         )
-    return [
-        artifact / "filtered/include",
-        artifact,
-        artifact / "include",
-        data / "include",
-        data / "csrc",
-        data / "csrc/nv_internal",
-        data / "csrc/nv_internal/include",
-        data / "cutlass/include",
-        data / "cutlass/tools/util/include",
-        data / "cccl/libcudacxx/include",
-        data / "cccl/cub",
-        data / "cccl/thrust",
-    ]
+    return [artifact / "filtered/include", artifact, artifact / "include"]
 
 
-def geometry(fields: dict[str, Any]) -> list[str]:
+def geometry(fields: dict[str, Any]) -> dict[str, cuda.Definition]:
     """The descriptor's own values, as the entry's compile-time definitions."""
     rows, columns = fields["tile"]
     cluster_m, cluster_n = fields["cluster"]
-    return [
-        f"UNISERVE_HIDDEN={fields['hidden']}",
-        f"UNISERVE_INTERMEDIATE={fields['intermediate']}",
-        f"UNISERVE_EXPERTS={fields['experts']}",
-        f"UNISERVE_TOP={fields['top']}",
-        f"UNISERVE_TILE_TOKENS={rows}",
-        f"UNISERVE_TILE_COLUMNS={columns}",
-        f"UNISERVE_CLUSTER_ROWS={cluster_m}",
-        f"UNISERVE_CLUSTER_COLUMNS={cluster_n}",
-    ]
-
-
-def nvcc_command(
-    request: Request,
-    defines: list[str],
-    includes: list[pathlib.Path],
-    source: pathlib.Path,
-    output: pathlib.Path,
-) -> list[str]:
-    """The nvcc command compiling one unit of a routed product."""
-    cuda = request.toolchain.require_cuda()
-    return [
-        cuda.nvcc,
-        "-c",
-        "-x",
-        "cu",
-        "-O3",
-        "-std=c++17",
-        f"-arch={request.target}",
-        "--expt-relaxed-constexpr",
-        "-Xcompiler",
-        "-fPIC",
-        *[f"-D{one}" for one in defines],
-        *[f"-I{one}" for one in includes],
-        "-o",
-        str(output),
-        str(source),
-    ]
+    return {
+        "UNISERVE_HIDDEN": fields["hidden"],
+        "UNISERVE_INTERMEDIATE": fields["intermediate"],
+        "UNISERVE_EXPERTS": fields["experts"],
+        "UNISERVE_TOP": fields["top"],
+        "UNISERVE_TILE_TOKENS": rows,
+        "UNISERVE_TILE_COLUMNS": columns,
+        "UNISERVE_CLUSTER_ROWS": cluster_m,
+        "UNISERVE_CLUSTER_COLUMNS": cluster_n,
+    }
 
 
 def build_routed_gemm(
     request: Request,
     renderings: dict[str, Callable[[str], str]] | None = None,
-    entry_defines: Iterable[str] = (),
+    entry_definitions: Mapping[str, cuda.Definition] | None = None,
 ) -> None:
     """Compiles one descriptor of a routed NVFP4 batched-GEMM package.
 
@@ -438,32 +527,20 @@ def build_routed_gemm(
        into the compile's include path, so the runner's configuration list is
        exactly this descriptor's tactics: a cubin that is not published cannot
        be selected;
-    4. compile the entry unit (the manifest's ``[source] unit``) and the vendor
-       units its runner resolves, and link ``module.so``.
+    4. compile the entry unit and :data:`ROUTED_GEMM` and link ``module.so``
+       (:func:`build`).
 
     ``renderings`` adds the enum renderings of options only one package's
-    manifest selects, and ``entry_defines`` the preprocessor definitions only
-    one package's entry unit reads. The module
-    needs the CUDA driver (`libcuda`) as well as the runtime: trtllm-gen's
-    launcher calls `cuModuleLoadData`, `cuModuleGetFunction` and
-    `cuLaunchKernelEx` directly, and the entry writes the padded route count
-    with `cuMemsetD32Async`.
+    manifest selects, and ``entry_definitions`` the preprocessor definitions
+    only one package's entry unit reads. The entry writes the padded route count
+    with `cuMemsetD32Async`, a driver call of its own.
     """
-    if request.unit is None:
-        raise SystemExit(
-            "a routed product names its entry unit in [source] unit"
-        )
-    data = data_tree()
     out = request.output
     renderings = {**RENDERINGS, **(renderings or {})}
-    # The staged library, the filtered table and the objects are the build's
-    # own intermediates, in a directory of its workspace the module does not
-    # publish (a dot directory).
-    with tempfile.TemporaryDirectory(dir=out, prefix=".") as scratch:
-        staging = pathlib.Path(scratch)
+    with cuda.scratch(request) as staging:
         stage(
             request,
-            "trtllm-gen-bmm",
+            ROUTED_GEMM.library,
             staging,
             ["include/flashinferMetaInfo.h", *EXPORT_HEADERS],
         )
@@ -478,7 +555,7 @@ def build_routed_gemm(
         )
         stage(
             request,
-            "trtllm-gen-bmm",
+            ROUTED_GEMM.library,
             staging,
             [cubin_name(name) for name in kept],
         )
@@ -502,53 +579,13 @@ def build_routed_gemm(
             filtered_header(header, blocks, kept)
         )
 
-        includes = headers(staging, data)
-        defines = [*DEFINES, 'TLLM_GEN_GEMM_CUBIN_PATH="."']
-        objects = [staging / "entry.o"]
-        run(
-            nvcc_command(
-                request,
-                [*defines, *geometry(request.fields), *entry_defines],
-                includes,
-                request.package / request.unit,
-                objects[0],
-            ),
-            "compiling the entry unit",
+        build(
+            request,
+            ROUTED_GEMM,
+            includes=artifact_includes(staging),
+            definitions={"TLLM_GEN_GEMM_CUBIN_PATH": '"."'},
+            entry_definitions={
+                **geometry(request.fields),
+                **(entry_definitions or {}),
+            },
         )
-        # The vendor units carry no descriptor: they are the launch code.
-        for relative in SOURCES:
-            objects.append(staging / (pathlib.Path(relative).stem + ".o"))
-            run(
-                nvcc_command(
-                    request, defines, includes, data / relative, objects[-1]
-                ),
-                f"compiling {relative}",
-            )
-
-        # trtllm-gen's launcher calls the CUDA driver API directly, and the
-        # entry writes the padded route count through it: the toolkit's stub is
-        # the link-time input, and the serving process loads the driver.
-        cuda = request.toolchain.require_cuda()
-        run(
-            [
-                cuda.nvcc,
-                "-shared",
-                f"-arch={request.target}",
-                *[str(one) for one in objects],
-                f"-L{cuda.stubs}",
-                "-lcuda",
-                "-lcudart",
-                "-o",
-                str(out / "module.so"),
-            ],
-            "linking module.so",
-        )
-    print(
-        json.dumps(
-            {
-                "descriptor": request.descriptor,
-                "target": request.target.name,
-                "cubins": len(kept),
-            }
-        )
-    )

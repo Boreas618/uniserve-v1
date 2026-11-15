@@ -29,9 +29,7 @@ def compile(request: Request) -> None:
     field), and the runner's activation in the entry unit, which reads
     `UNISERVE_GELU_TANH`.
     """
+    gelu_tanh = request.field("activation") == "gelu_tanh"
     trtllm.build_routed_gemm(
-        request,
-        entry_defines=[
-            f"UNISERVE_GELU_TANH={int(request.field('activation') == 'gelu_tanh')}"
-        ],
+        request, entry_definitions={"UNISERVE_GELU_TANH": gelu_tanh}
     )

@@ -15,6 +15,7 @@ packages = ["flashinfer-python"]
 
 [source]
 kind = "cuda"
+unit = "src/entry.cpp"
 
 # `hidden_2048_top_8_experts_128_input_bf16_scales_f32_output_bf16`.
 # The extents are launch values; the entry reads a row in whole 8-element groups.

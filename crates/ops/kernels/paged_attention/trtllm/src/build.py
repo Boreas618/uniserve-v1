@@ -16,56 +16,26 @@ Steps:
    select — the element types, `head_dim`, `page`, the mask and the phase, on
    the architecture families the target runs;
 3. fetch those cubins and publish them beside the module, under `cubins/`;
-4. compile the entry unit and the vendor's reduction unit against the staged
-   header, and link `module.so`.
-
-The module needs two things besides the runtime: the CUDA driver (`libcuda`),
-because trtllm-gen's launcher calls `cuModuleLoadData`, `cuModuleGetFunction`
-and `cuLaunchKernelEx` directly, and the vendor's own `runFmhaReduction`, whose
-definition ships in the same data tree as the headers (`csrc/fmhaReduction.cu`)
-and is compiled beside the entry. The driver is a *link-time stub* and a
-*run-time host library*: the toolkit's `libcuda.so` contributes the symbols and
-the soname `libcuda.so.1`, which the host's driver satisfies when the module is
-loaded — the module carries no driver of its own.
+4. compile the entry unit and the FMHA launch code against the staged header,
+   and link `module.so` (`uniserve_build_server.trtllm.build`).
 
 A descriptor is the operator's: phase, dtype, kv, out, head_dim, page, q_heads,
 kv_heads, mask, window, len.
 """
 
 import hashlib
-import pathlib
 import re
 import shutil
 import sys
-import tempfile
 
-from uniserve_build_server import trtllm
+from uniserve_build_server import cuda, trtllm
 from uniserve_build_server.request import Request
 
 #: The operator's element types, as the artifact names them in a kernel.
 NAMES = {"bf16": "Bfloat16", "f16": "Fp16", "f8e4m3": "E4m3", "f4e2m1": "E2m1"}
 
-#: The pinned trtllm-gen library this package launches.
-LIBRARY = "trtllm-gen-fmha"
-
 #: The artifact's generated kernel table.
 METADATA_HEADER = "include/flashInferMetaInfo.h"
-
-
-#: The compile defines the artifact's own build uses.
-DEFINES = [
-    "TLLM_GEN_EXPORT_INTERFACE",
-    "FLASHINFER_ENABLE_F16",
-    "FLASHINFER_ENABLE_BF16",
-    "FLASHINFER_ENABLE_FP8_E4M3",
-    "FLASHINFER_ENABLE_FP8_E5M2",
-    "FLASHINFER_ENABLE_FP8_E8M0",
-    "FLASHINFER_ENABLE_FP4_E2M1",
-    "ENABLE_BF16",
-    "ENABLE_FP8",
-    "ENABLE_FP4",
-    "NDEBUG",
-]
 
 
 def matching_kernels(header, fields, target):
@@ -131,123 +101,38 @@ def matching_kernels(header, fields, target):
     return sorted(set(kept))
 
 
-def publish_cubins(request, names, artifact):
-    """Publish the named cubins beside the module, as bytes, not links."""
-    trtllm.stage(
-        request, LIBRARY, artifact, [f"{name}.cubin" for name in names]
-    )
-    for name in names:
-        staged = artifact / f"{name}.cubin"
-        if not staged.is_file():
-            raise SystemExit(f"the fetcher staged no {staged}")
-        target = request.output / "cubins" / f"{name}.cubin"
-        target.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copyfile(staged.resolve(), target)
-
-
 def compile(request: Request) -> None:
     """Compile the request's descriptor into ``module.so`` with its cubins.
 
-    The artifact is the build's input, not the module: it is staged into a dot
-    directory of the request's output, which the Build Server does not
-    publish, compiled against, and never enters the directory a runner is
-    handed. The objects are staged there too.
+    The artifact is the build's input, not the module: it is staged into the
+    build's scratch (`uniserve_build_server.cuda.scratch`), compiled
+    against, and never enters the directory a runner is handed.
     """
-    data = trtllm.data_tree()
-    with tempfile.TemporaryDirectory(dir=request.output, prefix=".") as scratch:
-        staging = pathlib.Path(scratch)
-        trtllm.stage(request, LIBRARY, staging, [METADATA_HEADER])
-        build(request, data, staging)
+    with cuda.scratch(request) as artifact:
+        trtllm.stage(request, trtllm.FMHA.library, artifact, [METADATA_HEADER])
+        header_path = artifact / METADATA_HEADER
+        names = matching_kernels(
+            header_path.read_text(), request.fields, request.target
+        )
 
+        cubins = [f"{name}.cubin" for name in names]
+        trtllm.stage(request, trtllm.FMHA.library, artifact, cubins)
+        published = request.output / "cubins"
+        published.mkdir(parents=True, exist_ok=True)
+        for cubin in cubins:
+            shutil.copyfile(artifact / cubin, published / cubin)
+        print(f"published {len(names)} cubins", file=sys.stderr)
 
-def build(request, data, artifact):
-    """Compile one descriptor's module and publish the cubins it can select.
-
-    ``artifact`` is the scratch directory the artifact's header is staged in;
-    the cubins and the objects are staged beside it.
-    """
-    package = request.package
-    target = request.target
-    header_path = artifact / METADATA_HEADER
-    header = header_path.read_text()
-    names = matching_kernels(header, request.fields, target)
-    publish_cubins(request, names, artifact)
-    print(f"published {len(names)} cubins", file=sys.stderr)
-
-    metainfo_hash = hashlib.sha256(header_path.read_bytes()).hexdigest()
-    cuda = request.toolchain.require_cuda()
-    # The compiler's identity is part of a failure: a module that builds on one
-    # host and not another is a defect of the package, and this is what the
-    # next reader needs to see it, beside the command `trtllm.run` logs.
-    identity = f"{cuda.nvcc} ({cuda.version})"
-    includes = [
-        artifact / "include",
-        data / "include",
-        data / "csrc",
-        data / "csrc/nv_internal",
-        data / "csrc/nv_internal/include",
-        data / "cutlass/include",
-        data / "cutlass/tools/util/include",
-        data / "cccl/libcudacxx/include",
-        data / "cccl/cub",
-        data / "cccl/thrust",
-    ]
-    unit = artifact / "entry.o"
-    command = [
-        cuda.nvcc,
-        "-c",
-        "-x",
-        "cu",
-        "-O3",
-        "-std=c++17",
-        f"-arch={target}",
-        "--expt-relaxed-constexpr",
-        "-Xcompiler",
-        "-fPIC",
-        *[f"-D{one}" for one in DEFINES],
-        '-DTLLM_GEN_FMHA_CUBIN_PATH="."',
-        f'-DTLLM_GEN_FMHA_METAINFO_HASH="{metainfo_hash}"',
-        *[f"-I{one}" for one in includes],
-        "-o",
-        str(unit),
-        str(package / "src/entry.cpp"),
-    ]
-    trtllm.run(command, f"compiling the entry unit with {identity}")
-
-    # trtllm-gen's launcher also calls the vendor's own reduction
-    # (`tensorrt_llm::kernels::runFmhaReduction`), whose definition ships in the
-    # same data tree as the headers: it is compiled beside the entry, with the
-    # entry's own flags, and linked into the module.
-    reduction = artifact / "fmhaReduction.o"
-    reduction_command = [
-        *command[:-3],
-        "-o",
-        str(reduction),
-        str(data / "csrc/fmhaReduction.cu"),
-    ]
-    trtllm.run(
-        reduction_command,
-        f"compiling the vendor's reduction unit with {identity}",
-    )
-
-    # trtllm-gen's launcher calls the CUDA driver API directly
-    # (`cuModuleLoadData`, `cuModuleGetFunction`, `cuLaunchKernelEx`), so the
-    # module links against `libcuda` as well as the runtime. The toolkit's stub
-    # `libcuda.so` is a link-time input only, named by its directory: the
-    # module carries no dependency of that name, and the host's own driver
-    # satisfies the symbols when the module is loaded.
-    trtllm.run(
-        [
-            cuda.nvcc,
-            "-shared",
-            f"-arch={target}",
-            str(unit),
-            str(reduction),
-            f"-L{cuda.stubs}",
-            "-lcuda",
-            "-lcudart",
-            "-o",
-            str(request.output / "module.so"),
-        ],
-        "linking module.so",
-    )
+        # The launch code's header refuses to compile without the table's hash
+        # and the directory its loader prefixes to a cubin's name, both of
+        # which FlashInfer's own build defines.
+        metainfo_hash = hashlib.sha256(header_path.read_bytes()).hexdigest()
+        trtllm.build(
+            request,
+            trtllm.FMHA,
+            includes=[artifact / "include"],
+            definitions={
+                "TLLM_GEN_FMHA_CUBIN_PATH": '"."',
+                "TLLM_GEN_FMHA_METAINFO_HASH": f'"{metainfo_hash}"',
+            },
+        )

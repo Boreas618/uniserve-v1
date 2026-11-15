@@ -21,7 +21,7 @@ packages = ["flashinfer-python"]
 
 [source]
 kind = "cuda"
-unit = "src/entry.cpp"
+unit = "src/entry.cu"
 
 [kernel]
 requires = ["tensor_memory"]
@@ -43,12 +43,6 @@ requires = ["tensor_memory"]
 # a size no published tactic divides.
 [[kernel.descriptors]]
 dimensions = { hidden = { multiple = 64 }, intermediate = { multiple = 128 }, experts = { min = 1 }, top = { min = 1 }, activation = ["silu", "gelu_tanh"], dtype = ["bf16"], scale = ["f8e4m3", "u8"], layout = ["swizzled_128x4", "linear"], tile = ["128x8", "128x16", "128x32", "128x64", "128x128", "128x192", "128x256"], cluster = ["1x1", "2x1", "1x2"] }
-
-[parameters]
-# The trtllm-gen batched-GEMM artifact: the pin its manifest is hashed by, and the
-# header (`include/flashinferMetaInfo.h`) whose kernel table names every cubin.
-artifact = "trtllm-gen-bmm"
-artifact_sha256 = "011635d3c36756addcdc148eea90c984f2d7611ba375626aaaf466d355c80e50"
 
 # The descriptor's own values the artifact's table is filtered by, as the entry
 # compiles them in. A cubin whose name disagrees with any of these is not

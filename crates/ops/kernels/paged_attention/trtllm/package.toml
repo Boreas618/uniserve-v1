@@ -10,10 +10,9 @@
 # `priority` puts it ahead of the Triton package, which declares the same keys as a
 # fallback, wherever both cover a key.
 #
-# The manifest records where the kernels come from: `[toolchain] packages` names
-# the FlashInfer distribution that carries the launch code, and
-# `[parameters] artifact` the pinned trtllm-gen artifact the Build Server's
-# fetcher verifies before the build reads it.
+# `[toolchain] packages` names the FlashInfer distribution that carries the
+# launch code; the build stages the pinned trtllm-gen FMHA library it launches
+# (`uniserve_build_server.trtllm.FMHA`).
 
 op = "paged_attention"
 backend = "trtllm"
@@ -25,6 +24,7 @@ packages = ["flashinfer-python"]
 
 [source]
 kind = "cuda"
+unit = "src/entry.cu"
 
 [kernel]
 requires = ["tensor_memory"]
@@ -54,8 +54,3 @@ dimensions = { phase = ["decode", "prefill"], dtype = ["bf16"], kv = ["bf16"], o
 
 [[kernel.descriptors]]
 dimensions = { phase = ["decode", "prefill"], dtype = ["f16"], kv = ["f16"], out = ["f16"], head_dim = ["128", "64", "256"], page = ["64", "16", "32"], q_heads = { min = 1 }, kv_heads = { min = 1 }, mask = ["causal", "dense"], window = ["false"], len = { min = 1 } }
-
-[parameters]
-# The trtllm-gen artifact: the pin its manifest is hashed by.
-artifact = "trtllm-gen-fmha"
-artifact_sha256 = "d79b5c51fc8597fac57dae0da4afa114fb2014575e4ec3df099ad856d97cabc3"
