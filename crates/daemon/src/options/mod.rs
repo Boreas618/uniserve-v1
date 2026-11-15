@@ -874,11 +874,12 @@ impl ServerArgs {
         );
         // The model holds the capacity to its own bounds when its processor
         // is bound; a duration that is no positive number admits nothing.
-        anyhow::ensure!(
-            self.video_config.max_seconds.is_finite() && self.video_config.max_seconds > 0.0,
-            "`video_config.max_seconds` must be a positive number of seconds, got {}",
-            self.video_config.max_seconds
-        );
+        if let Some(seconds) = self.video_config.max_seconds {
+            anyhow::ensure!(
+                seconds.is_finite() && seconds > 0.0,
+                "`video_config.max_seconds` must be a positive number of seconds, got {seconds}"
+            );
+        }
         Ok(())
     }
 

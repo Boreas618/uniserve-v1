@@ -1404,6 +1404,8 @@ impl ModelRunner {
         let longest = self.engine_config().model.max_model_len;
         let sizes = video
             .sizes
+            .as_deref()
+            .context("the leader states a video deployment's sizes")?
             .iter()
             .map(|size| {
                 size.split_once('x')
@@ -1413,7 +1415,9 @@ impl ModelRunner {
             .collect::<Result<Vec<(u32, u32)>>>()?;
         Ok(VideoServing {
             sizes,
-            max_seconds: video.max_seconds,
+            max_seconds: video
+                .max_seconds
+                .context("the leader states a video deployment's longest output")?,
             text_capacities: prompt_capacities(video, longest)?,
             condition_rows: video.max_condition_rows,
         })

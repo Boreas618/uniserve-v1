@@ -327,6 +327,14 @@ mod tests {
             &[]
         }
 
+        fn default_sizes(&self) -> &'static [&'static str] {
+            &["768x768"]
+        }
+
+        fn default_max_seconds(&self) -> f64 {
+            4.0
+        }
+
         fn bind(&self, _: VideoBinding<'_>) -> Result<Box<dyn VideoProcessor>, String> {
             Err("this family binds no processor".to_owned())
         }

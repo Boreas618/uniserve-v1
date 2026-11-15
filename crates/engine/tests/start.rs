@@ -475,8 +475,8 @@ fn media_two_host_launch(
     config.parallel.engine_host = "rank-0".to_owned();
     config.parallel.worker_groups = groups;
     config.video = proto::config::VideoConfig {
-        max_seconds: 4.0,
-        sizes: vec!["768x768".to_owned()],
+        max_seconds: Some(4.0),
+        sizes: Some(vec!["768x768".to_owned()]),
         text_capacities: None,
         max_condition_rows: None,
     };

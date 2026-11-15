@@ -908,9 +908,24 @@ impl Leader {
         model.eos = control_tokens.eos;
         // Video workers prepare exactly the configured sizes, refusing one
         // their model does not generate, and report them back as the only
-        // sizes requests may target. Other models prepare none.
-        if model_config.video().is_none() {
-            engine.video.sizes.clear();
+        // sizes requests may target; the family states the sizes and the
+        // longest output a configuration leaves unset. Other models prepare
+        // none.
+        match model_config.video() {
+            Some(family) => {
+                let video = &mut engine.video;
+                video.sizes.get_or_insert_with(|| {
+                    family
+                        .default_sizes()
+                        .iter()
+                        .map(|&size| size.to_owned())
+                        .collect()
+                });
+                video
+                    .max_seconds
+                    .get_or_insert_with(|| family.default_max_seconds());
+            }
+            None => engine.video.sizes = None,
         }
 
         Ok(Prepared {
@@ -978,7 +993,11 @@ impl Leader {
                     .bind(processing::VideoBinding {
                         description: &info.video_denoiser,
                         latent_encoding_units: info.latent_encoding_units.max(1),
-                        max_seconds: config.video_config.max_seconds,
+                        max_seconds: served
+                            .engine_config
+                            .video
+                            .max_seconds
+                            .context("the leader states a video deployment's longest output")?,
                         processor_options: &config.mm_processor_kwargs,
                         files: &files,
                     })

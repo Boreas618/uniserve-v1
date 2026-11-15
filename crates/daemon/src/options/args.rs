@@ -410,7 +410,7 @@ mod tests {
                 .map(|sizes| sizes.iter().map(|size| size.get()).collect::<Vec<_>>()),
             Some(vec![1024, 10240])
         );
-        assert_eq!(config.video_config.sizes, ["1344x768"]);
+        assert_eq!(config.video_config.sizes, Some(vec!["1344x768".to_owned()]));
         assert_eq!(config.quantization.mode, Some(PrecisionMode::Balanced));
         assert_eq!(
             config.quantization.modules,

@@ -51,6 +51,11 @@ pub const MIN_SECONDS: f64 = 4.0;
 /// The longest output a request may ask for, in seconds: the most a deployment may serve.
 pub const MAX_SECONDS: f64 = 15.0;
 
+/// The sizes a deployment prepares when it names none, `WxH` in pixels: the landscape and portrait
+/// canvases of the released checkpoint's resolution class (`CANVAS_RULE`, a 768-pixel short edge
+/// and `768 * 1344` pixels).
+pub const DEFAULT_SIZES: [&str; 2] = ["1344x768", "768x1344"];
+
 /// Samples per second of the generated audio track; every soundtrack is resampled to it.
 pub const AUDIO_SAMPLE_RATE: u32 = 32_000;
 
@@ -395,6 +400,14 @@ pub const FAMILY: crate::Family = crate::Family {
 impl VideoFamily for H3Family {
     fn processor_files(&self) -> &'static [(&'static str, &'static str)] {
         PROCESSOR_FILES
+    }
+
+    fn default_sizes(&self) -> &'static [&'static str] {
+        &DEFAULT_SIZES
+    }
+
+    fn default_max_seconds(&self) -> f64 {
+        MAX_SECONDS
     }
 
     fn bind(&self, binding: VideoBinding<'_>) -> Result<Box<dyn VideoProcessor>, String> {

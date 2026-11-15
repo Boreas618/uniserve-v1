@@ -224,6 +224,14 @@ pub trait VideoFamily: Send + Sync {
     /// directory and the file in it.
     fn processor_files(&self) -> &'static [(&'static str, &'static str)];
 
+    /// The output sizes a deployment of the family prepares when its configuration names none
+    /// (`video_config.sizes`), each `WxH` in pixels.
+    fn default_sizes(&self) -> &'static [&'static str];
+
+    /// The longest output a deployment of the family admits when its configuration states none
+    /// (`video_config.max_seconds`), in seconds.
+    fn default_max_seconds(&self) -> f64;
+
     /// Binds the deployment's processor.
     ///
     /// # Errors

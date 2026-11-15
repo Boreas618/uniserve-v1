@@ -377,8 +377,8 @@ The [FastH3 guide](minimax_h3/minimax_h3.md#startup-and-capacity) explains how t
 
 | Option | Default | Meaning |
 | --- | --- | --- |
-| `max_seconds` | `15` | Longest admitted output, in seconds: a positive number, which the served model also holds to its own bounds when its request processor binds (4 to 15 for MiniMax-H3) |
-| `sizes` | `["1344x768", "768x1344"]` | Output sizes startup prepares and requests may name, each `WxH` in pixels; the served model refuses at startup a size its checkpoint does not generate |
+| `max_seconds` | The model family's longest output (15 for MiniMax-H3) | Longest admitted output, in seconds: a positive number, which the served model also holds to its own bounds when its request processor binds (4 to 15 for MiniMax-H3) |
+| `sizes` | The model family's sizes (`["1344x768", "768x1344"]` for MiniMax-H3) | Output sizes startup prepares and requests may name, each `WxH` in pixels; the served model refuses at startup a size its checkpoint does not generate |
 | `text_capacities` | `1024`, then steps of 2048, below `max_model_len` | Prompt capacities startup captures, strictly increasing and none above `max_model_len`; `max_model_len` itself completes them as the largest, so every admitted prompt runs in the smallest capacity that holds it |
 | `max_condition_rows` | Largest condition set | Denoiser rows one request's conditions may take |
 

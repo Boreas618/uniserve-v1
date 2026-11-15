@@ -564,14 +564,16 @@ impl Default for ImageFetchConfig {
 }
 
 /// Video generation (`video_config`).
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct VideoConfig {
-    /// Longest admitted output, in seconds, within the model's own bounds.
-    pub max_seconds: f64,
-    /// Output sizes startup prepares, each `WxH` in pixels (`1344x768`); the
-    /// model refuses a size it does not generate.
-    pub sizes: Vec<String>,
+    /// Longest admitted output, in seconds, within the model's own bounds; the model family's
+    /// default when unset, which the leader states once it reads the checkpoint.
+    pub max_seconds: Option<f64>,
+    /// Output sizes startup prepares, each `WxH` in pixels (`1344x768`); the model refuses a
+    /// size it does not generate. The model family's default sizes when unset, which the leader
+    /// states once it reads the checkpoint; none for a model that generates no video.
+    pub sizes: Option<Vec<String>>,
     /// Prompt capacities startup captures, strictly increasing and none above
     /// `max_model_len`, which completes them as the largest; 1024, then steps
     /// of 2048 below `max_model_len`, when unset.
@@ -579,17 +581,6 @@ pub struct VideoConfig {
     /// Denoiser rows one request's conditions may take; the largest
     /// condition set the denoiser admits when unset.
     pub max_condition_rows: Option<u32>,
-}
-
-impl Default for VideoConfig {
-    fn default() -> Self {
-        Self {
-            max_seconds: 15.0,
-            sizes: vec!["1344x768".to_owned(), "768x1344".to_owned()],
-            text_capacities: None,
-            max_condition_rows: None,
-        }
-    }
 }
 
 /// Condition media of video requests (`media_config`).

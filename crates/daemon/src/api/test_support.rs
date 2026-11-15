@@ -99,6 +99,14 @@ impl processing::VideoFamily for TestVideo {
         &[]
     }
 
+    fn default_sizes(&self) -> &'static [&'static str] {
+        &["768x768"]
+    }
+
+    fn default_max_seconds(&self) -> f64 {
+        4.0
+    }
+
     fn bind(
         &self,
         _: processing::VideoBinding<'_>,
