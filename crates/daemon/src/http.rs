@@ -819,8 +819,9 @@ mod tests {
     }
 
     /// A LoRA adapter's checkpoint: one tensor in a safetensors file of a
-    /// directory of its own, its header padded to a multiple of eight bytes as
-    /// the format states.
+    /// directory of its own, under the PEFT file name the engine reads
+    /// (`adapter_model.safetensors`), its header padded to a multiple of eight
+    /// bytes as the format states.
     fn adapter_checkpoint() -> tempfile::TempDir {
         let directory = tempfile::tempdir().expect("an adapter directory");
         let mut header =
@@ -830,7 +831,7 @@ mod tests {
         let mut file = (header.len() as u64).to_le_bytes().to_vec();
         file.extend_from_slice(header.as_bytes());
         file.extend_from_slice(&1.0_f32.to_le_bytes());
-        std::fs::write(directory.path().join("adapter.safetensors"), file)
+        std::fs::write(directory.path().join("adapter_model.safetensors"), file)
             .expect("an adapter checkpoint");
         directory
     }
