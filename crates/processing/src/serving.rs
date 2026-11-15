@@ -141,4 +141,17 @@ impl ToolCallFormat {
     pub fn named(name: &str) -> Option<Self> {
         Self::ALL.into_iter().find(|format| format.name() == name)
     }
+
+    /// The text that opens one tool-call region and the text that closes it.
+    ///
+    /// The JSON format's newlines belong to its delimiters, as its families' chat templates
+    /// instruct them, so a bare `<tool_call>` mentioned in prose stays text. The tag format
+    /// writes its tags on lines of their own, and whitespace between its tags carries no
+    /// meaning, so its delimiters are the tags alone.
+    pub const fn delimiters(self) -> (&'static str, &'static str) {
+        match self {
+            Self::Json => ("<tool_call>\n", "\n</tool_call>"),
+            Self::Xml => ("<tool_call>", "</tool_call>"),
+        }
+    }
 }

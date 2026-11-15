@@ -6,8 +6,6 @@
 
 pub use decoded::DecodeStream;
 pub use decoded::DecodedTextEvent;
-pub use error::{Error, Result};
 
 mod decoded;
-mod error;
 mod logprobs;

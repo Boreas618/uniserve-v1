@@ -18,6 +18,7 @@ use std::sync::Arc;
 use proto::handoff;
 use proto::request::Event;
 
+use crate::api::error::Error;
 use crate::api::events::{Events, Stats};
 use crate::api::output::assembly::StreamClock;
 use crate::api::output::chat::ChatParser;
@@ -44,6 +45,38 @@ pub struct OutputProcessor {
     ended: bool,
 }
 
+/// The parts of a lowering every token response is built from, each checked present once.
+struct Parts {
+    response: handoff::ChatResponseOptions,
+    parser: handoff::Parser,
+    decode: handoff::TextDecode,
+}
+
+impl Parts {
+    /// The parts `lowering` states.
+    ///
+    /// # Errors
+    ///
+    /// Fails with [`Error::Lowering`] when it leaves one out.
+    fn of(lowering: &handoff::Lowering) -> Result<Self, Error> {
+        let missing = |part| Error::Lowering { part };
+        Ok(Self {
+            response: lowering
+                .response
+                .clone()
+                .ok_or_else(|| missing("response fields"))?,
+            parser: lowering
+                .parser
+                .clone()
+                .ok_or_else(|| missing("output parsers"))?,
+            decode: lowering
+                .decode_options
+                .clone()
+                .ok_or_else(|| missing("decode options"))?,
+        })
+    }
+}
+
 impl OutputProcessor {
     /// The output processor of the request `lowering` describes, before any engine event.
     ///
@@ -53,46 +86,46 @@ impl OutputProcessor {
     ///
     /// # Errors
     ///
-    /// Fails when the prompt is empty or the tokenizer lacks a delimiter of the family's
-    /// reasoning format.
+    /// Fails when the lowering leaves out a part every response states, the prompt is empty, or
+    /// the request's parsers cannot be built.
     pub fn new(
         tokenizer: DynTokenizer,
         lowering: handoff::Lowering,
         compile_us: u64,
         stats: Box<dyn Stats>,
     ) -> Result<Self, OutputError> {
-        let handoff::Lowering {
-            prompt_token_ids,
-            decode_options,
-            prompt_logprobs,
-            logprobs,
-            parser,
-            response,
-        } = lowering;
-        let response = response.unwrap_or_default();
-        let parser = parser.unwrap_or_default();
-        let failed = |source: crate::api::output::chat::Error| OutputError {
-            request_id: response.request_id.clone(),
+        let request_id = lowering
+            .response
+            .as_ref()
+            .map(|response| response.request_id.clone())
+            .unwrap_or_default();
+        let failed = |source| OutputError {
+            request_id: request_id.clone(),
             source,
         };
+        let Parts {
+            response,
+            parser,
+            decode,
+        } = Parts::of(&lowering).map_err(failed)?;
 
         let parsers = ChatParser::new(&parser, Arc::clone(&tokenizer)).map_err(failed)?;
         let decode = DecodeStream::new(
             response.request_id.clone(),
             tokenizer,
-            prompt_token_ids,
-            prompt_logprobs,
-            logprobs,
-            decode_options.unwrap_or_default(),
+            lowering.prompt_token_ids,
+            lowering.prompt_logprobs,
+            lowering.logprobs,
+            decode,
         )
-        .map_err(|source| failed(source.into()))?;
+        .map_err(failed)?;
         let clock = StreamClock::new(stats.started(), compile_us);
 
         Ok(Self {
             response,
             parser,
-            prompt_logprobs,
-            logprobs,
+            prompt_logprobs: lowering.prompt_logprobs,
+            logprobs: lowering.logprobs,
             decode,
             parsers,
             blocks: StructuredEventState::new(),
@@ -108,36 +141,43 @@ impl OutputProcessor {
     ///
     /// # Errors
     ///
-    /// Fails as [`Self::new`] does.
+    /// Fails as [`Self::new`] does, and when a state does not fit the processor the lowering
+    /// builds.
     pub fn resume(
         tokenizer: DynTokenizer,
         lowering: &handoff::Lowering,
         decode: &handoff::Decode,
-        parsers: Option<&handoff::Processor>,
+        parsers: &handoff::Processor,
         assembly: &handoff::Assembly,
         stats: Box<dyn Stats>,
     ) -> Result<Self, OutputError> {
-        let response = lowering.response.clone().unwrap_or_default();
-        let parser = lowering.parser.clone().unwrap_or_default();
-        let failed = |source: crate::api::output::chat::Error| OutputError {
-            request_id: response.request_id.clone(),
+        let request_id = lowering
+            .response
+            .as_ref()
+            .map(|response| response.request_id.clone())
+            .unwrap_or_default();
+        let failed = |source| OutputError {
+            request_id: request_id.clone(),
             source,
         };
+        let Parts {
+            response,
+            parser,
+            decode: options,
+        } = Parts::of(lowering).map_err(failed)?;
 
         let mut chat = ChatParser::new(&parser, Arc::clone(&tokenizer)).map_err(failed)?;
-        if let Some(state) = parsers {
-            chat.resume(state);
-        }
+        chat.resume(parsers).map_err(failed)?;
         let decode = DecodeStream::resume(
             response.request_id.clone(),
             tokenizer,
             lowering.prompt_token_ids.clone(),
             lowering.prompt_logprobs,
             lowering.logprobs,
-            lowering.decode_options.clone().unwrap_or_default(),
+            options,
             decode,
         )
-        .map_err(|source| failed(source.into()))?;
+        .map_err(failed)?;
         let mut blocks = StructuredEventState::new();
         blocks.resume(assembly);
 
@@ -192,14 +232,11 @@ impl OutputProcessor {
         events: &mut dyn Events,
     ) -> Result<Vec<RequestOutput>, OutputError> {
         let request_id = self.response.request_id.clone();
-        let failed = |source: crate::api::output::chat::Error| OutputError {
+        let failed = |source| OutputError {
             request_id: request_id.clone(),
             source,
         };
-        let decoded = self
-            .decode
-            .push(event, events)
-            .map_err(|source| failed(source.into()))?;
+        let decoded = self.decode.push(event, events).map_err(failed)?;
 
         let mut outputs = Vec::new();
         for event in decoded {
@@ -311,9 +348,8 @@ impl OutputProcessor {
         self.decode.state()
     }
 
-    /// The reasoning and tool-call parsers' state; `None` when a parser cannot be continued,
-    /// in which case the response cannot be handed over.
-    pub fn parser_state(&self) -> Option<handoff::Processor> {
+    /// The reasoning and tool-call parsers' state.
+    pub fn parser_state(&self) -> handoff::Processor {
         self.parsers.state()
     }
 

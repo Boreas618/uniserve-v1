@@ -435,3 +435,39 @@ pub mod chat {
         }
     }
 }
+
+/// Drives tool parsers over text cut into chunks, as decoded text reaches them.
+pub mod tool_parsing {
+    use itertools::Itertools as _;
+
+    use crate::api::error::Result;
+    use crate::api::output::tools::{ToolParser, ToolParserOutput};
+
+    /// The output of `chunks` pushed through `parser` in order and the parser finished, with
+    /// each call's deltas merged.
+    pub fn parse_chunks<'a>(
+        parser: &mut dyn ToolParser,
+        chunks: impl IntoIterator<Item = &'a str>,
+    ) -> Result<ToolParserOutput> {
+        let mut output = ToolParserOutput::default();
+        for chunk in chunks {
+            parser.parse_into(chunk, &mut output)?;
+        }
+        output.append(parser.finish()?);
+        Ok(output.coalesce_calls())
+    }
+
+    /// The output of the whole of `text` pushed through `parser` as one chunk.
+    pub fn parse_whole(parser: &mut dyn ToolParser, text: &str) -> Result<ToolParserOutput> {
+        parse_chunks(parser, [text])
+    }
+
+    /// `text` cut into chunks of `size` characters, the last one shorter.
+    pub fn chunks_of(text: &str, size: usize) -> Vec<String> {
+        text.chars()
+            .chunks(size)
+            .into_iter()
+            .map(String::from_iter)
+            .collect()
+    }
+}

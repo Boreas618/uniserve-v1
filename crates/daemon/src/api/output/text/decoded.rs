@@ -19,8 +19,8 @@ use proto::request::{Event, PositionLogprobs, RejectionKind};
 use tracing::{Level, debug, trace};
 
 use super::logprobs::{decode_logprobs, decode_prompt_logprobs};
+use crate::api::error::Error;
 use crate::api::output::events::{FinishReason, PromptInfo, StopReason};
-use crate::api::output::text::error::Error;
 use crate::api::tokenizer::{DynTokenizer, IncrementalDecoder};
 use proto::handoff::DecodedLogprobs;
 
@@ -128,7 +128,7 @@ impl DecodeStream {
     ///
     /// # Errors
     ///
-    /// Fails with [`Error::EmptyPromptTokenIds`] when the prompt is empty.
+    /// Fails with [`Error::EmptyPrompt`] when the prompt is empty.
     pub fn new(
         request_id: String,
         tokenizer: DynTokenizer,
@@ -138,7 +138,7 @@ impl DecodeStream {
         decode_options: TextDecode,
     ) -> Result<Self, Error> {
         if prompt_token_ids.is_empty() {
-            return Err(Error::EmptyPromptTokenIds { request_id });
+            return Err(Error::EmptyPrompt { request_id });
         }
         let decoder = tokenizer.create_decode_stream(
             &prompt_token_ids,
@@ -506,7 +506,7 @@ impl DecodeStream {
     ///
     /// # Errors
     ///
-    /// Fails with [`Error::EmptyPromptTokenIds`] when the state names no prompt.
+    /// Fails with [`Error::EmptyPrompt`] when the state names no prompt.
     pub fn resume(
         request_id: String,
         tokenizer: DynTokenizer,
@@ -517,7 +517,7 @@ impl DecodeStream {
         state: &proto::handoff::Decode,
     ) -> Result<Self, Error> {
         if prompt_token_ids.is_empty() {
-            return Err(Error::EmptyPromptTokenIds { request_id });
+            return Err(Error::EmptyPrompt { request_id });
         }
         let decoder = match &state.decoder {
             Some(decoder) => IncrementalDecoder::resume(decoder, Arc::clone(&tokenizer)),

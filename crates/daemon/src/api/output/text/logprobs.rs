@@ -13,7 +13,7 @@ use proto::handoff::{
 };
 use proto::request::PositionLogprobs;
 
-use crate::api::output::text::error::Error;
+use crate::api::error::Error;
 
 /// Decodes generated-token logprobs from the engine's token-ID candidates into
 /// the text-layer decoded-token representation.
@@ -40,7 +40,7 @@ pub(super) fn decode_logprobs(
 ///
 /// # Errors
 ///
-/// Returns [`Error::EmptyPromptTokenIds`] for an empty prompt and a tokenizer
+/// Returns [`Error::EmptyPrompt`] for an empty prompt and a tokenizer
 /// error when a token cannot be decoded.
 pub(super) fn decode_prompt_logprobs(
     request_id: &str,
@@ -50,7 +50,7 @@ pub(super) fn decode_prompt_logprobs(
     skip_special_tokens: bool,
 ) -> Result<DecodedPromptLogprobs, Error> {
     let Some(first_token_id) = prompt_token_ids.first().copied() else {
-        return Err(Error::EmptyPromptTokenIds {
+        return Err(Error::EmptyPrompt {
             request_id: request_id.to_string(),
         });
     };

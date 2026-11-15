@@ -1,100 +1,85 @@
 //! The tool-call stage of [`ChatParser`](super::ChatParser).
 //!
-//! Visible text passes through the model's `ToolParser`; reasoning passes
-//! unchanged. A parser error does not fail the request: the stage logs it and
-//! forwards all later text unparsed. After a parse error, the input the
-//! parser has not represented in its output, such as a whole call whose
-//! header failed, is re-emitted as visible text. Finalization fails only
-//! while a published call is open; that call keeps the arguments already
-//! streamed.
+//! Visible text passes through the request's `ToolParser`; reasoning passes unchanged. A
+//! malformed call fails the stage with the parser's error, which fails the request's output
+//! processing, so the response reports the model's malformed call instead of passing it on as
+//! text.
 
 use proto::handoff;
-use thiserror_ext::AsReport as _;
-use tracing::warn;
 
 use super::AssistantEvent;
 use super::parser::generate_tool_call_id;
-use crate::api::output::chat::{AssistantBlockKind, Error, Result};
+use crate::api::error::{Error, Result};
+use crate::api::output::chat::AssistantBlockKind;
 use crate::api::output::tools::{ToolCallDelta, ToolParser, ToolParserItem, ToolParserOutput};
 
 /// Tool-stage state for one request.
 pub(super) struct ToolStage {
     parser: Box<dyn ToolParser>,
-    /// Set after a parse or finalization error; later text bypasses the parser.
-    parser_failed: bool,
-    /// Parser-local index of the tool call that later argument deltas extend.
-    /// Cleared when visible text or a non-`Text` delta follows the call, or
-    /// when the parser fails.
+    /// Parser-local index of the tool call that later argument deltas extend. Cleared when
+    /// visible text or reasoning follows the call.
     open_call_index: Option<usize>,
 }
 
 impl ToolStage {
-    /// Creates the stage state around the request's tool parser.
+    /// The stage around the request's tool parser.
     pub(super) fn new(parser: Box<dyn ToolParser>) -> Self {
         Self {
             parser,
-            parser_failed: false,
             open_call_index: None,
         }
     }
 
-    /// The stage's state, for the process that goes on parsing where this one
-    /// stopped (design §7.5.1 step 3); `None` when the parser has no state.
-    pub(super) fn state(&self) -> Option<handoff::ToolStage> {
-        Some(handoff::ToolStage {
-            parser_failed: self.parser_failed,
+    /// The stage's state, for the process that goes on parsing where this one stopped.
+    pub(super) fn state(&self) -> handoff::ToolStage {
+        handoff::ToolStage {
             open_call_index: self.open_call_index.map(|index| index as u64),
-            parser: Some(self.parser.state()?),
-        })
-    }
-
-    /// Takes over `state`, which this stage's parser produced.
-    pub(super) fn resume(&mut self, state: &handoff::ToolStage) {
-        self.parser_failed = state.parser_failed;
-        self.open_call_index = state.open_call_index.map(|index| index as usize);
-        if let Some(parser) = state.parser.as_ref() {
-            self.parser.resume(parser);
+            parser: Some(self.parser.state()),
         }
     }
 
-    /// Feeds visible text through incremental tool parsing with a visible-text
-    /// fallback; reasoning, and all text after a parser error, passes
-    /// unchanged and closes the open call.
+    /// Takes over `state`, which a stage of the same parser produced.
     ///
-    /// On a parser error, the events parsed before the error are still
-    /// emitted, followed by `ToolParser::reset`'s unrepresented input as
-    /// visible text: for example the whole attempted call when its header
-    /// failed, or the input after the arguments of an already published call.
+    /// # Errors
+    ///
+    /// Fails with [`Error::Lowering`] when `state` names no parser state, or another format's.
+    pub(super) fn resume(&mut self, state: &handoff::ToolStage) -> Result<()> {
+        let parser = state.parser.as_ref().ok_or(Error::Lowering {
+            part: "tool parser state",
+        })?;
+        self.parser.resume(parser)?;
+        self.open_call_index = state.open_call_index.map(|index| index as usize);
+        Ok(())
+    }
+
+    /// Feeds visible text through the tool parser; reasoning passes unchanged and closes the
+    /// open call.
+    ///
+    /// # Errors
+    ///
+    /// Fails with [`Error::ToolCall`] for a malformed call and [`Error::ToolCallStream`] when
+    /// the parser's deltas are out of order.
     pub(super) fn push(
         &mut self,
         kind: AssistantBlockKind,
         delta: String,
     ) -> Result<Vec<AssistantEvent>> {
         let mut events = Vec::new();
-        if kind != AssistantBlockKind::Text || self.parser_failed {
+        if kind != AssistantBlockKind::Text {
             self.open_call_index = None;
             events.push(AssistantEvent::TextDelta { kind, delta });
             return Ok(events);
         }
 
         let mut output = ToolParserOutput::default();
-        match self.parser.parse_into(&delta, &mut output) {
-            Ok(()) => self.process_parser_output(kind, output, &mut events)?,
-            Err(error) => {
-                warn!(error = %error.as_report(), "tool-call parsing failed");
-                self.parser_failed = true;
-                self.process_parser_output(kind, output, &mut events)?;
-                self.open_call_index = None;
-                push_text_delta(&mut events, kind, self.parser.reset());
-            }
-        }
+        self.parser.parse_into(&delta, &mut output)?;
+        self.process_parser_output(kind, output, &mut events)?;
         Ok(events)
     }
 
     /// Emits one parser output's items in their input order.
     ///
-    /// The parser resumes text only after a call's end delimiter, so a text
-    /// item closes the open call.
+    /// The parser resumes text only after a call's end, so a text item closes the open call.
     fn process_parser_output(
         &mut self,
         kind: AssistantBlockKind,
@@ -105,7 +90,9 @@ impl ToolStage {
             match item {
                 ToolParserItem::Text(text) => {
                     self.open_call_index = None;
-                    push_text_delta(events, kind, text);
+                    if !text.is_empty() {
+                        events.push(AssistantEvent::TextDelta { kind, delta: text });
+                    }
                 }
                 ToolParserItem::Call(call) => self.process_tool_item(call, events)?,
             }
@@ -132,56 +119,37 @@ impl ToolStage {
         if item.arguments.is_empty() {
             return Ok(());
         }
-        let Some(open_call_index) = self.open_call_index else {
-            return Err(Error::ToolCallStreamInvariant {
+        match self.open_call_index {
+            Some(open) if open == item.tool_index => {
+                events.push(AssistantEvent::ToolCallArgumentsDelta {
+                    delta: item.arguments,
+                });
+                Ok(())
+            }
+            Some(open) => Err(Error::ToolCallStream {
+                message: format!(
+                    "received arguments for tool index {} while tool index {open} is open",
+                    item.tool_index
+                ),
+            }),
+            None => Err(Error::ToolCallStream {
                 message: format!(
                     "received arguments for tool index {} before any tool-call start",
                     item.tool_index
                 ),
-            });
-        };
-        if open_call_index != item.tool_index {
-            return Err(Error::ToolCallStreamInvariant {
-                message: format!(
-                    "received arguments for tool index {} while tool index {} is open",
-                    item.tool_index, open_call_index
-                ),
-            });
+            }),
         }
-        events.push(AssistantEvent::ToolCallArgumentsDelta {
-            delta: item.arguments,
-        });
-        Ok(())
     }
 
-    /// Flushes the parser at end of generation.
+    /// Flushes the parser at the end of generation: held-back text is visible text.
     ///
-    /// Buffered text, including an unfinished call with its start marker, is
-    /// emitted as visible text. The parser fails to finalize only while a
-    /// published call is still open; that error is logged and produces no
-    /// events, because the call's arguments have already been streamed and
-    /// only wrapper text remains buffered.
+    /// # Errors
+    ///
+    /// Fails with [`Error::ToolCall`] when the text ended inside a call.
     pub(super) fn finish(&mut self) -> Result<Vec<AssistantEvent>> {
-        if self.parser_failed {
-            return Ok(Vec::new());
-        }
+        let output = self.parser.finish()?;
         let mut events = Vec::new();
-        match self.parser.finish() {
-            Ok(output) => {
-                self.process_parser_output(AssistantBlockKind::Text, output, &mut events)?
-            }
-            Err(error) => {
-                warn!(error = %error.as_report(), "tool-call parser finalization failed");
-                self.parser_failed = true;
-            }
-        }
+        self.process_parser_output(AssistantBlockKind::Text, output, &mut events)?;
         Ok(events)
-    }
-}
-
-/// Appends a nonempty semantic text delta.
-fn push_text_delta(events: &mut Vec<AssistantEvent>, kind: AssistantBlockKind, delta: String) {
-    if !delta.is_empty() {
-        events.push(AssistantEvent::TextDelta { kind, delta });
     }
 }

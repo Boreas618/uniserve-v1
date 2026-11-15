@@ -101,8 +101,8 @@ impl GenerationRun<ChatBodySink> {
     }
 }
 
-/// The output processor of a handed-over response, rebuilt from the parts of
-/// its state every chat response shares.
+/// The output processor of a handed-over response, rebuilt from the parts of its state every
+/// chat response shares, each of which the state must state.
 fn resumed_output(
     tokenizer: DynTokenizer,
     lowering: Option<&handoff::Lowering>,
@@ -112,20 +112,12 @@ fn resumed_output(
     stats: Box<dyn Stats>,
 ) -> anyhow::Result<OutputProcessor> {
     let lowering = lowering.context("a handed response states no lowering")?;
-    lowering
-        .response
-        .as_ref()
-        .context("a handed response states no response fields")?;
+    let decode = decode.context("a handed response states no decoder state")?;
+    let parsers = parsers.context("a handed response states no parser state")?;
+    let assembly = assembly.context("a handed response states no assembly")?;
 
-    OutputProcessor::resume(
-        tokenizer,
-        lowering,
-        decode.unwrap_or(&Default::default()),
-        parsers,
-        assembly.unwrap_or(&Default::default()),
-        stats,
-    )
-    .context("resuming the output processor")
+    OutputProcessor::resume(tokenizer, lowering, decode, parsers, assembly, stats)
+        .context("resuming the output processor")
 }
 
 /// What a response body's outputs become: the frames it writes.
@@ -170,7 +162,7 @@ impl ResponseSink for ChatStreamEmitter {
     }
 
     fn freeze(&self, output: &OutputProcessor, events: &dyn Events) -> Option<Application> {
-        let processor = output.parser_state()?;
+        let processor = output.parser_state();
         let chunks = ChatStreamEmitter::state(self)?;
         let (consumed_events, consumed_tokens) = events.progress();
         let usage_owed = output.response().include_usage && !ChatStreamEmitter::done(self);
@@ -245,7 +237,7 @@ impl ResponseSink for ChatBodySink {
     }
 
     fn freeze(&self, output: &OutputProcessor, events: &dyn Events) -> Option<Application> {
-        let processor = output.parser_state()?;
+        let processor = output.parser_state();
         let (consumed_events, consumed_tokens) = events.progress();
 
         Some(Application::ChatResponse(handoff::ChatResponse {

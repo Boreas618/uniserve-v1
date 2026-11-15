@@ -292,22 +292,22 @@ message Processor {
   optional ToolStage tools = 2;
 }
 
-// The delimited reasoning state machine's state. Its delimiters, labels and
-// region default are configuration: the request's model family restates them
-// when the successor rebuilds the parser.
+// The delimited reasoning state machine's state. Its delimiters and region
+// default are configuration: the request's model family restates them when the
+// successor rebuilds the parser.
 message Reasoning {
+  reserved 2;
+  reserved "label_pending";
   // Whether the text parsed so far is inside a reasoning section.
   bool in_reasoning = 1;
-  // Whether a start delimiter was parsed and its section label may follow.
-  bool label_pending = 2;
-  // Text a later delta may still complete into a delimiter or label.
+  // Text a later delta may still complete into a delimiter.
   string buffer = 3;
 }
 
 // The tool-call stage of the output processor.
 message ToolStage {
-  // Whether parsing failed and later text bypasses the parser.
-  bool parser_failed = 1;
+  reserved 1;
+  reserved "parser_failed";
   // The parser-local index of the tool call later arguments extend.
   optional uint64 open_call_index = 2;
   // The parser behind the stage, with its state.
@@ -319,60 +319,35 @@ message ToolStage {
 
 // The function-and-parameter tag tool-call parser's state.
 message XmlToolCall {
+  reserved 5, 6;
+  reserved "active_tool_index", "emitted_tool_count";
   // Input no complete tag or parameter consumed.
   string buffer = 1;
-  // Whether the text parsed so far is inside `<tool_call>`.
+  // Whether the text parsed so far is inside a tool-call region.
   bool in_tool_call = 2;
   // The function whose call is open, from its `<function=NAME>` tag until its
-  // `</function>`.
+  // `</function>`; the open call is the last one started.
   optional string function = 3;
   // Parameters the open call has published.
   uint64 parameters = 4;
-  // The tool call later arguments extend.
-  optional uint64 active_tool_index = 5;
-  // Tool calls published since the last reset; the next call's index.
-  uint64 emitted_tool_count = 6;
+  // Calls started in the turn; the next call's index.
+  uint64 started = 7;
 }
 
-// The marker-wrapped JSON tool-call parser's state.
+// The JSON tool-call parser's state.
 message JsonToolCall {
-  // Input no complete event consumed.
+  reserved 2, 3, 4;
+  reserved "mode", "active_tool_index", "emitted_tool_count";
+  // Input after the emitted text and the open call's body: a partial start
+  // delimiter outside a call, or a prefix of the end delimiter after a call's
+  // object closed.
   string buffer = 1;
-  // Which part of the grammar the parser is in.
-  JsonToolMode mode = 2;
-  // The tool call later arguments extend.
-  optional uint64 active_tool_index = 3;
-  // Tool calls published since the last reset; the next call's index.
-  uint64 emitted_tool_count = 4;
-}
-
-// A point of the JSON tool-call grammar.
-enum JsonToolModeKind {
-  JSON_TOOL_MODE_TEXT = 0;
-  JSON_TOOL_MODE_HEADER = 1;
-  JSON_TOOL_MODE_ARGUMENTS = 2;
-}
-
-message JsonToolMode {
-  JsonToolModeKind kind = 1;
-  // The arguments object's lexical scan, inside JSON_TOOL_MODE_ARGUMENTS.
-  optional JsonObjectScan scan = 2;
-}
-
-// The lexical scan of one raw JSON arguments object.
-message JsonObjectScan {
-  uint64 object_depth = 1;
-  uint64 array_depth = 2;
-  // Whether the scan is inside a string literal.
-  bool in_string = 3;
-  // Whether the previous string byte was an unescaped backslash.
-  bool escape = 4;
-  enum Phase {
-    JSON_OBJECT_PHASE_INITIAL = 0;
-    JSON_OBJECT_PHASE_SCANNING = 1;
-    JSON_OBJECT_PHASE_COMPLETE = 2;
-  }
-  Phase phase = 5;
+  // The open call's text after its start delimiter, which a successor's parser
+  // reads again to stand where this one stood; the open call is the last one
+  // started.
+  optional string call = 5;
+  // Calls started in the turn; the next call's index.
+  uint64 started = 6;
 }
 
 // The assistant blocks a chat response assembled.

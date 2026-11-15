@@ -42,7 +42,7 @@ pub struct OutputError {
     pub request_id: String,
     /// Underlying decoding or parsing failure.
     #[source]
-    pub source: chat::Error,
+    pub source: crate::api::error::Error,
 }
 
 /// Boxed asynchronous stream of a request's public events.

@@ -1,111 +1,115 @@
 //! Streaming tool-call parsers, one per tool-call format.
 //!
-//! The chat output tool stage (`output::chat`) feeds visible assistant text
-//! chunk by chunk to the [`ToolParser`] of the format the request's model
-//! family writes (`processing::ToolCallFormat`): [`JsonToolParser`] for one
-//! JSON object inside `<tool_call>` tags, [`XmlToolParser`] for function and
-//! parameter tags. A parser is named for its format, never for a model. It
-//! turns each chunk into an ordered sequence of plain text and
-//! `ToolCallDelta` updates, holding back bytes it cannot classify yet, such
-//! as a partial tag or an incomplete tool call.
+//! The chat output tool stage (`output::chat`) feeds visible assistant text chunk by chunk to the
+//! [`ToolParser`] of the format the request's model family declares
+//! (`processing::ToolCallFormat`), which [`parser`] builds: [`JsonToolParser`] for one JSON
+//! object per call, [`XmlToolParser`] for function and parameter tags. A parser is named for its
+//! format, never for a model, and reads the format's region delimiters from its declaration
+//! (`ToolCallFormat::delimiters`). It turns each chunk into an ordered sequence of plain text and
+//! [`ToolCallDelta`] updates, holding back the bytes it cannot classify yet, such as a partial
+//! delimiter or a parameter whose value has not ended.
+//!
+//! A parser is strict: text inside a call that breaks the format's grammar, and a call the text
+//! leaves open, fail with [`Error::ToolCall`], which the request's response reports. A parser
+//! repairs nothing and guesses nothing. What it holds is bounded by the text the model wrote,
+//! which the request's token budget bounds.
 
-#[macro_use]
-mod error;
 mod json;
-#[cfg(test)]
-mod test_utils;
-mod utils;
 mod xml;
 
+use processing::ToolCallFormat;
 use proto::handoff;
 
-pub use error::{Result, ToolParserError};
 pub use json::JsonToolParser;
 pub use xml::XmlToolParser;
 
-/// Incremental extraction of tool calls from one assistant turn's visible
-/// text.
+use crate::api::error::{Error, Result};
+use crate::api::protocol::Tool;
+
+/// Incremental extraction of tool calls from one assistant turn's visible text.
 ///
-/// Call `parse_into` for each text chunk and `finish` once at end of
-/// generation. After a failure, `reset` recovers the input that emitted
-/// output does not represent, so the caller can surface it as text.
+/// Call [`Self::parse_into`] for each text chunk and [`Self::finish`] once at the end of
+/// generation.
 pub trait ToolParser: Send {
     /// Parses one text chunk into an existing output accumulator.
     ///
-    /// Fails with `ToolParserError::ParsingFailed` when the input cannot be
-    /// interpreted under the parser's grammar or its pending buffer exceeds
-    /// the parser's size cap. Events parsed before the failure remain in
-    /// `output`, and `reset` returns the input that `output` does not
-    /// represent.
+    /// # Errors
+    ///
+    /// Fails with [`Error::ToolCall`] when the text breaks the format's grammar. The events
+    /// parsed before the failure remain in `output`.
     fn parse_into(&mut self, chunk: &str, output: &mut ToolParserOutput) -> Result<()>;
 
-    /// Flushes buffered parser state at end of generation.
+    /// Releases what the parser holds at the end of generation: a held-back partial delimiter
+    /// is text.
     ///
-    /// Buffered input that belongs to no published tool call is returned as
-    /// plain text. Fails, leaving the state unchanged, when a published call
-    /// is still open.
+    /// # Errors
+    ///
+    /// Fails with [`Error::ToolCall`] when the text ended inside a call.
     fn finish(&mut self) -> Result<ToolParserOutput>;
 
-    /// Resets parser state and returns the buffered input that no emitted
-    /// output represents.
-    fn reset(&mut self) -> String;
+    /// The parser's state, for the process that goes on writing the response after a handoff.
+    fn state(&self) -> handoff::tool_stage::Parser;
 
-    /// The parser's state for the process that goes on writing the response
-    /// after a handoff (design §7.5.1 step 3). `None` when this parser has no
-    /// state to continue from: a successor ends the response.
-    fn state(&self) -> Option<handoff::tool_stage::Parser>;
+    /// Takes over a state a parser of the same format and tools produced ([`Self::state`]).
+    ///
+    /// # Errors
+    ///
+    /// Fails with [`Error::Lowering`] when `state` is another format's.
+    fn resume(&mut self, state: &handoff::tool_stage::Parser) -> Result<()>;
+}
 
-    /// Takes over the state `state`, which belongs to a parser of this kind
-    /// (`state` is the value this parser's [`Self::state`] returned).
-    fn resume(&mut self, state: &handoff::tool_stage::Parser);
+/// The parser of `format` for a request whose callable tools are `tools`, the JSON array the
+/// request stated them in (empty for none).
+///
+/// # Errors
+///
+/// Fails with [`Error::Parser`] when `tools` is not that array or a tool's parameter schema is
+/// no valid JSON Schema.
+pub fn parser(format: ToolCallFormat, tools: &str) -> Result<Box<dyn ToolParser>> {
+    let refused = |source: crate::api::error::BoxError| Error::Parser {
+        kind: "tool",
+        name: format.name().to_owned(),
+        source,
+    };
+    let tools: Vec<Tool> = if tools.is_empty() {
+        Vec::new()
+    } else {
+        serde_json::from_str(tools).map_err(|error| refused(Box::new(error)))?
+    };
 
-    #[cfg(test)]
-    /// Parses one incremental text chunk.
-    fn parse_chunk(&mut self, chunk: &str) -> Result<ToolParserOutput> {
-        let mut output = ToolParserOutput::default();
-        self.parse_into(chunk, &mut output)?;
-        Ok(output)
-    }
-
-    #[cfg(test)]
-    /// Parses a complete assistant response and flushes all state.
-    fn parse_complete(&mut self, text: &str) -> Result<ToolParserOutput> {
-        let mut output = self.parse_chunk(text)?;
-        output.append(self.finish()?);
-        Ok(output.coalesce_calls())
-    }
+    Ok(match format {
+        ToolCallFormat::Json => Box::new(JsonToolParser::new()),
+        ToolCallFormat::Xml => Box::new(XmlToolParser::new(&tools).map_err(refused)?),
+    })
 }
 
 /// One tool-call update emitted while parsing assistant text.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ToolCallDelta {
-    /// Stable parser-local tool index for this call within one assistant turn.
+    /// Parser-local index of the call within one assistant turn, from 0.
     pub tool_index: usize,
-    /// Function name, present on the first update for one tool call.
+    /// Function name, on the first update of a call.
     pub name: Option<String>,
-    /// Arguments text contributed by this update. Concatenating every update
-    /// for one `tool_index` yields the call's arguments as JSON text.
-    /// `JsonToolParser` forwards the JSON exactly as the model wrote it,
-    /// neither parsed nor normalized; `XmlToolParser` writes each parameter's
-    /// value as the JSON its tool's schema types it to.
+    /// Arguments text this update contributes. The updates of one call concatenate to the
+    /// call's arguments as one JSON object.
     pub arguments: String,
 }
 
 /// One piece of parser output.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ToolParserItem {
-    /// Plain assistant text that is not part of any tool call.
+    /// Plain assistant text that is part of no tool call.
     Text(String),
     /// One tool-call update.
     Call(ToolCallDelta),
 }
 
-/// Result of advancing tool parsing with one or more assistant-text inputs.
+/// What advancing a tool parser over one or more chunks produced.
 ///
-/// Items follow the order of the input they were parsed from, so text written
-/// before a tool call precedes that call's deltas and text written after it
-/// follows them. Adjacent text is merged into one nonempty item. A call's
-/// deltas are contiguous, because text resumes only after its end delimiter.
+/// Items follow the order of the input they were parsed from, so text written before a call
+/// precedes the call's deltas and text written after it follows them. Adjacent text is merged
+/// into one nonempty item. A call's deltas are contiguous, because text resumes only after the
+/// call's end.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ToolParserOutput {
     /// Text runs and tool-call updates in input order.
@@ -113,9 +117,7 @@ pub struct ToolParserOutput {
 }
 
 impl ToolParserOutput {
-    /// Appends plain text, merging it into a trailing text item.
-    ///
-    /// Empty text is ignored, so every text item is nonempty.
+    /// Appends plain text, merging it into a trailing text item; empty text is ignored.
     fn push_text(&mut self, text: &str) {
         if text.is_empty() {
             return;
@@ -123,19 +125,16 @@ impl ToolParserOutput {
 
         match self.items.last_mut() {
             Some(ToolParserItem::Text(last)) => last.push_str(text),
-            _ => self.items.push(ToolParserItem::Text(text.to_string())),
+            _ => self.items.push(ToolParserItem::Text(text.to_owned())),
         }
     }
 
-    /// Appends one tool-call update after the existing items.
+    /// Appends one tool-call update.
     fn push_call(&mut self, call: ToolCallDelta) {
         self.items.push(ToolParserItem::Call(call));
     }
 
-    /// Appends another parser output onto this one, keeping item order.
-    ///
-    /// Text on both sides of the boundary is merged. Deltas for the same tool
-    /// call are not; call `coalesce_calls` afterwards to merge them.
+    /// Appends another output, keeping item order and merging text across the boundary.
     pub fn append(&mut self, other: Self) {
         for item in other.items {
             match item {
@@ -145,7 +144,7 @@ impl ToolParserOutput {
         }
     }
 
-    /// Returns the concatenation of every text item.
+    /// The concatenation of every text item.
     pub fn normal_text(&self) -> String {
         self.items
             .iter()
@@ -156,7 +155,7 @@ impl ToolParserOutput {
             .collect()
     }
 
-    /// Returns the tool-call updates in order.
+    /// The tool-call updates in order.
     pub fn calls(&self) -> impl Iterator<Item = &ToolCallDelta> {
         self.items.iter().filter_map(|item| match item {
             ToolParserItem::Call(call) => Some(call),
@@ -164,13 +163,8 @@ impl ToolParserOutput {
         })
     }
 
-    /// Merges consecutive deltas for the same tool call into one item.
-    ///
-    /// Each merged call takes the first name any of its deltas carries and the
-    /// concatenation of their arguments. A call's deltas are contiguous in
-    /// parser output, so this yields one item per call there.
-    /// `ToolParser::parse_complete` and the test helper `collect_stream` use
-    /// this to collapse streamed argument fragments into final tool calls.
+    /// Merges consecutive deltas of one call into one item: the first name any of them carries
+    /// and the concatenation of their arguments.
     pub fn coalesce_calls(self) -> Self {
         let mut coalesced = Self::default();
 
@@ -192,5 +186,32 @@ impl ToolParserOutput {
         }
 
         coalesced
+    }
+}
+
+/// The byte length of the longest proper prefix of `delimiter` that `text` ends with: the text a
+/// parser holds back because the next chunk may complete the delimiter.
+///
+/// The length is a character boundary of both strings, so the caller may slice either.
+fn partial_prefix_len(text: &str, delimiter: &str) -> usize {
+    let longest = text.len().min(delimiter.len().saturating_sub(1));
+    (1..=longest)
+        .rev()
+        .find(|&len| {
+            let start = text.len() - len;
+            text.is_char_boundary(start)
+                && delimiter.is_char_boundary(len)
+                && text.as_bytes()[start..] == delimiter.as_bytes()[..len]
+        })
+        .unwrap_or(0)
+}
+
+/// The length of the text a parser outside a call emits from `buffer`: everything before the
+/// first `delimiter`, or, without one, everything but a trailing partial delimiter. The second
+/// value is whether the delimiter follows that text.
+fn text_before(buffer: &str, delimiter: &str) -> (usize, bool) {
+    match buffer.find(delimiter) {
+        Some(start) => (start, true),
+        None => (buffer.len() - partial_prefix_len(buffer, delimiter), false),
     }
 }

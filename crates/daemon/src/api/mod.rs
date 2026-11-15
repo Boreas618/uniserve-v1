@@ -22,6 +22,7 @@
 //! - `model`: the served checkpoint's files, configuration and family profile.
 
 pub mod body;
+pub mod error;
 pub mod events;
 pub mod input;
 pub mod model;

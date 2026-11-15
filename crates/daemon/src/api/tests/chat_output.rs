@@ -208,6 +208,32 @@ fn qwen3_processor_keeps_text_and_tool_call_order_within_a_delta() -> TestResult
     Ok(())
 }
 
+/// A malformed call fails the request's output processing, which the response reports,
+/// instead of reaching the client as text.
+#[test]
+fn a_malformed_tool_call_fails_the_output() -> TestResult {
+    let processor = qwen3(true, qwen_tokenizer()?, false)?;
+
+    let failed = parse(
+        processor,
+        &[],
+        &["before<tool_call>\n{\"name\":\"lookup\",\"arguments\":{'q': 1}}\n</tool_call>"],
+    );
+
+    let error = failed.expect_err("a malformed call is no text");
+    let error = error
+        .downcast_ref::<crate::api::error::Error>()
+        .expect("the output processing error");
+    assert!(
+        matches!(
+            error,
+            crate::api::error::Error::ToolCall { format: "json", .. }
+        ),
+        "{error}"
+    );
+    Ok(())
+}
+
 /// With reasoning parsing disabled, `<think>` delimiters stream verbatim as
 /// assistant content instead of opening a reasoning block, including when the
 /// delimiters arrive in separate deltas.
@@ -262,11 +288,11 @@ fn function_and_parameter_tags_become_typed_tool_calls() -> TestResult {
             text("Searching."),
             OrderedOutput::Call {
                 name: "lookup".to_string(),
-                arguments: r#"{"q": "rust traits", "limit": 3}"#.to_string(),
+                arguments: r#"{"q":"rust traits","limit":3}"#.to_string(),
             },
             OrderedOutput::Call {
                 name: "lookup".to_string(),
-                arguments: r#"{"q": "x"}"#.to_string(),
+                arguments: r#"{"q":"x"}"#.to_string(),
             },
             text("done"),
         ]

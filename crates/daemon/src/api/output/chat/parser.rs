@@ -12,9 +12,10 @@
 use proto::handoff;
 use uuid::Uuid;
 
-use crate::api::output::chat::{AssistantBlockKind, Error, Result};
+use crate::api::error::{Error, Result};
+use crate::api::output::chat::AssistantBlockKind;
 use crate::api::output::reasoning::{DelimitedReasoningParser, ReasoningDelta};
-use crate::api::output::tools::{JsonToolParser, ToolParser, XmlToolParser};
+use crate::api::output::tools;
 use crate::api::tokenizer::DynTokenizer;
 use processing::ToolCallFormat;
 
@@ -58,18 +59,19 @@ pub struct ChatParser {
 
 impl ChatParser {
     /// The parsers `parser` states for a request: the reasoning parser over its delimiters when
-    /// reasoning is parsed, and the parser of its tool-call format when tool calls are.
+    /// reasoning is parsed, and the parser of its tool-call format ([`tools::parser`]) when tool
+    /// calls are.
     ///
     /// # Errors
     ///
-    /// Returns `Error::ParserInitialization` when a tool-call format's name is no format's, the
-    /// tokenizer lacks a reasoning delimiter as one token, or the request's tools are not the
-    /// JSON array a request states.
+    /// Returns [`Error::Parser`] when a tool-call format's name is no format's, the tokenizer
+    /// lacks a reasoning delimiter as one token, or the request's tools are not the JSON array a
+    /// request states.
     pub fn new(parser: &handoff::Parser, tokenizer: DynTokenizer) -> Result<Self> {
-        let unknown = |kind: &'static str, name: &str| Error::ParserInitialization {
+        let unknown = |kind: &'static str, name: &str| Error::Parser {
             kind,
             name: name.to_owned(),
-            error: format!("no {kind} format is named {name:?}").into(),
+            source: format!("no {kind} format is named {name:?}").into(),
         };
 
         let reasoning = match &parser.reasoning_delimiters {
@@ -81,68 +83,56 @@ impl ChatParser {
                     &delimiters.close,
                     false,
                 )
-                .map_err(|error| Error::ParserInitialization {
+                .map_err(|error| Error::Parser {
                     kind: "reasoning",
                     name: format!("{} {}", delimiters.open, delimiters.close),
-                    error: Box::new(error),
+                    source: Box::new(error),
                 })?;
                 Some(reasoning)
             }
         };
 
-        let tools: Option<Box<dyn ToolParser>> = match parser.tool_calls.as_str() {
+        let tools = match parser.tool_calls.as_str() {
             "" => None,
-            name => match ToolCallFormat::named(name).ok_or_else(|| unknown("tool", name))? {
-                ToolCallFormat::Json => Some(Box::new(JsonToolParser::new())),
-                ToolCallFormat::Xml => {
-                    // The tools travel as the JSON array the request stated them in.
-                    let tools = if parser.tools.is_empty() {
-                        Vec::new()
-                    } else {
-                        serde_json::from_str(&parser.tools).map_err(|error| {
-                            Error::ParserInitialization {
-                                kind: "tool",
-                                name: ToolCallFormat::Xml.name().to_owned(),
-                                error: Box::new(error),
-                            }
-                        })?
-                    };
-                    Some(Box::new(XmlToolParser::new(tools)))
-                }
-            },
+            name => {
+                let format = ToolCallFormat::named(name).ok_or_else(|| unknown("tool", name))?;
+                Some(ToolStage::new(tools::parser(format, &parser.tools)?))
+            }
         };
 
-        Ok(Self {
-            reasoning,
-            tools: tools.map(ToolStage::new),
-        })
+        Ok(Self { reasoning, tools })
     }
 
-    /// The parsers' state, for the process that goes on writing the response
-    /// after a handoff (design §7.5.1 step 3); `None` when a parser of this
-    /// processor cannot be continued, in which case the response cannot be
+    /// The parsers' state, for the process that goes on writing the response after a handoff.
+    pub fn state(&self) -> handoff::Processor {
+        handoff::Processor {
+            reasoning: self.reasoning.as_ref().map(DelimitedReasoningParser::state),
+            tools: self.tools.as_ref().map(ToolStage::state),
+        }
+    }
+
+    /// Puts the parsers back where `state` left them: the successor builds the same parsers for
+    /// the request (its family and its tools) and resumes them from the state the predecessor
     /// handed over.
-    pub fn state(&self) -> Option<handoff::Processor> {
-        let reasoning = self.reasoning.as_ref().map(DelimitedReasoningParser::state);
-        let tools = match self.tools.as_ref() {
-            Some(tools) => Some(tools.state()?),
-            None => None,
-        };
-        Some(handoff::Processor { reasoning, tools })
-    }
-
-    /// Puts the parsers back where `state` left them: the successor builds
-    /// the same processor for the request (its family and its tools) and
-    /// resumes the parsers from the state the predecessor handed over.
-    pub fn resume(&mut self, state: &handoff::Processor) {
-        if let (Some(reasoning), Some(reasoning_state)) =
-            (self.reasoning.as_mut(), state.reasoning.as_ref())
-        {
+    ///
+    /// # Errors
+    ///
+    /// Fails with [`Error::Lowering`] when `state` does not state each of this request's
+    /// parsers, or states one of another format.
+    pub fn resume(&mut self, state: &handoff::Processor) -> Result<()> {
+        if let Some(reasoning) = self.reasoning.as_mut() {
+            let reasoning_state = state.reasoning.as_ref().ok_or(Error::Lowering {
+                part: "reasoning parser state",
+            })?;
             reasoning.resume(reasoning_state);
         }
-        if let (Some(tools), Some(tools_state)) = (self.tools.as_mut(), state.tools.as_ref()) {
-            tools.resume(tools_state);
+        if let Some(tools) = self.tools.as_mut() {
+            let tools_state = state.tools.as_ref().ok_or(Error::Lowering {
+                part: "tool stage state",
+            })?;
+            tools.resume(tools_state)?;
         }
+        Ok(())
     }
 
     /// Chooses the region generation starts in from the prompt.
@@ -163,8 +153,8 @@ impl ChatParser {
     ///
     /// # Errors
     ///
-    /// Returns `Error::ToolCallStreamInvariant` when the tool parser's output
-    /// is inconsistent.
+    /// Returns [`Error::ToolCall`] for a malformed tool call and
+    /// [`Error::ToolCallStream`] when the tool parser's output is out of order.
     pub fn push(&mut self, delta: String) -> Result<Vec<AssistantEvent>> {
         let parsed = match self.reasoning.as_mut() {
             Some(reasoning) => reasoning.push(&delta),

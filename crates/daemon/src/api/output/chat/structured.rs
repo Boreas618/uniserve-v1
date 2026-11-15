@@ -13,7 +13,8 @@ use super::AssistantEvent;
 use crate::api::output::RequestOutput;
 use proto::handoff;
 
-use crate::api::output::chat::{AssistantBlockKind, Error, Result};
+use crate::api::error::{Error, Result};
+use crate::api::output::chat::AssistantBlockKind;
 
 /// One currently open assistant text-like block being assembled from streamed
 /// deltas.
@@ -126,7 +127,7 @@ impl StructuredEventState {
     ///
     /// # Errors
     ///
-    /// Returns `Error::ToolCallStreamInvariant` for tool-call arguments
+    /// Returns [`Error::ToolCallStream`] for tool-call arguments
     /// without an open tool call.
     pub fn push(&mut self, event: AssistantEvent) -> Result<Vec<RequestOutput>> {
         match event {
@@ -174,11 +175,11 @@ impl StructuredEventState {
     ///
     /// # Errors
     ///
-    /// Returns `Error::ToolCallStreamInvariant` when no tool call is open.
+    /// Returns [`Error::ToolCallStream`] when no tool call is open.
     fn push_tool_call_arguments(&mut self, delta: String) -> Result<Vec<RequestOutput>> {
         let mut events = Vec::new();
         let Some(open_tool_call) = self.open_tool_call.as_mut() else {
-            return Err(Error::ToolCallStreamInvariant {
+            return Err(Error::ToolCallStream {
                 message: "received tool-call arguments delta without an open tool call".to_string(),
             });
         };

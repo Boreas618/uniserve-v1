@@ -4,9 +4,7 @@
 //! the start of a delimiter split across deltas is held back until later text
 //! completes or rules it out, or the stream ends. Each delimiter begins with a
 //! single vocabulary token, whose id `initialize` looks for in the prompt to
-//! choose the initial region. A section label may follow the start token,
-//! such as the channel name in a `<|channel>thought\n` delimiter; it belongs
-//! to the delimiter and is stripped from the reasoning.
+//! choose the initial region.
 
 use crate::api::tokenizer::{DynTokenizer, HuggingFaceTokenizer};
 
@@ -20,19 +18,11 @@ use super::{ReasoningDelta, ReasoningError, Result};
 pub struct DelimitedReasoningParser {
     tokenizer: DynTokenizer,
     current_in_reasoning: bool,
-    /// True from a start delimiter in the generated text until the section
-    /// label that may follow it has been stripped or ruled out.
-    label_pending: bool,
-    /// Text not yet parsed: a trailing partial delimiter, or the start of a
-    /// reasoning section that may still grow into a section label, held until
-    /// a later delta disambiguates it or `finish` flushes it.
+    /// Text not yet parsed: a trailing partial delimiter, held until a later delta completes or
+    /// rules it out, or `finish` flushes it.
     buffer: String,
     /// Text that opens a reasoning section: the start token.
     start_delimiter: String,
-    /// Section labels that may follow the start token. The longest one that
-    /// opens a section is stripped from its reasoning; a section without one
-    /// starts its reasoning right after the start token.
-    start_labels: Vec<String>,
     /// Text that closes a reasoning section: the end token.
     end_delimiter: String,
     start_token_id: u32,
@@ -83,10 +73,8 @@ impl DelimitedReasoningParser {
         Ok(Self {
             tokenizer,
             current_in_reasoning: default_in_reasoning,
-            label_pending: false,
             buffer: String::new(),
             start_delimiter: start_token,
-            start_labels: Vec::new(),
             end_delimiter: end_token,
             start_token_id,
             end_token_id,
@@ -95,16 +83,11 @@ impl DelimitedReasoningParser {
     }
 
     /// Parses the buffered text, keeping back what a later delta may still
-    /// change: a trailing partial delimiter, and the start of a section that
-    /// may still grow into a longer label. `finishing` keeps back nothing.
+    /// change: a trailing partial delimiter. `finishing` keeps back nothing.
     fn parse_buffer(&mut self, finishing: bool) -> ReasoningDelta {
         let mut delta = ReasoningDelta::default();
 
         loop {
-            if self.label_pending && !self.strip_start_label(finishing) {
-                return delta;
-            }
-
             let held = if finishing {
                 0
             } else {
@@ -134,44 +117,15 @@ impl DelimitedReasoningParser {
             }
 
             self.current_in_reasoning = !self.current_in_reasoning;
-            self.label_pending = self.current_in_reasoning && !self.start_labels.is_empty();
         }
-    }
-
-    /// Strips the longest start label that opens the buffered section.
-    ///
-    /// Returns false, stripping nothing, while the buffered text could still
-    /// grow into a longer label; `finishing` decides with the text at hand.
-    fn strip_start_label(&mut self, finishing: bool) -> bool {
-        let buffered = self.buffer.as_str();
-        if !finishing
-            && self
-                .start_labels
-                .iter()
-                .any(|label| label.len() > buffered.len() && label.starts_with(buffered))
-        {
-            return false;
-        }
-
-        let label_len = self
-            .start_labels
-            .iter()
-            .filter(|label| buffered.starts_with(label.as_str()))
-            .map(String::len)
-            .max()
-            .unwrap_or(0);
-        self.buffer.drain(..label_len);
-        self.label_pending = false;
-        true
     }
 
     /// The state machine's state, for a response that moves to another
-    /// process (design §7.5.1). Its delimiters, labels and region default are
-    /// configuration, which the request's model family restates.
+    /// process. Its delimiters and region default are configuration, which
+    /// the request's model family restates.
     pub fn state(&self) -> proto::handoff::Reasoning {
         proto::handoff::Reasoning {
             in_reasoning: self.current_in_reasoning,
-            label_pending: self.label_pending,
             buffer: self.buffer.clone(),
         }
     }
@@ -179,7 +133,6 @@ impl DelimitedReasoningParser {
     /// Restores the state machine's state.
     pub fn resume(&mut self, state: &proto::handoff::Reasoning) {
         self.current_in_reasoning = state.in_reasoning;
-        self.label_pending = state.label_pending;
         self.buffer.clone_from(&state.buffer);
     }
 
@@ -237,8 +190,8 @@ impl DelimitedReasoningParser {
 
     /// Parses one decoded text delta and returns its reasoning/content split.
     ///
-    /// Text that could begin a delimiter or a section label stays buffered,
-    /// so the returned delta may be empty.
+    /// Text that could begin a delimiter stays buffered, so the returned
+    /// delta may be empty.
     pub fn push(&mut self, delta: &str) -> ReasoningDelta {
         self.buffer.push_str(delta);
         self.parse_buffer(false)
@@ -247,7 +200,7 @@ impl DelimitedReasoningParser {
     /// Flushes buffered text at end of stream.
     ///
     /// An unfinished delimiter is emitted as ordinary text of the current
-    /// region, and a section's complete label is stripped.
+    /// region.
     pub fn finish(&mut self) -> ReasoningDelta {
         self.parse_buffer(true)
     }

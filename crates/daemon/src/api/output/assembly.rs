@@ -109,11 +109,10 @@ pub fn started_instant(started_unix_us: u64) -> Instant {
 fn malformed(request_id: &str, message: &str) -> OutputError {
     OutputError {
         request_id: request_id.to_owned(),
-        source: crate::api::output::text::Error::MalformedOutput {
+        source: crate::api::error::Error::MalformedOutput {
             request_id: request_id.to_string(),
             message: message.to_owned(),
-        }
-        .into(),
+        },
     }
 }
 

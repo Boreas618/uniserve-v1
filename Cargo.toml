@@ -104,6 +104,8 @@ float8 = "0.7.0"
 half = "2.5.0"
 
 # ---- daemon third-party deps ----
+# A push JSON parser, which reads a streamed tool call's object byte by byte as it is generated.
+actson = "2.1.0"
 anyhow = "1.0.100"
 async-stream = "0.3.6"
 async-trait = "0.1.89"
@@ -129,6 +131,9 @@ indexmap = "2.13.0"
 # The IANA special-purpose address registries, which the media connector refuses fetches into.
 iprfc = "1.0.0"
 itertools = "0.14.0"
+# JSON Schema validation of tool-call arguments against the schemas a request's tools declare;
+# a schema is the request's own, so no reference is resolved over the network or the file system.
+jsonschema = { version = "0.61.2", default-features = false }
 libc = "0.2.177"
 libloading = "0.8.9"
 nvtx = { version = "2.0.0", default-features = false, features = ["std"] }
@@ -205,7 +210,6 @@ wasmtime = { version = "50.0.1", default-features = false, features = [
 ] }
 # The WebAssembly text assembler the policy host's tests build their fault modules with.
 wat = "1.263.0"
-winnow = "1.0.2"
 
 [workspace.lints.clippy]
 clone_on_ref_ptr = "warn"
