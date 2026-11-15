@@ -287,13 +287,18 @@ def remote_build_server(host: str) -> Iterator[str]:
         str(compiler()),
     ]
     # The server runs in this test's environment: its search paths, native
-    # libraries and CUDA toolkit, and its compilations' parallelism.
+    # libraries and CUDA toolkit, the FFmpeg prefix and libclang (with its
+    # bindgen arguments) its build of the engine package reads
+    # (tools/gpu_e2e.sh), and its compilations' parallelism.
     variables = " ".join(
         f"{name}={shlex.quote(os.environ.get(name, default))}"
         for name, default in (
             ("PATH", ""),
             ("LD_LIBRARY_PATH", ""),
             ("CUDA_HOME", ""),
+            ("UNISERVE_FFMPEG_DIR", ""),
+            ("LIBCLANG_PATH", ""),
+            ("BINDGEN_EXTRA_CLANG_ARGS", ""),
             ("MAX_JOBS", "16"),
         )
     )
