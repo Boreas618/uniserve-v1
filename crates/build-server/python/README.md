@@ -100,12 +100,13 @@ A package that builds against code it does not own names that code by a pin of `
 | `deepep` | DeepEP's elastic dispatch and combine kernels, deepseek-ai/DeepEP commit `b306af06afd4` | each file from the commit's raw tree |
 | `nccl` | NCCL 2.30.4's headers, the device API DeepEP is built against | the `nvidia-nccl-cu13==2.30.4` wheel the serving environment locks, whose headers are the same for every architecture; read out of the archive, which is not kept |
 | `megamoe` | FlashInfer's fused MegaMoE CuTe DSL kernel | the `flashinfer-python` distribution this environment locks |
+| `cutlass-nvfp4-gemm` | CUTLASS's CuTe DSL tutorial NVFP4 GEMM (`nvfp4_gemm_0.py`), the kernel of `nvfp4_gemm` | the CUTLASS examples among the data files of the `flashinfer-python` distribution this environment locks |
 
 ```text
 uniserve-build-server provision PIN --cache DIR [--file NAME ...] [--all] [--jobs N] [--offline]
 ```
 
-fetches the named files (`--all`: all of them; the FMHA library has 35 324 cubins) into a cache and prints a JSON description of the pin. A build calls the same functions with the request's cache: `fetch.fetch(pin, cache, names, jobs)`, `fetch.stage` (or, for a build that patches the files, a copy) and `fetch.apply_patch`, which applies a package's own unified diff to a staged copy and refuses one that does not apply. A pin of Python sources states in `packages` the directories of its files that are packages, and `fetch.load(pin, tree)` imports each from a build's staged copy under its directory's name, without adding to the interpreter's search path, so sources that name their siblings as top-level modules import from that copy. The megamoe package carries `patches/megamoe.patch`, applies it to a staged copy and loads the kernel's packages from it.
+fetches the named files (`--all`: all of them; the FMHA library has 35 324 cubins) into a cache and prints a JSON description of the pin. A build calls the same functions with the request's cache: `fetch.fetch(pin, cache, names, jobs)`, `fetch.stage` (or, for a build that patches the files, a copy) and `fetch.apply_patch`, which applies a package's own unified diff to a staged copy and refuses one that does not apply. A pin of Python sources states in `packages` the directories of its files that are packages, and `fetch.load(pin, tree)` imports each from a build's staged copy under its directory's name, without adding to the interpreter's search path, so sources that name their siblings as top-level modules import from that copy. The megamoe package carries `patches/megamoe.patch`, applies it to a staged copy and loads the kernel's packages from it; the nvfp4_gemm package does the same with `patches/nvfp4_gemm.patch` and the tutorial's directory, a namespace package of the one module the pin holds.
 
 ### The trtllm-gen packages
 

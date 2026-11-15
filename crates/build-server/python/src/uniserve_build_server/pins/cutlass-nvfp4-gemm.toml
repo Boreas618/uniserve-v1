@@ -1,0 +1,15 @@
+# CUTLASS's CuTe DSL tutorial NVFP4 block-scaled GEMM (`nvfp4_gemm_0.py`), from
+# the CUTLASS examples the `flashinfer-python` distribution this environment
+# locks carries among its data files. The manifest is `cutlass-nvfp4-gemm.sha256`.
+sha256 = "505f302908e71bd247e25f39b3177f8dbc643b174e0eadfd0b02363418a7deeb"
+
+# The tutorial's directory, imported from a build's staged copy as a namespace
+# package (`fetch.load`): the pin holds only the one kernel module, which the
+# nvfp4_gemm package patches; the tutorial's runner (`utils.py`) drives it
+# through PyTorch and is not part of the pin.
+packages = [
+    "flashinfer/data/cutlass/examples/python/CuTeDSL/blackwell/tutorial_gemm",
+]
+
+[origin]
+distribution = "flashinfer-python"

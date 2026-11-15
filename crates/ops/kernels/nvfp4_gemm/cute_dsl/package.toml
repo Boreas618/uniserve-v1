@@ -4,10 +4,18 @@
 # 128x256 tile of `[m, n]`, reducing over whole 256 element steps with the
 # Blackwell block-scaled tensor-core instructions, and the epilogue applies the
 # call's alpha in FP32 before the one rounding that writes the tile.
+#
+# The kernel's source is CUTLASS's tutorial NVFP4 GEMM, the Build Server's
+# `cutlass-nvfp4-gemm` pin (from the FlashInfer distribution's data files), with
+# `patches/nvfp4_gemm.patch` applied to a build's staged copy.
 
 op = "nvfp4_gemm"
 backend = "cute_dsl"
 interface_version = 1
+
+# The distribution the pinned kernel source is read from.
+[toolchain]
+packages = ["flashinfer-python"]
 
 [source]
 kind = "cute_dsl"

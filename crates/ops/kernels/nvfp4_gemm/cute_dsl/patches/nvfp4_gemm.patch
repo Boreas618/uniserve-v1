@@ -1,0 +1,396 @@
+--- a/flashinfer/data/cutlass/examples/python/CuTeDSL/blackwell/tutorial_gemm/nvfp4_gemm_0.py
++++ b/flashinfer/data/cutlass/examples/python/CuTeDSL/blackwell/tutorial_gemm/nvfp4_gemm_0.py
+@@ -26,96 +26,100 @@
+ # OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
+ # OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+ 
++"""NVFP4 dense product: the CuTe DSL source of the ``nvfp4_gemm`` operator.
+ 
+-import argparse
+-import os
+-import sys
+-from typing import Type, Tuple
+-import cuda.bindings.driver as cuda
++This module is CUTLASS's CuTe DSL tutorial kernel
++``examples/python/CuTeDSL/blackwell/tutorial_gemm/nvfp4_gemm_0.py``
++(``Sm100BlockScaledDenseGemmKernel``), as the locked FlashInfer distribution
++carries it among its data files, with the ``nvfp4_gemm`` package's patch
++(``patches/nvfp4_gemm.patch``) applied to a build's staged copy of the
++``cutlass-nvfp4-gemm`` pin: the call's alpha in the epilogue, the problem's
++extents and element types as parameters of the class, the target's
++tensor-memory columns, and no torch runner.
++
++The kernel is CUTLASS's block-scaled dense GEMM for Blackwell: one CTA computes a
++128x256 tile of the product over packed E2M1 operands, reducing over whole 256
++element steps with the tensor-core FP4 instructions, and the epilogue applies the
++call's alpha (the product of the two tensor scales, a device value the kernel
++reads) in FP32 before the one rounding that writes the tile.
++
++The operand layouts are the operator's: the activations and the weight are
++``[rows, k / 2]`` packed bytes with unit stride on ``k``, both scale fields are
++E4M3 in the 128x4 interleaved atom the block scaled tensor-core instructions
++read (``tile_atom_to_shape_SF``: the atom tiled over the operand's shape, rows
++padded to a multiple of 128 and scale columns to a multiple of 4), and the
++product is ``[m, n]`` with unit stride on ``n``.
++"""
+ 
+-import torch
++from typing import Tuple
+ 
++import cuda.bindings.driver as cuda
+ import cutlass
+ import cutlass.cute as cute
+-import cutlass.utils as utils
+ import cutlass.pipeline as pipeline
+-from cutlass.cute.nvgpu import cpasync, tcgen05
+-import cutlass.torch as cutlass_torch
++import cutlass.utils as utils
+ import cutlass.utils.blackwell_helpers as sm100_utils
+ import cutlass.utils.blockscaled_layout as blockscaled_utils
++from cutlass.cute.nvgpu import cpasync, tcgen05
+ from cutlass.cute.runtime import make_ptr
+ 
+-if __name__ == "__main__":
+-    current_dir = os.path.dirname(os.path.abspath(__file__))
+-    examples_dir = os.path.join(current_dir, "..", "..")
+-    if examples_dir not in sys.path:
+-        sys.path.insert(0, examples_dir)
+-
+-from blackwell.tutorial_gemm.utils import create_parser, run
+-
+-mma_tiler_mn = (128, 256)
+-mma_inst_shape_k = 64
+-ab_dtype = cutlass.Float4E2M1FN
+-sf_dtype = cutlass.Float8E4M3FN
+-c_dtype = cutlass.Float16
+-sf_vec_size = 16
+-
+-"""
+-The first tutorial NVFP4 block-scaled batched GEMM demonstrating a simple kernel implementation in CuTeDSL
+ 
+-This example demonstrates the kernel implementation of block-scaled batched GEMM with NVFP4 data type.
+-With large tile sizes (128x256x256), it can achieve very high performance on 8k×8k×8k problem sizes.
+-It can serve as a starting point to help users quickly experiment with optimizations for 
+-challenges that may arise with other problem sizes.
+-
+-To run this example:
+-.. code-block:: bash
+-
+-    python examples/blackwell/tutorial_gemm/nvfp4_gemm_0.py  \
+-      --mnkl 8192,8192,8192,1 --do_benchmark
+-
+-Constraints for this example:
+-* The problem size of m, n and k must be divisible by the tile size m&n&k (128,256,256)
+-* The scaling factor vector size is 16.
+-* The A/B matrices have data contiguous on the k dimension.
+-* The C matrix has data contiguous on the n dimension.
+-* The A/B matrix data type is Float4E2M1FN.
+-* The SFA/SFB matrix data type is Float8E4M3FN.
+-"""
++class Nvfp4GemmKernel:
++    """One compilation of the block-scaled FP4 product.
+ 
++    ``tile_mn`` is the CTA's product tile, ``self.mma_inst_shape_k`` the tensor-core
++    instruction's contraction step, ``acc_dtype`` the epilogue's arithmetic and
++    ``out_dtype`` what the tile is written as. ``tmem_columns`` is the target's
++    tensor-memory columns, which the accumulator takes whole (one CTA per
++    multiprocessor); the A/B stages are a fixed four.
++    """
+ 
+-class Sm100BlockScaledDenseGemmKernel:
+-    def __init__(self):
++    def __init__(
++        self,
++        tile_mn,
++        mma_inst_shape_k,
++        acc_dtype,
++        out_dtype,
++        tmem_columns,
++    ):
++        self.tile_mn = tile_mn
++        self.mma_inst_shape_k = mma_inst_shape_k
++        self.acc_dtype = acc_dtype
++        self.out_dtype = out_dtype
++        self.ab_dtype = cutlass.Float4E2M1FN
++        self.sf_dtype = cutlass.Float8E4M3FN
++        self.sf_vec_size = 16
+         self.threads_per_cta = 128
+-        self.smem_capacity = utils.get_smem_capacity_in_bytes("sm_100")
+-        self.num_tmem_alloc_cols = 512
++        self.num_tmem_alloc_cols = tmem_columns
+ 
+         # set stages for ab_pipeline and acc_pipeline
+         self.num_acc_stage = 1
+         self.num_ab_stage = 4
+ 
+     @cute.jit
+-    def __call__(
++    def launch(
+         self,
+         a_ptr: cute.Pointer,
+         b_ptr: cute.Pointer,
+         sfa_ptr: cute.Pointer,
+         sfb_ptr: cute.Pointer,
++        alpha_ptr: cute.Pointer,
+         c_ptr: cute.Pointer,
+-        problem_size: tuple,
++        m: cutlass.Constexpr,
++        n: cutlass.Constexpr,
++        k: cutlass.Constexpr,
+         stream: cuda.CUstream,
+-        epilogue_op: cutlass.Constexpr = lambda x: x,
+     ):
+         # setup static attributes before smem/grid/tma computation
+         self.c_layout = utils.LayoutEnum.ROW_MAJOR
+-        m, n, k, l = problem_size
++        l = 1
+ 
+         # Setup attributes that depend on gemm inputs
+         mma_inst_tile_k = 4
+         self.mma_tiler = (
+-            mma_tiler_mn[0],
+-            mma_tiler_mn[1],
+-            mma_inst_shape_k * mma_inst_tile_k,
++            self.tile_mn[0],
++            self.tile_mn[1],
++            self.mma_inst_shape_k * mma_inst_tile_k,
+         )
+         self.cta_tile_shape_mnk = (
+             self.mma_tiler[0],
+@@ -149,19 +153,19 @@
+         # Setup sfa/sfb tensor by filling A/B tensor to scale factor atom layout
+         # ((Atom_M, Rest_M),(Atom_K, Rest_K),RestL)
+         sfa_layout = blockscaled_utils.tile_atom_to_shape_SF(
+-            a_tensor.shape, sf_vec_size
++            a_tensor.shape, self.sf_vec_size
+         )
+         sfa_tensor = cute.make_tensor(sfa_ptr, sfa_layout)
+ 
+         # ((Atom_N, Rest_N),(Atom_K, Rest_K),RestL)
+         sfb_layout = blockscaled_utils.tile_atom_to_shape_SF(
+-            b_tensor.shape, sf_vec_size
++            b_tensor.shape, self.sf_vec_size
+         )
+         sfb_tensor = cute.make_tensor(sfb_ptr, sfb_layout)
+ 
+         mma_op = tcgen05.MmaMXF4NVF4Op(
+-            sf_dtype,
+-            (*mma_tiler_mn, mma_inst_shape_k),
++            self.sf_dtype,
++            (*self.tile_mn, self.mma_inst_shape_k),
+             tcgen05.CtaGroup.ONE,
+             tcgen05.OperandSource.SMEM,
+         )
+@@ -176,25 +180,25 @@
+         self.a_smem_layout_staged = sm100_utils.make_smem_layout_a(
+             tiled_mma,
+             self.mma_tiler,
+-            ab_dtype,
++            self.ab_dtype,
+             self.num_ab_stage,
+         )
+         self.b_smem_layout_staged = sm100_utils.make_smem_layout_b(
+             tiled_mma,
+             self.mma_tiler,
+-            ab_dtype,
++            self.ab_dtype,
+             self.num_ab_stage,
+         )
+         self.sfa_smem_layout_staged = blockscaled_utils.make_smem_layout_sfa(
+             tiled_mma,
+             self.mma_tiler,
+-            sf_vec_size,
++            self.sf_vec_size,
+             self.num_ab_stage,
+         )
+         self.sfb_smem_layout_staged = blockscaled_utils.make_smem_layout_sfb(
+             tiled_mma,
+             self.mma_tiler,
+-            sf_vec_size,
++            self.sf_vec_size,
+             self.num_ab_stage,
+         )
+ 
+@@ -250,10 +254,10 @@
+         )
+ 
+         # Compute TMA load bytes
+-        a_copy_size = cute.size_in_bytes(ab_dtype, a_smem_layout)
+-        b_copy_size = cute.size_in_bytes(ab_dtype, b_smem_layout)
+-        sfa_copy_size = cute.size_in_bytes(sf_dtype, sfa_smem_layout)
+-        sfb_copy_size = cute.size_in_bytes(sf_dtype, sfb_smem_layout)
++        a_copy_size = cute.size_in_bytes(self.ab_dtype, a_smem_layout)
++        b_copy_size = cute.size_in_bytes(self.ab_dtype, b_smem_layout)
++        sfa_copy_size = cute.size_in_bytes(self.sf_dtype, sfa_smem_layout)
++        sfb_copy_size = cute.size_in_bytes(self.sf_dtype, sfb_smem_layout)
+         self.num_tma_load_bytes = (
+             a_copy_size + b_copy_size + sfa_copy_size + sfb_copy_size
+         ) * atom_thr_size
+@@ -281,7 +285,7 @@
+             self.b_smem_layout_staged,
+             self.sfa_smem_layout_staged,
+             self.sfb_smem_layout_staged,
+-            epilogue_op,
++            alpha_ptr,
+         ).launch(
+             grid=grid,
+             block=[self.threads_per_cta, 1, 1],
+@@ -308,7 +312,7 @@
+         b_smem_layout_staged: cute.ComposedLayout,
+         sfa_smem_layout_staged: cute.Layout,
+         sfb_smem_layout_staged: cute.Layout,
+-        epilogue_op: cutlass.Constexpr,
++        alpha_ptr: cute.Pointer,
+     ):
+         """
+         GPU device kernel performing the batched GEMM computation.
+@@ -344,27 +348,27 @@
+         storage = smem.allocate(SharedStorage)
+         # (MMA, MMA_M, MMA_K, STAGE)
+         sA = smem.allocate_tensor(
+-            element_type=ab_dtype,
++            element_type=self.ab_dtype,
+             layout=a_smem_layout_staged.outer,
+             byte_alignment=128,
+             swizzle=a_smem_layout_staged.inner,
+         )
+         # (MMA, MMA_N, MMA_K, STAGE)
+         sB = smem.allocate_tensor(
+-            element_type=ab_dtype,
++            element_type=self.ab_dtype,
+             layout=b_smem_layout_staged.outer,
+             byte_alignment=128,
+             swizzle=b_smem_layout_staged.inner,
+         )
+         # (MMA, MMA_M, MMA_K, STAGE)
+         sSFA = smem.allocate_tensor(
+-            element_type=sf_dtype,
++            element_type=self.sf_dtype,
+             layout=sfa_smem_layout_staged,
+             byte_alignment=128,
+         )
+         # (MMA, MMA_N, MMA_K, STAGE)
+         sSFB = smem.allocate_tensor(
+-            element_type=sf_dtype,
++            element_type=self.sf_dtype,
+             layout=sfb_smem_layout_staged,
+             byte_alignment=128,
+         )
+@@ -514,13 +518,13 @@
+         # Get SFA tmem ptr
+         sfa_tmem_ptr = cute.recast_ptr(
+             acc_tmem_ptr + tcgen05.find_tmem_tensor_col_offset(tCtAcc),
+-            dtype=sf_dtype,
++            dtype=self.sf_dtype,
+         )
+         # (MMA, MMA_M, MMA_K)
+         tCtSFA_layout = blockscaled_utils.make_tmem_layout_sfa(
+             tiled_mma,
+             self.mma_tiler,
+-            sf_vec_size,
++            self.sf_vec_size,
+             cute.slice_(sfa_smem_layout_staged, (None, None, None, 0)),
+         )
+         tCtSFA = cute.make_tensor(sfa_tmem_ptr, tCtSFA_layout)
+@@ -529,13 +533,13 @@
+             acc_tmem_ptr
+             + tcgen05.find_tmem_tensor_col_offset(tCtAcc)
+             + tcgen05.find_tmem_tensor_col_offset(tCtSFA),
+-            dtype=sf_dtype,
++            dtype=self.sf_dtype,
+         )
+         # (MMA, MMA_N, MMA_K)
+         tCtSFB_layout = blockscaled_utils.make_tmem_layout_sfb(
+             tiled_mma,
+             self.mma_tiler,
+-            sf_vec_size,
++            self.sf_vec_size,
+             cute.slice_(sfb_smem_layout_staged, (None, None, None, 0)),
+         )
+         tCtSFB = cute.make_tensor(sfb_tmem_ptr, tCtSFB_layout)
+@@ -546,7 +550,7 @@
+         # Make S2T CopyAtom
+         copy_atom_s2t = cute.make_copy_atom(
+             tcgen05.Cp4x32x128bOp(tcgen05.CtaGroup.ONE),
+-            sf_dtype,
++            self.sf_dtype,
+         )
+         # (MMA, MMA_MN, MMA_K, STAGE)
+         tCsSFA_compact = cute.filter_zeros(sSFA)
+@@ -702,10 +706,10 @@
+         )
+         # (T2R_M, T2R_N, EPI_M, EPI_N）
+         tTR_rC = cute.make_rmem_tensor(
+-            tTR_gC[None, None, None, None, 0, 0, 0].shape, c_dtype
++            tTR_gC[None, None, None, None, 0, 0, 0].shape, self.out_dtype
+         )
+         # STG Atom
+-        simt_atom = cute.make_copy_atom(cute.nvgpu.CopyUniversalOp(), c_dtype)
++        simt_atom = cute.make_copy_atom(cute.nvgpu.CopyUniversalOp(), self.out_dtype)
+         tTR_gC = tTR_gC[(None, None, None, None, *mma_tile_coord_mnl)]
+ 
+         # Release TMEM allocation lock
+@@ -716,7 +720,12 @@
+ 
+         # Copy accumulator to register
+         cute.copy(tiled_copy_t2r, tTR_tAcc, tTR_rAcc)
+-        acc_vec = epilogue_op(tTR_rAcc.load().to(c_dtype))
++        # The call's alpha is the product of the two tensor scales: one FP32
++        # device value, which the epilogue applies before the tile is rounded.
++        alpha_value = cute.make_tensor(
++            alpha_ptr, cute.make_layout((1,), stride=(1,))
++        )[0]
++        acc_vec = (tTR_rAcc.load() * alpha_value).to(self.out_dtype)
+         tTR_rC.store(acc_vec)
+         # Store C to global memory
+         cute.copy(simt_atom, tTR_rC, tTR_gC)
+@@ -730,49 +739,3 @@
+         return
+ 
+ 
+-def run_nvfp4_gemm(
+-    mnkl: Tuple[int, int, int, int],
+-    tolerance: float,
+-    do_benchmark: bool = False,
+-    warmup_iterations: int = 10,
+-    iterations: int = 100,
+-    use_cold_l2: bool = True,
+-):
+-    run(
+-        gemm_class=Sm100BlockScaledDenseGemmKernel,
+-        ab_dtype=ab_dtype,
+-        sf_dtype=sf_dtype,
+-        c_dtype=c_dtype,
+-        sf_vec_size=sf_vec_size,
+-        mma_tiler_mn=mma_tiler_mn,
+-        cluster_shape_mnk=(1, 1, 1),
+-        mnkl=mnkl,
+-        tolerance=tolerance,
+-        do_benchmark=do_benchmark,
+-        warmup_iterations=warmup_iterations,
+-        iterations=iterations,
+-        use_cold_l2=use_cold_l2,
+-    )
+-
+-
+-if __name__ == "__main__":
+-    parser = create_parser()
+-    args = parser.parse_args()
+-
+-    if len(args.mnkl) != 4:
+-        parser.error("--mnkl must contain exactly 4 values")
+-
+-    m, n, k, _ = args.mnkl
+-    if m % mma_tiler_mn[0] != 0:
+-        parser.error("m must be multiples of mma_tiler_mn[0] (got m={})".format(m))
+-    if n % mma_tiler_mn[1] != 0:
+-        parser.error("n must be multiples of mma_tiler_mn[1] (got n={})".format(n))
+-    if k % 256 != 0:
+-        parser.error("k must be a multiple of 256 (got k={})".format(k))
+-
+-    run_nvfp4_gemm(
+-        args.mnkl,
+-        args.tolerance,
+-        args.do_benchmark,
+-    )
+-    print("PASS")
