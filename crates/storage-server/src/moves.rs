@@ -23,7 +23,7 @@ use std::collections::BTreeMap;
 use std::os::fd::OwnedFd;
 
 use ::storage::protocol::{
-    Access, Allocation, ErrorKind, Event, LinkEnd, Location, Response, StorageRecord, TaskStatus,
+    Access, Allocation, ErrorKind, Event, Location, Response, StorageRecord, TaskStatus,
 };
 
 use crate::{ClientId, Handling, Server, StorageEntry, StorageId, invalid};
@@ -203,7 +203,7 @@ impl Server {
                 }
             } else {
                 let Some(transfer_server) = self.transfers.client else {
-                    self.item_ended(number, index, Some("no Transfer Server runs".to_owned()));
+                    self.item_ended(number, index, Some(crate::transfers::unavailable().1));
                     continue;
                 };
                 let allocation = self.moves.next_allocation;
@@ -469,14 +469,5 @@ impl Server {
             }
         }
         Ok(())
-    }
-}
-
-/// The storages a move's copy reads and writes, as the Transfer Server maps
-/// them: a device storage on its GPU, a host storage in host storage.
-pub(crate) fn storage_of(record: &StorageRecord) -> LinkEnd {
-    match record.location {
-        Location::Device { gpu } => LinkEnd::Device { gpu },
-        Location::Host { .. } => LinkEnd::Host,
     }
 }

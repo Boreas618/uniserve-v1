@@ -50,7 +50,7 @@ pub mod transfer;
 mod transfers;
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
-use std::io::{self, Read};
+use std::io;
 use std::net::TcpListener;
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd};
 use std::os::unix::net::{UnixListener, UnixStream};
@@ -76,10 +76,6 @@ use shoot::ShootDowns;
 /// How often a shoot-down that waits for a GPU to drop its victim polls
 /// NVML.
 const NVML_POLL: Duration = Duration::from_millis(20);
-
-/// How long one request may hold the single-threaded server before it is
-/// logged: every other client's request waits meanwhile.
-const SLOW_REQUEST: Duration = Duration::from_millis(100);
 
 type ClientId = u64;
 type StorageId = u64;
@@ -732,17 +728,15 @@ impl Server {
                 Ok(Handling::Response(reply, storages)) => {
                     self.respond(id, request_id, reply, &storages);
                     self.send_events();
-                    // The server is single-threaded: a request that holds
-                    // it this long delays every other client's.
+                    // The server is single-threaded: the time a request holds it is the time
+                    // every other client's request waits.
                     let served = started.elapsed();
-                    if served >= SLOW_REQUEST {
-                        tracing::info!(
-                            request = request_name(&request),
-                            handled_ms = handled.as_millis() as u64,
-                            served_ms = served.as_millis() as u64,
-                            "a request held the server"
-                        );
-                    }
+                    tracing::debug!(
+                        request = <&str>::from(&request),
+                        handled_us = u64::try_from(handled.as_micros()).unwrap_or(u64::MAX),
+                        served_us = u64::try_from(served.as_micros()).unwrap_or(u64::MAX),
+                        "a request held the server"
+                    );
                 }
                 Ok(Handling::Descriptors(reply, descriptors)) => {
                     let borrowed: Vec<BorrowedFd<'_>> =
@@ -1073,13 +1067,13 @@ impl Server {
                     } => self.host_part(&holder, (region, *part), *bytes, *numa_node),
                     _ => Err(invalid(&format!(
                         "{} is not a worker request",
-                        request_name(request)
+                        <&str>::from(request)
                     ))),
                 }
             }
             (request, role) => Err(invalid(&format!(
                 "{} is not a request of {role:?}",
-                request_name(request)
+                <&str>::from(request)
             ))),
         }
     }
@@ -2509,57 +2503,29 @@ fn resource(error: io::Error) -> (ErrorKind, String) {
     (ErrorKind::Resource, error.to_string())
 }
 
-fn request_name(request: &Request) -> &'static str {
-    match request {
-        Request::Claim { .. } => "claim",
-        Request::Publish { .. } => "publish_epochs",
-        Request::Retain { .. } => "retain",
-        Request::KeepWeights { .. } => "keep_weights",
-        Request::Get { .. } => "get",
-        Request::Put { .. } => "put",
-        Request::AllocateHost { .. } => "allocate_host",
-        Request::Promote { .. } => "promote",
-        Request::Release { .. } => "release",
-        Request::Rekey { .. } => "rekey",
-        Request::List => "list",
-        Request::Retire { .. } => "retire",
-        Request::Restart { .. } => "restart",
-        Request::Status => "status",
-        Request::Stop => "stop",
-        Request::Finished { .. } => "finished",
-        Request::Quota { .. } => "reserve",
-        Request::Usage { .. } => "quota",
-        Request::Submit { .. } => "transfer",
-        Request::OpenSession { .. } => "open_transfer",
-        Request::CloseSession { .. } => "close_transfer",
-        Request::Cancel { .. } => "cancel",
-        Request::Throttle { .. } => "throttle",
-        Request::Measured { .. } => "measured",
-        Request::Copied { .. } => "copied",
-        Request::Expose { .. } => "expose",
-        Request::Unexpose { .. } => "unexpose",
-        Request::Registered { .. } => "registered",
-        Request::Offload { .. } => "offload",
-        Request::Restore { .. } => "restore",
-        Request::Allocated { .. } => "allocated",
-        Request::Open(_) => "open",
-        Request::Close => "close",
-        Request::Place { .. } => "place",
-        Request::PlaceRemote { .. } => "place_remote",
-        Request::Grant { .. } => "grant",
-        Request::Withdraw { .. } => "withdraw",
-        Request::HostPart { .. } => "host_part",
-        Request::PeerHold { .. } => "peer hold",
-        Request::PeerRelease { .. } => "peer release",
-        Request::Pages { .. } => "pages",
-    }
-}
-
-/// A fresh claim token.
+/// A fresh claim token, from the kernel's random source (`getrandom(2)`).
 fn random_token() -> io::Result<[u8; 16]> {
     let mut token = [0_u8; 16];
-    std::fs::File::open("/dev/urandom")?.read_exact(&mut token)?;
+    let filled = rustix::rand::getrandom(&mut token, rustix::rand::GetRandomFlags::empty())?;
+    if filled != token.len() {
+        return Err(io::Error::other(
+            "the kernel gave fewer random bytes than asked",
+        ));
+    }
     Ok(token)
+}
+
+/// This host's name, as the kernel states it (`uname(2)`'s node name).
+///
+/// # Errors
+///
+/// Fails when the name is not UTF-8.
+pub(crate) fn host_name() -> io::Result<String> {
+    rustix::system::uname()
+        .nodename()
+        .to_str()
+        .map(str::to_owned)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "this host's name is not UTF-8"))
 }
 
 /// Read everything a wake descriptor holds.

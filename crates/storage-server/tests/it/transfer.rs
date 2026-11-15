@@ -1504,7 +1504,7 @@ pub(crate) mod device {
             panic!("the allocation exports no fabric handle");
         };
         let region = Region::Fabric {
-            handle: handle.to_vec(),
+            handle: ::storage::protocol::FabricHandle(handle),
             gpu: first.uuid().unwrap().0,
             bytes: granularity as u64,
             offset: 0,

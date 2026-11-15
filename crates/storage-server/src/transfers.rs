@@ -54,7 +54,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use ::storage::protocol::{
     Access, Allocation, ContextBytes, ErrorKind, Event, FabricExport, FabricHandle, Link,
-    LinkBandwidth, LinkEnd, Location, Move, Priority, Region, Registration, Response, Role, Span,
+    LinkBandwidth, LinkEnd, Move, Priority, Region, Registration, Response, Role, Span,
     TaskListing, TaskStatus, TaskTotal, Throttle, TransferListing,
 };
 
@@ -260,10 +260,7 @@ impl Server {
                 Ok(Handling::Response(Response::Submitted { task }, Vec::new()))
             }
             Request::OpenSession { gpus } => {
-                let transfer = self
-                    .transfers
-                    .client
-                    .ok_or_else(|| (ErrorKind::Unavailable, "no Transfer Server runs".into()))?;
+                let transfer = self.transfers.client.ok_or_else(unavailable)?;
                 if gpus.iter().any(|gpu| {
                     !self
                         .transfers
@@ -727,7 +724,7 @@ impl Server {
         };
         let resolved = |storage: StorageId, record: &::storage::protocol::StorageRecord| Resolved {
             allocation: Allocation::Storage { storage },
-            end: crate::moves::storage_of(record),
+            end: LinkEnd::from(record.location),
             base: 0,
             bytes: record.bytes,
             attachment: Some(Attachment::Storage(storage)),
@@ -844,10 +841,7 @@ impl Server {
                     .storages
                     .get(&tensor.storage)
                     .ok_or_else(|| invalid(&format!("{} has no storage", tensor.name)))?;
-                let end = match storage.record.location {
-                    Location::Device { gpu } => LinkEnd::Device { gpu },
-                    Location::Host { .. } => LinkEnd::Host,
-                };
+                let end = LinkEnd::from(storage.record.location);
                 Ok(Resolved {
                     allocation: Allocation::Storage {
                         storage: tensor.storage,
@@ -881,23 +875,18 @@ impl Server {
                 gpu,
                 bytes,
                 offset,
-            } => {
-                if handle.len() != 64 {
-                    return Err(invalid("a fabric handle has 64 bytes"));
-                }
-                Ok(Resolved {
-                    allocation: Allocation::Fabric {
-                        handle: handle.clone(),
-                        gpu: *gpu,
-                        bytes: *bytes,
-                    },
-                    end: LinkEnd::Device { gpu: *gpu },
-                    base: *offset,
+            } => Ok(Resolved {
+                allocation: Allocation::Fabric {
+                    handle: *handle,
+                    gpu: *gpu,
                     bytes: *bytes,
-                    attachment: None,
-                    writable: destination,
-                })
-            }
+                },
+                end: LinkEnd::Device { gpu: *gpu },
+                base: *offset,
+                bytes: *bytes,
+                attachment: None,
+                writable: destination,
+            }),
             Region::Remote { .. } => Err(invalid(if destination {
                 "a span writes storage of this host: another host's region is a source, which \
                  this host READs"

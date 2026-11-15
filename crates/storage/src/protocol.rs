@@ -317,6 +317,16 @@ pub enum Location {
     Host { numa_node: Option<u32> },
 }
 
+impl From<Location> for LinkEnd {
+    /// The end of a link a copy of storage at `location` runs over: its GPU, or host storage.
+    fn from(location: Location) -> Self {
+        match location {
+            Location::Device { gpu } => Self::Device { gpu },
+            Location::Host { .. } => Self::Host,
+        }
+    }
+}
+
 /// One physical allocation. Its descriptor travels with the message that
 /// names it, in the order the message lists its storages.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -341,7 +351,7 @@ pub struct StorageRecord {
 /// A device allocation's 64-byte fabric handle (`CU_MEM_HANDLE_TYPE_FABRIC`),
 /// which only the process that created the allocation exports, and which
 /// imports only while that process holds the allocation.
-#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct FabricHandle(pub [u8; 64]);
 
 impl std::fmt::Debug for FabricHandle {
@@ -673,7 +683,7 @@ pub enum Region {
     /// allocation. Copies import the handle into this host's Transfer
     /// Server.
     Fabric {
-        handle: Vec<u8>,
+        handle: FabricHandle,
         gpu: [u8; 16],
         bytes: u64,
         offset: u64,
@@ -830,7 +840,7 @@ pub enum Allocation {
     /// A device allocation of another host of the NVLink fabric, `bytes`
     /// long, on the GPU `gpu`, by its fabric handle.
     Fabric {
-        handle: Vec<u8>,
+        handle: FabricHandle,
         gpu: [u8; 16],
         bytes: u64,
     },
@@ -968,8 +978,9 @@ pub struct ContextBytes {
 /// worker requests from a [`Role::Worker`] client; `List` from any. The
 /// connector's, the Transfer Server's and a peer's requests say which they
 /// are.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, strum::IntoStaticStr)]
 #[serde(rename_all = "snake_case")]
+#[strum(serialize_all = "snake_case")]
 pub enum Request {
     /// Make the caller the head of its deployment, keeping the claim it holds
     /// already, and state the scopes `claimant` places on the host for

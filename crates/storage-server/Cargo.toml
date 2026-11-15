@@ -23,7 +23,7 @@ mooncake_store.workspace = true
 libloading.workspace = true
 rmp-serde.workspace = true
 serde_bytes.workspace = true
-rustix = { workspace = true, features = ["event", "fs", "mm", "net", "pipe", "process", "time"] }
+rustix = { workspace = true, features = ["event", "fs", "mm", "net", "pipe", "process", "rand", "system", "time"] }
 serde.workspace = true
 service.workspace = true
 storage.workspace = true

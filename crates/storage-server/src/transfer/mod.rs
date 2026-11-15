@@ -856,10 +856,7 @@ impl TransferServer {
                 .map(|mapped| Side::Given(Arc::clone(mapped)))
                 .ok_or_else(|| format!("{allocation:?} was not given to the Transfer Server")),
             Allocation::Fabric { handle, gpu, bytes } => Ok(Side::Fabric {
-                handle: handle
-                    .as_slice()
-                    .try_into()
-                    .map_err(|_| "a fabric handle has 64 bytes".to_owned())?,
+                handle: handle.0,
                 gpu: *gpu,
                 bytes: *bytes,
             }),

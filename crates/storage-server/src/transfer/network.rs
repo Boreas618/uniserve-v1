@@ -46,7 +46,6 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, OnceLock};
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use ::storage::Client;
 use ::storage::protocol::{FabricExport, Link, LinkEnd, Region, Registration};
@@ -149,7 +148,7 @@ impl Network {
                 if let Some(library) = &self.library {
                     nixl::load_library(library).map_err(|error| error.to_string())?;
                 }
-                let name = agent_name();
+                let name = agent_name().map_err(|error| format!("naming a NIXL agent: {error}"))?;
                 let agent = nixl::Agent::new(&name)
                     .map_err(|error| format!("starting a NIXL agent: {error}"))?;
                 tracing::info!(agent = name, "started the NIXL agent");
@@ -517,27 +516,16 @@ fn source_region(range: &Registration) -> Result<nixl::Region, String> {
     })
 }
 
-/// A name no other agent takes, on any host: this host's name, the process,
-/// and when the agent started (a process id is reused after its process
-/// ends).
-fn agent_name() -> String {
-    let started = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |since| since.as_nanos());
-    format!(
-        "uniserve-transfer-{}-{}-{started:x}",
-        host_name(),
-        std::process::id()
-    )
-}
-
-/// This host's name, or `host` when it has none readable.
-fn host_name() -> String {
-    let mut name = [0_u8; 256];
-    // SAFETY: gethostname writes at most `name.len()` bytes into `name`.
-    if unsafe { libc::gethostname(name.as_mut_ptr().cast(), name.len()) } != 0 {
-        return "host".into();
+/// A name no other agent takes, on any host or across restarts: 128 bits from the kernel's
+/// random source.
+fn agent_name() -> std::io::Result<String> {
+    let mut identity = [0_u8; 16];
+    let filled = rustix::rand::getrandom(&mut identity, rustix::rand::GetRandomFlags::empty())?;
+    if filled != identity.len() {
+        return Err(std::io::Error::other(
+            "the kernel gave fewer random bytes than asked",
+        ));
     }
-    let length = name.iter().position(|byte| *byte == 0).unwrap_or(0);
-    String::from_utf8_lossy(&name[..length]).into_owned()
+    let hex: String = identity.iter().map(|byte| format!("{byte:02x}")).collect();
+    Ok(format!("uniserve-transfer-{hex}"))
 }

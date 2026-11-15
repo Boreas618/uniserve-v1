@@ -104,7 +104,7 @@ struct Shared {
 /// Connect to Mooncake with `settings`, say hello on `channel`, the connection the Storage Server
 /// made for its connector, and run the server's tasks until the server closes the connection.
 pub fn run(channel: service::Connection, settings: &Settings) -> Result<(), Error> {
-    let hostname = host_name()?;
+    let hostname = crate::host_name()?;
     // Mooncake Store's C API is opened by its soname from the loader's default search path,
     // where the Mooncake package installs it, before any store exists; the binding's own lookup
     // is never asked.
@@ -372,20 +372,4 @@ fn unmap(store: &MooncakeStore, mapped: Mapping) {
 fn drain(reader: &OwnedFd) {
     let mut buffer = [0_u8; 64];
     while matches!(rustix::io::read(reader, &mut buffer), Ok(read) if read > 0) {}
-}
-
-/// This host's name, as `gethostname(2)` gives it: the name other Mooncake clients reach this
-/// host's transfer engine by.
-fn host_name() -> Result<String, Error> {
-    let mut name = [0_u8; 256];
-    // SAFETY: gethostname writes at most `name.len()` bytes into `name`.
-    if unsafe { libc::gethostname(name.as_mut_ptr().cast(), name.len()) } != 0 {
-        return Err(io::Error::last_os_error().into());
-    }
-    let length = name
-        .iter()
-        .position(|byte| *byte == 0)
-        .unwrap_or(name.len());
-    String::from_utf8(name[..length].to_vec())
-        .map_err(|_| Error::Settings("this host's name is not UTF-8".into()))
 }

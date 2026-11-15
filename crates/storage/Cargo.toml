@@ -20,6 +20,8 @@ serde_bytes.workspace = true
 serde_json.workspace = true
 service.workspace = true
 sha2.workspace = true
+# A request's name, from its variant (`Request` into `&str`).
+strum.workspace = true
 thiserror.workspace = true
 # The settings document a Storage Server reads (`settings`).
 toml.workspace = true
