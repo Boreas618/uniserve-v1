@@ -354,20 +354,18 @@ pub fn detach(socket: &Path, relay: Option<ReadyFd>) -> io::Result<ReadyFd> {
 ///
 /// The service runs in a session of its own, not as a child of this process, so this process's
 /// end never ends it. The starter reports the server's records on its standard output once the
-/// server serves ([`detach`]); the wait for them is bounded by `timeout`, and a server that ends
-/// first is reported with its log.
+/// server serves ([`detach`]) and exits once the server closes its readiness descriptor, so the
+/// wait for them ends with the server serving or with its end, which is reported with its log.
 ///
 /// # Errors
 ///
-/// Fails when the service cannot be started, ends before it serves, or reports no record in
-/// time.
+/// Fails when the service cannot be started, or ends before it serves.
 pub fn start<S: DeserializeOwned>(
     executable: &Path,
     name: &str,
     socket: &Path,
     arguments: &[String],
     input: Option<&[u8]>,
-    timeout: Duration,
 ) -> io::Result<Readiness<S>> {
     if let Some(record) = running(socket)? {
         return Ok(record);
@@ -399,7 +397,7 @@ pub fn start<S: DeserializeOwned>(
         .stdout
         .take()
         .ok_or_else(|| io::Error::other("the starter's standard output was not piped"))?;
-    let record = ReadyReader::new(OwnedFd::from(output)).wait(State::Serving, timeout);
+    let record = ReadyReader::new(OwnedFd::from(output)).wait(State::Serving, Duration::MAX);
     let status = starter.wait()?;
     match record {
         Ok(record) if status.success() => Ok(record),

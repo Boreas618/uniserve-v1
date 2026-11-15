@@ -21,19 +21,24 @@ pub(crate) mod processes;
 mod service;
 mod supervisor;
 
-pub(crate) use service::ServiceHandoff;
+pub(crate) use service::{ServiceHandoff, readable};
 pub(crate) use supervisor::engine_executable;
+
+/// The kernel's name of the executable image this process runs. The host services a daemon starts
+/// (the Build Server and the Storage Server) are commands of the running build, so the daemon
+/// starts them from its own image: the path names that image even after the file it was loaded
+/// from is replaced or removed.
+pub(crate) const RUNNING_IMAGE: &str = "/proc/self/exe";
 
 use std::net::IpAddr;
 use std::os::fd::OwnedFd;
-use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
-use ::service::{Connection, Listener};
+use ::service::{Connection, Listener, Wake, Waker};
 use anyhow::Context as _;
 use proto::process::{Hello, Join, Welcome, hello};
 
@@ -46,6 +51,41 @@ use supervisor::Supervisor;
 /// together, so this covers one that is starting rather than one waiting to
 /// be scheduled.
 pub const JOIN_TIMEOUT: Duration = Duration::from_secs(300);
+
+/// A sender to the daemon's service thread that wakes it: the thread blocks on its sockets and its
+/// processes' exits, and what another thread hands it through a channel reaches it with the wake
+/// this sender fires after each message.
+pub(crate) struct ToService<T> {
+    sender: std::sync::mpsc::Sender<T>,
+    wake: Wake,
+}
+
+impl<T> Clone for ToService<T> {
+    fn clone(&self) -> Self {
+        Self {
+            sender: self.sender.clone(),
+            wake: self.wake.clone(),
+        }
+    }
+}
+
+impl<T> ToService<T> {
+    /// Sends on `sender` and wakes with `wake`.
+    pub(crate) fn new(sender: std::sync::mpsc::Sender<T>, wake: Wake) -> Self {
+        Self { sender, wake }
+    }
+
+    /// Sends `value` and wakes the service thread.
+    ///
+    /// # Errors
+    ///
+    /// Gives `value` back when the service thread ended.
+    pub(crate) fn send(&self, value: T) -> Result<(), std::sync::mpsc::SendError<T>> {
+        self.sender.send(value)?;
+        self.wake.wake();
+        Ok(())
+    }
+}
 
 /// Where a daemon runs and how it reaches the other nodes' daemons.
 #[derive(Debug, Clone)]
@@ -61,11 +101,7 @@ pub struct DaemonOptions {
     pub dist_init_addr: Option<::service::Endpoint>,
     /// The leader's process socket, which engines connect to.
     pub socket: PathBuf,
-    /// The `uniserve` executable that starts this node's Storage Server
-    /// when it has none, as its `storage-server serve` command.
-    pub executable: PathBuf,
-    /// How long the leader waits for the members and a member for the
-    /// leader.
+    /// How long the leader waits for the members, and a member for the leader's welcome.
     pub join_timeout: Duration,
     /// This node's Build Server, which the engines the node starts resolve their
     /// modules from (`build_config`).
@@ -86,7 +122,7 @@ pub struct DaemonOptions {
 #[derive(Clone)]
 pub struct ProcessCommands {
     /// Commands, by the engine that is to execute them.
-    pub(crate) commands: std::sync::mpsc::Sender<(u64, proto::process::Command)>,
+    pub(crate) commands: ToService<(u64, proto::process::Command)>,
     /// Every report an engine sent, by the engine that sent it.
     pub(crate) reports:
         Arc<std::sync::Mutex<std::sync::mpsc::Receiver<(u64, proto::process::Report)>>>,
@@ -134,30 +170,65 @@ pub struct Daemon {
     /// shared between the HTTP threads and the channel ends are not
     /// themselves `Sync`.
     link: std::sync::Mutex<Option<processes::ProcessLink>>,
-    /// A clone of the requests channel inside `link`, kept for the processes
-    /// this daemon starts itself: the frontend is spawned and commanded
-    /// through the node's service too, and its channel must not be the
-    /// updater's to take.
-    _requests: Option<
-        std::sync::mpsc::Sender<(
-            proto::process::Request,
-            std::sync::mpsc::Sender<proto::process::Reply>,
-        )>,
-    >,
     /// The processes this node supervises, which the service keeps current:
     /// the updater and `GET /admin/config` read them.
     table: Option<service::ProcessTable>,
     /// One token per thing the updater has to read, so the thread that
     /// advances the update waits instead of polling.
     awake: std::sync::Mutex<Option<std::sync::mpsc::Receiver<()>>>,
-    /// The process socket engines connect to, on the leader.
+    /// The process socket engines connect to, on the leader. Its listener, which the service
+    /// owns, removes a Unix socket's file when it closes.
     address: Option<String>,
-    /// The leader's socket file, removed once its service ends.
-    socket: Option<PathBuf>,
     requested: Arc<AtomicBool>,
     handoff: Arc<AtomicBool>,
-    wake: UnixStream,
+    /// The service's waker, fired with a stop.
+    wake: Wake,
     thread: Option<JoinHandle<Served>>,
+}
+
+/// The ends of the leader's service: the service's own ([`service::Updater`]) and the
+/// updater's ([`processes::ProcessLink`]), with the token channel that wakes the updater's thread
+/// and the process table both read.
+struct LeaderEnds {
+    service: service::Updater,
+    link: processes::ProcessLink,
+    awake: std::sync::mpsc::Receiver<()>,
+    table: service::ProcessTable,
+}
+
+impl LeaderEnds {
+    /// The two ends of a leader's service whose waker fires `wake`.
+    fn new(wake: &Wake) -> Self {
+        let (commands, commands_rx) = std::sync::mpsc::channel();
+        let (reports, reports_rx) = std::sync::mpsc::channel();
+        let (requests, requests_rx) = std::sync::mpsc::channel();
+        let (greetings, greetings_rx) = std::sync::mpsc::channel();
+        let (exits, exits_rx) = std::sync::mpsc::channel();
+        let (activity, awake) = std::sync::mpsc::channel();
+        let table: service::ProcessTable = Default::default();
+        Self {
+            service: service::Updater {
+                commands: commands_rx,
+                reports,
+                requests: requests_rx,
+                greetings,
+                exits,
+                wake: activity,
+                processes: Arc::clone(&table),
+            },
+            link: processes::ProcessLink {
+                requests: ToService::new(requests, wake.clone()),
+                greetings: greetings_rx,
+                exits: exits_rx,
+                commands: ProcessCommands {
+                    commands: ToService::new(commands, wake.clone()),
+                    reports: Arc::new(std::sync::Mutex::new(reports_rx)),
+                },
+            },
+            awake,
+            table,
+        }
+    }
 }
 
 /// How the service thread ended: stopped (`None`), or stopped for a hot
@@ -215,190 +286,134 @@ impl Daemon {
             options.nnodes == 1 || options.dist_init_addr.is_some(),
             "a deployment of several nodes needs the leader's address (`--dist-init-addr`)"
         );
-        let (wake, wake_reader) = UnixStream::pair().context("creating the daemon's wake")?;
-        wake_reader.set_nonblocking(true)?;
+        let waker = Waker::new().context("creating the daemon's waker")?;
+        let wake = waker.wake();
         let requested = Arc::new(AtomicBool::new(false));
         let handoff = Arc::new(AtomicBool::new(false));
-        let stop = Stop {
+        let mut stop = Stop {
             requested: Arc::clone(&requested),
             handoff: Arc::clone(&handoff),
-            wake: wake_reader,
+            waker,
         };
 
-        let (served, thread, link, requests, awake, table) = if options.node_rank == 0 {
+        let (address, thread, ends) = if options.node_rank == 0 {
             let (joins, members) = join_members(&options, join)?;
-            let leader_address = leader_address(&options, &members);
+            let leader_address = leader_address(&options)?;
             // Engines may run on any joined node. A deployment with a
             // network address exposes process control on that interface;
             // single-host deployments retain their Unix socket.
-            let (address, socket) = match leader_address {
-                Some(ip) => (
-                    ::service::Endpoint::tcp(std::net::SocketAddr::new(ip, 0)),
-                    None,
-                ),
-                None => (
-                    ::service::Endpoint::unix(&options.socket),
-                    Some(options.socket.clone()),
-                ),
+            let endpoint = match leader_address {
+                Some(ip) => ::service::Endpoint::tcp(std::net::SocketAddr::new(ip, 0)),
+                None => ::service::Endpoint::unix(&options.socket),
             };
-            if let Some(parent) = options.socket.parent() {
-                std::fs::create_dir_all(parent)
-                    .with_context(|| format!("creating {}", parent.display()))?;
-            }
-            // A socket a stopped daemon left behind is replaced.
-            let _ = std::fs::remove_file(&options.socket);
-            let listener = Listener::bind(&address)
-                .with_context(|| format!("binding the process socket {address}"))?;
+            let listener = Listener::bind(&endpoint)
+                .with_context(|| format!("binding the process socket {endpoint}"))?;
             let address = listener.endpoint().to_string();
             // While nodes may join, their processes reach this node's
             // Storage Server too: their Transfer Servers read its storage.
-            let local = local(&options, leader_address, joins.is_some())?;
+            let local = local(&options, leader_address, joins.is_some(), wake.clone())?;
             let host = options.host.clone();
-            let (commands, commands_rx) = std::sync::mpsc::channel();
-            let (reports, reports_rx) = std::sync::mpsc::channel();
-            let (requests, requests_rx) = std::sync::mpsc::channel();
-            let (greetings, greetings_rx) = std::sync::mpsc::channel();
-            let (exits, exits_rx) = std::sync::mpsc::channel();
-            let (activity, awake) = std::sync::mpsc::channel();
-            // The processes this node supervises, which the service keeps
-            // current and the admin API reports.
-            let table: service::ProcessTable = Default::default();
-            let published = Arc::clone(&table);
+            let LeaderEnds {
+                service,
+                link,
+                awake,
+                table,
+            } = LeaderEnds::new(&wake);
             let thread = std::thread::Builder::new()
                 .name("daemon".into())
                 .spawn(move || {
                     service::serve_leader(
-                        &host,
-                        local,
-                        listener,
-                        joins,
-                        members,
-                        commands_rx,
-                        reports,
-                        requests_rx,
-                        greetings,
-                        exits,
-                        activity,
-                        published,
-                        &stop,
+                        &host, local, listener, joins, members, service, &mut stop,
                     )
                 })
                 .context("starting the daemon's service")?;
-            let commands = ProcessCommands {
-                commands,
-                reports: Arc::new(std::sync::Mutex::new(reports_rx)),
-            };
-            let link = Some(processes::ProcessLink {
-                requests: requests.clone(),
-                greetings: greetings_rx,
-                exits: exits_rx,
-                commands,
-            });
-            (
-                Some((address, socket)),
-                thread,
-                link,
-                Some(requests),
-                Some(awake),
-                Some(table),
-            )
+            (Some(address), thread, Some((link, awake, table)))
         } else {
             let leader = join_leader(&options)?;
             let address = leader.local_addr().map(|address| address.ip());
-            let local = local(&options, address, true)?;
+            let local = local(&options, address, true, wake.clone())?;
             let thread = std::thread::Builder::new()
                 .name("daemon".into())
-                .spawn(move || service::serve_member(local, leader, &stop))
+                .spawn(move || service::serve_member(local, leader, &mut stop))
                 .context("starting the daemon's service")?;
-            (None, thread, None, None, None, None)
+            (None, thread, None)
         };
-        let (address, socket) = served.unzip();
-        Ok(Self {
+        Ok(Self::running(
+            address, requested, handoff, wake, thread, ends,
+        ))
+    }
+
+    /// A running daemon of the service thread `thread`, which `wake` wakes; `ends` are the
+    /// updater's ends of a leader's service, `None` on a member.
+    fn running(
+        address: Option<String>,
+        requested: Arc<AtomicBool>,
+        handoff: Arc<AtomicBool>,
+        wake: Wake,
+        thread: JoinHandle<Served>,
+        ends: Option<(
+            processes::ProcessLink,
+            std::sync::mpsc::Receiver<()>,
+            service::ProcessTable,
+        )>,
+    ) -> Self {
+        let (link, awake, table) = match ends {
+            Some((link, awake, table)) => (Some(link), Some(awake), Some(table)),
+            None => (None, None, None),
+        };
+        Self {
             table,
-            _requests: requests,
             link: std::sync::Mutex::new(link),
             awake: std::sync::Mutex::new(awake),
             address,
-            socket: socket.flatten(),
             requested,
             handoff,
             wake,
             thread: Some(thread),
-        })
+        }
     }
 
     /// Goes on with the service a predecessor handed over in a hot restart
-    /// ([`Daemon::hand_over`]), on host `host`; `address` and `socket` are
-    /// the leader's process socket, `None` on a member.
+    /// ([`Daemon::hand_over`]), on host `host`; `address` is the leader's process socket, `None`
+    /// on a member.
     ///
     /// # Errors
     ///
     /// Fails when the service thread cannot start.
     pub(crate) fn resume(
         host: String,
-        address: Option<(String, Option<PathBuf>)>,
+        address: Option<String>,
         service: ServiceHandoff,
         descriptors: Vec<OwnedFd>,
     ) -> anyhow::Result<Self> {
-        let (wake, wake_reader) = UnixStream::pair().context("creating the daemon's wake")?;
-        wake_reader.set_nonblocking(true)?;
+        let waker = Waker::new().context("creating the daemon's waker")?;
+        let wake = waker.wake();
         let requested = Arc::new(AtomicBool::new(false));
         let handoff = Arc::new(AtomicBool::new(false));
-        let stop = Stop {
+        let mut stop = Stop {
             requested: Arc::clone(&requested),
             handoff: Arc::clone(&handoff),
-            wake: wake_reader,
+            waker,
         };
-        let (commands, commands_rx) = std::sync::mpsc::channel();
-        let (reports, reports_rx) = std::sync::mpsc::channel();
-        let (requests, requests_rx) = std::sync::mpsc::channel();
-        let (greetings, greetings_rx) = std::sync::mpsc::channel();
-        let (exits, exits_rx) = std::sync::mpsc::channel();
-        let (activity, awake) = std::sync::mpsc::channel();
-        let table: service::ProcessTable = Default::default();
-        let published = Arc::clone(&table);
         let leader = matches!(service, ServiceHandoff::Leader { .. });
-        let node = host.clone();
+        let LeaderEnds {
+            service: ends,
+            link,
+            awake,
+            table,
+        } = LeaderEnds::new(&wake);
         let thread = std::thread::Builder::new()
             .name("daemon".into())
-            .spawn(move || {
-                service::resume(
-                    node,
-                    service,
-                    descriptors,
-                    commands_rx,
-                    reports,
-                    requests_rx,
-                    greetings,
-                    exits,
-                    activity,
-                    published,
-                    &stop,
-                )
-            })
+            .spawn(move || service::resume(host, service, descriptors, ends, &mut stop))
             .context("starting the daemon's service")?;
-        let link = leader.then(|| processes::ProcessLink {
-            requests: requests.clone(),
-            greetings: greetings_rx,
-            exits: exits_rx,
-            commands: ProcessCommands {
-                commands,
-                reports: Arc::new(std::sync::Mutex::new(reports_rx)),
-            },
-        });
-        let (address, socket) = address.unzip();
-        Ok(Self {
-            table: leader.then_some(table),
-            _requests: leader.then_some(requests),
-            link: std::sync::Mutex::new(link),
-            awake: std::sync::Mutex::new(leader.then_some(awake)),
+        Ok(Self::running(
             address,
-            socket: socket.flatten(),
             requested,
             handoff,
             wake,
-            thread: Some(thread),
-        })
+            thread,
+            leader.then_some((link, awake, table)),
+        ))
     }
 
     /// Stops the service between two rounds and returns everything it
@@ -410,16 +425,12 @@ impl Daemon {
     ///
     /// Fails when the service ended or failed before it handed over.
     pub(crate) fn hand_over(&mut self) -> anyhow::Result<(ServiceHandoff, Vec<OwnedFd>)> {
-        use std::io::Write as _;
-
         self.handoff.store(true, Ordering::Release);
-        let _ = (&self.wake).write(&[1]);
+        self.wake.wake();
         let thread = self
             .thread
             .take()
             .context("the daemon's service is not running")?;
-        // The successor serves the socket from here on.
-        self.socket = None;
         thread
             .join()
             .map_err(|_| anyhow::anyhow!("the daemon's service panicked"))??
@@ -499,10 +510,8 @@ impl Daemon {
 
     /// Stops the service and ends every process it supervises.
     pub fn stop(&mut self) -> anyhow::Result<()> {
-        use std::io::Write as _;
-
         self.requested.store(true, Ordering::Release);
-        let _ = (&self.wake).write(&[1]);
+        self.wake.wake();
         self.join()
     }
 
@@ -510,13 +519,10 @@ impl Daemon {
         let Some(thread) = self.thread.take() else {
             return Ok(());
         };
-        let served = thread
+        thread
             .join()
-            .map_err(|_| anyhow::anyhow!("the daemon's service panicked"));
-        if let Some(socket) = self.socket.take() {
-            let _ = std::fs::remove_file(socket);
-        }
-        served?.map(drop)
+            .map_err(|_| anyhow::anyhow!("the daemon's service panicked"))?
+            .map(drop)
     }
 }
 
@@ -535,25 +541,23 @@ fn local(
     options: &DaemonOptions,
     address: Option<IpAddr>,
     remote_pages: bool,
+    wake: Wake,
 ) -> anyhow::Result<Local> {
     Ok(Local::new(
         Supervisor::new(options.host.clone())
             .context("creating the daemon's lifeline")?
             .with_build_server(options.build_server.clone()),
-        ClaimHolder::new(
-            options.executable.clone(),
-            remote_pages,
-            address,
-            options.storage.clone(),
-        ),
+        ClaimHolder::new(remote_pages, address, options.storage.clone()),
         address,
+        wake,
     ))
 }
 
 /// The members that joined before the leader serves, at the join listener the caller bound
 /// (`join`, [`Daemon::bind_join`]) when the deployment names a join endpoint
 /// (`dist_init_addr`): every node rank below `nnodes` (other than the leader's) within the join
-/// timeout. The listener stays bound while the leader serves, so a node may join the running
+/// timeout. The wait blocks on the listener and the joining connections, so a join ends it as it
+/// arrives. The listener stays bound while the leader serves, so a node may join the running
 /// deployment later (`Joins`).
 fn join_members(
     options: &DaemonOptions,
@@ -577,69 +581,76 @@ fn join_members(
             .filter(|rank| !members.iter().any(|member| member.node_rank == *rank))
             .count()
     };
-    while awaited(&members) > 0 {
+    loop {
+        let admitted = joins.admit(&members)?;
+        members.extend(admitted);
+        if awaited(&members) == 0 {
+            return Ok((Some(joins), members));
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
         anyhow::ensure!(
-            Instant::now() < deadline,
+            !remaining.is_zero(),
             "{} of {} nodes joined within {:?}",
             options.nnodes as usize - awaited(&members),
             options.nnodes,
             options.join_timeout
         );
-        let admitted = joins.admit(&members)?;
-        members.extend(admitted);
-        std::thread::sleep(Duration::from_millis(20));
+        let mut descriptors: Vec<libc::pollfd> = joins.poll_fds().collect();
+        ::service::wait_ready(&mut descriptors, Some(remaining))?;
     }
-    Ok((Some(joins), members))
 }
 
-/// The address the leader's members reach it at: the address a member
-/// connected to, or the host `dist_init_addr` names when no member joined
-/// yet.
-fn leader_address(options: &DaemonOptions, members: &[service::Membership]) -> Option<IpAddr> {
+/// The address the leader's members reach it at: the host of the join endpoint the deployment
+/// declares (`dist_init_addr`), which the members dial, as the system resolver resolves it.
+/// `None` for a deployment that names no join endpoint, whose processes all run on this host.
+///
+/// # Errors
+///
+/// Fails when the declared host resolves to no address a member can reach.
+fn leader_address(options: &DaemonOptions) -> anyhow::Result<Option<IpAddr>> {
     use std::net::ToSocketAddrs as _;
 
-    members
-        .first()
-        .and_then(|member| member.connection.local_addr())
+    let Some(endpoint) = &options.dist_init_addr else {
+        return Ok(None);
+    };
+    let ::service::Endpoint::Tcp { host, port } = endpoint else {
+        anyhow::bail!("the leader's join endpoint {endpoint} is no TCP endpoint");
+    };
+    let address = (host.as_str(), *port)
+        .to_socket_addrs()
+        .with_context(|| format!("resolving the leader's join host {host}"))?
         .map(|address| address.ip())
-        .or_else(|| {
-            let ::service::Endpoint::Tcp { host, port } = options.dist_init_addr.as_ref()? else {
-                return None;
-            };
-            (host.as_str(), *port)
-                .to_socket_addrs()
-                .ok()?
-                .map(|address| address.ip())
-                .find(|address| !address.is_unspecified())
-        })
+        .find(|address| !address.is_unspecified())
+        .with_context(|| {
+            format!("the leader's join host {host} names no address another node can reach")
+        })?;
+    Ok(Some(address))
 }
 
-/// A member's join: connects to the leader, retrying until the deadline,
-/// and says hello.
+/// A member's join: connects to the leader at the join endpoint the leader reported bound
+/// (`dist_init_addr`, from the leader's readiness record), states this node and the address its
+/// connection reaches the leader from, and reads the leader's welcome.
 fn join_leader(options: &DaemonOptions) -> anyhow::Result<Connection> {
     let address = options
         .dist_init_addr
         .as_ref()
         .context("a member needs the leader's address")?;
-    let deadline = Instant::now() + options.join_timeout;
-    let mut connection = loop {
-        match Connection::connect(address) {
-            Ok(connection) => break connection,
-            Err(error) if Instant::now() < deadline => {
-                tracing::debug!(%error, "the leader is not reachable yet");
-                std::thread::sleep(Duration::from_millis(500));
-            }
-            Err(error) => {
-                return Err(error).with_context(|| format!("joining the leader at {address}"));
-            }
-        }
-    };
+    // The leader binds its join listener before it starts anything slow and reports it, so a
+    // member started from that report connects at once; a refused connection is a leader that
+    // is not serving that endpoint.
+    let mut connection =
+        Connection::connect(address).with_context(|| format!("joining the leader at {address}"))?;
+    let reached_from = connection
+        .local_addr()
+        .context("a member reaches the leader over TCP")?
+        .ip();
     connection.deliver(&Hello {
         major: proto::ENGINE_INTERFACE_VERSION,
         build: proto::BUILD.to_owned(),
         peer: Some(hello::Peer::Join(Join {
             node_rank: options.node_rank,
             host: options.host.clone(),
+            address: reached_from.to_string(),
         })),
     })?;
     let welcome: Welcome = connection
@@ -708,7 +719,6 @@ mod tests {
                 host: "localhost".to_owned(),
                 dist_init_addr: join.as_ref().map(|(_, endpoint)| endpoint.clone()),
                 socket: socket.clone(),
-                executable: PathBuf::from("uniserve"),
                 join_timeout: Duration::from_secs(5),
                 build_server: build_server::command::Settings::default(),
                 storage: storage::Settings::default(),
@@ -755,13 +765,8 @@ mod tests {
         drop(daemon);
         assert_eq!(socket.exists(), !network);
         assert!(Path::new(&format!("/proc/{}", spawned.pid)).exists());
-        let mut successor = Daemon::resume(
-            "localhost".to_owned(),
-            Some((address, (!network).then_some(socket.clone()))),
-            handoff,
-            descriptors,
-        )
-        .unwrap();
+        let mut successor =
+            Daemon::resume("localhost".to_owned(), Some(address), handoff, descriptors).unwrap();
 
         send(
             &mut engine,

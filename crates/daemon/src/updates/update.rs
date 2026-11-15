@@ -139,8 +139,6 @@ pub(crate) struct EpochSwitch {
     /// module set, the engine it succeeds and its own launch generation
     /// (`engine`), so the engine parks by itself once it is ready.
     pub(crate) launches: Vec<(proto::config::EngineArgs, Vec<u64>)>,
-    /// The request socket requests are submitted to after the switch.
-    pub(crate) requests: String,
     /// What the previous epoch keeps through the trial
     /// (`update_config.previous_epoch`).
     pub(crate) keeps: PreviousEpoch,
@@ -758,7 +756,7 @@ impl Update {
                         // `Serving`: the serving epoch still serves what it
                         // has, so none waits.
                         if trial.serving.is_empty() {
-                            processes.serve(trial.switch.epoch, &trial.switch.requests);
+                            processes.serve(trial.switch.epoch);
                         }
                         trial.serving.insert(target);
                     }
@@ -821,10 +819,8 @@ impl Update {
     /// The previous epoch's engine `node` serves again for the rollback: new
     /// requests return to the previous epoch from the first such engine.
     fn previous_serves(&mut self, processes: &mut Processes, node: usize) {
-        if self.acknowledged.is_empty()
-            && let Form::Epoch(trial) = &self.form
-        {
-            processes.serve(self.serving, &trial.switch.requests);
+        if self.acknowledged.is_empty() && matches!(self.form, Form::Epoch(_)) {
+            processes.serve(self.serving);
         }
         self.acknowledged.insert(node);
     }

@@ -152,7 +152,6 @@ impl Deployment {
             epoch: TARGET,
             record,
             launches,
-            requests: "unix:/run/requests.sock".to_owned(),
             keeps: PreviousEpoch::Parked,
             recompute: false,
             drain: Duration::from_secs_f64(UpdateConfig::default().drain_s),
@@ -261,7 +260,6 @@ fn names(commands: &[command::Kind]) -> Vec<&'static str> {
             command::Kind::Drain(_) => "drain",
             command::Kind::Promote(_) => "promote",
             command::Kind::Pause(_) => "pause",
-            command::Kind::Serve(_) => "serve",
             command::Kind::Grow(_) => "grow",
         })
         .collect()

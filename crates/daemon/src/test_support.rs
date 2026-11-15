@@ -471,32 +471,27 @@ pub(crate) fn post_json(path: &str, body: &serde_json::Value) -> Request<Body> {
         .unwrap()
 }
 
-/// The connection number of the engine of launch generation `generation`
-/// that the fake nodes start: another number than the generation, so that a
-/// test shows the daemon binds a connection by the launch generation its
-/// reports state.
-pub(crate) fn connection(generation: u64) -> u64 {
-    1000 + generation
-}
-
 /// The engines' and the node daemons' ends of a process link, played by
 /// `testkit::process`: every request the leader makes of a node gets the reply
 /// a node gives it, every engine the leader spawns is a fake engine that
 /// reports as the process interface states, and a test reads what each was
-/// sent.
+/// sent. An engine's process link is filed under the launch generation it was
+/// launched under, as the leader's service files it.
 pub(crate) struct Engines {
     /// Every request the leader made of the nodes, in arrival order.
     requests: Arc<std::sync::Mutex<Vec<proto::process::request::Kind>>>,
-    /// The commands the daemon sent, by engine connection.
+    /// The commands the daemon sent, by launch generation.
     commands: std::sync::mpsc::Receiver<(u64, proto::process::Command)>,
-    /// The reports the engines send up, by engine connection.
+    /// The reports the engines send up, by launch generation.
     reports: std::sync::mpsc::Sender<(u64, proto::process::Report)>,
     exits: std::sync::mpsc::Sender<proto::process::Exit>,
-    greetings: std::sync::mpsc::Sender<(u64, crate::supervision::processes::Greeting)>,
-    /// The fake engines by connection number.
+    greetings: std::sync::mpsc::Sender<(u64, String)>,
+    /// The fake engines by launch generation.
     engines: std::collections::BTreeMap<u64, testkit::process::Engine>,
     /// How many of the recorded spawns were started as engines.
     started: usize,
+    /// The waker the link's senders fire, which the leader's service would wait on.
+    _waker: service::Waker,
 }
 
 impl Engines {
@@ -526,12 +521,13 @@ impl Engines {
         });
         let (commands, sent) = std::sync::mpsc::channel();
         let (reports, reported) = std::sync::mpsc::channel();
+        let waker = service::Waker::new().expect("a waker");
         let link = crate::supervision::processes::ProcessLink {
-            requests,
+            requests: crate::supervision::ToService::new(requests, waker.wake()),
             greetings: greeted,
             exits: exited,
             commands: crate::supervision::ProcessCommands {
-                commands,
+                commands: crate::supervision::ToService::new(commands, waker.wake()),
                 reports: Arc::new(std::sync::Mutex::new(reported)),
             },
         };
@@ -543,6 +539,7 @@ impl Engines {
             greetings,
             engines: std::collections::BTreeMap::new(),
             started: 0,
+            _waker: waker,
         };
         (engines, link)
     }
@@ -569,16 +566,9 @@ impl Engines {
             } else {
                 testkit::process::Engine::serving(spawn.generation)
             };
-            let peer = connection(spawn.generation);
-            let _ = self.greetings.send((
-                peer,
-                crate::supervision::processes::Greeting {
-                    build: build.to_owned(),
-                    frontend: false,
-                },
-            ));
-            let _ = self.reports.send((peer, engine.started()));
-            self.engines.insert(peer, engine);
+            let _ = self.greetings.send((spawn.generation, build.to_owned()));
+            let _ = self.reports.send((spawn.generation, engine.started()));
+            self.engines.insert(spawn.generation, engine);
         }
         let started = !new.is_empty();
         self.started = spawns.len();
@@ -616,18 +606,8 @@ impl Engines {
 
     /// The fake engine of launch generation `generation`.
     pub(crate) fn engine(&mut self, generation: u64) -> &mut testkit::process::Engine {
-        let peer = self.peer(generation);
         self.engines
-            .get_mut(&peer)
-            .expect("an engine of that generation")
-    }
-
-    /// The connection number of the engine of launch generation `generation`.
-    fn peer(&self, generation: u64) -> u64 {
-        self.engines
-            .iter()
-            .find(|(_, engine)| engine.launch_generation() == generation)
-            .map(|(peer, _)| *peer)
+            .get_mut(&generation)
             .expect("an engine of that generation")
     }
 
@@ -638,7 +618,7 @@ impl Engines {
 
     /// Sends `report` up as the engine of launch generation `generation`.
     pub(crate) fn report(&self, generation: u64, report: proto::process::Report) {
-        let _ = self.reports.send((self.peer(generation), report));
+        let _ = self.reports.send((generation, report));
     }
 
     /// The node `host` reports that the engine of launch generation
@@ -652,26 +632,6 @@ impl Engines {
             status: status.to_owned(),
             last_line: String::new(),
         });
-    }
-
-    /// A frontend process greets on connection `peer`.
-    pub(crate) fn greet_frontend(&self, peer: u64) {
-        let _ = self.greetings.send((
-            peer,
-            crate::supervision::processes::Greeting {
-                build: String::new(),
-                frontend: true,
-            },
-        ));
-    }
-
-    /// The commands the daemon sent that no engine took, by connection: a
-    /// frontend's, in the tests that greet one.
-    pub(crate) fn undelivered(&self) -> Vec<(u64, proto::process::command::Kind)> {
-        self.commands
-            .try_iter()
-            .filter_map(|(peer, command)| Some((peer, command.kind?)))
-            .collect()
     }
 
     /// Every request the leader made of the nodes, in arrival order.

@@ -2,16 +2,17 @@
 //!
 //! [`Processes`] owns the deployment's engines for the daemon's life: it starts
 //! and stops them through the leader service, commands the engine of one launch
-//! generation, tells a frontend process which epoch serves, and turns what the
-//! engines report into the update's [`Event`]s. It is also the writer of the
-//! node's process table (`GET /admin/config`): every launch is one row, from
-//! `Starting` at its spawn to `Parked`, `Serving`, `Stopped` or `Failed`.
+//! generation, and turns what the engines report into the update's [`Event`]s.
+//! It is also the writer of the node's process table (`GET /admin/config`):
+//! every launch is one row, from `Starting` at its spawn to `Parked`,
+//! `Serving`, `Stopped` or `Failed`.
 //!
-//! A launch generation is the identity of one process; the generation of
-//! modules travels inside each [`process::Command`]. Events carry the launch
-//! generation, so a connection is bound to its launch by the number its first
-//! `Parked` or `Serving` report states: reports arrive from the peer that sent
-//! them, never from a launch.
+//! A launch generation is the identity of one process: the daemon launches an
+//! engine under it, the engine states it in the hello of its process link,
+//! and the leader's service files that link under it, so a command for a
+//! launch generation reaches its engine and a report names the launch it
+//! comes from. The generation of modules travels inside each
+//! [`process::Command`].
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::sync::Arc;
@@ -21,30 +22,16 @@ use std::time::Duration;
 use proto::process::{self, Command, Exit, Report, Request, Spawn};
 
 use crate::epoch::{Epochs, ManagedProcess, ProcessState};
-use crate::supervision::ProcessCommands;
-
-/// How long a request to the deployment's daemons waits for its response: a
-/// spawn starts a process, and a claim starts a Storage Server when the node
-/// has none.
-const REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
-
-/// A peer that greeted the leader: what it runs, and whether it is the
-/// frontend rather than an engine.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct Greeting {
-    /// The build the peer reported in its `Hello`.
-    pub(crate) build: String,
-    /// The frontend process, which is told the epoch that serves.
-    pub(crate) frontend: bool,
-}
+use crate::supervision::{ProcessCommands, ToService};
 
 /// The update's ends of the leader service: requests down, and what the
 /// service sees up.
 pub(crate) struct ProcessLink {
     /// Requests to the deployment's daemons, each with where its reply goes.
-    pub(crate) requests: Sender<(Request, Sender<process::Reply>)>,
-    /// Every peer that greeted the leader.
-    pub(crate) greetings: Receiver<(u64, Greeting)>,
+    pub(crate) requests: ToService<(Request, Sender<process::Reply>)>,
+    /// Every engine whose process link greeted the leader, by its launch generation, with the
+    /// build its hello states.
+    pub(crate) greetings: Receiver<(u64, String)>,
     /// Every supervised process that exited.
     pub(crate) exits: Receiver<Exit>,
     /// Commands to a connected peer and the reports it sends.
@@ -88,8 +75,8 @@ struct Launch {
     pid: Option<u32>,
 }
 
-/// The engine processes of one deployment: their launches, the connection each
-/// one reports on, and the link they are commanded through.
+/// The engine processes of one deployment: their launches, and the link they are commanded
+/// through.
 pub(crate) struct Processes {
     epochs: Arc<Epochs>,
     /// The deployment's name, which every claim states.
@@ -98,15 +85,6 @@ pub(crate) struct Processes {
     /// The launches by launch generation. The generation is unique across the
     /// deployment's engine group, so a number names one launch.
     launches: BTreeMap<u64, Launch>,
-    /// Which launch a connected peer runs, once its report named it.
-    engines: BTreeMap<u64, u64>,
-    /// The build each greeted peer reported, until the launch it runs is
-    /// known.
-    builds: BTreeMap<u64, String>,
-    /// The peers whose `Hello` became an event.
-    greeted: BTreeSet<u64>,
-    /// The frontend's connection, once it greeted.
-    frontend: Option<u64>,
     /// Launches the daemon stopped: their exit is not a failure.
     stopping: BTreeSet<u64>,
     /// Events raised here, ahead of the ones still on the link.
@@ -122,17 +100,15 @@ impl Processes {
             deployment,
             link,
             launches: BTreeMap::new(),
-            engines: BTreeMap::new(),
-            builds: BTreeMap::new(),
-            greeted: BTreeSet::new(),
-            frontend: None,
             stopping: BTreeSet::new(),
             queued: VecDeque::new(),
             next_request: 1,
         }
     }
 
-    /// Sends one request and waits for its reply.
+    /// Sends one request and waits for its reply. The service replies to every request: at once
+    /// for this node, once a member replied for another node, and with the member's loss when
+    /// that node's daemon is lost; a service that ended drops the reply's sender.
     fn request(&mut self, kind: process::request::Kind) -> Result<process::Reply, String> {
         let id = self.next_request;
         self.next_request += 1;
@@ -148,30 +124,14 @@ impl Processes {
             ))
             .map_err(|_| "the daemon's service stopped".to_owned())?;
         replied
-            .recv_timeout(REQUEST_TIMEOUT)
-            .map_err(|_| format!("the daemon did not reply to request {id}"))
+            .recv()
+            .map_err(|_| format!("the daemon's service ended before it replied to request {id}"))
     }
 
-    /// The launch generation a peer runs, once a report of it named one.
-    fn launch_of(&mut self, engine: u64, generation: u64) -> Option<u64> {
-        if let Some(launch) = self.engines.get(&engine) {
-            return Some(*launch);
-        }
-        self.launches.get(&generation)?;
-        self.engines.insert(engine, generation);
-        self.raise_hello(engine, generation);
-        Some(generation)
-    }
-
-    /// Raises the `Hello` of the peer that now runs `generation`, once: an
-    /// update checks the build of every engine it starts.
-    fn raise_hello(&mut self, engine: u64, generation: u64) {
-        if !self.greeted.insert(engine) {
-            return;
-        }
-        let Some(build) = self.builds.get(&engine).cloned() else {
-            return;
-        };
+    /// Raises the `Hello` of the engine of launch generation `generation`, which greeted with
+    /// `build`: an update checks the build of every engine it starts. An engine of no launch
+    /// known here (one the daemon neither started nor adopted) raises nothing.
+    fn greeted(&mut self, generation: u64, build: String) {
         let Some(launch) = self.launches.get(&generation) else {
             return;
         };
@@ -216,27 +176,13 @@ impl Processes {
         self.epochs.set_processes(processes);
     }
 
-    /// One report a peer sent.
-    fn report(&mut self, engine: u64, report: Report) {
+    /// One report the engine of launch generation `generation` sent on its process link.
+    fn report(&mut self, generation: u64, report: Report) {
         use process::report::Kind;
 
-        // The reports that state the launch generation of the peer that sent
-        // them are how a connection is bound to the launch it runs.
-        let stated = match &report.kind {
-            Some(Kind::Parked(parked)) => Some(parked.launch_generation),
-            Some(Kind::Serving(serving)) => Some(serving.launch_generation),
-            _ => None,
-        };
-        let launch = match stated {
-            Some(generation) => self.launch_of(engine, generation),
-            None => self.engines.get(&engine).copied(),
-        };
-        let Some(generation) = launch else {
-            // A peer of no launch known here: a connection of an engine the
-            // daemon neither started nor adopted. Nothing names a node for it.
-            return;
-        };
         let Some(launch) = self.launches.get_mut(&generation) else {
+            // An engine of no launch known here: one the daemon neither started nor adopted.
+            // Nothing names a node for it.
             return;
         };
         let host = launch.host.clone();
@@ -268,7 +214,6 @@ impl Processes {
         if let Some(launch) = self.launches.get_mut(&generation) {
             launch.pid = None;
         }
-        self.engines.retain(|_, launch| *launch != generation);
         self.queued.push_back(Event::Exit {
             host: exit.host,
             generation,
@@ -375,7 +320,8 @@ impl Processes {
         }
     }
 
-    /// Commands the engine of launch generation `generation` on `host`.
+    /// Commands the engine of launch generation `generation` on `host`: the leader's service
+    /// carries it down the process link that engine opened under that number.
     pub(crate) fn command(&mut self, host: &str, generation: u64, command: Command) {
         let Some(launch) = self.launches.get(&generation) else {
             return;
@@ -383,23 +329,13 @@ impl Processes {
         if launch.host != host {
             return;
         }
-        let Some(engine) = self
-            .engines
-            .iter()
-            .find(|(_, launch)| **launch == generation)
-            .map(|(engine, _)| *engine)
-        else {
-            tracing::warn!(%host, generation, "the engine of this launch generation is not connected");
-            return;
-        };
-        if let Err(error) = self.link.commands.send(engine, command) {
+        if let Err(error) = self.link.commands.send(generation, command) {
             tracing::warn!(%host, generation, %error, "a command did not reach the engine");
         }
     }
 
-    /// Makes the engine of `generation` on `host` commandable: an engine the
-    /// daemon's engine control started states its launch generation as its
-    /// engine number, so its connection is known before any report.
+    /// Records the engine of `generation` on `host`, which the daemon's engine control started
+    /// rather than this updater, so it is commanded and reported like the engines started here.
     pub(crate) fn adopt(&mut self, host: &str, group: &str, rank: u32, generation: u64) {
         self.launches.entry(generation).or_insert_with(|| Launch {
             host: host.to_owned(),
@@ -408,26 +344,12 @@ impl Processes {
             epoch: None,
             pid: None,
         });
-        self.engines.insert(generation, generation);
     }
 
-    /// States that `epoch` serves from now on, at the request socket
-    /// `requests`: the record every request path of this daemon follows, and
-    /// the command a frontend process of its own hears.
-    pub(crate) fn serve(&mut self, epoch: u64, requests: &str) {
+    /// States that `epoch` serves from now on: the record every request path of this daemon
+    /// follows.
+    pub(crate) fn serve(&mut self, epoch: u64) {
         self.epochs.announce_serve(epoch);
-        let Some(frontend) = self.frontend else {
-            return;
-        };
-        let serve = Command {
-            kind: Some(process::command::Kind::Serve(process::Serve {
-                epoch,
-                requests: requests.to_owned(),
-            })),
-        };
-        if let Err(error) = self.link.commands.send(frontend, serve) {
-            tracing::warn!(epoch, %error, "serving the epoch did not reach the frontend");
-        }
     }
 
     /// Retains `epoch`'s weights on `host` once its processes exited, and
@@ -458,17 +380,11 @@ impl Processes {
     /// Takes the events that arrived since the last call, oldest first, each
     /// launch's `Hello` before the report that named it.
     pub(crate) fn events(&mut self) -> Vec<Event> {
-        while let Ok((engine, greeting)) = self.link.greetings.try_recv() {
-            if greeting.frontend {
-                self.frontend = Some(engine);
-            } else {
-                // Its `Hello` is raised with the report that names the launch
-                // the peer runs.
-                self.builds.insert(engine, greeting.build);
-            }
+        while let Ok((generation, build)) = self.link.greetings.try_recv() {
+            self.greeted(generation, build);
         }
-        while let Some((engine, report)) = self.link.commands.report(Duration::ZERO) {
-            self.report(engine, report);
+        while let Some((generation, report)) = self.link.commands.report(Duration::ZERO) {
+            self.report(generation, report);
         }
         while let Ok(exit) = self.link.exits.try_recv() {
             self.exited(exit);
@@ -481,7 +397,7 @@ impl Processes {
 mod tests {
     use super::*;
     use crate::epoch::ProcessState;
-    use crate::test_support::{Engines, connection};
+    use crate::test_support::Engines;
     use proto::process::{command, report};
     use testkit::process::Refusals;
 
@@ -519,12 +435,11 @@ mod tests {
         launch
     }
 
-    /// An engine's connection is bound to its launch by the launch generation
-    /// its first report states, its `Hello` is raised before that report, and
-    /// its row follows its lifecycle. A command by launch generation reaches
-    /// the connection that reported it.
+    /// An engine is the launch generation it was launched under: its `Hello`
+    /// is raised before its first report, its row follows its lifecycle, and a
+    /// command by launch generation reaches it.
     #[test]
-    fn an_engine_is_bound_by_the_launch_generation_it_reports() {
+    fn an_engine_is_the_launch_generation_it_was_launched_under() {
         let (epochs, mut engines, mut processes) = processes();
         // A row another writer keeps is not replaced.
         epochs.set_processes(vec![ManagedProcess {
@@ -573,7 +488,6 @@ mod tests {
         assert_eq!(engines.received(7).len(), 1);
         processes.events();
         assert_eq!(epochs.processes()[1].state, ProcessState::Serving);
-        assert_ne!(connection(7), 7, "the connection is not the generation");
     }
 
     /// An exit the daemon asked for is a stop; one it did not ask for is a
@@ -599,27 +513,6 @@ mod tests {
         let rows = epochs.processes();
         assert_eq!(rows[0].state, ProcessState::Stopped);
         assert_eq!(rows[1].state, ProcessState::Failed("signal: 11".to_owned()));
-    }
-
-    /// The epoch that serves is announced to this daemon's request path and
-    /// commanded to a frontend process of its own.
-    #[test]
-    fn the_epoch_that_serves_is_announced_and_a_frontend_is_told() {
-        let (epochs, engines, mut processes) = processes();
-        engines.greet_frontend(9);
-        processes.events();
-        processes.serve(12, "unix:/run/requests.sock");
-        assert_eq!(
-            engines.undelivered(),
-            vec![(
-                9,
-                command::Kind::Serve(process::Serve {
-                    epoch: 12,
-                    requests: "unix:/run/requests.sock".to_owned(),
-                })
-            )]
-        );
-        assert_eq!(*epochs.served().borrow(), 12);
     }
 
     /// A claim names the deployment, the epoch, its scopes and what it

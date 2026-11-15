@@ -48,13 +48,88 @@ use std::path::PathBuf;
 use std::process::{Command, ExitStatus, Stdio};
 use std::sync::{Arc, Mutex};
 
-/// A supervised process: the owner it was started for, the connection that
-/// asked for it, its worker group, its rank and the generation of the group's
-/// launch. The connection is the launch's own: every client of the socket
-/// shares the deployment's owner, and two of them may name one group and rank,
-/// as two engines do during an epoch change. Its exit report goes down that
-/// connection, and it ends with that connection.
-type Key = (u64, u64, String, u32, u64);
+/// Whom a request of the process interface is served for (`proto::process::Owner`): the engine
+/// of a number, which owns the processes it starts and claims as itself, or the deployment's head
+/// (the updater and the daemon's own clients of the socket), which owns the engines it launches
+/// and claims on the epoch's behalf.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+pub(crate) enum Owner {
+    Engine(u64),
+    Head,
+}
+
+impl Owner {
+    /// The claimant a claim served for this owner is made as.
+    pub(crate) fn claimant(self) -> storage::Claimant {
+        match self {
+            Self::Engine(engine) => storage::Claimant::Engine(engine),
+            Self::Head => storage::Claimant::Head,
+        }
+    }
+}
+
+impl From<Owner> for proto::process::Owner {
+    fn from(owner: Owner) -> Self {
+        use proto::process::owner::Owner as Wire;
+        Self {
+            owner: Some(match owner {
+                Owner::Engine(engine) => Wire::Engine(engine),
+                Owner::Head => Wire::Head(proto::process::Head {}),
+            }),
+        }
+    }
+}
+
+impl TryFrom<Option<proto::process::Owner>> for Owner {
+    type Error = String;
+
+    fn try_from(owner: Option<proto::process::Owner>) -> Result<Self, String> {
+        use proto::process::owner::Owner as Wire;
+        match owner.and_then(|owner| owner.owner) {
+            Some(Wire::Engine(engine)) => Ok(Self::Engine(engine)),
+            Some(Wire::Head(_)) => Ok(Self::Head),
+            None => Err("a forwarded request states no owner".to_owned()),
+        }
+    }
+}
+
+/// Who asked for a launch or any other request: a connection of the leader's process socket, by
+/// the identity the leader's service gives it, or the leader's updater, which asks over no
+/// connection. A reply goes back to it, and so does the exit report of a launch it asked for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+pub(crate) enum Asker {
+    Connection(u64),
+    Updater,
+}
+
+impl Asker {
+    /// The asker of a forwarded request's `connection` field.
+    pub(crate) fn of_wire(connection: Option<u64>) -> Self {
+        connection.map_or(Self::Updater, Self::Connection)
+    }
+
+    /// This asker as a forwarded request's `connection` field.
+    pub(crate) fn wire(self) -> Option<u64> {
+        match self {
+            Self::Connection(connection) => Some(connection),
+            Self::Updater => None,
+        }
+    }
+}
+
+/// A supervised process: the owner it was started for, who asked for it, its worker group, its
+/// rank and the generation of the group's launch. The asker is the launch's own: every client of
+/// the socket shares the deployment's head as owner, and two of them may name one group and rank,
+/// as two engines do during an epoch change. Its exit report goes to that asker, and it ends with
+/// that asker's connection.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct Key {
+    owner: Owner,
+    asker: Asker,
+    group: String,
+    rank: u32,
+    generation: u64,
+}
 
 /// One supervised process.
 struct Supervised {
@@ -228,7 +303,7 @@ impl StderrTail {
 
 /// A listening socket held for a group until a process inherits it.
 struct Reservation {
-    engine: u64,
+    owner: Owner,
     group: String,
     listener: TcpListener,
 }
@@ -387,26 +462,26 @@ impl Supervisor {
         Ok((executable, launch))
     }
 
-    /// Starts the process `spawn` describes for `engine`, as a child of this
+    /// Starts the process `spawn` describes for `owner`, as `asker` asked, as a child of this
     /// thread, and returns its process id.
     ///
     /// # Errors
     ///
-    /// Fails when a reservation to inherit is not this engine's, or the
+    /// Fails when a reservation to inherit is not this owner's, or the
     /// process cannot be started.
     pub(crate) fn spawn(
         &mut self,
-        engine: u64,
-        reporter: u64,
+        owner: Owner,
+        asker: Asker,
         spawn: &Spawn,
     ) -> Result<u32, String> {
-        let key = (
-            engine,
-            reporter,
-            spawn.group.clone(),
-            spawn.rank,
-            spawn.generation,
-        );
+        let key = Key {
+            owner,
+            asker,
+            group: spawn.group.clone(),
+            rank: spawn.rank,
+            generation: spawn.generation,
+        };
 
         // An engine runs as the engine package its launch names; any
         // other process as the executable the request states. Every one's
@@ -434,39 +509,21 @@ impl Supervisor {
             !self
                 .reservations
                 .get(reservation)
-                .is_some_and(|held| held.engine == engine && held.group == spawn.group)
+                .is_some_and(|held| held.owner == owner && held.group == spawn.group)
         }) {
-            // Which of the three cases this is decides three different fixes:
-            // the reservation is gone (a race between two launches), it names
-            // another group, or it names another engine. The table is named
-            // with the absent case, so an entry filed under another peer or
-            // another id is visible rather than missing.
-            match self.reservations.get(reservation) {
-                None => tracing::warn!(
-                    reservation,
-                    engine,
-                    spawn_group = ?spawn.group,
-                    held = ?self
-                        .reservations
-                        .iter()
-                        .map(|(id, held)| (*id, held.engine, held.group.clone()))
-                        .collect::<Vec<_>>(),
-                    "a spawn inherits a reservation the node does not hold"
+            // The refusal names which of the three cases this is: the reservation is gone, it
+            // names another group, or it is another owner's.
+            return Err(match self.reservations.get(reservation) {
+                None => format!("this node holds no reservation {reservation}"),
+                Some(held) if held.owner != owner => format!(
+                    "reservation {reservation} is {:?}'s, not {owner:?}'s",
+                    held.owner
                 ),
-                Some(held) => tracing::warn!(
-                    reservation,
-                    case = if held.engine != engine { "engine" } else { "group" },
-                    engine,
-                    spawn_group = ?spawn.group,
-                    held_engine = held.engine,
-                    held_group = ?held.group,
-                    "a spawn inherits a reservation filed under another identity"
+                Some(held) => format!(
+                    "reservation {reservation} is worker group {}'s, not {}'s",
+                    held.group, spawn.group
                 ),
-            }
-            return Err(format!(
-                "reservation {reservation} is not one of worker group {}'s",
-                spawn.group
-            ));
+            });
         }
         for reservation in &spawn.inherit {
             if let Some(held) = self.reservations.remove(reservation) {
@@ -508,7 +565,7 @@ impl Supervisor {
         Ok(pid)
     }
 
-    /// Binds a listening socket for `engine`'s group and holds it until a
+    /// Binds a listening socket for `owner`'s group and holds it until a
     /// spawn of the group inherits it. `address` is this node's address
     /// other nodes reach, which a routable reservation names.
     ///
@@ -517,7 +574,7 @@ impl Supervisor {
     /// Fails when no port can be bound.
     pub(crate) fn reserve(
         &mut self,
-        engine: u64,
+        owner: Owner,
         reserve: &Reserve,
         address: Option<IpAddr>,
     ) -> Result<Reserved, String> {
@@ -540,14 +597,14 @@ impl Supervisor {
         let descriptor = listener.as_raw_fd();
         tracing::debug!(
             reservation,
-            engine,
+            ?owner,
             group = ?reserve.group,
             "a node reserved a socket"
         );
         self.reservations.insert(
             reservation,
             Reservation {
-                engine,
+                owner,
                 group: reserve.group.clone(),
                 listener,
             },
@@ -559,16 +616,16 @@ impl Supervisor {
         })
     }
 
-    /// Stops every process of `engine`'s `group` without reporting its exit,
+    /// Stops every process of `owner`'s `group` without reporting its exit,
     /// and closes the group's reservations, ahead of the group's next launch.
-    pub(crate) fn stop(&mut self, engine: u64, group: &str, generation: Option<u64>) {
+    pub(crate) fn stop(&mut self, owner: Owner, group: &str, generation: Option<u64>) {
         let stopped: Vec<Key> = self
             .children
             .keys()
-            .filter(|(owner, _, name, _, launched)| {
-                *owner == engine
-                    && name == group
-                    && generation.is_none_or(|generation| *launched == generation)
+            .filter(|key| {
+                key.owner == owner
+                    && key.group == group
+                    && generation.is_none_or(|generation| key.generation == generation)
             })
             .cloned()
             .collect();
@@ -577,21 +634,24 @@ impl Supervisor {
         // group.
         if generation.is_none() {
             self.reservations
-                .retain(|_, held| held.engine != engine || held.group != group);
+                .retain(|_, held| held.owner != owner || held.group != group);
         }
     }
 
-    /// Ends every process and reservation of a connection that closed: what
-    /// the engine it is owns, and what it asked for as a client.
-    pub(crate) fn release(&mut self, engine: u64) {
-        let owned: Vec<Key> = self
+    /// Ends what a connection that closed leaves: every process it asked for, and, when it was
+    /// `engine`'s process link, every process and reservation that engine owns.
+    pub(crate) fn release(&mut self, connection: u64, engine: Option<u64>) {
+        let owner = engine.map(Owner::Engine);
+        let ended: Vec<Key> = self
             .children
             .keys()
-            .filter(|(owner, reporter, ..)| *owner == engine || *reporter == engine)
+            .filter(|key| key.asker == Asker::Connection(connection) || Some(key.owner) == owner)
             .cloned()
             .collect();
-        self.terminate(owned);
-        self.reservations.retain(|_, held| held.engine != engine);
+        self.terminate(ended);
+        if let Some(owner) = owner {
+            self.reservations.retain(|_, held| held.owner != owner);
+        }
     }
 
     /// Ends every process this daemon supervises.
@@ -601,10 +661,9 @@ impl Supervisor {
         self.reservations.clear();
     }
 
-    /// Returns, with the connection that asked for its launch, every child
-    /// that exited since the last call, which is supervised no longer. A
-    /// child whose status cannot be read is reported as exited.
-    pub(crate) fn exits(&mut self) -> Vec<(u64, Exit)> {
+    /// Returns, with the asker of its launch, every child that exited since the last call, which
+    /// is supervised no longer. A child whose status cannot be read is reported as exited.
+    pub(crate) fn exits(&mut self) -> Vec<(Asker, Exit)> {
         let mut exited = Vec::new();
         for (key, supervised) in &mut self.children {
             let (status, success) = match supervised.child.try_wait() {
@@ -624,20 +683,26 @@ impl Supervisor {
         }
         exited
             .into_iter()
-            .map(|((engine, reporter, group, rank, generation), status, success, last_stderr)| {
-                self.children
-                    .remove(&(engine, reporter, group.clone(), rank, generation));
-                // The report names the engine the process was spawned for, its
+            .map(|(key, status, success, last_stderr)| {
+                self.children.remove(&key);
+                let Key {
+                    owner,
+                    asker,
+                    group,
+                    rank,
+                    generation,
+                } = key;
+                // The report names the owner the process was spawned for, its
                 // rank, how it ended, and the last line it wrote itself: a
                 // launch that failed for a reason outside the engine says so
                 // here rather than arriving as an unexplained status.
                 if success {
-                    tracing::info!(engine, %group, rank, generation, last_stderr = ?last_stderr, "a process exited");
+                    tracing::info!(?owner, %group, rank, generation, last_stderr = ?last_stderr, "a process exited");
                 } else {
-                    tracing::warn!(engine, %group, rank, generation, %status, last_stderr = ?last_stderr, "a process exited");
+                    tracing::warn!(?owner, %group, rank, generation, %status, last_stderr = ?last_stderr, "a process exited");
                 }
                 (
-                    reporter,
+                    asker,
                     Exit {
                         host: self.host.clone(),
                         group,
@@ -651,13 +716,21 @@ impl Supervisor {
             .collect()
     }
 
+    /// The descriptors that turn readable when a supervised process exits, one per process: the
+    /// service waits on them beside its sockets, so an exit ends its wait.
+    pub(crate) fn exit_descriptors(&self) -> impl Iterator<Item = std::os::fd::RawFd> + '_ {
+        self.children
+            .values()
+            .map(|supervised| supervised.child.exit_descriptor())
+    }
+
     /// Kills the processes of `keys`, then reaps each one.
     fn terminate(&mut self, keys: Vec<Key>) {
         let mut ending = Vec::with_capacity(keys.len());
         for key in keys {
             if let Some(mut supervised) = self.children.remove(&key) {
                 if let Err(error) = supervised.child.kill() {
-                    tracing::warn!(group = %key.2, rank = key.3, %error, "a process could not be stopped");
+                    tracing::warn!(group = %key.group, rank = key.rank, %error, "a process could not be stopped");
                 }
                 ending.push(supervised);
             }
@@ -675,16 +748,7 @@ impl Supervisor {
     pub(crate) fn live(&self) -> Vec<ProcessHandoff> {
         self.children
             .iter()
-            .map(
-                |((engine, reporter, group, rank, generation), supervised)| ProcessHandoff {
-                    engine: *engine,
-                    reporter: *reporter,
-                    group: group.clone(),
-                    rank: *rank,
-                    generation: *generation,
-                    pid: supervised.child.id(),
-                },
-            )
+            .map(|(key, supervised)| ProcessHandoff::of(key, supervised.child.id()))
             .collect()
     }
 
@@ -712,25 +776,16 @@ impl Supervisor {
         let mut processes = Vec::with_capacity(self.children.len());
         let mut descriptors =
             Vec::with_capacity(2 * self.children.len() + self.reservations.len() + 2);
-        for (((engine, reporter, group, rank, generation), supervised), pidfd) in
-            self.children.iter_mut().zip(pidfds)
-        {
+        for ((key, supervised), pidfd) in self.children.iter_mut().zip(pidfds) {
             descriptors.push(pidfd);
             descriptors.push(supervised.tail.hand_over()?);
-            processes.push(ProcessHandoff {
-                engine: *engine,
-                reporter: *reporter,
-                group: group.clone(),
-                rank: *rank,
-                generation: *generation,
-                pid: supervised.child.id(),
-            });
+            processes.push(ProcessHandoff::of(key, supervised.child.id()));
         }
         let mut reservations = Vec::with_capacity(self.reservations.len());
         for (id, reservation) in self.reservations.drain() {
             reservations.push(ReservationHandoff {
                 id,
-                engine: reservation.engine,
+                owner: reservation.owner,
                 group: reservation.group,
             });
             descriptors.push(OwnedFd::from(reservation.listener));
@@ -777,13 +832,13 @@ impl Supervisor {
             let tail = StderrTail::read(next()?)?;
             tracing::info!(group = %process.group, rank = process.rank, generation = process.generation, pid = process.pid, "adopted a process");
             supervisor.children.insert(
-                (
-                    process.engine,
-                    process.reporter,
-                    process.group,
-                    process.rank,
-                    process.generation,
-                ),
+                Key {
+                    owner: process.owner,
+                    asker: process.asker,
+                    group: process.group,
+                    rank: process.rank,
+                    generation: process.generation,
+                },
                 Supervised { child, tail },
             );
         }
@@ -791,7 +846,7 @@ impl Supervisor {
             supervisor.reservations.insert(
                 reservation.id,
                 Reservation {
-                    engine: reservation.engine,
+                    owner: reservation.owner,
                     group: reservation.group,
                     listener: TcpListener::from(next()?),
                 },
@@ -833,20 +888,33 @@ pub(crate) struct ProcessesHandoff {
 /// One process of the handoff: its key and process id.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub(crate) struct ProcessHandoff {
-    pub(crate) engine: u64,
-    /// The connection its exit report goes down.
-    pub(crate) reporter: u64,
+    pub(crate) owner: Owner,
+    /// Who asked for its launch, which its exit report goes to.
+    pub(crate) asker: Asker,
     pub(crate) group: String,
     pub(crate) rank: u32,
     pub(crate) generation: u64,
     pub(crate) pid: u32,
 }
 
+impl ProcessHandoff {
+    fn of(key: &Key, pid: u32) -> Self {
+        Self {
+            owner: key.owner,
+            asker: key.asker,
+            group: key.group.clone(),
+            rank: key.rank,
+            generation: key.generation,
+            pid,
+        }
+    }
+}
+
 /// One reservation of the handoff.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub(crate) struct ReservationHandoff {
     pub(crate) id: u64,
-    pub(crate) engine: u64,
+    pub(crate) owner: Owner,
     pub(crate) group: String,
 }
 
@@ -912,8 +980,12 @@ pub(crate) struct Child {
 }
 
 enum Process {
-    /// Spawned by this daemon, which reaps it.
-    Spawned(std::process::Child),
+    /// Spawned by this daemon, which reaps it; its pidfd turns readable when it exits, which is
+    /// what the service's wait observes.
+    Spawned {
+        child: std::process::Child,
+        pidfd: OwnedFd,
+    },
     /// Spawned by a daemon this one replaced, observed through its pidfd.
     Adopted { pid: u32, pidfd: OwnedFd },
 }
@@ -930,10 +1002,27 @@ pub(crate) enum Exited {
 impl Child {
     /// Spawns the process `command` describes.
     pub(crate) fn spawn(command: &mut Command) -> std::io::Result<Self> {
+        let mut child = command.spawn()?;
+        // An unreaped child's id names it alone, so the pidfd is the child's.
+        let pidfd = match pidfd_open(child.id()) {
+            Ok(pidfd) => pidfd,
+            Err(error) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(error);
+            }
+        };
         Ok(Self {
-            process: Process::Spawned(command.spawn()?),
+            process: Process::Spawned { child, pidfd },
             exited: None,
         })
+    }
+
+    /// The descriptor that turns readable once the process exited.
+    fn exit_descriptor(&self) -> std::os::fd::RawFd {
+        match &self.process {
+            Process::Spawned { pidfd, .. } | Process::Adopted { pidfd, .. } => pidfd.as_raw_fd(),
+        }
     }
 
     /// Supervises process `pid`, which a daemon this one replaced spawned,
@@ -949,7 +1038,7 @@ impl Child {
     /// spawned with a pipe.
     fn take_stderr(&mut self) -> Option<std::process::ChildStderr> {
         match &mut self.process {
-            Process::Spawned(child) => child.stderr.take(),
+            Process::Spawned { child, .. } => child.stderr.take(),
             Process::Adopted { .. } => None,
         }
     }
@@ -957,7 +1046,7 @@ impl Child {
     /// The rank's process id.
     pub(crate) fn id(&self) -> u32 {
         match &self.process {
-            Process::Spawned(child) => child.id(),
+            Process::Spawned { child, .. } => child.id(),
             Process::Adopted { pid, .. } => *pid,
         }
     }
@@ -966,9 +1055,7 @@ impl Child {
     /// its id, for a successor daemon to adopt it with.
     fn pidfd(&self) -> std::io::Result<OwnedFd> {
         match &self.process {
-            // An unreaped child's id names it alone.
-            Process::Spawned(child) => pidfd_open(child.id()),
-            Process::Adopted { pidfd, .. } => pidfd.try_clone(),
+            Process::Spawned { pidfd, .. } | Process::Adopted { pidfd, .. } => pidfd.try_clone(),
         }
     }
 
@@ -978,7 +1065,7 @@ impl Child {
             return Ok(());
         }
         match &mut self.process {
-            Process::Spawned(child) => child.kill(),
+            Process::Spawned { child, .. } => child.kill(),
             Process::Adopted { pidfd, .. } => {
                 // SAFETY: the call takes a live pidfd and no pointers but a
                 // null `siginfo`.
@@ -1008,7 +1095,7 @@ impl Child {
     pub(crate) fn try_wait(&mut self) -> std::io::Result<Option<Exited>> {
         if self.exited.is_none() {
             self.exited = match &mut self.process {
-                Process::Spawned(child) => child.try_wait()?.map(Exited::Status),
+                Process::Spawned { child, .. } => child.try_wait()?.map(Exited::Status),
                 Process::Adopted { pidfd, .. } => {
                     pidfd_exited(pidfd, false)?.then_some(Exited::Unread)
                 }
@@ -1024,7 +1111,7 @@ impl Child {
             return Ok(exited);
         }
         let exited = match &mut self.process {
-            Process::Spawned(child) => Exited::Status(child.wait()?),
+            Process::Spawned { child, .. } => Exited::Status(child.wait()?),
             Process::Adopted { pidfd, .. } => {
                 pidfd_exited(pidfd, true)?;
                 Exited::Unread
@@ -1142,15 +1229,17 @@ mod tests {
             arguments: vec!["-c".to_owned(), "exec sleep 600".to_owned()],
             ..Spawn::default()
         };
-        let pid = first.spawn(7, 7, &spawn).unwrap();
+        let pid = first
+            .spawn(Owner::Engine(7), Asker::Connection(7), &spawn)
+            .unwrap();
         let reserved = first
             .reserve(
-                7,
+                Owner::Engine(7),
                 &Reserve {
                     host: "host".to_owned(),
                     group: "model".to_owned(),
                     routable: false,
-                    engine: 7,
+                    engine: Some(7),
                 },
                 None,
             )
@@ -1163,7 +1252,7 @@ mod tests {
         let mut successor = Supervisor::adopt("host".to_owned(), handoff, descriptors).unwrap();
         assert!(successor.exits().is_empty());
         assert!(successor.reservations.contains_key(&reserved.reservation));
-        successor.stop(7, "model", None);
+        successor.stop(Owner::Engine(7), "model", None);
         assert!(successor.children.is_empty());
         // The killed process is gone once the host's init reaps it, which
         // in a test is this process: its zombie is reaped here.

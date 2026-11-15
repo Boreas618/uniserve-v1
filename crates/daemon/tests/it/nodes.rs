@@ -2,7 +2,7 @@
 //! joined over loopback. An engine connects to the leader only, and the
 //! leader routes what it asks for the member's node to the member.
 
-use daemon::engine::control::{BuildServer, EngineControl, PrepareSteps, prepare_epoch};
+use daemon::engine::control::{BuildServer, EngineControl, prepare_epoch};
 use daemon::{Daemon, DaemonOptions};
 use proto::process::{Exit, NodesQuery, PrepareModules, ThrottleTransfers, reply, request};
 
@@ -38,7 +38,6 @@ impl Deployment {
             host: host.to_owned(),
             dist_init_addr: Some(endpoint.clone()),
             socket: directory.path().join(format!("{host}.sock")),
-            executable: "uniserve".into(),
             join_timeout: TIMEOUT,
             build_server: if host == "member" {
                 settings.clone()
@@ -146,7 +145,6 @@ fn a_node_joins_a_running_deployment_and_the_next_engine_runs_processes_there() 
         host: host.to_owned(),
         dist_init_addr: Some(endpoint.clone()),
         socket: directory.path().join(format!("{host}.sock")),
-        executable: "uniserve".into(),
         join_timeout: TIMEOUT,
         build_server: build_server::command::Settings::default(),
         storage: storage::Settings::default(),
@@ -285,8 +283,7 @@ fn an_epoch_is_prepared_at_every_host_it_runs_on_at_once() {
     let hosts = ["leader".to_owned(), "member".to_owned()];
 
     let prepared = std::thread::scope(|scope| {
-        let preparing = scope
-            .spawn(|| prepare_epoch(&local, Some(&control), &hosts, &set, &PrepareSteps::new()));
+        let preparing = scope.spawn(|| prepare_epoch(&local, Some(&control), &hosts, &set));
         leader_modules.asked();
         member_modules.asked();
         leader_modules.release();
@@ -325,7 +322,6 @@ fn a_host_that_prepares_other_modules_fails_the_preparation() {
         Some(&control),
         &["leader".to_owned(), "member".to_owned()],
         &module_set(),
-        &PrepareSteps::new(),
     )
     .unwrap_err();
     assert!(format!("{refused:#}").contains("member"), "{refused:#}");

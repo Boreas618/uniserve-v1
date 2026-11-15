@@ -187,13 +187,6 @@ pub(crate) fn request_counts() -> (u64, u64) {
     )
 }
 
-/// How long the Build Servers may take to fix and build a module set: a cold
-/// store builds every module the set names, on every host at once.
-const PREPARE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20 * 60);
-
-/// How often a wait on the Build Servers says it still waits.
-const HEARTBEAT: std::time::Duration = std::time::Duration::from_secs(60);
-
 /// Fixes the module set `named` states: every interface's revision as
 /// `local`, this daemon's own host's Build Server, selects it through `cover`
 /// ([`crate::engine::control::with_store_modules`]), then every module built
@@ -209,58 +202,28 @@ const HEARTBEAT: std::time::Duration = std::time::Duration::from_secs(60);
 /// returns is part of the epoch's record and of every launch file made from
 /// it.
 ///
+/// The wait ends with the Build Servers' answers: each reports every module's build as it goes
+/// (`engine::control::prepare_epoch`), and a host whose daemon is lost fails the preparation.
+///
 /// # Errors
 ///
 /// `UpdateError::Refused` when a Build Server holds no package, or not the
 /// revision, the deployment names, or cannot build a module, and when a host
 /// of `hosts` cannot prepare: no daemon runs there, it is lost, or its Build
 /// Server prepares other modules than `local`; `UpdateError::Failed` when the
-/// Build Servers do not respond in time.
+/// preparation's thread ended without an answer.
 pub(crate) async fn fix_modules(
     local: crate::engine::control::BuildServer,
     nodes: Option<Arc<EngineControl>>,
     hosts: Vec<String>,
     named: crate::epoch::ModuleSet,
 ) -> Result<crate::epoch::ModuleSet, UpdateError> {
-    // The client's waits have no deadline of their own, so the blocking task
-    // records which one each host is in and the deadline here names it.
-    let steps = crate::engine::control::PrepareSteps::new();
-    let recorded = steps.clone();
-    let mut fixing = tokio::task::spawn_blocking(move || {
+    let fixed = tokio::task::spawn_blocking(move || {
         let complete = crate::engine::control::with_store_modules(&local, &named)?;
-        crate::engine::control::prepare_epoch(
-            &local,
-            nodes.as_deref(),
-            &hosts,
-            &complete,
-            &recorded,
-        )
-    });
-    let started = tokio::time::Instant::now();
-    let deadline = started + PREPARE_TIMEOUT;
-    let fixed = loop {
-        let left = deadline.saturating_duration_since(tokio::time::Instant::now());
-        match tokio::time::timeout(left.min(HEARTBEAT), &mut fixing).await {
-            Ok(joined) => {
-                break joined.map_err(|error| {
-                    UpdateError::Failed(anyhow::anyhow!("fixing the module set: {error}"))
-                })?;
-            }
-            Err(_) if left <= HEARTBEAT => {
-                return Err(UpdateError::Failed(anyhow::anyhow!(
-                    "fixing the module set: no Build Server responded within {} s: the daemon \
-                     was {}",
-                    PREPARE_TIMEOUT.as_secs(),
-                    steps.describe()
-                )));
-            }
-            Err(_) => tracing::info!(
-                waited_s = started.elapsed().as_secs(),
-                step = %steps.describe(),
-                "still fixing the module set at the Build Servers"
-            ),
-        }
-    };
+        crate::engine::control::prepare_epoch(&local, nodes.as_deref(), &hosts, &complete)
+    })
+    .await
+    .map_err(|error| UpdateError::Failed(anyhow::anyhow!("fixing the module set: {error}")))?;
     fixed.map_err(|error| UpdateError::Refused(format!("fixing the module set: {error:#}")))
 }
 

@@ -619,7 +619,6 @@ impl Leader {
                 epoch: target_epoch,
                 record,
                 launches,
-                requests: control.request_address().to_owned(),
                 keeps: options.previous_epoch,
                 recompute: request.in_flight == InFlight::Recompute,
                 drain: Duration::from_secs_f64(options.drain_s),

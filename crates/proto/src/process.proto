@@ -25,22 +25,14 @@ message Hello {
   uint32 major = 1;
   // The sender's build: package version and source digest.
   string build = 3;
+  reserved 6;
+  reserved "frontend";
   oneof peer {
     // A daemon of another node joining the leader.
     Join join = 4;
     // An engine process asking the leader to supervise its processes.
     Engine engine = 5;
-    // A frontend process of the deployment, which the daemon commands down
-    // this connection.
-    Frontend frontend = 6;
   }
-}
-
-// A frontend process of a deployment: the application on the leader node,
-// which the leader's daemon starts and commands (`Serve`, `Drain`, `Pause`).
-message Frontend {
-  // The deployment: the served model name.
-  string deployment = 1;
 }
 
 // A daemon of another node joining the leader.
@@ -49,6 +41,10 @@ message Join {
   uint32 node_rank = 1;
   // The node's host identity, as rank layouts name it.
   string host = 2;
+  // The address the deployment's other nodes reach this node at (an IP address without a port):
+  // the address of the member's end of its connection to the leader, which the member's kernel
+  // routes towards the leader. The leader states it as this node's in every `Node`.
+  string address = 3;
 }
 
 // An engine process of a deployment.
@@ -143,6 +139,7 @@ message Request {
   // Chosen by the sender; the reply repeats it.
   uint64 id = 1;
   reserved 10;
+  reserved "devices";
   oneof kind {
     Spawn spawn = 2;
     Stop stop = 3;
@@ -163,6 +160,7 @@ message Reply {
   // Why the request failed; empty when it succeeded.
   string error = 2;
   reserved 11;
+  reserved "devices";
   oneof kind {
     Spawned spawned = 3;
     Stopped stopped = 4;
@@ -275,12 +273,12 @@ message Stopped {}
 message Reserve {
   string host = 1;
   string group = 2;
-  // The engine that will spawn the process inheriting this socket. A
-  // reservation is filed under this number rather than under the connection
-  // that asked for it: the asking connection may be the deployment's own
-  // client, which is not the engine that spawns, and it may be re-established
-  // between the reservation and the launch without changing whose socket it is.
-  uint64 engine = 4;
+  // The engine that will spawn the process inheriting this socket, when it is not the owner the
+  // asking connection is served for. A reservation is filed under this number rather than under
+  // the connection that asked for it: the asking connection may be the deployment's own client,
+  // which is not the engine that spawns, and it may be re-established between the reservation and
+  // the launch without changing whose socket it is.
+  optional uint64 engine = 4;
   // Whether processes on other nodes connect to it: it then binds every
   // interface, and loopback otherwise.
   bool routable = 3;
@@ -513,6 +511,8 @@ message KernelPackage {
 // with the report named beside it, and a phase of the daemon's update ends
 // only on those acknowledgements.
 message Command {
+  reserved 8;
+  reserved "serve";
   oneof kind {
     // Make the next generation ready beside the serving one: resolve and load
     // the modules, instantiate the policy, rebind the graphs whose launch
@@ -542,9 +542,6 @@ message Command {
     // Hold or release admissions, the `/admin/pause_generation` gate, without
     // ending any request.
     Pause pause = 7;
-    // To a frontend process: epoch `epoch` serves from now on, and requests
-    // are submitted at `requests`.
-    Serve serve = 8;
     // A serving engine gave device memory back on a host this engine has
     // ranks on (`Shrunk`): sent to the scheduler node's main process, which
     // has every rank it holds, on its host and on its peers' hosts, create
@@ -606,12 +603,6 @@ message Pause {
 }
 
 message Grow {}
-
-message Serve {
-  uint64 epoch = 1;
-  // The engine's request socket, `unix:<path>` or `host:port`.
-  string requests = 2;
-}
 
 // What an engine tells its daemon, unasked: the acknowledgement of a command,
 // the lifecycle state it reached, or a failure it observed.
@@ -803,19 +794,41 @@ message Downstream {
 message ToMember {
   oneof kind {
     Forwarded forwarded = 1;
-    // An engine connection closed: the member terminates its processes.
-    uint64 released = 2;
+    // A connection at the leader closed: the member ends the processes it asked for and, when it
+    // was an engine's process link, the processes owned by that engine (`Released`).
+    Released released = 2;
   }
 }
 
+// Whom a request is served for: the engine of a number, which owns the processes it starts and
+// whose claims are its own, or the deployment's head (the daemon's own clients and the updater),
+// which claims on the epoch's behalf.
+message Owner {
+  oneof owner {
+    uint64 engine = 1;
+    Head head = 2;
+  }
+}
+
+// The deployment's head as an owner.
+message Head {}
+
 message Forwarded {
-  // The connection at the leader that asked: its reply and the exit report of a launch go back
-  // down it.
-  uint64 engine = 1;
+  // The connection at the leader that asked, by the identity the leader's service gives it: its
+  // reply and the exit report of a launch go back down it. Absent for the leader's updater, which
+  // asks over no connection.
+  optional uint64 connection = 1;
   Request request = 2;
-  // Whom the request is served for: the engine number a process states, or the epoch's own owner
-  // for a client. It differs from `engine` for a client, whose launches are the deployment's.
-  uint64 owner = 3;
+  // Whom the request is served for.
+  Owner owner = 3;
+}
+
+// A connection at the leader that closed.
+message Released {
+  uint64 connection = 1;
+  // The engine whose process link it was, whose processes end with it; absent for any other
+  // connection, which takes only the launches it asked for.
+  optional uint64 engine = 2;
 }
 
 // What travels from a member daemon to the leader.
@@ -826,12 +839,14 @@ message FromMember {
   }
 }
 
+// A member's reply to a forwarded request, for the asker the request named (`Forwarded`).
 message Replied {
-  uint64 engine = 1;
+  optional uint64 connection = 1;
   Reply reply = 2;
 }
 
+// A process a member supervises exited, reported to the asker of its launch (`Forwarded`).
 message Exited {
-  uint64 engine = 1;
+  optional uint64 connection = 1;
   Exit exit = 2;
 }

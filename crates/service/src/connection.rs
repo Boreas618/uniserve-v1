@@ -375,6 +375,21 @@ impl Connection {
         Ok(self.recv_with(timeout)?.map(|(message, _)| message))
     }
 
+    /// Waits for the next message, however long that takes: the wait ends with a message or with
+    /// the connection's end, which the peer's close or a failure brings.
+    ///
+    /// # Errors
+    ///
+    /// As [`Connection::try_recv`]; the terminal failure once the connection ended.
+    pub fn recv_next<M: Message>(&mut self) -> io::Result<M> {
+        loop {
+            if let Some(message) = self.try_recv()? {
+                return Ok(message);
+            }
+            self.wait_on(None, Duration::MAX)?;
+        }
+    }
+
     /// [`Connection::recv`], with the descriptors the frame carried.
     ///
     /// # Errors
@@ -949,10 +964,7 @@ fn pollfd(fd: RawFd, events: libc::c_short) -> libc::pollfd {
 /// Polls `descriptors` once until one is ready or `timeout` passes (forever for `None`), keeping
 /// the deadline across signals. Returns after any completed poll, ready or timed out: callers
 /// check their own state rather than `revents`.
-pub(crate) fn wait_ready(
-    descriptors: &mut [libc::pollfd],
-    timeout: Option<Duration>,
-) -> io::Result<()> {
+pub fn wait_ready(descriptors: &mut [libc::pollfd], timeout: Option<Duration>) -> io::Result<()> {
     let deadline = timeout.and_then(|timeout| Instant::now().checked_add(timeout));
     loop {
         // Rounded up to whole milliseconds, so the poll does not return before the deadline.

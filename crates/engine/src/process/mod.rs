@@ -805,8 +805,6 @@ impl MainProcess {
                 self.paused = pause.paused;
                 self.release();
             }
-            // A frontend's command: no engine is told where requests go.
-            command::Kind::Serve(_) => {}
             command::Kind::Grow(_) => self.grow(),
         }
     }

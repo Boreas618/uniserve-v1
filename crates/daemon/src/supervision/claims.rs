@@ -24,17 +24,11 @@
 use std::collections::HashMap;
 use std::collections::hash_map::Entry;
 use std::os::fd::OwnedFd;
-use std::time::Duration;
 
 use proto::process::{Claim, Claimed, WeightsKept};
 
-/// Longest a Storage Server this daemon starts takes to serve.
-const START_TIMEOUT: Duration = Duration::from_secs(30);
-
 /// The claims this node's daemon holds, by deployment.
 pub(crate) struct ClaimHolder {
-    /// The `uniserve` executable a Storage Server this daemon starts runs as.
-    executable: std::path::PathBuf,
     /// Whether processes on other nodes reach this node's server (their
     /// engine's page requests, their Transfer Servers' reads of its
     /// storage): the server it starts then also listens on TCP.
@@ -55,7 +49,6 @@ pub(crate) struct ClaimHolder {
 /// claiming connections' descriptors travel beside it, in the same order.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub(crate) struct Handoff {
-    executable: std::path::PathBuf,
     remote_pages: bool,
     settings: storage::Settings,
     claims: Vec<(storage::ClaimHandoff, String)>,
@@ -63,13 +56,11 @@ pub(crate) struct Handoff {
 
 impl ClaimHolder {
     pub(crate) fn new(
-        executable: std::path::PathBuf,
         remote_pages: bool,
         address: Option<std::net::IpAddr>,
         settings: storage::Settings,
     ) -> Self {
         Self {
-            executable,
             remote_pages,
             address,
             settings,
@@ -129,12 +120,11 @@ impl ClaimHolder {
                 // starts reads them, and one that serves already states its own, which must be
                 // these.
                 let record: storage::Readiness = service::host::start(
-                    &self.executable,
+                    std::path::Path::new(crate::supervision::RUNNING_IMAGE),
                     storage::SERVICE,
                     &socket,
                     &["--settings".to_owned(), "-".to_owned()],
                     Some(document.as_bytes()),
-                    START_TIMEOUT,
                 )
                 .context("starting this node's storage server")?;
                 storage::settings::Mismatch::check(&record, &settings)?;
@@ -257,7 +247,8 @@ impl ClaimHolder {
                         "an epoch's weights moved to host storage"
                     );
                 }
-                // An epoch that cannot is kept as its weights on the GPUs.
+                // The refusal is the answer's: the update records it in its status
+                // (`host_refused`), and the epoch's weights stay where they are.
                 Err(error) => {
                     tracing::warn!(deployment, epoch, %error, "an epoch's weights stay on the GPUs");
                     kept.refused = format!("epoch {epoch}: {error}");
@@ -339,7 +330,6 @@ impl ClaimHolder {
         }
 
         let handoff = Handoff {
-            executable: self.executable.clone(),
             remote_pages: self.remote_pages,
             settings: self.settings.clone(),
             claims,
@@ -354,12 +344,7 @@ impl ClaimHolder {
         handoff: Handoff,
         descriptors: Vec<OwnedFd>,
     ) -> storage::Result<Self> {
-        let mut holder = Self::new(
-            handoff.executable,
-            handoff.remote_pages,
-            address,
-            handoff.settings,
-        );
+        let mut holder = Self::new(handoff.remote_pages, address, handoff.settings);
         for ((claim, tcp), descriptor) in handoff.claims.into_iter().zip(descriptors) {
             let deployment = claim.deployment.clone();
             let client = storage::ClaimClient::resume(claim, descriptor)?;

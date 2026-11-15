@@ -47,7 +47,6 @@ fn a_follower_joins_without_a_model() {
             host: "leader".into(),
             dist_init_addr: Some(endpoint),
             socket: directory.path().join("leader.sock"),
-            executable: env!("CARGO_BIN_EXE_uniserve").into(),
             join_timeout: Duration::from_secs(10),
             build_server: build_server::command::Settings::default(),
             storage: Default::default(),

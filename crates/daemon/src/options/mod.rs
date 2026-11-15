@@ -992,8 +992,8 @@ impl ServerArgs {
     }
 
     /// The options of this node's daemon. The leader's process socket lies in the daemon's
-    /// instance directory `instance`; `executable` starts the node's Storage Server when it has
-    /// none, with the deployment's [`ServerArgs::storage_settings`].
+    /// instance directory `instance`; the node's Storage Server, when it has none, starts with the
+    /// deployment's [`ServerArgs::storage_settings`].
     pub fn daemon_options(&self, instance: &Path) -> DaemonOptions {
         DaemonOptions {
             nnodes: self.nnodes.get(),
@@ -1001,8 +1001,6 @@ impl ServerArgs {
             host: self.host_identity.clone(),
             dist_init_addr: self.dist_init_addr.clone(),
             socket: instance.join("process.sock"),
-            // The host services are commands of this executable.
-            executable: std::env::current_exe().unwrap_or_else(|_| "uniserve".into()),
             join_timeout: crate::supervision::JOIN_TIMEOUT,
             build_server: self.build_config.clone(),
             storage: self.storage_settings(),

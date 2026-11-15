@@ -17,9 +17,9 @@
 
 use proto::config::EngineArgs;
 use std::collections::BTreeMap;
+use std::os::fd::AsRawFd as _;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{Duration, Instant};
 
 use anyhow::Context as _;
 use proto::process::{self, downstream, event, hello, reply, request, upstream};
@@ -31,33 +31,11 @@ use crate::engine::client::{EngineClient, EngineInfo, EngineState, StatsSink};
 /// The worker group a daemon supervises an engine process under.
 pub(crate) const ENGINE_GROUP: &str = "engine";
 
-/// How long one read of a starting target's state waits. The start itself has
-/// no bound: an engine loads its ranks, resolves its modules and captures its
-/// graphs before it states that it parked, and one that exits meanwhile
-/// closes this connection, which ends the wait.
-const TARGET_STATE_READ: Duration = Duration::from_secs(60);
-/// How long an engine process takes to connect back to the request socket
-/// once the daemon started it.
-const CONNECT_TIMEOUT: Duration = Duration::from_secs(60);
-
-/// How long the daemon takes to reply on the control connection. A spawn is answered once the
-/// process started, which takes no build: every host of an epoch prepared the epoch's module set
-/// before any of its processes is spawned ([`prepare_epoch`]), so the node reads the engine's
-/// module from its store. A preparation has no such bound (`EngineControl::prepare_on`).
-const DAEMON_TIMEOUT: Duration = Duration::from_secs(90);
-
-/// How often a wait rechecks the engine process while it starts.
-const POLL_INTERVAL: Duration = Duration::from_millis(50);
-
-/// How long a Build Server this daemon starts may take to serve: it
-/// discovers its toolchains, which imports the compilers of its Python
-/// environment, and loads every installed package first.
-const BUILD_SERVER_START: std::time::Duration = std::time::Duration::from_secs(120);
-
-/// Makes sure this host's Build Server serves on the socket `settings`
-/// names, and returns that socket: when none serves, the Build Server is
-/// started with `settings` as a host service of this executable
-/// (`service::host::start`), which outlives this daemon.
+/// Makes sure this host's Build Server serves on the socket `settings` names, and returns that
+/// socket: when none serves, the deployment's daemon starts it with `settings` as a host service
+/// of the running build ([`crate::supervision::RUNNING_IMAGE`], `service::host::start`), which
+/// outlives this daemon. The start ends with the server's readiness record, or with the server's
+/// end before it served.
 ///
 /// # Errors
 ///
@@ -66,14 +44,12 @@ pub fn ensure_build_server(settings: &build_server::command::Settings) -> anyhow
     let socket = settings
         .socket()
         .context("finding this host's Build Server socket")?;
-    let executable = std::env::current_exe().context("locating this executable")?;
     ::service::host::start::<()>(
-        &executable,
+        Path::new(crate::supervision::RUNNING_IMAGE),
         "build-server",
         &socket,
         &settings.arguments(),
         None,
-        BUILD_SERVER_START,
     )
     .context("starting this host's Build Server")?;
     Ok(socket)
@@ -83,9 +59,8 @@ pub struct EngineControl {
     /// The request socket engine processes connect back to.
     requests: Listener,
     request_address: String,
-    socket: PathBuf,
     /// The daemon's process socket.
-    processes: String,
+    processes: service::Endpoint,
     /// This node's host identity, where the engine process runs.
     host: String,
     /// The deployment the engines serve.
@@ -115,13 +90,17 @@ impl EngineControl {
         deployment: String,
         build_server: PathBuf,
     ) -> anyhow::Result<Self> {
-        // A socket a stopped daemon left behind is replaced.
-        let _ = std::fs::remove_file(socket);
-        // The request socket is reached as the process socket is: a Unix socket on one host, the
-        // same interface's TCP endpoint, on a port the kernel picks, across hosts.
-        let endpoint = match processes.parse::<service::Endpoint>()? {
+        let processes: service::Endpoint = processes.parse()?;
+        // The request socket is reached as the process socket is: a Unix socket on one host (in
+        // this daemon's own instance directory, so no other process's socket lies at its path),
+        // the same interface's TCP endpoint, on a port the kernel picks, across hosts. Its
+        // listener removes a Unix socket's file when it closes.
+        let endpoint = match &processes {
             service::Endpoint::Unix(_) => service::Endpoint::unix(socket),
-            service::Endpoint::Tcp { host, .. } => service::Endpoint::Tcp { host, port: 0 },
+            service::Endpoint::Tcp { host, .. } => service::Endpoint::Tcp {
+                host: host.clone(),
+                port: 0,
+            },
         };
         let requests = Listener::bind(&endpoint)
             .with_context(|| format!("binding the request socket {endpoint}"))?;
@@ -129,7 +108,6 @@ impl EngineControl {
         Ok(Self {
             requests,
             request_address,
-            socket: socket.to_path_buf(),
             processes,
             host,
             deployment,
@@ -142,9 +120,9 @@ impl EngineControl {
     /// Starts an engine process with `args` and returns its client once it reports that it
     /// serves, or, for arguments that name the process it succeeds ([`EngineArgs::standby`]), once
     /// it reports that it stands by; `stats` receives its schedulers' statistics. The process runs
-    /// the executable the engine configuration names (`worker_config.executable`). This control
-    /// states the process's place and interfaces in the arguments it writes ([`Self::launch`]).
-    /// Blocks for the engine's whole start, its workers' loading included.
+    /// the engine package its launch's module set names, which the node that starts it resolves at
+    /// its own Build Server. This control states the process's place and interfaces in the launch
+    /// ([`place_world`]). Blocks for the engine's whole start, its workers' loading included.
     ///
     /// # Errors
     ///
@@ -247,9 +225,10 @@ impl EngineControl {
         args: EngineArgs,
         numbers: &[u64],
     ) -> anyhow::Result<(Vec<EngineArgs>, Vec<Vec<u64>>)> {
+        let processes = self.processes.to_string();
         let interfaces = Interfaces {
             requests: &self.request_address,
-            processes: &self.processes,
+            processes: &processes,
             build_server: &self.build_server,
         };
         let mut launches = place_world(args, numbers, &interfaces)?;
@@ -299,12 +278,12 @@ impl EngineControl {
                     kind: Some(request::Kind::Reserve(process::Reserve {
                         host: host.to_owned(),
                         group: ENGINE_GROUP.to_owned(),
-                        engine: 0,
+                        engine: None,
                         routable: true,
                     })),
                 })),
             })?;
-            let reply = await_reply(&mut control, id, "a reservation")?;
+            let reply = await_reply(&mut control, id).context("awaiting a reservation")?;
             anyhow::ensure!(
                 reply.error.is_empty(),
                 "reserving a socket on {host}: {}",
@@ -383,20 +362,14 @@ impl EngineControl {
         Ok(scheduler.with_peers(clients.collect()))
     }
 
-    /// Joins the one target engine `engine` of [`Self::join_target`].
+    /// Joins the one target engine `engine` of [`Self::join_target`]. The start has no bound: an
+    /// engine loads its ranks, resolves its modules and captures its graphs before it states that
+    /// it parked, and one that exits meanwhile closes its request link, which ends the wait.
     fn join(&self, engine: u64, epoch: u64, stats: StatsSink) -> anyhow::Result<EngineClient> {
         let (mut reader, mut writer, hello) = self.accept(engine, None)?;
         welcome(&mut writer, &hello, engine)?;
-        let started = Instant::now();
         loop {
-            let Some(message) = reader.recv::<wire::FromEngine>(TARGET_STATE_READ)? else {
-                tracing::info!(
-                    engine,
-                    waited_s = started.elapsed().as_secs(),
-                    "the update's target is still starting"
-                );
-                continue;
-            };
+            let message: wire::FromEngine = reader.recv_next()?;
             let Some(wire::from_engine::Kind::State(state)) = message.kind else {
                 continue;
             };
@@ -420,9 +393,9 @@ impl EngineControl {
     ///
     /// # Errors
     ///
-    /// Fails when the engine does not connect in time, speaks another version
-    /// of the engine interface than this daemon, is another engine, or
-    /// reports anything but ready.
+    /// Fails when the engine's process exits or its request link closes before it states its
+    /// state, when it speaks another version of the engine interface than this daemon, is another
+    /// engine, or reports anything but ready.
     pub fn adopt(
         &self,
         engine: u64,
@@ -434,13 +407,9 @@ impl EngineControl {
         self.next_engine.fetch_max(next_engine, Ordering::Relaxed);
         let (mut reader, mut writer, hello) = self.accept(engine, control.as_mut())?;
         welcome(&mut writer, &hello, engine)?;
-        let deadline = Instant::now() + CONNECT_TIMEOUT;
         loop {
-            let remaining = deadline.saturating_duration_since(Instant::now());
-            anyhow::ensure!(!remaining.is_zero(), "engine {engine} reported no state");
-            let Some(message) = reader.recv::<wire::FromEngine>(remaining)? else {
-                continue;
-            };
+            // An attaching engine states its state right after the welcome.
+            let message: wire::FromEngine = reader.recv_next()?;
             if let Some(wire::from_engine::Kind::State(state)) = message.kind {
                 anyhow::ensure!(
                     state.state == wire::EngineState::Serving as i32,
@@ -465,15 +434,11 @@ impl EngineControl {
         }
     }
 
-    /// Connects to the daemon's process socket and has it start engine
-    /// `engine` as `executable` on this node; returns the control connection
-    /// the process lives under.
+    /// Connects to the daemon's process socket as a client of it, and returns the connection and
+    /// the deployment's nodes the daemon's welcome states. The daemon's service answers every
+    /// request on it, so each read below ends with the answer or with the connection's end.
     fn connect(&self) -> anyhow::Result<(Connection, Vec<process::Node>)> {
-        let mut control = self
-            .processes
-            .parse()
-            .map_err(std::io::Error::from)
-            .and_then(|endpoint| Connection::connect(&endpoint))
+        let mut control = Connection::connect(&self.processes)
             .with_context(|| format!("connecting to the daemon at {}", self.processes))?;
         control.deliver(&process::Hello {
             major: proto::ENGINE_INTERFACE_VERSION,
@@ -488,8 +453,8 @@ impl EngineControl {
             })),
         })?;
         let welcome: process::Welcome = control
-            .recv(DAEMON_TIMEOUT)?
-            .context("the daemon did not respond on the control connection")?;
+            .recv_next()
+            .context("the daemon closed the control connection before its welcome")?;
         if let Some(refusal) = welcome.refusal {
             return Err(
                 anyhow::Error::new(refusal).context("the daemon refused the control connection")
@@ -516,8 +481,8 @@ impl EngineControl {
                 })),
             })?;
             let message: process::Downstream = connection
-                .recv(DAEMON_TIMEOUT)?
-                .context("the daemon did not report its quotas")?;
+                .recv_next()
+                .context("the daemon closed the connection before it reported its quotas")?;
             let Some(downstream::Kind::Reply(reply)) = message.kind else {
                 anyhow::bail!("the daemon did not reply to its quota query");
             };
@@ -564,8 +529,8 @@ impl EngineControl {
                 })),
             })?;
             let message: process::Downstream = connection
-                .recv(DAEMON_TIMEOUT)?
-                .context("the daemon did not report epoch publication")?;
+                .recv_next()
+                .context("the daemon closed the connection before it reported epoch publication")?;
             let Some(downstream::Kind::Reply(reply)) = message.kind else {
                 anyhow::bail!("the daemon did not reply to epoch publication");
             };
@@ -608,8 +573,8 @@ impl EngineControl {
                 })),
             })?;
             let message: process::Downstream = connection
-                .recv(DAEMON_TIMEOUT)?
-                .context("the daemon did not report the throttle")?;
+                .recv_next()
+                .context("the daemon closed the connection before it reported the throttle")?;
             let Some(downstream::Kind::Reply(reply)) = message.kind else {
                 anyhow::bail!("the daemon did not reply to the throttle");
             };
@@ -627,10 +592,10 @@ impl EngineControl {
     /// Has the daemon of `host` prepare the module set `filled` at its own Build Server
     /// (`Request::PrepareModules`), and returns the set as that Build Server prepared it.
     ///
-    /// The wait has no deadline of its own: a store that misses the engine's executable builds it
-    /// for minutes. It ends with the node's reply, which the leader's service gives with a
-    /// failure when the node's daemon is lost first, or when this daemon's service ends; the
-    /// caller bounds the preparation as a whole (`leader::fix_modules`).
+    /// The wait has no deadline: a store that misses the engine's executable builds it for
+    /// minutes, and the node's Build Server reports each module's build as it goes. It ends with
+    /// the node's reply, which the leader's service gives with a failure when the node's daemon is
+    /// lost first, or with this connection's end when this daemon's service ends.
     ///
     /// # Errors
     ///
@@ -640,9 +605,7 @@ impl EngineControl {
         &self,
         host: &str,
         filled: &crate::epoch::ModuleSet,
-        steps: &PrepareSteps,
     ) -> anyhow::Result<crate::epoch::ModuleSet> {
-        steps.at(host, "asking the host's daemon to prepare");
         let modules = Some(filled.into());
         let (mut control, _) = self.connect()?;
         control.deliver(&process::Upstream {
@@ -654,26 +617,12 @@ impl EngineControl {
                 })),
             })),
         })?;
-        steps.at(
-            host,
-            "waiting for the host's daemon to prepare at its Build Server",
-        );
         tracing::info!(
             host,
             "asking a host's daemon to prepare the epoch's modules at its Build Server"
         );
-
-        // `Duration::MAX` is no deadline: the read ends with a reply or with the connection.
-        let reply = loop {
-            let Some(message) = control.recv::<process::Downstream>(Duration::MAX)? else {
-                continue;
-            };
-            if let Some(downstream::Kind::Reply(reply)) = message.kind
-                && reply.id == 1
-            {
-                break reply;
-            }
-        };
+        let reply = await_reply(&mut control, 1)
+            .with_context(|| format!("awaiting the preparation at {host}"))?;
         anyhow::ensure!(
             reply.error.is_empty(),
             "preparing the epoch's modules at {host}: {}",
@@ -687,7 +636,6 @@ impl EngineControl {
             .context("the answer holds no module set")
             .and_then(|modules| Ok(crate::epoch::ModuleSet::try_from(modules)?))
             .with_context(|| format!("reading the module set {host} prepared"))?;
-        steps.at(host, "prepared");
         tracing::info!(host, "a host's daemon prepared the epoch's modules");
         Ok(prepared)
     }
@@ -719,7 +667,7 @@ impl EngineControl {
             "engine host {host} has not joined the deployment"
         );
         anyhow::ensure!(
-            host == self.host || !self.processes.starts_with("unix:"),
+            host == self.host || matches!(self.processes, service::Endpoint::Tcp { .. }),
             "a remote engine needs the deployment's network control address"
         );
 
@@ -741,7 +689,7 @@ impl EngineControl {
                 })),
             })),
         })?;
-        let reply = await_reply(&mut control, 1, "the engine's start")?;
+        let reply = await_reply(&mut control, 1).context("awaiting the engine's start")?;
         anyhow::ensure!(
             reply.error.is_empty(),
             "starting the engine process on {host}: {}",
@@ -758,8 +706,13 @@ impl EngineControl {
         Ok(control)
     }
 
-    /// Accepts engine `engine`'s connection to the request socket, failing
-    /// when its process exits first or does not connect in time.
+    /// Accepts engine `engine`'s connection to the request socket, failing when the daemon
+    /// reports its process's exit on `control` first.
+    ///
+    /// The wait blocks on the request socket and on `control`: an engine dials as the first thing
+    /// it does, and an engine that exits before is reported on its control connection. Engines
+    /// dial in any order; one that dials before it is awaited waits in `incoming` under the number
+    /// it states.
     fn accept(
         &self,
         engine: u64,
@@ -769,7 +722,6 @@ impl EngineControl {
         if let Some(connection) = incoming.remove(&engine) {
             return Ok(connection);
         }
-        let deadline = Instant::now() + CONNECT_TIMEOUT;
         // Whether the handoff's control connection has been seen to close: the service
         // goes on with its accepted side, so an end here is a predecessor that left without
         // handing it over, and not the engine. Stated once.
@@ -778,9 +730,10 @@ impl EngineControl {
             match self.requests.try_accept() {
                 Ok(Some(mut reader)) => {
                     let writer = reader.writer()?;
+                    // An engine's first message on its request link is its hello.
                     let hello: wire::Hello = reader
-                        .recv(CONNECT_TIMEOUT)?
-                        .context("the engine said no hello")?;
+                        .recv_next()
+                        .context("the engine closed its request link before its hello")?;
                     // Whose dial this is: a successor waits for one engine's front, and a
                     // connection it cannot use is otherwise indistinguishable from one that never
                     // arrived — the difference between an engine that dialled the wrong daemon and
@@ -795,6 +748,7 @@ impl EngineControl {
                         return Ok((reader, writer, hello));
                     }
                     incoming.insert(hello.engine, (reader, writer, hello));
+                    continue;
                 }
                 Ok(None) => {}
                 Err(error) => return Err(error).context("accepting the engine's connection"),
@@ -826,18 +780,15 @@ impl EngineControl {
                     }
                 }
             }
-            anyhow::ensure!(
-                Instant::now() < deadline,
-                "engine {engine} did not connect within {CONNECT_TIMEOUT:?}"
-            );
-            std::thread::sleep(POLL_INTERVAL);
+            // A dial or the control connection's report ends the wait.
+            let mut descriptors = vec![crate::supervision::readable(self.requests.as_raw_fd())];
+            if let Some(control) = control.as_deref()
+                && !control_closed
+            {
+                descriptors.extend(control.poll_fds());
+            }
+            service::wait_ready(&mut descriptors, None)?;
         }
-    }
-}
-
-impl Drop for EngineControl {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.socket);
     }
 }
 
@@ -894,18 +845,11 @@ pub(crate) fn start_state(state: wire::State) -> anyhow::Result<Option<(EngineIn
     Ok(Some((info.into(), ended)))
 }
 
-/// Reads the reply `id` on a control connection, within the daemon's reply time.
-fn await_reply(control: &mut Connection, id: u64, what: &str) -> anyhow::Result<process::Reply> {
-    let deadline = Instant::now() + DAEMON_TIMEOUT;
+/// Reads the reply `id` on a control connection. The daemon's service answers every request on
+/// it, so the read ends with the reply or with the connection's end.
+fn await_reply(control: &mut Connection, id: u64) -> anyhow::Result<process::Reply> {
     loop {
-        let remaining = deadline.saturating_duration_since(Instant::now());
-        anyhow::ensure!(
-            !remaining.is_zero(),
-            "the daemon did not reply to {what} in time"
-        );
-        let Some(message) = control.recv::<process::Downstream>(remaining)? else {
-            continue;
-        };
+        let message: process::Downstream = control.recv_next()?;
         if let Some(downstream::Kind::Reply(reply)) = message.kind
             && reply.id == id
         {
@@ -916,7 +860,8 @@ fn await_reply(control: &mut Connection, id: u64, what: &str) -> anyhow::Result<
 
 /// Waits until every process of a world reported that it serves, or that it stands by when
 /// `standby`, and returns what each reported. The first failure ends the wait: a process that
-/// reports its start failed, or exits, as its control connection says.
+/// reports its start failed, or exits, as its control connection says. The wait blocks on every
+/// process's request link and control connection at once.
 fn await_started(
     links: &mut [(Connection, Connection)],
     controls: &mut [Connection],
@@ -963,7 +908,7 @@ fn await_started(
                     Ok(wire::EngineState::Failed) => {
                         // The failed engine closes its workers and exits;
                         // their storage is free once it has.
-                        await_exit(reader, &mut controls[index], FAILED_EXIT);
+                        await_exit(reader, &mut controls[index]);
                         anyhow::bail!("the engine on {host} failed to start: {}", state.error);
                     }
                     _ => {}
@@ -973,18 +918,19 @@ fn await_started(
         if started.iter().all(Option::is_some) {
             return Ok(started.into_iter().flatten().collect());
         }
+        let mut descriptors = Vec::new();
         for (index, control) in controls.iter_mut().enumerate() {
             if started[index].is_none() {
                 exited(control)
                     .with_context(|| format!("the engine on {}", launches[index].host))?;
+                descriptors.extend(control.poll_fds());
+                descriptors.extend(links[index].0.poll_fds());
             }
         }
-        std::thread::sleep(POLL_INTERVAL);
+        // A state on a request link or an exit on a control connection ends the wait.
+        service::wait_ready(&mut descriptors, None)?;
     }
 }
-
-/// How long a failed engine takes to close its workers and exit, at most.
-const FAILED_EXIT: Duration = Duration::from_secs(120);
 
 /// Whether the control connection still reports a serving engine: `Ok(false)` when it has
 /// closed, which is a connection ending rather than an engine exit.
@@ -998,23 +944,29 @@ fn still_serving(control: &mut Connection) -> anyhow::Result<bool> {
     }
 }
 
-/// Waits up to `timeout` for the daemon to report the engine process's exit
-/// on its control connection; a wait that times out is logged.
-fn await_exit(reader: &mut Connection, control: &mut Connection, timeout: Duration) {
-    let deadline = Instant::now() + timeout;
-    while Instant::now() < deadline {
+/// Waits until the engine process that reported its failure exited: the daemon reports the exit
+/// on its control connection `control`, and the process's end closes its request link `reader`.
+/// Whichever comes first ends the wait.
+fn await_exit(reader: &mut Connection, control: &mut Connection) {
+    loop {
         if exited(control).is_err() {
             return;
         }
         // A process that goes closes this connection, and the daemon then forgets it without
         // reporting an exit on `control`.
-        match reader.try_recv::<wire::FromEngine>() {
-            Ok(Some(_)) => {}
-            Ok(None) if reader.wait(POLL_INTERVAL).is_ok() => {}
-            _ => return,
+        loop {
+            match reader.try_recv::<wire::FromEngine>() {
+                Ok(Some(_)) => {}
+                Ok(None) => break,
+                Err(_) => return,
+            }
+        }
+        let mut descriptors = control.poll_fds().to_vec();
+        descriptors.extend(reader.poll_fds());
+        if service::wait_ready(&mut descriptors, None).is_err() {
+            return;
         }
     }
-    tracing::warn!("the failed engine process did not exit within {timeout:?}");
 }
 
 /// Fails when the daemon reported the engine process's exit on its control
@@ -1048,48 +1000,6 @@ pub struct BuildServer {
     pub targets: Vec<build_server::Target>,
 }
 
-/// The step of each host's Build Server exchange the daemon is in.
-///
-/// The exchange waits in ways this crate cannot bound: the client opens its socket, and reads the
-/// response a Build Server may never send, with no deadline (`crates/build-server/src/protocol.rs`:
-/// `Connection::connect` and `Connection::receive`), and another host's daemon answers a
-/// preparation once its Build Server did. Whoever times the preparation out reads the steps
-/// recorded here, so a deadline names the wait and the host rather than the phase.
-#[derive(Clone)]
-pub struct PrepareSteps(std::sync::Arc<std::sync::Mutex<BTreeMap<String, &'static str>>>);
-
-impl Default for PrepareSteps {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl PrepareSteps {
-    /// A record of an exchange that has not reached a Build Server yet.
-    pub fn new() -> Self {
-        Self(std::sync::Arc::new(std::sync::Mutex::new(BTreeMap::new())))
-    }
-
-    /// Records that the exchange with `host` is at `what`.
-    fn at(&self, host: &str, what: &'static str) {
-        let mut steps = self.0.lock().unwrap_or_else(|broken| broken.into_inner());
-        steps.insert(host.to_owned(), what);
-    }
-
-    /// The step of every host the exchange reached, in host order.
-    pub fn describe(&self) -> String {
-        let steps = self.0.lock().unwrap_or_else(|broken| broken.into_inner());
-        if steps.is_empty() {
-            return "about to reach its first Build Server".to_owned();
-        }
-        steps
-            .iter()
-            .map(|(host, what)| format!("{what} ({host})"))
-            .collect::<Vec<_>>()
-            .join("; ")
-    }
-}
-
 /// Prepares the module set `filled`, whose revisions are fixed ([`with_store_modules`]), at the
 /// Build Server of every host in `hosts`, and returns it with the parameters each package runs
 /// with. The daemon calls it before it spawns any process of the epoch, at a start and at every
@@ -1104,6 +1014,10 @@ impl PrepareSteps {
 /// revision names the same module on every host, so a host whose Build Server lacks one fails the
 /// preparation rather than choosing another.
 ///
+/// Every wait ends with a reply or a connection's end: a Build Server answers a prepare once it
+/// built every module, reporting each build as it goes, and another host's daemon answers once
+/// its Build Server did, or the leader's service fails the request with that daemon's loss.
+///
 /// # Errors
 ///
 /// Fails when a Build Server refuses or cannot build a module, when no daemon runs on a host of
@@ -1114,7 +1028,6 @@ pub fn prepare_epoch(
     nodes: Option<&EngineControl>,
     hosts: &[String],
     filled: &crate::epoch::ModuleSet,
-    steps: &PrepareSteps,
 ) -> anyhow::Result<crate::epoch::ModuleSet> {
     let mut others: Vec<&str> = Vec::new();
     for host in hosts {
@@ -1141,12 +1054,12 @@ pub fn prepare_epoch(
                     let nodes = nodes.with_context(|| {
                         format!("no daemon of the deployment reaches host {host}")
                     })?;
-                    nodes.prepare_on(host, filled, steps)
+                    nodes.prepare_on(host, filled)
                 });
                 (host, wait)
             })
             .collect();
-        let pinned = prepare_at(local, filled, steps);
+        let pinned = prepare_at(local, filled);
         let remote: Vec<_> = waits
             .into_iter()
             .map(|(host, wait)| (host, wait.join()))
@@ -1212,10 +1125,7 @@ pub(crate) fn prepare_node(
         socket,
         targets: Vec::new(),
     };
-    // Nobody times this node's preparation by its steps: the leader's own record names the wait
-    // for this node's reply.
-    let prepared =
-        prepare_at(&server, &filled, &PrepareSteps::new()).map_err(|error| format!("{error:#}"))?;
+    let prepared = prepare_at(&server, &filled).map_err(|error| format!("{error:#}"))?;
     Ok(process::ModulesPrepared {
         modules: Some((&prepared).into()),
     })
@@ -1253,7 +1163,7 @@ pub fn with_store_modules(
 
     let mut complete = filled.clone();
     fix_revision(&mut client, proto::module::ENGINE, &mut complete.engine)?;
-    fix_revision(&mut client, POLICY_SLOT, &mut complete.policy)?;
+    fix_revision(&mut client, proto::module::POLICY, &mut complete.policy)?;
     for (slot, package) in &mut complete.kernels {
         fix_revision(&mut client, &slot.op, package)?;
     }
@@ -1324,9 +1234,8 @@ fn fix_revision(
 fn prepare_at(
     server: &BuildServer,
     filled: &crate::epoch::ModuleSet,
-    steps: &PrepareSteps,
 ) -> anyhow::Result<crate::epoch::ModuleSet> {
-    let policy_slot = proto::module::ModuleSlot::all(POLICY_SLOT);
+    let policy_slot = proto::module::ModuleSlot::all(proto::module::POLICY);
     let engine_slot = proto::module::ModuleSlot::all(proto::module::ENGINE);
     let mut requests = Vec::with_capacity(filled.kernels.len() + 2);
     for (slot, package) in &filled.kernels {
@@ -1359,7 +1268,6 @@ fn prepare_at(
     // Before the connect, not after it: a daemon that blocks opening the
     // socket names the host it was reaching from this line alone, and the
     // server it never reached logs nothing at all.
-    steps.at(&server.host, "opening its connection to a Build Server");
     tracing::info!(
         host = %server.host,
         socket = %server.socket.display(),
@@ -1408,14 +1316,9 @@ fn prepare_at(
             );
         }
     };
-    steps.at(
-        &server.host,
-        "waiting for a Build Server's response to the prepare",
-    );
     let prepared = client
         .prepare(&request, &mut progress)
         .with_context(|| format!("preparing the epoch's modules at {}", server.host))?;
-    steps.at(&server.host, "reading the modules a Build Server selected");
     tracing::info!(
         host = %server.host,
         prepared = prepared.len(),
@@ -1442,20 +1345,12 @@ fn prepare_at(
         kernels.len(),
         filled.kernels.len()
     );
-    steps.at(&server.host, "prepared");
     Ok(crate::epoch::ModuleSet {
         engine,
         kernels,
         policy,
     })
 }
-
-/// The slot the scheduling policy package fills: the name the policy packages state
-/// as their `op` (`crates/scheduling/policies/<backend>/package.toml`). The
-/// scheduling interface is not an operator: the epoch record keeps its
-/// package beside the kernels' rather than among them, so `prepare` names it
-/// by this slot and the daemon takes it back out.
-const POLICY_SLOT: &str = "scheduling";
 
 /// One engine process on a node, by the engine number its process link is
 /// registered under, which a command names and a report carries.
@@ -1972,10 +1867,10 @@ mod tests {
 
         // The close reaches this end once no process holds the accepted side's socket, and a
         // child another thread of this process is spawning holds a copy until it starts its
-        // program: wait for the close, as the adopting daemon's polls do, rather than look once.
-        let closed = control.wait(Duration::from_secs(30));
+        // program: wait for the close, as the adopting daemon's wait does, rather than look once.
+        let closed = control.recv_next::<process::Downstream>();
         assert_eq!(
-            closed.map_err(|error| error.kind()),
+            closed.map(drop).map_err(|error| error.kind()),
             Err(std::io::ErrorKind::UnexpectedEof)
         );
         assert!(

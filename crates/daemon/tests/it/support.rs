@@ -24,8 +24,6 @@ pub(crate) fn single_node(host: &str, socket: PathBuf) -> DaemonOptions {
         host: host.to_owned(),
         dist_init_addr: None,
         socket,
-        // No test claims storage, which is the only use of the executable.
-        executable: PathBuf::from("uniserve"),
         join_timeout: TIMEOUT,
         build_server: build_server::command::Settings::default(),
         storage: storage::Settings::default(),
@@ -173,7 +171,7 @@ impl Engine {
             group: group.into(),
             routable,
             // Reserved by the connection that also spawns it.
-            engine: 0,
+            engine: None,
         };
         match self.request(request::Kind::Reserve(reserve)) {
             Reply {
