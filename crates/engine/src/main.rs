@@ -14,8 +14,8 @@
 //! every device's runners, prints the kernel keys they recorded as the key
 //! list `uniserve build-server build --keys` reads, and serves nothing.
 //!
-//! This is the one place the engine names a concrete model: the families it
-//! loads are registered in [`FAMILIES`], and the library dispatches by
+//! The engine names no concrete model: the executable loads the families
+//! `models` registers ([`models::FAMILIES`]), and the library dispatches by
 //! capability.
 
 use std::io::Write as _;
@@ -43,16 +43,6 @@ static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 static InitializeInjectionNvtx2_fnptr: unsafe extern "C" fn(
     *const std::ffi::c_void,
 ) -> std::ffi::c_int = platform::cupti::initialize_nvtx_injection;
-
-/// The model families this executable loads. A model is added with its module
-/// of `models` and one entry here, and its request-processing side in
-/// `processing::FAMILIES`, which the daemon serves.
-const FAMILIES: [nn::family::Family; 4] = [
-    models::qwen3::family::FAMILY,
-    models::qwen3::family::HYBRID_FAMILY,
-    models::qwen4_exp::family::FAMILY,
-    models::minimax_h3::family::FAMILY,
-];
 
 /// The engine's command line: a main process with `--launch`.
 #[derive(Debug, Parser)]
@@ -98,7 +88,7 @@ fn main() -> Result<ExitCode> {
     let cli = Cli::parse();
     let lifeline = cli.lifeline.map(take_lifeline);
     let launch = read_launch(cli.launch)?;
-    let registry = nn::family::Registry::new(FAMILIES)?;
+    let registry = nn::family::Registry::new(models::FAMILIES.iter().copied())?;
 
     if cli.keys {
         // The key list is this command's output, so its logs go to standard
