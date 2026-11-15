@@ -38,8 +38,6 @@ import importlib.machinery
 import importlib.util
 import json
 import pathlib
-import subprocess
-import tomllib
 from collections.abc import Mapping
 from typing import IO, Any
 
@@ -278,43 +276,6 @@ def stated(
             "launch_pdl": dependent,
         },
     }
-
-
-def stated_for(
-    kernels: Any,
-    package: pathlib.Path,
-    descriptor: str,
-    target: Target,
-    uniserve: str,
-) -> dict[str, Any]:
-    """What a package's launch table states for ``descriptor``, outside a build.
-
-    ``kernels`` is the package's source module as the caller imported it. The
-    fields are the ones a build is handed, read by the Build Server's own
-    reader of the key grammar, ``build-server fields`` of the ``uniserve``
-    executable the caller names; the table and the parameters are the
-    package manifest's.
-
-    Raises:
-        ValueError: If the package's declared dimensions do not read the key.
-    """
-    read = subprocess.run(
-        [uniserve, "build-server", "fields", str(package), descriptor],
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-    if read.returncode != 0:
-        raise ValueError(f"{descriptor}: {read.stderr.strip()}")
-    manifest = tomllib.loads((package / "package.toml").read_text())
-    return stated(
-        manifest["launch"],
-        kernels,
-        descriptor,
-        json.loads(read.stdout),
-        manifest.get("parameters", {}),
-        target,
-    )
 
 
 def launches(requests: IO[str], answers: IO[str]) -> None:

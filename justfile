@@ -26,9 +26,10 @@ lint: fmt clippy
     {{python}} -m ruff format --check uniserve_eval tests
     {{python}} -m mypy
 
-# Fast Python tests (CPU only). The tensor primitives' checks read a descriptor key's fields with
-# the base executable (`uniserve build-server fields`), which is built here unless
-# `UNISERVE_BINARY` names one.
+# Fast Python tests (CPU only); the kernel checks run on Triton's interpreter. The tensor
+# primitives' checks state a descriptor key's launch with the base executable (`uniserve
+# build-server launch`, which runs the Build Server's environment program `uniserve-build-server`
+# from the search path); it is built here unless `UNISERVE_BINARY` names one.
 test-python-fast:
     #!/usr/bin/env bash
     set -euo pipefail

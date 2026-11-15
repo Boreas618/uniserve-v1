@@ -1,20 +1,19 @@
 """What the tensor primitives' checks share.
 
 A check launches one package's kernel the way its operator launches it and
-compares the result with numpy or torch on the same values. It runs on
-Triton's interpreter, which needs no device, or with ``--device`` compiled
-for a device, where the same cases run on device tensors. This module holds
-what every such check needs:
+compares the result with numpy or torch on the same values, on the session's
+device (``tests/python/kernels/conftest.py``). This module holds what every
+such check needs:
 
-- the launch of a descriptor key: the key is read against the package's
-  manifest as the Build Server reads it for a build, and the kernel runs with
-  the compile-time values the package's launch table states for it, so a
-  check launches the module a key names;
-- the strided inputs a check traverses: contiguous, sliced, stepped, permuted
-  and broadcast (zero-stride) views of rank 1 to 6;
+- the launch of a descriptor key (:meth:`Primitives.launch`): the kernel runs
+  with the compilation the package's launch table states for the key, as the
+  Build Server states it for a build, so a check launches the module a key
+  names;
+- the strided inputs a check traverses (:data:`LAYOUTS`): contiguous, sliced,
+  stepped, permuted and broadcast (zero-stride) views of rank 1 to 6;
 - the launch arithmetic of ``crates/ops/src/strided.rs``: the axes a program
-  traverses once every run the operands step through together is merged, and the
-  extents and strides packed right-aligned;
+  traverses once every run the operands step through together is merged, and
+  the extents and strides packed right-aligned;
 - the operators' bounds, in the expressions of ``crates/ops/src/tolerance.rs``.
 
 **BF16 on the interpreter.** A device rounds an FP32 value to the nearest
@@ -28,38 +27,14 @@ compared exactly.
 
 from __future__ import annotations
 
-import functools
-import importlib
-import os
-import pathlib
-import sys
+from collections.abc import Callable
 
-#: Whether this run compiles the kernels for a device instead of interpreting
-#: them. Triton reads ``TRITON_INTERPRET`` when it is imported, so the mode is
-#: chosen here, which every check imports before Triton.
-DEVICE = "--device" in sys.argv
-if not DEVICE:
-    os.environ["TRITON_INTERPRET"] = "1"
+import numpy as np
+import torch
 
-import numpy as np  # noqa: E402
-import torch  # noqa: E402
+from tests.python.kernels.packages import Launches, StatedLaunch
 
-#: Where a check's tensors live.
-TARGET = torch.device("cuda" if DEVICE else "cpu")
-
-#: The kernel packages' root: the checks live in
-#: ``tests/python/kernels/<family>/``.
-KERNELS = (
-    pathlib.Path(__file__).resolve().parents[4] / "crates" / "ops" / "kernels"
-)
-
-#: The packages' compile driver is the Build Server's Python package.
-sys.path.insert(0, str(KERNELS.parents[1] / "build-server" / "python" / "src"))
-
-from uniserve_build_server import triton as driver  # noqa: E402
-from uniserve_build_server.request import Target  # noqa: E402
-
-#: The architecture a check asks a compile script about. It has no
+#: The architecture whose compilation a check launches. It has no
 #: programmatic dependent launch, so a key's ``pdl`` compiles to nothing and a
 #: check launches one grid at a time.
 ARCHITECTURE = "sm_90a"
@@ -84,6 +59,9 @@ ELEMENTS = {
     "f64": torch.float64,
 }
 
+#: The name `ops::DType` prints for each torch element type.
+NAMES = {element: name for name, element in ELEMENTS.items()}
+
 FLOATS = ("f16", "bf16", "f32", "f64")
 INTEGERS = ("u8", "u32", "i16", "i32", "i64")
 
@@ -98,69 +76,45 @@ MOVED = {"f8e4m3": torch.uint8}
 #: (``ops::tolerance::unit_roundoff``).
 UNIT = {"f16": 2.0**-11, "bf16": 2.0**-8, "f32": 2.0**-24, "f64": 2.0**-53}
 
-
-def ready() -> bool:
-    """Whether the mode this run asked for can run here.
-
-    A device run on a host without a device says so and is no failure: the
-    interpreter run is the one every host can make.
-    """
-    if DEVICE and not torch.cuda.is_available():
-        print(
-            "skipped: --device needs a CUDA device; without it the same cases "
-            "run on Triton's interpreter",
-            file=sys.stderr,
-        )
-        return False
-    return True
+#: A bound is ``(atol, rtol, cancels)``, as ``Tolerance`` holds it.
+EXACT = (0.0, 0.0, False)
 
 
-def where() -> str:
-    """The name of what this run launches on, for a check's last line."""
-    return "a device" if DEVICE else "Triton's interpreter"
+def identity(tensor: torch.Tensor) -> torch.Tensor:
+    """The contiguous tensor itself."""
+    return tensor
 
 
-def load(op: str):
-    """The Triton source of ``op``'s package, imported from its ``src/``."""
-    source = str(KERNELS / op / "triton" / "src")
-    if source not in sys.path:
-        sys.path.insert(0, source)
-    return importlib.import_module(op)
-
-
-@functools.cache
-def described(op: str, key: str) -> dict:
-    """What ``op``'s package states for the module of descriptor ``key``.
-
-    The key is read against the package's manifest and its launch table is
-    stated for the fields it reads, which is how the Build Server asks for a
-    build: a key the manifest does not declare, or a field the table misreads,
-    fails here rather than passing as a launch of something else.
-    """
-    return driver.stated_for(
-        load(op),
-        KERNELS / op / "triton",
-        key,
-        Target.named(ARCHITECTURE),
-        os.environ.get("UNISERVE_BINARY", "uniserve"),
-    )
-
-
-def launch(op: str, key: str, programs: tuple, *words) -> None:
-    """Launch the module ``key`` names over ``programs``, with ``words``.
-
-    ``words`` are the launch's arguments in the order the operator packs
-    them; the compile-time values are the package's own.
-    """
-    stated = described(op, key)
-    signature = stated["signature"]
-    packed = [name for name, kind in signature.items() if kind != "constexpr"]
-    if len(words) != len(packed):
-        raise SystemExit(
-            f"{op} {key}: {len(words)} words launched, the signature states "
-            f"{len(packed)}: {packed}"
-        )
-    stated["kernel"][programs](*words, **stated["constexprs"])
+#: The strided inputs of rank 1 to 6 a check traverses, by name: the shape of
+#: the contiguous tensor drawn, the offset of its seed, and the view taken of
+#: it. The layouts are the ones an address computation gets wrong: an offset
+#: window, a step that skips elements, a permutation that leaves no run of
+#: axes to merge, a broadcast whose stride is zero, and an input wider than
+#: one program.
+LAYOUTS: dict[str, tuple[tuple[int, ...], int, Callable]] = {
+    "rank 1 contiguous": ((37,), 0, identity),
+    "rank 1 over several blocks": ((3 * BLOCK + 17,), 1, identity),
+    "rank 1 stepped": ((40,), 2, lambda t: t[3::3]),
+    "one element": ((1,), 3, identity),
+    "rank 2 contiguous": ((5, 7), 4, identity),
+    "rank 2 transposed": ((7, 5), 5, lambda t: t.t()),
+    "rank 2 broadcast rows": ((1, 7), 6, lambda t: t.expand(5, 7)),
+    "rank 3 permuted": ((3, 4, 5), 7, lambda t: t.permute(2, 0, 1)),
+    "rank 3 window": ((4, 6, 8), 8, lambda t: t[1:3, ::2, 2:7]),
+    "rank 4 permuted": ((2, 3, 4, 5), 9, lambda t: t.permute(0, 3, 1, 2)),
+    "rank 4 broadcast": ((2, 1, 4, 1), 10, lambda t: t.expand(2, 3, 4, 5)),
+    "rank 5 contiguous": ((2, 3, 2, 3, 2), 11, identity),
+    "rank 5 reversed": (
+        (2, 3, 2, 3, 2),
+        12,
+        lambda t: t.permute(4, 3, 2, 1, 0),
+    ),
+    "rank 6 reversed": (
+        (2, 2, 3, 2, 2, 2),
+        13,
+        lambda t: t.permute(5, 4, 3, 2, 1, 0),
+    ),
+}
 
 
 def accumulate(dtype: str) -> str:
@@ -173,71 +127,9 @@ def element(dtype: str) -> torch.dtype:
     return MOVED[dtype] if dtype in MOVED else ELEMENTS[dtype]
 
 
-def values(dtype: str, shape, seed: int, scale: float = 3.0) -> torch.Tensor:
-    """A contiguous tensor of ``dtype`` values drawn from one seed.
-
-    A floating tensor is normal with deviation ``scale``; an integer one is
-    uniform over a range its element type holds, both signs where it has one.
-    An element type that only moves is uniform over every byte, which holds
-    its NaNs, both zeros and its largest values.
-    """
-    generator = torch.Generator().manual_seed(seed)
-    if dtype in MOVED:
-        return tensor(torch.randint(0, 256, shape, generator=generator), dtype)
-    if dtype in FLOATS:
-        drawn = torch.randn(shape, generator=generator, dtype=torch.float64)
-        return tensor(drawn * scale, dtype)
-    low = 0 if dtype in ("u8", "u32") else -100
-    return tensor(torch.randint(low, 101, shape, generator=generator), dtype)
-
-
-def tensor(data, dtype: str) -> torch.Tensor:
-    """``data`` as a contiguous tensor of ``dtype`` where the check runs."""
-    return torch.as_tensor(data).to(element(dtype)).to(TARGET)
-
-
-def empty(shape, element: torch.dtype) -> torch.Tensor:
-    """An output of ``shape`` for a launch to write, where the check runs."""
-    return torch.empty(tuple(shape), dtype=element, device=TARGET)
-
-
-def views(dtype: str, seed: int, make=values):
-    """Strided inputs of rank 1 to 6, as ``(name, view)``.
-
-    The layouts are the ones an address computation gets wrong: an offset
-    window, a step that skips elements, a permutation that leaves no run of
-    axes to merge, a broadcast whose stride is zero, and an input wider than
-    one program.
-    """
-    yield "rank 1 contiguous", make(dtype, (37,), seed)
-    yield "rank 1 over several blocks", make(dtype, (3 * BLOCK + 17,), seed + 1)
-    yield "rank 1 stepped", make(dtype, (40,), seed + 2)[3::3]
-    yield "one element", make(dtype, (1,), seed + 3)
-    yield "rank 2 contiguous", make(dtype, (5, 7), seed + 4)
-    yield "rank 2 transposed", make(dtype, (7, 5), seed + 5).t()
-    yield (
-        "rank 2 broadcast rows",
-        make(dtype, (1, 7), seed + 6).expand(5, 7),
-    )
-    yield "rank 3 permuted", make(dtype, (3, 4, 5), seed + 7).permute(2, 0, 1)
-    yield "rank 3 window", make(dtype, (4, 6, 8), seed + 8)[1:3, ::2, 2:7]
-    yield (
-        "rank 4 permuted",
-        make(dtype, (2, 3, 4, 5), seed + 9).permute(0, 3, 1, 2),
-    )
-    yield (
-        "rank 4 broadcast",
-        make(dtype, (2, 1, 4, 1), seed + 10).expand(2, 3, 4, 5),
-    )
-    yield "rank 5 contiguous", make(dtype, (2, 3, 2, 3, 2), seed + 11)
-    yield (
-        "rank 5 reversed",
-        make(dtype, (2, 3, 2, 3, 2), seed + 12).permute(4, 3, 2, 1, 0),
-    )
-    yield (
-        "rank 6 reversed",
-        make(dtype, (2, 2, 3, 2, 2, 2), seed + 13).permute(5, 4, 3, 2, 1, 0),
-    )
+def width(dtype: str) -> int:
+    """The bits of one ``dtype`` element's storage."""
+    return torch.empty((), dtype=element(dtype)).element_size() * 8
 
 
 def real(tensor: torch.Tensor) -> np.ndarray:
@@ -256,22 +148,18 @@ def bits(tensor: torch.Tensor) -> torch.Tensor:
     return tensor.contiguous().view(widths[tensor.element_size()])
 
 
-def same(label: str, got: torch.Tensor, expected: torch.Tensor) -> int:
-    """Hold ``got`` to the bits of ``expected``, element for element.
-
-    Returns the number of elements compared.
-    """
+def assert_same(label: str, got: torch.Tensor, expected: torch.Tensor) -> None:
+    """Hold ``got`` to the bits of ``expected``, element for element."""
     assert got.dtype == expected.dtype, (label, got.dtype, expected.dtype)
     assert got.shape == expected.shape, (label, got.shape, expected.shape)
     differing = (bits(got) != bits(expected)).nonzero()
     if differing.numel():
         at = tuple(int(axis) for axis in differing[0])
-        raise SystemExit(
+        raise AssertionError(
             f"{label}: {differing.size(0)} of {got.numel()} elements differ; "
             f"first at {at}: got {got[at].item()!r}, expected "
             f"{expected[at].item()!r}"
         )
-    return got.numel()
 
 
 def merge(shape, strides) -> tuple[list[int], list[list[int]]]:
@@ -342,10 +230,6 @@ def gamma(reduction: int, unit: float) -> float:
     return 1.0 if terms >= 1.0 else terms / (1.0 - terms)
 
 
-#: A bound is ``(atol, rtol, cancels)``, as ``Tolerance`` holds it.
-EXACT = (0.0, 0.0, False)
-
-
 def rounding(reduction: int, dtype: str):
     """``Tolerance::rounding(reduction, dtype.accumulate(), dtype)``."""
     unit = UNIT[accumulate(dtype)]
@@ -364,55 +248,131 @@ def with_atol(bound, atol: float):
     return (atol, bound[1], bound[2])
 
 
-def compare(label: str, got: torch.Tensor, expected: np.ndarray, bound) -> int:
-    """Hold ``got`` to ``bound`` around ``expected``, element for element.
+class Primitives:
+    """What a tensor check launches on: the session's device and the launches
+    the packages state for their keys (the ``primitives`` fixture).
+    """  # noqa: D205
 
-    ``expected`` is the exact value of each element in float64 or int64. A
-    bound of zero is equality, with a NaN equal to a NaN; any other bound is
-    ``|got - expected| <= atol + rtol * magnitude``, the magnitude being the
-    element's own or, for a bound that cancels, the output's largest. A BF16
-    output on the interpreter gains the store's truncation (module
-    docstring). Returns the number of elements compared.
+    def __init__(
+        self, device: torch.device, interpreted: bool, launches: Launches
+    ) -> None:
+        self.device = device
+        self.interpreted = interpreted
+        self._launches = launches
 
-    A rounding bound is relative, which holds where the element type's
-    values are: a value past its largest finite one is stored as an infinity,
-    and below its smallest normal one the type's grid is uniform, so the
-    comparison there allows one step of that grid.
-    """
-    result = real(got)
-    expected = np.asarray(expected).reshape(result.shape)
-    atol, rtol, cancels = bound
+    def described(self, op: str, key: str) -> StatedLaunch:
+        """What ``op``'s package states for the module of descriptor ``key``.
 
-    if atol == 0.0 and rtol == 0.0:
-        wrong = ~(
-            (result == expected) | ((result != result) & (expected != expected))
+        A key the manifest does not declare, or one its launch table refuses,
+        raises :class:`~tests.python.kernels.packages.RefusedLaunchError`
+        rather than passing as a launch of something else.
+        """
+        return self._launches(op, key, ARCHITECTURE)
+
+    def launch(self, op: str, key: str, programs: tuple, *words) -> None:
+        """Launch the module ``key`` names over ``programs``, with ``words``.
+
+        ``words`` are the launch's arguments in the order the operator packs
+        them; the compile-time values are the package's own.
+        """
+        stated = self.described(op, key)
+        assert len(words) == len(stated.words), (
+            f"{op} {key}: {len(words)} words launched, the signature states "
+            f"{len(stated.words)}: {stated.words}"
         )
-    else:
-        limits = torch.finfo(got.dtype)
-        if got.dtype == torch.bfloat16 and not DEVICE:
-            rtol += 2.0 * UNIT["bf16"]
-        with np.errstate(invalid="ignore"):
-            overflows = np.abs(expected) > limits.max
-        expected = np.where(overflows, np.copysign(np.inf, expected), expected)
+        stated.kernel[programs](*words, **stated.constexprs)
 
-        finite = np.isfinite(expected)
-        magnitude = np.abs(np.where(finite, expected, 0.0))
-        if cancels:
-            magnitude = np.full_like(magnitude, magnitude.max(initial=0.0))
-        allowed = atol + rtol * magnitude + limits.tiny * limits.eps
-        with np.errstate(invalid="ignore"):
-            close = np.abs(result - expected) <= allowed
-        # An infinity or a NaN has no neighbourhood: it is matched as it is.
-        same = (result == expected) | (
-            (result != result) & (expected != expected)
-        )
-        wrong = ~np.where(finite, close, same)
+    def tensor(self, data, dtype: str) -> torch.Tensor:
+        """``data`` as a contiguous tensor of ``dtype`` on the device."""
+        return torch.as_tensor(data).to(element(dtype)).to(self.device)
 
-    if wrong.any():
-        at = tuple(int(axis) for axis in np.argwhere(wrong)[0])
-        raise SystemExit(
-            f"{label}: {int(wrong.sum())} of {result.size} elements outside "
-            f"atol {atol:.3e} rtol {rtol:.3e}; first at {at}: got "
-            f"{result[at]!r}, expected {expected[at]!r}"
+    def values(
+        self, dtype: str, shape, seed: int, scale: float = 3.0
+    ) -> torch.Tensor:
+        """A contiguous tensor of ``dtype`` values drawn from one seed.
+
+        A floating tensor is normal with deviation ``scale``; an integer one is
+        uniform over a range its element type holds, both signs where it has
+        one. An element type that only moves is uniform over every byte, which
+        holds its NaNs, both zeros and its largest values.
+        """
+        generator = torch.Generator().manual_seed(seed)
+        if dtype in MOVED:
+            drawn = torch.randint(0, 256, shape, generator=generator)
+            return self.tensor(drawn, dtype)
+        if dtype in FLOATS:
+            drawn = torch.randn(shape, generator=generator, dtype=torch.float64)
+            return self.tensor(drawn * scale, dtype)
+        low = 0 if dtype in ("u8", "u32") else -100
+        return self.tensor(
+            torch.randint(low, 101, shape, generator=generator), dtype
         )
-    return int(result.size)
+
+    def empty(self, shape, element: torch.dtype) -> torch.Tensor:
+        """An output of ``shape`` for a launch to write, on the device."""
+        return torch.empty(tuple(shape), dtype=element, device=self.device)
+
+    def view(self, layout: str, dtype: str, seed: int, make=None):
+        """The input of :data:`LAYOUTS` entry ``layout``, its values drawn by
+        ``make(dtype, shape, seed)`` (:meth:`values` when unset).
+        """  # noqa: D205
+        shape, offset, take = LAYOUTS[layout]
+        return take((make or self.values)(dtype, shape, seed + offset))
+
+    def assert_close(
+        self, label: str, got: torch.Tensor, expected: np.ndarray, bound
+    ) -> None:
+        """Hold ``got`` to ``bound`` around ``expected``, element for element.
+
+        ``expected`` is the exact value of each element in float64 or int64. A
+        bound of zero is equality, with a NaN equal to a NaN; any other bound
+        is ``|got - expected| <= atol + rtol * magnitude``, the magnitude being
+        the element's own or, for a bound that cancels, the output's largest.
+        A BF16 output on the interpreter gains the store's truncation (module
+        docstring).
+
+        A rounding bound is relative, which holds where the element type's
+        values are: a value past its largest finite one is stored as an
+        infinity, and below its smallest normal one the type's grid is
+        uniform, so the comparison there allows one step of that grid.
+        """
+        result = real(got)
+        expected = np.asarray(expected).reshape(result.shape)
+        atol, rtol, cancels = bound
+
+        if atol == 0.0 and rtol == 0.0:
+            wrong = ~(
+                (result == expected)
+                | ((result != result) & (expected != expected))
+            )
+        else:
+            limits = torch.finfo(got.dtype)
+            if got.dtype == torch.bfloat16 and self.interpreted:
+                rtol += 2.0 * UNIT["bf16"]
+            with np.errstate(invalid="ignore"):
+                overflows = np.abs(expected) > limits.max
+            expected = np.where(
+                overflows, np.copysign(np.inf, expected), expected
+            )
+
+            finite = np.isfinite(expected)
+            magnitude = np.abs(np.where(finite, expected, 0.0))
+            if cancels:
+                magnitude = np.full_like(magnitude, magnitude.max(initial=0.0))
+            allowed = atol + rtol * magnitude + limits.tiny * limits.eps
+            with np.errstate(invalid="ignore"):
+                close = np.abs(result - expected) <= allowed
+            # An infinity or a NaN has no neighbourhood: it is matched as it
+            # is.
+            same = (result == expected) | (
+                (result != result) & (expected != expected)
+            )
+            wrong = ~np.where(finite, close, same)
+
+        if wrong.any():
+            at = tuple(int(axis) for axis in np.argwhere(wrong)[0])
+            raise AssertionError(
+                f"{label}: {int(wrong.sum())} of {result.size} elements "
+                f"outside atol {atol:.3e} rtol {rtol:.3e}; first at {at}: got "
+                f"{result[at]!r}, expected {expected[at]!r}"
+            )

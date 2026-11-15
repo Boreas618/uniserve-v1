@@ -78,7 +78,7 @@ The source kind selects how the package states its compilation:
 
 The Build Server then checks the module its manifest's form requires: a cubin whose metadata names its kernel, or a native library that defines every C entry it is launched through.
 
-`python -m uniserve_build_server` and `uniserve-build-server` are one program. Outside a build, `uniserve_build_server.triton.stated_for` computes what a Triton package's launch table states for a key, with the typed fields the Build Server's reader gives (`uniserve build-server fields`), for a check that launches a package's kernel on Triton's interpreter.
+`python -m uniserve_build_server` and `uniserve-build-server` are one program.
 
 ## A package's launches outside a build
 

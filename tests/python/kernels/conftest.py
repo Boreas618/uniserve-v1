@@ -12,10 +12,10 @@ operator.
 covers are parameters (``pytest.mark.parametrize``, with readable ids): the
 cases it states, and of each descriptor option the values it states it
 covers, each marked for the mode it runs in. Each assertion carries the
-measured error and the bound it was held to. A
-bound, a tolerance and a reference are the operator's (``crates/ops/src``) and
-are written once, beside the check that uses them. A launch of a kernel is
-written once per module, in one function the tests call.
+measured error and the bound it was held to. A bound, a tolerance and a
+reference are the operator's (``crates/ops/src``) and are written once,
+beside the check that uses them. A launch of a kernel is written once per
+module, in one function the tests call.
 
 **Where the kernels run.** ``--kernel-device`` (registered in
 ``tests/python/conftest.py``) chooses once per session: ``interpreter``, the
