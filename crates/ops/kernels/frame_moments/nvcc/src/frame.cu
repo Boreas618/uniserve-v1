@@ -9,27 +9,29 @@
 // [frames, channels, pixels] tensor PyTorch normalizes. The result is therefore bit
 // for bit PyTorch's, which is what the embedding that consumes it relies on.
 //
-// The device code uses vendored counterparts of the ATen operator and the ATen
-// reduction, and launches on the call's stream.
+// The Welford operator and the warp and block reductions are ATen's own, from the headers
+// of the torch distribution the Build Server's environment locks
+// (`ATen/native/SharedReduceOps.h`, `ATen/native/cuda/block_reduce.cuh`). They are templates
+// defined in their headers, so the module compiles them and links nothing of torch: the
+// serving process loads it without one. The kernel launches on the call's stream.
 
+#include <ATen/native/SharedReduceOps.h>
+#include <ATen/native/cuda/block_reduce.cuh>
 #include <cuda_runtime.h>
+#include <thrust/pair.h>
 
 #include <cstdint>
 #include <cstdio>
 
-#include "aten_block_reduce.cuh"
-#include "uniserve_frame_moments.h"
+#include <uniserve_frame_moments.h>
 
 namespace {
 
-using uniserve::block_reduce;
-using uniserve::kCudaBlockReduceNumThreads;
-using uniserve::kCudaWarpSize;
-using uniserve::kCudaWarpSizeUpperBound;
-using uniserve::warp_reduce;
-using uniserve::variance_and_mean;
-using uniserve::welford_data;
-using uniserve::welford_ops;
+using at::native::WelfordData;
+using at::native::WelfordOps;
+using at::native::cuda_utils::BlockReduce;
+using at::native::cuda_utils::kCUDABlockReduceNumThreads;
+using at::native::cuda_utils::WarpReduce;
 
 // Elements each thread of the moments kernel loads ahead of reducing them.
 constexpr int kMomentLoads = 8;
@@ -45,8 +47,10 @@ __global__ void frame_moments_kernel(const float* values, int64_t stride_batch,
                                      int64_t stride_pixel, int64_t frames, int64_t pixels,
                                      int64_t channels_per_group, int64_t groups, float eps,
                                      float* mean, float* rstd) {
-  using WelfordType = welford_data<float, int64_t>;
-  using WelfordOp = welford_ops<float, float, int64_t, variance_and_mean>;
+  using WelfordType = WelfordData<float, int64_t>;
+  // The projection's pair is ATen's device pair type (`at::native::detail::pair`), which a
+  // device function may return: the variance, then the mean.
+  using WelfordOp = WelfordOps<float, float, int64_t, thrust::pair<float, float>>;
 
   const int64_t i = blockIdx.x;
   const int64_t folded = i / groups;
@@ -90,17 +94,17 @@ __global__ void frame_moments_kernel(const float* values, int64_t stride_batch,
       }
     }
   }
-  if (blockDim.x <= kCudaWarpSize) {
-    val = warp_reduce(val, welford_op);
+  if (blockDim.x <= C10_WARP_SIZE) {
+    val = WarpReduce(val, welford_op);
   } else {
-    alignas(WelfordType) __shared__ char val_shared[sizeof(WelfordType) * kCudaWarpSizeUpperBound];
+    alignas(WelfordType) __shared__ char val_shared[sizeof(WelfordType) * C10_WARP_SIZE_UPPER_BOUND];
     WelfordType* val_shared_ptr = reinterpret_cast<WelfordType*>(val_shared);
-    val = block_reduce(val, welford_op, WelfordType(0, 0, 0, 0), val_shared_ptr);
+    val = BlockReduce(val, welford_op, WelfordType(0, 0, 0, 0), val_shared_ptr);
   }
   if (threadIdx.x == 0) {
-    const variance_and_mean projected = welford_op.project(val);
-    mean[i] = projected.mean;
-    rstd[i] = ::rsqrtf(projected.variance + eps);
+    const auto [variance, row_mean] = welford_op.project(val);
+    mean[i] = row_mean;
+    rstd[i] = ::rsqrtf(variance + eps);
   }
 }
 
@@ -142,7 +146,7 @@ extern "C" int32_t uniserve_frame_moments(const uniserve_frame_moments_call* cal
   // PyTorch's launch width, which fixes the reduction tree: one warp for a row a
   // warp already spans, its 512-thread block otherwise.
   const int64_t threads =
-      row_length < kCudaBlockReduceNumThreads ? kCudaWarpSize : kCudaBlockReduceNumThreads;
+      row_length < kCUDABlockReduceNumThreads ? C10_WARP_SIZE : kCUDABlockReduceNumThreads;
   // The call structure carries no sample count, so the grid is one sample's rows. The
   // operator's caller runs one video sample per call; a call that batched several would
   // need the count in the structure.
