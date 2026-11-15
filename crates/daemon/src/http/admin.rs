@@ -131,7 +131,8 @@ impl Journal {
     }
 
     /// The event log and the operations' record, for the successor of a hot restart to go on
-    /// with ([`Journal::resume`]). No operation starts here from then on.
+    /// with ([`Journal::resume`]). No operation starts and no event is recorded here from then
+    /// on.
     pub(crate) fn hand_over(&self) -> JournalHandoff {
         self.handoff_sent.store(true, Ordering::Release);
         JournalHandoff {
@@ -143,7 +144,14 @@ impl Journal {
     }
 
     /// Appends an event of category and data `body`, and wakes the readers that wait for one.
+    ///
+    /// A journal handed to a successor records nothing more: the successor's journal, which
+    /// goes on from the same sequence numbers, is the node's log from then on, so a reader
+    /// that reaches the successor reads one sequence without another daemon's events between.
     pub(crate) fn record(&self, body: EventBody, message: impl Into<String>) {
+        if self.handoff_sent.load(Ordering::Acquire) {
+            return;
+        }
         let mut events = service::lock(&self.events);
         if events.len() == self.log.capacity.get() {
             events.pop_front();
@@ -1215,7 +1223,8 @@ mod tests {
     }
 
     /// One operation runs at a time; its start and end are events that carry it, and a journal
-    /// handed to a successor starts none.
+    /// handed to a successor starts none and records nothing more, while the successor goes on
+    /// from the same numbers.
     #[tokio::test]
     async fn one_operation_runs_at_a_time_and_its_events_carry_it() {
         let journal = journal();
@@ -1238,7 +1247,11 @@ mod tests {
             journal.begin(OperationKind::FlushCache),
             Err(Refusal::HandedOver)
         ));
+        journal.record(EventBody::Deployment, "after the handover");
+        assert_eq!(journal.events_after(0, Duration::ZERO).await, page);
         let next = successor.begin(OperationKind::FlushCache).unwrap();
         assert_eq!(next.id, 2);
+        let resumed = successor.events_after(page.next, Duration::ZERO).await;
+        assert_eq!(resumed.events[0].seq, page.next + 1);
     }
 }
