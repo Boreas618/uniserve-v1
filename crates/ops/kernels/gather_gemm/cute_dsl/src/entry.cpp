@@ -31,6 +31,13 @@ int32_t launch(const uniserve_gather_call* call, void* stream) {
   if (call->width % 2 != 0) {
     return cute_dsl_refuse(call, "gather_gemm needs an even 2*intermediate width");
   }
+  // The persistent grid keeps one CTA on every multiprocessor of the device
+  // the stream runs on, so its bound is that device's count.
+  int32_t multiprocessors = 0;
+  if (cute_dsl_multiprocessors(reinterpret_cast<cudaStream_t>(stream), &multiprocessors) !=
+      cudaSuccess) {
+    return cute_dsl_refuse(call, "gather_gemm cannot read its device's multiprocessor count");
+  }
   return cute_dsl_gather_gemm_wrapper(
       &cute_dsl_module<gather_gemm_Kernel_Module_t, gather_gemm_Kernel_Module_Load>(),
       const_cast<void*>(call->hidden),
@@ -45,6 +52,7 @@ int32_t launch(const uniserve_gather_call* call, void* stream) {
       call->width,
       call->hidden_size,
       call->experts,
+      multiprocessors,
       reinterpret_cast<cudaStream_t>(stream));
 }
 

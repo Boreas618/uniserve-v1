@@ -27,9 +27,3 @@ requires = ["tensor_memory"]
 # `intermediate` is a multiple of 64.
 [[kernel.descriptors]]
 dimensions = { hidden = { multiple = 64 }, intermediate = { multiple = 64 }, experts = { min = 1 }, top = { min = 1 }, activation = ["silu", "gelu_tanh"], dtype = ["bf16"], tile = ["128x128", "256x128", "128x256", "256x256"], cluster = ["1x1", "2x1", "1x2", "2x2"] }
-
-[parameters]
-# The persistent grid's bound, one cluster per multiprocessor. It is the largest multiprocessor
-# count of the parts this architecture serves, GB200's 152: a smaller bound leaves multiprocessors
-# idle, and on a part with fewer the CTAs past its count start as the first ones exit.
-max_active_clusters = 152

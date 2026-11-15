@@ -221,10 +221,10 @@ class GatherGroupedGemmKernel(GroupedGemm):
         tile_idx_to_mn_limit: cute.Tensor,
         token_id_mapping_tensor: cute.Tensor,
         num_non_exiting_tiles: cute.Tensor,
-        max_active_clusters: cutlass.Constexpr,
+        multiprocessors: cutlass.Int32,
         stream: cuda.CUstream,
     ):
-        """Launch the kernel on ``stream``.
+        """Launch the kernel on ``stream``, of ``multiprocessors``.
 
         ``a`` is the ``(T, K, 1)`` hidden states, gathered by
         ``token_id_mapping_tensor[row] // topk`` for every permuted row below
@@ -266,7 +266,7 @@ class GatherGroupedGemmKernel(GroupedGemm):
         self.tile_sched_params, grid = self._compute_grid(
             num_ctas_mnl,
             self.cluster_shape_mn,
-            max_active_clusters,
+            multiprocessors,
         )
 
         self.buffer_align_bytes = 1024
@@ -1601,8 +1601,8 @@ class GatherGroupedGemmKernel(GroupedGemm):
         n: cutlass.Int64,
         k: cutlass.Int64,
         experts: cutlass.Int64,
+        multiprocessors: cutlass.Int32,
         tile_size: cutlass.Constexpr,
-        max_active_clusters: cutlass.Constexpr,
         stream: cuda.CUstream,
     ):
         """Bind row-major pointers and launch.
@@ -1610,7 +1610,8 @@ class GatherGroupedGemmKernel(GroupedGemm):
         ``a`` is ``[tokens, k]``, ``b`` ``[experts, n, k]`` with each
         expert's ``n / 2`` up rows followed by its ``n / 2`` gate rows, ``c``
         ``[m, n / 2]``; the tile metadata holds ``m / tile_size`` entries and
-        ``token_id_mapping`` ``m``.
+        ``token_id_mapping`` ``m``. ``multiprocessors`` is the device's count,
+        which bounds the persistent grid.
         """
         num_tiles = m // tile_size
         a = cute.make_tensor(
@@ -1655,6 +1656,6 @@ class GatherGroupedGemmKernel(GroupedGemm):
             tile_idx_to_mn_limit,
             token_id_mapping,
             num_non_exiting_tiles,
-            max_active_clusters=max_active_clusters,
+            multiprocessors=multiprocessors,
             stream=stream,
         )

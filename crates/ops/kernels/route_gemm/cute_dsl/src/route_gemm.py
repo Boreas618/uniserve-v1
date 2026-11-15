@@ -182,10 +182,10 @@ class RouteGroupedGemmKernel(GroupedGemm):
         num_non_exiting_tiles: cute.Tensor,
         tile_idx_to_mn_limit: cute.Tensor,
         permuted_idx_to_expanded_idx: cute.Tensor,
-        max_active_clusters: cutlass.Constexpr,
+        multiprocessors: cutlass.Int32,
         stream: cuda.CUstream,
     ):
-        """Launch the kernel on ``stream``.
+        """Launch the kernel on ``stream``, of ``multiprocessors``.
 
         ``a`` is the ``(M, K, 1)`` permuted rows, ``b`` the ``(N, K, E)``
         expert weights, ``out`` the ``(R, N, 1)`` route rows written at
@@ -235,7 +235,7 @@ class RouteGroupedGemmKernel(GroupedGemm):
         self.tile_sched_params, grid = self._compute_grid(
             num_ctas_mnl,
             self.cluster_shape_mn,
-            max_active_clusters,
+            multiprocessors,
         )
 
         self.buffer_align_bytes = 1024
@@ -1217,15 +1217,16 @@ class RouteGroupedGemmKernel(GroupedGemm):
         k: cutlass.Int64,
         experts: cutlass.Int64,
         routes: cutlass.Int64,
+        multiprocessors: cutlass.Int32,
         tile_size: cutlass.Constexpr,
-        max_active_clusters: cutlass.Constexpr,
         stream: cuda.CUstream,
     ):
         """Bind row-major pointers and launch.
 
         ``a`` is ``[m, k]``, ``b`` ``[experts, n, k]`` and ``out``
         ``[routes, n]``; the tile metadata holds ``m / tile_size`` entries
-        and ``permuted_idx_to_expanded_idx`` ``m``.
+        and ``permuted_idx_to_expanded_idx`` ``m``. ``multiprocessors`` is the
+        device's count, which bounds the persistent grid.
         """
         num_tiles = m // tile_size
         a = cute.make_tensor(
@@ -1259,6 +1260,6 @@ class RouteGroupedGemmKernel(GroupedGemm):
             num_non_exiting_tiles,
             tile_idx_to_mn_limit,
             permuted_idx_to_expanded_idx,
-            max_active_clusters=max_active_clusters,
+            multiprocessors=multiprocessors,
             stream=stream,
         )

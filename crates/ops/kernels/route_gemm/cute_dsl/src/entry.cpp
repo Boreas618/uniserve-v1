@@ -26,6 +26,13 @@ int32_t launch(const uniserve_route_call* call, void* stream) {
   if (call->rows == nullptr || call->weights == nullptr || call->out == nullptr) {
     return cute_dsl_refuse(call, "route_gemm needs rows, weights and out");
   }
+  // The persistent grid keeps one CTA on every multiprocessor of the device
+  // the stream runs on, so its bound is that device's count.
+  int32_t multiprocessors = 0;
+  if (cute_dsl_multiprocessors(reinterpret_cast<cudaStream_t>(stream), &multiprocessors) !=
+      cudaSuccess) {
+    return cute_dsl_refuse(call, "route_gemm cannot read its device's multiprocessor count");
+  }
   // The wrapper's `n` is the output width (the model's hidden size, which the
   // call names `width`) and its `k` the contraction length (the intermediate
   // width); the rows are permuted in and out, so the wrapper's `m` and its output
@@ -44,6 +51,7 @@ int32_t launch(const uniserve_route_call* call, void* stream) {
       call->intermediate,
       call->experts,
       call->permuted_rows,
+      multiprocessors,
       reinterpret_cast<cudaStream_t>(stream));
 }
 

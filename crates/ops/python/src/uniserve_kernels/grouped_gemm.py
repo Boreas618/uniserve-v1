@@ -206,20 +206,23 @@ class GroupedGemm:
     def _compute_grid(
         num_ctas_mnl: tuple,
         cluster_shape_mn: tuple[int, int],
-        max_active_clusters: cutlass.Constexpr,
+        multiprocessors: cutlass.Int32,
     ) -> tuple[utils.PersistentTileSchedulerParams, tuple[int, int, int]]:
         """The persistent tile scheduler over ``num_ctas_mnl`` CTA tiles and
-        the grid of at most ``max_active_clusters`` clusters it runs on.
+        the grid it runs on, of the device's ``multiprocessors``.
 
-        Clusters raster along N, so a CTA's tiles visit the M tiles in rising
-        order and the scheduler warp stops at the first M tile at or past
-        ``num_non_exiting_tiles``.
+        A CTA fills a multiprocessor (occupancy 1), so the clusters that run
+        at once, and the persistent grid's bound, are the multiprocessors
+        over the CTAs of a cluster. Clusters raster along N, so a CTA's tiles
+        visit the M tiles in rising order and the scheduler warp stops at the
+        first M tile at or past ``num_non_exiting_tiles``.
         """  # noqa: D205
         cluster_shape_mnl = (*cluster_shape_mn, 1)
 
         tile_sched_params = utils.PersistentTileSchedulerParams(
             num_ctas_mnl, cluster_shape_mnl, raster_along_m=False
         )
+        max_active_clusters = multiprocessors // cute.size(cluster_shape_mn)
         grid = utils.StaticPersistentTileScheduler.get_grid_shape(
             tile_sched_params, max_active_clusters
         )

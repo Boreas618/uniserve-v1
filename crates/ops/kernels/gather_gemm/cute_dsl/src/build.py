@@ -53,12 +53,9 @@ def spec(request):
                 driver.scalar(cutlass.Int64),
                 driver.scalar(cutlass.Int64),
                 driver.scalar(cutlass.Int64),
+                # The multiprocessors of the device the launch runs on.
+                driver.scalar(cutlass.Int32),
             ],
-            {
-                "tile_size": tiler[0],
-                "max_active_clusters": int(
-                    request.parameters["max_active_clusters"]
-                ),
-            },
+            {"tile_size": tiler[0]},
         ),
     }
