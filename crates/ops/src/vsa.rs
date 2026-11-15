@@ -28,7 +28,7 @@ use crate::abi;
 use crate::descriptor::{Float, Key};
 use crate::kernel::{Arguments, Kernel, LaunchGrid};
 use crate::operand::Operand;
-use crate::tolerance::Tolerance;
+use crate::tolerance::{self, Tolerance};
 use crate::{Error, Op, Result, Twins};
 
 /// The rows one program handles at a time.
@@ -1174,11 +1174,13 @@ impl Op for VsaScores {
     }
 
     fn tolerance(descriptor: &Self::Descriptor) -> Tolerance {
-        // The standard bound for the contraction and nothing else: `width` products per score,
-        // accumulated in FP32 and written as FP32, with no activation between them — so the reduction
-        // length is the feature width and the output's rounding is the accumulator's (whose `u` is
-        // already in the bound at FP32).
-        Tolerance::dot(u64::from(descriptor.width), DType::F32, DType::F32)
+        // The bound for the contraction and nothing else: `width` products per score, accumulated
+        // in FP32 and written as FP32, with no activation between them — so the reduction length is
+        // the feature width and the output's rounding is the accumulator's (whose `u` is already in
+        // the bound at FP32). The products are three TF32 passes on the tensor cores, each within
+        // `(20 + 2⁻⁷)·u` of exact rather than FP32's `u`, which `tolerance::tf32x3` counts.
+        let width = u64::from(descriptor.width);
+        Tolerance::split_dot(width, tolerance::tf32x3(width), DType::F32, DType::F32)
     }
 }
 
@@ -1449,9 +1451,13 @@ impl Op for VsaCompressPooled {
         // features, both accumulated in FP32 with one rounding to the rows' element type. The
         // softmax's weights are a scale of positive terms and the sum is of bounded weights, so the
         // bound is the standard one over the longer reduction — the tile bound — with FP32
-        // accumulation and the output's own rounding.
-        Tolerance::dot(
-            u64::from(descriptor.max_tiles.max(descriptor.width)),
+        // accumulation and the output's own rounding. The weighted sum's products are three TF32
+        // passes on the tensor cores, each within `(20 + 2⁻⁷)·u` of exact rather than FP32's `u`,
+        // which `tolerance::tf32x3` counts.
+        let reduction = u64::from(descriptor.max_tiles.max(descriptor.width));
+        Tolerance::split_dot(
+            reduction,
+            tolerance::tf32x3(reduction),
             DType::F32,
             descriptor.dtype,
         )

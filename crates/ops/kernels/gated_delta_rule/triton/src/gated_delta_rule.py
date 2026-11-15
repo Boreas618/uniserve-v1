@@ -40,9 +40,11 @@ with another program. Two forms:
   columns holds ``2·CHUNK + 4·BLOCK`` tensor-memory columns on sm_100, which
   ``build.py`` checks against the 512 a multiprocessor has.
 
-Every intermediate is FP32 and the products run at FP32 accuracy on the tensor
-cores (``_product``: three TF32 passes into one accumulator); the output rounds
-once.
+Every intermediate and every sum is FP32, and the output rounds once. The
+recurrent walk multiplies in FP32; the chunked form multiplies on the tensor
+cores in three TF32 passes into one accumulator (``_product``), each product
+within ``3·2⁻²⁰`` of exact rather than FP32's ``2⁻²⁴``, which the operator's
+tolerance counts.
 
 The kernel body imports nothing but Triton: the operand checks and the launch
 stay with the operator's Rust side.
@@ -63,21 +65,32 @@ _TF32_BITS = tl.constexpr(0xFFFFE000)
 
 @triton.jit
 def _product(left, right):
-    """``left @ right`` of FP32 tiles at FP32 accuracy, on the tensor cores.
+    """``left @ right`` of FP32 tiles on the tensor cores, within ``3·2⁻²⁰``.
 
-    Each operand is split into its TF32 head and the rest, and the three products that matter
-    (head·head, rest·head, head·rest) accumulate into one sum: the dropped rest·rest term is
-    below FP32's resolution. The three passes run through one ``tl.dot`` site, because every
-    site holds its own tensor-memory accumulator on sm_100 and a chunk's products would
-    otherwise outgrow it. (Triton's own ``ieee`` and ``tf32x3`` either fall back to one TF32
-    pass for operands widened from a narrower load or need three accumulators.)
+    Each operand ``a`` is split into its head, ``a`` truncated to TF32
+    (``|a − head| < 2⁻¹⁰|a|``), and the rest ``a − head``, exact in FP32, which
+    the tensor cores read truncated to TF32 (within ``2⁻²⁰|a|``). The head·head,
+    rest·head and head·rest products are exact in FP32 and the dropped
+    rest·rest one is below ``2⁻²⁰|ab|``, so a product is within ``3·2⁻²⁰|ab|``
+    of exact (``chunked_roundings`` in ``ops::recurrent`` counts this and the
+    passes' additions). The passes of rests go first, so they sum below ``2⁻⁹``
+    of the result and the head·head pass adds to a small accumulator rather
+    than they to a full one.
+
+    The three passes run through one ``tl.dot`` site, because every site holds
+    its own tensor-memory accumulator on sm_100 and a chunk's products would
+    otherwise outgrow it. Triton's own modes do not serve: on sm_100 ``ieee``
+    lowers a product of an operand computed from a 16-bit load to a single
+    TF32 pass (``tcgen05.mma kind::tf32``), and ``tf32x3`` holds two
+    accumulators per site.
     """
     left_head = (left.to(tl.uint32, bitcast=True) & _TF32_BITS).to(tl.float32, bitcast=True)
     right_head = (right.to(tl.uint32, bitcast=True) & _TF32_BITS).to(tl.float32, bitcast=True)
     total = tl.zeros((left.shape[0], right.shape[1]), dtype=tl.float32)
+    # Parts 0 and 1 are rest·head and head·rest, part 2 head·head.
     for part in range(3):
-        a = tl.where(part == 1, left - left_head, left_head)
-        b = tl.where(part == 2, right - right_head, right_head)
+        a = tl.where(part == 0, left - left_head, left_head)
+        b = tl.where(part == 1, right - right_head, right_head)
         total = tl.dot(a, b, total, input_precision="tf32")
     return total
 

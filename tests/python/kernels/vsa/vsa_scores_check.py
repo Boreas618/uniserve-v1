@@ -1,22 +1,27 @@
 #!/usr/bin/env python3
 """Run vsa_scores' kernel and check every score it writes against the operator's product.
 
-The kernel is a per-head contraction, so its arithmetic is checkable without a device: Triton's
-interpreter executes the kernel body with numpy-backed tensors, one program at a time, and the
-result is compared with the operator's definition (``VsaScores`` in ``crates/ops/src/vsa.rs``) — one dot
-product per (head, query tile, key tile) over the pooled rows, accumulated in FP32 and scaled, with
-no softmax, over operands in the layout the pooling writes:
+The kernel is a per-head contraction, compared with the operator's definition (``VsaScores`` in
+``crates/ops/src/vsa.rs``) — one dot product per (head, query tile, key tile) over the pooled rows,
+accumulated in FP32 and scaled, with no softmax, over operands in the layout the pooling writes:
 
     scores[head, i, j] = Σ_w pooled_query[i, head, w] · pooled_key[j, head, w] / sqrt(width)
 
-    TRITON_INTERPRET=1 python scores_check.py [--package .] [--heads 3] [--width 128]
+    python vsa_scores_check.py [--package .]             # Triton's interpreter
+    python vsa_scores_check.py --device [--package .]    # a device
+
+Triton's interpreter executes the kernel body with numpy-backed tensors, one program at a time, and
+proves the indexing, the masks and the layout; its ``tl.dot`` is an FP32 product whatever the
+``input_precision``. The product's own precision is the tensor cores', so ``--device`` runs the
+module's extents on a GPU, where the three TF32 passes of ``tf32x3`` multiply.
 
 What is checked:
 
-* the scores themselves, at the operator's own bound — ``Tolerance::dot(width, f32, f32)``, the
-  standard bound for a ``width``-term contraction — computed here by torch in FP64 and rounded once,
-  so the reference is exact and the bound is what the operator declares;
-* a key-tile count that is not a multiple of the kernel's 16-tile step, so the step's mask is
+* the scores themselves, at the operator's own bound — ``Tolerance::split_dot(width,
+  tf32x3(width), f32, f32)``, the bound for a ``width``-term contraction with the three-pass
+  product's excess counted — computed here by torch in FP64 and rounded once, so the reference is
+  exact and the bound is what the operator declares;
+* a key-tile count that is not a multiple of the kernel's key step, so the step's mask is
   exercised rather than implied;
 * a contraction narrower than the block of lanes, so the lane mask is exercised — the case where a
   kernel that summed the whole block would still pass a width that fills it;
@@ -31,16 +36,20 @@ import os
 import pathlib
 import sys
 
+#: Triton reads `TRITON_INTERPRET` when it is imported, so the mode is chosen from the command line
+#: before the kernel is loaded: `--device` compiles for the device, anything else interprets.
+DEVICE = "--device" in sys.argv
+if not DEVICE:
+    os.environ["TRITON_INTERPRET"] = "1"
+
+import torch  # noqa: E402  (after TRITON_INTERPRET, which Triton reads at import)
+
 #: The kernel packages' root: this check lives in `tests/python/kernels/<family>/`.
 KERNELS = (
     pathlib.Path(__file__).resolve().parents[4] / "crates" / "ops" / "kernels"
 )
 #: The package this check covers.
 PACKAGE = KERNELS / "vsa_scores" / "triton"
-
-os.environ.setdefault("TRITON_INTERPRET", "1")
-
-import torch
 
 #: Unit roundoff of FP32, the accumulator the operator names.
 UNIT_ROUNDOFF = 2.0**-24
@@ -52,9 +61,14 @@ def gamma(reduction, unit=UNIT_ROUNDOFF):
     return 1.0 if terms >= 1.0 else terms / (1.0 - terms)
 
 
+def tf32x3(reduction):
+    """``ops::tolerance::tf32x3``: the roundings the three-pass product costs beyond FP32's."""
+    return 21 + -(-3 * reduction // 1024)
+
+
 def declared_bound(width):
-    """``Tolerance::dot(width, f32, f32)``'s ``rtol``, as ``VsaScores::tolerance`` declares it."""
-    return 2.0 * gamma(width) * width**0.5 + UNIT_ROUNDOFF
+    """``VsaScores::tolerance``: ``split_dot(width, tf32x3(width), f32, f32)``'s ``rtol``."""
+    return 2.0 * gamma(width + tf32x3(width)) * width**0.5 + UNIT_ROUNDOFF
 
 
 def load_kernel(package):
@@ -66,7 +80,18 @@ def load_kernel(package):
     return module
 
 
-def run(module, *, heads, width, block, query_tiles, key_tiles, seed=23):
+def run(
+    module,
+    *,
+    heads,
+    width,
+    block,
+    query_tiles,
+    key_tiles,
+    key_step=16,
+    seed=23,
+    device="cpu",
+):
     """Multiply one pair of pooled tilings and compare with the operator's product."""
     torch.manual_seed(seed)
     # Both operands are FP32: that is the type `vsa_prepare_tiles` pools a tile's per-head means
@@ -74,22 +99,26 @@ def run(module, *, heads, width, block, query_tiles, key_tiles, seed=23):
     query = torch.randn(query_tiles, heads, width, dtype=torch.float32)
     key = torch.randn(key_tiles, heads, width, dtype=torch.float32)
     out = torch.full(
-        (heads, query_tiles, key_tiles), float("nan"), dtype=torch.float32
+        (heads, query_tiles, key_tiles),
+        float("nan"),
+        dtype=torch.float32,
+        device=device,
     )
 
     module._vsa_scores_kernel[((query_tiles + 15) // 16, heads, 1)](
-        query,
-        key,
+        query.to(device),
+        key.to(device),
         out,
         query_tiles,
         key_tiles,
         0,
         WIDTH=width,
         BLOCK=block,
-        KEY_TILES=16,
+        KEY_TILES=key_step,
         QUERIES=16,
         PDL=False,
     )
+    out = out.cpu()
 
     # The reference: the same operands in FP64, rounded once into FP32.
     expected = (
@@ -136,27 +165,53 @@ def main():
         default=PACKAGE,
         help="the package directory holding src/vsa_scores.py",
     )
+    parser.add_argument(
+        "--device", action="store_true", help="run on a CUDA device"
+    )
     options = parser.parse_args()
-    if os.environ.get("TRITON_INTERPRET") != "1":
-        raise SystemExit(
-            "run this with TRITON_INTERPRET=1: the kernel is checked on the CPU"
-        )
     module = load_kernel(options.package)
 
     checked = 0
-    # The fixture's cell, then the two edges: a key count that is not a multiple of the 16-tile
-    # step, and a contraction narrower than the block of lanes.
-    checked += run(
-        module, heads=2, width=128, block=128, query_tiles=3, key_tiles=7
-    )
-    checked += run(
-        module, heads=3, width=64, block=128, query_tiles=2, key_tiles=5
-    )
-    checked += run(
-        module, heads=1, width=32, block=128, query_tiles=4, key_tiles=20
-    )
+    if options.device:
+        # The module's own extents (`build.py`: a key step of 32, sixteen query tiles a program),
+        # which the tensor cores need at least sixteen wide: query and key tile counts that fill
+        # no step, and a contraction narrower than its lanes.
+        checked += run(
+            module,
+            heads=2,
+            width=128,
+            block=128,
+            query_tiles=37,
+            key_tiles=70,
+            key_step=32,
+            device="cuda",
+        )
+        checked += run(
+            module,
+            heads=3,
+            width=96,
+            block=128,
+            query_tiles=20,
+            key_tiles=45,
+            key_step=32,
+            device="cuda",
+        )
+        where = "the device"
+    else:
+        # The fixture's cell, then the two edges: a key count that is not a multiple of the 16-tile
+        # step, and a contraction narrower than the block of lanes.
+        checked += run(
+            module, heads=2, width=128, block=128, query_tiles=3, key_tiles=7
+        )
+        checked += run(
+            module, heads=3, width=64, block=128, query_tiles=2, key_tiles=5
+        )
+        checked += run(
+            module, heads=1, width=32, block=128, query_tiles=4, key_tiles=20
+        )
+        where = "the interpreter"
     print(
-        f"ok: {checked} scores within the contraction's bound, both masks exercised"
+        f"ok on {where}: {checked} scores within the contraction's bound, both masks exercised"
     )
     return 0
 

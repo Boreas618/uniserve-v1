@@ -15,11 +15,15 @@ The reference is the recurrence itself in FP64, token by token, from the same ro
 (transformers' `torch_recurrent_gated_delta_rule`, with the gating and the l2 norm of
 `Qwen3_5MoeGatedDeltaNet.forward`). Each output is compared against the largest magnitude of the
 reference output in its value head, because a head's outputs are dot products that cancel. The
-bound follows the arithmetic: the program's sums are FP32 (the dots at FP32 accuracy), a state
-element is a decayed sum of rank-one updates whose rounding no later step amplifies
-(`I − β k̂k̂ᵀ` has norm at most one and the decay at most one), and the output rounds once:
+bound follows the arithmetic: the program's sums are FP32, a state element is a decayed sum of
+rank-one updates whose rounding no later step amplifies (`I − β k̂k̂ᵀ` has norm at most one and
+the decay at most one), and the output rounds once:
 
-    |o − ô| ≤ 2 · (2 γ_dk √dk + u_out) · max|o|          (`ops::recurrent::GatedDeltaRule`'s bound)
+    |o − ô| ≤ 2 · (2 γ_(dk+e) √dk + u_out) · max|o|      (`ops::recurrent::GatedDeltaRule`'s bound)
+
+The recurrent walk's products are FP32 ones (`e = 0`); the chunked form's are three TF32 passes
+of truncated splits on the tensor cores, each within `3·2⁻²⁰` of exact, and its passes of rests
+are summed first, which costs `e = 48 + ⌈3·dk/512⌉` roundings more (`chunked_roundings`).
 
 The states, the checkpoints and the zero rows of the padding row are checked too: a state against
 the largest magnitude of its head's reference state at the same FP32 bound, a padding row's output
@@ -66,9 +70,11 @@ TORCH_TYPES = {"bf16": torch.bfloat16, "f32": torch.float32}
 UNIT_ROUNDOFF = {"bf16": 2.0**-8, "f32": 2.0**-24}
 
 
-def bound(key_dim, dtype):
-    """The operator's relative bound against a head's largest output."""
-    gamma = key_dim * 2.0**-24 / (1 - key_dim * 2.0**-24)
+def bound(key_dim, dtype, chunk):
+    """The operator's relative bound against a head's largest output, for a form's chunk."""
+    extra = 0 if chunk == 1 else 48 + -(-3 * key_dim // 512)
+    terms = (key_dim + extra) * 2.0**-24
+    gamma = terms / (1 - terms)
     return 2.0 * (2.0 * gamma * math.sqrt(key_dim) + UNIT_ROUNDOFF[dtype])
 
 
@@ -194,9 +200,9 @@ def run(case, device, failures, report):
         return torch.tensor(values, dtype=torch.int32, device=device)
 
     seq_lens = [start + length for start, length in zip(starts, lengths)]
-    relative = bound(dk, case["dtype"])
-    state_relative = bound(dk, "f32")
     for form, chunk in case["forms"]:
+        relative = bound(dk, case["dtype"], chunk)
+        state_relative = bound(dk, "f32", chunk)
         # Only the recurrent walk keeps a trail.
         trailing = case.get("trailing", False) and chunk == 1
         state = initial.clone().to(device)

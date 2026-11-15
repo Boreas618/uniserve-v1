@@ -1,7 +1,8 @@
 """The video sparse attention helpers' kernels against their references.
 
 Three of them pin their rounding with inline PTX, which the interpreter cannot
-execute, so they are checked on a device only.
+execute, so they are checked on a device only. Two multiply on the tensor cores,
+whose products the interpreter computes in FP32, so they are checked on both.
 """
 
 import pathlib
@@ -39,6 +40,20 @@ def test_a_vsa_kernel_matches_its_reference_on_the_interpreter(check):
 @pytest.mark.parametrize("check", DEVICE)
 def test_a_vsa_kernel_rounds_as_its_reference_on_the_device(check):
     on_device(FAMILY / check)
+
+
+#: The checks whose products run on the tensor cores, where the interpreter's
+#: FP32 `tl.dot` cannot show the products' precision.
+PRODUCTS = (
+    "vsa_compress_pooled_check.py",
+    "vsa_scores_check.py",
+)
+
+
+@pytest.mark.gpu
+@pytest.mark.parametrize("check", PRODUCTS)
+def test_a_vsa_product_meets_its_bound_on_the_device(check):
+    on_device(FAMILY / check, "--device")
 
 
 #: The operators whose dependent launch `pdl_chain_check.py` checks.

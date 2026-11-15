@@ -820,13 +820,34 @@ impl Op for GatedDeltaRule {
         // itself a decayed sum of rank-one updates; two implementations differ by their FP32
         // association of those sums and by the one rounding into the output type. The update's
         // inner product `k̂ᵀS` has the same length, so the bound is that of a dot product over the
-        // key width, applied twice.
-        let dot = Tolerance::dot(u64::from(descriptor.key_dim), DType::F32, descriptor.dtype);
+        // key width, applied twice. The recurrent walk's products are FP32 ones; the chunked form's
+        // are split TF32 products on the tensor cores, whose excess `chunked_roundings` counts.
+        let key_dim = u64::from(descriptor.key_dim);
+        let extra = match descriptor.form {
+            Form::Recurrent => 0,
+            Form::Chunked => chunked_roundings(key_dim),
+        };
+        let dot = Tolerance::split_dot(key_dim, extra, DType::F32, descriptor.dtype);
         Tolerance {
             rtol: 2.0 * dot.rtol,
             ..dot
         }
     }
+}
+
+/// The roundings beyond an `n`-term FP32 dot product's that a product of the chunked form costs:
+/// `48 + ⌈3n/512⌉`, the `extra` of [`Tolerance::split_dot`].
+///
+/// The package's `_product` splits each FP32 operand `a` into its head, `a` truncated to TF32
+/// (eleven significant bits, so `|a − head| < 2⁻¹⁰|a|` and `|head| ≤ |a|`), and the rest `a − head`,
+/// exact in FP32, which the tensor cores read truncated to TF32 (within `2⁻¹⁰` of the rest, `2⁻²⁰`
+/// of `a`). The head·head, rest·head and head·rest products are exact in FP32 and the rest·rest
+/// one, below `2⁻²⁰|ab|`, is dropped, so a product is within `3·2⁻²⁰|ab| = 48·u·|ab|` of exact,
+/// `u = 2⁻²⁴`. The two passes of rests are summed first, into partial sums below
+/// `2⁻⁹·Σ|aᵢbᵢ|`, so the `3n` additions cost `n·(1 + 3·2⁻⁹)·u·Σ|aᵢbᵢ|` where an FP32 dot
+/// product's bound counts `n·u·Σ|aᵢbᵢ|`.
+fn chunked_roundings(reduction: u64) -> u64 {
+    48 + (3 * reduction).div_ceil(512)
 }
 
 #[cfg(test)]

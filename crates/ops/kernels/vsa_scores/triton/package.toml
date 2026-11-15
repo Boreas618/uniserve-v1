@@ -3,8 +3,9 @@
 # The step between VSA's pooling and its selection: one dot product per (head, query tile, key tile)
 # over the pooled per-head means, written as the contiguous FP32
 # [heads, query tiles, key tiles] matrix the selection reads. No scale and no softmax — the caller
-# applies both — so the value is the raw sum of `width` products, accumulated in FP32, and the
-# operator's tolerance is the contraction's own bound.
+# applies both — so the value is the raw sum of `width` products, accumulated in FP32. The products
+# are Triton's three-pass TF32 ones, each within (20 + 2^-7)·2^-24 of exact, and the operator's
+# tolerance is the contraction's bound with that excess counted.
 
 op = "vsa_scores"
 backend = "triton"

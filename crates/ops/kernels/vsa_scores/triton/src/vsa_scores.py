@@ -11,14 +11,16 @@ scores[head, i, j] = Σ_w pooled_query[i, head, w] · pooled_key[j, head, w] / s
 The operands are in the layout ``vsa_prepare_tiles`` writes, a tile first. The scale is the
 reference's: the selection only compares, but the compression's softmax reads these same scores.
 There is no softmax here. Both operands are FP32 — the type ``vsa_prepare_tiles`` pools a tile's
-per-head means in — and the products accumulate in FP32, which is the operator's tolerance: the
-standard bound for a ``width``-term contraction.
+per-head means in — and the products accumulate in FP32.
 
-A program is one block of ``QUERIES`` query tiles of one head: it holds their rows and walks the key
-tiles ``KEY_TILES`` at a time as one matrix step in three TF32 products, whose error at these widths
-matches FP32's against an FP64 product (2.8e-6 and 3.5e-6 at 544 tiles, 14 heads and width 128) at an
-eighth of the time of the FP32 step. A key row is read once per block of queries. The destination is the contiguous ``[heads, query tiles, key tiles]`` matrix
-the selection reads, which the operator requires and nothing else may be.
+A program is one block of ``QUERIES`` query tiles of one head: it holds their
+rows and walks the key tiles ``KEY_TILES`` at a time as one matrix step of
+Triton's ``tf32x3`` product, at an eighth of the time of the FP32 step. Its
+three TF32 passes keep each product within ``(20 + 2⁻⁷)·2⁻²⁴`` of exact rather
+than FP32's ``2⁻²⁴``, an excess the operator's tolerance counts
+(``ops::tolerance::tf32x3``). A key row is read once per block of queries. The
+destination is the contiguous ``[heads, query tiles, key tiles]`` matrix the
+selection reads, which the operator requires and nothing else may be.
 """
 
 import triton

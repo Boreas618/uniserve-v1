@@ -35,6 +35,10 @@
 //!   inequality, not a relaxation of it. One element of such an output can cancel far below its
 //!   own `Σ|aᵢbᵢ|`, so the bound is taken against the largest magnitude of the output it belongs
 //!   to, which is the same order as that sum, rather than against the element's own value.
+//! - [`Tolerance::split_dot`] is [`Tolerance::dot`] for products that each err by more than the
+//!   one rounding an FP32 product makes — a tensor-core product of FP32 operands split into TF32
+//!   parts — with the excess counted as further terms of the reduction ([`tf32x3`] counts Triton's
+//!   three-pass product).
 //! - [`Tolerance::exact`] is for an operator that only moves values: a gather, a scatter, a sort of
 //!   indices. Two implementations of a copy agree bit for bit.
 //!
@@ -87,11 +91,22 @@ impl Tolerance {
     /// `2γₙ(u)√n + u_out`: two implementations of a sum of mixed-sign products, with the reduction
     /// accumulated in `accumulate` and rounded once to `output`.
     pub fn dot(reduction: u64, accumulate: DType, output: DType) -> Self {
-        let reduction = reduction as f64;
+        Self::split_dot(reduction, 0, accumulate, output)
+    }
+
+    /// `2γₙ₊ₑ(u)√n + u_out`: [`Tolerance::dot`] for products that each cost `extra` roundings of
+    /// `accumulate` beyond what an `n`-term FP32 dot product's bound counts.
+    ///
+    /// A product within `k·u` of exact is `(1 + θₖ)` times it, and such factors compose with the
+    /// reduction's own into `γ` of the summed counts (Higham, *Accuracy and Stability of Numerical
+    /// Algorithms*, 2nd ed., Lemma 3.3), so a product's excess error lengthens the reduction `γ`
+    /// is taken over. The `√n` that relates `Σ|aᵢbᵢ|` to the result stays the count of products.
+    pub fn split_dot(reduction: u64, extra: u64, accumulate: DType, output: DType) -> Self {
+        let products = reduction as f64;
         Self {
             atol: 0.0,
             rtol: relative(
-                2.0 * gamma(reduction as u64, accumulate) * reduction.sqrt()
+                2.0 * gamma(reduction + extra, accumulate) * products.sqrt()
                     + unit_roundoff(output),
             ),
             cancels: true,
@@ -164,6 +179,22 @@ pub fn gamma(reduction: u64, accumulate: DType) -> f64 {
     } else {
         terms / (1.0 - terms)
     }
+}
+
+/// The roundings beyond an `n`-term FP32 dot product's that Triton's `tf32x3` product costs:
+/// `21 + ⌈3n/1024⌉`, the `extra` of [`Tolerance::split_dot`].
+///
+/// `tl.dot(…, input_precision="tf32x3")` splits each FP32 operand `a` into its head, `a` rounded
+/// to the nearest TF32 (`cvt.rna.tf32.f32`, eleven significant bits, so `|a − head| ≤ 2⁻¹¹|a|`),
+/// and the rest `a − head`, exact in FP32, which the tensor cores read truncated to TF32 (within
+/// `2⁻¹⁰` of the rest, `2⁻²¹` of `a`). The head·head, rest·head and head·rest products are exact
+/// in FP32 and the rest·rest one, at most `2⁻²²|ab|`, is dropped, so a product is within
+/// `(20 + 2⁻⁷)·u·|ab|` of exact, `u = 2⁻²⁴`. The two passes of rests are summed first, into
+/// partial sums below `2⁻¹⁰(1 + 2⁻¹¹)·Σ|aᵢbᵢ|`, so the `3n` additions cost
+/// `n·(1 + 3·2⁻¹⁰(1 + 2⁻¹¹))·u·Σ|aᵢbᵢ|` where an FP32 dot product's bound counts `n·u·Σ|aᵢbᵢ|`.
+/// Both excesses together lie below `(21 + ⌈3n/1024⌉)·u·Σ|aᵢbᵢ|`.
+pub fn tf32x3(reduction: u64) -> u64 {
+    21 + (3 * reduction).div_ceil(1024)
 }
 
 /// An `f64` bound as the `f32` a tolerance is stored in.

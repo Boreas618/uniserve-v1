@@ -15,15 +15,18 @@ weighs only the keys it has. A tile with no live key contributes nothing: its sc
 
 Both operands are FP32 (``vsa_prepare_tiles`` pools a tile's per-head means in FP32 and the
 reference's softmax runs in FP32) and the sum accumulates in FP32; only the store narrows, to the
-attention's own row type, which is the descriptor's `dtype`. That is the operator's tolerance: the
-standard bound over the longer of the two reductions, the tile bound and the width.
+attention's own row type, which is the descriptor's `dtype`. The operator's
+tolerance is the bound over the longer of the two reductions, the tile bound
+and the width, with the products' excess counted (below).
 
 A program is one block of ``QUERIES`` query tiles of one head. It walks the key tiles ``KEYS`` at a
 time with a running softmax, so every pooled value row is read once per block of queries rather
 than once per query tile: reading them per query tile made this the largest kernel of a denoising
 step. The running form is the exact softmax up to rounding: the maximum so far rescales what was
-already summed, and the sum divides once at the end. The product is one matrix step in three TF32
-products, whose error matches an FP32 product's, as `vsa_scores` measures it.
+already summed, and the sum divides once at the end. The weighted sum is one
+matrix step of Triton's ``tf32x3`` product: its three TF32 passes keep each
+product within ``(20 + 2⁻⁷)·2⁻²⁴`` of exact rather than FP32's ``2⁻²⁴``, an
+excess the operator's tolerance counts (``ops::tolerance::tf32x3``).
 """
 
 import triton
