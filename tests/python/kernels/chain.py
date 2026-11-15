@@ -3,10 +3,14 @@
 A module compiled for PDL (`launch_pdl`) may start while the grid before it on
 the stream is still running: the producer's `gdc_launch_dependents` lets it
 begin, and only its own `gdc_wait` holds its reads back until the producer's
-writes are complete and visible. Each family's `pdl_chain_check.py` runs its
-operators through :func:`check` behind a producer that releases its dependent
-at once and writes the operator's inputs only after a delay, so an operator
-that reads before it waits computes from the inputs' previous contents.
+writes are complete and visible. :func:`check` runs an operator behind a
+producer that releases its dependent at once and writes the operator's inputs
+only after a delay, so an operator that reads before it waits computes from
+the inputs' previous contents. An operator's check module runs its case
+through :func:`check` in a test marked `gpu` and asserts that no round
+differed; a family whose checks are scripts runs its cases from its
+`pdl_chain_check.py` through :func:`main`, which imports the operators'
+sources with :func:`source`.
 
 A case states one operator: the inputs it reads, the buffers it writes (with
 their starting contents, since some operators read them too) and a launch. The
@@ -180,7 +184,7 @@ def check(case: Case) -> int:
     reset()
     torch.cuda.synchronize()
     if _equal(case.launch(views, outputs, False), reference):
-        raise SystemExit(
+        raise AssertionError(
             f"{case.name}: the result on zeroed inputs is the reference"
         )
 

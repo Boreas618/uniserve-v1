@@ -9,8 +9,10 @@ over two layouts) is one module named for them, parametrized over the
 operator.
 
 **Layout of a module.** ``pytestmark = pytest.mark.unit``; the cases a check
-covers are parameters (``pytest.mark.parametrize``, with readable ids), and
-each assertion carries the measured error and the bound it was held to. A
+covers are parameters (``pytest.mark.parametrize``, with readable ids): the
+cases it states, and of each descriptor option the values it states it
+covers, each marked for the mode it runs in. Each assertion carries the
+measured error and the bound it was held to. A
 bound, a tolerance and a reference are the operator's (``crates/ops/src``) and
 are written once, beside the check that uses them. A launch of a kernel is
 written once per module, in one function the tests call.
