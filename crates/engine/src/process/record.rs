@@ -27,8 +27,9 @@ use crate::process::ranks::rank::ModelRunner;
 pub type Recorded = BTreeMap<String, BTreeSet<String>>;
 
 /// Records the kernels the main process `launch` describes would launch: the union of its ranks'
-/// profiled keys. Its checkpoint is served by the family of `registry` that claims the class it
-/// declares.
+/// profiled keys, and the range markers' kernels when the deployment places markers
+/// (`crate::profiling::markers::keys`). Its checkpoint is served by the family of `registry` that
+/// claims the class it declares.
 ///
 /// # Errors
 ///
@@ -54,6 +55,18 @@ pub fn record(launch: &EngineArgs, registry: &nn::family::Registry) -> Result<Re
             keys = rank.keys.len(),
             "the rank's profile run recorded its kernels"
         );
+    }
+
+    // The markers' kernels are the process's, installed on every device it serves before the
+    // warm-up captures: a recorded start states them as a serving start resolves them.
+    let classes = crate::profiling::markers::classes(
+        &launch.engine_config.profiling,
+        model_runner.step_stack(),
+    );
+    if !classes.is_empty() {
+        for (operator, keys) in crate::profiling::markers::keys() {
+            recorded.entry(operator).or_default().extend(keys);
+        }
     }
     Ok(recorded)
 }

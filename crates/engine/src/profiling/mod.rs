@@ -7,7 +7,7 @@
 //!   device and the record of its streams' device time.
 //! - [`markers`]: the range markers at the entry and exit of the model's profiler ranges
 //!   (`nn::profiler::range`), the process's `ops::Profiler`, exported as per-step module
-//!   times.
+//!   times, whose device code is the `range_marker` operator's package.
 //! - [`pc_sampling`]: CUPTI's PC sampling, enabled for a rank's life when the deployment profiles
 //!   its CUDA graphs' kernels.
 //! - [`session`]: a profiling session's window on one rank, its collectors and its file.
@@ -20,11 +20,10 @@
 //!   `context.set_profiler(markers::profiler(&stream))`.
 //! - The worker keeps one `Option<Session>` per rank and performs each [`session::Change`] of
 //!   its queue between two batches with [`session::Session::change`].
-//! - At a step's begin it tells the session ([`session::Session::begin`]) and launches the step's
-//!   begin marker ([`markers::Markers::begin_step`]); right behind the step's last launch it
-//!   launches the end marker ([`markers::Markers::end_step`]); once the step completed it tells
-//!   the session ([`session::Session::end`]). When the session returns `true` the worker waits
-//!   for the rank's streams and calls [`session::Session::apply`].
+//! - At a step's begin it tells the session ([`session::Session::begin`]), and it runs the step's
+//!   launches between the step's begin and end markers ([`markers::Markers::bracket`]); once the
+//!   step completed it tells the session ([`session::Session::end`]). When the session returns
+//!   `true` the worker waits for the rank's streams and calls [`session::Session::apply`].
 //! - With each batch result it sends what [`forward_stats`] returns
 //!   (`BatchOutput::forward_stats`).
 //! - A graph compares [`graph_renewals`] with the number its executable was instantiated at, and
@@ -171,7 +170,7 @@ pub(crate) fn forward_stats(
     }
 
     if let Some(markers) = markers::Markers::installed() {
-        markers.read_device(device, false);
+        markers.read_device(device);
         (stats.fence_us, stats.fence_records_lost) = markers.take(device);
     }
     if let Some(session) = session {

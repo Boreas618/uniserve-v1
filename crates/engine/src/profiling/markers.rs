@@ -5,12 +5,17 @@
 //! its class, which names the kind of module, and its path, which names the instance. The context
 //! a runner captures a graph under carries the process's [`Markers`] as its profiler
 //! ([`profiler`], `ops::Context::set_profiler`), so a module whose class matches the
-//! deployment's class patterns gets one marker as it is entered and one as it returns. Each is a
-//! launch of [`PTX`]'s single-thread kernel on the forward's stream, so the graph captures it and
-//! every replay runs it. The worker brackets each batch's execution with a step marker of the
-//! same kernel on the runner's stream ([`Markers::begin_step`], [`Markers::end_step`]), which
-//! stamps the batch and stores its id in the stream's step cell; the markers the replay runs read
-//! the cell, so every stamp names its step.
+//! deployment's class patterns ([`classes`]) gets one marker as it is entered and one as it
+//! returns. Each is a launch of the stamp kernel on the forward's stream, so the graph captures
+//! it and every replay runs it. The worker brackets each batch's execution with a step marker of
+//! the same kernel on the runner's stream at either end ([`Markers::bracket`]), which stamps the
+//! batch and stores its id in the stream's step cell; the markers the replay runs read the cell,
+//! so every stamp names its step.
+//!
+//! **The kernels.** The device code is the package of the `range_marker` operator
+//! (`crates/ops/kernels/range_marker`): a stamp kernel, and a clock kernel for calibrations. The
+//! Build Server builds it for each device's target, and the start installs it through the
+//! engine's module load like every operator's package ([`keys`]).
 //!
 //! **What a marker does.** It reads the device switch: a word per class and a master word, in
 //! device storage. A marker whose words are off returns at once, so switching markers needs no
@@ -19,19 +24,28 @@
 //! its slot of a double buffer in pinned host storage the device writes through unified
 //! addressing. Sequence number `s` writes slot `s mod N` of half `(s / N) mod 2`, `N` stamps a
 //! half; the epoch `s / N` is tagged in the stamp (12 bits). The marker that completes a half
-//! publishes the half's epoch plus one in the half's `filled` word.
+//! publishes the half's epoch plus one in the half's `filled` word. A stamp's tagged word and a
+//! half's `filled` word are stored with release semantics at system scope (the package states
+//! the ordering), so a reader that acquires a stamp's tag reads its time, and one that acquires
+//! a half's `filled` word reads every stamp of the half.
 //!
-//! **Reading.** Each worker reads its device's halves after every batch
-//! ([`Markers::read_device`]), without any device synchronization, and the control thread does so
-//! with every metrics report ([`Markers::read`]), so an idle device's last stamps are not left
-//! behind. A half is read once its `filled` word shows it complete, and at most once a
-//! [`PARTIAL_READ`] so are the stamps of the half being filled, so steps are reported while the
-//! marker rate is low. A stamp is taken only when its tag is that of the epoch read: a stamp not
-//! yet visible is read again later, and one the device already overwrote with a later epoch (the
-//! host fell two halves behind) is counted as lost.
+//! **Reading.** Each worker reads its device's stamps after every batch
+//! ([`Markers::read_device`]), without any device synchronization: the complete halves, then the
+//! stamps of the half being filled up to the first the device has not written yet, which a later
+//! read takes. A stamp is taken only when its tag is that of the epoch read; a slot of a complete
+//! half without it was overwritten by a later epoch (the host fell two halves behind) and is
+//! counted as lost.
 //!
-//! **Clocks.** `%globaltimer` is a nanosecond clock of the GPU. A calibration launches a kernel
-//! that stores `%globaltimer` into pinned host storage and times its appearance on the host
+//! **Steps.** A step is measured once its begin stamp and its end stamp were read, with the
+//! stamps of its modules between. A loss discards every step whose begin was read before it,
+//! since the loss may have taken any of its stamps, and a module's stamp of a step whose begin
+//! was not read is dropped. Steps on one stream end in their launch order, so the end of a step
+//! read releases every earlier step of its stream whose end was lost: what a device keeps of its
+//! steps is bounded by the steps in flight.
+//!
+//! **Clocks.** `%globaltimer` is a nanosecond clock of the GPU. A calibration launches the clock
+//! kernel, which stores `%globaltimer` into pinned host storage, and behind it on the same stream
+//! a host function that reads the host's clocks once the kernel completed
 //! ([`Markers::calibrate`]); the sample of least uncertainty aligns the GPU's clock to the host's
 //! `CLOCK_REALTIME` and to CUPTI's clock.
 //!
@@ -46,129 +60,26 @@
 //! keeps (the buffers, the step cells, the steps not yet ended, the histograms) is that device's,
 //! because two ranks of one group run one batch id at once.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::error::Error as StdError;
-use std::ffi::c_void;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
-use std::time::{Duration, Instant};
 
 use crossbeam_channel::Sender;
-use platform::{
-    Device, DeviceAllocation, DeviceId, Function, LaunchConfig, Library, PinnedBuffer, Stream,
-};
+use ops::{Arguments, Kernel, KernelEntry, LaunchGrid};
+use platform::{DeviceAllocation, DeviceId, DevicePtr, PinnedBuffer, Stream};
+use proto::config::ProfilingConfig;
 use proto::report::FenceHistogram;
 
 use super::artifact::{ClockRow, Message};
 use crate::worker::{Error, Result};
 use service::lock;
 
-/// The marker kernel and the clock kernel, in PTX the driver compiles for the device. Parameters
-/// of `uniserve_range_marker`:
-///
-/// - `switches`: `u32[1 + classes]`, the master word then a word per class;
-/// - `class`: the marker's word, 0 for a step marker (on with the master word);
-/// - `marker`: the marker's id (20 bits);
-/// - `cell`: the stream's step cell (`u32`);
-/// - `mark`, `step`: a step marker stores `step` into the cell; a module's marker (`mark == 0`)
-///   reads it;
-/// - `counter`: the `u64` sequence counter; `written`: `u32[2]`, the stamps written into each
-///   half's current epoch;
-/// - `stamps`: `16 * 2 * N` bytes of pinned host storage; `filled`: `u64[2]` of pinned host
-///   storage;
-/// - `shift`: `log2 N`.
-const PTX: &str = r"
-.version 8.0
-.target sm_90
-.address_size 64
+/// The descriptor key of the `range_marker` package's stamp kernel.
+const STAMP_KERNEL: &str = "function_stamp";
 
-.visible .entry uniserve_range_marker(
-    .param .u64 switches,
-    .param .u32 class,
-    .param .u32 marker,
-    .param .u64 cell,
-    .param .u32 mark,
-    .param .u32 step,
-    .param .u64 counter,
-    .param .u64 written,
-    .param .u64 stamps,
-    .param .u64 filled,
-    .param .u32 shift
-)
-{
-    .reg .pred %p<4>;
-    .reg .b32 %r<16>;
-    .reg .b64 %rd<24>;
-
-    ld.param.u64 %rd1, [switches];
-    ld.global.cg.u32 %r1, [%rd1];
-    setp.eq.u32 %p1, %r1, 0;
-    @%p1 bra DONE;
-    ld.param.u32 %r2, [class];
-    setp.eq.u32 %p1, %r2, 0;
-    @%p1 bra ON;
-    mul.wide.u32 %rd2, %r2, 4;
-    add.u64 %rd3, %rd1, %rd2;
-    ld.global.cg.u32 %r3, [%rd3];
-    setp.eq.u32 %p1, %r3, 0;
-    @%p1 bra DONE;
-ON:
-    ld.param.u64 %rd4, [cell];
-    ld.param.u32 %r4, [mark];
-    ld.param.u32 %r5, [step];
-    setp.ne.u32 %p2, %r4, 0;
-    @%p2 st.global.u32 [%rd4], %r5;
-    @!%p2 ld.global.cg.u32 %r5, [%rd4];
-    mov.u64 %rd5, %globaltimer;
-    ld.param.u64 %rd6, [counter];
-    atom.global.add.u64 %rd7, [%rd6], 1;
-    ld.param.u32 %r6, [shift];
-    shr.u64 %rd9, %rd7, %r6;
-    mov.u64 %rd8, 1;
-    shl.b64 %rd8, %rd8, %r6;
-    sub.u64 %rd10, %rd8, 1;
-    and.b64 %rd10, %rd7, %rd10;
-    and.b64 %rd11, %rd9, 1;
-    mad.lo.u64 %rd12, %rd11, %rd8, %rd10;
-    shl.b64 %rd13, %rd12, 4;
-    ld.param.u64 %rd14, [stamps];
-    add.u64 %rd15, %rd14, %rd13;
-    ld.param.u32 %r7, [marker];
-    and.b32 %r7, %r7, 1048575;
-    cvt.u32.u64 %r8, %rd9;
-    and.b32 %r8, %r8, 4095;
-    shl.b32 %r8, %r8, 20;
-    or.b32 %r9, %r7, %r8;
-    mov.b64 %rd16, {%r9, %r5};
-    st.global.v2.u64 [%rd15], {%rd5, %rd16};
-    ld.param.u64 %rd17, [written];
-    shl.b64 %rd18, %rd11, 2;
-    add.u64 %rd19, %rd17, %rd18;
-    atom.global.add.u32 %r10, [%rd19], 1;
-    cvt.u32.u64 %r11, %rd8;
-    sub.u32 %r12, %r11, 1;
-    setp.ne.u32 %p3, %r10, %r12;
-    @%p3 bra DONE;
-    neg.s32 %r13, %r11;
-    atom.global.add.u32 %r14, [%rd19], %r13;
-    ld.param.u64 %rd20, [filled];
-    shl.b64 %rd21, %rd11, 3;
-    add.u64 %rd22, %rd20, %rd21;
-    add.u64 %rd23, %rd9, 1;
-    st.volatile.global.u64 [%rd22], %rd23;
-DONE:
-    ret;
-}
-
-.visible .entry uniserve_clock(.param .u64 out)
-{
-    .reg .b64 %rd<3>;
-    ld.param.u64 %rd1, [out];
-    mov.u64 %rd2, %globaltimer;
-    st.volatile.global.u64 [%rd1], %rd2;
-    ret;
-}
-";
+/// The descriptor key of the `range_marker` package's clock kernel.
+const CLOCK_KERNEL: &str = "function_clock";
 
 /// `log2` of the stamps a half holds: 4096 stamps, 64 KiB.
 const SHIFT: u32 = 12;
@@ -191,20 +102,26 @@ const STEP_END: u32 = 0xf_ffff;
 /// every other is taken.
 const CELLS: usize = 64;
 
-/// How often the half being filled is read, at most.
-const PARTIAL_READ: Duration = Duration::from_secs(1);
+/// The name patterns of the module classes whose instances carry markers in the graphs a
+/// deployment captures: `profiling_config.fence_modules`, or the family's step stack (the class
+/// of the module the family runs once per step) when it names none. Empty for a deployment that
+/// places no marker.
+pub(crate) fn classes(profiling: &ProfilingConfig, step_stack: &str) -> Vec<String> {
+    profiling
+        .fence_modules
+        .clone()
+        .unwrap_or_else(|| vec![step_stack.to_owned()])
+}
 
-/// How long a complete half's stamps that are not visible yet are waited for before they are
-/// counted as lost.
-const VISIBILITY: Duration = Duration::from_millis(50);
-
-/// How long a calibration spins for its timestamp on the host before it blocks until the clock
-/// kernel completes: on a busy device the kernel queues behind the device's work for longer.
-const CALIBRATION_SPIN: Duration = Duration::from_micros(500);
-
-/// The steps whose end marker has not been read that a device keeps; older ones (a batch that
-/// failed between its markers) are dropped.
-const OPEN_STEPS: usize = 4096;
+/// The kernels a process launches for its markers, by operator, as a recorded start states the
+/// kernels it launches and the module load selects their packages: the `range_marker` package's
+/// stamp and clock kernels.
+pub(crate) fn keys() -> BTreeMap<String, BTreeSet<String>> {
+    BTreeMap::from([(
+        proto::module::operator::RANGE_MARKER.to_owned(),
+        BTreeSet::from([STAMP_KERNEL.to_owned(), CLOCK_KERNEL.to_owned()]),
+    )])
+}
 
 /// What one marker wrote, as a reader takes it from a device's buffer and a session's writer
 /// stores it.
@@ -219,13 +136,63 @@ pub(crate) struct Stamp {
     pub(crate) step: u32,
 }
 
+/// What a reader took from a device's buffer, in sequence order.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Read {
+    /// A stamp the device wrote.
+    Stamp(Stamp),
+    /// Stamps the device overwrote before the reader took them.
+    Lost(u64),
+}
+
+/// A step whose begin marker was launched and whose end has not been read: the stream it runs
+/// on, by the stream's handle, its batch id's low 32 bits and its stage.
+struct Launched {
+    stream: usize,
+    step: u32,
+    stage: Arc<str>,
+}
+
+/// The `range_marker` package's two kernels, loaded on one device.
+struct Kernels {
+    stamp: Arc<Kernel>,
+    clock: Arc<Kernel>,
+}
+
+impl Kernels {
+    /// The stamp and clock kernels among `entries`, `device`'s installed modules of the package.
+    ///
+    /// # Errors
+    ///
+    /// When the entries lack either kernel.
+    fn of(device: DeviceId, entries: &[KernelEntry]) -> Result<Self> {
+        let find = |key: &str| {
+            entries
+                .iter()
+                .find(|entry| {
+                    entry.operator == proto::module::operator::RANGE_MARKER
+                        && entry.descriptor == key
+                })
+                .map(|entry| Arc::clone(&entry.kernel))
+                .ok_or_else(|| {
+                    Error::Invalid(format!(
+                        "the range markers of {device} have no {key} kernel of the {} package",
+                        proto::module::operator::RANGE_MARKER
+                    ))
+                })
+        };
+        Ok(Self {
+            stamp: find(STAMP_KERNEL)?,
+            clock: find(CLOCK_KERNEL)?,
+        })
+    }
+}
+
 /// A device's marker resources: the kernels, the switch, the counter, the step cells and the
 /// double buffer, and the reader's position in it.
 struct DeviceMarkers {
     device: DeviceId,
-    _library: Library,
-    marker: Function,
-    clock: Function,
+    kernels: Kernels,
     /// `u32[1 + CLASSES]`.
     switches: DeviceAllocation,
     /// The `u64` counter, then `u32[2]` written counts.
@@ -238,13 +205,14 @@ struct DeviceMarkers {
     filled: PinnedBuffer,
     /// `u64`, the clock kernel's output.
     clock_out: PinnedBuffer,
-    /// The stream the switch writes and calibrations go on.
+    /// The stream the switch writes and calibrations go on, of the device's greatest priority so
+    /// that neither queues behind the device's computation.
     control: Stream,
     /// The step cell of each stream that carried a marker, by the stream's handle.
     stream_cells: Mutex<HashMap<usize, usize>>,
     reader: Mutex<Reader>,
-    /// The stage of each step whose begin marker was launched.
-    stages: Mutex<HashMap<u32, Arc<str>>>,
+    /// The steps whose begin marker was launched and whose end was not read, in launch order.
+    launched: Mutex<VecDeque<Launched>>,
     /// Histograms of completed steps since the last take, by `{stage}/{class}`.
     histograms: Mutex<BTreeMap<String, FenceHistogram>>,
     /// Where the stamps read go while a session keeps them: the class patterns it keeps (empty
@@ -257,14 +225,10 @@ struct DeviceMarkers {
 struct Reader {
     /// The next sequence number to take.
     next: u64,
-    /// When a complete half first showed stamps not yet visible.
-    waiting_since: Option<Instant>,
     /// Stamps counted as lost since the last take.
     lost: u64,
-    /// When the half being filled was last read.
-    partial_read: Option<Instant>,
-    /// The stamps of each step whose end marker has not been read: its begin marker's and its
-    /// modules'.
+    /// The stamps of each step whose begin stamp was read and whose end stamp was not: its begin
+    /// marker's and its modules'.
     steps: BTreeMap<u32, Vec<Stamp>>,
     /// The calibration sample of least uncertainty.
     best: Option<ClockRow>,
@@ -340,23 +304,24 @@ impl ops::Profiler for Markers {
 }
 
 impl Markers {
-    /// Installs the markers of the classes `patterns` name (`*` matches any run) on `devices`,
+    /// Installs the markers of the classes `patterns` name (`*` matches any run) on every device
+    /// of `kernels`, each with its installed modules of the `range_marker` package ([`keys`]),
     /// every switch word on as `enabled` says but those of the classes `off` names, as the
     /// process's markers. A graph captured from here on carries them ([`profiler`]).
     ///
     /// # Errors
     ///
-    /// Fails when a device cannot load the kernels or allocate the buffers, or the process
-    /// installed markers already.
+    /// Fails when a device's modules lack a kernel of the package or the device cannot allocate
+    /// the buffers, or the process installed markers already.
     pub(crate) fn install(
-        devices: &[DeviceId],
+        kernels: Vec<(DeviceId, Vec<KernelEntry>)>,
         patterns: Vec<String>,
         enabled: bool,
         off: &[String],
     ) -> Result<Arc<Self>> {
-        let devices = devices
-            .iter()
-            .map(|&device| DeviceMarkers::new(device))
+        let devices = kernels
+            .into_iter()
+            .map(|(device, entries)| DeviceMarkers::new(device, Kernels::of(device, &entries)?))
             .collect::<Result<Vec<_>>>()?;
         let markers = Arc::new(Self {
             devices,
@@ -372,7 +337,6 @@ impl Markers {
             .map_err(|_| Error::State("the process installed range markers already"))?;
         Ok(markers)
     }
-
     /// The process's markers, once installed.
     pub(crate) fn installed() -> Option<&'static Arc<Self>> {
         MARKERS.get()
@@ -520,46 +484,41 @@ impl Markers {
         Ok(())
     }
 
-    /// Launches the begin marker of step `step` (a batch id) of stage `stage` (its call kind) on
-    /// `stream`, the runner's computation stream, before the step's first launch.
+    /// Runs `run`, the launches of step `step` (a batch id) of stage `stage` (its call kind) on
+    /// `stream`, the runner's computation stream, between the step's begin marker and its end
+    /// marker. The end is launched right behind the step's last launch, whatever `run` returns,
+    /// so every step whose begin marker was launched has its end launched; launched after the
+    /// worker waited for the step, its span would hold the host's trip back as well as the
+    /// device's work. With the markers switched off, `run` runs alone.
     ///
     /// # Errors
     ///
-    /// When the stream's device has no markers or the launch fails.
-    pub(crate) fn begin_step(&self, stream: &Stream, step: u64, stage: &str) -> Result<()> {
+    /// When the stream's device has no markers or a marker's launch fails; `run`'s own outcome
+    /// is the value.
+    pub(crate) fn bracket<T>(
+        &self,
+        stream: &Stream,
+        step: u64,
+        stage: &str,
+        run: impl FnOnce() -> T,
+    ) -> Result<T> {
         if !self.recording.load(Ordering::Acquire) {
-            return Ok(());
+            return Ok(run());
         }
         let markers = self.device(stream.device())?;
         let cell = Self::cell(markers, stream.raw());
         // A stamp carries the low 32 bits of the batch id.
         let step = step as u32;
 
-        {
-            let mut stages = lock(&markers.stages);
-            // A step whose end marker was never read leaves its stage here.
-            if stages.len() >= OPEN_STEPS {
-                stages.clear();
-            }
-            stages.insert(step, Arc::from(stage));
-        }
-        markers.launch(stream, 0, STEP_BEGIN, cell, Some(step))
-    }
-
-    /// Launches the end marker of step `step` on `stream`, right behind the step's last launch:
-    /// launched after the worker waited for the step, its span would hold the host's trip back
-    /// as well as the device's work.
-    ///
-    /// # Errors
-    ///
-    /// When the stream's device has no markers or the launch fails.
-    pub(crate) fn end_step(&self, stream: &Stream, step: u64) -> Result<()> {
-        if !self.recording.load(Ordering::Acquire) {
-            return Ok(());
-        }
-        let markers = self.device(stream.device())?;
-        let cell = Self::cell(markers, stream.raw());
-        markers.launch(stream, 0, STEP_END, cell, Some(step as u32))
+        markers.launch(stream, 0, STEP_BEGIN, cell, Some(step))?;
+        lock(&markers.launched).push_back(Launched {
+            stream: stream.raw(),
+            step,
+            stage: Arc::from(stage),
+        });
+        let ran = run();
+        markers.launch(stream, 0, STEP_END, cell, Some(step))?;
+        Ok(ran)
     }
 
     /// Has the stamps read from `device` from now on also reach `rows`, a session's writer, until
@@ -581,25 +540,28 @@ impl Markers {
         }
     }
 
-    /// Reads `device`'s complete halves, and the half being filled when [`PARTIAL_READ`] passed
-    /// since its last read or `partial` asks; aggregates the steps that ended. Never waits for
-    /// the device.
-    pub(crate) fn read_device(&self, device: DeviceId, partial: bool) {
+    /// Reads `device`'s stamps, its complete halves and the written stamps of the half being
+    /// filled, and aggregates the steps that ended. Never waits for the device.
+    pub(crate) fn read_device(&self, device: DeviceId) {
         if let Ok(markers) = self.device(device) {
-            self.read_of(markers, partial);
+            self.read_of(markers);
         }
     }
 
-    fn read_of(&self, device: &DeviceMarkers, partial: bool) {
-        let stamps = device.read(partial);
-        if stamps.is_empty() {
+    fn read_of(&self, device: &DeviceMarkers) {
+        let read = device.read();
+        if read.is_empty() {
             return;
         }
-        self.aggregate(device, &stamps);
+        self.aggregate(device, &read);
 
         if let Some((classes, rows)) = lock(&device.tap).as_ref() {
-            let kept: Vec<Stamp> = stamps
-                .into_iter()
+            let kept: Vec<Stamp> = read
+                .iter()
+                .filter_map(|read| match read {
+                    Read::Stamp(stamp) => Some(*stamp),
+                    Read::Lost(_) => None,
+                })
                 .filter(|stamp| self.kept(classes, stamp.marker))
                 .collect();
             if !kept.is_empty() {
@@ -628,31 +590,41 @@ impl Markers {
         class.is_some_and(|name| classes.iter().any(|pattern| matches(pattern, name)))
     }
 
-    /// Adds the steps whose end marker `stamps` hold to the device's histograms.
-    fn aggregate(&self, device: &DeviceMarkers, stamps: &[Stamp]) {
-        let mut reader = lock(&device.reader);
-        let mut ended = Vec::new();
-        for stamp in stamps {
-            match stamp.marker {
-                STEP_END => ended.push((stamp.step, stamp.time)),
-                _ => reader.steps.entry(stamp.step).or_default().push(*stamp),
+    /// Adds the steps whose end stamp `read` holds to the device's histograms, by the rules of the
+    /// module documentation's **Steps**.
+    fn aggregate(&self, device: &DeviceMarkers, read: &[Read]) {
+        let ended = end_steps(&mut lock(&device.reader).steps, read);
+        if ended.is_empty() {
+            return;
+        }
+
+        let mut lost_ends = Vec::new();
+        let mut measured = Vec::new();
+        {
+            let mut launched = lock(&device.launched);
+            for (step, end, open) in ended {
+                // A step no bracket of this process launched names no stage, and is not measured.
+                let Some((stage, lost)) = release(&mut launched, step) else {
+                    continue;
+                };
+                lost_ends.extend(lost);
+                if let Some(open) = open {
+                    measured.push((stage, end, open));
+                }
             }
         }
-        // A step whose other stamps were all lost still ends, so that its stage is let go.
-        let completed: Vec<(u32, u64, Vec<Stamp>)> = ended
-            .into_iter()
-            .map(|(step, end)| (step, end, reader.steps.remove(&step).unwrap_or_default()))
-            .collect();
-        while reader.steps.len() > OPEN_STEPS {
-            reader.steps.pop_first();
+        // The earlier steps of a stream whose ends were lost are not measured: what was read of
+        // them goes.
+        if !lost_ends.is_empty() {
+            let mut reader = lock(&device.reader);
+            for step in lost_ends {
+                reader.steps.remove(&step);
+            }
         }
-        drop(reader);
 
-        let mut stages = lock(&device.stages);
         let mut histograms = lock(&device.histograms);
         let instances = lock(&self.instances);
-        for (step, end, mut open) in completed {
-            let stage = stages.remove(&step).unwrap_or_else(|| Arc::from("unknown"));
+        for (stage, end, mut open) in measured {
             let begin = open.iter().rev().find(|stamp| stamp.marker == STEP_BEGIN);
             if let Some(begin) = begin {
                 histograms
@@ -668,7 +640,6 @@ impl Markers {
             }
         }
     }
-
     /// The histograms of `device`'s steps completed since the last take, in microseconds by
     /// `{stage}/{class}`, and its stamps lost.
     pub(crate) fn take(&self, device: DeviceId) -> (BTreeMap<String, FenceHistogram>, u64) {
@@ -744,18 +715,74 @@ pub(crate) fn matches(pattern: &str, name: &str) -> bool {
     rest.len() >= last.len() && rest.ends_with(last)
 }
 
-impl DeviceMarkers {
-    fn new(device: DeviceId) -> Result<Self> {
-        let handle = Device::new(device)?;
-        // The driver compiles the text for the device, and it needs the terminating NUL a text
-        // image is read to.
-        let mut image = PTX.as_bytes().to_vec();
-        image.push(0);
-        let library = Library::load(&handle, &image)?;
-        let marker = library.kernel("uniserve_range_marker")?;
-        let clock = library.kernel("uniserve_clock")?;
+/// Takes `read`, a device's stamps in sequence order, into `steps`, the stamps of each step whose
+/// begin stamp was read and whose end was not, and returns each step whose end stamp it holds:
+/// its batch id's low 32 bits, the end's time and the step's stamps, `None` when its begin was not
+/// read. A begin stamp opens its step; a module's stamp joins its step when that is open and is
+/// dropped otherwise; a loss discards every open step, since it may have taken any of their
+/// stamps.
+fn end_steps(
+    steps: &mut BTreeMap<u32, Vec<Stamp>>,
+    read: &[Read],
+) -> Vec<(u32, u64, Option<Vec<Stamp>>)> {
+    let mut ended = Vec::new();
+    for read in read {
+        match *read {
+            Read::Lost(_) => steps.clear(),
+            Read::Stamp(stamp) => match stamp.marker {
+                STEP_BEGIN => steps.entry(stamp.step).or_default().push(stamp),
+                STEP_END => ended.push((stamp.step, stamp.time, steps.remove(&stamp.step))),
+                _ => {
+                    if let Some(open) = steps.get_mut(&stamp.step) {
+                        open.push(stamp);
+                    }
+                }
+            },
+        }
+    }
+    ended
+}
 
-        let control = Stream::with_priority(device, -5)?;
+/// Releases step `step`, whose end stamp was read, from `launched`: its entry, and every earlier
+/// entry of its stream, which ended before it in stream order and whose end stamp was lost.
+/// Returns the step's stage and the steps released whose ends were lost; `None` for a step no
+/// entry names.
+fn release(launched: &mut VecDeque<Launched>, step: u32) -> Option<(Arc<str>, Vec<u32>)> {
+    let position = launched.iter().position(|entry| entry.step == step)?;
+    let stream = launched[position].stream;
+
+    let mut lost = Vec::new();
+    let mut stage = None;
+    let mut index = 0;
+    launched.retain(|entry| {
+        let at = index;
+        index += 1;
+        if at == position {
+            stage = Some(Arc::clone(&entry.stage));
+            return false;
+        }
+        if at < position && entry.stream == stream {
+            lost.push(entry.step);
+            return false;
+        }
+        true
+    });
+    stage.map(|stage| (stage, lost))
+}
+
+/// Notes `stamps` lost at the current position of a read: the reader counts them, and `taken`
+/// states them in sequence order, one entry for a run of them.
+fn lose(reader: &mut Reader, taken: &mut Vec<Read>, stamps: u64) {
+    reader.lost += stamps;
+    match taken.last_mut() {
+        Some(Read::Lost(lost)) => *lost += stamps,
+        _ => taken.push(Read::Lost(stamps)),
+    }
+}
+
+impl DeviceMarkers {
+    fn new(device: DeviceId, kernels: Kernels) -> Result<Self> {
+        let control = Stream::with_greatest_priority(device)?;
         let switches = DeviceAllocation::linear(device, 4 * (1 + CLASSES))?;
         let counters = DeviceAllocation::linear(device, 16)?;
         let cells = DeviceAllocation::linear(device, 4 * CELLS)?;
@@ -780,9 +807,7 @@ impl DeviceMarkers {
 
         Ok(Self {
             device,
-            _library: library,
-            marker,
-            clock,
+            kernels,
             switches,
             counters,
             cells,
@@ -792,13 +817,13 @@ impl DeviceMarkers {
             control,
             stream_cells: Mutex::new(HashMap::new()),
             reader: Mutex::new(Reader::default()),
-            stages: Mutex::new(HashMap::new()),
+            launched: Mutex::new(VecDeque::new()),
             histograms: Mutex::new(BTreeMap::new()),
             tap: Mutex::new(None),
         })
     }
 
-    /// Launches the marker kernel on `stream`: a module's marker of switch word `class`, or with
+    /// Launches the stamp kernel on `stream`: a module's marker of switch word `class`, or with
     /// `step` a step marker.
     fn launch(
         &self,
@@ -808,62 +833,56 @@ impl DeviceMarkers {
         cell: usize,
         step: Option<u32>,
     ) -> Result<()> {
-        let mut switches = self.switches.address();
-        let mut class = class;
-        let mut marker = marker;
-        let mut cell = self.cells.address() + 4 * cell as u64;
-        let mut mark = u32::from(step.is_some());
-        let mut step = step.unwrap_or(0);
-        let mut counter = self.counters.address();
-        let mut written = self.counters.address() + 8;
-        let mut stamps = self.stamps.address();
-        let mut filled = self.filled.address();
-        let mut shift = SHIFT;
-        let mut parameters: [*mut c_void; 11] = [
-            (&raw mut switches).cast(),
-            (&raw mut class).cast(),
-            (&raw mut marker).cast(),
-            (&raw mut cell).cast(),
-            (&raw mut mark).cast(),
-            (&raw mut step).cast(),
-            (&raw mut counter).cast(),
-            (&raw mut written).cast(),
-            (&raw mut stamps).cast(),
-            (&raw mut filled).cast(),
-            (&raw mut shift).cast(),
-        ];
+        let address = DevicePtr::from_address;
+        let mut arguments = Arguments::new();
+        arguments
+            .pointer(address(self.switches.address()))
+            .u32(class)
+            .u32(marker)
+            .pointer(address(self.cells.address() + 4 * cell as u64))
+            .u32(u32::from(step.is_some()))
+            .u32(step.unwrap_or(0))
+            .pointer(address(self.counters.address()))
+            .pointer(address(self.counters.address() + 8))
+            .pointer(address(self.stamps.address()))
+            .pointer(address(self.filled.address()))
+            .u32(SHIFT);
 
-        // The parameters are the kernel's, and every buffer they address lives with the process's
-        // markers, past every replay of a graph that captured the launch.
-        self.marker
-            .launch_ex(stream, &single_thread(), &mut parameters)?;
+        // Every buffer the arguments address lives with the process's markers, past every replay
+        // of a graph that captured the launch.
+        self.kernels
+            .stamp
+            .launch(LaunchGrid::linear(1)?, &mut arguments, stream)?;
         Ok(())
     }
 
-    /// The `filled` word of `half`.
+    /// The word at `index` of the pinned host storage `buffer`, as an atomic the device writes.
+    fn word(buffer: &PinnedBuffer, index: usize) -> &AtomicU64 {
+        // SAFETY: `buffer` is pinned host storage of whole, aligned `u64` words that lives as long
+        // as the markers, `index` lies in it (every caller's index is within its buffer's
+        // layout), and the device writes its words only with atomic stores.
+        unsafe { AtomicU64::from_ptr(buffer.as_ptr().cast::<u64>().add(index)) }
+    }
+
+    /// The `filled` word of `half`, acquired: a half it shows complete has every stamp visible.
     fn filled(&self, half: u64) -> u64 {
-        // SAFETY: the word is pinned host storage the device writes whole; a volatile read
-        // observes its latest value.
-        unsafe { std::ptr::read_volatile(self.filled.as_ptr().cast::<u64>().add(half as usize)) }
+        Self::word(&self.filled, half as usize).load(Ordering::Acquire)
     }
 
-    /// The two words of sequence number `sequence`'s slot.
+    /// The two words of sequence number `sequence`'s slot, `(time, packed)`: the tagged word is
+    /// acquired first, so a tag of the epoch read comes with that stamp's time.
     fn slot(&self, sequence: u64) -> (u64, u64) {
-        let index = ((sequence >> SHIFT) & 1) * HALF + (sequence & (HALF - 1));
-        // SAFETY: the index lies in the buffer; the device writes each stamp whole in one 16-byte
-        // store, read here as two volatile words.
-        unsafe {
-            let base = self.stamps.as_ptr().cast::<u64>().add(2 * index as usize);
-            (
-                std::ptr::read_volatile(base),
-                std::ptr::read_volatile(base.add(1)),
-            )
-        }
+        let index = (((sequence >> SHIFT) & 1) * HALF + (sequence & (HALF - 1))) as usize;
+        let packed = Self::word(&self.stamps, 2 * index + 1).load(Ordering::Acquire);
+        let time = Self::word(&self.stamps, 2 * index).load(Ordering::Relaxed);
+        (time, packed)
     }
 
-    /// Takes the stamps the device completed: the complete halves in epoch order, then, when due,
-    /// the visible stamps of the half being filled.
-    fn read(&self, partial: bool) -> Vec<Stamp> {
+    /// Takes what the device wrote since the last read, in sequence order: every stamp of the
+    /// complete halves, a [`Read::Lost`] where the device overwrote stamps before they were read,
+    /// then the stamps of the half being filled up to the first the device has not written yet,
+    /// which a later read takes.
+    fn read(&self) -> Vec<Read> {
         let mut reader = lock(&self.reader);
         let mut taken = Vec::new();
         let completed = self.filled(0).max(self.filled(1));
@@ -873,101 +892,70 @@ impl DeviceMarkers {
         let oldest = completed.saturating_sub(1);
         if reader.next >> SHIFT < oldest {
             let resumed = oldest << SHIFT;
-            reader.lost += resumed - reader.next;
+            let skipped = resumed - reader.next;
+            lose(&mut reader, &mut taken, skipped);
             reader.next = resumed;
         }
 
+        // A complete half: its acquired `filled` word makes every stamp of it visible, so a slot
+        // without the epoch's tag was overwritten by a later epoch.
         loop {
             let epoch = reader.next >> SHIFT;
             if self.filled(epoch & 1) != epoch + 1 {
                 break;
             }
-            // A complete half: every stamp past the reader's position.
-            let mut pending = false;
             while reader.next >> SHIFT == epoch {
                 match stamp(self.slot(reader.next), epoch) {
-                    Some(stamp) => taken.push(stamp),
-                    None if tag(self.slot(reader.next).1) == (epoch + 2) & TAG_MASK => {
-                        reader.lost += 1;
-                    }
-                    None => {
-                        pending = true;
-                        break;
-                    }
+                    Some(stamp) => taken.push(Read::Stamp(stamp)),
+                    None => lose(&mut reader, &mut taken, 1),
                 }
                 reader.next += 1;
             }
-            if pending {
-                let since = *reader.waiting_since.get_or_insert_with(Instant::now);
-                if since.elapsed() < VISIBILITY {
-                    return taken;
-                }
-                // Gone: the device moved on before the host saw it.
-                reader.lost += 1;
-                reader.next += 1;
-                continue;
-            }
-            reader.waiting_since = None;
         }
 
-        let due = partial
-            || reader
-                .partial_read
-                .is_none_or(|read| read.elapsed() >= PARTIAL_READ);
-        if due {
-            reader.partial_read = Some(Instant::now());
-            let epoch = reader.next >> SHIFT;
-            while reader.next >> SHIFT == epoch {
-                match stamp(self.slot(reader.next), epoch) {
-                    Some(stamp) => taken.push(stamp),
-                    None => break,
-                }
-                reader.next += 1;
+        // The half being filled: its stamps up to the first the device has not written yet.
+        let epoch = reader.next >> SHIFT;
+        while reader.next >> SHIFT == epoch {
+            match stamp(self.slot(reader.next), epoch) {
+                Some(stamp) => taken.push(Read::Stamp(stamp)),
+                None => break,
             }
+            reader.next += 1;
         }
         taken
     }
 
-    /// One calibration sample: the clock kernel's `%globaltimer` against the host clocks around
-    /// its appearance. Keeps and returns the best sample.
+    /// One calibration sample: the clock kernel's `%globaltimer` against the host's clocks before
+    /// its launch and in a host function the stream runs once the kernel completed. Keeps and
+    /// returns the best sample.
     ///
-    /// The sample's uncertainty is half the host's window from before the launch to the value's
-    /// appearance: a kernel that queued behind the device's work gives a wide sample, which a
+    /// The sample's uncertainty is half the host's window from before the launch to the host
+    /// function: a kernel that queued behind the device's work gives a wide sample, which a
     /// narrower one replaces.
     fn calibrate(&self) -> Result<ClockRow> {
-        // SAFETY: the word is pinned host storage no device work addresses now: a calibration
-        // returns only once its kernel has stored into it.
-        unsafe { std::ptr::write_volatile(self.clock_out.as_ptr().cast::<u64>(), 0) };
-        let mut out = self.clock_out.address();
-        let mut parameters: [*mut c_void; 1] = [(&raw mut out).cast()];
+        let mut arguments = Arguments::new();
+        arguments.pointer(DevicePtr::from_address(self.clock_out.address()));
         let before = (realtime(), platform::cupti::timestamp().unwrap_or(0));
-        let started = Instant::now();
+        self.kernels
+            .clock
+            .launch(LaunchGrid::linear(1)?, &mut arguments, &self.control)?;
 
-        // The parameter is the kernel's; the word outlives it.
-        self.clock
-            .launch_ex(&self.control, &single_thread(), &mut parameters)?;
-        let gpu = loop {
-            // SAFETY: as above; the device writes the word whole.
-            let value = unsafe { std::ptr::read_volatile(self.clock_out.as_ptr().cast::<u64>()) };
-            if value != 0 {
-                break value;
-            }
-            if started.elapsed() > CALIBRATION_SPIN {
-                // Blocking until the kernel completes ends the sample, and keeps the next
-                // calibration, which zeroes the word, from reading this kernel's late store as
-                // its own.
-                self.control.synchronize()?;
-                // SAFETY: as above; the kernel completed.
-                let value =
-                    unsafe { std::ptr::read_volatile(self.clock_out.as_ptr().cast::<u64>()) };
-                if value == 0 {
-                    return Err(Error::State("the clock kernel completed without its time"));
-                }
-                break value;
-            }
-            std::hint::spin_loop();
-        };
-        let after = (realtime(), platform::cupti::timestamp().unwrap_or(0));
+        let (sender, completed) = crossbeam_channel::bounded(1);
+        let word = self.clock_out.as_ptr().cast::<u64>().expose_provenance();
+        self.control.launch_host_fn(move || {
+            let after = (realtime(), platform::cupti::timestamp().unwrap_or(0));
+            // SAFETY: the word is aligned pinned host storage of the markers, which outlive the
+            // calibration, and the calibration waits for this function; the kernel before it
+            // stored the word.
+            let gpu = unsafe { AtomicU64::from_ptr(std::ptr::with_exposed_provenance_mut(word)) }
+                .load(Ordering::Acquire);
+            let _ = sender.send((gpu, after));
+        })?;
+        // The stream completes with the host function, which holds the sample.
+        self.control.synchronize()?;
+        let (gpu, after) = completed
+            .try_recv()
+            .map_err(|_| Error::State("the calibration's host function did not run"))?;
 
         let sample = ClockRow {
             source: "globaltimer",
@@ -976,7 +964,7 @@ impl DeviceMarkers {
             realtime: before.0 / 2 + after.0 / 2,
             cupti: Some(before.1 / 2 + after.1 / 2),
             monotonic: None,
-            uncertainty: (after.0 - before.0) / 2,
+            uncertainty: after.0.saturating_sub(before.0) / 2,
         };
         let mut reader = lock(&self.reader);
         let best = match reader.best {
@@ -986,11 +974,6 @@ impl DeviceMarkers {
         reader.best = Some(best);
         Ok(best)
     }
-}
-
-/// One block of one thread.
-fn single_thread() -> LaunchConfig {
-    LaunchConfig::new([1, 1, 1], [1, 1, 1])
 }
 
 /// The host's `CLOCK_REALTIME`, nanoseconds.
@@ -1093,14 +1076,94 @@ mod tests {
         assert_eq!(time, BTreeMap::from([(1, 10), (2, 3)]));
     }
 
+    /// A begin stamp opens its step and its end closes it with the module stamps between; a
+    /// module's stamp of a step whose begin was not read is dropped, and a loss discards the
+    /// steps open before it, whose ends then close nothing.
+    #[test]
+    fn a_step_is_measured_only_from_its_begin_and_never_across_a_loss() {
+        let at = |time, marker, step| Read::Stamp(Stamp { time, marker, step });
+        let mut steps = BTreeMap::new();
+
+        let ended = end_steps(
+            &mut steps,
+            &[
+                at(1, STEP_BEGIN, 7),
+                at(2, 0, 7),
+                at(3, 1, 7),
+                // Step 8's begin was not read: its module's stamp is dropped.
+                at(4, 0, 8),
+                at(5, STEP_END, 7),
+                at(6, STEP_BEGIN, 9),
+                at(7, 0, 9),
+            ],
+        );
+        assert_eq!(ended.len(), 1);
+        let (step, end, open) = &ended[0];
+        assert_eq!((*step, *end), (7, 5));
+        assert_eq!(open.as_ref().map(Vec::len), Some(3));
+        assert!(!steps.contains_key(&8));
+
+        // Step 9 was open when stamps were lost: its end closes nothing measured.
+        let ended = end_steps(&mut steps, &[Read::Lost(3), at(9, STEP_END, 9)]);
+        assert_eq!(ended, vec![(9, 9, None)]);
+        assert!(steps.is_empty());
+    }
+
+    /// The end of a step releases the earlier steps of its stream, whose ends were lost, and
+    /// leaves another stream's steps for their own ends.
+    #[test]
+    fn a_step_s_end_releases_the_earlier_steps_of_its_stream() {
+        let entry = |stream, step, stage: &str| Launched {
+            stream,
+            step,
+            stage: Arc::from(stage),
+        };
+        let mut launched = VecDeque::from([
+            entry(1, 10, "decode"),
+            entry(2, 11, "prefill"),
+            entry(1, 12, "decode"),
+            entry(1, 13, "verify"),
+        ]);
+
+        let (stage, lost) = release(&mut launched, 12).unwrap();
+        assert_eq!((&*stage, lost), ("decode", vec![10]));
+        let left: Vec<(usize, u32)> = launched
+            .iter()
+            .map(|entry| (entry.stream, entry.step))
+            .collect();
+        assert_eq!(left, [(2, 11), (1, 13)]);
+
+        // A step no bracket launched names no stage.
+        assert!(release(&mut launched, 99).is_none());
+    }
+
+    /// The `range_marker` package's modules on `device`, as the start installs them: selected and
+    /// built for the device's target at the host's Build Server (`build_server::default_socket`),
+    /// which holds the package.
+    fn kernels(device: DeviceId) -> Vec<KernelEntry> {
+        let socket = build_server::default_socket().unwrap();
+        let mut client = build_server::Client::connect(&socket).unwrap();
+        let targets = [build_server::Target::arch(device.compute_capability().unwrap()).unwrap()];
+        let (packages, routes) =
+            crate::modules::load::select(&mut client, &targets, &Default::default(), &keys())
+                .unwrap();
+        crate::modules::load::install(&mut client, device, &packages, &routes).unwrap()
+    }
+
     /// The markers a capture places around a module run at every replay: each step between its
     /// step markers counts once in the histogram of its stage and the module's class, and once in
-    /// the stage's own.
+    /// the stage's own; a calibration samples the device's clock.
     #[test]
-    #[ignore = "requires a GPU"]
+    #[ignore = "requires a GPU and the host's Build Server holding the range_marker package"]
     fn a_captured_range_times_its_module_at_every_replay() {
         let device = DeviceId(0);
-        let markers = Markers::install(&[device], vec!["Mlp".to_owned()], true, &[]).unwrap();
+        let markers = Markers::install(
+            vec![(device, kernels(device))],
+            vec!["Mlp".to_owned()],
+            true,
+            &[],
+        )
+        .unwrap();
         let stream = Stream::new(device).unwrap();
 
         // A forward run once carries no marker; a capture's does.
@@ -1122,12 +1185,13 @@ mod tests {
         let graph = capture.end().unwrap();
         let executable = graph.instantiate().unwrap();
         for step in [7, 8] {
-            markers.begin_step(&stream, step, "decode").unwrap();
-            executable.launch(&stream).unwrap();
-            markers.end_step(&stream, step).unwrap();
+            markers
+                .bracket(&stream, step, "decode", || executable.launch(&stream))
+                .unwrap()
+                .unwrap();
         }
         stream.synchronize().unwrap();
-        markers.read_device(device, true);
+        markers.read_device(device);
 
         let (histograms, lost) = markers.take(device);
         let steps = |name: &str| histograms[name].buckets.iter().sum::<u64>();
@@ -1138,5 +1202,8 @@ mod tests {
             markers.instances(),
             [("Mlp".to_owned(), "layers.0.mlp".to_owned())]
         );
+
+        let sample = markers.calibrate(device).unwrap();
+        assert!(sample.gpu.is_some_and(|gpu| gpu > 0));
     }
 }

@@ -151,10 +151,11 @@ pub struct ModuleSet {
 
 /// The operators of this build, by the name their packages are filed under.
 ///
-/// Each constant is the `NAME` of one operator of the kernel library (`ops::Op::NAME`), which takes
-/// it from here: the daemon keys the epoch record by these names and filters the Build Server's
-/// store by [`ALL`], and the main process installs a module under the same name, without either
-/// linking the kernel library to learn them.
+/// Each constant names the device code one package fills: the `NAME` of an operator of the kernel
+/// library (`ops::Op::NAME`), which takes it from here, or the engine's range markers
+/// ([`operator::RANGE_MARKER`]). The daemon keys the epoch record by these names and filters the
+/// Build Server's store by [`ALL`](operator::ALL), and the main process installs a module under
+/// the same name, without either linking the kernel library to learn them.
 pub mod operator {
     pub const ACT_AND_MUL: &str = "act_and_mul";
     pub const VALUE_FIRST_SWIGLU: &str = "value_first_swiglu";
@@ -254,6 +255,9 @@ pub mod operator {
     pub const FILL: &str = "fill";
     pub const REDUCE: &str = "reduce";
     pub const INDEX: &str = "index";
+    /// The engine's range markers: a stamp of the device's clock at a module's entry and exit,
+    /// and a read of that clock for a calibration (`crates/engine/src/profiling/markers.rs`).
+    pub const RANGE_MARKER: &str = "range_marker";
 
     /// Every operator this build has, in a stable order for a package's coverage check.
     ///
@@ -358,6 +362,7 @@ pub mod operator {
         FILL,
         REDUCE,
         INDEX,
+        RANGE_MARKER,
     ];
 
     /// `name`, interned, when this build has an operator by that name.

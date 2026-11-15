@@ -617,7 +617,7 @@ pub(crate) fn start(
     // captures and instantiates, so they precede the warm-up's captures, whose executables are
     // current at the tracing mode's renewal count of their instantiation.
     if !meta {
-        instrument(launch, &model_runner)?;
+        instrument(launch, &model_runner, build.as_ref())?;
     }
     let registers = |group: GroupId| head.completed_registers(group, &pairs);
     let (route, workers) = spawn(&mut ranks, (&open, &opened), &registers, remotes.clone())?;
@@ -850,7 +850,7 @@ fn start_peer(
 
     // What attaches to the graphs precedes the workers and the warm-up, as on the scheduler node.
     if launch.engine_config.device.device != DeviceKind::Meta {
-        instrument(launch, model_runner)?;
+        instrument(launch, model_runner, build.as_ref())?;
     }
     // A peer holds no queue pair: its ended sequences reach the scheduler node over its link.
     let (route, workers) = spawn(
@@ -1087,27 +1087,50 @@ fn weight_binding(
 
 /// Installs what the deployment's always-on profiling captures into every graph of the devices
 /// `model_runner` serves: the range markers of the classes `profiling_config.fence_modules` names,
-/// or of the family's step stack when it names none ([`ModelRunner::step_stack`]), and PC sampling
-/// when `graph_pc_sampling` keeps it on, which CUPTI attributes to a graph only when enabled
-/// before its capture; otherwise the counters' record of each graph launch as a whole, in which
-/// the executables are then instantiated ([`crate::profiling::counters::record_whole_graphs`]).
+/// or of the family's step stack when it names none ([`ModelRunner::step_stack`]), with their
+/// kernels resolved through `build`, the Build Server's client and the devices' targets, as every
+/// operator's are; and PC sampling when `graph_pc_sampling` keeps it on, which CUPTI attributes
+/// to a graph only when enabled before its capture; otherwise the counters' record of each graph
+/// launch as a whole, in which the executables are then instantiated
+/// ([`crate::profiling::counters::record_whole_graphs`]).
 ///
 /// Called before the ranks' workers start and capture the warm-up's graphs.
 ///
 /// # Errors
 ///
-/// When a device cannot load the markers' kernels or enable sampling.
-fn instrument(launch: &EngineArgs, model_runner: &ModelRunner) -> Result<()> {
+/// A deployment that places markers with no Build Server client, the Build Server's refusal to
+/// select or build the markers' package, or a device that cannot load its kernels or enable
+/// sampling.
+fn instrument(
+    launch: &EngineArgs,
+    model_runner: &ModelRunner,
+    build: Option<&(Arc<Mutex<build_server::Client>>, Vec<Target>)>,
+) -> Result<()> {
     let profiling = &launch.engine_config.profiling;
     let devices = model_runner.devices();
-    let modules = profiling
-        .fence_modules
-        .clone()
-        .unwrap_or_else(|| vec![model_runner.step_stack().to_owned()]);
-    if !modules.is_empty() {
+    let classes = crate::profiling::markers::classes(profiling, model_runner.step_stack());
+    if !classes.is_empty() {
+        let (client, targets) =
+            build.context("the start holds no Build Server client to resolve the range markers")?;
+        let mut client = service::lock(client);
+        let (packages, routes) = load::select(
+            &mut client,
+            targets,
+            &launch.modules.kernels,
+            &crate::profiling::markers::keys(),
+        )?;
+        let kernels = devices
+            .iter()
+            .map(|&device| {
+                Ok((
+                    device,
+                    load::install(&mut client, device, &packages, &routes)?,
+                ))
+            })
+            .collect::<Result<Vec<_>>>()?;
         crate::profiling::markers::Markers::install(
-            devices,
-            modules,
+            kernels,
+            classes,
             profiling.fence_probes,
             &profiling.fence_probes_off,
         )

@@ -148,6 +148,24 @@ impl Stream {
         })
     }
 
+    /// Creates a non-blocking stream of the greatest priority `device`'s
+    /// primary context offers (the numerically lowest of
+    /// `cuCtxGetStreamPriorityRange`): work queued on it is scheduled ahead of
+    /// every other stream's pending work, as a short control operation beside
+    /// long-running computation needs.
+    pub fn with_greatest_priority(device: DeviceId) -> Result<Self> {
+        let context = PrimaryContext::retain(device)?;
+        let (mut least, mut greatest) = (0, 0);
+        in_context(context.raw(), |driver| {
+            // SAFETY: the driver writes the context's two bounds into the locals.
+            driver.check(
+                unsafe { (driver.ctx_get_stream_priority_range)(&mut least, &mut greatest) },
+                "cuCtxGetStreamPriorityRange",
+            )
+        })?;
+        Self::with_priority(device, greatest)
+    }
+
     /// Creates an independent owned stream in this stream's context with the
     /// same priority. It retains whatever this stream retains; forking a
     /// borrowed stream inherits the borrow's lifetime rule.

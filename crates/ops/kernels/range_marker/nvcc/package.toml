@@ -1,0 +1,32 @@
+# The range_marker operator's CUDA backend: design 5.2's package.
+#
+# The device code of the engine's range markers
+# (`crates/engine/src/profiling/markers.rs`), one cubin per descriptor, built
+# by `src/build.py` for every GPU target the Build Server describes:
+#
+# - `function_stamp`: a range marker, launched at the entry and the exit of a
+#   model module and around each step. It reads the device switch and, when
+#   its word is on, writes a stamp of the device's `%globaltimer` into the next
+#   slot of a double buffer of pinned host storage; the stamp that completes a
+#   half publishes it.
+# - `function_clock`: a read of `%globaltimer` into one word of pinned host
+#   storage, for a calibration against the host's clocks.
+#
+# The stamp layout and the ordering the engine's reader relies on are stated
+# in `src/range_marker.cu`. The markers run on every device a deployment
+# serves on, so the package requires nothing of a target. Its module is a
+# cubin the engine loads into each device's context, not the native library a
+# CUDA source otherwise builds.
+
+op = "range_marker"
+backend = "nvcc"
+interface_version = 1
+
+[module]
+form = "cubin"
+
+[source]
+kind = "cuda"
+
+[[kernel.descriptors]]
+dimensions = { function = ["stamp", "clock"] }

@@ -734,7 +734,7 @@ fn stop(
         Prepared::RangeTimeline { markers, .. } => {
             // What the device stamped so far reaches the file before the tap goes.
             if let Some(device) = device {
-                markers.read_device(device, true);
+                markers.read_device(device);
                 markers.untap(device);
             }
             Ok(())

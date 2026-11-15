@@ -103,6 +103,7 @@ driver_table! {
     primary_ctx_reset = "cuDevicePrimaryCtxReset_v2": fn(i32);
     ctx_push = "cuCtxPushCurrent_v2": fn(Handle);
     ctx_pop = "cuCtxPopCurrent_v2": fn(*mut Handle);
+    ctx_get_stream_priority_range = "cuCtxGetStreamPriorityRange": fn(*mut i32, *mut i32);
     thread_exchange_capture_mode = "cuThreadExchangeStreamCaptureMode": fn(
         *mut sys::CUstreamCaptureMode,
     );

@@ -658,9 +658,7 @@ impl Graphs {
         buffer.release(slot, &cuda.stream)?;
 
         let step = step.take();
-        begin_step(&cuda.stream, step)?;
-        executable.launch(&cuda.stream)?;
-        end_step(&cuda.stream, step)?;
+        bracket(&cuda.stream, step, || executable.launch(&cuda.stream))??;
         cuda.done.record(&cuda.stream)?;
         *launches += executable.kernel_nodes();
         *replays += 1;
@@ -685,13 +683,11 @@ impl Graphs {
         self.lend_values(&cuda.launching, slot)?;
 
         let step = self.state.borrow_mut().step.take();
-        begin_step(&cuda.stream, step)?;
         cuda.launching.reset();
-        let outputs = {
+        let outputs = bracket(&cuda.stream, step, || {
             let _guard = cuda.launching.enter();
             runner.forward(bucket)
-        };
-        end_step(&cuda.stream, step)?;
+        })?;
 
         // The forward's own copies read the slot, so the slot is free only behind them.
         self.with_buffer(|buffer| buffer.release(slot, &cuda.stream))?;
@@ -1418,20 +1414,16 @@ impl State {
     }
 }
 
-/// Launches the begin marker of `step` on `stream`, when the worker stated a step and the
-/// process holds range markers.
-fn begin_step(stream: &Stream, step: Option<(u64, &'static str)>) -> Result<()> {
+/// Runs `run`, a step's launches on `stream`, between the step's range markers when the worker
+/// stated a step and the process holds range markers (`Markers::bracket`), and alone otherwise.
+fn bracket<T>(
+    stream: &Stream,
+    step: Option<(u64, &'static str)>,
+    run: impl FnOnce() -> T,
+) -> Result<T> {
     match (step, crate::profiling::markers::Markers::installed()) {
-        (Some((step, stage)), Some(markers)) => markers.begin_step(stream, step, stage),
-        _ => Ok(()),
-    }
-}
-
-/// Launches the end marker of `step` on `stream`, right behind the step's last launch.
-fn end_step(stream: &Stream, step: Option<(u64, &'static str)>) -> Result<()> {
-    match (step, crate::profiling::markers::Markers::installed()) {
-        (Some((step, _)), Some(markers)) => markers.end_step(stream, step),
-        _ => Ok(()),
+        (Some((step, stage)), Some(markers)) => markers.bracket(stream, step, stage, run),
+        _ => Ok(run()),
     }
 }
 
