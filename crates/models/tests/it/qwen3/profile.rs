@@ -255,7 +255,7 @@ fn qwen3_moe_profiles_a_decode_and_a_prefill_bucket() {
 fn qwen3_moe_profiles_pipeline_stages_and_sequence_members() {
     for rank in 0..2 {
         let placement = TextPlacement {
-            pipeline: Split { size: 2, rank },
+            pipeline: Split::new(2, rank).unwrap(),
             ..TextPlacement::WHOLE
         };
         let model = load(QWEN3_30B_A3B, &placement);
@@ -263,14 +263,19 @@ fn qwen3_moe_profiles_pipeline_stages_and_sequence_members() {
         assert_eq!((shape.layers, shape.kv_heads), (24, 4));
 
         let name = format!("Qwen3-30B-A3B pipeline stage {rank} of 2");
-        buckets(&name, &*model, &[Split { size: 2, rank }], &no_exchange);
+        buckets(
+            &name,
+            &*model,
+            &[Split::new(2, rank).unwrap()],
+            &no_exchange,
+        );
     }
 
     for projection in [Projection::Gather, Projection::Exchange] {
         for rank in 0..2 {
             let placement = TextPlacement {
                 sequence: SequenceSplit {
-                    split: Split { size: 2, rank },
+                    split: Split::new(2, rank).unwrap(),
                     projection,
                 },
                 ..TextPlacement::WHOLE
@@ -279,7 +284,7 @@ fn qwen3_moe_profiles_pipeline_stages_and_sequence_members() {
             let shape = model.cache();
             assert_eq!((shape.layers, shape.kv_heads), (48, 2));
 
-            let group = [Split { size: 2, rank }];
+            let group = [Split::new(2, rank).unwrap()];
             let name = format!("Qwen3-30B-A3B {projection:?} sequence member {rank} of 2");
             buckets(&name, &*model, &group, &no_exchange);
             step(&*model, &batch(Phase::Decode, 1, 1, 1), &group, None);
@@ -294,27 +299,32 @@ fn qwen3_moe_profiles_pipeline_stages_and_sequence_members() {
 fn qwen3_moe_profiles_tensor_and_expert_parallel_ranks() {
     for rank in 0..2 {
         let placement = TextPlacement {
-            tensor: Split { size: 2, rank },
+            tensor: Split::new(2, rank).unwrap(),
             ..TextPlacement::WHOLE
         };
         let model = load(QWEN3_30B_A3B, &placement);
         assert_eq!(model.cache().kv_heads, 2);
 
         let name = format!("Qwen3-30B-A3B tensor rank {rank} of 2");
-        buckets(&name, &*model, &[Split { size: 2, rank }], &no_exchange);
+        buckets(
+            &name,
+            &*model,
+            &[Split::new(2, rank).unwrap()],
+            &no_exchange,
+        );
     }
 
     // A deployment that splits neither the heads nor the experts evenly is refused at load.
     let checkpoint = QWEN3_30B_A3B.checkpoint();
     for (tensor, experts) in [(3, 1), (1, 3)] {
         let config = models::qwen3::Config::open(&checkpoint).expect("the configuration");
-        let split = |size| Split { size, rank: 0 };
+        let split = |size| Split::new(size, 0).unwrap();
         assert!(config.check_splits(split(tensor), split(experts)).is_err());
     }
 
     for rank in 0..2 {
         let placement = TextPlacement {
-            experts: Split { size: 2, rank },
+            experts: Split::new(2, rank).unwrap(),
             ..TextPlacement::WHOLE
         };
         let model = load(QWEN3_30B_A3B, &placement);
@@ -345,7 +355,7 @@ fn qwen3_moe_profiles_tensor_and_expert_parallel_ranks() {
             })
         };
 
-        let group = [Split { size: 2, rank }];
+        let group = [Split::new(2, rank).unwrap()];
         let name = format!("Qwen3-30B-A3B expert rank {rank} of 2");
         for keys in buckets(&name, &*model, &group, &exchange) {
             assert_operators(

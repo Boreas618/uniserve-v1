@@ -19,8 +19,8 @@ use crate::error::{Error, Result};
 /// so a rank past the vocabulary's end holds none. The embedding and the vocabulary head shard
 /// by this one rule, so a token's row and its logit column are on the same rank.
 pub fn vocabulary_shard(vocabulary: u32, split: Split) -> (u32, u32) {
-    let per_rank = vocabulary.div_ceil(split.size.max(1));
-    let first = split.rank.saturating_mul(per_rank).min(vocabulary);
+    let per_rank = vocabulary.div_ceil(split.size());
+    let first = split.rank().saturating_mul(per_rank).min(vocabulary);
 
     (first, per_rank.min(vocabulary - first))
 }
@@ -152,7 +152,7 @@ mod tests {
         for (vocabulary, size) in [(151_936_u32, 4_u32), (151_937, 4), (30, 2), (7, 4), (5, 1)] {
             let mut next = 0;
             for rank in 0..size {
-                let (first, rows) = vocabulary_shard(vocabulary, Split { size, rank });
+                let (first, rows) = vocabulary_shard(vocabulary, Split::new(size, rank).unwrap());
                 assert_eq!(first, next.min(vocabulary), "{vocabulary} over {size}");
                 assert!(rows <= vocabulary.div_ceil(size));
                 next = first + rows;
@@ -165,10 +165,10 @@ mod tests {
 
         // The last rank of an uneven vocabulary keeps the remainder.
         assert_eq!(
-            vocabulary_shard(151_937, Split { size: 4, rank: 3 }),
+            vocabulary_shard(151_937, Split::new(4, 3).unwrap()),
             (113_955, 37_982)
         );
         // A rank past the end of a small vocabulary holds no row.
-        assert_eq!(vocabulary_shard(5, Split { size: 4, rank: 3 }), (5, 0));
+        assert_eq!(vocabulary_shard(5, Split::new(4, 3).unwrap()), (5, 0));
     }
 }

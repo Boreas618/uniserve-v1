@@ -432,7 +432,7 @@ fn an_eight_way_ulysses_rank_steps_the_largest_profiled_layout() {
     for projection in [Projection::Gather, Projection::Exchange] {
         let split = DenoiserSplit {
             ulysses: SequenceSplit {
-                split: Split { size: 8, rank: 3 },
+                split: Split::new(8, 3).unwrap(),
                 projection,
             },
             ..DenoiserSplit::WHOLE

@@ -211,8 +211,8 @@ fn a_share_is_its_part_of_the_whole_tensors_encoding() {
         };
 
         let whole = load(Parallel::None);
-        let column = load(Parallel::Column(Split { size: 2, rank: 1 }));
-        let row = load(Parallel::Row(Split { size: 2, rank: 1 }));
+        let column = load(Parallel::Column(Split::new(2, 1).unwrap()));
+        let row = load(Parallel::Row(Split::new(2, 1).unwrap()));
 
         let all = values(&whole.forward(&x).unwrap());
         let share = values(&column.forward(&x).unwrap());
@@ -317,7 +317,7 @@ fn a_converted_weight_is_refused_where_no_encoded_product_reads_it() {
             inputs: 512,
             outputs: 256,
             bias: false,
-            parallel: Parallel::Column(Split { size: 2, rank: 0 }),
+            parallel: Parallel::Column(Split::new(2, 0).unwrap()),
         },
         loader.root().pp("proj"),
     );

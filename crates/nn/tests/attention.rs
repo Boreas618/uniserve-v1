@@ -1281,12 +1281,12 @@ fn a_paged_forward_writes_its_layers_planes_then_reads_them() {
     // Rank 1 of 2 holds two query heads over one key head, and its output projection is a
     // partial sum the group reduces.
     let mut split = attention_config(FUSED, true, false);
-    split.qkv.split = Split { size: 2, rank: 1 };
+    split.qkv.split = Split::new(2, 1).unwrap();
     let attention = Attention::load(&split, loader.root().pp("attn")).unwrap();
     let cache = meta_cache(DType::BF16, 1, DIM);
 
     let forward = || attention.forward_paged(&hidden, Some((&cos, &sin)), &batch, &cache, 0);
-    let (out, Recording { launches, .. }) = record(&[Split { size: 2, rank: 1 }], forward);
+    let (out, Recording { launches, .. }) = record(&[Split::new(2, 1).unwrap()], forward);
     assert_eq!(out.unwrap().dims(), [tokens, HIDDEN]);
     assert_eq!(
         launches[5].1,
@@ -1327,7 +1327,7 @@ fn a_sequence_split_member_attends_its_heads_of_every_row_and_returns_its_own_ro
     ] {
         let config = AttentionConfig {
             sequence: SequenceSplit {
-                split: Split { size: 2, rank: 1 },
+                split: Split::new(2, 1).unwrap(),
                 projection,
             },
             ..attention_config(FUSED, true, false)
@@ -1336,7 +1336,7 @@ fn a_sequence_split_member_attends_its_heads_of_every_row_and_returns_its_own_ro
         assert_eq!(attention.query().n(), (held * DIM) as u32, "{projection:?}");
 
         let forward = || attention.forward_paged(&hidden, Some((&cos, &sin)), &batch, &cache, 0);
-        let (out, Recording { launches, .. }) = record(&[Split { size: 2, rank: 1 }], forward);
+        let (out, Recording { launches, .. }) = record(&[Split::new(2, 1).unwrap()], forward);
         assert_eq!(out.unwrap().dims(), [share, HIDDEN], "{projection:?}");
 
         let written = launches
@@ -1357,18 +1357,18 @@ fn a_sequence_split_member_attends_its_heads_of_every_row_and_returns_its_own_ro
         let (alone, _) = record(&[], forward);
         assert!(alone.is_err(), "{projection:?}");
         let whole = meta((tokens, HIDDEN), DType::BF16);
-        let (unshared, _) = record(&[Split { size: 2, rank: 1 }], || {
+        let (unshared, _) = record(&[Split::new(2, 1).unwrap()], || {
             attention.forward_paged(&whole, Some((&cos, &sin)), &batch, &cache, 0)
         });
         assert!(unshared.is_err(), "{projection:?}");
-        let (dense, _) = record(&[Split { size: 2, rank: 1 }], || {
+        let (dense, _) = record(&[Split::new(2, 1).unwrap()], || {
             attention.forward(&hidden, Some((&cos, &sin)))
         });
         assert!(dense.is_err(), "{projection:?}");
     }
 
     let mut both = attention_config(FUSED, true, false);
-    both.qkv.split = Split { size: 2, rank: 0 };
-    both.sequence.split = Split { size: 2, rank: 0 };
+    both.qkv.split = Split::new(2, 0).unwrap();
+    both.sequence.split = Split::new(2, 0).unwrap();
     assert!(Attention::load(&both, loader.root().pp("attn")).is_err());
 }

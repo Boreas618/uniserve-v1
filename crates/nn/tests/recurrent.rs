@@ -945,7 +945,7 @@ fn a_gated_delta_net_states_its_fields_and_its_kernels() {
     // A rank of a tensor-parallel group holds a share of the key heads and of the value heads
     // they serve, so the split divides the key heads.
     let halves = GatedDeltaNetConfig {
-        split: Split { size: 2, rank: 1 },
+        split: Split::new(2, 1).unwrap(),
         ..config
     };
     assert_eq!(halves.conv_channels(), config.conv_channels() / 2);
@@ -953,7 +953,7 @@ fn a_gated_delta_net_states_its_fields_and_its_kernels() {
     assert!(GatedDeltaNet::load(&halves, loader.root().pp("mixer")).is_ok());
 
     let thirds = GatedDeltaNetConfig {
-        split: Split { size: 3, rank: 0 },
+        split: Split::new(3, 0).unwrap(),
         ..config
     };
     let refused = GatedDeltaNet::load(&thirds, loader.root().pp("mixer"));

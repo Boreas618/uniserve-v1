@@ -841,7 +841,8 @@ impl ModelRunner {
             )?;
             let config = self.encoder_config(model.as_ref(), classes)?;
             let (graphs, stream) = graphs(ENCODER, EncoderRunner::input_bytes(&config))?;
-            let (rank, ranks) = super::split(text_split.rank as usize, text_split.size as usize);
+            let (rank, ranks) =
+                super::split(text_split.rank() as usize, text_split.size() as usize);
             graphs.set_group(tensor, rank, ranks)?;
             let runner = EncoderRunner::new(text, config, graphs, stream, Arc::clone(memory))
                 .context("building the rank's text encoder")?;
@@ -868,7 +869,7 @@ impl ModelRunner {
                 .into_iter()
                 .zip(places)
                 .map(|(group, place)| {
-                    let (rank, ranks) = super::split(place.rank as usize, place.size as usize);
+                    let (rank, ranks) = super::split(place.rank() as usize, place.size() as usize);
                     (group, rank, ranks)
                 })
                 .collect();

@@ -185,7 +185,7 @@ impl Linear {
             Parallel::Row(split) => (share(&vb, inputs, split, "contraction")?, outputs),
         };
         let reduce = match parallel {
-            Parallel::Row(split) => split.size,
+            Parallel::Row(split) => split.size(),
             _ => 1,
         };
         let name = vb.name("weight");
@@ -696,14 +696,15 @@ impl Module for Linear {
 /// `extent` split over `split`'s ranks: this rank's share, refused when the split does not
 /// divide.
 fn share(vb: &VarBuilder<'_, '_>, extent: u64, split: Split, what: &str) -> Result<u64> {
-    let size = u64::from(split.size);
+    let size = u64::from(split.size());
 
-    if size == 0 || split.rank >= split.size || !extent.is_multiple_of(size) {
+    if !extent.is_multiple_of(size) {
         return Err(Error::weight(
             &vb.name("weight"),
             format!(
                 "rank {} of a split of {} does not hold a share of {extent} {what}",
-                split.rank, split.size
+                split.rank(),
+                split.size()
             ),
         ));
     }
@@ -733,12 +734,12 @@ fn weight_source(
         },
         Parallel::Column(split) => WeightSource::Region {
             tensor,
-            start: u64::from(split.rank) * rows * columns,
+            start: u64::from(split.rank()) * rows * columns,
             shape,
         },
         Parallel::Row(split) => WeightSource::Strided {
             tensor,
-            start: u64::from(split.rank) * width,
+            start: u64::from(split.rank()) * width,
             shape,
             row_stride: columns,
         },
@@ -760,12 +761,12 @@ fn load_bias(
     match parallel {
         // A partial sum's bias is added once, on the first rank, so the reduction counts it
         // once.
-        Parallel::Row(split) if split.rank != 0 => Ok(None),
+        Parallel::Row(split) if split.rank() != 0 => Ok(None),
         Parallel::Row(_) | Parallel::None => Ok(Some(vb.get(local_out as usize, "bias")?)),
         Parallel::Column(split) => Ok(Some(vb.get_rows(
             local_out as usize,
             "bias",
-            (u64::from(split.rank) * local_out) as usize,
+            (u64::from(split.rank()) * local_out) as usize,
         )?)),
     }
 }
@@ -839,34 +840,37 @@ impl QkvLinear {
         let refuse = |problem: String| Error::weight(vb.path(), problem);
         let split = config.split;
 
-        if split.size == 0 || split.rank >= split.size || !config.heads.is_multiple_of(split.size) {
+        if !config.heads.is_multiple_of(split.size()) {
             return Err(refuse(format!(
                 "a split of {} does not divide {} query heads",
-                split.size, config.heads
+                split.size(),
+                config.heads
             )));
         }
 
         // The key/value heads' own split: the group's, or, when the group is wider than the
         // heads, one head per `size / kv_heads` ranks.
-        let kv_split = if split.size <= config.kv_heads {
-            if !config.kv_heads.is_multiple_of(split.size) {
+        let kv_split = if split.size() <= config.kv_heads {
+            if !config.kv_heads.is_multiple_of(split.size()) {
                 return Err(refuse(format!(
                     "a split of {} does not divide {} key/value heads",
-                    split.size, config.kv_heads
+                    split.size(),
+                    config.kv_heads
                 )));
             }
             split
         } else {
-            if !split.size.is_multiple_of(config.kv_heads) {
+            if !split.size().is_multiple_of(config.kv_heads) {
                 return Err(refuse(format!(
                     "a split of {} does not replicate {} key/value heads evenly",
-                    split.size, config.kv_heads
+                    split.size(),
+                    config.kv_heads
                 )));
             }
-            Split {
-                size: config.kv_heads,
-                rank: split.rank / (split.size / config.kv_heads),
-            }
+            Split::new(
+                config.kv_heads,
+                split.rank() / (split.size() / config.kv_heads),
+            )?
         };
 
         let query_width = config.heads * config.head_dim * if config.gated { 2 } else { 1 };
@@ -884,7 +888,7 @@ impl QkvLinear {
                     }
                 };
                 let load = |module: &str, outputs: u32, split: Split| {
-                    let parallel = if split.size == 1 {
+                    let parallel = if split.size() == 1 {
                         Parallel::None
                     } else {
                         Parallel::Column(split)
@@ -918,15 +922,15 @@ impl QkvLinear {
                 // The query rows, then the key rows, then the value rows; each split's block is
                 // its own rows of its window.
                 let window = |index: usize, base: u32, width: u32, split: Split| {
-                    let rows = (width / split.size) as usize;
-                    let first = base as usize + split.rank as usize * rows;
+                    let rows = (width / split.size()) as usize;
+                    let first = base as usize + split.rank() as usize * rows;
                     let weight = fused.get_rows((rows, hidden), "weight", first)?;
 
                     let bias = match config.bias {
                         QkvBias::Absent => None,
                         QkvBias::Present => Some(fused.get_rows(rows, "bias", first)?),
                         QkvBias::Windows(names) => {
-                            Some(vb.get_rows(rows, names[index], split.rank as usize * rows)?)
+                            Some(vb.get_rows(rows, names[index], split.rank() as usize * rows)?)
                         }
                     };
                     Linear::new(weight, bias, WeightOrder::NxK)

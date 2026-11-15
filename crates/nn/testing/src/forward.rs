@@ -55,7 +55,7 @@ pub fn record<T>(
                 if *axis == Split::WHOLE {
                     (None, 0, 0)
                 } else {
-                    (None, u64::from(axis.rank), u64::from(axis.size))
+                    (None, u64::from(axis.rank()), u64::from(axis.size()))
                 }
             })
             .collect();

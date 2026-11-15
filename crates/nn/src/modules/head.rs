@@ -57,7 +57,7 @@ impl LmHead {
             first as usize,
         )?;
 
-        Self::over(weight, config.vocabulary, config.split.size)
+        Self::over(weight, config.vocabulary, config.split.size())
     }
 
     /// The head that shares `embedding`'s table: a checkpoint that ties its word embeddings.

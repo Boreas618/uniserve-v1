@@ -276,7 +276,7 @@ const STEP: [&str; 14] = [
 /// delta networks with a window of the history and the drafts and a state of value rows; one
 /// PLE window; twelve rings of eight raw keys.
 fn assert_shapes(model: &dyn TextModel, tensor: Split) {
-    let ranks = tensor.size as usize;
+    let ranks = tensor.size() as usize;
     let cache = model.cache();
     assert_eq!((cache.layers, cache.head_dim), (12, 256));
     assert_eq!(cache.kv_heads as usize, (2 / ranks).max(1));
@@ -308,7 +308,7 @@ fn assert_shapes(model: &dyn TextModel, tensor: Split) {
 
 /// The profile of a checkpoint whose experts are NVFP4: whole, and as rank one of four.
 fn profile_packed(release: Release) {
-    for tensor in [Split::WHOLE, Split { size: 4, rank: 1 }] {
+    for tensor in [Split::WHOLE, Split::new(4, 1).unwrap()] {
         let (model, unread) = load(release, &placement(tensor));
         assert_shapes(&*model, tensor);
         assert!(model.experts().expect("routed experts").encoded);
@@ -317,7 +317,7 @@ fn profile_packed(release: Release) {
         // each, and a rank names all but the shards of the n-gram table other ranks hold.
         let stray: Vec<&String> = unread
             .iter()
-            .filter(|name| tensor.size == 1 || !name.contains("ngram_embedding.shard_"))
+            .filter(|name| tensor.size() == 1 || !name.contains("ngram_embedding.shard_"))
             .collect();
         assert!(
             stray.is_empty(),
@@ -328,9 +328,11 @@ fn profile_packed(release: Release) {
 
         let label = format!(
             "{} tensor rank {} of {}",
-            release.repository, tensor.rank, tensor.size
+            release.repository,
+            tensor.rank(),
+            tensor.size()
         );
-        let group: &[Split] = if tensor.size > 1 { &[tensor] } else { &[] };
+        let group: &[Split] = if tensor.size() > 1 { &[tensor] } else { &[] };
         for profile in buckets(&label, &*model, group) {
             assert_operators(
                 "a step",

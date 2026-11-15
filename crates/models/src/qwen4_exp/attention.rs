@@ -87,7 +87,7 @@ impl IndexedAttention {
     /// A split that does not divide the query heads, or a module the loader refuses.
     pub fn load(config: &Config, vb: VarBuilder<'_, '_>, split: Split) -> Result<Self> {
         let (text, indexer) = (&config.text, config.indexer);
-        let whole = split.size == 1;
+        let whole = split.size() == 1;
 
         let qkv = QkvLinear::load(
             &QkvLinearConfig {
@@ -139,8 +139,8 @@ impl IndexedAttention {
             q_layernorm: index.pp("q_layernorm").get(index_dim, "weight")?,
             k_layernorm: index.pp("k_layernorm").get(index_dim, "weight")?,
             indexer,
-            heads: (text.num_attention_heads / split.size) as usize,
-            kv_heads: (text.num_key_value_heads / split.size).max(1) as usize,
+            heads: (text.num_attention_heads / split.size()) as usize,
+            kv_heads: (text.num_key_value_heads / split.size()).max(1) as usize,
             head_dim,
             eps: text.rms_norm_eps,
             scale: text.rope.score_scale(text.head_dim)?,

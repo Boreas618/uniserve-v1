@@ -111,17 +111,19 @@ impl NgramEmbedding {
     pub fn load(config: &Config, vb: VarBuilder<'_, '_>, split: Split) -> Result<Self> {
         let ngram = &config.ngram;
         let (heads, head_dim) = (ngram.heads() as usize, ngram.head_dim() as usize);
-        if split.size == 0 || split.rank >= split.size || !ngram.parts.is_multiple_of(split.size) {
+        if !ngram.parts.is_multiple_of(split.size()) {
             return Err(ID.config(format!(
                 "rank {} of a tensor group of {} does not hold whole shards of {}",
-                split.rank, split.size, ngram.parts
+                split.rank(),
+                split.size(),
+                ngram.parts
             )));
         }
 
         // The shards this rank holds, fused in order into its rows of the table.
         let shard_rows = ngram.table_rows() / u64::from(ngram.parts);
-        let held_parts = ngram.parts / split.size;
-        let first_part = split.rank * held_parts;
+        let held_parts = ngram.parts / split.size();
+        let first_part = split.rank() * held_parts;
         let rows = u64::from(held_parts) * shard_rows;
 
         let table = vb.pp("ngram_embedding");
@@ -177,7 +179,7 @@ impl NgramEmbedding {
             held: (u64::from(first_part) * shard_rows, rows),
             heads_per_ngram: ngram.heads_per_ngram as usize,
             head_dim,
-            sharded: split.size > 1,
+            sharded: split.size() > 1,
         })
     }
 

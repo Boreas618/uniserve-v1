@@ -652,23 +652,12 @@ impl DenoiserSplit {
     /// this rank's, the Ulysses place varying fastest: the interval of the packed rows the rank
     /// holds.
     pub const fn sequence(&self) -> Split {
-        let (ulysses, gather) = (self.ulysses.split, self.gather);
-        Split {
-            size: ulysses.size * gather.size,
-            rank: gather.rank * ulysses.size + ulysses.rank,
-        }
+        self.gather.nest(self.ulysses.split)
     }
 
     /// The blocks of a stack of `blocks` this rank's stage holds, as `first..end`.
     pub const fn stage_blocks(&self, blocks: u32) -> std::ops::Range<u32> {
-        let (stages, stage) = (
-            if self.layers.size == 0 {
-                1
-            } else {
-                self.layers.size
-            },
-            self.layers.rank,
-        );
+        let (stages, stage) = (self.layers.size(), self.layers.rank());
         let (share, extra) = (blocks / stages, blocks % stages);
         let first = stage * share + if stage < extra { stage } else { extra };
         let count = share + if stage < extra { 1 } else { 0 };

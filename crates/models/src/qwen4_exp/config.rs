@@ -432,17 +432,8 @@ impl Config {
     ///
     /// # Errors
     ///
-    /// A split that does not divide what it shards, or a rank outside its split.
+    /// A split that does not divide what it shards.
     pub fn check_splits(&self, tensor: Split, experts: Split) -> Result<()> {
-        for (name, split) in [("tensor", tensor), ("expert", experts)] {
-            if split.size == 0 || split.rank >= split.size {
-                return Err(ID.config(format!(
-                    "{name}-parallel rank {} of a group of {}",
-                    split.rank, split.size
-                )));
-            }
-        }
-
         let network = &self.text.gated_delta_net;
         for (name, extent) in [
             ("attention heads", self.text.num_attention_heads),
@@ -453,17 +444,18 @@ impl Config {
             ),
             ("n-gram table shards", self.ngram.parts),
         ] {
-            if !extent.is_multiple_of(tensor.size) {
+            if !extent.is_multiple_of(tensor.size()) {
                 return Err(ID.config(format!(
                     "tensor parallel degree {} does not divide {extent} {name}",
-                    tensor.size
+                    tensor.size()
                 )));
             }
         }
-        if !self.moe.num_experts.is_multiple_of(experts.size) {
+        if !self.moe.num_experts.is_multiple_of(experts.size()) {
             return Err(ID.config(format!(
                 "expert parallel degree {} does not divide {} experts",
-                experts.size, self.moe.num_experts
+                experts.size(),
+                self.moe.num_experts
             )));
         }
         Ok(())
@@ -912,7 +904,7 @@ mod tests {
     #[test]
     fn a_split_divides_the_heads_the_experts_width_and_the_table() {
         let config = parse(&fixtures::flash_next()).expect("parsed");
-        let split = |size| Split { size, rank: 0 };
+        let split = |size| Split::new(size, 0).unwrap();
 
         // Four ranks hold six query heads, four key heads, 160 expert columns and 32 shards
         // each; the two key/value heads are each held by two ranks.
@@ -921,10 +913,5 @@ mod tests {
 
         assert!(config.check_splits(split(5), split(1)).is_err());
         assert!(config.check_splits(split(1), split(3)).is_err());
-        assert!(
-            config
-                .check_splits(Split { size: 4, rank: 4 }, split(1))
-                .is_err()
-        );
     }
 }

@@ -106,7 +106,7 @@ fn a_parallel_projection_loads_this_rank_s_block() {
     );
     let store = CpuWeights::new();
     let loader = WeightLoader::new(&checkpoint, &store, None);
-    let split = Split { size: 2, rank: 1 };
+    let split = Split::new(2, 1).unwrap();
 
     // Column parallel: rank 1 holds output channels 3..6 and their bias.
     let column = Linear::load(
@@ -153,7 +153,7 @@ fn a_parallel_projection_loads_this_rank_s_block() {
     // A split that does not divide the split axis holds no share.
     let uneven = Linear::load(
         &LinearConfig {
-            parallel: Parallel::Column(Split { size: 4, rank: 0 }),
+            parallel: Parallel::Column(Split::new(4, 0).unwrap()),
             ..WHOLE
         },
         loader.root().pp("proj"),
@@ -176,13 +176,13 @@ fn a_row_parallel_projection_reduces_under_its_group() {
             inputs: 32,
             outputs: 8,
             bias: false,
-            parallel: Parallel::Row(Split { size: 2, rank: 1 }),
+            parallel: Parallel::Row(Split::new(2, 1).unwrap()),
         },
         loader.root().pp("proj"),
     )
     .unwrap();
 
-    let (output, Recording { launches, .. }) = record(&[Split { size: 2, rank: 1 }], || {
+    let (output, Recording { launches, .. }) = record(&[Split::new(2, 1).unwrap()], || {
         Ok(row.forward(&meta((4, 16), DType::BF16))?.dims().to_vec())
     });
     assert_eq!(output.unwrap(), [4, 8]);
@@ -615,7 +615,7 @@ fn an_attention_s_projections_load_separately_or_as_windows_of_one_module() {
         gated: false,
         names: QkvNames::Separate(["q_proj", "k_proj", "v_proj"]),
         bias: QkvBias::Absent,
-        split: Split { size: 2, rank: 1 },
+        split: Split::new(2, 1).unwrap(),
     };
 
     // A split wider than the key/value heads replicates the one head on both ranks, and halves
@@ -650,7 +650,7 @@ fn an_attention_s_projections_load_separately_or_as_windows_of_one_module() {
 
     let uneven = QkvLinear::load(
         &QkvLinearConfig {
-            split: Split { size: 3, rank: 0 },
+            split: Split::new(3, 0).unwrap(),
             ..config
         },
         loader.root().pp("attn"),
@@ -688,7 +688,7 @@ fn an_embedding_gathers_its_table_s_rows() {
     // Rank 1 of 2 holds rows 4..8, and its rows are summed over the group.
     let shard = Embedding::load(
         &EmbeddingConfig {
-            split: Split { size: 2, rank: 1 },
+            split: Split::new(2, 1).unwrap(),
             ..config
         },
         loader.root().pp("embed_tokens"),
@@ -713,13 +713,13 @@ fn a_sharded_embedding_states_its_shard_in_its_kernel() {
         &EmbeddingConfig {
             vocabulary: 32,
             hidden: 8,
-            split: Split { size: 2, rank: 1 },
+            split: Split::new(2, 1).unwrap(),
         },
         loader.root().pp("embed_tokens"),
     )
     .unwrap();
 
-    let (output, Recording { launches, .. }) = record(&[Split { size: 2, rank: 1 }], || {
+    let (output, Recording { launches, .. }) = record(&[Split::new(2, 1).unwrap()], || {
         shard.forward(&meta(5, DType::U32))
     });
     assert_eq!(output.unwrap().dims(), [5, 8]);
@@ -789,13 +789,13 @@ fn a_split_head_gathers_the_shards_of_its_group() {
         &LmHeadConfig {
             vocabulary: 32,
             hidden: 8,
-            split: Split { size: 2, rank: 1 },
+            split: Split::new(2, 1).unwrap(),
         },
         loader.root().pp("lm_head"),
     )
     .unwrap();
 
-    let (output, Recording { launches, .. }) = record(&[Split { size: 2, rank: 1 }], || {
+    let (output, Recording { launches, .. }) = record(&[Split::new(2, 1).unwrap()], || {
         let logits = head.forward(&meta((3, 8), DType::BF16))?;
         Ok((logits.dims().to_vec(), logits.dtype()))
     });
@@ -842,7 +842,7 @@ fn a_whole_head_gathers_nothing_in_a_group_that_splits_something_else() {
         Recording {
             launches: in_group, ..
         },
-    ) = record(&[Split { size: 2, rank: 1 }], forward);
+    ) = record(&[Split::new(2, 1).unwrap()], forward);
     let (
         alone,
         Recording {
@@ -870,7 +870,7 @@ fn a_shard_shorter_than_its_peers_is_refused_at_load() {
             &LmHeadConfig {
                 vocabulary,
                 hidden: 8,
-                split: Split { size: 2, rank: 1 },
+                split: Split::new(2, 1).unwrap(),
             },
             loader.root().pp("lm_head"),
         )

@@ -264,10 +264,10 @@ impl Qwen3ForCausalLm {
     /// loaded for: its rows pass over that group.
     fn require_group(axis: &str, split: Split) -> Result<()> {
         let members = collective::split().map(|(_, members)| members);
-        if members != Some(u64::from(split.size)) {
+        if members != Some(u64::from(split.size())) {
             return Err(ID.config(format!(
                 "a {axis} split over {} ranks runs in a forward whose group is {members:?}",
-                split.size
+                split.size()
             )));
         }
         Ok(())
@@ -293,7 +293,7 @@ impl Qwen3ForCausalLm {
     /// rows of the stage before it, taken from the handoffs of every earlier stage in order.
     fn stage_input(&self, hidden: &Tensor) -> Result<(Tensor, Option<Tensor>)> {
         let mut input = (hidden.clone(), None);
-        for root in 0..self.pipeline.rank {
+        for root in 0..self.pipeline.rank() {
             let (output, stream) = self.handoff(root, (hidden, hidden))?;
             input = (output, Some(stream));
         }
@@ -305,7 +305,7 @@ impl Qwen3ForCausalLm {
     /// normalizes, and every stage of a pipeline ends with the last stage's rows, which it
     /// broadcasts.
     fn stage_output(&self, hidden: Tensor, residual: Tensor) -> Result<Tensor> {
-        let (stage, last) = (self.pipeline.rank, self.pipeline.size - 1);
+        let (stage, last) = (self.pipeline.rank(), self.pipeline.size() - 1);
         if stage < last {
             for root in stage..last {
                 self.handoff(root, (&hidden, &residual))?;
@@ -369,7 +369,7 @@ impl CausalLm for Qwen3ForCausalLm {
             if let Some(group) = group {
                 let text = &self.config.text;
                 let q_heads =
-                    text.num_attention_heads / (self.tensor.size * self.sequence.split.size);
+                    text.num_attention_heads / (self.tensor.size() * self.sequence.split.size());
                 functional::zero_arrival_counters_(&group.workspace, batch.rows(), q_heads)?;
             }
 
@@ -378,7 +378,7 @@ impl CausalLm for Qwen3ForCausalLm {
             // row of its share.
             let members = self.sequence.split;
             let shared;
-            let (rows, batch) = if members.size > 1 {
+            let (rows, batch) = if members.size() > 1 {
                 Self::require_group("sequence", members)?;
                 shared = TokenBatch {
                     live_tokens: None,
@@ -417,7 +417,7 @@ impl CausalLm for Qwen3ForCausalLm {
             let residual =
                 residual.ok_or_else(|| ID.config("a decoder stack of no layers".to_owned()))?;
             let output = self.stage_output(hidden, residual)?;
-            if members.size > 1 {
+            if members.size() > 1 {
                 return ulysses::gather(&output, members, tokens);
             }
             Ok(output)
@@ -458,7 +458,7 @@ impl TextModel for Qwen3ForCausalLm {
             layers: self.held_layers(false),
             // The load checked that the split divides the heads; at most one of the two splits
             // is above one.
-            kv_heads: text.num_key_value_heads / (self.tensor.size * self.sequence.split.size),
+            kv_heads: text.num_key_value_heads / (self.tensor.size() * self.sequence.split.size()),
             head_dim: text.head_dim,
             index_keys: None,
         }

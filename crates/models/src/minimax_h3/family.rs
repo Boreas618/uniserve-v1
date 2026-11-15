@@ -405,13 +405,13 @@ impl MinimaxH3 {
         // ranks; an all-gather degree splits rows alone.
         for (stage, denoiser) in &config.denoisers {
             let heads = denoiser.transformer.num_attention_heads;
-            let shares = split.ulysses.split.size * split.tensor.size;
+            let shares = split.ulysses.split.size() * split.tensor.size();
             if shares == 0 || !heads.is_multiple_of(shares) {
                 return Err(ID.config(format!(
                     "a Ulysses degree of {} in a tensor split of {} does not divide the {heads} \
                      attention heads of {}",
-                    split.ulysses.split.size,
-                    split.tensor.size,
+                    split.ulysses.split.size(),
+                    split.tensor.size(),
                     stage.name()
                 )));
             }

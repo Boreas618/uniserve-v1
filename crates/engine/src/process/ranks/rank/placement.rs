@@ -58,10 +58,7 @@ impl ModelRunner {
             self.capability_groups(),
             &self.group,
             u32::try_from(self.position()?).context("a rank past what the protocol numbers")?,
-            Split {
-                size: self.mapping.tensor_parallel,
-                rank: self.mapping.tensor_rank,
-            },
+            Split::new(self.mapping.tensor_parallel, self.mapping.tensor_rank)?,
             self.world_size,
             &denoisers,
             text_encoder,
@@ -155,27 +152,22 @@ impl Mapping {
     /// `draft_tokens` tokens a step: its tensor, pipeline and sequence splits, its share of the
     /// expert union's experts, and, when expert parallelism shards its own group's experts,
     /// whole experts of its tensor-parallel group's slots (`docs/expert_parallelism.md`).
-    pub(super) fn text_placement(&self, draft_tokens: u32) -> TextPlacement {
-        TextPlacement {
-            tensor: Split {
-                size: self.tensor_parallel,
-                rank: self.tensor_rank,
-            },
-            pipeline: Split {
-                size: self.pipeline_parallel,
-                rank: self.pipeline_rank,
-            },
+    ///
+    /// # Errors
+    ///
+    /// A split whose rank lies outside its degree.
+    pub(super) fn text_placement(&self, draft_tokens: u32) -> Result<TextPlacement> {
+        Ok(TextPlacement {
+            tensor: Split::new(self.tensor_parallel, self.tensor_rank)?,
+            pipeline: Split::new(self.pipeline_parallel, self.pipeline_rank)?,
             sequence: self.sequence,
-            experts: Split {
-                size: self.expert_parallel,
-                rank: self.expert_rank,
-            },
+            experts: Split::new(self.expert_parallel, self.expert_rank)?,
             tensor_experts: self.group_experts,
             // The drafter's layers load when the deployment speculates with them, and a model
             // whose state keeps a window per request sizes it by the drafts.
             drafter: draft_tokens > 0,
             draft_tokens,
-        }
+        })
     }
 }
 
@@ -201,14 +193,14 @@ pub(super) fn video_split(
     denoisers: &[&str],
     text_encoder: &str,
 ) -> Result<(DenoiserSplit, Split)> {
-    let tensor_parallel = tensor.size as usize;
-    let tensor_rank = tensor.rank as usize;
+    let tensor_parallel = tensor.size() as usize;
+    let tensor_rank = tensor.rank() as usize;
     let rank = usize::try_from(rank).context("a rank number the process addresses")?;
     let split = |size: usize, rank: usize| -> Result<Split> {
-        Ok(Split {
-            size: u32::try_from(size).context("a split wider than the protocol addresses")?,
-            rank: u32::try_from(rank).context("a split rank the protocol addresses")?,
-        })
+        Ok(Split::new(
+            u32::try_from(size).context("a split wider than the protocol addresses")?,
+            u32::try_from(rank).context("a split rank the protocol addresses")?,
+        )?)
     };
     let denoiser = denoisers.first().copied().unwrap_or_default();
     // A deployment that places the whole model states no block to split. With one rank there is no
@@ -423,10 +415,7 @@ mod tests {
             groups,
             group,
             rank,
-            Split {
-                size: tensor_parallel,
-                rank: tensor_rank,
-            },
+            Split::new(tensor_parallel, tensor_rank).unwrap(),
             world_size,
             &["transformer", "transformer_ref"],
             "text_encoder",
@@ -462,11 +451,11 @@ mod tests {
             "the group that places the denoiser is this rank's, whatever the launch calls it",
         );
         assert_eq!(
-            sequence.sequence().size,
+            sequence.sequence().size(),
             4,
             "its split is the one this rank serves"
         );
-        assert_eq!(sequence.sequence().rank, 1);
+        assert_eq!(sequence.sequence().rank(), 1);
 
         let two = page(
             "[[worker_groups]]\nid = \"text\"\nranks = [\"cuda:0-3\"]\nqueue_depth = 2\n\
@@ -498,19 +487,19 @@ mod tests {
         );
         let (sequence, tensor) =
             split(Some(&placed), "model", 2, 4, 2, 4).expect("a four-way exchange partition");
-        assert_eq!(sequence.sequence().size, 4, "the page states the degree");
+        assert_eq!(sequence.sequence().size(), 4, "the page states the degree");
         assert_eq!(
             sequence.ulysses.projection,
             Projection::Exchange,
             "the page states the projection"
         );
         assert_eq!(
-            (tensor.size, tensor.rank),
+            (tensor.size(), tensor.rank()),
             (4, 2),
             "the tensor place is the rank's"
         );
         assert_eq!(
-            sequence.sequence().rank,
+            sequence.sequence().rank(),
             2,
             "a block of every rank places the rank at its ordinal"
         );
@@ -529,12 +518,15 @@ mod tests {
              [worker_groups.blocks.text_encoder]\nranks = [0, 1, 2, 3]\ntensor_parallel_size = 4\n",
         );
         let (_, tensor) = split(Some(&placed), "model", 2, 1, 0, 8).expect("a member's split");
-        assert_eq!((tensor.size, tensor.rank), (4, 2));
+        assert_eq!((tensor.size(), tensor.rank()), (4, 2));
 
         let (sequence, tensor) =
             split(Some(&placed), "model", 5, 1, 0, 8).expect("a denoising rank outside the block");
         assert_eq!(tensor, Split::WHOLE);
-        assert_eq!((sequence.sequence().size, sequence.sequence().rank), (8, 5));
+        assert_eq!(
+            (sequence.sequence().size(), sequence.sequence().rank()),
+            (8, 5)
+        );
     }
 
     /// A denoiser block's order places each rank on its four degrees, the Ulysses degree
@@ -553,10 +545,10 @@ mod tests {
         let place = |groups: &[WorkerGroupConfig], rank: u32| {
             let (denoiser, _) = split(Some(groups), "model", rank, 1, 0, 4).unwrap();
             (
-                (denoiser.sequence().size, denoiser.sequence().rank),
-                denoiser.ulysses.split.size,
-                (denoiser.tensor.size, denoiser.tensor.rank),
-                (denoiser.layers.size, denoiser.layers.rank),
+                (denoiser.sequence().size(), denoiser.sequence().rank()),
+                denoiser.ulysses.split.size(),
+                (denoiser.tensor.size(), denoiser.tensor.rank()),
+                (denoiser.layers.size(), denoiser.layers.rank()),
             )
         };
 
@@ -574,7 +566,10 @@ mod tests {
             "sequence_parallel = { kind = \"hybrid\", ulysses_degree = 2, allgather_degree = 2 }",
         );
         let (denoiser, _) = split(Some(&hybrid), "model", 0, 1, 0, 4).unwrap();
-        assert_eq!((denoiser.ulysses.split.rank, denoiser.gather.rank), (1, 1));
+        assert_eq!(
+            (denoiser.ulysses.split.rank(), denoiser.gather.rank()),
+            (1, 1)
+        );
         assert_eq!(denoiser.ulysses.projection, Projection::Gather);
 
         let pipeline = placed("pipeline_parallel_size = 4");
@@ -629,7 +624,7 @@ mod tests {
             ));
             let (sequence, _) = split(Some(&placed), "model", 0, 1, 0, 2)
                 .unwrap_or_else(|error| panic!("the {projection} projection is served: {error:#}"));
-            assert_eq!(sequence.sequence().size, 2);
+            assert_eq!(sequence.sequence().size(), 2);
         }
         let two = page(
             "[[worker_groups]]\nid = \"model\"\nranks = [\"cuda:0-1\"]\nqueue_depth = 2\n\

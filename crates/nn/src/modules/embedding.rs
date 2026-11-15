@@ -55,7 +55,7 @@ impl Embedding {
             weight,
             first,
             vocabulary: config.vocabulary,
-            shards: config.split.size.max(1),
+            shards: config.split.size(),
         })
     }
 

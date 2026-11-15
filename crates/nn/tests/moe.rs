@@ -1180,24 +1180,15 @@ fn a_block_refuses_a_routing_or_a_share_its_checkpoint_does_not_have() {
         assert!(message.contains("permutation"), "{message}");
     }
 
-    // Splits that do not divide the experts or their width, and a rank outside its group.
-    let third = Split { size: 3, rank: 0 };
-    let outside = Split { size: 2, rank: 2 };
+    // Splits that do not divide the experts or their width.
+    let third = Split::new(3, 0).unwrap();
     for config in [
         MoEConfig {
             exchange: third,
             ..dense_config()
         },
         MoEConfig {
-            exchange: outside,
-            ..dense_config()
-        },
-        MoEConfig {
-            split: Split { size: 4, rank: 0 },
-            ..dense_config()
-        },
-        MoEConfig {
-            split: outside,
+            split: Split::new(4, 0).unwrap(),
             ..dense_config()
         },
     ] {
@@ -1222,7 +1213,7 @@ fn a_block_split_over_a_tensor_group_holds_its_share_and_reduces_its_sum() {
     let directory = tempfile::tempdir().unwrap();
     let checkpoint = dense_checkpoint(directory.path(), DType::BF16);
     let config = MoEConfig {
-        split: Split { size: 2, rank: 1 },
+        split: Split::new(2, 1).unwrap(),
         ..dense_config()
     };
 
@@ -1255,7 +1246,7 @@ fn a_block_split_over_a_tensor_group_holds_its_share_and_reduces_its_sum() {
     let message = alone.err().unwrap().to_string();
     assert!(message.contains("no group"), "{message}");
 
-    let (grouped, Recording { launches, .. }) = record(&[Split { size: 2, rank: 1 }], || {
+    let (grouped, Recording { launches, .. }) = record(&[Split::new(2, 1).unwrap()], || {
         block.forward(&meta((4, 8), DType::BF16), None, None)
     });
     assert_eq!(grouped.unwrap().dims(), [4, 8]);
@@ -1293,7 +1284,7 @@ fn a_tensor_group_holding_whole_experts_runs_its_window_over_every_token_and_red
     let directory = tempfile::tempdir().unwrap();
     let checkpoint = dense_checkpoint(directory.path(), DType::BF16);
     let config = MoEConfig {
-        split: Split { size: 2, rank: 1 },
+        split: Split::new(2, 1).unwrap(),
         tensor_experts: true,
         ..dense_config()
     };
@@ -1336,7 +1327,7 @@ fn a_tensor_group_holding_whole_experts_runs_its_window_over_every_token_and_red
     let message = alone.err().unwrap().to_string();
     assert!(message.contains("no group"), "{message}");
 
-    let (grouped, Recording { launches, .. }) = record(&[Split { size: 2, rank: 1 }], || {
+    let (grouped, Recording { launches, .. }) = record(&[Split::new(2, 1).unwrap()], || {
         block.forward(&meta((4, 8), DType::BF16), None, None)
     });
     assert_eq!(grouped.unwrap().dims(), [4, 8]);
@@ -1366,7 +1357,7 @@ fn a_tensor_group_holding_whole_experts_runs_its_window_over_every_token_and_red
 
     // Its ranks hold the same tokens, so an exchange would carry their routes twice.
     let lent = exchange(2, 4, 8, 2);
-    let (exchanged, _) = record(&[Split { size: 2, rank: 1 }], || {
+    let (exchanged, _) = record(&[Split::new(2, 1).unwrap()], || {
         block.forward(&meta((4, 8), DType::BF16), None, Some(&lent))
     });
     let message = exchanged.err().unwrap().to_string();
@@ -1375,7 +1366,7 @@ fn a_tensor_group_holding_whole_experts_runs_its_window_over_every_token_and_red
     // One group divides the slots.
     let message = MoE::load(
         &MoEConfig {
-            exchange: Split { size: 2, rank: 0 },
+            exchange: Split::new(2, 0).unwrap(),
             ..config
         },
         meta_loader.root().pp("mlp"),
@@ -1552,7 +1543,7 @@ fn a_calibrated_block_runs_the_packed_products_over_its_stacks() {
             ..packed_config()
         },
         MoEConfig {
-            split: Split { size: 2, rank: 0 },
+            split: Split::new(2, 0).unwrap(),
             ..packed_config()
         },
     ] {
@@ -1578,7 +1569,7 @@ fn a_tensor_group_holding_whole_packed_experts_runs_the_packed_products_over_its
         .unwrap();
     let block = MoE::load(
         &MoEConfig {
-            split: Split { size: 2, rank: 1 },
+            split: Split::new(2, 1).unwrap(),
             tensor_experts: true,
             ..packed_config()
         },
@@ -1587,7 +1578,7 @@ fn a_tensor_group_holding_whole_packed_experts_runs_the_packed_products_over_its
     .unwrap();
     assert_eq!((block.experts(), block.local_experts()), (2, 1));
 
-    let (output, Recording { launches, .. }) = record(&[Split { size: 2, rank: 1 }], || {
+    let (output, Recording { launches, .. }) = record(&[Split::new(2, 1).unwrap()], || {
         block.forward(&meta((3, 32), DType::BF16), None, None)
     });
     assert_eq!(output.unwrap().dims(), [3, 32]);
@@ -1649,7 +1640,7 @@ fn a_block_over_an_expert_group_exchanges_its_routes_around_its_own_experts() {
     let loader = WeightLoader::new(&checkpoint, &store, None);
     let block = MoE::load(
         &MoEConfig {
-            exchange: Split { size: 2, rank: 1 },
+            exchange: Split::new(2, 1).unwrap(),
             ..dense_config()
         },
         loader.root().pp("mlp"),
@@ -1669,7 +1660,7 @@ fn a_block_over_an_expert_group_exchanges_its_routes_around_its_own_experts() {
     // experts.
     let lent = exchange(2, 4, 8, 2);
     let live_tokens = meta(1, DType::U32);
-    let (output, Recording { launches, .. }) = record(&[Split { size: 2, rank: 1 }], || {
+    let (output, Recording { launches, .. }) = record(&[Split::new(2, 1).unwrap()], || {
         block.forward(&meta((3, 8), DType::BF16), Some(&live_tokens), Some(&lent))
     });
     assert_eq!(output.unwrap().dims(), [3, 8]);
@@ -1706,7 +1697,7 @@ fn a_block_over_an_expert_group_exchanges_its_routes_around_its_own_experts() {
     );
 
     // A rank with no tokens of its own joins the step: it sends nothing and serves its peers.
-    let (joined, Recording { launches, .. }) = record(&[Split { size: 2, rank: 1 }], || {
+    let (joined, Recording { launches, .. }) = record(&[Split::new(2, 1).unwrap()], || {
         block.join_expert_step(&lent)
     });
     joined.unwrap();
@@ -1772,7 +1763,7 @@ fn a_calibrated_block_over_an_expert_group_runs_in_the_exchange_s_one_launch() {
         .unwrap();
     let block = MoE::load(
         &MoEConfig {
-            exchange: Split { size: 2, rank: 0 },
+            exchange: Split::new(2, 0).unwrap(),
             ..packed_config()
         },
         loader.root().pp("mlp"),

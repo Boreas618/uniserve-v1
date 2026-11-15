@@ -195,11 +195,12 @@ impl MoE {
 
         // One group divides the slots: a tensor group that holds whole experts runs them over
         // every token, so no exchange beside it moves one.
-        if config.tensor_experts && exchange.size > 1 {
+        if config.tensor_experts && exchange.size() > 1 {
             return Err(refuse(format!(
                 "a tensor group of {} that holds whole experts and an expert group of {} both \
                  divide the slots: one group divides them",
-                config.split.size, exchange.size
+                config.split.size(),
+                exchange.size()
             )));
         }
         // The tensor group's split as the share of each expert's width (`split`) and as the
@@ -225,30 +226,27 @@ impl MoE {
                 config.order.len()
             )));
         }
-        if windows.size == 0
-            || windows.rank >= windows.size
-            || !experts.is_multiple_of(windows.size)
-        {
+        if !experts.is_multiple_of(windows.size()) {
             return Err(refuse(format!(
                 "rank {} of the {holder} group of {} does not hold a share of {experts} experts",
-                windows.rank, windows.size
+                windows.rank(),
+                windows.size()
             )));
         }
-        if split.size == 0
-            || split.rank >= split.size
-            || !config.intermediate.is_multiple_of(split.size)
-        {
+        if !config.intermediate.is_multiple_of(split.size()) {
             return Err(refuse(format!(
                 "rank {} of a tensor group of {} does not hold a share of an expert's {} \
                  intermediate columns",
-                split.rank, split.size, config.intermediate
+                split.rank(),
+                split.size(),
+                config.intermediate
             )));
         }
 
-        let held = experts / windows.size;
-        let local = windows.rank * held..(windows.rank + 1) * held;
+        let held = experts / windows.size();
+        let local = windows.rank() * held..(windows.rank() + 1) * held;
         let window = &config.order[local.start as usize..local.end as usize];
-        let intermediate = config.intermediate / split.size;
+        let intermediate = config.intermediate / split.size();
 
         let router = Linear::new(
             vb.pp(config.router)
@@ -271,16 +269,16 @@ impl MoE {
             // A rank's block of packed experts: whole bytes and block scales of every row,
             // padded to the width the products compute over.
             let padded = packed_width(intermediate);
-            let share = (split.size > 1).then_some((
-                u64::from(split.rank * intermediate),
+            let share = (split.size() > 1).then_some((
+                u64::from(split.rank() * intermediate),
                 u64::from(intermediate),
                 u64::from(padded),
             ));
-            if share.is_some() && (exchange.size > 1 || !intermediate.is_multiple_of(16)) {
+            if share.is_some() && (exchange.size() > 1 || !intermediate.is_multiple_of(16)) {
                 return Err(refuse(format!(
                     "packed experts split over a tensor group of {} hold blocks of {intermediate} \
                      columns: whole block scales of sixteen, and no expert group beside it",
-                    split.size
+                    split.size()
                 )));
             }
 
@@ -290,7 +288,7 @@ impl MoE {
                 intermediate
             };
             (
-                Self::load_packed(config, &vb, window, exchange.size > 1, share)?,
+                Self::load_packed(config, &vb, window, exchange.size() > 1, share)?,
                 width,
             )
         } else {
@@ -309,10 +307,10 @@ impl MoE {
             activation: config.activation,
             renormalize: config.renormalize,
             local,
-            exchanges: exchange.size > 1,
+            exchanges: exchange.size() > 1,
             // The tensor group sums its ranks' outputs whether it divides each expert's width
             // or the slots.
-            reduce: config.split.size,
+            reduce: config.split.size(),
         })
     }
 
@@ -326,8 +324,8 @@ impl MoE {
         split: Split,
     ) -> Result<(Tensor, Tensor)> {
         let (hidden, intermediate) = (u64::from(config.hidden), u64::from(config.intermediate));
-        let local_intermediate = intermediate / u64::from(split.size);
-        let first = u64::from(split.rank) * local_intermediate;
+        let local_intermediate = intermediate / u64::from(split.size());
+        let first = u64::from(split.rank()) * local_intermediate;
         let count = window.len() as u64;
         let list = vb.pp(config.list);
 
@@ -394,7 +392,7 @@ impl MoE {
                     .iter()
                     .map(|&expert| weight(expert, config.down))
                     .collect();
-                let block = |block: PartBlock| (split.size > 1).then_some(block);
+                let block = |block: PartBlock| (split.size() > 1).then_some(block);
 
                 (
                     vb.name("experts.up_gate"),

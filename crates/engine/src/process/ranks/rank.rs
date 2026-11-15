@@ -508,10 +508,7 @@ impl ModelRunner {
         let along = |degree: usize| -> Result<Split> {
             let size =
                 u32::try_from(degree).context("a degree wider than the protocol addresses")?;
-            Ok(Split {
-                size,
-                rank: if size > 1 { position } else { 0 },
-            })
+            Ok(Split::new(size, if size > 1 { position } else { 0 })?)
         };
         let (tensor, pipeline, sequence) = (
             along(block.tensor_parallel_size)?,
@@ -523,10 +520,10 @@ impl ModelRunner {
         placed.rank = rank;
         placed.group = group.id.0.clone();
         placed.world_size = ranks;
-        placed.mapping.tensor_parallel = tensor.size;
-        placed.mapping.tensor_rank = tensor.rank;
-        placed.mapping.pipeline_parallel = pipeline.size;
-        placed.mapping.pipeline_rank = pipeline.rank;
+        placed.mapping.tensor_parallel = tensor.size();
+        placed.mapping.tensor_rank = tensor.rank();
+        placed.mapping.pipeline_parallel = pipeline.size();
+        placed.mapping.pipeline_rank = pipeline.rank();
         placed.mapping.sequence = SequenceSplit {
             split: sequence,
             projection,
@@ -755,12 +752,16 @@ impl ModelRunner {
         let opened = nn::Checkpoint::open(self.checkpoint())?;
         let checkpoint = family.open(&opened, &self.engine_config().model.quantization)?;
         let mut loader = nn::WeightLoader::new(&opened, weights, None);
-        Ok(checkpoint.load(&opened, &mut loader, &self.text_placement(), experts)?)
+        Ok(checkpoint.load(&opened, &mut loader, &self.text_placement()?, experts)?)
     }
 
     /// The placement this rank's causal language model loads at: its splits of the model and
     /// its share of the routed experts, as the deployment places the rank.
-    pub(crate) fn text_placement(&self) -> TextPlacement {
+    ///
+    /// # Errors
+    ///
+    /// A split whose rank lies outside its degree.
+    pub(crate) fn text_placement(&self) -> Result<TextPlacement> {
         self.mapping
             .text_placement(self.engine_config().speculative.num_draft_tokens)
     }

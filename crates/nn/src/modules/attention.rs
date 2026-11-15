@@ -199,18 +199,20 @@ impl Attention {
         // A sequence split exchanges rows over the forward's one group, which a tensor split
         // would need for its own sums.
         let sequence = config.sequence;
-        let members = sequence.split.size;
+        let members = sequence.split.size();
         if members > 1 {
             let divides = config.qkv.heads.is_multiple_of(members)
                 && config.qkv.kv_heads.is_multiple_of(members);
-            if config.qkv.split.size > 1 || !divides {
+            if config.qkv.split.size() > 1 || !divides {
                 return Err(Error::shape(
                     OWNER,
                     format!(
                         "a sequence split over {members} members of {} query and {} key heads, \
                          beside a tensor split over {}: the members share the heads evenly, and \
                          the forward's group is one split",
-                        config.qkv.heads, config.qkv.kv_heads, config.qkv.split.size
+                        config.qkv.heads,
+                        config.qkv.kv_heads,
+                        config.qkv.split.size()
                     ),
                 ));
             }
@@ -245,7 +247,7 @@ impl Attention {
                 inputs: config.qkv.heads * head_dim,
                 outputs: config.qkv.hidden,
                 bias: config.output_bias,
-                parallel: if split.size == 1 {
+                parallel: if split.size() == 1 {
                     Parallel::None
                 } else {
                     Parallel::Row(split)
@@ -444,7 +446,7 @@ impl Attention {
     /// Refuses the dense forward `name` of an attention loaded with a sequence split: its rows
     /// are exchanged around the paged forward alone.
     fn whole(&self, name: &str) -> Result<()> {
-        if self.sequence.split.size > 1 {
+        if self.sequence.split.size() > 1 {
             return Err(Error::Unsupported(format!(
                 "Attention: {name} over a sequence split; a split attention runs the paged forward"
             )));
@@ -471,7 +473,7 @@ impl Attention {
                 format!("{:?} is not [rows, hidden]", hidden.dims()),
             ));
         };
-        let members = self.sequence.split.size;
+        let members = self.sequence.split.size();
         let expected = if members > 1 {
             share_rows(rows, members)
         } else {
@@ -583,7 +585,7 @@ impl Attention {
     /// member's share.
     fn project(&self, hidden: &Tensor, rows: usize) -> Result<[Tensor; 3]> {
         let projections = [self.qkv.query(), self.qkv.key(), self.qkv.value()];
-        let members = self.sequence.split.size as usize;
+        let members = self.sequence.split.size() as usize;
         if members <= 1 {
             let [query, key, value] = projections.map(|projection| projection.forward(hidden));
             return Ok([query?, key?, value?]);
@@ -634,7 +636,7 @@ impl Attention {
     /// its `own` rows of every member's heads, padded past the sequence's last row, which the
     /// whole output projection reads: `[own, hidden]`.
     fn project_out(&self, attended: &Tensor, own: usize) -> Result<Tensor> {
-        let members = self.sequence.split.size as usize;
+        let members = self.sequence.split.size() as usize;
         if members <= 1 {
             return self.output.forward(attended);
         }
@@ -669,13 +671,13 @@ impl Attention {
     /// Refuses a forward whose group is not the attention's sequence split.
     fn grouped(&self) -> Result<()> {
         let members = collective::split().map(|(_, members)| members);
-        if members != Some(u64::from(self.sequence.split.size)) {
+        if members != Some(u64::from(self.sequence.split.size())) {
             return Err(Error::shape(
                 "Attention",
                 format!(
                     "an attention split over {} members runs in a forward whose group is \
                      {members:?}",
-                    self.sequence.split.size
+                    self.sequence.split.size()
                 ),
             ));
         }

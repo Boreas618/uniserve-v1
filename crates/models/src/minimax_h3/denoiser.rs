@@ -139,22 +139,11 @@ impl Denoiser {
         if transformer.head_dim == 0 || transformer.num_attention_heads == 0 {
             return Err(ID.config("a denoiser's transformer has attention heads".to_owned()));
         }
-        // The sequence split's places are the Ulysses split's inside the all-gather split's.
-        for (axis, place) in [
-            ("Ulysses", split.ulysses.split),
-            ("all-gather", split.gather),
-        ] {
-            if place.rank >= place.size {
-                return Err(ID.config(format!(
-                    "rank {} of a {axis} split of {} is no place of it",
-                    place.rank, place.size
-                )));
-            }
-        }
-        if !sequence.size.is_power_of_two() {
+        if !sequence.size().is_power_of_two() {
             return Err(ID.config(format!(
                 "rank {} of a sequence split of {} is not a rank of a power-of-two split",
-                sequence.rank, sequence.size
+                sequence.rank(),
+                sequence.size()
             )));
         }
         let unit = config.capacity_unit();
@@ -452,12 +441,12 @@ fn max_rows(config: &DenoiserConfig, capacity: (u32, u32), split: DenoiserSplit)
 /// computes the values of the unpadded layout.
 fn layout_rows(layout: &Layout, vsa: Option<&VsaConfig>, split: DenoiserSplit) -> usize {
     let Some(vsa) = vsa else {
-        return packing::dense_len(layout, split.sequence().size);
+        return packing::dense_len(layout, split.sequence().size());
     };
 
     // One whole tile of every all-gather interval, and one whole block of every rank.
-    let step = split.gather.size as usize * vsa.tile_rows as usize;
-    let blocks = split.sequence().size as usize * functional::VSA_BLOCK_ROWS as usize;
+    let step = split.gather.size() as usize * vsa.tile_rows as usize;
+    let blocks = split.sequence().size() as usize * functional::VSA_BLOCK_ROWS as usize;
 
     // The steps reach a common multiple of both within `blocks` of them.
     let mut rows = packing::tiled_len(layout, vsa).next_multiple_of(step);
@@ -732,10 +721,10 @@ impl Denoiser {
                     }
                 }
             }
-            None => packing::dense_rows(request, &layout, self.split.sequence().size)?,
+            None => packing::dense_rows(request, &layout, self.split.sequence().size())?,
         };
         let tokens = rows.elem_count();
-        let ranks = self.split.sequence().size as usize;
+        let ranks = self.split.sequence().size() as usize;
         if tokens > self.max_rows as usize || !tokens.is_multiple_of(ranks) {
             return Err(ID.request(format!(
                 "a layout of {tokens} packed rows on a denoiser loaded for {} rows over {ranks} \
@@ -744,7 +733,7 @@ impl Denoiser {
             )));
         }
         let own = tokens / ranks;
-        let first = self.split.sequence().rank as usize * own;
+        let first = self.split.sequence().rank() as usize * own;
         let interval =
             |table: &Tensor| -> Result<Tensor> { on_device(&table.narrow(0, first, own)?, video) };
 
@@ -822,7 +811,7 @@ impl Denoiser {
         // Each modality's velocity rows, in its own order: every rank's interval gathered in
         // sequence order, the Ulysses group's consecutive intervals first and the groups' after,
         // and the modality's rows read out of the whole sequence.
-        let (ulysses, gather) = (self.split.ulysses.split.size, self.split.gather.size);
+        let (ulysses, gather) = (self.split.ulysses.split.size(), self.split.gather.size());
         let collected = |velocity: Tensor, places: &Tensor| -> Result<Tensor> {
             let mut sequence = velocity;
             for (axis, size) in [(ULYSSES_AXIS, ulysses), (GATHER_AXIS, gather)] {

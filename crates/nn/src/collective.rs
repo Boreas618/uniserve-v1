@@ -18,18 +18,56 @@ use tensor::Tensor;
 
 use crate::Result;
 
-/// One rank's place in a partition of `size` ranks, as a module's `load` reads it.
+/// One rank's place in a partition of ranks, as a module's `load` reads it.
+///
+/// A partition spans at least one rank and the place is one of them: [`Split::new`] refuses any
+/// other pair, so a module reads `size` and `rank` without checking them again.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Split {
-    /// Ranks the partition spans; one is no partition.
-    pub size: u32,
+    /// Ranks the partition spans, at least one; one is no partition.
+    size: u32,
     /// This rank's position in it, below `size`.
-    pub rank: u32,
+    rank: u32,
 }
 
 impl Split {
     /// No partition: one rank holds the whole.
     pub const WHOLE: Self = Self { size: 1, rank: 0 };
+
+    /// Rank `rank`'s place in a partition of `size` ranks.
+    ///
+    /// # Errors
+    ///
+    /// [`crate::Error::Shape`] for a partition of no rank, or a rank outside the partition.
+    pub fn new(size: u32, rank: u32) -> Result<Self> {
+        if size == 0 || rank >= size {
+            return Err(crate::Error::shape(
+                "Split",
+                format!("rank {rank} is no place of a partition of {size} ranks"),
+            ));
+        }
+        Ok(Self { size, rank })
+    }
+
+    /// Ranks the partition spans, at least one.
+    pub const fn size(self) -> u32 {
+        self.size
+    }
+
+    /// This rank's position in the partition, below [`Self::size`].
+    pub const fn rank(self) -> u32 {
+        self.rank
+    }
+
+    /// The partition that divides each place of this one into the places of `inner`, `inner`'s
+    /// place varying fastest: `size · inner.size` places, this rank at
+    /// `rank · inner.size + inner.rank`.
+    pub const fn nest(self, inner: Self) -> Self {
+        Self {
+            size: self.size * inner.size,
+            rank: self.rank * inner.size + inner.rank,
+        }
+    }
 }
 
 /// This rank's index in the forward's group and the group's member count, or `None` when the
@@ -193,4 +231,27 @@ pub fn finish(started: usize) -> Result<()> {
 /// When the stream cannot be waited for.
 pub fn settle() -> Result<()> {
     Ok(ops::collective::settle()?)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Split;
+
+    #[test]
+    fn a_split_places_its_rank_among_at_least_one() {
+        assert!(Split::new(0, 0).is_err(), "a partition of no rank");
+        assert!(Split::new(4, 4).is_err(), "a rank past the partition");
+
+        let split = Split::new(4, 3).expect("a place of four ranks");
+        assert_eq!((split.size(), split.rank()), (4, 3));
+    }
+
+    #[test]
+    fn a_nested_split_varies_its_inner_place_fastest() {
+        let outer = Split::new(2, 1).unwrap();
+        let inner = Split::new(4, 3).unwrap();
+
+        assert_eq!(outer.nest(inner), Split::new(8, 7).unwrap());
+        assert_eq!(Split::WHOLE.nest(inner), inner);
+    }
 }

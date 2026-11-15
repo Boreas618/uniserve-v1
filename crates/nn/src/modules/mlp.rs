@@ -82,7 +82,7 @@ impl Mlp {
             ));
         }
 
-        let (column, row) = if config.split.size == 1 {
+        let (column, row) = if config.split.size() == 1 {
             (Parallel::None, Parallel::None)
         } else {
             (Parallel::Column(config.split), Parallel::Row(config.split))
@@ -104,7 +104,7 @@ impl Mlp {
                 gate: input(gate, config.intermediate)?,
                 up: input(up, config.intermediate)?,
             },
-            GateUp::ValueFirst(name) if config.split.size == 1 => {
+            GateUp::ValueFirst(name) if config.split.size() == 1 => {
                 Inputs::ValueFirst(input(name, 2 * config.intermediate)?)
             }
             // A rank's share of the packed rows is not one block of them: its value rows lie in
@@ -119,17 +119,14 @@ impl Mlp {
                             inputs: config.hidden,
                             outputs: 2 * config.intermediate,
                             bias: config.bias,
-                            parallel: Parallel::Column(Split {
-                                size: 2 * split.size,
-                                rank,
-                            }),
+                            parallel: Parallel::Column(Split::new(2 * split.size(), rank)?),
                         },
                         vb.pp(name),
                     )
                 };
                 Inputs::Split {
-                    up: half(split.rank)?,
-                    gate: half(split.size + split.rank)?,
+                    up: half(split.rank())?,
+                    gate: half(split.size() + split.rank())?,
                 }
             }
         };

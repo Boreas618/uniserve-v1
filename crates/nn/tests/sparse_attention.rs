@@ -837,8 +837,7 @@ fn a_member_of_an_all_gather_group_attends_its_interval_over_every_tile() {
             first,
         )
     };
-    let (branches, Recording { launches, .. }) =
-        record(&[Split { size: 2, rank: 1 }], || attend(2));
+    let (branches, Recording { launches, .. }) = record(&[Split::new(2, 1).unwrap()], || attend(2));
     let (fine, compressed) = branches.unwrap();
     assert_eq!(fine.dims(), [2 * 64, 4 * 128]);
     assert_eq!(
@@ -851,7 +850,7 @@ fn a_member_of_an_all_gather_group_attends_its_interval_over_every_tile() {
         assert!(operators.contains(&operator), "{operators:?}");
     }
 
-    let (past, _) = record(&[Split { size: 2, rank: 1 }], || attend(3));
+    let (past, _) = record(&[Split::new(2, 1).unwrap()], || attend(3));
     assert!(past.is_err());
 }
 
@@ -867,7 +866,7 @@ fn ulysses(checkpoint: &Checkpoint, projection: Projection) -> UlyssesAttention 
             head_dim: 16,
             inputs: &["to_q"],
             output: "to_out",
-            split: Split { size: 2, rank: 1 },
+            split: Split::new(2, 1).unwrap(),
             projection,
             tensor: Split::WHOLE,
             axis: 0,
@@ -892,7 +891,7 @@ fn a_sequence_split_projects_heads_by_its_mode_and_returns_rows() {
             ("attn.to_out.weight", vec![32, 64], sequence(32 * 64, 31)),
         ],
     );
-    let split = [Split { size: 2, rank: 1 }];
+    let split = [Split::new(2, 1).unwrap()];
 
     // Four own rows of a sequence of eight; this member's heads are two of four, 32 channels.
     let exchange = ulysses(&checkpoint, Projection::Exchange);
@@ -951,7 +950,7 @@ fn a_sequence_split_projects_heads_by_its_mode_and_returns_rows() {
     gathered.unwrap();
 
     // A group of another size, and a forward with none, are refused before any collective.
-    let (refused, _) = record(&[Split { size: 4, rank: 1 }], || {
+    let (refused, _) = record(&[Split::new(4, 1).unwrap()], || {
         exchange.project(0, &meta((4, 32), DType::BF16))
     });
     let text = refused.err().unwrap().to_string();
@@ -983,9 +982,9 @@ fn a_sequence_split_inside_a_tensor_split_holds_its_share_of_the_tensor_rank_s_h
             head_dim: 16,
             inputs: &["to_q"],
             output: "to_out",
-            split: Split { size: 2, rank: 1 },
+            split: Split::new(2, 1).unwrap(),
             projection: Projection::Exchange,
-            tensor: Split { size: 2, rank: 1 },
+            tensor: Split::new(2, 1).unwrap(),
             axis: 1,
         },
         loader.root().pp("attn"),
@@ -1016,9 +1015,9 @@ fn a_sequence_split_inside_a_tensor_split_holds_its_share_of_the_tensor_rank_s_h
             head_dim: 16,
             inputs: &["to_q"],
             output: "to_out",
-            split: Split { size: 4, rank: 0 },
+            split: Split::new(4, 0).unwrap(),
             projection: Projection::Exchange,
-            tensor: Split { size: 2, rank: 0 },
+            tensor: Split::new(2, 0).unwrap(),
             axis: 1,
         },
         loader.root().pp("attn"),

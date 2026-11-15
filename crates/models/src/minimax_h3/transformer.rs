@@ -155,7 +155,7 @@ impl Attention {
     ) -> Result<Self> {
         let transformer = &config.transformer;
         let head_dim = transformer.head_dim as usize;
-        let shares = split.ulysses.split.size * split.tensor.size;
+        let shares = split.ulysses.split.size() * split.tensor.size();
         let local_heads = transformer.num_attention_heads / shares.max(1);
         let rotary = rotary_config(transformer);
 
@@ -219,8 +219,8 @@ impl Attention {
     /// The first row and the rows of this rank's Ulysses group's interval of a sequence of
     /// `rows` packed rows: the whole sequence without an all-gather degree.
     fn interval(&self, rows: usize) -> (usize, usize) {
-        let own = rows / self.gather.size.max(1) as usize;
-        (self.gather.rank as usize * own, own)
+        let own = rows / self.gather.size() as usize;
+        (self.gather.rank() as usize * own, own)
     }
 
     /// The rotary tables `factors` of the whole sequence narrowed to the interval of `rows`
@@ -266,7 +266,7 @@ impl Attention {
     ) -> Result<Tensor> {
         let ulysses = &self.ulysses;
         let rows = ulysses.rows(normalized)?;
-        let gathers = self.gather.size > 1;
+        let gathers = self.gather.size() > 1;
 
         let Some(vsa) = &self.vsa else {
             let [queries, keys] = tables else {
@@ -428,7 +428,7 @@ impl Block {
                 self.attention.forward(normalized, factors, tables)
             })
         };
-        match self.tensor.size {
+        match self.tensor.size() {
             1 => Ok(forward()?),
             _ => Ok(collective::along(TENSOR_AXIS, forward)?),
         }
@@ -514,7 +514,7 @@ impl Block {
         // exchange after another. The composition folds one tile's compression into each kernel
         // block of an owner's rows, so the intervals are whole blocks of rows the layout made
         // whole blocks on every rank.
-        let slots: Vec<u32> = (0..split.size).collect();
+        let slots: Vec<u32> = (0..split.size()).collect();
         let unit = functional::VSA_BLOCK_ROWS as usize;
         let mut returning = Vec::new();
         for interval in UlyssesAttention::intervals(own, unit) {
@@ -544,7 +544,7 @@ impl Block {
                     .adaln
                     .attention_input(next_table, &interval_rows, &output)?;
 
-                sequence.slice_set(&normalized, 0, own * split.rank as usize + first)?;
+                sequence.slice_set(&normalized, 0, own * split.rank() as usize + first)?;
                 arriving.push(ulysses.start_gather(sequence, own, interval)?);
             }
             outputs.push(output);
@@ -741,10 +741,11 @@ impl Transformer {
             OutputHead::load(transformer, out, weights.as_deref(), vb.pp(name))
         };
 
-        if split.layers.size == 0 || split.layers.size > transformer.num_hidden_layers {
+        if split.layers.size() > transformer.num_hidden_layers {
             return Err(ID.config(format!(
                 "a layer split of {} stages over a stack of {} blocks",
-                split.layers.size, transformer.num_hidden_layers
+                split.layers.size(),
+                transformer.num_hidden_layers
             )));
         }
         let stage = split.stage_blocks(transformer.num_hidden_layers);
@@ -753,10 +754,10 @@ impl Transformer {
             .map(|index| Block::load(config, split, max_rows, vb.pp(BLOCKS).pp(index)))
             .collect::<Result<Vec<_>>>()?;
         let overlapped = config.vsa.is_some()
-            && split.ulysses.split.size > 1
-            && split.gather.size == 1
-            && split.tensor.size == 1
-            && split.layers.size == 1;
+            && split.ulysses.split.size() > 1
+            && split.gather.size() == 1
+            && split.tensor.size() == 1
+            && split.layers.size() == 1;
 
         Ok(Self {
             proj_in: project_in("proj_in", transformer.patch_width())?,
@@ -930,7 +931,7 @@ impl Transformer {
                         })
                     })
             };
-            let (stages, stage) = (self.layers.size, self.layers.rank);
+            let (stages, stage) = (self.layers.size(), self.layers.rank());
             if stages == 1 {
                 return blocks(hidden.clone());
             }
@@ -977,7 +978,7 @@ impl Transformer {
             let normalized = first.adaln.attention_input(&modulation, rows, hidden)?;
 
             let sequence = nn::collective::sequence_like(&normalized)?;
-            sequence.slice_set(&normalized, 0, own * ulysses.split().rank as usize)?;
+            sequence.slice_set(&normalized, 0, own * ulysses.split().rank() as usize)?;
             arriving.push(ulysses.start_gather(&sequence, own, 0..own)?);
 
             Some(sequence)

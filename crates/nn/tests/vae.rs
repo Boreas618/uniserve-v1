@@ -251,7 +251,7 @@ fn a_tiled_encode_runs_each_tile_and_stitches_the_blocks() {
     // In a group of two, each rank encodes its share and gathers the other's before the
     // stitch; the blend and the assembly are generic primitives.
     let mut encoded = Vec::new();
-    let (raster, Recording { launches, .. }) = record(&[Split { size: 2, rank: 1 }], || {
+    let (raster, Recording { launches, .. }) = record(&[Split::new(2, 1).unwrap()], || {
         vae::tiled_encode(&rows, &columns, &[4, 3], DType::F32, |index| {
             encoded.push(index);
             Ok(meta((4, 3, 2, 2), DType::F32))

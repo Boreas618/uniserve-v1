@@ -2365,9 +2365,12 @@ fn expert_parallelism_places_whole_experts_on_a_tensor_group_and_shares_them_in_
         )
         .unwrap();
         let ranks = ModelRunner::of(launch, family).unwrap().ranks().unwrap();
-        ranks.iter().map(ModelRunner::text_placement).collect()
+        ranks
+            .iter()
+            .map(|rank| rank.text_placement().unwrap())
+            .collect()
     };
-    let half = |rank| nn::Split { size: 2, rank };
+    let half = |rank| nn::Split::new(2, rank).unwrap();
 
     for expert_parallel in [true, false] {
         let tensor: Vec<(nn::Split, nn::Split, bool)> = placements(&tensor_group(expert_parallel))

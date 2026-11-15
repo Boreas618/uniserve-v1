@@ -90,13 +90,15 @@ impl UlyssesAttention {
     /// A group whose size does not divide the heads, or a projection the loader refuses.
     pub fn load(config: &UlyssesAttentionConfig, vb: VarBuilder<'_, '_>) -> Result<Self> {
         let (split, tensor) = (config.split, config.tensor);
-        let shares = split.size.saturating_mul(tensor.size);
-        if shares == 0 || !config.heads.is_multiple_of(shares) || tensor.rank >= tensor.size {
+        let shares = split.size().saturating_mul(tensor.size());
+        if !config.heads.is_multiple_of(shares) {
             return Err(Error::shape(
                 "UlyssesAttention",
                 format!(
                     "{} heads over a group of {} inside a tensor split of {}",
-                    config.heads, split.size, tensor.size
+                    config.heads,
+                    split.size(),
+                    tensor.size()
                 ),
             ));
         }
@@ -108,10 +110,7 @@ impl UlyssesAttention {
             let parallel = if shares == 1 {
                 Parallel::None
             } else {
-                Parallel::Column(Split {
-                    size: shares,
-                    rank: tensor.rank * split.size + rank,
-                })
+                Parallel::Column(Split::new(shares, tensor.rank() * split.size() + rank)?)
             };
 
             Linear::load(
@@ -128,10 +127,10 @@ impl UlyssesAttention {
         let inputs = config
             .inputs
             .iter()
-            .map(|name| match (split.size, config.projection) {
+            .map(|name| match (split.size(), config.projection) {
                 (1, _) => Ok(vec![member(name, 0)?]),
-                (_, Projection::Gather) => Ok(vec![member(name, split.rank)?]),
-                (_, Projection::Exchange) => (0..split.size)
+                (_, Projection::Gather) => Ok(vec![member(name, split.rank())?]),
+                (_, Projection::Exchange) => (0..split.size())
                     .map(|rank| member(name, rank))
                     .collect::<Result<Vec<_>>>(),
             })
@@ -141,7 +140,7 @@ impl UlyssesAttention {
                 inputs: inner_width,
                 outputs: config.hidden,
                 bias: false,
-                parallel: if tensor.size == 1 {
+                parallel: if tensor.size() == 1 {
                     Parallel::None
                 } else {
                     Parallel::Row(tensor)
@@ -173,7 +172,7 @@ impl UlyssesAttention {
 
     /// Whether the rows cross members: a group of more than one.
     pub const fn exchanges(&self) -> bool {
-        self.config.split.size > 1
+        self.config.split.size() > 1
     }
 
     /// How this member reaches its heads.
@@ -193,7 +192,7 @@ impl UlyssesAttention {
 
     /// The heads this member attends: its share of its tensor rank's.
     pub const fn local_heads(&self) -> u32 {
-        self.config.heads / (self.config.split.size * self.config.tensor.size)
+        self.config.heads / (self.config.split.size() * self.config.tensor.size())
     }
 
     /// Channels of one head.
@@ -213,7 +212,7 @@ impl UlyssesAttention {
 
     /// The members of the group.
     fn members(&self) -> usize {
-        self.config.split.size as usize
+        self.config.split.size() as usize
     }
 
     /// The rows the projections read: this member's own `normalized` rows, or the whole
@@ -435,12 +434,12 @@ impl UlyssesAttention {
             ));
         };
 
-        if ranks != u64::from(self.config.split.size) {
+        if ranks != u64::from(self.config.split.size()) {
             return Err(Error::shape(
                 "UlyssesAttention",
                 format!(
                     "the module is loaded for {} members and the group has {ranks}",
-                    self.config.split.size
+                    self.config.split.size()
                 ),
             ));
         }
@@ -470,8 +469,8 @@ pub fn share(rows: &Tensor, split: Split) -> Result<Tensor> {
             format!("a sequence is [rows, width], not {:?}", rows.dims()),
         ));
     };
-    let held = share_rows(tokens, split.size);
-    let first = split.rank as usize * held;
+    let held = share_rows(tokens, split.size());
+    let first = split.rank() as usize * held;
 
     // The sequence's own rows of the share, then the zero rows that pad it.
     let own = tokens.saturating_sub(first).min(held);
@@ -496,16 +495,16 @@ pub fn share(rows: &Tensor, split: Split) -> Result<Tensor> {
 /// When the gather refuses its tensors, the forward has no group of `split`'s members, or the
 /// shares do not hold `tokens` rows.
 pub fn gather(share: &Tensor, split: Split, tokens: usize) -> Result<Tensor> {
-    if split.size <= 1 {
+    if split.size() <= 1 {
         return Ok(share.clone());
     }
     let members = collective::split().map(|(_, members)| members);
-    if members != Some(u64::from(split.size)) {
+    if members != Some(u64::from(split.size())) {
         return Err(Error::shape(
             "ulysses::gather",
             format!(
                 "a sequence split over {} members gathers in a forward whose group is {members:?}",
-                split.size
+                split.size()
             ),
         ));
     }
@@ -547,14 +546,14 @@ mod tests {
 
         assert_eq!(share_rows(5, 2), 3);
         assert_eq!(
-            rows_of(Split { size: 2, rank: 0 }),
+            rows_of(Split::new(2, 0).unwrap()),
             [[1.0, 2.0], [3.0, 4.0], [5.0, 6.0]]
         );
         assert_eq!(
-            rows_of(Split { size: 2, rank: 1 }),
+            rows_of(Split::new(2, 1).unwrap()),
             [[7.0, 8.0], [9.0, 10.0], [0.0, 0.0]]
         );
-        assert_eq!(rows_of(Split { size: 8, rank: 6 }), [[0.0, 0.0]]);
+        assert_eq!(rows_of(Split::new(8, 6).unwrap()), [[0.0, 0.0]]);
         assert_eq!(rows_of(Split::WHOLE).len(), 5);
     }
 

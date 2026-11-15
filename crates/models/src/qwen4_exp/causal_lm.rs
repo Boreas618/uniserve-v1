@@ -236,20 +236,26 @@ impl Qwen4ExpForCausalLm {
         // A tensor group that holds whole experts divides the experts, not their width, and no
         // expert group divides them beside it.
         if placement.tensor_experts
-            && (placement.experts.size > 1
-                || !config.moe.num_experts.is_multiple_of(placement.tensor.size))
+            && (placement.experts.size() > 1
+                || !config
+                    .moe
+                    .num_experts
+                    .is_multiple_of(placement.tensor.size()))
         {
             return Err(ID.config(format!(
                 "a tensor group of {} holding whole experts beside an expert group of {}: the \
                  tensor group alone divides the {} experts",
-                placement.tensor.size, placement.experts.size, config.moe.num_experts
+                placement.tensor.size(),
+                placement.experts.size(),
+                config.moe.num_experts
             )));
         }
-        if placement.pipeline.size > 1 || placement.sequence.split.size > 1 {
+        if placement.pipeline.size() > 1 || placement.sequence.split.size() > 1 {
             return Err(ID.config(format!(
                 "a pipeline split over {} stages or a sequence split over {} members: this \
                  model's layers are split over tensor and expert ranks alone",
-                placement.pipeline.size, placement.sequence.split.size
+                placement.pipeline.size(),
+                placement.sequence.split.size()
             )));
         }
 
@@ -535,7 +541,7 @@ pub(crate) fn cache_shape(config: &Config, tensor: Split, layers: u32) -> CacheS
 
     CacheShape {
         layers,
-        kv_heads: (text.num_key_value_heads / tensor.size).max(1),
+        kv_heads: (text.num_key_value_heads / tensor.size()).max(1),
         head_dim: text.head_dim,
         index_keys: Some(IndexKeys {
             width: indexer.head_dim,
@@ -588,7 +594,7 @@ mod tests {
             })
         );
 
-        let rank = cache_shape(&config, Split { size: 4, rank: 3 }, 2);
+        let rank = cache_shape(&config, Split::new(4, 3).unwrap(), 2);
         assert_eq!(rank.kv_heads, 1);
     }
 }

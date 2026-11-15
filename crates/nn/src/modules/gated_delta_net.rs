@@ -75,7 +75,7 @@ pub struct GatedDeltaNetConfig {
 impl GatedDeltaNetConfig {
     /// Channels the short convolution mixes on this rank: its queries, keys and values.
     pub const fn conv_channels(&self) -> u32 {
-        (2 * self.key_heads * self.key_dim + self.value_heads * self.value_dim) / self.split.size
+        (2 * self.key_heads * self.key_dim + self.value_heads * self.value_dim) / self.split.size()
     }
 
     /// The state one layer keeps per request slot on this rank, in the order its buffers are
@@ -85,7 +85,7 @@ impl GatedDeltaNetConfig {
     /// A deployment that drafts keeps the matrices after each token of a decode-phase row in a
     /// slot of their own (`stepwise`), and the window's draft rows inside its one slot.
     pub fn state_fields(&self, dtype: DType) -> Vec<StateField> {
-        let heads = (self.value_heads / self.split.size) as usize;
+        let heads = (self.value_heads / self.split.size()) as usize;
         let (key, value) = (self.key_dim as usize, self.value_dim as usize);
 
         vec![
@@ -149,15 +149,14 @@ impl GatedDeltaNet {
         }
 
         let split = config.split;
-        if split.size == 0
-            || split.rank >= split.size
-            || !config.key_heads.is_multiple_of(split.size)
-        {
+        if !config.key_heads.is_multiple_of(split.size()) {
             return Err(Error::weight(
                 vb.path(),
                 format!(
                     "rank {} of a tensor group of {} does not hold a share of {} key heads",
-                    split.rank, split.size, config.key_heads
+                    split.rank(),
+                    split.size(),
+                    config.key_heads
                 ),
             ));
         }
@@ -168,7 +167,7 @@ impl GatedDeltaNet {
             config.key_heads * config.key_dim,
             config.value_heads * config.value_dim,
         );
-        let (local_key, local_value) = (key_width / split.size, value_width / split.size);
+        let (local_key, local_value) = (key_width / split.size(), value_width / split.size());
         if config.key_dim == 0
             || config.value_dim == 0
             || !local_value.is_multiple_of(config.key_dim)
@@ -187,7 +186,7 @@ impl GatedDeltaNet {
         }
 
         let parallel = |parallel: fn(Split) -> Parallel| {
-            if split.size == 1 {
+            if split.size() == 1 {
                 Parallel::None
             } else {
                 parallel(split)
@@ -207,7 +206,7 @@ impl GatedDeltaNet {
 
         // This rank's runs of the `[q | k | v]` rows: `rows` elements a row, in a tensor whose
         // rows are `row` elements apart.
-        let rank = u64::from(split.rank);
+        let rank = u64::from(split.rank());
         let (local_key, local_value) = (u64::from(local_key), u64::from(local_value));
         let runs = |row: u64| -> Vec<PartBlock> {
             [
@@ -246,7 +245,7 @@ impl GatedDeltaNet {
         };
 
         let hidden = u64::from(config.hidden);
-        let in_proj_qkv = if split.size == 1 {
+        let in_proj_qkv = if split.size() == 1 {
             projection(
                 "in_proj_qkv",
                 config.hidden,
@@ -264,7 +263,7 @@ impl GatedDeltaNet {
         // PyTorch's depthwise `Conv1d` stores one input channel per group; the taps are its
         // rows.
         let width = u64::from(config.conv_width);
-        let conv1d = if split.size == 1 {
+        let conv1d = if split.size() == 1 {
             vb.pp("conv1d")
                 .get((channels as usize, 1, width as usize), "weight")?
                 .reshape((channels as usize, width as usize))?
@@ -272,8 +271,8 @@ impl GatedDeltaNet {
             gathered("conv1d", width)?
         };
 
-        let heads = (config.value_heads / split.size) as usize;
-        let first = split.rank as usize * heads;
+        let heads = (config.value_heads / split.size()) as usize;
+        let first = split.rank() as usize * heads;
         let a_log = vb.get_rows(heads, "A_log", first)?;
         let dt_bias = vb.get_rows(heads, "dt_bias", first)?;
 
@@ -354,7 +353,7 @@ impl GatedDeltaNet {
         }
 
         let config = self.config;
-        let ranks = config.split.size;
+        let ranks = config.split.size();
         let (key_heads, key_dim) = ((config.key_heads / ranks) as usize, config.key_dim as usize);
         let (value_heads, value_dim) = (
             (config.value_heads / ranks) as usize,

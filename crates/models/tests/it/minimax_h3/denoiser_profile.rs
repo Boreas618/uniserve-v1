@@ -242,7 +242,7 @@ fn a_rank_of_a_sequence_split_profiles_under_each_projection() {
     for projection in [Projection::Gather, Projection::Exchange] {
         let sequence = DenoiserSplit {
             ulysses: SequenceSplit {
-                split: Split { size: 4, rank: 1 },
+                split: Split::new(4, 1).unwrap(),
                 projection,
             },
             ..DenoiserSplit::WHOLE
@@ -263,31 +263,31 @@ fn a_rank_of_a_sequence_split_profiles_under_each_projection() {
 fn a_rank_of_each_four_rank_partition_profiles_its_share() {
     let partitions = [
         DenoiserSplit {
-            tensor: Split { size: 4, rank: 2 },
+            tensor: Split::new(4, 2).unwrap(),
             ..DenoiserSplit::WHOLE
         },
         DenoiserSplit {
-            gather: Split { size: 4, rank: 1 },
+            gather: Split::new(4, 1).unwrap(),
             ..DenoiserSplit::WHOLE
         },
         DenoiserSplit {
             ulysses: SequenceSplit {
-                split: Split { size: 2, rank: 1 },
+                split: Split::new(2, 1).unwrap(),
                 projection: Projection::Gather,
             },
-            gather: Split { size: 2, rank: 1 },
+            gather: Split::new(2, 1).unwrap(),
             ..DenoiserSplit::WHOLE
         },
         DenoiserSplit {
             ulysses: SequenceSplit {
-                split: Split { size: 2, rank: 1 },
+                split: Split::new(2, 1).unwrap(),
                 projection: Projection::Exchange,
             },
-            tensor: Split { size: 2, rank: 1 },
+            tensor: Split::new(2, 1).unwrap(),
             ..DenoiserSplit::WHOLE
         },
         DenoiserSplit {
-            layers: Split { size: 4, rank: 1 },
+            layers: Split::new(4, 1).unwrap(),
             ..DenoiserSplit::WHOLE
         },
     ];
@@ -426,7 +426,7 @@ fn the_precision_policy_reads_against_the_released_headers() {
     };
     let ulysses8 = DenoiserSplit {
         ulysses: SequenceSplit {
-            split: Split { size: 8, rank: 3 },
+            split: Split::new(8, 3).unwrap(),
             projection: Projection::Exchange,
         },
         ..DenoiserSplit::WHOLE

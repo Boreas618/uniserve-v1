@@ -504,22 +504,17 @@ impl Config {
     ///
     /// # Errors
     ///
-    /// A split that does not divide what it shards, or a rank outside its split.
+    /// A split that does not divide what it shards.
     pub fn check_splits(&self, tensor: Split, experts: Split) -> Result<()> {
         self.text.local_heads(tensor)?;
 
-        if experts.size == 0 || experts.rank >= experts.size {
-            return Err(ID.config(format!(
-                "expert rank {} of a group of {}",
-                experts.rank, experts.size
-            )));
-        }
         if let Some(moe) = &self.moe
-            && !moe.num_experts.is_multiple_of(experts.size)
+            && !moe.num_experts.is_multiple_of(experts.size())
         {
             return Err(ID.config(format!(
                 "expert parallel degree {} does not divide {} experts",
-                experts.size, moe.num_experts
+                experts.size(),
+                moe.num_experts
             )));
         }
         Ok(())
@@ -553,42 +548,35 @@ impl Config {
         // expert group divides them beside it.
         if placement.tensor_experts
             && let Some(moe) = &self.moe
-            && (placement.experts.size > 1 || !moe.num_experts.is_multiple_of(tensor.size))
+            && (placement.experts.size() > 1 || !moe.num_experts.is_multiple_of(tensor.size()))
         {
             return Err(ID.config(format!(
                 "a tensor group of {} holding whole experts beside an expert group of {}: the \
                  tensor group alone divides the {} experts",
-                tensor.size, placement.experts.size, moe.num_experts
+                tensor.size(),
+                placement.experts.size(),
+                moe.num_experts
             )));
         }
 
-        let split = [tensor.size, pipeline.size, sequence.size];
+        let split = [tensor.size(), pipeline.size(), sequence.size()];
         if split.iter().filter(|size| **size > 1).count() > 1 {
             return Err(ID.config(format!(
                 "tensor, pipeline and sequence degrees {split:?}: a forward runs over one group, \
                  so one of them splits the model"
             )));
         }
-        for (name, split) in [("pipeline", pipeline), ("sequence", sequence)] {
-            if split.size == 0 || split.rank >= split.size {
-                return Err(ID.config(format!(
-                    "{name} rank {} of a group of {}",
-                    split.rank, split.size
-                )));
-            }
-        }
-
-        if sequence.size > 1 {
+        if sequence.size() > 1 {
             let text = &self.text;
             let heads = [text.num_attention_heads, text.num_key_value_heads];
             if heads
                 .iter()
-                .any(|heads| !heads.is_multiple_of(sequence.size))
+                .any(|heads| !heads.is_multiple_of(sequence.size()))
             {
                 return Err(ID.config(format!(
                     "a sequence split over {} members of {heads:?} attention and key/value \
                      heads: the members share the heads evenly",
-                    sequence.size
+                    sequence.size()
                 )));
             }
             if self.linear_layers() > 0 || placement.drafter {
@@ -596,14 +584,14 @@ impl Config {
                     "a sequence split over {} members of a model whose {} layers keep a \
                      recurrent state or that loads its drafter: a recurrent scan reads every row \
                      in order, and the drafter's attention is not split",
-                    sequence.size,
+                    sequence.size(),
                     self.linear_layers()
                 )));
             }
         }
 
         let layers = self.text.num_hidden_layers;
-        let stages = pipeline.size;
+        let stages = pipeline.size();
         let attention_in = |range: Range<u32>| -> usize {
             range
                 .filter(|layer| !self.text.linear_layers[*layer as usize])
@@ -622,7 +610,7 @@ impl Config {
                  as many layers, and as many attention layers, as every other"
             )));
         }
-        let first = pipeline.rank * per_stage;
+        let first = pipeline.rank() * per_stage;
         Ok(first..first + per_stage)
     }
 }
@@ -717,29 +705,23 @@ impl TextConfig {
     ///
     /// # Errors
     ///
-    /// A split that does not divide both head counts, or a rank outside it.
+    /// A split that does not divide both head counts.
     pub fn local_heads(&self, split: Split) -> Result<(u32, u32)> {
-        if split.size == 0 || split.rank >= split.size {
-            return Err(ID.config(format!(
-                "tensor-parallel rank {} of a group of {}",
-                split.rank, split.size
-            )));
-        }
         for (name, heads) in [
             ("attention", self.num_attention_heads),
             ("key/value", self.num_key_value_heads),
         ] {
-            if !heads.is_multiple_of(split.size) {
+            if !heads.is_multiple_of(split.size()) {
                 return Err(ID.config(format!(
                     "tensor parallel degree {} does not divide {heads} {name} heads",
-                    split.size
+                    split.size()
                 )));
             }
         }
 
         Ok((
-            self.num_attention_heads / split.size,
-            self.num_key_value_heads / split.size,
+            self.num_attention_heads / split.size(),
+            self.num_key_value_heads / split.size(),
         ))
     }
 }
@@ -1059,12 +1041,11 @@ mod tests {
     #[test]
     fn splits_must_divide_the_heads_and_the_experts() {
         let config = parse(&moe()).expect("parsed");
-        let split = |size, rank| Split { size, rank };
+        let split = |size, rank| Split::new(size, rank).unwrap();
 
         assert_eq!(config.text.local_heads(split(4, 2)).expect("four"), (8, 1));
         assert!(config.check_splits(split(4, 3), split(4, 2)).is_ok());
         assert!(config.text.local_heads(split(3, 0)).is_err());
-        assert!(config.text.local_heads(split(4, 4)).is_err());
         assert!(config.check_splits(split(1, 0), split(3, 0)).is_err());
     }
 
@@ -1075,7 +1056,7 @@ mod tests {
     fn a_placement_holds_one_split_that_divides_what_it_splits() {
         let config = parse(&moe()).expect("parsed");
         let layers = config.text.num_hidden_layers;
-        let split = |size, rank| Split { size, rank };
+        let split = |size, rank| Split::new(size, rank).unwrap();
         let placed = |tensor, pipeline, sequence| TextPlacement {
             tensor,
             pipeline,
@@ -1122,11 +1103,6 @@ mod tests {
         assert!(
             config
                 .check_placement(&placed(split(2, 0), split(2, 0), whole))
-                .is_err()
-        );
-        assert!(
-            config
-                .check_placement(&placed(whole, whole, split(2, 2)))
                 .is_err()
         );
 
