@@ -1380,6 +1380,15 @@ pub trait Vision {
     /// The most rows an image the processor sizes encodes to: the block of the largest image.
     fn max_image_rows(&self) -> u32;
 
+    /// The patch grid execution captures an encode of `rows` rows over: of the grids whose
+    /// block takes `rows` rows ([`Vision::image_rows`]), the one the tower's own geometry makes
+    /// of them.
+    ///
+    /// # Errors
+    ///
+    /// A row count no grid of the tower encodes to.
+    fn bucket_grid(&self, rows: u32) -> Result<[u32; 3]>;
+
     /// The rotary axes of [`TokenBatch::rope_positions`] a batch with image rows states.
     fn position_axes(&self) -> u32;
 

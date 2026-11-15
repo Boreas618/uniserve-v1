@@ -608,16 +608,10 @@ fn bucket_of(grid: [u32; 3]) -> Result<Bucket> {
     Ok(Bucket::prefill(1, patches, Variant::ConditionEncode))
 }
 
-/// The grid the runner states an image of `rows` merged rows by: one time step, its sides the
-/// most nearly equal whole merge blocks that make them.
+/// The grid the runner states an image of `rows` merged rows by: the one the tower captures an
+/// encode of that many rows over ([`Vision::bucket_grid`]), which must encode to `rows` rows.
 fn grid(vision: &dyn Vision, rows: u32) -> Result<[u32; 3]> {
-    let merge = vision.patch_format().merge;
-    let short = (1..=rows.isqrt())
-        .rev()
-        .find(|side| rows.is_multiple_of(*side))
-        .unwrap_or(1);
-
-    let grid = [1, short * merge, rows / short.max(1) * merge];
+    let grid = vision.bucket_grid(rows)?;
     if rows == 0 || vision.image_rows(grid)? != rows {
         return Err(Error::Invalid(format!(
             "the vision tower sizes no image of {rows} rows to a grid of whole merge blocks"
@@ -761,6 +755,15 @@ pub(crate) mod tests {
 
         fn max_image_rows(&self) -> u32 {
             MAX_ROWS
+        }
+
+        /// One time step, its sides the most nearly equal whole merge blocks.
+        fn bucket_grid(&self, rows: u32) -> nn::Result<[u32; 3]> {
+            let short = (1..=rows.isqrt())
+                .rev()
+                .find(|side| rows.is_multiple_of(*side))
+                .ok_or_else(|| nn::Error::Unsupported(format!("no grid of {rows} rows")))?;
+            Ok([1, short * MERGE, rows / short * MERGE])
         }
 
         fn position_axes(&self) -> u32 {

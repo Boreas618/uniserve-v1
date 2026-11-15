@@ -445,6 +445,19 @@ impl Vision for VisionTower {
         Ok(self.patches(grid)? / (merge * merge))
     }
 
+    /// One time step, its sides the most nearly equal whole merge blocks that make `rows`
+    /// merged rows: the tower merges square blocks of `spatial_merge_size` patches a side.
+    fn bucket_grid(&self, rows: u32) -> nn::Result<[u32; 3]> {
+        let merge = self.config.spatial_merge_size;
+        let short = (1..=rows.isqrt())
+            .rev()
+            .find(|side| rows.is_multiple_of(*side));
+        match short {
+            Some(short) => Ok([1, short * merge, rows / short * merge]),
+            None => Err(Error::Config(format!("no image grid encodes to {rows} rows")).into()),
+        }
+    }
+
     fn max_image_rows(&self) -> u32 {
         // A resized image's area is at most the processor's pixel budget, in whole merged
         // tokens.
