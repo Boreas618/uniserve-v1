@@ -72,23 +72,30 @@ impl WeightLayout {
     /// pair.
     pub const NVFP4_VALUES: Self = Self("nvfp4_values");
 
-    /// The same values after `shuffleMatrixA`: rows permuted inside blocks of sixteen or
-    /// thirty-two, which is the arrangement the trtllm-gen products read (`useShuffledMatrix`).
+    /// The same values with their rows in [`ValueLayout::Shuffled`], an arrangement a product's
+    /// descriptor declares.
+    ///
+    /// [`ValueLayout::Shuffled`]: ops::fp4::ValueLayout::Shuffled
     pub const NVFP4_VALUES_SHUFFLED: Self = Self("nvfp4_values_shuffled");
 
-    /// Packed values whose two row halves interleave in sixteen-row blocks, the second half's
-    /// first: the row order a gated product reads when each gate block precedes its up block.
+    /// The same values with their rows in [`ValueLayout::GateFirst`].
+    ///
+    /// [`ValueLayout::GateFirst`]: ops::fp4::ValueLayout::GateFirst
     pub const NVFP4_VALUES_GATE_FIRST: Self = Self("nvfp4_values_gate_first");
 
-    /// Packed values whose two row halves interleave row by row before the shuffle: the row
-    /// order a gated product reads its linear and gate rows side by side in.
+    /// The same values with their rows in [`ValueLayout::InterleavedShuffled`].
+    ///
+    /// [`ValueLayout::InterleavedShuffled`]: ops::fp4::ValueLayout::InterleavedShuffled
     pub const NVFP4_VALUES_INTERLEAVED_SHUFFLED: Self = Self("nvfp4_values_interleaved_shuffled");
 
     /// A calibrated NVFP4 matrix's E4M3 block scales in the linear layout:
     /// `[rows, columns / 16]`.
     pub const NVFP4_SCALES_LINEAR: Self = Self("nvfp4_scales_linear");
 
-    /// The same scales in the swizzled 128x4 layout the cuDNN product reads.
+    /// The same scales in [`ScaleLayout::Swizzled128X4`], a layout a product's descriptor
+    /// declares.
+    ///
+    /// [`ScaleLayout::Swizzled128X4`]: ops::fp4::ScaleLayout::Swizzled128X4
     pub const NVFP4_SCALES_SWIZZLED: Self = Self("nvfp4_scales_swizzled_128x4");
 
     /// The layout named `name`.

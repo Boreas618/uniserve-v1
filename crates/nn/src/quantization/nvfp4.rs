@@ -1,15 +1,16 @@
-//! Calibrated NVFP4 weights: the names an export spells their fields with, the arrangements the
-//! products read them in, and the loading of one matrix and of a stack of experts.
+//! Calibrated NVFP4 weights: the names an export spells their fields with, and the loading of
+//! one matrix and of a stack of experts into the arrangements their products declare.
 //!
 //! A calibrated checkpoint already holds the encoded fields of each projection (packed E2M1
 //! values, K16 block scales, a tensor scale and the calibration's activation scale), so nothing
 //! is quantized at load: the fields are published through retained storage under keys naming
-//! their layouts, permuted once into the arrangement the deployment's products read.
+//! their layouts, permuted once into the arrangement the reading product's descriptor declares
+//! ([`ValueLayout`], [`ScaleLayout`]).
 
 use std::borrow::Cow;
 use std::fmt;
 
-use ops::fp4::ScaleLayout;
+use ops::fp4::{ScaleLayout, ValueLayout};
 use tensor::{DType, Shape, Tensor};
 
 use crate::error::{Error, Result};
@@ -63,114 +64,40 @@ impl fmt::Display for Nvfp4Names {
     }
 }
 
-/// The arrangement of a calibrated matrix's packed E2M1 values.
-///
-/// The values are two codes a byte along the contraction whichever arrangement they are in; what
-/// varies is the order of the **rows**, because the trtllm-gen products read their A operand
-/// with `useShuffledMatrix`: rows permuted inside blocks of sixteen or thirty-two so that the
-/// tile a thread block loads is contiguous. It is a permutation of the shard's own bytes, applied
-/// once at load, never in a forward and never by a kernel, and a matrix whose row count is not a
-/// whole number of blocks has no such arrangement, which the loader refuses by name.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ValueLayout {
-    /// The shard's own row order.
-    Plain,
-    /// `shuffleMatrixA`'s row order, for a product whose epilogue tile is `epilogue_tile_m` rows.
-    Shuffled {
-        /// Rows one MMA tile of the product covers; the shuffle block is thirty-two rows when
-        /// this is a whole number of 128s and sixteen otherwise, as the reference's
-        /// `get_shuffle_block_size` states.
-        epilogue_tile_m: u32,
-    },
-    /// A gated product's row order: the matrix's two row halves interleave, so row `i` of the
-    /// first half sits at `2i` and row `i` of the second half at `2i + 1`
-    /// (`reorderRowsForGatedActGemm`), and the result shuffles as [`Self::Shuffled`] does. The
-    /// product's epilogue then reads the linear and the gate row of one output channel side by
-    /// side.
-    InterleavedShuffled {
-        /// Rows one MMA tile of the product covers, as [`Self::Shuffled`] states it.
-        epilogue_tile_m: u32,
-    },
-    /// A fused gated product's row order: thirty-two-row block `b` holds rows `[16b, 16b + 16)`
-    /// of the matrix's second half, then the same rows of its first half.
-    GateFirst,
+/// The layout name a weight whose packed rows are in `layout` is filed under.
+fn values_key(layout: ValueLayout) -> WeightLayout {
+    match layout {
+        ValueLayout::Plain => WeightLayout::NVFP4_VALUES,
+        ValueLayout::Shuffled { .. } => WeightLayout::NVFP4_VALUES_SHUFFLED,
+        ValueLayout::InterleavedShuffled { .. } => WeightLayout::NVFP4_VALUES_INTERLEAVED_SHUFFLED,
+        ValueLayout::GateFirst => WeightLayout::NVFP4_VALUES_GATE_FIRST,
+    }
 }
 
-impl ValueLayout {
-    /// The layout name a weight published in this arrangement is filed under.
-    pub fn layout(self) -> WeightLayout {
-        match self {
-            Self::Plain => WeightLayout::NVFP4_VALUES,
-            Self::Shuffled { .. } => WeightLayout::NVFP4_VALUES_SHUFFLED,
-            Self::InterleavedShuffled { .. } => WeightLayout::NVFP4_VALUES_INTERLEAVED_SHUFFLED,
-            Self::GateFirst => WeightLayout::NVFP4_VALUES_GATE_FIRST,
-        }
+/// `bytes` with every expert's rows moved into `layout`, the arrangement the reading product
+/// declares ([`ValueLayout::destination`]): a permutation of the shard's own bytes, applied once
+/// at load and never in a forward.
+///
+/// `bytes` holds `experts` matrices of `rows` rows by `row_bytes` bytes, one after another, and
+/// the caller holds `rows` to whole blocks of the arrangement; a plain arrangement is the bytes
+/// unchanged.
+fn arrange(layout: ValueLayout, bytes: &[u8], experts: u64, rows: u64, row_bytes: u64) -> Vec<u8> {
+    if layout == ValueLayout::Plain {
+        return bytes.to_vec();
     }
 
-    /// The rows one shuffle block holds, or `None` when the arrangement is plain.
-    pub fn block(self) -> Option<u64> {
-        match self {
-            Self::Plain => None,
-            Self::GateFirst => Some(32),
-            Self::Shuffled { epilogue_tile_m } | Self::InterleavedShuffled { epilogue_tile_m } => {
-                Some(if epilogue_tile_m % 128 == 0 { 32 } else { 16 })
-            }
+    let mut arranged = bytes.to_vec();
+    let stride = row_bytes as usize;
+    for expert in 0..experts {
+        let base = expert * rows * row_bytes;
+        for row in 0..rows {
+            let source = (base + row * row_bytes) as usize;
+            let target = (base + layout.destination(row, rows) * row_bytes) as usize;
+
+            arranged[target..target + stride].copy_from_slice(&bytes[source..source + stride]);
         }
     }
-
-    /// `bytes` with every expert's rows moved into this arrangement.
-    ///
-    /// `bytes` holds `experts` packed matrices of `rows` rows by `row_bytes` bytes, one after
-    /// another; a plain arrangement is the bytes unchanged.
-    fn arrange(self, bytes: &[u8], experts: u64, rows: u64, row_bytes: u64) -> Vec<u8> {
-        let Some(block) = self.block() else {
-            return bytes.to_vec();
-        };
-        let mut arranged = bytes.to_vec();
-        let stride = row_bytes as usize;
-
-        if matches!(self, Self::GateFirst) {
-            for expert in 0..experts {
-                let base = expert * rows * row_bytes;
-                for position in 0..rows {
-                    let (group, within) = (position / 32, position % 32);
-                    let half = if within < 16 { rows / 2 } else { 0 };
-                    let source = (base + (group * 16 + within % 16 + half) * row_bytes) as usize;
-                    let target = (base + position * row_bytes) as usize;
-
-                    arranged[target..target + stride]
-                        .copy_from_slice(&bytes[source..source + stride]);
-                }
-            }
-            return arranged;
-        }
-
-        let lanes = block / 8;
-        for expert in 0..experts {
-            let base = expert * rows * row_bytes;
-            for row in 0..rows {
-                let interleaved = match self {
-                    Self::InterleavedShuffled { .. } if row < rows / 2 => 2 * row,
-                    Self::InterleavedShuffled { .. } => 2 * (row - rows / 2) + 1,
-                    _ => row,
-                };
-
-                // The reference's maps in closed form: within its block, a source row `r` moves
-                // to `(r % lanes) * 8 + r / lanes`, the interleave of `lanes` eight-row groups
-                // that the artifact's `srcToDstBlk16RowMap` and `srcToDstBlk32RowMap` list. The
-                // block is taken first: a row's offset inside its own block decides where it
-                // goes, and its block decides where that block starts.
-                let within = interleaved % block;
-                let destination =
-                    (interleaved / block) * block + (within % lanes) * 8 + within / lanes;
-                let source = (base + row * row_bytes) as usize;
-                let target = (base + destination * row_bytes) as usize;
-
-                arranged[target..target + stride].copy_from_slice(&bytes[source..source + stride]);
-            }
-        }
-        arranged
-    }
+    arranged
 }
 
 /// One tensor-parallel rank's share of every matrix of a packed stack, in elements of the
@@ -973,10 +900,10 @@ impl WeightLoader<'_> {
         let shared = share.map_or_else(String::new, |share| format!("@{share:?}"));
         let name = &format!("{name}{shared}");
 
-        // The values' row arrangement: a plain shard needs nothing, a shuffled one is permuted
-        // here once, at load. A product whose A operand is read with `useShuffledMatrix` cannot
-        // read a shard's own row order, so a row count that is not a whole number of shuffle
-        // blocks has no arrangement at all and is refused by name.
+        // The values' row arrangement: a plain shard needs nothing, an arranged one is
+        // permuted here once, at load. A product that declares an arrangement cannot read a
+        // shard's own row order, so a row count that is not a whole number of the
+        // arrangement's blocks has no arrangement at all and is refused by name.
         if let Some(block) = values_layout.block()
             && !rows.is_multiple_of(block)
         {
@@ -1022,7 +949,7 @@ impl WeightLoader<'_> {
             &computed_key(
                 files.clone(),
                 DType::U8,
-                values_layout.layout(),
+                values_key(values_layout),
                 computed_from("nvfp4_values"),
                 &values_shape,
             ),
@@ -1038,7 +965,8 @@ impl WeightLoader<'_> {
                     }
                 }
 
-                Ok(Cow::Owned(values_layout.arrange(
+                Ok(Cow::Owned(arrange(
+                    values_layout,
                     &bytes,
                     count,
                     rows,
@@ -1079,7 +1007,7 @@ impl WeightLoader<'_> {
                 for expert in 0..usize::try_from(count).unwrap_or(0) {
                     let entry = &scales_bytes[expert * (rows * blocks) as usize
                         ..(expert + 1) * (rows * blocks) as usize];
-                    let entry = values_layout.arrange(entry, 1, rows, blocks);
+                    let entry = arrange(values_layout, entry, 1, rows, blocks);
 
                     match layout {
                         ScaleLayout::Linear => arranged.extend_from_slice(&entry),
@@ -1172,7 +1100,7 @@ impl WeightLoader<'_> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Nvfp4Share, ValueLayout, swizzled_scales};
+    use super::{Nvfp4Share, swizzled_scales};
 
     /// A rank's share of a packed matrix is its rows, or its bytes of every row, and zeros to
     /// the padded extent: two codes a byte, one block scale per sixteen elements.
@@ -1288,31 +1216,5 @@ mod tests {
         let linear: Vec<u8> = (1..=rows * blocks).map(|value| value as u8).collect();
         let swizzled = swizzled_scales(&linear, rows, blocks);
         assert_eq!(swizzled[594], (5 * blocks + 6 + 1) as u8);
-    }
-
-    /// A gated stack's rows: logical row `i` of each half reaches the position the reference
-    /// states, `2i` or `2i + 1` before the shuffle, then `(r % 4) · 8 + r / 4` inside its
-    /// 32-row block.
-    #[test]
-    fn a_gated_stack_interleaves_its_halves_before_the_shuffle() {
-        let rows = 256_u64;
-        let bytes: Vec<u8> = (0..rows).map(|row| row as u8).collect();
-        let layout = ValueLayout::InterleavedShuffled {
-            epilogue_tile_m: 128,
-        };
-
-        let arranged = layout.arrange(&bytes, 1, rows, 1);
-        for half in 0..2_u64 {
-            for index in 0..rows / 2 {
-                let position = 2 * index + half;
-                let within = position % 32;
-                let stored = (position / 32) * 32 + (within % 4) * 8 + within / 4;
-                assert_eq!(
-                    u64::from(arranged[stored as usize]),
-                    half * (rows / 2) + index,
-                    "row {index} of half {half} belongs at {stored}"
-                );
-            }
-        }
     }
 }

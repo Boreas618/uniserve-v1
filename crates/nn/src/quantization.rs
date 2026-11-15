@@ -80,7 +80,7 @@ mod modelopt;
 mod nvfp4;
 
 pub use modelopt::ModeloptManifest;
-pub use nvfp4::{Nvfp4Names, Nvfp4Share, Nvfp4Stack, Nvfp4Weight, ValueLayout};
+pub use nvfp4::{Nvfp4Names, Nvfp4Share, Nvfp4Stack, Nvfp4Weight};
 
 /// The spelling of a ModelOpt unified checkpoint's calibrated NVFP4 projection: the four fields
 /// are tensors beside each other under the projection's module, the activation scale among

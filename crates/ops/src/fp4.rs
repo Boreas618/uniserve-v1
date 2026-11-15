@@ -132,6 +132,104 @@ impl ScaleLayout {
     }
 }
 
+/// The arrangement of a packed NVFP4 matrix's rows that a product reads.
+///
+/// The values are two codes a byte along the contraction whichever arrangement they are in; what
+/// varies is the order of the **rows**, which a product's package fixes when it is compiled: a
+/// product that reads its weight operand shuffled loads contiguous tiles because the rows were
+/// permuted inside blocks of sixteen or thirty-two before it ran. Each product's descriptor
+/// declares the arrangement of the weights it reads, and the loader moves a checkpoint's rows
+/// into it once ([`ValueLayout::destination`]); a matrix whose row count is not a whole number
+/// of blocks has no such arrangement.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum ValueLayout {
+    /// The checkpoint's own row order.
+    Plain,
+    /// Rows permuted inside blocks, for a product whose epilogue tile is `epilogue_tile_m` rows:
+    /// within its block, row `r` moves to `(r mod lanes) · 8 + r / lanes`, `lanes` being the
+    /// block's eight-row groups.
+    Shuffled {
+        /// Rows one MMA tile of the product covers; the block is thirty-two rows when this is a
+        /// whole number of 128s and sixteen otherwise.
+        epilogue_tile_m: u32,
+    },
+    /// A gated product's row order: the matrix's two row halves interleave, row `i` of the
+    /// first half at `2i` and row `i` of the second half at `2i + 1`, and the result is
+    /// shuffled as [`Self::Shuffled`] is, so the product's epilogue reads the linear and the gate
+    /// row of one output channel side by side.
+    InterleavedShuffled {
+        /// Rows one MMA tile of the product covers, as [`Self::Shuffled`] states it.
+        epilogue_tile_m: u32,
+    },
+    /// A fused gated product's row order: thirty-two-row block `b` holds rows `[16b, 16b + 16)`
+    /// of the matrix's second half, then the same rows of its first half.
+    GateFirst,
+}
+
+impl ValueLayout {
+    /// The rows one block of the arrangement holds, or `None` when it is plain.
+    pub const fn block(self) -> Option<u64> {
+        match self {
+            Self::Plain => None,
+            Self::GateFirst => Some(32),
+            Self::Shuffled { epilogue_tile_m } | Self::InterleavedShuffled { epilogue_tile_m } => {
+                Some(if epilogue_tile_m % 128 == 0 { 32 } else { 16 })
+            }
+        }
+    }
+
+    /// Where row `row` of a matrix of `rows` rows lies in this arrangement.
+    ///
+    /// The caller holds `rows` to whole blocks ([`Self::block`]); over such a matrix the map is
+    /// a permutation of its rows.
+    pub const fn destination(self, row: u64, rows: u64) -> u64 {
+        let half = rows / 2;
+
+        match self {
+            Self::Plain => row,
+            Self::GateFirst => {
+                // A second-half row leads its block's sixteen; a first-half row follows them.
+                if row >= half {
+                    let row = row - half;
+                    (row / 16) * 32 + row % 16
+                } else {
+                    (row / 16) * 32 + 16 + row % 16
+                }
+            }
+            Self::Shuffled { .. } | Self::InterleavedShuffled { .. } => {
+                let interleaved = match self {
+                    Self::InterleavedShuffled { .. } if row < half => 2 * row,
+                    Self::InterleavedShuffled { .. } => 2 * (row - half) + 1,
+                    _ => row,
+                };
+                let block = match self.block() {
+                    Some(block) => block,
+                    None => 1,
+                };
+                let lanes = block / 8;
+
+                // Within its block, a row moves to the interleave of the block's eight-row
+                // groups; its block decides where that block starts.
+                let within = interleaved % block;
+                (interleaved / block) * block + (within % lanes) * 8 + within / lanes
+            }
+        }
+    }
+}
+
+impl fmt::Display for ValueLayout {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Plain => formatter.write_str("plain"),
+            Self::Shuffled { epilogue_tile_m } => write!(formatter, "shuffled_{epilogue_tile_m}"),
+            Self::InterleavedShuffled { epilogue_tile_m } => {
+                write!(formatter, "interleaved_shuffled_{epilogue_tile_m}")
+            }
+            Self::GateFirst => formatter.write_str("gate_first"),
+        }
+    }
+}
+
 /// One compilation of `nvfp4_quantize`.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub struct QuantizeDescriptor {
@@ -365,6 +463,32 @@ pub struct GemmDescriptor {
 /// The key states what the compiled object is built for. **Not `pdl`**: the program does not carry
 /// it - there is no such field left to state - because the two values compile one object, measured
 /// byte for byte in both the host and the device code.
+impl GemmDescriptor {
+    /// The arrangement of the block scales the packed product reads, the weight's and the
+    /// encoded activation's alike: its package serves the swizzled layout alone.
+    pub const SCALE_LAYOUT: ScaleLayout = ScaleLayout::Swizzled128X4;
+
+    /// The arrangement of the packed weight's rows the product reads: the checkpoint's own.
+    pub const WEIGHT_VALUES: ValueLayout = ValueLayout::Plain;
+
+    /// The compilation of a product over `m` encoded activation rows and a packed `[n, k]`
+    /// weight with `scale` block scales into `output` rows, accumulated in FP32, block scales in
+    /// [`Self::SCALE_LAYOUT`] and no epilogue.
+    pub fn new(scale: DType, output: DType, m: u32, n: u32, k: u32) -> Self {
+        Self {
+            packed: DType::U8,
+            scale,
+            accumulate: DType::F32,
+            output,
+            layout: Self::SCALE_LAYOUT,
+            epilogue: Epilogue::None,
+            m,
+            n,
+            k,
+        }
+    }
+}
+
 impl fmt::Display for GemmDescriptor {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         Key::new()
@@ -618,6 +742,56 @@ impl Op for Nvfp4Gemm {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A gated stack's rows: logical row `i` of each half reaches the position the reference
+    /// states, `2i` or `2i + 1` before the shuffle, then `(r % 4) · 8 + r / 4` inside its
+    /// 32-row block.
+    #[test]
+    fn a_gated_stack_interleaves_its_halves_before_the_shuffle() {
+        let rows = 256_u64;
+        let layout = ValueLayout::InterleavedShuffled {
+            epilogue_tile_m: 128,
+        };
+
+        for half in 0..2_u64 {
+            for index in 0..rows / 2 {
+                let position = 2 * index + half;
+                let within = position % 32;
+                let stored = (position / 32) * 32 + (within % 4) * 8 + within / 4;
+                assert_eq!(
+                    layout.destination(half * (rows / 2) + index, rows),
+                    stored,
+                    "row {index} of half {half} belongs at {stored}"
+                );
+            }
+        }
+    }
+
+    /// A fused gated stack's rows: block `b` holds the second half's rows `16b..16b + 16` and
+    /// then the first half's, and every arrangement over whole blocks is a permutation.
+    #[test]
+    fn a_gate_first_stack_leads_each_block_with_the_second_half() {
+        let rows = 64_u64;
+        assert_eq!(ValueLayout::GateFirst.destination(32, rows), 0);
+        assert_eq!(ValueLayout::GateFirst.destination(47, rows), 15);
+        assert_eq!(ValueLayout::GateFirst.destination(0, rows), 16);
+        assert_eq!(ValueLayout::GateFirst.destination(16, rows), 48);
+
+        for layout in [
+            ValueLayout::Plain,
+            ValueLayout::GateFirst,
+            ValueLayout::Shuffled {
+                epilogue_tile_m: 64,
+            },
+            ValueLayout::InterleavedShuffled {
+                epilogue_tile_m: 128,
+            },
+        ] {
+            let mut seen: Vec<u64> = (0..rows).map(|row| layout.destination(row, rows)).collect();
+            seen.sort_unstable();
+            assert_eq!(seen, (0..rows).collect::<Vec<_>>(), "{layout}");
+        }
+    }
 
     #[test]
     fn the_class_is_the_smallest_declared_one_that_holds_the_rows() {

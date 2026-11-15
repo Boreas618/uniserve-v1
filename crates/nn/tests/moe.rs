@@ -13,7 +13,7 @@ use std::path::Path;
 use nn::collective::Split;
 use nn::functional::{self, Activation, Rounding};
 use nn::modules::{GateUp, MlpConfig, MoE, MoEConfig, SharedExpert, SharedExpertConfig};
-use nn::quantization::{Declaration, Nvfp4Stack, UNIFIED_EXPORT, ValueLayout};
+use nn::quantization::{Declaration, Nvfp4Stack, UNIFIED_EXPORT};
 use nn::{
     Checkpoint, CpuWeights, DType, Device, ExpertExchange, MetaWeights, Tensor, WeightLoader,
 };
@@ -21,7 +21,8 @@ use nn_testing::{
     Recording, assert_close, checkpoint, encode, meta, operators, record, sequence, tensor, values,
     write_checkpoint,
 };
-use ops::fp4::ScaleLayout;
+use ops::fp4::{ScaleLayout, ValueLayout};
+use ops::moe::grouped::{GatherGemmNvfp4Descriptor, RouteGemmNvfp4Descriptor, WEIGHT_SCALE_LAYOUT};
 
 /// The tolerance of an FP32 result against a reference accumulated in another order.
 const F32_TOLERANCE: f32 = 1e-4;
@@ -833,9 +834,9 @@ fn packed_checkpoint(
     (Checkpoint::open(directory).unwrap(), fields)
 }
 
-/// The stacks of a packed block's two experts in the arrangement the routed products read.
+/// The stacks of a packed block's two experts in the arrangements the routed products declare.
 fn routed_stacks(loader: &WeightLoader<'_>) -> (Nvfp4Stack, Nvfp4Stack) {
-    let stack = |name: &str, projections: &[&str], values: ValueLayout| {
+    let stack = |name: &str, projections: &[&str], layout: (ValueLayout, ScaleLayout)| {
         loader
             .nvfp4_stack(
                 name,
@@ -844,7 +845,7 @@ fn routed_stacks(loader: &WeightLoader<'_>) -> (Nvfp4Stack, Nvfp4Stack) {
                 &[0, 1],
                 2,
                 UNIFIED_EXPORT,
-                (values, ScaleLayout::Swizzled128X4),
+                layout,
                 true,
             )
             .unwrap()
@@ -855,16 +856,15 @@ fn routed_stacks(loader: &WeightLoader<'_>) -> (Nvfp4Stack, Nvfp4Stack) {
         stack(
             "mlp.experts.up_gate",
             &["up_proj", "gate_proj"],
-            ValueLayout::InterleavedShuffled {
-                epilogue_tile_m: 128,
-            },
+            (
+                GatherGemmNvfp4Descriptor::WEIGHT_VALUES,
+                WEIGHT_SCALE_LAYOUT,
+            ),
         ),
         stack(
             "mlp.experts.down",
             &["down_proj"],
-            ValueLayout::Shuffled {
-                epilogue_tile_m: 128,
-            },
+            (RouteGemmNvfp4Descriptor::WEIGHT_VALUES, WEIGHT_SCALE_LAYOUT),
         ),
     )
 }

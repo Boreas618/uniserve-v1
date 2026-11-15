@@ -21,14 +21,12 @@
 //! joins the accumulator, except the packed product's, which joins the rounded product.
 
 use ops::dynamic_scale::{self, DynamicScale, FLOOR};
-use ops::fp4::{
-    BLOCK_ELEMENTS, GemmArgs, GemmDescriptor, Nvfp4Gemm, PACKED_M_CLASSES, ScaleLayout,
-};
+use ops::fp4::{BLOCK_ELEMENTS, GemmArgs, GemmDescriptor, Nvfp4Gemm, PACKED_M_CLASSES};
 use ops::fp8::{
     E4M3_MAX, Fp8Gemm, Fp8GemmArgs, Fp8GemmDescriptor, Fp8Quantize, Fp8QuantizeArgs,
     Fp8QuantizeDescriptor,
 };
-use ops::gemm::{Args, Descriptor, Epilogue, Gemm};
+use ops::gemm::{Args, Descriptor, Gemm};
 use ops::reduce::{self, Function, Reduce};
 use tensor::{D, DType, Device, Tensor};
 
@@ -37,10 +35,6 @@ use super::{ACCUMULATE, as_rows, columns, like_rows, on_cpu, vector};
 use crate::error::{Error, Result};
 
 pub use ops::gemm::WeightOrder;
-
-/// The arrangement the packed product reads block scales in, the weight's and the encoded
-/// activation's alike.
-pub(crate) const PRODUCT_SCALE_LAYOUT: ScaleLayout = ScaleLayout::Swizzled128X4;
 
 /// `x · weightᵀ + bias` over a dense weight: `[..., n]` in `x`'s element type for `x` of
 /// `[..., k]`.
@@ -383,14 +377,14 @@ pub fn linear_nvfp4(
 
     // One layout governs a product: it states both how the activation's block scales are
     // arranged and, by naming the product, how the weight's are read.
-    let expected = PRODUCT_SCALE_LAYOUT.shape(n as u64, u64::from(k));
+    let expected = GemmDescriptor::SCALE_LAYOUT.shape(n as u64, u64::from(k));
     let stated: Vec<u64> = scales.dims().iter().map(|dim| *dim as u64).collect();
     if stated != expected {
         return Err(refuse(format!(
-            "the block scales are {:?}; {n} rows of {k} elements take {:?} in the \
-             {PRODUCT_SCALE_LAYOUT} layout",
+            "the block scales are {:?}; {n} rows of {k} elements take {:?} in the {} layout",
             scales.dims(),
-            expected
+            expected,
+            GemmDescriptor::SCALE_LAYOUT
         )));
     }
     factor(OWNER, "input scale", input_scale)?;
@@ -465,18 +459,18 @@ fn packed_product(
         // rows; the product's rows past those are computed from bytes nothing reads and are not
         // part of the result.
         let packed_rows = ops::empty((class, packed), DType::U8)?;
-        let class_scales = PRODUCT_SCALE_LAYOUT.shape(class as u64, k as u64);
+        let class_scales = GemmDescriptor::SCALE_LAYOUT.shape(class as u64, k as u64);
         let packed_scales = ops::empty(
             (class_scales[0] as usize, class_scales[1] as usize),
             DType::U8,
         )?;
         let token_scale = ops::empty(class, DType::F32)?;
 
-        let row_scales = PRODUCT_SCALE_LAYOUT.shape(held as u64, k as u64);
+        let row_scales = GemmDescriptor::SCALE_LAYOUT.shape(held as u64, k as u64);
         launch_quantize(
             &rows.narrow(0, first, held)?,
             input_scale,
-            PRODUCT_SCALE_LAYOUT,
+            GemmDescriptor::SCALE_LAYOUT,
             (
                 ops::operand(&packed_rows.narrow(0, 0, held)?)?,
                 ops::operand(&packed_scales.narrow(0, 0, row_scales[0] as usize)?)?,
@@ -486,17 +480,13 @@ fn packed_product(
         )?;
 
         // 2. Multiply the encoded rows by the weight, over the class's rows.
-        let descriptor = GemmDescriptor {
-            packed: DType::U8,
-            scale: scales.dtype(),
-            accumulate: ACCUMULATE,
-            output: rows.dtype(),
-            layout: PRODUCT_SCALE_LAYOUT,
-            epilogue: Epilogue::None,
-            m: class as u32,
-            n: n as u32,
-            k: k as u32,
-        };
+        let descriptor = GemmDescriptor::new(
+            scales.dtype(),
+            rows.dtype(),
+            class as u32,
+            n as u32,
+            k as u32,
+        );
 
         // The scale's type is the checkpoint's own statement, so scales declared as anything
         // but E4M3 make a key no store built: refused here, where the function can say which
@@ -538,7 +528,7 @@ fn nvfp4_formula(
         .reshape((m, k))?;
 
     // The weight, decoded: its codes times its block scales, read out of the swizzled table.
-    let weight = decoded(values, scales, PRODUCT_SCALE_LAYOUT)?;
+    let weight = decoded(values, scales, GemmDescriptor::SCALE_LAYOUT)?;
 
     Ok(activation
         .matmul(&weight.t()?)?

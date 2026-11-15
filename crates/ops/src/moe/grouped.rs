@@ -36,7 +36,7 @@ use tensor::DType;
 use crate::abi::{self, MESSAGE};
 use crate::activation::Activation;
 use crate::descriptor::Key;
-use crate::fp4::ScaleLayout;
+use crate::fp4::{ScaleLayout, ValueLayout};
 use crate::kernel::{Kernel, NativeCall};
 use crate::operand::Operand;
 use crate::tolerance::{self, Tolerance};
@@ -562,12 +562,6 @@ impl NativeCall for RouteCall {
     }
 }
 
-/// One compilation of `gather_gemm_nvfp4`.
-///
-/// The routed first matrix of an encoded (NVFP4) expert block. It is its own operator rather than a
-/// variant of [`GatherGemm`]: the weight operand's type changes — packed E2M1 nibbles, the swizzled
-/// block scales, one FP32 tensor scale per expert — and an optional-and-branch form would put the
-/// branch in the descriptor key and in the hot path of the dense case that never has it.
 /// The block-scale layout both routed NVFP4 products read their weights' scales in.
 ///
 /// The packages compile their kernels for this layout of the weight operand (their manifests'
@@ -575,6 +569,12 @@ impl NativeCall for RouteCall {
 /// a caller transforms every checkpoint's weight scales into this layout before it binds them.
 pub const WEIGHT_SCALE_LAYOUT: ScaleLayout = ScaleLayout::Swizzled128X4;
 
+/// One compilation of `gather_gemm_nvfp4`.
+///
+/// The routed first matrix of an encoded (NVFP4) expert block. It is its own operator rather than a
+/// variant of [`GatherGemm`]: the weight operand's type changes — packed E2M1 nibbles, the swizzled
+/// block scales, one FP32 tensor scale per expert — and an optional-and-branch form would put the
+/// branch in the descriptor key and in the hot path of the dense case that never has it.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub struct GatherGemmNvfp4Descriptor {
     /// Hidden elements of a token: the contraction length.
@@ -602,6 +602,23 @@ pub struct GatherGemmNvfp4Descriptor {
     pub cluster: (u32, u32),
 }
 
+/// The expert width both encoded products compute over for `intermediate` columns of a
+/// checkpoint's experts: padded to whole MMA row tiles of the gated product, whose stack holds
+/// `2 · intermediate` rows, and to whole swizzled scale atoms of the second product's
+/// contraction. A loader pads a rank's share of the experts to this width with zero codes and
+/// zero scales, which contribute nothing.
+pub const fn packed_width(intermediate: u32) -> u32 {
+    let rows = TILE.0 / 2;
+    let atoms = crate::fp4::SWIZZLE_COLUMNS as u32 * crate::fp4::BLOCK_ELEMENTS;
+
+    // The least common multiple of the two granules, both powers of two in every package.
+    let (mut a, mut b) = (rows, atoms);
+    while b != 0 {
+        (a, b) = (b, a % b);
+    }
+    intermediate.next_multiple_of(rows / a * atoms)
+}
+
 /// The bytes an encoded product's entry writes before the package's workspace: a header that
 /// holds the padded route count.
 const ENTRY_PREAMBLE: u64 = 16;
@@ -627,6 +644,44 @@ fn packed_workspace(routes: u64, width: u64, tile: (u32, u32), cluster: (u32, u3
 }
 
 impl GatherGemmNvfp4Descriptor {
+    /// The arrangement of the `[up; gate]` stack's packed rows the gated product reads: the two
+    /// halves interleaved row by row, then shuffled inside the blocks of one tile
+    /// (`mUseShuffledMatrix`).
+    pub const WEIGHT_VALUES: ValueLayout = ValueLayout::InterleavedShuffled {
+        epilogue_tile_m: TILE.0,
+    };
+
+    /// The arrangement of the encoded tokens' block scales the product reads: it gathers the
+    /// tokens it routes, in the linear form. The descriptor's `layout`.
+    pub const TOKEN_SCALES: ScaleLayout = ScaleLayout::Linear;
+
+    /// The compilation of the gated product of `top` routes over `experts` packed experts of
+    /// `intermediate` gated width from `hidden`-wide tokens into `dtype` rows, gated by
+    /// `activation`, over block scales of type `scale`: tokens in [`Self::TOKEN_SCALES`], at
+    /// the products' tile and cluster.
+    pub fn new(
+        hidden: u32,
+        intermediate: u32,
+        experts: u32,
+        top: u32,
+        activation: Activation,
+        dtype: DType,
+        scale: DType,
+    ) -> Self {
+        Self {
+            hidden,
+            intermediate,
+            experts,
+            top,
+            activation,
+            dtype,
+            scale,
+            layout: Self::TOKEN_SCALES,
+            tile: TILE,
+            cluster: CLUSTER,
+        }
+    }
+
     /// The bytes of workspace a launch of `routes` permuted rows takes: the package's sizing over
     /// the gated product's `2 · intermediate` output columns.
     pub fn workspace_bytes(&self, routes: u64) -> u64 {
@@ -1227,6 +1282,16 @@ mod nvfp4_tests {
         );
     }
 
+    /// A share of 160 columns, a rank's quarter of 640, is computed as 192: three 128-row tiles of
+    /// the gated stack and three scale atoms of the second contraction.
+    #[test]
+    fn a_share_is_padded_to_whole_tiles_and_scale_atoms() {
+        assert_eq!(packed_width(160), 192);
+        assert_eq!(packed_width(192), 192);
+        assert_eq!(packed_width(768), 768);
+        assert_eq!(packed_width(1), 64);
+    }
+
     /// The workspaces follow the package's arithmetic over a bucket's route count: 15 tokens over
     /// 128 experts are 120 tiles of 128 permuted rows, for which the gated product (1536 columns)
     /// asks 16 + 740 356 bytes and the second (2048 columns) 16 + 987 140; a bucket of a single
@@ -1290,6 +1355,40 @@ pub struct RouteGemmNvfp4Descriptor {
 }
 
 impl RouteGemmNvfp4Descriptor {
+    /// The arrangement of the `down` stack's packed rows the product reads: shuffled inside the
+    /// blocks of one tile (`mUseShuffledMatrix`).
+    pub const WEIGHT_VALUES: ValueLayout = ValueLayout::Shuffled {
+        epilogue_tile_m: TILE.0,
+    };
+
+    /// The arrangement of the encoded rows' block scales the product reads: the descriptor's
+    /// `layout`.
+    pub const TOKEN_SCALES: ScaleLayout = ScaleLayout::Swizzled128X4;
+
+    /// The compilation of the second product of `top` routes over `experts` packed experts
+    /// from `intermediate`-wide gated rows into `hidden` columns of `dtype`, over block scales
+    /// of type `scale`: rows in [`Self::TOKEN_SCALES`], at the products' tile and cluster.
+    pub fn new(
+        hidden: u32,
+        intermediate: u32,
+        experts: u32,
+        top: u32,
+        dtype: DType,
+        scale: DType,
+    ) -> Self {
+        Self {
+            hidden,
+            intermediate,
+            experts,
+            top,
+            dtype,
+            scale,
+            layout: Self::TOKEN_SCALES,
+            tile: TILE,
+            cluster: CLUSTER,
+        }
+    }
+
     /// The bytes of workspace a launch of `routes` permuted rows takes: the package's sizing over
     /// the product's `hidden` output columns.
     pub fn workspace_bytes(&self, routes: u64) -> u64 {

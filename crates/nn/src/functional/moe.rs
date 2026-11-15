@@ -33,8 +33,9 @@
 
 use std::ops::Range;
 
-use ops::fp4::{BLOCK_ELEMENTS, ScaleLayout};
+use ops::fp4::{BLOCK_ELEMENTS, ValueLayout};
 use ops::moe::ExchangeArgs;
+use ops::moe::TILE;
 use ops::moe::combine::{self, MoeUnpermute, UnpermuteArgs};
 use ops::moe::exchange::{self, FusedLayer, Mode};
 use ops::moe::grouped::{
@@ -44,7 +45,6 @@ use ops::moe::grouped::{
 };
 use ops::moe::routing::{TopkArgs, TopkDescriptor, TopkSoftmax};
 use ops::moe::sort::{self, MoeSort, SortArgs};
-use ops::moe::{CLUSTER, TILE};
 use ops::residual::{SigmoidGatedAdd, SigmoidGatedAddArgs, SigmoidGatedAddDescriptor};
 use tensor::{D, DType, Device, Tensor};
 
@@ -53,7 +53,7 @@ use super::nvfp4::{decoded, encoded, integer, launch_quantize};
 use super::{ACCUMULATE, Activation, as_rows, columns, on_cpu, same_rows};
 use crate::capability::ExpertExchange;
 use crate::error::{Error, Result};
-use crate::quantization::{Nvfp4Stack, ValueLayout};
+use crate::quantization::Nvfp4Stack;
 
 /// The rows of the route maps [`moe_sort`] returns, `[SORT_MAPS, permuted rows]` U32: each row is
 /// one map, in its leading entries.
@@ -86,24 +86,6 @@ const ABSENT: u32 = u32::MAX;
 
 /// The map entry of a route of a token row the batch does not fill: the kernels' `-2`.
 const NOT_LIVE: u32 = u32::MAX - 1;
-
-/// The arrangement the gated product reads its `[up; gate]` stack's packed rows in: the two
-/// halves interleaved row by row, then shuffled inside the blocks of one tile.
-pub(crate) const GATED_VALUE_LAYOUT: ValueLayout = ValueLayout::InterleavedShuffled {
-    epilogue_tile_m: TILE.0,
-};
-
-/// The arrangement the second product reads its `down` stack's packed rows in.
-pub(crate) const DOWN_VALUE_LAYOUT: ValueLayout = ValueLayout::Shuffled {
-    epilogue_tile_m: TILE.0,
-};
-
-/// The arrangement the gated product reads its activation's block scales in: its kernels read
-/// the tokens they route in the linear form.
-const GATED_TOKEN_SCALE_LAYOUT: ScaleLayout = ScaleLayout::Linear;
-
-/// The arrangement the second product reads its activation's block scales in.
-const ACTIVATION_SCALE_LAYOUT: ScaleLayout = ScaleLayout::Swizzled128X4;
 
 /// The router's choice: `(ids, weights)`, the `top` most probable experts of each token and
 /// their probabilities, `[tokens, top]` U32 and FP32.
@@ -572,18 +554,10 @@ pub fn gather_gemm_nvfp4(
 
         let x = decoded_rows(hidden, &up_gate.encode_scale)?.index_select(&token, 0)?;
 
-        // The stack's rows in their own order: up row `i` is stored at the shuffle of `2i` and
-        // gate row `i` at the shuffle of `2i + 1`.
+        // The stack's rows in their own order, read back out of the arrangement the product
+        // declares.
         let stored = decoded(&up_gate.values, &up_gate.scales, up_gate.layout)?;
-        let half = Tensor::arange(0_u32, intermediate as u32, &Device::Cpu)?;
-        let doubled = half.broadcast_mul(&integer(2, &half)?)?;
-        let order = Tensor::cat(
-            &[
-                shuffled(&doubled)?,
-                shuffled(&doubled.broadcast_add(&integer(1, &half)?)?)?,
-            ],
-            0,
-        )?;
+        let order = stored_order(GatherGemmNvfp4Descriptor::WEIGHT_VALUES, gated)?;
         let weight = stored.index_select(&order, 1)?.index_select(&expert, 0)?;
         let projected = weight.matmul(&x.unsqueeze(2)?)?.squeeze(2)?;
 
@@ -600,15 +574,25 @@ pub fn gather_gemm_nvfp4(
         return Ok(zero_padding(&product, &live)?.to_dtype(hidden.dtype())?);
     }
 
-    // 1. The hidden rows' encoding, in the layout the gated product reads its tokens in.
+    // 1. The hidden rows' encoding, in the layout the gated product reads its tokens in. The
+    //    weights' scale type is the checkpoint's.
+    let descriptor = GatherGemmNvfp4Descriptor::new(
+        width,
+        intermediate as u32,
+        experts as u32,
+        top,
+        activation,
+        hidden.dtype(),
+        up_gate.scales.dtype(),
+    );
     let values = ops::empty((tokens, packed), DType::U8)?;
-    let blocks = GATED_TOKEN_SCALE_LAYOUT.shape(tokens as u64, u64::from(width));
+    let blocks = descriptor.layout.shape(tokens as u64, u64::from(width));
     let scales = ops::empty((blocks[0] as usize, blocks[1] as usize), DType::U8)?;
     let token_scale = ops::empty(tokens, DType::F32)?;
     launch_quantize(
         hidden,
         &up_gate.encode_scale,
-        GATED_TOKEN_SCALE_LAYOUT,
+        descriptor.layout,
         (
             ops::operand(&values)?,
             ops::operand(&scales)?,
@@ -617,20 +601,6 @@ pub fn gather_gemm_nvfp4(
     )?;
 
     // 2. The product, token-major: it gathers each permuted row's token itself.
-    let descriptor = GatherGemmNvfp4Descriptor {
-        hidden: width,
-        intermediate: intermediate as u32,
-        experts: experts as u32,
-        top,
-        activation,
-        dtype: hidden.dtype(),
-        // The weights' scale type is the checkpoint's; the layout is the tokens', which the
-        // encoding above wrote.
-        scale: up_gate.scales.dtype(),
-        layout: GATED_TOKEN_SCALE_LAYOUT,
-        tile: TILE,
-        cluster: CLUSTER,
-    };
     let out = ops::empty((rows, intermediate), hidden.dtype())?;
     let workspace = ops::empty(descriptor.workspace_bytes(rows as u64) as usize, DType::U8)?;
     ops::launch::<GatherGemmNvfp4>(
@@ -720,7 +690,7 @@ pub fn route_gemm_nvfp4(
 
         let x = decoded_rows(gated, &down.encode_scale)?;
         let stored = decoded(&down.values, &down.scales, down.layout)?;
-        let order = shuffled(&Tensor::arange(0_u32, width as u32, &Device::Cpu)?)?;
+        let order = stored_order(RouteGemmNvfp4Descriptor::WEIGHT_VALUES, width)?;
         let weight = stored.index_select(&order, 1)?.index_select(&expert, 0)?;
 
         let scales = down.global_scale.index_select(&expert, 1)?.get(0)?;
@@ -732,16 +702,27 @@ pub fn route_gemm_nvfp4(
         return Ok(zero_padding(&product, &live)?.to_dtype(gated.dtype())?);
     }
 
-    // 1. The gated rows' encoding: the first product's output is a 16-bit row, so this is an
-    //    encoding of its own and not a wider operand of the second product.
+    // 1. The gated rows' encoding, in the layout the product reads them in: the first product's
+    //    output is a 16-bit row, so this is an encoding of its own and not a wider operand of
+    //    the second product.
+    let descriptor = RouteGemmNvfp4Descriptor::new(
+        width as u32,
+        intermediate,
+        experts as u32,
+        top,
+        gated.dtype(),
+        down.scales.dtype(),
+    );
     let values = ops::empty((rows, packed), DType::U8)?;
-    let blocks = ACTIVATION_SCALE_LAYOUT.shape(rows as u64, u64::from(intermediate));
+    let blocks = descriptor
+        .layout
+        .shape(rows as u64, u64::from(intermediate));
     let scales = ops::empty((blocks[0] as usize, blocks[1] as usize), DType::U8)?;
     let token_scale = ops::empty(rows, DType::F32)?;
     launch_quantize(
         gated,
         &down.encode_scale,
-        ACTIVATION_SCALE_LAYOUT,
+        descriptor.layout,
         (
             ops::operand(&values)?,
             ops::operand(&scales)?,
@@ -750,17 +731,6 @@ pub fn route_gemm_nvfp4(
     )?;
 
     // 2. The product: one row per permuted row, the `top` routes of a token still separate.
-    let descriptor = RouteGemmNvfp4Descriptor {
-        hidden: width as u32,
-        intermediate,
-        experts: experts as u32,
-        top,
-        dtype: gated.dtype(),
-        scale: down.scales.dtype(),
-        layout: ACTIVATION_SCALE_LAYOUT,
-        tile: TILE,
-        cluster: CLUSTER,
-    };
     let out = ops::empty((rows, width), gated.dtype())?;
     let workspace = ops::empty(descriptor.workspace_bytes(rows as u64) as usize, DType::U8)?;
     ops::launch::<RouteGemmNvfp4>(
@@ -1023,7 +993,7 @@ pub fn expert_exchange_fused(
         launch_quantize(
             hidden,
             &up_gate.encode_scale,
-            ScaleLayout::Linear,
+            exchange::Descriptor::FUSED_TOKEN_SCALES,
             (
                 ops::operand(&exchange.packed.narrow(0, 0, tokens)?)?,
                 // The encoder writes each scale's byte, whatever type the transport labels
@@ -1235,16 +1205,14 @@ fn decoded_rows(rows: &Tensor, encode_scale: &Tensor) -> Result<Tensor> {
         .reshape(rows.shape())?)
 }
 
-/// Where the shuffle of a packed stack stores each row of `rows`, a U32 tensor of row indices:
-/// inside its block of thirty-two, row `r` moves to `(r mod 4) · 8 + r / 4`.
-fn shuffled(rows: &Tensor) -> Result<Tensor> {
-    let within = rows.broadcast_remainder(&integer(32, rows)?)?;
-    let block = rows.broadcast_sub(&within)?;
-    let group = within
-        .broadcast_remainder(&integer(4, &within)?)?
-        .broadcast_mul(&integer(8, rows)?)?;
+/// Where `layout` stores each of the `rows` rows of a packed matrix, `[rows]` U32: the rows a
+/// CPU formula reads back in the matrix's own order.
+fn stored_order(layout: ValueLayout, rows: usize) -> Result<Tensor> {
+    let order: Vec<u32> = (0..rows as u64)
+        .map(|row| layout.destination(row, rows as u64) as u32)
+        .collect();
 
-    Ok(((block + group)? + within.broadcast_div(&integer(4, rows)?)?)?)
+    Ok(Tensor::from_vec(order, rows, &Device::Cpu)?)
 }
 
 /// The descriptor of one launch of the expert exchange in `mode` over `exchange`'s group, for a

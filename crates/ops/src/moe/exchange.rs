@@ -42,6 +42,7 @@ use tensor::DType;
 
 use crate::abi::{self, MESSAGE};
 use crate::descriptor::Key;
+use crate::fp4::{ScaleLayout, ValueLayout};
 use crate::kernel::{Kernel, NativeCall};
 use crate::operand::Operand;
 use crate::tolerance::Tolerance;
@@ -140,6 +141,22 @@ pub struct Descriptor {
     pub multiprocessors: u32,
     /// Element type of the states.
     pub dtype: DType,
+}
+
+impl Descriptor {
+    /// The arrangement of the `[up; gate]` stack's packed rows a fused launch reads
+    /// ([`FusedLayer::up_gate`]): each thirty-two-row block leads with the gate rows.
+    pub const FUSED_UP_GATE_VALUES: ValueLayout = ValueLayout::GateFirst;
+
+    /// The arrangement of the `down` stack's packed rows a fused launch reads
+    /// ([`FusedLayer::down`]): the checkpoint's own.
+    pub const FUSED_DOWN_VALUES: ValueLayout = ValueLayout::Plain;
+
+    /// The arrangement of both stacks' block scales a fused launch reads.
+    pub const FUSED_SCALES: ScaleLayout = ScaleLayout::Swizzled128X4;
+
+    /// The arrangement of the exchanged tokens' block scales a fused launch reads.
+    pub const FUSED_TOKEN_SCALES: ScaleLayout = ScaleLayout::Linear;
 }
 
 impl fmt::Display for Descriptor {

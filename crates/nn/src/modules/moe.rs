@@ -49,22 +49,21 @@
 
 use std::ops::Range;
 
+use ops::moe::exchange;
+use ops::moe::grouped::{
+    GatherGemmNvfp4Descriptor, RouteGemmNvfp4Descriptor, WEIGHT_SCALE_LAYOUT, packed_width,
+};
 use tensor::{DType, Device, Shape, Tensor};
 
 use crate::capability::ExpertExchange;
 use crate::collective::{self, Split};
 use crate::error::{Error, Result};
-use crate::functional::{self, Activation, DOWN_VALUE_LAYOUT, GATED_VALUE_LAYOUT, WeightOrder};
+use crate::functional::{self, Activation, WeightOrder};
 use crate::modules::linear::{Linear, LinearConfig, Parallel};
 use crate::modules::mlp::{Mlp, MlpConfig};
-use crate::quantization::{Nvfp4Share, Nvfp4Stack, Scheme, ValueLayout};
+use crate::quantization::{Nvfp4Share, Nvfp4Stack, Scheme};
 use crate::var_builder::VarBuilder;
 use crate::weights::{PartBlock, WeightLayout, WeightSource, extents};
-
-/// The intermediate columns a rank's block of packed experts is padded to: the gated product's
-/// `2 · intermediate` rows are whole 128-row tiles (vLLM pads the family's 160 to 192,
-/// `refs/qwen-kernel-challenge/packages/_common/nvfp4.py:98-126`).
-const PACKED_TILE: u32 = 64;
 
 /// The class the per-expert tables of a fused exchange are filed under: the producer of their
 /// retained keys. Its text is part of every stored key, so it does not follow the type's name.
@@ -270,8 +269,8 @@ impl MoE {
         let packed = list.pp(window[0]).pp(config.up).scheme("weight") == Scheme::Nvfp4;
         let (stacks, intermediate) = if packed {
             // A rank's block of packed experts: whole bytes and block scales of every row,
-            // padded to whole row tiles of the products.
-            let padded = intermediate.next_multiple_of(PACKED_TILE);
+            // padded to the width the products compute over.
+            let padded = packed_width(intermediate);
             let share = (split.size > 1).then_some((
                 u64::from(split.rank * intermediate),
                 u64::from(intermediate),
@@ -440,10 +439,27 @@ impl MoE {
         let loader = vb.loader();
         let names = loader.representation().names();
         let list = vb.pp(config.list);
+        // Each stack in the arrangements its reading operator declares: the fused exchange's,
+        // or the routed products'.
         let (gated_layout, down_layout) = if exchanged {
-            (ValueLayout::GateFirst, ValueLayout::Plain)
+            (
+                (
+                    exchange::Descriptor::FUSED_UP_GATE_VALUES,
+                    exchange::Descriptor::FUSED_SCALES,
+                ),
+                (
+                    exchange::Descriptor::FUSED_DOWN_VALUES,
+                    exchange::Descriptor::FUSED_SCALES,
+                ),
+            )
         } else {
-            (GATED_VALUE_LAYOUT, DOWN_VALUE_LAYOUT)
+            (
+                (
+                    GatherGemmNvfp4Descriptor::WEIGHT_VALUES,
+                    WEIGHT_SCALE_LAYOUT,
+                ),
+                (RouteGemmNvfp4Descriptor::WEIGHT_VALUES, WEIGHT_SCALE_LAYOUT),
+            )
         };
 
         // The checkpoint's block scales are linear, and the published tables are built from
@@ -467,7 +483,7 @@ impl MoE {
             window,
             config.experts,
             names,
-            (gated_layout, ops::moe::grouped::WEIGHT_SCALE_LAYOUT),
+            gated_layout,
             true,
             rows,
         )?;
@@ -478,7 +494,7 @@ impl MoE {
             window,
             config.experts,
             names,
-            (down_layout, ops::moe::grouped::WEIGHT_SCALE_LAYOUT),
+            down_layout,
             true,
             columns,
         )?;

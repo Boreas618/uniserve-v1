@@ -31,7 +31,7 @@ use std::ops::Range;
 use float8::F8E4M3;
 use half::f16;
 use ops::dynamic_scale::{FP8_RANGE, NVFP4_RANGE};
-use ops::fp4::{BLOCK_ELEMENTS, ScaleLayout};
+use ops::fp4::{BLOCK_ELEMENTS, GemmDescriptor, ScaleLayout};
 use tensor::cpu_backend::CpuExecutor;
 use tensor::{DType, Shape, Tensor};
 
@@ -45,8 +45,9 @@ use crate::weights::{
 /// The layout a tensor's largest magnitude is filed under.
 const ABSMAX: WeightLayout = WeightLayout::named("absmax");
 
-/// The arrangement the packed product reads a converted weight's block scales in.
-const PRODUCT_SCALE_LAYOUT: ScaleLayout = crate::functional::PRODUCT_SCALE_LAYOUT;
+/// The arrangement the packed product reads a converted weight's block scales in, as its
+/// descriptor declares it.
+const PRODUCT_SCALE_LAYOUT: ScaleLayout = GemmDescriptor::SCALE_LAYOUT;
 
 /// The FP32 value of element `index` of `bytes`, which hold `dtype` elements: BF16, FP16 or
 /// FP32, each widened exactly.

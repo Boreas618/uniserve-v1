@@ -240,7 +240,8 @@ fn every_package_names_an_operator_of_ops() {
 }
 
 /// The routed NVFP4 products' packages compile their kernels for the weights' block-scale layout
-/// the operator states, and select by the descriptor's own layout for the tokens.
+/// the operator states and for the rows' arrangement each product's descriptor declares, and
+/// select by the descriptor's own layout for the tokens.
 ///
 /// A product's kernels are compiled with one layout for each operand, and nothing compares the
 /// two at a launch: a package built for one form and handed a table in the other reads every
@@ -249,8 +250,17 @@ fn every_package_names_an_operator_of_ops() {
 /// weights' layout is the enumerator those values give the operator's weight scale layout.
 #[test]
 fn a_routed_nvfp4_package_reads_the_weight_scale_layout_its_operator_states() {
+    use ops::fp4::ValueLayout;
+    use ops::moe::grouped::{GatherGemmNvfp4Descriptor, RouteGemmNvfp4Descriptor};
+
     let kernels = Path::new(env!("CARGO_MANIFEST_DIR")).join("kernels");
-    for operator in ["gather_gemm_nvfp4", "route_gemm_nvfp4"] {
+    for (operator, values) in [
+        (
+            "gather_gemm_nvfp4",
+            GatherGemmNvfp4Descriptor::WEIGHT_VALUES,
+        ),
+        ("route_gemm_nvfp4", RouteGemmNvfp4Descriptor::WEIGHT_VALUES),
+    ] {
         let package = kernels.join(operator).join("trtllm");
         let manifest: toml::Table = std::fs::read_to_string(package.join(Manifest::FILE))
             .unwrap()
@@ -268,6 +278,12 @@ fn a_routed_nvfp4_package_reads_the_weight_scale_layout_its_operator_states() {
             selected["mSfLayoutA"].as_str(),
             tokens["values"][weights.as_str()].as_str(),
             "{operator}'s package compiles for another weight scale layout than its operator's"
+        );
+        let shuffled = i64::from(values != ValueLayout::Plain);
+        assert_eq!(
+            selected["mUseShuffledMatrix"].as_integer(),
+            Some(shuffled),
+            "{operator}'s package reads its weights' rows in another arrangement than {values}"
         );
     }
 }

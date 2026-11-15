@@ -11,7 +11,7 @@
 use std::collections::BTreeMap;
 use std::path::Path;
 
-use nn::quantization::{ModeloptManifest, Nvfp4Names, UNIFIED_EXPORT, ValueLayout};
+use nn::quantization::{ModeloptManifest, Nvfp4Names, UNIFIED_EXPORT};
 use nn::weights::PartBlock;
 use nn::{
     Checkpoint, CpuWeights, DType, Device, Library, MetaWeights, PipelineIndex, Shape, Source,
@@ -19,6 +19,7 @@ use nn::{
 };
 use nn_testing::{Stored, encode, stored, values, write_checkpoint, write_file};
 use ops::fp4::ScaleLayout;
+use ops::fp4::ValueLayout;
 use processing::RootFile;
 
 /// The local directory `directory`.

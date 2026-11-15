@@ -37,7 +37,7 @@
 //! one product.
 
 use ops::dynamic_scale::{FP8_RANGE, NVFP4_RANGE};
-use ops::fp4::{BLOCK_ELEMENTS, PRODUCT_TILE, ScaleLayout};
+use ops::fp4::{BLOCK_ELEMENTS, GemmDescriptor, PRODUCT_TILE, ScaleLayout};
 use tensor::{DType, Module, Shape, Tensor};
 
 use crate::collective::{self, Split};
@@ -55,8 +55,9 @@ const FILE_SCALE_LAYOUT: ScaleLayout = ScaleLayout::Linear;
 /// of their retained keys. Its text is part of every stored key of such a constant.
 const PRODUCER: &str = "nn::Linear";
 
-/// The arrangement the packed product reads the weight's block scales in.
-const PRODUCT_SCALE_LAYOUT: ScaleLayout = functional::PRODUCT_SCALE_LAYOUT;
+/// The arrangement the packed product reads the weight's block scales in, as its descriptor
+/// declares it.
+const PRODUCT_SCALE_LAYOUT: ScaleLayout = GemmDescriptor::SCALE_LAYOUT;
 
 /// How a projection is split across a tensor-parallel group.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
