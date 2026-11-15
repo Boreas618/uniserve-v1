@@ -76,17 +76,6 @@ struct Cli {
 }
 
 fn main() -> Result<ExitCode> {
-    // A supervised process's standard error is its supervisor's pipe, and the
-    // supervisor that started it may be gone: after a hot restart the
-    // successor adopts the process without its predecessor's pipe, so a panic
-    // written only to standard error is invisible in the run's log. Standard
-    // output is the log every process of the deployment shares, so a panic is
-    // stated there as well.
-    let default = std::panic::take_hook();
-    std::panic::set_hook(Box::new(move |panic| {
-        println!("a process panicked: {panic}");
-        default(panic);
-    }));
     // Before any thread, CUDA or NCCL exists.
     runtime_settings();
     let cli = Cli::parse();
