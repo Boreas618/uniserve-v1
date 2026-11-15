@@ -98,8 +98,8 @@ use nn::{Clip, Decoder, Splice, Splicer};
 use ops::pcm::{self, PcmInterleave};
 use ops::rgb::{self, RgbBytes};
 use platform::{
-    Communicator, DevicePtr, DeviceRange, Event, EventFlags, Pitched, PitchedBatch, SourceOrder,
-    Stream,
+    Communicator, DataType, DevicePtr, DeviceRange, Event, EventFlags, Pitched, PitchedBatch,
+    SourceOrder, Stream,
 };
 use proto::video::Layout;
 use tensor::{DType, Device, Shape, Tensor};
@@ -120,9 +120,9 @@ const CHANNELS: u64 = rgb::CHANNELS as u64;
 /// The channels of the interleaved PCM.
 const PCM_CHANNELS: u32 = 2;
 
-/// The `ncclDataType_t` code a tail travels as between the decoder ranks: `ncclUint8`, so its
-/// element count is its bytes whatever the decoder's element type.
-const TAIL_ELEMENT: i32 = 1;
+/// The element type a tail travels as between the decoder ranks: bytes, so its element count is
+/// its bytes whatever the decoder's element type.
+const TAIL_ELEMENT: DataType = DataType::Uint8;
 
 /// What one unit of a call issues, in the order `serve` issues it (module documentation):
 ///

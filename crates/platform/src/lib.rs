@@ -84,7 +84,7 @@ pub use launch::{
 pub use library::Library;
 pub use memory::{DeviceAllocation, HostRegistration, PinnedBuffer};
 pub use native::NativeLibrary;
-pub use nccl::{Communicator, UniqueId};
+pub use nccl::{Communicator, DataType, UniqueId};
 pub use nvml::{Nvml, NvmlMemory};
 pub use pool::VirtualPool;
 pub use stream::{CaptureStatus, Stream, WaitValue};

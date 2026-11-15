@@ -172,10 +172,10 @@ impl Communicator {
     /// Reduces `count` elements from every rank into every rank's `recv` (in
     /// place when both ranges start at the same address).
     ///
-    /// `dtype` is the elements' `ncclDataType_t` code. Each range states how
-    /// many bytes are valid from its address. The call checks, before any NCCL
-    /// call, that `stream` belongs to this communicator's device, that `dtype`
-    /// is a code of `nccl.h`, and that `count` elements of it fit both ranges; the caller keeps the storage alive until the stream (or graph
+    /// `dtype` is the elements' type. Each range states how many bytes are
+    /// valid from its address. The call checks, before any NCCL call, that
+    /// `stream` belongs to this communicator's device and that `count`
+    /// elements of `dtype` fit both ranges; the caller keeps the storage alive until the stream (or graph
     /// replay) completes.
     ///
     /// Takes `&self` so that a caller may hold the group as a shared reference
@@ -188,7 +188,7 @@ impl Communicator {
         send: DeviceRange,
         recv: DeviceRange,
         count: usize,
-        dtype: i32,
+        dtype: DataType,
         op: ReduceOp,
     ) -> Result<()> {
         self.ready(stream, "ncclAllReduce")?;
@@ -208,7 +208,7 @@ impl Communicator {
                 pointer(send.ptr()),
                 pointer(recv.ptr()),
                 count,
-                dtype,
+                dtype.code(),
                 op as i32,
                 self.raw,
                 stream.handle(),
@@ -227,7 +227,7 @@ impl Communicator {
         send: DeviceRange,
         recv: DeviceRange,
         count: usize,
-        dtype: i32,
+        dtype: DataType,
     ) -> Result<()> {
         self.ready(stream, "ncclAllGather")?;
         require_room(send.bytes(), elements_bytes(count, dtype)?, "send")?;
@@ -244,7 +244,7 @@ impl Communicator {
                 pointer(send.ptr()),
                 pointer(recv.ptr()),
                 count,
-                dtype,
+                dtype.code(),
                 self.raw,
                 stream.handle(),
             )
@@ -263,7 +263,7 @@ impl Communicator {
         send: DeviceRange,
         recv: DeviceRange,
         count: usize,
-        dtype: i32,
+        dtype: DataType,
     ) -> Result<()> {
         self.ready(stream, "ncclAlltoAll")?;
         let needed = ranks_bytes(count, dtype, self.size)?;
@@ -281,7 +281,7 @@ impl Communicator {
                 pointer(send.ptr()),
                 pointer(recv.ptr()),
                 count,
-                dtype,
+                dtype.code(),
                 self.raw,
                 stream.handle(),
             )
@@ -300,7 +300,7 @@ impl Communicator {
         send: DeviceRange,
         recv: DeviceRange,
         count: usize,
-        dtype: i32,
+        dtype: DataType,
         root: i32,
     ) -> Result<()> {
         self.ready(stream, "ncclBroadcast")?;
@@ -320,7 +320,7 @@ impl Communicator {
                 pointer(send.ptr()),
                 pointer(recv.ptr()),
                 count,
-                dtype,
+                dtype.code(),
                 root,
                 self.raw,
                 stream.handle(),
@@ -339,7 +339,7 @@ impl Communicator {
         stream: &Stream,
         data: DeviceRange,
         count: usize,
-        dtype: i32,
+        dtype: DataType,
         peer: i32,
     ) -> Result<()> {
         self.ready(stream, "ncclSend")?;
@@ -356,7 +356,7 @@ impl Communicator {
             (api.send)(
                 pointer(data.ptr()),
                 count,
-                dtype,
+                dtype.code(),
                 peer,
                 self.raw,
                 stream.handle(),
@@ -374,7 +374,7 @@ impl Communicator {
         stream: &Stream,
         data: DeviceRange,
         count: usize,
-        dtype: i32,
+        dtype: DataType,
         peer: i32,
     ) -> Result<()> {
         self.ready(stream, "ncclRecv")?;
@@ -391,7 +391,7 @@ impl Communicator {
             (api.recv)(
                 pointer(data.ptr()),
                 count,
-                dtype,
+                dtype.code(),
                 peer,
                 self.raw,
                 stream.handle(),
@@ -486,42 +486,72 @@ impl Communicator {
     }
 }
 
-/// The width in bytes of one element of the `ncclDataType_t` code `dtype`, as `nccl.h` defines
-/// the code.
-///
-/// The code is the caller's, derived from its own element type; this is the one place the crate
-/// reads it, to check a range's room before NCCL addresses it. A code `nccl.h` does not define is
-/// refused rather than passed on.
-fn width(dtype: i32) -> Result<usize> {
-    let code = sys::ncclDataType_t::try_from(dtype)
-        .map_err(|_| Error::invalid(format!("{dtype} is no ncclDataType_t code of nccl.h")))?;
-    match code {
-        sys::ncclInt8 | sys::ncclUint8 | sys::ncclFloat8e4m3 | sys::ncclFloat8e5m2 => Ok(1),
-        sys::ncclFloat16 | sys::ncclBfloat16 => Ok(2),
-        sys::ncclInt32 | sys::ncclUint32 | sys::ncclFloat32 => Ok(4),
-        sys::ncclInt64 | sys::ncclUint64 | sys::ncclFloat64 => Ok(8),
-        _ => Err(Error::invalid(format!(
-            "{dtype} is no ncclDataType_t code of nccl.h"
-        ))),
+/// An element type NCCL moves, as `nccl.h` declares it (`ncclDataType_t`): what a collective's
+/// elements are, which states their width and the code NCCL reads.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DataType {
+    Int8,
+    Uint8,
+    Int32,
+    Uint32,
+    Int64,
+    Uint64,
+    Float16,
+    Float32,
+    Float64,
+    Bfloat16,
+    Float8e4m3,
+    Float8e5m2,
+}
+
+impl DataType {
+    /// The type's `ncclDataType_t` code, as the bindings of `nccl.h` state it.
+    fn code(self) -> i32 {
+        let code = match self {
+            Self::Int8 => sys::ncclInt8,
+            Self::Uint8 => sys::ncclUint8,
+            Self::Int32 => sys::ncclInt32,
+            Self::Uint32 => sys::ncclUint32,
+            Self::Int64 => sys::ncclInt64,
+            Self::Uint64 => sys::ncclUint64,
+            Self::Float16 => sys::ncclFloat16,
+            Self::Float32 => sys::ncclFloat32,
+            Self::Float64 => sys::ncclFloat64,
+            Self::Bfloat16 => sys::ncclBfloat16,
+            Self::Float8e4m3 => sys::ncclFloat8e4m3,
+            Self::Float8e5m2 => sys::ncclFloat8e5m2,
+        };
+        // Every code of `nccl.h` is below `ncclNumTypes`, which an `int` holds.
+        code as i32
+    }
+
+    /// The width in bytes of one element of the type.
+    pub const fn width(self) -> usize {
+        match self {
+            Self::Int8 | Self::Uint8 | Self::Float8e4m3 | Self::Float8e5m2 => 1,
+            Self::Float16 | Self::Bfloat16 => 2,
+            Self::Int32 | Self::Uint32 | Self::Float32 => 4,
+            Self::Int64 | Self::Uint64 | Self::Float64 => 8,
+        }
     }
 }
 
 /// The bytes `count` elements of the NCCL type `dtype` occupy, without overflowing.
-fn elements_bytes(count: usize, dtype: i32) -> Result<usize> {
-    count.checked_mul(width(dtype)?).ok_or_else(|| {
+fn elements_bytes(count: usize, dtype: DataType) -> Result<usize> {
+    count.checked_mul(dtype.width()).ok_or_else(|| {
         Error::invalid(format!(
-            "{count} elements of NCCL type {dtype} overflow the byte count"
+            "{count} elements of NCCL type {dtype:?} overflow the byte count"
         ))
     })
 }
 
 /// The bytes `size * count` elements of the NCCL type `dtype` occupy, without overflowing.
-fn ranks_bytes(count: usize, dtype: i32, size: i32) -> Result<usize> {
+fn ranks_bytes(count: usize, dtype: DataType, size: i32) -> Result<usize> {
     elements_bytes(count, dtype)?
         .checked_mul(size as usize)
         .ok_or_else(|| {
             Error::invalid(format!(
-                "{count} elements of NCCL type {dtype} on {size} ranks overflow the byte count"
+                "{count} elements of NCCL type {dtype:?} on {size} ranks overflow the byte count"
             ))
         })
 }
@@ -557,7 +587,7 @@ pub fn group<R>(submit: impl FnOnce() -> Result<R>) -> Result<R> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Communicator, sys};
+    use super::{Communicator, DataType, sys};
 
     /// The main process moves a communicator to the thread that drives its
     /// device; it never shares one between threads at once.
@@ -567,26 +597,23 @@ mod tests {
         movable::<Communicator>();
     }
 
-    /// A range's room is checked at the width `nccl.h` gives each type code,
-    /// and a code it does not define is refused before NCCL sees it.
+    /// A range's room is checked at the width `nccl.h` gives each type, and each type travels
+    /// as the code `nccl.h` gives it.
     #[test]
-    fn a_type_code_has_the_width_nccl_gives_it() {
-        for (code, width) in [
-            (sys::ncclInt8, 1),
-            (sys::ncclFloat16, 2),
-            (sys::ncclBfloat16, 2),
-            (sys::ncclFloat32, 4),
-            (sys::ncclInt64, 8),
-            (sys::ncclFloat8e4m3, 1),
+    fn a_type_has_the_width_and_code_nccl_gives_it() {
+        for (dtype, code, width) in [
+            (DataType::Int8, sys::ncclInt8, 1),
+            (DataType::Uint8, sys::ncclUint8, 1),
+            (DataType::Float16, sys::ncclFloat16, 2),
+            (DataType::Bfloat16, sys::ncclBfloat16, 2),
+            (DataType::Float32, sys::ncclFloat32, 4),
+            (DataType::Int64, sys::ncclInt64, 8),
+            (DataType::Float8e4m3, sys::ncclFloat8e4m3, 1),
         ] {
-            assert_eq!(super::width(code as i32).unwrap(), width, "code {code}");
+            assert_eq!(dtype.width(), width, "{dtype:?}");
+            assert_eq!(dtype.code(), code as i32, "{dtype:?}");
         }
-        assert!(super::width(-1).is_err());
-        assert!(super::width(sys::ncclNumTypes as i32).is_err());
-        assert_eq!(
-            super::ranks_bytes(3, sys::ncclFloat32 as i32, 4).unwrap(),
-            48
-        );
+        assert_eq!(super::ranks_bytes(3, DataType::Float32, 4).unwrap(), 48);
     }
 
     /// The rendezvous token every rank exchanges is the header's

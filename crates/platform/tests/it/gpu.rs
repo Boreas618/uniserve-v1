@@ -765,12 +765,12 @@ fn single_rank_communicators_run_collectives() {
             words,
             words,
             4,
-            2, /* ncclInt32 */
+            platform::DataType::Int32,
             ReduceOp::Min,
         )
         .unwrap();
     communicator
-        .broadcast(&stream, words, words, 4, 2 /* ncclInt32 */, 0)
+        .broadcast(&stream, words, words, 4, platform::DataType::Int32, 0)
         .unwrap();
     // A collective whose stated ranges cannot hold the elements it asks for
     // fails before any NCCL call is made.
@@ -781,7 +781,7 @@ fn single_rank_communicators_run_collectives() {
             short,
             words,
             4,
-            2, /* ncclInt32 */
+            platform::DataType::Int32,
             ReduceOp::Min,
         )
         .unwrap_err();
@@ -1687,7 +1687,7 @@ fn a_communicator_splits_into_a_subgroup_and_a_rank_left_out_gets_none() {
         words,
         words,
         4,
-        2, /* ncclInt32 */
+        platform::DataType::Int32,
         ReduceOp::Min,
     )
     .unwrap();
@@ -1765,7 +1765,13 @@ fn two_rank_half(rank: i32, id: UniqueId) -> Result<(), String> {
     let send_range = DeviceRange::new(DevicePtr::from_address(send.address()), 16);
     let recv_range = DeviceRange::new(DevicePtr::from_address(recv.address()), 16);
     group
-        .all_to_all(&stream, send_range, recv_range, 2, 3 /* ncclUint32 */)
+        .all_to_all(
+            &stream,
+            send_range,
+            recv_range,
+            2,
+            platform::DataType::Uint32,
+        )
         .map_err(|error| error.to_string())?;
     // Sum the exchanged window across the group, in place.
     group
@@ -1774,7 +1780,7 @@ fn two_rank_half(rank: i32, id: UniqueId) -> Result<(), String> {
             recv_range,
             recv_range,
             4,
-            3, /* ncclUint32 */
+            platform::DataType::Uint32,
             ReduceOp::Sum,
         )
         .map_err(|error| error.to_string())?;

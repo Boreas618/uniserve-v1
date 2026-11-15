@@ -35,7 +35,7 @@
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
-use platform::nccl::{Communicator, ReduceOp, group as nccl_group};
+use platform::nccl::{Communicator, DataType, ReduceOp, group as nccl_group};
 use platform::{CaptureStatus, DeviceRange, Event, EventFlags, Stream};
 use tensor::{DType, Tensor};
 
@@ -157,7 +157,7 @@ impl Group {
         &self,
         send: &Operand,
         recv: &Operand,
-        (block, bytes, dtype): (usize, usize, i32),
+        (block, bytes, dtype): (usize, usize, DataType),
         stream: &Stream,
     ) -> Result<()> {
         self.communicator().all_to_all(
@@ -175,7 +175,7 @@ impl Group {
     fn exchange_rows(
         &self,
         block: impl Fn(u64) -> DeviceRange,
-        (elements, dtype): (usize, i32),
+        (elements, dtype): (usize, DataType),
         ranks: u64,
         stream: &Stream,
     ) -> Result<()> {
@@ -615,23 +615,22 @@ fn range(operand: &Operand, bytes: usize) -> DeviceRange {
     DeviceRange::new(operand.ptr, bytes)
 }
 
-/// The `ncclDataType_t` code NCCL moves `dtype` as, when NCCL has one: the one conversion of an
-/// element type into a vendor's code.
+/// The element type NCCL moves `dtype` as, when NCCL has one: the one conversion of an element
+/// type into the communicator's.
 ///
 /// A sub-byte type has no collective counterpart: it travels inside a program's own encoded
 /// layout, never as a buffer a collective reads.
-fn nccl_type(dtype: DType) -> Option<i32> {
-    // The codes of `nccl.h`'s `ncclDataType_t`.
+fn nccl_type(dtype: DType) -> Option<DataType> {
     Some(match dtype {
-        DType::U8 => 1,      // ncclUint8
-        DType::I32 => 2,     // ncclInt32
-        DType::U32 => 3,     // ncclUint32
-        DType::I64 => 4,     // ncclInt64
-        DType::F16 => 6,     // ncclFloat16
-        DType::F32 => 7,     // ncclFloat32
-        DType::F64 => 8,     // ncclFloat64
-        DType::BF16 => 9,    // ncclBfloat16
-        DType::F8E4M3 => 10, // ncclFloat8e4m3
+        DType::U8 => DataType::Uint8,
+        DType::I32 => DataType::Int32,
+        DType::U32 => DataType::Uint32,
+        DType::I64 => DataType::Int64,
+        DType::F16 => DataType::Float16,
+        DType::F32 => DataType::Float32,
+        DType::F64 => DataType::Float64,
+        DType::BF16 => DataType::Bfloat16,
+        DType::F8E4M3 => DataType::Float8e4m3,
         // NCCL has no 16-bit integer reduction: a silent fallback would be a wrong answer, so a
         // PCM sample travels as bytes and never as a collective's element.
         DType::I16 => return None,
@@ -642,7 +641,7 @@ fn nccl_type(dtype: DType) -> Option<i32> {
 
 /// The element count of `send` and the element type NCCL moves it as, refusing buffers of two
 /// element types and element types NCCL does not have.
-fn elements(send: &Operand, recv: &Operand, collective: &'static str) -> Result<(usize, i32)> {
+fn elements(send: &Operand, recv: &Operand, collective: &'static str) -> Result<(usize, DataType)> {
     if send.dtype != recv.dtype {
         return Err(misuse(
             collective,
@@ -668,7 +667,7 @@ fn elements(send: &Operand, recv: &Operand, collective: &'static str) -> Result<
 
 /// The element counts of an all-gather over `ranks` members, `send`'s and the `ranks` times as
 /// many `recv` must hold, and its element type.
-fn gather(send: &Operand, recv: &Operand, ranks: u64) -> Result<(usize, usize, i32)> {
+fn gather(send: &Operand, recv: &Operand, ranks: u64) -> Result<(usize, usize, DataType)> {
     let (count, dtype) = elements(send, recv, "all_gather")?;
     let gathered = usize::try_from(ranks)
         .ok()
@@ -688,7 +687,7 @@ fn gather(send: &Operand, recv: &Operand, ranks: u64) -> Result<(usize, usize, i
 
 /// One block's element count, the bytes of each whole buffer and the element type of an
 /// all-to-all over `ranks` members, whose buffers both hold `ranks` equal blocks.
-fn exchange(send: &Operand, recv: &Operand, ranks: u64) -> Result<(usize, usize, i32)> {
+fn exchange(send: &Operand, recv: &Operand, ranks: u64) -> Result<(usize, usize, DataType)> {
     let (count, dtype) = elements(send, recv, "all_to_all")?;
     let ranks = usize::try_from(ranks).unwrap_or(usize::MAX);
 
