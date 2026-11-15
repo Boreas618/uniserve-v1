@@ -13,13 +13,14 @@
 use std::collections::HashSet;
 use std::time::{Duration, Instant};
 
+use engine::batch::cache::CacheGroupKind;
 use engine::batch::{Batch, Phase};
 use engine::scheduler::{Message, Output};
 use proto::request::{Event, FinishReason, GenerationRequest, MigrationCause, RequestId};
 use storage::Key;
-use storage::runtime::{Completion, Request};
+use storage::runtime::{self, Completion, OwnerId, Request, Tier};
 
-use crate::harness::{BLOCK, Deployment, Harness, VIDEO_PHASES, token, video};
+use crate::harness::{A, BLOCK, Deployment, Harness, VIDEO_PHASES, token, video};
 
 /// Whether `event` is the `Migratable` of a drain with no stored step.
 fn drained(event: Option<&Event>) -> bool {
@@ -483,6 +484,99 @@ fn a_request_running_through_a_shrinking_drain_steps_on_to_its_end() {
     let replied = harness.drain(Instant::now() + Duration::from_secs(60), true);
     answered_after(&mut harness, &replied);
 
+    let Some(Event::Finished {
+        reason,
+        completion_tokens,
+        ..
+    }) = harness.terminal(running)
+    else {
+        panic!("{:?}", harness.events(running));
+    };
+    assert_eq!((reason, completion_tokens), (FinishReason::MaxTokens, 30));
+}
+
+/// A request running through a shrinking drain steps on to its end while the target of another
+/// layout serves from the memory the drain gave back (SD §3.8; §10 E10). The target's blocks lie
+/// in its own region over the same device memory; once the host tier the two epochs share holds
+/// copies of them, this scheduler lists the cache and learns each as a device copy in its group's
+/// memory, though no unit of its own region holds it. The shrink still keeps what the running
+/// request may take before it ends.
+#[test]
+fn a_request_running_through_a_shrinking_drain_steps_on_beside_the_targets_blocks() {
+    // Blocks of sixteen tokens: the running request fills none, and so gives nothing back, until
+    // the scheduler has read the listing.
+    const WIDE_BLOCK: u32 = 16;
+    let mut harness = Deployment::tokens()
+        .cache(&[(CacheGroupKind::Full, WIDE_BLOCK)])
+        .host(64)
+        .build();
+    let kv = harness.region("kv-0");
+
+    // One block of prompt and thirty tokens to decode: three blocks at its end and the low
+    // watermark's, of which its admission asks for two.
+    let running = harness.submit(token(1, 6, 30));
+    harness.run_until(20, |harness| !harness.tokens(running).is_empty());
+
+    // The drain gives back what the running request will not take.
+    let replied = harness.drain(Instant::now() + Duration::from_secs(60), true);
+    harness.run_until(20, |harness| {
+        let mut outputs = harness.outputs().iter();
+        outputs.any(|output| matches!(output, Output::Shrunk(region, _) if *region == kv))
+    });
+    let generated = harness.tokens(running).len() as u32;
+    assert!(6 + generated < WIDE_BLOCK, "it filled a block: {generated}");
+
+    // The target commits sixteen blocks in a region of its own and stores them to the host.
+    harness.apart("kv-0", 16);
+    let owner = OwnerId(1);
+    let after = vec![(A, 0)];
+    let keys: Vec<Key> = (0..16).map(|at| Key([100 + at; 32])).collect();
+    let mut asks = vec![
+        Request::Attach { owner, group: A },
+        Request::Allocate {
+            owner,
+            class: 0,
+            at: 0,
+            count: 16,
+            units: 0,
+        },
+    ];
+    for (at, &key) in (0u32..).zip(&keys) {
+        asks.push(Request::Commit {
+            owner,
+            class: 0,
+            at,
+            key,
+            tokens: WIDE_BLOCK as u16,
+            after: after.clone(),
+        });
+    }
+    asks.push(Request::Store {
+        group: A,
+        keys,
+        tier: Tier::Host,
+    });
+    let answers = harness.elsewhere(&asks);
+    let committed = answers
+        .iter()
+        .filter(|answer| **answer == Completion::Committed)
+        .count();
+    assert_eq!(committed, 16, "{answers:?}");
+    // The `Store` is the last request of the target's queue pair, which numbers them from 1.
+    let store = runtime::RequestId(asks.len() as u64);
+    let answers = harness.elsewhere(&[Request::Finish {
+        copy: store,
+        ok: true,
+        after,
+    }]);
+    assert!(
+        answers
+            .iter()
+            .any(|answer| matches!(answer, Completion::Stored { .. })),
+        "{answers:?}"
+    );
+
+    answered_after(&mut harness, &replied);
     let Some(Event::Finished {
         reason,
         completion_tokens,

@@ -93,22 +93,43 @@ impl Scheduler {
     /// while it shrinks (`install_victims`), and never takes a private or pinned block, so a
     /// shrink stops short while requests run and each `Resized` lets the next one take what has
     /// come free since. Each `Resized` is reported as `Output::Shrunk` (`answered`).
+    ///
+    /// What a region gives back is never more than it holds beyond the blocks the live requests
+    /// asked for (`Scheduler::units_asked`) and the units the running ones may still take: the
+    /// scheduler's own count of its requests. `available` alone may show more than the region
+    /// can give, since the capacity words read with an answer may not show what it changed yet,
+    /// a `Resized` among them, and since it counts, beyond the installed head, the blocks the
+    /// scheduler's view places in the region's order, among them those a `Listing` states as
+    /// device copies in its groups' memory that lie in a region of another session over that
+    /// memory (the target of an epoch update of another layout). A `Resize` that asked for
+    /// fewer units would take the units a running request is still to take, which would end it
+    /// at the length the region holds.
     fn shrink_regions(&mut self) {
         let ended = self.requests.is_empty();
         let kept = self.units_to_end();
+        // Counted once a region shows something to give back.
+        let mut asked: Option<Vec<u32>> = None;
         for (index, number) in self.device_regions() {
             if self.resizing_region(number) {
                 continue;
             }
             let available = self.available.get(index).copied().unwrap_or(0);
-            let free = available.saturating_sub(kept.get(index).copied().unwrap_or(0));
+            let kept = kept.get(index).copied().unwrap_or(0);
             let retiring = self.retiring.get(index).copied().unwrap_or(0);
             let released = self.released.get(index).copied().unwrap_or(false);
-            if free == 0 && (retiring == 0 || !ended) && !released {
+            let idle = |free: u32| free == 0 && (retiring == 0 || !ended) && !released;
+            let shown = available.saturating_sub(kept);
+            if idle(shown) {
                 continue;
             }
 
             let capacity = self.capacity.get(index).copied().unwrap_or(0);
+            let units_asked = asked.get_or_insert_with(|| self.units_asked());
+            let held = units_asked.get(index).copied().unwrap_or(0);
+            let free = shown.min(capacity.saturating_sub(held.saturating_add(kept)));
+            if idle(free) {
+                continue;
+            }
             self.submit(runtime::Request::Resize {
                 region: number,
                 units: capacity.saturating_sub(free),

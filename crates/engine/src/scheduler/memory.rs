@@ -39,6 +39,7 @@
 //! boundary the answers support and allocates what no entry holds. The expected hit is
 //! `num_cached_tokens` until the hit is final.
 
+use std::collections::HashSet;
 use std::ops::Range;
 use std::time::Instant;
 
@@ -50,7 +51,7 @@ use storage::Key;
 use storage::key::{Digest, encoder_output, page_key, page_root};
 use storage::runtime::{self, Completion, GroupId, OwnerId, Source, Tier};
 
-use super::cache::{DEVICE, HOST, LOW_WATERMARK, REMOTE};
+use super::cache::{Cached, DEVICE, HOST, LOW_WATERMARK, REMOTE};
 use super::rows::state_interval;
 use super::video::products;
 use super::{Blocks, Request, RequestStatus, Scheduler, monotonic_nanos, span};
@@ -886,6 +887,45 @@ impl Scheduler {
                 let asked = blocks.asked.saturating_sub(blocks.first);
                 let need = most.saturating_add(LOW_WATERMARK).saturating_sub(asked);
                 self.charge_units(&mut units, group, class, need, 0);
+            }
+        }
+        units
+    }
+
+    /// Per region (an index), the units of the blocks the live token requests' tables hold or
+    /// asked for there (SD §3.8, "the units its live requests still hold"), each block once: a
+    /// read-only entry is the block of its key in the request's group, which the other requests
+    /// of the group that read the key (a prefix they share) hold too; every other entry is the
+    /// request's own: a private block, a block answered `Duplicate` (`Request::unpinned`), and
+    /// an entry of an `Allocate` not answered yet, whose units the buffer pool gives it once it
+    /// is answered. The buffer pool's shrink takes none of these units. A video request holds
+    /// blocks of sized classes alone, in regions no running request takes units of
+    /// ([`Scheduler::units_to_end`]).
+    pub(super) fn units_asked(&self) -> Vec<u32> {
+        let mut units = vec![0; self.regions.len()];
+        // The read-only blocks counted, by group and the number of their key (`Cached::id`).
+        let mut read: HashSet<(GroupId, u64)> = HashSet::new();
+        for request in self.requests.values() {
+            let (Some(_), Some(group)) = (request.generation(), self.kv_group(request)) else {
+                continue;
+            };
+            for (index, blocks) in request.blocks.iter().enumerate() {
+                let Ok(class) = u8::try_from(index) else {
+                    continue;
+                };
+                let chain = request.keys.get(index).map_or(&[][..], Vec::as_slice);
+                let shared = blocks.shared.max(blocks.first).min(blocks.asked);
+                let mut held = blocks.asked.saturating_sub(shared);
+                for position in blocks.first..shared {
+                    let counts = match chain.get(position as usize) {
+                        Some(key) if !request.unpinned.contains(key) => {
+                            read.insert((group, Cached::id(key)))
+                        }
+                        _ => true,
+                    };
+                    held += u32::from(counts);
+                }
+                self.charge_units(&mut units, group, class, held, 0);
             }
         }
         units

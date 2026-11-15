@@ -1214,26 +1214,58 @@ impl Harness {
     /// Opens the session of an engine epoch of another layout (epoch 2) beside this scheduler's,
     /// as an epoch update's target of another layout starts: its region of the memory space of
     /// this session's region `name` is a region of its own, `{name}-beside`, which takes `units`
-    /// units of that space at its opening, as far as the space's free memory goes. Returns that
-    /// region's number; [`Harness::elsewhere`] submits on this epoch's queue pair from then on.
+    /// units of that space at its opening, as far as the space's free memory goes, and its slot
+    /// rows lie in regions of its own (`slots-g-beside`, in memory of their own). Returns the
+    /// number of `{name}-beside`; [`Harness::elsewhere`] submits on this epoch's queue pair from
+    /// then on.
     ///
     /// # Panics
     ///
     /// When the session's layout states no region `name`, or the buffer pool refuses the session.
     pub(crate) fn beside(&mut self, name: &str, units: u32) -> u8 {
+        self.open_target(name, units, false)
+    }
+
+    /// [`Harness::beside`] with the target's region `{name}-beside` over a memory space of its
+    /// own, which holds `units` units from its opening: the target's groups state the memories of
+    /// this session's, so a block of the target is valid in the memory of a group of this
+    /// session, but none of its units lies in a region of this session.
+    ///
+    /// # Panics
+    ///
+    /// When the session's layout states no region `name`, or the buffer pool refuses the session.
+    pub(crate) fn apart(&mut self, name: &str, units: u32) -> u8 {
+        self.open_target(name, units, true)
+    }
+
+    /// Opens the session of [`Harness::beside`], its region `{name}-beside` over the space of
+    /// `name` or, with `own_space`, over a space of its own.
+    fn open_target(&mut self, name: &str, units: u32, own_space: bool) -> u8 {
         let renamed = format!("{name}-beside");
         let mut layout = runtime::Open {
             epoch: 2,
             ..self.layout.clone()
         };
+        for slots in layout
+            .regions
+            .iter_mut()
+            .filter(|region| region.name.starts_with("slots-") && region.name != name)
+        {
+            let own = format!("{}-beside", slots.name);
+            slots.space.clone_from(&own);
+            slots.name = own;
+        }
         let region = layout
             .regions
             .iter_mut()
             .find(|region| region.name == name)
             .unwrap_or_else(|| panic!("the layout states no region {name}"));
-        // The space keeps its name: the two epochs' regions share its memory.
+        // Over the same space, the two epochs' regions share its memory.
         region.name.clone_from(&renamed);
         region.units = units;
+        if own_space {
+            region.space.clone_from(&renamed);
+        }
 
         let groups: Vec<GroupId> = layout.groups.iter().map(|group| group.id).collect();
         let (inbox, _) = unbounded();
