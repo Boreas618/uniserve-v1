@@ -55,7 +55,6 @@ use super::rows::state_interval;
 use super::video::products;
 use super::{Blocks, Request, RequestStatus, Scheduler, monotonic_nanos, span};
 
-
 /// The checkpoints a recurrent-state table holds: its base at `first`, and the one at `end - 1`
 /// when that is another.
 fn checkpoints(blocks: &Blocks) -> [Option<u32>; 2] {

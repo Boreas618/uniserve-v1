@@ -38,9 +38,9 @@ use crate::memory::client::StorageClient;
 use crate::process::ranks::rank::ModelRunner;
 use crate::process::ranks::rank::text::Keys;
 use crate::process::ranks::rank::video::MediaCollective;
+use nn::pipeline::{Pipeline, Product};
 use testkit::LONG;
 use testkit::serving::{DEPLOYMENT, SLOTS, StorageServer, launch};
-use nn::pipeline::{Pipeline, Product};
 
 /// The pipeline of the media cases: MiniMax-H3's, as its family declares it.
 fn pipeline() -> Pipeline {
