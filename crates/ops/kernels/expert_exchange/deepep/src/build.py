@@ -20,10 +20,12 @@ UNIT = "src/exchange.cu"
 
 
 def definitions(request):
-    """The compile-time values a descriptor states, by the macro each defines.
+    """The compile-time values of the module, by the macro each defines.
 
-    The direction and the element type are the manifest's single choices, so
-    only the extents reach the compile.
+    DeepEP's kernels take them as template arguments: the descriptor's extents
+    and its device's multiprocessors, the opt-in shared memory of a block of
+    the target, and the manifest's parameters. The direction and the element
+    type are the manifest's single choices, so they reach no definition.
     """
     return {
         "UNISERVE_HIDDEN": request.field("hidden"),
@@ -32,6 +34,12 @@ def definitions(request):
         "UNISERVE_MAX_TOKENS": request.field("max_tokens"),
         "UNISERVE_RANKS": request.field("ranks"),
         "UNISERVE_ATTENTION_RANKS": request.field("attention"),
+        "UNISERVE_MULTIPROCESSORS": request.field("multiprocessors"),
+        "UNISERVE_SHARED_MEMORY": request.target.shared_memory,
+        "UNISERVE_EXCHANGE_MULTIPROCESSORS": request.parameters[
+            "exchange_multiprocessors"
+        ],
+        "UNISERVE_QUEUE_PAIRS": request.parameters["queue_pairs"],
     }
 
 

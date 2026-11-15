@@ -2114,6 +2114,7 @@ fn member(group: &Arc<HostGroup>, rank: u32, join: JoinHook) -> Member {
         top: 2,
         dtype: DType::BF16,
         device: 0,
+        multiprocessors: 148,
         attention_ranks: 0,
     };
 
@@ -2302,6 +2303,7 @@ fn a_union_is_joined_by_a_runner_whose_model_routes_experts() {
         top: 2,
         dtype: DType::BF16,
         device: 0,
+        multiprocessors: 148,
         attention_ranks: 0,
     };
 

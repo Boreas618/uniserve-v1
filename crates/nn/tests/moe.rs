@@ -1626,6 +1626,7 @@ fn exchange(ranks: u32, rank_rows: u32, hidden: usize, top: usize) -> ExpertExch
         attention: 0,
         rank_rows,
         step_rows: rank_rows,
+        multiprocessors: 148,
         states: meta((rows, hidden), DType::BF16),
         ids: meta((rows, top), DType::U32),
         weights: meta((rows, top), DType::F32),
@@ -1642,7 +1643,7 @@ fn exchange(ranks: u32, rank_rows: u32, hidden: usize, top: usize) -> ExpertExch
 fn exchange_key(mode: &str) -> String {
     format!(
         "mode_{mode}_hidden_8_intermediate_6_top_2_experts_4_max_tokens_4_ranks_2_attention_0_\
-         dtype_bf16"
+         multiprocessors_148_dtype_bf16"
     )
 }
 
@@ -1789,7 +1790,7 @@ fn a_calibrated_block_over_an_expert_group_runs_in_the_exchange_s_one_launch() {
             (
                 "expert_exchange",
                 "mode_fused_hidden_32_intermediate_16_top_2_experts_2_max_tokens_4_ranks_2_\
-                 attention_0_dtype_bf16"
+                 attention_0_multiprocessors_148_dtype_bf16"
             ),
         ]
         .map(|(operator, key)| (operator, key.to_owned()))

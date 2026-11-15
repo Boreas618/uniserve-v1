@@ -367,6 +367,7 @@ fn qwen3_moe_profiles_tensor_and_expert_parallel_ranks() {
                 attention: 0,
                 rank_rows,
                 step_rows: rank_rows,
+                multiprocessors: 148,
                 states: meta(Shape::from((rows, hidden)), model.dtype()),
                 ids: meta(Shape::from((rows, top)), DType::U32),
                 weights: meta(Shape::from((rows, top)), DType::F32),

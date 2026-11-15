@@ -421,6 +421,9 @@ pub struct ExpertExchange {
     /// most this many, so the received tensors are read to `ranks * step_rows` rows. At most
     /// `rank_rows`.
     pub step_rows: u32,
+    /// Multiprocessors of the device the exchange runs on, which the exchange's kernels are
+    /// compiled for (`ops::moe::exchange::Descriptor::multiprocessors`).
+    pub multiprocessors: u32,
     /// `[ranks * rank_rows, hidden]` in the activation element type: the dispatched activations.
     pub states: Tensor,
     /// `[ranks * rank_rows, top]` U32: the experts each received row is routed to.

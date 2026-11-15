@@ -141,6 +141,10 @@ pub struct Descriptor {
     pub ranks: u32,
     /// Leading ranks of the group that hold no experts.
     pub attention: u32,
+    /// Multiprocessors of the device the exchange runs on ([`multiprocessors`]). A backend whose
+    /// kernels spread over the whole device compiles its grid for them: a persistent grid that
+    /// synchronizes grid-wide needs every block resident, so it is sized to the device's count.
+    pub multiprocessors: u32,
     /// Element type of the states.
     pub dtype: DType,
 }
@@ -156,9 +160,28 @@ impl fmt::Display for Descriptor {
             .field("max_tokens", self.max_tokens)
             .field("ranks", self.ranks)
             .field("attention", self.attention)
+            .field("multiprocessors", self.multiprocessors)
             .field("dtype", abi::name(self.dtype))
             .finish(formatter)
     }
+}
+
+/// The multiprocessors of `device` (`platform::DeviceAttribute::MultiprocessorCount`), as an
+/// exchange descriptor and a transport shape state them.
+///
+/// # Errors
+///
+/// [`Error::Platform`] when the driver cannot report the device's count, and
+/// [`Error::Unsupported`] for a count that is not positive.
+pub fn multiprocessors(device: platform::DeviceId) -> Result<u32> {
+    let count = device.attribute(platform::DeviceAttribute::MultiprocessorCount)?;
+    u32::try_from(count)
+        .ok()
+        .filter(|count| *count > 0)
+        .ok_or_else(|| Error::Unsupported {
+            operation: ExpertExchange::NAME,
+            reason: format!("device {} reports {count} multiprocessors", device.0),
+        })
 }
 
 /// The arguments of one exchange launch.
@@ -331,11 +354,31 @@ pub struct TransportShape {
     pub dtype: DType,
     /// The CUDA device of this rank.
     pub device: i32,
+    /// Multiprocessors of that device ([`multiprocessors`]).
+    pub multiprocessors: u32,
     /// Leading ranks that hold no experts; zero when every rank holds its share.
     pub attention_ranks: u32,
 }
 
 impl TransportShape {
+    /// The descriptor of the module that drives a transport of this shape in `mode`: the module
+    /// whose `create` makes the transport, and whose launches run over it.
+    #[must_use]
+    pub const fn descriptor(&self, mode: Mode) -> Descriptor {
+        Descriptor {
+            mode,
+            hidden: self.hidden,
+            intermediate: self.intermediate,
+            top: self.top,
+            experts: self.experts,
+            max_tokens: self.max_tokens,
+            ranks: self.ranks,
+            attention: self.attention_ranks,
+            multiprocessors: self.multiprocessors,
+            dtype: self.dtype,
+        }
+    }
+
     /// What a fused backend holds beside its rows: its counters and its window's granule.
     const FUSED_FIXED_BYTES: u64 = 64 << 20;
     /// What any other backend holds beside its rows. A device communicator takes this: creating
@@ -783,6 +826,9 @@ impl Op for ExpertExchange {
 
 #[cfg(test)]
 mod tests {
+    /// The multiprocessors of the device the tests' descriptors state.
+    const MULTIPROCESSORS: u32 = 148;
+
     /// A shape of the deployment the bound was measured on.
     fn measured(max_tokens: u32, ranks: u32, attention_ranks: u32) -> TransportShape {
         TransportShape {
@@ -795,6 +841,7 @@ mod tests {
             top: 8,
             dtype: DType::BF16,
             device: 0,
+            multiprocessors: MULTIPROCESSORS,
             attention_ranks,
         }
     }
@@ -812,6 +859,7 @@ mod tests {
             max_tokens: 16,
             ranks: 2,
             attention: 0,
+            multiprocessors: MULTIPROCESSORS,
             dtype: DType::BF16,
         };
         let view = |dtype, dims: &[u64]| {
@@ -876,6 +924,7 @@ mod tests {
             max_tokens: 8192,
             ranks: 4,
             attention: 0,
+            multiprocessors: MULTIPROCESSORS,
             dtype: DType::BF16,
         };
         assert_eq!(
@@ -905,11 +954,13 @@ mod tests {
             max_tokens: 8192,
             ranks: 4,
             attention: 0,
+            multiprocessors: MULTIPROCESSORS,
             dtype: DType::BF16,
         };
         assert_eq!(
             combine.to_string(),
-            "mode_combine_hidden_2048_intermediate_768_top_8_experts_128_max_tokens_8192_ranks_4_attention_0_dtype_bf16"
+            "mode_combine_hidden_2048_intermediate_768_top_8_experts_128_max_tokens_8192_ranks_4_attention_0_\
+             multiprocessors_148_dtype_bf16"
         );
         let wider = Descriptor {
             ranks: 8,

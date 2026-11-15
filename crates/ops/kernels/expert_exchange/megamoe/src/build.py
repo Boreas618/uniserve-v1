@@ -17,12 +17,6 @@ import tempfile
 from uniserve_build_server import cute_dsl, fetch
 from uniserve_build_server.request import Request
 
-#: The SMs the launch's clusters are sized for. A persistent cluster that does
-#: not fit on the device would wait for one that never starts, so this is the
-#: smallest SM100 part's count, and a larger part leaves SMs idle rather than
-#: hanging.
-SM_COUNT = 148
-
 
 def shape_of(request):
     """The extents a descriptor states.
@@ -164,8 +158,16 @@ def compile_kernel(request, shape, staging):
     def pointer():
         return make_ptr(cutlass.Uint8, 16, AddressSpace.gmem, assumed_align=16)
 
+    # The persistent grid synchronizes grid-wide, so every cluster of it must
+    # be resident at once: as many clusters as the device's multiprocessors
+    # hold, one block on each.
     cluster_size = cluster[0] * cluster[1]
-    clusters = max(1, SM_COUNT // max(cluster_size, 1))
+    clusters = request.field("multiprocessors") // cluster_size
+    if clusters == 0:
+        raise SystemExit(
+            f"a device of {request.field('multiprocessors')} multiprocessors "
+            f"holds no cluster of {cluster_size}"
+        )
     # The launcher is traced with one offset per rank: its tuple's length is
     # the group's size, and the exported function takes the offsets as one
     # array.

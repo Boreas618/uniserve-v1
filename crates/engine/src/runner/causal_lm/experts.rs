@@ -327,6 +327,7 @@ impl Member {
             attention: self.shape.attention_ranks,
             rank_rows: self.shape.max_tokens,
             step_rows,
+            multiprocessors: self.shape.multiprocessors,
             states,
             ids,
             weights,
@@ -443,19 +444,7 @@ impl Member {
 
     /// The descriptor of the kernel that creates the transport.
     const fn descriptor(&self) -> Descriptor {
-        let shape = self.shape;
-
-        Descriptor {
-            mode: self.mode,
-            hidden: shape.hidden,
-            intermediate: shape.intermediate,
-            top: shape.top,
-            experts: shape.experts,
-            max_tokens: shape.max_tokens,
-            ranks: shape.ranks,
-            attention: shape.attention_ranks,
-            dtype: shape.dtype,
-        }
+        self.shape.descriptor(self.mode)
     }
 }
 

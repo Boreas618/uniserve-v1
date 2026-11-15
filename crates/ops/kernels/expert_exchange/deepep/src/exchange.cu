@@ -67,11 +67,16 @@ constexpr int kReceived = kRanks * kMaxTokens;
 constexpr int kLocalExperts = kExperts / (kRanks - kAttentionRanks);
 constexpr int kWireExperts = kRanks * kLocalExperts;
 
-// The launch shapes of the exchange, as DeepEP derives them.
-constexpr int kSMs = 24;
-constexpr int kFullSMs = 148;
-constexpr int kQPs = 129;
-constexpr int kSharedBytes = 232448;  // the opt-in shared memory of an SM100 block
+// The launch shapes of the exchange, as DeepEP derives them from what the build states: the
+// multiprocessors the dispatch and combine run on (the manifest's `exchange_multiprocessors`),
+// every multiprocessor of the device for the epilogues (the descriptor's `multiprocessors`), the
+// RDMA queue pairs the kernels address (the manifest's `queue_pairs`), and the shared memory a
+// block of the target may opt into, in bytes.
+constexpr int kSMs = UNISERVE_EXCHANGE_MULTIPROCESSORS;
+constexpr int kFullSMs = UNISERVE_MULTIPROCESSORS;
+constexpr int kQPs = UNISERVE_QUEUE_PAIRS;
+constexpr int kSharedBytes = UNISERVE_SHARED_MEMORY;
+static_assert(kSMs <= kFullSMs, "the exchange runs on the device's multiprocessors");
 constexpr int64_t kTimeoutCycles = 120ll * 1900 * 1000 * 1000;
 constexpr int kNotifyWarps = 4;
 constexpr int kHiddenBytes = kHidden * 2;

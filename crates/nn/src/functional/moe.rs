@@ -1323,6 +1323,7 @@ fn exchange_descriptor(
         max_tokens: exchange.rank_rows,
         ranks: exchange.ranks,
         attention: exchange.attention,
+        multiprocessors: exchange.multiprocessors,
         dtype,
     })
 }

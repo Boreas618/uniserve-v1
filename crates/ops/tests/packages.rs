@@ -271,3 +271,45 @@ fn a_routed_nvfp4_package_reads_the_weight_scale_layout_its_operator_states() {
         );
     }
 }
+
+/// Each expert_exchange package covers the keys of the descriptors its directions are launched
+/// with: a field the operator's key states and a manifest does not declare leaves every exchange
+/// of that backend without a module.
+#[test]
+fn every_exchange_package_covers_the_keys_its_operator_states() {
+    use ops::moe::exchange::{Descriptor, Mode};
+
+    let dispatch = Descriptor {
+        mode: Mode::Dispatch,
+        hidden: 2048,
+        intermediate: 768,
+        top: 8,
+        experts: 128,
+        max_tokens: 512,
+        ranks: 2,
+        attention: 0,
+        multiprocessors: 148,
+        dtype: DType::BF16,
+    };
+    let backends = [
+        ("alltoall", &[Mode::Dispatch, Mode::Combine][..]),
+        ("deepep", &[Mode::Dispatch, Mode::Combine]),
+        ("megamoe", &[Mode::Fused]),
+    ];
+
+    let manifests = kernel_manifests();
+    let mut failures = Vec::new();
+    for (backend, modes) in backends {
+        let (package, manifest) = manifests
+            .iter()
+            .find(|(_, manifest)| manifest.op == "expert_exchange" && manifest.backend == backend)
+            .unwrap_or_else(|| panic!("no expert_exchange package {backend}"));
+        for &mode in modes {
+            let key = Descriptor { mode, ..dispatch }.to_string();
+            if manifest.typed_fields(&key).is_none() {
+                failures.push(format!("{}: covers no {key}", package.display()));
+            }
+        }
+    }
+    assert_none(&failures);
+}

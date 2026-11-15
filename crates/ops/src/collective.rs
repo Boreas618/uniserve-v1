@@ -869,6 +869,7 @@ mod tests {
             max_tokens: 16,
             ranks: 2,
             attention: 0,
+            multiprocessors: 148,
             dtype: DType::BF16,
         };
         let tensor = |shape: (usize, usize), dtype| {
@@ -931,7 +932,7 @@ mod tests {
             [(
                 "expert_exchange",
                 "mode_dispatch_hidden_64_intermediate_128_top_2_experts_8_max_tokens_16_ranks_2_\
-                 attention_0_dtype_bf16"
+                 attention_0_multiprocessors_148_dtype_bf16"
                     .to_owned(),
                 String::new()
             )]

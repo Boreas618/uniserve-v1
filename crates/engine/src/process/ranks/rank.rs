@@ -677,6 +677,8 @@ impl ModelRunner {
             top: experts.top,
             dtype: model.dtype(),
             device: device.0,
+            multiprocessors: ops::moe::exchange::multiprocessors(device)
+                .context("reading the multiprocessors the exchange is compiled for")?,
             attention_ranks: self.mapping.attention_ranks,
         };
         Ok((shape, experts.encoded))
