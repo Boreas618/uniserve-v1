@@ -512,6 +512,14 @@ pub struct WorkerConfig {
     /// replaced; a rank reports a stalled job after half of it.
     #[serde(with = "values::duration")]
     pub watchdog_timeout: Duration,
+    /// How long the main processes of an epoch whose ranks span several hosts
+    /// wait for one another as they start: the scheduler node for every peer's
+    /// registration, a peer for the scheduler node's acceptance, and every
+    /// process for the others at the ranks' host-group rendezvous. A process
+    /// that is connected and then exits or loses its host fails the start at
+    /// once; the bound covers a process that never arrives.
+    #[serde(with = "values::duration")]
+    pub join_timeout: Duration,
     /// `tower=gen:<device>` places the generation tower on another device
     /// than the rank's.
     pub mesh: Option<String>,
@@ -546,6 +554,7 @@ impl Default for WorkerConfig {
             engine: DEFAULT_ENGINE.to_owned(),
             engine_revision: None,
             watchdog_timeout: DEFAULT_WATCHDOG_TIMEOUT,
+            join_timeout: DEFAULT_JOIN_TIMEOUT,
             mesh: None,
             standby: false,
             standby_storage: StandbyStorage::Auto,
@@ -558,6 +567,13 @@ impl Default for WorkerConfig {
 /// above the longest step a served model takes (a denoising step of the longest video, a prefill
 /// of the longest prompt) and below what an operator waits before replacing a stuck group by hand.
 pub const DEFAULT_WATCHDOG_TIMEOUT: Duration = Duration::from_secs(300);
+
+/// How long the main processes of a multi-host epoch wait for one another as they start, when the
+/// deployment states no bound (`worker_config.join_timeout`): five minutes, a policy bound above
+/// the skew between the hosts' spawns of one epoch's processes (the daemons spawn them together
+/// once every host prepared the epoch's modules, and each process registers before it loads
+/// anything) and below what an operator waits before replacing a start by hand.
+pub const DEFAULT_JOIN_TIMEOUT: Duration = Duration::from_secs(300);
 
 /// The engine package a deployment runs when its configuration names none: the implementation
 /// of the engine interface this tree holds (`crates/engine/package.toml`).
