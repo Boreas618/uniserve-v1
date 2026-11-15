@@ -106,10 +106,11 @@ mod tests {
             .into_iter()
             .collect(),
             host: "rank-0".to_owned(),
-            requests: "unix:/run/uniserve/requests.sock".to_owned(),
-            processes: "unix:/run/uniserve/processes.sock".to_owned(),
+            // The interfaces are data the engine reads; no socket is opened here.
+            requests: "unix:requests.sock".to_owned(),
+            processes: "unix:processes.sock".to_owned(),
             engine: 7,
-            build_server: "/run/uniserve/modules.sock".to_owned(),
+            build_server: "build-server.sock".to_owned(),
             modules: crate::epoch::modules_of(&crate::options::ServerArgs::default()),
             devices: vec![0, 1],
             group: "engine".to_owned(),

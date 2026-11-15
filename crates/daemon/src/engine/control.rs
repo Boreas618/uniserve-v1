@@ -1619,7 +1619,7 @@ mod tests {
     #[test]
     fn a_launch_places_the_process_on_the_engine_hosts_devices() {
         let mut options = ServerArgs {
-            model: Some("/models/qwen3".to_owned()),
+            model: Some("model".to_owned()),
             host_identity: "rank-0".to_owned(),
             tensor_parallel_size: std::num::NonZeroUsize::new(2).unwrap(),
             ..Default::default()
@@ -1653,7 +1653,7 @@ mod tests {
     #[test]
     fn a_group_over_two_hosts_is_one_process_per_host() {
         let mut options = ServerArgs {
-            model: Some("/models/qwen3".to_owned()),
+            model: Some("model".to_owned()),
             host_identity: "rank-0".to_owned(),
             tensor_parallel_size: std::num::NonZeroUsize::new(4).unwrap(),
             ..Default::default()
@@ -1683,24 +1683,44 @@ mod tests {
         crate::epoch::modules_of(&ServerArgs::default())
     }
 
-    /// The launches of the deployment file `file` of the repository's `configs/`, whose hosts are
-    /// `rank-0`, the engine host, and `rank-1`: one engine per host, numbered 1 and 2, with each
-    /// launch's host, first rank, devices, world size, whether it is the scheduler node, and epoch.
-    fn two_host_launches(file: &str) -> Vec<(String, u32, Vec<u32>, u32, bool, u64)> {
-        let configs = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../configs");
-        let layout = std::fs::read_to_string(configs.join(file)).expect("reading the layout");
-        let (stated, _) =
-            crate::options::resolve_text(&layout, &[]).expect("the layout is a configuration");
+    /// A worker group `id` of `role` whose ranks are `ranks`, each a host and a GPU of it, in rank
+    /// order.
+    fn group(
+        id: &str,
+        role: proto::config::WorkerGroupRole,
+        ranks: &[(&str, u32)],
+    ) -> proto::config::WorkerGroupConfig {
+        proto::config::WorkerGroupConfig {
+            id: proto::config::WorkerGroupId(id.to_owned()),
+            role,
+            replicas: 1,
+            ranks: ranks
+                .iter()
+                .map(|&(host, device)| proto::config::WorkerRank {
+                    host: host.to_owned(),
+                    device: proto::config::DeviceKind::Cuda.rank_device(device),
+                })
+                .collect(),
+            blocks: BTreeMap::new(),
+            queue_depth: 2,
+            mem_fraction_static: None,
+        }
+    }
+
+    /// The launches of a deployment of the worker groups `groups`, whose hosts are `rank-0`, the
+    /// engine host, and `rank-1`: one engine per host, numbered 1 and 2, with each launch's host,
+    /// first rank, devices, world size, whether it is the scheduler node, and epoch.
+    fn two_host_launches(
+        groups: Vec<proto::config::WorkerGroupConfig>,
+    ) -> Vec<(String, u32, Vec<u32>, u32, bool, u64)> {
         let options = ServerArgs {
-            model: Some("/models/checkpoint".to_owned()),
+            model: Some("model".to_owned()),
             host_identity: "rank-0".to_owned(),
-            worker_groups: stated.worker_groups,
             ..Default::default()
         };
-        let args = EngineArgs::new(
-            options.engine_config().expect("the deployment file places"),
-            modules(),
-        );
+        let mut config = options.engine_config().expect("the configuration resolves");
+        config.parallel.worker_groups = groups;
+        let args = EngineArgs::new(config, modules());
         let interfaces = Interfaces {
             requests: "",
             processes: "",
@@ -1729,20 +1749,32 @@ mod tests {
     /// on either side of another host's.
     #[test]
     fn each_host_of_a_two_host_deployment_starts_from_its_first_rank_in_a_world_of_every_rank() {
-        // One text replica and one flow replica on each host's four devices: the text replicas
-        // are ranks 0-3 (`rank-0`) and 4-7 (`rank-1`), the flow replicas ranks 8-11 and 12-15.
+        use proto::config::WorkerGroupRole::{Experts, Model};
+
+        // Two groups, each with a replica on each host's four devices: the first group's ranks
+        // are 0-3 (`rank-0`) and 4-7 (`rank-1`), the second group's ranks 8-11 and 12-15.
+        let spread = |id| {
+            let ranks: Vec<(&str, u32)> = ["rank-0", "rank-1"]
+                .into_iter()
+                .flat_map(|host| (0..4).map(move |device| (host, device)))
+                .collect();
+            group(id, Model, &ranks)
+        };
         assert_eq!(
-            two_host_launches("minimax_h3/fasth3-ulysses4x2-two-host.toml"),
+            two_host_launches(vec![spread("first"), spread("second")]),
             vec![
                 ("rank-0".to_owned(), 0, vec![0, 1, 2, 3], 16, true, 1),
                 ("rank-1".to_owned(), 4, vec![0, 1, 2, 3], 16, false, 1),
             ]
         );
 
-        // A tensor-parallel attention group on `rank-0` (ranks 0 and 1) and its expert group on
-        // `rank-1` (ranks 2 and 3).
+        // A model group on `rank-0` (ranks 0 and 1) and its expert group on `rank-1` (ranks 2
+        // and 3).
         assert_eq!(
-            two_host_launches("afd/qwen3_moe.toml"),
+            two_host_launches(vec![
+                group("model", Model, &[("rank-0", 0), ("rank-0", 1)]),
+                group("experts", Experts, &[("rank-1", 0), ("rank-1", 1)]),
+            ]),
             vec![
                 ("rank-0".to_owned(), 0, vec![0, 1], 4, true, 1),
                 ("rank-1".to_owned(), 2, vec![0, 1], 4, false, 1),
@@ -1758,14 +1790,14 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let control = EngineControl::new(
             &directory.path().join("requests.sock"),
-            "unix:/run/processes.sock".into(),
+            service::Endpoint::unix(directory.path().join("processes.sock")).to_string(),
             "rank-0".into(),
             "model".into(),
-            std::path::PathBuf::from("/run/build-server.sock"),
+            directory.path().join("build-server.sock"),
         )
         .unwrap();
         let mut options = ServerArgs {
-            model: Some("/models/qwen3".to_owned()),
+            model: Some("model".to_owned()),
             served_model_name: Some("model".to_owned()),
             host_identity: "rank-0".to_owned(),
             ..Default::default()
@@ -1784,7 +1816,10 @@ mod tests {
         assert!(inherit.is_empty(), "a world of one host reserves nothing");
         assert_eq!(launch.engine, 9);
         assert_eq!(launch.epoch, 3);
-        assert_eq!(launch.processes, "unix:/run/processes.sock");
+        assert_eq!(
+            launch.processes,
+            service::Endpoint::unix(directory.path().join("processes.sock")).to_string()
+        );
         assert_eq!(launch.requests, control.request_address());
         assert_eq!(launch.queue_depth, 4);
         assert_eq!(launch.world_size, 1);
@@ -1809,14 +1844,14 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let control = EngineControl::new(
             &directory.path().join("requests.sock"),
-            "unix:/run/processes.sock".into(),
+            service::Endpoint::unix(directory.path().join("processes.sock")).to_string(),
             "rank-0".into(),
             "model".into(),
-            std::path::PathBuf::from("/run/build-server.sock"),
+            directory.path().join("build-server.sock"),
         )
         .unwrap();
         let mut options = ServerArgs {
-            model: Some("/models/qwen3".to_owned()),
+            model: Some("model".to_owned()),
             served_model_name: Some("model".to_owned()),
             host_identity: "rank-0".to_owned(),
             data_parallel_size: std::num::NonZeroUsize::new(2).unwrap(),
