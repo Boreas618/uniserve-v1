@@ -266,6 +266,15 @@ extern "C" int32_t uniserve_frame_norm_pad(const uniserve_frame_norm_pad_call* c
     return 0;
   }
   const size_t parameter_bytes = 2 * static_cast<size_t>(call->channels) * sizeof(float);
+  // A block takes more dynamic shared memory than the device's default per-block limit only
+  // once its kernel opts in to the larger size.
+  int device = 0;
+  int default_limit = 0;
+  if (cudaGetDevice(&device) != cudaSuccess ||
+      cudaDeviceGetAttribute(&default_limit, cudaDevAttrMaxSharedMemoryPerBlock, device) !=
+          cudaSuccess) {
+    return refuse(call, "frame_norm_pad cannot read the device's shared memory per block");
+  }
   const auto values = reinterpret_cast<const float*>(call->values);
   const auto mean = reinterpret_cast<const float*>(call->mean);
   const auto rstd = reinterpret_cast<const float*>(call->rstd);
@@ -273,7 +282,7 @@ extern "C" int32_t uniserve_frame_norm_pad(const uniserve_frame_norm_pad_call* c
   const auto bias = call->bias == 0 ? nullptr : reinterpret_cast<const float*>(call->bias);
   auto out = reinterpret_cast<float*>(call->out);
   auto launch = [&](auto kernel) {
-    if (parameter_bytes > 48 * 1024) {
+    if (parameter_bytes > static_cast<size_t>(default_limit)) {
       const cudaError_t attribute = cudaFuncSetAttribute(
           kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(parameter_bytes));
       if (attribute != cudaSuccess) {

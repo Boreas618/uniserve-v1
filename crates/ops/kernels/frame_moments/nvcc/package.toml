@@ -17,5 +17,11 @@ interface_version = 1
 [source]
 kind = "cuda"
 
+# No contraction in host code: the arithmetic is PyTorch's, and its expressions round as PyTorch's do.
+[compile]
+units = ["src/frame.cu"]
+standard = "c++17"
+host_contraction = false
+
 [[kernel.descriptors]]
 dimensions = { dtype = ["f32"] }
