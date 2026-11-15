@@ -3,8 +3,8 @@
 // layers' CUTLASS/cuBLASLt GEMM).
 //
 // The module is compiled once per descriptor: the element types, the weight
-// order and the epilogue are macros the package's compile script derives from
-// the descriptor's fields, so one module is one point of the operator's matrix of
+// order and the epilogue are macros the package's manifest binds to the
+// descriptor's fields, so one module is one point of the operator's matrix of
 // descriptors, as design 5.2 asks of a package.
 //
 // The product is row-major in `ops`' terms and cuBLASLt computes column-major,
@@ -41,28 +41,15 @@
 
 #include "uniserve_gemm.h"
 
-// The descriptor's compile-time choices, defined by `src/build.py` from
-// the descriptor's fields. The defaults make the file readable on its own and
-// are never used by a module the Build Server builds.
-#ifndef UNISERVE_INPUT_TYPE
-#define UNISERVE_INPUT_TYPE CUDA_R_16BF
-#endif
-#ifndef UNISERVE_WEIGHT_TYPE
-#define UNISERVE_WEIGHT_TYPE CUDA_R_16BF
-#endif
-#ifndef UNISERVE_ACCUMULATE_TYPE
-#define UNISERVE_ACCUMULATE_TYPE CUBLAS_COMPUTE_32F
-#endif
-#ifndef UNISERVE_OUTPUT_TYPE
-#define UNISERVE_OUTPUT_TYPE CUDA_R_16BF
-#endif
-// 0: `[k, n]` (kxn); 1: `[n, k]` (nxk), the checkpoint's own layout.
-#ifndef UNISERVE_WEIGHT_ORDER
-#define UNISERVE_WEIGHT_ORDER 1
-#endif
-// 0: no epilogue; 1: add the bias.
-#ifndef UNISERVE_EPILOGUE
-#define UNISERVE_EPILOGUE 0
+// The descriptor's compile-time choices, which the package's manifest defines
+// (`[compile.definitions]`): the cuBLASLt data types of the input, the weight and
+// the output, the compute type of the accumulation, the weight order (0: `[k, n]`;
+// 1: `[n, k]`, the checkpoint's own layout) and the epilogue (0: none; 1: add the
+// bias).
+#if !defined(UNISERVE_INPUT_TYPE) || !defined(UNISERVE_WEIGHT_TYPE) ||       \
+    !defined(UNISERVE_ACCUMULATE_TYPE) || !defined(UNISERVE_OUTPUT_TYPE) || \
+    !defined(UNISERVE_WEIGHT_ORDER) || !defined(UNISERVE_EPILOGUE)
+#error "the package's manifest defines the descriptor's compile-time choices"
 #endif
 
 namespace {
