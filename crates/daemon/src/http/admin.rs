@@ -966,9 +966,9 @@ async fn flush_cache(State(state): State<AdminState>) -> Response {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct UpdateWeightsBody {
-    /// Another checkpoint of the served model: a local directory or a
-    /// Hugging Face repository.
-    model_path: String,
+    /// Another checkpoint of the served model (a local directory or a
+    /// Hugging Face repository), or a plugin's weight source by its URL.
+    model_path: crate::leader::WeightSource,
     /// How the requests in flight continue: `keep` (the default), `recompute`
     /// or `abort`.
     #[serde(default)]

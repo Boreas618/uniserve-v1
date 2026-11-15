@@ -678,13 +678,13 @@ impl Leader {
 
     pub async fn update_weights(
         &self,
-        model_path: &str,
+        source: &WeightSource,
         in_flight: WeightsInFlight,
     ) -> Result<Vec<wire::WeightReport>, UpdateError> {
         let _replacing = self.replicas.replacing.lock().await;
         let mut results = Vec::new();
         for replica in self.replicas() {
-            results.extend(replica.update_weights(model_path, in_flight).await?);
+            results.extend(replica.update_weights(source, in_flight).await?);
         }
         Ok(results)
     }
@@ -1460,6 +1460,58 @@ pub struct UpdateStatus {
 /// An update's phase by its name ([`Phase::name`]).
 fn phase_name<S: serde::Serializer>(phase: &Phase, serializer: S) -> Result<S::Ok, S::Error> {
     serializer.serialize_str(phase.name())
+}
+
+/// Where an in-place weight update reads the weights from (`POST /admin/update_weights`'s
+/// `model_path`).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(try_from = "String", into = "String")]
+pub enum WeightSource {
+    /// Another checkpoint of the served model: a local directory or a Hugging Face repository.
+    Checkpoint(String),
+    /// A plugin's weight source that streams the served checkpoint's tensors, named by its URL
+    /// (`scheme://...`).
+    Streamed(String),
+}
+
+impl WeightSource {
+    /// The source as the operator named it.
+    pub fn as_str(&self) -> &str {
+        match self {
+            Self::Checkpoint(source) | Self::Streamed(source) => source,
+        }
+    }
+}
+
+impl TryFrom<String> for WeightSource {
+    type Error = String;
+
+    /// A source that parses as a URL with a scheme of its own is streamed; any other names a
+    /// checkpoint.
+    ///
+    /// # Errors
+    ///
+    /// An empty source.
+    fn try_from(source: String) -> Result<Self, Self::Error> {
+        if source.is_empty() {
+            return Err("model_path names no checkpoint or weight source".to_owned());
+        }
+        // A one-letter scheme is a drive, not a protocol.
+        let streamed = url::Url::parse(&source).is_ok_and(|url| url.scheme().len() > 1);
+        Ok(if streamed {
+            Self::Streamed(source)
+        } else {
+            Self::Checkpoint(source)
+        })
+    }
+}
+
+impl From<WeightSource> for String {
+    fn from(source: WeightSource) -> Self {
+        match source {
+            WeightSource::Checkpoint(source) | WeightSource::Streamed(source) => source,
+        }
+    }
 }
 
 /// How the requests in flight continue through an in-place weight update
@@ -3269,10 +3321,9 @@ impl Replica {
             .map_err(|error| UpdateError::Failed(anyhow::anyhow!("{what}: {error}")))
     }
 
-    /// Rewrites the engine's weights in place from the checkpoint at
-    /// `model_path`, another checkpoint of the served model, as SGLang's
-    /// `update_weights_from_disk` does, or from a plugin's weight source
-    /// (`scheme://...`) that streams the served checkpoint's tensors, and
+    /// Rewrites the engine's weights in place from `source`: another checkpoint
+    /// of the served model, as SGLang's `update_weights_from_disk` does, or a
+    /// plugin's weight source that streams the served checkpoint's tensors, and
     /// returns what each worker reported. New requests wait; the requests
     /// in flight continue as `in_flight` says (`scheduler::WeightsInFlight`):
     /// on the new weights with the KV cache they reached, recomputed with
@@ -3287,18 +3338,18 @@ impl Replica {
     /// worker did not update, after which the weights are those of before.
     pub(crate) async fn update_weights(
         self: &Arc<Self>,
-        model_path: &str,
+        source: &WeightSource,
         in_flight: WeightsInFlight,
     ) -> Result<Vec<wire::WeightReport>, UpdateError> {
         let _replacing = self.replacing.lock().await;
         let hold = self.hold();
         let client = hold.client().ok_or(UpdateError::NoEngine)?;
         let mut config = service::lock(&self.config).clone();
+        let model_path = source.as_str();
         // A plugin's weight source streams the tensors of the served
-        // checkpoint, whose configuration and tokenizer stay; a directory
-        // is another checkpoint of the model, checked to process requests
-        // alike.
-        let streamed = model_path.contains("://");
+        // checkpoint, whose configuration and tokenizer stay; another
+        // checkpoint of the model is checked to process requests alike.
+        let streamed = matches!(source, WeightSource::Streamed(_));
         if streamed {
             config.load_config.weights = Some(model_path.to_owned());
         } else {
@@ -4258,6 +4309,32 @@ mod tests {
         let mut union = deployment(1, 4, true);
         union.moe.exchange = Some("deepep".to_owned());
         assert_eq!(super::replica_configs(&union).unwrap().len(), 1);
+    }
+
+    /// A weight source that parses as a URL of its own scheme streams the served checkpoint's
+    /// tensors; a directory, a repository or a path behind a drive letter names a checkpoint,
+    /// and an empty source is refused.
+    #[test]
+    fn a_weight_source_is_streamed_by_its_url_scheme() {
+        use super::WeightSource;
+
+        for checkpoint in ["Org/model", "relative/dir", "C:\\checkpoints\\model"] {
+            assert_eq!(
+                WeightSource::try_from(checkpoint.to_owned()),
+                Ok(WeightSource::Checkpoint(checkpoint.to_owned()))
+            );
+        }
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().to_str().unwrap().to_owned();
+        assert_eq!(
+            WeightSource::try_from(path.clone()),
+            Ok(WeightSource::Checkpoint(path))
+        );
+        assert_eq!(
+            WeightSource::try_from("s3://bucket/weights".to_owned()),
+            Ok(WeightSource::Streamed("s3://bucket/weights".to_owned()))
+        );
+        assert!(WeightSource::try_from(String::new()).is_err());
     }
 
     /// A pipeline checkpoint processes requests as the served one only with the same index and,
