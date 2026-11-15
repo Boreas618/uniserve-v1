@@ -65,14 +65,13 @@ impl std::fmt::Debug for Tensor {
             DType::F32 => self.fmt_dt::<f32>(f),
             DType::F64 => self.fmt_dt::<f64>(f),
             DType::F8E4M3 => self.fmt_dt::<float8::F8E4M3>(f),
-            DType::F6E2M3 | DType::F6E3M2 | DType::F4 | DType::F8E8M0 => {
-                write!(
-                    f,
-                    "Tensor[{:?}; dtype={}, unsupported dummy type]",
-                    self.shape(),
-                    self.dtype().as_str()
-                )
-            }
+            // No host element type holds an F4 element: the tensor states its shape only.
+            DType::F4 => write!(
+                f,
+                "Tensor[{:?}; dtype={}]",
+                self.shape(),
+                self.dtype().as_str()
+            ),
         }
     }
 }
@@ -463,7 +462,8 @@ fn get_summarized_data(t: &Tensor, edge_items: usize) -> Result<Tensor> {
 impl std::fmt::Display for Tensor {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         let po = locked_options();
-        let summarize = self.elem_count() > po.threshold;
+        // The values of an F4 tensor are not printed, so there is nothing to summarize.
+        let summarize = self.dtype() != DType::F4 && self.elem_count() > po.threshold;
         let to_display = if summarize {
             match get_summarized_data(self, po.edge_items) {
                 Ok(v) => v,
@@ -538,13 +538,8 @@ impl std::fmt::Display for Tensor {
                     writeln!(f)?;
                 }
             }
-            DType::F6E2M3 | DType::F6E3M2 | DType::F4 | DType::F8E8M0 => {
-                writeln!(
-                    f,
-                    "Dummy type {} (not supported for display)",
-                    self.dtype().as_str()
-                )?;
-            }
+            // No host element type holds an F4 element: the values are not printed.
+            DType::F4 => writeln!(f, "[packed {} elements]", self.dtype().as_str())?,
         };
 
         let device_str = device_suffix(self.device().location());

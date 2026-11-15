@@ -159,6 +159,11 @@ pub enum Error {
     #[error("cannot find tensor {path}")]
     CannotFindTensor { path: String },
 
+    /// The CPU executor refused a configuration or a second start
+    /// (`cpu_backend::CpuExecutor::install`).
+    #[error("CPU executor: {0}")]
+    CpuExecutor(String),
+
     // === Wrapped Errors ===
     /// An error of a device backend, kept as the backend's own error type.
     #[error(transparent)]

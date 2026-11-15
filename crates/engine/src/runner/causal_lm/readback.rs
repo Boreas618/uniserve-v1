@@ -73,7 +73,14 @@ impl Readback {
                     "output {index} of the step is not contiguous, and is read back as stored"
                 )));
             }
-            let size = output.elem_count() * output.dtype().size_in_bytes();
+            let size = output
+                .dtype()
+                .storage_bytes(output.elem_count())
+                .ok_or_else(|| {
+                    Error::Invariant(format!(
+                        "output {index} of the step holds more bytes than the address space"
+                    ))
+                })?;
             let source = ops::operand(output)?.ptr.address();
 
             layout.push((output.dtype(), output.dims().to_vec(), bytes, size));

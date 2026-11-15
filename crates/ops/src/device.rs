@@ -177,18 +177,8 @@ fn zeros(shape: &Shape, dtype: DType, asked: Option<usize>) -> Result<CudaStorag
 ///
 /// # Errors
 ///
-/// As [`CudaStorage::allocate`] and [`input::copy_to_device`]; [`Error::ElementType`] for a
-/// 6-bit element type.
+/// As [`CudaStorage::allocate`] and [`input::copy_to_device`].
 fn from_host(storage: &CpuStorage, asked: Option<usize>) -> Result<CudaStorage> {
-    // The 6-bit elements have no byte layout on the device, as for every other storage.
-    if matches!(storage, CpuStorage::F6E2M3(_) | CpuStorage::F6E3M2(_)) {
-        return Err(Error::ElementType {
-            operation: "a host-to-device copy",
-            dtype: storage.dtype(),
-            reason: "the element is narrower than a byte and has no packed layout here",
-        });
-    }
-
     let bytes = host_bytes(storage);
     let device = CudaStorage::allocate_unused(bytes.len() as u64, storage.dtype(), asked)?;
 
@@ -220,11 +210,8 @@ fn host_bytes(storage: &CpuStorage) -> &[u8] {
         CpuStorage::F32(values) => bytes_of(values),
         CpuStorage::F64(values) => bytes_of(values),
         CpuStorage::F8E4M3(values) => bytes_of(values),
-        // The packed types are held on the host as their bytes.
-        CpuStorage::F6E2M3(values)
-        | CpuStorage::F6E3M2(values)
-        | CpuStorage::F4(values)
-        | CpuStorage::F8E8M0(values) => values,
+        // F4 is held on the host as its packed bytes.
+        CpuStorage::F4(values) => values,
     }
 }
 

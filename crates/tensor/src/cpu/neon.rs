@@ -1,31 +1,14 @@
 use super::{Cpu, CpuBF16, CpuF16};
-#[cfg(target_arch = "arm")]
-use core::arch::arm::*;
-
-#[cfg(target_arch = "aarch64")]
 use core::arch::aarch64::*;
 use half::{bf16, f16};
 
 pub struct CurrentCpu {}
 
 impl CurrentCpu {
-    #[cfg(target_arch = "aarch64")]
     unsafe fn reduce_one(x: float32x4_t) -> f32 {
         // SAFETY: the caller runs this on a CPU with this module's instruction set; the
         // instructions compute in registers.
         unsafe { vaddvq_f32(x) }
-    }
-
-    #[cfg(target_arch = "arm")]
-    unsafe fn reduce_one(x: float32x4_t) -> f32 {
-        // SAFETY: the caller runs this on a CPU with this module's instruction set; the
-        // instructions compute in registers.
-        unsafe {
-            vgetq_lane_f32(x, 0)
-                + vgetq_lane_f32(x, 1)
-                + vgetq_lane_f32(x, 2)
-                + vgetq_lane_f32(x, 3)
-        }
     }
 }
 
@@ -40,12 +23,6 @@ impl Cpu for CurrentCpu {
         // SAFETY: the caller runs this on a CPU with this module's instruction set (`Cpu`); the
         // instructions compute in registers.
         unsafe { vdupq_n_f32(0.0) }
-    }
-
-    unsafe fn from_f32(x: f32) -> Self::Unit {
-        // SAFETY: the caller runs this on a CPU with this module's instruction set (`Cpu`); the
-        // instructions compute in registers.
-        unsafe { vdupq_n_f32(x) }
     }
 
     unsafe fn zero_array() -> Self::Array {
@@ -72,14 +49,6 @@ impl Cpu for CurrentCpu {
         unsafe { vfmaq_f32(a, b, c) }
     }
 
-    unsafe fn vec_store(mem_addr: *mut f32, a: Self::Unit) {
-        // SAFETY: the caller passes `mem_addr` valid for `EPR` writes, on a CPU with this module's
-        // instruction set (`Cpu`).
-        unsafe {
-            vst1q_f32(mem_addr, a);
-        }
-    }
-
     unsafe fn vec_reduce(mut x: Self::Array, y: *mut f32) {
         // SAFETY: the caller passes `y` valid for one write, on a CPU with this module's
         // instruction set (`Cpu`).
@@ -100,10 +69,7 @@ impl Cpu for CurrentCpu {
 
 mod fp16 {
     use super::super::CpuF16;
-    #[cfg(target_arch = "aarch64")]
     use core::arch::aarch64::*;
-    #[cfg(target_arch = "arm")]
-    use core::arch::arm::*;
     use half::f16;
     use std::arch::asm;
 

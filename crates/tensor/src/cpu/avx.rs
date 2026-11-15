@@ -1,12 +1,16 @@
-use super::{Cpu, CpuBF16, CpuF16};
-#[cfg(target_arch = "x86")]
-use core::arch::x86::*;
-#[cfg(target_arch = "x86_64")]
+use super::{Cpu, CpuBF16, CpuF16, features};
 use core::arch::x86_64::*;
 use half::{bf16, f16};
-use std::{is_x86_feature_detected, mem::transmute};
+use std::mem::transmute;
 
 pub struct CurrentCpu {}
+
+/// Whether the host converts between BF16 and F32 in 256-bit vectors (AVX-512 BF16 with VL).
+#[inline(always)]
+fn avx512_bf16() -> bool {
+    let features = features::get();
+    features.avx512bf16 && features.avx512vl
+}
 
 const STEP: usize = 32;
 const EPR: usize = 8;
@@ -32,12 +36,6 @@ impl Cpu for CurrentCpu {
         unsafe { [Self::zero(); ARR] }
     }
 
-    unsafe fn from_f32(v: f32) -> Self::Unit {
-        // SAFETY: the caller runs this on a CPU with this module's instruction set (`Cpu`); the
-        // instructions compute in registers.
-        unsafe { _mm256_set1_ps(v) }
-    }
-
     unsafe fn load(mem_addr: *const f32) -> Self::Unit {
         // SAFETY: the caller passes `mem_addr` valid for `EPR` reads, on a CPU with this module's
         // instruction set (`Cpu`).
@@ -54,14 +52,6 @@ impl Cpu for CurrentCpu {
         // SAFETY: the caller runs this on a CPU with this module's instruction set (`Cpu`); the
         // instructions compute in registers.
         unsafe { _mm256_add_ps(_mm256_mul_ps(b, c), a) }
-    }
-
-    unsafe fn vec_store(mem_addr: *mut f32, a: Self::Unit) {
-        // SAFETY: the caller passes `mem_addr` valid for `EPR` writes, on a CPU with this module's
-        // instruction set (`Cpu`).
-        unsafe {
-            _mm256_storeu_ps(mem_addr, a);
-        }
     }
 
     unsafe fn vec_reduce(mut x: Self::Array, y: *mut f32) {
@@ -218,7 +208,7 @@ impl CpuBF16 for CurrentCpuBF16 {
         // SAFETY: the caller passes `mem_addr` valid for `EPR` reads, on a CPU with this module's
         // instruction set (`CpuBF16`).
         unsafe {
-            if is_x86_feature_detected!("avx512bf16") && is_x86_feature_detected!("avx512vl") {
+            if avx512_bf16() {
                 _mm256_cvtpbh_ps(transmute::<__m128i, __m128bh>(_mm_loadu_si128(
                     mem_addr as *const __m128i,
                 )))
@@ -248,7 +238,7 @@ impl CpuBF16 for CurrentCpuBF16 {
         // SAFETY: the caller passes `mem_addr` valid for `EPR` writes, on a CPU with this module's
         // instruction set (`CpuBF16`).
         unsafe {
-            if is_x86_feature_detected!("avx512bf16") && is_x86_feature_detected!("avx512vl") {
+            if avx512_bf16() {
                 _mm_storeu_si128(
                     mem_addr as *mut __m128i,
                     transmute::<__m128bh, __m128i>(_mm256_cvtneps_pbh(a)),

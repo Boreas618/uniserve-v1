@@ -27,7 +27,7 @@ bytemuck.workspace = true
 clap.workspace = true
 crossbeam-channel.workspace = true
 # A shadow comparison reads 16-bit floating elements as the tensor library does.
-half = "2.5.0"
+half.workspace = true
 indexmap.workspace = true
 libc.workspace = true
 libloading.workspace = true

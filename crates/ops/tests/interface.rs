@@ -248,8 +248,6 @@ fn element_types_keep_their_abi_numbering_and_round_off() {
     // Appended for the tensor primitives' indices and for double precision.
     assert_eq!(abi::code(DType::U32).unwrap(), 9);
     assert_eq!(abi::code(DType::F64).unwrap(), 10);
-    // An element type the tensor library has and no package reads has no number.
-    assert!(abi::code(DType::F8E8M0).is_err());
     assert_eq!(abi::bytes(DType::I16), Some(2));
     assert_eq!(unit_roundoff(DType::I16), 0.0, "an integer has no rounding");
     assert!(!DType::I16.is_float());

@@ -99,8 +99,17 @@ impl Op for Fill {
         strided::require_elements(Self::NAME, "destination", &args.destination)?;
         strided::require_window(Self::NAME, "destination", &args.destination)?;
 
-        // Every element type of a fill is a whole number of bytes.
-        let width = u8::BITS * descriptor.dtype.size_in_bytes() as u32;
+        // Every element type of a fill is a whole number of bytes (`strided::MOVED`).
+        let Some(size) = descriptor.dtype.size_in_bytes() else {
+            return Err(Error::argument(
+                Self::NAME,
+                format!(
+                    "{} elements are narrower than a byte",
+                    abi::name(descriptor.dtype)
+                ),
+            ));
+        };
+        let width = u8::BITS * size as u32;
         if width < u64::BITS && args.bits >> width != 0 {
             return Err(Error::argument(
                 Self::NAME,

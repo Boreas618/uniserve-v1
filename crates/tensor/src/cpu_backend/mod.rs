@@ -1,5 +1,5 @@
 //! The CPU backend: host storage and the primitives tensor operations are built from.
-use crate::op::{self, BinaryOp, BinaryOpT, CmpOp, ReduceOp, UnaryOp, UnaryOpT};
+use crate::op::{self, BinaryOp, BinaryOpT, CmpOp, IntUnaryOpT, ReduceOp, UnaryOp, UnaryOpT};
 use crate::{DType, Error, IntDType, Layout, NdIter, Result, Shape, WithDType};
 use float8::F8E4M3;
 use half::{bf16, f16, slice::HalfFloatSliceExt, vec::HalfFloatVecExt};
@@ -10,6 +10,8 @@ pub use utils::{
     Map1, Map1Any, Map2, Map2InPlace, Map2U8, binary_map, binary_map_vec, binary_map_vec_par,
     unary_map, unary_map_vec, unary_map_vec_par,
 };
+mod executor;
+pub use executor::{CpuExecutor, ExecutorConfig};
 mod conv2d;
 use conv2d::Conv2D;
 
@@ -30,11 +32,8 @@ pub enum CpuStorage {
     F32(Vec<f32>),
     F64(Vec<f64>),
     F8E4M3(Vec<F8E4M3>),
-    // Dummy types that store raw bytes
-    F6E2M3(Vec<u8>),
-    F6E3M2(Vec<u8>),
+    /// FP4 (E2M1) elements as their packed bytes, two to a byte ([`DType::F4`]).
     F4(Vec<u8>),
-    F8E8M0(Vec<u8>),
 }
 
 #[derive(Debug, Clone)]
@@ -49,11 +48,8 @@ pub enum CpuStorageRef<'a> {
     F32(&'a [f32]),
     F64(&'a [f64]),
     F8E4M3(&'a [F8E4M3]),
-    // Dummy types that store raw bytes
-    F6E2M3(&'a [u8]),
-    F6E3M2(&'a [u8]),
+    /// FP4 (E2M1) elements as their packed bytes, two to a byte ([`DType::F4`]).
     F4(&'a [u8]),
-    F8E8M0(&'a [u8]),
 }
 
 #[derive(Debug, Clone)]
@@ -1543,11 +1539,10 @@ impl Map2 for MatMul {
         let dst_cs = dst_strides[1];
 
         let mut dst = vec![T::zero(); b * m * n];
-        let num_threads = crate::utils::get_num_threads();
-        let parallelism = if num_threads > 1 {
-            Parallelism::Rayon(num_threads)
-        } else {
-            Parallelism::None
+        let executor = CpuExecutor::current()?;
+        let parallelism = match executor.config().threads {
+            1 => Parallelism::None,
+            threads => Parallelism::Rayon(threads),
         };
         let (b, m, n, k) = if b_skip == 0 && a_skip == m * k {
             // A batch-invariant rhs lets the batches of lhs stack into the rows of a single
@@ -1563,37 +1558,40 @@ impl Map2 for MatMul {
             // over itself, so a stride-zero batch on lhs goes through the loop below.
             (b, m, n, k)
         };
-        for step in 0..b {
-            let lhs_p = &lhs[step * a_skip..];
-            let rhs_p = &rhs[step * b_skip..];
-            let dst_p = &mut dst[step * c_skip..];
-            // SAFETY: the layouts address `b` matrices of `m x k` and `k x n` elements within `lhs`
-            // and `rhs` at the batch skips `ab_skip` derived from them, and `dst` holds `b`
-            // matrices of `m x n`; `gemm` reads and writes only the elements these strides address.
-            unsafe {
-                gemm(
-                    /* m: usize = */ m,
-                    /* n: usize = */ n,
-                    /* k: usize = */ k,
-                    /* dst: *mut T = */ dst_p.as_mut_ptr(),
-                    /* dst_cs: isize = */ dst_cs as isize,
-                    /* dst_rs: isize = */ dst_rs as isize,
-                    /* read_dst: bool = */ false,
-                    /* lhs: *const T = */ lhs_p.as_ptr(),
-                    /* lhs_cs: isize = */ lhs_cs as isize,
-                    /* lhs_rs: isize = */ lhs_rs as isize,
-                    /* rhs: *const T = */ rhs_p.as_ptr(),
-                    /* rhs_cs: isize = */ rhs_cs as isize,
-                    /* rhs_rs: isize = */ rhs_rs as isize,
-                    /* alpha: T = */ T::zero(),
-                    /* beta: T = */ T::one(),
-                    /* conj_dst: bool = */ false,
-                    /* conj_lhs: bool = */ false,
-                    /* conj_rhs: bool = */ false,
-                    parallelism,
-                )
+        // `gemm`'s rayon parallelism splits each product over the pool it runs on.
+        executor.run(|| {
+            for step in 0..b {
+                let lhs_p = &lhs[step * a_skip..];
+                let rhs_p = &rhs[step * b_skip..];
+                let dst_p = &mut dst[step * c_skip..];
+                // SAFETY: the layouts address `b` matrices of `m x k` and `k x n` elements within `lhs`
+                // and `rhs` at the batch skips `ab_skip` derived from them, and `dst` holds `b`
+                // matrices of `m x n`; `gemm` reads and writes only the elements these strides address.
+                unsafe {
+                    gemm(
+                        /* m: usize = */ m,
+                        /* n: usize = */ n,
+                        /* k: usize = */ k,
+                        /* dst: *mut T = */ dst_p.as_mut_ptr(),
+                        /* dst_cs: isize = */ dst_cs as isize,
+                        /* dst_rs: isize = */ dst_rs as isize,
+                        /* read_dst: bool = */ false,
+                        /* lhs: *const T = */ lhs_p.as_ptr(),
+                        /* lhs_cs: isize = */ lhs_cs as isize,
+                        /* lhs_rs: isize = */ lhs_rs as isize,
+                        /* rhs: *const T = */ rhs_p.as_ptr(),
+                        /* rhs_cs: isize = */ rhs_cs as isize,
+                        /* rhs_rs: isize = */ rhs_rs as isize,
+                        /* alpha: T = */ T::zero(),
+                        /* beta: T = */ T::one(),
+                        /* conj_dst: bool = */ false,
+                        /* conj_lhs: bool = */ false,
+                        /* conj_rhs: bool = */ false,
+                        parallelism,
+                    )
+                }
             }
-        }
+        });
         Ok(dst)
     }
 }
@@ -1750,50 +1748,8 @@ impl CpuStorage {
                     .concat();
                 Self::F8E4M3(storages)
             }
-            Self::F6E2M3(_) => {
-                let storages = storages
-                    .iter()
-                    .map(|s| match s {
-                        Self::F6E2M3(s) => Ok(s.as_slice()),
-                        _ => crate::bail!("dtype mismatch"),
-                    })
-                    .collect::<Result<Vec<_>>>()?
-                    .concat();
-                Self::F6E2M3(storages)
-            }
-            Self::F6E3M2(_) => {
-                let storages = storages
-                    .iter()
-                    .map(|s| match s {
-                        Self::F6E3M2(s) => Ok(s.as_slice()),
-                        _ => crate::bail!("dtype mismatch"),
-                    })
-                    .collect::<Result<Vec<_>>>()?
-                    .concat();
-                Self::F6E3M2(storages)
-            }
-            Self::F4(_) => {
-                let storages = storages
-                    .iter()
-                    .map(|s| match s {
-                        Self::F4(s) => Ok(s.as_slice()),
-                        _ => crate::bail!("dtype mismatch"),
-                    })
-                    .collect::<Result<Vec<_>>>()?
-                    .concat();
-                Self::F4(storages)
-            }
-            Self::F8E8M0(_) => {
-                let storages = storages
-                    .iter()
-                    .map(|s| match s {
-                        Self::F8E8M0(s) => Ok(s.as_slice()),
-                        _ => crate::bail!("dtype mismatch"),
-                    })
-                    .collect::<Result<Vec<_>>>()?
-                    .concat();
-                Self::F8E8M0(storages)
-            }
+            // An F4 storage of an odd count ends in half a byte, so its bytes do not join.
+            Self::F4(_) => Err(Error::UnsupportedDTypeForOp(DType::F4, "concat").bt())?,
         };
         Ok(s)
     }
@@ -1812,10 +1768,7 @@ impl CpuStorage {
             Self::F32(_) => DType::F32,
             Self::F64(_) => DType::F64,
             Self::F8E4M3(_) => DType::F8E4M3,
-            Self::F6E2M3(_) => DType::F6E2M3,
-            Self::F6E3M2(_) => DType::F6E3M2,
             Self::F4(_) => DType::F4,
-            Self::F8E8M0(_) => DType::F8E8M0,
         }
     }
 
@@ -2228,16 +2181,9 @@ impl CpuStorage {
                 let data = unary_map(storage, layout, |v| F8E4M3::from_f32(v as f32));
                 Ok(Self::F8E4M3(data))
             }
-            // Dummy types - return error for all conversions to/from dummy types
-            (_, DType::F6E2M3) | (_, DType::F6E3M2) | (_, DType::F4) | (_, DType::F8E8M0) => {
-                Err(Error::UnsupportedDTypeForOp(dtype, "to_dtype").bt())
-            }
-            (Self::F6E2M3(_), _)
-            | (Self::F6E3M2(_), _)
-            | (Self::F4(_), _)
-            | (Self::F8E8M0(_), _) => {
-                Err(Error::UnsupportedDTypeForOp(self.dtype(), "to_dtype").bt())
-            }
+            // F4 elements are stored packed: no conversion reads or writes them.
+            (_, DType::F4) => Err(Error::UnsupportedDTypeForOp(dtype, "to_dtype").bt()),
+            (Self::F4(_), _) => Err(Error::UnsupportedDTypeForOp(DType::F4, "to_dtype").bt()),
         }
     }
 
@@ -2379,10 +2325,7 @@ impl CpuStorage {
             Self::I16(_) => Err(Error::UnsupportedDTypeForOp(DType::I16, "powf").bt()),
             Self::I32(_) => Err(Error::UnsupportedDTypeForOp(DType::I32, "powf").bt()),
             Self::I64(_) => Err(Error::UnsupportedDTypeForOp(DType::I64, "powf").bt()),
-            Self::F6E2M3(_) => Err(Error::UnsupportedDTypeForOp(DType::F6E2M3, "powf").bt()),
-            Self::F6E3M2(_) => Err(Error::UnsupportedDTypeForOp(DType::F6E3M2, "powf").bt()),
             Self::F4(_) => Err(Error::UnsupportedDTypeForOp(DType::F4, "powf").bt()),
-            Self::F8E8M0(_) => Err(Error::UnsupportedDTypeForOp(DType::F8E8M0, "powf").bt()),
         }
     }
 
@@ -2414,36 +2357,30 @@ impl CpuStorage {
             Self::I16(_) => Err(Error::UnsupportedDTypeForOp(DType::I16, "elu").bt()),
             Self::I32(_) => Err(Error::UnsupportedDTypeForOp(DType::I32, "elu").bt()),
             Self::I64(_) => Err(Error::UnsupportedDTypeForOp(DType::I64, "elu").bt()),
-            Self::F6E2M3(_) => Err(Error::UnsupportedDTypeForOp(DType::F6E2M3, "elu").bt()),
-            Self::F6E3M2(_) => Err(Error::UnsupportedDTypeForOp(DType::F6E3M2, "elu").bt()),
             Self::F4(_) => Err(Error::UnsupportedDTypeForOp(DType::F4, "elu").bt()),
-            Self::F8E8M0(_) => Err(Error::UnsupportedDTypeForOp(DType::F8E8M0, "elu").bt()),
         }
     }
 
+    /// `op` of every element. An operation whose result on an integer is no integer of its
+    /// type (`exp`, `neg` of an unsigned value, ...) is an error on an integer storage.
     pub fn unary(&self, op: UnaryOp, layout: &Layout) -> Result<Self> {
-        // The logistic function of an integer is no integer.
-        if op == UnaryOp::Sigmoid && self.dtype().is_int() {
-            return Err(Error::UnsupportedDTypeForOp(self.dtype(), op.name()).bt());
-        }
-
         match op {
-            UnaryOp::Exp => self.unary_impl::<op::Exp>(layout),
-            UnaryOp::Log => self.unary_impl::<op::Log>(layout),
-            UnaryOp::Sin => self.unary_impl::<op::Sin>(layout),
-            UnaryOp::Cos => self.unary_impl::<op::Cos>(layout),
+            UnaryOp::Exp => self.float_unary_impl::<op::Exp>(layout),
+            UnaryOp::Log => self.float_unary_impl::<op::Log>(layout),
+            UnaryOp::Sin => self.float_unary_impl::<op::Sin>(layout),
+            UnaryOp::Cos => self.float_unary_impl::<op::Cos>(layout),
             UnaryOp::Abs => self.unary_impl::<op::Abs>(layout),
-            UnaryOp::Neg => self.unary_impl::<op::Neg>(layout),
-            UnaryOp::Recip => self.unary_impl::<op::Recip>(layout),
-            UnaryOp::Sqr => self.unary_impl::<op::Sqr>(layout),
-            UnaryOp::Sqrt => self.unary_impl::<op::Sqrt>(layout),
-            UnaryOp::Gelu => self.unary_impl::<op::Gelu>(layout),
-            UnaryOp::GeluErf => self.unary_impl::<op::GeluErf>(layout),
-            UnaryOp::Erf => self.unary_impl::<op::Erf>(layout),
+            UnaryOp::Neg => self.float_unary_impl::<op::Neg>(layout),
+            UnaryOp::Recip => self.float_unary_impl::<op::Recip>(layout),
+            UnaryOp::Sqr => self.float_unary_impl::<op::Sqr>(layout),
+            UnaryOp::Sqrt => self.float_unary_impl::<op::Sqrt>(layout),
+            UnaryOp::Gelu => self.float_unary_impl::<op::Gelu>(layout),
+            UnaryOp::GeluErf => self.float_unary_impl::<op::GeluErf>(layout),
+            UnaryOp::Erf => self.float_unary_impl::<op::Erf>(layout),
             UnaryOp::Relu => self.unary_impl::<op::Relu>(layout),
-            UnaryOp::Silu => self.unary_impl::<op::Silu>(layout),
-            UnaryOp::Sigmoid => self.unary_impl::<op::Sigmoid>(layout),
-            UnaryOp::Tanh => self.unary_impl::<op::Tanh>(layout),
+            UnaryOp::Silu => self.float_unary_impl::<op::Silu>(layout),
+            UnaryOp::Sigmoid => self.float_unary_impl::<op::Sigmoid>(layout),
+            UnaryOp::Tanh => self.float_unary_impl::<op::Tanh>(layout),
             UnaryOp::Floor => self.unary_impl::<op::Floor>(layout),
             UnaryOp::Ceil => self.unary_impl::<op::Ceil>(layout),
             UnaryOp::Round => self.unary_impl::<op::Round>(layout),
@@ -2546,8 +2483,9 @@ impl CpuStorage {
             elements
         }
 
-        let (from, size) = (self.dtype(), self.dtype().size_in_bytes());
-        if size == 0 || size != dtype.size_in_bytes() {
+        let from = self.dtype();
+        let size = from.size_in_bytes();
+        if size.is_none() || size != dtype.size_in_bytes() {
             crate::bail!(
                 "cannot view {from:?} elements as {dtype:?}: the two element types differ in \
                  size, or one of them is narrower than a byte"
@@ -2555,7 +2493,7 @@ impl CpuStorage {
         }
 
         let bytes = match self {
-            Self::U8(values) | Self::F8E8M0(values) => values.as_slice(),
+            Self::U8(values) => values.as_slice(),
             Self::U32(values) => bytes_of(values),
             Self::I16(values) => bytes_of(values),
             Self::I32(values) => bytes_of(values),
@@ -2566,7 +2504,7 @@ impl CpuStorage {
             Self::F64(values) => bytes_of(values),
             Self::F8E4M3(values) => bytes_of(values),
             // Narrower than a byte: refused above.
-            Self::F6E2M3(values) | Self::F6E3M2(values) | Self::F4(values) => values.as_slice(),
+            Self::F4(values) => values.as_slice(),
         };
 
         // SAFETY: every bit pattern is a value of each integer and float element type.
@@ -2582,61 +2520,59 @@ impl CpuStorage {
                 DType::F32 => Self::F32(elements_of(bytes)),
                 DType::F64 => Self::F64(elements_of(bytes)),
                 DType::F8E4M3 => Self::F8E4M3(elements_of(bytes)),
-                DType::F8E8M0 => Self::F8E8M0(elements_of(bytes)),
-                DType::F6E2M3 | DType::F6E3M2 | DType::F4 => {
-                    return Err(Error::UnsupportedDTypeForOp(dtype, "view").bt());
-                }
+                DType::F4 => return Err(Error::UnsupportedDTypeForOp(dtype, "view").bt()),
             }
         };
         Ok(storage)
     }
 
-    pub fn unary_impl<B: UnaryOpT>(&self, layout: &Layout) -> Result<Self> {
+    /// `B` of every element of a storage of any element type but F4.
+    pub fn unary_impl<B: IntUnaryOpT>(&self, layout: &Layout) -> Result<Self> {
+        match self {
+            Self::U8(storage) => Ok(Self::U8(unary_map(storage, layout, B::u8))),
+            Self::U32(storage) => Ok(Self::U32(unary_map(storage, layout, B::u32))),
+            Self::I16(storage) => Ok(Self::I16(unary_map(storage, layout, B::i16))),
+            Self::I32(storage) => Ok(Self::I32(unary_map(storage, layout, B::i32))),
+            Self::I64(storage) => Ok(Self::I64(unary_map(storage, layout, B::i64))),
+            _ => self.float_unary_impl::<B>(layout),
+        }
+    }
+
+    /// `B` of every element of a floating storage; an error for any other.
+    pub fn float_unary_impl<B: UnaryOpT>(&self, layout: &Layout) -> Result<Self> {
         match self {
             Self::BF16(storage) => {
-                let data = unary_map_vec_par(storage, layout, B::bf16, B::bf16_vec);
+                let data = unary_map_vec_par(
+                    CpuExecutor::current()?,
+                    storage,
+                    layout,
+                    B::bf16,
+                    B::bf16_vec,
+                );
                 Ok(Self::BF16(data))
             }
             Self::F16(storage) => {
-                let data = unary_map_vec_par(storage, layout, B::f16, B::f16_vec);
+                let data =
+                    unary_map_vec_par(CpuExecutor::current()?, storage, layout, B::f16, B::f16_vec);
                 Ok(Self::F16(data))
             }
             Self::F32(storage) => {
-                let data = unary_map_vec_par(storage, layout, B::f32, B::f32_vec);
+                let data =
+                    unary_map_vec_par(CpuExecutor::current()?, storage, layout, B::f32, B::f32_vec);
                 Ok(Self::F32(data))
             }
             Self::F64(storage) => {
-                let data = unary_map_vec_par(storage, layout, B::f64, B::f64_vec);
+                let data =
+                    unary_map_vec_par(CpuExecutor::current()?, storage, layout, B::f64, B::f64_vec);
                 Ok(Self::F64(data))
             }
-            Self::U8(storage) => {
-                let data = unary_map(storage, layout, B::u8);
-                Ok(Self::U8(data))
-            }
-            Self::U32(storage) => {
-                let data = unary_map(storage, layout, B::u32);
-                Ok(Self::U32(data))
-            }
-            Self::I16(storage) => {
-                let data = unary_map(storage, layout, B::i16);
-                Ok(Self::I16(data))
-            }
-            Self::I32(storage) => {
-                let data = unary_map(storage, layout, B::i32);
-                Ok(Self::I32(data))
-            }
-            Self::I64(storage) => {
-                let data = unary_map(storage, layout, B::i64);
-                Ok(Self::I64(data))
-            }
-            Self::F8E4M3(storage) => {
-                let data = unary_map(storage, layout, B::f8e4m3);
-                Ok(Self::F8E4M3(data))
-            }
-            Self::F6E2M3(_) => Err(Error::UnsupportedDTypeForOp(DType::F6E2M3, "unary").bt()),
-            Self::F6E3M2(_) => Err(Error::UnsupportedDTypeForOp(DType::F6E3M2, "unary").bt()),
-            Self::F4(_) => Err(Error::UnsupportedDTypeForOp(DType::F4, "unary").bt()),
-            Self::F8E8M0(_) => Err(Error::UnsupportedDTypeForOp(DType::F8E8M0, "unary").bt()),
+            Self::F8E4M3(storage) => Ok(Self::F8E4M3(unary_map(storage, layout, B::f8e4m3))),
+            Self::U8(_)
+            | Self::U32(_)
+            | Self::I16(_)
+            | Self::I32(_)
+            | Self::I64(_)
+            | Self::F4(_) => Err(Error::UnsupportedDTypeForOp(self.dtype(), B::NAME).bt()),
         }
     }
 
@@ -2649,6 +2585,7 @@ impl CpuStorage {
         match (self, rhs) {
             (Self::BF16(lhs), Self::BF16(rhs)) => {
                 let data = binary_map_vec_par(
+                    CpuExecutor::current()?,
                     lhs_l,
                     rhs_l,
                     lhs,
@@ -2661,6 +2598,7 @@ impl CpuStorage {
             }
             (Self::F16(lhs), Self::F16(rhs)) => {
                 let data = binary_map_vec_par(
+                    CpuExecutor::current()?,
                     lhs_l,
                     rhs_l,
                     lhs,
@@ -2673,6 +2611,7 @@ impl CpuStorage {
             }
             (Self::F32(lhs), Self::F32(rhs)) => {
                 let data = binary_map_vec_par(
+                    CpuExecutor::current()?,
                     lhs_l,
                     rhs_l,
                     lhs,
@@ -2685,6 +2624,7 @@ impl CpuStorage {
             }
             (Self::F64(lhs), Self::F64(rhs)) => {
                 let data = binary_map_vec_par(
+                    CpuExecutor::current()?,
                     lhs_l,
                     rhs_l,
                     lhs,
@@ -2697,6 +2637,7 @@ impl CpuStorage {
             }
             (Self::U32(lhs), Self::U32(rhs)) => {
                 let data = binary_map_vec_par(
+                    CpuExecutor::current()?,
                     lhs_l,
                     rhs_l,
                     lhs,
@@ -2709,6 +2650,7 @@ impl CpuStorage {
             }
             (Self::I16(lhs), Self::I16(rhs)) => {
                 let data = binary_map_vec_par(
+                    CpuExecutor::current()?,
                     lhs_l,
                     rhs_l,
                     lhs,
@@ -2721,6 +2663,7 @@ impl CpuStorage {
             }
             (Self::I32(lhs), Self::I32(rhs)) => {
                 let data = binary_map_vec_par(
+                    CpuExecutor::current()?,
                     lhs_l,
                     rhs_l,
                     lhs,
@@ -2733,6 +2676,7 @@ impl CpuStorage {
             }
             (Self::I64(lhs), Self::I64(rhs)) => {
                 let data = binary_map_vec_par(
+                    CpuExecutor::current()?,
                     lhs_l,
                     rhs_l,
                     lhs,
@@ -2804,15 +2748,9 @@ impl CpuStorage {
             (Self::F8E4M3(src), Self::F8E4M3(dst)) => {
                 copy2d_(src, dst, d1, d2, src_s, dst_s, src_o, dst_o)
             }
-            (Self::F6E2M3(src), Self::F6E2M3(dst)) => {
-                copy2d_(src, dst, d1, d2, src_s, dst_s, src_o, dst_o)
-            }
-            (Self::F6E3M2(src), Self::F6E3M2(dst)) => {
-                copy2d_(src, dst, d1, d2, src_s, dst_s, src_o, dst_o)
-            }
-            (Self::F4(src), Self::F4(dst)) => copy2d_(src, dst, d1, d2, src_s, dst_s, src_o, dst_o),
-            (Self::F8E8M0(src), Self::F8E8M0(dst)) => {
-                copy2d_(src, dst, d1, d2, src_s, dst_s, src_o, dst_o)
+            // Two F4 elements share a byte: no element offset addresses one.
+            (Self::F4(_), Self::F4(_)) => {
+                return Err(Error::UnsupportedDTypeForOp(DType::F4, "copy2d").bt());
             }
             (_, dst) => {
                 return Err(Error::DTypeMismatchBinaryOp {
@@ -2845,15 +2783,9 @@ impl CpuStorage {
             (Self::F8E4M3(src), Self::F8E4M3(dst)) => {
                 copy_strided_src_(src, dst, dst_offset, src_l)
             }
-            (Self::F6E2M3(src), Self::F6E2M3(dst)) => {
-                copy_strided_src_(src, dst, dst_offset, src_l)
-            }
-            (Self::F6E3M2(src), Self::F6E3M2(dst)) => {
-                copy_strided_src_(src, dst, dst_offset, src_l)
-            }
-            (Self::F4(src), Self::F4(dst)) => copy_strided_src_(src, dst, dst_offset, src_l),
-            (Self::F8E8M0(src), Self::F8E8M0(dst)) => {
-                copy_strided_src_(src, dst, dst_offset, src_l)
+            // Two F4 elements share a byte: no stride addresses one.
+            (Self::F4(_), Self::F4(_)) => {
+                return Err(Error::UnsupportedDTypeForOp(DType::F4, "copy_strided").bt());
             }
             (_, dst) => {
                 // This should be covered by the dtype check above.
@@ -2887,6 +2819,17 @@ impl CpuStorage {
     }
 
     pub fn conv1d(
+        &self,
+        l: &Layout,
+        kernel: &Self,
+        kernel_l: &Layout,
+        params: &crate::conv::ParamsConv1D,
+    ) -> Result<Self> {
+        CpuExecutor::current()?.run(|| self.conv1d_on_pool(l, kernel, kernel_l, params))
+    }
+
+    /// [`CpuStorage::conv1d`] on the thread pool it runs on.
+    fn conv1d_on_pool(
         &self,
         l: &Layout,
         kernel: &Self,
@@ -2933,6 +2876,17 @@ impl CpuStorage {
     }
 
     pub fn conv_transpose1d(
+        &self,
+        l: &Layout,
+        kernel: &Self,
+        kernel_l: &Layout,
+        params: &crate::conv::ParamsConvTranspose1D,
+    ) -> Result<Self> {
+        CpuExecutor::current()?.run(|| self.conv_transpose1d_on_pool(l, kernel, kernel_l, params))
+    }
+
+    /// [`CpuStorage::conv_transpose1d`] on the thread pool it runs on.
+    fn conv_transpose1d_on_pool(
         &self,
         l: &Layout,
         kernel: &Self,
@@ -2994,10 +2948,32 @@ impl CpuStorage {
         kernel_l: &Layout,
         params: &crate::conv::ParamsConv2D,
     ) -> Result<Self> {
+        CpuExecutor::current()?.run(|| self.conv2d_on_pool(l, kernel, kernel_l, params))
+    }
+
+    /// [`CpuStorage::conv2d`] on the thread pool it runs on.
+    fn conv2d_on_pool(
+        &self,
+        l: &Layout,
+        kernel: &Self,
+        kernel_l: &Layout,
+        params: &crate::conv::ParamsConv2D,
+    ) -> Result<Self> {
         Conv2D(params).map(self, l, kernel, kernel_l)
     }
 
     pub fn conv_transpose2d(
+        &self,
+        l: &Layout,
+        kernel: &Self,
+        kernel_l: &Layout,
+        params: &crate::conv::ParamsConvTranspose2D,
+    ) -> Result<Self> {
+        CpuExecutor::current()?.run(|| self.conv_transpose2d_on_pool(l, kernel, kernel_l, params))
+    }
+
+    /// [`CpuStorage::conv_transpose2d`] on the thread pool it runs on.
+    fn conv_transpose2d_on_pool(
         &self,
         l: &Layout,
         kernel: &Self,
@@ -3167,19 +3143,8 @@ impl CpuStorage {
             (Self::I32(storage), Scalar::I32(v)) => set(storage, l, v),
             (Self::I64(storage), Scalar::I64(v)) => set(storage, l, v),
             (Self::F8E4M3(storage), Scalar::F8E4M3(v)) => set(storage, l, v),
-            // Dummy types don't support scalar operations
-            (Self::F6E2M3(_), _) => {
-                crate::bail!("const_set not supported for dummy type F6E2M3")
-            }
-            (Self::F6E3M2(_), _) => {
-                crate::bail!("const_set not supported for dummy type F6E3M2")
-            }
-            (Self::F4(_), _) => {
-                crate::bail!("const_set not supported for dummy type F4")
-            }
-            (Self::F8E8M0(_), _) => {
-                crate::bail!("const_set not supported for dummy type F8E8M0")
-            }
+            // No scalar is an F4 element, and no layout addresses one.
+            (Self::F4(_), _) => Err(Error::UnsupportedDTypeForOp(DType::F4, "const_set").bt())?,
             (st, s) => crate::bail!(
                 "const_set dtype mismatch, expected {:?} but got {:?}",
                 st.dtype(),
@@ -3258,9 +3223,7 @@ impl CpuDevice {
                     v.set_len(elem_count);
                     CpuStorage::F8E4M3(v)
                 }
-                DType::F6E2M3 | DType::F6E3M2 | DType::F4 | DType::F8E8M0 => {
-                    return Err(Error::UnsupportedDTypeForOp(dtype, "alloc_uninit").bt());
-                }
+                DType::F4 => CpuStorage::F4(vec![0u8; packed_bytes(elem_count)?]),
             };
             Ok(storage)
         }
@@ -3280,12 +3243,18 @@ impl CpuDevice {
             DType::F32 => CpuStorage::F32(vec![0f32; elem_count]),
             DType::F64 => CpuStorage::F64(vec![0f64; elem_count]),
             DType::F8E4M3 => CpuStorage::F8E4M3(vec![F8E4M3::ZERO; elem_count]),
-            DType::F6E2M3 | DType::F6E3M2 | DType::F4 | DType::F8E8M0 => {
-                return Err(Error::UnsupportedDTypeForOp(dtype, "zeros").bt());
-            }
+            // All bits clear is an F4 zero.
+            DType::F4 => CpuStorage::F4(vec![0u8; packed_bytes(elem_count)?]),
         };
         Ok(storage)
     }
+}
+
+/// The bytes of a storage of `elements` F4 elements ([`DType::storage_bytes`]).
+fn packed_bytes(elements: usize) -> Result<usize> {
+    DType::F4
+        .storage_bytes(elements)
+        .ok_or_else(|| Error::msg(format!("{elements} F4 elements exceed the address space")))
 }
 
 #[macro_export]

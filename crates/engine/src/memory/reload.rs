@@ -70,8 +70,10 @@ impl MetaWeights {
         self.order.borrow_mut().push((key.clone(), writable));
 
         // Every tensor takes at least one aligned block, so no two share an address.
-        let bytes = (shape.elem_count() as u64)
-            .saturating_mul(key.dtype.size_in_bytes().max(1) as u64)
+        let bytes = key
+            .dtype
+            .storage_bytes(shape.elem_count())
+            .map_or(u64::MAX, |bytes| bytes as u64)
             .max(1);
         let address = self.next.get();
         self.next.set(

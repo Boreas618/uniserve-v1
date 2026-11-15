@@ -26,14 +26,13 @@ pub enum DType {
     F64,
     // 8-bit floating point with 4-bit exponent and 3-bit mantissa.
     F8E4M3,
-    /// 6-bit float with 2 exponent bits and 3 mantissa bits (MX6 format)
-    F6E2M3,
-    /// 6-bit float with 3 exponent bits and 2 mantissa bits (MX6 format)
-    F6E3M2,
-    /// 4-bit float (MX4 format)
+    /// 4-bit floating point with 2-bit exponent and 1-bit mantissa (FP4 E2M1), two elements to a
+    /// byte; an odd count leaves half of the last byte unused.
+    ///
+    /// A tensor of it holds its packed bytes as they were built ([`crate::Tensor::from_raw_buffer`])
+    /// and moves them between devices whole. No host element type holds one element, so the CPU
+    /// backend computes nothing on it and addresses no single element.
     F4,
-    /// 8-bit float with 8 exponent bits and 0 mantissa bits
-    F8E8M0,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -61,10 +60,7 @@ impl std::str::FromStr for DType {
             "f32" => Ok(Self::F32),
             "f64" => Ok(Self::F64),
             "f8e4m3" => Ok(Self::F8E4M3),
-            "f6e2m3" => Ok(Self::F6E2M3),
-            "f6e3m2" => Ok(Self::F6E3M2),
             "f4" => Ok(Self::F4),
-            "f8e8m0" => Ok(Self::F8E8M0),
             _ => Err(DTypeParseError(s.to_string())),
         }
     }
@@ -84,60 +80,49 @@ impl DType {
             Self::F32 => "f32",
             Self::F64 => "f64",
             Self::F8E4M3 => "f8e4m3",
-            Self::F6E2M3 => "f6e2m3",
-            Self::F6E3M2 => "f6e3m2",
             Self::F4 => "f4",
-            Self::F8E8M0 => "f8e8m0",
         }
     }
 
-    /// The size used by each element in bytes, i.e. 1 for `U8`, 4 for `F32`.
-    pub fn size_in_bytes(&self) -> usize {
+    /// The bytes one element occupies: 1 for `U8`, 4 for `F32`. `None` for `F4`, two of whose
+    /// elements share a byte ([`DType::storage_bytes`]).
+    pub fn size_in_bytes(&self) -> Option<usize> {
         match self {
-            Self::U8 => 1,
-            Self::U32 => 4,
-            Self::I16 => 2,
-            Self::I32 => 4,
-            Self::I64 => 8,
-            Self::BF16 => 2,
-            Self::F16 => 2,
-            Self::F32 => 4,
-            Self::F64 => 8,
-            Self::F8E4M3 => 1,
-            Self::F6E2M3 => 0, // 6 bits
-            Self::F6E3M2 => 0, // 6 bits
-            Self::F4 => 0,     // 4 bits
-            Self::F8E8M0 => 1,
+            Self::U8 => Some(1),
+            Self::U32 => Some(4),
+            Self::I16 => Some(2),
+            Self::I32 => Some(4),
+            Self::I64 => Some(8),
+            Self::BF16 => Some(2),
+            Self::F16 => Some(2),
+            Self::F32 => Some(4),
+            Self::F64 => Some(8),
+            Self::F8E4M3 => Some(1),
+            Self::F4 => None,
+        }
+    }
+
+    /// The bytes `elements` contiguous elements occupy: whole elements times their size, and
+    /// for `F4` one byte per two elements, rounded up. `None` when the count exceeds `usize`.
+    pub fn storage_bytes(&self, elements: usize) -> Option<usize> {
+        match self.size_in_bytes() {
+            Some(size) => elements.checked_mul(size),
+            // F4 is the one element type narrower than a byte.
+            None => Some(elements.div_ceil(2)),
         }
     }
 
     pub fn is_int(&self) -> bool {
         match self {
             Self::U8 | Self::U32 | Self::I16 | Self::I32 | Self::I64 => true,
-            Self::BF16
-            | Self::F16
-            | Self::F32
-            | Self::F64
-            | Self::F8E4M3
-            | Self::F6E2M3
-            | Self::F6E3M2
-            | Self::F4
-            | Self::F8E8M0 => false,
+            Self::BF16 | Self::F16 | Self::F32 | Self::F64 | Self::F8E4M3 | Self::F4 => false,
         }
     }
 
     pub fn is_float(&self) -> bool {
         match self {
             Self::U8 | Self::U32 | Self::I16 | Self::I32 | Self::I64 => false,
-            Self::BF16
-            | Self::F16
-            | Self::F32
-            | Self::F64
-            | Self::F8E4M3
-            | Self::F6E2M3
-            | Self::F6E3M2
-            | Self::F4
-            | Self::F8E8M0 => true,
+            Self::BF16 | Self::F16 | Self::F32 | Self::F64 | Self::F8E4M3 | Self::F4 => true,
         }
     }
 }

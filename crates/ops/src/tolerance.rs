@@ -145,10 +145,8 @@ pub fn unit_roundoff(dtype: DType) -> f64 {
         DType::F32 => 5.960_464_477_539_063e-8,    // 2^-24
         DType::BF16 => 3.906_25e-3,                // 2^-8
         DType::F16 => 4.882_812_5e-4,              // 2^-11
-        DType::F8E4M3 | DType::F6E2M3 => 6.25e-2,  // 2^-4
-        DType::F6E3M2 => 1.25e-1,                  // 2^-3
+        DType::F8E4M3 => 6.25e-2,                  // 2^-4
         DType::F4 => 2.5e-1,                       // 2^-2
-        DType::F8E8M0 => 5e-1,                     // 2^-1: a power of two and nothing between
         DType::U8 | DType::U32 | DType::I16 | DType::I32 | DType::I64 => 0.0,
         // An element type the tensor library adds has no bound until it is stated here: a NaN
         // bound holds for no pair of values, so a comparison under it fails instead of passing.

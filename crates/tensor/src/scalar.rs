@@ -1,6 +1,6 @@
 //! TensorScalar Enum and Trait
 //!
-use crate::{DType, Result, Tensor, WithDType};
+use crate::{DType, Error, Result, Tensor, WithDType};
 use float8::F8E4M3 as f8e4m3;
 use half::{bf16, f16};
 
@@ -25,8 +25,13 @@ impl<T: WithDType> From<T> for Scalar {
 }
 
 impl Scalar {
-    pub fn zero(dtype: DType) -> Self {
-        match dtype {
+    /// The zero of `dtype`.
+    ///
+    /// # Errors
+    ///
+    /// For `F4`, which no scalar holds.
+    pub fn zero(dtype: DType) -> Result<Self> {
+        Ok(match dtype {
             DType::U8 => Scalar::U8(0),
             DType::U32 => Scalar::U32(0),
             DType::I16 => Scalar::I16(0),
@@ -37,14 +42,18 @@ impl Scalar {
             DType::F32 => Scalar::F32(0.0),
             DType::F64 => Scalar::F64(0.0),
             DType::F8E4M3 => Scalar::F8E4M3(f8e4m3::ZERO),
-            DType::F6E2M3 | DType::F6E3M2 | DType::F4 | DType::F8E8M0 => {
-                panic!("Cannot create zero scalar for dummy type {dtype:?}")
-            }
-        }
+            // No scalar holds an F4 element.
+            DType::F4 => return Err(Error::UnsupportedDTypeForOp(dtype, "scalar").bt()),
+        })
     }
 
-    pub fn one(dtype: DType) -> Self {
-        match dtype {
+    /// The one of `dtype`.
+    ///
+    /// # Errors
+    ///
+    /// For `F4`, which no scalar holds.
+    pub fn one(dtype: DType) -> Result<Self> {
+        Ok(match dtype {
             DType::U8 => Scalar::U8(1),
             DType::U32 => Scalar::U32(1),
             DType::I16 => Scalar::I16(1),
@@ -55,10 +64,9 @@ impl Scalar {
             DType::F32 => Scalar::F32(1.0),
             DType::F64 => Scalar::F64(1.0),
             DType::F8E4M3 => Scalar::F8E4M3(f8e4m3::ONE),
-            DType::F6E2M3 | DType::F6E3M2 | DType::F4 | DType::F8E8M0 => {
-                panic!("Cannot create one scalar for dummy type {dtype:?}")
-            }
-        }
+            // No scalar holds an F4 element.
+            DType::F4 => return Err(Error::UnsupportedDTypeForOp(dtype, "scalar").bt()),
+        })
     }
 
     pub fn dtype(&self) -> DType {

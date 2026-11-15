@@ -1,3 +1,4 @@
+use crate::cpu_backend::CpuExecutor;
 use crate::tensor::from_storage;
 use crate::{Result, Storage, Tensor};
 use rayon::prelude::*;
@@ -76,24 +77,9 @@ impl ArgSort {
             crate::CpuStorage::F32(vs) => self.asort(vs, layout)?,
             crate::CpuStorage::F64(vs) => self.asort(vs, layout)?,
             crate::CpuStorage::F8E4M3(vs) => self.asort(vs, layout)?,
-            // Dummy types don't support sorting
-            crate::CpuStorage::F6E2M3(_) => {
-                return Err(
-                    crate::Error::UnsupportedDTypeForOp(crate::DType::F6E2M3, "argsort").bt(),
-                );
-            }
-            crate::CpuStorage::F6E3M2(_) => {
-                return Err(
-                    crate::Error::UnsupportedDTypeForOp(crate::DType::F6E3M2, "argsort").bt(),
-                );
-            }
+            // Two F4 elements share a byte: no host element type holds one to compare.
             crate::CpuStorage::F4(_) => {
                 return Err(crate::Error::UnsupportedDTypeForOp(crate::DType::F4, "argsort").bt());
-            }
-            crate::CpuStorage::F8E8M0(_) => {
-                return Err(
-                    crate::Error::UnsupportedDTypeForOp(crate::DType::F8E8M0, "argsort").bt(),
-                );
             }
         };
         Ok(crate::CpuStorage::U32(sort_indexes))
@@ -121,7 +107,10 @@ impl Tensor {
         };
         let sort = ArgSort { asc, last_dim };
         let storage = match &*self.storage() {
-            Storage::Cpu(storage) => Storage::Cpu(sort.cpu_fwd(storage, self.layout())?),
+            // The rows are sorted in parallel on the CPU executor's pool.
+            Storage::Cpu(storage) => {
+                Storage::Cpu(CpuExecutor::current()?.run(|| sort.cpu_fwd(storage, self.layout()))?)
+            }
             Storage::Backend(_) => crate::bail!("no backend implementation for argsort"),
         };
         Ok(from_storage(storage, self.shape().clone()))

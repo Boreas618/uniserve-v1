@@ -174,10 +174,11 @@ impl Tensor {
     /// ```
     pub fn ones<S: Into<Shape>>(shape: S, dtype: DType, device: &Device) -> Result<Self> {
         let shape = shape.into();
+        let one = crate::scalar::Scalar::one(dtype)?;
         // SAFETY: `const_set` below writes every element before the storage is read.
         let mut storage = unsafe { device.alloc_uninit(&shape, dtype)? };
         let layout = Layout::contiguous(shape.clone());
-        storage.const_set(crate::scalar::Scalar::one(dtype), &layout)?;
+        storage.const_set(one, &layout)?;
         Ok(from_storage(storage, shape))
     }
 
@@ -186,11 +187,11 @@ impl Tensor {
     }
 
     pub fn zero_set(&self) -> Result<()> {
-        self.const_set(crate::scalar::Scalar::zero(self.dtype()))
+        self.const_set(crate::scalar::Scalar::zero(self.dtype())?)
     }
 
     pub fn one_set(&self) -> Result<()> {
-        self.const_set(crate::scalar::Scalar::one(self.dtype()))
+        self.const_set(crate::scalar::Scalar::one(self.dtype())?)
     }
 
     /// Creates a new tensor filled with ones with same shape, dtype, and device as the other tensor.

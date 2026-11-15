@@ -4,7 +4,7 @@
 mod common;
 
 use float8::F8E4M3;
-use tensor::{D, DType, Device, IndexOp, Result, Tensor};
+use tensor::{CpuStorage, D, DType, Device, IndexOp, Result, Storage, Tensor};
 
 fn zeros(device: &Device) -> Result<()> {
     let tensor = Tensor::zeros((5, 2), DType::F32, device)?;
@@ -1239,6 +1239,16 @@ fn slice_scatter(device: &Device) -> Result<()> {
             [9.0, 10.0, 11.0]
         ]
     );
+
+    // Along the second dimension: a column written into each row, and the tensor scattered into
+    // left as it was.
+    let rows = Tensor::new(&[[0f32, 1., 2.], [3., 4., 5.]], device)?;
+    let column = Tensor::new(&[[88f32], [99.]], device)?;
+    assert_eq!(
+        rows.slice_scatter(&column, 1, 2)?.to_vec2::<f32>()?,
+        [[0., 1., 88.], [3., 4., 99.]]
+    );
+    assert_eq!(rows.to_vec2::<f32>()?, [[0., 1., 2.], [3., 4., 5.]]);
     Ok(())
 }
 
@@ -1918,6 +1928,52 @@ fn view(device: &Device) -> Result<()> {
     Ok(())
 }
 
+/// The bytes `tensor` writes out.
+fn written(tensor: &Tensor) -> Result<Vec<u8>> {
+    let mut bytes = Vec::new();
+    tensor.write_bytes(&mut bytes)?;
+    Ok(bytes)
+}
+
+/// An F4 tensor holds the packed bytes it was built from, two elements to a byte, and writes
+/// them out as they were. No host element type holds one element, so it computes nothing and
+/// no layout addresses a single element.
+fn packed_f4_keeps_its_bytes(device: &Device) -> Result<()> {
+    let bytes = [0x12u8, 0x34, 0xab];
+    let t = Tensor::from_raw_buffer(&bytes, DType::F4, &[6], device)?;
+    assert!(t.device().same_device(device));
+    assert_eq!(t.dtype(), DType::F4);
+    assert_eq!(t.dims(), [6]);
+
+    let on_cpu = t.to_device(&Device::Cpu)?;
+    {
+        let (storage, _) = on_cpu.storage_and_layout();
+        let Storage::Cpu(CpuStorage::F4(data)) = &*storage else {
+            panic!("expected a packed F4 cpu storage")
+        };
+        assert_eq!(data, &bytes);
+    }
+    assert_eq!(written(&t)?, bytes);
+
+    // An odd count leaves half of the last byte unused; the bytes are the shape's.
+    let odd = Tensor::from_raw_buffer(&bytes, DType::F4, &[5], device)?;
+    assert_eq!(written(&odd)?, bytes);
+    assert!(Tensor::from_raw_buffer(&bytes, DType::F4, &[4], device).is_err());
+    assert!(Tensor::from_raw_buffer(&bytes, DType::F4, &[7], device).is_err());
+
+    // All bits clear is an F4 zero; no scalar is an F4 one.
+    assert_eq!(written(&Tensor::zeros(5, DType::F4, device)?)?, [0; 3]);
+    assert!(Tensor::ones(5, DType::F4, device).is_err());
+
+    // No arithmetic, conversion or copy of single elements.
+    assert!(t.affine(2., 0.).is_err());
+    assert!(t.exp().is_err());
+    assert!(t.to_dtype(DType::F32).is_err());
+    assert!(t.reshape((2, 3))?.t()?.contiguous().is_err());
+    assert!(written(&t.narrow(0, 0, 2)?).is_err());
+    Ok(())
+}
+
 /// Sums of 16-bit floats accumulate in F32 and round once. Accumulated in the element type, a
 /// sum stops growing as soon as a term is below half of its last place: the cases below would
 /// then stop far short of 65536 for the ones and give 1 for each column.
@@ -1962,6 +2018,7 @@ test_device!(zeros);
 test_device!(ones);
 test_device!(sigmoid);
 test_device!(view);
+test_device!(packed_f4_keeps_its_bytes);
 test_device!(half_precision_sums);
 test_device!(full);
 test_device!(const_set);

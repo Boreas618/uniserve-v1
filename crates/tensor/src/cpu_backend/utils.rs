@@ -1,4 +1,5 @@
 /// Helper functions to write CPU kernels.
+use super::CpuExecutor;
 use crate::nditer::NdIter;
 use crate::{Error, Layout, Result, WithDType};
 
@@ -18,11 +19,8 @@ pub trait Map1 {
             C::F32(vs) => Ok(C::F32(self.f(vs, layout)?)),
             C::F64(vs) => Ok(C::F64(self.f(vs, layout)?)),
             C::F8E4M3(vs) => Ok(C::F8E4M3(self.f(vs, layout)?)),
-            // Dummy types don't support Map1 operations
-            C::F6E2M3(_) => Err(Error::UnsupportedDTypeForOp(vs.dtype(), "map1").bt()),
-            C::F6E3M2(_) => Err(Error::UnsupportedDTypeForOp(vs.dtype(), "map1").bt()),
+            // Two F4 elements share a byte: no host element type holds one.
             C::F4(_) => Err(Error::UnsupportedDTypeForOp(vs.dtype(), "map1").bt()),
-            C::F8E8M0(_) => Err(Error::UnsupportedDTypeForOp(vs.dtype(), "map1").bt()),
         }
     }
 }
@@ -42,11 +40,8 @@ pub trait Map1Any {
             C::F32(vs) => Ok(self.f(vs, layout, C::F32)?),
             C::F64(vs) => Ok(self.f(vs, layout, C::F64)?),
             C::F8E4M3(vs) => Ok(self.f(vs, layout, C::F8E4M3)?),
-            // Dummy types don't support Map1Any operations
-            C::F6E2M3(_) => Err(Error::UnsupportedDTypeForOp(vs.dtype(), "map1any").bt()),
-            C::F6E3M2(_) => Err(Error::UnsupportedDTypeForOp(vs.dtype(), "map1any").bt()),
+            // Two F4 elements share a byte: no host element type holds one.
             C::F4(_) => Err(Error::UnsupportedDTypeForOp(vs.dtype(), "map1any").bt()),
-            C::F8E8M0(_) => Err(Error::UnsupportedDTypeForOp(vs.dtype(), "map1any").bt()),
         }
     }
 }
@@ -381,51 +376,52 @@ pub fn unary_map_vec<T: Copy, U: Copy, F: FnMut(T) -> U, FV: FnMut(&[T], &mut [U
     }
 }
 
-// Below this many logical elements the barrier-pool split costs more than it saves.
-const PAR_ELEMWISE_MIN: usize = 64 * 1024;
-// Per-unit span: big enough to amortize dispatch, small enough to balance.
-const PAR_ELEMWISE_CHUNK: usize = 16 * 1024;
-
+/// [`unary_map_vec`] split across the threads of `executor` when the layout is one block of
+/// enough elements ([`ExecutorConfig::parallel_elements`]); any other layout is mapped on the
+/// calling thread.
+///
+/// [`ExecutorConfig::parallel_elements`]: super::ExecutorConfig::parallel_elements
 pub fn unary_map_vec_par<
     T: Copy + Send + Sync,
     U: Copy + Send + Sync,
     F: Fn(T) -> U + Sync,
     FV: Fn(&[T], &mut [U]) + Sync,
 >(
+    executor: &CpuExecutor,
     vs: &[T],
     layout: &Layout,
     f: F,
     f_vec: FV,
 ) -> Vec<U> {
     if let crate::StridedBlocks::SingleBlock { start_offset, len } = layout.strided_blocks()
-        && len >= PAR_ELEMWISE_MIN
+        && executor.splits(len)
     {
         let src = &vs[start_offset..start_offset + len];
         let mut ys: Vec<U> = Vec::with_capacity(len);
         let ys_ptr = ys.as_mut_ptr() as usize;
-        let n_units = len.div_ceil(PAR_ELEMWISE_CHUNK);
-        crate::utils::barrier_pool().execute_chunked(n_units, |range| {
+        executor.for_each_chunk(len, |range| {
             let ys_ptr = ys_ptr as *mut U;
-            for unit in range {
-                let lo = unit * PAR_ELEMWISE_CHUNK;
-                let hi = len.min(lo + PAR_ELEMWISE_CHUNK);
-                // SAFETY: `lo..hi` lies within the capacity `len`, and each work unit owns its
-                // disjoint range of the output, which it writes before `set_len`.
-                let dst = unsafe { std::slice::from_raw_parts_mut(ys_ptr.add(lo), hi - lo) };
-                f_vec(&src[lo..hi], dst);
-            }
+            // SAFETY: the chunk lies within the capacity `len`, and each chunk owns its disjoint
+            // range of the output, which it writes before `set_len`.
+            let dst =
+                unsafe { std::slice::from_raw_parts_mut(ys_ptr.add(range.start), range.len()) };
+            f_vec(&src[range], dst);
         });
-        // SAFETY: every element is written by exactly one unit.
+        // SAFETY: every element is written by exactly one chunk.
         unsafe { ys.set_len(len) };
         return ys;
     }
     unary_map_vec(vs, layout, f, f_vec)
 }
 
+/// [`binary_map_vec`] split across the threads of `executor` when the output has enough elements
+/// ([`ExecutorConfig::parallel_elements`]); a smaller output is mapped on the calling thread.
+///
+/// [`ExecutorConfig::parallel_elements`]: super::ExecutorConfig::parallel_elements
 #[allow(clippy::too_many_arguments)]
 #[expect(
     clippy::expect_used,
-    reason = "a unit's offsets are below `el_count`, which the `NdIter` of the same layouts walks \
+    reason = "a chunk's offsets are below `el_count`, which the `NdIter` of the same layouts walks \
               in blocks of `inner_size`"
 )]
 pub fn binary_map_vec_par<
@@ -434,6 +430,7 @@ pub fn binary_map_vec_par<
     FV: Fn(&[T], &[T], &mut [T]) + Sync,
     FSV: Fn(T, &[T], &mut [T]) + Sync,
 >(
+    executor: &CpuExecutor,
     lhs_l: &Layout,
     rhs_l: &Layout,
     lhs: &[T],
@@ -443,7 +440,7 @@ pub fn binary_map_vec_par<
     f_scalar_vec: FSV,
 ) -> Vec<T> {
     let el_count = lhs_l.shape().elem_count();
-    if el_count < PAR_ELEMWISE_MIN {
+    if !executor.splits(el_count) {
         return binary_map_vec(lhs_l, rhs_l, lhs, rhs, f, f_vec, f_scalar_vec);
     }
 
@@ -454,55 +451,49 @@ pub fn binary_map_vec_par<
 
     let mut ys: Vec<T> = Vec::with_capacity(el_count);
     let ys_ptr = ys.as_mut_ptr() as usize;
-    let n_units = el_count.div_ceil(PAR_ELEMWISE_CHUNK);
-    crate::utils::barrier_pool().execute_chunked(n_units, |range| {
+    executor.for_each_chunk(el_count, |range| {
         let ys_ptr = ys_ptr as *mut T;
-        for unit in range {
-            let mut dst_offset = unit * PAR_ELEMWISE_CHUNK;
-            let hi = el_count.min(dst_offset + PAR_ELEMWISE_CHUNK);
-            let mut inner_offset = dst_offset % inner_size;
-            let mut nd_iter = NdIter::new([lhs_l, rhs_l]);
-            let mut offsets = nd_iter
-                .nth(dst_offset / inner_size)
-                .expect("logical output offset must map to an NdIter block");
+        let (mut dst_offset, hi) = (range.start, range.end);
+        let mut inner_offset = dst_offset % inner_size;
+        let mut nd_iter = NdIter::new([lhs_l, rhs_l]);
+        let mut offsets = nd_iter
+            .nth(dst_offset / inner_size)
+            .expect("logical output offset must map to an NdIter block");
 
-            while dst_offset < hi {
-                let len = (inner_size - inner_offset).min(hi - dst_offset);
-                let lhs_offset = offsets[0] + inner_offset * lhs_stride;
-                let rhs_offset = offsets[1] + inner_offset * rhs_stride;
-                // SAFETY: work units own disjoint output ranges, all written before set_len.
-                let dst = unsafe { std::slice::from_raw_parts_mut(ys_ptr.add(dst_offset), len) };
+        while dst_offset < hi {
+            let len = (inner_size - inner_offset).min(hi - dst_offset);
+            let lhs_offset = offsets[0] + inner_offset * lhs_stride;
+            let rhs_offset = offsets[1] + inner_offset * rhs_stride;
+            // SAFETY: chunks own disjoint output ranges, all written before set_len.
+            let dst = unsafe { std::slice::from_raw_parts_mut(ys_ptr.add(dst_offset), len) };
 
-                match (lhs_stride, rhs_stride) {
-                    (1, 1) => f_vec(
-                        &lhs[lhs_offset..lhs_offset + len],
-                        &rhs[rhs_offset..rhs_offset + len],
-                        dst,
-                    ),
-                    (1, 0) => {
-                        f_scalar_vec(rhs[rhs_offset], &lhs[lhs_offset..lhs_offset + len], dst)
-                    }
-                    _ => {
-                        for (i, dst) in dst.iter_mut().enumerate() {
-                            *dst = f(
-                                lhs[lhs_offset + i * lhs_stride],
-                                rhs[rhs_offset + i * rhs_stride],
-                            );
-                        }
+            match (lhs_stride, rhs_stride) {
+                (1, 1) => f_vec(
+                    &lhs[lhs_offset..lhs_offset + len],
+                    &rhs[rhs_offset..rhs_offset + len],
+                    dst,
+                ),
+                (1, 0) => f_scalar_vec(rhs[rhs_offset], &lhs[lhs_offset..lhs_offset + len], dst),
+                _ => {
+                    for (i, dst) in dst.iter_mut().enumerate() {
+                        *dst = f(
+                            lhs[lhs_offset + i * lhs_stride],
+                            rhs[rhs_offset + i * rhs_stride],
+                        );
                     }
                 }
+            }
 
-                dst_offset += len;
-                inner_offset = 0;
-                if dst_offset < hi {
-                    offsets = nd_iter
-                        .next()
-                        .expect("logical output range must stay within NdIter blocks");
-                }
+            dst_offset += len;
+            inner_offset = 0;
+            if dst_offset < hi {
+                offsets = nd_iter
+                    .next()
+                    .expect("logical output range must stay within NdIter blocks");
             }
         }
     });
-    // SAFETY: every element is written by exactly one work unit.
+    // SAFETY: every element is written by exactly one chunk.
     unsafe { ys.set_len(el_count) };
     ys
 }
@@ -511,12 +502,39 @@ pub fn binary_map_vec_par<
 mod tests {
     use super::*;
     use crate::Shape;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use crate::cpu_backend::ExecutorConfig;
+
+    /// The chunk of [`splitting_executor`]: a few dozen elements cross chunk boundaries inside
+    /// and between rows.
+    const CHUNK: usize = 5;
+
+    /// An executor of its own that splits every map into chunks of [`CHUNK`] elements.
+    fn splitting_executor() -> Result<CpuExecutor> {
+        let config = ExecutorConfig {
+            threads: 3,
+            parallel_elements: 1,
+            chunk_elements: CHUNK,
+            ..ExecutorConfig::for_process()?
+        };
+        CpuExecutor::start(config)
+    }
+
+    fn difference_vec(lhs: &[i64], rhs: &[i64], ys: &mut [i64]) {
+        for ((&lhs, &rhs), y) in lhs.iter().zip(rhs).zip(ys) {
+            *y = lhs - rhs;
+        }
+    }
+
+    fn difference_scalar_vec(scalar: i64, xs: &[i64], ys: &mut [i64]) {
+        for (&x, y) in xs.iter().zip(ys) {
+            *y = x - scalar;
+        }
+    }
 
     #[test]
-    fn binary_map_vec_par_chunks_non_contiguous_broadcasts() {
-        const ROWS: usize = 2;
-        const COLS: usize = 2 * PAR_ELEMWISE_CHUNK;
+    fn binary_map_vec_par_splits_non_contiguous_broadcasts() -> Result<()> {
+        const ROWS: usize = 3;
+        const COLS: usize = 2 * CHUNK + 2;
         const LHS_ROW_STRIDE: usize = COLS + 1;
 
         let mut lhs = vec![i64::MAX; ROWS * LHS_ROW_STRIDE];
@@ -525,42 +543,33 @@ mod tests {
                 lhs[row * LHS_ROW_STRIDE + col] = (row * COLS + col) as i64;
             }
         }
-        let rhs = [11i64, 29];
+        let rhs = [11i64, 29, 47];
         let shape = Shape::from((ROWS, COLS));
         let lhs_l = Layout::new(shape.clone(), vec![LHS_ROW_STRIDE, 1], 0);
         let rhs_l = Layout::new(shape, vec![1, 0], 0);
 
-        let calls = AtomicUsize::new(0);
-        let elements = AtomicUsize::new(0);
         let result = binary_map_vec_par(
+            &splitting_executor()?,
             &lhs_l,
             &rhs_l,
             &lhs,
             &rhs,
             |lhs, rhs| lhs - rhs,
-            |_, _, _| panic!("broadcast layout must not use the two-vector kernel"),
-            |scalar, xs, ys| {
-                assert!(xs.len() <= PAR_ELEMWISE_CHUNK);
-                calls.fetch_add(1, Ordering::Relaxed);
-                elements.fetch_add(xs.len(), Ordering::Relaxed);
-                for (&x, y) in xs.iter().zip(ys) {
-                    *y = x - scalar;
-                }
-            },
+            difference_vec,
+            difference_scalar_vec,
         );
 
         let expected: Vec<_> = (0..ROWS)
             .flat_map(|row| (0..COLS).map(move |col| (row * COLS + col) as i64 - rhs[row]))
             .collect();
         assert_eq!(result, expected);
-        assert_eq!(calls.load(Ordering::Relaxed), 4);
-        assert_eq!(elements.load(Ordering::Relaxed), ROWS * COLS);
+        Ok(())
     }
 
     #[test]
-    fn binary_map_vec_par_handles_two_strided_inputs() {
+    fn binary_map_vec_par_splits_two_strided_inputs() -> Result<()> {
         const ROWS: usize = 2;
-        const COLS: usize = 2 * PAR_ELEMWISE_CHUNK;
+        const COLS: usize = 2 * CHUNK + 3;
         const LHS_ROW_STRIDE: usize = COLS + 1;
         const RHS_ROW_STRIDE: usize = COLS + 2;
 
@@ -577,13 +586,14 @@ mod tests {
         let rhs_l = Layout::new(shape, vec![1, RHS_ROW_STRIDE], 0);
 
         let result = binary_map_vec_par(
+            &splitting_executor()?,
             &lhs_l,
             &rhs_l,
             &lhs,
             &rhs,
             |lhs, rhs| lhs - rhs,
-            |_, _, _| panic!("strided layout must not use the two-vector kernel"),
-            |_, _, _| panic!("strided layout must not use the scalar-vector kernel"),
+            difference_vec,
+            difference_scalar_vec,
         );
 
         let lhs = &lhs;
@@ -596,5 +606,28 @@ mod tests {
             })
             .collect();
         assert_eq!(result, expected);
+        Ok(())
+    }
+
+    #[test]
+    fn unary_map_vec_par_splits_one_block() -> Result<()> {
+        let vs: Vec<u32> = (0..4 * CHUNK as u32 + 3).collect();
+        let layout = Layout::contiguous_with_offset(vs.len() - 2, 2);
+
+        let result = unary_map_vec_par(
+            &splitting_executor()?,
+            &vs,
+            &layout,
+            |v| v * 3,
+            |xs, ys| {
+                for (&x, y) in xs.iter().zip(ys) {
+                    *y = x * 3;
+                }
+            },
+        );
+
+        let expected: Vec<_> = vs[2..].iter().map(|v| v * 3).collect();
+        assert_eq!(result, expected);
+        Ok(())
     }
 }

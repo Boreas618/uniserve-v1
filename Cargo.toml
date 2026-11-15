@@ -98,6 +98,12 @@ crossbeam-utils = "0.8"
 sha2 = "0.10"
 signal-hook-registry = "1.4.8"
 
+# ---- tensor element types ----
+# The FP8 and 16-bit float types of the tensor library's element types. The crates that compute
+# host values of those elements take the same versions, so they round as the library does.
+float8 = "0.7.0"
+half = "2.5.0"
+
 # ---- daemon third-party deps ----
 anyhow = "1.0.100"
 async-stream = "0.3.6"

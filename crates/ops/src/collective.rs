@@ -265,7 +265,7 @@ pub fn all_reduce(x: &Tensor) -> Result<()> {
     };
     let group = group(&context, "all_reduce")?;
     meet(&group, stream)?;
-    let bytes = x.dtype.size_in_bytes() * count;
+    let bytes = byte_count(&x, count, "all_reduce")?;
 
     group.communicator().all_reduce(
         stream,
@@ -294,12 +294,10 @@ pub fn all_gather(send: &Tensor, recv: &Tensor) -> Result<()> {
     };
     let group = group(&context, "all_gather")?;
     meet(&group, stream)?;
-    let bytes = send.dtype.size_in_bytes();
-
     group.communicator().all_gather(
         stream,
-        range(&send, bytes * count),
-        range(&recv, bytes * gathered),
+        range(&send, byte_count(&send, count, "all_gather")?),
+        range(&recv, byte_count(&recv, gathered, "all_gather")?),
         count,
         dtype,
     )?;
@@ -396,7 +394,7 @@ pub fn start_gather_rows(
     // One rank's rows of the interval; every rank's lie at the same offset of its own block.
     let elements = usize::try_from(count * width)
         .map_err(|_| misuse("gather_rows", "an element count above usize::MAX"))?;
-    let bytes = gathered.dtype.size_in_bytes() * elements;
+    let bytes = byte_count(&gathered, elements, "gather_rows")?;
     let block = |rank: u64| {
         let at = gathered.offset_elements((rank * owner_rows + first) * width);
         DeviceRange::new(at, bytes)
@@ -439,7 +437,7 @@ pub fn broadcast(x: &Tensor, root: u64) -> Result<Tensor> {
     };
     let group = group(&context, "broadcast")?;
     meet(&group, stream)?;
-    let bytes = operand.dtype.size_in_bytes() * count;
+    let bytes = byte_count(&operand, count, "broadcast")?;
 
     group.communicator().broadcast(
         stream,
@@ -604,6 +602,14 @@ fn misuse(collective: &'static str, problem: impl Into<String>) -> Error {
     }
 }
 
+/// The bytes `count` elements of `operand`'s element type occupy ([`DType::storage_bytes`]).
+fn byte_count(operand: &Operand, count: usize, collective: &'static str) -> Result<usize> {
+    operand
+        .dtype
+        .storage_bytes(count)
+        .ok_or_else(|| misuse(collective, "a byte count above usize::MAX"))
+}
+
 /// The `bytes` bytes `operand` starts at, as the communicator takes a buffer.
 fn range(operand: &Operand, bytes: usize) -> DeviceRange {
     DeviceRange::new(operand.ptr, bytes)
@@ -696,7 +702,7 @@ fn exchange(send: &Operand, recv: &Operand, ranks: u64) -> Result<(usize, usize,
         ));
     }
 
-    Ok((count / ranks, send.dtype.size_in_bytes() * count, dtype))
+    Ok((count / ranks, byte_count(send, count, "all_to_all")?, dtype))
 }
 
 /// Waits for a collective issued outside a capture, so the forward goes on with none in flight.

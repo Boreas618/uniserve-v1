@@ -57,7 +57,9 @@ pub(crate) fn shard(
     let mut payload: Vec<u8> = Vec::new();
 
     for (tensor, dtype, shape, bytes) in tensors {
-        let expected = shape.iter().product::<usize>() * dtype.size_in_bytes();
+        let expected = dtype
+            .storage_bytes(shape.iter().product::<usize>())
+            .expect("the fixture's shape fits the address space");
         assert_eq!(
             expected,
             bytes.len(),

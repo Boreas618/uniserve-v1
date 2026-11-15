@@ -232,23 +232,6 @@ impl<S: WithDType> NdArray for Vec<Vec<Vec<Vec<S>>>> {
 }
 
 impl Device {
-    /// Run `f` with device specific context.
-    ///
-    /// On CPU this installs the crate's private rayon thread pool for the
-    /// duration of `f`, keeping worker threads warm across the many short
-    /// parallel sections in a model forward pass. It does nothing more than call `f` on a
-    /// backend device.
-    pub fn with_context<F, R>(&self, f: F) -> R
-    where
-        F: FnOnce() -> R + Send,
-        R: Send,
-    {
-        match self {
-            Self::Cpu => crate::utils::with_threadpool(f),
-            Self::Backend(_) => f(),
-        }
-    }
-
     /// Whether tensors of the two devices may meet in one operation.
     ///
     /// The CPU is the same device as itself only. Two backend devices are the same device when

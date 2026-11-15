@@ -73,10 +73,7 @@ pub fn name(dtype: DType) -> &'static str {
 /// read it (`gemm` on an NVFP4 weight, for one) name; everything that hands out bytes fails for
 /// it rather than rounding.
 pub fn bytes(dtype: DType) -> Option<u64> {
-    match dtype.size_in_bytes() {
-        0 => None,
-        bytes => Some(bytes as u64),
-    }
+    dtype.size_in_bytes().map(|bytes| bytes as u64)
 }
 
 /// The element type an interface names (a configuration's `dtype`, `kv_cache_config.dtype`), as
@@ -118,20 +115,6 @@ mod tests {
             assert_eq!(code(dtype).unwrap(), number, "{spelling}");
             assert_eq!(name(dtype), spelling);
             assert_eq!(bytes(dtype), size, "{spelling}");
-        }
-    }
-
-    #[test]
-    fn an_element_type_the_abi_does_not_state_has_a_spelling_and_no_number() {
-        for (dtype, spelling) in [
-            (DType::F6E2M3, "f6e2m3"),
-            (DType::F6E3M2, "f6e3m2"),
-            (DType::F8E8M0, "f8e8m0"),
-        ] {
-            assert_eq!(name(dtype), spelling);
-
-            let refused = code(dtype).unwrap_err().to_string();
-            assert!(refused.contains(spelling), "{refused}");
         }
     }
 

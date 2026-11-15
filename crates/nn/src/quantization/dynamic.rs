@@ -88,8 +88,9 @@ fn bands(rows: usize) -> Vec<Range<usize>> {
 
 /// The largest magnitude of the `dtype` elements `bytes` holds, folded in bands on host threads.
 fn largest_magnitude(dtype: DType, bytes: &[u8]) -> f32 {
-    let width = dtype.size_in_bytes();
-    let elements = bytes.len() / width;
+    // The sources are BF16, FP16 or FP32 (`widened`); an element narrower than a byte is none,
+    // and gives no element to read.
+    let elements = dtype.size_in_bytes().map_or(0, |width| bytes.len() / width);
 
     std::thread::scope(|scope| {
         let workers: Vec<_> = bands(elements)

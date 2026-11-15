@@ -196,6 +196,36 @@ fn an_integer_operation_on_floats_is_an_error(device: &Device) -> Result<()> {
     Ok(())
 }
 
+/// A unary operation keeps the element type, so on integers it is computed only when its result
+/// is an integer of that type, and is an error otherwise.
+fn a_unary_operation_on_integers_is_exact_or_an_error(device: &Device) -> Result<()> {
+    let signed = Tensor::new(&[i64::MIN, -3, 0, 5], device)?;
+
+    // `abs` of the smallest value wraps to itself, as `torch.abs` does.
+    assert_eq!(signed.abs()?.to_vec1::<i64>()?, [i64::MIN, 3, 0, 5]);
+    assert_eq!(signed.relu()?.to_vec1::<i64>()?, [0, 0, 0, 5]);
+    assert_eq!(signed.sign()?.to_vec1::<i64>()?, [-1, -1, 0, 1]);
+    assert_eq!(signed.floor()?.to_vec1::<i64>()?, [i64::MIN, -3, 0, 5]);
+
+    for result in [
+        signed.exp(),
+        signed.log(),
+        signed.neg(),
+        signed.sqr(),
+        signed.sqrt(),
+        signed.recip(),
+        signed.tanh(),
+        signed.gelu(),
+        signed.gelu_erf(),
+        signed.erf(),
+        signed.silu(),
+    ] {
+        let message = refusal(result);
+        assert!(message.contains("unsupported dtype I64"), "{message}");
+    }
+    Ok(())
+}
+
 fn a_zero_divisor_is_an_error(device: &Device) -> Result<()> {
     let dividend = Tensor::new(&[[7i64, 8], [9, 10]], device)?;
     let divisor = Tensor::new(&[[1i64, 2], [0, 4]], device)?;
@@ -318,6 +348,7 @@ test_device!(arithmetic_wraps_and_the_quotient_truncates);
 test_device!(remainder_takes_the_sign_of_the_divisor);
 test_device!(bits_combine_and_shift);
 test_device!(an_integer_operation_on_floats_is_an_error);
+test_device!(a_unary_operation_on_integers_is_exact_or_an_error);
 test_device!(a_zero_divisor_is_an_error);
 test_device!(a_scalar_operand_is_exact_on_integers);
 test_device!(a_scalar_that_is_no_value_of_the_element_type_is_an_error);

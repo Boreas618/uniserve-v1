@@ -3,7 +3,6 @@ name = "tensor"
 version.workspace = true
 edition.workspace = true
 description = "Inference tensors for UniServe: views, tensor operations, a CPU backend and an open device-backend interface, derived from candle-core"
-repository = "https://github.com/Boreas618/uniserve-tensor"
 # The library keeps candle-core's dual license, under which it is derived (`LICENSE-MIT`,
 # `LICENSE-APACHE`), not the workspace's.
 license = "MIT OR Apache-2.0"
@@ -12,15 +11,16 @@ readme = "README.md"
 # The library knows nothing of UniServe: it depends on no crate of the workspace.
 [dependencies]
 byteorder = "1.4.3"
-float8 = { version = "0.7.0", features = ["num-traits"] }
-# Without the `f16` feature: `gemm-f16` does not build unoptimized for aarch64 targets that lack
-# FP16 in their baseline, and the CPU backend multiplies F16 matrices in F32 instead.
-gemm = { version = "0.19.0", default-features = false, features = ["std", "rayon", "wasm-simd128-enable"] }
-half = { version = "2.5.0", features = ["num-traits", "use-intrinsics"] }
+float8 = { workspace = true, features = ["num-traits"] }
+# F32 and F64 products only. The CPU backend multiplies F16 and BF16 matrices in F32
+# (`MatMul::f_widened`) on every target: gemm's `f16` kernels round the running sums into F16
+# after each depth block, and on aarch64 CPUs with FP16 they accumulate in F16, where the
+# backend's products accumulate in F32 and round once.
+gemm = { version = "0.19.0", default-features = false, features = ["std", "rayon"] }
+half = { workspace = true, features = ["num-traits", "use-intrinsics"] }
 libc.workspace = true
 libm = "0.2.15"
 num-traits = "0.2.15"
-num_cpus = "1.15.0"
 parking_lot = "0.12.5"
 rayon = "1.7.0"
 thiserror.workspace = true

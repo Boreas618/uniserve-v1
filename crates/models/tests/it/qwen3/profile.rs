@@ -42,7 +42,9 @@ type Keys = BTreeSet<(&'static str, String)>;
 fn meta(shape: Shape, dtype: DType) -> Tensor {
     static NEXT: AtomicU64 = AtomicU64::new(1 << 40);
 
-    let bytes = (shape.elem_count() * dtype.size_in_bytes()) as u64;
+    let bytes = dtype
+        .storage_bytes(shape.elem_count())
+        .expect("a profile input fits the address space") as u64;
     let address = NEXT.fetch_add(
         bytes.next_multiple_of(1 << 16).max(1 << 16),
         Ordering::Relaxed,

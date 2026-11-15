@@ -1,7 +1,7 @@
 //! Implement conversion traits for tensors
 use crate::cpu_backend::CpuStorage;
 use crate::tensor::from_storage;
-use crate::{DType, Device, Error, Tensor, WithDType};
+use crate::{DType, Device, Error, Storage, Tensor, WithDType};
 use half::{bf16, f16, slice::HalfFloatSliceExt};
 use std::convert::TryFrom;
 
@@ -159,18 +159,38 @@ impl Tensor {
                     f.write_u8(v.to_bits())?
                 }
             }
-            DType::F6E2M3 | DType::F6E3M2 | DType::F4 | DType::F8E8M0 => {
-                return Err(crate::Error::UnsupportedDTypeForOp(self.dtype(), "write_bytes").bt());
-            }
+            DType::F4 => f.write_all(&packed_bytes(&vs)?)?,
         }
         Ok(())
     }
 }
 
+/// The packed bytes of an F4 tensor whose elements are its whole storage, as
+/// [`Tensor::from_raw_buffer`] builds one. A view of part of a storage is refused: its first or
+/// last byte may hold an element outside of it.
+fn packed_bytes(tensor: &Tensor) -> crate::Result<Vec<u8>> {
+    let host = tensor.to_device(&Device::Cpu)?;
+    let (storage, layout) = host.storage_and_layout();
+    let Storage::Cpu(CpuStorage::F4(bytes)) = &*storage else {
+        return Err(Error::UnexpectedDType {
+            msg: "the storage of an F4 tensor",
+            expected: DType::F4,
+            got: tensor.dtype(),
+        }
+        .bt());
+    };
+
+    let whole = DType::F4.storage_bytes(layout.shape().elem_count()) == Some(bytes.len());
+    if layout.start_offset() != 0 || !whole {
+        return Err(Error::UnsupportedDTypeForOp(DType::F4, "write_bytes of a view").bt());
+    }
+    Ok(bytes.clone())
+}
+
 impl Tensor {
     /// A tensor of `dtype` and `shape` on `device` over the little-endian element bytes `data`,
-    /// copied. The bytes of a packed dtype (`F6E2M3`, `F6E3M2`, `F4`, `F8E8M0`) are kept as they
-    /// are, since these dtypes have no host element type.
+    /// copied. The packed bytes of an `F4` tensor are kept as they are: `data` holds
+    /// [`DType::storage_bytes`] of the shape's elements.
     pub fn from_raw_buffer(
         data: &[u8],
         dtype: DType,
@@ -188,9 +208,7 @@ impl Tensor {
             DType::F32 => convert_slice::<f32>(data, shape, device),
             DType::F64 => convert_slice::<f64>(data, shape, device),
             DType::F8E4M3 => convert_slice::<float8::F8E4M3>(data, shape, device),
-            DType::F6E2M3 | DType::F6E3M2 | DType::F4 | DType::F8E8M0 => {
-                packed_tensor(data, dtype, shape, device)
-            }
+            DType::F4 => packed_tensor(data, shape, device),
         }
     }
 }
@@ -200,7 +218,7 @@ fn convert_slice<T: WithDType>(
     shape: &[usize],
     device: &Device,
 ) -> crate::Result<Tensor> {
-    let size_in_bytes = T::DTYPE.size_in_bytes();
+    let size_in_bytes = size_of::<T>();
     let elem_count = data.len() / size_in_bytes;
     if (data.as_ptr() as usize).is_multiple_of(size_in_bytes) {
         // SAFETY: `data` is aligned for `T` (checked above) and holds `elem_count` whole
@@ -224,21 +242,21 @@ fn convert_slice<T: WithDType>(
     }
 }
 
-/// A tensor of a packed dtype. Its storage holds the bytes of `data` as they are, since these
-/// dtypes have no host element type.
-fn packed_tensor(
-    data: &[u8],
-    dtype: DType,
-    shape: &[usize],
-    device: &Device,
-) -> crate::Result<Tensor> {
-    let storage = match dtype {
-        DType::F6E2M3 => CpuStorage::F6E2M3(data.to_vec()),
-        DType::F6E3M2 => CpuStorage::F6E3M2(data.to_vec()),
-        DType::F4 => CpuStorage::F4(data.to_vec()),
-        DType::F8E8M0 => CpuStorage::F8E8M0(data.to_vec()),
-        dtype => return Err(Error::UnsupportedDTypeForOp(dtype, "packed load").bt()),
-    };
-    let storage = device.storage_from_cpu_storage(storage)?;
+/// An F4 tensor of `shape` over the packed bytes `data`, which it keeps as they are.
+///
+/// # Errors
+///
+/// [`Error::ShapeMismatch`] when `data` is not the bytes of the shape's elements.
+fn packed_tensor(data: &[u8], shape: &[usize], device: &Device) -> crate::Result<Tensor> {
+    let shape = crate::Shape::from(shape);
+    if DType::F4.storage_bytes(shape.elem_count()) != Some(data.len()) {
+        return Err(Error::ShapeMismatch {
+            buffer_size: data.len(),
+            shape,
+        }
+        .bt());
+    }
+
+    let storage = device.storage_from_cpu_storage(CpuStorage::F4(data.to_vec()))?;
     Ok(from_storage(storage, shape))
 }

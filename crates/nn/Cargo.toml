@@ -26,11 +26,11 @@ serde_json.workspace = true
 memmap2 = "0.9"
 # A computed weight has no file to name it, so its key carries a digest of the bytes it produced.
 sha2.workspace = true
-safetensors = "0.8.0"
+safetensors.workspace = true
 # A scalar's BF16 rounding and an E4M3 byte's value on the host, as the tensor library computes
 # them.
-half = "2.5.0"
-float8 = "0.7.0"
+half.workspace = true
+float8.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

@@ -131,7 +131,7 @@ impl CudaStorage {
     /// A storage of `elements` elements of `dtype` from the thread's context
     /// ([`CudaStorage::allocate`]).
     pub(crate) fn of_elements(elements: usize, dtype: DType, asked: Option<usize>) -> Result<Self> {
-        let bytes = byte_length(dtype, elements as u64, "an allocation")?;
+        let bytes = byte_length(dtype, elements as u64)?;
         Self::allocate(bytes, dtype, asked)
     }
 
@@ -140,7 +140,7 @@ impl CudaStorage {
     fn borrowed(address: u64, elements: usize, dtype: DType, gpu: Option<usize>) -> Result<Self> {
         Ok(Self {
             address,
-            bytes: byte_length(dtype, elements as u64, "a tensor over lent memory")?,
+            bytes: byte_length(dtype, elements as u64)?,
             dtype,
             gpu,
             block: None,
@@ -178,7 +178,7 @@ impl CudaStorage {
     /// ([`retained`], [`external`]).
     pub(crate) fn reinterpreted(&self, dtype: DType) -> Result<Self> {
         let size = self.dtype.size_in_bytes();
-        if size == 0 || size != dtype.size_in_bytes() {
+        if size.is_none() || size != dtype.size_in_bytes() {
             return Err(Error::ElementType {
                 operation: "a view of a tensor as another element type",
                 dtype,
@@ -216,10 +216,9 @@ impl CudaStorage {
     /// The whole elements the storage holds.
     pub(crate) fn elements(&self) -> usize {
         let elements = match self.dtype.size_in_bytes() {
-            // A packed 4-bit element: two share a byte. No other packed type is ever stored
-            // (`byte_length`).
-            0 => self.bytes * 2,
-            size => self.bytes / size as u64,
+            // A packed F4 element, the one element narrower than a byte: two share a byte.
+            None => self.bytes * 2,
+            Some(size) => self.bytes / size as u64,
         };
 
         // The byte length came from an element count that was a `usize`.
@@ -252,15 +251,15 @@ impl CudaStorage {
 
         let offset = layout.start_offset() as u64;
         let address = match self.dtype.size_in_bytes() {
-            0 if offset == 0 => self.address,
-            0 => {
+            None if offset == 0 => self.address,
+            None => {
                 return Err(Error::ElementType {
                     operation: "a kernel operand",
                     dtype: self.dtype,
                     reason: "a view into a packed tensor starts inside a byte",
                 });
             }
-            size => self.address + offset * size as u64,
+            Some(size) => self.address + offset * size as u64,
         };
 
         Ok(Operand::with_layout(
@@ -308,7 +307,6 @@ impl CudaStorage {
                 DType::F8E4M3 => CpuStorage::F8E4M3(self.read_as(stream)?),
                 // The packed types are held on the host as their bytes.
                 DType::F4 => CpuStorage::F4(self.read_as(stream)?),
-                DType::F8E8M0 => CpuStorage::F8E8M0(self.read_as(stream)?),
                 dtype => {
                     return Err(Error::ElementType {
                         operation: "a device-to-host read",
@@ -349,26 +347,18 @@ impl CudaStorage {
     }
 }
 
-/// The bytes `elements` elements of `dtype` occupy, for `operation`.
+/// The bytes `elements` elements of `dtype` occupy ([`DType::storage_bytes`]): two NVFP4
+/// elements share a byte, the last byte of an odd count half used.
 ///
 /// # Errors
 ///
-/// [`Error::ElementType`] for a packed element with no byte layout; [`Error::TooLarge`].
-fn byte_length(dtype: DType, elements: u64, operation: &'static str) -> Result<u64> {
-    let bytes = match (dtype.size_in_bytes(), dtype) {
-        // NVFP4: two elements share a byte, the last byte of an odd count half used.
-        (0, DType::F4) => Some(elements.div_ceil(2)),
-        (0, _) => {
-            return Err(Error::ElementType {
-                operation,
-                dtype,
-                reason: "the element is narrower than a byte and has no packed layout here",
-            });
-        }
-        (size, _) => elements.checked_mul(size as u64),
-    };
-
-    bytes.ok_or(Error::TooLarge { elements, dtype })
+/// [`Error::TooLarge`] for more bytes than the address space holds.
+fn byte_length(dtype: DType, elements: u64) -> Result<u64> {
+    usize::try_from(elements)
+        .ok()
+        .and_then(|elements| dtype.storage_bytes(elements))
+        .map(|bytes| bytes as u64)
+        .ok_or(Error::TooLarge { elements, dtype })
 }
 
 /// A new tensor of `shape` elements of `dtype` from the context installed on this thread: a
@@ -379,8 +369,7 @@ fn byte_length(dtype: DType, elements: u64, operation: &'static str) -> Result<u
 ///
 /// # Errors
 ///
-/// [`Error::NoContext`]; [`Error::OutOfMemory`]; [`Error::ElementType`] for an element type
-/// with no byte layout.
+/// [`Error::NoContext`]; [`Error::OutOfMemory`]; [`Error::TooLarge`].
 pub fn empty(shape: impl Into<Shape>, dtype: DType) -> Result<Tensor> {
     let shape = shape.into();
     let storage = CudaStorage::of_elements(shape.elem_count(), dtype, None)?;
@@ -401,7 +390,7 @@ pub fn empty(shape: impl Into<Shape>, dtype: DType) -> Result<Tensor> {
 /// # Errors
 ///
 /// [`Error::ForeignTensor`] when `device` is not a device of this backend;
-/// [`Error::ElementType`] for an element type with no byte layout.
+/// [`Error::TooLarge`].
 ///
 /// # Safety
 ///

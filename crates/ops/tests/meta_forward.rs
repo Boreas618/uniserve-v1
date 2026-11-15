@@ -975,12 +975,6 @@ fn memory_is_lent_on_a_device_of_this_backend() {
     assert_eq!(lent.dims(), [2, 3]);
     assert_eq!(lent.dtype(), DType::I64);
     assert_eq!(lent.device().location(), META);
-
-    // A 6-bit element has no byte layout to lend.
-    assert!(matches!(
-        retained(0x1000, 8, DType::F6E2M3, &cuda(0)),
-        Err(Error::ElementType { .. })
-    ));
 }
 
 #[test]

@@ -152,17 +152,17 @@ impl UnaryOp {
     }
 }
 
+/// A unary operation on the floating element types.
+///
+/// An operation whose result on an integer is an integer of the same type implements
+/// [`IntUnaryOpT`] as well; the CPU backend refuses any other one on an integer tensor, as no
+/// operation changes the element type.
 pub trait UnaryOpT {
     const NAME: &'static str;
     fn bf16(v1: bf16) -> bf16;
     fn f16(v1: f16) -> f16;
     fn f32(v1: f32) -> f32;
     fn f64(v1: f64) -> f64;
-    fn u8(v1: u8) -> u8;
-    fn u32(v1: u32) -> u32;
-    fn i16(v1: i16) -> i16;
-    fn i32(v1: i32) -> i32;
-    fn i64(v1: i64) -> i64;
     fn f8e4m3(v1: f8e4m3) -> f8e4m3;
 
     #[inline(always)]
@@ -181,6 +181,16 @@ pub trait UnaryOpT {
     fn f64_vec(xs: &[f64], ys: &mut [f64]) {
         xs.iter().zip(ys).for_each(|(&x, y)| *y = Self::f64(x))
     }
+}
+
+/// A [`UnaryOpT`] whose result on each integer element type is an integer of that type: `abs`
+/// of the smallest signed value wraps to itself, as the integer arithmetic wraps.
+pub trait IntUnaryOpT: UnaryOpT {
+    fn u8(v1: u8) -> u8;
+    fn u32(v1: u32) -> u32;
+    fn i16(v1: i16) -> i16;
+    fn i32(v1: i32) -> i32;
+    fn i64(v1: i64) -> i64;
 }
 
 pub trait BinaryOpT {
@@ -504,26 +514,6 @@ macro_rules! unary_op {
                 $e
             }
             #[inline(always)]
-            fn u8(_: u8) -> u8 {
-                todo!("no unary function for u8")
-            }
-            #[inline(always)]
-            fn u32(_: u32) -> u32 {
-                todo!("no unary function for u32")
-            }
-            #[inline(always)]
-            fn i16(_: i16) -> i16 {
-                todo!("no unary function for i16")
-            }
-            #[inline(always)]
-            fn i32(_: i32) -> i32 {
-                todo!("no unary function for i32")
-            }
-            #[inline(always)]
-            fn i64(_: i64) -> i64 {
-                todo!("no unary function for i64")
-            }
-            #[inline(always)]
             fn f8e4m3($a: f8e4m3) -> f8e4m3 {
                 $e
             }
@@ -584,26 +574,6 @@ impl UnaryOpT for Gelu {
         0.5 * v * (1.0 + f64::tanh(SQRT_TWO_OVER_PI_F64 * v * (1.0 + 0.044715 * v * v)))
     }
     #[inline(always)]
-    fn u8(_: u8) -> u8 {
-        0
-    }
-    #[inline(always)]
-    fn u32(_: u32) -> u32 {
-        0
-    }
-    #[inline(always)]
-    fn i16(_: i16) -> i16 {
-        0
-    }
-    #[inline(always)]
-    fn i32(_: i32) -> i32 {
-        0
-    }
-    #[inline(always)]
-    fn i64(_: i64) -> i64 {
-        0
-    }
-    #[inline(always)]
     fn f8e4m3(v: f8e4m3) -> f8e4m3 {
         f8e4m3::from_f32(0.5)
             * v
@@ -637,26 +607,6 @@ impl UnaryOpT for Erf {
         crate::cpu::erf::erf_f64(v)
     }
     #[inline(always)]
-    fn u8(_: u8) -> u8 {
-        0
-    }
-    #[inline(always)]
-    fn u32(_: u32) -> u32 {
-        0
-    }
-    #[inline(always)]
-    fn i16(_: i16) -> i16 {
-        0
-    }
-    #[inline(always)]
-    fn i32(_: i32) -> i32 {
-        0
-    }
-    #[inline(always)]
-    fn i64(_: i64) -> i64 {
-        0
-    }
-    #[inline(always)]
     fn f8e4m3(v: f8e4m3) -> f8e4m3 {
         f8e4m3::from_f64(Self::f64(v.to_f64()))
     }
@@ -680,26 +630,6 @@ impl UnaryOpT for Silu {
     #[inline(always)]
     fn f64(v: f64) -> f64 {
         v / (1.0 + (-v).exp())
-    }
-    #[inline(always)]
-    fn u8(_: u8) -> u8 {
-        0
-    }
-    #[inline(always)]
-    fn u32(_: u32) -> u32 {
-        0
-    }
-    #[inline(always)]
-    fn i16(_: i16) -> i16 {
-        0
-    }
-    #[inline(always)]
-    fn i32(_: i32) -> i32 {
-        0
-    }
-    #[inline(always)]
-    fn i64(_: i64) -> i64 {
-        0
     }
     #[inline(always)]
     fn f8e4m3(v: f8e4m3) -> f8e4m3 {
@@ -730,26 +660,6 @@ impl UnaryOpT for Sigmoid {
         1.0 / (1.0 + (-v).exp())
     }
     #[inline(always)]
-    fn u8(_: u8) -> u8 {
-        0
-    }
-    #[inline(always)]
-    fn u32(_: u32) -> u32 {
-        0
-    }
-    #[inline(always)]
-    fn i16(_: i16) -> i16 {
-        0
-    }
-    #[inline(always)]
-    fn i32(_: i32) -> i32 {
-        0
-    }
-    #[inline(always)]
-    fn i64(_: i64) -> i64 {
-        0
-    }
-    #[inline(always)]
     fn f8e4m3(v: f8e4m3) -> f8e4m3 {
         f8e4m3::from_f32(Self::f32(v.to_f32()))
     }
@@ -774,6 +684,13 @@ impl UnaryOpT for Abs {
         v.abs()
     }
     #[inline(always)]
+    fn f8e4m3(v: f8e4m3) -> f8e4m3 {
+        v.abs()
+    }
+}
+
+impl IntUnaryOpT for Abs {
+    #[inline(always)]
     fn u8(v: u8) -> u8 {
         v
     }
@@ -783,19 +700,15 @@ impl UnaryOpT for Abs {
     }
     #[inline(always)]
     fn i16(v: i16) -> i16 {
-        v.abs()
+        v.wrapping_abs()
     }
     #[inline(always)]
     fn i32(v: i32) -> i32 {
-        v.abs()
+        v.wrapping_abs()
     }
     #[inline(always)]
     fn i64(v: i64) -> i64 {
-        v.abs()
-    }
-    #[inline(always)]
-    fn f8e4m3(v: f8e4m3) -> f8e4m3 {
-        v.abs()
+        v.wrapping_abs()
     }
 }
 
@@ -818,6 +731,13 @@ impl UnaryOpT for Ceil {
         v.ceil()
     }
     #[inline(always)]
+    fn f8e4m3(v: f8e4m3) -> f8e4m3 {
+        v.ceil()
+    }
+}
+
+impl IntUnaryOpT for Ceil {
+    #[inline(always)]
     fn u8(v: u8) -> u8 {
         v
     }
@@ -836,10 +756,6 @@ impl UnaryOpT for Ceil {
     #[inline(always)]
     fn i64(v: i64) -> i64 {
         v
-    }
-    #[inline(always)]
-    fn f8e4m3(v: f8e4m3) -> f8e4m3 {
-        v.ceil()
     }
 }
 
@@ -862,6 +778,13 @@ impl UnaryOpT for Floor {
         v.floor()
     }
     #[inline(always)]
+    fn f8e4m3(v: f8e4m3) -> f8e4m3 {
+        v.floor()
+    }
+}
+
+impl IntUnaryOpT for Floor {
+    #[inline(always)]
     fn u8(v: u8) -> u8 {
         v
     }
@@ -880,10 +803,6 @@ impl UnaryOpT for Floor {
     #[inline(always)]
     fn i64(v: i64) -> i64 {
         v
-    }
-    #[inline(always)]
-    fn f8e4m3(v: f8e4m3) -> f8e4m3 {
-        v.floor()
     }
 }
 
@@ -906,6 +825,13 @@ impl UnaryOpT for Round {
         v.round()
     }
     #[inline(always)]
+    fn f8e4m3(v: f8e4m3) -> f8e4m3 {
+        v.round()
+    }
+}
+
+impl IntUnaryOpT for Round {
+    #[inline(always)]
     fn u8(v: u8) -> u8 {
         v
     }
@@ -924,10 +850,6 @@ impl UnaryOpT for Round {
     #[inline(always)]
     fn i64(v: i64) -> i64 {
         v
-    }
-    #[inline(always)]
-    fn f8e4m3(v: f8e4m3) -> f8e4m3 {
-        v.round()
     }
 }
 
@@ -948,26 +870,6 @@ impl UnaryOpT for GeluErf {
     #[inline(always)]
     fn f64(v: f64) -> f64 {
         (crate::cpu::erf::erf_f64(v * std::f64::consts::FRAC_1_SQRT_2) + 1.) * 0.5 * v
-    }
-    #[inline(always)]
-    fn u8(_: u8) -> u8 {
-        0
-    }
-    #[inline(always)]
-    fn u32(_: u32) -> u32 {
-        0
-    }
-    #[inline(always)]
-    fn i16(_: i16) -> i16 {
-        0
-    }
-    #[inline(always)]
-    fn i32(_: i32) -> i32 {
-        0
-    }
-    #[inline(always)]
-    fn i64(_: i64) -> i64 {
-        0
     }
     #[inline(always)]
     fn f8e4m3(v: f8e4m3) -> f8e4m3 {
@@ -994,6 +896,13 @@ impl UnaryOpT for Relu {
         v.max(0f64)
     }
     #[inline(always)]
+    fn f8e4m3(v: f8e4m3) -> f8e4m3 {
+        v.max(f8e4m3::ZERO)
+    }
+}
+
+impl IntUnaryOpT for Relu {
+    #[inline(always)]
     fn u8(v: u8) -> u8 {
         v
     }
@@ -1012,10 +921,6 @@ impl UnaryOpT for Relu {
     #[inline(always)]
     fn i64(v: i64) -> i64 {
         v.max(0)
-    }
-    #[inline(always)]
-    fn f8e4m3(v: f8e4m3) -> f8e4m3 {
-        v.max(f8e4m3::ZERO)
     }
 }
 
@@ -1038,6 +943,19 @@ impl UnaryOpT for Sign {
         f64::from(v > 0.) - f64::from(v < 0.)
     }
     #[inline(always)]
+    fn f8e4m3(v: f8e4m3) -> f8e4m3 {
+        if v > f8e4m3::ZERO {
+            f8e4m3::ONE
+        } else if v < f8e4m3::ZERO {
+            -f8e4m3::ONE
+        } else {
+            f8e4m3::ZERO
+        }
+    }
+}
+
+impl IntUnaryOpT for Sign {
+    #[inline(always)]
     fn u8(v: u8) -> u8 {
         u8::min(1, v)
     }
@@ -1056,15 +974,5 @@ impl UnaryOpT for Sign {
     #[inline(always)]
     fn i64(v: i64) -> i64 {
         (v > 0) as i64 - (v < 0) as i64
-    }
-    #[inline(always)]
-    fn f8e4m3(v: f8e4m3) -> f8e4m3 {
-        if v > f8e4m3::ZERO {
-            f8e4m3::ONE
-        } else if v < f8e4m3::ZERO {
-            -f8e4m3::ONE
-        } else {
-            f8e4m3::ZERO
-        }
     }
 }
