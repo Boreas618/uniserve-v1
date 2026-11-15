@@ -53,6 +53,20 @@ HOST_CACHE_GIB = 16
 #: closes.
 FOLLOWER_EXIT_S = 120.0
 
+#: How long the second host's transfer calibration may take, in seconds: it
+#: times a few copies of each of its paths (``storage-server calibrate``).
+CALIBRATION_S = 600.0
+
+
+@dataclasses.dataclass(frozen=True)
+class Follower:
+    """A deployment's second-host daemon: its runtime directory there, where
+    its Storage Server's socket lies (``storage-server`` commands run there
+    with ``XDG_RUNTIME_DIR`` set to it).
+    """  # noqa: D205
+
+    runtime: str
+
 
 @dataclasses.dataclass(frozen=True)
 class Settings:
@@ -61,6 +75,24 @@ class Settings:
     time_scale: float
     serve_set: tuple[str, ...]
     engine: str | None
+
+
+def two_host_leader(host: RemoteHost) -> tuple[str, ...]:
+    """The options of the leader of a deployment over this host and `host`:
+    node ``rank-0`` of two, which binds its join endpoint at the address
+    `host` reaches this host at on a port it picks, and reports it in its
+    listening record (:meth:`Deployments.follower`).
+    """  # noqa: D205
+    return (
+        "--nnodes",
+        "2",
+        "--node-rank",
+        "0",
+        "--dist-init-addr",
+        f"{host.leader_address}:0",
+        "--host-identity",
+        "rank-0",
+    )
 
 
 @contextmanager
@@ -146,22 +178,30 @@ class Deployments:
         self.lease = lease
         self.directory = directory
 
+    def assignments(self) -> list[str]:
+        """The ``PATH=VALUE`` assignments every deployment of the run
+        states: its engine package (``--engine``) and its ``--serve-set``,
+        as a deployment that a model-less node brings up (``PUT
+        /admin/config``) states them too.
+        """  # noqa: D205
+        engine = (
+            [f'worker_config.engine="{self.settings.engine}"']
+            if self.settings.engine is not None
+            else []
+        )
+        return [*engine, *self.settings.serve_set]
+
     def options(self, build_socket: str | None = None) -> list[str]:
         """The options every deployment of the run states after its own: the
-        Build Server at `build_socket` (the run's by default), the run's
-        engine package and its assignments.
+        Build Server at `build_socket` (the run's by default) and the run's
+        :meth:`assignments`.
         """  # noqa: D205
         if build_socket is None and self.build_server is not None:
             build_socket = str(self.build_server.socket)
         stated: list[str] = []
         if build_socket is not None:
             stated += ["--set", f'build_config.socket="{build_socket}"']
-        if self.settings.engine is not None:
-            stated += [
-                "--set",
-                f'worker_config.engine="{self.settings.engine}"',
-            ]
-        for assignment in self.settings.serve_set:
+        for assignment in self.assignments():
             stated += ["--set", assignment]
         return stated
 
@@ -197,6 +237,7 @@ class Deployments:
         serving: bool = True,
         host_gib: int | None = HOST_CACHE_GIB,
         runtime: Path | None = None,
+        calibration: Path | None = None,
     ) -> Iterator[Server]:
         """Serve a deployment of `model` with `options` until the block ends,
         once its readiness record states it serves (with `serving` unset,
@@ -217,12 +258,21 @@ class Deployments:
             runtime: A runtime directory the caller owns
                 (:func:`runtime_directory`), for a case whose deployments
                 share their Storage Server; a fresh one by default.
+            calibration: The transfer calibration its Storage Server copies
+                by (:meth:`calibration`), for a deployment that transfers;
+                without one its Storage Server runs no Transfer Server.
         """  # noqa: D205
         sized = (
             ("--set", f"kv_cache_config.host_gib={host_gib}")
             if host_gib is not None
             else ()
         )
+        if calibration is not None:
+            sized = (
+                *sized,
+                "--set",
+                f'storage_config.transfer_calibration="{calibration}"',
+            )
         with ExitStack() as owned:
             if runtime is None:
                 runtime = owned.enter_context(
@@ -240,6 +290,31 @@ class Deployments:
             server.wait("serving" if serving else "listening", timeout_s)
             yield server
 
+    def calibration(self, *, reads: bool = False) -> Path:
+        """The transfer calibration of the case's GPUs and this host's
+        storage, which ``uniserve storage-server calibrate`` measures on the
+        leased GPUs (and with `reads` NIXL's READs through the host's RDMA
+        ports), written into the case's directory once per case.
+        """  # noqa: D205
+        calibration = self.directory / "transfer-calibration.json"
+        if not calibration.exists():
+            declared = {}
+            if self.lease is not None:
+                declared["CUDA_VISIBLE_DEVICES"] = self.lease.visible
+            subprocess.run(
+                [
+                    str(self.uniserve),
+                    "storage-server",
+                    "calibrate",
+                    "--output",
+                    str(calibration),
+                    *(["--reads"] if reads else []),
+                ],
+                env=environment(**declared),
+                check=True,
+            )
+        return calibration
+
     @contextmanager
     def follower(
         self,
@@ -249,21 +324,26 @@ class Deployments:
         *options: str,
         timeout_s: float | None = None,
         devices: Sequence[int] | None = None,
+        calibration: Path | None = None,
+        reads: bool = False,
         name: str = "follower",
-    ) -> Iterator[None]:
+    ) -> Iterator[Follower]:
         """The daemon of a deployment's second host, joining `leader` as
         node ``rank-1`` with `options` after its own, until the block ends.
 
         `leader` is a leader started with ``serving=False``: its listening
         record states the endpoint its members join at, and it serves once
-        this member joined (within `timeout_s` seconds, scaled, when stated),
-        which this
-        waits for before the block begins. The daemon runs on `devices` of
-        the host (all of its GPUs without them) under a runtime directory of
-        its own there, at a Build Server of its own there
-        (:func:`remote_build_server`). On exit the leader stops first; the
-        daemon ends when the leader's connection closes, which this waits
-        for, and a daemon that outlives its leader fails the case.
+        this member joined (within `timeout_s` seconds, scaled, when
+        stated), which this waits for before the block begins. The daemon
+        runs on `devices` of the host (all of its GPUs without them) under a
+        runtime directory of its own there, at a Build Server of its own
+        there (:func:`remote_build_server`). A deployment that names a
+        transfer calibration names it on every host it serves on, so with
+        `calibration` (the path the leader's options name) the host's own is
+        measured at that path there first, with NIXL's READs when `reads`.
+        On exit the leader stops first; the daemon ends when the leader's
+        connection closes, which this waits for, and a daemon that outlives
+        its leader fails the case.
         """  # noqa: D205
         with ExitStack() as owned:
             runtime = owned.enter_context(host.runtime_directory())
@@ -273,6 +353,20 @@ class Deployments:
             declared = {"XDG_RUNTIME_DIR": runtime}
             if devices is not None:
                 declared["CUDA_VISIBLE_DEVICES"] = ",".join(map(str, devices))
+            if calibration is not None:
+                host.run("mkdir", "-p", str(calibration.parent))
+                host.run(
+                    "env",
+                    *(f"{key}={value}" for key, value in declared.items()),
+                    "uniserve",
+                    "storage-server",
+                    "calibrate",
+                    "--output",
+                    str(calibration),
+                    *(["--reads"] if reads else []),
+                    timeout_s=CALIBRATION_S,
+                )
+                owned.callback(host.run, "rm", "-f", str(calibration))
             argv = [
                 "uniserve",
                 "serve",
@@ -293,7 +387,7 @@ class Deployments:
             owned.callback(stop_remote_storage_server, host, runtime)
             try:
                 leader.wait("serving", timeout_s)
-                yield
+                yield Follower(runtime=runtime)
             finally:
                 leader.stop()
                 try:

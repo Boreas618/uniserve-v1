@@ -30,6 +30,7 @@ import tomllib
 from collections.abc import Iterator
 from contextlib import contextmanager
 from pathlib import Path
+from typing import Any
 
 from uniserve_testing.servers import Server, environment, launch, socket_path
 
@@ -134,7 +135,15 @@ class BuildServer:
             executable=Path(executable) if executable is not None else None,
         )
 
-    def _command(self, command: str, *arguments: str) -> dict:
+    def list(self) -> list[dict]:
+        """Every package revision the server installed, with the modules
+        its store holds of it, as ``build-server list --json`` prints them:
+        each ``{op, backend, revision, modules}``, each module ``{target,
+        descriptor, form, interface_version}``.
+        """  # noqa: D205
+        return self._command("list")
+
+    def _command(self, command: str, *arguments: str) -> Any:
         """The JSON answer of one ``build-server`` command at the server."""
         completed = subprocess.run(
             [
@@ -210,6 +219,24 @@ def build_server(
     finally:
         server.stop()
         shutil.rmtree(runtime, ignore_errors=True)
+
+
+@contextmanager
+def tree_build_server(
+    uniserve: Path, repository: Path, work: Path, *, scale: float = 1.0
+) -> Iterator[BuildServer]:
+    """A Build Server (:func:`build_server`) with every package of the tree
+    installed (:func:`tree_packages`), until the block ends.
+
+    Installing copies a package's source and registers its revision; a
+    deployment's profile runs name every descriptor key it launches, and
+    the server builds each on its first prepare, so a deployment's start
+    builds what it launches and later deployments reuse it.
+    """  # noqa: D205
+    with build_server(uniserve, work, scale=scale) as server:
+        for package in tree_packages(repository):
+            server.install(package)
+        yield server
 
 
 def tree_packages(repository: Path) -> list[Path]:

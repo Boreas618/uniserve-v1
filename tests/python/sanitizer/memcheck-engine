@@ -1,7 +1,7 @@
 #!/bin/bash
 # The executable of the `memcheck` engine package: a main process run under
 # compute-sanitizer's memcheck. A deployment selects the package with
-# `worker_config.engine=memcheck` (the e2e servers through UNISERVE_ENGINE),
+# `worker_config.engine=memcheck` (the e2e servers through `--engine memcheck`),
 # and each main process writes its memory errors to $SANITIZER_LOGS and exits
 # with status 86 on one. $UNISERVE_MEMCHECK_TARGET names the `uniserve-engine`
 # executable to run; $COMPUTE_SANITIZER, the sanitizer (`compute-sanitizer` on

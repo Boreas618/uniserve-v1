@@ -13,63 +13,85 @@ the image-only request that fits. Every deployment serves under CUDA
 graphs: a request with conditions denoises in a captured layout widened to
 the deployment's condition capacity, and the encoding of reference media
 whose shape no graph holds runs eagerly. Reference media are read from
-``file://`` URLs under
-``--media-directory``. Every served response is a complete MP4 at
-the size and frame count the request resolves to.
+``file://`` URLs under the deployment's ``media_config.directory``. Every
+served response is a complete MP4 at the size and frame count the request
+resolves to.
 """
 
 from __future__ import annotations
 
+import importlib.resources
 import json
-import re
-import time
+import shutil
+from contextlib import AbstractContextManager
 from pathlib import Path
+from typing import Any
 
-import httpx
 import pytest
-
-from tests.python.e2e.http_helpers import (
-    H3_CHECKPOINT,
-    MINIMAX_H3_CHECKPOINT,
-    engine_selection,
-    host_asset,
-    require_uniserve_binary,
-    server_process,
-)
-from uniserve_eval.transport.video import inspect_video_bytes
+from uniserve_testing import assets, media
+from uniserve_testing.deployments import Deployments
+from uniserve_testing.servers import Server
 
 pytestmark = [
     pytest.mark.e2e,
     pytest.mark.gpu,
     pytest.mark.model("minimax_h3"),
-    # Every deployment of the module serves on the host's four GPUs.
-    pytest.mark.gpus(4),
 ]
 
-ROOT = Path(__file__).resolve().parents[3]
-WORKLOADS = ROOT / "uniserve_eval" / "workloads" / "minimax_h3"
+#: The evaluator's packaged MiniMax-H3 workloads.
+WORKLOADS = (
+    importlib.resources.files("uniserve_eval") / "workloads" / "minimax_h3"
+)
+
+#: The reference media the workloads name, by their paths in it.
+INPUTS = assets.CHECKPOINTS["minimax-h3-inputs"]
+
+#: The size every request below resolves to: the 16:9 keyframe's canvas, and
+#: the first size the reference deployments serve.
+SIZE = "1344x768"
 
 
-def _request(workload: str, inputs: Path) -> dict:
-    """The seed-42 request of a packaged referenced workload.
+@pytest.fixture
+def inputs(tmp_path: Path) -> Path:
+    """The case's media directory (``media_config.directory``), by its
+    canonical path, into which :func:`_request` copies the reference media
+    its requests read.
+    """  # noqa: D205
+    directory = (tmp_path / "inputs").resolve()
+    directory.mkdir()
+    return directory
+
+
+def _request(workload: str, inputs: Path) -> dict[str, Any]:
+    """The seed-42 request of a packaged referenced workload, its reference
+    media copied into the media directory `inputs`.
 
     A workload's warmup manifest holds its seed-42 request: the prompt, the
-    frame count and the reference media in request order, named relative to
-    the inputs directory. The request states no size, so the server's own
-    default holds: the first keyframe's canvas for fl2va, the deployment's
-    first served size for ref2va.
-    """
+    frame count and the reference media in request order, named by their
+    paths in :data:`INPUTS`. The server reads a ``file://`` reference only at
+    a canonical path inside its media directory, and the Hugging Face cache
+    holds a file as a link into its blob store, so each medium is copied
+    from the cache into `inputs`. The request states no size, so the
+    server's own default holds: the first keyframe's canvas for fl2va, the
+    deployment's first served size for ref2va.
+    """  # noqa: D205
     manifest = WORKLOADS / f"{workload}-warmup.jsonl"
     row = json.loads(manifest.read_text().splitlines()[0])
-    references = [
-        {
-            **{
-                key: value for key, value in reference.items() if key != "media"
-            },
-            "url": f"file://{(inputs / reference['media']).resolve()}",
-        }
-        for reference in row["input_references"]
-    ]
+    references = []
+    for reference in row["input_references"]:
+        path = inputs / reference["media"]
+        path.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(INPUTS.file(reference["media"]), path)
+        references.append(
+            {
+                **{
+                    key: value
+                    for key, value in reference.items()
+                    if key != "media"
+                },
+                "url": f"file://{path}",
+            }
+        )
     return {
         "model": "MiniMax-H3",
         "prompt": row["prompt"],
@@ -79,191 +101,135 @@ def _request(workload: str, inputs: Path) -> dict:
     }
 
 
-def _root() -> str:
-    model = str(host_asset("UNISERVE_MINIMAX_H3_MODEL", MINIMAX_H3_CHECKPOINT))
-    return model
-
-
-def _inputs() -> Path:
-    inputs = host_asset(
-        "UNISERVE_MINIMAX_H3_INPUTS",
-        "the protocol inputs directory holding media/",
-    )
-    if not (inputs / "media").is_dir():
-        pytest.fail(f"UNISERVE_MINIMAX_H3_INPUTS: {inputs} holds no media/")
-    return inputs.resolve()
-
-
-def _command(model, deployment, inputs, options) -> list[str]:
-    return [
-        str(require_uniserve_binary()),
-        "serve",
-        "--model-dir",
-        model,
-        "--config",
-        str(ROOT / "configs" / "minimax_h3" / deployment),
-        *engine_selection(),
+def _serve(
+    deployments: Deployments,
+    repository: Path,
+    checkpoint: str,
+    deployment: str,
+    inputs: Path,
+    *options: str,
+) -> AbstractContextManager[Server]:
+    """The deployment file `deployment` of ``configs/minimax_h3`` serving
+    the checkpoint `checkpoint` (:data:`assets.CHECKPOINTS`) with `options`,
+    reading reference media from `inputs`.
+    """  # noqa: D205
+    return deployments.serve(
         "--served-model-name",
         "MiniMax-H3",
+        "--config",
+        str(repository / "configs" / "minimax_h3" / deployment),
         "--set",
         f'media_config.directory="{inputs}"',
         *options,
-    ]
-
-
-def _check_media(response, *, width, height, frames) -> None:
-    assert response.status_code == 200, response.text
-    # The server reports the shape it generated.
-    assert (
-        response.headers["x-video-size"],
-        response.headers["x-video-num-frames"],
-        response.headers["x-video-fps"],
-    ) == (f"{width}x{height}", str(frames), "24")
-    media = inspect_video_bytes(
-        response.content, declared_mime=response.headers["content-type"]
+        model=assets.CHECKPOINTS[checkpoint].model,
     )
-    assert (media.width, media.height) == (width, height)
-    assert media.frame_count == frames
-    assert media.fps_numerator == 24 * media.fps_denominator
-    assert media.video_codec == "h264"
-    assert (media.audio_codec, media.audio_channels) == ("aac", 2)
-    assert media.audio_sample_rate == 32_000
-    assert abs(media.audio_duration_s - frames / 24) <= 1 / 24
-    assert media.video_variance > 0 and media.audio_rms > 0
 
 
-def test_base_first_frame_request(tmp_path: Path) -> None:
-    model, inputs = _root(), _inputs()
-    # The official first-frame presentation holds 1935 text rows and its
-    # keyframe 1008 condition rows; without a stated condition capacity the
-    # deployment provisions the two keyframes a request may bring.
-    options = [
-        "--set",
-        "video_config.max_seconds=8",
-        "--max-model-len",
-        "2048",
-        "--set",
-        "video_config.text_capacities=[2048]",
-    ]
+# The official first-frame presentation holds 1935 text rows and its
+# keyframe 1008 condition rows; without a stated condition capacity the
+# deployment provisions the two keyframes a request may bring.
+FIRST_FRAME_OPTIONS = (
+    "--set",
+    "video_config.max_seconds=8",
+    "--max-model-len",
+    "2048",
+    "--set",
+    "video_config.text_capacities=[2048]",
+)
+
+
+@pytest.mark.gpus(4)
+def test_base_first_frame_request(
+    deployments: Deployments, repository: Path, inputs: Path, tmp_path: Path
+) -> None:
+    request = _request("w3", inputs)
     with (
-        server_process(
-            _command(model, "ulysses4.toml", inputs, options),
-            tmp_path / "server.log",
-            timeout_s=3600,
+        _serve(
+            deployments,
+            repository,
+            "minimax-h3",
+            "ulysses4.toml",
+            inputs,
+            *FIRST_FRAME_OPTIONS,
         ) as server,
-        httpx.Client(timeout=3600) as client,
+        media.api(server) as api,
     ):
-        base = server.base_url
-        client.base_url = base
-        video = client.get("/v1/capabilities").json()["video"]["model"]
+        video = api.get("/v1/capabilities").json()["video"]["model"]
         assert set(video["tasks"]) == {"t2va", "fl2va"}
 
-        response = client.post("/v1/videos/sync", json=_request("w3", inputs))
+        response = api.post("/v1/videos/sync", json=request)
         (tmp_path / "fl2va.mp4").write_bytes(response.content)
         # The 16:9 keyframe resolves the 1344x768 canvas of the 192 frames
         # the row states.
-        _check_media(response, width=1344, height=768, frames=192)
+        media.assert_generated(
+            response, size=SIZE, frames=192, media_format=media.MINIMAX_H3
+        )
 
 
-def test_fasth3_first_frame_request(tmp_path: Path) -> None:
+@pytest.mark.gpus(4)
+def test_fasth3_first_frame_request(
+    deployments: Deployments, repository: Path, inputs: Path, tmp_path: Path
+) -> None:
     """A FastH3 DMD student serves its partition's keyframe requests."""
-    model = str(host_asset("UNISERVE_H3_MODEL", H3_CHECKPOINT))
-    inputs = _inputs()
+    request = _request("w3", inputs)
     # The student generates 16:9 at 768p; eight seconds and a 2048-token
     # prompt capacity admit W3, and the deployment provisions the two
     # keyframes a request may bring in tiles of their own.
-    options = [
-        "--set",
-        'video_config.sizes=["1344x768"]',
-        "--set",
-        "video_config.max_seconds=8",
-        "--max-model-len",
-        "2048",
-        "--set",
-        "video_config.text_capacities=[2048]",
-    ]
     with (
-        server_process(
-            _command(model, "ulysses4.toml", inputs, options),
-            tmp_path / "server.log",
-            timeout_s=3600,
+        _serve(
+            deployments,
+            repository,
+            "fasth3",
+            "ulysses4.toml",
+            inputs,
+            "--set",
+            f'video_config.sizes=["{SIZE}"]',
+            *FIRST_FRAME_OPTIONS,
         ) as server,
-        httpx.Client(timeout=3600) as client,
+        media.api(server) as api,
     ):
-        base = server.base_url
-        client.base_url = base
-        video = client.get("/v1/capabilities").json()["video"]["model"]
+        video = api.get("/v1/capabilities").json()["video"]["model"]
         assert video["tasks"] == ["t2va", "fl2va"]
 
-        response = client.post("/v1/videos/sync", json=_request("w3", inputs))
+        response = api.post("/v1/videos/sync", json=request)
         (tmp_path / "fl2va.mp4").write_bytes(response.content)
-        _check_media(response, width=1344, height=768, frames=192)
+        media.assert_generated(
+            response, size=SIZE, frames=192, media_format=media.MINIMAX_H3
+        )
 
 
-def _graph_replays(client: httpx.Client) -> float:
-    """The workers' graph replays once their counters stop moving.
-
-    Worker statistics reach the registry with the engine's periodic
-    snapshot, so the counter is read until three reads agree.
-    """
-
-    def read() -> float:
-        response = client.get("/metrics")
-        response.raise_for_status()
-        total = 0.0
-        for line in response.text.splitlines():
-            match = re.match(
-                r"uniserve:worker_graph_runtime_mode_counts_total"
-                r"\{([^}]*)\} (\S+)",
-                line,
-            )
-            if match and 'mode="graph_replay"' in match.group(1):
-                total += float(match.group(2))
-        return total
-
-    current, stable = read(), 0
-    deadline = time.monotonic() + 120
-    while stable < 3:
-        if time.monotonic() > deadline:
-            pytest.fail("worker graph counters did not settle")
-        time.sleep(1)
-        value = read()
-        stable = stable + 1 if value == current else 0
-        current = value
-    return current
-
-
-def _reference_requests(command, tmp_path, *, inputs):
-    """Serve ``command`` and check W4 and W5 against it; each request's
-    denoising steps replay captured graphs.
+def _reference_requests(
+    server: Server, requests: dict[str, dict[str, Any]], directory: Path
+) -> None:
+    """Send W4 and W5 (`requests`, by workload) to the reference deployment
+    `server`; each serves complete media whose denoising steps replay
+    captured graphs.
     """  # noqa: D205
-    with (
-        server_process(
-            command, tmp_path / "server.log", timeout_s=3600
-        ) as server,
-        httpx.Client(timeout=3600) as client,
-    ):
-        base = server.base_url
-        client.base_url = base
-        video = client.get("/v1/capabilities").json()["video"]["model"]
+    with media.api(server) as api:
+        video = api.get("/v1/capabilities").json()["video"]["model"]
         assert video["tasks"] == ["ref2va"]
         steps = video["num_inference_steps"]
 
-        for name in ("w4", "w5"):
-            before = _graph_replays(client)
-            response = client.post(
-                "/v1/videos/sync", json=_request(name, inputs)
-            )
-            (tmp_path / f"{name}.mp4").write_bytes(response.content)
+        for name, request in requests.items():
+            before = media.graph_dispatches(server, "graph_replay")[
+                "graph_replay"
+            ]
+            response = api.post("/v1/videos/sync", json=request)
+            (directory / f"{name}.mp4").write_bytes(response.content)
             # References take the deployment's first served size, 1344x768,
             # at the 124 frames the row states.
-            _check_media(response, width=1344, height=768, frames=124)
-            assert _graph_replays(client) - before >= steps, name
+            media.assert_generated(
+                response, size=SIZE, frames=124, media_format=media.MINIMAX_H3
+            )
+            after = media.graph_dispatches(server, "graph_replay")[
+                "graph_replay"
+            ]
+            assert after - before >= steps, name
 
 
 # The official video-plus-audio presentation holds 6913 text rows and its
 # references about 38k condition rows.
-REFERENCE_OPTIONS = [
+REFERENCE_OPTIONS = (
     "--set",
     "video_config.max_seconds=5",
     "--max-model-len",
@@ -272,16 +238,23 @@ REFERENCE_OPTIONS = [
     "video_config.text_capacities=[8192]",
     "--set",
     "video_config.max_condition_rows=40960",
-]
+)
 
 
-def test_base_reference_requests(tmp_path: Path) -> None:
-    model, inputs = _root(), _inputs()
-    _reference_requests(
-        _command(model, "ulysses4-reference.toml", inputs, REFERENCE_OPTIONS),
-        tmp_path,
-        inputs=inputs,
-    )
+@pytest.mark.gpus(4)
+def test_base_reference_requests(
+    deployments: Deployments, repository: Path, inputs: Path, tmp_path: Path
+) -> None:
+    requests = {name: _request(name, inputs) for name in ("w4", "w5")}
+    with _serve(
+        deployments,
+        repository,
+        "minimax-h3",
+        "ulysses4-reference.toml",
+        inputs,
+        *REFERENCE_OPTIONS,
+    ) as server:
+        _reference_requests(server, requests, tmp_path)
 
 
 # The OmniRef reference DiT packs each condition into whole 128-row tiles,
@@ -289,7 +262,7 @@ def test_base_reference_requests(tmp_path: Path) -> None:
 # same video-plus-audio request takes 47,104 rows there: its 37 x 24 x 42
 # reference video fills 10 x 6 x 6 tiles and its soundtrack and audio
 # reference 4 tiles each, against 38,124 rows packed densely.
-OMNIREF_OPTIONS = [
+OMNIREF_OPTIONS = (
     "--set",
     "video_config.max_seconds=5",
     "--max-model-len",
@@ -298,33 +271,25 @@ OMNIREF_OPTIONS = [
     "video_config.text_capacities=[8192]",
     "--set",
     "video_config.max_condition_rows=49152",
-]
+)
 
 
-def _omniref() -> str:
-    """The OmniRef export the environment names.
-
-    The export reads the parts it omits from the Hugging Face cache at
-    the base revision it pins.
-    """
-    return str(
-        host_asset("UNISERVE_MINIMAX_H3_OMNIREF", "a FastH3 OmniRef export")
-    )
-
-
-def test_omniref_reference_requests(tmp_path: Path) -> None:
-    inputs = _inputs()
-    export = _omniref()
-    _reference_requests(
-        _command(
-            export,
-            "ulysses4-reference.toml",
-            inputs,
-            OMNIREF_OPTIONS,
-        ),
-        tmp_path,
-        inputs=inputs,
-    )
+@pytest.mark.gpus(4)
+def test_omniref_reference_requests(
+    deployments: Deployments, repository: Path, inputs: Path, tmp_path: Path
+) -> None:
+    # The OmniRef export reads the parts it omits from the Hugging Face
+    # cache at the base revision it pins.
+    requests = {name: _request(name, inputs) for name in ("w4", "w5")}
+    with _serve(
+        deployments,
+        repository,
+        "fasth3-omniref",
+        "ulysses4-reference.toml",
+        inputs,
+        *OMNIREF_OPTIONS,
+    ) as server:
+        _reference_requests(server, requests, tmp_path)
 
 
 # The image-plus-audio request (W4) packs 7,808 condition rows on OmniRef when
@@ -334,7 +299,7 @@ def test_omniref_reference_requests(tmp_path: Path) -> None:
 # four (two tracks of 207 rows, 414 rows of audio latents). This deployment
 # states a 7,680-row condition capacity: each of W4's condition products fits
 # it and their packed rows do not. W4's image without its voice fits.
-SMALL_CAPACITY_OPTIONS = [
+SMALL_CAPACITY_OPTIONS = (
     "--set",
     "mm_processor_kwargs.enlarge_references=true",
     "--set",
@@ -345,35 +310,33 @@ SMALL_CAPACITY_OPTIONS = [
     "video_config.text_capacities=[8192]",
     "--set",
     "video_config.max_condition_rows=7680",
-]
+)
 
 
-def test_omniref_refuses_conditions_above_capacity(tmp_path: Path) -> None:
+@pytest.mark.gpus(4)
+def test_omniref_refuses_conditions_above_capacity(
+    deployments: Deployments, repository: Path, inputs: Path, tmp_path: Path
+) -> None:
     # Each of W4's condition products fits its bound, and the server counts
     # its conditions in the denoiser's tiles and refuses it; the deployment
     # then serves its image-only form.
-    inputs = _inputs()
-    export = _omniref()
-    command = _command(
-        export,
-        "ulysses4-reference.toml",
-        inputs,
-        SMALL_CAPACITY_OPTIONS,
-    )
     packed = _request("w4", inputs)
     image_only = {
         **packed,
         "input_references": packed["input_references"][:1],
     }
     with (
-        server_process(
-            command, tmp_path / "server.log", timeout_s=3600
+        _serve(
+            deployments,
+            repository,
+            "fasth3-omniref",
+            "ulysses4-reference.toml",
+            inputs,
+            *SMALL_CAPACITY_OPTIONS,
         ) as server,
-        httpx.Client(timeout=3600) as client,
+        media.api(server) as api,
     ):
-        base = server.base_url
-        client.base_url = base
-        refused = client.post("/v1/videos/sync", json=packed)
+        refused = api.post("/v1/videos/sync", json=packed)
         assert refused.status_code == 400, refused.text
         error = refused.json()["error"]
         assert error["type"] == "invalid_request_error", error
@@ -381,6 +344,8 @@ def test_omniref_refuses_conditions_above_capacity(tmp_path: Path) -> None:
         assert "7808" in message and "7680" in message, message
         assert "video_config.max_condition_rows" in message, message
 
-        served = client.post("/v1/videos/sync", json=image_only)
+        served = api.post("/v1/videos/sync", json=image_only)
         (tmp_path / "image_only.mp4").write_bytes(served.content)
-        _check_media(served, width=1344, height=768, frames=124)
+        media.assert_generated(
+            served, size=SIZE, frames=124, media_format=media.MINIMAX_H3
+        )

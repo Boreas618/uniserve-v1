@@ -35,83 +35,67 @@ Which main process serves before and after a kill is what ``GET
 /admin/status`` reports: the serving process's launch generation
 (``generation``) and the parked standby's (``standby``), which a promotion
 makes the serving one; ``GET /admin/config`` names the process of each
-launch generation (``processes``).
-
-Each test runs a Storage Server of its own: ``XDG_RUNTIME_DIR`` points the
-daemon at a directory of the test's, and the server the daemon starts there
-is stopped at the end.
+launch generation (``processes``). Each test's deployment runs a Storage
+Server of its own.
 """
 
 from __future__ import annotations
 
-import json
 import os
 import signal
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 import httpx
 import pytest
-
-from tests.python.e2e.http_helpers import (
-    ATTENTION_BACKEND,
-    admin_status,
-    dedicated_experts,
-    engine_selection,
-    granted_devices,
-    log_tail,
-    qwen3_checkpoint,
-    require_uniserve_binary,
-    runtime_directory,
-    server_process,
-    serving_engine,
-    wait_until,
-)
+from uniserve_testing import admin, chat, client
+from uniserve_testing.assets import CHECKPOINTS
+from uniserve_testing.deployments import Deployments
 
 pytestmark = [pytest.mark.e2e, pytest.mark.gpu, pytest.mark.model("qwen3")]
 
-SERVED_MODEL = "qwen3-relaunch"
-MAX_TOKENS = 16384
+NAME = "qwen3-relaunch"
 # Tokens the client reads before a process is killed.
 EARLY_TOKENS = 64
-PROMPT = (
+
+#: The count, greedy and with each token's logprob, whose tokens a stream
+#: and a later answer compare.
+COUNT = chat.body(
+    NAME,
     "Count from 1 to 5000, separated by commas and spaces. "
-    "Write only the numbers."
+    "Write only the numbers.",
+    16384,
+    logprobs=True,
+    return_tokens_as_token_ids=True,
+    **chat.GREEDY,
+    **chat.NO_THINKING,
 )
 
+#: Few captured graphs, so that an engine starts again while the count
+#: streams, and a small KV cache.
+OPTIONS = (
+    "--served-model-name",
+    NAME,
+    "--set",
+    "kv_cache_config.max_tokens=32768",
+    "--set",
+    "chat_config.reasoning_parser=none",
+    "--set",
+    "cuda_graph_config.prefill_token_sizes=[512]",
+    "--set",
+    "cuda_graph_config.decode_batch_sizes=[1, 2, 4, 8]",
+)
 
-def _body(stream: bool) -> dict:
-    body = {
-        "model": SERVED_MODEL,
-        "messages": [{"role": "user", "content": PROMPT}],
-        "chat_template_kwargs": {"enable_thinking": False},
-        "temperature": 0,
-        "top_p": 1.0,
-        "top_k": 0,
-        "min_p": 0.0,
-        "max_completion_tokens": MAX_TOKENS,
-        "logprobs": True,
-        "return_tokens_as_token_ids": True,
-    }
-    if stream:
-        body["stream"] = True
-        body["stream_options"] = {"include_usage": True}
-    return body
+#: How long a standby takes to park, in seconds (scaled): it starts as the
+#: deployment's engine did, but maps the weights the serving epoch holds
+#: instead of loading them, and captures the same few graphs.
+STANDBY_S = 900.0
 
-
-def _chunk_tokens(line: str) -> tuple[list[str], dict | None, bool]:
-    """The tokens and usage one SSE line carries, and whether it ends."""
-    if not line.startswith("data: "):
-        return [], None, False
-    if line == "data: [DONE]":
-        return [], None, True
-    chunk = json.loads(line[6:])
-    tokens = [
-        entry["token"]
-        for choice in chunk.get("choices", ())
-        for entry in (choice.get("logprobs") or {}).get("content") or ()
-    ]
-    return tokens, chunk.get("usage"), False
+#: How long the stream may wait for its next line, in seconds (scaled):
+#: across the kill, until another main process serves the request, which a
+#: relaunch starts as the deployment's engine started, on retained weights.
+KILL_GAP_S = 1800.0
 
 
 @dataclass
@@ -125,94 +109,59 @@ class Killed:
     """
 
     streamed: list[str]
-    usage: dict
+    usage: dict[str, Any] | None
     reference: list[str]
-    reference_usage: dict
-    before: dict
-    after: dict
+    reference_usage: dict[str, Any]
+    before: dict[str, Any]
+    after: dict[str, Any]
 
 
 def _stream_through_a_kill(
-    tmp_path: Path,
-    *,
-    options: tuple[str, ...] = (),
-    devices: str | None = None,
-    standby: bool = False,
+    deployments: Deployments, *options: str, standby: bool = False
 ) -> Killed:
     """Stream the count, killing the serving engine's process after the
     first tokens.
 
-    The server runs on `devices` with the extra `options`; with `standby`,
-    the stream starts once the deployment reports its standby parked.
+    The deployment serves with `options` beside :data:`OPTIONS`; with
+    `standby`, the stream starts once the deployment reports its standby
+    parked.
     """  # noqa: D205
-    command = [
-        str(require_uniserve_binary()),
-        "serve",
-        "--model-dir",
-        qwen3_checkpoint(),
-        "--served-model-name",
-        SERVED_MODEL,
-        "--host",
-        "127.0.0.1",
-        *engine_selection(),
-        "--set",
-        'dtype="bfloat16"',
-        "--set",
-        f'attention_backend="{ATTENTION_BACKEND}"',
-        "--set",
-        "kv_cache_config.max_tokens=32768",
-        "--set",
-        'chat_config.reasoning_parser="none"',
-        "--set",
-        "cuda_graph_config.prefill_token_sizes=[512]",
-        "--set",
-        "cuda_graph_config.decode_batch_sizes=[1, 2, 4, 8]",
-        *options,
-    ]
-    log = tmp_path / "server.log"
     streamed: list[str] = []
     usage = None
-    with runtime_directory(tmp_path / "storage-server.log") as runtime:
-        env = {
-            "CUDA_VISIBLE_DEVICES": devices or granted_devices(1),
-            "XDG_RUNTIME_DIR": str(runtime),
-        }
-        with server_process(command, log, timeout_s=900, env=env) as server:
-            base_url = server.base_url
-            if standby:
-                wait_until(
-                    lambda: admin_status(base_url)["deployment"]["standby"],
-                    900,
-                    "the deployment reported no parked standby",
-                    context=lambda: log_tail(log),
-                )
-            before = admin_status(base_url)["deployment"]
-            engine = serving_engine(base_url)["pid"]
-            with httpx.stream(
-                "POST",
-                f"{base_url}/v1/chat/completions",
-                json=_body(stream=True),
-                timeout=1800,
-            ) as response:
-                response.raise_for_status()
-                killed = False
-                for line in response.iter_lines():
-                    tokens, chunk_usage, done = _chunk_tokens(line)
-                    if done:
-                        break
-                    streamed.extend(tokens)
-                    usage = chunk_usage or usage
-                    if not killed and len(streamed) >= EARLY_TOKENS:
-                        os.kill(engine, signal.SIGKILL)
-                        killed = True
-            reply = httpx.post(
-                f"{base_url}/v1/chat/completions",
-                json=_body(stream=False),
-                timeout=900,
+    with deployments.serve(
+        *OPTIONS, *options, model=CHECKPOINTS["qwen3"].model
+    ) as server:
+        if standby:
+            # No event of the node's log announces a standby that parks: the
+            # status states it once it parked.
+            server.wait_until(
+                lambda: admin.status(server)["deployment"]["standby"],
+                STANDBY_S,
+                "the deployment reported no parked standby",
             )
-            reply.raise_for_status()
-            answer = reply.json()
-            after = admin_status(base_url)["deployment"]
+        before = admin.status(server)["deployment"]
+        engine = admin.serving_engine(server)["pid"]
+        with httpx.stream(
+            "POST",
+            f"{server.base_url}/v1/chat/completions",
+            json=chat.stream_options(COUNT),
+            timeout=server.scaled(KILL_GAP_S),
+        ) as response:
+            response.raise_for_status()
+            killed = False
+            for line in response.iter_lines():
+                tokens, line_usage, done = chat.stream_tokens(line)
+                if done:
+                    break
+                streamed.extend(tokens)
+                usage = line_usage or usage
+                if not killed and len(streamed) >= EARLY_TOKENS:
+                    os.kill(engine, signal.SIGKILL)
+                    killed = True
+        answer = chat.complete(
+            server.base_url, COUNT, server.scaled(chat.COMPLETION_S)
+        )
+        after = admin.status(server)["deployment"]
     return Killed(
         streamed=streamed,
         usage=usage,
@@ -236,8 +185,10 @@ def _continued(killed: Killed) -> None:
     assert killed.after["engine"] == "serving", killed.after
 
 
-def test_a_request_continues_after_its_engine_process_is_lost(tmp_path: Path):
-    killed = _stream_through_a_kill(tmp_path)
+def test_a_request_continues_after_its_engine_process_is_lost(
+    deployments: Deployments,
+):
+    killed = _stream_through_a_kill(deployments)
     _continued(killed)
     # The daemon started another engine process, which serves.
     assert killed.after["generation"] not in (
@@ -246,41 +197,38 @@ def test_a_request_continues_after_its_engine_process_is_lost(tmp_path: Path):
     ), (killed.before, killed.after)
 
 
-def _expert_epoch(topology: str, tmp_path: Path) -> tuple[str, ...]:
-    """The options of an expert epoch of two groups on two GPUs.
+def _expert_epoch(topology: str, directory: Path) -> tuple[str, ...]:
+    """The options of an expert epoch of two groups on the case's two GPUs.
 
     ``replicas``: two schedulers sharing their experts over the all-to-all.
-    ``dedicated``: attention and expert workers exchanging through DeepEP,
-    whose windows a suspended standby frees and its promotion rebuilds.
+    ``dedicated``: attention on the first GPU and the routed experts on the
+    second, exchanging through DeepEP, whose windows a suspended standby
+    frees and its promotion rebuilds; its deployment file is written into
+    `directory`.
     """
     if topology == "replicas":
         return ("--data-parallel-size", "2")
-    return (
-        "--config",
-        str(dedicated_experts(tmp_path)),
-        "--set",
-        'moe_config.exchange="deepep"',
-    )
+    return client.dedicated_experts(directory)
 
 
 @pytest.mark.gpus(2)
 @pytest.mark.parametrize("topology", ["replicas", "dedicated"])
 @pytest.mark.parametrize("standby_storage", ["resident", "suspended"])
 def test_an_expert_epoch_promotes_its_standby_when_its_engine_is_lost(
-    tmp_path: Path, standby_storage: str, topology: str
+    deployments: Deployments,
+    tmp_path: Path,
+    standby_storage: str,
+    topology: str,
 ):
     killed = _stream_through_a_kill(
-        tmp_path,
-        options=(
-            *_expert_epoch(topology, tmp_path),
-            "--set",
-            "moe_config.expert_parallel=true",
-            "--set",
-            "worker_config.standby=true",
-            "--set",
-            f'worker_config.standby_storage="{standby_storage}"',
-        ),
-        devices=granted_devices(2),
+        deployments,
+        *_expert_epoch(topology, tmp_path),
+        "--set",
+        "moe_config.expert_parallel=true",
+        "--set",
+        "worker_config.standby=true",
+        "--set",
+        f'worker_config.standby_storage="{standby_storage}"',
         standby=True,
     )
     _continued(killed)

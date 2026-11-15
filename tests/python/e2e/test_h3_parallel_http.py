@@ -2,87 +2,39 @@
 
 from __future__ import annotations
 
-import io
+import http.client
 import json
-import os
+import urllib.parse
+from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import ExitStack
-from itertools import zip_longest
 from pathlib import Path
+from typing import Any
 
-import av
 import httpx
-import numpy as np
 import pytest
-from transformers import AutoTokenizer
-
-from tests.python.e2e.build_server import remote_build_server
-from tests.python.e2e.http_helpers import (
-    H3_CHECKPOINT,
-    engine_selection,
-    granted_devices,
-    host_asset,
-    require_uniserve_binary,
-    second_host,
-    server_process,
-    t2va_request,
-    written_deployment,
-)
-from uniserve_eval.datasets.minimax_h3 import MiniMaxH3Dataset
-from uniserve_eval.transport.video import inspect_video_bytes
-from uniserve_eval.types import (
-    BenchmarkPoint,
-    LoadConfig,
-    MetricDefinition,
-    TaskName,
-    VideoConfig,
-)
+from uniserve_testing import admin, assets, client, media
+from uniserve_testing.deployments import Deployments, two_host_leader
+from uniserve_testing.remote import RemoteHost
+from uniserve_testing.servers import Server
 
 pytestmark = [
     pytest.mark.e2e,
     pytest.mark.gpu,
     pytest.mark.model("minimax_h3"),
-    # Every layout addresses up to the host's four GPUs.
-    pytest.mark.gpus(4),
 ]
 
+#: The GPUs every case leases on this host, and that a two-host case's
+#: layout addresses on each of its hosts.
+HOST_GPUS = 4
 
-def _assert_media_values_close(actual: bytes, expected: bytes) -> None:
-    """Compare decoded media within the BF16 model-composition error budget."""
-    for kind in ("video", "audio"):
-        with (
-            av.open(io.BytesIO(actual)) as observed,
-            av.open(io.BytesIO(expected)) as reference,
-        ):
-            for frame, wanted in zip_longest(
-                observed.decode(**{kind: 0}), reference.decode(**{kind: 0})
-            ):
-                assert frame is not None and wanted is not None, (
-                    f"{kind}: frame count mismatch"
-                )
-                assert frame.time == wanted.time, (
-                    f"{kind}: presentation time mismatch"
-                )
-                if kind == "video":
-                    values = (
-                        frame.to_ndarray(format="rgb24").astype(np.float32)
-                        / 255
-                    )
-                    reference_values = (
-                        wanted.to_ndarray(format="rgb24").astype(np.float32)
-                        / 255
-                    )
-                else:
-                    values = frame.to_ndarray()
-                    reference_values = wanted.to_ndarray()
-                np.testing.assert_allclose(
-                    values,
-                    reference_values,
-                    rtol=2e-2,
-                    atol=2e-2,
-                    equal_nan=False,
-                )
+#: The canvas every request asks for, one of the default deployment's.
+SIZE = "1344x768"
 
+#: The request shapes the layouts serve, as (seconds, prompt tokens, frames):
+#: the shortest admitted duration at the smallest text capacity, and the
+#: longest at the prompt capacity, `--max-model-len`.
+SHORT = (5, 1000, 124)
+LONG = (15, 16384, 362)
 
 # Each deployment below starts its own server, which takes most of its time,
 # so the layouts are one per way of dividing the denoiser: the sequence
@@ -111,8 +63,8 @@ FOUR_RANK_PARALLEL_CONFIGS = {
     "pipeline4": {"pipeline_parallel_size": 4},
 }
 
-# Eight-rank layouts place every numerical block on all eight devices,
-# which is how an eight-device host, or two hosts of four, serve.
+# Eight-rank layouts place every numerical block on all eight devices of two
+# hosts of four.
 EIGHT_RANK_PARALLEL_CONFIGS = {
     "ulysses8": {
         "sequence_parallel": {"kind": "ulysses", "ulysses_degree": 8},
@@ -138,33 +90,77 @@ EIGHT_RANK_PARALLEL_CONFIGS = {
     },
 }
 
-# Ranks reach devices through this order rather than by identity, so a layout
-# that assumed rank index equals device index would fail. The order permutes
-# device pairs and never the devices inside one, because a host can give peer
-# access only within its own adjacent pairs: a Ulysses group of two occupies one
-# consecutive rank pair, and splitting those across a host's pairs would test
-# nothing about the layout while making every such layout unrunnable there.
+# Ranks reach devices through these orders rather than by identity, so a
+# layout that assumed rank index equals device index would fail. The
+# eight-rank order permutes device pairs and never the devices inside one,
+# because a host can give peer access only within its own adjacent pairs: a
+# Ulysses group of two occupies one consecutive rank pair, and splitting those
+# across a host's pairs would test nothing about the layout while making every
+# such layout unrunnable there.
+FOUR_RANK_DEVICES = [3, 1, 2, 0]
 EIGHT_RANK_DENOISER_RANKS = [2, 3, 0, 1, 6, 7, 4, 5]
 
-# A layout needing more devices than this host has is placed on two hosts when
-# UNISERVE_H3_FOLLOWER names the second (an ssh destination whose checkout
-# path holds the same build) and UNISERVE_H3_LEADER_ADDRESS the address of
-# this host that the second reaches. The second host's daemon
-# (`http_helpers.second_host`) joins this host's leader as node `rank-1`, as
-# docs/minimax_h3/minimax_h3.md's two-host deployments do, and runs the ranks
-# placed on its devices.
-FOLLOWER = os.environ.get("UNISERVE_H3_FOLLOWER")
-LEADER_ADDRESS = os.environ.get("UNISERVE_H3_LEADER_ADDRESS")
+
+def _sequence_layout(degree: int) -> tuple[list[int], dict[str, Any]]:
+    """The devices and blocks of a layout whose denoiser divides the
+    sequence over `degree` ranks (Ulysses; none for one rank), beside a text
+    encoder of the same tensor degree and the decoders, on the first
+    `degree` devices of :data:`FOUR_RANK_DEVICES`.
+    """  # noqa: D205
+    ranks = list(range(degree))
+    sequence = (
+        {"kind": "ulysses", "ulysses_degree": degree}
+        if degree > 1
+        else {"kind": "local"}
+    )
+    return FOUR_RANK_DEVICES[:degree], {
+        "transformer": {
+            "ranks": ranks,
+            "parallel_config": {"sequence_parallel": sequence},
+        },
+        "text_encoder": {
+            "ranks": ranks,
+            "parallel_config": {"tensor_parallel_size": degree},
+        },
+        "video_decoder": {
+            "ranks": ranks,
+            "parallel_config": {"distribution": "temporal_units"},
+        },
+        "audio_decoder": {"ranks": [0]},
+    }
 
 
-def _eight_rank_worker_config(parallel_kind: str) -> dict:
-    """Place an eight-rank layout's blocks on all eight devices."""
+def _four_rank_layout(
+    parallel_config: dict[str, Any],
+) -> tuple[list[int], dict[str, Any]]:
+    """The devices and blocks of a four-rank layout of the denoiser, whose
+    ranks reach the devices in the order of :data:`FOUR_RANK_DEVICES`.
+    """  # noqa: D205
+    return [0, 1, 2, 3], {
+        "transformer": {
+            "ranks": FOUR_RANK_DEVICES,
+            "parallel_config": parallel_config,
+        },
+        "text_encoder": {"ranks": [0]},
+        "video_decoder": {
+            "ranks": [2, 0],
+            "parallel_config": {"distribution": "temporal_units"},
+        },
+        "audio_decoder": {"ranks": [1]},
+    }
+
+
+def _eight_rank_layout(
+    parallel_config: dict[str, Any],
+) -> tuple[list[int], dict[str, Any]]:
+    """The devices and blocks of an eight-rank layout, every block on all
+    eight devices.
+    """  # noqa: D205
     ranks = list(range(8))
-    return {
-        "devices": ranks,
+    return ranks, {
         "transformer": {
             "ranks": EIGHT_RANK_DENOISER_RANKS,
-            "parallel_config": EIGHT_RANK_PARALLEL_CONFIGS[parallel_kind],
+            "parallel_config": parallel_config,
         },
         "text_encoder": {
             "ranks": ranks,
@@ -178,169 +174,100 @@ def _eight_rank_worker_config(parallel_kind: str) -> dict:
     }
 
 
-@pytest.mark.parametrize(
-    ("parallel_kind", "grouping", "max_running_requests"),
-    [
-        (kind, "whole", 2)
-        for kind in (
-            "local",
-            *FOUR_RANK_PARALLEL_CONFIGS,
-            *EIGHT_RANK_PARALLEL_CONFIGS,
-        )
-    ]
-    # A worker group per block carries every product edge between
-    # groups. The Ulysses-4 deployment admits one request: the worker's two
-    # state slots follow its queue depth, not the number of admitted
-    # requests, so one admitted request still leaves two.
-    + [("ulysses4", "split", 1), ("tensor2_ulysses4", "split", 2)],
-)
-def test_block_bindings_release_cancelled_requests(
-    tmp_path: Path,
-    parallel_kind: str,
+#: Every layout of one host's four GPUs, by name.
+ONE_HOST_LAYOUTS = {
+    "local": _sequence_layout(1),
+    "ulysses4": _sequence_layout(4),
+    **{
+        name: _four_rank_layout(config)
+        for name, config in FOUR_RANK_PARALLEL_CONFIGS.items()
+    },
+}
+
+#: Every layout of two hosts' four GPUs each, by name.
+TWO_HOST_LAYOUTS = {
+    name: _eight_rank_layout(config)
+    for name, config in EIGHT_RANK_PARALLEL_CONFIGS.items()
+}
+
+
+def _workers(
+    devices: list[int],
+    blocks: dict[str, Any],
     grouping: str,
-    max_running_requests: int,
-) -> None:
-    model_value = str(host_asset("UNISERVE_H3_MODEL", H3_CHECKPOINT))
-    # A layout that holds the whole denoiser on one device cannot also hold a
-    # 15-second activation working set: the single-device warmup exhausts a
-    # 184 GiB device with 178 GB allocated. That layout is qualified at a
-    # five-second maximum; every other layout takes both shapes.
-    shapes = (
-        ((5, 1000, 124),)
-        if parallel_kind == "local"
-        else ((5, 1000, 124), (15, 16384, 362))
-    )
-    max_video_seconds = str(max(seconds for seconds, _, _ in shapes))
-    if parallel_kind in ("local", "ulysses4"):
-        degree = {"local": 1, "ulysses4": 4}[parallel_kind]
-        ranks = list(range(degree))
-        sequence = (
-            {"kind": "local"}
-            if degree == 1
-            else {"kind": "ulysses", "ulysses_degree": degree}
-        )
-        worker_config = {
-            "devices": [3, 1, 2, 0][:degree],
-            "transformer": {
-                "ranks": ranks,
-                "parallel_config": {"sequence_parallel": sequence},
-            },
-            "text_encoder": {
-                "ranks": ranks,
-                "parallel_config": {"tensor_parallel_size": degree},
-            },
-            "video_decoder": {
-                "ranks": ranks,
-                "parallel_config": {"distribution": "temporal_units"},
-            },
-            "audio_decoder": {"ranks": [0]},
-        }
-    elif parallel_kind in FOUR_RANK_PARALLEL_CONFIGS:
-        # The denoiser's ranks reach the devices in the order 3, 1, 2, 0, so
-        # a layout that assumed rank index equals device index would fail.
-        worker_config = {
-            "devices": [0, 1, 2, 3],
-            "transformer": {
-                "ranks": [3, 1, 2, 0],
-                "parallel_config": FOUR_RANK_PARALLEL_CONFIGS[parallel_kind],
-            },
-            "text_encoder": {"ranks": [0]},
-            "video_decoder": {
-                "ranks": [2, 0],
-                "parallel_config": {"distribution": "temporal_units"},
-            },
-            "audio_decoder": {"ranks": [1]},
-        }
-    else:
-        worker_config = _eight_rank_worker_config(parallel_kind)
+    place: Callable[[int], str],
+) -> list[dict[str, Any]]:
+    """The worker groups of a layout: its numerical `blocks`, whose ranks
+    reach `devices` by index, and the blocks every FastH3 deployment places
+    beside them, in one group (``whole``) or a group per block (``split``),
+    each group's ranks on the devices `place` names.
+    """  # noqa: D205
+    blocks = dict(blocks)
     # A FastH3 student also serves fl2va, so every deployment places the
     # latent encoder that encodes its keyframes, here on the first video
     # decoder rank; the requests below are text-to-video and never use it.
-    worker_config["latent_encoder"] = {
-        "ranks": worker_config["video_decoder"]["ranks"][:1],
-    }
-    devices = worker_config.pop("devices")
-    visible_devices = max(devices) + 1
-    # The layout's device indices address the GPUs the module leased, in
-    # their order.
-    leased = granted_devices(4).split(",")
-    local_devices = len(leased)
-    two_hosts = (
-        local_devices < visible_devices <= 2 * local_devices
-        and FOLLOWER is not None
-        and LEADER_ADDRESS is not None
-    )
-    if local_devices < visible_devices and not two_hosts:
-        pytest.skip(
-            f"{parallel_kind} needs {visible_devices} devices; "
-            f"this host has {local_devices} and no second host is named"
-        )
-
-    def place(device: int) -> str:
-        # The ranks past this host's devices run on the second host's.
-        if device < local_devices:
-            return f"cuda:{device}"
-        return f"rank-1/cuda:{device - local_devices}"
-
+    blocks["latent_encoder"] = {"ranks": blocks["video_decoder"]["ranks"][:1]}
     # The media blocks encode and assemble on the host inside the main
     # process, which serves CUDA devices only, so they are placed on CUDA
     # ranks as the deployment files of `configs/minimax_h3` place them: each
     # decoded unit's codec slot on its decoder's rank, and the muxer and the
-    # media reader on one rank of the leader's host.
-    leader_rank = next(
-        rank for rank, device in enumerate(devices) if device < local_devices
-    )
-    worker_config["video_codec"] = {
-        "ranks": worker_config["video_decoder"]["ranks"],
+    # media reader on rank 0, which every layout places on the leader's host.
+    blocks["video_codec"] = {
+        "ranks": blocks["video_decoder"]["ranks"],
         "parallel_config": {"distribution": "temporal_units"},
     }
-    worker_config["muxer"] = {"ranks": [leader_rank]}
-    worker_config["media_reader"] = {"ranks": [leader_rank]}
+    blocks["muxer"] = {"ranks": [0]}
+    blocks["media_reader"] = {"ranks": [0]}
     groups = {
-        "whole": [tuple(worker_config)],
-        "split": [(name,) for name in worker_config],
+        "whole": [tuple(blocks)],
+        "split": [(name,) for name in blocks],
     }[grouping]
     workers = []
     for names in groups:
         members = sorted(
-            {rank for name in names for rank in worker_config[name]["ranks"]}
+            {rank for name in names for rank in blocks[name]["ranks"]}
         )
-        worker_id = names[0]
-        blocks = {
-            name: {
-                "ranks": [
-                    members.index(rank) for rank in worker_config[name]["ranks"]
-                ],
-                **worker_config[name].get("parallel_config", {}),
-            }
-            for name in names
-        }
         workers.append(
             {
-                "id": worker_id,
+                "id": names[0],
                 "ranks": [place(devices[rank]) for rank in members],
                 "queue_depth": 6,
-                "blocks": blocks,
+                "blocks": {
+                    name: {
+                        "ranks": [
+                            members.index(rank)
+                            for rank in blocks[name]["ranks"]
+                        ],
+                        **blocks[name].get("parallel_config", {}),
+                    }
+                    for name in names
+                },
             }
         )
-    command = [
-        str(require_uniserve_binary()),
-        "serve",
-        "--model-dir",
-        model_value,
+    return workers
+
+
+def _options(
+    directory: Path,
+    workers: list[dict[str, Any]],
+    max_running_requests: int,
+    shapes: tuple[tuple[int, int, int], ...],
+) -> list[str]:
+    """The options of a deployment of `workers` admitting
+    `max_running_requests` requests of up to the longest of `shapes`.
+    """  # noqa: D205
+    max_seconds = max(seconds for seconds, _, _ in shapes)
+    return [
         "--served-model-name",
         "MiniMax-H3",
-        "--host",
-        "127.0.0.1",
-        *engine_selection(),
         "--config",
-        str(written_deployment(tmp_path, workers)),
+        str(client.written_deployment(directory, workers)),
         "--max-running-requests",
         str(max_running_requests),
         "--max-model-len",
         "16384",
         "--set",
-        f"video_config.max_seconds={max_video_seconds}",
+        f"video_config.max_seconds={max_seconds}",
         # Two text capacities bound the startup capture of every admitted
         # duration; the requests below exercise both.
         "--set",
@@ -348,7 +275,7 @@ def test_block_bindings_release_cancelled_requests(
         # One and two device layouts hold the whole denoiser on each of their
         # ranks and split the 15-second sequence over fewer of them, so their
         # warmup reaches a larger share of the device than the four-device
-        # deployment the default grant is sized for.
+        # deployment the default share is sized for.
         "--mem-fraction-static",
         "0.92",
         "--set",
@@ -356,287 +283,286 @@ def test_block_bindings_release_cancelled_requests(
         "--set",
         'quantization.mode="balanced"',
     ]
-    if two_hosts:
-        # The leader binds its join endpoint on a port it picks.
-        command += [
-            "--host-identity",
-            "rank-0",
-            "--nnodes",
-            "2",
-            "--dist-init-addr",
-            f"{LEADER_ADDRESS}:0",
-        ]
-    tokenizer = AutoTokenizer.from_pretrained(Path(model_value) / "tokenizer")
-    payloads = []
-    for _seconds, tokens, frames in shapes:
-        # The evaluator's FastH3 prompt synthesis yields exactly `tokens`
-        # prompt tokens, so each request lands in its intended text capacity.
-        case = BenchmarkPoint(
-            name="fast-h3-prompt",
-            server="uniserve",
-            task=TaskName.VIDEO,
-            model="FastH3",
-            dataset="minimax-h3",
-            # The point only synthesizes the prompt; its metric is never read.
-            metrics=(MetricDefinition(("videos_per_second",), "higher"),),
-            load=LoadConfig(num_prompts=1),
-            video=VideoConfig(prompt_tokens=tokens),
-        )
-        prompt = MiniMaxH3Dataset(case).load(tokenizer)[0].prompt
-        payloads.append(t2va_request("MiniMax-H3", prompt, frames, 1000))
-    log = tmp_path / "h3-blocks.log"
-    environment = {
-        "CUDA_VISIBLE_DEVICES": ",".join(
-            leased[: min(visible_devices, local_devices)]
-        )
-    }
-    with ExitStack() as deployment:
-        if two_hosts:
-            # Every eight-rank layout places its worker groups on all eight
-            # devices, four on each host: a product its ranks on one host
-            # write and its ranks on the other read is copied between the
-            # hosts by the reading host's Storage Server
-            # (docs/minimax_h3/minimax_h3.md, Two hosts). The second host's
-            # main process resolves its modules from that host's Build
-            # Server, which the leader asks to prepare the epoch's modules
-            # before any process starts there.
-            assert FOLLOWER is not None
-            follower_modules = deployment.enter_context(
-                remote_build_server(FOLLOWER)
-            )
-        server = deployment.enter_context(
-            server_process(
-                command,
-                # Startup prepares and captures every admitted duration at
-                # both text capacities; two-way tensor or pipeline layouts
-                # took 9 to 11 minutes to become ready on 4 x GB200.
-                log,
-                timeout_s=1800,
-                env=environment,
-                serving=not two_hosts,
-            )
-        )
-        if two_hosts:
-            # The second host joins the leader at the endpoint its readiness
-            # record states; the leader serves once it joined.
-            deployment.enter_context(
-                second_host(
-                    FOLLOWER,
-                    log.with_name("h3-follower.log"),
-                    server,
-                    arguments=(
-                        "--set",
-                        f'build_config.socket="{follower_modules}"',
-                    ),
-                )
-            )
-        base_url = server.base_url
 
-        # Warm both decode geometries before exercising cancellation. Three
-        # disconnects exceed the two provisioned slots and require their reuse.
+
+def _payloads(shapes: tuple[tuple[int, int, int], ...]) -> list[dict]:
+    """A text-to-video request of each of `shapes`, whose prompt is exactly
+    the shape's prompt tokens long, so each request lands in its intended
+    text capacity.
+    """  # noqa: D205
+    tokenizer = media.tokenizer(assets.CHECKPOINTS["fasth3"])
+    return [
+        media.t2va_request(
+            "MiniMax-H3",
+            media.exact_prompt(tokenizer, tokens),
+            frames,
+            1000,
+            size=SIZE,
+        )
+        for _seconds, tokens, frames in shapes
+    ]
+
+
+def _disconnect(server: Server, payload: dict) -> None:
+    """Send `payload` to ``POST /v1/videos/sync`` and close the connection
+    while the engine generates it, as a client that goes away does.
+
+    The engine announces no admission of a request, so the deployment's
+    in-flight count (``GET /admin/status``) is read until it holds the
+    request; the connection then closes before any answer arrives.
+    """  # noqa: D205
+    address = urllib.parse.urlsplit(server.base_url)
+    connection = http.client.HTTPConnection(address.hostname, address.port)
+    try:
+        connection.request(
+            "POST",
+            "/v1/videos/sync",
+            body=json.dumps(payload),
+            headers={"Content-Type": "application/json"},
+        )
+        server.wait_until(
+            lambda: admin.status(server)["deployment"]["in_flight"] > 0,
+            media.GENERATION_S,
+            "the engine did not take the request",
+            interval_s=media.READ_S,
+        )
+    finally:
+        connection.close()
+
+
+def _exercise(
+    server: Server,
+    payloads: list[dict],
+    shapes: tuple[tuple[int, int, int], ...],
+    directory: Path,
+) -> None:
+    """Serve complete media of every shape, then serve again after more
+    disconnected requests than the deployment's request slots.
+    """  # noqa: D205
+    with media.api(server) as api:
+        # Warm both decode layouts before exercising cancellation.
         for payload, (seconds, _tokens, frames) in zip(
             payloads, shapes, strict=True
         ):
-            response = httpx.post(
-                f"{base_url}/v1/videos/sync",
-                json=payload,
-                timeout=600,
+            response = api.post("/v1/videos/sync", json=payload)
+            media.assert_generated(
+                response,
+                size=SIZE,
+                frames=frames,
+                media_format=media.MINIMAX_H3,
             )
-            response.raise_for_status()
-            media = inspect_video_bytes(
-                response.content, declared_mime=response.headers["content-type"]
-            )
-            assert media.frame_count == frames
-            assert (media.width, media.height) == (1344, 768)
-            assert (media.audio_channels, media.audio_sample_rate) == (2, 32000)
-            (tmp_path / f"{seconds}s.mp4").write_bytes(response.content)
-            print(
-                f"{parallel_kind}/{grouping}: {seconds}s complete media passed",
-                flush=True,
-            )
+            (directory / f"{seconds}s.mp4").write_bytes(response.content)
 
-        payload = payloads[0]
+        # Three disconnects exceed the two provisioned slots and require
+        # their reuse.
+        _seconds, _tokens, frames = shapes[0]
         for _ in range(3):
-            with httpx.Client(timeout=httpx.Timeout(30, read=0.2)) as client:
-                with pytest.raises(httpx.ReadTimeout):
-                    client.post(f"{base_url}/v1/videos/sync", json=payload)
-            response = httpx.post(
-                f"{base_url}/v1/videos/sync", json=payload, timeout=600
+            _disconnect(server, payloads[0])
+            response = api.post("/v1/videos/sync", json=payloads[0])
+            media.assert_generated(
+                response,
+                size=SIZE,
+                frames=frames,
+                media_format=media.MINIMAX_H3,
             )
-            response.raise_for_status()
-            media = inspect_video_bytes(
-                response.content, declared_mime=response.headers["content-type"]
-            )
-            assert media.frame_count == 124
-            assert (media.audio_channels, media.audio_sample_rate) == (2, 32000)
 
 
-def test_replicas_on_two_hosts_serve_complete_media(tmp_path: Path) -> None:
+# A worker group per block carries every product edge between groups. The
+# Ulysses-4 deployment admits one request: the worker's two state slots
+# follow its queue depth, not the number of admitted requests, so one
+# admitted request still leaves two. The whole denoiser on one device is
+# served at the short shape alone: its long shape's activation working set
+# does not fit beside it on one device.
+@pytest.mark.gpus(HOST_GPUS)
+@pytest.mark.parametrize(
+    ("layout", "grouping", "max_running_requests", "shapes"),
+    [
+        pytest.param("local", "whole", 2, (SHORT,), id="local-whole"),
+        *(
+            pytest.param(name, "whole", 2, (SHORT, LONG), id=f"{name}-whole")
+            for name in FOUR_RANK_PARALLEL_CONFIGS
+        ),
+        pytest.param(
+            "ulysses4", "split", 1, (SHORT, LONG), id="ulysses4-split"
+        ),
+    ],
+)
+def test_block_bindings_release_cancelled_requests(
+    deployments: Deployments,
+    tmp_path: Path,
+    layout: str,
+    grouping: str,
+    max_running_requests: int,
+    shapes: tuple[tuple[int, int, int], ...],
+) -> None:
+    """A layout of one host's four GPUs serves complete media of each shape,
+    and serves again after more disconnected requests than its slots.
+    """  # noqa: D205
+    devices, blocks = ONE_HOST_LAYOUTS[layout]
+    workers = _workers(devices, blocks, grouping, lambda d: f"cuda:{d}")
+    payloads = _payloads(shapes)
+
+    with deployments.serve(
+        *_options(tmp_path, workers, max_running_requests, shapes),
+        model=assets.CHECKPOINTS["fasth3"].model,
+    ) as server:
+        _exercise(server, payloads, shapes, tmp_path)
+
+
+@pytest.mark.gpus(HOST_GPUS)
+@pytest.mark.parametrize(
+    ("layout", "grouping"),
+    [
+        *((name, "whole") for name in EIGHT_RANK_PARALLEL_CONFIGS),
+        ("tensor2_ulysses4", "split"),
+    ],
+)
+def test_block_bindings_on_two_hosts_release_cancelled_requests(
+    deployments: Deployments,
+    peer_host: RemoteHost,
+    repository: Path,
+    tmp_path: Path,
+    layout: str,
+    grouping: str,
+) -> None:
+    """An eight-rank layout over two hosts of four GPUs serves complete media
+    of each shape, and serves again after more disconnected requests than
+    its slots.
+
+    Its worker groups lie on all eight devices, four on each host: a product
+    its ranks on one host write and its ranks on the other read is copied
+    between the hosts by the reading host's Storage Server
+    (docs/minimax_h3/minimax_h3.md, Two hosts). The second host's daemon
+    joins this host's leader as node ``rank-1`` and runs the ranks placed on
+    its devices.
+    """  # noqa: D205
+    shapes = (SHORT, LONG)
+    devices, blocks = TWO_HOST_LAYOUTS[layout]
+
+    def place(device: int) -> str:
+        # The ranks past this host's devices run on the second host's.
+        if device < HOST_GPUS:
+            return f"cuda:{device}"
+        return f"rank-1/cuda:{device - HOST_GPUS}"
+
+    workers = _workers(devices, blocks, grouping, place)
+    payloads = _payloads(shapes)
+
+    with (
+        deployments.serve(
+            *_options(tmp_path, workers, 2, shapes),
+            *two_host_leader(peer_host),
+            model=assets.CHECKPOINTS["fasth3"].model,
+            serving=False,
+        ) as server,
+        deployments.follower(peer_host, server, repository),
+    ):
+        _exercise(server, payloads, shapes, tmp_path)
+
+
+@pytest.mark.gpus(HOST_GPUS)
+def test_replicas_on_two_hosts_serve_complete_media(
+    deployments: Deployments, peer_host: RemoteHost, repository: Path
+) -> None:
     """`fasth3-ulysses4x2-two-host.toml` serves across two hosts of four GPUs.
 
     Each Ulysses4 replica, with its text encoder, decoders, codecs, muxer and
     media reader, lies on one host, so no product passes between the hosts'
     main processes, and the server places each request's stages on the
     replicas of one host (docs/minimax_h3/minimax_h3.md, Two hosts). Twice as
-    many concurrent requests as one replica's slots reach both hosts'
+    many concurrent requests as the deployment admits reach both hosts'
     replicas, and each answer is complete media.
     """
-    if FOLLOWER is None or LEADER_ADDRESS is None:
-        pytest.skip(
-            "the two-host replicas need UNISERVE_H3_FOLLOWER and "
-            "UNISERVE_H3_LEADER_ADDRESS"
-        )
-    model = str(host_asset("UNISERVE_H3_MODEL", H3_CHECKPOINT))
-    deployment = (
-        Path(__file__).resolve().parents[3]
-        / "configs"
-        / "minimax_h3"
-        / "fasth3-ulysses4x2-two-host.toml"
-    )
-    # The validated throughput setting of 8 x GB200 over two hosts, bounded to
-    # one five-second duration and one text capacity so that startup captures
-    # little.
+    # Two resident requests on each host's replica. One five-second duration
+    # and one text capacity keep the startup capture small.
     max_running_requests = 4
-    command = [
-        str(require_uniserve_binary()),
-        "serve",
-        "--model-dir",
-        model,
-        "--served-model-name",
-        "FastH3",
-        "--host",
-        "127.0.0.1",
-        *engine_selection(),
-        "--config",
-        str(deployment),
-        "--max-running-requests",
-        str(max_running_requests),
-        "--max-model-len",
-        "1024",
-        "--set",
-        "video_config.max_seconds=5",
-        "--set",
-        "video_config.text_capacities=[1024]",
-        "--host-identity",
-        "rank-0",
-        "--nnodes",
-        "2",
-        # The leader binds its join endpoint on a port it picks.
-        "--dist-init-addr",
-        f"{LEADER_ADDRESS}:0",
-    ]
     payloads = [
-        t2va_request(
+        media.t2va_request(
             "FastH3",
             f"A river at dawn, seen from bank {index}.",
             124,
             1000 + index,
+            size=SIZE,
         )
         for index in range(2 * max_running_requests)
     ]
-    environment = {"CUDA_VISIBLE_DEVICES": granted_devices(4)}
+    deployment = (
+        repository
+        / "configs"
+        / "minimax_h3"
+        / "fasth3-ulysses4x2-two-host.toml"
+    )
 
     with (
-        remote_build_server(FOLLOWER) as follower_modules,
-        server_process(
-            command,
-            tmp_path / "h3-replicas.log",
-            timeout_s=1800,
-            env=environment,
+        deployments.serve(
+            "--served-model-name",
+            "FastH3",
+            "--config",
+            str(deployment),
+            "--max-running-requests",
+            str(max_running_requests),
+            "--max-model-len",
+            "1024",
+            "--set",
+            "video_config.max_seconds=5",
+            "--set",
+            "video_config.text_capacities=[1024]",
+            *two_host_leader(peer_host),
+            model=assets.CHECKPOINTS["fasth3"].model,
             serving=False,
         ) as server,
-        second_host(
-            FOLLOWER,
-            tmp_path / "h3-follower.log",
-            server,
-            arguments=("--set", f'build_config.socket="{follower_modules}"'),
-        ),
+        deployments.follower(peer_host, server, repository),
+        media.api(server) as api,
         ThreadPoolExecutor(max_workers=len(payloads)) as pool,
     ):
 
-        def generate(payload: dict) -> tuple[bytes, str]:
-            response = httpx.post(
-                f"{server.base_url}/v1/videos/sync", json=payload, timeout=1200
+        def generate(payload: dict) -> httpx.Response:
+            return api.post("/v1/videos/sync", json=payload)
+
+        for response in pool.map(generate, payloads):
+            media.assert_generated(
+                response, size=SIZE, frames=124, media_format=media.MINIMAX_H3
             )
-            response.raise_for_status()
-            return response.content, response.headers["content-type"]
-
-        for content, content_type in pool.map(generate, payloads):
-            media = inspect_video_bytes(content, declared_mime=content_type)
-            assert media.frame_count == 124
-            assert (media.width, media.height) == (1344, 768)
-            assert (media.audio_channels, media.audio_sample_rate) == (2, 32000)
 
 
+@pytest.mark.gpus(HOST_GPUS)
 def test_video_jobs_retain_content_and_cancel_active_work(
-    tmp_path: Path,
+    deployments: Deployments, repository: Path
 ) -> None:
     """Exercise async ownership and reuse through the HTTP interface.
 
     The exercise runs on the documented four-device deployment, whose
     blocks, the media ones included, share one worker group.
     """
-    import time
-
-    model = str(host_asset("UNISERVE_H3_MODEL", H3_CHECKPOINT))
-    inference = json.loads(
-        (Path(model) / "fastvideo_inference.json").read_text()
-    )
-    expected_steps = len(inference["dmd_denoising_steps"])
-    deployment = (
-        Path(__file__).resolve().parents[3]
-        / "configs"
-        / "minimax_h3"
-        / "ulysses4.toml"
-    )
-    command = [
-        str(require_uniserve_binary()),
-        "serve",
-        "--model-dir",
-        model,
-        "--config",
-        str(deployment),
-        *engine_selection(),
-        "--served-model-name",
-        "FastH3",
-        # A media deployment states the prompt length it admits; one text
-        # capacity of that length bounds the startup capture of every
-        # admitted duration.
-        "--max-model-len",
-        "1024",
-        "--set",
-        "video_config.text_capacities=[1024]",
-        # Full-duration decoder graphs need a larger static grant on H200
-        # alongside BF16 weights and two resident request slots.
-        "--mem-fraction-static",
-        "0.92",
-    ]
-
-    def completed(client, job_id):
-        deadline = time.monotonic() + 600
-        while time.monotonic() < deadline:
-            response = client.get(f"/v1/videos/{job_id}")
-            response.raise_for_status()
-            job = response.json()
-            assert job["status"] != "failed", job
-            if job["status"] == "completed":
-                return job
-            time.sleep(0.1)
-        pytest.fail("video did not complete within the request deadline")
-
     with (
-        server_process(
-            command, tmp_path / "video-jobs.log", timeout_s=900
+        deployments.serve(
+            "--served-model-name",
+            "FastH3",
+            "--config",
+            str(repository / "configs" / "minimax_h3" / "ulysses4.toml"),
+            # A media deployment states the prompt length it admits; one
+            # text capacity of that length bounds the startup capture of
+            # every admitted duration.
+            "--max-model-len",
+            "1024",
+            "--set",
+            "video_config.text_capacities=[1024]",
+            # Full-duration decoder graphs beside BF16 weights and two
+            # resident request slots need more than the default share.
+            "--mem-fraction-static",
+            "0.92",
+            model=assets.CHECKPOINTS["fasth3"].model,
         ) as server,
-        httpx.Client(timeout=600) as client,
+        media.api(server) as api,
     ):
-        client.base_url = server.base_url
-        caps = client.get("/v1/capabilities").json()
+        caps = api.get("/v1/capabilities").json()
         assert caps["model"] == "FastH3"
         video = caps["video"]
         assert video["model"]["tasks"] == ["t2va", "fl2va"]
-        # The schedule counts denoiser evaluations: one per trained rung.
-        assert video["model"]["num_inference_steps"] == expected_steps
+        # The schedule counts denoiser evaluations: one per trained rung of
+        # the eight-step student.
+        steps = video["model"]["num_inference_steps"]
+        assert steps == 8
         # The request API's fields, whatever the model.
         assert set(video["request_fields"]) == {
             "model",
@@ -652,7 +578,7 @@ def test_video_jobs_retain_content_and_cancel_active_work(
             "input_references",
             "extra_params",
         }
-        river = t2va_request("FastH3", "A river", 124, 1001)
+        river = media.t2va_request("FastH3", "A river", 124, 1001, size=SIZE)
         for payload in (
             # Longer than the deployment's default 15-second capacity.
             {"model": "FastH3", "prompt": "A river", "seconds": 16},
@@ -667,44 +593,49 @@ def test_video_jobs_retain_content_and_cancel_active_work(
             # A field the request API does not have.
             {**river, "task": "t2va"},
         ):
-            response = client.post("/v1/videos", json=payload)
+            response = api.post("/v1/videos", json=payload)
             assert response.status_code == 400, (payload, response.text)
-        payload = t2va_request(
+        payload = media.t2va_request(
             "FastH3",
             "A river flows through a forest, with birds singing.",
             124,
             1001,
+            size=SIZE,
         )
         # Multipart fields carry the same names as text parts.
-        response = client.post(
+        response = api.post(
             "/v1/videos",
             files={name: (None, str(value)) for name, value in payload.items()},
         )
         response.raise_for_status()
         job_id = response.json()["id"]
-        job = completed(client, job_id)
+        job = media.completed_job(server, job_id)
         # The job reports the generated shape; its seconds are the generated
         # duration as the OpenAI-style string.
-        assert job["size"] == "1344x768"
+        assert job["size"] == SIZE
         assert job["num_frames"] == 124 and job["fps"] == 24
         assert float(job["seconds"]) == pytest.approx(124 / 24, abs=1e-3)
-        assert job["completed_steps"] == job["total_steps"] == expected_steps
+        assert job["completed_steps"] == job["total_steps"] == steps
         assert job["expires_at"] > job["completed_at"]
         assert job_id in {
-            item["id"] for item in client.get("/v1/videos").json()["data"]
+            item["id"] for item in api.get("/v1/videos").json()["data"]
         }
-        first = client.get(f"/v1/videos/{job_id}/content")
-        second = client.get(f"/v1/videos/{job_id}/content")
+        first = api.get(f"/v1/videos/{job_id}/content")
+        second = api.get(f"/v1/videos/{job_id}/content")
         assert first.content == second.content
-        media = inspect_video_bytes(
-            first.content, declared_mime=first.headers["content-type"]
+        media.assert_video(
+            first.content,
+            first.headers["content-type"],
+            size=SIZE,
+            frames=124,
+            media_format=media.MINIMAX_H3,
         )
-        assert media.frame_count == 124 and media.audio_channels == 2
-        assert client.delete(f"/v1/videos/{job_id}").json()["deleted"]
-        assert client.get(f"/v1/videos/{job_id}/content").status_code == 404
+        assert api.delete(f"/v1/videos/{job_id}").json()["deleted"]
+        assert api.get(f"/v1/videos/{job_id}/content").status_code == 404
 
-        # Concurrent request storage must preserve each prompt and seed. Compare
-        # both artifacts with isolated executions through the same public route.
+        # Concurrent request storage must preserve each prompt and seed.
+        # Compare both artifacts with isolated executions through the same
+        # public route.
         concurrent = [
             {**payload, "seed": 1010},
             {
@@ -716,48 +647,43 @@ def test_video_jobs_retain_content_and_cancel_active_work(
             },
         ]
         ids = [
-            client.post("/v1/videos", json=item).json()["id"]
+            api.post("/v1/videos", json=item).json()["id"]
             for item in concurrent
         ]
         for item, concurrent_id in zip(concurrent, ids, strict=True):
-            completed(client, concurrent_id)
-            content = client.get(f"/v1/videos/{concurrent_id}/content")
-            isolated = client.post("/v1/videos/sync", json=item)
+            content = media.job_video(server, concurrent_id)
+            isolated = api.post("/v1/videos/sync", json=item)
             isolated.raise_for_status()
-            _assert_media_values_close(content.content, isolated.content)
+            media.assert_same_media(
+                content.content,
+                isolated.content,
+                tolerance=media.BF16_COMPOSITION,
+            )
 
         # Cancel more requests than the two resident slots, including a
         # genuinely active job.
         for seed in range(3):
-            active = client.post(
+            active = api.post(
                 "/v1/videos",
                 json={**payload, "num_frames": 362, "seed": seed},
             ).json()["id"]
-            deadline = time.monotonic() + 600
-            while time.monotonic() < deadline:
-                state = client.get(f"/v1/videos/{active}").json()
-                if state["status"] == "in_progress":
-                    break
-                assert state["status"] != "failed", state
-                time.sleep(0.05)
-            else:
-                pytest.fail("job never reached execution")
-            queued = client.post(
+            media.wait_for_job(
+                server,
+                active,
+                lambda record: record["status"] == "in_progress",
+                "the job never reached execution",
+            )
+            queued = api.post(
                 "/v1/videos", json={**payload, "seed": seed + 100}
             ).json()["id"]
-            assert client.delete(f"/v1/videos/{active}").status_code == 200
-            assert client.delete(f"/v1/videos/{queued}").status_code == 200
-            assert client.get(f"/v1/videos/{active}").status_code == 404
-        reused = client.post(
-            "/v1/videos", json={**payload, "seed": 1002}
-        ).json()["id"]
-        completed(client, reused)
-        assert client.get(f"/v1/videos/{reused}/content").status_code == 200
-        sync = client.post("/v1/videos/sync", json={**payload, "seed": 1003})
-        sync.raise_for_status()
-        assert (
-            inspect_video_bytes(
-                sync.content, declared_mime=sync.headers["content-type"]
-            ).frame_count
-            == 124
+            assert api.delete(f"/v1/videos/{active}").status_code == 200
+            assert api.delete(f"/v1/videos/{queued}").status_code == 200
+            assert api.get(f"/v1/videos/{active}").status_code == 404
+        reused = api.post("/v1/videos", json={**payload, "seed": 1002}).json()[
+            "id"
+        ]
+        media.job_video(server, reused)
+        sync = api.post("/v1/videos/sync", json={**payload, "seed": 1003})
+        media.assert_generated(
+            sync, size=SIZE, frames=124, media_format=media.MINIMAX_H3
         )

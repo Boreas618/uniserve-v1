@@ -1,9 +1,10 @@
-"""GPU leases and the Build Server of the end-to-end tests.
+"""The GPU leases, the Build Server and the deployments of the end-to-end
+cases.
 
 The GPU recipe runs the end-to-end cases in parallel (``pytest -n`` with
 ``--dist loadgroup``). Each case serves on the GPUs it leases for its
-duration, so independent cases share the host while no two of them share a
-GPU:
+duration (:mod:`uniserve_testing.devices`), so independent cases share the
+host while no two of them share a GPU:
 
 - a case leases one GPU unless it is marked ``gpus(count)``; ``gpus(0)``
   leases none;
@@ -14,112 +15,24 @@ GPU:
 - a case marked ``host_wide`` observes state of the whole host, such as its
   shared memory, and runs alone, holding every GPU.
 
-A lease exports the devices it holds, comma-separated, in
-``UNISERVE_WORLD_DEVICES``, which the tests read through
-``http_helpers.granted_devices``. The GPUs come from ``UNISERVE_E2E_DEVICES`` (a
-comma-separated list of device ordinals), else every GPU ``nvidia-smi``
-lists. A case that needs more GPUs than that is skipped, naming both counts.
-
-Leases are advisory ``flock`` locks on one file per GPU, plus a host lock
-every case holds shared and a host-wide case holds exclusively. They live in
-a directory of the system's temporary directory, so concurrent runs on one
-host respect one another.
-"""
+A case that needs more GPUs than the run may lease (``--e2e-devices``, else
+every GPU of the host) is skipped, naming both counts. The lease is the
+``lease`` fixture's value, and the deployments a case starts
+(``deployments``, :class:`uniserve_testing.deployments.Deployments`) serve on
+it at the run's Build Server, which holds the tree's packages.
+"""  # noqa: D205
 
 from __future__ import annotations
 
-import fcntl
-import os
-import subprocess
-import tempfile
-import time
 from collections.abc import Iterator
-from contextlib import ExitStack, contextmanager
+from contextlib import contextmanager
 from pathlib import Path
-from typing import IO
 
 import pytest
-
-from tests.python.e2e.build_server import (
-    build_server as running_build_server,
-)
-from tests.python.e2e.http_helpers import modules_from
-
-#: How long a case waits between attempts to lease its GPUs, in seconds.
-LEASE_RETRY_S = 2.0
-
-
-def _devices() -> list[str]:
-    """The GPU ordinals the run may lease."""
-    stated = os.environ.get("UNISERVE_E2E_DEVICES", "")
-    if stated:
-        return [device.strip() for device in stated.split(",") if device]
-    listed = subprocess.run(
-        ["nvidia-smi", "--query-gpu=index", "--format=csv,noheader"],
-        check=True,
-        capture_output=True,
-        text=True,
-    ).stdout
-    return [line.strip() for line in listed.splitlines() if line.strip()]
-
-
-def _lock_directory() -> Path:
-    directory = Path(tempfile.gettempdir()) / f"uniserve-e2e-gpus-{os.getuid()}"
-    directory.mkdir(mode=0o700, exist_ok=True)
-    return directory
-
-
-def _try_lock(path: Path) -> IO[str] | None:
-    """`path` locked exclusively without waiting, or `None` when it is held."""
-    handle = path.open("a+")
-    try:
-        fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
-    except BlockingIOError:
-        handle.close()
-        return None
-    return handle
-
-
-@contextmanager
-def lease(count: int, host_wide: bool) -> Iterator[list[str]]:
-    """Hold `count` GPUs (every GPU when `host_wide`) and export them.
-
-    The host lock is taken first, shared or exclusive, and the GPU locks are
-    taken all at once or not at all: a case that finds too few free releases
-    what it took and retries, so two cases never hold part of each other's
-    GPUs while they wait.
-    """
-    devices = _devices()
-    wanted = len(devices) if host_wide else count
-    if wanted > len(devices):
-        pytest.skip(
-            f"the case needs {wanted} GPUs and the run may lease "
-            f"{len(devices)} (UNISERVE_E2E_DEVICES or nvidia-smi)"
-        )
-    directory = _lock_directory()
-    with ExitStack() as stack:
-        host = stack.enter_context((directory / "host.lock").open("a+"))
-        fcntl.flock(host, fcntl.LOCK_EX if host_wide else fcntl.LOCK_SH)
-        held: list[tuple[str, IO[str]]] = []
-        while len(held) < wanted:
-            for device in devices:
-                if len(held) == wanted:
-                    break
-                handle = _try_lock(directory / f"gpu{device}.lock")
-                if handle is not None:
-                    held.append((device, handle))
-            if len(held) < wanted:
-                for _, handle in held:
-                    handle.close()
-                held = []
-                time.sleep(LEASE_RETRY_S)
-        for _, handle in held:
-            stack.callback(handle.close)
-        granted = [device for device, _ in held]
-        with pytest.MonkeyPatch.context() as patch:
-            if granted:
-                patch.setenv("UNISERVE_WORLD_DEVICES", ",".join(granted))
-            yield granted
+from uniserve_testing import builds
+from uniserve_testing.builds import BuildServer
+from uniserve_testing.deployments import Deployments, Settings
+from uniserve_testing.devices import Lease, lease_gpus
 
 
 def _module_gpus(module: object) -> int | None:
@@ -150,51 +63,104 @@ def _is_gpu_e2e(node: pytest.Item | pytest.Module) -> bool:
     return "e2e" in keywords and "gpu" in keywords
 
 
-@pytest.fixture(scope="module", autouse=True)
-def module_gpus(request: pytest.FixtureRequest) -> Iterator[None]:
+@contextmanager
+def _leased(
+    devices: tuple[int, ...], count: int, host_wide: bool
+) -> Iterator[Lease]:
+    """`count` of `devices` leased (all when `host_wide`), or the case
+    skipped when the run may lease fewer.
+    """  # noqa: D205
+    wanted = len(devices) if host_wide else count
+    if wanted > len(devices):
+        pytest.skip(
+            f"the case needs {wanted} GPUs and the run may lease {len(devices)}"
+        )
+    with lease_gpus(devices, wanted, host_wide=host_wide) as granted:
+        yield granted
+
+
+@pytest.fixture(scope="module")
+def module_lease(
+    request: pytest.FixtureRequest, run_devices: tuple[int, ...]
+) -> Iterator[Lease | None]:
     """The module's lease, for a module that states ``gpus`` itself."""
     count = _module_gpus(request.module)
     if count is None or not _is_gpu_e2e(request.node):
-        yield
+        yield None
         return
-    with lease(count, host_wide=False):
-        yield
+    with _leased(run_devices, count, host_wide=False) as granted:
+        yield granted
 
 
 @pytest.fixture(autouse=True)
-def case_gpus(request: pytest.FixtureRequest) -> Iterator[None]:
-    """The case's lease, unless its module holds one."""
-    if not _is_gpu_e2e(request.node) or (
-        _module_gpus(request.module) is not None
-    ):
-        yield
+def lease(
+    request: pytest.FixtureRequest,
+    run_devices: tuple[int, ...],
+    module_lease: Lease | None,
+) -> Iterator[Lease | None]:
+    """The GPUs the case serves on: its module's lease, or its own."""
+    if not _is_gpu_e2e(request.node) or module_lease is not None:
+        yield module_lease
         return
     mark = request.node.get_closest_marker("gpus")
     count = int(mark.args[0]) if mark else 1
     host_wide = request.node.get_closest_marker("host_wide") is not None
-    with lease(count, host_wide):
-        yield
+    with _leased(run_devices, count, host_wide) as granted:
+        yield granted
 
 
-@pytest.fixture(scope="module", autouse=True)
+@pytest.fixture(scope="session")
 def build_server(
-    request: pytest.FixtureRequest, tmp_path_factory: pytest.TempPathFactory
-) -> Iterator[Path | None]:
-    """The module's Build Server, which every deployment it starts names.
+    uniserve: Path,
+    repository: Path,
+    e2e_settings: Settings,
+    tmp_path_factory: pytest.TempPathFactory,
+) -> Iterator[BuildServer]:
+    """The run's Build Server, with every package of the tree installed
+    (:func:`uniserve_testing.builds.tree_build_server`).
 
-    A deployment's epoch is resolved at this host's Build Server, and the
-    one a daemon starts by itself holds no package, so the module starts one
-    with every package of the tree installed, and `start_server` gives each
-    deployment that names no other ``build_config.socket`` this one. A
-    module that installs packages of its own overrides this fixture, and a
-    module that leases no GPU starts none.
-    """
-    # A module that leases no GPU starts no deployment.
-    if not _is_gpu_e2e(request.node) or _module_gpus(request.module) == 0:
-        yield None
-        return
-    with (
-        running_build_server(tmp_path_factory) as socket,
-        modules_from(socket),
-    ):
-        yield socket
+    A deployment's epoch is resolved at its host's Build Server, and the one
+    a daemon starts by itself holds no package. A module whose cases install
+    revisions of their own overrides this fixture with a server of its own,
+    since a revision installed here is what every later deployment of the
+    session would select.
+    """  # noqa: D205
+    with builds.tree_build_server(
+        uniserve,
+        repository,
+        tmp_path_factory.mktemp("build-server"),
+        scale=e2e_settings.time_scale,
+    ) as server:
+        yield server
+
+
+@pytest.fixture
+def deployments(
+    uniserve: Path,
+    build_server: BuildServer,
+    e2e_settings: Settings,
+    lease: Lease | None,
+    tmp_path: Path,
+) -> Deployments:
+    """The case's deployments, on its lease at the run's Build Server."""
+    return Deployments(uniserve, build_server, e2e_settings, lease, tmp_path)
+
+
+@pytest.fixture(scope="module")
+def module_deployments(
+    uniserve: Path,
+    build_server: BuildServer,
+    e2e_settings: Settings,
+    module_lease: Lease | None,
+    tmp_path_factory: pytest.TempPathFactory,
+) -> Deployments:
+    """The deployments of a module that serves one deployment for all its
+    cases, on the module's lease.
+    """  # noqa: D205
+    return Deployments(
+        uniserve,
+        build_server,
+        e2e_settings,
+        module_lease,
+        tmp_path_factory.mktemp("deployments"),
+    )

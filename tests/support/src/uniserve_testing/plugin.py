@@ -27,7 +27,9 @@ Options:
 
 from __future__ import annotations
 
+import os
 import shutil
+import sys
 import sysconfig
 from pathlib import Path
 
@@ -93,11 +95,56 @@ def pytest_addoption(parser: pytest.Parser) -> None:
         default=None,
         help="the address the second host reaches this host at",
     )
+    e2e.addoption(
+        "--mooncake-master",
+        default=None,
+        metavar="HOST:PORT",
+        help="a running Mooncake master, the remote store of the cases that "
+        "keep host blocks in one",
+    )
 
 
 def _device_indices(text: str) -> tuple[int, ...]:
     """The device indices of ``--e2e-devices``."""
     return tuple(int(index) for index in text.split(",") if index.strip())
+
+
+def interpreting(config: pytest.Config) -> bool:
+    """Whether the session runs the kernels on Triton's interpreter."""
+    return config.getoption("kernel_device") == "interpreter"
+
+
+#: Triton's setting of its mode, which ``triton.knobs.runtime.interpret``
+#: reads when Triton is imported and its language library is decorated.
+TRITON_MODE = "TRITON_INTERPRET"
+
+
+def pytest_configure(config: pytest.Config) -> None:
+    """Fix Triton's mode for the session (``--kernel-device``) before Triton
+    is first imported.
+
+    Triton fixes a function's mode when ``@triton.jit`` decorates it, and
+    decorates its own language library when it is first imported, so the
+    mode is one per process and must be chosen before any test module of
+    the session, whichever directory it lies in, imports Triton (a test
+    module that imports torch or transformers may). This hook runs when
+    pytest loads the plugin, before collection. The choice is Triton's own
+    setting, the only one it reads before it decorates its language
+    library; a process a test starts runs with the declared environment of
+    :func:`uniserve_testing.servers.environment`, which does not carry it.
+
+    Raises:
+        pytest.UsageError: When Triton was imported earlier in another mode.
+    """  # noqa: D205
+    triton = sys.modules.get("triton")
+    if triton is not None:
+        if triton.knobs.runtime.interpret != interpreting(config):
+            raise pytest.UsageError(
+                "Triton was imported in the other mode before the session "
+                "chose its own (--kernel-device)"
+            )
+        return
+    os.environ[TRITON_MODE] = "1" if interpreting(config) else "0"
 
 
 #: The program the root project installs into its environment's scripts
@@ -173,3 +220,18 @@ def peer_host(pytestconfig: pytest.Config) -> RemoteHost:
             "--leader-address"
         )
     return RemoteHost(destination, address, leader)
+
+
+@pytest.fixture(scope="session")
+def mooncake_master(pytestconfig: pytest.Config) -> str:
+    """The Mooncake master a remote store case keeps its objects at
+    (``kv_cache_config.mooncake.master``, ``host:port``): a service of the
+    host the run names with ``--mooncake-master``; the case is skipped
+    without one. The Storage Server's connector opens Mooncake Store's C API
+    from the loader's default search path, where the Mooncake package
+    installs it.
+    """  # noqa: D205
+    master = pytestconfig.getoption("mooncake_master")
+    if master is None:
+        pytest.skip("a remote store case needs --mooncake-master")
+    return master

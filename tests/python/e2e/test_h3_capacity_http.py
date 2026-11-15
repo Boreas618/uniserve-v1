@@ -2,33 +2,20 @@
 
 from __future__ import annotations
 
-import re
-import time
 from pathlib import Path
 
-import httpx
 import pytest
-from transformers import AutoTokenizer
-
-from tests.python.e2e.http_helpers import (
-    H3_CHECKPOINT,
-    engine_selection,
-    host_asset,
-    require_uniserve_binary,
-    server_process,
-)
-from tests.python.e2e.test_h3_parallel_http import _assert_media_values_close
-from uniserve_eval.datasets.minimax_h3 import _PROMPT
-from uniserve_eval.transport.video import inspect_video_bytes
+from uniserve_testing import assets, media
+from uniserve_testing.deployments import Deployments
 
 pytestmark = [
     pytest.mark.e2e,
     pytest.mark.gpu,
     pytest.mark.model("minimax_h3"),
-    # Every deployment of the module serves on the host's four GPUs.
-    pytest.mark.gpus(4),
 ]
 
+#: The canvas every request asks for, one of the default deployment's.
+SIZE = "1344x768"
 # Every output length the [4, 15] second API range produces at 24 fps.
 FRAME_COUNTS = tuple(107 + 17 * index for index in range(16))
 # Prompt lengths around and between the text capacities: the listed 1024 and
@@ -38,67 +25,21 @@ TEXT_CAPACITIES = "[1024]"
 
 
 def _request(prompt: str, seconds: float, seed: int) -> dict[str, object]:
-    """A 1344x768 t2va request for a duration the server aligns to frames."""
+    """A t2va request at :data:`SIZE` for a duration the server aligns to
+    frames.
+    """  # noqa: D205
     return {
         "model": "FastH3",
         "prompt": prompt,
-        "size": "1344x768",
+        "size": SIZE,
         "seconds": seconds,
         "seed": seed,
     }
 
 
-def _prompt(tokenizer, target: int) -> str:
-    """The benchmark prompt, cut or extended to exactly ``target`` tokens."""
-    filler = tokenizer.encode(
-        " A coherent continuation preserves the scene, motion, lighting, and "
-        "sound.",
-        add_special_tokens=False,
-    )
-    ids = tokenizer.encode(_PROMPT, add_special_tokens=False)[:target]
-    while len(ids) < target:
-        ids.extend(filler[: target - len(ids)])
-    text = tokenizer.decode(
-        ids, skip_special_tokens=True, clean_up_tokenization_spaces=False
-    )
-    assert len(tokenizer.encode(text, add_special_tokens=False)) == target
-    return text
-
-
-def _graph_modes(client: httpx.Client) -> dict[str, float]:
-    """Sum the worker's graph replay, capture and eager call counters."""
-    response = client.get("/metrics")
-    response.raise_for_status()
-    result: dict[str, float] = {}
-    for line in response.text.splitlines():
-        match = re.match(
-            r"uniserve:worker_graph_runtime_mode_counts_total"
-            r"\{([^}]*)\} (\S+)",
-            line,
-        )
-        if match:
-            mode = dict(re.findall(r'(\w+)="([^"]*)"', match.group(1)))["mode"]
-            result[mode] = result.get(mode, 0.0) + float(match.group(2))
-    return result
-
-
-def _settled(client: httpx.Client) -> dict[str, float]:
-    # Worker statistics reach the registry with the engine's periodic
-    # snapshot; read them once they stop moving.
-    current, stable = _graph_modes(client), 0
-    deadline = time.monotonic() + 120
-    while stable < 3:
-        if time.monotonic() > deadline:
-            pytest.fail("worker graph counters did not settle")
-        time.sleep(1)
-        value = _graph_modes(client)
-        stable = stable + 1 if value == current else 0
-        current = value
-    return current
-
-
+@pytest.mark.gpus(4)
 def test_every_admitted_duration_and_prompt_length_replays(
-    tmp_path: Path,
+    deployments: Deployments, repository: Path
 ) -> None:
     """Serve the complete admitted range from startup-captured graphs.
 
@@ -111,43 +52,27 @@ def test_every_admitted_duration_and_prompt_length_replays(
     of different layouts then run concurrently on the two request slots, and
     each matches its own isolated execution.
     """
-    model = str(host_asset("UNISERVE_H3_MODEL", H3_CHECKPOINT))
-    deployment = (
-        Path(__file__).resolve().parents[3]
-        / "configs"
-        / "minimax_h3"
-        / "ulysses4.toml"
-    )
-    command = [
-        str(require_uniserve_binary()),
-        "serve",
-        "--model-dir",
-        model,
-        "--config",
-        str(deployment),
-        *engine_selection(),
-        "--served-model-name",
-        "FastH3",
-        "--max-running-requests",
-        "2",
-        "--max-model-len",
-        "16384",
-        "--set",
-        "video_config.max_seconds=15",
-        "--set",
-        f"video_config.text_capacities={TEXT_CAPACITIES}",
-    ]
-    tokenizer = AutoTokenizer.from_pretrained(Path(model) / "tokenizer")
+    tokenizer = media.tokenizer(assets.CHECKPOINTS["fasth3"])
 
     with (
-        server_process(
-            command, tmp_path / "capacity.log", timeout_s=2400
+        deployments.serve(
+            "--served-model-name",
+            "FastH3",
+            "--config",
+            str(repository / "configs" / "minimax_h3" / "ulysses4.toml"),
+            "--max-running-requests",
+            "2",
+            "--max-model-len",
+            "16384",
+            "--set",
+            "video_config.max_seconds=15",
+            "--set",
+            f"video_config.text_capacities={TEXT_CAPACITIES}",
+            model=assets.CHECKPOINTS["fasth3"].model,
         ) as server,
-        httpx.Client(timeout=900) as client,
+        media.api(server) as api,
     ):
-        base = server.base_url
-        client.base_url = base
-        capabilities = client.get("/v1/capabilities").json()["video"]["model"]
+        capabilities = api.get("/v1/capabilities").json()["video"]["model"]
         assert (
             capabilities["min_seconds"],
             capabilities["max_seconds"],
@@ -158,54 +83,49 @@ def test_every_admitted_duration_and_prompt_length_replays(
             # Eight frames short of the output length, which extends to it.
             seconds = (frames - 8) / 24
             tokens = PROMPT_TOKENS[index % len(PROMPT_TOKENS)]
-            before = _settled(client)
-            response = client.post(
+            before = media.graph_dispatches(
+                server, "graph_capture", "graph_replay"
+            )
+            response = api.post(
                 "/v1/videos/sync",
                 json=_request(
-                    _prompt(tokenizer, tokens), seconds, 2000 + index
+                    media.exact_prompt(tokenizer, tokens), seconds, 2000 + index
                 ),
             )
-            response.raise_for_status()
-            media = inspect_video_bytes(
-                response.content,
-                declared_mime=response.headers["content-type"],
+            media.assert_generated(
+                response,
+                size=SIZE,
+                frames=frames,
+                media_format=media.MINIMAX_H3,
             )
-            assert media.frame_count == frames, (seconds, tokens)
-            assert response.headers["x-video-num-frames"] == str(frames)
-            assert (media.width, media.height) == (1344, 768)
-            assert (media.audio_channels, media.audio_sample_rate) == (
-                2,
-                32000,
+            after = media.graph_dispatches(
+                server, "graph_capture", "graph_replay"
             )
-            after = _settled(client)
-            assert after.get("graph_capture", 0.0) == before.get(
-                "graph_capture", 0.0
-            ), (seconds, tokens)
+            assert after["graph_capture"] == before["graph_capture"], (
+                seconds,
+                tokens,
+            )
             # Eight denoising steps, the text encoder and the refiner.
-            assert (
-                after["graph_replay"] - before.get("graph_replay", 0.0) >= 10
-            ), (seconds, tokens)
+            assert after["graph_replay"] - before["graph_replay"] >= 10, (
+                seconds,
+                tokens,
+            )
 
         # Two layouts in flight together keep their own slots and state.
         payloads = [
-            _request(_prompt(tokenizer, 500), 7.3, 3001),
-            _request(_prompt(tokenizer, 9000), 12.2, 3002),
+            _request(media.exact_prompt(tokenizer, 500), 7.3, 3001),
+            _request(media.exact_prompt(tokenizer, 9000), 12.2, 3002),
         ]
         ids = [
-            client.post("/v1/videos", json=payload).json()["id"]
+            api.post("/v1/videos", json=payload).json()["id"]
             for payload in payloads
         ]
         for payload, job_id in zip(payloads, ids, strict=True):
-            deadline = time.monotonic() + 900
-            while time.monotonic() < deadline:
-                job = client.get(f"/v1/videos/{job_id}").json()
-                assert job["status"] != "failed", job
-                if job["status"] == "completed":
-                    break
-                time.sleep(0.2)
-            else:
-                pytest.fail("concurrent video did not complete")
-            content = client.get(f"/v1/videos/{job_id}/content")
-            isolated = client.post("/v1/videos/sync", json=payload)
+            content = media.job_video(server, job_id)
+            isolated = api.post("/v1/videos/sync", json=payload)
             isolated.raise_for_status()
-            _assert_media_values_close(content.content, isolated.content)
+            media.assert_same_media(
+                content.content,
+                isolated.content,
+                tolerance=media.BF16_COMPOSITION,
+            )

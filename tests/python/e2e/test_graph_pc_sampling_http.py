@@ -1,6 +1,6 @@
 """PC sampling of a deployment's CUDA graphs.
 
-Qwen3 serves on the GPU the module's lease granted with
+Qwen3 serves on the GPU the module's lease holds with
 ``profiling_config.graph_pc_sampling``: every worker enables PC sampling
 before it captures its graphs, so a session's PC samples name the kernels
 the graphs launch, which a timeline in node mode records inside graphs.
@@ -12,11 +12,14 @@ from __future__ import annotations
 
 from collections.abc import Iterator
 from pathlib import Path
+from typing import Any
 
 import pytest
+from uniserve_testing import admin, profiling
+from uniserve_testing.deployments import Deployments
+from uniserve_testing.profiling import Load
+from uniserve_testing.servers import Server
 
-from tests.python.e2e.http_helpers import admin_request
-from tests.python.e2e.profiling_helpers import Load, ended, serve, start
 from uniserve_eval.profile import ProfileFile
 
 pytestmark = [
@@ -28,26 +31,18 @@ pytestmark = [
 ]
 
 OPTIONS = (
-    "dtype=bfloat16",
-    "attention_backend=trtllm",
-    "max_num_batched_tokens=512",
+    "--set",
     "kv_cache_config.max_tokens=32768",
-    "chat_config.reasoning_parser=none",
-    "cuda_graph_config.prefill_token_sizes=[512]",
-    "cuda_graph_config.decode_batch_sizes=[1, 2, 4, 8]",
+    "--set",
     "profiling_config.graph_pc_sampling=true",
 )
 
 
 @pytest.fixture(scope="module")
-def served(
-    tmp_path_factory: pytest.TempPathFactory, build_server: Path
-) -> Iterator[str]:
+def served(module_deployments: Deployments) -> Iterator[Server]:
     """A Qwen3 deployment whose workers keep PC sampling enabled."""
-    with serve(
-        tmp_path_factory.mktemp("served"), OPTIONS, build_server
-    ) as base_url:
-        yield base_url
+    with profiling.serve(module_deployments, *OPTIONS) as server:
+        yield server
 
 
 @pytest.mark.parametrize(
@@ -60,23 +55,24 @@ def served(
     ],
 )
 def test_collectors_cupti_cannot_run_beside_it_are_refused(
-    served: str, tmp_path: Path, request_body: dict
+    served: Server, tmp_path: Path, request_body: dict[str, Any]
 ):
-    response = admin_request(
+    response = admin.request(
         served,
         "POST",
-        "/admin/profile",
+        profiling.PROFILE,
         body={**request_body, "output_dir": str(tmp_path)},
-        timeout_s=600,
     )
     assert response.status_code == 400, response.text
     assert "profiling_config.graph_pc_sampling" in response.text
 
 
-def test_pc_samples_name_the_kernels_graphs_launch(served: str, tmp_path: Path):
+def test_pc_samples_name_the_kernels_graphs_launch(
+    served: Server, tmp_path: Path
+):
     output = tmp_path / "profiles"
     with Load(served):
-        start(
+        profiling.start(
             served,
             {
                 "collectors": ["timeline", "pc_sampling"],
@@ -87,7 +83,7 @@ def test_pc_samples_name_the_kernels_graphs_launch(served: str, tmp_path: Path):
                 "output_dir": str(output),
             },
         )
-        session = ended(served, 600)
+        session = profiling.ended(served)
     assert session["end_reason"] == "window", session
 
     [path] = sorted(output.glob("*.sqlite"))

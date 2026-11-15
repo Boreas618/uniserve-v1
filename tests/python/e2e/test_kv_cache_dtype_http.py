@@ -5,28 +5,18 @@ cache (``kv_cache_config.dtype=float16``), with CUDA graphs captured for
 prefill and decode. The FP16 deployment's attention reads and writes its KV
 blocks in FP16, so its greedy outputs differ from the BF16 deployment's only
 by rounding. They are compared by the rule of vLLM's
-``check_logprobs_close``: the two outputs of a prompt agree token for token
-until their first difference, where each output's token is among the other's
-``TOP_LOGPROBS`` most likely tokens.
+``check_logprobs_close`` (:func:`uniserve_testing.chat.assert_logprobs_close`):
+the two outputs of a prompt agree token for token until their first
+difference, where each output's token is among the other's ``TOP_LOGPROBS``
+most likely tokens.
 """
 
 from __future__ import annotations
 
-import json
-from pathlib import Path
-
-import httpx
 import pytest
-
-from tests.python.e2e.http_helpers import (
-    ATTENTION_BACKEND,
-    QWEN3_CHECKPOINT,
-    engine_selection,
-    granted_devices,
-    host_asset,
-    require_uniserve_binary,
-    server_process,
-)
+from uniserve_testing import chat
+from uniserve_testing.assets import CHECKPOINTS
+from uniserve_testing.deployments import Deployments
 
 pytestmark = [pytest.mark.e2e, pytest.mark.gpu, pytest.mark.model("qwen3")]
 
@@ -47,106 +37,56 @@ TOP_LOGPROBS = 5
 
 
 def _generate(
-    tmp_path: Path, checkpoint: str, label: str, extra: list[str]
+    deployments: Deployments, name: str, *options: str
 ) -> list[list[tuple[str, set[str]]]]:
-    """Serve the model with `extra` arguments and decode every prompt.
+    """Serve the model with `options` and decode every prompt.
 
     Returns each prompt's generated tokens, each with the set of its
     position's most likely tokens, as ``token_id:<id>`` strings.
     """
-    command = [
-        str(require_uniserve_binary()),
-        "serve",
-        "--model-dir",
-        checkpoint,
+    with deployments.serve(
         "--served-model-name",
         SERVED_MODEL,
-        "--host",
-        "127.0.0.1",
-        *engine_selection(),
-        "--set",
-        'dtype="bfloat16"',
-        "--set",
-        f'attention_backend="{ATTENTION_BACKEND}"',
-        "--set",
-        "kv_cache_config.max_tokens=16384",
-        "--max-model-len",
-        "4096",
-        "--max-running-requests",
-        "8",
-        "--set",
-        "kv_cache_config.block_size=64",
-        "--set",
-        'chat_config.reasoning_parser="none"',
-        *extra,
-    ]
-    outputs = []
-    with server_process(
-        command,
-        tmp_path / f"{label}.log",
-        timeout_s=900,
-        env={"CUDA_VISIBLE_DEVICES": granted_devices(1)},
+        *options,
+        model=CHECKPOINTS["qwen3"].model,
+        name=name,
     ) as server:
-        base_url = server.base_url
-        for prompt in PROMPTS:
-            response = httpx.post(
-                f"{base_url}/v1/chat/completions",
-                json={
-                    "model": SERVED_MODEL,
-                    "messages": [{"role": "user", "content": prompt}],
-                    "temperature": 0,
-                    # No candidate is masked, so every reported candidate
-                    # carries the model's own probability.
-                    "top_p": 1.0,
-                    "top_k": 0,
-                    "min_p": 0.0,
-                    "max_completion_tokens": MAX_TOKENS,
-                    "logprobs": True,
-                    "top_logprobs": TOP_LOGPROBS,
-                    "return_tokens_as_token_ids": True,
-                },
-                timeout=300,
+        return [
+            chat.ranked_tokens(
+                chat.complete(
+                    server.base_url,
+                    chat.body(
+                        SERVED_MODEL,
+                        prompt,
+                        MAX_TOKENS,
+                        # No candidate is masked, so every reported
+                        # candidate carries the model's own probability.
+                        **chat.GREEDY,
+                        logprobs=True,
+                        top_logprobs=TOP_LOGPROBS,
+                        return_tokens_as_token_ids=True,
+                    ),
+                )
             )
-            response.raise_for_status()
-            content = response.json()["choices"][0]["logprobs"]["content"]
-            outputs.append(
-                [
-                    (
-                        entry["token"],
-                        {top["token"] for top in entry["top_logprobs"]},
-                    )
-                    for entry in content
-                ]
-            )
-    (tmp_path / f"{label}.json").write_text(
-        json.dumps([[token for token, _ in output] for output in outputs])
-    )
-    return outputs
+            for prompt in PROMPTS
+        ]
 
 
-def test_an_fp16_cache_serves_a_bf16_model_like_a_bf16_cache(tmp_path: Path):
-    checkpoint = str(host_asset("UNISERVE_QWEN3_MODEL", QWEN3_CHECKPOINT))
-
-    reference = _generate(tmp_path, checkpoint, "bfloat16-cache", [])
+def test_an_fp16_cache_serves_a_bf16_model_like_a_bf16_cache(
+    deployments: Deployments,
+):
+    reference = _generate(deployments, "bfloat16-cache")
     converted = _generate(
-        tmp_path,
-        checkpoint,
+        deployments,
         "float16-cache",
-        ["--set", 'kv_cache_config.dtype="float16"'],
+        "--set",
+        'kv_cache_config.dtype="float16"',
     )
 
     for prompt, expected, actual in zip(
         PROMPTS, reference, converted, strict=True
     ):
         assert actual, prompt
-        for position, ((token, top), (other, other_top)) in enumerate(
-            zip(expected, actual)
-        ):
-            if token == other:
-                continue
-            assert token in other_top and other in top, (
-                f"{prompt!r} diverges at token {position}: {token} is not "
-                f"among the FP16 cache's top tokens {sorted(other_top)}, or "
-                f"{other} not among the BF16 cache's {sorted(top)}"
-            )
-            break
+        chat.assert_logprobs_close(
+            expected, actual, f"{prompt!r} on a BF16 and an FP16 cache"
+        )

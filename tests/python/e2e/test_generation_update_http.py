@@ -1,7 +1,8 @@
 """A generation update while a deployment serves (``specs/updates.md`` §3.1).
 
-One Qwen3-MoE deployment serves on one GPU while the test replaces kernel
-packages and the scheduling policy under it:
+One Qwen3-MoE deployment serves on one GPU, as the deployment both update
+modules serve (:data:`uniserve_testing.updates.PROFILE`), while the cases
+replace kernel packages and the scheduling policy under it:
 
 - one kernel package swapped by **rebind**, one by **recapture** together with
   the **policy**, then **rolled back**, with no request failing at any step;
@@ -11,99 +12,50 @@ packages and the scheduling policy under it:
 - the allocator's mapped bytes stay within the device's budget while both
   generations' graphs exist.
 
-The Build Server runs beside the deployment: the test starts it, installs a
-variant package into it, and applies the unchanged deployment configuration,
-which is what moves a newly installed revision into a generation update
-(``docs/admin.md``, Updates). Phases are asserted on the daemon's events,
-never on sleeps.
+Each case installs a revision at the run's Build Server and applies the
+unchanged deployment configuration, which is what moves a newly installed
+revision into a generation update (``docs/admin.md``, Updates). Phases are
+asserted on the daemon's events, never on sleeps. The revisions are derived
+from the serving packages by the mutations ``tests/python/e2e/packages``
+declares (:func:`uniserve_testing.updates.derived`):
 
-The model is ``UNISERVE_QWEN3_MODEL``'s checkpoint; the module is skipped
-when it is unset. The packages are revisions of serving packages, each derived
-from its serving package by a mutation ``packages/`` declares
-(``build_server.derived_package``), and each variable below names another:
+- ``rms_norm`` ``rebind``: a package of an operator the slice launches every
+  step, with the serving descriptor key and the same launch structure (a
+  rebind swap);
+- ``gemm`` ``recapture``: a package of one operator whose single entry
+  launches two kernels (a native module; the recapture case of 4.5);
+- the serving scheduling policy (wasm) installed again, which makes its next
+  revision;
+- ``rms_norm`` ``wrong``: a package of the rebind operator whose result is
+  outside ``Op::tolerance``.
 
-- ``UNISERVE_REBIND_PACKAGE``: a package of an operator the slice
-  launches every step, with the serving descriptor key and the same launch
-  structure (a rebind swap).
-- ``UNISERVE_RECAPTURE_PACKAGE``: a package of one operator whose single
-  entry launches two kernels (a native module; the recapture case of 4.5).
-- ``UNISERVE_POLICY_PACKAGE``: a scheduling-policy package (wasm) of the
-  serving policy's backend, which installing makes its next revision.
-- ``UNISERVE_WRONG_PACKAGE``: a package of the rebind operator whose
-  result is outside ``Op::tolerance``.
-- ``UNISERVE_MODULE_TARGET``: the Build Server's target, derived from the
-  served device (``sm_100a`` on Blackwell) when unset.
-
-The Build Server's toolchain environment is its program on the search path
-(``uniserve-build-server``), and the binary is named by
-``UNISERVE_BINARY``.
+The Build Server is the run's, so the module installs the serving packages
+it replaced again when it ends: their latest revisions are then the tree's
+kernels, which every later deployment of the run serves.
 
 The admin surface is the operator socket's: `POST /admin/config/commit` and
-`/admin/config/rollback`, events whose `kind` is `deployment` and whose
-`data` is the update as it stood, its `phase` among them, and
-`/admin/config`'s `epochs` array whose elements carry `kernels` and
-`previous_kernels` as a list of `{op, phase, package: {backend, revision,
-arguments}}`.
+`/admin/config/rollback`, events whose `kind` is `update` and whose `data` is
+the update as it stood, its `phase` among them, and `/admin/config`'s `epochs`
+array whose elements carry `kernels` and `previous_kernels` as a list of
+`{op, phase, package: {backend, revision, arguments}}`.
 """
 
 from __future__ import annotations
 
 import json
-import os
-import re
-import subprocess
 import threading
-import time
 from collections.abc import Iterator
 from pathlib import Path
 
 import httpx
 import pytest
-
-from tests.python.e2e.build_server import (
-    POLICY_PACKAGE,
-    derived_package,
-    repository,
-)
-from tests.python.e2e.build_server import (
-    build_server as running_build_server,
-)
-from tests.python.e2e.http_helpers import (
-    QWEN3_CHECKPOINT,
-    admin,
-    admin_config,
-    admin_request,
-    admin_status,
-    apply_config,
-    engine_selection,
-    host_asset,
-    require_uniserve_binary,
-    server_process,
-)
-
-#: Options every deployment this file serves with. They are the live-update
-#: file's, deliberately: the two files serve the same model on the same host,
-#: and a deployment that stated a different attention backend, graph catalogue
-#: or token budget would be a second deployment whose numbers nobody could
-#: compare with the first's.
-#:
-#: `attention_backend` in particular is not optional: a package is selected by
-#: its backend's name, so a deployment left at `auto` states no package and its
-#: epoch cannot be prepared at all.
-DEPLOYMENT_OPTIONS = (
-    "dtype=bfloat16",
-    "attention_backend=trtllm",
-    "kv_cache_config.max_tokens=32768",
-    "chat_config.reasoning_parser=none",
-    "cuda_graph_config.prefill_token_sizes=[512]",
-    "cuda_graph_config.decode_batch_sizes=[1, 2, 4, 8]",
-    "max_num_batched_tokens=512",
-)
-
-#: The host tier this deployment holds, in GiB. The live-update file serves the
-#: same model with the same figure, so the two files' deployments size their
-#: host memory alike.
-HOST_GIB = 8
+from uniserve_testing import admin, builds, chat, updates
+from uniserve_testing.assets import CHECKPOINTS
+from uniserve_testing.builds import BuildServer
+from uniserve_testing.client import metric
+from uniserve_testing.deployments import Deployments, Settings
+from uniserve_testing.servers import Server
+from uniserve_testing.updates import Stream
 
 pytestmark = [
     pytest.mark.e2e,
@@ -112,6 +64,9 @@ pytestmark = [
     # The module's cases are one deployment's history.
     pytest.mark.gpus(1),
 ]
+
+#: The deployment's served model name.
+NAME = "qwen3-moe"
 
 PROMPTS = [
     "Explain what a KV cache is in two sentences.",
@@ -126,186 +81,85 @@ PROMPTS = [
 
 CONCURRENCY = 8
 MAX_TOKENS = 64
-STEP_TIMEOUT_S = 900.0
 
-# The phases the daemon reports for one update, up to its trial and after it
-# (``docs/admin.md``, One update, two forms).
-TO_TRIAL = ["preparing", "switching", "trial"]
-COMMITTED = ["committed"]
-ROLLED_BACK = ["rolled_back"]
-
-
-#: The derived revision each kernel package variable stands for when it is
-#: unset: a fixture of ``packages/`` and its variant.
-DERIVED = {
-    "UNISERVE_REBIND_PACKAGE": ("rms_norm", "rebind"),
-    "UNISERVE_RECAPTURE_PACKAGE": ("gemm", "recapture"),
-    "UNISERVE_WRONG_PACKAGE": ("rms_norm", "wrong"),
-}
-
-
-def _package(name: str, directory: Path) -> Path:
-    """The package directory `name` names, else its derived revision written
-    into `directory`, or the deployment's own policy package, whose second
-    installation is the next revision of its backend.
-    """  # noqa: D205
-    value = os.environ.get(name)
-    if value:
-        path = Path(value)
-    elif name in DERIVED:
-        path = derived_package(*DERIVED[name], directory)
-    else:
-        path = repository() / POLICY_PACKAGE
-    if not path.is_dir():
-        pytest.fail(f"{name}: {path} is not a package directory")
-    return path
-
-
-@pytest.fixture(scope="module")
-def model() -> Path:
-    return host_asset("UNISERVE_QWEN3_MODEL", QWEN3_CHECKPOINT)
-
-
-@pytest.fixture(scope="module")
-def build_server(tmp_path_factory: pytest.TempPathFactory):
-    """The host's Build Server, with every package installed.
-
-    The deployment's startup builds the kernels its recorded walk names, and
-    the scheduling policy is installed beside them; the shared helper does
-    both, so this file and the others serve one store the same way.
-    """
-    with running_build_server(tmp_path_factory) as socket:
-        yield {"socket": socket, "binary": require_uniserve_binary()}
-
-
-@pytest.fixture(scope="module")
-def server(
-    model: Path, build_server, tmp_path_factory: pytest.TempPathFactory
-) -> Iterator[str]:
-    """One deployment of `model` beside this host's Build Server.
-
-    Module-scoped, like the epoch history the tests read back.
-
-    Every test here requests `server`, and until this fixture existed none of
-    them could start: pytest fails the setup of a test whose fixture is
-    undefined and reports it as an error rather than a failure, so a run of the
-    file read "no failures" with no test executed.
-
-    The deployment is module-scoped because the tests are one epoch history —
-    a rebind, a recapture with its policy, a rollback and a refusal — each read
-    back through `/admin/status` and `/metrics` against the same deployment's
-    records. The options are `DEPLOYMENT_OPTIONS`, the live-update file's
-    deliberately, and the host tier is `HOST_GIB`, the figure that file
-    serves the same model with.
-    """
-    directory = tmp_path_factory.mktemp("deployment")
-    log = directory / "deployment.log"
-    command = [
-        str(require_uniserve_binary()),
-        "serve",
-        "--model-dir",
-        str(model),
-        "--served-model-name",
-        "qwen3-moe",
-        "--host",
-        "127.0.0.1",
-        *engine_selection(),
-        "--set",
-        f'build_config.socket="{build_server["socket"]}"',
-        "--set",
-        f"kv_cache_config.host_gib={HOST_GIB}",
-    ]
-    for option in DEPLOYMENT_OPTIONS:
-        command += ["--set", option]
-    with server_process(command, log, timeout_s=1800) as server:
-        base_url = server.base_url
-        yield base_url
-
-
+#: The tokens the running request of a preparation's shadow asks for: more
+#: than an update takes to prepare at the deployment's steps.
 RESIDENT_TOKENS = 512
 
 # The two sentences a wrong-kernel refusal can carry. The comparison's own
-# sentence names the element
-# that left tolerance and the bound it left; the idle sentence says no request
-# ran a step, which means
-# nothing was compared. A guard that accepts both cannot tell a refused kernel
-# from an update that
+# sentence names the element that left tolerance and the bound it left; the
+# idle sentence says no request ran a step, which means nothing was compared.
+# A guard that accepts both cannot tell a refused kernel from an update that
 # never ran one.
 COMPARED = "differ beyond tolerance"
 IDLE = "no running request ran a step"
 
 
-class Resident:
-    """One streamed completion, held running for a whole update window.
+@pytest.fixture(scope="module")
+def server(module_deployments: Deployments) -> Iterator[Server]:
+    """The module's deployment, beside the run's Build Server.
+
+    Module-scoped because the cases are one epoch history — a rebind, a
+    recapture with its policy, a rollback and a refusal — each read back
+    through ``/admin/config`` and ``/metrics`` against the same deployment's
+    records.
+    """
+    with module_deployments.serve(
+        "--served-model-name",
+        NAME,
+        *updates.assigned(*updates.PROFILE),
+        model=CHECKPOINTS["qwen3"].model,
+        name="deployment",
+    ) as served:
+        yield served
+
+
+@pytest.fixture(scope="module")
+def build_server(
+    uniserve: Path,
+    repository: Path,
+    e2e_settings: Settings,
+    tmp_path_factory: pytest.TempPathFactory,
+) -> Iterator[BuildServer]:
+    """The module's own Build Server, with the tree's packages installed.
+
+    A revision the module installs is what every later epoch selects, so the
+    module installs its revisions at a server of its own, which no other
+    module's deployment resolves at.
+    """
+    with builds.tree_build_server(
+        uniserve,
+        repository,
+        tmp_path_factory.mktemp("build-server"),
+        scale=e2e_settings.time_scale,
+    ) as server:
+        yield server
+
+
+def _resident(base_url: str, prompt: str) -> Stream:
+    """One streamed completion, held running for a whole update window,
+    once its first frame arrived.
 
     The shadow pairs a changed operator's kernel on one step of the batches a
     scheduler forms from its **running** requests. A closed loop of short
     requests has moments with none in flight, and a preparation that lands in
     one of them compares nothing and fails by name ("no running request ran a
     step"). Holding one request open for as long as the caller keeps it makes
-    the wrong-kernel assertion mean what it says.
+    the wrong-kernel assertion mean what it says. Its first frame proves the
+    engine formed a batch for it: it is running, not waiting behind
+    admission.
 
-    The stream is drained on its own thread so the daemon is never blocked by
-    backpressure, and `close` ends it: the caller closes it after the update's
-    answer has arrived and before any failure is read, so a request in flight
-    never races the assertions.
-    """
-
-    def __init__(self, base_url: str, prompt: str) -> None:
-        self._closed = threading.Event()
-        self._client = httpx.Client(timeout=STEP_TIMEOUT_S)
-        request = self._client.build_request(
-            "POST",
-            f"{base_url}/v1/chat/completions",
-            json={
-                "model": "qwen3-moe",
-                "messages": [{"role": "user", "content": prompt}],
-                "max_completion_tokens": RESIDENT_TOKENS,
-                "stream": True,
-            },
-        )
-        self._response = self._client.send(request, stream=True)
-        if self._response.status_code != 200:
-            body = self._response.read()[:300]
-            self.close()
-            raise AssertionError(
-                "the running request was refused: "
-                f"{self._response.status_code}: {body!r}"
-            )
-        self._lines = self._response.iter_lines()
-        # The first line proves the engine formed a batch for this request: it
-        # is running, not waiting behind admission.
-        # An SSE comment or a blank line can precede the first frame, so a few
-        # are read before the stream is called silent.
-        first = ""
-        for _ in range(4):
-            first = next(self._lines, "")
-            if "data:" in first:
-                break
-        if "data:" not in first:
-            self.close()
-            raise AssertionError(
-                f"the running request produced no stream: {first!r}"
-            )
-        self._reader = threading.Thread(target=self._drain, daemon=True)
-        self._reader.start()
-
-    def _drain(self) -> None:
-        try:
-            for _ in self._lines:
-                if self._closed.is_set():
-                    return
-        except (httpx.HTTPError, OSError):
-            # A stream the client closed is the caller's own doing, not a
-            # failure of the deployment.
-            return
-
-    def close(self) -> None:
-        self._closed.set()
-        try:
-            self._response.close()
-        finally:
-            self._client.close()
+    The caller closes it after the update's answer has arrived and before any
+    failure is read, so a request in flight never races the assertions.
+    """  # noqa: D205
+    stream = Stream(
+        base_url, chat.body(NAME, prompt, RESIDENT_TOKENS, stream=True)
+    )
+    stream.wait_for(
+        lambda streamed: streamed.frames >= 1,
+        "the running request produced no stream",
+    )
+    return stream
 
 
 class Traffic:
@@ -315,6 +169,9 @@ class Traffic:
         self.base_url = base_url
         self.failures: list[str] = []
         self.completed = 0
+        # The failures and completions change under this condition, which
+        # wakes a caller waiting for the loop's progress.
+        self._progress = threading.Condition()
         self._stop = threading.Event()
         self._threads = [
             threading.Thread(target=self._loop, args=(prompt,), daemon=True)
@@ -323,32 +180,38 @@ class Traffic:
         for thread in self._threads:
             thread.start()
 
+    def served(self, count: int) -> None:
+        """Wait until the loop completed `count` requests, or one failed."""
+        with self._progress:
+            self._progress.wait_for(
+                lambda: self.completed >= count or bool(self.failures)
+            )
+
+    def _fail(self, failure: str) -> None:
+        with self._progress:
+            self.failures.append(failure)
+            self._progress.notify_all()
+
     def _one(self, prompt: str) -> None:
-        body = {
-            "model": "qwen3-moe",
-            "messages": [{"role": "user", "content": prompt}],
-            "max_completion_tokens": MAX_TOKENS,
-            "stream": False,
-        }
-        response = httpx.post(
-            f"{self.base_url}/v1/chat/completions", json=body, timeout=600.0
-        )
-        if response.status_code != 200:
-            self.failures.append(
-                f"{response.status_code}: {response.text[:300]}"
+        try:
+            answer = chat.complete(
+                self.base_url, chat.body(NAME, prompt, MAX_TOKENS)
+            )
+        except httpx.HTTPStatusError as error:
+            self._fail(
+                f"{error.response.status_code}: {error.response.text[:300]}"
             )
             return
-        payload = response.json()
-        choice = payload["choices"][0]
+        choice = answer["choices"][0]
         if not choice.get("message", {}).get("content"):
-            self.failures.append(f"empty content: {json.dumps(payload)[:300]}")
+            self._fail(f"empty content: {json.dumps(answer)[:300]}")
             return
         if choice.get("finish_reason") in (None, "migratable"):
-            self.failures.append(
-                f"no finish reason: {json.dumps(choice)[:300]}"
-            )
+            self._fail(f"no finish reason: {json.dumps(choice)[:300]}")
             return
-        self.completed += 1
+        with self._progress:
+            self.completed += 1
+            self._progress.notify_all()
 
     def _loop(self, prompt: str) -> None:
         while not self._stop.is_set():
@@ -356,109 +219,60 @@ class Traffic:
                 self._one(prompt)
             except Exception as error:  # noqa: BLE001 - a request that cannot be
                 # made is a failure of the update under test, not of the test.
-                self.failures.append(f"{type(error).__name__}: {error}")
+                self._fail(f"{type(error).__name__}: {error}")
 
     def stop(self) -> None:
+        """End the loop once each request in flight answered."""
         self._stop.set()
         for thread in self._threads:
-            thread.join(timeout=120.0)
+            thread.join()
 
 
 @pytest.fixture(scope="module")
-def traffic(server: str):
-    loop = Traffic(server)
-    deadline = time.monotonic() + 300.0
-    while loop.completed < CONCURRENCY and time.monotonic() < deadline:
-        time.sleep(0.5)
-    assert loop.completed >= CONCURRENCY, "the deployment served nothing"
+def traffic(server: Server) -> Iterator[Traffic]:
+    loop = Traffic(server.base_url)
     try:
+        loop.served(CONCURRENCY)
+        assert not loop.failures, f"the deployment failed: {loop.failures}"
         yield loop
     finally:
         loop.stop()
 
 
-def install(build_server, package: Path) -> int:
-    """Install `package` on the Build Server and answer the new revision."""
-    done = subprocess.run(
-        [
-            str(build_server["binary"]),
-            "build-server",
-            "install",
-            str(package),
-            "--socket",
-            str(build_server["socket"]),
-        ],
-        capture_output=True,
-        text=True,
-        timeout=1800,
+def _to_trial(server: Server) -> None:
+    """Apply the unchanged configuration, which moves the newly installed
+    revisions into a generation update, and see it reach its trial.
+    """  # noqa: D205
+    before = admin.next_event(server)
+    applied = admin.apply(server)
+    assert applied.status_code == 200, applied.text
+    update = admin.wait_for_phase(
+        server, "trial", "abandoned", "rolled_back", after=before
     )
-    if done.returncode != 0:
-        raise AssertionError(f"install failed: {done.stdout}\n{done.stderr}")
-    match = re.search(r"revision[^0-9]*([0-9]+)", done.stdout)
-    if not match:
-        raise AssertionError(f"install printed no revision: {done.stdout}")
-    return int(match.group(1))
+    assert update["phase"] == "trial", update
 
 
-def next_event(base_url: str) -> int:
-    """The sequence number the daemon's next event takes."""
-    return admin_status(base_url)["next_event"]
-
-
-def end_update(base_url: str, action: str) -> None:
-    """Commit or roll back the update on trial."""
-    response = admin(base_url, f"config/{action}")
+def _end_update(server: Server, action: str, phase: str) -> None:
+    """Commit or roll back the update on trial (`action`), and see it enter
+    `phase`.
+    """  # noqa: D205
+    before = admin.next_event(server)
+    response = admin.operation(server, f"config/{action}")
     assert response.status_code == 200, (
         f"POST /admin/config/{action} answered {response.status_code}: "
         f"{response.text[:500]}"
     )
+    admin.wait_for_phase(server, phase, after=before)
 
 
-def _phase_of(event: dict) -> str:
-    """The phase of the update an `update` event states."""
-    if event.get("kind") != "update":
-        return ""
-    phase = (event.get("data") or {}).get("phase")
-    return phase if isinstance(phase, str) else ""
-
-
-def wait_for_phases(base_url: str, phases: list[str], after: int) -> list[dict]:
-    """Long-poll the daemon's events after sequence number `after` until
-    every phase arrived.
-    """  # noqa: D205
-    seen: list[dict] = []
-    pending = list(phases)
-    deadline = time.monotonic() + STEP_TIMEOUT_S
-    next_seq = after
-    while pending:
-        if time.monotonic() > deadline:
-            raise TimeoutError(f"phases {pending} did not arrive; saw {seen}")
-        response = admin_request(
-            base_url,
-            "GET",
-            "/admin/events",
-            params={"after": next_seq, "wait": 30},
-            timeout_s=60,
-        )
-        response.raise_for_status()
-        payload = response.json()
-        next_seq = payload.get("next", next_seq)
-        for event in payload.get("events", []):
-            seen.append(event)
-            phase = _phase_of(event)
-            if phase in pending:
-                pending.remove(phase)
-    return seen
-
-
-def epoch_record(base_url: str) -> dict:
+def epoch_record(server: Server) -> dict:
     """The epoch the deployment serves, as the daemon records it.
 
     `/admin/config` reports every epoch, ascending; the one that serves is the
     highest-numbered epoch in `serving` or `trial`, and `/admin/events` names
     it by number (`data.epoch`).
     """
-    epochs = admin_config(base_url)["epochs"]
+    epochs = admin.config(server)["epochs"]
     live = [
         epoch for epoch in epochs if epoch.get("status") in ("serving", "trial")
     ]
@@ -466,45 +280,16 @@ def epoch_record(base_url: str) -> dict:
     return max(live, key=lambda epoch: epoch["epoch"])
 
 
-def metrics(
-    base_url: str,
-) -> dict[tuple[str, tuple[tuple[str, str], ...]], float]:
-    """The deployment's Prometheus text, keyed by name and labels."""
-    text = httpx.get(f"{base_url}/metrics", timeout=30.0).text
-    values: dict[tuple[str, tuple[tuple[str, str], ...]], float] = {}
-    pattern = re.compile(
-        r"^([a-zA-Z_:][a-zA-Z0-9_:]*)(\{[^}]*\})?\s+([0-9.eE+-]+)$"
-    )
-    for line in text.splitlines():
-        match = pattern.match(line.strip())
-        if not match:
-            continue
-        raw = match.group(2) or ""
-        labels = tuple(sorted(re.findall(r'([a-z_]+)="([^"]*)"', raw)))
-        values[(match.group(1), labels)] = float(match.group(3))
-    return values
+def mapped_within_budget(server: Server) -> None:
+    """The allocator's mapped bytes stay within the device's budget.
 
-
-def mapped_within_budget(base_url: str) -> None:
-    values = metrics(base_url)
-    budgets = {
-        labels: value
-        for (name, labels), value in values.items()
-        if name == "uniserve:memory_budget"
-    }
-    mapped: dict[tuple[tuple[str, str], ...], float] = {}
-    for (name, labels), value in values.items():
-        if name != "uniserve:memory_mapped":
-            continue
-        labels_by_name = dict(labels)
-        key = (("device", labels_by_name.get("device")),)
-        mapped[key] = mapped.get(key, 0.0) + value
-    assert budgets, "the deployment published no memory budget"
-    for device, budget in budgets.items():
-        assert mapped.get(device, 0.0) <= budget, (
-            f"device {device}: mapped {mapped.get(device)}"
-            f" exceeds budget {budget}"
-        )
+    The deployment serves one device, so the bytes every pool mapped there
+    and the device's budget are the sums of their metrics.
+    """
+    budget = metric(server.base_url, "uniserve:memory_budget")
+    mapped = metric(server.base_url, "uniserve:memory_mapped")
+    assert budget > 0, "the deployment published no memory budget"
+    assert mapped <= budget, f"mapped {mapped} exceeds the budget {budget}"
 
 
 def assert_no_failures(step: str, traffic: Traffic) -> None:
@@ -514,15 +299,17 @@ def assert_no_failures(step: str, traffic: Traffic) -> None:
 
 
 def test_a_kernel_package_is_swapped_by_rebind_while_requests_stream(
-    server: str, build_server, traffic: Traffic, tmp_path: Path
+    server: Server,
+    build_server: BuildServer,
+    repository: Path,
+    traffic: Traffic,
+    tmp_path: Path,
 ) -> None:
-    package = _package("UNISERVE_REBIND_PACKAGE", tmp_path)
+    package = updates.derived(repository, "rms_norm", "rebind", tmp_path)
     before = epoch_record(server)
-    revision = install(build_server, package)
+    revision = build_server.install(package).revision
 
-    after_event = next_event(server)
-    assert apply_config(server).status_code == 200
-    wait_for_phases(server, TO_TRIAL, after_event)
+    _to_trial(server)
     after = epoch_record(server)
     assert after["kernels"] != before["kernels"], (
         "the generation update did not change the recorded kernel packages"
@@ -536,30 +323,30 @@ def test_a_kernel_package_is_swapped_by_rebind_while_requests_stream(
         f"the recorded modules name no revision {revision}: {after['kernels']}"
     )
 
-    after_event = next_event(server)
-    end_update(server, "commit")
-    wait_for_phases(server, COMMITTED, after_event)
+    _end_update(server, "commit", "committed")
     assert_no_failures("the rebind swap", traffic)
     mapped_within_budget(server)
 
 
 def test_the_recapture_swap_and_the_policy_swap_keep_serving(
-    server: str, build_server, traffic: Traffic, tmp_path: Path
+    server: Server,
+    build_server: BuildServer,
+    repository: Path,
+    traffic: Traffic,
+    tmp_path: Path,
 ) -> None:
-    package = _package("UNISERVE_RECAPTURE_PACKAGE", tmp_path)
-    policy = _package("UNISERVE_POLICY_PACKAGE", tmp_path)
+    package = updates.derived(repository, "gemm", "recapture", tmp_path)
     before = epoch_record(server)
-    install(build_server, package)
-    install(build_server, policy)
+    build_server.install(package)
+    # The serving policy installed again: its next revision, the same code.
+    build_server.install(repository / builds.POLICY_PACKAGE)
 
     # The shadow compares on a step of a running request; without one the
     # preparation refuses by name and the swap below would be asserted on an
     # update that compared nothing.
-    resident = Resident(server, PROMPTS[0])
+    resident = _resident(server.base_url, PROMPTS[0])
     try:
-        after_event = next_event(server)
-        assert apply_config(server).status_code == 200
-        wait_for_phases(server, TO_TRIAL, after_event)
+        _to_trial(server)
     finally:
         # Closed after the update answered and before any failure is read: a
         # request in flight here would race `assert_no_failures` below.
@@ -579,12 +366,10 @@ def test_the_recapture_swap_and_the_policy_swap_keep_serving(
 
 
 def test_a_rollback_restores_the_previous_generation(
-    server: str, traffic: Traffic
+    server: Server, traffic: Traffic
 ) -> None:
     before = epoch_record(server)
-    after_event = next_event(server)
-    end_update(server, "rollback")
-    wait_for_phases(server, ROLLED_BACK, after_event)
+    _end_update(server, "rollback", "rolled_back")
     assert before["previous_kernels"] is not None, (
         "the epoch on trial kept no previous kernel packages to roll back to"
     )
@@ -600,20 +385,24 @@ def test_a_rollback_restores_the_previous_generation(
 
 
 def test_a_wrong_kernel_is_refused_by_shadow_execution(
-    server: str, build_server, traffic: Traffic, tmp_path: Path
+    server: Server,
+    build_server: BuildServer,
+    repository: Path,
+    traffic: Traffic,
+    tmp_path: Path,
 ) -> None:
-    package = _package("UNISERVE_WRONG_PACKAGE", tmp_path)
+    package = updates.derived(repository, "rms_norm", "wrong", tmp_path)
     before = epoch_record(server)
-    install(build_server, package)
+    build_server.install(package)
 
     # The comparison needs a request the scheduler is stepping when the
     # preparation shadows: a wrong kernel can only be refused by a comparison
     # that ran.
-    resident = Resident(server, PROMPTS[1])
+    resident = _resident(server.base_url, PROMPTS[1])
     try:
         # The update is abandoned while it prepares, which the answer states
         # with the update as it ended (`409`).
-        response = apply_config(server)
+        response = admin.apply(server)
     finally:
         resident.close()
     assert response.status_code == 409, response.text
@@ -624,10 +413,9 @@ def test_a_wrong_kernel_is_refused_by_shadow_execution(
 
     # The comparison's own sentence, not a refusal for any reason at all: the
     # element past tolerance and the bound it left, and never the sentence that
-    # says nothing was compared.
-    # The refusal is printed whole: its first clause names the step that failed
-    # and the rest carries the engine's own sentence, so a slice at 800
-    # characters can hide the very string these assertions are about.
+    # says nothing was compared. The refusal is printed whole: its first clause
+    # names the step that failed and the rest carries the engine's own
+    # sentence, so a slice can hide the very string these assertions are about.
     assert COMPARED in refusal, (
         "a wrong kernel was refused without the comparison's sentence: "
         f"{refusal}"
@@ -650,7 +438,7 @@ def test_a_wrong_kernel_is_refused_by_shadow_execution(
 
 
 def test_no_request_failed_and_every_mapping_stayed_within_budget(
-    server: str, traffic: Traffic
+    server: Server, traffic: Traffic
 ) -> None:
     mapped_within_budget(server)
     assert traffic.completed > 0

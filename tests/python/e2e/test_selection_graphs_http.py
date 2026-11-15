@@ -10,6 +10,8 @@ token after it; a chunk's last token scores the next chunk's first.
 Constraints hold exactly under graphs: allowed tokens, a dominating logit
 bias, bad words of one token and of several, reported top logprobs that rank
 the sampled token, and prompt scores for every prompt token after the first.
+The bad words are texts of the served checkpoint's tokenizer, which the case
+loads from the checkpoint's repository at its pinned revision.
 """
 
 from __future__ import annotations
@@ -17,17 +19,11 @@ from __future__ import annotations
 from collections.abc import Iterator
 from typing import Any
 
-import httpx
 import pytest
-import tokenizers
-
-from tests.python.e2e.http_helpers import (
-    ATTENTION_BACKEND,
-    engine_selection,
-    qwen3_checkpoint,
-    require_uniserve_binary,
-    server_process,
-)
+from transformers import AutoTokenizer, PreTrainedTokenizerBase
+from uniserve_testing import chat
+from uniserve_testing.assets import CHECKPOINTS
+from uniserve_testing.deployments import Deployments
 
 pytestmark = [
     pytest.mark.e2e,
@@ -37,106 +33,22 @@ pytestmark = [
     pytest.mark.gpus(1),
 ]
 
+SERVED_MODEL = "qwen3-selection"
 CHUNK = 256
 # About a thousand tokens of records, then a question about them: four
 # prefill chunks.
-PROMPT = (
-    " ".join(
-        f"Record {i}: item {i * 7919 % 1000} is worth {i * 104729 % 997}."
-        for i in range(80)
-    )
-    + " Which record is worth the most? Answer in one sentence."
-)
-
-
-@pytest.fixture(scope="module")
-def graphs(tmp_path_factory: pytest.TempPathFactory) -> Iterator[str]:
-    args = [
-        str(require_uniserve_binary()),
-        "serve",
-        "--model-dir",
-        qwen3_checkpoint(),
-        "--served-model-name",
-        "qwen3-selection",
-        "--host",
-        "127.0.0.1",
-        *engine_selection(),
-        "--set",
-        'dtype="bfloat16"',
-        "--set",
-        f'attention_backend="{ATTENTION_BACKEND}"',
-        "--set",
-        "kv_cache_config.max_tokens=32768",
-        "--set",
-        'chat_config.reasoning_parser="none"',
-        "--set",
-        f"max_num_batched_tokens={2 * CHUNK}",
-        "--set",
-        f"scheduler_config.chunked_prefill_size={CHUNK}",
-    ]
-    log = tmp_path_factory.mktemp("selection") / "server.log"
-    with server_process(
-        args,
-        log,
-        timeout_s=1800.0,
-    ) as server:
-        base_url = server.base_url
-        yield base_url
-
-
-def _chat(base_url: str, prompt: str = PROMPT, **body: Any) -> dict[str, Any]:
-    model = httpx.get(f"{base_url}/v1/models", timeout=30).json()["data"][0]
-    response = httpx.post(
-        f"{base_url}/v1/chat/completions",
-        json={
-            "model": model["id"],
-            "messages": [{"role": "user", "content": prompt}],
-            "max_completion_tokens": 16,
-            "return_tokens_as_token_ids": True,
-            **body,
-        },
-        timeout=600,
-    )
-    assert response.status_code == 200, response.text
-    return response.json()
-
-
-def _tokens(reply: dict[str, Any]) -> list[str]:
-    return [
-        entry["token"] for entry in reply["choices"][0]["logprobs"]["content"]
-    ]
-
-
-def _ids(reply: dict[str, Any]) -> list[int]:
-    return [int(token.split(":")[1]) for token in _tokens(reply)]
-
-
-def _word(tokenizer: tokenizers.Tokenizer, ids: list[int]) -> str | None:
-    """The text of `ids` when it encodes back to exactly them, as a bad word."""
-    text = tokenizer.decode(ids)
-    if tokenizer.encode(text, add_special_tokens=False).ids != ids:
-        return None
-    return text
-
+PROMPT = chat.long_prompt(52)
+MAX_TOKENS = 16
 
 # Greedy, reporting five top tokens and three per prompt position.
-GREEDY = {
-    "temperature": 0,
-    "top_p": 1.0,
-    "top_k": 0,
-    "min_p": 0.0,
+RANKED = {
+    **chat.GREEDY,
     "logprobs": True,
     "top_logprobs": 5,
     "prompt_logprobs": 3,
 }
 # Greedy, reporting each selected token and no prompt scores.
-SELECTED = {
-    "temperature": 0,
-    "top_p": 1.0,
-    "top_k": 0,
-    "min_p": 0.0,
-    "logprobs": True,
-}
+SELECTED = {**chat.GREEDY, "logprobs": True}
 # Seeded sampling through the general sampler.
 SAMPLED = {
     "temperature": 0.8,
@@ -149,9 +61,55 @@ SAMPLED = {
 }
 
 
+@pytest.fixture(scope="module")
+def graphs(module_deployments: Deployments) -> Iterator[str]:
+    """The base URL of the module's deployment, which steps at most two
+    chunks of tokens and prefills a prompt one chunk at a time.
+    """  # noqa: D205
+    with module_deployments.serve(
+        "--served-model-name",
+        SERVED_MODEL,
+        "--set",
+        f"max_num_batched_tokens={2 * CHUNK}",
+        "--set",
+        f"scheduler_config.chunked_prefill_size={CHUNK}",
+        model=CHECKPOINTS["qwen3"].model,
+    ) as server:
+        yield server.base_url
+
+
+def _chat(base_url: str, **fields: Any) -> dict[str, Any]:
+    """The answer to the prompt, with `fields` beside its defaults: at most
+    ``MAX_TOKENS`` tokens, each reported by its token id.
+    """  # noqa: D205
+    request = chat.body(
+        SERVED_MODEL, PROMPT, MAX_TOKENS, return_tokens_as_token_ids=True
+    )
+    return chat.complete(base_url, {**request, **fields})
+
+
+def _ids(answer: dict[str, Any]) -> list[int]:
+    """The ids of the tokens `answer` selected (``token_id:<id>``)."""
+    return [
+        int(token.removeprefix("token_id:"))
+        for token, _ in chat.ranked_tokens(answer)
+    ]
+
+
+def _word(tokenizer: PreTrainedTokenizerBase, ids: list[int]) -> str | None:
+    """The text of `ids` when it encodes back to exactly them, as a bad word.
+
+    Special tokens decode to no text, so a word holding one never encodes
+    back to its ids.
+    """
+    text = tokenizer.decode(ids, skip_special_tokens=True)
+    if tokenizer.encode(text, add_special_tokens=False) != ids:
+        return None
+    return text
+
+
 def test_constraints_hold_under_graphs(graphs: str) -> None:
-    greedy = _chat(graphs, **GREEDY)
-    tokens = _tokens(greedy)
+    greedy = _chat(graphs, **RANKED)
     for entry in greedy["choices"][0]["logprobs"]["content"]:
         # Greedy over the model's distribution selects its top token.
         top = entry["top_logprobs"]
@@ -172,7 +130,8 @@ def test_constraints_hold_under_graphs(graphs: str) -> None:
     )
 
     # Tasks restricted to two tokens select only those.
-    allowed = sorted({int(token.split(":")[1]) for token in tokens[:4]})[:2]
+    selected = _ids(greedy)
+    allowed = sorted(set(selected[:4]))[:2]
     restricted = _chat(
         graphs,
         **SAMPLED,
@@ -180,26 +139,25 @@ def test_constraints_hold_under_graphs(graphs: str) -> None:
         ignore_eos=True,
         max_completion_tokens=8,
     )
-    assert {int(token.split(":")[1]) for token in _tokens(restricted)} <= set(
-        allowed
-    )
+    assert set(_ids(restricted)) <= set(allowed)
 
     # A bias of a hundred makes its token the greedy selection.
-    forced = int(tokens[-1].split(":")[1])
+    forced = selected[-1]
     biased = _chat(
         graphs,
-        **GREEDY,
+        **RANKED,
         logit_bias={str(forced): 100.0},
         max_completion_tokens=2,
     )
-    assert _tokens(biased)[0] == f"token_id:{forced}"
+    assert _ids(biased)[0] == forced
 
 
 def test_greedy_constraints_hold_under_graphs(graphs: str) -> None:
-    tokenizer = tokenizers.Tokenizer.from_file(
-        f"{qwen3_checkpoint()}/tokenizer.json"
+    checkpoint = CHECKPOINTS["qwen3"]
+    tokenizer = AutoTokenizer.from_pretrained(
+        checkpoint.repository, revision=checkpoint.revision
     )
-    special = set(tokenizer.get_added_tokens_decoder())
+    special = set(tokenizer.added_tokens_decoder)
     greedy = _ids(_chat(graphs, **SELECTED, ignore_eos=True))
 
     # A greedy request restricted to one token selects it at every step.

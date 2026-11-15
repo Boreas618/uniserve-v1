@@ -1,25 +1,26 @@
 """A prompt's KV blocks cross hosts through the Storage Servers' peers.
 
-**Peer reuse across hosts.** Qwen3 is served by two single-node deployments
-of the same checkpoint, served name and block size: deployment A on this
-host and deployment B on a second host, whose ``kv_cache_config.peers``
-names A's Storage Server. A answers a long prompt; its write policy stores
-every full block it commits to A's host tier, which A's own admission then
-loads back once its device copies are evicted (``POST /admin/flush_cache``):
-that answer is computed over the stored blocks. B then answers the same
-prompt: its admission finds the keys in neither its device nor its host
-tier, and since the peers could deepen the hit by at least
-``prefetch_min_tokens``, it submits a ``Prefetch`` from the peers
-(``specs/scheduler-design.md`` §4.4). A's Storage Server holds the host
-copies by key (``PeerHold``) while B's Transfer Server reads them through
-NIXL into B's host tier, and B's admission loads them. B's
-``prefix_cache_peer_hits`` grows by the prompt's full blocks, its
-``storage-server list`` shows the measured link from A's host, and its
-greedy tokens equal A's answer over the stored blocks, computed over the
-same keys and values. A prompt A never saw brings nothing from A; once A's
-Storage Server stops, B computes a prompt A stored, with the same tokens as
-A computed it, and no request fails (a tier's failure never fails a
-request, ``specs/buffer-pool.md`` §12.4).
+**Peer reuse across hosts.** Qwen3 is served by two deployments of the same
+checkpoint and served name: deployment A on this host, and deployment B,
+whose engine runs on a second host (``engine_host``), with its rank, its
+buffer pool and its host KV cache there, while its daemon serves B's API on
+this host. B's ``kv_cache_config.peers`` names A's Storage Server. A answers
+a long prompt; its write policy stores every full block it commits to A's
+host tier, which A's own admission then loads back once its device copies
+are evicted (``POST /admin/flush_cache``): that answer is computed over the
+stored blocks. B then answers the same prompt: its admission finds the keys
+in neither its device nor its host tier, and since the peers could deepen
+the hit by at least ``prefetch_min_tokens``, it submits a ``Prefetch`` from
+the peers (``specs/scheduler-design.md`` §4.4). A's Storage Server holds the
+host copies by key (``PeerHold``) while the Transfer Server of B's host
+reads them through NIXL into B's host tier, and B's admission loads them.
+B's first answer finds nothing cached on B itself, so the prompt tokens it
+states as cached (:mod:`uniserve_testing.caching`) are tokens the peers
+brought, and its greedy tokens equal A's answer over the stored blocks,
+computed over the same keys and values. A prompt A never saw brings nothing
+from A; once A's Storage Server stops, B computes a prompt A stored, with
+the same tokens as A computed it, and no request fails (a tier's failure
+never fails a request, ``specs/buffer-pool.md`` §12.4).
 
 **Converted reuse across hosts.** Deployment B keeps its device KV blocks in
 FP8 (``kv_cache_config.dtype=float8_e4m3fn``) while A keeps BF16: a key
@@ -28,407 +29,273 @@ precision, so B's prefetch finds A's BF16 host copies, which A's Storage
 Server states in the encoding A's class wrote them in; B's buffer pool reads
 them into its converted-load source region (``Class::source``), and B's load
 converts each into its FP8 device block (``specs/buffer-pool.md`` §13, §20),
-as B's own writes encode it. B's
-``prefix_cache_peer_hits`` grows by the prompt's full blocks, and its greedy
-answer over the converted blocks agrees with its answer over the same
-prompt's blocks it computed and wrote itself (another ``cache_salt``, asked
-twice: computed cold, then pinned on its device) by the rule of vLLM's
-``check_logprobs_close``: token for token until their first difference,
-where each answer's token is among the other's ``TOP_LOGPROBS`` most likely
-tokens. Both answers compute the prompt's last tokens over FP8 blocks; FP8
-blocks written whole from a block's amax and blocks written token by token
-round differently, so the two are not required to be identical.
+as B's own writes encode it. B's answer reuses the peers' blocks, and it
+agrees with its answer over the same prompt's blocks it computed and wrote
+itself (another ``cache_salt``, asked twice: computed cold, then pinned on
+its device) by the rule of vLLM's ``check_logprobs_close``
+(:func:`uniserve_testing.chat.assert_logprobs_close`) over the
+``TOP_LOGPROBS`` most likely tokens. Both answers compute the prompt's last
+tokens over FP8 blocks; FP8 blocks written whole from a block's amax and
+blocks written token by token round differently, so the two are not
+required to be identical.
 
-The second host is named by the suite's two-host variables (docs/testing.md,
-Two hosts): ``UNISERVE_H3_FOLLOWER``, an ssh destination with this checkout
-at the same path, and ``UNISERVE_H3_LEADER_ADDRESS``, this host's address as
-the second reaches it. Both hosts' Storage Servers are the deployments'
-own, which their daemons start with the settings the deployments state: a
-TCP endpoint on a port each picks, which A's readiness record states as the
-peer endpoint B names, and NIXL, which both hosts have installed as
-docs/nixl.md states; without these variables the two-host case is skipped.
-The peer endpoints are unauthenticated: the hosts share an isolated network.
+The second host is the run's ``--peer-host`` (``uniserve_testing.plugin``):
+B's leader, node ``rank-0`` here, binds its join endpoint at the address the
+second host reaches this host at (``--leader-address``) on a port it picks,
+and the second host's daemon joins it as ``rank-1``
+(:meth:`uniserve_testing.deployments.Deployments.follower`), at a Build
+Server there that installs the tree's packages from this repository's path,
+which the second host must mount at the same path, and on its first GPU.
+B's engine there opens the checkpoint's snapshot at the path the leader
+resolved, which the second host's Hugging Face cache must hold. Both hosts'
+Storage Servers are their daemons' own, which they start with the settings
+the deployments state: A's accepts other hosts at the leader address on a
+port it picks, which A's readiness record states as the peer endpoint B
+names, and both read through the NIXL package each host has installed
+(``docs/nixl.md``). The peer endpoints are unauthenticated: the hosts share
+an isolated network.
 """
 
 from __future__ import annotations
 
-import json
-import os
-import shlex
-import subprocess
-from collections.abc import Iterator
-from contextlib import contextmanager
 from pathlib import Path
 
-import httpx
 import pytest
-
-from tests.python.e2e.build_server import remote_build_server
-from tests.python.e2e.http_helpers import (
-    ATTENTION_BACKEND,
-    admin,
-    engine_selection,
-    granted_devices,
-    on_host,
-    qwen3_checkpoint,
-    remote_environment,
-    remote_runtime_directory,
-    require_uniserve_binary,
+from uniserve_testing import admin, chat
+from uniserve_testing.assets import CHECKPOINTS
+from uniserve_testing.caching import cached_tokens
+from uniserve_testing.deployments import (
+    Deployments,
     runtime_directory,
-    server_process,
-    start_remote_server,
-    stop_remote_storage_server,
     stop_storage_server,
-    storage_socket,
-    tokens_found,
-    wait_until,
+    two_host_leader,
 )
+from uniserve_testing.remote import RemoteHost
+from uniserve_testing.servers import Server
 
 pytestmark = [pytest.mark.e2e, pytest.mark.gpu, pytest.mark.model("qwen3")]
 
-FOLLOWER = os.environ.get("UNISERVE_H3_FOLLOWER")
-LEADER_ADDRESS = os.environ.get("UNISERVE_H3_LEADER_ADDRESS")
-# The second host's GPU the cases serve on.
-FOLLOWER_DEVICE = os.environ.get("UNISERVE_FOLLOWER_DEVICE", "0")
-
 SERVED_MODEL = "qwen3"
-BLOCK_SIZE = 64
 MAX_TOKENS = 32
-# Blocks a prompt must fill for its peer hit to count.
-PEER_BLOCKS = 16
+# The fewest tokens B's answer must find cached from the peers, and A's
+# prompt must reuse: sixteen blocks of the deployments' block size
+# (`kv_cache_config.block_size`, 64 tokens by default).
+PEER_TOKENS = 1024
 # The candidates two greedy answers are compared at, as vLLM's model
 # correctness tests compare logprobs.
 TOP_LOGPROBS = 5
+# How long the host tier of A may take to hold a prompt's blocks after A
+# answered it, in seconds: the write policy's copies run with the batches
+# that follow the commits.
+STORED_S = 120
 
 
-def _records(label: str, count: int = 260) -> str:
-    """A long prompt of records under `label`, then a question about them."""
-    return (
-        f"{label}. "
-        + " ".join(
-            f"Record {i}: the value of item {i * 7919 % 1000} is "
-            f"{i * 104729 % 997}."
-            for i in range(count)
-        )
-        + " Summarize the first three records in one sentence."
-    )
+def _prompt(label: str) -> str:
+    """A long prompt of records under `label`, whose first block is the
+    label's own, so that prompts of two labels share no block.
+    """  # noqa: D205
+    return f"{label}. {chat.long_prompt(260)}"
 
 
-def _answer(base_url: str, prompt: str, **fields) -> dict:
-    """The greedy answer to `prompt`, with `fields` added to the request."""
-    response = httpx.post(
-        f"{base_url}/v1/chat/completions",
-        json={
-            "model": SERVED_MODEL,
-            "messages": [{"role": "user", "content": prompt}],
-            "temperature": 0,
-            "top_p": 1.0,
-            "top_k": 0,
-            "min_p": 0.0,
-            "max_completion_tokens": MAX_TOKENS,
-            "logprobs": True,
-            "return_tokens_as_token_ids": True,
+def _ask(base_url: str, prompt: str, **fields: object) -> dict:
+    """The greedy answer to `prompt`, each token reported by its token id,
+    with `fields` added to the request.
+    """  # noqa: D205
+    return chat.complete(
+        base_url,
+        chat.body(
+            SERVED_MODEL,
+            prompt,
+            MAX_TOKENS,
+            **chat.GREEDY,
+            logprobs=True,
+            return_tokens_as_token_ids=True,
             **fields,
-        },
-        timeout=600,
+        ),
     )
-    response.raise_for_status()
-    return response.json()
 
 
-def _ask(base_url: str, prompt: str) -> tuple[int, list[str]]:
-    """Decode `prompt` greedily: its prompt tokens and the decoded tokens."""
-    reply = _answer(base_url, prompt)
-    tokens = [
-        entry["token"] for entry in reply["choices"][0]["logprobs"]["content"]
-    ]
-    return reply["usage"]["prompt_tokens"], tokens
+def _stored(server: Server, prompt: str) -> tuple[dict, dict]:
+    """A's answers to `prompt`: computed whole, and computed over the blocks
+    A's host tier stores once it holds every reusable one.
 
-
-def _found(base_url: str, prompt: str) -> tuple[list[str], dict[str, float]]:
-    """Decode `prompt` greedily: the decoded tokens, and the tokens its
-    admission found cached per tier and source (:func:`tokens_found`).
+    The prompt asked again finds its whole reuse limit on the device. Once
+    the device copies are evicted (``POST /admin/flush_cache``), the prompt
+    asked once more loads what the host tier holds, A's only other tier, so
+    its answer reuses the whole reuse limit once the host tier holds every
+    block. The write policy stores a block once it is committed, by a copy
+    its executor runs with the next batch, so the copies may still run when
+    the request has answered, and ``flush_cache`` answers without waiting
+    for them: the case evicts and asks again until the answer loads every
+    block, a state the deployment announces no event of.
     """  # noqa: D205
-    (_, tokens), found = tokens_found(base_url, lambda: _ask(base_url, prompt))
-    return tokens, found
-
-
-def _reusable(prompt_tokens: int) -> int:
-    """The tokens an admission may reuse: the prompt less its last token, in
-    whole blocks.
-    """  # noqa: D205
-    return (prompt_tokens - 1) // BLOCK_SIZE * BLOCK_SIZE
-
-
-def _stored(base_url: str, prompt: str, reusable: int) -> list[str]:
-    """Waits until the host tier of the deployment at `base_url` holds every
-    reusable block of `prompt`, which the deployment answered before: its
-    device copies are evicted, and the prompt asked again loads every one of
-    them from the host. Returns that answer, computed over the stored blocks.
-
-    The write policy stores a block once it is committed, by a copy its
-    executor runs with the next batch, so the copies may still run when the
-    request has answered.
-    """  # noqa: D205
-    answers: list[list[str]] = []
+    computed = _ask(server.base_url, prompt)
+    reusable = cached_tokens(_ask(server.base_url, prompt))
+    answers: list[dict] = []
 
     def loaded() -> bool:
-        flushed = admin(base_url, "flush_cache")
+        flushed = admin.operation(server, "flush_cache")
         assert flushed.status_code == 200, flushed.text
-        tokens, found = _found(base_url, prompt)
-        answers.append(tokens)
-        return found["host_hits"] == reusable
+        answers.append(_ask(server.base_url, prompt))
+        return cached_tokens(answers[-1]) == reusable
 
-    wait_until(loaded, 120, "the host tier did not hold the prompt's blocks")
-    return answers[-1]
+    server.wait_until(
+        loaded, STORED_S, "the host tier did not hold the prompt's blocks"
+    )
+    return computed, answers[-1]
 
 
-def _candidates(base_url: str, prompt: str, **fields) -> list[tuple[str, set]]:
-    """Decode `prompt` greedily: each decoded token with its position's
-    `TOP_LOGPROBS` most likely tokens.
+def _writer(peer_host: RemoteHost) -> tuple[str, ...]:
+    """Deployment A's options: a Storage Server that also accepts other
+    hosts at the address the second host reaches this host at, on a port it
+    picks, which A's readiness record states as its peer endpoint.
     """  # noqa: D205
-    reply = _answer(base_url, prompt, top_logprobs=TOP_LOGPROBS, **fields)
-    return [
-        (entry["token"], {top["token"] for top in entry["top_logprobs"]})
-        for entry in reply["choices"][0]["logprobs"]["content"]
-    ]
-
-
-def _logprobs_close(left: list, right: list) -> bool:
-    """Whether two answers agree by vLLM's `check_logprobs_close`: token for
-    token until their first difference, where each one's token is among the
-    other's most likely tokens.
-    """  # noqa: D205
-    for (token, tops), (other, other_tops) in zip(left, right):
-        if token != other:
-            return token in other_tops and other in tops
-    return True
-
-
-def _serve_command(
-    checkpoint: str, host: str, address: str, extra: tuple[str, ...] = ()
-) -> list[str]:
-    """Serve the checkpoint on `host`, with a Storage Server that accepts
-    other hosts at `address`, on a port it picks, and reads them through
-    NIXL.
-    """  # noqa: D205
-    return [
-        str(require_uniserve_binary()),
-        "serve",
-        "--model-dir",
-        checkpoint,
+    return (
         "--served-model-name",
         SERVED_MODEL,
-        "--host",
-        host,
-        *engine_selection(),
         "--set",
-        'dtype="bfloat16"',
-        "--set",
-        f'attention_backend="{ATTENTION_BACKEND}"',
-        "--set",
-        "kv_cache_config.max_tokens=32768",
-        "--set",
-        f"kv_cache_config.block_size={BLOCK_SIZE}",
-        "--set",
-        'chat_config.reasoning_parser="none"',
-        "--set",
-        f'storage_config.tcp="{address}:0"',
-        *extra,
-    ]
-
-
-@contextmanager
-def _follower_deployment(
-    log: Path, devices: str, extra: list[str]
-) -> Iterator[tuple[str, str]]:
-    """Deployment B on the second host, with its own Storage Server, which
-    its daemon starts with a TCP endpoint and NIXL, and its own Build Server.
-
-    Yields B's HTTP base URL and its runtime directory there; on exit it
-    stops the daemon and the Storage Server, keeping their logs beside `log`.
-    """  # noqa: D205
-    assert FOLLOWER is not None
-    address = on_host(FOLLOWER, "hostname -I").split()[0]
-    runtime = remote_runtime_directory(FOLLOWER, "uniserve-peer")
-    environment = remote_environment(
-        {"XDG_RUNTIME_DIR": runtime, "CUDA_VISIBLE_DEVICES": devices}
+        f'storage_config.tcp="{peer_host.leader_address}:0"',
     )
-    with remote_build_server(FOLLOWER) as modules:
-        command = _serve_command(
-            qwen3_checkpoint(),
-            "0.0.0.0",
-            address,
-            ("--set", f'build_config.socket="{modules}"', *extra),
-        )
-        server = start_remote_server(
-            FOLLOWER,
-            command,
-            log,
-            environment=environment,
-            timeout_s=1800,
-            address=address,
-        )
-        try:
-            server.wait("serving", 1800)
-            yield server.base_url, runtime
-        finally:
-            if server.record and server.process.poll() is None:
-                on_host(FOLLOWER, f"kill -TERM -- {server.pid}; true")
-            try:
-                server.process.wait(timeout=120)
-            except subprocess.TimeoutExpired:
-                server.process.kill()
-            stop_remote_storage_server(
-                FOLLOWER, runtime, log.with_suffix(".storage.log")
-            )
 
 
-def _leader_environment(runtime: Path) -> dict[str, str]:
-    """The environment deployment A serves under: its GPU and the runtime
-    directory its Storage Server serves in.
+def _reader(peer_host: RemoteHost, peer: str) -> tuple[str, ...]:
+    """Deployment B's options: a leader here, node ``rank-0`` of two, whose
+    engine runs on the second host, node ``rank-1``, and whose peers are the
+    Storage Server at `peer`.
     """  # noqa: D205
-    return {
-        "CUDA_VISIBLE_DEVICES": granted_devices(1),
-        "XDG_RUNTIME_DIR": str(runtime),
-    }
-
-
-def _skip_without_two_hosts() -> None:
-    if FOLLOWER is None or LEADER_ADDRESS is None:
-        pytest.skip(
-            "peer reads across hosts need UNISERVE_H3_FOLLOWER and "
-            "UNISERVE_H3_LEADER_ADDRESS"
-        )
+    return (
+        "--served-model-name",
+        SERVED_MODEL,
+        *two_host_leader(peer_host),
+        "--set",
+        'engine_host="rank-1"',
+        "--set",
+        f'kv_cache_config.peers=["{peer}"]',
+    )
 
 
 def test_a_host_loads_a_prompts_blocks_from_a_peer_hosts_host_tier(
+    uniserve: Path,
+    repository: Path,
+    deployments: Deployments,
+    peer_host: RemoteHost,
     tmp_path: Path,
 ):
-    _skip_without_two_hosts()
-    assert LEADER_ADDRESS is not None
-    shared = _records("Shared")
-    dropped = _records("Dropped")
-    listing = ""
+    model = CHECKPOINTS["qwen3"].model
+    shared = _prompt("Shared")
+    dropped = _prompt("Dropped")
+    unseen = _prompt("Unseen")
+    # B's host reads A's blocks through NIXL: both hosts' calibrations
+    # time those READs.
+    calibration = deployments.calibration(reads=True)
     with (
-        runtime_directory(tmp_path / "storage-server.log") as runtime,
-        server_process(
-            _serve_command(qwen3_checkpoint(), "127.0.0.1", LEADER_ADDRESS),
-            tmp_path / "a.log",
-            timeout_s=1800,
-            env=_leader_environment(runtime),
-        ) as server,
+        runtime_directory(uniserve, tmp_path / "a.storage") as runtime,
+        deployments.serve(
+            *_writer(peer_host),
+            model=model,
+            name="a",
+            runtime=runtime,
+            calibration=calibration,
+        ) as a,
     ):
-        base_url = server.base_url
-        # The endpoint B's peers name: A's Storage Server's, as A's
-        # readiness record states it.
-        peer = server.endpoint("peer")
         # A computes both prompts and stores their full blocks to its host
         # tier. Its answer to the shared prompt over the stored blocks
-        # computes only the last tokens over them, as B's does over the blocks
-        # it reads: the two compute the same tokens over the same cached keys
-        # and values (a prompt computed whole may round otherwise, as
-        # `test_host_kv_cache_http.py` states).
-        prompt_tokens, _ = _ask(base_url, shared)
-        reusable = _reusable(prompt_tokens)
-        a_shared = _stored(base_url, shared, reusable)
-        _, a_dropped = _ask(base_url, dropped)
-        _stored(base_url, dropped, reusable)
+        # computes only the last tokens over them, as B's does over the
+        # blocks it reads: the two compute the same tokens over the same
+        # cached keys and values (a prompt computed whole may round
+        # otherwise, as `test_host_kv_cache_http.py` states).
+        _, a_shared = _stored(a, shared)
+        a_dropped, _ = _stored(a, dropped)
 
-        with _follower_deployment(
-            tmp_path / "b.log",
-            FOLLOWER_DEVICE,
-            ["--set", f'kv_cache_config.peers=["{peer}"]'],
-        ) as (b_url, b_runtime):
-            # B reads the shared prompt's blocks from A.
-            b_shared, shared_found = _found(b_url, shared)
-            assert FOLLOWER is not None
-            listing = on_host(
-                FOLLOWER,
-                f"env {remote_environment()} "
-                + shlex.join(
-                    [
-                        str(require_uniserve_binary()),
-                        "storage-server",
-                        "list",
-                        "--socket",
-                        storage_socket(b_runtime),
-                    ]
-                ),
-            )
-
-            # A prompt A never saw brings nothing from A, and B's answer
-            # is A's.
-            unseen = _records("Unseen")
-            b_unseen, unseen_found = _found(b_url, unseen)
-            _, a_unseen = _ask(base_url, unseen)
+        with (
+            deployments.serve(
+                *_reader(peer_host, a.endpoint("peer")),
+                model=model,
+                name="b",
+                serving=False,
+                calibration=calibration,
+            ) as b,
+            deployments.follower(
+                peer_host,
+                b,
+                repository,
+                calibration=calibration,
+                reads=True,
+                name="b-member",
+            ),
+        ):
+            # B reads the shared prompt's blocks from A: B holds no block
+            # of its own yet, so what its answer finds cached the peers
+            # brought.
+            b_shared = _ask(b.base_url, shared)
+            # A prompt A never saw brings nothing from A, and B's answer is
+            # A's.
+            b_unseen = _ask(b.base_url, unseen)
+            a_unseen = _ask(a.base_url, unseen)
             # A's Storage Server is gone: B computes what A stored.
-            stop_storage_server(runtime)
-            b_dropped, dropped_found = _found(b_url, dropped)
+            stop_storage_server(uniserve, runtime, tmp_path / "a.storage")
+            b_dropped = _ask(b.base_url, dropped)
 
-    assert reusable >= PEER_BLOCKS * BLOCK_SIZE, prompt_tokens
-    assert shared_found["peer_hits"] >= PEER_BLOCKS * BLOCK_SIZE, shared_found
-    # Every peer hit is a host hit B loaded.
-    assert shared_found["host_hits"] >= shared_found["peer_hits"], shared_found
-    assert f"link {peer} host -> host" in listing, listing
-    assert b_shared == a_shared
-    assert unseen_found["peer_hits"] == 0, unseen_found
-    assert dropped_found["peer_hits"] == 0, dropped_found
-    assert b_dropped == a_dropped
-    assert b_unseen == a_unseen
+    assert cached_tokens(a_shared) >= PEER_TOKENS, a_shared["usage"]
+    assert cached_tokens(b_shared) >= PEER_TOKENS, b_shared["usage"]
+    assert chat.ranked_tokens(b_shared) == chat.ranked_tokens(a_shared)
+    assert cached_tokens(b_unseen) == 0, b_unseen["usage"]
+    assert chat.ranked_tokens(b_unseen) == chat.ranked_tokens(a_unseen)
+    assert cached_tokens(b_dropped) == 0, b_dropped["usage"]
+    assert chat.ranked_tokens(b_dropped) == chat.ranked_tokens(a_dropped)
 
 
 def test_an_fp8_host_loads_a_bf16_hosts_blocks_by_converting_them(
-    tmp_path: Path,
+    repository: Path,
+    deployments: Deployments,
+    peer_host: RemoteHost,
 ):
-    _skip_without_two_hosts()
-    assert LEADER_ADDRESS is not None
-    shared = _records("Converted")
-    with (
-        runtime_directory(tmp_path / "storage-server.log") as runtime,
-        server_process(
-            _serve_command(qwen3_checkpoint(), "127.0.0.1", LEADER_ADDRESS),
-            tmp_path / "a.log",
-            timeout_s=1800,
-            env=_leader_environment(runtime),
-        ) as server,
-    ):
-        base_url = server.base_url
-        peer = server.endpoint("peer")
-        # A computes the prompt in BF16 and stores its full blocks to its host
-        # tier.
-        prompt_tokens, _ = _ask(base_url, shared)
-        reusable = _reusable(prompt_tokens)
-        bf16 = _stored(base_url, shared, reusable)
+    model = CHECKPOINTS["qwen3"].model
+    shared = _prompt("Converted")
+    calibration = deployments.calibration(reads=True)
+    with deployments.serve(
+        *_writer(peer_host), model=model, name="a", calibration=calibration
+    ) as a:
+        # A computes the prompt in BF16 and stores its full blocks to its
+        # host tier.
+        _, bf16 = _stored(a, shared)
 
-        with _follower_deployment(
-            tmp_path / "b.log",
-            FOLLOWER_DEVICE,
-            [
+        with (
+            deployments.serve(
+                *_reader(peer_host, a.endpoint("peer")),
                 "--set",
                 'kv_cache_config.dtype="float8_e4m3fn"',
-                "--set",
-                f'kv_cache_config.peers=["{peer}"]',
-            ],
-        ) as (b_url, _):
+                model=model,
+                name="b",
+                serving=False,
+                calibration=calibration,
+            ) as b,
+            deployments.follower(
+                peer_host,
+                b,
+                repository,
+                calibration=calibration,
+                reads=True,
+                name="b-member",
+            ),
+        ):
             # The same prompt on B under a salt no cache holds: computed
-            # cold, then over the FP8 blocks B wrote itself.
-            cold = _candidates(b_url, shared, cache_salt="local")
-            local = _candidates(b_url, shared, cache_salt="local")
-            converted, found = tokens_found(
-                b_url, lambda: _candidates(b_url, shared)
+            # cold, then over the FP8 blocks B wrote itself. Their keys are
+            # the salt's, so what the unsalted answer finds cached the peers
+            # brought.
+            _ask(b.base_url, shared, cache_salt="local")
+            local = _ask(
+                b.base_url,
+                shared,
+                cache_salt="local",
+                top_logprobs=TOP_LOGPROBS,
             )
+            converted = _ask(b.base_url, shared, top_logprobs=TOP_LOGPROBS)
 
-    (tmp_path / "answers.json").write_text(
-        json.dumps(
-            {
-                "bf16": bf16,
-                "cold": [token for token, _ in cold],
-                "local": [token for token, _ in local],
-                "converted": [token for token, _ in converted],
-            }
-        )
+    assert cached_tokens(bf16) >= PEER_TOKENS, bf16["usage"]
+    assert cached_tokens(converted) >= PEER_TOKENS, converted["usage"]
+    chat.assert_logprobs_close(
+        chat.ranked_tokens(local),
+        chat.ranked_tokens(converted),
+        "an answer over converted BF16 blocks and one over FP8 blocks",
     )
-    assert reusable >= PEER_BLOCKS * BLOCK_SIZE, prompt_tokens
-    assert found["peer_hits"] >= PEER_BLOCKS * BLOCK_SIZE, found
-    assert _logprobs_close(converted, local), (converted, local)

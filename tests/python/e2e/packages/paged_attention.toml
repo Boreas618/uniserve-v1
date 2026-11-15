@@ -1,0 +1,19 @@
+# A revision of the serving paged_attention/trtllm package that an epoch update
+# switches to, to step slower with no fault.
+#
+# `repeated` is the package under the backend name `trtllm_repeated`, whose entry
+# runs trtllm-gen's kernel twelve times per call. Every run reads the same inputs
+# and writes the same output, so the revision computes the serving package's
+# tokens, later, as a release that lost a fast path would serve them, and no
+# fault reports it. A deployment selects it by its name
+# (`decode_attention_backend`); a key no deployment names a backend for keeps the
+# serving package, whose name sorts first among the packages of their shared
+# priority.
+
+package = "crates/ops/kernels/paged_attention/trtllm"
+
+[variants.repeated]
+replace = [
+    { file = "package.toml", old = 'backend = "trtllm"', new = 'backend = "trtllm_repeated"' },
+    { file = "src/entry.cu", old = "    runner.run(params);\n", new = "    for (int run = 0; run < 12; ++run) {\n      runner.run(params);\n    }\n" },
+]

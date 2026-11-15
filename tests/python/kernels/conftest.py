@@ -26,7 +26,8 @@ when ``@triton.jit`` decorates it (``triton.knobs.runtime.interpret``), it
 decorates its own language library (``tl.cdiv``, the reductions) when it is
 first imported, and a kernel and every ``@triton.jit`` function it calls
 (``uniserve_kernels``, ``triton.language``) must share one mode; so the mode
-is one per process, fixed by :func:`pytest_configure` before Triton is first
+is one per process, fixed by the plugin's ``pytest_configure`` when the
+session starts, before any test directory is collected and Triton is first
 imported, and no check sets it again.
 
 - A test that runs in both modes takes its tensors on ``torch_device``; one
@@ -73,8 +74,6 @@ reference arithmetic and operands are a module of the family's subpackage of
 
 from __future__ import annotations
 
-import os
-import sys
 from collections.abc import Callable, Iterator
 from pathlib import Path
 from types import ModuleType
@@ -87,43 +86,7 @@ from uniserve_testing.kernels.packages import (
     Modules,
     source_module,
 )
-
-
-def interpreting(config: pytest.Config) -> bool:
-    """Whether the session runs the kernels on Triton's interpreter."""
-    return config.getoption("kernel_device") == "interpreter"
-
-
-#: Triton's setting of its mode, which ``triton.knobs.runtime.interpret``
-#: reads when Triton is imported and its language library is decorated.
-TRITON_MODE = "TRITON_INTERPRET"
-
-
-def pytest_configure(config: pytest.Config) -> None:
-    """Fix Triton's mode for the session before Triton is first imported.
-
-    No check and no kernel source imports Triton before this hook runs, which
-    pytest calls once this file is loaded and before it imports a test module
-    of this directory. The choice is Triton's own setting, the only one it
-    reads before it decorates its language library. A process a check starts
-    runs with the declared environment of the tests' servers
-    (:func:`uniserve_testing.servers.environment`), which does not carry it:
-    the Build Server's driver decorates a package's kernels in Triton's
-    compiled mode itself.
-
-    Raises:
-        pytest.UsageError: When Triton was imported earlier in another mode,
-            which decorated its language library in that mode.
-    """
-    if "triton" in sys.modules:
-        triton = sys.modules["triton"]
-        if triton.knobs.runtime.interpret != interpreting(config):
-            raise pytest.UsageError(
-                "Triton was imported in the other mode before the kernel "
-                "checks chose theirs (--kernel-device)"
-            )
-        return
-    os.environ[TRITON_MODE] = "1" if interpreting(config) else "0"
+from uniserve_testing.plugin import interpreting
 
 
 def pytest_runtest_setup(item: pytest.Item) -> None:

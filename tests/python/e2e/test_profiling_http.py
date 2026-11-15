@@ -1,8 +1,6 @@
 """Online profiling of a serving deployment through the admin API.
 
-Qwen3 serves on the GPU the module's lease granted, with a
-Storage Server of the test's own in a runtime directory the test creates
-(``tempfile``'s directory, ``TMPDIR`` when set):
+Qwen3 serves on the GPU the module's lease holds:
 
 - The fence probes are always on: every decode step's span and its
   transformer layers' time reach the Prometheus histogram, and switching
@@ -13,11 +11,12 @@ Storage Server of the test's own in a runtime directory the test creates
   API calls with the fence records and PC sampling's counts (its records
   of graph kernels need ``profiling_config.graph_pc_sampling``), PM
   samples, and range metrics; the reader states each file's contents and
-  the Perfetto
-  converter turns it into a trace. One session runs at a time, and one
-  naming two collectors of the device's performance monitors is refused.
-- A range_metrics session reserves its range profiler pass's device storage
-  with the worker's process item in the GPU's quota until it ends.
+  the Perfetto converter turns it into a trace. One session runs at a time,
+  and one naming two collectors of the device's performance monitors is
+  refused.
+- A range_metrics session reserves its range profiler pass's device storage,
+  which its worker measures and reports, with the worker's process item in
+  the GPU's quota until it ends.
 - A session whose epoch is replaced ends with the epoch change, its file
   written.
 - The quality-of-service guard turns collectors off, costliest first, and
@@ -27,28 +26,18 @@ Storage Server of the test's own in a runtime directory the test creates
 from __future__ import annotations
 
 import json
-import re
 import time
 from collections.abc import Iterator
+from fnmatch import fnmatchcase
 from pathlib import Path
+from typing import Any
 
-import httpx
 import pytest
+from uniserve_testing import admin, chat, client, profiling
+from uniserve_testing.deployments import Deployments
+from uniserve_testing.profiling import Load
+from uniserve_testing.servers import Server
 
-from tests.python.e2e.http_helpers import (
-    admin,
-    admin_config,
-    admin_request,
-    apply_config,
-    metric,
-    wait_until,
-)
-from tests.python.e2e.profiling_helpers import NAME, RANGE_PASS_STORAGE, serve
-from tests.python.e2e.profiling_helpers import Load as _Load
-from tests.python.e2e.profiling_helpers import ended as _ended
-from tests.python.e2e.profiling_helpers import profile as _profile
-from tests.python.e2e.profiling_helpers import start as _start
-from tests.python.e2e.profiling_helpers import stop as _stop
 from uniserve_eval.profile import ProfileFile, convert
 
 pytestmark = [
@@ -59,101 +48,83 @@ pytestmark = [
     pytest.mark.gpus(1),
 ]
 
+#: The module classes the deployment probes, and the sessions' fence records
+#: keep: its transformer layers, as a pattern of their class names.
+LAYERS = "*.TransformerLayer"
+
 OPTIONS = (
-    "dtype=bfloat16",
-    "attention_backend=trtllm",
-    "max_num_batched_tokens=512",
+    "--set",
     "kv_cache_config.max_tokens=32768",
-    "chat_config.reasoning_parser=none",
-    "cuda_graph_config.prefill_token_sizes=[512]",
-    "cuda_graph_config.decode_batch_sizes=[1, 2, 4, 8]",
-    'profiling_config.fence_modules=["*.TransformerLayer"]',
+    "--set",
+    f'profiling_config.fence_modules=["{LAYERS}"]',
 )
+
+#: How long the workers take to report the forwards or fence steps of the
+#: load's decode steps, in seconds (scaled): each report carries the steps
+#: since the last, once a second.
+REPORTED_S = 60.0
 
 
 @pytest.fixture(scope="module")
-def served(
-    tmp_path_factory: pytest.TempPathFactory, build_server: Path
-) -> Iterator[str]:
+def served(module_deployments: Deployments) -> Iterator[Server]:
     """A Qwen3 deployment serving with fence probes on its transformer
     layers, which the module's tests share.
     """  # noqa: D205
-    with serve(
-        tmp_path_factory.mktemp("served"), OPTIONS, build_server
-    ) as base_url:
-        yield base_url
+    with profiling.serve(module_deployments, *OPTIONS) as server:
+        yield server
 
 
-def _chat(base_url: str, tokens: int = 32) -> None:
-    response = httpx.post(
-        f"{base_url}/v1/chat/completions",
-        json={
-            "model": NAME,
-            "messages": [{"role": "user", "content": "Say hello."}],
-            "chat_template_kwargs": {"enable_thinking": False},
-            "temperature": 0,
-            "max_completion_tokens": tokens,
-        },
-        timeout=600,
-    )
-    response.raise_for_status()
-
-
-def _fence_count(base_url: str, stage: str, label: str) -> int:
-    """The steps the fence histogram counted for `stage` and `label`."""
-    text = httpx.get(f"{base_url}/metrics", timeout=30).text
-    pattern = re.compile(
-        r"^uniserve:worker_fence_step_seconds_count\{([^}]*)\} (\S+)$",
-        re.MULTILINE,
-    )
-    total = 0
-    for labels, value in pattern.findall(text):
-        if f'stage="{stage}"' in labels and label in labels:
-            total += int(float(value))
-    return total
-
-
-def _apply(base_url: str, *assignments: str) -> dict:
-    response = apply_config(base_url, *assignments)
+def _apply(server: Server, *assignments: str) -> dict[str, Any]:
+    """The result of applying `assignments` (``PUT /admin/config``)."""
+    response = admin.apply(server, *assignments)
     assert response.status_code == 200, response.text
     return response.json()["result"]
 
 
-def _forwards(base_url: str) -> float:
+def _forwards(server: Server) -> float:
     """The forwards the workers reported so far, which their reports carry
     beside the fence histogram's steps
     (``uniserve:worker_forward_mode_counts``).
     """  # noqa: D205
-    return metric(base_url, "uniserve:worker_forward_mode_counts")
+    return client.metric(server.base_url, "uniserve:worker_forward_mode_counts")
 
 
-def _forwards_reported(base_url: str) -> None:
-    """Waits until the workers reported forwards they ran from now on."""
-    forwards = _forwards(base_url)
-    wait_until(
-        lambda: _forwards(base_url) > forwards,
-        60,
+def _forwards_reported(server: Server) -> None:
+    """Return once the workers reported forwards they ran from now on.
+
+    The counts reach ``/metrics`` with the workers' reports, which no event
+    of the node's log announces, so they are read every second.
+    """
+    forwards = _forwards(server)
+    server.wait_until(
+        lambda: _forwards(server) > forwards,
+        REPORTED_S,
         "the workers reported no forward",
     )
 
 
-def test_fence_probes_report_steps_and_switch_in_place(served: str):
+def test_fence_probes_report_steps_and_switch_in_place(served: Server):
     def steps() -> int:
-        return _fence_count(served, "decode", 'module="step"')
+        return profiling.fence_steps(served, "decode", "step")
 
-    _chat(served)
-    with _Load(served, streams=1):
-        wait_until(
-            lambda: (
-                steps() > 0
-                and _fence_count(served, "decode", "TransformerLayer") > 0
-            ),
-            60,
+    def layer_steps() -> int:
+        return profiling.fence_steps(served, "decode", LAYERS)
+
+    chat.complete(
+        served.base_url,
+        chat.body(
+            profiling.NAME, "Say hello.", 32, temperature=0, **chat.NO_THINKING
+        ),
+    )
+    with Load(served, streams=1):
+        # The counts reach /metrics with the workers' reports, which no event
+        # of the node's log announces.
+        served.wait_until(
+            lambda: steps() > 0 and layer_steps() > 0,
+            REPORTED_S,
             "the fence probes reported no decode step",
         )
-    decode = steps()
-    layers = _fence_count(served, "decode", "TransformerLayer")
-    print(f"decode steps {decode}, layer steps {layers}")
+    print(f"decode steps {steps()}, layer steps {layer_steps()}")
 
     off = _apply(served, "profiling_config.fence_probes=false")
     assert off["change"] == "in_place", off
@@ -161,7 +132,7 @@ def test_fence_probes_report_steps_and_switch_in_place(served: str):
         # The steps whose probes ran before the switch are read with the next
         # results; none is counted after them, while the workers report the
         # forwards they run.
-        with _Load(served, streams=1):
+        with Load(served, streams=1):
             _forwards_reported(served)
             settled = steps()
             _forwards_reported(served)
@@ -171,10 +142,10 @@ def test_fence_probes_report_steps_and_switch_in_place(served: str):
         # one with its probes as it was started, whatever this one found.
         on = _apply(served, "profiling_config.fence_probes=true")
     assert on["change"] == "in_place", on
-    with _Load(served, streams=1):
-        wait_until(
+    with Load(served, streams=1):
+        served.wait_until(
             lambda: steps() > settled,
-            60,
+            REPORTED_S,
             "the fence probes counted no step once switched on",
         )
 
@@ -197,7 +168,7 @@ SESSIONS = {
 
 @pytest.mark.parametrize("name", sorted(SESSIONS))
 def test_a_session_records_its_collectors_into_its_file(
-    served: str, tmp_path: Path, name: str
+    served: Server, tmp_path: Path, name: str
 ):
     collectors, tables = SESSIONS[name]
     output = tmp_path / "profiles"
@@ -206,30 +177,26 @@ def test_a_session_records_its_collectors_into_its_file(
         "stages": ["decode"],
         "start_step": 5,
         "steps": 40,
-        "modules": ["*.TransformerLayer"],
+        "modules": [LAYERS],
         "output_dir": str(output),
     }
     # Two collectors of the performance monitors are refused together.
     conflicting = {**request, "collectors": ["pm_sampling", "pc_sampling"]}
-    refused = admin_request(
-        served, "POST", "/admin/profile", body=conflicting, timeout_s=600
-    )
+    refused = admin.request(served, "POST", profiling.PROFILE, body=conflicting)
     assert refused.status_code == 400, refused.text
     assert "performance monitors" in refused.text, refused.text
 
-    with _Load(served):
-        session = _start(served, request)
+    with Load(served):
+        session = profiling.start(served, request)
         worker = session["workers"][0]
         assert worker["selected"], worker
         assert all(
             state == "prepared" for state in worker["collectors"].values()
         ), worker
         # One session at a time.
-        refused = admin_request(
-            served, "POST", "/admin/profile", body=request, timeout_s=600
-        )
+        refused = admin.request(served, "POST", profiling.PROFILE, body=request)
         assert refused.status_code == 400, refused.text
-        ended = _ended(served, 600)
+        ended = profiling.ended(served)
     print(json.dumps(ended, indent=2))
     assert ended["end_reason"] == "window", ended
     assert ended["steps"] == 40, ended
@@ -253,25 +220,24 @@ def test_a_session_records_its_collectors_into_its_file(
         assert len(taken) == 40
         assert {step["stage"] for step in taken} == {"decode"}
         if "fence_timeline" in collectors:
-            intervals = list(profile.fence_intervals())
-            assert intervals
-            assert {item["module"] for item in intervals} == {
-                "models.qwen3.transformer.TransformerLayer"
-            }
+            # The fence records the session kept are the calls of the module
+            # classes its request named.
+            modules = {item["module"] for item in profile.fence_intervals()}
+            assert modules, "the session kept no fence record"
+            assert all(fnmatchcase(module, LAYERS) for module in modules), (
+                modules
+            )
     if "fence_timeline" in collectors:
         trace = convert([path])
-        names = {event.get("name") for event in trace["traceEvents"]}
-        assert "models.qwen3.transformer.TransformerLayer" in names
+        names = {event.get("name") or "" for event in trace["traceEvents"]}
+        assert any(fnmatchcase(name, LAYERS) for name in names), sorted(names)
 
 
-def _process_bytes(base_url: str) -> int:
+def _process_bytes(server: Server) -> int:
     """The bytes the worker's process item reserves in its GPU's quota."""
-    status = admin_config(base_url)
     entries = [
         entry
-        for node in status["quotas"]
-        for quota in node["quotas"]
-        for entry in quota["reservations"]
+        for entry in admin.reservations(server)
         if entry["item"] == "process"
     ]
     assert len(entries) == 1, entries
@@ -279,10 +245,10 @@ def _process_bytes(base_url: str) -> int:
 
 
 def test_a_range_metrics_session_books_its_pass_while_it_runs(
-    served: str, tmp_path: Path
+    served: Server, tmp_path: Path
 ):
     before = _process_bytes(served)
-    _start(
+    session = profiling.start(
         served,
         {
             "collectors": ["range_metrics"],
@@ -290,18 +256,23 @@ def test_a_range_metrics_session_books_its_pass_while_it_runs(
             "output_dir": str(tmp_path / "profiles"),
         },
     )
-    assert _process_bytes(served) == before + RANGE_PASS_STORAGE
-    stopped = _stop(served)
-    assert stopped.status_code == 200, stopped.text
-    assert _ended(served, 60)["end_reason"] == "operator"
+    # The pass's device storage, as the worker measured it when the session
+    # started.
+    [worker] = session["workers"]
+    held = worker["device_storage"]
+    assert held > 0, worker
+    assert _process_bytes(served) == before + held
+    stopped = profiling.stop(served)
+    assert stopped["state"] == "ended", stopped
+    assert stopped["end_reason"] == "operator", stopped
     assert _process_bytes(served) == before
 
 
 def test_a_epoch_change_ends_the_session_of_the_epoch_it_replaces(
-    served: str, tmp_path: Path
+    served: Server, tmp_path: Path
 ):
-    with _Load(served, streams=1):
-        _start(
+    with Load(served, streams=1):
+        profiling.start(
             served,
             {
                 "collectors": ["timeline"],
@@ -313,44 +284,73 @@ def test_a_epoch_change_ends_the_session_of_the_epoch_it_replaces(
             served, "cuda_graph_config.decode_batch_sizes=[1, 2, 4, 8, 16]"
         )
         assert changed["change"] == "epoch", changed
-        session = _profile(served)
+        session = profiling.session(served)
         assert session["state"] == "ended", session
         assert session["end_reason"] == "epoch change", session
         assert session["files"][0]["file"]["rows"]["kernel"] > 0, session
-        committed = admin(served, "config/commit")
+        committed = admin.operation(served, "config/commit")
         assert committed.status_code == 200, committed.text
 
 
+#: The span before a guarded session whose average step time its guard
+#: compares the session's with (``baseline_s``), in seconds: the load decodes
+#: alone for this span before the session starts.
+BASELINE_S = 30
+
+#: The span of the session the guard averages its step time over, and the
+#: least time between two of its actions (``guard_window_s``), in seconds.
+GUARD_WINDOW_S = 10
+
+#: How long the guard takes to act twice, in seconds (scaled): it first acts
+#: once a window of the session's steps is measured and again at least a
+#: window later, so two actions take up to three windows; the bound allows
+#: twice that.
+GUARD_ACTIONS_S = 6 * GUARD_WINDOW_S
+
+
 def test_the_guard_releases_collectors_then_ends_the_session(
-    served: str, tmp_path: Path
+    served: Server, tmp_path: Path
 ):
     def actions() -> list[tuple[str, str | None]]:
-        session = _profile(served) or {}
+        current = profiling.session(served) or {}
         return [
             (action["action"], action["collector"])
-            for action in session.get("guard", [])
+            for action in current.get("guard", [])
         ]
 
-    with _Load(served):
-        # The guard's baseline: the step time before the session.
-        time.sleep(30)
-        _start(
+    with Load(served) as load:
+        # The guard's baseline is the step time over the span its request
+        # states before the session, in which the load alone decodes: a span
+        # of time by definition, not a state to wait for.
+        load.decoding()
+        time.sleep(BASELINE_S)
+        profiling.start(
             served,
             {
                 "collectors": ["timeline", "pc_sampling"],
                 "timeline": {"graphs": "nodes"},
                 "output_dir": str(tmp_path / "profiles"),
                 "max_slowdown": 0.0,
+                "baseline_s": BASELINE_S,
+                "guard_window_s": GUARD_WINDOW_S,
             },
         )
-        deadline = time.monotonic() + 300
-        while len(actions()) < 2 and time.monotonic() < deadline:
-            time.sleep(1.0)
-        session = _profile(served)
-        if session["state"] == "running":
-            stopped = _stop(served)
-            assert stopped.status_code == 200, stopped.text
-        ended = _ended(served, 60)
+        # The guard's actions are in the session's state, which no event of
+        # the node's log announces.
+        served.wait_until(
+            lambda: (
+                len(actions()) >= 2
+                or (profiling.session(served) or {}).get("state") == "ended"
+            ),
+            GUARD_ACTIONS_S,
+            "the guard did not act twice",
+        )
+        current = profiling.session(served)
+        ended = (
+            profiling.stop(served)
+            if current["state"] == "running"
+            else profiling.ended(served)
+        )
     print(json.dumps(ended, indent=2))
     taken = actions()
     # Costliest first; a slowdown left without a collector ends the

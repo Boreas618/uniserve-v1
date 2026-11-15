@@ -35,11 +35,6 @@ from typing import Any
 INHERITED = ("PATH", "HOME")
 HUGGING_FACE = "HF_"
 
-#: How long a stopped server may take to end before it is killed, in
-#: seconds: a daemon finishes what it holds within its shutdown timeout,
-#: which test deployments leave at its default (``server_config``).
-STOP_GRACE_S = 60.0
-
 
 def environment(**declared: str) -> dict[str, str]:
     """The environment a launched server runs with: :data:`INHERITED` and
@@ -223,12 +218,10 @@ class Server:
         return int(self.record["pid"])
 
     def stop(self) -> None:
-        """Stop the server's process group and close the record descriptor.
-
-        The server ends on SIGTERM within :data:`STOP_GRACE_S` (scaled), or
-        is killed then.
-        """
-        stop_process(self.process, self.scaled(STOP_GRACE_S))
+        """Stop the server's process group and close the record descriptor
+        (:func:`stop_process`).
+        """  # noqa: D205
+        stop_process(self.process)
         self.close()
 
     def close(self) -> None:
@@ -238,18 +231,19 @@ class Server:
             self._records = -1
 
 
-def stop_process(process: subprocess.Popen[bytes], grace_s: float) -> None:
-    """End `process`'s session (it leads one, :func:`launch`) with SIGTERM,
-    and with SIGKILL when it has not ended within `grace_s` seconds.
+def stop_process(process: subprocess.Popen[bytes]) -> None:
+    """End `process`'s session (it leads one, :func:`launch`) with SIGTERM
+    and wait for it.
+
+    A UniServe server ends on SIGTERM within its own shutdown bound
+    (``server_config.shutdown_timeout`` for a daemon), so the wait needs no
+    bound of its own: the case's bound (pytest-timeout) covers one that
+    hangs.
     """  # noqa: D205
     if process.poll() is not None:
         return
     os.killpg(process.pid, signal.SIGTERM)
-    try:
-        process.wait(timeout=grace_s)
-    except subprocess.TimeoutExpired:
-        os.killpg(process.pid, signal.SIGKILL)
-        process.wait()
+    process.wait()
 
 
 def launch(
