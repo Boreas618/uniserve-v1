@@ -1,12 +1,18 @@
 //! A deployment of two nodes: a leader and a member daemon in this process,
 //! joined over loopback. An engine connects to the leader only, and the
-//! leader routes what it asks for the member's node to the member.
+//! leader routes what it asks for the member's node to the member. A test of
+//! what a node claims at its host's Storage Server runs each daemon in a
+//! process of its own, whose runtime directory is its host's ([`Hosts`]).
 
 use daemon::engine::control::{BuildServer, EngineControl, prepare_epoch};
 use daemon::{Daemon, DaemonOptions};
-use proto::process::{Exit, NodesQuery, PrepareModules, ThrottleTransfers, reply, request};
+use proto::process::{
+    Claim, Exit, NodesQuery, PrepareModules, Scope, ThrottleTransfers, reply, request,
+};
 
-use crate::support::{BuildServerStandIn, Engine, launch, module_set, package, sleeper};
+use crate::support::{
+    BuildServerStandIn, Engine, StorageServerStandIn, launch, module_set, package, sleeper,
+};
 
 /// A leader on host `leader` and a member on host `member`, each host with its stand-in Build
 /// Server.
@@ -337,4 +343,161 @@ fn a_host_that_prepares_other_modules_fails_the_preparation() {
     )
     .unwrap_err();
     assert!(format!("{refused:#}").contains("member"), "{refused:#}");
+}
+
+/// A deployment of two hosts, `leader` and `member`, each node's daemon in a process of its own
+/// (the `daemon-host` binary) whose runtime directory is its host's, where a Storage Server
+/// stand-in and a Build Server stand-in serve: a claim and a publication at a node reach that
+/// host's Storage Server alone, as on two machines.
+struct Hosts {
+    leader: StorageServerStandIn,
+    member: StorageServerStandIn,
+    /// The address engines reach the leader at.
+    address: String,
+    /// The node processes, the member's last.
+    processes: Vec<std::process::Child>,
+    /// Each host's Build Server, the leader's first.
+    build_servers: Vec<BuildServerStandIn>,
+    directory: tempfile::TempDir,
+}
+
+impl Hosts {
+    fn start() -> Self {
+        let directory = tempfile::tempdir().unwrap();
+        let runtime = |host: &str| {
+            let runtime = directory.path().join(host);
+            std::fs::create_dir_all(&runtime).unwrap();
+            runtime
+        };
+        let store = |host: &str| {
+            let socket = service::RuntimeDirectory::within(&runtime(host))
+                .unwrap()
+                .socket(storage::SERVICE);
+            StorageServerStandIn::serve(socket)
+        };
+        let build = |host: &str| {
+            BuildServerStandIn::serve(directory.path().join(format!("{host}.build")), false, 0)
+        };
+        let (leader, member) = (store("leader"), store("member"));
+        let build_servers = vec![build("leader"), build("member")];
+
+        // Each line a node process writes, as it writes it.
+        let node = |node_rank: u32, host: &str, join: &str, build: &BuildServerStandIn| {
+            let mut process = std::process::Command::new(env!("CARGO_BIN_EXE_daemon-host"))
+                .arg("--socket")
+                .arg(directory.path().join(format!("{host}.sock")))
+                .arg("--build-server")
+                .arg(build.socket())
+                .args(["--host", host, "--nnodes", "2"])
+                .args(["--node-rank", &node_rank.to_string(), "--join", join])
+                .env("XDG_RUNTIME_DIR", runtime(host))
+                .stdout(std::process::Stdio::piped())
+                .spawn()
+                .unwrap();
+            let lines =
+                std::io::BufRead::lines(std::io::BufReader::new(process.stdout.take().unwrap()));
+            (process, lines)
+        };
+        let (leader_process, mut leader_lines) =
+            node(0, "leader", "127.0.0.1:0", &build_servers[0]);
+        let mut next = move |expected: &str| {
+            let line = leader_lines.next().unwrap().unwrap();
+            line.strip_prefix(expected)
+                .unwrap_or_else(|| panic!("the leader wrote {line:?}, not {expected:?}"))
+                .to_owned()
+        };
+        let join = next("joining ");
+        let (member_process, mut member_lines) = node(1, "member", &join, &build_servers[1]);
+        assert_eq!(next("serving"), "", "the leader did not start");
+        let address = next("address ");
+        assert_eq!(
+            member_lines.next().unwrap().unwrap(),
+            "serving",
+            "the member did not start"
+        );
+
+        Self {
+            leader,
+            member,
+            address,
+            processes: vec![leader_process, member_process],
+            build_servers,
+            directory,
+        }
+    }
+
+    /// The engine control of the leader's daemon, for the deployment the engines claim.
+    fn control(&self) -> EngineControl {
+        EngineControl::new(
+            &self.directory.path().join("requests.sock"),
+            self.address.clone(),
+            "leader".into(),
+            "deployment".into(),
+            self.build_servers[0].socket(),
+        )
+        .unwrap()
+    }
+}
+
+impl Drop for Hosts {
+    fn drop(&mut self) {
+        // The member first: its service ends when the leader's connection closes, which
+        // `the_members_processes_end_with_the_leader` observes on its own.
+        for process in self.processes.iter_mut().rev() {
+            let _ = process.kill();
+            let _ = process.wait();
+        }
+    }
+}
+
+/// Claims epoch `epoch` of the deployment at `host`'s Storage Server for the deployment's rank
+/// `rank`, as the epoch's engine there does before it maps storage.
+fn claim(engine: &mut Engine, host: &str, epoch: u64, rank: u32) {
+    let claimed = engine.request(request::Kind::Claim(Claim {
+        host: host.into(),
+        deployment: "deployment".into(),
+        scopes: vec![Scope {
+            group: "model".into(),
+            rank,
+        }],
+        storage: None,
+        epoch,
+        retire: Vec::new(),
+    }));
+    assert!(
+        matches!(claimed.kind, Some(reply::Kind::Claimed(_))),
+        "{host} did not claim epoch {epoch}: {claimed:?}"
+    );
+}
+
+/// An epoch is published at the nodes that claimed it, and only there. The deployment's first
+/// epoch places every rank on the leader, so the member, which holds no rank, never claimed and
+/// is not asked; a later epoch that places ranks on the member is claimed there too and published
+/// at both. A node asked to publish an epoch it holds no claim of refuses, naming itself.
+#[test]
+fn an_epoch_is_published_at_the_nodes_that_claimed_it() {
+    let hosts = Hosts::start();
+    let mut engine = Engine::connect(&hosts.address);
+    let control = hosts.control();
+
+    claim(&mut engine, "leader", 1, 0);
+    control.publish_epochs(&[1], &["leader".into()]).unwrap();
+    assert_eq!(hosts.leader.published(), [vec![1]]);
+    assert!(hosts.member.published().is_empty());
+
+    let refused = control
+        .publish_epochs(&[1], &["member".into()])
+        .unwrap_err();
+    assert!(
+        format!("{refused:#}").contains("publishing epochs at member: this node holds no claim"),
+        "{refused:#}"
+    );
+
+    claim(&mut engine, "leader", 2, 0);
+    claim(&mut engine, "member", 2, 1);
+    control
+        .publish_epochs(&[2], &["leader".into(), "member".into()])
+        .unwrap();
+    assert_eq!(hosts.leader.published(), [vec![1], vec![2]]);
+    assert_eq!(hosts.member.published(), [vec![2]]);
 }

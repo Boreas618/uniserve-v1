@@ -780,6 +780,17 @@ impl Engines {
             .collect()
     }
 
+    /// The publications among them.
+    pub(crate) fn publications(&self) -> Vec<proto::process::PublishEpochs> {
+        self.requests()
+            .into_iter()
+            .filter_map(|kind| match kind {
+                proto::process::request::Kind::PublishEpochs(publish) => Some(publish),
+                _ => None,
+            })
+            .collect()
+    }
+
     /// The launch generations the leader stopped, in order.
     pub(crate) fn stops(&self) -> Vec<Option<u64>> {
         self.requests()

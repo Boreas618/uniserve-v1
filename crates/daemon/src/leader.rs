@@ -799,7 +799,7 @@ impl Leader {
         };
         let hosts = epoch_hosts(&prepared.engine)?;
         let named = crate::epoch::modules_of(config);
-        let modules = fix_modules(local, Some(Arc::clone(&control)), hosts, named)
+        let modules = fix_modules(local, Some(Arc::clone(&control)), hosts.clone(), named)
             .await
             .map_err(anyhow::Error::from)
             .context("fixing the deployment's module set")?;
@@ -898,9 +898,12 @@ impl Leader {
         }
         // A serving epoch's tensors are what the next epoch starts from:
         // until it is published its storage is private to it, and a target
-        // of another epoch finds nothing.
+        // of another epoch finds nothing. Each of the epoch's engines claimed
+        // its own node's storage before it mapped any, so the nodes that
+        // claimed the epoch are the hosts it runs on: a node that holds none
+        // of its ranks claimed nothing and is not asked.
         let publishing = Arc::clone(&control);
-        tokio::task::spawn_blocking(move || publishing.publish_epochs(&[epoch], &mut None))
+        tokio::task::spawn_blocking(move || publishing.publish_epochs(&[epoch], &hosts))
             .await
             .context("publishing the first epoch")?
             .context("publishing the first epoch")?;
@@ -2445,19 +2448,10 @@ impl Replica {
             }
         }
 
-        if phase == Some(Phase::Committed) {
-            // The committed target is what the next update starts from.
-            let publishing = Arc::clone(&control);
-            let published =
-                tokio::task::spawn_blocking(move || publishing.publish_epochs(&[epoch], &mut None))
-                    .await;
-            if !matches!(published, Ok(Ok(()))) {
-                warn!(
-                    epoch,
-                    "publishing the committed epoch failed: {published:?}"
-                );
-            }
-        } else if !returned {
+        // The committed target stays routed, and its update published it
+        // (`Update::committed`). An update that ended otherwise routes the
+        // requests back to the previous epoch, unless its rollback did.
+        if phase != Some(Phase::Committed) && !returned {
             for (replica, (_, args)) in previous.iter().zip(&before) {
                 *service::lock(&replica.served) = args.clone();
                 *service::lock(&replica.config) = config_before.clone();

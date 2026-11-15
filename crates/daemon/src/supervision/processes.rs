@@ -249,6 +249,26 @@ impl Processes {
         }
     }
 
+    /// Publishes the committed `epochs` at `host`'s Storage Server, through
+    /// the claim of the deployment the node holds. `Err` says why the node
+    /// refused: it holds no claim of the deployment, or none of an epoch.
+    pub(crate) fn publish(&mut self, host: &str, epochs: &[u64]) -> Result<(), String> {
+        let reply = self.request(process::request::Kind::PublishEpochs(
+            process::PublishEpochs {
+                host: host.to_owned(),
+                deployment: self.deployment.clone(),
+                epochs: epochs.to_vec(),
+            },
+        ))?;
+        if !reply.error.is_empty() {
+            return Err(reply.error);
+        }
+        match reply.kind {
+            Some(process::reply::Kind::EpochsPublished(_)) => Ok(()),
+            _ => Err("the daemon replied to a publication without its result".to_owned()),
+        }
+    }
+
     /// Starts the engine `spawn` names from `launch`, and returns its process
     /// id.
     ///

@@ -12,8 +12,8 @@
 //! ([`Engine::withhold`]).
 //!
 //! [`node_reply`] replies to the requests a leader makes of a node's daemon
-//! (`Spawn`, `Claim`, `Stop`, `KeepWeights`) the way a node does, with what
-//! [`Refusals`] names refused.
+//! (`Spawn`, `Claim`, `PublishEpochs`, `Stop`, `KeepWeights`) the way a node
+//! does, with what [`Refusals`] names refused.
 
 use proto::process::{self, Command, Report, command, report};
 use proto::request::wire::EngineState;
@@ -289,6 +289,9 @@ pub fn node_reply(request: &process::Request, refusals: &Refusals) -> process::R
                 claim: Vec::new(),
                 tcp: String::new(),
             }));
+        }
+        (Some(Kind::PublishEpochs(_)), _) => {
+            reply.kind = Some(reply::Kind::EpochsPublished(process::EpochsPublished {}));
         }
         (Some(Kind::Stop(_)), _) => {
             reply.kind = Some(reply::Kind::Stopped(process::Stopped {}));

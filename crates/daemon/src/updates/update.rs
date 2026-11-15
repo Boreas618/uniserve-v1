@@ -23,7 +23,10 @@
 //! the kept side serves and the new one drained, and `RolledBack` after. A
 //! commit records its decision (the phase and the epoch's record) before it
 //! releases anything, so an engine lost while the kept side is released is
-//! replaced by one of the committed modules.
+//! replaced by one of the committed modules. The epoch form claims its target
+//! at every node either epoch runs on; its commit publishes the target at
+//! each of those nodes, and only there, before any of them retires the
+//! previous epoch, and a rollback publishes nothing and retires the target.
 //!
 //! Every phase ends on acknowledgements the engines make, never on an
 //! assumption about their progress. The epoch form's two epochs step together
@@ -467,11 +470,7 @@ impl Update {
         keeping: &[Node],
         retire: &[u64],
     ) -> Result<(), String> {
-        let mut hosts: BTreeSet<&str> = self.nodes.iter().map(|node| node.host.as_str()).collect();
-        if let Form::Epoch(trial) = &self.form {
-            hosts.extend(trial.targets.iter().map(|node| node.host.as_str()));
-        }
-        for host in hosts {
+        for host in self.hosts() {
             let mut scopes: Vec<process::Scope> = Vec::new();
             for node in keeping.iter().filter(|node| node.host == host) {
                 for scope in &node.scopes {
@@ -483,6 +482,35 @@ impl Update {
             processes.claim(host, epoch, &scopes, retire)?;
         }
         Ok(())
+    }
+
+    /// Publishes the committed `epoch` at every node that claimed it
+    /// ([`Self::hosts`]), and only there: a node neither epoch runs on was
+    /// never asked to claim it and holds no storage of it. A node that
+    /// refuses keeps the epoch's outputs private to the epoch; the commit
+    /// stands, and the log names the node and its reason.
+    fn publish_everywhere(&self, processes: &mut Processes, epoch: u64) {
+        for host in self.hosts() {
+            if let Err(reason) = processes.publish(host, &[epoch]) {
+                tracing::error!(
+                    epoch,
+                    host,
+                    %reason,
+                    "a node that claimed the committed epoch did not publish it"
+                );
+            }
+        }
+    }
+
+    /// The hosts either epoch runs on, each once: every node the update
+    /// claims at ([`Self::claim_everywhere`]), so every node whose Storage
+    /// Server holds a claim of the epoch form's target.
+    fn hosts(&self) -> BTreeSet<&str> {
+        let mut hosts: BTreeSet<&str> = self.nodes.iter().map(|node| node.host.as_str()).collect();
+        if let Form::Epoch(trial) = &self.form {
+            hosts.extend(trial.targets.iter().map(|node| node.host.as_str()));
+        }
+        hosts
     }
 
     /// Starts `Preparing`.
@@ -947,12 +975,16 @@ impl Update {
                 }
             }
             Form::Epoch(trial) => {
+                // The target's outputs are every epoch's from now on: each
+                // node that claimed it publishes it before any node retires
+                // the previous epoch.
+                let (epoch, targets) = (trial.switch.epoch, trial.targets.clone());
+                self.publish_everywhere(processes, epoch);
                 for node in &self.nodes {
                     processes.stop(&self.group, Some(node.launch));
                 }
                 // The previous epoch's storage ends on every node while the
                 // target keeps its own.
-                let (epoch, targets) = (trial.switch.epoch, trial.targets.clone());
                 self.claim_failed = self
                     .claim_everywhere(processes, epoch, &targets, &[self.serving.number()])
                     .err();

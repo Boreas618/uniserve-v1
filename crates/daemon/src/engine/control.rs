@@ -512,18 +512,20 @@ impl EngineControl {
         Ok(reports)
     }
 
-    /// Publishes one commit decision at every deployment node. Publication
-    /// is atomic within each Storage Server and idempotent across retries;
-    /// the daemon retains its commit decision until every node has replied.
-    pub fn publish_epochs(
-        &self,
-        epochs: &[u64],
-        pending: &mut Option<Vec<String>>,
-    ) -> anyhow::Result<()> {
-        let (mut connection, nodes) = self.connect()?;
-        let pending =
-            pending.get_or_insert_with(|| nodes.into_iter().map(|node| node.host).collect());
-        while let Some(host) = pending.first().cloned() {
+    /// Publishes the committed `epochs` at the Storage Server of each node of `hosts`, through the
+    /// claim of the deployment that node's daemon holds: `hosts` are the nodes that claimed the
+    /// epochs, and only those hold storage of theirs to publish. A node that holds no claim of
+    /// the deployment, or none of an epoch, refuses, and the publication fails naming it.
+    /// Publication is atomic within each Storage Server and idempotent, so a caller may ask
+    /// again.
+    ///
+    /// # Errors
+    ///
+    /// Fails when the daemon cannot be reached, and at the first node that refuses or does not
+    /// reply in time.
+    pub fn publish_epochs(&self, epochs: &[u64], hosts: &[String]) -> anyhow::Result<()> {
+        let (mut connection, _) = self.connect()?;
+        for host in hosts {
             connection.deliver(&process::Upstream {
                 kind: Some(upstream::Kind::Request(process::Request {
                     id: 1,
@@ -549,7 +551,6 @@ impl EngineControl {
                 matches!(reply.kind, Some(reply::Kind::EpochsPublished(_))),
                 "the daemon returned no publication result"
             );
-            pending.remove(0);
         }
         Ok(())
     }

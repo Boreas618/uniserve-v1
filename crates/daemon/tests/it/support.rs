@@ -488,3 +488,109 @@ pub(crate) fn module_set() -> proto::module::ModuleSet {
         .collect(),
     }
 }
+
+/// A stand-in for a host's Storage Server, which a node's daemon claims the deployment's storage
+/// at: it owns its socket and states its readiness as a Storage Server serving the default
+/// settings does, and answers the requests a claim and a publication make of it (`Claim`,
+/// `Restore`, `Publish`) as a server that holds no storage does. As the Storage Server, it
+/// publishes only epochs a claim at it named. Each connection is served on a thread of its own.
+pub(crate) struct StorageServerStandIn {
+    state: Arc<Mutex<StorageState>>,
+}
+
+/// What a [`StorageServerStandIn`] was asked.
+#[derive(Default)]
+struct StorageState {
+    /// The epochs claimed at the server and not retired.
+    claimed: std::collections::BTreeSet<u64>,
+    /// Each publication it took, in order.
+    published: Vec<Vec<u64>>,
+}
+
+impl StorageServerStandIn {
+    /// Serves at `socket`, the Storage Server socket of the runtime directory a daemon claims
+    /// storage in (`storage::default_socket`).
+    pub(crate) fn serve(socket: PathBuf) -> Self {
+        let (listener, starting) = service::host::bind::<storage::Settings>(&socket)
+            .unwrap()
+            .owned(&socket)
+            .expect("no server owns the stand-in's socket");
+        let lock = starting
+            .finish(&service::Readiness::of_process(
+                service::State::Serving,
+                None,
+                service::Endpoints {
+                    storage: Some(service::Endpoint::unix(&socket)),
+                    ..service::Endpoints::default()
+                },
+                storage::Settings::default(),
+            ))
+            .unwrap();
+        let state = Arc::new(Mutex::new(StorageState::default()));
+        let serving = Arc::clone(&state);
+        std::thread::spawn(move || {
+            let _lock = lock;
+            for stream in listener.incoming() {
+                let Ok(stream) = stream else {
+                    return;
+                };
+                let state = Arc::clone(&serving);
+                std::thread::spawn(move || serve_storage(Connection::new(stream).unwrap(), &state));
+            }
+        });
+        Self { state }
+    }
+
+    /// The publications the server took, in order: the epochs each published.
+    pub(crate) fn published(&self) -> Vec<Vec<u64>> {
+        self.state.lock().unwrap().published.clone()
+    }
+}
+
+/// Serves one connection of a [`StorageServerStandIn`] until it closes.
+fn serve_storage(mut connection: Connection, state: &Mutex<StorageState>) {
+    use storage::protocol::{
+        ClientMessage, ErrorKind, Request as StorageRequest, Response, ServerMessage,
+        Welcome as StorageWelcome,
+    };
+
+    while let Ok(message) = connection.recv_next::<ClientMessage>() {
+        let reply = match message {
+            ClientMessage::Hello(_) => ServerMessage::Welcome(StorageWelcome::Accepted),
+            ClientMessage::Request { id, request } => {
+                let mut state = state.lock().unwrap();
+                let response = match request {
+                    StorageRequest::Claim { epoch, retire, .. } => {
+                        state.claimed.insert(epoch);
+                        state.claimed.retain(|claimed| !retire.contains(claimed));
+                        Response::Claimed {
+                            claim: storage::Claim([7; 16]),
+                        }
+                    }
+                    StorageRequest::Restore { .. } => Response::Moved {
+                        storages: 0,
+                        bytes: 0,
+                    },
+                    StorageRequest::Publish { epochs }
+                        if epochs.iter().all(|epoch| state.claimed.contains(epoch)) =>
+                    {
+                        state.published.push(epochs);
+                        Response::Published
+                    }
+                    StorageRequest::Publish { .. } => Response::Error {
+                        kind: ErrorKind::Invalid,
+                        message: "only claimed epochs can be published".to_owned(),
+                    },
+                    other => Response::Error {
+                        kind: ErrorKind::Invalid,
+                        message: format!("the stand-in serves no {other:?}"),
+                    },
+                };
+                ServerMessage::Response { id, response }
+            }
+        };
+        if connection.deliver(&reply).is_err() {
+            return;
+        }
+    }
+}

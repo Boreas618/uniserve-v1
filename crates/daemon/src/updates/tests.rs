@@ -867,6 +867,76 @@ fn an_epoch_update_covers_every_node_of_both_epochs() {
     );
 }
 
+/// A commit publishes the target at every node that claimed it, before any
+/// node retires the previous epoch: a target that places ranks on a node the
+/// serving epoch does not use is claimed and published there too. Nothing is
+/// published while the target is on trial, and a rollback publishes nothing.
+#[test]
+fn a_commit_publishes_the_target_at_every_node_that_claimed_it() {
+    let start = |deployment: &mut Deployment| {
+        let nodes = deployment.nodes(1);
+        let switch = deployment.switch(vec![
+            (target_launch(HOST, 0, SPAWNED), Vec::new()),
+            (target_launch(OTHER, 2, SPAWNED_PEER), Vec::new()),
+        ]);
+        let update = deployment.epoch_over(1, nodes, switch, None);
+        deployment.apply(update);
+        assert_eq!(deployment.status()["phase"], "trial");
+    };
+
+    let mut deployment = Deployment::new(Refusals::default());
+    start(&mut deployment);
+    let claimed: Vec<_> = deployment
+        .engines
+        .claims()
+        .iter()
+        .map(|claim| (claim.host.clone(), claim.epoch))
+        .collect();
+    assert_eq!(
+        claimed,
+        [(HOST.to_owned(), TARGET), (OTHER.to_owned(), TARGET)]
+    );
+    assert!(deployment.engines.publications().is_empty());
+
+    assert!(deployment.updater.commit().is_some());
+    deployment.run();
+    let requests = deployment.engines.requests();
+    let published: Vec<_> = requests
+        .iter()
+        .filter_map(|kind| match kind {
+            process::request::Kind::PublishEpochs(publish) => {
+                Some((publish.host.as_str(), publish.epochs.clone()))
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(published, [(HOST, vec![TARGET]), (OTHER, vec![TARGET])]);
+    let last_published = requests
+        .iter()
+        .rposition(|kind| matches!(kind, process::request::Kind::PublishEpochs(_)))
+        .expect("the commit published the target");
+    let first_retired = requests
+        .iter()
+        .position(|kind| {
+            matches!(kind, process::request::Kind::Claim(claim) if claim.retire == [SERVING])
+        })
+        .expect("the commit retired the previous epoch");
+    assert!(
+        last_published < first_retired,
+        "a node retired the previous epoch before every node published the target: {requests:?}"
+    );
+
+    let mut deployment = Deployment::new(Refusals::default());
+    start(&mut deployment);
+    deployment
+        .updater
+        .rollback(decision("the target answers worse"))
+        .expect("an update is on trial");
+    deployment.run();
+    assert_eq!(deployment.status()["phase"], "rolled_back");
+    assert!(deployment.engines.publications().is_empty());
+}
+
 /// The two epochs need not have as many replicas: two serving replicas move
 /// to one target engine, both drained once it serves.
 #[test]
