@@ -558,6 +558,31 @@ LEMMA CopiesMap ==
 (* Steps that return units to the free list: G is what they reclaim, and   *)
 (* alloc and sharedKey are reset on G alone.                               *)
 
+(* The units the holders hold are those HeldIn holds of; what a step       *)
+(* reclaims is, unit by unit, each dropped unit nothing holds any more.    *)
+LEMMA HeldUnitsIn ==
+  ASSUME NEW u, NEW tbl, NEW slt, NEW cch, NEW hch, NEW dfr, NEW cps, NEW tsk
+  PROVE  u \in HeldUnits(tbl, slt, cch, hch, dfr, cps, tsk) <=> HeldIn(u, tbl, slt, cch, hch, dfr, cps, tsk)
+  <1>1. u \in UNION {{tbl[o][p].u : p \in Positions} : o \in Owners}
+          <=> \E o \in Owners, p \in Positions : tbl[o][p].u = u
+    OBVIOUS
+  <1>2. u \in UNION {t.units \cup {t.slot, t.h} : t \in {x \in tsk : x.held}}
+          <=> \E t \in tsk : t.held /\ (u \in t.units \/ u = t.slot \/ u = t.h)
+    OBVIOUS
+  <1> QED
+    BY <1>1, <1>2 DEF HeldUnits, HeldIn
+
+LEMMA ReclaimedHeld ==
+  ASSUME NEW U, NEW tbl, NEW slt, NEW cch, NEW hch, NEW dfr, NEW cps, NEW tsk
+  PROVE  ReclaimedWith(U, tbl, slt, cch, hch, dfr, cps, tsk)
+           = {u \in U : ~HeldIn(u, tbl, slt, cch, hch, dfr, cps, tsk)}
+  <1>1. \A u : u \in HeldUnits(tbl, slt, cch, hch, dfr, cps, tsk) <=> HeldIn(u, tbl, slt, cch, hch, dfr, cps, tsk)
+    BY HeldUnitsIn
+  <1>2. ReclaimedWith(U, tbl, slt, cch, hch, dfr, cps, tsk) = U \ HeldUnits(tbl, slt, cch, hch, dfr, cps, tsk)
+    BY Design DEF ReclaimedWith, On, AllRules
+  <1> QED
+    BY <1>1, <1>2
+
 LEMMA FreeReclaim ==
   ASSUME FreeClean, NoLeak, Outside, Regions, UnitTyped, NEW G, G \subseteq AllUnits,
          free' = free \cup G, member' = member,
@@ -1056,7 +1081,7 @@ LEMMA Retire ==
   <1>1. /\ \A x : Held(x)' = HeldIn(x, table, oslot, cache, hcache, deferred', copies', tasks)
         /\ G = {x \in U : ~Held(x)'}
         /\ free' = free \cup G /\ alloc' = Reset(alloc, G) /\ sharedKey' = Reset(sharedKey, G)
-    BY DEF Held, DropWith, ReclaimedWith, On, AllRules
+    BY ReclaimedHeld DEF Held, DropWith, On, AllRules
   <1>2. /\ U \subseteq AllUnits
         /\ \A x \in U : Held(x)
     BY <1>0 DEF WorkTyped, Held, HeldIn

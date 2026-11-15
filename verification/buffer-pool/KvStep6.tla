@@ -771,7 +771,7 @@ LEMMA TakeRelease_Taken ==
       <3> DEFINE G == ReclaimedWith(U, RelTable(r), oslot, cache, hcache, deferred, copies, tasks)
       <3>1. /\ free' = free \cup G /\ alloc' = Reset(alloc, G) /\ sharedKey' = Reset(sharedKey, G)
             /\ G = {x \in U : ~Held(x)'}
-        BY <1>2, <2>1, <2>3 DEF DropWith, ReclaimedWith, On, AllRules
+        BY <1>2, <2>1, <2>3, ReclaimedHeld DEF DropWith, On, AllRules
       <3>2. /\ \A x \in AllUnits : Held(x)' => Held(x)
             /\ \A x \in AllUnits : Held(x) => Held(x)' \/ x \in G
             /\ \A x \in G : Held(x) /\ ~Held(x)'
@@ -1251,7 +1251,7 @@ LEMMA TakeDetach_Taken ==
                                     tasks)
       <3>1. /\ free' = free \cup G /\ alloc' = Reset(alloc, G) /\ sharedKey' = Reset(sharedKey, G)
             /\ G = {x \in U : ~Held(x)'}
-        BY <1>2, <2>1, <2>5 DEF DropWith, ReclaimedWith, On, AllRules
+        BY <1>2, <2>1, <2>5, ReclaimedHeld DEF DropWith, On, AllRules
       <3>2. /\ \A x \in AllUnits : Held(x)' => Held(x)
             /\ \A x \in AllUnits : Held(x) => Held(x)' \/ x \in G
             /\ \A x \in G : Held(x) /\ ~Held(x)'

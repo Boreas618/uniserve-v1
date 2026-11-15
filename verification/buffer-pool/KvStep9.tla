@@ -1004,7 +1004,7 @@ LEMMA PrefetchEndInv ==
     <2>2. ~HeldIn(t.h, table, oslot, cache, hcache, deferred, copies, tasks')
       BY <1>1, PrefetchSole DEF HeldIn
     <2>3. ReclaimedWith({t.h}, table, oslot, cache, hcache, deferred, copies, tasks') = {t.h}
-      BY <2>2 DEF ReclaimedWith
+      BY <2>2, ReclaimedHeld
     <2>4. /\ free' = free \cup {t.h}
           /\ alloc' = [u \in AllUnits |-> IF u = t.h THEN NONE ELSE alloc[u]]
           /\ sharedKey' = [u \in AllUnits |-> IF u = t.h THEN NONE ELSE sharedKey[u]]

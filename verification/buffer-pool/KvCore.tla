@@ -206,10 +206,23 @@ HeldIn(u, tbl, slt, cch, hch, dfr, cps, tsk) ==
     \/ \E c \in cps : u = c.read \/ u = c.write
     \/ \E t \in tsk : t.held /\ (u \in t.units \/ u = t.slot \/ u = t.h)
 
+(* Every unit the given holders hold: a unit is in this set exactly when   *)
+(* `HeldIn` holds of it (KvFrame's `HeldUnitsIn`).                         *)
+\* @type: (Str -> (Str -> {k: Str, u: Str}), Str -> Str, Str -> Str, Str -> Str, Set($def), Set($copy), Set($task)) => Set(Str);
+HeldUnits(tbl, slt, cch, hch, dfr, cps, tsk) ==
+    (UNION {{tbl[o][p].u : p \in Positions} : o \in Owners}) \cup {slt[o] : o \in Owners}
+        \cup {cch[k] : k \in Keys} \cup {hch[k] : k \in Keys}
+        \cup (UNION {d.units : d \in dfr}) \cup (UNION {{c.read, c.write} : c \in cps})
+        \cup (UNION {t.units \cup {t.slot, t.h} : t \in {x \in tsk : x.held}})
+
 (* R2: runs return to a region only when the last reference is dropped.    *)
+(* What is still held is gathered once, not looked up per dropped unit: an *)
+(* engine's loss drops every block of its owners, and a lookup per unit    *)
+(* reads every owner's table for each (KvFrame's `ReclaimedHeld` states    *)
+(* the same set unit by unit).                                             *)
 \* @type: (Set(Str), Str -> (Str -> {k: Str, u: Str}), Str -> Str, Str -> Str, Str -> Str, Set($def), Set($copy), Set($task)) => Set(Str);
 ReclaimedWith(dropped, tbl, slt, cch, hch, dfr, cps, tsk) ==
-    IF On("R2") THEN {u \in dropped : ~HeldIn(u, tbl, slt, cch, hch, dfr, cps, tsk)} ELSE dropped
+    IF On("R2") THEN dropped \ HeldUnits(tbl, slt, cch, hch, dfr, cps, tsk) ELSE dropped
 
 \* @type: (Str -> Str, Set(Str)) => (Str -> Str);
 Reset(f, gone) == [u \in AllUnits |-> IF u \in gone THEN NONE ELSE f[u]]
@@ -1213,13 +1226,17 @@ Lose(e) ==
     /\ e \in Losable \ lost
     /\ lost' = lost \cup {e}
     /\ LET mine(g) == GroupEpoch[g] = e
-           gone == {o \in Owners : OwnerEpoch[o] = e /\ ostate[o] = "live"}
+           \* Whether the loss detaches owner o: a test of one owner, where TLC
+           \* builds `gone` from every owner anew at each `o \in gone` it meets
+           \* reading the tables and slots after the loss.
+           goes(o) == OwnerEpoch[o] = e /\ ostate[o] = "live"
+           gone == {o \in Owners : goes(o)}
            cps == {c \in copies : ~mine(c.g)}
            dfr == {d \in deferred :
                      /\ ~(d.kind = "finish" /\ \E c \in copies \ cps : c.id = d.c)
                      /\ ~(d.kind \in {"commit", "transfer", "replicate"} /\ OwnerEpoch[d.o] = e)}
-           tbl == [o \in Owners |-> IF o \in gone THEN [p \in Positions |-> Empty] ELSE table[o]]
-           slt == [o \in Owners |-> IF o \in gone THEN NONE ELSE oslot[o]]
+           tbl == [o \in Owners |-> IF goes(o) THEN [p \in Positions |-> Empty] ELSE table[o]]
+           slt == [o \in Owners |-> IF goes(o) THEN NONE ELSE oslot[o]]
            dropped == (UNION {{table[o][p].u : p \in Positions} \cup {oslot[o]} : o \in gone})
                         \cup (UNION {{c.read, c.write} : c \in copies \ cps})
                         \cup (UNION {d.units : d \in deferred \ dfr})
@@ -1232,7 +1249,7 @@ Lose(e) ==
           /\ deferred' = dfr
           /\ table' = tbl
           /\ oslot' = slt
-          /\ ostate' = [o \in Owners |-> IF o \in gone THEN "gone" ELSE ostate[o]]
+          /\ ostate' = [o \in Owners |-> IF goes(o) THEN "gone" ELSE ostate[o]]
           /\ DropWith(dropped \ {NONE}, tbl, slt, cache, hcache, dfr, cps, tasks)
     /\ UNCHANGED <<ogroup, cache, hcache, ncopy, tasks, trial, member, valid, vis, launched,
                    remote, bad>>

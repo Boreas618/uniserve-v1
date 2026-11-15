@@ -181,6 +181,13 @@ def epoch_of(name):
     return name.split(".")[0]
 
 
+def unstated(state, owner):
+    """What an owner that `state` does not state is: never attached while
+    its session is open, gone once its session is closed (a closed
+    session's owners are not stated), as KvTrace's `Matches` reads it."""
+    return "new" if state.epochs.get(epoch_of(owner), ("closed",))[0] == "open" else "gone"
+
+
 def epoch_key(name):
     """The order of the model's epochs: by engine epoch, then by session
     (`e1`, `e1-2`, `e2`; an engine with a parked standby has a session per
@@ -585,9 +592,11 @@ def changes(before, after):
     for line in removed | added:
         word, _, rest = line.partition(" ")
         if word == "owner":
+            # An owner of a session that closes is not stated after it: one
+            # gone before the close is gone after it, and does not change.
             owner = rest.split()[0]
-            old = before.owners.get(owner, ("new", "-", "-", {}))
-            new = after.owners.get(owner, ("new", "-", "-", {}))
+            old = before.owners.get(owner, (unstated(before, owner), "-", "-", {}))
+            new = after.owners.get(owner, (unstated(after, owner), "-", "-", {}))
             if old[:3] != new[:3]:
                 changed.add(("h", owner))
                 changed.add(("f", owner))
@@ -750,9 +759,7 @@ def projected(state, part, witnesses, rename):
               if epoch not in state.epochs]
     for owner in sorted({fact[1] for fact in part if fact[0] == "h"}):
         if owner not in state.owners:
-            # The owners of a closed session are not stated: gone, or never attached.
-            is_ = "new" if state.epochs.get(epoch_of(owner), ("closed",))[0] == "open" else "gone"
-            lines.append(f"owner {rename(owner, 'o')} {is_}")
+            lines.append(f"owner {rename(owner, 'o')} {unstated(state, owner)}")
             continue
         is_, group, slot, entries = state.owners[owner]
         if is_ != "live":
@@ -1404,8 +1411,9 @@ def check(job):
         errors = [line for line in output.split("\n") if line.startswith("Error") or "Exception" in line]
         return None, f"TLC did not complete ({directory}/tlc.log): {' '.join(errors[:3])}"
     reached = {int(window) for window in re.findall(r'<<"reached", (\d+)>>', output)}
-    distinct = re.search(r"([\d,]+) distinct states found", output)
-    return [index + 1 in reached for index in range(len(batch))], int(distinct.group(1).replace(",", ""))
+    # The final count: the progress lines before it state counts so far.
+    distinct = re.findall(r"([\d,]+) distinct states found", output)[-1]
+    return [index + 1 in reached for index in range(len(batch))], int(distinct.replace(",", ""))
 
 
 def input_record(item, groups, owners, positions, keys, rank):

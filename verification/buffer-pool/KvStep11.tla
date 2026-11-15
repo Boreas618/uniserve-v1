@@ -881,7 +881,7 @@ LEMMA ReplicateDue_Answer ==
     <2>1. HeldIn(u, table, oslot, cache, hcache, deferred', copies, tasks)
       BY <1>2 DEF HeldIn
     <2>2. ReclaimedWith(d.units, table, oslot, cache, hcache, deferred', copies, tasks) = {}
-      BY <1>2, <2>1 DEF ReclaimedWith, On, AllRules
+      BY <1>2, <2>1, ReclaimedHeld DEF On, AllRules
     <2>3. Reset(alloc, {}) = alloc /\ Reset(sharedKey, {}) = sharedKey
       BY UnitTypes DEF UnitTyped, Reset
     <2> QED
@@ -1158,7 +1158,7 @@ LEMMA ReplicateEnd_Back ==
     <2>1. HeldIn(u, table, oslot, cache, hcache, deferred, copies, tasks')
       BY <1>2 DEF HeldIn
     <2>2. ReclaimedWith(t.units, table, oslot, cache, hcache, deferred, copies, tasks') = {}
-      BY <1>2, <2>1 DEF ReclaimedWith, On, AllRules
+      BY <1>2, <2>1, ReclaimedHeld DEF On, AllRules
     <2>3. Reset(alloc, {}) = alloc /\ Reset(sharedKey, {}) = sharedKey
       BY <1>0 DEF UnitTyped, Reset
     <2> QED
@@ -1526,7 +1526,7 @@ LEMMA ReplicateEnd_Away ==
     BY <1>1, ReplicateEnd_Facts
   <1>3. /\ \A x : Held(x)' = HeldIn(x, table, oslot, cache, hcache, deferred, copies, tasks \ {t})
         /\ G = {x \in t.units : ~Held(x)'}
-    BY <1>1 DEF Held, ReclaimedWith, On, AllRules
+    BY <1>1, ReclaimedHeld DEF Held, On, AllRules
   <1>4. /\ \A x \in AllUnits : Held(x)' => Held(x)
         /\ \A x \in AllUnits : Held(x) => Held(x)' \/ x \in G
         /\ \A x \in G : Held(x) /\ ~Held(x)'

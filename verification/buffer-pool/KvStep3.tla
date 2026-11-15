@@ -61,7 +61,7 @@ LEMMA Evict_Effect ==
   <1>9. ~HeldIn(u, table, oslot, cache', hcache, deferred, copies, tasks)
     BY <1>0, <1>1, <1>3, <1>4, <1>5, <1>6, <1>7 DEF HeldIn, UnitTyped
   <1>10. ReclaimedWith({u}, table, oslot, cache', hcache, deferred, copies, tasks) = {u}
-    BY <1>9 DEF ReclaimedWith, On, AllRules
+    BY <1>9, ReclaimedHeld DEF On, AllRules
   <1>11. /\ free' = free \cup {u}
          /\ alloc' = [alloc EXCEPT ![u] = NONE]
          /\ sharedKey' = [sharedKey EXCEPT ![u] = NONE]
@@ -312,7 +312,7 @@ LEMMA EvictHost_Effect ==
   <1>8. ~HeldIn(h, table, oslot, cache, hcache', deferred, copies, tasks)
     BY <1>0, <1>1, <1>3, <1>4, <1>5, <1>6 DEF HeldIn, UnitTyped
   <1>9. ReclaimedWith({h}, table, oslot, cache, hcache', deferred, copies, tasks) = {h}
-    BY <1>8 DEF ReclaimedWith, On, AllRules
+    BY <1>8, ReclaimedHeld DEF On, AllRules
   <1>10. /\ free' = free \cup {h}
          /\ alloc' = [alloc EXCEPT ![h] = NONE]
          /\ sharedKey' = [sharedKey EXCEPT ![h] = NONE]

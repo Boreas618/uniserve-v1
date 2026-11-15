@@ -1073,7 +1073,7 @@ LEMMA FinishDue_Private ==
       BY <2>4, <2>5 DEF Held, HeldIn
   <1>6. UNCHANGED <<free, alloc, sharedKey>>
     <2>1. ReclaimedWith({c.read}, table', oslot, cache, hcache, deferred', copies', tasks) = {}
-      BY <1>3 DEF ReclaimedWith, HeldIn, On, AllRules
+      BY <1>3, ReclaimedHeld DEF HeldIn, On, AllRules
     <2> QED
       BY <1>0, <2>1 DEF DropWith, Reset, UnitTyped
   <1>7. TypeInv'
@@ -2115,7 +2115,7 @@ LEMMA FinishDue_Host ==
   <1>2. /\ \A x : Held(x)' = HeldIn(x, table, oslot, cache, hcache', deferred', copies', tasks)
         /\ G = {x \in {c.read} : ~Held(x)'}
         /\ G \subseteq AllUnits
-    BY <1>1 DEF Held, ReclaimedWith, On, AllRules
+    BY <1>1, ReclaimedHeld DEF Held, On, AllRules
   <1>3. /\ \A k \in Keys : hcache'[k] = IF k = c.k THEN w ELSE hcache[k]
         /\ \A v \in AllUnits : alloc'[v] = IF v = w THEN "shared" ELSE IF v \in G THEN NONE ELSE alloc[v]
         /\ \A v \in AllUnits : sharedKey'[v] = IF v = w THEN c.k ELSE IF v \in G THEN NONE ELSE sharedKey[v]
@@ -2448,7 +2448,7 @@ LEMMA FinishDue_HostFill ==
       BY <2>3, <2>4 DEF Held, HeldIn
   <1>5. UNCHANGED <<free, alloc, sharedKey>>
     <2>1. ReclaimedWith({c.read}, table, oslot, cache, hcache, deferred', copies', tasks) = {}
-      BY <1>2 DEF ReclaimedWith, HeldIn, On, AllRules
+      BY <1>2, ReclaimedHeld DEF HeldIn, On, AllRules
     <2> QED
       BY <1>0, <2>1 DEF DropWith, Reset, UnitTyped
   <1>6. \A q \in Owners : Moving(q)' => Moving(q)

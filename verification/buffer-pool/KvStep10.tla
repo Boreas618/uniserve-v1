@@ -44,6 +44,14 @@ LEMMA Lose_Effect ==
          /\ sharedKey' = Reset(sharedKey, Reclaimed(e))
          /\ UNCHANGED <<ogroup, cache, hcache, ncopy, tasks, trial, member, valid, vis, launched,
                         remote, bad>>
+  \* Lose tests each owner by its epoch and state, as GoneOwners(e) states it.
+  <1>0. /\ [o \in Owners |-> IF OwnerEpoch[o] = e /\ ostate[o] = "live"
+                             THEN [p \in Positions |-> Empty] ELSE table[o]] = KeptTable(e)
+        /\ [o \in Owners |-> IF OwnerEpoch[o] = e /\ ostate[o] = "live" THEN NONE ELSE oslot[o]]
+             = KeptSlot(e)
+        /\ [o \in Owners |-> IF OwnerEpoch[o] = e /\ ostate[o] = "live" THEN "gone" ELSE ostate[o]]
+             = [o \in Owners |-> IF o \in GoneOwners(e) THEN "gone" ELSE ostate[o]]
+    BY DEF KeptTable, KeptSlot, GoneOwners
   <1>1. /\ e \in Losable /\ e \notin lost
         /\ lost' = lost \cup {e}
         /\ inflight' = {b \in inflight : ~Mine(e, b.g)}
@@ -60,7 +68,7 @@ LEMMA Lose_Effect ==
                     KeptCopies(e), tasks)
         /\ UNCHANGED <<ogroup, cache, hcache, ncopy, tasks, trial, member, valid, vis, launched,
                        remote, bad>>
-    BY DEF Lose, Mine, GoneOwners, KeptCopies, KeptDeferred, KeptTable, KeptSlot, Dropped
+    BY <1>0 DEF Lose, Mine, GoneOwners, KeptCopies, KeptDeferred, Dropped
   <1> QED
     BY <1>1 DEF DropWith, Reclaimed
 
@@ -181,7 +189,7 @@ LEMMA Lose_Held ==
     <2> QED
       BY <2>1, <2>2 DEF Held, HeldIn
   <1>5. Reclaimed(e) = {u \in Dropped(e) \ {NONE} : ~Held(u)'}
-    BY <1>1 DEF Reclaimed, ReclaimedWith, On, AllRules
+    BY <1>1, ReclaimedHeld DEF Reclaimed, On, AllRules
   <1> QED
     BY <1>2, <1>3, <1>4, <1>5
 

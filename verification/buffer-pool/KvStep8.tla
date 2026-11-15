@@ -595,7 +595,7 @@ LEMMA TransferEnd_Fail ==
     BY <1>1, TransferEnd_Facts DEF AllUnits
   <1>3. /\ \A u : Held(u)' = HeldIn(u, table, oslot, cache, hcache, deferred, copies, tasks \ {t})
         /\ G = {u \in t.units \cup {t.slot} : ~Held(u)'}
-    BY <1>1 DEF Held, ReclaimedWith, On, AllRules
+    BY <1>1, ReclaimedHeld DEF Held, On, AllRules
   <1>4. /\ \A u \in AllUnits : Held(u)' => Held(u)
         /\ \A u \in AllUnits : Held(u) => Held(u)' \/ u \in G
         /\ \A u \in G : Held(u) /\ ~Held(u)'
@@ -859,7 +859,7 @@ LEMMA TransferEnd_Values ==
     BY <1>0, <1>1, <1>2 DEF OwnerTyped
   <1>4. /\ \A u : Held(u)' = HeldIn(u, table, oslot', cache, hcache, deferred, copies, tasks \ {t})
         /\ EndFreed(t) = {u \in t.units : ~Held(u)'}
-    BY <1>1 DEF Held, EndFreed, ReclaimedWith, On, AllRules
+    BY <1>1, ReclaimedHeld DEF Held, EndFreed, On, AllRules
   <1>5. EndFreed(t) \subseteq AllUnits
     BY <1>2, <1>4 DEF AllUnits
   <1>6. \A u \in AllUnits : Held(u)' => Held(u)
