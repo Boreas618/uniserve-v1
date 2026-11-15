@@ -46,8 +46,8 @@ use nn::family::{
 };
 use nn::pipeline::{Block, Extent, Phase, Pipeline, Product, ProductSpec};
 use nn::{
-    Adapter, Checkpoint, ConditionRole, ConditionShape, DType, Decoder, Encoder, MediaFormat,
-    PipelineIndex, Result, Source, Sources, Splicer, VideoRequest, WeightLoader,
+    Adapter, AudioFormat, Checkpoint, ConditionRole, ConditionShape, DType, Decoder, Encoder,
+    MediaFormat, PipelineIndex, Result, Source, Sources, Splicer, VideoRequest, WeightLoader,
 };
 use processing::minimax_h3::{
     CANVAS_RULE, ConditionPacking, DenoiserInfo, MIN_SECONDS, PIPELINE_CLASS, PreparedCondition,
@@ -631,7 +631,10 @@ impl VideoModel for MinimaxH3 {
                 self.config.pixels,
                 self.dtype,
             ),
-            hop: u64::from(AUDIO_HOP),
+            audio: AudioFormat {
+                channels: AUDIO_CHANNELS,
+                hop: u64::from(AUDIO_HOP),
+            },
         })
     }
 
@@ -976,10 +979,15 @@ fn candidates(
     for resolution in served_resolutions(&serving.sizes)? {
         for task in tasks.iter().copied() {
             // `fl2va` anchors both keyframes. A `ref2va` reference's raster follows the
-            // client's media, so its request counts a reference, which makes it a `ref2va`
-            // request, states no condition and rides its rung's condition rows.
-            let keyframes = u32::from(task == VideoTask::FirstLastToVideoAudio);
-            let references = u32::from(task == VideoTask::ReferenceToVideoAudio);
+            // client's media, so its request states a reference's role, which makes it a
+            // `ref2va` request, states no raster and rides its rung's condition rows.
+            let roles = match task {
+                VideoTask::FirstLastToVideoAudio => {
+                    vec![ConditionRole::FirstFrame, ConditionRole::LastFrame]
+                }
+                VideoTask::ReferenceToVideoAudio => vec![ConditionRole::Reference],
+                VideoTask::TextToVideoAudio => Vec::new(),
+            };
             let rungs: Vec<Option<u32>> = if task.conditioned() {
                 ladder.iter().copied().map(Some).collect()
             } else {
@@ -1003,9 +1011,7 @@ fn candidates(
                             height: resolution.canvas.height,
                             frames,
                             fps: FPS,
-                            first_frames: keyframes,
-                            last_frames: keyframes,
-                            references,
+                            roles: roles.clone(),
                             text_tokens: *capacity,
                             conditions: Vec::new(),
                             vision_spans: Vec::new(),
@@ -1735,14 +1741,14 @@ mod tests {
         assert_eq!(candidates.len(), 3);
         assert!(candidates.iter().all(|(request, _)| request.frames == 107));
 
-        // A request states the task it is captured for by the conditions it counts.
+        // A request states the task it is captured for by the roles of its conditions.
         let tasks: Vec<VideoTask> = candidates
             .iter()
             .map(|(request, _)| {
                 VideoTask::of(
-                    request.first_frames,
-                    request.last_frames,
-                    request.references,
+                    request.count(ConditionRole::FirstFrame),
+                    request.count(ConditionRole::LastFrame),
+                    request.count(ConditionRole::Reference),
                 )
             })
             .collect();
@@ -1762,7 +1768,7 @@ mod tests {
             None,
         )
         .unwrap();
-        assert_eq!(reference[0].0.references, 1);
+        assert_eq!(reference[0].0.roles, [ConditionRole::Reference]);
         assert_eq!(reference[0].0.condition_rows, Some(1024));
 
         let resolution = &served_resolutions(&[(1344, 768)]).unwrap()[0];

@@ -84,21 +84,12 @@ fn request_of(case: &Value) -> (VideoRequest, Layout) {
             audio_samples: count(condition, "audio_samples"),
         })
         .collect();
-    let roles = |role: ConditionRole| {
-        conditions
-            .iter()
-            .filter(|condition| condition.role == role)
-            .count() as u32
-    };
-
     let request = VideoRequest {
         width: count(case, "width"),
         height: count(case, "height"),
         frames: count(case, "frames"),
         fps: 24,
-        first_frames: roles(ConditionRole::FirstFrame),
-        last_frames: roles(ConditionRole::LastFrame),
-        references: roles(ConditionRole::Reference),
+        roles: conditions.iter().map(|condition| condition.role).collect(),
         text_tokens: count(case, "text_tokens"),
         vision_spans: case["vision_spans"]
             .as_array()

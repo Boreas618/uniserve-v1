@@ -2,7 +2,8 @@
 //!
 //! The media reader decodes a condition's bytes into RGB frames and stereo PCM, the media's own
 //! forms. What an encoder reads is stated by the model ([`MediaFormat`]): the normalization of its
-//! pixels, the patch rows of its vision tower, the padding of a track. The conversions here execute
+//! pixels, the patch rows of its vision tower, the channels and padding of a track. The
+//! conversions here execute
 //! that statement on the host thread that reads the request's conditions (a thread of the media
 //! host's pool, or the vision runner's image read), sharing a large image's work out over
 //! [`share`]'s scoped threads, as many as the process's host-thread budget
@@ -279,22 +280,34 @@ fn encode(dtype: DType, values: &[f32]) -> Result<Vec<u8>> {
 /// The samples an encoder reads of a track of `samples` samples: the track right-padded with zeros
 /// to a whole number of `format`'s latent hops, the reference's `unpack_samples`.
 pub(crate) fn track_samples(format: &MediaFormat, samples: u64) -> Result<u64> {
-    if samples == 0 || format.hop == 0 {
+    let hop = format.audio.hop;
+    if samples == 0 || hop == 0 {
         return Err(mismatched(
             "an audio track of no samples encodes to no latent frames".to_owned(),
         ));
     }
-    Ok(samples.div_ceil(format.hop) * format.hop)
+    Ok(samples.div_ceil(hop) * hop)
 }
 
-/// Writes `[samples, 2]` interleaved stereo into `out` as `[2, 1, padded]` channel rows, each
-/// channel's tail zero: `2 * track_samples(format, samples)` elements.
+/// The channels of the PCM the media reader decodes: interleaved stereo.
+const READ_CHANNELS: u32 = 2;
+
+/// Writes `[samples, 2]` interleaved stereo, as the media reader decodes it, into `out` as the
+/// encoder's `[channels, 1, padded]` channel rows, each channel's tail zero:
+/// `channels * track_samples(format, samples)` elements. An encoder that reads another number
+/// of channels than the reader decodes is refused, since no channel is invented or mixed.
 pub(crate) fn track(
     format: &MediaFormat,
     pcm: &[f32],
     samples: u64,
     out: &mut [f32],
 ) -> Result<()> {
+    if format.audio.channels != READ_CHANNELS {
+        return Err(mismatched(format!(
+            "an audio encoder reads {} channels and the media reader decodes {READ_CHANNELS}",
+            format.audio.channels
+        )));
+    }
     let padded = track_samples(format, samples)? as usize;
     let samples = samples as usize;
     if pcm.len() != 2 * samples || out.len() != 2 * padded {
@@ -316,6 +329,7 @@ pub(crate) fn track(
 mod tests {
     use super::*;
     use half::bf16;
+    use nn::capability::AudioFormat;
 
     /// The threads a test's conversion shares its work over: more than one, so the shares meet.
     const THREADS: NonZeroUsize = NonZeroUsize::new(2).unwrap();
@@ -337,7 +351,10 @@ mod tests {
                 norm: half,
                 dtype: DType::BF16,
             },
-            hop: 800,
+            audio: AudioFormat {
+                channels: 2,
+                hop: 800,
+            },
         }
     }
 

@@ -668,9 +668,9 @@ pub struct EncoderLayout {
 /// A video request's numerical layout input: what the denoiser must lay out.
 ///
 /// Every field is a request fact execution already holds (it decoded the media, encoded the
-/// prompt and knows the resolution), and none is derivable from the others: the packed layout
-/// needs the resolution, the roles' counts, the prompt's token count and each condition's
-/// raster. A deployment also states one of these per layout it serves, before any request of the
+/// prompt and knows the resolution): the packed layout needs the resolution, the roles of its
+/// conditions, the prompt's token count and each condition's raster. A deployment also states
+/// one of these per layout it serves, before any request of the
 /// layout arrives ([`crate::family::VideoModel::candidates`]): a capture happens before the
 /// first request of a shape, and the bucket is derived from the request ([`Denoiser::layout`]),
 /// never stated beside it.
@@ -684,21 +684,18 @@ pub struct VideoRequest {
     pub frames: u32,
     /// Frames per second of the output.
     pub fps: u32,
-    /// Frame-one anchors: each one pins the first generated frame.
-    pub first_frames: u32,
-    /// Last-frame anchors: each one pins the last generated frame.
-    pub last_frames: u32,
-    /// Reference images or clips: they condition the generation as a whole.
-    ///
-    /// The three roles are counted apart because they enter the layout differently: an anchor
-    /// is one encoded frame at a fixed position, a reference is an encoded clip.
-    pub references: u32,
+    /// The role of each condition the request states, in request order: what the request
+    /// conditions on, which decides its layout and its schedule. A request a deployment
+    /// captures for states its roles and none of its conditions' rasters; a request that states
+    /// [`Self::conditions`] states their roles here in the same order.
+    pub roles: Vec<ConditionRole>,
     /// Prompt tokens the request presents, vision tokens included.
     ///
     /// The packed sequence's rotary clock starts at the prompt's length, so a layout cannot
     /// place a row without it.
     pub text_tokens: u32,
-    /// The encoded condition media, in request order: anchors, then references.
+    /// The encoded condition media, in request order, each of the role [`Self::roles`] states
+    /// at its place.
     pub conditions: Vec<ConditionShape>,
     /// Per-image prompt spans, in request order: the prompt rows a reference's own rows replace.
     ///
@@ -713,6 +710,14 @@ pub struct VideoRequest {
     /// its start. The caller chooses it, because a request a deployment captures for states no
     /// conditions to count.
     pub condition_rows: Option<u32>,
+}
+
+impl VideoRequest {
+    /// The conditions of `role` the request states.
+    pub fn count(&self, role: ConditionRole) -> u32 {
+        let counted = self.roles.iter().filter(|stated| **stated == role).count();
+        u32::try_from(counted).unwrap_or(u32::MAX)
+    }
 }
 
 /// One condition's raster, as a layout needs it.
@@ -808,10 +813,10 @@ pub struct ConditionPiece {
 
 /// How a model's encoders read the media a request's conditions decode to.
 ///
-/// The media reader decodes bytes into RGB frames and stereo PCM, which are the media's own
-/// forms. What an encoder reads is the model's arithmetic: the normalization of its pixels, its
-/// vision tower's patch rows, the padding of a track. The model declares that layout here and
-/// execution performs the conversions on its host threads, so no model holds a thread or a
+/// The media reader decodes bytes into RGB frames and PCM, which are the media's own forms.
+/// What an encoder reads is the model's arithmetic: the normalization of its pixels, its vision
+/// tower's patch rows, the channels and padding of a track. The model declares that layout here
+/// and execution performs the conversions on its host threads, so no model holds a thread or a
 /// media byte format.
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub struct MediaFormat {
@@ -820,8 +825,18 @@ pub struct MediaFormat {
     pub pixels: PixelNorm,
     /// The patch rows a vision block presents to the text encoder.
     pub patches: PatchFormat,
-    /// Samples of one audio latent frame. A track [`MediaInput::audio`] holds is right-padded
-    /// with zeros to a whole number of them, as `[2, 1, padded]` channel rows.
+    /// How the audio encoder reads a condition's track.
+    pub audio: AudioFormat,
+}
+
+/// How an audio encoder reads a track: [`MediaInput::audio`] holds it as
+/// `[channels, 1, padded]` FP32 channel rows, each right-padded with zeros to a whole number of
+/// latent hops.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct AudioFormat {
+    /// The channels the encoder reads.
+    pub channels: u32,
+    /// Samples of one audio latent frame.
     pub hop: u64,
 }
 
@@ -881,8 +896,7 @@ pub struct PixelNorm {
 /// buffers.
 ///
 /// The rows of every tensor follow the order the layout reserves: the encoded text first, then
-/// the request's conditions in the order [`VideoRequest`] counts them (first-frame anchors,
-/// last-frame anchors, references).
+/// the request's conditions in the order the model packs them ([`Denoiser::condition_pieces`]).
 ///
 /// The one request-shaped thing here is [`Conditioning::media`], the raw media a conditioner
 /// encodes. It has to be: [`Denoiser::prepare_conditioning`] runs once per request, before any
@@ -1027,9 +1041,8 @@ pub trait Denoiser {
     /// value as a schedule that exists and has no steps, which is the opposite fact.
     fn schedule(&self, request: &VideoRequest) -> Result<Vec<Step>> {
         Err(Error::Unsupported(format!(
-            "a denoiser that states no schedule for a request of {} anchor(s) and {} reference(s)",
-            request.first_frames + request.last_frames,
-            request.references
+            "a denoiser that states no schedule for a request conditioned on {:?}",
+            request.roles
         )))
     }
 

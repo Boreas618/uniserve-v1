@@ -1562,7 +1562,10 @@ mod tests {
                     norm: half,
                     dtype: DType::BF16,
                 },
-                hop: 800,
+                audio: nn::capability::AudioFormat {
+                    channels: 2,
+                    hop: 800,
+                },
             },
             threads: NonZeroUsize::MIN,
         }

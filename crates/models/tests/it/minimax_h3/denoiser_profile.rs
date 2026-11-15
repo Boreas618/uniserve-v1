@@ -187,9 +187,8 @@ fn profile(release: Release, network: Stage, sequence: DenoiserSplit) {
     let mut large = large.clone();
     if let Some(keyframes) = openings.last() {
         large.conditions.clone_from(keyframes);
-        large.first_frames = 1;
-        large.last_frames = u32::from(keyframes.len() > 1);
-    } else if large.references > 0 {
+        large.roles = keyframes.iter().map(|keyframe| keyframe.role).collect();
+    } else if large.count(ConditionRole::Reference) > 0 {
         let reference = |frames: u32, side: u32, audio_samples: u32| ConditionShape {
             role: ConditionRole::Reference,
             frames,
@@ -198,7 +197,7 @@ fn profile(release: Release, network: Stage, sequence: DenoiserSplit) {
             audio_samples,
         };
         large.conditions = vec![reference(1, 512, 0), reference(30, 384, 40_000)];
-        large.references = 2;
+        large.roles = vec![ConditionRole::Reference; 2];
     }
     let layout = denoiser.layout(&large).unwrap();
     assert_eq!(layout.video.frames, 107);

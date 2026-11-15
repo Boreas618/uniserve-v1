@@ -78,7 +78,7 @@ use crate::batch::{
 use ::storage::manifest::{Encoding, Field, Logical, Segment, Span, StorageLayout};
 use ::storage::runtime;
 use nn::pipeline::Product;
-use nn::{ConditionPiece, ConditionRole, ConditionShape, Conditioning, Denoiser};
+use nn::{ConditionPiece, ConditionShape, Conditioning, Denoiser};
 use nn::{LatentShape, MediaInput, Step, VideoRequest};
 use platform::{Event, EventFlags, PitchedBatch, SourceOrder, Stream};
 use proto::video::Layout;
@@ -1114,22 +1114,16 @@ fn stated(warm: &VideoRequest, conditioning: &[u8]) -> Result<VideoRequest> {
     ))
 }
 
-/// `warm` presenting `conditions`, a prompt of `text_tokens` tokens and `vision_spans`: the role
-/// counts follow the conditions, and the rest is the candidate's.
+/// `warm` presenting `conditions`, a prompt of `text_tokens` tokens and `vision_spans`: the
+/// roles follow the conditions, and the rest is the candidate's.
 fn opened(
     warm: &VideoRequest,
     conditions: Vec<ConditionShape>,
     text_tokens: u32,
     vision_spans: Vec<(u32, u32)>,
 ) -> VideoRequest {
-    let count = |role: ConditionRole| {
-        let counted = conditions.iter().filter(|held| held.role == role).count();
-        u32::try_from(counted).unwrap_or(u32::MAX)
-    };
     VideoRequest {
-        first_frames: count(ConditionRole::FirstFrame),
-        last_frames: count(ConditionRole::LastFrame),
-        references: count(ConditionRole::Reference),
+        roles: conditions.iter().map(|condition| condition.role).collect(),
         text_tokens,
         conditions,
         vision_spans,

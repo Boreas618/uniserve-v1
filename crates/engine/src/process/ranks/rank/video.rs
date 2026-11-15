@@ -1178,12 +1178,13 @@ impl ModelRunner {
             let (condition_pixels, condition_samples, vision_pixels) = match (&format, conditioned)
             {
                 (Some(format), true) => {
-                    let hop = format.hop.max(1);
+                    let audio = format.audio;
+                    let hop = audio.hop.max(1);
                     let samples = u64::from(bounds.samples).div_ceil(hop) * hop;
                     let patch = u64::from(format.patches.width()) * element(format.patches.dtype)?;
                     (
                         u64::from(bounds.pixels) * 3 * 4,
-                        samples * 2 * 4,
+                        samples * u64::from(audio.channels) * 4,
                         u64::from(text_rows) * u64::from(bounds.patches_per_token) * patch,
                     )
                 }

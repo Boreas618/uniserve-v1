@@ -206,9 +206,7 @@ fn request(conditions: Vec<ConditionShape>, condition_rows: Option<u32>) -> Vide
         height: 64,
         frames: 22,
         fps: 24,
-        first_frames: conditions.len() as u32,
-        last_frames: 0,
-        references: 0,
+        roles: conditions.iter().map(|condition| condition.role).collect(),
         text_tokens: 5,
         conditions,
         vision_spans: vec![(1, 2)],
@@ -384,7 +382,7 @@ fn a_request_of_a_task_the_network_does_not_serve_is_refused_by_name() {
     .unwrap();
 
     let mut reference = request(Vec::new(), None);
-    reference.references = 1;
+    reference.roles = vec![ConditionRole::Reference];
     let error = denoiser.schedule(&reference).unwrap_err().to_string();
     assert!(error.contains("ReferenceToVideoAudio"), "{error}");
 
@@ -420,9 +418,7 @@ fn an_eight_way_ulysses_rank_steps_the_largest_profiled_layout() {
         height: 768,
         frames: 362,
         fps: 24,
-        first_frames: 1,
-        last_frames: 1,
-        references: 0,
+        roles: vec![ConditionRole::FirstFrame, ConditionRole::LastFrame],
         text_tokens: 1024,
         conditions: Vec::new(),
         vision_spans: Vec::new(),

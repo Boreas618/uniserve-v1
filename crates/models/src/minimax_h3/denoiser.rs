@@ -44,8 +44,8 @@ use nn::diffusion::{add_noise, euler_step, scale_noise};
 use nn::family::{DenoiserSplit, GATHER_AXIS, ULYSSES_AXIS};
 use nn::modules::{TimestepTable, TimestepTableConfig};
 use nn::{
-    ConditionPiece, Conditioning, DType, Device, MediaInput, Result, Shape, Step, Tensor,
-    VarBuilder, VideoRequest, functional,
+    ConditionPiece, ConditionRole, Conditioning, DType, Device, MediaInput, Result, Shape, Step,
+    Tensor, VarBuilder, VideoRequest, functional,
 };
 use proto::video::Layout;
 
@@ -72,9 +72,9 @@ const LEAST_CONDITION_RUNG: u32 = 1024;
 /// The task a request runs, from the conditions it states.
 fn task_of(request: &VideoRequest) -> VideoTask {
     VideoTask::of(
-        request.first_frames,
-        request.last_frames,
-        request.references,
+        request.count(ConditionRole::FirstFrame),
+        request.count(ConditionRole::LastFrame),
+        request.count(ConditionRole::Reference),
     )
 }
 
@@ -411,9 +411,7 @@ fn max_rows(config: &DenoiserConfig, capacity: (u32, u32), split: DenoiserSplit)
                 height: resolution.canvas.height,
                 frames,
                 fps: FPS,
-                first_frames: 0,
-                last_frames: 0,
-                references: 0,
+                roles: Vec::new(),
                 text_tokens: 1,
                 conditions: Vec::new(),
                 vision_spans: Vec::new(),
