@@ -25,6 +25,8 @@ rmp-serde.workspace = true
 serde_bytes.workspace = true
 rustix = { workspace = true, features = ["event", "fs", "mm", "net", "pipe", "process", "rand", "system", "time"] }
 serde.workspace = true
+# `storage-server list --json`.
+serde_json.workspace = true
 service.workspace = true
 storage.workspace = true
 thiserror.workspace = true
@@ -33,7 +35,6 @@ toml.workspace = true
 tracing.workspace = true
 
 [dev-dependencies]
-serde_json.workspace = true
 # The integration tests replay the traces their servers record (`buffer_pool::replay`).
 storage-server = { path = ".", features = ["verification"] }
 tempfile.workspace = true

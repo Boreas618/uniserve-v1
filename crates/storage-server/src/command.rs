@@ -98,6 +98,10 @@ pub enum Command {
     List {
         #[arg(long)]
         socket: Option<PathBuf>,
+        /// Print the listing as one JSON document (`storage::protocol::Listing`) instead of
+        /// its text rendering.
+        #[arg(long)]
+        json: bool,
     },
     /// Release the storage of a deployment that is no longer served; refused
     /// while its head is connected.
@@ -222,8 +226,17 @@ pub fn run(args: Args, levels: &service::logging::Levels) -> anyhow::Result<()> 
                 .and_then(|operator| operator.stop(STOP_TIMEOUT))
                 .with_context(|| format!("stopping the Storage Server at {}", socket.display()))
         }
-        Command::List { socket } => {
-            crate::list(&socket_or_default(socket)?, &mut std::io::stdout().lock())
+        Command::List { socket, json } => {
+            let rendering = if json {
+                crate::Rendering::Json
+            } else {
+                crate::Rendering::Text
+            };
+            crate::list(
+                &socket_or_default(socket)?,
+                rendering,
+                &mut std::io::stdout().lock(),
+            )
         }
         Command::Retire { socket, deployment } => {
             crate::retire(&socket_or_default(socket)?, &deployment).map_err(anyhow::Error::from)

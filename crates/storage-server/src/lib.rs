@@ -69,7 +69,7 @@ pub use child::{Children, Program};
 pub use error::Error;
 use kv_storage::{KvStorage, Task};
 pub use restart::Resumed;
-pub use serve::{ServeOptions, Start, list, retire, serve};
+pub use serve::{Rendering, ServeOptions, Start, list, retire, serve};
 use service::Connection;
 use shoot::ShootDowns;
 

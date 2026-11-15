@@ -95,6 +95,15 @@ pub fn serve(options: ServeOptions) -> anyhow::Result<()> {
     served
 }
 
+/// How [`list`] prints a running server's listing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Rendering {
+    /// One line per tensor, deployment, child, quota and buffer pool fact, for an operator.
+    Text,
+    /// The listing as one JSON document, for tools.
+    Json,
+}
+
 /// Write to `out` what the server on `socket` holds, a line each: its
 /// tensors, its deployments, its connector and Transfer Server, the quotas
 /// of its GPUs, and the buffer pool of each deployment (`list_pool`).
@@ -103,9 +112,14 @@ pub fn serve(options: ServeOptions) -> anyhow::Result<()> {
 ///
 /// Fails when the server cannot be reached or refuses the listing, or `out`
 /// cannot be written.
-pub fn list(socket: &Path, out: &mut impl Write) -> anyhow::Result<()> {
+pub fn list(socket: &Path, rendering: Rendering, out: &mut impl Write) -> anyhow::Result<()> {
     let mut client = Client::connect(socket, Role::Operator)?;
     let listing = client.list()?;
+    if rendering == Rendering::Json {
+        serde_json::to_writer_pretty(&mut *out, &listing)?;
+        writeln!(out)?;
+        return Ok(());
+    }
     for tensor in &listing.tensors {
         let scopes: Vec<String> = tensor.scopes.iter().map(ToString::to_string).collect();
         writeln!(

@@ -14,7 +14,7 @@ use std::path::Path;
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
-use ::storage::protocol::{BlockState, ErrorKind, HostCopy, RegionPart, UnitRun};
+use ::storage::protocol::{BlockState, ErrorKind, HostCopy, Listing, RegionPart, UnitRun, Waiting};
 use ::storage::runtime::{
     Cause, Class, Completion, Group, GroupId, Open, Opened, OwnerId, Region, Registers, Request,
     RequestId, Tier, VERSION,
@@ -405,30 +405,51 @@ fn the_operator_s_list_prints_the_buffer_pool_s_blocks_groups_and_copies() {
         "{answered:?} answered {answer:?}"
     );
 
+    // The operator's command prints the listing as JSON for tools.
     let mut printed = Vec::new();
-    storage_server::list(&server.socket, &mut printed).unwrap();
-    let printed = String::from_utf8(printed).unwrap();
-    let mut pool: Vec<&str> = printed
-        .lines()
-        .filter(|line| line.starts_with("buffer pool of model: "))
+    storage_server::list(
+        &server.socket,
+        storage_server::Rendering::Json,
+        &mut printed,
+    )
+    .unwrap();
+    let listing: Listing = serde_json::from_slice(&printed).unwrap();
+    let [pool] = &listing.buffer_pools[..] else {
+        panic!("one buffer pool is listed: {listing:?}");
+    };
+    assert_eq!(pool.deployment, "model");
+    let blocks = |region: &str, class: Option<u8>, state: BlockState| {
+        let found = pool
+            .blocks
+            .iter()
+            .find(|count| count.region == region && count.class == class && count.state == state);
+        found.map(|count| count.blocks)
+    };
+    assert_eq!(blocks("units", Some(0), BlockState::Shared), Some(1));
+    assert_eq!(blocks("units", Some(0), BlockState::Private), Some(1));
+    assert_eq!(blocks("units", Some(0), BlockState::Retired), Some(1));
+    assert_eq!(blocks("host", Some(0), BlockState::Private), Some(1));
+    assert_eq!(blocks("prefill rows 0", None, BlockState::Private), Some(1));
+    assert_eq!(pool.blocks.len(), 5, "{pool:?}");
+
+    let groups: Vec<(u8, u64)> = pool
+        .groups
+        .iter()
+        .map(|group| (group.group, group.completed))
         .collect();
-    pool.sort_unstable();
-    let copies = format!(
-        "buffer pool of model: 1 copies in flight of request {} of scheduler 0 of epoch 0",
-        store.0
+    assert_eq!(groups, [(0, 0), (1, 0)]);
+    let waiting: Vec<&[(u64, Waiting)]> =
+        pool.groups.iter().map(|group| &group.waiting[..]).collect();
+    assert_eq!(
+        waiting,
+        [&[(9, Waiting::Commit), (9, Waiting::Release)][..], &[][..]]
     );
-    let mut expected = vec![
-        "buffer pool of model: 1 shared blocks of class 0 in region units",
-        "buffer pool of model: 1 private blocks of class 0 in region units",
-        "buffer pool of model: 1 retired blocks of class 0 in region units",
-        "buffer pool of model: 1 private blocks of class 0 in region host",
-        "buffer pool of model: 1 private slot rows in region prefill rows 0",
-        "buffer pool of model: group 0 of epoch 0 completed 0, waiting commit at 9, release at 9",
-        "buffer pool of model: group 1 of epoch 0 completed 0, nothing waits",
-        &copies,
-    ];
-    expected.sort_unstable();
-    assert_eq!(pool, expected, "{printed}");
+    let copies: Vec<(Option<u64>, u16, u64, u32)> = pool
+        .copies
+        .iter()
+        .map(|copy| (copy.epoch, copy.scheduler, copy.request, copy.copies))
+        .collect();
+    assert_eq!(copies, [(Some(0), 0, store.0, 1)]);
 }
 
 #[test]
