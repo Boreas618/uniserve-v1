@@ -54,6 +54,7 @@ def graphs(tmp_path_factory: pytest.TempPathFactory) -> Iterator[str]:
     args = [
         str(require_uniserve_binary()),
         "serve",
+        "--model-dir",
         qwen3_checkpoint(),
         "--served-model-name",
         "qwen3-selection",

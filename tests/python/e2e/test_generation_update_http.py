@@ -192,6 +192,7 @@ def server(
     command = [
         str(require_uniserve_binary()),
         "serve",
+        "--model-dir",
         str(model),
         "--served-model-name",
         "qwen3-moe",

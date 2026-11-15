@@ -326,6 +326,7 @@ def test_block_bindings_release_cancelled_requests(
     command = [
         str(require_uniserve_binary()),
         "serve",
+        "--model-dir",
         model_value,
         "--served-model-name",
         "MiniMax-H3",
@@ -499,6 +500,7 @@ def test_replicas_on_two_hosts_serve_complete_media(tmp_path: Path) -> None:
     command = [
         str(require_uniserve_binary()),
         "serve",
+        "--model-dir",
         model,
         "--served-model-name",
         "FastH3",
@@ -590,6 +592,7 @@ def test_video_jobs_retain_content_and_cancel_active_work(
     command = [
         str(require_uniserve_binary()),
         "serve",
+        "--model-dir",
         model,
         "--config",
         str(deployment),

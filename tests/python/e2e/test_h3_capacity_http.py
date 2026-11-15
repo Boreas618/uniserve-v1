@@ -121,6 +121,7 @@ def test_every_admitted_duration_and_prompt_length_replays(
     command = [
         str(require_uniserve_binary()),
         "serve",
+        "--model-dir",
         model,
         "--config",
         str(deployment),

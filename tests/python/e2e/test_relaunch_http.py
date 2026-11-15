@@ -148,6 +148,7 @@ def _stream_through_a_kill(
     command = [
         str(require_uniserve_binary()),
         "serve",
+        "--model-dir",
         qwen3_checkpoint(),
         "--served-model-name",
         SERVED_MODEL,

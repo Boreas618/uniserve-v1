@@ -98,6 +98,7 @@ def _command(model, deployment, inputs, options) -> list[str]:
     return [
         str(require_uniserve_binary()),
         "serve",
+        "--model-dir",
         model,
         "--config",
         str(ROOT / "configs" / "minimax_h3" / deployment),

@@ -511,7 +511,7 @@ def test_only_the_checkpoint_and_kv_cache_dtype_differ_between_cells() -> None:
                 assert values.pop() == "--set"
                 continue
             values.append(value)
-        values[values.index("serve") + 1] = "<checkpoint>"
+        values[values.index("--model-dir") + 1] = "<checkpoint>"
         values[values.index("--port") + 1] = "<port>"
         return [
             "kv_cache_config.dtype=<dtype>"
@@ -526,7 +526,7 @@ def test_only_the_checkpoint_and_kv_cache_dtype_differ_between_cells() -> None:
 
     def model(command: list[str]) -> str:
         """Return the checkpoint path a server command serves."""
-        return command[command.index("serve") + 1]
+        return command[command.index("--model-dir") + 1]
 
     assert model(commands[0]) == "/workspace/models/Qwen3-30B-A3B"
     assert model(commands[2]) == "/workspace/models/Qwen3-30B-A3B"

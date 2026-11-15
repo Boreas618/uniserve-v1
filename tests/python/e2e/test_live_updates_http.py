@@ -548,6 +548,7 @@ def _serving(
     command = [
         str(require_uniserve_binary()),
         "serve",
+        "--model-dir",
         checkpoint or qwen3_checkpoint(),
         "--served-model-name",
         name,

@@ -132,6 +132,7 @@ def test_a_group_over_two_hosts_promotes_its_standby_when_a_hosts_rank_is_lost(
     command = [
         str(require_uniserve_binary()),
         "serve",
+        "--model-dir",
         checkpoint,
         "--served-model-name",
         SERVED_MODEL,

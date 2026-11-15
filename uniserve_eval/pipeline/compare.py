@@ -334,9 +334,10 @@ def _require_comparable(reference: Bundle, candidate: Bundle) -> None:
 def _model_argument(bundle: Bundle) -> str | None:
     """Return the checkpoint path a bundle's daemon command served.
 
-    The daemon command is ``uniserve serve [MODEL] [OPTIONS]``, so the model
-    is the first positional value after the ``serve`` subcommand. A command
-    recorded without one yields ``None``.
+    The daemon command is ``uniserve serve MODEL [OPTIONS]`` or ``uniserve
+    serve --model-dir DIR [OPTIONS]``, so the checkpoint is the first value
+    after the ``serve`` subcommand, or the directory ``--model-dir`` names
+    there. A command recorded without one yields ``None``.
     """
     command = bundle.launch.get("command")
     if not isinstance(command, list) or not command:
@@ -346,10 +347,11 @@ def _model_argument(bundle: Bundle) -> str | None:
         index = values.index("serve")
     except ValueError:
         return None
-    for value in values[index + 1 :]:
-        if value.startswith("-"):
-            return None
-        return value
+    rest = values[index + 1 :]
+    if rest[:1] == ["--model-dir"]:
+        return rest[1] if len(rest) > 1 else None
+    if rest and not rest[0].startswith("-"):
+        return rest[0]
     return None
 
 

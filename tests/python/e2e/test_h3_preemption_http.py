@@ -156,6 +156,7 @@ def _serve(tmp_path: Path, deployment=_deployment) -> Iterator[str]:
     command = [
         str(require_uniserve_binary()),
         "serve",
+        "--model-dir",
         _model(),
         "--served-model-name",
         NAME,

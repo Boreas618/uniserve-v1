@@ -215,6 +215,7 @@ def _serve_command(
     return [
         str(require_uniserve_binary()),
         "serve",
+        "--model-dir",
         checkpoint,
         "--served-model-name",
         SERVED_MODEL,

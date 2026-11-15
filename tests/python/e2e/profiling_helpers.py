@@ -47,6 +47,7 @@ def serve(
     command = [
         str(require_uniserve_binary()),
         "serve",
+        "--model-dir",
         qwen3_checkpoint(),
         "--served-model-name",
         NAME,

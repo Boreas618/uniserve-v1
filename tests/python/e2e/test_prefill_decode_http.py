@@ -125,6 +125,7 @@ def _command(*options: str) -> list[str]:
     command = [
         str(require_uniserve_binary()),
         "serve",
+        "--model-dir",
         _checkpoint(),
         "--served-model-name",
         SERVED_MODEL,

@@ -58,6 +58,7 @@ def test_base_text_to_video_at_every_768p_size(tmp_path: Path) -> None:
     command = [
         str(require_uniserve_binary()),
         "serve",
+        "--model-dir",
         model,
         "--config",
         str(deployment),
@@ -177,6 +178,7 @@ def test_a_fasth3_adapter_over_the_base_release_serves_its_student(
     command = [
         str(require_uniserve_binary()),
         "serve",
+        "--model-dir",
         model,
         "--lora-path",
         adapter,

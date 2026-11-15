@@ -125,6 +125,7 @@ def test_requests_are_served_by_the_replicas_the_policy_routes_them_to(
     command = [
         str(require_uniserve_binary()),
         "serve",
+        "--model-dir",
         checkpoint,
         "--served-model-name",
         SERVED_MODEL,
