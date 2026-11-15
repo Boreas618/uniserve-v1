@@ -18,6 +18,7 @@
 //! would state of a region under a load the case does not build: no unit available, or units
 //! retiring.
 
+use std::num::NonZeroU32;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -743,7 +744,7 @@ fn hybrid_speculating_requests_keep_the_checkpoints_their_decodes_reach() {
         ])
         .speculative(1)
         .verifying()
-        .state_interval(16)
+        .state_interval(NonZeroU32::new(16).unwrap())
         .batch(128, 1024)
         .chunk(1024)
         .kv_units(256)
@@ -769,7 +770,7 @@ fn hybrid_requests_short_of_checkpoints_wait_or_preempt_and_all_end_at_their_len
             (CacheGroupKind::Full, BLOCK),
             (CacheGroupKind::State, BLOCK),
         ])
-        .state_interval(8)
+        .state_interval(NonZeroU32::new(8).unwrap())
         .kv_units(1024)
         .state_units(10)
         .slots(16)

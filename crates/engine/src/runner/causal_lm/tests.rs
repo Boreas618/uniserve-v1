@@ -45,7 +45,7 @@ use crate::runner::buckets::{Bucket, Buckets};
 use crate::runner::graphs::Graphs;
 use crate::worker::Error;
 use crate::worker::completion::Outcome;
-use crate::worker::{COPY_BUDGET, Sequences, Worker};
+use crate::worker::{Sequences, Worker};
 
 const VOCABULARY: usize = 64;
 const HIDDEN: usize = 16;
@@ -1798,7 +1798,7 @@ fn a_shadow_batch_whose_rows_do_not_fit_the_scratch_set_is_reported_uncompared()
         held(&[1, 2, 3]),
         Arc::clone(&sequences),
         0,
-        COPY_BUDGET,
+        proto::config::DEFAULT_COPY_BUDGET,
     )
     .unwrap();
     let ended = |submission: crate::worker::Result<crate::worker::completion::Submission>| {
@@ -2079,6 +2079,10 @@ fn the_runner_serves_the_phases_of_its_config() {
 /// The most rows a member of the tested union sends in a step: the largest bucket's tokens.
 const UNION_ROWS: u32 = 80;
 
+/// The rows per rank of the tested union's middle capture class, the deployment's default, which
+/// the union's capacity is too small to capture.
+const BESIDE: u32 = proto::config::DEFAULT_BESIDE_ROWS.get();
+
 /// The host groups of a union of `size` members of this process, in member order.
 fn host_groups(size: usize) -> Vec<Arc<HostGroup>> {
     HostGroup::local(size)
@@ -2103,7 +2107,7 @@ fn member(group: &Arc<HostGroup>, rank: u32, join: JoinHook) -> Member {
         attention_ranks: 0,
     };
 
-    Member::new(Arc::clone(group), shape, Mode::Dispatch, join).unwrap()
+    Member::new(Arc::clone(group), shape, Mode::Dispatch, join, BESIDE).unwrap()
 }
 
 /// A join hook that hands each join batch to the worker reading `inbox`.
@@ -2150,7 +2154,7 @@ fn union_runner(member: Member) -> CausalLmRunner {
 #[test]
 fn a_union_member_captures_each_bucket_at_the_capacities_its_steps_meet() {
     let stated = config().buckets;
-    let classes = experts::classes(&stated, UNION_ROWS);
+    let classes = experts::classes(&stated, UNION_ROWS, BESIDE);
 
     // Every bucket and the join at the whole capacity; the buckets a step of a quarter of it
     // holds, at the class of their own tokens or of the largest decode.
@@ -2298,6 +2302,7 @@ fn a_union_is_joined_by_a_runner_whose_model_routes_experts() {
         shape,
         Mode::Dispatch,
         Arc::clone(&hook),
+        BESIDE,
     );
     assert!(runner.join_union(alone.unwrap()).is_err());
 
@@ -2315,7 +2320,7 @@ fn a_union_is_joined_by_a_runner_whose_model_routes_experts() {
         ranks: 2,
         ..shape
     };
-    assert!(Member::new(Arc::clone(&groups[0]), other, Mode::Dispatch, hook).is_err());
+    assert!(Member::new(Arc::clone(&groups[0]), other, Mode::Dispatch, hook, BESIDE).is_err());
 }
 
 // ---- The runner over the rank's cache and state -------------------------------------------------
@@ -2580,7 +2585,7 @@ fn a_batch_with_no_rows_writes_the_tables_and_runs_the_copies_without_a_forward(
         tables,
         Arc::clone(&sequences),
         0,
-        COPY_BUDGET,
+        proto::config::DEFAULT_COPY_BUDGET,
     )
     .unwrap();
     let map = |id: u64, request: Request, completion: Completion| {

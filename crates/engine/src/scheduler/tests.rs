@@ -288,6 +288,7 @@ impl Bench {
             terminal: None,
             event_credit: 64,
             event_window: 64,
+            draft_limit: 0,
             last_progress: now,
             dirty: false,
         };

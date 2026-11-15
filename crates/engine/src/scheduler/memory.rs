@@ -40,7 +40,7 @@
 //! `num_cached_tokens` until the hit is final.
 
 use std::ops::Range;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use crate::batch::cache::CacheGroupKind;
 use crate::batch::product::{CONDITIONING, VISION_FEATURES};
@@ -58,17 +58,6 @@ use super::{Blocks, Request, RequestStatus, Scheduler, monotonic_nanos, span};
 
 /// The name of an image model's latent encoder output (SD §7.4).
 const LATENT_FEATURES: &str = "latent_features";
-
-/// The pages of the largest block size between the aligned boundaries before which a sliding
-/// window is stored to the host, when the deployment states none (SD §4.4).
-const BOUNDARY_INTERVAL: u32 = 64;
-
-/// How long a prefetch of `tokens` tokens may take, and how long the scheduler lets a copy the
-/// engine runs for that many tokens go before it gives the copy up (SD §4.4, `S/kv_cache/
-/// offload.rs:247-248`): one second, and a quarter second per 1024 tokens.
-pub(super) fn prefetch_wait(tokens: u32) -> Duration {
-    Duration::from_secs(1) + Duration::from_millis(250 * u64::from(tokens) / 1024)
-}
 
 /// The checkpoints a recurrent-state table holds: its base at `first`, and the one at `end - 1`
 /// when that is another.
@@ -177,9 +166,7 @@ fn before_boundary(
     window: u32,
 ) -> bool {
     let step = step(shapes);
-    let interval = kv
-        .boundary_interval
-        .map_or(BOUNDARY_INTERVAL, |interval| interval.get());
+    let interval = kv.boundary_interval.get();
     let aligned = interval.saturating_mul(step).max(1);
     let after = (at + 1).saturating_mul(block);
     let reissued = prompt.map(|prompt| prompt.saturating_sub(1) / step * step);
@@ -286,7 +273,7 @@ impl Scheduler {
         let group = self.kv_group(request).and_then(|id| self.group(id))?;
         let shapes = &group.capacity.cache_groups;
         let class = shapes.iter().position(|(kind, _)| kind.is_state())?;
-        Some((class, shapes[class].1, state_interval(&group.capacity)))
+        Some((class, shapes[class].1, state_interval(&group.capacity)?))
     }
 
     /// The class of encoder outputs: the one after the cache groups, when the session states one
@@ -1255,7 +1242,8 @@ impl Scheduler {
     /// deepening is asked for. Either deepens it only to a boundary with which the admission
     /// holds no more than the regions' capacity alone ([`Scheduler::holds_alone`]). One per
     /// cache class but the draft cache, with the class's keys beyond what the device and the
-    /// host hold, and a deadline of [`prefetch_wait`] of the deepening from now.
+    /// host hold, and a deadline of the copy timeout of the deepening from now
+    /// (`SchedulerConfig::copy_timeout`).
     pub(super) fn prefetch_requests(
         &self,
         request: &Request,
@@ -1326,7 +1314,7 @@ impl Scheduler {
             return Vec::new();
         };
 
-        let wait = prefetch_wait(target - hit).as_nanos();
+        let wait = self.config.copy_timeout(target - hit).as_nanos();
         let now = monotonic_nanos(Instant::now());
         let deadline = now.saturating_add(u64::try_from(wait).unwrap_or(u64::MAX));
         let mut asks = Vec::new();
@@ -1853,7 +1841,7 @@ impl Scheduler {
         if stored == 0 || tokens < self.policy.limits.prefetch_min_tokens.max(1) {
             return Vec::new();
         }
-        let wait = prefetch_wait(tokens).as_nanos();
+        let wait = self.config.copy_timeout(tokens).as_nanos();
         let deadline =
             monotonic_nanos(Instant::now()).saturating_add(u64::try_from(wait).unwrap_or(u64::MAX));
         vec![runtime::Request::Prefetch {
@@ -2866,7 +2854,7 @@ mod tests {
                 generated_token_ids: Vec::new(),
                 adapter: 0,
             };
-            let mut request = Request::new(input.into(), 1, Instant::now(), WINDOW);
+            let mut request = Request::new(input.into(), 1, Instant::now(), WINDOW, 0);
             request.placement[Phase::Prefill.index()] = Some(A);
             request.placement[Phase::Decode.index()] = Some(A);
             request.placement[Phase::VisionEncode.index()] = Some(A);
@@ -3788,7 +3776,7 @@ mod tests {
     #[test]
     fn a_verification_commits_its_checkpoint_once_its_accepted_tokens_reach_the_boundary() {
         let kv = KvCacheConfig {
-            state_interval: std::num::NonZeroU32::new(8),
+            state_interval: std::num::NonZeroU32::new(8).unwrap(),
             ..KvCacheConfig::default()
         };
         let mut session = serving(&[full(4), (CacheGroupKind::State, 4)], kv);
@@ -3884,7 +3872,7 @@ mod tests {
     #[test]
     fn the_write_policy_stores_full_blocks_and_windows_before_aligned_boundaries() {
         let kv = KvCacheConfig {
-            boundary_interval: std::num::NonZeroU32::new(4),
+            boundary_interval: std::num::NonZeroU32::new(4).unwrap(),
             ..KvCacheConfig::default()
         };
         let mut session = serving(&[full(4), window(4, 4)], kv);

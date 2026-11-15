@@ -119,7 +119,8 @@ impl Scheduler {
 
         // A resumed request's generated tokens continue its prompt; it is named for its
         // continuation by this epoch unless it carries a name.
-        let mut request = Request::new(input, self.epoch, Instant::now(), window);
+        let drafts = u32::try_from(self.config.draft_tokens).unwrap_or(u32::MAX);
+        let mut request = Request::new(input, self.epoch, Instant::now(), window, drafts);
         request.listing = self.lists_asked;
         let at = if request.resumes() {
             self.waiting
@@ -1751,7 +1752,7 @@ mod tests {
         let mut bench = bench(1024);
         let scheduler = &mut bench.scheduler;
         scheduler.policy.limits.chunked_prefill_size = 8;
-        let mut request = Request::new(tokens(1, &[1; 20], 4).into(), 1, Instant::now(), WINDOW);
+        let mut request = Request::new(tokens(1, &[1; 20], 4).into(), 1, Instant::now(), WINDOW, 0);
 
         let mut budget = (100, 3);
         let charge = |request: &Request, phase, asked, budget: &mut (u32, usize)| {
@@ -1855,7 +1856,7 @@ mod tests {
         );
         let scheduler = &mut bench.scheduler;
         let place = |scheduler: &mut super::Scheduler, id: u64| {
-            let request = Request::new(tokens(id, &[1, 2], 4).into(), 1, Instant::now(), WINDOW);
+            let request = Request::new(tokens(id, &[1, 2], 4).into(), 1, Instant::now(), WINDOW, 0);
             scheduler.requests.insert(RequestId(id), request);
             let placed = scheduler.place(RequestId(id));
             (placed, scheduler.requests[&RequestId(id)].placement)

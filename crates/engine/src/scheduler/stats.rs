@@ -1,6 +1,6 @@
 //! What a scheduler reports (`specs/scheduler-design.md` §7.5): counting into
 //! [`proto::report::SchedulerStats`] as it works, and `publish_stats`, which sends the report as
-//! [`Output::Stats`] once a second has passed.
+//! [`Output::Stats`] once a report period (`worker_config.report_period`) has passed.
 //!
 //! The report message is the accumulator. Counters add into it where the scheduler acts: a batch
 //! submitted, a batch's output applied, a verification's drafts, an admission's queue wait and
@@ -27,9 +27,6 @@ use scheduling::PhaseClass;
 use storage::runtime::Completion;
 
 use super::{Output, Scheduler};
-
-/// How often a scheduler reports: one report per second.
-const STATS_PERIOD: Duration = Duration::from_secs(1);
 
 /// The domain a call is counted in: the class of its batch's phase, with media work and the work
 /// of no phase of its own (a latent preparation) counted together as a media request's flow.
@@ -286,11 +283,11 @@ impl Scheduler {
 
     /// When the next report is due: the loop need not wake for statistics before it.
     pub(super) fn stats_due(&self) -> Instant {
-        self.published + STATS_PERIOD
+        self.published + self.config.report_period
     }
 
-    /// Sends the interval's report as [`Output::Stats`] once a second has passed since the last,
-    /// and starts the next interval. Before that, it does nothing.
+    /// Sends the interval's report as [`Output::Stats`] once a report period has passed since the
+    /// last, and starts the next interval. Before that, it does nothing.
     pub(super) fn publish_stats(&mut self, now: Instant) {
         if now < self.stats_due() {
             return;

@@ -1,9 +1,9 @@
 //! What the process states to its daemon: its lifecycle state and what it serves on every
-//! request front, the schedulers' statistics and the process's metrics once a second, the
+//! request front, the schedulers' statistics and the process's metrics once a report period, the
 //! watchdog's stalls and sticky errors, and the failures and faults it observed on the process
 //! interface.
 
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use crate::batch::BatchId;
 use proto::process::report;
@@ -13,9 +13,6 @@ use proto::request::wire::{self, from_engine};
 
 use super::MainProcess;
 use super::lifecycle::{self, Lifecycle};
-
-/// How often the process states its metrics.
-pub(super) const METRICS_EVERY: Duration = Duration::from_secs(1);
 
 impl MainProcess {
     /// States the lifecycle state the engine is in on every live front, `described` with what it
@@ -162,7 +159,7 @@ impl MainProcess {
     pub(super) fn watch(&mut self, now: Instant) {
         if now >= self.next_metrics {
             self.metrics();
-            self.next_metrics = now + METRICS_EVERY;
+            self.next_metrics = now + self.launch.engine_config.worker.report_period;
         }
         let Some(engine) = self.engine.as_ref() else {
             return;

@@ -274,7 +274,14 @@ impl MainProcess {
 
         // The arrival as the policy reads a request no scheduler took yet: waiting, with no
         // group and no phase ready.
-        let arrival = Request::new(input.clone(), self.launch.epoch, Instant::now(), window);
+        let drafts = self.launch.engine_config.speculative.num_draft_tokens;
+        let arrival = Request::new(
+            input.clone(),
+            self.launch.epoch,
+            Instant::now(),
+            window,
+            drafts,
+        );
         let index = match routed(route, &view_of(&arrival, &[]), &ranks) {
             Ok(index) => index,
             // This request goes to the least loaded scheduler.

@@ -42,6 +42,7 @@
 //! [`CausalLmRunner::set_features`]: super::CausalLmRunner::set_features
 
 use std::cell::Cell;
+use std::num::NonZeroUsize;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -89,6 +90,9 @@ pub(crate) struct VisionRunner {
     /// The grid of the forward being prepared or run: the largest captured grid but while an
     /// image or another captured grid is prepared.
     grid: Cell<[u32; 3]>,
+    /// The threads an image's conversion into patch rows shares its work over: the process's
+    /// host-thread budget (`worker_config.host_threads`).
+    threads: NonZeroUsize,
 }
 
 /// One image of a batch, read far enough to know its block: its encoded bytes, its displayed
@@ -164,7 +168,8 @@ impl VisionRunner {
     /// tower's largest when it sizes fewer) over `graphs`, made for
     /// [`VisionRunner::input_bytes`] bytes of input tensors, which replay on `stream` (`None`
     /// for graphs that hold no device). It writes encoder outputs of class `class` in `memory`,
-    /// the rank's media memory.
+    /// the rank's media memory, and shares an image's conversion into patch rows over `threads`
+    /// threads.
     ///
     /// # Errors
     ///
@@ -177,6 +182,7 @@ impl VisionRunner {
         stream: Option<Stream>,
         memory: Arc<BufferMemory>,
         (class, rows): (u8, u32),
+        threads: NonZeroUsize,
     ) -> Result<Self> {
         let vision = tower(&*model)?;
         let rows = bound(vision, rows)?;
@@ -222,6 +228,7 @@ impl VisionRunner {
             rows,
             grids,
             grid: Cell::new(largest),
+            threads,
         })
     }
 
@@ -347,7 +354,15 @@ impl VisionRunner {
             let out = block.get_mut(..patches).ok_or_else(|| {
                 Error::Invariant("an image's patch rows exceed the input block".into())
             })?;
-            conditions::pack_block(&format, &rgb, 1, (*height, *width), *grid, out)
+            conditions::pack_block(
+                &format,
+                &rgb,
+                1,
+                (*height, *width),
+                *grid,
+                out,
+                self.threads,
+            )
         })?;
         Ok(Ok(bucket))
     }
@@ -619,6 +634,7 @@ fn patch_bytes(format: &PatchFormat, grid: [u32; 3]) -> Result<u64> {
 
 #[cfg(test)]
 pub(crate) mod tests {
+    use std::num::NonZeroUsize;
     use std::sync::Arc;
 
     use crate::batch::{MediaRow, Variant};
@@ -864,6 +880,7 @@ pub(crate) mod tests {
             None,
             Arc::new(memory),
             (ENCODER, rows),
+            NonZeroUsize::MIN,
         )
         .unwrap()
     }

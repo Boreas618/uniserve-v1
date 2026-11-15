@@ -33,6 +33,7 @@ pub(crate) mod text;
 pub(crate) mod video;
 
 use std::collections::BTreeMap;
+use std::num::NonZeroUsize;
 use std::path::Path;
 use std::sync::Arc;
 
@@ -631,7 +632,8 @@ impl ModelRunner {
         } else {
             ops::moe::exchange::Mode::Dispatch
         };
-        Ok(Some(Member::new(group, shape, mode, join)?))
+        let beside = self.engine_config().moe.beside_rows.get();
+        Ok(Some(Member::new(group, shape, mode, join, beside)?))
     }
 
     /// The shape of the transport a member of an expert union creates on `device`.
@@ -765,11 +767,44 @@ impl ModelRunner {
 /// What the main process reads of a rank to run it: its thread pools and its devices' build
 /// targets.
 impl ModelRunner {
-    /// The thread pool media host work runs on, one per process: half the host's parallelism
-    /// within one to eight, each thread with [`MEDIA_TASKS`] tasks of room.
+    /// The thread pool media host work runs on, one per process: [`ModelRunner::host_threads`]
+    /// threads holding [`ModelRunner::media_tasks`] tasks.
     pub(crate) fn media_pool(&self) -> Result<ThreadPool> {
-        let threads = host_share();
-        Ok(ThreadPool::new("media", media_tasks(), threads)?)
+        let threads = self.host_threads()?;
+        Ok(ThreadPool::new(
+            "media",
+            self.media_tasks()?,
+            threads.get(),
+        )?)
+    }
+
+    /// The threads of the process's host work (`worker_config.host_threads`): the deployment's,
+    /// or half the CPUs the process may run on, at least one, the other half left to its
+    /// workers', schedulers' and communicators' threads. The CPUs are those its affinity mask
+    /// holds within its cgroup's CPU quota, as `std::thread::available_parallelism` reads them.
+    ///
+    /// # Errors
+    ///
+    /// A host that states no CPUs the process may run on, when the deployment states no budget.
+    pub(crate) fn host_threads(&self) -> Result<NonZeroUsize> {
+        if let Some(threads) = self.engine_config().worker.host_threads {
+            return Ok(threads);
+        }
+        let cpus = std::thread::available_parallelism()
+            .context("reading the CPUs the process may run on for its host work")?;
+        Ok(NonZeroUsize::new(cpus.get() / 2).unwrap_or(NonZeroUsize::MIN))
+    }
+
+    /// The tasks the process's media pool holds at once, the requests a host phase's stage holds
+    /// (`Capacity::rows`): each of its [`ModelRunner::host_threads`] threads with
+    /// `worker_config.host_queue_depth` tasks of room.
+    ///
+    /// # Errors
+    ///
+    /// As [`ModelRunner::host_threads`].
+    pub(crate) fn media_tasks(&self) -> Result<usize> {
+        let depth = self.engine_config().worker.host_queue_depth.get();
+        Ok(self.host_threads()?.get().saturating_mul(depth))
     }
 
     /// The Build Server's targets this rank resolves a module for: the architecture-specific
@@ -861,22 +896,4 @@ pub(crate) fn split(rank: usize, ranks: usize) -> (u64, u64) {
     } else {
         (0, 0)
     }
-}
-
-/// The tasks of host work one thread of the media pool has room for.
-const MEDIA_TASKS: usize = 4;
-
-/// The tasks the process's media pool holds at once: the requests a host phase's stage holds
-/// (`Capacity::rows`).
-pub(crate) fn media_tasks() -> usize {
-    host_share().saturating_mul(MEDIA_TASKS)
-}
-
-/// The threads a pool of host work takes when nothing states its width: half the host's
-/// parallelism, within one to eight.
-fn host_share() -> usize {
-    let available = std::thread::available_parallelism()
-        .map(|count| count.get())
-        .unwrap_or(4);
-    (available / 2).clamp(1, 8)
 }

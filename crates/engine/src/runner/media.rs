@@ -69,6 +69,7 @@
 //! media host's. A session a request left unfinished is closed when another request takes its
 //! slot.
 
+use std::num::NonZeroUsize;
 use std::ops::Range;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -145,6 +146,9 @@ pub(crate) struct HostConfig {
     pub audio_rate: u32,
     /// How the model's encoders read decoded condition media.
     pub format: MediaFormat,
+    /// The threads a conversion of a request's condition media shares its work over: the
+    /// process's host-thread budget (`worker_config.host_threads`).
+    pub threads: NonZeroUsize,
 }
 
 /// The runner of a video request's host work (module documentation).
@@ -328,9 +332,10 @@ impl MediaHost {
                 let conditioning = conditions_of(row)?;
                 let format = self.config.format;
                 let rates = (self.config.frame_rate, self.config.audio_rate);
+                let threads = self.config.threads;
 
                 Box::new(move || {
-                    let regions = read_conditions(&media, rates, &conditioning, &format)?;
+                    let regions = read_conditions(&media, rates, &conditioning, &format, threads)?;
                     Ok((regions, None))
                 })
             }
@@ -1257,6 +1262,7 @@ fn read_conditions(
     (frame_rate, audio_rate): (u32, u32),
     conditioning: &proto::video::Conditions,
     format: &MediaFormat,
+    threads: NonZeroUsize,
 ) -> Result<Vec<Vec<u8>>> {
     use media::read::{
         AudioTransform, ConditionProducts, ConditionSource, ImageTransform, VideoClip,
@@ -1386,6 +1392,7 @@ fn read_conditions(
                 canvas.height,
                 canvas.width,
                 out,
+                threads,
             )?;
             pixels_at += source.len();
         }
@@ -1427,6 +1434,7 @@ fn read_conditions(
                         (height, width),
                         grid,
                         out,
+                        threads,
                     )?;
                 }
                 None => {
@@ -1440,6 +1448,7 @@ fn read_conditions(
                         (canvas.height, canvas.width),
                         grid,
                         out,
+                        threads,
                     )?;
                 }
             }
@@ -1542,6 +1551,7 @@ mod tests {
                 },
                 hop: 800,
             },
+            threads: NonZeroUsize::MIN,
         }
     }
 
@@ -2022,7 +2032,7 @@ mod tests {
                     tables(rank),
                     Arc::clone(&sequences),
                     rank,
-                    crate::worker::COPY_BUDGET,
+                    proto::config::DEFAULT_COPY_BUDGET,
                 );
                 Arc::new(worker.unwrap())
             })

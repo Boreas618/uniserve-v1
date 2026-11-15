@@ -80,8 +80,8 @@ use engine::runner::Runner;
 use engine::runner::buckets::Bucket;
 use engine::runner::graphs::Graphs;
 use engine::worker::completion::{Outcome, Submission};
-use engine::worker::{COPY_BUDGET, Sequences, Worker};
 use engine::worker::{Error, Result};
+use engine::worker::{Sequences, Worker};
 use ops::Generation;
 use service::lock;
 use storage::runtime::{Completion, GroupId, OwnerId, Request, RequestId, Run, Stamps, Tier};
@@ -1217,7 +1217,7 @@ fn worker(
         BlockTables::new(GROUP, &[KV, HOST], &UNIT_BYTES),
         Arc::clone(sequences),
         place,
-        COPY_BUDGET,
+        proto::config::DEFAULT_COPY_BUDGET,
     )
     .unwrap();
 

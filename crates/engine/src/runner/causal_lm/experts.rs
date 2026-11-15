@@ -62,10 +62,6 @@ use crate::parallel::HostGroup;
 use crate::runner::buckets::{Bucket, Buckets};
 use crate::worker::{Error, Result};
 
-/// The rows per member of a step in which another member prefills a few prompts while this
-/// one decodes.
-const PREFILL_BESIDE: u32 = 1024;
-
 /// What submits a join batch to the worker of every other member of the union.
 pub(crate) type JoinHook = Arc<dyn Fn(Batch) -> Result<()> + Send + Sync>;
 
@@ -74,11 +70,12 @@ pub(crate) type JoinHook = Arc<dyn Fn(Batch) -> Result<()> + Send + Sync>;
 ///
 /// When every member decodes, a step holds at most the largest decode bucket's rows, which
 /// the smallest class holds. A decode beside another member's prefill of a few prompts takes
-/// a middle class, and a step another member fills with a large prefill takes the class of
-/// the whole capacity. One class for every step would shape each decode's expert work for the
-/// largest prefill any member could send. A class within a quarter of the whole capacity is
-/// not captured: the smaller shape would save little.
-pub(crate) fn classes(buckets: &Buckets, capacity: u32) -> Buckets {
+/// the middle class of `beside` rows (`moe_config.beside_rows`), and a step another member
+/// fills with a large prefill takes the class of the whole capacity. One class for every step
+/// would shape each decode's expert work for the largest prefill any member could send. A
+/// class within a quarter of the whole capacity is not captured: the smaller shape would save
+/// little.
+pub(crate) fn classes(buckets: &Buckets, capacity: u32, beside: u32) -> Buckets {
     let decode = buckets
         .iter()
         .filter(|bucket| bucket.variant.is_decode())
@@ -99,9 +96,9 @@ pub(crate) fn classes(buckets: &Buckets, capacity: u32) -> Buckets {
             classes.push(bucket.at_capacity(small));
         }
 
-        let beside = bucket.variant.is_decode() || bucket.variant == Variant::ExpertJoin;
-        if beside && small < PREFILL_BESIDE && PREFILL_BESIDE.saturating_mul(4) <= capacity {
-            classes.push(bucket.at_capacity(PREFILL_BESIDE));
+        let decodes = bucket.variant.is_decode() || bucket.variant == Variant::ExpertJoin;
+        if decodes && small < beside && beside.saturating_mul(4) <= capacity {
+            classes.push(bucket.at_capacity(beside));
         }
         classes
     }))
@@ -128,6 +125,9 @@ pub(crate) struct Member {
     regions: [Tensor; 7],
     /// Whether one launch runs the whole expert layer.
     fused: bool,
+    /// The rows per rank of the union's middle capture class (`moe_config.beside_rows`,
+    /// [`classes`]).
+    beside: u32,
     /// The transport, once the members created it.
     transport: Option<Transport>,
     /// What the package reaches the host group through: `link.handle` is the address of
@@ -147,7 +147,8 @@ impl Member {
     /// `mode` is the module that creates the transport: [`Mode::Fused`] for an exchange whose
     /// one launch runs the expert layer, [`Mode::Dispatch`] for any other. `join` submits a
     /// join batch to the worker of every other member; the batch states the phase the
-    /// asking member serves and its group is the hook's to address.
+    /// asking member serves and its group is the hook's to address. `beside` is the rows per
+    /// rank of the union's middle capture class ([`classes`]).
     ///
     /// # Errors
     ///
@@ -158,6 +159,7 @@ impl Member {
         shape: TransportShape,
         mode: Mode,
         join: JoinHook,
+        beside: u32,
     ) -> Result<Self> {
         if group.size() != shape.ranks as usize || group.rank() != shape.rank as usize {
             return Err(Error::Invalid(format!(
@@ -202,6 +204,7 @@ impl Member {
                 Error::Invariant("a transport lays out another number of regions".into())
             })?,
             fused: mode == Mode::Fused,
+            beside,
             transport: None,
             link,
         })
@@ -266,6 +269,11 @@ impl Member {
     /// The most rows one member sends in a step: the capacity of the largest class.
     pub(crate) const fn capacity(&self) -> u32 {
         self.shape.max_tokens
+    }
+
+    /// The rows per rank of the union's middle capture class ([`classes`]).
+    pub(crate) const fn beside(&self) -> u32 {
+        self.beside
     }
 
     /// Whether the member holds experts alone: every forward of its buckets is the join.

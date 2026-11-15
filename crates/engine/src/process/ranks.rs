@@ -85,7 +85,7 @@ use crate::runner::graphs::Graphs;
 use crate::runner::thread_pool::ThreadPool;
 use crate::runner::vision::VisionRunner;
 use crate::runner::{Runner, RunnerId};
-use crate::worker::{COPY_BUDGET, Sequences, Worker};
+use crate::worker::{Sequences, Worker};
 use anyhow::{Context as _, Result, bail};
 use nn::WeightKey;
 use nn::family::TextModel;
@@ -97,7 +97,7 @@ use storage::QueuePair;
 use storage::protocol::UnitRun;
 use storage::runtime::{Class, Group, GroupId, Open, Opened, Region, Segments, Tier, VERSION};
 
-use self::rank::{Collective, ModelRunner, RankModel, Weights, media_tasks, parallel_order};
+use self::rank::{Collective, ModelRunner, RankModel, Weights, parallel_order};
 use crate::process::binding::{self, Served};
 use crate::process::ranks::rank::memory::{
     Peaks, fewest_states, fewest_units, granularity, plane_segments,
@@ -643,7 +643,8 @@ fn load_rank(
             let inputs = VisionRunner::input_bytes(meta.as_ref(), images)?;
             let graphs = Graphs::meta(Arc::clone(&unserved), inputs);
             let model = Arc::clone(&meta);
-            let runner = vision_runner(model, graphs, None, memory, (class, images))?;
+            let threads = model_runner.host_threads()?;
+            let runner = vision_runner(model, graphs, None, memory, (class, images), threads)?;
             let graphs = crate::runner::Runner::graphs(&runner);
             keys.extend(graphs.keys());
             Some(Peaks {
@@ -895,7 +896,7 @@ fn load_video_rank(
     let meta = model_runner
         .load_profiled()
         .context("loading the epoch's pipeline from its checkpoint's headers")?;
-    let tasks = u32::try_from(media_tasks()).unwrap_or(u32::MAX);
+    let tasks = u32::try_from(model_runner.media_tasks()?).unwrap_or(u32::MAX);
     let (mut video, keys) = model_runner.profile_media(meta, (tensor, denoiser), tasks)?;
     video.host = Some(host);
     video.decoder = decoder;
@@ -2806,7 +2807,15 @@ fn open_rank(
                 let inputs = VisionRunner::input_bytes(rank.model.as_ref(), images)?;
                 let graphs = Graphs::meta(Arc::clone(kernels), inputs);
                 let model = Arc::clone(&rank.model);
-                Some(vision_runner(model, graphs, None, memory, (class, images))?)
+                let threads = model_runner.host_threads()?;
+                Some(vision_runner(
+                    model,
+                    graphs,
+                    None,
+                    memory,
+                    (class, images),
+                    threads,
+                )?)
             }
             None => None,
         };
@@ -2934,7 +2943,8 @@ fn open_rank(
             )?;
             let model = Arc::clone(&rank.model);
             let issued = Some(encoding.clone());
-            let runner = vision_runner(model, graphs, issued, memory, (class, images))?;
+            let threads = model_runner.host_threads()?;
+            let runner = vision_runner(model, graphs, issued, memory, (class, images), threads)?;
             streams.push(("device", encoding));
             Some(runner)
         }
@@ -3842,7 +3852,8 @@ pub(crate) fn spawn(
             tables,
             Arc::clone(group_sequences),
             *place,
-            COPY_BUDGET,
+            // The epoch's one budget, so that every worker of a group starts the same copies.
+            rank.model_runner.engine_config().worker.copy_budget,
         )?;
         let worker = match union_turn {
             Some(first) => worker.in_union(first),

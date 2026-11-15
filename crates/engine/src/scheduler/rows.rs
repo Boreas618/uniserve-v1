@@ -46,10 +46,6 @@ use super::group::variants;
 use super::memory::{kept, restored};
 use super::{Capacity, Request, Scheduler};
 
-/// The decoded tokens between two recurrent-state checkpoints when the deployment states none
-/// (`KvCacheConfig::state_interval`).
-const STATE_INTERVAL: u32 = 256;
-
 /// The sampler's parameter columns of one row.
 const PARAMETERS: usize = PARAMETER_COLUMNS as usize;
 
@@ -236,11 +232,11 @@ impl Scheduler {
         // the last block boundary it reaches, a decode or a verification only at a multiple of
         // the state interval.
         let (mut restore, mut keep) = (None, None);
-        if let Some(block) = state_block(capacity) {
+        if let (Some(block), Some(interval)) = (state_block(capacity), state_interval(capacity)) {
             if !seen && start > 0 {
                 restore = Some(restored(start, block)?);
             }
-            keep = kept(phase, start, end, block, state_interval(capacity));
+            keep = kept(phase, start, end, block, interval);
         }
 
         // Each row draws at the rotary position of the token it samples, in its request's
@@ -904,13 +900,13 @@ fn state_block(capacity: &Capacity) -> Option<u32> {
         .filter(|block| *block > 0)
 }
 
-/// The decoded tokens between two recurrent-state checkpoints: the deployment's, at least one.
-pub(super) fn state_interval(capacity: &Capacity) -> u32 {
+/// The decoded tokens between two recurrent-state checkpoints of a group that holds a cache: its
+/// deployment's `kv_cache_config.state_interval`.
+pub(super) fn state_interval(capacity: &Capacity) -> Option<u32> {
     capacity
         .kv_cache
         .as_ref()
-        .and_then(|config| config.state_interval)
-        .map_or(STATE_INTERVAL, |interval| interval.get())
+        .map(|config| config.state_interval.get())
 }
 
 /// Appends one call's cells to a commit table laid out column-major over `calls` calls: cell
@@ -967,6 +963,9 @@ mod tests {
         let mut scheduler = bench(1024).scheduler;
         for group in &mut scheduler.groups {
             let capacity = &mut group.capacity;
+            // A group that holds a cache states its deployment's cache configuration, the
+            // default's here.
+            capacity.kv_cache = Some(proto::config::KvCacheConfig::default());
             capacity.cache_groups = [(CacheGroupKind::Full, BLOCK)]
                 .into_iter()
                 .chain(groups.iter().copied())
@@ -1064,6 +1063,7 @@ mod tests {
             terminal: None,
             event_credit: 64,
             event_window: 64,
+            draft_limit: 0,
             last_progress: now,
             dirty: false,
         }

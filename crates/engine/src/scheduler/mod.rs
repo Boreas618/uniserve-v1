@@ -1767,7 +1767,7 @@ impl Scheduler {
         } = &completion
         {
             let tokens = self.copy_tokens(&request, keys, *copier);
-            let bound = Instant::now() + memory::prefetch_wait(tokens);
+            let bound = Instant::now() + self.config.copy_timeout(tokens);
             self.copies.insert(id.0, (*copier, bound));
         }
         self.executor.map(group, slot, id, request, completion);

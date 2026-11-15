@@ -20,6 +20,7 @@
 //! whole on every rank of a tensor group, so each rank encodes the whole output into its own
 //! region, at the units the session gives every rank of the group alike.
 
+use std::num::NonZeroUsize;
 use std::sync::{Arc, Mutex};
 
 use crate::batch::product::VISION_FEATURES;
@@ -258,8 +259,9 @@ pub(crate) fn feature_tensors(model: &dyn TextModel) -> [u8; 32] {
 /// The vision runner of `model` encoding images of at most `rows` rows
 /// ([`ModelRunner::image_rows`]) over `graphs`, which replay on `stream` (`None` for graphs that
 /// hold no device), writing the encoder outputs of class `class` into `memory`, the rank's media
-/// memory, profiled (steps 7 and 22): the forward of each grid it captures, which states its
-/// region and input bytes and the kernels every grid of at most `rows` rows launches.
+/// memory, and sharing an image's conversion over `threads` threads, profiled (steps 7 and 22):
+/// the forward of each grid it captures, which states its region and input bytes and the kernels
+/// every grid of at most `rows` rows launches.
 ///
 /// # Errors
 ///
@@ -270,8 +272,9 @@ pub(crate) fn vision_runner(
     stream: Option<Stream>,
     memory: Arc<BufferMemory>,
     (class, rows): (u8, u32),
+    threads: NonZeroUsize,
 ) -> Result<VisionRunner> {
-    let runner = VisionRunner::new(model, graphs, stream, memory, (class, rows))
+    let runner = VisionRunner::new(model, graphs, stream, memory, (class, rows), threads)
         .context("building the rank's vision runner")?;
     crate::runner::Runner::graphs(&runner)
         .profile_run(&runner)

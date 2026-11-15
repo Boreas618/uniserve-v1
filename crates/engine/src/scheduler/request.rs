@@ -44,10 +44,6 @@ use super::group::variants;
 use super::video::VIDEO_PHASES;
 use super::{Scheduler, WorkerGroup};
 
-/// The most drafts one verification carries (SD §7.2, `S/lib.rs:611`): the bound the consumer's
-/// window reserves for a verification's tokens.
-pub(super) const MAX_VERIFY_DRAFTS: u32 = 16;
-
 /// The events a request's window keeps free for its terminal events (SD §7.1).
 const TERMINAL_RESERVE: u32 = 2;
 
@@ -141,6 +137,10 @@ pub(crate) struct Request {
     /// The events the consumer takes ahead of its reports (its front's event window): the most
     /// credit it holds.
     pub event_window: u32,
+    /// The most drafts one verification of the request carries (the deployment's
+    /// `speculative_config.num_draft_tokens`): the bound its consumer's window reserves for a
+    /// verification's tokens.
+    pub draft_limit: u32,
     /// Its admission or its last applied call.
     pub last_progress: Instant,
     /// Whether its view changed since the policy was told.
@@ -222,6 +222,7 @@ impl Request {
         epoch: u64,
         arrival: Instant,
         window: std::num::NonZeroU32,
+        draft_limit: u32,
     ) -> Self {
         let mut input = input;
         let token_ids = match &mut input {
@@ -270,6 +271,7 @@ impl Request {
             terminal: None,
             event_credit: window.get(),
             event_window: window.get(),
+            draft_limit,
             last_progress: arrival,
             dirty: false,
         }
@@ -479,25 +481,27 @@ impl Request {
 
     /// Whether the consumer's window holds the events one more call of `phase` may add (SD §3.4,
     /// §7.1): the credit covers the bound of every call in flight, the terminal's reserve and
-    /// the call's own bound. A request whose consumer is slow keeps its slot and blocks nobody.
+    /// the call's own bound, a verification carrying at most the request's draft limit. A
+    /// request whose consumer is slow keeps its slot and blocks nobody.
     pub(crate) fn has_event_room(&self, phase: Phase) -> bool {
+        let bound = |phase| output_bound(phase, self.draft_limit);
         let in_flight = Phase::ALL
             .into_iter()
-            .map(|phase| self.in_flight(phase).saturating_mul(output_bound(phase)))
+            .map(|phase| self.in_flight(phase).saturating_mul(bound(phase)))
             .fold(0, u32::saturating_add);
         let needed = in_flight
             .saturating_add(TERMINAL_RESERVE)
-            .saturating_add(output_bound(phase));
+            .saturating_add(bound(phase));
         self.event_credit >= needed
     }
 
     /// How many drafts the request's next verification carries, `spec_token_ids[..drafts]`
     /// (SD §7.2 "Speculation", `S/speculation.rs:229-267`): none while its draft cache does not
-    /// cover its computed tokens; else what its last forward proposed, at most
-    /// [`MAX_VERIFY_DRAFTS`] and one fewer than the tokens it may still generate, cut before the
-    /// first draft at whose position the request bans other tokens than at the verification's
-    /// first (a bad word's prefix forming across the drafts, or the `min_tokens` floor crossed),
-    /// since a verification's rows sample under one banned set. `eos` are the deployment's
+    /// cover its computed tokens; else what its last forward proposed, at most its draft limit
+    /// and one fewer than the tokens it may still generate, cut before the first draft at whose
+    /// position the request bans other tokens than at the verification's first (a bad word's
+    /// prefix forming across the drafts, or the `min_tokens` floor crossed), since a
+    /// verification's rows sample under one banned set. `eos` are the deployment's
     /// end-of-sequence tokens.
     pub(crate) fn drafts(&self, eos: &[u32]) -> u32 {
         let Some(request) = self.generation() else {
@@ -514,7 +518,7 @@ impl Request {
         let most = self
             .spec_token_ids
             .len()
-            .min(MAX_VERIFY_DRAFTS as usize)
+            .min(self.draft_limit as usize)
             .min(usize::try_from(remaining).unwrap_or(usize::MAX));
         let proposals = self.spec_token_ids.get(..most).unwrap_or_default();
 
@@ -951,12 +955,12 @@ fn rows(input: &ImageEncoderInput) -> u32 {
 }
 
 /// The most events one call of `phase` adds to its request's stream (SD §7.1, `S/lib.rs:604-626`):
-/// a prefill chunk, a refill or a decode 4, a verification 4 and one for each draft it may carry,
-/// a denoising step 3, every other call 2.
-const fn output_bound(phase: Phase) -> u32 {
+/// a prefill chunk, a refill or a decode 4, a verification 4 and one for each of the `drafts` it
+/// may carry, a denoising step 3, every other call 2.
+const fn output_bound(phase: Phase, drafts: u32) -> u32 {
     match phase {
         Phase::Prefill | Phase::Refill | Phase::Decode => 4,
-        Phase::Verify => 4 + MAX_VERIFY_DRAFTS,
+        Phase::Verify => 4u32.saturating_add(drafts),
         Phase::Denoise => 3,
         _ => 2,
     }
@@ -1000,6 +1004,9 @@ mod tests {
 
     /// The event window a test's consumer states in its welcome.
     const WINDOW: std::num::NonZeroU32 = std::num::NonZeroU32::new(64).unwrap();
+
+    /// The most drafts a verification of a running request carries: its deployment's.
+    const DRAFT_LIMIT: u32 = 16;
 
     const EOS: u32 = 2;
 
@@ -1080,7 +1087,7 @@ mod tests {
 
     /// `request`, admitted with every phase on group 0.
     fn running(request: GenerationRequest) -> Request {
-        let mut request = Request::new(request.into(), 3, Instant::now(), WINDOW);
+        let mut request = Request::new(request.into(), 3, Instant::now(), WINDOW, DRAFT_LIMIT);
         request.status = RequestStatus::Running;
         request.placement = [Some(GroupId(0)); Phase::COUNT];
         request
@@ -1105,7 +1112,7 @@ mod tests {
     fn a_resumed_request_continues_its_prompt_and_its_generated_count() {
         let mut input = tokens(&[1, 2, 3], 10);
         input.generated_token_ids = vec![7, 8];
-        let request = Request::new(input.into(), 3, Instant::now(), WINDOW);
+        let request = Request::new(input.into(), 3, Instant::now(), WINDOW, 0);
 
         assert_eq!(request.token_ids, [1, 2, 3, 7, 8]);
         assert_eq!(request.num_prompt_tokens, 5);
@@ -1129,7 +1136,7 @@ mod tests {
             request_id: 5,
         };
         named.cache.resume = Some(carried);
-        let request = Request::new(named.into(), 3, Instant::now(), WINDOW);
+        let request = Request::new(named.into(), 3, Instant::now(), WINDOW, 0);
         assert!(!request.resumes());
         let resume = request
             .generation()
@@ -1145,7 +1152,7 @@ mod tests {
             image(2, ImageEncoder::Vision, 3),
             image(2, ImageEncoder::Latent, 2),
         ];
-        let request = Request::new(input.into(), 0, Instant::now(), WINDOW);
+        let request = Request::new(input.into(), 0, Instant::now(), WINDOW, 0);
 
         assert_eq!(request.token_ids, [1, 2, 0, 0, 0, 0, 0, 3, 4]);
         assert_eq!(request.num_prompt_tokens, 9);

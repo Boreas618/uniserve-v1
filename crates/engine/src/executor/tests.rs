@@ -146,7 +146,7 @@ pub(crate) fn node(
                 BlockTables::new(GROUP, &[DEVICE, HOST], &[(DEVICE, 64), (HOST, 64)]),
                 Arc::clone(&sequences),
                 rank,
-                crate::worker::COPY_BUDGET,
+                proto::config::DEFAULT_COPY_BUDGET,
             );
             Arc::new(worker.unwrap())
         })

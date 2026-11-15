@@ -30,6 +30,15 @@ pub use worker_group::{
     WorkerGroupRole, WorkerRank,
 };
 
+/// A positive count of a `u32` option's default; a zero count fails the constant's evaluation, so
+/// the build refuses it.
+const fn nonzero(count: u32) -> NonZeroU32 {
+    match NonZeroU32::new(count) {
+        Some(count) => count,
+        None => panic!("the default of a positive option is zero"),
+    }
+}
+
 /// A positive count, for the defaults of non-zero options.
 pub const fn positive(count: usize) -> NonZeroUsize {
     match NonZeroUsize::new(count) {
@@ -144,18 +153,32 @@ pub struct KvCacheConfig {
     /// prefetch long hits back. Applies with `host_tier`; none when unset.
     pub mooncake: Option<storage::connector::Settings>,
     /// The pages of the largest block size between the aligned boundaries
-    /// a long prompt offloads its sliding windows before; the engine's
-    /// default when unset.
-    pub boundary_interval: Option<NonZeroU32>,
+    /// a long prompt offloads its sliding windows before
+    /// ([`DEFAULT_BOUNDARY_INTERVAL`] unless stated).
+    pub boundary_interval: NonZeroU32,
     /// The decoded tokens between two checkpoints of the state a model
-    /// keeps per request slot (a recurrent state); the engine's default
-    /// when unset.
-    pub state_interval: Option<NonZeroU32>,
+    /// keeps per request slot, a recurrent state ([`DEFAULT_STATE_INTERVAL`]
+    /// unless stated).
+    pub state_interval: NonZeroU32,
     /// For a model that keeps a recurrent state, the bytes of its state
     /// region beyond one checkpoint per request slot over the bytes of the
     /// KV planes, which divide what a rank's share leaves between them;
     /// positive. [`DEFAULT_STATE_RATIO`] unless stated.
     pub state_ratio: f64,
+    /// The time a copy of cached blocks the scheduler asks for may take
+    /// whatever its size, before it gives the copy up and the request
+    /// computes those tokens instead (as SGLang's `prefetch_timeout_base`):
+    /// a prefetch from the remote store or the peers, a copy between the
+    /// host and the device, and a stored trajectory's restore
+    /// ([`DEFAULT_PREFETCH_TIMEOUT_BASE`] unless stated).
+    #[serde(with = "values::duration")]
+    pub prefetch_timeout_base: Duration,
+    /// The time such a copy may take beyond `prefetch_timeout_base` for
+    /// every 1024 tokens it moves (as SGLang's
+    /// `prefetch_timeout_per_ki_token`)
+    /// ([`DEFAULT_PREFETCH_TIMEOUT_PER_KI_TOKEN`] unless stated).
+    #[serde(with = "values::duration")]
+    pub prefetch_timeout_per_ki_token: Duration,
     /// The Storage Server endpoints (`host:port`) of other hosts serving the
     /// same model under the same served name, whose published host KV cache
     /// pages admission reads when they deepen a prompt's hit: the pages are
@@ -185,9 +208,11 @@ impl Default for KvCacheConfig {
             host_ratio: DEFAULT_HOST_RATIO,
             host_gib: None,
             mooncake: None,
-            boundary_interval: None,
-            state_interval: None,
+            boundary_interval: DEFAULT_BOUNDARY_INTERVAL,
+            state_interval: DEFAULT_STATE_INTERVAL,
             state_ratio: DEFAULT_STATE_RATIO,
+            prefetch_timeout_base: DEFAULT_PREFETCH_TIMEOUT_BASE,
+            prefetch_timeout_per_ki_token: DEFAULT_PREFETCH_TIMEOUT_PER_KI_TOKEN,
             peers: Vec::new(),
             conversion_buffer_mib: DEFAULT_CONVERSION_BUFFER_MIB,
         }
@@ -200,6 +225,26 @@ impl KvCacheConfig {
         self.block_size.map_or(DEFAULT_BLOCK_SIZE, NonZeroU32::get)
     }
 }
+
+/// The pages of the largest block size between two aligned boundaries a long prompt offloads its
+/// sliding windows before, when the deployment states none (`kv_cache_config.boundary_interval`):
+/// 64, a policy between the windows a long prompt stores to the host (one per interval) and the
+/// part of an offloaded prompt a continuation of it reuses (whole intervals).
+pub const DEFAULT_BOUNDARY_INTERVAL: NonZeroU32 = nonzero(64);
+
+/// The decoded tokens between two checkpoints of a request's recurrent state, when the deployment
+/// states none (`kv_cache_config.state_interval`): 256, as SGLang's `--mamba-track-interval`, a
+/// policy between the checkpoints a decode stores (one per interval) and the decoded tokens a
+/// resumed request recomputes (at most one interval).
+pub const DEFAULT_STATE_INTERVAL: NonZeroU32 = nonzero(256);
+
+/// The time a copy may take whatever its size, when the deployment states none
+/// (`kv_cache_config.prefetch_timeout_base`): one second, SGLang's default.
+pub const DEFAULT_PREFETCH_TIMEOUT_BASE: Duration = Duration::from_secs(1);
+
+/// The time a copy may take for every 1024 tokens it moves, when the deployment states none
+/// (`kv_cache_config.prefetch_timeout_per_ki_token`): a quarter second, SGLang's default.
+pub const DEFAULT_PREFETCH_TIMEOUT_PER_KI_TOKEN: Duration = Duration::from_millis(250);
 
 /// Default maximum calls selected by one generation scheduling pass.
 pub const DEFAULT_MAX_BATCH: usize = 128;
@@ -268,6 +313,18 @@ pub struct SchedulerConfig {
     /// in.
     #[serde(skip)]
     pub block_tokens: u32,
+    /// The time a copy may take whatever its size, resolved from
+    /// `kv_cache_config.prefetch_timeout_base`.
+    #[serde(skip)]
+    pub prefetch_timeout_base: Duration,
+    /// The time a copy may take for every 1024 tokens it moves, resolved from
+    /// `kv_cache_config.prefetch_timeout_per_ki_token`.
+    #[serde(skip)]
+    pub prefetch_timeout_per_ki_token: Duration,
+    /// How often the scheduler reports its statistics, resolved from
+    /// `worker_config.report_period`.
+    #[serde(skip)]
+    pub report_period: Duration,
 }
 
 /// The budget a scheduling policy module runs under (`scheduler_config.policy_budget`): the
@@ -344,6 +401,9 @@ impl Default for SchedulerConfig {
             graph_tiers: Vec::new(),
             policy_budget: PolicyBudget::default(),
             block_tokens: DEFAULT_BLOCK_SIZE,
+            prefetch_timeout_base: DEFAULT_PREFETCH_TIMEOUT_BASE,
+            prefetch_timeout_per_ki_token: DEFAULT_PREFETCH_TIMEOUT_PER_KI_TOKEN,
+            report_period: DEFAULT_REPORT_PERIOD,
         }
     }
 }
@@ -354,7 +414,8 @@ impl SchedulerConfig {
     /// sizes in tokens, ascending (§4.4, §4.5).
     ///
     /// The rest is the configuration's: its running requests, its waiting queue and its prefill
-    /// chunk, and the drafter's tokens.
+    /// chunk, the drafter's tokens, the KV cache's copy timeouts and the workers' report
+    /// period.
     pub fn of(
         engine: &EngineConfig,
         max_batch: usize,
@@ -378,7 +439,17 @@ impl SchedulerConfig {
             graph_tiers,
             policy_budget: engine.scheduler.policy_budget,
             block_tokens: engine.kv_cache.block_tokens(),
+            prefetch_timeout_base: engine.kv_cache.prefetch_timeout_base,
+            prefetch_timeout_per_ki_token: engine.kv_cache.prefetch_timeout_per_ki_token,
+            report_period: engine.worker.report_period,
         }
+    }
+
+    /// How long a copy of `tokens` tokens may take before the scheduler gives it up:
+    /// `prefetch_timeout_base`, and `prefetch_timeout_per_ki_token` for every 1024 tokens.
+    pub fn copy_timeout(&self, tokens: u32) -> Duration {
+        let share = self.prefetch_timeout_per_ki_token.saturating_mul(tokens) / 1024;
+        self.prefetch_timeout_base.saturating_add(share)
     }
 
     /// The prefill chunk, as resolved: the configured one, or the default.
@@ -602,6 +673,12 @@ pub struct MoeConfig {
     pub exchange: String,
     /// Microbatches overlapping attention with dedicated expert workers.
     pub microbatches: NonZeroU32,
+    /// The rows per rank of the middle capture class of an expert union's steps: a step in which
+    /// another member prefills a few prompts while this one decodes, which neither the decode
+    /// class nor the class of the union's whole capacity fits well. Not captured when the decode
+    /// class reaches it or it is within a quarter of the whole capacity
+    /// ([`DEFAULT_BESIDE_ROWS`] unless stated).
+    pub beside_rows: NonZeroU32,
 }
 
 impl Default for MoeConfig {
@@ -610,9 +687,15 @@ impl Default for MoeConfig {
             expert_parallel: false,
             exchange: DEFAULT_EXPERT_EXCHANGE.to_owned(),
             microbatches: NonZeroU32::MIN,
+            beside_rows: DEFAULT_BESIDE_ROWS,
         }
     }
 }
+
+/// The rows per rank of an expert union's middle capture class when the deployment states none
+/// (`moe_config.beside_rows`): 1024, the steps of a few prompts' prefill beside the other
+/// members' decodes.
+pub const DEFAULT_BESIDE_ROWS: NonZeroU32 = nonzero(1024);
 
 /// CUDA graph capture (`cuda_graph_config`).
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -697,6 +780,26 @@ pub struct WorkerConfig {
     /// are created again at the promotion, which captures the graphs that
     /// use them anew.
     pub standby_storage: StandbyStorage,
+    /// How often each main process states its metrics and each scheduler its statistics to the
+    /// daemon, each report covering the period since the last ([`DEFAULT_REPORT_PERIOD`] unless
+    /// stated).
+    #[serde(with = "values::duration")]
+    pub report_period: Duration,
+    /// The bytes, summed over a worker group's ranks, that the copies started with one batch may
+    /// move together beside its forward; a larger copy starts alone ([`DEFAULT_COPY_BUDGET`]
+    /// unless stated).
+    #[serde(with = "values::bytes")]
+    pub copy_budget: u64,
+    /// The threads of a main process's host work: the width of its media pool, each with
+    /// `host_queue_depth` tasks of room, and the threads a conversion of a request's condition
+    /// media shares its work over. Half the CPUs the process may run on (its affinity mask within
+    /// its cgroup's quota) when unset, the other half left to its workers', schedulers' and
+    /// communicators' threads.
+    pub host_threads: Option<NonZeroUsize>,
+    /// The tasks of host work one thread of a main process's media pool has room for: the
+    /// requests a host phase serves at once are the threads times it
+    /// ([`DEFAULT_HOST_QUEUE_DEPTH`] unless stated).
+    pub host_queue_depth: NonZeroUsize,
 }
 
 impl Default for WorkerConfig {
@@ -709,9 +812,32 @@ impl Default for WorkerConfig {
             mesh: None,
             standby: false,
             standby_storage: StandbyStorage::Auto,
+            report_period: DEFAULT_REPORT_PERIOD,
+            copy_budget: DEFAULT_COPY_BUDGET,
+            host_threads: None,
+            host_queue_depth: positive(DEFAULT_HOST_QUEUE_DEPTH),
         }
     }
 }
+
+/// How often the engine's processes and schedulers report, when the deployment states no period
+/// (`worker_config.report_period`): a second, the interval of the daemon's metrics and of the
+/// step times the interference guard compares (`update_config.transfer_slowdown`).
+pub const DEFAULT_REPORT_PERIOD: Duration = Duration::from_secs(1);
+
+/// The bytes a batch's copies may move together, summed over a worker group's ranks, when the
+/// deployment states no budget (`worker_config.copy_budget`): 512 MiB. Host storage fed a GB200
+/// GPU at 209 GB/s in the Transfer Server's interference measurement (`docs/configuration.md`
+/// under `transfer_slowdown`), so the budget is at most 2.6 ms of copying on one device of that
+/// host, an eighth of the measurement's 20.5 ms decode step, in which copies from host storage at
+/// a quarter of the link's bandwidth slowed the steps by 2% and at a sixteenth by none. A host
+/// of another link bandwidth or step time states its own.
+pub const DEFAULT_COPY_BUDGET: u64 = 512 << 20;
+
+/// The tasks one thread of the media pool has room for when the deployment states none
+/// (`worker_config.host_queue_depth`): four, a pipelining depth that keeps tasks queued behind
+/// the one each thread runs, so a thread takes its next task without waiting for a step.
+pub const DEFAULT_HOST_QUEUE_DEPTH: usize = 4;
 
 /// How long a batch may run without its ranks' progress before its worker group is replaced, when
 /// the deployment states no bound (`worker_config.watchdog_timeout`): five minutes, a policy bound
@@ -1312,6 +1438,7 @@ impl EngineConfig {
             expert_parallel,
             exchange: _,
             microbatches,
+            beside_rows,
         } = moe;
         let SpeculativeConfig {
             num_draft_tokens,
@@ -1337,6 +1464,7 @@ impl EngineConfig {
             kv_cache,
             expert_parallel: *expert_parallel,
             microbatches: *microbatches,
+            beside_rows: *beside_rows,
             cuda_graph,
             worker,
             num_draft_tokens: *num_draft_tokens,
@@ -1374,6 +1502,8 @@ pub struct BuildPart<'a> {
     pub kv_cache: &'a KvCacheConfig,
     pub expert_parallel: bool,
     pub microbatches: NonZeroU32,
+    /// The expert union's middle capture class, which the captured graphs are shaped for.
+    pub beside_rows: NonZeroU32,
     pub cuda_graph: &'a CudaGraphConfig,
     pub worker: &'a WorkerConfig,
     pub num_draft_tokens: u32,

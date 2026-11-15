@@ -57,7 +57,8 @@
 //!
 //! A copy the buffer pool's `Copy` queues starts with a later numbered batch that every rank of
 //! the group runs, on the device's copy stream, and the batch's end covers it. The copy budget
-//! bounds the bytes the copies started with one batch move together ([`COPY_BUDGET`]): a batch
+//! bounds the bytes the copies started with one batch move together (`worker_config.copy_budget`,
+//! [`proto::config::DEFAULT_COPY_BUDGET`] unless the deployment states its own): a batch
 //! starts the oldest queued copies, in the order they were queued, while their bytes stay within
 //! the budget, and the first copy that would pass it waits, with every copy behind it, for a
 //! later batch. A copy larger than the budget starts alone, as the only copy of its batch. The
@@ -170,17 +171,6 @@ use crate::profiling::session::{Change, ProfileAnswer, Session};
 use crate::runner::Runner;
 use crate::runner::buckets::Bucket;
 use crate::runner::graphs::Preparation;
-
-/// The copy budget per batch the engine gives its workers: the bytes, summed over a group's
-/// ranks, that the copies started with one batch may move together, 512 MiB.
-///
-/// The copies run on the device's copy stream beside the batch's forward, and the batch ends with
-/// them. Host storage feeds a GB200 GPU at 209 GB/s (the Transfer Server's interference
-/// measurement, `docs/configuration.md` under `transfer_slowdown`), so the budget is at most
-/// 2.6 ms of copying on one device, an eighth of the 20.5 ms decode step of that measurement, in
-/// which copies from host storage at a quarter of the link's bandwidth slowed the steps by 2% and
-/// at a sixteenth by none.
-pub const COPY_BUDGET: u64 = 512 << 20;
 
 /// The copies one batch started: the request of each, in the order they were queued, with
 /// whether it was issued; and the runners, by index, that were handed copies, whose copies the
@@ -451,7 +441,9 @@ impl Worker {
     /// which states its ended sequence to `sequences`.
     ///
     /// `copy_budget` is the bytes, summed over the group's ranks, that the copies started with
-    /// one batch may move together ([`COPY_BUDGET`]). Every worker of a group is given the
+    /// one batch may move together (`worker_config.copy_budget`); the copies run on the device's
+    /// copy stream beside the batch's forward, and the batch ends with them. Every worker of a
+    /// group is given the
     /// same budget and tables given the same unit sizes, or the ranks would start different
     /// copies with one batch and the group's submission would fail.
     ///

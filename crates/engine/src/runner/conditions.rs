@@ -5,22 +5,19 @@
 //! pixels, the patch rows of its vision tower, the padding of a track. The conversions here execute
 //! that statement on the host thread that reads the request's conditions (a thread of the media
 //! host's pool, or the vision runner's image read), sharing a large image's work out over
-//! [`share`]'s scoped threads, so no model holds a thread or a byte format.
+//! [`share`]'s scoped threads, as many as the process's host-thread budget
+//! (`worker_config.host_threads`), so no model holds a thread or a byte format.
+
+use std::num::NonZeroUsize;
 
 use nn::DType;
 use nn::capability::{MediaFormat, PatchFormat, PixelNorm};
 
 use crate::worker::{Error, Result};
 
-/// The threads a host conversion on a request's critical path shares its work over.
-fn workers() -> usize {
-    std::thread::available_parallelism().map_or(1, |count| count.get().min(16))
-}
-
-/// Runs `work` over `items`, a run of them on each of `workers` scoped threads of this call.
-pub(crate) fn share<T: Send>(items: &mut [T], work: impl Fn(&mut T) + Sync) {
-    let workers = workers();
-    let run = items.len().div_ceil(workers.max(1)).max(1);
+/// Runs `work` over `items`, a run of them on each of `threads` scoped threads of this call.
+pub(crate) fn share<T: Send>(threads: NonZeroUsize, items: &mut [T], work: impl Fn(&mut T) + Sync) {
+    let run = items.len().div_ceil(threads.get()).max(1);
     let work = &work;
     std::thread::scope(|scope| {
         for items in items.chunks_mut(run) {
@@ -29,10 +26,10 @@ pub(crate) fn share<T: Send>(items: &mut [T], work: impl Fn(&mut T) + Sync) {
     });
 }
 
-/// How many bands a plane of `area` pixels is cut into so that `frames` frames' bands keep every
-/// worker busy: the band length.
-pub(crate) fn band(area: usize, frames: usize) -> usize {
-    area.div_ceil(workers().div_ceil(frames.max(1))).max(1)
+/// How many bands a plane of `area` pixels is cut into so that `frames` frames' bands keep each of
+/// `threads` threads busy: the band length.
+pub(crate) fn band(threads: NonZeroUsize, area: usize, frames: usize) -> usize {
+    area.div_ceil(threads.get().div_ceil(frames.max(1))).max(1)
 }
 
 /// The refusal of a conversion whose buffers do not hold what it writes.
@@ -43,7 +40,8 @@ fn mismatched(problem: String) -> Error {
 }
 
 /// Writes `[frames, height, width, 3]` RGB bytes into `out` as `[3, frames, height, width]` FP32,
-/// each byte normalized as `(byte / 255 - mean) / std` in FP32.
+/// each byte normalized as `(byte / 255 - mean) / std` in FP32, the work shared over `threads`
+/// threads.
 ///
 /// A byte has 256 values, so the normalization is a table of them, and a frame's pixels are shared
 /// out in bands: a reference image at its encoding size is twenty million elements.
@@ -54,6 +52,7 @@ pub(crate) fn pixels(
     height: u32,
     width: u32,
     out: &mut [f32],
+    threads: NonZeroUsize,
 ) -> Result<()> {
     let area = height as usize * width as usize;
     let frames = frames as usize;
@@ -73,7 +72,7 @@ pub(crate) fn pixels(
         }
     }
     let table = &table;
-    let band = band(area, frames);
+    let band = band(threads, area, frames);
     let mut planes: Vec<_> = out
         .chunks_mut(area)
         .map(|plane| plane.chunks_mut(band))
@@ -91,7 +90,7 @@ pub(crate) fn pixels(
             first += pixels;
         }
     }
-    share(&mut bands, |(first, red, green, blue)| {
+    share(threads, &mut bands, |(first, red, green, blue)| {
         let source = &rgb[*first * channels..(*first + red.len()) * channels];
         for (index, pixel) in source.chunks_exact(channels).enumerate() {
             red[index] = table[0][usize::from(pixel[0])];
@@ -107,13 +106,15 @@ pub(crate) fn pixels(
 ///
 /// The processor's arithmetic, op for op: `(byte - 255 · mean) / (255 · std)` in FP32, rounded once
 /// to the tower's element type; the last frame repeated to a whole temporal patch; rows over each
-/// temporal patch in merge-block order, each one channel-major tubelet.
+/// temporal patch in merge-block order, each one channel-major tubelet. The work is shared over
+/// `threads` threads.
 pub(crate) fn patches(
     format: &PatchFormat,
     planes: &[u8],
     frames: u32,
     grid: [u32; 3],
     out: &mut [u8],
+    threads: NonZeroUsize,
 ) -> Result<()> {
     let [time, rows, columns] = grid;
     let (patch, merge, temporal) = (format.side, format.merge, format.temporal);
@@ -160,7 +161,7 @@ pub(crate) fn patches(
     let block_columns = columns as usize / merge;
     let band = count / (time as usize * block_rows) * width_bytes;
     let mut bands: Vec<(usize, &mut [u8])> = out.chunks_mut(band).enumerate().collect();
-    share(&mut bands, |(index, out)| {
+    share(threads, &mut bands, |(index, out)| {
         let (step, block_row) = (*index / block_rows, *index % block_rows);
         let mut at = 0_usize;
         for block_column in 0..block_columns {
@@ -196,7 +197,8 @@ pub(crate) fn patches(
 /// One vision block's frames, `[frames, height, width, 3]` RGB at `raster`, as its patch rows.
 ///
 /// The tower reads a grid's own pixels, so each frame is resized to the raster the processor sized
-/// the grid from ([`PatchFormat::raster`]) first and packed second.
+/// the grid from ([`PatchFormat::raster`]) first and packed second, the work shared over
+/// `threads` threads.
 pub(crate) fn pack_block(
     format: &PatchFormat,
     rgb: &[u8],
@@ -204,10 +206,16 @@ pub(crate) fn pack_block(
     raster: (u32, u32),
     grid: [u32; 3],
     out: &mut [u8],
+    threads: NonZeroUsize,
 ) -> Result<()> {
     let (height, width) = raster;
     let (rows, columns) = format.raster(grid);
-    let planes = planes_of(rgb, frames as usize, height as usize, width as usize);
+    let planes = planes_of(
+        rgb,
+        frames as usize,
+        (height as usize, width as usize),
+        threads,
+    );
     let planes = if (rows, columns) == (height, width) {
         planes
     } else {
@@ -220,17 +228,23 @@ pub(crate) fn pack_block(
         }
         resized
     };
-    patches(format, &planes, frames, grid, out)
+    patches(format, &planes, frames, grid, out, threads)
 }
 
-/// `[frames, height, width, 3]` interleaved RGB as `[frames, 3, height, width]` planes.
-fn planes_of(rgb: &[u8], frames: usize, height: usize, width: usize) -> Vec<u8> {
+/// `[frames, height, width, 3]` interleaved RGB as `[frames, 3, height, width]` planes, the work
+/// shared over `threads` threads.
+fn planes_of(
+    rgb: &[u8],
+    frames: usize,
+    (height, width): (usize, usize),
+    threads: NonZeroUsize,
+) -> Vec<u8> {
     let area = height * width;
     let mut planes = vec![0_u8; frames * 3 * area];
 
     // A reference image at its encoding size is seven million pixels on a request's critical path,
     // so a frame's pixels are shared out in bands of its three planes.
-    let band = band(area, frames);
+    let band = band(threads, area, frames);
     let mut bands = Vec::new();
     for (frame, block) in planes.chunks_mut((3 * area).max(1)).enumerate() {
         let (red, rest) = block.split_at_mut(area);
@@ -246,7 +260,7 @@ fn planes_of(rgb: &[u8], frames: usize, height: usize, width: usize) -> Vec<u8> 
             first += pixels;
         }
     }
-    share(&mut bands, |(first, red, green, blue)| {
+    share(threads, &mut bands, |(first, red, green, blue)| {
         let pixels = &rgb[*first * 3..(*first + red.len()) * 3];
         for (index, pixel) in pixels.as_chunks::<3>().0.iter().enumerate() {
             red[index] = pixel[0];
@@ -303,6 +317,9 @@ mod tests {
     use super::*;
     use half::bf16;
 
+    /// The threads a test's conversion shares its work over: more than one, so the shares meet.
+    const THREADS: NonZeroUsize = NonZeroUsize::new(2).unwrap();
+
     /// The format of a tower of `patch`-pixel patches, two-frame tubelets and `2 x 2` merges, its
     /// pixels and patches normalized about one half.
     fn format(patch: u32) -> MediaFormat {
@@ -336,7 +353,7 @@ mod tests {
         // Two frames of one row of two pixels.
         let rgb = [1_u8, 2, 3, 4, 5, 6, 11, 12, 13, 14, 15, 16];
         assert_eq!(
-            planes_of(&rgb, 2, 1, 2),
+            planes_of(&rgb, 2, (1, 2), THREADS),
             [1, 4, 2, 5, 3, 6, 11, 14, 12, 15, 13, 16]
         );
     }
@@ -361,7 +378,7 @@ mod tests {
         let row = format.width() as usize;
         assert_eq!(row, 3 * 2);
         let mut out = vec![0_u8; rows * row * 2];
-        patches(&format, &planes, 1, [1, 2, 4], &mut out)
+        patches(&format, &planes, 1, [1, 2, 4], &mut out, THREADS)
             .expect("one frame fills one temporal patch");
         let pixel = |byte: u8| (f32::from(byte) - 127.5) / 127.5;
         let rounded = |value: f32| bf16::from_f32(value).to_f32();
@@ -406,7 +423,7 @@ mod tests {
         let row = format.width() as usize;
         let rows = 2 * 2 * 2;
         let mut out = vec![0_u8; rows * row * 2];
-        patches(&format, &planes, 3, [2, 2, 2], &mut out)
+        patches(&format, &planes, 3, [2, 2, 2], &mut out, THREADS)
             .expect("three frames fill two temporal patches");
         let pixel = |byte: u8| bf16::from_f32((f32::from(byte) - 127.5) / 127.5).to_f32();
         // Inside a channel the tubelet holds its frames in order, four pixels each.
@@ -429,7 +446,7 @@ mod tests {
         let planes: Vec<u8> = (0..3 * 4).map(|value| (10 * value) as u8).collect();
         let row = format.width() as usize;
         let mut out = vec![0_u8; 4 * row * 4];
-        patches(&format, &planes, 1, [1, 2, 2], &mut out).expect("FP32 rows");
+        patches(&format, &planes, 1, [1, 2, 2], &mut out, THREADS).expect("FP32 rows");
         let value = |index: usize| {
             f32::from_le_bytes([
                 out[4 * index],
@@ -443,7 +460,7 @@ mod tests {
         assert_eq!(value(2), (40.0 - 127.5) / 127.5);
         // A buffer of BF16 width is two bytes per element short.
         let mut short = vec![0_u8; 4 * row * 2];
-        assert!(patches(&format, &planes, 1, [1, 2, 2], &mut short).is_err());
+        assert!(patches(&format, &planes, 1, [1, 2, 2], &mut short, THREADS).is_err());
     }
 
     /// A condition's pixels are planar and normalised as the encoder reads them, and the track is
@@ -453,7 +470,7 @@ mod tests {
         let format = format(16);
         let rgb = [255_u8, 0, 128, 0, 255, 128];
         let mut out = [0.0_f32; 6];
-        pixels(&format.pixels, &rgb, 1, 1, 2, &mut out).expect("one frame of two pixels");
+        pixels(&format.pixels, &rgb, 1, 1, 2, &mut out, THREADS).expect("one frame of two pixels");
         let normalized = |byte: u8| (f32::from(byte) / 255.0 - 0.5) / 0.5;
         assert_eq!(
             out,

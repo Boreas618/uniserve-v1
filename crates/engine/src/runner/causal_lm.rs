@@ -823,7 +823,7 @@ impl CausalLmRunner {
             ));
         }
 
-        self.buckets = experts::classes(&self.config.buckets, member.capacity());
+        self.buckets = experts::classes(&self.config.buckets, member.capacity(), member.beside());
         self.graphs
             .set_exchange(member.transport(), Some(member.meet()));
         self.union = Some(member);

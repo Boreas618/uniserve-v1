@@ -44,11 +44,6 @@ use storage::runtime::{self, Cause, Completion, GroupId, OwnerId};
 use super::update::migratable;
 use super::{Request, RequestStatus, Scheduler, WorkerGroup};
 
-/// Denoising steps one request keeps in flight: the step its denoiser runs and the next, queued
-/// behind it, so that the denoiser never waits for the host between steps and a preemption meets
-/// the request at a step boundary within that many steps.
-const DENOISING_LOOKAHEAD: u32 = 2;
-
 /// The media phases of a video request, in the order a request offers the ones that are ready:
 /// the first is its next phase, which the policy reads. After denoising, completed decodes are
 /// encoded before further decodes are asked for (`S/execution/media.rs:380-410`).
@@ -132,7 +127,10 @@ impl Request {
     ///   and nothing later is offered before them;
     /// - the latent preparation waits until the text encoding is handed over (at once when the
     ///   admission found the conditioning), and a denoising step until the preparation is, with
-    ///   at most [`DENOISING_LOOKAHEAD`] steps in flight;
+    ///   at most the denoising group's call window of steps in flight (`Capacity::call_window`:
+    ///   the step its denoiser runs and those its queue depth holds behind it, so that the
+    ///   denoiser never waits for the host between steps and a preemption meets the request at a
+    ///   step boundary within that many steps);
     /// - the decoders wait until every denoising step is handed over, and a video decode round
     ///   until the round before it completed: its first unit splices onto the tail of that
     ///   round's last unit;
@@ -183,7 +181,11 @@ impl Request {
             Phase::MediaRead | Phase::TextEncode => true,
             Phase::LatentPrepare => handed(Phase::TextEncode),
             Phase::Denoise => {
-                handed(Phase::LatentPrepare) && in_flight(Phase::Denoise) < DENOISING_LOOKAHEAD
+                let window = |group: &WorkerGroup| group.capacity.call_window.max(1);
+                handed(Phase::LatentPrepare)
+                    && self
+                        .serving(phase, groups)
+                        .is_some_and(|group| in_flight(Phase::Denoise) < window(group))
             }
             Phase::VideoDecode => handed(Phase::Denoise) && in_flight(Phase::VideoDecode) == 0,
             Phase::AudioDecode => handed(Phase::Denoise),
@@ -1361,6 +1363,7 @@ mod tests {
             terminal: None,
             event_credit: 64,
             event_window: 64,
+            draft_limit: 0,
             last_progress: now,
             dirty: false,
         }

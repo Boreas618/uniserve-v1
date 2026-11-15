@@ -798,6 +798,7 @@ impl ModelRunner {
             format: model
                 .format()
                 .context("the media host lays condition media out in the model's format")?,
+            threads: self.host_threads()?,
         })
     }
 

@@ -137,8 +137,8 @@ pub(crate) struct Deployment {
     /// `None`: two per request slot, which no load of a case runs short of.
     state_units: Option<u32>,
     /// The decoded tokens between two checkpoints of a request's recurrent state
-    /// (`KvCacheConfig::state_interval`); `None`: the deployment's default.
-    state_interval: Option<NonZeroU32>,
+    /// (`KvCacheConfig::state_interval`).
+    state_interval: NonZeroU32,
     /// The units of the host latent pool, which holds stored trajectories.
     latent_units: u32,
     /// The request slots of each group.
@@ -183,7 +183,7 @@ impl Deployment {
             kv_units: 256,
             host_units: 0,
             state_units: None,
-            state_interval: None,
+            state_interval: proto::config::DEFAULT_STATE_INTERVAL,
             latent_units: 1 << 12,
             slots: 8,
             rows: 8,
@@ -338,8 +338,8 @@ impl Deployment {
     }
 
     /// The decoded tokens between two checkpoints of a request's recurrent state.
-    pub(crate) fn state_interval(mut self, tokens: u32) -> Self {
-        self.state_interval = NonZeroU32::new(tokens);
+    pub(crate) fn state_interval(mut self, tokens: NonZeroU32) -> Self {
+        self.state_interval = tokens;
         self
     }
 

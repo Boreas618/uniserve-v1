@@ -327,6 +327,7 @@ impl MainProcess {
         // kernels the first generation serves are those its start selected, added once it ends
         // (`started`).
         let serving = Packages::from([(policy_slot(), launch.modules.policy.clone())]);
+        let report_period = launch.engine_config.worker.report_period;
         Ok(Self {
             inbox,
             fronts: vec![Some(front)],
@@ -351,7 +352,7 @@ impl MainProcess {
             operations,
             metrics: wire::Metrics::default(),
             lifetime: Vec::new(),
-            next_metrics: Instant::now() + reports::METRICS_EVERY,
+            next_metrics: Instant::now() + report_period,
             announced: None,
             ending: None,
         })
