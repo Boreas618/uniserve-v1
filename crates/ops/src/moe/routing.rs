@@ -21,6 +21,12 @@
 //! FP32 accumulation and output; the expert ids are exact — the descending-then-ascending order is
 //! part of the operator's rule, not an implementation detail, so two correct implementations name the same
 //! experts in the same slots.
+//!
+//! The widest router a kernel serves is its package's: the expert counts and top-k widths its
+//! manifest's descriptor ranges admit. A descriptor outside them is no key the package covers, so
+//! the Build Server refuses it when the deployment's modules are prepared, naming the key. One
+//! warp routes one token, so a block routes as many tokens as the module's metadata states warps,
+//! which is the grid this module computes.
 
 use std::fmt;
 
@@ -36,24 +42,6 @@ use crate::tolerance::{self, Tolerance};
 use crate::{Error, Op, Result, Twins};
 
 use super::row_stride;
-
-/// The warps one thread block of `topk_softmax` holds.
-///
-/// One warp routes one token, so a block covers [`TOKENS_PER_BLOCK`] tokens; the package compiles the
-/// kernel with exactly this many warps and the launch checks it.
-pub const WARPS_PER_BLOCK: u64 = 4;
-
-/// The tokens one `topk_softmax` thread block routes.
-pub const TOKENS_PER_BLOCK: u64 = WARPS_PER_BLOCK;
-
-/// The largest expert count a router of this build selects over: the widest block a served
-/// checkpoint routes over. The kernel holds `ceil(experts / 32)` scores per lane, compiled in, up
-/// to 1024 experts.
-pub const MAX_EXPERTS: u32 = 512;
-
-/// The largest top-k a router of this build keeps: the widest served block's (10). The kernel's
-/// renormalizing sum is over a zero-padded warp and holds up to 32.
-pub const MAX_TOP: u32 = 10;
 
 /// One compilation of `topk_softmax`.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
@@ -137,19 +125,19 @@ impl Op for TopkSoftmax {
                 ),
             });
         }
-        if descriptor.experts == 0 || descriptor.experts > MAX_EXPERTS {
+        if descriptor.experts == 0 {
+            return Err(Error::Unsupported {
+                operation: Self::NAME,
+                reason: "a router selects over at least one expert".to_owned(),
+            });
+        }
+        if descriptor.top == 0 || u64::from(descriptor.top) > experts {
             return Err(Error::Unsupported {
                 operation: Self::NAME,
                 reason: format!(
-                    "{} experts are outside 1..={MAX_EXPERTS}",
-                    descriptor.experts
+                    "top {} is outside 1..={} experts",
+                    descriptor.top, descriptor.experts
                 ),
-            });
-        }
-        if descriptor.top == 0 || descriptor.top > MAX_TOP || u64::from(descriptor.top) > experts {
-            return Err(Error::Unsupported {
-                operation: Self::NAME,
-                reason: format!("top {} is outside 1..={MAX_TOP}", descriptor.top),
             });
         }
 
@@ -230,8 +218,14 @@ impl Op for TopkSoftmax {
             _ => (None, -1),
         };
 
-        cubin_metadata(kernel, Self::NAME, WARPS_PER_BLOCK)?;
-        let grid = LaunchGrid::covering(tokens, TOKENS_PER_BLOCK)?;
+        // One warp routes one token, so a block routes as many tokens as it holds warps.
+        let metadata = kernel.metadata().ok_or_else(|| Error::KernelForm {
+            operator: Self::NAME,
+            kernel: kernel.name().to_owned(),
+            expected: "cubin",
+            actual: "native",
+        })?;
+        let grid = LaunchGrid::covering(tokens, u64::from(metadata.num_warps))?;
         let mut arguments = Arguments::new();
         arguments
             .view(&args.scores)
@@ -280,31 +274,6 @@ impl Op for TopkSoftmax {
             (f64::from(rounding.rtol) + 4.0 * tolerance::unit_roundoff(accumulate)) as f32,
         )
     }
-}
-
-/// The launch metadata of a cubin kernel of `operator`, checking that its block holds `warps` warps.
-///
-/// An operator whose grid counts tokens per block depends on the package compiling the block it
-/// expects; a module with another block width would route a different number of tokens per block,
-/// so it fails here instead of launching.
-fn cubin_metadata<'k>(
-    kernel: &'k Kernel,
-    operator: &'static str,
-    warps: u64,
-) -> Result<&'k crate::kernel::CubinMetadata> {
-    let metadata = kernel.metadata().ok_or_else(|| Error::KernelForm {
-        operator,
-        kernel: kernel.name().to_owned(),
-        expected: "cubin",
-        actual: "native",
-    })?;
-    if u64::from(metadata.num_warps) != warps {
-        return Err(Error::Metadata(format!(
-            "{operator} launches blocks of {warps} warps and the module declares {}",
-            metadata.num_warps
-        )));
-    }
-    Ok(metadata)
 }
 
 fn to_i64(operator: &'static str, value: u64) -> Result<i64> {

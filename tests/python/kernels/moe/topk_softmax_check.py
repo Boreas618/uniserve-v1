@@ -4,10 +4,10 @@
     python topk_softmax_check.py --module <store>/modules/topk_softmax/nvcc/1/sm_100a/<descriptor>
     python topk_softmax_check.py --module <module> --launch     # and launch it on a device
 
-It checks the module against its own build, without a device: the constants in `baked.json` are
-the ones this run states and the ones the kernel derives from them (the iterations a lane walks
-are `ceil(experts / 32)` and the renormalizing butterfly is the top-k rounded up to a power of
-two), and the twelve words in `metadata.json`'s signature are the operator's, in order and by kind
+It checks the module against its own build, without a device: the compile constants
+`metadata.json` records (`definitions`: the expert count and the top-k the kernel derives its
+iterations and its butterfly from) are the ones this run states, and the twelve words in
+`metadata.json`'s signature are the operator's, in order and by kind
 — the fourth pointer is the scale, and a `scale_none` module still declares it as one, and the
 last is the expert map, which the operator passes null without one. A module built for another
 descriptor is refused here, which is the observable form of the kernel's `__trap()`.
@@ -25,7 +25,7 @@ The fixed input states both cases: one row whose second and third picks are exac
 ever read. The run prints the routing it pins for that input.
 
 **With `--launch`** the module's cubin is loaded through the CUDA driver and launched on the fixed
-input the way the operator launches it (one token per warp of a four-warp block, the parameters in
+input the way the operator launches it (one token per warp of the module's block, the parameters in
 `SIGNATURE`'s order), twice: once plain, comparing the ids exactly and the weights within the
 operator's tolerance, and once with the logical-to-physical map reversed and the last row turned
 into a padding row of NaN scores, as a captured bucket's rows past the batch hold. The mapped run's
@@ -69,9 +69,6 @@ UNIT_ROUNDOFF = 2.0**-24
 
 #: The storage kinds the kernel reads, as its `score_kind` and `scale_kind` take them.
 KINDS = {"f32": 0, "bf16": 1, "f16": 2, "none": -1}
-
-#: The warps one block holds, which the operator's grid counts tokens by.
-WARPS_PER_BLOCK = 4
 
 
 def derive(module):
@@ -152,33 +149,27 @@ def fixed_case(experts, top, rows, row_stride, renormalize=True):
 def check_module(module, experts, top, dtype, row_stride):
     """Refuse a module built for another descriptor, and check its published words."""
     problems = []
-    baked_path = module / "baked.json"
-    if not baked_path.exists():
-        problems.append(
-            f"{module} holds no baked.json, so its build constants are unobservable"
-        )
-    else:
-        baked = json.loads(baked_path.read_text())
-        expected = {
-            "experts": experts,
-            "top": top,
-            "iterations": -(-experts // 32),
-            "butterfly": 1 << (top - 1).bit_length(),
-        }
-        for key, value in expected.items():
-            if baked.get(key) != value:
-                problems.append(
-                    f"baked.json says {key} = {baked.get(key)}, this run needs {value}"
-                )
-        print(
-            f"baked: experts {baked.get('experts')}, top {baked.get('top')}, "
-            f"iterations {baked.get('iterations')}, butterfly {baked.get('butterfly')}"
-        )
-
     metadata_path = module / "metadata.json"
     metadata = (
         json.loads(metadata_path.read_text()) if metadata_path.exists() else {}
     )
+    definitions = metadata.get("definitions")
+    if not definitions:
+        problems.append(
+            f"{module} records no definitions, so its build constants are unobservable"
+        )
+    else:
+        expected = {"UNISERVE_EXPERTS": experts, "UNISERVE_TOP": top}
+        for key, value in expected.items():
+            if definitions.get(key) != value:
+                problems.append(
+                    f"the module was built with {key} = {definitions.get(key)}, "
+                    f"this run needs {value}"
+                )
+        print(
+            f"built with: experts {definitions.get('UNISERVE_EXPERTS')}, "
+            f"top {definitions.get('UNISERVE_TOP')}"
+        )
     signature = metadata.get("signature")
     if not signature:
         problems.append(
@@ -298,7 +289,7 @@ def launch(module, scores, experts, top, renormalize, dtype, mapping=None):
         checked(
             driver.cuLaunchKernel(
                 function,
-                -(-rows // WARPS_PER_BLOCK),
+                -(-rows // metadata["num_warps"]),
                 1,
                 1,
                 metadata["num_warps"] * 32,

@@ -21,12 +21,14 @@
 //
 // Launches synchronize nothing, so CUDA graphs capture them.
 //
-// The module is a cubin: the descriptor bakes the scores' per-lane iteration
-// count (`UNISERVE_ITERATIONS`, the expert count rounded up to 32) and the
-// butterfly width (`UNISERVE_TOP`, the top-k width rounded up to a power of
-// two), so the kernel reads its arguments in the operator's packed order and
-// nothing else. Four warps route four tokens, which is the grid the operator
-// computes.
+// The module is a cubin: the package's manifest defines the descriptor's
+// expert count (`UNISERVE_EXPERTS`) and top-k width (`UNISERVE_TOP`), from which
+// the kernel derives the scores' per-lane iteration count (the expert count in
+// whole warps) and the butterfly width (the top-k width rounded up to a power of
+// two), and the warps of a block (`UNISERVE_WARPS`), so the kernel reads its
+// arguments in the operator's packed order and nothing else. A block of
+// `UNISERVE_WARPS` warps routes as many tokens, which is the grid the operator
+// computes from the module's metadata.
 
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
@@ -36,31 +38,26 @@
 #include <climits>
 #include <cstdint>
 
-#ifndef UNISERVE_ITERATIONS
-#define UNISERVE_ITERATIONS 4
-#endif
-
-#ifndef UNISERVE_TOP
-#define UNISERVE_TOP 8
-#endif
-
-// The descriptor's own expert count and top-k, for the guard below. A build
-// that does not define them keeps the kernel's defaults and guards nothing,
-// which is what a hand-written nvcc invocation gets.
-#ifndef UNISERVE_EXPERTS
-#define UNISERVE_EXPERTS 0
-#endif
-
-#ifndef UNISERVE_MAX_TOP
-#define UNISERVE_MAX_TOP 0
+#if !defined(UNISERVE_EXPERTS) || !defined(UNISERVE_TOP) || !defined(UNISERVE_WARPS)
+#error "the package's manifest defines UNISERVE_EXPERTS, UNISERVE_TOP and UNISERVE_WARPS"
 #endif
 
 namespace {
 
 constexpr int kWarp = 32;
-constexpr int kWarpsPerBlock = 4;
-constexpr int kIterations = UNISERVE_ITERATIONS;
-constexpr int kTop = UNISERVE_TOP;
+constexpr int kWarpsPerBlock = UNISERVE_WARPS;
+
+/// The smallest power of two at or above `top`: the width of the butterfly
+/// that sums `top` picks.
+constexpr int butterfly(int top) {
+  int width = 1;
+  while (width < top) width *= 2;
+  return width;
+}
+
+/// The scores a lane walks: the expert count in whole warps.
+constexpr int kIterations = (UNISERVE_EXPERTS + kWarp - 1) / kWarp;
+constexpr int kTop = butterfly(UNISERVE_TOP);
 
 // Storage kinds of the scores and of the per-expert scale.
 constexpr int kAbsent = -1;
@@ -86,13 +83,12 @@ extern "C" __global__ void uniserve_topk_softmax(const void* scores, int score_k
                                                  int scale_kind, int32_t* ids, float* weights,
                                                  const int32_t* map) {
   // `experts` and `top` arrive as launch arguments while the iteration count and
-  // the butterfly width are baked into this cubin. A call arriving with a
+  // the butterfly width are compiled into this cubin. A call arriving with a
   // different expert count would reduce over part of the row and write
   // valid-looking ids; a wider top-k would read past the pick arrays. A cubin
   // has no error channel, so a mismatch traps and fails the launch loudly
-  // rather than routing wrongly for the rest of the process's life. Builds that
-  // define neither constant (a hand-written nvcc line) keep the old behaviour.
-  if (UNISERVE_EXPERTS != 0 && (experts != UNISERVE_EXPERTS || top > UNISERVE_MAX_TOP)) {
+  // rather than routing wrongly for the rest of the process's life.
+  if (experts != UNISERVE_EXPERTS || top > UNISERVE_TOP) {
     __trap();
   }
 

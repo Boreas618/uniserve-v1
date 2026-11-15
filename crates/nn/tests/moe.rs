@@ -136,8 +136,6 @@ fn topk_softmax_keeps_the_most_probable_experts_and_renormalizes_them() {
 #[test]
 fn topk_softmax_routes_ten_of_five_hundred_and_twelve_experts() {
     let (tokens, experts, top) = (3, 512, 10);
-    assert!(ops::moe::routing::MAX_EXPERTS >= experts as u32);
-    assert!(ops::moe::routing::MAX_TOP >= top as u32);
 
     let scores = sequence(tokens * experts, 77);
     let (expected_ids, expected_weights) = route_by_hand(&scores, experts, top);

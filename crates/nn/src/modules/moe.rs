@@ -49,7 +49,6 @@
 
 use std::ops::Range;
 
-use ops::moe::routing::{MAX_EXPERTS, MAX_TOP};
 use tensor::{DType, Device, Shape, Tensor};
 
 use crate::capability::ExpertExchange;
@@ -213,14 +212,9 @@ impl MoE {
             (config.split, exchange, "expert")
         };
 
-        if top == 0 || top > MAX_TOP || top > experts {
+        if experts == 0 || top == 0 || top > experts {
             return Err(refuse(format!(
-                "a top of {top} is outside the routers' 1..={MAX_TOP} of {experts} experts"
-            )));
-        }
-        if experts == 0 || experts > MAX_EXPERTS {
-            return Err(refuse(format!(
-                "{experts} experts are outside a router's 1..={MAX_EXPERTS}"
+                "a top of {top} is outside 1..={experts} experts"
             )));
         }
 
