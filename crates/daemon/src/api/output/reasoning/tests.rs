@@ -2,36 +2,10 @@
 
 use std::sync::Arc;
 
-use tokenizers::models::bpe::BPE;
-use tokenizers::{AddedToken, Tokenizer as TokenizerBuilder};
-
+use crate::api::test_support::configured_tokenizer as reasoning_tokenizer;
 use crate::api::tokenizer::DynTokenizer;
 
 use super::DelimitedReasoningParser;
-
-/// Builds a tokenizer whose only special tokens are the reasoning delimiters
-/// and `<|im_end|>`, which stands in for a chat-turn boundary.
-fn reasoning_tokenizer() -> DynTokenizer {
-    let model = BPE::builder()
-        .vocab_and_merges(
-            [
-                ("<unk>".to_string(), 0),
-                ("a".to_string(), 1),
-                ("b".to_string(), 2),
-            ],
-            Vec::new(),
-        )
-        .unk_token("<unk>".to_string())
-        .build()
-        .expect("build tokenizer model");
-    let mut tokenizer = TokenizerBuilder::new(model);
-    tokenizer.add_special_tokens(&[
-        AddedToken::from("<think>", true),
-        AddedToken::from("</think>", true),
-        AddedToken::from("<|im_end|>", true),
-    ]);
-    Arc::new(crate::api::test_support::load_tokenizer(&tokenizer))
-}
 
 /// The parser of `<think>` reasoning, which waits for an explicit start
 /// delimiter when the prompt states no reasoning boundary.
@@ -74,7 +48,7 @@ fn delimited_parser_flushes_partial_end_marker() {
 }
 
 #[test]
-fn qwen3_without_prompt_boundary_waits_for_reasoning_start() {
+fn without_a_prompt_boundary_reasoning_waits_for_its_start() {
     let tokenizer = reasoning_tokenizer();
     let mut parser = think_parser(tokenizer);
 
@@ -84,7 +58,7 @@ fn qwen3_without_prompt_boundary_waits_for_reasoning_start() {
 }
 
 #[test]
-fn qwen3_prompt_boundaries_select_the_initial_output_region() {
+fn prompt_boundaries_select_the_initial_output_region() {
     let tokenizer = reasoning_tokenizer();
     let start = token_id(&tokenizer, "<think>");
     let end = token_id(&tokenizer, "</think>");
@@ -103,7 +77,7 @@ fn qwen3_prompt_boundaries_select_the_initial_output_region() {
 /// The backward prompt scan stops at `<|im_end|>` before reaching the earlier
 /// `<think>`, so the parser keeps its default content region.
 #[test]
-fn qwen3_prompt_scan_stops_at_the_last_special_token() {
+fn the_prompt_scan_stops_at_the_last_special_token() {
     let tokenizer = reasoning_tokenizer();
     let start = token_id(&tokenizer, "<think>");
     let prompt_end = token_id(&tokenizer, "<|im_end|>");

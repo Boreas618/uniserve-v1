@@ -1,38 +1,17 @@
 //! Reasoning and tool-call parsing of a chat request's output across stream boundaries, in each
 //! tool-call format.
 
-use std::sync::Arc;
-
 use crate::api::output::chat::AssistantEvent;
 use crate::api::output::chat::{AssistantBlockKind, ChatParser};
-use crate::api::tokenizer::{DynTokenizer, HuggingFaceTokenizer};
+use crate::api::test_support::configured_tokenizer;
+use crate::api::tokenizer::DynTokenizer;
 use proto::handoff;
-use tokenizers::models::bpe::BPE;
-use tokenizers::{AddedToken, Tokenizer as TokenizerBuilder};
 
 type TestResult = Result<(), Box<dyn std::error::Error + Send + Sync>>;
 
-/// Builds a tokenizer whose only special tokens are the reasoning delimiters
-/// that the `<think>` reasoning parser requires and the `<|im_end|>` turn
-/// delimiter.
-fn qwen_tokenizer() -> Result<DynTokenizer, Box<dyn std::error::Error + Send + Sync>> {
-    let model = BPE::builder()
-        .vocab_and_merges([("<unk>".to_string(), 0), ("a".to_string(), 1)], Vec::new())
-        .unk_token("<unk>".to_string())
-        .build()?;
-    let mut tokenizer = TokenizerBuilder::new(model);
-    tokenizer.add_special_tokens(&[
-        AddedToken::from("<think>", true),
-        AddedToken::from("</think>", true),
-        AddedToken::from("<|im_end|>", true),
-    ]);
-    let definition = serde_json::from_str(&tokenizer.to_string(false)?)?;
-    Ok(Arc::new(HuggingFaceTokenizer::from_json(definition)?))
-}
-
 /// The parsers of a request whose family writes JSON tool calls: `<think>`
 /// reasoning when `reasoning` is set, tool calls when `tools` is.
-fn qwen3(
+fn json_parsers(
     tools: bool,
     tokenizer: DynTokenizer,
     reasoning: bool,
@@ -120,13 +99,13 @@ fn lookup(q: &str) -> OrderedOutput {
 /// calls separates into reasoning, visible text with the tool-call markup
 /// removed, and one call per `<tool_call>` block in order.
 #[test]
-fn qwen3_processor_emits_reasoning_text_and_tool_calls() -> TestResult {
-    let tokenizer = qwen_tokenizer()?;
+fn reasoning_text_and_json_calls_separate_in_order() -> TestResult {
+    let tokenizer = configured_tokenizer();
     let prompt_end = tokenizer
         .token_to_id("<|im_end|>")
         .ok_or_else(|| std::io::Error::other("configured prompt-end token is unavailable"))?;
     // The final argument enables reasoning parsing.
-    let processor = qwen3(true, tokenizer, true)?;
+    let processor = json_parsers(true, tokenizer, true)?;
 
     // The prompt ends with `<|im_end|>` and has no reasoning delimiter after
     // it, so generation starts outside a reasoning section and the `<think>`
@@ -165,8 +144,8 @@ fn qwen3_processor_emits_reasoning_text_and_tool_calls() -> TestResult {
 /// call boundaries, both when the delta starts outside a call and when it
 /// starts inside a call's arguments.
 #[test]
-fn qwen3_processor_keeps_text_and_tool_call_order_within_a_delta() -> TestResult {
-    let processor = qwen3(true, qwen_tokenizer()?, false)?;
+fn text_and_json_calls_keep_their_order_within_a_delta() -> TestResult {
+    let processor = json_parsers(true, configured_tokenizer(), false)?;
 
     // The first delta starts outside any call and ends inside the second
     // call's arguments; the second delta starts inside those arguments.
@@ -212,7 +191,7 @@ fn qwen3_processor_keeps_text_and_tool_call_order_within_a_delta() -> TestResult
 /// instead of reaching the client as text.
 #[test]
 fn a_malformed_tool_call_fails_the_output() -> TestResult {
-    let processor = qwen3(true, qwen_tokenizer()?, false)?;
+    let processor = json_parsers(true, configured_tokenizer(), false)?;
 
     let failed = parse(
         processor,
@@ -239,7 +218,7 @@ fn a_malformed_tool_call_fails_the_output() -> TestResult {
 /// delimiters arrive in separate deltas.
 #[test]
 fn disabled_reasoning_parsing_streams_delimiters_as_content() -> TestResult {
-    let processor = qwen3(false, qwen_tokenizer()?, false)?;
+    let processor = json_parsers(false, configured_tokenizer(), false)?;
 
     let events = parse(processor, &[], &["<think>", "hi</think>after"])?;
 
@@ -267,7 +246,7 @@ fn function_and_parameter_tags_become_typed_tool_calls() -> TestResult {
         }])
         .to_string(),
     };
-    let processor = ChatParser::new(&parser, qwen_tokenizer()?)?;
+    let processor = ChatParser::new(&parser, configured_tokenizer())?;
 
     // The deltas cut the reasoning delimiter, a tag and a value.
     let events = parse(
