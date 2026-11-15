@@ -16,27 +16,7 @@
 
 #include "entry.h"
 
-#include <cstdio>
-#include <mutex>
-
-namespace {
-
-// The exported module holds the kernel's cubin and its host launcher.
-flash_attn_dense_Kernel_Module_t& module() {
-  static flash_attn_dense_Kernel_Module_t handle{};
-  static std::once_flag loaded;
-  std::call_once(loaded, [] { flash_attn_dense_Kernel_Module_Load(&handle); });
-  return handle;
-}
-
-// The message an entry writes before it returns a nonzero status.
-int32_t refuse(const uniserve_dense_attention_call* call, const char* message) {
-  std::snprintf(const_cast<uniserve_dense_attention_call*>(call)->error, sizeof(call->error), "%s",
-                message);
-  return 1;
-}
-
-}  // namespace
+#include <uniserve_cute_dsl.h>
 
 extern "C" int32_t uniserve_dense_attention(const uniserve_dense_attention_call* call,
                                             void* stream) {
@@ -44,34 +24,35 @@ extern "C" int32_t uniserve_dense_attention(const uniserve_dense_attention_call*
     return 1;
   }
   if (call->dtype_query != call->dtype_key_value || call->dtype_query != call->dtype_output) {
-    return refuse(call, "the fa4 module serves one element type for query, key, value and output");
+    return cute_dsl_refuse(
+        call, "the fa4 module serves one element type for query, key, value and output");
   }
   if (call->dtype_query != UNISERVE_DTYPE_BF16 && call->dtype_query != UNISERVE_DTYPE_F16) {
-    return refuse(call, "the fa4 module serves bf16 and f16");
+    return cute_dsl_refuse(call, "the fa4 module serves bf16 and f16");
   }
   if (call->query == nullptr || call->key == nullptr || call->value == nullptr ||
       call->out == nullptr) {
-    return refuse(call, "dense_attention needs query, key, value and out");
+    return cute_dsl_refuse(call, "dense_attention needs query, key, value and out");
   }
   if (call->cu_seq_lens_q == nullptr || call->cu_seq_lens_k == nullptr) {
-    return refuse(call,
+    return cute_dsl_refuse(call,
                   "the fa4 module reads the sequences' offsets; a launch without them is a "
                   "compilation this package does not carry");
   }
   if (call->window_left >= 0) {
-    return refuse(call, "the fa4 module is compiled without an attention window");
+    return cute_dsl_refuse(call, "the fa4 module is compiled without an attention window");
   }
   if (!(call->scale > 0.0)) {
-    return refuse(call, "dense_attention needs a positive softmax scale");
+    return cute_dsl_refuse(call, "dense_attention needs a positive softmax scale");
   }
   if (call->batch <= 0 || call->q_tokens <= 0 || call->kv_tokens <= 0) {
-    return refuse(call, "dense_attention needs a positive batch and token count");
+    return cute_dsl_refuse(call, "dense_attention needs a positive batch and token count");
   }
   if (call->q_heads % call->kv_heads != 0) {
-    return refuse(call, "dense_attention needs q_heads to be a multiple of kv_heads");
+    return cute_dsl_refuse(call, "dense_attention needs q_heads to be a multiple of kv_heads");
   }
   if (call->max_kv_len > 0 && call->kv_tokens > call->batch * call->max_kv_len) {
-    return refuse(call, "a key sequence is longer than the length the module serves");
+    return cute_dsl_refuse(call, "a key sequence is longer than the length the module serves");
   }
 
   flash_attn_dense_Tensor_mQ_t query{};
@@ -115,11 +96,11 @@ extern "C" int32_t uniserve_dense_attention(const uniserve_dense_attention_call*
   cu_seqlens_k.dynamic_shapes[0] = static_cast<int32_t>(call->batch + 1);
 
   const int32_t status = cute_dsl_flash_attn_dense_wrapper(
-      &module(), &query, &key, &value, &out, static_cast<float>(call->scale), &cu_seqlens_q,
-      &cu_seqlens_k, static_cast<int32_t>(call->max_q_len),
-      reinterpret_cast<cudaStream_t>(stream));
+      &cute_dsl_module<flash_attn_dense_Kernel_Module_t, flash_attn_dense_Kernel_Module_Load>(),
+      &query, &key, &value, &out, static_cast<float>(call->scale), &cu_seqlens_q, &cu_seqlens_k,
+      static_cast<int32_t>(call->max_q_len), reinterpret_cast<cudaStream_t>(stream));
   if (status != 0) {
-    return refuse(call, "FlashAttention 4's launch reported an error");
+    return cute_dsl_refuse(call, "FlashAttention 4's launch reported an error");
   }
   return 0;
 }

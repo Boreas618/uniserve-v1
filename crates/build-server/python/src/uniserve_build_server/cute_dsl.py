@@ -28,7 +28,8 @@ package, whose tuning data a package reads), one shape for every package:
 The entry unit is the C++ translation unit the manifest names in ``[source]
 unit``, which defines the C entry ``[module.entries]`` names; it is compiled
 where it is, so the ABI header beside it is found as its own include, and the
-export's header through the include path.
+export's header and the shared entry header (:func:`shared_headers`) through
+the include path.
 
 The module is a **shared library with an entry symbol**, not a cubin ``ops``
 launches: the call's parameters are the ``Call`` struct ``entry.h`` declares,
@@ -39,6 +40,7 @@ whose layout a ``static_assert`` fixes, so no launch signature is written to a
 from __future__ import annotations
 
 import importlib.metadata
+import importlib.resources
 import pathlib
 import subprocess
 import tempfile
@@ -145,6 +147,19 @@ def dialect_runtime(cuda: Cuda) -> pathlib.Path:
     raise SystemExit(f"{distribution} holds no {DIALECT_RUNTIME}")
 
 
+def shared_headers() -> pathlib.Path:
+    """The C++ headers of the kernel packages' shared sources.
+
+    ``uniserve_kernels/include`` holds what every CuTe DSL entry unit shares
+    (``uniserve_cute_dsl.h``); the library is a distribution of this
+    environment, found through ``importlib.resources`` like any package's data,
+    and its files are digested into every module's build identity.
+    """
+    return pathlib.Path(
+        str(importlib.resources.files("uniserve_kernels") / "include")
+    )
+
+
 def compile_cxx(compiler: str, arguments: list[str], what: str) -> None:
     """Run the host C++ compiler; a failure refuses the build."""
     built = subprocess.run(
@@ -187,6 +202,7 @@ def build(request: Request, spec: Spec) -> None:
                 str(request.package / request.unit),
                 *(f"-D{one}" for one in stated.get("defines", [])),
                 f"-I{staging}",
+                f"-I{shared_headers()}",
                 f"-I{cuda.include}",
             ],
             "compiling the entry unit",
