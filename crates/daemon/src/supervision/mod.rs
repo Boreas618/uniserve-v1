@@ -665,28 +665,15 @@ fn join_leader(options: &DaemonOptions) -> anyhow::Result<Connection> {
 
 #[cfg(test)]
 mod tests {
-    use std::path::Path;
-
     use proto::process::{
-        Downstream, Engine, Request, Spawn, Stop, Upstream, downstream, reply, request, upstream,
+        Downstream, Engine, NodesQuery, Request, Reserve, Stop, Upstream, downstream, reply,
+        request, upstream,
     };
 
     use super::*;
 
-    /// The next reply on `connection`.
-    fn reply(connection: &mut Connection) -> proto::process::Reply {
-        loop {
-            let message: Downstream = connection
-                .recv(Duration::from_secs(30))
-                .unwrap()
-                .expect("a reply in time");
-            if let Some(downstream::Kind::Reply(reply)) = message.kind {
-                return reply;
-            }
-        }
-    }
-
-    fn send(connection: &mut Connection, id: u64, kind: request::Kind) {
+    /// Sends request `id` of `kind` on `connection` and returns its reply.
+    fn ask(connection: &mut Connection, id: u64, kind: request::Kind) -> proto::process::Reply {
         connection
             .deliver(&Upstream {
                 kind: Some(upstream::Kind::Request(Request {
@@ -695,14 +682,20 @@ mod tests {
                 })),
             })
             .unwrap();
+        loop {
+            let message: Downstream = connection.recv_next().unwrap();
+            if let Some(downstream::Kind::Reply(reply)) = message.kind {
+                assert_eq!(reply.id, id);
+                return reply;
+            }
+        }
     }
 
-    /// A leader's service handed over goes on with what it served: a
-    /// request on an engine connection the first service accepted is
-    /// served by the successor's, which ends the process the first one
-    /// started.
+    /// A leader's service handed over goes on with what it served: the successor answers a
+    /// request on a connection the first service accepted, holds the socket the first one
+    /// reserved, and ends it with the group's stop.
     #[test]
-    fn a_resumed_service_serves_the_connections_of_its_handoff() {
+    fn a_resumed_service_serves_the_connections_and_reservations_of_its_handoff() {
         for network in [false, true] {
             resumed_service(network);
         }
@@ -719,7 +712,7 @@ mod tests {
                 host: "localhost".to_owned(),
                 dist_init_addr: join.as_ref().map(|(_, endpoint)| endpoint.clone()),
                 socket: socket.clone(),
-                join_timeout: Duration::from_secs(5),
+                join_timeout: JOIN_TIMEOUT,
                 build_server: build_server::command::Settings::default(),
                 storage: storage::Settings::default(),
             },
@@ -727,63 +720,71 @@ mod tests {
         )
         .unwrap();
         let address = daemon.address().unwrap().to_owned();
-        let mut engine = Connection::connect(&address.parse().unwrap()).unwrap();
-        engine
+        let mut client = Connection::connect(&address.parse().unwrap()).unwrap();
+        client
             .deliver(&Hello {
                 major: proto::ENGINE_INTERFACE_VERSION,
                 build: proto::BUILD.to_owned(),
+                // A client of the socket: no engine number, no interface.
                 peer: Some(hello::Peer::Engine(Engine {
                     deployment: "model".to_owned(),
-                    // A test client that asks for a spawn, not an engine: it states no engine
-                    // number and no interface, so no command is addressed to it.
                     engine: 0,
                     interface: 0,
                 })),
             })
             .unwrap();
-        let welcome: Welcome = engine.recv(Duration::from_secs(30)).unwrap().unwrap();
+        let welcome: Welcome = client.recv_next().unwrap();
         assert_eq!(welcome.refusal, None);
-        send(
-            &mut engine,
+        let reserved = ask(
+            &mut client,
             1,
-            request::Kind::Spawn(Spawn {
+            request::Kind::Reserve(Reserve {
                 host: "localhost".to_owned(),
                 group: "model".to_owned(),
-                rank: 0,
-                generation: 1,
-                executable: "sh".to_owned(),
-                arguments: vec!["-c".to_owned(), "exec sleep 600".to_owned()],
-                ..Spawn::default()
+                engine: None,
+                routable: false,
             }),
         );
-        let Some(reply::Kind::Spawned(spawned)) = reply(&mut engine).kind else {
-            panic!("the spawn got no reply");
+        let Some(reply::Kind::Reserved(reserved)) = reserved.kind else {
+            panic!("the reservation got no socket: {reserved:?}");
         };
 
         let (handoff, descriptors) = daemon.hand_over().unwrap();
         // The daemon that handed over ends nothing and leaves its socket.
         drop(daemon);
         assert_eq!(socket.exists(), !network);
-        assert!(Path::new(&format!("/proc/{}", spawned.pid)).exists());
         let mut successor =
             Daemon::resume("localhost".to_owned(), Some(address), handoff, descriptors).unwrap();
 
-        send(
-            &mut engine,
-            2,
+        let nodes = ask(&mut client, 2, request::Kind::Nodes(NodesQuery {}));
+        assert!(
+            matches!(nodes.kind, Some(reply::Kind::Nodes(_))),
+            "{nodes:?}"
+        );
+        std::net::TcpStream::connect(&reserved.address)
+            .expect("the successor holds the reserved socket");
+        let stopped = ask(
+            &mut client,
+            3,
             request::Kind::Stop(Stop {
                 group: "model".to_owned(),
                 generation: None,
             }),
         );
-        let stopped = reply(&mut engine);
-        assert_eq!(stopped.id, 2);
         assert!(stopped.error.is_empty(), "{}", stopped.error);
-        // The stopped process is this test's child: reap its zombie.
-        let mut status = 0;
-        // SAFETY: waits for this test's own child.
-        unsafe { libc::waitpid(spawned.pid as libc::pid_t, &mut status, 0) };
-        assert!(libc::WIFSIGNALED(status));
+        // The group's stop closed the reservation the successor adopted: a launch that inherits
+        // it is refused before anything starts.
+        let refused = ask(
+            &mut client,
+            4,
+            request::Kind::Spawn(proto::process::Spawn {
+                host: "localhost".to_owned(),
+                group: "model".to_owned(),
+                inherit: vec![reserved.reservation],
+                ..proto::process::Spawn::default()
+            }),
+        );
+        assert!(refused.error.contains("no reservation"), "{refused:?}");
         successor.stop().unwrap();
     }
 }

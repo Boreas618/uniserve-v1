@@ -417,8 +417,6 @@ mod tests {
             group: "engine".to_owned(),
             rank: 0,
             generation,
-            executable: String::new(),
-            arguments: Vec::new(),
             inherit: Vec::new(),
             launch: Vec::new(),
         }

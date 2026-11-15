@@ -681,12 +681,9 @@ impl EngineControl {
                     group: ENGINE_GROUP.to_owned(),
                     rank: launch.rank,
                     generation: engine,
-                    // The node that starts the process resolves the engine
-                    // package its launch names at its own Build Server.
-                    executable: String::new(),
-                    arguments: Vec::new(),
                     inherit,
-                    // The node that starts the process writes its launch file.
+                    // The node that starts the process resolves the engine package its launch
+                    // names at its own Build Server and passes it the launch.
                     launch: serde_json::to_vec(launch).context("encoding the launch file")?,
                 })),
             })),
@@ -979,11 +976,7 @@ fn exited(control: &mut Connection) -> anyhow::Result<()> {
             kind: Some(event::Kind::Exit(exit)),
         })) = message.kind
         {
-            anyhow::bail!(
-                "the engine process exited: {}: {}",
-                exit.status,
-                exit.last_line.trim()
-            );
+            anyhow::bail!("the engine process exited: {}", exit.status);
         }
     }
     Ok(())

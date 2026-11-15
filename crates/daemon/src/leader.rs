@@ -4179,14 +4179,16 @@ mod tests {
         ));
     }
 
-    /// The engine configuration of a deployment of `data` schedulers of `tensor` ranks each,
-    /// with expert parallelism (`moe_config.expert_parallel`) when `experts` holds.
     /// The device strings of `ranks` local ranks of a default deployment's device kind.
     fn rank_devices(ranks: std::ops::Range<u32>) -> Vec<String> {
         let kind = crate::options::ServerArgs::default().device_config.device;
-        ranks.map(|rank| kind.rank_device(rank)).collect()
+        ranks
+            .map(|rank| kind.rank_device(rank).to_string())
+            .collect()
     }
 
+    /// The engine configuration of a deployment of `data` schedulers of `tensor` ranks each,
+    /// with expert parallelism (`moe_config.expert_parallel`) when `experts` holds.
     fn deployment(tensor: usize, data: usize, experts: bool) -> proto::config::EngineConfig {
         let mut options = crate::options::ServerArgs {
             tensor_parallel_size: std::num::NonZeroUsize::new(tensor).unwrap(),

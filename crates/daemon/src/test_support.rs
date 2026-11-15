@@ -652,7 +652,6 @@ impl Engines {
             rank: 0,
             generation,
             status: status.to_owned(),
-            last_line: String::new(),
         });
     }
 

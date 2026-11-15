@@ -107,5 +107,20 @@ harness = false
 name = "tool_parsers"
 harness = false
 
+# Helper binaries of the integration tests (`tests/it`), which reach them through
+# `CARGO_BIN_EXE_<name>`: the stand-in engine a node starts as it starts an engine, and a node's
+# daemon in a process of its own.
+[[bin]]
+name = "stand-in-engine"
+path = "tests/bin/stand_in_engine.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "daemon-host"
+path = "tests/bin/daemon_host.rs"
+test = false
+doc = false
+
 [lints]
 workspace = true

@@ -1,12 +1,13 @@
 //! The processes a daemon starts on its node and supervises.
 //!
-//! An engine asks the daemon of each node to start its workers there
-//! (`Spawn`); each becomes a child of the daemon's service thread and leads
-//! a process group of its own, so the Storage Server's shoot-down of a
-//! previous writer ends the processes it started and never the daemon. The
-//! daemon reaps each child, removes the driver and NCCL shared memory a
-//! child that did not end in order left (`Child`), and reports its exit to
-//! the engine that started it.
+//! A node's processes are engines: a spawn (`Spawn`) carries an engine's launch, and the node runs
+//! the engine package its module set names, resolved at the node's own Build Server, with the
+//! launch inherited and its lifeline. Each becomes a child of the daemon's service thread and
+//! leads a process group of its own, so the Storage Server's shoot-down of a previous writer ends
+//! the processes it started and never the daemon. The daemon reaps each child and reports its exit
+//! to the asker of its launch. A process writes its own log, to the standard error it inherits
+//! from the daemon; how it ended travels as its exit status, and a failure it observed as its
+//! report on the process interface.
 //!
 //! A process ends with its daemon through its lifeline: a pipe whose write
 //! end the daemon holds and whose read end every process inherits, at the
@@ -17,14 +18,12 @@
 //! and the write end with them, to the successor daemon
 //! (`Supervisor::hand_over`), which supervises them from then on through
 //! their pidfds (`Supervisor::adopt`): the pipe stays open across it, so no
-//! process ends. The read end of each process's standard error goes with it,
-//! so what a process writes there after the restart (a panic among it)
-//! reaches the successor's log and its exit report.
+//! process ends.
 //!
-//! An engine starts from a launch file, which the spawn carries
-//! (`Spawn::launch`): the daemon of the node it runs on states its own node's
-//! Build Server in it and writes it to its own runtime directory, so the
-//! leader starts an engine on any node of the deployment the same way.
+//! An engine starts from its launch, which the spawn carries (`Spawn::launch`): the daemon of the
+//! node it runs on states its own node's Build Server in it and passes it as a sealed memfd
+//! (`crate::engine::launch`), so the leader starts an engine on any node of the deployment the
+//! same way.
 //!
 //! A worker group's first rank serves the group's collective store. The
 //! daemon of that rank's node binds the store's socket when the engine
@@ -40,13 +39,12 @@
 //! it.
 
 use proto::process::{Exit, Reserve, Reserved, Spawn};
-use std::collections::{HashMap, VecDeque};
+use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::os::unix::process::CommandExt;
 use std::path::PathBuf;
-use std::process::{Command, ExitStatus, Stdio};
-use std::sync::{Arc, Mutex};
+use std::process::{Command, ExitStatus};
 
 /// Whom a request of the process interface is served for (`proto::process::Owner`): the engine
 /// of a number, which owns the processes it starts and claims as itself, or the deployment's head
@@ -131,176 +129,6 @@ struct Key {
     generation: u64,
 }
 
-/// One supervised process.
-struct Supervised {
-    child: Child,
-    /// The last lines the process wrote to its standard error, which its exit
-    /// report carries: a worker that dies before it registers explains itself
-    /// there and nowhere else the daemon can see.
-    tail: StderrTail,
-}
-
-/// The last lines a supervised process wrote to its standard error, and the
-/// read end of the pipe they arrive on.
-///
-/// The pipe is drained on its own thread for as long as the process runs, so
-/// a full pipe never blocks it, and only a bounded number of lines is kept.
-/// This is a report: nothing in the supervisor decides anything from it.
-///
-/// A hot restart hands the read end to the successor
-/// ([`StderrTail::hand_over`]), whose tail reads on from where this one
-/// stopped: a process's standard error has a reader for as long as it runs,
-/// and what it writes after a restart, a panic included, reaches the run's
-/// log through the daemon that supervises it then.
-struct StderrTail {
-    kept: Arc<Mutex<VecDeque<String>>>,
-    /// The reader thread, which returns the read end once it stopped, and the
-    /// eventfd that stops it.
-    reader: Option<(std::thread::JoinHandle<OwnedFd>, OwnedFd)>,
-}
-
-impl StderrTail {
-    /// How many of the process's last stderr lines the exit report keeps.
-    const LINES: usize = 8;
-    /// The longest line prefix kept of any one line.
-    const LINE: usize = 400;
-
-    /// Reads the pipe whose read end is `stream` on its own thread, keeping
-    /// the last lines, until the pipe ends or [`Self::hand_over`] stops it.
-    ///
-    /// # Errors
-    ///
-    /// When the stop's eventfd or the thread cannot be made.
-    fn read(stream: OwnedFd) -> std::io::Result<Self> {
-        // SAFETY: eventfd takes integers only and returns a new descriptor.
-        let stop = unsafe { libc::eventfd(0, libc::EFD_CLOEXEC) };
-        if stop < 0 {
-            return Err(std::io::Error::last_os_error());
-        }
-        // SAFETY: eventfd returned a new descriptor this tail owns.
-        let stop = unsafe { OwnedFd::from_raw_fd(stop) };
-
-        let kept = Arc::new(Mutex::new(VecDeque::new()));
-        let lines = Arc::clone(&kept);
-        let stopped = stop.try_clone()?;
-        let thread = std::thread::Builder::new()
-            .name("stderr-tail".to_owned())
-            .spawn(move || Self::drain(stream, &stopped, &lines))?;
-        Ok(Self {
-            kept,
-            reader: Some((thread, stop)),
-        })
-    }
-
-    /// Stops the reader and returns the pipe's read end, for the successor of
-    /// a hot restart to read on from: the lines the pipe holds as the reader
-    /// stops are read and kept first, so none is lost between the two.
-    ///
-    /// # Errors
-    ///
-    /// When the reader was stopped already, cannot be told to stop, or
-    /// panicked.
-    fn hand_over(&mut self) -> std::io::Result<OwnedFd> {
-        let (thread, stop) = self.reader.take().ok_or_else(|| {
-            std::io::Error::other("the standard error's reader was handed over already")
-        })?;
-        let one = 1_u64.to_ne_bytes();
-        // SAFETY: an eight-byte write from a local to the tail's eventfd.
-        if unsafe { libc::write(stop.as_raw_fd(), one.as_ptr().cast(), one.len()) } < 0 {
-            return Err(std::io::Error::last_os_error());
-        }
-        thread
-            .join()
-            .map_err(|_| std::io::Error::other("the standard error's reader panicked"))
-    }
-
-    /// The reader thread: waits on `stream` and on `stop`, keeps each line
-    /// `stream` delivers, and returns `stream` once it ended or `stop` fired;
-    /// at the stop, what the pipe holds then is read first.
-    fn drain(stream: OwnedFd, stop: &OwnedFd, kept: &Mutex<VecDeque<String>>) -> OwnedFd {
-        let mut pending = String::new();
-        let mut chunk = [0u8; 4096];
-        let mut stopping = false;
-        loop {
-            let mut polled = [
-                libc::pollfd {
-                    fd: stream.as_raw_fd(),
-                    events: libc::POLLIN,
-                    revents: 0,
-                },
-                libc::pollfd {
-                    fd: stop.as_raw_fd(),
-                    events: libc::POLLIN,
-                    revents: 0,
-                },
-            ];
-            // Once stopping, only what the pipe holds now is read: a look.
-            let watched = if stopping { 1 } else { 2 };
-            let timeout = if stopping { 0 } else { -1 };
-            // SAFETY: `watched` valid pollfds of descriptors this thread holds.
-            let ready = unsafe { libc::poll(polled.as_mut_ptr(), watched, timeout) };
-            if ready < 0 {
-                if std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted {
-                    continue;
-                }
-                break;
-            }
-            if polled[1].revents & libc::POLLIN != 0 {
-                stopping = true;
-            }
-            if polled[0].revents == 0 {
-                if stopping {
-                    break;
-                }
-                continue;
-            }
-
-            // SAFETY: reads into a local buffer from the pipe this thread holds; the
-            // pipe is readable or at its end, so the read does not block.
-            let read =
-                unsafe { libc::read(stream.as_raw_fd(), chunk.as_mut_ptr().cast(), chunk.len()) };
-            let Ok(read) = usize::try_from(read) else {
-                break;
-            };
-            if read == 0 {
-                break;
-            }
-            pending.push_str(&String::from_utf8_lossy(&chunk[..read]));
-            while let Some(end) = pending.find('\n') {
-                let line = pending[..end].trim_end().to_owned();
-                pending.drain(..end + 1);
-                Self::push(kept, line);
-            }
-        }
-        if !pending.trim().is_empty() {
-            Self::push(kept, pending.trim_end().to_owned());
-        }
-        stream
-    }
-
-    /// Keeps `line` in the ring, and echoes it where the process's standard
-    /// error went before it was piped: the run's own log.
-    ///
-    /// The echo is not decoration. A worker writes its explanation as it dies,
-    /// and the ring only carries the last line — the ones before it are what a
-    /// reader follows a failure through, so they go out unchanged.
-    fn push(kept: &Mutex<VecDeque<String>>, line: String) {
-        eprintln!("{line}");
-        let kept_line: String = line.chars().take(Self::LINE).collect();
-        if let Ok(mut kept) = kept.lock() {
-            kept.push_back(kept_line);
-            while kept.len() > Self::LINES {
-                kept.pop_front();
-            }
-        }
-    }
-
-    /// The last line the process wrote, when it wrote one.
-    fn last(&self) -> Option<String> {
-        self.kept.lock().ok()?.back().cloned()
-    }
-}
-
 /// A listening socket held for a group until a process inherits it.
 struct Reservation {
     owner: Owner,
@@ -314,7 +142,7 @@ pub(crate) struct Supervisor {
     host: String,
     /// The pipe every process inherits the read end of.
     lifeline: Lifeline,
-    children: HashMap<Key, Supervised>,
+    children: HashMap<Key, Child>,
     reservations: HashMap<u64, Reservation>,
     next_reservation: u64,
     /// This node's Build Server, which an engine started here resolves its modules from:
@@ -482,26 +310,6 @@ impl Supervisor {
             generation: spawn.generation,
         };
 
-        // An engine runs as the engine package its launch names; any
-        // other process as the executable the request states. Every one's
-        // command line ends with its lifeline.
-        let mut command = if spawn.launch.is_empty() {
-            Command::new(&spawn.executable)
-        } else {
-            let (executable, launch) = self.main_process(spawn)?;
-            let mut command = Command::new(executable);
-            crate::engine::launch::inherit(&mut command, launch);
-            // An engine process logs at this daemon's level.
-            command.args(::service::logging::arguments());
-            command
-        };
-        command.args(&spawn.arguments);
-        inherit_lifeline(&mut command, &self.lifeline.read);
-        // A worker leads a process group of its own, with every process it
-        // starts: the Storage Server shoots down a previous writer by its
-        // group, which ends the children that may have inherited its device
-        // descriptors, and never the daemon.
-        command.process_group(0);
         // Every reservation is checked before any is taken, so a refused
         // spawn leaves the group's reservations held.
         if let Some(reservation) = spawn.inherit.iter().find(|reservation| {
@@ -524,42 +332,33 @@ impl Supervisor {
                 ),
             });
         }
+
+        // The process runs as the engine package its launch names, with the launch inherited, at
+        // this daemon's log level, and with its lifeline last on its command line.
+        let (executable, launch) = self.main_process(spawn)?;
+        let mut command = Command::new(&executable);
+        crate::engine::launch::inherit(&mut command, launch);
+        command.args(::service::logging::arguments());
+        inherit_lifeline(&mut command, &self.lifeline.read);
+        // A worker leads a process group of its own, with every process it
+        // starts: the Storage Server shoots down a previous writer by its
+        // group, which ends the children that may have inherited its device
+        // descriptors, and never the daemon.
+        command.process_group(0);
         for reservation in &spawn.inherit {
             if let Some(held) = self.reservations.remove(reservation) {
                 inherit_listener(&mut command, held.listener);
             }
         }
 
-        // A process's own words are where a launch failure explains itself: a
-        // worker that dies before it registers is otherwise only a status. The
-        // stream is read for as long as the process runs, so the pipe never
-        // fills and the process never blocks on it.
-        command.stderr(Stdio::piped());
-        let mut child = Child::spawn(&mut command)
-            .map_err(|error| format!("spawning {}: {error}", spawn.executable))?;
-        let tail = child
-            .take_stderr()
-            .map(OwnedFd::from)
-            .ok_or_else(|| std::io::Error::other("the process was spawned without its pipe"))
-            .and_then(StderrTail::read);
-        let tail = match tail {
-            Ok(tail) => tail,
-            Err(error) => {
-                // A process whose standard error nothing reads would block on it.
-                let _ = child.kill();
-                let _ = child.wait();
-                return Err(format!(
-                    "reading the standard error of {}: {error}",
-                    spawn.executable
-                ));
-            }
-        };
+        let child = Child::spawn(&mut command)
+            .map_err(|error| format!("spawning {}: {error}", executable.display()))?;
         let pid = child.id();
         tracing::info!(group = %spawn.group, rank = spawn.rank, generation = spawn.generation, pid, "started a process");
-        if let Some(mut previous) = self.children.insert(key, Supervised { child, tail }) {
+        if let Some(mut previous) = self.children.insert(key, child) {
             // A spawn repeated for one launch replaces its process.
-            let _ = previous.child.kill();
-            let _ = previous.child.wait();
+            let _ = previous.kill();
+            let _ = previous.wait();
         }
         Ok(pid)
     }
@@ -664,8 +463,8 @@ impl Supervisor {
     /// is supervised no longer. A child whose status cannot be read is reported as exited.
     pub(crate) fn exits(&mut self) -> Vec<(Asker, Exit)> {
         let mut exited = Vec::new();
-        for (key, supervised) in &mut self.children {
-            let (status, success) = match supervised.child.try_wait() {
+        for (key, child) in &mut self.children {
+            let (status, success) = match child.try_wait() {
                 Ok(Some(Exited::Status(status))) => (status.to_string(), status.success()),
                 // An adopted process's parent was the daemon this one
                 // replaced: it exited while it should have run.
@@ -678,11 +477,11 @@ impl Supervisor {
                 Ok(None) => continue,
                 Err(error) => (format!("exit status unreadable: {error}"), false),
             };
-            exited.push((key.clone(), status, success, supervised.tail.last()));
+            exited.push((key.clone(), status, success));
         }
         exited
             .into_iter()
-            .map(|(key, status, success, last_stderr)| {
+            .map(|(key, status, success)| {
                 self.children.remove(&key);
                 let Key {
                     owner,
@@ -691,14 +490,12 @@ impl Supervisor {
                     rank,
                     generation,
                 } = key;
-                // The report names the owner the process was spawned for, its
-                // rank, how it ended, and the last line it wrote itself: a
-                // launch that failed for a reason outside the engine says so
-                // here rather than arriving as an unexplained status.
+                // The report names the owner the process was spawned for, its rank and how it
+                // ended; what the process explained of its end is in its own log.
                 if success {
-                    tracing::info!(?owner, %group, rank, generation, last_stderr = ?last_stderr, "a process exited");
+                    tracing::info!(?owner, %group, rank, generation, "a process exited");
                 } else {
-                    tracing::warn!(?owner, %group, rank, generation, %status, last_stderr = ?last_stderr, "a process exited");
+                    tracing::warn!(?owner, %group, rank, generation, %status, "a process exited");
                 }
                 (
                     asker,
@@ -708,7 +505,6 @@ impl Supervisor {
                         rank,
                         generation,
                         status,
-                        last_line: last_stderr.unwrap_or_default(),
                     },
                 )
             })
@@ -718,24 +514,22 @@ impl Supervisor {
     /// The descriptors that turn readable when a supervised process exits, one per process: the
     /// service waits on them beside its sockets, so an exit ends its wait.
     pub(crate) fn exit_descriptors(&self) -> impl Iterator<Item = std::os::fd::RawFd> + '_ {
-        self.children
-            .values()
-            .map(|supervised| supervised.child.exit_descriptor())
+        self.children.values().map(Child::exit_descriptor)
     }
 
     /// Kills the processes of `keys`, then reaps each one.
     fn terminate(&mut self, keys: Vec<Key>) {
         let mut ending = Vec::with_capacity(keys.len());
         for key in keys {
-            if let Some(mut supervised) = self.children.remove(&key) {
-                if let Err(error) = supervised.child.kill() {
+            if let Some(mut child) = self.children.remove(&key) {
+                if let Err(error) = child.kill() {
                     tracing::warn!(group = %key.group, rank = key.rank, %error, "a process could not be stopped");
                 }
-                ending.push(supervised);
+                ending.push(child);
             }
         }
-        for mut supervised in ending {
-            let _ = supervised.child.wait();
+        for mut child in ending {
+            let _ = child.wait();
         }
     }
 }
@@ -747,38 +541,26 @@ impl Supervisor {
     pub(crate) fn live(&self) -> Vec<ProcessHandoff> {
         self.children
             .iter()
-            .map(|(key, supervised)| ProcessHandoff::of(key, supervised.child.id()))
+            .map(|(key, child)| ProcessHandoff::of(key, child.id()))
             .collect()
     }
 
     /// Hands every process and reservation to this daemon's successor in a
     /// hot restart, which goes on with them ([`Supervisor::adopt`]): their
-    /// keys, and for each process its pidfd and the read end of its standard
-    /// error's pipe, followed by each reservation's socket, then the
-    /// lifeline's read and write ends, in `descriptors`. This daemon
-    /// supervises nothing afterwards.
+    /// keys, and a pidfd for each process followed by each reservation's
+    /// socket, then the lifeline's read and write ends, in `descriptors`.
+    /// This daemon supervises nothing afterwards.
     ///
     /// # Errors
     ///
-    /// Fails when a process's pidfd cannot be opened, the supervisor keeping
-    /// every process then; or when a process's standard error cannot be
-    /// handed over.
+    /// Fails when a process's pidfd cannot be opened; the supervisor keeps
+    /// every process then.
     pub(crate) fn hand_over(&mut self) -> std::io::Result<(ProcessesHandoff, Vec<OwnedFd>)> {
-        // Every pidfd is opened before any reader stops, so a refused one leaves each process
-        // with its standard error read here.
-        let pidfds = self
-            .children
-            .values()
-            .map(|supervised| supervised.child.pidfd())
-            .collect::<std::io::Result<Vec<_>>>()?;
-
         let mut processes = Vec::with_capacity(self.children.len());
-        let mut descriptors =
-            Vec::with_capacity(2 * self.children.len() + self.reservations.len() + 2);
-        for ((key, supervised), pidfd) in self.children.iter_mut().zip(pidfds) {
-            descriptors.push(pidfd);
-            descriptors.push(supervised.tail.hand_over()?);
-            processes.push(ProcessHandoff::of(key, supervised.child.id()));
+        let mut descriptors = Vec::with_capacity(self.children.len() + self.reservations.len());
+        for (key, child) in &self.children {
+            descriptors.push(child.pidfd()?);
+            processes.push(ProcessHandoff::of(key, child.id()));
         }
         let mut reservations = Vec::with_capacity(self.reservations.len());
         for (id, reservation) in self.reservations.drain() {
@@ -827,8 +609,6 @@ impl Supervisor {
         let mut supervisor = Self::new(host)?;
         for process in handoff.processes {
             let child = Child::adopt(process.pid, next()?);
-            // The process's standard error is read on from where the predecessor stopped.
-            let tail = StderrTail::read(next()?)?;
             tracing::info!(group = %process.group, rank = process.rank, generation = process.generation, pid = process.pid, "adopted a process");
             supervisor.children.insert(
                 Key {
@@ -838,7 +618,7 @@ impl Supervisor {
                     rank: process.rank,
                     generation: process.generation,
                 },
-                Supervised { child, tail },
+                child,
             );
         }
         for reservation in handoff.reservations {
@@ -857,8 +637,7 @@ impl Supervisor {
         };
         // The lifeline is the processes': a supervised process ends when every write
         // end of the pipe closes, so a successor that did not take these would let the
-        // engine die the moment the predecessor exits — silently, on stderr no one
-        // reads any more.
+        // engine die the moment the predecessor exits.
         tracing::info!(
             processes = supervisor.children.len(),
             "a supervisor adopted the processes the previous daemon supervised, with their \
@@ -1033,15 +812,6 @@ impl Child {
         }
     }
 
-    /// The process's standard error, when this daemon spawned it and it was
-    /// spawned with a pipe.
-    fn take_stderr(&mut self) -> Option<std::process::ChildStderr> {
-        match &mut self.process {
-            Process::Spawned { child, .. } => child.stderr.take(),
-            Process::Adopted { .. } => None,
-        }
-    }
-
     /// The rank's process id.
     pub(crate) fn id(&self) -> u32 {
         match &self.process {
@@ -1154,111 +924,4 @@ pub(crate) fn pidfd_open(pid: u32) -> std::io::Result<OwnedFd> {
     }
     // SAFETY: the call returned a new descriptor this daemon owns.
     Ok(unsafe { OwnedFd::from_raw_fd(descriptor as libc::c_int) })
-}
-
-#[cfg(test)]
-mod tests {
-    use std::io::Write as _;
-
-    use super::*;
-
-    /// A worker that dies before it registers says why on its own standard
-    /// error; the report keeps its last line and no more than a bounded number
-    /// of them, whatever it wrote.
-    #[test]
-    fn a_process_s_last_stderr_line_reaches_its_exit_report() {
-        let written = (0..StderrTail::LINES * 3)
-            .map(|line| format!("line {line}\n"))
-            .collect::<String>();
-        let (read, mut write) = pipe();
-        write.write_all(written.as_bytes()).unwrap();
-        let mut tail = StderrTail::read(read).unwrap();
-
-        // The handover reads what the pipe holds before it returns.
-        tail.hand_over().unwrap();
-        assert_eq!(tail.last().as_deref(), Some("line 23"));
-        assert_eq!(tail.kept.lock().unwrap().len(), StderrTail::LINES);
-    }
-
-    /// A tail handed over in a hot restart stops reading and gives the pipe to its successor:
-    /// what the process writes afterwards is the successor's, and nothing written is lost.
-    #[test]
-    fn a_handed_over_tail_leaves_what_follows_to_its_successor() {
-        let (read, mut write) = pipe();
-        write.write_all(b"before\n").unwrap();
-        let mut first = StderrTail::read(read).unwrap();
-        let handed = first.hand_over().unwrap();
-        assert_eq!(first.last().as_deref(), Some("before"));
-
-        write.write_all(b"after\n").unwrap();
-        drop(write);
-        let mut successor = StderrTail::read(handed).unwrap();
-        successor.hand_over().unwrap();
-        assert_eq!(successor.last().as_deref(), Some("after"));
-        assert_eq!(first.last().as_deref(), Some("before"));
-    }
-
-    /// A pipe's read end and write end.
-    fn pipe() -> (OwnedFd, std::fs::File) {
-        let mut ends = [0; 2];
-        // SAFETY: pipe2 fills the two descriptors it creates.
-        let created = unsafe { libc::pipe2(ends.as_mut_ptr(), libc::O_CLOEXEC) };
-        assert_eq!(created, 0);
-        // SAFETY: two new descriptors the test owns.
-        unsafe {
-            (
-                OwnedFd::from_raw_fd(ends[0]),
-                std::fs::File::from(OwnedFd::from_raw_fd(ends[1])),
-            )
-        }
-    }
-
-    /// A successor's supervisor adopts the processes and reservations a
-    /// supervisor hands over: it reports none of them exited while they
-    /// run, ends them as its own, and observes their exits.
-    #[test]
-    fn the_successor_supervises_the_processes_of_a_handoff() {
-        let mut first = Supervisor::new("host".to_owned()).unwrap();
-        let spawn = Spawn {
-            host: "host".to_owned(),
-            group: "model".to_owned(),
-            rank: 0,
-            generation: 1,
-            executable: "sh".to_owned(),
-            arguments: vec!["-c".to_owned(), "exec sleep 600".to_owned()],
-            ..Spawn::default()
-        };
-        let pid = first
-            .spawn(Owner::Engine(7), Asker::Connection(7), &spawn)
-            .unwrap();
-        let reserved = first
-            .reserve(
-                Owner::Engine(7),
-                &Reserve {
-                    host: "host".to_owned(),
-                    group: "model".to_owned(),
-                    routable: false,
-                    engine: Some(7),
-                },
-                None,
-            )
-            .unwrap();
-        let (handoff, descriptors) = first.hand_over().unwrap();
-        // The first supervisor holds nothing more: dropping it ends nothing.
-        drop(first);
-        assert!(std::path::Path::new(&format!("/proc/{pid}")).exists());
-
-        let mut successor = Supervisor::adopt("host".to_owned(), handoff, descriptors).unwrap();
-        assert!(successor.exits().is_empty());
-        assert!(successor.reservations.contains_key(&reserved.reservation));
-        successor.stop(Owner::Engine(7), "model", None);
-        assert!(successor.children.is_empty());
-        // The killed process is gone once the host's init reaps it, which
-        // in a test is this process: its zombie is reaped here.
-        let mut status = 0;
-        // SAFETY: waits for this test's own child, which the first
-        // supervisor spawned.
-        unsafe { libc::waitpid(pid as libc::pid_t, &mut status, 0) };
-        assert!(libc::WIFSIGNALED(status));
-    }
 }

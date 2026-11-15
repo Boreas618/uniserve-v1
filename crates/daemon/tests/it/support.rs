@@ -1,10 +1,12 @@
-//! An engine's side of the process interface, which the tests drive a
-//! daemon with, and the stand-in processes they have it start.
+//! An engine's side of the process interface, which the tests drive a daemon with; the stand-in
+//! Build Server a daemon's node resolves its engines at; and the stand-in engines it starts, which
+//! are the test crate's `stand-in-engine` binary.
 
 use std::collections::VecDeque;
+use std::os::fd::{AsRawFd as _, FromRawFd as _, OwnedFd};
 use std::path::PathBuf;
 use std::sync::mpsc::{Receiver, Sender};
-use std::time::{Duration, Instant};
+use std::sync::{Arc, Mutex};
 
 use daemon::DaemonOptions;
 use proto::process::{
@@ -13,19 +15,34 @@ use proto::process::{
 };
 use service::Connection;
 
-/// The bound for a daemon or a process it supervises to react.
-pub(crate) const TIMEOUT: Duration = Duration::from_secs(30);
+/// The engine packages the stand-in engine (`tests/bin/stand_in_engine.rs`) stands for, by the
+/// backend a launch's module set names.
+pub(crate) mod package {
+    /// Exits with status 1.
+    pub(crate) const FAILS: &str = "fails";
+    /// Exits with status 0.
+    pub(crate) const SUCCEEDS: &str = "succeeds";
+    /// Runs until its lifeline ends or it is killed.
+    pub(crate) const FOLLOWS_LIFELINE: &str = "follows-lifeline";
+    /// Serves one peer on the store socket its launch's world states it inherited.
+    pub(crate) const SERVES_STORE: &str = "serves-store";
+}
 
-/// The options of the single node `host`, whose process socket is `socket`.
-pub(crate) fn single_node(host: &str, socket: PathBuf) -> DaemonOptions {
+/// The options of the single node `host`, whose process socket is `socket` and whose host's
+/// Build Server is `build_server`.
+pub(crate) fn single_node(
+    host: &str,
+    socket: PathBuf,
+    build_server: &BuildServerStandIn,
+) -> DaemonOptions {
     DaemonOptions {
         nnodes: 1,
         node_rank: 0,
         host: host.to_owned(),
         dist_init_addr: None,
         socket,
-        join_timeout: TIMEOUT,
-        build_server: build_server::command::Settings::default(),
+        join_timeout: daemon::JOIN_TIMEOUT,
+        build_server: build_server.settings(),
         storage: storage::Settings::default(),
     }
 }
@@ -69,22 +86,11 @@ impl Engine {
         (engine, reply)
     }
 
-    /// Connects to the leader at `address` and says hello as an engine whose
-    /// build speaks `major`.
+    /// Connects to the leader at `address`, which is bound once its daemon's start returned, and
+    /// says hello as an engine whose build speaks `major`.
     fn dial(address: &str, major: u32) -> Self {
-        let deadline = Instant::now() + TIMEOUT;
-        let mut connection = loop {
-            match Connection::connect(&address.parse().unwrap()) {
-                Ok(connection) => break connection,
-                Err(error) => {
-                    assert!(
-                        Instant::now() < deadline,
-                        "the leader is not reachable: {error}"
-                    );
-                    std::thread::sleep(Duration::from_millis(20));
-                }
-            }
-        };
+        let mut connection = Connection::connect(&address.parse().unwrap())
+            .unwrap_or_else(|error| panic!("the leader is not reachable at {address}: {error}"));
         connection
             .deliver(&Hello {
                 major,
@@ -109,8 +115,7 @@ impl Engine {
     /// The leader's answer to the hello.
     fn welcome(&mut self) -> Welcome {
         self.connection
-            .recv::<Welcome>(TIMEOUT)
-            .unwrap()
+            .recv_next::<Welcome>()
             .expect("the leader answers a hello")
     }
 
@@ -164,13 +169,18 @@ impl Engine {
         }
     }
 
+    /// Starts `spawn`, a process that runs until it is ended, and returns it.
+    pub(crate) fn start(&mut self, spawn: Spawn) -> Process {
+        Process::of(self.spawn(spawn))
+    }
+
     /// Reserves a socket on `host` for `group`.
     pub(crate) fn reserve(&mut self, host: &str, group: &str, routable: bool) -> Reserved {
         let reserve = Reserve {
             host: host.into(),
             group: group.into(),
             routable,
-            // Reserved by the connection that also spawns it.
+            // Reserved for the owner the asking connection is served for.
             engine: None,
         };
         match self.request(request::Kind::Reserve(reserve)) {
@@ -214,75 +224,102 @@ impl Engine {
     fn receive(&mut self) -> downstream::Kind {
         let message: Downstream = self
             .connection
-            .recv(TIMEOUT)
-            .unwrap()
-            .expect("the daemon sent nothing in time");
+            .recv_next()
+            .expect("the daemon closed the connection");
         message.kind.expect("the daemon sent an empty message")
     }
 }
 
-/// The launch of `executable` with `arguments` as `rank` of `group`'s
-/// launch `generation` on `host`.
-pub(crate) fn launch(
-    host: &str,
-    group: &str,
-    rank: u32,
-    generation: u64,
-    executable: &str,
-    arguments: &[&str],
-) -> Spawn {
+/// The launch of a stand-in engine of package `package` as `rank` of `group`'s launch
+/// `generation` on `host`: an engine's launch, whose module set names the stand-in engine package
+/// the node resolves at its Build Server.
+pub(crate) fn launch(host: &str, group: &str, rank: u32, generation: u64, package: &str) -> Spawn {
+    let mut args = engine_args(package);
+    args.engine = generation;
     Spawn {
         host: host.into(),
         group: group.into(),
         rank,
         generation,
-        executable: executable.into(),
-        arguments: arguments
-            .iter()
-            .map(|&argument| argument.to_owned())
-            .collect(),
-        ..Spawn::default()
+        inherit: Vec::new(),
+        launch: serde_json::to_vec(&args).unwrap(),
     }
 }
 
-/// The launch of a process that sleeps until it is killed. Its shell takes the lifeline the
-/// daemon appends to its command line as its positional parameters.
+/// The launch of a stand-in engine that runs until it is killed or its daemon ends.
 pub(crate) fn sleeper(host: &str, group: &str, rank: u32, generation: u64) -> Spawn {
-    launch(
-        host,
-        group,
-        rank,
-        generation,
-        "sh",
-        &["-c", "exec sleep 600"],
-    )
+    launch(host, group, rank, generation, package::FOLLOWS_LIFELINE)
 }
 
-/// Whether process `pid` exists and is not a zombie awaiting its reaper.
-pub(crate) fn alive(pid: u32) -> bool {
-    let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) else {
-        return false;
-    };
-    // The state letter follows the parenthesized command name.
-    let state = stat.rsplit(')').next().unwrap_or("").trim_start();
-    !state.starts_with('Z')
+/// The arguments of a stand-in engine of package `package`: a default deployment's engine
+/// configuration with a module set whose engine package is `package`.
+pub(crate) fn engine_args(package: &str) -> proto::config::EngineArgs {
+    let config = daemon::options::ServerArgs::default()
+        .engine_config()
+        .expect("the default configuration resolves");
+    let mut modules = module_set();
+    modules.engine.backend = package.to_owned();
+    proto::config::EngineArgs::new(config, modules)
 }
 
-/// Polls `condition` for up to [`TIMEOUT`] and returns its last value.
-pub(crate) fn eventually(mut condition: impl FnMut() -> bool) -> bool {
-    let deadline = Instant::now() + TIMEOUT;
-    while Instant::now() < deadline {
-        if condition() {
-            return true;
+/// A process a daemon started, observed through its pidfd, which names it whatever process
+/// later takes its id and turns readable once it exited.
+pub(crate) struct Process {
+    pidfd: OwnedFd,
+}
+
+impl Process {
+    /// The process `pid`, which runs.
+    pub(crate) fn of(pid: u32) -> Self {
+        // SAFETY: the call takes integers only.
+        let descriptor = unsafe { libc::syscall(libc::SYS_pidfd_open, pid as libc::pid_t, 0) };
+        assert!(
+            descriptor >= 0,
+            "process {pid} is gone: {}",
+            std::io::Error::last_os_error()
+        );
+        Self {
+            // SAFETY: the call returned a new descriptor this test owns.
+            pidfd: unsafe { OwnedFd::from_raw_fd(descriptor as libc::c_int) },
         }
-        std::thread::sleep(Duration::from_millis(20));
     }
-    condition()
+
+    /// Whether the process runs: its pidfd is not readable.
+    pub(crate) fn runs(&self) -> bool {
+        !self.poll(0)
+    }
+
+    /// Waits until the process exited.
+    pub(crate) fn wait(&self) {
+        self.poll(-1);
+    }
+
+    /// Whether the pidfd turned readable within `milliseconds` (forever for -1).
+    fn poll(&self, milliseconds: libc::c_int) -> bool {
+        let mut polled = libc::pollfd {
+            fd: self.pidfd.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        loop {
+            // SAFETY: one valid pollfd for the call.
+            let ready = unsafe { libc::poll(&mut polled, 1, milliseconds) };
+            if ready >= 0 {
+                return ready > 0;
+            }
+            assert_eq!(
+                std::io::Error::last_os_error().kind(),
+                std::io::ErrorKind::Interrupted
+            );
+        }
+    }
 }
 
 /// A stand-in for a host's Build Server, the host service a daemon prepares an epoch's module set
-/// at: it serves `prepare` at its socket and answers every slot with the package revision the
-/// request fixed for it, raised by `raise`, as a Build Server that holds every module answers.
+/// at and resolves its engines at: it serves `prepare` at its socket and answers every slot with
+/// the package revision the request fixed for it, raised by `raise`, as a Build Server that holds
+/// every module answers; and it resolves every engine package to the stand-in engine. Each
+/// connection is served on a thread of its own, as the Build Server serves them.
 pub(crate) struct BuildServerStandIn {
     socket: PathBuf,
     /// One token per `prepare` that arrived.
@@ -295,8 +332,6 @@ impl BuildServerStandIn {
     /// Serves at `socket`, owning it as a Build Server does; with `held`, each `prepare` answers
     /// only once [`Self::release`] lets it, as one building the engine's executable does.
     pub(crate) fn serve(socket: PathBuf, held: bool, raise: u32) -> Self {
-        use build_server::protocol::wire;
-
         let (listener, starting) = service::host::bind::<()>(&socket)
             .unwrap()
             .owned(&socket)
@@ -304,44 +339,23 @@ impl BuildServerStandIn {
         let lock = starting.finish(&build_server::readiness(&socket)).unwrap();
         let (asked_sender, asked) = std::sync::mpsc::channel();
         let (release, released) = std::sync::mpsc::channel::<()>();
+        let released = Arc::new(Mutex::new(released));
         std::thread::spawn(move || {
             let _lock = lock;
             for stream in listener.incoming() {
                 let Ok(stream) = stream else {
                     return;
                 };
-                let mut connection = Connection::new(stream).unwrap();
-                // A daemon probes whether a server listens with a connection that sends nothing.
-                let Ok(Some(request)) = connection.recv::<wire::Request>(TIMEOUT) else {
-                    continue;
-                };
-                let Some(wire::request::Request::Prepare(prepare)) = request.request else {
-                    continue;
-                };
-                let _ = asked_sender.send(());
-                if held && released.recv().is_err() {
-                    return;
-                }
-                let packages = prepare
-                    .packages
-                    .into_iter()
-                    .map(|requested| wire::SlotPackage {
-                        op: requested.op,
-                        phase: requested.phase,
-                        part: requested.part,
-                        package: match requested.selector {
-                            Some(wire::package_request::Selector::Package(mut revision)) => {
-                                revision.revision += raise;
-                                Some(revision)
-                            }
-                            _ => None,
-                        },
-                    })
-                    .collect();
-                let _ = connection.deliver(&wire::ServerMessage {
-                    message: Some(wire::server_message::Message::Prepared(
-                        wire::PrepareResponse { packages },
-                    )),
+                let asked = asked_sender.clone();
+                let released = Arc::clone(&released);
+                std::thread::spawn(move || {
+                    answer(
+                        Connection::new(stream).unwrap(),
+                        held,
+                        raise,
+                        &asked,
+                        &released,
+                    );
                 });
             }
         });
@@ -368,13 +382,85 @@ impl BuildServerStandIn {
     /// Waits until a `prepare` arrived.
     pub(crate) fn asked(&self) {
         self.asked
-            .recv_timeout(TIMEOUT)
+            .recv()
             .expect("the Build Server was asked to prepare");
     }
 
     /// Lets one held `prepare` answer.
     pub(crate) fn release(&self) {
         self.release.send(()).unwrap();
+    }
+}
+
+/// Answers the one request a client of the stand-in Build Server sends on `connection`.
+fn answer(
+    mut connection: Connection,
+    held: bool,
+    raise: u32,
+    asked: &Sender<()>,
+    released: &Mutex<Receiver<()>>,
+) {
+    use build_server::protocol::wire;
+
+    // A connection that closes before its request asked nothing.
+    let Ok(request) = connection.recv_next::<wire::Request>() else {
+        return;
+    };
+    match request.request {
+        Some(wire::request::Request::Prepare(prepare)) => {
+            let _ = asked.send(());
+            if held && released.lock().unwrap().recv().is_err() {
+                return;
+            }
+            let packages = prepare
+                .packages
+                .into_iter()
+                .map(|requested| wire::SlotPackage {
+                    op: requested.op,
+                    phase: requested.phase,
+                    part: requested.part,
+                    package: match requested.selector {
+                        Some(wire::package_request::Selector::Package(mut revision)) => {
+                            revision.revision += raise;
+                            Some(revision)
+                        }
+                        _ => None,
+                    },
+                })
+                .collect();
+            let _ = connection.deliver(&wire::ServerMessage {
+                message: Some(wire::server_message::Message::Prepared(
+                    wire::PrepareResponse { packages },
+                )),
+            });
+        }
+        Some(wire::request::Request::Resolve(_)) => {
+            // Every engine package is the stand-in engine, which the test crate built.
+            let path = env!("CARGO_BIN_EXE_stand-in-engine");
+            let file = std::fs::File::open(path).unwrap();
+            let size = file.metadata().unwrap().len();
+            let name = "stand-in-engine".to_owned();
+            let response = wire::ServerMessage {
+                message: Some(wire::server_message::Message::Resolved(
+                    wire::ResolveResponse {
+                        form: wire::ModuleForm::Executable as i32,
+                        files: vec![wire::ModuleFile {
+                            name: name.clone(),
+                            size,
+                            path: path.to_owned(),
+                        }],
+                        entries: std::collections::HashMap::new(),
+                        metadata: String::new(),
+                        interface_version: proto::ENGINE_INTERFACE_VERSION,
+                        executable: name,
+                    },
+                )),
+            };
+            use std::os::fd::AsFd as _;
+            connection.send_with(&response, &[file.as_fd()]).unwrap();
+            connection.flush().unwrap();
+        }
+        _ => {}
     }
 }
 

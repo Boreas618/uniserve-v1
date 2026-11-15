@@ -53,15 +53,14 @@ fn read(descriptor: OwnedFd) -> String {
     std::io::read_to_string(std::fs::File::from(descriptor)).unwrap()
 }
 
-/// Takes the connection that is on its way to `listener`.
+/// Takes the connection that is on its way to `listener`, waiting for the listener to report it.
 fn accept(listener: &Listener) -> Connection {
-    let deadline = Instant::now() + TIMEOUT;
     loop {
         if let Some(connection) = listener.try_accept().unwrap() {
             return connection;
         }
-        assert!(Instant::now() < deadline, "no connection arrived");
-        std::thread::sleep(Duration::from_millis(5));
+        let mut descriptors = [super::pollfd(listener.as_raw_fd(), libc::POLLIN)];
+        super::wait_ready(&mut descriptors, None).unwrap();
     }
 }
 
@@ -267,18 +266,13 @@ fn a_buffered_message_does_not_end_a_wait_and_a_new_one_does() {
         "a buffered message ended the wait"
     );
 
-    let writer = std::thread::spawn(move || {
-        std::thread::sleep(short);
-        peer.write_all(&frame_of(&line(3))).unwrap();
-        peer
-    });
+    peer.write_all(&frame_of(&line(3))).unwrap();
     let started = Instant::now();
     connection.wait(TIMEOUT).unwrap();
     assert!(
         started.elapsed() < TIMEOUT,
         "a new message did not end the wait"
     );
-    let _peer = writer.join().unwrap();
     for length in [2, 3] {
         assert_eq!(connection.try_recv::<Line>().unwrap(), Some(line(length)));
     }
@@ -422,16 +416,14 @@ fn a_hangup_reports_the_peers_close_and_nothing_else() {
         let hangup = connection.hangup().unwrap();
         let (cancel, canceller) = UnixStream::pair().unwrap();
 
+        // Unread data waits on the connection when the owner cancels the wait: only the
+        // cancellation ends it.
         peer.send(&line(1)).unwrap();
-        let cancelling = std::thread::spawn(move || {
-            std::thread::sleep(Duration::from_millis(100));
-            drop(canceller);
-        });
+        drop(canceller);
         assert!(
             !hangup.wait(&cancel).unwrap(),
             "unread data read as a close"
         );
-        cancelling.join().unwrap();
 
         let (cancel, _canceller) = UnixStream::pair().unwrap();
         drop(peer);

@@ -6,11 +6,10 @@ use daemon::engine::control::{BuildServer, EngineControl, prepare_epoch};
 use daemon::{Daemon, DaemonOptions};
 use proto::process::{Exit, NodesQuery, PrepareModules, ThrottleTransfers, reply, request};
 
-use crate::support::{
-    BuildServerStandIn, Engine, TIMEOUT, alive, eventually, launch, module_set, sleeper,
-};
+use crate::support::{BuildServerStandIn, Engine, launch, module_set, package, sleeper};
 
-/// A leader on host `leader` and a member on host `member`.
+/// A leader on host `leader` and a member on host `member`, each host with its stand-in Build
+/// Server.
 struct Deployment {
     // The member is dropped first: dropping the leader first ends the
     // member's service, which is what `the_members_processes_end_with_the_leader`
@@ -18,17 +17,24 @@ struct Deployment {
     member: Option<Daemon>,
     leader: Option<Daemon>,
     address: String,
-    _directory: tempfile::TempDir,
+    _build_servers: Vec<BuildServerStandIn>,
+    _directories: Vec<tempfile::TempDir>,
 }
 
 impl Deployment {
     fn start() -> Self {
-        Self::with_member_build_server(build_server::command::Settings::default())
+        let directory = tempfile::tempdir().unwrap();
+        let member = BuildServerStandIn::serve(directory.path().join("member.build"), false, 0);
+        let mut deployment = Self::with_member_build_server(&member);
+        deployment._build_servers.push(member);
+        deployment._directories.push(directory);
+        deployment
     }
 
-    /// A deployment whose member's host is served by the Build Server `settings` names.
-    fn with_member_build_server(settings: build_server::command::Settings) -> Self {
+    /// A deployment whose member's host is served by the Build Server `member`.
+    fn with_member_build_server(member: &BuildServerStandIn) -> Self {
         let directory = tempfile::tempdir().unwrap();
+        let leader = BuildServerStandIn::serve(directory.path().join("leader.build"), false, 0);
         // The leader's join listener, bound on a port the kernel picks; the member joins at the
         // endpoint it bound.
         let (join, endpoint) = Daemon::bind_join(&"127.0.0.1:0".parse().unwrap()).unwrap();
@@ -38,29 +44,34 @@ impl Deployment {
             host: host.to_owned(),
             dist_init_addr: Some(endpoint.clone()),
             socket: directory.path().join(format!("{host}.sock")),
-            join_timeout: TIMEOUT,
+            join_timeout: daemon::JOIN_TIMEOUT,
             build_server: if host == "member" {
-                settings.clone()
+                member.settings()
             } else {
-                build_server::command::Settings::default()
+                leader.settings()
             },
             storage: storage::Settings::default(),
         };
 
         // The leader's start returns once every member joined, and a
         // member's once it joined, so they start together.
-        let leader = std::thread::spawn({
+        let leader_daemon = std::thread::spawn({
             let options = options(0, "leader");
             move || Daemon::start(options, Some(join)).unwrap()
         });
-        let member = Daemon::start(options(1, "member"), None).unwrap();
-        let leader = leader.join().unwrap();
-        assert_eq!(member.address(), None, "only the leader serves engines");
+        let member_daemon = Daemon::start(options(1, "member"), None).unwrap();
+        let leader_daemon = leader_daemon.join().unwrap();
+        assert_eq!(
+            member_daemon.address(),
+            None,
+            "only the leader serves engines"
+        );
         Self {
-            address: leader.address().unwrap().to_owned(),
-            member: Some(member),
-            leader: Some(leader),
-            _directory: directory,
+            address: leader_daemon.address().unwrap().to_owned(),
+            member: Some(member_daemon),
+            leader: Some(leader_daemon),
+            _build_servers: vec![leader],
+            _directories: vec![directory],
         }
     }
 }
@@ -78,7 +89,7 @@ fn the_leader_routes_each_node_s_requests_to_its_daemon() {
     assert_eq!(nodes, [(0, "leader"), (1, "member")]);
 
     // The member's exit comes back through the leader, naming the node.
-    engine.spawn(launch("member", "group", 1, 2, "/bin/false", &[]));
+    engine.spawn(launch("member", "group", 1, 2, package::FAILS));
     assert_eq!(
         engine.exit(),
         Exit {
@@ -87,7 +98,6 @@ fn the_leader_routes_each_node_s_requests_to_its_daemon() {
             rank: 1,
             generation: 2,
             status: "exit status: 1".into(),
-            last_line: String::new(),
         }
     );
 
@@ -110,34 +120,36 @@ fn the_leader_routes_each_node_s_requests_to_its_daemon() {
 fn a_stop_and_an_engine_s_close_reach_every_node() {
     let deployment = Deployment::start();
     let mut engine = Engine::connect(&deployment.address);
-    let on_leader = engine.spawn(sleeper("leader", "stopped", 0, 0));
-    let on_member = engine.spawn(sleeper("member", "stopped", 1, 0));
+    let on_leader = engine.start(sleeper("leader", "stopped", 0, 0));
+    let on_member = engine.start(sleeper("member", "stopped", 1, 0));
 
-    // The stop is answered once both nodes stopped the group, and the
-    // engine's next request is answered in turn.
+    // The stop is answered once both nodes stopped the group (each killed and reaped its
+    // processes), and the engine's next request is answered in turn.
     engine.stop("stopped");
-    assert!(eventually(|| !alive(on_leader) && !alive(on_member)));
-    let kept = engine.spawn(sleeper("member", "kept", 1, 0));
+    assert!(!on_leader.runs() && !on_member.runs());
+    let kept = engine.start(sleeper("member", "kept", 1, 0));
 
     drop(engine);
-    assert!(eventually(|| !alive(kept)), "a process outlived its engine");
+    kept.wait();
 }
 
 #[test]
 fn the_members_processes_end_with_the_leader() {
     let mut deployment = Deployment::start();
     let mut engine = Engine::connect(&deployment.address);
-    let pid = engine.spawn(sleeper("member", "group", 1, 0));
+    let process = engine.start(sleeper("member", "group", 1, 0));
 
     drop(deployment.leader.take());
     // The member's service ends when the leader's connection closes.
     deployment.member.take().unwrap().wait().unwrap();
-    assert!(!alive(pid), "a member's process outlived the leader");
+    assert!(!process.runs(), "a member's process outlived the leader");
 }
 
 #[test]
 fn a_node_joins_a_running_deployment_and_the_next_engine_runs_processes_there() {
     let directory = tempfile::tempdir().unwrap();
+    let build_server =
+        BuildServerStandIn::serve(directory.path().join("build-server.sock"), false, 0);
     let (join, endpoint) = Daemon::bind_join(&"127.0.0.1:0".parse().unwrap()).unwrap();
     let options = |nnodes: u32, node_rank: u32, host: &str| DaemonOptions {
         nnodes,
@@ -145,8 +157,8 @@ fn a_node_joins_a_running_deployment_and_the_next_engine_runs_processes_there() 
         host: host.to_owned(),
         dist_init_addr: Some(endpoint.clone()),
         socket: directory.path().join(format!("{host}.sock")),
-        join_timeout: TIMEOUT,
-        build_server: build_server::command::Settings::default(),
+        join_timeout: daemon::JOIN_TIMEOUT,
+        build_server: build_server.settings(),
         storage: storage::Settings::default(),
     };
 
@@ -190,7 +202,7 @@ fn a_node_joins_a_running_deployment_and_the_next_engine_runs_processes_there() 
         .map(|node| (node.node_rank, node.host.as_str()))
         .collect();
     assert_eq!(nodes, [(0, "leader"), (1, "member")]);
-    engine.spawn(launch("member", "group", 1, 0, "/bin/false", &[]));
+    engine.spawn(launch("member", "group", 1, 0, package::FAILS));
     assert_eq!(engine.exit().host, "member");
 
     drop(engine);
@@ -208,7 +220,7 @@ fn a_node_prepares_the_module_set_at_its_build_server_and_serves_meanwhile() {
     let directory = tempfile::tempdir().unwrap();
     let modules =
         BuildServerStandIn::serve(directory.path().join("member/build-server.sock"), true, 0);
-    let deployment = Deployment::with_member_build_server(modules.settings());
+    let deployment = Deployment::with_member_build_server(&modules);
     let mut engine = Engine::connect(&deployment.address);
 
     let set = module_set();
@@ -217,8 +229,8 @@ fn a_node_prepares_the_module_set_at_its_build_server_and_serves_meanwhile() {
         modules: Some((&set).into()),
     }));
     modules.asked();
-    let pid = engine.spawn(sleeper("member", "group", 1, 0));
-    assert!(alive(pid), "the spawn answered while the node prepares");
+    let process = engine.start(sleeper("member", "group", 1, 0));
+    assert!(process.runs(), "the spawn answered while the node prepares");
 
     modules.release();
     let prepared = engine.reply(preparing);
@@ -238,7 +250,7 @@ fn a_preparation_fails_naming_its_node_when_the_node_is_lost() {
     let directory = tempfile::tempdir().unwrap();
     let modules =
         BuildServerStandIn::serve(directory.path().join("member/build-server.sock"), true, 0);
-    let mut deployment = Deployment::with_member_build_server(modules.settings());
+    let mut deployment = Deployment::with_member_build_server(&modules);
     let mut engine = Engine::connect(&deployment.address);
 
     let preparing = engine.send(request::Kind::PrepareModules(PrepareModules {
@@ -265,7 +277,7 @@ fn an_epoch_is_prepared_at_every_host_it_runs_on_at_once() {
         BuildServerStandIn::serve(directory.path().join("leader/build-server.sock"), true, 0);
     let member_modules =
         BuildServerStandIn::serve(directory.path().join("member/build-server.sock"), true, 0);
-    let deployment = Deployment::with_member_build_server(member_modules.settings());
+    let deployment = Deployment::with_member_build_server(&member_modules);
     let control = EngineControl::new(
         &directory.path().join("requests.sock"),
         deployment.address.clone(),
@@ -302,7 +314,7 @@ fn a_host_that_prepares_other_modules_fails_the_preparation() {
         BuildServerStandIn::serve(directory.path().join("leader/build-server.sock"), false, 0);
     let member_modules =
         BuildServerStandIn::serve(directory.path().join("member/build-server.sock"), false, 1);
-    let deployment = Deployment::with_member_build_server(member_modules.settings());
+    let deployment = Deployment::with_member_build_server(&member_modules);
     let control = EngineControl::new(
         &directory.path().join("requests.sock"),
         deployment.address.clone(),

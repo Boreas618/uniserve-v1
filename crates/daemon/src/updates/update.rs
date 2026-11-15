@@ -570,8 +570,6 @@ impl Update {
                 generation: launch.engine,
                 // The node's daemon resolves the engine package the launch
                 // names and writes the launch file for this process.
-                executable: String::new(),
-                arguments: Vec::new(),
                 inherit,
                 launch: Vec::new(),
             };

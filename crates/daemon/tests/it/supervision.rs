@@ -4,34 +4,51 @@
 
 use std::io::BufRead as _;
 use std::net::TcpStream;
-use std::time::Duration;
 
 use daemon::Daemon;
 use proto::process::{Exit, reply, request};
 
-use crate::support::{Engine, TIMEOUT, alive, eventually, launch, single_node, sleeper};
+use crate::support::{
+    BuildServerStandIn, Engine, engine_args, launch, package, single_node, sleeper,
+};
 
-/// Starts a single-node daemon on `host` whose process socket lies in
-/// `directory`.
-fn start(directory: &tempfile::TempDir, host: &str) -> Daemon {
-    Daemon::start(
-        single_node(host, directory.path().join("process.sock")),
-        None,
-    )
-    .unwrap()
+/// A single-node daemon on `host` whose process socket lies in `directory`, with the stand-in
+/// Build Server its node resolves its engines at.
+struct Node {
+    daemon: Daemon,
+    _build_server: BuildServerStandIn,
+}
+
+impl Node {
+    fn start(directory: &tempfile::TempDir, host: &str) -> Self {
+        let build_server =
+            BuildServerStandIn::serve(directory.path().join("build-server.sock"), false, 0);
+        let daemon = Daemon::start(
+            single_node(host, directory.path().join("process.sock"), &build_server),
+            None,
+        )
+        .unwrap();
+        Self {
+            daemon,
+            _build_server: build_server,
+        }
+    }
+
+    fn address(&self) -> &str {
+        self.daemon.address().unwrap()
+    }
 }
 
 #[test]
 fn exits_arrive_unasked_and_name_their_launch() {
     let directory = tempfile::tempdir().unwrap();
-    let daemon = start(&directory, "node");
-    let mut engine = Engine::connect(daemon.address().unwrap());
+    let node = Node::start(&directory, "node");
+    let mut engine = Engine::connect(node.address());
 
-    // /bin/false is a real process with a known exit status.
-    engine.spawn(launch("node", "first", 0, 3, "/bin/false", &[]));
+    engine.spawn(launch("node", "first", 0, 3, package::FAILS));
 
     // No further request is sent: the report comes from the daemon's own
-    // polling of its children. It names the generation the spawn carried,
+    // observation of its children. It names the generation the spawn carried,
     // which is how an engine tells it from an exit of the same rank before
     // its group was relaunched.
     assert_eq!(
@@ -42,7 +59,6 @@ fn exits_arrive_unasked_and_name_their_launch() {
             rank: 0,
             generation: 3,
             status: "exit status: 1".into(),
-            last_line: String::new(),
         }
     );
 }
@@ -53,10 +69,10 @@ fn exits_arrive_unasked_and_name_their_launch() {
 #[test]
 fn a_launch_sent_with_the_hello_reports_its_exit_to_its_connection() {
     let directory = tempfile::tempdir().unwrap();
-    let daemon = start(&directory, "node");
+    let node = Node::start(&directory, "node");
     let (mut engine, reply) = Engine::connect_asking(
-        daemon.address().unwrap(),
-        request::Kind::Spawn(launch("node", "first", 0, 3, "/bin/false", &[])),
+        node.address(),
+        request::Kind::Spawn(launch("node", "first", 0, 3, package::FAILS)),
     );
     assert!(
         matches!(reply.kind, Some(reply::Kind::Spawned(_))),
@@ -73,14 +89,14 @@ fn a_launch_sent_with_the_hello_reports_its_exit_to_its_connection() {
 #[test]
 fn an_exit_goes_to_the_connection_that_asked_for_the_launch() {
     let directory = tempfile::tempdir().unwrap();
-    let daemon = start(&directory, "node");
-    let mut asker = Engine::connect(daemon.address().unwrap());
-    let mut other = Engine::connect(daemon.address().unwrap());
+    let node = Node::start(&directory, "node");
+    let mut asker = Engine::connect(node.address());
+    let mut other = Engine::connect(node.address());
 
     // Both clients' launches are the deployment's, so the report cannot be
     // routed by owner: a client waiting for its own process must not read
     // another client's exit as that process's.
-    asker.spawn(launch("node", "first", 0, 0, "/bin/false", &[]));
+    asker.spawn(launch("node", "first", 0, 0, package::FAILS));
     assert_eq!(asker.exit().group, "first");
 
     // The exit was sent before this answer, so a report for `other` is
@@ -92,48 +108,47 @@ fn an_exit_goes_to_the_connection_that_asked_for_the_launch() {
 #[test]
 fn the_first_rank_serves_its_store_on_the_reserved_socket() {
     let directory = tempfile::tempdir().unwrap();
-    let daemon = start(&directory, "node");
-    let mut engine = Engine::connect(daemon.address().unwrap());
+    let node = Node::start(&directory, "node");
+    let mut engine = Engine::connect(node.address());
 
-    let reserved = engine.reserve("node", "group", false);
+    // A world's two sockets, the peer channel and the store, as engine control reserves them.
+    let channel = engine.reserve("node", "group", false);
+    let store = engine.reserve("node", "group", false);
     let other = engine.reserve("node", "other", false);
-    assert_ne!(reserved.address, other.address);
+    assert_ne!(store.address, other.address);
 
     // A reservation is its group's: another group's process cannot take it.
-    let mut stolen = launch("node", "other", 0, 0, "/bin/true", &[]);
-    stolen.inherit = vec![reserved.reservation];
+    let mut stolen = launch("node", "other", 0, 0, package::SUCCEEDS);
+    stolen.inherit = vec![store.reservation];
     let refused = engine.request(request::Kind::Spawn(stolen));
     assert!(
         refused.error.contains("other"),
         "the refusal names the group: {refused:?}"
     );
 
-    // The stand-in rank accepts one peer on the socket it inherits at the
-    // number the reservation reported, which is how a collective store
-    // serves on an inherited socket, and answers it with the launch
-    // generation its command line names. An engine names the number in the
-    // rank's launch descriptor; this stand-in reads it from its command line.
-    let store = "import socket, sys\n\
-         argument = lambda name: sys.argv[sys.argv.index(name) + 1]\n\
-         store = socket.socket(fileno=int(argument('--store')))\n\
-         peer, _ = store.accept()\n\
-         peer.sendall(f'served {argument(\"--generation\")}\\n'.encode())\n";
-    let descriptor = reserved.descriptor.to_string();
-    let mut rank = launch(
-        "node",
-        "group",
-        0,
-        4,
-        "python3",
-        &["-c", store, "--store", &descriptor, "--generation", "4"],
-    );
-    rank.inherit = vec![reserved.reservation];
+    // The stand-in rank accepts one peer on the store it inherits at the number the reservation
+    // reported, which its launch's world states as an engine's does, and answers it with the
+    // engine number its launch states.
+    let mut args = engine_args(package::SERVES_STORE);
+    args.engine = 4;
+    args.world = Some(proto::config::World {
+        scheduler: 4,
+        channel: channel.address.clone(),
+        store: store.address.clone(),
+        peers: 0,
+        inherited: Some(proto::config::Inherited {
+            channel: channel.descriptor,
+            store: store.descriptor,
+        }),
+    });
+    let mut rank = launch("node", "group", 0, 4, package::SERVES_STORE);
+    rank.launch = serde_json::to_vec(&args).unwrap();
+    rank.inherit = vec![channel.reservation, store.reservation];
     engine.spawn(rank);
 
     // The reserved socket is already listening, so this connection waits in
     // its backlog until the rank starts and accepts it.
-    let peer = TcpStream::connect(&reserved.address).unwrap();
-    peer.set_read_timeout(Some(TIMEOUT)).unwrap();
+    let peer = TcpStream::connect(&store.address).unwrap();
     let mut served = String::new();
     std::io::BufReader::new(peer)
         .read_line(&mut served)
@@ -141,29 +156,29 @@ fn the_first_rank_serves_its_store_on_the_reserved_socket() {
     assert_eq!(served, "served 4\n");
     assert_eq!(engine.exit().status, "exit status: 0");
 
-    // The daemon kept no copy of the socket it handed over, so the port
-    // closes with the rank that served it.
-    assert_eq!(
-        TcpStream::connect(&reserved.address).unwrap_err().kind(),
-        std::io::ErrorKind::ConnectionRefused
+    // The daemon handed the socket over and holds it no longer: a second launch cannot inherit
+    // it.
+    let mut again = launch("node", "group", 0, 5, package::SUCCEEDS);
+    again.inherit = vec![store.reservation];
+    let refused = engine.request(request::Kind::Spawn(again));
+    assert!(
+        refused.error.contains("no reservation"),
+        "a reservation is inherited once: {refused:?}"
     );
 }
 
 #[test]
 fn a_reservation_serves_a_launch_another_connection_sends() {
-    // A worker group's client reserves a socket and launches the rank that
-    // inherits it; the two are separate connections of one deployment, and a
-    // client is filed under the deployment rather than under the number its
-    // arrival gave it. Filed by arrival, the launch would be refused as
-    // another group's — the reservation was made on the first connection and
-    // inherited through the second.
+    // A worker group's client reserves a socket and launches the rank that inherits it; the two
+    // are separate connections of one deployment, both served for its head, so the reservation
+    // made on the first serves the launch sent on the second.
     let directory = tempfile::tempdir().unwrap();
-    let daemon = start(&directory, "node");
-    let mut first = Engine::connect(daemon.address().unwrap());
+    let node = Node::start(&directory, "node");
+    let mut first = Engine::connect(node.address());
     let reserved = first.reserve("node", "group", false);
 
-    let mut second = Engine::connect(daemon.address().unwrap());
-    let mut rank = launch("node", "group", 0, 1, "/bin/true", &[]);
+    let mut second = Engine::connect(node.address());
+    let mut rank = launch("node", "group", 0, 1, package::SUCCEEDS);
     rank.inherit = vec![reserved.reservation];
     second.spawn(rank);
     assert_eq!(second.exit().status, "exit status: 0");
@@ -172,18 +187,19 @@ fn a_reservation_serves_a_launch_another_connection_sends() {
 #[test]
 fn a_stop_ends_every_generation_of_one_group_only() {
     let directory = tempfile::tempdir().unwrap();
-    let daemon = start(&directory, "node");
-    let mut engine = Engine::connect(daemon.address().unwrap());
+    let node = Node::start(&directory, "node");
+    let mut engine = Engine::connect(node.address());
 
     // A group's standby ranks run beside its serving ones under a later
     // generation.
-    let serving = engine.spawn(sleeper("node", "stopped", 0, 0));
-    let standby = engine.spawn(sleeper("node", "stopped", 0, 1));
-    let kept = engine.spawn(sleeper("node", "kept", 0, 0));
+    let serving = engine.start(sleeper("node", "stopped", 0, 0));
+    let standby = engine.start(sleeper("node", "stopped", 0, 1));
+    let kept = engine.start(sleeper("node", "kept", 0, 0));
 
+    // The stop is answered once the group's processes were killed and reaped.
     engine.stop("stopped");
-    assert!(eventually(|| !alive(serving) && !alive(standby)));
-    assert!(alive(kept), "a stop ended another group");
+    assert!(!serving.runs() && !standby.runs());
+    assert!(kept.runs(), "a stop ended another group");
 }
 
 /// A stop that names one generation ends that launch of the group, and
@@ -191,36 +207,36 @@ fn a_stop_ends_every_generation_of_one_group_only() {
 #[test]
 fn a_stop_of_one_generation_leaves_the_groups_other_launches() {
     let directory = tempfile::tempdir().unwrap();
-    let daemon = start(&directory, "node");
-    let mut engine = Engine::connect(daemon.address().unwrap());
-    let serving = engine.spawn(sleeper("node", "group", 0, 0));
-    let standby = engine.spawn(sleeper("node", "group", 0, 1));
+    let node = Node::start(&directory, "node");
+    let mut engine = Engine::connect(node.address());
+    let serving = engine.start(sleeper("node", "group", 0, 0));
+    let standby = engine.start(sleeper("node", "group", 0, 1));
 
     let reply = engine.request(request::Kind::Stop(proto::process::Stop {
         group: "group".into(),
         generation: Some(0),
     }));
     assert_eq!(reply.error, "");
-    assert!(eventually(|| !alive(serving)));
-    assert!(alive(standby), "a stop of one generation ended another");
+    assert!(!serving.runs());
+    assert!(standby.runs(), "a stop of one generation ended another");
 }
 
 #[test]
 fn an_engine_takes_its_processes_with_it() {
     let directory = tempfile::tempdir().unwrap();
-    let daemon = start(&directory, "node");
+    let node = Node::start(&directory, "node");
 
     // Two engines of one deployment, as during an epoch change, name the same
     // groups and ranks.
-    let mut leaving = Engine::connect(daemon.address().unwrap());
-    let mut staying = Engine::connect(daemon.address().unwrap());
-    let left = leaving.spawn(sleeper("node", "group", 0, 0));
-    let stayed = staying.spawn(sleeper("node", "group", 0, 0));
+    let mut leaving = Engine::connect(node.address());
+    let mut staying = Engine::connect(node.address());
+    let left = leaving.start(sleeper("node", "group", 0, 0));
+    let stayed = staying.start(sleeper("node", "group", 0, 0));
 
     drop(leaving);
-    assert!(eventually(|| !alive(left)), "a process outlived its engine");
+    left.wait();
     assert!(
-        alive(stayed),
+        stayed.runs(),
         "an engine's close ended another engine's process"
     );
     assert!(matches!(
@@ -232,18 +248,18 @@ fn an_engine_takes_its_processes_with_it() {
             .kind,
         Some(reply::Kind::Stopped(_))
     ));
-    assert!(eventually(|| !alive(stayed)));
+    assert!(!stayed.runs());
 }
 
 #[test]
 fn a_stopped_daemon_takes_its_processes_with_it() {
     let directory = tempfile::tempdir().unwrap();
-    let mut daemon = start(&directory, "node");
-    let mut engine = Engine::connect(daemon.address().unwrap());
-    let pid = engine.spawn(sleeper("node", "group", 0, 0));
+    let mut node = Node::start(&directory, "node");
+    let mut engine = Engine::connect(node.address());
+    let process = engine.start(sleeper("node", "group", 0, 0));
 
-    daemon.stop().unwrap();
-    assert!(!alive(pid), "a process outlived its daemon's stop");
+    node.daemon.stop().unwrap();
+    assert!(!process.runs(), "a process outlived its daemon's stop");
 }
 
 /// A daemon serves an engine of its own version of the engine interface alone, and refuses one
@@ -254,13 +270,13 @@ fn a_daemon_serves_engines_of_its_own_version_alone() {
     use proto::process::{Refusal, VersionRefusal};
 
     let directory = tempfile::tempdir().unwrap();
-    let daemon = start(&directory, "node");
+    let node = Node::start(&directory, "node");
 
     let ours = proto::ENGINE_INTERFACE_VERSION;
-    let (_, welcome) = Engine::hello(daemon.address().unwrap(), ours);
+    let (_, welcome) = Engine::hello(node.address(), ours);
     assert_eq!(welcome.refusal, None, "an engine of this build is refused");
     for offered in [ours - 1, ours + 1] {
-        let (_, welcome) = Engine::hello(daemon.address().unwrap(), offered);
+        let (_, welcome) = Engine::hello(node.address(), offered);
         assert_eq!(
             welcome.refusal,
             Some(Refusal {
@@ -274,53 +290,34 @@ fn a_daemon_serves_engines_of_its_own_version_alone() {
     }
 }
 
-/// The daemon of [`a_killed_daemon_takes_its_processes_with_it`], in a
-/// process of its own: this test binary runs it with the socket's path in
-/// [`DAEMON_SOCKET`].
-#[test]
-#[ignore = "runs as the daemon process of a supervision test"]
-fn daemon_host() {
-    let Some(socket) = std::env::var_os(DAEMON_SOCKET) else {
-        return;
-    };
-    let _daemon = Daemon::start(single_node("node", socket.into()), None).unwrap();
-    loop {
-        std::thread::sleep(Duration::from_secs(60));
-    }
-}
-
-const DAEMON_SOCKET: &str = "UNISERVE_TEST_DAEMON_SOCKET";
-
+/// A daemon killed outright takes its processes with it: each follows its lifeline, whose last
+/// write end the kernel closes with the daemon.
 #[test]
 fn a_killed_daemon_takes_its_processes_with_it() {
     let directory = tempfile::tempdir().unwrap();
     let socket = directory.path().join("process.sock");
-    let mut host = std::process::Command::new(std::env::current_exe().unwrap())
-        .args(["--exact", "supervision::daemon_host", "--ignored"])
-        .env(DAEMON_SOCKET, &socket)
-        .stdout(std::process::Stdio::null())
+    let build_server =
+        BuildServerStandIn::serve(directory.path().join("build-server.sock"), false, 0);
+    let mut host = std::process::Command::new(env!("CARGO_BIN_EXE_daemon-host"))
+        .arg("--socket")
+        .arg(&socket)
+        .arg("--build-server")
+        .arg(build_server.socket())
+        .stdout(std::process::Stdio::piped())
         .spawn()
         .unwrap();
-    assert!(eventually(|| socket.exists()), "the daemon did not start");
+    // The host reports that its daemon serves.
+    let mut ready = String::new();
+    std::io::BufReader::new(host.stdout.take().unwrap())
+        .read_line(&mut ready)
+        .unwrap();
+    assert_eq!(ready, "serving\n", "the daemon did not start");
     let mut engine = Engine::connect(&format!("unix:{}", socket.display()));
-    // A process that follows its lifeline, as the engine does: the
-    // descriptor its command line's `--lifeline` names.
-    let pid = engine.spawn(launch(
-        "node",
-        "group",
-        0,
-        0,
-        "python3",
-        &[
-            "-c",
-            "import os, sys; os.read(int(sys.argv[sys.argv.index('--lifeline') + 1]), 1)",
-        ],
-    ));
-    assert!(alive(pid));
+    let process = engine.start(sleeper("node", "group", 0, 0));
 
     // SIGKILL skips every exit path of the daemon's own; the kernel closes
     // the lifeline's write end with the daemon.
     host.kill().unwrap();
     host.wait().unwrap();
-    assert!(eventually(|| !alive(pid)), "a process outlived its daemon");
+    process.wait();
 }

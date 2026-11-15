@@ -227,8 +227,10 @@ message ModuleSet {
   repeated KernelPackage kernels = 3;
 }
 
-// Start one process of a worker group on a node, as a child of its daemon.
+// Start one engine process of a worker group on a node, as a child of its daemon.
 message Spawn {
+  reserved 5, 6, 7;
+  reserved "executable", "arguments", "environment";
   // The node, by host identity.
   string host = 1;
   // The worker group, its rank within the group and the generation of the
@@ -236,19 +238,15 @@ message Spawn {
   string group = 2;
   uint32 rank = 3;
   uint64 generation = 4;
-  // The executable and its arguments, after the executable's name.
-  string executable = 5;
-  repeated string arguments = 6;
-  reserved 7;
-  reserved "environment";
   // Reservations of this node whose sockets the process inherits, each at
   // the descriptor number its `Reserved` named.
   repeated uint64 inherit = 8;
-  // An engine's launch file (`proto::config::EngineArgs` as JSON); empty
-  // for any other process. The node's daemon states its own node's facts in
-  // it (its Build Server's socket), writes it to its runtime directory and
-  // passes `--launch <path>` after `arguments`, so an engine starts on
-  // any node of the deployment from the same request.
+  // The engine's launch (`proto::config::EngineArgs` as JSON). The node's
+  // daemon states its own node's facts in it (its Build Server's socket),
+  // runs the engine package its module set names, resolved at that Build
+  // Server, and passes the launch as an inherited sealed memfd
+  // (`--launch <fd>`), so an engine starts on any node of the deployment from
+  // the same request.
   bytes launch = 9;
 }
 
@@ -759,17 +757,17 @@ message Shrunk {
   string host = 3;
 }
 
-// A supervised process exited.
+// A supervised process exited. What it explained of its end is in its own log, which is its
+// daemon's standard error.
 message Exit {
+  reserved 6;
+  reserved "last_line";
   string host = 1;
   string group = 2;
   uint32 rank = 3;
   uint64 generation = 4;
   // Its exit status, or why the status could not be read.
   string status = 5;
-  // The last line it wrote to its standard error: a process that ends before
-  // it can state why says so there.
-  string last_line = 6;
 }
 
 // What travels from a connecting peer after its `Hello`.
