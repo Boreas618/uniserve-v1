@@ -111,7 +111,6 @@ fn main() -> Result<std::process::ExitCode> {
         println!("a process panicked: {panic}");
         default(panic);
     }));
-    take_lifeline();
     // The serving commands read which flags their command line states, so they keep its matches.
     let matches = <Cli as clap::CommandFactory>::command().get_matches();
     let cli = <Cli as clap::FromArgMatches>::from_arg_matches(&matches)
@@ -175,25 +174,6 @@ fn idle_devices() -> std::result::Result<Vec<u32>, String> {
 /// engine executable registers the numerical side of the same families.
 pub(crate) fn served() -> Result<processing::Registry> {
     Ok(processing::Registry::new(processing::FAMILIES)?)
-}
-
-/// Drops a lifeline this process inherited from a daemon that started it
-/// (`proto::LIFELINE_ENV`): the read end of a pipe whose write end that daemon
-/// holds. A host service outlives the daemon that started it, so it does not
-/// follow the lifeline; the variable leaves the environment and the descriptor
-/// turns close-on-exec, so no process this one starts takes either for its
-/// own. Runs before any thread starts.
-fn take_lifeline() {
-    let Some(descriptor) = std::env::var(daemon::supervision::LIFELINE_ENV)
-        .ok()
-        .and_then(|descriptor| descriptor.parse::<i32>().ok())
-    else {
-        return;
-    };
-    // SAFETY: no other thread exists yet to read the environment.
-    unsafe { std::env::remove_var(daemon::supervision::LIFELINE_ENV) };
-    // SAFETY: fcntl takes integers only; the descriptor is this process's.
-    unsafe { libc::fcntl(descriptor, libc::F_SETFD, libc::FD_CLOEXEC) };
 }
 
 /// The daemon's Tokio runtime.

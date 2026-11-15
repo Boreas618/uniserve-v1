@@ -503,7 +503,6 @@ mod tests {
             generation,
             executable: String::new(),
             arguments: Vec::new(),
-            environment: Default::default(),
             inherit: Vec::new(),
             launch: Vec::new(),
         }

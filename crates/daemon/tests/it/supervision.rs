@@ -112,22 +112,22 @@ fn the_first_rank_serves_its_store_on_the_reserved_socket() {
     // number the reservation reported, which is how a collective store
     // serves on an inherited socket, and answers it with the launch
     // generation its command line names. An engine names the number in the
-    // rank's launch descriptor; this stand-in reads it from its environment.
-    let store = "import os, socket, sys\n\
-         store = socket.socket(fileno=int(os.environ['STORE_FD']))\n\
+    // rank's launch descriptor; this stand-in reads it from its command line.
+    let store = "import socket, sys\n\
+         argument = lambda name: sys.argv[sys.argv.index(name) + 1]\n\
+         store = socket.socket(fileno=int(argument('--store')))\n\
          peer, _ = store.accept()\n\
-         generation = sys.argv[sys.argv.index('--generation') + 1]\n\
-         peer.sendall(f'served {generation}\\n'.encode())\n";
+         peer.sendall(f'served {argument(\"--generation\")}\\n'.encode())\n";
+    let descriptor = reserved.descriptor.to_string();
     let mut rank = launch(
         "node",
         "group",
         0,
         4,
         "python3",
-        &["-c", store, "--generation", "4"],
+        &["-c", store, "--store", &descriptor, "--generation", "4"],
     );
     rank.inherit = vec![reserved.reservation];
-    rank.environment = [("STORE_FD".to_owned(), reserved.descriptor.to_string())].into();
     engine.spawn(rank);
 
     // The reserved socket is already listening, so this connection waits in
@@ -303,7 +303,8 @@ fn a_killed_daemon_takes_its_processes_with_it() {
         .unwrap();
     assert!(eventually(|| socket.exists()), "the daemon did not start");
     let mut engine = Engine::connect(&format!("unix:{}", socket.display()));
-    // A process that follows its lifeline, as the engine and the workers do.
+    // A process that follows its lifeline, as the engine does: the
+    // descriptor its command line's `--lifeline` names.
     let pid = engine.spawn(launch(
         "node",
         "group",
@@ -312,7 +313,7 @@ fn a_killed_daemon_takes_its_processes_with_it() {
         "python3",
         &[
             "-c",
-            "import os; os.read(int(os.environ['UNISERVE_LIFELINE']), 1)",
+            "import os, sys; os.read(int(sys.argv[sys.argv.index('--lifeline') + 1]), 1)",
         ],
     ));
     assert!(alive(pid));

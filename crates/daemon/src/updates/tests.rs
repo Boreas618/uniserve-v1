@@ -152,7 +152,6 @@ impl Deployment {
             epoch: TARGET,
             record,
             launches,
-            environment: Default::default(),
             requests: "unix:/run/requests.sock".to_owned(),
             keeps: PreviousEpoch::Parked,
             recompute: false,

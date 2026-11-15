@@ -139,8 +139,6 @@ pub(crate) struct EpochSwitch {
     /// module set, the engine it succeeds and its own launch generation
     /// (`engine`), so the engine parks by itself once it is ready.
     pub(crate) launches: Vec<(proto::config::EngineArgs, Vec<u64>)>,
-    /// Variables set over the daemon's environment for the target engines.
-    pub(crate) environment: std::collections::HashMap<String, String>,
     /// The request socket requests are submitted to after the switch.
     pub(crate) requests: String,
     /// What the previous epoch keeps through the trial
@@ -566,7 +564,6 @@ impl Update {
             .record(trial.switch.epoch, trial.switch.record.clone());
 
         let launches = trial.switch.launches.clone();
-        let environment = trial.switch.environment.clone();
         for (launch, inherit) in launches {
             let spawn = Spawn {
                 host: launch.host.clone(),
@@ -577,7 +574,6 @@ impl Update {
                 // names and writes the launch file for this process.
                 executable: String::new(),
                 arguments: Vec::new(),
-                environment: environment.clone(),
                 inherit,
                 launch: Vec::new(),
             };

@@ -248,9 +248,17 @@ pub(crate) fn launch(
     }
 }
 
-/// The launch of a process that sleeps until it is killed.
+/// The launch of a process that sleeps until it is killed. Its shell takes the lifeline the
+/// daemon appends to its command line as its positional parameters.
 pub(crate) fn sleeper(host: &str, group: &str, rank: u32, generation: u64) -> Spawn {
-    launch(host, group, rank, generation, "/bin/sleep", &["600"])
+    launch(
+        host,
+        group,
+        rank,
+        generation,
+        "sh",
+        &["-c", "exec sleep 600"],
+    )
 }
 
 /// Whether process `pid` exists and is not a zombie awaiting its reaper.

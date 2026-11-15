@@ -22,7 +22,6 @@ mod service;
 mod supervisor;
 
 pub(crate) use service::ServiceHandoff;
-pub use supervisor::LIFELINE_ENV;
 pub(crate) use supervisor::engine_executable;
 
 use std::net::IpAddr;
@@ -757,8 +756,8 @@ mod tests {
                 group: "model".to_owned(),
                 rank: 0,
                 generation: 1,
-                executable: "sleep".to_owned(),
-                arguments: vec!["600".to_owned()],
+                executable: "sh".to_owned(),
+                arguments: vec!["-c".to_owned(), "exec sleep 600".to_owned()],
                 ..Spawn::default()
             }),
         );

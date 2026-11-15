@@ -249,9 +249,8 @@ message Spawn {
   // The executable and its arguments, after the executable's name.
   string executable = 5;
   repeated string arguments = 6;
-  // Variables set over the daemon's environment; an empty value is set
-  // empty rather than removed.
-  map<string, string> environment = 7;
+  reserved 7;
+  reserved "environment";
   // Reservations of this node whose sockets the process inherits, each at
   // the descriptor number its `Reserved` named.
   repeated uint64 inherit = 8;

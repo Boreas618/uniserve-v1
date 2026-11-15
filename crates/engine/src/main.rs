@@ -4,9 +4,10 @@
 //! The engine is a package: this crate with the crates it depends on, built by
 //! the Build Server into this executable (`package.toml`). A node's daemon
 //! resolves the revision its epoch names and starts it with one launch file
-//! (`--launch`, [`proto::config::EngineArgs`]); the process serves until its
-//! daemon commands it down, the epoch fails, or the daemon is gone
-//! ([`follow_lifeline`]).
+//! (`--launch`, [`proto::config::EngineArgs`]) and its lifeline (`--lifeline`);
+//! the process serves until its daemon commands it down, the epoch fails, or
+//! the daemon is gone ([`follow_lifeline`]). The process states the settings its
+//! CUDA and NCCL libraries read at initialization itself ([`RUNTIME_SETTINGS`]).
 //!
 //! With `--keys` the process runs the same start up to the profile run of
 //! every device's runners, prints the kernel keys they recorded as the key
@@ -64,6 +65,11 @@ struct Cli {
     /// (`proto::config::EngineArgs`).
     #[arg(long, value_name = "FILE")]
     launch: PathBuf,
+    /// The descriptor of the lifeline the supervising daemon passed
+    /// (`proto::LIFELINE_OPTION`): the read end of a pipe whose write end the
+    /// daemon holds. The process ends once the pipe does.
+    #[arg(long, value_name = "FD")]
+    lifeline: Option<i32>,
     /// Print the kernel keys this launch's profile runs record
     /// (`operator<TAB>key` lines, sorted, each once) and exit, serving
     /// nothing.
@@ -87,8 +93,10 @@ fn main() -> Result<ExitCode> {
         println!("a process panicked: {panic}");
         default(panic);
     }));
-    let lifeline = take_lifeline();
+    // Before any thread, CUDA or NCCL exists.
+    runtime_settings();
     let cli = Cli::parse();
+    let lifeline = cli.lifeline.map(take_lifeline);
     let launch_file = cli.launch;
     let registry = nn::family::Registry::new(FAMILIES)?;
 
@@ -125,21 +133,41 @@ fn main() -> Result<ExitCode> {
     engine::run(&launch_file, &registry).map(|()| ExitCode::SUCCESS)
 }
 
-/// The lifeline this process inherited from the daemon that supervises it
-/// ([`proto::LIFELINE_ENV`]): the read end of a pipe whose write end the
-/// daemon holds. The variable leaves the environment and the descriptor turns
-/// close-on-exec, so no process this one starts takes either for its own.
-/// Runs before any thread starts.
-fn take_lifeline() -> Option<i32> {
-    let descriptor = std::env::var(proto::LIFELINE_ENV)
-        .ok()?
-        .parse::<i32>()
-        .ok()?;
-    // SAFETY: no other thread exists yet to read the environment.
-    unsafe { std::env::remove_var(proto::LIFELINE_ENV) };
+/// Settings this process's CUDA and NCCL libraries read from the process environment when they
+/// initialize, stated by the process itself before either initializes.
+///
+/// - `CUDA_MODULE_LOADING=EAGER`: lazy module loading synchronizes the context when a kernel is
+///   first used, which can deadlock against a collective another stream is waiting in for a peer.
+/// - `NCCL_RUNTIME_CONNECT=0`: deferred peer handshakes would allocate connection buffers after the
+///   process reserved its device storage.
+/// - `NCCL_GRAPH_REGISTER=0`: a collective captured in a graph registers its buffers, which lie in
+///   the rank's graph pool, with its peers, which map that storage themselves. A sleep, and a
+///   standby that parks with its storage suspended, give the graph pool's storage back and map new
+///   storage at the same addresses when they wake, which the peers' mappings do not follow: every
+///   collective after the wake would move data through storage no rank reads. Unregistered, a
+///   captured collective copies through NCCL's own buffers, which stay mapped.
+const RUNTIME_SETTINGS: [(&str, &str); 3] = [
+    ("CUDA_MODULE_LOADING", "EAGER"),
+    ("NCCL_RUNTIME_CONNECT", "0"),
+    ("NCCL_GRAPH_REGISTER", "0"),
+];
+
+/// States [`RUNTIME_SETTINGS`] in this process's environment. Runs first in `main`, before any
+/// thread starts.
+fn runtime_settings() {
+    for (name, value) in RUNTIME_SETTINGS {
+        // SAFETY: no other thread exists yet to read the environment.
+        unsafe { std::env::set_var(name, value) };
+    }
+}
+
+/// Takes the lifeline at `descriptor`, which this process inherited from the daemon that
+/// supervises it (`--lifeline`): the descriptor turns close-on-exec, so no process this one starts
+/// takes it for its own.
+fn take_lifeline(descriptor: i32) -> i32 {
     // SAFETY: fcntl takes integers only; the descriptor is this process's.
     unsafe { libc::fcntl(descriptor, libc::F_SETFD, libc::FD_CLOEXEC) };
-    Some(descriptor)
+    descriptor
 }
 
 /// Ends this process once its daemon is gone: the end of the lifeline's

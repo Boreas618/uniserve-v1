@@ -10,9 +10,10 @@
 //!
 //! A process ends with its daemon through its lifeline: a pipe whose write
 //! end the daemon holds and whose read end every process inherits, at the
-//! descriptor [`LIFELINE_ENV`] names. The engine and the workers exit once
-//! they read the pipe's end, which the kernel delivers when the last write
-//! end closed, however the daemon ended. A hot restart hands the processes,
+//! descriptor the last option of its command line names
+//! (`proto::LIFELINE_OPTION`). The engine exits once it reads the pipe's end,
+//! which the kernel delivers when the last write end closed, however the
+//! daemon ended. A hot restart hands the processes,
 //! and the write end with them, to the successor daemon
 //! (`Supervisor::hand_over`), which supervises them from then on through
 //! their pidfds (`Supervisor::adopt`): the pipe stays open across it, so no
@@ -45,8 +46,6 @@ use std::os::unix::process::CommandExt;
 use std::path::PathBuf;
 use std::process::{Command, ExitStatus, Stdio};
 use std::sync::{Arc, Mutex};
-
-pub use proto::LIFELINE_ENV;
 
 /// A supervised process: the owner it was started for, the connection that
 /// asked for it, its worker group, its rank and the generation of the group's
@@ -318,7 +317,8 @@ impl Supervisor {
         );
 
         // An engine runs as the engine package its launch names; any
-        // other process as the executable the request states.
+        // other process as the executable the request states. Every one's
+        // command line ends with its lifeline.
         let mut command = if spawn.launch.is_empty() {
             Command::new(&spawn.executable)
         } else {
@@ -330,15 +330,12 @@ impl Supervisor {
             command
         };
         command.args(&spawn.arguments);
-        for (name, value) in &spawn.environment {
-            command.env(name, value);
-        }
+        inherit_lifeline(&mut command, &self.lifeline.read);
         // A worker leads a process group of its own, with every process it
         // starts: the Storage Server shoots down a previous writer by its
         // group, which ends the children that may have inherited its device
         // descriptors, and never the daemon.
         command.process_group(0);
-        inherit_lifeline(&mut command, &self.lifeline.read);
         // Every reservation is checked before any is taken, so a refused
         // spawn leaves the group's reservations held.
         if let Some(reservation) = spawn.inherit.iter().find(|reservation| {
@@ -736,11 +733,14 @@ pub(crate) struct ReservationHandoff {
     pub(crate) group: String,
 }
 
-/// Makes the process `command` starts inherit the lifeline's read end at
-/// its descriptor number, which [`LIFELINE_ENV`] names to it.
+/// Makes the process `command` starts inherit the lifeline's read end at its
+/// descriptor number, which the option appended to its command line names
+/// (`proto::LIFELINE_OPTION`).
 fn inherit_lifeline(command: &mut Command, read: &OwnedFd) {
     let descriptor = read.as_raw_fd();
-    command.env(LIFELINE_ENV, descriptor.to_string());
+    command
+        .arg(proto::LIFELINE_OPTION)
+        .arg(descriptor.to_string());
     // SAFETY: the closure runs in the forked child between fork and exec and
     // only calls `fcntl`, which is async-signal-safe; the daemon holds the
     // descriptor open for as long as it supervises.
@@ -993,8 +993,8 @@ mod tests {
             group: "model".to_owned(),
             rank: 0,
             generation: 1,
-            executable: "sleep".to_owned(),
-            arguments: vec!["600".to_owned()],
+            executable: "sh".to_owned(),
+            arguments: vec!["-c".to_owned(), "exec sleep 600".to_owned()],
             ..Spawn::default()
         };
         let pid = first.spawn(7, 7, &spawn).unwrap();

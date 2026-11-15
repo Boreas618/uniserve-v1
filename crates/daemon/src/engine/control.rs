@@ -49,37 +49,6 @@ const DAEMON_TIMEOUT: Duration = Duration::from_secs(90);
 /// How often a wait rechecks the engine process while it starts.
 const POLL_INTERVAL: Duration = Duration::from_millis(50);
 
-/// Variables an engine's CUDA and NCCL libraries read before their first use, with the value it
-/// runs with unless the daemon's own environment states the variable.
-///
-/// - `CUDA_MODULE_LOADING=EAGER`: lazy module loading synchronizes the context when a kernel is first
-///   used, which can deadlock against a collective another stream is waiting in for a peer.
-/// - `NCCL_RUNTIME_CONNECT=0`: deferred peer handshakes would allocate connection buffers after the
-///   process reserved its device storage.
-/// - `NCCL_GRAPH_REGISTER=0`: a collective captured in a graph registers its buffers, which lie in
-///   the rank's graph pool, with its peers, which map that storage themselves. A sleep, and a
-///   standby that parks with its storage suspended, give the graph pool's storage back and map
-///   new storage at the same addresses when they wake, which the peers' mappings do not follow:
-///   every collective after the wake would move data through storage no rank reads. Unregistered,
-///   a captured collective copies through NCCL's own buffers, which stay mapped.
-const RUNTIME_DEFAULTS: [(&str, &str); 3] = [
-    ("CUDA_MODULE_LOADING", "EAGER"),
-    ("NCCL_RUNTIME_CONNECT", "0"),
-    ("NCCL_GRAPH_REGISTER", "0"),
-];
-
-/// The environment an engine is started under: stated on its command, so it precedes any CUDA
-/// or NCCL initialization.
-pub(crate) fn main_process_environment() -> std::collections::HashMap<String, String> {
-    RUNTIME_DEFAULTS
-        .into_iter()
-        .map(|(name, value)| {
-            let value = std::env::var(name).unwrap_or_else(|_| value.to_owned());
-            (name.to_owned(), value)
-        })
-        .collect()
-}
-
 /// How long a Build Server this daemon starts may take to serve: it
 /// discovers its toolchains, which imports the compilers of its Python
 /// environment, and loads every installed package first.
@@ -725,8 +694,7 @@ impl EngineControl {
 
     /// What an epoch update starts the world of one target replica with: the launch file of each of
     /// its engines, numbered `numbers` (the launch generations, the scheduler node's first), with
-    /// the reservations it inherits ([`Self::world`]). The engines are started with
-    /// [`main_process_environment`] set over the daemon's environment.
+    /// the reservations it inherits ([`Self::world`]).
     ///
     /// # Errors
     ///
@@ -767,7 +735,6 @@ impl EngineControl {
                     // package its launch names at its own Build Server.
                     executable: String::new(),
                     arguments: Vec::new(),
-                    environment: main_process_environment(),
                     inherit,
                     // The node that starts the process writes its launch file.
                     launch: serde_json::to_vec(launch).context("encoding the launch file")?,

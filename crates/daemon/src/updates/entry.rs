@@ -619,7 +619,6 @@ impl Leader {
                 epoch: target_epoch,
                 record,
                 launches,
-                environment: crate::engine::control::main_process_environment(),
                 requests: control.request_address().to_owned(),
                 keeps: options.previous_epoch,
                 recompute: request.in_flight == InFlight::Recompute,

@@ -207,10 +207,11 @@ envelopes!(
     request::wire::ArtifactPart,
 );
 
-/// The environment variable that names a supervised process's lifeline: the
-/// descriptor number of the read end of a pipe whose write end its daemon
-/// holds. The process ends once the pipe does.
-pub const LIFELINE_ENV: &str = "UNISERVE_LIFELINE";
+/// The command-line option that names a supervised process's lifeline: the
+/// descriptor number, inherited from the daemon that supervises the process, of
+/// the read end of a pipe whose write end that daemon holds. The daemon appends
+/// it to every process's command line; an engine ends once the pipe does.
+pub const LIFELINE_OPTION: &str = "--lifeline";
 
 /// The build this crate is compiled in: the package version, then `+` and a
 /// digest of the workspace sources every artifact of the build is compiled
