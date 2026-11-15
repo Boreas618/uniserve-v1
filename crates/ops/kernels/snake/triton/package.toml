@@ -15,8 +15,7 @@ kind = "triton"
 kernel = "_snake_kernel"
 warps = { field = "block", steps = [[2048, 8]], otherwise = 4 }
 
-# The signal's row count, channel count and width are launch words. `pdl` is a word the kernel
-# does not read: the dependent launch is compiled in.
+# The signal's row count, channel count and width are launch words.
 [launch.types]
 x_ptr = { pointer = "dtype" }
 alpha_ptr = { pointer = "dtype" }
@@ -24,7 +23,6 @@ out_ptr = { pointer = "dtype" }
 rows = "i64"
 channels = "i32"
 width = "i32"
-pdl = "i32"
 
 # `block` is the program's lane width.
 [launch.constants]

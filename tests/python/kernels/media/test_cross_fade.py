@@ -87,7 +87,6 @@ def launch(kernels, previous, current, out, extent, axis, block, pdl=False):
         *current.stride()[:3],
         *out.stride()[:3],
         block,
-        int(pdl),
         AXIS=axis,
         BLOCK=block,
         PDL=pdl,

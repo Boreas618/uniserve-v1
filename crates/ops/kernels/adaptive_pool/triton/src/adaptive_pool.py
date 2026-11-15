@@ -33,7 +33,6 @@ def _adaptive_pool_kernel(
     heads,
     width,
     output,
-    pdl,
     HEADS: tl.constexpr,  # noqa: N803
     WIDTH: tl.constexpr,  # noqa: N803
     OUTPUT: tl.constexpr,  # noqa: N803

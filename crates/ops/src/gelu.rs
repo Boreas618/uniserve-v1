@@ -134,8 +134,7 @@ impl Op for Gelu {
             .view("x_ptr", &args.x)
             .view("out_ptr", &args.out)
             .u64("elements", elements)
-            .u32("columns", descriptor.columns)
-            .flag("pdl", descriptor.pdl);
+            .u32("columns", descriptor.columns);
         kernel.launch(
             LaunchGrid::covering(elements, u64::from(descriptor.block))?,
             &mut arguments,

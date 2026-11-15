@@ -276,8 +276,7 @@ impl Op for Posterior {
             .u64("noise_channel", args.noise.stride(1))
             .u64("out_row", args.out.stride(0))
             .u64("out_channel", args.out.stride(1))
-            .u64("total", positions * channels)
-            .flag("pdl", descriptor.pdl);
+            .u64("total", positions * channels);
         kernel.launch(
             LaunchGrid::linear((positions * channels).div_ceil(u64::from(descriptor.block)))?,
             &mut arguments,

@@ -16,13 +16,11 @@ kernel = "_log_softmax_kernel"
 warps = { field = "step", steps = [[2048, 8]], otherwise = 4 }
 derive = "derive"
 
-# The output is FP32 whatever the input's element type. `pdl` is a word the kernel does not read:
-# the dependent launch is compiled in.
+# The output is FP32 whatever the input's element type.
 [launch.types]
 x_ptr = { pointer = "dtype" }
 out_ptr = "*fp32"
 columns = "i32"
-pdl = "i32"
 
 [launch.constants]
 STEP = { field = "step" }

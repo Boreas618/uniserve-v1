@@ -32,7 +32,6 @@ def _channel_affine_kernel(
     channels,
     positions,
     elements,
-    pdl,
     BLOCK: tl.constexpr,
     PDL: tl.constexpr,  # noqa: N803
 ):

@@ -185,7 +185,6 @@ def launch(
         page,
         heads,
         head_dim,
-        0,
         TILE=tile,
         PDL=False,
     )

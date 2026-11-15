@@ -135,7 +135,6 @@ def launch_gather(primitives, source, indices, destination, axis, dtype):
         *operands.stride_words(row),
         *operands.stride_words(index_strides),
         step,
-        0,
     )
 
 
@@ -173,7 +172,6 @@ def launch_scatter(
         source.stride(axis),
         indices.stride(axis),
         destination.stride(axis),
-        0,
     )
 
 

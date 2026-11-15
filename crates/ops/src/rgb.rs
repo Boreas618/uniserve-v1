@@ -283,8 +283,7 @@ impl Op for RgbBytes {
             .u64("in2", input[2])
             .u64("out0", out[0])
             .u64("out1", out[1])
-            .u64("out2", out[2])
-            .flag("pdl", descriptor.pdl);
+            .u64("out2", out[2]);
         kernel.launch(
             LaunchGrid::linear(args.out.numel().div_ceil(u64::from(descriptor.block)))?,
             &mut arguments,

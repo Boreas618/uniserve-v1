@@ -64,7 +64,6 @@ def _cross_fade_kernel(
     out_stride1,
     out_stride2,
     block,
-    pdl,
     AXIS: tl.constexpr,
     BLOCK: tl.constexpr,
     PDL: tl.constexpr,  # noqa: N803
@@ -76,7 +75,7 @@ def _cross_fade_kernel(
 
     ``AXIS`` is the descriptor's, because the blend's position is a different coordinate of the
     index on each axis and both the read and the mask follow from it. ``extent``, ``channels``,
-    ``frames``, ``rows``, ``columns``, each view's three outer strides, ``block`` and ``pdl`` are the
+    ``frames``, ``rows``, ``columns``, each view's three outer strides and ``block`` are the
     launch's words.
     """
     dependent_launch.prologue(PDL)

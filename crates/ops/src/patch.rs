@@ -196,8 +196,7 @@ impl Op for Patch {
             .u32("channels", args.channels)
             .u32("height", args.height)
             .u32("width", args.width)
-            .u32("block", descriptor.block)
-            .flag("pdl", descriptor.pdl);
+            .u32("block", descriptor.block);
         // The grid walks the rows: one block per (row, element block). A row element is written by
         // exactly one block and reads a single latent element, so the order between blocks never
         // matters and a replay is deterministic.

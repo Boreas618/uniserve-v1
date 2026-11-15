@@ -21,15 +21,13 @@ def _silu_kernel(
     out_ptr,
     elements,
     columns,
-    pdl,
     BLOCK: tl.constexpr,
     PDL: tl.constexpr,  # noqa: N803
 ):
     """Store one block of ``x / (1 + exp(−x))``.
 
     The grid covers the flattened tensor, and ``columns`` is the row width of
-    the launch: a word the module does not specialize on. ``pdl`` is the
-    launch's flag and the module's metadata carries the decision.
+    the launch: a word the module does not specialize on.
     """
     dependent_launch.prologue(PDL)
 

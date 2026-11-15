@@ -216,8 +216,7 @@ impl Op for KvWrite {
             .u64("tokens", tokens)
             .u32("page", descriptor.page)
             .u32("heads", descriptor.heads)
-            .u32("head_dim", descriptor.head_dim)
-            .flag("pdl", descriptor.pdl);
+            .u32("head_dim", descriptor.head_dim);
         kernel.launch(
             LaunchGrid::new([tokens, row.div_ceil(u64::from(descriptor.tile)), 1])?,
             &mut arguments,
@@ -447,8 +446,7 @@ impl Op for KvWriteScaled {
             .u64("tokens", tokens)
             .u32("page", descriptor.page)
             .u32("heads", descriptor.heads)
-            .u32("head_dim", descriptor.head_dim)
-            .flag("pdl", descriptor.pdl);
+            .u32("head_dim", descriptor.head_dim);
         // One program per token, so the work follows the tokens this launch writes and not the
         // pages the cache has: a page's maximum is over every row the launch brings to it and its
         // re-encode over every row already written, so one program writes each page, the program

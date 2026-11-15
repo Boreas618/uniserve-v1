@@ -53,7 +53,6 @@ def launch(kernels, source, out, block):
         rows,
         columns,
         block,
-        0,
         BLOCK=block,
         PDL=False,
     )

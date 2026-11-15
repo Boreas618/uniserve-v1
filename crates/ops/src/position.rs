@@ -186,8 +186,7 @@ impl Op for PositionInterpolate {
             .view("out_ptr", &args.out)
             .u64("points", points)
             .u32("channels", descriptor.channels)
-            .u32("block", descriptor.block)
-            .flag("pdl", descriptor.pdl);
+            .u32("block", descriptor.block);
         // One block per (output point, element block): the four taps of a point are read and summed
         // by one block, so the sum's order is fixed and two blocks never write the same element.
         kernel.launch(

@@ -39,7 +39,6 @@ def _vsa_scores_kernel(
     out_ptr,
     query_tiles,
     key_tiles,
-    pdl,
     WIDTH: tl.constexpr,
     BLOCK: tl.constexpr,
     KEY_TILES: tl.constexpr,
@@ -50,8 +49,8 @@ def _vsa_scores_kernel(
 
     ``WIDTH`` is the contraction and ``BLOCK`` the lanes it uses, both the descriptor's; ``KEY_TILES``
     is the key tiles one step reduces and ``QUERIES`` the query tiles a program holds.
-    ``query_tiles`` and ``key_tiles`` are the launch's words - the grid names the block of query tiles
-    and the head - and ``pdl`` is a launching decision.
+    ``query_tiles`` and ``key_tiles`` are the launch's words: the grid names the block of query tiles
+    and the head.
     """
     dependent_launch.prologue(PDL)
 

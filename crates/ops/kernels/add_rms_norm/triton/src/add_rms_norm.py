@@ -24,7 +24,6 @@ def _add_rms_norm_kernel(
     c_ptr,
     columns,
     eps,
-    pdl,
     BLOCK: tl.constexpr,
     PDL: tl.constexpr,  # noqa: N803
     CENTRED: tl.constexpr,  # noqa: N803

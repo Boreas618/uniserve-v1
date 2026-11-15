@@ -181,7 +181,6 @@ def launch(kernels, table, indices, weights, out, block, pdl=False):
         points,
         channels,
         block,
-        int(pdl),
         CHANNELS=channels,
         BLOCK=block,
         PDL=pdl,

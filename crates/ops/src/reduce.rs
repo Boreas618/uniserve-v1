@@ -314,7 +314,6 @@ impl Op for Reduce {
         strided::pack_strides(&mut arguments, "ks", &kept);
         strided::pack_extents(&mut arguments, "r", &reduced);
         strided::pack_strides(&mut arguments, "rs", &reduced);
-        arguments.flag("pdl", descriptor.pdl);
 
         // One program folds `block / tile` outputs.
         let rows = u64::from(descriptor.block / descriptor.tile());

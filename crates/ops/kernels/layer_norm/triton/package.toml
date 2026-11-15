@@ -17,8 +17,8 @@ kind = "triton"
 kernel = "_layer_norm_kernel"
 warps = { field = "tile", steps = [[2048, 8]], otherwise = 4 }
 
-# `has_bias` and `pdl` are words the kernel does not read: the bias and the dependent launch are
-# compiled in. A layer without a bias passes the weight's address as `bias_ptr`.
+# `has_bias` is a word the kernel does not read: the bias is compiled in. A layer without a bias
+# passes the weight's address as `bias_ptr`.
 [launch.types]
 x_ptr = { pointer = "dtype" }
 weight_ptr = { pointer = "dtype" }
@@ -27,7 +27,6 @@ out_ptr = { pointer = "dtype" }
 columns = "i32"
 eps = "fp32"
 has_bias = "i32"
-pdl = "i32"
 
 [launch.constants]
 BLOCK = { field = "tile" }

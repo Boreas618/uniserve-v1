@@ -135,7 +135,6 @@ def launch(kernels, x, weight, bias, out, tile):
         columns,
         EPS,
         1 if bias is not None else 0,
-        0,
         BLOCK=tile,
         HAS_BIAS=bias is not None,
         PDL=False,

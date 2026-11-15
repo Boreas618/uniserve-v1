@@ -35,14 +35,13 @@ def _patch_kernel(
     height,
     width,
     block,
-    pdl,
     BLOCK: tl.constexpr,
 ):
     """Read one packed row's ``BLOCK`` columns from the latent and store them.
 
     ``frames`` and ``rows`` are the launch's words — a request's frame count varies while the
-    geometry is the model's, so one program serves every request of a geometry. ``block`` and
-    ``pdl`` are launching decisions: the grid already names the row and the column slice, and the
+    geometry is the model's, so one program serves every request of a geometry. ``block`` is a
+    launching decision: the grid already names the row and the column slice, and the
     block width is ``BLOCK``.
     """
     row = tl.program_id(0).to(tl.int64)

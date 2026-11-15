@@ -25,7 +25,7 @@ kernel = "_posterior_kernel"
 warps = { field = "block", steps = [[2048, 8]], otherwise = 4 }
 
 # Every operand is read through its own row and channel strides, so both physical layouts are one
-# launch. `pdl` is a word the kernel does not read: the dependent launch is compiled in.
+# launch.
 [launch.types]
 mean_ptr = "*fp32"
 log_variance_ptr = "*fp32"
@@ -41,7 +41,6 @@ noise_channel = "u32"
 out_row = "u32"
 out_channel = "u32"
 total = "u64"
-pdl = "i32"
 
 [launch.constants]
 BLOCK = { field = "block" }

@@ -129,7 +129,6 @@ def fill(primitives, dtype, pattern, buffer, block, name):
         *operands.extent_words(extents),
         *operands.stride_words(strides),
         pattern,
-        0,
     )
     label = f"{dtype} {pattern:#x} {name} {tuple(destination.shape)}"
     operands.assert_same(label, buffer, expected)

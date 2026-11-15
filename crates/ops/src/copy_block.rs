@@ -247,14 +247,10 @@ impl Op for CopyBlock {
             arguments.i64(name, stride);
         }
         let elements = extents.iter().product::<u64>();
-        // `total`, then the elements one program moves and the dependent launch, two words the
-        // program takes and does not read: its block is the `BLOCK` constexpr and its dependent
-        // launch the `PDL` one.
+        // `total`, then the elements one program moves, a word the program takes and does not read:
+        // its block is the `BLOCK` constexpr.
         let copy = if descriptor.wide { WIDE_COPY } else { COPY };
-        arguments
-            .u64("total", elements)
-            .u32("block", copy)
-            .flag("pdl", false);
+        arguments.u64("total", elements).u32("block", copy);
         // A last axis one program wide or more is walked a row at a time (the package's fast path),
         // so the grid counts each row's blocks rather than the elements.
         let grid = if descriptor.wide || extents[3] >= u64::from(copy) {

@@ -70,7 +70,6 @@ def launch(kernels, operands, out, channels, total, block=BLOCK, pdl=False):
         out.stride(0),
         out.stride(1),
         total,
-        int(pdl),
         BLOCK=block,
         PDL=pdl,
         launch_pdl=pdl,

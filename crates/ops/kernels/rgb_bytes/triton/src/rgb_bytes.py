@@ -57,17 +57,16 @@ def _rgb_bytes_kernel(
     out0,
     out1,
     out2,
-    pdl,
     CHANNELS: tl.constexpr,  # noqa: N803
     BLOCK: tl.constexpr,  # noqa: N803
     PDL: tl.constexpr,  # noqa: N803
 ):
     """Store one block of packed pixels.
 
-    Grid: ``ceil(frames · rows · columns · channels / BLOCK)`` programs. ``pdl`` is
-    the operator's own flag and the compiled ``PDL`` says what this module was
-    built for: a module launched as a dependent waits for the grid before it
-    before reading anything, and then lets the grid after it launch.
+    Grid: ``ceil(frames · rows · columns · channels / BLOCK)`` programs. The
+    compiled ``PDL`` says what this module was built for: a module launched as a
+    dependent waits for the grid before it before reading anything, and then
+    lets the grid after it launch.
     """
     dependent_launch.prologue(PDL)
 

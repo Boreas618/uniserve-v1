@@ -109,7 +109,7 @@ def launch(
     """  # noqa: D205
     tokens, heads, head_dim = x.shape
     narrowed = rotated != head_dim
-    words = [x, cosine, sine, out, tokens, 0] + ([rotated] if narrowed else [])
+    words = [x, cosine, sine, out, tokens] + ([rotated] if narrowed else [])
     kernel = (
         kernels._rope_apply_narrowed_kernel
         if narrowed

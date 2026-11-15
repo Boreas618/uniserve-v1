@@ -60,7 +60,6 @@ def launch(kernels, source, out, wide):
         *out.stride(),
         total,
         block,
-        0,
         BLOCK=block,
         WIDE=wide,
     )

@@ -133,8 +133,7 @@ impl Op for PcmInterleave {
             .view("right", &args.right)
             .view("out", &args.out)
             .u32("samples", args.samples)
-            .u32("block", descriptor.block)
-            .flag("pdl", descriptor.pdl);
+            .u32("block", descriptor.block);
         // One block per range of samples: a sample's two outputs are written by the same block beside
         // each other, so the interleaving needs no second pass.
         kernel.launch(

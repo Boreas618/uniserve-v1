@@ -90,7 +90,6 @@ def launch(kernels, source, destination, indices, mode, columns, block):
         count,
         columns,
         block,
-        0,
         COLUMNS=columns,
         REPLACE=mode != "add",
         BLOCK=block,

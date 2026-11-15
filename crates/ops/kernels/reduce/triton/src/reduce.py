@@ -75,7 +75,6 @@ def _reduce_kernel(
     rs3,
     rs4,
     rs5,
-    pdl,
     FUNCTION: tl.constexpr,  # noqa: N803
     ACCUMULATE: tl.constexpr,  # noqa: N803
     NEUTRAL: tl.constexpr,  # noqa: N803

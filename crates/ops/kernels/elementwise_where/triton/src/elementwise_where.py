@@ -49,7 +49,6 @@ def _elementwise_where_kernel(
     f3,
     f4,
     f5,
-    pdl,
     RANK: tl.constexpr,  # noqa: N803
     BLOCK: tl.constexpr,  # noqa: N803
     PDL: tl.constexpr,  # noqa: N803

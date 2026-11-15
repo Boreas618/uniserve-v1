@@ -43,7 +43,6 @@ in2 = "i64"
 out0 = "i64"
 out1 = "i64"
 out2 = "i64"
-pdl = "i32"
 
 [launch.constants]
 CHANNELS = { field = "channels" }

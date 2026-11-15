@@ -75,7 +75,6 @@ def launch(kernels, source, mean, std, out, block, pdl=False):
         channels,
         *source.stride()[:3],
         *out.stride()[:3],
-        int(pdl),
         CHANNELS=channels,
         BLOCK=block,
         PDL=pdl,

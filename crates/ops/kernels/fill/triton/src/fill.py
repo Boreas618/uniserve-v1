@@ -36,7 +36,6 @@ def _fill_kernel(
     t4,
     t5,
     bits,
-    pdl,
     WIDTH: tl.constexpr,  # noqa: N803
     RANK: tl.constexpr,  # noqa: N803
     BLOCK: tl.constexpr,  # noqa: N803

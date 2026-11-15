@@ -41,7 +41,6 @@ s4 = "i64"
 s5 = "i64"
 a = { field = "compute", values = { fp32 = "fp32", fp64 = "fp64", int = "i64" } }
 b = { field = "compute", values = { fp32 = "fp32", fp64 = "fp64", int = "i64" } }
-pdl = "i32"
 
 [launch.constants]
 FUNCTION = { field = "function" }

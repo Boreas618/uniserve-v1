@@ -143,11 +143,11 @@ def launch(kernel_source, operator, x, out, columns, tile):
     rows = x.shape[0]
     if operator == "softmax":
         kernel_source("softmax")._softmax_kernel[(rows,)](
-            x, out, columns, 0, BLOCK=tile, PDL=False
+            x, out, columns, BLOCK=tile, PDL=False
         )
     else:
         kernel_source("log_softmax")._log_softmax_kernel[(rows,)](
-            x, out, columns, 0, STEP=min(tile, LANES), PDL=False
+            x, out, columns, STEP=min(tile, LANES), PDL=False
         )
 
 

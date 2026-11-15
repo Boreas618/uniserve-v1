@@ -31,7 +31,6 @@ def _gelu_kernel(
     out_ptr,
     elements,
     columns,
-    pdl,
     APPROXIMATE: tl.constexpr,
     BLOCK: tl.constexpr,
     PDL: tl.constexpr,  # noqa: N803

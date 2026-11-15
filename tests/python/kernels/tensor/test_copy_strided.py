@@ -91,7 +91,6 @@ def copy(primitives, dtype, source, destination):
         *operands.extent_words(extents),
         *operands.stride_words(source_strides),
         *operands.stride_words(destination_strides),
-        0,
     )
 
 

@@ -158,7 +158,6 @@ def check(primitives, function, name, x, axes, block=operands.BLOCK):
         *operands.stride_words(kept_strides),
         *operands.extent_words(reduced),
         *operands.stride_words(reduced_strides),
-        0,
     )
 
     # `Reduce::tolerance`.

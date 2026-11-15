@@ -163,7 +163,6 @@ impl Op for Cast {
             .u64("elements", elements);
         strided::pack_extents(&mut arguments, "d", &out);
         strided::pack_strides(&mut arguments, "s", &x);
-        arguments.flag("pdl", descriptor.pdl);
 
         kernel.launch(
             LaunchGrid::covering(elements, u64::from(descriptor.block))?,

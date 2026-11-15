@@ -30,7 +30,6 @@ def _layer_norm_kernel(
     columns,
     eps,
     has_bias,
-    pdl,
     BLOCK: tl.constexpr,
     HAS_BIAS: tl.constexpr,  # noqa: N803
     PDL: tl.constexpr,  # noqa: N803

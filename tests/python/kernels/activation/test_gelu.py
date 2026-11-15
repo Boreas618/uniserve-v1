@@ -109,7 +109,6 @@ def launch(kernels, values, out, columns, approximate, block):
         out,
         elements,
         columns,
-        0,
         APPROXIMATE=approximate,
         BLOCK=block,
         PDL=False,

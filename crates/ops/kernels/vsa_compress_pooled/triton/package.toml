@@ -21,7 +21,6 @@ kind = "triton"
 kernel = "_vsa_compress_pooled_kernel"
 warps = 4
 
-# `pdl` is a word the kernel does not read: the dependent launch is compiled in.
 [launch.types]
 scores_ptr = "*fp32"
 values_ptr = "*fp32"
@@ -29,7 +28,6 @@ sizes_ptr = "*i32"
 out_ptr = { pointer = "dtype" }
 query_tiles = "i32"
 tiles = "i32"
-pdl = "i32"
 
 # `QUERIES` is the query tiles a program holds, the launch's grid divisor as well, which
 # `crates/ops/src/vsa.rs` states as `POOLED_QUERIES`; `KEYS` is the key tiles one step reads.

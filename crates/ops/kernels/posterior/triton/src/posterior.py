@@ -52,7 +52,6 @@ def _posterior_kernel(
     out_row,
     out_channel,
     total,
-    pdl,
     BLOCK: tl.constexpr,
     PDL: tl.constexpr,
 ):

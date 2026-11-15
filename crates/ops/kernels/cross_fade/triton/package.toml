@@ -41,7 +41,6 @@ out_stride0 = "u32"
 out_stride1 = "u32"
 out_stride2 = "u32"
 block = "u32"
-pdl = "i32"
 
 # The axis is compiled because the blend's position is the row on axis 2 and the column on axis 3,
 # and the previous tile's band sits at the far end of that axis, so the read and the mask both

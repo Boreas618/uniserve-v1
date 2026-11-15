@@ -114,8 +114,7 @@ impl Op for ChannelAffine {
             .view("out", &args.out)
             .u64("channels", args.x.dim(1))
             .u64("positions", args.x.dim(2))
-            .u64("elements", elements)
-            .flag("pdl", descriptor.pdl);
+            .u64("elements", elements);
         kernel.launch(
             LaunchGrid::covering(elements, u64::from(descriptor.block))?,
             &mut arguments,

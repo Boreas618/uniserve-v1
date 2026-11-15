@@ -40,7 +40,6 @@ def launch(kernels, left, right, out, samples, block):
         out,
         samples,
         block,
-        0,
         BLOCK=block,
         PDL=False,
         num_warps=max(1, min(8, block // 512)),

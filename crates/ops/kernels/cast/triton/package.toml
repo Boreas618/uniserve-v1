@@ -42,7 +42,6 @@ s2 = "i64"
 s3 = "i64"
 s4 = "i64"
 s5 = "i64"
-pdl = "i32"
 
 [launch.constants]
 THROUGH = { field = "through" }

@@ -484,8 +484,7 @@ fn launch_strided(
         .u64("tokens", tokens)
         .u64("row_stride", query_row)
         .u64("table_rows", table)
-        .f32("epsilon", f32::from_bits(descriptor.epsilon.0 as u32))
-        .flag("pdl", descriptor.pdl);
+        .f32("epsilon", f32::from_bits(descriptor.epsilon.0 as u32));
     kernel.launch(
         LaunchGrid::linear(blocks * u64::from(descriptor.q_heads))?,
         &mut arguments,
@@ -660,10 +659,9 @@ impl Op for QkNormRope {
             .view("q_out_ptr", &args.q_out)
             .view("k_out_ptr", &args.k_out)
             .u64("tokens", tokens)
-            .f32("epsilon", f32::from_bits(descriptor.epsilon.0 as u32))
-            .flag("pdl", descriptor.pdl);
-        // A full rotation's arguments end at `pdl`, so its existing packages stay valid; a partial
-        // one names how many channels rotate.
+            .f32("epsilon", f32::from_bits(descriptor.epsilon.0 as u32));
+        // A full rotation's arguments end at `epsilon`; a partial one names how many channels
+        // rotate.
         if descriptor.rotated != descriptor.head_dim {
             arguments.u32("rotated", descriptor.rotated);
         }
@@ -824,9 +822,8 @@ impl Op for RopeApply {
             .view("cosine", &args.cosine)
             .view("sine", &args.sine)
             .view("out", &args.out)
-            .u64("tokens", tokens)
-            .flag("pdl", descriptor.pdl);
-        // A full rotation's arguments end at `pdl`; a partial one names how many channels rotate.
+            .u64("tokens", tokens);
+        // A full rotation's arguments end at `tokens`; a partial one names how many channels rotate.
         if descriptor.rotated != descriptor.head_dim {
             arguments.u32("rotated", descriptor.rotated);
         }

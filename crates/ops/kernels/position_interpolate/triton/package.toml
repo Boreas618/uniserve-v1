@@ -20,7 +20,7 @@ kernel = "_position_interpolate_kernel"
 warps = { field = "block", steps = [[1024, 8]], otherwise = 4 }
 
 # The table and the output are stored in the descriptor's element type; the taps accumulate in
-# FP32. `points`, `channels`, `block` and `pdl` are the launch's words.
+# FP32. `points`, `channels` and `block` are the launch's words.
 [launch.types]
 table_ptr = { pointer = "dtype" }
 indices_ptr = "*i32"
@@ -29,7 +29,6 @@ out_ptr = { pointer = "dtype" }
 points = "u32"
 channels = "u32"
 block = "u32"
-pdl = "i32"
 
 [launch.constants]
 CHANNELS = { field = "channels" }

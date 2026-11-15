@@ -325,7 +325,6 @@ impl Op for ElementwiseUnary {
         for (name, scalar) in ["a", "b"].into_iter().zip(args.scalars) {
             pack_scalar(&mut arguments, name, descriptor.dtype, scalar);
         }
-        arguments.flag("pdl", descriptor.pdl);
 
         kernel.launch(
             LaunchGrid::covering(elements, u64::from(descriptor.block))?,
@@ -579,7 +578,6 @@ impl Op for ElementwiseBinary {
         strided::pack_extents(&mut arguments, "d", &out);
         strided::pack_strides(&mut arguments, "l", &lhs);
         strided::pack_strides(&mut arguments, "r", &rhs);
-        arguments.flag("pdl", descriptor.pdl);
 
         kernel.launch(
             LaunchGrid::covering(elements, u64::from(descriptor.block))?,
@@ -732,7 +730,6 @@ impl Op for ElementwiseWhere {
         strided::pack_strides(&mut arguments, "c", &condition);
         strided::pack_strides(&mut arguments, "t", &on_true);
         strided::pack_strides(&mut arguments, "f", &on_false);
-        arguments.flag("pdl", descriptor.pdl);
 
         kernel.launch(
             LaunchGrid::covering(elements, u64::from(descriptor.block))?,

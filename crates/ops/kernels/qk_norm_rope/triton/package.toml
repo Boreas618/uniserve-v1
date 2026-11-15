@@ -24,9 +24,8 @@ warps = 4
 aligned = { field = "strided", values = { true = ["query_ptr", "key_ptr", "cosine_ptr", "sine_ptr", "row_stride"], false = [] } }
 derive = "derive"
 
-# A narrowed program's call names how many channels turn, after `pdl`; the module compiled its
-# own width from the key, so the word is the call's. `pdl` is a word the kernel does not read: the
-# dependent launch is compiled in.
+# A narrowed program's call names how many channels turn, after `epsilon`; the module compiled
+# its own width from the key, so the word is the call's.
 [launch.types]
 query_ptr = { pointer = "dtype" }
 key_ptr = { pointer = "dtype" }
@@ -40,7 +39,6 @@ tokens = "i64"
 row_stride = "i64"
 table_rows = "i64"
 epsilon = "fp32"
-pdl = "i32"
 rotated = "u32"
 
 # The strided form's one head count is the query's. A key names `centred` only for a zero-centred

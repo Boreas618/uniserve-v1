@@ -141,8 +141,7 @@ impl Op for RmsNorm {
             .view("w_ptr", &args.weight)
             .view("y_ptr", &args.out)
             .u32("columns", descriptor.columns)
-            .f32("eps", args.eps)
-            .flag("pdl", descriptor.pdl);
+            .f32("eps", args.eps);
         kernel.launch(LaunchGrid::linear(args.x.rows())?, &mut arguments, stream)
     }
 
@@ -250,8 +249,7 @@ impl Op for AddRmsNorm {
             .view("y_ptr", &args.out)
             .view("c_ptr", &args.residual_out)
             .u32("columns", descriptor.columns)
-            .f32("eps", args.eps)
-            .flag("pdl", descriptor.pdl);
+            .f32("eps", args.eps);
         kernel.launch(LaunchGrid::linear(args.x.rows())?, &mut arguments, stream)
     }
 
@@ -510,8 +508,7 @@ impl Op for LayerNorm {
             .view("out_ptr", &args.out)
             .u32("columns", descriptor.columns)
             .f32("eps", args.eps)
-            .flag("has_bias", args.bias.is_some())
-            .flag("pdl", descriptor.pdl);
+            .flag("has_bias", args.bias.is_some());
         kernel.launch(LaunchGrid::linear(args.x.rows())?, &mut arguments, stream)
     }
 
@@ -603,8 +600,7 @@ impl Op for Softmax {
         arguments
             .view("x_ptr", &args.x)
             .view("out_ptr", &args.out)
-            .u32("columns", descriptor.columns)
-            .flag("pdl", descriptor.pdl);
+            .u32("columns", descriptor.columns);
         kernel.launch(LaunchGrid::linear(args.x.rows())?, &mut arguments, stream)
     }
 

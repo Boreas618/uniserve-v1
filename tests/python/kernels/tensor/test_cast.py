@@ -140,7 +140,6 @@ def check(primitives, source, target, name, x):
         elements,
         *operands.extent_words(extents),
         *operands.stride_words(x_strides),
-        0,
     )
 
     # `Cast::tolerance`.

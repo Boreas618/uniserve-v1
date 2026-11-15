@@ -33,7 +33,6 @@ rows = "i64"
 heads = "i32"
 width = "i32"
 output = "i32"
-pdl = "i32"
 
 # The head axis and the window are compile-time loops; `window` is the longest window the width
 # and the pooled width give, which the derivation computes.

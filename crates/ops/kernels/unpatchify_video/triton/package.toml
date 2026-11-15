@@ -19,8 +19,8 @@ kind = "triton"
 kernel = { field = "affine", values = { true = "_unpatchify_video_affine_kernel", false = "_unpatchify_video_kernel" } }
 warps = { field = "block", steps = [[1024, 8]], otherwise = 4 }
 
-# `scale_ptr` and `bias_ptr` are the affine kernel's alone. `block` and `pdl` are words neither
-# kernel reads: the block width is compiled in.
+# `scale_ptr` and `bias_ptr` are the affine kernel's alone. `block` is a word neither kernel
+# reads: the block width is compiled in.
 [launch.types]
 tokens_ptr = { pointer = "dtype" }
 scale_ptr = { pointer = "dtype" }
@@ -37,7 +37,6 @@ out_stride0 = "i64"
 out_stride1 = "i64"
 out_stride2 = "i64"
 block = "i32"
-pdl = "i32"
 
 [launch.constants]
 BLOCK = { field = "block" }

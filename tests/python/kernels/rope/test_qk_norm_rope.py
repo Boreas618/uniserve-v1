@@ -168,7 +168,7 @@ def launch(kernels, operands, tokens, epsilon, spec, outputs):
     q_heads, k_heads = spec["heads"]
     affine = spec.get("affine", True)
     narrowed = rotated != head_dim
-    words = [*operands, *outputs, tokens, epsilon, 0]
+    words = [*operands, *outputs, tokens, epsilon]
     if narrowed:
         words.append(rotated)
     kernel = getattr(kernels, ENTRIES[(affine, narrowed)])

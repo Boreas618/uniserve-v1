@@ -42,7 +42,6 @@ def _cast_kernel(
     s3,
     s4,
     s5,
-    pdl,
     THROUGH: tl.constexpr,  # noqa: N803
     NARROWS: tl.constexpr,  # noqa: N803
     RANK: tl.constexpr,  # noqa: N803

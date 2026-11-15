@@ -22,7 +22,6 @@ def _rms_norm_kernel(
     y_ptr,
     columns,
     eps,
-    pdl,
     BLOCK: tl.constexpr,
     PDL: tl.constexpr,  # noqa: N803
     CENTRED: tl.constexpr,  # noqa: N803
@@ -31,9 +30,9 @@ def _rms_norm_kernel(
     """Normalize one row per program.
 
     ``x``, ``w`` and ``y`` are the launch's packed operands (row tile, weight
-    row, output row); ``columns`` is the row width, ``eps`` the variance floor
-    and ``pdl`` the launch's copy of the descriptor's flag. Every program loads
-    its whole row before storing, so the output may alias the input.
+    row, output row); ``columns`` is the row width and ``eps`` the variance
+    floor. Every program loads its whole row before storing, so the output
+    may alias the input.
     ``CENTRED`` reads a zero-centred weight: the row is scaled by ``1 + w``,
     the one added in FP32. ``GROUPS`` is the weight's row count: row ``i``
     reads weight row ``i mod GROUPS``.

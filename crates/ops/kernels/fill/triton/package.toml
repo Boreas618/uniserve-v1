@@ -40,7 +40,6 @@ t3 = "i64"
 t4 = "i64"
 t5 = "i64"
 bits = { field = "word", values = { u8 = "u8", u16 = "u16", u32 = "u32", u64 = "u64" } }
-pdl = "i32"
 
 [launch.constants]
 WIDTH = { field = "width" }

@@ -72,7 +72,6 @@ def launch(kernels, operands, out, channels, kernel, ratio, length, block):
         length,
         out_length,
         block,
-        0,
         KERNEL=kernel,
         RATIO=ratio,
         BLOCK=block,

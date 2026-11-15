@@ -17,16 +17,15 @@ def _log_softmax_kernel(
     x_ptr,
     out_ptr,
     columns,
-    pdl,
     STEP: tl.constexpr,
     PDL: tl.constexpr,  # noqa: N803
 ):
     """Write the log-softmax of one row per program.
 
     ``x`` is ``[rows, columns]`` in the descriptor's dtype, ``out`` the same
-    shape in FP32, ``columns`` the row width and ``pdl`` the launch's copy of the
-    descriptor's flag. The row is walked in ``STEP`` wide tiles, so a descriptor
-    tile larger than a program's registers costs more steps, not a bigger block.
+    shape in FP32 and ``columns`` the row width. The row is walked in ``STEP``
+    wide tiles, so a descriptor tile larger than a program's registers costs
+    more steps, not a bigger block.
     Grid: (rows,).
     """
     dependent_launch.prologue(PDL)

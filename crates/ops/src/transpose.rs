@@ -176,8 +176,7 @@ impl Op for Transpose {
             .view("out", &args.out)
             .u64("rows", rows)
             .u64("columns", columns)
-            .u32("block", descriptor.block)
-            .flag("pdl", descriptor.pdl);
+            .u32("block", descriptor.block);
         // One program per tile: the source is read a tile of columns at a time and the destination is
         // written a tile of rows at a time, so the grid is the tile grid and no axis needs a second
         // pass.

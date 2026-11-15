@@ -804,8 +804,7 @@ impl Op for LogSoftmax {
         arguments
             .view("x_ptr", &args.x)
             .view("out_ptr", &args.out)
-            .u32("columns", descriptor.columns)
-            .flag("pdl", descriptor.pdl);
+            .u32("columns", descriptor.columns);
         kernel.launch(LaunchGrid::linear(args.x.rows())?, &mut arguments, stream)
     }
 

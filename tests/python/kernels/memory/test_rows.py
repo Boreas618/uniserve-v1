@@ -92,7 +92,6 @@ def launch(kernels, source, destination, indices, mode, columns, pdl=False):
         count,
         columns,
         BLOCK,
-        int(pdl),
         COLUMNS=columns,
         REPLACE=mode == "replace",
         BLOCK=BLOCK,

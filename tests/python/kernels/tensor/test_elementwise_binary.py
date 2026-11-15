@@ -162,7 +162,6 @@ def check(primitives, function, dtype, name, left, right):
         *operands.extent_words(extents),
         *operands.stride_words(left_strides),
         *operands.stride_words(right_strides),
-        0,
     )
 
     expected = expected_of(function, numpy_values(left), numpy_values(right))

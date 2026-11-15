@@ -19,14 +19,13 @@ kernel = "_vsa_scores_kernel"
 warps = { field = "block", steps = [[1024, 8]], otherwise = 4 }
 
 # The pooled rows are FP32, the type `vsa_prepare_tiles` pools in, so no operand type is a
-# dimension. `pdl` is a word the kernel does not read: the dependent launch is compiled in.
+# dimension.
 [launch.types]
 query_ptr = "*fp32"
 key_ptr = "*fp32"
 out_ptr = "*fp32"
 query_tiles = "i32"
 key_tiles = "i32"
-pdl = "i32"
 
 # `width` is the contraction and `block` the lanes it uses, so both are compiled; `heads` sizes no
 # tile, since a program is one head and the grid carries the count. `QUERIES` is the query tiles a

@@ -172,7 +172,6 @@ def launch(kernels, source, slots, scales, cache, flags, page, block, scan):
         page,
         heads,
         head_dim,
-        0,
         BLOCK=block,
         PDL=False,
         SCAN=kernels.SCAN if scan is None else scan,

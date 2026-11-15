@@ -139,8 +139,7 @@ impl Op for Snake {
             .view("out_ptr", &args.out)
             .u64("rows", rows)
             .u32("channels", descriptor.channels)
-            .u64("width", width)
-            .flag("pdl", descriptor.pdl);
+            .u64("width", width);
         kernel.launch(
             LaunchGrid::covering(elements, u64::from(descriptor.block))?,
             &mut arguments,

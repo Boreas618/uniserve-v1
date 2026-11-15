@@ -49,7 +49,6 @@ def launch(kernels, x, out, frames, rows, channels, height, width, block):
         height,
         width,
         block,
-        0,
         BLOCK=block,
     )
 

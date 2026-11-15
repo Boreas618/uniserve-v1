@@ -50,7 +50,6 @@ def _pcm_interleave_kernel(
     out,
     samples,
     block,
-    pdl,
     BLOCK: tl.constexpr,  # noqa: N803
     PDL: tl.constexpr,  # noqa: N803
 ):

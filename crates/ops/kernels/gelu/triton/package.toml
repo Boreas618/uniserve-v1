@@ -17,13 +17,11 @@ kind = "triton"
 kernel = "_gelu_kernel"
 warps = { field = "block", steps = [[2048, 8]], otherwise = 4 }
 
-# `pdl` is a word the kernel does not read: the dependent launch is compiled in.
 [launch.types]
 x_ptr = { pointer = "dtype" }
 out_ptr = { pointer = "dtype" }
 elements = "i64"
 columns = "i32"
-pdl = "i32"
 
 [launch.constants]
 APPROXIMATE = { field = "approximate" }

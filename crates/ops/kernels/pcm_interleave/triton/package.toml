@@ -28,7 +28,6 @@ right = { pointer = "dtype" }
 out = "*i16"
 samples = "i32"
 block = "i32"
-pdl = "i32"
 
 # The block is compiled so the grid a launch computes and the module agree.
 [launch.constants]

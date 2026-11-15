@@ -31,7 +31,6 @@ def _kv_write_kernel(
     page,
     heads,
     head_dim,
-    pdl,
     TILE: tl.constexpr,
     PDL: tl.constexpr,  # noqa: N803
 ):

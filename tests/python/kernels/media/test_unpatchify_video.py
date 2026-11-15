@@ -50,7 +50,6 @@ def launch(kernels, tokens, raster, grid_shape, patch, block, affine=None):
         *patch,
         *raster.stride()[:3],
         block,
-        0,
     )
     grid = (-(-raster.numel() // block), 1, 1)
     num_warps = 8 if block >= 1024 else 4

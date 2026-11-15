@@ -42,7 +42,6 @@ def _vsa_compress_pooled_kernel(
     out_ptr,
     query_tiles,
     tiles,
-    pdl,
     HEADS: tl.constexpr,
     WIDTH: tl.constexpr,
     BLOCK: tl.constexpr,
@@ -54,8 +53,7 @@ def _vsa_compress_pooled_kernel(
 
     ``BLOCK`` is the lanes one feature row uses; ``HEADS`` and ``WIDTH`` size the pooled values'
     layout; ``QUERIES`` and ``KEYS`` are the block of query tiles a program holds and the key tiles
-    one step reads. ``query_tiles`` and ``tiles`` are the launch's words, and ``pdl`` is a launching
-    decision.
+    one step reads. ``query_tiles`` and ``tiles`` are the launch's words.
     """
     dependent_launch.prologue(PDL)
 

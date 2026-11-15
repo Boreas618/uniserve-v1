@@ -1298,8 +1298,7 @@ impl Op for VsaScores {
             .view("key_ptr", &args.pooled_key)
             .view("out_ptr", &args.out)
             .u64("query_tiles", query_tiles)
-            .u64("key_tiles", key_tiles)
-            .flag("pdl", descriptor.pdl);
+            .u64("key_tiles", key_tiles);
         // One program per (head, query tile): it walks the key tiles and writes one row of scores.
         kernel.launch(
             LaunchGrid::new([query_tiles.div_ceil(POOLED_QUERIES), heads, 1])?,
@@ -1571,8 +1570,7 @@ impl Op for VsaCompressPooled {
             .view("sizes_ptr", &args.sizes)
             .view("out_ptr", &args.out)
             .u64("query_tiles", query_tiles)
-            .u64("tiles", tiles)
-            .flag("pdl", descriptor.pdl);
+            .u64("tiles", tiles);
         // One program per (head, query tile): it reduces the key tiles and writes one row.
         kernel.launch(
             LaunchGrid::new([query_tiles.div_ceil(POOLED_QUERIES), heads, 1])?,

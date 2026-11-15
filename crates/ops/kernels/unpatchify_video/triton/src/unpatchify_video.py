@@ -102,13 +102,11 @@ def _unpatchify_video_kernel(
     out_stride1,
     out_stride2,
     block,
-    pdl,
     BLOCK: tl.constexpr,
 ):
     """Write one block of the raster from the packed tokens, as they are.
 
-    ``block`` and ``pdl`` are the launch's words: the block width is ``BLOCK`` and programmatic
-    dependent launch is a launching decision.
+    ``block`` is a launch word: the block width is ``BLOCK``.
     """
     offsets = tl.program_id(0).to(tl.int64) * BLOCK + tl.arange(0, BLOCK).to(tl.int64)
     source, destination, _channel, live = _token_offsets(
@@ -149,7 +147,6 @@ def _unpatchify_video_affine_kernel(
     out_stride1,
     out_stride2,
     block,
-    pdl,
     BLOCK: tl.constexpr,
 ):
     """Write one block of the raster, denormalized by the per-channel scale and bias.

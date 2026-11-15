@@ -43,7 +43,6 @@ def launch(kernels, x, out, columns, block, pdl=False):
         out,
         x.numel(),
         columns,
-        int(pdl),
         BLOCK=block,
         PDL=pdl,
         launch_pdl=pdl,

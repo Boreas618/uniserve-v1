@@ -31,7 +31,6 @@ tokens = "i64"
 page = "i32"
 heads = "i32"
 head_dim = "i32"
-pdl = "i32"
 
 [launch.constants]
 TILE = { field = "tile" }

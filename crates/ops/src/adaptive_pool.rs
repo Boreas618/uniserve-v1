@@ -136,8 +136,7 @@ impl Op for AdaptivePool {
             .u64("rows", args.x.dim(0))
             .u32("heads", descriptor.heads)
             .u32("width", descriptor.width)
-            .u32("output", descriptor.output)
-            .flag("pdl", descriptor.pdl);
+            .u32("output", descriptor.output);
         kernel.launch(
             LaunchGrid::covering(outputs, u64::from(descriptor.block))?,
             &mut arguments,

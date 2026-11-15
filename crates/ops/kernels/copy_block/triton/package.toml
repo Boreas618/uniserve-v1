@@ -23,7 +23,7 @@ warps = 4
 aligned = { field = "wide", values = { true = ["source_ptr", "out_ptr", "e3", "s0", "s1", "s2", "d0", "d1", "d2"], false = [] } }
 
 # The descriptor names the two element types, and they are equal at launch: a copy converts
-# nothing. `pdl` is a word the kernel does not read.
+# nothing.
 [launch.types]
 source_ptr = { pointer = "source" }
 out_ptr = { pointer = "out" }
@@ -41,7 +41,6 @@ d2 = "i64"
 d3 = "i64"
 total = "u64"
 block = "u32"
-pdl = "i32"
 
 [launch.constants]
 BLOCK = { field = "wide", values = { true = 2048, false = 1024 } }

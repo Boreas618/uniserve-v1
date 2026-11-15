@@ -85,7 +85,6 @@ def _rope_apply_full_kernel(
     sine,
     out,
     tokens,
-    pdl,
     ROTATED: tl.constexpr,
     PAIRS: tl.constexpr,
     PAIRS_TILE: tl.constexpr,
@@ -96,7 +95,7 @@ def _rope_apply_full_kernel(
     INTERLEAVED: tl.constexpr,
     PDL: tl.constexpr,
 ):
-    """Every channel of a head rotates: the launch's last word is ``pdl``."""
+    """Every channel of a head rotates: the launch's last word is ``tokens``."""
     dependent_launch.prologue(PDL)
     base = tl.program_id(0) * ROWS
     for row in tl.static_range(ROWS):
@@ -125,7 +124,6 @@ def _rope_apply_narrowed_kernel(
     sine,
     out,
     tokens,
-    pdl,
     rotated,
     ROTATED: tl.constexpr,
     PAIRS: tl.constexpr,

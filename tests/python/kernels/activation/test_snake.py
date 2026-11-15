@@ -137,7 +137,7 @@ def launch(kernels, values, alpha, out):
     """One launch over every element of `values`."""
     rows, channels, width = values.shape
     kernels._snake_kernel[((values.numel() + BLOCK - 1) // BLOCK, 1, 1)](
-        values, alpha, out, rows, channels, width, 0, BLOCK=BLOCK, PDL=False
+        values, alpha, out, rows, channels, width, BLOCK=BLOCK, PDL=False
     )
 
 

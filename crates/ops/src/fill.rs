@@ -140,7 +140,7 @@ impl Op for Fill {
             .u64("elements", elements);
         strided::pack_extents(&mut arguments, "d", &destination);
         strided::pack_strides(&mut arguments, "t", &destination);
-        arguments.u64("bits", args.bits).flag("pdl", descriptor.pdl);
+        arguments.u64("bits", args.bits);
 
         kernel.launch(
             LaunchGrid::covering(elements, u64::from(descriptor.block))?,

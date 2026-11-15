@@ -262,7 +262,6 @@ def launch(primitives, function, dtype, x, scalars):
         *operands.extent_words(extents),
         *operands.stride_words(x_strides),
         *scalars,
-        0,
     )
     return out
 

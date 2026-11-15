@@ -53,7 +53,6 @@ def _elementwise_binary_kernel(
     r3,
     r4,
     r5,
-    pdl,
     FUNCTION: tl.constexpr,  # noqa: N803
     COMPARES: tl.constexpr,  # noqa: N803
     COMPUTE: tl.constexpr,  # noqa: N803

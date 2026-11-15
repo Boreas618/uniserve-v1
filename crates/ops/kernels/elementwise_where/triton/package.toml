@@ -55,7 +55,6 @@ f2 = "i64"
 f3 = "i64"
 f4 = "i64"
 f5 = "i64"
-pdl = "i32"
 
 [launch.constants]
 RANK = { field = "rank" }

@@ -34,7 +34,6 @@ def _softmax_kernel(
     x_ptr,
     out_ptr,
     columns,
-    pdl,
     BLOCK: tl.constexpr,
     PDL: tl.constexpr,  # noqa: N803
 ):

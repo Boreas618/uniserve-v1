@@ -47,7 +47,6 @@ def _activation1d_kernel(
     length,
     out_length,
     block,
-    pdl,
     KERNEL: tl.constexpr,
     RATIO: tl.constexpr,
     BLOCK: tl.constexpr,

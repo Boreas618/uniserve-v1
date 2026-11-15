@@ -20,7 +20,6 @@ kernel = "_channel_affine_kernel"
 options = { enable_fp_fusion = false }
 warps = { field = "block", steps = [[2048, 8]], otherwise = 4 }
 
-# `pdl` is a word the kernel does not read: the dependent launch is compiled in.
 [launch.types]
 x = { pointer = "dtype" }
 scale = { pointer = "dtype" }
@@ -29,7 +28,6 @@ out = { pointer = "dtype" }
 channels = "i64"
 positions = "i64"
 elements = "i64"
-pdl = "i32"
 
 [launch.constants]
 BLOCK = { field = "block" }

@@ -325,7 +325,6 @@ impl Op for Index {
                 count
             }
         };
-        arguments.flag("pdl", descriptor.pdl);
 
         // One program gathers a block of destination elements, or scatters a block of columns.
         kernel.launch(

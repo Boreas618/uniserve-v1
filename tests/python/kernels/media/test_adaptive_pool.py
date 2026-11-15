@@ -84,7 +84,6 @@ def launch(kernels, x, out, heads, width, output, block, pdl=False):
         heads,
         width,
         output,
-        int(pdl),
         HEADS=heads,
         WIDTH=width,
         OUTPUT=output,

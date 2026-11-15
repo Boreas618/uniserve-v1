@@ -19,8 +19,8 @@ kind = "triton"
 kernel = "_patch_kernel"
 warps = { field = "block", steps = [[1024, 8]], otherwise = 4 }
 
-# `block` and `pdl` are the operator's words, which the kernel does not read: the grid names the
-# row and the column slice, and the block width is compiled in.
+# `block` is the operator's word, which the kernel does not read: the grid names the row and the
+# column slice, and the block width is compiled in.
 [launch.types]
 x_ptr = { pointer = "dtype" }
 out_ptr = { pointer = "dtype" }
@@ -30,7 +30,6 @@ channels = "i32"
 height = "i32"
 width = "i32"
 block = "i32"
-pdl = "i32"
 
 [launch.constants]
 BLOCK = { field = "block" }

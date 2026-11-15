@@ -45,7 +45,6 @@ def _rows_kernel(
     count,
     columns,
     block,
-    pdl,
     COLUMNS: tl.constexpr,
     REPLACE: tl.constexpr,
     BLOCK: tl.constexpr,
@@ -55,7 +54,7 @@ def _rows_kernel(
     """Place one source row's block of columns at the row its index names.
 
     ``COLUMNS`` is the row width, ``REPLACE`` whether the row is copied and not added, ``SKIP``
-    whether a negative index stores nothing, and ``BLOCK`` the lanes one program covers. ``count``, ``columns``, ``block`` and ``pdl`` are the launch's words: the grid
+    whether a negative index stores nothing, and ``BLOCK`` the lanes one program covers. ``count``, ``columns`` and ``block`` are the launch's words: the grid
     names the source row and the column slice.
     """
     dependent_launch.prologue(PDL)

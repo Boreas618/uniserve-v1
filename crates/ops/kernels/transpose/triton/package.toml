@@ -31,7 +31,6 @@ out = { pointer = "dtype" }
 rows = "i64"
 columns = "i64"
 block = "i32"
-pdl = "i32"
 
 # The tile is compiled because the launch grid is computed from it, one program per tile.
 [launch.constants]

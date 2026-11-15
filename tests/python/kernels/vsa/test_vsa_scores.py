@@ -72,7 +72,6 @@ def launch(kernels, query, key, out, block, step, pdl=False):
         out,
         query_tiles,
         key.shape[0],
-        int(pdl),
         WIDTH=width,
         BLOCK=block,
         KEY_TILES=step,

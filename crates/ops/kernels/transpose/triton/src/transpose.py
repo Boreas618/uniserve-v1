@@ -9,9 +9,9 @@ swap.
 
 The two extents are words of the launch, not of the key: the frame count of an audio
 clip changes per request while the arithmetic does not, so a module serves a matrix of
-any shape. `block` and `pdl` arrive twice on purpose — the pack carries them as the
-operator's arguments, and the module was compiled with them, because the grid a launch
-computes has to agree with the tile a program moves.
+any shape. `block` arrives twice on purpose — the pack carries it as the operator's
+argument, and the module was compiled with it, because the grid a launch computes has
+to agree with the tile a program moves.
 """
 
 import triton
@@ -26,7 +26,6 @@ def _transpose_kernel(
     rows,
     columns,
     block,
-    pdl,
     BLOCK: tl.constexpr,  # noqa: N803
     PDL: tl.constexpr,  # noqa: N803
 ):

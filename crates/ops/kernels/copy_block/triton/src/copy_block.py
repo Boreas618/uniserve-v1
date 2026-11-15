@@ -43,7 +43,6 @@ def _copy_block_kernel(
     d3,
     total,
     block,
-    pdl,
     BLOCK: tl.constexpr,
     WIDE: tl.constexpr,
 ):

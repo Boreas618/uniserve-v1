@@ -79,7 +79,6 @@ step = "i64"
 source_step = "i64"
 indices_step = "i64"
 destination_step = "i64"
-pdl = "i32"
 
 [launch.constants]
 ADDS = { field = "adds" }

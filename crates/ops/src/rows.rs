@@ -189,8 +189,7 @@ impl Op for Rows {
             .view("indices_ptr", &args.indices)
             .u64("count", count)
             .u32("columns", descriptor.columns)
-            .u32("block", descriptor.block)
-            .flag("pdl", descriptor.pdl);
+            .u32("block", descriptor.block);
         // One block covers one row's element block, so the row's writes are ordered inside a block
         // and two blocks never touch the same destination element.
         kernel.launch(

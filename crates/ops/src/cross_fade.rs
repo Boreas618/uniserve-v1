@@ -283,8 +283,7 @@ impl Op for CrossFade {
             .u64("out_stride0", out_strides[0])
             .u64("out_stride1", out_strides[1])
             .u64("out_stride2", out_strides[2])
-            .u32("block", descriptor.block)
-            .flag("pdl", descriptor.pdl);
+            .u32("block", descriptor.block);
         // One thread per output voxel: the leading band blends and everything after it copies, and
         // both branches write the position they read `current` at, which is what lets `out` alias it.
         kernel.launch(

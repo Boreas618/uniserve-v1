@@ -265,8 +265,7 @@ impl Op for Activation1d {
             .u32("ratio", descriptor.ratio)
             .u32("length", args.length)
             .u64("out_length", out_length)
-            .u32("block", descriptor.block)
-            .flag("pdl", descriptor.pdl);
+            .u32("block", descriptor.block);
         // One block owns a channel's whole length: the upsampled signal between stages never leaves
         // the block, so no intermediate buffer exists to allocate, and the low-pass's sum order is
         // fixed by the block's own walk.

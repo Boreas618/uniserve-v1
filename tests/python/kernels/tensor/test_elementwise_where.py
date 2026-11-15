@@ -78,7 +78,6 @@ def check(primitives, name, dtype, condition, on_true, on_false):
         *operands.stride_words(strides[0]),
         *operands.stride_words(strides[1]),
         *operands.stride_words(strides[2]),
-        0,
     )
 
     # The selection as torch states it, on contiguous copies so that no layout

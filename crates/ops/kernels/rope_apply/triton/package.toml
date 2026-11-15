@@ -21,15 +21,13 @@ kernel = { field = "narrowed", values = { false = "_rope_apply_full_kernel", tru
 warps = { field = "block", steps = [[256, 8]], otherwise = 4 }
 derive = "derive"
 
-# The tables are `[tokens, rotated / 2]` FP32 each. `pdl` is a word the kernel does not read: the
-# dependent launch is compiled in.
+# The tables are `[tokens, rotated / 2]` FP32 each.
 [launch.types]
 x = { pointer = "dtype" }
 cosine = "*fp32"
 sine = "*fp32"
 out = { pointer = "output" }
 tokens = "u64"
-pdl = "i32"
 rotated = "u32"
 
 # The head tile is the descriptor's block, which covers the heads.

@@ -39,7 +39,6 @@ def _position_interpolate_kernel(
     points,
     channels,
     block,
-    pdl,
     CHANNELS: tl.constexpr,
     BLOCK: tl.constexpr,
     PDL: tl.constexpr,  # noqa: N803
@@ -47,7 +46,7 @@ def _position_interpolate_kernel(
     """Gather four table rows and write one block of one output point.
 
     ``CHANNELS`` is the table's feature width and ``BLOCK`` the lanes one program covers, both the
-    descriptor's. ``points``, ``channels``, ``block`` and ``pdl`` are the launch's words: the grid
+    descriptor's. ``points``, ``channels`` and ``block`` are the launch's words: the grid
     names the output point and the channel slice.
     """
     dependent_launch.prologue(PDL)

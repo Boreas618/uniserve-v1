@@ -260,8 +260,7 @@ impl Op for Unpatchify {
             .u64("out_stride0", strides[0])
             .u64("out_stride1", strides[1])
             .u64("out_stride2", strides[2])
-            .u32("block", descriptor.block)
-            .flag("pdl", descriptor.pdl);
+            .u32("block", descriptor.block);
         // The grid walks the output's elements: one thread writes one voxel, so a token's voxels are
         // written by the threads that own them and no thread waits for another.
         kernel.launch(

@@ -20,8 +20,7 @@ kernel = "_activation1d_kernel"
 warps = { field = "block", steps = [[1024, 8]], otherwise = 4 }
 
 # The two filters are of the signal's element type and SnakeBeta's two log-space parameters are
-# FP32. The kernel has no dependent-launch prologue, so `pdl` is a word it does not read and its
-# launch never carries the attribute.
+# FP32. The kernel has no dependent-launch prologue, so its launch never carries the attribute.
 [launch.types]
 values_ptr = { pointer = "dtype" }
 alpha_ptr = "*fp32"
@@ -35,7 +34,6 @@ ratio = "i32"
 length = "i32"
 out_length = "i32"
 block = "i32"
-pdl = "i32"
 
 [launch.constants]
 KERNEL = { field = "kernel" }

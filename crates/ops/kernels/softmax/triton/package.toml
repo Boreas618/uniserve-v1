@@ -14,13 +14,11 @@ kind = "triton"
 kernel = "_softmax_kernel"
 warps = { field = "tile", steps = [[2048, 8]], otherwise = 4 }
 
-# The row width is a launch word. `pdl` is a word the kernel does not read: the dependent launch
-# is compiled in.
+# The row width is a launch word.
 [launch.types]
 x_ptr = { pointer = "dtype" }
 out_ptr = { pointer = "dtype" }
 columns = "i32"
-pdl = "i32"
 
 # `tile` is the lane block the program walks a row in.
 [launch.constants]

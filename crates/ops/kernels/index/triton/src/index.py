@@ -63,7 +63,6 @@ def _gather_kernel(
     i4,
     i5,
     step,
-    pdl,
     ABSENT: tl.constexpr,  # noqa: N803
     RANK: tl.constexpr,  # noqa: N803
     BLOCK: tl.constexpr,  # noqa: N803
@@ -128,7 +127,6 @@ def _scatter_kernel(
     source_step,
     indices_step,
     destination_step,
-    pdl,
     ADDS: tl.constexpr,  # noqa: N803
     COMPUTE: tl.constexpr,  # noqa: N803
     ABSENT: tl.constexpr,  # noqa: N803

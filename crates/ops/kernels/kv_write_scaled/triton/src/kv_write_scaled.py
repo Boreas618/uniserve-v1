@@ -70,7 +70,6 @@ def _kv_write_scaled_kernel(
     page,
     heads,
     head_dim,
-    pdl,
     BLOCK: tl.constexpr,
     PDL: tl.constexpr,  # noqa: N803
     SCAN: tl.constexpr,  # noqa: N803

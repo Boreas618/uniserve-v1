@@ -43,7 +43,6 @@ def _copy_strided_kernel(
     t3,
     t4,
     t5,
-    pdl,
     RANK: tl.constexpr,  # noqa: N803
     BLOCK: tl.constexpr,  # noqa: N803
     PDL: tl.constexpr,  # noqa: N803

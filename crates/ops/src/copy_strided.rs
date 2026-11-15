@@ -133,7 +133,6 @@ impl Op for CopyStrided {
         strided::pack_extents(&mut arguments, "d", &destination);
         strided::pack_strides(&mut arguments, "s", &source);
         strided::pack_strides(&mut arguments, "t", &destination);
-        arguments.flag("pdl", descriptor.pdl);
 
         kernel.launch(
             LaunchGrid::covering(elements, u64::from(descriptor.block))?,

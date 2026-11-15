@@ -32,7 +32,6 @@ def _snake_kernel(
     rows,
     channels,
     width,
-    pdl,
     BLOCK: tl.constexpr,
     PDL: tl.constexpr,  # noqa: N803
 ):

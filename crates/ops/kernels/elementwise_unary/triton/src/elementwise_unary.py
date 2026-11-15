@@ -159,7 +159,6 @@ def _elementwise_unary_kernel(
     s5,
     a,
     b,
-    pdl,
     FUNCTION: tl.constexpr,  # noqa: N803
     COMPUTE: tl.constexpr,  # noqa: N803
     RANK: tl.constexpr,  # noqa: N803

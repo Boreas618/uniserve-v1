@@ -116,7 +116,6 @@ def launch(kernels, scores, values, sizes, out, shape, pdl=False):
         out,
         query_tiles,
         shape["tiles"],
-        int(pdl),
         HEADS=heads,
         WIDTH=shape["width"],
         BLOCK=shape["block"],
