@@ -9,10 +9,17 @@
 //! [`Collectors::disarm`]), drained while armed by the session's sampler thread
 //! ([`Collectors::drain`]), and released when the session ends or the quality-of-service guard
 //! turns it off ([`Collectors::release`]).
+//!
+//! What a collector costs on the rank's device and CPU is measured when it is prepared, never
+//! taken from another machine: the range profiler's pass states the device storage its first
+//! start took ([`Collectors::device_storage`]), PM sampling decodes one read period's samples and
+//! is refused when its reads could not keep up, and PC sampling is released as failed at the
+//! first read whose hardware buffer filled.
 
 use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use crossbeam_channel::Sender;
 use platform::cupti::pc_sampling::PcSampler;
@@ -68,6 +75,8 @@ enum Prepared {
     RangeMetrics {
         profiler: RangeProfiler,
         ranges: MetricRanges,
+        /// The device storage the pass's first start took, measured when it was prepared.
+        storage: u64,
     },
     /// The session's own PC sampler of the context `context`, every `2^period` cycles, enabled
     /// while armed: CUPTI refuses to enable activity records (`CUPTI_ERROR_NOT_COMPATIBLE`) while
@@ -395,6 +404,19 @@ impl Collectors {
         )
     }
 
+    /// The device storage the prepared collectors hold on the rank's device while they run:
+    /// what the range profiler's pass took at its first start, measured when it was prepared;
+    /// nothing for a collector of host storage alone.
+    pub(crate) fn device_storage(&self) -> u64 {
+        self.prepared
+            .values()
+            .map(|prepared| match prepared {
+                Prepared::RangeMetrics { storage, .. } => *storage,
+                _ => 0,
+            })
+            .sum()
+    }
+
     /// The set of collectors prepared and not released, as [`bit`]s.
     pub(crate) fn running(&self) -> Arc<AtomicU32> {
         Arc::clone(&self.running)
@@ -436,7 +458,9 @@ impl Collectors {
                     )),
                 },
                 Prepared::PmSampling(sampler) => sampler.start(),
-                Prepared::RangeMetrics { profiler, ranges } => profiler.start().map(|()| {
+                Prepared::RangeMetrics {
+                    profiler, ranges, ..
+                } => profiler.start().map(|()| {
                     if *ranges == MetricRanges::Module
                         && let (Some(markers), Some(device)) = (Markers::installed(), self.device)
                     {
@@ -462,7 +486,7 @@ impl Collectors {
                     *context,
                     *period,
                     pc_sampling::MAX_PCS,
-                    pc_sampling::hardware_buffer(*period),
+                    Some(pc_sampling::hardware_buffer(*period)),
                 )
                 .and_then(|mut enabled| {
                     enabled.start()?;
@@ -483,9 +507,7 @@ impl Collectors {
                 } => with_rank_sampler(self.device, |sampler| {
                     if !*configured {
                         sampler.set_period(*period)?;
-                        if let Some(bytes) = pc_sampling::hardware_buffer(*period) {
-                            sampler.set_hardware_buffer(bytes)?;
-                        }
+                        sampler.set_hardware_buffer(pc_sampling::hardware_buffer(*period))?;
                         *configured = true;
                     }
                     sampler.start()?;
@@ -553,7 +575,8 @@ impl Collectors {
             .context
             .as_ref()
             .and_then(|context| context.enter().ok());
-        for prepared in self.prepared.values_mut() {
+        let mut overflowed = Vec::new();
+        for (&collector, prepared) in &mut self.prepared {
             let drained = match prepared {
                 Prepared::PmSampling(sampler) => sampler.decode().map(|decoded| {
                     if decoded.overflow {
@@ -569,24 +592,48 @@ impl Collectors {
                 }),
                 Prepared::PcSampling {
                     sampler: Some(sampler),
+                    period,
                     ..
                 } => sampler.take().map(|taken| {
+                    if taken.hardware_buffer_full {
+                        overflowed.push((collector, *period));
+                    }
                     if taken.total_samples > 0 {
                         send(&self.rows, Message::Pc(taken));
                     }
                 }),
-                Prepared::RankPcSampling { .. } => with_rank_sampler(self.device, |sampler| {
-                    let taken = sampler.take()?;
-                    if taken.total_samples > 0 {
-                        send(&self.rows, Message::Pc(taken));
-                    }
-                    Ok(())
-                }),
+                Prepared::RankPcSampling { period, .. } => {
+                    with_rank_sampler(self.device, |sampler| {
+                        let taken = sampler.take()?;
+                        if taken.hardware_buffer_full {
+                            overflowed.push((collector, *period));
+                        }
+                        if taken.total_samples > 0 {
+                            send(&self.rows, Message::Pc(taken));
+                        }
+                        Ok(())
+                    })
+                }
                 _ => Ok(()),
             };
             if let Err(error) = drained {
                 tracing::warn!("a profiling collector could not be drained: {error}");
             }
+        }
+        // A period whose samples fill the hardware buffer between CUPTI's reads loses samples on
+        // this device: the session measured it as too short, and the collector stops rather than
+        // record a sample of what ran.
+        for (collector, period) in overflowed {
+            let reason = format!(
+                "the hardware buffer of {} bytes filled at period {period}: this device's samples \
+                 outrun CUPTI's reads of it, so the period is too short for it",
+                pc_sampling::hardware_buffer(period)
+            );
+            tracing::warn!(
+                "profiling collector {} failed: {reason}",
+                collector.as_str()
+            );
+            self.release(collector, "failed", &reason);
         }
     }
 
@@ -804,7 +851,7 @@ fn prepare(
             let per_read =
                 (super::session::DRAIN_PERIOD.as_nanos() as u64).div_ceil(options.interval_ns);
             let samples = (2 * per_read).max(PM_MIN_SAMPLES);
-            PmSampler::sample_bytes(device, &metrics, options.interval_ns)
+            let mut sampler = PmSampler::sample_bytes(device, &metrics, options.interval_ns)
                 .and_then(|bytes| {
                     PmSampler::enable(
                         device,
@@ -814,8 +861,9 @@ fn prepare(
                         u32::try_from(samples).unwrap_or(u32::MAX),
                     )
                 })
-                .map_err(|error| error.to_string())
-                .map(Prepared::PmSampling)
+                .map_err(|error| error.to_string())?;
+            keeps_up(&mut sampler, options.interval_ns)?;
+            Ok(Prepared::PmSampling(sampler))
         }
         Collector::RangeMetrics => {
             cupti()?;
@@ -832,17 +880,19 @@ fn prepare(
                     Ranges::User
                 }
             };
-            RangeProfiler::enable(
+            let mut profiler = RangeProfiler::enable(
                 context,
                 device,
                 &metrics_or(&options.metrics, &RANGE_DEFAULT_METRICS),
                 ranges,
                 options.pass_ranges,
             )
-            .map_err(|error| error.to_string())
-            .map(|profiler| Prepared::RangeMetrics {
+            .map_err(|error| error.to_string())?;
+            let storage = pass_storage(&mut profiler, DeviceId(device as i32))?;
+            Ok(Prepared::RangeMetrics {
                 profiler,
                 ranges: options.ranges,
+                storage,
             })
         }
         Collector::PcSampling => {
@@ -866,6 +916,92 @@ fn prepare(
     }
 }
 
+/// Whether the rank's reads keep up with PM samples taken every `interval_ns`, measured on this
+/// device and CPU: `sampler` samples for one read period ([`super::session::DRAIN_PERIOD`]) and
+/// the samples are decoded, as a read decodes them. A read decodes the samples of the period
+/// before it, so the reads keep up when decoding one period's samples takes less than the
+/// period; past that, every read falls further behind and its image overflows, losing samples.
+/// The calibration's samples are discarded, and the sampler is left stopped and empty.
+///
+/// # Errors
+///
+/// Refuses the interval when its reads would fall behind, naming what was measured; fails with
+/// CUPTI's error when sampling cannot start, stop or decode.
+fn keeps_up(sampler: &mut PmSampler, interval_ns: u64) -> std::result::Result<(), String> {
+    let period = super::session::DRAIN_PERIOD;
+    sampler.start().map_err(|error| error.to_string())?;
+    // The measurement window: one read period of samples at the session's interval.
+    std::thread::sleep(period);
+    sampler.stop().map_err(|error| error.to_string())?;
+    let decoding = Instant::now();
+    let decoded = sampler.decode().map_err(|error| error.to_string())?;
+    decoding_keeps_up(
+        decoding.elapsed(),
+        decoded.samples.len() as u64,
+        interval_ns,
+        period,
+    )
+}
+
+/// Whether reads every `period` keep up with PM samples taken every `interval_ns`, given that
+/// decoding `sampled` samples took `took` on this host: decoding one period's samples must take
+/// less than the period.
+///
+/// # Errors
+///
+/// Refuses the interval, naming what was measured, when the reads would fall behind.
+fn decoding_keeps_up(
+    took: Duration,
+    sampled: u64,
+    interval_ns: u64,
+    period: Duration,
+) -> std::result::Result<(), String> {
+    if sampled == 0 {
+        // An interval longer than the period samples nothing in it; its reads decode at most a
+        // sample each.
+        return Ok(());
+    }
+    // The decoding time of the samples one read period takes at this interval.
+    let per_read = (period.as_nanos() as u64).div_ceil(interval_ns);
+    let read = took.mul_f64(per_read as f64 / sampled as f64);
+    if read >= period {
+        return Err(format!(
+            "decoding the {per_read} samples of one {period:?} read at an interval of \
+             {interval_ns} ns takes {read:?} on this host ({sampled} samples took {took:?}), \
+             longer than the read period: the reads would fall behind and lose samples, so \
+             the interval is too short"
+        ));
+    }
+    Ok(())
+}
+
+/// The device storage a pass of `profiler` takes on `device`, measured as the device's free
+/// storage its first start took: CUPTI states no size for it, takes it at a pass's first start
+/// and keeps it until the profiler is disabled. The rank has nothing in flight while it prepares,
+/// so its own allocations do not move the measure; another process's allocation on the device
+/// in the same moment would. The pass is stopped again, empty.
+///
+/// # Errors
+///
+/// Fails with CUPTI's or the driver's error when the pass cannot start or stop, or the device's
+/// storage cannot be read: a device without room for the pass refuses its start.
+fn pass_storage(
+    profiler: &mut RangeProfiler,
+    device: DeviceId,
+) -> std::result::Result<u64, String> {
+    let free = || {
+        device
+            .memory_info()
+            .map(|info| info.free)
+            .map_err(|error| error.to_string())
+    };
+    let before = free()?;
+    profiler.start().map_err(|error| error.to_string())?;
+    let after = free()?;
+    profiler.stop().map_err(|error| error.to_string())?;
+    Ok(before.saturating_sub(after))
+}
+
 /// Runs `work` on the PC sampler of the rank of `device`.
 fn with_rank_sampler(
     device: Option<DeviceId>,
@@ -875,4 +1011,22 @@ fn with_rank_sampler(
         platform::Error::InvalidArgument("the rank keeps no PC sampler".to_owned())
     })?;
     work(&mut service::lock(&sampler))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    /// An interval is refused when decoding one read period's samples, at the decoding rate
+    /// measured on the host, takes the period or longer, and kept otherwise: 14 µs a sample
+    /// keeps up with samples every 20 µs and falls behind samples every 10 µs.
+    #[test]
+    fn an_interval_whose_reads_fall_behind_is_refused() {
+        let period = Duration::from_millis(100);
+        let took = Duration::from_micros(14) * 1000;
+        assert!(super::decoding_keeps_up(took, 1000, 20_000, period).is_ok());
+        let refused = super::decoding_keeps_up(took, 1000, 10_000, period).unwrap_err();
+        assert!(refused.contains("too short"), "{refused}");
+        assert!(super::decoding_keeps_up(Duration::ZERO, 0, 1_000_000_000, period).is_ok());
+    }
 }

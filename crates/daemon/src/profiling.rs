@@ -104,10 +104,10 @@ pub struct Session {
     pub baseline: Option<Rates>,
     pub overhead: Option<Overhead>,
     pub guard: Vec<GuardAction>,
-    /// The device storage the session holds on each selected worker's GPU
-    /// (`SessionRequest::device_storage`), which the workers reserve in the
-    /// GPUs' quotas: the KV cache gave back tail segments for it
-    /// where a quota lacked room, and grows back once the session ends.
+    /// The device storage the session holds on a selected worker's GPU, the largest any
+    /// worker measured as the session started there (a range_metrics pass), which the workers
+    /// reserve in the GPUs' quotas: the KV cache gave back tail segments for it where a quota
+    /// lacked room, and grows back once the session ends.
     pub device_storage: u64,
 }
 
@@ -226,38 +226,56 @@ impl Replica {
             request: request.clone(),
         })
         .map_err(|error| UpdateError::Failed(error.into()))?;
-        // The device storage the collectors hold on each selected worker's
-        // GPU must fit its quota: where it lacks room, the KV cache
-        // gives back tail segments first, as an epoch change's preparation
-        // does, the requests holding them running on.
-        let device_storage = request.device_storage();
-        if device_storage > 0 {
-            client.reserve_storage(device_storage, &Default::default()).await.map_err(|error| {
+        // The device storage the collectors hold on each selected worker's GPU (a range_metrics
+        // pass) has no size CUPTI states: each worker measures it as the session starts there,
+        // and reserves it in its GPU's quota. A worker whose quota lacks the room refuses,
+        // stating the bytes, and leaves the session to the workers that started it, which end
+        // it; the KV cache then gives back tail segments for those bytes, as an epoch change's
+        // preparation does, the requests holding them running on, and the session starts once
+        // more, its storage now known. Any other refusal ends the start.
+        let mut room = 0;
+        let workers =
+            loop {
+                let results = match self.hook("uniserve.profile_start", &payload).await {
+                    Ok(results) => results,
+                    Err(error) => {
+                        self.abandon_profile(id, room, &client).await;
+                        return Err(error);
+                    }
+                };
+                let workers = answers(&results);
+                let Some(refusal) = workers
+                    .iter()
+                    .find_map(|worker| worker["refused"].as_str().map(str::to_owned))
+                else {
+                    break workers;
+                };
+                self.abandon_profile(id, room, &client).await;
+                let needed = workers
+                    .iter()
+                    .filter(|worker| worker["refused"].is_string())
+                    .filter_map(|worker| worker["device_storage"].as_u64())
+                    .max()
+                    .unwrap_or(0);
+                if room > 0 || needed == 0 {
+                    return Err(UpdateError::Refused(refusal));
+                }
+                client.reserve_storage(needed, &Default::default()).await.map_err(|error| {
                 UpdateError::Refused(format!(
-                    "the session holds {device_storage} bytes of device storage on each selected \
-                     worker's GPU (a range_metrics pass), for which the KV cache cannot make \
-                     room: {error}"
+                    "the session holds {needed} bytes of device storage on a selected worker's \
+                     GPU (a range_metrics pass, as the worker measured it), for which the KV \
+                     cache cannot make room: {error}"
                 ))
             })?;
-        }
-        // A worker that cannot start the session, or whose GPU's storage
-        // quota cannot fit the device storage its collectors would hold,
-        // leaves the session to the workers that started it, which end it.
-        let results = match self.hook("uniserve.profile_start", &payload).await {
-            Ok(results) => results,
-            Err(error) => {
-                self.abandon_profile(id, device_storage, &client).await;
-                return Err(error);
-            }
-        };
-        let workers = answers(&results);
-        if let Some(refusal) = workers
+                room = needed;
+            };
+        // What the selected workers measured their collectors hold, the largest of them.
+        let device_storage = workers
             .iter()
-            .find_map(|worker| worker["refused"].as_str().map(str::to_owned))
-        {
-            self.abandon_profile(id, device_storage, &client).await;
-            return Err(UpdateError::Refused(refusal));
-        }
+            .filter_map(|worker| worker["device_storage"].as_u64())
+            .max()
+            .unwrap_or(0)
+            .max(room);
         // The collectors some selected worker runs.
         let collectors: BTreeSet<Collector> = workers
             .iter()

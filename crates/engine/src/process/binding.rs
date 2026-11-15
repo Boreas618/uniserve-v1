@@ -830,9 +830,10 @@ impl WeightBinding {
     }
 
     /// Starts the profiling session `payload` states on every rank (`docs/profiling.md`): each
-    /// reserves what its collectors hold, then starts at its next batch boundary. A rank whose
-    /// quota cannot fit the storage responds that it refused, and the daemon ends what the others
-    /// started.
+    /// starts at its next batch boundary, its collectors measuring the device storage they hold
+    /// (the range profiler's pass), and then reserves that storage in its GPU's quota. A rank
+    /// whose quota cannot fit it ends the session there and responds that it refused, stating
+    /// the storage, and the daemon ends what the others started.
     ///
     /// # Errors
     ///
@@ -848,12 +849,25 @@ impl WeightBinding {
                 (rank.rank, rank.worker()?)
             };
 
-            let held = crate::profiling::session::device_storage(&start.request, number);
+            let response = worker.profile(Change::Start {
+                start: Box::new(start.clone()),
+                rank: number,
+            })?;
+            // The storage the rank's collectors measured they hold; none on a rank the session
+            // does not select.
+            let held = response["device_storage"].as_u64().unwrap_or(0);
             if let Some(refusal) = self.reserve_profiling(index, held)? {
+                // The session holds the storage only while it runs: it ends here.
+                worker.profile(Change::Stop {
+                    session: start.session,
+                    reason: "refused".to_owned(),
+                    rank: number,
+                })?;
                 responses.push(
                     serde_json::json!({
                         "rank": number,
                         "selected": true,
+                        "device_storage": held,
                         "refused": format!(
                             "range_metrics holds {held} bytes of device storage for its range \
                              profiler pass, which the quota of the rank's GPU cannot fit: \
@@ -864,18 +878,7 @@ impl WeightBinding {
                 );
                 continue;
             }
-
-            let started = worker.profile(Change::Start {
-                start: Box::new(start.clone()),
-                rank: number,
-            });
-            match started {
-                Ok(response) => responses.push(response.to_string()),
-                Err(error) => {
-                    self.release_profiling(index);
-                    return Err(error);
-                }
-            }
+            responses.push(response.to_string());
         }
         Ok(responses)
     }

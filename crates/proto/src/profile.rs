@@ -6,6 +6,7 @@
 //! `uniserve.profile_start`, JSON-encoded; workers of another build read the
 //! fields they know, and every field has a default.
 
+use std::ops::RangeInclusive;
 use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
@@ -89,7 +90,9 @@ pub struct PmSamplingOptions {
     /// Metric names of the collector's performance library that PM sampling collects in one
     /// pass; the collector's own default metrics when empty.
     pub metrics: Vec<String>,
-    /// The sampling interval, nanoseconds of device time.
+    /// The sampling interval, nanoseconds of device time. A worker refuses an interval whose
+    /// samples its reads cannot decode as fast as the device takes them, which it measures when
+    /// the session starts.
     pub interval_ns: u64,
 }
 
@@ -114,29 +117,10 @@ pub enum MetricRanges {
     Module,
 }
 
-/// The shortest `pm_sampling` interval, nanoseconds: on GB200 a worker's
-/// read decodes and evaluates a sample of the default metrics in about 14
-/// µs, so samples every 20 µs keep one thread about 70% busy and every 10
-/// µs outrun it (`docs/profiling.md`).
-pub const PM_MIN_INTERVAL_NS: u64 = 20_000;
-
 /// The kernel and graph launches of one step a `range_metrics` pass makes
 /// room for: a pass of `pass_ranges` ranges is read every
 /// `pass_ranges / RANGE_STEP_LAUNCHES` recorded steps.
 pub const RANGE_STEP_LAUNCHES: usize = 32;
-
-/// The device storage a range profiler pass takes per range. CUPTI takes the
-/// pass's ranges' storage at its first start, rounded up to whole
-/// [`RANGE_STORAGE_GRANULE`]s, and keeps it until the profiler is disabled.
-/// Measured on GB200 with `nvidia-cuda-cupti` 13.4.92 as the device's free
-/// storage (`cuMemGetInfo`) a pass's first start took: 727,711,744,
-/// 1,746,927,616, 2,908,749,824 and 5,817,499,648 bytes for passes of 512,
-/// 1,229, 2,048 and 4,096 ranges, which this size per range gives for
-/// each; the same for one, two and four metrics.
-const RANGE_STORAGE: u64 = 1_420_288;
-
-/// The unit CUPTI takes a pass's device storage in: 2 MiB.
-const RANGE_STORAGE_GRANULE: u64 = 2 << 20;
 
 /// The `range_metrics` collector's options.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -146,9 +130,10 @@ pub struct RangeMetricsOptions {
     pub metrics: Vec<String>,
     pub ranges: MetricRanges,
     /// The ranges one pass holds, at least [`RANGE_STEP_LAUNCHES`]: its
-    /// device storage grows with them ([`Self::pass_storage`]), and the
-    /// worker reads it every `pass_ranges / RANGE_STEP_LAUNCHES` recorded
-    /// steps. The default, 512, takes 728 MB.
+    /// device storage grows with them, and the worker reads it every
+    /// `pass_ranges / RANGE_STEP_LAUNCHES` recorded steps. CUPTI states no
+    /// size for a pass's device storage, so each worker measures what the
+    /// pass's first start took when the session starts, and reserves that.
     pub pass_ranges: usize,
 }
 
@@ -163,12 +148,6 @@ impl Default for RangeMetricsOptions {
 }
 
 impl RangeMetricsOptions {
-    /// The device storage one pass takes: 1,420,288 bytes per range, the
-    /// pass's total rounded up to whole 2 MiB.
-    pub fn pass_storage(&self) -> u64 {
-        (self.pass_ranges as u64 * RANGE_STORAGE).next_multiple_of(RANGE_STORAGE_GRANULE)
-    }
-
     /// Every how many recorded steps the worker reads a pass.
     pub fn read_steps(&self) -> u64 {
         (self.pass_ranges / RANGE_STEP_LAUNCHES).max(1) as u64
@@ -180,17 +159,17 @@ impl RangeMetricsOptions {
 #[serde(default, deny_unknown_fields)]
 pub struct PcSamplingOptions {
     /// Each SM samples a warp every `2^period` cycles
-    /// (`CUPTI_PC_SAMPLING_CONFIGURATION_ATTR_TYPE_SAMPLING_PERIOD`), from
-    /// [`PcSamplingOptions::MIN_PERIOD`] to 31.
+    /// (`CUPTI_PC_SAMPLING_CONFIGURATION_ATTR_TYPE_SAMPLING_PERIOD`), one of
+    /// [`PcSamplingOptions::PERIODS`]. A worker refuses a period whose
+    /// samples, at its device's sampling rate, no hardware buffer CUPTI
+    /// accepts holds between CUPTI's reads of it.
     pub period: u32,
 }
 
 impl PcSamplingOptions {
-    /// The shortest period a session samples at: below it, no hardware
-    /// buffer of up to CUPTI's 512 MiB holds the samples of a busy GB200
-    /// between CUPTI's reads of it, and the samples are lost
-    /// (`docs/profiling.md`).
-    pub const MIN_PERIOD: u32 = 12;
+    /// The sampling periods CUPTI accepts: 5 to 31, as its PC sampling
+    /// API states for `CUPTI_PC_SAMPLING_CONFIGURATION_ATTR_TYPE_SAMPLING_PERIOD`.
+    pub const PERIODS: RangeInclusive<u32> = 5..=31;
 }
 
 impl Default for PcSamplingOptions {
@@ -235,18 +214,6 @@ pub struct SessionRequest {
 }
 
 impl SessionRequest {
-    /// The device storage the session holds on the GPU of each worker it
-    /// selects while it runs: a range profiler pass for `range_metrics`
-    /// ([`RangeMetricsOptions::pass_storage`]); 0 otherwise. The worker
-    /// reserves it in the GPU's quota beside its process.
-    pub fn device_storage(&self) -> u64 {
-        if self.collectors.contains(&Collector::RangeMetrics) {
-            self.range_metrics.pass_storage()
-        } else {
-            0
-        }
-    }
-
     /// Why a deployment whose ranks keep PC sampling enabled
     /// (`profiling_config.graph_pc_sampling`) refuses this request, if it
     /// does: CUPTI then refuses PM sampling (the device's performance
@@ -349,12 +316,11 @@ impl SessionRequest {
                 collector.as_str()
             ));
         }
-        if !(PcSamplingOptions::MIN_PERIOD..=31).contains(&self.pc_sampling.period) {
+        if !PcSamplingOptions::PERIODS.contains(&self.pc_sampling.period) {
             return Err(format!(
-                "pc_sampling.period is from {} to 31: below {}, no hardware buffer of up to \
-                 512 MiB holds the samples of a busy device",
-                PcSamplingOptions::MIN_PERIOD,
-                PcSamplingOptions::MIN_PERIOD
+                "pc_sampling.period is from {} to {}, the periods CUPTI accepts",
+                PcSamplingOptions::PERIODS.start(),
+                PcSamplingOptions::PERIODS.end()
             ));
         }
         if self.range_metrics.pass_ranges < RANGE_STEP_LAUNCHES
@@ -365,12 +331,8 @@ impl SessionRequest {
                 u32::MAX
             ));
         }
-        if self.pm_sampling.interval_ns < PM_MIN_INTERVAL_NS {
-            return Err(format!(
-                "pm_sampling.interval_ns is at least {PM_MIN_INTERVAL_NS}: a worker decodes \
-                 about 70,000 samples a second on one thread, and shorter intervals lose \
-                 samples"
-            ));
+        if self.pm_sampling.interval_ns == 0 {
+            return Err("pm_sampling.interval_ns is a positive number of nanoseconds".to_owned());
         }
         Ok(())
     }
@@ -510,7 +472,12 @@ mod tests {
             },
             SessionRequest {
                 collectors: vec![Collector::PcSampling],
-                pc_sampling: PcSamplingOptions { period: 11 },
+                pc_sampling: PcSamplingOptions { period: 4 },
+                ..request()
+            },
+            SessionRequest {
+                collectors: vec![Collector::PcSampling],
+                pc_sampling: PcSamplingOptions { period: 32 },
                 ..request()
             },
             SessionRequest {
@@ -524,7 +491,7 @@ mod tests {
             SessionRequest {
                 collectors: vec![Collector::PmSampling],
                 pm_sampling: PmSamplingOptions {
-                    interval_ns: 10_000,
+                    interval_ns: 0,
                     ..PmSamplingOptions::default()
                 },
                 ..request()

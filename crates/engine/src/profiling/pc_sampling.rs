@@ -17,7 +17,9 @@
 //!
 //! CUPTI keeps the samples in a hardware buffer of process host storage, which its own thread
 //! empties; a buffer too small for the sampling rate fills, and the samples are lost.
-//! [`hardware_buffer`] sizes it for a period from measurement.
+//! [`hardware_buffer`] sizes it for a period, and a read whose buffer filled tells the session
+//! the period is too short for the device, which releases the collector as failed
+//! (`super::collectors`).
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, OnceLock};
@@ -49,11 +51,7 @@ static KINDS: OnceLock<KindsHold> = OnceLock::new();
 /// subscription.
 pub(crate) fn enable(context: &PrimaryContext) -> Result<()> {
     let period = proto::profile::PcSamplingOptions::default().period;
-    let bytes = hardware_buffer(period).ok_or_else(|| {
-        Error::Invalid(format!(
-            "no hardware buffer holds PC sampling at period {period}"
-        ))
-    })?;
+    let bytes = hardware_buffer(period);
     if KINDS.get().is_none() {
         let hold = KindsHold::take().map_err(|error| {
             Error::Unsupported(format!("the activity records beside PC sampling: {error}"))
@@ -85,23 +83,26 @@ pub(crate) fn of(device: DeviceId) -> Option<Arc<Mutex<PcSampler>>> {
     lock(&RANKS).as_ref()?.get(&device).cloned()
 }
 
-/// The hardware buffer, in bytes, that holds PC samples at `period` when every SM is busy, or
-/// `None` when no buffer of up to CUPTI's 512 MiB does.
+/// CUPTI's largest hardware buffer, which is also its default: 512 MiB.
+const LARGEST_HARDWARE_BUFFER: usize = 512 << 20;
+
+/// The hardware buffer, in bytes, a session samples at `period` into.
 ///
-/// Measured on GB200 with `nvidia-cuda-cupti` 13.0 with every SM busy: a size holds when no window
-/// of 0.6 s filled it. Each period takes twice the smallest size that held three windows, capped
-/// at CUPTI's 512 MiB, and the size taken held ten more (`docs/profiling.md` states the table).
-/// Below period 12 even 512 MiB fills.
-pub(crate) fn hardware_buffer(period: u32) -> Option<usize> {
+/// Sized from a measurement on GB200 with `nvidia-cuda-cupti` 13.0 with every SM busy: a size
+/// holds when no window of 0.6 s filled it, each period takes twice the smallest size that held
+/// three windows, and the size taken held ten more (`docs/profiling.md` states the table). A
+/// period shorter than that table's takes CUPTI's largest buffer. A device that samples faster
+/// fills a buffer sooner: the first read whose buffer filled releases the collector as failed,
+/// naming the period, rather than recording a sample of what ran.
+pub(crate) fn hardware_buffer(period: u32) -> usize {
     const MIB: usize = 1 << 20;
     match period {
-        19.. => Some(2 * MIB),
-        18 => Some(4 * MIB),
-        17 => Some(8 * MIB),
-        15 | 16 => Some(32 * MIB),
-        14 => Some(128 * MIB),
-        13 => Some(256 * MIB),
-        12 => Some(512 * MIB),
-        _ => None,
+        19.. => 2 * MIB,
+        18 => 4 * MIB,
+        17 => 8 * MIB,
+        15 | 16 => 32 * MIB,
+        14 => 128 * MIB,
+        13 => 256 * MIB,
+        _ => LARGEST_HARDWARE_BUFFER,
     }
 }

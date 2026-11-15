@@ -75,16 +75,6 @@ pub(crate) enum Change {
     },
 }
 
-/// The device storage a session of `request` holds on the device of rank `rank` while it runs, for
-/// a session that selects the rank; 0 otherwise.
-pub(crate) fn device_storage(request: &SessionRequest, rank: u32) -> u64 {
-    if request.workers.is_empty() || request.workers.contains(&rank) {
-        request.device_storage()
-    } else {
-        0
-    }
-}
-
 /// A session on a rank the session selected.
 pub(crate) struct Session {
     id: u64,
@@ -217,6 +207,8 @@ impl Session {
         }
 
         let (collectors, states) = Collectors::prepare(&request, Some(device), rows.clone());
+        // What the collectors measured they hold on the device, which the rank's quota reserves.
+        let device_storage = collectors.device_storage();
         let running = collectors.running();
         let collectors = Arc::new(Mutex::new(collectors));
         let sampler = sampler(Arc::clone(&collectors))?;
@@ -225,6 +217,7 @@ impl Session {
             "selected": true,
             "path": path,
             "collectors": states,
+            "device_storage": device_storage,
         });
         tracing::info!(session, path = %path.display(), "a profiling session started");
 
@@ -520,8 +513,6 @@ mod tests {
             epoch: 2,
             request: request(&[0]),
         };
-        assert_eq!(device_storage(&start.request, 1), 0);
-
         let response = Session::change(
             &mut slot,
             Change::Start {
