@@ -301,7 +301,9 @@ fn install_names_a_package_on_the_server_host_and_list_needs_nothing() {
     ])
     .unwrap();
     match args.command {
-        Command::Install { socket, package } => {
+        Command::Install {
+            socket, package, ..
+        } => {
             assert_eq!(
                 socket,
                 Some(PathBuf::from("/run/uniserve/build-server.sock"))
@@ -315,7 +317,13 @@ fn install_names_a_package_on_the_server_host_and_list_needs_nothing() {
     }
 
     let args = Args::try_parse_from(["build-server", "list"]).unwrap();
-    assert!(matches!(args.command, Command::List { socket: None }));
+    assert!(matches!(
+        args.command,
+        Command::List {
+            socket: None,
+            json: false
+        }
+    ));
 }
 
 #[test]

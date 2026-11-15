@@ -42,7 +42,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::builder::Limits;
 use crate::launch::Launch;
-use crate::manifest::{SOURCE_DIRECTORY, ToolchainKind};
+use crate::manifest::{ModuleForm, SOURCE_DIRECTORY, ToolchainKind};
 use crate::protocol::Client;
 use crate::server::{BuildServer, ServerConfig};
 use crate::store::Root;
@@ -73,12 +73,20 @@ pub enum Command {
         socket: Option<PathBuf>,
         /// The package directory, as the Build Server's host sees it.
         package: PathBuf,
+        /// Print the installed package as one JSON object ([`InstalledPackage`])
+        /// instead of its text line.
+        #[arg(long)]
+        json: bool,
     },
     /// List the installed packages, revisions and modules.
     List {
         /// The Build Server's socket; this user's default socket when unset.
         #[arg(long)]
         socket: Option<PathBuf>,
+        /// Print the listing as one JSON array ([`ListedPackage`]) instead of
+        /// its text rendering.
+        #[arg(long)]
+        json: bool,
     },
     /// Resolve one module and print the path of each of its files in the
     /// store, building the module first when the store misses it.
@@ -99,6 +107,10 @@ pub enum Command {
         /// The module's key; the key of a single-module package when unset.
         #[arg(long, value_name = "KEY")]
         key: Option<String>,
+        /// Print the module as one JSON object ([`ResolvedModule`]) instead of
+        /// one file path per line.
+        #[arg(long)]
+        json: bool,
     },
     /// Read a descriptor key against a package's declared dimensions and
     /// print its fields as a JSON object, typed as a compilation is handed them.
@@ -438,18 +450,55 @@ pub type HostTargets<'a> = &'a dyn Fn() -> std::result::Result<Vec<Target>, Stri
 pub fn run(args: Args, host: HostTargets<'_>, levels: &service::logging::Levels) -> Result<()> {
     match args.command {
         Command::Serve(serve) => run_serve(*serve, host, levels),
-        Command::Install { socket, package } => {
+        Command::Install {
+            socket,
+            package,
+            json,
+        } => {
             let mut client = Client::connect(&socket_or_default(socket)?)?;
             let installed = client.install(&absolute(package))?;
-            println!(
-                "{} {} revision {}",
-                installed.op, installed.backend, installed.revision
-            );
+            if json {
+                write_line(
+                    &mut std::io::stdout().lock(),
+                    &InstalledPackage {
+                        op: &installed.op,
+                        backend: &installed.backend,
+                        revision: installed.revision,
+                    },
+                )?;
+            } else {
+                println!(
+                    "{} {} revision {}",
+                    installed.op, installed.backend, installed.revision
+                );
+            }
             Ok(())
         }
-        Command::List { socket } => {
+        Command::List { socket, json } => {
             let mut client = Client::connect(&socket_or_default(socket)?)?;
-            for (package, modules) in client.list()? {
+            let listing = client.list()?;
+            if json {
+                let packages: Vec<ListedPackage<'_>> = listing
+                    .iter()
+                    .map(|(package, modules)| ListedPackage {
+                        op: &package.op,
+                        backend: &package.backend,
+                        revision: package.revision,
+                        modules: modules
+                            .iter()
+                            .map(|module| ListedModule {
+                                target: module.target.to_string(),
+                                descriptor: &module.descriptor,
+                                form: module.form,
+                                interface_version: module.interface_version,
+                            })
+                            .collect(),
+                    })
+                    .collect();
+                write_line(&mut std::io::stdout().lock(), &packages)?;
+                return Ok(());
+            }
+            for (package, modules) in listing {
                 println!(
                     "{} {} revision {}",
                     package.op, package.backend, package.revision
@@ -470,6 +519,7 @@ pub fn run(args: Args, host: HostTargets<'_>, levels: &service::logging::Levels)
             revision,
             target,
             key,
+            json,
         } => {
             let mut client = Client::connect(&socket_or_default(socket)?)?;
             let module = client.resolve(
@@ -485,6 +535,25 @@ pub fn run(args: Args, host: HostTargets<'_>, levels: &service::logging::Levels)
                     eprintln!("{} {:?}", progress.path, progress.state);
                 },
             )?;
+            if json {
+                write_line(
+                    &mut std::io::stdout().lock(),
+                    &ResolvedModule {
+                        form: module.form,
+                        files: module
+                            .files
+                            .iter()
+                            .map(|file| file.path.as_path())
+                            .collect(),
+                        executable: module
+                            .executable
+                            .as_deref()
+                            .and_then(|name| module.files.iter().find(|file| file.name == name))
+                            .map(|file| file.path.as_path()),
+                    },
+                )?;
+                return Ok(());
+            }
             for file in module.files {
                 println!("{}", file.path.display());
             }
@@ -694,6 +763,43 @@ pub fn state_launches(
         )));
     }
     Ok(())
+}
+
+/// What `install --json` prints: the package the server installed and the revision it numbered.
+#[derive(Serialize)]
+pub struct InstalledPackage<'a> {
+    pub op: &'a str,
+    pub backend: &'a str,
+    pub revision: u32,
+}
+
+/// One element of what `list --json` prints: an installed package revision and the modules its
+/// store holds.
+#[derive(Serialize)]
+pub struct ListedPackage<'a> {
+    pub op: &'a str,
+    pub backend: &'a str,
+    pub revision: u32,
+    pub modules: Vec<ListedModule<'a>>,
+}
+
+/// One module of a [`ListedPackage`]: the target it was built for, its descriptor key, its form
+/// and the interface version it was built for.
+#[derive(Serialize)]
+pub struct ListedModule<'a> {
+    pub target: String,
+    pub descriptor: &'a str,
+    pub form: ModuleForm,
+    pub interface_version: u32,
+}
+
+/// What `resolve --json` prints: the module's form, the path of each of its files in the store,
+/// and for an executable module the file its process runs as.
+#[derive(Serialize)]
+pub struct ResolvedModule<'a> {
+    pub form: ModuleForm,
+    pub files: Vec<&'a Path>,
+    pub executable: Option<&'a Path>,
 }
 
 /// Writes `value` to `writer` as one JSON line and flushes it.
