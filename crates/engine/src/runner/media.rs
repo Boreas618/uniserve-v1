@@ -1230,7 +1230,7 @@ fn floats(bytes: &mut [u8]) -> Result<&mut [f32]> {
 }
 
 /// The bytes one condition's media was published as, read from shared memory.
-fn published_bytes(source: &proto::video::MediaLocator) -> Result<Vec<u8>> {
+fn published_bytes(source: &proto::MediaLocator) -> Result<Vec<u8>> {
     use std::os::unix::fs::FileExt as _;
 
     let read = |error: std::io::Error| {

@@ -545,9 +545,9 @@ impl Update {
             kernels: modules
                 .kernels
                 .iter()
-                .map(|(slot, package)| crate::epoch::kernel_to_wire(slot, package))
+                .map(|(slot, package)| proto::module::kernel_to_wire(slot, package))
                 .collect(),
-            policy: Some(crate::epoch::package_to_wire(&modules.policy)),
+            policy: Some((&modules.policy).into()),
         }));
         for node in &self.nodes {
             processes.command(&node.host, node.launch, prepare.clone());

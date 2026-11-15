@@ -620,11 +620,9 @@ fn artifact_descriptor(
     if let Some(descriptor) = media.descriptor() {
         return Ok(descriptor.try_clone_to_owned()?);
     }
-    let (object, mut file) = proto::SharedMemory::create(media.len())
+    let mut file = proto::shared_memory::anonymous(media.len())
         .context("creating shared memory for a video artifact")?;
     std::io::Write::write_all(&mut file, media)?;
-    // The descriptor keeps the storage; the object's name is not needed.
-    drop(object);
     Ok(OwnedFd::from(file))
 }
 

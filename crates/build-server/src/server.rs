@@ -926,7 +926,8 @@ impl BuildServer {
     /// the ones that build for every requested target. The response lists them
     /// in selection order, which is what the daemon fixes a module set from. A key goes to the first candidate whose manifest
     /// covers it, in the selection order: a backend the request names for the
-    /// key's phase ([`proto::module::PhaseKind::of_key`]) first, then the manifest's
+    /// key's phase (its descriptor's `phase` field, as the candidate's manifest
+    /// reads the key) first, then the manifest's
     /// `priority`, highest first, then the backend whose name sorts first. A
     /// named backend that does not cover a key leaves it to the next candidate,
     /// so a deployment that names its attention backend still serves the keys
@@ -1022,16 +1023,26 @@ impl BuildServer {
             if !seen.insert(key.as_str()) {
                 continue;
             }
-            let phase = proto::module::PhaseKind::of_key(key);
-            let preferred = |backend: &str| {
+            // A key's phase is a field of its descriptor, which only the manifest that
+            // declares the operator's dimensions reads: each candidate reads it itself.
+            let phase = |index: usize| {
+                candidates[index]
+                    .2
+                    .manifest
+                    .fields(key)?
+                    .into_iter()
+                    .find(|(dimension, _)| dimension == "phase")
+                    .and_then(|(_, value)| proto::module::PhaseKind::named(&value))
+            };
+            let preferred = |index: &usize| {
                 request.preferred.iter().any(|preference| {
-                    preference.backend == backend
-                        && (preference.phase.is_none() || preference.phase == phase)
+                    preference.backend == candidates[*index].0
+                        && (preference.phase.is_none() || preference.phase == phase(*index))
                 })
             };
             let covering = |index: &usize| candidates[*index].2.manifest.covers(key);
             let selected = (0..candidates.len())
-                .filter(|index| preferred(candidates[*index].0))
+                .filter(preferred)
                 .find(covering)
                 .or_else(|| (0..candidates.len()).find(covering));
             match selected {

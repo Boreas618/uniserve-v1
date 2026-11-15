@@ -6,16 +6,21 @@
 //! generations by the same operator names and phases. The vocabulary is stated here, below all of
 //! them, so a daemon or a scheduler names packages without linking the numerical library, and the
 //! record key, the wire message and a package's descriptor cannot drift apart. Its parameters
-//! travel as a TOML table, so a package's arguments keep the types their configuration fields have.
+//! are a TOML table, so a package's arguments keep the types their configuration fields have, and
+//! the process interface carries each as a typed `Value` (`wire`).
 //!
 //! The revision fixes everything a module is built from (design section 5.2), so a path in the
 //! Build Server's module store needs nothing else to name one module: the same revision of the
 //! same package is the same module on every host.
 
+mod wire;
+
 use std::collections::BTreeMap;
 use std::fmt;
 
 use serde::{Deserialize, Serialize};
+
+pub use wire::{WireError, kernel_of, kernel_to_wire, phase_of};
 
 /// Which phase of a request an operator call belongs to, and which phase of an operator a package
 /// fills.
@@ -55,14 +60,10 @@ impl PhaseKind {
         }
     }
 
-    /// The phase a descriptor key states, when its operator's descriptor holds one.
-    ///
-    /// An operator split by phase writes the phase as its key's first field (`phase_decode_...`,
-    /// the paged attention operator's keys); a key of an operator without one states no phase and
-    /// returns `None`.
-    pub fn of_key(key: &str) -> Option<Self> {
-        let rest = key.strip_prefix("phase_")?;
-        let name = rest.split('_').next()?;
+    /// The phase named `name` ([`Self::as_str`]), as a descriptor's `phase` field states it once
+    /// the key's grammar owner (the Build Server's package manifest) has read the key into fields;
+    /// `None` for a name of no phase.
+    pub fn named(name: &str) -> Option<Self> {
         Self::ALL.into_iter().find(|phase| phase.as_str() == name)
     }
 }
@@ -486,13 +487,10 @@ mod tests {
     }
 
     #[test]
-    fn a_key_states_its_phase_as_its_first_field() {
-        assert_eq!(
-            PhaseKind::of_key("phase_decode_dtype_bf16"),
-            Some(PhaseKind::Decode)
-        );
-        assert_eq!(PhaseKind::of_key("phase_prefill"), Some(PhaseKind::Prefill));
-        assert_eq!(PhaseKind::of_key("dtype_bf16_phase_decode"), None);
-        assert_eq!(PhaseKind::of_key("phase_sideways_dtype_bf16"), None);
+    fn a_phase_is_found_by_its_name_alone() {
+        for phase in PhaseKind::ALL {
+            assert_eq!(PhaseKind::named(phase.as_str()), Some(phase));
+        }
+        assert_eq!(PhaseKind::named("sideways"), None);
     }
 }

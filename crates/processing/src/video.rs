@@ -1,9 +1,8 @@
 //! Video requests: a model-agnostic request, the processor a video family binds, and the engine
 //! input it processes a request into.
 
-use proto::video::{
-    Canvas, Condition, ConditionMedia, ConditionRole, ConditionVision, MediaLocator,
-};
+use proto::MediaLocator;
+use proto::video::{Canvas, Condition, ConditionMedia, ConditionRole, ConditionVision};
 use serde_json::{Map, Value};
 
 use crate::media::MediaMetadata;

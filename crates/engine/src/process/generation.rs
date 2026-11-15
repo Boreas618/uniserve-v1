@@ -36,7 +36,7 @@ use crate::worker::completion::{Outcome, Submission};
 use anyhow::{Context as _, Result, anyhow};
 use build_server::{Client, Target};
 use crossbeam_channel::{RecvTimeoutError, Sender};
-use proto::module::{ModuleSlot, PackageRevision, Packages, PhaseKind};
+use proto::module::{PackageRevision, Packages};
 use scheduling::limits::{Limits, Parameters};
 use scheduling::view::Snapshot;
 use service::lock;
@@ -52,65 +52,23 @@ use crate::scheduler::Message;
 use crate::scheduler::policy::Policy;
 
 /// The packages the daemon's `Prepare` names: each operator's package under its slot, and the
-/// scheduling policy's package. The Protobuf carries a package's arguments as the TOML text of
-/// each value, which are read back as the values they were; it carries no module's bytes, which
-/// the Build Server resolves.
+/// scheduling policy's package, each argument with the type the configuration gave it
+/// (`proto::module`'s wire form). It carries no module's bytes, which the Build Server resolves.
 ///
 /// # Errors
 ///
 /// A kernel or the policy that names no package, a phase that is no phase kind, or an argument
-/// that is not a TOML value.
+/// that states no value.
 pub(crate) fn named(prepare: proto::process::Prepare) -> Result<(Packages, PackageRevision)> {
-    let mut packages = Packages::new();
-    for kernel in prepare.kernels {
-        let package = kernel
-            .package
-            .with_context(|| format!("the preparation's kernel {} names no package", kernel.op))?;
-        let slot = ModuleSlot {
-            op: kernel.op,
-            phase: kernel.phase.map(phase_of).transpose()?.flatten(),
-            part: kernel.part,
-        };
-        packages.insert(slot, package_of(package)?);
-    }
-
+    let packages = prepare
+        .kernels
+        .into_iter()
+        .map(proto::module::kernel_of)
+        .collect::<std::result::Result<Packages, _>>()
+        .context("the preparation's kernels")?;
     let policy = prepare.policy.context("the preparation names no policy")?;
-    Ok((packages, package_of(policy)?))
-}
-
-/// A package as the daemon's Protobuf states it, its arguments read back as TOML values.
-fn package_of(package: proto::process::PackageRevision) -> Result<PackageRevision> {
-    let mut arguments = toml::Table::new();
-    for (name, value) in package.arguments {
-        let value = value.parse::<toml::Value>().map_err(|_| {
-            anyhow!(
-                "the argument {name} of {} is not a TOML value",
-                package.backend
-            )
-        })?;
-        arguments.insert(name, value);
-    }
-
-    Ok(PackageRevision {
-        backend: package.backend,
-        revision: package.revision,
-        arguments,
-    })
-}
-
-/// A kernel's phase as the Protobuf states it; `None` for the unspecified value, which means the
-/// package fills every phase of its operator.
-fn phase_of(phase: i32) -> Result<Option<PhaseKind>> {
-    use proto::process::PhaseKind as Wire;
-
-    Ok(match Wire::try_from(phase) {
-        Ok(Wire::Prefill) => Some(PhaseKind::Prefill),
-        Ok(Wire::Decode) => Some(PhaseKind::Decode),
-        Ok(Wire::Encode) => Some(PhaseKind::Encode),
-        Ok(Wire::Denoise) => Some(PhaseKind::Denoise),
-        Ok(Wire::Unspecified) => None,
-        Err(_) => return Err(anyhow!("phase {phase} is not a phase kind")),
-    })
+    let policy = PackageRevision::try_from(policy).context("the preparation's policy")?;
+    Ok((packages, policy))
 }
 
 /// Makes generation `generation` of kernels ready beside the serving one on every worker and

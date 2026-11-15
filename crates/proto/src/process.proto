@@ -214,16 +214,27 @@ message EpochsPublished {}
 // fails it.
 message PrepareModules {
   string host = 1;
-  // The module set, every revision fixed (`proto::module::ModuleSet` as JSON, as a launch file
-  // states it).
-  bytes modules = 2;
+  // The module set, every revision fixed.
+  ModuleSet modules = 2;
 }
 
 message ModulesPrepared {
-  // The module set as the node's Build Server prepared it (`proto::module::ModuleSet` as JSON):
-  // each package at its revision, with the parameters its manifest gives it under the
-  // deployment's arguments. Every host of an epoch answers the same set.
-  bytes modules = 1;
+  // The module set as the node's Build Server prepared it: each package at its revision, with
+  // the parameters its manifest gives it under the deployment's arguments. Every host of an
+  // epoch answers the same set.
+  ModuleSet modules = 1;
+}
+
+// A module set (`proto::module::ModuleSet`): the package of every interface an epoch uses, each
+// at the revision the daemon fixed when the epoch's configuration was applied.
+message ModuleSet {
+  // The engine package, whose executable the epoch's main processes run as.
+  PackageRevision engine = 1;
+  // The scheduling policy's package.
+  PackageRevision policy = 2;
+  // The kernel packages, one per slot: an operator, the phase when the operator is filled per
+  // phase, and the backend when the operator's packages divide its descriptors between them.
+  repeated KernelPackage kernels = 3;
 }
 
 // Start one process of a worker group on a node, as a child of its daemon.
@@ -434,19 +445,41 @@ message Event {
 
 // A package: the backend that fills an operator or the scheduling interface,
 // the revision of its package the upstream Build Server numbered, and its
-// parameters. The Rust type is `crates/build-server`'s
-// `PackageRevision`; this is only its wire form, which the daemon records and sends.
+// parameters. The Rust type is `proto::module::PackageRevision`; this is its
+// wire form, which the daemon records and sends.
 message PackageRevision {
   // The backend's name, from the configuration field that selects it.
   string backend = 1;
   // The revision the upstream Build Server gave the package: the same
   // content on every host, and never overwritten.
   uint32 revision = 2;
-  // The package's parameters as TOML key/value pairs: each value is the TOML
-  // representation of that parameter's configured value, so `chunked_prefill_size
-  // = 4096` arrives as `chunked_prefill_size = "4096"`. An engine of
-  // another build reads them back as TOML values.
-  map<string, string> arguments = 3;
+  // The package's parameters, each with the type its configuration field
+  // has: `chunked_prefill_size = 4096` arrives as the integer 4096.
+  map<string, Value> arguments = 3;
+}
+
+// One package parameter's value, typed as the configuration states it.
+message Value {
+  oneof kind {
+    bool boolean = 1;
+    int64 integer = 2;
+    double float = 3;
+    string text = 4;
+    Values list = 5;
+    Table table = 6;
+    // A TOML datetime, as its RFC 3339 text.
+    string datetime = 7;
+  }
+}
+
+// A list of parameter values, in order.
+message Values {
+  repeated Value items = 1;
+}
+
+// A table of parameter values, by name.
+message Table {
+  map<string, Value> entries = 1;
 }
 
 // The phase of an operator's calls that a kernel package fills. An operator

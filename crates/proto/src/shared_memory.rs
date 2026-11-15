@@ -1,4 +1,7 @@
-//! Owned, physically backed POSIX shared-memory allocations.
+//! Physically backed shared-memory allocations: anonymous memory files ([`anonymous`]), which
+//! cross processes only by descriptor and which the kernel frees with the last descriptor or
+//! mapping, and named POSIX objects ([`SharedMemory`]), which a process on the same host opens by
+//! name.
 
 use std::ffi::CString;
 use std::fs::File;
@@ -35,7 +38,7 @@ impl SharedMemory {
         Ok(unsafe { File::from_raw_fd(descriptor) })
     }
 
-    /// Allocate physical storage and return its writable descriptor. The
+    /// Allocate physical storage under a fresh name and return its writable descriptor. The
     /// caller may close the descriptor as soon as writing or mapping ends.
     pub fn create(size: usize) -> io::Result<(Self, File)> {
         static NEXT: AtomicU64 = AtomicU64::new(0);
@@ -71,16 +74,7 @@ impl SharedMemory {
         // SAFETY: shm_open returned one new descriptor owned by this call.
         let file = unsafe { File::from_raw_fd(descriptor) };
         let storage = Self { name, size };
-
-        // Reserve tmpfs pages before exposing a writable mapping. A sparse
-        // allocation can otherwise raise SIGBUS during a later mapped write.
-        // posix_fallocate returns its error number directly, without errno.
-        // SAFETY: `file` keeps the descriptor open for the call, which takes no pointers.
-        let error = unsafe { libc::posix_fallocate(file.as_raw_fd(), 0, length) };
-        if error != 0 {
-            return Err(io::Error::from_raw_os_error(error));
-        }
-
+        reserve(&file, length)?;
         Ok((storage, file))
     }
 
@@ -96,6 +90,51 @@ impl SharedMemory {
     pub fn into_name(mut self) -> String {
         std::mem::take(&mut self.name)
     }
+}
+
+/// Allocates `size` bytes of physically reserved anonymous shared memory (`memfd_create`) and
+/// returns its writable descriptor.
+///
+/// The memory has no name: it reaches another process only as a descriptor passed beside a
+/// message (`SCM_RIGHTS`), and the kernel frees it once the last descriptor and the last mapping
+/// of it are gone, so nothing outlives a process that crashes.
+///
+/// # Errors
+///
+/// Fails when `size` is zero or does not fit a file offset, or when the kernel refuses the file or
+/// its storage.
+pub fn anonymous(size: usize) -> io::Result<File> {
+    if size == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "shared memory must not be empty",
+        ));
+    }
+    let length = libc::off_t::try_from(size)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "shared memory is too large"))?;
+
+    // SAFETY: the label is a NUL-terminated literal; a successful call returns an owned
+    // descriptor.
+    let descriptor = unsafe { libc::memfd_create(c"uniserve-media".as_ptr(), libc::MFD_CLOEXEC) };
+    if descriptor < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: memfd_create returned one new descriptor that nothing else owns.
+    let file = unsafe { File::from_raw_fd(descriptor) };
+    reserve(&file, length)?;
+    Ok(file)
+}
+
+/// Reserves `length` bytes of pages for `file` before anyone maps it writable: a sparse
+/// allocation can otherwise raise SIGBUS during a later mapped write.
+fn reserve(file: &File, length: libc::off_t) -> io::Result<()> {
+    // posix_fallocate returns its error number directly, without errno.
+    // SAFETY: `file` keeps the descriptor open for the call, which takes no pointers.
+    let error = unsafe { libc::posix_fallocate(file.as_raw_fd(), 0, length) };
+    if error != 0 {
+        return Err(io::Error::from_raw_os_error(error));
+    }
+    Ok(())
 }
 
 impl Drop for SharedMemory {

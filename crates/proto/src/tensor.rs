@@ -44,20 +44,6 @@ impl DType {
             Self::I64 => 8,
         }
     }
-
-    /// The name a transfer locator spells the type with: the torch dtype name without the
-    /// `torch.` prefix, as the worker's DLPack dtype writes it.
-    pub const fn torch_name(self) -> &'static str {
-        match self {
-            Self::U8 => "uint8",
-            Self::I16 => "int16",
-            Self::I32 => "int32",
-            Self::I64 => "int64",
-            Self::F16 => "float16",
-            Self::BF16 => "bfloat16",
-            Self::F32 => "float32",
-        }
-    }
 }
 
 impl From<ModelDtype> for DType {
@@ -67,22 +53,6 @@ impl From<ModelDtype> for DType {
             ModelDtype::Float16 => Self::F16,
             ModelDtype::BFloat16 => Self::BF16,
             ModelDtype::Float32 => Self::F32,
-        }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn a_model_dtype_is_the_element_type_of_its_name() {
-        for dtype in [
-            ModelDtype::Float16,
-            ModelDtype::BFloat16,
-            ModelDtype::Float32,
-        ] {
-            assert_eq!(DType::from(dtype).torch_name(), dtype.as_str());
         }
     }
 }

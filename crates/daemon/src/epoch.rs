@@ -35,42 +35,6 @@ use crate::options::ServerArgs;
 /// and the Build Server all name modules with.
 pub type KernelKey = ModuleSlot;
 
-/// One package as the process interface's wire form: its parameters as the
-/// TOML text of each value, so an engine of another build reads each
-/// back as the value it was.
-pub fn package_to_wire(package: &PackageRevision) -> proto::process::PackageRevision {
-    proto::process::PackageRevision {
-        backend: package.backend.clone(),
-        revision: package.revision,
-        arguments: package
-            .arguments
-            .iter()
-            .map(|(key, value)| (key.clone(), value.to_string()))
-            .collect(),
-    }
-}
-
-/// One operator's package as the `Prepare` command states it.
-pub fn kernel_to_wire(
-    slot: &KernelKey,
-    package: &PackageRevision,
-) -> proto::process::KernelPackage {
-    proto::process::KernelPackage {
-        op: slot.op.clone(),
-        phase: slot.phase.map(|phase| {
-            let phase = match phase {
-                PhaseKind::Prefill => proto::process::PhaseKind::Prefill,
-                PhaseKind::Decode => proto::process::PhaseKind::Decode,
-                PhaseKind::Encode => proto::process::PhaseKind::Encode,
-                PhaseKind::Denoise => proto::process::PhaseKind::Denoise,
-            };
-            phase as i32
-        }),
-        package: Some(package_to_wire(package)),
-        part: slot.part.clone(),
-    }
-}
-
 /// Where an epoch is in its life.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Status {

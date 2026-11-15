@@ -30,7 +30,7 @@ pub mod module;
 pub mod profile;
 pub mod report;
 pub mod request;
-mod shared_memory;
+pub mod shared_memory;
 mod storage_settings;
 pub mod tensor;
 pub mod video;

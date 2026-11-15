@@ -670,7 +670,7 @@ impl EngineControl {
         steps: &PrepareSteps,
     ) -> anyhow::Result<crate::epoch::ModuleSet> {
         steps.at(host, "asking the host's daemon to prepare");
-        let modules = serde_json::to_vec(filled).context("encoding the module set")?;
+        let modules = Some(filled.into());
         let (mut control, _) = self.connect()?;
         control.deliver(&process::Upstream {
             kind: Some(upstream::Kind::Request(process::Request {
@@ -709,7 +709,10 @@ impl EngineControl {
         let Some(reply::Kind::ModulesPrepared(prepared)) = reply.kind else {
             anyhow::bail!("the daemon of {host} answered the preparation with no module set");
         };
-        let prepared = serde_json::from_slice(&prepared.modules)
+        let prepared = prepared
+            .modules
+            .context("the answer holds no module set")
+            .and_then(|modules| Ok(crate::epoch::ModuleSet::try_from(modules)?))
             .with_context(|| format!("reading the module set {host} prepared"))?;
         steps.at(host, "prepared");
         tracing::info!(host, "a host's daemon prepared the epoch's modules");
@@ -1209,8 +1212,14 @@ pub(crate) fn prepare_node(
     settings: Option<&build_server::command::Settings>,
     prepare: &process::PrepareModules,
 ) -> Result<process::ModulesPrepared, String> {
-    let filled: crate::epoch::ModuleSet = serde_json::from_slice(&prepare.modules)
-        .map_err(|error| format!("reading the module set to prepare: {error}"))?;
+    let filled = prepare
+        .modules
+        .clone()
+        .ok_or_else(|| "the request names no module set to prepare".to_owned())
+        .and_then(|modules| {
+            crate::epoch::ModuleSet::try_from(modules)
+                .map_err(|error| format!("reading the module set to prepare: {error}"))
+        })?;
     let settings =
         settings.ok_or_else(|| "this node's daemon states no Build Server".to_owned())?;
     let socket = ensure_build_server(settings)
@@ -1224,9 +1233,9 @@ pub(crate) fn prepare_node(
     // for this node's reply.
     let prepared =
         prepare_at(&server, &filled, &PrepareSteps::new()).map_err(|error| format!("{error:#}"))?;
-    let modules = serde_json::to_vec(&prepared)
-        .map_err(|error| format!("encoding the prepared module set: {error}"))?;
-    Ok(process::ModulesPrepared { modules })
+    Ok(process::ModulesPrepared {
+        modules: Some((&prepared).into()),
+    })
 }
 
 /// `filled` as a fixed module set: every package it names at the revision `server`, the leader

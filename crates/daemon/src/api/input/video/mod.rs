@@ -39,9 +39,9 @@ pub mod probe;
 use std::sync::Arc;
 
 use processing::{InputError, Length, Reference, ReferenceKind, VideoProcessor, VideoSpec};
-use proto::MediaSource;
 use proto::request::{DiffusionRequest, DiffusionSamplingParams, RequestId, Trajectory};
-use proto::video::{Canvas, Conditions, MediaLocator};
+use proto::video::{Canvas, Conditions};
+use proto::{MediaLocator, MediaSource};
 use serde_json::{Value, json};
 
 use crate::api::input::ServeError;

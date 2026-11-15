@@ -90,10 +90,10 @@ impl PartialEq for MediaSource {
 impl Eq for MediaSource {}
 
 /// An artifact arriving in bounded network frames. Bytes go directly into
-/// shared host storage, without keeping a second complete payload in a Vec.
-/// Dropping an incomplete transfer releases its storage.
+/// anonymous shared memory ([`crate::shared_memory::anonymous`]), without keeping a second
+/// complete payload in a Vec, and the finished artifact is consumed by its descriptor. Dropping
+/// an incomplete transfer releases its storage.
 pub struct MediaReceiver {
-    _storage: SharedMemory,
     file: std::fs::File,
     size: u64,
     written: u64,
@@ -108,9 +108,8 @@ impl MediaReceiver {
                 "artifact size exceeds address space",
             )
         })?;
-        let (storage, file) = SharedMemory::create(length)?;
+        let file = crate::shared_memory::anonymous(length)?;
         Ok(Self {
-            _storage: storage,
             file,
             size,
             written: 0,

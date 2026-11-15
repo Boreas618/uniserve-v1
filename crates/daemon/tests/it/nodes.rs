@@ -218,7 +218,7 @@ fn a_node_prepares_the_module_set_at_its_build_server_and_serves_meanwhile() {
     let set = module_set();
     let preparing = engine.send(request::Kind::PrepareModules(PrepareModules {
         host: "member".into(),
-        modules: serde_json::to_vec(&set).unwrap(),
+        modules: Some((&set).into()),
     }));
     modules.asked();
     let pid = engine.spawn(sleeper("member", "group", 1, 0));
@@ -230,7 +230,7 @@ fn a_node_prepares_the_module_set_at_its_build_server_and_serves_meanwhile() {
     let Some(reply::Kind::ModulesPrepared(prepared)) = prepared.kind else {
         panic!("the preparation answered no module set: {prepared:?}");
     };
-    let prepared: proto::module::ModuleSet = serde_json::from_slice(&prepared.modules).unwrap();
+    let prepared = proto::module::ModuleSet::try_from(prepared.modules.unwrap()).unwrap();
     assert_eq!(prepared, set);
     engine.stop("group");
 }
@@ -247,7 +247,7 @@ fn a_preparation_fails_naming_its_node_when_the_node_is_lost() {
 
     let preparing = engine.send(request::Kind::PrepareModules(PrepareModules {
         host: "member".into(),
-        modules: serde_json::to_vec(&module_set()).unwrap(),
+        modules: Some((&module_set()).into()),
     }));
     modules.asked();
     drop(deployment.member.take());

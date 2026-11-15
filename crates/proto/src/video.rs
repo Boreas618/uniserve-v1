@@ -14,6 +14,8 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::MediaLocator;
+
 /// A video raster in pixels.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct Canvas {
@@ -40,16 +42,6 @@ impl ConditionRole {
     pub const fn is_keyframe(self) -> bool {
         matches!(self, Self::FirstFrame | Self::LastFrame)
     }
-}
-
-/// Where a condition's fetched media bytes are: a POSIX shared-memory object
-/// on the host that runs the server and the media reader.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub struct MediaLocator {
-    /// Object name without its leading `/`.
-    pub name: String,
-    /// Published byte count.
-    pub bytes: u64,
 }
 
 /// A decoded still image put on a raster: resized with LANCZOS to `resized`,
