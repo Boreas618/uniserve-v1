@@ -43,7 +43,9 @@ from collections.abc import Callable
 from typing import Any
 
 import cutlass.cute as cute
-from cutlass.cute.runtime import make_fake_stream
+from cutlass import Numeric
+from cutlass.cute.runtime import make_fake_stream, make_ptr
+from cutlass.cute.typing import Pointer
 from cutlass.cutlass_dsl import CuTeDSL
 
 from uniserve_build_server.request import Request, Target
@@ -78,6 +80,26 @@ def kernel(
     return lambda: cute.compile(
         compiled, *args, **options, stream=make_fake_stream()
     )
+
+
+def pointer(dtype: type[Numeric], align: int) -> Pointer:
+    """A fake device pointer to ``dtype`` elements, ``align`` bytes aligned.
+
+    The compiled function takes the pointer at launch: the compilation is told
+    its element type, its address space and the alignment the kernel's accesses
+    rely on, and the address itself is never read.
+    """
+    return make_ptr(dtype, 0, cute.AddressSpace.gmem, assumed_align=align)
+
+
+def scalar(dtype: type[Numeric]) -> Numeric:
+    """A fake scalar of ``dtype`` for a parameter the function takes at launch.
+
+    A parameter annotated with a numeric type is a runtime word of the compiled
+    function, so the value the compilation is handed only states its type; no
+    problem size is compiled in.
+    """
+    return dtype(0)
 
 
 def dialect_runtime(cuda: Cuda) -> pathlib.Path:

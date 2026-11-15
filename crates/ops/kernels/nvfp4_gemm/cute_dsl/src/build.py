@@ -12,9 +12,7 @@ tiles.
 """
 
 import cutlass
-import cutlass.cute as cute
 import nvfp4_gemm as kernels
-from cutlass.cute.runtime import make_ptr
 from uniserve_build_server import cute_dsl as driver
 
 #: The product's element types, by the operator's name.
@@ -24,14 +22,9 @@ OUTPUTS = {"bf16": cutlass.BFloat16, "f16": cutlass.Float16}
 TILE_MN = (128, 256)
 MMA_INST_SHAPE_K = 64
 
-#: Elements of a row the operands' pointers are aligned to: the packed E2M1 rows
-#: are 32-byte aligned and the product's rows 16.
+#: The alignment, in bytes, of every operand's base: the operands and both
+#: scale fields move by TMA, and the product's rows are stored in 16-byte units.
 ALIGN = 16
-
-
-def pointer(dtype):
-    """A fake device pointer of ``dtype``, as ``cute.compile`` describes one."""
-    return make_ptr(dtype, 0, cute.AddressSpace.gmem, assumed_align=ALIGN)
 
 
 def spec(fields, parameters, target):
@@ -72,12 +65,12 @@ def spec(fields, parameters, target):
             # The operator packs the activation, the weight, both scale
             # matrices, the alpha and the output, then the three extents.
             [
-                pointer(cutlass.Float4E2M1FN),
-                pointer(cutlass.Float4E2M1FN),
-                pointer(cutlass.Float8E4M3FN),
-                pointer(cutlass.Float8E4M3FN),
-                pointer(cutlass.Float32),
-                pointer(out_dtype),
+                driver.pointer(cutlass.Float4E2M1FN, ALIGN),
+                driver.pointer(cutlass.Float4E2M1FN, ALIGN),
+                driver.pointer(cutlass.Float8E4M3FN, ALIGN),
+                driver.pointer(cutlass.Float8E4M3FN, ALIGN),
+                driver.pointer(cutlass.Float32, ALIGN),
+                driver.pointer(out_dtype, ALIGN),
                 m,
                 n,
                 k,

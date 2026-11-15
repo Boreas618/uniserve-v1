@@ -8,63 +8,45 @@ the MMA tile and the cluster, which is what the operator's key carries.
 """
 
 import cutlass
-import cutlass.cute as cute
 import route_gemm as kernels
-from cutlass.cute.runtime import make_ptr
 from uniserve_build_server import cute_dsl as driver
 
 #: The element types the kernel serves, by the operator's name.
 DTYPES = {"bf16": cutlass.BFloat16}
 
-#: Elements of a row a pointer must be aligned to: 32 bytes.
+#: The alignment, in bytes, of every operand's base: the operands move by TMA
+#: and each product row by a bulk copy of whole 16-byte units.
 ALIGN = 16
-
-
-def shape_of(text):
-    """The (rows, columns) a `MxN` descriptor value names."""
-    rows, columns = text.split("x")
-    return (int(rows), int(columns))
-
-
-def pointer(dtype):
-    """A fake device pointer of ``dtype``, as ``cute.compile`` describes one."""
-    return make_ptr(dtype, 0, cute.AddressSpace.gmem, assumed_align=ALIGN)
 
 
 def spec(fields, parameters, target):
     """The compilation of one route_gemm descriptor."""
-    tiler = shape_of(fields["tile"])
-    cluster = shape_of(fields["cluster"])
+    tiler = tuple(fields["tile"])
     element = DTYPES[fields["dtype"]]
-    experts = int(fields["experts"])
-    hidden = int(fields["hidden"])
-    intermediate = int(fields["intermediate"])
-    # The sort metadata and the row counts are runtime sizes; the compile
-    # describes one representative problem big enough for every bucket.
-    # The rows are permuted in and out, so the wrapper's `m` (the activations' rows) and its output
-    # row count are the same height.
-    permuted_rows = int(parameters["permuted_rows"])
     kernel = kernels.RouteGroupedGemmKernel(
         mma_tiler_mn=tiler,
-        cluster_shape_mn=cluster,
+        cluster_shape_mn=tuple(fields["cluster"]),
     )
+    # The row counts, both widths and the expert count are the call's runtime
+    # words: the kernel's grids derive from the tile count at launch, so the
+    # compilation states only their types.
     return {
         "name": "route_gemm",
         "compile": driver.kernel(
             kernel.wrapper,
             [
-                pointer(element),
-                pointer(element),
-                pointer(element),
-                pointer(cutlass.Int32),
-                pointer(cutlass.Int32),
-                pointer(cutlass.Int32),
-                pointer(cutlass.Int32),
-                permuted_rows,
-                hidden,
-                intermediate,
-                experts,
-                permuted_rows,
+                driver.pointer(element, ALIGN),
+                driver.pointer(element, ALIGN),
+                driver.pointer(element, ALIGN),
+                driver.pointer(cutlass.Int32, ALIGN),
+                driver.pointer(cutlass.Int32, ALIGN),
+                driver.pointer(cutlass.Int32, ALIGN),
+                driver.pointer(cutlass.Int32, ALIGN),
+                driver.scalar(cutlass.Int64),
+                driver.scalar(cutlass.Int64),
+                driver.scalar(cutlass.Int64),
+                driver.scalar(cutlass.Int64),
+                driver.scalar(cutlass.Int64),
             ],
             {
                 "tile_size": tiler[0],

@@ -8,69 +8,49 @@ the MMA tile and the cluster, which is what the operator's key carries.
 """
 
 import cutlass
-import cutlass.cute as cute
 import gather_gemm as kernels
-from cutlass.cute.runtime import make_ptr
 from uniserve_build_server import cute_dsl as driver
 
 #: The element types the kernel serves, by the operator's name.
 DTYPES = {"bf16": cutlass.BFloat16}
 
-#: Elements of a row a pointer must be aligned to: 32 bytes.
+#: The alignment, in bytes, of every operand's base: the activation rows are
+#: gathered with 16-byte copies and the weights and the product move by TMA.
 ALIGN = 16
-
-
-def shape_of(text):
-    """The (rows, columns) a `MxN` descriptor value names."""
-    rows, columns = text.split("x")
-    return (int(rows), int(columns))
-
-
-def pointer(dtype):
-    """A fake device pointer of ``dtype``, as ``cute.compile`` describes one."""
-    return make_ptr(dtype, 0, cute.AddressSpace.gmem, assumed_align=ALIGN)
 
 
 def spec(fields, parameters, target):
     """The compilation of one gather_gemm descriptor."""
-    tiler = shape_of(fields["tile"])
-    cluster = shape_of(fields["cluster"])
+    tiler = tuple(fields["tile"])
+    element = DTYPES[fields["dtype"]]
     # The kernel class names its gated activations as the operator does, and
     # the manifest's `activation` dimension admits only the ones it implements.
-    activation = fields["activation"]
-    element = DTYPES[fields["dtype"]]
-    experts = int(fields["experts"])
-    top = int(fields["top"])
-    hidden = int(fields["hidden"])
-    intermediate = int(fields["intermediate"])
-    # The sort metadata and the output rows are runtime sizes; the compile
-    # describes one representative problem big enough for every bucket, since
-    # the kernel's grids derive from the tile count at launch.
-    tokens = int(parameters["tokens"])
-    permuted_rows = int(parameters["permuted_rows"])
     kernel = kernels.GatherGroupedGemmKernel(
         mma_tiler_mn=tiler,
-        cluster_shape_mn=cluster,
-        topk=top,
-        activation=activation,
+        cluster_shape_mn=tuple(fields["cluster"]),
+        topk=fields["top"],
+        activation=fields["activation"],
     )
+    # The token count, the permuted rows, both widths and the expert count are
+    # the call's runtime words: the kernel's grids derive from the tile count
+    # at launch, so the compilation states only their types.
     return {
         "name": "gather_gemm",
         "compile": driver.kernel(
             kernel.wrapper,
             [
-                pointer(element),
-                pointer(element),
-                pointer(element),
-                pointer(cutlass.Int32),
-                pointer(cutlass.Int32),
-                pointer(cutlass.Int32),
-                pointer(cutlass.Int32),
-                tokens,
-                permuted_rows,
-                2 * intermediate,
-                hidden,
-                experts,
+                driver.pointer(element, ALIGN),
+                driver.pointer(element, ALIGN),
+                driver.pointer(element, ALIGN),
+                driver.pointer(cutlass.Int32, ALIGN),
+                driver.pointer(cutlass.Int32, ALIGN),
+                driver.pointer(cutlass.Int32, ALIGN),
+                driver.pointer(cutlass.Int32, ALIGN),
+                driver.scalar(cutlass.Int64),
+                driver.scalar(cutlass.Int64),
+                driver.scalar(cutlass.Int64),
+                driver.scalar(cutlass.Int64),
+                driver.scalar(cutlass.Int64),
             ],
             {
                 "tile_size": tiler[0],

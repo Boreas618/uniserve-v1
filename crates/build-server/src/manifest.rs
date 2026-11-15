@@ -482,6 +482,7 @@ impl Descriptors {
 ///
 /// ```toml
 /// dtype = ["bf16", "f16"]            # an enumeration
+/// tile = ["128x128", "256x128"]      # an enumeration of the shapes a kernel is written for
 /// columns = { multiple = 16 }        # a positive multiple of 16
 /// block = { power_of_two = true }    # a power of two
 /// first = { min = 0 }                # a non-negative integer
@@ -515,8 +516,11 @@ impl Dimension {
     ///
     /// - An enumeration of `true` and `false` is a flag, and its value a
     ///   boolean; an enumeration whose values are all integers holds the
-    ///   integers a kernel is specialized on, and its value is a number; any
-    ///   other enumeration's value is its text.
+    ///   integers a kernel is specialized on, and its value is a number; an
+    ///   enumeration whose values are all extent tuples ([`extent_tuple`])
+    ///   holds the shapes a kernel is written for, such as a GEMM's tiles, and
+    ///   its value is a list of numbers; any other enumeration's value is its
+    ///   text.
     /// - A constraint's value is a number, a list of numbers when the
     ///   constraint has a `separator`, and the float whose bit pattern it is
     ///   when the constraint has `bits` (a value the descriptor's float takes
@@ -538,6 +542,9 @@ impl Dimension {
             Self::Values(values) if values.iter().all(|value| value.parse::<u64>().is_ok()) => {
                 text.parse::<u64>().ok().map(Value::from)
             }
+            Self::Values(values) if values.iter().all(|value| extent_tuple(value).is_some()) => {
+                extent_tuple(text).map(Value::from)
+            }
             Self::Values(_) => Some(Value::String(text.to_owned())),
             Self::Constraint(constraint) => constraint.typed(text),
         }
@@ -551,6 +558,20 @@ impl Dimension {
             Self::Constraint(constraint) => constraint.example(),
         }
     }
+}
+
+/// What joins the extents of a tuple an enumeration holds, as `ops` prints a
+/// shape into a key (`tile_128x256`).
+const EXTENT_SEPARATOR: char = 'x';
+
+/// The extents `text` names when it is an extent tuple: two or more integers
+/// joined by [`EXTENT_SEPARATOR`], such as `128x256`.
+fn extent_tuple(text: &str) -> Option<Vec<u64>> {
+    let extents = text
+        .split(EXTENT_SEPARATOR)
+        .map(|part| part.parse::<u64>().ok())
+        .collect::<Option<Vec<u64>>>()?;
+    (extents.len() >= 2).then_some(extents)
 }
 
 /// The constraint a width-generic dimension imposes on its value.

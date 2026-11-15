@@ -259,8 +259,8 @@ def selection(blocks, fields, selected, target: Target, renderings):
     the cluster.
     """
     runs = families(target)
-    rows, columns = (int(one) for one in fields["tile"].split("x"))
-    cluster_m, cluster_n = (int(one) for one in fields["cluster"].split("x"))
+    rows, columns = fields["tile"]
+    cluster_m, cluster_n = fields["cluster"]
     expected = {}
     for name, value in selected.items():
         render = renderings.get(name)
@@ -373,8 +373,8 @@ def headers(artifact: pathlib.Path, data: pathlib.Path) -> list[pathlib.Path]:
 
 def geometry(fields: dict[str, Any]) -> list[str]:
     """The descriptor's own values, as the entry's compile-time definitions."""
-    rows, columns = (int(one) for one in fields["tile"].split("x"))
-    cluster_m, cluster_n = (int(one) for one in fields["cluster"].split("x"))
+    rows, columns = fields["tile"]
+    cluster_m, cluster_n = fields["cluster"]
     return [
         f"UNISERVE_HIDDEN={fields['hidden']}",
         f"UNISERVE_INTERMEDIATE={fields['intermediate']}",

@@ -185,23 +185,34 @@ fn a_key_is_read_into_the_fields_a_compilation_is_handed() {
     );
 }
 
-/// An enumeration of `true` and `false` is a flag and an enumeration of integers holds the
-/// integers a kernel is specialized on, so a compilation is handed a boolean and a number;
-/// any other enumeration's value is its name.
+/// An enumeration of `true` and `false` is a flag, an enumeration of integers holds the
+/// integers a kernel is specialized on and an enumeration of extent tuples the shapes it is
+/// written for, so a compilation is handed a boolean, a number and a list of numbers; any other
+/// enumeration's value is its name.
 #[test]
-fn a_flag_and_an_enumerated_integer_are_typed() {
+fn a_flag_an_enumerated_integer_and_an_enumerated_shape_are_typed() {
     let manifest = load(
-        &generic(r#"{ pdl = ["true", "false"], head_dim = ["64", "128"], window = ["false"], mode = ["0", "fused"] }"#),
+        &generic(
+            r#"{ pdl = ["true", "false"], head_dim = ["64", "128"], window = ["false"], mode = ["0", "fused"], tile = ["128x128", "256x128"], layout = ["128x4", "swizzled_128x4"] }"#,
+        ),
         &GENERIC_FILES,
     )
     .unwrap();
     assert_eq!(
-        manifest.typed_fields("pdl_true_head_dim_128_window_false_mode_0"),
+        manifest
+            .typed_fields("pdl_true_head_dim_128_window_false_mode_0_tile_256x128_layout_128x4"),
         Some(
-            serde_json::json!({ "pdl": true, "head_dim": 128, "window": false, "mode": "0" })
-                .as_object()
-                .unwrap()
-                .clone()
+            serde_json::json!({
+                "pdl": true,
+                "head_dim": 128,
+                "window": false,
+                "mode": "0",
+                "tile": [256, 128],
+                "layout": "128x4",
+            })
+            .as_object()
+            .unwrap()
+            .clone()
         )
     );
 }
