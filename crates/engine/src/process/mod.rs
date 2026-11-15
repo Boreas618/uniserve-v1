@@ -1292,9 +1292,6 @@ impl MainProcess {
             Kind::StartExperts(start) => {
                 self.on_ranks(front, start.id, Ok(RankOperation::StartExperts));
             }
-            Kind::CheckExperts(check) => {
-                self.on_ranks(front, check.id, Ok(RankOperation::CheckExperts));
-            }
             Kind::AbortExperts(abort) => {
                 self.on_ranks(front, abort.id, Ok(RankOperation::AbortExperts));
             }
@@ -1650,7 +1647,6 @@ fn rank_reports(reports: RankReports) -> Option<wire::operated::Reports> {
                     .collect(),
             })
         }
-        RankReports::ExpertCopies(ready) => Reports::ExpertCopies(wire::ExpertCopies { ready }),
         RankReports::Adapters(ranks) => Reports::AdapterReports(wire::AdapterReports {
             ranks: ranks
                 .into_iter()

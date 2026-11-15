@@ -1,7 +1,6 @@
 //! Same-epoch expert redistribution through retained weight copy manifests.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::time::Duration;
 
 use proto::request::wire;
 use serde::{Deserialize, Serialize};
@@ -188,13 +187,10 @@ async fn prepare(
     for allocation in &allocations {
         *devices.entry(allocation.gpu).or_default() += allocation.bytes;
     }
-    client.reserve_storage(0, &devices).await?;
+    client
+        .reserve_storage(crate::engine::client::Room::Devices(devices))
+        .await?;
+    // The engine answers once every rank's copies completed.
     client.start_experts().await?;
-    loop {
-        let ready = client.check_experts().await?;
-        if ready.iter().all(|ready| *ready) {
-            return Ok(allocations);
-        }
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    }
+    Ok(allocations)
 }

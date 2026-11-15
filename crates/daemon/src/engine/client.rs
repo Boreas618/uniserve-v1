@@ -97,6 +97,16 @@ pub enum EngineState {
     Failed(String),
 }
 
+/// The device storage a resize of the engine's KV cache makes room for
+/// ([`EngineClient::reserve_storage`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Room {
+    /// The same bytes on every device the engine's ranks use.
+    Each(u64),
+    /// The bytes of each named GPU.
+    Devices(std::collections::BTreeMap<storage::manifest::Gpu, u64>),
+}
+
 /// Why a request could not be submitted to an engine.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum SubmitError {
@@ -608,30 +618,17 @@ impl EngineClient {
         }
     }
 
-    /// Starts the prepared expert copies beside the batches.
+    /// Runs the prepared expert copies beside the batches, and answers once every rank's
+    /// completed.
     ///
     /// # Errors
     ///
-    /// Fails when no redistribution is prepared, or when the engine ends first.
+    /// Fails when no redistribution is prepared, with the reason a rank's copies failed, or
+    /// when the engine ends first.
     pub async fn start_experts(&self) -> Result<(), String> {
         self.ask(|id| wire::engine_command::Kind::StartExperts(wire::StartExperts { id }))
             .await
             .map(drop)
-    }
-
-    /// Whether each rank's expert copies completed.
-    ///
-    /// # Errors
-    ///
-    /// Fails with the reason a rank's copies failed, or when the engine ends first.
-    pub async fn check_experts(&self) -> Result<Vec<bool>, String> {
-        match self
-            .ask(|id| wire::engine_command::Kind::CheckExperts(wire::CheckExperts { id }))
-            .await?
-        {
-            Some(wire::operated::Reports::ExpertCopies(copies)) => Ok(copies.ready),
-            other => Err(unexpected("check_experts", other)),
-        }
     }
 
     /// Abandons the prepared or copying expert redistribution; the serving order stays.
@@ -828,10 +825,9 @@ impl EngineClient {
         .map(drop)
     }
 
-    /// Gives back the tail of the engine's KV cache until each device's
-    /// quota has room for `bytes`, overridden by `devices` on named
-    /// GPUs, beside everything it reserves; the requests that hold the tail
-    /// run on, and the response comes once they let it go.
+    /// Gives back the tail of the engine's KV cache until its devices'
+    /// quotas have `room`, beside everything they reserve; the requests that
+    /// hold the tail run on, and the response comes once they let it go.
     ///
     /// # Errors
     ///
@@ -839,23 +835,26 @@ impl EngineClient {
     /// give back leave a device too little room (naming every device's
     /// bytes), while another change of the cache is in progress, or when
     /// the engine ends first.
-    pub async fn reserve_storage(
-        &self,
-        bytes: u64,
-        devices: &std::collections::BTreeMap<storage::manifest::Gpu, u64>,
-    ) -> Result<(), String> {
+    pub async fn reserve_storage(&self, room: Room) -> Result<(), String> {
+        let (room_bytes, device_bytes) = match room {
+            Room::Each(bytes) => (bytes, Vec::new()),
+            Room::Devices(devices) => (
+                0,
+                devices
+                    .into_iter()
+                    .map(|(gpu, bytes)| wire::DeviceBytes {
+                        gpu: gpu.to_vec(),
+                        bytes,
+                    })
+                    .collect(),
+            ),
+        };
         self.ask(|id| {
             wire::engine_command::Kind::ResizeCache(wire::ResizeCache {
                 id,
                 change: wire::CacheChange::MakeRoom as i32,
-                room_bytes: bytes,
-                device_bytes: devices
-                    .iter()
-                    .map(|(gpu, bytes)| wire::DeviceBytes {
-                        gpu: gpu.to_vec(),
-                        bytes: *bytes,
-                    })
-                    .collect(),
+                room_bytes,
+                device_bytes,
             })
         })
         .await

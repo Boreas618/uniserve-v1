@@ -329,7 +329,7 @@ message Takeover {
 // answered with an `Operated` of that id, carrying the reports its kind
 // states, or with `Configured` for a `Configure`.
 message EngineCommand {
-  reserved 5, 13, 14, 16, 17;
+  reserved 5, 13, 14, 16, 17, 21;
   oneof kind {
     // Finish every request as aborted, close the workers and exit.
     Shutdown shutdown = 1;
@@ -353,11 +353,10 @@ message EngineCommand {
     // answered with `WeightReports`.
     CommitExperts commit_experts = 18;
     // The stages of an expert redistribution, beside the batches: prepare
-    // the copies of an order (answered with `ExpertAllocations`), start
-    // them, ask whether they completed (`ExpertCopies`), or abandon them.
+    // the copies of an order (answered with `ExpertAllocations`), run them
+    // (answered once every rank's copies completed), or abandon them.
     PrepareExperts prepare_experts = 19;
     StartExperts start_experts = 20;
-    CheckExperts check_experts = 21;
     AbortExperts abort_experts = 22;
     // Load a LoRA adapter's tensors into a slot of every rank, or release
     // a slot's; answered with `AdapterReports`.
@@ -388,13 +387,9 @@ message PrepareExperts {
   map<string, ExpertOrder> order = 2;
 }
 
-// Start the prepared copies beside the batches.
+// Run the prepared copies beside the batches; answered, with no reports,
+// once every rank's copies completed, or with the reason a rank's failed.
 message StartExperts {
-  uint64 id = 1;
-}
-
-// Whether every rank's copies completed.
-message CheckExperts {
   uint64 id = 1;
 }
 
@@ -504,13 +499,13 @@ enum ProfileMetricRanges {
 // The answer to an engine command that names an `id`: what every rank
 // reported, of the kind the command states, or why the command failed.
 message Operated {
+  reserved 4;
   uint64 id = 1;
   // Empty when every rank ran the command.
   string error = 2;
   // Unset for a command that reports nothing, and with an error.
   oneof reports {
     ExpertAllocations expert_allocations = 3;
-    ExpertCopies expert_copies = 4;
     AdapterReports adapter_reports = 5;
     ProfileStarts profile_starts = 6;
     ProfileStops profile_stops = 7;
@@ -531,11 +526,6 @@ message ExpertAllocation {
   map<string, ExpertOrder> order = 1;
   bytes gpu = 2;
   uint64 bytes = 3;
-}
-
-// Whether each rank's expert copies completed, in rank order.
-message ExpertCopies {
-  repeated bool ready = 1;
 }
 
 // What each rank did with an adapter's slot, in rank order.

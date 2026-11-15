@@ -252,7 +252,7 @@ impl Replica {
                 if room > 0 || needed == 0 {
                     return Err(UpdateError::Refused(refusal));
                 }
-                client.reserve_storage(needed, &Default::default()).await.map_err(|error| {
+                client.reserve_storage(crate::engine::client::Room::Each(needed)).await.map_err(|error| {
                 UpdateError::Refused(format!(
                     "the session holds {needed} bytes of device storage on a selected worker's \
                      GPU (a range_metrics pass, as the worker measured it), for which the KV \

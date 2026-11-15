@@ -461,6 +461,7 @@ mod tests {
                 "launch_attention".to_owned(),
             )]),
             interface_version: 1,
+            executable: None,
         };
         let Resolved::Native { library, entry } = Resolved::of(native).unwrap() else {
             panic!("a native module reads as a native library");
@@ -485,6 +486,7 @@ mod tests {
             metadata: Some("launch.json".to_owned()),
             entries: BTreeMap::new(),
             interface_version: 1,
+            executable: None,
         };
         let Resolved::Cubin { image, entry, .. } = Resolved::of(cubin).unwrap() else {
             panic!("a cubin module reads as a cubin");
@@ -506,6 +508,7 @@ mod tests {
                 "launch".to_owned(),
             )]),
             interface_version: 1,
+            executable: None,
         };
 
         let Err(refused) = Resolved::of(module) else {

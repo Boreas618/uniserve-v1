@@ -87,7 +87,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, Weak};
+use std::sync::{Arc, Condvar, Mutex, Weak};
 
 use crate::executor::peers::messages::{
     AdapterReport, DataOperation, ExpertAllocation, RankOperation, RankReports,
@@ -310,8 +310,10 @@ struct Reservation {
 enum Experts {
     /// The weights are paired, and the copies wait to start.
     Paired(Replacement),
-    /// The copies run beside the serving batches.
-    Copying(std::thread::JoinHandle<Result<Replacement>>),
+    /// The copies run beside the serving batches, on the thread of the operation that started
+    /// them ([`WeightBinding::start_experts`]), which holds their storage; `aborted` once an
+    /// abort came while they ran, which the copier answers by discarding what it copied.
+    Copying { aborted: bool },
     /// The copies completed, and the new weights wait for the common boundary.
     Ready(Replacement),
 }
@@ -338,6 +340,9 @@ pub(crate) struct WeightBinding {
     /// A weight update's load, waiting for its boundary.
     staged: Mutex<Option<Replacement>>,
     experts: Mutex<Option<Experts>>,
+    /// Signalled when copies that ran leave [`Experts::Copying`], which an abort waits on: the
+    /// copies own their storage until they end.
+    experts_copied: Condvar,
     /// Each rank's adapters, by the slot the daemon assigned.
     adapters: Mutex<BTreeMap<u32, Vec<Adapter>>>,
     /// Whether the graph pools are suspended, which only a restore reverses.
@@ -599,6 +604,7 @@ impl WeightBinding {
             target: Mutex::new(target),
             staged: Mutex::new(None),
             experts: Mutex::new(None),
+            experts_copied: Condvar::new(),
             adapters: Mutex::new(BTreeMap::new()),
             suspended: AtomicBool::new(false),
             derived_stale: AtomicBool::new(false),
@@ -2084,83 +2090,76 @@ impl WeightBinding {
         Ok(reports)
     }
 
-    /// Starts the copies of the prepared redistribution, beside the serving batches.
+    /// Runs the copies of the prepared redistribution beside the serving batches, on the calling
+    /// operation's thread, and returns once they completed: the new weights then wait for the
+    /// common boundary of their commit.
     ///
     /// # Errors
     ///
-    /// When no redistribution is prepared, or it started already.
-    pub(crate) fn start_experts(self: &Arc<Self>) -> Result<()> {
-        let mut experts = lock(&self.experts);
-        let replacement = match experts.take() {
-            Some(Experts::Paired(replacement)) => replacement,
-            other => {
-                *experts = other;
-                return Err(Error::State("no expert redistribution waits to start"));
+    /// When no redistribution is prepared or it started already; when a rank's copies failed,
+    /// or an abort came while they ran: the redistribution is over, its storage released, and the
+    /// routing did not change.
+    pub(crate) fn start_experts(&self) -> Result<()> {
+        let replacement = {
+            let mut experts = lock(&self.experts);
+            match experts.take() {
+                Some(Experts::Paired(replacement)) => {
+                    *experts = Some(Experts::Copying { aborted: false });
+                    replacement
+                }
+                other => {
+                    *experts = other;
+                    return Err(Error::State("no expert redistribution waits to start"));
+                }
             }
         };
 
-        let plane = Arc::clone(self);
-        let copying = std::thread::Builder::new()
-            .name("expert-copies".into())
-            .spawn(move || plane.load_here(replacement))
-            .map_err(|error| rejected("starting the expert copies", error))?;
+        let copied = self.load_here(replacement);
 
-        *experts = Some(Experts::Copying(copying));
-        Ok(())
-    }
-
-    /// Whether the copies completed, as each rank responds.
-    ///
-    /// # Errors
-    ///
-    /// When a rank's copies failed; the redistribution is over, and the routing did not change.
-    pub(crate) fn experts_ready(&self) -> Result<Vec<bool>> {
         let mut experts = lock(&self.experts);
-        let ready = match experts.take() {
-            Some(Experts::Copying(task)) if task.is_finished() => {
-                let replacement = task
-                    .join()
-                    .map_err(|_| Error::Invariant("the expert copies panicked".into()))??;
+        let aborted = matches!(*experts, Some(Experts::Copying { aborted: true }));
+        let started = match copied {
+            Ok(replacement) if aborted => {
+                self.discard_here(replacement);
+                *experts = None;
+                Err(Error::State("the expert redistribution was aborted"))
+            }
+            Ok(replacement) => {
                 *experts = Some(Experts::Ready(replacement));
-                true
+                Ok(())
             }
-            Some(Experts::Copying(task)) => {
-                *experts = Some(Experts::Copying(task));
-                false
-            }
-            Some(Experts::Ready(replacement)) => {
-                *experts = Some(Experts::Ready(replacement));
-                true
-            }
-            other => {
-                *experts = other;
-                return Err(Error::State("no expert copies run"));
+            Err(error) => {
+                *experts = None;
+                Err(error)
             }
         };
-
-        Ok(self.ranks.iter().map(|_| ready).collect())
+        drop(experts);
+        self.experts_copied.notify_all();
+        started
     }
 
     /// Ends a redistribution that will not commit: the incoming storage goes, and the routing and
-    /// the weights that serve are untouched.
+    /// the weights that serve are untouched. Copies that run are told to end, and waited for: they
+    /// own their storage until they end.
     ///
     /// # Errors
     ///
-    /// When the copies panicked.
+    /// When the copies' thread panicked while it held the redistribution's state.
     pub(crate) fn abort_experts(&self) -> Result<()> {
-        let state = lock(&self.experts).take();
-        match state {
+        let mut experts = lock(&self.experts);
+        match experts.take() {
             Some(Experts::Paired(replacement) | Experts::Ready(replacement)) => {
+                drop(experts);
                 self.discard_here(replacement);
             }
-            Some(Experts::Copying(task)) => {
-                // The copies own their allocations until they end, so they are waited for.
-                if let Ok(replacement) = task
-                    .join()
-                    .map_err(|_| Error::Invariant("the expert copies panicked".into()))?
-                {
-                    self.discard_here(replacement);
-                }
+            Some(Experts::Copying { .. }) => {
+                *experts = Some(Experts::Copying { aborted: true });
+                let _ended = self
+                    .experts_copied
+                    .wait_while(experts, |experts| {
+                        matches!(experts, Some(Experts::Copying { .. }))
+                    })
+                    .map_err(|_| Error::Invariant("the expert copies panicked".into()))?;
             }
             None => {}
         }

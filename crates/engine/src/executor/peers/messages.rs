@@ -297,10 +297,9 @@ pub enum RankOperation {
     /// Prepares the copies that put each named routed-expert layer's experts in its order.
     /// Answers [`RankReports::ExpertAllocations`].
     PrepareExperts { orders: BTreeMap<String, Vec<u32>> },
-    /// Starts the prepared copies beside the batches. Answers [`RankReports::None`].
+    /// Runs the prepared copies beside the batches. Answers [`RankReports::None`] once they
+    /// completed.
     StartExperts,
-    /// Answers whether each rank's copies completed ([`RankReports::ExpertCopies`]).
-    CheckExperts,
     /// Abandons the prepared or copying redistribution. Answers [`RankReports::None`].
     AbortExperts,
     /// Loads the LoRA adapter at `path` into `slot`. Answers [`RankReports::Adapters`].
@@ -331,8 +330,6 @@ pub(crate) enum RankReports {
     /// The operation reports nothing.
     None,
     ExpertAllocations(Vec<ExpertAllocation>),
-    /// Whether each rank's expert copies completed.
-    ExpertCopies(Vec<bool>),
     Adapters(Vec<AdapterReport>),
     ProfileStarts(Vec<RankStart>),
     ProfileStops(Vec<RankStop>),
@@ -351,7 +348,6 @@ impl RankReports {
         match (self, other) {
             (Self::None, Self::None) => {}
             (Self::ExpertAllocations(ours), Self::ExpertAllocations(theirs)) => ours.extend(theirs),
-            (Self::ExpertCopies(ours), Self::ExpertCopies(theirs)) => ours.extend(theirs),
             (Self::Adapters(ours), Self::Adapters(theirs)) => ours.extend(theirs),
             (Self::ProfileStarts(ours), Self::ProfileStarts(theirs)) => ours.extend(theirs),
             (Self::ProfileStops(ours), Self::ProfileStops(theirs)) => ours.extend(theirs),

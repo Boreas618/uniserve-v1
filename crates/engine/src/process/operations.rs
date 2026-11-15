@@ -473,8 +473,16 @@ pub(crate) fn on_ranks(
     binding: &Arc<WeightBinding>,
     operation: &RankOperation,
 ) -> Result<RankReports> {
-    let mut reports = here(binding, operation)?;
-    for peer in binding.on_peers(operation)? {
+    // Every process runs the operation at once, the peers' share on a thread of its own while
+    // this process's ranks run theirs: an operation that lasts, as an expert redistribution's
+    // copies do, takes as long as its slowest process.
+    let (here, peers) = std::thread::scope(|scope| {
+        let peers = scope.spawn(|| binding.on_peers(operation));
+        (here(binding, operation), peers.join())
+    });
+    let mut reports = here?;
+    let peers = peers.map_err(|_| anyhow!("relaying a rank operation to the peers panicked"))??;
+    for peer in peers {
         reports.append(peer).map_err(|error| anyhow!(error))?;
     }
     Ok(reports)
@@ -494,7 +502,6 @@ fn here(binding: &Arc<WeightBinding>, operation: &RankOperation) -> Result<RankR
             binding.start_experts()?;
             RankReports::None
         }
-        RankOperation::CheckExperts => RankReports::ExpertCopies(binding.experts_ready()?),
         RankOperation::AbortExperts => {
             binding.abort_experts()?;
             RankReports::None
