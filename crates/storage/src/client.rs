@@ -19,16 +19,16 @@ use std::net::ToSocketAddrs;
 use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
 use std::os::unix::net::UnixStream;
 use std::path::Path;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 
 use crate::error::{Error, Result};
 use crate::protocol::{
-    Claim, ClientMessage, Event, Hello, HostCopy, Item, Key, Link, Listing, Location, Mode, OLDEST,
-    Priority, Quota, Region, RegionPart, Registration, Request, Response, Role, Scope, Segment,
-    ServerMessage, Span, StorageRecord, TaskStatus, TensorRecord, Tensors, Throttle, UnitRun,
-    Usage, VERSION, Welcome,
+    ANSWER, Claim, ClientMessage, Event, Hello, HostCopy, Item, Key, Link, Listing, Location, Mode,
+    OLDEST, Priority, Quota, Region, RegionPart, Registration, Request, Response, Role, Scope,
+    Segment, ServerMessage, Span, StorageRecord, TaskStatus, TensorRecord, Tensors, Throttle,
+    UnitRun, Usage, VERSION, Welcome,
 };
 use crate::runtime::{Open, Opened};
 use service::Connection;
@@ -40,9 +40,11 @@ pub struct Client {
     /// stated it: this build's [`VERSION`], or [`OLDEST`] with a server of
     /// that version.
     version: u32,
-    /// How long a blocking call waits for its response: unbounded on this host, the timeout
-    /// given for another host's server ([`Client::connect_remote`]).
-    timeout: Duration,
+    /// Whether the server is another host's, whose answers the protocol bounds
+    /// ([`Request::remote_deadline`]); a server of this host closes the connection when it ends.
+    remote: bool,
+    /// When each request in flight to another host's server must be answered.
+    deadlines: HashMap<u64, Instant>,
     next: u64,
     /// Responses received and not yet taken, by request, each with the
     /// descriptors that came with it.
@@ -54,35 +56,29 @@ pub struct Client {
 impl Client {
     /// Connect to the server at `socket` as `role`.
     pub fn connect(socket: &Path, role: Role) -> Result<Self> {
-        Self::open(
-            Connection::new(UnixStream::connect(socket)?)?,
-            role,
-            Duration::MAX,
-        )
+        Self::open(Connection::new(UnixStream::connect(socket)?)?, role, false)
     }
 
     /// Connect to the server of another host at `address` (`host:port`,
     /// its `Endpoint`) as [`Role::Peer`]: the Transfer Server of this host
-    /// that READs storage there. Connecting, and every blocking
-    /// call after it ([`Client::call`]), fails once `timeout` passes without
-    /// a response, so a host that stopped responding fails the caller's task
-    /// instead of holding it.
-    pub fn connect_peer(address: &str, timeout: Duration) -> Result<Self> {
-        Self::connect_remote(address, Role::Peer, timeout)
+    /// that READs storage there. Connecting, and every call after it
+    /// ([`Client::call`]), fails once the protocol's bound of its request
+    /// passes without an answer ([`Request::remote_deadline`]), so a host that
+    /// stopped responding fails the caller's task instead of holding it.
+    pub fn connect_peer(address: &str) -> Result<Self> {
+        Self::connect_remote(address, Role::Peer)
     }
 
     /// Connect to the server of another host at `address` (`host:port`,
-    /// its `Endpoint`) as `role`, as [`Self::connect_peer`] does: connecting
-    /// and every blocking call fail once `timeout` passes without a
-    /// response. A Storage Server reaches another host's this way for its
-    /// buffer pools' tasks: as a [`Role::Peer`] to hold host copies it
-    /// reads, as a [`Role::Head`] of the deployment to submit a transfer
-    /// into a rank of that host.
-    pub fn connect_remote(address: &str, role: Role, timeout: Duration) -> Result<Self> {
+    /// its `Endpoint`) as `role`, as [`Self::connect_peer`] does. A Storage
+    /// Server reaches another host's this way for its buffer pools' tasks: as
+    /// a [`Role::Peer`] to hold host copies it reads, as a [`Role::Head`] of
+    /// the deployment to submit a transfer into a rank of that host.
+    pub fn connect_remote(address: &str, role: Role) -> Result<Self> {
         let mut refused = None;
         for candidate in address.to_socket_addrs()? {
-            match std::net::TcpStream::connect_timeout(&candidate, timeout) {
-                Ok(stream) => return Self::open(Connection::new(stream)?, role, timeout),
+            match std::net::TcpStream::connect_timeout(&candidate, ANSWER) {
+                Ok(stream) => return Self::open(Connection::new(stream)?, role, true),
                 Err(error) => refused = Some(error),
             }
         }
@@ -94,19 +90,21 @@ impl Client {
         })))
     }
 
-    fn open(mut connection: Connection, role: Role, timeout: Duration) -> Result<Self> {
+    fn open(mut connection: Connection, role: Role, remote: bool) -> Result<Self> {
         connection.send(&ClientMessage::Hello(Hello {
             version: VERSION,
             role,
         }))?;
-        match receive(&mut connection, timeout)?.0 {
+        let deadline = remote.then(|| Instant::now() + ANSWER);
+        match receive(&mut connection, deadline)?.0 {
             ServerMessage::Welcome(Welcome::Accepted { version })
                 if (OLDEST..=VERSION).contains(&version) =>
             {
                 Ok(Self {
                     connection,
                     version,
-                    timeout,
+                    remote,
+                    deadlines: HashMap::new(),
                     next: 1,
                     responses: HashMap::new(),
                     events: VecDeque::new(),
@@ -151,7 +149,8 @@ impl Client {
         Ok(Self {
             connection: Connection::new(UnixStream::from(descriptor))?,
             version,
-            timeout: Duration::MAX,
+            remote: false,
+            deadlines: HashMap::new(),
             next,
             responses: HashMap::new(),
             events: VecDeque::new(),
@@ -169,6 +168,10 @@ impl Client {
     pub fn submit(&mut self, request: &Request, descriptors: &[BorrowedFd<'_>]) -> Result<u64> {
         let id = self.next;
         self.next += 1;
+        if self.remote {
+            self.deadlines
+                .insert(id, Instant::now() + request.remote_deadline());
+        }
         self.connection.send_with(
             &ClientMessage::Request {
                 id,
@@ -187,7 +190,11 @@ impl Client {
     /// The response to request `id`, with the descriptors that came with
     /// it, when it has arrived.
     pub fn take(&mut self, id: u64) -> Option<(Response, Vec<OwnedFd>)> {
-        self.responses.remove(&id)
+        let response = self.responses.remove(&id);
+        if response.is_some() {
+            self.deadlines.remove(&id);
+        }
+        response
     }
 
     /// The next event received, with the descriptors that came with it.
@@ -195,35 +202,100 @@ impl Client {
         self.events.pop_front()
     }
 
-    /// Consume one task's end without waiting, discarding its progress
-    /// events: the bytes it copied and how it ended. Other tasks' events
-    /// stay queued for their owners. Returns `None` while the task runs or
-    /// after its end was consumed.
-    pub fn poll_task(&mut self, task: u64) -> Result<Option<(u64, TaskStatus)>> {
-        self.pump()?;
-        let mut ended = None;
-        self.events.retain(|(event, _)| match event {
-            Event::TaskProgress { task: found, .. } if *found == task => false,
-            Event::TaskEnded {
-                task: found,
-                bytes,
-                status,
-            } if *found == task => {
-                ended = Some((*bytes, status.clone()));
-                false
-            }
-            _ => true,
-        });
-        Ok(ended)
+    /// Blocks until task `task` ended, `interrupt` (when given) becomes readable or reaches its
+    /// end, or `deadline` (when given) passes; returns the bytes the task copied and how it
+    /// ended. Its
+    /// progress events are discarded; other tasks' events stay queued for their owners.
+    ///
+    /// # Errors
+    ///
+    /// Fails when the connection fails.
+    pub fn wait_task(
+        &mut self,
+        task: u64,
+        interrupt: Option<BorrowedFd<'_>>,
+        deadline: Option<Instant>,
+    ) -> Result<Waited<(u64, TaskStatus)>> {
+        self.wait_event(interrupt, deadline, |events| {
+            let mut ended = None;
+            events.retain(|(event, _)| match event {
+                Event::TaskProgress { task: found, .. } if *found == task => false,
+                Event::TaskEnded {
+                    task: found,
+                    bytes,
+                    status,
+                } if *found == task => {
+                    ended = Some((*bytes, status.clone()));
+                    false
+                }
+                _ => true,
+            });
+            ended
+        })
     }
 
-    /// Block until request `id` has its response.
+    /// Blocks until one of the pages tasks `tasks` ([`Request::Pages`]) reported its results,
+    /// `interrupt` (when given) becomes readable or reaches its end, or `deadline` (when given)
+    /// passes; returns the task and its results, one per page.
+    ///
+    /// # Errors
+    ///
+    /// Fails when the connection fails.
+    pub fn wait_pages(
+        &mut self,
+        tasks: &[u64],
+        interrupt: Option<BorrowedFd<'_>>,
+        deadline: Option<Instant>,
+    ) -> Result<Waited<(u64, Vec<bool>)>> {
+        self.wait_event(interrupt, deadline, |events| {
+            let at = events.iter().position(|(event, _)| {
+                matches!(event, Event::PagesMoved { task, .. } if tasks.contains(task))
+            })?;
+            match events.remove(at)?.0 {
+                Event::PagesMoved { task, results } => Some((task, results)),
+                _ => None,
+            }
+        })
+    }
+
+    /// Blocks until `found` takes an event from those received, `interrupt` becomes readable,
+    /// or `deadline` passes.
+    fn wait_event<T>(
+        &mut self,
+        interrupt: Option<BorrowedFd<'_>>,
+        deadline: Option<Instant>,
+        mut found: impl FnMut(&mut VecDeque<(Event, Vec<OwnedFd>)>) -> Option<T>,
+    ) -> Result<Waited<T>> {
+        loop {
+            self.route()?;
+            if let Some(event) = found(&mut self.events) {
+                return Ok(Waited::Done(event));
+            }
+            let remaining = deadline.map_or(Duration::MAX, |deadline| {
+                deadline.saturating_duration_since(Instant::now())
+            });
+            if remaining.is_zero() {
+                return Ok(Waited::TimedOut);
+            }
+            let interrupted = match interrupt {
+                Some(interrupt) => self.connection.wait_or(interrupt, remaining)?,
+                None => self.connection.wait(remaining).map(|()| false)?,
+            };
+            if interrupted {
+                return Ok(Waited::Interrupted);
+            }
+        }
+    }
+
+    /// Block until request `id` has its response: within the protocol's bound of the request
+    /// on another host's server ([`Request::remote_deadline`]), unbounded on this host's.
     pub fn wait(&mut self, id: u64) -> Result<(Response, Vec<OwnedFd>)> {
+        let deadline = self.deadlines.remove(&id);
         loop {
             if let Some(response) = self.responses.remove(&id) {
                 return Ok(response);
             }
-            let (message, descriptors) = receive(&mut self.connection, self.timeout)?;
+            let (message, descriptors) = receive(&mut self.connection, deadline)?;
             self.deliver(message, descriptors)?;
         }
     }
@@ -736,7 +808,7 @@ impl Client {
     /// See [`Request::Pages`]: have the connector of this connection's host
     /// move `pages` of part `part` of the host region `region`, to the KV
     /// storage when `upload` and from it otherwise. Returns the task, whose
-    /// results arrive as an event ([`Client::poll_pages`]).
+    /// results arrive as an event ([`Client::wait_pages`]).
     pub fn pages(
         &mut self,
         region: String,
@@ -754,23 +826,6 @@ impl Client {
             Response::Submitted { task } => Ok(task),
             other => Err(unexpected("pages", &other)),
         }
-    }
-
-    /// Consume the results of the [`Request::Pages`] task `task` without
-    /// waiting: one per page, in the order the request named them. Other
-    /// events stay queued for their owners. Returns `None` while the task
-    /// runs or after its results were consumed.
-    pub fn poll_pages(&mut self, task: u64) -> Result<Option<Vec<bool>>> {
-        self.pump()?;
-        let at = self.events.iter().position(
-            |(event, _)| matches!(event, Event::PagesMoved { task: found, .. } if *found == task),
-        );
-        Ok(at
-            .and_then(|at| self.events.remove(at))
-            .and_then(|(event, _)| match event {
-                Event::PagesMoved { results, .. } => Some(results),
-                _ => None,
-            }))
     }
 }
 
@@ -980,7 +1035,18 @@ impl ClaimClient {
     }
 }
 
-/// The next message from the server, waiting up to `timeout`.
+/// How a wait for an event ended ([`Client::wait_task`], [`Client::wait_pages`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Waited<T> {
+    /// The event arrived.
+    Done(T),
+    /// The waiter's owner interrupted the wait.
+    Interrupted,
+    /// The deadline passed first.
+    TimedOut,
+}
+
+/// The next message from the server, waiting until `deadline` (unbounded for `None`).
 ///
 /// # Errors
 ///
@@ -988,14 +1054,17 @@ impl ClaimClient {
 /// server closed it.
 fn receive(
     connection: &mut Connection,
-    timeout: Duration,
+    deadline: Option<Instant>,
 ) -> Result<(ServerMessage, Vec<OwnedFd>)> {
+    let timeout = deadline.map_or(Duration::MAX, |deadline| {
+        deadline.saturating_duration_since(Instant::now())
+    });
     connection
         .recv_with::<ServerMessage>(timeout)?
         .ok_or_else(|| {
             Error::Io(io::Error::new(
                 io::ErrorKind::TimedOut,
-                "the storage server did not respond within the connection's timeout",
+                "the storage server of another host did not answer within the protocol's bound",
             ))
         })
 }

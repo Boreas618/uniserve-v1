@@ -190,6 +190,29 @@ fn a_frame_decodes_only_as_the_message_it_carries() {
     assert_eq!(error.kind(), ErrorKind::InvalidData);
 }
 
+/// An interrupt ends a wait that nothing on the connection ends, and says so, whether its owner
+/// writes to it or closes it; a message ends the wait without it.
+#[test]
+fn an_interrupt_ends_a_wait_and_says_so() {
+    let (mut connection, mut peer) = with_raw_peer();
+    let long = Duration::from_secs(30);
+    let short = Duration::from_millis(50);
+    let (reader, writer) = UnixStream::pair().unwrap();
+
+    assert!(!connection.wait_or(reader.as_fd(), short).unwrap());
+
+    peer.write_all(&frame_of(&line(1))).unwrap();
+    assert!(!connection.wait_or(reader.as_fd(), long).unwrap());
+    assert_eq!(receive::<Line>(&mut connection).unwrap(), line(1));
+
+    (&writer).write_all(&[1]).unwrap();
+    assert!(connection.wait_or(reader.as_fd(), long).unwrap());
+    drop(writer);
+    let mut taken = [0_u8; 1];
+    (&reader).read_exact(&mut taken).unwrap();
+    assert!(connection.wait_or(reader.as_fd(), long).unwrap());
+}
+
 /// A wake ends a wait that no message would have ended, fires coalesce into the one wait that
 /// observes them, and the wake rearms afterwards.
 #[test]

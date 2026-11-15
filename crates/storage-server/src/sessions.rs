@@ -219,8 +219,8 @@ struct Running {
     ok: bool,
     /// The task was told to stop: what it has not started, it does not.
     stopped: bool,
-    /// What cancels its transfers on other hosts' Transfer Servers.
-    cancels: Vec<mpsc::Sender<()>>,
+    /// What stops its transfers on other hosts' Transfer Servers and their connectors' pages.
+    cancels: Vec<hosts::Stop>,
     /// A read from the peers: what has the helper release its holds once
     /// dropped, and per copy the peer connection it is read from with the
     /// tokens its block holds, for the leading copies being read.
@@ -1590,18 +1590,20 @@ impl Server {
             let Some(endpoint) = endpoint else {
                 continue;
             };
-            let (cancel, cancelled) = mpsc::channel();
-            let started = hosts::transfer_at(
-                self.sessions.thread.notifier(),
-                number,
-                endpoint,
-                session.clone(),
-                spans,
-                port,
-                (cancelled, self.sessions.transfer_deadline),
-            );
+            let started = hosts::Stop::new().and_then(|(cancel, cancelled)| {
+                hosts::transfer_at(
+                    self.sessions.thread.notifier(),
+                    number,
+                    endpoint,
+                    session.clone(),
+                    spans,
+                    port,
+                    (cancelled, self.sessions.transfer_deadline),
+                )
+                .map(|()| cancel)
+            });
             match started {
-                Ok(()) => {
+                Ok(cancel) => {
                     if let Some(running) = self.sessions.running.get_mut(&number) {
                         running.cancels.push(cancel);
                     }
@@ -1890,17 +1892,19 @@ impl Server {
                 .map(|((region, part), pages)| (region, part, pages))
                 .collect();
             let keys: Vec<Vec<usize>> = parts.iter().map(|(.., (_, of))| of.clone()).collect();
-            let (stop, stopped) = mpsc::channel();
-            let started = hosts::pages_at(
-                self.sessions.thread.notifier(),
-                number,
-                endpoint,
-                (session.clone(), upload),
-                parts,
-                (stopped, self.sessions.put_deadline),
-            );
+            let started = hosts::Stop::new().and_then(|(stop, stopped)| {
+                hosts::pages_at(
+                    self.sessions.thread.notifier(),
+                    number,
+                    endpoint,
+                    (session.clone(), upload),
+                    parts,
+                    (stopped, self.sessions.put_deadline),
+                )
+                .map(|()| stop)
+            });
             match started {
-                Ok(()) => {
+                Ok(stop) => {
                     if let Some(running) = self.sessions.running.get_mut(&number) {
                         running.cancels.push(stop);
                     }
@@ -2026,7 +2030,7 @@ impl Server {
         };
         running.stopped = true;
         for cancel in &running.cancels {
-            let _ = cancel.send(());
+            cancel.stop();
         }
         let number = *number;
         self.cancel_pool_transfer(number);

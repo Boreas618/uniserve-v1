@@ -1302,7 +1302,7 @@ fn host_parts_of_one_index_on_two_hosts_are_kept_apart() {
 
     // A peer reads a region's copies from the parts its first copy lies in;
     // the second, which other parts hold, is left out.
-    let mut reader = Client::connect_peer(&here.tcp, Duration::from_secs(30)).unwrap();
+    let mut reader = Client::connect_peer(&here.tcp).unwrap();
     let (copies, mut parts) = reader
         .peer_hold("model".into(), vec![key(8), key(9)])
         .unwrap();
@@ -1328,7 +1328,7 @@ fn a_peer_holds_the_host_copies_it_reads_until_it_releases_them() {
 
     // Another host's Storage Server holds what it reads; a held copy is no
     // longer evictable.
-    let mut peer = Client::connect_peer(&server.tcp, Duration::from_secs(30)).unwrap();
+    let mut peer = Client::connect_peer(&server.tcp).unwrap();
     let (copies, mut parts) = peer
         .peer_hold("model".into(), vec![key(7), key(8)])
         .unwrap();

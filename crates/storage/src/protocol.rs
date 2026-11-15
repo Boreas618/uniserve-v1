@@ -128,6 +128,8 @@
 //! isolation of the network it listens on to keep other processes from
 //! reading the host tensors and host copies it serves.
 
+use std::time::Duration;
+
 use serde::{Deserialize, Serialize};
 
 use crate::runtime::{Open, Opened};
@@ -153,6 +155,19 @@ pub const VERSION: u32 = 26
 /// The earliest protocol version this build's Storage Server serves and its
 /// clients accept: the one before [`VERSION`].
 pub const OLDEST: u32 = VERSION - 1;
+
+/// How long a server of another host may take to answer a request it answers from what it holds
+/// (a hello, a peer's hold and release, a task's submission or cancellation, a connector's pages):
+/// a host whose server does not answer within it is taken as unresponsive, so a prefetch skips
+/// the peer and a transfer there fails rather than holding its task. Connecting to the host is
+/// bounded alike. A server of this host has no such bound: its end closes the connection.
+pub const ANSWER: Duration = Duration::from_secs(2);
+
+/// How long a server of another host may take to answer an exposure ([`Request::Expose`]),
+/// which it answers once its Transfer Server registered the regions with its NIXL agent: pinning
+/// a host region's part of tens of GiB takes seconds there, and the bound lies far above it, so
+/// that only a host that stopped responding reaches it.
+pub const EXPOSURE: Duration = Duration::from_secs(120);
 
 /// A content address: the 32-byte digest of everything that determines a
 /// tensor's bytes, computed by the client.
@@ -1357,6 +1372,17 @@ pub enum ErrorKind {
     /// A reservation or a new device storage would take a GPU's quota past
     /// its quota.
     Quota,
+}
+
+impl Request {
+    /// How long a server of another host may take to answer this request: [`EXPOSURE`] for an
+    /// exposure, [`ANSWER`] for every other request a client of another host makes.
+    pub fn remote_deadline(&self) -> Duration {
+        match self {
+            Self::Expose { .. } => EXPOSURE,
+            _ => ANSWER,
+        }
+    }
 }
 
 /// The server's response to one request.

@@ -46,7 +46,7 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, OnceLock};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use ::storage::Client;
 use ::storage::protocol::{FabricExport, Link, LinkEnd, Region, Registration};
@@ -56,12 +56,6 @@ use super::contexts::Hold;
 use super::nixl;
 use super::storage::{Fabric, Mapping};
 use super::threads::{End, Piece, Runner, ThreadKey};
-
-/// How long another host's Storage Server may take to accept the connection
-/// and to respond to an exposure: far longer than registering the largest
-/// region takes there (pinning a host region's part of tens of GiB takes
-/// seconds), so that only a host that stopped responding to reaches it.
-const PEER_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// The process's NIXL agent and its connections to other hosts' Storage
 /// Servers.
@@ -413,9 +407,7 @@ impl Host {
         loop {
             let client = match &mut self.client {
                 Some(client) => client,
-                None => self
-                    .client
-                    .insert(Client::connect_peer(endpoint, PEER_TIMEOUT)?),
+                None => self.client.insert(Client::connect_peer(endpoint)?),
             };
             match client.expose(deployment.to_owned(), regions.clone()) {
                 Err(error @ (::storage::Error::Io(_) | ::storage::Error::Protocol(_))) => {

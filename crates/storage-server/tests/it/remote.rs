@@ -142,7 +142,7 @@ fn a_read_from_another_host_fails_when_that_host_cannot_expose_its_source() {
 /// READs between two hosts' GPUs and from host storage: the GPU tests.
 mod device {
     use std::os::fd::AsFd;
-    use std::time::{Duration, Instant};
+    use std::time::Instant;
 
     use ::storage::protocol::{
         FabricExport, FabricHandle, Link, LinkEnd, Priority, Span, TaskStatus,
@@ -460,7 +460,7 @@ mod device {
             .unwrap();
 
         let endpoint = endpoint(&source_host.socket);
-        let mut peer = Client::connect_peer(&endpoint, Duration::from_secs(60)).unwrap();
+        let mut peer = Client::connect_peer(&endpoint).unwrap();
         let (exposure, _, registered) = peer
             .expose("model".into(), vec![tensor_region(1), tensor_region(3)])
             .unwrap();

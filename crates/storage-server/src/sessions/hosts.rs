@@ -5,7 +5,11 @@
 //! Every call to another host blocks until it answers, so each conversation
 //! runs on a helper thread of its own, never on the server's main loop, and
 //! reports to the main loop through notices ([`Notifier`]). Each connection
-//! fails a call once [`REMOTE_TIMEOUT`] passes without an answer.
+//! fails a call once the protocol's bound of its request passes without an
+//! answer (`storage::protocol::Request::remote_deadline`). A helper that waits
+//! for another host's task blocks on that connection and on the pipe its main
+//! loop stops it through (`Stop`), until its task's end, its stop or its
+//! deadline.
 //!
 //! - **Peers.** A prefetch from the peers asks each peer in turn to hold
 //!   the keys no earlier peer holds ([`Request::PeerHold`]); the holds of
@@ -31,9 +35,11 @@
 //! [`Request::Pages`]: storage::protocol::Request::Pages
 
 use std::io;
+use std::os::fd::{AsFd as _, OwnedFd};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
+use storage::client::Waited;
 use storage::protocol::{HostCopy, Key, Priority, Region, RegionPart, Role, Span, TaskStatus};
 use storage::{Client, Error, Result};
 
@@ -41,13 +47,28 @@ use super::Pages;
 use super::polling::Notifier;
 use crate::Server;
 
-/// How long connecting to another host's Storage Server, or a call on that
-/// connection, may take: a peer that does not answer within it is skipped,
-/// and a transfer there fails.
-pub(super) const REMOTE_TIMEOUT: Duration = Duration::from_secs(2);
+/// How the main loop stops a helper that waits for another host's task: the write end of a pipe
+/// whose read end the helper waits on. Stopping writes to it, and dropping it closes it, which
+/// stops the helper alike: a helper whose pool task is gone stops too.
+pub(super) struct Stop(OwnedFd);
 
-/// How often a helper looks for the end of a transfer on another host.
-const POLL: Duration = Duration::from_millis(1);
+impl Stop {
+    /// A stop and the read end its helper waits on.
+    ///
+    /// # Errors
+    ///
+    /// Fails when the pipe cannot be made.
+    pub(super) fn new() -> io::Result<(Self, OwnedFd)> {
+        let (reader, writer) = rustix::pipe::pipe_with(rustix::pipe::PipeFlags::CLOEXEC)?;
+        Ok((Self(writer), reader))
+    }
+
+    /// Stops the helper.
+    pub(super) fn stop(&self) {
+        // A pipe whose buffer is full holds bytes already, which stop the helper as well.
+        let _ = rustix::io::write(&self.0, &[1]);
+    }
+}
 
 /// What a read from the peers found: per key of the task, in order, the
 /// connection that holds its host copy and the copy; per connection, its
@@ -90,7 +111,7 @@ pub(super) fn read_from_peers(
                 if wanted.is_empty() {
                     break;
                 }
-                let held = Client::connect_peer(endpoint, REMOTE_TIMEOUT).and_then(|mut client| {
+                let held = Client::connect_peer(endpoint).and_then(|mut client| {
                     let (copies, parts) = client.peer_hold(deployment.clone(), wanted)?;
                     Ok((client, copies, parts))
                 });
@@ -150,8 +171,8 @@ pub(super) fn read_from_peers(
 /// a head of `deployment`'s `epoch`. Each span's source is that host's own
 /// storage or another host's region, or, when flagged, storage of this
 /// host, whose server listens on `port`. Notices the main loop of its end
-/// ([`Server::end_pool_task`]); a message on `cancel`, or its closing,
-/// cancels it, as does `limit` passing.
+/// ([`Server::end_pool_task`]); its stop (`cancel`, [`Stop`]) cancels it, as does `limit`
+/// passing.
 ///
 /// # Errors
 ///
@@ -163,7 +184,7 @@ pub(super) fn transfer_at(
     session: (String, u64),
     spans: Vec<(Span, bool)>,
     port: Option<u16>,
-    (cancel, limit): (mpsc::Receiver<()>, Duration),
+    (cancel, limit): (OwnedFd, Duration),
 ) -> io::Result<()> {
     std::thread::Builder::new()
         .name("remote-transfer".into())
@@ -188,7 +209,7 @@ fn transfer(
     (deployment, epoch): (String, u64),
     spans: Vec<(Span, bool)>,
     port: Option<u16>,
-    cancel: &mpsc::Receiver<()>,
+    cancel: &OwnedFd,
     limit: Duration,
 ) -> Result<bool> {
     let role = Role::Head {
@@ -196,7 +217,7 @@ fn transfer(
         epoch,
         generation: 0,
     };
-    let mut client = Client::connect_remote(endpoint, role, REMOTE_TIMEOUT)?;
+    let mut client = Client::connect_remote(endpoint, role)?;
 
     // This host as the other one reaches it: the address the connection
     // leaves from, and the port this server listens on.
@@ -223,24 +244,27 @@ fn transfer(
         .collect();
     let task = client.copy(spans, Priority::Request, 0)?;
 
-    let mut deadline = Instant::now() + limit;
-    let mut cancelled = false;
-    loop {
-        if let Some((_, status)) = client.poll_task(task)? {
-            return Ok(status == TaskStatus::Complete);
-        }
-        let stop = !matches!(cancel.try_recv(), Err(mpsc::TryRecvError::Empty));
-        if !cancelled && (stop || Instant::now() >= deadline) {
+    // The task runs until its end, its stop or `limit`; a cancelled one's end is waited for
+    // `limit` again.
+    let ended = match client.wait_task(task, Some(cancel.as_fd()), Some(Instant::now() + limit))? {
+        Waited::Done(ended) => Some(ended),
+        Waited::Interrupted | Waited::TimedOut => None,
+    };
+    let (_, status) = match ended {
+        Some(ended) => ended,
+        None => {
             client.cancel(vec![task], None)?;
-            cancelled = true;
-            deadline = Instant::now() + limit;
-        } else if cancelled && Instant::now() >= deadline {
-            return Err(Error::Protocol(format!(
-                "{endpoint} reported no end of a cancelled transfer"
-            )));
+            match client.wait_task(task, None, Some(Instant::now() + limit))? {
+                Waited::Done(ended) => ended,
+                Waited::Interrupted | Waited::TimedOut => {
+                    return Err(Error::Protocol(format!(
+                        "{endpoint} reported no end of a cancelled transfer"
+                    )));
+                }
+            }
         }
-        std::thread::sleep(POLL);
-    }
+    };
+    Ok(status == TaskStatus::Complete)
 }
 
 /// The pages of a put (`upload`) or a prefetch of the pool task `number` of
@@ -250,8 +274,8 @@ fn transfer(
 /// deployment's epoch, one task per part. Notices the main loop of each
 /// part's results ([`Server::pool_pages_moved`]). A part that could not be
 /// asked moved nothing, as did one whose end is not heard within `limit`
-/// once `stop` received or closed: the task was stopped, and nothing more
-/// is heard of that host.
+/// once stopped ([`Stop`]): the task was stopped, and nothing more is heard
+/// of that host.
 ///
 /// # Errors
 ///
@@ -262,7 +286,7 @@ pub(super) fn pages_at(
     endpoint: String,
     (session, upload): ((String, u64), bool),
     parts: Vec<(String, u32, Pages)>,
-    (stop, limit): (mpsc::Receiver<()>, Duration),
+    (stop, limit): (OwnedFd, Duration),
 ) -> io::Result<()> {
     std::thread::Builder::new()
         .name("remote-pages".into())
@@ -295,14 +319,14 @@ fn pages_there(
     (deployment, epoch): (String, u64),
     upload: bool,
     parts: &[(String, u32, Pages)],
-    (stop, limit): (&mpsc::Receiver<()>, Duration),
+    (stop, limit): (&OwnedFd, Duration),
 ) -> Result<Vec<Option<Vec<bool>>>> {
     let role = Role::Head {
         deployment,
         epoch,
         generation: 0,
     };
-    let mut client = Client::connect_remote(endpoint, role, REMOTE_TIMEOUT)?;
+    let mut client = Client::connect_remote(endpoint, role)?;
     let mut tasks = Vec::with_capacity(parts.len());
     for (region, part, (pages, _)) in parts {
         let asked = client.pages(region.clone(), *part, pages.clone(), upload);
@@ -312,40 +336,40 @@ fn pages_there(
     }
 
     let mut results: Vec<Option<Vec<bool>>> = vec![None; parts.len()];
-    let mut deadline = None;
-    loop {
-        for (task, result) in tasks.iter().zip(&mut results) {
-            let Ok(task) = task else {
-                continue;
-            };
-            if result.is_none() {
-                match client.poll_pages(*task) {
-                    Ok(polled) => *result = polled,
-                    Err(error) => {
-                        tracing::warn!(endpoint, %error, "a host moving pages was lost");
-                        return Ok(results);
-                    }
+    let mut waiting: Vec<u64> = tasks
+        .iter()
+        .filter_map(|task| task.as_ref().ok())
+        .copied()
+        .collect();
+    // Until stopped, a part's results are waited for as long as its task runs; once stopped, for
+    // `limit` more.
+    let mut stopped: Option<Instant> = None;
+    while !waiting.is_empty() {
+        let deadline = stopped.map(|at| at + limit);
+        let interrupt = stopped.is_none().then(|| stop.as_fd());
+        match client.wait_pages(&waiting, interrupt, deadline) {
+            Ok(Waited::Done((task, moved))) => {
+                waiting.retain(|waited| *waited != task);
+                let at = tasks
+                    .iter()
+                    .position(|asked| asked.as_ref().is_ok_and(|asked| *asked == task));
+                if let Some(at) = at {
+                    results[at] = Some(moved);
                 }
             }
+            Ok(Waited::Interrupted) => stopped = Some(Instant::now()),
+            Ok(Waited::TimedOut) => {
+                tracing::warn!(
+                    endpoint,
+                    "another host reported no end of a stopped task's pages"
+                );
+                return Ok(results);
+            }
+            Err(error) => {
+                tracing::warn!(endpoint, %error, "a host moving pages was lost");
+                return Ok(results);
+            }
         }
-        let waiting = tasks
-            .iter()
-            .zip(&results)
-            .any(|(task, result)| task.is_ok() && result.is_none());
-        if !waiting {
-            return Ok(results);
-        }
-
-        if deadline.is_none() && !matches!(stop.try_recv(), Err(mpsc::TryRecvError::Empty)) {
-            deadline = Some(Instant::now() + limit);
-        }
-        if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
-            tracing::warn!(
-                endpoint,
-                "another host reported no end of a stopped task's pages"
-            );
-            return Ok(results);
-        }
-        std::thread::sleep(POLL);
     }
+    Ok(results)
 }

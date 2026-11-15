@@ -412,9 +412,31 @@ impl Connection {
     /// The terminal failure once the connection failed or the peer closed it: at once when that
     /// is known, and otherwise when it is observed without new bytes arriving first.
     pub fn wait(&mut self, timeout: Duration) -> io::Result<()> {
+        self.wait_on(None, timeout).map(drop)
+    }
+
+    /// [`Connection::wait`], which also ends once `interrupt` becomes readable or reaches its
+    /// end; returns whether it did. A thread that waits on a connection on its owner's behalf
+    /// blocks here, and the owner stops it by writing to, or closing, the other end of
+    /// `interrupt` (a pipe).
+    ///
+    /// # Errors
+    ///
+    /// As [`Connection::wait`].
+    pub fn wait_or(&mut self, interrupt: BorrowedFd<'_>, timeout: Duration) -> io::Result<bool> {
+        self.wait_on(Some(interrupt), timeout)
+    }
+
+    /// The wait of [`Connection::wait`] and [`Connection::wait_or`]; whether `interrupt` ended
+    /// it.
+    fn wait_on(
+        &mut self,
+        interrupt: Option<BorrowedFd<'_>>,
+        timeout: Duration,
+    ) -> io::Result<bool> {
         self.failed()?;
         if self.local.take() {
-            return Ok(());
+            return Ok(false);
         }
 
         let deadline = Instant::now().checked_add(timeout);
@@ -423,7 +445,17 @@ impl Connection {
         loop {
             let remaining =
                 deadline.map(|deadline| deadline.saturating_duration_since(Instant::now()));
-            wait_ready(&mut self.poll_fds(), remaining)?;
+            let [socket, local] = self.poll_fds();
+            let mut descriptors = [
+                socket,
+                local,
+                pollfd(interrupt.map_or(-1, |fd| fd.as_raw_fd()), libc::POLLIN),
+            ];
+            // A negative descriptor is one `poll` skips.
+            wait_ready(&mut descriptors, remaining)?;
+            if descriptors[2].revents != 0 {
+                return Ok(true);
+            }
             let woken = self.local.take();
             self.pump();
 
@@ -432,11 +464,11 @@ impl Connection {
             let arrived = self.inbox.len() > received;
             let sent = self.outbox.len() < queued;
             if woken || arrived || sent {
-                return Ok(());
+                return Ok(false);
             }
             self.failed()?;
             if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
-                return Ok(());
+                return Ok(false);
             }
         }
     }

@@ -386,14 +386,11 @@ fn concurrent_transfers_can_be_collected_in_reverse_order() {
 
     let deadline = Instant::now() + Duration::from_secs(60);
     for task in tasks.into_iter().rev() {
-        let completed = loop {
-            if let Some(completed) = worker.poll_task(task).unwrap() {
-                break completed;
-            }
-            assert!(Instant::now() < deadline, "a transfer did not complete");
-            std::thread::sleep(Duration::from_millis(1));
-        };
-        assert_eq!(completed, (32, TaskStatus::Complete));
+        let completed = worker.wait_task(task, None, Some(deadline)).unwrap();
+        assert_eq!(
+            completed,
+            ::storage::client::Waited::Done((32, TaskStatus::Complete))
+        );
     }
     assert_eq!(read(&destination, 0, 64), source_bytes);
 }
