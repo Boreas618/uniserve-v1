@@ -142,6 +142,7 @@ message Node {
 message Request {
   // Chosen by the sender; the reply repeats it.
   uint64 id = 1;
+  reserved 10;
   oneof kind {
     Spawn spawn = 2;
     Stop stop = 3;
@@ -151,7 +152,6 @@ message Request {
     KeepWeights keep_weights = 7;
     ThrottleTransfers throttle_transfers = 8;
     NodesQuery nodes = 9;
-    DeviceQuery devices = 10;
     PublishEpochs publish_epochs = 11;
     PrepareModules prepare_modules = 12;
   }
@@ -162,6 +162,7 @@ message Reply {
   uint64 id = 1;
   // Why the request failed; empty when it succeeded.
   string error = 2;
+  reserved 11;
   oneof kind {
     Spawned spawned = 3;
     Stopped stopped = 4;
@@ -171,7 +172,6 @@ message Reply {
     WeightsKept weights_kept = 8;
     TransfersThrottled transfers_throttled = 9;
     NodesKnown nodes = 10;
-    DeviceInventory devices = 11;
     EpochsPublished epochs_published = 12;
     ModulesPrepared modules_prepared = 13;
   }
@@ -185,14 +185,6 @@ message NodesKnown {
   repeated Node nodes = 1;
 }
 
-// CUDA-visible devices available for an independent replica's successor.
-message DeviceQuery {
-  string host = 1;
-}
-
-message DeviceInventory {
-  repeated uint32 available = 1;
-}
 // Publish the immutable pages of a committed set of epochs at one node.
 // Every successor is published before any predecessor is retired.
 message PublishEpochs {

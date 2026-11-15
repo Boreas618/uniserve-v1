@@ -177,7 +177,6 @@ pub async fn serve(
     config: ServerArgs,
     stated: Stated,
     families: processing::Registry,
-    devices: crate::supervision::DeviceProbe,
     ready: Option<service::ReadyFd>,
     shutdown: CancellationToken,
 ) -> Result<()> {
@@ -204,7 +203,7 @@ pub async fn serve(
     } else {
         None
     };
-    let mut options = config.daemon_options(devices, instance.path());
+    let mut options = config.daemon_options(instance.path());
     if let Some((_, endpoint)) = &join {
         ready.endpoints().join = Some(endpoint.clone());
         options.dist_init_addr = Some(endpoint.clone());

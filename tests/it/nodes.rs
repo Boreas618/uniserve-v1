@@ -49,7 +49,6 @@ fn a_follower_joins_without_a_model() {
             socket: directory.path().join("leader.sock"),
             executable: env!("CARGO_BIN_EXE_uniserve").into(),
             join_timeout: Duration::from_secs(10),
-            devices: || Ok(Vec::new()),
             build_server: build_server::command::Settings::default(),
             storage: Default::default(),
         },

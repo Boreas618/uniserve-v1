@@ -67,9 +67,6 @@ pub struct DaemonOptions {
     /// How long the leader waits for the members and a member for the
     /// leader.
     pub join_timeout: Duration,
-    /// Reads which of this host's devices are idle, for the deployment's
-    /// placement of its processes.
-    pub devices: DeviceProbe,
     /// This node's Build Server, which the engines the node starts resolve their
     /// modules from (`build_config`).
     pub build_server: build_server::command::Settings,
@@ -78,14 +75,6 @@ pub struct DaemonOptions {
     /// deployment, so the Storage Server a node starts for it serves with them.
     pub storage: storage::Settings,
 }
-
-/// Reads the ordinals of this host's idle devices from the driver.
-///
-/// The daemon places and supervises processes but runs no device
-/// code itself, so the executable that links the platform supplies the probe,
-/// as it supplies the Build Server's host targets. An `Err` states why the
-/// devices could not be read; the daemon replies to the asking engine with it.
-pub type DeviceProbe = fn() -> Result<Vec<u32>, String>;
 
 /// The daemon's downward path to the engines its service supervises, and the
 /// reports they send up: the daemon commands an engine and reads its `Report`s
@@ -347,7 +336,6 @@ impl Daemon {
     /// Fails when the service thread cannot start.
     pub(crate) fn resume(
         host: String,
-        devices: DeviceProbe,
         address: Option<(String, Option<PathBuf>)>,
         service: ServiceHandoff,
         descriptors: Vec<OwnedFd>,
@@ -376,7 +364,6 @@ impl Daemon {
             .spawn(move || {
                 service::resume(
                     node,
-                    devices,
                     service,
                     descriptors,
                     commands_rx,
@@ -560,7 +547,6 @@ fn local(
             options.storage.clone(),
         ),
         address,
-        options.devices,
     ))
 }
 
@@ -724,7 +710,6 @@ mod tests {
                 socket: socket.clone(),
                 executable: PathBuf::from("uniserve"),
                 join_timeout: Duration::from_secs(5),
-                devices: || Ok(Vec::new()),
                 build_server: build_server::command::Settings::default(),
                 storage: storage::Settings::default(),
             },
@@ -772,7 +757,6 @@ mod tests {
         assert!(Path::new(&format!("/proc/{}", spawned.pid)).exists());
         let mut successor = Daemon::resume(
             "localhost".to_owned(),
-            || Ok(Vec::new()),
             Some((address, (!network).then_some(socket.clone()))),
             handoff,
             descriptors,

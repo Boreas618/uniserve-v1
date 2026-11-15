@@ -72,8 +72,6 @@ struct Node {
     build_config: build_server::command::Settings,
     /// The model families the executable serves.
     families: processing::Registry,
-    /// Reads this host's idle devices, for each deployment's daemon.
-    devices: crate::supervision::DeviceProbe,
     /// The node's instance directory, where each deployment's daemon keeps its sockets.
     instance: std::path::PathBuf,
 }
@@ -92,7 +90,6 @@ pub async fn node(
     server: ServerConfig,
     build_config: build_server::command::Settings,
     families: processing::Registry,
-    devices: crate::supervision::DeviceProbe,
     ready: Option<service::ReadyFd>,
     shutdown: CancellationToken,
 ) -> Result<()> {
@@ -115,7 +112,6 @@ pub async fn node(
         server: server.clone(),
         build_config,
         families,
-        devices,
         instance: instance.path().to_owned(),
     });
     // The operator's socket takes the node's own verbs and, once a
@@ -311,7 +307,7 @@ async fn serve_deployment(
     token: &CancellationToken,
 ) -> Result<()> {
     let name = config.served_model_name().to_owned();
-    let mut options = config.daemon_options(node.devices, &node.instance);
+    let mut options = config.daemon_options(&node.instance);
     let join = match &config.dist_init_addr {
         Some(endpoint) => {
             let (listener, bound) = Daemon::bind_join(endpoint)?;

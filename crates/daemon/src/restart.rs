@@ -689,7 +689,6 @@ impl service::Message for Message {
 pub async fn take_over(
     descriptor: i32,
     families: processing::Registry,
-    devices: crate::supervision::DeviceProbe,
     shutdown: CancellationToken,
 ) -> anyhow::Result<()> {
     // SAFETY: the daemon that started this process placed the handoff
@@ -700,7 +699,7 @@ pub async fn take_over(
         (Message::Prepare(prepare), _) => prepare,
         (other, _) => anyhow::bail!("the daemon sent {other:?} first"),
     };
-    match prepared_successor(&mut channel, *prepare, &families, devices, shutdown).await {
+    match prepared_successor(&mut channel, *prepare, &families, shutdown).await {
         Ok(()) => Ok(()),
         Err(error) => {
             let _ = send(
@@ -720,7 +719,6 @@ async fn prepared_successor(
     channel: &mut Connection,
     prepare: Prepare,
     families: &processing::Registry,
-    devices: crate::supervision::DeviceProbe,
     shutdown: CancellationToken,
 ) -> anyhow::Result<()> {
     // The engines go on serving through this daemon, so an engine interface of another version
@@ -839,7 +837,6 @@ async fn prepared_successor(
         .map(std::path::PathBuf::from);
     let daemon = Daemon::resume(
         config.host_identity.clone(),
-        devices,
         Some((prepare.processes.clone(), socket)),
         service,
         service_fds,

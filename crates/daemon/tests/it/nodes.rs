@@ -40,7 +40,6 @@ impl Deployment {
             socket: directory.path().join(format!("{host}.sock")),
             executable: "uniserve".into(),
             join_timeout: TIMEOUT,
-            devices: || Ok(Vec::new()),
             build_server: if host == "member" {
                 settings.clone()
             } else {
@@ -149,7 +148,6 @@ fn a_node_joins_a_running_deployment_and_the_next_engine_runs_processes_there() 
         socket: directory.path().join(format!("{host}.sock")),
         executable: "uniserve".into(),
         join_timeout: TIMEOUT,
-        devices: || Ok(Vec::new()),
         build_server: build_server::command::Settings::default(),
         storage: storage::Settings::default(),
     };

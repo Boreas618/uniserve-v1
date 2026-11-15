@@ -29,13 +29,7 @@ pub(crate) fn run(
     let runtime = crate::runtime()?;
     if let Some(descriptor) = args.predecessor {
         runtime.block_on(async move {
-            daemon::restart::take_over(
-                descriptor,
-                crate::served()?,
-                crate::idle_devices,
-                crate::shutdown_signal(),
-            )
-            .await
+            daemon::restart::take_over(descriptor, crate::served()?, crate::shutdown_signal()).await
         })?;
         return Ok(ExitCode::SUCCESS);
     }
@@ -70,7 +64,6 @@ async fn serve(
             config.server_config,
             config.build_config,
             crate::served()?,
-            crate::idle_devices,
             ready,
             crate::shutdown_signal(),
         )
@@ -83,7 +76,6 @@ async fn serve(
         config,
         stated,
         crate::served()?,
-        crate::idle_devices,
         ready,
         crate::shutdown_signal(),
     )

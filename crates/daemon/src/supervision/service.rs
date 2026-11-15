@@ -83,8 +83,6 @@ pub(crate) struct Local {
     pub(crate) claims: ClaimHolder,
     /// This node's address other nodes reach; `None` on a single node.
     pub(crate) address: Option<IpAddr>,
-    /// Reads this host's idle devices (`Request::Devices`).
-    pub(crate) devices: super::DeviceProbe,
     /// Where each preparation this node runs off its service sends its reply, with the connection
     /// that asked (`Local::prepare`).
     preparations: Sender<(u64, Reply)>,
@@ -93,20 +91,18 @@ pub(crate) struct Local {
 }
 
 impl Local {
-    /// This node's local part: its supervisor and claims, its address other nodes reach (`None`
-    /// on a single node) and its device probe.
+    /// This node's local part: its supervisor and claims and its address other nodes reach
+    /// (`None` on a single node).
     pub(crate) fn new(
         supervisor: Supervisor,
         claims: ClaimHolder,
         address: Option<IpAddr>,
-        devices: super::DeviceProbe,
     ) -> Self {
         let (preparations, prepared) = std::sync::mpsc::channel();
         Self {
             supervisor,
             claims,
             address,
-            devices,
             preparations,
             prepared,
         }
@@ -133,7 +129,6 @@ impl Local {
     /// descriptors from `descriptors`.
     fn adopt(
         host: String,
-        devices: super::DeviceProbe,
         handoff: LocalHandoff,
         descriptors: &mut std::vec::IntoIter<OwnedFd>,
     ) -> anyhow::Result<Self> {
@@ -154,7 +149,6 @@ impl Local {
             Supervisor::adopt(host, handoff.processes, processes)?,
             ClaimHolder::adopt(handoff.address, handoff.claims, claims)?,
             handoff.address,
-            devices,
         ))
     }
 
@@ -246,12 +240,6 @@ impl Local {
             Some(request::Kind::Nodes(_)) => {
                 reply.error = "the leader replies for the deployment's nodes".to_owned();
             }
-            Some(request::Kind::Devices(_)) => match (self.devices)() {
-                Ok(available) => {
-                    reply.kind = Some(reply::Kind::Devices(process::DeviceInventory { available }))
-                }
-                Err(error) => reply.error = error,
-            },
             None => reply.error = "an empty request".to_owned(),
         }
         Some(reply)
@@ -1355,7 +1343,6 @@ fn route(
         Some(request::Kind::Usage(query)) => Some(query.host.as_str()),
         Some(request::Kind::KeepWeights(keep)) => Some(keep.host.as_str()),
         Some(request::Kind::ThrottleTransfers(throttle)) => Some(throttle.host.as_str()),
-        Some(request::Kind::Devices(query)) => Some(query.host.as_str()),
         Some(request::Kind::PublishEpochs(publish)) => Some(publish.host.as_str()),
         Some(request::Kind::PrepareModules(prepare)) => Some(prepare.host.as_str()),
         Some(request::Kind::Stop(_) | request::Kind::Nodes(_)) | None => None,
@@ -1683,7 +1670,6 @@ impl LeaderService {
 )]
 pub(crate) fn resume(
     host: String,
-    devices: super::DeviceProbe,
     handoff: ServiceHandoff,
     descriptors: Vec<OwnedFd>,
     commands: Receiver<(u64, process::Command)>,
@@ -1766,7 +1752,7 @@ pub(crate) fn resume(
                 });
             }
             let mut rest: std::vec::IntoIter<OwnedFd> = descriptors.collect::<Vec<_>>().into_iter();
-            let local = Local::adopt(host, devices, local, &mut rest)?;
+            let local = Local::adopt(host, local, &mut rest)?;
             let nodes = nodes
                 .iter()
                 .map(|node| Node::decode(node.as_slice()))
@@ -1819,7 +1805,7 @@ pub(crate) fn resume(
         ServiceHandoff::Member { leader, local } => {
             let leader = leader.resume(next()?)?;
             let mut rest: std::vec::IntoIter<OwnedFd> = descriptors.collect::<Vec<_>>().into_iter();
-            let local = Local::adopt(host, devices, local, &mut rest)?;
+            let local = Local::adopt(host, local, &mut rest)?;
             tracing::info!("the service goes on from the previous daemon");
             serve_member(local, leader, stop)
         }
