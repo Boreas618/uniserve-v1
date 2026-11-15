@@ -428,14 +428,20 @@ impl Op for VsaComposeGatedRows {
                 "an empty row interval composes nothing".to_owned(),
             ));
         }
-        if args.start % u64::from(descriptor.block_rows) != 0
-            || args.count % u64::from(descriptor.block_rows) != 0
+        // A program reads the compression of the tile its block starts in, so a block lies
+        // within one tile only when member `m`'s rows `m · owner_rows + start ..` start on a
+        // block boundary: whole-block owner rows, starts and counts.
+        let block = u64::from(descriptor.block_rows);
+        if [args.owner_rows, args.start, args.count]
+            .iter()
+            .any(|rows| rows % block != 0)
             || args.start + args.count > args.owner_rows
         {
             return Err(Error::argument(
                 Self::NAME,
                 format!(
-                    "the interval {}..{} is not whole blocks within {} owned rows",
+                    "the interval {}..{} of {} owned rows is not whole {block}-row blocks within \
+                     them",
                     args.start,
                     args.start + args.count,
                     args.owner_rows
@@ -490,6 +496,66 @@ impl Op for VsaComposeGatedRows {
     fn tolerance(descriptor: &Self::Descriptor) -> Tolerance {
         // The product rounds, then the sum rounds, both in the common dtype.
         Tolerance::rounding(2, descriptor.dtype, descriptor.dtype)
+    }
+}
+
+#[cfg(test)]
+mod compose_gated_rows_tests {
+    use super::*;
+    use platform::DevicePtr;
+
+    /// Eight members of seven 128-feature heads over 64-row tiles.
+    fn descriptor() -> ComposeGatedRowsDescriptor {
+        let mut slots = [0; MAX_MEMBERS];
+        for (member, slot) in slots.iter_mut().enumerate() {
+            *slot = member as u32;
+        }
+        ComposeGatedRowsDescriptor {
+            dtype: DType::BF16,
+            heads: 7,
+            tile_rows: 64,
+            width: 128,
+            block_rows: BLOCK_ROWS,
+            slots,
+            members: 8,
+        }
+    }
+
+    /// The interval `start..start + count` of each member's `owner_rows` rows.
+    fn args(owner_rows: u64, start: u64, count: u64) -> ComposeGatedRowsArgs {
+        let operand = |address: u64, dims: &[u64]| {
+            Operand::new(DevicePtr::from_address(address), DType::BF16, dims)
+        };
+        let rows = 8 * owner_rows;
+        ComposeGatedRowsArgs {
+            output: operand(0x10_0000, &[8, count, 7, 128]),
+            fine: operand(0x20_0000, &[rows, 7, 128]),
+            compressed: operand(0x30_0000, &[7, rows / 64, 128]),
+            gate: operand(0x40_0000, &[rows, 7, 128]),
+            owner_rows,
+            start,
+            count,
+        }
+    }
+
+    #[test]
+    fn every_member_s_interval_starts_on_a_block() {
+        let check = |owner_rows, start, count| {
+            VsaComposeGatedRows::check(&descriptor(), &args(owner_rows, start, count))
+        };
+
+        // 2090 tiles: each member's 16720 rows and the interval are whole blocks.
+        check(16_720, 2_784, 5_584).unwrap();
+
+        // 2089 tiles: each member's 16712 rows are not, so member 1's interval would start
+        // half a block into one and its last block of a tile would read into the next tile,
+        // however whole the interval is.
+        assert!(check(16_712, 2_784, 5_584).is_err());
+        assert!(check(16_720, 2_792, 5_584).is_err());
+        assert!(
+            check(16_720, 2_784, 13_952).is_err(),
+            "past a member's rows"
+        );
     }
 }
 

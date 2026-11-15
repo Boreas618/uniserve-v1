@@ -30,7 +30,7 @@ use nn::{
     WeightLoader,
 };
 use proto::config::{PrecisionMode, Quantization, WeightFormat};
-use support::{Recording, meta, recorded, report};
+use support::{Recording, meta, recorded, recorded_at, report};
 
 /// The released base checkpoint: dense attention, the 50-point uniform grid, both networks.
 const BASE: &str = "/workspace/models/MiniMax-H3";
@@ -90,43 +90,6 @@ fn load_under(
     let mut loader = WeightLoader::meta(&checkpoint, None);
 
     opened.load(&checkpoint, &mut loader, &placement)
-}
-
-/// [`recorded`], with the context stating this rank's place on each axis of `sequence`'s
-/// partition, in the order the denoiser addresses them (`nn::family::ULYSSES_AXIS` and after).
-fn recorded_at<T>(
-    sequence: DenoiserSplit,
-    forward: impl FnOnce() -> nn::Result<T>,
-) -> (nn::Result<T>, Recording) {
-    if sequence == DenoiserSplit::WHOLE {
-        return recorded(forward);
-    }
-
-    let context = ops::Context::meta(None);
-    let axes = [
-        sequence.ulysses.split,
-        sequence.gather,
-        sequence.tensor,
-        sequence.layers,
-    ]
-    .map(|place| match place.size {
-        1 => (None, 0, 0),
-        size => (None, u64::from(place.rank), u64::from(size)),
-    });
-    context.set_axes(axes.to_vec()).unwrap();
-    context.record_launches();
-
-    let output = {
-        let _guard = context.enter();
-        forward()
-    };
-    let launches = context
-        .take_launches()
-        .into_iter()
-        .map(|(operator, key, ..)| (operator, key))
-        .collect();
-
-    (output, (launches, context.peak()))
 }
 
 /// The requests the deployment captures for, with the keyframe sets each may open with.

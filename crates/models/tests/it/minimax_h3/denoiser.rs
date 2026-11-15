@@ -13,6 +13,10 @@
 //! packing's gathers, the modulation rows, the rotary coordinates, the key bounds of the dense
 //! attention and the tile tables of the sparse one.
 //!
+//! A rank of a sequence split meets the other ranks through collectives, which take no CPU
+//! tensor, so such a rank's step runs on meta tensors over the checkpoint's header: every
+//! operand a launch would take on the device is checked, and nothing is computed.
+//!
 //! ## Tolerance
 //!
 //! The two runs of a pair evaluate the same FP32 formulas with their reductions in another
@@ -28,14 +32,14 @@ use super::support;
 use std::path::Path;
 
 use models::minimax_h3::config::{DenoiserConfig, ScheduleConfig, TransformerConfig, VsaConfig};
-use models::minimax_h3::denoiser::Denoiser;
+use models::minimax_h3::denoiser::{Denoiser, SAMPLE_DTYPE};
 use models::minimax_h3::{VideoTask, packing};
-use nn::family::DenoiserSplit;
+use nn::family::{DenoiserSplit, Projection, SequenceSplit};
 use nn::{
     Checkpoint, ConditionRole, ConditionShape, Conditioning, CpuWeights, DType, Denoiser as _,
-    Device, Tensor, VideoRequest, WeightLoader,
+    Device, Split, Tensor, VideoRequest, WeightLoader,
 };
-use support::{assert_close, f32_shard, sequence, values};
+use support::{assert_close, f32_shard, meta, recorded_at, sequence, values};
 
 /// Stages times the longest reduction times the FP32 unit roundoff (module documentation).
 const TOLERANCE: f32 = 22.0 * 384.0 / 16_777_216.0;
@@ -67,10 +71,11 @@ fn transformer() -> TransformerConfig {
     }
 }
 
-/// The network's configuration with a four-rung ladder, attending densely or through `vsa`.
-fn config(vsa: Option<VsaConfig>) -> DenoiserConfig {
+/// The configuration of the network `transformer` with a four-rung ladder, attending densely or
+/// through `vsa`.
+fn config(transformer: TransformerConfig, vsa: Option<VsaConfig>) -> DenoiserConfig {
     DenoiserConfig::new(
-        transformer(),
+        transformer,
         ScheduleConfig::ladder(&[999, 749, 500, 250], 1000.0, 12.0, 3.0).unwrap(),
         vsa,
         vec![
@@ -81,10 +86,10 @@ fn config(vsa: Option<VsaConfig>) -> DenoiserConfig {
     .unwrap()
 }
 
-/// Writes the tiny network's checkpoint into `directory`: every tensor the released checkpoint
-/// names, with values that differ from tensor to tensor, and a negligible compression gate.
-fn write_checkpoint(directory: &Path) {
-    let config = transformer();
+/// Writes the checkpoint of the network `config` into `directory`: every tensor the released
+/// checkpoint names, with values that differ from tensor to tensor, and a negligible compression
+/// gate.
+fn write_checkpoint(directory: &Path, config: &TransformerConfig) {
     let (hidden, inner) = (
         config.hidden_size as usize,
         (config.num_attention_heads * config.head_dim) as usize,
@@ -224,12 +229,12 @@ fn stepped(
     steps: usize,
 ) -> (Vec<f32>, Vec<f32>) {
     let directory = tempfile::tempdir().unwrap();
-    write_checkpoint(directory.path());
+    write_checkpoint(directory.path(), &transformer());
     let checkpoint = Checkpoint::open(directory.path()).unwrap();
     let store = CpuWeights::new();
     let loader = WeightLoader::new(&checkpoint, &store, None);
 
-    let config = config(vsa);
+    let config = config(transformer(), vsa);
     let denoiser =
         Denoiser::load(&config, capacity, DenoiserSplit::WHOLE, None, loader.root()).unwrap();
     denoiser.initialize().unwrap();
@@ -368,12 +373,12 @@ fn a_sparse_attention_that_keeps_every_tile_is_the_dense_attention() {
 #[test]
 fn a_request_of_a_task_the_network_does_not_serve_is_refused_by_name() {
     let directory = tempfile::tempdir().unwrap();
-    write_checkpoint(directory.path());
+    write_checkpoint(directory.path(), &transformer());
     let checkpoint = Checkpoint::open(directory.path()).unwrap();
     let store = CpuWeights::new();
     let loader = WeightLoader::new(&checkpoint, &store, None);
     let denoiser = Denoiser::load(
-        &config(None),
+        &config(transformer(), None),
         (64, 64),
         DenoiserSplit::WHOLE,
         None,
@@ -390,4 +395,93 @@ fn a_request_of_a_task_the_network_does_not_serve_is_refused_by_name() {
     let layout = denoiser.layout(&request(Vec::new(), None)).unwrap();
     assert_eq!((layout.text_rows, layout.condition_rows), (64, 0));
     assert_eq!(denoiser.condition_ladder(), [64]);
+}
+
+/// A rank of an eight-way Ulysses split steps the largest layout an eight-step student's
+/// deployment of a 16384-row text capacity profiles: an `fl2va` request of 15 seconds at
+/// 1344x768 on the 2048-row condition rung, under 64-row tiles. A sparse block of a Ulysses
+/// split returns each member's attended rows to it interval by interval, under either
+/// projection.
+///
+/// The network has the released network's 56 heads, so each member attends seven, and is
+/// loaded in BF16 from its checkpoint's header; the step runs on meta tensors, which check
+/// every operand a launch takes on the device without computing it.
+#[test]
+fn an_eight_way_ulysses_rank_steps_the_largest_profiled_layout() {
+    let directory = tempfile::tempdir().unwrap();
+    let network = TransformerConfig {
+        num_attention_heads: 56,
+        ..transformer()
+    };
+    write_checkpoint(directory.path(), &network);
+    let checkpoint = Checkpoint::open(directory.path()).unwrap();
+    let vsa = VsaConfig::new(64, 0.8, None).unwrap();
+    let config = config(network, Some(vsa));
+
+    let request = VideoRequest {
+        width: 1344,
+        height: 768,
+        frames: 362,
+        fps: 24,
+        first_frames: 1,
+        last_frames: 1,
+        references: 0,
+        text_tokens: 1024,
+        conditions: Vec::new(),
+        vision_spans: Vec::new(),
+        condition_rows: Some(2048),
+    };
+
+    for projection in [Projection::Gather, Projection::Exchange] {
+        let split = DenoiserSplit {
+            ulysses: SequenceSplit {
+                split: Split { size: 8, rank: 3 },
+                projection,
+            },
+            ..DenoiserSplit::WHOLE
+        };
+        let loader = WeightLoader::meta(&checkpoint, Some(DType::BF16));
+        let denoiser =
+            Denoiser::load(&config, (16_384, 2_048), split, None, loader.root()).unwrap();
+
+        // The text capacity's 256 tiles, the condition rung's 32, the audio's 19 and the
+        // video's 1782: an odd count of tiles, whose eighth is not whole sixteen-row blocks.
+        let layout = denoiser.layout(&request).unwrap();
+        assert_eq!(packing::tiled_len(&layout, &vsa), 2089 * 64);
+
+        let schedule = denoiser.schedule(&request).unwrap();
+        let (stepped, _) = recorded_at(split, || {
+            let shape = layout.video;
+            let video = meta(
+                (
+                    shape.channels as usize,
+                    shape.frames as usize,
+                    shape.height as usize,
+                    shape.width as usize,
+                ),
+                SAMPLE_DTYPE,
+            );
+            let track = layout.audio.unwrap();
+            let audio = meta(
+                (track.channels as usize, track.frames as usize),
+                SAMPLE_DTYPE,
+            );
+            let cond = Conditioning {
+                text: meta(
+                    (
+                        nn::capability::prefix_rows(&layout) as usize,
+                        network.hidden_size as usize,
+                    ),
+                    DType::BF16,
+                ),
+                source: None,
+                media: Vec::new(),
+                images: None,
+                audio: None,
+            };
+
+            denoiser.forward(schedule[0], &request, &video, Some(&audio), &cond)
+        });
+        stepped.unwrap_or_else(|error| panic!("{projection:?}: {error}"));
+    }
 }

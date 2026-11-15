@@ -41,6 +41,12 @@ use tensor::{D, DType, Device, Tensor};
 use super::on_cpu;
 use crate::error::{Error, Result};
 
+/// The rows one program of a VSA kernel handles: a tile is whole blocks of them, and on the
+/// device so are each member's rows and the row interval of [`vsa_compose_gated_rows`], so that
+/// a block lies within one tile. A sequence split that returns its rows through the composition
+/// lays out whole blocks for every member.
+pub const VSA_BLOCK_ROWS: u32 = BLOCK_ROWS;
+
 /// The fewest tiles a selection's kernel is compiled to rank, however few a layout holds.
 const SELECT_FLOOR: usize = 256;
 
@@ -785,11 +791,16 @@ pub fn vsa_add_gated_tiles_(
 /// `fine + compressed[:, tile] · gate` over rows `m · owner rows + rows` (the arithmetic of
 /// [`vsa_add_gated_tiles_`]).
 ///
+/// On the device a member's owner rows and `rows` are whole [`VSA_BLOCK_ROWS`]-row blocks: the
+/// kernel folds one tile's compression into each block it handles, so a block that started off
+/// a block boundary could reach into the next tile.
+///
 /// # Errors
 ///
 /// When there is no member or more than the operator covers, the slots are not one per member,
 /// the interval is outside a member's rows, the operands are not one shape and type, or the
-/// operator refuses its arguments.
+/// operator refuses its arguments (on the device, owner rows or an interval that are not whole
+/// blocks).
 pub fn vsa_compose_gated_rows(
     fine: &Tensor,
     compressed: &Tensor,

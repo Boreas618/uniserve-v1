@@ -31,13 +31,14 @@
 //!
 //! ## Parallelism
 //!
-//! A rank of a sequence split computes one contiguous interval of the packed rows; under an
-//! all-gather degree a tiled layout is padded to whole tiles in every all-gather interval. Every
-//! rank holds the whole sample and draws the whole noise stream, projects the modality rows and
-//! gathers its own interval of them; after the stack the ranks' velocity rows are gathered in
-//! sequence order, so every rank advances the same latents. The ranks of a tensor split and the
-//! stages of a layer split hold the same rows and end the stack with the same rows
-//! ([`crate::minimax_h3::transformer`]), so they advance the same latents too.
+//! A rank of a sequence split computes one contiguous interval of the packed rows; a tiled
+//! layout is padded with empty tiles to whole tiles in every all-gather interval and whole
+//! kernel blocks on every rank, which the sparse attention's return to a Ulysses member reads
+//! block by block. Every rank holds the whole sample and draws the whole noise stream, projects
+//! the modality rows and gathers its own interval of them; after the stack the ranks' velocity
+//! rows are gathered in sequence order, so every rank advances the same latents. The ranks of a
+//! tensor split and the stages of a layer split hold the same rows and end the stack with the
+//! same rows ([`crate::minimax_h3::transformer`]), so they advance the same latents too.
 
 use nn::diffusion::{add_noise, euler_step, scale_noise};
 use nn::family::{DenoiserSplit, GATHER_AXIS, ULYSSES_AXIS};
@@ -439,18 +440,33 @@ fn max_rows(config: &DenoiserConfig, capacity: (u32, u32), split: DenoiserSplit)
     Ok(bound as u32)
 }
 
-/// The rows of `layout`'s packed sequence on a partition of `split`: the tiled layout's under
-/// sparse attention, in whole tiles for every all-gather interval, and the dense layout's
-/// aligned to the sequence split otherwise.
+/// The rows of `layout`'s packed sequence on a partition of `split`: the dense layout's aligned
+/// to the sequence split, and under sparse attention the tiled layout's followed by the fewest
+/// empty tiles that make every all-gather interval whole tiles and every rank's interval whole
+/// [`functional::VSA_BLOCK_ROWS`]-row blocks.
+///
+/// A Ulysses member's attended rows return to it interval by interval through a composition
+/// that folds one tile's compression into each block of a member's rows, so each member's rows
+/// start on a block. A tile is whole blocks, so the blocks add tiles only where an all-gather
+/// interval has more ranks than a tile has blocks: eight Ulysses members of 64-row tiles (four
+/// blocks) would each hold an eighth of an odd tile count, eight rows short of whole blocks.
+/// An empty tile holds no valid row, which no query keeps and no compression weighs, so the step
+/// computes the values of the unpadded layout.
 fn layout_rows(layout: &Layout, vsa: Option<&VsaConfig>, split: DenoiserSplit) -> usize {
-    match vsa {
-        Some(vsa) => {
-            let tile = vsa.tile_rows as usize;
-            let tiles = packing::tiled_len(layout, vsa) / tile;
-            tiles.next_multiple_of(split.gather.size as usize) * tile
-        }
-        None => packing::dense_len(layout, split.sequence().size),
+    let Some(vsa) = vsa else {
+        return packing::dense_len(layout, split.sequence().size);
+    };
+
+    // One whole tile of every all-gather interval, and one whole block of every rank.
+    let step = split.gather.size as usize * vsa.tile_rows as usize;
+    let blocks = split.sequence().size as usize * functional::VSA_BLOCK_ROWS as usize;
+
+    // The steps reach a common multiple of both within `blocks` of them.
+    let mut rows = packing::tiled_len(layout, vsa).next_multiple_of(step);
+    while !rows.is_multiple_of(blocks) {
+        rows += step;
     }
+    rows
 }
 
 impl nn::Denoiser for Denoiser {
@@ -713,8 +729,8 @@ impl Denoiser {
                         layout.text_rows, layout.condition_rows
                     )));
                 }
-                // Each all-gather interval holds whole tiles, the tiles past the layout's own
-                // padding.
+                // Each all-gather interval holds whole tiles and each rank whole kernel blocks:
+                // the empty tiles past the layout's own padding (`layout_rows`).
                 let tiled = packing::tiled_rows(request, &layout, vsa)?;
                 let padded = layout_rows(&layout, Some(vsa), self.split);
                 match padded.saturating_sub(tiled.elem_count()) {

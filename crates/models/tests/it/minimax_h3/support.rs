@@ -4,6 +4,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
+use nn::family::DenoiserSplit;
 use nn::{DType, Device, Shape, Tensor};
 
 /// The format's name for an element type: the header states the name, not a number.
@@ -191,6 +192,43 @@ pub(crate) type Recording = (Vec<(&'static str, String)>, u64);
 /// the context's [`Recording`].
 pub(crate) fn recorded<T, E>(forward: impl FnOnce() -> Result<T, E>) -> (Result<T, E>, Recording) {
     let context = ops::Context::meta(None);
+    context.record_launches();
+
+    let output = {
+        let _guard = context.enter();
+        forward()
+    };
+    let launches = context
+        .take_launches()
+        .into_iter()
+        .map(|(operator, key, ..)| (operator, key))
+        .collect();
+
+    (output, (launches, context.peak()))
+}
+
+/// [`recorded`], with the context stating this rank's place on each axis of `sequence`'s
+/// partition, in the order the denoiser addresses them (`nn::family::ULYSSES_AXIS` and after).
+pub(crate) fn recorded_at<T>(
+    sequence: DenoiserSplit,
+    forward: impl FnOnce() -> nn::Result<T>,
+) -> (nn::Result<T>, Recording) {
+    if sequence == DenoiserSplit::WHOLE {
+        return recorded(forward);
+    }
+
+    let context = ops::Context::meta(None);
+    let axes = [
+        sequence.ulysses.split,
+        sequence.gather,
+        sequence.tensor,
+        sequence.layers,
+    ]
+    .map(|place| match place.size {
+        1 => (None, 0, 0),
+        size => (None, u64::from(place.rank), u64::from(size)),
+    });
+    context.set_axes(axes.to_vec()).unwrap();
     context.record_launches();
 
     let output = {

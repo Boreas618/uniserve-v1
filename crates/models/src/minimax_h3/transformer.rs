@@ -513,9 +513,11 @@ impl Block {
         }
 
         // Every rank's rows of this rank's heads leave in intervals of each owner's rows, one
-        // exchange after another.
+        // exchange after another. The composition folds one tile's compression into each kernel
+        // block of an owner's rows, so the intervals are whole blocks of rows the layout made
+        // whole blocks on every rank.
         let slots: Vec<u32> = (0..split.size).collect();
-        let unit = vsa.tile_rows() as usize / split.size as usize;
+        let unit = functional::VSA_BLOCK_ROWS as usize;
         let mut returning = Vec::new();
         for interval in UlyssesAttention::intervals(own, unit) {
             let payload = vsa.compose(&fine, &compressed, &gate, interval.clone(), &slots)?;

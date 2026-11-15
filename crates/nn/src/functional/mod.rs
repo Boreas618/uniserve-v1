@@ -99,8 +99,8 @@ pub use sampling::{
 };
 pub use sparse::sparse_attention;
 pub use vsa::{
-    vsa_add_gated_tiles_, vsa_compose_gated_rows, vsa_compress_pooled, vsa_prepare_tiles_,
-    vsa_scores, vsa_select_tiles, vsa_zero_padding_,
+    VSA_BLOCK_ROWS, vsa_add_gated_tiles_, vsa_compose_gated_rows, vsa_compress_pooled,
+    vsa_prepare_tiles_, vsa_scores, vsa_select_tiles, vsa_zero_padding_,
 };
 
 /// Whether the descriptors this crate builds are the programmatic-dependent-launch variants.

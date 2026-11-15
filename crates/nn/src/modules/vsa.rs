@@ -392,7 +392,9 @@ impl VsaAttention {
     /// `fine` and `gate` hold every member's rows of this member's heads,
     /// `[members · owner rows, heads · head_dim]`; `rows` is the interval of each owner's rows
     /// the result carries, and `slots` the block each member's rows land in, in member order.
-    /// The result is `[members, rows.len(), heads, head_dim]`.
+    /// The result is `[members, rows.len(), heads, head_dim]`. On the device the owner rows and
+    /// the interval are whole [`functional::VSA_BLOCK_ROWS`]-row blocks, which the sequence's
+    /// layout provides.
     ///
     /// # Errors
     ///
