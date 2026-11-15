@@ -187,8 +187,6 @@ def test_every_row_lands_bit_for_bit_and_the_rest_stay(
 
 @pytest.mark.gpu
 def test_a_dependent_launch_reads_what_its_producer_wrote(kernel_source):
-    if not chain.supported():
-        pytest.skip("this device compiles no dependent launch")
     torch.manual_seed(0)
     kernels = kernel_source("rows")
     count, columns = 8, BLOCK

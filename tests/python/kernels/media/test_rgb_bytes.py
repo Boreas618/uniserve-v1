@@ -240,8 +240,6 @@ def test_every_element_type_matches_the_exact_bytes(
 
 @pytest.mark.gpu
 def test_a_dependent_launch_reads_what_its_producer_wrote(kernel_source):
-    if not chain.supported():
-        pytest.skip("this device compiles no dependent launch")
     torch.manual_seed(0)
     kernels = kernel_source("rgb_bytes")
     channels, frames, rows, columns, block = 3, 2, 16, 32, 256

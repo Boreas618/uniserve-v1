@@ -277,8 +277,6 @@ def test_the_tensor_core_product_meets_its_bound(
 
 @pytest.mark.gpu
 def test_a_dependent_launch_reads_what_its_producer_wrote(kernel_source):
-    if not chain.supported():
-        pytest.skip("this device compiles no dependent launch")
     torch.manual_seed(0)
     kernels = kernel_source("vsa_compress_pooled")
     shape = {

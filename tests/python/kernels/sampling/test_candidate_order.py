@@ -268,8 +268,6 @@ def test_the_built_module_ranks_every_row_by_token_id(kernel_module):
 
 @pytest.mark.gpu
 def test_a_dependent_launch_reads_what_its_producer_wrote(kernel_source):
-    if not chain.supported():
-        pytest.skip("this device compiles no dependent launch")
     torch.manual_seed(0)
     kernels = kernel_source("candidate_order")
     rows, width = 4, 300

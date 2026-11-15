@@ -160,8 +160,6 @@ def test_every_threshold_drops_exactly_its_candidates(
 
 
 def test_a_dependent_launch_reads_what_its_producer_wrote(kernel_source):
-    if not chain.supported():
-        pytest.skip("this device compiles no dependent launch")
     torch.manual_seed(0)
     kernels = kernel_source("filter_candidates")
     rows, width = 4, 1024

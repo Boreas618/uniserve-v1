@@ -180,8 +180,6 @@ def test_every_row_keeps_its_largest_logits_lower_id_first(
 
 @pytest.mark.gpu
 def test_a_dependent_launch_reads_what_its_producer_wrote(kernel_source):
-    if not chain.supported():
-        pytest.skip("this device compiles no dependent launch")
     torch.manual_seed(0)
     kernels = kernel_source("top_k")
     rows, vocabulary, width = 4, 8192, 64

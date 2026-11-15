@@ -139,8 +139,6 @@ def test_every_row_keeps_its_largest_entries_in_order(
 
 @pytest.mark.gpu
 def test_a_dependent_launch_reads_what_its_producer_wrote(kernel_source):
-    if not chain.supported():
-        pytest.skip("this device compiles no dependent launch")
     torch.manual_seed(0)
     kernels = kernel_source("top_logprobs")
     rows, width, tile, candidates = 4, 4096, 1024, 8

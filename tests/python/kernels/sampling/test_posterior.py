@@ -151,8 +151,6 @@ def test_the_sample_is_the_chain_and_the_recorded_bits(
 
 @pytest.mark.gpu
 def test_a_dependent_launch_reads_what_its_producer_wrote(kernel_source):
-    if not chain.supported():
-        pytest.skip("this device compiles no dependent launch")
     torch.manual_seed(0)
     kernels = kernel_source("posterior")
     positions, channels, block = 64, 16, 256

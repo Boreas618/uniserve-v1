@@ -547,8 +547,6 @@ def launch(kernels, inputs, outputs, columns, block, pdl):
 
 @pytest.mark.gpu
 def test_a_dependent_launch_reads_what_its_producer_wrote(kernel_source):
-    if not chain.supported():
-        pytest.skip("this device compiles no dependent launch")
     torch.manual_seed(0)
     kernels = kernel_source("nvfp4_quantize")
     rows, columns, block = 16, 2048, 64

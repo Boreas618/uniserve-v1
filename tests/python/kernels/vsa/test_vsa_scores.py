@@ -161,8 +161,6 @@ def test_every_score_is_within_the_operators_bound(
 
 @pytest.mark.gpu
 def test_a_dependent_launch_reads_what_its_producer_wrote(kernel_source):
-    if not chain.supported():
-        pytest.skip("this device compiles no dependent launch")
     torch.manual_seed(0)
     kernels = kernel_source("vsa_scores")
     heads, width, block, query_tiles, key_tiles = 4, 64, 64, 32, 48

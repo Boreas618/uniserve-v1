@@ -8,9 +8,9 @@ producer that releases its dependent at once and writes the operator's inputs
 only after a delay, so an operator that reads before it waits computes from
 the inputs' previous contents. An operator's check module runs its case
 through :func:`check` in a test marked `gpu` and asserts that no round
-differed; a family whose checks are scripts runs its cases from its
-`pdl_chain_check.py` through :func:`main`, which imports the operators'
-sources with :func:`source`.
+differed. Every target the Build Server describes launches dependently
+(its target description's `dependent_launch`), so a device a module is built
+for runs the case.
 
 A case states one operator: the inputs it reads, the buffers it writes (with
 their starting contents, since some operators read them too) and a launch. The
@@ -23,19 +23,11 @@ every round.
 from __future__ import annotations
 
 import dataclasses
-import importlib
-import pathlib
-import sys
 from collections.abc import Callable
 
 import torch
 import triton
 import triton.language as tl
-
-#: The kernel packages' root.
-KERNELS = (
-    pathlib.Path(__file__).resolve().parents[3] / "crates" / "ops" / "kernels"
-)
 
 #: The producer's delay before it writes, in nanoseconds of the global timer:
 #: long enough that a dependent which does not wait reads its inputs first.
@@ -110,20 +102,6 @@ class Case:
     inputs: dict[str, torch.Tensor]
     outputs: dict[str, torch.Tensor]
     launch: Callable[[dict, dict, bool], list[torch.Tensor]]
-
-
-def source(op: str):
-    """The Triton source module of operator `op`'s package."""
-    sys.path.insert(0, str(KERNELS / op / "triton" / "src"))
-    return importlib.import_module(op)
-
-
-def supported() -> bool:
-    """Whether the device has the dependent launch the packages compile for.
-
-    The packages compile a dependent launch for Blackwell targets only.
-    """
-    return torch.cuda.get_device_capability()[0] >= 10
 
 
 def _arena(
@@ -210,17 +188,3 @@ def check(case: Case) -> int:
         "after a synchronization"
     )
     return failures
-
-
-def main(cases: dict[str, Callable[[], Case]]) -> int:
-    """A family check's command line: `--op <name>` runs that case."""
-    import argparse
-
-    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    parser.add_argument("--op", required=True, choices=sorted(cases))
-    arguments = parser.parse_args()
-    if not supported():
-        print(f"{arguments.op}: this device compiles no dependent launch")
-        return 0
-    torch.manual_seed(0)
-    return 1 if check(cases[arguments.op]()) else 0

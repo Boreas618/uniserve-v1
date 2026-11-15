@@ -245,8 +245,6 @@ def test_every_channel_matches_the_four_tap_sum(
 
 @pytest.mark.gpu
 def test_a_dependent_launch_reads_what_its_producer_wrote(kernel_source):
-    if not chain.supported():
-        pytest.skip("this device compiles no dependent launch")
     torch.manual_seed(SEED)
     kernels = kernel_source("position_interpolate")
     side, points, channels, block = 16, 64, 64, 64

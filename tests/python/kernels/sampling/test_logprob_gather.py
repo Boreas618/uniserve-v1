@@ -133,8 +133,6 @@ def test_every_row_reports_its_token_and_rank(
 
 @pytest.mark.gpu
 def test_a_dependent_launch_reads_what_its_producer_wrote(kernel_source):
-    if not chain.supported():
-        pytest.skip("this device compiles no dependent launch")
     torch.manual_seed(0)
     kernels = kernel_source("logprob_gather")
     rows, columns = 8, 1024

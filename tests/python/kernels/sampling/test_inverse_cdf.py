@@ -169,8 +169,6 @@ def test_every_draw_lands_on_the_lowest_id_it_reaches(
 
 @pytest.mark.gpu
 def test_a_dependent_launch_reads_what_its_producer_wrote(kernel_source):
-    if not chain.supported():
-        pytest.skip("this device compiles no dependent launch")
     torch.manual_seed(0)
     kernels = kernel_source("inverse_cdf")
     rows, width, tile = 4, 16384, 8192

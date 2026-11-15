@@ -98,8 +98,6 @@ def test_every_selected_row_is_copied(case, dtype, torch_device, kernel_source):
 
 @pytest.mark.gpu
 def test_a_dependent_launch_reads_what_its_producer_wrote(kernel_source):
-    if not chain.supported():
-        pytest.skip("this device compiles no dependent launch")
     torch.manual_seed(0)
     kernels = kernel_source("logits_gather")
     count, columns = 8, 1024

@@ -377,8 +377,6 @@ def test_the_fp8_encoder_meets_the_format_edges(torch_device, kernel_source):
 
 @pytest.mark.gpu
 def test_a_dependent_launch_reads_what_its_producer_wrote(kernel_source):
-    if not chain.supported():
-        pytest.skip("this device compiles no dependent launch")
     torch.manual_seed(0)
     kernels = kernel_source("cache_copy_region")
     # A page of an FP8 pool: `columns` layer planes per unit, each

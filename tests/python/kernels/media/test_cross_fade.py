@@ -267,8 +267,6 @@ def test_a_seam_read_from_strided_rasters_blends_bit_for_bit(
 
 @pytest.mark.gpu
 def test_a_dependent_launch_reads_what_its_producer_wrote(kernel_source):
-    if not chain.supported():
-        pytest.skip("this device compiles no dependent launch")
     torch.manual_seed(0)
     kernels = kernel_source("cross_fade")
     shape, extent, axis, block = (3, 4, 16, 32), 8, 2, 256

@@ -128,8 +128,6 @@ def test_every_real_column_is_copied(case, dtype, torch_device, kernel_source):
 
 @pytest.mark.gpu
 def test_a_dependent_launch_reads_what_its_producer_wrote(kernel_source):
-    if not chain.supported():
-        pytest.skip("this device compiles no dependent launch")
     torch.manual_seed(0)
     kernels = kernel_source("vocab_unpad")
     rows, padded, vocabulary, ranks = 4, 1024, 1000, 2
