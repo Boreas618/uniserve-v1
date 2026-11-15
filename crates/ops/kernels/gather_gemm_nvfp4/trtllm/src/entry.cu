@@ -1,258 +1,91 @@
 // SPDX-License-Identifier: Apache-2.0
 
-// The gather_gemm_nvfp4 entry: the operator's call, checked against the geometry this
-// module was compiled for, handed to trtllm-gen's routed block-scaled first matrix.
-//
-// What the entry owns: the checks that turn a misplaced operand into a message (the
-// compiled geometry, the operand dtypes, the scratch floor), the per-call tactic
-// choice, and the two device words the product reads -- the padded route count the
-// GEMM bounds its M by. What it does not own: any arithmetic. The product is the
-// artifact's, and everything the call states is either its geometry or an operand.
+// The gather_gemm_nvfp4 entry: trtllm-gen's routed block-scaled first matrix, fused with the gated
+// activation, behind the routed products' shared entry (`uniserve_trtllm/routed_gemm.h`). This
+// unit states what is the first matrix's own: its runner, the rows it sizes its tactics by (the
+// tokens it gathers), the counts a call must satisfy and the operands the runner takes.
 
 #include "entry.h"
 
-#include <cuda.h>
-#include <cuda_runtime.h>
+#include <uniserve_trtllm/routed_gemm.h>
 
-#include <cstdio>
-#include <cstring>
-#include <exception>
-
-#include "flashinfer/trtllm/fused_moe/runner.h"
-
-#include <uniserve_trtllm/cubins.h>
-
-
-// The compiled geometry, stated by the build from the descriptor's own values.
-#ifndef UNISERVE_HIDDEN
-#error "UNISERVE_HIDDEN is not defined; the build states the descriptor's geometry"
-#endif
-#ifndef UNISERVE_INTERMEDIATE
-#error "UNISERVE_INTERMEDIATE is not defined"
-#endif
-#ifndef UNISERVE_EXPERTS
-#error "UNISERVE_EXPERTS is not defined"
-#endif
-#ifndef UNISERVE_TOP
-#error "UNISERVE_TOP is not defined"
-#endif
 #ifndef UNISERVE_GELU_TANH
 #error "UNISERVE_GELU_TANH is not defined; the build states the descriptor's activation"
-#endif
-#ifndef UNISERVE_TILE_TOKENS
-#error "UNISERVE_TILE_TOKENS is not defined"
 #endif
 
 namespace {
 
-namespace btg = batchedGemm::trtllm::gen;
-using ActivationType = tensorrt_llm::kernels::trtllmgen_moe::MoE::ActivationType;
-using Product = tensorrt_llm::kernels::trtllmgen_moe::PermuteGemm1::Runner;
+namespace routed = uniserve::trtllm::routed;
 
-constexpr int32_t kHidden = UNISERVE_HIDDEN;
-constexpr int32_t kIntermediate = UNISERVE_INTERMEDIATE;
-constexpr int32_t kExperts = UNISERVE_EXPERTS;
-constexpr int32_t kTop = UNISERVE_TOP;
-constexpr int32_t kTileTokens = UNISERVE_TILE_TOKENS;
+using ActivationType = tensorrt_llm::kernels::trtllmgen_moe::MoE::ActivationType;
 
 // The fused gated epilogue the descriptor's `activation` names, which the build states as
-// `UNISERVE_GELU_TANH`. The artifact calls `silu(gate) · up` Swiglu and `gelu_tanh(gate) · up`
+// `UNISERVE_GELU_TANH`. The library calls `silu(gate) · up` Swiglu and `gelu_tanh(gate) · up`
 // Geglu, and the kernels the build published are the same activation's.
 constexpr ActivationType kActivation =
     UNISERVE_GELU_TANH ? ActivationType::Geglu : ActivationType::Swiglu;
 
-//: The dense half of the E2M1 kernels' block scales: this module serves the
-//: artifact's variants whose *weight* scales are the plain `[experts, rows, columns/16]`
-//: table. The 8x4-tiled variants are a different shard layout and a different
-//: descriptor, and a module built for one may not read the other.
-constexpr batchedGemm::gemm::MatrixLayout kWeightLayout =
-    batchedGemm::gemm::MatrixLayout::MajorK;
+struct FirstMatrix {
+  using Runner = tensorrt_llm::kernels::trtllmgen_moe::PermuteGemm1::Runner;
+  using Call = uniserve_gather_gemm_nvfp4_call;
 
-/// The runner, built once per process from the compiled geometry.
-///
-/// The kernels must be read in their block-swizzled form (`useShuffledMatrix`): the
-/// loader states the shard's layout and refuses a plain one, so by the time a call
-/// arrives the operand is the layout the kernels index.
-Product& runner() {
-  static Product one(
-      /*dtypeAct=*/btg::Dtype::E2m1,
-      /*dtypeWeights=*/btg::Dtype::E2m1,
-      /*dtypeOutput=*/btg::Dtype::Bfloat16,
-      /*useDeepSeekFp8=*/false,
-      /*tileTokensDim=*/kTileTokens,
-      /*activationType=*/kActivation,
-      /*useShuffledMatrix=*/true,
-      /*weight_layout=*/kWeightLayout,
-      // The operator has no bias, and `None` is the only bias type the artifact's cubins and the
-      // runner can agree on: the runner's options hardcode the bias dtype to BF16 while every
-      // gated BF16-output cubin in this artifact is `biasFp32M`, so a bias kernel can never match.
-      // With `None` the runner skips the bias checks and accepts a null pointer (its own words:
-      // "we can pass nullptr bias to get biasType::None for any bias kernel"), which is exactly
-      // what this bias-free operator passes.
-      /*biasType=*/batchedGemm::gemm::BiasType::None,
-      // The artifact's FP4 kernels read the encoder's per-token factor beside the block scales.
-      /*usePerTokenScaling=*/true,
-      /*usePerChannelScaling=*/false);
-  return one;
-}
-
-int refuse(uniserve_gather_gemm_nvfp4_call* call, char const* message) {
-  std::snprintf(call->error, sizeof(call->error), "%s", message);
-  return 1;
-}
-
-/// Refuse a call whose geometry is not the one this module was compiled for.
-///
-/// The tactic is compiled in: the tiles, the cluster and the epilogue belong to the
-/// cubins this module published, so a call of another shape would be read by a
-/// kernel addressing rows and columns it does not have.
-int check_geometry(uniserve_gather_gemm_nvfp4_call const* call) {
-  struct Expected {
-    char const* name;
-    int64_t found;
-    int64_t expected;
-  };
-  for (Expected const& one :
-       {Expected{"hidden", call->hidden_size, kHidden},
-        Expected{"intermediate", call->intermediate, kIntermediate},
-        Expected{"experts", call->experts, kExperts}}) {
-    if (one.found != one.expected) {
-      return 1;
-    }
+  // The runner, built once per process from the compiled geometry.
+  //
+  // The kernels must be read in their block-swizzled form (`useShuffledMatrix`): the loader states
+  // the shard's layout and refuses a plain one, so by the time a call arrives the operand is the
+  // layout the kernels index.
+  static Runner& runner() {
+    static Runner one(
+        /*dtypeAct=*/routed::btg::Dtype::E2m1,
+        /*dtypeWeights=*/routed::btg::Dtype::E2m1,
+        /*dtypeOutput=*/routed::btg::Dtype::Bfloat16,
+        /*useDeepSeekFp8=*/false,
+        /*tileTokensDim=*/routed::kTileTokens,
+        /*activationType=*/kActivation,
+        /*useShuffledMatrix=*/true,
+        /*weight_layout=*/routed::kWeightLayout,
+        // The operator has no bias, and `None` is the only bias type the library's cubins and the
+        // runner can agree on: the runner's options hardcode the bias dtype to BF16 while every
+        // gated BF16-output cubin in this library is `biasFp32M`, so a bias kernel can never match.
+        // With `None` the runner skips the bias checks and accepts a null pointer (its own words:
+        // "we can pass nullptr bias to get biasType::None for any bias kernel"), which is exactly
+        // what this bias-free operator passes.
+        /*biasType=*/batchedGemm::gemm::BiasType::None,
+        // The library's FP4 kernels read the encoder's per-token factor beside the block scales.
+        /*usePerTokenScaling=*/true,
+        /*usePerChannelScaling=*/false);
+    return one;
   }
-  if (call->top > kTop || call->top <= 0) {
-    return 1;
-  }
-  if (call->tokens <= 0 || call->routes < call->tokens * call->top) {
-    return 1;
-  }
-  return 0;
-}
 
-/// The message for a refused geometry, filled only when there is one.
-int refuse_geometry(uniserve_gather_gemm_nvfp4_call* call) {
-  char message[512];
-  std::snprintf(message, sizeof(message),
-                "this module is compiled for hidden %d, intermediate %d, experts %d, top up to %d "
-                "and was handed hidden %lld, intermediate %lld, experts %lld, top %lld",
-                kHidden, kIntermediate, kExperts, kTop, static_cast<long long>(call->hidden_size),
-                static_cast<long long>(call->intermediate), static_cast<long long>(call->experts),
-                static_cast<long long>(call->top));
-  return refuse(call, message);
-}
+  // The first matrix's tactics are sized by the tokens it gathers.
+  static int32_t rows(Call const* call) { return static_cast<int32_t>(call->tokens); }
+
+  // Every token gathers its `top` routes.
+  static bool counts(Call const* call) {
+    return call->tokens > 0 && call->routes >= call->tokens * call->top;
+  }
+
+  static void run(Runner& runner, Call* call, routed::Problem const& problem,
+                  int32_t* padded_routes, void* workspace, int device, cudaStream_t order,
+                  int32_t config) {
+    runner.run(const_cast<void*>(call->hidden), const_cast<void*>(call->hidden_scale),
+               const_cast<void*>(call->weights), const_cast<void*>(call->scales),
+               const_cast<void*>(call->hidden_token_scale), /*perChannelScales=*/nullptr,
+               const_cast<float*>(static_cast<float const*>(call->global_scale)),
+               const_cast<float*>(static_cast<float const*>(call->global_scale_gate)),
+               /*bias=*/nullptr, /*gatedActAlpha=*/nullptr, /*gatedActBeta=*/nullptr,
+               /*clampLimit=*/nullptr, /*permutedIdxToBiasRowIdx=*/nullptr, call->out,
+               /*outputScale=*/nullptr, problem.top, problem.hidden, problem.intermediate,
+               problem.experts, problem.rows, const_cast<int32_t*>(call->permuted_to_token),
+               const_cast<int32_t*>(call->num_non_exiting_tiles), padded_routes,
+               const_cast<int32_t*>(call->tile_to_expert),
+               const_cast<int32_t*>(call->tile_to_limit), workspace,
+               /*useRoutingScalesOnInput=*/false, device, order, config, /*enable_pdl=*/false);
+  }
+};
 
 }  // namespace
 
-/// The launch itself: every check this entry makes, then the artifact's product.
-///
-/// It answers 0 or a refusal with `call->error` filled, and it may throw: the artifact's
-/// runner construction and its own `TLLM_CHECK`s raise `TllmException`, which is what the
-/// entry below turns into a message.
-int launch(uniserve_gather_gemm_nvfp4_call* call, void* stream) {
-  if (call == nullptr) {
-    return 1;
-  }
-  std::memset(call->error, 0, sizeof(call->error));
-  if (call == nullptr) {
-    return 1;
-  }
-  std::memset(call->error, 0, sizeof(call->error));
-  if (call->dtype != uniserve_dtype_bf16) {
-    return refuse(call, "the product's output is compiled as bf16 and this module is the bf16 one");
-  }
-  if (check_geometry(call) != 0) {
-    return refuse_geometry(call);
-  }
-  // The tiles the descriptor states are the ones the published cubins carry; a
-  // module whose tactic is another row/column tile is another module, and this is the
-  // refusal that says so rather than a launch into a shape mismatch.
-  if (call->tile_m != 128 || call->tile_n <= 0 || call->cluster_m <= 0 || call->cluster_n <= 0) {
-    return refuse(call, "the compiled tile is 128 rows by the descriptor's columns at a positive "
-                        "cluster; the call states another");
-  }
-
-  auto const top_k = static_cast<int32_t>(call->top);
-  auto const hidden = static_cast<int32_t>(call->hidden_size);
-  auto const intermediate = static_cast<int32_t>(call->intermediate);
-  auto const experts = static_cast<int32_t>(call->experts);
-  auto const tokens = static_cast<int32_t>(call->tokens);
-
-  Product& product = runner();
-  int32_t const config = product.getDefaultValidConfigIndex(top_k, hidden, intermediate, experts,
-                                                            tokens);
-  if (config < 0) {
-    return refuse(call, "no compiled tactic serves this problem's shape");
-  }
-  // The arming: the artifact's own requirement for the chosen tactic, plus the two
-  // device words this entry owns (the padded route count). A buffer shorter than that
-  // is refused with both numbers -- the caller sizes it from the bucket's route count
-  // (`nn::functional::moe`), and a step that grows one is a host allocation inside a
-  // captured graph.
-  size_t const required = product.getWorkspaceSizeInBytes(top_k, hidden, intermediate, experts,
-                                                          tokens, config);
-  // The scratch the entry owns: the padded route count (one i32), then the tactic's own. The
-  // bias table this entry used to zero is gone with `BiasType::None`: a null pointer is what the
-  // operator passes, and a table nothing reads is a buffer a capture would size for nothing.
-  size_t const bias_at = 16;
-  size_t const needed = bias_at + required;
-  if (static_cast<size_t>(call->workspace_bytes) < needed) {
-    char message[512];
-    std::snprintf(message, sizeof(message),
-                  "the product's tactic needs %zu bytes of scratch and the step provided %lld: the "
-                  "caller sizes this buffer, and the entry never grows one",
-                  needed, static_cast<long long>(call->workspace_bytes));
-    return refuse(call, message);
-  }
-
-  auto* seat = static_cast<unsigned char*>(call->workspace);
-  auto* total_num_padded_tokens = reinterpret_cast<int32_t*>(seat);
-  void* bmm_workspace = static_cast<void*>(seat + bias_at);
-  cudaStream_t const order = reinterpret_cast<cudaStream_t>(stream);
-  // The GEMM bounds its M by the padded route count, which is this call's own value: it
-  // is written on the stream, before the product, so the ordering is the stream's.
-  if (cuMemsetD32Async(reinterpret_cast<CUdeviceptr>(total_num_padded_tokens),
-                       static_cast<unsigned int>(call->routes), 1,
-                       reinterpret_cast<CUstream>(order)) != CUDA_SUCCESS) {
-    return refuse(call, "the padded route count could not be written on the call's stream");
-  }
-
-  int device = 0;
-  if (cudaGetDevice(&device) != cudaSuccess) {
-    return refuse(call, "the entry could not read the device the call runs on");
-  }
-
-  product.run(const_cast<void*>(call->hidden), const_cast<void*>(call->hidden_scale),
-              const_cast<void*>(call->weights), const_cast<void*>(call->scales),
-              const_cast<void*>(call->hidden_token_scale), /*perChannelScales=*/nullptr,
-              const_cast<float*>(static_cast<float const*>(call->global_scale)),
-              const_cast<float*>(static_cast<float const*>(call->global_scale_gate)),
-              /*bias=*/nullptr, /*gatedActAlpha=*/nullptr, /*gatedActBeta=*/nullptr,
-              /*clampLimit=*/nullptr, /*permutedIdxToBiasRowIdx=*/nullptr, call->out,
-              /*outputScale=*/nullptr, top_k, hidden, intermediate, experts, tokens,
-              const_cast<int32_t*>(call->permuted_to_token),
-              const_cast<int32_t*>(call->num_non_exiting_tiles), total_num_padded_tokens,
-              const_cast<int32_t*>(call->tile_to_expert), const_cast<int32_t*>(call->tile_to_limit),
-              bmm_workspace, /*useRoutingScalesOnInput=*/false, device, order, config,
-              /*enable_pdl=*/false);
-  return 0;
-}
-
-/// The operator's entry: the launch, and the artifact's exceptions turned into messages.
-///
-/// An exception raised inside the artifact's runner would otherwise cross this C boundary,
-/// where nothing may unwind: the process ends and the only message a log holds is the runtime's
-/// own (`internal error: entered unreachable code`), which names neither the operator nor the
-/// reason the artifact refused. A thrown `TllmException` states one, so it goes into the call's
-/// error buffer and the launch answers a refusal like every other one this entry makes.
 extern "C" int uniserve_gather_gemm_nvfp4(uniserve_gather_gemm_nvfp4_call* call, void* stream) {
-  if (call == nullptr) {
-    return 1;
-  }
-  try {
-    return launch(call, stream);
-  } catch (std::exception const& thrown) {
-    return refuse(call, thrown.what());
-  } catch (...) {
-    return refuse(call, "the artifact's launch failed without stating why");
-  }
+  return routed::entry<FirstMatrix>(call, stream);
 }

@@ -11,9 +11,10 @@ sources and imports what several packages compile from here:
   experts' grouped GEMMs (``gather_gemm`` and ``route_gemm``) share, which
   calls FlashInfer's pipelines and device functions;
 - ``include/``, C++ headers a native package's units include:
-  ``uniserve_cute_dsl.h``, what every CuTe DSL module's entry shares, and
+  ``uniserve_cute_dsl.h``, what every CuTe DSL module's entry shares;
   ``uniserve_trtllm/cubins.h``, the cubin loader and load entry of the modules
-  that launch trtllm-gen kernels.
+  that launch trtllm-gen kernels; and ``uniserve_trtllm/routed_gemm.h``, the
+  entry of the routed NVFP4 products, whose packages state what differs.
 
 The Build Server's environment installs this library and digests its files into
 every module's build identity (``uniserve_build_server.toolchain``).
