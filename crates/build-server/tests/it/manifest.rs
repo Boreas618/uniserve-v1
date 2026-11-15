@@ -554,6 +554,189 @@ fn a_native_module_names_its_launch_entry_and_any_lifecycle_entries() {
     );
 }
 
+/// A CUDA package that declares its compilation: a native module of two
+/// units whose definitions read the descriptor's fields and a parameter, and
+/// which links cuBLASLt.
+const DECLARED: &str = r#"
+op = "dense_attention"
+backend = "f32"
+interface_version = 1
+
+[source]
+kind = "cuda"
+
+[compile]
+units = ["src/entry.cpp", "src/dense.cu"]
+standard = "c++17"
+libraries = ["cublasLt"]
+host_contraction = false
+
+[compile.definitions]
+UNISERVE_CAUSAL = { field = "mask", values = { causal = 1, dense = 0 } }
+UNISERVE_SEQUENCES = { field = "cu_seq_lens", absent = true }
+UNISERVE_TILE = { parameter = "tile" }
+
+[[kernel.descriptors]]
+dimensions = { mask = ["causal", "dense"] }
+
+[[kernel.descriptors]]
+dimensions = { mask = ["causal", "dense"], cu_seq_lens = ["false"] }
+
+[parameters]
+tile = 64
+"#;
+
+/// The units [`DECLARED`] compiles.
+const DECLARED_FILES: [&str; 2] = ["src/entry.cpp", "src/dense.cu"];
+
+/// A CUDA package may declare its compilation instead of writing a build module: its units, the
+/// standard, the definitions bound to literals, fields and parameters, the libraries and its own
+/// options, which the manifest types; it then has no build module, and its native module still
+/// launches through its operator's entry.
+#[test]
+fn a_cuda_package_declares_its_compilation() {
+    use build_server::compile::{Library, Standard};
+
+    let manifest = load(DECLARED, &DECLARED_FILES).unwrap();
+    let compile = manifest.compile.as_ref().unwrap();
+    assert_eq!(compile.units, DECLARED_FILES);
+    assert_eq!(compile.standard, Standard::Cxx17);
+    assert_eq!(compile.libraries, [Library::CublasLt]);
+    assert!(!compile.host_contraction);
+    assert_eq!(compile.definitions.len(), 3);
+    assert!(compile.kernel.is_none());
+    assert!(!manifest.has_build_module());
+    assert_eq!(manifest.toolchain.kind, ToolchainKind::Nvcc);
+    assert_eq!(manifest.module.form, ModuleForm::Native);
+    assert_eq!(
+        manifest.module.entries.get("launch").map(String::as_str),
+        Some("uniserve_dense_attention")
+    );
+
+    // The host compiler's contraction is the default.
+    let contracted = load(
+        &DECLARED.replace("host_contraction = false\n", ""),
+        &DECLARED_FILES,
+    )
+    .unwrap();
+    assert!(contracted.compile.unwrap().host_contraction);
+}
+
+/// A declared compilation is refused when it reads a field no descriptor declares or a
+/// parameter the manifest lacks, names a unit the package lacks, a library the toolchain
+/// description does not state or no C identifier, sits beside a build module, or belongs to
+/// another source kind.
+#[test]
+fn a_declared_compilation_is_checked_against_its_package() {
+    let refused = |text: &str, files: &[&str], reason: &str| {
+        let error = load(text, files).unwrap_err();
+        assert!(error.contains(reason), "{reason}: {error}");
+    };
+    refused(
+        &DECLARED.replace(r#"field = "mask""#, r#"field = "window""#),
+        &DECLARED_FILES,
+        "window",
+    );
+    refused(
+        &DECLARED.replace(r#"parameter = "tile""#, r#"parameter = "rows""#),
+        &DECLARED_FILES,
+        "rows",
+    );
+    refused(DECLARED, &DECLARED_FILES[..1], "src/dense.cu");
+    refused(
+        DECLARED,
+        &["src/entry.cpp", "src/dense.cu", "src/build.py"],
+        "src/build.py",
+    );
+    refused(
+        &DECLARED.replace("UNISERVE_TILE =", "\"2TILE\" ="),
+        &DECLARED_FILES,
+        "no C identifier",
+    );
+    assert!(load(&DECLARED.replace("cublasLt", "cufft"), &DECLARED_FILES).is_err());
+    assert!(load(&DECLARED.replace("c++17", "c++98"), &DECLARED_FILES).is_err());
+    refused(
+        &DECLARED.replace("kind = \"cuda\"", "kind = \"cute_dsl\""),
+        &["src/entry.cpp", "src/dense.cu", "src/build.py"],
+        "only a CUDA source declares its compilation",
+    );
+}
+
+/// A cubin module's declared compilation states its kernel: its symbol, its warps and its
+/// signature in parameter order, from one unit and linking nothing; a native module's states no
+/// kernel.
+#[test]
+fn a_declared_cubin_states_its_kernel() {
+    let cubin = r#"
+op = "topk_softmax"
+backend = "nvcc"
+interface_version = 1
+
+[module]
+form = "cubin"
+
+[source]
+kind = "cuda"
+
+[compile]
+units = ["src/topk_softmax.cu"]
+standard = "c++20"
+definitions = { UNISERVE_EXPERTS = { field = "experts" }, UNISERVE_WARPS = { parameter = "warps" } }
+
+[compile.kernel]
+name = "uniserve_topk_softmax"
+warps = { parameter = "warps" }
+signature = [["scores", { pointer = "scores" }], ["rows", "i32"]]
+
+[[kernel.descriptors]]
+dimensions = { scores = ["bf16"], experts = { min = 1 } }
+
+[parameters]
+warps = 4
+"#;
+    let files = ["src/topk_softmax.cu"];
+    let manifest = load(cubin, &files).unwrap();
+    let kernel = manifest.compile.as_ref().unwrap().kernel.as_ref().unwrap();
+    assert_eq!(kernel.name, "uniserve_topk_softmax");
+    let names: Vec<&str> = kernel
+        .signature
+        .iter()
+        .map(|(name, _)| name.as_str())
+        .collect();
+    assert_eq!(names, ["scores", "rows"], "the kernel's parameter order");
+    assert_eq!(manifest.module.metadata.as_deref(), Some("metadata.json"));
+
+    let refused = |text: &str, reason: &str| {
+        let error = load(text, &files).unwrap_err();
+        assert!(error.contains(reason), "{reason}: {error}");
+    };
+    refused(
+        &cubin.replace(r#"pointer = "scores""#, r#"pointer = "dtype""#),
+        "dtype",
+    );
+    refused(
+        &cubin.replace("[module]\nform = \"cubin\"\n", ""),
+        "[compile.kernel]",
+    );
+    refused(
+        &cubin.replace(r#"["rows", "i32"]"#, r#"["scores", "i32"]"#),
+        "twice",
+    );
+    refused(
+        &cubin.replace(
+            "standard = \"c++20\"",
+            "standard = \"c++20\"\nlibraries = [\"cuda\"]",
+        ),
+        "links no library",
+    );
+    let uncompiled = cubin.replace(
+        r#"units = ["src/topk_softmax.cu"]"#,
+        r#"units = ["src/topk_softmax.cu", "src/other.cu"]"#,
+    );
+    let error = load(&uncompiled, &["src/topk_softmax.cu", "src/other.cu"]).unwrap_err();
+    assert!(error.contains("one translation unit"), "{error}");
+}
+
 /// The manifest of an engine package with the `[source]` lines `source` and
 /// the `kernel` section: it states neither its interface version, which its
 /// executable states, nor its compiler release, which its workspace's

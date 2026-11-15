@@ -9,7 +9,8 @@ builds is a function of the request and of the files the request names.
 
 - the package: its operator and backend, its installed root, its source kind,
   the module the compilation imports (a Triton package's kernel module, or the
-  build module ``src/build.py``) and a Triton package's launch table;
+  build module ``src/build.py``), a Triton package's launch table and a CUDA
+  package's declared compilation;
 - the descriptor: its key and the fields the Build Server read out of the key
   against the package's declared dimensions, each typed as its dimension
   declares it (``Descriptors::typed_fields`` in
@@ -116,10 +117,15 @@ class Request:
     source: str
     #: The module the compilation imports from the package's source directory,
     #: its working directory: a Triton package's kernel module ``<op>``, or the
-    #: build module ``build``.
-    module: str
+    #: build module ``build``; ``None`` for a CUDA package's declared
+    #: compilation, which imports nothing of the package.
+    module: str | None
     #: A Triton package's launch table (``crates/build-server/src/launch.rs``).
     launch: dict[str, Any] | None
+    #: A CUDA package's declared compilation (``[compile]``,
+    #: ``crates/build-server/src/compile.rs``), which
+    #: :mod:`uniserve_build_server.cuda` runs.
+    compile: dict[str, Any] | None
     #: A native module's C entry symbols by role, as the manifest resolves
     #: them: ``launch`` is the operator's ``uniserve_<op>`` unless the manifest
     #: names another.

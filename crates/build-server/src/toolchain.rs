@@ -4,8 +4,8 @@
 //! guessing a path:
 //!
 //! - **Its Python environment** (`python/`, locked by `python/uv.lock`), which
-//!   holds the Triton and CuTe DSL compilers and describes the CUDA toolkit and
-//!   the host C++ compiler it resolved. The server runs the environment's
+//!   holds the Triton and CuTe DSL compilers and describes the CUDA toolkit,
+//!   cuDNN and the host C++ compiler it resolved. The server runs the environment's
 //!   program, `uniserve-build-server toolchain --json`, from its search path
 //!   once when it starts and keeps the description ([`Report`]): the versions,
 //!   the environment's distributions, its interpreter and the digest of its
@@ -81,6 +81,17 @@ pub struct Cuda {
     pub stubs: PathBuf,
 }
 
+/// The cuDNN the environment resolved: the host distribution package of the
+/// release its lock fixes, on the default search paths.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Cudnn {
+    /// The headers' release, such as `9.12.0`.
+    pub version: String,
+    pub include: PathBuf,
+    pub lib: PathBuf,
+}
+
 /// The toolchain description `uniserve-build-server toolchain --json` prints
 /// (`uniserve_build_server.toolchain.Toolchain`), which a compilation is
 /// handed back in its request.
@@ -99,6 +110,7 @@ pub struct Report {
     pub triton: Entry<String>,
     pub cute_dsl: Entry<String>,
     pub cuda: Entry<Cuda>,
+    pub cudnn: Entry<Cudnn>,
     pub host_compiler: Entry<PathBuf>,
 }
 
@@ -147,8 +159,8 @@ impl Report {
 
     /// What a module built through this environment is built by, as one line:
     /// the compile driver's digest, the digest of the kernel packages' shared
-    /// sources, the version of every compiler the environment describes, and
-    /// the digest of the locked distributions
+    /// sources, the version of every compiler and library the environment
+    /// describes, and the digest of the locked distributions
     /// ([`Self::distributions_digest`]). A build module may use any of them (a
     /// CuTe DSL kernel linked by nvcc, FlashInfer's sources), so a change of
     /// any is another identity.
@@ -161,8 +173,13 @@ impl Report {
             Entry::Available(cuda) => cuda.version.clone(),
             Entry::Missing(_) => "none".to_owned(),
         };
+        let cudnn = match &self.cudnn {
+            Entry::Available(cudnn) => cudnn.version.clone(),
+            Entry::Missing(_) => "none".to_owned(),
+        };
         format!(
-            "driver {}; kernels {}; triton {}; cute_dsl {}; cuda {cuda}; distributions {}",
+            "driver {}; kernels {}; triton {}; cute_dsl {}; cuda {cuda}; cudnn {cudnn}; \
+             distributions {}",
             self.driver,
             entry(&self.kernels),
             entry(&self.triton),
@@ -472,6 +489,9 @@ mod tests {
             "cuda": {"available": {
                 "version": "13.0.48", "root": "/cuda", "nvcc": "/cuda/bin/nvcc",
                 "include": "/cuda/include", "lib": "/cuda/lib", "stubs": "/cuda/lib/stubs"
+            }},
+            "cudnn": {"available": {
+                "version": "9.12.0", "include": "/usr/include", "lib": "/usr/lib"
             }},
             "host_compiler": {"missing": "no c++ on this host's search path"}
         }))

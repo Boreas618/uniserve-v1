@@ -5,9 +5,9 @@
 //! what is particular to the package:
 //!
 //! - the operator and backend names, and the interface version it implements;
-//! - the kind of source (a Triton kernel with its launch table, CUDA C++ or
-//!   CuTe DSL with a build module, a vendor cubin, a crate cargo builds, an
-//!   executable);
+//! - the kind of source (a Triton kernel with its launch table, CUDA C++ with
+//!   its declared compilation or a build module, CuTe DSL with a build module,
+//!   a vendor cubin, a crate cargo builds, an executable);
 //! - what it requires of a target, and the descriptors it covers;
 //! - its parameters and their defaults, and its tuning data;
 //! - and only where it differs from what its source kind fixes: the toolchain,
@@ -19,8 +19,10 @@
 //! locks, recorded in every revision's build inputs, so no package restates a
 //! version. A source kind fixes its module's form (a Triton kernel is a cubin
 //! with `metadata.json`, a CuTe DSL or CUDA package a native library whose
-//! launch entry is `uniserve_<op>`), its build module (`src/build.py`) and the
-//! entry unit of a CuTe DSL module (`src/entry.cpp`). The targets a package
+//! launch entry is `uniserve_<op>`), the build module of a package whose
+//! compilation is code (`src/build.py`: a CuTe DSL package's, and a CUDA
+//! package's that declares no `[compile]`) and the entry unit of a CuTe DSL
+//! module (`src/entry.cpp`). The targets a package
 //! builds for are every GPU target of the Build Server's description that
 //! meets the package's requirements (`crate::target`), so no package names a
 //! GPU.
@@ -37,6 +39,7 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
+use crate::compile::Compile;
 use crate::launch::Launch;
 use crate::target::Requirement;
 
@@ -88,8 +91,11 @@ pub enum ModuleForm {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SourceKind {
-    /// CUDA C++: the build module [`BUILD_MODULE`]'s `compile(request)` is the
-    /// whole compilation, to a cubin or a native library.
+    /// CUDA C++, to a cubin or a native library: the manifest's declared
+    /// compilation ([`Compile`]), which the CUDA driver runs, or, for a
+    /// compilation computed from what the package compiles against, the build
+    /// module [`BUILD_MODULE`]'s `compile(request)`, which calls the same
+    /// driver's routines.
     Cuda,
     /// Triton through `triton.compile`, which writes a cubin and its
     /// metadata JSON (design section 5.3): the manifest's launch table
@@ -118,13 +124,6 @@ impl SourceKind {
     /// Whether the source is compiled by the Python environment.
     pub fn compiled_by_module(self) -> bool {
         matches!(self, Self::Cuda | Self::Triton | Self::CuteDsl)
-    }
-
-    /// Whether the source's compilation is a build module the package writes
-    /// ([`BUILD_MODULE`]): CUDA C++ and CuTe DSL. A Triton source's is its
-    /// launch table, which the Triton driver compiles.
-    pub fn has_build_module(self) -> bool {
-        matches!(self, Self::Cuda | Self::CuteDsl)
     }
 
     /// The toolchain a source of this kind builds with unless its manifest
@@ -757,6 +756,9 @@ pub struct Manifest {
     /// A Triton package's launch table.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub launch: Option<Launch>,
+    /// A CUDA package's declared compilation.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub compile: Option<Compile>,
     /// The kernel package's requirements and descriptors. A scheduling policy
     /// has no kernel package: it requires nothing of a GPU and has one key,
     /// [`SINGLE_KEY`]; neither does the engine.
@@ -788,6 +790,8 @@ struct Declared {
     source: SourceSpec,
     #[serde(default)]
     launch: Option<Launch>,
+    #[serde(default)]
+    compile: Option<Compile>,
     #[serde(default)]
     kernel: Option<KernelSpec>,
     #[serde(default)]
@@ -841,6 +845,7 @@ impl TryFrom<Declared> for Manifest {
             },
             source,
             launch: declared.launch,
+            compile: declared.compile,
             kernel: declared.kernel,
             parameters: declared.parameters,
             tuning: declared.tuning,
@@ -969,21 +974,7 @@ impl Manifest {
                     )));
                 }
                 if launch.derive.is_none() {
-                    let declared: Vec<&String> = self
-                        .descriptors()
-                        .iter()
-                        .flat_map(|shape| shape.dimensions.keys())
-                        .collect();
-                    let unknown: Vec<&str> = launch
-                        .fields()
-                        .into_iter()
-                        .filter(|field| !declared.iter().any(|name| name == field))
-                        .collect();
-                    if !unknown.is_empty() {
-                        return Err(ManifestError::Invalid(format!(
-                            "the launch table reads fields no descriptor declares: {unknown:?}"
-                        )));
-                    }
+                    self.check_fields("the launch table", launch.fields())?;
                 }
             }
             (_, Some(_)) => {
@@ -994,9 +985,19 @@ impl Manifest {
             }
             (_, None) => {}
         }
-        if self.source.unit.is_some() && !self.source.kind.has_build_module() {
+        match (self.source.kind, &self.compile) {
+            (SourceKind::Cuda, Some(compile)) => self.check_compile(root, compile)?,
+            (_, Some(_)) => {
+                return Err(ManifestError::Invalid(format!(
+                    "only a CUDA source declares its compilation in [compile], not a {:?} one",
+                    self.source.kind
+                )));
+            }
+            (_, None) => {}
+        }
+        if self.source.unit.is_some() && !self.has_build_module() {
             return Err(ManifestError::Invalid(format!(
-                "a {:?} source has no C++ entry unit",
+                "a {:?} source without a build module has no C++ entry unit",
                 self.source.kind
             )));
         }
@@ -1066,8 +1067,11 @@ impl Manifest {
             .chain(self.tuning.iter())
             .cloned()
             .collect();
-        if self.source.kind.has_build_module() {
+        if self.has_build_module() {
             named.push(format!("{SOURCE_DIRECTORY}/{BUILD_MODULE}.py"));
+        }
+        if let Some(compile) = &self.compile {
+            named.extend(compile.units.iter().cloned());
         }
         if self.source.kind == SourceKind::Triton {
             named.push(format!("{SOURCE_DIRECTORY}/{}.py", self.op));
@@ -1110,6 +1114,76 @@ impl Manifest {
             }
         }
         Ok(())
+    }
+
+    /// Whether the package's compilation is a build module it writes
+    /// ([`BUILD_MODULE`]): a CuTe DSL package's, and a CUDA package's that
+    /// declares no compilation. A Triton package's compilation is its launch
+    /// table and a declared CUDA package's its `[compile]`, which their
+    /// drivers run.
+    pub fn has_build_module(&self) -> bool {
+        match self.source.kind {
+            SourceKind::CuteDsl => true,
+            SourceKind::Cuda => self.compile.is_none(),
+            _ => false,
+        }
+    }
+
+    /// Checks a CUDA package's declared compilation against the rest of the
+    /// manifest and the package's files.
+    fn check_compile(&self, root: &Path, compile: &Compile) -> Result<(), ManifestError> {
+        if let Some(reason) = compile.invalid() {
+            return Err(ManifestError::Invalid(reason));
+        }
+        if compile.kernel.is_some() != (self.module.form == ModuleForm::Cubin) {
+            return Err(ManifestError::Invalid(
+                "a cubin module's compilation states its kernel in [compile.kernel], and a \
+                 native module's states none"
+                    .into(),
+            ));
+        }
+        let unknown: Vec<&str> = compile
+            .parameters()
+            .into_iter()
+            .filter(|parameter| !self.parameters.contains_key(*parameter))
+            .collect();
+        if !unknown.is_empty() {
+            return Err(ManifestError::Invalid(format!(
+                "the compilation reads parameters the manifest does not state: {unknown:?}"
+            )));
+        }
+        self.check_fields("the compilation", compile.fields())?;
+        if root
+            .join(SOURCE_DIRECTORY)
+            .join(format!("{BUILD_MODULE}.py"))
+            .is_file()
+        {
+            return Err(ManifestError::Invalid(format!(
+                "a declared compilation is the package's whole compilation: \
+                 {SOURCE_DIRECTORY}/{BUILD_MODULE}.py would be a second one"
+            )));
+        }
+        Ok(())
+    }
+
+    /// Refuses a table, `what`, that reads `fields` no descriptor declares.
+    fn check_fields(&self, what: &str, fields: Vec<&str>) -> Result<(), ManifestError> {
+        let declared: Vec<&String> = self
+            .descriptors()
+            .iter()
+            .flat_map(|shape| shape.dimensions.keys())
+            .collect();
+        let unknown: Vec<&str> = fields
+            .into_iter()
+            .filter(|field| !declared.iter().any(|name| name == field))
+            .collect();
+        if unknown.is_empty() {
+            Ok(())
+        } else {
+            Err(ManifestError::Invalid(format!(
+                "{what} reads fields no descriptor declares: {unknown:?}"
+            )))
+        }
     }
 
     /// The descriptor shapes this package covers, in the manifest's order: one

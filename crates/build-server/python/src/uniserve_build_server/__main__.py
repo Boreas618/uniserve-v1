@@ -15,8 +15,10 @@ for four things:
     Triton package's launch table is compiled by
     :mod:`uniserve_build_server.triton`; a CuTe DSL package's build module
     states ``spec(fields, parameters, target)``, which
-    :mod:`uniserve_build_server.cute_dsl` compiles; a CUDA package's build
-    module states ``compile(request)``, the whole compilation.
+    :mod:`uniserve_build_server.cute_dsl` compiles; a CUDA package's declared
+    compilation is compiled by :mod:`uniserve_build_server.cuda`, and the
+    build module of a CUDA package whose compilation is computed states
+    ``compile(request)``, which calls that driver's routines.
 
 ``uniserve-build-server provision PIN --cache DIR``
     fetches and verifies a pinned third-party source into the Build Server's
@@ -39,18 +41,25 @@ import pathlib
 import sys
 from collections.abc import Callable
 
-from uniserve_build_server import cute_dsl, fetch, toolchain, triton
+from uniserve_build_server import cuda, cute_dsl, fetch, toolchain, triton
 from uniserve_build_server.request import Request
 
-#: How each source kind's build module is compiled.
+
+def compile_cuda(request: Request) -> None:
+    """A CUDA package's declared compilation, or its build module's."""
+    if request.module is None:
+        cuda.build(request)
+    else:
+        importlib.import_module(request.module).compile(request)
+
+
+#: How each source kind is compiled.
 DRIVERS: dict[str, Callable[[Request], None]] = {
     "triton": triton.build,
     "cute_dsl": lambda request: cute_dsl.build(
         request, importlib.import_module(request.module).spec
     ),
-    "cuda": lambda request: importlib.import_module(request.module).compile(
-        request
-    ),
+    "cuda": compile_cuda,
 }
 
 
@@ -59,8 +68,8 @@ def compile_request(request: Request) -> None:
     driver = DRIVERS.get(request.source)
     if driver is None:
         raise SystemExit(
-            f"a {request.source} package is not compiled by a build module; "
-            f"the build modules' source kinds are {sorted(DRIVERS)}"
+            f"a {request.source} package is not compiled through this "
+            f"environment; the compiled source kinds are {sorted(DRIVERS)}"
         )
     request.output.mkdir(parents=True, exist_ok=True)
     driver(request)
@@ -73,7 +82,14 @@ def describe_toolchain(as_json: bool) -> None:
         return
     print(f"interpreter    {described.interpreter}")
     print(f"driver         {described.driver}")
-    for name in ("kernels", "triton", "cute_dsl", "cuda", "host_compiler"):
+    for name in (
+        "kernels",
+        "triton",
+        "cute_dsl",
+        "cuda",
+        "cudnn",
+        "host_compiler",
+    ):
         entry = getattr(described, name)
         state = entry.get("available", f"missing: {entry.get('missing')}")
         print(f"{name:<14} {state}")

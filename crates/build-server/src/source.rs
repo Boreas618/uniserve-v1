@@ -9,10 +9,11 @@
 //!   `python -m uniserve_build_server compile` in the package's source
 //!   directory with a typed compile request on standard input ([`Request`]):
 //!   the package, the descriptor's fields typed as its dimensions declare
-//!   them, a Triton package's launch table, the target with its hardware
-//!   facts, the output directory, the job limit, the cache of pinned sources
-//!   and the toolchain description the server checked. The request is the
-//!   whole interface; a compilation reads no environment variable.
+//!   them, a Triton package's launch table or a CUDA package's declared
+//!   compilation, the target with its hardware facts, the output directory,
+//!   the job limit, the cache of pinned sources and the toolchain description
+//!   the server checked. The request is the whole interface; a compilation
+//!   reads no environment variable.
 //! - [`CubinSource`]: a vendor cubin the package carries, stored as it is.
 //! - [`WasmSource`]: a scheduling policy, a crate built for wasm32 from the
 //!   revision's whole-workspace snapshot (`crate::snapshot`).
@@ -29,6 +30,7 @@ use std::process::Command;
 
 use serde::Serialize;
 
+use crate::compile::Compile;
 use crate::launch::Launch;
 use crate::manifest::{BUILD_MODULE, Manifest, ModuleForm, SOURCE_DIRECTORY, SourceKind};
 use crate::target::{Facts, Target};
@@ -489,10 +491,14 @@ pub struct Request<'a> {
     parameters: &'a BTreeMap<String, toml::Value>,
     source: SourceKind,
     /// The module the compilation imports from the package's source directory:
-    /// a Triton package's kernel module, `<op>`, or the build module.
-    module: &'a str,
+    /// a Triton package's kernel module, `<op>`, or the build module; none
+    /// for a CUDA package's declared compilation, which imports nothing of
+    /// the package.
+    module: Option<&'a str>,
     /// A Triton package's launch table.
     launch: Option<&'a Launch>,
+    /// A CUDA package's declared compilation.
+    compile: Option<&'a Compile>,
     /// A native module's C entry symbols by role, as the manifest resolves them
     /// (`[module.entries]` over the operator's default launch entry).
     entries: &'a BTreeMap<String, String>,
@@ -527,8 +533,9 @@ impl Source for ModuleSource {
         })?;
         let directory = package.root.join(SOURCE_DIRECTORY);
         let module = match package.manifest.source.kind {
-            SourceKind::Triton => package.manifest.op.as_str(),
-            _ => BUILD_MODULE,
+            SourceKind::Triton => Some(package.manifest.op.as_str()),
+            _ if package.manifest.has_build_module() => Some(BUILD_MODULE),
+            _ => None,
         };
         let pins = build.cache.pins();
         let request = Request {
@@ -540,6 +547,7 @@ impl Source for ModuleSource {
             source: package.manifest.source.kind,
             module,
             launch: package.manifest.launch.as_ref(),
+            compile: package.manifest.compile.as_ref(),
             entries: &package.manifest.module.entries,
             unit: package.manifest.source.unit.as_deref(),
             package: &package.root,

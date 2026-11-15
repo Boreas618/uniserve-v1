@@ -174,6 +174,36 @@ pub enum Constant {
     Literal(toml::Value),
 }
 
+impl ArgumentType {
+    /// The descriptor field the type is read from, when it is read from one.
+    pub fn field(&self) -> Option<&str> {
+        match self {
+            Self::Pointer { pointer: field }
+            | Self::Element { element: field }
+            | Self::Selected { field, .. } => Some(field),
+            Self::Named(_) => None,
+        }
+    }
+}
+
+impl Constant {
+    /// The descriptor field the value is read from, when it is read from one.
+    pub fn field(&self) -> Option<&str> {
+        match self {
+            Self::Selected { field, .. } | Self::Field { field, .. } => Some(field),
+            Self::Parameter { .. } | Self::Literal(_) => None,
+        }
+    }
+
+    /// The manifest parameter the value is read from, when it is read from one.
+    pub fn parameter(&self) -> Option<&str> {
+        match self {
+            Self::Parameter { parameter } => Some(parameter),
+            _ => None,
+        }
+    }
+}
+
 impl Launch {
     /// The fields the table reads, so a manifest that reads one no descriptor
     /// declares is refused when it is loaded. A derived field is the
@@ -190,22 +220,13 @@ impl Launch {
         if let Aligned::Selected { field, .. } = &self.aligned {
             fields.push(field.as_str());
         }
-        for argument in self.types.values() {
-            match argument {
-                ArgumentType::Pointer { pointer: field }
-                | ArgumentType::Element { element: field }
-                | ArgumentType::Selected { field, .. } => fields.push(field),
-                ArgumentType::Named(_) => {}
-            }
-        }
-        for constant in self.constants.values().chain(self.options.values()) {
-            match constant {
-                Constant::Selected { field, .. } | Constant::Field { field, .. } => {
-                    fields.push(field)
-                }
-                Constant::Parameter { .. } | Constant::Literal(_) => {}
-            }
-        }
+        fields.extend(self.types.values().filter_map(ArgumentType::field));
+        fields.extend(
+            self.constants
+                .values()
+                .chain(self.options.values())
+                .filter_map(Constant::field),
+        );
         fields
     }
 
@@ -214,10 +235,7 @@ impl Launch {
         self.constants
             .values()
             .chain(self.options.values())
-            .filter_map(|constant| match constant {
-                Constant::Parameter { parameter } => Some(parameter.as_str()),
-                _ => None,
-            })
+            .filter_map(Constant::parameter)
             .collect()
     }
 

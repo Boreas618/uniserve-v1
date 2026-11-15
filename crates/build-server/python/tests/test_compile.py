@@ -4,8 +4,9 @@ The Build Server runs ``python -m uniserve_build_server compile`` in the
 build module's directory with the request as JSON on standard input
 (``Request`` in ``crates/build-server/src/source.rs``). These tests run the
 program exactly so, with a CUDA-kind package of their own (``recording``)
-whose build module records what it was handed, so the protocol is checked
-without a compiler or a device.
+whose build module records what it was handed, and a compiler of their own
+(``recording/nvcc``) that records how the CUDA driver ran it, so the protocol
+and the declared compilation are checked without a CUDA toolkit or a device.
 """
 
 from __future__ import annotations
@@ -26,6 +27,9 @@ from uniserve_build_server.toolchain import available, missing
 #: The recording package: its build module writes what it was handed.
 RECORDING = pathlib.Path(__file__).parent / "recording"
 
+#: The compiler that records its arguments beside what it writes.
+NVCC = RECORDING / "nvcc"
+
 
 def request(package: pathlib.Path, output: pathlib.Path, **changes) -> dict:
     """A request as the Build Server writes one for the recording module."""
@@ -39,6 +43,7 @@ def request(package: pathlib.Path, output: pathlib.Path, **changes) -> dict:
         "source": "cuda",
         "module": "build",
         "launch": None,
+        "compile": None,
         "entries": {"launch": "uniserve_recording"},
         "unit": None,
         "package": str(package),
@@ -73,6 +78,13 @@ def request(package: pathlib.Path, output: pathlib.Path, **changes) -> dict:
                     "include": "/cuda/include",
                     "lib": "/cuda/lib",
                     "stubs": "/cuda/lib/stubs",
+                }
+            ),
+            "cudnn": available(
+                {
+                    "version": "9.12.0",
+                    "include": "/cudnn/include",
+                    "lib": "/cudnn/lib",
                 }
             ),
             "host_compiler": missing("no c++ on this host's search path"),
@@ -128,6 +140,163 @@ def test_a_source_without_a_build_module_is_refused(tmp_path):
     )
     assert compiled.returncode != 0
     assert "cubin" in compiled.stderr
+
+
+def declared(output: pathlib.Path, compile: dict, **fields) -> dict:
+    """A request for a declared CUDA compilation, compiled by the recording
+    compiler.
+    """  # noqa: D205
+    stated = request(
+        RECORDING,
+        output,
+        module=None,
+        compile=compile,
+        fields=fields,
+        descriptor="_".join(
+            f"{name}_{value}" for name, value in fields.items()
+        ),
+    )
+    stated["toolchain"]["cuda"]["available"]["nvcc"] = str(NVCC)
+    return stated
+
+
+def recorded(output: pathlib.Path) -> list[list[str]]:
+    """Each run of the recording compiler, as its arguments."""
+    lines = (output / "nvcc.jsonl").read_text().splitlines()
+    return [json.loads(line) for line in lines]
+
+
+def test_a_declared_native_compilation_binds_and_links(tmp_path):
+    """Its definitions are bound for the descriptor and its libraries linked
+    where the toolchain description states them.
+    """  # noqa: D205
+    output = tmp_path / "output"
+    compile = {
+        "units": ["src/entry.cpp", "src/dense.cu"],
+        "standard": "c++17",
+        "definitions": {
+            "UNISERVE_CAUSAL": {
+                "field": "mask",
+                "values": {"causal": 1, "dense": 0},
+            },
+            "UNISERVE_SEQUENCES": {"field": "cu_seq_lens", "absent": True},
+            "UNISERVE_TILE": {"parameter": "tile"},
+            "UNISERVE_INPUT": {
+                "field": "dtype",
+                "values": {"bf16": "CUDA_R_16BF", "f32": "CUDA_R_32F"},
+            },
+        },
+        "libraries": ["cublasLt", "cudnn"],
+        "host_contraction": False,
+        "kernel": None,
+    }
+    stated = declared(output, compile, mask="causal", dtype="bf16")
+    compiled = compile_in(RECORDING / "src", stated)
+    assert compiled.returncode == 0, compiled.stderr
+
+    # The units compile at once, so their runs are recorded in either order.
+    *units, linked = recorded(output)
+    assert sorted(arguments[-1] for arguments in units) == sorted(
+        str(RECORDING / source) for source in compile["units"]
+    )
+    for arguments in units:
+        assert "-std=c++17" in arguments and "-arch=sm_100a" in arguments
+        # Each definition is bound for this descriptor: the value the field
+        # selects, the absent field's value, the parameter.
+        for bound in (
+            "-DUNISERVE_CAUSAL=1",
+            "-DUNISERVE_SEQUENCES=1",
+            "-DUNISERVE_TILE=64",
+            "-DUNISERVE_INPUT=CUDA_R_16BF",
+        ):
+            assert bound in arguments, arguments
+        # The package's own headers, a library's headers, and its own option.
+        assert f"-I{RECORDING / 'include'}" in arguments
+        assert "-I/cudnn/include" in arguments
+        assert "-ffp-contract=off" in arguments
+    # The libraries where the description states them, and the runtime.
+    for argument in ("-L/cuda/lib", "-L/cudnn/lib", "-lcublasLt", "-lcudnn"):
+        assert argument in linked, linked
+    assert "-lcudart" in linked
+    assert linked[linked.index("-o") + 1] == str(output / "module.so")
+    # The objects lived in a scratch directory the module does not keep.
+    assert sorted(path.name for path in output.iterdir()) == [
+        "module.so",
+        "nvcc.jsonl",
+    ]
+
+
+def test_a_declared_cubin_writes_its_kernel_launch_metadata(tmp_path):
+    output = tmp_path / "output"
+    compile = {
+        "units": ["src/topk_softmax.cu"],
+        "standard": "c++20",
+        "definitions": {
+            "UNISERVE_EXPERTS": {"field": "experts"},
+            "UNISERVE_WARPS": {"parameter": "warps"},
+        },
+        "libraries": [],
+        "host_contraction": True,
+        "kernel": {
+            "name": "uniserve_topk_softmax",
+            "warps": {"parameter": "warps"},
+            "shared": 0,
+            "signature": [
+                ["scores", {"pointer": "scores"}],
+                ["rows", "i32"],
+                [
+                    "scale",
+                    {
+                        "field": "scale",
+                        "values": {"none": "*fp32", "bf16": "*bf16"},
+                    },
+                ],
+            ],
+        },
+    }
+    stated = declared(output, compile, scores="bf16", experts=128, scale="none")
+    stated["parameters"] = {"warps": 4}
+    compiled = compile_in(RECORDING / "src", stated)
+    assert compiled.returncode == 0, compiled.stderr
+
+    (arguments,) = recorded(output)
+    assert "-cubin" in arguments
+    assert arguments[arguments.index("-o") + 1] == str(output / "module.cubin")
+    metadata = json.loads((output / "metadata.json").read_text())
+    assert metadata == {
+        "name": "uniserve_topk_softmax",
+        "num_warps": 4,
+        "num_ctas": 1,
+        "shared": 0,
+        "launch_pdl": False,
+        "launch_cooperative_grid": False,
+        "global_scratch_size": 0,
+        "global_scratch_align": 1,
+        "profile_scratch_size": 0,
+        "profile_scratch_align": 1,
+        # In the kernel's parameter order, spelled as `ops` reads a signature.
+        "signature": {"scores": "*bf16", "rows": "i32", "scale": "*fp32"},
+        # The module's compile constants.
+        "definitions": {"UNISERVE_EXPERTS": 128, "UNISERVE_WARPS": 4},
+    }
+    assert list(metadata["signature"]) == ["scores", "rows", "scale"]
+
+
+def test_a_failed_compile_refuses_the_build_naming_the_unit(tmp_path):
+    output = tmp_path / "output"
+    compile = {
+        "units": ["src/dense.cu"],
+        "standard": "c++17",
+        "definitions": {},
+        "libraries": [],
+        "host_contraction": True,
+        "kernel": None,
+    }
+    stated = declared(output, compile, mask="dense")
+    stated["toolchain"]["cuda"]["available"]["nvcc"] = "/bin/false"
+    compiled = compile_in(RECORDING / "src", stated)
+    assert compiled.returncode != 0
+    assert f"compiling {RECORDING / 'src/dense.cu'} failed" in compiled.stderr
 
 
 def test_a_target_the_description_does_not_state_is_refused():

@@ -13,9 +13,14 @@ kernel one descriptor compiles, and how.
 - :mod:`uniserve_build_server.request`: the compile request and the target's
   hardware facts (``targets.toml``);
 - :mod:`uniserve_build_server.triton`: the Triton compile driver, which turns
-  a package's ``spec`` into ``module.cubin`` and ``metadata.json``;
+  a package's launch table into ``module.cubin`` and ``metadata.json``;
 - :mod:`uniserve_build_server.cute_dsl`: the CuTe DSL compile driver, which
   turns a package's ``spec`` into a native ``module.so``;
+- :mod:`uniserve_build_server.cuda`: the CUDA compile driver, which compiles a
+  package's declared compilation and offers its routines to the build module
+  of a package whose compilation is computed;
+- :mod:`uniserve_build_server.binding`: how a launch table or a declared
+  compilation binds a value for one descriptor;
 - :mod:`uniserve_build_server.fetch`: the pinned third-party sources
   (trtllm-gen's kernel libraries, DeepEP, NCCL's headers, FlashInfer's MegaMoE),
   one data file each under ``pins/``, fetched, verified and cached by one

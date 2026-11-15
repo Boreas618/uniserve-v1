@@ -23,6 +23,11 @@ Every entry is resolved through a declared mechanism, never by guessing a path:
   NVIDIA's distribution packages register; nvcc's own version is read from the
   macros it predefines (``__CUDACC_VER_MAJOR__`` and its two siblings), not from
   the text of ``--version``;
+- cuDNN of the release this environment's lock fixes (the major release of the
+  locked ``nvidia-cudnn-cu13`` distribution), as the host's distribution package
+  installs it on the default search paths: the host C++ compiler finds its
+  header, whose macros state the version, and resolves its library, the file
+  the serving process's loader opens by the same search;
 - the host C++ compiler, the program ``c++`` names on this host's search path,
   resolved once to the file it runs.
 
@@ -38,6 +43,7 @@ import hashlib
 import importlib.metadata
 import importlib.resources
 import json
+import pathlib
 import re
 import shutil
 import subprocess
@@ -53,6 +59,13 @@ CUDA_RUNTIME = "nvidia-cuda-runtime"
 #: The distributions of the two Python compilers.
 TRITON = "triton"
 CUTE_DSL = "nvidia-cutlass-dsl"
+
+#: The distribution whose major release fixes the cuDNN this environment
+#: compiles against, and the header and library of that release's distribution
+#: package.
+CUDNN = "nvidia-cudnn-cu13"
+CUDNN_HEADER = "cudnn_version.h"
+CUDNN_LIBRARY = "libcudnn.so"
 
 #: The program that names the host C++ compiler, as POSIX systems install it.
 HOST_COMPILER = "c++"
@@ -81,6 +94,21 @@ class Cuda:
 
 
 @dataclasses.dataclass(frozen=True)
+class Cudnn:
+    """The cuDNN a module that calls it compiles and links against.
+
+    ``version`` is the header's release, such as ``9.12.0``; ``include`` holds
+    its headers and ``lib`` its library, both directories of the default
+    search paths the distribution package installs into, so a module links the
+    library by its soname and the serving process's loader finds the same file.
+    """
+
+    version: str
+    include: str
+    lib: str
+
+
+@dataclasses.dataclass(frozen=True)
 class Toolchain:
     """This environment's toolchains, as the Build Server reads them.
 
@@ -101,6 +129,7 @@ class Toolchain:
     triton: dict[str, Any]
     cute_dsl: dict[str, Any]
     cuda: dict[str, Any]
+    cudnn: dict[str, Any]
     host_compiler: dict[str, Any]
 
     def to_json(self) -> str:
@@ -115,6 +144,10 @@ class Toolchain:
     def require_cuda(self) -> Cuda:
         """The CUDA toolkit, or a refusal naming why this host has none."""
         return Cuda(**_require(self.cuda, "the CUDA toolkit"))
+
+    def require_cudnn(self) -> Cudnn:
+        """cuDNN, or a refusal naming why this host has none."""
+        return Cudnn(**_require(self.cudnn, "cuDNN"))
 
     def require_host_compiler(self) -> str:
         """The host C++ compiler, or a refusal naming why this host has none."""
@@ -266,6 +299,80 @@ def cuda() -> dict[str, Any]:
     )
 
 
+def cudnn(compiler: dict[str, Any]) -> dict[str, Any]:
+    """The cuDNN of the release the lock fixes, as the host compiler finds it.
+
+    The header is found by preprocessing an include of it, whose line markers
+    name the file and whose macros state the release; the library is the file
+    the compiler driver resolves on the linker's search path.
+    """
+    try:
+        locked = importlib.metadata.version(CUDNN).split(".")[0]
+    except importlib.metadata.PackageNotFoundError:
+        return missing(f"this environment locks no {CUDNN} release")
+    if "available" not in compiler:
+        return missing(
+            f"no host C++ compiler finds cuDNN: {compiler['missing']}"
+        )
+    host = compiler["available"]
+    preprocessed = subprocess.run(
+        [host, "-x", "c++", "-E", "-dD", "-"],
+        input=f"#include <{CUDNN_HEADER}>\n",
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if preprocessed.returncode != 0:
+        return missing(
+            f"the host compiler finds no {CUDNN_HEADER} (NVIDIA's "
+            f"libcudnn{locked}-dev package provides it): "
+            f"{preprocessed.stderr.strip()}"
+        )
+    header = re.search(
+        rf'^# \d+ "(/[^"]*)/{re.escape(CUDNN_HEADER)}"',
+        preprocessed.stdout,
+        re.M,
+    )
+    macros = dict(
+        re.findall(
+            r"^#define (CUDNN_(?:MAJOR|MINOR|PATCHLEVEL)) (\d+)$",
+            preprocessed.stdout,
+            re.M,
+        )
+    )
+    resolved = subprocess.run(
+        [host, f"-print-file-name={CUDNN_LIBRARY}"],
+        capture_output=True,
+        text=True,
+        check=False,
+    ).stdout.strip()
+    if header is None or len(macros) != 3:
+        return missing(f"{CUDNN_HEADER} states no cuDNN release")
+    version = ".".join(
+        macros[f"CUDNN_{part}"] for part in ("MAJOR", "MINOR", "PATCHLEVEL")
+    )
+    if macros["CUDNN_MAJOR"] != locked:
+        return missing(
+            f"the host's cuDNN is {version}, and this environment's lock fixes "
+            f"release {locked}"
+        )
+    # The driver prints the bare name for a library its search does not find.
+    if not resolved.startswith("/"):
+        return missing(
+            f"the host compiler resolves no {CUDNN_LIBRARY} (NVIDIA's "
+            f"libcudnn{locked}-dev package provides it)"
+        )
+    return available(
+        dataclasses.asdict(
+            Cudnn(
+                version=version,
+                include=header.group(1),
+                lib=str(pathlib.Path(resolved).resolve().parent),
+            )
+        )
+    )
+
+
 def kernels() -> dict[str, Any]:
     """The digest of the kernel packages' shared sources."""
     try:
@@ -286,6 +393,7 @@ def host_compiler() -> dict[str, Any]:
 
 def describe() -> Toolchain:
     """This environment's toolchains."""
+    compiler = host_compiler()
     return Toolchain(
         interpreter=sys.executable,
         driver=digest(__package__),
@@ -294,5 +402,6 @@ def describe() -> Toolchain:
         triton=_version(TRITON),
         cute_dsl=_version(CUTE_DSL),
         cuda=cuda(),
-        host_compiler=host_compiler(),
+        cudnn=cudnn(compiler),
+        host_compiler=compiler,
     )

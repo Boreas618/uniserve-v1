@@ -24,6 +24,7 @@ FIELDS = {
     "triton",
     "cute_dsl",
     "cuda",
+    "cudnn",
     "host_compiler",
 }
 
@@ -55,7 +56,7 @@ def test_the_description_names_this_environment_and_its_compilers():
         "available": description["distributions"]["nvidia-cutlass-dsl"]
     }
     # A toolchain is available with what a build needs, or missing with why.
-    for name in ("cuda", "host_compiler"):
+    for name in ("cuda", "cudnn", "host_compiler"):
         entry = description[name]
         assert list(entry) in (["available"], ["missing"]), entry
     if "available" in description["cuda"]:
@@ -69,6 +70,15 @@ def test_the_description_names_this_environment_and_its_compilers():
             "lib",
             "stubs",
         }
+    if "available" in description["cudnn"]:
+        # The release the lock fixes, found on the host's default search paths.
+        cudnn = description["cudnn"]["available"]
+        assert re.fullmatch(r"\d+\.\d+\.\d+", cudnn["version"])
+        assert (
+            cudnn["version"].split(".")[0]
+            == (description["distributions"]["nvidia-cudnn-cu13"].split(".")[0])
+        )
+        assert set(cudnn) == {"version", "include", "lib"}
 
 
 def test_the_description_reads_back_as_a_compilation_is_handed_it():

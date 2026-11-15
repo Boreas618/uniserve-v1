@@ -38,7 +38,9 @@
 //!   declared toolchains that compile them.
 //! - [`target`]: what a module is compiled for, and each GPU target's
 //!   hardware facts.
-//! - [`manifest`]: the `package.toml` of section 5.2.
+//! - [`manifest`]: the `package.toml` of section 5.2, with a Triton
+//!   package's launch table ([`launch`]) and a CUDA package's declared
+//!   compilation ([`compile`]).
 //! - [`protocol`]: the Protobuf protocol and its client, which the daemon and
 //!   the main process use.
 //!
@@ -49,6 +51,7 @@
 pub mod build;
 pub mod builder;
 pub mod command;
+pub mod compile;
 pub mod inputs;
 pub mod launch;
 pub mod manifest;

@@ -14,10 +14,12 @@ names and the order of its arguments, and its manifest's launch table
 (``[launch]``, ``crates/build-server/src/launch.rs``) states what the list does
 not: each launch argument's type, each compile-time parameter's value, the warp
 count and the aligned arguments, each a literal or read from the descriptor's
-fields. This driver is the one implementation of the rest:
+fields (:mod:`uniserve_build_server.binding` evaluates those statements). This
+driver is the one implementation of the rest:
 
 - an element type a field names is spelled as Triton spells it
-  (:data:`ELEMENTS`, keyed by the names ``ops::abi`` prints);
+  (:data:`uniserve_build_server.binding.ELEMENTS`, keyed by the names
+  ``ops::abi`` prints);
 - the kernel's ``PDL`` parameter is its programmatic dependent launch, true
   when the descriptor's ``pdl`` field is and the target has dependent launch,
   and the module's launch carries the attribute exactly then;
@@ -45,100 +47,21 @@ import triton
 from triton.backends.compiler import GPUTarget
 from triton.compiler.compiler import ASTSource
 
+from uniserve_build_server.binding import (
+    argument_type,
+    constant,
+    field,
+    selected,
+)
 from uniserve_build_server.request import Request, Target
 
-#: Triton's spelling of each element type, by the name ``ops::abi`` prints.
-ELEMENTS = {
-    "u8": "u8",
-    "u32": "u32",
-    "i16": "i16",
-    "i32": "i32",
-    "i64": "i64",
-    "f16": "fp16",
-    "bf16": "bf16",
-    "f32": "fp32",
-    "f64": "fp64",
-    "f8e4m3": "fp8e4nv",
-}
-
-#: The kernel parameter that carries the programmatic dependent launch, and the
-#: descriptor field that asks for it (``crates/build-server/src/launch.rs``).
+#: The kernel parameter that carries the programmatic dependent launch, and
+#: the descriptor field that asks for it (``crates/build-server/src/launch.rs``).
 DEPENDENT_LAUNCH_PARAMETER = "PDL"
 DEPENDENT_LAUNCH_FIELD = "pdl"
 
 #: The divisor an aligned argument is attributed with.
 ALIGNMENT = 16
-
-
-def element(name: str) -> str:
-    """Triton's spelling of the element type ``ops::abi`` spells ``name``."""
-    try:
-        return ELEMENTS[name]
-    except KeyError:
-        raise SystemExit(
-            f"{name!r} is no element type a Triton kernel takes; the element "
-            f"types are {sorted(ELEMENTS)}"
-        ) from None
-
-
-def field(fields: Mapping[str, Any], name: str, descriptor: str) -> Any:
-    """The value of field ``name``, or a refusal naming the field."""
-    try:
-        return fields[name]
-    except KeyError:
-        raise SystemExit(
-            f"{descriptor}: the descriptor names no {name}"
-        ) from None
-
-
-def argument_type(
-    stated: Any, fields: Mapping[str, Any], descriptor: str
-) -> str:
-    """The Triton type one launch argument's table entry states."""
-    if isinstance(stated, str):
-        return stated
-    if "pointer" in stated:
-        return "*" + element(field(fields, stated["pointer"], descriptor))
-    if "element" in stated:
-        return element(field(fields, stated["element"], descriptor))
-    return selected(stated, fields, descriptor)
-
-
-def selected(
-    stated: Mapping[str, Any], fields: Mapping[str, Any], descriptor: str
-) -> Any:
-    """The value a field's value selects from a table entry's ``values``.
-
-    A key of a TOML table is text, so the field's value is looked up as the
-    text a descriptor key prints for it.
-    """
-    value = field(fields, stated["field"], descriptor)
-    printed = str(value).lower() if isinstance(value, bool) else str(value)
-    try:
-        return stated["values"][printed]
-    except KeyError:
-        raise SystemExit(
-            f"{descriptor}: {stated['field']} = {printed} selects nothing of "
-            f"{sorted(stated['values'])}"
-        ) from None
-
-
-def constant(
-    stated: Any,
-    fields: Mapping[str, Any],
-    parameters: Mapping[str, Any],
-    descriptor: str,
-) -> Any:
-    """The value one compile-time parameter's table entry states."""
-    if not isinstance(stated, dict):
-        return stated
-    if "parameter" in stated:
-        return parameters[stated["parameter"]]
-    if "values" in stated:
-        return selected(stated, fields, descriptor)
-    if stated["field"] not in fields and "absent" in stated:
-        return stated["absent"]
-    return field(fields, stated["field"], descriptor)
 
 
 def warps(stated: Any, fields: Mapping[str, Any], descriptor: str) -> int:

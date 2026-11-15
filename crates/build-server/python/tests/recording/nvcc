@@ -1,0 +1,22 @@
+#!/usr/bin/env python3
+"""A compiler that records how it was run: the CUDA driver's tests' nvcc.
+
+The driver tests (``tests/test_compile.py``) name this program as the toolchain
+description's ``nvcc``, so a declared compilation runs without a CUDA toolkit:
+each run appends its arguments as one JSON line to ``nvcc.jsonl`` beside the
+file it is asked to write (``-o``), and writes that file.
+"""
+
+import json
+import pathlib
+import sys
+
+arguments = sys.argv[1:]
+output = pathlib.Path(arguments[arguments.index("-o") + 1])
+# The module's directory, whatever scratch directory of it an object lands in.
+log = next(
+    parent for parent in output.parents if not parent.name.startswith(".")
+) / "nvcc.jsonl"
+with log.open("a") as recorded:
+    recorded.write(json.dumps(arguments) + "\n")
+output.write_bytes(b"compiled\n")

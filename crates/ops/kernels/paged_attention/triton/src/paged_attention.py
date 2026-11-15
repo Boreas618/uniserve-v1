@@ -791,8 +791,9 @@ def derive(fields, parameters, target):
         return derived
 
     # The products compare the element types by Triton's names, which the
-    # Triton driver's one table spells; the driver is this function's caller.
-    from uniserve_build_server.triton import element
+    # Build Server's drivers spell by one table; the Triton driver is this
+    # function's caller.
+    from uniserve_build_server.binding import element
 
     tiles = prefill_tiles(q_heads, kv_heads, fields["head_dim"])
     products = prefill_products(
