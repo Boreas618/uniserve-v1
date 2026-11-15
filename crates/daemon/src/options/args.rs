@@ -450,7 +450,7 @@ mod tests {
             [("video_vae".to_owned(), WeightFormat::Bf16)].into()
         );
         assert!(config.moe_config.expert_parallel);
-        assert_eq!(config.moe_config.exchange, "deepep");
+        assert_eq!(config.moe_config.exchange.as_deref(), Some("deepep"));
         assert_eq!(
             config.server_config.request_timeout,
             Some(Duration::from_secs(120))
@@ -913,7 +913,7 @@ mod tests {
             }
         );
         assert!(engine.moe.expert_parallel);
-        assert_eq!(engine.moe.exchange, "deepep");
+        assert_eq!(engine.moe.exchange.as_deref(), Some("deepep"));
         assert!(!engine.kv_cache.prefix_caching);
         assert_eq!(
             engine.scheduler.chunked_prefill_size,

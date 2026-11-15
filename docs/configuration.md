@@ -303,7 +303,7 @@ Each entry is the median over the point's reports of the step time over its run'
 | Option | Default | Meaning |
 | --- | --- | --- |
 | `expert_parallel` | `false` | Shard routed experts across the deployment's expert workers, across schedulers of one rank each (`data_parallel_size` above one), or otherwise over the tensor-parallel ranks of each scheduler's worker group, each rank holding whole experts; a group split over pipeline stages or sequence members is refused with it |
-| `exchange` | `"alltoall"` | The expert-exchange package's backend: `alltoall`, `megamoe` or `deepep` among the packages this tree holds (`crates/ops/kernels/expert_exchange`), refused at the Build Server when it holds no package of the backend; a deployment that shards its groups' experts over their tensor-parallel ranks moves no token and refuses any but the default |
+| `exchange` | unset | The expert-exchange package's backend: `alltoall`, `megamoe` or `deepep` among the packages this tree holds (`crates/ops/kernels/expert_exchange`), refused at the Build Server when it holds no package of the backend; unset, a deployment whose schedulers exchange experts runs `alltoall`. A deployment that shards its groups' experts over their tensor-parallel ranks moves no token and refuses an exchange |
 | `microbatches` | `1` | Microbatches overlapping attention with dedicated expert workers |
 | `beside_rows` | `1024` | The rows per rank of the middle capture class of an expert union's steps, a step in which another member prefills a few prompts while this one decodes, beside the class of its decode buckets and the class of the union's whole capacity; not captured when a decode bucket reaches it or it lies within a quarter of the whole capacity |
 

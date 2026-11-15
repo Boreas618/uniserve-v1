@@ -656,8 +656,10 @@ pub struct MoeConfig {
     /// experts ([`EngineConfig::expert_union`]).
     pub expert_parallel: bool,
     /// The expert-exchange package's backend, which reaches sharded experts (`alltoall`,
-    /// `megamoe`, `deepep`): a package the Build Server holds.
-    pub exchange: String,
+    /// `megamoe`, `deepep`): a package the Build Server holds. Unset, a deployment whose
+    /// schedulers exchange experts runs [`DEFAULT_EXPERT_EXCHANGE`], and one that exchanges no
+    /// token names none.
+    pub exchange: Option<String>,
     /// Microbatches overlapping attention with dedicated expert workers.
     pub microbatches: NonZeroU32,
     /// The rows per rank of the middle capture class of an expert union's steps: a step in which
@@ -672,7 +674,7 @@ impl Default for MoeConfig {
     fn default() -> Self {
         Self {
             expert_parallel: false,
-            exchange: DEFAULT_EXPERT_EXCHANGE.to_owned(),
+            exchange: None,
             microbatches: NonZeroU32::MIN,
             beside_rows: DEFAULT_BESIDE_ROWS,
         }

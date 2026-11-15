@@ -268,17 +268,15 @@ pub(crate) fn replica_configs(
             .get(proto::config::DEFAULT_BLOCK)
             .is_some_and(|block| block.tensor_parallel_size > 1)
     });
-    anyhow::ensure!(
-        !config.moe.expert_parallel
-            || union
-            || !tensor_groups
-            || config.moe.exchange == proto::config::DEFAULT_EXPERT_EXCHANGE,
-        "`moe_config.exchange` is {:?} and `moe_config.expert_parallel` shards each worker \
-         group's experts over its tensor-parallel ranks, which exchange no token: the exchanges \
-         serve schedulers of one rank each and dedicated expert workers \
-         (docs/expert_parallelism.md)",
-        config.moe.exchange
-    );
+    if let Some(exchange) = &config.moe.exchange {
+        anyhow::ensure!(
+            !config.moe.expert_parallel || union || !tensor_groups,
+            "`moe_config.exchange` is {exchange:?} and `moe_config.expert_parallel` shards each \
+             worker group's experts over its tensor-parallel ranks, which exchange no token: the \
+             exchanges serve schedulers of one rank each and dedicated expert workers \
+             (docs/expert_parallelism.md)"
+        );
+    }
 
     let count = config.parallel.data_parallel_size.get();
     if count == 1 || union {
@@ -4119,13 +4117,13 @@ mod tests {
     }
 
     /// The exchanges serve expert unions: a deployment that shards its groups' experts over
-    /// their tensor-parallel ranks and names another exchange than the default is refused,
-    /// while schedulers of one rank each take any exchange.
+    /// their tensor-parallel ranks and names an exchange is refused, while schedulers of one
+    /// rank each take any exchange.
     #[test]
     fn tensor_parallel_groups_sharding_their_experts_take_no_exchange() {
         for (tensor, data) in [(4, 1), (2, 2)] {
             let mut config = deployment(tensor, data, true);
-            config.moe.exchange = "deepep".to_owned();
+            config.moe.exchange = Some("deepep".to_owned());
             let error = super::replica_configs(&config)
                 .expect_err("an exchange beside tensor-parallel experts")
                 .to_string();
@@ -4133,7 +4131,7 @@ mod tests {
         }
 
         let mut union = deployment(1, 4, true);
-        union.moe.exchange = "deepep".to_owned();
+        union.moe.exchange = Some("deepep".to_owned());
         assert_eq!(super::replica_configs(&union).unwrap().len(), 1);
     }
 

@@ -532,7 +532,11 @@ pub fn modules_of(config: &ServerArgs) -> ModuleSet {
             kernels.insert(
                 KernelKey::all(operator::EXPERT_EXCHANGE),
                 PackageRevision {
-                    backend: config.moe_config.exchange.clone(),
+                    backend: config
+                        .moe_config
+                        .exchange
+                        .clone()
+                        .unwrap_or_else(|| proto::config::DEFAULT_EXPERT_EXCHANGE.to_owned()),
                     revision: 0,
                     arguments: toml::Table::new(),
                 },
@@ -1183,7 +1187,7 @@ mod tests {
         // so the setting moves nothing there — and filling the slot anyway
         // would pin a package no call reaches.
         let exchange_only =
-            set(|config: &mut ServerArgs| config.moe_config.exchange = "deepep".to_owned());
+            set(|config: &mut ServerArgs| config.moe_config.exchange = Some("deepep".to_owned()));
         assert_eq!(
             change(
                 &base,
@@ -1195,7 +1199,7 @@ mod tests {
         let mut spread = ServerArgs::default();
         spread.moe_config.expert_parallel = true;
         let mut spread_exchanged = spread.clone();
-        spread_exchanged.moe_config.exchange = "deepep".to_owned();
+        spread_exchanged.moe_config.exchange = Some("deepep".to_owned());
         assert_eq!(
             change(
                 &Epoch::of(spread).expect("the configuration resolves"),

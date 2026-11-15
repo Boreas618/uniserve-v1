@@ -101,7 +101,7 @@ fn comparable(config: &EngineConfig) -> EngineConfig {
     comparable.decode_attention_backend = None;
     comparable.moe_runner_backend = None;
     comparable.scheduler.policy = proto::config::SchedulerConfig::default().policy;
-    comparable.moe.exchange = proto::config::MoeConfig::default().exchange;
+    comparable.moe.exchange = None;
     comparable.speculative.expected_speedup = None;
     comparable.speculative.refill_token_cost = None;
     comparable
