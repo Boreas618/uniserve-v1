@@ -413,15 +413,10 @@ impl Updater {
     pub(crate) fn promote(&self, host: &str, group: &str, rank: u32, generation: u64) {
         let mut state = self.lock();
         state.processes.adopt(host, group, rank, generation);
-        state.processes.command(
-            host,
-            generation,
-            proto::process::Command {
-                kind: Some(proto::process::command::Kind::Promote(
-                    proto::process::Promote::default(),
-                )),
-            },
-        );
+        // A standby's promotion keeps the requests' state and grows into no other layout.
+        state
+            .processes
+            .command(host, generation, update::promote(false, false));
     }
 
     /// Why `target` may not be applied without `force`: a rollback marked it

@@ -38,6 +38,7 @@ pub mod keys;
 mod leader;
 pub mod metrics;
 pub mod migration;
+pub mod observe;
 pub mod options;
 pub mod profiling;
 pub mod restart;
@@ -45,13 +46,6 @@ pub mod standby;
 pub mod supervision;
 #[cfg(test)]
 pub(crate) mod test_support;
-// The epoch layer lands beside `epochs`, which commit C deletes; nothing drives
-// the switch until the update layer that owns it lands too.
-pub mod observe;
-#[allow(
-    dead_code,
-    reason = "the switch lands before the update layer that drives it"
-)]
 pub(crate) mod updates;
 
 pub use crate::http::{node, serve};

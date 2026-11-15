@@ -126,10 +126,6 @@ pub(crate) struct ConfigStatus {
     pub(crate) unavailable: Vec<crate::updates::Unavailable>,
 }
 
-/// How long the status waits for the quotas, which each node's
-/// daemon reads from its Storage Server.
-const QUOTA_READ: Duration = Duration::from_secs(10);
-
 /// Whether `target` differs from `served` in the profiler ranges' switch
 /// alone, which the workers change in place. Every other part of the
 /// profiling configuration shapes the CUDA graphs an epoch captures at its
@@ -442,7 +438,7 @@ impl Leader {
                 "modules": crate::updates::change::modules_report(&next.modules),
             })));
         }
-        let nodes = self.serving_nodes();
+        let nodes = self.serving_nodes()?;
         if nodes.is_empty() {
             return Err(UpdateError::NoEngine);
         }
@@ -472,40 +468,54 @@ impl Leader {
     }
 
     /// The serving engines, one node each: the processes a generation update
-    /// commands, by the launch generation their reports state.
-    fn serving_nodes(&self) -> Vec<Node> {
+    /// commands, by the launch generation their reports state, each with the world's first rank
+    /// on its host and the launch of the world's scheduler node, which holds the world's first
+    /// rank.
+    ///
+    /// # Errors
+    ///
+    /// Refuses a replica whose configuration does not place its world, an engine on a host its
+    /// world places no rank on, or a world whose first rank no engine holds.
+    fn serving_nodes(&self) -> Result<Vec<Node>, UpdateError> {
         let mut nodes: Vec<Node> = Vec::new();
         for replica in self.replicas() {
             let Some(client) = replica.hold().client() else {
                 continue;
             };
-            let config = service::lock(&replica.config).engine_config().ok();
-            let ranks = config
-                .as_ref()
-                .and_then(|config| crate::engine::control::world_hosts(config).ok())
-                .unwrap_or_default();
+            let config = service::lock(&replica.config)
+                .engine_config()
+                .map_err(|error| UpdateError::Refused(format!("{error:#}")))?;
+            let ranks = crate::engine::control::world_hosts(&config)
+                .map_err(|error| UpdateError::Refused(format!("{error:#}")))?;
             let first_of = |host: &str| {
                 ranks
                     .iter()
                     .find(|ranks| ranks.host == host)
-                    .map_or(0, |ranks| ranks.first)
+                    .map(|ranks| ranks.first)
+                    .ok_or_else(|| {
+                        UpdateError::Refused(format!(
+                            "an engine serves on {host}, where its world places no rank"
+                        ))
+                    })
             };
-            // The scheduler node's process holds the world's first rank.
             let processes = client.processes();
-            let head = processes
-                .iter()
-                .find(|process| first_of(&process.host) == 0)
-                .map(|process| process.engine);
+            let mut placed = Vec::with_capacity(processes.len());
             for process in processes {
-                let rank = first_of(&process.host);
-                let head = head.unwrap_or(process.engine);
-                let scopes = config.as_ref().map_or_else(Vec::new, |config| {
-                    crate::engine::control::host_scopes(config, &process.host)
-                });
+                placed.push((first_of(&process.host)?, process));
+            }
+            let head = placed
+                .iter()
+                .find(|(first, _)| *first == 0)
+                .map(|(_, process)| process.engine)
+                .ok_or_else(|| {
+                    UpdateError::Refused("no engine holds its world's first rank".to_owned())
+                })?;
+            for (rank, process) in placed {
+                let scopes = crate::engine::control::host_scopes(&config, &process.host);
                 nodes.push(Node::new(process.host, rank, process.engine, head, scopes));
             }
         }
-        nodes
+        Ok(nodes)
     }
 
     /// Starts an update in its epoch form: `next`'s engines start beside the
@@ -534,7 +544,7 @@ impl Leader {
         let control = replicas[0].control.get().ok_or(UpdateError::NoEngine)?;
         // Every engine process that serves, of every replica and on every
         // node: each is drained by its launch generation.
-        let nodes = self.serving_nodes();
+        let nodes = self.serving_nodes()?;
         if nodes.is_empty() {
             return Err(UpdateError::Refused(format!(
                 "no engine serving epoch {} has a launch generation: this daemon neither \
@@ -771,12 +781,10 @@ impl Leader {
                         .map_err(|error| error.to_string())?
                         .map_err(|error| format!("{error:#}"))
                 };
-                Some(match tokio::time::timeout(QUOTA_READ, read).await {
-                    Ok(Ok(nodes)) => Quotas::Read(nodes),
-                    Ok(Err(error)) => Quotas::Unread { error },
-                    Err(_) => Quotas::Unread {
-                        error: format!("the quotas were not read within {QUOTA_READ:?}"),
-                    },
+                // Each node's daemon answers within the process interface's own bound.
+                Some(match read.await {
+                    Ok(nodes) => Quotas::Read(nodes),
+                    Err(error) => Quotas::Unread { error },
                 })
             }
             _ => None,
@@ -1067,7 +1075,7 @@ mod tests {
         served.max_running_requests = std::num::NonZeroUsize::new(8).unwrap();
         let mut target = served.clone();
         target.max_running_requests = std::num::NonZeroUsize::new(4).unwrap();
-        target.attention_backend = Some("trtllm".to_owned());
+        target.attention_backend = Some("attention-c".to_owned());
         let capacity = proto::request::wire::BatchCapacity {
             max_batch: 8,
             max_num_batched_tokens: 8192,
@@ -1118,20 +1126,6 @@ mod tests {
                 Some(vec![std::num::NonZeroU32::new(2).unwrap()]);
         }));
         assert!(layouts_differ(&[served.clone(), served.clone()], &[served]));
-    }
-
-    /// A node's storage report as its daemon states it, with what the
-    /// deployment's transfers copied there by priority.
-    fn node(host: &str, totals: &[(storage::protocol::Priority, u64, u64)]) -> String {
-        let transfers: Vec<_> = totals
-            .iter()
-            .map(|&(priority, bytes, copied)| storage::protocol::TaskTotal {
-                priority,
-                bytes,
-                copied,
-            })
-            .collect();
-        serde_json::json!({ "host": host, "quotas": [], "transfers": transfers }).to_string()
     }
 
     /// The status names the epoch that executes; the engine reads no storage

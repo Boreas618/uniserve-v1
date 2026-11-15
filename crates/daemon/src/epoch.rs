@@ -911,7 +911,7 @@ mod tests {
         EpochRecord {
             config: config.engine_config().expect("the configuration resolves"),
             engine: package("uniserve"),
-            kernels: BTreeMap::from([(KernelKey::all("rms_norm"), package("triton"))]),
+            kernels: BTreeMap::from([(KernelKey::all("rms_norm"), package("base"))]),
             policy: package("fcfs"),
             previous: None,
             status: Status::Serving,
@@ -926,7 +926,7 @@ mod tests {
     fn a_change_of_the_models_files_is_an_epoch_change() {
         let serving = Epoch::of(ServerArgs::default()).expect("the configuration resolves");
         let other = ServerArgs {
-            model: Some("/models/other".to_owned()),
+            model: Some("org/other-model".to_owned()),
             ..Default::default()
         };
         assert_eq!(
@@ -1234,16 +1234,16 @@ mod tests {
                 |config: &mut ServerArgs| config.speculative_config.refill_token_cost = Some(0.5),
             ),
             ("attention_backend", |config: &mut ServerArgs| {
-                config.attention_backend = Some("flashinfer".to_owned())
+                config.attention_backend = Some("attention-a".to_owned())
             }),
             ("prefill_attention_backend", |config: &mut ServerArgs| {
-                config.prefill_attention_backend = Some("fa4".to_owned())
+                config.prefill_attention_backend = Some("attention-b".to_owned())
             }),
             ("decode_attention_backend", |config: &mut ServerArgs| {
-                config.decode_attention_backend = Some("trtllm".to_owned())
+                config.decode_attention_backend = Some("attention-c".to_owned())
             }),
             ("moe_runner_backend", |config: &mut ServerArgs| {
-                config.moe_runner_backend = Some("cutlass".to_owned())
+                config.moe_runner_backend = Some("grouped".to_owned())
             }),
         ];
 
@@ -1336,7 +1336,7 @@ mod tests {
         // A package's revision is a generation change: the same backend
         // and parameters at a newly installed revision move the modules.
         let named_base = Epoch::of(set(|config: &mut ServerArgs| {
-            config.attention_backend = Some("trtllm".to_owned());
+            config.attention_backend = Some("attention-c".to_owned());
         }))
         .expect("the configuration resolves");
         let mut installed = named_base.clone();
@@ -1428,8 +1428,8 @@ mod tests {
         // Per-phase attention: two entries, each naming its phase, once the
         // fields state different backends.
         let split = ServerArgs {
-            prefill_attention_backend: Some("fa4".to_owned()),
-            decode_attention_backend: Some("trtllm".to_owned()),
+            prefill_attention_backend: Some("attention-b".to_owned()),
+            decode_attention_backend: Some("attention-c".to_owned()),
             ..Default::default()
         };
         let modules = crate::epoch::modules_of(&split);
@@ -1438,7 +1438,7 @@ mod tests {
         let decode = &modules.kernels[&KernelKey::phase(operator::PAGED_ATTENTION, Phase::Decode)];
         assert_eq!(
             (prefill.backend.as_str(), decode.backend.as_str()),
-            ("fa4", "trtllm")
+            ("attention-b", "attention-c")
         );
         assert!(
             !modules
@@ -1452,13 +1452,13 @@ mod tests {
         // phase falls back to `attention_backend`, which the split above
         // keeps as a phase of its own.
         let one = ServerArgs {
-            attention_backend: Some("fa4".to_owned()),
+            attention_backend: Some("attention-b".to_owned()),
             ..Default::default()
         };
         let modules = crate::epoch::modules_of(&one);
         assert_eq!(
             modules.kernels[&KernelKey::all(operator::PAGED_ATTENTION)].backend,
-            "fa4"
+            "attention-b"
         );
         assert!(
             !modules
@@ -1467,27 +1467,27 @@ mod tests {
             "one backend covers every phase of the operator"
         );
         let agreed = ServerArgs {
-            prefill_attention_backend: Some("fa4".to_owned()),
-            decode_attention_backend: Some("fa4".to_owned()),
+            prefill_attention_backend: Some("attention-b".to_owned()),
+            decode_attention_backend: Some("attention-b".to_owned()),
             ..Default::default()
         };
         let modules = crate::epoch::modules_of(&agreed);
         assert_eq!(
             modules.kernels[&KernelKey::all(operator::PAGED_ATTENTION)].backend,
-            "fa4",
+            "attention-b",
             "phases that agree collapse to the operator's slot"
         );
 
         // A stated grouped expert GEMM package fills both of its operators.
         let moe = ServerArgs {
-            moe_runner_backend: Some("cutlass".to_owned()),
+            moe_runner_backend: Some("grouped".to_owned()),
             ..Default::default()
         };
         let modules = crate::epoch::modules_of(&moe);
         for operator in [operator::GATHER_GEMM, operator::ROUTE_GEMM] {
             assert_eq!(
                 modules.kernels[&KernelKey::all(operator)].backend,
-                "cutlass"
+                "grouped"
             );
         }
     }
@@ -1498,7 +1498,7 @@ mod tests {
     #[test]
     fn an_unset_backend_names_no_package() {
         let mut config = ServerArgs {
-            decode_attention_backend: Some("triton".to_owned()),
+            decode_attention_backend: Some("base".to_owned()),
             ..Default::default()
         };
         let modules = crate::epoch::modules_of(&config);
@@ -1507,12 +1507,12 @@ mod tests {
             vec![KernelKey::phase(operator::PAGED_ATTENTION, Phase::Decode)]
         );
 
-        config.attention_backend = Some("trtllm".to_owned());
+        config.attention_backend = Some("attention-c".to_owned());
         config.decode_attention_backend = None;
         let modules = crate::epoch::modules_of(&config);
         assert_eq!(
             modules.kernels[&KernelKey::all(operator::PAGED_ATTENTION)].backend,
-            "trtllm"
+            "attention-c"
         );
     }
 
@@ -1556,7 +1556,7 @@ mod tests {
         let rolled_back = proto::process::Report {
             kind: Some(Kind::PolicyRolledBack(proto::process::PolicyRolledBack {
                 scheduler: Some(2),
-                backend: "trtllm".to_owned(),
+                backend: "attention-c".to_owned(),
                 revision: 7,
                 reason: "the fuel budget is exhausted".to_owned(),
                 fatal: false,
@@ -1565,7 +1565,7 @@ mod tests {
         let failure = Failure::of_report(&rolled_back).expect("a policy rollback fails the update");
         assert_eq!(failure.kind, FailureKind::PolicyRolledBack);
         assert!(failure.reason.contains("scheduler 2"), "{}", failure.reason);
-        assert!(failure.reason.contains("trtllm"), "{}", failure.reason);
+        assert!(failure.reason.contains("attention-c"), "{}", failure.reason);
         assert!(failure.reason.contains("revision 7"), "{}", failure.reason);
         assert!(
             failure.reason.contains("the fuel budget is exhausted"),
@@ -1634,7 +1634,7 @@ mod tests {
         second.status = Status::Preparing;
         second.kernels.insert(
             KernelKey::phase(operator::PAGED_ATTENTION, Phase::Decode),
-            package("trtllm"),
+            package("attention-c"),
         );
         epochs.record(2, second);
         assert_eq!(
@@ -1659,7 +1659,7 @@ mod tests {
         assert_eq!(entries[1]["kernels"][0]["phase"], Value::from("decode"));
         assert_eq!(
             entries[1]["kernels"][0]["package"]["backend"],
-            Value::from("trtllm")
+            Value::from("attention-c")
         );
     }
 

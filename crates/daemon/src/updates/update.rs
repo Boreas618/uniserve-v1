@@ -326,9 +326,6 @@ pub(crate) struct Update {
     uncompared: Vec<String>,
     /// Why the claim that ended the update failed, when it did.
     claim_failed: Option<String>,
-    /// Whether a serving engine was lost during the update, which hands its
-    /// failure domain to the standby promotion or a relaunch.
-    promotion_due: bool,
 }
 
 impl Update {
@@ -424,7 +421,6 @@ impl Update {
             trial_began: None,
             uncompared: Vec::new(),
             claim_failed: None,
-            promotion_due: false,
         }
     }
 
@@ -488,12 +484,6 @@ impl Update {
                 .map(|index| self.nodes[*index].launch)
                 .collect(),
         }
-    }
-
-    /// Whether a serving engine was lost during the update: its failure
-    /// domain is the standby promotion's or a relaunch's.
-    pub(crate) fn promotion_due(&self) -> bool {
-        self.promotion_due
     }
 
     /// Epochs this update dropped whose storage a later claim retires.
@@ -935,7 +925,6 @@ impl Update {
             // domain is replaced by a standby or a relaunch of the modules
             // the epoch's record names, which are the kept ones until a
             // commit.
-            self.promotion_due = true;
             match self.phase {
                 Phase::Preparing => self.abandon(processes, exited),
                 Phase::Switching | Phase::Trial => self.roll_back(processes, exited, Some(index)),
@@ -957,14 +946,10 @@ impl Update {
 
         trial.previous_exited.insert(index);
         match (self.phase, self.back) {
-            (Phase::Preparing, _) => {
-                self.promotion_due = true;
-                self.abandon(processes, exited);
-            }
+            (Phase::Preparing, _) => self.abandon(processes, exited),
             (Phase::Switching, false) => {
                 // Nothing is left to drain there: its requests end as
                 // migratable with its loss, and the target takes them.
-                self.promotion_due = true;
                 trial.drained.insert(index);
             }
             (Phase::Switching, true) => {
@@ -978,7 +963,6 @@ impl Update {
             // The trial stopped it: its exit lets the node release all but
             // the weights it keeps.
             (Phase::Trial, _) if trial.previous_stopped => self.keep_weights(processes, index),
-            (Phase::Trial, _) => self.promotion_due = true,
             _ => {}
         }
     }
@@ -1412,7 +1396,7 @@ fn grow_on(processes: &mut Processes, host: &str, engines: &[Node]) {
 /// The promotion of an epoch switch: whether the requests that migrate onto
 /// the engine compute their state again, and whether it grows its regions as
 /// the engine draining beside it gives its memory back.
-fn promote(recompute: bool, grow: bool) -> process::Command {
+pub(crate) fn promote(recompute: bool, grow: bool) -> process::Command {
     command(command::Kind::Promote(process::Promote { recompute, grow }))
 }
 
