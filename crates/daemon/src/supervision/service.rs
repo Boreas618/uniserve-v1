@@ -1208,25 +1208,18 @@ pub(crate) fn run_leader(
         // The numbers engines stated take effect before this round's
         // commands go down, so a command the updater sends right after a
         // process reported itself ready already reaches that process.
-        for (arrived, number) in renumbered.drain(..) {
-            let Some(mut connection) = engines.remove(&arrived) else {
-                continue;
-            };
-            connection.process_of = Some(number);
-            if let Some(displaced) = engines.remove(&number) {
-                // Nothing addresses a peer that states no number: it is a
-                // worker's client or a client of this interface, and the
-                // number is the engine's.
-                let fresh = next_engine;
-                next_engine += 1;
-                engines.insert(fresh, displaced);
-                tracing::info!(
-                    engine = fresh,
-                    stated = number,
-                    "a peer was moved off the number an engine states"
-                );
+        let filed = file_stated(&mut engines, renumbered.drain(..), &mut next_engine);
+        for (fresh, stated) in filed.displaced {
+            tracing::info!(
+                engine = fresh,
+                stated,
+                "a peer was moved off the number an engine states"
+            );
+        }
+        for (number, arrived) in filed.numbered {
+            if let Some(connection) = engines.get_mut(&number) {
+                connection.process_of = Some(number);
             }
-            engines.insert(number, connection);
             process_links.insert(number, arrived);
             tracing::info!(
                 engine = number,
@@ -1255,6 +1248,55 @@ pub(crate) fn run_leader(
         }
         stop.drain();
     }
+}
+
+/// What [`file_stated`] did: each engine filed under the number it stated, with the number its
+/// arrival gave it, and each peer moved off a stated number, with its new number.
+struct Filed {
+    /// `(stated, arrived)` per engine filed under its stated number.
+    numbered: Vec<(u64, u64)>,
+    /// `(new number, stated)` per peer that held a stated number without stating it.
+    displaced: Vec<(u64, u64)>,
+}
+
+/// Files every engine that stated its number this round under that number.
+///
+/// `moves` holds `(arrived, stated)`: the number an engine's arrival gave it and the number it
+/// stated. Every moving engine is taken out by its arrival number before any is filed, so a
+/// stated number that is another moving engine's arrival number (two engines that arrived in
+/// each other's order) is never confused with it, and a command for a stated number reaches the
+/// engine that stated it. A peer that holds a stated number without having stated it (a worker's
+/// client, or a client of this interface, which nothing addresses) moves to the next number no
+/// peer holds. A move whose arrival number holds no peer (it closed) is skipped.
+fn file_stated<C>(
+    engines: &mut HashMap<u64, C>,
+    moves: impl IntoIterator<Item = (u64, u64)>,
+    next_engine: &mut u64,
+) -> Filed {
+    let moving: Vec<(u64, u64, C)> = moves
+        .into_iter()
+        .filter_map(|(arrived, stated)| {
+            engines.remove(&arrived).map(|peer| (arrived, stated, peer))
+        })
+        .collect();
+    let mut filed = Filed {
+        numbered: Vec::with_capacity(moving.len()),
+        displaced: Vec::new(),
+    };
+    let stated: Vec<u64> = moving.iter().map(|(_, stated, _)| *stated).collect();
+    for (arrived, number, peer) in moving {
+        if let Some(displaced) = engines.remove(&number) {
+            while engines.contains_key(next_engine) || stated.contains(next_engine) {
+                *next_engine += 1;
+            }
+            engines.insert(*next_engine, displaced);
+            filed.displaced.push((*next_engine, number));
+            *next_engine += 1;
+        }
+        engines.insert(number, peer);
+        filed.numbered.push((number, arrived));
+    }
+    filed
 }
 
 /// A stop the leader applied on its own node, awaiting the members' replies.
@@ -1876,4 +1918,46 @@ fn wait(descriptors: &[RawFd], timeout: Duration) {
             timeout.as_millis() as libc::c_int,
         )
     };
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Two engines whose stated numbers are each other's arrival numbers (the second replica
+    /// of an epoch connected first) are each filed under the number it stated, so a command
+    /// for either reaches it, and a client holding a stated number moves to a free one.
+    #[test]
+    fn engines_that_arrived_in_each_others_order_are_filed_under_their_own_numbers() {
+        let mut engines: HashMap<u64, &str> =
+            HashMap::from([(11, "states 12"), (12, "states 11"), (13, "client")]);
+        let mut next_engine = 13;
+        let filed = file_stated(
+            &mut engines,
+            [(12, 11), (11, 12), (14, 13)],
+            &mut next_engine,
+        );
+
+        assert_eq!(engines.get(&11), Some(&"states 11"));
+        assert_eq!(engines.get(&12), Some(&"states 12"));
+        assert_eq!(filed.numbered, vec![(11, 12), (12, 11)]);
+        // The move from arrival 14 names no peer; the client keeps its number.
+        assert_eq!(engines.get(&13), Some(&"client"));
+        assert!(filed.displaced.is_empty());
+    }
+
+    #[test]
+    fn a_client_on_a_stated_number_moves_to_a_number_no_peer_holds() {
+        let mut engines: HashMap<u64, &str> =
+            HashMap::from([(1, "client"), (2, "states 1"), (3, "other")]);
+        let mut next_engine = 2;
+        let filed = file_stated(&mut engines, [(2, 1)], &mut next_engine);
+
+        assert_eq!(engines.get(&1), Some(&"states 1"));
+        assert_eq!(engines.get(&3), Some(&"other"));
+        let (fresh, stated) = filed.displaced[0];
+        assert_eq!(stated, 1);
+        assert_eq!(engines.get(&fresh), Some(&"client"));
+        assert_eq!(engines.len(), 3);
+    }
 }
