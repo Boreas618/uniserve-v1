@@ -14,6 +14,7 @@
 use std::fs::File;
 use std::os::fd::AsFd;
 use std::os::unix::fs::FileExt;
+use std::time::Duration;
 
 use ::storage::protocol::UnitRun;
 use ::storage::runtime::{
@@ -41,15 +42,19 @@ fn files(parts: Vec<std::os::fd::OwnedFd>) -> Vec<File> {
     parts.into_iter().map(File::from).collect()
 }
 
-/// A prefetch of keys 7 and 9 from the peers.
+/// A prefetch of keys 7 and 9 from the peers, due within the tests' patience on the host's
+/// monotonic clock, which the buffer pool's deadlines are stated in.
 fn from_peers() -> Request {
+    let now = rustix::time::clock_gettime(rustix::time::ClockId::Monotonic);
+    let now = Duration::new(now.tv_sec.unsigned_abs(), now.tv_nsec.unsigned_abs() as u32);
+    let deadline = u64::try_from((now + crate::PATIENCE).as_nanos()).unwrap();
     Request::Prefetch {
         group: PREFILL,
         class: KV,
         units: 0,
         keys: vec![key(7), key(9)],
         source: Source::Peers,
-        deadline: u64::MAX / 2,
+        deadline,
     }
 }
 
