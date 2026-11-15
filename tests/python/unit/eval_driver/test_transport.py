@@ -214,6 +214,28 @@ def test_stream_rejects_non_object_events() -> None:
     assert record.token_timing_available is False
 
 
+def test_stream_records_the_error_event_it_carries() -> None:
+    # A request the engine refused after the stream began: UniServe writes the
+    # error event of the OpenAI error body, then the sentinel.
+    error = {
+        "message": "request exceeds total KV capacity",
+        "type": "invalid_request_error",
+        "code": "invalid_request_error",
+    }
+    body = f"data: {json.dumps({'error': error})}\n\ndata: [DONE]\n\n"
+    record = _send(
+        _event_stream(body),
+        TaskRequest(CHAT_COMPLETIONS, {"model": "m"}, stream=True),
+        task="text",
+    )
+
+    assert record.success is False
+    assert record.classifier == "model_error"
+    assert record.record_dict()["error"] == (
+        "invalid_request_error: request exceeds total KV capacity"
+    )
+
+
 def test_a_closed_stream_record_keeps_its_tokens_out_of_the_collector() -> None:
     # Two token events with their top candidates, as UniServe streams them
     # under `logprobs`, `top_logprobs` and `return_token_ids`. A load keeps

@@ -8,6 +8,7 @@ visible content.
 
 from __future__ import annotations
 
+import json
 from typing import Any
 
 
@@ -17,8 +18,8 @@ class StreamOutcome:
     The streaming chat transport folds each event into its record as it
     completes and keeps no event, so the facts the classification needs are
     gathered here one event at a time: how many events arrived, whether any
-    was not a JSON object or was a ``parse_error`` marker, whether any
-    carried an error object, whether the stream terminated, and whether any
+    was not a JSON object or was a ``parse_error`` marker, the first error
+    object an event carried, whether the stream terminated, and whether any
     carried output.
     """
 
@@ -26,7 +27,9 @@ class StreamOutcome:
         """Start with no event observed."""
         self.events = 0
         self.invalid = False
-        self.error = False
+        # The first error object's type and message, as the request's record
+        # states its failure; ``None`` while no event carried one.
+        self.error: str | None = None
         self.terminal = False
         self.output = False
 
@@ -36,8 +39,9 @@ class StreamOutcome:
         if not isinstance(event, dict) or event.get("type") == "parse_error":
             self.invalid = True
             return
-        if isinstance(event.get("error"), dict):
-            self.error = True
+        error = event.get("error")
+        if isinstance(error, dict) and self.error is None:
+            self.error = _error_text(error)
         # The `sse_done` event type is synthesized by `SseParser` for the
         # `[DONE]` sentinel, and `parse_error` for malformed JSON under the
         # `record` parse-error policy that `_send_chat_stream` passes;
@@ -61,13 +65,27 @@ class StreamOutcome:
             return False, "response_empty_response"
         if self.invalid:
             return False, "response_invalid_event"
-        if self.error:
+        if self.error is not None:
             return False, "model_error"
         if not self.terminal:
             return False, "response_missing_terminal"
         if not self.output:
             return False, "response_empty_output"
         return True, "ok"
+
+
+def _error_text(error: dict[str, Any]) -> str:
+    """State an OpenAI-style error object as ``type: message``.
+
+    A server that fails a request after its stream began reports the failure
+    as an event carrying ``{"error": {"message", "type", ...}}``; the record
+    keeps its type and message, or the whole object when it states neither.
+    """
+    message = error.get("message")
+    kind = error.get("type")
+    if not isinstance(message, str) or not message:
+        return json.dumps(error, sort_keys=True)
+    return f"{kind}: {message}" if isinstance(kind, str) and kind else message
 
 
 class OpenAIChat:

@@ -326,7 +326,9 @@ async def _send_chat_stream(
     if ok:
         record.mark_success()
     else:
-        record.mark_failure(classifier)
+        # An error event the stream carried is the server's own statement of
+        # the failure, which the record keeps beside its classifier.
+        record.mark_failure(classifier, outcome.error)
 
     # Images decode after timing is folded; a decode failure replaces the
     # stream's classification.
