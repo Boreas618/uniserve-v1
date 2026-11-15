@@ -21,7 +21,7 @@ use super::{
 };
 
 /// The most regions a pool numbers at once: a run names its region by a byte (§11), and a
-/// region's number is reused once it holds no unit and no session names it.
+/// region's number is reused once the region is closed (every session that named it ended).
 const REGIONS: usize = u8::MAX as usize;
 
 /// The most worker groups a session states: a key of a `Listing` names the groups that hold or
@@ -244,11 +244,8 @@ impl BufferPool {
         units: u32,
         limit: u32,
     ) -> u8 {
-        // A region that holds no unit and that no session names leaves its number to a new one:
-        // the lowest such number, else the next.
-        let named = self.named_by_sessions();
-        let reused = (0..self.regions.len())
-            .find(|index| self.regions[*index].units() == 0 && !named.contains(&(*index as u8)));
+        // A closed region leaves its number to a new one: the lowest closed number, else the next.
+        let reused = (0..self.regions.len()).find(|index| self.regions[*index].closed);
         let id = reused.unwrap_or(self.regions.len()) as u8;
         let bytes = (unit_bytes, part_bytes);
         let mut region = Region::new(id, name, tier, space, bytes, reserved, 0, limit);
@@ -279,6 +276,7 @@ impl BufferPool {
         for (offset, bytes) in found.shrink(u32::MAX) {
             insert_range(&mut self.quota[space], offset, bytes);
         }
+        found.closed = true;
         self.settle_counts();
     }
 
@@ -312,6 +310,17 @@ impl BufferPool {
         self.fits(open)?;
 
         // Every check passed: nothing below refuses.
+        // A closed region the session states again by its name opens again under its number and
+        // numbering, before any new region takes a closed number.
+        for stated in &open.regions {
+            if let Some(found) = self
+                .regions
+                .iter_mut()
+                .find(|region| region.name == stated.name)
+            {
+                found.closed = false;
+            }
+        }
         let mut reserved = self.memories_in_use();
         let named = self.named_by_sessions();
         let mut numbers = Vec::with_capacity(open.regions.len());
@@ -626,13 +635,16 @@ impl BufferPool {
                 }
             }
         }
+        // A stated name the pool holds opens that region (again, if it was closed); every other
+        // name takes a closed number the admission does not open again, else the next.
         let new = names
             .iter()
             .filter(|name| !self.regions.iter().any(|region| region.name == **name))
             .count();
-        let named = self.named_by_sessions();
-        let reusable = (0..self.regions.len())
-            .filter(|index| self.regions[*index].units() == 0 && !named.contains(&(*index as u8)))
+        let reusable = self
+            .regions
+            .iter()
+            .filter(|region| region.closed && !names.contains(&region.name.as_str()))
             .count();
         if self.regions.len() + new.saturating_sub(reusable) > REGIONS {
             return Err(format!(

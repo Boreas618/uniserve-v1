@@ -2943,6 +2943,60 @@ fn a_pool_made_again_from_its_image_carries_a_waiting_crossing() {
     assert_eq!(fixture.free(UNITS), 4);
 }
 
+/// Each region an admission states takes a number of its own, a region stated with no unit yet
+/// (a KV region stated before its memory exists) among them; a region's number goes to a new
+/// region only once the region closed with the last session that named it, and a closed region
+/// a later session states again by its name opens again under its number.
+#[test]
+fn a_region_number_is_reused_only_once_its_region_closed() {
+    use storage::runtime::Region;
+
+    let empty = |name: &str| Region {
+        name: name.into(),
+        tier: Tier::Device,
+        space: "units".into(),
+        unit_bytes: 64,
+        part_bytes: 64,
+        reserved: 0,
+        units: 0,
+        limit: 8,
+        segments: Vec::new(),
+        memory: String::new(),
+    };
+    // The group takes class 0's blocks from the layout's "units" region and from both new KV
+    // regions (stated sixth and seventh).
+    let mut first = processes_layout(vec![stated(
+        0,
+        "process a",
+        1,
+        vec![vec![0, 6, 7], vec![3]],
+    )]);
+    first.regions.push(empty("kv a"));
+    first.regions.push(empty("kv b"));
+    let mut pool = BufferPool::new((1_000, 1_000));
+    pool.admit(SERVING, &first).unwrap();
+    let a = pool.region_number("kv a").unwrap();
+    let b = pool.region_number("kv b").unwrap();
+    assert_ne!(a, b);
+    let numbers: std::collections::BTreeSet<u8> = first
+        .regions
+        .iter()
+        .map(|region| pool.region_number(&region.name).unwrap())
+        .collect();
+    assert_eq!(numbers.len(), first.regions.len());
+    let units = pool.region_number("units").unwrap();
+
+    // The session ends: its device regions close, and their numbers go to the next new regions.
+    pool.end(SERVING);
+    let mut second = processes_layout(vec![stated(0, "process a", 1, vec![vec![0, 6], vec![3]])]);
+    second.epoch = 2;
+    second.regions.push(empty("kv c"));
+    pool.admit(2, &second).unwrap();
+    assert!(numbers.contains(&pool.region_number("kv c").unwrap()));
+    // A region the second session states again by its name keeps its number.
+    assert_eq!(pool.region_number("units"), Some(units));
+}
+
 /// A deployment's sessions state at most 64 memories in use at once, not over the pool's life:
 /// a session whose memories no session states any more and no block is valid in leaves their
 /// numbers to the memories of the sessions that come after it, while a layout that would state

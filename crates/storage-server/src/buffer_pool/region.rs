@@ -78,6 +78,11 @@ pub(crate) struct Region {
     /// validity, when its units exist once (a rank's product buffer); `None`
     /// when they exist in every memory that maps it (`storage::runtime::Region::memory`).
     pub(crate) memory: Option<u8>,
+    /// Whether the region was closed ([`super::BufferPool::close_region`]): its units went back
+    /// to the quota and its number is free for the next region opened. A region opened and not
+    /// yet named by a session (one an admission states before its session opens) is not closed,
+    /// however few units it holds.
+    pub(crate) closed: bool,
     /// The free runs by their first unit; neighbours are joined.
     free: BTreeMap<u32, Run>,
     /// The runs outside the region by their first unit.
@@ -135,6 +140,7 @@ impl Region {
             unit_bytes,
             part_bytes,
             memory: None,
+            closed: false,
             free: BTreeMap::new(),
             outside: BTreeMap::new(),
             units,

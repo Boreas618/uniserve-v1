@@ -32,7 +32,7 @@ use super::{
 /// written are records of this build's runtime interface
 /// (`storage::runtime::VERSION`). A change of the image or of those records
 /// is a new format.
-pub(crate) const FORMAT: u32 = 6;
+pub(crate) const FORMAT: u32 = 7;
 
 /// The image of a pool, over the regions `R` and the blocks `B`: borrowed
 /// from a pool to write it, owned to make a pool of it. Maps keyed by more
