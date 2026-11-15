@@ -679,7 +679,16 @@ pub async fn take_over(
         (Message::Prepare(prepare), _) => prepare,
         (other, _) => anyhow::bail!("the daemon sent {other:?} first"),
     };
-    match prepared_successor(&mut channel, *prepare, &families, shutdown).await {
+    // The successor's whole bring-up is one future, which lives on the heap rather than in the
+    // caller's frame.
+    match Box::pin(prepared_successor(
+        &mut channel,
+        *prepare,
+        &families,
+        shutdown,
+    ))
+    .await
+    {
         Ok(()) => Ok(()),
         Err(error) => {
             let _ = send(
