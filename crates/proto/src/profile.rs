@@ -165,26 +165,54 @@ impl RangeMetricsOptions {
 pub struct PcSamplingOptions {
     /// Each SM samples a warp every `2^period` cycles
     /// (`CUPTI_PC_SAMPLING_CONFIGURATION_ATTR_TYPE_SAMPLING_PERIOD`), one of
-    /// [`PcSamplingOptions::PERIODS`]. A worker refuses a period whose
-    /// samples, at its device's sampling rate, no hardware buffer CUPTI
-    /// accepts holds between CUPTI's reads of it.
+    /// [`PcSamplingOptions::PERIODS`].
     pub period: u32,
+    /// The hardware buffer CUPTI keeps the samples in, in MiB of process
+    /// host storage, which CUPTI's own thread empties
+    /// (`CUPTI_PC_SAMPLING_CONFIGURATION_ATTR_TYPE_HARDWARE_BUFFER_SIZE`), one
+    /// of [`PcSamplingOptions::HARDWARE_BUFFERS_MIB`]. A buffer that fills
+    /// between CUPTI's reads loses samples, and the worker then releases the
+    /// collector as failed, naming the period and the buffer: a device whose
+    /// samples outrun the buffer at the period samples at a longer period or
+    /// into a larger buffer.
+    pub hardware_buffer_mib: u32,
 }
 
 impl PcSamplingOptions {
     /// The sampling periods CUPTI accepts: 5 to 31, as its PC sampling
     /// API states for `CUPTI_PC_SAMPLING_CONFIGURATION_ATTR_TYPE_SAMPLING_PERIOD`.
     pub const PERIODS: RangeInclusive<u32> = 5..=31;
-}
 
-impl Default for PcSamplingOptions {
-    fn default() -> Self {
-        Self { period: 17 }
+    /// The hardware buffers a session asks for, in MiB: up to CUPTI's
+    /// default, which is its largest.
+    pub const HARDWARE_BUFFERS_MIB: RangeInclusive<u32> = 1..=DEFAULT_PC_HARDWARE_BUFFER_MIB;
+
+    /// The hardware buffer in bytes.
+    pub fn hardware_buffer(&self) -> usize {
+        (self.hardware_buffer_mib as usize) << 20
     }
 }
 
+/// The PC sampling hardware buffer a session takes when it states none, in MiB: CUPTI's own
+/// default and largest buffer, which holds the samples of the shortest periods longest.
+pub const DEFAULT_PC_HARDWARE_BUFFER_MIB: u32 = 512;
+
+impl Default for PcSamplingOptions {
+    fn default() -> Self {
+        Self {
+            period: 17,
+            hardware_buffer_mib: DEFAULT_PC_HARDWARE_BUFFER_MIB,
+        }
+    }
+}
+
+/// How often a worker reads its armed samplers when a session states none, in milliseconds: often
+/// enough that a PM sampler's buffers, which hold two read periods of samples, stay a few MiB at
+/// the default interval, and seldom enough that the reads cost the rank's host little.
+pub const DEFAULT_SAMPLER_READ_MS: u64 = 100;
+
 /// A session's request, as `POST /admin/profile` takes it.
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct SessionRequest {
     pub collectors: Vec<Collector>,
@@ -211,11 +239,38 @@ pub struct SessionRequest {
     pub pm_sampling: PmSamplingOptions,
     pub range_metrics: RangeMetricsOptions,
     pub pc_sampling: PcSamplingOptions,
+    /// How often each worker reads its armed samplers (`pm_sampling` and
+    /// `pc_sampling`), in milliseconds: a PM sampler's counter data image and
+    /// hardware buffer hold the samples of two read periods, and a PC take
+    /// reads what CUPTI gathered since the last one. Neither interface states
+    /// an event for samples gathered, so a worker reads them at this period.
+    pub sampler_read_ms: u64,
     /// How much longer than before the session a step may take on
     /// average, as a fraction (`0.1` for 10%), before the guard turns off
     /// the costliest collector, and then ends the session; unguarded when
     /// unset.
     pub max_slowdown: Option<f64>,
+}
+
+impl Default for SessionRequest {
+    fn default() -> Self {
+        Self {
+            collectors: Vec::new(),
+            start_step: 0,
+            steps: None,
+            seconds: None,
+            stages: Vec::new(),
+            workers: Vec::new(),
+            modules: Vec::new(),
+            output_dir: PathBuf::new(),
+            timeline: TimelineOptions::default(),
+            pm_sampling: PmSamplingOptions::default(),
+            range_metrics: RangeMetricsOptions::default(),
+            pc_sampling: PcSamplingOptions::default(),
+            sampler_read_ms: DEFAULT_SAMPLER_READ_MS,
+            max_slowdown: None,
+        }
+    }
 }
 
 impl SessionRequest {
@@ -327,6 +382,17 @@ impl SessionRequest {
                 PcSamplingOptions::PERIODS.start(),
                 PcSamplingOptions::PERIODS.end()
             ));
+        }
+        if !PcSamplingOptions::HARDWARE_BUFFERS_MIB.contains(&self.pc_sampling.hardware_buffer_mib)
+        {
+            return Err(format!(
+                "pc_sampling.hardware_buffer_mib is from {} to {}, CUPTI's largest buffer",
+                PcSamplingOptions::HARDWARE_BUFFERS_MIB.start(),
+                PcSamplingOptions::HARDWARE_BUFFERS_MIB.end()
+            ));
+        }
+        if self.sampler_read_ms == 0 {
+            return Err("sampler_read_ms is a positive number of milliseconds".to_owned());
         }
         if self.range_metrics.pass_ranges < RANGE_STEP_LAUNCHES
             || u32::try_from(self.range_metrics.pass_ranges).is_err()
@@ -543,7 +609,10 @@ mod tests {
                 ..request()
             },
             SessionRequest {
-                pc_sampling: PcSamplingOptions { period: 20 },
+                pc_sampling: PcSamplingOptions {
+                    period: 20,
+                    ..PcSamplingOptions::default()
+                },
                 ..request()
             },
             SessionRequest {
@@ -560,12 +629,38 @@ mod tests {
             },
             SessionRequest {
                 collectors: vec![Collector::PcSampling],
-                pc_sampling: PcSamplingOptions { period: 4 },
+                pc_sampling: PcSamplingOptions {
+                    period: 4,
+                    ..PcSamplingOptions::default()
+                },
                 ..request()
             },
             SessionRequest {
                 collectors: vec![Collector::PcSampling],
-                pc_sampling: PcSamplingOptions { period: 32 },
+                pc_sampling: PcSamplingOptions {
+                    period: 32,
+                    ..PcSamplingOptions::default()
+                },
+                ..request()
+            },
+            SessionRequest {
+                collectors: vec![Collector::PcSampling],
+                pc_sampling: PcSamplingOptions {
+                    hardware_buffer_mib: 0,
+                    ..PcSamplingOptions::default()
+                },
+                ..request()
+            },
+            SessionRequest {
+                collectors: vec![Collector::PcSampling],
+                pc_sampling: PcSamplingOptions {
+                    hardware_buffer_mib: 513,
+                    ..PcSamplingOptions::default()
+                },
+                ..request()
+            },
+            SessionRequest {
+                sampler_read_ms: 0,
                 ..request()
             },
             SessionRequest {

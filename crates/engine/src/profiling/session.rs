@@ -20,7 +20,9 @@
 //! [`Session::end`]) and, when either returns `true`, waits for the rank's streams and then
 //! changes the collectors ([`Session::apply`]).
 //!
-//! A sampler thread drains the armed samplers every [`DRAIN_PERIOD`]. The rank reports its
+//! A sampler thread reads the armed samplers every read period the session states
+//! (`sampler_read_ms`): neither PM nor PC sampling states an event for samples gathered, so their
+//! hardware buffers are read at a period they are sized for. The rank reports its
 //! progress with every batch result (`ForwardStats::profile`, [`Session::progress`]): the steps
 //! its window took, the bytes of its file, and that its window ended. The daemon ends the session
 //! with `uniserve.profile_stop` when every window ended, its time passed, the operator ends it,
@@ -45,9 +47,6 @@ use super::collectors::{self, Collectors};
 use super::markers::{Markers, realtime};
 use crate::worker::{Error, Result};
 use service::lock;
-
-/// How often the sampler thread drains the armed samplers.
-pub(super) const DRAIN_PERIOD: Duration = Duration::from_millis(100);
 
 /// A change of the collectors a step's forward waits for.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -258,7 +257,10 @@ impl Session {
         let device_storage = collectors.device_storage();
         let running = collectors.running();
         let collectors = Arc::new(Mutex::new(collectors));
-        let sampler = sampler(Arc::clone(&collectors))?;
+        let sampler = sampler(
+            Arc::clone(&collectors),
+            Duration::from_millis(request.sampler_read_ms),
+        )?;
         let response = RankStart {
             rank,
             selected: true,
@@ -529,13 +531,17 @@ fn clocks(rows: &Sender<Message>, device: DeviceId, source: &'static str) {
     }
 }
 
-/// The thread that drains the armed samplers every [`DRAIN_PERIOD`], until its sender is dropped.
-fn sampler(collectors: Arc<Mutex<Collectors>>) -> Result<(mpsc::Sender<()>, JoinHandle<()>)> {
+/// The thread that reads the armed samplers every `period`, the session's read period, until its
+/// sender is dropped.
+fn sampler(
+    collectors: Arc<Mutex<Collectors>>,
+    period: Duration,
+) -> Result<(mpsc::Sender<()>, JoinHandle<()>)> {
     let (stop, stopped) = mpsc::channel::<()>();
     let thread = std::thread::Builder::new()
         .name("profile-sampler".into())
         .spawn(move || {
-            while let Err(RecvTimeoutError::Timeout) = stopped.recv_timeout(DRAIN_PERIOD) {
+            while let Err(RecvTimeoutError::Timeout) = stopped.recv_timeout(period) {
                 lock(&collectors).drain();
             }
         })
@@ -547,23 +553,25 @@ fn sampler(collectors: Arc<Mutex<Collectors>>) -> Result<(mpsc::Sender<()>, Join
 mod tests {
     use super::*;
 
-    /// A request for the range timeline over every stage, of the ranks `workers`.
-    fn request(workers: &[u32]) -> SessionRequest {
-        serde_json::from_value(serde_json::json!({
-            "collectors": ["fence_timeline"],
-            "workers": workers,
-            "output_dir": "/nonexistent/profiles",
-        }))
-        .unwrap()
+    /// A request for the range timeline over every stage, of the ranks `workers`, whose files go
+    /// to `output`.
+    fn request(workers: &[u32], output: &std::path::Path) -> SessionRequest {
+        SessionRequest {
+            collectors: vec![Collector::FenceTimeline],
+            workers: workers.to_vec(),
+            output_dir: output.to_path_buf(),
+            ..SessionRequest::default()
+        }
     }
 
     #[test]
     fn a_rank_the_session_does_not_select_records_nothing() {
+        let output = tempfile::tempdir().unwrap();
         let mut slot = None;
         let start = SessionStart {
             session: 7,
             epoch: 2,
-            request: request(&[0]),
+            request: request(&[0], output.path()),
         };
         let response = Session::change(
             &mut slot,
@@ -577,6 +585,8 @@ mod tests {
 
         assert_eq!(response, ProfileAnswer::Started(RankStart::unselected(1)));
         assert!(slot.is_none());
+        // An unselected rank creates no file.
+        assert_eq!(std::fs::read_dir(output.path()).unwrap().count(), 0);
     }
 
     #[test]

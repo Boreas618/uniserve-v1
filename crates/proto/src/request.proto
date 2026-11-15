@@ -469,6 +469,10 @@ message ProfileRequest {
   uint64 pass_ranges = 14;
   uint32 pc_period = 15;
   optional double max_slowdown = 16;
+  // The PC sampling hardware buffer, in MiB.
+  uint32 pc_hardware_buffer_mib = 17;
+  // How often each worker reads its armed samplers, in milliseconds.
+  uint64 sampler_read_ms = 18;
 }
 
 enum ProfileCollector {

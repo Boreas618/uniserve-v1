@@ -75,6 +75,8 @@ impl From<&SessionStart> for wire::ProfileSession {
                 } as i32,
                 pass_ranges: request.range_metrics.pass_ranges as u64,
                 pc_period: request.pc_sampling.period,
+                pc_hardware_buffer_mib: request.pc_sampling.hardware_buffer_mib,
+                sampler_read_ms: request.sampler_read_ms,
                 max_slowdown: request.max_slowdown,
             }),
         }
@@ -137,7 +139,9 @@ impl TryFrom<&wire::ProfileSession> for SessionStart {
                 },
                 pc_sampling: PcSamplingOptions {
                     period: request.pc_period,
+                    hardware_buffer_mib: request.pc_hardware_buffer_mib,
                 },
+                sampler_read_ms: request.sampler_read_ms,
                 max_slowdown: request.max_slowdown,
             },
         })
@@ -266,7 +270,11 @@ mod tests {
                     ranges: MetricRanges::Module,
                     ..RangeMetricsOptions::default()
                 },
-                pc_sampling: PcSamplingOptions { period: 20 },
+                pc_sampling: PcSamplingOptions {
+                    period: 20,
+                    hardware_buffer_mib: 64,
+                },
+                sampler_read_ms: 250,
                 max_slowdown: Some(0.1),
             },
         };

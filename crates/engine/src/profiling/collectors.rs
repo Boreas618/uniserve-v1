@@ -6,15 +6,15 @@
 //! timeline needs no CUPTI: it keeps the stamps the process's range markers write
 //! ([`super::markers`]). A collector is prepared when the session starts
 //! ([`Collectors::prepare`]), armed and disarmed at step boundaries ([`Collectors::arm`],
-//! [`Collectors::disarm`]), drained while armed by the session's sampler thread
-//! ([`Collectors::drain`]), and released when the session ends or the quality-of-service guard
+//! [`Collectors::disarm`]), read while armed by the session's sampler thread at the session's read
+//! period ([`Collectors::drain`]), and released when the session ends or the quality-of-service guard
 //! turns it off ([`Collectors::release`]).
 //!
 //! What a collector costs on the rank's device and CPU is measured when it is prepared, never
 //! taken from another machine: the range profiler's pass states the device storage its first
 //! start took ([`Collectors::device_storage`]), PM sampling decodes one read period's samples and
 //! is refused when its reads could not keep up, and PC sampling is released as failed at the
-//! first read whose hardware buffer filled.
+//! first read whose hardware buffer, of the session's size, filled.
 
 use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
@@ -28,7 +28,7 @@ use platform::cupti::range_profiler::{RangeProfiler, Ranges};
 use platform::cupti::records::Record;
 use platform::cupti::timeline::{self, Timeline};
 use platform::{DeviceId, PrimaryContext};
-use proto::profile::{Collector, GraphTrace, MetricRanges, SessionRequest};
+use proto::profile::{Collector, GraphTrace, MetricRanges, PcSamplingOptions, SessionRequest};
 
 use super::artifact::{Message, send};
 use super::markers::Markers;
@@ -78,23 +78,23 @@ enum Prepared {
         /// The device storage the pass's first start took, measured when it was prepared.
         storage: u64,
     },
-    /// The session's own PC sampler of the context `context`, every `2^period` cycles, enabled
-    /// while armed: CUPTI refuses to enable activity records (`CUPTI_ERROR_NOT_COMPATIBLE`) while
-    /// PC sampling samples, so it is enabled at each arm after the timeline started and disabled
-    /// at each disarm before the timeline stops. It attributes only kernels launched outside CUDA
-    /// graphs ([`pc_sampling`]).
+    /// The session's own PC sampler of the context `context`, at the session's period and into
+    /// its hardware buffer (`options`), enabled while armed: CUPTI refuses to enable activity
+    /// records (`CUPTI_ERROR_NOT_COMPATIBLE`) while PC sampling samples, so it is enabled at each
+    /// arm after the timeline started and disabled at each disarm before the timeline stops. It
+    /// attributes only kernels launched outside CUDA graphs ([`pc_sampling`]).
     PcSampling {
         context: usize,
-        period: u32,
+        options: PcSamplingOptions,
         sampler: Option<PcSampler>,
         /// Whether the stall reasons' names reached the file.
         reasons: bool,
     },
     /// The rank's PC sampler ([`pc_sampling::of`]), enabled for the rank's life: the first arm
-    /// sets the session's period and a hardware buffer that holds it, each arm starts it and each
+    /// sets the session's period and hardware buffer (`options`), each arm starts it and each
     /// disarm stops it, and it stays enabled after the session.
     RankPcSampling {
-        period: u32,
+        options: PcSamplingOptions,
         /// Whether the session's period and buffer are set.
         configured: bool,
         /// Whether the stall reasons' names reached the file.
@@ -479,14 +479,14 @@ impl Collectors {
                 }),
                 Prepared::PcSampling {
                     context,
-                    period,
+                    options,
                     sampler,
                     reasons,
                 } => PcSampler::enable(
                     *context,
-                    *period,
+                    options.period,
                     pc_sampling::MAX_PCS,
-                    Some(pc_sampling::hardware_buffer(*period)),
+                    Some(options.hardware_buffer()),
                 )
                 .and_then(|mut enabled| {
                     enabled.start()?;
@@ -501,13 +501,13 @@ impl Collectors {
                     Ok(())
                 }),
                 Prepared::RankPcSampling {
-                    period,
+                    options,
                     configured,
                     reasons,
                 } => with_rank_sampler(self.device, |sampler| {
                     if !*configured {
-                        sampler.set_period(*period)?;
-                        sampler.set_hardware_buffer(pc_sampling::hardware_buffer(*period))?;
+                        sampler.set_period(options.period)?;
+                        sampler.set_hardware_buffer(options.hardware_buffer())?;
                         *configured = true;
                     }
                     sampler.start()?;
@@ -592,21 +592,21 @@ impl Collectors {
                 }),
                 Prepared::PcSampling {
                     sampler: Some(sampler),
-                    period,
+                    options,
                     ..
                 } => sampler.take().map(|taken| {
                     if taken.hardware_buffer_full {
-                        overflowed.push((collector, *period));
+                        overflowed.push((collector, options.clone()));
                     }
                     if taken.total_samples > 0 {
                         send(&self.rows, Message::Pc(taken));
                     }
                 }),
-                Prepared::RankPcSampling { period, .. } => {
+                Prepared::RankPcSampling { options, .. } => {
                     with_rank_sampler(self.device, |sampler| {
                         let taken = sampler.take()?;
                         if taken.hardware_buffer_full {
-                            overflowed.push((collector, *period));
+                            overflowed.push((collector, options.clone()));
                         }
                         if taken.total_samples > 0 {
                             send(&self.rows, Message::Pc(taken));
@@ -623,11 +623,11 @@ impl Collectors {
         // A period whose samples fill the hardware buffer between CUPTI's reads loses samples on
         // this device: the session measured it as too short, and the collector stops rather than
         // record a sample of what ran.
-        for (collector, period) in overflowed {
+        for (collector, options) in overflowed {
             let reason = format!(
-                "the hardware buffer of {} bytes filled at period {period}: this device's samples \
-                 outrun CUPTI's reads of it, so the period is too short for it",
-                pc_sampling::hardware_buffer(period)
+                "the hardware buffer of {} MiB filled at period {}: this device's samples outrun \
+                 CUPTI's reads of it, so the period is too short for the buffer",
+                options.hardware_buffer_mib, options.period
             );
             tracing::warn!(
                 "profiling collector {} failed: {reason}",
@@ -848,8 +848,8 @@ fn prepare(
             // read whose image fills loses the samples past it. The buffer takes the image's
             // bytes per sample, which exceed a raw record's (on GB200, 13.6 KB of image against
             // 8 KiB of buffer for the default metrics).
-            let per_read =
-                (super::session::DRAIN_PERIOD.as_nanos() as u64).div_ceil(options.interval_ns);
+            let period = Duration::from_millis(request.sampler_read_ms);
+            let per_read = (period.as_nanos() as u64).div_ceil(options.interval_ns);
             let samples = (2 * per_read).max(PM_MIN_SAMPLES);
             let mut sampler = PmSampler::sample_bytes(device, &metrics, options.interval_ns)
                 .and_then(|bytes| {
@@ -862,7 +862,7 @@ fn prepare(
                     )
                 })
                 .map_err(|error| error.to_string())?;
-            keeps_up(&mut sampler, options.interval_ns)?;
+            keeps_up(&mut sampler, options.interval_ns, period)?;
             Ok(Prepared::PmSampling(sampler))
         }
         Collector::RangeMetrics => {
@@ -901,14 +901,14 @@ fn prepare(
             let context_device = self_device;
             if context_device.is_some_and(|device| pc_sampling::of(device).is_some()) {
                 return Ok(Prepared::RankPcSampling {
-                    period: request.pc_sampling.period,
+                    options: request.pc_sampling.clone(),
                     configured: false,
                     reasons: false,
                 });
             }
             Ok(Prepared::PcSampling {
                 context,
-                period: request.pc_sampling.period,
+                options: request.pc_sampling.clone(),
                 sampler: None,
                 reasons: false,
             })
@@ -916,9 +916,9 @@ fn prepare(
     }
 }
 
-/// Whether the rank's reads keep up with PM samples taken every `interval_ns`, measured on this
-/// device and CPU: `sampler` samples for one read period ([`super::session::DRAIN_PERIOD`]) and
-/// the samples are decoded, as a read decodes them. A read decodes the samples of the period
+/// Whether the rank's reads every `period` (the session's read period) keep up with PM samples
+/// taken every `interval_ns`, measured on this device and CPU: `sampler` samples for one read
+/// period and the samples are decoded, as a read decodes them. A read decodes the samples of the period
 /// before it, so the reads keep up when decoding one period's samples takes less than the
 /// period; past that, every read falls further behind and its image overflows, losing samples.
 /// The calibration's samples are discarded, and the sampler is left stopped and empty.
@@ -927,8 +927,11 @@ fn prepare(
 ///
 /// Refuses the interval when its reads would fall behind, naming what was measured; fails with
 /// CUPTI's error when sampling cannot start, stop or decode.
-fn keeps_up(sampler: &mut PmSampler, interval_ns: u64) -> std::result::Result<(), String> {
-    let period = super::session::DRAIN_PERIOD;
+fn keeps_up(
+    sampler: &mut PmSampler,
+    interval_ns: u64,
+    period: Duration,
+) -> std::result::Result<(), String> {
     sampler.start().map_err(|error| error.to_string())?;
     // The measurement window: one read period of samples at the session's interval.
     std::thread::sleep(period);

@@ -16,10 +16,10 @@
 //! graphs.
 //!
 //! CUPTI keeps the samples in a hardware buffer of process host storage, which its own thread
-//! empties; a buffer too small for the sampling rate fills, and the samples are lost.
-//! [`hardware_buffer`] sizes it for a period, and a read whose buffer filled tells the session
-//! the period is too short for the device, which releases the collector as failed
-//! (`super::collectors`).
+//! empties; a buffer too small for the sampling rate fills, and the samples are lost. A session
+//! states the buffer with its period (`pc_sampling.hardware_buffer_mib`, CUPTI's own largest by
+//! default), and a read whose buffer filled tells the session the period is too short for the
+//! device and the buffer, which releases the collector as failed (`super::collectors`).
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, OnceLock};
@@ -42,16 +42,21 @@ static RANKS: Mutex<Option<HashMap<DeviceId, Arc<Mutex<PcSampler>>>>> = Mutex::n
 /// The stream record's activity kinds, held enabled from before the rank's sampler for its life.
 static KINDS: OnceLock<KindsHold> = OnceLock::new();
 
-/// Enables PC sampling on `context`, stopped, for the rank's life, at the default period, before
-/// the rank captures any CUDA graph.
+/// Enables PC sampling on `context`, stopped, for the rank's life, before the rank captures any
+/// CUDA graph: at a session's default period, and into the smallest hardware buffer a session may
+/// state, since a stopped sampler gathers nothing and each session sets its own period and buffer
+/// at its first arm.
 ///
 /// # Errors
 ///
 /// Fails when CUPTI refuses PC sampling, as when another profiler holds the process's CUPTI
 /// subscription.
 pub(crate) fn enable(context: &PrimaryContext) -> Result<()> {
-    let period = proto::profile::PcSamplingOptions::default().period;
-    let bytes = hardware_buffer(period);
+    let options = proto::profile::PcSamplingOptions {
+        hardware_buffer_mib: *proto::profile::PcSamplingOptions::HARDWARE_BUFFERS_MIB.start(),
+        ..proto::profile::PcSamplingOptions::default()
+    };
+    let (period, bytes) = (options.period, options.hardware_buffer());
     if KINDS.get().is_none() {
         let hold = KindsHold::take().map_err(|error| {
             Error::Unsupported(format!("the activity records beside PC sampling: {error}"))
@@ -81,28 +86,4 @@ pub(crate) fn enable(context: &PrimaryContext) -> Result<()> {
 /// The sampler of the rank of `device`, when the rank keeps one.
 pub(crate) fn of(device: DeviceId) -> Option<Arc<Mutex<PcSampler>>> {
     lock(&RANKS).as_ref()?.get(&device).cloned()
-}
-
-/// CUPTI's largest hardware buffer, which is also its default: 512 MiB.
-const LARGEST_HARDWARE_BUFFER: usize = 512 << 20;
-
-/// The hardware buffer, in bytes, a session samples at `period` into.
-///
-/// Sized from a measurement on GB200 with `nvidia-cuda-cupti` 13.0 with every SM busy: a size
-/// holds when no window of 0.6 s filled it, each period takes twice the smallest size that held
-/// three windows, and the size taken held ten more (`docs/profiling.md` states the table). A
-/// period shorter than that table's takes CUPTI's largest buffer. A device that samples faster
-/// fills a buffer sooner: the first read whose buffer filled releases the collector as failed,
-/// naming the period, rather than recording a sample of what ran.
-pub(crate) fn hardware_buffer(period: u32) -> usize {
-    const MIB: usize = 1 << 20;
-    match period {
-        19.. => 2 * MIB,
-        18 => 4 * MIB,
-        17 => 8 * MIB,
-        15 | 16 => 32 * MIB,
-        14 => 128 * MIB,
-        13 => 256 * MIB,
-        _ => LARGEST_HARDWARE_BUFFER,
-    }
 }
