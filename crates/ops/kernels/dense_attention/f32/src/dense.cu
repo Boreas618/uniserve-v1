@@ -72,22 +72,17 @@
 
 #include "uniserve_dense_attention.h"
 
-// The export name and the mask, defined by `src/build.py` from the package's
-// manifest and the descriptor. The defaults keep this file readable by itself and
-// are never what a module the Build Server builds carries.
-#ifndef UNISERVE_ENTRY
-#define UNISERVE_ENTRY uniserve_dense_attention
-#endif
-// 0: the dense mask, every key of the sequence visible. 1: the causal mask.
-#ifndef UNISERVE_CAUSAL
-#define UNISERVE_CAUSAL 0
-#endif
-// 1: the launch carries `[batch + 1]` sequence offsets. 0: it carries none, and the
-// module attends one sequence — `[0, q_tokens)` against `[0, kv_tokens)`. The two are
-// separate compilations, so this module never branches on a missing table and never
-// reads a null pointer.
-#ifndef UNISERVE_SEQUENCES
-#define UNISERVE_SEQUENCES 1
+// The descriptor's two compiled-in fields, which the package's manifest defines
+// (`[compile.definitions]`):
+//
+// - `UNISERVE_CAUSAL`: 0 for the dense mask, every key of the sequence visible; 1
+//   for the causal mask.
+// - `UNISERVE_SEQUENCES`: 1 when the launch carries `[batch + 1]` sequence offsets;
+//   0 when it carries none, and the module attends one sequence — `[0, q_tokens)`
+//   against `[0, kv_tokens)`. The two are separate compilations, so this module
+//   never branches on a missing table and never reads a null pointer.
+#if !defined(UNISERVE_CAUSAL) || !defined(UNISERVE_SEQUENCES)
+#error "the package's manifest defines UNISERVE_CAUSAL and UNISERVE_SEQUENCES"
 #endif
 
 namespace {
@@ -481,7 +476,7 @@ __global__ void mask_softmax_kernel(float* tile, int64_t columns, int64_t head_s
 /// One dense attention call. Returns 0 when the attention ran, and 1 with this
 /// entry's message in `call->error` otherwise (design 4.2: a package reports
 /// through the call structure it was given).
-extern "C" int32_t UNISERVE_ENTRY(UniserveDenseAttentionCall* call, void* stream) {
+extern "C" int32_t uniserve_dense_attention(UniserveDenseAttentionCall* call, void* stream) {
   if (call == nullptr) {
     return 1;
   }
