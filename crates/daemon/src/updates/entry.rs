@@ -157,13 +157,13 @@ fn differing(served: &EngineConfig, target: &EngineConfig) -> Vec<&'static str> 
 /// memory, so the drain gives the serving epoch's back (`shrink`) and the
 /// target grows into it. The cache's size and its tiers are no layout. The
 /// engine names its device KV regions by the same layout
-/// (`EngineConfig::layout_hash`).
+/// (`EngineConfig::layout`).
 fn layouts_differ(serving: &[EngineConfig], target: &[EngineConfig]) -> bool {
     serving.len() != target.len()
         || serving
             .iter()
             .zip(target)
-            .any(|(serving, target)| serving.layout_hash() != target.layout_hash())
+            .any(|(serving, target)| serving.layout() != target.layout())
 }
 
 impl Leader {

@@ -964,7 +964,7 @@ pub struct ParallelConfig {
 /// The leader daemon resolves it once from the serving options and hands the same value to every
 /// engine process of the epoch. Any change to it is a new epoch, except a change to a value that
 /// selects a package's backend or is a package's parameter, which the generation layer applies in
-/// place; [`EngineConfig::build_hash`] tells the two apart.
+/// place; [`EngineConfig::build_part`] tells the two apart.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct EngineConfig {
@@ -1031,57 +1031,155 @@ impl EngineConfig {
             && (dedicated || (self.parallel.data_parallel_size.get() > 1 && single_ranks))
     }
 
-    /// The identity of the build this configuration makes: two configurations whose hashes differ
-    /// need a new epoch, and two whose hashes agree differ at most in what the generation layer
-    /// changes in place (§7.7).
+    /// The part of this configuration that makes the epoch's build ([`BuildPart`]): two
+    /// configurations whose build parts differ need a new epoch, and two whose build parts agree
+    /// differ at most in what the generation layer changes in place (§7.7).
     ///
-    /// Every value enters it except those §7.7 assigns elsewhere: the package backends (attention,
-    /// the grouped expert GEMM, the expert exchange); the scheduling policy's parameters (the
-    /// scheduler section, the batched token budget, the speculative cost figures); the probes'
-    /// switches, which change at a step boundary; and the media section, which the frontend reads.
+    /// Every field of the configuration, and of each of its sections that holds a value of both
+    /// layers, is classified by name here, and the destructuring is exhaustive: a field added to
+    /// any of these types does not compile until it is placed in the build part or named as a
+    /// generation-layer value. The generation layer's values are the package backends
+    /// (attention, the grouped expert GEMM, the expert exchange); the scheduling policy's
+    /// parameters (the scheduler section, the batched token budget, the speculative cost
+    /// figures); the probes' switches, which change at a step boundary; and the media section,
+    /// which the frontend reads.
+    pub fn build_part(&self) -> BuildPart<'_> {
+        let Self {
+            executable,
+            model,
+            parallel,
+            deployment,
+            max_running_requests,
+            max_num_batched_tokens: _,
+            max_logprobs,
+            attention_backend: _,
+            prefill_attention_backend: _,
+            decode_attention_backend: _,
+            moe_runner_backend: _,
+            device,
+            scheduler: _,
+            media: _,
+            mem_fraction_static,
+            load,
+            kv_cache,
+            moe,
+            cuda_graph,
+            worker,
+            speculative,
+            video,
+            profiling,
+        } = self;
+        let MoeConfig {
+            expert_parallel,
+            exchange: _,
+            microbatches,
+        } = moe;
+        let SpeculativeConfig {
+            num_draft_tokens,
+            expected_speedup: _,
+            refill_token_cost: _,
+        } = speculative;
+        let ProfilingConfig {
+            fence_probes: _,
+            fence_modules,
+            fence_probes_off: _,
+            graph_pc_sampling,
+        } = profiling;
+        BuildPart {
+            executable,
+            model,
+            parallel,
+            deployment,
+            max_running_requests: *max_running_requests,
+            max_logprobs: *max_logprobs,
+            device,
+            mem_fraction_static: *mem_fraction_static,
+            load,
+            kv_cache,
+            expert_parallel: *expert_parallel,
+            microbatches: *microbatches,
+            cuda_graph,
+            worker,
+            num_draft_tokens: *num_draft_tokens,
+            video,
+            fence_modules,
+            graph_pc_sampling: *graph_pc_sampling,
+        }
+    }
+
+    /// The layout this configuration lays an epoch's device memory out in ([`Layout`]).
+    pub fn layout(&self) -> Layout {
+        Layout {
+            parallel: self.parallel.clone(),
+            max_running_requests: self.max_running_requests,
+            block_size: self.kv_cache.block_size,
+            dtype: self.kv_cache.dtype,
+            cuda_graph: self.cuda_graph.clone(),
+        }
+    }
+}
+
+/// The part of an [`EngineConfig`] that makes an epoch's build ([`EngineConfig::build_part`]),
+/// every field of it entering the build's identity ([`BuildPart::identity`]).
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct BuildPart<'a> {
+    pub executable: &'a str,
+    pub model: &'a ModelConfig,
+    pub parallel: &'a ParallelConfig,
+    pub deployment: &'a str,
+    pub max_running_requests: NonZeroUsize,
+    pub max_logprobs: u32,
+    pub device: &'a DeviceConfig,
+    pub mem_fraction_static: f64,
+    pub load: &'a LoadConfig,
+    pub kv_cache: &'a KvCacheConfig,
+    pub expert_parallel: bool,
+    pub microbatches: NonZeroU32,
+    pub cuda_graph: &'a CudaGraphConfig,
+    pub worker: &'a WorkerConfig,
+    pub num_draft_tokens: u32,
+    pub video: &'a VideoConfig,
+    pub fence_modules: &'a Option<Vec<String>>,
+    pub graph_pc_sampling: bool,
+}
+
+impl BuildPart<'_> {
+    /// The build's identity: the digest of the whole build part, in lowercase hexadecimal.
     #[expect(
         clippy::expect_used,
         reason = "a configuration is plain data with string keys, which JSON always encodes"
     )]
-    pub fn build_hash(&self) -> String {
-        let mut build = self.clone();
-        build.attention_backend = String::new();
-        build.prefill_attention_backend = None;
-        build.decode_attention_backend = None;
-        build.moe_runner_backend = None;
-        build.scheduler = SchedulerConfig::default();
-        build.max_num_batched_tokens = None;
-        build.media = MediaConfig::default();
-        build.moe.exchange = MoeConfig::default().exchange;
-        build.speculative.expected_speedup = None;
-        build.speculative.refill_token_cost = None;
-        build.profiling.fence_probes = ProfilingConfig::default().fence_probes;
-        build.profiling.fence_probes_off = Vec::new();
-        let bytes = serde_json::to_vec(&build).expect("a configuration serializes");
+    pub fn identity(&self) -> String {
+        let bytes = serde_json::to_vec(self).expect("a configuration serializes");
         let digest = <sha2::Sha256 as sha2::Digest>::digest(&bytes);
         digest.iter().map(|byte| format!("{byte:02x}")).collect()
     }
+}
 
-    /// The identity of the layout this configuration lays an epoch's device memory out in
-    /// (`specs/buffer-pool.md` §14, "A change of layout"): the parallel configuration, whose worker
-    /// groups state the devices and the hosts; the request slots; the KV cache's block size and
-    /// element type; and the graph buckets. Two epochs of one layout name the same device KV
-    /// regions and share their blocks, and an epoch of another layout opens regions of its own,
-    /// into which the serving epoch's device memory moves as it drains, so the engine names its
-    /// regions by this and the daemon drains with `shrink` exactly when it differs.
+/// What lays an epoch's device memory out (`specs/buffer-pool.md` §14, "A change of layout"): the
+/// parallel configuration, whose worker groups state the devices and the hosts; the request slots;
+/// the KV cache's block size and element type; and the graph buckets. Two epochs of one layout
+/// name the same device KV regions and share their blocks, and an epoch of another layout opens
+/// regions of its own, into which the serving epoch's device memory moves as it drains, so the
+/// engine names its regions by the layout's identity and the daemon drains with `shrink` exactly
+/// when the layouts differ.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct Layout {
+    pub parallel: ParallelConfig,
+    pub max_running_requests: NonZeroUsize,
+    pub block_size: Option<NonZeroU32>,
+    pub dtype: Option<PrefixCacheDtype>,
+    pub cuda_graph: CudaGraphConfig,
+}
+
+impl Layout {
+    /// The layout's identity: the digest of the whole layout, in lowercase hexadecimal.
     #[expect(
         clippy::expect_used,
         reason = "a configuration is plain data with string keys, which JSON always encodes"
     )]
-    pub fn layout_hash(&self) -> String {
-        let layout = (
-            &self.parallel,
-            self.max_running_requests,
-            self.kv_cache.block_size,
-            self.kv_cache.dtype,
-            &self.cuda_graph,
-        );
-        let bytes = serde_json::to_vec(&layout).expect("a configuration serializes");
+    pub fn identity(&self) -> String {
+        let bytes = serde_json::to_vec(self).expect("a configuration serializes");
         let digest = <sha2::Sha256 as sha2::Digest>::digest(&bytes);
         digest.iter().map(|byte| format!("{byte:02x}")).collect()
     }

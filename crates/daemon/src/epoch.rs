@@ -797,7 +797,7 @@ impl Epoch {
 pub fn change(previous: &Epoch, next: &Epoch) -> Change {
     if host_options_differ(&previous.config, &next.config) {
         Change::Host
-    } else if previous.engine.build_hash() != next.engine.build_hash()
+    } else if previous.engine.build_part() != next.engine.build_part()
         || previous.modules.engine != next.modules.engine
     {
         // Another engine package, or another revision of it, is another
@@ -1233,8 +1233,9 @@ mod tests {
                 set(*change)
                     .engine_config()
                     .expect("the configuration resolves")
-                    .build_hash(),
-                base.engine.build_hash(),
+                    .build_part()
+                    .identity(),
+                base.engine.build_part().identity(),
                 "{what} is not a build-config value"
             );
         }
@@ -1243,8 +1244,9 @@ mod tests {
                 set(*change)
                     .engine_config()
                     .expect("the configuration resolves")
-                    .build_hash(),
-                base.engine.build_hash(),
+                    .build_part()
+                    .identity(),
+                base.engine.build_part().identity(),
                 "{what} builds the engine"
             );
         }

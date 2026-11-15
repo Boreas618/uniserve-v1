@@ -1724,14 +1724,8 @@ fn a_target_of_another_layout_maps_none_of_the_serving_epochs_segments() {
     other.epoch = 3;
     other.engine_config.cuda_graph.decode_batch_sizes =
         Some(vec![std::num::NonZeroU32::new(1).unwrap()]);
-    assert_eq!(
-        serving.engine_config.layout_hash(),
-        same.engine_config.layout_hash()
-    );
-    assert_ne!(
-        serving.engine_config.layout_hash(),
-        other.engine_config.layout_hash()
-    );
+    assert_eq!(serving.engine_config.layout(), same.engine_config.layout());
+    assert_ne!(serving.engine_config.layout(), other.engine_config.layout());
 
     let same_ranks = loaded(&same);
     let (mut same_head, _, same_open, same_opened) = opened_session(&server, &same, &same_ranks);

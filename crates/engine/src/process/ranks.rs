@@ -1266,7 +1266,7 @@ fn media_memory(groups: &[WorkerGroupConfig], host: &str) -> String {
 /// The name of the device region of scheduler `scheduler`'s KV units of `layout`, for an epoch of
 /// `config`: two epochs of one layout name one region, and any other layout another, whose memory
 /// space is its own (`specs/buffer-pool.md` §14.1). The layout is the epoch's
-/// ([`proto::config::EngineConfig::layout_hash`]: its worker groups with their devices and hosts,
+/// ([`proto::config::Layout`]: its worker groups with their devices and hosts,
 /// its slots, its KV block size and element type, its graph buckets), by which the daemon tells
 /// a target of another layout to take the device memory over as the serving epoch drains, and what
 /// lays a unit out. A data-parallel replica that runs an engine of its own states its own worker
@@ -1282,7 +1282,7 @@ fn units_region(
     config: &proto::config::EngineConfig,
 ) -> Result<String> {
     let mut digest = storage::key::Digest::new(b"uniserve.units-region");
-    digest.text(&config.layout_hash());
+    digest.text(&config.layout().identity());
     for (group, _) in (0..)
         .zip(&layout.groups)
         .filter(|(_, group)| !group.state())
@@ -1313,7 +1313,7 @@ fn states_region(
         return Ok(None);
     };
     let mut digest = storage::key::Digest::new(b"uniserve.states-region");
-    digest.text(&config.layout_hash());
+    digest.text(&config.layout().identity());
     digest.bytes(&host::page_shape(layout, group)?.layout.0);
     digest.numbers(&[layout.state_bytes(), layout.plane_bytes]);
     let digest = digest.finish();

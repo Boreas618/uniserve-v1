@@ -63,7 +63,7 @@ pub(crate) struct Transition {
 pub(crate) fn target_digest(target: &Epoch) -> String {
     use sha2::Digest as _;
     let mut hasher = sha2::Sha256::new();
-    hasher.update(target.engine.build_hash().as_bytes());
+    hasher.update(target.engine.build_part().identity().as_bytes());
     hasher.update(serde_json::to_vec(&target.modules).unwrap_or_default());
     hasher
         .finalize()
