@@ -20,6 +20,10 @@ What differs between pins is only where a file comes from, the pin's
 one archive whose own sha256 is pinned (``archive``, ``archive_sha256``), or a
 distribution this environment's lock installs (``distribution``).
 
+A pin of Python sources states the directories among its files that are
+packages a build imports under their own names (``packages``), and
+:func:`load` imports them from a build's staged copy of the files.
+
 The cache is the Build Server's: a build is handed its root in its request
 (:attr:`uniserve_build_server.request.Request.cache`), and
 ``uniserve-build-server provision PIN --cache DIR`` fills it by hand.
@@ -31,8 +35,10 @@ import concurrent.futures
 import dataclasses
 import functools
 import hashlib
+import importlib.machinery
 import importlib.metadata
 import importlib.resources
+import importlib.util
 import os
 import shutil
 import sys
@@ -74,6 +80,9 @@ class Pin:
     #: The manifest's name in the origin, for a manifest published beside the
     #: files; ``None`` keeps it in this package as ``pins/<name>.sha256``.
     manifest: str | None = None
+    #: The directories of the pin's files that are Python packages, each
+    #: imported under its directory's name (:func:`load`).
+    packages: tuple[str, ...] = ()
 
     def directory(self, cache: Path) -> Path:
         """The pin's cache directory, content-addressed by its manifest."""
@@ -210,6 +219,7 @@ def pins() -> dict[str, Pin]:
             sha256=stated["sha256"],
             origin=_origin(stated["origin"]),
             manifest=stated.get("manifest"),
+            packages=tuple(stated.get("packages", ())),
         )
     return found
 
@@ -412,6 +422,50 @@ def stage(
             os.link(cached_file, destination)
         staged.append(name)
     return staged
+
+
+def load(source: Pin, tree: Path) -> None:
+    """Imports the pin's packages from a staged copy of its files.
+
+    ``tree`` holds the pin's files under their manifest paths (:func:`stage`).
+    Each of the pin's ``packages`` is imported under its directory's name: the
+    standard path finder looks for it with that directory's parent as its only
+    location, and every package enters :data:`sys.modules` before any of them
+    runs, so their imports of one another (sources that name their siblings as
+    top-level modules) resolve to the staged copy. Nothing is added to the
+    interpreter's search path. A directory whose ``__init__.py`` the pin does
+    not list is a namespace package: the modules the pin lists import without
+    the package code it leaves out.
+
+    A name the process has already imported is refused, since that module is
+    not the staged copy.
+    """
+    found = []
+    for package in source.packages:
+        directory = tree / package
+        name = directory.name
+        if name in sys.modules:
+            imported = getattr(sys.modules[name], "__file__", None)
+            raise FetchError(
+                f"the {source.name} pin's package {name} is already imported "
+                f"from {imported}"
+            )
+        spec = importlib.machinery.PathFinder.find_spec(
+            name, [str(directory.parent)]
+        )
+        if spec is None:
+            raise FetchError(
+                f"the {source.name} pin's package {package} is not staged "
+                f"under {tree}"
+            )
+        found.append((spec, importlib.util.module_from_spec(spec)))
+
+    # Every package is entered before any runs: a package's code may import
+    # a sibling that comes later in the list.
+    for spec, module in found:
+        sys.modules[spec.name] = module
+    for spec, module in found:
+        spec.loader.exec_module(module)
 
 
 def apply_patch(root: Path, patch: Path) -> None:

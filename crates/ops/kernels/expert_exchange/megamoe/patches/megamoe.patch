@@ -1,5 +1,5 @@
---- a/moe_nvfp4_swapab/epilogue_refactor.py
-+++ b/moe_nvfp4_swapab/epilogue_refactor.py
+--- a/flashinfer/moe_ep/kernel_src/cutedsl_megamoe/src/moe_nvfp4_swapab/epilogue_refactor.py
++++ b/flashinfer/moe_ep/kernel_src/cutedsl_megamoe/src/moe_nvfp4_swapab/epilogue_refactor.py
 @@ -1011,6 +1011,7 @@
              Tuple[int, int, int]
          ] = None,  # [expert, intermediate, hidden]
@@ -61,8 +61,8 @@
              exp_pair = (
                  cute.math.exp2(neg_g_log2e[0], fastmath=True),
                  cute.math.exp2(neg_g_log2e[1], fastmath=True),
---- a/moe_nvfp4_swapab/kernel_fc12.py
-+++ b/moe_nvfp4_swapab/kernel_fc12.py
+--- a/flashinfer/moe_ep/kernel_src/cutedsl_megamoe/src/moe_nvfp4_swapab/kernel_fc12.py
++++ b/flashinfer/moe_ep/kernel_src/cutedsl_megamoe/src/moe_nvfp4_swapab/kernel_fc12.py
 @@ -90,6 +90,7 @@
          apply_topk_in_fc1: bool = True,
          gate_up_clamp: Optional[float] = None,
@@ -97,8 +97,8 @@
          )
  
          if self.num_sched_stages is None:
---- a/moe_nvfp4_swapab/megamoe_kernel.py
-+++ b/moe_nvfp4_swapab/megamoe_kernel.py
+--- a/flashinfer/moe_ep/kernel_src/cutedsl_megamoe/src/moe_nvfp4_swapab/megamoe_kernel.py
++++ b/flashinfer/moe_ep/kernel_src/cutedsl_megamoe/src/moe_nvfp4_swapab/megamoe_kernel.py
 @@ -195,6 +195,7 @@
          gate_up_clamp: Optional[float] = None,
          epi_flag_batch: Optional[Tuple[int, int]] = (1, 1),
@@ -115,8 +115,8 @@
          )
  
          self.enable_token_comm = True
---- a/src/token_comm.py
-+++ b/src/token_comm.py
+--- a/flashinfer/moe_ep/kernel_src/cutedsl_megamoe/src/src/token_comm.py
++++ b/flashinfer/moe_ep/kernel_src/cutedsl_megamoe/src/src/token_comm.py
 @@ -675,11 +675,14 @@
                          scope="cta",
                      )

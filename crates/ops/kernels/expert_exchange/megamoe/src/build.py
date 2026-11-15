@@ -2,8 +2,8 @@
 
 The Build Server compiles a descriptor by calling :func:`compile` with the
 compile request. It compiles FlashInfer's MegaMoE kernel (the pinned `megamoe`
-source with `patches/megamoe.patch`, see `kernel_sources`) for one group and
-one shape with the CuTe DSL, exports the kernel with its host launcher, and
+source with `patches/megamoe.patch`, see `load_kernel_sources`) for one group
+and one shape with the CuTe DSL, exports the kernel with its host launcher, and
 links them with `src/entry.cpp` and `src/stage.cu` into `module.so`. No device
 is read: the target names the architecture, and the kernel's tuning is the
 table below.
@@ -124,20 +124,15 @@ class Export:
 """
 
 
-#: Where the kernel's sources sit in FlashInfer's distribution, and so in the
-#: staged tree.
-KERNEL_SOURCES = "flashinfer/moe_ep/kernel_src/cutedsl_megamoe/src"
-
-
-def kernel_sources(request, staging):
-    """The kernel's sources, staged as this package compiles them.
+def load_kernel_sources(request, staging):
+    """Import the kernel's packages as this package compiles them.
 
     They are the pinned FlashInfer copy (`uniserve_build_server.fetch`'s
     `megamoe` pin) with `patches/megamoe.patch` applied, which adds the
     tanh-approximated GELU gate and fixes the peer-metadata stride of the token
     exchange. The patch is applied to copies in the build's staging directory,
     so neither the distribution nor the Build Server's verified cache of pins
-    is changed.
+    is changed, and the pin's packages are imported from those copies.
     """
     pinned = fetch.pin("megamoe")
     staged = staging / "megamoe"
@@ -146,10 +141,10 @@ def kernel_sources(request, staging):
         names = list(fetch.manifest(pinned, request.cache))
         fetch.fetch(pinned, request.cache, names, request.jobs)
         fetch.stage(pinned, request.cache, staged, names, copy=True)
-        fetch.apply_patch(staged / KERNEL_SOURCES, patch)
+        fetch.apply_patch(staged, patch)
+        fetch.load(pinned, staged)
     except fetch.FetchError as error:
         raise SystemExit(str(error)) from error
-    return staged / KERNEL_SOURCES
 
 
 def compile_kernel(request, shape, staging):
@@ -157,7 +152,7 @@ def compile_kernel(request, shape, staging):
     hidden, intermediate, top, experts, tokens, ranks = shape
     # The kernel is traced for the request's target, never for a probed device.
     cute_dsl.configure(request.target)
-    sys.path.insert(0, str(kernel_sources(request, staging)))
+    load_kernel_sources(request, staging)
     import cutlass  # noqa: PLC0415
     import cutlass.cute as cute  # noqa: PLC0415
     import torch  # noqa: PLC0415

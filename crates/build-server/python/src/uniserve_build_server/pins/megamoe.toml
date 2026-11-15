@@ -2,5 +2,15 @@
 # distribution this environment locks. The manifest is `megamoe.sha256`.
 sha256 = "dae28b342e055af61128a79efbce8727bbed54228613b8a547ad37134ecf2d97"
 
+# The kernel's packages, which name one another as top-level modules
+# (`common.megamoe_constants`, `src.token_comm`): FlashInfer's own shim puts
+# their parent directory on the interpreter's path, and `fetch.load` imports
+# them from a build's staged copy instead.
+packages = [
+    "flashinfer/moe_ep/kernel_src/cutedsl_megamoe/src/common",
+    "flashinfer/moe_ep/kernel_src/cutedsl_megamoe/src/moe_nvfp4_swapab",
+    "flashinfer/moe_ep/kernel_src/cutedsl_megamoe/src/src",
+]
+
 [origin]
 distribution = "flashinfer-python"
