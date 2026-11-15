@@ -21,9 +21,9 @@
 //! `step mod layers` of a speculation's steps (`qwen3_5_mtp.py:172-173`). A forward here is
 //! not told its step, so a checkpoint of more than one layer is refused at load.
 
-use nn::family::{CacheShape, SequenceSplit};
+use nn::family::{CacheShape, SequenceSplit, TextPlacement};
 use nn::modules::{Linear, LinearConfig, Parallel, RmsNorm, Rotary};
-use nn::{D, Drafter, KvCache, Split, Tensor, TokenBatch, VarBuilder, functional};
+use nn::{D, Drafter, KvCache, Tensor, TokenBatch, VarBuilder, functional};
 
 use crate::qwen3::causal_lm::text_rotary;
 use crate::qwen3::config::Config;
@@ -49,14 +49,18 @@ pub struct Mtp {
 }
 
 impl Mtp {
-    /// The drafter of `config` at `vb` (`mtp`), at the ranks `splits` state of the tensor and
-    /// the expert group.
+    /// The drafter of `config` at `vb` (`mtp`), at the ranks `placement` states of the tensor
+    /// and the expert group; its attention splits no sequence.
     ///
     /// # Errors
     ///
     /// A checkpoint that carries no drafter or one of several layers (module documentation),
     /// or a module the loader refuses.
-    pub fn load(config: &Config, vb: VarBuilder<'_, '_>, splits: (Split, Split)) -> Result<Self> {
+    pub fn load(
+        config: &Config,
+        vb: VarBuilder<'_, '_>,
+        placement: &TextPlacement,
+    ) -> Result<Self> {
         match config.mtp_num_hidden_layers {
             1 => {}
             0 => {
@@ -97,15 +101,17 @@ impl Mtp {
                 vb.pp("layers").pp(0),
                 false,
                 config.moe.is_some(),
-                splits,
-                SequenceSplit::WHOLE,
+                &TextPlacement {
+                    sequence: SequenceSplit::WHOLE,
+                    ..*placement
+                },
                 None,
             )?,
             norm: RmsNorm::load(&norm, vb.pp("norm"))?,
             hidden: text.hidden_size as usize,
             cache: CacheShape {
                 layers: 1,
-                kv_heads: text.local_heads(splits.0)?.1,
+                kv_heads: text.local_heads(placement.tensor)?.1,
                 head_dim: text.head_dim,
                 index_keys: None,
             },

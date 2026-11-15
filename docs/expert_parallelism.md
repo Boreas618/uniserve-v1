@@ -1,6 +1,6 @@
 # Expert parallelism
 
-Mixture-of-experts models can shard their routed experts across GPUs. UniServe supports four deployments: schedulers that shard the experts among themselves and exchange tokens at every expert layer, the tensor-parallel ranks of one scheduler sharding the experts among themselves without exchanging tokens, dedicated expert workers that hold the experts while attention workers route tokens to them, and distributed weight data parallelism (DWDP), in which schedulers read missing expert weights from their peers instead of exchanging tokens.
+Mixture-of-experts models can shard their routed experts across GPUs. UniServe supports four deployments: schedulers that shard the experts among themselves and exchange tokens at every expert layer, the tensor-parallel ranks of each scheduler sharding its experts among themselves without exchanging tokens, dedicated expert workers that hold the experts while attention workers route tokens to them, and distributed weight data parallelism (DWDP), in which schedulers read missing expert weights from their peers instead of exchanging tokens.
 
 ## Schedulers sharing their experts
 
@@ -31,7 +31,15 @@ CUDA_VISIBLE_DEVICES=0,1,2,3 .venv/bin/uniserve serve /models/Qwen3-30B-A3B \
   --set moe_config.expert_parallel=true
 ```
 
-With one scheduler, expert parallelism shards the experts over the ranks of its single tensor-parallel worker group: attention and the other layers stay tensor-parallel, and rank `r` of `P` keeps the whole experts `[r * E / P, (r + 1) * E / P)` of every layer instead of `1 / P` of every expert's channels. The ranks hold every token of the batch, so no exchange moves tokens: each runs its experts over all of them, routes to the other ranks' experts contributing nothing, and the group sums the ranks' outputs with the all-reduce that sums tensor-parallel expert shards. `moe_config.exchange` keeps its default; the other exchanges apply across schedulers or to dedicated expert workers.
+Without dedicated expert workers and without schedulers of one rank each, expert parallelism shards the experts over the ranks of each scheduler's tensor-parallel worker group: attention and the other layers stay tensor-parallel, and rank `r` of `P` keeps the whole experts `[r * E / P, (r + 1) * E / P)` of every layer, at their full intermediate width, instead of `1 / P` of every expert's channels. The ranks hold every token of the batch, so no exchange moves tokens: each runs its experts over all of them, routes to the other ranks' experts contributing nothing, and the group sums the ranks' outputs with the all-reduce that sums tensor-parallel expert shards. The key/value cache is laid out as the same group's without the flag, and the shards of a calibrated NVFP4 checkpoint's experts are read whole, unpadded.
+
+```bash
+CUDA_VISIBLE_DEVICES=0,1,2,3 .venv/bin/uniserve serve /models/Qwen3-30B-A3B \
+  --served-model-name qwen3-moe --tensor-parallel-size 2 --data-parallel-size 2 \
+  --set moe_config.expert_parallel=true
+```
+
+Several such schedulers exchange nothing with each other, so they are independent replicas, each an engine of its own as without the flag, and each shards its experts over its own tensor-parallel ranks: `--tensor-parallel-size 2 --data-parallel-size 2` runs two replicas of two ranks, each rank holding half the experts. A deployment file's tensor-parallel groups shard their experts the same way. `moe_config.exchange` keeps its default, and any other exchange is refused, since the exchanges apply across schedulers of one rank each or to dedicated expert workers; a group split over pipeline stages or sequence members has no tensor-parallel ranks to shard the experts over and is refused with the flag.
 
 ## Dedicated expert workers
 

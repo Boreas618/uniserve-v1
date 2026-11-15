@@ -434,8 +434,7 @@ fn the_gated_delta_layer_is_the_references() {
             model.pp("layers.0"),
             true,
             false,
-            (Split::WHOLE, Split::WHOLE),
-            DRAFTS,
+            &support::placement(Split::WHOLE, DRAFTS),
             None,
             false,
         )
@@ -702,8 +701,7 @@ fn the_indexed_attention_layer_is_the_references() {
             model.pp("layers.1"),
             false,
             false,
-            (Split::WHOLE, Split::WHOLE),
-            DRAFTS,
+            &support::placement(Split::WHOLE, DRAFTS),
             None,
             false,
         )

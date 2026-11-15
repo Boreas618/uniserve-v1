@@ -277,7 +277,10 @@ impl ModelRunner {
     /// on this process's host ([`placed_ranks`]).
     ///
     /// Each rank is a rank of the deployment's worker group that places it, or a member of the
-    /// node's expert union when the deployment splits its experts.
+    /// node's expert union when the deployment's schedulers or dedicated expert workers share
+    /// their experts in one ([`proto::config::EngineConfig::expert_union`]). Expert parallelism
+    /// outside a union shards each group's experts over its tensor-parallel ranks
+    /// ([`Self::text_placement`]).
     pub(crate) fn ranks(&self) -> Result<Vec<Self>> {
         let text = matches!(self.family.model, Model::Text(_));
         let attention = self.attention_ranks()?;
@@ -466,6 +469,19 @@ impl ModelRunner {
                  along one axis",
                 group.id,
                 proto::config::DEFAULT_BLOCK
+            );
+        }
+        // Expert parallelism outside an expert union shards a group's routed experts over its
+        // tensor-parallel ranks; a group split along its pipeline or its sequence has none.
+        if self.mapping.group_experts && block.tensor_parallel_size == 1 && ranks > 1 {
+            bail!(
+                "worker group {} splits its model over pipeline and sequence degrees ({}, {}) \
+                 with `moe_config.expert_parallel`: expert parallelism shards a group's routed \
+                 experts over its tensor-parallel ranks, or over an expert union of one-rank \
+                 schedulers or dedicated expert workers",
+                group.id,
+                block.pipeline_parallel_size,
+                sequence
             );
         }
         // The stages of a pipeline meet on the host before each handoff an eager forward makes
@@ -721,7 +737,6 @@ impl ModelRunner {
         weights: Weights<'_>,
         experts: &ExpertOrder,
     ) -> Result<Arc<dyn TextModel>> {
-        let mapping = &self.mapping;
         let Model::Text(family) = self.family.model else {
             bail!(
                 "{} is a media model, which a text rank does not load",
@@ -731,27 +746,14 @@ impl ModelRunner {
         let opened = nn::Checkpoint::open(self.checkpoint())?;
         let checkpoint = family.open(&opened, &self.engine_config().model.quantization)?;
         let mut loader = weights.loader(&opened);
-        let drafts = self.engine_config().speculative.num_draft_tokens;
-        let placement = TextPlacement {
-            tensor: Split {
-                size: mapping.tensor_parallel,
-                rank: mapping.tensor_rank,
-            },
-            pipeline: Split {
-                size: mapping.pipeline_parallel,
-                rank: mapping.pipeline_rank,
-            },
-            sequence: mapping.sequence,
-            experts: Split {
-                size: mapping.expert_parallel,
-                rank: mapping.expert_rank,
-            },
-            // The drafter's layers load when the deployment speculates with them, and a model
-            // whose state keeps a window per request sizes it by the drafts.
-            drafter: drafts > 0,
-            draft_tokens: drafts,
-        };
-        Ok(checkpoint.load(&opened, &mut loader, &placement, experts)?)
+        Ok(checkpoint.load(&opened, &mut loader, &self.text_placement(), experts)?)
+    }
+
+    /// The placement this rank's causal language model loads at: its splits of the model and
+    /// its share of the routed experts, as the deployment places the rank.
+    pub(crate) fn text_placement(&self) -> TextPlacement {
+        self.mapping
+            .text_placement(self.engine_config().speculative.num_draft_tokens)
     }
 }
 

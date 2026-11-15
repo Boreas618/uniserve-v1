@@ -295,8 +295,17 @@ pub struct TextPlacement {
     /// The Ulysses sequence split of every layer's rows: this rank's member holds its share of
     /// a batch's rows and attends its share of the heads of every row.
     pub sequence: SequenceSplit,
-    /// The expert-parallel split of the routed experts.
+    /// The expert group's split of the routed experts: this rank holds one window of every
+    /// routed layer's slots, and the group's exchange carries each token's routes to the ranks
+    /// that hold their experts.
     pub experts: Split,
+    /// Whether the tensor split divides the routed experts whole instead of every expert's
+    /// intermediate width: rank `r` of `P` holds the slots `[r·E/P, (r + 1)·E/P)` of every
+    /// routed layer, each expert at its full width, runs them over every token of the batch,
+    /// and the tensor group's all-reduce sums the ranks' outputs, routes to other ranks'
+    /// experts contributing nothing. No exchange moves a token, so the expert group's split
+    /// is then whole. A tensor split of one rank holds every expert whole either way.
+    pub tensor_experts: bool,
     /// Whether the deployment speculates with the checkpoint's own drafter, so its layers load
     /// beside the model's ([`TextModel::drafter`]); a deployment that does not leaves them unread.
     pub drafter: bool,
@@ -304,6 +313,19 @@ pub struct TextPlacement {
     /// deployment that does not speculate: a model whose state fields hold a window per request
     /// ([`crate::capability::VerifySlots`]) sizes them by it.
     pub draft_tokens: u32,
+}
+
+impl TextPlacement {
+    /// One rank holding the whole model: no split along any axis, no drafter.
+    pub const WHOLE: Self = Self {
+        tensor: Split::WHOLE,
+        pipeline: Split::WHOLE,
+        sequence: SequenceSplit::WHOLE,
+        experts: Split::WHOLE,
+        tensor_experts: false,
+        drafter: false,
+        draft_tokens: 0,
+    };
 }
 
 /// A loaded causal language model, as execution sizes and serves it.

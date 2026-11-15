@@ -2303,6 +2303,171 @@ fn a_text_group_splits_its_model_along_one_axis_and_every_group_alike() {
     );
 }
 
+/// The key of the one launch of `operator` the profile runs of `ranks` name, the same on every
+/// rank.
+fn rank_key(ranks: &[LoadedRank], operator: &str) -> String {
+    let keys: std::collections::BTreeSet<&String> = ranks
+        .iter()
+        .flat_map(|rank| rank.keys.iter())
+        .filter(|(launched, _)| *launched == operator)
+        .map(|(_, key)| key)
+        .collect();
+    assert_eq!(keys.len(), 1, "{operator}: {keys:?}");
+    keys.into_iter().next().unwrap().clone()
+}
+
+/// A deployment of one scheduler's group of two tensor-parallel ranks over the fixture, with
+/// expert parallelism (`moe_config.expert_parallel`) when `expert_parallel` holds.
+fn tensor_group(expert_parallel: bool) -> EngineArgs {
+    let mut launch = parallel_launch(2, |block| block.tensor_parallel_size = 2);
+    launch.engine_config.moe.expert_parallel = expert_parallel;
+    launch
+}
+
+/// With expert parallelism a scheduler's group of two tensor-parallel ranks shards the fixture's
+/// four experts over its ranks (`docs/expert_parallelism.md`): each rank's profile run names the
+/// routed products of two whole experts at the full eight intermediate columns and the sort of a
+/// window of two, where the same group without the flag holds every expert at half its width.
+/// Neither runs an exchange: every rank holds every token.
+#[test]
+fn a_tensor_group_with_expert_parallelism_runs_whole_experts_over_every_token() {
+    for expert_parallel in [true, false] {
+        let ranks = loaded(&tensor_group(expert_parallel));
+        assert_eq!(ranks.len(), 2);
+
+        let (local, intermediate, experts) = if expert_parallel {
+            (2, 8, 2)
+        } else {
+            (4, 4, 4)
+        };
+        assert!(
+            rank_key(&ranks, "moe_sort").starts_with(&format!("experts_4_top_2_local_{local}_")),
+            "expert parallelism {expert_parallel}"
+        );
+        for operator in ["gather_gemm", "route_gemm"] {
+            assert!(
+                rank_key(&ranks, operator).starts_with(&format!(
+                    "hidden_16_intermediate_{intermediate}_experts_{experts}_top_2_"
+                )),
+                "{operator}, expert parallelism {expert_parallel}"
+            );
+        }
+        assert!(
+            ranks.iter().all(|rank| rank
+                .keys
+                .iter()
+                .all(|(operator, _)| *operator != "expert_exchange")),
+            "expert parallelism {expert_parallel}"
+        );
+    }
+}
+
+/// The placement each rank hands its model under expert parallelism: a group of two
+/// tensor-parallel ranks holds whole experts of the group's slots, each rank at its tensor
+/// position, and no expert union; two schedulers of one rank each form an expert union, each
+/// keeping its scheduler's half of the experts, which their exchange reaches.
+#[test]
+fn expert_parallelism_places_whole_experts_on_a_tensor_group_and_shares_them_in_a_union() {
+    let registry = nn::family::Registry::new([models::qwen3::family::FAMILY]).unwrap();
+    let placements = |launch: &EngineArgs| -> Vec<nn::family::TextPlacement> {
+        let family = crate::process::catalogue::resolve(
+            &registry,
+            Path::new(&launch.engine_config.model.model),
+        )
+        .unwrap();
+        let ranks = ModelRunner::of(launch, family).unwrap().ranks().unwrap();
+        ranks.iter().map(ModelRunner::text_placement).collect()
+    };
+    let half = |rank| nn::Split { size: 2, rank };
+
+    for expert_parallel in [true, false] {
+        let tensor: Vec<(nn::Split, nn::Split, bool)> = placements(&tensor_group(expert_parallel))
+            .iter()
+            .map(|placement| {
+                (
+                    placement.tensor,
+                    placement.experts,
+                    placement.tensor_experts,
+                )
+            })
+            .collect();
+        // The group's ranks are listed in descending device order, so its first rank is
+        // position one.
+        assert_eq!(
+            tensor,
+            [
+                (half(1), nn::Split::WHOLE, expert_parallel),
+                (half(0), nn::Split::WHOLE, expert_parallel)
+            ],
+            "expert parallelism {expert_parallel}"
+        );
+    }
+
+    let mut union = launch();
+    let scheduler = |index: usize| WorkerGroupConfig {
+        id: WorkerGroupId(format!("model-{index}")),
+        role: Default::default(),
+        replicas: 1,
+        ranks: vec![WorkerRank {
+            host: "localhost".to_owned(),
+            device: format!("cuda:{index}"),
+        }],
+        blocks: WorkerGroupConfig::single_block(proto::config::DEFAULT_BLOCK, 1),
+        queue_depth: 2,
+        mem_fraction_static: None,
+    };
+    union.engine_config.parallel.worker_groups = vec![scheduler(0), scheduler(1)];
+    union.engine_config.parallel.data_parallel_size = std::num::NonZeroUsize::new(2).unwrap();
+    union.engine_config.moe.expert_parallel = true;
+    union.group = "model-0".to_owned();
+    union.devices = vec![0, 1];
+    union.world_size = 2;
+    let shared: Vec<(nn::Split, nn::Split, bool)> = placements(&union)
+        .iter()
+        .map(|placement| {
+            (
+                placement.tensor,
+                placement.experts,
+                placement.tensor_experts,
+            )
+        })
+        .collect();
+    assert_eq!(
+        shared,
+        [
+            (nn::Split::WHOLE, half(0), false),
+            (nn::Split::WHOLE, half(1), false)
+        ]
+    );
+}
+
+/// Expert parallelism outside an expert union shards a group's experts over its tensor-parallel
+/// ranks, so a group split over pipeline stages or sequence members with the flag is refused at
+/// start rather than served with every expert on every rank.
+#[test]
+fn a_pipeline_or_sequence_group_with_expert_parallelism_is_refused() {
+    let registry = nn::family::Registry::new([models::qwen3::family::FAMILY]).unwrap();
+    let stages = |block: &mut BlockConfig| block.pipeline_parallel_size = 2;
+    let members = |block: &mut BlockConfig| {
+        block.sequence_parallel = proto::config::SequenceParallel::Ulysses {
+            ulysses_degree: 2,
+            projection: proto::config::HeadProjection::Gather,
+            projection_rows: None,
+        };
+    };
+    for mut launch in [parallel_launch(2, stages), parallel_launch(2, members)] {
+        launch.engine_config.moe.expert_parallel = true;
+        let family = crate::process::catalogue::resolve(
+            &registry,
+            Path::new(&launch.engine_config.model.model),
+        )
+        .unwrap();
+        let ranks = ModelRunner::of(&launch, family).unwrap().ranks();
+        let refusal = format!("{:#}", ranks.err().expect("the deployment is refused"));
+        assert!(refusal.contains("expert_parallel"), "{refusal}");
+    }
+}
+
 /// An FP8 cache that reads its peers' pages converts the dense pages they store: the session
 /// states each cache group's converted-load source region, a dense page a unit, as many as one
 /// rank's source buffer holds, apart from the group's host region of FP8 pages, and the group's

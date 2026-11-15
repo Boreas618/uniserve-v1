@@ -59,6 +59,7 @@ pub(crate) fn whole(drafter: bool) -> TextPlacement {
         pipeline: nn::Split::WHOLE,
         sequence: nn::family::SequenceSplit::WHOLE,
         experts: nn::Split::WHOLE,
+        tensor_experts: false,
         drafter,
         draft_tokens: 0,
     }

@@ -531,8 +531,9 @@ impl Config {
 
     /// Checks a deployment's placement of the model and returns the decoder layers this rank's
     /// pipeline stage holds: the tensor and expert splits as [`Self::check_splits`] checks them,
-    /// at most one of the tensor, pipeline and sequence splits above one rank (a forward runs
-    /// over one group), and the pipeline's and the sequence's own conditions.
+    /// a tensor group that holds whole experts dividing them alone, at most one of the tensor,
+    /// pipeline and sequence splits above one rank (a forward runs over one group), and the
+    /// pipeline's and the sequence's own conditions.
     ///
     /// Stage `s` of `P` holds layers `s·L/P .. (s + 1)·L/P` of the stack's `L`. `P` divides `L`
     /// and every stage holds as many attention layers as every other: every rank of a group
@@ -552,6 +553,18 @@ impl Config {
             placement.sequence.split,
         );
         self.check_splits(tensor, placement.experts)?;
+        // A tensor group that holds whole experts divides the experts, not their width, and no
+        // expert group divides them beside it.
+        if placement.tensor_experts
+            && let Some(moe) = &self.moe
+            && (placement.experts.size > 1 || !moe.num_experts.is_multiple_of(tensor.size))
+        {
+            return Err(Error::Config(format!(
+                "a tensor group of {} holding whole experts beside an expert group of {}: the \
+                 tensor group alone divides the {} experts",
+                tensor.size, placement.experts.size, moe.num_experts
+            )));
+        }
 
         let split = [tensor.size, pipeline.size, sequence.size];
         if split.iter().filter(|size| **size > 1).count() > 1 {
@@ -1241,6 +1254,7 @@ mod tests {
                 projection: nn::family::Projection::Gather,
             },
             experts: Split::WHOLE,
+            tensor_experts: false,
             drafter: false,
             draft_tokens: 0,
         };
@@ -1285,6 +1299,27 @@ mod tests {
                 .check_placement(&placed(whole, whole, split(2, 2)))
                 .is_err()
         );
+
+        // A tensor group of four holding whole experts holds every layer; an expert group beside
+        // it is refused.
+        let holding = TextPlacement {
+            tensor_experts: true,
+            ..placed(split(4, 1), whole, whole)
+        };
+        assert_eq!(
+            config
+                .check_placement(&holding)
+                .expect("a tensor group holding whole experts"),
+            0..layers
+        );
+        let error = config
+            .check_placement(&TextPlacement {
+                experts: split(2, 0),
+                ..holding
+            })
+            .expect_err("two groups dividing the experts")
+            .to_string();
+        assert!(error.contains("whole experts"), "{error}");
 
         // A hybrid stack of three linear layers and one attention layer: two stages would hold
         // zero and one attention layers, and its recurrent scan is not split over members.

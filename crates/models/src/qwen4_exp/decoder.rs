@@ -15,13 +15,14 @@
 //! into the streams. That boundary is the one vLLM's kernel chain and its fused layer kernels
 //! have, so a layer is the unit either computes.
 
+use nn::family::TextPlacement;
 use nn::functional::Rounding;
 use nn::modules::{
     GateUp, GatedDeltaNet, GatedDeltaNetConfig, MlpConfig, MoE, MoEConfig, Rotary, SharedExpert,
     SharedExpertConfig,
 };
 use nn::quantization::Scheme;
-use nn::{DType, ExpertExchange, KvCache, RecurrentState, Split, Tensor, TokenBatch, VarBuilder};
+use nn::{DType, ExpertExchange, KvCache, RecurrentState, Tensor, TokenBatch, VarBuilder};
 
 use crate::qwen4_exp::attention::IndexedAttention;
 use crate::qwen4_exp::config::Config;
@@ -58,12 +59,14 @@ pub struct DecoderLayer {
 }
 
 impl DecoderLayer {
-    /// The layer the module at `vb` (`<stack>.layers.<i>`) states, at `tensor`'s rank of the
-    /// tensor-parallel group, for a deployment that drafts `draft_tokens` tokens a step.
+    /// The layer the module at `vb` (`<stack>.layers.<i>`) states, at the ranks `placement`
+    /// states: its rank of the tensor-parallel group, for a deployment that drafts the
+    /// placement's draft tokens a step.
     ///
     /// `linear` loads a gated delta network as the mixer in place of indexed attention, and
-    /// `ple` the PLE layer the layer holds. The routed experts are held at `experts`' rank of
-    /// the expert group in the slots `order` states, or in the checkpoint's order when it
+    /// `ple` the PLE layer the layer holds. The routed experts are held at the placement's share
+    /// of them (its window of the expert group's slots, or of the tensor group's when that group
+    /// holds whole experts) in the slots `order` states, or in the checkpoint's order when it
     /// states none. `decode` lets routed experts an export stores as block-scaled FP8 be
     /// decoded to dense matrices at load, which a drafter's one layer is few enough for and a
     /// stack's layers are not.
@@ -73,20 +76,16 @@ impl DecoderLayer {
     /// [`Error::Representation`] for routed experts stored as block-scaled FP8 when `decode`
     /// does not allow them to be decoded dense at load; a module the loader refuses; or a
     /// split that does not divide what it shards.
-    #[expect(
-        clippy::too_many_arguments,
-        reason = "what a checkpoint's layer is and how a deployment holds it"
-    )]
     pub fn load(
         config: &Config,
         vb: VarBuilder<'_, '_>,
         linear: bool,
         ple: bool,
-        (tensor, experts): (Split, Split),
-        draft_tokens: u32,
+        placement: &TextPlacement,
         order: Option<&Vec<u32>>,
         decode: bool,
     ) -> Result<Self> {
+        let (tensor, draft_tokens) = (placement.tensor, placement.draft_tokens);
         let (text, moe) = (&config.text, &config.moe);
 
         // No operator of this build multiplies block-scaled FP8 expert weights, and a
@@ -140,7 +139,8 @@ impl DecoderLayer {
                 .cloned()
                 .unwrap_or_else(|| (0..moe.num_experts).collect()),
             split: tensor,
-            exchange: experts,
+            tensor_experts: placement.tensor_experts,
+            exchange: placement.experts,
         };
         let shared = SharedExpertConfig {
             mlp: MlpConfig {

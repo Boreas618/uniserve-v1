@@ -6,7 +6,7 @@ use anyhow::{Context as _, Result, bail};
 use nn::Split;
 use nn::family::{
     DenoiserSplit, GATHER_AXIS, LAYER_AXIS, Model, Projection, SequenceSplit, TENSOR_AXIS,
-    ULYSSES_AXIS, VideoCheckpoint,
+    TextPlacement, ULYSSES_AXIS, VideoCheckpoint,
 };
 use proto::config::{BlockConfig, EngineArgs, HeadProjection, WorkerGroupConfig};
 
@@ -116,21 +116,29 @@ pub(crate) struct Mapping {
     /// This rank's position in its worker group's parallel order (`parallel_order`): its place
     /// along the group's one axis and its part of every unit of the session's regions.
     pub(super) position: u32,
+    /// The ranks of the expert union that share the routed experts, and which share this rank
+    /// keeps; one rank outside a union.
     pub(super) expert_parallel: u32,
     pub(super) expert_rank: u32,
     /// This rank's place in the expert union, attention ranks first.
     pub(super) union_rank: u32,
     /// Leading ranks of the union that hold no experts.
     pub(super) attention_ranks: u32,
+    /// Whether expert parallelism shards the routed experts over this rank's own worker group
+    /// rather than an expert union: each of the group's tensor-parallel ranks holds whole
+    /// experts and runs them over every token of the group's batches
+    /// ([`proto::config::EngineConfig::expert_union`]).
+    pub(super) group_experts: bool,
 }
 
 impl Mapping {
     /// This rank's part of the epoch's parallel shape.
     ///
-    /// Tensor parallelism splits every layer of the group's ranks; expert parallelism splits the
-    /// routed experts of the deployment's schedulers. A rank's ordinal places it in both: its
-    /// tensor rank is its position inside its scheduler's group, and its expert rank is which
-    /// scheduler's share of the experts it keeps.
+    /// Tensor parallelism splits every layer of the group's ranks. Expert parallelism splits the
+    /// routed experts of the deployment's schedulers when they form an expert union, and
+    /// otherwise those of each scheduler's group over its tensor-parallel ranks. A rank's
+    /// ordinal places it in both: its tensor rank is its position inside its scheduler's group,
+    /// and its expert rank in a union is which scheduler's share of the experts it keeps.
     pub(super) fn of(launch: &EngineArgs, build: &proto::config::EngineConfig) -> Result<Self> {
         let tensor_parallel = u32::try_from(build.parallel.tensor_parallel_size.get())
             .context("a tensor-parallel degree larger than u32::MAX")?;
@@ -139,11 +147,8 @@ impl Mapping {
         }
         let data_parallel = u32::try_from(build.parallel.data_parallel_size.get())
             .context("a data-parallel degree larger than u32::MAX")?;
-        let expert_parallel = if build.moe.expert_parallel {
-            data_parallel
-        } else {
-            1
-        };
+        let union = build.expert_union();
+        let expert_parallel = if union { data_parallel } else { 1 };
         let tensor_rank = launch.rank % tensor_parallel;
         Ok(Self {
             tensor_parallel,
@@ -156,7 +161,35 @@ impl Mapping {
             expert_rank: (launch.rank / tensor_parallel) % expert_parallel,
             union_rank: 0,
             attention_ranks: 0,
+            group_experts: build.moe.expert_parallel && !union,
         })
+    }
+
+    /// The placement this rank's causal language model loads at, for a deployment that drafts
+    /// `draft_tokens` tokens a step: its tensor, pipeline and sequence splits, its share of the
+    /// expert union's experts, and, when expert parallelism shards its own group's experts,
+    /// whole experts of its tensor-parallel group's slots (`docs/expert_parallelism.md`).
+    pub(super) fn text_placement(&self, draft_tokens: u32) -> TextPlacement {
+        TextPlacement {
+            tensor: Split {
+                size: self.tensor_parallel,
+                rank: self.tensor_rank,
+            },
+            pipeline: Split {
+                size: self.pipeline_parallel,
+                rank: self.pipeline_rank,
+            },
+            sequence: self.sequence,
+            experts: Split {
+                size: self.expert_parallel,
+                rank: self.expert_rank,
+            },
+            tensor_experts: self.group_experts,
+            // The drafter's layers load when the deployment speculates with them, and a model
+            // whose state keeps a window per request sizes it by the drafts.
+            drafter: draft_tokens > 0,
+            draft_tokens,
+        }
     }
 }
 

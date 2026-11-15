@@ -34,7 +34,15 @@
 //! intermediate width, so its output is a partial sum that [`MoE::forward`] reduces over the
 //! group. Packed experts are split the same way, each rank's block padded with zero rows and
 //! columns to whole row tiles of the grouped products ([`Nvfp4Share`]): the products then run
-//! at the padded width, and the zeros contribute nothing. Over an expert group ([`MoEConfig::exchange`]) a rank holds a window of the slots and
+//! at the padded width, and the zeros contribute nothing.
+//!
+//! A tensor-parallel group may divide the slots instead ([`MoEConfig::tensor_experts`]): rank
+//! `r` of `P` holds the window `r` of the slots, every expert at its full width, and runs it
+//! over every token of the batch. The sort gives a route to another rank's expert no row, so it
+//! contributes nothing to the rank's sum, and the group's reduction adds each route's product
+//! exactly once.
+//!
+//! Over an expert group ([`MoEConfig::exchange`]) a rank holds a window of the slots and
 //! the block runs through the group's exchange, whose rows execution lends
 //! ([`ExpertExchange`]): the routes travel to the ranks that hold their experts, and each
 //! token's sums come back.
@@ -102,8 +110,15 @@ pub struct MoEConfig {
     /// out and by which an expert group's ranks divide them. The experts' own order when a
     /// deployment has not redistributed them.
     pub order: Vec<u32>,
-    /// The tensor-parallel split of each expert's intermediate width.
+    /// The tensor-parallel group's split of the block, whose ranks' outputs the forward sums:
+    /// this rank's block of each expert's intermediate width, or its window of the slots when
+    /// the group holds whole experts ([`Self::tensor_experts`]).
     pub split: Split,
+    /// Whether the tensor-parallel group divides the slots instead of each expert's width:
+    /// rank `r` of [`Self::split`] holds the window `r` of the slots, every expert at its full
+    /// intermediate width, and runs it over every token. The expert group's split is then
+    /// whole, since no exchange moves a token.
+    pub tensor_experts: bool,
     /// The expert group's split of the slots: this rank holds one contiguous window of them.
     pub exchange: Split,
 }
@@ -150,10 +165,12 @@ pub struct MoE {
     intermediate: u32,
     activation: Activation,
     renormalize: bool,
-    /// The slots this rank holds; every slot when no expert group divides them.
+    /// The slots this rank holds; every slot when no group divides them.
     local: Range<u32>,
-    /// Ranks of the tensor-parallel group the experts' gated width is split over: above one,
-    /// the output is a partial sum the forward reduces.
+    /// Whether an expert group divides the slots, so the forward runs through its exchange.
+    exchanges: bool,
+    /// Ranks of the tensor-parallel group the experts' gated width or slots are split over:
+    /// above one, the output is a partial sum the forward reduces.
     reduce: u32,
 }
 
@@ -162,20 +179,41 @@ impl MoE {
     ///
     /// The router is replicated: every rank routes a token the same way. Over an expert group
     /// the rank holds its window of the slots; over a tensor-parallel group, its rows of every
-    /// gate and up projection and its columns of every down projection. A calibrated NVFP4
-    /// checkpoint's experts are read packed: on one rank in the arrangement the routed products
-    /// read, and over an expert group in the fused exchange's, with the per-expert scalars its
-    /// kernel multiplies in.
+    /// gate and up projection and its columns of every down projection, or its window of the
+    /// slots, every expert whole, when the group holds whole experts. A calibrated NVFP4
+    /// checkpoint's experts are read packed: without an expert group in the arrangement the
+    /// routed products read, and over an expert group in the fused exchange's, with the
+    /// per-expert scalars its kernel multiplies in.
     ///
     /// # Errors
     ///
     /// When the routing is outside what the router's kernel holds, the order is no permutation
-    /// of the experts, a split does not divide the experts or their width, packed experts are
-    /// split by a tensor-parallel group, or a tensor is missing or of another extent.
+    /// of the experts, a split does not divide the experts or their width, a tensor group that
+    /// holds whole experts sits beside an expert group, packed experts are split by a
+    /// tensor-parallel group in blocks the products cannot read, or a tensor is missing or of
+    /// another extent.
     pub fn load(config: &MoEConfig, vb: VarBuilder<'_, '_>) -> Result<Self> {
         let refuse = |problem: String| Error::weight(vb.path(), problem);
         let (experts, top) = (config.experts, config.top);
-        let (split, exchange) = (config.split, config.exchange);
+        let exchange = config.exchange;
+
+        // One group divides the slots: a tensor group that holds whole experts runs them over
+        // every token, so no exchange beside it moves one.
+        if config.tensor_experts && exchange.size > 1 {
+            return Err(refuse(format!(
+                "a tensor group of {} that holds whole experts and an expert group of {} both \
+                 divide the slots: one group divides them",
+                config.split.size, exchange.size
+            )));
+        }
+        // The tensor group's split as the share of each expert's width (`split`) and as the
+        // window of the slots (`windows`): the window is the expert group's unless the tensor
+        // group holds whole experts.
+        let (split, windows, holder) = if config.tensor_experts {
+            (Split::WHOLE, config.split, "tensor")
+        } else {
+            (config.split, exchange, "expert")
+        };
 
         if top == 0 || top > MAX_TOP || top > experts {
             return Err(refuse(format!(
@@ -196,13 +234,13 @@ impl MoE {
                 config.order.len()
             )));
         }
-        if exchange.size == 0
-            || exchange.rank >= exchange.size
-            || !experts.is_multiple_of(exchange.size)
+        if windows.size == 0
+            || windows.rank >= windows.size
+            || !experts.is_multiple_of(windows.size)
         {
             return Err(refuse(format!(
-                "rank {} of an expert group of {} does not hold a share of {experts} experts",
-                exchange.rank, exchange.size
+                "rank {} of the {holder} group of {} does not hold a share of {experts} experts",
+                windows.rank, windows.size
             )));
         }
         if split.size == 0
@@ -216,8 +254,8 @@ impl MoE {
             )));
         }
 
-        let held = experts / exchange.size;
-        let local = exchange.rank * held..(exchange.rank + 1) * held;
+        let held = experts / windows.size;
+        let local = windows.rank * held..(windows.rank + 1) * held;
         let window = &config.order[local.start as usize..local.end as usize];
         let intermediate = config.intermediate / split.size;
 
@@ -265,7 +303,7 @@ impl MoE {
                 width,
             )
         } else {
-            let (up_gate, down) = Self::load_dense(config, &vb, window)?;
+            let (up_gate, down) = Self::load_dense(config, &vb, window, split)?;
             (Experts::Dense { up_gate, down }, intermediate)
         };
 
@@ -280,19 +318,22 @@ impl MoE {
             activation: config.activation,
             renormalize: config.renormalize,
             local,
-            reduce: split.size,
+            exchanges: exchange.size > 1,
+            // The tensor group sums its ranks' outputs whether it divides each expert's width
+            // or the slots.
+            reduce: config.split.size,
         })
     }
 
-    /// The dense stacks of the experts `window` names, this rank's block of each: from the
-    /// checkpoint's stacked tensors when it holds them, and from one module per expert
-    /// otherwise.
+    /// The dense stacks of the experts `window` names, this rank's block `split` of each
+    /// expert's width: from the checkpoint's stacked tensors when it holds them, and from one
+    /// module per expert otherwise.
     fn load_dense(
         config: &MoEConfig,
         vb: &VarBuilder<'_, '_>,
         window: &[u32],
+        split: Split,
     ) -> Result<(Tensor, Tensor)> {
-        let split = config.split;
         let (hidden, intermediate) = (u64::from(config.hidden), u64::from(config.intermediate));
         let local_intermediate = intermediate / u64::from(split.size);
         let first = u64::from(split.rank) * local_intermediate;
@@ -582,13 +623,15 @@ impl MoE {
     /// ([`TokenBatch::live_tokens`](crate::TokenBatch::live_tokens)), when execution states it:
     /// the rows of a captured bucket past the batch route nowhere and their output is zeros.
     /// `exchange` is the expert group's exchange, lent when the block's experts are split over
-    /// one; the block then runs through it.
+    /// one; the block then runs through it. Experts a tensor-parallel group holds whole run
+    /// over every token of `x` without one, each rank's routes to the others' experts adding
+    /// nothing before the group's sum.
     ///
     /// # Errors
     ///
     /// When `x` does not fit the block, an operator refuses, experts split over an expert group
-    /// run without its exchange, or experts split over a tensor-parallel group run in a forward
-    /// that has no group.
+    /// run without its exchange, experts a tensor-parallel group holds whole run with one, or
+    /// experts split over a tensor-parallel group run in a forward that has no group.
     pub fn forward(
         &self,
         x: &Tensor,
@@ -611,14 +654,25 @@ impl MoE {
             ));
         }
 
-        let out = if self.local_experts() != self.count || exchange.is_some() {
+        // A tensor group that holds whole experts runs every token over its own window: its
+        // ranks hold the same tokens, so a lent exchange would add their routes again.
+        let tensor_window = self.reduce > 1 && self.local_experts() != self.count;
+        if tensor_window && !self.exchanges && exchange.is_some() {
+            return Err(Error::Unsupported(
+                "MoE: experts held whole by a tensor group run over every token, and the \
+                 forward lends an expert exchange"
+                    .to_owned(),
+            ));
+        }
+        let out = if self.exchanges || exchange.is_some() {
             self.exchanged(x, live_tokens, exchange)?
         } else {
             self.routed(x, live_tokens)?
         };
 
         if self.reduce > 1 {
-            // One rank's block of every expert's width: the group sums the ranks'.
+            // One rank's block of every expert's width, or its window of the slots: the group
+            // sums the ranks'.
             if collective::split().is_none() {
                 return Err(Error::shape(
                     "MoE",

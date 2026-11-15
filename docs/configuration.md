@@ -112,7 +112,7 @@ Three backend-name fields are read with `attention_backend` (`modules_of`, `crat
 | `max_num_batched_tokens` | The widest prefill batch the workers' captured graphs hold; `8192` when they capture none | Token work admitted in one scheduling step, the scheduling policy's step budget when its package states none; token models only |
 | `mem_fraction_static` | `0.7` | The deployment's share of each device's storage for weights, static allocations, graph pools and the KV cache, in (0, 1]: the limit `⌊total × fraction⌋` of the GPU's quota, which both epochs of a configuration change and the host's Transfer Server share (`docs/admin.md`); a deployment group's `mem_fraction_static` overrides it for the group's ranks, and a GPU that holds ranks of several groups has the shares of them all (below) |
 | `tensor_parallel_size` | `1` | Tensor-parallel workers of each scheduler's group without `worker_groups` |
-| `data_parallel_size` | `1` | DP ranks, each a scheduler with its own KV cache and worker groups. Independent replicas each run an engine of their own, and the leader sends a request to the one with the fewest in flight; with `moe_config.expert_parallel`, whose replicas exchange experts, one engine runs every replica's scheduler and the scheduling policy's `route` names each request's. With `worker_groups`, the file's groups that serve requests form the schedulers as equal consecutive blocks |
+| `data_parallel_size` | `1` | DP ranks, each a scheduler with its own KV cache and worker groups. Independent replicas each run an engine of their own, and the leader sends a request to the one with the fewest in flight. With `moe_config.expert_parallel`, replicas of one rank each (`tensor_parallel_size` 1) share their experts and exchange tokens, so one engine runs every replica's scheduler and the scheduling policy's `route` names each request's; replicas of several tensor-parallel ranks each shard their experts over their own ranks and stay independent replicas. With `worker_groups`, the file's groups that serve requests form the schedulers as equal consecutive blocks |
 | `worker_groups` | Unset | [Deployment file](#deployment-files) placing worker groups and their blocks |
 | `host_identity` | `"localhost"` | This node's host name; its daemon runs the ranks assigned to this host |
 | `engine_host` | This node's identity | The joined node that runs the engine and any ranks without an explicit host. Changing it starts a successor epoch there while the HTTP daemon remains on its node |
@@ -279,8 +279,8 @@ Each entry is the median over the point's reports of the step time over its run'
 
 | Option | Default | Meaning |
 | --- | --- | --- |
-| `expert_parallel` | `false` | Shard routed experts across the schedulers, the tensor-parallel ranks of a single scheduler's one worker group, or the deployment's expert workers |
-| `exchange` | `"alltoall"` | `alltoall`, `megamoe`, `deepep` or `dwdp` |
+| `expert_parallel` | `false` | Shard routed experts across the deployment's expert workers, across schedulers of one rank each (`data_parallel_size` above one), or otherwise over the tensor-parallel ranks of each scheduler's worker group, each rank holding whole experts; a group split over pipeline stages or sequence members is refused with it |
+| `exchange` | `"alltoall"` | `alltoall`, `megamoe`, `deepep` or `dwdp`; a deployment that shards its groups' experts over their tensor-parallel ranks moves no token and refuses any but the default |
 | `microbatches` | `1` | Microbatches overlapping attention with dedicated expert workers |
 
 ### `cuda_graph_config`

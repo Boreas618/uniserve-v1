@@ -52,6 +52,7 @@ pub(crate) fn placement(tensor: Split, draft_tokens: u32) -> TextPlacement {
         pipeline: Split::WHOLE,
         sequence: nn::family::SequenceSplit::WHOLE,
         experts: Split::WHOLE,
+        tensor_experts: false,
         drafter: draft_tokens > 0,
         draft_tokens,
     }

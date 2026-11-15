@@ -233,8 +233,19 @@ impl Qwen4ExpForCausalLm {
         placement: &TextPlacement,
         order: &ExpertOrder,
     ) -> Result<Self> {
-        let splits = (placement.tensor, placement.experts);
-        config.check_splits(splits.0, splits.1)?;
+        config.check_splits(placement.tensor, placement.experts)?;
+        // A tensor group that holds whole experts divides the experts, not their width, and no
+        // expert group divides them beside it.
+        if placement.tensor_experts
+            && (placement.experts.size > 1
+                || !config.moe.num_experts.is_multiple_of(placement.tensor.size))
+        {
+            return Err(Error::Config(format!(
+                "a tensor group of {} holding whole experts beside an expert group of {}: the \
+                 tensor group alone divides the {} experts",
+                placement.tensor.size, placement.experts.size, config.moe.num_experts
+            )));
+        }
         if placement.pipeline.size > 1 || placement.sequence.split.size > 1 {
             return Err(Error::Config(format!(
                 "a pipeline split over {} stages or a sequence split over {} members: this \
@@ -259,8 +270,7 @@ impl Qwen4ExpForCausalLm {
                     model.pp("layers").pp(layer),
                     text.linear_layers[layer as usize],
                     config.ple(layer).is_some(),
-                    splits,
-                    placement.draft_tokens,
+                    placement,
                     order.get(&expert_module(layer)),
                     false,
                 )
@@ -268,12 +278,7 @@ impl Qwen4ExpForCausalLm {
             .collect::<Result<Vec<_>>>()?;
 
         let mtp = if placement.drafter {
-            Some(Mtp::load(
-                config,
-                vb.pp("mtp"),
-                splits,
-                placement.draft_tokens,
-            )?)
+            Some(Mtp::load(config, vb.pp("mtp"), placement)?)
         } else {
             None
         };
@@ -289,13 +294,13 @@ impl Qwen4ExpForCausalLm {
 
         Ok(Self {
             config: config.clone(),
-            tensor: splits.0,
+            tensor: placement.tensor,
             draft_tokens: placement.draft_tokens,
             embed_tokens: Embedding::load(
                 &EmbeddingConfig {
                     vocabulary: text.vocab_size,
                     hidden: text.hidden_size,
-                    split: splits.0,
+                    split: placement.tensor,
                 },
                 model.pp("embed_tokens"),
             )?,
@@ -310,7 +315,7 @@ impl Qwen4ExpForCausalLm {
                 &LmHeadConfig {
                     vocabulary: text.vocab_size,
                     hidden: text.hidden_size,
-                    split: splits.0,
+                    split: placement.tensor,
                 },
                 vb.pp("lm_head"),
             )?,

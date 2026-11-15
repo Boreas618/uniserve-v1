@@ -982,6 +982,7 @@ fn dense_config() -> MoEConfig {
         stacked: None,
         order: vec![0, 1, 2, 3],
         split: Split::WHOLE,
+        tensor_experts: false,
         exchange: Split::WHOLE,
     }
 }
@@ -1296,6 +1297,105 @@ fn a_block_split_over_a_tensor_group_holds_its_share_and_reduces_its_sum() {
     );
 }
 
+/// A tensor group that holds whole experts: the second of two ranks holds experts 2 and 3 at
+/// their full width, runs them over every token and reduces its sum over the group; a forward
+/// without a group, or one that lends an expert exchange, is refused, and so is an expert group
+/// beside the tensor group.
+#[test]
+fn a_tensor_group_holding_whole_experts_runs_its_window_over_every_token_and_reduces_its_sum() {
+    let directory = tempfile::tempdir().unwrap();
+    let checkpoint = dense_checkpoint(directory.path(), DType::BF16);
+    let config = MoEConfig {
+        split: Split { size: 2, rank: 1 },
+        tensor_experts: true,
+        ..dense_config()
+    };
+
+    // The rank's stacks are experts 2 and 3, every row and column of each: its weights are
+    // filed under the experts it holds, and under no other expert's projection.
+    let store = CpuWeights::new();
+    let loader = WeightLoader::new(&checkpoint, &store, None);
+    MoE::load(&config, loader.root().pp("mlp")).unwrap();
+    let keys: Vec<String> = store.keys().iter().map(ToString::to_string).collect();
+    for piece in [
+        "|bf16|up_gate|mlp.experts.2.up_proj.weight+mlp.experts.2.gate_proj.weight+\
+         mlp.experts.3.up_proj.weight+mlp.experts.3.gate_proj.weight",
+        "|bf16|down|mlp.experts.2.down_proj.weight+mlp.experts.3.down_proj.weight",
+    ] {
+        assert!(
+            keys.iter().any(|key| key.contains(piece)),
+            "no key holds `{piece}`: {keys:#?}"
+        );
+    }
+    assert!(
+        !keys
+            .iter()
+            .any(|key| key.contains("experts.0.") || key.contains("experts.1.")),
+        "the first rank's experts are not this rank's: {keys:#?}"
+    );
+
+    // Its output is a partial sum: a forward with no group is refused, and one with a group
+    // states the kernels of a block of two whole experts routed from four.
+    let meta_loader = WeightLoader::meta(&checkpoint, None);
+    let block = MoE::load(&config, meta_loader.root().pp("mlp")).unwrap();
+    assert_eq!(
+        (block.experts(), block.local_experts(), block.top()),
+        (4, 2, 2)
+    );
+    let (alone, _) = recorded(|| block.forward(&meta((4, 8), DType::BF16), None, None));
+    let message = alone.err().unwrap().to_string();
+    assert!(message.contains("no group"), "{message}");
+
+    let (grouped, launches) = recorded_split(Some((1, 2)), || {
+        block.forward(&meta((4, 8), DType::BF16), None, None)
+    });
+    assert_eq!(grouped.unwrap().dims(), [4, 8]);
+    assert_eq!(
+        launches[2..],
+        [
+            (
+                "moe_sort",
+                "experts_4_top_2_local_2_tile_128_scales_f32_counted_true"
+            ),
+            (
+                "gather_gemm",
+                "hidden_8_intermediate_6_experts_2_top_2_activation_silu_dtype_bf16_\
+                 tile_128x128_cluster_1x1"
+            ),
+            (
+                "route_gemm",
+                "hidden_8_intermediate_6_experts_2_top_2_dtype_bf16_tile_128x128_cluster_1x1"
+            ),
+            (
+                "moe_unpermute",
+                "layout_permuted_hidden_8_top_2_experts_4_input_bf16_scales_f32_output_bf16"
+            ),
+        ]
+        .map(|(operator, key)| (operator, key.to_owned()))
+    );
+
+    // Its ranks hold the same tokens, so an exchange would carry their routes twice.
+    let lent = exchange(2, 4, 8, 2);
+    let (exchanged, _) = recorded_split(Some((1, 2)), || {
+        block.forward(&meta((4, 8), DType::BF16), None, Some(&lent))
+    });
+    let message = exchanged.err().unwrap().to_string();
+    assert!(message.contains("exchange"), "{message}");
+
+    // One group divides the slots.
+    let message = MoE::load(
+        &MoEConfig {
+            exchange: Split { size: 2, rank: 0 },
+            ..config
+        },
+        meta_loader.root().pp("mlp"),
+    )
+    .err()
+    .expect("two groups dividing the slots")
+    .to_string();
+    assert!(message.contains("one group"), "{message}");
+}
+
 #[test]
 fn a_dense_block_states_its_routing_its_products_and_its_combine() {
     let directory = tempfile::tempdir().unwrap();
@@ -1471,6 +1571,49 @@ fn a_calibrated_block_runs_the_packed_products_over_its_stacks() {
             .to_string();
         assert!(message.contains("packed"), "{message}");
     }
+}
+
+/// Packed experts a tensor group holds whole: each of two ranks holds one of the two experts at
+/// its full sixteen columns, unpadded, in the routed products' arrangement, and runs the packed
+/// products over its own expert.
+#[test]
+fn a_tensor_group_holding_whole_packed_experts_runs_the_packed_products_over_its_window() {
+    let directory = tempfile::tempdir().unwrap();
+    let (checkpoint, _) = packed_checkpoint(directory.path(), 2);
+    let mut loader = WeightLoader::meta(&checkpoint, None);
+    loader
+        .declare(&Declaration::read(&checkpoint).unwrap())
+        .unwrap();
+    let block = MoE::load(
+        &MoEConfig {
+            split: Split { size: 2, rank: 1 },
+            tensor_experts: true,
+            ..packed_config()
+        },
+        loader.root().pp("mlp"),
+    )
+    .unwrap();
+    assert_eq!((block.experts(), block.local_experts()), (2, 1));
+
+    let (output, launches) = recorded_split(Some((1, 2)), || {
+        block.forward(&meta((3, 32), DType::BF16), None, None)
+    });
+    assert_eq!(output.unwrap().dims(), [3, 32]);
+    let keyed = |operator: &str| {
+        launches
+            .iter()
+            .find(|(launched, _)| *launched == operator)
+            .map(|(_, key)| key.clone())
+            .unwrap_or_else(|| panic!("no {operator} launch: {launches:?}"))
+    };
+    assert!(keyed("moe_sort").starts_with("experts_2_top_2_local_1_"));
+    for operator in ["gather_gemm_nvfp4", "route_gemm_nvfp4"] {
+        assert!(
+            keyed(operator).starts_with("hidden_32_intermediate_16_experts_1_top_2_"),
+            "{operator}: {launches:?}"
+        );
+    }
+    assert!(!operators(&launches).contains(&"expert_exchange"));
 }
 
 // ---- The exchange -----------------------------------------------------------------------------

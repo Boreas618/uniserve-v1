@@ -22,7 +22,7 @@
 //! positions, computed once per forward, and may hold more than one spectrum (a text batch and
 //! an image batch of a Qwen3.5 model turn by different spectra of the same rotary width).
 
-use nn::family::SequenceSplit;
+use nn::family::TextPlacement;
 use nn::functional::Rounding;
 use nn::modules::{
     Attention, AttentionConfig, GateUp, GatedDeltaNet, GatedDeltaNetConfig, Mlp, MlpConfig, MoE,
@@ -95,14 +95,15 @@ pub struct DecoderLayer {
 }
 
 impl DecoderLayer {
-    /// The layer the module at `vb` (`<stack>.layers.<i>`) states, at `tensor`'s rank of the
-    /// tensor-parallel group, its attention exchanging its rows over `sequence`, the Ulysses
-    /// sequence split ([`SequenceSplit::WHOLE`] for none).
+    /// The layer the module at `vb` (`<stack>.layers.<i>`) states, at the ranks `placement`
+    /// states: its rank of the tensor-parallel group, its attention exchanging its rows over the
+    /// Ulysses sequence split ([`nn::family::SequenceSplit::WHOLE`] for none).
     ///
     /// `linear` loads a gated delta network as the mixer in place of attention. `routed` loads
     /// routed experts (and the shared expert the configuration states) in place of the dense
-    /// MLP, held at `experts`' rank of the expert group in the slots `order` states, or in the
-    /// checkpoint's order when it states none.
+    /// MLP, held at the placement's share of them (its window of the expert group's slots, or
+    /// of the tensor group's when that group holds whole experts) in the slots `order` states,
+    /// or in the checkpoint's order when it states none.
     ///
     /// # Errors
     ///
@@ -113,10 +114,10 @@ impl DecoderLayer {
         vb: VarBuilder<'_, '_>,
         linear: bool,
         routed: bool,
-        (tensor, experts): (Split, Split),
-        sequence: SequenceSplit,
+        placement: &TextPlacement,
         order: Option<&Vec<u32>>,
     ) -> Result<Self> {
+        let (tensor, sequence) = (placement.tensor, placement.sequence);
         let text = &config.text;
         let norm = stream_norm(text);
         let refuse = |missing: &str| Error::Config(format!("{} states no {missing}", vb.path()));
@@ -191,7 +192,8 @@ impl DecoderLayer {
                     .cloned()
                     .unwrap_or_else(|| (0..moe.num_experts).collect()),
                 split: tensor,
-                exchange: experts,
+                tensor_experts: placement.tensor_experts,
+                exchange: placement.experts,
             };
             let shared = match moe.shared_expert_intermediate_size {
                 Some(intermediate) => Some(SharedExpert::load(

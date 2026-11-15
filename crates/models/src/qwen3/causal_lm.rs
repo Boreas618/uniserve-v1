@@ -147,7 +147,6 @@ impl Qwen3ForCausalLm {
         placement: &TextPlacement,
         order: &ExpertOrder,
     ) -> Result<Self> {
-        let splits = (placement.tensor, placement.experts);
         let held = config.check_placement(placement)?;
 
         let routed = expert_layers(config);
@@ -164,7 +163,7 @@ impl Qwen3ForCausalLm {
             &EmbeddingConfig {
                 vocabulary: text.vocab_size,
                 hidden: text.hidden_size,
-                split: splits.0,
+                split: placement.tensor,
             },
             model.pp("embed_tokens"),
         )?;
@@ -175,7 +174,7 @@ impl Qwen3ForCausalLm {
                 &LmHeadConfig {
                     vocabulary: text.vocab_size,
                     hidden: text.hidden_size,
-                    split: splits.0,
+                    split: placement.tensor,
                 },
                 vb.pp("lm_head"),
             )?
@@ -189,15 +188,14 @@ impl Qwen3ForCausalLm {
                     model.pp("layers").pp(layer),
                     text.linear_layers[layer as usize],
                     config.routes(layer),
-                    splits,
-                    placement.sequence,
+                    placement,
                     order.get(&expert_module(layer)),
                 )
             })
             .collect::<Result<Vec<_>>>()?;
 
         let mtp = if placement.drafter {
-            Some(Mtp::load(config, vb.pp("mtp"), splits)?)
+            Some(Mtp::load(config, vb.pp("mtp"), placement)?)
         } else {
             None
         };
@@ -233,7 +231,7 @@ impl Qwen3ForCausalLm {
 
         Ok(Self {
             config: config.clone(),
-            tensor: splits.0,
+            tensor: placement.tensor,
             pipeline: placement.pipeline,
             sequence: placement.sequence,
             held,

@@ -299,17 +299,40 @@ pub(crate) fn epoch_hosts(config: &proto::config::EngineConfig) -> anyhow::Resul
 }
 
 /// The engine configuration of each data-parallel replica of `config`: independent replicas each
-/// run their own engine process on their own worker groups, while schedulers whose expert-parallel
-/// groups exchange experts stay in one.
+/// run their own engine process on their own worker groups, while schedulers that share their
+/// experts in an expert union stay in one ([`proto::config::EngineConfig::expert_union`]).
+/// Replicas whose experts are sharded over each one's own tensor-parallel ranks are independent
+/// and keep the flag.
 ///
 /// # Errors
 ///
-/// Fails when the worker groups do not form equal replicas.
+/// Fails when the worker groups do not form equal replicas, or when a deployment that shards its
+/// groups' experts over their tensor-parallel ranks selects an exchange: no token moves between
+/// those ranks, and the exchanges serve expert unions.
 pub(crate) fn replica_configs(
     config: &proto::config::EngineConfig,
 ) -> anyhow::Result<Vec<proto::config::EngineConfig>> {
+    let union = config.expert_union();
+    let tensor_groups = config.parallel.worker_groups.iter().any(|group| {
+        group
+            .blocks
+            .get(proto::config::DEFAULT_BLOCK)
+            .is_some_and(|block| block.tensor_parallel_size > 1)
+    });
+    anyhow::ensure!(
+        !config.moe.expert_parallel
+            || union
+            || !tensor_groups
+            || config.moe.exchange == proto::config::MoeConfig::default().exchange,
+        "`moe_config.exchange` is {} and `moe_config.expert_parallel` shards each worker \
+         group's experts over its tensor-parallel ranks, which exchange no token: the exchanges \
+         serve schedulers of one rank each and dedicated expert workers \
+         (docs/expert_parallelism.md)",
+        serde_json::to_string(&config.moe.exchange).unwrap_or_default()
+    );
+
     let count = config.parallel.data_parallel_size.get();
-    if count == 1 || config.moe.expert_parallel {
+    if count == 1 || union {
         return Ok(vec![config.clone()]);
     }
     let groups = &config.parallel.worker_groups;
@@ -3984,7 +4007,7 @@ mod tests {
     }
 
     /// The engine configuration of a deployment of `data` schedulers of `tensor` ranks each,
-    /// whose experts the schedulers exchange when `experts` holds.
+    /// with expert parallelism (`moe_config.expert_parallel`) when `experts` holds.
     fn deployment(tensor: usize, data: usize, experts: bool) -> proto::config::EngineConfig {
         let mut options = crate::options::ServerArgs {
             tensor_parallel_size: std::num::NonZeroUsize::new(tensor).unwrap(),
@@ -4035,6 +4058,57 @@ mod tests {
                 .sum::<usize>(),
             4
         );
+    }
+
+    /// Schedulers of several tensor-parallel ranks shard their experts over their own ranks and
+    /// exchange no token: with expert parallelism they are independent replicas, each its own
+    /// engine on its own ranks launched in the epoch's one number, and each keeps the flag.
+    #[test]
+    fn tensor_parallel_replicas_sharding_their_experts_are_independent() {
+        let config = deployment(2, 2, true);
+        let modules = crate::epoch::modules_of(&crate::options::ServerArgs::default());
+        let launches = super::epoch_launches(&config, &modules, 7).unwrap();
+        let devices: Vec<Vec<String>> = launches
+            .iter()
+            .map(|launch| {
+                launch
+                    .engine_config
+                    .parallel
+                    .worker_groups
+                    .iter()
+                    .flat_map(|group| group.ranks.iter().map(|rank| rank.device.clone()))
+                    .collect()
+            })
+            .collect();
+        assert_eq!(
+            devices,
+            vec![vec!["cuda:0", "cuda:1"], vec!["cuda:2", "cuda:3"]]
+        );
+        assert!(launches.iter().all(|launch| {
+            let replica = &launch.engine_config;
+            launch.epoch == 7
+                && replica.parallel.data_parallel_size.get() == 1
+                && replica.moe.expert_parallel
+        }));
+    }
+
+    /// The exchanges serve expert unions: a deployment that shards its groups' experts over
+    /// their tensor-parallel ranks and names another exchange than the default is refused,
+    /// while schedulers of one rank each take any exchange.
+    #[test]
+    fn tensor_parallel_groups_sharding_their_experts_take_no_exchange() {
+        for (tensor, data) in [(4, 1), (2, 2)] {
+            let mut config = deployment(tensor, data, true);
+            config.moe.exchange = proto::request::ExpertExchange::Dwdp;
+            let error = super::replica_configs(&config)
+                .expect_err("an exchange beside tensor-parallel experts")
+                .to_string();
+            assert!(error.contains("dwdp"), "{error}");
+        }
+
+        let mut union = deployment(1, 4, true);
+        union.moe.exchange = proto::request::ExpertExchange::Dwdp;
+        assert_eq!(super::replica_configs(&union).unwrap().len(), 1);
     }
 
     /// A standby exists only where the deployment reserved room for one and the

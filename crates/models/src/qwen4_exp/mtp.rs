@@ -39,9 +39,9 @@
 //! The references run one multi-token-prediction layer per forward, and a forward here is not
 //! told its step, so a checkpoint of more than one layer is refused at load.
 
-use nn::family::{CacheShape, StateShape};
+use nn::family::{CacheShape, StateShape, TextPlacement};
 use nn::modules::{Linear, LinearConfig, Parallel, RmsNorm, RmsNormConfig, Rotary};
-use nn::{DType, Drafter, KvCache, RecurrentState, Split, Tensor, TokenBatch, VarBuilder};
+use nn::{DType, Drafter, KvCache, RecurrentState, Tensor, TokenBatch, VarBuilder};
 
 use crate::qwen4_exp::attention::IndexedAttention;
 use crate::qwen4_exp::causal_lm::{cache_shape, coordinates, token_columns};
@@ -74,9 +74,9 @@ pub struct Mtp {
 }
 
 impl Mtp {
-    /// The drafter of `config` at `vb` (`mtp`), at the ranks `splits` state of the tensor and
-    /// the expert group, for a deployment that drafts `draft_tokens` tokens a step. The two
-    /// input projections are whole on every rank.
+    /// The drafter of `config` at `vb` (`mtp`), at the ranks `placement` states of the tensor
+    /// and the expert group, for a deployment that drafts the placement's draft tokens a step.
+    /// The two input projections are whole on every rank.
     ///
     /// # Errors
     ///
@@ -85,9 +85,9 @@ impl Mtp {
     pub fn load(
         config: &Config,
         vb: VarBuilder<'_, '_>,
-        splits: (Split, Split),
-        draft_tokens: u32,
+        placement: &TextPlacement,
     ) -> Result<Self> {
+        let draft_tokens = placement.draft_tokens;
         match config.mtp_num_hidden_layers {
             1 => {}
             0 => {
@@ -143,8 +143,7 @@ impl Mtp {
                 vb.pp("layers").pp(0),
                 false,
                 false,
-                splits,
-                draft_tokens,
+                placement,
                 None,
                 true,
             )?,
@@ -155,7 +154,7 @@ impl Mtp {
             )?,
             hidden: hidden as usize,
             streams: streams as usize,
-            cache: cache_shape(config, splits.0, 1),
+            cache: cache_shape(config, placement.tensor, 1),
             state: StateShape {
                 layers: 1,
                 fields: IndexedAttention::state_fields(

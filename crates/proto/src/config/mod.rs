@@ -402,9 +402,10 @@ impl Default for DeviceConfig {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct MoeConfig {
-    /// Shard routed experts across the schedulers, the tensor-parallel
-    /// ranks of a single scheduler's one worker group, or the deployment's
-    /// expert workers.
+    /// Shard routed experts across the deployment's expert workers, across
+    /// schedulers of one rank each, or otherwise over the tensor-parallel
+    /// ranks of each scheduler's worker group, each rank holding whole
+    /// experts ([`EngineConfig::expert_union`]).
     pub expert_parallel: bool,
     /// How sharded experts are reached: `alltoall`, `megamoe`, `deepep` or
     /// `dwdp`.
@@ -1082,6 +1083,26 @@ pub struct EngineConfig {
 }
 
 impl EngineConfig {
+    /// Whether `moe_config.expert_parallel` shards the routed experts over an expert union,
+    /// whose ranks exchange tokens at every expert layer and so run in one engine: the
+    /// deployment's dedicated expert workers (a group of role `experts`) and the ranks that
+    /// route tokens to them, or several schedulers of one rank each (`data_parallel_size` above
+    /// one). Otherwise the flag shards each serving group's experts over the group's own
+    /// tensor-parallel ranks, whose every rank holds every token: no token moves between
+    /// groups, so their schedulers are independent replicas, as without the flag.
+    pub fn expert_union(&self) -> bool {
+        let groups = &self.parallel.worker_groups;
+        let dedicated = groups
+            .iter()
+            .any(|group| group.role == WorkerGroupRole::Experts);
+        let single_ranks = groups
+            .iter()
+            .filter(|group| group.role.serves_requests())
+            .all(|group| group.ranks.len() == 1);
+        self.moe.expert_parallel
+            && (dedicated || (self.parallel.data_parallel_size.get() > 1 && single_ranks))
+    }
+
     /// The identity of the build this configuration makes: two configurations whose hashes differ
     /// need a new epoch, and two whose hashes agree differ at most in what the generation layer
     /// changes in place (§7.7).
