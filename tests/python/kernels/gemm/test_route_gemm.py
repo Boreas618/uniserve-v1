@@ -2,8 +2,9 @@
 
 The module (resolved at the session's Build Server for the session's device)
 is compiled for one descriptor, below, so every case runs its shapes. It is
-called with the operator's `RouteCall` (``crates/ops/src/moe/grouped.rs``)
-over a valid sort built on the host
+called with the operator's `RouteCall` (``crates/ops/src/moe/grouped.rs``),
+which states the multiprocessors of the session's device as the operator
+does, over a valid sort built on the host
 (:mod:`uniserve_testing.kernels.gemm.routes`) that holds an expert with no
 routes and a partly filled last tile.
 
@@ -25,6 +26,7 @@ import math
 
 import pytest
 import torch
+from uniserve_testing.kernels import capture
 from uniserve_testing.kernels.gemm import routes
 from uniserve_testing.kernels.packages import (
     abi_enumerator,
@@ -65,6 +67,7 @@ class Call(ctypes.Structure):
         ("intermediate", ctypes.c_int64),
         ("experts", ctypes.c_int64),
         ("dtype", ctypes.c_int64),
+        ("multiprocessors", ctypes.c_int64),
         ("error", ctypes.c_char * 512),
     ]
 
@@ -88,8 +91,9 @@ def bound(intermediate):
 
 
 @pytest.mark.gpu
+@pytest.mark.parametrize("captured", capture.MODES)
 def test_every_route_receives_its_product_once_within_the_operators_bound(
-    torch_device, kernel_module
+    torch_device, kernel_module, captured
 ):
     library = ctypes.CDLL(
         str(kernel_module("route_gemm", "cute_dsl", KEY) / "module.so")
@@ -157,13 +161,12 @@ def test_every_route_receives_its_product_once_within_the_operators_bound(
         intermediate=INTERMEDIATE,
         experts=EXPERTS,
         dtype=BF16,
+        multiprocessors=torch.cuda.get_device_properties(
+            torch_device
+        ).multi_processor_count,
         error=b"",
     )
-    stream = torch.cuda.current_stream(torch_device).cuda_stream
-    status = entry(ctypes.byref(call), ctypes.c_void_p(stream))
-    torch.cuda.synchronize(torch_device)
-    message = call.error.decode("utf-8", "replace").rstrip("\x00")
-    assert status == 0, f"the module refused the call ({status}): {message}"
+    capture.call(entry, call, torch_device, captured)
     assert torch.equal(rows, rows_before) and torch.equal(
         weights, weights_before
     ), "the module wrote into its inputs; FC2 scatters only into `out`"

@@ -4,7 +4,8 @@ The module (resolved at the session's Build Server for the session's device)
 is compiled for one descriptor, below, so every case runs its shapes and the
 token count, a runtime argument, is the check's. It is called with the
 operator's `moe::grouped::GatherCall` (``crates/ops/src/moe/grouped.rs``, the
-generated header's ``uniserve_gather_call``), over a valid sort built on the
+generated header's ``uniserve_gather_call``), which states the multiprocessors
+of the session's device as the operator does, over a valid sort built on the
 host (:mod:`uniserve_testing.kernels.gemm.routes`) that holds an expert with
 no routes and a partly filled last tile.
 
@@ -25,6 +26,7 @@ import math
 
 import pytest
 import torch
+from uniserve_testing.kernels import capture
 from uniserve_testing.kernels.gemm import routes
 from uniserve_testing.kernels.packages import (
     abi_enumerator,
@@ -67,6 +69,7 @@ class Call(ctypes.Structure):
         ("experts", ctypes.c_int64),
         ("top", ctypes.c_int64),
         ("dtype", ctypes.c_int64),
+        ("multiprocessors", ctypes.c_int64),
         ("error", ctypes.c_char * 512),
     ]
 
@@ -116,8 +119,9 @@ def reference(hidden, weights, tile_expert, tile_limit, map_rows):
 
 
 @pytest.mark.gpu
+@pytest.mark.parametrize("captured", capture.MODES)
 def test_the_gated_product_writes_the_live_rows_within_the_operators_bound(
-    torch_device, kernel_module
+    torch_device, kernel_module, captured
 ):
     library = ctypes.CDLL(
         str(kernel_module("gather_gemm", "cute_dsl", KEY) / "module.so")
@@ -185,13 +189,12 @@ def test_the_gated_product_writes_the_live_rows_within_the_operators_bound(
         experts=EXPERTS,
         top=TOP,
         dtype=BF16,
+        multiprocessors=torch.cuda.get_device_properties(
+            torch_device
+        ).multi_processor_count,
         error=b"",
     )
-    stream = torch.cuda.current_stream(torch_device).cuda_stream
-    status = entry(ctypes.byref(call), ctypes.c_void_p(stream))
-    torch.cuda.synchronize(torch_device)
-    message = call.error.decode("utf-8", "replace").rstrip("\x00")
-    assert status == 0, f"the module refused the call ({status}): {message}"
+    capture.call(entry, call, torch_device, captured)
 
     # The rows the metadata names are a tile's first `limit` rows; the rest of
     # each tile is the sort's padding, which every tile carries at its own end.

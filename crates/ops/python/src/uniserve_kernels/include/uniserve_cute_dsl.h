@@ -13,30 +13,12 @@
 
 #pragma once
 
-#include <cuda_runtime_api.h>
-
 #include <cstdint>
 #include <cstdio>
 #include <exception>
 #include <mutex>
 
 namespace {
-
-// The multiprocessors of the device `stream` runs on, into `count`: the bound
-// of a persistent grid that keeps one CTA on every multiprocessor. Both
-// queries are host calls that enqueue nothing on the stream.
-cudaError_t cute_dsl_multiprocessors(cudaStream_t stream, int32_t* count) {
-  int device = 0;
-  const cudaError_t found = cudaStreamGetDevice(stream, &device);
-  if (found != cudaSuccess) {
-    return found;
-  }
-  int multiprocessors = 0;
-  const cudaError_t read =
-      cudaDeviceGetAttribute(&multiprocessors, cudaDevAttrMultiProcessorCount, device);
-  *count = multiprocessors;
-  return read;
-}
 
 // The exported module, holding the kernel's cubin and its host launcher. The
 // module is loaded into this process's devices once, by the export's `Load`;

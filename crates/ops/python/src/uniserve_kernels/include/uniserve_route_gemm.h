@@ -31,11 +31,14 @@ struct uniserve_route_call {
   int64_t intermediate;
   int64_t experts;
   int64_t dtype;
+  /// The multiprocessors of the device the launch runs on: the bound of the persistent grid,
+  /// which keeps at most one CTA on each.
+  int64_t multiprocessors;
   /// The entry's message on a nonzero return.
   char error[UNISERVE_MESSAGE];
 };
 
-static_assert(sizeof(uniserve_route_call) == 608, "the operator crate's layout of uniserve_route_call");
+static_assert(sizeof(uniserve_route_call) == 616, "the operator crate's layout of uniserve_route_call");
 static_assert(offsetof(uniserve_route_call, rows) == 0, "the operator crate's layout of uniserve_route_call");
 static_assert(offsetof(uniserve_route_call, weights) == 8, "the operator crate's layout of uniserve_route_call");
 static_assert(offsetof(uniserve_route_call, out) == 16, "the operator crate's layout of uniserve_route_call");
@@ -48,4 +51,5 @@ static_assert(offsetof(uniserve_route_call, width) == 64, "the operator crate's 
 static_assert(offsetof(uniserve_route_call, intermediate) == 72, "the operator crate's layout of uniserve_route_call");
 static_assert(offsetof(uniserve_route_call, experts) == 80, "the operator crate's layout of uniserve_route_call");
 static_assert(offsetof(uniserve_route_call, dtype) == 88, "the operator crate's layout of uniserve_route_call");
-static_assert(offsetof(uniserve_route_call, error) == 96, "the operator crate's layout of uniserve_route_call");
+static_assert(offsetof(uniserve_route_call, multiprocessors) == 96, "the operator crate's layout of uniserve_route_call");
+static_assert(offsetof(uniserve_route_call, error) == 104, "the operator crate's layout of uniserve_route_call");

@@ -67,7 +67,9 @@ through a fixture of this module or of the plugin:
   device.
 
 A check of a dependent launch runs its operator behind a producer that writes
-the inputs late (:mod:`uniserve_testing.kernels.chain`); a family's shared
+the inputs late (:mod:`uniserve_testing.kernels.chain`); a check that holds a
+native module's entry to the capture its engine calls it under calls it
+through :mod:`uniserve_testing.kernels.capture`; a family's shared
 reference arithmetic and operands are a module of the family's subpackage of
 :mod:`uniserve_testing.kernels`.
 """

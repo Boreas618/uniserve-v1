@@ -2,9 +2,11 @@
 
 :mod:`~uniserve_testing.kernels.packages` reaches the kernel packages outside
 a build (a package's kernel source, the launch its table states, a built
-module and the generated ABI headers), and
+module and the generated ABI headers),
 :mod:`~uniserve_testing.kernels.chain` runs an operator as a programmatic
-dependent behind a late producer. The
+dependent behind a late producer, and
+:mod:`~uniserve_testing.kernels.capture` calls a native module's entry
+directly or while its stream captures. The
 subpackages, one per family of checks, hold the reference arithmetic and the
 operands that several checks of the family share.
 """

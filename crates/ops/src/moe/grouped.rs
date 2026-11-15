@@ -17,7 +17,12 @@
 //!
 //! Both programs are CuTe DSL native libraries — tiles, cluster shapes and the persistent scheduler
 //! are the package's, and its tuning data (which tactic for which token count) is the package's too
-//! — so [`Op::launch`] computes no grid.
+//! — so [`Op::launch`] computes no grid. The persistent grid is bounded by the multiprocessors of
+//! the device the launch runs on, a launch value rather than a compiled one (the device code is the
+//! same on every part of a target), so the call states it: [`Op::launch`] reads it from the
+//! stream's device (`platform::DeviceId::multiprocessors`, a driver attribute that touches neither
+//! the stream nor a context) and the entry queries nothing, which keeps it safe to call while the
+//! stream captures.
 //!
 //! # The bound
 //!
@@ -219,6 +224,9 @@ pub struct GatherCall {
     pub experts: i64,
     pub top: i64,
     pub dtype: i64,
+    /// The multiprocessors of the device the launch runs on: the bound of the persistent grid,
+    /// which keeps at most one CTA on each.
+    pub multiprocessors: i64,
     /// The entry's message on a nonzero return.
     pub error: [c_char; MESSAGE],
 }
@@ -342,6 +350,7 @@ impl Op for GatherGemm {
             experts: to_i64(Self::NAME, experts)?,
             top: to_i64(Self::NAME, top)?,
             dtype: abi::code(descriptor.dtype)?,
+            multiprocessors: i64::from(stream.device().multiprocessors()?),
             error: [0; MESSAGE],
         };
         // SAFETY: `GatherCall` is the call structure this package's entry declares: the declaration
@@ -480,6 +489,7 @@ impl Op for RouteGemm {
             intermediate: to_i64(Self::NAME, intermediate)?,
             experts: to_i64(Self::NAME, experts)?,
             dtype: abi::code(descriptor.dtype)?,
+            multiprocessors: i64::from(stream.device().multiprocessors()?),
             error: [0; MESSAGE],
         };
         // SAFETY: `RouteCall` is the call structure this package's entry declares: the declaration
@@ -552,6 +562,9 @@ pub struct RouteCall {
     pub intermediate: i64,
     pub experts: i64,
     pub dtype: i64,
+    /// The multiprocessors of the device the launch runs on: the bound of the persistent grid,
+    /// which keeps at most one CTA on each.
+    pub multiprocessors: i64,
     /// The entry's message on a nonzero return.
     pub error: [c_char; MESSAGE],
 }
