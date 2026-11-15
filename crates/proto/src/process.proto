@@ -8,11 +8,11 @@
 // own node and forwards the others to the node's daemon; exits come back the
 // same way.
 //
-// The interface is versioned across builds: a persistent daemon serves
-// engines of successive builds. Messages change only by additions: a new
-// field has a default, a peer skips fields it does not know, and the hello
-// exchange agrees a major version: the daemon speaks its build's and the one
-// before (`proto::speaks`).
+// The interface has one version per release (`proto::ENGINE_INTERFACE_VERSION`):
+// a peer states its version in its hello, and the daemon serves a peer of its
+// own version alone, refusing any other in its welcome with a typed
+// `Refusal`. The `Hello` and the `Welcome` are the one part of the interface
+// that no release changes, so that a peer of any version reads its refusal.
 
 syntax = "proto3";
 
@@ -20,8 +20,8 @@ package uniserve.process;
 
 // The first message on a connection, from the connecting side.
 message Hello {
-  // `ENGINE_INTERFACE_VERSION` of the sender's build, which carries the storage protocol's
-  // version; the daemon refuses a peer of a version its build does not speak.
+  // `ENGINE_INTERFACE_VERSION` of the sender's build; the daemon refuses a peer of any other
+  // version than its own.
   uint32 major = 1;
   // The sender's build: package version and source digest.
   string build = 3;
@@ -85,15 +85,47 @@ enum Interface {
 
 // The response to a `Hello`.
 message Welcome {
-  // The version the connection speaks for its life: the peer's own when the daemon speaks it,
-  // the daemon's own with a refusal.
-  uint32 major = 1;
+  reserved 1, 4;
+  // The daemon's build: package version and source digest.
   string build = 3;
-  // Why the peer is refused; empty when it is accepted.
-  string refusal = 4;
   // Every node of the deployment, by rank (to an engine).
   repeated Node nodes = 5;
+  // Why the peer is refused; absent when it is accepted.
+  Refusal refusal = 6;
 }
+
+// Why the daemon refuses a peer's hello.
+message Refusal {
+  oneof reason {
+    // The peer speaks another version of the engine interface than the daemon.
+    VersionRefusal version = 1;
+    // The peer is not one the socket it reached serves: an engine on the
+    // members' address, a joining node on a process socket, or no peer at all.
+    Unserved unserved = 2;
+    // A joining node states the rank of the leader or of a node that joined.
+    uint32 rank_taken = 3;
+    // An engine's process link states no engine number, so no command could
+    // be addressed to it.
+    Unnumbered unnumbered = 4;
+    // The engine of this number holds the link this connection states
+    // already: each process has one process link and one request link.
+    uint64 linked = 5;
+  }
+}
+
+// The versions of a refusal for the engine interface's version.
+message VersionRefusal {
+  // The version the peer's hello states.
+  uint32 offered = 1;
+  // The daemon's version, the one it serves.
+  uint32 spoken = 2;
+}
+
+// A peer the socket it reached does not serve.
+message Unserved {}
+
+// An engine's process link that states no engine number.
+message Unnumbered {}
 
 // One node as the leader knows it.
 message Node {

@@ -112,11 +112,9 @@ pub(crate) fn claim(
     let welcome: proto::process::Welcome = process
         .recv(HANDSHAKE_TIMEOUT)?
         .context("the daemon did not welcome this engine's process interface")?;
-    if !welcome.refusal.is_empty() {
-        bail!(
-            "the daemon refused this engine's process interface: {}",
-            welcome.refusal
-        );
+    if let Some(refusal) = welcome.refusal {
+        return Err(anyhow::Error::new(refusal)
+            .context("the daemon refused this engine's process interface"));
     }
     // The nodes are what the claim and every later request are answered by: a welcome with none
     // admits the process to a deployment the daemon does not know it in.
@@ -231,19 +229,10 @@ fn hello(connection: &mut Connection, engine: u64, timeout: Duration) -> Result<
     let welcome: wire::Welcome = connection
         .recv(timeout)?
         .context("the daemon closed the request interface before it welcomed this engine")?;
-    if !welcome.refusal.is_empty() {
-        bail!("the daemon refused this engine: {}", welcome.refusal);
+    match welcome.refusal {
+        Some(refusal) => Err(anyhow::Error::new(refusal).context("the daemon refused this engine")),
+        None => Ok(()),
     }
-    // The daemon welcomes this engine in its own version when the daemon's build speaks it and
-    // refuses it otherwise; a welcome that states another is a daemon of another interface.
-    if welcome.major != proto::ENGINE_INTERFACE_VERSION {
-        bail!(
-            "the daemon's interface is version {} and this engine's {}",
-            welcome.major,
-            proto::ENGINE_INTERFACE_VERSION
-        );
-    }
-    Ok(())
 }
 
 /// Starts the reader thread of front `front`, which hands every frame of `connection` to the
@@ -408,16 +397,4 @@ pub(crate) fn report(
     process.deliver(&proto::process::Upstream {
         kind: Some(upstream::Kind::Report(report)),
     })
-}
-
-#[cfg(test)]
-mod tests {
-    /// The engine interface carries the Storage Server protocol's version, which the interfaces
-    /// state without linking the storage crate: the two are one fact, and an engine whose
-    /// interface version did not move with the storage protocol would be admitted by a daemon
-    /// whose Storage Server it cannot speak to.
-    #[test]
-    fn the_engine_interface_carries_the_storage_protocol_version() {
-        assert_eq!(proto::STORAGE_PROTOCOL, storage::protocol::VERSION);
-    }
 }

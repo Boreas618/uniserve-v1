@@ -216,9 +216,8 @@ fn started(
     assert_eq!(hello.interface, proto::process::Interface::Requests as i32);
     requests
         .deliver(&wire::Welcome {
-            major: proto::ENGINE_INTERFACE_VERSION,
             build: proto::BUILD.to_owned(),
-            refusal: String::new(),
+            refusal: None,
         })
         .unwrap();
     let from_engine::Kind::State(starting) = next(&mut requests, READ) else {
@@ -236,9 +235,8 @@ fn started(
     ));
     processes
         .deliver(&proto::process::Welcome {
-            major: proto::ENGINE_INTERFACE_VERSION,
             build: proto::BUILD.to_owned(),
-            refusal: String::new(),
+            refusal: None,
             nodes: vec![proto::process::Node {
                 node_rank: 0,
                 host: "localhost".to_owned(),

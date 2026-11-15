@@ -7,11 +7,10 @@
 //!
 //! - **Sessions.** An engine's main process, a head of its epoch, opens the
 //!   epoch's session ([`Request::Open`]) and gets one queue pair per
-//!   scheduler. The session speaks the version of the interface its `Open`
-//!   states, one of those the server serves (`storage::runtime::OLDEST` to
-//!   `VERSION`), for its life, across restarts in place; the pool refuses
-//!   any other. The engine closes it ([`Request::Close`]) once its workers
-//!   stopped.
+//!   scheduler. The session speaks the server's version of the interface
+//!   (`storage::runtime::VERSION`), which its `Open` states; the pool
+//!   refuses any other. The engine closes it ([`Request::Close`]) once its
+//!   workers stopped.
 //!   When its connection closes first, the session closes only once the
 //!   engine's processes have exited and no GPU lists them (A7), the
 //!   evidence a shoot-down gathers, never on the connection's close alone:
@@ -249,16 +248,14 @@ impl Running {
 }
 
 /// What the sessions are as a restart in place hands them over: the
-/// pools' image with its format, and the number of queue pairs, whose memfds
-/// travel apart, and what the main loop keeps. No task runs then.
+/// pools' image in this build's format ([`crate::buffer_pool::FORMAT`],
+/// which the successor agreed to before the takeover), and the number of
+/// queue pairs, whose memfds travel apart, and what the main loop keeps. No
+/// task runs then.
 #[derive(Debug, Serialize, Deserialize)]
 pub(crate) struct SessionsHandoff {
     #[serde(with = "serde_bytes")]
     image: Vec<u8>,
-    /// The format of the image ([`crate::buffer_pool::FORMAT`]); a
-    /// predecessor that states none wrote format 1.
-    #[serde(default = "first_format")]
-    pub(crate) format: u32,
     pub(crate) queues: usize,
     open: Vec<(Engine, (ClientId, PoolSession))>,
     /// The sessions waiting for their engine's processes, each process by
@@ -271,12 +268,6 @@ pub(crate) struct SessionsHandoff {
     remote: Vec<(Engine, BTreeSet<(u32, String)>)>,
     next: u64,
     rolled: Vec<(String, u64)>,
-}
-
-/// The format of an image whose handoff states none: that of the builds
-/// before images stated their format.
-fn first_format() -> u32 {
-    1
 }
 
 /// The limits of a transfer and of a put to the remote store, in
@@ -349,7 +340,6 @@ impl Sessions {
             .ok_or_else(|| std::io::Error::other("the buffer pool's thread ended"))??;
         let handoff = SessionsHandoff {
             image,
-            format: crate::buffer_pool::FORMAT,
             queues: descriptors.len(),
             open: std::mem::take(&mut self.open).into_iter().collect(),
             gone: std::mem::take(&mut self.gone)
@@ -377,7 +367,7 @@ impl Sessions {
         queues: Vec<OwnedFd>,
         pidfd: impl Fn(usize) -> std::io::Result<Arc<OwnedFd>>,
     ) -> std::io::Result<Self> {
-        let image = Some((handoff.image, handoff.format, queues));
+        let image = Some((handoff.image, queues));
         let limits = limits(TRANSFER_DEADLINE, PUT_DEADLINE);
         let thread = polling::Thread::start(limits, image)?;
         let mut sessions = Self::with(thread)?;

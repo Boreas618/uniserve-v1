@@ -71,7 +71,7 @@ impl Deployment {
 fn the_leader_routes_each_node_s_requests_to_its_daemon() {
     let deployment = Deployment::start();
     let (mut engine, welcome) = Engine::hello(&deployment.address, proto::ENGINE_INTERFACE_VERSION);
-    assert_eq!(welcome.refusal, "");
+    assert_eq!(welcome.refusal, None);
     let nodes: Vec<(u32, &str)> = welcome
         .nodes
         .iter()

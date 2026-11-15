@@ -34,9 +34,7 @@ use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
 use storage::protocol::{Key, Segment};
-use storage::runtime::{
-    Completion, GroupId, Open, OwnerId, Request, RequestId, Stamps, Tier, VERSION,
-};
+use storage::runtime::{Completion, GroupId, Open, OwnerId, Request, RequestId, Stamps, Tier};
 
 use super::{Block, BufferPool, ClientId, Copy, Deferred, Encoding, Held, QueueId, SLOT, Target};
 
@@ -435,21 +433,19 @@ impl Trace {
         self.clock.0 = now;
     }
 
-    /// Appends the completions `pool` produced, in order, each in the
-    /// version its queue pair is written in.
+    /// Appends the completions the pool produced, in order.
     ///
     /// # Errors
     ///
     /// Fails when a record cannot be written.
     pub(crate) fn completed(
         &mut self,
-        pool: &BufferPool,
         produced: &[(QueueId, RequestId, Completion)],
     ) -> io::Result<()> {
         for (queue, request, completion) in produced {
             let mut body = Vec::new();
             queued(&mut body, *queue);
-            completion.encode_as(version(pool, *queue), *request, &mut body);
+            completion.encode(*request, &mut body);
             frame(&mut self.completions, COMPLETION, &body)?;
         }
         Ok(())
@@ -464,13 +460,6 @@ impl Trace {
         self.inputs.flush()?;
         self.completions.flush()
     }
-}
-
-/// The version of the runtime interface a queue pair's records are in: its
-/// session's, or this build's once the session is gone, as the buffer pool's
-/// thread writes them.
-fn version(pool: &BufferPool, queue: QueueId) -> u32 {
-    pool.version(queue.0).unwrap_or(VERSION)
 }
 
 /// Acts on an input as the buffer pool's thread does: the replay's pool and
@@ -491,7 +480,7 @@ pub(crate) fn apply(pool: &mut BufferPool, input: &Input) -> Result<(), String> 
         }
         Input::Close(client) => pool.end(*client),
         Input::Request(queue, record) => {
-            if let Ok((id, request)) = Request::decode_as(record, version(pool, *queue)) {
+            if let Ok((id, request)) = Request::decode(record) {
                 pool.take(*queue, id, request);
             }
         }
@@ -537,9 +526,9 @@ pub(crate) fn copies_asked(completion: &Completion) -> u32 {
     }
 }
 
-/// A completion's record of `version` as a replay states it.
-fn shown(record: &[u8], version: u32) -> String {
-    match Completion::decode_as(record, version) {
+/// A completion's record as a replay states it.
+fn shown(record: &[u8]) -> String {
+    match Completion::decode(record) {
         Ok((request, completion)) => format!("{completion:?} for request {}", request.0),
         Err(error) => format!("an unreadable completion ({error})"),
     }
@@ -643,14 +632,14 @@ pub fn replay(inputs: &Path, mut states: Option<&mut dyn Write>) -> Result<u64, 
         for (queue, request, completion) in pool.completions() {
             copies += copies_asked(&completion);
             let mut record = Vec::new();
-            completion.encode_as(version(&pool, queue), request, &mut record);
+            completion.encode(request, &mut record);
             match recorded.pop_front() {
                 Some((_, ran, ran_record)) if ran == queue && ran_record == record => {}
                 Some((_, ran, ran_record)) => {
                     return Err(format!(
                         "after {}: the run completed {} on queue pair {ran:?}, the replay {completion:?} for request {} on {queue:?}",
                         named(&pool, &names),
-                        shown(&ran_record, version(&pool, ran)),
+                        shown(&ran_record),
                         request.0
                     ));
                 }
@@ -679,7 +668,7 @@ pub fn replay(inputs: &Path, mut states: Option<&mut dyn Write>) -> Result<u64, 
     if let Some((at, queue, record)) = recorded.pop_front() {
         return Err(format!(
             "the run completed {} on queue pair {queue:?} (byte {at} of its completions), and the replay did not",
-            shown(&record, version(&pool, queue))
+            shown(&record)
         ));
     }
     Ok(replayed)
@@ -745,15 +734,14 @@ impl SessionNames {
 /// kind, and what it names in the terms of [`stated`] (owners and groups
 /// qualified by their session's name, positions by number, keys by their
 /// 32 bytes in hex, stamps as `<group>:<sequence>`, a request's session as
-/// `e=`; an update's commit and rollback name the engine epoch, `e<epoch>`);
-/// a request is read in its session's version.
+/// `e=`; an update's commit and rollback name the engine epoch, `e<epoch>`).
 pub(crate) fn stated_input(pool: &BufferPool, names: &SessionNames, input: &Input) -> String {
     let session = |client: ClientId| names.of(pool, client);
     match input {
         Input::Image(_) => "image".into(),
         Input::Open(..) => "open".into(),
         Input::Close(client) => format!("close e={}", session(*client)),
-        Input::Request(queue, record) => match Request::decode_as(record, version(pool, *queue)) {
+        Input::Request(queue, record) => match Request::decode(record) {
             Ok((_, request)) => stated_request(&request, &session(queue.0)),
             Err(_) => "unreadable".into(),
         },

@@ -29,11 +29,12 @@ use std::sync::mpsc::{Receiver, Sender};
 use std::time::Duration;
 
 use prost::Message as _;
+use proto::process::refusal::Reason;
 use proto::process::{
     self, Downstream, Event, Exit, Exited, Forwarded, FromMember, Hello, Interface, Node,
-    NodesKnown, Replied, Reply, Request, Spawned, Stopped, ToMember, TransfersThrottled, Upstream,
-    UsageReport, Welcome, downstream, event, from_member, hello, reply, request, to_member,
-    upstream,
+    NodesKnown, Refusal, Replied, Reply, Request, Spawned, Stopped, ToMember, TransfersThrottled,
+    Unnumbered, Unserved, Upstream, UsageReport, Welcome, downstream, event, from_member, hello,
+    reply, request, to_member, upstream,
 };
 use service::{Connection, Handed, Listener};
 
@@ -363,17 +364,11 @@ impl Joins {
                             .iter()
                             .chain(&joined)
                             .any(|known| known.node_rank == member.node_rank))
-                    .then(|| format!("node rank {} is taken", member.node_rank))
+                    .then(|| Refusal::because(Reason::RankTaken(member.node_rank)))
                 });
-            // A member joins in its own version, which the connection speaks for its life.
             let welcome = Welcome {
-                major: if refusal.is_none() {
-                    hello.major
-                } else {
-                    proto::ENGINE_INTERFACE_VERSION
-                },
                 build: proto::BUILD.to_owned(),
-                refusal: refusal.clone().unwrap_or_default(),
+                refusal,
                 nodes: Vec::new(),
             };
             let sent = connection.deliver(&welcome).is_ok();
@@ -812,46 +807,25 @@ pub(crate) fn run_leader(
                                 refusal = match (link, stated) {
                                     // A link that receives commands must say
                                     // which engine's commands it receives.
-                                    (Interface::Process, None) => Some(
-                                        "a process link states no engine number: no command could                                          be addressed to it"
-                                            .to_owned(),
-                                    ),
+                                    (Interface::Process, None) => {
+                                        Some(Refusal::because(Reason::Unnumbered(Unnumbered {})))
+                                    }
                                     // A process has one command link. A second
                                     // one is a deployment fault, and the first
                                     // keeps the commands it is serving.
-                                    (Interface::Process, Some(number)) => {
-                                        process_links.get(&number).map(|held| {
-                                            format!(
-                                                "engine {number} already has its process link on \
-                                                 connection {held}; this connection states the \
-                                                 same engine"
-                                            )
-                                        })
-                                    }
+                                    (Interface::Process, Some(number)) => process_links
+                                        .contains_key(&number)
+                                        .then(|| Refusal::because(Reason::Linked(number))),
                                     // A process has one request link.
-                                    (Interface::Requests, Some(number)) => {
-                                        request_links.get(&number).map(|held| {
-                                            format!(
-                                                "engine {number} already has its request link on \
-                                                 connection {held}; this connection states the \
-                                                 same engine"
-                                            )
-                                        })
-                                    }
+                                    (Interface::Requests, Some(number)) => request_links
+                                        .contains_key(&number)
+                                        .then(|| Refusal::because(Reason::Linked(number))),
                                     _ => None,
                                 };
                             }
-                            // A peer is welcomed in its own version, which
-                            // the connection speaks for its life: an engine
-                            // of the build this daemon replaced keeps serving.
                             let welcome = Welcome {
-                                major: if refusal.is_none() {
-                                    hello.major
-                                } else {
-                                    proto::ENGINE_INTERFACE_VERSION
-                                },
                                 build: proto::BUILD.to_owned(),
-                                refusal: refusal.clone().unwrap_or_default(),
+                                refusal,
                                 nodes: nodes.clone(),
                             };
                             if peer.connection.deliver(&welcome).is_err() || refusal.is_some() {
@@ -1848,22 +1822,14 @@ pub(crate) fn resume(
     }
 }
 
-/// Why a hello is refused, when it is: a major version this daemon's build
-/// does not speak ([`proto::speaks`]), or a peer of the wrong kind for the
-/// socket it reached.
-pub(crate) fn refusal(hello: &Hello, accepts: impl Fn(&hello::Peer) -> bool) -> Option<String> {
-    if !proto::speaks(hello.major) {
-        return Some(format!(
-            "the peer speaks major version {} and this daemon {} to {}",
-            hello.major,
-            proto::ENGINE_INTERFACE_OLDEST,
-            proto::ENGINE_INTERFACE_VERSION
-        ));
-    }
-    match &hello.peer {
+/// Why a hello is refused, when it is: another version of the engine
+/// interface than this daemon's ([`proto::ENGINE_INTERFACE_VERSION`]), or a
+/// peer of the wrong kind for the socket it reached.
+pub(crate) fn refusal(hello: &Hello, accepts: impl Fn(&hello::Peer) -> bool) -> Option<Refusal> {
+    Refusal::of_version(hello.major).or_else(|| match &hello.peer {
         Some(peer) if accepts(peer) => None,
-        _ => Some("the peer is not one this socket serves".to_owned()),
-    }
+        _ => Some(Refusal::because(Reason::Unserved(Unserved {}))),
+    })
 }
 
 fn failed(request: &Request, error: String) -> Reply {

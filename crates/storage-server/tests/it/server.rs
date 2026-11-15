@@ -14,7 +14,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
-use ::storage::protocol::{ErrorKind, Item};
+use ::storage::protocol::{ClientMessage, ErrorKind, Hello, Item, ServerMessage, Welcome};
 use ::storage::{
     Access, Claim, Client, Error, Key, Location, Mode, Role, Scope, StorageRecord, TensorRecord,
 };
@@ -96,22 +96,6 @@ impl Running {
             // A server states what `serve` publishes for it.
             server.set_readiness(record);
             (server, lock)
-        })
-    }
-
-    /// The server a restart in place passed on, `resumed` with the lock of
-    /// its socket `socket` in `directory`.
-    pub(crate) fn resumed(
-        directory: tempfile::TempDir,
-        socket: PathBuf,
-        resumed: (Server, OwnedFd),
-    ) -> Self {
-        let (mut server, lock) = resumed;
-        let held = socket.clone();
-        let tcp = server.tcp_endpoint().map(|tcp| tcp.to_string());
-        server.set_readiness(readiness(&socket, tcp.as_deref()));
-        Self::on_thread(directory, socket, String::new(), move || {
-            (server, service::host::SocketLock::resume(lock, held))
         })
     }
 
@@ -1092,15 +1076,12 @@ fn host_storage_is_admitted_before_allocation_and_retires_with_its_owner() {
     }
 }
 
-/// A server speaks its protocol version and the one before: a client of
-/// either is served in its own, a client one version later in the server's,
-/// which that client speaks as its earlier one, and any other is refused by
-/// the versions the server speaks.
+/// A server serves a client of its own protocol version alone: such a client
+/// is welcomed and served, and a client of any other version is refused at its
+/// hello with the typed refusal naming both versions.
 #[test]
-fn a_server_serves_its_protocol_and_the_one_before() {
-    use ::storage::protocol::{
-        ClientMessage, Hello, OLDEST, Request, Response, ServerMessage, VERSION, Welcome,
-    };
+fn a_server_serves_its_own_protocol_version_alone() {
+    use ::storage::protocol::{Refusal, Request, Response, VERSION};
 
     let server = Running::start();
     let timeout = std::time::Duration::from_secs(30);
@@ -1116,46 +1097,38 @@ fn a_server_serves_its_protocol_and_the_one_before() {
         (connection, welcome)
     };
 
-    for (version, speaks) in [(VERSION, VERSION), (OLDEST, OLDEST), (VERSION + 1, VERSION)] {
-        let (mut connection, welcome) = connect(version);
-        assert!(
-            matches!(&welcome, ServerMessage::Welcome(Welcome::Accepted { version }) if *version == speaks),
-            "a client of protocol {version}: {welcome:?}"
-        );
-        // The connection is served in the version agreed.
-        let listed = ClientMessage::Request {
-            id: 7,
-            request: Request::List,
-        };
-        connection.send(&listed).unwrap();
-        let response = connection.recv::<ServerMessage>(timeout).unwrap().unwrap();
-        assert!(
-            matches!(
-                response,
-                ServerMessage::Response {
-                    id: 7,
-                    response: Response::Listing(_)
-                }
-            ),
-            "{response:?}"
+    let (mut connection, welcome) = connect(VERSION);
+    assert_eq!(welcome, ServerMessage::Welcome(Welcome::Accepted));
+    let listed = ClientMessage::Request {
+        id: 7,
+        request: Request::List,
+    };
+    connection.send(&listed).unwrap();
+    let response = connection.recv::<ServerMessage>(timeout).unwrap().unwrap();
+    assert!(
+        matches!(
+            response,
+            ServerMessage::Response {
+                id: 7,
+                response: Response::Listing(_)
+            }
+        ),
+        "{response:?}"
+    );
+
+    for offered in [VERSION - 1, VERSION + 1] {
+        let (_, welcome) = connect(offered);
+        assert_eq!(
+            welcome,
+            ServerMessage::Welcome(Welcome::Refused {
+                refusal: Refusal::Version {
+                    offered,
+                    spoken: VERSION,
+                },
+            }),
+            "a client of protocol {offered}"
         );
     }
-
-    for version in [OLDEST - 1, VERSION + 2] {
-        let (_, welcome) = connect(version);
-        let ServerMessage::Welcome(Welcome::Refused { message }) = welcome else {
-            panic!("a client of protocol {version} is served: {welcome:?}");
-        };
-        assert!(
-            message.contains(&format!("{OLDEST} to {VERSION}"))
-                && message.contains(&format!("the client {version}")),
-            "{message}"
-        );
-    }
-
-    // The workspace's client speaks the version the server's welcome stated.
-    let client = Client::connect(&server.socket, Role::Operator).unwrap();
-    assert_eq!(client.version(), VERSION);
 }
 
 #[test]

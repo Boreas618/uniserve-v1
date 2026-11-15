@@ -6,12 +6,10 @@
 //! FD`) with one end of a socket pair at that descriptor. They talk over it:
 //!
 //! 1. The daemon sends its options and the version of the engine interface
-//!    each engine it serves speaks (`Prepare`); a successor that does not
-//!    speak one gives up. The successor restarts the host's Storage Server in
-//!    place into its own build when that server speaks an earlier protocol
-//!    (`storage-server restart --executable`), loads the model's files and
-//!    binds a request socket of its own, which it responds with
-//!    (`Prepared`).
+//!    its engines speak (`Prepare`); a successor of another version gives
+//!    up, as one does whose protocol the host's Storage Server does not
+//!    speak. The successor loads the model's files and binds a request
+//!    socket of its own, which it responds with (`Prepared`).
 //! 2. The daemon stops its service thread between two rounds and sends what
 //!    the thread served, its HTTP listener and the connection its engine's
 //!    process lives under, with the arguments the engine serves with, the admin's log
@@ -28,13 +26,12 @@
 //!
 //! No connection closes: the listener, the processes' connections and the
 //! claim cross as descriptors, and each request ends on the daemon that took
-//! it. The engines are the same processes throughout: a daemon speaks its
-//! build's version of the engine interface and the one before
-//! (`proto::speaks`), so the engine of the build it replaced serves on until
-//! the next epoch replaces it, and the Storage Server it restarted serves that
-//! engine's connections and sessions in their versions. A connection that
-//! arrives meanwhile waits in the listener's queue until one of the two
-//! accepts it. Until the successor serves, a failure leaves the daemon serving
+//! it. The engines are the same processes throughout, so a successor speaks
+//! the same version of the engine interface as the daemon it replaces, and
+//! the same Storage Server protocol: each interface has one version per
+//! release, and a deployment moves to another release by an epoch change
+//! after a full restart, not in place. A connection that arrives meanwhile
+//! waits in the listener's queue until one of the two accepts it. Until the successor serves, a failure leaves the daemon serving
 //! as before, except after the service thread stopped, which then fails the
 //! restart and the daemon with it.
 
@@ -70,16 +67,6 @@ const STEP_TIMEOUT: Duration = Duration::from_secs(600);
 
 /// How often a wait rechecks the channel.
 const POLL: Duration = Duration::from_millis(20);
-
-/// How long a successor waits for the host's Storage Server it restarts in
-/// place to serve: the server hands over once nothing is in flight, which the
-/// deadlines of its buffer pools' tasks bound (a minute each unless set), and
-/// its successor answers each step of the handover within a minute. The rest
-/// of the predecessor's [`STEP_TIMEOUT`] is the model's load.
-const STORAGE_RESTART_TIMEOUT: Duration = Duration::from_secs(300);
-
-/// How often the wait for a restarted Storage Server looks again.
-const STORAGE_POLL: Duration = Duration::from_millis(100);
 
 /// The messages of the handoff socket.
 #[derive(Debug, Serialize, Deserialize)]
@@ -142,12 +129,10 @@ struct Prepare {
     /// Whether the configuration listens on another address than the
     /// daemon's listener: the successor binds it before the handover.
     rebind: bool,
-    /// The version of the engine interface each engine the daemon hands over
-    /// speaks, which the successor serves it in; a successor that does not
-    /// speak one gives up before anything is handed over. A daemon of a build
-    /// before this field states none.
-    #[serde(default)]
-    engine_versions: Vec<u32>,
+    /// The version of the engine interface the daemon and every engine it
+    /// hands over speak ([`proto::ENGINE_INTERFACE_VERSION`]): a successor of
+    /// another version gives up before anything is handed over.
+    interface: u32,
 }
 
 /// What a daemon hands its successor. The descriptors travel in this
@@ -375,10 +360,7 @@ impl Restarter {
                 processes,
                 instance: self.instance.clone(),
                 rebind,
-                engine_versions: handoff
-                    .iter()
-                    .map(|replica| replica.client.interface())
-                    .collect(),
+                interface: proto::ENGINE_INTERFACE_VERSION,
             })),
             &[],
         )?;
@@ -741,39 +723,20 @@ async fn prepared_successor(
     devices: crate::supervision::DeviceProbe,
     shutdown: CancellationToken,
 ) -> anyhow::Result<()> {
-    // The engines go on serving through this daemon in their own versions, so one it does not speak
-    // ends the restart here, while the predecessor serves as it was.
-    if let Some(unspoken) = prepare
-        .engine_versions
-        .iter()
-        .find(|version| !proto::speaks(**version))
-    {
-        anyhow::bail!(
-            "an engine of the deployment speaks version {unspoken} of the engine interface, and \
-             this daemon versions {} to {}",
-            proto::ENGINE_INTERFACE_OLDEST,
-            proto::ENGINE_INTERFACE_VERSION
-        );
-    }
-    // An update replaces the Storage Server before the daemon: the host's server goes into this
-    // build first, so that a server that cannot take this build's engines over leaves the
-    // predecessor serving as it was.
-    let executable = std::env::current_exe().context("finding this daemon's executable")?;
-    let restarted = tokio::task::spawn_blocking(move || {
-        restart_storage_server(
-            &storage::default_socket()?,
-            &executable,
-            STORAGE_RESTART_TIMEOUT,
-        )
+    // The engines go on serving through this daemon, so an engine interface of another version
+    // ends the restart here, while the predecessor serves as it was; so does a Storage Server
+    // whose protocol this build does not speak, since the claims cross on its connections.
+    anyhow::ensure!(
+        prepare.interface == proto::ENGINE_INTERFACE_VERSION,
+        "the deployment's engines speak version {} of the engine interface, and this daemon {}",
+        prepare.interface,
+        proto::ENGINE_INTERFACE_VERSION
+    );
+    tokio::task::spawn_blocking(|| -> anyhow::Result<()> {
+        storage_server_speaks(&storage::default_socket()?)
     })
-    .await
-    .context("the Storage Server's restart did not complete")??;
-    if let Some(pid) = restarted {
-        info!(
-            pid,
-            "the host's Storage Server serves this build's protocol"
-        );
-    }
+        .await
+        .context("the check of the Storage Server's protocol did not complete")??;
     let (mut config, _) = crate::options::resolve_text(&prepare.config, &[])?;
     config.server_config.api_key = prepare.api_key;
     let stated = Stated::from_paths(prepare.stated);
@@ -1182,74 +1145,31 @@ fn adopted_epoch(
     Ok((record, process))
 }
 
-/// Restarts the host's Storage Server at `socket` in place as `executable`,
-/// this daemon's own, when it speaks an earlier protocol than this build: the
-/// version it agrees at this build's hello is then its own, before
-/// [`storage::protocol::VERSION`]. Returns the successor server's process id
-/// once a connection to the socket agrees this build's version, which only
-/// that successor does; `None` when no server listens at `socket` or it
-/// speaks this build's protocol.
+/// Whether the host's Storage Server at `socket` serves this build's protocol
+/// ([`storage::protocol::VERSION`]), which the claim connections a successor
+/// takes over must speak: the server serves one version, and refuses this
+/// build's hello with the typed version refusal when it is another. A host
+/// where no server listens has none to speak to yet.
 ///
 /// # Errors
 ///
-/// Fails when the server refuses this build's hello (it speaks no version this
-/// build speaks), refuses the restart, gives it up (the successor does not
-/// speak a version of a connection or session in use and ends), or its
-/// successor does not serve within `timeout`. The server then serves as it did,
-/// and a restart it still runs ends either way without this daemon.
-fn restart_storage_server(
-    socket: &std::path::Path,
-    executable: &std::path::Path,
-    timeout: Duration,
-) -> anyhow::Result<Option<u32>> {
-    use storage::protocol::VERSION;
-
-    if service::host::running::<storage::Settings>(socket)?.is_none() {
-        return Ok(None);
-    }
-    let reach = || {
-        storage::Client::connect(socket, storage::Role::Operator)
-            .with_context(|| format!("reaching the Storage Server at {}", socket.display()))
-    };
-    let mut operator = reach()?;
-    let speaks = operator.version();
-    if speaks >= VERSION {
-        return Ok(None);
-    }
-
-    let named = executable
-        .to_str()
-        .context("this daemon's executable is not named in UTF-8")?;
-    let successor = operator.restart(Some(named.to_owned())).with_context(|| {
-        format!("restarting the Storage Server, which speaks protocol {speaks}, as {named}")
-    })?;
-    info!(
-        pid = successor,
-        protocol = speaks,
-        "restarting the host's Storage Server in place into this build"
-    );
-    // The successor is the server's child, and ends before the handover only when the restart is
-    // given up; a pidfd follows it whatever process later takes its id. One that cannot be opened
-    // names a process that already ended.
-    let followed = crate::supervision::pidfd_open(successor).ok();
-    let deadline = Instant::now() + timeout;
-    loop {
-        if reach()?.version() == VERSION {
-            return Ok(Some(successor));
+/// [`storage::Error::Version`] when the server speaks another version, and
+/// any other failure to reach a server that listens.
+fn storage_server_speaks(socket: &std::path::Path) -> anyhow::Result<()> {
+    match storage::Client::connect(socket, storage::Role::Operator) {
+        Ok(_) => Ok(()),
+        Err(storage::Error::Io(error))
+            if matches!(
+                error.kind(),
+                std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused
+            ) =>
+        {
+            Ok(())
         }
-        let alive = followed
-            .as_ref()
-            .is_some_and(|pidfd| !crate::supervision::pidfd_exited(pidfd, false).unwrap_or(false));
-        anyhow::ensure!(
-            alive,
-            "the Storage Server gave its restart up: its successor {successor} ended without \
-             taking it over, and it serves protocol {speaks} as it did"
-        );
-        anyhow::ensure!(
-            Instant::now() < deadline,
-            "the Storage Server's successor {successor} did not serve within {timeout:?}"
-        );
-        std::thread::sleep(STORAGE_POLL);
+        Err(error) => Err(anyhow::Error::new(error).context(format!(
+            "the host's Storage Server at {} does not serve this daemon",
+            socket.display()
+        ))),
     }
 }
 
@@ -1260,12 +1180,7 @@ pub(crate) const RESTART_GRACE: std::time::Duration = std::time::Duration::from_
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Mutex;
-    use std::sync::atomic::AtomicU32;
-
-    use storage::protocol::{
-        ClientMessage, OLDEST, Request, Response, ServerMessage, VERSION, Welcome,
-    };
+    use storage::protocol::{ClientMessage, Refusal, ServerMessage, VERSION, Welcome};
 
     use super::*;
 
@@ -1293,173 +1208,52 @@ mod tests {
         assert_eq!(process.state, crate::epoch::ProcessState::Serving);
     }
 
-    /// The executable a successor daemon names its Storage Server's successor by.
-    const UNISERVE: &str = "/opt/uniserve/bin/uniserve";
-
-    /// A host's Storage Server as a daemon reaches it at its socket: it welcomes
-    /// every hello in the version it speaks, and answers an operator's restart
-    /// with the process id of its successor, `successor` (a command), once
-    /// started. A successor that takes the server over welcomes every later
-    /// hello in this build's version; one that does not ends, and the server
-    /// serves on as it did.
-    struct StorageServer {
-        socket: std::path::PathBuf,
-        /// The executable each restart named.
-        restarts: Arc<Mutex<Vec<Option<String>>>>,
-        /// The successors started, stopped with the server.
-        successors: Arc<Mutex<Vec<std::process::Child>>>,
-        /// The lock that makes the stand-in the socket's owner, with its published record.
-        _lock: service::host::SocketLock,
-        _directory: tempfile::TempDir,
-    }
-
-    impl StorageServer {
-        fn start(speaks: u32, successor: &'static [&'static str], takes_over: bool) -> Self {
-            let directory = tempfile::tempdir().unwrap();
-            let socket = directory.path().join("storage.sock");
-            // The stand-in owns its socket as a Storage Server does, so the daemon finds it
-            // serving.
-            let (listener, starting) = service::host::bind::<storage::Settings>(&socket)
-                .unwrap()
-                .owned(&socket)
-                .unwrap();
-            let lock = starting
-                .finish(&service::Readiness::of_process(
-                    service::State::Serving,
-                    None,
-                    service::Endpoints::default(),
-                    storage::Settings::default(),
-                ))
-                .unwrap();
-            let version = Arc::new(AtomicU32::new(speaks));
-            let restarts = Arc::new(Mutex::new(Vec::new()));
-            let successors = Arc::new(Mutex::new(Vec::new()));
-            let server = Self {
-                socket,
-                _lock: lock,
-                restarts: Arc::clone(&restarts),
-                successors: Arc::clone(&successors),
-                _directory: directory,
-            };
-            std::thread::spawn(move || {
-                for stream in listener.incoming() {
-                    let Ok(stream) = stream else {
-                        return;
-                    };
-                    let mut connection = Connection::new(stream).unwrap();
-                    let version = Arc::clone(&version);
-                    let restarts = Arc::clone(&restarts);
-                    let successors = Arc::clone(&successors);
-                    std::thread::spawn(move || {
-                        while let Ok(message) = connection.recv(Duration::from_secs(30)) {
-                            let reply = match message {
-                                None => continue,
-                                Some(ClientMessage::Hello(_)) => {
-                                    ServerMessage::Welcome(Welcome::Accepted {
-                                        version: version.load(Ordering::SeqCst),
-                                    })
-                                }
-                                Some(ClientMessage::Request {
-                                    id,
-                                    request: Request::Restart { executable },
-                                }) => {
-                                    restarts.lock().unwrap().push(executable);
-                                    let child = std::process::Command::new(successor[0])
-                                        .args(&successor[1..])
-                                        .spawn()
-                                        .unwrap();
-                                    let pid = child.id();
-                                    successors.lock().unwrap().push(child);
-                                    if takes_over {
-                                        // The handover follows once nothing is in flight.
-                                        let version = Arc::clone(&version);
-                                        std::thread::spawn(move || {
-                                            std::thread::sleep(Duration::from_millis(300));
-                                            version.store(VERSION, Ordering::SeqCst);
-                                        });
-                                    }
-                                    ServerMessage::Response {
-                                        id,
-                                        response: Response::Restarting { pid },
-                                    }
-                                }
-                                Some(other) => panic!("the daemon asked {other:?}"),
-                            };
-                            connection.deliver(&reply).unwrap();
-                        }
+    /// A host's Storage Server of another release, as a successor daemon reaches it at its
+    /// socket: it refuses every hello with the typed version refusal, naming the version it
+    /// speaks.
+    fn storage_server_of_version(spoken: u32) -> (tempfile::TempDir, std::path::PathBuf) {
+        let directory = tempfile::tempdir().unwrap();
+        let socket = directory.path().join("storage.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(stream) = stream else {
+                    return;
+                };
+                let mut connection = Connection::new(stream).unwrap();
+                if let Ok(Some(ClientMessage::Hello(hello))) =
+                    connection.recv::<ClientMessage>(Duration::from_secs(30))
+                {
+                    let refused = ServerMessage::Welcome(Welcome::Refused {
+                        refusal: Refusal::Version {
+                            offered: hello.version,
+                            spoken,
+                        },
                     });
+                    let _ = connection.deliver(&refused);
                 }
-            });
-            server
-        }
-
-        fn restarts(&self) -> Vec<Option<String>> {
-            self.restarts.lock().unwrap().clone()
-        }
-    }
-
-    impl Drop for StorageServer {
-        fn drop(&mut self) {
-            for mut successor in self.successors.lock().unwrap().drain(..) {
-                let _ = successor.kill();
-                let _ = successor.wait();
             }
-        }
+        });
+        (directory, socket)
     }
 
-    /// A successor daemon restarts a Storage Server of the protocol before its
-    /// build's into its own executable, and goes on once the server's successor
-    /// serves, which a connection agreeing this build's version shows.
+    /// A successor daemon does not take a deployment over when the host's Storage Server
+    /// speaks another protocol version than its build: the claims cross on that server's
+    /// connections. A host with no server listening has none to speak to.
     #[test]
-    fn a_storage_server_of_an_earlier_protocol_is_restarted_into_this_build() {
-        let server = StorageServer::start(OLDEST, &["sleep", "30"], true);
-
-        let restarted = restart_storage_server(
-            &server.socket,
-            std::path::Path::new(UNISERVE),
-            Duration::from_secs(30),
-        )
-        .unwrap();
-
-        let started = server.successors.lock().unwrap()[0].id();
-        assert_eq!(restarted, Some(started));
-        assert_eq!(server.restarts(), [Some(UNISERVE.to_owned())]);
-    }
-
-    /// A Storage Server that speaks this build's protocol is left as it is.
-    #[test]
-    fn a_storage_server_of_this_build_s_protocol_is_not_restarted() {
-        let server = StorageServer::start(VERSION, &["sleep", "30"], true);
-
-        let restarted = restart_storage_server(
-            &server.socket,
-            std::path::Path::new(UNISERVE),
-            Duration::from_secs(30),
-        )
-        .unwrap();
-
-        assert_eq!(restarted, None);
-        assert!(server.restarts().is_empty());
-    }
-
-    /// A restart the Storage Server gives up, its successor ending without
-    /// taking it over, fails the successor daemon's preparation: the daemon it
-    /// would replace serves on, with the server as it was.
-    #[test]
-    fn a_storage_server_restart_given_up_fails_the_successor_daemon() {
-        let server = StorageServer::start(OLDEST, &["sleep", "1"], false);
-
-        let error = restart_storage_server(
-            &server.socket,
-            std::path::Path::new(UNISERVE),
-            Duration::from_secs(30),
-        )
-        .unwrap_err();
-
+    fn a_successor_needs_the_storage_server_to_speak_its_protocol() {
+        let (_directory, socket) = storage_server_of_version(VERSION + 1);
+        let error = storage_server_speaks(&socket).unwrap_err();
         assert!(
-            format!("{error:#}").contains("gave its restart up"),
+            matches!(
+                error.downcast_ref::<storage::Error>(),
+                Some(storage::Error::Version { offered, spoken })
+                    if *offered == VERSION && *spoken == VERSION + 1
+            ),
             "{error:#}"
         );
-        assert_eq!(server.restarts(), [Some(UNISERVE.to_owned())]);
+
+        let absent = tempfile::tempdir().unwrap();
+        storage_server_speaks(&absent.path().join("storage.sock")).unwrap();
     }
 }

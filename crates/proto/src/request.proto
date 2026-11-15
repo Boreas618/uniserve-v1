@@ -13,10 +13,11 @@
 // `Artifact` event passes the shared memory holding the bytes as a file
 // descriptor beside its frame.
 //
-// The interface is versioned across builds: a persistent daemon serves
-// engines of successive builds. Messages change only by additions; the hello
-// exchange agrees a major version: the daemon speaks its build's and the one
-// before (`proto::speaks`).
+// The interface has one version per release (`proto::ENGINE_INTERFACE_VERSION`,
+// shared with the process interface): the daemon serves an engine of its own
+// version alone, refusing any other in its welcome with a typed `Refusal`.
+// The `Hello` and the `Welcome` are the one part of the interface that no
+// release changes, so that an engine of any version reads its refusal.
 
 syntax = "proto3";
 
@@ -35,12 +36,38 @@ message Hello {
 
 // The answer to a `Hello`.
 message Welcome {
-  // The version the link speaks for its life: the engine's own when the daemon speaks it, the
-  // daemon's own with a refusal.
-  uint32 major = 1;
+  reserved 1, 4;
+  // The daemon's build: package version and source digest.
   string build = 3;
-  // Why the engine is refused; empty when it is accepted.
-  string refusal = 4;
+  // Why the engine is refused; absent when it is accepted.
+  Refusal refusal = 5;
+}
+
+// Why the daemon refuses an engine's hello on its request link.
+message Refusal {
+  oneof reason {
+    // The engine speaks another version of the engine interface than the daemon.
+    VersionRefusal version = 1;
+    // The engine states another engine number than the one the link was made
+    // for.
+    EngineMismatch engine = 2;
+  }
+}
+
+// The versions of a refusal for the engine interface's version.
+message VersionRefusal {
+  // The version the engine's hello states.
+  uint32 offered = 1;
+  // The daemon's version, the one it serves.
+  uint32 spoken = 2;
+}
+
+// The engine numbers of a refusal for a link made for another engine.
+message EngineMismatch {
+  // The number the engine's hello states.
+  uint64 stated = 1;
+  // The number the link was made for.
+  uint64 expected = 2;
 }
 
 // What travels from the engine process after the welcome.

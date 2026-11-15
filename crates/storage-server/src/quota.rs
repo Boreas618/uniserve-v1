@@ -86,7 +86,6 @@ pub(crate) struct Quotas {
     /// The `(deployment, epoch)`s that keep their weights alone: no
     /// reservation is kept for their processes, which the head stopped,
     /// until one of their processes reserves again.
-    #[serde(default)]
     weights_only: BTreeSet<(String, u64)>,
 }
 

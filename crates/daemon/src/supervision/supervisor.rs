@@ -156,9 +156,9 @@ pub(crate) struct Supervisor {
 ///
 /// Every host of the epoch prepared the module set before any of its processes was spawned
 /// (`Request::PrepareModules`), so this is a read of the node's store, within the reply time of a spawn;
-/// a store that lost the module builds it again first. A module of a version of the engine
-/// interface this daemon does not speak ([`proto::speaks`]) is refused here, before a process
-/// starts.
+/// a store that lost the module builds it again first. A module of another version of the
+/// engine interface than this daemon's ([`proto::ENGINE_INTERFACE_VERSION`]) is refused here,
+/// before a process starts.
 pub(crate) fn engine_executable(launch: &proto::config::EngineArgs) -> Result<PathBuf, String> {
     let engine = &launch.modules.engine;
     let named = format!(
@@ -188,14 +188,11 @@ pub(crate) fn engine_executable(launch: &proto::config::EngineArgs) -> Result<Pa
             },
         )
         .map_err(|error| format!("resolving {named}: {error}"))?;
-    // The engine of the build this daemon replaced implements the version before its own: its
-    // relaunches and standbys start from its epoch's module until the next epoch replaces it.
-    if !proto::speaks(module.interface_version) {
+    if module.interface_version != proto::ENGINE_INTERFACE_VERSION {
         return Err(format!(
             "{named} implements version {} of the engine interface and this daemon speaks \
-             versions {} to {}",
+             version {}",
             module.interface_version,
-            proto::ENGINE_INTERFACE_OLDEST,
             proto::ENGINE_INTERFACE_VERSION
         ));
     }
@@ -723,9 +720,7 @@ pub(crate) struct ProcessesHandoff {
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub(crate) struct ProcessHandoff {
     pub(crate) engine: u64,
-    /// The connection its exit report goes down. A predecessor that states
-    /// none leaves the report to the updater alone.
-    #[serde(default)]
+    /// The connection its exit report goes down.
     pub(crate) reporter: u64,
     pub(crate) group: String,
     pub(crate) rank: u32,

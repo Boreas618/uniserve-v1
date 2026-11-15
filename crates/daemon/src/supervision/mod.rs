@@ -23,7 +23,7 @@ mod supervisor;
 
 pub(crate) use service::ServiceHandoff;
 pub use supervisor::LIFELINE_ENV;
-pub(crate) use supervisor::{engine_executable, pidfd_exited, pidfd_open};
+pub(crate) use supervisor::engine_executable;
 
 use std::net::IpAddr;
 use std::os::fd::OwnedFd;
@@ -660,11 +660,9 @@ fn join_leader(options: &DaemonOptions) -> anyhow::Result<Connection> {
     let welcome: Welcome = connection
         .recv(options.join_timeout)?
         .context("the leader did not reply to this node's hello")?;
-    anyhow::ensure!(
-        welcome.refusal.is_empty(),
-        "the leader refused this node: {}",
-        welcome.refusal
-    );
+    if let Some(refusal) = welcome.refusal {
+        return Err(anyhow::Error::new(refusal).context("the leader refused this node"));
+    }
     tracing::info!(leader = %address, node_rank = options.node_rank, "joined the leader");
     Ok(connection)
 }
@@ -750,7 +748,7 @@ mod tests {
             })
             .unwrap();
         let welcome: Welcome = engine.recv(Duration::from_secs(30)).unwrap().unwrap();
-        assert!(welcome.refusal.is_empty(), "{}", welcome.refusal);
+        assert_eq!(welcome.refusal, None);
         send(
             &mut engine,
             1,

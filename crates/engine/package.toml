@@ -11,10 +11,11 @@
 
 op = "engine"
 backend = "uniserve"
-# The engine interface: its messages with the daemon, the Storage Server and
-# the Build Server (`proto::ENGINE_INTERFACE_VERSION`, which carries the
-# storage protocol's version).
-interface_version = 8
+# The engine interface: its messages with the daemon
+# (`proto::ENGINE_INTERFACE_VERSION`). The Storage Server's protocol and the
+# buffer pool's runtime interface have versions of their own, checked at their
+# own hellos.
+interface_version = 9
 
 [toolchain]
 kind = "cargo"

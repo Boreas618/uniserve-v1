@@ -246,32 +246,30 @@ fn a_stopped_daemon_takes_its_processes_with_it() {
     assert!(!alive(pid), "a process outlived its daemon's stop");
 }
 
-/// The engine interface's version carries the storage protocol's, so the version before a
-/// build's own is what the engine of the build a restarted daemon replaced states, and the next
-/// one what an engine built for the next storage protocol states. A daemon serves its build's
-/// version and the one before, each engine in its own, and refuses any other, saying why.
+/// A daemon serves an engine of its own version of the engine interface alone, and refuses one
+/// of any other version at its hello with the typed refusal naming both versions.
 #[test]
-fn a_daemon_serves_engines_of_its_version_and_the_one_before() {
+fn a_daemon_serves_engines_of_its_own_version_alone() {
+    use proto::process::refusal::Reason;
+    use proto::process::{Refusal, VersionRefusal};
+
     let directory = tempfile::tempdir().unwrap();
     let daemon = start(&directory, "node");
 
     let ours = proto::ENGINE_INTERFACE_VERSION;
-    for major in [ours - 1, ours] {
-        let (_, welcome) = Engine::hello(daemon.address().unwrap(), major);
+    let (_, welcome) = Engine::hello(daemon.address().unwrap(), ours);
+    assert_eq!(welcome.refusal, None, "an engine of this build is refused");
+    for offered in [ours - 1, ours + 1] {
+        let (_, welcome) = Engine::hello(daemon.address().unwrap(), offered);
         assert_eq!(
-            welcome.refusal, "",
-            "an engine of version {major} is refused"
-        );
-        assert_eq!(
-            welcome.major, major,
-            "the engine is welcomed in another version than its own"
-        );
-    }
-    for major in [ours - 2, ours + 1] {
-        let (_, welcome) = Engine::hello(daemon.address().unwrap(), major);
-        assert!(
-            welcome.refusal.contains("major version"),
-            "an engine of version {major} is served, or its refusal does not say why: {welcome:?}"
+            welcome.refusal,
+            Some(Refusal {
+                reason: Some(Reason::Version(VersionRefusal {
+                    offered,
+                    spoken: ours,
+                })),
+            }),
+            "an engine of version {offered}"
         );
     }
 }

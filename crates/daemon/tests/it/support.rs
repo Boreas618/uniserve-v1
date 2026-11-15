@@ -45,7 +45,7 @@ impl Engine {
     /// Connects to the leader at `address` as an engine of this build.
     pub(crate) fn connect(address: &str) -> Self {
         let (engine, welcome) = Self::hello(address, proto::ENGINE_INTERFACE_VERSION);
-        assert_eq!(welcome.refusal, "", "the leader refused this engine");
+        assert_eq!(welcome.refusal, None, "the leader refused this engine");
         engine
     }
 
@@ -65,7 +65,7 @@ impl Engine {
         let id = engine.send(kind);
         assert_eq!(
             engine.welcome().refusal,
-            "",
+            None,
             "the leader refused this engine"
         );
         let reply = engine.reply(id);

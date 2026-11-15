@@ -9,23 +9,16 @@
 //! the server refuses is responded with [`Response::Error`], the protocol's
 //! one error: an [`ErrorKind`] and a message.
 //!
-//! The protocol is versioned ([`VERSION`]), and its version is part of the
-//! engine interface's (`proto::ENGINE_INTERFACE_VERSION`). A build speaks its
-//! version and the one before ([`OLDEST`]), so that a Storage Server
-//! restarted in place into the next build goes on serving every connection
-//! the previous one served, each in the version it agreed at its `Hello`. The
-//! client states its version; the server answers the version the connection
-//! speaks for its life ([`Welcome::Accepted`]): the client's, or the server's
-//! own for a client one version later, which speaks it as its earlier one. A
-//! client of a version before [`OLDEST`], or more than one after
-//! [`VERSION`], is refused at `Hello`, the refusal naming the versions the
-//! server speaks.
+//! The protocol has one version per release ([`VERSION`]). The client states
+//! its version at `Hello`, and the server serves a client of its own version
+//! alone: a client of any other is refused with [`Refusal::Version`], which
+//! names both, before it sends a request. The `Hello` and the `Welcome` are
+//! the one part of the protocol that no release changes, so that a peer of
+//! any version reads its refusal. Every refusal of a `Hello` is typed
+//! ([`Refusal`]).
 //!
-//! The encoding is MessagePack with named fields. A new version adds
-//! requests, responses, events or optional fields and changes nothing else,
-//! so one encoding serves both versions a build speaks: a peer of the earlier
-//! version never sends what it lacks, is never sent it (a response or an
-//! event answers what it asked), and reads past a field it does not know.
+//! The encoding is MessagePack with named fields, and every field is
+//! required.
 //!
 //! The server stores bytes with DLPack metadata and never interprets them:
 //! clients compute every [`Key`] and define what the bytes mean. The
@@ -135,26 +128,10 @@ use serde::{Deserialize, Serialize};
 use crate::runtime::{Open, Opened};
 
 /// The protocol version this build's clients state and its Storage Server
-/// speaks, besides [`OLDEST`]. The engine interface carries it
-/// (`proto::ENGINE_INTERFACE_VERSION`, through `proto::STORAGE_PROTOCOL`, which
-/// a change of this version changes with it), so an engine built for a
-/// storage protocol the daemon's build does not speak is refused at its hello
-/// to the daemon as well.
-///
-/// A build made with `UNISERVE_STORAGE_PROTOCOL_RAISE=1` in its environment
-/// states the version after this one, and nothing else changes: the
-/// executable a restart in place into a further version is tested with. The
-/// variable raises `proto::STORAGE_PROTOCOL` alike.
-pub const VERSION: u32 = 26
-    + match option_env!("UNISERVE_STORAGE_PROTOCOL_RAISE") {
-        None => 0,
-        Some(raise) if raise.len() == 1 && raise.as_bytes()[0] == b'1' => 1,
-        Some(_) => panic!("UNISERVE_STORAGE_PROTOCOL_RAISE is 1 when it is set"),
-    };
-
-/// The earliest protocol version this build's Storage Server serves and its
-/// clients accept: the one before [`VERSION`].
-pub const OLDEST: u32 = VERSION - 1;
+/// speaks: the one version either accepts. Each process that talks to the
+/// server checks it at its own `Hello`, independently of the other
+/// interfaces it speaks.
+pub const VERSION: u32 = 27;
 
 /// How long a server of another host may take to answer a request it answers from what it holds
 /// (a hello, a peer's hold and release, a task's submission or cancellation, a connector's pages):
@@ -236,7 +213,6 @@ pub enum Role {
     Head {
         deployment: String,
         epoch: u64,
-        #[serde(default)]
         generation: u64,
     },
     /// A worker of `scope` in `epoch`, started by the launch `generation` of
@@ -276,28 +252,39 @@ pub struct Hello {
     pub role: Role,
 }
 
-/// The version a connection speaks when its client states `version` to a
-/// server of this build: the client's own when this build speaks it, this
-/// build's [`VERSION`] when the client's is the next (a client speaks its
-/// build's version and the one before); `None` otherwise.
-pub fn agreed(version: u32) -> Option<u32> {
-    if (OLDEST..=VERSION).contains(&version) {
-        Some(version)
-    } else if version == VERSION + 1 {
-        Some(VERSION)
-    } else {
-        None
-    }
-}
-
 /// The server's response to [`Hello`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Welcome {
-    /// The server serves the client, in `version` for the connection's life.
-    Accepted { version: u32 },
-    /// The server does not serve this client, for the reason given.
-    Refused { message: String },
+    /// The server serves the client in this build's [`VERSION`].
+    Accepted,
+    /// The server does not serve this client, for the reason stated.
+    Refused { refusal: Refusal },
+}
+
+/// Why a server refuses a client's [`Hello`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, thiserror::Error)]
+#[serde(rename_all = "snake_case")]
+pub enum Refusal {
+    /// The client states another version of the protocol than the server's:
+    /// `offered` is the client's, `spoken` the server's, the only one it
+    /// serves.
+    #[error("the client speaks version {offered} of the storage protocol, the server {spoken}")]
+    Version { offered: u32, spoken: u32 },
+    /// The connection said hello before.
+    #[error("the connection already said hello")]
+    Repeated,
+    /// A connection from another host states a role other than a head's or a
+    /// peer's.
+    #[error("a connection from another host is a head's or a peer's")]
+    Remote,
+    /// A connector says hello while the server has one.
+    #[error("the server has a connector")]
+    Connector,
+    /// A Transfer Server says hello that the server does not take, for the
+    /// reason given.
+    #[error("the server does not take this Transfer Server: {reason}")]
+    Transfer { reason: String },
 }
 
 /// Where a storage's physical storage is.
@@ -925,8 +912,7 @@ pub struct UnitRun {
 /// (`crate::runtime::Class::tensors` and `Class::encoding`). Each part of
 /// the region ([`RegionPart`]) holds its bytes of those units. The reader
 /// reads a copy only into a block of a class of the same encoding, or of a
-/// class that converts from it (`crate::runtime::Class::source`); a server
-/// that states no encoding states zeros, which no class has.
+/// class that converts from it (`crate::runtime::Class::source`).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HostCopy {
     pub key: Key,
@@ -934,9 +920,7 @@ pub struct HostCopy {
     pub region: String,
     pub first: u32,
     pub count: u32,
-    #[serde(default)]
     pub tensors: [u8; 32],
-    #[serde(default)]
     pub encoding: [u8; 32],
 }
 
@@ -1539,7 +1523,6 @@ pub struct BufferPoolListing {
     /// The checks of the pool's tables after an input that found them
     /// inconsistent, while the server checks them
     /// (`storage-server serve --buffer-pool-check`).
-    #[serde(default)]
     pub check_failures: u64,
 }
 
@@ -1807,9 +1790,8 @@ pub enum ServerMessage {
 }
 
 /// The payload of a frame of the Storage Server's protocol: `message` in MessagePack with named
-/// fields, so a reader of another version skips a field it does not know and its own fields
-/// default when absent. Each such frame (`service::frame`) carries the descriptors of the
-/// storage its message names.
+/// fields. Each such frame (`service::frame`) carries the descriptors of the storage its
+/// message names.
 ///
 /// # Errors
 ///

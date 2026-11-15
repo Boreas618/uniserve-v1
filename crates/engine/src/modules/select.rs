@@ -429,9 +429,8 @@ mod tests {
         assert!(refusal.contains(&(launched + 1).to_string()), "{refusal}");
     }
 
-    /// The engine package's manifest states the engine interface's version, which carries the
-    /// storage protocol's: an engine built from this tree is the one a daemon of this tree
-    /// accepts at its hello.
+    /// The engine package's manifest states the engine interface's version: an engine built
+    /// from this tree is the one a daemon of this tree accepts at its hello.
     #[test]
     fn the_engine_package_states_the_engine_interface_version() {
         let manifest: toml::Table = include_str!("../../package.toml")
